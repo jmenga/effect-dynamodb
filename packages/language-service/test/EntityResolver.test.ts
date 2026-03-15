@@ -1,0 +1,214 @@
+import ts from "typescript"
+import { describe, expect, it } from "vitest"
+import { resolveEntities } from "../src/core/EntityResolver"
+
+function parseSource(source: string): ts.SourceFile {
+  return ts.createSourceFile("test.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+}
+
+describe("EntityResolver", () => {
+  describe("resolveEntities", () => {
+    it("should resolve a basic entity with primary index", () => {
+      const source = `
+        import * as DynamoSchema from "@effect-dynamodb/core/DynamoSchema"
+        import * as Table from "@effect-dynamodb/core/Table"
+        import * as Entity from "@effect-dynamodb/core/Entity"
+
+        const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
+        const MainTable = Table.make({ schema: AppSchema })
+
+        const Users = Entity.make({
+          model: User,
+          table: MainTable,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+          },
+        })
+      `
+      const sf = parseSource(source)
+      const entities = resolveEntities(ts, sf)
+
+      expect(entities).toHaveLength(1)
+      expect(entities[0]!.variableName).toBe("Users")
+      expect(entities[0]!.entityType).toBe("User")
+      expect(entities[0]!.schema).toEqual({ name: "myapp", version: 1, casing: "lowercase" })
+      expect(entities[0]!.indexes.primary).toBeDefined()
+      expect(entities[0]!.indexes.primary!.pk).toEqual({ field: "pk", composite: ["userId"] })
+      expect(entities[0]!.indexes.primary!.sk).toEqual({ field: "sk", composite: [] })
+    })
+
+    it("should resolve entity with GSI indexes", () => {
+      const source = `
+        const AppSchema = DynamoSchema.make({ name: "crud-demo", version: 1 })
+        const MainTable = Table.make({ schema: AppSchema })
+
+        const Users = Entity.make({
+          model: User,
+          table: MainTable,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            byRole: {
+              index: "gsi1",
+              pk: { field: "gsi1pk", composite: ["role"] },
+              sk: { field: "gsi1sk", composite: ["userId"] },
+            },
+          },
+          timestamps: true,
+          versioned: { retain: true },
+        })
+      `
+      const sf = parseSource(source)
+      const entities = resolveEntities(ts, sf)
+
+      expect(entities).toHaveLength(1)
+      const user = entities[0]!
+      expect(user.entityType).toBe("User")
+      expect(user.indexes.byRole).toBeDefined()
+      expect(user.indexes.byRole!.index).toBe("gsi1")
+      expect(user.indexes.byRole!.pk).toEqual({ field: "gsi1pk", composite: ["role"] })
+      expect(user.indexes.byRole!.sk).toEqual({ field: "gsi1sk", composite: ["userId"] })
+      expect(user.timestamps).toBe(true)
+      expect(user.versioned).toEqual({ retain: true })
+    })
+
+    it("should resolve multiple entities in the same file", () => {
+      const source = `
+        const AppSchema = DynamoSchema.make({ name: "test", version: 2 })
+        const MainTable = Table.make({ schema: AppSchema })
+
+        const Users = Entity.make({
+          model: User,
+          table: MainTable,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+          },
+        })
+
+        const Tasks = Entity.make({
+          model: Task,
+          table: MainTable,
+          entityType: "Task",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["taskId"] },
+              sk: { field: "sk", composite: [] },
+            },
+          },
+          softDelete: true,
+        })
+      `
+      const sf = parseSource(source)
+      const entities = resolveEntities(ts, sf)
+
+      expect(entities).toHaveLength(2)
+      expect(entities[0]!.entityType).toBe("User")
+      expect(entities[1]!.entityType).toBe("Task")
+      expect(entities[1]!.softDelete).toBe(true)
+    })
+
+    it("should resolve DynamoSchema with custom casing", () => {
+      const source = `
+        const AppSchema = DynamoSchema.make({ name: "MyApp", version: 1, casing: "preserve" })
+        const MainTable = Table.make({ schema: AppSchema })
+
+        const Items = Entity.make({
+          model: Item,
+          table: MainTable,
+          entityType: "Item",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
+            },
+          },
+        })
+      `
+      const sf = parseSource(source)
+      const entities = resolveEntities(ts, sf)
+
+      expect(entities).toHaveLength(1)
+      expect(entities[0]!.schema.casing).toBe("preserve")
+      expect(entities[0]!.schema.name).toBe("MyApp")
+    })
+
+    it("should resolve entity with collection indexes", () => {
+      const source = `
+        const AppSchema = DynamoSchema.make({ name: "shop", version: 1 })
+        const MainTable = Table.make({ schema: AppSchema })
+
+        const Orders = Entity.make({
+          model: Order,
+          table: MainTable,
+          entityType: "Order",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["orderId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            byCustomer: {
+              index: "gsi1",
+              collection: "customerOrders",
+              pk: { field: "gsi1pk", composite: ["customerId"] },
+              sk: { field: "gsi1sk", composite: ["orderDate"] },
+            },
+          },
+        })
+      `
+      const sf = parseSource(source)
+      const entities = resolveEntities(ts, sf)
+
+      expect(entities).toHaveLength(1)
+      expect(entities[0]!.indexes.byCustomer!.collection).toBe("customerOrders")
+    })
+
+    it("should return empty array when no Entity.make calls exist", () => {
+      const source = `
+        const x = 42
+        const y = "hello"
+      `
+      const sf = parseSource(source)
+      const entities = resolveEntities(ts, sf)
+
+      expect(entities).toHaveLength(0)
+    })
+
+    it("should handle entity with softDelete and unique config", () => {
+      const source = `
+        const AppSchema = DynamoSchema.make({ name: "app", version: 1 })
+        const MainTable = Table.make({ schema: AppSchema })
+
+        const Users = Entity.make({
+          model: User,
+          table: MainTable,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+          },
+          softDelete: { ttl: 86400 },
+          unique: { email: { fields: ["email"] } },
+        })
+      `
+      const sf = parseSource(source)
+      const entities = resolveEntities(ts, sf)
+
+      expect(entities).toHaveLength(1)
+      expect(entities[0]!.softDelete).toEqual({ ttl: 86400 })
+      expect(entities[0]!.unique).toEqual({ email: { fields: ["email"] } })
+    })
+  })
+})

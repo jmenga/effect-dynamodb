@@ -1,0 +1,57 @@
+{
+  "name": "@effect-dynamodb/geo",
+  "version": "0.1.0",
+  "description": "Geospatial index and search for effect-dynamodb using H3 hexagonal grid",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/effect-dynamodb/core"
+  },
+  "keywords": [
+    "effect",
+    "effect-ts",
+    "dynamodb",
+    "geospatial",
+    "h3",
+    "hexagonal-grid",
+    "geo-search",
+    "location",
+    "proximity"
+  ],
+  "sideEffects": false,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:connected": "vitest run --config vitest.connected.ts",
+    "check": "tsc --noEmit && tsc --noEmit -p tsconfig.examples.json",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write ."
+  },
+  "dependencies": {
+    "@effect-dynamodb/core": "workspace:*",
+    "effect": "^4.0.0-beta.27",
+    "h3-js": "^4.2.1"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-dynamodb": "^3.700.0",
+    "@effect/vitest": "^4.0.0-beta.27",
+    "@types/node": "^25.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

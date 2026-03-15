@@ -1,0 +1,568 @@
+# Aggregates & Relational Patterns
+
+This guide covers three related features for modeling rich domain relationships in DynamoDB:
+
+1. **Entity References** — Denormalized copies of related entities, with automatic ID-based inputs and hydration on write
+2. **Aggregates** — Graph-based composite domain objects assembled from multiple entity types sharing a partition key
+3. **Cascade Updates** — Propagating source entity changes to all items that embed it via refs
+
+## Entity References
+
+### The Problem
+
+DynamoDB doesn't have JOINs. When your domain model needs data from a related entity, you denormalize — store a copy of the related data alongside the item that references it. This creates two problems:
+
+- **Write complexity** — Instead of accepting an ID, you must fetch the full entity by ID and embed its data
+- **Read/write type mismatch** — Create/update inputs should accept IDs; read outputs should return full entity data
+
+### DynamoModel.identifier
+
+Mark the primary business identifier field on any entity that can be referenced:
+
+```typescript
+import { Schema } from "effect"
+import { DynamoModel } from "effect-dynamodb"
+
+class Team extends Schema.Class<Team>("Team")({
+  id: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+  country: Schema.String,
+  ranking: Schema.Number,
+}) {}
+```
+
+Rules:
+- Exactly one field per model may be annotated with `identifier`
+- The field should be a string or branded string type
+- Only entities with an `identifier` field can be referenced via `DynamoModel.ref`
+
+### DynamoModel.ref
+
+Mark a field as a denormalized reference to another entity:
+
+```typescript
+class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
+  squadId: Schema.String,
+  selectionNumber: Schema.Number,
+  team: Team.pipe(DynamoModel.ref),
+  player: Player.pipe(DynamoModel.ref),
+  squadRole: Schema.Literals(["batter", "bowler", "all-rounder"]),
+  isCaptain: Schema.Boolean,
+}) {}
+```
+
+`DynamoModel.ref` is a schema annotation (like `DynamoModel.Immutable`). It tells Entity how to handle the field across different type contexts.
+
+### Entity Ref Integration
+
+When creating an entity with ref fields, provide a `refs` config mapping field names to the entities they reference:
+
+```typescript
+const SquadSelections = Entity.make({
+  model: SquadSelection,
+  table: MainTable,
+  entityType: "SquadSelection",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["squadId"] },
+      sk: { field: "sk", composite: ["selectionNumber"] },
+    },
+    byPlayer: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["playerId"] },
+      sk: { field: "gsi1sk", composite: ["squadId", "selectionNumber"] },
+    },
+  },
+  refs: {
+    team: Teams,     // "team" field references the Teams entity
+    player: Players, // "player" field references the Players entity
+  },
+})
+```
+
+### Type Transformation
+
+Ref fields transform across Entity's derived types:
+
+| Type | Ref field shape | Example |
+|------|-----------------|---------|
+| `Entity.Input<E>` | ID field (derived from identifier name + "Id" suffix) | `teamId: string`, `playerId: string` |
+| `Entity.Record<E>` | Full domain object | `team: Team`, `player: Player` |
+| `Entity.Update<E>` | Optional ID field | `teamId?: string`, `playerId?: string` |
+
+```typescript
+// Input accepts IDs — not full objects
+yield* SquadSelections.put({
+  squadId: "aus#2024-25#BGT",
+  selectionNumber: 1,
+  teamId: "aus",         // ID, not Team object
+  playerId: "cummins-01", // ID, not Player object
+  squadRole: "bowler",
+  isCaptain: true,
+})
+
+// Record returns full domain objects
+const selection = yield* SquadSelections.get({
+  squadId: "aus#2024-25#BGT",
+  selectionNumber: 1,
+})
+console.log(selection.team.name)     // "Australia"
+console.log(selection.player.role)   // "bowler"
+```
+
+### Ref Hydration
+
+On `put` and `update`, Entity automatically:
+1. Extracts the ID from each ref field in the input
+2. Fetches the referenced entity by ID (parallel fetches for multiple refs)
+3. Embeds the entity's core domain data (Schema.Type — no system fields) in the DynamoDB item
+4. Returns `RefNotFound` if any referenced entity doesn't exist
+
+```typescript
+// RefNotFound when a ref doesn't resolve
+const result = yield* SquadSelections.put({
+  squadId: "aus#2024-25#BGT",
+  selectionNumber: 99,
+  teamId: "aus",
+  playerId: "nonexistent",  // doesn't exist
+  squadRole: "batter",
+  isCaptain: false,
+}).asEffect().pipe(Effect.flip)
+
+if (result._tag === "RefNotFound") {
+  console.log(result.field)     // "player"
+  console.log(result.refId)     // "nonexistent"
+  console.log(result.refEntity) // "Player"
+}
+```
+
+### DynamoDB Storage
+
+In DynamoDB, a ref field is stored as an embedded map containing the referenced entity's domain fields:
+
+```json
+{
+  "pk": { "S": "$cricket#v1#squad_selection#aus#2024-25#BGT" },
+  "sk": { "S": "$cricket#v1#squad_selection#1" },
+  "team": { "M": { "id": { "S": "aus" }, "name": { "S": "Australia" }, "country": { "S": "Australia" }, "ranking": { "N": "1" } } },
+  "player": { "M": { "id": { "S": "cummins-01" }, "firstName": { "S": "Pat" }, "lastName": { "S": "Cummins" }, "role": { "S": "bowler" } } },
+  "squadRole": { "S": "bowler" },
+  "isCaptain": { "BOOL": true }
+}
+```
+
+---
+
+## Aggregates
+
+### The Problem
+
+Real-world DynamoDB applications model rich domain objects as multiple denormalized items sharing a partition key. A cricket match, for example, might store the match root, venue, two team sheets, coaches, and player selections as separate items in the same partition. Building and maintaining these structures requires:
+
+- Manual collection queries with discrimination by entity type
+- Complex assembly logic (reduce + merge items into domain shape)
+- Deep destructuring for mutations
+- Transactional writes for consistency
+
+The `Aggregate` module automates all of this.
+
+### Core Concepts
+
+An **Aggregate** is a domain object composed of multiple DynamoDB entity types sharing a partition key. The structure is a directed acyclic graph (DAG):
+
+- **Root node** — The aggregate identity
+- **Edges** — Relationships with cardinality (`one` or `many`)
+- **Edge attributes** — Data owned by the relationship, not the referenced entity (e.g., `isCaptain`, `battingPosition`)
+- **Sub-aggregates** — Reusable child aggregates that form transaction boundaries
+
+### Defining an Aggregate
+
+#### Step 1: Domain Schemas
+
+Define the composed domain shape using Schema.Class. Ref fields reference other entities; edge fields reference aggregate members.
+
+```typescript
+class PlayerSheet extends Schema.Class<PlayerSheet>("PlayerSheet")({
+  player: Player.pipe(DynamoModel.ref),
+  battingPosition: Schema.Number,
+  isCaptain: Schema.Boolean,
+}) {}
+
+class TeamSheet extends Schema.Class<TeamSheet>("TeamSheet")({
+  team: Team.pipe(DynamoModel.ref),
+  coach: Coach.pipe(DynamoModel.ref),
+  homeTeam: Schema.Boolean,
+  players: Schema.Array(PlayerSheet),
+}) {}
+
+class Match extends Schema.Class<Match>("Match")({
+  id: Schema.String,
+  name: Schema.String,
+  venue: Venue.pipe(DynamoModel.ref),
+  team1: TeamSheet,
+  team2: TeamSheet,
+}) {}
+```
+
+#### Step 2: Sub-Aggregates
+
+Define reusable graph shapes for repeated structures. A sub-aggregate specifies a root entity type and edges to member entity types.
+
+```typescript
+const TeamSheetAggregate = Aggregate.make(TeamSheet, {
+  root: { entityType: "MatchTeam" },
+  edges: {
+    coach: Aggregate.one("coach", { entityType: "MatchCoach" }),
+    players: Aggregate.many("players", { entityType: "MatchPlayer" }),
+  },
+})
+```
+
+- `Aggregate.one(name, config)` — One member item per aggregate instance
+- `Aggregate.many(name, config)` — Multiple member items per aggregate instance
+
+Edge keys (`coach`, `players`) correspond to fields on the schema.
+
+#### Step 3: Top-Level Aggregate
+
+Bind the full domain schema to a table, schema namespace, partition key, and collection index:
+
+```typescript
+const MatchAggregate = Aggregate.make(Match, {
+  table: MainTable,
+  schema: CricketSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: {
+    index: "lsi1",
+    name: "match",
+    sk: { field: "lsi1sk", composite: ["name"] },
+  },
+  root: { entityType: "MatchItem" },
+  refs: {
+    Team: Teams,
+    Player: Players,
+    Coach: Coaches,
+    Venue: Venues,
+  },
+  edges: {
+    venue: Aggregate.one("venue", { entityType: "MatchVenue" }),
+    team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
+    team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
+  },
+})
+```
+
+**Config properties:**
+
+| Property | Description |
+|----------|-------------|
+| `table` | The DynamoDB table |
+| `schema` | DynamoSchema namespace for key prefixing |
+| `pk` | Partition key definition (field + composite attributes from the schema) |
+| `collection` | Collection index for the read path query (index name, collection name, SK definition) |
+| `root` | Entity type for the root item |
+| `refs` | Map of Schema.Class identifiers to Entity instances for ref hydration |
+| `context` | Optional array of schema field names to propagate to all member items |
+| `edges` | Map of schema fields to edge descriptors or bound sub-aggregates |
+
+#### Sub-Aggregate Binding with Discriminators
+
+When the same sub-aggregate shape appears multiple times (e.g., `team1` and `team2`), use `.with()` to bind discriminator values:
+
+```typescript
+team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
+team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
+```
+
+Discriminator values are stored on each member item in DynamoDB and used during assembly to route items to the correct sub-aggregate instance.
+
+### Aggregate Operations
+
+#### get — Read and Assemble
+
+Fetch all items in the partition via a collection query, then assemble them into the domain object:
+
+```typescript
+const match = yield* MatchAggregate.get({ id: "bgt-2025-test-1" })
+// match: Match — fully assembled domain object
+
+console.log(match.name)                         // "AUS vs IND, 1st Test"
+console.log(match.venue.name)                   // "Melbourne Cricket Ground"
+console.log(match.team1.team.name)              // "Australia"
+console.log(match.team1.players[0].player.role) // "bowler"
+```
+
+Assembly works by:
+1. Querying the collection index for all items in the partition
+2. Discriminating items by `__edd_e__` entity type + discriminator values
+3. Traversing the graph leaves-to-root (topological sort)
+4. Building the Schema.Class instance at each node
+
+Returns `AggregateAssemblyError` if the collection query returns incomplete or unexpected items.
+
+#### create — Decompose and Write
+
+Create a new aggregate from input data. Ref fields accept IDs (not full objects):
+
+```typescript
+const match = yield* MatchAggregate.create({
+  id: "bgt-2025-test-1",
+  name: "AUS vs IND, 1st Test",
+  venueId: "mcg",
+  team1: {
+    teamId: "aus",
+    coachId: "mcdonald",
+    homeTeam: true,
+    players: [
+      { playerId: "cummins-01", battingPosition: 8, isCaptain: true },
+      { playerId: "smith-01", battingPosition: 4, isCaptain: false },
+    ],
+  },
+  team2: {
+    teamId: "ind",
+    coachId: "gambhir",
+    homeTeam: false,
+    players: [
+      { playerId: "kohli-01", battingPosition: 4, isCaptain: true },
+    ],
+  },
+})
+```
+
+The create operation:
+1. Validates the input against the schema
+2. Hydrates all ref fields (fetches entities by ID, embeds domain data)
+3. Decomposes the domain object into individual DynamoDB items following the graph structure
+4. Adds partition keys, sort keys, entity type discriminators, and context fields
+5. Writes items in sub-aggregate transaction groups (each sub-aggregate = one `transactWriteItems`)
+
+Returns `RefNotFound` if a ref ID doesn't resolve. Returns `AggregateTransactionOverflow` if a sub-aggregate group exceeds 100 items (DynamoDB transaction limit).
+
+#### update — Diff and Write
+
+Fetch the current state, apply a mutation function, diff, and write only changed sub-aggregate groups:
+
+```typescript
+const updated = yield* MatchAggregate.update(
+  { id: "bgt-2025-test-1" },
+  (current) => ({
+    ...current,
+    team1: {
+      ...current.team1,
+      players: current.team1.players.map((ps) => ({
+        ...ps,
+        isCaptain: ps.player.lastName === "Smith",
+      })),
+    },
+  }),
+)
+```
+
+The update operation:
+1. Fetches the current aggregate via `get`
+2. Applies the mutation function to produce the updated domain object
+3. Decomposes both old and new into DynamoDB items
+4. Diffs at sub-aggregate group boundaries
+5. Writes only the groups that changed
+
+**Context field propagation:** If the mutation changes a context field (a root-level field propagated to all members), all sub-aggregate groups are rewritten with the new context values.
+
+#### Optics Support
+
+The mutation function receives an optional second argument with optics context for composable, type-safe immutable updates on deeply nested structures:
+
+```typescript
+const updated = yield* MatchAggregate.update(
+  { id: "bgt-2025-test-1" },
+  (_current, { plain, optic }) =>
+    optic.key("team1").key("players").modify(
+      (players) => players.map(ps => ({ ...ps, isCaptain: ps.player.lastName === "Smith" }))
+    )(plain),
+)
+```
+
+The context provides:
+- **`plain`** — The current aggregate state as a plain object (class instance converted via `Schema.toIso`). Required because Effect's `Optic.modify`/`Optic.replace` work on plain objects, not `Schema.Class` instances.
+- **`optic`** — An identity optic (`Optic.Iso`) rooted at the plain object type. Use `.key("field")` chains to focus into nested fields.
+
+**Key optic operations:**
+
+| Operation | Signature | Description |
+|-----------|-----------|-------------|
+| `optic.key("field")` | `Optic.Lens<S, FieldType>` | Focus on a nested field |
+| `lens.modify(fn)(source)` | `S` | Apply a function to the focused value, returning updated source |
+| `lens.replace(value, source)` | `S` | Replace the focused value, returning updated source |
+
+Simple field update:
+```typescript
+// Rename match — optic.key().replace()
+yield* MatchAggregate.update(
+  { id: "match-1" },
+  (_current, { plain, optic }) => optic.key("name").replace("New Name", plain),
+)
+```
+
+The mutation function can return either a class instance (from spreading `current`) or a plain object (from optic operations) — the schema decode handles both. Existing mutations that ignore the second argument continue to work unchanged.
+
+#### delete — Remove All Items
+
+Remove all items in the aggregate's partition:
+
+```typescript
+yield* MatchAggregate.delete({ id: "bgt-2025-test-1" })
+```
+
+Queries all items in the partition and batch-deletes them.
+
+### Type Extractors
+
+| Type | Description |
+|------|-------------|
+| `Aggregate.Type<A>` | The assembled domain type (e.g., `Match`) |
+| `Aggregate.Key<A>` | The partition key type |
+
+```typescript
+type MatchDomain = Aggregate.Type<typeof MatchAggregate>  // Match
+type MatchKey = Aggregate.Key<typeof MatchAggregate>       // { id: string }
+```
+
+### Error Handling
+
+| Error | When | Properties |
+|-------|------|------------|
+| `AggregateAssemblyError` | Read path: missing items, structural violations, or decode errors | `aggregate`, `reason`, `key` |
+| `AggregateDecompositionError` | Write path: schema validation or structural error during decomposition | `aggregate`, `member`, `reason` |
+| `AggregateTransactionOverflow` | Write path: sub-aggregate exceeds 100-item transaction limit | `aggregate`, `subgraph`, `itemCount`, `limit` |
+| `RefNotFound` | Ref hydration: referenced entity not found | `entity`, `field`, `refEntity`, `refId` |
+
+```typescript
+const match = yield* MatchAggregate.get({ id: "test-1" }).pipe(
+  Effect.catchTag("AggregateAssemblyError", (e) =>
+    Effect.die(`Assembly failed for ${e.aggregate}: ${e.reason}`)
+  ),
+)
+```
+
+---
+
+## Cascade Updates
+
+### The Problem
+
+When denormalized data changes at the source (e.g., a player's name is corrected), every item that embeds that entity via `DynamoModel.ref` must be found and updated. Without automation, this requires per-entity-type GSIs and manual batch update logic.
+
+### Entity.cascade
+
+Attach a cascade to an `EntityUpdate` operation. After the source entity update completes, the cascade finds and updates all target items:
+
+```typescript
+import { Entity } from "effect-dynamodb"
+
+const updatedPlayer = yield* Players.update({ id: "smith-01" }).pipe(
+  Entity.set({ firstName: "Steven" }),
+  Entity.cascade({ targets: [SquadSelections] }),
+)
+```
+
+After updating the player, the cascade:
+1. Identifies all ref fields on `SquadSelections` that reference `Players`
+2. Queries the target entity's GSI (whose PK composite includes the player's ID field) to find all items embedding this player
+3. Updates each matching item with the new denormalized player data
+
+### Configuration
+
+```typescript
+Entity.cascade({
+  targets: ReadonlyArray<Entity>,  // Required: entities that embed this source via ref
+  filter?: Record<string, unknown>, // Optional: additional filter on target items
+  mode?: "eventual" | "transactional", // Optional: default "eventual"
+})
+```
+
+### Cascade Modes
+
+**Eventual (default):** Batch-updates target items. No item limit. Partial failures are possible.
+
+```typescript
+yield* Players.update({ id: "smith-01" }).pipe(
+  Entity.set({ firstName: "Steven" }),
+  Entity.cascade({ targets: [SquadSelections], mode: "eventual" }),
+)
+```
+
+**Transactional:** Atomic update via `transactWriteItems`. All target items updated in a single transaction. Maximum 100 items.
+
+```typescript
+yield* Players.update({ id: "smith-01" }).pipe(
+  Entity.set({ firstName: "Steven" }),
+  Entity.cascade({ targets: [SquadSelections], mode: "transactional" }),
+)
+```
+
+### Cascade Prerequisites
+
+For cascade to work, the target entity must:
+1. Have at least one `DynamoModel.ref` field pointing to the source entity type
+2. Have a GSI whose PK composite includes the ref's ID field (e.g., `byPlayer` with `composite: ["playerId"]`)
+3. Be configured with `refs` mapping the ref field to the source entity
+
+### Error Handling
+
+In eventual mode, partial failures return `CascadePartialFailure`:
+
+```typescript
+yield* Players.update({ id: "smith-01" }).pipe(
+  Entity.set({ firstName: "Steven" }),
+  Entity.cascade({ targets: [SquadSelections] }),
+).asEffect().pipe(
+  Effect.catchTag("CascadePartialFailure", (e) => {
+    console.log(`${e.succeeded} updated, ${e.failed} failed`)
+    // Retry or handle partial failure
+  }),
+)
+```
+
+| Property | Description |
+|----------|-------------|
+| `sourceEntity` | Entity type of the source (e.g., `"Player"`) |
+| `sourceId` | ID of the source entity |
+| `succeeded` | Number of successfully updated target items |
+| `failed` | Number of failed updates |
+| `errors` | Array of individual error details |
+
+In transactional mode, a failure rolls back the entire cascade (but not the source update — the source entity is already updated). You get `TransactionCancelled` instead of `CascadePartialFailure`.
+
+### Multiple Targets
+
+Cascade to multiple entity types in a single operation:
+
+```typescript
+yield* Players.update({ id: "smith-01" }).pipe(
+  Entity.set({ firstName: "Steven" }),
+  Entity.cascade({ targets: [SquadSelections, MatchPlayers, ContractRecords] }),
+)
+```
+
+Each target is queried independently. In eventual mode, each target's updates are batched separately.
+
+---
+
+## Full Example
+
+The `examples/cricket.ts` example demonstrates all three features in a cricket match domain:
+
+- **Part 1:** Entity refs — teams, players, coaches, venues as referenced entities; squad selections as the ref consumer
+- **Part 2:** Cascade updates — updating a player name propagates to all squad selections
+- **Part 3:** Aggregate CRUD — creating, reading, updating, and deleting a full match aggregate with sub-aggregates for team sheets
+
+Run it:
+
+```bash
+# Start DynamoDB Local
+docker run -p 8000:8000 amazon/dynamodb-local
+
+# Run the example
+npx tsx examples/cricket.ts
+```
+
+See also: [API Reference](./api-reference.md) for complete module-by-module documentation.

@@ -1,0 +1,58 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.4.4/schema.json",
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double",
+      "semicolons": "asNeeded"
+    }
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+      "style": {
+        "noNonNullAssertion": "off"
+      },
+      "suspicious": {
+        "noExplicitAny": "off",
+        "noShadowRestrictedNames": "off"
+      },
+      "complexity": {
+        "noArguments": "off",
+        "noBannedTypes": "off"
+      }
+    }
+  },
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": {
+          "level": "on"
+        }
+      }
+    }
+  },
+  "files": {
+    "includes": [
+      "packages/**/src/**",
+      "packages/**/test/**",
+      "packages/**/examples/**",
+      "*.json",
+      "*.ts"
+    ]
+  },
+  "overrides": [
+    {
+      "includes": ["packages/effect-dynamodb/src/_sparse_check.ts"],
+      "linter": {
+        "enabled": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,534 @@
+/**
+ * Cricket Match Example — Entity Refs + Cascade Updates + Aggregate CRUD
+ *
+ * Part 1: Demonstrates DynamoModel.ref and DynamoModel.identifier annotations
+ * for embedding denormalized entity data in DynamoDB items.
+ *
+ * Part 2: Demonstrates Entity.cascade for propagating source entity changes
+ * to all items that embed it via DynamoModel.ref.
+ *
+ * Part 3: Demonstrates the full Aggregate lifecycle:
+ * - Aggregate.create: ref hydration, decomposition, sub-aggregate transactions
+ * - Aggregate.get: query, discriminate, assemble from partition items
+ * - Aggregate.update: fetch → mutate → diff → write only changed groups
+ * - Aggregate.delete: remove all items in the partition
+ *
+ * Key patterns:
+ * - DynamoModel.identifier marks the primary business identifier on a model
+ * - DynamoModel.ref marks a field that holds a denormalized copy of another entity
+ * - Entity.Input accepts ID strings for ref fields (teamId, playerId)
+ * - Entity.Record returns full domain objects for ref fields (team: Team, player: Player)
+ * - Entity.cascade propagates source changes to denormalized copies in target entities
+ * - Aggregate.make binds a Schema.Class to a graph of entity types
+ * - Aggregate.create accepts ref IDs, hydrates from entities, writes via transactions
+ * - Aggregate.get queries, discriminates, and assembles items into domain objects
+ * - Aggregate.update diffs at graph edge boundaries, writes only changed sub-aggregates
+ * - Aggregate.delete removes all items in the aggregate partition
+ * - Sub-aggregates with discriminators enable reusable graph shapes
+ *
+ * Prerequisites:
+ *   docker run -p 8000:8000 amazon/dynamodb-local
+ *
+ * Run:
+ *   npx tsx examples/cricket.ts
+ */
+
+import { Console, Effect, Layer, Schema } from "effect"
+import * as Aggregate from "../src/Aggregate.js"
+import { DynamoClient } from "../src/DynamoClient.js"
+import * as DynamoModel from "../src/DynamoModel.js"
+import * as DynamoSchema from "../src/DynamoSchema.js"
+import * as Entity from "../src/Entity.js"
+import * as Table from "../src/Table.js"
+
+// ---------------------------------------------------------------------------
+// 1. Domain models — pure, no DynamoDB concepts
+// ---------------------------------------------------------------------------
+
+class Team extends Schema.Class<Team>("Team")({
+  id: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+  country: Schema.String,
+  ranking: Schema.Number,
+}) {}
+
+class Player extends Schema.Class<Player>("Player")({
+  id: Schema.String.pipe(DynamoModel.identifier),
+  firstName: Schema.String,
+  lastName: Schema.String,
+  role: Schema.Literals(["batter", "bowler", "all-rounder", "wicket-keeper"]),
+}) {}
+
+class Coach extends Schema.Class<Coach>("Coach")({
+  id: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+}) {}
+
+class Venue extends Schema.Class<Venue>("Venue")({
+  id: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+  city: Schema.String,
+}) {}
+
+// SquadSelection — a player selected to a team's squad for a series/season.
+// squadId encodes team + season + series (e.g., "aus#2024-25#BGT").
+class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
+  squadId: Schema.String,
+  selectionNumber: Schema.Number,
+  team: Team.pipe(DynamoModel.ref),
+  player: Player.pipe(DynamoModel.ref),
+  squadRole: Schema.Literals(["batter", "bowler", "all-rounder", "wicket-keeper"]),
+  isCaptain: Schema.Boolean,
+  isViceCaptain: Schema.Boolean,
+}) {}
+
+// Aggregate domain schemas
+class PlayerSheet extends Schema.Class<PlayerSheet>("PlayerSheet")({
+  player: Player.pipe(DynamoModel.ref),
+  battingPosition: Schema.Number,
+  isCaptain: Schema.Boolean,
+}) {}
+
+class TeamSheet extends Schema.Class<TeamSheet>("TeamSheet")({
+  team: Team.pipe(DynamoModel.ref),
+  coach: Coach.pipe(DynamoModel.ref),
+  homeTeam: Schema.Boolean,
+  players: Schema.Array(PlayerSheet),
+}) {}
+
+class Match extends Schema.Class<Match>("Match")({
+  id: Schema.String,
+  name: Schema.String,
+  venue: Venue.pipe(DynamoModel.ref),
+  team1: TeamSheet,
+  team2: TeamSheet,
+}) {}
+
+// ---------------------------------------------------------------------------
+// 2. Schema + Table
+// ---------------------------------------------------------------------------
+
+const CricketSchema = DynamoSchema.make({ name: "cricket", version: 1 })
+const MainTable = Table.make({ schema: CricketSchema })
+
+// ---------------------------------------------------------------------------
+// 3. Entity definitions
+// ---------------------------------------------------------------------------
+
+const Teams = Entity.make({
+  model: DynamoModel.configure(Team, { id: { field: "teamId" } }),
+  table: MainTable,
+  entityType: "Team",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
+    },
+  },
+})
+
+const Players = Entity.make({
+  model: DynamoModel.configure(Player, { id: { field: "playerId" } }),
+  table: MainTable,
+  entityType: "Player",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
+    },
+  },
+})
+
+const Coaches = Entity.make({
+  model: DynamoModel.configure(Coach, { id: { field: "coachId" } }),
+  table: MainTable,
+  entityType: "Coach",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
+    },
+  },
+})
+
+const Venues = Entity.make({
+  model: DynamoModel.configure(Venue, { id: { field: "venueId" } }),
+  table: MainTable,
+  entityType: "Venue",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
+    },
+  },
+})
+
+const SquadSelections = Entity.make({
+  model: SquadSelection,
+  table: MainTable,
+  entityType: "SquadSelection",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["squadId"] },
+      sk: { field: "sk", composite: ["selectionNumber"] },
+    },
+    byPlayer: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["playerId"] },
+      sk: { field: "gsi1sk", composite: ["squadId", "selectionNumber"] },
+    },
+  },
+  refs: {
+    team: { entity: Teams },
+    player: { entity: Players },
+  },
+})
+
+// ---------------------------------------------------------------------------
+// 4. Aggregate definitions
+// ---------------------------------------------------------------------------
+
+// Sub-aggregate: a team's composition within a match
+const TeamSheetAggregate = Aggregate.make(TeamSheet, {
+  root: { entityType: "MatchTeam" },
+  edges: {
+    team: Aggregate.ref(Teams),
+    coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: Coaches }),
+    players: Aggregate.many("players", { entityType: "MatchPlayer", entity: Players }),
+  },
+})
+
+// Top-level aggregate: the full match
+const MatchAggregate = Aggregate.make(Match, {
+  table: MainTable,
+  schema: CricketSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: {
+    index: "lsi1",
+    name: "match",
+    sk: { field: "lsi1sk", composite: ["name"] },
+  },
+  root: { entityType: "MatchItem" },
+  edges: {
+    venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: Venues }),
+    team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
+    team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
+  },
+})
+
+// ---------------------------------------------------------------------------
+// 5. Type-level demonstration
+// ---------------------------------------------------------------------------
+
+// Entity.Input accepts IDs for ref fields, not full objects
+type SelectionInput = Entity.Input<typeof SquadSelections>
+type SelectionRecord = Entity.Record<typeof SquadSelections>
+
+// Aggregate.Type extracts the domain type
+type MatchType = Aggregate.Type<typeof MatchAggregate>
+
+const _input: SelectionInput | undefined = undefined
+const _record: SelectionRecord | undefined = undefined
+const _matchType: MatchType | undefined = undefined
+void _input
+void _record
+void _matchType
+
+// ---------------------------------------------------------------------------
+// 6. Program — Entity Refs + Aggregate Read Path
+// ---------------------------------------------------------------------------
+
+const program = Effect.gen(function* () {
+  const client = yield* DynamoClient
+  const tableConfig = yield* MainTable.Tag
+
+  yield* Console.log("=== Cricket Match Example ===\n")
+
+  // --- Create table (with LSI for aggregate collection queries) ---
+  yield* Console.log("Creating table:", tableConfig.name)
+  yield* client.createTable({
+    TableName: tableConfig.name,
+    BillingMode: "PAY_PER_REQUEST",
+    KeySchema: [
+      { AttributeName: "pk", KeyType: "HASH" },
+      { AttributeName: "sk", KeyType: "RANGE" },
+    ],
+    AttributeDefinitions: [
+      { AttributeName: "pk", AttributeType: "S" },
+      { AttributeName: "sk", AttributeType: "S" },
+      { AttributeName: "lsi1sk", AttributeType: "S" },
+      { AttributeName: "gsi1pk", AttributeType: "S" },
+      { AttributeName: "gsi1sk", AttributeType: "S" },
+    ],
+    LocalSecondaryIndexes: [
+      {
+        IndexName: "lsi1",
+        KeySchema: [
+          { AttributeName: "pk", KeyType: "HASH" },
+          { AttributeName: "lsi1sk", KeyType: "RANGE" },
+        ],
+        Projection: { ProjectionType: "ALL" },
+      },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: "gsi1",
+        KeySchema: [
+          { AttributeName: "gsi1pk", KeyType: "HASH" },
+          { AttributeName: "gsi1sk", KeyType: "RANGE" },
+        ],
+        Projection: { ProjectionType: "ALL" },
+      },
+    ],
+  })
+
+  // =========================================================================
+  // Part 1: Entity Refs
+  // =========================================================================
+
+  yield* Console.log("\n--- Part 1: Entity Refs ---\n")
+
+  // --- Create teams (model uses 'id', DB stores as 'teamId') ---
+  yield* Console.log("Creating teams...")
+  yield* Teams.put({ id: "aus", name: "Australia", country: "Australia", ranking: 1 })
+  yield* Teams.put({ id: "ind", name: "India", country: "India", ranking: 2 })
+
+  // --- Create players (model uses 'id', DB stores as 'playerId') ---
+  yield* Console.log("Creating players...")
+  yield* Players.put({
+    id: "smith-01",
+    firstName: "Steve",
+    lastName: "Smith",
+    role: "batter",
+  })
+  yield* Players.put({
+    id: "cummins-01",
+    firstName: "Pat",
+    lastName: "Cummins",
+    role: "bowler",
+  })
+  yield* Players.put({
+    id: "kohli-01",
+    firstName: "Virat",
+    lastName: "Kohli",
+    role: "batter",
+  })
+
+  // --- Create coaches ---
+  yield* Console.log("Creating coaches...")
+  yield* Coaches.put({ id: "mcdonald", name: "Andrew McDonald" })
+  yield* Coaches.put({ id: "gambhir", name: "Gautam Gambhir" })
+
+  // --- Create venues ---
+  yield* Console.log("Creating venues...")
+  yield* Venues.put({ id: "mcg", name: "Melbourne Cricket Ground", city: "Melbourne" })
+
+  // --- Create squad selections with ref IDs ---
+  yield* Console.log("\nCreating squad selections (AUS BGT 2024-25)...")
+
+  yield* SquadSelections.put({
+    squadId: "aus#2024-25#BGT",
+    selectionNumber: 1,
+    teamId: "aus",
+    playerId: "cummins-01",
+    squadRole: "bowler",
+    isCaptain: true,
+    isViceCaptain: false,
+  })
+
+  yield* SquadSelections.put({
+    squadId: "aus#2024-25#BGT",
+    selectionNumber: 2,
+    teamId: "aus",
+    playerId: "smith-01",
+    squadRole: "batter",
+    isCaptain: false,
+    isViceCaptain: true,
+  })
+
+  yield* SquadSelections.put({
+    squadId: "ind#2024-25#BGT",
+    selectionNumber: 1,
+    teamId: "ind",
+    playerId: "kohli-01",
+    squadRole: "batter",
+    isCaptain: false,
+    isViceCaptain: false,
+  })
+
+  // --- Get returns full embedded data ---
+  yield* Console.log("\nRetrieving squad selection...")
+  const captain = yield* SquadSelections.get({ squadId: "aus#2024-25#BGT", selectionNumber: 1 })
+  yield* Console.log(`Captain: ${captain.player.firstName} ${captain.player.lastName}`)
+  yield* Console.log(`  Team: ${captain.team.name} (${captain.team.country})`)
+  yield* Console.log(`  Role: ${captain.player.role}`)
+  yield* Console.log(`  Captain: ${captain.isCaptain}`)
+
+  // --- RefNotFound when ref doesn't exist ---
+  yield* Console.log("\nAttempting to create selection with nonexistent player...")
+  const refError = yield* SquadSelections.put({
+    squadId: "aus#2024-25#BGT",
+    selectionNumber: 99,
+    teamId: "aus",
+    playerId: "nonexistent",
+    squadRole: "batter",
+    isCaptain: false,
+    isViceCaptain: false,
+  })
+    .asEffect()
+    .pipe(Effect.flip)
+
+  if (refError._tag === "RefNotFound") {
+    yield* Console.log(
+      `RefNotFound: ${refError.field} "${refError.refId}" not found in ${refError.refEntity}`,
+    )
+  }
+
+  // =========================================================================
+  // Part 2: Cascade Updates
+  // =========================================================================
+
+  yield* Console.log("\n--- Part 2: Cascade Updates ---\n")
+  yield* Console.log("Updating Player 'Steve Smith' → 'Steven Smith' with cascade...")
+
+  // Update the player and cascade to all SquadSelections that embed this player
+  const updatedPlayer = yield* Players.update({ id: "smith-01" }).pipe(
+    Entity.set({ firstName: "Steven" }),
+    Entity.cascade({ targets: [SquadSelections] }),
+  )
+
+  yield* Console.log(`Updated player: ${updatedPlayer.firstName} ${updatedPlayer.lastName}`)
+
+  // Verify cascade propagated — the squad selection should have the updated name
+  const afterCascade = yield* SquadSelections.get({
+    squadId: "aus#2024-25#BGT",
+    selectionNumber: 2,
+  })
+  yield* Console.log(
+    `Squad selection player after cascade: ${afterCascade.player.firstName} ${afterCascade.player.lastName}`,
+  )
+  yield* Console.log(`  (Should be "Steven Smith", was "Steve Smith")`)
+
+  // =========================================================================
+  // Part 3: Aggregate CRUD
+  // =========================================================================
+
+  yield* Console.log("\n--- Part 3: Aggregate CRUD ---\n")
+
+  // --- Aggregate.create: ref hydration + sub-aggregate transactions ---
+  yield* Console.log("Creating match via Aggregate.create...")
+  yield* Console.log("  (Input uses ref IDs; system hydrates from entity data)")
+
+  const match = yield* MatchAggregate.create({
+    id: "bgt-2025-test-1",
+    name: "AUS vs IND, 1st Test",
+    venueId: "mcg",
+    team1: {
+      teamId: "aus",
+      coachId: "mcdonald",
+      homeTeam: true,
+      players: [
+        { playerId: "cummins-01", battingPosition: 8, isCaptain: true },
+        { playerId: "smith-01", battingPosition: 4, isCaptain: false },
+      ],
+    },
+    team2: {
+      teamId: "ind",
+      coachId: "gambhir",
+      homeTeam: false,
+      players: [{ playerId: "kohli-01", battingPosition: 4, isCaptain: true }],
+    },
+  })
+
+  yield* Console.log(`\nCreated match: ${match.name}`)
+  yield* Console.log(`Venue: ${match.venue.name}, ${match.venue.city}`)
+
+  const printMatch = (m: typeof match) =>
+    Effect.gen(function* () {
+      yield* Console.log(`\nTeam 1: ${m.team1.team.name} (${m.team1.team.country})`)
+      yield* Console.log(`  Home: ${m.team1.homeTeam}`)
+      yield* Console.log(`  Coach: ${m.team1.coach.name}`)
+      yield* Console.log(`  Players:`)
+      for (const ps of m.team1.players) {
+        const captainTag = ps.isCaptain ? " (C)" : ""
+        yield* Console.log(
+          `    ${ps.battingPosition}. ${ps.player.firstName} ${ps.player.lastName}${captainTag} [${ps.player.role}]`,
+        )
+      }
+
+      yield* Console.log(`\nTeam 2: ${m.team2.team.name} (${m.team2.team.country})`)
+      yield* Console.log(`  Home: ${m.team2.homeTeam}`)
+      yield* Console.log(`  Coach: ${m.team2.coach.name}`)
+      yield* Console.log(`  Players:`)
+      for (const ps of m.team2.players) {
+        const captainTag = ps.isCaptain ? " (C)" : ""
+        yield* Console.log(
+          `    ${ps.battingPosition}. ${ps.player.firstName} ${ps.player.lastName}${captainTag} [${ps.player.role}]`,
+        )
+      }
+    })
+
+  yield* printMatch(match)
+
+  // --- Aggregate.get: read it back ---
+  yield* Console.log("\n--- Aggregate.get: Read back the match ---")
+  const fetched = yield* MatchAggregate.get({ id: "bgt-2025-test-1" })
+  yield* Console.log(`\nFetched match: ${fetched.name}`)
+  yield* Console.log(`Venue: ${fetched.venue.name}, ${fetched.venue.city}`)
+  yield* printMatch(fetched)
+
+  // --- Aggregate.update: rename match using cursor ---
+  yield* Console.log("\n--- Aggregate.update: Rename match (cursor replace) ---")
+  const renamed = yield* MatchAggregate.update({ id: "bgt-2025-test-1" }, ({ cursor }) =>
+    cursor.key("name").replace("AUS vs IND, Boxing Day Test"),
+  )
+  yield* Console.log(`Renamed match: ${renamed.name}`)
+
+  // --- Aggregate.update: transfer captaincy using cursor ---
+  yield* Console.log("\n--- Aggregate.update: Transfer captaincy (Cummins → Smith) ---")
+  const updated = yield* MatchAggregate.update({ id: "bgt-2025-test-1" }, ({ cursor }) =>
+    cursor
+      .key("team1")
+      .key("players")
+      .modify((players) =>
+        players.map((ps) => ({ ...ps, isCaptain: ps.player.lastName === "Smith" })),
+      ),
+  )
+
+  yield* Console.log(`\nUpdated match: ${updated.name}`)
+  yield* printMatch(updated)
+
+  // --- Aggregate.delete: remove all items ---
+  yield* Console.log("\n--- Aggregate.delete: Remove the match ---")
+  yield* MatchAggregate.delete({ id: "bgt-2025-test-1" })
+  yield* Console.log("Match deleted successfully.")
+
+  // Verify deletion
+  const getResult = yield* MatchAggregate.get({ id: "bgt-2025-test-1" }).pipe(Effect.flip)
+  yield* Console.log(`Get after delete: ${getResult._tag}`)
+
+  // --- Cleanup ---
+  yield* Console.log("\nCleaning up...")
+  yield* client.deleteTable({ TableName: tableConfig.name })
+  yield* Console.log("\n=== Done ===")
+})
+
+// ---------------------------------------------------------------------------
+// 7. Run
+// ---------------------------------------------------------------------------
+
+const AppLayer = Layer.merge(
+  DynamoClient.layer({
+    region: "us-east-1",
+    endpoint: "http://localhost:8000",
+    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  }),
+  MainTable.layer({ name: "cricket-table" }),
+)
+
+const main = program.pipe(Effect.provide(AppLayer), Effect.scoped)
+
+Effect.runPromise(main).then(
+  () => console.log("\nDone."),
+  (err) => console.error("Failed:", err),
+)
