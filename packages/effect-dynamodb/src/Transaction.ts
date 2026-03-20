@@ -20,7 +20,11 @@ import {
   ValidationError,
 } from "./Errors.js"
 import type { ExpressionResult } from "./Expression.js"
-import * as KeyComposer from "./KeyComposer.js"
+import {
+  composePrimaryKey,
+  resolveTableNames,
+  validateAndBuildPutItem,
+} from "./internal/TransactableOps.js"
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
 import type { TableConfig } from "./Table.js"
 
@@ -125,41 +129,14 @@ export const transactGet = <const T extends ReadonlyArray<EntityGet<any, any, an
       return info
     })
 
-    // Resolve table names for all entities
-    const tableNames = new Map<Entity, string>()
-    for (const info of infos) {
-      if (!tableNames.has(info.entity)) {
-        const { name } = yield* info.entity.table.Tag
-        tableNames.set(info.entity, name)
-      }
-    }
+    const tableNames = yield* resolveTableNames(infos)
 
-    const transactItems = infos.map((info) => {
-      const primary = info.entity.indexes.primary!
-      const schema = info.entity.table.schema
-      const composedKey = {
-        [primary.pk.field]: KeyComposer.composePk(
-          schema,
-          info.entity.entityType,
-          primary,
-          info.key!,
-        ),
-        [primary.sk.field]: KeyComposer.composeSk(
-          schema,
-          info.entity.entityType,
-          1,
-          primary,
-          info.key!,
-        ),
-      }
-
-      return {
-        Get: {
-          TableName: tableNames.get(info.entity)!,
-          Key: toAttributeMap(composedKey),
-        },
-      }
-    })
+    const transactItems = infos.map((info) => ({
+      Get: {
+        TableName: tableNames.get(info.entity)!,
+        Key: toAttributeMap(composePrimaryKey(info.entity, info.key!)),
+      },
+    }))
 
     const result = yield* client.transactGetItems({ TransactItems: transactItems }).pipe(
       Effect.mapError((error) => {
@@ -295,98 +272,36 @@ export const transactWrite = (
       }
     }
 
-    // Resolve table names
-    const tableNames = new Map<Entity, string>()
-    for (const info of opInfos) {
-      if (!tableNames.has(info.entity)) {
-        const { name } = yield* info.entity.table.Tag
-        tableNames.set(info.entity, name)
-      }
-    }
+    const tableNames = yield* resolveTableNames(opInfos)
 
     const transactItems: Array<Record<string, any>> = []
 
     for (const op of opInfos) {
       const tableName = tableNames.get(op.entity)!
-      const schema = op.entity.table.schema
-      const primary = op.entity.indexes.primary!
-      const entityVersion = 1
 
       if (op.type === "put") {
-        // Validate input
-        const inputSchema = op.entity.schemas.inputSchema as Schema.Codec<any>
-        const validated = yield* Schema.decodeUnknownEffect(inputSchema)(op.input).pipe(
-          Effect.mapError(
-            (cause) =>
-              new ValidationError({
-                entityType: op.entity.entityType,
-                operation: "transactWrite.put",
-                cause,
-              }),
-          ),
+        const marshalledItem = yield* validateAndBuildPutItem(
+          op.entity,
+          op.input!,
+          "transactWrite.put",
         )
-
-        // Build item with keys and system fields
-        const item: Record<string, unknown> = { ...validated }
-        item.__edd_e__ = op.entity.entityType
-
-        // Compose all keys
-        const keys = KeyComposer.composeAllKeys(
-          schema,
-          op.entity.entityType,
-          entityVersion,
-          op.entity.indexes,
-          validated,
-        )
-        Object.assign(item, keys)
-
-        // Add timestamps
-        const now = new Date().toISOString()
-        if (op.entity.systemFields.createdAt) item[op.entity.systemFields.createdAt] = now
-        if (op.entity.systemFields.updatedAt) item[op.entity.systemFields.updatedAt] = now
-        if (op.entity.systemFields.version) item[op.entity.systemFields.version] = 1
-
         transactItems.push({
-          Put: {
-            TableName: tableName,
-            Item: toAttributeMap(item),
-          },
+          Put: { TableName: tableName, Item: marshalledItem },
         })
       } else if (op.type === "delete") {
-        const composedKey = {
-          [primary.pk.field]: KeyComposer.composePk(schema, op.entity.entityType, primary, op.key!),
-          [primary.sk.field]: KeyComposer.composeSk(
-            schema,
-            op.entity.entityType,
-            entityVersion,
-            primary,
-            op.key!,
-          ),
-        }
-
         transactItems.push({
           Delete: {
             TableName: tableName,
-            Key: toAttributeMap(composedKey),
+            Key: toAttributeMap(composePrimaryKey(op.entity, op.key!)),
           },
         })
       } else {
         // conditionCheck
-        const composedKey = {
-          [primary.pk.field]: KeyComposer.composePk(schema, op.entity.entityType, primary, op.key!),
-          [primary.sk.field]: KeyComposer.composeSk(
-            schema,
-            op.entity.entityType,
-            entityVersion,
-            primary,
-            op.key!,
-          ),
-        }
-
+        const marshalledKey = toAttributeMap(composePrimaryKey(op.entity, op.key!))
         transactItems.push({
           ConditionCheck: {
             TableName: tableName,
-            Key: toAttributeMap(composedKey),
+            Key: marshalledKey,
             ConditionExpression: op.condition!.expression,
             ExpressionAttributeNames: op.condition!.names,
             ExpressionAttributeValues: op.condition!.values,

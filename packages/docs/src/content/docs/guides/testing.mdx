@@ -1,0 +1,145 @@
+---
+title: "Testing"
+description: "Mock DynamoClient, test CRUD operations, error paths, and queries"
+---
+
+This guide covers how to test effect-dynamodb entities using Effect's service-based architecture. You will learn how to mock the DynamoDB client, verify CRUD operations, assert on error paths, and test queries.
+
+## Set Up a Mock DynamoDB Client
+
+effect-dynamodb uses `DynamoClient` as an Effect Service (`ServiceMap.Service`). In tests, provide a mock implementation via `Layer.succeed`:
+
+```typescript
+import { it } from "@effect/vitest"
+import { Effect, Layer } from "effect"
+import { DynamoClient } from "effect-dynamodb"
+import { vi } from "vitest"
+
+const mockPutItem = vi.fn()
+const mockGetItem = vi.fn()
+const mockQuery = vi.fn()
+const mockUpdateItem = vi.fn()
+const mockDeleteItem = vi.fn()
+const mockTransactWriteItems = vi.fn()
+
+const MockDynamoClient = Layer.succeed(DynamoClient, {
+  putItem: mockPutItem,
+  getItem: mockGetItem,
+  query: mockQuery,
+  updateItem: mockUpdateItem,
+  deleteItem: mockDeleteItem,
+  transactWriteItems: mockTransactWriteItems,
+  batchGetItem: () => Effect.die("not used"),
+  batchWriteItem: () => Effect.die("not used"),
+  transactGetItems: () => Effect.die("not used"),
+  scan: () => Effect.die("not used"),
+  createTable: () => Effect.die("not used"),
+  deleteTable: () => Effect.die("not used"),
+  describeTable: () => Effect.die("not used"),
+})
+```
+
+## Verify a Put Operation
+
+Wire the mock layer into an `it.effect` test. Create a typed client with `DynamoClient.make()` then assert that the entity's `put` method calls the underlying DynamoDB client correctly:
+
+```typescript
+it.effect("creates an employee", () =>
+  Effect.gen(function* () {
+    mockPutItem.mockReturnValue(Effect.succeed({}))
+    mockGetItem.mockReturnValue(Effect.succeed({
+      Item: marshall({
+        pk: "$myapp#v1#employee#emp-1",
+        sk: "$myapp#v1#employee",
+        __edd_e__: "Employee",
+        employeeId: "emp-1",
+        email: "alice@acme.com",
+        displayName: "Alice",
+        department: "Engineering",
+        hireDate: "2024-01-15T00:00:00.000Z",
+        version: 1,
+        createdAt: "2024-01-15T10:30:00.000Z",
+        updatedAt: "2024-01-15T10:30:00.000Z",
+      }),
+    }))
+
+    const { EmployeeEntity: employees } = yield* DynamoClient.make(MainTable)
+
+    const result = yield* employees.put({
+      employeeId: "emp-1",
+      email: "alice@acme.com",
+      displayName: "Alice",
+      department: "Engineering",
+      hireDate: DateTime.unsafeMake("2024-01-15"),
+      createdBy: "admin",
+    })
+
+    expect(result.employeeId).toBe("emp-1")
+    expect(result.displayName).toBe("Alice")
+    expect(mockPutItem).toHaveBeenCalledOnce()
+  }).pipe(Effect.provide(MockDynamoClient))
+)
+```
+
+## Assert on Error Paths
+
+Mock the client to return a failure and use `Effect.flip` to inspect the error channel:
+
+```typescript
+it.effect("handles unique constraint violation", () =>
+  Effect.gen(function* () {
+    mockTransactWriteItems.mockReturnValue(
+      Effect.fail(new DynamoError({ operation: "TransactWriteItems", cause: new Error("TransactionCanceledException") }))
+    )
+
+    const { UserEntity: users } = yield* DynamoClient.make(MainTable)
+
+    const result = yield* users.put({
+      userId: "u-1",
+      email: "taken@example.com",
+      displayName: "Test",
+    }).pipe(Effect.flip)
+
+    expect(result._tag).toBe("UniqueConstraintViolation")
+  }).pipe(Effect.provide(MockDynamoClient))
+)
+```
+
+## Test Query Results
+
+Return mock query results from the client and verify the decoded output:
+
+```typescript
+it.effect("queries tasks by project", () =>
+  Effect.gen(function* () {
+    mockQuery.mockReturnValue(Effect.succeed({
+      Items: [
+        marshall({
+          pk: "$myapp#v1#task#t-1",
+          __edd_e__: "Task",
+          taskId: "t-1",
+          projectId: "proj-alpha",
+          status: "active",
+          // ...
+        }),
+      ],
+      LastEvaluatedKey: undefined,
+    }))
+
+    const { TaskEntity: tasks } = yield* DynamoClient.make(MainTable)
+
+    const results = yield* tasks.collect(
+      TaskEntity.query.byProject({ projectId: "proj-alpha" }),
+      TaskEntity.filter({ status: "active" }),
+    )
+
+    expect(results).toHaveLength(1)
+    expect(results[0].taskId).toBe("t-1")
+  }).pipe(Effect.provide(MockDynamoClient))
+)
+```
+
+## What's Next?
+
+- [Getting Started](/effect-dynamodb/getting-started/) — Quick start guide
+- [DynamoDB Streams](/effect-dynamodb/guides/streams/) — Process change events from DynamoDB Streams

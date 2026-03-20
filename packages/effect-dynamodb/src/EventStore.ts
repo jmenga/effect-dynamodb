@@ -452,6 +452,118 @@ export const makeStream = <
 }
 
 // ---------------------------------------------------------------------------
+// BoundEventStream — EventStream operations with services pre-resolved (R = never)
+// ---------------------------------------------------------------------------
+
+/**
+ * An EventStream whose operations have `DynamoClient` and `TableConfig` already
+ * resolved, so all methods return `Effect<A, E, never>`.
+ *
+ * Created via {@link bind}. Use in service layers to avoid leaking infrastructure
+ * requirements through service method signatures.
+ *
+ * @example
+ * ```typescript
+ * export class MatchEventService extends ServiceMap.Service<MatchEventService>()("MatchEventService", {
+ *   make: Effect.gen(function* () {
+ *     const stream = yield* EventStore.bind(MatchEvents)
+ *     return {
+ *       append: (matchId, events, version) => stream.append({ matchId }, events, version),
+ *       read: (matchId) => stream.read({ matchId }),
+ *     }
+ *   }),
+ * }) {}
+ * ```
+ */
+export interface BoundEventStream<
+  TEvent,
+  TStreamIdFields extends ReadonlyArray<string>,
+  TMetadata,
+> {
+  readonly [EventStreamTypeId]: EventStreamTypeId
+  readonly streamName: string
+  readonly eventSchema: Schema.Top
+
+  readonly append: (
+    streamId: StreamIdInput<TStreamIdFields>,
+    events: ReadonlyArray<TEvent>,
+    expectedVersion: number,
+    options?: { readonly metadata?: TMetadata } | undefined,
+  ) => Effect.Effect<
+    AppendResult<TEvent>,
+    VersionConflict | DynamoClientError | ValidationError | TransactionCancelled,
+    never
+  >
+
+  readonly read: (
+    streamId: StreamIdInput<TStreamIdFields>,
+  ) => Effect.Effect<ReadonlyArray<StreamEvent<TEvent>>, DynamoClientError | ValidationError, never>
+
+  readonly readFrom: (
+    streamId: StreamIdInput<TStreamIdFields>,
+    afterVersion: number,
+  ) => Effect.Effect<ReadonlyArray<StreamEvent<TEvent>>, DynamoClientError | ValidationError, never>
+
+  readonly currentVersion: (
+    streamId: StreamIdInput<TStreamIdFields>,
+  ) => Effect.Effect<number, DynamoClientError | ValidationError, never>
+
+  readonly query: {
+    readonly events: (streamId: StreamIdInput<TStreamIdFields>) => Query.Query<StreamEvent<TEvent>>
+  }
+
+  /** Escape hatch: provide DynamoClient | TableConfig to an arbitrary effect. */
+  readonly provide: <A, E>(
+    effect: Effect.Effect<A, E, DynamoClient | TableConfig>,
+  ) => Effect.Effect<A, E, never>
+}
+
+// ---------------------------------------------------------------------------
+// EventStore.bind — resolve services, return BoundEventStream with R = never
+// ---------------------------------------------------------------------------
+
+/**
+ * Bind an EventStream to resolved `DynamoClient` and `TableConfig` services.
+ * Returns a {@link BoundEventStream} where all operations have `R = never`.
+ *
+ * Use inside `ServiceMap.Service` make effects to prevent service methods
+ * from leaking infrastructure requirements.
+ *
+ * @example
+ * ```typescript
+ * const stream = yield* EventStore.bind(MatchEvents)
+ * const events = yield* stream.read({ matchId: "m-1" })    // R = never
+ * yield* stream.append({ matchId: "m-1" }, [event], 0)     // R = never
+ * ```
+ */
+export const bind = <TEvent, TStreamIdFields extends ReadonlyArray<string>, TMetadata>(
+  stream: EventStream<TEvent, TStreamIdFields, TMetadata>,
+): Effect.Effect<
+  BoundEventStream<TEvent, TStreamIdFields, TMetadata>,
+  never,
+  DynamoClient | TableConfig
+> =>
+  Effect.gen(function* () {
+    const ctx = yield* Effect.services<DynamoClient | TableConfig>()
+    const provide = <A, E>(
+      effect: Effect.Effect<A, E, DynamoClient | TableConfig>,
+    ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
+
+    return {
+      [EventStreamTypeId]: EventStreamTypeId,
+      streamName: stream.streamName,
+      eventSchema: stream.eventSchema,
+      append: (streamId, events, expectedVersion, options) =>
+        provide(stream.append(streamId, events, expectedVersion, options)),
+      read: (streamId) => provide(stream.read(streamId)),
+      readFrom: (streamId, afterVersion) => provide(stream.readFrom(streamId, afterVersion)),
+      currentVersion: (streamId) => provide(stream.currentVersion(streamId)),
+      query: stream.query,
+      provide,
+    } as BoundEventStream<TEvent, TStreamIdFields, TMetadata>
+  })
+
+// ---------------------------------------------------------------------------
 // commandHandler
 // ---------------------------------------------------------------------------
 
@@ -472,25 +584,60 @@ type CommandHandler<
   DynamoClient | TableConfig
 >
 
+type BoundCommandHandler<
+  State,
+  Command,
+  TEvent,
+  E,
+  TStreamIdFields extends ReadonlyArray<string>,
+  TMetadata,
+> = (
+  streamId: StreamIdInput<TStreamIdFields>,
+  command: Command,
+  options?: { readonly metadata?: TMetadata } | undefined,
+) => Effect.Effect<
+  CommandHandlerResult<State, TEvent>,
+  E | VersionConflict | DynamoClientError | ValidationError | TransactionCancelled,
+  never
+>
+
 /**
  * Create a command handler that reads, decides, and appends atomically.
  *
- * Supports both data-first and data-last (pipeable) usage:
+ * Supports both data-first and data-last (pipeable) usage, and works with
+ * both `EventStream` (R = DynamoClient | TableConfig) and `BoundEventStream` (R = never).
+ *
  * ```typescript
- * // Data-first
+ * // Data-first with EventStream
  * const handle = EventStore.commandHandler(decider, stream)
+ *
+ * // Data-first with BoundEventStream
+ * const handle = EventStore.commandHandler(decider, boundStream)
  *
  * // Data-last (pipe)
  * const handle = stream.pipe(EventStore.commandHandler(decider))
  * ```
  */
 export const commandHandler: {
+  // Data-last overloads
   <State, Command, TEvent, E>(
     decider: Decider<State, Command, TEvent, E>,
-  ): <TStreamIdFields extends ReadonlyArray<string>, TMetadata>(
-    stream: EventStream<TEvent, TStreamIdFields, TMetadata>,
-  ) => CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata>
+  ): {
+    <TStreamIdFields extends ReadonlyArray<string>, TMetadata>(
+      stream: BoundEventStream<TEvent, TStreamIdFields, TMetadata>,
+    ): BoundCommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata>
+    <TStreamIdFields extends ReadonlyArray<string>, TMetadata>(
+      stream: EventStream<TEvent, TStreamIdFields, TMetadata>,
+    ): CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata>
+  }
 
+  // Data-first: BoundEventStream → BoundCommandHandler
+  <State, Command, TEvent, E, TStreamIdFields extends ReadonlyArray<string>, TMetadata>(
+    decider: Decider<State, Command, TEvent, E>,
+    stream: BoundEventStream<TEvent, TStreamIdFields, TMetadata>,
+  ): BoundCommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata>
+
+  // Data-first: EventStream → CommandHandler
   <State, Command, TEvent, E, TStreamIdFields extends ReadonlyArray<string>, TMetadata>(
     decider: Decider<State, Command, TEvent, E>,
     stream: EventStream<TEvent, TStreamIdFields, TMetadata>,
@@ -499,9 +646,15 @@ export const commandHandler: {
   2,
   <State, Command, TEvent, E, TStreamIdFields extends ReadonlyArray<string>, TMetadata>(
     decider: Decider<State, Command, TEvent, E>,
-    stream: EventStream<TEvent, TStreamIdFields, TMetadata>,
-  ): CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata> =>
-    (streamId, command, options) =>
+    stream:
+      | EventStream<TEvent, TStreamIdFields, TMetadata>
+      | BoundEventStream<TEvent, TStreamIdFields, TMetadata>,
+  ) =>
+    (
+      streamId: StreamIdInput<TStreamIdFields>,
+      command: Command,
+      options?: { readonly metadata?: TMetadata } | undefined,
+    ) =>
       Effect.gen(function* () {
         // 1. Read all events
         const events = yield* stream.read(streamId)

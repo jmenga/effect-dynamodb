@@ -13,7 +13,6 @@ import * as Transaction from "../src/Transaction.js"
 // --- Test Models ---
 
 const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
 
 class User extends Schema.Class<User>("User")({
   userId: Schema.String,
@@ -32,7 +31,6 @@ class Order extends Schema.Class<Order>("Order")({
 
 const UserEntity = Entity.make({
   model: User,
-  table: MainTable,
   entityType: "User",
   indexes: {
     primary: {
@@ -49,7 +47,6 @@ const UserEntity = Entity.make({
 
 const OrderEntity = Entity.make({
   model: Order,
-  table: MainTable,
   entityType: "Order",
   indexes: {
     primary: {
@@ -62,6 +59,11 @@ const OrderEntity = Entity.make({
       sk: { field: "gsi1sk", composite: ["orderId"] },
     },
   },
+})
+
+const MainTable = Table.make({
+  schema: AppSchema,
+  entities: { UserEntity, OrderEntity },
 })
 
 // --- Mock DynamoClient ---
@@ -89,6 +91,7 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
     }),
   createTable: () => Effect.die("not used"),
   deleteTable: () => Effect.die("not used"),
+  describeTable: () => Effect.die("not used"),
   scan: () => Effect.die("not used"),
 })
 
@@ -641,7 +644,6 @@ describe("Transaction", () => {
 
         const SparseEntity = Entity.make({
           model: SparseItem,
-          table: MainTable,
           entityType: "SparseItem",
           indexes: {
             primary: {
@@ -655,6 +657,7 @@ describe("Transaction", () => {
             },
           },
         })
+        SparseEntity._configure(AppSchema, MainTable.Tag)
 
         mockTransactWriteItems.mockResolvedValueOnce({})
 

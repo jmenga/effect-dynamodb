@@ -140,6 +140,7 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
   transactGetItems: () => Effect.die("not used"),
   createTable: () => Effect.die("not used"),
   deleteTable: () => Effect.die("not used"),
+  describeTable: () => Effect.die("not used"),
 })
 
 const TestTableConfig = EventsTable.layer({ name: "events-table" })
@@ -691,6 +692,153 @@ describe("EventStore", () => {
   })
 
   // -------------------------------------------------------------------------
+  // bind
+  // -------------------------------------------------------------------------
+
+  describe("bind", () => {
+    it.effect("returns a BoundEventStream with R = never on all operations", () =>
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(MatchEvents)
+
+        // Verify structural properties
+        expect(bound.streamName).toBe("Match")
+        expect(bound.eventSchema).toBeDefined()
+        expect(typeof bound.append).toBe("function")
+        expect(typeof bound.read).toBe("function")
+        expect(typeof bound.readFrom).toBe("function")
+        expect(typeof bound.currentVersion).toBe("function")
+        expect(typeof bound.query.events).toBe("function")
+        expect(typeof bound.provide).toBe("function")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("bound append works without providing layers again", () =>
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(MatchEvents)
+
+        mockTransactWriteItems.mockResolvedValue({})
+
+        // This call has R = never — no need to provide DynamoClient | TableConfig
+        const result = yield* bound.append(
+          { matchId: "m-1" },
+          [new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" })],
+          0,
+        )
+
+        expect(result.version).toBe(1)
+        expect(result.events).toHaveLength(1)
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("bound read works without providing layers again", () =>
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(MatchEvents)
+
+        mockQuery.mockResolvedValue({
+          Items: [
+            makeEventItem("m-1", 1, "MatchStarted", {
+              venue: "MCG",
+              homeTeam: "AUS",
+              awayTeam: "ENG",
+            }),
+          ],
+        })
+
+        const events = yield* bound.read({ matchId: "m-1" })
+
+        expect(events).toHaveLength(1)
+        expect(events[0]!.version).toBe(1)
+        expect(events[0]!.data).toBeInstanceOf(MatchStarted)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("bound readFrom works without providing layers again", () =>
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(MatchEvents)
+
+        mockQuery.mockResolvedValue({
+          Items: [
+            makeEventItem("m-1", 3, "InningsCompleted", { innings: 2, runs: 180, wickets: 10 }),
+          ],
+        })
+
+        const events = yield* bound.readFrom({ matchId: "m-1" }, 2)
+
+        expect(events).toHaveLength(1)
+        expect(events[0]!.version).toBe(3)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("bound currentVersion works without providing layers again", () =>
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(MatchEvents)
+
+        mockQuery.mockResolvedValue({
+          Items: [
+            makeEventItem("m-1", 5, "InningsCompleted", { innings: 2, runs: 180, wickets: 10 }),
+          ],
+        })
+
+        const version = yield* bound.currentVersion({ matchId: "m-1" })
+
+        expect(version).toBe(5)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("bound query.events returns a Query", () =>
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(MatchEvents)
+
+        const q = bound.query.events({ matchId: "m-1" })
+        expect(Query.isQuery(q)).toBe(true)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("bound provide wraps arbitrary effects", () =>
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(MatchEvents)
+
+        // Use provide to wrap the unbound stream's read operation
+        mockQuery.mockResolvedValue({
+          Items: [
+            makeEventItem("m-1", 1, "MatchStarted", {
+              venue: "MCG",
+              homeTeam: "AUS",
+              awayTeam: "ENG",
+            }),
+          ],
+        })
+
+        const events = yield* bound.provide(MatchEvents.read({ matchId: "m-1" }))
+
+        expect(events).toHaveLength(1)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("commandHandler works with BoundEventStream", () =>
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(MatchEvents)
+
+        // commandHandler with BoundEventStream produces R = never
+        const handleMatch = EventStore.commandHandler(matchDecider, bound)
+
+        mockQuery.mockResolvedValueOnce({ Items: [] })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        const result = yield* handleMatch(
+          { matchId: "m-1" },
+          { _tag: "StartMatch", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
+        )
+
+        expect(result.state.status).toBe("in-progress")
+        expect(result.version).toBe(1)
+        expect(result.events).toHaveLength(1)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  // -------------------------------------------------------------------------
   // DynamoDB item structure verification
   // -------------------------------------------------------------------------
 
@@ -744,7 +892,7 @@ describe("EventStore", () => {
         const item = fromAttributeMap(call.TransactItems[0].Put.Item)
 
         // PK should include both composites
-        expect(item.pk).toBe("$cricket#v1#team#L-1#T-5")
+        expect(item.pk).toBe("$cricket#v1#team#l-1#t-5")
         // streamId should join composites with #
         expect(item.streamId).toBe("L-1#T-5")
       }).pipe(Effect.provide(TestLayer)),

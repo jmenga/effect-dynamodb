@@ -191,6 +191,9 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
       try: () => mockTransactGetItems(input),
       catch: (e) => new DynamoError({ operation: "TransactGetItems", cause: e }),
     }),
+  createTable: () => Effect.die("not used"),
+  deleteTable: () => Effect.die("not used"),
+  describeTable: () => Effect.die("not used"),
 } as any)
 
 const TestTableConfig = MainTable.layer({ name: "geo-test-table" })
@@ -202,7 +205,7 @@ const TestLayer = Layer.merge(TestDynamoClient, TestTableConfig)
 
 const seedVehicle = (input: Entity.Input<typeof Vehicles>) =>
   Effect.gen(function* () {
-    yield* VehicleGeo.put(input)
+    yield* VehicleGeo.put(input).asEffect()
   }).pipe(Effect.provide(TestLayer))
 
 // ---------------------------------------------------------------------------
@@ -465,5 +468,122 @@ describe("GeoSearch", () => {
 
     // The parentCell should be the parent at resolution 3
     expect(h3.cellToParent(enriched.cell!, 3)).toBe(enriched.parentCell)
+  })
+
+  // -------------------------------------------------------------------------
+  // GeoIndex.bind tests
+  // -------------------------------------------------------------------------
+
+  describe("GeoIndex.bind", () => {
+    it("returns a BoundGeoIndex with put, nearby, enrich, and provide", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const bound = yield* GeoIndex.bind(VehicleGeo)
+          expect(typeof bound.put).toBe("function")
+          expect(typeof bound.nearby).toBe("function")
+          expect(typeof bound.enrich).toBe("function")
+          expect(typeof bound.provide).toBe("function")
+        }).pipe(Effect.provide(TestLayer)),
+      )
+    })
+
+    it("bound put writes item with geo enrichment", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const bound = yield* GeoIndex.bind(VehicleGeo)
+          yield* bound.put({
+            vehicleId: "v-bind-put",
+            latitude: SF_CENTER.latitude,
+            longitude: SF_CENTER.longitude,
+            timestamp: NOW,
+          })
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      // Verify put was called
+      expect(mockPutItem).toHaveBeenCalled()
+
+      // Verify geo fields were enriched in the stored item
+      const lastCall = mockPutItem.mock.calls[mockPutItem.mock.calls.length - 1]![0]
+      const item = lastCall.Item as Record<string, AttributeValue>
+      expect(item.cell?.S).toBeDefined()
+      expect(item.parentCell?.S).toBeDefined()
+      expect(item.timePartition?.S).toBeDefined()
+    })
+
+    it("bound nearby searches with R = never", async () => {
+      // Seed a vehicle first
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const bound = yield* GeoIndex.bind(VehicleGeo)
+          yield* bound.put({
+            vehicleId: "v-bind-nearby",
+            latitude: POINT_1KM.latitude,
+            longitude: POINT_1KM.longitude,
+            timestamp: NOW,
+          })
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      // Search using bound nearby
+      const results = await Effect.runPromise(
+        Effect.gen(function* () {
+          const bound = yield* GeoIndex.bind(VehicleGeo)
+          return yield* bound.nearby({
+            center: SF_CENTER,
+            radius: 5000,
+            unit: "m",
+            timeWindow: { start: NOW - 60 * 60 * 1000, end: NOW + 1000 },
+          })
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      // Results should have correct structure
+      for (const r of results) {
+        expect(r.item).toBeDefined()
+        expect(typeof r.distance).toBe("number")
+      }
+    })
+
+    it("bound enrich is the same as unbound enrich", () => {
+      // enrich is pure — no need to provide layers
+      const input: Entity.Input<typeof Vehicles> = {
+        vehicleId: "v-bind-enrich",
+        latitude: SF_CENTER.latitude,
+        longitude: SF_CENTER.longitude,
+        timestamp: NOW,
+      }
+
+      // We need to bind to test, but enrich should produce same result
+      const unboundEnriched = VehicleGeo.enrich(input)
+
+      Effect.runPromise(
+        Effect.gen(function* () {
+          const bound = yield* GeoIndex.bind(VehicleGeo)
+          const boundEnriched = bound.enrich(input)
+          expect(boundEnriched).toEqual(unboundEnriched)
+        }).pipe(Effect.provide(TestLayer)),
+      )
+    })
+
+    it("bound provide resolves DynamoClient | TableConfig for arbitrary effects", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const bound = yield* GeoIndex.bind(VehicleGeo)
+
+          // Use provide to run an arbitrary effect that needs DynamoClient | TableConfig
+          const result = yield* bound.provide(
+            VehicleGeo.nearby({
+              center: SF_CENTER,
+              radius: 1000,
+              unit: "m",
+              timeWindow: { start: NOW - 60 * 60 * 1000, end: NOW + 1000 },
+            }),
+          )
+
+          expect(Array.isArray(result)).toBe(true)
+        }).pipe(Effect.provide(TestLayer)),
+      )
+    })
   })
 })

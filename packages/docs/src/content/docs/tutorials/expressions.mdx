@@ -1,0 +1,373 @@
+---
+title: "Example: Conditional Writes & Filters"
+description: "Conditional puts, updates, and deletes with Products.condition(), query filter expressions, callback API with PathBuilder, and low-level expression builders"
+---
+
+import { Aside } from "@astrojs/starlight/components"
+
+A product catalog that demonstrates **conditional writes** and **filter expressions** -- the two main ways DynamoDB expressions appear in effect-dynamodb. You will use `Entity.create()` for duplicate prevention, `Products.condition()` for server-side condition checks on put/update/delete, `Products.filter()` for narrowing query and scan results, and the low-level `Expression` builders for inspecting the generated DynamoDB expressions.
+
+**What you'll learn:**
+- `Entity.create()` -- put with automatic `attribute_not_exists` condition
+- `Products.condition()` -- callback API and shorthand on put, update, and delete
+- `Products.filter()` -- callback API and shorthand on queries and scans
+- `Products.select()` -- path-based projections
+- Combining conditions with optimistic locking (`expectedVersion`)
+- `Expression.condition()` and `Expression.update()` low-level builders
+- Error handling with `ConditionalCheckFailed`
+
+<Aside type="tip">
+  For a comprehensive reference of all expression types, operators, and DynamoDB mapping tables, see the [Expressions Guide](/effect-dynamodb/guides/expressions/).
+</Aside>
+
+---
+
+## Step 1: Model
+
+A pure domain model with no DynamoDB concepts:
+
+```typescript title="models.ts"
+import { Schema } from "effect"
+
+class Product extends Schema.Class<Product>("Product")({
+  productId: Schema.String,
+  name: Schema.NonEmptyString,
+  category: Schema.String,
+  price: Schema.Number,
+  stock: Schema.Number,
+}) {}
+```
+
+---
+
+## Step 2: Schema, Table, and Entity
+
+```typescript title="entities.ts"
+import { DynamoSchema, Entity, Table } from "effect-dynamodb"
+
+const AppSchema = DynamoSchema.make({ name: "expr-demo", version: 1 })
+const MainTable = Table.make({ schema: AppSchema })
+
+const Products = Entity.make({
+  model: Product,
+  entityType: "Product",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["productId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    byCategory: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["category"] },
+      sk: { field: "gsi1sk", composite: ["productId"] },
+    },
+  },
+  timestamps: true,
+  versioned: true,
+})
+```
+
+`versioned: true` enables optimistic locking -- every write increments a `version` counter, and `expectedVersion()` can enforce it.
+
+---
+
+## Step 3: Operations
+
+### Entity.create() -- Insert-Only Writes
+
+`Entity.create()` is `put()` with an automatic `attribute_not_exists` condition on the primary key. If the item already exists, it fails with `ConditionalCheckFailed`:
+
+```typescript
+import { Effect } from "effect"
+import { DynamoClient } from "effect-dynamodb"
+
+const { Products: products } = yield* DynamoClient.make(MainTable)
+
+// First create succeeds
+const widget = yield* products.create({
+  productId: "p-1",
+  name: "Widget",
+  category: "electronics",
+  price: 29.99,
+  stock: 100,
+})
+
+// Duplicate create fails with ConditionalCheckFailed
+const result = yield* products
+  .create({
+    productId: "p-1",
+    name: "Widget Duplicate",
+    category: "electronics",
+    price: 19.99,
+    stock: 50,
+  })
+  .pipe(
+    Effect.map(() => "unexpected success"),
+    Effect.catchTag("ConditionalCheckFailed", () =>
+      Effect.succeed("duplicate prevented!"),
+    ),
+  )
+// result → "duplicate prevented!"
+```
+
+BoundEntity methods return `Effect` directly, so you can pipe to `Effect.catchTag` and other combinators.
+
+### Conditional Put
+
+`Products.condition()` adds a server-side `ConditionExpression` to any write operation. The condition is evaluated atomically -- if it fails, the write is rejected with `ConditionalCheckFailed`.
+
+There are two ways to build conditions -- a **callback API** using a type-safe PathBuilder, and a **shorthand** with plain objects:
+
+```typescript
+// Callback API — type-safe, supports nested paths and all operators
+const newProduct = yield* products.put(
+  {
+    productId: "p-5",
+    name: "New Product",
+    category: "electronics",
+    price: 49.99,
+    stock: 10,
+  },
+  Products.condition((t, { notExists }) => notExists(t.productId)),
+)
+
+// Shorthand — plain object, AND-equality
+const newProduct2 = yield* products.put(
+  {
+    productId: "p-6",
+    name: "Another Product",
+    category: "electronics",
+    price: 59.99,
+    stock: 5,
+  },
+  Products.condition({ category: "electronics" }),
+)
+```
+
+### Conditional Delete
+
+Delete an item only when a condition is met. Here we delete only if the product has zero stock:
+
+```typescript
+// Delete only if stock is 0
+const deleteResult = yield* products
+  .delete(
+    { productId: "p-4" },
+    Products.condition((t, { eq }) => eq(t.stock, 0)),
+  )
+  .pipe(
+    Effect.match({
+      onFailure: (e) => `Failed: ${e._tag}`,
+      onSuccess: () => "deleted (stock was 0)",
+    }),
+  )
+
+// Fails when item has stock > 0
+const deleteFail = yield* products
+  .delete(
+    { productId: "p-1" },
+    Products.condition((t, { eq }) => eq(t.stock, 0)),
+  )
+  .pipe(
+    Effect.match({
+      onFailure: (e) => `${e._tag} — item has stock`,
+      onSuccess: () => "deleted",
+    }),
+  )
+// → "ConditionalCheckFailed — item has stock"
+```
+
+### Conditional Update + Optimistic Locking
+
+Combine `Products.condition()` with `expectedVersion()` and `set()`. The user condition is ANDed with the optimistic lock condition:
+
+```typescript
+// Update price only if stock > 0 AND version matches
+const updated = yield* products.update(
+  { productId: "p-1" },
+  Products.set({ price: 24.99 }),
+  Products.expectedVersion(1),
+  Products.condition((t, { gt }) => gt(t.stock, 0)),
+)
+// updated.price → 24.99, updated.version → 2
+```
+
+When the condition fails, you get a `ConditionalCheckFailed` error:
+
+```typescript
+// Fails: stock is 100, not > 1000
+const fail = yield* products
+  .update(
+    { productId: "p-1" },
+    Products.set({ price: 19.99 }),
+    Products.condition((t, { gt }) => gt(t.stock, 1000)),
+  )
+  .pipe(
+    Effect.match({
+      onFailure: (e) => `${e._tag} — stock not > 1000`,
+      onSuccess: () => "updated",
+    }),
+  )
+// → "ConditionalCheckFailed — stock not > 1000"
+```
+
+### Filter Expressions
+
+Filter expressions narrow query and scan results. They are applied server-side after items are read, reducing network transfer (but not read capacity).
+
+`Products.filter()` uses the same callback + shorthand API as `Products.condition()`, applied as a combinator on queries and scans:
+
+```typescript
+// Callback — type-safe with PathBuilder
+const expensive = yield* products.collect(
+  Products.query.byCategory({ category: "electronics" }),
+  Products.filter((t, { gt }) => gt(t.price, 30)),
+)
+
+// Between filter
+const midRange = yield* products.collect(
+  Products.query.byCategory({ category: "electronics" }),
+  Products.filter((t, { between }) => between(t.price, 20, 50)),
+)
+
+// Contains filter — string substring match
+const withWidget = yield* products.collect(
+  Products.scan(),
+  Products.filter((t, { contains }) => contains(t.name, "Widget")),
+)
+
+// Complex filter with OR
+const activeOrPending = yield* products.collect(
+  Products.scan(),
+  Products.filter((t, { or, eq }) =>
+    or(eq(t.category, "electronics"), eq(t.category, "accessories")),
+  ),
+)
+
+// Shorthand — AND-equality
+const electronics = yield* products.collect(
+  Products.scan(),
+  Products.filter({ category: "electronics" }),
+)
+
+// Attribute exists
+const allWithStock = yield* products.collect(
+  Products.scan(),
+  Products.filter((t, { exists }) => exists(t.stock)),
+)
+```
+
+### Projections with `Entity.select()`
+
+Select specific attributes to reduce network transfer:
+
+```typescript
+// Callback — type-safe path selection
+const names = yield* products.collect(
+  Products.scan(),
+  Products.select((t) => [t.name, t.price]),
+)
+// names → [{ name: "Widget", price: 29.99 }, ...]
+
+// String array shorthand
+const names2 = yield* products.collect(
+  Products.scan(),
+  Products.select(["name", "price"]),
+)
+```
+
+### Low-Level Expression Builders
+
+The `Expression` module exposes the raw builders used internally. These are useful for inspecting what DynamoDB expressions are generated:
+
+```typescript
+import { Expression } from "effect-dynamodb"
+
+// Condition expression with multiple clauses (ANDed together)
+const cond = Expression.condition({
+  eq: { status: "active" },
+  gt: { stock: 0 },
+})
+// cond.expression → "#status = :status AND #stock > :stock"
+// cond.names      → { "#status": "status", "#stock": "stock" }
+// cond.values     → { ":status": { S: "active" }, ":stock": { N: "0" } }
+
+// Between + attribute_exists
+const cond2 = Expression.condition({
+  between: { price: [10, 50] },
+  attributeExists: "category",
+})
+
+// Update expression with SET, REMOVE, and ADD clauses
+const upd = Expression.update({
+  set: { name: "New Name", price: 39.99 },
+  remove: ["description"],
+  add: { viewCount: 1 },
+})
+// upd.expression → "SET #name = :name, #price = :price REMOVE #description ADD #viewCount :viewCount"
+```
+
+---
+
+## Running the Example
+
+The complete runnable example is at [`examples/expressions.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/expressions.ts) in the repository.
+
+Start DynamoDB Local:
+
+```bash
+docker run -d -p 8000:8000 amazon/dynamodb-local
+```
+
+Run the example:
+
+```bash
+npx tsx examples/expressions.ts
+```
+
+### Layer Setup
+
+```typescript title="main.ts"
+import { Effect, Layer } from "effect"
+import { DynamoClient } from "effect-dynamodb"
+
+const AppLayer = Layer.mergeAll(
+  DynamoClient.layer({
+    region: "us-east-1",
+    endpoint: "http://localhost:8000",
+    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  }),
+  MainTable.layer({ name: "expr-demo-table" }),
+)
+
+const main = program.pipe(Effect.provide(AppLayer))
+
+Effect.runPromise(main).then(
+  () => console.log("Done."),
+  (err) => console.error("Failed:", err),
+)
+```
+
+---
+
+## Key Takeaways
+
+| Concept | How it's used |
+|---------|---------------|
+| **Entity.create()** | `put()` + automatic `attribute_not_exists` -- prevents duplicates |
+| **Products.condition()** | Callback: `(t, { eq }) => eq(t.status, "active")` -- type-safe, nested paths |
+| **Products.condition()** | Shorthand: `{ status: "active" }` -- simple AND-equality |
+| **Products.filter()** | Callback: `(t, { gt }) => gt(t.price, 30)` or shorthand: `{ status: "active" }` |
+| **Products.select()** | Path-based projection: `(t) => [t.name, t.price]` |
+| **expectedVersion()** | Optimistic locking -- user conditions are ANDed with version check |
+| **ConditionalCheckFailed** | Tagged error returned when any condition fails -- use `catchTag` to handle |
+| **Expression.condition()** | Low-level builder for inspecting generated ConditionExpression strings |
+| **Expression.update()** | Low-level builder for SET, REMOVE, ADD, DELETE update expressions |
+
+## What's Next?
+
+- [Expressions Guide](/effect-dynamodb/guides/expressions/) -- Comprehensive reference with DynamoDB mapping tables, all operators, and PathBuilder
+- [Example: Scan Operations](/effect-dynamodb/tutorials/scan/) -- Full-table scans with filters, limits, and entity-type isolation
+- [Example: Projections](/effect-dynamodb/tutorials/projections/) -- Selective attribute retrieval with ProjectionExpression
+- [Queries Guide](/effect-dynamodb/guides/queries/) -- Deep dive into query patterns, pagination, and sort key conditions
+- [Data Integrity Guide](/effect-dynamodb/guides/data-integrity/) -- Optimistic locking, conditional writes, and unique constraints

@@ -1,0 +1,20 @@
+---
+title: Playground
+description: Interactive explorer for effect-dynamodb key composition and query parameters
+---
+
+import Playground from "../../components/playground/Playground"
+
+Explore how effect-dynamodb composes DynamoDB keys and generates query parameters. Select a scenario, adjust the schema config and entity attributes, and see the generated keys and API parameters update in real-time.
+
+<Playground client:load />
+
+## How It Works
+
+The playground demonstrates the **key composition** engine at the heart of effect-dynamodb:
+
+1. **Schema prefix** — Every key starts with `$<schema>#v<version>` to namespace ORM-managed keys
+2. **Entity type** — Identifies the entity within the single-table design
+3. **Composite attributes** — Your domain values appended to the key in declaration order
+
+Keys are composed from the `indexes` config on your Entity declaration. The playground runs the same pure functions as the library — `DynamoSchema.composeKey`, `KeyComposer.composePk`, `KeyComposer.composeSk` — directly in your browser.

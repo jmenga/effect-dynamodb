@@ -12,6 +12,8 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { Effect, Function, Option, Pipeable, Stream } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import type { ValidationError } from "./Errors.js"
+import { compileExpr, type Expr } from "./internal/Expr.js"
+import { compilePath } from "./internal/PathBuilder.js"
 import { fromAttributeMap, toAttributeValue } from "./Marshaller.js"
 import * as Projection from "./Projection.js"
 
@@ -33,40 +35,6 @@ export type SortKeyCondition =
   | { readonly beginsWith: string }
 
 // ---------------------------------------------------------------------------
-// Filter condition types
-// ---------------------------------------------------------------------------
-
-/**
- * Filter operator for rich filter expressions.
- * Each operator maps to a DynamoDB FilterExpression function or comparison.
- */
-export type FilterOperator =
-  | { readonly contains: string }
-  | { readonly beginsWith: string }
-  | { readonly between: readonly [unknown, unknown] }
-  | { readonly gt: unknown }
-  | { readonly gte: unknown }
-  | { readonly lt: unknown }
-  | { readonly lte: unknown }
-  | { readonly ne: unknown }
-  | { readonly exists: true }
-  | { readonly notExists: true }
-
-/**
- * A filter value is either a plain value (equality) or a filter operator.
- * Plain values (string, number, boolean, null) produce `#attr = :val` expressions.
- * Operator objects produce the corresponding DynamoDB expression.
- */
-export type FilterValue = string | number | boolean | null | FilterOperator
-
-/**
- * Filter conditions applied as FilterExpression. Each key is an attribute name,
- * each value is either a plain value (equality) or a {@link FilterOperator}.
- * Multiple filters are ANDed together.
- */
-export type FilterCondition = Record<string, FilterValue>
-
-// ---------------------------------------------------------------------------
 // Query internal state
 // ---------------------------------------------------------------------------
 
@@ -80,7 +48,7 @@ interface QueryState {
     readonly field: string
     readonly condition: SortKeyCondition
   }>
-  readonly filterConditions: ReadonlyArray<FilterCondition>
+  readonly exprFilters: ReadonlyArray<Expr>
   readonly entityTypes: ReadonlyArray<string>
   readonly limitValue: number | undefined
   readonly maxPagesValue: number | undefined
@@ -90,6 +58,7 @@ interface QueryState {
   readonly exclusiveStartKey: Record<string, AttributeValue> | undefined
   readonly isScan: boolean
   readonly projection: ReadonlyArray<string> | undefined
+  readonly projectionPaths: ReadonlyArray<ReadonlyArray<string | number>> | undefined
   readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<unknown, ValidationError>
   /** Optional effect to resolve table name at execution time (for deferred resolution) */
   readonly resolveTableName: Effect.Effect<string, never, any> | undefined
@@ -156,7 +125,7 @@ export const make = <A>(config: {
     pkValue: config.pkValue,
     skField: config.skField,
     skConditions: [],
-    filterConditions: [],
+    exprFilters: [],
     entityTypes: config.entityTypes,
     limitValue: undefined,
     maxPagesValue: undefined,
@@ -166,6 +135,7 @@ export const make = <A>(config: {
     exclusiveStartKey: undefined,
     isScan: false,
     projection: undefined,
+    projectionPaths: undefined,
     decoder: config.decoder as (
       raw: Record<string, unknown>,
     ) => Effect.Effect<unknown, ValidationError>,
@@ -191,7 +161,7 @@ export const makeScan = <A>(config: {
     pkValue: "",
     skField: undefined,
     skConditions: [],
-    filterConditions: [],
+    exprFilters: [],
     entityTypes: config.entityTypes,
     limitValue: undefined,
     maxPagesValue: undefined,
@@ -201,6 +171,7 @@ export const makeScan = <A>(config: {
     exclusiveStartKey: undefined,
     isScan: true,
     projection: undefined,
+    projectionPaths: undefined,
     decoder: config.decoder as (
       raw: Record<string, unknown>,
     ) => Effect.Effect<unknown, ValidationError>,
@@ -234,22 +205,6 @@ export const where: {
     skConditions: [{ field: state.skField, condition }],
   })
 })
-
-/**
- * Add filter expression conditions.
- * Multiple filter calls are ANDed together.
- */
-export const filter: {
-  (conditions: FilterCondition): <A>(self: Query<A>) => Query<A>
-  <A>(self: Query<A>, conditions: FilterCondition): Query<A>
-} = Function.dual(
-  2,
-  <A>(self: Query<A>, conditions: FilterCondition): Query<A> =>
-    new QueryImpl<A>({
-      ...self._state,
-      filterConditions: [...self._state.filterConditions, conditions],
-    }),
-)
 
 /**
  * Set the maximum number of items per DynamoDB page.
@@ -355,6 +310,47 @@ export const select: {
     }),
 )
 
+/**
+ * Add an Expr-based filter expression to the query.
+ * Multiple filterExpr calls are ANDed together.
+ */
+export const filterExpr: {
+  (expr: Expr): <A>(self: Query<A>) => Query<A>
+  <A>(self: Query<A>, expr: Expr): Query<A>
+} = Function.dual(
+  2,
+  <A>(self: Query<A>, expr: Expr): Query<A> =>
+    new QueryImpl<A>({
+      ...self._state,
+      exprFilters: [...self._state.exprFilters, expr],
+    }),
+)
+
+/**
+ * Apply path-based projections. Compiles path segments to ProjectionExpression.
+ * When projection is active, items are returned as raw `Record<string, unknown>`.
+ */
+export const selectPaths: {
+  (
+    paths: ReadonlyArray<ReadonlyArray<string | number>>,
+  ): <A>(self: Query<A>) => Query<Record<string, unknown>>
+  <A>(
+    self: Query<A>,
+    paths: ReadonlyArray<ReadonlyArray<string | number>>,
+  ): Query<Record<string, unknown>>
+} = Function.dual(
+  2,
+  <A>(
+    self: Query<A>,
+    paths: ReadonlyArray<ReadonlyArray<string | number>>,
+  ): Query<Record<string, unknown>> =>
+    new QueryImpl<Record<string, unknown>>({
+      ...self._state,
+      projectionPaths: paths,
+      decoder: (raw) => Effect.succeed(raw),
+    }),
+)
+
 // ---------------------------------------------------------------------------
 // Internal: shared filter clause builder (entity type + user filters)
 // ---------------------------------------------------------------------------
@@ -374,141 +370,126 @@ const buildFilterClauses = (state: QueryState) => {
     })
   }
 
-  // User filter conditions
-  let filterCounter = 0
-  for (const fc of state.filterConditions) {
-    for (const [attr, val] of Object.entries(fc)) {
-      const nameKey = `#f${filterCounter}`
-      const valKey = `:f${filterCounter}`
-      names[nameKey] = attr
-
-      if (val !== null && typeof val === "object") {
-        if ("contains" in val) {
-          values[valKey] = toAttributeValue(val.contains)
-          filterClauses.push(`contains(${nameKey}, ${valKey})`)
-        } else if ("beginsWith" in val) {
-          values[valKey] = toAttributeValue(val.beginsWith)
-          filterClauses.push(`begins_with(${nameKey}, ${valKey})`)
-        } else if ("between" in val) {
-          const valKey2 = `:f${filterCounter}b`
-          values[valKey] = toAttributeValue(val.between[0])
-          values[valKey2] = toAttributeValue(val.between[1])
-          filterClauses.push(`${nameKey} BETWEEN ${valKey} AND ${valKey2}`)
-        } else if ("gt" in val) {
-          values[valKey] = toAttributeValue(val.gt)
-          filterClauses.push(`${nameKey} > ${valKey}`)
-        } else if ("gte" in val) {
-          values[valKey] = toAttributeValue(val.gte)
-          filterClauses.push(`${nameKey} >= ${valKey}`)
-        } else if ("lt" in val) {
-          values[valKey] = toAttributeValue(val.lt)
-          filterClauses.push(`${nameKey} < ${valKey}`)
-        } else if ("lte" in val) {
-          values[valKey] = toAttributeValue(val.lte)
-          filterClauses.push(`${nameKey} <= ${valKey}`)
-        } else if ("ne" in val) {
-          values[valKey] = toAttributeValue(val.ne)
-          filterClauses.push(`${nameKey} <> ${valKey}`)
-        } else if ("exists" in val) {
-          filterClauses.push(`attribute_exists(${nameKey})`)
-        } else if ("notExists" in val) {
-          filterClauses.push(`attribute_not_exists(${nameKey})`)
-        }
-      } else {
-        values[valKey] = toAttributeValue(val)
-        filterClauses.push(`${nameKey} = ${valKey}`)
-      }
-      filterCounter++
-    }
+  // Expr-based filters (compiled from Entity.filter() callback/shorthand API)
+  for (const expr of state.exprFilters) {
+    const compiled = compileExpr(expr)
+    filterClauses.push(compiled.expression)
+    Object.assign(names, compiled.names)
+    Object.assign(values, compiled.values)
   }
 
   return { filterClauses, names, values }
 }
 
 // ---------------------------------------------------------------------------
-// Internal: build DynamoDB query input from state
+// Internal: build projection expression from state
 // ---------------------------------------------------------------------------
 
-const buildQueryInput = (state: QueryState) => {
-  const names: Record<string, string> = { "#pk": state.pkField }
-  const values: Record<string, AttributeValue> = { ":pk": toAttributeValue(state.pkValue) }
-  let keyCondition = "#pk = :pk"
+const buildProjection = (state: QueryState, names: Record<string, string>): string | undefined => {
+  if (state.projectionPaths && state.projectionPaths.length > 0) {
+    const counter = { value: 0 }
+    const projParts: Array<string> = []
+    for (const segments of state.projectionPaths) {
+      projParts.push(compilePath(segments, names, "proj", counter))
+    }
+    return projParts.join(", ")
+  }
+  if (state.projection && state.projection.length > 0) {
+    const proj = Projection.projection(state.projection)
+    Object.assign(names, proj.names)
+    return proj.expression
+  }
+  return undefined
+}
 
-  // Sort key condition
-  if (state.skConditions.length > 0) {
-    const skCond = state.skConditions[0]!
-    names["#sk"] = skCond.field
-    const cond = skCond.condition
-    if ("eq" in cond) {
-      keyCondition += " AND #sk = :sk"
-      values[":sk"] = toAttributeValue(cond.eq)
-    } else if ("lt" in cond) {
-      keyCondition += " AND #sk < :sk"
-      values[":sk"] = toAttributeValue(cond.lt)
-    } else if ("lte" in cond) {
-      keyCondition += " AND #sk <= :sk"
-      values[":sk"] = toAttributeValue(cond.lte)
-    } else if ("gt" in cond) {
-      keyCondition += " AND #sk > :sk"
-      values[":sk"] = toAttributeValue(cond.gt)
-    } else if ("gte" in cond) {
-      keyCondition += " AND #sk >= :sk"
-      values[":sk"] = toAttributeValue(cond.gte)
-    } else if ("between" in cond) {
-      keyCondition += " AND #sk BETWEEN :sk1 AND :sk2"
-      values[":sk1"] = toAttributeValue(cond.between[0])
-      values[":sk2"] = toAttributeValue(cond.between[1])
-    } else if ("beginsWith" in cond) {
-      keyCondition += " AND begins_with(#sk, :sk)"
-      values[":sk"] = toAttributeValue(cond.beginsWith)
+// ---------------------------------------------------------------------------
+// Internal: build DynamoDB command input from state
+// ---------------------------------------------------------------------------
+
+interface DynamoCommandInput {
+  readonly KeyConditionExpression?: string | undefined
+  readonly FilterExpression?: string | undefined
+  readonly ProjectionExpression?: string | undefined
+  readonly ExpressionAttributeNames?: Record<string, string> | undefined
+  readonly ExpressionAttributeValues?: Record<string, AttributeValue> | undefined
+  readonly ConsistentRead?: boolean | undefined
+}
+
+const buildCommandInput = (state: QueryState): DynamoCommandInput => {
+  const fc = buildFilterClauses(state)
+  const names = { ...fc.names }
+  const values = { ...fc.values }
+  let keyCondition: string | undefined
+
+  // Key condition (query mode only)
+  if (!state.isScan) {
+    names["#pk"] = state.pkField
+    values[":pk"] = toAttributeValue(state.pkValue)
+    keyCondition = "#pk = :pk"
+
+    if (state.skConditions.length > 0) {
+      const skCond = state.skConditions[0]!
+      names["#sk"] = skCond.field
+      const cond = skCond.condition
+      if ("eq" in cond) {
+        keyCondition += " AND #sk = :sk"
+        values[":sk"] = toAttributeValue(cond.eq)
+      } else if ("lt" in cond) {
+        keyCondition += " AND #sk < :sk"
+        values[":sk"] = toAttributeValue(cond.lt)
+      } else if ("lte" in cond) {
+        keyCondition += " AND #sk <= :sk"
+        values[":sk"] = toAttributeValue(cond.lte)
+      } else if ("gt" in cond) {
+        keyCondition += " AND #sk > :sk"
+        values[":sk"] = toAttributeValue(cond.gt)
+      } else if ("gte" in cond) {
+        keyCondition += " AND #sk >= :sk"
+        values[":sk"] = toAttributeValue(cond.gte)
+      } else if ("between" in cond) {
+        keyCondition += " AND #sk BETWEEN :sk1 AND :sk2"
+        values[":sk1"] = toAttributeValue(cond.between[0])
+        values[":sk2"] = toAttributeValue(cond.between[1])
+      } else if ("beginsWith" in cond) {
+        keyCondition += " AND begins_with(#sk, :sk)"
+        values[":sk"] = toAttributeValue(cond.beginsWith)
+      }
     }
   }
 
-  // Merge shared filter clauses (entity type + user filters)
-  const fc = buildFilterClauses(state)
-  Object.assign(names, fc.names)
-  Object.assign(values, fc.values)
-
-  // Projection
-  let projectionExpression: string | undefined
-  if (state.projection && state.projection.length > 0) {
-    const proj = Projection.projection(state.projection)
-    projectionExpression = proj.expression
-    Object.assign(names, proj.names)
-  }
+  const projectionExpression = buildProjection(state, names)
 
   return {
     KeyConditionExpression: keyCondition,
     FilterExpression: fc.filterClauses.length > 0 ? fc.filterClauses.join(" AND ") : undefined,
     ProjectionExpression: projectionExpression,
-    ExpressionAttributeNames: names,
-    ExpressionAttributeValues: values,
+    ExpressionAttributeNames: Object.keys(names).length > 0 ? names : undefined,
+    ExpressionAttributeValues: Object.keys(values).length > 0 ? values : undefined,
     ConsistentRead: state.consistentRead || undefined,
   }
 }
 
-// ---------------------------------------------------------------------------
-// Internal: build DynamoDB scan input from state
-// ---------------------------------------------------------------------------
-
-const buildScanInput = (state: QueryState) => {
-  const fc = buildFilterClauses(state)
-
-  // Projection
-  let projectionExpression: string | undefined
-  const names = { ...fc.names }
-  if (state.projection && state.projection.length > 0) {
-    const proj = Projection.projection(state.projection)
-    projectionExpression = proj.expression
-    Object.assign(names, proj.names)
-  }
-
+/**
+ * @internal Build the full DynamoDB command parameters from state and table name.
+ */
+const buildDynamoCommand = (
+  state: QueryState,
+  tableName: string,
+  overrides?: Record<string, unknown>,
+) => {
+  const input = buildCommandInput(state)
   return {
-    FilterExpression: fc.filterClauses.length > 0 ? fc.filterClauses.join(" AND ") : undefined,
-    ProjectionExpression: projectionExpression,
-    ExpressionAttributeNames: Object.keys(names).length > 0 ? names : undefined,
-    ExpressionAttributeValues: Object.keys(fc.values).length > 0 ? fc.values : undefined,
-    ConsistentRead: state.consistentRead || undefined,
+    TableName: tableName,
+    IndexName: state.indexName,
+    KeyConditionExpression: input.KeyConditionExpression,
+    FilterExpression: input.FilterExpression,
+    ProjectionExpression: input.ProjectionExpression,
+    ExpressionAttributeNames: input.ExpressionAttributeNames,
+    ExpressionAttributeValues: input.ExpressionAttributeValues,
+    ConsistentRead: input.ConsistentRead,
+    Limit: state.limitValue,
+    ScanIndexForward: state.isScan ? undefined : state.scanForward,
+    ...overrides,
   }
 }
 
@@ -560,37 +541,10 @@ export const execute = <A>(
     const state = self._state
     const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName
 
-    const result = state.isScan
-      ? yield* (() => {
-          const scanInput = buildScanInput(state)
-          return client.scan({
-            TableName: tableName,
-            IndexName: state.indexName,
-            FilterExpression: scanInput.FilterExpression,
-            ProjectionExpression: scanInput.ProjectionExpression,
-            ExpressionAttributeNames: scanInput.ExpressionAttributeNames,
-            ExpressionAttributeValues: scanInput.ExpressionAttributeValues,
-            ExclusiveStartKey: state.exclusiveStartKey,
-            Limit: state.limitValue,
-            ConsistentRead: scanInput.ConsistentRead,
-          })
-        })()
-      : yield* (() => {
-          const queryInput = buildQueryInput(state)
-          return client.query({
-            TableName: tableName,
-            IndexName: state.indexName,
-            KeyConditionExpression: queryInput.KeyConditionExpression,
-            FilterExpression: queryInput.FilterExpression,
-            ProjectionExpression: queryInput.ProjectionExpression,
-            ExpressionAttributeNames: queryInput.ExpressionAttributeNames,
-            ExpressionAttributeValues: queryInput.ExpressionAttributeValues,
-            ExclusiveStartKey: state.exclusiveStartKey,
-            Limit: state.limitValue,
-            ScanIndexForward: state.scanForward,
-            ConsistentRead: queryInput.ConsistentRead,
-          })
-        })()
+    const cmd = buildDynamoCommand(state, tableName, {
+      ExclusiveStartKey: state.exclusiveStartKey,
+    })
+    const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
 
     const rawItems = (result.Items ?? []).map((item) => fromAttributeMap(item))
     const items = yield* Effect.forEach(
@@ -627,8 +581,6 @@ const paginateInternal = <A>(
   Effect.gen(function* () {
     const client = yield* DynamoClient
     const state = self._state
-
-    // Resolve table name — either from state or via provided effect
     const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName
 
     let pageCount = 0
@@ -637,37 +589,8 @@ const paginateInternal = <A>(
       (exclusiveStartKey: Record<string, AttributeValue> | undefined) =>
         Effect.gen(function* () {
           pageCount++
-          const result = state.isScan
-            ? yield* (() => {
-                const scanInput = buildScanInput(state)
-                return client.scan({
-                  TableName: tableName,
-                  IndexName: state.indexName,
-                  FilterExpression: scanInput.FilterExpression,
-                  ProjectionExpression: scanInput.ProjectionExpression,
-                  ExpressionAttributeNames: scanInput.ExpressionAttributeNames,
-                  ExpressionAttributeValues: scanInput.ExpressionAttributeValues,
-                  ExclusiveStartKey: exclusiveStartKey,
-                  Limit: state.limitValue,
-                  ConsistentRead: scanInput.ConsistentRead,
-                })
-              })()
-            : yield* (() => {
-                const queryInput = buildQueryInput(state)
-                return client.query({
-                  TableName: tableName,
-                  IndexName: state.indexName,
-                  KeyConditionExpression: queryInput.KeyConditionExpression,
-                  FilterExpression: queryInput.FilterExpression,
-                  ProjectionExpression: queryInput.ProjectionExpression,
-                  ExpressionAttributeNames: queryInput.ExpressionAttributeNames,
-                  ExpressionAttributeValues: queryInput.ExpressionAttributeValues,
-                  ExclusiveStartKey: exclusiveStartKey,
-                  Limit: state.limitValue,
-                  ScanIndexForward: state.scanForward,
-                  ConsistentRead: queryInput.ConsistentRead,
-                })
-              })()
+          const cmd = buildDynamoCommand(state, tableName, { ExclusiveStartKey: exclusiveStartKey })
+          const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
 
           const rawItems = (result.Items ?? []).map((item) => fromAttributeMap(item))
           const decoded = yield* Effect.forEach(
@@ -703,37 +626,11 @@ export const count = <A>(self: Query<A>): Effect.Effect<number, DynamoClientErro
 
     do {
       pageCount++
-      const result = state.isScan
-        ? yield* (() => {
-            const scanInput = buildScanInput(state)
-            return client.scan({
-              TableName: tableName,
-              IndexName: state.indexName,
-              FilterExpression: scanInput.FilterExpression,
-              ExpressionAttributeNames: scanInput.ExpressionAttributeNames,
-              ExpressionAttributeValues: scanInput.ExpressionAttributeValues,
-              ExclusiveStartKey: exclusiveStartKey,
-              Limit: state.limitValue,
-              ConsistentRead: scanInput.ConsistentRead,
-              Select: "COUNT",
-            })
-          })()
-        : yield* (() => {
-            const queryInput = buildQueryInput(state)
-            return client.query({
-              TableName: tableName,
-              IndexName: state.indexName,
-              KeyConditionExpression: queryInput.KeyConditionExpression,
-              FilterExpression: queryInput.FilterExpression,
-              ExpressionAttributeNames: queryInput.ExpressionAttributeNames,
-              ExpressionAttributeValues: queryInput.ExpressionAttributeValues,
-              ExclusiveStartKey: exclusiveStartKey,
-              Limit: state.limitValue,
-              ScanIndexForward: state.scanForward,
-              ConsistentRead: queryInput.ConsistentRead,
-              Select: "COUNT",
-            })
-          })()
+      const cmd = buildDynamoCommand(state, tableName, {
+        ExclusiveStartKey: exclusiveStartKey,
+        Select: "COUNT",
+      })
+      const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
 
       total += result.Count ?? 0
       exclusiveStartKey = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined
@@ -752,34 +649,7 @@ export const asParams = <A>(self: Query<A>): Effect.Effect<Record<string, unknow
   Effect.gen(function* () {
     const state = self._state
     const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName
-
-    if (state.isScan) {
-      const scanInput = buildScanInput(state)
-      return {
-        TableName: tableName,
-        IndexName: state.indexName,
-        FilterExpression: scanInput.FilterExpression,
-        ProjectionExpression: scanInput.ProjectionExpression,
-        ExpressionAttributeNames: scanInput.ExpressionAttributeNames,
-        ExpressionAttributeValues: scanInput.ExpressionAttributeValues,
-        Limit: state.limitValue,
-        ConsistentRead: scanInput.ConsistentRead,
-      }
-    }
-
-    const queryInput = buildQueryInput(state)
-    return {
-      TableName: tableName,
-      IndexName: state.indexName,
-      KeyConditionExpression: queryInput.KeyConditionExpression,
-      FilterExpression: queryInput.FilterExpression,
-      ProjectionExpression: queryInput.ProjectionExpression,
-      ExpressionAttributeNames: queryInput.ExpressionAttributeNames,
-      ExpressionAttributeValues: queryInput.ExpressionAttributeValues,
-      Limit: state.limitValue,
-      ScanIndexForward: state.scanForward,
-      ConsistentRead: queryInput.ConsistentRead,
-    }
+    return buildDynamoCommand(state, tableName)
   })
 
 // ---------------------------------------------------------------------------

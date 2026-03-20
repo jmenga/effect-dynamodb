@@ -9,12 +9,16 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import { Effect, Schema } from "effect"
+import { Effect } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import type { Entity, EntityDelete, EntityGet, EntityPut } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
-import { DynamoError, ValidationError } from "./Errors.js"
-import * as KeyComposer from "./KeyComposer.js"
+import { DynamoError, type ValidationError } from "./Errors.js"
+import {
+  composePrimaryKey,
+  resolveTableNames,
+  validateAndBuildPutItem,
+} from "./internal/TransactableOps.js"
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
 import type { TableConfig } from "./Table.js"
 
@@ -86,14 +90,7 @@ export const get = <const T extends ReadonlyArray<EntityGet<any, any, any, any>>
       return info
     })
 
-    // Resolve table names
-    const tableNames = new Map<Entity, string>()
-    for (const info of infos) {
-      if (!tableNames.has(info.entity)) {
-        const { name } = yield* info.entity.table.Tag
-        tableNames.set(info.entity, name)
-      }
-    }
+    const tableNames = yield* resolveTableNames(infos)
 
     // Build composed keys for each item and track the mapping
     const itemKeys: Array<{
@@ -106,29 +103,13 @@ export const get = <const T extends ReadonlyArray<EntityGet<any, any, any, any>>
 
     for (let i = 0; i < infos.length; i++) {
       const info = infos[i]!
-      const primary = info.entity.indexes.primary!
-      const schema = info.entity.table.schema
       const tableName = tableNames.get(info.entity)!
-      const composedKey = {
-        [primary.pk.field]: KeyComposer.composePk(
-          schema,
-          info.entity.entityType,
-          primary,
-          info.key!,
-        ),
-        [primary.sk.field]: KeyComposer.composeSk(
-          schema,
-          info.entity.entityType,
-          1,
-          primary,
-          info.key!,
-        ),
-      }
+      const composed = composePrimaryKey(info.entity, info.key!)
 
       itemKeys.push({
         tableName,
-        composedKey,
-        marshalledKey: toAttributeMap(composedKey),
+        composedKey: composed,
+        marshalledKey: toAttributeMap(composed),
         entity: info.entity,
         index: i,
       })
@@ -172,17 +153,7 @@ export const get = <const T extends ReadonlyArray<EntityGet<any, any, any, any>>
               })
 
               if (matched) {
-                const recordSchema = matched.entity.schemas.recordSchema as Schema.Codec<any>
-                const decoded = yield* Schema.decodeUnknownEffect(recordSchema)(raw).pipe(
-                  Effect.mapError(
-                    (cause) =>
-                      new ValidationError({
-                        entityType: matched.entity.entityType,
-                        operation: "batchGet",
-                        cause,
-                      }),
-                  ),
-                )
+                const decoded = yield* matched.entity._decodeRecord(raw)
                 results[matched.index] = decoded
               }
             }
@@ -264,64 +235,19 @@ export const write = (
       }
 
       const entity = info.entity
-      const primary = entity.indexes.primary!
-      const schema = entity.table.schema
-      const entityVersion = 1
-
-      // Resolve table name
-      const { name: tableName } = yield* entity.table.Tag
+      const { name: tableName } = yield* entity._tableTag
 
       if (info.opType === "put") {
-        // Validate input
-        const inputSchema = entity.schemas.inputSchema as Schema.Codec<any>
-        const validated = yield* Schema.decodeUnknownEffect(inputSchema)(info.input).pipe(
-          Effect.mapError(
-            (cause) =>
-              new ValidationError({
-                entityType: entity.entityType,
-                operation: "batchWrite.put",
-                cause,
-              }),
-          ),
-        )
-
-        // Build item with keys and system fields
-        const item: Record<string, unknown> = { ...validated }
-        item.__edd_e__ = entity.entityType
-
-        const keys = KeyComposer.composeAllKeys(
-          schema,
-          entity.entityType,
-          entityVersion,
-          entity.indexes,
-          validated,
-        )
-        Object.assign(item, keys)
-
-        const now = new Date().toISOString()
-        if (entity.systemFields.createdAt) item[entity.systemFields.createdAt] = now
-        if (entity.systemFields.updatedAt) item[entity.systemFields.updatedAt] = now
-        if (entity.systemFields.version) item[entity.systemFields.version] = 1
-
+        const marshalledItem = yield* validateAndBuildPutItem(entity, info.input!, "batchWrite.put")
         writeRequests.push({
           tableName,
-          request: { PutRequest: { Item: toAttributeMap(item) } },
+          request: { PutRequest: { Item: marshalledItem } },
         })
       } else if (info.opType === "delete") {
-        const composedKey = {
-          [primary.pk.field]: KeyComposer.composePk(schema, entity.entityType, primary, info.key!),
-          [primary.sk.field]: KeyComposer.composeSk(
-            schema,
-            entity.entityType,
-            entityVersion,
-            primary,
-            info.key!,
-          ),
-        }
-
+        const composed = composePrimaryKey(entity, info.key!)
         writeRequests.push({
           tableName,
-          request: { DeleteRequest: { Key: toAttributeMap(composedKey) } },
+          request: { DeleteRequest: { Key: toAttributeMap(composed) } },
         })
       } else {
         throw new Error(

@@ -135,7 +135,7 @@ describeConnected("GeoSearch (connected)", () => {
         ]
 
         for (const input of inputs) {
-          yield* VehicleGeo.put(input)
+          yield* VehicleGeo.put(input).asEffect()
         }
       }).pipe(provide),
     )
@@ -167,7 +167,7 @@ describeConnected("GeoSearch (connected)", () => {
     await Effect.runPromise(
       Effect.gen(function* () {
         // Item without coordinates — enrichment skips geo fields
-        yield* VehicleGeo.put({ vehicleId: "v-noloc", timestamp })
+        yield* VehicleGeo.put({ vehicleId: "v-noloc", timestamp }).asEffect()
       }).pipe(provide),
     )
 
@@ -205,7 +205,7 @@ describeConnected("GeoSearch (connected)", () => {
           },
         ]
         for (const input of inputs) {
-          yield* VehicleGeo.put(input)
+          yield* VehicleGeo.put(input).asEffect()
         }
       }).pipe(provide),
     )

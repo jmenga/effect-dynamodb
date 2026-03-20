@@ -30,20 +30,23 @@ import * as Table from "../src/Table.js"
 // 1. Pure domain model — no DynamoDB concepts
 // =============================================================================
 
+const StoreCategory = {
+  FoodCoffee: "food/coffee",
+  FoodMeal: "food/meal",
+  Clothing: "clothing",
+  Electronics: "electronics",
+  Department: "department",
+  Misc: "misc",
+} as const
+const StoreCategorySchema = Schema.Literals(Object.values(StoreCategory))
+
 class MallStore extends Schema.Class<MallStore>("MallStore")({
   cityId: Schema.String,
   mallId: Schema.String,
   storeId: Schema.String,
   buildingId: Schema.String,
   unitId: Schema.String,
-  category: Schema.Literals([
-    "food/coffee",
-    "food/meal",
-    "clothing",
-    "electronics",
-    "department",
-    "misc",
-  ]),
+  category: StoreCategorySchema,
   leaseEndDate: Schema.String,
   rent: Schema.String,
   discount: Schema.String.pipe(Schema.withDecodingDefaultKey(() => "0.00")),
@@ -51,11 +54,10 @@ class MallStore extends Schema.Class<MallStore>("MallStore")({
 }) {}
 
 // =============================================================================
-// 2. Schema + Table
+// 2. Schema
 // =============================================================================
 
 const MallSchema = DynamoSchema.make({ name: "mall", version: 1 })
-const MallTable = Table.make({ schema: MallSchema })
 
 // =============================================================================
 // 3. Entity definition — 1 entity, 2 GSIs
@@ -67,7 +69,6 @@ const MallTable = Table.make({ schema: MallSchema })
 
 const MallStores = Entity.make({
   model: MallStore,
-  table: MallTable,
   entityType: "MallStore",
   indexes: {
     primary: {
@@ -89,7 +90,13 @@ const MallStores = Entity.make({
 })
 
 // =============================================================================
-// 4. Seed data
+// 4. Table definition — declare entities as members
+// =============================================================================
+
+const MallTable = Table.make({ schema: MallSchema, entities: { MallStores } })
+
+// =============================================================================
+// 5. Seed data
 // =============================================================================
 
 const stores = {
@@ -169,7 +176,7 @@ const stores = {
 }
 
 // =============================================================================
-// 5. Helpers
+// 6. Helpers
 // =============================================================================
 
 const assert = (condition: boolean, message: string): void => {
@@ -183,22 +190,18 @@ const assertEq = <T>(actual: T, expected: T, label: string): void => {
 }
 
 // =============================================================================
-// 6. Main program — 6 access patterns with assertions
+// 7. Main program — 6 access patterns with assertions
 // =============================================================================
 
 const program = Effect.gen(function* () {
-  const client = yield* DynamoClient
+  const db = yield* DynamoClient.make(MallTable)
 
   // --- Setup: create table ---
-  yield* client.createTable({
-    TableName: "mall-table",
-    BillingMode: "PAY_PER_REQUEST",
-    ...Table.definition(MallTable, [MallStores]),
-  })
+  yield* db.createTable()
 
   // --- Seed data ---
   for (const store of Object.values(stores)) {
-    yield* MallStores.put(store)
+    yield* db.MallStores.put(store)
   }
 
   // -------------------------------------------------------------------------
@@ -206,7 +209,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 1: Get Specific Store (primary key)")
 
-  const coffee = yield* MallStores.get({
+  const coffee = yield* db.MallStores.get({
     cityId: "atlanta",
     mallId: "eastpointe",
     buildingId: "bldg-a",
@@ -224,7 +227,9 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 2: All Stores in a Mall (gsi1)")
 
-  const eastpointeStores = yield* Query.collect(MallStores.query.units({ mallId: "eastpointe" }))
+  const eastpointeStores = yield* db.MallStores.collect(
+    MallStores.query.units({ mallId: "eastpointe" }),
+  )
   assertEq(eastpointeStores.length, 4, "eastpointe has 4 stores")
   const eastpointeIds = eastpointeStores.map((s) => s.storeId).sort()
   assertEq(
@@ -233,7 +238,9 @@ const program = Effect.gen(function* () {
     "eastpointe store IDs",
   )
 
-  const westgateStores = yield* Query.collect(MallStores.query.units({ mallId: "westgate" }))
+  const westgateStores = yield* db.MallStores.collect(
+    MallStores.query.units({ mallId: "westgate" }),
+  )
   assertEq(westgateStores.length, 2, "westgate has 2 stores")
   const westgateIds = westgateStores.map((s) => s.storeId).sort()
   assertEq(westgateIds, ["gifts-galore", "mega-mart"], "westgate store IDs")
@@ -249,9 +256,9 @@ const program = Effect.gen(function* () {
     buildingId: "bldg-a",
   })
 
-  const bldgAStores = yield* MallStores.query
-    .units({ mallId: "eastpointe" })
-    .pipe(Query.where({ beginsWith: bldgAPrefix }), Query.collect)
+  const bldgAStores = yield* db.MallStores.collect(
+    MallStores.query.units({ mallId: "eastpointe" }).pipe(Query.where({ beginsWith: bldgAPrefix })),
+  )
   assertEq(bldgAStores.length, 2, "bldg-a has 2 stores")
   const bldgAIds = bldgAStores.map((s) => s.storeId).sort()
   assertEq(bldgAIds, ["burger-barn", "star-coffee"], "bldg-a store IDs")
@@ -260,9 +267,9 @@ const program = Effect.gen(function* () {
     buildingId: "bldg-b",
   })
 
-  const bldgBStores = yield* MallStores.query
-    .units({ mallId: "eastpointe" })
-    .pipe(Query.where({ beginsWith: bldgBPrefix }), Query.collect)
+  const bldgBStores = yield* db.MallStores.collect(
+    MallStores.query.units({ mallId: "eastpointe" }).pipe(Query.where({ beginsWith: bldgBPrefix })),
+  )
   assertEq(bldgBStores.length, 2, "bldg-b has 2 stores")
   const bldgBIds = bldgBStores.map((s) => s.storeId).sort()
   assertEq(bldgBIds, ["tech-zone", "trendy-threads"], "bldg-b store IDs")
@@ -274,7 +281,9 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 4: Lease Renewals by Date Range (gsi2)")
 
   // All leases for burger-barn
-  const burgerLeases = yield* Query.collect(MallStores.query.leases({ storeId: "burger-barn" }))
+  const burgerLeases = yield* db.MallStores.collect(
+    MallStores.query.leases({ storeId: "burger-barn" }),
+  )
   assertEq(burgerLeases.length, 1, "burger-barn has 1 lease record")
   assertEq(burgerLeases[0]!.leaseEndDate, "2025-06-30", "burger-barn lease end date")
 
@@ -287,16 +296,18 @@ const program = Effect.gen(function* () {
     leaseEndDate: "2025-03-31",
   })
 
-  const starCoffeeQ1 = yield* MallStores.query
-    .leases({ storeId: "star-coffee" })
-    .pipe(Query.where({ between: [q1Lo, q1Hi] }), Query.collect)
+  const starCoffeeQ1 = yield* db.MallStores.collect(
+    MallStores.query
+      .leases({ storeId: "star-coffee" })
+      .pipe(Query.where({ between: [q1Lo, q1Hi] })),
+  )
   assertEq(starCoffeeQ1.length, 1, "star-coffee has 1 lease in Q1 2025")
   assertEq(starCoffeeQ1[0]!.leaseEndDate, "2025-03-31", "star-coffee Q1 lease date")
 
   // Check tech-zone lease (Q3 2025) does NOT appear in Q1 range
-  const techZoneQ1 = yield* MallStores.query
-    .leases({ storeId: "tech-zone" })
-    .pipe(Query.where({ between: [q1Lo, q1Hi] }), Query.collect)
+  const techZoneQ1 = yield* db.MallStores.collect(
+    MallStores.query.leases({ storeId: "tech-zone" }).pipe(Query.where({ between: [q1Lo, q1Hi] })),
+  )
   assertEq(techZoneQ1.length, 0, "tech-zone has no leases in Q1 2025")
 
   // tech-zone lease in Q3 2025
@@ -307,9 +318,9 @@ const program = Effect.gen(function* () {
     leaseEndDate: "2025-09-30",
   })
 
-  const techZoneQ3 = yield* MallStores.query
-    .leases({ storeId: "tech-zone" })
-    .pipe(Query.where({ between: [q3Lo, q3Hi] }), Query.collect)
+  const techZoneQ3 = yield* db.MallStores.collect(
+    MallStores.query.leases({ storeId: "tech-zone" }).pipe(Query.where({ between: [q3Lo, q3Hi] })),
+  )
   assertEq(techZoneQ3.length, 1, "tech-zone has 1 lease in Q3 2025")
   assertEq(techZoneQ3[0]!.leaseEndDate, "2025-09-30", "tech-zone Q3 lease date")
   yield* Console.log("  Q1 star-coffee (1), Q1 tech-zone (0), Q3 tech-zone (1) — OK")
@@ -319,13 +330,14 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 5: Update Store Rent")
 
-  const updated = yield* MallStores.update({
-    cityId: "atlanta",
-    mallId: "eastpointe",
-    buildingId: "bldg-a",
-    storeId: "star-coffee",
-  }).pipe(
-    MallStores.set({
+  const updated = yield* db.MallStores.update(
+    {
+      cityId: "atlanta",
+      mallId: "eastpointe",
+      buildingId: "bldg-a",
+      storeId: "star-coffee",
+    },
+    Entity.set({
       rent: "4000.00",
       discount: "100.00",
     }),
@@ -336,7 +348,7 @@ const program = Effect.gen(function* () {
   assertEq(updated.category, "food/coffee", "update preserves category")
 
   // Verify via get
-  const refetched = yield* MallStores.get({
+  const refetched = yield* db.MallStores.get({
     cityId: "atlanta",
     mallId: "eastpointe",
     buildingId: "bldg-a",
@@ -351,39 +363,37 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 6: Delete Store")
 
-  yield* MallStores.delete({
+  yield* db.MallStores.delete({
     cityId: "atlanta",
     mallId: "westgate",
     buildingId: "bldg-c",
     storeId: "gifts-galore",
   })
 
-  const deleted = yield* MallStores.get({
+  const deleted = yield* db.MallStores.get({
     cityId: "atlanta",
     mallId: "westgate",
     buildingId: "bldg-c",
     storeId: "gifts-galore",
-  })
-    .asEffect()
-    .pipe(
-      Effect.map(() => false),
-      Effect.catchTag("ItemNotFound", () => Effect.succeed(true)),
-    )
+  }).pipe(
+    Effect.map(() => false),
+    Effect.catchTag("ItemNotFound", () => Effect.succeed(true)),
+  )
   assert(deleted, "delete removes gifts-galore")
 
   // Verify westgate now has 1 store
-  const westgateAfter = yield* Query.collect(MallStores.query.units({ mallId: "westgate" }))
+  const westgateAfter = yield* db.MallStores.collect(MallStores.query.units({ mallId: "westgate" }))
   assertEq(westgateAfter.length, 1, "westgate has 1 store after delete")
   assertEq(westgateAfter[0]!.storeId, "mega-mart", "remaining westgate store is mega-mart")
   yield* Console.log("  Delete gifts-galore, westgate now has 1 store — OK")
 
   // --- Cleanup ---
-  yield* client.deleteTable({ TableName: "mall-table" })
+  yield* db.deleteTable
   yield* Console.log("\nAll 6 patterns passed.")
 })
 
 // =============================================================================
-// 7. Provide dependencies and run
+// 8. Provide dependencies and run
 // =============================================================================
 
 const AppLayer = Layer.mergeAll(
@@ -395,7 +405,7 @@ const AppLayer = Layer.mergeAll(
   MallTable.layer({ name: "mall-table" }),
 )
 
-const main = program.pipe(Effect.provide(AppLayer), Effect.scoped)
+const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
   () => console.log("\nDone."),

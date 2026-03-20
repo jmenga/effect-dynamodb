@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+:root {
+  --sl-color-accent-low: #1a1a3e;
+  --sl-color-accent: #6366f1;
+  --sl-color-accent-high: #c7d2fe;
+  --sl-font-system-mono:
+    "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+:root[data-theme="light"] {
+  --sl-color-accent-low: #e0e7ff;
+  --sl-color-accent: #4f46e5;
+  --sl-color-accent-high: #312e81;
+}
+
+/* Restore list styles stripped by Tailwind v4 reset */
+.sl-markdown-content ul:not(:where(.not-content *)) {
+  list-style-type: disc;
+  padding-inline-start: 1.5em;
+}
+
+.sl-markdown-content ol:not(:where(.not-content *)) {
+  list-style-type: decimal;
+  padding-inline-start: 1.5em;
+}
+
+.sl-markdown-content li:not(:where(.not-content *)) > ul {
+  list-style-type: circle;
+}
+
+.sl-markdown-content li:not(:where(.not-content *)) > ol {
+  list-style-type: lower-alpha;
+}
+
+/* Light mode: white code background (github-light theme uses #fff natively) */
+:root[data-theme="light"] .expressive-code .frame:not(.is-terminal) pre,
+:root[data-theme="light"] .expressive-code .frame:not(.is-terminal) {
+  background: #ffffff !important;
+}

@@ -38,19 +38,21 @@ class Product extends Schema.Class<Product>("Product")({
   stock: Schema.Number,
   viewCount: Schema.Number,
   tags: Schema.Array(Schema.String),
-  category: Schema.String.pipe(DynamoModel.Immutable),
+  category: Schema.String,
 }) {}
+
+const ProductModel = DynamoModel.configure(Product, {
+  category: { immutable: true },
+})
 
 // ---------------------------------------------------------------------------
 // 2. Schema + Table + Entity
 // ---------------------------------------------------------------------------
 
 const AppSchema = DynamoSchema.make({ name: "updates-demo", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
 
 const Products = Entity.make({
-  model: Product,
-  table: MainTable,
+  model: ProductModel,
   entityType: "Product",
   indexes: {
     primary: {
@@ -62,25 +64,23 @@ const Products = Entity.make({
   versioned: true,
 })
 
+const MainTable = Table.make({ schema: AppSchema, entities: { Products } })
+
 // ---------------------------------------------------------------------------
 // 3. Main program
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
-  const client = yield* DynamoClient
+  const db = yield* DynamoClient.make(MainTable)
 
   // --- Setup ---
   yield* Console.log("=== Setup ===\n")
 
-  yield* client.createTable({
-    TableName: "updates-demo-table",
-    BillingMode: "PAY_PER_REQUEST",
-    ...Table.definition(MainTable, [Products]),
-  })
+  yield* db.createTable()
   yield* Console.log("Table created\n")
 
   // Create initial product
-  const product = yield* Products.put({
+  const product = yield* db.Products.put({
     productId: "p-1",
     name: "Wireless Mouse",
     description: "Ergonomic wireless mouse",
@@ -89,10 +89,8 @@ const program = Effect.gen(function* () {
     viewCount: 0,
     tags: ["electronics", "accessories"],
     category: "peripherals",
-  }).pipe(Entity.asRecord)
-  yield* Console.log(
-    `Created: ${product.name} — $${product.price}, stock: ${product.stock}, version: ${product.version}`,
-  )
+  })
+  yield* Console.log(`Created: ${product.name} — $${product.price}, stock: ${product.stock}`)
   yield* Console.log(`  tags: ${JSON.stringify(product.tags)}`)
   yield* Console.log(`  viewCount: ${product.viewCount}\n`)
 
@@ -101,16 +99,13 @@ const program = Effect.gen(function* () {
 
   // ADD atomically increments a number. If the attribute doesn't exist,
   // it's initialized to the provided value. Thread-safe — no read-modify-write.
-  const afterAdd = yield* Products.update({ productId: "p-1" }).pipe(
-    Entity.add({ viewCount: 1 }),
-    Entity.asRecord,
-  )
+  const afterAdd = yield* db.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1 }))
   yield* Console.log(`After add(viewCount: 1): viewCount = ${afterAdd.viewCount}`)
 
   // Multiple adds compose
-  const afterMultiAdd = yield* Products.update({ productId: "p-1" }).pipe(
+  const afterMultiAdd = yield* db.Products.update(
+    { productId: "p-1" },
     Entity.add({ viewCount: 5, stock: 50 }),
-    Entity.asRecord,
   )
   yield* Console.log(
     `After add(viewCount: 5, stock: 50): viewCount = ${afterMultiAdd.viewCount}, stock = ${afterMultiAdd.stock}\n`,
@@ -121,10 +116,7 @@ const program = Effect.gen(function* () {
 
   // Subtract synthesizes SET #field = #field - :val
   // (DynamoDB has no native SUBTRACT — this is a convenience wrapper)
-  const afterSub = yield* Products.update({ productId: "p-1" }).pipe(
-    Entity.subtract({ stock: 3 }),
-    Entity.asRecord,
-  )
+  const afterSub = yield* db.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
   yield* Console.log(
     `After subtract(stock: 3): stock = ${afterSub.stock} (was ${afterMultiAdd.stock})\n`,
   )
@@ -134,9 +126,9 @@ const program = Effect.gen(function* () {
 
   // Append uses list_append to add elements to the end of a list.
   // The value must be an array.
-  const afterAppend = yield* Products.update({ productId: "p-1" }).pipe(
+  const afterAppend = yield* db.Products.update(
+    { productId: "p-1" },
     Entity.append({ tags: ["on-sale", "featured"] }),
-    Entity.asRecord,
   )
   yield* Console.log(`After append(tags: ["on-sale", "featured"]):`)
   yield* Console.log(`  tags = ${JSON.stringify(afterAppend.tags)}\n`)
@@ -146,9 +138,9 @@ const program = Effect.gen(function* () {
 
   // REMOVE deletes attributes entirely from the item.
   // The attribute no longer exists after removal (undefined, not null).
-  const afterRemove = yield* Products.update({ productId: "p-1" }).pipe(
+  const afterRemove = yield* db.Products.update(
+    { productId: "p-1" },
     Entity.remove(["description"]),
-    Entity.asRecord,
   )
   yield* Console.log(`After remove(["description"]):`)
   yield* Console.log(
@@ -170,49 +162,48 @@ const program = Effect.gen(function* () {
 
   // All update combinators compose in a single pipe.
   // They are merged into one UpdateItem call to DynamoDB.
-  const composed = yield* Products.update({ productId: "p-1" }).pipe(
+  const composed = yield* db.Products.update(
+    { productId: "p-1" },
     Products.set({ name: "Premium Wireless Mouse", price: 39.99 }),
     Entity.add({ viewCount: 10 }),
     Entity.subtract({ stock: 5 }),
     Entity.append({ tags: ["premium"] }),
-    Entity.asRecord,
   )
   yield* Console.log(`Composed update:`)
   yield* Console.log(`  name: ${composed.name}`)
   yield* Console.log(`  price: $${composed.price}`)
   yield* Console.log(`  viewCount: ${composed.viewCount}`)
   yield* Console.log(`  stock: ${composed.stock}`)
-  yield* Console.log(`  tags: ${JSON.stringify(composed.tags)}`)
-  yield* Console.log(`  version: ${composed.version}\n`)
+  yield* Console.log(`  tags: ${JSON.stringify(composed.tags)}\n`)
 
   // --- Combining with expectedVersion ---
   yield* Console.log("=== Rich Updates + Optimistic Locking ===\n")
 
-  const currentVersion = composed.version
-  const locked = yield* Products.update({ productId: "p-1" }).pipe(
+  // Use expectedVersion to guard against concurrent writes.
+  // After the previous mutations (put + 4 updates), the version is 6.
+  const locked = yield* db.Products.update(
+    { productId: "p-1" },
     Entity.add({ viewCount: 1 }),
-    Products.expectedVersion(currentVersion),
-    Entity.asRecord,
+    Products.expectedVersion(6),
   )
-  yield* Console.log(
-    `Update with expectedVersion(${currentVersion}): viewCount = ${locked.viewCount}, version = ${locked.version}`,
-  )
+  yield* Console.log(`Update with expectedVersion(6): viewCount = ${locked.viewCount}`)
 
   // Wrong version → OptimisticLockError
-  const lockFail = yield* Products.update({ productId: "p-1" })
-    .pipe(Entity.add({ viewCount: 1 }), Products.expectedVersion(1))
-    .asEffect()
-    .pipe(
-      Effect.map(() => "updated"),
-      Effect.catchTag("OptimisticLockError", (e) =>
-        Effect.succeed(`OptimisticLockError: expected v${e.expectedVersion}`),
-      ),
-    )
+  const lockFail = yield* db.Products.update(
+    { productId: "p-1" },
+    Entity.add({ viewCount: 1 }),
+    Products.expectedVersion(1),
+  ).pipe(
+    Effect.map(() => "updated"),
+    Effect.catchTag("OptimisticLockError", (e) =>
+      Effect.succeed(`OptimisticLockError: expected v${e.expectedVersion}`),
+    ),
+  )
   yield* Console.log(`Wrong version: ${lockFail}\n`)
 
   // --- Cleanup ---
   yield* Console.log("=== Cleanup ===\n")
-  yield* client.deleteTable({ TableName: "updates-demo-table" })
+  yield* db.deleteTable
   yield* Console.log("Table deleted.")
 })
 
@@ -229,7 +220,7 @@ const AppLayer = Layer.mergeAll(
   MainTable.layer({ name: "updates-demo-table" }),
 )
 
-const main = program.pipe(Effect.provide(AppLayer), Effect.scoped)
+const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
   () => console.log("\nDone."),

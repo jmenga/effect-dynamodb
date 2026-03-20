@@ -1,0 +1,480 @@
+---
+title: "Expressions"
+description: "Type-safe condition, filter, update, and projection expressions — callback API, shorthand syntax, and DynamoDB mapping reference"
+---
+
+import { Aside, Tabs, TabItem } from "@astrojs/starlight/components"
+
+DynamoDB uses **expressions** — string-based mini-languages — to describe conditions, filters, updates, and projections. effect-dynamodb provides two ways to build them:
+
+1. **Callback API** — Type-safe, composable, supports nested paths and all DynamoDB operators
+2. **Shorthand syntax** — Concise object literals for common AND-equality patterns
+
+Both compile to the same DynamoDB expression strings with properly aliased `ExpressionAttributeNames` and `ExpressionAttributeValues`.
+
+## Expression Types at a Glance
+
+| DynamoDB Expression | Purpose | effect-dynamodb API |
+|---|---|---|
+| `ConditionExpression` | Guard writes — fail if condition is false | `Entity.condition()` on put/update/delete |
+| `FilterExpression` | Narrow reads — remove non-matching items from results | `Entity.filter()` on query/scan |
+| `UpdateExpression` | Describe mutations — SET, REMOVE, ADD, DELETE clauses | `Entity.set()`, `remove()`, `add()`, etc. |
+| `KeyConditionExpression` | Select partition + sort key range | `Entity.query.indexName()`, `Query.where()` |
+| `ProjectionExpression` | Select attributes to return | `Entity.select()` |
+
+---
+
+## Condition Expressions
+
+Condition expressions guard write operations. DynamoDB evaluates the condition atomically — if it fails, the write is rejected with `ConditionalCheckFailed`.
+
+### Callback API
+
+The callback receives two arguments:
+
+- `t` — a `PathBuilder` proxy for type-safe attribute access
+- `ops` — comparison and logical operators that return `Expr` nodes
+
+```typescript
+// Single comparison
+Products.condition((t, { eq }) => eq(t.status, "active"))
+
+// Multiple conditions with AND
+Products.condition((t, { eq, gt, and }) =>
+  and(eq(t.status, "active"), gt(t.stock, 0)),
+)
+
+// Nested path
+Products.condition((t, { eq }) => eq(t.address.city, "NYC"))
+
+// Size comparison
+Products.condition((t, { gt }) => gt(t.tags.size(), 5))
+
+// Attribute existence
+Products.condition((t, { exists }) => exists(t.email))
+
+// OR + NOT composition
+Products.condition((t, { or, not, eq }) =>
+  or(eq(t.status, "active"), not(eq(t.status, "archived"))),
+)
+```
+
+Apply the condition as a combinator on put, update, or delete:
+
+```typescript
+// On put
+yield* products.put(input, Products.condition((t, { eq }) => eq(t.status, "active")))
+
+// On update (ANDed with optimistic lock)
+yield* products.update(
+  { id },
+  Products.set({ name: "New Name" }),
+  Products.expectedVersion(3),
+  Products.condition((t, { gt }) => gt(t.stock, 0)),
+)
+
+// On delete
+yield* products.delete(
+  { id },
+  Products.condition((t, { eq }) => eq(t.stock, 0)),
+)
+```
+
+### Shorthand Syntax
+
+For simple equality-only conditions, pass a plain object. Each key-value pair becomes an `=` comparison, all ANDed together:
+
+```typescript
+// Equivalent to: eq(t.status, "active") AND eq(t.role, "admin")
+Products.condition({ status: "active", role: "admin" })
+```
+
+<Aside type="tip">
+  Discrimination is automatic — if the first argument is a function, the callback API is used; if it's an object, the shorthand is used.
+</Aside>
+
+### Condition Operators Reference
+
+| Operator | Callback | DynamoDB |
+|---|---|---|
+| Equals | `eq(t.field, value)` | `#field = :val` |
+| Not equals | `ne(t.field, value)` | `#field <> :val` |
+| Less than | `lt(t.field, value)` | `#field < :val` |
+| Less or equal | `lte(t.field, value)` | `#field <= :val` |
+| Greater than | `gt(t.field, value)` | `#field > :val` |
+| Greater or equal | `gte(t.field, value)` | `#field >= :val` |
+| Between | `between(t.field, low, high)` | `#field BETWEEN :lo AND :hi` |
+| In list | `isIn(t.field, [a, b, c])` | `#field IN (:a, :b, :c)` |
+| Begins with | `beginsWith(t.field, prefix)` | `begins_with(#field, :prefix)` |
+| Contains | `contains(t.field, substr)` | `contains(#field, :substr)` |
+| Exists | `exists(t.field)` | `attribute_exists(#field)` |
+| Not exists | `notExists(t.field)` | `attribute_not_exists(#field)` |
+| Attribute type | `attributeType(t.field, "S")` | `attribute_type(#field, :type)` |
+| Size | `gt(t.field.size(), 5)` | `size(#field) > :val` |
+
+### Logical Composition
+
+| Combinator | Callback | DynamoDB |
+|---|---|---|
+| AND | `and(exprA, exprB, ...)` | `(exprA) AND (exprB)` |
+| OR | `or(exprA, exprB, ...)` | `(exprA) OR (exprB)` |
+| NOT | `not(expr)` | `NOT (expr)` |
+
+---
+
+## Filter Expressions
+
+Filter expressions narrow query and scan results **after** items are read from disk. They use the same grammar as condition expressions but apply to reads instead of writes.
+
+<Aside type="caution">
+  Filters do **not** reduce read capacity — you pay for all items matched by `KeyConditionExpression`. The 1 MB per-page limit also applies before filtering. Use sort key conditions for efficient pre-read narrowing.
+</Aside>
+
+### Callback API
+
+`Entity.filter()` works identically to `Entity.condition()` but returns a `Query` combinator:
+
+```typescript
+// Filter on query
+yield* products.collect(
+  Products.query.byCategory({ category: "electronics" }),
+  Products.filter((t, { gt }) => gt(t.price, 30)),
+)
+
+// Filter on scan
+yield* products.collect(
+  Products.scan(),
+  Products.filter((t, { contains }) => contains(t.name, "Widget")),
+)
+
+// Complex filter with OR
+yield* products.collect(
+  Products.scan(),
+  Products.filter((t, { or, eq }) =>
+    or(eq(t.status, "active"), eq(t.status, "pending")),
+  ),
+)
+```
+
+### Shorthand Syntax
+
+```typescript
+Products.filter({ status: "active" })
+Products.filter({ category: "electronics", inStock: true })
+```
+
+---
+
+## Update Expressions
+
+Update expressions describe how to modify item attributes. DynamoDB supports four clause types, all composable in a single atomic operation.
+
+### Record-Based Combinators
+
+These accept plain objects with field names — good for top-level attribute updates:
+
+```typescript
+// SET — assign values
+yield* products.update({ id }, Entity.set({ name: "New Name", price: 29.99 }))
+
+// REMOVE — delete attributes
+yield* products.update({ id }, Entity.remove(["description", "tempFlag"]))
+
+// ADD — atomic increment (numbers) or union (sets)
+yield* products.update({ id }, Entity.add({ viewCount: 1, stock: 50 }))
+
+// Subtract — SET field = field - value
+yield* products.update({ id }, Entity.subtract({ stock: 3 }))
+
+// Append — SET field = list_append(field, value)
+yield* products.update({ id }, Entity.append({ tags: ["on-sale", "featured"] }))
+
+// DELETE — remove elements from a set
+yield* products.update(
+  { id },
+  Entity.deleteFromSet({ categories: new Set(["obsolete"]) }),
+)
+```
+
+### Composing Multiple Update Types
+
+All combinators compose as variadic arguments to `update()`. They compile to a single `UpdateExpression` with the appropriate SET, REMOVE, ADD, and DELETE clauses:
+
+```typescript
+yield* products.update(
+  { id },
+  Entity.set({ name: "Updated Widget", price: 24.99 }),
+  Entity.add({ viewCount: 1 }),
+  Entity.subtract({ stock: 3 }),
+  Entity.append({ tags: ["clearance"] }),
+  Entity.remove(["temporaryFlag"]),
+  Entity.expectedVersion(5),
+)
+```
+
+### Path-Based Combinators
+
+For nested attributes, array elements, and attribute-to-attribute operations, use the path-based combinators with `Entity.pathSet()`, `Entity.pathRemove()`, etc.:
+
+```typescript
+// SET nested path
+yield* products.update({ id }, Entity.pathSet({
+  segments: ["address", "city"],
+  value: "NYC",
+  isPath: false,
+}))
+
+// SET array element
+yield* products.update({ id }, Entity.pathSet({
+  segments: ["roster", 0, "position"],
+  value: "captain",
+  isPath: false,
+}))
+
+// Copy attribute to attribute
+yield* products.update({ id }, Entity.pathSet({
+  segments: ["backup_email"],
+  value: undefined,
+  isPath: true,
+  valueSegments: ["email"],
+}))
+
+// REMOVE nested attribute
+yield* products.update({ id }, Entity.pathRemove(["metadata", "temporary"]))
+
+// PREPEND to list
+yield* products.update({ id }, Entity.pathPrepend({
+  segments: ["tags"],
+  value: ["URGENT"],
+}))
+
+// if_not_exists — set only if the attribute doesn't exist
+yield* products.update({ id }, Entity.pathIfNotExists({
+  segments: ["createdBy"],
+  value: "system",
+}))
+```
+
+### Update Expression Reference
+
+| Operation | Record Combinator | Path Combinator | DynamoDB |
+|---|---|---|---|
+| Set value | `Entity.set({ field: value })` | `Entity.pathSet(...)` | `SET #f = :v` |
+| Remove attribute | `Entity.remove(["field"])` | `Entity.pathRemove(segs)` | `REMOVE #f` |
+| Atomic add | `Entity.add({ field: n })` | `Entity.pathAdd(...)` | `ADD #f :v` |
+| Subtract | `Entity.subtract({ field: n })` | `Entity.pathSubtract(...)` | `SET #f = #f - :v` |
+| Append to list | `Entity.append({ field: [...] })` | `Entity.pathAppend(...)` | `SET #f = list_append(#f, :v)` |
+| Prepend to list | — | `Entity.pathPrepend(...)` | `SET #f = list_append(:v, #f)` |
+| Default value | — | `Entity.pathIfNotExists(...)` | `SET #f = if_not_exists(#f, :v)` |
+| Delete from set | `Entity.deleteFromSet({ f: set })` | `Entity.pathDelete(...)` | `DELETE #f :v` |
+| Copy attribute | — | `Entity.pathSet({ isPath: true })` | `SET #a = #b` |
+
+---
+
+## Key Condition Expressions
+
+Key conditions select which items DynamoDB reads from disk. They are the most efficient way to narrow results because they reduce consumed read capacity.
+
+### Entity Query Accessors
+
+Each non-primary index defined on an entity generates a named query accessor:
+
+```typescript
+const Tasks = Entity.make({
+  model: Task,
+  entityType: "Task",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["taskId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    byProject: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["projectId"] },
+      sk: { field: "gsi1sk", composite: ["status", "createdAt"] },
+    },
+  },
+})
+
+// Access via query namespace
+Tasks.query.byProject({ projectId: "proj-alpha" })
+
+// Partial SK composites narrow with begins_with automatically
+Tasks.query.byProject({ projectId: "proj-alpha", status: "active" })
+```
+
+### Sort Key Conditions with `Query.where`
+
+`Query.where()` adds a sort key condition to the `KeyConditionExpression`:
+
+```typescript
+import { Query } from "effect-dynamodb"
+
+// Exact match
+query.pipe(Query.where({ eq: sortKeyValue }))
+
+// Range comparisons
+query.pipe(Query.where({ gt: sortKeyValue }))
+query.pipe(Query.where({ gte: sortKeyValue }))
+query.pipe(Query.where({ lt: sortKeyValue }))
+query.pipe(Query.where({ lte: sortKeyValue }))
+
+// Inclusive range
+query.pipe(Query.where({ between: [lo, hi] }))
+
+// Prefix match
+query.pipe(Query.where({ beginsWith: prefix }))
+```
+
+| Operator | Syntax | DynamoDB |
+|---|---|---|
+| Equals | `{ eq: value }` | `#sk = :sk` |
+| Less than | `{ lt: value }` | `#sk < :sk` |
+| Less or equal | `{ lte: value }` | `#sk <= :sk` |
+| Greater than | `{ gt: value }` | `#sk > :sk` |
+| Greater or equal | `{ gte: value }` | `#sk >= :sk` |
+| Between | `{ between: [lo, hi] }` | `#sk BETWEEN :lo AND :hi` |
+| Begins with | `{ beginsWith: prefix }` | `begins_with(#sk, :prefix)` |
+
+<Aside type="note">
+  Sort key values in effect-dynamodb are **composed strings** that include the schema prefix, entity type, and composite attribute values. You don't construct these manually — use `KeyComposer.composeSortKeyPrefix()` to build the prefix from domain attributes, then pass it to `Query.where({ beginsWith: prefix })`.
+</Aside>
+
+---
+
+## Projection Expressions
+
+Projections select which attributes DynamoDB returns, reducing network transfer.
+
+### Callback API with `Entity.select()`
+
+`Entity.select()` uses the same `PathBuilder` proxy as condition/filter expressions:
+
+```typescript
+// Top-level fields
+Products.select((t) => [t.name, t.status])
+
+// Nested map paths
+Products.select((t) => [t.name, t.address.city])
+
+// Array elements
+Products.select((t) => [t.name, t.roster.at(0).name])
+
+// Mixed
+Products.select((t) => [t.name, t.address.city, t.tags.at(0)])
+```
+
+Apply as a combinator on queries and scans:
+
+```typescript
+// Project on query
+yield* products.collect(
+  Products.query.byCategory({ category: "electronics" }),
+  Products.select((t) => [t.name, t.price]),
+)
+
+// Project on scan
+yield* products.collect(
+  Products.scan(),
+  Products.select((t) => [t.name, t.status]),
+)
+```
+
+### String Array Shorthand
+
+For top-level-only projections:
+
+```typescript
+Products.select(["name", "status", "price"])
+```
+
+<Aside type="caution">
+  When projection is active, results are returned as `Record<string, unknown>` instead of typed model instances, since projected items may be partial. DynamoDB still reads the full item from disk — projections reduce network transfer, not read capacity.
+</Aside>
+
+---
+
+## PathBuilder
+
+The `PathBuilder` is a recursive `Proxy` that tracks attribute path segments as you access properties. It is the first argument in all callback-style expression builders.
+
+```typescript
+// t is PathBuilder<Team, Team>
+Products.condition((t, ops) => {
+  // t.name        → Path with segments ["name"]
+  // t.address.city → Path with segments ["address", "city"]
+  // t.roster.at(0) → Path with segments ["roster", 0]
+  // t.roster.at(0).name → Path with segments ["roster", 0, "name"]
+  // t.tags.size() → SizeOperand with segments ["tags"]
+  return ops.eq(t.status, "active")
+})
+```
+
+### Supported Path Types
+
+| Access | Type | Segments | DynamoDB Path |
+|---|---|---|---|
+| `t.name` | Top-level attribute | `["name"]` | `#name` |
+| `t.address.city` | Nested map | `["address", "city"]` | `#address.#city` |
+| `t.items.at(0)` | Array element | `["items", 0]` | `#items[0]` |
+| `t.items.at(0).name` | Nested in array | `["items", 0, "name"]` | `#items[0].#name` |
+| `t.tags.size()` | Size function | `["tags"]` | `size(#tags)` |
+
+All string segments are automatically aliased through `ExpressionAttributeNames` to handle DynamoDB reserved words.
+
+---
+
+## DynamoDB Expression Mapping Reference
+
+### Condition / Filter Expression Operators
+
+| DynamoDB Expression | effect-dynamodb |
+|---|---|
+| `#a = :v` | `eq(t.a, v)` |
+| `#a <> :v` | `ne(t.a, v)` |
+| `#a < :v` | `lt(t.a, v)` |
+| `#a <= :v` | `lte(t.a, v)` |
+| `#a > :v` | `gt(t.a, v)` |
+| `#a >= :v` | `gte(t.a, v)` |
+| `#a BETWEEN :lo AND :hi` | `between(t.a, lo, hi)` |
+| `#a IN (:v1, :v2)` | `isIn(t.a, [v1, v2])` |
+| `begins_with(#a, :v)` | `beginsWith(t.a, v)` |
+| `contains(#a, :v)` | `contains(t.a, v)` |
+| `attribute_exists(#a)` | `exists(t.a)` |
+| `attribute_not_exists(#a)` | `notExists(t.a)` |
+| `attribute_type(#a, :t)` | `attributeType(t.a, "S")` |
+| `size(#a) > :v` | `gt(t.a.size(), v)` |
+| `(A) AND (B)` | `and(A, B)` |
+| `(A) OR (B)` | `or(A, B)` |
+| `NOT (A)` | `not(A)` |
+| `#a.#b = :v` | `eq(t.a.b, v)` |
+| `#a[0] = :v` | `eq(t.a.at(0), v)` |
+| `#a > #b` | `gt(t.a, t.b)` |
+
+### Update Expression Operations
+
+| DynamoDB Expression | effect-dynamodb Record | effect-dynamodb Path |
+|---|---|---|
+| `SET #a = :v` | `Entity.set({ a: v })` | `Entity.pathSet({ segments: ["a"], value: v, isPath: false })` |
+| `SET #a.#b = :v` | — | `Entity.pathSet({ segments: ["a", "b"], value: v, isPath: false })` |
+| `SET #a[0] = :v` | — | `Entity.pathSet({ segments: ["a", 0], value: v, isPath: false })` |
+| `SET #a = #b` | — | `Entity.pathSet({ segments: ["a"], isPath: true, valueSegments: ["b"] })` |
+| `SET #a = #a - :v` | `Entity.subtract({ a: n })` | `Entity.pathSubtract({ segments: ["a"], value: n, isPath: false })` |
+| `SET #a = list_append(#a, :v)` | `Entity.append({ a: [...] })` | `Entity.pathAppend({ segments: ["a"], value: [...] })` |
+| `SET #a = list_append(:v, #a)` | — | `Entity.pathPrepend({ segments: ["a"], value: [...] })` |
+| `SET #a = if_not_exists(#a, :v)` | — | `Entity.pathIfNotExists({ segments: ["a"], value: v })` |
+| `REMOVE #a` | `Entity.remove(["a"])` | `Entity.pathRemove(["a"])` |
+| `REMOVE #a.#b` | — | `Entity.pathRemove(["a", "b"])` |
+| `REMOVE #a[0]` | — | `Entity.pathRemove(["a", 0])` |
+| `ADD #a :v` | `Entity.add({ a: n })` | `Entity.pathAdd({ segments: ["a"], value: n })` |
+| `DELETE #a :v` | `Entity.deleteFromSet({ a: set })` | `Entity.pathDelete({ segments: ["a"], value: set })` |
+
+---
+
+## What's Next?
+
+- [Example: Conditional Writes & Filters](/effect-dynamodb/tutorials/expressions/) — Runnable example with all expression types
+- [Example: Rich Updates](/effect-dynamodb/tutorials/updates/) — Atomic increments, list appends, set deletions
+- [Example: Projections](/effect-dynamodb/tutorials/projections/) — Selective attribute retrieval
+- [Queries Guide](/effect-dynamodb/guides/queries/) — Deep dive into query patterns and pagination
+- [Data Integrity Guide](/effect-dynamodb/guides/data-integrity/) — Optimistic locking and unique constraints

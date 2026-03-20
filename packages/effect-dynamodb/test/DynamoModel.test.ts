@@ -4,34 +4,23 @@ import * as DynamoModel from "../src/DynamoModel.js"
 
 describe("DynamoModel", () => {
   // ---------------------------------------------------------------------------
-  // Immutable annotation
+  // configure — immutable
   // ---------------------------------------------------------------------------
 
-  describe("Immutable", () => {
-    it("marks a field as immutable", () => {
-      const field = Schema.String.pipe(DynamoModel.Immutable)
-      expect(DynamoModel.isImmutable(field)).toBe(true)
-    })
-
-    it("unmarked fields are not immutable", () => {
-      expect(DynamoModel.isImmutable(Schema.String)).toBe(false)
-    })
-
-    it("preserves the schema type", () => {
-      const field = Schema.NonEmptyString.pipe(DynamoModel.Immutable)
-      const result = Schema.decodeUnknownSync(field)("hello")
-      expect(result).toBe("hello")
-    })
-
-    it("works with Schema.Class fields", () => {
+  describe("configure immutable", () => {
+    it("marks a field as immutable via configure", () => {
       class User extends Schema.Class<User>("User")({
         userId: Schema.String,
-        createdBy: Schema.String.pipe(DynamoModel.Immutable),
+        createdBy: Schema.String,
       }) {}
 
-      const fields = User.fields
-      expect(DynamoModel.isImmutable(fields.createdBy)).toBe(true)
-      expect(DynamoModel.isImmutable(fields.userId)).toBe(false)
+      const configured = DynamoModel.configure(User, {
+        createdBy: { immutable: true },
+      })
+
+      expect(DynamoModel.isConfiguredModel(configured)).toBe(true)
+      expect(configured.attributes.createdBy?.immutable).toBe(true)
+      expect(configured.attributes.userId).toBeUndefined()
     })
   })
 
@@ -55,10 +44,10 @@ describe("DynamoModel", () => {
       expect(result).toBe("hello")
     })
 
-    it("composes with Immutable", () => {
-      const field = Schema.String.pipe(DynamoModel.identifier, DynamoModel.Immutable)
+    it("composes with Hidden", () => {
+      const field = Schema.String.pipe(DynamoModel.identifier, DynamoModel.Hidden)
       expect(DynamoModel.isIdentifier(field)).toBe(true)
-      expect(DynamoModel.isImmutable(field)).toBe(true)
+      expect(DynamoModel.isHidden(field)).toBe(true)
     })
 
     it("works with Schema.Class fields", () => {
@@ -124,12 +113,6 @@ describe("DynamoModel", () => {
       expect(DynamoModel.isRef(Schema.String)).toBe(false)
     })
 
-    it("composes with Immutable", () => {
-      const field = Team.pipe(DynamoModel.ref, DynamoModel.Immutable)
-      expect(DynamoModel.isRef(field)).toBe(true)
-      expect(DynamoModel.isImmutable(field)).toBe(true)
-    })
-
     it("composes with Hidden", () => {
       const field = Team.pipe(DynamoModel.ref, DynamoModel.Hidden)
       expect(DynamoModel.isRef(field)).toBe(true)
@@ -167,9 +150,9 @@ describe("DynamoModel", () => {
       expect(result).toBe("hello")
     })
 
-    it("composes with Immutable", () => {
-      const field = Schema.String.pipe(DynamoModel.Immutable, DynamoModel.Hidden)
-      expect(DynamoModel.isImmutable(field)).toBe(true)
+    it("composes with identifier", () => {
+      const field = Schema.String.pipe(DynamoModel.identifier, DynamoModel.Hidden)
+      expect(DynamoModel.isIdentifier(field)).toBe(true)
       expect(DynamoModel.isHidden(field)).toBe(true)
     })
   })
@@ -494,20 +477,11 @@ describe("DynamoModel", () => {
       expect(encoding).toEqual({ storage: "string", domain: "DateTime.Utc" })
     })
 
-    it("Immutable + DynamoEncoding compose", () => {
-      const field = DynamoModel.DateEpochMs.pipe(DynamoModel.Immutable)
-      expect(DynamoModel.isImmutable(field)).toBe(true)
-      const encoding = DynamoModel.getEncoding(field)
-      expect(encoding).toEqual({ storage: "epochMs", domain: "DateTime.Utc" })
-    })
-
-    it("all three annotations compose", () => {
+    it("storedAs + Hidden compose", () => {
       const field = DynamoModel.DateString.pipe(
         DynamoModel.storedAs(DynamoModel.DateEpochSeconds),
-        DynamoModel.Immutable,
         DynamoModel.Hidden,
       )
-      expect(DynamoModel.isImmutable(field)).toBe(true)
       expect(DynamoModel.isHidden(field)).toBe(true)
       const encoding = DynamoModel.getEncoding(field)
       expect(encoding).toEqual({ storage: "epochSeconds", domain: "DateTime.Utc" })

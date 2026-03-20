@@ -1,0 +1,464 @@
+---
+title: "FAQ & Troubleshooting"
+description: "Common questions and troubleshooting for effect-dynamodb"
+---
+
+Common questions and solutions for working with effect-dynamodb.
+
+---
+
+## FAQ
+
+### How does the client gateway pattern work?
+
+Entity definitions created with `Entity.make()` are **not executable** — they carry type information, schemas, and index config. To get executable operations, register entities on a table with `Table.make({ schema, entities: {...} })`, then call `DynamoClient.make(table)` to get a typed client. This resolves `DynamoClient` and `TableConfig` from the Effect context and returns bound operations with `R = never`.
+
+**The typed client provides executable operations:**
+
+```typescript
+const program = Effect.gen(function* () {
+  const { Users: users } = yield* DynamoClient.make(MainTable)
+
+  const user = yield* users.get({ userId: "123" })
+  yield* users.put({ userId: "456", name: "Alice" })
+  yield* users.delete({ userId: "789" })
+})
+```
+
+**Bound methods return Effects**, so they work naturally with Effect combinators:
+
+```typescript
+const { Users: users } = yield* DynamoClient.make(MainTable)
+
+// Effect combinators work directly — no .asEffect() needed
+yield* users.get({ userId: "123" }).pipe(Effect.map((u) => u.name))
+```
+
+**For updates with combinators**, pass them as additional arguments to `update`:
+
+```typescript
+const { Users: users } = yield* DynamoClient.make(MainTable)
+
+yield* users.update(
+  { userId: "123" },
+  Entity.set({ name: "Alice" }),
+  Entity.expectedVersion(1),
+)
+```
+
+**Rule of thumb:**
+- Use `DynamoClient.make(MainTable)` at the top of each `Effect.gen` block — destructure all entities you need
+- Use bound methods for all operations (`users.get`, `users.put`, `users.update`, `users.delete`, `users.upsert`, `users.restore`, `users.purge`, etc.)
+- Pass update combinators (`Entity.set`, `Entity.expectedVersion`, `EntityDef.condition`, etc.) as rest arguments to `users.update` / `users.patch`
+
+---
+
+### What are the 7 derived types?
+
+Every entity automatically derives 7 types from your domain model and configuration:
+
+| Type | Extractor | Description |
+|------|-----------|-------------|
+| **Model** | `Entity.Model<E>` | Pure domain object — exactly what your `Schema.Class` defines |
+| **Record** | `Entity.Record<E>` | Domain fields + system metadata (`version`, `createdAt`, `updatedAt`) |
+| **Input** | `Entity.Input<E>` | Creation input — model fields without system-managed fields |
+| **Update** | `Entity.Update<E>` | Mutable fields only — keys and `immutable` fields excluded, all optional |
+| **Key** | `Entity.Key<E>` | Primary key attributes — the fields needed for `get`, `update`, `delete` |
+| **Item** | `Entity.Item<E>` | Full unmarshalled DynamoDB item including internal fields (`__edd_e__`, key fields) |
+| **Marshalled** | `Entity.Marshalled<E>` | DynamoDB `AttributeValue` format — what gets sent to/from the wire |
+
+**Key relationships:**
+- `put()` and `create()` accept `Input`
+- `get()`, `update()`, `delete()` accept `Key`
+- `get()` and `query` return `Record` by default (or `Model` via `yield*`)
+- `set()` combinator on updates accepts `Update`
+
+---
+
+### How do GSI composite updates work?
+
+When updating attributes that participate in a GSI's composite key, you must provide **all** composite attributes for that GSI — not just the ones you're changing. This is the "fetch-merge" pattern.
+
+**Why?** GSI keys are recomposed from composite attributes on every update. If you provide only some composites, the library cannot build a complete key, and `extractComposites` will fail with an error.
+
+```typescript
+const { Users: users } = yield* DynamoClient.make(MainTable)
+
+// Entity with GSI: byTenant has composite: ["tenantId", "region"]
+
+// WRONG: partial GSI composites — will error
+yield* users.update({ userId: "u-1" }, Entity.set({ tenantId: "t-new" }))  // Missing "region"!
+
+// CORRECT: provide all composites for the GSI
+yield* users.update({ userId: "u-1" }, Entity.set({ tenantId: "t-new", region: "us-east-1" }))
+```
+
+**What about `Entity.remove()`?** When you remove a GSI composite attribute, the corresponding GSI key fields (pk/sk) are automatically removed so the item drops out of the sparse index. If SET and REMOVE target composites of the same GSI, removal wins.
+
+---
+
+### How does single-table design work?
+
+Multiple entity types share one physical DynamoDB table. Three mechanisms make this work:
+
+1. **Entity type discriminator (`__edd_e__`)** — Every item carries a hidden `__edd_e__` attribute containing the entity type string (e.g., `"User"`, `"Order"`). All queries automatically include a `FilterExpression` on this field to isolate entity types.
+
+2. **Structured key format** — Keys follow the pattern `$schema#v1#entity_type#attr_value#attr_value`. The schema name, version, and entity type prefix ensure that different entity types produce non-overlapping key spaces even when they share the same physical index.
+
+3. **Index overloading** — Generic GSI names (`gsi1`, `gsi2`) serve different access patterns for different entity types. Each entity maps its logical index names (e.g., `byTenant`, `byProject`) to physical GSI names.
+
+```typescript
+// Both entities use gsi1 for different patterns
+const Users = Entity.make({
+  // ...
+  indexes: {
+    primary: { pk: { field: "pk", composite: ["userId"] }, sk: { field: "sk", composite: [] } },
+    byTenant: { index: "gsi1", pk: { field: "gsi1pk", composite: ["tenantId"] }, sk: { field: "gsi1sk", composite: ["userId"] } },
+  },
+})
+
+const Orders = Entity.make({
+  // ...
+  indexes: {
+    primary: { pk: { field: "pk", composite: ["orderId"] }, sk: { field: "sk", composite: [] } },
+    byCustomer: { index: "gsi1", pk: { field: "gsi1pk", composite: ["customerId"] }, sk: { field: "gsi1sk", composite: ["createdAt"] } },
+  },
+})
+```
+
+---
+
+### What's the difference between `put`, `create`, and `upsert`?
+
+| Operation | Behavior | On Duplicate Key | DynamoDB API |
+|-----------|----------|------------------|--------------|
+| **`put`** | Unconditional write — creates or overwrites | Silently replaces the existing item | PutItem |
+| **`create`** | Insert-only — `put` + automatic `attribute_not_exists` condition | Fails with `ConditionalCheckFailed` | PutItem (with condition) |
+| **`upsert`** | Create-or-update atomically | Creates if missing, updates if exists | UpdateItem (with `if_not_exists`) |
+
+```typescript
+const { Users: users } = yield* DynamoClient.make(MainTable)
+
+// put: overwrites if exists
+yield* users.put({ userId: "u-1", name: "Alice" })
+
+// create: fails if exists
+yield* users.create({ userId: "u-1", name: "Alice" }).pipe(
+  Effect.catchTag("ConditionalCheckFailed", () =>
+    Effect.fail(new Error("User already exists"))
+  ),
+)
+
+// upsert: creates or updates
+// - Immutable fields and createdAt use if_not_exists (only set on first creation)
+// - Version is incremented atomically: if_not_exists(version, 0) + 1
+// - Returns the full record (ReturnValues: ALL_NEW)
+yield* users.upsert({ userId: "u-1", name: "Alice" })
+```
+
+**Note:** `upsert` does not support unique constraints or version retention (`retain`) because it cannot determine whether the item previously existed.
+
+---
+
+### How do version snapshots work?
+
+When `versioned: { retain: true }` is configured, every write operation (put, update, delete) stores a **snapshot** of the item at that version.
+
+```typescript
+const Users = Entity.make({
+  // ...
+  versioned: { retain: true },
+})
+```
+
+**How it works:**
+- Snapshots share the same partition key (PK) as the main item but use a version sort key: `$schema#v1#entity#v#0000001`
+- GSI key fields are **stripped** from snapshots so they do not appear in index queries
+- The `__edd_e__` entity type is preserved for filtering
+- Retain-aware writes use `transactWriteItems` to atomically write both the main item and the snapshot
+
+**Accessing versions:**
+
+```typescript
+const { Users: users } = yield* DynamoClient.make(MainTable)
+
+// Get a specific version
+const v2 = yield* users.getVersion({ userId: "u-1" }, 2)
+
+// Query version history (most recent first)
+const history = yield* users.collect(
+  Users.versions({ userId: "u-1" }),
+  Query.reverse,
+  Query.limit(10),
+)
+```
+
+---
+
+### How does soft delete work?
+
+When `softDelete` is configured, `entity.delete()` performs a **logical deletion** — the item becomes invisible to normal queries but remains in the table.
+
+```typescript
+const Users = Entity.make({
+  // ...
+  softDelete: true,
+  // Or with auto-purge:
+  // softDelete: { ttl: Duration.days(30) },
+})
+```
+
+**What happens on delete:**
+
+1. The sort key is modified: `$schema#v1#user` becomes `$schema#v1#user#deleted#2024-01-15T10:30:00Z`
+2. All GSI keys are **removed** — the item disappears from secondary indexes and collections
+3. A `deletedAt` timestamp is added to the item
+4. If `ttl` is configured, a `_ttl` attribute is set for DynamoDB's auto-expiry
+
+**Visibility:**
+
+| Access Path | Sees Deleted Items? |
+|-------------|---------------------|
+| `entity.get(key)` | No |
+| `entity.query.byIndex(...)` | No |
+| Collection queries | No |
+| `entity.deleted.get(key)` | Yes |
+| `entity.deleted.list(key)` | Yes |
+
+**Recovery and cleanup:**
+
+```typescript
+const { Users: users } = yield* DynamoClient.make(MainTable)
+
+// Read a deleted item
+const deleted = yield* users.deleted.get({ userId: "u-1" })
+
+// Restore — recomposes all keys and re-establishes unique sentinels
+yield* users.restore({ userId: "u-1" })
+
+// Purge — permanently removes item + all versions + unique sentinels
+yield* users.purge({ userId: "u-1" })
+```
+
+When an entity has both `softDelete` and `unique` constraints, the `preserveUnique` option controls whether unique sentinels are freed on delete (default: `false`, sentinels are freed) or preserved until purge.
+
+---
+
+## Troubleshooting
+
+### "Cannot use entity operation directly"
+
+**Symptom:** Entity operations from `Entity.make()` cannot be yielded or executed directly.
+
+**Cause:** `Entity.make()` returns a definition, not executable operations. You must use `DynamoClient.make(table)` to get a typed client first.
+
+**Solution:** Use `DynamoClient.make(MainTable)` to get a typed client with executable methods:
+
+```typescript
+const { Users: users } = yield* DynamoClient.make(MainTable)
+
+// BoundEntity methods return Effects — work with all combinators
+yield* users.get({ userId: "123" }).pipe(Effect.map((u) => u.name))
+
+// Updates accept combinators as rest arguments
+yield* users.update({ userId: "123" }, Entity.set({ name: "Alice" }))
+```
+
+---
+
+### "GSI key composition failed"
+
+**Symptom:** Error from `extractComposites` when updating an item.
+
+**Cause:** You provided some but not all composite attributes for a GSI. When any composite attribute for a GSI is updated, the library must recompose the entire GSI key, which requires all composites to be present.
+
+**Solution:** Provide all composite attributes for the affected GSI:
+
+```typescript
+const { Users: users } = yield* DynamoClient.make(MainTable)
+
+// If the GSI has composite: ["tenantId", "region"]
+// Provide BOTH when updating either one
+yield* users.update({ userId: "u-1" }, Entity.set({ tenantId: "t-new", region: "us-east-1" }))
+```
+
+If you want to update a non-GSI field without touching the GSI, omit all GSI composites and the GSI key will not be recomposed.
+
+---
+
+### "ConditionalCheckFailed on create"
+
+**Symptom:** `ConditionalCheckFailed` error when calling `entity.create()`.
+
+**Cause:** An item with the same primary key already exists. `create()` adds an automatic `attribute_not_exists` condition that prevents overwrites.
+
+**Solution:** Choose the appropriate operation for your intent:
+
+```typescript
+const { Users: users } = yield* DynamoClient.make(MainTable)
+
+// Use put() to overwrite if exists
+yield* users.put({ userId: "u-1", name: "Alice" })
+
+// Use upsert() for create-or-update semantics
+yield* users.upsert({ userId: "u-1", name: "Alice" })
+
+// Or handle the duplicate explicitly
+yield* users.create({ userId: "u-1", name: "Alice" }).pipe(
+  Effect.catchTag("ConditionalCheckFailed", () =>
+    Effect.logWarning("User already exists, skipping")
+  ),
+)
+```
+
+---
+
+### "UniqueConstraintViolation"
+
+**Symptom:** `UniqueConstraintViolation` error on `put`, `create`, or `update`.
+
+**Cause:** Another item already has the same value for the unique constraint fields. Uniqueness is enforced via transactional sentinel items.
+
+**Solution:**
+
+```typescript
+const { Users: users } = yield* DynamoClient.make(MainTable)
+
+yield* users.put({ userId: "u-1", email: "alice@example.com" }).pipe(
+  Effect.catchTag("UniqueConstraintViolation", (e) =>
+    // e.constraint — name of the violated constraint (e.g., "email")
+    // e.fields — the field values that collided (e.g., { email: "alice@example.com" })
+    Effect.fail(new Error(`${e.constraint} already taken: ${JSON.stringify(e.fields)}`))
+  ),
+)
+```
+
+To update a unique field, provide the new value in `set()`. The library automatically deletes the old sentinel and creates a new one in a transaction. If the new value is already taken, you get `UniqueConstraintViolation`.
+
+---
+
+### "OptimisticLockError"
+
+**Symptom:** `OptimisticLockError` on update with `expectedVersion`.
+
+**Cause:** The item was modified between when you read it and when you attempted the update. The version in DynamoDB no longer matches your expected version.
+
+**Solution:** Re-read the item and retry:
+
+```typescript
+const { Users: users } = yield* DynamoClient.make(MainTable)
+
+yield* users.update(
+  { userId: "u-1" },
+  Entity.set({ name: "Updated" }),
+  Entity.expectedVersion(3),
+).pipe(
+  Effect.catchTag("OptimisticLockError", (e) =>
+    // e.expectedVersion — what you expected
+    // e.actualVersion — what DynamoDB has
+    Effect.gen(function* () {
+      // Re-read and retry with the current version
+      const current = yield* users.get({ userId: "u-1" })
+      return yield* users.update(
+        { userId: "u-1" },
+        Entity.set({ name: "Updated" }),
+        Entity.expectedVersion(current.version),
+      )
+    })
+  ),
+)
+```
+
+---
+
+### "AggregateAssemblyError"
+
+**Symptom:** `AggregateAssemblyError` when fetching or assembling an aggregate.
+
+**Cause:** The aggregate could not be assembled from the items in DynamoDB. Common reasons:
+- **Missing items** — A required sub-entity or edge target does not exist in the partition
+- **Structural violations** — Items do not match the expected aggregate shape (e.g., wrong entity type, unexpected discriminator)
+- **Decode errors** — An item failed Schema validation during assembly
+
+**Solution:**
+
+```typescript
+yield* MyAggregate.get({ rootId: "123" }).pipe(
+  Effect.catchTag("AggregateAssemblyError", (e) =>
+    // e.aggregate — aggregate name
+    // e.reason — description of what went wrong
+    // e.key — the key that was being assembled
+    Effect.logError(`Assembly failed: ${e.reason}`)
+  ),
+)
+```
+
+Check that all items in the partition are consistent. If items were written outside the aggregate (e.g., direct entity writes), they may not match the expected structure.
+
+---
+
+### "ItemDeleted"
+
+**Symptom:** `ItemDeleted` error when trying to modify or access an item.
+
+**Cause:** The item has been soft-deleted. Normal `get()` and `query` operations will not find it — only `deleted.get()` and `deleted.list()` can access it.
+
+**Solution:**
+
+```typescript
+const { Users: users } = yield* DynamoClient.make(MainTable)
+
+// Read the deleted item
+const item = yield* users.deleted.get({ userId: "u-1" })
+
+// Restore it to make it active again
+yield* users.restore({ userId: "u-1" })
+
+// Or purge it permanently (removes item + versions + sentinels)
+yield* users.purge({ userId: "u-1" })
+```
+
+---
+
+### "ItemNotDeleted"
+
+**Symptom:** `ItemNotDeleted` error when calling `entity.restore()`.
+
+**Cause:** The item is not soft-deleted — `restore` can only be called on items that have been soft-deleted.
+
+**Solution:** Check the item's state before restoring. If the item is active, no action is needed.
+
+---
+
+### Common type errors with entity operations
+
+**"Type 'EntityUpdate\<...>' is not assignable to type 'Effect.Effect\<...>'"**
+
+Do not try to extract `A`/`E`/`R` from entity operations using `Effect.Effect<infer A, ...>`. Entity ops are not `Effect.Effect`. Use the specific entity op types:
+
+```typescript
+// WRONG
+type Result = MyOp extends Effect.Effect<infer A> ? A : never  // resolves to never
+
+// CORRECT
+type Result = MyOp extends EntityOp<infer A, any, any, any> ? A : never
+```
+
+**"Property 'set' does not exist on EntityUpdate"**
+
+Update combinators (`set`, `expectedVersion`, `remove`, `add`, etc.) are module-level functions on `Entity`, not methods on the update object. Pass them as rest arguments to the bound `update` method:
+
+```typescript
+const { Users: users } = yield* DynamoClient.make(MainTable)
+
+// Pass combinators as rest arguments
+yield* users.update({ userId: "u-1" }, Entity.set({ name: "Alice" }))
+
+// Multiple combinators
+yield* users.update(
+  { userId: "u-1" },
+  Entity.set({ name: "Alice" }),
+  Entity.expectedVersion(3),
+  Users.condition((t, { exists }) => exists(t.email)),
+)
+```

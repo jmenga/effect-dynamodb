@@ -37,7 +37,7 @@ import {
 } from "./Marshaller.js"
 import type { Table, TableConfig } from "./Table.js"
 
-export type { Cursor, DiscriminatorConfig, UpdateContext } from "./_AggregateCursor.js"
+export type { Cursor, DiscriminatorConfig, UpdateContext } from "./internal/AggregateCursor.js"
 // Internal modules (decomposed from Aggregate.ts)
 export {
   type AggregateEdge,
@@ -52,7 +52,7 @@ export {
   type RefEdge,
   type RefEntity,
   ref,
-} from "./_AggregateEdges.js"
+} from "./internal/AggregateEdges.js"
 export {
   type DerivedAggregateSchemas,
   deriveAggregateSchemas,
@@ -63,7 +63,7 @@ export {
   isFieldOptional,
   isSchemaMatchingEntity,
   unwrapModel,
-} from "./_AggregateSchemas.js"
+} from "./internal/AggregateSchemas.js"
 export type {
   AggregateInputType,
   BoundSubAggregate,
@@ -72,12 +72,20 @@ export type {
   SubAggregate,
   Type,
   UpdateFn,
-} from "./_AggregateTypes.js"
+} from "./internal/AggregateTypes.js"
 
-import { type DiscriminatorConfig, makeCursor, type UpdateContext } from "./_AggregateCursor.js"
-import type { AggregateEdge, RefEntity } from "./_AggregateEdges.js"
-import { deriveAggregateSchemas, deriveEntityFieldName } from "./_AggregateSchemas.js"
-import type { AggregateInputType, BoundSubAggregate, SubAggregate } from "./_AggregateTypes.js"
+import {
+  type DiscriminatorConfig,
+  makeCursor,
+  type UpdateContext,
+} from "./internal/AggregateCursor.js"
+import type { AggregateEdge, RefEntity } from "./internal/AggregateEdges.js"
+import { deriveAggregateSchemas, deriveEntityFieldName } from "./internal/AggregateSchemas.js"
+import type {
+  AggregateInputType,
+  BoundSubAggregate,
+  SubAggregate,
+} from "./internal/AggregateTypes.js"
 
 // ---------------------------------------------------------------------------
 // TypeId
@@ -901,18 +909,14 @@ const makeAggregate = <TSchema extends Schema.Top>(
 }
 
 // ---------------------------------------------------------------------------
-// Aggregate.bind — resolve services, return BoundAggregate with R = never
+// Aggregate binding — resolve services, return BoundAggregate with R = never
 // ---------------------------------------------------------------------------
 
 /**
  * Bind an Aggregate to resolved `DynamoClient` and `TableConfig` services.
  * Returns a {@link BoundAggregate} where all operations have `R = never`.
  *
- * @example
- * ```typescript
- * const matches = yield* Aggregate.bind(Matches)
- * const match = yield* matches.get({ matchId })  // Effect<Match, ..., never>
- * ```
+ * @internal Used by `DynamoClient.make(table)` to bind aggregates.
  */
 export const bind = <TSchema extends Schema.Top, TKey extends Record<string, unknown>, TInput>(
   aggregate: Aggregate<TSchema, TKey, TInput>,

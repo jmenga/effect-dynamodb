@@ -1,8 +1,8 @@
 /**
- * DynamoModel — Schema annotations and date schemas for effect-dynamodb.
+ * DynamoModel — Schema annotations, date schemas, and model configuration for effect-dynamodb.
  *
  * Provides:
- * - `Immutable` annotation — marks fields as read-only after creation
+ * - `configure` — per-field DynamoDB overrides (field rename, storage encoding, immutable, identifier, ref)
  * - `Hidden` annotation — marks fields as excluded from default decode (asModel/asRecord)
  * - `DynamoEncoding` annotation — controls how date fields are stored in DynamoDB
  * - Date schemas — wire ↔ domain ↔ storage transformations for DateTime.Utc, DateTime.Zoned, Date
@@ -12,34 +12,6 @@
  */
 
 import { DateTime, Effect, Option, Schema, SchemaAST, SchemaGetter, SchemaIssue } from "effect"
-
-// ---------------------------------------------------------------------------
-// Immutable annotation
-// ---------------------------------------------------------------------------
-
-/** Unique symbol for the Immutable annotation */
-const ImmutableId: unique symbol = Symbol.for("effect-dynamodb/Immutable")
-
-/**
- * Mark a schema field as immutable (read-only after creation).
- *
- * Immutable fields:
- * - Included in Entity.Input (provided on creation)
- * - Included in Entity.Record (readable)
- * - Excluded from Entity.Update (cannot be changed)
- *
- * Key-composite fields are inherently immutable and don't need this annotation.
- */
-export const Immutable = <S extends Schema.Top>(schema: S): S =>
-  schema.pipe(Schema.annotate({ [ImmutableId]: true })) as S
-
-/**
- * Check if a schema field has the Immutable annotation.
- */
-export const isImmutable = (schema: Schema.Top): boolean =>
-  ((SchemaAST.resolve(schema.ast) as globalThis.Record<symbol, unknown> | undefined)?.[
-    ImmutableId
-  ] as boolean) ?? false
 
 // ---------------------------------------------------------------------------
 // Identifier annotation
@@ -524,27 +496,40 @@ export const ConfiguredModelTag: unique symbol = Symbol.for("effect-dynamodb/Con
  * Carries the original model plus per-field configuration:
  * - `field` — rename domain field → DynamoDB attribute name
  * - `storedAs` — override DynamoDB storage encoding (resolved to DynamoEncoding)
+ * - `immutable` — mark field as read-only after creation (excluded from Entity.Update)
  * - `identifier` — mark field as the identity field for ref resolution
  * - `ref` — mark field as a denormalized reference to another entity
  */
-export interface ConfiguredModel<M extends Schema.Top> {
+export interface ConfiguredModel<
+  M extends Schema.Top,
+  A extends ConfigureAttributes<M> = ConfigureAttributes<M>,
+> {
   readonly [ConfiguredModelTag]: true
   readonly model: M
+  readonly _attributes: A
   readonly attributes: globalThis.Record<
     string,
     {
       readonly field?: string
       readonly encoding?: DynamoEncoding
+      readonly immutable?: boolean
       readonly identifier?: boolean
       readonly ref?: boolean
     }
   >
 }
 
+/** Extract the identifier field name from a ConfiguredModel's attributes type. */
+export type ExtractIdentifier<Model> =
+  Model extends ConfiguredModel<any, infer A>
+    ? { [K in keyof A & string]: A[K] extends { readonly identifier: true } ? K : never }[keyof A &
+        string]
+    : undefined
+
 /**
  * Check if a value is a ConfiguredModel.
  */
-export const isConfiguredModel = (value: unknown): value is ConfiguredModel<Schema.Top> =>
+export const isConfiguredModel = (value: unknown): value is ConfiguredModel<Schema.Top, any> =>
   typeof value === "object" &&
   value !== null &&
   (value as globalThis.Record<symbol, unknown>)[ConfiguredModelTag] === true
@@ -554,12 +539,14 @@ export const isConfiguredModel = (value: unknown): value is ConfiguredModel<Sche
  *
  * - `field` — Rename the domain field to a different DynamoDB attribute name
  * - `storedAs` — Override DynamoDB storage format via a DynamoModel date schema
- * - `identifier` — Mark as the identity field for ref resolution (replaces model-level DynamoModel.identifier)
- * - `ref` — Mark as a denormalized reference field (replaces model-level DynamoModel.ref)
+ * - `immutable` — Mark as read-only after creation (excluded from Entity.Update)
+ * - `identifier` — Mark as the identity field for ref resolution
+ * - `ref` — Mark as a denormalized reference field
  */
 type AttributeConfig<A> = {
   readonly field?: string
   readonly storedAs?: Schema.Schema<A>
+  readonly immutable?: boolean
   readonly identifier?: boolean
   readonly ref?: boolean
 }
@@ -591,15 +578,16 @@ type ConfigureAttributes<M extends Schema.Top> = {
  * })
  * ```
  */
-export const configure = <M extends Schema.Top>(
+export const configure = <M extends Schema.Top, const A extends ConfigureAttributes<M>>(
   model: M,
-  attributes: ConfigureAttributes<M>,
-): ConfiguredModel<M> => {
+  attributes: A,
+): ConfiguredModel<M, A> => {
   const resolved: globalThis.Record<
     string,
     {
       readonly field?: string
       readonly encoding?: DynamoEncoding
+      readonly immutable?: boolean
       readonly identifier?: boolean
       readonly ref?: boolean
     }
@@ -610,10 +598,12 @@ export const configure = <M extends Schema.Top>(
     const entry: {
       field?: string
       encoding?: DynamoEncoding
+      immutable?: boolean
       identifier?: boolean
       ref?: boolean
     } = {}
     if (config.field) entry.field = config.field
+    if (config.immutable) entry.immutable = true
     if (config.identifier) entry.identifier = true
     if (config.ref) entry.ref = true
     if (config.storedAs) {
@@ -630,6 +620,7 @@ export const configure = <M extends Schema.Top>(
   return {
     [ConfiguredModelTag]: true as const,
     model,
+    _attributes: attributes,
     attributes: resolved,
-  }
+  } as ConfiguredModel<M, A>
 }

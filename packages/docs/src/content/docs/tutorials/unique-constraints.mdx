@@ -1,0 +1,296 @@
+---
+title: "Example: Unique Constraints"
+description: "Enforce globally unique fields, composite uniqueness, and TTL-based idempotency keys using DynamoDB transaction sentinels"
+---
+
+Unique constraints guarantee that certain field values (like email addresses or usernames) are globally unique across all items of an entity. effect-dynamodb enforces this atomically using DynamoDB transaction sentinel items — no external locks or secondary queries required.
+
+**What you'll learn:**
+- Declaring unique constraints on an entity
+- Automatic enforcement via sentinel items
+- Handling `UniqueConstraintViolation` errors
+- TTL-based idempotency key pattern
+- Sentinel rotation on update (old value released, new value claimed)
+
+---
+
+## Step 1: Models
+
+Two pure domain models — a `User` with email and username, and an `ApiRequest` with an idempotency key:
+
+```typescript title="models.ts"
+import { Schema } from "effect"
+
+class User extends Schema.Class<User>("User")({
+  userId: Schema.String,
+  email: Schema.String,
+  username: Schema.NonEmptyString,
+  tenantId: Schema.String,
+  name: Schema.NonEmptyString,
+}) {}
+
+class ApiRequest extends Schema.Class<ApiRequest>("ApiRequest")({
+  requestId: Schema.String,
+  idempotencyKey: Schema.String,
+  payload: Schema.String,
+  status: Schema.Literals(["pending", "completed", "failed"]),
+}) {}
+```
+
+No DynamoDB concepts here — uniqueness is declared at the entity level, not in the model.
+
+---
+
+## Step 2: Schema, Table, and Entities
+
+### Schema and Table
+
+```typescript title="entities.ts"
+import { DynamoSchema, Table } from "effect-dynamodb"
+
+const AppSchema = DynamoSchema.make({ name: "unique-demo", version: 1 })
+const MainTable = Table.make({ schema: AppSchema })
+```
+
+### Users Entity — Multiple Unique Constraints
+
+The `unique` config declares which fields must be globally unique. Each key names the constraint; the value lists the fields that compose the unique value:
+
+```typescript title="entities.ts"
+import { Entity } from "effect-dynamodb"
+
+const Users = Entity.make({
+  model: User,
+  entityType: "User",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["userId"] },
+      sk: { field: "sk", composite: [] },
+    },
+  },
+  timestamps: true,
+  unique: {
+    email: ["email"],
+    username: ["username"],
+  },
+})
+```
+
+Under the hood, every `put` becomes a DynamoDB `TransactWriteItems` that atomically writes the main item **and** a sentinel item for each unique constraint. If any sentinel already exists, the transaction fails with `UniqueConstraintViolation`.
+
+### ApiRequests Entity — TTL-Based Idempotency Key
+
+For idempotency keys, you want the constraint to expire after a window. Pass an object with `fields` and `ttl` instead of a plain array:
+
+```typescript title="entities.ts"
+import { Duration } from "effect"
+
+const ApiRequests = Entity.make({
+  model: ApiRequest,
+  entityType: "ApiRequest",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["requestId"] },
+      sk: { field: "sk", composite: [] },
+    },
+  },
+  timestamps: true,
+  unique: {
+    idempotencyKey: {
+      fields: ["idempotencyKey"],
+      ttl: Duration.minutes(30),
+    },
+  },
+})
+```
+
+The sentinel item gets a `_ttl` attribute set to 30 minutes in the future. DynamoDB's TTL mechanism automatically deletes it after expiry, freeing the idempotency key for reuse.
+
+---
+
+## Step 3: Operations
+
+### Creating Users — Duplicate Detection
+
+Create the first user normally. Attempting to create a second user with the same email is blocked:
+
+```typescript
+import { DynamoClient } from "effect-dynamodb"
+
+const { Users: users, ApiRequests: requests } = yield* DynamoClient.make(MainTable)
+
+const alice = yield* users.put({
+  userId: "u-1",
+  email: "alice@example.com",
+  username: "alice",
+  tenantId: "t-1",
+  name: "Alice",
+})
+// Created: Alice (email: alice@example.com, username: alice)
+
+// Same email → UniqueConstraintViolation
+const duplicateEmail = yield* users.put({
+  userId: "u-2",
+  email: "alice@example.com",
+  username: "bob",
+  tenantId: "t-1",
+  name: "Bob",
+}).pipe(
+  Effect.catchTag("UniqueConstraintViolation", (e) =>
+    Effect.succeed(`Blocked: constraint="${e.constraint}", fields=${JSON.stringify(e.fields)}`),
+  ),
+)
+// Blocked: constraint="email", fields={"email":"alice@example.com"}
+```
+
+The error includes the constraint name and the conflicting field values, making it straightforward to produce user-facing messages.
+
+Username uniqueness works identically — same email but duplicate username is also blocked:
+
+```typescript
+// Different email, same username → UniqueConstraintViolation
+yield* users.put({
+  userId: "u-2",
+  email: "bob@example.com",
+  username: "alice",  // taken!
+  tenantId: "t-1",
+  name: "Bob",
+}).pipe(
+  Effect.catchTag("UniqueConstraintViolation", (e) =>
+    Effect.succeed(`Blocked: constraint="${e.constraint}"`),
+  ),
+)
+// Blocked: constraint="username"
+
+// Both different → succeeds
+yield* users.put({
+  userId: "u-2",
+  email: "bob@example.com",
+  username: "bob",
+  tenantId: "t-1",
+  name: "Bob",
+})
+// Created: Bob
+```
+
+### Idempotency Key Pattern
+
+The TTL-based constraint prevents duplicate request processing. The first request succeeds; retries with the same key are blocked until the sentinel expires:
+
+```typescript
+// First request — succeeds
+const req1 = yield* requests.put({
+  requestId: "r-1",
+  idempotencyKey: "idem-abc-123",
+  payload: '{"action":"charge","amount":100}',
+  status: "completed",
+})
+
+// Retry with same idempotency key → blocked
+yield* requests.put({
+  requestId: "r-2",
+  idempotencyKey: "idem-abc-123",
+  payload: '{"action":"charge","amount":100}',
+  status: "pending",
+}).pipe(
+  Effect.catchTag("UniqueConstraintViolation", (e) =>
+    Effect.succeed(`Blocked: constraint="${e.constraint}" — duplicate request prevented`),
+  ),
+)
+// The sentinel has a TTL of 30 minutes
+// After expiry, the same key can be reused
+
+// Different idempotency key — succeeds immediately
+yield* requests.put({
+  requestId: "r-2",
+  idempotencyKey: "idem-def-456",
+  payload: '{"action":"refund","amount":50}',
+  status: "completed",
+})
+```
+
+### Sentinel Rotation on Update
+
+When you update a unique field, effect-dynamodb atomically **removes** the old sentinel and **creates** a new one. The old value becomes available for other items:
+
+```typescript
+// Update Alice's email
+yield* users.update({ userId: "u-1" }, Entity.set({ email: "alice-new@example.com" }))
+
+// The old email "alice@example.com" is now free
+yield* users.put({
+  userId: "u-3",
+  email: "alice@example.com",  // previously Alice's — now available
+  username: "charlie",
+  tenantId: "t-1",
+  name: "Charlie",
+})
+// Created: Charlie
+
+// But Alice's new email is still protected
+yield* users.update(
+  { userId: "u-2" },
+  Entity.set({ email: "alice-new@example.com" }),
+).pipe(
+  Effect.catchTag("UniqueConstraintViolation", (e) =>
+    Effect.succeed(`Blocked: constraint="${e.constraint}"`),
+  ),
+)
+// Blocked: constraint="email"
+```
+
+---
+
+## Running the Example
+
+The complete runnable example is at [`examples/unique-constraints.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/unique-constraints.ts) in the repository.
+
+```bash
+docker run -d -p 8000:8000 amazon/dynamodb-local
+```
+
+```bash
+npx tsx examples/unique-constraints.ts
+```
+
+### Layer Setup
+
+```typescript title="main.ts"
+import { Effect, Layer } from "effect"
+import { DynamoClient, Table } from "effect-dynamodb"
+
+const AppLayer = Layer.mergeAll(
+  DynamoClient.layer({
+    region: "us-east-1",
+    endpoint: "http://localhost:8000",
+    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  }),
+  MainTable.layer({ name: "unique-demo-table" }),
+)
+
+const main = program.pipe(Effect.provide(AppLayer))
+
+Effect.runPromise(main).then(
+  () => console.log("Done."),
+  (err) => console.error("Failed:", err),
+)
+```
+
+---
+
+## Key Takeaways
+
+| Concept | How it's used |
+|---------|---------------|
+| **Unique constraints** | `unique: { email: ["email"], username: ["username"] }` on Entity config |
+| **Sentinel items** | Automatically created/deleted via DynamoDB transactions — no manual management |
+| **UniqueConstraintViolation** | Tagged error with `constraint` name and `fields` for precise error handling |
+| **TTL-based uniqueness** | `{ fields: [...], ttl: Duration.minutes(30) }` for expiring constraints like idempotency keys |
+| **Sentinel rotation** | Updating a unique field atomically releases the old value and claims the new one |
+| **No extra indexes** | Sentinels live in the same table using structured key values — no GSIs needed |
+
+## What's Next?
+
+- [Modeling Guide](/effect-dynamodb/guides/modeling/) — Deep dive into models, schemas, tables, and entities
+- [Data Integrity](/effect-dynamodb/guides/data-integrity/) — Unique constraints, optimistic locking, and conditional writes
+- [Example: Human Resources](/effect-dynamodb/tutorials/human-resources/) — Single-table design with collections, transactions, and soft delete

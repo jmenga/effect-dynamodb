@@ -1,0 +1,644 @@
+---
+title: "Example: Version Control"
+description: "4-entity single-table design with 2 GSIs, 3 cross-entity collections, status-based queries, and atomic transactions"
+---
+
+A version control platform managing **users**, **repositories**, **issues**, and **pull requests** in a single DynamoDB table. Adapted from the [ElectroDB Version Control example](https://electrodb.dev/en/examples/version-control/) to showcase effect-dynamodb's approach to the same problem.
+
+**What you'll learn:**
+- 4 entities sharing one table (single-table design)
+- 2 GSIs with index overloading
+- 3 cross-entity collection patterns (`owned`, `managed`, `activity`)
+- Status-based sort key composition for filtered queries
+- Entity-scoped `set()` for status updates with GSI all-or-none constraints
+- Atomic issue + PR creation via `Transaction.transactWrite`
+
+---
+
+## Access Patterns
+
+This example covers 8 access patterns:
+
+1. **Get user profile** -- primary key lookup
+2. **Get repository** -- primary key with composite sort key
+3. **User's owned repos** -- GSI1 `owned` collection (User + Repository)
+4. **Create + update issue status** -- put + set with GSI recomposition
+5. **Create + close pull request** -- same pattern, different entity
+6. **User's managed items** -- GSI1 `managed` collection (Issue + PullRequest)
+7. **Repository activity** -- GSI2 `activity` collection (Repository + Issue + PullRequest)
+8. **Atomic create** -- Transaction for issue + PR together
+
+---
+
+## Table Design
+
+All four entities share a single table with 2 Global Secondary Indexes:
+
+| Key | Field | Used by |
+|-----|-------|---------|
+| PK | `pk` | User (username), Repository (repoOwner), Issue (repoOwner+repoName), PullRequest (repoOwner+repoName) |
+| SK | `sk` | User, Repository (repoName), Issue (issueNumber), PullRequest (pullRequestNumber) |
+| GSI1 PK | `gsi1pk` | User (username), Repository (repoOwner), Issue (username), PullRequest (username) |
+| GSI1 SK | `gsi1sk` | User, Repository (repoName), Issue (status+issueNumber), PullRequest (status+pullRequestNumber) |
+| GSI2 PK | `gsi2pk` | Repository (repoOwner+repoName), Issue (repoOwner+repoName), PullRequest (repoOwner+repoName) |
+| GSI2 SK | `gsi2sk` | Repository, Issue (status+issueNumber), PullRequest (status+pullRequestNumber) |
+
+GSI1 is **overloaded** -- it serves the `owned` collection (User + Repository by owner) and the `managed` collection (Issue + PullRequest by username). GSI2 serves the `activity` collection (Repository + Issue + PullRequest by repo).
+
+---
+
+## Step 1: Models
+
+Pure domain models with no DynamoDB concepts:
+
+```typescript title="models.ts"
+import { Schema } from "effect"
+
+class User extends Schema.Class<User>("User")({
+  username: Schema.String,
+  fullName: Schema.String,
+  bio: Schema.String,
+  location: Schema.String,
+}) {}
+
+class Repository extends Schema.Class<Repository>("Repository")({
+  repoName: Schema.String,
+  repoOwner: Schema.String,
+  about: Schema.String,
+  description: Schema.String,
+  isPrivate: Schema.Boolean,
+  defaultBranch: Schema.String,
+}) {}
+
+class Issue extends Schema.Class<Issue>("Issue")({
+  issueNumber: Schema.String,
+  repoName: Schema.String,
+  repoOwner: Schema.String,
+  username: Schema.String,
+  subject: Schema.String,
+  body: Schema.String,
+  status: Schema.Literals(["Open", "Closed"]),
+}) {}
+
+class PullRequest extends Schema.Class<PullRequest>("PullRequest")({
+  pullRequestNumber: Schema.String,
+  repoName: Schema.String,
+  repoOwner: Schema.String,
+  username: Schema.String,
+  subject: Schema.String,
+  body: Schema.String,
+  status: Schema.Literals(["Open", "Closed"]),
+}) {}
+```
+
+Issue and PullRequest both have a `status` field using `Schema.Literals` -- this field participates in sort key composition for status-based filtering.
+
+---
+
+## Step 2: Schema, Table, and Entities
+
+### Schema and Table
+
+```typescript title="entities.ts"
+import { DynamoSchema, Table } from "effect-dynamodb"
+
+const VcsSchema = DynamoSchema.make({ name: "vcs", version: 1 })
+const VcsTable = Table.make({ schema: VcsSchema, entities: { Users, Repositories, Issues, PullRequests } })
+```
+
+### User Entity
+
+User has a primary index and participates in the `owned` collection on GSI1:
+
+```typescript title="entities.ts"
+import { Entity } from "effect-dynamodb"
+
+const Users = Entity.make({
+  model: User,
+  entityType: "User",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["username"] },
+      sk: { field: "sk", composite: [] },
+    },
+    owned: {
+      index: "gsi1",
+      collection: "owned",
+      pk: { field: "gsi1pk", composite: ["username"] },
+      sk: { field: "gsi1sk", composite: [] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+### Repository Entity
+
+Repository participates in both collections -- `owned` on GSI1 (repos by owner) and `activity` on GSI2 (repo + issues + PRs):
+
+```typescript title="entities.ts"
+const Repositories = Entity.make({
+  model: Repository,
+  entityType: "Repository",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["repoOwner"] },
+      sk: { field: "sk", composite: ["repoName"] },
+    },
+    created: {
+      index: "gsi1",
+      collection: "owned",
+      pk: { field: "gsi1pk", composite: ["repoOwner"] },
+      sk: { field: "gsi1sk", composite: ["repoName"] },
+    },
+    activity: {
+      index: "gsi2",
+      collection: "activity",
+      pk: { field: "gsi2pk", composite: ["repoOwner", "repoName"] },
+      sk: { field: "gsi2sk", composite: [] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+The `owned` collection works because User's GSI1 PK uses `username` and Repository's uses `repoOwner` -- when these values match, both entities appear in the same partition.
+
+### Issue Entity
+
+Issue participates in the `managed` collection on GSI1 (issues by creator) and the `activity` collection on GSI2 (issues by repo). Both sort keys include `status` for prefix-based filtering:
+
+```typescript title="entities.ts"
+const Issues = Entity.make({
+  model: Issue,
+  entityType: "Issue",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["repoOwner", "repoName"] },
+      sk: { field: "sk", composite: ["issueNumber"] },
+    },
+    created: {
+      index: "gsi1",
+      collection: "managed",
+      pk: { field: "gsi1pk", composite: ["username"] },
+      sk: { field: "gsi1sk", composite: ["status", "issueNumber"] },
+    },
+    todos: {
+      index: "gsi2",
+      collection: "activity",
+      pk: { field: "gsi2pk", composite: ["repoOwner", "repoName"] },
+      sk: { field: "gsi2sk", composite: ["status", "issueNumber"] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+Key design decisions:
+- **`created` (GSI1)** shares the `managed` collection with PullRequest -- both use `username` as the partition key
+- **`todos` (GSI2)** shares the `activity` collection with Repository and PullRequest -- all use `repoOwner + repoName` as the partition key
+- **`status` in the sort key** means items naturally group by status within a partition
+
+### PullRequest Entity
+
+PullRequest mirrors Issue's index structure -- same two collections, same status-based sort keys:
+
+```typescript title="entities.ts"
+const PullRequests = Entity.make({
+  model: PullRequest,
+  entityType: "PullRequest",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["repoOwner", "repoName"] },
+      sk: { field: "sk", composite: ["pullRequestNumber"] },
+    },
+    created: {
+      index: "gsi1",
+      collection: "managed",
+      pk: { field: "gsi1pk", composite: ["username"] },
+      sk: { field: "gsi1sk", composite: ["status", "pullRequestNumber"] },
+    },
+    enhancements: {
+      index: "gsi2",
+      collection: "activity",
+      pk: { field: "gsi2pk", composite: ["repoOwner", "repoName"] },
+      sk: { field: "gsi2sk", composite: ["status", "pullRequestNumber"] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+---
+
+## Step 3: Seed Data
+
+```typescript title="seed.ts"
+const users = {
+  octocat: {
+    username: "octocat",
+    fullName: "The Octocat",
+    bio: "GitHub mascot",
+    location: "San Francisco, CA",
+  },
+  torvalds: {
+    username: "torvalds",
+    fullName: "Linus Torvalds",
+    bio: "Creator of Linux and Git",
+    location: "Portland, OR",
+  },
+}
+
+const repos = {
+  helloWorld: {
+    repoName: "hello-world",
+    repoOwner: "octocat",
+    about: "My first repository on GitHub!",
+    description: "A simple hello world project for learning Git",
+    isPrivate: false,
+    defaultBranch: "main",
+  },
+  linux: {
+    repoName: "linux",
+    repoOwner: "torvalds",
+    about: "Linux kernel source tree",
+    description: "The Linux kernel",
+    isPrivate: false,
+    defaultBranch: "master",
+  },
+}
+
+const issues = {
+  helloWorldBug: {
+    issueNumber: "1",
+    repoName: "hello-world",
+    repoOwner: "octocat",
+    username: "torvalds",
+    subject: "Bug: README has typo",
+    body: "There is a typo in the README file on line 3.",
+    status: "Open" as const,
+  },
+  helloWorldFeature: {
+    issueNumber: "2",
+    repoName: "hello-world",
+    repoOwner: "octocat",
+    username: "octocat",
+    subject: "Feature: Add contributing guide",
+    body: "We should add a CONTRIBUTING.md file.",
+    status: "Closed" as const,
+  },
+  linuxBug: {
+    issueNumber: "1",
+    repoName: "linux",
+    repoOwner: "torvalds",
+    username: "octocat",
+    subject: "Bug: Kernel panic on boot",
+    body: "Kernel panic when booting with specific hardware configuration.",
+    status: "Open" as const,
+  },
+}
+
+const pullRequests = {
+  helloWorldPR: {
+    pullRequestNumber: "1",
+    repoName: "hello-world",
+    repoOwner: "octocat",
+    username: "torvalds",
+    subject: "Fix README typo",
+    body: "Fixes the typo mentioned in issue #1.",
+    status: "Open" as const,
+  },
+  linuxPR: {
+    pullRequestNumber: "1",
+    repoName: "linux",
+    repoOwner: "torvalds",
+    username: "octocat",
+    subject: "Fix boot panic for hardware X",
+    body: "Addresses kernel panic on boot with specific hardware.",
+    status: "Open" as const,
+  },
+}
+```
+
+```typescript title="seed.ts"
+import { DynamoClient } from "effect-dynamodb"
+
+const {
+  Users: boundUsers,
+  Repositories: boundRepos,
+  Issues: boundIssues,
+  PullRequests: boundPRs,
+} = yield* DynamoClient.make(VcsTable)
+
+// Seed all data
+for (const user of Object.values(users)) {
+  yield* boundUsers.put(user)
+}
+for (const repo of Object.values(repos)) {
+  yield* boundRepos.put(repo)
+}
+for (const issue of Object.values(issues)) {
+  yield* boundIssues.put(issue)
+}
+for (const pr of Object.values(pullRequests)) {
+  yield* boundPRs.put(pr)
+}
+```
+
+---
+
+## Step 4: Fulfilling the Access Patterns
+
+### Pattern 1: Get User Profile
+
+> Look up a user by their username (primary key).
+
+```typescript
+const octocat = yield* boundUsers.get({ username: "octocat" })
+// octocat.fullName → "The Octocat"
+// octocat.bio → "GitHub mascot"
+// octocat.location → "San Francisco, CA"
+
+const torvalds = yield* boundUsers.get({ username: "torvalds" })
+// torvalds.fullName → "Linus Torvalds"
+```
+
+### Pattern 2: Get Repository
+
+> Look up a repository by owner and name (composite primary key).
+
+```typescript
+const helloWorld = yield* boundRepos.get({
+  repoOwner: "octocat",
+  repoName: "hello-world",
+})
+// helloWorld.about → "My first repository on GitHub!"
+// helloWorld.defaultBranch → "main"
+
+const linux = yield* boundRepos.get({
+  repoOwner: "torvalds",
+  repoName: "linux",
+})
+// linux.about → "Linux kernel source tree"
+// linux.defaultBranch → "master"
+```
+
+### Pattern 3: User's Owned Repos (GSI1 -- `owned` Collection)
+
+> See all repositories owned by a user.
+
+User and Repository share GSI1 via the `owned` collection. Both use the owner's username as the partition key, so a single partition holds the user profile and all their repositories.
+
+```typescript
+// Octocat's repositories
+const octocatRepos = yield* boundRepos.collect(
+  Repositories.query.created({ repoOwner: "octocat" }),
+)
+// → [{ repoName: "hello-world", ... }]
+
+// Torvalds' repositories
+const torvaldsRepos = yield* boundRepos.collect(
+  Repositories.query.created({ repoOwner: "torvalds" }),
+)
+// → [{ repoName: "linux", ... }]
+
+// User side of the same collection
+const octocatProfile = yield* boundUsers.collect(
+  Users.query.owned({ username: "octocat" }),
+)
+// → [{ fullName: "The Octocat", ... }]
+```
+
+Both queries hit GSI1 with the same partition key. DynamoDB serves both from the same item collection.
+
+### Pattern 4: Create Issue + Update Status
+
+> Create a new issue, then close it.
+
+Creating an issue is a simple `put`. Closing it requires an `update` with `set()`. Because `status` appears in GSI sort keys, changing it triggers GSI key recomposition -- the all-or-none rule means you must provide all composites for affected GSIs.
+
+```typescript
+// Create a new issue
+const newIssue = yield* boundIssues.put({
+  issueNumber: "3",
+  repoName: "hello-world",
+  repoOwner: "octocat",
+  username: "torvalds",
+  subject: "Enhancement: Add CI pipeline",
+  body: "We should add GitHub Actions for CI/CD.",
+  status: "Open",
+})
+// newIssue.status → "Open"
+
+// Close the issue — status touches GSI1 and GSI2 sort keys
+// GSI1 (created): username + status — both required
+// GSI2 (todos): status is the only non-primary composite
+const closedIssue = yield* boundIssues.update(
+  { repoOwner: "octocat", repoName: "hello-world", issueNumber: "3" },
+  { status: "Closed", username: "torvalds" }, // all GSI1 composites required
+)
+// closedIssue.status → "Closed"
+// closedIssue.subject → "Enhancement: Add CI pipeline" (preserved)
+```
+
+The `username` field must be included in the `set()` even though it hasn't changed -- it's a composite of the `created` GSI alongside `status`, and the all-or-none rule requires all composites for any GSI that's being recomposed.
+
+### Pattern 5: Create Pull Request + Close
+
+> Create a PR, then merge/close it.
+
+The same pattern as issues -- `status` in the sort key means the GSI keys must be fully recomposed on status change.
+
+```typescript
+// Create a PR
+const newPR = yield* boundPRs.put({
+  pullRequestNumber: "2",
+  repoName: "hello-world",
+  repoOwner: "octocat",
+  username: "octocat",
+  subject: "Add CONTRIBUTING.md",
+  body: "Adds a contributing guide as requested in issue #2.",
+  status: "Open",
+})
+
+// Close the PR (merged)
+const closedPR = yield* boundPRs.update(
+  { repoOwner: "octocat", repoName: "hello-world", pullRequestNumber: "2" },
+  { status: "Closed", username: "octocat" }, // all GSI1 composites required
+)
+// closedPR.status → "Closed"
+```
+
+### Pattern 6: User's Managed Items (GSI1 -- `managed` Collection)
+
+> See all issues and PRs created by a user.
+
+Issue and PullRequest share GSI1 via the `managed` collection. Both use `username` as the partition key. Query each entity type separately to see a user's work items.
+
+```typescript
+// Torvalds' issues
+const torvaldsIssues = yield* boundIssues.collect(
+  Issues.query.created({ username: "torvalds" }),
+)
+// → [
+//   { issueNumber: "1", subject: "Bug: README has typo", status: "Open" },
+//   { issueNumber: "3", subject: "Enhancement: Add CI pipeline", status: "Closed" },
+// ]
+
+// Torvalds' PRs
+const torvaldsPRs = yield* boundPRs.collect(
+  PullRequests.query.created({ username: "torvalds" }),
+)
+// → [{ pullRequestNumber: "1", subject: "Fix README typo", status: "Open" }]
+
+// Octocat's issues
+const octocatIssues = yield* boundIssues.collect(
+  Issues.query.created({ username: "octocat" }),
+)
+// → 2 issues (hello-world #2 Closed, linux #1 Open)
+
+// Octocat's PRs
+const octocatPRs = yield* boundPRs.collect(
+  PullRequests.query.created({ username: "octocat" }),
+)
+// → 2 PRs (linux #1 Open, hello-world #2 Closed)
+```
+
+### Pattern 7: Repository Activity (GSI2 -- `activity` Collection)
+
+> See all issues and PRs for a specific repository.
+
+Repository, Issue, and PullRequest share GSI2 via the `activity` collection. All use `repoOwner + repoName` as the partition key, grouping everything related to a repository in one partition.
+
+```typescript
+// hello-world issues
+const hwIssues = yield* boundIssues.collect(
+  Issues.query.todos({ repoOwner: "octocat", repoName: "hello-world" }),
+)
+// → 3 issues: #1 (Open), #2 (Closed), #3 (Closed)
+
+const hwOpenIssues = hwIssues.filter((i) => i.status === "Open")
+// → [{ issueNumber: "1", ... }]
+
+// hello-world PRs
+const hwPRs = yield* boundPRs.collect(
+  PullRequests.query.enhancements({ repoOwner: "octocat", repoName: "hello-world" }),
+)
+// → 2 PRs: #1 (Open), #2 (Closed)
+
+// linux issues
+const linuxIssues = yield* boundIssues.collect(
+  Issues.query.todos({ repoOwner: "torvalds", repoName: "linux" }),
+)
+// → [{ issueNumber: "1", status: "Open", ... }]
+
+// Repository record itself via activity index
+const hwRepoActivity = yield* boundRepos.collect(
+  Repositories.query.activity({ repoOwner: "octocat", repoName: "hello-world" }),
+)
+// → [{ repoName: "hello-world", ... }]
+```
+
+Because `status` is in the sort key for Issues and PullRequests on GSI2, items within a partition naturally group by status. Open items sort before Closed items.
+
+### Pattern 8: Atomic Create (Transaction)
+
+> Create an issue and PR together atomically.
+
+`Transaction.transactWrite` ensures both items are created as a single atomic operation -- if either fails, neither is persisted.
+
+```typescript
+import { Transaction } from "effect-dynamodb"
+
+yield* Transaction.transactWrite([
+  Issues.put({
+    issueNumber: "2",
+    repoName: "linux",
+    repoOwner: "torvalds",
+    username: "torvalds",
+    subject: "Track: Memory leak in driver",
+    body: "Tracking issue for the memory leak fix.",
+    status: "Open",
+  }),
+  PullRequests.put({
+    pullRequestNumber: "2",
+    repoName: "linux",
+    repoOwner: "torvalds",
+    username: "torvalds",
+    subject: "Fix memory leak in driver X",
+    body: "Fixes the memory leak described in issue #2.",
+    status: "Open",
+  }),
+])
+
+// Both created atomically — verify via activity index
+const linuxIssuesAfter = yield* boundIssues.collect(
+  Issues.query.todos({ repoOwner: "torvalds", repoName: "linux" }),
+)
+// → 2 issues now
+
+const linuxPRsAfter = yield* boundPRs.collect(
+  PullRequests.query.enhancements({ repoOwner: "torvalds", repoName: "linux" }),
+)
+// → 2 PRs now
+```
+
+---
+
+## Running the Example
+
+The complete runnable example is at [`examples/version-control.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/version-control.ts) in the repository. It seeds data, runs all 8 access patterns, and verifies each with assertions.
+
+```bash
+docker run -d -p 8000:8000 amazon/dynamodb-local
+```
+
+```bash
+npx tsx examples/version-control.ts
+```
+
+### Layer Setup
+
+The example wires dependencies via Effect Layers:
+
+```typescript title="main.ts"
+import { Effect, Layer } from "effect"
+import { DynamoClient } from "effect-dynamodb"
+
+const AppLayer = Layer.mergeAll(
+  DynamoClient.layer({
+    region: "us-east-1",
+    endpoint: "http://localhost:8000",
+    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  }),
+  VcsTable.layer({ name: "vcs-table" }),
+)
+
+const main = program.pipe(Effect.provide(AppLayer))
+
+Effect.runPromise(main).then(
+  () => console.log("Done."),
+  (err) => console.error("Failed:", err),
+)
+```
+
+---
+
+## Key Takeaways
+
+| Concept | How it's used |
+|---------|---------------|
+| **Single-table design** | 4 entities, 1 table, structured key values |
+| **Index overloading** | GSI1 serves `owned` (User + Repository) and `managed` (Issue + PullRequest) collections |
+| **3 collections** | `owned` (GSI1), `managed` (GSI1), `activity` (GSI2) enable cross-entity queries |
+| **Status in sort key** | `status` as first sort key composite groups items by Open/Closed within a partition |
+| **GSI all-or-none** | Changing `status` requires providing all composites for affected GSIs (e.g., `username` for GSI1) |
+| **Transactions** | Atomic multi-entity writes for issue + PR creation |
+| **Composite primary keys** | Repository, Issue, and PullRequest use multi-attribute partition and sort keys |
+
+## What's Next?
+
+- [Modeling Guide](/effect-dynamodb/guides/modeling/) -- Deep dive into models, schemas, tables, and entities
+- [Indexes & Collections](/effect-dynamodb/guides/indexes/) -- Access pattern design and collection patterns
+- [Queries](/effect-dynamodb/guides/queries/) -- Query combinators, filtering, and pagination
+- [Human Resources Example](/effect-dynamodb/tutorials/human-resources/) -- 3 entities, 5 GSIs, soft delete, and salary range queries

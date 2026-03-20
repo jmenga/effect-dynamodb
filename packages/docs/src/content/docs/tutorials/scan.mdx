@@ -1,0 +1,255 @@
+---
+title: "Example: Scan Operations"
+description: "Full-table scans with filters, limits, consistent reads, and entity-type isolation in a single-table design"
+---
+
+A product and review catalog that demonstrates **scan operations** -- reading all items from a table without targeting a specific partition key. Scans are the broadest read operation in DynamoDB, and effect-dynamodb makes them composable with the same `Query` combinators used for index queries.
+
+**What you'll learn:**
+- `Entity.scan()` on entity definitions -- full-table scan descriptor
+- `collect()` / `paginate()` on bound entities -- executing scans with `Entity.filter()`, `Query.limit()`, and `Query.consistentRead` combinators
+- Entity-type isolation -- scans automatically filter by `__edd_e__` so each entity only sees its own items
+- When to use scan vs query
+
+---
+
+## Step 1: Models
+
+Two entity types sharing a single table -- products and reviews:
+
+```typescript title="models.ts"
+import { Schema } from "effect"
+
+class Product extends Schema.Class<Product>("Product")({
+  productId: Schema.String,
+  name: Schema.NonEmptyString,
+  category: Schema.String,
+  price: Schema.Number,
+  inStock: Schema.Boolean,
+}) {}
+
+class Review extends Schema.Class<Review>("Review")({
+  reviewId: Schema.String,
+  productId: Schema.String,
+  rating: Schema.Number,
+  comment: Schema.String,
+}) {}
+```
+
+---
+
+## Step 2: Schema, Table, and Entities
+
+Both entities share one table with a GSI for category/product lookups:
+
+```typescript title="entities.ts"
+import { DynamoSchema, Entity, Table } from "effect-dynamodb"
+
+const AppSchema = DynamoSchema.make({ name: "scan-demo", version: 1 })
+const Products = Entity.make({
+  model: Product,
+  entityType: "Product",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["productId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    byCategory: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["category"] },
+      sk: { field: "gsi1sk", composite: ["productId"] },
+    },
+  },
+  timestamps: true,
+})
+
+const Reviews = Entity.make({
+  model: Review,
+  entityType: "Review",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["reviewId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    byProduct: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["productId"] },
+      sk: { field: "gsi1sk", composite: ["reviewId"] },
+    },
+  },
+  timestamps: true,
+})
+
+const MainTable = Table.make({ schema: AppSchema, entities: { Products, Reviews } })
+```
+
+Note that both entities overload GSI1 -- Products use it for category lookups while Reviews use it for product lookups. This is standard single-table design.
+
+---
+
+## Step 3: Seed Data
+
+```typescript title="seed.ts"
+import { DynamoClient } from "effect-dynamodb"
+
+const { Products: products, Reviews: reviews } = yield* DynamoClient.make(MainTable)
+
+yield* products.put({
+  productId: "p-1", name: "Wireless Mouse",
+  category: "electronics", price: 29.99, inStock: true,
+})
+yield* products.put({
+  productId: "p-2", name: "Mechanical Keyboard",
+  category: "electronics", price: 89.99, inStock: true,
+})
+yield* products.put({
+  productId: "p-3", name: "USB-C Cable",
+  category: "accessories", price: 9.99, inStock: false,
+})
+yield* products.put({
+  productId: "p-4", name: "Monitor Stand",
+  category: "accessories", price: 49.99, inStock: true,
+})
+yield* reviews.put({
+  reviewId: "r-1", productId: "p-1", rating: 5, comment: "Great mouse!",
+})
+yield* reviews.put({
+  reviewId: "r-2", productId: "p-2", rating: 4, comment: "Good keyboard",
+})
+```
+
+The table now has 6 items: 4 products and 2 reviews.
+
+---
+
+## Step 4: Operations
+
+### Basic Scan
+
+`Products.scan()` on the entity definition returns a `Query<Entity.Record>` descriptor that reads the entire table. Pass it to `collect()` on the bound entity to execute it. Despite sharing a table with reviews, `Products.scan()` only returns product items -- the ORM automatically adds a `FilterExpression` on `__edd_e__`:
+
+```typescript
+const allProducts = yield* products.collect(Products.scan())
+// → 4 products (reviews excluded automatically)
+```
+
+### Scan with Filter
+
+Scans support all `Query` combinators, including entity-level `filter()`. Pass combinators as additional arguments to `collect()` -- they are applied to the scan descriptor before execution. The filter is applied server-side after items are read, reducing network transfer:
+
+```typescript
+const inStockProducts = yield* products.collect(
+  Products.scan(),
+  Products.filter({ inStock: true }),
+)
+// → 3 products (USB-C Cable excluded — inStock: false)
+```
+
+Note that filters do **not** reduce read capacity -- DynamoDB still reads every item in the table. Use queries with partition keys when you need efficient reads.
+
+### Scan with Limit
+
+`Query.limit()` controls how many items DynamoDB evaluates per request. Combined with `collect()`, it caps the total results:
+
+```typescript
+const firstTwo = yield* products.collect(Products.scan(), Query.limit(2))
+// → 2 products
+```
+
+### Scan with Consistent Read
+
+`Query.consistentRead` passes `ConsistentRead: true` to DynamoDB, ensuring you read the most recent data. This costs 2x the read capacity of eventually-consistent reads:
+
+```typescript
+const consistent = yield* products.collect(Products.scan(), Query.consistentRead)
+// → 4 products (strongly consistent)
+```
+
+### Entity-Type Isolation
+
+The key feature of scans in a single-table design: each entity's scan only returns its own items. The `__edd_e__` discriminator attribute is automatically included in the `FilterExpression`:
+
+```typescript
+const productScan = yield* products.collect(Products.scan())
+const reviewScan = yield* reviews.collect(Reviews.scan())
+
+// productScan.length → 4 (only products)
+// reviewScan.length  → 2 (only reviews)
+```
+
+Even though both scans read the same physical table, each returns only items matching its entity type.
+
+---
+
+## Scan vs Query
+
+| | Scan | Query |
+|---|------|-------|
+| **Reads** | Entire table (or index) | Single partition key |
+| **Cost** | Proportional to table size | Proportional to items in partition |
+| **Use case** | Analytics, admin tools, data export | Application access patterns |
+| **FilterExpression** | Reduces network transfer, NOT read capacity | Same behavior |
+
+Prefer queries for application access patterns. Use scans for administrative operations, data migrations, or when you genuinely need all items of a given entity type.
+
+---
+
+## Running the Example
+
+The complete runnable example is at [`examples/scan.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/scan.ts) in the repository.
+
+Start DynamoDB Local:
+
+```bash
+docker run -d -p 8000:8000 amazon/dynamodb-local
+```
+
+Run the example:
+
+```bash
+npx tsx examples/scan.ts
+```
+
+### Layer Setup
+
+```typescript title="main.ts"
+import { Effect, Layer } from "effect"
+import { DynamoClient } from "effect-dynamodb"
+
+const AppLayer = Layer.mergeAll(
+  DynamoClient.layer({
+    region: "us-east-1",
+    endpoint: "http://localhost:8000",
+    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  }),
+  MainTable.layer({ name: "scan-demo-table" }),
+)
+
+const main = program.pipe(Effect.provide(AppLayer))
+
+Effect.runPromise(main).then(
+  () => console.log("Done."),
+  (err) => console.error("Failed:", err),
+)
+```
+
+---
+
+## Key Takeaways
+
+| Concept | How it's used |
+|---------|---------------|
+| **Entity.scan()** | On entity definitions -- returns `Query<Entity.Record>` descriptor, composable with all Query combinators |
+| **collect() / paginate()** | On bound entities -- executes a scan (or query) with optional variadic combinators |
+| **Entity.filter()** | Server-side FilterExpression on scans -- reduces network transfer |
+| **Query.limit()** | Caps items evaluated per DynamoDB request |
+| **Query.consistentRead** | Strongly consistent reads at 2x RCU cost |
+| **Entity-type isolation** | `__edd_e__` filter ensures scans return only the matching entity type |
+| **Scan vs Query** | Scans read the whole table; queries target a partition -- prefer queries for app patterns |
+
+## What's Next?
+
+- [Example: Conditional Writes & Filters](/effect-dynamodb/tutorials/expressions/) -- Conditional puts, updates, deletes, and filter operators
+- [Example: Projections](/effect-dynamodb/tutorials/projections/) -- Selective attribute retrieval with ProjectionExpression
+- [Queries Guide](/effect-dynamodb/guides/queries/) -- Index queries, pagination, sort key conditions, and collections
+- [Example: Human Resources](/effect-dynamodb/tutorials/human-resources/) -- Full single-table design with 3 entities, collections, and transactions

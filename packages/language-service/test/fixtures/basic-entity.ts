@@ -9,8 +9,12 @@ class User extends Schema.Class<User>("User")({
   email: Schema.String,
   displayName: Schema.NonEmptyString,
   role: Schema.Literals(["admin", "member"]),
-  createdBy: Schema.String.pipe(DynamoModel.Immutable),
+  createdBy: Schema.String,
 }) {}
+
+const UserModel = DynamoModel.configure(User, {
+  createdBy: { immutable: true },
+})
 
 class Task extends Schema.Class<Task>("Task")({
   taskId: Schema.String,
@@ -24,7 +28,7 @@ const AppSchema = DynamoSchema.make({ name: "crud-demo", version: 1 })
 const MainTable = Table.make({ schema: AppSchema })
 
 const _Users = Entity.make({
-  model: User,
+  model: UserModel,
   table: MainTable,
   entityType: "User",
   indexes: {

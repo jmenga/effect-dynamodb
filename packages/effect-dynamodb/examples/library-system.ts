@@ -34,7 +34,6 @@ import { Console, Effect, Layer, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 
@@ -80,11 +79,10 @@ class Member extends Schema.Class<Member>("Member")({
 }) {}
 
 // =============================================================================
-// 2. Schema + Table
+// 2. Schema
 // =============================================================================
 
 const LibSchema = DynamoSchema.make({ name: "library", version: 1 })
-const LibTable = Table.make({ schema: LibSchema })
 
 // =============================================================================
 // 3. Entity definitions — 4 entities, 3 GSIs, 4 collections
@@ -98,7 +96,6 @@ const LibTable = Table.make({ schema: LibSchema })
  */
 const Authors = Entity.make({
   model: Author,
-  table: LibTable,
   entityType: "Author",
   indexes: {
     primary: {
@@ -127,7 +124,6 @@ const Authors = Entity.make({
  */
 const Books = Entity.make({
   model: Book,
-  table: LibTable,
   entityType: "Book",
   indexes: {
     primary: {
@@ -166,7 +162,6 @@ const Books = Entity.make({
  */
 const Genres = Entity.make({
   model: Genre,
-  table: LibTable,
   entityType: "Genre",
   indexes: {
     primary: {
@@ -202,7 +197,6 @@ const Genres = Entity.make({
  */
 const Members = Entity.make({
   model: Member,
-  table: LibTable,
   entityType: "Member",
   indexes: {
     primary: {
@@ -220,7 +214,13 @@ const Members = Entity.make({
 })
 
 // =============================================================================
-// 4. Seed data
+// 4. Table definition — declares all entity members
+// =============================================================================
+
+const LibTable = Table.make({ schema: LibSchema, entities: { Authors, Books, Genres, Members } })
+
+// =============================================================================
+// 5. Seed data
 // =============================================================================
 
 const authors = {
@@ -316,7 +316,7 @@ const members = {
 } as const
 
 // =============================================================================
-// 5. Helpers
+// 6. Helpers
 // =============================================================================
 
 const assert = (condition: boolean, message: string): void => {
@@ -330,31 +330,28 @@ const assertEq = <T>(actual: T, expected: T, label: string): void => {
 }
 
 // =============================================================================
-// 6. Main program — 8 access patterns with assertions
+// 7. Main program — 8 access patterns with assertions
 // =============================================================================
 
 const program = Effect.gen(function* () {
-  const client = yield* DynamoClient
+  // Typed execution gateway — binds all table members
+  const db = yield* DynamoClient.make(LibTable)
 
   // --- Setup: create table ---
-  yield* client.createTable({
-    TableName: "library-table",
-    BillingMode: "PAY_PER_REQUEST",
-    ...Table.definition(LibTable, [Authors, Books, Genres, Members]),
-  })
+  yield* db.createTable()
 
   // --- Seed data ---
   for (const author of Object.values(authors)) {
-    yield* Authors.put(author)
+    yield* db.Authors.put(author)
   }
   for (const book of Object.values(books)) {
-    yield* Books.put(book)
+    yield* db.Books.put(book)
   }
   for (const g of Object.values(genres)) {
-    yield* Genres.put(g)
+    yield* db.Genres.put(g)
   }
   for (const member of Object.values(members)) {
-    yield* Members.put(member)
+    yield* db.Members.put(member)
   }
 
   // -------------------------------------------------------------------------
@@ -362,7 +359,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 1: Get Author by Name (primary)")
 
-  const tolkien = yield* Authors.get({
+  const tolkien = yield* db.Authors.get({
     authorLastName: "Tolkien",
     authorFirstName: "J.R.R.",
   })
@@ -371,7 +368,7 @@ const program = Effect.gen(function* () {
   assertEq(tolkien.birthday, "1892-01-03", "tolkien birthday")
   assert(tolkien.bio.includes("philologist"), "tolkien bio")
 
-  const asimov = yield* Authors.get({
+  const asimov = yield* db.Authors.get({
     authorLastName: "Asimov",
     authorFirstName: "Isaac",
   })
@@ -387,7 +384,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 2: Book + Genre by ISBN (primary — detail)")
 
-  const hobbit = yield* Books.get({
+  const hobbit = yield* db.Books.get({
     isbn: "978-0-547-928227",
     bookId: "b-hobbit",
   })
@@ -398,7 +395,7 @@ const program = Effect.gen(function* () {
 
   // Genre for the same ISBN — querying Genre's primary by isbn
   // Since Genre has composite SK [genre, subgenre], we get by full key
-  const hobbitGenre = yield* Genres.get({
+  const hobbitGenre = yield* db.Genres.get({
     isbn: "978-0-547-928227",
     genre: "Fantasy",
     subgenre: "High Fantasy",
@@ -417,28 +414,28 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 3: Author's Works (gsi2 — works collection)")
 
-  const asimovBooks = yield* Query.collect(
+  const asimovBooks = yield* db.Books.collect(
     Books.query.author({ authorLastName: "Asimov", authorFirstName: "Isaac" }),
   )
   assertEq(asimovBooks.length, 2, "Asimov has 2 books")
   const asimovTitles = asimovBooks.map((b) => b.bookTitle).sort()
   assertEq(asimovTitles, ["Foundation", "I, Robot"], "Asimov book titles")
 
-  const asimovGenres = yield* Query.collect(
+  const asimovGenres = yield* db.Genres.collect(
     Genres.query.author({ authorLastName: "Asimov", authorFirstName: "Isaac" }),
   )
   assertEq(asimovGenres.length, 2, "Asimov has 2 genres")
   const asimovSubgenres = asimovGenres.map((g) => g.subgenre).sort()
   assertEq(asimovSubgenres, ["Robotics", "Space Opera"], "Asimov subgenres")
 
-  const tolkienBooks = yield* Query.collect(
+  const tolkienBooks = yield* db.Books.collect(
     Books.query.author({ authorLastName: "Tolkien", authorFirstName: "J.R.R." }),
   )
   assertEq(tolkienBooks.length, 1, "Tolkien has 1 book")
   assertEq(tolkienBooks[0]!.bookTitle, "The Hobbit", "Tolkien book title")
 
   // Author's own record in the works collection
-  const tolkienInfo = yield* Query.collect(
+  const tolkienInfo = yield* db.Authors.collect(
     Authors.query.info({ authorLastName: "Tolkien", authorFirstName: "J.R.R." }),
   )
   assertEq(tolkienInfo.length, 1, "Tolkien has 1 author record in works")
@@ -455,13 +452,13 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 4: Member Account (gsi1 — account collection)")
 
   // Before loans: member record only
-  const aliceAccount = yield* Query.collect(Members.query.account({ memberId: "m-alice" }))
+  const aliceAccount = yield* db.Members.collect(Members.query.account({ memberId: "m-alice" }))
   assertEq(aliceAccount.length, 1, "Alice has 1 account record (no loans yet)")
   assertEq(aliceAccount[0]!.city, "New York", "Alice city")
   assertEq(aliceAccount[0]!.state, "NY", "Alice state")
 
   // No loaned books yet — sparse index means Books won't appear in gsi1
-  const aliceLoans = yield* Query.collect(Books.query.loans({ memberId: "m-alice" }))
+  const aliceLoans = yield* db.Books.collect(Books.query.loans({ memberId: "m-alice" }))
   assertEq(aliceLoans.length, 0, "Alice has 0 loaned books initially")
   yield* Console.log("  Account: Member info (no loans yet) — OK")
 
@@ -473,12 +470,14 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 5: Books by Title (gsi3 — titles collection)")
 
-  const foundationByTitle = yield* Query.collect(Books.query.releases({ bookTitle: "Foundation" }))
+  const foundationByTitle = yield* db.Books.collect(
+    Books.query.releases({ bookTitle: "Foundation" }),
+  )
   assertEq(foundationByTitle.length, 1, "1 book titled Foundation")
   assertEq(foundationByTitle[0]!.isbn, "978-0-553-293357", "Foundation ISBN")
   assertEq(foundationByTitle[0]!.releaseDate, "1951-06-01", "Foundation release")
 
-  const foundationGenresByTitle = yield* Query.collect(
+  const foundationGenresByTitle = yield* db.Genres.collect(
     Genres.query.title({ bookTitle: "Foundation" }),
   )
   assertEq(foundationGenresByTitle.length, 1, "Foundation has 1 genre")
@@ -494,12 +493,12 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 6: Genre Categories (gsi1 — standalone)")
 
-  const sciFiGenres = yield* Query.collect(Genres.query.categories({ genre: "Sci-Fi" }))
+  const sciFiGenres = yield* db.Genres.collect(Genres.query.categories({ genre: "Sci-Fi" }))
   assertEq(sciFiGenres.length, 2, "2 Sci-Fi genres")
   const sciFiSubgenres = sciFiGenres.map((g) => g.subgenre).sort()
   assertEq(sciFiSubgenres, ["Robotics", "Space Opera"], "Sci-Fi subgenres")
 
-  const fantasyGenres = yield* Query.collect(Genres.query.categories({ genre: "Fantasy" }))
+  const fantasyGenres = yield* db.Genres.collect(Genres.query.categories({ genre: "Fantasy" }))
   assertEq(fantasyGenres.length, 1, "1 Fantasy genre")
   assertEq(fantasyGenres[0]!.subgenre, "High Fantasy", "Fantasy subgenre")
   assertEq(fantasyGenres[0]!.bookTitle, "The Hobbit", "Fantasy bookTitle")
@@ -513,11 +512,12 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 7: Loan a Book (update — sparse index)")
 
-  const loanedHobbit = yield* Books.update({
-    isbn: "978-0-547-928227",
-    bookId: "b-hobbit",
-  }).pipe(
-    Books.set({
+  const loanedHobbit = yield* db.Books.update(
+    {
+      isbn: "978-0-547-928227",
+      bookId: "b-hobbit",
+    },
+    Entity.set({
       memberId: "m-alice",
       loanEndDate: "2025-04-01",
       // Must provide all GSI composites for affected indexes.
@@ -535,13 +535,13 @@ const program = Effect.gen(function* () {
   assertEq(loanedHobbit.bookTitle, "The Hobbit", "loaned title preserved")
 
   // Now the book appears in Alice's loans via sparse index
-  const aliceLoansAfter = yield* Query.collect(Books.query.loans({ memberId: "m-alice" }))
+  const aliceLoansAfter = yield* db.Books.collect(Books.query.loans({ memberId: "m-alice" }))
   assertEq(aliceLoansAfter.length, 1, "Alice now has 1 loaned book")
   assertEq(aliceLoansAfter[0]!.bookTitle, "The Hobbit", "loaned book is The Hobbit")
   assertEq(aliceLoansAfter[0]!.isbn, "978-0-547-928227", "loaned book ISBN")
 
   // Bob still has no loans
-  const bobLoans = yield* Query.collect(Books.query.loans({ memberId: "m-bob" }))
+  const bobLoans = yield* db.Books.collect(Books.query.loans({ memberId: "m-bob" }))
   assertEq(bobLoans.length, 0, "Bob has 0 loans")
   yield* Console.log("  Loan: Book appears in sparse loans index — OK")
 
@@ -570,11 +570,11 @@ const program = Effect.gen(function* () {
   ])
 
   // Verify: book is returned (no longer in loans index)
-  const aliceLoansCleared = yield* Query.collect(Books.query.loans({ memberId: "m-alice" }))
+  const aliceLoansCleared = yield* db.Books.collect(Books.query.loans({ memberId: "m-alice" }))
   assertEq(aliceLoansCleared.length, 0, "Alice has 0 loans after return")
 
   // Verify: book still exists and is intact
-  const returnedHobbit = yield* Books.get({
+  const returnedHobbit = yield* db.Books.get({
     isbn: "978-0-547-928227",
     bookId: "b-hobbit",
   })
@@ -585,7 +585,7 @@ const program = Effect.gen(function* () {
   assert(returnedHobbit.loanEndDate === undefined, "loanEndDate cleared after return")
 
   // Verify: book still appears in author's works
-  const tolkienBooksAfter = yield* Query.collect(
+  const tolkienBooksAfter = yield* db.Books.collect(
     Books.query.author({ authorLastName: "Tolkien", authorFirstName: "J.R.R." }),
   )
   assertEq(tolkienBooksAfter.length, 1, "Tolkien still has 1 book after return")
@@ -593,12 +593,12 @@ const program = Effect.gen(function* () {
   yield* Console.log("  Return: Book removed from loans index, still in works — OK")
 
   // --- Cleanup ---
-  yield* client.deleteTable({ TableName: "library-table" })
+  yield* db.deleteTable
   yield* Console.log("\nAll 8 patterns passed.")
 })
 
 // =============================================================================
-// 7. Provide dependencies and run
+// 8. Provide dependencies and run
 // =============================================================================
 
 const AppLayer = Layer.mergeAll(
@@ -610,7 +610,7 @@ const AppLayer = Layer.mergeAll(
   LibTable.layer({ name: "library-table" }),
 )
 
-const main = program.pipe(Effect.provide(AppLayer), Effect.scoped)
+const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
   () => console.log("\nDone."),

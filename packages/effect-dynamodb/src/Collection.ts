@@ -14,7 +14,7 @@ import { ValidationError } from "./Errors.js"
 import type { IndexDefinition } from "./KeyComposer.js"
 import * as KeyComposer from "./KeyComposer.js"
 import * as Query from "./Query.js"
-import type { Table, TableConfig } from "./Table.js"
+import type { TableConfig } from "./Table.js"
 
 // ---------------------------------------------------------------------------
 // Structural entity constraint — avoids Entity interface invariance in TIndexes.
@@ -27,7 +27,8 @@ interface CollectionEntity {
   readonly _tag: "Entity"
   readonly entityType: string
   readonly indexes: Record<string, IndexDefinition>
-  readonly table: Table
+  readonly _schema: DynamoSchema.DynamoSchema
+  readonly _tableTag: import("effect").ServiceMap.Service<TableConfig, TableConfig>
   readonly schemas: {
     readonly recordSchema: Schema.Codec<any>
   }
@@ -112,7 +113,7 @@ export const make = <
         sharedPkField = indexDef.pk.field
         sharedSkField = indexDef.sk.field
         sharedDynamoIndexName = indexDef.index
-        sharedSchema = entity.table.schema
+        sharedSchema = entity._schema
         collectionType = indexDef.type ?? "clustered"
         break
       }
@@ -223,7 +224,7 @@ export const make = <
       skField: sharedSkField,
       entityTypes: targetEntityTypes,
       decoder,
-      resolveTableName: firstEntity.table.Tag.useSync((tc: TableConfig) => tc.name),
+      resolveTableName: firstEntity._tableTag.useSync((tc: TableConfig) => tc.name),
     })
   }
 
@@ -248,7 +249,7 @@ export const make = <
       pkValue: rawQuery._state.pkValue,
       skField: sharedSkField,
       entityTypes,
-      resolveTableName: entityEntries[0]![1].table.Tag.useSync((tc: TableConfig) => tc.name),
+      resolveTableName: entityEntries[0]![1]._tableTag.useSync((tc: TableConfig) => tc.name),
       decoder: (raw) => {
         // This decoder gets called per-item, but Query.collect collects all items
         // We need to tag each item with its entity key so the caller can group
@@ -297,7 +298,7 @@ export const make = <
                 }),
             ),
           ),
-        resolveTableName: entity.table.Tag.useSync((tc: TableConfig) => tc.name),
+        resolveTableName: entity._tableTag.useSync((tc: TableConfig) => tc.name),
       })
 
       // Clustered entity selectors add begins_with on the entity SK prefix

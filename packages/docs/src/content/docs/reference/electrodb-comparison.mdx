@@ -1,0 +1,272 @@
+---
+title: "ElectroDB Comparison"
+description: "Feature-by-feature comparison between effect-dynamodb and ElectroDB"
+---
+
+ElectroDB is the most feature-rich existing DynamoDB ORM for TypeScript. This comparison maps its capabilities against effect-dynamodb to help teams evaluate which library best fits their needs.
+
+**Methodology:** Complete feature inventory of ElectroDB (from electrodb.dev documentation) compared against effect-dynamodb capabilities.
+
+---
+
+## Feature Comparison Matrix
+
+### 1. Data Modeling
+
+| Feature | ElectroDB | effect-dynamodb | Assessment |
+|---------|-----------|-----------------|------------|
+| Schema definition | Inline JS objects with type inference | Effect Schema (`Schema.Class`/`Struct`) | **Advantage** — richer validation, bidirectional transforms, branded types |
+| Attribute types | string, number, boolean, map, list, set, any, `CustomAttributeType` | All Effect Schema types including DateTime, branded, unions | **Advantage** — full Schema ecosystem |
+| Required attributes | `required: true` property | Schema-level required/optional | Parity |
+| Default values | `default: value \| () => value` | Schema defaults (`Schema.withDefault`) | Parity |
+| Attribute validation | `validate: RegExp \| callback` | Schema `.check()` with named factories | **Advantage** — composable, named checks |
+| Read-only after creation | `readOnly: true` | `DynamoModel.configure(model, { field: { immutable: true } })` | Parity |
+| Field aliasing | `field: "dbFieldName"` | `DynamoModel.configure(model, { field: { field: "dbName" } })` | Parity |
+| Hidden attributes | `hidden: true` (excluded from responses) | `DynamoModel.Hidden` annotation | Parity |
+| Enum attributes | Array of allowed values | `Schema.Literals([...])` | Parity |
+| Opaque/branded types | `CustomAttributeType<T>`, `OpaquePrimitiveType` | Effect Schema branded types | **Advantage** — first-class support with compile-time enforcement |
+| Date/time handling | Manual (string/number attributes) | 9 built-in date schemas (`DateString`, `DateEpochMs`, `DateEpochSeconds`, `DateTimeZoned`, etc.) with `storedAs` modifier | **Advantage** — type-safe date handling with configurable storage |
+| Attribute labels for keys | `label: "customPrefix"` | Not supported (attribute name used) | ElectroDB only |
+| Attribute padding in keys | `padding: { length, char }` | Automatic zero-padding for numeric composites (16 digits for numbers, 38 for bigints) | Parity |
+| Getter/setter hooks | `get`/`set` callbacks per attribute | Use `Schema.transform` / `Schema.transformOrFail` | Different approach — see note 1 |
+| Watch attribute changes | `watch: ["attr1"] \| "*"` | Not applicable | Different approach — see note 1 |
+| Calculated attributes | Via watch + set | Not applicable | Different approach — see note 1 |
+| Virtual attributes | Via watch + get (never persisted) | Not applicable | Different approach — see note 1 |
+| DynamoDB native Set type | `type: "set"`, items: "string"/"number" | `Schema.ReadonlySet(Schema.String)` / `Schema.ReadonlySet(Schema.Number)` — marshalls to native `SS`/`NS`; `Entity.add()` (atomic addition), `Entity.deleteFromSet()` (atomic removal) | Parity |
+
+> **Note 1:** ElectroDB's getter/setter/watch/calculated/virtual attributes follow an imperative callback paradigm. Effect Schema provides equivalent power through composable, declarative transformations (`Schema.transform`, `Schema.transformOrFail`, custom annotations). These represent a different design philosophy rather than a missing capability.
+
+### 2. Indexes
+
+| Feature | ElectroDB | effect-dynamodb | Assessment |
+|---------|-----------|-----------------|------------|
+| Named access patterns | Yes | Yes (index names on Entity) | Parity |
+| Composite key composition | Attribute arrays | ElectroDB-style attribute arrays | Parity |
+| Key casing | `"upper"/"lower"/"none"/"default"` | `"lowercase"/"uppercase"/"preserve"` | Parity |
+| Isolated indexes | `type: "isolated"` (default) | Supported | Parity |
+| Clustered indexes | `type: "clustered"` | Supported (default for collections) | Parity |
+| Sparse indexes | `condition` callback | Auto-sparse via `tryComposeIndexKeys` (missing composites skip GSI) | Parity |
+| Sub-collections | `collection: ["parent", "child"]` | `collection: ["parent", "child"]` | Parity |
+| Custom key templates | `template: "${attr}_suffix"` | Not supported (attribute-list only) | ElectroDB only — intentional (see note 2) |
+| Composite index type | `type: "composite"` (separate columns per attribute) | Not supported | ElectroDB only |
+| Index scope | `scope` string for entity isolation | Not supported | ElectroDB only |
+| Key casting | `cast: "number"` for numeric sort keys | Not supported (string keys only) | ElectroDB only |
+| Attributes as indexes | When attribute field matches index field | Not supported | ElectroDB only |
+
+> **Note 2:** Key templates (`"USER#${userId}"`) offer maximum flexibility but introduce string-based complexity. Attribute-list composition is simpler, more predictable, and covers standard single-table patterns. This is an intentional design choice.
+
+### 3. Read Operations
+
+| Feature | ElectroDB | effect-dynamodb | Assessment |
+|---------|-----------|-----------------|------------|
+| Get (single item) | `entity.get(pk).go()` | `bound.get(key)` | Parity |
+| Query by access pattern | `entity.query.<name>(pk).go()` | `bound.collect(EntityDef.query.<name>(pk))` | Parity |
+| Sort key conditions | begins, between, gt, gte, lt, lte | eq, lt, lte, gt, gte, between, beginsWith | Parity |
+| Filter expressions | `.where((attrs, ops) => ...)` callback | `Entity.filter(callback | shorthand)` declarative object | Parity |
+| Scan | `entity.scan.go()` | `bound.collect(EntityDef.scan())` | Parity |
+| Collection query | `service.collections.<name>(pk)` | `Collection.query(pk)` | Parity |
+| Batch get | `entity.get([...]).go()` | `Batch.get(items)` with auto-retry | Parity |
+| Transact get | `service.transaction.get(cb)` | `Transaction.transactGet(items)` | Parity |
+| Consistent reads | `consistent: true` | `Entity.consistentRead()`, `Query.consistentRead()` | Parity |
+| Projection expression | `attributes: [...]` | `Entity.select(callback | attrs)` | Parity |
+| Page count limiting | `pages: N` | `Query.maxPages(n)` | Parity |
+| Count mode | Count target | `Query.count` terminal (uses `Select: "COUNT"`) | Parity |
+| Params-only mode | `.params()` returns request without executing | `Query.asParams` | Parity |
+| Ignore entity ownership | `ignoreOwnership: true` | `Query.ignoreOwnership` | Parity |
+| Auto-pagination | `pages: "all"` | `bound.collect(query)` fetches all pages | Parity |
+| Cursor-based pagination | `cursor` in response | `bound.paginate(query)` returns Stream, `Query.execute(query)` returns single page with cursor | **Advantage** — Stream-based pagination is more composable |
+| Response data format | `"attributes"/"includeKeys"/"raw"` | 4 decode modes: `asModel`/`asRecord`/`asItem`/`asNative` | **Advantage** — richer decode options |
+| Preserve batch order | `preserveBatchOrder: true` | Positional tuple matching (always ordered) | **Advantage** — ordered by default |
+| Find (auto index selection) | `entity.find(attrs).go()` | Not supported — use explicit `entity.query.<indexName>()` | ElectroDB only |
+| Match (auto index + filter) | `entity.match(attrs).go()` | Not supported — use explicit query + filter | ElectroDB only |
+| Hydrate (KEYS_ONLY GSI) | `hydrate: true` auto batch-get | Not supported — compose manually: query GSI then `Batch.get` | ElectroDB only |
+
+### 4. Write Operations
+
+| Feature | ElectroDB | effect-dynamodb | Assessment |
+|---------|-----------|-----------------|------------|
+| Put (create/overwrite) | `entity.put(data).go()` | `bound.put(input)` | Parity |
+| Create (fail if exists) | `entity.create(data).go()` | `bound.create(input)` | Parity |
+| Upsert (create or update) | `entity.upsert(data).go()` | `bound.upsert(input)` | Parity |
+| Update | `entity.update(pk).set({}).go()` | `bound.update(key, Entity.set(updates))` | Parity |
+| Patch (fail if not exists) | `entity.patch(pk).set({}).go()` | `bound.patch(key, Entity.set(updates))` | Parity |
+| Delete | `entity.delete(pk).go()` | `bound.delete(key)` | Parity |
+| Remove (fail if not exists) | `entity.remove(pk).go()` | `bound.deleteIfExists(key)` | Parity |
+| Conditional writes | `.where()` on any mutation | `Entity.condition(callback \| shorthand)` on put/update/delete | Parity |
+| Batch put/delete | `entity.put([...]).go()`, `entity.delete([...]).go()` | `Batch.write(ops)` with auto-retry | Parity |
+| Transact write | `service.transaction.write(cb)` | `Transaction.transactWrite(ops)` | Parity |
+| Condition check (transaction) | `.check().where().commit()` | `Transaction.check(condition)` | Parity |
+| Return values control | `response: "all_old"/"all_new"/etc.` | `Entity.returnValues(mode)` | Parity |
+
+### 5. Update Expression Builders
+
+| Feature | ElectroDB | effect-dynamodb | Assessment |
+|---------|-----------|-----------------|------------|
+| SET (replace values) | `.set({})` | `Entity.set(updates)` | Parity |
+| REMOVE (delete attributes) | `.remove([])` | `Entity.remove(fields)` | Parity |
+| ADD (increment / add to set) | `.add({})` | `Entity.add(values)` | Parity |
+| SUBTRACT (decrement) | `.subtract({})` | `Entity.subtract(values)` | Parity |
+| APPEND (add to list) | `.append({})` | `Entity.append(values)` | Parity |
+| DELETE (remove from set) | `.delete({})` | `Entity.deleteFromSet(values)` | Parity |
+| Data callback | `.data((attrs, ops) => ...)` | Not supported — use pipe composition with Effect operators | ElectroDB only |
+| Nested property updates | Dot notation for maps, brackets for lists | Not supported — use full object via `Entity.set()` or `DynamoClient.updateItem` | ElectroDB only |
+
+### 6. Lifecycle & Data Integrity
+
+| Feature | ElectroDB | effect-dynamodb | Assessment |
+|---------|-----------|-----------------|------------|
+| Entity isolation | `__edb_e__` + `__edb_v__` | `__edd_e__` discriminator | Parity |
+| Schema versioning | `model.version` | `DynamoSchema.version` | Parity |
+| Application namespace | `model.service` | `DynamoSchema.name` | Parity |
+| DynamoDB Streams parsing | `entity.parse()` utility | `Entity.marshalledSchema()`, `Entity.itemSchema()` | Parity |
+| Timestamps | Manual (watch/set/default recipe) | Built-in `timestamps` config with configurable storage format | **Advantage** |
+| Version tracking | Not built-in | Built-in `versioned` config with auto-increment | **Advantage** |
+| Version history/snapshots | Not built-in | Built-in `versioned: { retain: true }` — atomic snapshot on every write | **Advantage** |
+| Version retrieval | Not built-in | `Entity.getVersion(key, version)`, `Entity.versions(key)` | **Advantage** |
+| Soft delete | Not built-in | Built-in `softDelete` config with optional TTL | **Advantage** |
+| Restore soft-deleted | Not built-in | `Entity.restore(key)` — recomposes all keys and unique sentinels | **Advantage** |
+| Purge (full partition) | Not built-in | `Entity.purge(key)` — deletes item + versions + sentinels | **Advantage** |
+| Soft-deleted item access | Not built-in | `Entity.deleted.get(key)`, `Entity.deleted.list(key)` | **Advantage** |
+| Unique constraints | Manual via transactions | Built-in `unique` config — sentinel-based with atomic transactions | **Advantage** |
+| Optimistic locking | Not built-in | Built-in `Entity.expectedVersion(n)` | **Advantage** |
+| Idempotency | Manual via transaction tokens | Built-in via unique constraints | **Advantage** |
+| Conversion utilities | Composites ↔ Keys ↔ Cursors | Use `KeyComposer` functions directly | Different approach |
+| Event listeners/logging | `listeners`/`logger` callbacks | Use Effect tracing/logging (`Effect.tap`, `Effect.log`, spans) | Different approach |
+| Custom params merge | `params` option merged into request | Not supported | ElectroDB only |
+
+### 7. Aggregates & Domain Modeling
+
+| Feature | ElectroDB | effect-dynamodb | Assessment |
+|---------|-----------|-----------------|------------|
+| Graph-based aggregates | Not built-in | `Aggregate.make()` — multi-entity composite domain models | **Advantage** |
+| Edge types (one/many/ref) | Not built-in | `Aggregate.one()`, `Aggregate.many()`, `Aggregate.ref()` | **Advantage** |
+| Sub-aggregates | Not built-in | Recursive sub-aggregate composition via `.with()` | **Advantage** |
+| Aggregate create (atomic) | Not built-in | Atomic transactional decomposition + write | **Advantage** |
+| Aggregate update (optic-based) | Not built-in | `Aggregate.update()` with cursor/optic mutation context | **Advantage** |
+| Ref hydration on read | Not built-in | Automatic entity hydration for one/many/ref edges | **Advantage** |
+| Discriminator-based edges | Not built-in | `OneEdge` and `BoundSubAggregate` with discriminator SK format | **Advantage** |
+
+### 8. Event Sourcing
+
+| Feature | ElectroDB | effect-dynamodb | Assessment |
+|---------|-----------|-----------------|------------|
+| Event streams | Not built-in | `EventStore.makeStream()` — append-only event log per stream | **Advantage** |
+| Command handlers | Not built-in | `EventStore.commandHandler()` — decider pattern with state fold | **Advantage** |
+| Stream fold/projection | Not built-in | `EventStore.fold()`, `EventStore.foldFrom()` | **Advantage** |
+
+### 9. Type System
+
+| Feature | ElectroDB | effect-dynamodb | Assessment |
+|---------|-----------|-----------------|------------|
+| Type inference from schema | Inline schemas get inference; external need `as const` | Full inference from Effect Schema | **Advantage** |
+| Item type | `EntityItem<E>` | `Entity.Record<E>` | Parity |
+| Identity/key type | `EntityIdentifiers<E>` | `Entity.Key<E>` | Parity |
+| Create input type | `CreateEntityItem<E>` | `Entity.Input<E>` | Parity |
+| Update input type | `UpdateEntityItem<E>` | `Entity.Update<E>` | Parity |
+| Marshalled type | Not built-in | `Entity.Marshalled<E>` | **Advantage** |
+| Item with keys type | Not separate | `Entity.Item<E>` | **Advantage** |
+| 7 derived types | N/A | Model, Record, Input, Update, Key, Item, Marshalled | **Advantage** |
+| Ref-aware input types | N/A | Entity fields auto-transform to `fieldId: string` in Input | **Advantage** |
+
+### 10. Integration & DX
+
+| Feature | ElectroDB | effect-dynamodb | Assessment |
+|---------|-----------|-----------------|------------|
+| AWS SDK v3 support | Yes | Yes (via DynamoClient) | Parity |
+| Layer-based DI | N/A (plain JS) | Full Effect Layer/Service integration | **Advantage** |
+| Resource management | Manual client lifecycle | `Effect.acquireRelease` in DynamoClient | **Advantage** |
+| Error handling | `ElectroError` with codes | 18 tagged errors with `catchTag` discrimination | **Advantage** |
+| Streaming pagination | Not built-in (cursor loops) | `Stream.paginate` integration | **Advantage** |
+| Table definition export | Not built-in | `Table.definition()` for CloudFormation/CDK | **Advantage** |
+| Config-based setup | N/A | `DynamoClient.layerConfig()`, `Table.layerConfig()` via Effect Config | **Advantage** |
+| Dual APIs (pipe support) | N/A (fluent chaining only) | `Function.dual` on all public functions | **Advantage** |
+| Geospatial queries | Not built-in | `@effect-dynamodb/geo` — H3-based proximity search | **Advantage** |
+| Language service plugin | Not built-in | `@effect-dynamodb/language-service` — hover tooltips showing DynamoDB operations | **Advantage** |
+| Interactive playground | electrodb.fun | Built-in docs playground | Parity |
+| CLI tooling | ElectroCLI | Not built-in | ElectroDB only |
+| AWS SDK v2 support | Yes | No | N/A (v2 is deprecated) |
+
+---
+
+## Summary
+
+| Category | Parity | effect-dynamodb Advantage | ElectroDB Only |
+|----------|--------|---------------------------|----------------|
+| Data Modeling | 9 | 3 | 3 (3 philosophical) |
+| Indexes | 6 | 0 | 6 (1 intentional) |
+| Read Operations | 14 | 3 | 3 |
+| Write Operations | 12 | 0 | 0 |
+| Update Expressions | 6 | 0 | 2 |
+| Lifecycle & Data Integrity | 3 | 11 | 1 |
+| Aggregates & Domain Modeling | 0 | 7 | 0 |
+| Event Sourcing | 0 | 3 | 0 |
+| Type System | 4 | 5 | 0 |
+| Integration & DX | 2 | 10 | 1 |
+| **Total** | **56** | **42** | **16** |
+
+---
+
+## effect-dynamodb Advantages
+
+These are capabilities that ElectroDB does not provide:
+
+1. **Built-in lifecycle management** — Timestamps, versioning with snapshot history, soft delete with restore/purge — all declarative config. ElectroDB requires manual implementation for each.
+
+2. **Built-in data integrity** — Unique constraints via sentinel items, optimistic locking via `expectedVersion()`, and idempotency — all enforced atomically. ElectroDB has no built-in concurrency control.
+
+3. **Graph-based aggregates** — `Aggregate.make()` binds multi-entity hierarchies (one/many/ref edges) to a single partition, with atomic create, optic-based update, and automatic hydration on read. No equivalent in ElectroDB.
+
+4. **Event sourcing** — `EventStore.makeStream()` provides append-only event logs with command handlers and state fold projections built on DynamoDB.
+
+5. **Effect integration** — Full Effect ecosystem: Layer-based DI, 18 tagged errors with `catchTag`, Stream-based pagination, resource management, composable pipelines, dual APIs. This is the primary architectural differentiator.
+
+6. **9 derived types** — One entity declaration automatically produces Model, Record, Input, Update, Key, Item, Marshalled types plus ref-aware Input and Update variants. ElectroDB has fewer derived types and no marshalled/item distinction.
+
+7. **Date schema system** — 9 built-in date schemas covering `DateTime.Utc`, `DateTime.Zoned`, and native `Date` with configurable storage formats (ISO string, epoch ms, epoch seconds) and a `storedAs` modifier for runtime format switching.
+
+8. **4 decode modes** — `asModel` (clean domain), `asRecord` (with system fields), `asItem` (with DynamoDB keys), `asNative` (raw AttributeValue). ElectroDB has 3 data modes.
+
+9. **Table definition export** — `Table.definition()` generates `CreateTableCommandInput` from entity declarations for CloudFormation/CDK/testing.
+
+10. **Ecosystem packages** — `@effect-dynamodb/geo` for H3-based geospatial proximity queries, `@effect-dynamodb/language-service` for IDE hover tooltips showing DynamoDB operations.
+
+---
+
+## ElectroDB-Only Features
+
+Features in ElectroDB that are not available in effect-dynamodb, with workarounds where applicable:
+
+| Feature | Workaround |
+|---------|------------|
+| Find/Match (auto index selection) | Use explicit `entity.query.<indexName>()` — more predictable than auto-selection |
+| Custom key templates | Attribute-list composition covers standard patterns |
+| Getter/setter hooks | `Schema.transform` / `Schema.transformOrFail` provide equivalent power |
+| Watch/calculated/virtual attributes | Compute at application layer or use `Schema.transform` |
+| Attribute padding | Automatic zero-padding for numeric composites in sort keys |
+| Composite index type | DynamoDB feature from Nov 2025 — can be added in a future release |
+| Key casting (numeric keys) | All keys are strings by design |
+| Index scope | Key namespacing provides sufficient isolation |
+| Attributes as indexes | Use standard composite key definitions |
+| Data callback | Pipe composition with Effect operators |
+| Nested property updates | Full object via `Entity.set()` or `DynamoClient.updateItem` directly |
+| Custom params merge | Use `DynamoClient` directly for custom operations |
+| ElectroCLI | N/A — no CLI equivalent |
+| Hydrate (KEYS_ONLY GSI) | Query GSI then compose `Batch.get(keys)` in a pipe |
+
+See the [Migration from ElectroDB](/effect-dynamodb/reference/migration-from-electrodb/) guide for side-by-side code examples.
+
+---
+
+## Choosing Between Them
+
+| If you... | Choose |
+|-----------|--------|
+| Already use Effect TS | **effect-dynamodb** — native integration, no impedance mismatch |
+| Need lifecycle management (versioning, soft delete, restore) | **effect-dynamodb** — built-in, declarative config |
+| Need aggregate/composite domain models | **effect-dynamodb** — graph-based aggregates with atomic operations |
+| Need event sourcing on DynamoDB | **effect-dynamodb** — built-in EventStore module |
+| Need geospatial queries | **effect-dynamodb** — H3-based proximity search via `@effect-dynamodb/geo` |
+| Want minimal setup for basic CRUD | **ElectroDB** — less boilerplate, fluent chaining |
+| Need custom key templates | **ElectroDB** — template string support |
+| Need auto index selection (find/match) | **ElectroDB** — automatic index matching |
+| Prefer imperative hooks (get/set/watch) | **ElectroDB** — callback-based attribute transforms |

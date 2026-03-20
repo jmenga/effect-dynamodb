@@ -99,7 +99,7 @@ const program = Effect.gen(function* () {
 
   console.log(`Seeding ${vehicles.length} vehicles...`)
   for (const vehicle of vehicles) {
-    yield* VehicleGeo.put(vehicle)
+    yield* VehicleGeo.put(vehicle).asEffect()
     const enriched = VehicleGeo.enrich(vehicle)
     if (enriched.cell) {
       console.log(

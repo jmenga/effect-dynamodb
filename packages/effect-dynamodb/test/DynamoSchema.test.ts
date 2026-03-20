@@ -45,15 +45,15 @@ describe("DynamoSchema", () => {
       )
     })
 
-    it("applies casing to entity type only, not attribute values", () => {
+    it("applies casing to both entity type and attribute values", () => {
       expect(DynamoSchema.composeKey(schema, "Employee", ["Alice@Example.com"])).toBe(
-        "$myapp#v1#employee#Alice@Example.com",
+        "$myapp#v1#employee#alice@example.com",
       )
     })
 
     it("respects casing override", () => {
       expect(DynamoSchema.composeKey(schema, "User", ["abc"], { casing: "uppercase" })).toBe(
-        "$myapp#v1#USER#abc",
+        "$myapp#v1#USER#ABC",
       )
     })
   })

@@ -12,9 +12,9 @@ Schema-driven DynamoDB ORM for [Effect TS](https://effect.website). Single-table
 - **Schema-driven models** — Pure `Schema.Class`/`Schema.Struct` domain models with 7 auto-derived types
 - **Single-table design** — Multiple entity types sharing one table with entity type isolation and index overloading
 - **Composite key composition** — ElectroDB-style `{ pk: { field, composite }, sk: { field, composite } }` index definitions
-- **Pipeable Query API** — `Query<A>` data type with `where`, `filter`, `limit`, `reverse`, `consistentRead` combinators
-- **Scan** — `Entity.scan()` with full Query combinator support
-- **Conditional writes** — `Entity.condition()` on put, update, and delete operations
+- **Pipeable Query API** — `Query<A>` data type with `where`, `limit`, `reverse`, `consistentRead` combinators
+- **Scan** — `Entity.scan()` with full combinator support
+- **Type-safe expressions** — `Entity.condition()`, `Entity.filter()`, `Entity.select()` with PathBuilder callback API
 - **Create (insert-only)** — `Entity.create()` with automatic `attribute_not_exists` condition
 - **Rich update operations** — `Entity.remove()`, `Entity.add()`, `Entity.subtract()`, `Entity.append()`, `Entity.deleteFromSet()`
 - **Batch operations** — `Batch.get` and `Batch.write` with auto-chunking and unprocessed item retry
@@ -54,17 +54,20 @@ class Task extends Schema.Class<Task>("Task")({
   title:     Schema.NonEmptyString,
   status:    Schema.Literals(["todo", "active", "done"]),
   priority:  Schema.Number,
-  createdBy: Schema.String.pipe(DynamoModel.Immutable),
+  createdBy: Schema.String,
 }) {}
 
-// 2. Create schema + table
-const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
+// 2. Configure DynamoDB-specific overrides (separate from model)
+const TaskModel = DynamoModel.configure(Task, {
+  createdBy: { immutable: true },
+})
 
-// 3. Bind entity — indexes, timestamps, versioning
+// 3. Create schema
+const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
+
+// 4. Define entity — indexes, timestamps, versioning
 const Tasks = Entity.make({
-  model: Task,
-  table: MainTable,
+  model: TaskModel,
   entityType: "Task",
   indexes: {
     primary: {
@@ -81,10 +84,15 @@ const Tasks = Entity.make({
   versioned: true,
 })
 
-// 4. Use it
+// 5. Register entities on the table
+const MainTable = Table.make({ schema: AppSchema, entities: { Tasks } })
+
+// 6. Use it
 const program = Effect.gen(function* () {
+  const { Tasks: tasks } = yield* DynamoClient.make(MainTable)
+
   // Create
-  const task = yield* Tasks.put({
+  const task = yield* tasks.put({
     taskId: "t-1",
     projectId: "p-1",
     title: "Ship v1.0",
@@ -94,32 +102,44 @@ const program = Effect.gen(function* () {
   })
 
   // Read
-  const found = yield* Tasks.get({ taskId: "t-1" })
+  const found = yield* tasks.get({ taskId: "t-1" })
 
-  // Query with sort key condition + filter
-  const active = yield* Tasks.query.byProject({ projectId: "p-1" }).pipe(
-    Query.where({ status: "active" }),
-    Query.filter({ priority: { gte: 1 } }),
+  // Query with filter
+  const active = yield* tasks.collect(
+    Tasks.query.byProject({ projectId: "p-1" }),
+    Tasks.filter((t, { gte }) => gte(t.priority, 1)),
     Query.limit(25),
-    Query.execute,
   )
 
-  // Update with optimistic locking
-  yield* Tasks.update({ taskId: "t-1" }).pipe(
-    Tasks.set({ status: "done" }),
-    Tasks.expectedVersion(1),
-    Entity.asRecord,
+  // Update with combinators
+  yield* tasks.update(
+    { taskId: "t-1" },
+    Entity.set({ status: "done" }),
+  )
+
+  // Condition expression (callback API — type-safe)
+  yield* tasks.update(
+    { taskId: "t-1" },
+    Entity.set({ status: "active" }),
+    Tasks.condition((t, { eq }) => eq(t.status, "done")),
+  )
+
+  // Filter expression (callback API)
+  const highPriority = yield* tasks.collect(
+    Tasks.query.byProject({ projectId: "p-1" }),
+    Tasks.filter((t, { gt }) => gt(t.priority, 3)),
   )
 
   // Delete
-  yield* Tasks.delete({ taskId: "t-1" })
+  yield* tasks.delete({ taskId: "t-1" })
 
   // Scan all tasks
-  const all = yield* Tasks.scan().pipe(Query.execute)
+  const all = yield* tasks.collect(Tasks.scan())
 
   // Stream pagination
-  const stream = yield* Tasks.query.byProject({ projectId: "p-1" }).pipe(
-    Query.paginate,
+  const stream = tasks.paginate(
+    Tasks.query.byProject({ projectId: "p-1" }),
+    Query.limit(25),
   )
   yield* Stream.runForEach(stream, (t) =>
     Effect.log(`Task: ${t.title}`)
@@ -195,7 +215,8 @@ Schema.Class  →  DynamoSchema  →  Table  →  Entity
 All errors are tagged for precise discrimination:
 
 ```typescript
-const user = yield* UserEntity.get({ userId: "u-1" }).pipe(
+const { Users: users } = yield* DynamoClient.make(MainTable)
+const user = yield* users.get({ userId: "u-1" }).pipe(
   Effect.catchTag("ItemNotFound", () => Effect.succeed(null)),
   Effect.catchTag("ValidationError", (e) =>
     Effect.die(`Schema error: ${e.message}`)

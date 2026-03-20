@@ -28,11 +28,17 @@ import * as Table from "../src/Table.js"
 // 1. Domain models
 // ---------------------------------------------------------------------------
 
+const Role = { Admin: "admin", Member: "member" } as const
+const RoleSchema = Schema.Literals(Object.values(Role))
+
+const OrderStatus = { Pending: "pending", Shipped: "shipped", Delivered: "delivered" } as const
+const OrderStatusSchema = Schema.Literals(Object.values(OrderStatus))
+
 class User extends Schema.Class<User>("User")({
   userId: Schema.String,
   email: Schema.String,
   name: Schema.NonEmptyString,
-  role: Schema.Literals(["admin", "member"]),
+  role: RoleSchema,
 }) {}
 
 class Order extends Schema.Class<Order>("Order")({
@@ -40,19 +46,17 @@ class Order extends Schema.Class<Order>("Order")({
   userId: Schema.String,
   product: Schema.NonEmptyString,
   quantity: Schema.Number,
-  status: Schema.Literals(["pending", "shipped", "delivered"]),
+  status: OrderStatusSchema,
 }) {}
 
 // ---------------------------------------------------------------------------
-// 2. Schema + Table + Entities
+// 2. Schema + Entities + Table
 // ---------------------------------------------------------------------------
 
 const AppSchema = DynamoSchema.make({ name: "batch-demo", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
 
 const Users = Entity.make({
   model: User,
-  table: MainTable,
   entityType: "User",
   indexes: {
     primary: {
@@ -65,7 +69,6 @@ const Users = Entity.make({
 
 const Orders = Entity.make({
   model: Order,
-  table: MainTable,
   entityType: "Order",
   indexes: {
     primary: {
@@ -81,21 +84,19 @@ const Orders = Entity.make({
   timestamps: true,
 })
 
+const MainTable = Table.make({ schema: AppSchema, entities: { Users, Orders } })
+
 // ---------------------------------------------------------------------------
 // 3. Main program
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
-  const client = yield* DynamoClient
+  const db = yield* DynamoClient.make(MainTable)
 
   // --- Create the table ---
   yield* Console.log("=== Setup ===\n")
 
-  yield* client.createTable({
-    TableName: "batch-demo-table",
-    BillingMode: "PAY_PER_REQUEST",
-    ...Table.definition(MainTable, [Users, Orders]),
-  })
+  yield* db.createTable()
   yield* Console.log("Table created: batch-demo-table\n")
 
   // --- Batch.write — create multiple items at once ---
@@ -207,7 +208,7 @@ const program = Effect.gen(function* () {
 
   // --- Cleanup ---
   yield* Console.log("=== Cleanup ===\n")
-  yield* client.deleteTable({ TableName: "batch-demo-table" })
+  yield* db.deleteTable
   yield* Console.log("Table deleted.")
 })
 
@@ -224,7 +225,7 @@ const AppLayer = Layer.mergeAll(
   MainTable.layer({ name: "batch-demo-table" }),
 )
 
-const main = program.pipe(Effect.provide(AppLayer), Effect.scoped)
+const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
   () => console.log("\nDone."),

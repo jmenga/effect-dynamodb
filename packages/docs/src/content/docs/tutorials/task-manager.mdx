@@ -1,0 +1,799 @@
+---
+title: "Example: Task Manager"
+description: "3 entities with 5 GSIs, team queries, task status workflows, range queries, soft delete archival, and transactions"
+---
+
+A task management application with **employees**, **tasks**, and **offices** in a single DynamoDB table. Adapted from the [ElectroDB Task Manager example](https://electrodb.dev/en/examples/task-manager/) to showcase effect-dynamodb's approach to status-driven workflows, range queries, and task archival.
+
+**What you'll learn:**
+- 3 entities sharing one table with 5 GSIs
+- Team queries with date-hired range filtering (GSI2)
+- Task status index for cross-project status queries (GSI4)
+- Task status workflow: open -> in-progress -> closed
+- Soft delete for task archival with restore capability
+- Atomic onboarding via transactions
+- Sort key range queries using `KeyComposer.composeSortKeyPrefix`
+
+---
+
+## Requirements
+
+As stakeholders of this task management system, we need to support these access patterns:
+
+1. **CRUD** -- Create, read, update, and delete employees and tasks
+2. **Regional Manager** -- See office details and employees at a location (workplaces collection)
+3. **Project Manager** -- Find an employee's details and their assigned tasks (assignments collection)
+4. **Team Lead** -- Find all employees on a team, with date-hired range queries
+5. **Scrum Master** -- Find all tasks by status across projects (open, in-progress, closed)
+6. **Developer** -- Move a task through the status workflow with GSI recomposition
+7. **Hiring Manager** -- Find employees by title with salary range queries
+8. **HR** -- Atomically onboard a new employee with their first task
+9. **PM** -- Archive completed tasks (soft delete) and restore if needed
+
+---
+
+## Table Design
+
+All three entities share a single table with 5 Global Secondary Indexes:
+
+| Key | Field | Used by |
+|-----|-------|---------|
+| PK | `pk` | Employee (by ID), Task (by ID), Office (by ID) |
+| SK | `sk` | Employee, Task (project + employee), Office |
+| GSI1 PK | `gsi1pk` | Employee (by office), Task (by project), Office (by office) |
+| GSI1 SK | `gsi1sk` | Employee (team + title + ID), Task (employee + status), Office |
+| GSI2 PK | `gsi2pk` | Employee (by team) |
+| GSI2 SK | `gsi2sk` | Employee (dateHired + title) |
+| GSI3 PK | `gsi3pk` | Employee (by ID), Task (by employee) |
+| GSI3 SK | `gsi3sk` | Employee, Task (project + status) |
+| GSI4 PK | `gsi4pk` | Employee (by title), Task (by status) |
+| GSI4 SK | `gsi4sk` | Employee (salary), Task (project + employee) |
+| GSI5 PK | `gsi5pk` | Employee (by manager) |
+| GSI5 SK | `gsi5sk` | Employee (team + office) |
+
+GSI1, GSI3, and GSI4 are **overloaded** -- multiple entity types share the same physical index with different key compositions.
+
+---
+
+## Step 1: Models
+
+Pure domain models with no DynamoDB concepts:
+
+```typescript title="models.ts"
+import { Schema } from "effect"
+
+class Employee extends Schema.Class<Employee>("Employee")({
+  employee: Schema.String,
+  firstName: Schema.String,
+  lastName: Schema.String,
+  office: Schema.String,
+  title: Schema.String,
+  team: Schema.Literals(["development", "marketing", "finance", "product"]),
+  salary: Schema.String,
+  manager: Schema.String,
+  dateHired: Schema.String,
+}) {}
+
+class Task extends Schema.Class<Task>("Task")({
+  task: Schema.String,
+  project: Schema.String,
+  employee: Schema.String,
+  description: Schema.String,
+  status: Schema.Literals(["open", "in-progress", "closed"]),
+  points: Schema.Number,
+}) {}
+
+class Office extends Schema.Class<Office>("Office")({
+  office: Schema.String,
+  country: Schema.String,
+  state: Schema.String,
+  city: Schema.String,
+  zip: Schema.String,
+  address: Schema.String,
+}) {}
+```
+
+Key modeling decisions:
+- **`team`** uses `Schema.Literals` to restrict values to a fixed set of team names
+- **`status`** uses `Schema.Literals` for the task lifecycle states: `"open"`, `"in-progress"`, `"closed"`
+- **`points`** is `Schema.Number` -- numeric fields work naturally in entity attributes
+- **`salary`** is zero-padded `"000120.00"` for correct lexicographic sort key ordering
+
+---
+
+## Step 2: Schema, Table, and Entities
+
+### Schema and Table
+
+```typescript title="entities.ts"
+import { DynamoSchema, Table } from "effect-dynamodb"
+
+const TmSchema = DynamoSchema.make({ name: "taskman", version: 1 })
+const TmTable = Table.make({ schema: TmSchema, entities: { Employees, Tasks, Offices } })
+```
+
+### Employee Entity
+
+Employee has 6 indexes -- primary key plus 5 GSIs. The `teams` index (GSI2) is the key differentiator from the HR example, enabling team-based queries with date-hired range filtering:
+
+```typescript title="entities.ts"
+import { Entity } from "effect-dynamodb"
+
+const Employees = Entity.make({
+  model: Employee,
+  entityType: "Employee",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["employee"] },
+      sk: { field: "sk", composite: [] },
+    },
+    // GSI1 -- "workplaces" collection (shared with Office)
+    coworkers: {
+      index: "gsi1",
+      collection: "workplaces",
+      pk: { field: "gsi1pk", composite: ["office"] },
+      sk: { field: "gsi1sk", composite: ["team", "title", "employee"] },
+    },
+    // GSI2 -- standalone: employees by team with dateHired range queries
+    teams: {
+      index: "gsi2",
+      pk: { field: "gsi2pk", composite: ["team"] },
+      sk: { field: "gsi2sk", composite: ["dateHired", "title"] },
+    },
+    // GSI3 -- "assignments" collection (shared with Task)
+    employeeLookup: {
+      index: "gsi3",
+      collection: "assignments",
+      pk: { field: "gsi3pk", composite: ["employee"] },
+      sk: { field: "gsi3sk", composite: [] },
+    },
+    // GSI4 -- standalone: employees by title + salary
+    roles: {
+      index: "gsi4",
+      pk: { field: "gsi4pk", composite: ["title"] },
+      sk: { field: "gsi4sk", composite: ["salary"] },
+    },
+    // GSI5 -- standalone: employees by manager
+    directReports: {
+      index: "gsi5",
+      pk: { field: "gsi5pk", composite: ["manager"] },
+      sk: { field: "gsi5sk", composite: ["team", "office"] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+The `teams` index is designed for team leads: partition by `team`, sort by `dateHired + title`. This enables queries like "all development team members" and "development team members hired between 2020 and 2023".
+
+### Task Entity
+
+Task has 4 indexes. The `statuses` index (GSI4) enables cross-project status queries. Task also uses `versioned` and `softDelete` for lifecycle management:
+
+```typescript title="entities.ts"
+const Tasks = Entity.make({
+  model: Task,
+  entityType: "Task",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["task"] },
+      sk: { field: "sk", composite: ["project", "employee"] },
+    },
+    // GSI1 -- standalone: tasks by project
+    project: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["project"] },
+      sk: { field: "gsi1sk", composite: ["employee", "status"] },
+    },
+    // GSI3 -- "assignments" collection (shared with Employee)
+    assigned: {
+      index: "gsi3",
+      collection: "assignments",
+      pk: { field: "gsi3pk", composite: ["employee"] },
+      sk: { field: "gsi3sk", composite: ["project", "status"] },
+    },
+    // GSI4 -- standalone: tasks by status across all projects
+    statuses: {
+      index: "gsi4",
+      pk: { field: "gsi4pk", composite: ["status"] },
+      sk: { field: "gsi4sk", composite: ["project", "employee"] },
+    },
+  },
+  timestamps: true,
+  versioned: true,
+  softDelete: true,
+})
+```
+
+Key design decisions:
+- **`statuses` (GSI4)** partitions by `status`, sorts by `project + employee` -- enables "all open tasks" and "open tasks for a specific project" queries
+- **`softDelete: true`** enables task archival -- closed tasks can be archived (removed from all indexes) while remaining retrievable for audit
+- **`versioned: true`** creates version snapshots on updates for audit trail
+
+### Office Entity
+
+```typescript title="entities.ts"
+const Offices = Entity.make({
+  model: Office,
+  entityType: "Office",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["office"] },
+      sk: { field: "sk", composite: [] },
+    },
+    // GSI1 -- "workplaces" collection (shared with Employee)
+    workplace: {
+      index: "gsi1",
+      collection: "workplaces",
+      pk: { field: "gsi1pk", composite: ["office"] },
+      sk: { field: "gsi1sk", composite: [] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+---
+
+## Step 3: Seed Data
+
+```typescript title="seed.ts"
+const offices = {
+  portland: {
+    office: "portland",
+    country: "US",
+    state: "OR",
+    city: "Portland",
+    zip: "97201",
+    address: "123 SW Main St",
+  },
+  nyc: {
+    office: "nyc",
+    country: "US",
+    state: "NY",
+    city: "New York",
+    zip: "10001",
+    address: "456 Broadway",
+  },
+}
+
+const employees = {
+  tyler: {
+    employee: "tyler",
+    firstName: "Tyler",
+    lastName: "Walch",
+    office: "portland",
+    title: "Senior Engineer",
+    team: "development" as const,
+    salary: "000120.00",
+    manager: "tyler",
+    dateHired: "2019-03-15",
+  },
+  sean: {
+    employee: "sean",
+    firstName: "Sean",
+    lastName: "Green",
+    office: "portland",
+    title: "Junior Engineer",
+    team: "development" as const,
+    salary: "000085.00",
+    manager: "tyler",
+    dateHired: "2022-06-01",
+  },
+  morgan: {
+    employee: "morgan",
+    firstName: "Morgan",
+    lastName: "Lee",
+    office: "nyc",
+    title: "Product Manager",
+    team: "product" as const,
+    salary: "000110.00",
+    manager: "morgan",
+    dateHired: "2020-09-01",
+  },
+  alex: {
+    employee: "alex",
+    firstName: "Alex",
+    lastName: "Chen",
+    office: "nyc",
+    title: "Marketing Lead",
+    team: "marketing" as const,
+    salary: "000095.00",
+    manager: "morgan",
+    dateHired: "2021-01-15",
+  },
+}
+
+const tasks = {
+  buildApi: {
+    task: "build-api",
+    project: "platform",
+    employee: "tyler",
+    description: "Build the REST API for the platform",
+    status: "open" as const,
+    points: 8,
+  },
+  writeTests: {
+    task: "write-tests",
+    project: "platform",
+    employee: "sean",
+    description: "Write integration tests for the API",
+    status: "in-progress" as const,
+    points: 5,
+  },
+  designLanding: {
+    task: "design-landing",
+    project: "website",
+    employee: "alex",
+    description: "Design the landing page for the website",
+    status: "open" as const,
+    points: 13,
+  },
+  userResearch: {
+    task: "user-research",
+    project: "website",
+    employee: "morgan",
+    description: "Conduct user research interviews",
+    status: "closed" as const,
+    points: 3,
+  },
+  codeReview: {
+    task: "code-review",
+    project: "platform",
+    employee: "tyler",
+    description: "Review PRs from the team",
+    status: "open" as const,
+    points: 2,
+  },
+  deployCi: {
+    task: "deploy-ci",
+    project: "platform",
+    employee: "sean",
+    description: "Set up CI/CD pipeline",
+    status: "open" as const,
+    points: 5,
+  },
+}
+```
+
+```typescript title="seed.ts"
+import { DynamoClient } from "effect-dynamodb"
+
+const { Employees: boundEmployees, Tasks: boundTasks, Offices: boundOffices } =
+  yield* DynamoClient.make(TmTable)
+
+// Seed all data
+for (const office of Object.values(offices)) {
+  yield* boundOffices.put(office)
+}
+for (const emp of Object.values(employees)) {
+  yield* boundEmployees.put(emp)
+}
+for (const task of Object.values(tasks)) {
+  yield* boundTasks.put(task)
+}
+```
+
+---
+
+## Step 4: Fulfilling the Requirements
+
+### Requirement 1: CRUD
+
+> Create, read, update, and delete employees and tasks.
+
+```typescript
+import { Entity } from "effect-dynamodb"
+
+// Read
+const tyler = yield* boundEmployees.get({ employee: "tyler" })
+// tyler.title → "Senior Engineer"
+// tyler.team → "development"
+
+const buildApi = yield* boundTasks.get({
+  task: "build-api",
+  project: "platform",
+  employee: "tyler",
+})
+// buildApi.status → "open"
+// buildApi.points → 8
+
+// Update — promote Tyler (provide all GSI composites for affected indexes)
+yield* boundEmployees.update(
+  { employee: "tyler" },
+  Entity.set({
+    office: "portland",
+    team: "development",
+    title: "Staff Engineer",
+    salary: "000140.00",
+    manager: "tyler",
+    dateHired: "2019-03-15",
+  }),
+)
+
+// Delete
+yield* boundEmployees.delete({ employee: "tyler" })
+```
+
+Note that the `get` call on a deleted item returns an `ItemNotFound` error. Use `catchTag` to handle it:
+
+```typescript
+import { Effect } from "effect"
+
+const exists = yield* boundEmployees.get({ employee: "tyler" }).pipe(
+  Effect.map(() => true),
+  Effect.catchTag("ItemNotFound", () => Effect.succeed(false)),
+)
+```
+
+### Requirement 2: Workplaces Collection
+
+> As a regional manager, see office details and all employees at a location.
+
+Employee and Office share GSI1 via the `workplaces` collection. Both use `office` as the partition key.
+
+```typescript
+import { Query } from "effect-dynamodb"
+
+// All employees at Portland
+const portlandEmployees = yield* boundEmployees.collect(
+  Employees.query.coworkers({ office: "portland" }),
+)
+// → [{ employee: "sean", ... }, { employee: "tyler", ... }]
+
+// The office itself (same GSI, same partition)
+const portlandOffice = yield* boundOffices.collect(
+  Offices.query.workplace({ office: "portland" }),
+)
+// → [{ office: "portland", city: "Portland", state: "OR", ... }]
+```
+
+### Requirement 3: Assignments Collection
+
+> As a project manager, find an employee's details and their assigned tasks.
+
+Employee and Task share GSI3 via the `assignments` collection. Both use `employee` as the partition key.
+
+```typescript
+// Tyler's tasks
+const tylerTasks = yield* boundTasks.collect(
+  Tasks.query.assigned({ employee: "tyler" }),
+)
+// → [{ task: "build-api", points: 8 }, { task: "code-review", points: 2 }]
+
+// Total points across Tyler's tasks
+const totalPoints = tylerTasks.reduce((sum, t) => sum + t.points, 0)
+// → 10
+
+// Tyler's employee info (same GSI, same partition)
+const tylerInfo = yield* boundEmployees.collect(
+  Employees.query.employeeLookup({ employee: "tyler" }),
+)
+// → [{ firstName: "Tyler", title: "Senior Engineer", ... }]
+```
+
+### Requirement 4: Teams Query with Date Range
+
+> As a team lead, find all members of a team and filter by hire date.
+
+Employee's `teams` index on GSI2 uses `team` as PK and `dateHired + title` as SK. This enables both full team listings and date-range filtering.
+
+```typescript
+import { KeyComposer, Query } from "effect-dynamodb"
+
+// All development team members
+const devTeam = yield* boundEmployees.collect(
+  Employees.query.teams({ team: "development" }),
+)
+// → [{ employee: "tyler", dateHired: "2019-03-15" },
+//    { employee: "sean", dateHired: "2022-06-01" }]
+
+// Range query: hired between 2020 and 2023
+const teamsIndex = Employees.indexes.teams
+const loHired = KeyComposer.composeSortKeyPrefix(
+  TmSchema, "Employee", 1, teamsIndex, { dateHired: "2020-01-01" },
+)
+const hiHired = KeyComposer.composeSortKeyPrefix(
+  TmSchema, "Employee", 1, teamsIndex, { dateHired: "2023-12-31" },
+)
+
+const recentDevHires = yield* boundEmployees.collect(
+  Employees.query.teams({ team: "development" }).pipe(
+    Query.where({ between: [loHired, hiHired] }),
+  ),
+)
+// → [{ employee: "sean", dateHired: "2022-06-01" }]
+
+// Reverse sort: most recently hired first
+const devReversed = yield* boundEmployees.collect(
+  Employees.query.teams({ team: "development" }).pipe(Query.reverse),
+)
+// → [{ employee: "sean", ... }, { employee: "tyler", ... }]
+```
+
+`KeyComposer.composeSortKeyPrefix` builds the structured sort key prefix (`$taskman#v1#employee#2020-01-01`) used for `between` range bounds. This works because date strings in ISO format sort lexicographically in chronological order.
+
+### Requirement 5: Tasks by Status
+
+> As a scrum master, see all tasks by status across all projects.
+
+Task's `statuses` index on GSI4 uses `status` as PK and `project + employee` as SK. This is the other key differentiator from the HR example.
+
+```typescript
+// All open tasks across all projects
+const openTasks = yield* boundTasks.collect(
+  Tasks.query.statuses({ status: "open" }),
+)
+// → 4 tasks: build-api, code-review, deploy-ci, design-landing
+
+const totalOpenPoints = openTasks.reduce((sum, t) => sum + t.points, 0)
+// → 28 (8 + 2 + 5 + 13)
+
+// In-progress tasks
+const inProgressTasks = yield* boundTasks.collect(
+  Tasks.query.statuses({ status: "in-progress" }),
+)
+// → [{ task: "write-tests", points: 5 }]
+
+// Closed tasks
+const closedTasks = yield* boundTasks.collect(
+  Tasks.query.statuses({ status: "closed" }),
+)
+// → [{ task: "user-research", points: 3 }]
+```
+
+You can narrow by project using a sort key prefix:
+
+```typescript
+// Open tasks in the "platform" project only
+const statusesIndex = Tasks.indexes.statuses
+const platformPrefix = KeyComposer.composeSortKeyPrefix(
+  TmSchema, "Task", 1, statusesIndex, { project: "platform" },
+)
+
+const openPlatformTasks = yield* boundTasks.collect(
+  Tasks.query.statuses({ status: "open" }).pipe(
+    Query.where({ beginsWith: platformPrefix }),
+  ),
+)
+// → [{ task: "build-api" }, { task: "code-review" }, { task: "deploy-ci" }]
+```
+
+### Requirement 6: Task Status Workflow
+
+> As a developer, move a task through the lifecycle: open -> in-progress -> closed.
+
+Updating a task's `status` field triggers GSI recomposition on every index that includes `status` as a composite. The task moves between partitions in the `statuses` GSI4 index.
+
+```typescript
+// Move build-api from open → in-progress
+yield* boundTasks.update({
+  task: "build-api",
+  project: "platform",
+  employee: "tyler",
+}, { status: "in-progress" })
+
+// Verify: open tasks decreased by 1
+const openAfter = yield* boundTasks.collect(
+  Tasks.query.statuses({ status: "open" }),
+)
+// → 3 open tasks (was 4)
+
+// Verify: in-progress tasks increased by 1
+const inProgressAfter = yield* boundTasks.collect(
+  Tasks.query.statuses({ status: "in-progress" }),
+)
+// → [{ task: "build-api" }, { task: "write-tests" }]
+
+// Move build-api from in-progress → closed
+yield* boundTasks.update({
+  task: "build-api",
+  project: "platform",
+  employee: "tyler",
+}, { status: "closed" })
+
+// Now 2 closed tasks
+const closedAfter = yield* boundTasks.collect(
+  Tasks.query.statuses({ status: "closed" }),
+)
+// → [{ task: "build-api" }, { task: "user-research" }]
+```
+
+Because `employee` and `project` are primary key fields (provided in the update key), they are automatically reused for GSI recomposition. Only `status` -- the GSI-only composite -- needs to be in `set()`.
+
+### Requirement 7: Employee Roles with Salary Range
+
+> As a hiring manager, find employees by title with salary range queries.
+
+Employee's `roles` index on GSI4 has `title` as PK and `salary` as SK. Zero-padded salary strings ensure correct lexicographic ordering.
+
+```typescript
+// All Senior Engineers
+const engineers = yield* boundEmployees.collect(
+  Employees.query.roles({ title: "Senior Engineer" }),
+)
+// → [{ employee: "tyler", salary: "000120.00" }]
+
+// Product Managers with salary between 100k and 200k
+const rolesIndex = Employees.indexes.roles
+const loSalary = KeyComposer.composeSortKeyPrefix(
+  TmSchema, "Employee", 1, rolesIndex, { salary: "000100.00" },
+)
+const hiSalary = KeyComposer.composeSortKeyPrefix(
+  TmSchema, "Employee", 1, rolesIndex, { salary: "000200.00" },
+)
+
+const wellPaidPMs = yield* boundEmployees.collect(
+  Employees.query.roles({ title: "Product Manager" }).pipe(
+    Query.where({ between: [loSalary, hiSalary] }),
+  ),
+)
+// → [{ employee: "morgan", salary: "000110.00" }]
+```
+
+### Requirement 8: Atomic Onboarding
+
+> As HR, atomically onboard a new employee with their first task.
+
+`Transaction.transactWrite` ensures both the employee and task are created atomically -- if either fails, neither is persisted.
+
+```typescript
+import { Transaction } from "effect-dynamodb"
+
+yield* Transaction.transactWrite([
+  Employees.put({
+    employee: "jordan",
+    firstName: "Jordan",
+    lastName: "Rivera",
+    office: "portland",
+    title: "Junior Engineer",
+    team: "development",
+    salary: "000080.00",
+    manager: "tyler",
+    dateHired: "2024-02-01",
+  }),
+  Tasks.put({
+    task: "onboarding",
+    project: "internal",
+    employee: "jordan",
+    description: "Complete new-hire orientation and setup dev environment",
+    status: "open",
+    points: 3,
+  }),
+])
+
+// Both created atomically
+const newHire = yield* boundEmployees.get({ employee: "jordan" })
+// → { firstName: "Jordan", title: "Junior Engineer", team: "development" }
+
+// New hire appears in team queries
+const devTeamAfter = yield* boundEmployees.collect(
+  Employees.query.teams({ team: "development" }),
+)
+// → 3 members (was 2)
+
+// Onboarding task appears in status queries
+const onboardingTasks = yield* boundTasks.collect(
+  Tasks.query.assigned({ employee: "jordan" }),
+)
+// → [{ task: "onboarding", points: 3 }]
+```
+
+### Requirement 9: Task Archival (Soft Delete + Restore)
+
+> As a PM, archive completed tasks so they vanish from all status queries but remain retrievable for audit.
+
+Because Task has `softDelete: true`, deleting a task **archives** it. GSI keys are stripped, so the task disappears from all index queries. The record is preserved with a `deletedAt` timestamp for compliance.
+
+```typescript
+import { Entity } from "effect-dynamodb"
+
+// Archive the closed "user-research" task
+yield* boundTasks.delete({
+  task: "user-research",
+  project: "website",
+  employee: "morgan",
+})
+
+// Gone from status queries
+const closedAfterArchive = yield* boundTasks.collect(
+  Tasks.query.statuses({ status: "closed" }),
+)
+// → [] (user-research was the only closed task)
+
+// Gone from assignment queries
+const morganTasks = yield* boundTasks.collect(
+  Tasks.query.assigned({ employee: "morgan" }),
+)
+// user-research no longer appears
+
+// But retrievable for audit via deleted.get
+const archivedTask = yield* boundTasks.deleted
+  .get({ task: "user-research", project: "website", employee: "morgan" })
+  .pipe(Entity.asRecord)
+// → { description: "Conduct user research interviews", deletedAt: ..., ... }
+```
+
+If a task was archived by mistake, restore it:
+
+```typescript
+// Restore recomposes all keys — task reappears in all indexes
+const restored = yield* boundTasks.restore({
+  task: "user-research",
+  project: "website",
+  employee: "morgan",
+})
+// restored.status → "closed" (original status preserved)
+
+// Back in status queries
+const closedAfterRestore = yield* boundTasks.collect(
+  Tasks.query.statuses({ status: "closed" }),
+)
+// user-research is back
+```
+
+This is the natural end of the task lifecycle: **open -> in-progress -> closed -> archived**. Soft delete strips all GSI keys, so archived tasks are invisible to every query while the data is preserved.
+
+---
+
+## Running the Example
+
+The complete runnable example is at [`examples/task-manager.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/task-manager.ts) in the repository. It seeds data, runs all 9 access patterns, and verifies each with assertions.
+
+```bash
+docker run -d -p 8000:8000 amazon/dynamodb-local
+```
+
+```bash
+npx tsx examples/task-manager.ts
+```
+
+### Layer Setup
+
+The example wires dependencies via Effect Layers -- no global config or constructor options:
+
+```typescript title="main.ts"
+import { Effect, Layer } from "effect"
+import { DynamoClient } from "effect-dynamodb"
+
+const AppLayer = Layer.mergeAll(
+  DynamoClient.layer({
+    region: "us-east-1",
+    endpoint: "http://localhost:8000",
+    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  }),
+  TmTable.layer({ name: "taskman-table" }),
+)
+
+const main = program.pipe(Effect.provide(AppLayer))
+
+Effect.runPromise(main).then(
+  () => console.log("Done."),
+  (err) => console.error("Failed:", err),
+)
+```
+
+---
+
+## Key Takeaways
+
+| Concept | How it's used |
+|---------|---------------|
+| **Single-table design** | 3 entities, 1 table, 5 GSIs with structured key values |
+| **Index overloading** | GSI1 serves employees-by-office, tasks-by-project, and offices-by-office |
+| **Collections** | `workplaces` (GSI1) and `assignments` (GSI3) enable cross-entity queries |
+| **Teams index (GSI2)** | Partition by team, sort by dateHired for range queries |
+| **Status index (GSI4)** | Partition by status for cross-project task visibility |
+| **Sort key range queries** | `KeyComposer.composeSortKeyPrefix` + `Query.where({ between })` for date and salary ranges |
+| **Status workflow** | Updating `status` triggers automatic GSI recomposition across all affected indexes |
+| **Soft delete archival** | Closed tasks archived via `softDelete` -- invisible to queries, preserved for audit |
+| **Restore** | `Entity.restore` recomposes all keys, returning archived items to full index visibility |
+| **Transactions** | Atomic multi-entity writes for employee onboarding |
+
+## What's Next?
+
+- [Modeling Guide](/effect-dynamodb/guides/modeling/) -- Deep dive into models, schemas, tables, and entities
+- [Indexes & Collections](/effect-dynamodb/guides/indexes/) -- Access pattern design and collection patterns
+- [Lifecycle](/effect-dynamodb/guides/lifecycle/) -- Soft delete, versioning, and TTL
+- [Library System](/effect-dynamodb/tutorials/library-system/) -- Sparse indexes, 4-entity collections, and book loan workflows
+- [Human Resources](/effect-dynamodb/tutorials/human-resources/) -- Full HR system with transfers, termination, and rehire

@@ -19,6 +19,8 @@ import type {
   DeleteItemCommandOutput,
   DeleteTableCommandInput,
   DeleteTableCommandOutput,
+  DescribeTableCommandInput,
+  DescribeTableCommandOutput,
   GetItemCommandInput,
   GetItemCommandOutput,
   PutItemCommandInput,
@@ -40,6 +42,7 @@ import {
   CreateTableCommand,
   DeleteItemCommand,
   DeleteTableCommand,
+  DescribeTableCommand,
   DynamoDBClient,
   GetItemCommand,
   PutItemCommand,
@@ -50,6 +53,10 @@ import {
   UpdateItemCommand,
 } from "@aws-sdk/client-dynamodb"
 import { Config, Effect, Layer, ServiceMap } from "effect"
+import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
+import { bind as aggregateBind } from "./Aggregate.js"
+import type { BoundEntity, Entity as EntityType } from "./Entity.js"
+import { bind as entityBind } from "./Entity.js"
 import {
   DynamoError,
   DynamoValidationError,
@@ -61,6 +68,8 @@ import {
   ResourceNotFoundError,
   ThrottlingError,
 } from "./Errors.js"
+import type { CreateTableOptions, Table, TableConfig } from "./Table.js"
+import { definition as tableDefinition } from "./Table.js"
 
 /** Union of all DynamoDB client error types */
 export type DynamoClientError =
@@ -84,6 +93,11 @@ export interface DynamoClientService {
   readonly deleteTable: (
     input: DeleteTableCommandInput,
   ) => Effect.Effect<DeleteTableCommandOutput, DynamoClientError>
+
+  /** Describe a DynamoDB table (status, stream specification, etc.). */
+  readonly describeTable: (
+    input: DescribeTableCommandInput,
+  ) => Effect.Effect<DescribeTableCommandOutput, DynamoClientError>
 
   /** Put a single item. */
   readonly putItem: (
@@ -154,13 +168,6 @@ export class DynamoClient extends ServiceMap.Service<DynamoClient, DynamoClientS
    * @param config.endpoint - Optional endpoint override (e.g., for DynamoDB Local)
    * @param config.credentials - Optional static credentials
    */
-  /**
-   * Create a live Layer that manages an AWS DynamoDBClient.
-   *
-   * @param config.region - AWS region
-   * @param config.endpoint - Optional endpoint override (e.g., for DynamoDB Local)
-   * @param config.credentials - Optional static credentials
-   */
   static readonly layer = (config: {
     readonly region: string
     readonly endpoint?: string | undefined
@@ -200,6 +207,100 @@ export class DynamoClient extends ServiceMap.Service<DynamoClient, DynamoClientS
         )
       }),
     )
+
+  /**
+   * Create a typed client gateway for a Table.
+   *
+   * Resolves `DynamoClient` and `TableConfig` services, binds all entities
+   * registered on the table, and returns a typed client where every operation
+   * has `R = never`.
+   *
+   * Matches the `HttpApiClient.make(api)` pattern from Effect v4.
+   *
+   * @example
+   * ```typescript
+   * const db = yield* DynamoClient.make(MainTable)
+   * const user = yield* db.Users.get({ userId: "123" })
+   * yield* db.createTable()
+   * ```
+   */
+  static readonly make = <T extends Table>(
+    table: T,
+  ): Effect.Effect<TypedClient<T>, never, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const tableConfig = yield* table.Tag
+
+      // Bind each entity
+      const boundEntities: Record<string, unknown> = {}
+      for (const [key, entity] of Object.entries(table.entities)) {
+        boundEntities[key] = yield* entityBind(entity as EntityType)
+      }
+
+      // Bind each aggregate
+      const boundAggregates: Record<string, unknown> = {}
+      for (const [key, aggregate] of Object.entries(table.aggregates)) {
+        boundAggregates[key] = yield* aggregateBind(aggregate as AggregateType<any, any, any>)
+      }
+
+      return {
+        ...boundEntities,
+        ...boundAggregates,
+
+        createTable: (options?: CreateTableOptions) =>
+          client
+            .createTable({
+              TableName: tableConfig.name,
+              BillingMode: options?.billingMode ?? "PAY_PER_REQUEST",
+              ...tableDefinition(table),
+            })
+            .pipe(Effect.asVoid),
+
+        deleteTable: client.deleteTable({ TableName: tableConfig.name }).pipe(Effect.asVoid),
+
+        describeTable: client.describeTable({ TableName: tableConfig.name }),
+      } as TypedClient<T>
+    })
+}
+
+// ---------------------------------------------------------------------------
+// TypedClient — mapped type for DynamoClient.make() return value
+// ---------------------------------------------------------------------------
+
+/**
+ * Typed client returned by `DynamoClient.make(table)`.
+ * Maps each entity key to its BoundEntity type, each aggregate key to its
+ * BoundAggregate type, plus table management operations.
+ */
+export type TypedClient<T extends Table> = {
+  readonly [K in keyof T["entities"]]: T["entities"][K] extends EntityType<
+    infer M,
+    any,
+    infer I,
+    any,
+    any,
+    any,
+    any,
+    infer R,
+    any
+  >
+    ? BoundEntity<M, I, R>
+    : never
+} & {
+  readonly [K in keyof T["aggregates"]]: T["aggregates"][K] extends AggregateType<
+    infer S,
+    infer TKey,
+    infer TInput
+  >
+    ? BoundAggregate<S, TKey, TInput>
+    : never
+} & {
+  /** Create the physical DynamoDB table from registered entity/aggregate definitions. */
+  readonly createTable: (options?: CreateTableOptions) => Effect.Effect<void, DynamoClientError>
+  /** Delete the physical DynamoDB table. */
+  readonly deleteTable: Effect.Effect<void, DynamoClientError>
+  /** Describe the table. */
+  readonly describeTable: Effect.Effect<DescribeTableCommandOutput, DynamoClientError>
 }
 
 /** @internal Classify an AWS SDK error into a specific tagged error type. */
@@ -237,6 +338,11 @@ const buildService = (
         Effect.tryPromise({
           try: () => client.send(new DeleteTableCommand(input)),
           catch: classifyError("DeleteTable"),
+        }),
+      describeTable: (input) =>
+        Effect.tryPromise({
+          try: () => client.send(new DescribeTableCommand(input)),
+          catch: classifyError("DescribeTable"),
         }),
       putItem: (input) =>
         Effect.tryPromise({

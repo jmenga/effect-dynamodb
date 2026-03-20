@@ -1,0 +1,263 @@
+---
+title: "Example: Batch Operations"
+description: "Batch get and batch write across multiple entity types with auto-chunking and typed tuple returns"
+---
+
+A multi-entity example demonstrating `Batch.get` and `Batch.write` for efficient bulk operations. DynamoDB imposes limits on batch sizes (100 items for gets, 25 for writes) — effect-dynamodb handles chunking and unprocessed-item retries transparently.
+
+**What you'll learn:**
+- `Batch.write()` to create and delete items across entities in one call
+- `Batch.get()` to fetch items across entities with typed tuple returns
+- Auto-chunking beyond DynamoDB's batch limits
+- Handling missing items (`undefined` in the result tuple)
+- Mixing puts and deletes in a single batch write
+
+---
+
+## Step 1: Models
+
+Two pure domain models — a `User` and an `Order`:
+
+```typescript title="models.ts"
+import { Schema } from "effect"
+
+class User extends Schema.Class<User>("User")({
+  userId: Schema.String,
+  email: Schema.String,
+  name: Schema.NonEmptyString,
+  role: Schema.Literals(["admin", "member"]),
+}) {}
+
+class Order extends Schema.Class<Order>("Order")({
+  orderId: Schema.String,
+  userId: Schema.String,
+  product: Schema.NonEmptyString,
+  quantity: Schema.Number,
+  status: Schema.Literals(["pending", "shipped", "delivered"]),
+}) {}
+```
+
+---
+
+## Step 2: Schema, Table, and Entities
+
+Both entities share a single table. Orders have a GSI for querying by user:
+
+```typescript title="entities.ts"
+import { DynamoSchema, Entity, Table } from "effect-dynamodb"
+
+const AppSchema = DynamoSchema.make({ name: "batch-demo", version: 1 })
+const MainTable = Table.make({ schema: AppSchema })
+
+const Users = Entity.make({
+  model: User,
+  entityType: "User",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["userId"] },
+      sk: { field: "sk", composite: [] },
+    },
+  },
+  timestamps: true,
+})
+
+const Orders = Entity.make({
+  model: Order,
+  entityType: "Order",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["orderId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    byUser: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["userId"] },
+      sk: { field: "gsi1sk", composite: ["orderId"] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+---
+
+## Step 3: Batch Write — Create Multiple Items
+
+`Batch.write` accepts a mix of put and delete operations across any number of entity types. DynamoDB limits batch writes to 25 items per request — effect-dynamodb auto-chunks larger batches transparently.
+
+```typescript
+import { Batch } from "effect-dynamodb"
+
+yield* Batch.write([
+  Users.put({ userId: "u-1", email: "alice@example.com", name: "Alice", role: "admin" }),
+  Users.put({ userId: "u-2", email: "bob@example.com", name: "Bob", role: "member" }),
+  Users.put({ userId: "u-3", email: "charlie@example.com", name: "Charlie", role: "member" }),
+  Orders.put({
+    orderId: "o-1",
+    userId: "u-1",
+    product: "Widget",
+    quantity: 2,
+    status: "pending",
+  }),
+  Orders.put({
+    orderId: "o-2",
+    userId: "u-1",
+    product: "Gadget",
+    quantity: 1,
+    status: "shipped",
+  }),
+  Orders.put({
+    orderId: "o-3",
+    userId: "u-2",
+    product: "Doohickey",
+    quantity: 5,
+    status: "pending",
+  }),
+])
+// 3 users + 3 orders created in a single batch call
+```
+
+All six items are written in one DynamoDB `BatchWriteItem` call (or auto-chunked if the batch exceeds 25 items).
+
+---
+
+## Step 4: Batch Get — Fetch Multiple Items
+
+`Batch.get` returns a **typed tuple** — each position in the result matches the entity type of the corresponding input. DynamoDB limits batch gets to 100 items per request; larger batches are auto-chunked with automatic retry of unprocessed keys.
+
+```typescript
+const [alice, bob, order1, order2] = yield* Batch.get([
+  Users.get({ userId: "u-1" }),
+  Users.get({ userId: "u-2" }),
+  Orders.get({ orderId: "o-1" }),
+  Orders.get({ orderId: "o-2" }),
+])
+
+// alice: User | undefined — fully typed as User
+// bob: User | undefined
+// order1: Order | undefined — fully typed as Order
+// order2: Order | undefined
+```
+
+Each result is `Model | undefined`. If an item does not exist in DynamoDB, the corresponding position is `undefined`:
+
+```typescript
+const [existing, missing] = yield* Batch.get([
+  Users.get({ userId: "u-1" }),
+  Users.get({ userId: "u-nonexistent" }),
+])
+
+// existing → { userId: "u-1", name: "Alice", ... }
+// missing → undefined
+```
+
+---
+
+## Step 5: Mixed Put + Delete in One Batch
+
+`Batch.write` accepts both `Entity.put()` and `Entity.delete()` operations in the same array:
+
+```typescript
+yield* Batch.write([
+  // Add a new order
+  Orders.put({
+    orderId: "o-4",
+    userId: "u-3",
+    product: "Thingamajig",
+    quantity: 1,
+    status: "pending",
+  }),
+  // Delete an existing order
+  Orders.delete({ orderId: "o-3" }),
+])
+// Added o-4 and deleted o-3 in one atomic batch
+
+// Verify
+const [deleted, created] = yield* Batch.get([
+  Orders.get({ orderId: "o-3" }),
+  Orders.get({ orderId: "o-4" }),
+])
+// deleted → undefined (removed)
+// created → { orderId: "o-4", product: "Thingamajig", ... }
+```
+
+---
+
+## Step 6: Cross-Entity Batch Write
+
+Puts and deletes can target different entity types in the same batch. This is useful for operations that need to modify users and orders together:
+
+```typescript
+yield* Batch.write([
+  Users.put({ userId: "u-4", email: "diana@example.com", name: "Diana", role: "admin" }),
+  Orders.put({
+    orderId: "o-5",
+    userId: "u-4",
+    product: "Gizmo",
+    quantity: 3,
+    status: "pending",
+  }),
+  Users.delete({ userId: "u-3" }),
+])
+// Created user u-4 + order o-5, deleted user u-3 — all in one batch
+```
+
+Note that batch writes are **not transactional** — DynamoDB applies each item independently. If you need atomic all-or-nothing semantics, use `Transaction.transactWrite` instead (limited to 100 items, 2x WCU cost).
+
+---
+
+## Running the Example
+
+The complete runnable example is at [`examples/batch.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/batch.ts) in the repository.
+
+```bash
+docker run -d -p 8000:8000 amazon/dynamodb-local
+```
+
+```bash
+npx tsx examples/batch.ts
+```
+
+### Layer Setup
+
+```typescript title="main.ts"
+import { Effect, Layer } from "effect"
+import { DynamoClient } from "effect-dynamodb"
+
+const AppLayer = Layer.mergeAll(
+  DynamoClient.layer({
+    region: "us-east-1",
+    endpoint: "http://localhost:8000",
+    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  }),
+  MainTable.layer({ name: "batch-demo-table" }),
+)
+
+const main = program.pipe(Effect.provide(AppLayer))
+
+Effect.runPromise(main).then(
+  () => console.log("Done."),
+  (err) => console.error("Failed:", err),
+)
+```
+
+---
+
+## Key Takeaways
+
+| Concept | How it's used |
+|---------|---------------|
+| **`Batch.write()`** | Create and delete items across entity types in one call |
+| **`Batch.get()`** | Fetch items across entity types with typed tuple returns |
+| **Auto-chunking** | Batches exceeding DynamoDB limits (25 write, 100 get) are split transparently |
+| **Unprocessed retries** | Unprocessed items/keys are retried automatically with exponential backoff |
+| **Typed tuples** | Each position in the `Batch.get` result is typed to its input entity |
+| **Missing items** | Non-existent items return `undefined` in the result tuple |
+| **Mixed operations** | Puts and deletes from different entities compose in one `Batch.write` call |
+
+## What's Next?
+
+- [Modeling Guide](/effect-dynamodb/guides/modeling/) — Deep dive into models, schemas, tables, and entities
+- [Queries](/effect-dynamodb/guides/queries/) — Query combinators and pagination
+- [Example: Rich Updates](/effect-dynamodb/tutorials/updates/) — Atomic increments, decrements, list appends, and composed updates
+- [Example: Human Resources](/effect-dynamodb/tutorials/human-resources/) — Full single-table design with collections, transactions, and soft delete

@@ -1,9 +1,9 @@
 /**
  * Spherical — Pure spherical geometry functions.
  *
- * Replaces the two functions used from `geodesy/latlon-spherical.js`:
+ * Provides:
  * - `initialBearingTo` — great-circle initial bearing (forward azimuth)
- * - `LatLon.intersection` — intersection of two great-circle paths
+ * - `intersection` — intersection of two great-circle paths
  *
  * All angles are in degrees externally, radians internally.
  */

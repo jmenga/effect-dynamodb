@@ -74,11 +74,9 @@ class Article extends Schema.Class<Article>("Article")({
 // ---------------------------------------------------------------------------
 
 const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
 
 const VenueEntity = Entity.make({
   model: Venue,
-  table: MainTable,
   entityType: "Venue",
   indexes: {
     primary: {
@@ -90,7 +88,6 @@ const VenueEntity = Entity.make({
 
 const TeamEntity = Entity.make({
   model: Team,
-  table: MainTable,
   entityType: "Team",
   indexes: {
     primary: {
@@ -102,7 +99,6 @@ const TeamEntity = Entity.make({
 
 const CoachEntity = Entity.make({
   model: Coach,
-  table: MainTable,
   entityType: "Coach",
   indexes: {
     primary: {
@@ -114,7 +110,6 @@ const CoachEntity = Entity.make({
 
 const PlayerEntity = Entity.make({
   model: Player,
-  table: MainTable,
   entityType: "Player",
   indexes: {
     primary: {
@@ -122,6 +117,11 @@ const PlayerEntity = Entity.make({
       sk: { field: "sk", composite: [] },
     },
   },
+})
+
+const MainTable = Table.make({
+  schema: AppSchema,
+  entities: { VenueEntity, TeamEntity, CoachEntity, PlayerEntity },
 })
 
 // ---------------------------------------------------------------------------
@@ -146,6 +146,7 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
   transactWriteItems: () => Effect.die("not used"),
   createTable: () => Effect.die("not used"),
   deleteTable: () => Effect.die("not used"),
+  describeTable: () => Effect.die("not used"),
   scan: () => Effect.die("not used"),
 })
 
@@ -686,7 +687,6 @@ describe("Aggregate", () => {
 
     const UmpireEntity = Entity.make({
       model: Umpire,
-      table: MainTable,
       entityType: "Umpire",
       indexes: {
         primary: {
@@ -695,6 +695,7 @@ describe("Aggregate", () => {
         },
       },
     })
+    UmpireEntity._configure(AppSchema, MainTable.Tag)
 
     class UmpireSheet extends Schema.Class<UmpireSheet>("UmpireSheet")({
       matchReferee: Schema.optionalKey(Umpire),
@@ -1147,6 +1148,7 @@ describe("Aggregate write path", () => {
     transactGetItems: () => Effect.die("not used"),
     createTable: () => Effect.die("not used"),
     deleteTable: () => Effect.die("not used"),
+    describeTable: () => Effect.die("not used"),
     scan: () => Effect.die("not used"),
   })
 
@@ -1896,7 +1898,6 @@ describe("Aggregate write path", () => {
 
         const RefEntity = Entity.make({
           model: RefTarget,
-          table: MainTable,
           entityType: "RefTarget",
           indexes: {
             primary: {
@@ -1905,6 +1906,7 @@ describe("Aggregate write path", () => {
             },
           },
         })
+        RefEntity._configure(AppSchema, MainTable.Tag)
 
         class WithRef extends Schema.Class<WithRef>("WithRef")({
           id: Schema.String,
@@ -2180,7 +2182,6 @@ describe("Aggregate write path", () => {
 
     const UmpireEntity = Entity.make({
       model: Umpire,
-      table: MainTable,
       entityType: "Umpire",
       indexes: {
         primary: {
@@ -2189,6 +2190,7 @@ describe("Aggregate write path", () => {
         },
       },
     })
+    UmpireEntity._configure(AppSchema, MainTable.Tag)
 
     class UmpireSheet extends Schema.Class<UmpireSheet>("UmpireSheet")({
       matchReferee: Schema.optionalKey(Umpire),
@@ -2379,6 +2381,7 @@ describe("Aggregate write path", () => {
       transactWriteItems: () => Effect.die("not used"),
       createTable: () => Effect.die("not used"),
       deleteTable: () => Effect.die("not used"),
+      describeTable: () => Effect.die("not used"),
     })
 
     const ListLayer = Layer.merge(ListDynamoClient, MainTable.layer({ name: "test-table" }))
@@ -2549,7 +2552,7 @@ describe("Aggregate write path", () => {
         expect(gsiInput.KeyConditionExpression).toBe("#pk = :pk AND begins_with(#sk, :skPrefix)")
         expect(gsiInput.ExpressionAttributeNames["#sk"]).toBe("gsi1sk")
         expect(gsiInput.ExpressionAttributeValues[":skPrefix"]).toEqual({
-          S: "$myapp#v1#articlelist#Alice",
+          S: "$myapp#v1#articlelist#alice",
         })
       }).pipe(Effect.provide(ListLayer)),
     )

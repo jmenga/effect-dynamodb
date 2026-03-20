@@ -32,8 +32,15 @@ describe("KeyComposer", () => {
       expect(KeyComposer.serializeValue("hello")).toBe("hello")
     })
 
-    it("numbers stringify", () => {
-      expect(KeyComposer.serializeValue(42)).toBe("42")
+    it("numbers are zero-padded to 16 digits", () => {
+      expect(KeyComposer.serializeValue(42)).toBe("0000000000000042")
+      expect(KeyComposer.serializeValue(0)).toBe("0000000000000000")
+      expect(KeyComposer.serializeValue(9007199254740991)).toBe("9007199254740991") // MAX_SAFE_INTEGER
+    })
+
+    it("bigints are zero-padded to 38 digits", () => {
+      expect(KeyComposer.serializeValue(42n)).toBe("00000000000000000000000000000000000042")
+      expect(KeyComposer.serializeValue(0n)).toBe("00000000000000000000000000000000000000")
     })
 
     it("booleans stringify", () => {
@@ -373,6 +380,64 @@ describe("KeyComposer", () => {
       )
       expect(result.gsi1pk).toBe("$myapp#v1#user#admin")
       expect(result.gsi1sk).toBe("$myapp#v1#user#u-1")
+    })
+
+    it("throws PartialGsiCompositeError when only some composites are provided", () => {
+      // byTenantRole has pk: [tenantId], sk: [role] — providing tenantId but not role
+      const multiCompositeIndexes: Record<string, KeyComposer.IndexDefinition> = {
+        primary: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        byTenantRole: {
+          index: "gsi1",
+          pk: { field: "gsi1pk", composite: ["tenantId"] },
+          sk: { field: "gsi1sk", composite: ["region"] },
+        },
+      }
+      expect(() =>
+        KeyComposer.composeGsiKeysForUpdate(
+          schema,
+          "User",
+          1,
+          multiCompositeIndexes,
+          { tenantId: "t-2" }, // only one of two composites
+          { userId: "u-1" },
+        ),
+      ).toThrow(KeyComposer.PartialGsiCompositeError)
+    })
+
+    it("PartialGsiCompositeError includes index name and missing attributes", () => {
+      const multiCompositeIndexes: Record<string, KeyComposer.IndexDefinition> = {
+        primary: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        byTenantRole: {
+          index: "gsi1",
+          pk: { field: "gsi1pk", composite: ["tenantId"] },
+          sk: { field: "gsi1sk", composite: ["region"] },
+        },
+      }
+      try {
+        KeyComposer.composeGsiKeysForUpdate(
+          schema,
+          "User",
+          1,
+          multiCompositeIndexes,
+          { tenantId: "t-2" },
+          { userId: "u-1" },
+        )
+        expect.fail("should have thrown")
+      } catch (e) {
+        expect(e).toBeInstanceOf(KeyComposer.PartialGsiCompositeError)
+        const err = e as KeyComposer.PartialGsiCompositeError
+        expect(err.indexName).toBe("byTenantRole")
+        expect(err.provided).toEqual(["tenantId"])
+        expect(err.missing).toEqual(["region"])
+        expect(err.required).toEqual(["tenantId", "region"])
+        expect(err.message).toContain("byTenantRole")
+      }
     })
   })
 

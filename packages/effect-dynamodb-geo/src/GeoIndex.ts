@@ -12,9 +12,10 @@ import type {
   DynamoClientError,
   KeyComposer,
   Table,
+  UniqueConstraintViolation,
   ValidationError,
 } from "@effect-dynamodb/core"
-import type { Effect, Schema } from "effect"
+import { Effect, type Schema } from "effect"
 import * as _GeoSearch from "./GeoSearch.js"
 import * as H3 from "./H3.js"
 import type { LatLng } from "./Spherical.js"
@@ -156,3 +157,56 @@ export const make = <A, P>(config: {
     enrich,
   }
 }
+
+// ---------------------------------------------------------------------------
+// BoundGeoIndex — dependencies resolved, R = never
+// ---------------------------------------------------------------------------
+
+/**
+ * A GeoIndex with `DynamoClient | Table.TableConfig` dependencies resolved.
+ * All operations return `Effect<..., ..., never>`.
+ */
+export interface BoundGeoIndex<A> {
+  /** Write an item with automatic geo field enrichment. R = never. */
+  readonly put: (
+    input: A,
+  ) => Effect.Effect<A, DynamoClientError | ValidationError | UniqueConstraintViolation, never>
+  /** Search for items near a geographic point. R = never. */
+  readonly nearby: (
+    options: NearbyOptions,
+  ) => Effect.Effect<Array<NearbyResult<A>>, DynamoClientError | ValidationError, never>
+  /** Compute geo fields for an input (pure — same as GeoIndex.enrich). */
+  readonly enrich: (input: A) => A
+  /** Provide escape hatch for complex pipe chains. */
+  readonly provide: <B, E>(
+    effect: Effect.Effect<B, E, DynamoClient | Table.TableConfig>,
+  ) => Effect.Effect<B, E, never>
+}
+
+/**
+ * Resolve `DynamoClient | Table.TableConfig` dependencies and return a
+ * `BoundGeoIndex` whose operations all have `R = never`.
+ *
+ * @example
+ * ```typescript
+ * const geo = yield* GeoIndex.bind(VehicleGeo)
+ * yield* geo.put({ vehicleId: "v-1", latitude: 37.77, longitude: -122.42, timestamp: Date.now() })
+ * const results = yield* geo.nearby({ center, radius: 2000, unit: "m" })
+ * ```
+ */
+export const bind = <A, P>(
+  geoIndex: GeoIndex<A, P>,
+): Effect.Effect<BoundGeoIndex<A>, never, DynamoClient | Table.TableConfig> =>
+  Effect.gen(function* () {
+    const ctx = yield* Effect.services<DynamoClient | Table.TableConfig>()
+    const provide = <B, E>(
+      effect: Effect.Effect<B, E, DynamoClient | Table.TableConfig>,
+    ): Effect.Effect<B, E, never> => Effect.provide(effect, ctx) as Effect.Effect<B, E, never>
+
+    return {
+      put: (input: A) => provide((geoIndex.put(input) as any).asEffect()),
+      nearby: (options: NearbyOptions) => provide(geoIndex.nearby(options)),
+      enrich: geoIndex.enrich,
+      provide,
+    } as BoundGeoIndex<A>
+  })

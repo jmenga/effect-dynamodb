@@ -15,7 +15,6 @@ import * as Table from "../src/Table.js"
 // ---------------------------------------------------------------------------
 
 const AppSchema = DynamoSchema.make({ name: "testapp", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
 
 class User extends Schema.Class<User>("User")({
   userId: Schema.String,
@@ -27,7 +26,6 @@ class User extends Schema.Class<User>("User")({
 /** Simple entity — no timestamps, no versioning, no refs */
 const UserEntity = Entity.make({
   model: User,
-  table: MainTable,
   entityType: "User",
   indexes: {
     primary: {
@@ -45,7 +43,6 @@ const UserEntity = Entity.make({
 /** Entity with timestamps + versioning */
 const VersionedUserEntity = Entity.make({
   model: User,
-  table: MainTable,
   entityType: "VersionedUser",
   indexes: {
     primary: {
@@ -66,7 +63,6 @@ class Membership extends Schema.Class<Membership>("Membership")({
 
 const MembershipEntity = Entity.make({
   model: Membership,
-  table: MainTable,
   entityType: "Membership",
   indexes: {
     primary: {
@@ -98,7 +94,6 @@ class Selection extends Schema.Class<Selection>("Selection")({
 
 const TeamEntity = Entity.make({
   model: Team,
-  table: MainTable,
   entityType: "Team",
   indexes: {
     primary: {
@@ -110,7 +105,6 @@ const TeamEntity = Entity.make({
 
 const PlayerEntity = Entity.make({
   model: Player,
-  table: MainTable,
   entityType: "Player",
   indexes: {
     primary: {
@@ -122,7 +116,6 @@ const PlayerEntity = Entity.make({
 
 const SelectionEntity = Entity.make({
   model: Selection,
-  table: MainTable,
   entityType: "Selection",
   indexes: {
     primary: {
@@ -164,7 +157,6 @@ const BrandedTeamEntity = Entity.make({
   model: DynamoModel.configure(BrandedTeam, {
     id: { field: "teamId", identifier: true },
   }),
-  table: MainTable,
   entityType: "BrandedTeam",
   indexes: {
     primary: {
@@ -178,7 +170,6 @@ const BrandedPlayerEntity = Entity.make({
   model: DynamoModel.configure(BrandedPlayer, {
     id: { field: "playerId", identifier: true },
   }),
-  table: MainTable,
   entityType: "BrandedPlayer",
   indexes: {
     primary: {
@@ -194,7 +185,6 @@ const BrandedSelectionEntity = Entity.make({
     team: { ref: true },
     player: { ref: true },
   }),
-  table: MainTable,
   entityType: "BrandedSelection",
   indexes: {
     primary: {
@@ -205,6 +195,21 @@ const BrandedSelectionEntity = Entity.make({
   refs: {
     team: { entity: BrandedTeamEntity },
     player: { entity: BrandedPlayerEntity },
+  },
+})
+
+const _MainTable = Table.make({
+  schema: AppSchema,
+  entities: {
+    UserEntity,
+    VersionedUserEntity,
+    MembershipEntity,
+    TeamEntity,
+    PlayerEntity,
+    SelectionEntity,
+    BrandedTeamEntity,
+    BrandedPlayerEntity,
+    BrandedSelectionEntity,
   },
 })
 
@@ -459,6 +464,56 @@ describe("Entity type extractors", () => {
 
     // Primary key should be excluded
     expectTypeOf<BSelUpdate>().not.toHaveProperty("id")
+  })
+
+  // -------------------------------------------------------------------------
+  // Entity.Create type tests
+  // -------------------------------------------------------------------------
+
+  it("Entity.Create omits identifier field when configured via DynamoModel.configure", () => {
+    type BTeamCreate = Entity.Create<typeof BrandedTeamEntity>
+
+    // Should have non-identifier fields
+    expectTypeOf<BTeamCreate>().toHaveProperty("name")
+    expectTypeOf<BTeamCreate["name"]>().toEqualTypeOf<string>()
+
+    // Identifier field should be excluded
+    expectTypeOf<BTeamCreate>().not.toHaveProperty("id")
+  })
+
+  it("Entity.Create omits identifier for ref-aware entities", () => {
+    type BSelCreate = Entity.Create<typeof BrandedSelectionEntity>
+
+    // Ref fields replaced with Id fields
+    expectTypeOf<BSelCreate>().toHaveProperty("teamId")
+    expectTypeOf<BSelCreate>().toHaveProperty("playerId")
+    expectTypeOf<BSelCreate["teamId"]>().toEqualTypeOf<BrandedTeamId>()
+    expectTypeOf<BSelCreate["playerId"]>().toEqualTypeOf<BrandedPlayerId>()
+
+    // Non-ref field present
+    expectTypeOf<BSelCreate>().toHaveProperty("role")
+
+    // Identifier field should be excluded
+    expectTypeOf<BSelCreate>().not.toHaveProperty("id")
+  })
+
+  it("Entity.Create falls back to PK composites when no identifier configured", () => {
+    type UserCreate = Entity.Create<typeof UserEntity>
+
+    // Non-PK fields present
+    expectTypeOf<UserCreate>().toHaveProperty("email")
+    expectTypeOf<UserCreate>().toHaveProperty("displayName")
+    expectTypeOf<UserCreate>().toHaveProperty("role")
+
+    // PK composite should be excluded
+    expectTypeOf<UserCreate>().not.toHaveProperty("userId")
+  })
+
+  it("Entity.Create matches createSchema type", () => {
+    type BTeamCreate = Entity.Create<typeof BrandedTeamEntity>
+    type CreateSchemaType = Schema.Schema.Type<typeof BrandedTeamEntity.createSchema>
+
+    expectTypeOf<BTeamCreate>().toEqualTypeOf<CreateSchemaType>()
   })
 
   // -------------------------------------------------------------------------

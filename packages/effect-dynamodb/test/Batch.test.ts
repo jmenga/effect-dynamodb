@@ -13,7 +13,6 @@ import * as Table from "../src/Table.js"
 // --- Test Models ---
 
 const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
 
 class User extends Schema.Class<User>("User")({
   userId: Schema.String,
@@ -32,7 +31,6 @@ class Order extends Schema.Class<Order>("Order")({
 
 const UserEntity = Entity.make({
   model: User,
-  table: MainTable,
   entityType: "User",
   indexes: {
     primary: {
@@ -44,7 +42,6 @@ const UserEntity = Entity.make({
 
 const OrderEntity = Entity.make({
   model: Order,
-  table: MainTable,
   entityType: "Order",
   indexes: {
     primary: {
@@ -58,6 +55,8 @@ const OrderEntity = Entity.make({
     },
   },
 })
+
+const MainTable = Table.make({ schema: AppSchema, entities: { UserEntity, OrderEntity } })
 
 // --- Mock DynamoClient ---
 
@@ -84,6 +83,7 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
   transactWriteItems: () => Effect.die("not used"),
   createTable: () => Effect.die("not used"),
   deleteTable: () => Effect.die("not used"),
+  describeTable: () => Effect.die("not used"),
   scan: () => Effect.die("not used"),
 })
 
@@ -302,7 +302,7 @@ describe("Batch", () => {
 
         expect(error._tag).toBe("ValidationError")
         expect((error as ValidationError).entityType).toBe("User")
-        expect((error as ValidationError).operation).toBe("batchGet")
+        expect((error as ValidationError).operation).toBe("decode")
       }).pipe(Effect.provide(TestLayer)),
     )
   })
@@ -659,7 +659,6 @@ describe("Batch", () => {
 
         const SparseEntity = Entity.make({
           model: SparseItem,
-          table: MainTable,
           entityType: "SparseItem",
           indexes: {
             primary: {
@@ -673,6 +672,7 @@ describe("Batch", () => {
             },
           },
         })
+        SparseEntity._configure(AppSchema, MainTable.Tag)
 
         mockBatchWriteItem.mockResolvedValueOnce({})
 

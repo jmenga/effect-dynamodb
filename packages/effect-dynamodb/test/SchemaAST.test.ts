@@ -8,8 +8,8 @@
 
 import { Schema, SchemaAST } from "effect"
 import { describe, expect, it } from "vitest"
-import { inferDefaultEncoding } from "../src/_EntitySchemas.js"
 import { DynamoEncodingKey } from "../src/DynamoModel.js"
+import { inferDefaultEncoding } from "../src/internal/EntitySchemas.js"
 
 describe("SchemaAST canary tests", () => {
   describe("DateTime.Utc detection via inferDefaultEncoding", () => {

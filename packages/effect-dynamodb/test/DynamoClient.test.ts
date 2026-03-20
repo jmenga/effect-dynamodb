@@ -57,6 +57,7 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
   transactWriteItems: () => Effect.die("not used"),
   createTable: () => Effect.die("not used"),
   deleteTable: () => Effect.die("not used"),
+  describeTable: () => Effect.die("not used"),
   scan: () => Effect.die("not used"),
 })
 
@@ -282,6 +283,7 @@ describe("DynamoClient", () => {
       transactWriteItems: () => Effect.die("not used"),
       createTable: () => Effect.die("not used"),
       deleteTable: () => Effect.die("not used"),
+      describeTable: () => Effect.die("not used"),
       scan: () => Effect.die("not used"),
     })
 

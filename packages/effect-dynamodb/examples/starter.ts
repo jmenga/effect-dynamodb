@@ -1,8 +1,14 @@
 /**
- * Starter example — effect-dynamodb v2
+ * Starter example — effect-dynamodb
  *
- * Demonstrates: model definition, schema/table/entity setup, table creation
- * from entity definitions, and raw key composition.
+ * Demonstrates the foundational building blocks:
+ *   - Pure domain models with Schema.Class
+ *   - DynamoSchema + Table + Entity definitions
+ *   - DynamoClient.make() — the typed execution gateway
+ *   - Basic CRUD: put, get, update, delete
+ *   - GSI query
+ *   - Table infrastructure derived from entity definitions
+ *   - Layer-based dependency injection
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -11,7 +17,6 @@
  *   npx tsx examples/starter.ts
  */
 
-import { marshall } from "@aws-sdk/util-dynamodb"
 import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
@@ -19,43 +24,50 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import * as KeyComposer from "../src/KeyComposer.js"
 import * as Table from "../src/Table.js"
 
 // ---------------------------------------------------------------------------
 // 1. Define pure domain models — no DynamoDB concepts
 // ---------------------------------------------------------------------------
 
+const Role = { Admin: "admin", Member: "member" } as const
+const RoleSchema = Schema.Literals(Object.values(Role))
+
+const TaskStatus = { Todo: "todo", InProgress: "in-progress", Done: "done" } as const
+const TaskStatusSchema = Schema.Literals(Object.values(TaskStatus))
+
 class User extends Schema.Class<User>("User")({
   userId: Schema.String,
   email: Schema.String,
   displayName: Schema.NonEmptyString,
-  role: Schema.Literals(["admin", "member"]),
-  createdBy: Schema.String.pipe(DynamoModel.Immutable),
+  role: RoleSchema,
+  createdBy: Schema.String,
 }) {}
+
+const UserModel = DynamoModel.configure(User, {
+  createdBy: { immutable: true },
+})
 
 class Task extends Schema.Class<Task>("Task")({
   taskId: Schema.String,
   userId: Schema.String,
   title: Schema.NonEmptyString,
-  status: Schema.Literals(["todo", "in-progress", "done"]),
+  status: TaskStatusSchema,
   priority: Schema.Number,
 }) {}
 
 // ---------------------------------------------------------------------------
-// 2. Application namespace + table
+// 2. Application namespace
 // ---------------------------------------------------------------------------
 
 const AppSchema = DynamoSchema.make({ name: "starter", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
 
 // ---------------------------------------------------------------------------
-// 3. Entity definitions — bind models to table with key rules
+// 3. Entity definitions — pure definitions, no table reference
 // ---------------------------------------------------------------------------
 
 const Users = Entity.make({
-  model: User,
-  table: MainTable,
+  model: UserModel,
   entityType: "User",
   indexes: {
     primary: {
@@ -75,7 +87,6 @@ const Users = Entity.make({
 
 const Tasks = Entity.make({
   model: Task,
-  table: MainTable,
   entityType: "Task",
   indexes: {
     primary: {
@@ -94,119 +105,94 @@ const Tasks = Entity.make({
 })
 
 // ---------------------------------------------------------------------------
-// 4. Derive table infrastructure from entities
+// 4. Table definition — declare entities as members
 // ---------------------------------------------------------------------------
 
-const tableDefinition = Table.definition(MainTable, [Users, Tasks])
+const MainTable = Table.make({ schema: AppSchema, entities: { Users, Tasks } })
 
 // ---------------------------------------------------------------------------
 // 5. Main program
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
-  const client = yield* DynamoClient
-  const tableConfig = yield* MainTable.Tag
+  // Get typed client — binds all table members
+  const db = yield* DynamoClient.make(MainTable)
 
-  // --- Create the table ---
-  yield* Console.log("Creating table:", tableConfig.name)
-  yield* Console.log("Table definition:", JSON.stringify(tableDefinition, null, 2))
+  // --- Create the table (derived from entity definitions) ---
+  yield* Console.log("=== Setup ===\n")
 
-  yield* client.createTable({
-    TableName: tableConfig.name,
-    BillingMode: "PAY_PER_REQUEST",
-    ...tableDefinition,
-  })
-  yield* Console.log("Table created successfully!\n")
+  yield* db.createTable()
+  yield* Console.log("Table created\n")
 
-  // --- Show key composition ---
-  yield* Console.log("=== Key Composition Examples ===\n")
+  // --- Put: create items ---
+  yield* Console.log("=== Put ===\n")
 
-  const userKeys = KeyComposer.composeAllKeys(AppSchema, "User", 1, Users.indexes, {
+  const alice = yield* db.Users.put({
     userId: "u-alice",
     email: "alice@example.com",
+    displayName: "Alice",
+    role: "admin",
+    createdBy: "system",
   })
-  yield* Console.log("User keys:", JSON.stringify(userKeys, null, 2))
+  yield* Console.log(`Created user: ${alice.displayName} (${alice.email})`)
 
-  const taskKeys = KeyComposer.composeAllKeys(AppSchema, "Task", 1, Tasks.indexes, {
+  yield* db.Tasks.put({
     taskId: "t-1",
     userId: "u-alice",
+    title: "Learn effect-dynamodb",
     status: "todo",
+    priority: 1,
   })
-  yield* Console.log("Task keys:", JSON.stringify(taskKeys, null, 2))
 
-  // --- Insert raw items to show what the ORM will store ---
-  yield* Console.log("\n=== Inserting raw items ===\n")
-
-  const now = new Date().toISOString()
-
-  yield* client.putItem({
-    TableName: tableConfig.name,
-    Item: marshall({
-      ...userKeys,
-      __edd_e__: "User",
-      userId: "u-alice",
-      email: "alice@example.com",
-      displayName: "Alice",
-      role: "admin",
-      createdBy: "system",
-      version: 1,
-      createdAt: now,
-      updatedAt: now,
-    }),
+  yield* db.Tasks.put({
+    taskId: "t-2",
+    userId: "u-alice",
+    title: "Build something cool",
+    status: "in-progress",
+    priority: 2,
   })
-  yield* Console.log("Inserted User: u-alice")
+  yield* Console.log("Created tasks: t-1, t-2\n")
 
-  yield* client.putItem({
-    TableName: tableConfig.name,
-    Item: marshall({
-      ...taskKeys,
-      __edd_e__: "Task",
-      taskId: "t-1",
-      userId: "u-alice",
-      title: "Learn effect-dynamodb",
-      status: "todo",
-      priority: 1,
-      createdAt: now,
-      updatedAt: now,
-    }),
-  })
-  yield* Console.log("Inserted Task: t-1")
+  // --- Get: read by primary key ---
+  yield* Console.log("=== Get ===\n")
 
-  // --- Query by GSI to show collection pattern ---
-  yield* Console.log("\n=== Query: Tasks by userId (GSI1 collection) ===\n")
+  const user = yield* db.Users.get({ userId: "u-alice" })
+  yield* Console.log(`Got user: ${user.displayName} (role: ${user.role})`)
 
-  const skPrefix = KeyComposer.composeSortKeyPrefix(
-    AppSchema,
-    "Task",
-    1,
-    Tasks.indexes.byUser!,
-    {}, // no SK composites — gets all tasks for the user
+  const task = yield* db.Tasks.get({ taskId: "t-1" })
+  yield* Console.log(`Got task: "${task.title}" (status: ${task.status})\n`)
+
+  // --- Update ---
+  yield* Console.log("=== Update ===\n")
+
+  // Note: status is a GSI composite, so we must also provide userId
+  // (all composites for the GSI) so the key can be recomposed
+  const updated = yield* db.Tasks.update(
+    { taskId: "t-1" },
+    Entity.set({ status: "done", userId: "u-alice" }),
   )
-  const pkValue = DynamoSchema.composeCollectionKey(AppSchema, "UserItems", ["u-alice"], undefined)
+  yield* Console.log(`Updated task: "${updated.title}" -> ${updated.status}\n`)
 
-  const queryResult = yield* client.query({
-    TableName: tableConfig.name,
-    IndexName: "gsi1",
-    KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
-    ExpressionAttributeNames: { "#pk": "gsi1pk", "#sk": "gsi1sk" },
-    ExpressionAttributeValues: marshall({ ":pk": pkValue, ":skPrefix": skPrefix }),
-  })
-  yield* Console.log(`Found ${queryResult.Items?.length ?? 0} items`)
-  for (const item of queryResult.Items ?? []) {
-    yield* Console.log("  ", JSON.stringify(item))
+  // --- Query: tasks by user via GSI ---
+  yield* Console.log("=== Query: Tasks by User (GSI) ===\n")
+
+  const aliceTasks = yield* db.Tasks.collect(Tasks.query.byUser({ userId: "u-alice" }))
+  yield* Console.log(`Alice's tasks (${aliceTasks.length}):`)
+  for (const t of aliceTasks) {
+    yield* Console.log(`  ${t.taskId}: "${t.title}" — ${t.status}`)
   }
+  yield* Console.log("")
 
-  // --- Show derived types ---
-  yield* Console.log("\n=== Entity-Derived Types ===\n")
-  yield* Console.log("Users.entityType:", Users.entityType)
-  yield* Console.log("Users.systemFields:", JSON.stringify(Users.systemFields))
-  yield* Console.log("Key attributes:", Entity.keyAttributes(Users))
-  yield* Console.log("All key field names:", Entity.keyFieldNames(Users))
-  yield* Console.log("All composite attrs:", Entity.compositeAttributes(Users))
+  // --- Delete ---
+  yield* Console.log("=== Delete ===\n")
+
+  yield* db.Tasks.delete({ taskId: "t-1" })
+  yield* db.Tasks.delete({ taskId: "t-2" })
+  yield* db.Users.delete({ userId: "u-alice" })
+  yield* Console.log("Deleted all items\n")
 
   // --- Cleanup ---
-  yield* Console.log("\n=== Cleanup ===\n")
-  yield* client.deleteTable({ TableName: tableConfig.name })
+  yield* db.deleteTable
   yield* Console.log("Table deleted.")
 })
 
@@ -223,7 +209,7 @@ const AppLayer = Layer.mergeAll(
   MainTable.layer({ name: "starter-table" }),
 )
 
-const main = program.pipe(Effect.provide(AppLayer), Effect.scoped)
+const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
   () => console.log("\nDone."),

@@ -145,18 +145,16 @@ const matchDecider: EventStore.Decider<
 }
 
 // ---------------------------------------------------------------------------
-// 5. Command Handler
-// ---------------------------------------------------------------------------
-
-const handleMatch = EventStore.commandHandler(matchDecider, MatchEvents)
-
-// ---------------------------------------------------------------------------
-// 6. Main program
+// 5. Main program
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
   const client = yield* DynamoClient
   const tableConfig = yield* EventsTable.Tag
+
+  // --- Bind event stream ---
+  const matchEvents = yield* EventStore.bind(MatchEvents)
+  const handleMatch = EventStore.commandHandler(matchDecider, matchEvents)
 
   // --- Create table ---
   yield* Console.log("Creating table:", tableConfig.name)
@@ -214,20 +212,20 @@ const program = Effect.gen(function* () {
 
   // --- Read all events ---
   yield* Console.log("\n=== Read all events ===")
-  const allEvents = yield* MatchEvents.read({ matchId: "m-1" })
+  const allEvents = yield* matchEvents.read({ matchId: "m-1" })
   for (const event of allEvents) {
     yield* Console.log(`  v${event.version}: ${event.eventType} at ${event.timestamp}`)
   }
 
   // --- Read from version ---
   yield* Console.log("\n=== Read from version 2 ===")
-  const laterEvents = yield* MatchEvents.readFrom({ matchId: "m-1" }, 2)
+  const laterEvents = yield* matchEvents.readFrom({ matchId: "m-1" }, 2)
   for (const event of laterEvents) {
     yield* Console.log(`  v${event.version}: ${event.eventType}`)
   }
 
   // --- Current version ---
-  const version = yield* MatchEvents.currentVersion({ matchId: "m-1" })
+  const version = yield* matchEvents.currentVersion({ matchId: "m-1" })
   yield* Console.log(`\nCurrent version: ${version}`)
 
   // --- Fold: reconstruct state from events ---
@@ -237,9 +235,9 @@ const program = Effect.gen(function* () {
 
   // --- Query combinator: get latest event ---
   yield* Console.log("\n=== Query: Latest event ===")
-  const latest = yield* MatchEvents.query
-    .events({ matchId: "m-1" })
-    .pipe(Query.reverse, Query.limit(1), Query.collect)
+  const latest = yield* matchEvents.provide(
+    matchEvents.query.events({ matchId: "m-1" }).pipe(Query.reverse, Query.limit(1), Query.collect),
+  )
   const [latestEvent] = latest
   if (latestEvent) {
     yield* Console.log(`Latest: v${latestEvent.version} ${latestEvent.eventType}`)
@@ -260,7 +258,7 @@ const program = Effect.gen(function* () {
 })
 
 // ---------------------------------------------------------------------------
-// 7. Provide dependencies and run
+// 6. Provide dependencies and run
 // ---------------------------------------------------------------------------
 
 const AppLayer = Layer.mergeAll(
@@ -272,7 +270,7 @@ const AppLayer = Layer.mergeAll(
   EventsTable.layer({ name: "event-sourcing-example" }),
 )
 
-const main = program.pipe(Effect.provide(AppLayer), Effect.scoped)
+const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
   () => console.log("\nDone."),

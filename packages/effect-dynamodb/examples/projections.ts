@@ -1,5 +1,5 @@
 /**
- * Projections example — effect-dynamodb v2
+ * Projections example — effect-dynamodb v3 (client gateway pattern)
  *
  * Demonstrates:
  *   - Projection.projection(): build a ProjectionExpression from attribute names
@@ -42,15 +42,13 @@ class Employee extends Schema.Class<Employee>("Employee")({
 }) {}
 
 // ---------------------------------------------------------------------------
-// 2. Schema + Table + Entity
+// 2. Schema + Entity + Table
 // ---------------------------------------------------------------------------
 
 const AppSchema = DynamoSchema.make({ name: "proj-demo", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
 
 const Employees = Entity.make({
   model: Employee,
-  table: MainTable,
   entityType: "Employee",
   indexes: {
     primary: {
@@ -66,26 +64,28 @@ const Employees = Entity.make({
   timestamps: true,
 })
 
+const MainTable = Table.make({ schema: AppSchema, entities: { Employees } })
+
 // ---------------------------------------------------------------------------
 // 3. Main program
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
+  // Typed execution gateway — binds all table members
+  const db = yield* DynamoClient.make(MainTable)
+
+  // Raw DynamoClient + TableConfig needed for low-level projection operations
   const client = yield* DynamoClient
   const tableConfig = yield* MainTable.Tag
 
   // --- Setup ---
   yield* Console.log("=== Setup ===\n")
 
-  yield* client.createTable({
-    TableName: tableConfig.name,
-    BillingMode: "PAY_PER_REQUEST",
-    ...Table.definition(MainTable, [Employees]),
-  })
+  yield* db.createTable()
   yield* Console.log("Table created\n")
 
   // Seed data
-  yield* Employees.put({
+  yield* db.Employees.put({
     employeeId: "e-1",
     name: "Alice",
     email: "alice@company.com",
@@ -93,7 +93,7 @@ const program = Effect.gen(function* () {
     salary: 120000,
     title: "Senior Engineer",
   })
-  yield* Employees.put({
+  yield* db.Employees.put({
     employeeId: "e-2",
     name: "Bob",
     email: "bob@company.com",
@@ -101,7 +101,7 @@ const program = Effect.gen(function* () {
     salary: 95000,
     title: "Engineer",
   })
-  yield* Employees.put({
+  yield* db.Employees.put({
     employeeId: "e-3",
     name: "Charlie",
     email: "charlie@company.com",
@@ -200,7 +200,7 @@ const program = Effect.gen(function* () {
 
   // --- Cleanup ---
   yield* Console.log("=== Cleanup ===\n")
-  yield* client.deleteTable({ TableName: tableConfig.name })
+  yield* db.deleteTable
   yield* Console.log("Table deleted.")
 })
 
@@ -217,7 +217,7 @@ const AppLayer = Layer.mergeAll(
   MainTable.layer({ name: "proj-demo-table" }),
 )
 
-const main = program.pipe(Effect.provide(AppLayer), Effect.scoped)
+const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
   () => console.log("\nDone."),

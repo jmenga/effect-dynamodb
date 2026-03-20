@@ -3,8 +3,13 @@ import { Effect, Layer, Stream } from "effect"
 import { beforeEach, vi } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import { DynamoError, ValidationError } from "../src/Errors.js"
+import { createConditionOps } from "../src/internal/Expr.js"
+import { createPathBuilder } from "../src/internal/PathBuilder.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
+
+const ops = createConditionOps<any>()
+const pb = createPathBuilder<any>()
 
 // ---------------------------------------------------------------------------
 // Mock DynamoClient
@@ -34,6 +39,7 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
   transactWriteItems: () => Effect.die("not used"),
   createTable: () => Effect.die("not used"),
   deleteTable: () => Effect.die("not used"),
+  describeTable: () => Effect.die("not used"),
 })
 
 // ---------------------------------------------------------------------------
@@ -191,29 +197,28 @@ describe("Query", () => {
 
   describe("filter", () => {
     it("adds a filter condition (data-last)", () => {
-      const q = makeTestQuery().pipe(Query.filter({ status: "active" }))
-      expect(q._state.filterConditions).toHaveLength(1)
-      expect(q._state.filterConditions[0]).toEqual({ status: "active" })
+      const q = makeTestQuery().pipe(Query.filterExpr(ops.eq(pb.status, "active")))
+      expect(q._state.exprFilters).toHaveLength(1)
     })
 
     it("adds a filter condition (data-first)", () => {
-      const q = Query.filter(makeTestQuery(), { status: "active" })
-      expect(q._state.filterConditions).toHaveLength(1)
+      const q = Query.filterExpr(makeTestQuery(), ops.eq(pb.status, "active"))
+      expect(q._state.exprFilters).toHaveLength(1)
     })
 
     it("ANDs multiple filters", () => {
       const q = makeTestQuery().pipe(
-        Query.filter({ status: "active" }),
-        Query.filter({ role: "admin" }),
+        Query.filterExpr(ops.eq(pb.status, "active")),
+        Query.filterExpr(ops.eq(pb.role, "admin")),
       )
-      expect(q._state.filterConditions).toHaveLength(2)
+      expect(q._state.exprFilters).toHaveLength(2)
     })
 
     it("does not mutate the original query", () => {
       const original = makeTestQuery()
-      const modified = original.pipe(Query.filter({ status: "active" }))
-      expect(original._state.filterConditions).toHaveLength(0)
-      expect(modified._state.filterConditions).toHaveLength(1)
+      const modified = original.pipe(Query.filterExpr(ops.eq(pb.status, "active")))
+      expect(original._state.exprFilters).toHaveLength(0)
+      expect(modified._state.exprFilters).toHaveLength(1)
     })
   })
 
@@ -276,13 +281,13 @@ describe("Query", () => {
     it("chains multiple combinators", () => {
       const q = makeTestQuery().pipe(
         Query.where({ beginsWith: "prefix" }),
-        Query.filter({ status: "active" }),
+        Query.filterExpr(ops.eq(pb.status, "active")),
         Query.limit(20),
         Query.reverse,
       )
 
       expect(q._state.skConditions).toHaveLength(1)
-      expect(q._state.filterConditions).toHaveLength(1)
+      expect(q._state.exprFilters).toHaveLength(1)
       expect(q._state.limitValue).toBe(20)
       expect(q._state.scanForward).toBe(false)
     })
@@ -433,129 +438,141 @@ describe("Query", () => {
         mockQuery.mockResolvedValueOnce({ Items: [], LastEvaluatedKey: undefined })
 
         const q = makeTestQuery().pipe(
-          Query.filter({ status: "active" }),
-          Query.filter({ role: "admin" }),
+          Query.filterExpr(ops.and(ops.eq(pb.status, "active"), ops.eq(pb.role, "admin"))),
         )
         yield* Query.collect(q)
 
         const call = mockQuery.mock.calls[0]![0]
         expect(call.FilterExpression).toContain("#eddE IN (:et0)")
-        expect(call.FilterExpression).toContain("#f0 = :f0")
-        expect(call.FilterExpression).toContain("#f1 = :f1")
-        expect(call.ExpressionAttributeNames["#f0"]).toBe("status")
-        expect(call.ExpressionAttributeNames["#f1"]).toBe("role")
+        expect(call.FilterExpression).toContain("=")
+        expect(Object.values(call.ExpressionAttributeNames)).toContain("status")
+        expect(Object.values(call.ExpressionAttributeNames)).toContain("role")
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
     it.effect("builds contains filter", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({ Items: [], LastEvaluatedKey: undefined })
-        const q = makeTestQuery().pipe(Query.filter({ tags: { contains: "typescript" } }))
+        const q = makeTestQuery().pipe(Query.filterExpr(ops.contains(pb.tags, "typescript")))
         yield* Query.collect(q)
         const call = mockQuery.mock.calls[0]![0]
-        expect(call.FilterExpression).toContain("contains(#f0, :f0)")
-        expect(call.ExpressionAttributeNames["#f0"]).toBe("tags")
+        expect(call.FilterExpression).toContain("contains(")
+        expect(Object.values(call.ExpressionAttributeNames)).toContain("tags")
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
     it.effect("builds beginsWith filter", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({ Items: [], LastEvaluatedKey: undefined })
-        const q = makeTestQuery().pipe(Query.filter({ name: { beginsWith: "Al" } }))
+        const q = makeTestQuery().pipe(Query.filterExpr(ops.beginsWith(pb.name as any, "Al")))
         yield* Query.collect(q)
         const call = mockQuery.mock.calls[0]![0]
-        expect(call.FilterExpression).toContain("begins_with(#f0, :f0)")
+        expect(call.FilterExpression).toContain("begins_with(")
+        expect(Object.values(call.ExpressionAttributeNames)).toContain("name")
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
     it.effect("builds between filter", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({ Items: [], LastEvaluatedKey: undefined })
-        const q = makeTestQuery().pipe(Query.filter({ age: { between: [18, 65] } }))
+        const q = makeTestQuery().pipe(Query.filterExpr(ops.between(pb.age, 18, 65)))
         yield* Query.collect(q)
         const call = mockQuery.mock.calls[0]![0]
-        expect(call.FilterExpression).toContain("#f0 BETWEEN :f0 AND :f0b")
+        expect(call.FilterExpression).toContain("BETWEEN")
+        expect(call.FilterExpression).toContain("AND")
+        expect(Object.values(call.ExpressionAttributeNames)).toContain("age")
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
     it.effect("builds gt filter", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({ Items: [], LastEvaluatedKey: undefined })
-        const q = makeTestQuery().pipe(Query.filter({ score: { gt: 90 } }))
+        const q = makeTestQuery().pipe(Query.filterExpr(ops.gt(pb.score, 90)))
         yield* Query.collect(q)
         const call = mockQuery.mock.calls[0]![0]
-        expect(call.FilterExpression).toContain("#f0 > :f0")
+        expect(call.FilterExpression).toContain(">")
+        expect(Object.values(call.ExpressionAttributeNames)).toContain("score")
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
     it.effect("builds gte filter", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({ Items: [], LastEvaluatedKey: undefined })
-        const q = makeTestQuery().pipe(Query.filter({ score: { gte: 90 } }))
+        const q = makeTestQuery().pipe(Query.filterExpr(ops.gte(pb.score, 90)))
         yield* Query.collect(q)
         const call = mockQuery.mock.calls[0]![0]
-        expect(call.FilterExpression).toContain("#f0 >= :f0")
+        expect(call.FilterExpression).toContain(">=")
+        expect(Object.values(call.ExpressionAttributeNames)).toContain("score")
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
     it.effect("builds lt filter", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({ Items: [], LastEvaluatedKey: undefined })
-        const q = makeTestQuery().pipe(Query.filter({ score: { lt: 50 } }))
+        const q = makeTestQuery().pipe(Query.filterExpr(ops.lt(pb.score, 50)))
         yield* Query.collect(q)
         const call = mockQuery.mock.calls[0]![0]
-        expect(call.FilterExpression).toContain("#f0 < :f0")
+        expect(call.FilterExpression).toContain("<")
+        expect(Object.values(call.ExpressionAttributeNames)).toContain("score")
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
     it.effect("builds lte filter", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({ Items: [], LastEvaluatedKey: undefined })
-        const q = makeTestQuery().pipe(Query.filter({ score: { lte: 50 } }))
+        const q = makeTestQuery().pipe(Query.filterExpr(ops.lte(pb.score, 50)))
         yield* Query.collect(q)
         const call = mockQuery.mock.calls[0]![0]
-        expect(call.FilterExpression).toContain("#f0 <= :f0")
+        expect(call.FilterExpression).toContain("<=")
+        expect(Object.values(call.ExpressionAttributeNames)).toContain("score")
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
     it.effect("builds ne filter", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({ Items: [], LastEvaluatedKey: undefined })
-        const q = makeTestQuery().pipe(Query.filter({ status: { ne: "deleted" } }))
+        const q = makeTestQuery().pipe(Query.filterExpr(ops.ne(pb.status, "deleted")))
         yield* Query.collect(q)
         const call = mockQuery.mock.calls[0]![0]
-        expect(call.FilterExpression).toContain("#f0 <> :f0")
+        expect(call.FilterExpression).toContain("<>")
+        expect(Object.values(call.ExpressionAttributeNames)).toContain("status")
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
     it.effect("builds exists filter", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({ Items: [], LastEvaluatedKey: undefined })
-        const q = makeTestQuery().pipe(Query.filter({ email: { exists: true } }))
+        const q = makeTestQuery().pipe(Query.filterExpr(ops.exists(pb.email)))
         yield* Query.collect(q)
         const call = mockQuery.mock.calls[0]![0]
-        expect(call.FilterExpression).toContain("attribute_exists(#f0)")
+        expect(call.FilterExpression).toContain("attribute_exists(")
+        expect(Object.values(call.ExpressionAttributeNames)).toContain("email")
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
     it.effect("builds notExists filter", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({ Items: [], LastEvaluatedKey: undefined })
-        const q = makeTestQuery().pipe(Query.filter({ deletedAt: { notExists: true } }))
+        const q = makeTestQuery().pipe(Query.filterExpr(ops.notExists(pb.deletedAt)))
         yield* Query.collect(q)
         const call = mockQuery.mock.calls[0]![0]
-        expect(call.FilterExpression).toContain("attribute_not_exists(#f0)")
+        expect(call.FilterExpression).toContain("attribute_not_exists(")
+        expect(Object.values(call.ExpressionAttributeNames)).toContain("deletedAt")
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
     it.effect("mixes equality and operator filters", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({ Items: [], LastEvaluatedKey: undefined })
-        const q = makeTestQuery().pipe(Query.filter({ status: "active", score: { gte: 80 } }))
+        const q = makeTestQuery().pipe(
+          Query.filterExpr(ops.and(ops.eq(pb.status, "active"), ops.gte(pb.score, 80))),
+        )
         yield* Query.collect(q)
         const call = mockQuery.mock.calls[0]![0]
-        expect(call.FilterExpression).toContain("#f0 = :f0")
-        expect(call.FilterExpression).toContain("#f1 >= :f1")
+        expect(call.FilterExpression).toContain("=")
+        expect(call.FilterExpression).toContain(">=")
+        expect(Object.values(call.ExpressionAttributeNames)).toContain("status")
+        expect(Object.values(call.ExpressionAttributeNames)).toContain("score")
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
@@ -750,11 +767,12 @@ describe("Query", () => {
           Items: [toAttributeMap({ id: "u-1", name: "Alice", __edd_e__: "User" })],
         })
 
-        const q = makeTestScan().pipe(Query.filter({ name: "Alice" }))
+        const q = makeTestScan().pipe(Query.filterExpr(ops.eq(pb.name, "Alice")))
         yield* Query.collect(q)
 
         const input = mockScan.mock.calls[0]![0]
-        expect(input.FilterExpression).toContain("#f0 = :f0")
+        expect(input.FilterExpression).toContain("=")
+        expect(Object.values(input.ExpressionAttributeNames)).toContain("name")
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
@@ -885,7 +903,7 @@ describe("Query", () => {
 
         yield* makeTestQuery().pipe(
           Query.ignoreOwnership,
-          Query.filter({ name: "Alice" }),
+          Query.filterExpr(ops.eq(pb.name, "Alice")),
           Query.collect,
         )
 
@@ -893,7 +911,8 @@ describe("Query", () => {
         // Should have user filter but not entity type filter
         expect(input.FilterExpression).toBeDefined()
         expect(input.FilterExpression).not.toContain("__edd_e__")
-        expect(input.FilterExpression).toContain("#f0 = :f0")
+        expect(input.FilterExpression).toContain("=")
+        expect(Object.values(input.ExpressionAttributeNames)).toContain("name")
       }).pipe(Effect.provide(TestDynamoClient)),
     )
   })
@@ -952,7 +971,7 @@ describe("Query", () => {
       Effect.gen(function* () {
         const params = yield* makeTestQuery().pipe(
           Query.where({ beginsWith: "prefix" }),
-          Query.filter({ name: "Alice" }),
+          Query.filterExpr(ops.eq(pb.name, "Alice")),
           Query.limit(10),
           Query.asParams,
         )
@@ -968,7 +987,10 @@ describe("Query", () => {
 
     it.effect("returns scan params", () =>
       Effect.gen(function* () {
-        const params = yield* makeTopLevelScan().pipe(Query.filter({ name: "Bob" }), Query.asParams)
+        const params = yield* makeTopLevelScan().pipe(
+          Query.filterExpr(ops.eq(pb.name, "Bob")),
+          Query.asParams,
+        )
 
         expect(params.TableName).toBe("TestTable")
         expect(params.FilterExpression).toBeDefined()

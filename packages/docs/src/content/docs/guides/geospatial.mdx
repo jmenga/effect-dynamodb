@@ -1,0 +1,205 @@
+---
+title: "Geospatial"
+description: "Proximity-based queries on DynamoDB using H3 hexagonal grid indexing"
+---
+
+The `@effect-dynamodb/geo` package enables proximity-based ("nearby") queries on DynamoDB using [H3 hexagonal grid cells](https://h3geo.org/). It transforms latitude/longitude coordinates into hierarchical H3 cells, stores them as GSI fields, and provides efficient radius-based search.
+
+**Use cases:** real-time location tracking, venue/store discovery, fleet management, delivery radius checks.
+
+## Installation
+
+```bash
+pnpm add @effect-dynamodb/geo
+```
+
+**Dependencies:** `effect-dynamodb`, `effect`, and `h3-js` (installed automatically).
+
+## How It Works
+
+1. **Write time** — Coordinates are converted to H3 cells at two resolutions: a fine cell (sort key) and a coarse parent cell (partition key). A time partition bucket is also computed for temporal scoping.
+2. **Query time** — The search center and radius determine which H3 cells to query. Contiguous cells are grouped into `BETWEEN` range queries on the sort key. All queries execute in parallel.
+3. **Post-filter** — Results are filtered by great-circle distance and sorted by proximity.
+
+## Setup
+
+### 1. Define a Model with Coordinate Fields
+
+The model needs latitude, longitude, and fields for the computed geo values. The geo fields (`cell`, `parentCell`, `timePartition`) are optional because they're computed automatically on write.
+
+```typescript
+import { Schema } from "effect"
+
+class Vehicle extends Schema.Class<Vehicle>("Vehicle")({
+  vehicleId: Schema.String,
+  latitude: Schema.optional(Schema.Number),
+  longitude: Schema.optional(Schema.Number),
+  timestamp: Schema.Number,
+  cell: Schema.optional(Schema.String),
+  parentCell: Schema.optional(Schema.String),
+  timePartition: Schema.optional(Schema.String),
+}) {}
+```
+
+### 2. Create Entity with Geo GSI
+
+The geo index uses a GSI where the partition key is composed from `parentCell` + `timePartition` and the sort key from `cell`.
+
+```typescript
+import { DynamoSchema, Table, Entity } from "effect-dynamodb"
+
+const AppSchema = DynamoSchema.make({ name: "fleet", version: 1 })
+const MainTable = Table.make({ schema: AppSchema })
+
+const Vehicles = Entity.make({
+  model: Vehicle,
+  entityType: "Vehicle",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["vehicleId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    byCell: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["parentCell", "timePartition"] },
+      sk: { field: "gsi1sk", composite: ["cell"] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+### 3. Create GeoIndex
+
+Bind geo configuration to the entity:
+
+```typescript
+import { GeoIndex } from "@effect-dynamodb/geo"
+
+const VehicleGeo = GeoIndex.make({
+  entity: Vehicles,
+  index: "byCell",
+  coordinates: (item) =>
+    item.latitude !== undefined && item.longitude !== undefined
+      ? { latitude: item.latitude, longitude: item.longitude }
+      : undefined,
+  fields: {
+    cell: { field: "cell", resolution: 15 },
+    parentCell: { field: "parentCell", resolution: 3 },
+    timePartition: {
+      field: "timePartition",
+      source: "timestamp",
+      bucket: "hourly",
+    },
+  },
+})
+```
+
+**Configuration:**
+
+| Field | Description |
+|-------|-------------|
+| `entity` | The effect-dynamodb Entity to bind to |
+| `index` | Name of the GSI to use for geo queries |
+| `coordinates` | Extractor function — returns `{ latitude, longitude }` or `undefined` for items without location |
+| `fields.cell` | Fine-grained H3 cell (sort key). Resolution 15 is ~1m precision |
+| `fields.parentCell` | Coarse H3 cell (partition key). Resolution 3 is ~12km hexagons |
+| `fields.timePartition` | Time bucketing for temporal scoping. `source` names the timestamp field, `bucket` is `"hourly"` |
+
+## Usage
+
+### Writing with Geo Enrichment
+
+After binding with `GeoIndex.bind()`, use `vehicleGeo.put()` instead of the entity's `put()` — it automatically computes and sets the geo fields:
+
+```typescript
+import { GeoIndex } from "@effect-dynamodb/geo"
+
+const program = Effect.gen(function* () {
+  const vehicleGeo = yield* GeoIndex.bind(VehicleGeo)
+
+  yield* vehicleGeo.put({
+    vehicleId: "v-1",
+    latitude: 37.7749,
+    longitude: -122.4194,
+    timestamp: Date.now(),
+  })
+  // cell, parentCell, and timePartition are computed automatically
+})
+```
+
+Items without coordinates (where the `coordinates` extractor returns `undefined`) skip geo field enrichment and don't appear in the geo GSI (sparse index pattern).
+
+### Nearby Search
+
+Find items within a radius of a center point:
+
+```typescript
+const vehicleGeo = yield* GeoIndex.bind(VehicleGeo)
+
+const results = yield* vehicleGeo.nearby({
+  center: { latitude: 37.7749, longitude: -122.4194 },
+  radius: 2000,
+  unit: "m",
+  timeWindow: {
+    start: Date.now() - 3_600_000, // 1 hour ago
+    end: Date.now(),
+  },
+  sort: "ASC",
+})
+
+for (const { item, distance } of results) {
+  console.log(`${item.vehicleId}: ${distance.toFixed(0)}m away`)
+}
+```
+
+**Options:**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `center` | `{ latitude, longitude }` | required | Search center |
+| `radius` | `number` | required | Search radius |
+| `unit` | `"m"` \| `"km"` | `"m"` | Radius unit |
+| `timeWindow` | `{ start, end }` | past 15 minutes | Temporal scope (epoch ms) |
+| `sort` | `"ASC"` \| `"DESC"` | `"ASC"` | Sort by distance |
+
+**Returns:** `Array<{ item: Entity.Record, distance: number }>` — sorted by distance, filtered to the exact radius using great-circle distance.
+
+### Enriching for Transactions
+
+When using transactions or batch writes, use `enrich()` to compute geo fields without writing:
+
+```typescript
+const enriched = VehicleGeo.enrich({
+  vehicleId: "v-2",
+  latitude: 37.78,
+  longitude: -122.41,
+  timestamp: Date.now(),
+})
+// enriched now has cell, parentCell, timePartition set
+// Use in Transaction.write() or Entity.batchWrite()
+```
+
+## How the Query Works
+
+Given a nearby search with `center` and `radius`:
+
+1. **Optimal resolution** — H3 resolution is chosen to balance precision and query count
+2. **Grid disk** — Concentric rings of H3 cells are generated around the center
+3. **Edge pruning** — Cells whose nearest edge exceeds the radius are removed
+4. **Contiguous chunking** — Adjacent H3 cells (numerically sequential) are grouped into `BETWEEN` range queries on the sort key, reducing the number of DynamoDB queries
+5. **Time partitions** — The time window is divided into hourly buckets
+6. **Parallel execution** — All (partition × chunk) query combinations execute in parallel
+7. **Great-circle filter** — Results are post-filtered using haversine distance to the exact radius
+
+## H3 Resolution Guide
+
+| Resolution | Avg Edge Length | Use Case |
+|------------|----------------|----------|
+| 0 | ~1,107 km | Continent-scale |
+| 3 | ~59 km | City/region grouping (recommended for `parentCell`) |
+| 7 | ~1.2 km | Neighborhood |
+| 10 | ~70 m | Block-level |
+| 15 | ~0.5 m | Precise positioning (recommended for `cell`) |
+
+Lower `parentCell` resolution = fewer partitions but larger GSI items per partition. Higher `cell` resolution = more precise sort key ranges.

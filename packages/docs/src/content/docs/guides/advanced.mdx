@@ -1,0 +1,299 @@
+---
+title: "Advanced Topics"
+description: "Rich updates, batch operations, multi-table design, and expression builders"
+---
+
+This guide covers rich update operations, batch operations, multi-table design, and the low-level expression builder API.
+
+## Updating Items
+
+Beyond `Entity.set()`, effect-dynamodb provides combinators for all DynamoDB update expression types. All compose as variadic arguments to `update()` and execute as one `UpdateItem` call.
+
+### Removing Attributes
+
+Deletes attributes entirely from the item:
+
+```typescript
+const { ProductEntity: products } = yield* DynamoClient.make(MainTable)
+
+yield* products.update(
+  { productId: "p-1" },
+  Entity.remove(["description", "temporaryFlag"]),
+)
+```
+
+### Atomic Increment
+
+Atomically increments numeric attributes. Thread-safe — no read-modify-write cycle:
+
+```typescript
+const { ProductEntity: products } = yield* DynamoClient.make(MainTable)
+
+yield* products.update(
+  { productId: "p-1" },
+  Entity.add({ viewCount: 1, stock: 50 }),
+)
+```
+
+### Atomic Decrement
+
+Synthesizes `SET #field = #field - :val` (DynamoDB has no native subtract):
+
+```typescript
+const { ProductEntity: products } = yield* DynamoClient.make(MainTable)
+
+yield* products.update(
+  { productId: "p-1" },
+  Entity.subtract({ stock: 3 }),
+)
+```
+
+### Appending to Lists
+
+Appends elements to the end of a list attribute using `list_append`:
+
+```typescript
+const { ProductEntity: products } = yield* DynamoClient.make(MainTable)
+
+yield* products.update(
+  { productId: "p-1" },
+  Entity.append({ tags: ["on-sale", "featured"] }),
+)
+```
+
+### Removing from Sets
+
+Removes specific elements from a DynamoDB Set attribute (StringSet, NumberSet):
+
+```typescript
+const { ProductEntity: products } = yield* DynamoClient.make(MainTable)
+
+yield* products.update(
+  { productId: "p-1" },
+  Entity.deleteFromSet({ categories: new Set(["obsolete"]) }),
+)
+```
+
+### Composing Multiple Update Types
+
+All update combinators compose as arguments — they are merged into one `UpdateItem` call:
+
+```typescript
+const { ProductEntity: products } = yield* DynamoClient.make(MainTable)
+
+yield* products.update(
+  { productId: "p-1" },
+  Entity.set({ name: "Premium Mouse", price: 39.99 }),
+  Entity.add({ viewCount: 10 }),
+  Entity.subtract({ stock: 5 }),
+  Entity.append({ tags: ["premium"] }),
+  Entity.remove(["temporaryNote"]),
+  Entity.expectedVersion(3),
+)
+```
+
+## Working in Bulk
+
+The entity provides batch operations that automatically handle DynamoDB limits (chunking) and retry unprocessed items:
+
+```typescript
+const { UserEntity: users } = yield* DynamoClient.make(MainTable)
+
+// Batch get (auto-chunks at 100 items)
+const results = yield* users.batchGet([
+  { userId: "u-1" },
+  { userId: "u-2" },
+  { userId: "u-3" },
+])
+
+// Batch write (auto-chunks at 25 items)
+yield* users.batchPut([
+  { userId: "u-1", email: "a@b.com", displayName: "A" },
+  { userId: "u-2", email: "b@c.com", displayName: "B" },
+])
+
+yield* users.batchDelete([
+  { userId: "u-1" },
+  { userId: "u-2" },
+])
+```
+
+Note: Batch operations do **not** enforce unique constraints (no transactional guarantees). Use individual `put`/`delete` for entities with unique constraints.
+
+## Conditional Writes
+
+Entity-level `condition()` adds a `ConditionExpression` to any mutation (put, update, delete). The condition is evaluated server-side — if it fails, the operation is rejected with `ConditionalCheckFailed`.
+
+```typescript
+import { DynamoClient, Entity } from "effect-dynamodb"
+
+const { UserEntity: users, ProductEntity: products, TaskEntity: tasks } = yield* DynamoClient.make(MainTable)
+
+// Conditional put — only if item doesn't already exist
+yield* users.put(newUser, UserEntity.condition((t, { notExists }) => notExists(t.email)))
+
+// Conditional delete — only if stock is zero
+yield* products.delete(
+  { productId: "p-1" },
+  ProductEntity.condition((t, { eq }) => eq(t.stock, 0)),
+)
+
+// Conditional update — only if status is "active"
+yield* tasks.update(
+  { taskId: "t-1" },
+  Entity.set({ status: "done" }),
+  TaskEntity.condition((t, { eq }) => eq(t.status, "active")),
+)
+```
+
+### Composing with Optimistic Locking
+
+When using `condition()` on an update that also has `Entity.expectedVersion()`, the user condition is ANDed with the version check:
+
+```typescript
+const { ProductEntity: products } = yield* DynamoClient.make(MainTable)
+
+yield* products.update(
+  { productId: "p-1" },
+  Entity.set({ price: 24.99 }),
+  Entity.expectedVersion(3),
+  ProductEntity.condition((t, { gt }) => gt(t.stock, 0)),
+)
+// ConditionExpression: (#version = :v_lock) AND (#stock > :v0)
+```
+
+### Handling ConditionalCheckFailed
+
+```typescript
+const { UserEntity: users } = yield* DynamoClient.make(MainTable)
+
+const result = yield* users
+  .put(newUser, UserEntity.condition((t, { notExists }) => notExists(t.email)))
+  .pipe(
+    Effect.catchTag("ConditionalCheckFailed", () =>
+      Effect.succeed("already exists")
+    ),
+  )
+```
+
+## Creating Items Safely
+
+`Entity.create()` is a convenience for "put if not exists" — it's `Entity.put()` with an automatic `attribute_not_exists` condition on the primary key:
+
+```typescript
+const { UserEntity: users } = yield* DynamoClient.make(MainTable)
+
+// Create — fails with ConditionalCheckFailed if item already exists
+const user = yield* users.create({
+  userId: "u-1",
+  email: "alice@example.com",
+  displayName: "Alice",
+})
+
+// Equivalent to:
+yield* users.put({...}, UserEntity.condition((t, { notExists }) => notExists(t.userId)))
+```
+
+## Working with Multiple Tables
+
+While single-table design is the default pattern, effect-dynamodb supports entities on different tables.
+
+### Declaring Multiple Tables
+
+```typescript
+const UserTable = Table.make({ schema: AppSchema })
+const AuditTable = Table.make({ schema: AppSchema })
+
+const UserEntity = Entity.make({
+  model: User,
+  entityType: "User",
+  // ...
+})
+
+const AuditEntity = Entity.make({
+  model: AuditEntry,
+  entityType: "AuditEntry",
+  // ...
+})
+
+// Provide physical table names at runtime
+program.pipe(
+  Effect.provide(
+    Layer.mergeAll(
+      DynamoClient.layer({ region: "us-east-1" }),
+      UserTable.layer({ name: "Users" }),
+      AuditTable.layer({ name: "AuditLog" }),
+    )
+  ),
+)
+```
+
+### When to Use Multiple Tables
+
+| Single Table | Multiple Tables |
+|-------------|-----------------|
+| Related entities queried together | Independent entity groups |
+| Need cross-entity queries (collections) | No cross-entity query need |
+| Fewer provisioned tables to manage | Different capacity settings per table |
+| Index overloading (one GSI serves many patterns) | Simpler, entity-specific indexes |
+
+### Considerations
+
+- **Collections require the same table.** All entities in a collection must share a table.
+- **Transactions can span tables.** DynamoDB transactions work across tables.
+- **Each table is a separate DynamoDB resource.** Separate provisioning, backups, and billing.
+
+## Building Expressions
+
+### Entity-Level Expressions
+
+Type-safe conditions, filters, and projections using `PathBuilder`:
+
+```typescript
+// Condition — type-safe, nested paths, OR/NOT composition
+Products.condition((t, { eq, gt, and }) =>
+  and(eq(t.status, "active"), gt(t.stock, 0)),
+)
+
+// Filter — same API, applied to queries/scans
+Products.filter((t, { contains }) => contains(t.name, "Widget"))
+
+// Projection — select specific attributes
+Products.select((t) => [t.name, t.price, t.address.city])
+```
+
+### Low-Level Builders
+
+The `Expression` module provides raw builders for advanced use cases:
+
+```typescript
+import { Expression } from "effect-dynamodb"
+
+// Condition expression (for conditional writes)
+const cond = Expression.condition({
+  eq: { status: "active" },
+  gt: { stock: 0 },
+})
+
+// Filter expression (for query post-filtering)
+const filter = Expression.filter({
+  between: { price: [10, 50] },
+  attributeExists: "category",
+})
+
+// Update expression
+const update = Expression.update({
+  set: { displayName: "New Name", updatedAt: new Date().toISOString() },
+  remove: ["temporaryFlag"],
+  add: { loginCount: 1 },
+})
+```
+
+See the [Expressions Guide](/effect-dynamodb/guides/expressions/) for the complete reference with DynamoDB mapping tables, all operators, and PathBuilder documentation.
+
+## What's Next?
+
+- [Expressions](/effect-dynamodb/guides/expressions/) — Complete expression reference with DynamoDB mapping tables
+- [DynamoDB Streams](/effect-dynamodb/guides/streams/) — Decode stream records into typed domain objects
+- [Testing](/effect-dynamodb/guides/testing/) — Mock DynamoClient and test CRUD operations
+- [Modeling](/effect-dynamodb/guides/modeling/) — Model, schema, table, entity definitions

@@ -1,0 +1,251 @@
+---
+title: "Example: Projections"
+description: "Selective attribute retrieval with ProjectionExpression to reduce read capacity and network transfer"
+---
+
+An employee directory that demonstrates **projection expressions** -- telling DynamoDB to return only specific attributes from an item. Projections reduce both network transfer and read capacity costs when you only need a subset of fields.
+
+**What you'll learn:**
+- `Projection.projection()` -- build a `ProjectionExpression` from attribute names
+- Applying projections to `GetItem` and `Query` operations via `DynamoClient`
+- How `ExpressionAttributeNames` safely handles DynamoDB reserved words
+- Trade-off: projections bypass Entity schema decode (partial records, not typed models)
+
+---
+
+## Step 1: Model
+
+A domain model with several fields -- projections let us fetch only what we need:
+
+```typescript title="models.ts"
+import { Schema } from "effect"
+
+class Employee extends Schema.Class<Employee>("Employee")({
+  employeeId: Schema.String,
+  name: Schema.NonEmptyString,
+  email: Schema.String,
+  department: Schema.String,
+  salary: Schema.Number,
+  title: Schema.String,
+}) {}
+```
+
+---
+
+## Step 2: Schema, Table, and Entity
+
+```typescript title="entities.ts"
+import { DynamoSchema, Entity, Table } from "effect-dynamodb"
+
+const AppSchema = DynamoSchema.make({ name: "proj-demo", version: 1 })
+const Employees = Entity.make({
+  model: Employee,
+  entityType: "Employee",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["employeeId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    byDepartment: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["department"] },
+      sk: { field: "gsi1sk", composite: ["employeeId"] },
+    },
+  },
+  timestamps: true,
+})
+
+const MainTable = Table.make({ schema: AppSchema, entities: { Employees } })
+```
+
+---
+
+## Step 3: Seed Data
+
+```typescript title="seed.ts"
+import { DynamoClient } from "effect-dynamodb"
+
+const { Employees: employees } = yield* DynamoClient.make(MainTable)
+
+yield* employees.put({
+  employeeId: "e-1", name: "Alice",
+  email: "alice@company.com", department: "engineering",
+  salary: 120000, title: "Senior Engineer",
+})
+yield* employees.put({
+  employeeId: "e-2", name: "Bob",
+  email: "bob@company.com", department: "engineering",
+  salary: 95000, title: "Engineer",
+})
+yield* employees.put({
+  employeeId: "e-3", name: "Charlie",
+  email: "charlie@company.com", department: "marketing",
+  salary: 85000, title: "Marketing Lead",
+})
+```
+
+---
+
+## Step 4: Operations
+
+### Building a Projection
+
+`Projection.projection()` takes an array of attribute names and returns an object with `expression` (the `ProjectionExpression` string) and `names` (the `ExpressionAttributeNames` map). All attribute names are aliased with `#` prefixes to safely handle DynamoDB reserved words:
+
+```typescript
+import { Projection } from "effect-dynamodb"
+
+const nameAndDept = Projection.projection(["name", "department"])
+// nameAndDept.expression → "#name, #department"
+// nameAndDept.names      → { "#name": "name", "#department": "department" }
+```
+
+### Projected GetItem
+
+Apply the projection to a `GetItem` call via `DynamoClient`. DynamoDB returns only the requested attributes, reducing both network transfer and read capacity:
+
+```typescript
+import { DynamoClient, Marshaller } from "effect-dynamodb"
+
+const client = yield* DynamoClient
+const tableConfig = yield* MainTable.Tag
+
+const nameAndDept = Projection.projection(["name", "department"])
+
+const result = yield* client.getItem({
+  TableName: tableConfig.name,
+  Key: Marshaller.toAttributeMap({
+    pk: "$proj-demo#v1#employee#e-1",
+    sk: "$proj-demo#v1#employee",
+  }),
+  ProjectionExpression: nameAndDept.expression,
+  ExpressionAttributeNames: nameAndDept.names,
+})
+
+if (result.Item) {
+  const item = Marshaller.fromAttributeMap(result.Item)
+  // item → { name: "Alice", department: "engineering" }
+  // salary, email, title, keys — all excluded
+}
+```
+
+Note that projected results are partial records, not typed model instances. The Entity schema decode is bypassed because the item lacks required fields. Use projections when you need raw efficiency (dashboards, lists, summaries).
+
+### Projected Query
+
+Projections work with queries too. Here we fetch only name and title for all engineering employees:
+
+```typescript
+import { Marshaller, Projection } from "effect-dynamodb"
+
+const listProjection = Projection.projection(["name", "title"])
+
+const queryResult = yield* client.query({
+  TableName: tableConfig.name,
+  IndexName: "gsi1",
+  KeyConditionExpression: "#pk = :pk",
+  ExpressionAttributeNames: {
+    "#pk": "gsi1pk",
+    ...listProjection.names,
+  },
+  ExpressionAttributeValues: Marshaller.toAttributeMap({
+    ":pk": "$proj-demo#v1#employee#engineering",
+  }),
+  ProjectionExpression: listProjection.expression,
+})
+
+for (const rawItem of queryResult.Items ?? []) {
+  const item = Marshaller.fromAttributeMap(rawItem)
+  // item → { name: "Alice", title: "Senior Engineer" }
+  // item → { name: "Bob", title: "Engineer" }
+}
+```
+
+When combining projections with queries, merge the projection's `names` into the query's `ExpressionAttributeNames` using the spread operator.
+
+### Edge Case: Empty Projection
+
+An empty projection produces an empty expression and empty names map. DynamoDB ignores an empty `ProjectionExpression`, so all attributes are returned:
+
+```typescript
+import { Projection } from "effect-dynamodb"
+
+const empty = Projection.projection([])
+// empty.expression → ""
+// empty.names      → {}
+```
+
+---
+
+## When to Use Projections
+
+| Scenario | Recommendation |
+|----------|----------------|
+| Dashboard showing name + status only | Use projection -- skip large fields |
+| Full entity CRUD (get, put, update) | Use `Entity.get()` -- full schema decode |
+| List views with a few columns | Use projection -- reduce network transfer |
+| Items with large string/binary fields | Use projection to exclude them |
+| Need typed model instances | Use `Entity.get()` or `Entity.query` -- schema-decoded |
+
+Projections trade type safety for efficiency. Use them at the edges (API responses, UI data) where you control the shape, and use full Entity operations in domain logic where type safety matters.
+
+---
+
+## Running the Example
+
+The complete runnable example is at [`examples/projections.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/projections.ts) in the repository.
+
+Start DynamoDB Local:
+
+```bash
+docker run -d -p 8000:8000 amazon/dynamodb-local
+```
+
+Run the example:
+
+```bash
+npx tsx examples/projections.ts
+```
+
+### Layer Setup
+
+```typescript title="main.ts"
+import { Effect, Layer } from "effect"
+import { DynamoClient } from "effect-dynamodb"
+
+const AppLayer = Layer.mergeAll(
+  DynamoClient.layer({
+    region: "us-east-1",
+    endpoint: "http://localhost:8000",
+    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  }),
+  MainTable.layer({ name: "proj-demo-table" }),
+)
+
+const main = program.pipe(Effect.provide(AppLayer))
+
+Effect.runPromise(main).then(
+  () => console.log("Done."),
+  (err) => console.error("Failed:", err),
+)
+```
+
+---
+
+## Key Takeaways
+
+| Concept | How it's used |
+|---------|---------------|
+| **Projection.projection()** | Builds `ProjectionExpression` + `ExpressionAttributeNames` from attribute names |
+| **ExpressionAttributeNames** | All attributes aliased with `#` prefix -- safely handles reserved words |
+| **Projected GetItem** | Pass `ProjectionExpression` to `DynamoClient.getItem` for selective retrieval |
+| **Projected Query** | Merge projection `names` with query `ExpressionAttributeNames` via spread |
+| **Partial records** | Projected results bypass Entity schema decode -- not typed model instances |
+| **Empty projection** | Produces empty string -- DynamoDB returns all attributes |
+
+## What's Next?
+
+- [Example: Conditional Writes & Filters](/effect-dynamodb/tutorials/expressions/) -- Conditional puts, updates, deletes, and filter operators
+- [Example: Scan Operations](/effect-dynamodb/tutorials/scan/) -- Full-table scans with filters, limits, and entity-type isolation
+- [Queries Guide](/effect-dynamodb/guides/queries/) -- Index queries, pagination, sort key conditions, and collections
+- [Example: Human Resources](/effect-dynamodb/tutorials/human-resources/) -- Full single-table design with 3 entities, collections, and transactions

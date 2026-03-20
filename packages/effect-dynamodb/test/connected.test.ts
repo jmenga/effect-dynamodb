@@ -54,8 +54,12 @@ class User extends Schema.Class<User>("User")({
   displayName: Schema.NonEmptyString,
   role: Schema.Literals(["admin", "member"]),
   bio: Schema.optional(Schema.String),
-  createdBy: Schema.String.pipe(DynamoModel.Immutable),
+  createdBy: Schema.String,
 }) {}
+
+const UserModel = DynamoModel.configure(User, {
+  createdBy: { immutable: true },
+})
 
 class Task extends Schema.Class<Task>("Task")({
   taskId: Schema.String,
@@ -71,13 +75,10 @@ class Task extends Schema.Class<Task>("Task")({
 // ---------------------------------------------------------------------------
 
 const AppSchema = DynamoSchema.make({ name: "connected-test", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
-
 const tableName = `connected-test-${Date.now()}`
 
 const Users = Entity.make({
-  model: User,
-  table: MainTable,
+  model: UserModel,
   entityType: "User",
   indexes: {
     primary: {
@@ -102,7 +103,6 @@ const Users = Entity.make({
 
 const Tasks = Entity.make({
   model: Task,
-  table: MainTable,
   entityType: "Task",
   indexes: {
     primary: {
@@ -119,6 +119,8 @@ const Tasks = Entity.make({
   versioned: true,
   softDelete: true,
 })
+
+const MainTable = Table.make({ schema: AppSchema, entities: { Users, Tasks } })
 
 // ---------------------------------------------------------------------------
 // Aggregate + Ref models
@@ -164,13 +166,11 @@ class ReviewerNote extends Schema.Class<ReviewerNote>("ReviewerNote")({
 }) {}
 
 const AggSchema = DynamoSchema.make({ name: "agg-test", version: 1 })
-const AggTable = Table.make({ schema: AggSchema })
 
 const aggTableName = `agg-test-${Date.now()}`
 
 const Authors = Entity.make({
   model: Author,
-  table: AggTable,
   entityType: "Author",
   indexes: {
     primary: {
@@ -182,7 +182,6 @@ const Authors = Entity.make({
 
 const Articles = Entity.make({
   model: Article,
-  table: AggTable,
   entityType: "Article",
   indexes: {
     primary: {
@@ -199,6 +198,8 @@ const Articles = Entity.make({
     author: { entity: Authors },
   },
 })
+
+const AggTable = Table.make({ schema: AggSchema, entities: { Authors, Articles } })
 
 // Sub-aggregate: reviewer note (bound with discriminator for editorial vs peer)
 const ReviewerNoteAggregate = Aggregate.make(ReviewerNote, {
@@ -285,12 +286,12 @@ describeConnected("Connected integration tests", () => {
           displayName: "Crud One",
           role: "admin",
           createdBy: "test",
-        })
+        }).asEffect()
         expect(created.userId).toBe("u-crud-1")
         expect(created.email).toBe("crud1@test.com")
         expect(created.role).toBe("admin")
 
-        const fetched = yield* Users.get({ userId: "u-crud-1" })
+        const fetched = yield* Users.get({ userId: "u-crud-1" }).asEffect()
         expect(fetched.userId).toBe("u-crud-1")
         expect(fetched.displayName).toBe("Crud One")
       }).pipe(provide),
@@ -321,7 +322,7 @@ describeConnected("Connected integration tests", () => {
           title: "Original",
           status: "todo",
           priority: 1,
-        })
+        }).asEffect()
         const err = yield* Tasks.create({
           taskId: "t-dup",
           userId: "u-dup",
@@ -343,7 +344,7 @@ describeConnected("Connected integration tests", () => {
           displayName: "Before",
           role: "member",
           createdBy: "test",
-        })
+        }).asEffect()
         const before = yield* Users.get({ userId: "u-upd" }).pipe(Entity.asRecord)
 
         const after = yield* Users.update({ userId: "u-upd" }).pipe(
@@ -363,9 +364,12 @@ describeConnected("Connected integration tests", () => {
           displayName: "Immutable",
           role: "member",
           createdBy: "original-creator",
-        })
-        yield* Users.update({ userId: "u-imm" }).pipe(Users.set({ displayName: "Changed" }))
-        const fetched = yield* Users.get({ userId: "u-imm" })
+        }).asEffect()
+        yield* Users.update({ userId: "u-imm" }).pipe(
+          Users.set({ displayName: "Changed" }),
+          Entity.asModel,
+        )
+        const fetched = yield* Users.get({ userId: "u-imm" }).asEffect()
         expect(fetched.createdBy).toBe("original-creator")
       }).pipe(provide),
     )
@@ -378,8 +382,8 @@ describeConnected("Connected integration tests", () => {
           displayName: "Delete Me",
           role: "member",
           createdBy: "test",
-        })
-        yield* Users.delete({ userId: "u-del" })
+        }).asEffect()
+        yield* Users.delete({ userId: "u-del" }).asEffect()
         const err = yield* Users.get({ userId: "u-del" }).asEffect().pipe(Effect.flip)
         expect(err._tag).toBe("ItemNotFound")
       }).pipe(provide),
@@ -399,7 +403,7 @@ describeConnected("Connected integration tests", () => {
           displayName: "Modes",
           role: "admin",
           createdBy: "test",
-        })
+        }).asEffect()
         const item = yield* Users.get({ userId: "u-modes" }).pipe(Entity.asItem)
         expect(item.__edd_e__).toBe("User")
         expect(item.pk).toBeDefined()
@@ -429,9 +433,9 @@ describeConnected("Connected integration tests", () => {
           title: "Add Test",
           status: "todo",
           priority: 1,
-        })
-        yield* Tasks.update({ taskId: "t-add" }).pipe(Entity.add({ priority: 5 }))
-        const task = yield* Tasks.get({ taskId: "t-add" })
+        }).asEffect()
+        yield* Tasks.update({ taskId: "t-add" }).pipe(Entity.add({ priority: 5 }), Entity.asModel)
+        const task = yield* Tasks.get({ taskId: "t-add" }).asEffect()
         expect(task.priority).toBe(6)
       }).pipe(provide),
     )
@@ -444,9 +448,12 @@ describeConnected("Connected integration tests", () => {
           title: "Sub Test",
           status: "todo",
           priority: 10,
-        })
-        yield* Tasks.update({ taskId: "t-sub" }).pipe(Entity.subtract({ priority: 3 }))
-        const task = yield* Tasks.get({ taskId: "t-sub" })
+        }).asEffect()
+        yield* Tasks.update({ taskId: "t-sub" }).pipe(
+          Entity.subtract({ priority: 3 }),
+          Entity.asModel,
+        )
+        const task = yield* Tasks.get({ taskId: "t-sub" }).asEffect()
         expect(task.priority).toBe(7)
       }).pipe(provide),
     )
@@ -460,9 +467,12 @@ describeConnected("Connected integration tests", () => {
           status: "todo",
           priority: 1,
           tags: ["initial"],
-        })
-        yield* Tasks.update({ taskId: "t-list" }).pipe(Entity.append({ tags: ["added"] }))
-        const task = yield* Tasks.get({ taskId: "t-list" })
+        }).asEffect()
+        yield* Tasks.update({ taskId: "t-list" }).pipe(
+          Entity.append({ tags: ["added"] }),
+          Entity.asModel,
+        )
+        const task = yield* Tasks.get({ taskId: "t-list" }).asEffect()
         expect(task.tags).toEqual(["initial", "added"])
       }).pipe(provide),
     )
@@ -476,8 +486,8 @@ describeConnected("Connected integration tests", () => {
           role: "member",
           bio: "will be removed",
           createdBy: "test",
-        })
-        yield* Users.update({ userId: "u-rem" }).pipe(Entity.remove(["bio"]))
+        }).asEffect()
+        yield* Users.update({ userId: "u-rem" }).pipe(Entity.remove(["bio"]), Entity.asModel)
         const item = yield* Users.get({ userId: "u-rem" }).pipe(Entity.asItem)
         expect(item.bio).toBeUndefined()
       }).pipe(provide),
@@ -497,7 +507,7 @@ describeConnected("Connected integration tests", () => {
           displayName: "Lock",
           role: "member",
           createdBy: "test",
-        })
+        }).asEffect()
         const record = yield* Users.get({ userId: "u-lock" }).pipe(Entity.asRecord)
         const updated = yield* Users.update({ userId: "u-lock" }).pipe(
           Users.set({ displayName: "Locked Update" }),
@@ -535,7 +545,7 @@ describeConnected("Connected integration tests", () => {
           displayName: "Unique1",
           role: "member",
           createdBy: "test",
-        })
+        }).asEffect()
         const err = yield* Users.put({
           userId: "u-uniq2",
           email: "unique@test.com",
@@ -557,14 +567,15 @@ describeConnected("Connected integration tests", () => {
           displayName: "Update Unique",
           role: "member",
           createdBy: "test",
-        })
+        }).asEffect()
 
         // Update email — should rotate the sentinel atomically
         yield* Users.update({ userId: "u-uniq-upd" }).pipe(
           Users.set({ email: "new-email@test.com" }),
+          Entity.asModel,
         )
 
-        const updated = yield* Users.get({ userId: "u-uniq-upd" })
+        const updated = yield* Users.get({ userId: "u-uniq-upd" }).asEffect()
         expect(updated.email).toBe("new-email@test.com")
       }).pipe(provide),
     )
@@ -578,9 +589,9 @@ describeConnected("Connected integration tests", () => {
           displayName: "Claimed Old",
           role: "member",
           createdBy: "test",
-        })
+        }).asEffect()
 
-        const claimed = yield* Users.get({ userId: "u-uniq-claim" })
+        const claimed = yield* Users.get({ userId: "u-uniq-claim" }).asEffect()
         expect(claimed.email).toBe("old-email@test.com")
       }).pipe(provide),
     )
@@ -596,7 +607,7 @@ describeConnected("Connected integration tests", () => {
         expect(err._tag).toBe("UniqueConstraintViolation")
 
         // Original value unchanged
-        const unchanged = yield* Users.get({ userId: "u-uniq-claim" })
+        const unchanged = yield* Users.get({ userId: "u-uniq-claim" }).asEffect()
         expect(unchanged.email).toBe("old-email@test.com")
       }).pipe(provide),
     )
@@ -615,11 +626,12 @@ describeConnected("Connected integration tests", () => {
           title: "Conditional",
           status: "todo",
           priority: 1,
-        })
+        }).asEffect()
         // Use priority (non-GSI composite) to avoid GSI key recomposition issues
         const updated = yield* Tasks.update({ taskId: "t-cond" }).pipe(
           Tasks.set({ priority: 99 }),
-          Entity.condition({ eq: { status: "todo" } }),
+          Tasks.condition({ status: "todo" }),
+          Entity.asModel,
         )
         expect(updated.priority).toBe(99)
       }).pipe(provide),
@@ -629,7 +641,7 @@ describeConnected("Connected integration tests", () => {
       Effect.gen(function* () {
         const err = yield* Tasks.update({ taskId: "t-cond" }).pipe(
           Tasks.set({ priority: 50 }),
-          Entity.condition({ eq: { status: "done" } }),
+          Tasks.condition({ status: "done" }),
           (op) => op.asEffect(),
           Effect.flip,
         )
@@ -651,21 +663,21 @@ describeConnected("Connected integration tests", () => {
           title: "Query 1",
           status: "todo",
           priority: 1,
-        })
+        }).asEffect()
         yield* Tasks.put({
           taskId: "t-q2",
           userId: "u-query",
           title: "Query 2",
           status: "done",
           priority: 2,
-        })
+        }).asEffect()
         yield* Tasks.put({
           taskId: "t-q3",
           userId: "u-other",
           title: "Other User",
           status: "todo",
           priority: 1,
-        })
+        }).asEffect()
 
         const results = yield* Tasks.query.byUser({ userId: "u-query" }).pipe(Query.collect)
         expect(results).toHaveLength(2)
@@ -729,7 +741,7 @@ describeConnected("Connected integration tests", () => {
             title: `Page Task ${i}`,
             status: "todo",
             priority: i,
-          })
+          }).asEffect()
         }
 
         // paginate with limit 2 per page returns a Stream of pages
@@ -774,8 +786,11 @@ describeConnected("Connected integration tests", () => {
           displayName: "Consistent",
           role: "member",
           createdBy: "test",
-        })
-        const user = yield* Users.get({ userId: "u-consist" }).pipe(Entity.consistentRead())
+        }).asEffect()
+        const user = yield* Users.get({ userId: "u-consist" }).pipe(
+          Entity.consistentRead(),
+          Entity.asModel,
+        )
         expect(user.userId).toBe("u-consist")
       }).pipe(provide),
     )
@@ -797,11 +812,11 @@ describeConnected("Connected integration tests", () => {
       }).pipe(provide),
     )
 
-    it.effect("Query.select returns only selected attributes", () =>
+    it.effect("Entity.select returns only selected attributes", () =>
       Effect.gen(function* () {
         const results = yield* Tasks.query
           .byUser({ userId: "u-query" })
-          .pipe(Query.select(["taskId", "title"]), Query.collect)
+          .pipe(Tasks.select(["taskId", "title"]), Query.collect)
         expect(results.length).toBeGreaterThan(0)
         for (const r of results) {
           expect(r.taskId).toBeDefined()
@@ -825,14 +840,14 @@ describeConnected("Connected integration tests", () => {
           displayName: "Batch1",
           role: "member",
           createdBy: "test",
-        })
+        }).asEffect()
         yield* Users.put({
           userId: "u-batch2",
           email: "batch2@test.com",
           displayName: "Batch2",
           role: "admin",
           createdBy: "test",
-        })
+        }).asEffect()
 
         const [u1, u2, u3] = yield* Batch.get([
           Users.get({ userId: "u-batch1" }),
@@ -863,8 +878,8 @@ describeConnected("Connected integration tests", () => {
             priority: 2,
           }),
         ])
-        const t1 = yield* Tasks.get({ taskId: "t-bw1" })
-        const t2 = yield* Tasks.get({ taskId: "t-bw2" })
+        const t1 = yield* Tasks.get({ taskId: "t-bw1" }).asEffect()
+        const t2 = yield* Tasks.get({ taskId: "t-bw2" }).asEffect()
         expect(t1.title).toBe("Batch Write 1")
         expect(t2.title).toBe("Batch Write 2")
       }).pipe(provide),
@@ -895,8 +910,8 @@ describeConnected("Connected integration tests", () => {
           }),
         ])
 
-        const user = yield* Users.get({ userId: "u-tx" })
-        const task = yield* Tasks.get({ taskId: "t-tx" })
+        const user = yield* Users.get({ userId: "u-tx" }).asEffect()
+        const task = yield* Tasks.get({ taskId: "t-tx" }).asEffect()
         expect(user.displayName).toBe("TxUser")
         expect(task.title).toBe("Tx Task")
       }).pipe(provide),
@@ -956,13 +971,19 @@ describeConnected("Connected integration tests", () => {
           displayName: "V1",
           role: "member",
           createdBy: "test",
-        })
-        yield* Users.update({ userId: "u-ver" }).pipe(Users.set({ displayName: "V2" }))
-        yield* Users.update({ userId: "u-ver" }).pipe(Users.set({ displayName: "V3" }))
+        }).asEffect()
+        yield* Users.update({ userId: "u-ver" }).pipe(
+          Users.set({ displayName: "V2" }),
+          Entity.asModel,
+        )
+        yield* Users.update({ userId: "u-ver" }).pipe(
+          Users.set({ displayName: "V3" }),
+          Entity.asModel,
+        )
 
-        const v1 = yield* Users.getVersion({ userId: "u-ver" }, 1)
-        const v2 = yield* Users.getVersion({ userId: "u-ver" }, 2)
-        const current = yield* Users.get({ userId: "u-ver" })
+        const v1 = yield* Users.getVersion({ userId: "u-ver" }, 1).asEffect()
+        const v2 = yield* Users.getVersion({ userId: "u-ver" }, 2).asEffect()
+        const current = yield* Users.get({ userId: "u-ver" }).asEffect()
 
         expect(v1.displayName).toBe("V1")
         expect(v2.displayName).toBe("V2")
@@ -999,12 +1020,12 @@ describeConnected("Connected integration tests", () => {
           title: "Soft Delete Me",
           status: "todo",
           priority: 1,
-        })
+        }).asEffect()
 
         const before = yield* Tasks.query.byUser({ userId: "u-soft" }).pipe(Query.collect)
         expect(before).toHaveLength(1)
 
-        yield* Tasks.delete({ taskId: "t-soft" })
+        yield* Tasks.delete({ taskId: "t-soft" }).asEffect()
 
         const after = yield* Tasks.query.byUser({ userId: "u-soft" }).pipe(Query.collect)
         expect(after).toHaveLength(0)
@@ -1017,9 +1038,9 @@ describeConnected("Connected integration tests", () => {
 
     it.effect("restore brings soft-deleted item back", () =>
       Effect.gen(function* () {
-        yield* Tasks.restore({ taskId: "t-soft" })
+        yield* Tasks.restore({ taskId: "t-soft" }).asEffect()
 
-        const restored = yield* Tasks.get({ taskId: "t-soft" })
+        const restored = yield* Tasks.get({ taskId: "t-soft" }).asEffect()
         expect(restored.title).toBe("Soft Delete Me")
 
         const results = yield* Tasks.query.byUser({ userId: "u-soft" }).pipe(Query.collect)
@@ -1041,10 +1062,13 @@ describeConnected("Connected integration tests", () => {
           displayName: "Purge Me",
           role: "member",
           createdBy: "test",
-        })
-        yield* Users.update({ userId: "u-purge" }).pipe(Users.set({ displayName: "V2" }))
+        }).asEffect()
+        yield* Users.update({ userId: "u-purge" }).pipe(
+          Users.set({ displayName: "V2" }),
+          Entity.asModel,
+        )
 
-        yield* Users.purge({ userId: "u-purge" })
+        yield* Users.purge({ userId: "u-purge" }).asEffect()
 
         const err = yield* Users.get({ userId: "u-purge" }).asEffect().pipe(Effect.flip)
         expect(err._tag).toBe("ItemNotFound")
@@ -1094,10 +1118,10 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
   describe("Entity refs", () => {
     it.effect("seed authors for ref tests", () =>
       Effect.gen(function* () {
-        yield* Authors.put({ id: "alice", name: "Alice Johnson" })
-        yield* Authors.put({ id: "bob", name: "Bob Williams" })
+        yield* Authors.put({ id: "alice", name: "Alice Johnson" }).asEffect()
+        yield* Authors.put({ id: "bob", name: "Bob Williams" }).asEffect()
 
-        const alice = yield* Authors.get({ id: "alice" })
+        const alice = yield* Authors.get({ id: "alice" }).asEffect()
         expect(alice.name).toBe("Alice Johnson")
       }).pipe(provideAgg),
     )
@@ -1109,9 +1133,9 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
           title: "Effect TS Guide",
           authorId: "alice",
           status: "published",
-        })
+        }).asEffect()
 
-        const article = yield* Articles.get({ articleId: "art-1" })
+        const article = yield* Articles.get({ articleId: "art-1" }).asEffect()
         expect(article.title).toBe("Effect TS Guide")
         expect(article.author.id).toBe("alice")
         expect(article.author.name).toBe("Alice Johnson")
@@ -1148,19 +1172,20 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
           title: "Second Article",
           authorId: "alice",
           status: "draft",
-        })
+        }).asEffect()
 
         // Update the author with cascade to Articles
         yield* Authors.update({ id: "alice" }).pipe(
           Entity.set({ name: "Alice J. Johnson" }),
           Entity.cascade({ targets: [Articles] }),
+          Entity.asModel,
         )
 
         // Verify cascade propagated — both articles should have the updated author
-        const art1 = yield* Articles.get({ articleId: "art-1" })
+        const art1 = yield* Articles.get({ articleId: "art-1" }).asEffect()
         expect(art1.author.name).toBe("Alice J. Johnson")
 
-        const art2 = yield* Articles.get({ articleId: "art-2" })
+        const art2 = yield* Articles.get({ articleId: "art-2" }).asEffect()
         expect(art2.author.name).toBe("Alice J. Johnson")
       }).pipe(provideAgg),
     )
@@ -1173,15 +1198,16 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
           title: "Bob's Article",
           authorId: "bob",
           status: "published",
-        })
+        }).asEffect()
 
         // Update Alice — should not affect Bob's article
         yield* Authors.update({ id: "alice" }).pipe(
           Entity.set({ name: "Alice Johnson" }),
           Entity.cascade({ targets: [Articles] }),
+          Entity.asModel,
         )
 
-        const bobArt = yield* Articles.get({ articleId: "art-bob" })
+        const bobArt = yield* Articles.get({ articleId: "art-bob" }).asEffect()
         expect(bobArt.author.name).toBe("Bob Williams")
       }).pipe(provideAgg),
     )

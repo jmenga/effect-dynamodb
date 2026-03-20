@@ -1,0 +1,404 @@
+---
+title: "Example: Blog Platform"
+description: "Multi-entity single-table design with GSI queries, optimistic locking, transactions, and raw DynamoDB access"
+---
+
+A blog platform managing **users**, **posts**, and **comments** in a single DynamoDB table. This example demonstrates how multiple entity types coexist in one table with index overloading, and covers the full range of everyday operations: CRUD, GSI queries, optimistic locking, transactions, and raw item inspection.
+
+**What you'll learn:**
+- 3 entities sharing one table (single-table design)
+- GSI queries for posts by author and comments by post
+- `Entity.set()` for type-safe updates with combinators
+- Optimistic locking with `Entity.expectedVersion()`
+- Atomic multi-entity reads and writes via transactions
+- `Entity.asRecord` for system fields and `Entity.asNative` for raw DynamoDB items
+
+---
+
+## Access Patterns
+
+1. **Get user** -- Look up a user by `userId` (primary key)
+2. **Get post** -- Look up a post by `postId` (primary key)
+3. **Posts by author** -- Find all posts by a user (GSI1: `byAuthor`)
+4. **Comments on a post** -- Find all comments on a post (GSI1: `byPost`)
+5. **Atomic operations** -- Read or write multiple entities atomically (transactions)
+6. **Raw inspection** -- View the underlying DynamoDB item for debugging
+
+---
+
+## Step 1: Models
+
+Three pure domain models with no DynamoDB concepts:
+
+```typescript title="models.ts"
+import { Schema } from "effect"
+
+class User extends Schema.Class<User>("User")({
+  userId: Schema.String,
+  email: Schema.String,
+  displayName: Schema.NonEmptyString,
+  bio: Schema.optional(Schema.String),
+  postCount: Schema.Number,
+}) {}
+
+class Post extends Schema.Class<Post>("Post")({
+  postId: Schema.String,
+  authorId: Schema.String,
+  title: Schema.NonEmptyString,
+  content: Schema.String,
+  status: Schema.Literals(["draft", "published", "archived"]),
+  commentCount: Schema.Number,
+}) {}
+
+class Comment extends Schema.Class<Comment>("Comment")({
+  commentId: Schema.String,
+  postId: Schema.String,
+  authorId: Schema.String,
+  body: Schema.NonEmptyString,
+}) {}
+```
+
+Key modeling decisions:
+- **`displayName`** and **`title`** use `Schema.NonEmptyString` for validation -- empty strings are rejected at the schema level
+- **`status`** uses `Schema.Literals` for a constrained set of post states
+- **`bio`** is optional -- not every user fills in a biography
+- **`postCount`** and **`commentCount`** are denormalized counters, typical in DynamoDB designs where aggregation queries are expensive
+
+---
+
+## Step 2: Schema, Table, and Entities
+
+### Schema
+
+```typescript title="entities.ts"
+import { DynamoSchema, Table } from "effect-dynamodb"
+
+const BlogSchema = DynamoSchema.make({ name: "blog", version: 1 })
+```
+
+### User Entity
+
+Users have a simple primary key and no GSIs. Versioning is enabled for optimistic locking:
+
+```typescript title="entities.ts"
+import { Entity } from "effect-dynamodb"
+
+const Users = Entity.make({
+  model: User,
+  entityType: "User",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["userId"] },
+      sk: { field: "sk", composite: [] },
+    },
+  },
+  timestamps: true,
+  versioned: true,
+})
+```
+
+### Post Entity
+
+Posts have a primary key plus a GSI for querying by author:
+
+```typescript title="entities.ts"
+const Posts = Entity.make({
+  model: Post,
+  entityType: "Post",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["postId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    byAuthor: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["authorId"] },
+      sk: { field: "gsi1sk", composite: ["postId"] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+### Comment Entity
+
+Comments also use GSI1 but with a different partition key -- this is **index overloading**. Posts partition GSI1 by `authorId`, while Comments partition it by `postId`:
+
+```typescript title="entities.ts"
+const Comments = Entity.make({
+  model: Comment,
+  entityType: "Comment",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["commentId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    byPost: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["postId"] },
+      sk: { field: "gsi1sk", composite: ["commentId"] },
+    },
+  },
+  timestamps: true,
+})
+
+const BlogTable = Table.make({
+  schema: BlogSchema,
+  entities: { Users, Posts, Comments },
+})
+```
+
+| Entity | Index | PK composites | SK composites | Access pattern |
+|--------|-------|--------------|---------------|----------------|
+| **User** | primary | `userId` | (empty) | Get user by ID |
+| **Post** | primary | `postId` | (empty) | Get post by ID |
+| **Post** | byAuthor (GSI1) | `authorId` | `postId` | Posts by author |
+| **Comment** | primary | `commentId` | (empty) | Get comment by ID |
+| **Comment** | byPost (GSI1) | `postId` | `commentId` | Comments on a post |
+
+GSI1 is **overloaded** -- Posts use it for `byAuthor` (partitioned by `authorId`) and Comments use it for `byPost` (partitioned by `postId`). Different entity types, different partition keys, same physical index.
+
+---
+
+## Step 3: Seed Data
+
+```typescript title="seed.ts"
+import { DynamoClient } from "effect-dynamodb"
+
+const { Users: users, Posts: posts, Comments: comments } = yield* DynamoClient.make(BlogTable)
+
+// Create a user
+const alice = yield* users.put({
+  userId: "alice-1",
+  email: "alice@blog.com",
+  displayName: "Alice",
+  postCount: 0,
+})
+
+// Create posts
+yield* posts.put({
+  postId: "post-1",
+  authorId: "alice-1",
+  title: "Getting Started with Effect TS",
+  content: "Effect is a powerful functional programming library...",
+  status: "published",
+  commentCount: 0,
+})
+
+yield* posts.put({
+  postId: "post-2",
+  authorId: "alice-1",
+  title: "DynamoDB Single-Table Design",
+  content: "Single-table design is a DynamoDB best practice...",
+  status: "published",
+  commentCount: 0,
+})
+
+yield* posts.put({
+  postId: "post-3",
+  authorId: "alice-1",
+  title: "Draft Post",
+  content: "Work in progress...",
+  status: "draft",
+  commentCount: 0,
+})
+
+// Create comments on post-1
+yield* comments.put({
+  commentId: "comment-1",
+  postId: "post-1",
+  authorId: "bob-1",
+  body: "Great article!",
+})
+
+yield* comments.put({
+  commentId: "comment-2",
+  postId: "post-1",
+  authorId: "charlie-1",
+  body: "Very helpful, thanks!",
+})
+```
+
+---
+
+## Step 4: Operations
+
+### Put and Get with System Fields
+
+`yield*` on a `put` or `get` returns the clean model type. To access system fields like `createdAt`, `updatedAt`, and `version`, pipe through `Entity.asRecord`:
+
+```typescript
+import { Entity } from "effect-dynamodb"
+
+// yield* returns User — clean model type
+const alice = yield* users.put({
+  userId: "alice-1",
+  email: "alice@blog.com",
+  displayName: "Alice",
+  postCount: 0,
+})
+// alice.displayName → "Alice"
+
+// Entity.asRecord exposes system fields
+const aliceRecord = yield* users.get({ userId: "alice-1" }).pipe(Entity.asRecord)
+// aliceRecord.version → 1
+// aliceRecord.createdAt → DateTime.Utc
+```
+
+### GSI Queries
+
+Query posts by author and comments by post using the GSI indexes:
+
+```typescript
+// All posts by alice
+const alicePosts = yield* posts.collect(Posts.query.byAuthor({ authorId: "alice-1" }))
+// → [
+//   { postId: "post-1", title: "Getting Started with Effect TS", ... },
+//   { postId: "post-2", title: "DynamoDB Single-Table Design", ... },
+//   { postId: "post-3", title: "Draft Post", ... },
+// ]
+
+// All comments on post-1
+const postComments = yield* comments.collect(
+  Comments.query.byPost({ postId: "post-1" }),
+)
+// → [
+//   { commentId: "comment-1", body: "Great article!", ... },
+//   { commentId: "comment-2", body: "Very helpful, thanks!", ... },
+// ]
+```
+
+### Pipeable Updates
+
+The update key identifies the item, and the remaining fields specify the changes:
+
+```typescript
+const updatedAlice = yield* users.update(
+  { userId: "alice-1" },
+  { displayName: "Alice B.", postCount: 3 },
+)
+// updatedAlice.displayName → "Alice B."
+// updatedAlice.postCount → 3
+```
+
+### Optimistic Locking
+
+When `versioned: true` is configured, every write increments the item's `version`. Use `Entity.expectedVersion()` to enforce that the item hasn't changed since you last read it:
+
+```typescript
+// Alice is currently at version 3 after two updates
+const lockResult = yield* users.update(
+  { userId: "alice-1" },
+  Entity.set({ displayName: "Wrong Name" }),
+  Entity.expectedVersion(1), // stale version — will fail
+).pipe(
+  Effect.catchTag("OptimisticLockError", (e) =>
+    Effect.succeed(`Caught: expected v${e.expectedVersion}`),
+  ),
+)
+// → "Caught: expected v1"
+```
+
+The `Entity.expectedVersion()` combinator adds a condition that the stored version must match. If another write has incremented the version, the update fails with an `OptimisticLockError`.
+
+### Transactions
+
+`Transaction.transactGet` reads multiple items atomically, and `Transaction.transactWrite` writes multiple items atomically:
+
+```typescript
+import { Transaction } from "effect-dynamodb"
+
+// Atomic read — typed tuple
+const [txUser, txPost] = yield* Transaction.transactGet([
+  Users.get({ userId: "alice-1" }),
+  Posts.get({ postId: "post-1" }),
+])
+// txUser: User | undefined
+// txPost: Post | undefined
+
+// Atomic write — create + delete in one transaction
+yield* Transaction.transactWrite([
+  Posts.put({
+    postId: "post-4",
+    authorId: "alice-1",
+    title: "Atomic Operations",
+    content: "Transactions ensure consistency...",
+    status: "published",
+    commentCount: 0,
+  }),
+  Posts.delete({ postId: "post-3" }),
+])
+```
+
+The transaction ensures both operations succeed or both fail. If post-4 can't be created, post-3 won't be deleted.
+
+### Raw DynamoDB Item
+
+For debugging, `Entity.asNative` returns the raw DynamoDB marshalled item with all internal attributes visible:
+
+```typescript
+const rawPost = yield* posts.get({ postId: "post-1" }).pipe(Entity.asNative)
+// rawPost includes pk, sk, gsi1pk, gsi1sk, __edd_e__, createdAt, updatedAt, ...
+```
+
+This is useful for verifying how composite keys are composed and inspecting the internal structure of items in the table.
+
+---
+
+## Running the Example
+
+The complete runnable example is at [`examples/blog.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/blog.ts) in the repository. It creates all entities, demonstrates each access pattern, and cleans up after itself.
+
+```bash
+docker run -d -p 8000:8000 amazon/dynamodb-local
+```
+
+```bash
+npx tsx examples/blog.ts
+```
+
+### Layer Setup
+
+The example wires dependencies via Effect Layers -- no global config or constructor options:
+
+```typescript title="main.ts"
+import { Effect, Layer } from "effect"
+import { DynamoClient } from "effect-dynamodb"
+
+const AppLayer = Layer.mergeAll(
+  DynamoClient.layer({
+    region: "us-east-1",
+    endpoint: "http://localhost:8000",
+    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  }),
+  BlogTable.layer({ name: "blog-table" }),
+)
+
+const main = program.pipe(Effect.provide(AppLayer))
+
+Effect.runPromise(main).then(
+  () => console.log("Done."),
+  (err) => console.error("Failed:", err),
+)
+```
+
+---
+
+## Key Takeaways
+
+| Concept | How it's used |
+|---------|---------------|
+| **Single-table design** | 3 entities (User, Post, Comment) share one table |
+| **Index overloading** | GSI1 serves posts-by-author and comments-by-post with different partition keys |
+| **Clean model types** | `yield*` returns `User`, `Post`, `Comment` -- no system field noise |
+| **System fields** | `Entity.asRecord` exposes `version`, `createdAt`, `updatedAt` when needed |
+| **Optimistic locking** | `versioned: true` + `Entity.expectedVersion()` prevents stale writes |
+| **Transactions** | `transactGet` and `transactWrite` for atomic multi-entity operations |
+| **Raw inspection** | `Entity.asNative` reveals internal DynamoDB structure for debugging |
+
+## What's Next?
+
+- [Modeling Guide](/effect-dynamodb/guides/modeling/) -- Deep dive into models, schemas, tables, and entities
+- [Queries Guide](/effect-dynamodb/guides/queries/) -- Sort key conditions, filters, and pagination
+- [Example: Shopping Mall](/effect-dynamodb/tutorials/shopping-mall/) -- Composite keys, `beginsWith`, and date range queries
+- [Example: Human Resources](/effect-dynamodb/tutorials/human-resources/) -- 3 entities, 5 GSIs, collections, and soft delete

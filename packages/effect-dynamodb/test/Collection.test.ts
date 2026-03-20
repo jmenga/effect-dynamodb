@@ -15,7 +15,6 @@ import * as Table from "../src/Table.js"
 // ---------------------------------------------------------------------------
 
 const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
 
 class User extends Schema.Class<User>("User")({
   tenantId: Schema.String,
@@ -31,7 +30,6 @@ class Order extends Schema.Class<Order>("Order")({
 
 const UserEntity = Entity.make({
   model: User,
-  table: MainTable,
   entityType: "User",
   indexes: {
     primary: {
@@ -50,7 +48,6 @@ const UserEntity = Entity.make({
 
 const OrderEntity = Entity.make({
   model: Order,
-  table: MainTable,
   entityType: "Order",
   indexes: {
     primary: {
@@ -65,6 +62,11 @@ const OrderEntity = Entity.make({
       sk: { field: "gsi1sk", composite: [] },
     },
   },
+})
+
+const MainTable = Table.make({
+  schema: AppSchema,
+  entities: { UserEntity, OrderEntity },
 })
 
 // ---------------------------------------------------------------------------
@@ -89,6 +91,7 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
   transactWriteItems: () => Effect.die("not used"),
   createTable: () => Effect.die("not used"),
   deleteTable: () => Effect.die("not used"),
+  describeTable: () => Effect.die("not used"),
   scan: () => Effect.die("not used"),
 })
 
@@ -137,7 +140,6 @@ describe("Collection", () => {
     it("throws when no entities have the collection name", () => {
       const UnlinkedEntity = Entity.make({
         model: User,
-        table: MainTable,
         entityType: "Unlinked",
         indexes: {
           primary: {
@@ -146,6 +148,7 @@ describe("Collection", () => {
           },
         },
       })
+      UnlinkedEntity._configure(AppSchema, MainTable.Tag)
 
       expect(() => Collection.make("NonExistent", { unlinked: UnlinkedEntity })).toThrow(
         'No entity in collection "NonExistent" has an index with collection: "NonExistent"',
@@ -358,7 +361,6 @@ describe("Collection", () => {
   describe("isolated mode", () => {
     const IsolatedUser = Entity.make({
       model: User,
-      table: MainTable,
       entityType: "User",
       indexes: {
         primary: {
@@ -374,10 +376,10 @@ describe("Collection", () => {
         },
       },
     })
+    IsolatedUser._configure(AppSchema, MainTable.Tag)
 
     const IsolatedOrder = Entity.make({
       model: Order,
-      table: MainTable,
       entityType: "Order",
       indexes: {
         primary: {
@@ -393,6 +395,7 @@ describe("Collection", () => {
         },
       },
     })
+    IsolatedOrder._configure(AppSchema, MainTable.Tag)
 
     it("collection query uses PK-only (no SK condition)", () => {
       const IsolatedCollection = Collection.make("IsolatedTenantItems", {

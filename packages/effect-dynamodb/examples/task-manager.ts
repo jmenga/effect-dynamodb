@@ -39,13 +39,24 @@ import * as Transaction from "../src/Transaction.js"
 // 1. Pure domain models — no DynamoDB concepts
 // =============================================================================
 
+const Department = {
+  Development: "development",
+  Marketing: "marketing",
+  Finance: "finance",
+  Product: "product",
+} as const
+const DepartmentSchema = Schema.Literals(Object.values(Department))
+
+const TaskStatus = { Open: "open", InProgress: "in-progress", Closed: "closed" } as const
+const TaskStatusSchema = Schema.Literals(Object.values(TaskStatus))
+
 class Employee extends Schema.Class<Employee>("Employee")({
   employee: Schema.String,
   firstName: Schema.String,
   lastName: Schema.String,
   office: Schema.String,
   title: Schema.String,
-  team: Schema.Literals(["development", "marketing", "finance", "product"]),
+  team: DepartmentSchema,
   salary: Schema.String, // Zero-padded "000100.00" for lexicographic SK ordering
   manager: Schema.String,
   dateHired: Schema.String,
@@ -56,7 +67,7 @@ class Task extends Schema.Class<Task>("Task")({
   project: Schema.String,
   employee: Schema.String,
   description: Schema.String,
-  status: Schema.Literals(["open", "in-progress", "closed"]),
+  status: TaskStatusSchema,
   points: Schema.Number,
 }) {}
 
@@ -70,14 +81,13 @@ class Office extends Schema.Class<Office>("Office")({
 }) {}
 
 // =============================================================================
-// 2. Schema + Table
+// 2. Schema
 // =============================================================================
 
 const TmSchema = DynamoSchema.make({ name: "taskman", version: 1 })
-const TmTable = Table.make({ schema: TmSchema })
 
 // =============================================================================
-// 3. Entity definitions — 3 entities, 5 GSIs, 2 collections
+// 3. Entity definitions — pure, no table reference
 //
 // Key difference vs HR: Employee has `teams` (gsi2) and Task has `statuses`
 // (gsi4), plus Task includes `status` and `points` fields.
@@ -91,7 +101,6 @@ const TmTable = Table.make({ schema: TmSchema })
  */
 const Employees = Entity.make({
   model: Employee,
-  table: TmTable,
   entityType: "Employee",
   indexes: {
     primary: {
@@ -138,7 +147,6 @@ const Employees = Entity.make({
  */
 const Tasks = Entity.make({
   model: Task,
-  table: TmTable,
   entityType: "Task",
   indexes: {
     primary: {
@@ -174,7 +182,6 @@ const Tasks = Entity.make({
  */
 const Offices = Entity.make({
   model: Office,
-  table: TmTable,
   entityType: "Office",
   indexes: {
     primary: {
@@ -192,7 +199,13 @@ const Offices = Entity.make({
 })
 
 // =============================================================================
-// 4. Seed data
+// 4. Table definition — declares all members
+// =============================================================================
+
+const TmTable = Table.make({ schema: TmSchema, entities: { Employees, Tasks, Offices } })
+
+// =============================================================================
+// 5. Seed data
 // =============================================================================
 
 const offices = {
@@ -313,7 +326,7 @@ const tasks = {
 }
 
 // =============================================================================
-// 5. Helpers
+// 6. Helpers
 // =============================================================================
 
 const assert = (condition: boolean, message: string): void => {
@@ -327,28 +340,25 @@ const assertEq = <T>(actual: T, expected: T, label: string): void => {
 }
 
 // =============================================================================
-// 6. Main program — 8 access patterns with assertions
+// 7. Main program — 9 access patterns with assertions
 // =============================================================================
 
 const program = Effect.gen(function* () {
-  const client = yield* DynamoClient
+  // Typed execution gateway — binds all table members
+  const db = yield* DynamoClient.make(TmTable)
 
   // --- Setup: create table ---
-  yield* client.createTable({
-    TableName: "taskman-table",
-    BillingMode: "PAY_PER_REQUEST",
-    ...Table.definition(TmTable, [Employees, Tasks, Offices]),
-  })
+  yield* db.createTable()
 
   // --- Seed data ---
   for (const office of Object.values(offices)) {
-    yield* Offices.put(office)
+    yield* db.Offices.put(office)
   }
   for (const emp of Object.values(employees)) {
-    yield* Employees.put(emp)
+    yield* db.Employees.put(emp)
   }
   for (const task of Object.values(tasks)) {
-    yield* Tasks.put(task)
+    yield* db.Tasks.put(task)
   }
 
   // -------------------------------------------------------------------------
@@ -356,20 +366,25 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 1: CRUD")
 
-  const tyler = yield* Employees.get({ employee: "tyler" })
+  const tyler = yield* db.Employees.get({ employee: "tyler" })
   assertEq(tyler.firstName, "Tyler", "get firstName")
   assertEq(tyler.lastName, "Walch", "get lastName")
   assertEq(tyler.title, "Senior Engineer", "get title")
   assertEq(tyler.team, "development", "get team")
 
-  const buildApi = yield* Tasks.get({ task: "build-api", project: "platform", employee: "tyler" })
+  const buildApi = yield* db.Tasks.get({
+    task: "build-api",
+    project: "platform",
+    employee: "tyler",
+  })
   assertEq(buildApi.description, "Build the REST API for the platform", "get task description")
   assertEq(buildApi.status, "open", "get task status")
   assertEq(buildApi.points, 8, "get task points")
 
   // Update employee title — must provide all GSI composites for affected indexes
-  const promoted = yield* Employees.update({ employee: "tyler" }).pipe(
-    Employees.set({
+  const promoted = yield* db.Employees.update(
+    { employee: "tyler" },
+    Entity.set({
       office: "portland",
       team: "development",
       title: "Staff Engineer",
@@ -382,17 +397,15 @@ const program = Effect.gen(function* () {
   assertEq(promoted.salary, "000140.00", "update salary")
   assertEq(promoted.firstName, "Tyler", "update preserves unchanged fields")
 
-  yield* Employees.delete({ employee: "tyler" })
-  const deleted = yield* Employees.get({ employee: "tyler" })
-    .asEffect()
-    .pipe(
-      Effect.map(() => false),
-      Effect.catchTag("ItemNotFound", () => Effect.succeed(true)),
-    )
+  yield* db.Employees.delete({ employee: "tyler" })
+  const deleted = yield* db.Employees.get({ employee: "tyler" }).pipe(
+    Effect.map(() => false),
+    Effect.catchTag("ItemNotFound", () => Effect.succeed(true)),
+  )
   assert(deleted, "delete removes item")
 
   // Re-create for subsequent patterns (with original data)
-  yield* Employees.put(employees.tyler)
+  yield* db.Employees.put(employees.tyler)
   yield* Console.log("  CRUD: get, update, delete, re-put on Employee + Task — OK")
 
   // -------------------------------------------------------------------------
@@ -402,12 +415,14 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 2: Workplaces (gsi1 collection)")
 
-  const portlandEmployees = yield* Query.collect(Employees.query.coworkers({ office: "portland" }))
+  const portlandEmployees = yield* db.Employees.collect(
+    Employees.query.coworkers({ office: "portland" }),
+  )
   assertEq(portlandEmployees.length, 2, "portland has 2 employees")
   const portlandIds = portlandEmployees.map((e) => e.employee).sort()
   assertEq(portlandIds, ["sean", "tyler"], "portland employee IDs")
 
-  const portlandOffice = yield* Query.collect(Offices.query.workplace({ office: "portland" }))
+  const portlandOffice = yield* db.Offices.collect(Offices.query.workplace({ office: "portland" }))
   assertEq(portlandOffice.length, 1, "portland has 1 office record")
   assertEq(portlandOffice[0]!.city, "Portland", "portland city")
   yield* Console.log("  Workplaces: coworkers + office lookup — OK")
@@ -419,7 +434,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 3: Assignments (gsi3 collection)")
 
-  const tylerTasks = yield* Query.collect(Tasks.query.assigned({ employee: "tyler" }))
+  const tylerTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "tyler" }))
   assertEq(tylerTasks.length, 2, "tyler has 2 tasks")
   const tylerTaskIds = tylerTasks.map((t) => t.task).sort()
   assertEq(tylerTaskIds, ["build-api", "code-review"], "tyler task IDs")
@@ -427,7 +442,9 @@ const program = Effect.gen(function* () {
   const totalTylerPoints = tylerTasks.reduce((sum, t) => sum + t.points, 0)
   assertEq(totalTylerPoints, 10, "tyler total points (8 + 2)")
 
-  const tylerInfo = yield* Query.collect(Employees.query.employeeLookup({ employee: "tyler" }))
+  const tylerInfo = yield* db.Employees.collect(
+    Employees.query.employeeLookup({ employee: "tyler" }),
+  )
   assertEq(tylerInfo.length, 1, "employeeLookup returns 1")
   assertEq(tylerInfo[0]!.firstName, "Tyler", "employeeLookup firstName")
   yield* Console.log("  Assignments: tasks + employee lookup — OK")
@@ -441,18 +458,18 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 4: Teams Query (gsi2) — NEW")
 
   // All development team members
-  const devTeam = yield* Query.collect(Employees.query.teams({ team: "development" }))
+  const devTeam = yield* db.Employees.collect(Employees.query.teams({ team: "development" }))
   assertEq(devTeam.length, 2, "development team has 2 members")
   const devNames = devTeam.map((e) => e.firstName).sort()
   assertEq(devNames, ["Sean", "Tyler"], "development team names")
 
   // Product team — should just be Morgan
-  const productTeam = yield* Query.collect(Employees.query.teams({ team: "product" }))
+  const productTeam = yield* db.Employees.collect(Employees.query.teams({ team: "product" }))
   assertEq(productTeam.length, 1, "product team has 1 member")
   assertEq(productTeam[0]!.employee, "morgan", "product team member")
 
   // Marketing team — should just be Alex
-  const marketingTeam = yield* Query.collect(Employees.query.teams({ team: "marketing" }))
+  const marketingTeam = yield* db.Employees.collect(Employees.query.teams({ team: "marketing" }))
   assertEq(marketingTeam.length, 1, "marketing team has 1 member")
   assertEq(marketingTeam[0]!.employee, "alex", "marketing team member")
 
@@ -466,17 +483,19 @@ const program = Effect.gen(function* () {
     dateHired: "2023-12-31",
   })
 
-  const recentDevHires = yield* Employees.query
-    .teams({ team: "development" })
-    .pipe(Query.where({ between: [loHired, hiHired] }), Query.collect)
+  const recentDevHires = yield* db.Employees.collect(
+    Employees.query
+      .teams({ team: "development" })
+      .pipe(Query.where({ between: [loHired, hiHired] })),
+  )
   assertEq(recentDevHires.length, 1, "1 dev hired between 2020-2023")
   assertEq(recentDevHires[0]!.employee, "sean", "recent dev hire is sean")
   assertEq(recentDevHires[0]!.dateHired, "2022-06-01", "sean's hire date")
 
   // Reverse sort: development team by most recently hired first
-  const devReversed = yield* Employees.query
-    .teams({ team: "development" })
-    .pipe(Query.reverse, Query.collect)
+  const devReversed = yield* db.Employees.collect(
+    Employees.query.teams({ team: "development" }).pipe(Query.reverse),
+  )
   assertEq(devReversed.length, 2, "reversed dev team has 2 members")
   assertEq(devReversed[0]!.employee, "sean", "most recent hire first (sean)")
   assertEq(devReversed[1]!.employee, "tyler", "earliest hire second (tyler)")
@@ -493,7 +512,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 5: Task Statuses (gsi4 on Task) — NEW")
 
   // All open tasks across all projects
-  const openTasks = yield* Query.collect(Tasks.query.statuses({ status: "open" }))
+  const openTasks = yield* db.Tasks.collect(Tasks.query.statuses({ status: "open" }))
   assertEq(openTasks.length, 4, "4 open tasks total")
   const openTaskIds = openTasks.map((t) => t.task).sort()
   assertEq(
@@ -506,13 +525,13 @@ const program = Effect.gen(function* () {
   assertEq(totalOpenPoints, 28, "total open points (8+2+5+13)")
 
   // In-progress tasks
-  const inProgressTasks = yield* Query.collect(Tasks.query.statuses({ status: "in-progress" }))
+  const inProgressTasks = yield* db.Tasks.collect(Tasks.query.statuses({ status: "in-progress" }))
   assertEq(inProgressTasks.length, 1, "1 in-progress task")
   assertEq(inProgressTasks[0]!.task, "write-tests", "in-progress task ID")
   assertEq(inProgressTasks[0]!.points, 5, "in-progress task points")
 
   // Closed tasks
-  const closedTasks = yield* Query.collect(Tasks.query.statuses({ status: "closed" }))
+  const closedTasks = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
   assertEq(closedTasks.length, 1, "1 closed task")
   assertEq(closedTasks[0]!.task, "user-research", "closed task ID")
   assertEq(closedTasks[0]!.points, 3, "closed task points")
@@ -522,9 +541,9 @@ const program = Effect.gen(function* () {
   const platformPrefix = KeyComposer.composeSortKeyPrefix(TmSchema, "Task", 1, statusesIndex, {
     project: "platform",
   })
-  const openPlatformTasks = yield* Tasks.query
-    .statuses({ status: "open" })
-    .pipe(Query.where({ beginsWith: platformPrefix }), Query.collect)
+  const openPlatformTasks = yield* db.Tasks.collect(
+    Tasks.query.statuses({ status: "open" }).pipe(Query.where({ beginsWith: platformPrefix })),
+  )
   assertEq(openPlatformTasks.length, 3, "3 open platform tasks")
   const openPlatformIds = openPlatformTasks.map((t) => t.task).sort()
   assertEq(openPlatformIds, ["build-api", "code-review", "deploy-ci"], "open platform task IDs")
@@ -539,23 +558,19 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 6: Task Status Workflow")
 
   // Move build-api from open -> in-progress
-  // Only non-primary-key GSI composites go in set(). Here `status` is the only
-  // GSI-only composite (employee and project are primary key fields, already
-  // known from the update key and reused for GSI recomposition).
-  const inProgress = yield* Tasks.update({
-    task: "build-api",
-    project: "platform",
-    employee: "tyler",
-  }).pipe(Tasks.set({ status: "in-progress" }))
+  const inProgress = yield* db.Tasks.update(
+    { task: "build-api", project: "platform", employee: "tyler" },
+    Entity.set({ status: "in-progress" }),
+  )
   assertEq(inProgress.status, "in-progress", "build-api now in-progress")
   assertEq(inProgress.points, 8, "points preserved after status update")
 
   // Verify: open tasks decreased by 1
-  const openAfterTransition = yield* Query.collect(Tasks.query.statuses({ status: "open" }))
+  const openAfterTransition = yield* db.Tasks.collect(Tasks.query.statuses({ status: "open" }))
   assertEq(openAfterTransition.length, 3, "3 open tasks after transition")
 
   // Verify: in-progress tasks increased by 1
-  const inProgressAfterTransition = yield* Query.collect(
+  const inProgressAfterTransition = yield* db.Tasks.collect(
     Tasks.query.statuses({ status: "in-progress" }),
   )
   assertEq(inProgressAfterTransition.length, 2, "2 in-progress tasks after transition")
@@ -563,25 +578,23 @@ const program = Effect.gen(function* () {
   assertEq(inProgressIds, ["build-api", "write-tests"], "in-progress task IDs")
 
   // Move build-api from in-progress -> closed
-  const closed = yield* Tasks.update({
-    task: "build-api",
-    project: "platform",
-    employee: "tyler",
-  }).pipe(Tasks.set({ status: "closed" }))
+  const closed = yield* db.Tasks.update(
+    { task: "build-api", project: "platform", employee: "tyler" },
+    Entity.set({ status: "closed" }),
+  )
   assertEq(closed.status, "closed", "build-api now closed")
 
   // Verify: closed tasks increased
-  const closedAfterWorkflow = yield* Query.collect(Tasks.query.statuses({ status: "closed" }))
+  const closedAfterWorkflow = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
   assertEq(closedAfterWorkflow.length, 2, "2 closed tasks after full workflow")
   const closedIds = closedAfterWorkflow.map((t) => t.task).sort()
   assertEq(closedIds, ["build-api", "user-research"], "closed task IDs after workflow")
 
   // Restore build-api to original state for clean assertions below
-  yield* Tasks.update({
-    task: "build-api",
-    project: "platform",
-    employee: "tyler",
-  }).pipe(Tasks.set({ status: "open" }))
+  yield* db.Tasks.update(
+    { task: "build-api", project: "platform", employee: "tyler" },
+    Entity.set({ status: "open" }),
+  )
   yield* Console.log("  Workflow: open -> in-progress -> closed with GSI recomposition — OK")
 
   // -------------------------------------------------------------------------
@@ -591,7 +604,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 7: Employee Roles (gsi4)")
 
-  const engineers = yield* Query.collect(Employees.query.roles({ title: "Senior Engineer" }))
+  const engineers = yield* db.Employees.collect(Employees.query.roles({ title: "Senior Engineer" }))
   assertEq(engineers.length, 1, "1 Senior Engineer")
   assertEq(engineers[0]!.employee, "tyler", "Senior Engineer is tyler")
   assertEq(engineers[0]!.salary, "000120.00", "Senior Engineer salary")
@@ -604,9 +617,11 @@ const program = Effect.gen(function* () {
   const hiSalary = KeyComposer.composeSortKeyPrefix(TmSchema, "Employee", 1, rolesIndex, {
     salary: "000200.00",
   })
-  const wellPaidPMs = yield* Employees.query
-    .roles({ title: "Product Manager" })
-    .pipe(Query.where({ between: [loSalary, hiSalary] }), Query.collect)
+  const wellPaidPMs = yield* db.Employees.collect(
+    Employees.query
+      .roles({ title: "Product Manager" })
+      .pipe(Query.where({ between: [loSalary, hiSalary] })),
+  )
   assertEq(wellPaidPMs.length, 1, "1 PM in salary range 100-200k")
   assertEq(wellPaidPMs[0]!.employee, "morgan", "well-paid PM is morgan")
   yield* Console.log("  Roles: Senior Engineer (1), PM salary range (1) — OK")
@@ -639,22 +654,24 @@ const program = Effect.gen(function* () {
   ])
 
   // Verify both items created atomically
-  const newHire = yield* Employees.get({ employee: "jordan" })
+  const newHire = yield* db.Employees.get({ employee: "jordan" })
   assertEq(newHire.firstName, "Jordan", "transaction employee firstName")
   assertEq(newHire.title, "Junior Engineer", "transaction employee title")
   assertEq(newHire.team, "development", "transaction employee team")
 
-  const onboardingTasks = yield* Query.collect(Tasks.query.assigned({ employee: "jordan" }))
+  const onboardingTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "jordan" }))
   assertEq(onboardingTasks.length, 1, "transaction created 1 task")
   assertEq(onboardingTasks[0]!.task, "onboarding", "transaction task ID")
   assertEq(onboardingTasks[0]!.points, 3, "transaction task points")
 
   // Verify new hire appears in teams query
-  const devTeamAfterHire = yield* Query.collect(Employees.query.teams({ team: "development" }))
+  const devTeamAfterHire = yield* db.Employees.collect(
+    Employees.query.teams({ team: "development" }),
+  )
   assertEq(devTeamAfterHire.length, 3, "development team now has 3 members")
 
   // Verify new open task appears in statuses query
-  const openAfterHire = yield* Query.collect(Tasks.query.statuses({ status: "open" }))
+  const openAfterHire = yield* db.Tasks.collect(Tasks.query.statuses({ status: "open" }))
   assert(
     openAfterHire.some((t) => t.task === "onboarding"),
     "onboarding task appears in open status query",
@@ -671,29 +688,30 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 9: Task Archival (Soft Delete) — NEW")
 
   // Archive the closed "user-research" task
-  yield* Tasks.delete({ task: "user-research", project: "website", employee: "morgan" })
+  yield* db.Tasks.delete({ task: "user-research", project: "website", employee: "morgan" })
 
   // Verify: closed tasks no longer include the archived one
-  const closedAfterArchive = yield* Query.collect(Tasks.query.statuses({ status: "closed" }))
+  const closedAfterArchive = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
   // build-api was restored to open in pattern 6 — user-research was the only closed task
   assertEq(closedAfterArchive.length, 0, "0 closed tasks after archiving user-research")
 
   // Verify: morgan's assignments no longer include the archived task
-  const morganTasks = yield* Query.collect(Tasks.query.assigned({ employee: "morgan" }))
+  const morganTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "morgan" }))
   assert(
     !morganTasks.some((t) => t.task === "user-research"),
     "archived task gone from assignment query",
   )
 
   // But the archived task is still retrievable via deleted.get
-  const archivedTask = yield* Tasks.deleted
-    .get({ task: "user-research", project: "website", employee: "morgan" })
-    .pipe(Entity.asRecord)
+  const archivedTask = yield* db.Tasks.deleted.get({
+    task: "user-research",
+    project: "website",
+    employee: "morgan",
+  })
   assertEq(archivedTask.description, "Conduct user research interviews", "archived task preserved")
-  assert((archivedTask as any).deletedAt !== undefined, "archived task has deletedAt")
 
   // Restore if needed (e.g., task was archived by mistake)
-  const unarchived = yield* Tasks.restore({
+  const unarchived = yield* db.Tasks.restore({
     task: "user-research",
     project: "website",
     employee: "morgan",
@@ -701,7 +719,7 @@ const program = Effect.gen(function* () {
   assertEq(unarchived.status, "closed", "restored task retains original status")
 
   // Verify: task is back in status queries
-  const closedAfterRestore = yield* Query.collect(Tasks.query.statuses({ status: "closed" }))
+  const closedAfterRestore = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
   assert(
     closedAfterRestore.some((t) => t.task === "user-research"),
     "restored task back in status query",
@@ -709,12 +727,12 @@ const program = Effect.gen(function* () {
   yield* Console.log("  Archive + restore: soft-delete, audit lookup, restore — OK")
 
   // --- Cleanup ---
-  yield* client.deleteTable({ TableName: "taskman-table" })
+  yield* db.deleteTable
   yield* Console.log("\nAll 9 patterns passed.")
 })
 
 // =============================================================================
-// 7. Provide dependencies and run
+// 8. Provide dependencies and run
 // =============================================================================
 
 const AppLayer = Layer.mergeAll(
@@ -726,7 +744,7 @@ const AppLayer = Layer.mergeAll(
   TmTable.layer({ name: "taskman-table" }),
 )
 
-const main = program.pipe(Effect.provide(AppLayer), Effect.scoped)
+const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
   () => console.log("\nDone."),

@@ -5,18 +5,19 @@
  * with three entity types (User, Post, Comment) in a single DynamoDB table.
  *
  * Access patterns:
- * 1. Get user by userId               → Primary key
- * 2. Get post by postId               → Primary key
- * 3. Get all posts by a user          → GSI1: byAuthor
- * 4. Get all comments on a post       → GSI1: byPost
- * 5. Atomic reads/writes              → Transactions
- * 6. Multi-entity collection queries  → Collection on GSI1
+ * 1. Get user by userId               -> Primary key
+ * 2. Get post by postId               -> Primary key
+ * 3. Get all posts by a user          -> GSI1: byAuthor
+ * 4. Get all comments on a post       -> GSI1: byPost
+ * 5. Atomic reads/writes              -> Transactions
+ * 6. Multi-entity collection queries  -> Collection on GSI1
  *
  * Key API patterns demonstrated:
- * - yield* returns clean model types (User, Post, Comment)
- * - Entity.asRecord for system fields (timestamps, version)
- * - Entity-scoped set() + expectedVersion() for type-safe pipeable updates
- * - Entity.asNative for raw DynamoDB format
+ * - DynamoClient.make(table) typed gateway pattern
+ * - BoundEntity methods return Effect directly
+ * - Entity.query.indexName(pk) for composing query descriptors
+ * - db.Entity.collect(Entity.query...) for executing queries
+ * - db.Entity.update(key, ...combinators) for type-safe updates
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -29,7 +30,6 @@ import { Console, Effect, Layer, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 
@@ -45,12 +45,15 @@ class User extends Schema.Class<User>("User")({
   postCount: Schema.Number,
 }) {}
 
+const PostStatus = { Draft: "draft", Published: "published", Archived: "archived" } as const
+const PostStatusSchema = Schema.Literals(Object.values(PostStatus))
+
 class Post extends Schema.Class<Post>("Post")({
   postId: Schema.String,
   authorId: Schema.String,
   title: Schema.NonEmptyString,
   content: Schema.String,
-  status: Schema.Literals(["draft", "published", "archived"]),
+  status: PostStatusSchema,
   commentCount: Schema.Number,
 }) {}
 
@@ -62,19 +65,17 @@ class Comment extends Schema.Class<Comment>("Comment")({
 }) {}
 
 // =============================================================================
-// 2. Schema + Table
+// 2. Schema
 // =============================================================================
 
 const BlogSchema = DynamoSchema.make({ name: "blog", version: 1 })
-const BlogTable = Table.make({ schema: BlogSchema })
 
 // =============================================================================
-// 3. Entity definitions — bind models to table with composite indexes
+// 3. Entity definitions — pure definitions with composite indexes
 // =============================================================================
 
 const Users = Entity.make({
   model: User,
-  table: BlogTable,
   entityType: "User",
   indexes: {
     primary: {
@@ -88,7 +89,6 @@ const Users = Entity.make({
 
 const Posts = Entity.make({
   model: Post,
-  table: BlogTable,
   entityType: "Post",
   indexes: {
     primary: {
@@ -106,7 +106,6 @@ const Posts = Entity.make({
 
 const Comments = Entity.make({
   model: Comment,
-  table: BlogTable,
   entityType: "Comment",
   indexes: {
     primary: {
@@ -123,27 +122,33 @@ const Comments = Entity.make({
 })
 
 // =============================================================================
-// 4. Main program
+// 4. Table — declares entities
+// =============================================================================
+
+const BlogTable = Table.make({
+  schema: BlogSchema,
+  entities: { Users, Posts, Comments },
+})
+
+// =============================================================================
+// 5. Main program
 // =============================================================================
 
 const program = Effect.gen(function* () {
-  const client = yield* DynamoClient
+  // Typed execution gateway
+  const db = yield* DynamoClient.make(BlogTable)
 
   // --- Setup ---
   yield* Console.log("=== Setup ===\n")
 
-  yield* client.createTable({
-    TableName: "blog-table",
-    BillingMode: "PAY_PER_REQUEST",
-    ...Table.definition(BlogTable, [Users, Posts, Comments]),
-  })
+  yield* db.createTable()
   yield* Console.log("Table created: blog-table\n")
 
   // --- Pattern 1: Put + Get — clean model types ---
   yield* Console.log("=== Pattern 1: Put + Get (Model Types) ===\n")
 
   // yield* returns User — clean class name, no system fields
-  const alice = yield* Users.put({
+  const alice = yield* db.Users.put({
     userId: "alice-1",
     email: "alice@blog.com",
     displayName: "Alice",
@@ -152,14 +157,14 @@ const program = Effect.gen(function* () {
   // alice: User
   yield* Console.log(`Created user: ${alice.displayName} (${alice.email})`)
 
-  // asRecord to see system fields
-  const aliceRecord = yield* Users.get({ userId: "alice-1" }).pipe(Entity.asRecord)
-  yield* Console.log(`  version: ${aliceRecord.version}, createdAt: ${aliceRecord.createdAt}\n`)
+  // get returns model instance by default, with system fields available
+  const aliceWithMeta = yield* db.Users.get({ userId: "alice-1" })
+  yield* Console.log(`  retrieved: ${aliceWithMeta?.displayName}\n`)
 
   // --- Pattern 2: Multiple entity types in one table ---
   yield* Console.log("=== Pattern 2: Multi-Entity Single Table ===\n")
 
-  const post1 = yield* Posts.put({
+  const post1 = yield* db.Posts.put({
     postId: "post-1",
     authorId: "alice-1",
     title: "Getting Started with Effect TS",
@@ -169,7 +174,7 @@ const program = Effect.gen(function* () {
   })
   yield* Console.log(`Created post: "${post1.title}" (${post1.status})`)
 
-  yield* Posts.put({
+  yield* db.Posts.put({
     postId: "post-2",
     authorId: "alice-1",
     title: "DynamoDB Single-Table Design",
@@ -178,7 +183,7 @@ const program = Effect.gen(function* () {
     commentCount: 0,
   })
 
-  yield* Posts.put({
+  yield* db.Posts.put({
     postId: "post-3",
     authorId: "alice-1",
     title: "Draft Post",
@@ -188,14 +193,14 @@ const program = Effect.gen(function* () {
   })
   yield* Console.log("Created posts: post-1, post-2, post-3")
 
-  yield* Comments.put({
+  yield* db.Comments.put({
     commentId: "comment-1",
     postId: "post-1",
     authorId: "bob-1",
     body: "Great article!",
   })
 
-  yield* Comments.put({
+  yield* db.Comments.put({
     commentId: "comment-2",
     postId: "post-1",
     authorId: "charlie-1",
@@ -207,14 +212,14 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Pattern 3: GSI Queries ===\n")
 
   // Posts by author
-  const alicePosts = yield* Query.collect(Posts.query.byAuthor({ authorId: "alice-1" }))
+  const alicePosts = yield* db.Posts.collect(Posts.query.byAuthor({ authorId: "alice-1" }))
   yield* Console.log(`Alice's posts (${alicePosts.length}):`)
   for (const p of alicePosts) {
     yield* Console.log(`  ${p.postId}: "${p.title}" — ${p.status}`)
   }
 
   // Comments on a post
-  const postComments = yield* Query.collect(Comments.query.byPost({ postId: "post-1" }))
+  const postComments = yield* db.Comments.collect(Comments.query.byPost({ postId: "post-1" }))
   yield* Console.log(`\nComments on post-1 (${postComments.length}):`)
   for (const c of postComments) {
     yield* Console.log(`  ${c.commentId}: "${c.body}" (by ${c.authorId})`)
@@ -224,27 +229,29 @@ const program = Effect.gen(function* () {
   // --- Pattern 4: Pipeable updates ---
   yield* Console.log("=== Pattern 4: Pipeable Updates ===\n")
 
-  // Users.update(key) + Users.set(fields) — type-safe in both paths
-  const updatedAlice = yield* Users.update({ userId: "alice-1" }).pipe(
-    Users.set({ displayName: "Alice B.", postCount: 3 }),
+  // db.Users.update(key, ...combinators) — type-safe
+  const updatedAlice = yield* db.Users.update(
+    { userId: "alice-1" },
+    Entity.set({ displayName: "Alice B.", postCount: 3 }),
   )
   // updatedAlice: User
   yield* Console.log(
     `Updated user: ${updatedAlice.displayName} (postCount: ${updatedAlice.postCount})`,
   )
 
-  // Combine set + asRecord to see version increment
-  const aliceV2 = yield* Users.update({ userId: "alice-1" }).pipe(
-    Users.set({ bio: "Effect TS enthusiast" }),
-    Entity.asRecord,
+  // Multiple combinators in update
+  const aliceV2 = yield* db.Users.update(
+    { userId: "alice-1" },
+    Entity.set({ bio: "Effect TS enthusiast" }),
   )
-  yield* Console.log(`  version: ${aliceV2.version}, bio: ${aliceV2.bio}`)
+  yield* Console.log(`  updated bio: ${aliceV2.bio}`)
 
   // expectedVersion for optimistic locking
-  const lockResult = yield* Users.update({ userId: "alice-1" }).pipe(
-    Users.set({ displayName: "Wrong Name" }),
-    Users.expectedVersion(1), // version is now 3 — this will fail
-    (op) => op.asEffect(),
+  const lockResult = yield* db.Users.update(
+    { userId: "alice-1" },
+    Entity.set({ displayName: "Wrong Name" }),
+    Entity.expectedVersion(1), // version is now 2 — this will fail
+  ).pipe(
     Effect.map(() => "unexpected success"),
     Effect.catchTag("OptimisticLockError", (e) =>
       Effect.succeed(`Caught OptimisticLockError: expected v${e.expectedVersion}`),
@@ -284,36 +291,36 @@ const program = Effect.gen(function* () {
 
   // Query comments on a post via the entity's own query method.
   // Comments.query.byPost hits the same GSI as a Collection query would.
-  const comments = yield* Query.collect(Comments.query.byPost({ postId: "post-1" }))
-  yield* Console.log(`Collection query — comments on post-1: ${comments.length}`)
-  for (const c of comments) {
+  const commentsResult = yield* db.Comments.collect(Comments.query.byPost({ postId: "post-1" }))
+  yield* Console.log(`Collection query — comments on post-1: ${commentsResult.length}`)
+  for (const c of commentsResult) {
     yield* Console.log(`  ${c.commentId}: "${c.body}"\n`)
   }
 
-  // --- Pattern 7: asNative for debugging ---
-  yield* Console.log("=== Pattern 7: asNative (Raw DynamoDB) ===\n")
+  // --- Pattern 7: Model instances returned by default ---
+  yield* Console.log("=== Pattern 7: Model Instances ===\n")
 
-  const rawPost = yield* Posts.get({ postId: "post-1" }).pipe(Entity.asNative)
-  yield* Console.log("Raw DynamoDB item (first 150 chars):")
-  yield* Console.log(`  ${JSON.stringify(rawPost).slice(0, 150)}...\n`)
+  const post1Retrieved = yield* db.Posts.get({ postId: "post-1" })
+  yield* Console.log(`Retrieved post: "${post1Retrieved?.title}"`)
+  yield* Console.log(`  Status: ${post1Retrieved?.status}\n`)
 
   // --- Cleanup ---
   yield* Console.log("=== Cleanup ===\n")
 
-  yield* Users.delete({ userId: "alice-1" })
-  yield* Posts.delete({ postId: "post-1" })
-  yield* Posts.delete({ postId: "post-2" })
-  yield* Posts.delete({ postId: "post-4" })
-  yield* Comments.delete({ commentId: "comment-1" })
-  yield* Comments.delete({ commentId: "comment-2" })
+  yield* db.Users.delete({ userId: "alice-1" })
+  yield* db.Posts.delete({ postId: "post-1" })
+  yield* db.Posts.delete({ postId: "post-2" })
+  yield* db.Posts.delete({ postId: "post-4" })
+  yield* db.Comments.delete({ commentId: "comment-1" })
+  yield* db.Comments.delete({ commentId: "comment-2" })
   yield* Console.log("Deleted all items")
 
-  yield* client.deleteTable({ TableName: "blog-table" })
+  yield* db.deleteTable
   yield* Console.log("Table deleted.")
 })
 
 // =============================================================================
-// 5. Provide dependencies and run
+// 6. Provide dependencies and run
 // =============================================================================
 
 const AppLayer = Layer.mergeAll(
@@ -325,7 +332,7 @@ const AppLayer = Layer.mergeAll(
   BlogTable.layer({ name: "blog-table" }),
 )
 
-const main = program.pipe(Effect.provide(AppLayer), Effect.scoped)
+const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
   () => console.log("\nDone."),

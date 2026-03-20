@@ -1,0 +1,657 @@
+---
+title: "Example: Library System"
+description: "Multi-entity single-table design with 4 entities, 3 GSIs, 4 collection patterns, sparse indexes, and transactions"
+---
+
+A library management system with **authors**, **books**, **genres**, and **members** in a single DynamoDB table. Adapted from the [ElectroDB Library System example](https://electrodb.dev/en/examples/library-system/) to showcase effect-dynamodb's approach to the same problem.
+
+**What you'll learn:**
+- 4 entities sharing one table (single-table design)
+- 3 GSIs with index overloading
+- 4 cross-entity collection patterns via shared GSI indexes
+- Sparse index pattern (items appear in a GSI only when optional fields are present)
+- Book loan and return workflows
+- Atomic book returns via transactions
+
+---
+
+## Requirements
+
+As stakeholders of this library system, we need to support these access patterns:
+
+1. **Librarian** -- Get author details by name
+2. **Patron** -- Get book and genre details by ISBN
+3. **Catalog** -- Get an author's complete works (books + genres)
+4. **Account** -- See a member's profile and loaned books
+5. **Search** -- Find books and genres by title
+6. **Browse** -- Browse genres by category (Sci-Fi, Fantasy, etc.)
+7. **Circulation** -- Loan a book to a member (sparse index)
+8. **Circulation** -- Return a book atomically via transaction
+
+---
+
+## Table Design
+
+All four entities share a single table with 3 Global Secondary Indexes:
+
+| Key | Field | Used by |
+|-----|-------|---------|
+| PK | `pk` | Author (by lastName), Book (by isbn), Genre (by isbn), Member (by memberId) |
+| SK | `sk` | Author (firstName), Book (bookId), Genre (genre + subgenre), Member |
+| GSI1 PK | `gsi1pk` | Book (by memberId -- loans), Genre (by genre), Member (by memberId) |
+| GSI1 SK | `gsi1sk` | Book (loanEndDate), Genre (subgenre), Member |
+| GSI2 PK | `gsi2pk` | Author (by name), Book (by author name), Genre (by author name) |
+| GSI2 SK | `gsi2sk` | Author, Book (bookId), Genre (genre) |
+| GSI3 PK | `gsi3pk` | Book (by bookTitle), Genre (by bookTitle) |
+| GSI3 SK | `gsi3sk` | Book (releaseDate), Genre (genre + subgenre) |
+
+GSI1 is **overloaded** -- it serves Book loans (sparse), Genre categories (standalone), and Member accounts. GSI2 and GSI3 each serve **collection** patterns grouping multiple entity types under the same partition key.
+
+**Collections:**
+
+| Collection | Index | Partition Key | Entities |
+|------------|-------|---------------|----------|
+| `works` | GSI2 | authorLastName + authorFirstName | Author, Book, Genre |
+| `account` | GSI1 | memberId | Member, Book |
+| `titles` | GSI3 | bookTitle | Book, Genre |
+
+---
+
+## Step 1: Models
+
+Pure domain models with no DynamoDB concepts:
+
+```typescript title="models.ts"
+import { Schema } from "effect"
+
+class Author extends Schema.Class<Author>("Author")({
+  authorFirstName: Schema.String,
+  authorLastName: Schema.String,
+  birthday: Schema.String,
+  bio: Schema.String,
+}) {}
+
+class Book extends Schema.Class<Book>("Book")({
+  bookId: Schema.String,
+  bookTitle: Schema.String,
+  description: Schema.String,
+  publisher: Schema.String,
+  releaseDate: Schema.String,
+  authorFirstName: Schema.String,
+  authorLastName: Schema.String,
+  isbn: Schema.String,
+  memberId: Schema.optional(Schema.String),
+  loanEndDate: Schema.optional(Schema.String),
+}) {}
+
+class Genre extends Schema.Class<Genre>("Genre")({
+  genre: Schema.String,
+  subgenre: Schema.String,
+  isbn: Schema.String,
+  bookTitle: Schema.String,
+  authorFirstName: Schema.String,
+  authorLastName: Schema.String,
+}) {}
+
+class Member extends Schema.Class<Member>("Member")({
+  memberId: Schema.String,
+  membershipStartDate: Schema.String,
+  membershipEndDate: Schema.String,
+  city: Schema.String,
+  state: Schema.String,
+}) {}
+```
+
+Note that Book has two **optional** fields -- `memberId` and `loanEndDate`. When these are absent, the book won't appear in the loans GSI. This is the **sparse index pattern**: DynamoDB only writes an item to a GSI when all key attributes for that index are present.
+
+---
+
+## Step 2: Schema, Table, and Entities
+
+### Schema and Table
+
+```typescript title="entities.ts"
+import { DynamoSchema, Table } from "effect-dynamodb"
+
+const LibSchema = DynamoSchema.make({ name: "library", version: 1 })
+const LibTable = Table.make({ schema: LibSchema, entities: { Authors, Books, Genres, Members } })
+```
+
+### Author Entity
+
+Author has 2 indexes -- primary key plus GSI2 participating in the `works` collection:
+
+```typescript title="entities.ts"
+import { Entity } from "effect-dynamodb"
+
+const Authors = Entity.make({
+  model: Author,
+  entityType: "Author",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["authorLastName"] },
+      sk: { field: "sk", composite: ["authorFirstName"] },
+    },
+    // GSI2 -- "works" collection (shared with Book and Genre)
+    info: {
+      index: "gsi2",
+      collection: "works",
+      pk: { field: "gsi2pk", composite: ["authorLastName", "authorFirstName"] },
+      sk: { field: "gsi2sk", composite: [] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+### Book Entity
+
+Book has 4 indexes -- the most complex entity. The `loans` index on GSI1 uses optional fields, creating a **sparse index**:
+
+```typescript title="entities.ts"
+const Books = Entity.make({
+  model: Book,
+  entityType: "Book",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["isbn"] },
+      sk: { field: "sk", composite: ["bookId"] },
+    },
+    // GSI1 -- sparse loans index + "account" collection (shared with Member)
+    loans: {
+      index: "gsi1",
+      collection: "account",
+      pk: { field: "gsi1pk", composite: ["memberId"] },
+      sk: { field: "gsi1sk", composite: ["loanEndDate"] },
+    },
+    // GSI2 -- "works" collection (shared with Author and Genre)
+    author: {
+      index: "gsi2",
+      collection: "works",
+      pk: { field: "gsi2pk", composite: ["authorLastName", "authorFirstName"] },
+      sk: { field: "gsi2sk", composite: ["bookId"] },
+    },
+    // GSI3 -- "titles" collection (shared with Genre)
+    releases: {
+      index: "gsi3",
+      collection: "titles",
+      pk: { field: "gsi3pk", composite: ["bookTitle"] },
+      sk: { field: "gsi3sk", composite: ["releaseDate"] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+Key design decisions:
+- **`loans` (GSI1)** uses `memberId` and `loanEndDate` as composites -- both are `Schema.optional`, so books without a loan are invisible in this index (sparse index pattern)
+- **`author` (GSI2)** shares the `works` collection with Author and Genre, grouping everything by author name
+- **`releases` (GSI3)** shares the `titles` collection with Genre, grouping books and genres by title
+
+### Genre Entity
+
+Genre has 4 indexes. It participates in three collection patterns plus a standalone category index:
+
+```typescript title="entities.ts"
+const Genres = Entity.make({
+  model: Genre,
+  entityType: "Genre",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["isbn"] },
+      sk: { field: "sk", composite: ["genre", "subgenre"] },
+    },
+    // GSI1 -- standalone genre browsing
+    categories: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["genre"] },
+      sk: { field: "gsi1sk", composite: ["subgenre"] },
+    },
+    // GSI2 -- "works" collection (shared with Author and Book)
+    author: {
+      index: "gsi2",
+      collection: "works",
+      pk: { field: "gsi2pk", composite: ["authorLastName", "authorFirstName"] },
+      sk: { field: "gsi2sk", composite: ["genre"] },
+    },
+    // GSI3 -- "titles" collection (shared with Book)
+    title: {
+      index: "gsi3",
+      collection: "titles",
+      pk: { field: "gsi3pk", composite: ["bookTitle"] },
+      sk: { field: "gsi3sk", composite: ["genre", "subgenre"] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+### Member Entity
+
+Member has 2 indexes. GSI1 participates in the `account` collection alongside Book loans:
+
+```typescript title="entities.ts"
+const Members = Entity.make({
+  model: Member,
+  entityType: "Member",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["memberId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    // GSI1 -- "account" collection (shared with Book loans)
+    account: {
+      index: "gsi1",
+      collection: "account",
+      pk: { field: "gsi1pk", composite: ["memberId"] },
+      sk: { field: "gsi1sk", composite: [] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+---
+
+## Step 3: Seed Data
+
+```typescript title="seed.ts"
+const authors = {
+  tolkien: {
+    authorFirstName: "J.R.R.",
+    authorLastName: "Tolkien",
+    birthday: "1892-01-03",
+    bio: "English writer and philologist, best known for The Hobbit and The Lord of the Rings",
+  },
+  asimov: {
+    authorFirstName: "Isaac",
+    authorLastName: "Asimov",
+    birthday: "1920-01-02",
+    bio: "American author and biochemist, prolific writer of science fiction and popular science",
+  },
+}
+
+const books = {
+  hobbit: {
+    bookId: "b-hobbit",
+    bookTitle: "The Hobbit",
+    description: "A fantasy novel about the adventures of Bilbo Baggins",
+    publisher: "George Allen & Unwin",
+    releaseDate: "1937-09-21",
+    authorFirstName: "J.R.R.",
+    authorLastName: "Tolkien",
+    isbn: "978-0-547-928227",
+  },
+  foundation: {
+    bookId: "b-foundation",
+    bookTitle: "Foundation",
+    description: "A science fiction novel about the fall of a galactic empire",
+    publisher: "Gnome Press",
+    releaseDate: "1951-06-01",
+    authorFirstName: "Isaac",
+    authorLastName: "Asimov",
+    isbn: "978-0-553-293357",
+  },
+  iRobot: {
+    bookId: "b-irobot",
+    bookTitle: "I, Robot",
+    description: "A collection of nine science fiction short stories about robots",
+    publisher: "Gnome Press",
+    releaseDate: "1950-12-02",
+    authorFirstName: "Isaac",
+    authorLastName: "Asimov",
+    isbn: "978-0-553-294385",
+  },
+}
+
+const genres = {
+  hobbitFantasy: {
+    genre: "Fantasy",
+    subgenre: "High Fantasy",
+    isbn: "978-0-547-928227",
+    bookTitle: "The Hobbit",
+    authorFirstName: "J.R.R.",
+    authorLastName: "Tolkien",
+  },
+  foundationSciFi: {
+    genre: "Sci-Fi",
+    subgenre: "Space Opera",
+    isbn: "978-0-553-293357",
+    bookTitle: "Foundation",
+    authorFirstName: "Isaac",
+    authorLastName: "Asimov",
+  },
+  iRobotSciFi: {
+    genre: "Sci-Fi",
+    subgenre: "Robotics",
+    isbn: "978-0-553-294385",
+    bookTitle: "I, Robot",
+    authorFirstName: "Isaac",
+    authorLastName: "Asimov",
+  },
+}
+
+const members = {
+  alice: {
+    memberId: "m-alice",
+    membershipStartDate: "2023-01-15",
+    membershipEndDate: "2026-01-15",
+    city: "New York",
+    state: "NY",
+  },
+  bob: {
+    memberId: "m-bob",
+    membershipStartDate: "2024-03-01",
+    membershipEndDate: "2027-03-01",
+    city: "Los Angeles",
+    state: "CA",
+  },
+}
+```
+
+```typescript title="seed.ts"
+import { DynamoClient } from "effect-dynamodb"
+
+const {
+  Authors: boundAuthors,
+  Books: boundBooks,
+  Genres: boundGenres,
+  Members: boundMembers,
+} = yield* DynamoClient.make(LibTable)
+
+// Seed all data
+for (const author of Object.values(authors)) {
+  yield* boundAuthors.put(author)
+}
+for (const book of Object.values(books)) {
+  yield* boundBooks.put(book)
+}
+for (const g of Object.values(genres)) {
+  yield* boundGenres.put(g)
+}
+for (const member of Object.values(members)) {
+  yield* boundMembers.put(member)
+}
+```
+
+---
+
+## Step 4: Fulfilling the Requirements
+
+### Requirement 1: Get Author by Name
+
+> As a librarian, look up an author by name.
+
+Author's primary key uses `authorLastName` as PK and `authorFirstName` as SK, enabling direct gets by full name.
+
+```typescript
+const tolkien = yield* boundAuthors.get({
+  authorLastName: "Tolkien",
+  authorFirstName: "J.R.R.",
+})
+// tolkien.birthday → "1892-01-03"
+// tolkien.bio → "English writer and philologist..."
+
+const asimov = yield* boundAuthors.get({
+  authorLastName: "Asimov",
+  authorFirstName: "Isaac",
+})
+// asimov.birthday → "1920-01-02"
+```
+
+### Requirement 2: Book + Genre Details by ISBN
+
+> As a patron, get book and genre details for a specific ISBN.
+
+Book and Genre share the same primary partition key (`isbn`). Querying each entity by ISBN retrieves related items from the same item collection.
+
+```typescript
+// Get the book
+const hobbit = yield* boundBooks.get({
+  isbn: "978-0-547-928227",
+  bookId: "b-hobbit",
+})
+// hobbit.bookTitle → "The Hobbit"
+// hobbit.publisher → "George Allen & Unwin"
+
+// Get the genre for the same ISBN
+const hobbitGenre = yield* boundGenres.get({
+  isbn: "978-0-547-928227",
+  genre: "Fantasy",
+  subgenre: "High Fantasy",
+})
+// hobbitGenre.genre → "Fantasy"
+// hobbitGenre.subgenre → "High Fantasy"
+```
+
+### Requirement 3: Author's Works (Works Collection)
+
+> As a catalog system, retrieve all of an author's books and genres.
+
+Author, Book, and Genre share GSI2 via the `works` collection. All three use `authorLastName + authorFirstName` as the partition key, so a single partition holds the author's complete catalog.
+
+```typescript
+import { Query } from "effect-dynamodb"
+
+// Asimov's books
+const asimovBooks = yield* boundBooks.collect(
+  Books.query.author({ authorLastName: "Asimov", authorFirstName: "Isaac" }),
+)
+// → [{ bookTitle: "Foundation", ... }, { bookTitle: "I, Robot", ... }]
+
+// Asimov's genres
+const asimovGenres = yield* boundGenres.collect(
+  Genres.query.author({ authorLastName: "Asimov", authorFirstName: "Isaac" }),
+)
+// → [{ subgenre: "Space Opera", ... }, { subgenre: "Robotics", ... }]
+
+// Author's own record in the works collection
+const tolkienInfo = yield* boundAuthors.collect(
+  Authors.query.info({ authorLastName: "Tolkien", authorFirstName: "J.R.R." }),
+)
+// → [{ birthday: "1892-01-03", bio: "...", ... }]
+```
+
+All three queries hit GSI2 with the same partition key. DynamoDB serves them from the same item collection -- three entity types, one efficient read.
+
+### Requirement 4: Member Account (Account Collection)
+
+> As an account system, show a member's profile alongside their loaned books.
+
+Member and Book share GSI1 via the `account` collection. Both use `memberId` as the partition key.
+
+```typescript
+// Member profile
+const aliceAccount = yield* boundMembers.collect(
+  Members.query.account({ memberId: "m-alice" }),
+)
+// → [{ memberId: "m-alice", city: "New York", state: "NY", ... }]
+
+// Alice's loaned books (initially empty -- sparse index)
+const aliceLoans = yield* boundBooks.collect(
+  Books.query.loans({ memberId: "m-alice" }),
+)
+// → [] (no books loaned yet)
+```
+
+Books only appear in the `loans` index when `memberId` and `loanEndDate` are populated. This is the sparse index pattern in action.
+
+### Requirement 5: Books by Title (Titles Collection)
+
+> Search for books and genres by title.
+
+Book and Genre share GSI3 via the `titles` collection. Both use `bookTitle` as the partition key.
+
+```typescript
+const foundationByTitle = yield* boundBooks.collect(
+  Books.query.releases({ bookTitle: "Foundation" }),
+)
+// → [{ isbn: "978-0-553-293357", releaseDate: "1951-06-01", ... }]
+
+const foundationGenres = yield* boundGenres.collect(
+  Genres.query.title({ bookTitle: "Foundation" }),
+)
+// → [{ genre: "Sci-Fi", subgenre: "Space Opera", ... }]
+```
+
+### Requirement 6: Genre Categories
+
+> Browse all books in a genre category.
+
+Genre's `categories` index on GSI1 is a **standalone** index (not part of a collection). It uses `genre` as PK and `subgenre` as SK for hierarchical browsing.
+
+```typescript
+// All Sci-Fi subgenres
+const sciFiGenres = yield* boundGenres.collect(
+  Genres.query.categories({ genre: "Sci-Fi" }),
+)
+// → [
+//   { subgenre: "Robotics", bookTitle: "I, Robot", ... },
+//   { subgenre: "Space Opera", bookTitle: "Foundation", ... },
+// ]
+
+// All Fantasy subgenres
+const fantasyGenres = yield* boundGenres.collect(
+  Genres.query.categories({ genre: "Fantasy" }),
+)
+// → [{ subgenre: "High Fantasy", bookTitle: "The Hobbit", ... }]
+```
+
+### Requirement 7: Loan a Book (Sparse Index)
+
+> As circulation, loan a book to a member so it appears in their account.
+
+Updating a book's `memberId` and `loanEndDate` populates the GSI1 composites, causing the book to **appear** in the loans sparse index. Before the update, those fields are absent, so the book is invisible in GSI1.
+
+```typescript
+yield* boundBooks.update(
+  { isbn: "978-0-547-928227", bookId: "b-hobbit" },
+  Books.set({
+    memberId: "m-alice",
+    loanEndDate: "2025-04-01",
+    // Must provide all GSI composites for affected indexes
+    authorLastName: "Tolkien",
+    authorFirstName: "J.R.R.",
+    bookTitle: "The Hobbit",
+    releaseDate: "1937-09-21",
+  }),
+)
+
+// Now the book appears in Alice's loans
+const aliceLoans = yield* boundBooks.collect(
+  Books.query.loans({ memberId: "m-alice" }),
+)
+// → [{ bookTitle: "The Hobbit", isbn: "978-0-547-928227", ... }]
+
+// Bob still has no loans
+const bobLoans = yield* boundBooks.collect(
+  Books.query.loans({ memberId: "m-bob" }),
+)
+// → []
+```
+
+When you update fields that participate in GSI composites, you must provide **all** composites for every affected GSI. Here the update touches `memberId` (loans GSI1), so `loanEndDate` is also required. The author and title fields are needed for GSI2 and GSI3 recomposition.
+
+### Requirement 8: Return a Book (Transaction)
+
+> As circulation, return a book by clearing the loan and removing it from the loans index.
+
+To return a book, re-put it without the loan fields. Since `memberId` and `loanEndDate` are omitted, the book drops out of the sparse loans index. `Transaction.transactWrite` ensures the operation is atomic.
+
+```typescript
+import { Transaction } from "effect-dynamodb"
+
+yield* Transaction.transactWrite([
+  Books.put({
+    bookId: "b-hobbit",
+    bookTitle: "The Hobbit",
+    description: "A fantasy novel about the adventures of Bilbo Baggins",
+    publisher: "George Allen & Unwin",
+    releaseDate: "1937-09-21",
+    authorFirstName: "J.R.R.",
+    authorLastName: "Tolkien",
+    isbn: "978-0-547-928227",
+    // memberId and loanEndDate intentionally omitted -- clears the loan
+  }),
+])
+
+// Book is no longer in Alice's loans
+const aliceLoansCleared = yield* boundBooks.collect(
+  Books.query.loans({ memberId: "m-alice" }),
+)
+// → []
+
+// But the book still exists and is intact
+const returnedHobbit = yield* boundBooks.get({
+  isbn: "978-0-547-928227",
+  bookId: "b-hobbit",
+})
+// returnedHobbit.bookTitle → "The Hobbit"
+// returnedHobbit.memberId → undefined (cleared)
+
+// And still appears in author's works
+const tolkienBooks = yield* boundBooks.collect(
+  Books.query.author({ authorLastName: "Tolkien", authorFirstName: "J.R.R." }),
+)
+// → [{ bookTitle: "The Hobbit", ... }]
+```
+
+---
+
+## Running the Example
+
+The complete runnable example is at [`examples/library-system.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/library-system.ts) in the repository. It seeds data, runs all 8 access patterns, and verifies each with assertions.
+
+```bash
+docker run -d -p 8000:8000 amazon/dynamodb-local
+```
+
+```bash
+npx tsx examples/library-system.ts
+```
+
+### Layer Setup
+
+The example wires dependencies via Effect Layers -- no global config or constructor options:
+
+```typescript title="main.ts"
+import { Effect, Layer } from "effect"
+import { DynamoClient } from "effect-dynamodb"
+
+const AppLayer = Layer.mergeAll(
+  DynamoClient.layer({
+    region: "us-east-1",
+    endpoint: "http://localhost:8000",
+    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  }),
+  LibTable.layer({ name: "library-table" }),
+)
+
+const main = program.pipe(Effect.provide(AppLayer))
+
+Effect.runPromise(main).then(
+  () => console.log("Done."),
+  (err) => console.error("Failed:", err),
+)
+```
+
+---
+
+## Key Takeaways
+
+| Concept | How it's used |
+|---------|---------------|
+| **Single-table design** | 4 entities, 1 table, structured key values |
+| **Index overloading** | GSI1 serves book loans, genre categories, and member accounts |
+| **Collections** | `works` (GSI2), `account` (GSI1), and `titles` (GSI3) enable cross-entity queries |
+| **Sparse index** | Book loans GSI only populated when `memberId` + `loanEndDate` are present |
+| **All-or-none GSI updates** | Loaning a book requires all composites for every affected GSI |
+| **Transactions** | Atomic book returns via `Transaction.transactWrite` |
+| **Optional fields drive visibility** | `Schema.optional` fields control sparse index membership |
+
+## What's Next?
+
+- [Modeling Guide](/effect-dynamodb/guides/modeling/) -- Deep dive into models, schemas, tables, and entities
+- [Indexes & Collections](/effect-dynamodb/guides/indexes/) -- Access pattern design and collection patterns
+- [Human Resources](/effect-dynamodb/tutorials/human-resources/) -- Similar patterns with soft delete and restore
+- [Task Manager](/effect-dynamodb/tutorials/task-manager/) -- Status workflows, range queries, and soft delete archival

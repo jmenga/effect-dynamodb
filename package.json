@@ -8,7 +8,9 @@
     "test": "pnpm -r test",
     "check": "pnpm -r check",
     "lint": "biome check .",
-    "lint:fix": "biome check --write ."
+    "lint:fix": "biome check --write .",
+    "docs:dev": "pnpm --filter @effect-dynamodb/docs dev",
+    "docs:build": "pnpm --filter @effect-dynamodb/docs build"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.4"
@@ -16,7 +18,8 @@
   "pnpm": {
     "onlyBuiltDependencies": [
       "esbuild",
-      "msgpackr-extract"
+      "msgpackr-extract",
+      "sharp"
     ]
   }
 }

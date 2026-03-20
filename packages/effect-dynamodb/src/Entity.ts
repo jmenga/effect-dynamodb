@@ -8,16 +8,16 @@
  */
 
 import type { AttributeValue, DeleteItemCommandInput } from "@aws-sdk/client-dynamodb"
-import { Duration, Effect, Schema } from "effect"
+import { Duration, Effect, Schema, Stream } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import {
   type ConfiguredModel,
   type DynamoEncoding,
+  type ExtractIdentifier,
   getEncoding,
   getIdentifierField,
   isConfiguredModel,
   isHidden,
-  isImmutable,
   isRef,
   isRefField,
 } from "./DynamoModel.js"
@@ -34,7 +34,16 @@ import {
   UniqueConstraintViolation,
   ValidationError,
 } from "./Errors.js"
-import { condition as buildConditionExpression, type ConditionInput } from "./Expression.js"
+import type { ConditionInput } from "./Expression.js"
+import {
+  compileExpr,
+  createConditionOps,
+  type Expr,
+  isExpr,
+  parseShorthand,
+  parseSimpleShorthand,
+} from "./internal/Expr.js"
+import { compilePath, createPathBuilder } from "./internal/PathBuilder.js"
 import type { IndexDefinition, KeyPart } from "./KeyComposer.js"
 import * as KeyComposer from "./KeyComposer.js"
 import {
@@ -45,7 +54,8 @@ import {
   toAttributeValue,
 } from "./Marshaller.js"
 import * as Query from "./Query.js"
-import type { Table, TableConfig } from "./Table.js"
+import { filterExpr, selectPaths } from "./Query.js"
+import type { TableConfig } from "./Table.js"
 
 // Internal modules (decomposed from Entity.ts)
 export type {
@@ -58,7 +68,7 @@ export type {
   UniqueConstraintDef,
   UniqueFieldsDef,
   VersionedConfig,
-} from "./_EntityConfig.js"
+} from "./internal/EntityConfig.js"
 export {
   type CascadeConfig,
   type CascadeTarget,
@@ -81,7 +91,7 @@ export {
   type ReturnValuesMode,
   returnValuesMap,
   type UpdateState,
-} from "./_EntityOps.js"
+} from "./internal/EntityOps.js"
 
 import {
   type CascadeConfig,
@@ -102,7 +112,7 @@ import {
   type ReturnValuesMode,
   returnValuesMap,
   type UpdateState,
-} from "./_EntityOps.js"
+} from "./internal/EntityOps.js"
 import * as Projection from "./Projection.js"
 
 export {
@@ -113,29 +123,41 @@ export {
   asNative,
   asRecord,
   cascade,
-  condition,
   consistentRead,
   deleteFromSet,
   expectedVersion,
+  pathAdd,
+  pathAppend,
+  pathDelete,
+  pathIfNotExists,
+  pathPrepend,
+  pathRemove,
+  pathSet,
+  pathSubtract,
   project,
   remove,
   returnValues,
   set,
   subtract,
-} from "./_EntityCombinators.js"
+} from "./internal/EntityCombinators.js"
 
-import { asModel, expectedVersion, set } from "./_EntityCombinators.js"
+import {
+  asModel,
+  condition as conditionCombinator,
+  expectedVersion,
+  set,
+} from "./internal/EntityCombinators.js"
 import type {
   CascadeIndexConfig,
   SoftDeleteConfig,
   TimestampsConfig,
   UniqueConfig,
   VersionedConfig,
-} from "./_EntityConfig.js"
+} from "./internal/EntityConfig.js"
 
 /** A ref config object: the entity and optional cascade index config. */
 interface AnyRefValue {
-  readonly entity: Entity<any, any, any, any, any, any, any, any>
+  readonly entity: Entity<any, any, any, any, any, any, any, any, any>
   readonly cascade?: CascadeIndexConfig
 }
 
@@ -150,11 +172,12 @@ import {
   type ResolvedSystemFields,
   resolveSystemFields,
   resolveUniqueFields,
-} from "./_EntitySchemas.js"
+} from "./internal/EntitySchemas.js"
 import type {
   EntityInputType,
   EntityKeyType,
   EntityRecordType,
+  EntityRefCreateType,
   EntityRefInputType,
   EntityRefUpdateType,
   EntityUpdateType,
@@ -162,7 +185,7 @@ import type {
   ModelType,
   PrimaryKeyComposites,
   RefErrors,
-} from "./_EntityTypes.js"
+} from "./internal/EntityTypes.js"
 
 // ---------------------------------------------------------------------------
 // Re-export KeyComposer types for convenience
@@ -178,21 +201,20 @@ export type { IndexDefinition, KeyPart }
  * An Entity binds a domain model to a DynamoDB Table with index definitions,
  * system field configuration, unique constraints, and CRUD operations.
  *
- * Created via {@link make}. Operations are called directly on the entity:
- * `Users.get(...)`, `Users.put(...)`, `Users.query.byTenant(...)`.
+ * Created via {@link make}. Returns a definition with descriptor builders.
+ * Table association and binding happen via `DynamoClient.make(table)`.
  *
  * @typeParam TModel - Effect Schema defining the domain model
- * @typeParam TTable - Table this entity belongs to
  * @typeParam TEntityType - Literal string discriminator stored as `__edd_e__`
  * @typeParam TIndexes - Index definitions (primary + GSIs)
  * @typeParam TTimestamps - Timestamp configuration
  * @typeParam TVersioned - Optimistic locking configuration
  * @typeParam TSoftDelete - Soft-delete configuration
  * @typeParam TUnique - Unique constraint definitions
+ * @typeParam TIdentifier - Identifier field name (auto-generated, omitted from Create type)
  */
 export interface Entity<
   TModel extends Schema.Top = Schema.Top,
-  TTable extends Table = Table,
   TEntityType extends string = string,
   TIndexes extends globalThis.Record<string, IndexDefinition> = globalThis.Record<
     string,
@@ -203,16 +225,17 @@ export interface Entity<
   TSoftDelete extends SoftDeleteConfig | undefined = SoftDeleteConfig | undefined,
   TUnique extends UniqueConfig | undefined = UniqueConfig | undefined,
   TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
+  TIdentifier extends string | undefined = undefined,
 > {
   readonly _tag: "Entity"
   readonly model: TModel
-  readonly table: TTable
   readonly entityType: TEntityType
   readonly indexes: TIndexes
   readonly timestamps: TTimestamps
   readonly versioned: TVersioned
   readonly softDelete: TSoftDelete
   readonly unique: TUnique
+  readonly identifier: TIdentifier
 
   /** @internal Resolved ref metadata — used by cascade to inspect target entities */
   readonly _resolvedRefs: ReadonlyArray<{
@@ -221,6 +244,25 @@ export interface Entity<
     readonly identifierField: string
     readonly refEntityType: string
   }>
+
+  /** @internal Full decode pipeline: rename + date deser + schema decode. Used by Batch/Aggregate. */
+  readonly _decodeRecord: (
+    raw: globalThis.Record<string, unknown>,
+  ) => Effect.Effect<any, ValidationError>
+
+  /**
+   * @internal Configure the entity with table schema and tag.
+   * Called by DynamoClient.make() when binding entities to a table.
+   */
+  readonly _configure: (
+    schema: DynamoSchema.DynamoSchema,
+    tableTag: import("effect").ServiceMap.Service<TableConfig, TableConfig>,
+  ) => void
+
+  /** @internal Injected DynamoSchema — available after _configure(). Used by cascade. */
+  readonly _schema: DynamoSchema.DynamoSchema
+  /** @internal Injected TableConfig tag — available after _configure(). Used by cascade. */
+  readonly _tableTag: import("effect").ServiceMap.Service<TableConfig, TableConfig>
 
   /** Resolved system field names */
   readonly systemFields: ResolvedSystemFields
@@ -253,9 +295,7 @@ export interface Entity<
    * })
    * ```
    */
-  readonly createSchema: Schema.Codec<
-    Omit<EntityRefInputType<TModel, TRefs>, PrimaryKeyComposites<TIndexes>>
-  >
+  readonly createSchema: Schema.Codec<EntityRefCreateType<TModel, TIndexes, TRefs, TIdentifier>>
 
   /**
    * Typed update schema. Partial fields minus primary key composites and immutable fields.
@@ -475,6 +515,86 @@ export interface Entity<
 
   /** Scan all items of this entity type. Returns a {@link Query.Query} that uses DynamoDB Scan. */
   readonly scan: () => Query.Query<ModelType<TModel>>
+
+  // --- Expression Combinators (callback + shorthand) ---
+
+  /**
+   * Build a condition expression combinator.
+   * Callback receives `(t, ops)` where `t` is a PathBuilder and `ops` provides comparison functions.
+   * Shorthand accepts a simple object for AND-equality conditions.
+   *
+   * @example
+   * ```typescript
+   * // Callback
+   * Teams.condition((t, { eq }) => eq(t.status, "active"))
+   * // Shorthand
+   * Teams.condition({ status: "active" })
+   * ```
+   */
+  readonly condition: {
+    (
+      cb: (
+        t: import("./internal/PathBuilder.js").PathBuilder<ModelType<TModel>, ModelType<TModel>>,
+        ops: import("./internal/Expr.js").ConditionOps<ModelType<TModel>>,
+      ) => import("./internal/Expr.js").Expr,
+    ): <
+      T extends
+        | EntityPut<any, any, any, any>
+        | EntityUpdate<any, any, any, any, any>
+        | EntityDelete<any, any>,
+    >(
+      self: T,
+    ) => T
+    (
+      shorthand: globalThis.Record<string, unknown>,
+    ): <
+      T extends
+        | EntityPut<any, any, any, any>
+        | EntityUpdate<any, any, any, any, any>
+        | EntityDelete<any, any>,
+    >(
+      self: T,
+    ) => T
+  }
+
+  /**
+   * Build a filter expression for query/scan operations.
+   * Same API as `condition()` — callback or shorthand.
+   *
+   * @example
+   * ```typescript
+   * teams.collect(Teams.query.byAll(pk), Teams.filter((t, { gt }) => gt(t.wins, 10)))
+   * ```
+   */
+  readonly filter: {
+    (
+      cb: (
+        t: import("./internal/PathBuilder.js").PathBuilder<ModelType<TModel>, ModelType<TModel>>,
+        ops: import("./internal/Expr.js").ConditionOps<ModelType<TModel>>,
+      ) => import("./internal/Expr.js").Expr,
+    ): <A>(self: Query.Query<A>) => Query.Query<A>
+    (shorthand: globalThis.Record<string, unknown>): <A>(self: Query.Query<A>) => Query.Query<A>
+  }
+
+  /**
+   * Build a select (projection) combinator for get/query/scan operations.
+   * Callback receives `t` — a PathBuilder. Returns an array of paths to project.
+   * String array shorthand for top-level only projections.
+   *
+   * @example
+   * ```typescript
+   * Teams.select((t) => [t.name, t.address.city])
+   * Teams.select(["name", "status"])
+   * ```
+   */
+  readonly select: {
+    (
+      cb: (
+        t: import("./internal/PathBuilder.js").PathBuilder<ModelType<TModel>, ModelType<TModel>>,
+      ) => ReadonlyArray<import("./internal/PathBuilder.js").Path<ModelType<TModel>, any>>,
+    ): (self: Query.Query<any>) => Query.Query<any>
+    (attributes: ReadonlyArray<string>): (self: Query.Query<any>) => Query.Query<any>
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -492,11 +612,11 @@ export interface Entity<
  * ```typescript
  * export class TeamService extends ServiceMap.Service<TeamService>()("TeamService", {
  *   make: Effect.gen(function* () {
- *     const teams = yield* Entity.bind(Teams)
+ *     const { Teams: teams } = yield* DynamoClient.make(MainTable)
  *     return {
  *       get: (id: TeamId) => teams.get({ id }),           // R = never
  *       create: (input) => teams.create({ ...input }),     // R = never
- *       list: (filter) => teams.execute(Teams.query.byAll(filter)), // R = never
+ *       list: (filter) => teams.execute(teams.query.byAll(filter)), // R = never
  *     }
  *   }),
  * }) {}
@@ -507,23 +627,31 @@ export interface BoundEntity<
   TIndexes extends globalThis.Record<string, IndexDefinition>,
   TRefs extends globalThis.Record<string, AnyRefValue> | undefined,
 > {
-  /** Fetch an item by primary key. */
+  // --- CRUD Operations ---
+
+  /** Fetch an item by primary key. Returns an Effect that resolves to the model type. */
   readonly get: (
     key: EntityKeyType<TModel, TIndexes>,
   ) => Effect.Effect<ModelType<TModel>, ItemNotFound | DynamoClientError | ValidationError, never>
 
-  /** Create or replace an item. */
+  /** Create or replace an item. Accepts optional combinators (e.g. `Entity.condition(...)`). */
   readonly put: (
     input: EntityRefInputType<TModel, TRefs>,
+    ...combinators: ReadonlyArray<
+      (op: EntityPut<any, any, any, any>) => EntityPut<any, any, any, any>
+    >
   ) => Effect.Effect<
     ModelType<TModel>,
     DynamoClientError | ValidationError | UniqueConstraintViolation | RefErrors<TRefs>,
     never
   >
 
-  /** Create a new item. Fails if primary key already exists. */
+  /** Create a new item. Fails if primary key already exists. Accepts optional combinators. */
   readonly create: (
     input: EntityRefInputType<TModel, TRefs>,
+    ...combinators: ReadonlyArray<
+      (op: EntityPut<any, any, any, any>) => EntityPut<any, any, any, any>
+    >
   ) => Effect.Effect<
     ModelType<TModel>,
     | DynamoClientError
@@ -534,10 +662,18 @@ export interface BoundEntity<
     never
   >
 
-  /** Update an item with partial fields. */
+  /**
+   * Update an existing item. Applies combinators and returns an Effect.
+   *
+   * ```ts
+   * yield* teams.update({ id }, Entity.set(updates), Entity.expectedVersion(3))
+   * ```
+   */
   readonly update: (
     key: EntityKeyType<TModel, TIndexes>,
-    updates: EntityRefUpdateType<TModel, TIndexes, TRefs>,
+    ...combinators: ReadonlyArray<
+      (op: EntityUpdate<any, any, any, any, any>) => EntityUpdate<any, any, any, any, any>
+    >
   ) => Effect.Effect<
     ModelType<TModel>,
     | DynamoClientError
@@ -549,41 +685,141 @@ export interface BoundEntity<
     never
   >
 
-  /** Delete an item by primary key. */
+  /** Delete an item by primary key. Accepts optional combinators (e.g. `Entity.condition(...)`). */
   readonly delete: (
     key: EntityKeyType<TModel, TIndexes>,
+    ...combinators: ReadonlyArray<(op: EntityDelete<any, any>) => EntityDelete<any, any>>
   ) => Effect.Effect<void, DynamoClientError | ItemNotFound, never>
 
-  /** Index query accessors (same as Entity — queries are pure data). */
-  readonly query: {
-    readonly [K in Exclude<keyof TIndexes, "primary">]: (
-      pk: IndexPkInput<TModel, TIndexes, K>,
-    ) => Query.Query<ModelType<TModel>>
+  /**
+   * Create or update an item atomically. Uses DynamoDB UpdateItem with `if_not_exists()`
+   * for immutable fields and createdAt so they're only set on first creation.
+   * Accepts optional combinators.
+   */
+  readonly upsert: (
+    input: EntityRefInputType<TModel, TRefs>,
+    ...combinators: ReadonlyArray<
+      (op: EntityPut<any, any, any, any>) => EntityPut<any, any, any, any>
+    >
+  ) => Effect.Effect<
+    ModelType<TModel>,
+    DynamoClientError | ValidationError | ItemNotFound | ConditionalCheckFailed | RefErrors<TRefs>,
+    never
+  >
+
+  /**
+   * Update an existing item. Fails with `ConditionalCheckFailed` if the item doesn't exist.
+   * Applies combinators and returns an Effect.
+   *
+   * ```ts
+   * yield* teams.patch({ id }, Entity.set(updates))
+   * ```
+   */
+  readonly patch: (
+    key: EntityKeyType<TModel, TIndexes>,
+    ...combinators: ReadonlyArray<
+      (op: EntityUpdate<any, any, any, any, any>) => EntityUpdate<any, any, any, any, any>
+    >
+  ) => Effect.Effect<
+    ModelType<TModel>,
+    | DynamoClientError
+    | ItemNotFound
+    | OptimisticLockError
+    | UniqueConstraintViolation
+    | ValidationError
+    | ConditionalCheckFailed
+    | RefErrors<TRefs>,
+    never
+  >
+
+  /** Delete an existing item, fails if not found. Accepts optional combinators. */
+  readonly deleteIfExists: (
+    key: EntityKeyType<TModel, TIndexes>,
+    ...combinators: ReadonlyArray<(op: EntityDelete<any, any>) => EntityDelete<any, any>>
+  ) => Effect.Effect<void, DynamoClientError | ItemNotFound | ConditionalCheckFailed, never>
+
+  // --- Lifecycle Operations ---
+
+  /** Fetch a specific version snapshot by version number. */
+  readonly getVersion: (
+    key: EntityKeyType<TModel, TIndexes>,
+    version: number,
+  ) => Effect.Effect<ModelType<TModel>, ItemNotFound | DynamoClientError | ValidationError, never>
+
+  /** Restore a soft-deleted item. */
+  readonly restore: (
+    key: EntityKeyType<TModel, TIndexes>,
+  ) => Effect.Effect<
+    ModelType<TModel>,
+    ItemNotFound | DynamoClientError | ValidationError | UniqueConstraintViolation,
+    never
+  >
+
+  /** Permanently remove an item plus all version history and sentinels. */
+  readonly purge: (
+    key: EntityKeyType<TModel, TIndexes>,
+  ) => Effect.Effect<void, DynamoClientError | ValidationError, never>
+
+  /** Soft-deleted item accessors. */
+  readonly deleted: {
+    /** Get a specific soft-deleted item. */
+    readonly get: (
+      key: EntityKeyType<TModel, TIndexes>,
+    ) => Effect.Effect<ModelType<TModel>, ItemNotFound | DynamoClientError | ValidationError, never>
   }
 
-  /** Scan all items of this entity type. */
-  readonly scan: () => Query.Query<ModelType<TModel>>
+  // --- Query Execution ---
 
-  /** Execute a query (single page) with services pre-resolved. */
-  readonly execute: <A>(
+  /**
+   * Execute a query and return a lazy Stream of items. Automatically paginates through all pages.
+   * Accepts optional query combinators (e.g. `Query.limit(...)`, `Query.reverse`).
+   *
+   * ```ts
+   * const stream = teams.paginate(Teams.query.byRole({ role: "admin" }), Query.limit(10))
+   * ```
+   */
+  readonly paginate: <A>(
     query: Query.Query<A>,
-  ) => Effect.Effect<Query.Page<A>, DynamoClientError | ValidationError, never>
+    ...combinators: ReadonlyArray<(q: Query.Query<A>) => Query.Query<A>>
+  ) => Stream.Stream<A, DynamoClientError | ValidationError, never>
 
-  /** Execute a query and collect all pages with services pre-resolved. */
+  /**
+   * Execute a query and collect all pages into a single array.
+   * Accepts optional query combinators (e.g. `Query.limit(...)`, `Query.reverse`).
+   *
+   * ```ts
+   * const items = yield* teams.collect(Teams.query.byRole({ role: "admin" }), Query.limit(10))
+   * ```
+   */
   readonly collect: <A>(
     query: Query.Query<A>,
+    ...combinators: ReadonlyArray<(q: Query.Query<A>) => Query.Query<A>>
   ) => Effect.Effect<Array<A>, DynamoClientError | ValidationError, never>
-
-  /** Eliminate DynamoClient | TableConfig from any effect using the pre-resolved context.
-   *  Escape hatch for advanced combinators (e.g. Entity.cascade) not covered by the simplified API. */
-  readonly provide: <A, E>(
-    effect: Effect.Effect<A, E, DynamoClient | TableConfig>,
-  ) => Effect.Effect<A, E, never>
 }
 
 // ---------------------------------------------------------------------------
 // Transaction limit pre-check (100-item DynamoDB limit)
 // ---------------------------------------------------------------------------
+
+/**
+ * Compile a condition that may be either an Expr ADT node or a ConditionInput object.
+ * Routes both paths through the Expr ADT compiler for a single compilation backend.
+ * Returns undefined if the condition is undefined.
+ */
+const compileCondition = (
+  cond: Expr | ConditionInput | undefined,
+  resolveDbNameFn?: (name: string) => string,
+):
+  | {
+      expression: string
+      names: globalThis.Record<string, string>
+      values: globalThis.Record<string, import("@aws-sdk/client-dynamodb").AttributeValue>
+    }
+  | undefined => {
+  if (cond === undefined) return undefined
+  const expr = isExpr(cond) ? cond : parseShorthand(cond)
+  return compileExpr(expr, resolveDbNameFn)
+}
 
 const TRANSACTION_LIMIT = 100
 
@@ -613,7 +849,6 @@ const checkTransactionLimit = (
  *
  * @param config - Entity configuration
  * @param config.model - Effect Schema class or struct defining the domain model
- * @param config.table - Table this entity belongs to
  * @param config.entityType - Literal string discriminator stored as `__edd_e__`
  * @param config.indexes - ElectroDB-style composite key definitions (must include `primary`)
  * @param config.timestamps - Automatic `createdAt` / `updatedAt` fields
@@ -639,7 +874,6 @@ const checkTransactionLimit = (
  */
 export const make = <
   TModel extends Schema.Top,
-  TTable extends Table,
   const TEntityType extends string,
   const TIndexes extends globalThis.Record<string, IndexDefinition> & {
     readonly primary: IndexDefinition
@@ -649,9 +883,9 @@ export const make = <
   const TSoftDelete extends SoftDeleteConfig | undefined = undefined,
   const TUnique extends UniqueConfig | undefined = undefined,
   const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
+  const TAttrs extends {} = {},
 >(config: {
-  readonly model: TModel | ConfiguredModel<TModel>
-  readonly table: TTable
+  readonly model: TModel | ConfiguredModel<TModel, TAttrs>
   readonly entityType: TEntityType
   readonly indexes: TIndexes
   readonly timestamps?: TTimestamps
@@ -661,14 +895,14 @@ export const make = <
   readonly refs?: TRefs
 }): Entity<
   TModel,
-  TTable,
   TEntityType,
   TIndexes,
   TTimestamps,
   TVersioned,
   TSoftDelete,
   TUnique,
-  TRefs
+  TRefs,
+  ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>
 > => {
   // Unwrap ConfiguredModel to get the raw model and attribute overrides
   const configured = isConfiguredModel(config.model) ? config.model : undefined
@@ -755,8 +989,30 @@ export const make = <
     ...cascadeIndexes,
   } as typeof config.indexes
 
-  const schemas = buildDerivedSchemas(modelFields, allIndexes, systemFields, resolvedRefs)
-  const schema = config.table.schema
+  // Build immutable fields set from ConfiguredModel (for update schema exclusion + upsert if_not_exists wrapping)
+  const immutableFields = new Set<string>()
+  for (const [fieldName, attrConfig] of Object.entries(configuredAttributes)) {
+    if (attrConfig.immutable) immutableFields.add(fieldName)
+  }
+
+  // Resolve identifier field name from model annotation
+  const resolvedIdentifier = getIdentifierField(config.model as Schema.Top)?.name
+
+  const schemas = buildDerivedSchemas(
+    modelFields,
+    allIndexes,
+    systemFields,
+    resolvedRefs,
+    immutableFields,
+    resolvedIdentifier,
+  )
+  // schema and tableTag are injected via _configure() when the entity is registered
+  // on a Table and bound through DynamoClient.make(table). They are captured by operation
+  // closures and resolved at runtime (inside Effects), not at definition time.
+  // Using definite assignment (!) since _configure is called before any operation executes.
+  let schema!: DynamoSchema.DynamoSchema
+  let tableTag!: import("effect").ServiceMap.Service<TableConfig, TableConfig>
+
   const entityType = config.entityType
   const entityVersion = 1
 
@@ -831,12 +1087,6 @@ export const make = <
 
   /** Resolve a domain field name to its DynamoDB attribute name. */
   const resolveDbName = (domainName: string): string => fieldRenames[domainName] ?? domainName
-
-  // Build immutable fields set (for upsert if_not_exists wrapping)
-  const immutableFields = new Set<string>()
-  for (const [fieldName, fieldSchema] of Object.entries(modelFields)) {
-    if (isImmutable(fieldSchema)) immutableFields.add(fieldName)
-  }
 
   /**
    * Convert domain date values to storage primitives for DynamoEncoding-annotated fields.
@@ -1133,10 +1383,10 @@ export const make = <
         if (!cascadeIdx) continue
 
         // Resolve target table name
-        const { name: targetTableName } = yield* target.table.Tag
+        const { name: targetTableName } = yield* target._tableTag
 
         // Compose GSI PK for the source entity's ID
-        const targetSchema = target.table.schema
+        const targetSchema = target._schema
         const gsiPkValue = KeyComposer.composePk(
           targetSchema,
           target.entityType,
@@ -1275,10 +1525,10 @@ export const make = <
 
   const put = (input: unknown) =>
     new EntityPutImpl(
-      (mode: DecodeMode, opts: { readonly condition: ConditionInput | undefined }) =>
+      (mode: DecodeMode, opts: { readonly condition: Expr | ConditionInput | undefined }) =>
         Effect.gen(function* () {
           const client = yield* DynamoClient
-          const { name: tableName } = yield* config.table.Tag
+          const { name: tableName } = yield* tableTag
 
           // Decode input
           const decodedInput = yield* Schema.decodeUnknownEffect(
@@ -1327,7 +1577,7 @@ export const make = <
 
           // Build user condition expression if provided
           const userCondition = opts.condition
-            ? buildConditionExpression(opts.condition)
+            ? compileCondition(opts.condition, resolveDbName)
             : undefined
 
           const hasUniqueConstraints =
@@ -1522,7 +1772,7 @@ export const make = <
       (mode: DecodeMode, opts: EntityGetOpts) =>
         Effect.gen(function* () {
           const client = yield* DynamoClient
-          const { name: tableName } = yield* config.table.Tag
+          const { name: tableName } = yield* tableTag
 
           // Decode key
           const decodedKey = yield* Schema.decodeUnknownEffect(
@@ -1591,7 +1841,7 @@ export const make = <
           const evExpected = uState.expectedVersion
           const userCond = uState.condition
           const client = yield* DynamoClient
-          const { name: tableName } = yield* config.table.Tag
+          const { name: tableName } = yield* tableTag
 
           // Decode key
           const decodedKey = yield* Schema.decodeUnknownEffect(
@@ -1835,7 +2085,7 @@ export const make = <
                 retainCondParts.push("#ver = :expectedVer")
               }
               if (userCond) {
-                const uc = buildConditionExpression(userCond)
+                const uc = compileCondition(userCond, resolveDbName)!
                 retainCondParts.push(`(${uc.expression})`)
                 Object.assign(retainNames, uc.names)
                 Object.assign(retainValues, uc.values)
@@ -2016,14 +2266,23 @@ export const make = <
                 return filtered
               })()
             : allIndexes
-          const gsiKeys = KeyComposer.composeGsiKeysForUpdate(
-            schema,
-            entityType,
-            entityVersion,
-            indexesForGsiUpdate,
-            hydratedUpdates as globalThis.Record<string, unknown>,
-            decodedKey as globalThis.Record<string, unknown>,
-          )
+          let gsiKeys: globalThis.Record<string, string>
+          try {
+            gsiKeys = KeyComposer.composeGsiKeysForUpdate(
+              schema,
+              entityType,
+              entityVersion,
+              indexesForGsiUpdate,
+              hydratedUpdates as globalThis.Record<string, unknown>,
+              decodedKey as globalThis.Record<string, unknown>,
+            )
+          } catch (e) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "update.gsiComposites",
+              cause: e instanceof Error ? e.message : e,
+            })
+          }
           for (const [field, value] of Object.entries(gsiKeys)) {
             const nameKey = `#u${counter}`
             const valKey = `:u${counter}`
@@ -2131,6 +2390,109 @@ export const make = <
             }
           }
 
+          // Path-based operations (from typed callback API)
+          const pathCounter = { value: 0 }
+
+          // Path SET operations
+          if (uState.pathSets) {
+            for (const op of uState.pathSets) {
+              const pathExpr = compilePath(op.segments, names, "ps", pathCounter, resolveDbName)
+              if (op.isPath && op.valueSegments) {
+                const srcExpr = compilePath(
+                  op.valueSegments,
+                  names,
+                  "ps",
+                  pathCounter,
+                  resolveDbName,
+                )
+                setClauses.push(`${pathExpr} = ${srcExpr}`)
+              } else {
+                const valKey = `:ps${pathCounter.value++}`
+                values[valKey] = toAttributeValue(op.value)
+                setClauses.push(`${pathExpr} = ${valKey}`)
+              }
+            }
+          }
+
+          // Path SUBTRACT operations
+          if (uState.pathSubtracts) {
+            for (const op of uState.pathSubtracts) {
+              const pathExpr = compilePath(op.segments, names, "psb", pathCounter, resolveDbName)
+              if (op.isPath && op.valueSegments) {
+                const srcExpr = compilePath(
+                  op.valueSegments,
+                  names,
+                  "psb",
+                  pathCounter,
+                  resolveDbName,
+                )
+                setClauses.push(`${pathExpr} = ${pathExpr} - ${srcExpr}`)
+              } else {
+                const valKey = `:psb${pathCounter.value++}`
+                values[valKey] = toAttributeValue(op.value)
+                setClauses.push(`${pathExpr} = ${pathExpr} - ${valKey}`)
+              }
+            }
+          }
+
+          // Path APPEND operations
+          if (uState.pathAppends) {
+            for (const op of uState.pathAppends) {
+              const pathExpr = compilePath(op.segments, names, "pa", pathCounter, resolveDbName)
+              const valKey = `:pa${pathCounter.value++}`
+              values[valKey] = toAttributeValue(op.value)
+              setClauses.push(`${pathExpr} = list_append(${pathExpr}, ${valKey})`)
+            }
+          }
+
+          // Path PREPEND operations
+          if (uState.pathPrepends) {
+            for (const op of uState.pathPrepends) {
+              const pathExpr = compilePath(op.segments, names, "pp", pathCounter, resolveDbName)
+              const valKey = `:pp${pathCounter.value++}`
+              values[valKey] = toAttributeValue(op.value)
+              setClauses.push(`${pathExpr} = list_append(${valKey}, ${pathExpr})`)
+            }
+          }
+
+          // Path if_not_exists operations
+          if (uState.pathIfNotExists) {
+            for (const op of uState.pathIfNotExists) {
+              const pathExpr = compilePath(op.segments, names, "pi", pathCounter, resolveDbName)
+              const valKey = `:pi${pathCounter.value++}`
+              values[valKey] = toAttributeValue(op.value)
+              setClauses.push(`${pathExpr} = if_not_exists(${pathExpr}, ${valKey})`)
+            }
+          }
+
+          // Path REMOVE operations
+          if (uState.pathRemoves) {
+            for (const segments of uState.pathRemoves) {
+              const pathExpr = compilePath(segments, names, "pr", pathCounter, resolveDbName)
+              removeClauses.push(pathExpr)
+            }
+          }
+
+          // Path ADD operations
+          if (uState.pathAdds) {
+            for (const op of uState.pathAdds) {
+              const pathExpr = compilePath(op.segments, names, "pad", pathCounter, resolveDbName)
+              const valKey = `:pad${pathCounter.value++}`
+              values[valKey] = toAttributeValue(op.value)
+              addClauses.push(`${pathExpr} ${valKey}`)
+            }
+          }
+
+          // Path DELETE operations
+          if (uState.pathDeletes) {
+            for (const op of uState.pathDeletes) {
+              const pathExpr = compilePath(op.segments, names, "pd", pathCounter, resolveDbName)
+              const valKey = `:pd${pathCounter.value++}`
+              values[valKey] = toAttributeValue(op.value)
+              deleteClauses.push(`${pathExpr} ${valKey}`)
+            }
+          }
+
           const hasAnyUpdate =
             setClauses.length > 0 ||
             removeClauses.length > 0 ||
@@ -2158,7 +2520,7 @@ export const make = <
             condParts.push("#condVer = :expectedVer")
           }
           if (userCond) {
-            const uc = buildConditionExpression(userCond)
+            const uc = compileCondition(userCond, resolveDbName)!
             condParts.push(`(${uc.expression})`)
             Object.assign(names, uc.names)
             Object.assign(values, uc.values)
@@ -2230,12 +2592,12 @@ export const make = <
   const del = (key: unknown) =>
     new EntityDeleteImpl(
       (opts: {
-        readonly condition: ConditionInput | undefined
+        readonly condition: Expr | ConditionInput | undefined
         readonly returnValues: ReturnValuesMode | undefined
       }) =>
         Effect.gen(function* () {
           const client = yield* DynamoClient
-          const { name: tableName } = yield* config.table.Tag
+          const { name: tableName } = yield* tableTag
 
           // Decode key
           const decodedKey = yield* Schema.decodeUnknownEffect(
@@ -2260,7 +2622,7 @@ export const make = <
 
           // Build user condition expression if provided
           const userCondition = opts.condition
-            ? buildConditionExpression(opts.condition)
+            ? compileCondition(opts.condition, resolveDbName)
             : undefined
 
           if (isSoftDeleteEnabled()) {
@@ -2472,10 +2834,10 @@ export const make = <
 
   const upsert = (input: unknown) =>
     new EntityPutImpl(
-      (mode: DecodeMode, opts: { readonly condition: ConditionInput | undefined }) =>
+      (mode: DecodeMode, opts: { readonly condition: Expr | ConditionInput | undefined }) =>
         Effect.gen(function* () {
           const client = yield* DynamoClient
-          const { name: tableName } = yield* config.table.Tag
+          const { name: tableName } = yield* tableTag
 
           // Decode input
           const decodedInput = yield* Schema.decodeUnknownEffect(
@@ -2598,7 +2960,7 @@ export const make = <
           // Optional user condition
           const condParts: Array<string> = []
           if (opts.condition) {
-            const uc = buildConditionExpression(opts.condition)
+            const uc = compileCondition(opts.condition, resolveDbName)!
             condParts.push(`(${uc.expression})`)
             Object.assign(names, uc.names)
             Object.assign(values, uc.values)
@@ -2656,7 +3018,7 @@ export const make = <
         skField: indexDef.sk.field,
         entityTypes: [entityType],
         decoder: (raw) => decodeRecord(raw),
-        resolveTableName: config.table.Tag.useSync((tc: TableConfig) => tc.name),
+        resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
       })
       if (hasSkComposites) {
         const skPrefix = KeyComposer.composeSortKeyPrefix(
@@ -2682,7 +3044,7 @@ export const make = <
       indexName: undefined,
       entityTypes: [entityType],
       decoder: (raw) => decodeRecord(raw),
-      resolveTableName: config.table.Tag.useSync((tc: TableConfig) => tc.name),
+      resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
     })
 
   // ---------------------------------------------------------------------------
@@ -2694,7 +3056,7 @@ export const make = <
       (mode: DecodeMode, opts: EntityGetOpts) =>
         Effect.gen(function* () {
           const client = yield* DynamoClient
-          const { name: tableName } = yield* config.table.Tag
+          const { name: tableName } = yield* tableTag
 
           // Decode key
           const decodedKey = yield* Schema.decodeUnknownEffect(
@@ -2755,7 +3117,7 @@ export const make = <
       skField: primary.sk.field,
       entityTypes: [entityType],
       decoder: (raw) => decodeRecord(raw),
-      resolveTableName: config.table.Tag.useSync((tc: TableConfig) => tc.name),
+      resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
     }).pipe(Query.where({ beginsWith: versionPrefix }))
   }
 
@@ -2768,7 +3130,7 @@ export const make = <
       (mode: DecodeMode, _opts: EntityGetOpts) =>
         Effect.gen(function* () {
           const client = yield* DynamoClient
-          const { name: tableName } = yield* config.table.Tag
+          const { name: tableName } = yield* tableTag
 
           // Decode key
           const decodedKey = yield* Schema.decodeUnknownEffect(
@@ -2809,9 +3171,10 @@ export const make = <
           }
 
           const raw = fromAttributeMap(result.Items[0]!)
-          // Decode through deletedRecordSchema for mode "model" and "record"
+          // Soft-deleted items have GSI keys stripped — always use deletedRecordSchema
+          // (itemSchema would fail because it expects GSI key fields that aren't present)
           if (mode === "native") return result.Items[0]!
-          const targetSchema = mode === "item" ? schemas.itemSchema : schemas.deletedRecordSchema
+          const targetSchema = schemas.deletedRecordSchema
           return yield* Schema.decodeUnknownEffect(targetSchema as Schema.Codec<any>)(raw).pipe(
             Effect.mapError(
               (cause) =>
@@ -2853,7 +3216,7 @@ export const make = <
       skField: primary.sk.field,
       entityTypes: [],
       decoder: (raw) => decodeDeleted(raw),
-      resolveTableName: config.table.Tag.useSync((tc: TableConfig) => tc.name),
+      resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
     }).pipe(Query.where({ beginsWith: deletedPrefix }))
   }
 
@@ -2866,7 +3229,7 @@ export const make = <
       (mode: DecodeMode, _opts: EntityGetOpts) =>
         Effect.gen(function* () {
           const client = yield* DynamoClient
-          const { name: tableName } = yield* config.table.Tag
+          const { name: tableName } = yield* tableTag
 
           // Decode key
           const decodedKey = yield* Schema.decodeUnknownEffect(
@@ -3055,10 +3418,10 @@ export const make = <
 
   const purge = (key: unknown) =>
     new EntityDeleteImpl(
-      (_opts: { readonly condition: ConditionInput | undefined }) =>
+      (_opts: { readonly condition: Expr | ConditionInput | undefined }) =>
         Effect.gen(function* () {
           const client = yield* DynamoClient
-          const { name: tableName } = yield* config.table.Tag
+          const { name: tableName } = yield* tableTag
 
           // Decode key
           const decodedKey = yield* Schema.decodeUnknownEffect(
@@ -3188,17 +3551,95 @@ export const make = <
       key as globalThis.Record<string, unknown>,
     )
 
+  // ---------------------------------------------------------------------------
+  // Expression combinators: condition, filter, select
+  // ---------------------------------------------------------------------------
+
+  const entityPathBuilder = createPathBuilder<any>([], resolveDbName)
+  const entityConditionOps = createConditionOps<any>()
+
+  /**
+   * Build a condition expression combinator from callback or shorthand.
+   * Returns a function that applies the condition to an EntityPut/Update/Delete.
+   */
+  const entityCondition = (
+    cbOrShorthand: ((...args: any[]) => any) | globalThis.Record<string, unknown>,
+  ) => {
+    const expr: Expr =
+      typeof cbOrShorthand === "function"
+        ? cbOrShorthand(entityPathBuilder, entityConditionOps)
+        : parseSimpleShorthand(cbOrShorthand)
+    return (self: any) => conditionCombinator(self, expr)
+  }
+
+  /**
+   * Build a filter expression combinator from callback or shorthand.
+   * Returns a function that applies the filter to a Query.
+   */
+  const entityFilter = (
+    cbOrShorthand: ((...args: any[]) => any) | globalThis.Record<string, unknown>,
+  ) => {
+    const expr: Expr =
+      typeof cbOrShorthand === "function"
+        ? cbOrShorthand(entityPathBuilder, entityConditionOps)
+        : parseSimpleShorthand(cbOrShorthand)
+    return <A>(q: Query.Query<A>): Query.Query<A> => filterExpr(q, expr)
+  }
+
+  /**
+   * Build a select (projection) combinator from callback or string array.
+   */
+  const entitySelect = (
+    cbOrAttrs:
+      | ((t: any) => ReadonlyArray<{ segments: ReadonlyArray<string | number> }>)
+      | ReadonlyArray<string>,
+  ) => {
+    if (typeof cbOrAttrs === "function") {
+      const paths = cbOrAttrs(entityPathBuilder)
+      const segments = paths.map((p: { segments: ReadonlyArray<string | number> }) => p.segments)
+      return <A>(q: Query.Query<A>): Query.Query<globalThis.Record<string, unknown>> =>
+        selectPaths(q, segments)
+    }
+    return <A>(q: Query.Query<A>): Query.Query<globalThis.Record<string, unknown>> =>
+      Query.select(q, cbOrAttrs)
+  }
+
+  // ---------------------------------------------------------------------------
+  // Flattened query accessors (same as query namespace, but on entity directly)
+  // ---------------------------------------------------------------------------
+
+  const flattenedAccessors: globalThis.Record<string, (pk: any) => Query.Query<any>> = {}
+  for (const indexName of Object.keys(config.indexes)) {
+    if (indexName === "primary") continue
+    flattenedAccessors[indexName] = queryNamespace[indexName]!
+  }
+
   const entity = {
     _tag: "Entity" as const,
     model: config.model,
-    table: config.table,
     entityType: config.entityType,
     indexes: allIndexes,
     timestamps: config.timestamps as TTimestamps,
     versioned: config.versioned as TVersioned,
     softDelete: config.softDelete as TSoftDelete,
     unique: config.unique as TUnique,
+    identifier: resolvedIdentifier as ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
     _resolvedRefs: resolvedRefs,
+    /** @internal Full decode pipeline: rename + date deser + schema decode. Used by Batch/Aggregate. */
+    _decodeRecord: decodeRecord,
+    _configure: (
+      injectedSchema: DynamoSchema.DynamoSchema,
+      injectedTableTag: import("effect").ServiceMap.Service<TableConfig, TableConfig>,
+    ) => {
+      schema = injectedSchema
+      tableTag = injectedTableTag
+    },
+    get _schema() {
+      return schema
+    },
+    get _tableTag() {
+      return tableTag
+    },
     systemFields,
     schemas,
     inputSchema: schemas.inputSchema,
@@ -3224,21 +3665,25 @@ export const make = <
     expectedVersion,
 
     query: queryNamespace,
+    condition: entityCondition,
+    filter: entityFilter,
+    select: entitySelect,
+    ...flattenedAccessors,
     // Cast rationale: Entity.make() builds the entity object incrementally from
     // closures that capture the config. The object literal's inferred type is a
     // union of all closure return types, which doesn't satisfy the fully-generic
-    // Entity<TModel, TTable, ...> interface. The cast is safe because each method
+    // Entity<TModel, ...> interface. The cast is safe because each method
     // is constructed with the correct types from the generic config parameters.
   } as unknown as Entity<
     TModel,
-    TTable,
     TEntityType,
     TIndexes,
     TTimestamps,
     TVersioned,
     TSoftDelete,
     TUnique,
-    TRefs
+    TRefs,
+    ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>
   >
 
   // Assign self so operation closures can reference the entity
@@ -3250,26 +3695,17 @@ export const make = <
 }
 
 // ---------------------------------------------------------------------------
-// Entity.bind — resolve services, return BoundEntity with R = never
+// Entity binding — resolve services, return BoundEntity with R = never
 // ---------------------------------------------------------------------------
 
 /**
  * Bind an Entity to resolved `DynamoClient` and `TableConfig` services.
  * Returns a {@link BoundEntity} where all operations have `R = never`.
  *
- * Use inside `ServiceMap.Service` make effects to prevent service methods
- * from leaking infrastructure requirements.
- *
- * @example
- * ```typescript
- * const teams = yield* Entity.bind(Teams)
- * const team = yield* teams.get({ id })     // Effect<Team, ..., never>
- * yield* teams.create({ id, name, ... })    // Effect<Team, ..., never>
- * ```
+ * @internal Used by `DynamoClient.make(table)` to bind entities.
  */
 export const bind = <
   TModel extends Schema.Top,
-  TTable extends Table,
   TEntityType extends string,
   TIndexes extends globalThis.Record<string, IndexDefinition>,
   TTimestamps extends TimestampsConfig | undefined,
@@ -3277,17 +3713,18 @@ export const bind = <
   TSoftDelete extends SoftDeleteConfig | undefined,
   TUnique extends UniqueConfig | undefined,
   TRefs extends globalThis.Record<string, AnyRefValue> | undefined,
+  TIdentifier extends string | undefined,
 >(
   entity: Entity<
     TModel,
-    TTable,
     TEntityType,
     TIndexes,
     TTimestamps,
     TVersioned,
     TSoftDelete,
     TUnique,
-    TRefs
+    TRefs,
+    TIdentifier
   >,
 ): Effect.Effect<BoundEntity<TModel, TIndexes, TRefs>, never, DynamoClient | TableConfig> =>
   Effect.gen(function* () {
@@ -3298,21 +3735,79 @@ export const bind = <
 
     type Key = EntityKeyType<TModel, TIndexes>
     type Input = EntityRefInputType<TModel, TRefs>
-    type Updates = EntityRefUpdateType<TModel, TIndexes, TRefs>
+
+    // Helper: apply combinators to an EntityUpdate, then asEffect + provide
+    const applyUpdate = (
+      op: EntityUpdate<any, any, any, any, any>,
+      combinators: ReadonlyArray<(op: any) => any>,
+    ) => {
+      let result: any = op
+      for (const fn of combinators) result = fn(result)
+      return provide(result.asEffect())
+    }
+
+    // Helper: apply combinators to an EntityPut, then asEffect + provide
+    const applyPut = (
+      op: EntityPut<any, any, any, any>,
+      combinators: ReadonlyArray<(op: any) => any>,
+    ) => {
+      let result: any = op
+      for (const fn of combinators) result = fn(result)
+      return provide(result.asEffect())
+    }
+
+    // Helper: apply combinators to an EntityDelete, then asEffect + provide
+    const applyDelete = (
+      op: EntityDelete<any, any>,
+      combinators: ReadonlyArray<(op: any) => any>,
+    ) => {
+      let result: any = op
+      for (const fn of combinators) result = fn(result)
+      return provide(result.asEffect())
+    }
+
+    // Helper: apply query combinators then execute
+    const applyQuery = <A>(q: Query.Query<A>, combinators: ReadonlyArray<(q: any) => any>) => {
+      let result: any = q
+      for (const fn of combinators) result = fn(result)
+      return result as Query.Query<A>
+    }
 
     return {
+      // CRUD — all ops return Effect (auto-wrapped)
       get: (key: Key) => provide(entity.get(key).asEffect()),
-      put: (input: Input) => provide(entity.put(input).asEffect()),
-      create: (input: Input) => provide(entity.create(input).asEffect()),
-      update: (key: Key, updates: Updates) =>
-        provide(entity.update(key).pipe(set(updates)).asEffect()),
-      delete: (key: Key) => provide(entity.delete(key).asEffect()),
-      query: entity.query,
-      scan: entity.scan,
-      execute: <A>(q: Query.Query<A>) => provide(Query.execute(q)),
-      collect: <A>(q: Query.Query<A>) => provide(Query.collect(q)),
-      provide,
-    } as BoundEntity<TModel, TIndexes, TRefs>
+      put: (input: Input, ...combinators: ReadonlyArray<(op: any) => any>) =>
+        applyPut(entity.put(input), combinators),
+      create: (input: Input, ...combinators: ReadonlyArray<(op: any) => any>) =>
+        applyPut(entity.create(input), combinators),
+      update: (key: Key, ...combinators: ReadonlyArray<(op: any) => any>) =>
+        applyUpdate(entity.update(key), combinators),
+      delete: (key: Key, ...combinators: ReadonlyArray<(op: any) => any>) =>
+        applyDelete(entity.delete(key), combinators),
+      upsert: (input: Input, ...combinators: ReadonlyArray<(op: any) => any>) =>
+        applyPut(entity.upsert(input), combinators),
+      patch: (key: Key, ...combinators: ReadonlyArray<(op: any) => any>) =>
+        applyUpdate(entity.patch(key), combinators),
+      deleteIfExists: (key: Key, ...combinators: ReadonlyArray<(op: any) => any>) =>
+        applyDelete(entity.deleteIfExists(key), combinators),
+      // Lifecycle
+      getVersion: (key: Key, version: number) =>
+        provide(entity.getVersion(key, version).asEffect()),
+      restore: (key: Key) => provide(entity.restore(key).asEffect()),
+      purge: (key: Key) => provide(entity.purge(key).asEffect()),
+      deleted: {
+        get: (key: Key) => provide(entity.deleted.get(key).asEffect()),
+      },
+      // Query execution
+      paginate: <A>(q: Query.Query<A>, ...combinators: ReadonlyArray<(q: any) => any>) => {
+        const final = applyQuery(q, combinators)
+        return Stream.unwrap(provide(Query.paginate(final))).pipe(
+          Stream.flatMap((page) => Stream.fromIterable(page)),
+        )
+      },
+      collect: <A>(q: Query.Query<A>, ...combinators: ReadonlyArray<(q: any) => any>) =>
+        provide(Query.collect(applyQuery(q, combinators))),
+    } as unknown as BoundEntity<TModel, TIndexes, TRefs>
   })
 
 // ---------------------------------------------------------------------------
@@ -3403,9 +3898,21 @@ export type Record<
  * `Entity.Input<typeof TeamPlayerSelection>` = `{ teamId: string, playerId: string, ... }`
  */
 export type Input<E extends { readonly model: Schema.Top }> =
-  E extends Entity<infer M extends Schema.Top, any, any, any, any, any, any, any, infer R>
+  E extends Entity<infer M extends Schema.Top, any, any, any, any, any, any, infer R, any>
     ? EntityRefInputType<M, R>
     : EntityInputType<E["model"]>
+
+/**
+ * Extract the create type from an Entity — input fields minus the identifier.
+ * Uses the `identifier` config to determine which field to omit.
+ * Falls back to omitting all primary key composites when no identifier is set.
+ *
+ * `Entity.Create<typeof Teams>` = `{ name: string, gender: Gender, league: League }`
+ */
+export type Create<E extends { readonly model: Schema.Top; readonly indexes: any }> =
+  E extends Entity<infer M extends Schema.Top, any, infer I, any, any, any, any, infer R, infer Id>
+    ? EntityRefCreateType<M, I, R, Id extends string ? Id : undefined>
+    : Omit<EntityInputType<E["model"]>, PrimaryKeyComposites<E["indexes"]>>
 
 /**
  * Extract the update type from an Entity. Ref-aware: when refs are present,
@@ -3414,7 +3921,7 @@ export type Input<E extends { readonly model: Schema.Top }> =
  * `Entity.Update<typeof Users>` = `{ email?: string, displayName?: string, ... }`
  */
 export type Update<E extends { readonly model: Schema.Top; readonly indexes: any }> =
-  E extends Entity<infer M extends Schema.Top, any, any, infer I, any, any, any, any, infer R>
+  E extends Entity<infer M extends Schema.Top, any, infer I, any, any, any, any, infer R, any>
     ? EntityRefUpdateType<M, I, R>
     : EntityUpdateType<E["model"], E["indexes"]>
 

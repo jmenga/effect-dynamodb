@@ -1,0 +1,351 @@
+---
+title: "Indexes & Collections"
+description: "Define access patterns using indexes, key generation, and collections"
+---
+
+This guide covers how to define access patterns using indexes, how key generation works, and how to use collections for cross-entity queries.
+
+## Index Definition
+
+Indexes are defined on the Entity using an ElectroDB-style declaration. Each index has a **logical name** (used in code) that maps to a **physical index** (on the DynamoDB table).
+
+```typescript
+const TaskEntity = Entity.make({
+  model: Task,
+  entityType: "Task",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["taskId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    byProject: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["projectId"] },
+      sk: { field: "gsi1sk", composite: ["status", "createdAt"] },
+    },
+    byAssignee: {
+      index: "gsi2",
+      pk: { field: "gsi2pk", composite: ["assigneeId"] },
+      sk: { field: "gsi2sk", composite: ["priority"] },
+    },
+  },
+})
+```
+
+### Anatomy of an Index
+
+```typescript
+byProject: {
+  index: "gsi1",                          // Physical GSI name (omit for primary)
+  pk: {
+    field: "gsi1pk",                       // Physical DynamoDB attribute
+    composite: ["projectId"],              // Model attributes → partition key
+  },
+  sk: {
+    field: "gsi1sk",
+    composite: ["status", "createdAt"],    // Model attributes → sort key
+  },
+}
+```
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `index` | `string` | No (primary only) | Physical GSI/LSI name from Table |
+| `pk.field` | `string` | Yes | Physical DynamoDB attribute name |
+| `pk.composite` | `string[]` | Yes | Model attributes composing the partition key |
+| `sk.field` | `string` | Yes | Physical DynamoDB attribute name |
+| `sk.composite` | `string[]` | Yes | Model attributes composing the sort key |
+| `collection` | `string \| string[]` | No | Collection membership |
+| `type` | `"isolated" \| "clustered"` | No | Collection type (default: `"clustered"`) |
+| `casing` | `"lowercase" \| "uppercase" \| "preserve"` | No | Casing override for this index |
+
+### Logical Names as API Surface
+
+The logical index name becomes a query accessor on the Entity:
+
+```typescript
+TaskEntity.query.byProject({ projectId: "proj-alpha" })   // uses gsi1
+TaskEntity.query.byAssignee({ assigneeId: "emp-alice" })  // uses gsi2
+```
+
+You never reference physical index names (`gsi1`, `gsi2`) in application code.
+
+## Key Generation
+
+effect-dynamodb generates DynamoDB key values automatically from your composite declarations. You declare *which* attributes compose each key — the system handles *how*.
+
+### Format
+
+```
+{schema}#{version}#{prefix}#{attr1}#{attr2}
+```
+
+Given `DynamoSchema({ name: "myapp", version: 1 })` and `entityType: "Task"`:
+
+| Composite | Generated Key |
+|-----------|---------------|
+| `["taskId"]` with value `"t-001"` | `$myapp#v1#task#t-001` |
+| `["projectId", "status"]` with values `"proj-alpha"`, `"active"` | `$myapp#v1#task#proj-alpha#active` |
+| `[]` (empty) | `$myapp#v1#task` |
+
+### Empty Composites
+
+Both `pk.composite` and `sk.composite` can be empty arrays. The entity type prefix guarantees no collisions between entity types.
+
+| pk | sk | Use Case |
+|----|----|----------|
+| `[]` | `[]` | Singleton (config, counters) |
+| `["userId"]` | `[]` | One item per user |
+| `[]` | `["userId"]` | All users in one partition |
+| `["tenantId"]` | `["userId"]` | Users partitioned by tenant |
+
+### Attribute Serialization
+
+| Type | Key Value |
+|------|-----------|
+| `string` | As-is |
+| `number` | Zero-padded |
+| `DateTime.Utc` | ISO 8601 |
+| `boolean` | `"true"` / `"false"` |
+| Branded string | Underlying value |
+
+### Casing Resolution
+
+Structural key parts (schema name, entity type, collection name) follow casing rules. Resolution order:
+
+1. Index-level `casing` (highest priority)
+2. Schema-level `casing` (default: `"lowercase"`)
+
+Attribute values are always preserved as-is.
+
+```typescript
+// With casing: "lowercase" and entityType: "Employee"
+// PK: $myapp#v1#employee#emp-Alice
+//     ^^^^^^^^ ^^ ^^^^^^^^          ← structural (lowercased)
+//                          ^^^^^^^^^ ← attribute value (preserved)
+```
+
+## Collections
+
+Collections group multiple entity types that share a partition key, enabling cross-entity queries. Two modes are supported.
+
+### Isolated Collections
+
+Each entity owns its sort key prefix. Collection queries use only the partition key — no sort key condition.
+
+```typescript
+const EmployeeEntity = Entity.make({
+  // ...
+  indexes: {
+    byDepartment: {
+      index: "gsi1",
+      collection: "DepartmentStaff",
+      type: "isolated",
+      pk: { field: "gsi1pk", composite: ["departmentId"] },
+      sk: { field: "gsi1sk", composite: ["hireDate"] },
+    },
+  },
+})
+
+const EquipmentEntity = Entity.make({
+  // ...
+  indexes: {
+    byDepartment: {
+      index: "gsi1",
+      collection: "DepartmentStaff",
+      type: "isolated",
+      pk: { field: "gsi1pk", composite: ["departmentId"] },
+      sk: { field: "gsi1sk", composite: ["purchaseDate"] },
+    },
+  },
+})
+```
+
+**Sort key format (isolated):**
+
+```
+$myapp#v1#employee_1#2020-01-15     ← Employee entity owns its SK
+$myapp#v1#equipment_1#2023-06-01    ← Equipment entity owns its SK
+```
+
+**Query behavior:**
+
+| Query | Mechanism | Returns |
+|-------|-----------|---------|
+| Everything | PK only (no SK condition) | Employee + Equipment |
+| Employees only | PK + `begins_with(SK, "$myapp#v1#employee_1")` | Employee |
+
+**Best for:** High-volume single-entity queries where cross-entity queries are occasional.
+
+### Clustered Collections
+
+The collection name sits at the top of every entity's sort key. All entities share this prefix.
+
+```typescript
+const EmployeeEntity = Entity.make({
+  // ...
+  indexes: {
+    byTenant: {
+      index: "gsi1",
+      collection: "TenantMembers",
+      type: "clustered",   // default
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["department", "hireDate"] },
+    },
+  },
+})
+
+const TaskEntity = Entity.make({
+  // ...
+  indexes: {
+    byTenant: {
+      index: "gsi1",
+      collection: "TenantMembers",
+      type: "clustered",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["projectId", "taskId"] },
+    },
+  },
+})
+```
+
+**Sort key format (clustered):**
+
+```
+$myapp#v1#tenantmembers#employee_1#engineering#2020-01-15
+$myapp#v1#tenantmembers#task_1#proj-alpha#t-001
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+collection prefix (shared)
+```
+
+**Query behavior:**
+
+| Query | Mechanism | Returns |
+|-------|-----------|---------|
+| Everything | PK + `begins_with(SK, "$myapp#v1#tenantmembers")` | Employee + Task |
+| Employees only | PK + `begins_with(SK, "$myapp#v1#tenantmembers#employee_1")` | Employee |
+| Tasks only | PK + `begins_with(SK, "$myapp#v1#tenantmembers#task_1")` | Task |
+
+**Best for:** Cross-entity queries, relationship-dense data.
+
+### Sub-Collections (Clustered Only)
+
+Sub-collections create a hierarchy within the sort key. An entity joins multiple collections by declaring an array:
+
+```typescript
+const EmployeeEntity = Entity.make({
+  // ...
+  indexes: {
+    byEmployee: {
+      index: "gsi2",
+      collection: "contributions",  // top-level only
+      type: "clustered",
+      pk: { field: "gsi2pk", composite: ["employeeId"] },
+      sk: { field: "gsi2sk", composite: ["departmentId"] },
+    },
+  },
+})
+
+const TaskEntity = Entity.make({
+  // ...
+  indexes: {
+    byAssignee: {
+      index: "gsi2",
+      collection: ["contributions", "assignments"],  // sub-collection
+      type: "clustered",
+      pk: { field: "gsi2pk", composite: ["employeeId"] },
+      sk: { field: "gsi2sk", composite: ["projectId", "taskId"] },
+    },
+  },
+})
+
+const ProjectMemberEntity = Entity.make({
+  // ...
+  indexes: {
+    byMember: {
+      index: "gsi2",
+      collection: ["contributions", "assignments"],  // same sub-collection
+      type: "clustered",
+      pk: { field: "gsi2pk", composite: ["employeeId"] },
+      sk: { field: "gsi2sk", composite: ["projectId"] },
+    },
+  },
+})
+```
+
+**Sort key hierarchy:**
+
+```
+$contributions
+├── #assignments
+│   ├── #projectmembers_1#pid_alpha
+│   ├── #tasks_1#pid_alpha#tid_write-api
+│   └── #tasks_1#pid_beta#tid_design-db
+└── #employees_1#dept_engineering
+```
+
+**Query at any depth:**
+
+| Collection | SK condition | Returns |
+|------------|-------------|---------|
+| `contributions` | `begins_with "$contributions"` | Employee + Task + ProjectMember |
+| `assignments` | `begins_with "$contributions#assignments"` | Task + ProjectMember |
+| Single entity | `begins_with "$contributions#assignments#tasks_1"` | Task only |
+
+### Defining Collections
+
+```typescript
+import { Collection } from "effect-dynamodb"
+
+const TenantMembers = Collection.make("TenantMembers", {
+  employees: EmployeeEntity,
+  tasks: TaskEntity,
+})
+
+// Sub-collection hierarchy
+const Contributions = Collection.make("contributions", {
+  employees: EmployeeEntity,
+  tasks: TaskEntity,
+  projectMembers: ProjectMemberEntity,
+})
+
+const Assignments = Collection.make("assignments", {
+  tasks: TaskEntity,
+  projectMembers: ProjectMemberEntity,
+})
+```
+
+### Validation Rules
+
+- All entities in a collection must share the same PK composite on that index
+- All entities sharing an index must agree on the type (no mixing isolated/clustered)
+- Sub-collection members must include parent: `["contributions", "assignments"]`
+- All collection members must be on the same table
+
+## Worked Example: Multi-Tenant Project Management
+
+### Access Patterns
+
+| Pattern | Index | PK | SK |
+|---------|-------|----|----|
+| Get employee by ID | primary | `employeeId` | — |
+| Get task by ID | primary | `taskId` | — |
+| Employees in tenant | gsi1 (TenantMembers) | `tenantId` | `department`, `hireDate` |
+| Tasks in tenant | gsi1 (TenantMembers) | `tenantId` | `projectId`, `taskId` |
+| All tenant items | gsi1 (TenantMembers) | `tenantId` | — |
+| Employee by email | gsi2 | `email` | — |
+| Tasks by assignee | gsi2 | `assigneeId` | `priority` |
+
+### DynamoDB Items
+
+| pk | sk | gsi1pk | gsi1sk | __edd_e__ |
+|----|----|--------|--------|------------|
+| `$myapp#v1#employee#emp-alice` | `$myapp#v1#employee` | `$myapp#v1#tenantmembers#t-acme` | `$myapp#v1#tenantmembers#employee_1#engineering#2024-01-15` | Employee |
+| `$myapp#v1#task#t-001` | `$myapp#v1#task` | `$myapp#v1#tenantmembers#t-acme` | `$myapp#v1#tenantmembers#task_1#proj-alpha#t-001` | Task |
+| `$myapp#v1#employee#emp-bob` | `$myapp#v1#employee` | `$myapp#v1#tenantmembers#t-acme` | `$myapp#v1#tenantmembers#employee_1#sales#2023-06-01` | Employee |
+
+## What's Next?
+
+- [Queries](/effect-dynamodb/guides/queries/) — Query by index, filter by sort key composites, paginate results
+- [Data Integrity](/effect-dynamodb/guides/data-integrity/) — Unique constraints and optimistic concurrency
+- [Lifecycle](/effect-dynamodb/guides/lifecycle/) — Soft delete and version retention

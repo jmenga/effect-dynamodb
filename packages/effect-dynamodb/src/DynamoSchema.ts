@@ -27,8 +27,11 @@ export const make = (config: {
 })
 
 /**
- * Apply casing to a structural key part.
- * Attribute values are NEVER cased — only structural parts (schema name, version prefix, entity type, collection name).
+ * Apply casing to a key part (structural or composite value).
+ *
+ * Matches ElectroDB behavior: casing is applied to the entire composed key,
+ * including composite attribute values. With the default `"lowercase"` casing,
+ * `"Male"` becomes `"male"` in the key, ensuring case-insensitive key matching.
  */
 export const applyCasing = (value: string, casing: Casing): string => {
   switch (casing) {
@@ -51,12 +54,24 @@ export const prefix = (schema: DynamoSchema): string => {
 }
 
 /**
+ * @internal Resolve casing and build the common key prefix parts.
+ */
+const resolveKeyPrefix = (
+  schema: DynamoSchema,
+  label: string,
+  options?: { readonly casing?: Casing | undefined } | undefined,
+): { readonly casing: Casing; readonly pre: string; readonly label: string } => {
+  const casing = options?.casing ?? schema.casing
+  return { casing, pre: prefix(schema), label: applyCasing(label, casing) }
+}
+
+/**
  * Compose a full key from schema, entity type, and composite attribute values.
  *
  * Format: `$<schema>#v<version>#<entityType>#<attr1>#<attr2>`
  *
- * The entityType is cased according to the schema's casing setting.
- * Attribute values are ALWAYS preserved as-is.
+ * Both the entityType and composite values are cased according to the schema's casing setting.
+ * This matches ElectroDB behavior where the entire key is uniformly cased.
  */
 export const composeKey = (
   schema: DynamoSchema,
@@ -64,14 +79,17 @@ export const composeKey = (
   composites: ReadonlyArray<string>,
   options?: { readonly casing?: Casing | undefined } | undefined,
 ): string => {
-  const effectiveCasing = options?.casing ?? schema.casing
-  const pre = prefix(schema)
-  const type = applyCasing(entityType, effectiveCasing)
+  const {
+    casing: effectiveCasing,
+    pre,
+    label: type,
+  } = resolveKeyPrefix(schema, entityType, options)
 
   if (composites.length === 0) {
     return `${pre}#${type}`
   }
-  return `${pre}#${type}#${composites.join("#")}`
+  const casedComposites = composites.map((v) => applyCasing(v, effectiveCasing))
+  return `${pre}#${type}#${casedComposites.join("#")}`
 }
 
 /**
@@ -85,14 +103,17 @@ export const composeCollectionKey = (
   composites: ReadonlyArray<string>,
   options?: { readonly casing?: Casing | undefined } | undefined,
 ): string => {
-  const effectiveCasing = options?.casing ?? schema.casing
-  const pre = prefix(schema)
-  const collection = applyCasing(collectionName, effectiveCasing)
+  const {
+    casing: effectiveCasing,
+    pre,
+    label: collection,
+  } = resolveKeyPrefix(schema, collectionName, options)
 
   if (composites.length === 0) {
     return `${pre}#${collection}`
   }
-  return `${pre}#${collection}#${composites.join("#")}`
+  const casedComposites = composites.map((v) => applyCasing(v, effectiveCasing))
+  return `${pre}#${collection}#${casedComposites.join("#")}`
 }
 
 /**
@@ -111,13 +132,16 @@ export const composeClusteredSortKey = (
   composites: ReadonlyArray<string>,
   options?: { readonly casing?: Casing | undefined } | undefined,
 ): string => {
-  const effectiveCasing = options?.casing ?? schema.casing
-  const pre = prefix(schema)
-  const collection = applyCasing(collectionName, effectiveCasing)
+  const {
+    casing: effectiveCasing,
+    pre,
+    label: collection,
+  } = resolveKeyPrefix(schema, collectionName, options)
   const type = applyCasing(entityType, effectiveCasing)
   const entityPrefix = `${type}_${entityVersion}`
 
-  const parts = [pre, collection, entityPrefix, ...composites].filter((p) => p.length > 0)
+  const casedComposites = composites.map((v) => applyCasing(v, effectiveCasing))
+  const parts = [pre, collection, entityPrefix, ...casedComposites].filter((p) => p.length > 0)
   return parts.join("#")
 }
 
@@ -133,12 +157,15 @@ export const composeIsolatedSortKey = (
   composites: ReadonlyArray<string>,
   options?: { readonly casing?: Casing | undefined } | undefined,
 ): string => {
-  const effectiveCasing = options?.casing ?? schema.casing
-  const pre = prefix(schema)
-  const type = applyCasing(entityType, effectiveCasing)
+  const {
+    casing: effectiveCasing,
+    pre,
+    label: type,
+  } = resolveKeyPrefix(schema, entityType, options)
   const entityPrefix = `${type}_${entityVersion}`
 
-  const parts = [pre, entityPrefix, ...composites].filter((p) => p.length > 0)
+  const casedComposites = composites.map((v) => applyCasing(v, effectiveCasing))
+  const parts = [pre, entityPrefix, ...casedComposites].filter((p) => p.length > 0)
   return parts.join("#")
 }
 
@@ -155,14 +182,16 @@ export const composeUniqueKey = (
   fieldValues: ReadonlyArray<string>,
   options?: { readonly casing?: Casing | undefined } | undefined,
 ): { readonly pk: string; readonly sk: string } => {
-  const effectiveCasing = options?.casing ?? schema.casing
-  const pre = prefix(schema)
-  const type = applyCasing(entityType, effectiveCasing)
+  const {
+    casing: effectiveCasing,
+    pre,
+    label: type,
+  } = resolveKeyPrefix(schema, entityType, options)
   const casedConstraintName = applyCasing(constraintName, effectiveCasing)
   const constraint = `${type}.${casedConstraintName}`
 
   return {
-    pk: `${pre}#${constraint}#${fieldValues.join("#")}`,
+    pk: `${pre}#${constraint}#${fieldValues.map((v) => applyCasing(v, effectiveCasing)).join("#")}`,
     sk: `${pre}#${constraint}`,
   }
 }
@@ -178,9 +207,7 @@ export const composeVersionKey = (
   version: number,
   options?: { readonly casing?: Casing | undefined } | undefined,
 ): string => {
-  const effectiveCasing = options?.casing ?? schema.casing
-  const pre = prefix(schema)
-  const type = applyCasing(entityType, effectiveCasing)
+  const { pre, label: type } = resolveKeyPrefix(schema, entityType, options)
   return `${pre}#${type}#v#${String(version).padStart(7, "0")}`
 }
 
@@ -195,9 +222,7 @@ export const composeDeletedKey = (
   timestamp: string,
   options?: { readonly casing?: Casing | undefined } | undefined,
 ): string => {
-  const effectiveCasing = options?.casing ?? schema.casing
-  const pre = prefix(schema)
-  const type = applyCasing(entityType, effectiveCasing)
+  const { pre, label: type } = resolveKeyPrefix(schema, entityType, options)
   return `${pre}#${type}#deleted#${timestamp}`
 }
 
@@ -211,9 +236,7 @@ export const composeVersionKeyPrefix = (
   entityType: string,
   options?: { readonly casing?: Casing | undefined } | undefined,
 ): string => {
-  const effectiveCasing = options?.casing ?? schema.casing
-  const pre = prefix(schema)
-  const type = applyCasing(entityType, effectiveCasing)
+  const { pre, label: type } = resolveKeyPrefix(schema, entityType, options)
   return `${pre}#${type}#v#`
 }
 
@@ -227,9 +250,7 @@ export const composeDeletedKeyPrefix = (
   entityType: string,
   options?: { readonly casing?: Casing | undefined } | undefined,
 ): string => {
-  const effectiveCasing = options?.casing ?? schema.casing
-  const pre = prefix(schema)
-  const type = applyCasing(entityType, effectiveCasing)
+  const { pre, label: type } = resolveKeyPrefix(schema, entityType, options)
   return `${pre}#${type}#deleted#`
 }
 
@@ -246,8 +267,6 @@ export const composeEventVersionKey = (
   version: number,
   options?: { readonly casing?: Casing | undefined } | undefined,
 ): string => {
-  const effectiveCasing = options?.casing ?? schema.casing
-  const pre = prefix(schema)
-  const type = applyCasing(entityType, effectiveCasing)
+  const { pre, label: type } = resolveKeyPrefix(schema, entityType, options)
   return `${pre}#${type}_1#${String(version).padStart(10, "0")}`
 }

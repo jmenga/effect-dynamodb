@@ -1,0 +1,275 @@
+---
+title: "Example: Rich Updates"
+description: "Atomic increments, decrements, list appends, attribute removal, set deletions, and composed multi-type updates"
+---
+
+A product catalog example demonstrating every update operation beyond simple `set()`. DynamoDB supports several update expression types — `SET`, `ADD`, `REMOVE`, and `DELETE` — and effect-dynamodb exposes each as a composable combinator that you can mix freely in a single update call.
+
+**What you'll learn:**
+- `Entity.add()` for atomic numeric increments
+- `Entity.subtract()` for atomic numeric decrements
+- `Entity.append()` for appending to list attributes
+- `Entity.remove()` for deleting attributes entirely
+- `Entity.deleteFromSet()` for removing elements from DynamoDB Set types
+- Composing multiple update types in one operation
+- Combining rich updates with optimistic locking via `expectedVersion()`
+
+---
+
+## Step 1: Model
+
+A pure domain model for a product — no DynamoDB concepts:
+
+```typescript title="models.ts"
+import { Schema } from "effect"
+import { DynamoModel } from "effect-dynamodb"
+
+class Product extends Schema.Class<Product>("Product")({
+  productId: Schema.String,
+  name: Schema.NonEmptyString,
+  description: Schema.optional(Schema.String),
+  price: Schema.Number,
+  stock: Schema.Number,
+  viewCount: Schema.Number,
+  tags: Schema.Array(Schema.String),
+  category: Schema.String,
+}) {}
+
+const ProductModel = DynamoModel.configure(Product, {
+  category: { immutable: true },
+})
+```
+
+`DynamoModel.configure` marks `category` as immutable — it can be set on creation but cannot be changed by updates.
+
+---
+
+## Step 2: Schema, Table, and Entity
+
+```typescript title="entities.ts"
+import { DynamoSchema, Entity, Table } from "effect-dynamodb"
+
+const AppSchema = DynamoSchema.make({ name: "updates-demo", version: 1 })
+const MainTable = Table.make({ schema: AppSchema })
+
+const Products = Entity.make({
+  model: ProductModel,
+  entityType: "Product",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["productId"] },
+      sk: { field: "sk", composite: [] },
+    },
+  },
+  timestamps: true,
+  versioned: true,
+})
+```
+
+`versioned: true` enables optimistic locking — every write increments a `version` field, and `expectedVersion()` can enforce concurrency safety.
+
+---
+
+## Step 3: Create a Product
+
+```typescript
+import { DynamoClient } from "effect-dynamodb"
+
+const { Products: products } = yield* DynamoClient.make(MainTable)
+
+const product = yield* products.put({
+  productId: "p-1",
+  name: "Wireless Mouse",
+  description: "Ergonomic wireless mouse",
+  price: 29.99,
+  stock: 100,
+  viewCount: 0,
+  tags: ["electronics", "accessories"],
+  category: "peripherals",
+})
+// → name: "Wireless Mouse", price: 29.99, stock: 100, viewCount: 0, version: 1
+```
+
+---
+
+## Step 4: Atomic Increment with `Entity.add()`
+
+`ADD` atomically increments a numeric attribute. If the attribute does not exist, DynamoDB initializes it to the provided value. This is thread-safe — no read-modify-write cycle needed.
+
+```typescript
+// Increment viewCount by 1
+yield* products.update({ productId: "p-1" },
+  Entity.add({ viewCount: 1 }),
+)
+// → viewCount: 1
+
+// Multiple fields in one call
+yield* products.update({ productId: "p-1" },
+  Entity.add({ viewCount: 5, stock: 50 }),
+)
+// → viewCount: 6, stock: 150
+```
+
+---
+
+## Step 5: Atomic Decrement with `Entity.subtract()`
+
+DynamoDB has no native `SUBTRACT` action. `Entity.subtract()` synthesizes `SET #field = #field - :val` for you:
+
+```typescript
+yield* products.update({ productId: "p-1" },
+  Entity.subtract({ stock: 3 }),
+)
+// → stock: 147 (was 150)
+```
+
+---
+
+## Step 6: List Append with `Entity.append()`
+
+Appends elements to the end of a list attribute using DynamoDB's `list_append` function:
+
+```typescript
+yield* products.update({ productId: "p-1" },
+  Entity.append({ tags: ["on-sale", "featured"] }),
+)
+// → tags: ["electronics", "accessories", "on-sale", "featured"]
+```
+
+The value must be an array — each element is appended to the existing list.
+
+---
+
+## Step 7: Remove Attributes with `Entity.remove()`
+
+`REMOVE` deletes attributes entirely from the item. The attribute no longer exists after removal (it becomes `undefined`, not `null`):
+
+```typescript
+yield* products.update({ productId: "p-1" },
+  Entity.remove(["description"]),
+)
+// → description is gone from the item
+```
+
+---
+
+## Step 8: Delete from Set with `Entity.deleteFromSet()`
+
+`DELETE` removes specific elements from a DynamoDB Set attribute (`SS`, `NS`, or `BS`). This operates on native DynamoDB Set types:
+
+```typescript
+// For models with Set-type fields:
+Entity.deleteFromSet({ fieldName: new Set(["value-to-remove"]) })
+// → Produces DynamoDB DELETE clause for the Set attribute
+```
+
+---
+
+## Step 9: Composing Multiple Update Types
+
+All update combinators compose as variadic arguments to `update()`. They are merged into one `UpdateItem` call to DynamoDB:
+
+```typescript
+yield* products.update({ productId: "p-1" },
+  Entity.set({ name: "Premium Wireless Mouse", price: 39.99 }),
+  Entity.add({ viewCount: 10 }),
+  Entity.subtract({ stock: 5 }),
+  Entity.append({ tags: ["premium"] }),
+)
+// One DynamoDB call produces:
+//   name: "Premium Wireless Mouse"
+//   price: 39.99
+//   viewCount: 16 (was 6, added 10)
+//   stock: 142 (was 147, subtracted 5)
+//   tags: ["electronics", "accessories", "on-sale", "featured", "premium"]
+```
+
+This is a single atomic DynamoDB operation — all changes apply together or none do.
+
+---
+
+## Step 10: Combining with Optimistic Locking
+
+Rich updates compose with `Entity.expectedVersion()` for concurrency control:
+
+```typescript
+import { Effect } from "effect"
+
+// Succeeds — version matches
+yield* products.update({ productId: "p-1" },
+  Entity.add({ viewCount: 1 }),
+  Entity.expectedVersion(currentVersion),
+)
+
+// Fails — stale version
+const result = yield* products.update({ productId: "p-1" },
+  Entity.add({ viewCount: 1 }),
+  Entity.expectedVersion(1),
+).pipe(
+  Effect.map(() => "updated"),
+  Effect.catchTag("OptimisticLockError", (e) =>
+    Effect.succeed(`OptimisticLockError: expected v${e.expectedVersion}`),
+  ),
+)
+// → "OptimisticLockError: expected v1"
+```
+
+When the version in DynamoDB does not match the expected version, the update is rejected with an `OptimisticLockError`. This prevents lost updates in concurrent scenarios.
+
+---
+
+## Running the Example
+
+The complete runnable example is at [`examples/updates.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/updates.ts) in the repository.
+
+```bash
+docker run -d -p 8000:8000 amazon/dynamodb-local
+```
+
+```bash
+npx tsx examples/updates.ts
+```
+
+### Layer Setup
+
+```typescript title="main.ts"
+import { Effect, Layer } from "effect"
+import { DynamoClient } from "effect-dynamodb"
+
+const AppLayer = Layer.mergeAll(
+  DynamoClient.layer({
+    region: "us-east-1",
+    endpoint: "http://localhost:8000",
+    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  }),
+  MainTable.layer({ name: "updates-demo-table" }),
+)
+
+const main = program.pipe(Effect.provide(AppLayer))
+
+Effect.runPromise(main).then(
+  () => console.log("Done."),
+  (err) => console.error("Failed:", err),
+)
+```
+
+---
+
+## Key Takeaways
+
+| Concept | How it's used |
+|---------|---------------|
+| **`Entity.add()`** | Atomic numeric increment via DynamoDB `ADD` — no read-modify-write needed |
+| **`Entity.subtract()`** | Synthesized `SET #f = #f - :v` for atomic decrement |
+| **`Entity.append()`** | `list_append` for adding elements to list attributes |
+| **`Entity.remove()`** | `REMOVE` to delete attributes entirely from an item |
+| **`Entity.deleteFromSet()`** | `DELETE` to remove elements from DynamoDB Set types |
+| **Composition** | All combinators compose as variadic arguments to `update()` — one atomic `UpdateItem` call |
+| **Optimistic locking** | `expectedVersion()` composes with any update combinator for concurrency safety |
+
+## What's Next?
+
+- [Modeling Guide](/effect-dynamodb/guides/modeling/) — Deep dive into models, schemas, tables, and entities
+- [Queries](/effect-dynamodb/guides/queries/) — Query combinators and pagination
+- [Example: Batch Operations](/effect-dynamodb/tutorials/batch/) — Batch get and write across entities
+- [Example: Human Resources](/effect-dynamodb/tutorials/human-resources/) — Full single-table design with collections, transactions, and soft delete

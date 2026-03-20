@@ -44,12 +44,13 @@
       "packages/**/test/**",
       "packages/**/examples/**",
       "*.json",
-      "*.ts"
+      "*.ts",
+      "!!**/packages/docs"
     ]
   },
   "overrides": [
     {
-      "includes": ["packages/effect-dynamodb/src/_sparse_check.ts"],
+      "includes": ["packages/effect-dynamodb/src/internal/sparse_check.ts"],
       "linter": {
         "enabled": false
       }

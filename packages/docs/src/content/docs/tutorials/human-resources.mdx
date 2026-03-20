@@ -1,0 +1,699 @@
+---
+title: "Example: Human Resources"
+description: "Single-table design with 3 entities, 5 GSIs, collections, transactions, and soft delete"
+---
+
+A human resources application managing **employees**, **tasks**, and **offices** in a single DynamoDB table. Adapted from the [ElectroDB Human Resources example](https://electrodb.dev/en/examples/human-resources/) to showcase effect-dynamodb's approach to the same problem.
+
+**What you'll learn:**
+- 3 entities sharing one table (single-table design)
+- 5 GSIs with index overloading
+- Cross-entity collection queries
+- Sort key range queries (salary ranges)
+- Atomic onboarding via transactions
+- Employee termination and rehire via soft delete + restore
+
+---
+
+## Requirements
+
+As stakeholders of this HR system, we need to support these access patterns:
+
+1. **CRUD** — Create, read, update, and delete employees
+2. **Regional Manager** — See all details about an office and its employees
+3. **Project Manager** — Find all tasks and details on a specific employee
+4. **Product Manager** — See all tasks for a project
+5. **Client** — Find a physical office by location (country + state)
+6. **Hiring Manager** — Find employees by title, with salary range queries
+7. **HR** — Find all employees that report to a specific manager
+8. **HR** — Transfer an employee between offices (all GSI composites must be consistent)
+9. **HR** — Atomically onboard a new employee with their first task
+10. **HR** — Terminate an employee (soft delete) and rehire them later (restore)
+
+---
+
+## Table Definition
+
+All three entities share a single table with 5 Global Secondary Indexes:
+
+| Key | Field | Used by |
+|-----|-------|---------|
+| PK | `pk` | Employee (by ID), Task (by ID), Office (by ID) |
+| SK | `sk` | Employee, Task (project + employee), Office |
+| GSI1 PK | `gsi1pk` | Employee (by office), Task (by project), Office (by office) |
+| GSI1 SK | `gsi1sk` | Employee (team + title + ID), Task (employee + task), Office |
+| GSI2 PK | `gsi2pk` | Office (by country + state) |
+| GSI2 SK | `gsi2sk` | Office (city + zip + ID) |
+| GSI3 PK | `gsi3pk` | Employee (by ID), Task (by employee) |
+| GSI3 SK | `gsi3sk` | Employee, Task (project + task) |
+| GSI4 PK | `gsi4pk` | Employee (by title) |
+| GSI4 SK | `gsi4sk` | Employee (salary + ID) |
+| GSI5 PK | `gsi5pk` | Employee (by manager) |
+| GSI5 SK | `gsi5sk` | Employee (team + office + ID) |
+
+GSI1 and GSI3 are **overloaded** — multiple entity types share the same physical index with different key compositions. This is the core single-table pattern.
+
+---
+
+## Step 1: Models
+
+Pure domain models with no DynamoDB concepts:
+
+```typescript title="models.ts"
+import { Schema } from "effect"
+
+class Employee extends Schema.Class<Employee>("Employee")({
+  employee: Schema.String,
+  firstName: Schema.String,
+  lastName: Schema.String,
+  office: Schema.String,
+  title: Schema.String,
+  team: Schema.Literals(["jupiter", "mercury", "saturn", "venus", "mars", "neptune"]),
+  salary: Schema.String,
+  manager: Schema.String,
+  dateHired: Schema.String,
+  birthday: Schema.String,
+}) {}
+
+class Task extends Schema.Class<Task>("Task")({
+  task: Schema.String,
+  project: Schema.String,
+  employee: Schema.String,
+  description: Schema.String,
+}) {}
+
+class Office extends Schema.Class<Office>("Office")({
+  office: Schema.String,
+  country: Schema.String,
+  state: Schema.String,
+  city: Schema.String,
+  zip: Schema.String,
+  address: Schema.String,
+}) {}
+```
+
+Note that `salary` is a `String` — we store it as zero-padded `"000150.00"` for correct lexicographic sort key ordering. This is a domain modeling choice for this example; in practice, numeric composites are automatically zero-padded by KeyComposer (16 digits for numbers, 38 for bigints).
+
+---
+
+## Step 2: Schema, Table, and Entities
+
+### Schema and Table
+
+```typescript title="entities.ts"
+import { DynamoSchema, Table } from "effect-dynamodb"
+
+const HrSchema = DynamoSchema.make({ name: "hr", version: 1 })
+const HrTable = Table.make({ schema: HrSchema })
+```
+
+### Employee Entity
+
+Employee has 5 indexes — primary key plus 4 GSIs. Two of the GSIs participate in **collections** (shared indexes with other entities):
+
+```typescript title="entities.ts"
+import { Entity } from "effect-dynamodb"
+
+const Employees = Entity.make({
+  model: Employee,
+  entityType: "Employee",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["employee"] },
+      sk: { field: "sk", composite: [] },
+    },
+    // GSI1 — "workplaces" collection (shared with Office)
+    coworkers: {
+      index: "gsi1",
+      collection: "workplaces",
+      pk: { field: "gsi1pk", composite: ["office"] },
+      sk: { field: "gsi1sk", composite: ["team", "title", "employee"] },
+    },
+    // GSI3 — "assignments" collection (shared with Task)
+    employeeLookup: {
+      index: "gsi3",
+      collection: "assignments",
+      pk: { field: "gsi3pk", composite: ["employee"] },
+      sk: { field: "gsi3sk", composite: [] },
+    },
+    // GSI4 — standalone (employees by title + salary)
+    roles: {
+      index: "gsi4",
+      pk: { field: "gsi4pk", composite: ["title"] },
+      sk: { field: "gsi4sk", composite: ["salary", "employee"] },
+    },
+    // GSI5 — standalone (employees by manager)
+    directReports: {
+      index: "gsi5",
+      pk: { field: "gsi5pk", composite: ["manager"] },
+      sk: { field: "gsi5sk", composite: ["team", "office", "employee"] },
+    },
+  },
+  timestamps: true,
+  versioned: true,
+  softDelete: true,
+})
+```
+
+Key design decisions:
+- **`coworkers` (GSI1)** shares the `workplaces` collection with Office — both use `office` as the partition key, enabling cross-entity queries
+- **`employeeLookup` (GSI3)** shares the `assignments` collection with Task — both use `employee` as the partition key
+- **`roles` (GSI4)** has `salary` in the sort key for range queries (find employees in a salary band)
+- **`softDelete: true`** enables termination/rehire without destroying records
+
+### Task Entity
+
+```typescript title="entities.ts"
+const Tasks = Entity.make({
+  model: Task,
+  entityType: "Task",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["task"] },
+      sk: { field: "sk", composite: ["project", "employee"] },
+    },
+    // GSI1 — standalone (tasks by project)
+    project: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["project"] },
+      sk: { field: "gsi1sk", composite: ["employee", "task"] },
+    },
+    // GSI3 — "assignments" collection (shared with Employee)
+    assigned: {
+      index: "gsi3",
+      collection: "assignments",
+      pk: { field: "gsi3pk", composite: ["employee"] },
+      sk: { field: "gsi3sk", composite: ["project", "task"] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+Note that `project` on GSI1 is **not** in the `workplaces` collection — it uses the same physical index but with a different partition key (`project` vs `office`). This is **index overloading**: one GSI serves multiple access patterns for different entity types.
+
+### Office Entity
+
+```typescript title="entities.ts"
+const Offices = Entity.make({
+  model: Office,
+  entityType: "Office",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["office"] },
+      sk: { field: "sk", composite: [] },
+    },
+    // GSI1 — "workplaces" collection (shared with Employee)
+    workplace: {
+      index: "gsi1",
+      collection: "workplaces",
+      pk: { field: "gsi1pk", composite: ["office"] },
+      sk: { field: "gsi1sk", composite: [] },
+    },
+    // GSI2 — standalone (offices by location)
+    byLocation: {
+      index: "gsi2",
+      pk: { field: "gsi2pk", composite: ["country", "state"] },
+      sk: { field: "gsi2sk", composite: ["city", "zip", "office"] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+---
+
+## Step 3: Seed Data
+
+```typescript title="seed.ts"
+const offices = {
+  gwZoo: {
+    office: "gw-zoo",
+    country: "US",
+    state: "OK",
+    city: "Wynnewood",
+    zip: "73098",
+    address: "25803 N County Road 3250",
+  },
+  bigCatRescue: {
+    office: "big-cat-rescue",
+    country: "US",
+    state: "FL",
+    city: "Tampa",
+    zip: "33625",
+    address: "12802 Easy St",
+  },
+}
+
+const employees = {
+  jlowe: {
+    employee: "jlowe",
+    firstName: "Joe",
+    lastName: "Lowe",
+    office: "gw-zoo",
+    title: "Zookeeper",
+    team: "jupiter" as const,
+    salary: "000045.00",
+    manager: "jlowe",
+    dateHired: "2020-01-01",
+    birthday: "1970-06-15",
+  },
+  cbaskin: {
+    employee: "cbaskin",
+    firstName: "Carole",
+    lastName: "Baskin",
+    office: "big-cat-rescue",
+    title: "Director",
+    team: "saturn" as const,
+    salary: "000150.00",
+    manager: "cbaskin",
+    dateHired: "1992-06-01",
+    birthday: "1961-06-06",
+  },
+  dfinlay: {
+    employee: "dfinlay",
+    firstName: "Don",
+    lastName: "Finlay",
+    office: "gw-zoo",
+    title: "Handler",
+    team: "jupiter" as const,
+    salary: "000035.00",
+    manager: "jlowe",
+    dateHired: "2021-03-15",
+    birthday: "1985-11-20",
+  },
+  hschreibvogel: {
+    employee: "hschreibvogel",
+    firstName: "Howard",
+    lastName: "Schreibvogel",
+    office: "big-cat-rescue",
+    title: "Volunteer",
+    team: "saturn" as const,
+    salary: "000000.00",
+    manager: "cbaskin",
+    dateHired: "2019-08-01",
+    birthday: "1955-03-22",
+  },
+}
+
+const tasks = {
+  feedCats: {
+    task: "feed-cats",
+    project: "feeding",
+    employee: "dfinlay",
+    description: "Feed the big cats their daily meals",
+  },
+  feedCubs: {
+    task: "feed-cubs",
+    project: "feeding",
+    employee: "hschreibvogel",
+    description: "Feed the cubs their special diet",
+  },
+  planGala: {
+    task: "plan-gala",
+    project: "fundraiser",
+    employee: "cbaskin",
+    description: "Plan the annual fundraiser gala",
+  },
+  sellMerch: {
+    task: "sell-merch",
+    project: "fundraiser",
+    employee: "jlowe",
+    description: "Sell merchandise at the gift shop",
+  },
+}
+```
+
+```typescript title="seed.ts"
+import { DynamoClient } from "effect-dynamodb"
+
+const {
+  Offices: boundOffices,
+  Employees: boundEmployees,
+  Tasks: boundTasks,
+} = yield* DynamoClient.make(HrTable)
+
+// Seed all data
+for (const office of Object.values(offices)) {
+  yield* boundOffices.put(office)
+}
+for (const emp of Object.values(employees)) {
+  yield* boundEmployees.put(emp)
+}
+for (const task of Object.values(tasks)) {
+  yield* boundTasks.put(task)
+}
+```
+
+---
+
+## Step 4: Fulfilling the Requirements
+
+### Requirement 1: CRUD
+
+> Create, read, update, and delete employees.
+
+```typescript
+// Create
+yield* boundEmployees.put(employees.jlowe)
+
+// Read
+const joe = yield* boundEmployees.get({ employee: "jlowe" })
+// joe.firstName → "Joe"
+// joe.title → "Zookeeper"
+
+// Update — promote Joe
+yield* boundEmployees.update(
+  { employee: "jlowe" },
+  Entity.set({
+    office: "gw-zoo",
+    team: "jupiter",
+    title: "Head Zookeeper",
+    salary: "000055.00",
+    manager: "jlowe",
+  }),
+)
+
+// Delete
+yield* boundEmployees.delete({ employee: "jlowe" })
+```
+
+Because Employee has `softDelete: true`, the delete doesn't destroy the record — it archives it. The employee vanishes from all GSI queries but remains retrievable for audit. See [Requirement 10](#requirement-10-termination--rehire) for the full soft delete workflow.
+
+### Requirement 2: Office + Employees (Workplaces Collection)
+
+> As a regional manager, see all details about an office and its employees.
+
+Employee and Office share GSI1 via the `workplaces` collection. Both use `office` as the partition key, so a single partition holds the office record and all employees at that location.
+
+```typescript
+// All employees at the GW Zoo
+const coworkers = yield* boundEmployees.collect(
+  Employees.query.coworkers({ office: "gw-zoo" }),
+)
+// → [{ employee: "jlowe", ... }, { employee: "dfinlay", ... }]
+
+// The office itself (same GSI, same partition)
+const officeRecords = yield* boundOffices.collect(
+  Offices.query.workplace({ office: "gw-zoo" }),
+)
+// → [{ office: "gw-zoo", city: "Wynnewood", state: "OK", ... }]
+```
+
+Both queries hit GSI1 with the same partition key (`office: "gw-zoo"`). DynamoDB serves both from the same item collection, making this highly efficient.
+
+### Requirement 3: Employee + Tasks (Assignments Collection)
+
+> As a project manager, find all tasks and details on a specific employee.
+
+Employee and Task share GSI3 via the `assignments` collection. Both use `employee` as the partition key.
+
+```typescript
+// Tasks assigned to dfinlay
+const assignedTasks = yield* boundTasks.collect(
+  Tasks.query.assigned({ employee: "dfinlay" }),
+)
+// → [{ task: "feed-cats", project: "feeding", ... }]
+
+// Employee details (same GSI, same partition)
+const employeeInfo = yield* boundEmployees.collect(
+  Employees.query.employeeLookup({ employee: "dfinlay" }),
+)
+// → [{ employee: "dfinlay", firstName: "Don", ... }]
+```
+
+### Requirement 4: Tasks by Project
+
+> As a product manager, see all tasks for a project.
+
+Task's `project` index on GSI1 uses `project` as the partition key. This is **index overloading** — the same physical GSI1 serves Employee's `coworkers` pattern, Office's `workplace` pattern, and Task's `project` pattern, each with different partition keys.
+
+```typescript
+const feedingTasks = yield* boundTasks.collect(
+  Tasks.query.project({ project: "feeding" }),
+)
+// → [
+//   { task: "feed-cats", employee: "dfinlay", ... },
+//   { task: "feed-cubs", employee: "hschreibvogel", ... },
+// ]
+
+const fundraiserTasks = yield* boundTasks.collect(
+  Tasks.query.project({ project: "fundraiser" }),
+)
+// → [
+//   { task: "plan-gala", employee: "cbaskin", ... },
+//   { task: "sell-merch", employee: "jlowe", ... },
+// ]
+```
+
+### Requirement 5: Offices by Location
+
+> As a client, find a physical office close to me.
+
+Office's `byLocation` index on GSI2 uses `country + state` as the partition key and `city + zip + office` as the sort key, enabling location-based queries with progressively finer granularity.
+
+```typescript
+// All offices in Florida
+const flOffices = yield* boundOffices.collect(
+  Offices.query.byLocation({ country: "US", state: "FL" }),
+)
+// → [{ office: "big-cat-rescue", city: "Tampa", zip: "33625", ... }]
+
+// All offices in Oklahoma
+const okOffices = yield* boundOffices.collect(
+  Offices.query.byLocation({ country: "US", state: "OK" }),
+)
+// → [{ office: "gw-zoo", city: "Wynnewood", zip: "73098", ... }]
+```
+
+### Requirement 6: Employees by Title + Salary Range
+
+> As a hiring manager, find employees with comparable salaries.
+
+Employee's `roles` index on GSI4 has `title` as the partition key and `salary + employee` as the sort key. Because salary is zero-padded (`"000150.00"`), it sorts lexicographically in the correct numeric order.
+
+```typescript
+import { KeyComposer, Query } from "effect-dynamodb"
+
+// All Zookeepers
+const zookeepers = yield* boundEmployees.collect(
+  Employees.query.roles({ title: "Zookeeper" }),
+)
+// → [{ employee: "jlowe", salary: "000045.00", ... }]
+
+// Directors in a salary range — compose SK bounds programmatically
+const rolesIndex = Employees.indexes.roles
+const loPrefix = KeyComposer.composeSortKeyPrefix(
+  HrSchema, "Employee", 1, rolesIndex, { salary: "000000.00" },
+)
+const hiPrefix = KeyComposer.composeSortKeyPrefix(
+  HrSchema, "Employee", 1, rolesIndex, { salary: "999999.99" },
+)
+
+const directors = yield* boundEmployees.collect(
+  Employees.query.roles({ title: "Director" }).pipe(
+    Query.where({ between: [loPrefix, hiPrefix] }),
+  ),
+)
+// → [{ employee: "cbaskin", salary: "000150.00", ... }]
+```
+
+### Requirement 7: Direct Reports
+
+> As HR, find all employees that report to a specific manager.
+
+Employee's `directReports` index on GSI5 uses `manager` as the partition key.
+
+```typescript
+// Joe Lowe's reports (includes self — self-managed)
+const jloweReports = yield* boundEmployees.collect(
+  Employees.query.directReports({ manager: "jlowe" }),
+)
+// → [{ employee: "dfinlay", ... }, { employee: "jlowe", ... }]
+
+// Carole Baskin's reports
+const cbaskinReports = yield* boundEmployees.collect(
+  Employees.query.directReports({ manager: "cbaskin" }),
+)
+// → [{ employee: "cbaskin", ... }, { employee: "hschreibvogel", ... }]
+```
+
+### Requirement 8: Employee Transfer (All-or-None GSI Constraints)
+
+> As HR, transfer an employee between offices while keeping all indexes consistent.
+
+Transferring an employee touches composites across multiple GSIs. When you update a field that appears in a GSI's composite key, you must provide **all** composites for that GSI — otherwise the index key can't be recomposed. This is the "fetch-merge" pattern.
+
+```typescript
+// Transfer dfinlay from gw-zoo to big-cat-rescue
+// This touches composites for:
+//   GSI1 (coworkers): office, team, title — all 3 required
+//   GSI4 (roles):     title, salary       — both required
+//   GSI5 (directReports): manager, team, office — all 3 required
+yield* boundEmployees.update(
+  { employee: "dfinlay" },
+  Entity.set({
+    office: "big-cat-rescue",
+    team: "saturn",
+    title: "Handler",       // required for GSI1 (office + team + title)
+    salary: "000035.00",    // required for GSI4 (title + salary)
+    manager: "cbaskin",     // required for GSI5 (manager + team + office)
+  }),
+)
+
+// Verify: dfinlay now in cbaskin's reports
+const newReports = yield* boundEmployees.collect(
+  Employees.query.directReports({ manager: "cbaskin" }),
+)
+// → [cbaskin, dfinlay, hschreibvogel] — 3 reports
+
+// And gone from jlowe's reports
+const jloweReportsAfter = yield* boundEmployees.collect(
+  Employees.query.directReports({ manager: "jlowe" }),
+)
+// → [jlowe] — only self remains
+```
+
+What happens if you provide only some composites? The type system warns you, and at runtime `extractComposites` fails with a `ValidationError` naming the violating index:
+
+```typescript
+// This fails — office alone can't recompose GSI1 (needs team + title too)
+yield* boundEmployees.update(
+  { employee: "dfinlay" },
+  Entity.set({ office: "gw-zoo" } as any), // bypassing types for demo
+)
+// → ValidationError: missing composite "team" for index "coworkers"
+```
+
+### Requirement 9: Atomic Onboarding (Transaction)
+
+> As HR, atomically onboard a new employee with their first task.
+
+`Transaction.transactWrite` ensures both the employee and task are created atomically — if either fails, neither is persisted.
+
+```typescript
+import { Transaction } from "effect-dynamodb"
+
+yield* Transaction.transactWrite([
+  Employees.put({
+    employee: "rstarr",
+    firstName: "Rick",
+    lastName: "Starr",
+    office: "gw-zoo",
+    title: "Trainee",
+    team: "jupiter",
+    salary: "000025.00",
+    manager: "jlowe",
+    dateHired: "2024-01-15",
+    birthday: "1995-04-10",
+  }),
+  Tasks.put({
+    task: "orientation",
+    project: "onboarding",
+    employee: "rstarr",
+    description: "Complete new-hire orientation and safety training",
+  }),
+])
+
+// Both created atomically
+const newHire = yield* boundEmployees.get({ employee: "rstarr" })
+// → { firstName: "Rick", title: "Trainee", office: "gw-zoo", ... }
+
+const onboardingTasks = yield* boundTasks.collect(
+  Tasks.query.assigned({ employee: "rstarr" }),
+)
+// → [{ task: "orientation", project: "onboarding", ... }]
+```
+
+### Requirement 10: Termination + Rehire (Soft Delete + Restore)
+
+> As HR, terminate an employee (archiving their record) and rehire them later.
+
+Because Employee has `softDelete: true`, deleting an employee **archives** the record rather than destroying it. The sort key is replaced, GSI keys are stripped, and a `deletedAt` timestamp is added. The employee vanishes from all index queries but the record is preserved for compliance.
+
+```typescript
+import { Entity } from "effect-dynamodb"
+
+// Terminate hschreibvogel
+yield* boundEmployees.delete({ employee: "hschreibvogel" })
+
+// Gone from all GSI queries
+const reportsAfterTermination = yield* boundEmployees.collect(
+  Employees.query.directReports({ manager: "cbaskin" }),
+)
+// hschreibvogel is no longer in cbaskin's reports
+
+// But the record is preserved for HR audit
+const terminated = yield* Employees.deleted.get({ employee: "hschreibvogel" })
+// → { firstName: "Howard", deletedAt: ..., ... }
+
+// Rehire: restore recomposes all keys
+const rehired = yield* boundEmployees.restore({ employee: "hschreibvogel" })
+// → { firstName: "Howard", office: "big-cat-rescue", ... }
+
+// Back in all GSI queries
+const reportsAfterRehire = yield* boundEmployees.collect(
+  Employees.query.directReports({ manager: "cbaskin" }),
+)
+// hschreibvogel is back in cbaskin's reports
+```
+
+---
+
+## Running the Example
+
+The complete runnable example is at [`examples/hr.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/hr.ts) in the repository. It seeds data, runs all 10 access patterns, and verifies each with assertions.
+
+```bash
+docker run -d -p 8000:8000 amazon/dynamodb-local
+```
+
+```bash
+npx tsx examples/hr.ts
+```
+
+### Layer Setup
+
+The example wires dependencies via Effect Layers — no global config or constructor options:
+
+```typescript title="main.ts"
+import { Effect, Layer } from "effect"
+import { DynamoClient } from "effect-dynamodb"
+
+const AppLayer = Layer.mergeAll(
+  DynamoClient.layer({
+    region: "us-east-1",
+    endpoint: "http://localhost:8000",
+    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  }),
+  HrTable.layer({ name: "hr-table" }),
+)
+
+const main = program.pipe(Effect.provide(AppLayer))
+
+Effect.runPromise(main).then(
+  () => console.log("Done."),
+  (err) => console.error("Failed:", err),
+)
+```
+
+---
+
+## Key Takeaways
+
+| Concept | How it's used |
+|---------|---------------|
+| **Single-table design** | 3 entities, 1 table, structured key values |
+| **Index overloading** | GSI1 serves employees-by-office, tasks-by-project, and offices-by-office |
+| **Collections** | `workplaces` (GSI1) and `assignments` (GSI3) enable cross-entity queries |
+| **Sort key range queries** | Zero-padded salary in GSI4 SK enables `between` queries |
+| **All-or-none GSI updates** | Updating one GSI composite requires all composites for that index |
+| **Transactions** | Atomic multi-entity writes for onboarding |
+| **Soft delete + restore** | Termination archives records; rehire restores them with all keys recomposed |
+
+## What's Next?
+
+- [Modeling Guide](/effect-dynamodb/guides/modeling/) — Deep dive into models, schemas, tables, and entities
+- [Indexes & Collections](/effect-dynamodb/guides/indexes/) — Access pattern design and collection patterns
+- [Lifecycle](/effect-dynamodb/guides/lifecycle/) — Soft delete, versioning, and TTL
+- [Cricket Match Manager](/effect-dynamodb/tutorials/gamemanager/) — Full end-to-end tutorial building a REST API

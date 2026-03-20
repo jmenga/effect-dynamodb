@@ -48,11 +48,12 @@
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.700.0",
     "@aws-sdk/util-dynamodb": "^3.700.0",
-    "effect": "^4.0.0-beta.27"
+    "effect": "4.0.0-beta.33"
   },
   "devDependencies": {
-    "@effect/vitest": "^4.0.0-beta.27",
+    "@effect/vitest": "4.0.0-beta.33",
+    "@types/node": "^25.5.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
+    "vitest": "^4.1.0"
   }
 }

@@ -1,0 +1,180 @@
+---
+title: "Getting Started"
+description: "Quick start guide for effect-dynamodb — installation, setup, and first entity"
+---
+
+Get up and running with effect-dynamodb in five minutes. This guide walks you through defining a model, creating a table and entity, and performing basic CRUD operations.
+
+## Prerequisites
+
+- Node.js 18+
+- An AWS account with DynamoDB access (or DynamoDB Local for development)
+- Basic familiarity with [Effect TS](https://effect.website) and [Effect Schema](https://effect.website/docs/schema/introduction)
+
+## Installation
+
+```bash
+pnpm add effect-dynamodb effect @effect/experimental @aws-sdk/client-dynamodb @aws-sdk/util-dynamodb
+```
+
+## Quick Start: A Single Entity
+
+### 1. Define a Model
+
+Models are plain Effect Schema definitions — no DynamoDB concepts. Use `Schema.Class` for class instances with `instanceof` support, or `Schema.Struct` for plain objects.
+
+```typescript
+import { Schema } from "effect"
+
+class Todo extends Schema.Class<Todo>("Todo")({
+  todoId: Schema.String,
+  title:  Schema.NonEmptyString,
+  done:   Schema.Boolean,
+}) {}
+```
+
+### 2. Create a Schema
+
+```typescript
+import { DynamoSchema } from "effect-dynamodb"
+
+const AppSchema = DynamoSchema.make({
+  name: "myapp",
+  version: 1,
+})
+```
+
+### 3. Define an Entity
+
+The Entity definition connects your model to the table with key composition rules and optional features.
+
+```typescript
+import { Entity } from "effect-dynamodb"
+
+const TodoEntity = Entity.make({
+  model: Todo,
+  entityType: "Todo",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["todoId"] },
+      sk: { field: "sk", composite: [] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+This tells effect-dynamodb:
+- The partition key is composed from `todoId`
+- The sort key is just the entity type prefix (no additional attributes)
+- `createdAt` and `updatedAt` are automatically managed
+
+### 4. Use It
+
+Register your entity on a table, then call `DynamoClient.make(table)` to get a typed client with executable operations. `DynamoClient.make()` resolves `DynamoClient` and `TableConfig` from the Effect context — you provide these as Layers when you run the program.
+
+```typescript
+import { Effect, Layer } from "effect"
+import { DynamoClient, Entity, Table } from "effect-dynamodb"
+
+// Register entities on the table
+const MainTable = Table.make({ schema: AppSchema, entities: { TodoEntity } })
+
+const program = Effect.gen(function* () {
+  // Required gateway — resolves dependencies, returns executable operations
+  const { TodoEntity: todos } = yield* DynamoClient.make(MainTable)
+
+  // Create
+  const todo = yield* todos.put({
+    todoId: "t-1",
+    title: "Learn effect-dynamodb",
+    done: false,
+  })
+  console.log(todo)
+  // { todoId: "t-1", title: "Learn effect-dynamodb", done: false,
+  //   version: 1, createdAt: DateTime.Utc, updatedAt: DateTime.Utc }
+
+  // Read
+  const found = yield* todos.get({ todoId: "t-1" })
+
+  // Update
+  yield* todos.update({ todoId: "t-1" }, Entity.set({ done: true }))
+
+  // Delete
+  yield* todos.delete({ todoId: "t-1" })
+})
+
+// Run with a real DynamoDB client
+const main = program.pipe(
+  Effect.provide(
+    Layer.mergeAll(
+      DynamoClient.layer({ region: "us-east-1" }),
+      MainTable.layer({ name: "Main" }),
+    )
+  )
+)
+
+Effect.runPromise(main)
+```
+
+### What Gets Stored in DynamoDB
+
+For the `put` call above, effect-dynamodb generates:
+
+| Attribute | Value |
+|-----------|-------|
+| `pk` | `$myapp#v1#todo#t-1` |
+| `sk` | `$myapp#v1#todo` |
+| `__edd_e__` | `Todo` |
+| `todoId` | `t-1` |
+| `title` | `Learn effect-dynamodb` |
+| `done` | `false` |
+| `createdAt` | `2024-01-15T10:30:00.000Z` |
+| `updatedAt` | `2024-01-15T10:30:00.000Z` |
+
+The key format (`$myapp#v1#todo#t-1`) is automatically generated from the schema, version, entity type, and composite attributes. You declare *which* attributes compose the key — the system handles *how*.
+
+## Optional Packages
+
+### Language Service Plugin
+
+The TypeScript Language Service Plugin enhances IDE hover tooltips to show the DynamoDB operations that effect-dynamodb will execute. Hover over `Users.get(...)`, `Users.query.byRole(...)`, or any entity operation to see the underlying DynamoDB command, key structure, and index being used.
+
+```bash
+pnpm add -D @effect-dynamodb/language-service
+```
+
+Add the plugin to your `tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "plugins": [
+      { "name": "@effect-dynamodb/language-service" }
+    ]
+  }
+}
+```
+
+The plugin detects `get`, `put`, `create`, `update`, `delete`, `query`, and `scan` operations. It resolves entities across imported modules, shows composed keys, and renders expressions (KeyCondition, Filter, Update, Condition) — all directly in your editor's hover tooltip.
+
+### Geospatial Package
+
+For proximity-based queries (e.g., "find all vehicles within 2 km"), the geo package adds H3 hexagonal grid indexing on top of effect-dynamodb entities.
+
+```bash
+pnpm add @effect-dynamodb/geo
+```
+
+See the [Geospatial](/effect-dynamodb/guides/geospatial/) guide for setup and usage.
+
+## What's Next?
+
+- [Modeling](/effect-dynamodb/guides/modeling/) — Learn about Schema.Class models, DynamoSchema, Table, Entity, and derived types
+- [Indexes & Collections](/effect-dynamodb/guides/indexes/) — Define access patterns with primary and secondary indexes
+- [Queries](/effect-dynamodb/guides/queries/) — Use the pipeable Query API for composable, type-safe queries
+- [Data Integrity](/effect-dynamodb/guides/data-integrity/) — Unique constraints, versioning, and optimistic concurrency
+- [Lifecycle](/effect-dynamodb/guides/lifecycle/) — Soft delete, restore, purge, and version retention
+- [Advanced](/effect-dynamodb/guides/advanced/) — Rich updates, batch operations, multi-table design
+- [DynamoDB Streams](/effect-dynamodb/guides/streams/) — Decode stream records into typed domain objects
+- [Testing](/effect-dynamodb/guides/testing/) — Mock DynamoClient and test patterns

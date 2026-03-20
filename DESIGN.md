@@ -6,35 +6,30 @@
 
 effect-dynamodb provides a type-safe, Effect-native DynamoDB ORM that makes single-table design first-class. The library bridges the gap between Effect's composable programming model and DynamoDB's access-pattern-driven data modeling, delivering an API where domain models are portable, storage concerns are declarative, and queries compose via pipes.
 
-### Five Principles
+### Six Principles
 
 1. **Domain models are portable.** A `User` schema should work with DynamoDB, SQL, or an API response — no storage concepts leak into the model.
 2. **Entity owns storage concerns.** Key composition, timestamps, versioning, soft delete — all configured at the Entity level, not annotated on model fields.
 3. **Convention over configuration.** The system owns key format, delimiters, and serialization. The developer declares *which* attributes compose each key, not *how*.
 4. **Composable queries.** Queries are pipeable data types with combinators, not builder patterns. They follow Effect TS idioms.
 5. **Type safety from declarations.** Seven types are derived automatically from Model + Table + Entity — zero manual type maintenance.
+6. **Client is the gateway.** `DynamoClient.make(table)` is the sole execution gateway — it resolves infrastructure dependencies, binds all entities and aggregates registered on the table, and returns a typed client where every operation has `R = never`. This matches `HttpApiClient.make(api)` from Effect v4 and enables clean service boundaries with layer-based testing.
 
 ### Design Evolution
 
-The API went through a significant redesign that established the current architecture. Key changes:
+The API went through two significant redesigns:
 
-| Concern | Original | Current |
-|---------|----------|---------|
-| Model base class | `DynamoModel.Class` (VariantSchema) | Standard `Schema.Class` |
-| Key fields | `DynamoModel.ComposedKey`, `DynamoModel.KeyField` | `DynamoModel.Immutable` (field annotation only) |
-| Key composition | Template strings: `"USER#${userId}"` | Attribute lists: `composite: ["userId"]` |
-| Timestamps | `DynamoModel.DateTimeInsert`, `DynamoModel.DateTimeUpdate` | `Entity.make({ timestamps: true })` |
-| Versioning | Not supported | `Entity.make({ versioned: true })` |
-| Soft delete | Not supported | `Entity.make({ softDelete: true })` |
-| Unique constraints | Not supported | `Entity.make({ unique: { email: ["email"] } })` |
-| Index definition | `keys: { primary: { pk: "USER#${userId}", sk: "METADATA" } }` | `indexes: { primary: { pk: { field: "pk", composite: ["userId"] } } }` |
-| Application namespace | Not supported | `DynamoSchema.make({ name: "myapp", version: 1 })` |
-| Query API | `repo.query.gsi1({ pk: {...}, sk: {...} })` → `Stream` | `Users.query.byTenant({...}).pipe(Query.where(...), Query.execute)` |
-| Collections | `Collection.query(indexName, { pk, sk })` | `TenantItems.query({...}).pipe(TenantItems.users, Query.execute)` |
-| Derived types | 4 (item, insert, update, key via VariantSchema) | 7 (Model, Record, Input, Update, Key, Item, Marshalled) |
-| Entity operations | Flat: `repo.put`, `repo.get`, `repo.delete` | Direct on Entity: `Users.get`, `Users.put`, `Users.update`, `Users.delete`, `Users.restore`, `Users.purge`, `Users.versions`, `Users.deleted` |
+| Concern | v1 | v2 (bind pattern) | v3 (client gateway) |
+|---------|----|--------------------|---------------------|
+| Model base class | `DynamoModel.Class` (VariantSchema) | Standard `Schema.Class` | Standard `Schema.Class` |
+| Key composition | Template strings: `"USER#${userId}"` | Attribute lists: `composite: ["userId"]` | Attribute lists: `composite: ["userId"]` |
+| Entity definition | `Entity.make({ model, table, ... })` | `Entity.make({ model, table, ... })` | `Entity.make({ model, ... })` — no `table` |
+| Table definition | `Table.make({ schema })` | `Table.make({ schema })` | `Table.make({ schema, entities, aggregates })` |
+| Execution gateway | `repo.put`, `repo.get` (flat) | `yield* Entity.bind(e)` → `BoundEntity` | `yield* DynamoClient.make(table)` → typed client |
+| Aggregate internals | N/A | Composes Entity, Collection, Transaction | Composes Entity, Collection, Transaction |
+| Aggregate edges | N/A | Explicit first-class entities | Explicit first-class entities |
 
-The redesign moved all DynamoDB concepts out of the model layer, replaced template-string key composition with ElectroDB-style attribute lists, introduced `DynamoSchema` for application namespacing, and made Entity the repository (operations directly on the Entity object).
+The v3 redesign moved the `table` parameter out of `Entity.make()` (entities are now pure definitions), had `Table.make()` declare its members (entities + aggregates) up front, and established `DynamoClient.make(table)` as the typed execution gateway — matching `HttpApiClient.make(api)` from Effect v4 where the API definition describes the shape, and the client factory returns typed access to every group and operation.
 
 ---
 
@@ -44,25 +39,47 @@ The redesign moved all DynamoDB concepts out of the model layer, replaced templa
 
 ```
 packages/effect-dynamodb/src/
-├── DynamoModel.ts      # DynamoModel.Immutable annotation for Schema.Class/Struct fields
+├── DynamoModel.ts      # Schema annotations (Hidden, identifier, ref) and configure() for field overrides (immutable, field rename, storedAs)
 ├── DynamoSchema.ts     # Application namespace (name + version) for key prefixing
-├── Table.ts            # Minimal table grouping ({ schema }) with Layer-based name injection
-├── Entity.ts           # Model-to-table binding, index definitions, CRUD + query operations
+├── Table.ts            # Table definition: { schema, entities, aggregates } — declares members up front
+├── Entity.ts           # Entity definition (pure, no table ref) + typed operations
+├── Aggregate.ts        # Aggregate definition — composes Entity, Collection, Transaction
+├── EventStore.ts       # EventStream definition — event sourcing on DynamoDB
 ├── KeyComposer.ts      # Composite key composition from index definitions
 ├── Collection.ts       # Multi-entity queries with per-entity Schema decode
-├── Expression.ts       # Condition, filter, and update expression builders
+├── Expression.ts       # Condition, filter, and update expression builders (ConditionInput / UpdateInput)
 ├── Transaction.ts      # TransactGetItems + TransactWriteItems (atomic multi-item ops)
 ├── Projection.ts       # ProjectionExpression builder for selecting specific attributes
-├── DynamoClient.ts     # ServiceMap.Service wrapping AWS SDK DynamoDBClient
+├── DynamoClient.ts     # ServiceMap.Service wrapping AWS SDK + DynamoClient.make(table) typed gateway
 ├── Marshaller.ts       # Thin wrapper around @aws-sdk/util-dynamodb
 ├── Errors.ts           # Tagged errors
+├── internal/           # Decomposed internals
+│   ├── Expr.ts         # Expr ADT — type-safe expression nodes, ConditionOps, compileExpr
+│   ├── PathBuilder.ts  # PathBuilder — recursive Proxy for type-safe attribute path access
+│   ├── EntityOps.ts    # Entity operation intermediates (EntityGet, EntityPut, EntityUpdate, EntityDelete)
+│   ├── EntityTypes.ts  # Type-level computations for Entity derived types
+│   ├── EntitySchemas.ts # Schema derivation (7 derived schemas)
+│   ├── EntityCombinators.ts # Terminal functions and update combinators (record + path-based)
+│   └── ...             # Other internal modules
+└── index.ts            # Public API barrel export
+
+packages/effect-dynamodb-geo/src/
+├── GeoIndex.ts         # GeoIndex definition — geospatial indexing on Entity
+├── GeoSearch.ts        # Internal search orchestration (H3 multi-cell parallel query)
+├── H3.ts               # H3 hexagonal grid utilities
+├── Spherical.ts        # Great-circle distance calculations
 └── index.ts            # Public API barrel export
 ```
 
 ### Data Flow
 
 ```
-User code → Entity.put(inputData)
+User code → yield* DynamoClient.make(MainTable)  // typed execution gateway
+  → resolves DynamoClient service + TableConfig from context
+  → binds ALL entities and aggregates registered on the table
+  → returns typed client: { Users, Tasks, Matches, createTable, ... }
+
+db.Users.put(inputData)
   → Schema.decode(Entity.Input) — validate input
   → compose keys (KeyComposer) for all indexes using composite attributes
   → add __edd_e__ + timestamps + version
@@ -70,20 +87,20 @@ User code → Entity.put(inputData)
   → DynamoClient.putItem (or transactWriteItems for unique constraints)
   → Schema.decode(Entity.Record) — decode full item for return
 
-User code → Entity.get(key)
+db.Users.get(key)
   → compose primary key → DynamoClient.getItem
   → unmarshall → Schema.decode(Entity.Record) — validate & type
 
-User code → Entity.query.indexName({ pk composites }).pipe(Query.collect)
+db.Users.execute(Users.query.indexName({ pk composites }))
   → compose PK/SK from composite attributes (KeyComposer)
   → build KeyConditionExpression + __edd_e__ FilterExpression
   → Stream.paginate (automatic DynamoDB pagination)
   → unmarshall → Schema.decode(Entity.Record) per item
 
-User code → Collection.query(collectionName, { pk composites })
-  → build KeyConditionExpression + __edd_e__ IN FilterExpression
-  → Stream.paginate (automatic DynamoDB pagination)
-  → unmarshall → discriminate by __edd_e__ → decode through matching entity schema
+db.Matches.get({ matchId: "m-1" })
+  → internally uses Collection query to fetch all items in partition
+  → discriminate by __edd_e__ into edge entity buckets
+  → assemble into domain object
 ```
 
 ### Key Design Decisions
@@ -94,10 +111,12 @@ User code → Collection.query(collectionName, { pk composites })
 | Raw AWS SDK (not @effect-aws) | Avoid extra dependency; thin wrapper is simple enough |
 | Effect Schema as sole schema system | Native Effect integration, bidirectional transforms, branded types |
 | Schema.Class/Struct for models | Pure domain schemas — no DynamoDB concepts in models. Entity derives DynamoDB types |
-| Entity IS the repository | `Entity.make()` returns definition + operations. No separate EntityRepository step |
+| DynamoClient.make(table) as typed gateway | `Table.make({ entities, aggregates })` declares members; `DynamoClient.make(table)` binds them all and returns typed access. Matches `HttpApiClient.make(api)` pattern from Effect v4 |
+| Entities are pure definitions | `Entity.make()` has no `table` parameter — entities carry only model, indexes, and config. Table association happens at `Table.make()` time |
+| Table declares its members | `Table.make({ schema, entities: { Users, Tasks }, aggregates: { Matches } })` — the named record provides property names on the typed client |
+| Aggregates compose entity operations | Aggregates never touch DynamoClient. They orchestrate Entity, Collection, and Transaction primitives |
 | ElectroDB-style composite indexes | `{ pk: { field, composite }, sk: { field, composite } }` — attribute lists not templates |
 | DynamoSchema for key namespacing | `$schema#v1#entity#attrs` format with `$` sentinel prefix for ORM/non-ORM coexistence |
-| Table stripped to `{ schema }` | Key structure derived from entities. Physical table name injected via Layer at runtime |
 | `__edd_e__` entity type attribute | Ugly name convention (like ElectroDB's `__edb_e__`) avoids collisions with user model fields |
 | Single-table first | Most impactful DynamoDB pattern; multi-table is simpler subset |
 | @aws-sdk/util-dynamodb for marshalling | Proven, maintained; Effect Schema handles validation layer above |
@@ -105,18 +124,37 @@ User code → Collection.query(collectionName, { pk composites })
 ### Module Dependencies
 
 ```
+Aggregate → Entity, Collection, Transaction, Errors (never DynamoClient directly)
 Entity → DynamoClient, DynamoSchema, Table, KeyComposer, Marshaller, Expression, Errors
 Collection → DynamoClient, Entity, Table, Marshaller, Errors
 Transaction → DynamoClient, Entity, KeyComposer, Marshaller, Expression, Errors
 Projection → (standalone, no internal deps)
 Expression → Marshaller
-Table → DynamoSchema
+Table → DynamoSchema, Entity (type-level for member registration)
 DynamoSchema → (standalone, no internal deps)
-DynamoModel → effect (Schema) — provides Immutable annotation
-DynamoClient → effect (ServiceMap, Layer), @aws-sdk/client-dynamodb
+DynamoModel → effect (Schema) — provides annotations (Hidden, identifier, ref) and configure()
+DynamoClient → effect (ServiceMap, Layer), @aws-sdk/client-dynamodb, Entity (for make() binding)
 KeyComposer → (standalone, no internal deps)
 Marshaller → @aws-sdk/util-dynamodb
 Errors → effect (Data)
+```
+
+### Layering Principle
+
+Higher-level constructs compose lower-level primitives. No layer may bypass the one below:
+
+```
+┌─────────────────────────────────────┐
+│  DynamoClient.make(table)           │  ← typed gateway (binds all members, R = never)
+├─────────────────────────────────────┤
+│  Aggregate / GeoIndex / EventStore  │  ← orchestration (decompose, assemble, diff)
+├─────────────────────────────────────┤
+│  Collection / Transaction / Batch   │  ← multi-entity coordination
+├─────────────────────────────────────┤
+│  Entity                             │  ← single-item CRUD, keys, validation, versioning
+├─────────────────────────────────────┤
+│  DynamoClient (raw service)         │  ← raw AWS SDK operations
+└─────────────────────────────────────┘
 ```
 
 ---
@@ -139,33 +177,29 @@ class User extends Schema.Class<User>("User")({
 }) {}
 ```
 
-### DynamoModel.Immutable — Field Annotation
+### DynamoModel.configure — Immutable Fields
 
-The sole export from `DynamoModel` is `Immutable`, a schema annotation that marks a field as read-only after creation. Immutable fields are excluded from `Entity.Update<E>` alongside key-referenced fields.
+`DynamoModel.configure` wraps a model with per-field DynamoDB overrides, keeping ORM concerns separate from pure domain models. The `immutable` option marks a field as read-only after creation — excluded from `Entity.Update<E>` alongside key-referenced fields.
 
 ```typescript
 import { Schema } from "effect"
 import { DynamoModel } from "effect-dynamodb"
 
+// Pure domain model — no DynamoDB concepts
 class User extends Schema.Class<User>("User")({
   userId:      Schema.String,
   email:       Schema.String,
   displayName: Schema.NonEmptyString,
-  createdBy:   Schema.String.pipe(DynamoModel.Immutable),  // never changes after creation
+  createdBy:   Schema.String,
 }) {}
+
+// DynamoDB-specific configuration — separate from model
+const UserModel = DynamoModel.configure(User, {
+  createdBy: { immutable: true },  // never changes after creation
+})
 ```
 
-**Implementation:**
-
-```typescript
-// DynamoModel.ts — the entire public surface
-const ImmutableId: unique symbol = Symbol.for("effect-dynamodb/Immutable")
-
-export const Immutable = <S extends Schema.Top>(schema: S) =>
-  schema.pipe(Schema.annotate({ [ImmutableId]: true }))
-```
-
-The Entity inspects each field's schema, checks for the `ImmutableId` annotation, and excludes that field from `Entity.Update<E>`.
+The Entity reads the `immutable` flag from the configured model's attributes and excludes that field from `Entity.Update<E>`.
 
 ---
 
@@ -251,47 +285,9 @@ $myapp#v2#user#abc-123     ← New version (migration in progress)
 
 ## 5. Table & Entity
 
-### Table — Shared Reference
+### Entity — Pure Definition
 
-`Table` groups entities that share a physical DynamoDB table and application namespace. It carries the `DynamoSchema` reference used for key prefix generation. The physical table name is not declared here — it is provided at runtime via `Table.layer()`.
-
-```typescript
-import { Table } from "effect-dynamodb"
-
-const MainTable = Table.make({
-  schema: AppSchema,
-})
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `schema` | `DynamoSchema` | The application schema (provides key prefixing) |
-
-### Runtime Configuration
-
-The physical table name is injected at runtime via Effect Layers, keeping definitions pure and environment-independent:
-
-```typescript
-// Provide physical table name at the edge
-MainTable.layer({ name: "my-prod-table" })
-
-// Or from environment variables via Effect Config
-MainTable.layerConfig({ name: Config.string("TABLE_NAME") })
-```
-
-### Table.definition — Derive Infrastructure
-
-Since the Table no longer declares key structure, it is derived from entities:
-
-```typescript
-const createTableInput = Table.definition(MainTable, [
-  UserEntity, TaskEntity, ProjectMemberEntity,
-])
-```
-
-### Entity — ElectroDB-Style Index Definitions
-
-The Entity binds a model to a table with key composition rules, system field configuration, unique constraints, and collection membership.
+An Entity binds a domain model to key composition rules, system field configuration, unique constraints, and collection membership. **Entities do not reference a Table** — they are pure definitions carrying only model, indexes, and config.
 
 ```typescript
 import { Duration } from "effect"
@@ -299,7 +295,6 @@ import { Entity } from "effect-dynamodb"
 
 const UserEntity = Entity.make({
   model: User,
-  table: MainTable,
   entityType: "User",
   indexes: {
     primary: {
@@ -326,9 +321,116 @@ const UserEntity = Entity.make({
 })
 ```
 
-### Entity as Operations Namespace
+### Table — Declares Members
 
-`Entity.make()` returns both a static definition and an operations namespace. The same object provides type derivation (`Entity.Record<typeof Users>`) and DynamoDB operations (`Users.put(...)`, `Users.get(...)`, `Users.query.byTenant(...)`).
+`Table` groups entities and aggregates that share a physical DynamoDB table and application namespace. It carries the `DynamoSchema` reference used for key prefix generation and the named records of its members. The physical table name is provided at runtime via `Table.layer()`.
+
+```typescript
+import { Table } from "effect-dynamodb"
+
+const MainTable = Table.make({
+  schema: AppSchema,
+  entities: { Users: UserEntity, Tasks: TaskEntity },
+  aggregates: { Matches: MatchAggregate },
+})
+```
+
+The named record keys (`Users`, `Tasks`, `Matches`) become the property names on the typed client returned by `DynamoClient.make()`.
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `schema` | `DynamoSchema` | Yes | The application schema (provides key prefixing) |
+| `entities` | `Record<string, Entity>` | No | Named entity definitions |
+| `aggregates` | `Record<string, Aggregate>` | No | Named aggregate definitions |
+
+### Runtime Configuration
+
+The physical table name is injected at runtime via Effect Layers, keeping definitions pure and environment-independent:
+
+```typescript
+// Provide physical table name at the edge
+MainTable.layer({ name: "my-prod-table" })
+
+// Or from environment variables via Effect Config
+MainTable.layerConfig({ name: Config.string("TABLE_NAME") })
+```
+
+### DynamoClient.make(table) — Typed Execution Gateway
+
+`DynamoClient.make(table)` is the sole gateway for executing operations. It resolves infrastructure dependencies (`DynamoClient` service + `TableConfig`), binds all entities and aggregates registered on the table, and returns a typed client where every operation has `R = never`.
+
+This follows the `HttpApiClient.make(api)` pattern from Effect v4: the table definition describes the shape (like `HttpApi` describes endpoints), and the client factory returns typed access to every member (like `HttpApiClient` returns typed access to every group).
+
+```typescript
+const program = Effect.gen(function* () {
+  const db = yield* DynamoClient.make(MainTable)
+
+  // Entity operations — typed, R = never
+  const user = yield* db.Users.get({ userId: "123" })
+  yield* db.Users.put({ userId: "456", ... })
+
+  // Aggregate operations — typed, R = never
+  const match = yield* db.Matches.get({ matchId: "m-1" })
+
+  // Table management
+  yield* db.createTable()
+  yield* db.deleteTable
+  const info = yield* db.describeTable
+})
+```
+
+The typed client provides:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `db.<EntityName>` | `BoundEntity<...>` | Bound entity operations (get, put, create, update, delete, query, etc.) |
+| `db.<AggregateName>` | `BoundAggregate<...>` | Bound aggregate operations (get, create, update, delete, list) |
+| `db.createTable(options?)` | `Effect<void, DynamoClientError>` | Create the physical table (derives schema from members) |
+| `db.deleteTable` | `Effect<void, DynamoClientError>` | Delete the physical table |
+| `db.describeTable` | `Effect<DescribeTableOutput, DynamoClientError>` | Describe the table |
+
+### Service Pattern
+
+Wrap `DynamoClient.make(table)` in `ServiceMap.Service` for dependency injection and testability. Destructure to access only the entities you need:
+
+```typescript
+export class TeamService extends ServiceMap.Service<TeamService>()("@gamemanager/TeamService", {
+  make: Effect.gen(function* () {
+    const { Teams } = yield* DynamoClient.make(MainTable)
+    return {
+      create: Effect.fn(function* (input: CreateTeamInput) {
+        const id = ulid() as TeamId
+        return yield* Teams.put({ ...input, id })
+      }),
+      get: (id: TeamId) => Teams.get({ id }),
+      update: (id: TeamId, updates: UpdateTeamInput) => Teams.update({ id }, updates),
+      delete: (id: TeamId) => Teams.delete({ id }),
+      list: (filter: TeamListFilter = {}, pagination?: PaginationOptions) =>
+        Teams.execute(applyPagination(Teams.query.byAll(filter), pagination)).pipe(
+          Effect.map((page) => ({
+            data: page.items,
+            count: page.items.length,
+            cursor: page.cursor,
+          })),
+        ),
+    }
+  }),
+}) {}
+```
+
+Testing — mock at the service level, no DynamoDB needed:
+
+```typescript
+program.pipe(
+  Effect.provide(Layer.succeed(TeamService, {
+    get: () => Effect.succeed(fakeTeam),
+    create: () => Effect.succeed(fakeTeam),
+    list: () => Effect.succeed({ data: [], count: 0, cursor: null }),
+  }))
+)
+```
+
+The entity definition still provides type derivation (`Entity.Record<typeof UserEntity>`, `Entity.Key<typeof UserEntity>`, etc.) without the client.
 
 ### Index Properties
 
@@ -639,7 +741,6 @@ const OrderModel = DynamoModel.configure(Order, {
 
 const OrderEntity = Entity.make({
   model: OrderModel,
-  table: MainTable,
   entityType: "Order",
   indexes: { ... },
 })
@@ -667,7 +768,7 @@ const OrderEntity = Entity.make({
 |--------|-------------|
 | `DynamoModel.storedAs(schema)` | Override DynamoDB storage format via schema annotation (Pattern A) |
 | `DynamoModel.configure(model, attributes)` | Create a configured model with per-field storage overrides and field renaming (Pattern B) |
-| `DynamoModel.Immutable` | Mark field as read-only after creation |
+| `DynamoModel.configure({ immutable: true })` | Mark field as read-only after creation |
 
 ---
 
@@ -746,41 +847,42 @@ Query.execute    // Query<A> => Effect<A, DynamoError, DynamoClient>
 Query.paginate   // Query<A> => Effect<Stream<A>, DynamoError, DynamoClient>
 ```
 
-### Entity Operations
+### Entity Operations (via typed client)
 
-`Entity.make()` returns a static object that serves as both a type-level definition and an operations namespace. There is no separate repository.
+All operations are accessed through the typed client returned by `DynamoClient.make(table)`. The client binds all entities and aggregates, providing operations with `R = never`.
 
 #### Read Operations
 
 ```typescript
-Users.get({ userId: "abc-123" })
-Users.query.byTenant({ tenantId: "t-1" })
+const db = yield* DynamoClient.make(MainTable)
 
-yield* Users.query.byTenant({ tenantId: "t-1" }).pipe(
-  Query.where({ createdAt: { gte: lastWeek } }),
-  Query.limit(25),
-  Query.execute
+yield* db.Users.get({ userId: "abc-123" })
+
+const results = yield* db.Users.execute(
+  Users.query.byTenant({ tenantId: "t-1" }).pipe(
+    Query.where({ createdAt: { gte: lastWeek } }),
+    Query.limit(25),
+  )
 )
 ```
 
 #### Write Operations
 
 ```typescript
-Users.put({ userId: "abc-123", email: "alice@example.com", displayName: "Alice", role: "admin" })
-Users.update({ userId: "abc-123" }, { displayName: "Alice B" })
-Users.update({ userId: "abc-123" }, { displayName: "Alice B" }, { expectedVersion: 5 })
+yield* db.Users.put({ userId: "abc-123", email: "alice@example.com", displayName: "Alice", role: "admin" })
+yield* db.Users.update({ userId: "abc-123" }, { displayName: "Alice B" })
 ```
 
 #### Lifecycle Operations
 
 ```typescript
-Users.delete({ userId: "abc-123" })     // soft delete (when enabled)
-Users.restore({ userId: "abc-123" })    // restore soft-deleted item
-Users.purge({ userId: "abc-123" })      // permanent delete
-Users.getVersion({ userId: "abc-123" }, 3)  // get specific version
-Users.versions({ userId: "abc-123" })   // query version history
-Users.deleted.get({ userId: "abc-123" })    // get soft-deleted item
-Users.deleted.list()                        // list all soft-deleted items
+yield* db.Users.delete({ userId: "abc-123" })     // soft delete (when enabled)
+yield* db.Users.restore({ userId: "abc-123" })    // restore soft-deleted item
+yield* db.Users.purge({ userId: "abc-123" })      // permanent delete
+yield* db.Users.getVersion({ userId: "abc-123" }, 3)  // get specific version
+yield* db.Users.versions({ userId: "abc-123" })   // query version history
+yield* db.Users.deleted.get({ userId: "abc-123" })    // get soft-deleted item
+yield* db.Users.deleted.list()                        // list all soft-deleted items
 ```
 
 ### Data Integrity
@@ -800,7 +902,7 @@ Enforcement uses sentinel items with transactional writes:
 When `versioned` is enabled, updates can include an expected version:
 
 ```typescript
-Users.update(key, changes, { expectedVersion: 5 })
+db.Users.update(key, changes, { expectedVersion: 5 })
 // Adds ConditionExpression: version = :expected
 // Fails with OptimisticLockError if version doesn't match
 ```
@@ -809,7 +911,7 @@ Users.update(key, changes, { expectedVersion: 5 })
 
 #### Soft Delete
 
-When `softDelete` is configured, `Users.delete()` performs a logical deletion:
+When `softDelete` is configured, `db.Users.delete()` performs a logical deletion:
 
 1. Modifies the sort key: `$myapp#v1#user` → `$myapp#v1#user#deleted#<timestamp>`
 2. Removes all GSI key attributes (item falls out of all indexes)
@@ -860,28 +962,73 @@ DynamoDB single-table designs frequently model rich domain objects as multiple d
 2. **Context attribute propagation** — Parent-level attributes are copied into every child item to enable sort-key queries.
 3. **Aggregate assembly** — Reading an aggregate requires a collection query followed by manual discrimination, reduction, and deep-merge.
 4. **Aggregate mutation** — Updating a nested field requires deep destructuring, manual array manipulation, reconstruction, validation, and transactional write.
-5. **Cascade updates** — When denormalized data changes at the source, every item that embeds that entity must be found and updated.
+5. **Cascade updates** — When denormalized data changes at the source, all items that embed that entity must be found and updated.
 
 A production cricket match management system built on ElectroDB demonstrates these patterns at scale — 17 model files, 16 service files, a ~1,100 line MatchService, and ~120 lines to update one player within a match. These patterns are universal to DynamoDB single-table designs.
 
 ### Concepts
 
-**Ref** — A schema field that stores a denormalized copy of another entity's core domain data. In DynamoDB it's stored as an embedded map. The system auto-generates ID-based DTOs and hydrates on write.
+**Edge Entity** — A first-class entity representing a relationship within an aggregate's partition. For example, `MatchVenueEntity` represents the Match<>Venue relationship, with `matchId` + `venueId` in its primary key. Edge entities may embed denormalized data from referenced entities (e.g., venue name, city). They are real entities with their own models, indexes, and configuration — not implicit decomposition targets.
 
-**Context** — Fields on the aggregate's domain schema that must be propagated to every member item in DynamoDB for query support. Defined once at the aggregate level.
+**Ref** — A reference to an external entity whose data is denormalized into an edge entity at write time. The aggregate framework handles hydration: on create/update it fetches the referenced entity (e.g., `VenueEntity.get({ venueId })`) and embeds its domain data into the edge entity (e.g., `MatchVenue`). On read, the data is already materialized — no ref lookups needed.
 
-**Aggregate** — A domain object composed of multiple DynamoDB entity types that share a partition key. The underlying structure is a directed acyclic graph (DAG) where nodes are entity types and edges are relationships with cardinality.
+**Context** — Fields on the aggregate's domain schema that must be propagated to every edge entity item in DynamoDB for query support. Defined once at the aggregate level.
+
+**Aggregate** — A domain object composed of multiple entity types that share a partition key. The aggregate orchestrates Entity, Collection, and Transaction primitives — it never touches DynamoClient directly. The underlying structure is a directed acyclic graph (DAG) where nodes are entity types and edges are relationships with cardinality.
 
 **Optics** — Effect v4's `effect/Optic` library solves aggregate mutation: instead of manual destructuring, an optic navigates to the target and produces an updated aggregate immutably.
 
-### Layer 1: DynamoModel.ref — Denormalized Reference Annotation
+### Edge Entities
+
+Edges in an aggregate are **explicit first-class entities**, not implicit constructs. Each edge entity has its own model, primary key, indexes, and configuration:
 
 ```typescript
-class TeamPlayerSelection extends Schema.Class<TeamPlayerSelection>("TeamPlayerSelection")({
-  id: Schema.String,
-  team: Team.pipe(DynamoModel.ref),
-  player: Player.pipe(DynamoModel.ref),
-  role: SelectionRoleSchema,
+// Edge entity model — includes relationship keys + denormalized ref data
+class MatchVenue extends Schema.Class<MatchVenue>("MatchVenue")({
+  matchId: Schema.String,
+  venueId: Schema.String,
+  name: Schema.String,        // denormalized from Venue
+  city: Schema.String,        // denormalized from Venue
+  capacity: Schema.Number,    // denormalized from Venue
+}) {}
+
+// Edge entity — real entity with keys, timestamps, versioning
+const MatchVenueEntity = Entity.make({
+  model: MatchVenue,
+  entityType: "MatchVenue",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["matchId"] },
+      sk: { field: "sk", composite: ["venueId"] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+DynamoDB partition layout for a Match aggregate:
+
+```
+PK = $cricket#v1#match#m-1
+
+  SK = $cricket#v1#match                          → MatchEntity (root)
+  SK = $cricket#v1#match_venue#v-1                → MatchVenueEntity (one-edge)
+  SK = $cricket#v1#match_team#teamNumber#1        → MatchTeamEntity (one-edge, discriminated)
+  SK = $cricket#v1#match_team#teamNumber#2        → MatchTeamEntity (one-edge, discriminated)
+  SK = $cricket#v1#match_player#p-1               → MatchPlayerEntity (many-edge)
+  SK = $cricket#v1#match_player#p-2               → MatchPlayerEntity (many-edge)
+```
+
+### DynamoModel.ref — Denormalized Reference Annotation
+
+`DynamoModel.ref` marks a field as a denormalized reference in edge entity models:
+
+```typescript
+class MatchPlayer extends Schema.Class<MatchPlayer>("MatchPlayer")({
+  matchId: Schema.String,
+  playerId: Schema.String,
+  player: Player.pipe(DynamoModel.ref),   // denormalized Player data
+  isCaptain: Schema.Boolean,
 }) {}
 ```
 
@@ -889,62 +1036,133 @@ When Entity encounters a `ref`-annotated field:
 
 | Derived Type | Behavior |
 |---------|----------|
-| `Entity.Input<E>` | Ref field becomes its ID type (`team: Team` → `teamId: string`) |
-| `Entity.Record<E>` | Ref field is the full entity domain type (`team: Team`) |
-| `Entity.Update<E>` | Ref field becomes optional ID (`teamId?: string`) |
+| `Entity.Input<E>` | Ref field becomes its ID type (`player: Player` → `playerId: string`) |
+| `Entity.Record<E>` | Ref field is the full entity domain type (`player: Player`) |
+| `Entity.Update<E>` | Ref field becomes optional ID (`playerId?: string`) |
 | DynamoDB storage | Core domain data stored as embedded map attribute |
 | Create/Put | Entity auto-hydrates: receives ID → fetches entity → embeds domain data |
 
-### Layer 2: Aggregate.make() — Graph-Based Composite Domain Model
+### Aggregate.make() — Graph-Based Composite Domain Model
 
-The consumer defines the aggregate's domain shape as a pure Schema.Class hierarchy, then `Aggregate.make` binds it to a graph of underlying entities.
+The consumer defines the aggregate's domain shape as a pure Schema.Class hierarchy, then `Aggregate.make` binds it to a graph of underlying edge entities:
 
 ```typescript
 const MatchAggregate = Aggregate.make(Match, {
-  table: MainTable,
   schema: AppSchema,
-  pk: { field: "pk", composite: ["id"] },
+  pk: { field: "pk", composite: ["matchId"] },
   collection: { index: "lsi1", name: "match", sk: { field: "lsi1sk", composite: [...] } },
   context: ["name", "gender", "matchType", "league", "series", "season", "startDate"],
-  root: { entityType: "MatchItem" },
-  refs: { Team: TeamEntity, Player: PlayerEntity, Venue: VenueEntity, ... },
+  root: MatchEntity,
 
   edges: {
-    venue:   Aggregate.one("venue", { entityType: "MatchVenue" }),
+    venue:   Aggregate.one(MatchVenueEntity, { ref: VenueEntity }),
     team1:   TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
     team2:   TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
-    umpires: Aggregate.many("umpires", { entityType: "MatchUmpire", ... }),
+    umpires: Aggregate.many(MatchUmpireEntity, { ref: UmpireEntity }),
   },
 })
 ```
 
-**Four edge types:**
-- `Aggregate.one()` — decomposes to separate DynamoDB item, one-to-one relationship
-- `Aggregate.many()` — one item per element, one-to-many relationship
-- `Aggregate.ref()` — no decomposition, hydrates inline via entity
+**Edge types:**
+- `Aggregate.one(EdgeEntity, { ref? })` — one-to-one edge entity. Optional `ref` specifies the external entity to hydrate/denormalize from.
+- `Aggregate.many(EdgeEntity, { ref? })` — one-to-many edge entities. One DynamoDB item per element.
 - **BoundSubAggregate** — sub-tree with discriminator for reuse (e.g., `TeamSheetAggregate.with(...)`)
 
-**Assembly (Read Path):**
-1. Collection query: PK = aggregateId
-2. Discriminate items by `__edd_e__` + discriminator into graph node buckets
-3. Assemble in topological order (leaves first)
-4. Return as Schema.Class instance
+### Aggregate Operations via Typed Client
 
-**Decomposition (Write Path):**
-1. Hydrate all refs via batch fetch
-2. Validate assembled instance via schema decode
-3. Decompose by walking graph root → leaves
-4. Inject context attributes into every member item
-5. Write via sub-aggregate transaction groups
+Aggregates registered on a table are accessible through the typed client, alongside entities:
+
+```typescript
+const MainTable = Table.make({
+  schema: AppSchema,
+  entities: { Teams: TeamEntity, Players: PlayerEntity, Venues: VenueEntity },
+  aggregates: { Matches: MatchAggregate },
+})
+
+const db = yield* DynamoClient.make(MainTable)
+
+// Aggregate operations — typed, R = never
+const match = yield* db.Matches.get({ matchId: "m-1" })
+yield* db.Matches.create({ matchId: "m-2", venueId: "v-1", ... })
+```
+
+Internally, `DynamoClient.make` resolves `DynamoClient` service + `TableConfig` once and binds:
+- All entities (root + edge + ref entities from all aggregates)
+- All aggregates
+
+As a service for testability:
+
+```typescript
+class MatchService extends ServiceMap.Service<MatchService>()("@gamemanager/MatchService", {
+  make: Effect.gen(function* () {
+    const { Matches } = yield* DynamoClient.make(MainTable)
+    return {
+      get: (matchId: string) => Matches.get({ matchId }),
+      create: Effect.fn(function* (input: CreateMatchInput) {
+        return yield* Matches.create(input)
+      }),
+    }
+  }),
+}) {}
+```
+
+### Assembly (Read Path)
+
+Aggregates compose entity operations for reads — they never query DynamoDB directly:
+
+```
+db.Matches.get({ matchId: "m-1" })
+  → Collection query (all items in partition, decoded per entity schema)
+  → Discriminate by __edd_e__ + discriminator into edge entity buckets
+  → Assemble in topological order (leaves first) into domain object
+  → Return as Schema.Class instance
+  // No ref lookups — data already denormalized in edge entities
+```
+
+### Decomposition (Write Path)
+
+On create/update, the aggregate decomposes the domain object into entity operations with write-time ref hydration:
+
+```
+db.Matches.create({ matchId: "m-2", venueId: "v-1", teams: [...], players: [...] })
+  → Ref hydration: VenueEntity.get({ venueId: "v-1" }) → { name: "MCG", city: "Melbourne", ... }
+  → Denormalize: MatchVenue = { matchId, venueId, name: "MCG", city: "Melbourne", capacity: 100000 }
+  → Decompose all edges into entity inputs
+  → Transaction.transactWrite(
+      MatchEntity.put(rootItem),
+      MatchVenueEntity.put({ matchId, venueId, name: "MCG", city: "Melbourne", capacity: 100000 }),
+      MatchTeamEntity.put(team1),
+      MatchTeamEntity.put(team2),
+      MatchPlayerEntity.put(player1),
+      ...
+    )
+```
+
+**Update with diff:**
+
+```
+db.Matches.update({ matchId: "m-1" }, mutation)
+  → current = db.Matches.get({ matchId: "m-1" })       // entity-based fetch
+  → next = mutation(current)                              // optic-powered mutation
+  → diff(current, next)
+  → Re-hydrate changed refs (e.g., venueId changed → fetch new Venue)
+  → Transaction.transactWrite(
+      MatchVenueEntity.delete(oldVenueKey),              // removed edge
+      MatchVenueEntity.put(newVenueItem),                // added edge (with denormalized data)
+      MatchPlayerEntity.update(changedPlayerKey, changes), // modified edge
+    )
+```
 
 **Transaction Decomposition:** Each sub-aggregate is a transactional unit, keeping transactions well within DynamoDB's 100-item limit.
 
-### Layer 3: Optic-Powered Mutations
+### Optic-Powered Mutations
 
 The aggregate exposes optics derived from its Schema.Class for immutable updates:
 
 ```typescript
-yield* MatchAggregate.update({ id: "match-123" }, ({ cursor }) =>
+const db = yield* DynamoClient.make(MainTable)
+
+yield* db.Matches.update({ matchId: "match-123" }, ({ cursor }) =>
   cursor
     .key("team1").key("players").at(0)
     .modify((s) => ({ ...s, isCaptain: true }))
@@ -953,15 +1171,17 @@ yield* MatchAggregate.update({ id: "match-123" }, ({ cursor }) =>
 
 The `update` mutation context provides: `state` (plain object), `cursor` (pre-bound optic), `optic` (composable optic), `current` (Schema.Class instance).
 
-### Layer 4: Cascade Updates
+### Cascade Updates
 
 When a source entity changes, all items that embed it via `ref` must be updated:
 
 ```typescript
-yield* PlayerEntity.update({ playerId: "player-smith" }).pipe(
-  PlayerEntity.set({ displayName: "Steven Smith" }),
-  Entity.cascade({ targets: [TeamPlayerSelectionEntity, MatchPlayerEntity] }),
-  Entity.asRecord,
+const { Players } = yield* DynamoClient.make(MainTable)
+yield* Players.provide(
+  PlayerEntity.update({ playerId: "player-smith" }).pipe(
+    Entity.set({ displayName: "Steven Smith" }),
+    Entity.cascade({ targets: [MatchPlayerEntity] }),
+  ).asEffect()
 )
 ```
 
@@ -973,34 +1193,152 @@ yield* PlayerEntity.update({ playerId: "player-smith" }).pipe(
 |-----------|-----------|-----------|
 | Multi-entity query | Yes | Yes (uses Collection internally) |
 | Domain shape assembly | No | Yes — returns Schema.Class instance |
-| Decomposition (write) | No | Yes — walks graph |
+| Decomposition (write) | No | Yes — walks edge entity graph |
+| Write-time ref hydration | No | Yes — fetches + denormalizes ref entities |
 | Context propagation | No | Yes |
-| Ref hydration | No | Yes — with batching |
 | Optics | No | Yes |
-| Diff-based updates | No | Yes — only changed sub-aggregates written |
+| Diff-based updates | No | Yes — only changed edges written |
 | Transaction boundaries | No | Yes — sub-aggregate = transaction unit |
 
 ### Implementation Notes
 
-**API Differences from Design:**
-- `DynamoModel.ref` accepts `Schema.Top` directly: `Team.pipe(DynamoModel.ref)` (simpler than the designed `Schema.propertySignature(Team).pipe(DynamoModel.ref)`)
-- Ref hydration uses parallel individual `Entity.get()` calls rather than `batchGet`
-- Aggregate config uses runtime validation rather than compile-time type safety for edge keys, context fields, and refs bindings
-- `Aggregate.update` provides `UpdateContext` with `cursor` + `optic` rather than pre-built graph-edge optics
+**Behavioral Notes:**
+- `Aggregate.update` handles orphaned items when reducing a many-edge array via diff-based delete operations.
+- Both `"eventual"` (default) and `"transactional"` cascade modes are supported.
+- Edge entities inherit all entity features: versioning, timestamps, unique constraints, soft delete.
 
 **Deferred Features:**
 - Pre-built graph-edge optics (generic `.key()` chains cover the same use cases)
 - `Aggregate.Input` type extractor (recursive ref→ID transformation)
 - Computed discriminators (only static literal discriminators supported)
-- `TestAggregate` helper (tests set up ref entities manually)
-
-**Behavioral Notes:**
-- `Aggregate.update` does not delete orphaned items when reducing a many-edge array. Use `delete` + `create` for structural changes that remove members.
-- Both `"eventual"` (default) and `"transactional"` cascade modes are supported.
 
 ---
 
-## 12. Error Types
+## 12. EventStore
+
+### Overview
+
+`EventStore` provides typed, Effect-native event sourcing on DynamoDB. It implements the Decider pattern (command → events → state) with stream-based event persistence.
+
+### Client Gateway Pattern
+
+EventStore definitions are registered on a table and accessed through the typed client, just like entities and aggregates:
+
+```typescript
+// Definition — no executable operations
+const MatchEvents = EventStore.makeStream({
+  streamName: "Match",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["matchId"] },
+})
+
+// Register on table
+const EventsTable = Table.make({
+  schema: EventSchema,
+  eventStores: { MatchEvents },
+})
+
+// Access through typed client
+const program = Effect.gen(function* () {
+  const db = yield* DynamoClient.make(EventsTable)
+  yield* db.MatchEvents.append({ matchId: "m-1" }, [new MatchStarted({ venue: "MCG" })], 0)
+  const events = yield* db.MatchEvents.read({ matchId: "m-1" })
+  const version = yield* db.MatchEvents.currentVersion({ matchId: "m-1" })
+})
+```
+
+As a service:
+
+```typescript
+class MatchEventStream extends ServiceMap.Service<MatchEventStream>()("@gamemanager/MatchEventStream", {
+  make: Effect.gen(function* () {
+    const { MatchEvents } = yield* DynamoClient.make(EventsTable)
+    return MatchEvents
+  }),
+}) {}
+```
+
+### Command Handler
+
+The `commandHandler` combinator implements the read-decide-append cycle:
+
+```typescript
+const { MatchEvents } = yield* DynamoClient.make(EventsTable)
+const handler = MatchEvents.commandHandler(MatchDecider)
+const result = yield* handler({ matchId: "m-1" }, new StartMatch({ venue: "MCG" }))
+// result: { state, version, events }
+```
+
+---
+
+## 13. GeoIndex (effect-dynamodb-geo)
+
+### Overview
+
+`GeoIndex` provides geospatial indexing and radius-based proximity search using H3 hexagonal grid. It wraps an entity with automatic geo field enrichment on writes and multi-cell parallel query on reads.
+
+### Client Gateway Pattern
+
+GeoIndex definitions are registered on a table and accessed through the typed client:
+
+```typescript
+// Definition — binds geo config to entity definition
+const VehicleGeo = GeoIndex.make({
+  entity: VehiclesEntity,
+  index: "byCell",
+  coordinates: (item) => ({ latitude: item.latitude, longitude: item.longitude }),
+  fields: {
+    cell: { field: "cell", resolution: 15 },
+    parentCell: { field: "parentCell", resolution: 3 },
+    timePartition: { field: "timePartition", source: "timestamp", bucket: "hourly" },
+  },
+})
+
+// Register on table
+const MainTable = Table.make({
+  schema: AppSchema,
+  entities: { Vehicles: VehiclesEntity },
+  geoIndexes: { VehicleGeo },
+})
+
+// Access through typed client
+const program = Effect.gen(function* () {
+  const db = yield* DynamoClient.make(MainTable)
+  yield* db.VehicleGeo.put({ vehicleId: "v-1", latitude: 37.77, longitude: -122.42, timestamp: now })
+  const results = yield* db.VehicleGeo.nearby({ center, radius: 2000, unit: "m" })
+})
+```
+
+As a service:
+
+```typescript
+class VehicleSearch extends ServiceMap.Service<VehicleSearch>()("@fleet/VehicleSearch", {
+  make: Effect.gen(function* () {
+    const { VehicleGeo } = yield* DynamoClient.make(MainTable)
+    return VehicleGeo
+  }),
+}) {}
+```
+
+### Layering
+
+GeoIndex composes Entity operations (for writes) and Query (for reads). It adds geo field enrichment and multi-cell search orchestration on top:
+
+```
+db.VehicleGeo.put(input)
+  → enrich(input)           // compute H3 cell, parent cell, time partition
+  → Entity.put(enriched)    // delegate to entity
+
+db.VehicleGeo.nearby(options)
+  → compute search cells    // H3 ring + prune
+  → build N queries          // one per (timePartition, cell chunk)
+  → execute in parallel     // via Query module
+  → post-process            // distance filter + sort
+```
+
+---
+
+## 14. Error Types
 
 ### Complete Error Taxonomy
 
@@ -1021,31 +1359,45 @@ yield* PlayerEntity.update({ playerId: "player-smith" }).pipe(
 
 ### Error Type Narrowing
 
-Entity operation signatures narrow error types based on Entity configuration:
+Operation signatures narrow error types based on Entity configuration:
 
 ```typescript
+const db = yield* DynamoClient.make(MainTable)
+
 // Entity without unique constraints or versioning
-Users.put(input)
-// Effect<Entity.Record<E>, DynamoError, DynamoClient | Table>
+db.Users.put(input)
+// Effect<Entity.Record<E>, DynamoError, never>
 
 // Entity with unique constraints
-Users.put(input)
-// Effect<Entity.Record<E>, DynamoError | UniqueConstraintViolation, DynamoClient | Table>
+db.Users.put(input)
+// Effect<Entity.Record<E>, DynamoError | UniqueConstraintViolation, never>
 
 // Update with optimistic locking
-Users.update(key, changes, { expectedVersion: 5 })
-// Effect<Entity.Record<E>, DynamoError | ItemNotFound | OptimisticLockError, DynamoClient | Table>
+db.Users.update(key, changes, { expectedVersion: 5 })
+// Effect<Entity.Record<E>, DynamoError | ItemNotFound | OptimisticLockError, never>
 ```
 
 ---
 
-## Appendix A: Migration Guide (v1 → v2)
+## Appendix A: Migration Guide (v1 → v2 → v3)
 
-### Module-by-Module Mapping
+### v2 → v3: Client Gateway Migration
+
+| v2 (bind pattern) | v3 (client gateway) |
+|--------------------|---------------------|
+| `Entity.make({ model, table: MainTable, ... })` | `Entity.make({ model, ... })` — no `table` |
+| `Table.make({ schema })` | `Table.make({ schema, entities: { Users }, aggregates: { Matches } })` |
+| `yield* Entity.bind(Users)` | `const { Users } = yield* DynamoClient.make(MainTable)` |
+| `yield* Aggregate.bind(MatchAggregate)` | `const { Matches } = yield* DynamoClient.make(MainTable)` |
+| `yield* Table.bind(MainTable)` → `table.create([Users])` | `db.createTable()` |
+| `yield* EventStore.bind(MatchEvents)` | `const { MatchEvents } = yield* DynamoClient.make(EventsTable)` |
+| `yield* GeoIndex.bind(VehicleGeo)` | `const { VehicleGeo } = yield* DynamoClient.make(MainTable)` |
+
+### v1 → v2: Module-by-Module Mapping
 
 | v1 Module | v2 Module | Changes |
 |-----------|-----------|---------|
-| `DynamoModel.ts` | `DynamoModel.ts` | Reduced to single `Immutable` export. Models use `Schema.Class`. |
+| `DynamoModel.ts` | `DynamoModel.ts` | Annotations (Hidden, identifier, ref) and `configure()` for per-field overrides (immutable, field rename, storedAs). Models use `Schema.Class`. |
 | `Table.ts` | `Table.ts` | Stripped to `schema` ref only. Physical name via `Table.layer()`. Key structure derived from entities. |
 | `Entity.ts` | `Entity.ts` | Major redesign: ElectroDB-style indexes, system fields, unique constraints, collections. |
 | `KeyComposer.ts` | `KeyComposer.ts` | Rewritten: attribute-list composition, convention-based format, casing rules. |

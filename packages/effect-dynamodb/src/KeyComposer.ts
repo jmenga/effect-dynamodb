@@ -70,14 +70,19 @@ export const tryExtractComposites = (
 /**
  * Serialize a value for use in a composite key.
  *
- * DateTime values are normalized to UTC for correct sort order:
- * - DateTime.Zoned → UTC ISO string (timezone stripped for sort correctness)
+ * Numeric values are zero-padded for correct lexicographic sort order:
+ * - number → 16-digit zero-padded string (covers Number.MAX_SAFE_INTEGER)
+ * - bigint → 38-digit zero-padded string (covers DynamoDB's max precision)
+ *
+ * DateTime values are formatted as ISO strings for correct sort order:
+ * - DateTime.Zoned → ISO string with offset (preserves timezone info)
  * - DateTime.Utc → ISO string
  * - Date → ISO string
  */
 export const serializeValue = (value: unknown): string => {
   if (typeof value === "string") return value
-  if (typeof value === "number") return String(value)
+  if (typeof value === "number") return String(value).padStart(16, "0")
+  if (typeof value === "bigint") return String(value).padStart(38, "0")
   if (typeof value === "boolean") return value ? "true" : "false"
   // DateTime types → ISO string (Zoned normalized to UTC for sort order)
   if (typeof value === "object" && value !== null && DateTime.isDateTime(value)) {
@@ -231,12 +236,53 @@ export const composeGsiKeysForUpdate = (
   for (const [indexName, index] of Object.entries(indexes)) {
     if (indexName === "primary") continue
     const allComposites = [...index.pk.composite, ...index.sk.composite]
-    if (allComposites.some((attr) => attr in updatePayload)) {
+    const touchedComposites = allComposites.filter((attr) => attr in updatePayload)
+    if (touchedComposites.length > 0) {
       const merged = { ...keyRecord, ...updatePayload }
+      const missingComposites = allComposites.filter(
+        (attr) => merged[attr] === undefined || merged[attr] === null,
+      )
+      if (missingComposites.length > 0) {
+        throw new PartialGsiCompositeError(
+          indexName,
+          touchedComposites,
+          missingComposites,
+          allComposites,
+        )
+      }
       Object.assign(result, composeIndexKeys(schema, entityType, entityVersion, index, merged))
     }
   }
   return result
+}
+
+/**
+ * Thrown when an update provides some but not all composite attributes for a GSI.
+ * Caught by Entity.update and converted to a tagged `ValidationError`.
+ */
+export class PartialGsiCompositeError extends Error {
+  readonly indexName: string
+  readonly provided: ReadonlyArray<string>
+  readonly missing: ReadonlyArray<string>
+  readonly required: ReadonlyArray<string>
+
+  constructor(
+    indexName: string,
+    provided: ReadonlyArray<string>,
+    missing: ReadonlyArray<string>,
+    required: ReadonlyArray<string>,
+  ) {
+    super(
+      `Partial GSI composite update on index "${indexName}": ` +
+        `provided [${provided.join(", ")}] but missing [${missing.join(", ")}]. ` +
+        `When updating any composite for a GSI, all composites must be provided: [${required.join(", ")}]`,
+    )
+    this.name = "PartialGsiCompositeError"
+    this.indexName = indexName
+    this.provided = provided
+    this.missing = missing
+    this.required = required
+  }
 }
 
 /**

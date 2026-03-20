@@ -10,7 +10,7 @@
  * Part 3: Demonstrates the full Aggregate lifecycle:
  * - Aggregate.create: ref hydration, decomposition, sub-aggregate transactions
  * - Aggregate.get: query, discriminate, assemble from partition items
- * - Aggregate.update: fetch → mutate → diff → write only changed groups
+ * - Aggregate.update: fetch -> mutate -> diff -> write only changed groups
  * - Aggregate.delete: remove all items in the partition
  *
  * Key patterns:
@@ -45,6 +45,14 @@ import * as Table from "../src/Table.js"
 // 1. Domain models — pure, no DynamoDB concepts
 // ---------------------------------------------------------------------------
 
+const PlayerRole = {
+  Batter: "batter",
+  Bowler: "bowler",
+  AllRounder: "all-rounder",
+  WicketKeeper: "wicket-keeper",
+} as const
+const PlayerRoleSchema = Schema.Literals(Object.values(PlayerRole))
+
 class Team extends Schema.Class<Team>("Team")({
   id: Schema.String.pipe(DynamoModel.identifier),
   name: Schema.String,
@@ -56,7 +64,7 @@ class Player extends Schema.Class<Player>("Player")({
   id: Schema.String.pipe(DynamoModel.identifier),
   firstName: Schema.String,
   lastName: Schema.String,
-  role: Schema.Literals(["batter", "bowler", "all-rounder", "wicket-keeper"]),
+  role: PlayerRoleSchema,
 }) {}
 
 class Coach extends Schema.Class<Coach>("Coach")({
@@ -77,7 +85,7 @@ class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
   selectionNumber: Schema.Number,
   team: Team.pipe(DynamoModel.ref),
   player: Player.pipe(DynamoModel.ref),
-  squadRole: Schema.Literals(["batter", "bowler", "all-rounder", "wicket-keeper"]),
+  squadRole: PlayerRoleSchema,
   isCaptain: Schema.Boolean,
   isViceCaptain: Schema.Boolean,
 }) {}
@@ -105,19 +113,17 @@ class Match extends Schema.Class<Match>("Match")({
 }) {}
 
 // ---------------------------------------------------------------------------
-// 2. Schema + Table
+// 2. Schema
 // ---------------------------------------------------------------------------
 
 const CricketSchema = DynamoSchema.make({ name: "cricket", version: 1 })
-const MainTable = Table.make({ schema: CricketSchema })
 
 // ---------------------------------------------------------------------------
-// 3. Entity definitions
+// 3. Entity definitions — pure definitions, no table reference
 // ---------------------------------------------------------------------------
 
 const Teams = Entity.make({
   model: DynamoModel.configure(Team, { id: { field: "teamId" } }),
-  table: MainTable,
   entityType: "Team",
   indexes: {
     primary: {
@@ -129,7 +135,6 @@ const Teams = Entity.make({
 
 const Players = Entity.make({
   model: DynamoModel.configure(Player, { id: { field: "playerId" } }),
-  table: MainTable,
   entityType: "Player",
   indexes: {
     primary: {
@@ -141,7 +146,6 @@ const Players = Entity.make({
 
 const Coaches = Entity.make({
   model: DynamoModel.configure(Coach, { id: { field: "coachId" } }),
-  table: MainTable,
   entityType: "Coach",
   indexes: {
     primary: {
@@ -153,7 +157,6 @@ const Coaches = Entity.make({
 
 const Venues = Entity.make({
   model: DynamoModel.configure(Venue, { id: { field: "venueId" } }),
-  table: MainTable,
   entityType: "Venue",
   indexes: {
     primary: {
@@ -165,7 +168,6 @@ const Venues = Entity.make({
 
 const SquadSelections = Entity.make({
   model: SquadSelection,
-  table: MainTable,
   entityType: "SquadSelection",
   indexes: {
     primary: {
@@ -185,7 +187,16 @@ const SquadSelections = Entity.make({
 })
 
 // ---------------------------------------------------------------------------
-// 4. Aggregate definitions
+// 4. Table definition — declare entities as members
+// ---------------------------------------------------------------------------
+
+const MainTable = Table.make({
+  schema: CricketSchema,
+  entities: { Teams, Players, Coaches, Venues, SquadSelections },
+})
+
+// ---------------------------------------------------------------------------
+// 5. Aggregate definitions
 // ---------------------------------------------------------------------------
 
 // Sub-aggregate: a team's composition within a match
@@ -217,7 +228,7 @@ const MatchAggregate = Aggregate.make(Match, {
 })
 
 // ---------------------------------------------------------------------------
-// 5. Type-level demonstration
+// 6. Type-level demonstration
 // ---------------------------------------------------------------------------
 
 // Entity.Input accepts IDs for ref fields, not full objects
@@ -235,10 +246,14 @@ void _record
 void _matchType
 
 // ---------------------------------------------------------------------------
-// 6. Program — Entity Refs + Aggregate Read Path
+// 7. Program — Entity Refs + Aggregate Read Path
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
+  // Get typed client — binds all table members
+  const db = yield* DynamoClient.make(MainTable)
+
+  // Keep raw client + table config for manual table creation (LSI required)
   const client = yield* DynamoClient
   const tableConfig = yield* MainTable.Tag
 
@@ -290,24 +305,24 @@ const program = Effect.gen(function* () {
 
   // --- Create teams (model uses 'id', DB stores as 'teamId') ---
   yield* Console.log("Creating teams...")
-  yield* Teams.put({ id: "aus", name: "Australia", country: "Australia", ranking: 1 })
-  yield* Teams.put({ id: "ind", name: "India", country: "India", ranking: 2 })
+  yield* db.Teams.put({ id: "aus", name: "Australia", country: "Australia", ranking: 1 })
+  yield* db.Teams.put({ id: "ind", name: "India", country: "India", ranking: 2 })
 
   // --- Create players (model uses 'id', DB stores as 'playerId') ---
   yield* Console.log("Creating players...")
-  yield* Players.put({
+  yield* db.Players.put({
     id: "smith-01",
     firstName: "Steve",
     lastName: "Smith",
     role: "batter",
   })
-  yield* Players.put({
+  yield* db.Players.put({
     id: "cummins-01",
     firstName: "Pat",
     lastName: "Cummins",
     role: "bowler",
   })
-  yield* Players.put({
+  yield* db.Players.put({
     id: "kohli-01",
     firstName: "Virat",
     lastName: "Kohli",
@@ -316,17 +331,17 @@ const program = Effect.gen(function* () {
 
   // --- Create coaches ---
   yield* Console.log("Creating coaches...")
-  yield* Coaches.put({ id: "mcdonald", name: "Andrew McDonald" })
-  yield* Coaches.put({ id: "gambhir", name: "Gautam Gambhir" })
+  yield* db.Coaches.put({ id: "mcdonald", name: "Andrew McDonald" })
+  yield* db.Coaches.put({ id: "gambhir", name: "Gautam Gambhir" })
 
   // --- Create venues ---
   yield* Console.log("Creating venues...")
-  yield* Venues.put({ id: "mcg", name: "Melbourne Cricket Ground", city: "Melbourne" })
+  yield* db.Venues.put({ id: "mcg", name: "Melbourne Cricket Ground", city: "Melbourne" })
 
   // --- Create squad selections with ref IDs ---
   yield* Console.log("\nCreating squad selections (AUS BGT 2024-25)...")
 
-  yield* SquadSelections.put({
+  yield* db.SquadSelections.put({
     squadId: "aus#2024-25#BGT",
     selectionNumber: 1,
     teamId: "aus",
@@ -336,7 +351,7 @@ const program = Effect.gen(function* () {
     isViceCaptain: false,
   })
 
-  yield* SquadSelections.put({
+  yield* db.SquadSelections.put({
     squadId: "aus#2024-25#BGT",
     selectionNumber: 2,
     teamId: "aus",
@@ -346,7 +361,7 @@ const program = Effect.gen(function* () {
     isViceCaptain: true,
   })
 
-  yield* SquadSelections.put({
+  yield* db.SquadSelections.put({
     squadId: "ind#2024-25#BGT",
     selectionNumber: 1,
     teamId: "ind",
@@ -358,7 +373,7 @@ const program = Effect.gen(function* () {
 
   // --- Get returns full embedded data ---
   yield* Console.log("\nRetrieving squad selection...")
-  const captain = yield* SquadSelections.get({ squadId: "aus#2024-25#BGT", selectionNumber: 1 })
+  const captain = yield* db.SquadSelections.get({ squadId: "aus#2024-25#BGT", selectionNumber: 1 })
   yield* Console.log(`Captain: ${captain.player.firstName} ${captain.player.lastName}`)
   yield* Console.log(`  Team: ${captain.team.name} (${captain.team.country})`)
   yield* Console.log(`  Role: ${captain.player.role}`)
@@ -366,7 +381,7 @@ const program = Effect.gen(function* () {
 
   // --- RefNotFound when ref doesn't exist ---
   yield* Console.log("\nAttempting to create selection with nonexistent player...")
-  const refError = yield* SquadSelections.put({
+  const refError = yield* db.SquadSelections.put({
     squadId: "aus#2024-25#BGT",
     selectionNumber: 99,
     teamId: "aus",
@@ -374,9 +389,7 @@ const program = Effect.gen(function* () {
     squadRole: "batter",
     isCaptain: false,
     isViceCaptain: false,
-  })
-    .asEffect()
-    .pipe(Effect.flip)
+  }).pipe(Effect.flip)
 
   if (refError._tag === "RefNotFound") {
     yield* Console.log(
@@ -392,7 +405,8 @@ const program = Effect.gen(function* () {
   yield* Console.log("Updating Player 'Steve Smith' → 'Steven Smith' with cascade...")
 
   // Update the player and cascade to all SquadSelections that embed this player
-  const updatedPlayer = yield* Players.update({ id: "smith-01" }).pipe(
+  const updatedPlayer = yield* db.Players.update(
+    { id: "smith-01" },
     Entity.set({ firstName: "Steven" }),
     Entity.cascade({ targets: [SquadSelections] }),
   )
@@ -400,7 +414,7 @@ const program = Effect.gen(function* () {
   yield* Console.log(`Updated player: ${updatedPlayer.firstName} ${updatedPlayer.lastName}`)
 
   // Verify cascade propagated — the squad selection should have the updated name
-  const afterCascade = yield* SquadSelections.get({
+  const afterCascade = yield* db.SquadSelections.get({
     squadId: "aus#2024-25#BGT",
     selectionNumber: 2,
   })
@@ -509,12 +523,12 @@ const program = Effect.gen(function* () {
 
   // --- Cleanup ---
   yield* Console.log("\nCleaning up...")
-  yield* client.deleteTable({ TableName: tableConfig.name })
+  yield* db.deleteTable
   yield* Console.log("\n=== Done ===")
 })
 
 // ---------------------------------------------------------------------------
-// 7. Run
+// 8. Run
 // ---------------------------------------------------------------------------
 
 const AppLayer = Layer.merge(
@@ -526,7 +540,7 @@ const AppLayer = Layer.merge(
   MainTable.layer({ name: "cricket-table" }),
 )
 
-const main = program.pipe(Effect.provide(AppLayer), Effect.scoped)
+const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
   () => console.log("\nDone."),

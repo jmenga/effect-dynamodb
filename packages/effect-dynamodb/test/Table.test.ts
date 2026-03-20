@@ -56,7 +56,6 @@ describe("Table", () => {
 
   describe("definition", () => {
     it("derives KeySchema and AttributeDefinitions from entities", () => {
-      const table = Table.make({ schema })
       const entity = {
         indexes: {
           primary: {
@@ -65,7 +64,8 @@ describe("Table", () => {
           },
         },
       }
-      const result = Table.definition(table, [entity])
+      const table = Table.make({ schema, entities: { entity } })
+      const result = Table.definition(table)
       expect(result.KeySchema).toEqual([
         { AttributeName: "pk", KeyType: "HASH" },
         { AttributeName: "sk", KeyType: "RANGE" },
@@ -78,7 +78,6 @@ describe("Table", () => {
     })
 
     it("collects GSIs from non-primary indexes", () => {
-      const table = Table.make({ schema })
       const entity = {
         indexes: {
           primary: {
@@ -92,7 +91,8 @@ describe("Table", () => {
           },
         },
       }
-      const result = Table.definition(table, [entity])
+      const table = Table.make({ schema, entities: { entity } })
+      const result = Table.definition(table)
       expect(result.GlobalSecondaryIndexes).toEqual([
         {
           IndexName: "gsi1",
@@ -107,7 +107,6 @@ describe("Table", () => {
     })
 
     it("merges indexes from multiple entities", () => {
-      const table = Table.make({ schema })
       const userEntity = {
         indexes: {
           primary: {
@@ -139,20 +138,20 @@ describe("Table", () => {
           },
         },
       }
-      const result = Table.definition(table, [userEntity, orderEntity])
+      const table = Table.make({ schema, entities: { userEntity, orderEntity } })
+      const result = Table.definition(table)
       expect(result.GlobalSecondaryIndexes).toHaveLength(2)
       expect(result.AttributeDefinitions).toHaveLength(6)
     })
 
     it("throws for empty members array", () => {
       const table = Table.make({ schema })
-      expect(() => Table.definition(table, [])).toThrow(
+      expect(() => Table.definition(table)).toThrow(
         "Table.definition requires at least one entity or aggregate",
       )
     })
 
     it("includes aggregate collection GSI", () => {
-      const table = Table.make({ schema })
       const entity = {
         indexes: {
           primary: {
@@ -167,7 +166,8 @@ describe("Table", () => {
         collection: { index: "gsi2", sk: { field: "gsi2sk" } },
         listIndex: undefined,
       }
-      const result = Table.definition(table, [entity, aggregate])
+      const table = Table.make({ schema, entities: { entity }, aggregates: { aggregate } })
+      const result = Table.definition(table)
 
       expect(result.GlobalSecondaryIndexes).toEqual([
         {
@@ -184,7 +184,6 @@ describe("Table", () => {
     })
 
     it("includes aggregate list GSI alongside collection GSI", () => {
-      const table = Table.make({ schema })
       const entity = {
         indexes: {
           primary: {
@@ -208,7 +207,8 @@ describe("Table", () => {
           sk: { field: "gsi1sk" },
         },
       }
-      const result = Table.definition(table, [entity, aggregate])
+      const table = Table.make({ schema, entities: { entity }, aggregates: { aggregate } })
+      const result = Table.definition(table)
 
       // gsi1 from entity, gsi2 from aggregate collection — no duplicates
       expect(result.GlobalSecondaryIndexes).toHaveLength(2)
@@ -218,7 +218,6 @@ describe("Table", () => {
     })
 
     it("includes aggregate list GSI when entity does not define it", () => {
-      const table = Table.make({ schema })
       const entity = {
         indexes: {
           primary: {
@@ -237,7 +236,8 @@ describe("Table", () => {
           sk: { field: "gsi1sk" },
         },
       }
-      const result = Table.definition(table, [entity, aggregate])
+      const table = Table.make({ schema, entities: { entity }, aggregates: { aggregate } })
+      const result = Table.definition(table)
 
       // Both GSIs present
       expect(result.GlobalSecondaryIndexes).toHaveLength(2)

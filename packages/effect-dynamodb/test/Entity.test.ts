@@ -17,6 +17,12 @@ import * as Table from "../src/Table.js"
 const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
 const MainTable = Table.make({ schema: AppSchema })
 
+/** Configure inline entities for testing (not registered via Table.make) */
+const withConfig = <E extends { _configure: Function }>(entity: E): E => {
+  entity._configure(AppSchema, MainTable.Tag)
+  return entity
+}
+
 class User extends Schema.Class<User>("User")({
   userId: Schema.String,
   email: Schema.String,
@@ -28,8 +34,12 @@ class UserWithImmutable extends Schema.Class<UserWithImmutable>("UserWithImmutab
   userId: Schema.String,
   email: Schema.String,
   displayName: Schema.NonEmptyString,
-  createdBy: Schema.String.pipe(DynamoModel.Immutable),
+  createdBy: Schema.String,
 }) {}
+
+const UserWithImmutableModel = DynamoModel.configure(UserWithImmutable, {
+  createdBy: { immutable: true },
+})
 
 class SimpleItem extends Schema.Class<SimpleItem>("SimpleItem")({
   itemId: Schema.String,
@@ -83,6 +93,7 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
   transactGetItems: () => Effect.die("not used"),
   createTable: () => Effect.die("not used"),
   deleteTable: () => Effect.die("not used"),
+  describeTable: () => Effect.die("not used"),
   scan: () => Effect.die("not used"),
 })
 
@@ -99,10 +110,9 @@ describe("Entity", () => {
   })
 
   describe("make", () => {
-    it("creates an entity with correct entityType and table", () => {
+    it("creates an entity with correct entityType and model", () => {
       const UserEntity = Entity.make({
         model: User,
-        table: MainTable,
         entityType: "User",
         indexes: {
           primary: {
@@ -114,14 +124,12 @@ describe("Entity", () => {
 
       expect(UserEntity._tag).toBe("Entity")
       expect(UserEntity.entityType).toBe("User")
-      expect(UserEntity.table).toBe(MainTable)
       expect(UserEntity.model).toBe(User)
     })
 
     it("stores index definitions", () => {
       const UserEntity = Entity.make({
         model: User,
-        table: MainTable,
         entityType: "User",
         indexes: {
           primary: {
@@ -145,7 +153,6 @@ describe("Entity", () => {
     it("stores timestamps config", () => {
       const UserEntity = Entity.make({
         model: User,
-        table: MainTable,
         entityType: "User",
         indexes: {
           primary: {
@@ -164,7 +171,6 @@ describe("Entity", () => {
     it("stores versioned config", () => {
       const UserEntity = Entity.make({
         model: User,
-        table: MainTable,
         entityType: "User",
         indexes: {
           primary: {
@@ -182,7 +188,6 @@ describe("Entity", () => {
     it("stores softDelete config", () => {
       const UserEntity = Entity.make({
         model: User,
-        table: MainTable,
         entityType: "User",
         indexes: {
           primary: {
@@ -199,7 +204,6 @@ describe("Entity", () => {
     it("stores unique constraint config", () => {
       const UserEntity = Entity.make({
         model: User,
-        table: MainTable,
         entityType: "User",
         indexes: {
           primary: {
@@ -216,7 +220,6 @@ describe("Entity", () => {
     it("defaults timestamps, versioned, softDelete, unique to undefined", () => {
       const UserEntity = Entity.make({
         model: User,
-        table: MainTable,
         entityType: "User",
         indexes: {
           primary: {
@@ -244,7 +247,6 @@ describe("Entity", () => {
     it("timestamps: true adds createdAt and updatedAt", () => {
       const UserEntity = Entity.make({
         model: User,
-        table: MainTable,
         entityType: "User",
         indexes: {
           primary: {
@@ -262,7 +264,6 @@ describe("Entity", () => {
     it("timestamps with custom field names", () => {
       const UserEntity = Entity.make({
         model: User,
-        table: MainTable,
         entityType: "User",
         indexes: {
           primary: {
@@ -280,7 +281,6 @@ describe("Entity", () => {
     it("versioned: true adds version", () => {
       const UserEntity = Entity.make({
         model: User,
-        table: MainTable,
         entityType: "User",
         indexes: {
           primary: {
@@ -297,7 +297,6 @@ describe("Entity", () => {
     it("versioned with custom field name", () => {
       const UserEntity = Entity.make({
         model: User,
-        table: MainTable,
         entityType: "User",
         indexes: {
           primary: {
@@ -314,7 +313,6 @@ describe("Entity", () => {
     it("versioned with retain option", () => {
       const UserEntity = Entity.make({
         model: User,
-        table: MainTable,
         entityType: "User",
         indexes: {
           primary: {
@@ -335,24 +333,25 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("derived schemas", () => {
-    const UserEntity = Entity.make({
-      model: User,
-      table: MainTable,
-      entityType: "User",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["userId"] },
-          sk: { field: "sk", composite: [] },
+    const UserEntity = withConfig(
+      Entity.make({
+        model: User,
+        entityType: "User",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
+          byEmail: {
+            index: "gsi1",
+            pk: { field: "gsi1pk", composite: ["email"] },
+            sk: { field: "gsi1sk", composite: [] },
+          },
         },
-        byEmail: {
-          index: "gsi1",
-          pk: { field: "gsi1pk", composite: ["email"] },
-          sk: { field: "gsi1sk", composite: [] },
-        },
-      },
-      timestamps: true,
-      versioned: true,
-    })
+        timestamps: true,
+        versioned: true,
+      }),
+    )
 
     it("Model schema decodes pure model fields", () => {
       const decode = Schema.decodeUnknownSync(UserEntity.schemas.modelSchema)
@@ -484,19 +483,20 @@ describe("Entity", () => {
   // Immutable fields excluded from Update
   // ---------------------------------------------------------------------------
 
-  describe("DynamoModel.Immutable", () => {
+  describe("DynamoModel.configure immutable", () => {
     it("excludes immutable fields from Update schema", () => {
-      const ImmutableEntity = Entity.make({
-        model: UserWithImmutable,
-        table: MainTable,
-        entityType: "UserImm",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const ImmutableEntity = withConfig(
+        Entity.make({
+          model: UserWithImmutableModel,
+          entityType: "UserImm",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
           },
-        },
-      })
+        }),
+      )
 
       const decode = Schema.decodeUnknownSync(ImmutableEntity.schemas.updateSchema)
 
@@ -511,17 +511,18 @@ describe("Entity", () => {
     })
 
     it("includes immutable fields in Model schema", () => {
-      const ImmutableEntity = Entity.make({
-        model: UserWithImmutable,
-        table: MainTable,
-        entityType: "UserImm",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const ImmutableEntity = withConfig(
+        Entity.make({
+          model: UserWithImmutableModel,
+          entityType: "UserImm",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
           },
-        },
-      })
+        }),
+      )
 
       const decode = Schema.decodeUnknownSync(ImmutableEntity.schemas.modelSchema)
       const result = decode({
@@ -534,17 +535,18 @@ describe("Entity", () => {
     })
 
     it("includes immutable fields in Input schema", () => {
-      const ImmutableEntity = Entity.make({
-        model: UserWithImmutable,
-        table: MainTable,
-        entityType: "UserImm",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const ImmutableEntity = withConfig(
+        Entity.make({
+          model: UserWithImmutableModel,
+          entityType: "UserImm",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
           },
-        },
-      })
+        }),
+      )
 
       const decode = Schema.decodeUnknownSync(ImmutableEntity.schemas.inputSchema)
       const result = decode({
@@ -563,22 +565,23 @@ describe("Entity", () => {
 
   describe("key extraction", () => {
     it("keyAttributes returns primary pk + sk composites", () => {
-      const UserEntity = Entity.make({
-        model: User,
-        table: MainTable,
-        entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const UserEntity = withConfig(
+        Entity.make({
+          model: User,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            byEmail: {
+              index: "gsi1",
+              pk: { field: "gsi1pk", composite: ["email"] },
+              sk: { field: "gsi1sk", composite: [] },
+            },
           },
-          byEmail: {
-            index: "gsi1",
-            pk: { field: "gsi1pk", composite: ["email"] },
-            sk: { field: "gsi1sk", composite: [] },
-          },
-        },
-      })
+        }),
+      )
 
       // Only primary key composites
       expect(Entity.keyAttributes(UserEntity)).toEqual(["userId"])
@@ -591,17 +594,18 @@ describe("Entity", () => {
         name: Schema.String,
       }) {}
 
-      const TenantUserEntity = Entity.make({
-        model: TenantUser,
-        table: MainTable,
-        entityType: "TenantUser",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["tenantId"] },
-            sk: { field: "sk", composite: ["userId"] },
+      const TenantUserEntity = withConfig(
+        Entity.make({
+          model: TenantUser,
+          entityType: "TenantUser",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["tenantId"] },
+              sk: { field: "sk", composite: ["userId"] },
+            },
           },
-        },
-      })
+        }),
+      )
 
       const composites = Entity.keyAttributes(TenantUserEntity)
       expect(composites).toContain("tenantId")
@@ -609,22 +613,23 @@ describe("Entity", () => {
     })
 
     it("keyFieldNames returns all physical key field names", () => {
-      const UserEntity = Entity.make({
-        model: User,
-        table: MainTable,
-        entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const UserEntity = withConfig(
+        Entity.make({
+          model: User,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            byEmail: {
+              index: "gsi1",
+              pk: { field: "gsi1pk", composite: ["email"] },
+              sk: { field: "gsi1sk", composite: [] },
+            },
           },
-          byEmail: {
-            index: "gsi1",
-            pk: { field: "gsi1pk", composite: ["email"] },
-            sk: { field: "gsi1sk", composite: [] },
-          },
-        },
-      })
+        }),
+      )
 
       const fieldNames = Entity.keyFieldNames(UserEntity)
       expect(fieldNames).toContain("pk")
@@ -634,22 +639,23 @@ describe("Entity", () => {
     })
 
     it("compositeAttributes returns all composite attrs across all indexes", () => {
-      const UserEntity = Entity.make({
-        model: User,
-        table: MainTable,
-        entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const UserEntity = withConfig(
+        Entity.make({
+          model: User,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            byEmail: {
+              index: "gsi1",
+              pk: { field: "gsi1pk", composite: ["email"] },
+              sk: { field: "gsi1sk", composite: [] },
+            },
           },
-          byEmail: {
-            index: "gsi1",
-            pk: { field: "gsi1pk", composite: ["email"] },
-            sk: { field: "gsi1sk", composite: [] },
-          },
-        },
-      })
+        }),
+      )
 
       const allComposites = Entity.compositeAttributes(UserEntity)
       expect(allComposites).toContain("userId")
@@ -663,27 +669,28 @@ describe("Entity", () => {
 
   describe("indexes", () => {
     it("stores multiple indexes including GSIs", () => {
-      const UserEntity = Entity.make({
-        model: User,
-        table: MainTable,
-        entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const UserEntity = withConfig(
+        Entity.make({
+          model: User,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            byEmail: {
+              index: "gsi1",
+              pk: { field: "gsi1pk", composite: ["email"] },
+              sk: { field: "gsi1sk", composite: [] },
+            },
+            byRole: {
+              index: "gsi2",
+              pk: { field: "gsi2pk", composite: ["role"] },
+              sk: { field: "gsi2sk", composite: ["userId"] },
+            },
           },
-          byEmail: {
-            index: "gsi1",
-            pk: { field: "gsi1pk", composite: ["email"] },
-            sk: { field: "gsi1sk", composite: [] },
-          },
-          byRole: {
-            index: "gsi2",
-            pk: { field: "gsi2pk", composite: ["role"] },
-            sk: { field: "gsi2sk", composite: ["userId"] },
-          },
-        },
-      })
+        }),
+      )
 
       expect(Object.keys(UserEntity.indexes)).toEqual(["primary", "byEmail", "byRole"])
       expect(UserEntity.indexes.byEmail.index).toBe("gsi1")
@@ -692,24 +699,25 @@ describe("Entity", () => {
     })
 
     it("stores collection and type on GSI indexes", () => {
-      const UserEntity = Entity.make({
-        model: User,
-        table: MainTable,
-        entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const UserEntity = withConfig(
+        Entity.make({
+          model: User,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            byTenant: {
+              index: "gsi1",
+              collection: "TenantItems",
+              type: "clustered",
+              pk: { field: "gsi1pk", composite: ["role"] },
+              sk: { field: "gsi1sk", composite: [] },
+            },
           },
-          byTenant: {
-            index: "gsi1",
-            collection: "TenantItems",
-            type: "clustered",
-            pk: { field: "gsi1pk", composite: ["role"] },
-            sk: { field: "gsi1sk", composite: [] },
-          },
-        },
-      })
+        }),
+      )
 
       expect(UserEntity.indexes.byTenant.collection).toBe("TenantItems")
       expect(UserEntity.indexes.byTenant.type).toBe("clustered")
@@ -722,18 +730,19 @@ describe("Entity", () => {
 
   describe("unique constraints", () => {
     it("stores single-field unique constraints", () => {
-      const UserEntity = Entity.make({
-        model: User,
-        table: MainTable,
-        entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const UserEntity = withConfig(
+        Entity.make({
+          model: User,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
           },
-        },
-        unique: { email: ["email"] },
-      })
+          unique: { email: ["email"] },
+        }),
+      )
 
       expect(UserEntity.unique).toEqual({ email: ["email"] })
     })
@@ -745,21 +754,22 @@ describe("Entity", () => {
         email: Schema.String,
       }) {}
 
-      const TenantUserEntity = Entity.make({
-        model: TenantUser,
-        table: MainTable,
-        entityType: "TenantUser",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const TenantUserEntity = withConfig(
+        Entity.make({
+          model: TenantUser,
+          entityType: "TenantUser",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
           },
-        },
-        unique: {
-          email: ["email"],
-          tenantEmail: ["tenantId", "email"],
-        },
-      })
+          unique: {
+            email: ["email"],
+            tenantEmail: ["tenantId", "email"],
+          },
+        }),
+      )
 
       expect(TenantUserEntity.unique).toEqual({
         email: ["email"],
@@ -774,17 +784,18 @@ describe("Entity", () => {
 
   describe("operations", () => {
     it("has get, put, update, delete functions", () => {
-      const UserEntity = Entity.make({
-        model: User,
-        table: MainTable,
-        entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const UserEntity = withConfig(
+        Entity.make({
+          model: User,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
           },
-        },
-      })
+        }),
+      )
 
       expect(typeof UserEntity.get).toBe("function")
       expect(typeof UserEntity.put).toBe("function")
@@ -793,27 +804,28 @@ describe("Entity", () => {
     })
 
     it("has query namespace with named index accessors", () => {
-      const UserEntity = Entity.make({
-        model: User,
-        table: MainTable,
-        entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const UserEntity = withConfig(
+        Entity.make({
+          model: User,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            byEmail: {
+              index: "gsi1",
+              pk: { field: "gsi1pk", composite: ["email"] },
+              sk: { field: "gsi1sk", composite: [] },
+            },
+            byRole: {
+              index: "gsi2",
+              pk: { field: "gsi2pk", composite: ["role"] },
+              sk: { field: "gsi2sk", composite: ["userId"] },
+            },
           },
-          byEmail: {
-            index: "gsi1",
-            pk: { field: "gsi1pk", composite: ["email"] },
-            sk: { field: "gsi1sk", composite: [] },
-          },
-          byRole: {
-            index: "gsi2",
-            pk: { field: "gsi2pk", composite: ["role"] },
-            sk: { field: "gsi2sk", composite: ["userId"] },
-          },
-        },
-      })
+        }),
+      )
 
       expect(typeof UserEntity.query.byEmail).toBe("function")
       expect(typeof UserEntity.query.byRole).toBe("function")
@@ -822,22 +834,23 @@ describe("Entity", () => {
     })
 
     it("query accessor returns a Query object", () => {
-      const UserEntity = Entity.make({
-        model: User,
-        table: MainTable,
-        entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const UserEntity = withConfig(
+        Entity.make({
+          model: User,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            byEmail: {
+              index: "gsi1",
+              pk: { field: "gsi1pk", composite: ["email"] },
+              sk: { field: "gsi1sk", composite: [] },
+            },
           },
-          byEmail: {
-            index: "gsi1",
-            pk: { field: "gsi1pk", composite: ["email"] },
-            sk: { field: "gsi1sk", composite: [] },
-          },
-        },
-      })
+        }),
+      )
 
       const q = UserEntity.query.byEmail({ email: "test@example.com" })
       expect(Query.isQuery(q)).toBe(true)
@@ -850,17 +863,18 @@ describe("Entity", () => {
 
   describe("entity without system fields", () => {
     it("Record schema equals Model schema when no system fields", () => {
-      const SimpleEntity = Entity.make({
-        model: SimpleItem,
-        table: MainTable,
-        entityType: "SimpleItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
+      const SimpleEntity = withConfig(
+        Entity.make({
+          model: SimpleItem,
+          entityType: "SimpleItem",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
+            },
           },
-        },
-      })
+        }),
+      )
 
       const decodeModel = Schema.decodeUnknownSync(SimpleEntity.schemas.modelSchema)
       const decodeRecord = Schema.decodeUnknownSync(SimpleEntity.schemas.recordSchema)
@@ -875,24 +889,25 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("type extractors", () => {
-    const UserEntity = Entity.make({
-      model: User,
-      table: MainTable,
-      entityType: "User",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["userId"] },
-          sk: { field: "sk", composite: [] },
+    const UserEntity = withConfig(
+      Entity.make({
+        model: User,
+        entityType: "User",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
+          byEmail: {
+            index: "gsi1",
+            pk: { field: "gsi1pk", composite: ["email"] },
+            sk: { field: "gsi1sk", composite: [] },
+          },
         },
-        byEmail: {
-          index: "gsi1",
-          pk: { field: "gsi1pk", composite: ["email"] },
-          sk: { field: "gsi1sk", composite: [] },
-        },
-      },
-      timestamps: true,
-      versioned: true,
-    })
+        timestamps: true,
+        versioned: true,
+      }),
+    )
 
     it("all 7 type extractors are defined", () => {
       // These are type-level only, but we can verify the schemas exist at runtime
@@ -965,19 +980,20 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("schema accessors", () => {
-    const UserEntity = Entity.make({
-      model: User,
-      table: MainTable,
-      entityType: "User",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["userId"] },
-          sk: { field: "sk", composite: [] },
+    const UserEntity = withConfig(
+      Entity.make({
+        model: User,
+        entityType: "User",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-      timestamps: true,
-      versioned: true,
-    })
+        timestamps: true,
+        versioned: true,
+      }),
+    )
 
     it("itemSchema returns the entity's item schema", () => {
       const schema = Entity.itemSchema(UserEntity)
@@ -1057,17 +1073,18 @@ describe("Entity", () => {
         value: Schema.Number,
       })
 
-      const StructEntity = Entity.make({
-        model: ItemStruct,
-        table: MainTable,
-        entityType: "Item",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
+      const StructEntity = withConfig(
+        Entity.make({
+          model: ItemStruct,
+          entityType: "Item",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
+            },
           },
-        },
-      })
+        }),
+      )
 
       expect(StructEntity.entityType).toBe("Item")
       const decode = Schema.decodeUnknownSync(StructEntity.schemas.modelSchema)
@@ -1082,17 +1099,18 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("Schema.Class instanceof", () => {
-    const ClassEntity = Entity.make({
-      model: SimpleItem,
-      table: MainTable,
-      entityType: "SimpleItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const ClassEntity = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "SimpleItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-    })
+      }),
+    )
 
     it.effect("get returns Schema.Class instance", () =>
       Effect.gen(function* () {
@@ -1106,7 +1124,7 @@ describe("Entity", () => {
           }),
         })
 
-        const result = yield* ClassEntity.get({ itemId: "i-1" })
+        const result = yield* ClassEntity.get({ itemId: "i-1" }).asEffect()
         expect(result).toBeInstanceOf(SimpleItem)
         expect(result.itemId).toBe("i-1")
       }).pipe(Effect.provide(TestLayer)),
@@ -1116,7 +1134,7 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockPutItem.mockResolvedValueOnce({})
 
-        const result = yield* ClassEntity.put({ itemId: "i-1", name: "Test" })
+        const result = yield* ClassEntity.put({ itemId: "i-1", name: "Test" }).asEffect()
         expect(result).toBeInstanceOf(SimpleItem)
         expect(result.itemId).toBe("i-1")
       }).pipe(Effect.provide(TestLayer)),
@@ -1126,7 +1144,7 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockPutItem.mockResolvedValueOnce({})
 
-        const result = yield* ClassEntity.create({ itemId: "i-1", name: "Test" })
+        const result = yield* ClassEntity.create({ itemId: "i-1", name: "Test" }).asEffect()
         expect(result).toBeInstanceOf(SimpleItem)
       }).pipe(Effect.provide(TestLayer)),
     )
@@ -1145,6 +1163,7 @@ describe("Entity", () => {
 
         const result = yield* ClassEntity.update({ itemId: "i-1" }).pipe(
           Entity.set({ name: "Updated" }),
+          Entity.asModel,
         )
         expect(result).toBeInstanceOf(SimpleItem)
         expect(result.name).toBe("Updated")
@@ -1169,22 +1188,23 @@ describe("Entity", () => {
           ],
         })
 
-        const QueryEntity = Entity.make({
-          model: User,
-          table: MainTable,
-          entityType: "User",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
+        const QueryEntity = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "User",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
+              },
+              byEmail: {
+                index: "gsi1",
+                pk: { field: "gsi1pk", composite: ["email"] },
+                sk: { field: "gsi1sk", composite: [] },
+              },
             },
-            byEmail: {
-              index: "gsi1",
-              pk: { field: "gsi1pk", composite: ["email"] },
-              sk: { field: "gsi1sk", composite: [] },
-            },
-          },
-        })
+          }),
+        )
 
         const page = yield* QueryEntity.query.byEmail({ email: "a@test.com" }).pipe(Query.execute)
         expect(page.items).toHaveLength(1)
@@ -1200,17 +1220,18 @@ describe("Entity", () => {
           value: Schema.Number,
         })
 
-        const StructEntity = Entity.make({
-          model: StructModel,
-          table: MainTable,
-          entityType: "StructItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const StructEntity = withConfig(
+          Entity.make({
+            model: StructModel,
+            entityType: "StructItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-        })
+          }),
+        )
 
         mockGetItem.mockResolvedValueOnce({
           Item: toAttributeMap({
@@ -1222,7 +1243,7 @@ describe("Entity", () => {
           }),
         })
 
-        const result = yield* StructEntity.get({ itemId: "i-1" })
+        const result = yield* StructEntity.get({ itemId: "i-1" }).asEffect()
         expect(result.itemId).toBe("i-1")
         expect(result.value).toBe(42)
         // Plain object, not an instance of any class
@@ -1237,26 +1258,27 @@ describe("Entity", () => {
 
   describe("full configuration", () => {
     it("creates entity matching design-v2.md User example", () => {
-      const UserEntity = Entity.make({
-        model: User,
-        table: MainTable,
-        entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const UserEntity = withConfig(
+        Entity.make({
+          model: User,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            byEmail: {
+              index: "gsi2",
+              pk: { field: "gsi2pk", composite: ["email"] },
+              sk: { field: "gsi2sk", composite: [] },
+            },
           },
-          byEmail: {
-            index: "gsi2",
-            pk: { field: "gsi2pk", composite: ["email"] },
-            sk: { field: "gsi2sk", composite: [] },
-          },
-        },
-        timestamps: true,
-        versioned: { retain: true },
-        softDelete: true,
-        unique: { email: ["email"] },
-      })
+          timestamps: true,
+          versioned: { retain: true },
+          softDelete: true,
+          unique: { email: ["email"] },
+        }),
+      )
 
       // Entity properties
       expect(UserEntity._tag).toBe("Entity")
@@ -1289,23 +1311,24 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("put", () => {
-    const SimpleEntity = Entity.make({
-      model: SimpleItem,
-      table: MainTable,
-      entityType: "SimpleItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const SimpleEntity = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "SimpleItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-    })
+      }),
+    )
 
     it.effect("puts an item and returns the record", () =>
       Effect.gen(function* () {
         mockPutItem.mockResolvedValueOnce({})
 
-        const result = yield* SimpleEntity.put({ itemId: "i-1", name: "Test" })
+        const result = yield* SimpleEntity.put({ itemId: "i-1", name: "Test" }).asEffect()
 
         expect(result.itemId).toBe("i-1")
         expect(result.name).toBe("Test")
@@ -1322,18 +1345,19 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockPutItem.mockResolvedValueOnce({})
 
-        const TimestampEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "TSItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const TimestampEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "TSItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          timestamps: true,
-        })
+            timestamps: true,
+          }),
+        )
 
         const result = yield* TimestampEntity.put({ itemId: "i-1", name: "Test" }).pipe(
           Entity.asRecord,
@@ -1347,18 +1371,19 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockPutItem.mockResolvedValueOnce({})
 
-        const VersionedEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "VerItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const VersionedEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "VerItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          versioned: true,
-        })
+            versioned: true,
+          }),
+        )
 
         const result = yield* VersionedEntity.put({ itemId: "i-1", name: "Test" }).pipe(
           Entity.asRecord,
@@ -1391,25 +1416,26 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockTransactWriteItems.mockResolvedValueOnce({})
 
-        const UniqueEntity = Entity.make({
-          model: User,
-          table: MainTable,
-          entityType: "UniqueUser",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
+        const UniqueEntity = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "UniqueUser",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          unique: { email: ["email"] },
-        })
+            unique: { email: ["email"] },
+          }),
+        )
 
         yield* UniqueEntity.put({
           userId: "u-1",
           email: "alice@test.com",
           displayName: "Alice",
           role: "admin",
-        })
+        }).asEffect()
 
         expect(mockTransactWriteItems).toHaveBeenCalledOnce()
         expect(mockPutItem).not.toHaveBeenCalled()
@@ -1430,18 +1456,19 @@ describe("Entity", () => {
         ]
         mockTransactWriteItems.mockRejectedValueOnce(txError)
 
-        const UniqueEntity = Entity.make({
-          model: User,
-          table: MainTable,
-          entityType: "UniqueUser",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
+        const UniqueEntity = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "UniqueUser",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          unique: { email: ["email"] },
-        })
+            unique: { email: ["email"] },
+          }),
+        )
 
         const error = yield* UniqueEntity.put({
           userId: "u-1",
@@ -1468,18 +1495,19 @@ describe("Entity", () => {
           uniqueConstraints[`c${i}`] = ["email"]
         }
 
-        const OverflowEntity = Entity.make({
-          model: User,
-          table: MainTable,
-          entityType: "OverflowUser",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
+        const OverflowEntity = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "OverflowUser",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          unique: uniqueConstraints,
-        })
+            unique: uniqueConstraints,
+          }),
+        )
 
         const error = yield* OverflowEntity.put({
           userId: "u-1",
@@ -1513,17 +1541,18 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("get", () => {
-    const SimpleEntity = Entity.make({
-      model: SimpleItem,
-      table: MainTable,
-      entityType: "SimpleItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const SimpleEntity = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "SimpleItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-    })
+      }),
+    )
 
     it.effect("gets an item and returns the record", () =>
       Effect.gen(function* () {
@@ -1537,7 +1566,7 @@ describe("Entity", () => {
           }),
         })
 
-        const result = yield* SimpleEntity.get({ itemId: "i-1" })
+        const result = yield* SimpleEntity.get({ itemId: "i-1" }).asEffect()
         expect(result.itemId).toBe("i-1")
         expect(result.name).toBe("Test")
 
@@ -1570,19 +1599,20 @@ describe("Entity", () => {
 
     it.effect("decodes record with timestamps", () =>
       Effect.gen(function* () {
-        const TSEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "TSItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const TSEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "TSItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          timestamps: true,
-          versioned: true,
-        })
+            timestamps: true,
+            versioned: true,
+          }),
+        )
 
         mockGetItem.mockResolvedValueOnce({
           Item: toAttributeMap({
@@ -1610,17 +1640,18 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("consistentRead", () => {
-    const SimpleEntity = Entity.make({
-      model: SimpleItem,
-      table: MainTable,
-      entityType: "SimpleItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const SimpleEntity = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "SimpleItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-    })
+      }),
+    )
 
     it.effect("passes ConsistentRead to getItem (data-last)", () =>
       Effect.gen(function* () {
@@ -1634,7 +1665,7 @@ describe("Entity", () => {
           }),
         })
 
-        yield* SimpleEntity.get({ itemId: "i-1" }).pipe(Entity.consistentRead())
+        yield* SimpleEntity.get({ itemId: "i-1" }).pipe(Entity.consistentRead(), Entity.asModel)
         expect(mockGetItem).toHaveBeenCalledOnce()
         const input = mockGetItem.mock.calls[0]![0]
         expect(input.ConsistentRead).toBe(true)
@@ -1653,7 +1684,7 @@ describe("Entity", () => {
           }),
         })
 
-        yield* Entity.consistentRead(SimpleEntity.get({ itemId: "i-1" }))
+        yield* Entity.consistentRead(SimpleEntity.get({ itemId: "i-1" })).asEffect()
         expect(mockGetItem).toHaveBeenCalledOnce()
         const input = mockGetItem.mock.calls[0]![0]
         expect(input.ConsistentRead).toBe(true)
@@ -1672,7 +1703,7 @@ describe("Entity", () => {
           }),
         })
 
-        yield* SimpleEntity.get({ itemId: "i-1" })
+        yield* SimpleEntity.get({ itemId: "i-1" }).asEffect()
         expect(mockGetItem).toHaveBeenCalledOnce()
         const input = mockGetItem.mock.calls[0]![0]
         expect(input.ConsistentRead).toBeUndefined()
@@ -1685,17 +1716,18 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("project", () => {
-    const SimpleEntity = Entity.make({
-      model: SimpleItem,
-      table: MainTable,
-      entityType: "SimpleItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const SimpleEntity = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "SimpleItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-    })
+      }),
+    )
 
     it.effect("passes ProjectionExpression to getItem (data-last)", () =>
       Effect.gen(function* () {
@@ -1710,6 +1742,7 @@ describe("Entity", () => {
 
         const result = yield* SimpleEntity.get({ itemId: "i-1" }).pipe(
           Entity.project(["itemId", "name"]),
+          Entity.asModel,
         )
 
         expect(result).toEqual(expect.objectContaining({ itemId: "i-1", name: "Test" }))
@@ -1733,7 +1766,9 @@ describe("Entity", () => {
           }),
         })
 
-        const result = yield* Entity.project(SimpleEntity.get({ itemId: "i-1" }), ["itemId"])
+        const result = yield* Entity.project(SimpleEntity.get({ itemId: "i-1" }), [
+          "itemId",
+        ]).asEffect()
 
         expect(result).toEqual(expect.objectContaining({ itemId: "i-1" }))
 
@@ -1753,7 +1788,10 @@ describe("Entity", () => {
           }),
         })
 
-        const result = yield* SimpleEntity.get({ itemId: "i-1" }).pipe(Entity.project(["name"]))
+        const result = yield* SimpleEntity.get({ itemId: "i-1" }).pipe(
+          Entity.project(["name"]),
+          Entity.asModel,
+        )
 
         // Raw record — __edd_e__ is visible (not stripped by schema decode)
         expect(result.__edd_e__).toBe("SimpleItem")
@@ -1767,17 +1805,18 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("update", () => {
-    const SimpleEntity = Entity.make({
-      model: SimpleItem,
-      table: MainTable,
-      entityType: "SimpleItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const SimpleEntity = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "SimpleItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-    })
+      }),
+    )
 
     it.effect("updates an item and returns the new record", () =>
       Effect.gen(function* () {
@@ -1793,6 +1832,7 @@ describe("Entity", () => {
 
         const result = yield* SimpleEntity.update({ itemId: "i-1" }).pipe(
           Entity.set({ name: "Updated" }),
+          Entity.asModel,
         )
         expect(result.name).toBe("Updated")
 
@@ -1806,18 +1846,19 @@ describe("Entity", () => {
 
     it.effect("includes version increment when versioned", () =>
       Effect.gen(function* () {
-        const VerEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "VerItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const VerEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "VerItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          versioned: true,
-        })
+            versioned: true,
+          }),
+        )
 
         mockUpdateItem.mockResolvedValueOnce({
           Attributes: toAttributeMap({
@@ -1843,18 +1884,19 @@ describe("Entity", () => {
 
     it.effect("adds optimistic lock condition when expectedVersion provided", () =>
       Effect.gen(function* () {
-        const VerEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "VerItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const VerEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "VerItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          versioned: true,
-        })
+            versioned: true,
+          }),
+        )
 
         mockUpdateItem.mockResolvedValueOnce({
           Attributes: toAttributeMap({
@@ -1870,6 +1912,7 @@ describe("Entity", () => {
         yield* VerEntity.update({ itemId: "i-1" }).pipe(
           Entity.set({ name: "Updated" }),
           Entity.expectedVersion(3),
+          Entity.asModel,
         )
 
         const call = mockUpdateItem.mock.calls[0]![0]
@@ -1879,18 +1922,19 @@ describe("Entity", () => {
 
     it.effect("returns OptimisticLockError on version conflict", () =>
       Effect.gen(function* () {
-        const VerEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "VerItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const VerEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "VerItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          versioned: true,
-        })
+            versioned: true,
+          }),
+        )
 
         const condError = new Error("ConditionalCheckFailedException")
         ;(condError as any).name = "ConditionalCheckFailedException"
@@ -1926,19 +1970,20 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("unique constraint update rotation", () => {
-    const UniqueEntity = Entity.make({
-      model: User,
-      table: MainTable,
-      entityType: "UniqueUser",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["userId"] },
-          sk: { field: "sk", composite: [] },
+    const UniqueEntity = withConfig(
+      Entity.make({
+        model: User,
+        entityType: "UniqueUser",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-      unique: { email: ["email"] },
-      versioned: true,
-    })
+        unique: { email: ["email"] },
+        versioned: true,
+      }),
+    )
 
     it.effect("rotates sentinel when unique constraint field changes", () =>
       Effect.gen(function* () {
@@ -1957,7 +2002,10 @@ describe("Entity", () => {
         })
         mockTransactWriteItems.mockResolvedValueOnce({})
 
-        yield* UniqueEntity.update({ userId: "u-1" }).pipe(Entity.set({ email: "alice@new.com" }))
+        yield* UniqueEntity.update({ userId: "u-1" }).pipe(
+          Entity.set({ email: "alice@new.com" }),
+          Entity.asModel,
+        )
 
         expect(mockTransactWriteItems).toHaveBeenCalledOnce()
         expect(mockUpdateItem).not.toHaveBeenCalled()
@@ -2002,6 +2050,7 @@ describe("Entity", () => {
 
         yield* UniqueEntity.update({ userId: "u-1" }).pipe(
           Entity.set({ displayName: "Alice Updated" }),
+          Entity.asModel,
         )
 
         expect(mockUpdateItem).toHaveBeenCalledOnce()
@@ -2069,7 +2118,10 @@ describe("Entity", () => {
         // Update email to the same value — still enters transact path
         // (because the field is in the update payload) but should NOT
         // include sentinel Delete/Put since the value didn't change
-        yield* UniqueEntity.update({ userId: "u-1" }).pipe(Entity.set({ email: "alice@test.com" }))
+        yield* UniqueEntity.update({ userId: "u-1" }).pipe(
+          Entity.set({ email: "alice@test.com" }),
+          Entity.asModel,
+        )
 
         expect(mockTransactWriteItems).toHaveBeenCalledOnce()
         const call = mockTransactWriteItems.mock.calls[0]![0]
@@ -2081,19 +2133,20 @@ describe("Entity", () => {
 
     it.effect("combines retain snapshot with sentinel rotation", () =>
       Effect.gen(function* () {
-        const RetainUniqueEntity = Entity.make({
-          model: User,
-          table: MainTable,
-          entityType: "RetainUniqueUser",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
+        const RetainUniqueEntity = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "RetainUniqueUser",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          unique: { email: ["email"] },
-          versioned: { retain: true },
-        })
+            unique: { email: ["email"] },
+            versioned: { retain: true },
+          }),
+        )
 
         mockGetItem.mockResolvedValueOnce({
           Item: toAttributeMap({
@@ -2111,6 +2164,7 @@ describe("Entity", () => {
 
         yield* RetainUniqueEntity.update({ userId: "u-1" }).pipe(
           Entity.set({ email: "alice@new.com" }),
+          Entity.asModel,
         )
 
         expect(mockTransactWriteItems).toHaveBeenCalledOnce()
@@ -2131,23 +2185,24 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("delete", () => {
-    const SimpleEntity = Entity.make({
-      model: SimpleItem,
-      table: MainTable,
-      entityType: "SimpleItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const SimpleEntity = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "SimpleItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-    })
+      }),
+    )
 
     it.effect("deletes an item", () =>
       Effect.gen(function* () {
         mockDeleteItem.mockResolvedValueOnce({})
 
-        yield* SimpleEntity.delete({ itemId: "i-1" })
+        yield* SimpleEntity.delete({ itemId: "i-1" }).asEffect()
 
         expect(mockDeleteItem).toHaveBeenCalledOnce()
         const call = mockDeleteItem.mock.calls[0]![0]
@@ -2158,18 +2213,19 @@ describe("Entity", () => {
 
     it.effect("uses transactWriteItems when unique constraints exist", () =>
       Effect.gen(function* () {
-        const UniqueEntity = Entity.make({
-          model: User,
-          table: MainTable,
-          entityType: "UniqueUser",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
+        const UniqueEntity = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "UniqueUser",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          unique: { email: ["email"] },
-        })
+            unique: { email: ["email"] },
+          }),
+        )
 
         // getItem to find the item data for sentinel cleanup
         mockGetItem.mockResolvedValueOnce({
@@ -2185,7 +2241,7 @@ describe("Entity", () => {
         })
         mockTransactWriteItems.mockResolvedValueOnce({})
 
-        yield* UniqueEntity.delete({ userId: "u-1" })
+        yield* UniqueEntity.delete({ userId: "u-1" }).asEffect()
 
         expect(mockTransactWriteItems).toHaveBeenCalledOnce()
         const call = mockTransactWriteItems.mock.calls[0]![0]
@@ -2210,22 +2266,23 @@ describe("Entity", () => {
 
   describe("query", () => {
     it("returns a Query object from query accessor", () => {
-      const UserEntity = Entity.make({
-        model: User,
-        table: MainTable,
-        entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const UserEntity = withConfig(
+        Entity.make({
+          model: User,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            byEmail: {
+              index: "gsi1",
+              pk: { field: "gsi1pk", composite: ["email"] },
+              sk: { field: "gsi1sk", composite: [] },
+            },
           },
-          byEmail: {
-            index: "gsi1",
-            pk: { field: "gsi1pk", composite: ["email"] },
-            sk: { field: "gsi1sk", composite: [] },
-          },
-        },
-      })
+        }),
+      )
 
       const q = UserEntity.query.byEmail({ email: "test@example.com" })
       expect(Query.isQuery(q)).toBe(true)
@@ -2235,22 +2292,23 @@ describe("Entity", () => {
     })
 
     it("query can be composed with combinators", () => {
-      const UserEntity = Entity.make({
-        model: User,
-        table: MainTable,
-        entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const UserEntity = withConfig(
+        Entity.make({
+          model: User,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            byRole: {
+              index: "gsi2",
+              pk: { field: "gsi2pk", composite: ["role"] },
+              sk: { field: "gsi2sk", composite: ["userId"] },
+            },
           },
-          byRole: {
-            index: "gsi2",
-            pk: { field: "gsi2pk", composite: ["role"] },
-            sk: { field: "gsi2sk", composite: ["userId"] },
-          },
-        },
-      })
+        }),
+      )
 
       const q = UserEntity.query
         .byRole({ role: "admin" })
@@ -2280,22 +2338,23 @@ describe("Entity", () => {
           LastEvaluatedKey: undefined,
         })
 
-        const UserEntity = Entity.make({
-          model: User,
-          table: MainTable,
-          entityType: "User",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
+        const UserEntity = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "User",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
+              },
+              byEmail: {
+                index: "gsi1",
+                pk: { field: "gsi1pk", composite: ["email"] },
+                sk: { field: "gsi1sk", composite: [] },
+              },
             },
-            byEmail: {
-              index: "gsi1",
-              pk: { field: "gsi1pk", composite: ["email"] },
-              sk: { field: "gsi1sk", composite: [] },
-            },
-          },
-        })
+          }),
+        )
 
         const q = UserEntity.query.byEmail({ email: "alice@test.com" })
         const results = yield* Query.collect(q)
@@ -2306,44 +2365,46 @@ describe("Entity", () => {
     )
 
     it("query with PK-only params does not add SK condition", () => {
-      const UserEntity = Entity.make({
-        model: User,
-        table: MainTable,
-        entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const UserEntity = withConfig(
+        Entity.make({
+          model: User,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            byRole: {
+              index: "gsi2",
+              pk: { field: "gsi2pk", composite: ["role"] },
+              sk: { field: "gsi2sk", composite: ["userId"] },
+            },
           },
-          byRole: {
-            index: "gsi2",
-            pk: { field: "gsi2pk", composite: ["role"] },
-            sk: { field: "gsi2sk", composite: ["userId"] },
-          },
-        },
-      })
+        }),
+      )
 
       const q = UserEntity.query.byRole({ role: "admin" })
       expect(q._state.skConditions).toHaveLength(0)
     })
 
     it("query with PK + partial SK params applies beginsWith condition", () => {
-      const UserEntity = Entity.make({
-        model: User,
-        table: MainTable,
-        entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const UserEntity = withConfig(
+        Entity.make({
+          model: User,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            byRole: {
+              index: "gsi2",
+              pk: { field: "gsi2pk", composite: ["role"] },
+              sk: { field: "gsi2sk", composite: ["userId", "email"] },
+            },
           },
-          byRole: {
-            index: "gsi2",
-            pk: { field: "gsi2pk", composite: ["role"] },
-            sk: { field: "gsi2sk", composite: ["userId", "email"] },
-          },
-        },
-      })
+        }),
+      )
 
       const q = UserEntity.query.byRole({ role: "admin", userId: "u-1" })
       expect(q._state.skConditions).toHaveLength(1)
@@ -2354,22 +2415,23 @@ describe("Entity", () => {
     })
 
     it("query with PK + full SK composites applies beginsWith for all values", () => {
-      const UserEntity = Entity.make({
-        model: User,
-        table: MainTable,
-        entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+      const UserEntity = withConfig(
+        Entity.make({
+          model: User,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            byRole: {
+              index: "gsi2",
+              pk: { field: "gsi2pk", composite: ["role"] },
+              sk: { field: "gsi2sk", composite: ["userId", "email"] },
+            },
           },
-          byRole: {
-            index: "gsi2",
-            pk: { field: "gsi2pk", composite: ["role"] },
-            sk: { field: "gsi2sk", composite: ["userId", "email"] },
-          },
-        },
-      })
+        }),
+      )
 
       const q = UserEntity.query.byRole({
         role: "admin",
@@ -2407,21 +2469,23 @@ describe("Entity", () => {
       transactGetItems: () => Effect.die("not used"),
       createTable: () => Effect.die("not used"),
       deleteTable: () => Effect.die("not used"),
+      describeTable: () => Effect.die("not used"),
     })
 
     const ScanTestLayer = Layer.merge(ScanTestDynamoClient, TestTableConfig)
 
-    const SimpleEntity = Entity.make({
-      model: SimpleItem,
-      table: MainTable,
-      entityType: "SimpleItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const SimpleEntity = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "SimpleItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-    })
+      }),
+    )
 
     beforeEach(() => {
       mockScan.mockReset()
@@ -2473,10 +2537,11 @@ describe("Entity", () => {
           ],
         })
 
-        yield* SimpleEntity.scan().pipe(Query.filter({ name: "Test" }), Query.collect)
+        yield* SimpleEntity.scan().pipe(SimpleEntity.filter({ name: "Test" }), Query.collect)
 
         const input = mockScan.mock.calls[0]![0]
-        expect(input.FilterExpression).toContain("#f0 = :f0")
+        expect(input.FilterExpression).toContain("=")
+        expect(Object.values(input.ExpressionAttributeNames)).toContain("name")
       }).pipe(Effect.provide(ScanTestLayer)),
     )
 
@@ -2497,44 +2562,49 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("condition", () => {
-    const SimpleEntity = Entity.make({
-      model: SimpleItem,
-      table: MainTable,
-      entityType: "SimpleItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const SimpleEntity = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "SimpleItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-    })
+      }),
+    )
 
     it.effect("adds ConditionExpression to put (data-last)", () =>
       Effect.gen(function* () {
         mockPutItem.mockResolvedValueOnce({})
 
         yield* SimpleEntity.put({ itemId: "i-1", name: "Test" }).pipe(
-          Entity.condition({ eq: { status: "draft" } }),
+          SimpleEntity.condition({ status: "draft" }),
+          Entity.asModel,
         )
 
         expect(mockPutItem).toHaveBeenCalledOnce()
         const input = mockPutItem.mock.calls[0]![0]
         expect(input.ConditionExpression).toBeDefined()
-        expect(input.ConditionExpression).toContain("#status = :v0")
+        expect(input.ConditionExpression).toContain("=")
+        // Expr compiler uses #eN = :eN placeholders
+        expect(Object.values(input.ExpressionAttributeNames)).toContain("status")
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("adds ConditionExpression to put (data-first)", () =>
+    it.effect("adds ConditionExpression to put (pipe style)", () =>
       Effect.gen(function* () {
         mockPutItem.mockResolvedValueOnce({})
 
-        yield* Entity.condition(SimpleEntity.put({ itemId: "i-1", name: "Test" }), {
-          eq: { status: "draft" },
-        })
+        yield* SimpleEntity.put({ itemId: "i-1", name: "Test" })
+          .pipe(SimpleEntity.condition({ status: "draft" }))
+          .asEffect()
 
         expect(mockPutItem).toHaveBeenCalledOnce()
         const input = mockPutItem.mock.calls[0]![0]
-        expect(input.ConditionExpression).toContain("#status = :v0")
+        expect(input.ConditionExpression).toContain("=")
+        expect(Object.values(input.ExpressionAttributeNames)).toContain("status")
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -2542,13 +2612,14 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockDeleteItem.mockResolvedValueOnce({})
 
-        yield* SimpleEntity.delete({ itemId: "i-1" }).pipe(
-          Entity.condition({ eq: { status: "draft" } }),
-        )
+        yield* SimpleEntity.delete({ itemId: "i-1" })
+          .pipe(SimpleEntity.condition({ status: "draft" }))
+          .asEffect()
 
         expect(mockDeleteItem).toHaveBeenCalledOnce()
         const input = mockDeleteItem.mock.calls[0]![0]
-        expect(input.ConditionExpression).toContain("#status = :v0")
+        expect(input.ConditionExpression).toContain("=")
+        expect(Object.values(input.ExpressionAttributeNames)).toContain("status")
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -2566,12 +2637,14 @@ describe("Entity", () => {
 
         yield* SimpleEntity.update({ itemId: "i-1" }).pipe(
           Entity.set({ name: "Updated" }),
-          Entity.condition({ eq: { status: "draft" } }),
+          SimpleEntity.condition({ status: "draft" }),
+          Entity.asModel,
         )
 
         expect(mockUpdateItem).toHaveBeenCalledOnce()
         const input = mockUpdateItem.mock.calls[0]![0]
-        expect(input.ConditionExpression).toContain("(#status = :v0)")
+        expect(input.ConditionExpression).toContain("=")
+        expect(Object.values(input.ExpressionAttributeNames)).toContain("status")
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -2587,30 +2660,32 @@ describe("Entity", () => {
           }),
         })
 
-        const VersionedEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "SimpleItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const VersionedEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SimpleItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          versioned: true,
-        })
+            versioned: true,
+          }),
+        )
 
         yield* VersionedEntity.update({ itemId: "i-1" }).pipe(
           Entity.set({ name: "Updated" }),
           Entity.expectedVersion(3),
-          Entity.condition({ eq: { status: "draft" } }),
+          VersionedEntity.condition({ status: "draft" }),
+          Entity.asModel,
         )
 
         const input = mockUpdateItem.mock.calls[0]![0]
         // Should contain both version check AND user condition
         expect(input.ConditionExpression).toContain("#condVer = :expectedVer")
-        expect(input.ConditionExpression).toContain("(#status = :v0)")
         expect(input.ConditionExpression).toContain("AND")
+        expect(Object.values(input.ExpressionAttributeNames)).toContain("status")
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -2622,7 +2697,7 @@ describe("Entity", () => {
         mockPutItem.mockRejectedValueOnce(err)
 
         const op = SimpleEntity.put({ itemId: "i-1", name: "Test" }).pipe(
-          Entity.condition({ attributeNotExists: "pk" }),
+          SimpleEntity.condition((_, { notExists }) => notExists(_.itemId)),
         )
         const result = yield* Effect.flip(Entity.asModel(op))
 
@@ -2638,7 +2713,7 @@ describe("Entity", () => {
         mockDeleteItem.mockRejectedValueOnce(err)
 
         const del = SimpleEntity.delete({ itemId: "i-1" }).pipe(
-          Entity.condition({ eq: { status: "draft" } }),
+          SimpleEntity.condition({ status: "draft" }),
         )
         const result = yield* Effect.flip(del.asEffect())
 
@@ -2652,23 +2727,24 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("create", () => {
-    const SimpleEntity = Entity.make({
-      model: SimpleItem,
-      table: MainTable,
-      entityType: "SimpleItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const SimpleEntity = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "SimpleItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-    })
+      }),
+    )
 
     it.effect("succeeds for a new item", () =>
       Effect.gen(function* () {
         mockPutItem.mockResolvedValueOnce({})
 
-        const result = yield* SimpleEntity.create({ itemId: "i-1", name: "New Item" })
+        const result = yield* SimpleEntity.create({ itemId: "i-1", name: "New Item" }).asEffect()
 
         expect(result.itemId).toBe("i-1")
         expect(result.name).toBe("New Item")
@@ -2698,18 +2774,19 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockPutItem.mockResolvedValueOnce({})
 
-        const TimestampedEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "SimpleItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const TimestampedEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SimpleItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          timestamps: true,
-        })
+            timestamps: true,
+          }),
+        )
 
         const result = yield* TimestampedEntity.create({ itemId: "i-1", name: "Timestamped" }).pipe(
           Entity.asRecord,
@@ -2728,18 +2805,19 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockPutItem.mockResolvedValueOnce({})
 
-        const VersionedEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "SimpleItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const VersionedEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SimpleItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          versioned: true,
-        })
+            versioned: true,
+          }),
+        )
 
         const result = yield* VersionedEntity.create({ itemId: "i-1", name: "Versioned" }).pipe(
           Entity.asRecord,
@@ -2756,12 +2834,15 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockPutItem.mockResolvedValueOnce({})
 
-        yield* SimpleEntity.create({ itemId: "i-1", name: "Test" })
+        yield* SimpleEntity.create({ itemId: "i-1", name: "Test" }).asEffect()
 
         const input = mockPutItem.mock.calls[0]![0]
         // Should reference both pk and sk fields in the condition
         expect(input.ConditionExpression).toContain("attribute_not_exists")
-        expect(input.ConditionExpression).toContain("pk")
+        // ExpressionAttributeNames maps the placeholders to actual field names
+        const names = input.ExpressionAttributeNames ?? {}
+        const nameValues = Object.values(names) as string[]
+        expect(nameValues).toContain("pk")
       }).pipe(Effect.provide(TestLayer)),
     )
   })
@@ -2771,17 +2852,18 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("rich update operations", () => {
-    const SimpleEntity = Entity.make({
-      model: SimpleItem,
-      table: MainTable,
-      entityType: "SimpleItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const SimpleEntity = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "SimpleItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-    })
+      }),
+    )
 
     const standardUpdateResult = {
       Attributes: toAttributeMap({
@@ -2797,7 +2879,7 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockUpdateItem.mockResolvedValueOnce(standardUpdateResult)
 
-        yield* SimpleEntity.update({ itemId: "i-1" }).pipe(Entity.remove(["name"]))
+        yield* SimpleEntity.update({ itemId: "i-1" }).pipe(Entity.remove(["name"]), Entity.asModel)
 
         const input = mockUpdateItem.mock.calls[0]![0]
         expect(input.UpdateExpression).toContain("REMOVE")
@@ -2810,7 +2892,10 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockUpdateItem.mockResolvedValueOnce(standardUpdateResult)
 
-        yield* SimpleEntity.update({ itemId: "i-1" }).pipe(Entity.add({ score: 10 }))
+        yield* SimpleEntity.update({ itemId: "i-1" }).pipe(
+          Entity.add({ score: 10 }),
+          Entity.asModel,
+        )
 
         const input = mockUpdateItem.mock.calls[0]![0]
         expect(input.UpdateExpression).toContain("ADD")
@@ -2822,7 +2907,10 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockUpdateItem.mockResolvedValueOnce(standardUpdateResult)
 
-        yield* SimpleEntity.update({ itemId: "i-1" }).pipe(Entity.subtract({ score: 5 }))
+        yield* SimpleEntity.update({ itemId: "i-1" }).pipe(
+          Entity.subtract({ score: 5 }),
+          Entity.asModel,
+        )
 
         const input = mockUpdateItem.mock.calls[0]![0]
         expect(input.UpdateExpression).toMatch(/SET.*#u\d+ = #u\d+ - :u\d+/)
@@ -2833,7 +2921,10 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockUpdateItem.mockResolvedValueOnce(standardUpdateResult)
 
-        yield* SimpleEntity.update({ itemId: "i-1" }).pipe(Entity.append({ tags: ["new-tag"] }))
+        yield* SimpleEntity.update({ itemId: "i-1" }).pipe(
+          Entity.append({ tags: ["new-tag"] }),
+          Entity.asModel,
+        )
 
         const input = mockUpdateItem.mock.calls[0]![0]
         expect(input.UpdateExpression).toMatch(/SET.*list_append/)
@@ -2846,6 +2937,7 @@ describe("Entity", () => {
 
         yield* SimpleEntity.update({ itemId: "i-1" }).pipe(
           Entity.deleteFromSet({ tags: new Set(["old-tag"]) }),
+          Entity.asModel,
         )
 
         const input = mockUpdateItem.mock.calls[0]![0]
@@ -2862,6 +2954,7 @@ describe("Entity", () => {
           Entity.set({ name: "Updated" }),
           Entity.remove(["obsoleteField"]),
           Entity.add({ viewCount: 1 }),
+          Entity.asModel,
         )
 
         const input = mockUpdateItem.mock.calls[0]![0]
@@ -2875,22 +2968,24 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockUpdateItem.mockResolvedValueOnce(standardUpdateResult)
 
-        const VersionedEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "SimpleItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const VersionedEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SimpleItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          versioned: true,
-        })
+            versioned: true,
+          }),
+        )
 
         yield* VersionedEntity.update({ itemId: "i-1" }).pipe(
           Entity.remove(["name"]),
           Entity.expectedVersion(2),
+          Entity.asModel,
         )
 
         const input = mockUpdateItem.mock.calls[0]![0]
@@ -2903,7 +2998,7 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockUpdateItem.mockResolvedValueOnce(standardUpdateResult)
 
-        yield* Entity.remove(SimpleEntity.update({ itemId: "i-1" }), ["name"])
+        yield* Entity.remove(SimpleEntity.update({ itemId: "i-1" }), ["name"]).asEffect()
 
         const input = mockUpdateItem.mock.calls[0]![0]
         expect(input.UpdateExpression).toContain("REMOVE")
@@ -2914,7 +3009,7 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockUpdateItem.mockResolvedValueOnce(standardUpdateResult)
 
-        yield* Entity.add(SimpleEntity.update({ itemId: "i-1" }), { score: 5 })
+        yield* Entity.add(SimpleEntity.update({ itemId: "i-1" }), { score: 5 }).asEffect()
 
         const input = mockUpdateItem.mock.calls[0]![0]
         expect(input.UpdateExpression).toContain("ADD")
@@ -2926,7 +3021,7 @@ describe("Entity", () => {
         mockUpdateItem.mockResolvedValueOnce(standardUpdateResult)
 
         const op = Entity.subtract(SimpleEntity.update({ itemId: "i-1" }), { score: 3 })
-        yield* Entity.append(op, { tags: ["x"] })
+        yield* Entity.append(op, { tags: ["x"] }).asEffect()
 
         const input = mockUpdateItem.mock.calls[0]![0]
         expect(input.UpdateExpression).toContain("SET")
@@ -2940,27 +3035,28 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("EntityDelete intermediate", () => {
-    const SimpleEntity = Entity.make({
-      model: SimpleItem,
-      table: MainTable,
-      entityType: "SimpleItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const SimpleEntity = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "SimpleItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-    })
+      }),
+    )
 
     it("delete returns an EntityDelete with EntityDeleteTypeId", () => {
       const deleteOp = SimpleEntity.delete({ itemId: "i-1" })
       expect(Entity.EntityDeleteTypeId in deleteOp).toBe(true)
     })
 
-    it.effect("EntityDelete is yieldable (backward-compatible)", () =>
+    it.effect("EntityDelete is convertible via .asEffect()", () =>
       Effect.gen(function* () {
         mockDeleteItem.mockResolvedValueOnce({})
-        yield* SimpleEntity.delete({ itemId: "i-1" })
+        yield* SimpleEntity.delete({ itemId: "i-1" }).asEffect()
         expect(mockDeleteItem).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
@@ -2981,17 +3077,18 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("extractTransactable", () => {
-    const SimpleEntity = Entity.make({
-      model: SimpleItem,
-      table: MainTable,
-      entityType: "SimpleItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const SimpleEntity = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "SimpleItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-    })
+      }),
+    )
 
     it("extracts from EntityGet", () => {
       const getOp = SimpleEntity.get({ itemId: "i-1" })
@@ -3060,22 +3157,23 @@ describe("Entity", () => {
       region: Schema.optional(Schema.String),
     }) {}
 
-    const SparseEntity = Entity.make({
-      model: TenantItem,
-      table: MainTable,
-      entityType: "TenantItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const SparseEntity = withConfig(
+      Entity.make({
+        model: TenantItem,
+        entityType: "TenantItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
+          byTenant: {
+            index: "gsi1",
+            pk: { field: "gsi1pk", composite: ["tenantId"] },
+            sk: { field: "gsi1sk", composite: ["region"] },
+          },
         },
-        byTenant: {
-          index: "gsi1",
-          pk: { field: "gsi1pk", composite: ["tenantId"] },
-          sk: { field: "gsi1sk", composite: ["region"] },
-        },
-      },
-    })
+      }),
+    )
 
     it.effect("put with all composites includes GSI keys", () =>
       Effect.gen(function* () {
@@ -3086,7 +3184,7 @@ describe("Entity", () => {
           name: "Test",
           tenantId: "t-1",
           region: "us-east-1",
-        })
+        }).asEffect()
 
         const call = mockPutItem.mock.calls[0]![0]
         const item = call.Item
@@ -3102,7 +3200,7 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockPutItem.mockResolvedValueOnce({})
 
-        yield* SparseEntity.put({ itemId: "i-2", name: "NoTenant" })
+        yield* SparseEntity.put({ itemId: "i-2", name: "NoTenant" }).asEffect()
 
         const call = mockPutItem.mock.calls[0]![0]
         const item = call.Item
@@ -3120,7 +3218,7 @@ describe("Entity", () => {
         mockPutItem.mockResolvedValueOnce({})
 
         // Only tenantId provided, region missing — sparse, so GSI keys omitted
-        yield* SparseEntity.put({ itemId: "i-3", name: "PartialGSI", tenantId: "t-1" })
+        yield* SparseEntity.put({ itemId: "i-3", name: "PartialGSI", tenantId: "t-1" }).asEffect()
 
         const call = mockPutItem.mock.calls[0]![0]
         const item = call.Item
@@ -3140,22 +3238,23 @@ describe("Entity", () => {
       email: Schema.String,
     }) {}
 
-    const SparseUpdateEntity = Entity.make({
-      model: TenantUser,
-      table: MainTable,
-      entityType: "TenantUser",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["userId"] },
-          sk: { field: "sk", composite: [] },
+    const SparseUpdateEntity = withConfig(
+      Entity.make({
+        model: TenantUser,
+        entityType: "TenantUser",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
+          byTenant: {
+            index: "gsi1",
+            pk: { field: "gsi1pk", composite: ["tenantId"] },
+            sk: { field: "gsi1sk", composite: ["region"] },
+          },
         },
-        byTenant: {
-          index: "gsi1",
-          pk: { field: "gsi1pk", composite: ["tenantId"] },
-          sk: { field: "gsi1sk", composite: ["region"] },
-        },
-      },
-    })
+      }),
+    )
 
     it.effect("update with no GSI composites succeeds without touching GSI keys", () =>
       Effect.gen(function* () {
@@ -3172,7 +3271,10 @@ describe("Entity", () => {
           }),
         })
 
-        yield* SparseUpdateEntity.update({ userId: "u-1" }).pipe(Entity.set({ name: "Updated" }))
+        yield* SparseUpdateEntity.update({ userId: "u-1" }).pipe(
+          Entity.set({ name: "Updated" }),
+          Entity.asModel,
+        )
 
         const call = mockUpdateItem.mock.calls[0]![0]
         // Should NOT include gsi1pk or gsi1sk in the update
@@ -3201,6 +3303,7 @@ describe("Entity", () => {
 
         yield* SparseUpdateEntity.update({ userId: "u-1" }).pipe(
           Entity.set({ tenantId: "t-2", region: "eu-west-1" }),
+          Entity.asModel,
         )
 
         const call = mockUpdateItem.mock.calls[0]![0]
@@ -3262,7 +3365,10 @@ describe("Entity", () => {
           }),
         })
 
-        yield* SparseUpdateEntity.update({ userId: "u-1" }).pipe(Entity.remove(["tenantId"]))
+        yield* SparseUpdateEntity.update({ userId: "u-1" }).pipe(
+          Entity.remove(["tenantId"]),
+          Entity.asModel,
+        )
 
         const call = mockUpdateItem.mock.calls[0]![0]
         const names = call.ExpressionAttributeNames as Record<string, string>
@@ -3289,27 +3395,28 @@ describe("Entity", () => {
           department: Schema.String,
         }) {}
 
-        const MultiGsiEntity = Entity.make({
-          model: MultiGsiUser,
-          table: MainTable,
-          entityType: "MultiGsiUser",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
+        const MultiGsiEntity = withConfig(
+          Entity.make({
+            model: MultiGsiUser,
+            entityType: "MultiGsiUser",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
+              },
+              byTenant: {
+                index: "gsi1",
+                pk: { field: "gsi1pk", composite: ["tenantId"] },
+                sk: { field: "gsi1sk", composite: ["region"] },
+              },
+              byDepartment: {
+                index: "gsi2",
+                pk: { field: "gsi2pk", composite: ["department"] },
+                sk: { field: "gsi2sk", composite: [] },
+              },
             },
-            byTenant: {
-              index: "gsi1",
-              pk: { field: "gsi1pk", composite: ["tenantId"] },
-              sk: { field: "gsi1sk", composite: ["region"] },
-            },
-            byDepartment: {
-              index: "gsi2",
-              pk: { field: "gsi2pk", composite: ["department"] },
-              sk: { field: "gsi2sk", composite: [] },
-            },
-          },
-        })
+          }),
+        )
 
         mockUpdateItem.mockResolvedValueOnce({
           Attributes: toAttributeMap({
@@ -3325,7 +3432,10 @@ describe("Entity", () => {
         })
 
         // Remove tenantId (affects byTenant GSI) but not department (byDepartment should be untouched)
-        yield* MultiGsiEntity.update({ userId: "u-1" }).pipe(Entity.remove(["tenantId"]))
+        yield* MultiGsiEntity.update({ userId: "u-1" }).pipe(
+          Entity.remove(["tenantId"]),
+          Entity.asModel,
+        )
 
         const call = mockUpdateItem.mock.calls[0]![0]
         const names = call.ExpressionAttributeNames as Record<string, string>
@@ -3345,25 +3455,26 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("version snapshots (retain)", () => {
-    const RetainEntity = Entity.make({
-      model: SimpleItem,
-      table: MainTable,
-      entityType: "RetainItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const RetainEntity = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "RetainItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-      timestamps: true,
-      versioned: { retain: true },
-    })
+        timestamps: true,
+        versioned: { retain: true },
+      }),
+    )
 
     it.effect("put creates v1 snapshot when retain=true", () =>
       Effect.gen(function* () {
         mockTransactWriteItems.mockResolvedValueOnce({})
 
-        yield* RetainEntity.put({ itemId: "i-1", name: "Test" })
+        yield* RetainEntity.put({ itemId: "i-1", name: "Test" }).asEffect()
 
         expect(mockTransactWriteItems).toHaveBeenCalledOnce()
         expect(mockPutItem).not.toHaveBeenCalled()
@@ -3388,26 +3499,27 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockTransactWriteItems.mockResolvedValueOnce({})
 
-        const UniqueRetainEntity = Entity.make({
-          model: User,
-          table: MainTable,
-          entityType: "UniqueRetain",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
+        const UniqueRetainEntity = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "UniqueRetain",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          versioned: { retain: true },
-          unique: { email: ["email"] },
-        })
+            versioned: { retain: true },
+            unique: { email: ["email"] },
+          }),
+        )
 
         yield* UniqueRetainEntity.put({
           userId: "u-1",
           email: "alice@test.com",
           displayName: "Alice",
           role: "admin",
-        })
+        }).asEffect()
 
         const call = mockTransactWriteItems.mock.calls[0]![0]
         // Should have 3 items: main entity + sentinel + v1 snapshot
@@ -3432,7 +3544,10 @@ describe("Entity", () => {
         })
         mockTransactWriteItems.mockResolvedValueOnce({})
 
-        yield* RetainEntity.update({ itemId: "i-1" }).pipe(Entity.set({ name: "Updated" }))
+        yield* RetainEntity.update({ itemId: "i-1" }).pipe(
+          Entity.set({ name: "Updated" }),
+          Entity.asModel,
+        )
 
         // Should have read current item first
         expect(mockGetItem).toHaveBeenCalledOnce()
@@ -3477,6 +3592,7 @@ describe("Entity", () => {
         yield* RetainEntity.update({ itemId: "i-1" }).pipe(
           Entity.set({ name: "Updated" }),
           Entity.expectedVersion(3),
+          Entity.asModel,
         )
 
         // The transaction Put should have a version condition
@@ -3563,20 +3679,21 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockTransactWriteItems.mockResolvedValueOnce({})
 
-        const TtlRetainEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "TtlRetain",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const TtlRetainEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "TtlRetain",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          versioned: { retain: true, ttl: Duration.days(90) },
-        })
+            versioned: { retain: true, ttl: Duration.days(90) },
+          }),
+        )
 
-        yield* TtlRetainEntity.put({ itemId: "i-1", name: "Test" })
+        yield* TtlRetainEntity.put({ itemId: "i-1", name: "Test" }).asEffect()
 
         const call = mockTransactWriteItems.mock.calls[0]![0]
         const snapshotPut = call.TransactItems[1].Put
@@ -3592,20 +3709,21 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("soft delete", () => {
-    const SoftDeleteEntity = Entity.make({
-      model: SimpleItem,
-      table: MainTable,
-      entityType: "SoftItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const SoftDeleteEntity = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "SoftItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-      timestamps: true,
-      versioned: true,
-      softDelete: true,
-    })
+        timestamps: true,
+        versioned: true,
+        softDelete: true,
+      }),
+    )
 
     it.effect("delete soft-deletes when configured", () =>
       Effect.gen(function* () {
@@ -3623,7 +3741,7 @@ describe("Entity", () => {
         })
         mockTransactWriteItems.mockResolvedValueOnce({})
 
-        yield* SoftDeleteEntity.delete({ itemId: "i-1" })
+        yield* SoftDeleteEntity.delete({ itemId: "i-1" }).asEffect()
 
         expect(mockTransactWriteItems).toHaveBeenCalledOnce()
         expect(mockDeleteItem).not.toHaveBeenCalled()
@@ -3644,19 +3762,20 @@ describe("Entity", () => {
 
     it.effect("soft delete with unique constraints deletes sentinels (preserveUnique=false)", () =>
       Effect.gen(function* () {
-        const SoftUniqueEntity = Entity.make({
-          model: User,
-          table: MainTable,
-          entityType: "SoftUnique",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
+        const SoftUniqueEntity = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "SoftUnique",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          softDelete: true,
-          unique: { email: ["email"] },
-        })
+            softDelete: true,
+            unique: { email: ["email"] },
+          }),
+        )
 
         mockGetItem.mockResolvedValueOnce({
           Item: toAttributeMap({
@@ -3671,7 +3790,7 @@ describe("Entity", () => {
         })
         mockTransactWriteItems.mockResolvedValueOnce({})
 
-        yield* SoftUniqueEntity.delete({ userId: "u-1" })
+        yield* SoftUniqueEntity.delete({ userId: "u-1" }).asEffect()
 
         const call = mockTransactWriteItems.mock.calls[0]![0]
         // 3 items: Delete current + Put soft-deleted + Delete sentinel
@@ -3683,19 +3802,20 @@ describe("Entity", () => {
 
     it.effect("soft delete with preserveUnique=true keeps sentinels", () =>
       Effect.gen(function* () {
-        const PreserveEntity = Entity.make({
-          model: User,
-          table: MainTable,
-          entityType: "PreserveUniq",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
+        const PreserveEntity = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "PreserveUniq",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          softDelete: { preserveUnique: true },
-          unique: { email: ["email"] },
-        })
+            softDelete: { preserveUnique: true },
+            unique: { email: ["email"] },
+          }),
+        )
 
         mockGetItem.mockResolvedValueOnce({
           Item: toAttributeMap({
@@ -3710,7 +3830,7 @@ describe("Entity", () => {
         })
         mockTransactWriteItems.mockResolvedValueOnce({})
 
-        yield* PreserveEntity.delete({ userId: "u-1" })
+        yield* PreserveEntity.delete({ userId: "u-1" }).asEffect()
 
         const call = mockTransactWriteItems.mock.calls[0]![0]
         // 2 items only: Delete current + Put soft-deleted (no sentinel delete)
@@ -3720,19 +3840,20 @@ describe("Entity", () => {
 
     it.effect("soft delete + retain creates version snapshot", () =>
       Effect.gen(function* () {
-        const SoftRetainEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "SoftRetain",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const SoftRetainEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SoftRetain",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          versioned: { retain: true },
-          softDelete: true,
-        })
+            versioned: { retain: true },
+            softDelete: true,
+          }),
+        )
 
         mockGetItem.mockResolvedValueOnce({
           Item: toAttributeMap({
@@ -3746,7 +3867,7 @@ describe("Entity", () => {
         })
         mockTransactWriteItems.mockResolvedValueOnce({})
 
-        yield* SoftRetainEntity.delete({ itemId: "i-1" })
+        yield* SoftRetainEntity.delete({ itemId: "i-1" }).asEffect()
 
         const call = mockTransactWriteItems.mock.calls[0]![0]
         // 3 items: Delete current + Put soft-deleted + Put version snapshot
@@ -3815,20 +3936,21 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
 
   describe("restore", () => {
-    const RestoreEntity = Entity.make({
-      model: SimpleItem,
-      table: MainTable,
-      entityType: "RestoreItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const RestoreEntity = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "RestoreItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-      timestamps: true,
-      versioned: true,
-      softDelete: true,
-    })
+        timestamps: true,
+        versioned: true,
+        softDelete: true,
+      }),
+    )
 
     it.effect("restore restores a soft-deleted item", () =>
       Effect.gen(function* () {
@@ -3872,20 +3994,21 @@ describe("Entity", () => {
 
     it.effect("restore with unique constraints re-establishes sentinels", () =>
       Effect.gen(function* () {
-        const RestoreUniqueEntity = Entity.make({
-          model: User,
-          table: MainTable,
-          entityType: "RestoreUniq",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
+        const RestoreUniqueEntity = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "RestoreUniq",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          versioned: true,
-          softDelete: true,
-          unique: { email: ["email"] },
-        })
+            versioned: true,
+            softDelete: true,
+            unique: { email: ["email"] },
+          }),
+        )
 
         mockQuery.mockResolvedValueOnce({
           Items: [
@@ -3905,7 +4028,7 @@ describe("Entity", () => {
         })
         mockTransactWriteItems.mockResolvedValueOnce({})
 
-        yield* RestoreUniqueEntity.restore({ userId: "u-1" })
+        yield* RestoreUniqueEntity.restore({ userId: "u-1" }).asEffect()
 
         const call = mockTransactWriteItems.mock.calls[0]![0]
         // 3 items: Delete soft-deleted + Put restored + Put sentinel
@@ -3918,20 +4041,21 @@ describe("Entity", () => {
 
     it.effect("restore fails with UniqueConstraintViolation when value is taken", () =>
       Effect.gen(function* () {
-        const RestoreUniqueEntity = Entity.make({
-          model: User,
-          table: MainTable,
-          entityType: "RestoreUniq",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
+        const RestoreUniqueEntity = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "RestoreUniq",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          versioned: true,
-          softDelete: true,
-          unique: { email: ["email"] },
-        })
+            versioned: true,
+            softDelete: true,
+            unique: { email: ["email"] },
+          }),
+        )
 
         mockQuery.mockResolvedValueOnce({
           Items: [
@@ -3969,19 +4093,20 @@ describe("Entity", () => {
 
     it.effect("restore + retain creates snapshot", () =>
       Effect.gen(function* () {
-        const RestoreRetainEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "RestoreRetain",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const RestoreRetainEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "RestoreRetain",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          versioned: { retain: true },
-          softDelete: true,
-        })
+            versioned: { retain: true },
+            softDelete: true,
+          }),
+        )
 
         mockQuery.mockResolvedValueOnce({
           Items: [
@@ -3999,7 +4124,7 @@ describe("Entity", () => {
         })
         mockTransactWriteItems.mockResolvedValueOnce({})
 
-        yield* RestoreRetainEntity.restore({ itemId: "i-1" })
+        yield* RestoreRetainEntity.restore({ itemId: "i-1" }).asEffect()
 
         const call = mockTransactWriteItems.mock.calls[0]![0]
         // 3 items: Delete soft-deleted + Put restored + Put snapshot
@@ -4065,22 +4190,24 @@ describe("Entity", () => {
       transactGetItems: () => Effect.die("not used"),
       createTable: () => Effect.die("not used"),
       deleteTable: () => Effect.die("not used"),
+      describeTable: () => Effect.die("not used"),
       scan: () => Effect.die("not used"),
     })
 
     const PurgeTestLayer = Layer.merge(PurgeTestDynamoClient, TestTableConfig)
 
-    const PurgeEntity = Entity.make({
-      model: SimpleItem,
-      table: MainTable,
-      entityType: "PurgeItem",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["itemId"] },
-          sk: { field: "sk", composite: [] },
+    const PurgeEntity = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "PurgeItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-    })
+      }),
+    )
 
     beforeEach(() => {
       mockBatchWriteItem.mockReset()
@@ -4108,7 +4235,7 @@ describe("Entity", () => {
         })
         mockBatchWriteItem.mockResolvedValueOnce({})
 
-        yield* PurgeEntity.purge({ itemId: "i-1" })
+        yield* PurgeEntity.purge({ itemId: "i-1" }).asEffect()
 
         expect(mockBatchWriteItem).toHaveBeenCalledOnce()
         const call = mockBatchWriteItem.mock.calls[0]![0]
@@ -4118,18 +4245,19 @@ describe("Entity", () => {
 
     it.effect("purge handles soft-deleted item + versions", () =>
       Effect.gen(function* () {
-        const PurgeSoftEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "PurgeSoft",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const PurgeSoftEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "PurgeSoft",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          softDelete: true,
-        })
+            softDelete: true,
+          }),
+        )
 
         // Query for all items in partition
         mockQuery.mockResolvedValueOnce({
@@ -4150,7 +4278,7 @@ describe("Entity", () => {
         })
         mockBatchWriteItem.mockResolvedValueOnce({})
 
-        yield* PurgeSoftEntity.purge({ itemId: "i-1" })
+        yield* PurgeSoftEntity.purge({ itemId: "i-1" }).asEffect()
 
         expect(mockBatchWriteItem).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(PurgeTestLayer)),
@@ -4169,7 +4297,7 @@ describe("Entity", () => {
         })
         mockBatchWriteItem.mockResolvedValueOnce({})
 
-        yield* PurgeEntity.purge({ itemId: "i-1" })
+        yield* PurgeEntity.purge({ itemId: "i-1" }).asEffect()
 
         expect(mockBatchWriteItem).toHaveBeenCalledOnce()
         const call = mockBatchWriteItem.mock.calls[0]![0]
@@ -4198,44 +4326,47 @@ describe("Entity", () => {
       occurredAt: DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds)),
     }) {}
 
-    const EventEntity = Entity.make({
-      model: Event,
-      table: MainTable,
-      entityType: "Event",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["eventId"] },
-          sk: { field: "sk", composite: [] },
+    const EventEntity = withConfig(
+      Entity.make({
+        model: Event,
+        entityType: "Event",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["eventId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-      timestamps: true,
-    })
+        timestamps: true,
+      }),
+    )
 
-    const EventEpochEntity = Entity.make({
-      model: EventEpoch,
-      table: MainTable,
-      entityType: "EventEpoch",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["eventId"] },
-          sk: { field: "sk", composite: [] },
+    const EventEpochEntity = withConfig(
+      Entity.make({
+        model: EventEpoch,
+        entityType: "EventEpoch",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["eventId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-      timestamps: true,
-    })
+        timestamps: true,
+      }),
+    )
 
-    const EventStoredAsEntity = Entity.make({
-      model: EventStoredAsEpoch,
-      table: MainTable,
-      entityType: "EventStoredAs",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["eventId"] },
-          sk: { field: "sk", composite: [] },
+    const EventStoredAsEntity = withConfig(
+      Entity.make({
+        model: EventStoredAsEpoch,
+        entityType: "EventStoredAs",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["eventId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-      timestamps: true,
-    })
+        timestamps: true,
+      }),
+    )
 
     it.effect("put: DateString field stored as ISO string in DynamoDB", () =>
       Effect.gen(function* () {
@@ -4243,7 +4374,7 @@ describe("Entity", () => {
         yield* EventEntity.put({
           eventId: "e-1",
           occurredAt: "2024-01-01T00:00:00.000Z",
-        })
+        }).asEffect()
 
         const call = mockPutItem.mock.calls[0]![0]
         // occurredAt should be stored as ISO string (S attribute)
@@ -4257,7 +4388,7 @@ describe("Entity", () => {
         yield* EventEpochEntity.put({
           eventId: "e-1",
           occurredAt: 1704067200,
-        })
+        }).asEffect()
 
         const call = mockPutItem.mock.calls[0]![0]
         // occurredAt should be stored as epoch seconds (N attribute)
@@ -4271,7 +4402,7 @@ describe("Entity", () => {
         yield* EventStoredAsEntity.put({
           eventId: "e-1",
           occurredAt: "2024-01-01T00:00:00.000Z",
-        })
+        }).asEffect()
 
         const call = mockPutItem.mock.calls[0]![0]
         // occurredAt should be stored as epoch seconds (N attribute) despite wire being ISO string
@@ -4293,7 +4424,7 @@ describe("Entity", () => {
           }),
         })
 
-        const result = yield* EventEntity.get({ eventId: "e-1" })
+        const result = yield* EventEntity.get({ eventId: "e-1" }).asEffect()
         expect(DateTime.isDateTime(result.occurredAt)).toBe(true)
         expect(DateTime.toEpochMillis(result.occurredAt)).toBe(1704067200000)
       }).pipe(Effect.provide(TestLayer)),
@@ -4313,7 +4444,7 @@ describe("Entity", () => {
           }),
         })
 
-        const result = yield* EventEpochEntity.get({ eventId: "e-1" })
+        const result = yield* EventEpochEntity.get({ eventId: "e-1" }).asEffect()
         expect(DateTime.isDateTime(result.occurredAt)).toBe(true)
         expect(DateTime.toEpochMillis(result.occurredAt)).toBe(1704067200000)
       }).pipe(Effect.provide(TestLayer)),
@@ -4333,7 +4464,7 @@ describe("Entity", () => {
           }),
         })
 
-        const result = yield* EventStoredAsEntity.get({ eventId: "e-1" })
+        const result = yield* EventStoredAsEntity.get({ eventId: "e-1" }).asEffect()
         expect(DateTime.isDateTime(result.occurredAt)).toBe(true)
         expect(DateTime.toEpochMillis(result.occurredAt)).toBe(1704067200000)
       }).pipe(Effect.provide(TestLayer)),
@@ -4356,23 +4487,24 @@ describe("Entity", () => {
         })
 
         // Need an entity with a GSI to test query
-        const EventEpochWithGsi = Entity.make({
-          model: EventEpoch,
-          table: MainTable,
-          entityType: "EventEpoch",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["eventId"] },
-              sk: { field: "sk", composite: [] },
+        const EventEpochWithGsi = withConfig(
+          Entity.make({
+            model: EventEpoch,
+            entityType: "EventEpoch",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["eventId"] },
+                sk: { field: "sk", composite: [] },
+              },
+              byEvent: {
+                index: "gsi1",
+                pk: { field: "gsi1pk", composite: ["eventId"] },
+                sk: { field: "gsi1sk", composite: [] },
+              },
             },
-            byEvent: {
-              index: "gsi1",
-              pk: { field: "gsi1pk", composite: ["eventId"] },
-              sk: { field: "gsi1sk", composite: [] },
-            },
-          },
-          timestamps: true,
-        })
+            timestamps: true,
+          }),
+        )
 
         const results = yield* EventEpochWithGsi.query
           .byEvent({ eventId: "e-1" })
@@ -4400,6 +4532,7 @@ describe("Entity", () => {
 
         const result = yield* EventEpochEntity.update({ eventId: "e-1" }).pipe(
           Entity.set({ occurredAt: 1704153600 }),
+          Entity.asModel,
         )
         expect(DateTime.isDateTime(result.occurredAt)).toBe(true)
         expect(DateTime.toEpochMillis(result.occurredAt)).toBe(1704153600000)
@@ -4425,23 +4558,24 @@ describe("Entity", () => {
       firmwareVersion: { field: "fw_ver" },
     })
 
-    const DeviceEntity = Entity.make({
-      model: DeviceModel,
-      table: MainTable,
-      entityType: "Device",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["id"] },
-          sk: { field: "sk", composite: [] },
+    const DeviceEntity = withConfig(
+      Entity.make({
+        model: DeviceModel,
+        entityType: "Device",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-      timestamps: true,
-    })
+        timestamps: true,
+      }),
+    )
 
     it.effect("put: field renaming maps domain names to DynamoDB attribute names", () =>
       Effect.gen(function* () {
         mockPutItem.mockResolvedValue({})
-        yield* DeviceEntity.put({ id: "d-1", name: "Sensor", firmwareVersion: "1.0.0" })
+        yield* DeviceEntity.put({ id: "d-1", name: "Sensor", firmwareVersion: "1.0.0" }).asEffect()
         const call = mockPutItem.mock.calls[0]![0]
         const item = call.Item
         // Domain "id" → DynamoDB "deviceId"
@@ -4469,7 +4603,7 @@ describe("Entity", () => {
             updatedAt: "2024-01-01T00:00:00.000Z",
           }),
         })
-        const result = yield* DeviceEntity.get({ id: "d-1" })
+        const result = yield* DeviceEntity.get({ id: "d-1" }).asEffect()
         // Should see domain names
         expect(result.id).toBe("d-1")
         expect(result.name).toBe("Sensor")
@@ -4488,18 +4622,19 @@ describe("Entity", () => {
       expiresAt: { storedAs: DynamoModel.DateEpochSeconds },
     })
 
-    const OrderEntity = Entity.make({
-      model: OrderModel,
-      table: MainTable,
-      entityType: "Order",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["orderId"] },
-          sk: { field: "sk", composite: [] },
+    const OrderEntity = withConfig(
+      Entity.make({
+        model: OrderModel,
+        entityType: "Order",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["orderId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-      timestamps: true,
-    })
+        timestamps: true,
+      }),
+    )
 
     it.effect("put: ConfiguredModel storage override stores epoch seconds", () =>
       Effect.gen(function* () {
@@ -4508,7 +4643,7 @@ describe("Entity", () => {
           orderId: "o-1",
           placedAt: "2024-01-01T00:00:00.000Z",
           expiresAt: "2024-02-01T00:00:00.000Z",
-        })
+        }).asEffect()
         const call = mockPutItem.mock.calls[0]![0]
         const item = call.Item
         // placedAt has no storage override — stored as ISO string (default)
@@ -4532,7 +4667,7 @@ describe("Entity", () => {
             updatedAt: "2024-01-01T00:00:00.000Z",
           }),
         })
-        const result = yield* OrderEntity.get({ orderId: "o-1" })
+        const result = yield* OrderEntity.get({ orderId: "o-1" }).asEffect()
         expect(DateTime.isDateTime(result.expiresAt)).toBe(true)
         expect(DateTime.toEpochMillis(result.expiresAt)).toBe(1706745600000)
       }).pipe(Effect.provide(TestLayer)),
@@ -4543,18 +4678,19 @@ describe("Entity", () => {
       expiresAt: { field: "ttl", storedAs: DynamoModel.DateEpochSeconds },
     })
 
-    const OrderFullEntity = Entity.make({
-      model: OrderModelFull,
-      table: MainTable,
-      entityType: "OrderFull",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["orderId"] },
-          sk: { field: "sk", composite: [] },
+    const OrderFullEntity = withConfig(
+      Entity.make({
+        model: OrderModelFull,
+        entityType: "OrderFull",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["orderId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-      timestamps: true,
-    })
+        timestamps: true,
+      }),
+    )
 
     it.effect("put: field rename + storage override compose correctly", () =>
       Effect.gen(function* () {
@@ -4563,7 +4699,7 @@ describe("Entity", () => {
           orderId: "o-1",
           placedAt: "2024-01-01T00:00:00.000Z",
           expiresAt: "2024-02-01T00:00:00.000Z",
-        })
+        }).asEffect()
         const call = mockPutItem.mock.calls[0]![0]
         const item = call.Item
         // expiresAt → field: "ttl", storedAs: epoch seconds
@@ -4586,7 +4722,7 @@ describe("Entity", () => {
             updatedAt: "2024-01-01T00:00:00.000Z",
           }),
         })
-        const result = yield* OrderFullEntity.get({ orderId: "o-1" })
+        const result = yield* OrderFullEntity.get({ orderId: "o-1" }).asEffect()
         // Domain name is "expiresAt", decoded from DynamoDB "ttl"
         expect(result.expiresAt).toBeDefined()
         expect(DateTime.isDateTime(result.expiresAt)).toBe(true)
@@ -4608,7 +4744,10 @@ describe("Entity", () => {
             updatedAt: "2024-01-01T00:00:00.000Z",
           }),
         })
-        yield* DeviceEntity.update({ id: "d-1" }).pipe(Entity.set({ firmwareVersion: "2.0.0" }))
+        yield* DeviceEntity.update({ id: "d-1" }).pipe(
+          Entity.set({ firmwareVersion: "2.0.0" }),
+          Entity.asModel,
+        )
         const call = mockUpdateItem.mock.calls[0]![0]
         // The update expression should use the DynamoDB name "fw_ver", not "firmwareVersion"
         const names = call.ExpressionAttributeNames
@@ -4631,28 +4770,29 @@ describe("Entity", () => {
 
     it.effect("timestamps with schema: updatedAt stored as epoch seconds", () =>
       Effect.gen(function* () {
-        const MetricEntity = Entity.make({
-          model: Metric,
-          table: MainTable,
-          entityType: "Metric",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["metricId"] },
-              sk: { field: "sk", composite: [] },
+        const MetricEntity = withConfig(
+          Entity.make({
+            model: Metric,
+            entityType: "Metric",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["metricId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          timestamps: {
-            created: DynamoModel.DateString,
-            updated: {
-              schema: DynamoModel.DateString.pipe(
-                DynamoModel.storedAs(DynamoModel.DateEpochSeconds),
-              ),
+            timestamps: {
+              created: DynamoModel.DateString,
+              updated: {
+                schema: DynamoModel.DateString.pipe(
+                  DynamoModel.storedAs(DynamoModel.DateEpochSeconds),
+                ),
+              },
             },
-          },
-        })
+          }),
+        )
 
         mockPutItem.mockResolvedValue({})
-        yield* MetricEntity.put({ metricId: "m-1", value: 42 })
+        yield* MetricEntity.put({ metricId: "m-1", value: 42 }).asEffect()
         const call = mockPutItem.mock.calls[0]![0]
         const item = call.Item
         // createdAt: DynamoModel.DateString → stored as ISO string
@@ -4668,24 +4808,25 @@ describe("Entity", () => {
 
     it.effect("timestamps with field rename: custom field names", () =>
       Effect.gen(function* () {
-        const MetricEntity = Entity.make({
-          model: Metric,
-          table: MainTable,
-          entityType: "Metric2",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["metricId"] },
-              sk: { field: "sk", composite: [] },
+        const MetricEntity = withConfig(
+          Entity.make({
+            model: Metric,
+            entityType: "Metric2",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["metricId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          timestamps: {
-            created: "registeredAt",
-            updated: "modifiedAt",
-          },
-        })
+            timestamps: {
+              created: "registeredAt",
+              updated: "modifiedAt",
+            },
+          }),
+        )
 
         mockPutItem.mockResolvedValue({})
-        yield* MetricEntity.put({ metricId: "m-1", value: 42 })
+        yield* MetricEntity.put({ metricId: "m-1", value: 42 }).asEffect()
         const call = mockPutItem.mock.calls[0]![0]
         const item = call.Item
         expect(item.registeredAt).toBeDefined()
@@ -4697,26 +4838,27 @@ describe("Entity", () => {
 
     it.effect("timestamps with { field, schema }: custom name + custom storage", () =>
       Effect.gen(function* () {
-        const MetricEntity = Entity.make({
-          model: Metric,
-          table: MainTable,
-          entityType: "Metric3",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["metricId"] },
-              sk: { field: "sk", composite: [] },
+        const MetricEntity = withConfig(
+          Entity.make({
+            model: Metric,
+            entityType: "Metric3",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["metricId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          timestamps: {
-            updated: {
-              field: "modifiedAt",
-              schema: DynamoModel.DateEpochSeconds,
+            timestamps: {
+              updated: {
+                field: "modifiedAt",
+                schema: DynamoModel.DateEpochSeconds,
+              },
             },
-          },
-        })
+          }),
+        )
 
         mockPutItem.mockResolvedValue({})
-        yield* MetricEntity.put({ metricId: "m-1", value: 42 })
+        yield* MetricEntity.put({ metricId: "m-1", value: 42 }).asEffect()
         const call = mockPutItem.mock.calls[0]![0]
         const item = call.Item
         // updatedAt uses custom name "modifiedAt" and epoch seconds
@@ -4735,19 +4877,20 @@ describe("Entity", () => {
   describe("patch", () => {
     it.effect("succeeds when item exists", () =>
       Effect.gen(function* () {
-        const UserEntity = Entity.make({
-          model: User,
-          table: MainTable,
-          entityType: "User",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
+        const UserEntity = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "User",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          timestamps: true,
-          versioned: true,
-        })
+            timestamps: true,
+            versioned: true,
+          }),
+        )
 
         mockUpdateItem.mockResolvedValue({
           Attributes: toAttributeMap({
@@ -4764,7 +4907,10 @@ describe("Entity", () => {
           }),
         })
 
-        yield* UserEntity.patch({ userId: "u-1" }).pipe(Entity.set({ email: "new@test.com" }))
+        yield* UserEntity.patch({ userId: "u-1" }).pipe(
+          Entity.set({ email: "new@test.com" }),
+          Entity.asModel,
+        )
 
         const call = mockUpdateItem.mock.calls[0]![0]
         // Should include attribute_exists condition for PK
@@ -4774,19 +4920,20 @@ describe("Entity", () => {
 
     it.effect("fails with ConditionalCheckFailed when item does not exist", () =>
       Effect.gen(function* () {
-        const UserEntity = Entity.make({
-          model: User,
-          table: MainTable,
-          entityType: "User",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
+        const UserEntity = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "User",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          timestamps: true,
-          versioned: true,
-        })
+            timestamps: true,
+            versioned: true,
+          }),
+        )
 
         const condError = new Error("ConditionalCheckFailedException")
         condError.name = "ConditionalCheckFailedException"
@@ -4803,19 +4950,20 @@ describe("Entity", () => {
 
     it.effect("composes with set and other combinators", () =>
       Effect.gen(function* () {
-        const UserEntity = Entity.make({
-          model: User,
-          table: MainTable,
-          entityType: "User",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
+        const UserEntity = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "User",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          timestamps: true,
-          versioned: true,
-        })
+            timestamps: true,
+            versioned: true,
+          }),
+        )
 
         mockUpdateItem.mockResolvedValue({
           Attributes: toAttributeMap({
@@ -4835,6 +4983,7 @@ describe("Entity", () => {
         yield* UserEntity.patch({ userId: "u-1" }).pipe(
           Entity.set({ email: "new@test.com" }),
           Entity.expectedVersion(2),
+          Entity.asModel,
         )
 
         const call = mockUpdateItem.mock.calls[0]![0]
@@ -4848,21 +4997,22 @@ describe("Entity", () => {
   describe("deleteIfExists", () => {
     it.effect("succeeds when item exists", () =>
       Effect.gen(function* () {
-        const ItemEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "SimpleItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const ItemEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SimpleItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-        })
+          }),
+        )
 
         mockDeleteItem.mockResolvedValue({})
 
-        yield* ItemEntity.deleteIfExists({ itemId: "i-1" })
+        yield* ItemEntity.deleteIfExists({ itemId: "i-1" }).asEffect()
 
         const call = mockDeleteItem.mock.calls[0]![0]
         // Should include attribute_exists condition for PK
@@ -4872,17 +5022,18 @@ describe("Entity", () => {
 
     it.effect("fails with ConditionalCheckFailed when item does not exist", () =>
       Effect.gen(function* () {
-        const ItemEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "SimpleItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const ItemEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SimpleItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-        })
+          }),
+        )
 
         const condError = new Error("ConditionalCheckFailedException")
         condError.name = "ConditionalCheckFailedException"
@@ -4900,19 +5051,20 @@ describe("Entity", () => {
   describe("upsert", () => {
     it.effect("creates a new item with if_not_exists for immutable fields and createdAt", () =>
       Effect.gen(function* () {
-        const UserEntity = Entity.make({
-          model: UserWithImmutable,
-          table: MainTable,
-          entityType: "UserImm",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
+        const UserEntity = withConfig(
+          Entity.make({
+            model: UserWithImmutableModel,
+            entityType: "UserImm",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          timestamps: true,
-          versioned: true,
-        })
+            timestamps: true,
+            versioned: true,
+          }),
+        )
 
         mockUpdateItem.mockResolvedValue({
           Attributes: toAttributeMap({
@@ -4934,7 +5086,7 @@ describe("Entity", () => {
           email: "test@test.com",
           displayName: "Test" as any,
           createdBy: "admin",
-        })
+        }).asEffect()
 
         const call = mockUpdateItem.mock.calls[0]![0]
         const updateExpr = call.UpdateExpression as string
@@ -4958,18 +5110,19 @@ describe("Entity", () => {
 
     it.effect("includes entity type discriminator in expression", () =>
       Effect.gen(function* () {
-        const ItemEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "SimpleItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const ItemEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SimpleItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          timestamps: true,
-        })
+            timestamps: true,
+          }),
+        )
 
         mockUpdateItem.mockResolvedValue({
           Attributes: toAttributeMap({
@@ -4983,7 +5136,7 @@ describe("Entity", () => {
           }),
         })
 
-        yield* ItemEntity.upsert({ itemId: "i-1", name: "Test" })
+        yield* ItemEntity.upsert({ itemId: "i-1", name: "Test" }).asEffect()
 
         const call = mockUpdateItem.mock.calls[0]![0]
         // __edd_e__ should be in the expression values
@@ -4995,18 +5148,19 @@ describe("Entity", () => {
 
     it.effect("version uses if_not_exists(version, 0) + 1 pattern", () =>
       Effect.gen(function* () {
-        const ItemEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "SimpleItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const ItemEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SimpleItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          versioned: true,
-        })
+            versioned: true,
+          }),
+        )
 
         mockUpdateItem.mockResolvedValue({
           Attributes: toAttributeMap({
@@ -5019,7 +5173,7 @@ describe("Entity", () => {
           }),
         })
 
-        yield* ItemEntity.upsert({ itemId: "i-1", name: "Test" })
+        yield* ItemEntity.upsert({ itemId: "i-1", name: "Test" }).asEffect()
 
         const call = mockUpdateItem.mock.calls[0]![0]
         const updateExpr = call.UpdateExpression as string
@@ -5032,17 +5186,18 @@ describe("Entity", () => {
   describe("returnValues", () => {
     it.effect("update with returnValues: none", () =>
       Effect.gen(function* () {
-        const ItemEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "SimpleItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const ItemEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SimpleItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-        })
+          }),
+        )
 
         mockUpdateItem.mockResolvedValue({
           Attributes: toAttributeMap({
@@ -5057,6 +5212,7 @@ describe("Entity", () => {
         yield* ItemEntity.update({ itemId: "i-1" }).pipe(
           Entity.set({ name: "Updated" }),
           Entity.returnValues("none"),
+          Entity.asModel,
         )
 
         const call = mockUpdateItem.mock.calls[0]![0]
@@ -5066,17 +5222,18 @@ describe("Entity", () => {
 
     it.effect("update with returnValues: updatedOld", () =>
       Effect.gen(function* () {
-        const ItemEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "SimpleItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const ItemEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SimpleItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-        })
+          }),
+        )
 
         mockUpdateItem.mockResolvedValue({
           Attributes: toAttributeMap({
@@ -5091,6 +5248,7 @@ describe("Entity", () => {
         yield* ItemEntity.update({ itemId: "i-1" }).pipe(
           Entity.set({ name: "Updated" }),
           Entity.returnValues("updatedOld"),
+          Entity.asModel,
         )
 
         const call = mockUpdateItem.mock.calls[0]![0]
@@ -5100,17 +5258,18 @@ describe("Entity", () => {
 
     it.effect("default update returnValues is ALL_NEW", () =>
       Effect.gen(function* () {
-        const ItemEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "SimpleItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const ItemEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SimpleItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-        })
+          }),
+        )
 
         mockUpdateItem.mockResolvedValue({
           Attributes: toAttributeMap({
@@ -5122,7 +5281,10 @@ describe("Entity", () => {
           }),
         })
 
-        yield* ItemEntity.update({ itemId: "i-1" }).pipe(Entity.set({ name: "Updated" }))
+        yield* ItemEntity.update({ itemId: "i-1" }).pipe(
+          Entity.set({ name: "Updated" }),
+          Entity.asModel,
+        )
 
         const call = mockUpdateItem.mock.calls[0]![0]
         expect(call.ReturnValues).toBe("ALL_NEW")
@@ -5131,21 +5293,22 @@ describe("Entity", () => {
 
     it.effect("delete with returnValues: allOld", () =>
       Effect.gen(function* () {
-        const ItemEntity = Entity.make({
-          model: SimpleItem,
-          table: MainTable,
-          entityType: "SimpleItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const ItemEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SimpleItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-        })
+          }),
+        )
 
         mockDeleteItem.mockResolvedValue({})
 
-        yield* ItemEntity.delete({ itemId: "i-1" }).pipe(Entity.returnValues("allOld"))
+        yield* ItemEntity.delete({ itemId: "i-1" }).pipe(Entity.returnValues("allOld")).asEffect()
 
         const call = mockDeleteItem.mock.calls[0]![0]
         expect(call.ReturnValues).toBe("ALL_OLD")
@@ -5166,17 +5329,18 @@ describe("Entity", () => {
 
     it.effect("hidden fields are stripped from model decode (yield*)", () =>
       Effect.gen(function* () {
-        const HiddenEntity = Entity.make({
-          model: ItemWithHidden,
-          table: MainTable,
-          entityType: "HiddenItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const HiddenEntity = withConfig(
+          Entity.make({
+            model: ItemWithHidden,
+            entityType: "HiddenItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-        })
+          }),
+        )
 
         mockGetItem.mockResolvedValue({
           Item: toAttributeMap({
@@ -5189,7 +5353,7 @@ describe("Entity", () => {
           }),
         })
 
-        const result = yield* HiddenEntity.get({ itemId: "i-1" })
+        const result = yield* HiddenEntity.get({ itemId: "i-1" }).asEffect()
         // Hidden field should not be present in model decode
         expect((result as any).internalScore).toBeUndefined()
         expect(result.name).toBe("Test")
@@ -5198,18 +5362,19 @@ describe("Entity", () => {
 
     it.effect("hidden fields are stripped from asRecord", () =>
       Effect.gen(function* () {
-        const HiddenEntity = Entity.make({
-          model: ItemWithHidden,
-          table: MainTable,
-          entityType: "HiddenItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const HiddenEntity = withConfig(
+          Entity.make({
+            model: ItemWithHidden,
+            entityType: "HiddenItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          timestamps: true,
-        })
+            timestamps: true,
+          }),
+        )
 
         mockGetItem.mockResolvedValue({
           Item: toAttributeMap({
@@ -5234,17 +5399,18 @@ describe("Entity", () => {
 
     it.effect("hidden fields are visible in asItem", () =>
       Effect.gen(function* () {
-        const HiddenEntity = Entity.make({
-          model: ItemWithHidden,
-          table: MainTable,
-          entityType: "HiddenItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const HiddenEntity = withConfig(
+          Entity.make({
+            model: ItemWithHidden,
+            entityType: "HiddenItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-        })
+          }),
+        )
 
         mockGetItem.mockResolvedValue({
           Item: toAttributeMap({
@@ -5266,21 +5432,22 @@ describe("Entity", () => {
 
     it.effect("hidden fields are stored in DynamoDB", () =>
       Effect.gen(function* () {
-        const HiddenEntity = Entity.make({
-          model: ItemWithHidden,
-          table: MainTable,
-          entityType: "HiddenItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
+        const HiddenEntity = withConfig(
+          Entity.make({
+            model: ItemWithHidden,
+            entityType: "HiddenItem",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["itemId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-        })
+          }),
+        )
 
         mockPutItem.mockResolvedValue({})
 
-        yield* HiddenEntity.put({ itemId: "i-1", name: "Test", internalScore: 42 })
+        yield* HiddenEntity.put({ itemId: "i-1", name: "Test", internalScore: 42 }).asEffect()
 
         const call = mockPutItem.mock.calls[0]![0]
         const item = call.Item
@@ -5314,45 +5481,48 @@ describe("Entity", () => {
       role: Schema.String,
     }) {}
 
-    const TeamEntity = Entity.make({
-      model: Team,
-      table: MainTable,
-      entityType: "Team",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["id"] },
-          sk: { field: "sk", composite: [] },
+    const TeamEntity = withConfig(
+      Entity.make({
+        model: Team,
+        entityType: "Team",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-    })
+      }),
+    )
 
-    const PlayerEntity = Entity.make({
-      model: Player,
-      table: MainTable,
-      entityType: "Player",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["id"] },
-          sk: { field: "sk", composite: [] },
+    const PlayerEntity = withConfig(
+      Entity.make({
+        model: Player,
+        entityType: "Player",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-    })
+      }),
+    )
 
-    const SelectionEntity = Entity.make({
-      model: TeamPlayerSelection,
-      table: MainTable,
-      entityType: "TeamPlayerSelection",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["selectionId"] },
-          sk: { field: "sk", composite: [] },
+    const SelectionEntity = withConfig(
+      Entity.make({
+        model: TeamPlayerSelection,
+        entityType: "TeamPlayerSelection",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["selectionId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-      refs: {
-        team: { entity: TeamEntity },
-        player: { entity: PlayerEntity },
-      },
-    })
+        refs: {
+          team: { entity: TeamEntity },
+          player: { entity: PlayerEntity },
+        },
+      }),
+    )
 
     it("validates ref annotation at make() time", () => {
       class BadModel extends Schema.Class<BadModel>("BadModel")({
@@ -5361,18 +5531,19 @@ describe("Entity", () => {
       }) {}
 
       expect(() =>
-        Entity.make({
-          model: BadModel,
-          table: MainTable,
-          entityType: "BadModel",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["id"] },
-              sk: { field: "sk", composite: [] },
+        withConfig(
+          Entity.make({
+            model: BadModel,
+            entityType: "BadModel",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["id"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          refs: { team: { entity: TeamEntity } } as any,
-        }),
+            refs: { team: { entity: TeamEntity } } as any,
+          }),
+        ),
       ).toThrow("does not have the DynamoModel.ref annotation")
     })
 
@@ -5382,17 +5553,18 @@ describe("Entity", () => {
         name: Schema.String,
       }) {}
 
-      const NoIdEntityDef = Entity.make({
-        model: NoIdEntity,
-        table: MainTable,
-        entityType: "NoIdEntity",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["code"] },
-            sk: { field: "sk", composite: [] },
+      const NoIdEntityDef = withConfig(
+        Entity.make({
+          model: NoIdEntity,
+          entityType: "NoIdEntity",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["code"] },
+              sk: { field: "sk", composite: [] },
+            },
           },
-        },
-      })
+        }),
+      )
 
       class RefModel extends Schema.Class<RefModel>("RefModel")({
         id: Schema.String,
@@ -5400,18 +5572,19 @@ describe("Entity", () => {
       }) {}
 
       expect(() =>
-        Entity.make({
-          model: RefModel,
-          table: MainTable,
-          entityType: "RefModel",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["id"] },
-              sk: { field: "sk", composite: [] },
+        withConfig(
+          Entity.make({
+            model: RefModel,
+            entityType: "RefModel",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["id"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          refs: { ref: { entity: NoIdEntityDef } } as any,
-        }),
+            refs: { ref: { entity: NoIdEntityDef } } as any,
+          }),
+        ),
       ).toThrow("has no identifier field")
     })
 
@@ -5452,7 +5625,7 @@ describe("Entity", () => {
           teamId: "team-1",
           playerId: "player-1",
           role: "Batter",
-        })
+        }).asEffect()
 
         // Verify getItem was called for both refs
         expect(mockGetItem).toHaveBeenCalledTimes(2)
@@ -5495,7 +5668,7 @@ describe("Entity", () => {
           }),
         })
 
-        const result = yield* SelectionEntity.get({ selectionId: "sel-1" })
+        const result = yield* SelectionEntity.get({ selectionId: "sel-1" }).asEffect()
 
         expect(result.selectionId).toBe("sel-1")
         expect(result.role).toBe("Batter")
@@ -5533,18 +5706,19 @@ describe("Entity", () => {
     it.effect("embedded ref data is domain-only (no system fields)", () =>
       Effect.gen(function* () {
         // Create a Team entity with timestamps to verify they're excluded from embedded data
-        const TeamWithTimestamps = Entity.make({
-          model: Team,
-          table: MainTable,
-          entityType: "TeamTS",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["id"] },
-              sk: { field: "sk", composite: [] },
+        const TeamWithTimestamps = withConfig(
+          Entity.make({
+            model: Team,
+            entityType: "TeamTS",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["id"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          timestamps: true,
-        })
+            timestamps: true,
+          }),
+        )
 
         // Mock getItem to return Team with timestamps
         mockGetItem.mockImplementation((input: any) => {
@@ -5585,28 +5759,29 @@ describe("Entity", () => {
           role: Schema.String,
         }) {}
 
-        const SelectionWithTSTeamEntity = Entity.make({
-          model: SelectionWithTSTeam,
-          table: MainTable,
-          entityType: "SelectionWithTSTeam",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["selectionId"] },
-              sk: { field: "sk", composite: [] },
+        const SelectionWithTSTeamEntity = withConfig(
+          Entity.make({
+            model: SelectionWithTSTeam,
+            entityType: "SelectionWithTSTeam",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["selectionId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          refs: {
-            team: { entity: TeamWithTimestamps },
-            player: { entity: PlayerEntity },
-          },
-        })
+            refs: {
+              team: { entity: TeamWithTimestamps },
+              player: { entity: PlayerEntity },
+            },
+          }),
+        )
 
         yield* SelectionWithTSTeamEntity.put({
           selectionId: "sel-1",
           teamId: "team-1",
           playerId: "player-1",
           role: "Batter",
-        })
+        }).asEffect()
 
         const putCall = mockPutItem.mock.calls[0]![0]
         const embeddedTeam = putCall.Item.team.M
@@ -5665,7 +5840,7 @@ describe("Entity", () => {
           teamId: "team-1",
           playerId: "player-1",
           role: "Batter",
-        })
+        }).asEffect()
 
         // Both refs should have been fetched (2 getItem calls)
         expect(mockGetItem).toHaveBeenCalledTimes(2)
@@ -5719,6 +5894,7 @@ describe("Entity", () => {
 
         yield* SelectionEntity.update({ selectionId: "sel-1" }).pipe(
           Entity.set({ teamId: "team-2" }),
+          Entity.asModel,
         )
 
         // Should have called getItem for the team ref hydration
@@ -5733,18 +5909,19 @@ describe("Entity", () => {
 
     it("Entity.make with refs validates field in model", () => {
       expect(() =>
-        Entity.make({
-          model: TeamPlayerSelection,
-          table: MainTable,
-          entityType: "Test",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["selectionId"] },
-              sk: { field: "sk", composite: [] },
+        withConfig(
+          Entity.make({
+            model: TeamPlayerSelection,
+            entityType: "Test",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["selectionId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-          refs: { nonexistent: { entity: TeamEntity } } as any,
-        }),
+            refs: { nonexistent: { entity: TeamEntity } } as any,
+          }),
+        ),
       ).toThrow("does not exist in the model")
     })
 
@@ -5804,45 +5981,48 @@ describe("Entity", () => {
         role: Schema.String,
       }) {}
 
-      const BTeamEntity = Entity.make({
-        model: BTeam,
-        table: MainTable,
-        entityType: "BTeam",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["id"] },
-            sk: { field: "sk", composite: [] },
+      const BTeamEntity = withConfig(
+        Entity.make({
+          model: BTeam,
+          entityType: "BTeam",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["id"] },
+              sk: { field: "sk", composite: [] },
+            },
           },
-        },
-      })
+        }),
+      )
 
-      const BPlayerEntity = Entity.make({
-        model: BPlayer,
-        table: MainTable,
-        entityType: "BPlayer",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["id"] },
-            sk: { field: "sk", composite: [] },
+      const BPlayerEntity = withConfig(
+        Entity.make({
+          model: BPlayer,
+          entityType: "BPlayer",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["id"] },
+              sk: { field: "sk", composite: [] },
+            },
           },
-        },
-      })
+        }),
+      )
 
-      const BSelEntity = Entity.make({
-        model: BSel,
-        table: MainTable,
-        entityType: "BSel",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["id"] },
-            sk: { field: "sk", composite: [] },
+      const BSelEntity = withConfig(
+        Entity.make({
+          model: BSel,
+          entityType: "BSel",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: ["id"] },
+              sk: { field: "sk", composite: [] },
+            },
           },
-        },
-        refs: {
-          team: { entity: BTeamEntity },
-          player: { entity: BPlayerEntity },
-        },
-      })
+          refs: {
+            team: { entity: BTeamEntity },
+            player: { entity: BPlayerEntity },
+          },
+        }),
+      )
 
       // inputSchema should accept plain strings (branded types decode from string)
       const decode = Schema.decodeUnknownSync(BSelEntity.inputSchema)
@@ -5881,53 +6061,56 @@ describe("Entity", () => {
       score: Schema.Number,
     }) {}
 
-    const CascadePlayerEntity = Entity.make({
-      model: CascadePlayer,
-      table: MainTable,
-      entityType: "CascadePlayer",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["playerId"] },
-          sk: { field: "sk", composite: [] },
+    const CascadePlayerEntity = withConfig(
+      Entity.make({
+        model: CascadePlayer,
+        entityType: "CascadePlayer",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["playerId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-    })
+      }),
+    )
 
-    const CascadeSelectionEntity = Entity.make({
-      model: CascadeSelection,
-      table: MainTable,
-      entityType: "CascadeSelection",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["selectionId"] },
-          sk: { field: "sk", composite: [] },
+    const CascadeSelectionEntity = withConfig(
+      Entity.make({
+        model: CascadeSelection,
+        entityType: "CascadeSelection",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["selectionId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-      refs: {
-        player: {
-          entity: CascadePlayerEntity,
-          cascade: { index: "gsi2", pk: { field: "gsi2pk" }, sk: { field: "gsi2sk" } },
+        refs: {
+          player: {
+            entity: CascadePlayerEntity,
+            cascade: { index: "gsi2", pk: { field: "gsi2pk" }, sk: { field: "gsi2sk" } },
+          },
         },
-      },
-    })
+      }),
+    )
 
-    const CascadeMatchPlayerEntity = Entity.make({
-      model: CascadeMatchPlayer,
-      table: MainTable,
-      entityType: "CascadeMatchPlayer",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["matchPlayerId"] },
-          sk: { field: "sk", composite: [] },
+    const CascadeMatchPlayerEntity = withConfig(
+      Entity.make({
+        model: CascadeMatchPlayer,
+        entityType: "CascadeMatchPlayer",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["matchPlayerId"] },
+            sk: { field: "sk", composite: [] },
+          },
         },
-      },
-      refs: {
-        player: {
-          entity: CascadePlayerEntity,
-          cascade: { index: "gsi3", pk: { field: "gsi3pk" }, sk: { field: "gsi3sk" } },
+        refs: {
+          player: {
+            entity: CascadePlayerEntity,
+            cascade: { index: "gsi3", pk: { field: "gsi3pk" }, sk: { field: "gsi3sk" } },
+          },
         },
-      },
-    })
+      }),
+    )
 
     it("auto-generates cascade indexes from cascade config", () => {
       expect(CascadeSelectionEntity.indexes).toHaveProperty("_cascade_player")
@@ -6000,6 +6183,7 @@ describe("Entity", () => {
         yield* CascadePlayerEntity.update({ playerId: "p-1" }).pipe(
           Entity.set({ displayName: "Steven Smith" }),
           Entity.cascade({ targets: [CascadeSelectionEntity] }),
+          Entity.asModel,
         )
 
         // Verify: GSI query was made
@@ -6041,6 +6225,7 @@ describe("Entity", () => {
             targets: [CascadeSelectionEntity],
             filter: { role: "Captain" },
           }),
+          Entity.asModel,
         )
 
         const queryCall = mockQuery.mock.calls[0]![0]
@@ -6087,6 +6272,7 @@ describe("Entity", () => {
             targets: [CascadeSelectionEntity],
             mode: "transactional",
           }),
+          Entity.asModel,
         )
 
         // Verify: transactWriteItems was used, not updateItem for cascade
@@ -6221,17 +6407,18 @@ describe("Entity", () => {
           name: Schema.String,
         }) {}
 
-        const UnrelatedEntity = Entity.make({
-          model: Unrelated,
-          table: MainTable,
-          entityType: "Unrelated",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["unrelatedId"] },
-              sk: { field: "sk", composite: [] },
+        const UnrelatedEntity = withConfig(
+          Entity.make({
+            model: Unrelated,
+            entityType: "Unrelated",
+            indexes: {
+              primary: {
+                pk: { field: "pk", composite: ["unrelatedId"] },
+                sk: { field: "sk", composite: [] },
+              },
             },
-          },
-        })
+          }),
+        )
 
         mockUpdateItem.mockResolvedValueOnce({
           Attributes: toAttributeMap({
@@ -6247,6 +6434,7 @@ describe("Entity", () => {
         yield* CascadePlayerEntity.update({ playerId: "p-1" }).pipe(
           Entity.set({ displayName: "Steven Smith" }),
           Entity.cascade({ targets: [UnrelatedEntity as any] }),
+          Entity.asModel,
         )
 
         // No GSI query or cascade update should happen
@@ -6310,6 +6498,7 @@ describe("Entity", () => {
         yield* CascadePlayerEntity.update({ playerId: "p-1" }).pipe(
           Entity.set({ displayName: "Steven Smith" }),
           Entity.cascade({ targets: [CascadeSelectionEntity] }),
+          Entity.asModel,
         )
 
         // Two pages queried
@@ -6353,6 +6542,7 @@ describe("Entity", () => {
         yield* CascadePlayerEntity.update({ playerId: "p-1" }).pipe(
           Entity.set({ displayName: "Steven Smith" }),
           Entity.cascade({ targets: [CascadeSelectionEntity] }),
+          Entity.asModel,
         )
 
         // Check the cascade update's ref data
@@ -6434,6 +6624,7 @@ describe("Entity", () => {
           Entity.cascade({
             targets: [CascadeSelectionEntity, CascadeMatchPlayerEntity],
           }),
+          Entity.asModel,
         )
 
         // Two GSI queries (one per target)

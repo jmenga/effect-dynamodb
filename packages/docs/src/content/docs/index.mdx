@@ -1,0 +1,138 @@
+---
+title: effect-dynamodb
+description: An Effect TS ORM for DynamoDB — Schema-driven entities, single-table design, composite keys, type-safe queries
+template: splash
+hero:
+  title: effect-dynamodb
+  tagline: An Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, automatic key composition, type-safe pipeable queries, and DynamoDB client as an Effect Service.
+  actions:
+    - text: Get Started
+      link: /effect-dynamodb/getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/placeholder/effect-dynamodb
+      icon: external
+      variant: minimal
+---
+
+An Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, automatic key composition, type-safe pipeable queries, and DynamoDB client as an Effect Service.
+
+## Guides
+
+| Guide | Description |
+|-------|-------------|
+| [Getting Started](/effect-dynamodb/getting-started/) | Prerequisites, installation, and a 5-minute single-entity walkthrough |
+| [Modeling](/effect-dynamodb/guides/modeling/) | Schema.Class models, DynamoSchema namespaces, Table definitions, Entity binding, and the 7 derived types |
+| [Indexes & Collections](/effect-dynamodb/guides/indexes/) | Primary and secondary index definition, key generation, isolated vs clustered collections, sub-collections |
+| [Queries](/effect-dynamodb/guides/queries/) | Pipeable Query API, entity query accessors, collection queries, sort key conditions, scan, consistent reads, pagination |
+| [Expressions](/effect-dynamodb/guides/expressions/) | Type-safe condition, filter, update, and projection expressions with DynamoDB mapping reference |
+| [Data Integrity](/effect-dynamodb/guides/data-integrity/) | Unique constraints, versioning, optimistic concurrency, idempotency |
+| [Lifecycle](/effect-dynamodb/guides/lifecycle/) | Soft delete, restore, purge, version retention, TTL |
+| [Aggregates & Refs](/effect-dynamodb/guides/aggregates/) | Entity references (DynamoModel.ref), graph-based aggregates, cascade updates |
+| [Geospatial](/effect-dynamodb/guides/geospatial/) | Proximity-based queries using H3 hexagonal grid indexing (`@effect-dynamodb/geo`) |
+| [Advanced](/effect-dynamodb/guides/advanced/) | Rich updates, batch operations, conditional writes, multi-table design, expression builders |
+| [DynamoDB Streams](/effect-dynamodb/guides/streams/) | Decode stream records into typed domain objects |
+| [Testing](/effect-dynamodb/guides/testing/) | Mock DynamoClient, test CRUD operations, error paths, and queries |
+| [API Reference](/effect-dynamodb/reference/api-reference/) | Module-by-module reference for all public exports |
+| [Migration from ElectroDB](/effect-dynamodb/reference/migration-from-electrodb/) | Concept mapping, side-by-side examples, and feature comparison |
+
+## Core Concepts
+
+**Four declarations drive everything:**
+
+```
+Schema.Class  →  DynamoSchema  →  Table  →  Entity
+(domain)         (namespace)      (physical)  (binding)
+```
+
+1. **Model** — A standard `Schema.Class` defining your domain fields. No DynamoDB concepts.
+2. **DynamoSchema** — Application namespace and version. Prefixes every generated key.
+3. **Table** — Physical DynamoDB table: name, primary key, and secondary indexes.
+4. **Entity** — Binds model to table with index definitions, system fields, unique constraints, and collection membership.
+
+**Seven types are derived automatically** from these declarations — no manual type maintenance:
+
+| Type | Description |
+|------|-------------|
+| `Entity.Model<E>` | Pure domain object |
+| `Entity.Record<E>` | Domain + system metadata (version, timestamps) |
+| `Entity.Input<E>` | Creation input (no system fields) |
+| `Entity.Update<E>` | Mutable fields only (keys and immutable excluded) |
+| `Entity.Key<E>` | Primary key attributes |
+| `Entity.Item<E>` | Full unmarshalled DynamoDB item |
+| `Entity.Marshalled<E>` | DynamoDB AttributeValue format |
+
+## Key Design Principles
+
+- **Domain models are portable.** A `User` schema works with DynamoDB, SQL, or API responses.
+- **Entity owns storage concerns.** Key composition, timestamps, versioning, soft delete — configured on Entity, not model.
+- **Convention over configuration.** Declare *which* attributes compose keys, not *how*. The system handles format, delimiters, and serialization.
+- **Composable queries.** Queries are pipeable data types (`Query<A>`) with combinators, following Effect TS idioms.
+- **Type safety from declarations.** All types derived automatically. Change the Entity, types update everywhere.
+
+## Quick Example
+
+```typescript
+import { Schema, Effect, Layer } from "effect"
+import {
+  DynamoSchema, Table, Entity, Query, DynamoClient,
+} from "effect-dynamodb"
+
+// 1. Model
+class Task extends Schema.Class<Task>("Task")({
+  taskId:    Schema.String,
+  projectId: Schema.String,
+  title:     Schema.NonEmptyString,
+  status:    Schema.Literals(["todo", "active", "done"]),
+}) {}
+
+// 2. Schema
+const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
+
+// 3. Entity
+const TaskEntity = Entity.make({
+  model: Task,
+  entityType: "Task",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["taskId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    byProject: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["projectId"] },
+      sk: { field: "gsi1sk", composite: ["status"] },
+    },
+  },
+  timestamps: true,
+  versioned: true,
+})
+
+// 4. Table — register entities
+const MainTable = Table.make({ schema: AppSchema, entities: { TaskEntity } })
+
+// 5. Use
+const program = Effect.gen(function* () {
+  const { TaskEntity: tasks } = yield* DynamoClient.make(MainTable)
+
+  yield* tasks.put({
+    taskId: "t-1", projectId: "p-1",
+    title: "Ship it", status: "active",
+  })
+
+  const active = yield* tasks.collect(
+    TaskEntity.query.byProject({ projectId: "p-1" }),
+    TaskEntity.filter({ status: "active" }),
+  )
+})
+
+Effect.runPromise(program.pipe(
+  Effect.provide(
+    Layer.mergeAll(
+      DynamoClient.layer({ region: "us-east-1" }),
+      MainTable.layer({ name: "Main" }),
+    )
+  )
+))
+```

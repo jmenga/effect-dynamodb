@@ -44,15 +44,13 @@ class Review extends Schema.Class<Review>("Review")({
 }) {}
 
 // ---------------------------------------------------------------------------
-// 2. Schema + Table + Entities
+// 2. Schema + Entities + Table
 // ---------------------------------------------------------------------------
 
 const AppSchema = DynamoSchema.make({ name: "scan-demo", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
 
 const Products = Entity.make({
   model: Product,
-  table: MainTable,
   entityType: "Product",
   indexes: {
     primary: {
@@ -70,7 +68,6 @@ const Products = Entity.make({
 
 const Reviews = Entity.make({
   model: Review,
-  table: MainTable,
   entityType: "Review",
   indexes: {
     primary: {
@@ -86,54 +83,53 @@ const Reviews = Entity.make({
   timestamps: true,
 })
 
+const MainTable = Table.make({ schema: AppSchema, entities: { Products, Reviews } })
+
 // ---------------------------------------------------------------------------
 // 3. Main program
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
-  const client = yield* DynamoClient
+  // Typed execution gateway — binds all entities
+  const db = yield* DynamoClient.make(MainTable)
 
   // --- Setup ---
   yield* Console.log("=== Setup ===\n")
 
-  yield* client.createTable({
-    TableName: "scan-demo-table",
-    BillingMode: "PAY_PER_REQUEST",
-    ...Table.definition(MainTable, [Products, Reviews]),
-  })
+  yield* db.createTable()
   yield* Console.log("Table created\n")
 
   // Seed data
-  yield* Products.put({
+  yield* db.Products.put({
     productId: "p-1",
     name: "Wireless Mouse",
     category: "electronics",
     price: 29.99,
     inStock: true,
   })
-  yield* Products.put({
+  yield* db.Products.put({
     productId: "p-2",
     name: "Mechanical Keyboard",
     category: "electronics",
     price: 89.99,
     inStock: true,
   })
-  yield* Products.put({
+  yield* db.Products.put({
     productId: "p-3",
     name: "USB-C Cable",
     category: "accessories",
     price: 9.99,
     inStock: false,
   })
-  yield* Products.put({
+  yield* db.Products.put({
     productId: "p-4",
     name: "Monitor Stand",
     category: "accessories",
     price: 49.99,
     inStock: true,
   })
-  yield* Reviews.put({ reviewId: "r-1", productId: "p-1", rating: 5, comment: "Great mouse!" })
-  yield* Reviews.put({ reviewId: "r-2", productId: "p-2", rating: 4, comment: "Good keyboard" })
+  yield* db.Reviews.put({ reviewId: "r-1", productId: "p-1", rating: 5, comment: "Great mouse!" })
+  yield* db.Reviews.put({ reviewId: "r-2", productId: "p-2", rating: 4, comment: "Good keyboard" })
   yield* Console.log("Seeded 4 products + 2 reviews\n")
 
   // --- Basic scan ---
@@ -142,7 +138,7 @@ const program = Effect.gen(function* () {
   // scan() returns a Query<Entity.Record> just like query accessors.
   // It reads the entire table but filters by __edd_e__ to return only
   // items matching this entity type.
-  const allProducts = yield* Products.scan().pipe(Query.collect)
+  const allProducts = yield* db.Products.collect(Products.scan())
   yield* Console.log(`Found ${allProducts.length} products:`)
   for (const p of allProducts) {
     yield* Console.log(`  ${p.productId}: ${p.name} — $${p.price} (in stock: ${p.inStock})`)
@@ -152,12 +148,11 @@ const program = Effect.gen(function* () {
   // --- Scan with filter ---
   yield* Console.log("=== Scan with Filter — In-Stock Products ===\n")
 
-  // Scan supports all Query combinators including filter.
-  // FilterExpression is applied server-side to reduce network transfer.
+  // Entity.filter() applies a FilterExpression server-side to reduce network transfer.
   // Note: filters don't reduce read capacity (DynamoDB still reads every item).
-  const inStockProducts = yield* Products.scan().pipe(
-    Query.filter({ inStock: true }),
-    Query.collect,
+  const inStockProducts = yield* db.Products.collect(
+    Products.scan(),
+    Products.filter({ inStock: true }),
   )
   yield* Console.log(`In-stock products: ${inStockProducts.length}`)
   for (const p of inStockProducts) {
@@ -169,7 +164,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Scan with Limit ===\n")
 
   // Limit controls the page size (how many items DynamoDB evaluates per request).
-  const firstTwo = yield* Products.scan().pipe(Query.limit(2), Query.collect)
+  const firstTwo = yield* db.Products.collect(Products.scan().pipe(Query.limit(2)))
   yield* Console.log(`First 2 products (limit=2): ${firstTwo.length}`)
   for (const p of firstTwo) {
     yield* Console.log(`  ${p.productId}: ${p.name}`)
@@ -181,7 +176,7 @@ const program = Effect.gen(function* () {
 
   // ConsistentRead on scan ensures you read the most recent data.
   // Costs 2x the read capacity of eventually-consistent reads.
-  const consistent = yield* Products.scan().pipe(Query.consistentRead, Query.collect)
+  const consistent = yield* db.Products.collect(Products.scan().pipe(Query.consistentRead))
   yield* Console.log(`Consistent scan: ${consistent.length} products\n`)
 
   // --- Scan only returns matching entity type ---
@@ -189,15 +184,15 @@ const program = Effect.gen(function* () {
 
   // Even though Products and Reviews share the same table,
   // Products.scan() only returns Product items (filtered by __edd_e__).
-  const productScan = yield* Products.scan().pipe(Query.collect)
-  const reviewScan = yield* Reviews.scan().pipe(Query.collect)
+  const productScan = yield* db.Products.collect(Products.scan())
+  const reviewScan = yield* db.Reviews.collect(Reviews.scan())
   yield* Console.log(`Products.scan(): ${productScan.length} items`)
   yield* Console.log(`Reviews.scan():  ${reviewScan.length} items`)
   yield* Console.log("Each scan only returns its own entity type\n")
 
   // --- Cleanup ---
   yield* Console.log("=== Cleanup ===\n")
-  yield* client.deleteTable({ TableName: "scan-demo-table" })
+  yield* db.deleteTable
   yield* Console.log("Table deleted.")
 })
 
@@ -214,7 +209,7 @@ const AppLayer = Layer.mergeAll(
   MainTable.layer({ name: "scan-demo-table" }),
 )
 
-const main = program.pipe(Effect.provide(AppLayer), Effect.scoped)
+const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
   () => console.log("\nDone."),

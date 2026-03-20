@@ -1,0 +1,117 @@
+---
+title: "DynamoDB Streams"
+description: "Decode DynamoDB Stream records into typed domain objects"
+---
+
+DynamoDB Streams deliver a time-ordered sequence of item-level changes. effect-dynamodb provides schemas for decoding stream records into typed domain objects.
+
+## Understanding the Problem
+
+DynamoDB Stream records contain items in DynamoDB's native `AttributeValue` format:
+
+```json
+{
+  "pk": { "S": "$myapp#v1#employee#emp-alice" },
+  "sk": { "S": "$myapp#v1#employee" },
+  "__edd_e__": { "S": "Employee" },
+  "email": { "S": "alice@acme.com" },
+  "version": { "N": "3" }
+}
+```
+
+Manually decoding this into your domain types is error-prone. effect-dynamodb provides two schema accessors for this.
+
+## Decoding from AttributeValue Format
+
+For Lambda functions consuming DynamoDB Stream events directly, use `Entity.marshalledSchema`:
+
+```typescript
+import { Schema } from "effect"
+import { Entity } from "effect-dynamodb"
+
+const employeeFromMarshalled = Entity.marshalledSchema(EmployeeEntity)
+
+const handler = async (event: DynamoDBStreamEvent) => {
+  for (const record of event.Records) {
+    if (record.dynamodb?.NewImage) {
+      const result = Schema.decodeUnknownEither(employeeFromMarshalled)(
+        record.dynamodb.NewImage
+      )
+      if (result._tag === "Right") {
+        const employee = result.right
+        console.log(`Updated: ${employee.displayName}`)
+      }
+    }
+  }
+}
+```
+
+## Decoding from Unmarshalled Format
+
+If you've already unmarshalled the item (e.g., using `@aws-sdk/util-dynamodb`), use `Entity.itemSchema`:
+
+```typescript
+import { Entity } from "effect-dynamodb"
+
+const employeeFromItem = Entity.itemSchema(EmployeeEntity)
+
+const unmarshalled = unmarshall(record.dynamodb.NewImage)
+const employee = Schema.decodeUnknownSync(employeeFromItem)(unmarshalled)
+```
+
+## Typing the Marshalled Shape
+
+The `Entity.Marshalled<E>` type represents the exact shape of a DynamoDB item in `AttributeValue` format:
+
+```typescript
+type EmployeeMarshalled = Entity.Marshalled<typeof EmployeeEntity>
+// {
+//   pk: { S: string },
+//   sk: { S: string },
+//   gsi1pk: { S: string },
+//   gsi1sk: { S: string },
+//   __edd_e__: { S: string },
+//   employeeId: { S: string },
+//   email: { S: string },
+//   displayName: { S: string },
+//   version: { N: string },
+//   createdAt: { S: string },
+//   updatedAt: { S: string },
+// }
+```
+
+## Processing Multiple Entity Types
+
+When processing streams from a single-table design, use `__edd_e__` to discriminate:
+
+```typescript
+const handler = async (event: DynamoDBStreamEvent) => {
+  for (const record of event.Records) {
+    const image = record.dynamodb?.NewImage
+    if (!image) continue
+
+    const entityType = image["__edd_e__"]?.S
+    switch (entityType) {
+      case "Employee": {
+        const emp = Schema.decodeUnknownSync(
+          Entity.marshalledSchema(EmployeeEntity)
+        )(image)
+        yield* handleEmployeeChange(emp)
+        break
+      }
+      case "Task": {
+        const task = Schema.decodeUnknownSync(
+          Entity.marshalledSchema(TaskEntity)
+        )(image)
+        yield* handleTaskChange(task)
+        break
+      }
+    }
+  }
+}
+```
+
+## What's Next?
+
+- [Testing](/effect-dynamodb/guides/testing/) — Testing patterns with mocked DynamoClient
+- [Modeling](/effect-dynamodb/guides/modeling/) — Model, schema, table, entity definitions

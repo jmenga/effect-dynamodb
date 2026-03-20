@@ -21,7 +21,6 @@ import * as Table from "../src/Table.js"
 // --- Models ---
 
 const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
 
 class User extends Schema.Class<User>("User")({
   userId: Schema.String,
@@ -42,7 +41,6 @@ class Order extends Schema.Class<Order>("Order")({
 
 const UserEntity = Entity.make({
   model: User,
-  table: MainTable,
   entityType: "User",
   indexes: {
     primary: {
@@ -59,7 +57,6 @@ const UserEntity = Entity.make({
 
 const OrderEntity = Entity.make({
   model: Order,
-  table: MainTable,
   entityType: "Order",
   indexes: {
     primary: {
@@ -72,6 +69,11 @@ const OrderEntity = Entity.make({
       sk: { field: "gsi1sk", composite: ["orderId"] },
     },
   },
+})
+
+const MainTable = Table.make({
+  schema: AppSchema,
+  entities: { UserEntity, OrderEntity },
 })
 
 // --- In-memory DynamoDB simulation ---
@@ -380,6 +382,7 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
     }),
   createTable: () => Effect.die("not used in integration tests"),
   deleteTable: () => Effect.die("not used in integration tests"),
+  describeTable: () => Effect.die("not used in integration tests"),
   scan: (input) =>
     Effect.tryPromise({
       try: () => mockScan(input),
@@ -404,7 +407,7 @@ describe("Integration: 2-Entity Single-Table", () => {
         email: "alice@example.com",
         name: "Alice",
         role: "admin",
-      })
+      }).asEffect()
       expect(alice.userId).toBe("u-1")
       expect(alice.email).toBe("alice@example.com")
 
@@ -418,12 +421,12 @@ describe("Integration: 2-Entity Single-Table", () => {
       expect(storedItem.__edd_e__).toBe("User")
 
       // GET
-      const fetched = yield* UserEntity.get({ userId: "u-1" })
+      const fetched = yield* UserEntity.get({ userId: "u-1" }).asEffect()
       expect(fetched.userId).toBe("u-1")
       expect(fetched.email).toBe("alice@example.com")
 
       // DELETE
-      yield* UserEntity.delete({ userId: "u-1" })
+      yield* UserEntity.delete({ userId: "u-1" }).asEffect()
 
       // GET after delete → ItemNotFound
       const error = yield* UserEntity.get({ userId: "u-1" }).asEffect().pipe(Effect.flip)
@@ -440,7 +443,7 @@ describe("Integration: 2-Entity Single-Table", () => {
         product: "Widget",
         quantity: 3,
         status: "pending",
-      })
+      }).asEffect()
       expect(order.orderId).toBe("ord-1")
       expect(order.product).toBe("Widget")
 
@@ -454,12 +457,12 @@ describe("Integration: 2-Entity Single-Table", () => {
       expect(storedItem.__edd_e__).toBe("Order")
 
       // GET
-      const fetched = yield* OrderEntity.get({ orderId: "ord-1" })
+      const fetched = yield* OrderEntity.get({ orderId: "ord-1" }).asEffect()
       expect(fetched.orderId).toBe("ord-1")
       expect(fetched.product).toBe("Widget")
 
       // DELETE
-      yield* OrderEntity.delete({ orderId: "ord-1" })
+      yield* OrderEntity.delete({ orderId: "ord-1" }).asEffect()
 
       const error = yield* OrderEntity.get({ orderId: "ord-1" }).asEffect().pipe(Effect.flip)
       expect(error._tag).toBe("ItemNotFound")
@@ -474,32 +477,47 @@ describe("Integration: 2-Entity Single-Table", () => {
         email: "alice@example.com",
         name: "Alice",
         role: "admin",
-      })
+      }).asEffect()
       yield* OrderEntity.put({
         orderId: "ord-1",
         userId: "u-1",
         product: "Widget",
         quantity: 3,
         status: "pending",
-      })
+      }).asEffect()
 
       // Both entities are in the store
       expect(store.size).toBe(2)
 
       // Get each entity independently
-      const user = yield* UserEntity.get({ userId: "u-1" })
+      const user = yield* UserEntity.get({ userId: "u-1" }).asEffect()
       expect(user.userId).toBe("u-1")
 
-      const order = yield* OrderEntity.get({ orderId: "ord-1" })
+      const order = yield* OrderEntity.get({ orderId: "ord-1" }).asEffect()
       expect(order.orderId).toBe("ord-1")
     }).pipe(Effect.provide(TestLayer)),
   )
 
   it.effect("query users by role (GSI)", () =>
     Effect.gen(function* () {
-      yield* UserEntity.put({ userId: "u-1", email: "a@b.com", name: "Alice", role: "admin" })
-      yield* UserEntity.put({ userId: "u-2", email: "b@c.com", name: "Bob", role: "admin" })
-      yield* UserEntity.put({ userId: "u-3", email: "c@d.com", name: "Charlie", role: "member" })
+      yield* UserEntity.put({
+        userId: "u-1",
+        email: "a@b.com",
+        name: "Alice",
+        role: "admin",
+      }).asEffect()
+      yield* UserEntity.put({
+        userId: "u-2",
+        email: "b@c.com",
+        name: "Bob",
+        role: "admin",
+      }).asEffect()
+      yield* UserEntity.put({
+        userId: "u-3",
+        email: "c@d.com",
+        name: "Charlie",
+        role: "member",
+      }).asEffect()
 
       const admins = yield* Query.collect(UserEntity.query.byRole({ role: "admin" }))
       expect(admins).toHaveLength(2)
@@ -518,21 +536,21 @@ describe("Integration: 2-Entity Single-Table", () => {
         product: "Widget",
         quantity: 3,
         status: "pending",
-      })
+      }).asEffect()
       yield* OrderEntity.put({
         orderId: "ord-2",
         userId: "u-1",
         product: "Gadget",
         quantity: 1,
         status: "shipped",
-      })
+      }).asEffect()
       yield* OrderEntity.put({
         orderId: "ord-3",
         userId: "u-2",
         product: "Doohickey",
         quantity: 2,
         status: "pending",
-      })
+      }).asEffect()
 
       // Query orders for user u-1
       const u1Orders = yield* Query.collect(OrderEntity.query.byUser({ userId: "u-1" }))
@@ -547,14 +565,19 @@ describe("Integration: 2-Entity Single-Table", () => {
   it.effect("cross-entity query independence", () =>
     Effect.gen(function* () {
       // Put data for both entities
-      yield* UserEntity.put({ userId: "u-1", email: "a@b.com", name: "Alice", role: "admin" })
+      yield* UserEntity.put({
+        userId: "u-1",
+        email: "a@b.com",
+        name: "Alice",
+        role: "admin",
+      }).asEffect()
       yield* OrderEntity.put({
         orderId: "ord-1",
         userId: "u-1",
         product: "Widget",
         quantity: 3,
         status: "pending",
-      })
+      }).asEffect()
 
       // Query users by role returns only users (__edd_e__ filter ensures isolation)
       const admins = yield* Query.collect(UserEntity.query.byRole({ role: "admin" }))
@@ -575,7 +598,7 @@ describe("Integration: 2-Entity Single-Table", () => {
         email: "test@example.com",
         name: "Test",
         role: "member",
-      })
+      }).asEffect()
 
       // Verify all composed keys follow the naming convention
       const putCall = mockPutItem.mock.calls[0]![0]
@@ -602,9 +625,9 @@ describe("Integration: 2-Entity Single-Table", () => {
         email: "alice@example.com",
         name: "Alice",
         role: "admin",
-      })
+      }).asEffect()
 
-      yield* UserEntity.get({ userId: "u-1" })
+      yield* UserEntity.get({ userId: "u-1" }).asEffect()
 
       const getCall = mockGetItem.mock.calls[0]![0]
       expect(getCall.TableName).toBe("test-table")
@@ -620,9 +643,9 @@ describe("Integration: 2-Entity Single-Table", () => {
         email: "alice@example.com",
         name: "Alice",
         role: "admin",
-      })
+      }).asEffect()
 
-      yield* UserEntity.delete({ userId: "u-1" })
+      yield* UserEntity.delete({ userId: "u-1" }).asEffect()
 
       const deleteCall = mockDeleteItem.mock.calls[0]![0]
       expect(deleteCall.TableName).toBe("test-table")
@@ -633,7 +656,12 @@ describe("Integration: 2-Entity Single-Table", () => {
 
   it.effect("query passes entity type filter to DynamoDB", () =>
     Effect.gen(function* () {
-      yield* UserEntity.put({ userId: "u-1", email: "a@b.com", name: "Alice", role: "admin" })
+      yield* UserEntity.put({
+        userId: "u-1",
+        email: "a@b.com",
+        name: "Alice",
+        role: "admin",
+      }).asEffect()
 
       yield* Query.collect(UserEntity.query.byRole({ role: "admin" }))
 
@@ -653,15 +681,25 @@ describe("Integration: 2-Entity Single-Table", () => {
 describe("Integration: Scan", () => {
   it.effect("scan returns all items of an entity type", () =>
     Effect.gen(function* () {
-      yield* UserEntity.put({ userId: "u-1", email: "a@b.com", name: "Alice", role: "admin" })
-      yield* UserEntity.put({ userId: "u-2", email: "b@c.com", name: "Bob", role: "member" })
+      yield* UserEntity.put({
+        userId: "u-1",
+        email: "a@b.com",
+        name: "Alice",
+        role: "admin",
+      }).asEffect()
+      yield* UserEntity.put({
+        userId: "u-2",
+        email: "b@c.com",
+        name: "Bob",
+        role: "member",
+      }).asEffect()
       yield* OrderEntity.put({
         orderId: "o-1",
         userId: "u-1",
         product: "Widget",
         quantity: 1,
         status: "pending",
-      })
+      }).asEffect()
 
       // Scan users — should only return users, not orders
       const users = yield* UserEntity.scan().pipe(Query.collect)
@@ -676,8 +714,18 @@ describe("Integration: Scan", () => {
 
   it.effect("scan with filter narrows results", () =>
     Effect.gen(function* () {
-      yield* UserEntity.put({ userId: "u-1", email: "a@b.com", name: "Alice", role: "admin" })
-      yield* UserEntity.put({ userId: "u-2", email: "b@c.com", name: "Bob", role: "member" })
+      yield* UserEntity.put({
+        userId: "u-1",
+        email: "a@b.com",
+        name: "Alice",
+        role: "admin",
+      }).asEffect()
+      yield* UserEntity.put({
+        userId: "u-2",
+        email: "b@c.com",
+        name: "Bob",
+        role: "member",
+      }).asEffect()
 
       // mockScan returns all matching entity types;
       // The filter is applied by DynamoDB (mocked here at API level)
@@ -706,7 +754,6 @@ describe("Integration: Scan", () => {
 describe("Integration: Entity.create", () => {
   const TimestampedUser = Entity.make({
     model: User,
-    table: MainTable,
     entityType: "User",
     indexes: {
       primary: {
@@ -716,6 +763,7 @@ describe("Integration: Entity.create", () => {
     },
     timestamps: true,
   })
+  TimestampedUser._configure(AppSchema, MainTable.Tag)
 
   it.effect("create succeeds for new item", () =>
     Effect.gen(function* () {
@@ -724,7 +772,7 @@ describe("Integration: Entity.create", () => {
         email: "alice@example.com",
         name: "Alice",
         role: "admin",
-      })
+      }).asEffect()
       expect(user.userId).toBe("u-1")
 
       // Verify ConditionExpression was sent
@@ -741,7 +789,7 @@ describe("Integration: Entity.create", () => {
         email: "alice@example.com",
         name: "Alice",
         role: "admin",
-      })
+      }).asEffect()
 
       // Second create with same key fails
       const error = yield* TimestampedUser.create({
@@ -850,7 +898,6 @@ describe("Integration: Timestamps + Versioning", () => {
 
   const VersionedItem = Entity.make({
     model: Item,
-    table: MainTable,
     entityType: "VersionedItem",
     indexes: {
       primary: {
@@ -861,6 +908,7 @@ describe("Integration: Timestamps + Versioning", () => {
     timestamps: true,
     versioned: true,
   })
+  VersionedItem._configure(AppSchema, MainTable.Tag)
 
   it.effect("put adds timestamps and version to stored item", () =>
     Effect.gen(function* () {
@@ -882,7 +930,7 @@ describe("Integration: Timestamps + Versioning", () => {
 
   it.effect("get returns record with system fields decoded", () =>
     Effect.gen(function* () {
-      yield* VersionedItem.put({ itemId: "i-1", name: "Test" })
+      yield* VersionedItem.put({ itemId: "i-1", name: "Test" }).asEffect()
 
       const record = yield* VersionedItem.get({ itemId: "i-1" }).pipe(Entity.asRecord)
       expect(record.version).toBe(1)
@@ -918,7 +966,6 @@ describe("Integration: Entity Refs", () => {
 
   const TeamEntity = Entity.make({
     model: Team,
-    table: MainTable,
     entityType: "Team",
     indexes: {
       primary: {
@@ -927,10 +974,10 @@ describe("Integration: Entity Refs", () => {
       },
     },
   })
+  TeamEntity._configure(AppSchema, MainTable.Tag)
 
   const PlayerEntity = Entity.make({
     model: Player,
-    table: MainTable,
     entityType: "Player",
     indexes: {
       primary: {
@@ -939,10 +986,10 @@ describe("Integration: Entity Refs", () => {
       },
     },
   })
+  PlayerEntity._configure(AppSchema, MainTable.Tag)
 
   const SelectionEntity = Entity.make({
     model: Selection,
-    table: MainTable,
     entityType: "Selection",
     indexes: {
       primary: {
@@ -955,16 +1002,17 @@ describe("Integration: Entity Refs", () => {
       player: { entity: PlayerEntity },
     },
   })
+  SelectionEntity._configure(AppSchema, MainTable.Tag)
 
   it.effect("put with ref IDs hydrates and stores embedded data, get round-trips", () =>
     Effect.gen(function* () {
       // Create referenced entities first
-      yield* TeamEntity.put({ teamId: "t-1", name: "Australia", country: "AU" })
+      yield* TeamEntity.put({ teamId: "t-1", name: "Australia", country: "AU" }).asEffect()
       yield* PlayerEntity.put({
         playerId: "p-1",
         displayName: "Steve Smith",
         position: "Batter",
-      })
+      }).asEffect()
 
       // Put selection with ref IDs — hydration fetches Team and Player
       yield* SelectionEntity.put({
@@ -972,10 +1020,10 @@ describe("Integration: Entity Refs", () => {
         teamId: "t-1",
         playerId: "p-1",
         role: "Captain",
-      })
+      }).asEffect()
 
       // Get the selection — should have full embedded data
-      const sel = yield* SelectionEntity.get({ selectionId: "sel-1" })
+      const sel = yield* SelectionEntity.get({ selectionId: "sel-1" }).asEffect()
       expect(sel.selectionId).toBe("sel-1")
       expect(sel.role).toBe("Captain")
       expect(sel.team.teamId).toBe("t-1")
@@ -994,7 +1042,7 @@ describe("Integration: Entity Refs", () => {
         playerId: "p-1",
         displayName: "Steve Smith",
         position: "Batter",
-      })
+      }).asEffect()
 
       const error = yield* SelectionEntity.put({
         selectionId: "sel-1",
@@ -1018,13 +1066,13 @@ describe("Integration: Entity Refs", () => {
   it.effect("update with changed ref ID re-hydrates", () =>
     Effect.gen(function* () {
       // Create teams and player
-      yield* TeamEntity.put({ teamId: "t-1", name: "Australia", country: "AU" })
-      yield* TeamEntity.put({ teamId: "t-2", name: "India", country: "IN" })
+      yield* TeamEntity.put({ teamId: "t-1", name: "Australia", country: "AU" }).asEffect()
+      yield* TeamEntity.put({ teamId: "t-2", name: "India", country: "IN" }).asEffect()
       yield* PlayerEntity.put({
         playerId: "p-1",
         displayName: "Steve Smith",
         position: "Batter",
-      })
+      }).asEffect()
 
       // Create selection
       yield* SelectionEntity.put({
@@ -1032,13 +1080,16 @@ describe("Integration: Entity Refs", () => {
         teamId: "t-1",
         playerId: "p-1",
         role: "Captain",
-      })
+      }).asEffect()
 
       // Update team ref
-      yield* SelectionEntity.update({ selectionId: "sel-1" }).pipe(Entity.set({ teamId: "t-2" }))
+      yield* SelectionEntity.update({ selectionId: "sel-1" }).pipe(
+        Entity.set({ teamId: "t-2" }),
+        Entity.asModel,
+      )
 
       // Get should show updated team
-      const sel = yield* SelectionEntity.get({ selectionId: "sel-1" })
+      const sel = yield* SelectionEntity.get({ selectionId: "sel-1" }).asEffect()
       expect(sel.team.teamId).toBe("t-2")
       expect(sel.team.name).toBe("India")
       expect(sel.team.country).toBe("IN")
@@ -1075,7 +1126,6 @@ describe("Integration: Cascade Updates", () => {
 
   const CascadeTeamEntity = Entity.make({
     model: CascadeTeam,
-    table: MainTable,
     entityType: "CascadeTeam",
     indexes: {
       primary: {
@@ -1084,10 +1134,10 @@ describe("Integration: Cascade Updates", () => {
       },
     },
   })
+  CascadeTeamEntity._configure(AppSchema, MainTable.Tag)
 
   const CascadePlayerEntity = Entity.make({
     model: CascadePlayer,
-    table: MainTable,
     entityType: "CascadePlayer",
     indexes: {
       primary: {
@@ -1096,10 +1146,10 @@ describe("Integration: Cascade Updates", () => {
       },
     },
   })
+  CascadePlayerEntity._configure(AppSchema, MainTable.Tag)
 
   const CascadeSelectionEntity = Entity.make({
     model: CascadeSelection,
-    table: MainTable,
     entityType: "CascadeSelection",
     indexes: {
       primary: {
@@ -1118,16 +1168,17 @@ describe("Integration: Cascade Updates", () => {
       },
     },
   })
+  CascadeSelectionEntity._configure(AppSchema, MainTable.Tag)
 
   it.effect("basic cascade propagation — update source, verify target embedded data updated", () =>
     Effect.gen(function* () {
       // Create source entities
-      yield* CascadeTeamEntity.put({ teamId: "t-1", name: "Australia", country: "AU" })
+      yield* CascadeTeamEntity.put({ teamId: "t-1", name: "Australia", country: "AU" }).asEffect()
       yield* CascadePlayerEntity.put({
         playerId: "p-1",
         displayName: "Steve Smith",
         position: "Batter",
-      })
+      }).asEffect()
 
       // Create selection with refs
       yield* CascadeSelectionEntity.put({
@@ -1136,20 +1187,21 @@ describe("Integration: Cascade Updates", () => {
         teamId: "t-1",
         role: "Captain",
         season: "2024-25",
-      })
+      }).asEffect()
 
       // Verify initial state
-      const before = yield* CascadeSelectionEntity.get({ selectionId: "sel-1" })
+      const before = yield* CascadeSelectionEntity.get({ selectionId: "sel-1" }).asEffect()
       expect(before.player.displayName).toBe("Steve Smith")
 
       // Update the player with cascade
       yield* CascadePlayerEntity.update({ playerId: "p-1" }).pipe(
         Entity.set({ displayName: "Steven Smith" }),
         Entity.cascade({ targets: [CascadeSelectionEntity] }),
+        Entity.asModel,
       )
 
       // Verify cascade propagated the updated name
-      const after = yield* CascadeSelectionEntity.get({ selectionId: "sel-1" })
+      const after = yield* CascadeSelectionEntity.get({ selectionId: "sel-1" }).asEffect()
       expect(after.player.displayName).toBe("Steven Smith")
       expect(after.player.position).toBe("Batter")
       expect(after.player.playerId).toBe("p-1")
@@ -1162,12 +1214,12 @@ describe("Integration: Cascade Updates", () => {
   it.effect("cascade with filter limits scope", () =>
     Effect.gen(function* () {
       // Create entities
-      yield* CascadeTeamEntity.put({ teamId: "t-1", name: "Australia", country: "AU" })
+      yield* CascadeTeamEntity.put({ teamId: "t-1", name: "Australia", country: "AU" }).asEffect()
       yield* CascadePlayerEntity.put({
         playerId: "p-1",
         displayName: "Steve Smith",
         position: "Batter",
-      })
+      }).asEffect()
 
       // Create two selections in different seasons
       yield* CascadeSelectionEntity.put({
@@ -1176,14 +1228,14 @@ describe("Integration: Cascade Updates", () => {
         teamId: "t-1",
         role: "Captain",
         season: "2024-25",
-      })
+      }).asEffect()
       yield* CascadeSelectionEntity.put({
         selectionId: "sel-2",
         playerId: "p-1",
         teamId: "t-1",
         role: "Batter",
         season: "2023-24",
-      })
+      }).asEffect()
 
       // Update with filter — only 2024-25 season
       yield* CascadePlayerEntity.update({ playerId: "p-1" }).pipe(
@@ -1192,14 +1244,15 @@ describe("Integration: Cascade Updates", () => {
           targets: [CascadeSelectionEntity],
           filter: { season: "2024-25" },
         }),
+        Entity.asModel,
       )
 
       // Filtered selection should be updated
-      const sel1 = yield* CascadeSelectionEntity.get({ selectionId: "sel-1" })
+      const sel1 = yield* CascadeSelectionEntity.get({ selectionId: "sel-1" }).asEffect()
       expect(sel1.player.displayName).toBe("Steven Smith")
 
       // Non-filtered selection should NOT be updated
-      const sel2 = yield* CascadeSelectionEntity.get({ selectionId: "sel-2" })
+      const sel2 = yield* CascadeSelectionEntity.get({ selectionId: "sel-2" }).asEffect()
       expect(sel2.player.displayName).toBe("Steve Smith")
     }).pipe(Effect.provide(TestLayer)),
   )
@@ -1215,7 +1268,6 @@ describe("Integration: Cascade Updates", () => {
 
       const CascadeMatchPlayerEntity = Entity.make({
         model: CascadeMatchPlayer,
-        table: MainTable,
         entityType: "CascadeMatchPlayer",
         indexes: {
           primary: {
@@ -1230,14 +1282,15 @@ describe("Integration: Cascade Updates", () => {
           },
         },
       })
+      CascadeMatchPlayerEntity._configure(AppSchema, MainTable.Tag)
 
       // Create entities
-      yield* CascadeTeamEntity.put({ teamId: "t-1", name: "Australia", country: "AU" })
+      yield* CascadeTeamEntity.put({ teamId: "t-1", name: "Australia", country: "AU" }).asEffect()
       yield* CascadePlayerEntity.put({
         playerId: "p-1",
         displayName: "Steve Smith",
         position: "Batter",
-      })
+      }).asEffect()
 
       yield* CascadeSelectionEntity.put({
         selectionId: "sel-1",
@@ -1245,12 +1298,12 @@ describe("Integration: Cascade Updates", () => {
         teamId: "t-1",
         role: "Captain",
         season: "2024-25",
-      })
+      }).asEffect()
       yield* CascadeMatchPlayerEntity.put({
         matchPlayerId: "mp-1",
         playerId: "p-1",
         score: 42,
-      })
+      }).asEffect()
 
       // Cascade to both target types
       yield* CascadePlayerEntity.update({ playerId: "p-1" }).pipe(
@@ -1258,13 +1311,14 @@ describe("Integration: Cascade Updates", () => {
         Entity.cascade({
           targets: [CascadeSelectionEntity, CascadeMatchPlayerEntity],
         }),
+        Entity.asModel,
       )
 
       // Both targets should be updated
-      const sel = yield* CascadeSelectionEntity.get({ selectionId: "sel-1" })
+      const sel = yield* CascadeSelectionEntity.get({ selectionId: "sel-1" }).asEffect()
       expect(sel.player.displayName).toBe("Steven Smith")
 
-      const mp = yield* CascadeMatchPlayerEntity.get({ matchPlayerId: "mp-1" })
+      const mp = yield* CascadeMatchPlayerEntity.get({ matchPlayerId: "mp-1" }).asEffect()
       expect(mp.player.displayName).toBe("Steven Smith")
     }).pipe(Effect.provide(TestLayer)),
   )
@@ -1284,7 +1338,6 @@ describe("Integration: Unique Constraint Update Rotation", () => {
 
   const AccountEntity = Entity.make({
     model: Account,
-    table: MainTable,
     entityType: "Account",
     indexes: {
       primary: {
@@ -1295,6 +1348,7 @@ describe("Integration: Unique Constraint Update Rotation", () => {
     unique: { email: ["email"], username: ["username"] },
     versioned: true,
   })
+  AccountEntity._configure(AppSchema, MainTable.Tag)
 
   it.effect("rotates sentinel when unique field changes", () =>
     Effect.gen(function* () {
@@ -1304,7 +1358,7 @@ describe("Integration: Unique Constraint Update Rotation", () => {
         email: "alice@old.com",
         username: "alice",
         displayName: "Alice",
-      })
+      }).asEffect()
 
       // Verify 3 items in store: entity + email sentinel + username sentinel
       expect(store.size).toBe(3)
@@ -1312,13 +1366,14 @@ describe("Integration: Unique Constraint Update Rotation", () => {
       // Update email — should delete old email sentinel, create new one
       yield* AccountEntity.update({ accountId: "acc-1" }).pipe(
         Entity.set({ email: "alice@new.com" }),
+        Entity.asModel,
       )
 
       // Still 3 items: entity + NEW email sentinel + username sentinel
       expect(store.size).toBe(3)
 
       // Verify entity has new email
-      const updated = yield* AccountEntity.get({ accountId: "acc-1" })
+      const updated = yield* AccountEntity.get({ accountId: "acc-1" }).asEffect()
       expect(updated.email).toBe("alice@new.com")
 
       // Verify old email sentinel is gone and new one exists
@@ -1341,11 +1396,12 @@ describe("Integration: Unique Constraint Update Rotation", () => {
         email: "shared@test.com",
         username: "user1",
         displayName: "User 1",
-      })
+      }).asEffect()
 
       // Update email — frees the old value
       yield* AccountEntity.update({ accountId: "acc-1" }).pipe(
         Entity.set({ email: "new@test.com" }),
+        Entity.asModel,
       )
 
       // A second account can now use the old email
@@ -1354,12 +1410,12 @@ describe("Integration: Unique Constraint Update Rotation", () => {
         email: "shared@test.com",
         username: "user2",
         displayName: "User 2",
-      })
+      }).asEffect()
 
       // Both accounts exist with correct emails
-      const acc1 = yield* AccountEntity.get({ accountId: "acc-1" })
+      const acc1 = yield* AccountEntity.get({ accountId: "acc-1" }).asEffect()
       expect(acc1.email).toBe("new@test.com")
-      const acc2 = yield* AccountEntity.get({ accountId: "acc-2" })
+      const acc2 = yield* AccountEntity.get({ accountId: "acc-2" }).asEffect()
       expect(acc2.email).toBe("shared@test.com")
     }).pipe(Effect.provide(TestLayer)),
   )
@@ -1372,13 +1428,13 @@ describe("Integration: Unique Constraint Update Rotation", () => {
         email: "alice@test.com",
         username: "alice",
         displayName: "Alice",
-      })
+      }).asEffect()
       yield* AccountEntity.put({
         accountId: "acc-2",
         email: "bob@test.com",
         username: "bob",
         displayName: "Bob",
-      })
+      }).asEffect()
 
       // Try to update acc-1's email to bob's email — should fail
       const error = yield* AccountEntity.update({ accountId: "acc-1" })
@@ -1392,7 +1448,7 @@ describe("Integration: Unique Constraint Update Rotation", () => {
       }
 
       // acc-1 should still have old email (transaction rolled back)
-      const acc1 = yield* AccountEntity.get({ accountId: "acc-1" })
+      const acc1 = yield* AccountEntity.get({ accountId: "acc-1" }).asEffect()
       expect(acc1.email).toBe("alice@test.com")
     }).pipe(Effect.provide(TestLayer)),
   )
@@ -1404,13 +1460,14 @@ describe("Integration: Unique Constraint Update Rotation", () => {
         email: "alice@test.com",
         username: "alice",
         displayName: "Alice",
-      })
+      }).asEffect()
 
       const callsBefore = mockTransactWriteItems.mock.calls.length
 
       // Update displayName (not a unique field) — uses standard updateItem path
       yield* AccountEntity.update({ accountId: "acc-1" }).pipe(
         Entity.set({ displayName: "Alice Updated" }),
+        Entity.asModel,
       )
 
       // transactWriteItems should NOT have been called again (only put used it)
