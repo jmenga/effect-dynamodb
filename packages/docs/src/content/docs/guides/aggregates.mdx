@@ -22,7 +22,7 @@ DynamoDB doesn't have JOINs. When your domain model needs data from a related en
 
 Mark the primary business identifier field on any entity that can be referenced:
 
-```typescript
+```typescript region="identifier-model" example="guide-aggregates.ts"
 class Team extends Schema.Class<Team>("Team")({
   id: Schema.String.pipe(DynamoModel.identifier),
   name: Schema.String,
@@ -40,7 +40,7 @@ Rules:
 
 Mark a field as a denormalized reference to another entity:
 
-```typescript
+```typescript region="ref-model" example="guide-aggregates.ts"
 class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
   squadId: Schema.String,
   selectionNumber: Schema.Number,
@@ -57,7 +57,7 @@ class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
 
 When creating an entity with ref fields, provide a `refs` config mapping field names to the entities they reference:
 
-```typescript
+```typescript region="entity-with-refs" example="guide-aggregates.ts"
 const SquadSelections = Entity.make({
   model: SquadSelection,
   entityType: "SquadSelection",
@@ -89,7 +89,7 @@ Ref fields transform across Entity's derived types:
 | `Entity.Record<E>` | Full domain object | `team: Team`, `player: Player` |
 | `Entity.Update<E>` | Optional ID field | `teamId?: string`, `playerId?: string` |
 
-```typescript
+```typescript region="ref-put-get" example="guide-aggregates.ts"
 // Input accepts IDs — not full objects
 yield* db.SquadSelections.put({
   squadId: "aus#2024-25#BGT",
@@ -115,7 +115,7 @@ On `put` and `update`, Entity automatically:
 3. Embeds the entity's core domain data (Schema.Type — no system fields) in the DynamoDB item
 4. Returns `RefNotFound` if any referenced entity doesn't exist
 
-```typescript
+```typescript region="ref-not-found" example="guide-aggregates.ts"
 // RefNotFound when a ref doesn't resolve
 const refError = yield* db.SquadSelections.put({
   squadId: "aus#2024-25#BGT",
@@ -178,7 +178,7 @@ An **Aggregate** is a domain object composed of multiple DynamoDB entity types s
 
 Define the composed domain shape using Schema.Class. Ref fields reference other entities; edge fields reference aggregate members.
 
-```typescript
+```typescript region="aggregate-schemas" example="guide-aggregates.ts"
 class PlayerSheet extends Schema.Class<PlayerSheet>("PlayerSheet")({
   player: Player.pipe(DynamoModel.ref),
   battingPosition: Schema.Number,
@@ -205,7 +205,7 @@ class Match extends Schema.Class<Match>("Match")({
 
 Define reusable graph shapes for repeated structures. A sub-aggregate specifies a root entity type and edges to member entity types.
 
-```typescript
+```typescript region="sub-aggregate" example="guide-aggregates.ts"
 const TeamSheetAggregate = Aggregate.make(TeamSheet, {
   root: { entityType: "MatchTeam" },
   edges: {
@@ -226,7 +226,7 @@ Edge keys (`coach`, `players`) correspond to fields on the schema.
 
 Bind the full domain schema to a table, schema namespace, partition key, and collection index:
 
-```typescript
+```typescript region="top-level-aggregate" example="guide-aggregates.ts"
 const MatchAggregate = Aggregate.make(Match, {
   table: MainTable,
   schema: CricketSchema,
@@ -274,7 +274,7 @@ Discriminator values are stored on each member item in DynamoDB and used during 
 
 Fetch all items in the partition via a collection query, then assemble them into the domain object:
 
-```typescript
+```typescript region="aggregate-get" example="guide-aggregates.ts"
 const fetched = yield* MatchAggregate.get({ id: "bgt-2025-test-1" })
 ```
 
@@ -290,7 +290,7 @@ Returns `AggregateAssemblyError` if the collection query returns incomplete or u
 
 Create a new aggregate from input data. Ref fields accept IDs (not full objects):
 
-```typescript
+```typescript region="aggregate-create" example="guide-aggregates.ts"
 const match = yield* MatchAggregate.create({
   id: "bgt-2025-test-1",
   name: "AUS vs IND, 1st Test",
@@ -308,9 +308,7 @@ const match = yield* MatchAggregate.create({
     teamId: "ind",
     coachId: "gambhir",
     homeTeam: false,
-    players: [
-      { playerId: "kohli-01", battingPosition: 4, isCaptain: true },
-    ],
+    players: [{ playerId: "kohli-01", battingPosition: 4, isCaptain: true }],
   },
 })
 ```
@@ -328,20 +326,17 @@ Returns `RefNotFound` if a ref ID doesn't resolve. Returns `AggregateTransaction
 
 Fetch the current state, apply a mutation function, diff, and write only changed sub-aggregate groups:
 
-```typescript
-const updated = yield* MatchAggregate.update(
-  { id: "bgt-2025-test-1" },
-  (current) => ({
-    ...current.state,
-    team1: {
-      ...current.state.team1,
-      players: current.state.team1.players.map((ps) => ({
-        ...ps,
-        isCaptain: ps.player.lastName === "Smith",
-      })),
-    },
-  }),
-)
+```typescript region="aggregate-update-spread" example="guide-aggregates.ts"
+const updated = yield* MatchAggregate.update({ id: "bgt-2025-test-1" }, (current) => ({
+  ...current.state,
+  team1: {
+    ...current.state.team1,
+    players: current.state.team1.players.map((ps) => ({
+      ...ps,
+      isCaptain: ps.player.lastName === "Smith",
+    })),
+  },
+}))
 ```
 
 The update operation:
@@ -357,12 +352,13 @@ The update operation:
 
 The mutation function receives a single `UpdateContext` object with tools for composable, type-safe immutable updates:
 
-```typescript
-const cursorUpdated = yield* MatchAggregate.update(
-  { id: "bgt-2025-test-1" },
-  ({ cursor }) =>
-    cursor.key("team1").key("players").modify(
-      (players) => players.map((ps) => ({ ...ps, isCaptain: ps.player.lastName === "Smith" })),
+```typescript region="aggregate-update-cursor" example="guide-aggregates.ts"
+const cursorUpdated = yield* MatchAggregate.update({ id: "bgt-2025-test-1" }, ({ cursor }) =>
+  cursor
+    .key("team1")
+    .key("players")
+    .modify((players) =>
+      players.map((ps) => ({ ...ps, isCaptain: ps.player.lastName === "Smith" })),
     ),
 )
 ```
@@ -388,18 +384,16 @@ The `UpdateContext` provides:
 | `cursor.modify(fn)` | Apply a function to the focused value, return updated root |
 
 Simple field update:
-```typescript
-yield* MatchAggregate.update(
-  { id: "bgt-2025-test-1" },
-  ({ cursor }) => cursor.key("name").replace("AUS vs IND, Boxing Day Test"),
+```typescript region="aggregate-update-simple" example="guide-aggregates.ts"
+yield* MatchAggregate.update({ id: "bgt-2025-test-1" }, ({ cursor }) =>
+  cursor.key("name").replace("AUS vs IND, Boxing Day Test"),
 )
 ```
 
 Using `optic` + `state` (for external lenses):
-```typescript
-yield* MatchAggregate.update(
-  { id: "bgt-2025-test-1" },
-  ({ state, optic }) => optic.key("name").replace("AUS vs IND, 1st Test", state),
+```typescript region="aggregate-update-optic" example="guide-aggregates.ts"
+yield* MatchAggregate.update({ id: "bgt-2025-test-1" }, ({ state, optic }) =>
+  optic.key("name").replace("AUS vs IND, 1st Test", state),
 )
 ```
 
@@ -409,7 +403,7 @@ The mutation function can return either a class instance (from spreading `curren
 
 Remove all items in the aggregate's partition:
 
-```typescript
+```typescript region="aggregate-delete" example="guide-aggregates.ts"
 yield* MatchAggregate.delete({ id: "bgt-2025-test-1" })
 ```
 
@@ -422,7 +416,7 @@ Queries all items in the partition and batch-deletes them.
 | `Aggregate.Type<A>` | The assembled domain type (e.g., `Match`) |
 | `Aggregate.Key<A>` | The partition key type |
 
-```typescript
+```typescript region="type-extractors" example="guide-aggregates.ts"
 type MatchDomain = Aggregate.Type<typeof MatchAggregate> // Match
 type MatchKey = Aggregate.Key<typeof MatchAggregate> // { id: string }
 ```
@@ -436,7 +430,7 @@ type MatchKey = Aggregate.Key<typeof MatchAggregate> // { id: string }
 | `AggregateTransactionOverflow` | Write path: sub-aggregate exceeds 100-item transaction limit | `aggregate`, `subgraph`, `itemCount`, `limit` |
 | `RefNotFound` | Ref hydration: referenced entity not found | `entity`, `field`, `refEntity`, `refId` |
 
-```typescript
+```typescript region="aggregate-error-handling" example="guide-aggregates.ts"
 const result = yield* MatchAggregate.get({ id: "nonexistent" }).pipe(
   Effect.catchTag("AggregateAssemblyError", (e) =>
     Effect.succeed(`Assembly failed for ${e.aggregate}: ${e.reason}`),
@@ -456,7 +450,7 @@ When denormalized data changes at the source (e.g., a player's name is corrected
 
 Attach a cascade to an `EntityUpdate` operation. After the source entity update completes, the cascade finds and updates all target items:
 
-```typescript
+```typescript region="cascade-basic" example="guide-aggregates.ts"
 const updatedPlayer = yield* db.Players.update(
   { id: "smith-01" },
   Entity.set({ firstName: "Steven" }),
@@ -483,7 +477,7 @@ Entity.cascade({
 
 **Eventual (default):** Batch-updates target items. No item limit. Partial failures are possible.
 
-```typescript
+```typescript region="cascade-eventual" example="guide-aggregates.ts"
 yield* db.Players.update(
   { id: "smith-01" },
   Entity.set({ firstName: "Steven" }),
@@ -493,7 +487,7 @@ yield* db.Players.update(
 
 **Transactional:** Atomic update via `transactWriteItems`. All target items updated in a single transaction. Maximum 100 items.
 
-```typescript
+```typescript region="cascade-transactional" example="guide-aggregates.ts"
 yield* db.Players.update(
   { id: "smith-01" },
   Entity.set({ firstName: "Steven" }),

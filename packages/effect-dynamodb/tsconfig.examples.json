@@ -8,5 +8,5 @@
     "sourceMap": false
   },
   "include": ["src", "examples"],
-  "exclude": ["node_modules", "dist", "examples/_walkthrough.ts", "examples/guide-aggregates.ts"]
+  "exclude": ["node_modules", "dist", "examples/_walkthrough.ts"]
 }
