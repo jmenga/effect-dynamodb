@@ -144,13 +144,16 @@ pnpm workspace monorepo:
 │   ├── effect-dynamodb/          # Core library (Entity, Table, Query, etc.)
 │   │   ├── src/
 │   │   ├── test/
-│   │   └── examples/
+│   │   └── examples/             # Runnable examples — source of truth for doc code snippets
 │   ├── effect-dynamodb-geo/      # Geospatial index and search using H3
 │   │   ├── src/
 │   │   └── test/
 │   ├── docs/                     # Documentation site (Astro + Starlight)
 │   │   ├── src/content/docs/
 │   │   └── e2e/
+│   ├── doctest/                  # Doc snippet sync verification (examples ↔ MDX)
+│   │   ├── src/                  # MDX extractor, region parser, sync logic
+│   │   └── test/                 # Sync, typecheck, and runtime tests
 │   └── language-service/         # TS Language Service Plugin (hover tooltips)
 │       ├── src/
 │       └── test/
@@ -233,16 +236,60 @@ Do NOT:
 
 **Key Limits:** Max item 400 KB | BatchWrite 25 | BatchGet 100 | Transaction 100 | GSIs 20 | Query/Scan response 1 MB | Per-partition 3,000 RCU / 1,000 WCU
 
+## Documentation Code Examples
+
+**Examples are the source of truth for all documentation code snippets.** Every tutorial and guide MDX page is backed by a runnable example file in `packages/effect-dynamodb/examples/`.
+
+### How it works
+
+1. **Example files** (`examples/*.ts`) contain complete, runnable programs with `// #region name` / `// #endregion` markers around sections that appear in docs.
+2. **MDX code blocks** reference their backing example via `region="name" example="filename.ts"` attributes on the code fence.
+3. **Sync tests** (`packages/doctest/`) verify that MDX snippet content matches the corresponding example region.
+
+### Adding or updating documentation code
+
+1. Write or update the **example file first** — it must type-check (`tsconfig.examples.json`) and run against DynamoDB Local.
+2. Add `// #region name` / `// #endregion` markers around the code section.
+3. In the MDX file, add `region="name" example="filename.ts"` to the code fence and paste the region content (minus imports and `Console.log` lines).
+4. Run `pnpm --filter @effect-dynamodb/doctest test` to verify sync.
+
+### Example ↔ MDX mapping
+
+| Tutorial/Guide MDX | Example file |
+|---|---|
+| `tutorials/starter.mdx` | `examples/starter.ts` |
+| `tutorials/crud.mdx` | `examples/crud.ts` |
+| `tutorials/gamemanager.mdx` | `examples/cricket.ts` |
+| `tutorials/human-resources.mdx` | `examples/hr.ts` |
+| `guides/modeling.mdx` | `examples/guide-modeling.ts` |
+| `guides/indexes.mdx` | `examples/guide-indexes.ts` |
+| `guides/queries.mdx` | `examples/guide-queries.ts` |
+| `guides/expressions.mdx` | `examples/guide-expressions.ts` |
+| ... (all other tutorials/guides follow the same pattern) | |
+
+### Sync normalization
+
+The sync comparison normalizes content by stripping: `Console.log` lines, blank lines, `assertEq`/`assert` lines, `#region`/`#endregion` markers, leading whitespace, inline output comments (`// →`, `// State:`, etc.), and rewriting import paths. Code blocks without `region`/`example` attributes are illustrative-only and not sync-checked.
+
+### Commands
+
+```bash
+pnpm --filter @effect-dynamodb/doctest test           # Sync + typecheck verification
+pnpm --filter @effect-dynamodb/doctest test:connected  # Runtime execution (needs DynamoDB Local)
+```
+
 ## Quality Gates
 
 Before committing:
 1. `pnpm lint` — zero lint/format errors (Biome)
 2. `pnpm check` — zero type errors
 3. `pnpm test` — all tests pass
-4. `npx tsx examples/<name>.ts` — examples run against DynamoDB Local (`docker run -p 8000:8000 amazon/dynamodb-local`). Run after changes to Entity, Query, Table, DynamoSchema, KeyComposer, Collection, Transaction, or Errors.
-5. New modules must have corresponding test files in `test/`
-6. New errors must use `Data.TaggedError`
-7. New services must follow `ServiceMap.Service` pattern
+4. `pnpm --filter @effect-dynamodb/doctest test` — doc snippet sync verification passes
+5. `npx tsx examples/<name>.ts` — examples run against DynamoDB Local (`docker run -p 8000:8000 amazon/dynamodb-local`). Run after changes to Entity, Query, Table, DynamoSchema, KeyComposer, Collection, Transaction, or Errors.
+6. New modules must have corresponding test files in `test/`
+7. New errors must use `Data.TaggedError`
+8. New services must follow `ServiceMap.Service` pattern
+9. New or updated doc pages must have a backing example file with region markers
 
 ## Behavioral Notes
 
