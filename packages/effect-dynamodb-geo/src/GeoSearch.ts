@@ -7,9 +7,9 @@
  * @internal Used by GeoIndex — consumers should use `GeoIndex.nearby()`.
  */
 
-import type { DynamoClientError, Table } from "@effect-dynamodb/core"
+import type { DynamoClientError, DynamoSchema, Table } from "@effect-dynamodb/core"
 import { type DynamoClient, KeyComposer, Query, ValidationError } from "@effect-dynamodb/core"
-import { Effect, Schema } from "effect"
+import { Effect, Schema, type ServiceMap } from "effect"
 import * as h3 from "h3-js"
 import type { Coordinates, GeoFields, NearbyOptions, NearbyResult } from "./GeoIndex.js"
 import * as H3 from "./H3.js"
@@ -18,7 +18,8 @@ import * as Spherical from "./Spherical.js"
 /** Internal config passed from GeoIndex.make to the search implementation. */
 export interface SearchConfig<A> {
   readonly entity: {
-    readonly table: Table.Table
+    readonly _schema: DynamoSchema.DynamoSchema
+    readonly _tableTag: ServiceMap.Service<Table.TableConfig, Table.TableConfig>
     readonly entityType: string
     readonly indexes: Record<string, KeyComposer.IndexDefinition>
     readonly schemas: { readonly recordSchema: Schema.Codec<any> }
@@ -83,7 +84,7 @@ export const nearby = <A>(
     const pkField = indexDef.pk.field
     const skField = indexDef.sk.field
 
-    const resolveTableName = entity.table.Tag.useSync((tc: { name: string }) => tc.name)
+    const resolveTableName = entity._tableTag.useSync((tc: { name: string }) => tc.name)
 
     const decoder = (raw: Record<string, unknown>) =>
       Schema.decodeUnknownEffect(entity.schemas.recordSchema as Schema.Codec<any>)(raw).pipe(
@@ -125,17 +126,17 @@ export const nearby = <A>(
           }
 
           const pkValue = KeyComposer.composePk(
-            entity.table.schema,
+            entity._schema,
             entity.entityType,
             indexDef,
             pkComposites,
           )
 
           // Compose full SK values with schema prefix (must match stored SK format)
-          const lower = KeyComposer.composeSk(entity.table.schema, entity.entityType, 1, indexDef, {
+          const lower = KeyComposer.composeSk(entity._schema, entity.entityType, 1, indexDef, {
             [fields.cell.field]: lowerCell,
           })
-          const upper = KeyComposer.composeSk(entity.table.schema, entity.entityType, 1, indexDef, {
+          const upper = KeyComposer.composeSk(entity._schema, entity.entityType, 1, indexDef, {
             [fields.cell.field]: upperCell,
           })
 

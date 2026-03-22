@@ -328,9 +328,12 @@ const program = Effect.gen(function* () {
   }).pipe(Effect.flip)
 
   if (refError._tag === "RefNotFound") {
-    yield* Console.log(`RefNotFound: ${refError.field} "${refError.refId}" not found in ${refError.refEntity}`)
+    // refError.field     → "player"
+    // refError.refId     → "nonexistent"
+    // refError.refEntity → "Player"
   }
   // #endregion
+  yield* Console.log(`RefNotFound: ${refError._tag}`)
 
   // =========================================================================
   // Part 2: Aggregate CRUD
@@ -356,9 +359,7 @@ const program = Effect.gen(function* () {
       teamId: "ind",
       coachId: "gambhir",
       homeTeam: false,
-      players: [
-        { playerId: "kohli-01", battingPosition: 4, isCaptain: true },
-      ],
+      players: [{ playerId: "kohli-01", battingPosition: 4, isCaptain: true }],
     },
   })
   // #endregion
@@ -368,54 +369,53 @@ const program = Effect.gen(function* () {
 
   // #region aggregate-get
   const fetched = yield* MatchAggregate.get({ id: "bgt-2025-test-1" })
+  // #endregion
 
   yield* Console.log(`Fetched: ${fetched.name}`)
   yield* Console.log(`Venue: ${fetched.venue.name}`)
   yield* Console.log(`Team 1: ${fetched.team1.team.name}`)
-  yield* Console.log(`Team 1 Captain: ${fetched.team1.players.find((p) => p.isCaptain)?.player.lastName}`)
-  // #endregion
 
   // #region aggregate-update-spread
-  const updated = yield* MatchAggregate.update(
-    { id: "bgt-2025-test-1" },
-    (current) => ({
-      ...current.state,
-      team1: {
-        ...current.state.team1,
-        players: current.state.team1.players.map((ps) => ({
-          ...ps,
-          isCaptain: ps.player.lastName === "Smith",
-        })),
-      },
-    }),
-  )
+  const updated = yield* MatchAggregate.update({ id: "bgt-2025-test-1" }, (current) => ({
+    ...current.state,
+    team1: {
+      ...current.state.team1,
+      players: current.state.team1.players.map((ps) => ({
+        ...ps,
+        isCaptain: ps.player.lastName === "Smith",
+      })),
+    },
+  }))
   // #endregion
 
-  yield* Console.log(`\nUpdated captain: ${updated.team1.players.find((p) => p.isCaptain)?.player.lastName}`)
+  yield* Console.log(
+    `\nUpdated captain: ${updated.team1.players.find((p) => p.isCaptain)?.player.lastName}`,
+  )
 
   // #region aggregate-update-cursor
-  const cursorUpdated = yield* MatchAggregate.update(
-    { id: "bgt-2025-test-1" },
-    ({ cursor }) =>
-      cursor.key("team1").key("players").modify(
-        (players) => players.map((ps) => ({ ...ps, isCaptain: ps.player.lastName === "Smith" })),
+  const cursorUpdated = yield* MatchAggregate.update({ id: "bgt-2025-test-1" }, ({ cursor }) =>
+    cursor
+      .key("team1")
+      .key("players")
+      .modify((players) =>
+        players.map((ps) => ({ ...ps, isCaptain: ps.player.lastName === "Smith" })),
       ),
   )
   // #endregion
 
-  yield* Console.log(`Cursor update captain: ${cursorUpdated.team1.players.find((p) => p.isCaptain)?.player.lastName}`)
+  yield* Console.log(
+    `Cursor update captain: ${cursorUpdated.team1.players.find((p) => p.isCaptain)?.player.lastName}`,
+  )
 
   // #region aggregate-update-simple
-  yield* MatchAggregate.update(
-    { id: "bgt-2025-test-1" },
-    ({ cursor }) => cursor.key("name").replace("AUS vs IND, Boxing Day Test"),
+  yield* MatchAggregate.update({ id: "bgt-2025-test-1" }, ({ cursor }) =>
+    cursor.key("name").replace("AUS vs IND, Boxing Day Test"),
   )
   // #endregion
 
   // #region aggregate-update-optic
-  yield* MatchAggregate.update(
-    { id: "bgt-2025-test-1" },
-    ({ state, optic }) => optic.key("name").replace("AUS vs IND, 1st Test", state),
+  yield* MatchAggregate.update({ id: "bgt-2025-test-1" }, ({ state, optic }) =>
+    optic.key("name").replace("AUS vs IND, 1st Test", state),
   )
   // #endregion
 

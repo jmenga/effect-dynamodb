@@ -4,12 +4,8 @@ import * as GeoIndex from "../src/GeoIndex.js"
 
 // Mock entity with minimal structural interface matching GeoEntity
 const mockEntity: GeoIndex.GeoEntity<any, any> = {
-  table: {
-    schema: { name: "test", version: 1, casing: "lowercase" as const },
-    Tag: {} as any,
-    layer: {} as any,
-    layerConfig: {} as any,
-  },
+  _schema: { name: "test", version: 1, casing: "lowercase" as const },
+  _tableTag: {} as any,
   entityType: "Vehicle",
   indexes: {
     primary: {

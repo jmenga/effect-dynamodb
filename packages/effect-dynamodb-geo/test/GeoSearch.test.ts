@@ -11,7 +11,6 @@ import * as H3 from "../src/H3.js"
 // ---------------------------------------------------------------------------
 
 const AppSchema = DynamoSchema.make({ name: "geotest", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
 
 class Vehicle extends Schema.Class<Vehicle>("Vehicle")({
   vehicleId: Schema.String,
@@ -25,7 +24,6 @@ class Vehicle extends Schema.Class<Vehicle>("Vehicle")({
 
 const Vehicles = Entity.make({
   model: Vehicle,
-  table: MainTable,
   entityType: "Vehicle",
   indexes: {
     primary: {
@@ -40,6 +38,8 @@ const Vehicles = Entity.make({
   },
   timestamps: true,
 })
+
+const MainTable = Table.make({ schema: AppSchema, entities: { Vehicles } })
 
 const VehicleGeo = GeoIndex.make({
   entity: Vehicles,

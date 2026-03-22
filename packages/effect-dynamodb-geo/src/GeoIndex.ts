@@ -10,12 +10,13 @@
 import type {
   DynamoClient,
   DynamoClientError,
+  DynamoSchema,
   KeyComposer,
   Table,
   UniqueConstraintViolation,
   ValidationError,
 } from "@effect-dynamodb/core"
-import { Effect, type Schema } from "effect"
+import { Effect, type Schema, type ServiceMap } from "effect"
 import * as _GeoSearch from "./GeoSearch.js"
 import * as H3 from "./H3.js"
 import type { LatLng } from "./Spherical.js"
@@ -60,7 +61,8 @@ export interface NearbyResult<A> {
 
 /** Structural type for the entity properties GeoIndex needs */
 export interface GeoEntity<A, P> {
-  readonly table: Table.Table
+  readonly _schema: DynamoSchema.DynamoSchema
+  readonly _tableTag: ServiceMap.Service<Table.TableConfig, Table.TableConfig>
   readonly entityType: string
   readonly indexes: Record<string, KeyComposer.IndexDefinition>
   readonly schemas: { readonly recordSchema: Schema.Codec<any> }

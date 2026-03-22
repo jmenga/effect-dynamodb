@@ -15,7 +15,6 @@ import { GeoIndex, H3 } from "../src/index.js"
 // ---------------------------------------------------------------------------
 
 const AppSchema = DynamoSchema.make({ name: "vehicles", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
 
 class Vehicle extends Schema.Class<Vehicle>("Vehicle")({
   vehicleId: Schema.String,
@@ -30,7 +29,6 @@ class Vehicle extends Schema.Class<Vehicle>("Vehicle")({
 
 const Vehicles = Entity.make({
   model: Vehicle,
-  table: MainTable,
   entityType: "Vehicle",
   indexes: {
     primary: {
@@ -45,6 +43,8 @@ const Vehicles = Entity.make({
   },
   timestamps: true,
 })
+
+const MainTable = Table.make({ schema: AppSchema, entities: { Vehicles } })
 
 // ---------------------------------------------------------------------------
 // GeoIndex Declaration
@@ -76,7 +76,7 @@ const program = Effect.gen(function* () {
   yield* client.createTable({
     TableName: "vehicle-tracking",
     BillingMode: "PAY_PER_REQUEST",
-    ...Table.definition(MainTable, [Vehicles]),
+    ...Table.definition(MainTable),
   })
 
   const now = Date.now()
