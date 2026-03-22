@@ -13,62 +13,40 @@ Beyond `Entity.set()`, effect-dynamodb provides combinators for all DynamoDB upd
 
 Deletes attributes entirely from the item:
 
-```typescript
-const { ProductEntity: products } = yield* DynamoClient.make(MainTable)
-
-yield* products.update(
-  { productId: "p-1" },
-  Entity.remove(["description", "temporaryFlag"]),
-)
+```typescript region="remove" example="guide-advanced.ts"
+yield* db.Products.update({ productId: "p-1" }, Entity.remove(["description"]))
 ```
 
 ### Atomic Increment
 
 Atomically increments numeric attributes. Thread-safe — no read-modify-write cycle:
 
-```typescript
-const { ProductEntity: products } = yield* DynamoClient.make(MainTable)
-
-yield* products.update(
-  { productId: "p-1" },
-  Entity.add({ viewCount: 1, stock: 50 }),
-)
+```typescript region="add" example="guide-advanced.ts"
+yield* db.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1, stock: 50 }))
 ```
 
 ### Atomic Decrement
 
 Synthesizes `SET #field = #field - :val` (DynamoDB has no native subtract):
 
-```typescript
-const { ProductEntity: products } = yield* DynamoClient.make(MainTable)
-
-yield* products.update(
-  { productId: "p-1" },
-  Entity.subtract({ stock: 3 }),
-)
+```typescript region="subtract" example="guide-advanced.ts"
+yield* db.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
 ```
 
 ### Appending to Lists
 
 Appends elements to the end of a list attribute using `list_append`:
 
-```typescript
-const { ProductEntity: products } = yield* DynamoClient.make(MainTable)
-
-yield* products.update(
-  { productId: "p-1" },
-  Entity.append({ tags: ["on-sale", "featured"] }),
-)
+```typescript region="append" example="guide-advanced.ts"
+yield* db.Products.update({ productId: "p-1" }, Entity.append({ tags: ["on-sale", "featured"] }))
 ```
 
 ### Removing from Sets
 
 Removes specific elements from a DynamoDB Set attribute (StringSet, NumberSet):
 
-```typescript
-const { ProductEntity: products } = yield* DynamoClient.make(MainTable)
-
-yield* products.update(
+```typescript region="delete-from-set" example="guide-advanced.ts"
+yield* db.Products.update(
   { productId: "p-1" },
   Entity.deleteFromSet({ categories: new Set(["obsolete"]) }),
 )
@@ -78,44 +56,39 @@ yield* products.update(
 
 All update combinators compose as arguments — they are merged into one `UpdateItem` call:
 
-```typescript
-const { ProductEntity: products } = yield* DynamoClient.make(MainTable)
-
-yield* products.update(
+```typescript region="composed-updates" example="guide-advanced.ts"
+yield* db.Products.update(
   { productId: "p-1" },
   Entity.set({ name: "Premium Mouse", price: 39.99 }),
   Entity.add({ viewCount: 10 }),
   Entity.subtract({ stock: 5 }),
   Entity.append({ tags: ["premium"] }),
-  Entity.remove(["temporaryNote"]),
-  Entity.expectedVersion(3),
+  Entity.remove(["description"]),
+  Entity.expectedVersion(5),
 )
 ```
 
 ## Working in Bulk
 
-The entity provides batch operations that automatically handle DynamoDB limits (chunking) and retry unprocessed items:
+The `Batch` module provides batch operations that automatically handle DynamoDB limits (chunking) and retry unprocessed items:
 
-```typescript
-const { UserEntity: users } = yield* DynamoClient.make(MainTable)
+```typescript region="batch-ops" example="guide-advanced.ts"
+// Batch write (auto-chunks at 25 items)
+yield* Batch.write([
+  Users.put({ userId: "u-1", email: "a@b.com", displayName: "A" }),
+  Users.put({ userId: "u-2", email: "b@c.com", displayName: "B" }),
+  Users.put({ userId: "u-3", email: "c@d.com", displayName: "C" }),
+])
 
 // Batch get (auto-chunks at 100 items)
-const results = yield* users.batchGet([
-  { userId: "u-1" },
-  { userId: "u-2" },
-  { userId: "u-3" },
+const [u1, u2, u3] = yield* Batch.get([
+  Users.get({ userId: "u-1" }),
+  Users.get({ userId: "u-2" }),
+  Users.get({ userId: "u-3" }),
 ])
 
-// Batch write (auto-chunks at 25 items)
-yield* users.batchPut([
-  { userId: "u-1", email: "a@b.com", displayName: "A" },
-  { userId: "u-2", email: "b@c.com", displayName: "B" },
-])
-
-yield* users.batchDelete([
-  { userId: "u-1" },
-  { userId: "u-2" },
-])
+// Batch delete
+yield* Batch.write([Users.delete({ userId: "u-2" }), Users.delete({ userId: "u-3" })])
 ```
 
 Note: Batch operations do **not** enforce unique constraints (no transactional guarantees). Use individual `put`/`delete` for entities with unique constraints.
@@ -124,25 +97,44 @@ Note: Batch operations do **not** enforce unique constraints (no transactional g
 
 Entity-level `condition()` adds a `ConditionExpression` to any mutation (put, update, delete). The condition is evaluated server-side — if it fails, the operation is rejected with `ConditionalCheckFailed`.
 
-```typescript
-import { DynamoClient, Entity } from "effect-dynamodb"
+Conditional put — only if item doesn't already exist:
 
-const { UserEntity: users, ProductEntity: products, TaskEntity: tasks } = yield* DynamoClient.make(MainTable)
-
+```typescript region="conditional-put" example="guide-advanced.ts"
 // Conditional put — only if item doesn't already exist
-yield* users.put(newUser, UserEntity.condition((t, { notExists }) => notExists(t.email)))
-
-// Conditional delete — only if stock is zero
-yield* products.delete(
-  { productId: "p-1" },
-  ProductEntity.condition((t, { eq }) => eq(t.stock, 0)),
+const condPutResult = yield* db.Users.put(
+  { userId: "u-10", email: "new@example.com", displayName: "New User" },
+  Users.condition((t, { notExists }) => notExists(t.email)),
+).pipe(
+  Effect.match({
+    onFailure: (e) => `${e._tag} — already exists`,
+    onSuccess: (u) => `created ${u.displayName}`,
+  }),
 )
+```
 
+Conditional delete — only if a specific attribute value matches:
+
+```typescript region="conditional-delete" example="guide-advanced.ts"
+// Conditional delete — only if stock is zero
+const condDeleteResult = yield* db.Products.delete(
+  { productId: "p-1" },
+  Products.condition((t, { eq }) => eq(t.stock, 0)),
+).pipe(
+  Effect.match({
+    onFailure: (e) => `${e._tag} — stock not zero, delete prevented`,
+    onSuccess: () => "deleted (stock was 0)",
+  }),
+)
+```
+
+Conditional update — only if status matches:
+
+```typescript region="conditional-update" example="guide-advanced.ts"
 // Conditional update — only if status is "active"
-yield* tasks.update(
+yield* db.Tasks.update(
   { taskId: "t-1" },
   Entity.set({ status: "done" }),
-  TaskEntity.condition((t, { eq }) => eq(t.status, "active")),
+  Tasks.condition((t, { eq }) => eq(t.status, "active")),
 )
 ```
 
@@ -150,48 +142,49 @@ yield* tasks.update(
 
 When using `condition()` on an update that also has `Entity.expectedVersion()`, the user condition is ANDed with the version check:
 
-```typescript
-const { ProductEntity: products } = yield* DynamoClient.make(MainTable)
-
-yield* products.update(
+```typescript region="optimistic-condition" example="guide-advanced.ts"
+yield* db.Products.update(
   { productId: "p-1" },
   Entity.set({ price: 24.99 }),
-  Entity.expectedVersion(3),
-  ProductEntity.condition((t, { gt }) => gt(t.stock, 0)),
+  Products.expectedVersion(6),
+  Products.condition((t, { gt }) => gt(t.stock, 0)),
 )
 // ConditionExpression: (#version = :v_lock) AND (#stock > :v0)
 ```
 
 ### Handling ConditionalCheckFailed
 
-```typescript
-const { UserEntity: users } = yield* DynamoClient.make(MainTable)
+Use `Entity.create()` for typed `ConditionalCheckFailed` error handling — `create()` includes this error in its typed error channel:
 
-const result = yield* users
-  .put(newUser, UserEntity.condition((t, { notExists }) => notExists(t.email)))
-  .pipe(
-    Effect.catchTag("ConditionalCheckFailed", () =>
-      Effect.succeed("already exists")
-    ),
-  )
+```typescript region="handle-conditional" example="guide-advanced.ts"
+const result = yield* db.Users.create({
+  userId: "u-10",
+  email: "new@example.com",
+  displayName: "New User",
+}).pipe(Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("already exists")))
 ```
 
 ## Creating Items Safely
 
 `Entity.create()` is a convenience for "put if not exists" — it's `Entity.put()` with an automatic `attribute_not_exists` condition on the primary key:
 
-```typescript
-const { UserEntity: users } = yield* DynamoClient.make(MainTable)
-
+```typescript region="create-safely" example="guide-advanced.ts"
 // Create — fails with ConditionalCheckFailed if item already exists
-const user = yield* users.create({
-  userId: "u-1",
+const user = yield* db.Users.create({
+  userId: "u-20",
   email: "alice@example.com",
   displayName: "Alice",
 })
 
-// Equivalent to:
-yield* users.put({...}, UserEntity.condition((t, { notExists }) => notExists(t.userId)))
+// Duplicate — caught gracefully
+const dup = yield* db.Users.create({
+  userId: "u-20",
+  email: "alice@example.com",
+  displayName: "Alice",
+}).pipe(
+  Effect.map(() => "created"),
+  Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("already exists")),
+)
 ```
 
 ## Working with Multiple Tables
@@ -201,20 +194,8 @@ While single-table design is the default pattern, effect-dynamodb supports entit
 ### Declaring Multiple Tables
 
 ```typescript
-const UserTable = Table.make({ schema: AppSchema })
-const AuditTable = Table.make({ schema: AppSchema })
-
-const UserEntity = Entity.make({
-  model: User,
-  entityType: "User",
-  // ...
-})
-
-const AuditEntity = Entity.make({
-  model: AuditEntry,
-  entityType: "AuditEntry",
-  // ...
-})
+const UserTable = Table.make({ schema: AppSchema, entities: { Users } })
+const AuditTable = Table.make({ schema: AppSchema, entities: { AuditEntries } })
 
 // Provide physical table names at runtime
 program.pipe(
@@ -249,26 +230,28 @@ program.pipe(
 
 Type-safe conditions, filters, and projections using `PathBuilder`:
 
-```typescript
+```typescript region="entity-expressions" example="guide-advanced.ts"
 // Condition — type-safe, nested paths, OR/NOT composition
-Products.condition((t, { eq, gt, and }) =>
-  and(eq(t.status, "active"), gt(t.stock, 0)),
-)
+Products.condition((t, { eq, gt, and }) => and(eq(t.category, "peripherals"), gt(t.stock, 0)))
 
 // Filter — same API, applied to queries/scans
-Products.filter((t, { contains }) => contains(t.name, "Widget"))
+const filtered = yield* db.Products.collect(
+  Products.query.byCategory({ category: "peripherals" }),
+  Products.filter((t, { contains }) => contains(t.name, "Widget")),
+)
 
 // Projection — select specific attributes
-Products.select((t) => [t.name, t.price, t.address.city])
+const projected = yield* db.Products.collect(
+  Products.scan(),
+  Products.select((t) => [t.name, t.price]),
+)
 ```
 
 ### Low-Level Builders
 
 The `Expression` module provides raw builders for advanced use cases:
 
-```typescript
-import { Expression } from "effect-dynamodb"
-
+```typescript region="expression-builders" example="guide-advanced.ts"
 // Condition expression (for conditional writes)
 const cond = Expression.condition({
   eq: { status: "active" },
@@ -282,7 +265,7 @@ const filter = Expression.filter({
 })
 
 // Update expression
-const update = Expression.update({
+const upd = Expression.update({
   set: { displayName: "New Name", updatedAt: new Date().toISOString() },
   remove: ["temporaryFlag"],
   add: { loginCount: 1 },

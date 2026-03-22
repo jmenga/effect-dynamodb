@@ -1,17 +1,35 @@
----
-title: "Testing"
-description: "Mock DynamoClient, test CRUD operations, error paths, and queries"
----
+/**
+ * Testing guide example — effect-dynamodb
+ *
+ * Demonstrates testing patterns from the Testing guide:
+ *   - Setting up a mock DynamoClient via Layer.succeed
+ *   - Verifying put operations against the mock
+ *   - Asserting on error paths (UniqueConstraintViolation)
+ *   - Testing query results with mock data
+ *
+ * This example shows the testing patterns as a standalone script.
+ * In a real project, use @effect/vitest with it.effect for the same patterns.
+ *
+ * Run:
+ *   npx tsx examples/guide-testing.ts
+ */
 
-import { Aside } from "@astrojs/starlight/components"
+import { Console, Effect, Layer, Schema } from "effect"
 
-This guide covers how to test effect-dynamodb entities using Effect's service-based architecture. You will learn how to mock the DynamoDB client, verify CRUD operations, assert on error paths, and test queries.
+// Import from source (use "effect-dynamodb" when published)
+import { DynamoClient } from "../src/DynamoClient.js"
+import * as DynamoModel from "../src/DynamoModel.js"
+import * as DynamoSchema from "../src/DynamoSchema.js"
+import * as Entity from "../src/Entity.js"
+import { DynamoError } from "../src/Errors.js"
+import { toAttributeMap } from "../src/Marshaller.js"
+import * as Table from "../src/Table.js"
 
-## Domain Models and Entities
+// ---------------------------------------------------------------------------
+// 1. Domain models
+// ---------------------------------------------------------------------------
 
-Define your models and entities as usual. These are the same models you use in production code:
-
-```typescript title="models.ts" region="models" example="guide-testing.ts"
+// #region models
 class Employee extends Schema.Class<Employee>("Employee")({
   employeeId: Schema.String,
   email: Schema.String,
@@ -31,9 +49,13 @@ class Task extends Schema.Class<Task>("Task")({
   status: Schema.Literals(["active", "completed", "archived"]),
   assignee: Schema.String,
 }) {}
-```
+// #endregion
 
-```typescript title="entities.ts" region="entities" example="guide-testing.ts"
+// ---------------------------------------------------------------------------
+// 2. Schema + Table + Entities
+// ---------------------------------------------------------------------------
+
+// #region entities
 const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
 
 const EmployeeEntity = Entity.make({
@@ -77,15 +99,13 @@ const MainTable = Table.make({
   schema: AppSchema,
   entities: { EmployeeEntity, TaskEntity },
 })
-```
+// #endregion
 
----
+// ---------------------------------------------------------------------------
+// 3. Mock DynamoDB Client
+// ---------------------------------------------------------------------------
 
-## Set Up a Mock DynamoDB Client
-
-effect-dynamodb uses `DynamoClient` as an Effect Service (`ServiceMap.Service`). In tests, provide a mock implementation via `Layer.succeed`. Each method receives the raw AWS SDK input and returns an `Effect`:
-
-```typescript title="mock-client.ts" region="mock-client" example="guide-testing.ts"
+// #region mock-client
 // Track calls for assertions
 let putItemCalls: Array<unknown> = []
 let getItemCalls: Array<unknown> = []
@@ -138,19 +158,13 @@ const MockDynamoClient = Layer.succeed(DynamoClient, {
 })
 
 const TestLayer = Layer.merge(MockDynamoClient, MainTable.layer({ name: "test-table" }))
-```
+// #endregion
 
-<Aside type="tip">
-  In vitest tests, you can use `vi.fn()` for the mock functions instead of tracking calls manually. The `Layer.succeed` pattern is the same either way.
-</Aside>
+// ---------------------------------------------------------------------------
+// 4. Test: Verify a Put Operation
+// ---------------------------------------------------------------------------
 
----
-
-## Verify a Put Operation
-
-Create a typed client with `DynamoClient.make()` and assert that the entity's `put` method calls the underlying DynamoDB client correctly. Wire the mock layer with `Effect.provide(TestLayer)`:
-
-```typescript region="test-put" example="guide-testing.ts"
+// #region test-put
 const testPutOperation = Effect.gen(function* () {
   resetMocks()
 
@@ -174,19 +188,13 @@ const testPutOperation = Effect.gen(function* () {
 
   yield* Console.log("  Put operation: PASSED")
 }).pipe(Effect.provide(TestLayer))
-```
+// #endregion
 
-<Aside type="note">
-  Entities with `unique` constraints use `transactWriteItems` to atomically write both the item and the uniqueness sentinel. Entities without `unique` use `putItem` directly.
-</Aside>
+// ---------------------------------------------------------------------------
+// 5. Test: Assert on Error Paths
+// ---------------------------------------------------------------------------
 
----
-
-## Assert on Error Paths
-
-Mock the client to return a failure and use `Effect.flip` to inspect the error channel. When a unique constraint entity receives a `TransactionCanceledException`, effect-dynamodb translates it to a `UniqueConstraintViolation`:
-
-```typescript region="test-error" example="guide-testing.ts"
+// #region test-error
 const testErrorPath = Effect.gen(function* () {
   resetMocks()
 
@@ -222,15 +230,13 @@ const testErrorPath = Effect.gen(function* () {
 
   yield* Console.log("  Error path (UniqueConstraintViolation): PASSED")
 }).pipe(Effect.provide(TestLayer))
-```
+// #endregion
 
----
+// ---------------------------------------------------------------------------
+// 6. Test: Query Results
+// ---------------------------------------------------------------------------
 
-## Test Query Results
-
-Return mock query results from the client and verify the decoded output. Use `toAttributeMap` from the Marshaller to build DynamoDB-formatted items:
-
-```typescript region="test-query" example="guide-testing.ts"
+// #region test-query
 const testQueryResults = Effect.gen(function* () {
   resetMocks()
 
@@ -285,48 +291,25 @@ const testQueryResults = Effect.gen(function* () {
 
   yield* Console.log("  Query results: PASSED")
 }).pipe(Effect.provide(TestLayer))
-```
+// #endregion
 
-<Aside type="tip">
-  Mock items must include all key fields (`pk`, `sk`, GSI keys), the `__edd_e__` entity type discriminator, and any fields required by the entity's schema. The entity layer decodes items through `Schema.decode`, so missing or invalid fields will cause a `ValidationError`.
-</Aside>
+// ---------------------------------------------------------------------------
+// 7. Run all tests
+// ---------------------------------------------------------------------------
 
----
+// #region run
+const program = Effect.gen(function* () {
+  yield* Console.log("=== Testing Guide Examples ===\n")
 
-## Using with Vitest
+  yield* testPutOperation
+  yield* testErrorPath
+  yield* testQueryResults
 
-In a real test suite, use `@effect/vitest` with `it.effect` instead of running assertions manually. The `Layer.succeed` and `Effect.provide` patterns are identical:
-
-```typescript title="employees.test.ts"
-import { describe, expect, it } from "@effect/vitest"
-import { Effect, Layer } from "effect"
-import { DynamoClient } from "effect-dynamodb"
-import { beforeEach, vi } from "vitest"
-
-describe("EmployeeEntity", () => {
-  beforeEach(() => vi.resetAllMocks())
-
-  it.effect("creates an employee", () =>
-    Effect.gen(function* () {
-      // ... same pattern as above, but with vi.fn() and expect()
-      const { EmployeeEntity: employees } = yield* DynamoClient.make(MainTable)
-
-      const result = yield* employees.put({
-        employeeId: "emp-1",
-        email: "alice@acme.com",
-        displayName: "Alice",
-        department: "Engineering",
-        createdBy: "admin",
-      })
-
-      expect(result.employeeId).toBe("emp-1")
-      expect(result.displayName).toBe("Alice")
-    }).pipe(Effect.provide(TestLayer))
-  )
+  yield* Console.log("\nAll tests passed.")
 })
-```
 
-## What's Next?
-
-- [Getting Started](/effect-dynamodb/getting-started/) — Quick start guide
-- [DynamoDB Streams](/effect-dynamodb/guides/streams/) — Process change events from DynamoDB Streams
+Effect.runPromise(program).then(
+  () => console.log("\nDone."),
+  (err) => console.error("Failed:", err),
+)
+// #endregion

@@ -22,10 +22,7 @@ DynamoDB doesn't have JOINs. When your domain model needs data from a related en
 
 Mark the primary business identifier field on any entity that can be referenced:
 
-```typescript
-import { Schema } from "effect"
-import { DynamoModel } from "effect-dynamodb"
-
+```typescript region="identifier-model" example="guide-aggregates.ts"
 class Team extends Schema.Class<Team>("Team")({
   id: Schema.String.pipe(DynamoModel.identifier),
   name: Schema.String,
@@ -43,7 +40,7 @@ Rules:
 
 Mark a field as a denormalized reference to another entity:
 
-```typescript
+```typescript region="ref-model" example="guide-aggregates.ts"
 class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
   squadId: Schema.String,
   selectionNumber: Schema.Number,
@@ -60,7 +57,7 @@ class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
 
 When creating an entity with ref fields, provide a `refs` config mapping field names to the entities they reference:
 
-```typescript
+```typescript region="entity-with-refs" example="guide-aggregates.ts"
 const SquadSelections = Entity.make({
   model: SquadSelection,
   entityType: "SquadSelection",
@@ -76,8 +73,8 @@ const SquadSelections = Entity.make({
     },
   },
   refs: {
-    team: Teams,     // "team" field references the Teams entity
-    player: Players, // "player" field references the Players entity
+    team: { entity: Teams },
+    player: { entity: Players },
   },
 })
 ```
@@ -92,28 +89,22 @@ Ref fields transform across Entity's derived types:
 | `Entity.Record<E>` | Full domain object | `team: Team`, `player: Player` |
 | `Entity.Update<E>` | Optional ID field | `teamId?: string`, `playerId?: string` |
 
-```typescript
-import { DynamoClient } from "effect-dynamodb"
-
-const { SquadSelections: squadSelections } = yield* DynamoClient.make(MainTable)
-
+```typescript region="ref-put-get" example="guide-aggregates.ts"
 // Input accepts IDs — not full objects
-yield* squadSelections.put({
+yield* db.SquadSelections.put({
   squadId: "aus#2024-25#BGT",
   selectionNumber: 1,
-  teamId: "aus",         // ID, not Team object
-  playerId: "cummins-01", // ID, not Player object
+  teamId: "aus",
+  playerId: "cummins-01",
   squadRole: "bowler",
   isCaptain: true,
 })
 
 // Record returns full domain objects
-const selection = yield* squadSelections.get({
+const selection = yield* db.SquadSelections.get({
   squadId: "aus#2024-25#BGT",
   selectionNumber: 1,
 })
-console.log(selection.team.name)     // "Australia"
-console.log(selection.player.role)   // "bowler"
 ```
 
 ### Ref Hydration
@@ -124,23 +115,21 @@ On `put` and `update`, Entity automatically:
 3. Embeds the entity's core domain data (Schema.Type — no system fields) in the DynamoDB item
 4. Returns `RefNotFound` if any referenced entity doesn't exist
 
-```typescript
-const { SquadSelections: squadSelections } = yield* DynamoClient.make(MainTable)
-
+```typescript region="ref-not-found" example="guide-aggregates.ts"
 // RefNotFound when a ref doesn't resolve
-const result = yield* squadSelections.put({
+const refError = yield* db.SquadSelections.put({
   squadId: "aus#2024-25#BGT",
   selectionNumber: 99,
   teamId: "aus",
-  playerId: "nonexistent",  // doesn't exist
+  playerId: "nonexistent",
   squadRole: "batter",
   isCaptain: false,
 }).pipe(Effect.flip)
 
-if (result._tag === "RefNotFound") {
-  console.log(result.field)     // "player"
-  console.log(result.refId)     // "nonexistent"
-  console.log(result.refEntity) // "Player"
+if (refError._tag === "RefNotFound") {
+  // refError.field     → "player"
+  // refError.refId     → "nonexistent"
+  // refError.refEntity → "Player"
 }
 ```
 
@@ -189,7 +178,7 @@ An **Aggregate** is a domain object composed of multiple DynamoDB entity types s
 
 Define the composed domain shape using Schema.Class. Ref fields reference other entities; edge fields reference aggregate members.
 
-```typescript
+```typescript region="aggregate-schemas" example="guide-aggregates.ts"
 class PlayerSheet extends Schema.Class<PlayerSheet>("PlayerSheet")({
   player: Player.pipe(DynamoModel.ref),
   battingPosition: Schema.Number,
@@ -216,12 +205,13 @@ class Match extends Schema.Class<Match>("Match")({
 
 Define reusable graph shapes for repeated structures. A sub-aggregate specifies a root entity type and edges to member entity types.
 
-```typescript
+```typescript region="sub-aggregate" example="guide-aggregates.ts"
 const TeamSheetAggregate = Aggregate.make(TeamSheet, {
   root: { entityType: "MatchTeam" },
   edges: {
-    coach: Aggregate.one("coach", { entityType: "MatchCoach" }),
-    players: Aggregate.many("players", { entityType: "MatchPlayer" }),
+    team: Aggregate.ref(Teams),
+    coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: Coaches }),
+    players: Aggregate.many("players", { entityType: "MatchPlayer", entity: Players }),
   },
 })
 ```
@@ -236,7 +226,7 @@ Edge keys (`coach`, `players`) correspond to fields on the schema.
 
 Bind the full domain schema to a table, schema namespace, partition key, and collection index:
 
-```typescript
+```typescript region="top-level-aggregate" example="guide-aggregates.ts"
 const MatchAggregate = Aggregate.make(Match, {
   table: MainTable,
   schema: CricketSchema,
@@ -247,14 +237,8 @@ const MatchAggregate = Aggregate.make(Match, {
     sk: { field: "lsi1sk", composite: ["name"] },
   },
   root: { entityType: "MatchItem" },
-  refs: {
-    Team: Teams,
-    Player: Players,
-    Coach: Coaches,
-    Venue: Venues,
-  },
   edges: {
-    venue: Aggregate.one("venue", { entityType: "MatchVenue" }),
+    venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: Venues }),
     team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
     team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
   },
@@ -270,9 +254,8 @@ const MatchAggregate = Aggregate.make(Match, {
 | `pk` | Partition key definition (field + composite attributes from the schema) |
 | `collection` | Collection index for the read path query (index name, collection name, SK definition) |
 | `root` | Entity type for the root item |
-| `refs` | Map of Schema.Class identifiers to Entity instances for ref hydration |
 | `context` | Optional array of schema field names to propagate to all member items |
-| `edges` | Map of schema fields to edge descriptors or bound sub-aggregates |
+| `edges` | Map of schema fields to edge descriptors, ref edges, or bound sub-aggregates |
 
 #### Sub-Aggregate Binding with Discriminators
 

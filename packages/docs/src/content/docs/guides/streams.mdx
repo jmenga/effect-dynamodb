@@ -3,7 +3,7 @@ title: "DynamoDB Streams"
 description: "Decode DynamoDB Stream records into typed domain objects"
 ---
 
-DynamoDB Streams deliver a time-ordered sequence of item-level changes. effect-dynamodb provides schemas for decoding stream records into typed domain objects.
+DynamoDB Streams deliver a time-ordered sequence of item-level changes. effect-dynamodb provides utilities for decoding stream records into typed domain objects.
 
 ## Understanding the Problem
 
@@ -15,100 +15,167 @@ DynamoDB Stream records contain items in DynamoDB's native `AttributeValue` form
   "sk": { "S": "$myapp#v1#employee" },
   "__edd_e__": { "S": "Employee" },
   "email": { "S": "alice@acme.com" },
-  "version": { "N": "3" }
+  "version": { "N": "1" }
 }
 ```
 
-Manually decoding this into your domain types is error-prone. effect-dynamodb provides two schema accessors for this.
+Manually decoding this into your domain types is error-prone. effect-dynamodb provides `Entity.decodeMarshalledItem` for AttributeValue input and `Entity.itemSchema` for already-unmarshalled input.
+
+## Setup
+
+The examples on this page use these models and entities:
+
+```typescript region="models" example="guide-streams.ts"
+class Employee extends Schema.Class<Employee>("Employee")({
+  employeeId: Schema.String,
+  email: Schema.String,
+  displayName: Schema.NonEmptyString,
+  department: Schema.String,
+}) {}
+
+const EmployeeModel = DynamoModel.configure(Employee, {
+  email: { immutable: true },
+})
+
+class Task extends Schema.Class<Task>("Task")({
+  taskId: Schema.String,
+  employeeId: Schema.String,
+  title: Schema.NonEmptyString,
+  status: Schema.String,
+}) {}
+```
+
+```typescript region="entities" example="guide-streams.ts"
+const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
+
+const EmployeeEntity = Entity.make({
+  model: EmployeeModel,
+  entityType: "Employee",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["employeeId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    byDepartment: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["department"] },
+      sk: { field: "gsi1sk", composite: ["displayName"] },
+    },
+  },
+  timestamps: true,
+  versioned: true,
+})
+
+const TaskEntity = Entity.make({
+  model: Task,
+  entityType: "Task",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["taskId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    byEmployee: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["employeeId"] },
+      sk: { field: "gsi1sk", composite: ["status"] },
+    },
+  },
+  timestamps: true,
+})
+
+const _MainTable = Table.make({
+  schema: AppSchema,
+  entities: { EmployeeEntity, TaskEntity },
+})
+```
 
 ## Decoding from AttributeValue Format
 
-For Lambda functions consuming DynamoDB Stream events directly, use `Entity.marshalledSchema`:
+For Lambda functions consuming DynamoDB Stream events directly, use `Entity.decodeMarshalledItem`. It unmarshalls the `AttributeValue` map and decodes via the entity's item schema in a single step, returning an `Effect` that fails with `ValidationError` on schema mismatch:
 
-```typescript
-import { Schema } from "effect"
-import { Entity } from "effect-dynamodb"
-
-const employeeFromMarshalled = Entity.marshalledSchema(EmployeeEntity)
-
-const handler = async (event: DynamoDBStreamEvent) => {
-  for (const record of event.Records) {
-    if (record.dynamodb?.NewImage) {
-      const result = Schema.decodeUnknownEither(employeeFromMarshalled)(
-        record.dynamodb.NewImage
-      )
-      if (result._tag === "Right") {
-        const employee = result.right
-        console.log(`Updated: ${employee.displayName}`)
+```typescript region="decode-marshalled" example="guide-streams.ts"
+const handleEmployeeStream = (event: DynamoDBStreamEvent) =>
+  Effect.gen(function* () {
+    for (const record of event.Records) {
+      if (record.dynamodb?.NewImage) {
+        const employee = yield* Entity.decodeMarshalledItem(
+          EmployeeEntity,
+          record.dynamodb.NewImage,
+        )
+        yield* Console.log(`Updated: ${(employee as Employee).displayName}`)
       }
     }
-  }
-}
+  })
 ```
 
 ## Decoding from Unmarshalled Format
 
-If you've already unmarshalled the item (e.g., using `@aws-sdk/util-dynamodb`), use `Entity.itemSchema`:
+If you've already unmarshalled the item (e.g., using `Marshaller.fromAttributeMap` or `@aws-sdk/util-dynamodb`), use `Entity.itemSchema` to get a Schema codec for direct decoding:
 
-```typescript
-import { Entity } from "effect-dynamodb"
-
+```typescript region="decode-unmarshalled" example="guide-streams.ts"
 const employeeFromItem = Entity.itemSchema(EmployeeEntity)
 
-const unmarshalled = unmarshall(record.dynamodb.NewImage)
-const employee = Schema.decodeUnknownSync(employeeFromItem)(unmarshalled)
+const decodeUnmarshalledEmployee = (
+  marshalledImage: Record<string, AttributeValue>,
+) => {
+  const unmarshalled = Marshaller.fromAttributeMap(marshalledImage)
+  return Schema.decodeUnknownSync(employeeFromItem)(unmarshalled)
+}
 ```
 
 ## Typing the Marshalled Shape
 
-The `Entity.Marshalled<E>` type represents the exact shape of a DynamoDB item in `AttributeValue` format:
+The `Entity.Marshalled<E>` type represents the shape of a DynamoDB item in `AttributeValue` format:
 
-```typescript
+```typescript region="marshalled-type" example="guide-streams.ts"
 type EmployeeMarshalled = Entity.Marshalled<typeof EmployeeEntity>
 // {
-//   pk: { S: string },
-//   sk: { S: string },
-//   gsi1pk: { S: string },
-//   gsi1sk: { S: string },
-//   __edd_e__: { S: string },
-//   employeeId: { S: string },
-//   email: { S: string },
-//   displayName: { S: string },
-//   version: { N: string },
-//   createdAt: { S: string },
-//   updatedAt: { S: string },
+//   readonly [x: string]: {
+//     readonly S?: string
+//     readonly N?: string
+//     readonly BOOL?: boolean
+//     readonly NULL?: boolean
+//     readonly L?: ReadonlyArray<unknown>
+//     readonly M?: Record<string, unknown>
+//   }
 // }
 ```
 
 ## Processing Multiple Entity Types
 
-When processing streams from a single-table design, use `__edd_e__` to discriminate:
+When processing streams from a single-table design, use `__edd_e__` to discriminate entity types and decode each with `Entity.decodeMarshalledItem`:
 
-```typescript
-const handler = async (event: DynamoDBStreamEvent) => {
-  for (const record of event.Records) {
-    const image = record.dynamodb?.NewImage
-    if (!image) continue
+```typescript region="multi-entity" example="guide-streams.ts"
+const handleStreamEvent = (event: DynamoDBStreamEvent) =>
+  Effect.gen(function* () {
+    for (const record of event.Records) {
+      const image = record.dynamodb?.NewImage
+      if (!image) continue
 
-    const entityType = image["__edd_e__"]?.S
-    switch (entityType) {
-      case "Employee": {
-        const emp = Schema.decodeUnknownSync(
-          Entity.marshalledSchema(EmployeeEntity)
-        )(image)
-        yield* handleEmployeeChange(emp)
-        break
-      }
-      case "Task": {
-        const task = Schema.decodeUnknownSync(
-          Entity.marshalledSchema(TaskEntity)
-        )(image)
-        yield* handleTaskChange(task)
-        break
+      const entityType = image["__edd_e__"]?.S
+      switch (entityType) {
+        case "Employee": {
+          const emp = yield* Entity.decodeMarshalledItem(
+            EmployeeEntity,
+            image,
+          )
+          yield* handleEmployeeChange(emp as Entity.Record<typeof EmployeeEntity>)
+          break
+        }
+        case "Task": {
+          const task = yield* Entity.decodeMarshalledItem(TaskEntity, image)
+          yield* handleTaskChange(task as Entity.Record<typeof TaskEntity>)
+          break
+        }
       }
     }
-  }
-}
+  })
+
+const handleEmployeeChange = (emp: Entity.Record<typeof EmployeeEntity>) =>
+  Console.log(`Employee changed: ${emp.displayName} (${emp.email})`)
+
+const handleTaskChange = (task: Entity.Record<typeof TaskEntity>) =>
+  Console.log(`Task changed: ${task.title} (${task.status})`)
 ```
 
 ## What's Next?

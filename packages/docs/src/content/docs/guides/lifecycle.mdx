@@ -11,39 +11,71 @@ When `softDelete` is configured, `entity.delete()` performs a **logical deletion
 
 ### Declaration
 
-```typescript
-import { Duration } from "effect"
+The simplest form enables soft delete with no TTL:
 
-const EmployeeEntity = Entity.make({
+```typescript
+const Employees = Entity.make({
   // ...
   softDelete: true,
 })
+```
 
-// With auto-purge TTL
-const EmployeeEntity = Entity.make({
-  // ...
+Add a TTL to auto-purge deleted items after a duration:
+
+```typescript region="entity-soft-delete" example="guide-lifecycle.ts"
+const Employees = Entity.make({
+  model: EmployeeModel,
+  entityType: "Employee",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["employeeId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    byTenant: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["department", "employeeId"] },
+    },
+  },
+  timestamps: true,
+  versioned: { retain: true, ttl: Duration.days(90) },
   softDelete: { ttl: Duration.days(30) },
 })
+```
 
-// With unique constraint policy
-const EmployeeEntity = Entity.make({
-  // ...
-  softDelete: {
-    ttl: Duration.days(30),
-    preserveUnique: false,  // default: free unique values on delete
+With `preserveUnique` to control unique constraint behavior on delete:
+
+```typescript region="entity-reserve-policy" example="guide-lifecycle.ts"
+const EmployeesReserve = Entity.make({
+  model: EmployeeModel,
+  entityType: "EmployeeReserve",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["employeeId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    byTenant: {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["department", "employeeId"] },
+    },
   },
+  timestamps: true,
+  versioned: { retain: true },
+  softDelete: { ttl: Duration.days(30), preserveUnique: true },
+  unique: { email: ["email"] },
 })
 ```
 
 ### What Happens on Delete
 
-```typescript
-const { EmployeeEntity: employees } = yield* DynamoClient.make(MainTable)
-
-yield* employees.delete({ employeeId: "emp-alice" })
+```typescript region="soft-delete" example="guide-lifecycle.ts"
+// Soft delete (version 3) — item disappears from GSI queries
+yield* db.Employees.delete({ employeeId: "emp-alice" })
+yield* Console.log("Soft-deleted alice")
 ```
 
-1. **Sort key is modified:** `$myapp#v1#employee` → `$myapp#v1#employee#deleted#2024-01-15T10:30:00Z`
+1. **Sort key is modified:** `$lifecycle#v1#employee` → `$lifecycle#v1#employee#deleted#2024-01-15T10:30:00Z`
 2. **GSI keys are removed:** The item falls out of all secondary indexes and collections
 3. **`deletedAt` timestamp is added** to the item
 4. **Optional TTL is set** for automatic purge by DynamoDB
@@ -54,28 +86,47 @@ yield* employees.delete({ employeeId: "emp-alice" })
 | Access Path | Sees Deleted Items? |
 |-------------|---------------------|
 | `employees.get(key)` | No |
-| `EmployeeEntity.query.byTenant(...)` | No |
+| `Employees.query.byTenant(...)` | No |
 | Collection queries | No |
 | `employees.deleted.get(key)` | Yes |
-| `EmployeeEntity.deleted.list(key)` | Yes |
+| `Employees.deleted.list(key)` | Yes |
+
+Normal get returns `ItemNotFound`:
+
+```typescript region="invisible" example="guide-lifecycle.ts"
+// Normal get returns ItemNotFound
+const getResult = yield* db.Employees.get({ employeeId: "emp-alice" }).pipe(
+  Effect.map(() => "found" as const),
+  Effect.catchTag("ItemNotFound", () => Effect.succeed("not-found" as const)),
+)
+yield* Console.log(`Normal get after delete: ${getResult}`)
+```
+
+GSI queries also return empty — deleted items fall out of indexes:
+
+```typescript region="query-invisible" example="guide-lifecycle.ts"
+// GSI query also returns empty — deleted items fall out of indexes
+const tenantEmployees = yield* db.Employees.collect(
+  Employees.query.byTenant({ tenantId: "t-acme" }),
+)
+yield* Console.log(`Tenant query after delete: ${tenantEmployees.length} results`)
+```
 
 ### Accessing Deleted Items
 
-```typescript
-const { EmployeeEntity: employees } = yield* DynamoClient.make(MainTable)
+```typescript region="deleted-get" example="guide-lifecycle.ts"
+// Access the soft-deleted item directly
+const deleted = yield* db.Employees.deleted.get({ employeeId: "emp-alice" })
+yield* Console.log(`Deleted item: ${deleted.displayName} (deletedAt present)`)
+```
 
-// Get a specific deleted item
-const deleted = yield* employees.deleted.get({ employeeId: "emp-alice" })
-// DeletedEntity<Entity.Record<typeof EmployeeEntity>>
-// { ...employee, deletedAt: DateTime.Utc }
-
-// List all deleted items (most recent deletions first)
-const allDeleted = yield* employees.collect(
-  EmployeeEntity.deleted.list({ employeeId: "emp-alice" }),
+```typescript region="deleted-list" example="guide-lifecycle.ts"
+// List all deleted items in the partition
+const allDeleted = yield* db.Employees.collect(
+  Employees.deleted.list({ employeeId: "emp-alice" }),
   Query.limit(20),
-  Query.reverse,
 )
-// DeletedEntity<Entity.Record<typeof EmployeeEntity>>[]
+yield* Console.log(`Deleted items in partition: ${allDeleted.length}`)
 ```
 
 ### Unique Constraint Policy
@@ -103,10 +154,10 @@ softDelete: { preserveUnique: true }
 
 Restore brings a soft-deleted item back to active status.
 
-```typescript
-const { EmployeeEntity: employees } = yield* DynamoClient.make(MainTable)
-
-yield* employees.restore({ employeeId: "emp-alice" })
+```typescript region="restore" example="guide-lifecycle.ts"
+// Restore the soft-deleted item (version 4) — recomposes all index keys
+const restored = yield* db.Employees.restore({ employeeId: "emp-alice" })
+yield* Console.log(`Restored: ${restored.displayName} (v${v(restored)})`)
 ```
 
 1. Retrieves the soft-deleted item
@@ -115,33 +166,35 @@ yield* employees.restore({ employeeId: "emp-alice" })
 4. Removes `deletedAt`, restores original sort key
 5. Item reappears in all secondary indexes and collections
 
+```typescript region="restore-visible" example="guide-lifecycle.ts"
+// Item is back in GSI queries
+const tenantAfterRestore = yield* db.Employees.collect(
+  Employees.query.byTenant({ tenantId: "t-acme" }),
+)
+yield* Console.log(`Tenant query after restore: ${tenantAfterRestore.length} results`)
+```
+
 ### Error Handling
 
-Restore can fail if unique values were claimed while the item was deleted:
+Restore can fail if unique values were claimed while the item was deleted, or if no deleted item exists:
 
-```typescript
-const { EmployeeEntity: employees } = yield* DynamoClient.make(MainTable)
-
-yield* employees.restore({ employeeId: "emp-alice" }).pipe(
-  Effect.catchTag("UniqueConstraintViolation", (e) =>
-    Effect.fail(new CannotRestore({
-      message: `Cannot restore: ${e.constraint} value "${e.fields[e.constraint]}" is now taken`,
-    }))
-  ),
-  Effect.catchTag("ItemNotFound", () =>
-    Effect.fail(new NotInRecycleBin({ employeeId: "emp-alice" }))
-  ),
+```typescript region="restore-error" example="guide-lifecycle.ts"
+// Attempting to restore a non-existent deleted item
+const restoreResult = yield* db.Employees.restore({ employeeId: "emp-nobody" }).pipe(
+  Effect.map(() => "restored" as const),
+  Effect.catchTag("ItemNotFound", () => Effect.succeed("not-in-recycle-bin" as const)),
 )
+yield* Console.log(`\nRestore non-existent: ${restoreResult}`)
 ```
 
 ## Purge
 
 Purge permanently removes an item and all associated data. This is irreversible.
 
-```typescript
-const { EmployeeEntity: employees } = yield* DynamoClient.make(MainTable)
-
-yield* employees.purge({ employeeId: "emp-alice" })
+```typescript region="purge" example="guide-lifecycle.ts"
+// Purge permanently removes the item, all version history, and sentinels
+yield* db.Employees.purge({ employeeId: "emp-bob" })
+yield* Console.log("\nPurged bob — item + version history permanently removed")
 ```
 
 What gets deleted:
@@ -168,29 +221,32 @@ When `versioned: { retain: true }` is configured, every mutation stores a snapsh
 ### Storage Pattern
 
 ```
-PK: $myapp#v1#employee#emp-alice  SK: $myapp#v1#employee            ← current (v4)
-PK: $myapp#v1#employee#emp-alice  SK: $myapp#v1#employee#v#0000001  ← snapshot v1
-PK: $myapp#v1#employee#emp-alice  SK: $myapp#v1#employee#v#0000002  ← snapshot v2
-PK: $myapp#v1#employee#emp-alice  SK: $myapp#v1#employee#v#0000003  ← snapshot v3
+PK: $lifecycle#v1#employee#emp-alice  SK: $lifecycle#v1#employee            ← current (v4)
+PK: $lifecycle#v1#employee#emp-alice  SK: $lifecycle#v1#employee#v#0000001  ← snapshot v1
+PK: $lifecycle#v1#employee#emp-alice  SK: $lifecycle#v1#employee#v#0000002  ← snapshot v2
+PK: $lifecycle#v1#employee#emp-alice  SK: $lifecycle#v1#employee#v#0000003  ← snapshot v3
 ```
 
 All versions share the same partition key — single-partition operations for efficient access.
 
 ### Querying Version History
 
-```typescript
-const { EmployeeEntity: employees } = yield* DynamoClient.make(MainTable)
+```typescript region="get-version" example="guide-lifecycle.ts"
+// Get a specific version snapshot
+const v1 = yield* db.Employees.getVersion({ employeeId: "emp-alice" }, 1)
+yield* Console.log(`\nVersion 1: ${v1.displayName} (v${v(v1)})`)
+```
 
-// Get a specific version
-const v2 = yield* employees.getVersion({ employeeId: "emp-alice" }, 2)
-
+```typescript region="version-history" example="guide-lifecycle.ts"
 // Browse version history (most recent first)
-const history = yield* employees.collect(
-  EmployeeEntity.versions({ employeeId: "emp-alice" }),
-  Query.limit(10),
+const history = yield* db.Employees.collect(
+  Employees.versions({ employeeId: "emp-alice" }),
   Query.reverse,
 )
-// [v3, v2, v1]  ← most recent first
+yield* Console.log(`\nVersion history (${history.length} snapshots):`)
+for (const snapshot of history) {
+  yield* Console.log(`  v${v(snapshot)}: ${snapshot.displayName}`)
+}
 ```
 
 ### TTL on Snapshots
@@ -217,10 +273,9 @@ When both features are enabled, delete and restore are **versioned events**. The
 
 ```
 v1: created    { email: "alice@acme.com", displayName: "Alice" }
-v2: updated    { email: "alice@acme.com", displayName: "Alice B" }
-v3: deleted    { email: "alice@acme.com", displayName: "Alice B", _deleted: true }
-v4: restored   { email: "alice@acme.com", displayName: "Alice B" }
-v5: updated    { email: "alice@acme.com", displayName: "Alice Baker" }
+v2: updated    { email: "alice@acme.com", displayName: "Alice Baker" }
+v3: deleted    { email: "alice@acme.com", displayName: "Alice Baker", _deleted: true }
+v4: restored   { email: "alice@acme.com", displayName: "Alice Baker" }
 ```
 
 This provides a complete audit trail of the entity's lifecycle.
@@ -244,57 +299,81 @@ DynamoDB limits transactions to 100 items. Plan accordingly.
 
 ## Complete Example
 
-```typescript
-import { Effect, Duration, Layer } from "effect"
-import { Entity, Query, DynamoClient } from "effect-dynamodb"
+The model and entity definition:
 
+```typescript title="models.ts" region="model" example="guide-lifecycle.ts"
+class Employee extends Schema.Class<Employee>("Employee")({
+  employeeId: Schema.String,
+  tenantId: Schema.String,
+  email: Schema.String,
+  displayName: Schema.NonEmptyString,
+  department: Schema.String,
+}) {}
+
+const EmployeeModel = DynamoModel.configure(Employee, {
+  tenantId: { immutable: true },
+})
+```
+
+The full program demonstrating create, update, soft delete, restore, version history, and purge:
+
+```typescript title="main.ts"
 const program = Effect.gen(function* () {
-  const { EmployeeEntity: employees } = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make(MainTable)
 
   // Create (version 1)
-  const alice = yield* employees.put({
+  const alice = yield* db.Employees.put({
     employeeId: "emp-alice",
     tenantId: "t-acme",
     email: "alice@acme.com",
     displayName: "Alice",
     department: "Engineering",
-    hireDate: DateTime.unsafeMake("2024-01-15"),
-    createdBy: "admin",
   })
-  // alice.version === 1
 
   // Update (version 2)
-  yield* employees.update({ employeeId: "emp-alice" }, Entity.set({ displayName: "Alice Baker" }))
+  yield* db.Employees.update(
+    { employeeId: "emp-alice" },
+    Entity.set({ displayName: "Alice Baker", department: "Engineering", tenantId: "t-acme" }),
+  )
 
   // Soft delete (version 3)
-  yield* employees.delete({ employeeId: "emp-alice" })
+  yield* db.Employees.delete({ employeeId: "emp-alice" })
 
   // Not found via normal get
-  // yield* employees.get({ employeeId: "emp-alice" })  // ItemNotFound!
+  // yield* db.Employees.get({ employeeId: "emp-alice" })  // ItemNotFound!
 
   // Found via deleted access
-  const deleted = yield* employees.deleted.get({ employeeId: "emp-alice" })
-  // deleted.deletedAt is defined
+  const deleted = yield* db.Employees.deleted.get({ employeeId: "emp-alice" })
 
   // Restore (version 4)
-  const restored = yield* employees.restore({ employeeId: "emp-alice" })
-  // restored.version === 4
+  const restored = yield* db.Employees.restore({ employeeId: "emp-alice" })
 
   // View full version history
-  const history = yield* employees.collect(
-    EmployeeEntity.versions({ employeeId: "emp-alice" }),
+  const history = yield* db.Employees.collect(
+    Employees.versions({ employeeId: "emp-alice" }),
     Query.reverse,
   )
   // [v3 (deleted), v2 (updated), v1 (created)]
 })
+```
 
-const main = program.pipe(
-  Effect.provide(
-    Layer.mergeAll(
-      DynamoClient.layer({ region: "us-east-1" }),
-      MainTable.layer({ name: "Main" }),
-    )
-  )
+Provide dependencies and run:
+
+```typescript title="main.ts" region="run" example="guide-lifecycle.ts"
+const AppLayer = Layer.mergeAll(
+  DynamoClient.layer({
+    region: "us-east-1",
+    endpoint: "http://localhost:8000",
+    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  }),
+  MainTable.layer({ name: "lifecycle-table" }),
+)
+
+const main = program.pipe(Effect.provide(AppLayer))
+
+Effect.runPromise(main).then(
+  () => console.log("\nDone."),
+  (err) => console.error("\nFailed:", err),
 )
 ```
 

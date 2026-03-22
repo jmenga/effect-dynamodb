@@ -108,6 +108,8 @@ function normalize(content: string): string {
   return lines
     // Remove assert/assertEq lines (test infrastructure, not doc content)
     .filter((line) => !line.trim().startsWith("assertEq(") && !line.trim().startsWith("assert("))
+    // Remove nested #region/#endregion markers
+    .filter((line) => !line.trim().match(/^\/\/\s*#(end)?region/))
     // Normalize indentation: trim all leading whitespace per line
     .map((line) => line.trimStart())
     .join("\n")

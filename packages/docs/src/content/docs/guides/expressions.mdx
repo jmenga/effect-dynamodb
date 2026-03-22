@@ -35,14 +35,12 @@ The callback receives two arguments:
 - `t` — a `PathBuilder` proxy for type-safe attribute access
 - `ops` — comparison and logical operators that return `Expr` nodes
 
-```typescript
+```typescript region="condition-callback" example="guide-expressions.ts"
 // Single comparison
 Products.condition((t, { eq }) => eq(t.status, "active"))
 
 // Multiple conditions with AND
-Products.condition((t, { eq, gt, and }) =>
-  and(eq(t.status, "active"), gt(t.stock, 0)),
-)
+Products.condition((t, { eq, gt, and }) => and(eq(t.status, "active"), gt(t.stock, 0)))
 
 // Nested path
 Products.condition((t, { eq }) => eq(t.address.city, "NYC"))
@@ -61,21 +59,31 @@ Products.condition((t, { or, not, eq }) =>
 
 Apply the condition as a combinator on put, update, or delete:
 
-```typescript
+```typescript region="condition-on-operations" example="guide-expressions.ts"
 // On put
-yield* products.put(input, Products.condition((t, { eq }) => eq(t.status, "active")))
+yield* db.Products.put(
+  {
+    ...baseProduct,
+    productId: "p-5",
+    name: "New Product",
+    category: "electronics",
+    price: 49.99,
+    stock: 10,
+  },
+  Products.condition((t, { notExists }) => notExists(t.productId)),
+)
 
 // On update (ANDed with optimistic lock)
-yield* products.update(
-  { id },
-  Products.set({ name: "New Name" }),
-  Products.expectedVersion(3),
+yield* db.Products.update(
+  { productId: "p-1" },
+  Products.set({ name: "Widget Pro" }),
+  Products.expectedVersion(1),
   Products.condition((t, { gt }) => gt(t.stock, 0)),
 )
 
 // On delete
-yield* products.delete(
-  { id },
+yield* db.Products.delete(
+  { productId: "p-4" },
   Products.condition((t, { eq }) => eq(t.stock, 0)),
 )
 ```
@@ -84,7 +92,7 @@ yield* products.delete(
 
 For simple equality-only conditions, pass a plain object. Each key-value pair becomes an `=` comparison, all ANDed together:
 
-```typescript
+```typescript region="condition-shorthand" example="guide-expressions.ts"
 // Equivalent to: eq(t.status, "active") AND eq(t.role, "admin")
 Products.condition({ status: "active", role: "admin" })
 ```
@@ -134,31 +142,29 @@ Filter expressions narrow query and scan results **after** items are read from d
 
 `Entity.filter()` works identically to `Entity.condition()` but returns a `Query` combinator:
 
-```typescript
+```typescript region="filter-callback" example="guide-expressions.ts"
 // Filter on query
-yield* products.collect(
+const expensive = yield* db.Products.collect(
   Products.query.byCategory({ category: "electronics" }),
   Products.filter((t, { gt }) => gt(t.price, 30)),
 )
 
 // Filter on scan
-yield* products.collect(
+const withWidget = yield* db.Products.collect(
   Products.scan(),
   Products.filter((t, { contains }) => contains(t.name, "Widget")),
 )
 
 // Complex filter with OR
-yield* products.collect(
+const activeOrPending = yield* db.Products.collect(
   Products.scan(),
-  Products.filter((t, { or, eq }) =>
-    or(eq(t.status, "active"), eq(t.status, "pending")),
-  ),
+  Products.filter((t, { or, eq }) => or(eq(t.status, "active"), eq(t.status, "pending"))),
 )
 ```
 
 ### Shorthand Syntax
 
-```typescript
+```typescript region="filter-shorthand" example="guide-expressions.ts"
 Products.filter({ status: "active" })
 Products.filter({ category: "electronics", inStock: true })
 ```
@@ -173,25 +179,28 @@ Update expressions describe how to modify item attributes. DynamoDB supports fou
 
 These accept plain objects with field names — good for top-level attribute updates:
 
-```typescript
+```typescript region="update-record" example="guide-expressions.ts"
 // SET — assign values
-yield* products.update({ id }, Entity.set({ name: "New Name", price: 29.99 }))
+yield* db.Products.update(
+  { productId: "p-1" },
+  Entity.set({ name: "Widget Deluxe", price: 34.99 }),
+)
 
 // REMOVE — delete attributes
-yield* products.update({ id }, Entity.remove(["description", "tempFlag"]))
+yield* db.Products.update({ productId: "p-4" }, Entity.remove(["description", "temporaryFlag"]))
 
 // ADD — atomic increment (numbers) or union (sets)
-yield* products.update({ id }, Entity.add({ viewCount: 1, stock: 50 }))
+yield* db.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1, stock: 50 }))
 
 // Subtract — SET field = field - value
-yield* products.update({ id }, Entity.subtract({ stock: 3 }))
+yield* db.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
 
 // Append — SET field = list_append(field, value)
-yield* products.update({ id }, Entity.append({ tags: ["on-sale", "featured"] }))
+yield* db.Products.update({ productId: "p-1" }, Entity.append({ tags: ["on-sale", "featured"] }))
 
 // DELETE — remove elements from a set
-yield* products.update(
-  { id },
+yield* db.Products.update(
+  { productId: "p-4" },
   Entity.deleteFromSet({ categories: new Set(["obsolete"]) }),
 )
 ```
@@ -200,59 +209,57 @@ yield* products.update(
 
 All combinators compose as variadic arguments to `update()`. They compile to a single `UpdateExpression` with the appropriate SET, REMOVE, ADD, and DELETE clauses:
 
-```typescript
-yield* products.update(
-  { id },
+```typescript region="update-composed" example="guide-expressions.ts"
+yield* db.Products.update(
+  { productId: "p-1" },
   Entity.set({ name: "Updated Widget", price: 24.99 }),
   Entity.add({ viewCount: 1 }),
   Entity.subtract({ stock: 3 }),
   Entity.append({ tags: ["clearance"] }),
   Entity.remove(["temporaryFlag"]),
-  Entity.expectedVersion(5),
+  Products.expectedVersion(5),
 )
 ```
 
 ### Path-Based Combinators
 
-For nested attributes, array elements, and attribute-to-attribute operations, use the path-based combinators with `Entity.pathSet()`, `Entity.pathRemove()`, etc.:
+For nested attributes, array elements, and attribute-to-attribute operations, use the path-based combinators. These take the update operation as the first argument, so wrap them in a lambda when passing as a combinator to `update()`:
 
-```typescript
+```typescript region="update-path" example="guide-expressions.ts"
 // SET nested path
-yield* products.update({ id }, Entity.pathSet({
-  segments: ["address", "city"],
-  value: "NYC",
-  isPath: false,
-}))
+yield* db.Products.update({ productId: "p-1" }, (op) =>
+  Entity.pathSet(op, { segments: ["address", "city"], value: "NYC", isPath: false }),
+)
 
 // SET array element
-yield* products.update({ id }, Entity.pathSet({
-  segments: ["roster", 0, "position"],
-  value: "captain",
-  isPath: false,
-}))
+yield* db.Products.update({ productId: "p-1" }, (op) =>
+  Entity.pathSet(op, { segments: ["roster", 0, "position"], value: "captain", isPath: false }),
+)
 
 // Copy attribute to attribute
-yield* products.update({ id }, Entity.pathSet({
-  segments: ["backup_email"],
-  value: undefined,
-  isPath: true,
-  valueSegments: ["email"],
-}))
+yield* db.Products.update({ productId: "p-1" }, (op) =>
+  Entity.pathSet(op, {
+    segments: ["backup_email"],
+    value: undefined,
+    isPath: true,
+    valueSegments: ["email"],
+  }),
+)
 
 // REMOVE nested attribute
-yield* products.update({ id }, Entity.pathRemove(["metadata", "temporary"]))
+yield* db.Products.update({ productId: "p-1" }, (op) =>
+  Entity.pathRemove(op, ["metadata", "temporary"]),
+)
 
 // PREPEND to list
-yield* products.update({ id }, Entity.pathPrepend({
-  segments: ["tags"],
-  value: ["URGENT"],
-}))
+yield* db.Products.update({ productId: "p-1" }, (op) =>
+  Entity.pathPrepend(op, { segments: ["tags"], value: ["URGENT"] }),
+)
 
 // if_not_exists — set only if the attribute doesn't exist
-yield* products.update({ id }, Entity.pathIfNotExists({
-  segments: ["createdBy"],
-  value: "system",
-}))
+yield* db.Products.update({ productId: "p-1" }, (op) =>
+  Entity.pathIfNotExists(op, { segments: ["createdBy"], value: "system" }),
+)
 ```
 
 ### Update Expression Reference
@@ -350,7 +357,7 @@ Projections select which attributes DynamoDB returns, reducing network transfer.
 
 `Entity.select()` uses the same `PathBuilder` proxy as condition/filter expressions:
 
-```typescript
+```typescript region="select-callback" example="guide-expressions.ts"
 // Top-level fields
 Products.select((t) => [t.name, t.status])
 
@@ -366,15 +373,15 @@ Products.select((t) => [t.name, t.address.city, t.tags.at(0)])
 
 Apply as a combinator on queries and scans:
 
-```typescript
+```typescript region="select-on-queries" example="guide-expressions.ts"
 // Project on query
-yield* products.collect(
+const projected = yield* db.Products.collect(
   Products.query.byCategory({ category: "electronics" }),
   Products.select((t) => [t.name, t.price]),
 )
 
 // Project on scan
-yield* products.collect(
+const scanned = yield* db.Products.collect(
   Products.scan(),
   Products.select((t) => [t.name, t.status]),
 )
@@ -384,7 +391,7 @@ yield* products.collect(
 
 For top-level-only projections:
 
-```typescript
+```typescript region="select-shorthand" example="guide-expressions.ts"
 Products.select(["name", "status", "price"])
 ```
 
@@ -398,8 +405,8 @@ Products.select(["name", "status", "price"])
 
 The `PathBuilder` is a recursive `Proxy` that tracks attribute path segments as you access properties. It is the first argument in all callback-style expression builders.
 
-```typescript
-// t is PathBuilder<Team, Team>
+```typescript region="pathbuilder" example="guide-expressions.ts"
+// t is PathBuilder<Product, Product>
 Products.condition((t, ops) => {
   // t.name        → Path with segments ["name"]
   // t.address.city → Path with segments ["address", "city"]

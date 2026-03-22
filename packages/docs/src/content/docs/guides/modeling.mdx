@@ -9,17 +9,15 @@ This guide covers how to define domain models, application schemas, tables, and 
 
 Models use standard Effect Schema definitions — `Schema.Class` for class instances or `Schema.Struct` for plain objects. They contain only domain fields — no DynamoDB concepts, no key composition, no timestamps.
 
-```typescript
-import { Schema } from "effect"
-
+```typescript region="model" example="guide-modeling.ts"
 class Employee extends Schema.Class<Employee>("Employee")({
-  employeeId:  Schema.String.pipe(Schema.brand("EmployeeId")),
-  tenantId:    Schema.String.pipe(Schema.brand("TenantId")),
-  email:       Schema.String,
+  employeeId: Schema.String.pipe(Schema.brand("EmployeeId")),
+  tenantId: Schema.String.pipe(Schema.brand("TenantId")),
+  email: Schema.String,
   displayName: Schema.NonEmptyString,
-  department:  Schema.String,
-  hireDate:    Schema.DateTimeUtcFromString,
-  createdBy:   Schema.String,
+  department: Schema.String,
+  hireDate: Schema.DateTimeUtcFromString,
+  createdBy: Schema.String,
 }) {}
 ```
 
@@ -29,12 +27,12 @@ Models are portable. The same `Employee` schema can be used with DynamoDB, SQL, 
 
 `DynamoModel.configure` layers DynamoDB-specific overrides onto a pure domain model. The model stays clean — infrastructure details like field renaming, storage encoding, and immutability are declared separately.
 
-```typescript
-import { DynamoModel } from "effect-dynamodb"
-
+```typescript region="configure" example="guide-modeling.ts"
 const EmployeeModel = DynamoModel.configure(Employee, {
   createdBy: { immutable: true },
-  hireDate:  { field: "hd", storedAs: DynamoModel.DateEpochSeconds },
+  hireDate: { field: "hd", storedAs: DynamoModel.DateEpochSeconds },
+  displayName: { field: "dn" },
+  employeeId: { identifier: true },
 })
 ```
 
@@ -117,13 +115,11 @@ const EmployeeModel = DynamoModel.configure(Employee, {
 
 `DynamoSchema` defines the application-level namespace that prefixes every generated key.
 
-```typescript
-import { DynamoSchema } from "effect-dynamodb"
-
+```typescript region="schema" example="guide-modeling.ts"
 const AppSchema = DynamoSchema.make({
   name: "projmgmt",
   version: 1,
-  casing: "lowercase",  // default
+  casing: "lowercase",
 })
 ```
 
@@ -168,12 +164,10 @@ Casing applies to **structural parts** of generated keys: schema name, version p
 
 ## Declaring the Physical Table
 
-`Table` declares the physical DynamoDB table: name, primary key structure, and secondary indexes.
+`Table` declares the physical DynamoDB table and registers the entities that share it.
 
-```typescript
-import { Table } from "effect-dynamodb"
-
-const MainTable = Table.make({ schema: AppSchema })
+```typescript region="table" example="guide-modeling.ts"
+const MainTable = Table.make({ schema: AppSchema, entities: { Employees } })
 ```
 
 The Table owns "what exists physically." The Entity owns "how I use it." Multiple entities can share the same table (single-table design).
@@ -183,6 +177,8 @@ The Table owns "what exists physically." The Entity owns "how I use it." Multipl
 | Property | Type | Description |
 |----------|------|-------------|
 | `schema` | `DynamoSchema` | Application schema for key prefixing |
+| `entities` | `Record<string, Entity>` | Named entities registered on this table |
+| `aggregates` | `Record<string, Aggregate>` | Named aggregates registered on this table (optional) |
 
 The physical table name is provided at runtime via `MainTable.layer({ name: "ProjectManagement" })`. See [Advanced](/effect-dynamodb/guides/advanced/) for configuration details.
 
@@ -194,11 +190,8 @@ The Entity binds a model to a table. It defines:
 - **Unique constraints** — Field-level uniqueness enforcement
 - **Collections** — Cross-entity query groups
 
-```typescript
-import { Duration } from "effect"
-import { Entity } from "effect-dynamodb"
-
-const EmployeeEntity = Entity.make({
+```typescript region="entity" example="guide-modeling.ts"
+const Employees = Entity.make({
   model: EmployeeModel,
   entityType: "Employee",
   indexes: {
@@ -288,29 +281,29 @@ See [Data Integrity](/effect-dynamodb/guides/data-integrity/) for details.
 Seven types are automatically derived from your Model + Table + Entity declarations. No manual type maintenance required.
 
 ```typescript
-// Given EmployeeEntity with timestamps: true, versioned: true
+// Given Employees with timestamps: true, versioned: true
 
-Entity.Model<typeof EmployeeEntity>
+Entity.Model<typeof Employees>
 // { employeeId, tenantId, email, displayName, department, hireDate, createdBy }
 
-Entity.Record<typeof EmployeeEntity>
+Entity.Record<typeof Employees>
 // Model + { version, createdAt, updatedAt }
 
-Entity.Input<typeof EmployeeEntity>
+Entity.Input<typeof Employees>
 // { employeeId, tenantId, email, displayName, department, hireDate, createdBy }
 
-Entity.Update<typeof EmployeeEntity>
+Entity.Update<typeof Employees>
 // { email?, displayName?, department?, hireDate? }
 // (employeeId, tenantId excluded — primary key composites)
 // (createdBy excluded — immutable: true in DynamoModel.configure)
 
-Entity.Key<typeof EmployeeEntity>
+Entity.Key<typeof Employees>
 // { employeeId }
 
-Entity.Item<typeof EmployeeEntity>
+Entity.Item<typeof Employees>
 // All physical DynamoDB attributes (pk, sk, gsi1pk, gsi1sk, __edd_e__, ...)
 
-Entity.Marshalled<typeof EmployeeEntity>
+Entity.Marshalled<typeof Employees>
 // DynamoDB AttributeValue format ({ pk: { S: "..." }, ... })
 ```
 
@@ -334,10 +327,10 @@ For consuming raw DynamoDB data (e.g., DynamoDB Streams):
 
 ```typescript
 // Decode an unmarshalled DynamoDB item to a Record
-Entity.itemSchema(EmployeeEntity)
+Entity.itemSchema(Employees)
 
 // Decode a marshalled (AttributeValue) DynamoDB item to a Record
-Entity.decodeMarshalledItem(EmployeeEntity, marshalledItem)
+Entity.decodeMarshalledItem(Employees, marshalledItem)
 ```
 
 See [DynamoDB Streams](/effect-dynamodb/guides/streams/) for usage.

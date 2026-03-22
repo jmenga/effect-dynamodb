@@ -9,8 +9,8 @@ This guide covers how to define access patterns using indexes, how key generatio
 
 Indexes are defined on the Entity using an ElectroDB-style declaration. Each index has a **logical name** (used in code) that maps to a **physical index** (on the DynamoDB table).
 
-```typescript
-const TaskEntity = Entity.make({
+```typescript region="task-entity" example="guide-indexes.ts"
+const Tasks = Entity.make({
   model: Task,
   entityType: "Task",
   indexes: {
@@ -21,7 +21,7 @@ const TaskEntity = Entity.make({
     byProject: {
       index: "gsi1",
       pk: { field: "gsi1pk", composite: ["projectId"] },
-      sk: { field: "gsi1sk", composite: ["status", "createdAt"] },
+      sk: { field: "gsi1sk", composite: ["priority"] },
     },
     byAssignee: {
       index: "gsi2",
@@ -29,6 +29,7 @@ const TaskEntity = Entity.make({
       sk: { field: "gsi2sk", composite: ["priority"] },
     },
   },
+  timestamps: true,
 })
 ```
 
@@ -36,14 +37,14 @@ const TaskEntity = Entity.make({
 
 ```typescript
 byProject: {
-  index: "gsi1",                          // Physical GSI name (omit for primary)
+  index: "gsi1",                       // Physical GSI name (omit for primary)
   pk: {
-    field: "gsi1pk",                       // Physical DynamoDB attribute
-    composite: ["projectId"],              // Model attributes → partition key
+    field: "gsi1pk",                    // Physical DynamoDB attribute
+    composite: ["projectId"],           // Model attributes → partition key
   },
   sk: {
     field: "gsi1sk",
-    composite: ["status", "createdAt"],    // Model attributes → sort key
+    composite: ["priority"],            // Model attributes → sort key
   },
 }
 ```
@@ -63,9 +64,11 @@ byProject: {
 
 The logical index name becomes a query accessor on the Entity:
 
-```typescript
-TaskEntity.query.byProject({ projectId: "proj-alpha" })   // uses gsi1
-TaskEntity.query.byAssignee({ assigneeId: "emp-alice" })  // uses gsi2
+```typescript region="query-accessors" example="guide-indexes.ts"
+// Logical names become query accessors — no physical index names in code
+const alphaTasks = yield* basic.Tasks.collect(Tasks.query.byProject({ projectId: "proj-alpha" }))
+
+const aliceTasks = yield* basic.Tasks.collect(Tasks.query.byAssignee({ assigneeId: "emp-alice" }))
 ```
 
 You never reference physical index names (`gsi1`, `gsi2`) in application code.
@@ -133,31 +136,50 @@ Collections group multiple entity types that share a partition key, enabling cro
 
 Each entity owns its sort key prefix. Collection queries use only the partition key — no sort key condition.
 
-```typescript
-const EmployeeEntity = Entity.make({
-  // ...
+```typescript region="isolated-entities" example="guide-indexes.ts"
+const IsolatedEmployees = Entity.make({
+  model: Employee,
+  entityType: "Employee",
   indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["employeeId"] },
+      sk: { field: "sk", composite: [] },
+    },
     byDepartment: {
       index: "gsi1",
       collection: "DepartmentStaff",
       type: "isolated",
-      pk: { field: "gsi1pk", composite: ["departmentId"] },
+      pk: { field: "gsi1pk", composite: ["department"] },
       sk: { field: "gsi1sk", composite: ["hireDate"] },
     },
   },
+  timestamps: true,
 })
 
-const EquipmentEntity = Entity.make({
-  // ...
+class Equipment extends Schema.Class<Equipment>("Equipment")({
+  equipmentId: Schema.String,
+  department: Schema.String,
+  name: Schema.String,
+  purchaseDate: Schema.String,
+}) {}
+
+const Equipments = Entity.make({
+  model: Equipment,
+  entityType: "Equipment",
   indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["equipmentId"] },
+      sk: { field: "sk", composite: [] },
+    },
     byDepartment: {
       index: "gsi1",
       collection: "DepartmentStaff",
       type: "isolated",
-      pk: { field: "gsi1pk", composite: ["departmentId"] },
+      pk: { field: "gsi1pk", composite: ["department"] },
       sk: { field: "gsi1sk", composite: ["purchaseDate"] },
     },
   },
+  timestamps: true,
 })
 ```
 
@@ -181,23 +203,34 @@ $myapp#v1#equipment_1#2023-06-01    ← Equipment entity owns its SK
 
 The collection name sits at the top of every entity's sort key. All entities share this prefix.
 
-```typescript
-const EmployeeEntity = Entity.make({
-  // ...
+```typescript region="clustered-entities" example="guide-indexes.ts"
+const ClusteredEmployees = Entity.make({
+  model: Employee,
+  entityType: "Employee",
   indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["employeeId"] },
+      sk: { field: "sk", composite: [] },
+    },
     byTenant: {
       index: "gsi1",
       collection: "TenantMembers",
-      type: "clustered",   // default
+      type: "clustered",
       pk: { field: "gsi1pk", composite: ["tenantId"] },
       sk: { field: "gsi1sk", composite: ["department", "hireDate"] },
     },
   },
+  timestamps: true,
 })
 
-const TaskEntity = Entity.make({
-  // ...
+const ClusteredTasks = Entity.make({
+  model: Task,
+  entityType: "Task",
   indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["taskId"] },
+      sk: { field: "sk", composite: [] },
+    },
     byTenant: {
       index: "gsi1",
       collection: "TenantMembers",
@@ -206,6 +239,7 @@ const TaskEntity = Entity.make({
       sk: { field: "gsi1sk", composite: ["projectId", "taskId"] },
     },
   },
+  timestamps: true,
 })
 ```
 
@@ -232,44 +266,62 @@ collection prefix (shared)
 
 Sub-collections create a hierarchy within the sort key. An entity joins multiple collections by declaring an array:
 
-```typescript
-const EmployeeEntity = Entity.make({
-  // ...
+```typescript region="subcollection-entities" example="guide-indexes.ts"
+const SubEmployee = Entity.make({
+  model: Employee,
+  entityType: "Employee",
   indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["employeeId"] },
+      sk: { field: "sk", composite: [] },
+    },
     byEmployee: {
       index: "gsi2",
-      collection: "contributions",  // top-level only
+      collection: "contributions",
       type: "clustered",
       pk: { field: "gsi2pk", composite: ["employeeId"] },
-      sk: { field: "gsi2sk", composite: ["departmentId"] },
+      sk: { field: "gsi2sk", composite: ["department"] },
     },
   },
+  timestamps: true,
 })
 
-const TaskEntity = Entity.make({
-  // ...
+const SubTasks = Entity.make({
+  model: Task,
+  entityType: "Task",
   indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["taskId"] },
+      sk: { field: "sk", composite: [] },
+    },
     byAssignee: {
       index: "gsi2",
-      collection: ["contributions", "assignments"],  // sub-collection
+      collection: ["contributions", "assignments"],
       type: "clustered",
-      pk: { field: "gsi2pk", composite: ["employeeId"] },
+      pk: { field: "gsi2pk", composite: ["assigneeId"] },
       sk: { field: "gsi2sk", composite: ["projectId", "taskId"] },
     },
   },
+  timestamps: true,
 })
 
-const ProjectMemberEntity = Entity.make({
-  // ...
+const SubProjectMembers = Entity.make({
+  model: ProjectMember,
+  entityType: "ProjectMember",
   indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["employeeId", "projectId"] },
+      sk: { field: "sk", composite: [] },
+    },
     byMember: {
       index: "gsi2",
-      collection: ["contributions", "assignments"],  // same sub-collection
+      collection: ["contributions", "assignments"],
       type: "clustered",
       pk: { field: "gsi2pk", composite: ["employeeId"] },
       sk: { field: "gsi2sk", composite: ["projectId"] },
     },
   },
+  timestamps: true,
 })
 ```
 
@@ -278,10 +330,10 @@ const ProjectMemberEntity = Entity.make({
 ```
 $contributions
 ├── #assignments
-│   ├── #projectmembers_1#pid_alpha
-│   ├── #tasks_1#pid_alpha#tid_write-api
-│   └── #tasks_1#pid_beta#tid_design-db
-└── #employees_1#dept_engineering
+│   ├── #projectmembers_1#proj-alpha
+│   ├── #tasks_1#proj-alpha#t-001
+│   └── #tasks_1#proj-beta#t-002
+└── #employees_1#engineering
 ```
 
 **Query at any depth:**
@@ -294,24 +346,26 @@ $contributions
 
 ### Defining Collections
 
-```typescript
-import { Collection } from "effect-dynamodb"
-
-const TenantMembers = Collection.make("TenantMembers", {
-  employees: EmployeeEntity,
-  tasks: TaskEntity,
+```typescript region="collection-make" example="guide-indexes.ts"
+const DepartmentStaff = Collection.make("DepartmentStaff", {
+  employees: IsolatedEmployees,
+  equipments: Equipments,
 })
 
-// Sub-collection hierarchy
+const TenantMembers = Collection.make("TenantMembers", {
+  employees: ClusteredEmployees,
+  tasks: ClusteredTasks,
+})
+
 const Contributions = Collection.make("contributions", {
-  employees: EmployeeEntity,
-  tasks: TaskEntity,
-  projectMembers: ProjectMemberEntity,
+  employees: SubEmployee,
+  tasks: SubTasks,
+  projectMembers: SubProjectMembers,
 })
 
 const Assignments = Collection.make("assignments", {
-  tasks: TaskEntity,
-  projectMembers: ProjectMemberEntity,
+  tasks: SubTasks,
+  projectMembers: SubProjectMembers,
 })
 ```
 
