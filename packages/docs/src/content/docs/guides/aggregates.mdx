@@ -274,18 +274,8 @@ Discriminator values are stored on each member item in DynamoDB and used during 
 
 Fetch all items in the partition via a collection query, then assemble them into the domain object:
 
-```typescript
-import { DynamoClient } from "effect-dynamodb"
-
-const { MatchAggregate: matches } = yield* DynamoClient.make(MainTable)
-
-const match = yield* matches.get({ id: "bgt-2025-test-1" })
-// match: Match — fully assembled domain object
-
-console.log(match.name)                         // "AUS vs IND, 1st Test"
-console.log(match.venue.name)                   // "Melbourne Cricket Ground"
-console.log(match.team1.team.name)              // "Australia"
-console.log(match.team1.players[0].player.role) // "bowler"
+```typescript region="aggregate-get" example="guide-aggregates.ts"
+const fetched = yield* MatchAggregate.get({ id: "bgt-2025-test-1" })
 ```
 
 Assembly works by:
@@ -300,10 +290,8 @@ Returns `AggregateAssemblyError` if the collection query returns incomplete or u
 
 Create a new aggregate from input data. Ref fields accept IDs (not full objects):
 
-```typescript
-const { MatchAggregate: matches } = yield* DynamoClient.make(MainTable)
-
-const match = yield* matches.create({
+```typescript region="aggregate-create" example="guide-aggregates.ts"
+const match = yield* MatchAggregate.create({
   id: "bgt-2025-test-1",
   name: "AUS vs IND, 1st Test",
   venueId: "mcg",
@@ -340,16 +328,14 @@ Returns `RefNotFound` if a ref ID doesn't resolve. Returns `AggregateTransaction
 
 Fetch the current state, apply a mutation function, diff, and write only changed sub-aggregate groups:
 
-```typescript
-const { MatchAggregate: matches } = yield* DynamoClient.make(MainTable)
-
-const updated = yield* matches.update(
+```typescript region="aggregate-update-spread" example="guide-aggregates.ts"
+const updated = yield* MatchAggregate.update(
   { id: "bgt-2025-test-1" },
   (current) => ({
-    ...current,
+    ...current.state,
     team1: {
-      ...current.team1,
-      players: current.team1.players.map((ps) => ({
+      ...current.state.team1,
+      players: current.state.team1.players.map((ps) => ({
         ...ps,
         isCaptain: ps.player.lastName === "Smith",
       })),
@@ -371,14 +357,12 @@ The update operation:
 
 The mutation function receives a single `UpdateContext` object with tools for composable, type-safe immutable updates:
 
-```typescript
-const { MatchAggregate: matches } = yield* DynamoClient.make(MainTable)
-
-const updated = yield* matches.update(
+```typescript region="aggregate-update-cursor" example="guide-aggregates.ts"
+const cursorUpdated = yield* MatchAggregate.update(
   { id: "bgt-2025-test-1" },
-  ({ state, cursor }) =>
+  ({ cursor }) =>
     cursor.key("team1").key("players").modify(
-      (players) => players.map(ps => ({ ...ps, isCaptain: ps.player.lastName === "Smith" }))
+      (players) => players.map((ps) => ({ ...ps, isCaptain: ps.player.lastName === "Smith" })),
     ),
 )
 ```
@@ -404,23 +388,18 @@ The `UpdateContext` provides:
 | `cursor.modify(fn)` | Apply a function to the focused value, return updated root |
 
 Simple field update:
-```typescript
-const { MatchAggregate: matches } = yield* DynamoClient.make(MainTable)
-
-// Rename match — cursor.key().replace()
-yield* matches.update(
-  { id: "match-1" },
-  ({ cursor }) => cursor.key("name").replace("New Name"),
+```typescript region="aggregate-update-simple" example="guide-aggregates.ts"
+yield* MatchAggregate.update(
+  { id: "bgt-2025-test-1" },
+  ({ cursor }) => cursor.key("name").replace("AUS vs IND, Boxing Day Test"),
 )
 ```
 
 Using `optic` + `state` (for external lenses):
-```typescript
-const { MatchAggregate: matches } = yield* DynamoClient.make(MainTable)
-
-yield* matches.update(
-  { id: "match-1" },
-  ({ state, optic }) => optic.key("name").replace("New Name", state),
+```typescript region="aggregate-update-optic" example="guide-aggregates.ts"
+yield* MatchAggregate.update(
+  { id: "bgt-2025-test-1" },
+  ({ state, optic }) => optic.key("name").replace("AUS vs IND, 1st Test", state),
 )
 ```
 
@@ -430,10 +409,8 @@ The mutation function can return either a class instance (from spreading `curren
 
 Remove all items in the aggregate's partition:
 
-```typescript
-const { MatchAggregate: matches } = yield* DynamoClient.make(MainTable)
-
-yield* matches.delete({ id: "bgt-2025-test-1" })
+```typescript region="aggregate-delete" example="guide-aggregates.ts"
+yield* MatchAggregate.delete({ id: "bgt-2025-test-1" })
 ```
 
 Queries all items in the partition and batch-deletes them.
@@ -445,9 +422,9 @@ Queries all items in the partition and batch-deletes them.
 | `Aggregate.Type<A>` | The assembled domain type (e.g., `Match`) |
 | `Aggregate.Key<A>` | The partition key type |
 
-```typescript
-type MatchDomain = Aggregate.Type<typeof MatchAggregate>  // Match
-type MatchKey = Aggregate.Key<typeof MatchAggregate>       // { id: string }
+```typescript region="type-extractors" example="guide-aggregates.ts"
+type MatchDomain = Aggregate.Type<typeof MatchAggregate> // Match
+type MatchKey = Aggregate.Key<typeof MatchAggregate> // { id: string }
 ```
 
 ### Error Handling
@@ -459,12 +436,10 @@ type MatchKey = Aggregate.Key<typeof MatchAggregate>       // { id: string }
 | `AggregateTransactionOverflow` | Write path: sub-aggregate exceeds 100-item transaction limit | `aggregate`, `subgraph`, `itemCount`, `limit` |
 | `RefNotFound` | Ref hydration: referenced entity not found | `entity`, `field`, `refEntity`, `refId` |
 
-```typescript
-const { MatchAggregate: matches } = yield* DynamoClient.make(MainTable)
-
-const match = yield* matches.get({ id: "test-1" }).pipe(
+```typescript region="aggregate-error-handling" example="guide-aggregates.ts"
+const result = yield* MatchAggregate.get({ id: "nonexistent" }).pipe(
   Effect.catchTag("AggregateAssemblyError", (e) =>
-    Effect.die(`Assembly failed for ${e.aggregate}: ${e.reason}`)
+    Effect.succeed(`Assembly failed for ${e.aggregate}: ${e.reason}`),
   ),
 )
 ```
@@ -481,12 +456,8 @@ When denormalized data changes at the source (e.g., a player's name is corrected
 
 Attach a cascade to an `EntityUpdate` operation. After the source entity update completes, the cascade finds and updates all target items:
 
-```typescript
-import { Entity, DynamoClient } from "effect-dynamodb"
-
-const { Players: players } = yield* DynamoClient.make(MainTable)
-
-const updatedPlayer = yield* players.update(
+```typescript region="cascade-basic" example="guide-aggregates.ts"
+const updatedPlayer = yield* db.Players.update(
   { id: "smith-01" },
   Entity.set({ firstName: "Steven" }),
   Entity.cascade({ targets: [SquadSelections] }),
@@ -512,10 +483,8 @@ Entity.cascade({
 
 **Eventual (default):** Batch-updates target items. No item limit. Partial failures are possible.
 
-```typescript
-const { Players: players } = yield* DynamoClient.make(MainTable)
-
-yield* players.update(
+```typescript region="cascade-eventual" example="guide-aggregates.ts"
+yield* db.Players.update(
   { id: "smith-01" },
   Entity.set({ firstName: "Steven" }),
   Entity.cascade({ targets: [SquadSelections], mode: "eventual" }),
@@ -524,10 +493,8 @@ yield* players.update(
 
 **Transactional:** Atomic update via `transactWriteItems`. All target items updated in a single transaction. Maximum 100 items.
 
-```typescript
-const { Players: players } = yield* DynamoClient.make(MainTable)
-
-yield* players.update(
+```typescript region="cascade-transactional" example="guide-aggregates.ts"
+yield* db.Players.update(
   { id: "smith-01" },
   Entity.set({ firstName: "Steven" }),
   Entity.cascade({ targets: [SquadSelections], mode: "transactional" }),
@@ -546,9 +513,7 @@ For cascade to work, the target entity must:
 In eventual mode, partial failures return `CascadePartialFailure`:
 
 ```typescript
-const { Players: players } = yield* DynamoClient.make(MainTable)
-
-yield* players.update(
+yield* db.Players.update(
   { id: "smith-01" },
   Entity.set({ firstName: "Steven" }),
   Entity.cascade({ targets: [SquadSelections] }),
@@ -575,9 +540,7 @@ In transactional mode, a failure rolls back the entire cascade (but not the sour
 Cascade to multiple entity types in a single operation:
 
 ```typescript
-const { Players: players } = yield* DynamoClient.make(MainTable)
-
-yield* players.update(
+yield* db.Players.update(
   { id: "smith-01" },
   Entity.set({ firstName: "Steven" }),
   Entity.cascade({ targets: [SquadSelections, MatchPlayers, ContractRecords] }),
@@ -590,11 +553,11 @@ Each target is queried independently. In eventual mode, each target's updates ar
 
 ## Full Example
 
-The [Cricket Match Manager](/effect-dynamodb/tutorials/gamemanager/) tutorial demonstrates all three features in a cricket match domain:
+The code blocks on this page are backed by a runnable example that demonstrates all three features in a cricket match domain:
 
 - **Part 1:** Entity refs — teams, players, coaches, venues as referenced entities; squad selections as the ref consumer
-- **Part 2:** Cascade updates — updating a player name propagates to all squad selections
-- **Part 3:** Aggregate CRUD — creating, reading, updating, and deleting a full match aggregate with sub-aggregates for team sheets
+- **Part 2:** Aggregate CRUD — creating, reading, updating (spread + cursor + optic), and deleting a full match aggregate with sub-aggregates for team sheets
+- **Part 3:** Cascade updates — updating a player name propagates to all squad selections
 
 Run it:
 
@@ -602,7 +565,13 @@ Run it:
 # Start DynamoDB Local
 docker run -p 8000:8000 amazon/dynamodb-local
 
-# Run the example
+# Run the guide example
+npx tsx examples/guide-aggregates.ts
+```
+
+For a more comprehensive example including print output and all lifecycle operations, see:
+
+```bash
 npx tsx examples/cricket.ts
 ```
 

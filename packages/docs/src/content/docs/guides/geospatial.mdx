@@ -27,9 +27,7 @@ pnpm add @effect-dynamodb/geo
 
 The model needs latitude, longitude, and fields for the computed geo values. The geo fields (`cell`, `parentCell`, `timePartition`) are optional because they're computed automatically on write.
 
-```typescript
-import { Schema } from "effect"
-
+```typescript title="models.ts" region="model" example="guide-geospatial.ts"
 class Vehicle extends Schema.Class<Vehicle>("Vehicle")({
   vehicleId: Schema.String,
   latitude: Schema.optional(Schema.Number),
@@ -45,11 +43,8 @@ class Vehicle extends Schema.Class<Vehicle>("Vehicle")({
 
 The geo index uses a GSI where the partition key is composed from `parentCell` + `timePartition` and the sort key from `cell`.
 
-```typescript
-import { DynamoSchema, Table, Entity } from "effect-dynamodb"
-
+```typescript title="entities.ts" region="entity" example="guide-geospatial.ts"
 const AppSchema = DynamoSchema.make({ name: "fleet", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
 
 const Vehicles = Entity.make({
   model: Vehicle,
@@ -67,15 +62,15 @@ const Vehicles = Entity.make({
   },
   timestamps: true,
 })
+
+const MainTable = Table.make({ schema: AppSchema, entities: { Vehicles } })
 ```
 
 ### 3. Create GeoIndex
 
 Bind geo configuration to the entity:
 
-```typescript
-import { GeoIndex } from "@effect-dynamodb/geo"
-
+```typescript region="geo-index" example="guide-geospatial.ts"
 const VehicleGeo = GeoIndex.make({
   entity: Vehicles,
   index: "byCell",
@@ -112,20 +107,16 @@ const VehicleGeo = GeoIndex.make({
 
 After binding with `GeoIndex.bind()`, use `vehicleGeo.put()` instead of the entity's `put()` — it automatically computes and sets the geo fields:
 
-```typescript
-import { GeoIndex } from "@effect-dynamodb/geo"
+```typescript region="put" example="guide-geospatial.ts"
+const vehicleGeo = yield* GeoIndex.bind(VehicleGeo)
 
-const program = Effect.gen(function* () {
-  const vehicleGeo = yield* GeoIndex.bind(VehicleGeo)
-
-  yield* vehicleGeo.put({
-    vehicleId: "v-1",
-    latitude: 37.7749,
-    longitude: -122.4194,
-    timestamp: Date.now(),
-  })
-  // cell, parentCell, and timePartition are computed automatically
+yield* vehicleGeo.put({
+  vehicleId: "v-1",
+  latitude: 37.7749,
+  longitude: -122.4194,
+  timestamp: now,
 })
+// cell, parentCell, and timePartition are computed automatically
 ```
 
 Items without coordinates (where the `coordinates` extractor returns `undefined`) skip geo field enrichment and don't appear in the geo GSI (sparse index pattern).
@@ -134,16 +125,14 @@ Items without coordinates (where the `coordinates` extractor returns `undefined`
 
 Find items within a radius of a center point:
 
-```typescript
-const vehicleGeo = yield* GeoIndex.bind(VehicleGeo)
-
+```typescript region="nearby" example="guide-geospatial.ts"
 const results = yield* vehicleGeo.nearby({
   center: { latitude: 37.7749, longitude: -122.4194 },
   radius: 2000,
   unit: "m",
   timeWindow: {
-    start: Date.now() - 3_600_000, // 1 hour ago
-    end: Date.now(),
+    start: now - H3.HOURLY_BUCKET_MS,
+    end: now + 1000,
   },
   sort: "ASC",
 })
@@ -169,15 +158,15 @@ for (const { item, distance } of results) {
 
 When using transactions or batch writes, use `enrich()` to compute geo fields without writing:
 
-```typescript
+```typescript region="enrich" example="guide-geospatial.ts"
 const enriched = VehicleGeo.enrich({
-  vehicleId: "v-2",
+  vehicleId: "v-6",
   latitude: 37.78,
   longitude: -122.41,
-  timestamp: Date.now(),
+  timestamp: now,
 })
 // enriched now has cell, parentCell, timePartition set
-// Use in Transaction.write() or Entity.batchWrite()
+// Use in Transaction.write() or Batch.write()
 ```
 
 ## How the Query Works

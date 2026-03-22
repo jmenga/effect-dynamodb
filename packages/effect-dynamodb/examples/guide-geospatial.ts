@@ -17,15 +17,13 @@
  */
 
 import { Console, Effect, Layer, Schema } from "effect"
-
+// Import from geo package source (use "@effect-dynamodb/geo" when published)
+import { GeoIndex, H3 } from "../../effect-dynamodb-geo/src/index.js"
 // Import from source (use "effect-dynamodb" when published)
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
-
-// Import from geo package source (use "@effect-dynamodb/geo" when published)
-import { GeoIndex, H3 } from "../../effect-dynamodb-geo/src/index.js"
 
 // ---------------------------------------------------------------------------
 // 1. Define a model with coordinate fields

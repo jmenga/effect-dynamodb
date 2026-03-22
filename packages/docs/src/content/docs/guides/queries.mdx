@@ -37,9 +37,7 @@ Query accessors live on the **entity definition** (`TaskEntity`), not the bound 
 const task = yield* tasks.get({ taskId: "t-001" })
 
 // Named index queries (return Query<A>) — on the entity definition
-const projectTasks = yield* tasks.collect(
-  TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-)
+const projectTasks = yield* tasks.collect(TaskEntity.query.byProject({ projectId: "proj-alpha" }))
 const assigneeTasks = yield* tasks.collect(
   TaskEntity.query.byAssignee({ assigneeId: "emp-alice" }),
 )
@@ -82,20 +80,14 @@ const activeTasks = yield* tasks.collect(
 // between — range on the composed sort key
 const startDate = "2025-02-01"
 const endDate = "2025-02-28"
-const lo = KeyComposer.composeSortKeyPrefix(
-  AppSchema,
-  "Task",
-  1,
-  TaskEntity.indexes.byProject,
-  { status: "active", createdAt: startDate },
-)
-const hi = KeyComposer.composeSortKeyPrefix(
-  AppSchema,
-  "Task",
-  1,
-  TaskEntity.indexes.byProject,
-  { status: "active", createdAt: endDate },
-)
+const lo = KeyComposer.composeSortKeyPrefix(AppSchema, "Task", 1, TaskEntity.indexes.byProject, {
+  status: "active",
+  createdAt: startDate,
+})
+const hi = KeyComposer.composeSortKeyPrefix(AppSchema, "Task", 1, TaskEntity.indexes.byProject, {
+  status: "active",
+  createdAt: endDate,
+})
 const activeInRange = yield* tasks.collect(
   TaskEntity.query.byProject({ projectId: "proj-alpha" }),
   Query.where({ between: [lo, hi] }),
@@ -134,9 +126,7 @@ All values are **composed sort key strings** — use `KeyComposer.composeSortKey
 // Callback — type-safe, supports nested paths, OR/NOT, all operators
 const highPriActive = yield* tasks.collect(
   TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-  TaskEntity.filter((t, { and, eq }) =>
-    and(eq(t.status, "active"), eq(t.priority, "high")),
-  ),
+  TaskEntity.filter((t, { and, eq }) => and(eq(t.status, "active"), eq(t.priority, "high"))),
 )
 ```
 
@@ -238,10 +228,9 @@ const allProjectTasks = yield* tasks.collect(
 
 ```typescript region="single-page" example="guide-queries.ts"
 // Single page with limit — returns Page<A> with items and cursor
-const page = yield* TaskEntity.query.byProject({ projectId: "proj-alpha" }).pipe(
-  Query.limit(3),
-  Query.execute,
-)
+const page = yield* TaskEntity.query
+  .byProject({ projectId: "proj-alpha" })
+  .pipe(Query.limit(3), Query.execute)
 // page.items: Task[] (up to 3 items)
 // page.cursor: string | null (pass to Query.startFrom for next page)
 ```
@@ -252,17 +241,14 @@ Use `Query.startFrom` to resume from a previous page's cursor:
 
 ```typescript region="cursor-pagination" example="guide-queries.ts"
 // Cursor-based pagination
-const page1 = yield* TaskEntity.query.byProject({ projectId: "proj-alpha" }).pipe(
-  Query.limit(3),
-  Query.execute,
-)
+const page1 = yield* TaskEntity.query
+  .byProject({ projectId: "proj-alpha" })
+  .pipe(Query.limit(3), Query.execute)
 
 if (page1.cursor) {
-  const page2 = yield* TaskEntity.query.byProject({ projectId: "proj-alpha" }).pipe(
-    Query.limit(3),
-    Query.startFrom(page1.cursor),
-    Query.execute,
-  )
+  const page2 = yield* TaskEntity.query
+    .byProject({ projectId: "proj-alpha" })
+    .pipe(Query.limit(3), Query.startFrom(page1.cursor), Query.execute)
   yield* Console.log(
     `Cursor pagination: page1=${page1.items.length} items, page2=${page2.items.length} items`,
   )
@@ -275,9 +261,7 @@ if (page1.cursor) {
 
 ```typescript region="streaming" example="guide-queries.ts"
 // Streaming — automatic pagination via Stream
-const stream = tasks.paginate(
-  TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-)
+const stream = tasks.paginate(TaskEntity.query.byProject({ projectId: "proj-alpha" }))
 
 const allFromStream = yield* Stream.runCollect(stream)
 yield* Console.log(`Stream collect: ${allFromStream.length} tasks\n`)
@@ -302,26 +286,18 @@ const activeScan = yield* tasks.collect(
 
 ```typescript region="scan-limit" example="guide-queries.ts"
 // Scan with limit
-const firstPage = yield* tasks.collect(
-  TaskEntity.scan(),
-  Query.limit(3),
-)
+const firstPage = yield* tasks.collect(TaskEntity.scan(), Query.limit(3))
 ```
 
 ```typescript region="scan-consistent" example="guide-queries.ts"
 // Scan with consistent read
-const consistent = yield* tasks.collect(
-  TaskEntity.scan(),
-  Query.consistentRead,
-)
+const consistent = yield* tasks.collect(TaskEntity.scan(), Query.consistentRead)
 ```
 
 ```typescript region="scan-stream" example="guide-queries.ts"
 // Stream-based scan
 const scanStream = tasks.paginate(TaskEntity.scan())
-yield* Stream.runForEach(scanStream, (t) =>
-  Console.log(`  Scanned: ${t.taskId} — "${t.title}"`),
-)
+yield* Stream.runForEach(scanStream, (t) => Console.log(`  Scanned: ${t.taskId} — "${t.title}"`))
 ```
 
 **When to use Scan vs Query:**
@@ -341,9 +317,7 @@ By default, DynamoDB reads are eventually consistent. For strong consistency, us
 
 ```typescript region="consistent-get" example="guide-queries.ts"
 // Consistent read on get — use entity definition's get + pipe
-const consistentTask = yield* TaskEntity.get({ taskId: "t-001" }).pipe(
-  Entity.consistentRead(),
-)
+const consistentTask = yield* TaskEntity.get({ taskId: "t-001" }).pipe(Entity.consistentRead())
 ```
 
 ```typescript region="consistent-query" example="guide-queries.ts"
@@ -356,10 +330,7 @@ const consistentQuery = yield* tasks.collect(
 
 ```typescript region="consistent-scan" example="guide-queries.ts"
 // Consistent read on scan
-const consistentScan = yield* tasks.collect(
-  TaskEntity.scan(),
-  Query.consistentRead,
-)
+const consistentScan = yield* tasks.collect(TaskEntity.scan(), Query.consistentRead)
 ```
 
 Consistent reads cost 2x the read capacity of eventually-consistent reads. Use them when you need read-after-write consistency (e.g., immediately after a put or update).
