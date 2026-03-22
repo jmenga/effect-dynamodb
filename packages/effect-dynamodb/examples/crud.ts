@@ -560,7 +560,7 @@ const program = Effect.gen(function* () {
 
   // --- Cleanup ---
   yield* Console.log("=== Cleanup ===\n")
-  yield* db.deleteTable
+  yield* db.deleteTable()
   yield* Console.log("Table deleted.")
 })
 

@@ -3,15 +3,25 @@ import { expect, test } from "@playwright/test"
 const BASE = "/effect-dynamodb"
 
 test.describe("Navigation", () => {
-  test("homepage renders with hero section", async ({ page }) => {
+  test("homepage renders introduction page", async ({ page }) => {
     await page.goto(`${BASE}/`)
-    await expect(page.locator("h1")).toContainText("effect-dynamodb")
-    await expect(page.getByText("Get Started")).toBeVisible()
+    await expect(page.locator("h1")).toContainText("Introduction")
+    const content = page.locator("main")
+    await expect(content).toBeVisible()
+    await expect(content.getByText("Core Concepts")).toBeVisible()
   })
 
-  test("Get Started link navigates to getting-started page", async ({ page }) => {
+  test("sidebar contains Introduction and Getting Started", async ({ page }) => {
     await page.goto(`${BASE}/`)
-    await page.getByText("Get Started").click()
+    const sidebar = page.locator("nav[aria-label='Main']")
+    await expect(sidebar.getByText("Introduction")).toBeVisible()
+    await expect(sidebar.getByText("Getting Started")).toBeVisible()
+  })
+
+  test("Getting Started link navigates from sidebar", async ({ page }) => {
+    await page.goto(`${BASE}/`)
+    const sidebar = page.locator("nav[aria-label='Main']")
+    await sidebar.getByText("Getting Started").click()
     await expect(page).toHaveURL(/getting-started/)
     await expect(page.locator("h1")).toContainText("Getting Started")
   })

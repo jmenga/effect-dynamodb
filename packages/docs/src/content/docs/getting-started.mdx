@@ -3,13 +3,43 @@ title: "Getting Started"
 description: "Quick start guide for effect-dynamodb — installation, setup, and first entity"
 ---
 
-Get up and running with effect-dynamodb in five minutes. This guide walks you through defining a model, creating a table and entity, and performing basic CRUD operations.
+Get up and running with effect-dynamodb in five minutes. This guide walks you through setting up a local DynamoDB instance, defining a model, creating a table and entity, and performing basic CRUD operations.
 
 ## Prerequisites
 
 - Node.js 18+
-- An AWS account with DynamoDB access (or DynamoDB Local for development)
+- [Docker](https://docs.docker.com/get-docker/) installed and running
 - Basic familiarity with [Effect TS](https://effect.website) and [Effect Schema](https://effect.website/docs/schema/introduction)
+
+## Running DynamoDB Local
+
+For local development, use [DynamoDB Local](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.html) — a Docker image that runs a local instance of DynamoDB with no AWS account required.
+
+Start a DynamoDB Local container:
+
+```bash
+docker run -d -p 8000:8000 --name dynamodb-local amazon/dynamodb-local
+```
+
+This starts DynamoDB Local on port 8000 in the background. The container persists until you stop it:
+
+```bash
+docker stop dynamodb-local   # stop
+docker start dynamodb-local  # restart later
+docker rm dynamodb-local     # remove when done
+```
+
+To verify it's running:
+
+```bash
+export AWS_ACCESS_KEY_ID=local
+export AWS_SECRET_ACCESS_KEY=local
+aws dynamodb list-tables --endpoint-url http://localhost:8000 --region us-east-1
+```
+
+:::tip
+DynamoDB Local doesn't validate credentials — any values will work. The inline env vars above avoid needing real AWS credentials configured.
+:::
 
 ## Installation
 
@@ -69,52 +99,79 @@ This tells effect-dynamodb:
 - The sort key is just the entity type prefix (no additional attributes)
 - `createdAt` and `updatedAt` are automatically managed
 
-### 4. Use It
+### 4. Register on a Table
 
-Register your entity on a table, then call `DynamoClient.make(table)` to get a typed client with executable operations. `DynamoClient.make()` resolves `DynamoClient` and `TableConfig` from the Effect context — you provide these as Layers when you run the program.
+Register your entity on a table definition. The physical DynamoDB table name is not set here — it's runtime configuration provided via `MainTable.layer({ name: "..." })` when you run the program.
+
+```typescript
+import { Table } from "effect-dynamodb"
+
+const MainTable = Table.make({ schema: AppSchema, entities: { TodoEntity } })
+```
+
+### 5. Use It
+
+Call `DynamoClient.make(table)` to get a typed client with executable operations. The typed client includes a `createTable()` method that derives the physical table definition (primary key, GSIs) from your registered entities — no manual `CreateTable` calls needed.
+
+`DynamoClient.make()` resolves `DynamoClient` and `TableConfig` from the Effect context — you provide these as Layers when you run the program.
 
 ```typescript
 import { Effect, Layer } from "effect"
-import { DynamoClient, Entity, Table } from "effect-dynamodb"
-
-// Register entities on the table
-const MainTable = Table.make({ schema: AppSchema, entities: { TodoEntity } })
+import { DynamoClient, Entity } from "effect-dynamodb"
 
 const program = Effect.gen(function* () {
   // Required gateway — resolves dependencies, returns executable operations
-  const { TodoEntity: todos } = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make(MainTable)
+
+  // Create the table — derived from entity definitions
+  yield* db.createTable()
 
   // Create
-  const todo = yield* todos.put({
+  const todo = yield* db.TodoEntity.put({
     todoId: "t-1",
     title: "Learn effect-dynamodb",
     done: false,
   })
   console.log(todo)
   // { todoId: "t-1", title: "Learn effect-dynamodb", done: false,
-  //   version: 1, createdAt: DateTime.Utc, updatedAt: DateTime.Utc }
+  //   createdAt: DateTime.Utc, updatedAt: DateTime.Utc }
 
   // Read
-  const found = yield* todos.get({ todoId: "t-1" })
+  const found = yield* db.TodoEntity.get({ todoId: "t-1" })
 
   // Update
-  yield* todos.update({ todoId: "t-1" }, Entity.set({ done: true }))
+  yield* db.TodoEntity.update({ todoId: "t-1" }, Entity.set({ done: true }))
 
   // Delete
-  yield* todos.delete({ todoId: "t-1" })
+  yield* db.TodoEntity.delete({ todoId: "t-1" })
 })
 
-// Run with a real DynamoDB client
+// Run with DynamoDB Local
 const main = program.pipe(
   Effect.provide(
     Layer.mergeAll(
-      DynamoClient.layer({ region: "us-east-1" }),
-      MainTable.layer({ name: "Main" }),
+      DynamoClient.layer({
+        region: "us-east-1",
+        endpoint: "http://localhost:8000",
+        credentials: { accessKeyId: "local", secretAccessKey: "local" },
+      }),
+      // Physical DynamoDB table name — required runtime configuration
+      MainTable.layer({ name: "quickstart" }),
     )
   )
 )
 
 Effect.runPromise(main)
+```
+
+:::note
+`createTable()` uses `PAY_PER_REQUEST` billing by default, which is ideal for development. For production, configure billing mode via `db.createTable({ billingMode: "PROVISIONED" })` or create the table through infrastructure-as-code (CloudFormation, CDK, Terraform).
+:::
+
+Save this as `quickstart.ts` and run it:
+
+```bash
+npx tsx quickstart.ts
 ```
 
 ### What Gets Stored in DynamoDB

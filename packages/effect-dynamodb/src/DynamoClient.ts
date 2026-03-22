@@ -256,9 +256,9 @@ export class DynamoClient extends ServiceMap.Service<DynamoClient, DynamoClientS
             })
             .pipe(Effect.asVoid),
 
-        deleteTable: client.deleteTable({ TableName: tableConfig.name }).pipe(Effect.asVoid),
+        deleteTable: () => client.deleteTable({ TableName: tableConfig.name }).pipe(Effect.asVoid),
 
-        describeTable: client.describeTable({ TableName: tableConfig.name }),
+        describeTable: () => client.describeTable({ TableName: tableConfig.name }),
       } as TypedClient<T>
     })
 }
@@ -298,9 +298,9 @@ export type TypedClient<T extends Table> = {
   /** Create the physical DynamoDB table from registered entity/aggregate definitions. */
   readonly createTable: (options?: CreateTableOptions) => Effect.Effect<void, DynamoClientError>
   /** Delete the physical DynamoDB table. */
-  readonly deleteTable: Effect.Effect<void, DynamoClientError>
+  readonly deleteTable: () => Effect.Effect<void, DynamoClientError>
   /** Describe the table. */
-  readonly describeTable: Effect.Effect<DescribeTableCommandOutput, DynamoClientError>
+  readonly describeTable: () => Effect.Effect<DescribeTableCommandOutput, DynamoClientError>
 }
 
 /** @internal Classify an AWS SDK error into a specific tagged error type. */

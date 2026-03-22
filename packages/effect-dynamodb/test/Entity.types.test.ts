@@ -4,7 +4,7 @@
  */
 
 import { type DateTime, Schema } from "effect"
-import { describe, expectTypeOf, it } from "vitest"
+import { describe, expect, expectTypeOf, it } from "vitest"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -579,5 +579,84 @@ describe("Entity type extractors", () => {
     type UpdateType = Entity.Update<typeof SelectionEntity>
 
     expectTypeOf<UpdateSchemaType>().toEqualTypeOf<UpdateType>()
+  })
+
+  it("rejects primary index with both pk and sk composites empty", () => {
+    expect(() =>
+      Entity.make({
+        model: User,
+        entityType: "User",
+        indexes: {
+          // @ts-expect-error — primary index must have at least one composite in pk or sk
+          primary: {
+            pk: { field: "pk", composite: [] as const },
+            sk: { field: "sk", composite: [] as const },
+          },
+        },
+      }),
+    ).toThrow()
+  })
+
+  it("allows primary index with empty pk if sk has composites", () => {
+    Entity.make({
+      model: User,
+      entityType: "User",
+      indexes: {
+        primary: {
+          pk: { field: "pk", composite: [] },
+          sk: { field: "sk", composite: ["userId"] },
+        },
+      },
+    })
+  })
+
+  it("allows primary index with empty sk if pk has composites", () => {
+    Entity.make({
+      model: User,
+      entityType: "User",
+      indexes: {
+        primary: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
+        },
+      },
+    })
+  })
+
+  it("rejects composite attributes that are not model fields", () => {
+    expect(() =>
+      Entity.make({
+        model: User,
+        entityType: "User",
+        indexes: {
+          primary: {
+            // @ts-expect-error — "nonExistent" is not a field on User
+            pk: { field: "pk", composite: ["nonExistent"] },
+            sk: { field: "sk", composite: [] },
+          },
+        },
+      }),
+    ).toThrow()
+  })
+
+  it("rejects invalid GSI composite attributes", () => {
+    expect(() =>
+      Entity.make({
+        model: User,
+        entityType: "User",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
+          byBogus: {
+            index: "gsi1",
+            // @ts-expect-error — "bogus" is not a field on User
+            pk: { field: "gsi1pk", composite: ["bogus"] },
+            sk: { field: "gsi1sk", composite: [] },
+          },
+        },
+      }),
+    ).toThrow()
   })
 })

@@ -30,6 +30,7 @@ export default defineConfig({
         },
       },
       sidebar: [
+        { label: "Introduction", slug: "" },
         { label: "Getting Started", slug: "getting-started" },
         {
           label: "Guides",

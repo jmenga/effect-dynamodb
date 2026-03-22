@@ -540,7 +540,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("  Atomic create: issue #2 + PR #2 on linux — OK")
 
   // --- Cleanup ---
-  yield* db.deleteTable
+  yield* db.deleteTable()
   yield* Console.log("\nAll 8 patterns passed.")
 })
 

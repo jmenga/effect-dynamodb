@@ -593,7 +593,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("  Return: Book removed from loans index, still in works — OK")
 
   // --- Cleanup ---
-  yield* db.deleteTable
+  yield* db.deleteTable()
   yield* Console.log("\nAll 8 patterns passed.")
 })
 

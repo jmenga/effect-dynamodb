@@ -38,30 +38,45 @@ export function resolveEntities(
   sourceFile: ts.SourceFile,
   program?: ts.Program,
 ): ReadonlyArray<ResolvedEntity> {
-  const entities: Array<ResolvedEntity> = []
-
   // First pass: collect variable declarations and their initializers for reference tracing
   const varDecls = new Map<string, ts.Expression>()
   collectVarDecls(ts, sourceFile, varDecls)
 
-  // Second pass: find Entity.make() calls
+  // Second pass: find Entity.make() calls (partial — no schema yet)
+  const partials: Array<{
+    varName: string
+    entityType: string
+    indexes: Record<string, IndexDefinition>
+    timestamps: boolean | object
+    versioned: boolean | object
+    softDelete: boolean | object
+    unique: object | undefined
+  }> = []
+
   ts.forEachChild(sourceFile, function visit(node) {
     if (ts.isVariableStatement(node)) {
       for (const decl of node.declarationList.declarations) {
         if (decl.initializer && ts.isIdentifier(decl.name)) {
-          const entity = tryResolveEntityMake(
-            ts,
-            decl.name.text,
-            decl.initializer,
-            varDecls,
-            program,
-          )
-          if (entity) entities.push(entity)
+          const partial = tryResolveEntityMake(ts, decl.name.text, decl.initializer)
+          if (partial) partials.push(partial)
         }
       }
     }
     ts.forEachChild(node, visit)
   })
+
+  if (partials.length === 0) return []
+
+  // Third pass: find Table.make() calls and resolve schemas for registered entities
+  const entitySchemas = resolveEntitySchemas(ts, sourceFile, varDecls, program)
+
+  // Combine partials with resolved schemas
+  const entities: Array<ResolvedEntity> = []
+  for (const partial of partials) {
+    const schema = entitySchemas.get(partial.varName)
+    if (!schema) continue
+    entities.push({ ...partial, variableName: partial.varName, schema })
+  }
 
   return entities
 }
@@ -120,13 +135,21 @@ function resolveVariable(
   return expr
 }
 
+interface PartialEntity {
+  readonly varName: string
+  readonly entityType: string
+  readonly indexes: Record<string, IndexDefinition>
+  readonly timestamps: boolean | object
+  readonly versioned: boolean | object
+  readonly softDelete: boolean | object
+  readonly unique: object | undefined
+}
+
 function tryResolveEntityMake(
   ts: typeof import("typescript"),
   varName: string,
   expr: ts.Expression,
-  varDecls: Map<string, ts.Expression>,
-  program?: ts.Program,
-): ResolvedEntity | undefined {
+): PartialEntity | undefined {
   // Match: Entity.make({ ... })
   if (!ts.isCallExpression(expr)) return undefined
   const callee = expr.expression
@@ -143,18 +166,15 @@ function tryResolveEntityMake(
   const configArg = args[0]!
   if (!ts.isObjectLiteralExpression(configArg)) return undefined
 
-  return resolveEntityConfig(ts, varName, configArg, varDecls, program)
+  return resolveEntityConfig(ts, varName, configArg)
 }
 
 function resolveEntityConfig(
   ts: typeof import("typescript"),
   varName: string,
   config: ts.ObjectLiteralExpression,
-  varDecls: Map<string, ts.Expression>,
-  program?: ts.Program,
-): ResolvedEntity | undefined {
+): PartialEntity | undefined {
   let entityType: string | undefined
-  let tableExpr: ts.Expression | undefined
   let indexes: Record<string, IndexDefinition> | undefined
   let timestamps: boolean | object = false
   let versioned: boolean | object = false
@@ -168,9 +188,6 @@ function resolveEntityConfig(
     switch (name) {
       case "entityType":
         entityType = extractStringLiteral(ts, prop.initializer)
-        break
-      case "table":
-        tableExpr = prop.initializer
         break
       case "indexes":
         indexes = resolveIndexes(ts, prop.initializer)
@@ -192,59 +209,92 @@ function resolveEntityConfig(
 
   if (!entityType || !indexes) return undefined
 
-  // Resolve schema from table -> Table.make({ schema }) -> DynamoSchema.make({ name, version })
-  const schema = resolveSchemaFromTable(ts, tableExpr, varDecls, program)
-  if (!schema) return undefined
-
-  return {
-    variableName: varName,
-    entityType,
-    schema,
-    indexes,
-    timestamps,
-    versioned,
-    softDelete,
-    unique,
-  }
+  return { varName, entityType, indexes, timestamps, versioned, softDelete, unique }
 }
 
-function resolveSchemaFromTable(
+/**
+ * Scan for Table.make({ schema, entities: { ... } }) calls and build a map
+ * from entity variable name → SchemaConfig.
+ */
+function resolveEntitySchemas(
   ts: typeof import("typescript"),
-  tableExpr: ts.Expression | undefined,
+  sourceFile: ts.SourceFile,
   varDecls: Map<string, ts.Expression>,
   program?: ts.Program,
-): SchemaConfig | undefined {
-  if (!tableExpr) return undefined
+): Map<string, SchemaConfig> {
+  const result = new Map<string, SchemaConfig>()
 
-  // Follow variable reference (same-file or cross-file)
-  const tableInit = resolveVariable(ts, tableExpr, varDecls, program)
+  ts.forEachChild(sourceFile, function visit(node) {
+    if (ts.isVariableStatement(node)) {
+      for (const decl of node.declarationList.declarations) {
+        if (!decl.initializer) continue
+        const tableInfo = tryResolveTableMake(ts, decl.initializer, varDecls, program)
+        if (tableInfo) {
+          for (const entityName of tableInfo.entityNames) {
+            result.set(entityName, tableInfo.schema)
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, visit)
+  })
 
-  // Match: Table.make({ schema: <schemaExpr> })
-  if (!ts.isCallExpression(tableInit)) return undefined
-  const callee = tableInit.expression
+  return result
+}
+
+function tryResolveTableMake(
+  ts: typeof import("typescript"),
+  expr: ts.Expression,
+  varDecls: Map<string, ts.Expression>,
+  program?: ts.Program,
+): { schema: SchemaConfig; entityNames: ReadonlyArray<string> } | undefined {
+  // Match: Table.make({ schema: <schemaExpr>, entities: { ... } })
+  if (!ts.isCallExpression(expr)) return undefined
+  const callee = expr.expression
   if (!ts.isPropertyAccessExpression(callee)) return undefined
   if (callee.name.text !== "make") return undefined
 
-  const args = tableInit.arguments
+  const target = callee.expression
+  if (!ts.isIdentifier(target) || target.text !== "Table") return undefined
+
+  const args = expr.arguments
   if (args.length < 1) return undefined
   const tableConfig = args[0]!
   if (!ts.isObjectLiteralExpression(tableConfig)) return undefined
 
   let schemaExpr: ts.Expression | undefined
+  let entitiesExpr: ts.Expression | undefined
+
   for (const prop of tableConfig.properties) {
     if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
-    if (prop.name.text === "schema") {
-      schemaExpr = prop.initializer
-      break
+    if (prop.name.text === "schema") schemaExpr = prop.initializer
+    if (prop.name.text === "entities") entitiesExpr = prop.initializer
+  }
+
+  if (!schemaExpr || !entitiesExpr) return undefined
+
+  // Resolve schema
+  const schemaInit = resolveVariable(ts, schemaExpr, varDecls, program)
+  const schema = resolveDynamoSchema(ts, schemaInit)
+  if (!schema) return undefined
+
+  // Extract entity names from the entities record
+  const entityNames: Array<string> = []
+  if (ts.isObjectLiteralExpression(entitiesExpr)) {
+    for (const prop of entitiesExpr.properties) {
+      if (ts.isShorthandPropertyAssignment(prop)) {
+        // { Todos } — shorthand, variable name = property name
+        entityNames.push(prop.name.text)
+      } else if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name)) {
+        // { Todos: TodoEntity } — the key is the client accessor, value is the entity variable
+        if (ts.isIdentifier(prop.initializer)) {
+          entityNames.push(prop.initializer.text)
+        }
+      }
     }
   }
 
-  if (!schemaExpr) return undefined
-
-  // Follow variable reference (same-file or cross-file)
-  const schemaInit = resolveVariable(ts, schemaExpr, varDecls, program)
-
-  return resolveDynamoSchema(ts, schemaInit)
+  return entityNames.length > 0 ? { schema, entityNames } : undefined
 }
 
 function resolveDynamoSchema(

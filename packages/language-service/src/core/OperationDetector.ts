@@ -105,8 +105,10 @@ function tryDetectDirectCall(
     const target = callee.expression
 
     // Direct method: Users.get(...), Users.put(...), etc.
-    if (ts.isIdentifier(target)) {
-      const entity = findEntity(target.text, entities)
+    // Also handles typed client: db.Users.get(...), db.Users.put(...), etc.
+    const entityName = resolveEntityName(ts, target)
+    if (entityName) {
+      const entity = findEntity(entityName, entities)
       if (entity) {
         const opType = methodToOpType(methodName)
         if (opType) {
@@ -129,17 +131,33 @@ function tryDetectDirectCall(
       const queryProp = target.name.text // "query"
       const entityId = target.expression
 
-      if (queryProp === "query" && ts.isIdentifier(entityId)) {
-        const entity = findEntity(entityId.text, entities)
-        if (entity) {
-          const args =
-            call.arguments.length > 0 ? extractCallArgs(ts, call.arguments[0]!) : undefined
-          return { entity, type: "query", indexName, arguments: args }
+      if (queryProp === "query") {
+        const queryEntityName = resolveEntityName(ts, entityId)
+        if (queryEntityName) {
+          const entity = findEntity(queryEntityName, entities)
+          if (entity) {
+            const args =
+              call.arguments.length > 0 ? extractCallArgs(ts, call.arguments[0]!) : undefined
+            return { entity, type: "query", indexName, arguments: args }
+          }
         }
       }
     }
   }
 
+  return undefined
+}
+
+/**
+ * Extract the entity name from the target expression.
+ * Handles both `Users` (identifier) and `db.Users` (property access).
+ */
+function resolveEntityName(
+  ts: typeof import("typescript"),
+  node: ts.Expression,
+): string | undefined {
+  if (ts.isIdentifier(node)) return node.text
+  if (ts.isPropertyAccessExpression(node)) return node.name.text
   return undefined
 }
 

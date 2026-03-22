@@ -557,7 +557,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("  Terminate + rehire: soft-delete, audit lookup, restore — OK")
 
   // --- Cleanup ---
-  yield* db.deleteTable
+  yield* db.deleteTable()
   yield* Console.log("\nAll 10 patterns passed.")
 })
 

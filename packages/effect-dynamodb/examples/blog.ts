@@ -315,7 +315,7 @@ const program = Effect.gen(function* () {
   yield* db.Comments.delete({ commentId: "comment-2" })
   yield* Console.log("Deleted all items")
 
-  yield* db.deleteTable
+  yield* db.deleteTable()
   yield* Console.log("Table deleted.")
 })
 

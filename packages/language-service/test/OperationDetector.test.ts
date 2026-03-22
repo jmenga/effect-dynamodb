@@ -158,4 +158,44 @@ describe("OperationDetector", () => {
     expect(op).toBeDefined()
     expect(op!.arguments?.priority).toBe(3)
   })
+
+  it("should detect db.Users.get() via typed client", () => {
+    const source = `db.Users.get({ userId: "u-alice" })`
+    const sf = parseSource(source)
+    // Position on "get" — after "db.Users."
+    const op = detectOperation(ts, sf, 9, entities)
+
+    expect(op).toBeDefined()
+    expect(op!.entity.variableName).toBe("Users")
+    expect(op!.type).toBe("get")
+    expect(op!.arguments).toEqual({ userId: "u-alice" })
+  })
+
+  it("should detect db.Tasks.put() via typed client", () => {
+    const source = `db.Tasks.put({ taskId: "t-1", userId: "u-1", title: "Test", status: "todo", priority: 1 })`
+    const sf = parseSource(source)
+    const op = detectOperation(ts, sf, 9, entities)
+
+    expect(op).toBeDefined()
+    expect(op!.entity.variableName).toBe("Tasks")
+    expect(op!.type).toBe("put")
+  })
+
+  it("should detect db.Users.update() via typed client", () => {
+    const source = `db.Users.update({ userId: "u-alice" })`
+    const sf = parseSource(source)
+    const op = detectOperation(ts, sf, 9, entities)
+
+    expect(op).toBeDefined()
+    expect(op!.type).toBe("update")
+  })
+
+  it("should detect db.Users.scan() via typed client", () => {
+    const source = `db.Users.scan()`
+    const sf = parseSource(source)
+    const op = detectOperation(ts, sf, 9, entities)
+
+    expect(op).toBeDefined()
+    expect(op!.type).toBe("scan")
+  })
 })

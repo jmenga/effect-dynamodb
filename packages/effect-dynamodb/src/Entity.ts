@@ -872,11 +872,34 @@ const checkTransactionLimit = (
  * })
  * ```
  */
+/** Valid composite attribute names: model fields + ref-derived ID fields (e.g., `playerId` from ref field `player`). */
+type ValidCompositeAttr<TModel extends Schema.Top, TRefs> =
+  | (string & keyof Schema.Schema.Type<TModel>)
+  | ([TRefs] extends [globalThis.Record<infer K extends string, any>] ? `${K}Id` : never)
+
+/** Extract all composite attribute names from an index definition. */
+type IndexComposites<T> = T extends {
+  readonly pk: { readonly composite: ReadonlyArray<infer P extends string> }
+  readonly sk: { readonly composite: ReadonlyArray<infer S extends string> }
+}
+  ? P | S
+  : never
+
+/** Find invalid composite attributes across all indexes. */
+type InvalidComposites<F extends string, TIndexes> = Exclude<
+  IndexComposites<TIndexes[keyof TIndexes]>,
+  F
+>
+
 export const make = <
   TModel extends Schema.Top,
   const TEntityType extends string,
   const TIndexes extends globalThis.Record<string, IndexDefinition> & {
-    readonly primary: IndexDefinition
+    readonly primary: IndexDefinition &
+      (
+        | { readonly pk: { readonly composite: readonly [string, ...string[]] } }
+        | { readonly sk: { readonly composite: readonly [string, ...string[]] } }
+      )
   },
   const TTimestamps extends TimestampsConfig | undefined = undefined,
   const TVersioned extends VersionedConfig | undefined = undefined,
@@ -887,7 +910,14 @@ export const make = <
 >(config: {
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
   readonly entityType: TEntityType
-  readonly indexes: TIndexes
+  readonly indexes: [InvalidComposites<ValidCompositeAttr<TModel, TRefs>, TIndexes>] extends [never]
+    ? TIndexes
+    : TIndexes & {
+        readonly [K in keyof TIndexes]: {
+          readonly pk: { readonly composite: ReadonlyArray<ValidCompositeAttr<TModel, TRefs>> }
+          readonly sk: { readonly composite: ReadonlyArray<ValidCompositeAttr<TModel, TRefs>> }
+        }
+      }
   readonly timestamps?: TTimestamps
   readonly versioned?: TVersioned
   readonly softDelete?: TSoftDelete
@@ -912,6 +942,36 @@ export const make = <
   const modelFields = getFields(rawModel)
   const hasHiddenFields = Object.values(modelFields).some(isHidden)
   const systemFields = resolveSystemFields(config.timestamps, config.versioned)
+
+  // ---------------------------------------------------------------------------
+  // Validate indexes
+  // ---------------------------------------------------------------------------
+
+  const primaryIndex = config.indexes.primary
+  if (primaryIndex.pk.composite.length === 0 && primaryIndex.sk.composite.length === 0) {
+    throw new Error(
+      `Entity "${config.entityType}": primary index must have at least one composite attribute across pk and sk`,
+    )
+  }
+
+  // Build the set of valid composite attribute names: model fields + ref-derived ID fields
+  const validCompositeFields = new Set(Object.keys(modelFields))
+  for (const fieldName of Object.keys(modelFields)) {
+    if (isRefField(fieldName, config.model as Schema.Top)) {
+      validCompositeFields.add(`${fieldName}Id`)
+    }
+  }
+
+  for (const [indexName, indexDef] of Object.entries(config.indexes)) {
+    for (const attr of [...indexDef.pk.composite, ...indexDef.sk.composite]) {
+      if (!validCompositeFields.has(attr)) {
+        throw new Error(
+          `Entity "${config.entityType}": index "${indexName}" references unknown attribute "${attr}". ` +
+            `Valid attributes: ${[...validCompositeFields].sort().join(", ")}`,
+        )
+      }
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Resolve refs at make() time

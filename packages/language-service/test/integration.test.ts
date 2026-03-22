@@ -12,11 +12,9 @@ function parseSource(source: string): ts.SourceFile {
 describe("Integration: Entity definition → hover tooltip", () => {
   const fullSource = `
     const AppSchema = DynamoSchema.make({ name: "crud-demo", version: 1 })
-    const MainTable = Table.make({ schema: AppSchema })
 
     const Users = Entity.make({
       model: User,
-      table: MainTable,
       entityType: "User",
       indexes: {
         primary: {
@@ -35,7 +33,6 @@ describe("Integration: Entity definition → hover tooltip", () => {
 
     const Tasks = Entity.make({
       model: Task,
-      table: MainTable,
       entityType: "Task",
       indexes: {
         primary: {
@@ -51,6 +48,8 @@ describe("Integration: Entity definition → hover tooltip", () => {
       timestamps: true,
       softDelete: true,
     })
+
+    const MainTable = Table.make({ schema: AppSchema, entities: { Users, Tasks } })
   `
 
   it("should resolve entities and produce tooltip for get operation", () => {
@@ -185,11 +184,9 @@ describe("Integration: Entity definition → hover tooltip", () => {
   it("should handle entity with collection indexes", () => {
     const source = `
       const AppSchema = DynamoSchema.make({ name: "shop", version: 1 })
-      const MainTable = Table.make({ schema: AppSchema })
 
       const Orders = Entity.make({
         model: Order,
-        table: MainTable,
         entityType: "Order",
         indexes: {
           primary: {
@@ -204,6 +201,8 @@ describe("Integration: Entity definition → hover tooltip", () => {
           },
         },
       })
+
+      const MainTable = Table.make({ schema: AppSchema, entities: { Orders } })
 
       Orders.query.byCustomer({ customerId: "c-123" })
     `

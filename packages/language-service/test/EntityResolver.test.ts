@@ -15,11 +15,9 @@ describe("EntityResolver", () => {
         import * as Entity from "@effect-dynamodb/core/Entity"
 
         const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
-        const MainTable = Table.make({ schema: AppSchema })
 
         const Users = Entity.make({
           model: User,
-          table: MainTable,
           entityType: "User",
           indexes: {
             primary: {
@@ -28,6 +26,8 @@ describe("EntityResolver", () => {
             },
           },
         })
+
+        const MainTable = Table.make({ schema: AppSchema, entities: { Users } })
       `
       const sf = parseSource(source)
       const entities = resolveEntities(ts, sf)
@@ -44,11 +44,9 @@ describe("EntityResolver", () => {
     it("should resolve entity with GSI indexes", () => {
       const source = `
         const AppSchema = DynamoSchema.make({ name: "crud-demo", version: 1 })
-        const MainTable = Table.make({ schema: AppSchema })
 
         const Users = Entity.make({
           model: User,
-          table: MainTable,
           entityType: "User",
           indexes: {
             primary: {
@@ -64,6 +62,8 @@ describe("EntityResolver", () => {
           timestamps: true,
           versioned: { retain: true },
         })
+
+        const MainTable = Table.make({ schema: AppSchema, entities: { Users } })
       `
       const sf = parseSource(source)
       const entities = resolveEntities(ts, sf)
@@ -82,11 +82,9 @@ describe("EntityResolver", () => {
     it("should resolve multiple entities in the same file", () => {
       const source = `
         const AppSchema = DynamoSchema.make({ name: "test", version: 2 })
-        const MainTable = Table.make({ schema: AppSchema })
 
         const Users = Entity.make({
           model: User,
-          table: MainTable,
           entityType: "User",
           indexes: {
             primary: {
@@ -98,7 +96,6 @@ describe("EntityResolver", () => {
 
         const Tasks = Entity.make({
           model: Task,
-          table: MainTable,
           entityType: "Task",
           indexes: {
             primary: {
@@ -108,6 +105,8 @@ describe("EntityResolver", () => {
           },
           softDelete: true,
         })
+
+        const MainTable = Table.make({ schema: AppSchema, entities: { Users, Tasks } })
       `
       const sf = parseSource(source)
       const entities = resolveEntities(ts, sf)
@@ -121,11 +120,9 @@ describe("EntityResolver", () => {
     it("should resolve DynamoSchema with custom casing", () => {
       const source = `
         const AppSchema = DynamoSchema.make({ name: "MyApp", version: 1, casing: "preserve" })
-        const MainTable = Table.make({ schema: AppSchema })
 
         const Items = Entity.make({
           model: Item,
-          table: MainTable,
           entityType: "Item",
           indexes: {
             primary: {
@@ -134,6 +131,8 @@ describe("EntityResolver", () => {
             },
           },
         })
+
+        const MainTable = Table.make({ schema: AppSchema, entities: { Items } })
       `
       const sf = parseSource(source)
       const entities = resolveEntities(ts, sf)
@@ -146,11 +145,9 @@ describe("EntityResolver", () => {
     it("should resolve entity with collection indexes", () => {
       const source = `
         const AppSchema = DynamoSchema.make({ name: "shop", version: 1 })
-        const MainTable = Table.make({ schema: AppSchema })
 
         const Orders = Entity.make({
           model: Order,
-          table: MainTable,
           entityType: "Order",
           indexes: {
             primary: {
@@ -165,6 +162,8 @@ describe("EntityResolver", () => {
             },
           },
         })
+
+        const MainTable = Table.make({ schema: AppSchema, entities: { Orders } })
       `
       const sf = parseSource(source)
       const entities = resolveEntities(ts, sf)
@@ -187,11 +186,9 @@ describe("EntityResolver", () => {
     it("should handle entity with softDelete and unique config", () => {
       const source = `
         const AppSchema = DynamoSchema.make({ name: "app", version: 1 })
-        const MainTable = Table.make({ schema: AppSchema })
 
         const Users = Entity.make({
           model: User,
-          table: MainTable,
           entityType: "User",
           indexes: {
             primary: {
@@ -202,6 +199,8 @@ describe("EntityResolver", () => {
           softDelete: { ttl: 86400 },
           unique: { email: { fields: ["email"] } },
         })
+
+        const MainTable = Table.make({ schema: AppSchema, entities: { Users } })
       `
       const sf = parseSource(source)
       const entities = resolveEntities(ts, sf)

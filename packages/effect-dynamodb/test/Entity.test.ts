@@ -168,6 +168,37 @@ describe("Entity", () => {
       expect(UserEntity.systemFields.updatedAt).toBe("updatedAt")
     })
 
+    it("throws if primary index has no composite attributes in pk or sk", () => {
+      expect(() =>
+        Entity.make({
+          model: User,
+          entityType: "User",
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- bypass compile-time check for runtime test
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: [] },
+              sk: { field: "sk", composite: [] },
+            },
+          } as any,
+        }),
+      ).toThrow('primary index must have at least one composite attribute across pk and sk')
+    })
+
+    it("allows primary index with empty pk composite if sk has composites", () => {
+      expect(() =>
+        Entity.make({
+          model: User,
+          entityType: "User",
+          indexes: {
+            primary: {
+              pk: { field: "pk", composite: [] },
+              sk: { field: "sk", composite: ["userId"] },
+            },
+          },
+        }),
+      ).not.toThrow()
+    })
+
     it("stores versioned config", () => {
       const UserEntity = Entity.make({
         model: User,

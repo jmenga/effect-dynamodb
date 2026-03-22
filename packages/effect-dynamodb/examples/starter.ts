@@ -192,7 +192,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("Deleted all items\n")
 
   // --- Cleanup ---
-  yield* db.deleteTable
+  yield* db.deleteTable()
   yield* Console.log("Table deleted.")
 })
 

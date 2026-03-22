@@ -1,41 +1,9 @@
 ---
-title: effect-dynamodb
-description: An Effect TS ORM for DynamoDB — Schema-driven entities, single-table design, composite keys, type-safe queries
-template: splash
-hero:
-  title: effect-dynamodb
-  tagline: An Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, automatic key composition, type-safe pipeable queries, and DynamoDB client as an Effect Service.
-  actions:
-    - text: Get Started
-      link: /effect-dynamodb/getting-started/
-      icon: right-arrow
-      variant: primary
-    - text: View on GitHub
-      link: https://github.com/placeholder/effect-dynamodb
-      icon: external
-      variant: minimal
+title: "Introduction"
+description: "An Effect TS ORM for DynamoDB — Schema-driven entities, single-table design, composite keys, type-safe queries"
 ---
 
-An Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, automatic key composition, type-safe pipeable queries, and DynamoDB client as an Effect Service.
-
-## Guides
-
-| Guide | Description |
-|-------|-------------|
-| [Getting Started](/effect-dynamodb/getting-started/) | Prerequisites, installation, and a 5-minute single-entity walkthrough |
-| [Modeling](/effect-dynamodb/guides/modeling/) | Schema.Class models, DynamoSchema namespaces, Table definitions, Entity binding, and the 7 derived types |
-| [Indexes & Collections](/effect-dynamodb/guides/indexes/) | Primary and secondary index definition, key generation, isolated vs clustered collections, sub-collections |
-| [Queries](/effect-dynamodb/guides/queries/) | Pipeable Query API, entity query accessors, collection queries, sort key conditions, scan, consistent reads, pagination |
-| [Expressions](/effect-dynamodb/guides/expressions/) | Type-safe condition, filter, update, and projection expressions with DynamoDB mapping reference |
-| [Data Integrity](/effect-dynamodb/guides/data-integrity/) | Unique constraints, versioning, optimistic concurrency, idempotency |
-| [Lifecycle](/effect-dynamodb/guides/lifecycle/) | Soft delete, restore, purge, version retention, TTL |
-| [Aggregates & Refs](/effect-dynamodb/guides/aggregates/) | Entity references (DynamoModel.ref), graph-based aggregates, cascade updates |
-| [Geospatial](/effect-dynamodb/guides/geospatial/) | Proximity-based queries using H3 hexagonal grid indexing (`@effect-dynamodb/geo`) |
-| [Advanced](/effect-dynamodb/guides/advanced/) | Rich updates, batch operations, conditional writes, multi-table design, expression builders |
-| [DynamoDB Streams](/effect-dynamodb/guides/streams/) | Decode stream records into typed domain objects |
-| [Testing](/effect-dynamodb/guides/testing/) | Mock DynamoClient, test CRUD operations, error paths, and queries |
-| [API Reference](/effect-dynamodb/reference/api-reference/) | Module-by-module reference for all public exports |
-| [Migration from ElectroDB](/effect-dynamodb/reference/migration-from-electrodb/) | Concept mapping, side-by-side examples, and feature comparison |
+**effect-dynamodb** is an Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, automatic key composition, type-safe pipeable queries, and DynamoDB client as an Effect Service.
 
 ## Core Concepts
 
@@ -114,14 +82,14 @@ const MainTable = Table.make({ schema: AppSchema, entities: { TaskEntity } })
 
 // 5. Use
 const program = Effect.gen(function* () {
-  const { TaskEntity: tasks } = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make(MainTable)
 
-  yield* tasks.put({
+  yield* db.TaskEntity.put({
     taskId: "t-1", projectId: "p-1",
     title: "Ship it", status: "active",
   })
 
-  const active = yield* tasks.collect(
+  const active = yield* db.TaskEntity.collect(
     TaskEntity.query.byProject({ projectId: "p-1" }),
     TaskEntity.filter({ status: "active" }),
   )
@@ -131,7 +99,8 @@ Effect.runPromise(program.pipe(
   Effect.provide(
     Layer.mergeAll(
       DynamoClient.layer({ region: "us-east-1" }),
-      MainTable.layer({ name: "Main" }),
+      // Physical DynamoDB table name — required runtime configuration
+      MainTable.layer({ name: "my-app-table" }),
     )
   )
 ))

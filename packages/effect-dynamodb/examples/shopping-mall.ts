@@ -388,7 +388,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("  Delete gifts-galore, westgate now has 1 store — OK")
 
   // --- Cleanup ---
-  yield* db.deleteTable
+  yield* db.deleteTable()
   yield* Console.log("\nAll 6 patterns passed.")
 })
 
