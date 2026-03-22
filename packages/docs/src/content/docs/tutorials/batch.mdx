@@ -18,14 +18,18 @@ A multi-entity example demonstrating `Batch.get` and `Batch.write` for efficient
 
 Two pure domain models — a `User` and an `Order`:
 
-```typescript title="models.ts"
-import { Schema } from "effect"
+```typescript title="models.ts" region="models" example="batch.ts"
+const Role = { Admin: "admin", Member: "member" } as const
+const RoleSchema = Schema.Literals(Object.values(Role))
+
+const OrderStatus = { Pending: "pending", Shipped: "shipped", Delivered: "delivered" } as const
+const OrderStatusSchema = Schema.Literals(Object.values(OrderStatus))
 
 class User extends Schema.Class<User>("User")({
   userId: Schema.String,
   email: Schema.String,
   name: Schema.NonEmptyString,
-  role: Schema.Literals(["admin", "member"]),
+  role: RoleSchema,
 }) {}
 
 class Order extends Schema.Class<Order>("Order")({
@@ -33,7 +37,7 @@ class Order extends Schema.Class<Order>("Order")({
   userId: Schema.String,
   product: Schema.NonEmptyString,
   quantity: Schema.Number,
-  status: Schema.Literals(["pending", "shipped", "delivered"]),
+  status: OrderStatusSchema,
 }) {}
 ```
 
@@ -43,11 +47,8 @@ class Order extends Schema.Class<Order>("Order")({
 
 Both entities share a single table. Orders have a GSI for querying by user:
 
-```typescript title="entities.ts"
-import { DynamoSchema, Entity, Table } from "effect-dynamodb"
-
+```typescript title="entities.ts" region="entities" example="batch.ts"
 const AppSchema = DynamoSchema.make({ name: "batch-demo", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
 
 const Users = Entity.make({
   model: User,
@@ -77,6 +78,8 @@ const Orders = Entity.make({
   },
   timestamps: true,
 })
+
+const MainTable = Table.make({ schema: AppSchema, entities: { Users, Orders } })
 ```
 
 ---
@@ -85,9 +88,10 @@ const Orders = Entity.make({
 
 `Batch.write` accepts a mix of put and delete operations across any number of entity types. DynamoDB limits batch writes to 25 items per request — effect-dynamodb auto-chunks larger batches transparently.
 
-```typescript
-import { Batch } from "effect-dynamodb"
-
+```typescript region="batch-write" example="batch.ts"
+// Batch.write accepts a mix of put and delete operations.
+// DynamoDB limits batch writes to 25 items per request —
+// effect-dynamodb auto-chunks larger batches transparently.
 yield* Batch.write([
   Users.put({ userId: "u-1", email: "alice@example.com", name: "Alice", role: "admin" }),
   Users.put({ userId: "u-2", email: "bob@example.com", name: "Bob", role: "member" }),
@@ -114,7 +118,6 @@ yield* Batch.write([
     status: "pending",
   }),
 ])
-// 3 users + 3 orders created in a single batch call
 ```
 
 All six items are written in one DynamoDB `BatchWriteItem` call (or auto-chunked if the batch exceeds 25 items).
@@ -125,30 +128,25 @@ All six items are written in one DynamoDB `BatchWriteItem` call (or auto-chunked
 
 `Batch.get` returns a **typed tuple** — each position in the result matches the entity type of the corresponding input. DynamoDB limits batch gets to 100 items per request; larger batches are auto-chunked with automatic retry of unprocessed keys.
 
-```typescript
+```typescript region="batch-get" example="batch.ts"
+// Batch.get returns a typed tuple: each position matches the entity type.
+// DynamoDB limits batch gets to 100 items per request —
+// effect-dynamodb auto-chunks and retries unprocessed keys.
 const [alice, bob, order1, order2] = yield* Batch.get([
   Users.get({ userId: "u-1" }),
   Users.get({ userId: "u-2" }),
   Orders.get({ orderId: "o-1" }),
   Orders.get({ orderId: "o-2" }),
 ])
-
-// alice: User | undefined — fully typed as User
-// bob: User | undefined
-// order1: Order | undefined — fully typed as Order
-// order2: Order | undefined
 ```
 
 Each result is `Model | undefined`. If an item does not exist in DynamoDB, the corresponding position is `undefined`:
 
-```typescript
+```typescript region="batch-get-missing" example="batch.ts"
 const [existing, missing] = yield* Batch.get([
   Users.get({ userId: "u-1" }),
   Users.get({ userId: "u-nonexistent" }),
 ])
-
-// existing → { userId: "u-1", name: "Alice", ... }
-// missing → undefined
 ```
 
 ---
@@ -157,7 +155,7 @@ const [existing, missing] = yield* Batch.get([
 
 `Batch.write` accepts both `Entity.put()` and `Entity.delete()` operations in the same array:
 
-```typescript
+```typescript region="batch-write-mixed" example="batch.ts"
 yield* Batch.write([
   // Add a new order
   Orders.put({
@@ -170,15 +168,12 @@ yield* Batch.write([
   // Delete an existing order
   Orders.delete({ orderId: "o-3" }),
 ])
-// Added o-4 and deleted o-3 in one atomic batch
 
-// Verify
+// Verify: o-3 is gone, o-4 exists
 const [deleted, created] = yield* Batch.get([
   Orders.get({ orderId: "o-3" }),
   Orders.get({ orderId: "o-4" }),
 ])
-// deleted → undefined (removed)
-// created → { orderId: "o-4", product: "Thingamajig", ... }
 ```
 
 ---
@@ -187,7 +182,7 @@ const [deleted, created] = yield* Batch.get([
 
 Puts and deletes can target different entity types in the same batch. This is useful for operations that need to modify users and orders together:
 
-```typescript
+```typescript region="batch-write-cross-entity" example="batch.ts"
 yield* Batch.write([
   Users.put({ userId: "u-4", email: "diana@example.com", name: "Diana", role: "admin" }),
   Orders.put({
@@ -199,7 +194,6 @@ yield* Batch.write([
   }),
   Users.delete({ userId: "u-3" }),
 ])
-// Created user u-4 + order o-5, deleted user u-3 — all in one batch
 ```
 
 Note that batch writes are **not transactional** — DynamoDB applies each item independently. If you need atomic all-or-nothing semantics, use `Transaction.transactWrite` instead (limited to 100 items, 2x WCU cost).
@@ -220,10 +214,7 @@ npx tsx examples/batch.ts
 
 ### Layer Setup
 
-```typescript title="main.ts"
-import { Effect, Layer } from "effect"
-import { DynamoClient } from "effect-dynamodb"
-
+```typescript title="main.ts" region="run" example="batch.ts"
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -236,8 +227,8 @@ const AppLayer = Layer.mergeAll(
 const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
-  () => console.log("Done."),
-  (err) => console.error("Failed:", err),
+  () => console.log("\nDone."),
+  (err) => console.error("\nFailed:", err),
 )
 ```
 

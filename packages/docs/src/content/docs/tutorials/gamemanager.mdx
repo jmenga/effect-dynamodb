@@ -142,109 +142,112 @@ export type TeamId = typeof TeamId.Type
 
 ### 2.2 Enums
 
-```ts
-// src/models/Enums.ts
-import { Schema } from "effect"
-
-export const Gender = {
-  Male: "Male",
-  Female: "Female",
+```ts region="model-enums" example="cricket.ts"
+const PlayerRole = {
+  Batter: "batter",
+  Bowler: "bowler",
+  AllRounder: "all-rounder",
+  WicketKeeper: "wicket-keeper",
 } as const
-export const GenderSchema = Schema.Literals(Object.values(Gender))
-export type Gender = typeof GenderSchema.Type
-
-export const BattingHand = {
-  Left: "Left",
-  Right: "Right",
-} as const
-export const BattingHandSchema = Schema.Literals(Object.values(BattingHand))
-export type BattingHand = typeof BattingHandSchema.Type
-
-export const MatchType = {
-  Test: "Test",
-  ODI: "ODI",
-  T20: "T20",
-} as const
-export const MatchTypeSchema = Schema.Literals(Object.values(MatchType))
-export type MatchType = typeof MatchTypeSchema.Type
-
-// Case-insensitive query variants: accept "male" or "Male"
-const lowercaseValues = <T extends Record<string, string>>(obj: T) =>
-  Object.values(obj).map((v) => v.toLowerCase()) as Lowercase<T[keyof T]>[]
-
-export const GenderQuerySchema = Schema.Literals(lowercaseValues(Gender))
-export const GenderQuery = Schema.Union([GenderSchema, GenderQuerySchema])
+const PlayerRoleSchema = Schema.Literals(Object.values(PlayerRole))
 ```
 
-> **Pattern: Enum objects with Schema.Literals** — Define enums as `const` objects for autocomplete and referenceability (`Gender.Male`), then derive a `Schema.Literals` for runtime validation. The `type` alias extracts the union type from the schema. This gives you three things: a namespace (`Gender.Male`), a schema (`GenderSchema`), and a type (`Gender`).
-
-> **Pattern: Case-insensitive query schemas** — `GenderQuerySchema` accepts lowercase variants (`"male"`, `"female"`), then `Schema.Union` combines both. API query parameters like `?gender=male` or `?gender=Male` both pass validation. The `lowercaseValues` helper derives lowercase literals from the enum object with proper typing via `Lowercase<T>`. This works because effect-dynamodb widens query input types to accept lowercase variants of string literals (via `CaseInsensitive<T>`) and applies the schema's casing (default: `"lowercase"`) to composite key values — so `"Male"` and `"male"` both produce the same key `$schema#v1#team#male#...`. The actual attribute value stored on the item retains its original casing.
+> **Pattern: Enum objects with Schema.Literals** — Define enums as `const` objects for autocomplete and referenceability (`PlayerRole.Batter`), then derive a `Schema.Literals` for runtime validation. This gives you two things: a namespace (`PlayerRole.Batter`) and a schema (`PlayerRoleSchema`).
 
 ### 2.3 Team model
 
-```ts
-// src/models/Team.ts
-import { Schema } from "effect"
-import { GenderSchema } from "./Enums.js"
-import { TeamId } from "./Ids.js"
-
-export class Team extends Schema.Class<Team>("Team")({
-  id: TeamId,
+```ts region="model-standalone" example="cricket.ts"
+class Team extends Schema.Class<Team>("Team")({
+  id: Schema.String.pipe(DynamoModel.identifier),
   name: Schema.String,
-  gender: GenderSchema,
-  league: Schema.String,
+  country: Schema.String,
+  ranking: Schema.Number,
+}) {}
+
+class Player extends Schema.Class<Player>("Player")({
+  id: Schema.String.pipe(DynamoModel.identifier),
+  firstName: Schema.String,
+  lastName: Schema.String,
+  role: PlayerRoleSchema,
+}) {}
+
+class Coach extends Schema.Class<Coach>("Coach")({
+  id: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+}) {}
+
+class Venue extends Schema.Class<Venue>("Venue")({
+  id: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+  city: Schema.String,
 }) {}
 ```
 
 Two things to notice:
 
-1. **`Schema.Class`** — Defines a runtime-validated class. `new Team({ id: "1" as TeamId, name: "Australia", gender: "Male", league: "ICC" })` validates all fields.
+1. **`Schema.Class`** — Defines a runtime-validated class. `new Team({ id: "aus", name: "Australia", country: "Australia", ranking: 1 })` validates all fields.
 
-2. **Pure domain model** — No DynamoDB imports or annotations. The model is portable and testable — DynamoDB binding happens later at the entity level.
+2. **`DynamoModel.identifier`** — Marks the `id` field as the primary business identifier. Other entities can reference this entity by this field. The model stays pure otherwise -- no DynamoDB concepts.
+
+3. **Pure domain model** — No DynamoDB imports or annotations beyond the identifier marker. The model is portable and testable — DynamoDB binding happens later at the entity level.
 
 ### 2.4 Teams entity
 
 The entity binds your pure model to DynamoDB with indexes, key composition, and optional features:
 
-```ts
-// src/entities/Teams.ts
-import { DynamoModel, Entity } from "@effect-dynamodb/core"
-import { Team } from "../models/Team.js"
-
-export const Teams = Entity.make({
-  model: DynamoModel.configure(Team, { id: { field: "teamId", identifier: true } }),
+```ts region="entity-standalone" example="cricket.ts"
+const Teams = Entity.make({
+  model: DynamoModel.configure(Team, { id: { field: "teamId" } }),
   entityType: "Team",
-  timestamps: true,
   indexes: {
     primary: {
       pk: { field: "pk", composite: ["id"] },
       sk: { field: "sk", composite: [] },
     },
-    byAll: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: [] },
-      sk: { field: "gsi1sk", composite: ["gender", "league", "name"] },
+  },
+})
+
+const Players = Entity.make({
+  model: DynamoModel.configure(Player, { id: { field: "playerId" } }),
+  entityType: "Player",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
     },
   },
-  unique: {
-    team: ["gender", "league", "name"],
+})
+
+const Coaches = Entity.make({
+  model: DynamoModel.configure(Coach, { id: { field: "coachId" } }),
+  entityType: "Coach",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
+    },
+  },
+})
+
+const Venues = Entity.make({
+  model: DynamoModel.configure(Venue, { id: { field: "venueId" } }),
+  entityType: "Venue",
+  indexes: {
+    primary: {
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
+    },
   },
 })
 ```
 
 Let's break down what each piece does:
 
-- **`DynamoModel.configure(Team, { id: { field: "teamId", identifier: true } })`** — Two things at once: renames the `id` field to `teamId` in the DynamoDB item (avoiding collisions when multiple entity types share a table), and marks it as the `identifier` field for ref resolution (so other entities can reference Teams by ID). The model stays pure — all DynamoDB configuration happens here.
+- **`DynamoModel.configure(Team, { id: { field: "teamId" } })`** — Renames the `id` field to `teamId` in the DynamoDB item, avoiding collisions when multiple entity types share a table. Since the model already marks `id` with `DynamoModel.identifier`, the entity inherits that for ref resolution.
 
 - **`entityType: "Team"`** — A discriminator value stored as `__edd_e__` on every item. Used to identify which entity type an item belongs to during queries.
 
-- **`timestamps: true`** — Automatically adds `createdAt` and `updatedAt` fields, managed by the library.
-
 - **`indexes.primary`** — The table's primary key. `pk` is composed from the `id` field. `sk` has an empty composite (the library fills it with the entity type).
-
-- **`indexes.byAll`** — A GSI for listing all teams. The `pk` has no composites (all teams share the same partition), and the `sk` composes `gender`, `league`, `name` for sort-key filtering.
-
-- **`unique: { team: ["gender", "league", "name"] }`** — Enforces uniqueness across those three fields using a sentinel item written in a transaction.
 
 > **Key concept:** `Entity.make` returns a **pure entity definition** — no table reference, no executable operations. The entity declares its model, indexes, and configuration. Table association happens when you register it on a `Table.make({ entities: { Teams } })`, which we'll create next.
 
@@ -252,16 +255,18 @@ Let's break down what each piece does:
 
 Now that we have an entity, we need a **DynamoSchema** (application namespace) and a **Table** (physical table binding) to assemble it:
 
-```ts
-// src/entities/Schema.ts
-import { DynamoSchema, Table } from "@effect-dynamodb/core"
-import { Teams } from "./Teams.js"
-
-export const CricketSchema = DynamoSchema.make({ name: "cricketapp", version: 1 })
-export const MainTable = Table.make({ schema: CricketSchema, entities: { Teams } })
+```ts region="schema" example="cricket.ts"
+const CricketSchema = DynamoSchema.make({ name: "cricket", version: 1 })
 ```
 
-> **Concept: Single-table design** — All entities share one DynamoDB table. The schema's `name` and `version` become part of every key prefix (`$cricketapp#v1#...`), preventing collisions between entity types. `Table.make` registers entities up front — you'll add more to the `entities` record as you create them throughout this tutorial.
+```ts region="table" example="cricket.ts"
+const MainTable = Table.make({
+  schema: CricketSchema,
+  entities: { Teams, Players, Coaches, Venues, SquadSelections },
+})
+```
+
+> **Concept: Single-table design** — All entities share one DynamoDB table. The schema's `name` and `version` become part of every key prefix (`$cricket#v1#...`), preventing collisions between entity types. `Table.make` registers entities up front — you'll add more to the `entities` record as you create them throughout this tutorial.
 
 > **Note:** Entity files don't import the table. Entities are pure definitions. The dependency flows the other way: `Schema.ts` imports entities and registers them on the table. In the service layer, `DynamoClient.make(MainTable)` binds all registered entities and returns a typed client where every operation has `R = never`.
 
@@ -1729,70 +1734,49 @@ export const SquadSelectionId = Schema.String.pipe(Schema.brand("SquadSelectionI
 export type SquadSelectionId = typeof SquadSelectionId.Type
 ```
 
-```ts
-// src/models/SquadSelection.ts
-import { Schema } from "effect"
-import { SquadSelectionId } from "./Ids.js"
-import { Player } from "./Player.js"
-import { Team } from "./Team.js"
-
-export class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
-  id: SquadSelectionId,
-  player: Player,
-  team: Team,
-  season: Schema.String,
-  role: Schema.optionalKey(Schema.String),
+```ts region="model-squad-selection" example="cricket.ts"
+// SquadSelection — a player selected to a team's squad for a series/season.
+// squadId encodes team + season + series (e.g., "aus#2024-25#BGT").
+class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
+  squadId: Schema.String,
+  selectionNumber: Schema.Number,
+  team: Team.pipe(DynamoModel.ref),
+  player: Player.pipe(DynamoModel.ref),
+  squadRole: PlayerRoleSchema,
+  isCaptain: Schema.Boolean,
+  isViceCaptain: Schema.Boolean,
 }) {}
 ```
 
-Notice the model is completely pure — `player` and `team` are plain Schema.Class fields with no DynamoDB annotations. The ref behavior (input accepts IDs, record contains full objects) is configured at the entity level.
+The `team` and `player` fields use `DynamoModel.ref` — this marks them as reference fields. In the **input** schema, these become `teamId` and `playerId` (you provide the ID). In the **record** schema, they contain the full `Team` and `Player` objects (hydrated on read).
 
 ### 4.2 SquadSelections entity with refs and cascade indexes
 
-```ts
-// src/entities/SquadSelections.ts
-import { DynamoModel, Entity } from "@effect-dynamodb/core"
-import { SquadSelection } from "../models/SquadSelection.js"
-import { Players } from "./Players.js"
-import { Teams } from "./Teams.js"
-
-export const SquadSelections = Entity.make({
-  model: DynamoModel.configure(SquadSelection, {
-    id: { field: "selectionId", identifier: true },
-    player: { ref: true },
-    team: { ref: true },
-  }),
+```ts region="entity-squad-selection" example="cricket.ts"
+const SquadSelections = Entity.make({
+  model: SquadSelection,
   entityType: "SquadSelection",
-  timestamps: true,
   indexes: {
     primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
+      pk: { field: "pk", composite: ["squadId"] },
+      sk: { field: "sk", composite: ["selectionNumber"] },
     },
-    byAll: {
+    byPlayer: {
       index: "gsi1",
-      pk: { field: "gsi1pk", composite: [] },
-      sk: { field: "gsi1sk", composite: ["season"] },
+      pk: { field: "gsi1pk", composite: ["playerId"] },
+      sk: { field: "gsi1sk", composite: ["squadId", "selectionNumber"] },
     },
   },
   refs: {
-    player: {
-      entity: Players,
-      cascade: { index: "gsi3", pk: { field: "gsi3pk" }, sk: { field: "gsi3sk" } },
-    },
-    team: {
-      entity: Teams,
-      cascade: { index: "gsi4", pk: { field: "gsi4pk" }, sk: { field: "gsi4sk" } },
-    },
+    team: { entity: Teams },
+    player: { entity: Players },
   },
 })
 ```
 
-- **`DynamoModel.configure(..., { player: { ref: true }, team: { ref: true } })`** — Marks `player` and `team` as ref fields. In the **input** schema, `player` becomes `playerId: PlayerId` (you provide the branded ID). In the **record** schema, `player` is the full `Player` object (hydrated on read).
+- **`refs`** — Maps ref fields to their source entities. Each ref field declared with `DynamoModel.ref` on the model is bound to its source entity here. The value `{ entity: Teams }` tells the library to hydrate the `team` field by looking up the referenced Team entity.
 
-- **`refs`** — Maps ref fields to their source entities. Each value is `{ entity: EntityDef }` with an optional `cascade` property. Without cascade (`{ entity: Players }`), it's a simple ref — hydrate on read. With cascade (`{ entity: Players, cascade: {...} }`), a GSI is added for cascade updates.
-
-- **`cascade`** (inside a ref) — Defines the GSI used to find SquadSelections when the referenced entity changes. When a Team is updated, the library queries `gsi4` to find all SquadSelections referencing that team and updates the denormalized data. The library auto-generates the cascade index's PK/SK composites from the ref field and primary key — you only specify the physical GSI names.
+- **`byPlayer` GSI** — A secondary index keyed by `playerId`, allowing queries like "find all squad selections for a given player".
 
 ### 4.3 Adding cascade to TeamService
 
@@ -2116,49 +2100,29 @@ This is the most powerful feature of effect-dynamodb. A Match is a **graph of re
 
 ### 5.1 Sub-aggregate models
 
-A Match contains two TeamSheets (one per team) and an UmpireSheet:
+A Match contains two TeamSheets (one per team). Each TeamSheet references a Team, a Coach, and an array of PlayerSheets:
 
-```ts
-// src/models/PlayerSheet.ts
-import { Schema } from "effect"
-import { Player } from "./Player.js"
-
-export class PlayerSheet extends Schema.Class<PlayerSheet>("PlayerSheet")({
-  player: Player,
-  battingPosition: Schema.optionalKey(Schema.Number),
-  bowlingPosition: Schema.optionalKey(Schema.Number),
-  isCaptain: Schema.optionalKey(Schema.Boolean).pipe(Schema.withDecodingDefault(() => false)),
-  isViceCaptain: Schema.optionalKey(Schema.Boolean).pipe(Schema.withDecodingDefault(() => false)),
-  isWicketkeeper: Schema.optionalKey(Schema.Boolean).pipe(Schema.withDecodingDefault(() => false)),
-  isSubstitute: Schema.optionalKey(Schema.Boolean).pipe(Schema.withDecodingDefault(() => false)),
+```ts region="model-aggregate" example="cricket.ts"
+// Aggregate domain schemas
+class PlayerSheet extends Schema.Class<PlayerSheet>("PlayerSheet")({
+  player: Player.pipe(DynamoModel.ref),
+  battingPosition: Schema.Number,
+  isCaptain: Schema.Boolean,
 }) {}
-```
 
-```ts
-// src/models/TeamSheet.ts
-import { Schema } from "effect"
-import { Coach } from "./Coach.js"
-import { PlayerSheet } from "./PlayerSheet.js"
-import { Team } from "./Team.js"
-
-export class TeamSheet extends Schema.Class<TeamSheet>("TeamSheet")({
-  team: Team,
-  coach: Coach,
+class TeamSheet extends Schema.Class<TeamSheet>("TeamSheet")({
+  team: Team.pipe(DynamoModel.ref),
+  coach: Coach.pipe(DynamoModel.ref),
   homeTeam: Schema.Boolean,
   players: Schema.Array(PlayerSheet),
 }) {}
-```
 
-```ts
-// src/models/UmpireSheet.ts
-import { Schema } from "effect"
-import { Umpire } from "./Umpire.js"
-
-export class UmpireSheet extends Schema.Class<UmpireSheet>("UmpireSheet")({
-  matchReferee: Schema.optionalKey(Umpire),
-  matchUmpire: Schema.optionalKey(Schema.Array(Umpire)),
-  tvUmpire: Schema.optionalKey(Umpire),
-  reserveUmpire: Schema.optionalKey(Umpire),
+class Match extends Schema.Class<Match>("Match")({
+  id: Schema.String,
+  name: Schema.String,
+  venue: Venue.pipe(DynamoModel.ref),
+  team1: TeamSheet,
+  team2: TeamSheet,
 }) {}
 ```
 

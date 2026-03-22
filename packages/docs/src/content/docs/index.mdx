@@ -41,6 +41,10 @@ Schema.Class  →  DynamoSchema  →  Table  →  Entity
 
 ## Quick Example
 
+:::note
+This example uses DynamoDB Local for local development. See [Running DynamoDB Local](/effect-dynamodb/getting-started/#running-dynamodb-local) for setup instructions.
+:::
+
 ```typescript
 import { Schema, Effect, Layer } from "effect"
 import {
@@ -84,6 +88,11 @@ const MainTable = Table.make({ schema: AppSchema, entities: { TaskEntity } })
 const program = Effect.gen(function* () {
   const db = yield* DynamoClient.make(MainTable)
 
+  // Create table if it doesn't exist
+  yield* db.describeTable().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => db.createTable()),
+  )
+
   yield* db.TaskEntity.put({
     taskId: "t-1", projectId: "p-1",
     title: "Ship it", status: "active",
@@ -98,7 +107,11 @@ const program = Effect.gen(function* () {
 Effect.runPromise(program.pipe(
   Effect.provide(
     Layer.mergeAll(
-      DynamoClient.layer({ region: "us-east-1" }),
+      DynamoClient.layer({
+        region: "us-east-1",
+        endpoint: "http://localhost:8000",
+        credentials: { accessKeyId: "local", secretAccessKey: "local" },
+      }),
       // Physical DynamoDB table name — required runtime configuration
       MainTable.layer({ name: "my-app-table" }),
     )

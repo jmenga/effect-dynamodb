@@ -23,13 +23,16 @@ import * as Table from "../src/Table.js"
 // 1. Infrastructure — Schema + Table
 // ---------------------------------------------------------------------------
 
+// #region infrastructure
 const AppSchema = DynamoSchema.make({ name: "cricket", version: 1 })
 const EventsTable = Table.make({ schema: AppSchema })
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 2. Events — pure domain Schema.Class definitions
 // ---------------------------------------------------------------------------
 
+// #region events
 class MatchStarted extends Schema.Class<MatchStarted>("MatchStarted")({
   venue: Schema.String,
   homeTeam: Schema.String,
@@ -47,22 +50,26 @@ class MatchEnded extends Schema.Class<MatchEnded>("MatchEnded")({
 }) {}
 
 type MatchEvent = MatchStarted | InningsCompleted | MatchEnded
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 3. Event Stream — binds events to a table with stream ID composites
 // ---------------------------------------------------------------------------
 
+// #region stream
 const MatchEvents = EventStore.makeStream({
   table: EventsTable,
   streamName: "Match",
   events: [MatchStarted, InningsCompleted, MatchEnded],
   streamId: { composite: ["matchId"] },
 })
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 4. Decider — command-event-state triad
 // ---------------------------------------------------------------------------
 
+// #region decider
 interface MatchState {
   readonly status: "pending" | "in-progress" | "completed"
   readonly venue?: string
@@ -143,6 +150,7 @@ const matchDecider: EventStore.Decider<
     return state
   },
 }
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 5. Main program
@@ -153,8 +161,10 @@ const program = Effect.gen(function* () {
   const tableConfig = yield* EventsTable.Tag
 
   // --- Bind event stream ---
+  // #region command-handler
   const matchEvents = yield* EventStore.bind(MatchEvents)
   const handleMatch = EventStore.commandHandler(matchDecider, matchEvents)
+  // #endregion
 
   // --- Create table ---
   yield* Console.log("Creating table:", tableConfig.name)
@@ -174,27 +184,31 @@ const program = Effect.gen(function* () {
 
   // --- Command handler: Start match ---
   yield* Console.log("=== Starting match ===")
+  // #region start-match
   const r1 = yield* handleMatch(
     { matchId: "m-1" },
     { _tag: "StartMatch", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
   )
+  // #endregion
   yield* Console.log(
     `State: ${r1.state.status}, Version: ${r1.version}, Events: ${r1.events.length}`,
   )
 
   // --- Command handler: Complete innings ---
   yield* Console.log("\n=== Completing innings ===")
+  // #region complete-innings
   const r2 = yield* handleMatch(
     { matchId: "m-1" },
     { _tag: "CompleteInnings", innings: 1, runs: 250, wickets: 10 },
-  )
-  yield* Console.log(
-    `State: ${r2.state.status}, Innings: ${r2.state.innings.length}, Version: ${r2.version}`,
   )
 
   const r3 = yield* handleMatch(
     { matchId: "m-1" },
     { _tag: "CompleteInnings", innings: 2, runs: 180, wickets: 10 },
+  )
+  // #endregion
+  yield* Console.log(
+    `State: ${r2.state.status}, Innings: ${r2.state.innings.length}, Version: ${r2.version}`,
   )
   yield* Console.log(
     `State: ${r3.state.status}, Innings: ${r3.state.innings.length}, Version: ${r3.version}`,
@@ -202,53 +216,67 @@ const program = Effect.gen(function* () {
 
   // --- Command handler: End match ---
   yield* Console.log("\n=== Ending match ===")
+  // #region end-match
   const r4 = yield* handleMatch(
     { matchId: "m-1" },
     { _tag: "EndMatch", result: "AUS won by 70 runs" },
   )
+  // #endregion
   yield* Console.log(
     `State: ${r4.state.status}, Result: ${r4.state.result}, Version: ${r4.version}`,
   )
 
   // --- Read all events ---
   yield* Console.log("\n=== Read all events ===")
+  // #region read-all
   const allEvents = yield* matchEvents.read({ matchId: "m-1" })
+  // #endregion
   for (const event of allEvents) {
     yield* Console.log(`  v${event.version}: ${event.eventType} at ${event.timestamp}`)
   }
 
   // --- Read from version ---
   yield* Console.log("\n=== Read from version 2 ===")
+  // #region read-from
   const laterEvents = yield* matchEvents.readFrom({ matchId: "m-1" }, 2)
+  // #endregion
   for (const event of laterEvents) {
     yield* Console.log(`  v${event.version}: ${event.eventType}`)
   }
 
   // --- Current version ---
+  // #region current-version
   const version = yield* matchEvents.currentVersion({ matchId: "m-1" })
+  // #endregion
   yield* Console.log(`\nCurrent version: ${version}`)
 
   // --- Fold: reconstruct state from events ---
   yield* Console.log("\n=== Fold: Reconstruct state ===")
+  // #region fold
   const state = EventStore.fold(matchDecider, allEvents)
+  // #endregion
   yield* Console.log(`Reconstructed: status=${state.status}, innings=${state.innings.length}`)
 
   // --- Query combinator: get latest event ---
   yield* Console.log("\n=== Query: Latest event ===")
+  // #region query-latest
   const latest = yield* matchEvents.provide(
     matchEvents.query.events({ matchId: "m-1" }).pipe(Query.reverse, Query.limit(1), Query.collect),
   )
   const [latestEvent] = latest
+  // #endregion
   if (latestEvent) {
     yield* Console.log(`Latest: v${latestEvent.version} ${latestEvent.eventType}`)
   }
 
   // --- Domain error: try to start again ---
   yield* Console.log("\n=== Domain error: StartMatch on completed match ===")
+  // #region domain-error
   const error = yield* handleMatch(
     { matchId: "m-1" },
     { _tag: "StartMatch", venue: "SCG", homeTeam: "AUS", awayTeam: "IND" },
   ).pipe(Effect.flip)
+  // #endregion
   yield* Console.log(`Error: ${error._tag}`)
 
   // --- Cleanup ---
@@ -261,6 +289,7 @@ const program = Effect.gen(function* () {
 // 6. Provide dependencies and run
 // ---------------------------------------------------------------------------
 
+// #region layer-setup
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -276,3 +305,4 @@ Effect.runPromise(main).then(
   () => console.log("\nDone."),
   (err) => console.error("Failed:", err),
 )
+// #endregion

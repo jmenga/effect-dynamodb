@@ -30,9 +30,7 @@ A blog platform managing **users**, **posts**, and **comments** in a single Dyna
 
 Three pure domain models with no DynamoDB concepts:
 
-```typescript title="models.ts"
-import { Schema } from "effect"
-
+```typescript title="models.ts" region="models" example="blog.ts"
 class User extends Schema.Class<User>("User")({
   userId: Schema.String,
   email: Schema.String,
@@ -41,12 +39,15 @@ class User extends Schema.Class<User>("User")({
   postCount: Schema.Number,
 }) {}
 
+const PostStatus = { Draft: "draft", Published: "published", Archived: "archived" } as const
+const PostStatusSchema = Schema.Literals(Object.values(PostStatus))
+
 class Post extends Schema.Class<Post>("Post")({
   postId: Schema.String,
   authorId: Schema.String,
   title: Schema.NonEmptyString,
   content: Schema.String,
-  status: Schema.Literals(["draft", "published", "archived"]),
+  status: PostStatusSchema,
   commentCount: Schema.Number,
 }) {}
 
@@ -60,7 +61,7 @@ class Comment extends Schema.Class<Comment>("Comment")({
 
 Key modeling decisions:
 - **`displayName`** and **`title`** use `Schema.NonEmptyString` for validation -- empty strings are rejected at the schema level
-- **`status`** uses `Schema.Literals` for a constrained set of post states
+- **`status`** uses a const object + `Schema.Literals` for a constrained set of post states
 - **`bio`** is optional -- not every user fills in a biography
 - **`postCount`** and **`commentCount`** are denormalized counters, typical in DynamoDB designs where aggregation queries are expensive
 
@@ -70,9 +71,7 @@ Key modeling decisions:
 
 ### Schema
 
-```typescript title="entities.ts"
-import { DynamoSchema, Table } from "effect-dynamodb"
-
+```typescript title="entities.ts" region="schema" example="blog.ts"
 const BlogSchema = DynamoSchema.make({ name: "blog", version: 1 })
 ```
 
@@ -80,9 +79,7 @@ const BlogSchema = DynamoSchema.make({ name: "blog", version: 1 })
 
 Users have a simple primary key and no GSIs. Versioning is enabled for optimistic locking:
 
-```typescript title="entities.ts"
-import { Entity } from "effect-dynamodb"
-
+```typescript title="entities.ts" region="user-entity" example="blog.ts"
 const Users = Entity.make({
   model: User,
   entityType: "User",
@@ -101,7 +98,7 @@ const Users = Entity.make({
 
 Posts have a primary key plus a GSI for querying by author:
 
-```typescript title="entities.ts"
+```typescript title="entities.ts" region="post-entity" example="blog.ts"
 const Posts = Entity.make({
   model: Post,
   entityType: "Post",
@@ -124,7 +121,7 @@ const Posts = Entity.make({
 
 Comments also use GSI1 but with a different partition key -- this is **index overloading**. Posts partition GSI1 by `authorId`, while Comments partition it by `postId`:
 
-```typescript title="entities.ts"
+```typescript title="entities.ts" region="comment-entity" example="blog.ts"
 const Comments = Entity.make({
   model: Comment,
   entityType: "Comment",
@@ -162,21 +159,24 @@ GSI1 is **overloaded** -- Posts use it for `byAuthor` (partitioned by `authorId`
 
 ## Step 3: Seed Data
 
-```typescript title="seed.ts"
-import { DynamoClient } from "effect-dynamodb"
+```typescript title="seed.ts" region="seed-data" example="blog.ts"
+// Typed execution gateway
+const db = yield* DynamoClient.make(BlogTable)
 
-const { Users: users, Posts: posts, Comments: comments } = yield* DynamoClient.make(BlogTable)
+yield* db.createTable()
 
-// Create a user
-const alice = yield* users.put({
+// yield* returns User — clean class name, no system fields
+const alice = yield* db.Users.put({
   userId: "alice-1",
   email: "alice@blog.com",
   displayName: "Alice",
   postCount: 0,
 })
 
-// Create posts
-yield* posts.put({
+// get returns model instance by default, with system fields available
+const aliceWithMeta = yield* db.Users.get({ userId: "alice-1" })
+
+const post1 = yield* db.Posts.put({
   postId: "post-1",
   authorId: "alice-1",
   title: "Getting Started with Effect TS",
@@ -185,7 +185,7 @@ yield* posts.put({
   commentCount: 0,
 })
 
-yield* posts.put({
+yield* db.Posts.put({
   postId: "post-2",
   authorId: "alice-1",
   title: "DynamoDB Single-Table Design",
@@ -194,7 +194,7 @@ yield* posts.put({
   commentCount: 0,
 })
 
-yield* posts.put({
+yield* db.Posts.put({
   postId: "post-3",
   authorId: "alice-1",
   title: "Draft Post",
@@ -203,15 +203,14 @@ yield* posts.put({
   commentCount: 0,
 })
 
-// Create comments on post-1
-yield* comments.put({
+yield* db.Comments.put({
   commentId: "comment-1",
   postId: "post-1",
   authorId: "bob-1",
   body: "Great article!",
 })
 
-yield* comments.put({
+yield* db.Comments.put({
   commentId: "comment-2",
   postId: "post-1",
   authorId: "charlie-1",
@@ -228,10 +227,8 @@ yield* comments.put({
 `yield*` on a `put` or `get` returns the clean model type. To access system fields like `createdAt`, `updatedAt`, and `version`, pipe through `Entity.asRecord`:
 
 ```typescript
-import { Entity } from "effect-dynamodb"
-
 // yield* returns User — clean model type
-const alice = yield* users.put({
+const alice = yield* db.Users.put({
   userId: "alice-1",
   email: "alice@blog.com",
   displayName: "Alice",
@@ -240,7 +237,7 @@ const alice = yield* users.put({
 // alice.displayName → "Alice"
 
 // Entity.asRecord exposes system fields
-const aliceRecord = yield* users.get({ userId: "alice-1" }).pipe(Entity.asRecord)
+const aliceRecord = yield* db.Users.get({ userId: "alice-1" }).pipe(Entity.asRecord)
 // aliceRecord.version → 1
 // aliceRecord.createdAt → DateTime.Utc
 ```
@@ -249,54 +246,42 @@ const aliceRecord = yield* users.get({ userId: "alice-1" }).pipe(Entity.asRecord
 
 Query posts by author and comments by post using the GSI indexes:
 
-```typescript
-// All posts by alice
-const alicePosts = yield* posts.collect(Posts.query.byAuthor({ authorId: "alice-1" }))
-// → [
-//   { postId: "post-1", title: "Getting Started with Effect TS", ... },
-//   { postId: "post-2", title: "DynamoDB Single-Table Design", ... },
-//   { postId: "post-3", title: "Draft Post", ... },
-// ]
+```typescript region="gsi-queries" example="blog.ts"
+// Posts by author
+const alicePosts = yield* db.Posts.collect(Posts.query.byAuthor({ authorId: "alice-1" }))
 
-// All comments on post-1
-const postComments = yield* comments.collect(
-  Comments.query.byPost({ postId: "post-1" }),
-)
-// → [
-//   { commentId: "comment-1", body: "Great article!", ... },
-//   { commentId: "comment-2", body: "Very helpful, thanks!", ... },
-// ]
+// Comments on a post
+const postComments = yield* db.Comments.collect(Comments.query.byPost({ postId: "post-1" }))
 ```
 
 ### Pipeable Updates
 
 The update key identifies the item, and the remaining fields specify the changes:
 
-```typescript
-const updatedAlice = yield* users.update(
+```typescript region="update" example="blog.ts"
+// db.Users.update(key, ...combinators) — type-safe
+const updatedAlice = yield* db.Users.update(
   { userId: "alice-1" },
-  { displayName: "Alice B.", postCount: 3 },
+  Entity.set({ displayName: "Alice B.", postCount: 3 }),
 )
-// updatedAlice.displayName → "Alice B."
-// updatedAlice.postCount → 3
 ```
 
 ### Optimistic Locking
 
 When `versioned: true` is configured, every write increments the item's `version`. Use `Entity.expectedVersion()` to enforce that the item hasn't changed since you last read it:
 
-```typescript
-// Alice is currently at version 3 after two updates
-const lockResult = yield* users.update(
+```typescript region="optimistic-locking" example="blog.ts"
+// expectedVersion for optimistic locking
+const lockResult = yield* db.Users.update(
   { userId: "alice-1" },
   Entity.set({ displayName: "Wrong Name" }),
-  Entity.expectedVersion(1), // stale version — will fail
+  Entity.expectedVersion(1), // version is now 2 — this will fail
 ).pipe(
+  Effect.map(() => "unexpected success"),
   Effect.catchTag("OptimisticLockError", (e) =>
-    Effect.succeed(`Caught: expected v${e.expectedVersion}`),
+    Effect.succeed(`Caught OptimisticLockError: expected v${e.expectedVersion}`),
   ),
 )
-// → "Caught: expected v1"
 ```
 
 The `Entity.expectedVersion()` combinator adds a condition that the stored version must match. If another write has incremented the version, the update fails with an `OptimisticLockError`.
@@ -305,18 +290,15 @@ The `Entity.expectedVersion()` combinator adds a condition that the stored versi
 
 `Transaction.transactGet` reads multiple items atomically, and `Transaction.transactWrite` writes multiple items atomically:
 
-```typescript
-import { Transaction } from "effect-dynamodb"
-
-// Atomic read — typed tuple
+```typescript region="transactions" example="blog.ts"
+// Atomic multi-entity read — typed tuple, no cast needed
 const [txUser, txPost] = yield* Transaction.transactGet([
   Users.get({ userId: "alice-1" }),
   Posts.get({ postId: "post-1" }),
 ])
-// txUser: User | undefined
-// txPost: Post | undefined
+// txUser: User | undefined, txPost: Post | undefined
 
-// Atomic write — create + delete in one transaction
+// Atomic multi-entity write — entity intermediates directly
 yield* Transaction.transactWrite([
   Posts.put({
     postId: "post-4",
@@ -337,7 +319,7 @@ The transaction ensures both operations succeed or both fail. If post-4 can't be
 For debugging, `Entity.asNative` returns the raw DynamoDB marshalled item with all internal attributes visible:
 
 ```typescript
-const rawPost = yield* posts.get({ postId: "post-1" }).pipe(Entity.asNative)
+const rawPost = yield* db.Posts.get({ postId: "post-1" }).pipe(Entity.asNative)
 // rawPost includes pk, sk, gsi1pk, gsi1sk, __edd_e__, createdAt, updatedAt, ...
 ```
 
@@ -361,10 +343,7 @@ npx tsx examples/blog.ts
 
 The example wires dependencies via Effect Layers -- no global config or constructor options:
 
-```typescript title="main.ts"
-import { Effect, Layer } from "effect"
-import { DynamoClient } from "effect-dynamodb"
-
+```typescript title="main.ts" region="layer" example="blog.ts"
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -377,8 +356,8 @@ const AppLayer = Layer.mergeAll(
 const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
-  () => console.log("Done."),
-  (err) => console.error("Failed:", err),
+  () => console.log("\nDone."),
+  (err) => console.error("\nFailed:", err),
 )
 ```
 

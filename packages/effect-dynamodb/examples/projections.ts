@@ -32,6 +32,7 @@ import * as Table from "../src/Table.js"
 // 1. Domain models
 // ---------------------------------------------------------------------------
 
+// #region model
 class Employee extends Schema.Class<Employee>("Employee")({
   employeeId: Schema.String,
   name: Schema.NonEmptyString,
@@ -40,11 +41,13 @@ class Employee extends Schema.Class<Employee>("Employee")({
   salary: Schema.Number,
   title: Schema.String,
 }) {}
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 2. Schema + Entity + Table
 // ---------------------------------------------------------------------------
 
+// #region schema-entity-table
 const AppSchema = DynamoSchema.make({ name: "proj-demo", version: 1 })
 
 const Employees = Entity.make({
@@ -65,12 +68,14 @@ const Employees = Entity.make({
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Employees } })
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 3. Main program
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
+  // #region seed-data
   // Typed execution gateway — binds all table members
   const db = yield* DynamoClient.make(MainTable)
 
@@ -110,10 +115,12 @@ const program = Effect.gen(function* () {
     title: "Marketing Lead",
   })
   yield* Console.log("Seeded 3 employees\n")
+  // #endregion
 
   // --- Build a projection ---
   yield* Console.log("=== Projection.projection() ===\n")
 
+  // #region projected-get-item
   // Build a projection to fetch only name and department
   const nameAndDept = Projection.projection(["name", "department"])
   yield* Console.log(`Expression: ${nameAndDept.expression}`)
@@ -142,6 +149,7 @@ const program = Effect.gen(function* () {
     yield* Console.log("  → Only requested fields returned (name, department)")
     yield* Console.log("  → salary, email, title, keys all excluded\n")
   }
+  // #endregion
 
   // --- Projection with more fields ---
   yield* Console.log("=== Broader Projection ===\n")
@@ -168,6 +176,7 @@ const program = Effect.gen(function* () {
   // --- Projection with query ---
   yield* Console.log("=== Projected Query ===\n")
 
+  // #region projected-query
   const listProjection = Projection.projection(["name", "title"])
   yield* Console.log(`Fetching engineering team (name + title only)...`)
 
@@ -189,14 +198,17 @@ const program = Effect.gen(function* () {
     const item = fromAttributeMap(rawItem)
     yield* Console.log(`  ${item.name}: ${item.title}`)
   }
+  // #endregion
   yield* Console.log("")
 
   // --- Empty projection ---
   yield* Console.log("=== Edge Case: Empty Projection ===\n")
 
+  // #region empty-projection
   const empty = Projection.projection([])
   yield* Console.log(`Empty projection expression: "${empty.expression}"`)
   yield* Console.log(`Empty projection names: ${JSON.stringify(empty.names)}\n`)
+  // #endregion
 
   // --- Cleanup ---
   yield* Console.log("=== Cleanup ===\n")
@@ -208,6 +220,7 @@ const program = Effect.gen(function* () {
 // 4. Provide dependencies and run
 // ---------------------------------------------------------------------------
 
+// #region layer-setup
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -223,3 +236,4 @@ Effect.runPromise(main).then(
   () => console.log("\nDone."),
   (err) => console.error("\nFailed:", err),
 )
+// #endregion

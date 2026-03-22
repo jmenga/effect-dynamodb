@@ -51,9 +51,7 @@ GSI1 is **overloaded** -- it serves the `owned` collection (User + Repository by
 
 Pure domain models with no DynamoDB concepts:
 
-```typescript title="models.ts"
-import { Schema } from "effect"
-
+```typescript title="models.ts" region="models" example="version-control.ts"
 class User extends Schema.Class<User>("User")({
   username: Schema.String,
   fullName: Schema.String,
@@ -70,6 +68,9 @@ class Repository extends Schema.Class<Repository>("Repository")({
   defaultBranch: Schema.String,
 }) {}
 
+const IssueStatus = { Open: "Open", Closed: "Closed" } as const
+const IssueStatusSchema = Schema.Literals(Object.values(IssueStatus))
+
 class Issue extends Schema.Class<Issue>("Issue")({
   issueNumber: Schema.String,
   repoName: Schema.String,
@@ -77,7 +78,7 @@ class Issue extends Schema.Class<Issue>("Issue")({
   username: Schema.String,
   subject: Schema.String,
   body: Schema.String,
-  status: Schema.Literals(["Open", "Closed"]),
+  status: IssueStatusSchema,
 }) {}
 
 class PullRequest extends Schema.Class<PullRequest>("PullRequest")({
@@ -87,7 +88,7 @@ class PullRequest extends Schema.Class<PullRequest>("PullRequest")({
   username: Schema.String,
   subject: Schema.String,
   body: Schema.String,
-  status: Schema.Literals(["Open", "Closed"]),
+  status: IssueStatusSchema,
 }) {}
 ```
 
@@ -99,20 +100,22 @@ Issue and PullRequest both have a `status` field using `Schema.Literals` -- this
 
 ### Schema and Table
 
-```typescript title="entities.ts"
-import { DynamoSchema, Table } from "effect-dynamodb"
-
+```typescript title="entities.ts" region="schema" example="version-control.ts"
 const VcsSchema = DynamoSchema.make({ name: "vcs", version: 1 })
-const VcsTable = Table.make({ schema: VcsSchema, entities: { Users, Repositories, Issues, PullRequests } })
+```
+
+```typescript title="entities.ts" region="table" example="version-control.ts"
+const VcsTable = Table.make({
+  schema: VcsSchema,
+  entities: { Users, Repositories, Issues, PullRequests },
+})
 ```
 
 ### User Entity
 
 User has a primary index and participates in the `owned` collection on GSI1:
 
-```typescript title="entities.ts"
-import { Entity } from "effect-dynamodb"
-
+```typescript title="entities.ts" region="user-entity" example="version-control.ts"
 const Users = Entity.make({
   model: User,
   entityType: "User",
@@ -136,7 +139,7 @@ const Users = Entity.make({
 
 Repository participates in both collections -- `owned` on GSI1 (repos by owner) and `activity` on GSI2 (repo + issues + PRs):
 
-```typescript title="entities.ts"
+```typescript title="entities.ts" region="repository-entity" example="version-control.ts"
 const Repositories = Entity.make({
   model: Repository,
   entityType: "Repository",
@@ -168,7 +171,7 @@ The `owned` collection works because User's GSI1 PK uses `username` and Reposito
 
 Issue participates in the `managed` collection on GSI1 (issues by creator) and the `activity` collection on GSI2 (issues by repo). Both sort keys include `status` for prefix-based filtering:
 
-```typescript title="entities.ts"
+```typescript title="entities.ts" region="issue-entity" example="version-control.ts"
 const Issues = Entity.make({
   model: Issue,
   entityType: "Issue",
@@ -203,7 +206,7 @@ Key design decisions:
 
 PullRequest mirrors Issue's index structure -- same two collections, same status-based sort keys:
 
-```typescript title="entities.ts"
+```typescript title="entities.ts" region="pullrequest-entity" example="version-control.ts"
 const PullRequests = Entity.make({
   model: PullRequest,
   entityType: "PullRequest",
@@ -233,7 +236,7 @@ const PullRequests = Entity.make({
 
 ## Step 3: Seed Data
 
-```typescript title="seed.ts"
+```typescript title="seed.ts" region="seed-data" example="version-control.ts"
 const users = {
   octocat: {
     username: "octocat",
@@ -247,7 +250,7 @@ const users = {
     bio: "Creator of Linux and Git",
     location: "Portland, OR",
   },
-}
+} as const
 
 const repos = {
   helloWorld: {
@@ -266,7 +269,7 @@ const repos = {
     isPrivate: false,
     defaultBranch: "master",
   },
-}
+} as const
 
 const issues = {
   helloWorldBug: {
@@ -296,7 +299,7 @@ const issues = {
     body: "Kernel panic when booting with specific hardware configuration.",
     status: "Open" as const,
   },
-}
+} as const
 
 const pullRequests = {
   helloWorldPR: {
@@ -317,31 +320,21 @@ const pullRequests = {
     body: "Addresses kernel panic on boot with specific hardware.",
     status: "Open" as const,
   },
-}
+} as const
 ```
 
-```typescript title="seed.ts"
-import { DynamoClient } from "effect-dynamodb"
-
-const {
-  Users: boundUsers,
-  Repositories: boundRepos,
-  Issues: boundIssues,
-  PullRequests: boundPRs,
-} = yield* DynamoClient.make(VcsTable)
-
-// Seed all data
+```typescript title="seed.ts" region="seed-execute" example="version-control.ts"
 for (const user of Object.values(users)) {
-  yield* boundUsers.put(user)
+  yield* db.Users.put(user)
 }
 for (const repo of Object.values(repos)) {
-  yield* boundRepos.put(repo)
+  yield* db.Repositories.put(repo)
 }
 for (const issue of Object.values(issues)) {
-  yield* boundIssues.put(issue)
+  yield* db.Issues.put(issue)
 }
 for (const pr of Object.values(pullRequests)) {
-  yield* boundPRs.put(pr)
+  yield* db.PullRequests.put(pr)
 }
 ```
 
@@ -353,13 +346,13 @@ for (const pr of Object.values(pullRequests)) {
 
 > Look up a user by their username (primary key).
 
-```typescript
-const octocat = yield* boundUsers.get({ username: "octocat" })
+```typescript region="pattern-1" example="version-control.ts"
+const octocat = yield* db.Users.get({ username: "octocat" })
 // octocat.fullName → "The Octocat"
 // octocat.bio → "GitHub mascot"
 // octocat.location → "San Francisco, CA"
 
-const torvalds = yield* boundUsers.get({ username: "torvalds" })
+const torvalds = yield* db.Users.get({ username: "torvalds" })
 // torvalds.fullName → "Linus Torvalds"
 ```
 
@@ -367,18 +360,12 @@ const torvalds = yield* boundUsers.get({ username: "torvalds" })
 
 > Look up a repository by owner and name (composite primary key).
 
-```typescript
-const helloWorld = yield* boundRepos.get({
-  repoOwner: "octocat",
-  repoName: "hello-world",
-})
+```typescript region="pattern-2" example="version-control.ts"
+const helloWorld = yield* db.Repositories.get({ repoOwner: "octocat", repoName: "hello-world" })
 // helloWorld.about → "My first repository on GitHub!"
 // helloWorld.defaultBranch → "main"
 
-const linux = yield* boundRepos.get({
-  repoOwner: "torvalds",
-  repoName: "linux",
-})
+const linux = yield* db.Repositories.get({ repoOwner: "torvalds", repoName: "linux" })
 // linux.about → "Linux kernel source tree"
 // linux.defaultBranch → "master"
 ```
@@ -389,23 +376,18 @@ const linux = yield* boundRepos.get({
 
 User and Repository share GSI1 via the `owned` collection. Both use the owner's username as the partition key, so a single partition holds the user profile and all their repositories.
 
-```typescript
-// Octocat's repositories
-const octocatRepos = yield* boundRepos.collect(
+```typescript region="pattern-3" example="version-control.ts"
+const octocatRepos = yield* db.Repositories.collect(
   Repositories.query.created({ repoOwner: "octocat" }),
 )
 // → [{ repoName: "hello-world", ... }]
 
-// Torvalds' repositories
-const torvaldsRepos = yield* boundRepos.collect(
+const torvaldsRepos = yield* db.Repositories.collect(
   Repositories.query.created({ repoOwner: "torvalds" }),
 )
 // → [{ repoName: "linux", ... }]
 
-// User side of the same collection
-const octocatProfile = yield* boundUsers.collect(
-  Users.query.owned({ username: "octocat" }),
-)
+const octocatProfile = yield* db.Users.collect(Users.query.owned({ username: "octocat" }))
 // → [{ fullName: "The Octocat", ... }]
 ```
 
@@ -417,9 +399,8 @@ Both queries hit GSI1 with the same partition key. DynamoDB serves both from the
 
 Creating an issue is a simple `put`. Closing it requires an `update` with `set()`. Because `status` appears in GSI sort keys, changing it triggers GSI key recomposition -- the all-or-none rule means you must provide all composites for affected GSIs.
 
-```typescript
-// Create a new issue
-const newIssue = yield* boundIssues.put({
+```typescript region="pattern-4" example="version-control.ts"
+const newIssue = yield* db.Issues.put({
   issueNumber: "3",
   repoName: "hello-world",
   repoOwner: "octocat",
@@ -430,12 +411,9 @@ const newIssue = yield* boundIssues.put({
 })
 // newIssue.status → "Open"
 
-// Close the issue — status touches GSI1 and GSI2 sort keys
-// GSI1 (created): username + status — both required
-// GSI2 (todos): status is the only non-primary composite
-const closedIssue = yield* boundIssues.update(
+const closedIssue = yield* db.Issues.update(
   { repoOwner: "octocat", repoName: "hello-world", issueNumber: "3" },
-  { status: "Closed", username: "torvalds" }, // all GSI1 composites required
+  Entity.set({ status: "Closed", username: "torvalds" }),
 )
 // closedIssue.status → "Closed"
 // closedIssue.subject → "Enhancement: Add CI pipeline" (preserved)
@@ -449,9 +427,8 @@ The `username` field must be included in the `set()` even though it hasn't chang
 
 The same pattern as issues -- `status` in the sort key means the GSI keys must be fully recomposed on status change.
 
-```typescript
-// Create a PR
-const newPR = yield* boundPRs.put({
+```typescript region="pattern-5" example="version-control.ts"
+const newPR = yield* db.PullRequests.put({
   pullRequestNumber: "2",
   repoName: "hello-world",
   repoOwner: "octocat",
@@ -461,10 +438,9 @@ const newPR = yield* boundPRs.put({
   status: "Open",
 })
 
-// Close the PR (merged)
-const closedPR = yield* boundPRs.update(
+const closedPR = yield* db.PullRequests.update(
   { repoOwner: "octocat", repoName: "hello-world", pullRequestNumber: "2" },
-  { status: "Closed", username: "octocat" }, // all GSI1 composites required
+  Entity.set({ status: "Closed", username: "octocat" }),
 )
 // closedPR.status → "Closed"
 ```
@@ -475,30 +451,19 @@ const closedPR = yield* boundPRs.update(
 
 Issue and PullRequest share GSI1 via the `managed` collection. Both use `username` as the partition key. Query each entity type separately to see a user's work items.
 
-```typescript
-// Torvalds' issues
-const torvaldsIssues = yield* boundIssues.collect(
-  Issues.query.created({ username: "torvalds" }),
-)
-// → [
-//   { issueNumber: "1", subject: "Bug: README has typo", status: "Open" },
-//   { issueNumber: "3", subject: "Enhancement: Add CI pipeline", status: "Closed" },
-// ]
+```typescript region="pattern-6" example="version-control.ts"
+const torvaldsIssues = yield* db.Issues.collect(Issues.query.created({ username: "torvalds" }))
+// → 2 issues (hello-world #1 Open, hello-world #3 Closed)
 
-// Torvalds' PRs
-const torvaldsPRs = yield* boundPRs.collect(
+const torvaldsPRs = yield* db.PullRequests.collect(
   PullRequests.query.created({ username: "torvalds" }),
 )
 // → [{ pullRequestNumber: "1", subject: "Fix README typo", status: "Open" }]
 
-// Octocat's issues
-const octocatIssues = yield* boundIssues.collect(
-  Issues.query.created({ username: "octocat" }),
-)
+const octocatIssues = yield* db.Issues.collect(Issues.query.created({ username: "octocat" }))
 // → 2 issues (hello-world #2 Closed, linux #1 Open)
 
-// Octocat's PRs
-const octocatPRs = yield* boundPRs.collect(
+const octocatPRs = yield* db.PullRequests.collect(
   PullRequests.query.created({ username: "octocat" }),
 )
 // → 2 PRs (linux #1 Open, hello-world #2 Closed)
@@ -510,9 +475,8 @@ const octocatPRs = yield* boundPRs.collect(
 
 Repository, Issue, and PullRequest share GSI2 via the `activity` collection. All use `repoOwner + repoName` as the partition key, grouping everything related to a repository in one partition.
 
-```typescript
-// hello-world issues
-const hwIssues = yield* boundIssues.collect(
+```typescript region="pattern-7" example="version-control.ts"
+const hwIssues = yield* db.Issues.collect(
   Issues.query.todos({ repoOwner: "octocat", repoName: "hello-world" }),
 )
 // → 3 issues: #1 (Open), #2 (Closed), #3 (Closed)
@@ -520,20 +484,22 @@ const hwIssues = yield* boundIssues.collect(
 const hwOpenIssues = hwIssues.filter((i) => i.status === "Open")
 // → [{ issueNumber: "1", ... }]
 
-// hello-world PRs
-const hwPRs = yield* boundPRs.collect(
+const hwPRs = yield* db.PullRequests.collect(
   PullRequests.query.enhancements({ repoOwner: "octocat", repoName: "hello-world" }),
 )
 // → 2 PRs: #1 (Open), #2 (Closed)
 
-// linux issues
-const linuxIssues = yield* boundIssues.collect(
+const linuxIssues = yield* db.Issues.collect(
   Issues.query.todos({ repoOwner: "torvalds", repoName: "linux" }),
 )
 // → [{ issueNumber: "1", status: "Open", ... }]
 
-// Repository record itself via activity index
-const hwRepoActivity = yield* boundRepos.collect(
+const linuxPRs = yield* db.PullRequests.collect(
+  PullRequests.query.enhancements({ repoOwner: "torvalds", repoName: "linux" }),
+)
+// → [{ pullRequestNumber: "1", status: "Open", ... }]
+
+const hwRepoActivity = yield* db.Repositories.collect(
   Repositories.query.activity({ repoOwner: "octocat", repoName: "hello-world" }),
 )
 // → [{ repoName: "hello-world", ... }]
@@ -547,9 +513,7 @@ Because `status` is in the sort key for Issues and PullRequests on GSI2, items w
 
 `Transaction.transactWrite` ensures both items are created as a single atomic operation -- if either fails, neither is persisted.
 
-```typescript
-import { Transaction } from "effect-dynamodb"
-
+```typescript region="pattern-8" example="version-control.ts"
 yield* Transaction.transactWrite([
   Issues.put({
     issueNumber: "2",
@@ -572,12 +536,12 @@ yield* Transaction.transactWrite([
 ])
 
 // Both created atomically — verify via activity index
-const linuxIssuesAfter = yield* boundIssues.collect(
+const linuxIssuesAfter = yield* db.Issues.collect(
   Issues.query.todos({ repoOwner: "torvalds", repoName: "linux" }),
 )
 // → 2 issues now
 
-const linuxPRsAfter = yield* boundPRs.collect(
+const linuxPRsAfter = yield* db.PullRequests.collect(
   PullRequests.query.enhancements({ repoOwner: "torvalds", repoName: "linux" }),
 )
 // → 2 PRs now
@@ -601,10 +565,7 @@ npx tsx examples/version-control.ts
 
 The example wires dependencies via Effect Layers:
 
-```typescript title="main.ts"
-import { Effect, Layer } from "effect"
-import { DynamoClient } from "effect-dynamodb"
-
+```typescript title="main.ts" region="layer" example="version-control.ts"
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -617,8 +578,8 @@ const AppLayer = Layer.mergeAll(
 const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
-  () => console.log("Done."),
-  (err) => console.error("Failed:", err),
+  () => console.log("\nDone."),
+  (err) => console.error("\nFailed:", err),
 )
 ```
 

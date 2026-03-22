@@ -28,6 +28,7 @@ import * as Table from "../src/Table.js"
 // 1. Domain models
 // ---------------------------------------------------------------------------
 
+// #region models
 const Role = { Admin: "admin", Member: "member" } as const
 const RoleSchema = Schema.Literals(Object.values(Role))
 
@@ -48,11 +49,13 @@ class Order extends Schema.Class<Order>("Order")({
   quantity: Schema.Number,
   status: OrderStatusSchema,
 }) {}
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 2. Schema + Entities + Table
 // ---------------------------------------------------------------------------
 
+// #region entities
 const AppSchema = DynamoSchema.make({ name: "batch-demo", version: 1 })
 
 const Users = Entity.make({
@@ -85,6 +88,7 @@ const Orders = Entity.make({
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Users, Orders } })
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 3. Main program
@@ -102,6 +106,7 @@ const program = Effect.gen(function* () {
   // --- Batch.write — create multiple items at once ---
   yield* Console.log("=== Batch.write — Create Items ===\n")
 
+  // #region batch-write
   // Batch.write accepts a mix of put and delete operations.
   // DynamoDB limits batch writes to 25 items per request —
   // effect-dynamodb auto-chunks larger batches transparently.
@@ -131,11 +136,13 @@ const program = Effect.gen(function* () {
       status: "pending",
     }),
   ])
+  // #endregion
   yield* Console.log("Created 3 users + 3 orders in a single batch write\n")
 
   // --- Batch.get — fetch multiple items at once ---
   yield* Console.log("=== Batch.get — Fetch Items ===\n")
 
+  // #region batch-get
   // Batch.get returns a typed tuple: each position matches the entity type.
   // DynamoDB limits batch gets to 100 items per request —
   // effect-dynamodb auto-chunks and retries unprocessed keys.
@@ -145,6 +152,7 @@ const program = Effect.gen(function* () {
     Orders.get({ orderId: "o-1" }),
     Orders.get({ orderId: "o-2" }),
   ])
+  // #endregion
 
   // Each result is Model | undefined (undefined if item doesn't exist)
   yield* Console.log(`User: ${alice?.name} (${alice?.role})`)
@@ -156,10 +164,12 @@ const program = Effect.gen(function* () {
   // --- Batch.get with non-existent items ---
   yield* Console.log("=== Batch.get — Missing Items Return undefined ===\n")
 
+  // #region batch-get-missing
   const [existing, missing] = yield* Batch.get([
     Users.get({ userId: "u-1" }),
     Users.get({ userId: "u-nonexistent" }),
   ])
+  // #endregion
 
   yield* Console.log(`Existing: ${existing?.name ?? "undefined"}`)
   yield* Console.log(`Missing: ${missing?.name ?? "undefined (as expected)"}`)
@@ -168,6 +178,7 @@ const program = Effect.gen(function* () {
   // --- Batch.write with deletes ---
   yield* Console.log("=== Batch.write — Mixed Put + Delete ===\n")
 
+  // #region batch-write-mixed
   yield* Batch.write([
     // Add a new order
     Orders.put({
@@ -180,19 +191,21 @@ const program = Effect.gen(function* () {
     // Delete an existing order
     Orders.delete({ orderId: "o-3" }),
   ])
-  yield* Console.log("Added order o-4 and deleted order o-3 in one batch\n")
 
   // Verify: o-3 is gone, o-4 exists
   const [deleted, created] = yield* Batch.get([
     Orders.get({ orderId: "o-3" }),
     Orders.get({ orderId: "o-4" }),
   ])
+  // #endregion
+  yield* Console.log("Added order o-4 and deleted order o-3 in one batch\n")
   yield* Console.log(`o-3: ${deleted?.product ?? "deleted (undefined)"}`)
   yield* Console.log(`o-4: ${created?.product ?? "missing"} (${created?.status})\n`)
 
   // --- Cross-entity batch write ---
   yield* Console.log("=== Cross-Entity Batch Write ===\n")
 
+  // #region batch-write-cross-entity
   yield* Batch.write([
     Users.put({ userId: "u-4", email: "diana@example.com", name: "Diana", role: "admin" }),
     Orders.put({
@@ -204,6 +217,7 @@ const program = Effect.gen(function* () {
     }),
     Users.delete({ userId: "u-3" }),
   ])
+  // #endregion
   yield* Console.log("Atomically created user u-4 + order o-5, deleted user u-3\n")
 
   // --- Cleanup ---
@@ -216,6 +230,7 @@ const program = Effect.gen(function* () {
 // 4. Provide dependencies and run
 // ---------------------------------------------------------------------------
 
+// #region run
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -231,3 +246,4 @@ Effect.runPromise(main).then(
   () => console.log("\nDone."),
   (err) => console.error("\nFailed:", err),
 )
+// #endregion

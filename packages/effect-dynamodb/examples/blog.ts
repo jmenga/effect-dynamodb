@@ -37,6 +37,7 @@ import * as Transaction from "../src/Transaction.js"
 // 1. Pure domain models — no DynamoDB concepts
 // =============================================================================
 
+// #region models
 class User extends Schema.Class<User>("User")({
   userId: Schema.String,
   email: Schema.String,
@@ -63,17 +64,21 @@ class Comment extends Schema.Class<Comment>("Comment")({
   authorId: Schema.String,
   body: Schema.NonEmptyString,
 }) {}
+// #endregion
 
 // =============================================================================
 // 2. Schema
 // =============================================================================
 
+// #region schema
 const BlogSchema = DynamoSchema.make({ name: "blog", version: 1 })
+// #endregion
 
 // =============================================================================
 // 3. Entity definitions — pure definitions with composite indexes
 // =============================================================================
 
+// #region user-entity
 const Users = Entity.make({
   model: User,
   entityType: "User",
@@ -86,7 +91,9 @@ const Users = Entity.make({
   timestamps: true,
   versioned: true,
 })
+// #endregion
 
+// #region post-entity
 const Posts = Entity.make({
   model: Post,
   entityType: "Post",
@@ -103,7 +110,9 @@ const Posts = Entity.make({
   },
   timestamps: true,
 })
+// #endregion
 
+// #region comment-entity
 const Comments = Entity.make({
   model: Comment,
   entityType: "Comment",
@@ -121,20 +130,18 @@ const Comments = Entity.make({
   timestamps: true,
 })
 
-// =============================================================================
-// 4. Table — declares entities
-// =============================================================================
-
 const BlogTable = Table.make({
   schema: BlogSchema,
   entities: { Users, Posts, Comments },
 })
+// #endregion
 
 // =============================================================================
 // 5. Main program
 // =============================================================================
 
 const program = Effect.gen(function* () {
+  // #region seed-data
   // Typed execution gateway
   const db = yield* DynamoClient.make(BlogTable)
 
@@ -207,19 +214,23 @@ const program = Effect.gen(function* () {
     body: "Very helpful, thanks!",
   })
   yield* Console.log("Created comments: comment-1, comment-2\n")
+  // #endregion
 
   // --- Pattern 3: GSI Queries ---
   yield* Console.log("=== Pattern 3: GSI Queries ===\n")
 
+  // #region gsi-queries
   // Posts by author
   const alicePosts = yield* db.Posts.collect(Posts.query.byAuthor({ authorId: "alice-1" }))
+
+  // Comments on a post
+  const postComments = yield* db.Comments.collect(Comments.query.byPost({ postId: "post-1" }))
+  // #endregion
   yield* Console.log(`Alice's posts (${alicePosts.length}):`)
   for (const p of alicePosts) {
     yield* Console.log(`  ${p.postId}: "${p.title}" — ${p.status}`)
   }
 
-  // Comments on a post
-  const postComments = yield* db.Comments.collect(Comments.query.byPost({ postId: "post-1" }))
   yield* Console.log(`\nComments on post-1 (${postComments.length}):`)
   for (const c of postComments) {
     yield* Console.log(`  ${c.commentId}: "${c.body}" (by ${c.authorId})`)
@@ -229,11 +240,13 @@ const program = Effect.gen(function* () {
   // --- Pattern 4: Pipeable updates ---
   yield* Console.log("=== Pattern 4: Pipeable Updates ===\n")
 
+  // #region update
   // db.Users.update(key, ...combinators) — type-safe
   const updatedAlice = yield* db.Users.update(
     { userId: "alice-1" },
     Entity.set({ displayName: "Alice B.", postCount: 3 }),
   )
+  // #endregion
   // updatedAlice: User
   yield* Console.log(
     `Updated user: ${updatedAlice.displayName} (postCount: ${updatedAlice.postCount})`,
@@ -246,6 +259,7 @@ const program = Effect.gen(function* () {
   )
   yield* Console.log(`  updated bio: ${aliceV2.bio}`)
 
+  // #region optimistic-locking
   // expectedVersion for optimistic locking
   const lockResult = yield* db.Users.update(
     { userId: "alice-1" },
@@ -257,20 +271,19 @@ const program = Effect.gen(function* () {
       Effect.succeed(`Caught OptimisticLockError: expected v${e.expectedVersion}`),
     ),
   )
+  // #endregion
   yield* Console.log(`  ${lockResult}\n`)
 
   // --- Pattern 5: Transactions — composable API ---
   yield* Console.log("=== Pattern 5: Transactions ===\n")
 
+  // #region transactions
   // Atomic multi-entity read — typed tuple, no cast needed
   const [txUser, txPost] = yield* Transaction.transactGet([
     Users.get({ userId: "alice-1" }),
     Posts.get({ postId: "post-1" }),
   ])
   // txUser: User | undefined, txPost: Post | undefined
-  yield* Console.log(`transactGet: fetched 2 items atomically`)
-  yield* Console.log(`  User: ${txUser?.displayName}`)
-  yield* Console.log(`  Post: "${txPost?.title}"`)
 
   // Atomic multi-entity write — entity intermediates directly
   yield* Transaction.transactWrite([
@@ -284,6 +297,10 @@ const program = Effect.gen(function* () {
     }),
     Posts.delete({ postId: "post-3" }),
   ])
+  // #endregion
+  yield* Console.log(`transactGet: fetched 2 items atomically`)
+  yield* Console.log(`  User: ${txUser?.displayName}`)
+  yield* Console.log(`  Post: "${txPost?.title}"`)
   yield* Console.log("\ntransactWrite: created post-4 + deleted post-3 atomically\n")
 
   // --- Pattern 6: Collection queries ---
@@ -323,6 +340,7 @@ const program = Effect.gen(function* () {
 // 6. Provide dependencies and run
 // =============================================================================
 
+// #region layer
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -338,5 +356,6 @@ Effect.runPromise(main).then(
   () => console.log("\nDone."),
   (err) => console.error("\nFailed:", err),
 )
+// #endregion
 
 export { program, BlogTable, Users, Posts, Comments, User, Post, Comment }

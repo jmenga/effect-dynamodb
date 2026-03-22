@@ -30,6 +30,7 @@ import * as Table from "../src/Table.js"
 // 1. Pure domain model — no DynamoDB concepts
 // =============================================================================
 
+// #region model
 const StoreCategory = {
   FoodCoffee: "food/coffee",
   FoodMeal: "food/meal",
@@ -52,12 +53,15 @@ class MallStore extends Schema.Class<MallStore>("MallStore")({
   discount: Schema.String.pipe(Schema.withDecodingDefaultKey(() => "0.00")),
   deposit: Schema.optional(Schema.Number),
 }) {}
+// #endregion
 
 // =============================================================================
 // 2. Schema
 // =============================================================================
 
+// #region schema
 const MallSchema = DynamoSchema.make({ name: "mall", version: 1 })
+// #endregion
 
 // =============================================================================
 // 3. Entity definition — 1 entity, 2 GSIs
@@ -67,6 +71,7 @@ const MallSchema = DynamoSchema.make({ name: "mall", version: 1 })
 // GSI2 `leases`:     pk=[storeId],        sk=[leaseEndDate]
 // =============================================================================
 
+// #region entity
 const MallStores = Entity.make({
   model: MallStore,
   entityType: "MallStore",
@@ -89,16 +94,14 @@ const MallStores = Entity.make({
   timestamps: true,
 })
 
-// =============================================================================
-// 4. Table definition — declare entities as members
-// =============================================================================
-
 const MallTable = Table.make({ schema: MallSchema, entities: { MallStores } })
+// #endregion
 
 // =============================================================================
 // 5. Seed data
 // =============================================================================
 
+// #region seed-data
 const stores = {
   // Mall: EastPointe — Building A
   starCoffee: {
@@ -174,6 +177,7 @@ const stores = {
     discount: "0.00",
   },
 }
+// #endregion
 
 // =============================================================================
 // 6. Helpers
@@ -194,6 +198,7 @@ const assertEq = <T>(actual: T, expected: T, label: string): void => {
 // =============================================================================
 
 const program = Effect.gen(function* () {
+  // #region seed-loop
   const db = yield* DynamoClient.make(MallTable)
 
   // --- Setup: create table ---
@@ -203,18 +208,24 @@ const program = Effect.gen(function* () {
   for (const store of Object.values(stores)) {
     yield* db.MallStores.put(store)
   }
+  // #endregion
 
   // -------------------------------------------------------------------------
   // Pattern 1: Get specific store by city/mall/building/store (primary key)
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 1: Get Specific Store (primary key)")
 
+  // #region pattern-1
   const coffee = yield* db.MallStores.get({
     cityId: "atlanta",
     mallId: "eastpointe",
     buildingId: "bldg-a",
     storeId: "star-coffee",
   })
+  // coffee.category → "food/coffee"
+  // coffee.rent → "3500.00"
+  // coffee.deposit → 7000
+  // #endregion
   assertEq(coffee.storeId, "star-coffee", "get storeId")
   assertEq(coffee.category, "food/coffee", "get category")
   assertEq(coffee.rent, "3500.00", "get rent")
@@ -227,19 +238,23 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 2: All Stores in a Mall (gsi1)")
 
+  // #region pattern-2
   const eastpointeStores = yield* db.MallStores.collect(
     MallStores.query.units({ mallId: "eastpointe" }),
   )
+  // → 4 stores: star-coffee, burger-barn, tech-zone, trendy-threads
+
+  const westgateStores = yield* db.MallStores.collect(
+    MallStores.query.units({ mallId: "westgate" }),
+  )
+  // → 2 stores: mega-mart, gifts-galore
+  // #endregion
   assertEq(eastpointeStores.length, 4, "eastpointe has 4 stores")
   const eastpointeIds = eastpointeStores.map((s) => s.storeId).sort()
   assertEq(
     eastpointeIds,
     ["burger-barn", "star-coffee", "tech-zone", "trendy-threads"],
     "eastpointe store IDs",
-  )
-
-  const westgateStores = yield* db.MallStores.collect(
-    MallStores.query.units({ mallId: "westgate" }),
   )
   assertEq(westgateStores.length, 2, "westgate has 2 stores")
   const westgateIds = westgateStores.map((s) => s.storeId).sort()
@@ -251,6 +266,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 3: Stores in a Building (gsi1 + beginsWith)")
 
+  // #region pattern-3
   const unitsIndex = MallStores.indexes.units
   const bldgAPrefix = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, unitsIndex, {
     buildingId: "bldg-a",
@@ -259,9 +275,7 @@ const program = Effect.gen(function* () {
   const bldgAStores = yield* db.MallStores.collect(
     MallStores.query.units({ mallId: "eastpointe" }).pipe(Query.where({ beginsWith: bldgAPrefix })),
   )
-  assertEq(bldgAStores.length, 2, "bldg-a has 2 stores")
-  const bldgAIds = bldgAStores.map((s) => s.storeId).sort()
-  assertEq(bldgAIds, ["burger-barn", "star-coffee"], "bldg-a store IDs")
+  // → 2 stores: star-coffee, burger-barn
 
   const bldgBPrefix = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, unitsIndex, {
     buildingId: "bldg-b",
@@ -270,6 +284,11 @@ const program = Effect.gen(function* () {
   const bldgBStores = yield* db.MallStores.collect(
     MallStores.query.units({ mallId: "eastpointe" }).pipe(Query.where({ beginsWith: bldgBPrefix })),
   )
+  // → 2 stores: tech-zone, trendy-threads
+  // #endregion
+  assertEq(bldgAStores.length, 2, "bldg-a has 2 stores")
+  const bldgAIds = bldgAStores.map((s) => s.storeId).sort()
+  assertEq(bldgAIds, ["burger-barn", "star-coffee"], "bldg-a store IDs")
   assertEq(bldgBStores.length, 2, "bldg-b has 2 stores")
   const bldgBIds = bldgBStores.map((s) => s.storeId).sort()
   assertEq(bldgBIds, ["tech-zone", "trendy-threads"], "bldg-b store IDs")
@@ -280,15 +299,10 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 4: Lease Renewals by Date Range (gsi2)")
 
-  // All leases for burger-barn
-  const burgerLeases = yield* db.MallStores.collect(
-    MallStores.query.leases({ storeId: "burger-barn" }),
-  )
-  assertEq(burgerLeases.length, 1, "burger-barn has 1 lease record")
-  assertEq(burgerLeases[0]!.leaseEndDate, "2025-06-30", "burger-barn lease end date")
-
-  // Find stores with leases expiring in Q1 2025 (Jan-Mar) using between on star-coffee
+  // #region pattern-4
   const leasesIndex = MallStores.indexes.leases
+
+  // Q1 2025 bounds
   const q1Lo = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, leasesIndex, {
     leaseEndDate: "2025-01-01",
   })
@@ -296,21 +310,21 @@ const program = Effect.gen(function* () {
     leaseEndDate: "2025-03-31",
   })
 
+  // star-coffee lease ends 2025-03-31 — within Q1
   const starCoffeeQ1 = yield* db.MallStores.collect(
     MallStores.query
       .leases({ storeId: "star-coffee" })
       .pipe(Query.where({ between: [q1Lo, q1Hi] })),
   )
-  assertEq(starCoffeeQ1.length, 1, "star-coffee has 1 lease in Q1 2025")
-  assertEq(starCoffeeQ1[0]!.leaseEndDate, "2025-03-31", "star-coffee Q1 lease date")
+  // → 1 result (lease ends 2025-03-31)
 
-  // Check tech-zone lease (Q3 2025) does NOT appear in Q1 range
+  // tech-zone lease ends 2025-09-30 — NOT in Q1
   const techZoneQ1 = yield* db.MallStores.collect(
     MallStores.query.leases({ storeId: "tech-zone" }).pipe(Query.where({ between: [q1Lo, q1Hi] })),
   )
-  assertEq(techZoneQ1.length, 0, "tech-zone has no leases in Q1 2025")
+  // → 0 results
 
-  // tech-zone lease in Q3 2025
+  // Q3 2025 bounds for tech-zone
   const q3Lo = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, leasesIndex, {
     leaseEndDate: "2025-07-01",
   })
@@ -321,6 +335,18 @@ const program = Effect.gen(function* () {
   const techZoneQ3 = yield* db.MallStores.collect(
     MallStores.query.leases({ storeId: "tech-zone" }).pipe(Query.where({ between: [q3Lo, q3Hi] })),
   )
+  // → 1 result (lease ends 2025-09-30)
+  // #endregion
+
+  // All leases for burger-barn
+  const burgerLeases = yield* db.MallStores.collect(
+    MallStores.query.leases({ storeId: "burger-barn" }),
+  )
+  assertEq(burgerLeases.length, 1, "burger-barn has 1 lease record")
+  assertEq(burgerLeases[0]!.leaseEndDate, "2025-06-30", "burger-barn lease end date")
+  assertEq(starCoffeeQ1.length, 1, "star-coffee has 1 lease in Q1 2025")
+  assertEq(starCoffeeQ1[0]!.leaseEndDate, "2025-03-31", "star-coffee Q1 lease date")
+  assertEq(techZoneQ1.length, 0, "tech-zone has no leases in Q1 2025")
   assertEq(techZoneQ3.length, 1, "tech-zone has 1 lease in Q3 2025")
   assertEq(techZoneQ3[0]!.leaseEndDate, "2025-09-30", "tech-zone Q3 lease date")
   yield* Console.log("  Q1 star-coffee (1), Q1 tech-zone (0), Q3 tech-zone (1) — OK")
@@ -330,6 +356,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 5: Update Store Rent")
 
+  // #region pattern-5
   const updated = yield* db.MallStores.update(
     {
       cityId: "atlanta",
@@ -342,6 +369,10 @@ const program = Effect.gen(function* () {
       discount: "100.00",
     }),
   )
+  // updated.rent → "4000.00"
+  // updated.discount → "100.00"
+  // updated.category → "food/coffee" (preserved)
+  // #endregion
   assertEq(updated.rent, "4000.00", "updated rent")
   assertEq(updated.discount, "100.00", "updated discount")
   assertEq(updated.storeId, "star-coffee", "update preserves storeId")
@@ -363,12 +394,18 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 6: Delete Store")
 
+  // #region pattern-6
   yield* db.MallStores.delete({
     cityId: "atlanta",
     mallId: "westgate",
     buildingId: "bldg-c",
     storeId: "gifts-galore",
   })
+
+  // Verify: westgate now has 1 store
+  const westgateAfter = yield* db.MallStores.collect(MallStores.query.units({ mallId: "westgate" }))
+  // → 1 store: mega-mart
+  // #endregion
 
   const deleted = yield* db.MallStores.get({
     cityId: "atlanta",
@@ -380,9 +417,6 @@ const program = Effect.gen(function* () {
     Effect.catchTag("ItemNotFound", () => Effect.succeed(true)),
   )
   assert(deleted, "delete removes gifts-galore")
-
-  // Verify westgate now has 1 store
-  const westgateAfter = yield* db.MallStores.collect(MallStores.query.units({ mallId: "westgate" }))
   assertEq(westgateAfter.length, 1, "westgate has 1 store after delete")
   assertEq(westgateAfter[0]!.storeId, "mega-mart", "remaining westgate store is mega-mart")
   yield* Console.log("  Delete gifts-galore, westgate now has 1 store — OK")
@@ -396,6 +430,7 @@ const program = Effect.gen(function* () {
 // 8. Provide dependencies and run
 // =============================================================================
 
+// #region run
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -411,5 +446,6 @@ Effect.runPromise(main).then(
   () => console.log("\nDone."),
   (err) => console.error("\nFailed:", err),
 )
+// #endregion
 
 export { program, MallTable, MallStores, MallStore, MallSchema }

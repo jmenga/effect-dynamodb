@@ -21,15 +21,18 @@ A comprehensive example demonstrating the full effect-dynamodb high-level API. S
 
 Pure domain models with no DynamoDB concepts:
 
-```typescript title="models.ts"
-import { Schema } from "effect"
-import { DynamoModel } from "effect-dynamodb"
+```typescript region="models" example="crud.ts"
+const Role = { Admin: "admin", Member: "member" } as const
+const RoleSchema = Schema.Literals(Object.values(Role))
+
+const TaskStatus = { Todo: "todo", InProgress: "in-progress", Done: "done" } as const
+const TaskStatusSchema = Schema.Literals(Object.values(TaskStatus))
 
 class User extends Schema.Class<User>("User")({
   userId: Schema.String,
   email: Schema.String,
   displayName: Schema.NonEmptyString,
-  role: Schema.Literals(["admin", "member"]),
+  role: RoleSchema,
   createdBy: Schema.String,
 }) {}
 
@@ -41,7 +44,7 @@ class Task extends Schema.Class<Task>("Task")({
   taskId: Schema.String,
   userId: Schema.String,
   title: Schema.NonEmptyString,
-  status: Schema.Literals(["todo", "in-progress", "done"]),
+  status: TaskStatusSchema,
   priority: Schema.Number,
 }) {}
 ```
@@ -52,10 +55,9 @@ class Task extends Schema.Class<Task>("Task")({
 
 ## Step 2: Schema, Table, and Entities
 
-```typescript title="entities.ts"
-import { DynamoSchema, Entity, Table } from "effect-dynamodb"
-
+```typescript region="entities" example="crud.ts"
 const AppSchema = DynamoSchema.make({ name: "crud-demo", version: 1 })
+
 const Users = Entity.make({
   model: UserModel,
   entityType: "User",
@@ -92,8 +94,6 @@ const Tasks = Entity.make({
   versioned: true,
   softDelete: true,
 })
-
-const MainTable = Table.make({ schema: AppSchema, entities: { Users, Tasks } })
 ```
 
 Key configuration:
@@ -108,22 +108,26 @@ Key configuration:
 
 Before calling any entity operations, obtain a typed client via `DynamoClient.make(MainTable)` to resolve the `DynamoClient` and `TableConfig` dependencies. The returned client provides bound entities where all operations have `R = never`:
 
-```typescript title="put.ts"
-import { DynamoClient } from "effect-dynamodb"
+```typescript region="client" example="crud.ts"
+// Typed execution gateway — binds all table members
+const db = yield* DynamoClient.make(MainTable)
+```
 
-const { Users: users, Tasks: tasks } = yield* DynamoClient.make(MainTable)
+Create items with `put` -- returns the model type (e.g. `User`):
 
-// Returns the model type (User)
-const alice = yield* users.put({
+```typescript region="put" example="crud.ts"
+// Default: yield* returns the model type (User) — clean, no system fields
+const alice = yield* db.Users.put({
   userId: "u-alice",
   email: "alice@example.com",
   displayName: "Alice",
   role: "admin",
   createdBy: "system",
 })
-// alice.userId, alice.email, alice.displayName, alice.role, alice.createdBy
+// alice: User — has userId, email, displayName, role, createdBy
 
-const bob = yield* users.put({
+// For asRecord decode mode, use entity definitions with Effect.provide
+const bob = yield* db.Users.put({
   userId: "u-bob",
   email: "bob@example.com",
   displayName: "Bob",
@@ -134,8 +138,9 @@ const bob = yield* users.put({
 
 The same pattern applies to Tasks:
 
-```typescript title="put.ts"
-yield* tasks.put({
+```typescript region="put-tasks" example="crud.ts"
+// Tasks: bare yield* returns Task
+const task1 = yield* db.Tasks.put({
   taskId: "t-1",
   userId: "u-alice",
   title: "Design the API",
@@ -143,7 +148,7 @@ yield* tasks.put({
   priority: 1,
 })
 
-yield* tasks.put({
+yield* db.Tasks.put({
   taskId: "t-2",
   userId: "u-alice",
   title: "Write tests",
@@ -158,10 +163,10 @@ yield* tasks.put({
 
 `get` returns the model type by default:
 
-```typescript title="get.ts"
-// Returns the clean domain type (User)
-const user = yield* users.get({ userId: "u-alice" })
-// user.userId, user.displayName, user.role
+```typescript region="get" example="crud.ts"
+// Default: clean domain type — no keys, no system fields, no __edd_e__
+const userModel = yield* db.Users.get({ userId: "u-alice" })
+// userModel: User
 ```
 
 ---
@@ -170,20 +175,20 @@ const user = yield* users.get({ userId: "u-alice" })
 
 `update(key, ...combinators)` accepts `Entity.set()`, `Entity.expectedVersion()`, and other combinators as variadic rest arguments:
 
-```typescript title="update.ts"
-// Simple field update
-const updatedAlice = yield* users.update(
+```typescript region="update" example="crud.ts"
+// db.Users.update(key, ...combinators) — update via bound entity
+const updatedAlice = yield* db.Users.update(
   { userId: "u-alice" },
   Entity.set({ role: "member", displayName: "Alice W." }),
 )
-// updatedAlice: User -- clean model type
+// updatedAlice: User — clean model type
 
-// Multiple combinators composed together
-const updatedAgain = yield* users.update(
+// Second update
+const updatedAlice2 = yield* db.Users.update(
   { userId: "u-alice" },
   Entity.set({ displayName: "Alice Wu" }),
 )
-// updatedAgain.createdBy → "system" (immutable -- unchanged)
+// updatedAlice2.createdBy → "system" (immutable — unchanged)
 ```
 
 ---
@@ -192,16 +197,17 @@ const updatedAgain = yield* users.update(
 
 `Entity.expectedVersion()` composes with `Entity.set()` as variadic combinators. If the item's current version does not match, the update fails with `OptimisticLockError`:
 
-```typescript title="locking.ts"
-import { Effect } from "effect"
-
-const result = yield* users.update(
+```typescript region="locking" example="crud.ts"
+// expectedVersion(n) composes with update
+const lockResult = yield* db.Users.update(
   { userId: "u-alice" },
   Entity.set({ displayName: "Alice Wrong" }),
-  Entity.expectedVersion(1), // item is at version 3 -- this will fail
+  Entity.expectedVersion(1), // version is now 3 — this will fail
 ).pipe(
   Effect.catchTag("OptimisticLockError", (e) =>
-    Effect.succeed(`Expected v${e.expectedVersion}, item has been updated`),
+    Effect.succeed(
+      `Expected v${e.expectedVersion}, item has been updated`,
+    ),
   ),
 )
 ```
@@ -212,14 +218,14 @@ const result = yield* users.update(
 
 All errors are tagged, enabling precise `catchTag` handling. `ItemNotFound` is the most common:
 
-```typescript title="errors.ts"
-const result = yield* users.get({ userId: "u-nonexistent" })
-  .pipe(
-    Effect.map((u) => `Found: ${u.userId}`),
-    Effect.catchTag("ItemNotFound", (e) =>
-      Effect.succeed(`Not found: entity=${e.entityType}, key=${JSON.stringify(e.key)}`),
-    ),
-  )
+```typescript region="error-handling" example="crud.ts"
+// Bound methods return Effects — error types flow through pipe
+const notFoundResult = yield* db.Users.get({ userId: "u-nonexistent" }).pipe(
+  Effect.map((u) => `Found: ${u.userId}`),
+  Effect.catchTag("ItemNotFound", (e) =>
+    Effect.succeed(`Not found: entity=${e.entityType}, key=${JSON.stringify(e.key)}`),
+  ),
+)
 ```
 
 Bound entity methods return `Effect` directly, so you can pipe to Effect combinators like `Effect.map` or `Effect.catchTag` without any conversion.
@@ -230,30 +236,28 @@ Bound entity methods return `Effect` directly, so you can pipe to Effect combina
 
 Query a GSI by providing the partition key composites. Use `Query.collect` to gather all results:
 
-```typescript title="queries.ts"
-// All tasks for a user
-const aliceTasks = yield* tasks.collect(Tasks.query.byUser({ userId: "u-alice" }))
+```typescript region="query" example="crud.ts"
+const aliceTasks = yield* db.Tasks.collect(Tasks.query.byUser({ userId: "u-alice" }))
 
-// All admins
-const admins = yield* users.collect(Users.query.byRole({ role: "admin" }))
+const admins = yield* db.Users.collect(Users.query.byRole({ role: "admin" }))
 ```
 
 ### Query Combinators
 
 Compose query behavior with pipeable combinators:
 
-```typescript title="queries.ts"
-import { Query } from "effect-dynamodb"
-
+```typescript region="query-combinators" example="crud.ts"
 // Reverse sort order
-const reversed = yield* Tasks.query
-  .byUser({ userId: "u-alice" })
-  .pipe(Query.reverse, (q) => tasks.collect(q))
+const reversedTasks = yield* db.Tasks.collect(
+  Tasks.query.byUser({ userId: "u-alice" }).pipe(Query.reverse),
+)
 
 // Sort key prefix filter (beginsWith)
-const todoTasks = yield* Tasks.query
-  .byUser({ userId: "u-alice" })
-  .pipe(Query.where({ beginsWith: "$crud-demo#v1#task#todo" }), (q) => tasks.collect(q))
+const todoTasks = yield* db.Tasks.collect(
+  Tasks.query
+    .byUser({ userId: "u-alice" })
+    .pipe(Query.where({ beginsWith: "$crud-demo#v1#task#todo" })),
+)
 ```
 
 `Query.reverse` flips the scan direction. `Query.where` adds a sort key condition -- here, `beginsWith` filters to tasks with a `todo` status prefix in the sort key.
@@ -266,9 +270,7 @@ const todoTasks = yield* Tasks.query
 
 Atomically create multiple items across entities. If either fails, neither is persisted:
 
-```typescript title="transactions.ts"
-import { Transaction } from "effect-dynamodb"
-
+```typescript region="transact-write" example="crud.ts"
 yield* Transaction.transactWrite([
   Users.put({
     userId: "u-charlie",
@@ -291,15 +293,14 @@ yield* Transaction.transactWrite([
 
 Fetch multiple items atomically with a typed tuple return:
 
-```typescript title="transactions.ts"
+```typescript region="transact-get" example="crud.ts"
+// transactGet — typed tuple return, no manual cast needed
 const [txAlice, txBob, txTask] = yield* Transaction.transactGet([
   Users.get({ userId: "u-alice" }),
   Users.get({ userId: "u-bob" }),
   Tasks.get({ taskId: "t-1" }),
 ])
-// txAlice: User | undefined
-// txBob: User | undefined
-// txTask: Task | undefined
+// txAlice: User | undefined, txBob: User | undefined, txTask: Task | undefined
 ```
 
 Each element in the returned tuple is typed to its entity's model, or `undefined` if the item was not found.
@@ -310,10 +311,11 @@ Each element in the returned tuple is typed to its entity's model, or `undefined
 
 When GSI composite attributes are optional, DynamoDB's sparse index behavior applies -- items only appear in the index when their key attributes are present:
 
-```typescript title="sparse.ts"
+```typescript region="sparse-models" example="crud.ts"
 class Project extends Schema.Class<Project>("Project")({
   projectId: Schema.String,
   name: Schema.NonEmptyString,
+  // Optional — only assigned projects have these
   ownerId: Schema.optional(Schema.String),
   department: Schema.optional(Schema.String),
 }) {}
@@ -334,49 +336,50 @@ const Projects = Entity.make({
   },
   timestamps: true,
 })
+```
 
-// assumes MainTable is defined with entities: { Projects }
-const { Projects: projects } = yield* DynamoClient.make(MainTable)
+Put items with and without optional GSI composites:
 
-// Assigned project -- appears in byOwner GSI
-yield* projects.put({
+```typescript region="sparse-put" example="crud.ts"
+// Assigned project — appears in byOwner GSI
+const assigned = yield* db.Projects.put({
   projectId: "p-1",
   name: "Alpha",
   ownerId: "u-alice",
   department: "engineering",
 })
 
-// Unassigned project -- does NOT appear in byOwner GSI (sparse)
-yield* projects.put({
+// Unassigned project — does NOT appear in byOwner GSI (sparse)
+const unassigned = yield* db.Projects.put({
   projectId: "p-2",
   name: "Beta",
   // ownerId and department omitted
 })
 
 // Query only returns assigned projects
-const ownerProjects = yield* projects.collect(
+const ownerProjects = yield* db.Projects.collect(
   Projects.query.byOwner({ ownerId: "u-alice" }),
 )
 // → [{ projectId: "p-1", name: "Alpha" }]
-// "Beta" is absent -- sparse index at work
+// "Beta" is absent — sparse index at work
 ```
 
 ### All-or-None Update Constraint
 
 When updating, if the payload includes ANY composite for a GSI, ALL composites for that GSI must be present. This prevents stale GSI entries:
 
-```typescript title="sparse.ts"
-// assumes MainTable is defined with entities: { Employees }
-const { Employees: employees } = yield* DynamoClient.make(MainTable)
-
+```typescript region="sparse-update" example="crud.ts"
 // GOOD: Update without touching GSI composites
-yield* employees.update({ employeeId: "e-1" }, Entity.set({ name: "Alice W." }))
+yield* db.Employees.update({ employeeId: "e-1" }, Entity.set({ name: "Alice W." }))
 
 // GOOD: Update ALL composites of a GSI
-yield* employees.update({ employeeId: "e-1" }, Entity.set({ tenantId: "t-2", region: "eu-west-1" }))
+yield* db.Employees.update(
+  { employeeId: "e-1" },
+  Entity.set({ tenantId: "t-2", region: "eu-west-1" }),
+)
 
-// BAD: Partial GSI composites -- runtime ValidationError
-yield* employees.update(
+// BAD: Partial GSI composites — runtime ValidationError
+yield* db.Employees.update(
   { employeeId: "e-1" },
   Entity.set({ tenantId: "t-3" }), // missing region!
 ).pipe(
@@ -392,15 +395,14 @@ yield* employees.update(
 
 For entities without `softDelete`, `Entity.delete` permanently removes the item:
 
-```typescript title="delete.ts"
-yield* users.delete({ userId: "u-charlie" })
+```typescript region="delete" example="crud.ts"
+yield* db.Users.delete({ userId: "u-charlie" })
 
 // Confirm deletion
-const result = yield* users.get({ userId: "u-charlie" })
-  .pipe(
-    Effect.map(() => "still exists!"),
-    Effect.catchTag("ItemNotFound", () => Effect.succeed("confirmed deleted")),
-  )
+const afterDelete = yield* db.Users.get({ userId: "u-charlie" }).pipe(
+  Effect.map(() => "still exists!"),
+  Effect.catchTag("ItemNotFound", () => Effect.succeed("confirmed deleted")),
+)
 ```
 
 ---
@@ -409,21 +411,22 @@ const result = yield* users.get({ userId: "u-charlie" })
 
 With `versioned: { retain: true }`, every put and update creates a snapshot in the same DynamoDB partition. Retrieve individual versions or query the full history:
 
-```typescript title="versions.ts"
+```typescript region="versions" example="crud.ts"
 // Fetch a specific version
-const aliceV1 = yield* users.getVersion({ userId: "u-alice" }, 1)
+const aliceV1 = yield* db.Users.getVersion({ userId: "u-alice" }, 1)
 // aliceV1.displayName → "Alice", aliceV1.role → "admin"
 
-const aliceV2 = yield* users.getVersion({ userId: "u-alice" }, 2)
+const aliceV2 = yield* db.Users.getVersion({ userId: "u-alice" }, 2)
 // aliceV2.displayName → "Alice W.", aliceV2.role → "member"
 
 // Query all version snapshots
-const allVersions = yield* users.collect(Users.versions({ userId: "u-alice" }))
+const allVersions = yield* db.Users.collect(Users.versions({ userId: "u-alice" }))
 // → [{ version: 1, ... }, { version: 2, ... }, { version: 3, ... }]
 
 // Non-existent version → ItemNotFound
-yield* users.getVersion({ userId: "u-alice" }, 99)
-  .pipe(Effect.catchTag("ItemNotFound", () => Effect.succeed("not found")))
+yield* db.Users.getVersion({ userId: "u-alice" }, 99).pipe(
+  Effect.catchTag("ItemNotFound", () => Effect.succeed("not found")),
+)
 ```
 
 Version snapshots share the primary partition key but use a version-specific sort key. GSI keys are stripped from snapshots so they do not appear in index queries.
@@ -436,15 +439,15 @@ Version snapshots share the primary partition key but use a version-specific sor
 
 For entities with `softDelete: true`, `Entity.delete` archives the item instead of destroying it. GSI keys are stripped, so the item vanishes from all index queries:
 
-```typescript title="soft-delete.ts"
-yield* tasks.delete({ taskId: "t-1" })
+```typescript region="soft-delete" example="crud.ts"
+yield* db.Tasks.delete({ taskId: "t-1" })
 
 // No longer in GSI queries
-const activeTasks = yield* tasks.collect(Tasks.query.byUser({ userId: "u-alice" }))
+const aliceTasksAfterDelete = yield* db.Tasks.collect(Tasks.query.byUser({ userId: "u-alice" }))
 // t-1 is absent
 
 // But retrievable via deleted.get
-const deletedTask = yield* tasks.deleted.get({ taskId: "t-1" })
+const deletedTask = yield* db.Tasks.deleted.get({ taskId: "t-1" })
 // deletedTask.title → "Design the API"
 ```
 
@@ -452,13 +455,13 @@ const deletedTask = yield* tasks.deleted.get({ taskId: "t-1" })
 
 Restore recomposes all keys, increments the version, and brings the item back to life:
 
-```typescript title="restore.ts"
-const restored = yield* tasks.restore({ taskId: "t-1" })
+```typescript region="restore" example="crud.ts"
+const restored = yield* db.Tasks.restore({ taskId: "t-1" })
 // restored.title → "Design the API"
 // restored.status → "done"
 
 // Back in GSI queries
-const tasksAfterRestore = yield* tasks.collect(Tasks.query.byUser({ userId: "u-alice" }))
+const aliceTasksAfterRestore = yield* db.Tasks.collect(Tasks.query.byUser({ userId: "u-alice" }))
 // t-1 is back
 ```
 
@@ -466,12 +469,13 @@ const tasksAfterRestore = yield* tasks.collect(Tasks.query.byUser({ userId: "u-a
 
 Purge permanently removes everything for a partition key -- the current item, all version snapshots, and any soft-deleted copies:
 
-```typescript title="purge.ts"
-yield* users.purge({ userId: "u-bob" })
+```typescript region="purge" example="crud.ts"
+yield* db.Users.purge({ userId: "u-bob" })
 
-// Completely gone -- no item, no versions, no snapshots
-yield* users.get({ userId: "u-bob" })
-  .pipe(Effect.catchTag("ItemNotFound", () => Effect.succeed("completely gone")))
+// Completely gone — no item, no versions, no snapshots
+yield* db.Users.get({ userId: "u-bob" }).pipe(
+  Effect.catchTag("ItemNotFound", () => Effect.succeed("completely gone")),
+)
 ```
 
 Purge is the nuclear option. Use it for GDPR "right to erasure" or test cleanup.
@@ -496,10 +500,7 @@ npx tsx examples/crud.ts
 
 ### Layer Setup
 
-```typescript title="main.ts"
-import { Effect, Layer } from "effect"
-import { DynamoClient } from "effect-dynamodb"
-
+```typescript region="run" example="crud.ts"
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -523,16 +524,16 @@ Effect.runPromise(main).then(
 
 | Concept | How it's used |
 |---------|---------------|
-| **Typed client** | `const { Users: users } = yield* DynamoClient.make(MainTable)` resolves dependencies; all ops have `R = never` |
-| **Variadic combinator updates** | `users.update(key, Entity.set(...), Entity.expectedVersion(n))` — combinators as rest args |
+| **Typed client** | `const db = yield* DynamoClient.make(MainTable)` resolves dependencies; all ops have `R = never` |
+| **Variadic combinator updates** | `db.Users.update(key, Entity.set(...), Entity.expectedVersion(n))` — combinators as rest args |
 | **Optimistic locking** | `Entity.expectedVersion(n)` composes with `Entity.set()` as variadic combinators |
 | **Tagged error handling** | `Effect.catchTag("ItemNotFound", ...)` for precise recovery — bound methods return `Effect` directly |
-| **GSI queries** | `Users.query.byRole(composites)` on entity definition, `users.collect(query)` on bound entity |
+| **GSI queries** | `Users.query.byRole(composites)` on entity definition, `db.Users.collect(query)` on bound entity |
 | **Transactions** | `transactWrite` for atomic multi-entity creates; `transactGet` for typed tuple reads |
 | **Sparse GSI** | Optional composites produce sparse indexes; all-or-none constraint prevents stale keys |
-| **Version history** | `versioned: { retain: true }` creates snapshots; `users.getVersion(key, n)` and `Users.versions(key)` for retrieval |
-| **Soft delete + restore** | `softDelete: true` archives items; `users.restore(key)` recomposes all keys |
-| **Purge** | `users.purge(key)` permanently removes item + versions + soft-deleted copies |
+| **Version history** | `versioned: { retain: true }` creates snapshots; `db.Users.getVersion(key, n)` and `Users.versions(key)` for retrieval |
+| **Soft delete + restore** | `softDelete: true` archives items; `db.Tasks.restore(key)` recomposes all keys |
+| **Purge** | `db.Users.purge(key)` permanently removes item + versions + soft-deleted copies |
 
 ## What's Next?
 

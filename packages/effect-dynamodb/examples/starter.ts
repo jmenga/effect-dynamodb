@@ -30,6 +30,7 @@ import * as Table from "../src/Table.js"
 // 1. Define pure domain models — no DynamoDB concepts
 // ---------------------------------------------------------------------------
 
+// #region models
 const Role = { Admin: "admin", Member: "member" } as const
 const RoleSchema = Schema.Literals(Object.values(Role))
 
@@ -55,17 +56,21 @@ class Task extends Schema.Class<Task>("Task")({
   status: TaskStatusSchema,
   priority: Schema.Number,
 }) {}
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 2. Application namespace
 // ---------------------------------------------------------------------------
 
+// #region schema
 const AppSchema = DynamoSchema.make({ name: "starter", version: 1 })
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 3. Entity definitions — pure definitions, no table reference
 // ---------------------------------------------------------------------------
 
+// #region entities
 const Users = Entity.make({
   model: UserModel,
   entityType: "User",
@@ -104,16 +109,14 @@ const Tasks = Entity.make({
   timestamps: true,
 })
 
-// ---------------------------------------------------------------------------
-// 4. Table definition — declare entities as members
-// ---------------------------------------------------------------------------
-
 const MainTable = Table.make({ schema: AppSchema, entities: { Users, Tasks } })
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 5. Main program
 // ---------------------------------------------------------------------------
 
+// #region program
 const program = Effect.gen(function* () {
   // Get typed client — binds all table members
   const db = yield* DynamoClient.make(MainTable)
@@ -195,11 +198,13 @@ const program = Effect.gen(function* () {
   yield* db.deleteTable()
   yield* Console.log("Table deleted.")
 })
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 6. Provide dependencies and run
 // ---------------------------------------------------------------------------
 
+// #region run
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -215,3 +220,4 @@ Effect.runPromise(main).then(
   () => console.log("\nDone."),
   (err) => console.error("Failed:", err),
 )
+// #endregion

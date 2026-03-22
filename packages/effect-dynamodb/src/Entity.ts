@@ -795,6 +795,39 @@ export interface BoundEntity<
     query: Query.Query<A>,
     ...combinators: ReadonlyArray<(q: Query.Query<A>) => Query.Query<A>>
   ) => Effect.Effect<Array<A>, DynamoClientError | ValidationError, never>
+
+  /**
+   * Execute a single DynamoDB page and return a {@link Query.Page} with an opaque cursor.
+   * Use `Query.startFrom(cursor)` to iterate through subsequent pages.
+   * Accepts optional query combinators (e.g. `Query.limit(...)`, `Query.reverse`).
+   *
+   * ```ts
+   * const page = yield* teams.fetch(Teams.query.byRole({ role: "admin" }), Query.limit(25))
+   * if (page.cursor) {
+   *   const next = yield* teams.fetch(Teams.query.byRole({ role: "admin" }), Query.limit(25), Query.startFrom(page.cursor))
+   * }
+   * ```
+   */
+  readonly fetch: <A>(
+    query: Query.Query<A>,
+    ...combinators: ReadonlyArray<(q: Query.Query<A>) => Query.Query<A>>
+  ) => Effect.Effect<Query.Page<A>, DynamoClientError | ValidationError, never>
+
+  /**
+   * Execute a single DynamoDB scan page and return a {@link Query.Page} with an opaque cursor.
+   * Convenience for `fetch(Entity.scan(), ...)`. Use `Query.startFrom(cursor)` for subsequent pages.
+   * Accepts optional query combinators (e.g. `Query.limit(...)`, `Query.filter(...)`).
+   *
+   * ```ts
+   * const page = yield* teams.scanFetch(Query.limit(25))
+   * if (page.cursor) {
+   *   const next = yield* teams.scanFetch(Query.limit(25), Query.startFrom(page.cursor))
+   * }
+   * ```
+   */
+  readonly scanFetch: (
+    ...combinators: ReadonlyArray<(q: Query.Query<ModelType<TModel>>) => Query.Query<ModelType<TModel>>>
+  ) => Effect.Effect<Query.Page<ModelType<TModel>>, DynamoClientError | ValidationError, never>
 }
 
 // ---------------------------------------------------------------------------
@@ -3867,6 +3900,10 @@ export const bind = <
       },
       collect: <A>(q: Query.Query<A>, ...combinators: ReadonlyArray<(q: any) => any>) =>
         provide(Query.collect(applyQuery(q, combinators))),
+      fetch: <A>(q: Query.Query<A>, ...combinators: ReadonlyArray<(q: any) => any>) =>
+        provide(Query.execute(applyQuery(q, combinators))),
+      scanFetch: (...combinators: ReadonlyArray<(q: any) => any>) =>
+        provide(Query.execute(applyQuery(entity.scan(), combinators))),
     } as unknown as BoundEntity<TModel, TIndexes, TRefs>
   })
 

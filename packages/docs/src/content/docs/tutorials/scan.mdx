@@ -17,9 +17,7 @@ A product and review catalog that demonstrates **scan operations** -- reading al
 
 Two entity types sharing a single table -- products and reviews:
 
-```typescript title="models.ts"
-import { Schema } from "effect"
-
+```typescript title="models.ts" region="models" example="scan.ts"
 class Product extends Schema.Class<Product>("Product")({
   productId: Schema.String,
   name: Schema.NonEmptyString,
@@ -42,10 +40,9 @@ class Review extends Schema.Class<Review>("Review")({
 
 Both entities share one table with a GSI for category/product lookups:
 
-```typescript title="entities.ts"
-import { DynamoSchema, Entity, Table } from "effect-dynamodb"
-
+```typescript title="entities.ts" region="entities" example="scan.ts"
 const AppSchema = DynamoSchema.make({ name: "scan-demo", version: 1 })
+
 const Products = Entity.make({
   model: Product,
   entityType: "Product",
@@ -89,33 +86,37 @@ Note that both entities overload GSI1 -- Products use it for category lookups wh
 
 ## Step 3: Seed Data
 
-```typescript title="seed.ts"
-import { DynamoClient } from "effect-dynamodb"
-
-const { Products: products, Reviews: reviews } = yield* DynamoClient.make(MainTable)
-
-yield* products.put({
-  productId: "p-1", name: "Wireless Mouse",
-  category: "electronics", price: 29.99, inStock: true,
+```typescript title="seed.ts" region="seed" example="scan.ts"
+yield* db.Products.put({
+  productId: "p-1",
+  name: "Wireless Mouse",
+  category: "electronics",
+  price: 29.99,
+  inStock: true,
 })
-yield* products.put({
-  productId: "p-2", name: "Mechanical Keyboard",
-  category: "electronics", price: 89.99, inStock: true,
+yield* db.Products.put({
+  productId: "p-2",
+  name: "Mechanical Keyboard",
+  category: "electronics",
+  price: 89.99,
+  inStock: true,
 })
-yield* products.put({
-  productId: "p-3", name: "USB-C Cable",
-  category: "accessories", price: 9.99, inStock: false,
+yield* db.Products.put({
+  productId: "p-3",
+  name: "USB-C Cable",
+  category: "accessories",
+  price: 9.99,
+  inStock: false,
 })
-yield* products.put({
-  productId: "p-4", name: "Monitor Stand",
-  category: "accessories", price: 49.99, inStock: true,
+yield* db.Products.put({
+  productId: "p-4",
+  name: "Monitor Stand",
+  category: "accessories",
+  price: 49.99,
+  inStock: true,
 })
-yield* reviews.put({
-  reviewId: "r-1", productId: "p-1", rating: 5, comment: "Great mouse!",
-})
-yield* reviews.put({
-  reviewId: "r-2", productId: "p-2", rating: 4, comment: "Good keyboard",
-})
+yield* db.Reviews.put({ reviewId: "r-1", productId: "p-1", rating: 5, comment: "Great mouse!" })
+yield* db.Reviews.put({ reviewId: "r-2", productId: "p-2", rating: 4, comment: "Good keyboard" })
 ```
 
 The table now has 6 items: 4 products and 2 reviews.
@@ -128,21 +129,19 @@ The table now has 6 items: 4 products and 2 reviews.
 
 `Products.scan()` on the entity definition returns a `Query<Entity.Record>` descriptor that reads the entire table. Pass it to `collect()` on the bound entity to execute it. Despite sharing a table with reviews, `Products.scan()` only returns product items -- the ORM automatically adds a `FilterExpression` on `__edd_e__`:
 
-```typescript
-const allProducts = yield* products.collect(Products.scan())
-// → 4 products (reviews excluded automatically)
+```typescript region="basic-scan" example="scan.ts"
+const allProducts = yield* db.Products.collect(Products.scan())
 ```
 
 ### Scan with Filter
 
 Scans support all `Query` combinators, including entity-level `filter()`. Pass combinators as additional arguments to `collect()` -- they are applied to the scan descriptor before execution. The filter is applied server-side after items are read, reducing network transfer:
 
-```typescript
-const inStockProducts = yield* products.collect(
+```typescript region="scan-filter" example="scan.ts"
+const inStockProducts = yield* db.Products.collect(
   Products.scan(),
   Products.filter({ inStock: true }),
 )
-// → 3 products (USB-C Cable excluded — inStock: false)
 ```
 
 Note that filters do **not** reduce read capacity -- DynamoDB still reads every item in the table. Use queries with partition keys when you need efficient reads.
@@ -151,30 +150,25 @@ Note that filters do **not** reduce read capacity -- DynamoDB still reads every 
 
 `Query.limit()` controls how many items DynamoDB evaluates per request. Combined with `collect()`, it caps the total results:
 
-```typescript
-const firstTwo = yield* products.collect(Products.scan(), Query.limit(2))
-// → 2 products
+```typescript region="scan-limit" example="scan.ts"
+const firstTwo = yield* db.Products.collect(Products.scan().pipe(Query.limit(2)))
 ```
 
 ### Scan with Consistent Read
 
 `Query.consistentRead` passes `ConsistentRead: true` to DynamoDB, ensuring you read the most recent data. This costs 2x the read capacity of eventually-consistent reads:
 
-```typescript
-const consistent = yield* products.collect(Products.scan(), Query.consistentRead)
-// → 4 products (strongly consistent)
+```typescript region="scan-consistent" example="scan.ts"
+const consistent = yield* db.Products.collect(Products.scan().pipe(Query.consistentRead))
 ```
 
 ### Entity-Type Isolation
 
 The key feature of scans in a single-table design: each entity's scan only returns its own items. The `__edd_e__` discriminator attribute is automatically included in the `FilterExpression`:
 
-```typescript
-const productScan = yield* products.collect(Products.scan())
-const reviewScan = yield* reviews.collect(Reviews.scan())
-
-// productScan.length → 4 (only products)
-// reviewScan.length  → 2 (only reviews)
+```typescript region="entity-isolation" example="scan.ts"
+const productScan = yield* db.Products.collect(Products.scan())
+const reviewScan = yield* db.Reviews.collect(Reviews.scan())
 ```
 
 Even though both scans read the same physical table, each returns only items matching its entity type.
@@ -212,10 +206,7 @@ npx tsx examples/scan.ts
 
 ### Layer Setup
 
-```typescript title="main.ts"
-import { Effect, Layer } from "effect"
-import { DynamoClient } from "effect-dynamodb"
-
+```typescript title="main.ts" region="layer" example="scan.ts"
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -228,8 +219,8 @@ const AppLayer = Layer.mergeAll(
 const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
-  () => console.log("Done."),
-  (err) => console.error("Failed:", err),
+  () => console.log("\nDone."),
+  (err) => console.error("\nFailed:", err),
 )
 ```
 

@@ -33,6 +33,12 @@
   list-style-type: lower-alpha;
 }
 
+/* Ensure spacing between code blocks and admonitions */
+.sl-markdown-content .expressive-code + .starlight-aside,
+.sl-markdown-content .starlight-aside + .expressive-code {
+  margin-top: 2rem;
+}
+
 /* Light mode: white code background (github-light theme uses #fff natively) */
 :root[data-theme="light"] .expressive-code .frame:not(.is-terminal) pre,
 :root[data-theme="light"] .expressive-code .frame:not(.is-terminal) {

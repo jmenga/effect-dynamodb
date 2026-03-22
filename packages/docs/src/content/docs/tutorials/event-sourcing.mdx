@@ -19,9 +19,7 @@ An event-sourced cricket match tracker using effect-dynamodb's `EventStore` modu
 
 Events are pure domain `Schema.Class` definitions. Each event captures something that happened in the domain — no DynamoDB concepts:
 
-```typescript title="events.ts"
-import { Schema } from "effect"
-
+```typescript title="events.ts" region="events" example="event-sourcing.ts"
 class MatchStarted extends Schema.Class<MatchStarted>("MatchStarted")({
   venue: Schema.String,
   homeTeam: Schema.String,
@@ -49,12 +47,7 @@ Each class name doubles as the event type discriminator stored in DynamoDB.
 
 An event stream binds events to a table, names the stream, and declares which attributes compose the stream ID (analogous to an aggregate ID):
 
-```typescript title="stream.ts"
-import { DynamoSchema, EventStore, Table } from "effect-dynamodb"
-
-const AppSchema = DynamoSchema.make({ name: "cricket", version: 1 })
-const EventsTable = Table.make({ schema: AppSchema })
-
+```typescript title="stream.ts" region="stream" example="event-sourcing.ts"
 const MatchEvents = EventStore.makeStream({
   table: EventsTable,
   streamName: "Match",
@@ -78,11 +71,7 @@ The decider is the core pattern for event sourcing. It defines three things:
 2. **decide** — validates a command against current state, returning events or an error
 3. **evolve** — applies an event to state, producing the next state
 
-```typescript title="decider.ts"
-import { Data, Effect } from "effect"
-import { EventStore } from "effect-dynamodb"
-
-// State
+```typescript title="decider.ts" region="decider" example="event-sourcing.ts"
 interface MatchState {
   readonly status: "pending" | "in-progress" | "completed"
   readonly venue?: string
@@ -90,13 +79,21 @@ interface MatchState {
   readonly result?: string
 }
 
-// Commands
 type MatchCommand =
-  | { readonly _tag: "StartMatch"; readonly venue: string; readonly homeTeam: string; readonly awayTeam: string }
-  | { readonly _tag: "CompleteInnings"; readonly innings: number; readonly runs: number; readonly wickets: number }
+  | {
+      readonly _tag: "StartMatch"
+      readonly venue: string
+      readonly homeTeam: string
+      readonly awayTeam: string
+    }
+  | {
+      readonly _tag: "CompleteInnings"
+      readonly innings: number
+      readonly runs: number
+      readonly wickets: number
+    }
   | { readonly _tag: "EndMatch"; readonly result: string }
 
-// Domain errors — tagged for precise catchTag handling
 class AlreadyStarted extends Data.TaggedError("AlreadyStarted") {}
 class NotStarted extends Data.TaggedError("NotStarted") {}
 class AlreadyEnded extends Data.TaggedError("AlreadyEnded") {}
@@ -165,10 +162,9 @@ The `decide` function is effectful — it can fail with domain errors. The `evol
 
 `EventStore.commandHandler` wires the decider to an event stream. It handles the read-decide-append cycle with optimistic concurrency:
 
-```typescript title="handler.ts"
-import { EventStore } from "effect-dynamodb"
-
-const handleMatch = EventStore.commandHandler(matchDecider, MatchEvents)
+```typescript title="handler.ts" region="command-handler" example="event-sourcing.ts"
+const matchEvents = yield* EventStore.bind(MatchEvents)
+const handleMatch = EventStore.commandHandler(matchDecider, matchEvents)
 ```
 
 Each call to `handleMatch`:
@@ -183,7 +179,7 @@ Each call to `handleMatch`:
 
 ### Start Match
 
-```typescript
+```typescript region="start-match" example="event-sourcing.ts"
 const r1 = yield* handleMatch(
   { matchId: "m-1" },
   { _tag: "StartMatch", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
@@ -195,12 +191,11 @@ The return value includes the new `state`, the `version` after append, and the `
 
 ### Complete Innings
 
-```typescript
+```typescript region="complete-innings" example="event-sourcing.ts"
 const r2 = yield* handleMatch(
   { matchId: "m-1" },
   { _tag: "CompleteInnings", innings: 1, runs: 250, wickets: 10 },
 )
-// State: in-progress, Innings: 1, Version: 2
 
 const r3 = yield* handleMatch(
   { matchId: "m-1" },
@@ -211,7 +206,7 @@ const r3 = yield* handleMatch(
 
 ### End Match
 
-```typescript
+```typescript region="end-match" example="event-sourcing.ts"
 const r4 = yield* handleMatch(
   { matchId: "m-1" },
   { _tag: "EndMatch", result: "AUS won by 70 runs" },
@@ -225,11 +220,8 @@ const r4 = yield* handleMatch(
 
 ### Read All Events
 
-```typescript
-const allEvents = yield* MatchEvents.read({ matchId: "m-1" })
-for (const event of allEvents) {
-  console.log(`v${event.version}: ${event.eventType} at ${event.timestamp}`)
-}
+```typescript region="read-all" example="event-sourcing.ts"
+const allEvents = yield* matchEvents.read({ matchId: "m-1" })
 // v1: MatchStarted at 2026-03-15T...
 // v2: InningsCompleted at 2026-03-15T...
 // v3: InningsCompleted at 2026-03-15T...
@@ -242,8 +234,8 @@ Each event envelope includes `version`, `eventType`, `timestamp`, and the decode
 
 Useful for catching up from a known checkpoint:
 
-```typescript
-const laterEvents = yield* MatchEvents.readFrom({ matchId: "m-1" }, 2)
+```typescript region="read-from" example="event-sourcing.ts"
+const laterEvents = yield* matchEvents.readFrom({ matchId: "m-1" }, 2)
 // v2: InningsCompleted
 // v3: InningsCompleted
 // v4: MatchEnded
@@ -251,8 +243,8 @@ const laterEvents = yield* MatchEvents.readFrom({ matchId: "m-1" }, 2)
 
 ### Current Version
 
-```typescript
-const version = yield* MatchEvents.currentVersion({ matchId: "m-1" })
+```typescript region="current-version" example="event-sourcing.ts"
+const version = yield* matchEvents.currentVersion({ matchId: "m-1" })
 // Current version: 4
 ```
 
@@ -264,9 +256,7 @@ const version = yield* MatchEvents.currentVersion({ matchId: "m-1" })
 
 `EventStore.fold` applies the decider's `evolve` function over a list of events, starting from `initialState`:
 
-```typescript
-import { EventStore } from "effect-dynamodb"
-
+```typescript region="fold" example="event-sourcing.ts"
 const state = EventStore.fold(matchDecider, allEvents)
 // Reconstructed: status=completed, innings=2
 ```
@@ -277,13 +267,10 @@ This is a pure function — no DynamoDB calls. It takes the events you already h
 
 Event streams expose a `query` API with the same combinators as entity queries. For example, get the latest event using `reverse` and `limit`:
 
-```typescript
-import { Query } from "effect-dynamodb"
-
-const latest = yield* MatchEvents.query
-  .events({ matchId: "m-1" })
-  .pipe(Query.reverse, Query.limit(1), Query.collect)
-
+```typescript region="query-latest" example="event-sourcing.ts"
+const latest = yield* matchEvents.provide(
+  matchEvents.query.events({ matchId: "m-1" }).pipe(Query.reverse, Query.limit(1), Query.collect),
+)
 const [latestEvent] = latest
 // Latest: v4 MatchEnded
 ```
@@ -294,8 +281,7 @@ const [latestEvent] = latest
 
 The decider enforces business rules. Sending an invalid command produces a tagged error:
 
-```typescript
-// Try to start a match that's already completed
+```typescript region="domain-error" example="event-sourcing.ts"
 const error = yield* handleMatch(
   { matchId: "m-1" },
   { _tag: "StartMatch", venue: "SCG", homeTeam: "AUS", awayTeam: "IND" },
@@ -330,10 +316,7 @@ npx tsx examples/event-sourcing.ts
 
 ### Layer Setup
 
-```typescript title="main.ts"
-import { Effect, Layer } from "effect"
-import { DynamoClient } from "effect-dynamodb"
-
+```typescript title="main.ts" region="layer-setup" example="event-sourcing.ts"
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -346,7 +329,7 @@ const AppLayer = Layer.mergeAll(
 const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
-  () => console.log("Done."),
+  () => console.log("\nDone."),
   (err) => console.error("Failed:", err),
 )
 ```

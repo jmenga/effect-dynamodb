@@ -27,6 +27,7 @@ import * as Table from "../src/Table.js"
 // 1. Domain models
 // ---------------------------------------------------------------------------
 
+// #region models
 class User extends Schema.Class<User>("User")({
   userId: Schema.String,
   email: Schema.String,
@@ -44,17 +45,21 @@ class ApiRequest extends Schema.Class<ApiRequest>("ApiRequest")({
   payload: Schema.String,
   status: RequestStatusSchema,
 }) {}
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 2. Application namespace
 // ---------------------------------------------------------------------------
 
+// #region schema
 const AppSchema = DynamoSchema.make({ name: "unique-demo", version: 1 })
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 3. Entity definitions — pure, no table reference
 // ---------------------------------------------------------------------------
 
+// #region users-entity
 // Users with two unique constraints:
 // - email: globally unique email addresses
 // - username: globally unique usernames
@@ -73,7 +78,9 @@ const Users = Entity.make({
     username: ["username"],
   },
 })
+// #endregion
 
+// #region api-requests-entity
 // API requests with a TTL-based idempotency key constraint.
 // The sentinel item auto-expires after the TTL, allowing the same
 // idempotency key to be reused later.
@@ -94,15 +101,18 @@ const ApiRequests = Entity.make({
     },
   },
 })
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 4. Table definition — declares all members
 // ---------------------------------------------------------------------------
 
+// #region table
 const MainTable = Table.make({
   schema: AppSchema,
   entities: { Users, ApiRequests },
 })
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 5. Main program
@@ -121,6 +131,7 @@ const program = Effect.gen(function* () {
   // --- Create a user with unique email ---
   yield* Console.log("=== Unique Email Constraint ===\n")
 
+  // #region create-user
   const alice = yield* db.Users.put({
     userId: "u-1",
     email: "alice@example.com",
@@ -128,9 +139,8 @@ const program = Effect.gen(function* () {
     tenantId: "t-1",
     name: "Alice",
   })
-  yield* Console.log(`Created: ${alice.name} (email: ${alice.email}, username: ${alice.username})`)
 
-  // Try to create another user with the same email → UniqueConstraintViolation
+  // Same email → UniqueConstraintViolation
   const duplicateEmail = yield* db.Users.put({
     userId: "u-2",
     email: "alice@example.com", // Same email as Alice!
@@ -138,18 +148,22 @@ const program = Effect.gen(function* () {
     tenantId: "t-1",
     name: "Bob",
   }).pipe(
-    Effect.map(() => "unexpected success"),
     Effect.catchTag("UniqueConstraintViolation", (e) =>
       Effect.succeed(
-        `UniqueConstraintViolation: constraint="${e.constraint}", fields=${JSON.stringify(e.fields)}`,
+        `Blocked: constraint="${e.constraint}", fields=${JSON.stringify(e.fields)}`,
       ),
     ),
   )
+  // Blocked: constraint="email", fields={"email":"alice@example.com"}
+  // #endregion
+  yield* Console.log(`Created: ${alice.name} (email: ${alice.email}, username: ${alice.username})`)
   yield* Console.log(`Duplicate email: ${duplicateEmail}\n`)
 
   // --- Unique username constraint ---
   yield* Console.log("=== Unique Username Constraint ===\n")
 
+  // #region duplicate-username
+  // Different email, same username → UniqueConstraintViolation
   const bob = yield* db.Users.put({
     userId: "u-2",
     email: "bob@example.com", // Different email — OK
@@ -157,14 +171,13 @@ const program = Effect.gen(function* () {
     tenantId: "t-1",
     name: "Bob",
   }).pipe(
-    Effect.map((u) => `Created: ${u.name}`),
     Effect.catchTag("UniqueConstraintViolation", (e) =>
-      Effect.succeed(`UniqueConstraintViolation: constraint="${e.constraint}"`),
+      Effect.succeed(`Blocked: constraint="${e.constraint}"`),
     ),
   )
-  yield* Console.log(`Duplicate username: ${bob}`)
+  // Blocked: constraint="username"
 
-  // Different email AND username — OK
+  // Both different → succeeds
   const charlie = yield* db.Users.put({
     userId: "u-2",
     email: "bob@example.com",
@@ -172,55 +185,59 @@ const program = Effect.gen(function* () {
     tenantId: "t-1",
     name: "Bob",
   })
+  // Created: Bob
+  // #endregion
+  yield* Console.log(`Duplicate username: ${bob}`)
   yield* Console.log(`Created: ${charlie.name} (unique email and username)\n`)
 
   // --- Idempotency key pattern ---
   yield* Console.log("=== Idempotency Key Pattern (TTL) ===\n")
 
-  // First request with idempotency key
+  // #region idempotency
+  // First request — succeeds
   const req1 = yield* db.ApiRequests.put({
     requestId: "r-1",
     idempotencyKey: "idem-abc-123",
     payload: '{"action":"charge","amount":100}',
     status: "completed",
   })
-  yield* Console.log(`Request 1: ${req1.requestId} (key: ${req1.idempotencyKey})`)
 
-  // Retry with same idempotency key → UniqueConstraintViolation
-  // This prevents duplicate processing of the same request
+  // Retry with same idempotency key → blocked
   const retry = yield* db.ApiRequests.put({
     requestId: "r-2",
     idempotencyKey: "idem-abc-123", // Same idempotency key!
     payload: '{"action":"charge","amount":100}',
     status: "pending",
   }).pipe(
-    Effect.map(() => "processed (duplicate!)"),
     Effect.catchTag("UniqueConstraintViolation", (e) =>
       Effect.succeed(`Blocked: constraint="${e.constraint}" — duplicate request prevented`),
     ),
   )
-  yield* Console.log(`Retry: ${retry}`)
-  yield* Console.log("  → The sentinel item has a TTL of 30 minutes")
-  yield* Console.log("  → After TTL expiry, the same key can be reused\n")
+  // The sentinel has a TTL of 30 minutes
+  // After expiry, the same key can be reused
 
-  // Different idempotency key — OK
+  // Different idempotency key — succeeds immediately
   const req2 = yield* db.ApiRequests.put({
     requestId: "r-2",
     idempotencyKey: "idem-def-456",
     payload: '{"action":"refund","amount":50}',
     status: "completed",
   })
+  // #endregion
+  yield* Console.log(`Request 1: ${req1.requestId} (key: ${req1.idempotencyKey})`)
+  yield* Console.log(`Retry: ${retry}`)
+  yield* Console.log("  → The sentinel item has a TTL of 30 minutes")
+  yield* Console.log("  → After TTL expiry, the same key can be reused\n")
   yield* Console.log(`Request 2: ${req2.requestId} (new key: ${req2.idempotencyKey})\n`)
 
   // --- Update rotation ---
   yield* Console.log("=== Unique Constraint Update Rotation ===\n")
 
-  // Update Alice's email — should rotate the email sentinel
+  // #region sentinel-rotation
+  // Update Alice's email
   yield* db.Users.update({ userId: "u-1" }, Users.set({ email: "alice-new@example.com" }))
-  const updatedAlice = yield* db.Users.get({ userId: "u-1" })
-  yield* Console.log(`Updated Alice's email: ${updatedAlice.email} (was alice@example.com)`)
 
-  // The old email "alice@example.com" is now free — another user can claim it
+  // The old email "alice@example.com" is now free
   const newUser = yield* db.Users.put({
     userId: "u-3",
     email: "alice@example.com", // Previously Alice's — now available
@@ -228,18 +245,22 @@ const program = Effect.gen(function* () {
     tenantId: "t-1",
     name: "Charlie",
   })
-  yield* Console.log(`Charlie claimed old email: ${newUser.email}`)
+  // Created: Charlie
 
-  // Try updating Bob's email to Alice's new email — should fail
+  // But Alice's new email is still protected
   const conflict = yield* db.Users.update(
     { userId: "u-2" },
     Users.set({ email: "alice-new@example.com" }),
   ).pipe(
-    Effect.map(() => "unexpected success"),
     Effect.catchTag("UniqueConstraintViolation", (e) =>
-      Effect.succeed(`Blocked: constraint="${e.constraint}", fields=${JSON.stringify(e.fields)}`),
+      Effect.succeed(`Blocked: constraint="${e.constraint}"`),
     ),
   )
+  // Blocked: constraint="email"
+  // #endregion
+  const updatedAlice = yield* db.Users.get({ userId: "u-1" })
+  yield* Console.log(`Updated Alice's email: ${updatedAlice.email} (was alice@example.com)`)
+  yield* Console.log(`Charlie claimed old email: ${newUser.email}`)
   yield* Console.log(`Update conflict: ${conflict}\n`)
 
   // --- Cleanup ---
@@ -252,6 +273,7 @@ const program = Effect.gen(function* () {
 // 6. Provide dependencies and run
 // ---------------------------------------------------------------------------
 
+// #region run
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -267,3 +289,4 @@ Effect.runPromise(main).then(
   () => console.log("\nDone."),
   (err) => console.error("\nFailed:", err),
 )
+// #endregion

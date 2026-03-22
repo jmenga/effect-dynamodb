@@ -32,8 +32,16 @@ This example supports six access patterns on a single entity:
 
 A pure domain model with no DynamoDB concepts:
 
-```typescript title="models.ts"
-import { Schema } from "effect"
+```typescript title="models.ts" region="model" example="shopping-mall.ts"
+const StoreCategory = {
+  FoodCoffee: "food/coffee",
+  FoodMeal: "food/meal",
+  Clothing: "clothing",
+  Electronics: "electronics",
+  Department: "department",
+  Misc: "misc",
+} as const
+const StoreCategorySchema = Schema.Literals(Object.values(StoreCategory))
 
 class MallStore extends Schema.Class<MallStore>("MallStore")({
   cityId: Schema.String,
@@ -41,14 +49,7 @@ class MallStore extends Schema.Class<MallStore>("MallStore")({
   storeId: Schema.String,
   buildingId: Schema.String,
   unitId: Schema.String,
-  category: Schema.Literals([
-    "food/coffee",
-    "food/meal",
-    "clothing",
-    "electronics",
-    "department",
-    "misc",
-  ]),
+  category: StoreCategorySchema,
   leaseEndDate: Schema.String,
   rent: Schema.String,
   discount: Schema.String.pipe(Schema.withDecodingDefaultKey(() => "0.00")),
@@ -57,7 +58,7 @@ class MallStore extends Schema.Class<MallStore>("MallStore")({
 ```
 
 Key modeling decisions:
-- **`category`** uses `Schema.Literals` for a constrained set of store types
+- **`category`** uses a const object + `Schema.Literals(Object.values(...))` for a constrained set of store types
 - **`discount`** has a decoding default of `"0.00"` — if omitted during `put`, it defaults automatically
 - **`deposit`** is optional — not every store has one
 - **`rent`**, **`leaseEndDate`** are strings for lexicographic sort key ordering in GSI queries
@@ -66,22 +67,17 @@ Key modeling decisions:
 
 ## Step 2: Schema, Table, and Entity
 
-### Schema and Table
+### Schema
 
-```typescript title="entities.ts"
-import { DynamoSchema, Table } from "effect-dynamodb"
-
+```typescript title="entities.ts" region="schema" example="shopping-mall.ts"
 const MallSchema = DynamoSchema.make({ name: "mall", version: 1 })
-const MallTable = Table.make({ schema: MallSchema })
 ```
 
-### MallStore Entity
+### MallStore Entity and Table
 
-The entity defines three indexes — a composite primary key plus two GSIs:
+The entity defines three indexes — a composite primary key plus two GSIs. The table declares the entity as a member:
 
-```typescript title="entities.ts"
-import { Entity } from "effect-dynamodb"
-
+```typescript title="entities.ts" region="entity" example="shopping-mall.ts"
 const MallStores = Entity.make({
   model: MallStore,
   entityType: "MallStore",
@@ -103,6 +99,8 @@ const MallStores = Entity.make({
   },
   timestamps: true,
 })
+
+const MallTable = Table.make({ schema: MallSchema, entities: { MallStores } })
 ```
 
 | Index | PK composites | SK composites | Access pattern |
@@ -117,7 +115,7 @@ The composite primary key uses four attributes — `cityId` and `mallId` form th
 
 ## Step 3: Seed Data
 
-```typescript title="seed.ts"
+```typescript title="seed.ts" region="seed-data" example="shopping-mall.ts"
 const stores = {
   // Mall: EastPointe — Building A
   starCoffee: {
@@ -197,13 +195,15 @@ const stores = {
 
 Six stores across two malls (EastPointe and WestGate) in Atlanta, with leases expiring at different times throughout 2025.
 
-```typescript title="seed.ts"
-import { DynamoClient } from "effect-dynamodb"
+```typescript title="seed.ts" region="seed-loop" example="shopping-mall.ts"
+const db = yield* DynamoClient.make(MallTable)
 
-const { MallStores: mallStores } = yield* DynamoClient.make(MallTable)
+// --- Setup: create table ---
+yield* db.createTable()
 
+// --- Seed data ---
 for (const store of Object.values(stores)) {
-  yield* mallStores.put(store)
+  yield* db.MallStores.put(store)
 }
 ```
 
@@ -215,8 +215,8 @@ for (const store of Object.values(stores)) {
 
 The composite primary key requires all four attributes — `cityId`, `mallId`, `buildingId`, and `storeId`:
 
-```typescript
-const coffee = yield* mallStores.get({
+```typescript region="pattern-1" example="shopping-mall.ts"
+const coffee = yield* db.MallStores.get({
   cityId: "atlanta",
   mallId: "eastpointe",
   buildingId: "bldg-a",
@@ -231,16 +231,14 @@ const coffee = yield* mallStores.get({
 
 The `units` index on GSI1 uses `mallId` as the partition key. Querying with just the PK composites returns all stores in that mall:
 
-```typescript
-import { Query } from "effect-dynamodb"
-
-const eastpointeStores = yield* mallStores.collect(
-  mallStores.query.units({ mallId: "eastpointe" }),
+```typescript region="pattern-2" example="shopping-mall.ts"
+const eastpointeStores = yield* db.MallStores.collect(
+  MallStores.query.units({ mallId: "eastpointe" }),
 )
 // → 4 stores: star-coffee, burger-barn, tech-zone, trendy-threads
 
-const westgateStores = yield* mallStores.collect(
-  mallStores.query.units({ mallId: "westgate" }),
+const westgateStores = yield* db.MallStores.collect(
+  MallStores.query.units({ mallId: "westgate" }),
 )
 // → 2 stores: mega-mart, gifts-galore
 ```
@@ -249,29 +247,23 @@ const westgateStores = yield* mallStores.collect(
 
 To narrow to a specific building, compose a sort key prefix with `KeyComposer.composeSortKeyPrefix` and use `Query.where({ beginsWith })`:
 
-```typescript
-import { KeyComposer, Query } from "effect-dynamodb"
-
+```typescript region="pattern-3" example="shopping-mall.ts"
 const unitsIndex = MallStores.indexes.units
-const bldgAPrefix = KeyComposer.composeSortKeyPrefix(
-  MallSchema, "MallStore", 1, unitsIndex, { buildingId: "bldg-a" },
-)
+const bldgAPrefix = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, unitsIndex, {
+  buildingId: "bldg-a",
+})
 
-const bldgAStores = yield* mallStores.collect(
-  mallStores.query.units({ mallId: "eastpointe" }).pipe(
-    Query.where({ beginsWith: bldgAPrefix }),
-  ),
+const bldgAStores = yield* db.MallStores.collect(
+  MallStores.query.units({ mallId: "eastpointe" }).pipe(Query.where({ beginsWith: bldgAPrefix })),
 )
 // → 2 stores: star-coffee, burger-barn
 
-const bldgBPrefix = KeyComposer.composeSortKeyPrefix(
-  MallSchema, "MallStore", 1, unitsIndex, { buildingId: "bldg-b" },
-)
+const bldgBPrefix = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, unitsIndex, {
+  buildingId: "bldg-b",
+})
 
-const bldgBStores = yield* mallStores.collect(
-  mallStores.query.units({ mallId: "eastpointe" }).pipe(
-    Query.where({ beginsWith: bldgBPrefix }),
-  ),
+const bldgBStores = yield* db.MallStores.collect(
+  MallStores.query.units({ mallId: "eastpointe" }).pipe(Query.where({ beginsWith: bldgBPrefix })),
 )
 // → 2 stores: tech-zone, trendy-threads
 ```
@@ -282,47 +274,41 @@ The sort key for `units` is composed from `buildingId + unitId`. By composing a 
 
 The `leases` index on GSI2 uses `storeId` as the partition key and `leaseEndDate` as the sort key. Compose sort key bounds to query a date range with `between`:
 
-```typescript
-import { KeyComposer, Query } from "effect-dynamodb"
-
+```typescript region="pattern-4" example="shopping-mall.ts"
 const leasesIndex = MallStores.indexes.leases
 
 // Q1 2025 bounds
-const q1Lo = KeyComposer.composeSortKeyPrefix(
-  MallSchema, "MallStore", 1, leasesIndex, { leaseEndDate: "2025-01-01" },
-)
-const q1Hi = KeyComposer.composeSortKeyPrefix(
-  MallSchema, "MallStore", 1, leasesIndex, { leaseEndDate: "2025-03-31" },
-)
+const q1Lo = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, leasesIndex, {
+  leaseEndDate: "2025-01-01",
+})
+const q1Hi = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, leasesIndex, {
+  leaseEndDate: "2025-03-31",
+})
 
 // star-coffee lease ends 2025-03-31 — within Q1
-const starCoffeeQ1 = yield* mallStores.collect(
-  mallStores.query.leases({ storeId: "star-coffee" }).pipe(
-    Query.where({ between: [q1Lo, q1Hi] }),
-  ),
+const starCoffeeQ1 = yield* db.MallStores.collect(
+  MallStores.query
+    .leases({ storeId: "star-coffee" })
+    .pipe(Query.where({ between: [q1Lo, q1Hi] })),
 )
 // → 1 result (lease ends 2025-03-31)
 
 // tech-zone lease ends 2025-09-30 — NOT in Q1
-const techZoneQ1 = yield* mallStores.collect(
-  mallStores.query.leases({ storeId: "tech-zone" }).pipe(
-    Query.where({ between: [q1Lo, q1Hi] }),
-  ),
+const techZoneQ1 = yield* db.MallStores.collect(
+  MallStores.query.leases({ storeId: "tech-zone" }).pipe(Query.where({ between: [q1Lo, q1Hi] })),
 )
 // → 0 results
 
 // Q3 2025 bounds for tech-zone
-const q3Lo = KeyComposer.composeSortKeyPrefix(
-  MallSchema, "MallStore", 1, leasesIndex, { leaseEndDate: "2025-07-01" },
-)
-const q3Hi = KeyComposer.composeSortKeyPrefix(
-  MallSchema, "MallStore", 1, leasesIndex, { leaseEndDate: "2025-09-30" },
-)
+const q3Lo = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, leasesIndex, {
+  leaseEndDate: "2025-07-01",
+})
+const q3Hi = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, leasesIndex, {
+  leaseEndDate: "2025-09-30",
+})
 
-const techZoneQ3 = yield* mallStores.collect(
-  mallStores.query.leases({ storeId: "tech-zone" }).pipe(
-    Query.where({ between: [q3Lo, q3Hi] }),
-  ),
+const techZoneQ3 = yield* db.MallStores.collect(
+  MallStores.query.leases({ storeId: "tech-zone" }).pipe(Query.where({ between: [q3Lo, q3Hi] })),
 )
 // → 1 result (lease ends 2025-09-30)
 ```
@@ -331,18 +317,21 @@ Because `leaseEndDate` is an ISO date string, it sorts lexicographically in chro
 
 ### Pattern 5: Update Store
 
-Update non-key attributes with `set()`. The composite key identifies which item to update:
+Update non-key attributes with `Entity.set()`. The composite key identifies which item to update:
 
-```typescript
-const updated = yield* mallStores.update({
-  cityId: "atlanta",
-  mallId: "eastpointe",
-  buildingId: "bldg-a",
-  storeId: "star-coffee",
-}, {
-  rent: "4000.00",
-  discount: "100.00",
-})
+```typescript region="pattern-5" example="shopping-mall.ts"
+const updated = yield* db.MallStores.update(
+  {
+    cityId: "atlanta",
+    mallId: "eastpointe",
+    buildingId: "bldg-a",
+    storeId: "star-coffee",
+  },
+  Entity.set({
+    rent: "4000.00",
+    discount: "100.00",
+  }),
+)
 // updated.rent → "4000.00"
 // updated.discount → "100.00"
 // updated.category → "food/coffee" (preserved)
@@ -352,8 +341,8 @@ const updated = yield* mallStores.update({
 
 Delete requires the full composite key:
 
-```typescript
-yield* mallStores.delete({
+```typescript region="pattern-6" example="shopping-mall.ts"
+yield* db.MallStores.delete({
   cityId: "atlanta",
   mallId: "westgate",
   buildingId: "bldg-c",
@@ -361,9 +350,7 @@ yield* mallStores.delete({
 })
 
 // Verify: westgate now has 1 store
-const westgateAfter = yield* mallStores.collect(
-  mallStores.query.units({ mallId: "westgate" }),
-)
+const westgateAfter = yield* db.MallStores.collect(MallStores.query.units({ mallId: "westgate" }))
 // → 1 store: mega-mart
 ```
 
@@ -387,10 +374,7 @@ npx tsx examples/shopping-mall.ts
 
 The example wires dependencies via Effect Layers -- no global config or constructor options:
 
-```typescript title="main.ts"
-import { Effect, Layer } from "effect"
-import { DynamoClient } from "effect-dynamodb"
-
+```typescript title="main.ts" region="run" example="shopping-mall.ts"
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -403,8 +387,8 @@ const AppLayer = Layer.mergeAll(
 const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
-  () => console.log("Done."),
-  (err) => console.error("Failed:", err),
+  () => console.log("\nDone."),
+  (err) => console.error("\nFailed:", err),
 )
 ```
 

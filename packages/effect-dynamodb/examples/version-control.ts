@@ -33,6 +33,7 @@ import * as Transaction from "../src/Transaction.js"
 // 1. Pure domain models — no DynamoDB concepts
 // =============================================================================
 
+// #region models
 class User extends Schema.Class<User>("User")({
   username: Schema.String,
   fullName: Schema.String,
@@ -71,17 +72,21 @@ class PullRequest extends Schema.Class<PullRequest>("PullRequest")({
   body: Schema.String,
   status: IssueStatusSchema,
 }) {}
+// #endregion
 
 // =============================================================================
 // 2. Schema
 // =============================================================================
 
+// #region schema
 const VcsSchema = DynamoSchema.make({ name: "vcs", version: 1 })
+// #endregion
 
 // =============================================================================
 // 3. Entity definitions — pure, no table reference
 // =============================================================================
 
+// #region user-entity
 const Users = Entity.make({
   model: User,
   entityType: "User",
@@ -99,7 +104,9 @@ const Users = Entity.make({
   },
   timestamps: true,
 })
+// #endregion
 
+// #region repository-entity
 const Repositories = Entity.make({
   model: Repository,
   entityType: "Repository",
@@ -123,7 +130,9 @@ const Repositories = Entity.make({
   },
   timestamps: true,
 })
+// #endregion
 
+// #region issue-entity
 const Issues = Entity.make({
   model: Issue,
   entityType: "Issue",
@@ -147,7 +156,9 @@ const Issues = Entity.make({
   },
   timestamps: true,
 })
+// #endregion
 
+// #region pullrequest-entity
 const PullRequests = Entity.make({
   model: PullRequest,
   entityType: "PullRequest",
@@ -171,20 +182,24 @@ const PullRequests = Entity.make({
   },
   timestamps: true,
 })
+// #endregion
 
 // =============================================================================
 // 4. Table definition — declares all entities as members
 // =============================================================================
 
+// #region table
 const VcsTable = Table.make({
   schema: VcsSchema,
   entities: { Users, Repositories, Issues, PullRequests },
 })
+// #endregion
 
 // =============================================================================
 // 5. Seed data
 // =============================================================================
 
+// #region seed-data
 const users = {
   octocat: {
     username: "octocat",
@@ -269,6 +284,7 @@ const pullRequests = {
     status: "Open" as const,
   },
 } as const
+// #endregion
 
 // =============================================================================
 // 6. Helpers
@@ -296,6 +312,7 @@ const program = Effect.gen(function* () {
   yield* db.createTable()
 
   // --- Seed data ---
+  // #region seed-execute
   for (const user of Object.values(users)) {
     yield* db.Users.put(user)
   }
@@ -308,12 +325,14 @@ const program = Effect.gen(function* () {
   for (const pr of Object.values(pullRequests)) {
     yield* db.PullRequests.put(pr)
   }
+  // #endregion
 
   // -------------------------------------------------------------------------
   // Pattern 1: Get user profile (primary key)
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 1: Get User Profile")
 
+  // #region pattern-1
   const octocat = yield* db.Users.get({ username: "octocat" })
   assertEq(octocat.fullName, "The Octocat", "octocat fullName")
   assertEq(octocat.bio, "GitHub mascot", "octocat bio")
@@ -322,6 +341,7 @@ const program = Effect.gen(function* () {
   const torvalds = yield* db.Users.get({ username: "torvalds" })
   assertEq(torvalds.fullName, "Linus Torvalds", "torvalds fullName")
   assertEq(torvalds.location, "Portland, OR", "torvalds location")
+  // #endregion
   yield* Console.log("  User profiles: octocat, torvalds — OK")
 
   // -------------------------------------------------------------------------
@@ -329,6 +349,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 2: Get Repository")
 
+  // #region pattern-2
   const helloWorld = yield* db.Repositories.get({ repoOwner: "octocat", repoName: "hello-world" })
   assertEq(helloWorld.about, "My first repository on GitHub!", "hello-world about")
   assertEq(helloWorld.isPrivate, false, "hello-world isPrivate")
@@ -337,6 +358,7 @@ const program = Effect.gen(function* () {
   const linux = yield* db.Repositories.get({ repoOwner: "torvalds", repoName: "linux" })
   assertEq(linux.about, "Linux kernel source tree", "linux about")
   assertEq(linux.defaultBranch, "master", "linux defaultBranch")
+  // #endregion
   yield* Console.log("  Repositories: hello-world, linux — OK")
 
   // -------------------------------------------------------------------------
@@ -344,6 +366,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 3: User's Owned Repos (gsi1 collection)")
 
+  // #region pattern-3
   const octocatRepos = yield* db.Repositories.collect(
     Repositories.query.created({ repoOwner: "octocat" }),
   )
@@ -359,6 +382,7 @@ const program = Effect.gen(function* () {
   const octocatProfile = yield* db.Users.collect(Users.query.owned({ username: "octocat" }))
   assertEq(octocatProfile.length, 1, "owned collection returns 1 user")
   assertEq(octocatProfile[0]!.fullName, "The Octocat", "owned user fullName")
+  // #endregion
   yield* Console.log("  Owned repos: octocat (1), torvalds (1) — OK")
 
   // -------------------------------------------------------------------------
@@ -366,6 +390,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 4: Create Issue + Update Status")
 
+  // #region pattern-4
   const newIssue = yield* db.Issues.put({
     issueNumber: "3",
     repoName: "hello-world",
@@ -384,6 +409,7 @@ const program = Effect.gen(function* () {
   )
   assertEq(closedIssue.status, "Closed", "closed issue status")
   assertEq(closedIssue.subject, "Enhancement: Add CI pipeline", "closed issue preserves subject")
+  // #endregion
   yield* Console.log("  Create + close issue #3 — OK")
 
   // -------------------------------------------------------------------------
@@ -391,6 +417,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 5: Create Pull Request + Close")
 
+  // #region pattern-5
   const newPR = yield* db.PullRequests.put({
     pullRequestNumber: "2",
     repoName: "hello-world",
@@ -409,6 +436,7 @@ const program = Effect.gen(function* () {
   )
   assertEq(closedPR.status, "Closed", "closed PR status")
   assertEq(closedPR.subject, "Add CONTRIBUTING.md", "closed PR preserves subject")
+  // #endregion
   yield* Console.log("  Create + close PR #2 — OK")
 
   // -------------------------------------------------------------------------
@@ -416,6 +444,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 6: User's Managed Items (gsi1 collection)")
 
+  // #region pattern-6
   const torvaldsIssues = yield* db.Issues.collect(Issues.query.created({ username: "torvalds" }))
   assertEq(torvaldsIssues.length, 2, "torvalds has 2 issues")
   const torvaldsIssueSubjects = torvaldsIssues.map((i) => i.subject).sort()
@@ -441,6 +470,7 @@ const program = Effect.gen(function* () {
     PullRequests.query.created({ username: "octocat" }),
   )
   assertEq(octocatPRs.length, 2, "octocat has 2 PRs")
+  // #endregion
   yield* Console.log("  Managed items: torvalds (2 issues, 1 PR), octocat (2 issues, 2 PRs) — OK")
 
   // -------------------------------------------------------------------------
@@ -448,6 +478,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 7: Repository Activity (gsi2 collection)")
 
+  // #region pattern-7
   const hwIssues = yield* db.Issues.collect(
     Issues.query.todos({ repoOwner: "octocat", repoName: "hello-world" }),
   )
@@ -484,6 +515,7 @@ const program = Effect.gen(function* () {
   )
   assertEq(hwRepoActivity.length, 1, "activity returns 1 repo record")
   assertEq(hwRepoActivity[0]!.repoName, "hello-world", "activity repo name")
+  // #endregion
   yield* Console.log("  Activity: hello-world (3 issues, 2 PRs), linux (1 issue, 1 PR) — OK")
 
   // -------------------------------------------------------------------------
@@ -491,6 +523,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 8: Atomic Create (Transaction)")
 
+  // #region pattern-8
   yield* Transaction.transactWrite([
     Issues.put({
       issueNumber: "2",
@@ -537,6 +570,7 @@ const program = Effect.gen(function* () {
     PullRequests.query.enhancements({ repoOwner: "torvalds", repoName: "linux" }),
   )
   assertEq(linuxPRsAfter.length, 2, "linux now has 2 PRs")
+  // #endregion
   yield* Console.log("  Atomic create: issue #2 + PR #2 on linux — OK")
 
   // --- Cleanup ---
@@ -548,6 +582,7 @@ const program = Effect.gen(function* () {
 // 8. Provide dependencies and run
 // =============================================================================
 
+// #region layer
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -563,6 +598,7 @@ Effect.runPromise(main).then(
   () => console.log("\nDone."),
   (err) => console.error("\nFailed:", err),
 )
+// #endregion
 
 export {
   program,

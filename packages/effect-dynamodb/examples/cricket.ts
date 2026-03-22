@@ -45,6 +45,8 @@ import * as Table from "../src/Table.js"
 // 1. Domain models — pure, no DynamoDB concepts
 // ---------------------------------------------------------------------------
 
+// #region models
+// #region model-enums
 const PlayerRole = {
   Batter: "batter",
   Bowler: "bowler",
@@ -52,7 +54,9 @@ const PlayerRole = {
   WicketKeeper: "wicket-keeper",
 } as const
 const PlayerRoleSchema = Schema.Literals(Object.values(PlayerRole))
+// #endregion
 
+// #region model-standalone
 class Team extends Schema.Class<Team>("Team")({
   id: Schema.String.pipe(DynamoModel.identifier),
   name: Schema.String,
@@ -77,7 +81,9 @@ class Venue extends Schema.Class<Venue>("Venue")({
   name: Schema.String,
   city: Schema.String,
 }) {}
+// #endregion
 
+// #region model-squad-selection
 // SquadSelection — a player selected to a team's squad for a series/season.
 // squadId encodes team + season + series (e.g., "aus#2024-25#BGT").
 class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
@@ -89,7 +95,9 @@ class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
   isCaptain: Schema.Boolean,
   isViceCaptain: Schema.Boolean,
 }) {}
+// #endregion
 
+// #region model-aggregate
 // Aggregate domain schemas
 class PlayerSheet extends Schema.Class<PlayerSheet>("PlayerSheet")({
   player: Player.pipe(DynamoModel.ref),
@@ -111,17 +119,23 @@ class Match extends Schema.Class<Match>("Match")({
   team1: TeamSheet,
   team2: TeamSheet,
 }) {}
+// #endregion
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 2. Schema
 // ---------------------------------------------------------------------------
 
+// #region schema
 const CricketSchema = DynamoSchema.make({ name: "cricket", version: 1 })
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 3. Entity definitions — pure definitions, no table reference
 // ---------------------------------------------------------------------------
 
+// #region entities
+// #region entity-standalone
 const Teams = Entity.make({
   model: DynamoModel.configure(Team, { id: { field: "teamId" } }),
   entityType: "Team",
@@ -165,7 +179,9 @@ const Venues = Entity.make({
     },
   },
 })
+// #endregion
 
+// #region entity-squad-selection
 const SquadSelections = Entity.make({
   model: SquadSelection,
   entityType: "SquadSelection",
@@ -185,20 +201,25 @@ const SquadSelections = Entity.make({
     player: { entity: Players },
   },
 })
+// #endregion
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 4. Table definition — declare entities as members
 // ---------------------------------------------------------------------------
 
+// #region table
 const MainTable = Table.make({
   schema: CricketSchema,
   entities: { Teams, Players, Coaches, Venues, SquadSelections },
 })
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 5. Aggregate definitions
 // ---------------------------------------------------------------------------
 
+// #region aggregates
 // Sub-aggregate: a team's composition within a match
 const TeamSheetAggregate = Aggregate.make(TeamSheet, {
   root: { entityType: "MatchTeam" },
@@ -226,11 +247,13 @@ const MatchAggregate = Aggregate.make(Match, {
     team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
   },
 })
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 6. Type-level demonstration
 // ---------------------------------------------------------------------------
 
+// #region types
 // Entity.Input accepts IDs for ref fields, not full objects
 type SelectionInput = Entity.Input<typeof SquadSelections>
 type SelectionRecord = Entity.Record<typeof SquadSelections>
@@ -244,6 +267,7 @@ const _matchType: MatchType | undefined = undefined
 void _input
 void _record
 void _matchType
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 7. Program — Entity Refs + Aggregate Read Path
@@ -303,6 +327,7 @@ const program = Effect.gen(function* () {
 
   yield* Console.log("\n--- Part 1: Entity Refs ---\n")
 
+  // #region seed-data
   // --- Create teams (model uses 'id', DB stores as 'teamId') ---
   yield* Console.log("Creating teams...")
   yield* db.Teams.put({ id: "aus", name: "Australia", country: "Australia", ranking: 1 })
@@ -337,7 +362,9 @@ const program = Effect.gen(function* () {
   // --- Create venues ---
   yield* Console.log("Creating venues...")
   yield* db.Venues.put({ id: "mcg", name: "Melbourne Cricket Ground", city: "Melbourne" })
+  // #endregion
 
+  // #region squad-refs
   // --- Create squad selections with ref IDs ---
   yield* Console.log("\nCreating squad selections (AUS BGT 2024-25)...")
 
@@ -378,7 +405,9 @@ const program = Effect.gen(function* () {
   yield* Console.log(`  Team: ${captain.team.name} (${captain.team.country})`)
   yield* Console.log(`  Role: ${captain.player.role}`)
   yield* Console.log(`  Captain: ${captain.isCaptain}`)
+  // #endregion
 
+  // #region ref-not-found
   // --- RefNotFound when ref doesn't exist ---
   yield* Console.log("\nAttempting to create selection with nonexistent player...")
   const refError = yield* db.SquadSelections.put({
@@ -396,6 +425,7 @@ const program = Effect.gen(function* () {
       `RefNotFound: ${refError.field} "${refError.refId}" not found in ${refError.refEntity}`,
     )
   }
+  // #endregion
 
   // =========================================================================
   // Part 2: Cascade Updates
@@ -404,6 +434,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("\n--- Part 2: Cascade Updates ---\n")
   yield* Console.log("Updating Player 'Steve Smith' → 'Steven Smith' with cascade...")
 
+  // #region cascade
   // Update the player and cascade to all SquadSelections that embed this player
   const updatedPlayer = yield* db.Players.update(
     { id: "smith-01" },
@@ -422,6 +453,7 @@ const program = Effect.gen(function* () {
     `Squad selection player after cascade: ${afterCascade.player.firstName} ${afterCascade.player.lastName}`,
   )
   yield* Console.log(`  (Should be "Steven Smith", was "Steve Smith")`)
+  // #endregion
 
   // =========================================================================
   // Part 3: Aggregate CRUD
@@ -429,6 +461,7 @@ const program = Effect.gen(function* () {
 
   yield* Console.log("\n--- Part 3: Aggregate CRUD ---\n")
 
+  // #region aggregate-create
   // --- Aggregate.create: ref hydration + sub-aggregate transactions ---
   yield* Console.log("Creating match via Aggregate.create...")
   yield* Console.log("  (Input uses ref IDs; system hydrates from entity data)")
@@ -453,6 +486,7 @@ const program = Effect.gen(function* () {
       players: [{ playerId: "kohli-01", battingPosition: 4, isCaptain: true }],
     },
   })
+  // #endregion
 
   yield* Console.log(`\nCreated match: ${match.name}`)
   yield* Console.log(`Venue: ${match.venue.name}, ${match.venue.city}`)
@@ -484,13 +518,16 @@ const program = Effect.gen(function* () {
 
   yield* printMatch(match)
 
+  // #region aggregate-get
   // --- Aggregate.get: read it back ---
   yield* Console.log("\n--- Aggregate.get: Read back the match ---")
   const fetched = yield* MatchAggregate.get({ id: "bgt-2025-test-1" })
   yield* Console.log(`\nFetched match: ${fetched.name}`)
   yield* Console.log(`Venue: ${fetched.venue.name}, ${fetched.venue.city}`)
   yield* printMatch(fetched)
+  // #endregion
 
+  // #region aggregate-update
   // --- Aggregate.update: rename match using cursor ---
   yield* Console.log("\n--- Aggregate.update: Rename match (cursor replace) ---")
   const renamed = yield* MatchAggregate.update({ id: "bgt-2025-test-1" }, ({ cursor }) =>
@@ -511,7 +548,9 @@ const program = Effect.gen(function* () {
 
   yield* Console.log(`\nUpdated match: ${updated.name}`)
   yield* printMatch(updated)
+  // #endregion
 
+  // #region aggregate-delete
   // --- Aggregate.delete: remove all items ---
   yield* Console.log("\n--- Aggregate.delete: Remove the match ---")
   yield* MatchAggregate.delete({ id: "bgt-2025-test-1" })
@@ -520,6 +559,7 @@ const program = Effect.gen(function* () {
   // Verify deletion
   const getResult = yield* MatchAggregate.get({ id: "bgt-2025-test-1" }).pipe(Effect.flip)
   yield* Console.log(`Get after delete: ${getResult._tag}`)
+  // #endregion
 
   // --- Cleanup ---
   yield* Console.log("\nCleaning up...")
@@ -531,6 +571,7 @@ const program = Effect.gen(function* () {
 // 8. Run
 // ---------------------------------------------------------------------------
 
+// #region layer
 const AppLayer = Layer.merge(
   DynamoClient.layer({
     region: "us-east-1",
@@ -546,3 +587,4 @@ Effect.runPromise(main).then(
   () => console.log("\nDone."),
   (err) => console.error("Failed:", err),
 )
+// #endregion

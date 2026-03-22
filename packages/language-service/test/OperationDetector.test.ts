@@ -198,4 +198,44 @@ describe("OperationDetector", () => {
     expect(op).toBeDefined()
     expect(op!.type).toBe("scan")
   })
+
+  it("should detect db.Users.collect(Users.query.byRole(...)) as query", () => {
+    const source = `db.Users.collect(Users.query.byRole({ role: "admin" }))`
+    const sf = parseSource(source)
+    const op = detectOperation(ts, sf, 9, entities)
+
+    expect(op).toBeDefined()
+    expect(op!.type).toBe("query")
+    expect(op!.indexName).toBe("byRole")
+    expect(op!.arguments).toEqual({ role: "admin" })
+  })
+
+  it("should detect db.Tasks.paginate(Tasks.query.byUser(...)) as query", () => {
+    const source = `db.Tasks.paginate(Tasks.query.byUser({ userId: "u-1" }))`
+    const sf = parseSource(source)
+    const op = detectOperation(ts, sf, 9, entities)
+
+    expect(op).toBeDefined()
+    expect(op!.type).toBe("query")
+    expect(op!.indexName).toBe("byUser")
+    expect(op!.arguments).toEqual({ userId: "u-1" })
+  })
+
+  it("should detect db.Users.collect(Users.scan()) as scan", () => {
+    const source = `db.Users.collect(Users.scan())`
+    const sf = parseSource(source)
+    const op = detectOperation(ts, sf, 9, entities)
+
+    expect(op).toBeDefined()
+    expect(op!.type).toBe("scan")
+  })
+
+  it("should detect db.Users.paginate(Users.scan()) as scan", () => {
+    const source = `db.Users.paginate(Users.scan())`
+    const sf = parseSource(source)
+    const op = detectOperation(ts, sf, 9, entities)
+
+    expect(op).toBeDefined()
+    expect(op!.type).toBe("scan")
+  })
 })

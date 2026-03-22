@@ -33,6 +33,7 @@ import * as Transaction from "../src/Transaction.js"
 // 1. Pure domain models — no DynamoDB concepts
 // =============================================================================
 
+// #region models
 const Department = {
   Jupiter: "jupiter",
   Mercury: "mercury",
@@ -71,17 +72,21 @@ class Office extends Schema.Class<Office>("Office")({
   zip: Schema.String,
   address: Schema.String,
 }) {}
+// #endregion
 
 // =============================================================================
 // 2. Schema
 // =============================================================================
 
+// #region schema
 const HrSchema = DynamoSchema.make({ name: "hr", version: 1 })
+// #endregion
 
 // =============================================================================
 // 3. Entity definitions
 // =============================================================================
 
+// #region employee-entity
 const Employees = Entity.make({
   model: Employee,
   entityType: "Employee",
@@ -117,7 +122,9 @@ const Employees = Entity.make({
   versioned: true,
   softDelete: true,
 })
+// #endregion
 
+// #region task-entity
 const Tasks = Entity.make({
   model: Task,
   entityType: "Task",
@@ -140,7 +147,9 @@ const Tasks = Entity.make({
   },
   timestamps: true,
 })
+// #endregion
 
+// #region office-entity
 const Offices = Entity.make({
   model: Office,
   entityType: "Office",
@@ -163,20 +172,24 @@ const Offices = Entity.make({
   },
   timestamps: true,
 })
+// #endregion
 
 // =============================================================================
 // 4. Table — declares entities
 // =============================================================================
 
+// #region table
 const HrTable = Table.make({
   schema: HrSchema,
   entities: { Employees, Tasks, Offices },
 })
+// #endregion
 
 // =============================================================================
 // 5. Seed data + helpers (unchanged)
 // =============================================================================
 
+// #region seed-data
 const offices = {
   gwZoo: {
     office: "gw-zoo",
@@ -273,6 +286,7 @@ const tasks = {
     description: "Sell merchandise at the gift shop",
   },
 }
+// #endregion
 
 const assert = (condition: boolean, message: string): void => {
   if (!condition) throw new Error(`Assertion failed: ${message}`)
@@ -290,6 +304,7 @@ const assertEq = <T>(actual: T, expected: T, label: string): void => {
 
 const program = Effect.gen(function* () {
   // Typed execution gateway — binds all entities
+  // #region seed-execution
   const db = yield* DynamoClient.make(HrTable)
 
   // --- Setup: create table ---
@@ -305,10 +320,12 @@ const program = Effect.gen(function* () {
   for (const task of Object.values(tasks)) {
     yield* db.Tasks.put(task)
   }
+  // #endregion
 
   // Pattern 1: CRUD
   yield* Console.log("Pattern 1: CRUD")
 
+  // #region crud
   const joe = yield* db.Employees.get({ employee: "jlowe" })
   assertEq(joe.firstName, "Joe", "get firstName")
   assertEq(joe.lastName, "Lowe", "get lastName")
@@ -337,11 +354,13 @@ const program = Effect.gen(function* () {
   assert(deleted, "delete removes item")
 
   yield* db.Employees.put(employees.jlowe)
+  // #endregion
   yield* Console.log("  CRUD: get, update, delete, re-put — OK")
 
   // Pattern 2: Workplaces (gsi1 collection)
   yield* Console.log("Pattern 2: Workplaces (gsi1 collection)")
 
+  // #region workplaces
   const gwZooEmployees = yield* db.Employees.collect(
     Employees.query.coworkers({ office: "gw-zoo" }),
   )
@@ -353,11 +372,13 @@ const program = Effect.gen(function* () {
   assertEq(gwZooOffice.length, 1, "gw-zoo has 1 office record")
   assertEq(gwZooOffice[0]!.city, "Wynnewood", "gw-zoo city")
   assertEq(gwZooOffice[0]!.state, "OK", "gw-zoo state")
+  // #endregion
   yield* Console.log("  Workplaces: coworkers + office lookup — OK")
 
   // Pattern 3: Assignments (gsi3 collection)
   yield* Console.log("Pattern 3: Assignments (gsi3 collection)")
 
+  // #region assignments
   const dfinlayTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "dfinlay" }))
   assertEq(dfinlayTasks.length, 1, "dfinlay has 1 task")
   assertEq(dfinlayTasks[0]!.task, "feed-cats", "dfinlay task ID")
@@ -368,11 +389,13 @@ const program = Effect.gen(function* () {
   )
   assertEq(dfinlayInfo.length, 1, "employeeLookup returns 1")
   assertEq(dfinlayInfo[0]!.firstName, "Don", "employeeLookup firstName")
+  // #endregion
   yield* Console.log("  Assignments: tasks + employee lookup — OK")
 
   // Pattern 4: Tasks by Project (gsi1)
   yield* Console.log("Pattern 4: Tasks by Project (gsi1)")
 
+  // #region tasks-by-project
   const feedingTasks = yield* db.Tasks.collect(Tasks.query.project({ project: "feeding" }))
   assertEq(feedingTasks.length, 2, "feeding project has 2 tasks")
   const feedingTaskIds = feedingTasks.map((t) => t.task).sort()
@@ -380,11 +403,13 @@ const program = Effect.gen(function* () {
 
   const fundraiserTasks = yield* db.Tasks.collect(Tasks.query.project({ project: "fundraiser" }))
   assertEq(fundraiserTasks.length, 2, "fundraiser project has 2 tasks")
+  // #endregion
   yield* Console.log("  Tasks by project: feeding (2), fundraiser (2) — OK")
 
   // Pattern 5: Offices by Location (gsi2)
   yield* Console.log("Pattern 5: Offices by Location (gsi2)")
 
+  // #region offices-by-location
   const flOffices = yield* db.Offices.collect(
     Offices.query.byLocation({ country: "US", state: "FL" }),
   )
@@ -397,11 +422,13 @@ const program = Effect.gen(function* () {
   )
   assertEq(okOffices.length, 1, "Oklahoma has 1 office")
   assertEq(okOffices[0]!.office, "gw-zoo", "OK office ID")
+  // #endregion
   yield* Console.log("  Offices by location: FL (1), OK (1) — OK")
 
   // Pattern 6: Salary Range Query (gsi4)
   yield* Console.log("Pattern 6: Salary Range Query (gsi4)")
 
+  // #region salary-range
   const zookeepers = yield* db.Employees.collect(Employees.query.roles({ title: "Zookeeper" }))
   assertEq(zookeepers.length, 1, "1 Zookeeper")
   assertEq(zookeepers[0]!.employee, "jlowe", "Zookeeper is jlowe")
@@ -423,11 +450,13 @@ const program = Effect.gen(function* () {
   assertEq(directorsBySalary.length, 1, "1 Director in salary range")
   assertEq(directorsBySalary[0]!.employee, "cbaskin", "Director is cbaskin")
   assertEq(directorsBySalary[0]!.salary, "000150.00", "Director salary")
+  // #endregion
   yield* Console.log("  Roles + salary range: Zookeeper (1), Director between (1) — OK")
 
   // Pattern 7: Direct Reports (gsi5)
   yield* Console.log("Pattern 7: Direct Reports (gsi5)")
 
+  // #region direct-reports
   const jloweReports = yield* db.Employees.collect(
     Employees.query.directReports({ manager: "jlowe" }),
   )
@@ -441,11 +470,13 @@ const program = Effect.gen(function* () {
   assertEq(cbaskinReports.length, 2, "cbaskin has 2 reports (including self)")
   const cbaskinReportIds = cbaskinReports.map((e) => e.employee).sort()
   assertEq(cbaskinReportIds, ["cbaskin", "hschreibvogel"], "cbaskin report IDs")
+  // #endregion
   yield* Console.log("  Direct reports: jlowe (2), cbaskin (2) — OK")
 
   // Pattern 8: Employee Transfer (All-or-None)
   yield* Console.log("Pattern 8: Employee Transfer (All-or-None)")
 
+  // #region transfer
   const transferred = yield* db.Employees.update(
     { employee: "dfinlay" },
     Entity.set({
@@ -477,8 +508,10 @@ const program = Effect.gen(function* () {
   )
   assertEq(jloweReportsAfter.length, 1, "jlowe has 1 report after transfer")
   assertEq(jloweReportsAfter[0]!.employee, "jlowe", "jlowe's only report is self")
+  // #endregion
 
   // Partial GSI update fails at runtime
+  // #region partial-gsi-error
   const partialError = yield* db.Employees.update(
     { employee: "dfinlay" },
     Entity.set({ office: "gw-zoo" } as any),
@@ -488,11 +521,13 @@ const program = Effect.gen(function* () {
     String((partialError as any).cause).includes("coworkers"),
     "error references the violating index",
   )
+  // #endregion
   yield* Console.log("  Transfer + all-or-none runtime guard — OK")
 
   // Pattern 9: Atomic Onboarding (Transaction)
   yield* Console.log("Pattern 9: Atomic Onboarding (Transaction)")
 
+  // #region transaction
   yield* Transaction.transactWrite([
     Employees.put({
       employee: "rstarr",
@@ -523,11 +558,13 @@ const program = Effect.gen(function* () {
   assertEq(onboardingTasks.length, 1, "transaction created 1 task")
   assertEq(onboardingTasks[0]!.task, "orientation", "transaction task ID")
   assertEq(onboardingTasks[0]!.project, "onboarding", "transaction task project")
+  // #endregion
   yield* Console.log("  Atomic onboarding: employee + task in transaction — OK")
 
   // Pattern 10: Termination + Rehire (Soft Delete + Restore)
   yield* Console.log("Pattern 10: Termination + Rehire (Soft Delete + Restore)")
 
+  // #region soft-delete
   yield* db.Employees.delete({ employee: "hschreibvogel" })
 
   const cbaskinReportsAfterTermination = yield* db.Employees.collect(
@@ -554,6 +591,7 @@ const program = Effect.gen(function* () {
     reportsAfterRehire.some((e) => e.employee === "hschreibvogel"),
     "rehired employee back in direct reports",
   )
+  // #endregion
   yield* Console.log("  Terminate + rehire: soft-delete, audit lookup, restore — OK")
 
   // --- Cleanup ---
@@ -565,6 +603,7 @@ const program = Effect.gen(function* () {
 // 7. Layer + run
 // =============================================================================
 
+// #region layer
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -580,5 +619,6 @@ Effect.runPromise(main).then(
   () => console.log("\nDone."),
   (err) => console.error("\nFailed:", err),
 )
+// #endregion
 
 export { program, HrTable, HrSchema, Employees, Tasks, Offices, Employee, Task, Office }

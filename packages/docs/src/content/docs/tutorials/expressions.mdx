@@ -26,9 +26,7 @@ A product catalog that demonstrates **conditional writes** and **filter expressi
 
 A pure domain model with no DynamoDB concepts:
 
-```typescript title="models.ts"
-import { Schema } from "effect"
-
+```typescript title="models.ts" region="model" example="expressions.ts"
 class Product extends Schema.Class<Product>("Product")({
   productId: Schema.String,
   name: Schema.NonEmptyString,
@@ -42,11 +40,8 @@ class Product extends Schema.Class<Product>("Product")({
 
 ## Step 2: Schema, Table, and Entity
 
-```typescript title="entities.ts"
-import { DynamoSchema, Entity, Table } from "effect-dynamodb"
-
+```typescript title="entities.ts" region="entities" example="expressions.ts"
 const AppSchema = DynamoSchema.make({ name: "expr-demo", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
 
 const Products = Entity.make({
   model: Product,
@@ -65,6 +60,8 @@ const Products = Entity.make({
   timestamps: true,
   versioned: true,
 })
+
+const MainTable = Table.make({ schema: AppSchema, entities: { Products } })
 ```
 
 `versioned: true` enables optimistic locking -- every write increments a `version` counter, and `expectedVersion()` can enforce it.
@@ -77,14 +74,10 @@ const Products = Entity.make({
 
 `Entity.create()` is `put()` with an automatic `attribute_not_exists` condition on the primary key. If the item already exists, it fails with `ConditionalCheckFailed`:
 
-```typescript
-import { Effect } from "effect"
-import { DynamoClient } from "effect-dynamodb"
-
-const { Products: products } = yield* DynamoClient.make(MainTable)
-
-// First create succeeds
-const widget = yield* products.create({
+```typescript region="create" example="expressions.ts"
+// create() is put() + automatic attribute_not_exists on primary key.
+// It fails with ConditionalCheckFailed if an item already exists.
+const widget = yield* db.Products.create({
   productId: "p-1",
   name: "Widget",
   category: "electronics",
@@ -92,35 +85,31 @@ const widget = yield* products.create({
   stock: 100,
 })
 
-// Duplicate create fails with ConditionalCheckFailed
-const result = yield* products
-  .create({
-    productId: "p-1",
-    name: "Widget Duplicate",
-    category: "electronics",
-    price: 19.99,
-    stock: 50,
-  })
-  .pipe(
-    Effect.map(() => "unexpected success"),
-    Effect.catchTag("ConditionalCheckFailed", () =>
-      Effect.succeed("duplicate prevented!"),
-    ),
-  )
-// result → "duplicate prevented!"
+// Try to create the same item again — should fail
+const duplicateResult = yield* db.Products.create({
+  productId: "p-1",
+  name: "Widget Duplicate",
+  category: "electronics",
+  price: 19.99,
+  stock: 50,
+}).pipe(
+  Effect.map(() => "unexpected success"),
+  Effect.catchTag("ConditionalCheckFailed", () =>
+    Effect.succeed("ConditionalCheckFailed — duplicate prevented!"),
+  ),
+)
 ```
 
 BoundEntity methods return `Effect` directly, so you can pipe to `Effect.catchTag` and other combinators.
 
 ### Conditional Put
 
-`Products.condition()` adds a server-side `ConditionExpression` to any write operation. The condition is evaluated atomically -- if it fails, the write is rejected with `ConditionalCheckFailed`.
+`Products.condition()` adds a server-side `ConditionExpression` to any write operation. The condition is evaluated atomically -- if it fails, the write is rejected with `ConditionalCheckFailed`:
 
-There are two ways to build conditions -- a **callback API** using a type-safe PathBuilder, and a **shorthand** with plain objects:
-
-```typescript
-// Callback API — type-safe, supports nested paths and all operators
-const newProduct = yield* products.put(
+```typescript region="conditional-put" example="expressions.ts"
+// Products.condition() adds a ConditionExpression to a put operation.
+// The condition is evaluated server-side. If it fails, the put is rejected.
+const condPutResult = yield* db.Products.put(
   {
     productId: "p-5",
     name: "New Product",
@@ -128,19 +117,8 @@ const newProduct = yield* products.put(
     price: 49.99,
     stock: 10,
   },
+  // Only put if item doesn't already exist (same as create, but explicit)
   Products.condition((t, { notExists }) => notExists(t.productId)),
-)
-
-// Shorthand — plain object, AND-equality
-const newProduct2 = yield* products.put(
-  {
-    productId: "p-6",
-    name: "Another Product",
-    category: "electronics",
-    price: 59.99,
-    stock: 5,
-  },
-  Products.condition({ category: "electronics" }),
 )
 ```
 
@@ -148,67 +126,88 @@ const newProduct2 = yield* products.put(
 
 Delete an item only when a condition is met. Here we delete only if the product has zero stock:
 
-```typescript
-// Delete only if stock is 0
-const deleteResult = yield* products
-  .delete(
-    { productId: "p-4" },
-    Products.condition((t, { eq }) => eq(t.stock, 0)),
-  )
-  .pipe(
-    Effect.match({
-      onFailure: (e) => `Failed: ${e._tag}`,
-      onSuccess: () => "deleted (stock was 0)",
-    }),
-  )
+```typescript region="conditional-delete" example="expressions.ts"
+// Delete only if the item's stock is 0 (don't delete items with stock).
+// Products.condition() maps ConditionalCheckFailedException at runtime.
+// Use Effect.match to handle both success and failure paths.
+const condDeleteResult = yield* db.Products.delete(
+  { productId: "p-4" },
+  Products.condition((t, { eq }) => eq(t.stock, 0)),
+).pipe(
+  Effect.match({
+    onFailure: (e) => `Failed: ${e._tag}`,
+    onSuccess: () => "deleted (stock was 0)",
+  }),
+)
 
-// Fails when item has stock > 0
-const deleteFail = yield* products
-  .delete(
-    { productId: "p-1" },
-    Products.condition((t, { eq }) => eq(t.stock, 0)),
-  )
-  .pipe(
-    Effect.match({
-      onFailure: (e) => `${e._tag} — item has stock`,
-      onSuccess: () => "deleted",
-    }),
-  )
-// → "ConditionalCheckFailed — item has stock"
+// Try to conditionally delete an item with stock > 0
+const condDeleteFail = yield* db.Products.delete(
+  { productId: "p-1" },
+  Products.condition((t, { eq }) => eq(t.stock, 0)),
+).pipe(
+  Effect.match({
+    onFailure: (e) => `${e._tag} — item has stock (correct!)`,
+    onSuccess: () => "deleted",
+  }),
+)
 ```
 
 ### Conditional Update + Optimistic Locking
 
 Combine `Products.condition()` with `expectedVersion()` and `set()`. The user condition is ANDed with the optimistic lock condition:
 
-```typescript
-// Update price only if stock > 0 AND version matches
-const updated = yield* products.update(
+```typescript region="conditional-update" example="expressions.ts"
+// Combine condition() with expectedVersion() and set().
+// The user condition is ANDed with the optimistic lock condition.
+const updated = yield* db.Products.update(
   { productId: "p-1" },
   Products.set({ price: 24.99 }),
   Products.expectedVersion(1),
   Products.condition((t, { gt }) => gt(t.stock, 0)),
 )
-// updated.price → 24.99, updated.version → 2
 ```
 
 When the condition fails, you get a `ConditionalCheckFailed` error:
 
-```typescript
-// Fails: stock is 100, not > 1000
-const fail = yield* products
-  .update(
-    { productId: "p-1" },
-    Products.set({ price: 19.99 }),
-    Products.condition((t, { gt }) => gt(t.stock, 1000)),
-  )
-  .pipe(
-    Effect.match({
-      onFailure: (e) => `${e._tag} — stock not > 1000`,
-      onSuccess: () => "updated",
-    }),
-  )
-// → "ConditionalCheckFailed — stock not > 1000"
+```typescript region="conditional-update-fail" example="expressions.ts"
+// Condition fails: update only if stock > 1000 (it's 100)
+const condUpdateFail = yield* db.Products.update(
+  { productId: "p-1" },
+  Products.set({ price: 19.99 }),
+  Products.condition((t, { gt }) => gt(t.stock, 1000)),
+).pipe(
+  Effect.match({
+    onFailure: (e) => `${e._tag} — stock not > 1000`,
+    onSuccess: () => "updated",
+  }),
+)
+```
+
+### Callback and Shorthand Conditions
+
+There are two ways to build conditions -- a **callback API** using a type-safe PathBuilder, and a **shorthand** with plain objects:
+
+```typescript region="condition-callback" example="expressions.ts"
+// The callback API provides type-safe conditions using PathBuilder.
+// First argument `t` is a path proxy, second `ops` has comparison functions.
+const conditionUpdated = yield* db.Products.update(
+  { productId: "p-2" },
+  Products.set({ price: 79.99 }),
+  // Type-safe: t.stock is typed as number, "active" would be a type error
+  Products.condition((t, { gt }) => gt(t.stock, 0)),
+)
+
+// Shorthand condition — plain object for simple equality
+const shorthandResult = yield* db.Products.update(
+  { productId: "p-2" },
+  Products.set({ price: 84.99 }),
+  Products.condition({ category: "electronics" }),
+).pipe(
+  Effect.match({
+    onFailure: (e) => `Failed: ${e._tag}`,
+    onSuccess: (p) => `Shorthand condition: ${p.name} price=$${p.price}`,
+  }),
+)
 ```
 
 ### Filter Expressions
@@ -217,43 +216,52 @@ Filter expressions narrow query and scan results. They are applied server-side a
 
 `Products.filter()` uses the same callback + shorthand API as `Products.condition()`, applied as a combinator on queries and scans:
 
-```typescript
-// Callback — type-safe with PathBuilder
-const expensive = yield* products.collect(
+```typescript region="filters" example="expressions.ts"
+// Equality filter
+const electronics = yield* db.Products.collect(
+  Products.query.byCategory({ category: "electronics" }),
+)
+
+// Greater-than filter
+const expensive = yield* db.Products.collect(
   Products.query.byCategory({ category: "electronics" }),
   Products.filter((t, { gt }) => gt(t.price, 30)),
 )
 
 // Between filter
-const midRange = yield* products.collect(
+const midRange = yield* db.Products.collect(
   Products.query.byCategory({ category: "electronics" }),
   Products.filter((t, { between }) => between(t.price, 20, 50)),
 )
 
-// Contains filter — string substring match
-const withWidget = yield* products.collect(
+// Contains filter (string substring match)
+const withWidget = yield* db.Products.collect(
   Products.scan(),
   Products.filter((t, { contains }) => contains(t.name, "Widget")),
 )
 
-// Complex filter with OR
-const activeOrPending = yield* products.collect(
+// Attribute exists/not exists
+const allWithStock = yield* db.Products.collect(
+  Products.scan(),
+  Products.filter((t, { exists }) => exists(t.stock)),
+)
+```
+
+Filter with callback supports nested paths, OR composition, and all DynamoDB operators:
+
+```typescript region="filter-callback" example="expressions.ts"
+// Filter with callback — supports nested paths, OR, and all DynamoDB operators
+const expensiveProducts = yield* db.Products.collect(
+  Products.query.byCategory({ category: "electronics" }),
+  Products.filter((t, { gt }) => gt(t.price, 30)),
+)
+
+// OR composition in filter
+const multiCategory = yield* db.Products.collect(
   Products.scan(),
   Products.filter((t, { or, eq }) =>
     or(eq(t.category, "electronics"), eq(t.category, "accessories")),
   ),
-)
-
-// Shorthand — AND-equality
-const electronics = yield* products.collect(
-  Products.scan(),
-  Products.filter({ category: "electronics" }),
-)
-
-// Attribute exists
-const allWithStock = yield* products.collect(
-  Products.scan(),
-  Products.filter((t, { exists }) => exists(t.stock)),
 )
 ```
 
@@ -261,18 +269,17 @@ const allWithStock = yield* products.collect(
 
 Select specific attributes to reduce network transfer:
 
-```typescript
-// Callback — type-safe path selection
-const names = yield* products.collect(
+```typescript region="select" example="expressions.ts"
+// Path-based projection — type-safe attribute selection
+const namesAndPrices = yield* db.Products.collect(
   Products.scan(),
   Products.select((t) => [t.name, t.price]),
 )
-// names → [{ name: "Widget", price: 29.99 }, ...]
 
 // String array shorthand
-const names2 = yield* products.collect(
+const nameOnly = yield* db.Products.collect(
   Products.scan(),
-  Products.select(["name", "price"]),
+  Products.select(["name", "category"]),
 )
 ```
 
@@ -280,19 +287,18 @@ const names2 = yield* products.collect(
 
 The `Expression` module exposes the raw builders used internally. These are useful for inspecting what DynamoDB expressions are generated:
 
-```typescript
-import { Expression } from "effect-dynamodb"
+```typescript region="expression-builders" example="expressions.ts"
+// Expression.condition() builds raw ConditionExpression strings.
+// These are what Products.condition() uses under the hood.
 
-// Condition expression with multiple clauses (ANDed together)
-const cond = Expression.condition({
+const cond1 = Expression.condition({
   eq: { status: "active" },
   gt: { stock: 0 },
 })
-// cond.expression → "#status = :status AND #stock > :stock"
-// cond.names      → { "#status": "status", "#stock": "stock" }
-// cond.values     → { ":status": { S: "active" }, ":stock": { N: "0" } }
+// cond1.expression → "#status = :status AND #stock > :stock"
+// cond1.names      → { "#status": "status", "#stock": "stock" }
+// cond1.values     → { ":status": { S: "active" }, ":stock": { N: "0" } }
 
-// Between + attribute_exists
 const cond2 = Expression.condition({
   between: { price: [10, 50] },
   attributeExists: "category",
@@ -327,10 +333,7 @@ npx tsx examples/expressions.ts
 
 ### Layer Setup
 
-```typescript title="main.ts"
-import { Effect, Layer } from "effect"
-import { DynamoClient } from "effect-dynamodb"
-
+```typescript title="main.ts" region="run" example="expressions.ts"
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -343,8 +346,8 @@ const AppLayer = Layer.mergeAll(
 const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
-  () => console.log("Done."),
-  (err) => console.error("Failed:", err),
+  () => console.log("\nDone."),
+  (err) => console.error("\nFailed:", err),
 )
 ```
 

@@ -213,7 +213,28 @@ Add the plugin to your `tsconfig.json`:
 }
 ```
 
-The plugin detects `get`, `put`, `create`, `update`, `delete`, `query`, and `scan` operations. It resolves entities across imported modules, shows composed keys, and renders expressions (KeyCondition, Filter, Update, Condition) — all directly in your editor's hover tooltip.
+For example, hovering over `get` in the quick start above shows the underlying DynamoDB command (scroll to the bottom of the tooltip):
+
+```
+  ┌──────────────────────────────────────────────┐
+  │ ...                                          │
+  │ ...                                          │
+  │                                              │
+  │ effect-dynamodb — Native DynamoDB operation  │
+  │                                              │
+  │ GetItemCommand({                             │
+  │   TableName: "{TableName}",                  │
+  │   Key: {                                     │
+  │     pk: "$myapp#v1#todo#t-1",                │
+  │     sk: "$myapp#v1#todo",                    │
+  │   },                                         │
+  │ })                                           │
+  └──────────────────────────────────┬──────────-┘
+                                     ▼
+  const found = yield* db.TodoEntity.get({ todoId: "t-1" })
+```
+
+The plugin detects `get`, `put`, `create`, `update`, `delete`, `query`, and `scan` operations, resolves entities across imported modules, and shows composed keys and expressions — all directly in your editor's hover tooltip.
 
 ### Geospatial Package
 

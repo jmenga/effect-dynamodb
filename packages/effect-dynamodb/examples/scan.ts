@@ -28,6 +28,7 @@ import * as Table from "../src/Table.js"
 // 1. Domain models
 // ---------------------------------------------------------------------------
 
+// #region models
 class Product extends Schema.Class<Product>("Product")({
   productId: Schema.String,
   name: Schema.NonEmptyString,
@@ -42,11 +43,13 @@ class Review extends Schema.Class<Review>("Review")({
   rating: Schema.Number,
   comment: Schema.String,
 }) {}
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 2. Schema + Entities + Table
 // ---------------------------------------------------------------------------
 
+// #region entities
 const AppSchema = DynamoSchema.make({ name: "scan-demo", version: 1 })
 
 const Products = Entity.make({
@@ -84,6 +87,7 @@ const Reviews = Entity.make({
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Products, Reviews } })
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 3. Main program
@@ -100,6 +104,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("Table created\n")
 
   // Seed data
+  // #region seed
   yield* db.Products.put({
     productId: "p-1",
     name: "Wireless Mouse",
@@ -130,6 +135,7 @@ const program = Effect.gen(function* () {
   })
   yield* db.Reviews.put({ reviewId: "r-1", productId: "p-1", rating: 5, comment: "Great mouse!" })
   yield* db.Reviews.put({ reviewId: "r-2", productId: "p-2", rating: 4, comment: "Good keyboard" })
+  // #endregion
   yield* Console.log("Seeded 4 products + 2 reviews\n")
 
   // --- Basic scan ---
@@ -138,7 +144,9 @@ const program = Effect.gen(function* () {
   // scan() returns a Query<Entity.Record> just like query accessors.
   // It reads the entire table but filters by __edd_e__ to return only
   // items matching this entity type.
+  // #region basic-scan
   const allProducts = yield* db.Products.collect(Products.scan())
+  // #endregion
   yield* Console.log(`Found ${allProducts.length} products:`)
   for (const p of allProducts) {
     yield* Console.log(`  ${p.productId}: ${p.name} — $${p.price} (in stock: ${p.inStock})`)
@@ -150,10 +158,12 @@ const program = Effect.gen(function* () {
 
   // Entity.filter() applies a FilterExpression server-side to reduce network transfer.
   // Note: filters don't reduce read capacity (DynamoDB still reads every item).
+  // #region scan-filter
   const inStockProducts = yield* db.Products.collect(
     Products.scan(),
     Products.filter({ inStock: true }),
   )
+  // #endregion
   yield* Console.log(`In-stock products: ${inStockProducts.length}`)
   for (const p of inStockProducts) {
     yield* Console.log(`  ${p.productId}: ${p.name}`)
@@ -164,7 +174,9 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Scan with Limit ===\n")
 
   // Limit controls the page size (how many items DynamoDB evaluates per request).
+  // #region scan-limit
   const firstTwo = yield* db.Products.collect(Products.scan().pipe(Query.limit(2)))
+  // #endregion
   yield* Console.log(`First 2 products (limit=2): ${firstTwo.length}`)
   for (const p of firstTwo) {
     yield* Console.log(`  ${p.productId}: ${p.name}`)
@@ -176,7 +188,9 @@ const program = Effect.gen(function* () {
 
   // ConsistentRead on scan ensures you read the most recent data.
   // Costs 2x the read capacity of eventually-consistent reads.
+  // #region scan-consistent
   const consistent = yield* db.Products.collect(Products.scan().pipe(Query.consistentRead))
+  // #endregion
   yield* Console.log(`Consistent scan: ${consistent.length} products\n`)
 
   // --- Scan only returns matching entity type ---
@@ -184,8 +198,10 @@ const program = Effect.gen(function* () {
 
   // Even though Products and Reviews share the same table,
   // Products.scan() only returns Product items (filtered by __edd_e__).
+  // #region entity-isolation
   const productScan = yield* db.Products.collect(Products.scan())
   const reviewScan = yield* db.Reviews.collect(Reviews.scan())
+  // #endregion
   yield* Console.log(`Products.scan(): ${productScan.length} items`)
   yield* Console.log(`Reviews.scan():  ${reviewScan.length} items`)
   yield* Console.log("Each scan only returns its own entity type\n")
@@ -200,6 +216,7 @@ const program = Effect.gen(function* () {
 // 4. Provide dependencies and run
 // ---------------------------------------------------------------------------
 
+// #region layer
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -215,3 +232,4 @@ Effect.runPromise(main).then(
   () => console.log("\nDone."),
   (err) => console.error("\nFailed:", err),
 )
+// #endregion

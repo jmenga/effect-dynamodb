@@ -17,9 +17,7 @@ An employee directory that demonstrates **projection expressions** -- telling Dy
 
 A domain model with several fields -- projections let us fetch only what we need:
 
-```typescript title="models.ts"
-import { Schema } from "effect"
-
+```typescript title="models.ts" region="model" example="projections.ts"
 class Employee extends Schema.Class<Employee>("Employee")({
   employeeId: Schema.String,
   name: Schema.NonEmptyString,
@@ -34,10 +32,9 @@ class Employee extends Schema.Class<Employee>("Employee")({
 
 ## Step 2: Schema, Table, and Entity
 
-```typescript title="entities.ts"
-import { DynamoSchema, Entity, Table } from "effect-dynamodb"
-
+```typescript title="entities.ts" region="schema-entity-table" example="projections.ts"
 const AppSchema = DynamoSchema.make({ name: "proj-demo", version: 1 })
+
 const Employees = Entity.make({
   model: Employee,
   entityType: "Employee",
@@ -62,25 +59,37 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Employees } })
 
 ## Step 3: Seed Data
 
-```typescript title="seed.ts"
-import { DynamoClient } from "effect-dynamodb"
+```typescript title="seed.ts" region="seed-data" example="projections.ts"
+const db = yield* DynamoClient.make(MainTable)
 
-const { Employees: employees } = yield* DynamoClient.make(MainTable)
+const client = yield* DynamoClient
+const tableConfig = yield* MainTable.Tag
 
-yield* employees.put({
-  employeeId: "e-1", name: "Alice",
-  email: "alice@company.com", department: "engineering",
-  salary: 120000, title: "Senior Engineer",
+yield* db.createTable()
+
+yield* db.Employees.put({
+  employeeId: "e-1",
+  name: "Alice",
+  email: "alice@company.com",
+  department: "engineering",
+  salary: 120000,
+  title: "Senior Engineer",
 })
-yield* employees.put({
-  employeeId: "e-2", name: "Bob",
-  email: "bob@company.com", department: "engineering",
-  salary: 95000, title: "Engineer",
+yield* db.Employees.put({
+  employeeId: "e-2",
+  name: "Bob",
+  email: "bob@company.com",
+  department: "engineering",
+  salary: 95000,
+  title: "Engineer",
 })
-yield* employees.put({
-  employeeId: "e-3", name: "Charlie",
-  email: "charlie@company.com", department: "marketing",
-  salary: 85000, title: "Marketing Lead",
+yield* db.Employees.put({
+  employeeId: "e-3",
+  name: "Charlie",
+  email: "charlie@company.com",
+  department: "marketing",
+  salary: 85000,
+  title: "Marketing Lead",
 })
 ```
 
@@ -93,8 +102,6 @@ yield* employees.put({
 `Projection.projection()` takes an array of attribute names and returns an object with `expression` (the `ProjectionExpression` string) and `names` (the `ExpressionAttributeNames` map). All attribute names are aliased with `#` prefixes to safely handle DynamoDB reserved words:
 
 ```typescript
-import { Projection } from "effect-dynamodb"
-
 const nameAndDept = Projection.projection(["name", "department"])
 // nameAndDept.expression → "#name, #department"
 // nameAndDept.names      → { "#name": "name", "#department": "department" }
@@ -104,17 +111,12 @@ const nameAndDept = Projection.projection(["name", "department"])
 
 Apply the projection to a `GetItem` call via `DynamoClient`. DynamoDB returns only the requested attributes, reducing both network transfer and read capacity:
 
-```typescript
-import { DynamoClient, Marshaller } from "effect-dynamodb"
-
-const client = yield* DynamoClient
-const tableConfig = yield* MainTable.Tag
-
+```typescript region="projected-get-item" example="projections.ts"
 const nameAndDept = Projection.projection(["name", "department"])
 
-const result = yield* client.getItem({
+const projResult = yield* client.getItem({
   TableName: tableConfig.name,
-  Key: Marshaller.toAttributeMap({
+  Key: toAttributeMap({
     pk: "$proj-demo#v1#employee#e-1",
     sk: "$proj-demo#v1#employee",
   }),
@@ -122,10 +124,8 @@ const result = yield* client.getItem({
   ExpressionAttributeNames: nameAndDept.names,
 })
 
-if (result.Item) {
-  const item = Marshaller.fromAttributeMap(result.Item)
-  // item → { name: "Alice", department: "engineering" }
-  // salary, email, title, keys — all excluded
+if (projResult.Item) {
+  const item = fromAttributeMap(projResult.Item)
 }
 ```
 
@@ -135,9 +135,7 @@ Note that projected results are partial records, not typed model instances. The 
 
 Projections work with queries too. Here we fetch only name and title for all engineering employees:
 
-```typescript
-import { Marshaller, Projection } from "effect-dynamodb"
-
+```typescript region="projected-query" example="projections.ts"
 const listProjection = Projection.projection(["name", "title"])
 
 const queryResult = yield* client.query({
@@ -148,16 +146,14 @@ const queryResult = yield* client.query({
     "#pk": "gsi1pk",
     ...listProjection.names,
   },
-  ExpressionAttributeValues: Marshaller.toAttributeMap({
+  ExpressionAttributeValues: toAttributeMap({
     ":pk": "$proj-demo#v1#employee#engineering",
   }),
   ProjectionExpression: listProjection.expression,
 })
 
 for (const rawItem of queryResult.Items ?? []) {
-  const item = Marshaller.fromAttributeMap(rawItem)
-  // item → { name: "Alice", title: "Senior Engineer" }
-  // item → { name: "Bob", title: "Engineer" }
+  const item = fromAttributeMap(rawItem)
 }
 ```
 
@@ -167,12 +163,8 @@ When combining projections with queries, merge the projection's `names` into the
 
 An empty projection produces an empty expression and empty names map. DynamoDB ignores an empty `ProjectionExpression`, so all attributes are returned:
 
-```typescript
-import { Projection } from "effect-dynamodb"
-
+```typescript region="empty-projection" example="projections.ts"
 const empty = Projection.projection([])
-// empty.expression → ""
-// empty.names      → {}
 ```
 
 ---
@@ -209,10 +201,7 @@ npx tsx examples/projections.ts
 
 ### Layer Setup
 
-```typescript title="main.ts"
-import { Effect, Layer } from "effect"
-import { DynamoClient } from "effect-dynamodb"
-
+```typescript title="main.ts" region="layer-setup" example="projections.ts"
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -225,8 +214,8 @@ const AppLayer = Layer.mergeAll(
 const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
-  () => console.log("Done."),
-  (err) => console.error("Failed:", err),
+  () => console.log("\nDone."),
+  (err) => console.error("\nFailed:", err),
 )
 ```
 

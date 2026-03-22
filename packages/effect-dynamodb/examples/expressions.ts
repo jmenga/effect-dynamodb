@@ -33,6 +33,7 @@ import * as Table from "../src/Table.js"
 // 1. Domain models
 // ---------------------------------------------------------------------------
 
+// #region model
 class Product extends Schema.Class<Product>("Product")({
   productId: Schema.String,
   name: Schema.NonEmptyString,
@@ -40,11 +41,13 @@ class Product extends Schema.Class<Product>("Product")({
   price: Schema.Number,
   stock: Schema.Number,
 }) {}
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 2. Schema + Table + Entity
 // ---------------------------------------------------------------------------
 
+// #region entities
 const AppSchema = DynamoSchema.make({ name: "expr-demo", version: 1 })
 
 const Products = Entity.make({
@@ -66,6 +69,7 @@ const Products = Entity.make({
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Products } })
+// #endregion
 
 // ---------------------------------------------------------------------------
 // 3. Main program
@@ -84,6 +88,7 @@ const program = Effect.gen(function* () {
   // --- Entity.create — put with duplicate detection ---
   yield* Console.log("=== Entity.create() — Insert-Only ===\n")
 
+  // #region create
   // create() is put() + automatic attribute_not_exists on primary key.
   // It fails with ConditionalCheckFailed if an item already exists.
   const widget = yield* db.Products.create({
@@ -93,7 +98,6 @@ const program = Effect.gen(function* () {
     price: 29.99,
     stock: 100,
   })
-  yield* Console.log(`Created: ${widget.name} ($${widget.price})`)
 
   // Try to create the same item again — should fail
   const duplicateResult = yield* db.Products.create({
@@ -108,7 +112,7 @@ const program = Effect.gen(function* () {
       Effect.succeed("ConditionalCheckFailed — duplicate prevented!"),
     ),
   )
-  yield* Console.log(`Duplicate create: ${duplicateResult}\n`)
+  // #endregion
 
   // Seed more products
   yield* db.Products.create({
@@ -137,6 +141,7 @@ const program = Effect.gen(function* () {
   // --- Conditional put ---
   yield* Console.log("=== Conditional Put ===\n")
 
+  // #region conditional-put
   // Products.condition() adds a ConditionExpression to a put operation.
   // The condition is evaluated server-side. If it fails, the put is rejected.
   const condPutResult = yield* db.Products.put(
@@ -150,11 +155,12 @@ const program = Effect.gen(function* () {
     // Only put if item doesn't already exist (same as create, but explicit)
     Products.condition((t, { notExists }) => notExists(t.productId)),
   )
-  yield* Console.log(`Conditional put succeeded: ${condPutResult.name}\n`)
+  // #endregion
 
   // --- Conditional delete ---
   yield* Console.log("=== Conditional Delete ===\n")
 
+  // #region conditional-delete
   // Delete only if the item's stock is 0 (don't delete items with stock).
   // Products.condition() maps ConditionalCheckFailedException at runtime.
   // Use Effect.match to handle both success and failure paths.
@@ -167,7 +173,6 @@ const program = Effect.gen(function* () {
       onSuccess: () => "deleted (stock was 0)",
     }),
   )
-  yield* Console.log(`Conditional delete (p-4 stock=0): ${condDeleteResult}`)
 
   // Try to conditionally delete an item with stock > 0
   const condDeleteFail = yield* db.Products.delete(
@@ -179,11 +184,12 @@ const program = Effect.gen(function* () {
       onSuccess: () => "deleted",
     }),
   )
-  yield* Console.log(`Conditional delete (p-1 stock=100): ${condDeleteFail}\n`)
+  // #endregion
 
   // --- Conditional update with optimistic locking ---
   yield* Console.log("=== Conditional Update + Optimistic Locking ===\n")
 
+  // #region conditional-update
   // Combine condition() with expectedVersion() and set().
   // The user condition is ANDed with the optimistic lock condition.
   const updated = yield* db.Products.update(
@@ -192,10 +198,13 @@ const program = Effect.gen(function* () {
     Products.expectedVersion(1),
     Products.condition((t, { gt }) => gt(t.stock, 0)),
   )
+  // #endregion
+
   yield* Console.log(
     `Updated p-1: price=$${updated.price} (condition: stock > 0, expectedVersion: 1)`,
   )
 
+  // #region conditional-update-fail
   // Condition fails: update only if stock > 1000 (it's 100)
   const condUpdateFail = yield* db.Products.update(
     { productId: "p-1" },
@@ -207,7 +216,7 @@ const program = Effect.gen(function* () {
       onSuccess: () => "updated",
     }),
   )
-  yield* Console.log(`Conditional update (stock > 1000): ${condUpdateFail}\n`)
+  // #endregion
 
   // --- Filter expressions ---
   yield* Console.log("=== Filter Expressions ===\n")
@@ -215,47 +224,50 @@ const program = Effect.gen(function* () {
   // Products.filter() adds FilterExpression to narrow query/scan results.
   // Uses the same callback + shorthand API as Products.condition().
 
+  // #region filters
   // Equality filter
   const electronics = yield* db.Products.collect(
     Products.query.byCategory({ category: "electronics" }),
   )
-  yield* Console.log(`Electronics: ${electronics.length} products`)
 
   // Greater-than filter
   const expensive = yield* db.Products.collect(
     Products.query.byCategory({ category: "electronics" }),
     Products.filter((t, { gt }) => gt(t.price, 30)),
   )
-  yield* Console.log(`Electronics > $30: ${expensive.length} products`)
-  for (const p of expensive) {
-    yield* Console.log(`  ${p.name}: $${p.price}`)
-  }
 
   // Between filter
   const midRange = yield* db.Products.collect(
     Products.query.byCategory({ category: "electronics" }),
     Products.filter((t, { between }) => between(t.price, 20, 50)),
   )
-  yield* Console.log(`Electronics $20-$50: ${midRange.length} products`)
 
   // Contains filter (string substring match)
   const withWidget = yield* db.Products.collect(
     Products.scan(),
     Products.filter((t, { contains }) => contains(t.name, "Widget")),
   )
-  yield* Console.log(`Products containing "Widget": ${withWidget.length}`)
 
   // Attribute exists/not exists
   const allWithStock = yield* db.Products.collect(
     Products.scan(),
     Products.filter((t, { exists }) => exists(t.stock)),
   )
+  // #endregion
+  yield* Console.log(`Electronics: ${electronics.length} products`)
+  yield* Console.log(`Electronics > $30: ${expensive.length} products`)
+  for (const p of expensive) {
+    yield* Console.log(`  ${p.name}: $${p.price}`)
+  }
+  yield* Console.log(`Electronics $20-$50: ${midRange.length} products`)
+  yield* Console.log(`Products containing "Widget": ${withWidget.length}`)
   yield* Console.log(`Products with stock attribute: ${allWithStock.length}`)
   yield* Console.log("")
 
   // --- Condition expressions ---
   yield* Console.log("=== Callback API: Products.condition() ===\n")
 
+  // #region condition-callback
   // The callback API provides type-safe conditions using PathBuilder.
   // First argument `t` is a path proxy, second `ops` has comparison functions.
   const conditionUpdated = yield* db.Products.update(
@@ -263,9 +275,6 @@ const program = Effect.gen(function* () {
     Products.set({ price: 79.99 }),
     // Type-safe: t.stock is typed as number, "active" would be a type error
     Products.condition((t, { gt }) => gt(t.stock, 0)),
-  )
-  yield* Console.log(
-    `Callback condition update: ${conditionUpdated.name} price=$${conditionUpdated.price}`,
   )
 
   // Shorthand condition — plain object for simple equality
@@ -279,21 +288,22 @@ const program = Effect.gen(function* () {
       onSuccess: (p) => `Shorthand condition: ${p.name} price=$${p.price}`,
     }),
   )
+  // #endregion
+  yield* Console.log(
+    `Callback condition update: ${conditionUpdated.name} price=$${conditionUpdated.price}`,
+  )
   yield* Console.log(shorthandResult)
   yield* Console.log("")
 
   // --- Callback API: Entity.filter() ---
   yield* Console.log("=== Callback API: Products.filter() ===\n")
 
+  // #region filter-callback
   // Filter with callback — supports nested paths, OR, and all DynamoDB operators
   const expensiveProducts = yield* db.Products.collect(
     Products.query.byCategory({ category: "electronics" }),
     Products.filter((t, { gt }) => gt(t.price, 30)),
   )
-  yield* Console.log(`Electronics > $30 (callback): ${expensiveProducts.length} products`)
-  for (const p of expensiveProducts) {
-    yield* Console.log(`  ${p.name}: $${p.price}`)
-  }
 
   // OR composition in filter
   const multiCategory = yield* db.Products.collect(
@@ -302,33 +312,41 @@ const program = Effect.gen(function* () {
       or(eq(t.category, "electronics"), eq(t.category, "accessories")),
     ),
   )
+  // #endregion
+  yield* Console.log(`Electronics > $30 (callback): ${expensiveProducts.length} products`)
+  for (const p of expensiveProducts) {
+    yield* Console.log(`  ${p.name}: $${p.price}`)
+  }
   yield* Console.log(`Electronics OR accessories (callback): ${multiCategory.length} products`)
   yield* Console.log("")
 
   // --- Callback API: Entity.select() ---
   yield* Console.log("=== Callback API: Products.select() ===\n")
 
+  // #region select
   // Path-based projection — type-safe attribute selection
   const namesAndPrices = yield* db.Products.collect(
     Products.scan(),
     Products.select((t) => [t.name, t.price]),
   )
-  yield* Console.log("Projected (name, price):")
-  for (const item of namesAndPrices) {
-    yield* Console.log(`  ${(item as any).name}: $${(item as any).price}`)
-  }
 
   // String array shorthand
   const nameOnly = yield* db.Products.collect(
     Products.scan(),
     Products.select(["name", "category"]),
   )
+  // #endregion
+  yield* Console.log("Projected (name, price):")
+  for (const item of namesAndPrices) {
+    yield* Console.log(`  ${(item as any).name}: $${(item as any).price}`)
+  }
   yield* Console.log(`\nProjected (string shorthand): ${nameOnly.length} items`)
   yield* Console.log("")
 
   // --- Low-level Expression builders ---
   yield* Console.log("=== Expression.condition() — Low-Level Builder ===\n")
 
+  // #region expression-builders
   // Expression.condition() builds raw ConditionExpression strings.
   // These are what Products.condition() uses under the hood.
 
@@ -336,24 +354,28 @@ const program = Effect.gen(function* () {
     eq: { status: "active" },
     gt: { stock: 0 },
   })
-  yield* Console.log(`Condition: ${cond1.expression}`)
-  yield* Console.log(`Names: ${JSON.stringify(cond1.names)}`)
-  yield* Console.log(`Values: ${JSON.stringify(cond1.values)}\n`)
+  // cond1.expression → "#status = :status AND #stock > :stock"
+  // cond1.names      → { "#status": "status", "#stock": "stock" }
+  // cond1.values     → { ":status": { S: "active" }, ":stock": { N: "0" } }
 
   const cond2 = Expression.condition({
     between: { price: [10, 50] },
     attributeExists: "category",
   })
-  yield* Console.log(`Between + exists: ${cond2.expression}\n`)
 
-  // --- Expression.update() ---
-  yield* Console.log("=== Expression.update() — Low-Level Builder ===\n")
-
+  // Update expression with SET, REMOVE, and ADD clauses
   const upd = Expression.update({
     set: { name: "New Name", price: 39.99 },
     remove: ["description"],
     add: { viewCount: 1 },
   })
+  // upd.expression → "SET #name = :name, #price = :price REMOVE #description ADD #viewCount :viewCount"
+  // #endregion
+  yield* Console.log(`Condition: ${cond1.expression}`)
+  yield* Console.log(`Names: ${JSON.stringify(cond1.names)}`)
+  yield* Console.log(`Values: ${JSON.stringify(cond1.values)}\n`)
+  yield* Console.log(`Between + exists: ${cond2.expression}\n`)
+  yield* Console.log("=== Expression.update() — Low-Level Builder ===\n")
   yield* Console.log(`Update: ${upd.expression}`)
   yield* Console.log(`Names: ${JSON.stringify(upd.names)}`)
   yield* Console.log(`Values: ${JSON.stringify(upd.values)}\n`)
@@ -368,6 +390,7 @@ const program = Effect.gen(function* () {
 // 4. Provide dependencies and run
 // ---------------------------------------------------------------------------
 
+// #region run
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -383,3 +406,4 @@ Effect.runPromise(main).then(
   () => console.log("\nDone."),
   (err) => console.error("\nFailed:", err),
 )
+// #endregion

@@ -122,6 +122,17 @@ function tryDetectDirectCall(
         if (methodName === "scan") {
           return { entity, type: "scan" }
         }
+
+        // collect/paginate: db.Entity.collect(Entity.query.index(pk), ...)
+        if (
+          (methodName === "collect" || methodName === "paginate") &&
+          call.arguments.length > 0
+        ) {
+          const queryArg = call.arguments[0]!
+          if (ts.isCallExpression(queryArg)) {
+            return tryDetectDirectCall(ts, queryArg, entities)
+          }
+        }
       }
     }
 

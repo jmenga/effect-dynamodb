@@ -39,6 +39,7 @@ import * as Transaction from "../src/Transaction.js"
 // 1. Pure domain models — no DynamoDB concepts
 // =============================================================================
 
+// #region models
 const Department = {
   Development: "development",
   Marketing: "marketing",
@@ -79,12 +80,15 @@ class Office extends Schema.Class<Office>("Office")({
   zip: Schema.String,
   address: Schema.String,
 }) {}
+// #endregion
 
 // =============================================================================
 // 2. Schema
 // =============================================================================
 
+// #region schema
 const TmSchema = DynamoSchema.make({ name: "taskman", version: 1 })
+// #endregion
 
 // =============================================================================
 // 3. Entity definitions — pure, no table reference
@@ -99,6 +103,7 @@ const TmSchema = DynamoSchema.make({ name: "taskman", version: 1 })
  * Full ElectroDB Task Manager index set including:
  * - gsi2 `teams`: pk=[team], sk=[dateHired, title] — NOT in HR example
  */
+// #region employee-entity
 const Employees = Entity.make({
   model: Employee,
   entityType: "Employee",
@@ -137,6 +142,7 @@ const Employees = Entity.make({
   },
   timestamps: true,
 })
+// #endregion
 
 /**
  * Task — 4 indexes (primary + 3 GSIs)
@@ -145,6 +151,7 @@ const Employees = Entity.make({
  * - gsi4 `statuses`: pk=[status], sk=[project, employee] — NOT in HR example
  * - `points` field (Schema.Number) for point-based filtering
  */
+// #region task-entity
 const Tasks = Entity.make({
   model: Task,
   entityType: "Task",
@@ -174,12 +181,14 @@ const Tasks = Entity.make({
   versioned: true,
   softDelete: true,
 })
+// #endregion
 
 /**
  * Office — 2 indexes (primary + 1 GSI)
  *
  * gsi1 is shared with Employee via the "workplaces" collection.
  */
+// #region office-entity
 const Offices = Entity.make({
   model: Office,
   entityType: "Office",
@@ -197,17 +206,21 @@ const Offices = Entity.make({
   },
   timestamps: true,
 })
+// #endregion
 
 // =============================================================================
 // 4. Table definition — declares all members
 // =============================================================================
 
+// #region table
 const TmTable = Table.make({ schema: TmSchema, entities: { Employees, Tasks, Offices } })
+// #endregion
 
 // =============================================================================
 // 5. Seed data
 // =============================================================================
 
+// #region seed-data
 const offices = {
   portland: {
     office: "portland",
@@ -324,6 +337,7 @@ const tasks = {
     points: 5,
   },
 }
+// #endregion
 
 // =============================================================================
 // 6. Helpers
@@ -351,6 +365,7 @@ const program = Effect.gen(function* () {
   yield* db.createTable()
 
   // --- Seed data ---
+  // #region seed-exec
   for (const office of Object.values(offices)) {
     yield* db.Offices.put(office)
   }
@@ -360,12 +375,14 @@ const program = Effect.gen(function* () {
   for (const task of Object.values(tasks)) {
     yield* db.Tasks.put(task)
   }
+  // #endregion
 
   // -------------------------------------------------------------------------
   // Pattern 1: CRUD — get, put, update, delete on Employee + Task
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 1: CRUD")
 
+  // #region crud
   const tyler = yield* db.Employees.get({ employee: "tyler" })
   assertEq(tyler.firstName, "Tyler", "get firstName")
   assertEq(tyler.lastName, "Walch", "get lastName")
@@ -398,11 +415,14 @@ const program = Effect.gen(function* () {
   assertEq(promoted.firstName, "Tyler", "update preserves unchanged fields")
 
   yield* db.Employees.delete({ employee: "tyler" })
+  // #endregion
+  // #region crud-delete-check
   const deleted = yield* db.Employees.get({ employee: "tyler" }).pipe(
     Effect.map(() => false),
     Effect.catchTag("ItemNotFound", () => Effect.succeed(true)),
   )
   assert(deleted, "delete removes item")
+  // #endregion
 
   // Re-create for subsequent patterns (with original data)
   yield* db.Employees.put(employees.tyler)
@@ -415,6 +435,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 2: Workplaces (gsi1 collection)")
 
+  // #region workplaces
   const portlandEmployees = yield* db.Employees.collect(
     Employees.query.coworkers({ office: "portland" }),
   )
@@ -425,6 +446,7 @@ const program = Effect.gen(function* () {
   const portlandOffice = yield* db.Offices.collect(Offices.query.workplace({ office: "portland" }))
   assertEq(portlandOffice.length, 1, "portland has 1 office record")
   assertEq(portlandOffice[0]!.city, "Portland", "portland city")
+  // #endregion
   yield* Console.log("  Workplaces: coworkers + office lookup — OK")
 
   // -------------------------------------------------------------------------
@@ -434,6 +456,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 3: Assignments (gsi3 collection)")
 
+  // #region assignments
   const tylerTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "tyler" }))
   assertEq(tylerTasks.length, 2, "tyler has 2 tasks")
   const tylerTaskIds = tylerTasks.map((t) => t.task).sort()
@@ -447,6 +470,7 @@ const program = Effect.gen(function* () {
   )
   assertEq(tylerInfo.length, 1, "employeeLookup returns 1")
   assertEq(tylerInfo[0]!.firstName, "Tyler", "employeeLookup firstName")
+  // #endregion
   yield* Console.log("  Assignments: tasks + employee lookup — OK")
 
   // -------------------------------------------------------------------------
@@ -457,6 +481,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 4: Teams Query (gsi2) — NEW")
 
+  // #region teams
   // All development team members
   const devTeam = yield* db.Employees.collect(Employees.query.teams({ team: "development" }))
   assertEq(devTeam.length, 2, "development team has 2 members")
@@ -499,6 +524,7 @@ const program = Effect.gen(function* () {
   assertEq(devReversed.length, 2, "reversed dev team has 2 members")
   assertEq(devReversed[0]!.employee, "sean", "most recent hire first (sean)")
   assertEq(devReversed[1]!.employee, "tyler", "earliest hire second (tyler)")
+  // #endregion
   yield* Console.log(
     "  Teams: all dev (2), product (1), marketing (1), hired range (1), reversed — OK",
   )
@@ -511,6 +537,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 5: Task Statuses (gsi4 on Task) — NEW")
 
+  // #region statuses
   // All open tasks across all projects
   const openTasks = yield* db.Tasks.collect(Tasks.query.statuses({ status: "open" }))
   assertEq(openTasks.length, 4, "4 open tasks total")
@@ -535,7 +562,9 @@ const program = Effect.gen(function* () {
   assertEq(closedTasks.length, 1, "1 closed task")
   assertEq(closedTasks[0]!.task, "user-research", "closed task ID")
   assertEq(closedTasks[0]!.points, 3, "closed task points")
+  // #endregion
 
+  // #region statuses-by-project
   // Open tasks in a specific project using SK prefix (beginsWith)
   const statusesIndex = Tasks.indexes.statuses
   const platformPrefix = KeyComposer.composeSortKeyPrefix(TmSchema, "Task", 1, statusesIndex, {
@@ -547,6 +576,7 @@ const program = Effect.gen(function* () {
   assertEq(openPlatformTasks.length, 3, "3 open platform tasks")
   const openPlatformIds = openPlatformTasks.map((t) => t.task).sort()
   assertEq(openPlatformIds, ["build-api", "code-review", "deploy-ci"], "open platform task IDs")
+  // #endregion
   yield* Console.log("  Statuses: open (4), in-progress (1), closed (1), open+platform (3) — OK")
 
   // -------------------------------------------------------------------------
@@ -557,6 +587,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 6: Task Status Workflow")
 
+  // #region workflow
   // Move build-api from open -> in-progress
   const inProgress = yield* db.Tasks.update(
     { task: "build-api", project: "platform", employee: "tyler" },
@@ -595,6 +626,7 @@ const program = Effect.gen(function* () {
     { task: "build-api", project: "platform", employee: "tyler" },
     Entity.set({ status: "open" }),
   )
+  // #endregion
   yield* Console.log("  Workflow: open -> in-progress -> closed with GSI recomposition — OK")
 
   // -------------------------------------------------------------------------
@@ -604,6 +636,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 7: Employee Roles (gsi4)")
 
+  // #region roles
   const engineers = yield* db.Employees.collect(Employees.query.roles({ title: "Senior Engineer" }))
   assertEq(engineers.length, 1, "1 Senior Engineer")
   assertEq(engineers[0]!.employee, "tyler", "Senior Engineer is tyler")
@@ -624,6 +657,7 @@ const program = Effect.gen(function* () {
   )
   assertEq(wellPaidPMs.length, 1, "1 PM in salary range 100-200k")
   assertEq(wellPaidPMs[0]!.employee, "morgan", "well-paid PM is morgan")
+  // #endregion
   yield* Console.log("  Roles: Senior Engineer (1), PM salary range (1) — OK")
 
   // -------------------------------------------------------------------------
@@ -631,6 +665,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 8: Atomic Onboarding (Transaction)")
 
+  // #region onboarding
   yield* Transaction.transactWrite([
     Employees.put({
       employee: "jordan",
@@ -676,6 +711,7 @@ const program = Effect.gen(function* () {
     openAfterHire.some((t) => t.task === "onboarding"),
     "onboarding task appears in open status query",
   )
+  // #endregion
   yield* Console.log("  Atomic onboarding: employee + task in transaction — OK")
 
   // -------------------------------------------------------------------------
@@ -687,6 +723,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 9: Task Archival (Soft Delete) — NEW")
 
+  // #region archival
   // Archive the closed "user-research" task
   yield* db.Tasks.delete({ task: "user-research", project: "website", employee: "morgan" })
 
@@ -709,7 +746,9 @@ const program = Effect.gen(function* () {
     employee: "morgan",
   })
   assertEq(archivedTask.description, "Conduct user research interviews", "archived task preserved")
+  // #endregion
 
+  // #region restore
   // Restore if needed (e.g., task was archived by mistake)
   const unarchived = yield* db.Tasks.restore({
     task: "user-research",
@@ -724,6 +763,7 @@ const program = Effect.gen(function* () {
     closedAfterRestore.some((t) => t.task === "user-research"),
     "restored task back in status query",
   )
+  // #endregion
   yield* Console.log("  Archive + restore: soft-delete, audit lookup, restore — OK")
 
   // --- Cleanup ---
@@ -735,6 +775,7 @@ const program = Effect.gen(function* () {
 // 8. Provide dependencies and run
 // =============================================================================
 
+// #region layer
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -750,5 +791,6 @@ Effect.runPromise(main).then(
   () => console.log("\nDone."),
   (err) => console.error("\nFailed:", err),
 )
+// #endregion
 
 export { program, TmTable, TmSchema, Employees, Tasks, Offices, Employee, Task, Office }

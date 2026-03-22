@@ -20,10 +20,7 @@ A product catalog example demonstrating every update operation beyond simple `se
 
 A pure domain model for a product — no DynamoDB concepts:
 
-```typescript title="models.ts"
-import { Schema } from "effect"
-import { DynamoModel } from "effect-dynamodb"
-
+```typescript title="models.ts" region="models" example="updates.ts"
 class Product extends Schema.Class<Product>("Product")({
   productId: Schema.String,
   name: Schema.NonEmptyString,
@@ -46,11 +43,8 @@ const ProductModel = DynamoModel.configure(Product, {
 
 ## Step 2: Schema, Table, and Entity
 
-```typescript title="entities.ts"
-import { DynamoSchema, Entity, Table } from "effect-dynamodb"
-
+```typescript title="entities.ts" region="entities" example="updates.ts"
 const AppSchema = DynamoSchema.make({ name: "updates-demo", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
 
 const Products = Entity.make({
   model: ProductModel,
@@ -64,6 +58,8 @@ const Products = Entity.make({
   timestamps: true,
   versioned: true,
 })
+
+const MainTable = Table.make({ schema: AppSchema, entities: { Products } })
 ```
 
 `versioned: true` enables optimistic locking — every write increments a `version` field, and `expectedVersion()` can enforce concurrency safety.
@@ -72,12 +68,8 @@ const Products = Entity.make({
 
 ## Step 3: Create a Product
 
-```typescript
-import { DynamoClient } from "effect-dynamodb"
-
-const { Products: products } = yield* DynamoClient.make(MainTable)
-
-const product = yield* products.put({
+```typescript region="setup" example="updates.ts"
+const product = yield* db.Products.put({
   productId: "p-1",
   name: "Wireless Mouse",
   description: "Ergonomic wireless mouse",
@@ -96,15 +88,12 @@ const product = yield* products.put({
 
 `ADD` atomically increments a numeric attribute. If the attribute does not exist, DynamoDB initializes it to the provided value. This is thread-safe — no read-modify-write cycle needed.
 
-```typescript
-// Increment viewCount by 1
-yield* products.update({ productId: "p-1" },
-  Entity.add({ viewCount: 1 }),
-)
-// → viewCount: 1
+```typescript region="add" example="updates.ts"
+const afterAdd = yield* db.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1 }))
 
-// Multiple fields in one call
-yield* products.update({ productId: "p-1" },
+// Multiple adds compose
+const afterMultiAdd = yield* db.Products.update(
+  { productId: "p-1" },
   Entity.add({ viewCount: 5, stock: 50 }),
 )
 // → viewCount: 6, stock: 150
@@ -116,10 +105,8 @@ yield* products.update({ productId: "p-1" },
 
 DynamoDB has no native `SUBTRACT` action. `Entity.subtract()` synthesizes `SET #field = #field - :val` for you:
 
-```typescript
-yield* products.update({ productId: "p-1" },
-  Entity.subtract({ stock: 3 }),
-)
+```typescript region="subtract" example="updates.ts"
+const afterSub = yield* db.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
 // → stock: 147 (was 150)
 ```
 
@@ -129,8 +116,9 @@ yield* products.update({ productId: "p-1" },
 
 Appends elements to the end of a list attribute using DynamoDB's `list_append` function:
 
-```typescript
-yield* products.update({ productId: "p-1" },
+```typescript region="append" example="updates.ts"
+const afterAppend = yield* db.Products.update(
+  { productId: "p-1" },
   Entity.append({ tags: ["on-sale", "featured"] }),
 )
 // → tags: ["electronics", "accessories", "on-sale", "featured"]
@@ -144,8 +132,9 @@ The value must be an array — each element is appended to the existing list.
 
 `REMOVE` deletes attributes entirely from the item. The attribute no longer exists after removal (it becomes `undefined`, not `null`):
 
-```typescript
-yield* products.update({ productId: "p-1" },
+```typescript region="remove" example="updates.ts"
+const afterRemove = yield* db.Products.update(
+  { productId: "p-1" },
   Entity.remove(["description"]),
 )
 // → description is gone from the item
@@ -169,9 +158,10 @@ Entity.deleteFromSet({ fieldName: new Set(["value-to-remove"]) })
 
 All update combinators compose as variadic arguments to `update()`. They are merged into one `UpdateItem` call to DynamoDB:
 
-```typescript
-yield* products.update({ productId: "p-1" },
-  Entity.set({ name: "Premium Wireless Mouse", price: 39.99 }),
+```typescript region="composed" example="updates.ts"
+const composed = yield* db.Products.update(
+  { productId: "p-1" },
+  Products.set({ name: "Premium Wireless Mouse", price: 39.99 }),
   Entity.add({ viewCount: 10 }),
   Entity.subtract({ stock: 5 }),
   Entity.append({ tags: ["premium"] }),
@@ -192,19 +182,18 @@ This is a single atomic DynamoDB operation — all changes apply together or non
 
 Rich updates compose with `Entity.expectedVersion()` for concurrency control:
 
-```typescript
-import { Effect } from "effect"
-
-// Succeeds — version matches
-yield* products.update({ productId: "p-1" },
+```typescript region="locking" example="updates.ts"
+const locked = yield* db.Products.update(
+  { productId: "p-1" },
   Entity.add({ viewCount: 1 }),
-  Entity.expectedVersion(currentVersion),
+  Products.expectedVersion(6),
 )
 
-// Fails — stale version
-const result = yield* products.update({ productId: "p-1" },
+// Wrong version → OptimisticLockError
+const lockFail = yield* db.Products.update(
+  { productId: "p-1" },
   Entity.add({ viewCount: 1 }),
-  Entity.expectedVersion(1),
+  Products.expectedVersion(1),
 ).pipe(
   Effect.map(() => "updated"),
   Effect.catchTag("OptimisticLockError", (e) =>
@@ -232,10 +221,7 @@ npx tsx examples/updates.ts
 
 ### Layer Setup
 
-```typescript title="main.ts"
-import { Effect, Layer } from "effect"
-import { DynamoClient } from "effect-dynamodb"
-
+```typescript title="main.ts" region="run" example="updates.ts"
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({
     region: "us-east-1",
@@ -248,8 +234,8 @@ const AppLayer = Layer.mergeAll(
 const main = program.pipe(Effect.provide(AppLayer))
 
 Effect.runPromise(main).then(
-  () => console.log("Done."),
-  (err) => console.error("Failed:", err),
+  () => console.log("\nDone."),
+  (err) => console.error("\nFailed:", err),
 )
 ```
 
