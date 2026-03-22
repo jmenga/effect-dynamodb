@@ -175,47 +175,6 @@ const alice = yield* db.Users.put({
 
 // get returns model instance by default, with system fields available
 const aliceWithMeta = yield* db.Users.get({ userId: "alice-1" })
-
-const post1 = yield* db.Posts.put({
-  postId: "post-1",
-  authorId: "alice-1",
-  title: "Getting Started with Effect TS",
-  content: "Effect is a powerful functional programming library...",
-  status: "published",
-  commentCount: 0,
-})
-
-yield* db.Posts.put({
-  postId: "post-2",
-  authorId: "alice-1",
-  title: "DynamoDB Single-Table Design",
-  content: "Single-table design is a DynamoDB best practice...",
-  status: "published",
-  commentCount: 0,
-})
-
-yield* db.Posts.put({
-  postId: "post-3",
-  authorId: "alice-1",
-  title: "Draft Post",
-  content: "Work in progress...",
-  status: "draft",
-  commentCount: 0,
-})
-
-yield* db.Comments.put({
-  commentId: "comment-1",
-  postId: "post-1",
-  authorId: "bob-1",
-  body: "Great article!",
-})
-
-yield* db.Comments.put({
-  commentId: "comment-2",
-  postId: "post-1",
-  authorId: "charlie-1",
-  body: "Very helpful, thanks!",
-})
 ```
 
 ---

@@ -446,6 +446,17 @@ const program = Effect.gen(function* () {
 
   // #region pattern-6
   const torvaldsIssues = yield* db.Issues.collect(Issues.query.created({ username: "torvalds" }))
+
+  const torvaldsPRs = yield* db.PullRequests.collect(
+    PullRequests.query.created({ username: "torvalds" }),
+  )
+
+  const octocatIssues = yield* db.Issues.collect(Issues.query.created({ username: "octocat" }))
+
+  const octocatPRs = yield* db.PullRequests.collect(
+    PullRequests.query.created({ username: "octocat" }),
+  )
+  // #endregion
   assertEq(torvaldsIssues.length, 2, "torvalds has 2 issues")
   const torvaldsIssueSubjects = torvaldsIssues.map((i) => i.subject).sort()
   assert(
@@ -456,21 +467,10 @@ const program = Effect.gen(function* () {
     torvaldsIssueSubjects.some((s) => s.includes("CI pipeline")),
     "torvalds has CI issue",
   )
-
-  const torvaldsPRs = yield* db.PullRequests.collect(
-    PullRequests.query.created({ username: "torvalds" }),
-  )
   assertEq(torvaldsPRs.length, 1, "torvalds has 1 PR")
   assertEq(torvaldsPRs[0]!.subject, "Fix README typo", "torvalds PR subject")
-
-  const octocatIssues = yield* db.Issues.collect(Issues.query.created({ username: "octocat" }))
   assertEq(octocatIssues.length, 2, "octocat has 2 issues")
-
-  const octocatPRs = yield* db.PullRequests.collect(
-    PullRequests.query.created({ username: "octocat" }),
-  )
   assertEq(octocatPRs.length, 2, "octocat has 2 PRs")
-  // #endregion
   yield* Console.log("  Managed items: torvalds (2 issues, 1 PR), octocat (2 issues, 2 PRs) — OK")
 
   // -------------------------------------------------------------------------
@@ -482,40 +482,41 @@ const program = Effect.gen(function* () {
   const hwIssues = yield* db.Issues.collect(
     Issues.query.todos({ repoOwner: "octocat", repoName: "hello-world" }),
   )
-  assertEq(hwIssues.length, 3, "hello-world has 3 issues")
+
   const hwOpenIssues = hwIssues.filter((i) => i.status === "Open")
-  assertEq(hwOpenIssues.length, 1, "hello-world has 1 open issue")
-  assertEq(hwOpenIssues[0]!.issueNumber, "1", "open issue is #1")
-  const hwClosedIssues = hwIssues.filter((i) => i.status === "Closed")
-  assertEq(hwClosedIssues.length, 2, "hello-world has 2 closed issues")
 
   const hwPRs = yield* db.PullRequests.collect(
     PullRequests.query.enhancements({ repoOwner: "octocat", repoName: "hello-world" }),
   )
+
+  const linuxIssues = yield* db.Issues.collect(
+    Issues.query.todos({ repoOwner: "torvalds", repoName: "linux" }),
+  )
+
+  const linuxPRs = yield* db.PullRequests.collect(
+    PullRequests.query.enhancements({ repoOwner: "torvalds", repoName: "linux" }),
+  )
+
+  const hwRepoActivity = yield* db.Repositories.collect(
+    Repositories.query.activity({ repoOwner: "octocat", repoName: "hello-world" }),
+  )
+  // #endregion
+  assertEq(hwIssues.length, 3, "hello-world has 3 issues")
+  assertEq(hwOpenIssues.length, 1, "hello-world has 1 open issue")
+  assertEq(hwOpenIssues[0]!.issueNumber, "1", "open issue is #1")
+  const hwClosedIssues = hwIssues.filter((i) => i.status === "Closed")
+  assertEq(hwClosedIssues.length, 2, "hello-world has 2 closed issues")
   assertEq(hwPRs.length, 2, "hello-world has 2 PRs")
   const hwOpenPRs = hwPRs.filter((pr) => pr.status === "Open")
   assertEq(hwOpenPRs.length, 1, "hello-world has 1 open PR")
   const hwClosedPRs = hwPRs.filter((pr) => pr.status === "Closed")
   assertEq(hwClosedPRs.length, 1, "hello-world has 1 closed PR")
-
-  const linuxIssues = yield* db.Issues.collect(
-    Issues.query.todos({ repoOwner: "torvalds", repoName: "linux" }),
-  )
   assertEq(linuxIssues.length, 1, "linux has 1 issue")
   assertEq(linuxIssues[0]!.status, "Open", "linux issue is Open")
-
-  const linuxPRs = yield* db.PullRequests.collect(
-    PullRequests.query.enhancements({ repoOwner: "torvalds", repoName: "linux" }),
-  )
   assertEq(linuxPRs.length, 1, "linux has 1 PR")
   assertEq(linuxPRs[0]!.status, "Open", "linux PR is Open")
-
-  const hwRepoActivity = yield* db.Repositories.collect(
-    Repositories.query.activity({ repoOwner: "octocat", repoName: "hello-world" }),
-  )
   assertEq(hwRepoActivity.length, 1, "activity returns 1 repo record")
   assertEq(hwRepoActivity[0]!.repoName, "hello-world", "activity repo name")
-  // #endregion
   yield* Console.log("  Activity: hello-world (3 issues, 2 PRs), linux (1 issue, 1 PR) — OK")
 
   // -------------------------------------------------------------------------
@@ -545,6 +546,16 @@ const program = Effect.gen(function* () {
     }),
   ])
 
+  // Both created atomically — verify via activity index
+  const linuxIssuesAfter = yield* db.Issues.collect(
+    Issues.query.todos({ repoOwner: "torvalds", repoName: "linux" }),
+  )
+
+  const linuxPRsAfter = yield* db.PullRequests.collect(
+    PullRequests.query.enhancements({ repoOwner: "torvalds", repoName: "linux" }),
+  )
+  // #endregion
+
   const txIssue = yield* db.Issues.get({
     repoOwner: "torvalds",
     repoName: "linux",
@@ -560,17 +571,8 @@ const program = Effect.gen(function* () {
   })
   assertEq(txPR.subject, "Fix memory leak in driver X", "transaction PR subject")
   assertEq(txPR.status, "Open", "transaction PR status")
-
-  const linuxIssuesAfter = yield* db.Issues.collect(
-    Issues.query.todos({ repoOwner: "torvalds", repoName: "linux" }),
-  )
   assertEq(linuxIssuesAfter.length, 2, "linux now has 2 issues")
-
-  const linuxPRsAfter = yield* db.PullRequests.collect(
-    PullRequests.query.enhancements({ repoOwner: "torvalds", repoName: "linux" }),
-  )
   assertEq(linuxPRsAfter.length, 2, "linux now has 2 PRs")
-  // #endregion
   yield* Console.log("  Atomic create: issue #2 + PR #2 on linux — OK")
 
   // --- Cleanup ---

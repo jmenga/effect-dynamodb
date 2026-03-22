@@ -145,14 +145,7 @@ const program = Effect.gen(function* () {
   // Typed execution gateway
   const db = yield* DynamoClient.make(BlogTable)
 
-  // --- Setup ---
-  yield* Console.log("=== Setup ===\n")
-
   yield* db.createTable()
-  yield* Console.log("Table created: blog-table\n")
-
-  // --- Pattern 1: Put + Get — clean model types ---
-  yield* Console.log("=== Pattern 1: Put + Get (Model Types) ===\n")
 
   // yield* returns User — clean class name, no system fields
   const alice = yield* db.Users.put({
@@ -161,11 +154,19 @@ const program = Effect.gen(function* () {
     displayName: "Alice",
     postCount: 0,
   })
-  // alice: User
-  yield* Console.log(`Created user: ${alice.displayName} (${alice.email})`)
 
   // get returns model instance by default, with system fields available
   const aliceWithMeta = yield* db.Users.get({ userId: "alice-1" })
+  // #endregion
+
+  // --- Setup ---
+  yield* Console.log("=== Setup ===\n")
+  yield* Console.log("Table created: blog-table\n")
+
+  // --- Pattern 1: Put + Get — clean model types ---
+  yield* Console.log("=== Pattern 1: Put + Get (Model Types) ===\n")
+  // alice: User
+  yield* Console.log(`Created user: ${alice.displayName} (${alice.email})`)
   yield* Console.log(`  retrieved: ${aliceWithMeta?.displayName}\n`)
 
   // --- Pattern 2: Multiple entity types in one table ---
@@ -214,7 +215,6 @@ const program = Effect.gen(function* () {
     body: "Very helpful, thanks!",
   })
   yield* Console.log("Created comments: comment-1, comment-2\n")
-  // #endregion
 
   // --- Pattern 3: GSI Queries ---
   yield* Console.log("=== Pattern 3: GSI Queries ===\n")

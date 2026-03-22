@@ -421,8 +421,8 @@ const program = Effect.gen(function* () {
     Effect.map(() => false),
     Effect.catchTag("ItemNotFound", () => Effect.succeed(true)),
   )
-  assert(deleted, "delete removes item")
   // #endregion
+  assert(deleted, "delete removes item")
 
   // Re-create for subsequent patterns (with original data)
   yield* db.Employees.put(employees.tyler)
@@ -439,14 +439,14 @@ const program = Effect.gen(function* () {
   const portlandEmployees = yield* db.Employees.collect(
     Employees.query.coworkers({ office: "portland" }),
   )
+
+  const portlandOffice = yield* db.Offices.collect(Offices.query.workplace({ office: "portland" }))
+  // #endregion
   assertEq(portlandEmployees.length, 2, "portland has 2 employees")
   const portlandIds = portlandEmployees.map((e) => e.employee).sort()
   assertEq(portlandIds, ["sean", "tyler"], "portland employee IDs")
-
-  const portlandOffice = yield* db.Offices.collect(Offices.query.workplace({ office: "portland" }))
   assertEq(portlandOffice.length, 1, "portland has 1 office record")
   assertEq(portlandOffice[0]!.city, "Portland", "portland city")
-  // #endregion
   yield* Console.log("  Workplaces: coworkers + office lookup — OK")
 
   // -------------------------------------------------------------------------
@@ -458,19 +458,20 @@ const program = Effect.gen(function* () {
 
   // #region assignments
   const tylerTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "tyler" }))
-  assertEq(tylerTasks.length, 2, "tyler has 2 tasks")
-  const tylerTaskIds = tylerTasks.map((t) => t.task).sort()
-  assertEq(tylerTaskIds, ["build-api", "code-review"], "tyler task IDs")
+
   // Verify points field (numeric) comes through correctly
   const totalTylerPoints = tylerTasks.reduce((sum, t) => sum + t.points, 0)
-  assertEq(totalTylerPoints, 10, "tyler total points (8 + 2)")
 
   const tylerInfo = yield* db.Employees.collect(
     Employees.query.employeeLookup({ employee: "tyler" }),
   )
+  // #endregion
+  assertEq(tylerTasks.length, 2, "tyler has 2 tasks")
+  const tylerTaskIds = tylerTasks.map((t) => t.task).sort()
+  assertEq(tylerTaskIds, ["build-api", "code-review"], "tyler task IDs")
+  assertEq(totalTylerPoints, 10, "tyler total points (8 + 2)")
   assertEq(tylerInfo.length, 1, "employeeLookup returns 1")
   assertEq(tylerInfo[0]!.firstName, "Tyler", "employeeLookup firstName")
-  // #endregion
   yield* Console.log("  Assignments: tasks + employee lookup — OK")
 
   // -------------------------------------------------------------------------
@@ -484,6 +485,27 @@ const program = Effect.gen(function* () {
   // #region teams
   // All development team members
   const devTeam = yield* db.Employees.collect(Employees.query.teams({ team: "development" }))
+
+  // Range query: development team members hired between 2020 and 2023
+  const teamsIndex = Employees.indexes.teams
+  const loHired = KeyComposer.composeSortKeyPrefix(TmSchema, "Employee", 1, teamsIndex, {
+    dateHired: "2020-01-01",
+  })
+  const hiHired = KeyComposer.composeSortKeyPrefix(TmSchema, "Employee", 1, teamsIndex, {
+    dateHired: "2023-12-31",
+  })
+
+  const recentDevHires = yield* db.Employees.collect(
+    Employees.query
+      .teams({ team: "development" })
+      .pipe(Query.where({ between: [loHired, hiHired] })),
+  )
+
+  // Reverse sort: development team by most recently hired first
+  const devReversed = yield* db.Employees.collect(
+    Employees.query.teams({ team: "development" }).pipe(Query.reverse),
+  )
+  // #endregion
   assertEq(devTeam.length, 2, "development team has 2 members")
   const devNames = devTeam.map((e) => e.firstName).sort()
   assertEq(devNames, ["Sean", "Tyler"], "development team names")
@@ -498,33 +520,12 @@ const program = Effect.gen(function* () {
   assertEq(marketingTeam.length, 1, "marketing team has 1 member")
   assertEq(marketingTeam[0]!.employee, "alex", "marketing team member")
 
-  // Range query: development team members hired between 2020 and 2023
-  // SK is [dateHired, title], so beginsWith on dateHired prefix works for range
-  const teamsIndex = Employees.indexes.teams
-  const loHired = KeyComposer.composeSortKeyPrefix(TmSchema, "Employee", 1, teamsIndex, {
-    dateHired: "2020-01-01",
-  })
-  const hiHired = KeyComposer.composeSortKeyPrefix(TmSchema, "Employee", 1, teamsIndex, {
-    dateHired: "2023-12-31",
-  })
-
-  const recentDevHires = yield* db.Employees.collect(
-    Employees.query
-      .teams({ team: "development" })
-      .pipe(Query.where({ between: [loHired, hiHired] })),
-  )
   assertEq(recentDevHires.length, 1, "1 dev hired between 2020-2023")
   assertEq(recentDevHires[0]!.employee, "sean", "recent dev hire is sean")
   assertEq(recentDevHires[0]!.dateHired, "2022-06-01", "sean's hire date")
-
-  // Reverse sort: development team by most recently hired first
-  const devReversed = yield* db.Employees.collect(
-    Employees.query.teams({ team: "development" }).pipe(Query.reverse),
-  )
   assertEq(devReversed.length, 2, "reversed dev team has 2 members")
   assertEq(devReversed[0]!.employee, "sean", "most recent hire first (sean)")
   assertEq(devReversed[1]!.employee, "tyler", "earliest hire second (tyler)")
-  // #endregion
   yield* Console.log(
     "  Teams: all dev (2), product (1), marketing (1), hired range (1), reversed — OK",
   )
@@ -540,6 +541,16 @@ const program = Effect.gen(function* () {
   // #region statuses
   // All open tasks across all projects
   const openTasks = yield* db.Tasks.collect(Tasks.query.statuses({ status: "open" }))
+
+  // Verify points are present on status-queried tasks
+  const totalOpenPoints = openTasks.reduce((sum, t) => sum + t.points, 0)
+
+  // In-progress tasks
+  const inProgressTasks = yield* db.Tasks.collect(Tasks.query.statuses({ status: "in-progress" }))
+
+  // Closed tasks
+  const closedTasks = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
+  // #endregion
   assertEq(openTasks.length, 4, "4 open tasks total")
   const openTaskIds = openTasks.map((t) => t.task).sort()
   assertEq(
@@ -547,22 +558,13 @@ const program = Effect.gen(function* () {
     ["build-api", "code-review", "deploy-ci", "design-landing"],
     "open task IDs",
   )
-  // Verify points are present on status-queried tasks
-  const totalOpenPoints = openTasks.reduce((sum, t) => sum + t.points, 0)
   assertEq(totalOpenPoints, 28, "total open points (8+2+5+13)")
-
-  // In-progress tasks
-  const inProgressTasks = yield* db.Tasks.collect(Tasks.query.statuses({ status: "in-progress" }))
   assertEq(inProgressTasks.length, 1, "1 in-progress task")
   assertEq(inProgressTasks[0]!.task, "write-tests", "in-progress task ID")
   assertEq(inProgressTasks[0]!.points, 5, "in-progress task points")
-
-  // Closed tasks
-  const closedTasks = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
   assertEq(closedTasks.length, 1, "1 closed task")
   assertEq(closedTasks[0]!.task, "user-research", "closed task ID")
   assertEq(closedTasks[0]!.points, 3, "closed task points")
-  // #endregion
 
   // #region statuses-by-project
   // Open tasks in a specific project using SK prefix (beginsWith)
@@ -573,10 +575,10 @@ const program = Effect.gen(function* () {
   const openPlatformTasks = yield* db.Tasks.collect(
     Tasks.query.statuses({ status: "open" }).pipe(Query.where({ beginsWith: platformPrefix })),
   )
+  // #endregion
   assertEq(openPlatformTasks.length, 3, "3 open platform tasks")
   const openPlatformIds = openPlatformTasks.map((t) => t.task).sort()
   assertEq(openPlatformIds, ["build-api", "code-review", "deploy-ci"], "open platform task IDs")
-  // #endregion
   yield* Console.log("  Statuses: open (4), in-progress (1), closed (1), open+platform (3) — OK")
 
   // -------------------------------------------------------------------------
@@ -593,33 +595,23 @@ const program = Effect.gen(function* () {
     { task: "build-api", project: "platform", employee: "tyler" },
     Entity.set({ status: "in-progress" }),
   )
-  assertEq(inProgress.status, "in-progress", "build-api now in-progress")
-  assertEq(inProgress.points, 8, "points preserved after status update")
 
   // Verify: open tasks decreased by 1
   const openAfterTransition = yield* db.Tasks.collect(Tasks.query.statuses({ status: "open" }))
-  assertEq(openAfterTransition.length, 3, "3 open tasks after transition")
 
   // Verify: in-progress tasks increased by 1
   const inProgressAfterTransition = yield* db.Tasks.collect(
     Tasks.query.statuses({ status: "in-progress" }),
   )
-  assertEq(inProgressAfterTransition.length, 2, "2 in-progress tasks after transition")
-  const inProgressIds = inProgressAfterTransition.map((t) => t.task).sort()
-  assertEq(inProgressIds, ["build-api", "write-tests"], "in-progress task IDs")
 
   // Move build-api from in-progress -> closed
   const closed = yield* db.Tasks.update(
     { task: "build-api", project: "platform", employee: "tyler" },
     Entity.set({ status: "closed" }),
   )
-  assertEq(closed.status, "closed", "build-api now closed")
 
   // Verify: closed tasks increased
   const closedAfterWorkflow = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
-  assertEq(closedAfterWorkflow.length, 2, "2 closed tasks after full workflow")
-  const closedIds = closedAfterWorkflow.map((t) => t.task).sort()
-  assertEq(closedIds, ["build-api", "user-research"], "closed task IDs after workflow")
 
   // Restore build-api to original state for clean assertions below
   yield* db.Tasks.update(
@@ -627,6 +619,16 @@ const program = Effect.gen(function* () {
     Entity.set({ status: "open" }),
   )
   // #endregion
+  assertEq(inProgress.status, "in-progress", "build-api now in-progress")
+  assertEq(inProgress.points, 8, "points preserved after status update")
+  assertEq(openAfterTransition.length, 3, "3 open tasks after transition")
+  assertEq(inProgressAfterTransition.length, 2, "2 in-progress tasks after transition")
+  const inProgressIds = inProgressAfterTransition.map((t) => t.task).sort()
+  assertEq(inProgressIds, ["build-api", "write-tests"], "in-progress task IDs")
+  assertEq(closed.status, "closed", "build-api now closed")
+  assertEq(closedAfterWorkflow.length, 2, "2 closed tasks after full workflow")
+  const closedIds = closedAfterWorkflow.map((t) => t.task).sort()
+  assertEq(closedIds, ["build-api", "user-research"], "closed task IDs after workflow")
   yield* Console.log("  Workflow: open -> in-progress -> closed with GSI recomposition — OK")
 
   // -------------------------------------------------------------------------
@@ -638,9 +640,6 @@ const program = Effect.gen(function* () {
 
   // #region roles
   const engineers = yield* db.Employees.collect(Employees.query.roles({ title: "Senior Engineer" }))
-  assertEq(engineers.length, 1, "1 Senior Engineer")
-  assertEq(engineers[0]!.employee, "tyler", "Senior Engineer is tyler")
-  assertEq(engineers[0]!.salary, "000120.00", "Senior Engineer salary")
 
   // Salary range query across all Product Managers
   const rolesIndex = Employees.indexes.roles
@@ -655,9 +654,12 @@ const program = Effect.gen(function* () {
       .roles({ title: "Product Manager" })
       .pipe(Query.where({ between: [loSalary, hiSalary] })),
   )
+  // #endregion
+  assertEq(engineers.length, 1, "1 Senior Engineer")
+  assertEq(engineers[0]!.employee, "tyler", "Senior Engineer is tyler")
+  assertEq(engineers[0]!.salary, "000120.00", "Senior Engineer salary")
   assertEq(wellPaidPMs.length, 1, "1 PM in salary range 100-200k")
   assertEq(wellPaidPMs[0]!.employee, "morgan", "well-paid PM is morgan")
-  // #endregion
   yield* Console.log("  Roles: Senior Engineer (1), PM salary range (1) — OK")
 
   // -------------------------------------------------------------------------
@@ -690,28 +692,28 @@ const program = Effect.gen(function* () {
 
   // Verify both items created atomically
   const newHire = yield* db.Employees.get({ employee: "jordan" })
-  assertEq(newHire.firstName, "Jordan", "transaction employee firstName")
-  assertEq(newHire.title, "Junior Engineer", "transaction employee title")
-  assertEq(newHire.team, "development", "transaction employee team")
 
   const onboardingTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "jordan" }))
-  assertEq(onboardingTasks.length, 1, "transaction created 1 task")
-  assertEq(onboardingTasks[0]!.task, "onboarding", "transaction task ID")
-  assertEq(onboardingTasks[0]!.points, 3, "transaction task points")
 
   // Verify new hire appears in teams query
   const devTeamAfterHire = yield* db.Employees.collect(
     Employees.query.teams({ team: "development" }),
   )
-  assertEq(devTeamAfterHire.length, 3, "development team now has 3 members")
 
   // Verify new open task appears in statuses query
   const openAfterHire = yield* db.Tasks.collect(Tasks.query.statuses({ status: "open" }))
+  // #endregion
+  assertEq(newHire.firstName, "Jordan", "transaction employee firstName")
+  assertEq(newHire.title, "Junior Engineer", "transaction employee title")
+  assertEq(newHire.team, "development", "transaction employee team")
+  assertEq(onboardingTasks.length, 1, "transaction created 1 task")
+  assertEq(onboardingTasks[0]!.task, "onboarding", "transaction task ID")
+  assertEq(onboardingTasks[0]!.points, 3, "transaction task points")
+  assertEq(devTeamAfterHire.length, 3, "development team now has 3 members")
   assert(
     openAfterHire.some((t) => t.task === "onboarding"),
     "onboarding task appears in open status query",
   )
-  // #endregion
   yield* Console.log("  Atomic onboarding: employee + task in transaction — OK")
 
   // -------------------------------------------------------------------------
@@ -729,15 +731,9 @@ const program = Effect.gen(function* () {
 
   // Verify: closed tasks no longer include the archived one
   const closedAfterArchive = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
-  // build-api was restored to open in pattern 6 — user-research was the only closed task
-  assertEq(closedAfterArchive.length, 0, "0 closed tasks after archiving user-research")
 
   // Verify: morgan's assignments no longer include the archived task
   const morganTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "morgan" }))
-  assert(
-    !morganTasks.some((t) => t.task === "user-research"),
-    "archived task gone from assignment query",
-  )
 
   // But the archived task is still retrievable via deleted.get
   const archivedTask = yield* db.Tasks.deleted.get({
@@ -745,8 +741,14 @@ const program = Effect.gen(function* () {
     project: "website",
     employee: "morgan",
   })
-  assertEq(archivedTask.description, "Conduct user research interviews", "archived task preserved")
   // #endregion
+  // build-api was restored to open in pattern 6 — user-research was the only closed task
+  assertEq(closedAfterArchive.length, 0, "0 closed tasks after archiving user-research")
+  assert(
+    !morganTasks.some((t) => t.task === "user-research"),
+    "archived task gone from assignment query",
+  )
+  assertEq(archivedTask.description, "Conduct user research interviews", "archived task preserved")
 
   // #region restore
   // Restore if needed (e.g., task was archived by mistake)
@@ -755,15 +757,15 @@ const program = Effect.gen(function* () {
     project: "website",
     employee: "morgan",
   })
-  assertEq(unarchived.status, "closed", "restored task retains original status")
 
   // Verify: task is back in status queries
   const closedAfterRestore = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
+  // #endregion
+  assertEq(unarchived.status, "closed", "restored task retains original status")
   assert(
     closedAfterRestore.some((t) => t.task === "user-research"),
     "restored task back in status query",
   )
-  // #endregion
   yield* Console.log("  Archive + restore: soft-delete, audit lookup, restore — OK")
 
   // --- Cleanup ---

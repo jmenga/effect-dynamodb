@@ -166,13 +166,9 @@ const composed = yield* db.Products.update(
   Entity.subtract({ stock: 5 }),
   Entity.append({ tags: ["premium"] }),
 )
-// One DynamoDB call produces:
-//   name: "Premium Wireless Mouse"
-//   price: 39.99
-//   viewCount: 16 (was 6, added 10)
-//   stock: 142 (was 147, subtracted 5)
-//   tags: ["electronics", "accessories", "on-sale", "featured", "premium"]
 ```
+
+One DynamoDB call produces: `name: "Premium Wireless Mouse"`, `price: 39.99`, `viewCount: 16` (was 6, added 10), `stock: 142` (was 147, subtracted 5), `tags: ["electronics", "accessories", "on-sale", "featured", "premium"]`.
 
 This is a single atomic DynamoDB operation — all changes apply together or none do.
 

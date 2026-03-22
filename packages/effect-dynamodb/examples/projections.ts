@@ -76,20 +76,13 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Employees } })
 
 const program = Effect.gen(function* () {
   // #region seed-data
-  // Typed execution gateway — binds all table members
   const db = yield* DynamoClient.make(MainTable)
 
-  // Raw DynamoClient + TableConfig needed for low-level projection operations
   const client = yield* DynamoClient
   const tableConfig = yield* MainTable.Tag
 
-  // --- Setup ---
-  yield* Console.log("=== Setup ===\n")
-
   yield* db.createTable()
-  yield* Console.log("Table created\n")
 
-  // Seed data
   yield* db.Employees.put({
     employeeId: "e-1",
     name: "Alice",
@@ -121,18 +114,8 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Projection.projection() ===\n")
 
   // #region projected-get-item
-  // Build a projection to fetch only name and department
   const nameAndDept = Projection.projection(["name", "department"])
-  yield* Console.log(`Expression: ${nameAndDept.expression}`)
-  yield* Console.log(`Names: ${JSON.stringify(nameAndDept.names)}`)
-  yield* Console.log("")
 
-  // --- Apply projection to a GetItem ---
-  yield* Console.log("=== Projected GetItem ===\n")
-
-  // Use DynamoClient directly to apply projection.
-  // ProjectionExpression tells DynamoDB to return only specified attributes,
-  // reducing read capacity and network transfer.
   const projResult = yield* client.getItem({
     TableName: tableConfig.name,
     Key: toAttributeMap({
@@ -144,12 +127,14 @@ const program = Effect.gen(function* () {
   })
 
   if (projResult.Item) {
-    const item = fromAttributeMap(projResult.Item)
-    yield* Console.log(`Projected result: ${JSON.stringify(item)}`)
+    const _item = fromAttributeMap(projResult.Item)
+  }
+  // #endregion
+  if (projResult.Item) {
+    yield* Console.log(`Projected result: ${JSON.stringify(fromAttributeMap(projResult.Item))}`)
     yield* Console.log("  → Only requested fields returned (name, department)")
     yield* Console.log("  → salary, email, title, keys all excluded\n")
   }
-  // #endregion
 
   // --- Projection with more fields ---
   yield* Console.log("=== Broader Projection ===\n")

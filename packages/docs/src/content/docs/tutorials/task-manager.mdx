@@ -458,8 +458,6 @@ Employee's `teams` index on GSI2 uses `team` as PK and `dateHired + title` as SK
 ```typescript region="teams" example="task-manager.ts"
 // All development team members
 const devTeam = yield* db.Employees.collect(Employees.query.teams({ team: "development" }))
-// → [{ employee: "tyler", dateHired: "2019-03-15" },
-//    { employee: "sean", dateHired: "2022-06-01" }]
 
 // Range query: development team members hired between 2020 and 2023
 const teamsIndex = Employees.indexes.teams
@@ -638,7 +636,6 @@ const devTeamAfterHire = yield* db.Employees.collect(
 
 // Verify new open task appears in statuses query
 const openAfterHire = yield* db.Tasks.collect(Tasks.query.statuses({ status: "open" }))
-// onboarding task appears in open status query
 ```
 
 ### Requirement 9: Task Archival (Soft Delete + Restore)
@@ -657,7 +654,6 @@ const closedAfterArchive = yield* db.Tasks.collect(Tasks.query.statuses({ status
 
 // Verify: morgan's assignments no longer include the archived task
 const morganTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "morgan" }))
-// user-research no longer appears
 
 // But the archived task is still retrievable via deleted.get
 const archivedTask = yield* db.Tasks.deleted.get({
@@ -681,7 +677,6 @@ const unarchived = yield* db.Tasks.restore({
 
 // Verify: task is back in status queries
 const closedAfterRestore = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
-// user-research is back
 ```
 
 This is the natural end of the task lifecycle: **open -> in-progress -> closed -> archived**. Soft delete strips all GSI keys, so archived tasks are invisible to every query while the data is preserved.

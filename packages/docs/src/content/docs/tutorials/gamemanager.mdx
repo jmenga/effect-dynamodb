@@ -2197,89 +2197,39 @@ The `MatchUpdatePayload` is a custom schema for the update endpoint. Aggregate u
 
 This is where the magic happens. The aggregate defines how a complex domain object decomposes into DynamoDB items and reassembles:
 
-```ts
-// src/entities/MatchAggregate.ts
-import { Aggregate } from "@effect-dynamodb/core"
-import { Match } from "../models/Match.js"
-import { TeamSheet } from "../models/TeamSheet.js"
-import { UmpireSheet } from "../models/UmpireSheet.js"
-import { Coaches } from "./Coaches.js"
-import { Players } from "./Players.js"
-import { CricketSchema } from "./Schema.js"
-import { Teams } from "./Teams.js"
-import { Umpires } from "./Umpires.js"
-import { Venues } from "./Venues.js"
-
+```ts region="aggregates" example="cricket.ts"
 // Sub-aggregate: a team's composition within a match
 const TeamSheetAggregate = Aggregate.make(TeamSheet, {
   root: { entityType: "MatchTeam" },
   edges: {
     team: Aggregate.ref(Teams),
-    coach: Aggregate.one("coach", { entity: Coaches, entityType: "MatchCoach" }),
-    players: Aggregate.many("players", { entity: Players, entityType: "MatchPlayer" }),
-  },
-})
-
-// Sub-aggregate: umpire assignments structured by role
-const UmpireSheetAggregate = Aggregate.make(UmpireSheet, {
-  root: { entityType: "MatchUmpires" },
-  edges: {
-    matchReferee: Aggregate.one("matchReferee", {
-      entity: Umpires,
-      entityType: "MatchUmpire",
-      discriminator: { role: "referee" },
-    }),
-    matchUmpire: Aggregate.many("matchUmpire", {
-      entity: Umpires,
-      entityType: "MatchUmpire",
-      inputField: "matchUmpireIds",
-    }),
-    tvUmpire: Aggregate.one("tvUmpire", {
-      entity: Umpires,
-      entityType: "MatchUmpire",
-      discriminator: { role: "tvUmpire" },
-    }),
-    reserveUmpire: Aggregate.one("reserveUmpire", {
-      entity: Umpires,
-      entityType: "MatchUmpire",
-      discriminator: { role: "reserve" },
-    }),
+    coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: Coaches }),
+    players: Aggregate.many("players", { entityType: "MatchPlayer", entity: Players }),
   },
 })
 
 // Top-level aggregate: the full match
-export const MatchAggregate = Aggregate.make(Match, {
+const MatchAggregate = Aggregate.make(Match, {
+  table: MainTable,
   schema: CricketSchema,
   pk: { field: "pk", composite: ["id"] },
   collection: {
-    index: "gsi2",
+    index: "lsi1",
     name: "match",
-    sk: { field: "gsi2sk", composite: [] },
+    sk: { field: "lsi1sk", composite: ["name"] },
   },
-  list: {
-    index: "gsi1",
-    name: "matchlist",
-    pk: { field: "gsi1pk", composite: [] },
-    sk: { field: "gsi1sk", composite: ["gender", "league", "name"] },
-  },
-  context: ["name", "gender", "matchType", "league", "series", "season", "startDate"],
   root: { entityType: "MatchItem" },
   edges: {
-    venue: Aggregate.one("venue", { entity: Venues, entityType: "MatchVenue" }),
+    venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: Venues }),
     team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
     team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
-    umpires: UmpireSheetAggregate.with({ discriminator: {} }),
-    toss: Aggregate.ref(Teams),
-    winner: Aggregate.ref(Teams),
   },
 })
-
-export type MatchAggregateType = Aggregate.Type<typeof MatchAggregate>
 ```
 
 Key aggregate concepts:
 
-- **`Aggregate.ref(Teams)`** — Like `DynamoModel.ref` but at the aggregate level. The `toss` and `winner` fields reference Teams. Input accepts IDs; output contains full Team objects.
+- **`Aggregate.ref(Teams)`** — Like `DynamoModel.ref` but at the aggregate level. The `team` field in `TeamSheet` references Teams. Input accepts IDs; output contains full Team objects.
 
 - **`Aggregate.one("venue", { entity: Venues, entityType: "MatchVenue" })`** — A one-to-one edge. The venue is decomposed into a separate DynamoDB item with entity type `MatchVenue`, all sharing the match's partition key.
 
@@ -2287,11 +2237,7 @@ Key aggregate concepts:
 
 - **`TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } })`** — Binds a sub-aggregate with a discriminator. Since a match has **two** TeamSheets, the discriminator (`teamNumber: 1` vs `teamNumber: 2`) distinguishes them in the sort key.
 
-- **`collection`** — A GSI for fetching all items belonging to one match (the aggregate's "get" query).
-
-- **`list`** — A GSI for listing matches with sort-key filtering.
-
-- **`context`** — Fields from the root that are copied to **every** edge item's sort key, making them queryable.
+- **`collection`** — An index for fetching all items belonging to one match (the aggregate's "get" query). In this example it uses an LSI (`lsi1`).
 
 ### 5.4 MatchesApi
 

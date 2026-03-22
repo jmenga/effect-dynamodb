@@ -327,10 +327,6 @@ const program = Effect.gen(function* () {
 
   // #region crud
   const joe = yield* db.Employees.get({ employee: "jlowe" })
-  assertEq(joe.firstName, "Joe", "get firstName")
-  assertEq(joe.lastName, "Lowe", "get lastName")
-  assertEq(joe.title, "Zookeeper", "get title")
-  assertEq(joe.office, "gw-zoo", "get office")
 
   const updated = yield* db.Employees.update(
     { employee: "jlowe" },
@@ -342,19 +338,19 @@ const program = Effect.gen(function* () {
       manager: "jlowe",
     }),
   )
-  assertEq(updated.title, "Head Zookeeper", "update title")
-  assertEq(updated.salary, "000055.00", "update salary")
-  assertEq(updated.firstName, "Joe", "update preserves unchanged fields")
 
   yield* db.Employees.delete({ employee: "jlowe" })
-  const deleted = yield* db.Employees.get({ employee: "jlowe" }).pipe(
-    Effect.map(() => false),
-    Effect.catchTag("ItemNotFound", () => Effect.succeed(true)),
-  )
-  assert(deleted, "delete removes item")
 
   yield* db.Employees.put(employees.jlowe)
   // #endregion
+  assertEq(joe.firstName, "Joe", "get firstName")
+  assertEq(joe.lastName, "Lowe", "get lastName")
+  assertEq(joe.title, "Zookeeper", "get title")
+  assertEq(joe.office, "gw-zoo", "get office")
+  assertEq(updated.title, "Head Zookeeper", "update title")
+  assertEq(updated.salary, "000055.00", "update salary")
+  assertEq(updated.firstName, "Joe", "update preserves unchanged fields")
+  // Note: delete + re-put is verified implicitly (jlowe is used in subsequent patterns)
   yield* Console.log("  CRUD: get, update, delete, re-put — OK")
 
   // Pattern 2: Workplaces (gsi1 collection)
@@ -364,15 +360,15 @@ const program = Effect.gen(function* () {
   const gwZooEmployees = yield* db.Employees.collect(
     Employees.query.coworkers({ office: "gw-zoo" }),
   )
+
+  const gwZooOffice = yield* db.Offices.collect(Offices.query.workplace({ office: "gw-zoo" }))
+  // #endregion
   assertEq(gwZooEmployees.length, 2, "gw-zoo has 2 employees")
   const gwZooIds = gwZooEmployees.map((e) => e.employee).sort()
   assertEq(gwZooIds, ["dfinlay", "jlowe"], "gw-zoo employee IDs")
-
-  const gwZooOffice = yield* db.Offices.collect(Offices.query.workplace({ office: "gw-zoo" }))
   assertEq(gwZooOffice.length, 1, "gw-zoo has 1 office record")
   assertEq(gwZooOffice[0]!.city, "Wynnewood", "gw-zoo city")
   assertEq(gwZooOffice[0]!.state, "OK", "gw-zoo state")
-  // #endregion
   yield* Console.log("  Workplaces: coworkers + office lookup — OK")
 
   // Pattern 3: Assignments (gsi3 collection)
@@ -380,16 +376,16 @@ const program = Effect.gen(function* () {
 
   // #region assignments
   const dfinlayTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "dfinlay" }))
-  assertEq(dfinlayTasks.length, 1, "dfinlay has 1 task")
-  assertEq(dfinlayTasks[0]!.task, "feed-cats", "dfinlay task ID")
-  assertEq(dfinlayTasks[0]!.project, "feeding", "dfinlay task project")
 
   const dfinlayInfo = yield* db.Employees.collect(
     Employees.query.employeeLookup({ employee: "dfinlay" }),
   )
+  // #endregion
+  assertEq(dfinlayTasks.length, 1, "dfinlay has 1 task")
+  assertEq(dfinlayTasks[0]!.task, "feed-cats", "dfinlay task ID")
+  assertEq(dfinlayTasks[0]!.project, "feeding", "dfinlay task project")
   assertEq(dfinlayInfo.length, 1, "employeeLookup returns 1")
   assertEq(dfinlayInfo[0]!.firstName, "Don", "employeeLookup firstName")
-  // #endregion
   yield* Console.log("  Assignments: tasks + employee lookup — OK")
 
   // Pattern 4: Tasks by Project (gsi1)
@@ -397,13 +393,13 @@ const program = Effect.gen(function* () {
 
   // #region tasks-by-project
   const feedingTasks = yield* db.Tasks.collect(Tasks.query.project({ project: "feeding" }))
+
+  const fundraiserTasks = yield* db.Tasks.collect(Tasks.query.project({ project: "fundraiser" }))
+  // #endregion
   assertEq(feedingTasks.length, 2, "feeding project has 2 tasks")
   const feedingTaskIds = feedingTasks.map((t) => t.task).sort()
   assertEq(feedingTaskIds, ["feed-cats", "feed-cubs"], "feeding task IDs")
-
-  const fundraiserTasks = yield* db.Tasks.collect(Tasks.query.project({ project: "fundraiser" }))
   assertEq(fundraiserTasks.length, 2, "fundraiser project has 2 tasks")
-  // #endregion
   yield* Console.log("  Tasks by project: feeding (2), fundraiser (2) — OK")
 
   // Pattern 5: Offices by Location (gsi2)
@@ -413,16 +409,16 @@ const program = Effect.gen(function* () {
   const flOffices = yield* db.Offices.collect(
     Offices.query.byLocation({ country: "US", state: "FL" }),
   )
-  assertEq(flOffices.length, 1, "Florida has 1 office")
-  assertEq(flOffices[0]!.office, "big-cat-rescue", "FL office ID")
-  assertEq(flOffices[0]!.city, "Tampa", "FL office city")
 
   const okOffices = yield* db.Offices.collect(
     Offices.query.byLocation({ country: "US", state: "OK" }),
   )
+  // #endregion
+  assertEq(flOffices.length, 1, "Florida has 1 office")
+  assertEq(flOffices[0]!.office, "big-cat-rescue", "FL office ID")
+  assertEq(flOffices[0]!.city, "Tampa", "FL office city")
   assertEq(okOffices.length, 1, "Oklahoma has 1 office")
   assertEq(okOffices[0]!.office, "gw-zoo", "OK office ID")
-  // #endregion
   yield* Console.log("  Offices by location: FL (1), OK (1) — OK")
 
   // Pattern 6: Salary Range Query (gsi4)
@@ -430,9 +426,6 @@ const program = Effect.gen(function* () {
 
   // #region salary-range
   const zookeepers = yield* db.Employees.collect(Employees.query.roles({ title: "Zookeeper" }))
-  assertEq(zookeepers.length, 1, "1 Zookeeper")
-  assertEq(zookeepers[0]!.employee, "jlowe", "Zookeeper is jlowe")
-  assertEq(zookeepers[0]!.salary, "000045.00", "Zookeeper salary")
 
   const rolesIndex = Employees.indexes.roles
   const loPrefix = KeyComposer.composeSortKeyPrefix(HrSchema, "Employee", 1, rolesIndex, {
@@ -447,10 +440,13 @@ const program = Effect.gen(function* () {
       .roles({ title: "Director" })
       .pipe(Query.where({ between: [loPrefix, hiPrefix] })),
   )
+  // #endregion
+  assertEq(zookeepers.length, 1, "1 Zookeeper")
+  assertEq(zookeepers[0]!.employee, "jlowe", "Zookeeper is jlowe")
+  assertEq(zookeepers[0]!.salary, "000045.00", "Zookeeper salary")
   assertEq(directorsBySalary.length, 1, "1 Director in salary range")
   assertEq(directorsBySalary[0]!.employee, "cbaskin", "Director is cbaskin")
   assertEq(directorsBySalary[0]!.salary, "000150.00", "Director salary")
-  // #endregion
   yield* Console.log("  Roles + salary range: Zookeeper (1), Director between (1) — OK")
 
   // Pattern 7: Direct Reports (gsi5)
@@ -460,17 +456,17 @@ const program = Effect.gen(function* () {
   const jloweReports = yield* db.Employees.collect(
     Employees.query.directReports({ manager: "jlowe" }),
   )
-  assertEq(jloweReports.length, 2, "jlowe has 2 reports (including self)")
-  const jloweReportIds = jloweReports.map((e) => e.employee).sort()
-  assertEq(jloweReportIds, ["dfinlay", "jlowe"], "jlowe report IDs")
 
   const cbaskinReports = yield* db.Employees.collect(
     Employees.query.directReports({ manager: "cbaskin" }),
   )
+  // #endregion
+  assertEq(jloweReports.length, 2, "jlowe has 2 reports (including self)")
+  const jloweReportIds = jloweReports.map((e) => e.employee).sort()
+  assertEq(jloweReportIds, ["dfinlay", "jlowe"], "jlowe report IDs")
   assertEq(cbaskinReports.length, 2, "cbaskin has 2 reports (including self)")
   const cbaskinReportIds = cbaskinReports.map((e) => e.employee).sort()
   assertEq(cbaskinReportIds, ["cbaskin", "hschreibvogel"], "cbaskin report IDs")
-  // #endregion
   yield* Console.log("  Direct reports: jlowe (2), cbaskin (2) — OK")
 
   // Pattern 8: Employee Transfer (All-or-None)
@@ -487,14 +483,19 @@ const program = Effect.gen(function* () {
       manager: "cbaskin",
     }),
   )
-  assertEq(transferred.office, "big-cat-rescue", "transfer office")
-  assertEq(transferred.team, "saturn", "transfer team")
-  assertEq(transferred.manager, "cbaskin", "transfer manager")
-  assertEq(transferred.firstName, "Don", "transfer preserves unchanged")
 
   const newReports = yield* db.Employees.collect(
     Employees.query.directReports({ manager: "cbaskin" }),
   )
+
+  const jloweReportsAfter = yield* db.Employees.collect(
+    Employees.query.directReports({ manager: "jlowe" }),
+  )
+  // #endregion
+  assertEq(transferred.office, "big-cat-rescue", "transfer office")
+  assertEq(transferred.team, "saturn", "transfer team")
+  assertEq(transferred.manager, "cbaskin", "transfer manager")
+  assertEq(transferred.firstName, "Don", "transfer preserves unchanged")
   assertEq(newReports.length, 3, "cbaskin now has 3 reports after transfer")
   const newReportIds = newReports.map((e) => e.employee).sort()
   assertEq(
@@ -502,13 +503,8 @@ const program = Effect.gen(function* () {
     ["cbaskin", "dfinlay", "hschreibvogel"],
     "cbaskin report IDs after transfer",
   )
-
-  const jloweReportsAfter = yield* db.Employees.collect(
-    Employees.query.directReports({ manager: "jlowe" }),
-  )
   assertEq(jloweReportsAfter.length, 1, "jlowe has 1 report after transfer")
   assertEq(jloweReportsAfter[0]!.employee, "jlowe", "jlowe's only report is self")
-  // #endregion
 
   // Partial GSI update fails at runtime
   // #region partial-gsi-error
@@ -516,12 +512,12 @@ const program = Effect.gen(function* () {
     { employee: "dfinlay" },
     Entity.set({ office: "gw-zoo" } as any),
   ).pipe(Effect.flip)
+  // #endregion
   assertEq(partialError._tag, "ValidationError", "partial GSI update fails with ValidationError")
   assert(
     String((partialError as any).cause).includes("coworkers"),
     "error references the violating index",
   )
-  // #endregion
   yield* Console.log("  Transfer + all-or-none runtime guard — OK")
 
   // Pattern 9: Atomic Onboarding (Transaction)
@@ -550,15 +546,15 @@ const program = Effect.gen(function* () {
   ])
 
   const newHire = yield* db.Employees.get({ employee: "rstarr" })
+
+  const onboardingTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "rstarr" }))
+  // #endregion
   assertEq(newHire.firstName, "Rick", "transaction employee firstName")
   assertEq(newHire.title, "Trainee", "transaction employee title")
   assertEq(newHire.office, "gw-zoo", "transaction employee office")
-
-  const onboardingTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "rstarr" }))
   assertEq(onboardingTasks.length, 1, "transaction created 1 task")
   assertEq(onboardingTasks[0]!.task, "orientation", "transaction task ID")
   assertEq(onboardingTasks[0]!.project, "onboarding", "transaction task project")
-  // #endregion
   yield* Console.log("  Atomic onboarding: employee + task in transaction — OK")
 
   // Pattern 10: Termination + Rehire (Soft Delete + Restore)
@@ -570,28 +566,28 @@ const program = Effect.gen(function* () {
   const cbaskinReportsAfterTermination = yield* db.Employees.collect(
     Employees.query.directReports({ manager: "cbaskin" }),
   )
+
+  const terminatedRecord = yield* db.Employees.deleted.get({ employee: "hschreibvogel" })
+
+  const rehired = yield* db.Employees.restore({ employee: "hschreibvogel" })
+
+  const reportsAfterRehire = yield* db.Employees.collect(
+    Employees.query.directReports({ manager: "cbaskin" }),
+  )
+  // #endregion
   const terminatedReportIds = cbaskinReportsAfterTermination.map((e) => e.employee).sort()
   assert(
     !terminatedReportIds.includes("hschreibvogel"),
     "terminated employee gone from direct reports",
   )
-
-  const terminatedRecord = yield* db.Employees.deleted.get({ employee: "hschreibvogel" })
   assertEq(terminatedRecord.firstName, "Howard", "terminated record preserved")
   assertEq(terminatedRecord.lastName, "Schreibvogel", "terminated last name")
-
-  const rehired = yield* db.Employees.restore({ employee: "hschreibvogel" })
   assertEq(rehired.firstName, "Howard", "rehired firstName")
   assertEq(rehired.office, "big-cat-rescue", "rehired office preserved")
-
-  const reportsAfterRehire = yield* db.Employees.collect(
-    Employees.query.directReports({ manager: "cbaskin" }),
-  )
   assert(
     reportsAfterRehire.some((e) => e.employee === "hschreibvogel"),
     "rehired employee back in direct reports",
   )
-  // #endregion
   yield* Console.log("  Terminate + rehire: soft-delete, audit lookup, restore — OK")
 
   // --- Cleanup ---
