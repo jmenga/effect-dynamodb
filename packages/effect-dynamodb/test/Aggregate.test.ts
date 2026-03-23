@@ -78,44 +78,36 @@ const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
 const VenueEntity = Entity.make({
   model: Venue,
   entityType: "Venue",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["venueId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["venueId"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const TeamEntity = Entity.make({
   model: Team,
   entityType: "Team",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["teamId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["teamId"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const CoachEntity = Entity.make({
   model: Coach,
   entityType: "Coach",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["coachId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["coachId"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const PlayerEntity = Entity.make({
   model: Player,
   entityType: "Player",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["playerId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["playerId"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
@@ -688,11 +680,9 @@ describe("Aggregate", () => {
     const UmpireEntity = Entity.make({
       model: Umpire,
       entityType: "Umpire",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["umpireId"] },
-          sk: { field: "sk", composite: [] },
-        },
+      primaryKey: {
+        pk: { field: "pk", composite: ["umpireId"] },
+        sk: { field: "sk", composite: [] },
       },
     })
     UmpireEntity._configure(AppSchema, MainTable.Tag)
@@ -1899,11 +1889,9 @@ describe("Aggregate write path", () => {
         const RefEntity = Entity.make({
           model: RefTarget,
           entityType: "RefTarget",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["refId"] },
-              sk: { field: "sk", composite: [] },
-            },
+          primaryKey: {
+            pk: { field: "pk", composite: ["refId"] },
+            sk: { field: "sk", composite: [] },
           },
         })
         RefEntity._configure(AppSchema, MainTable.Tag)
@@ -2183,11 +2171,9 @@ describe("Aggregate write path", () => {
     const UmpireEntity = Entity.make({
       model: Umpire,
       entityType: "Umpire",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["umpireId"] },
-          sk: { field: "sk", composite: [] },
-        },
+      primaryKey: {
+        pk: { field: "pk", composite: ["umpireId"] },
+        sk: { field: "sk", composite: [] },
       },
     })
     UmpireEntity._configure(AppSchema, MainTable.Tag)

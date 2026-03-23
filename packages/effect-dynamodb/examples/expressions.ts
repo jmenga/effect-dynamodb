@@ -23,7 +23,6 @@
 import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
-import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -58,20 +57,18 @@ const Products = Entity.make({
     pk: { field: "pk", composite: ["productId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byCategory: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["category"],
+      sk: ["productId"],
+    },
+  },
   timestamps: true,
   versioned: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Products } })
-
-const ProductsByCategory = Collections.make("productsByCategory", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["category"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Products: Collections.member(Products, { sk: { composite: ["productId"] } }),
-  },
-})
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -82,7 +79,6 @@ const program = Effect.gen(function* () {
   // Typed execution gateway
   const db = yield* DynamoClient.make({
     entities: { Products },
-    collections: { ProductsByCategory },
   })
 
   // --- Setup ---
@@ -231,10 +227,8 @@ const program = Effect.gen(function* () {
   // Uses the same callback + shorthand API as Products.condition().
 
   // #region filters
-  // All electronics via collection query
-  const { Products: electronics } = yield* db.collections
-    .ProductsByCategory({ category: "electronics" })
-    .collect()
+  // All electronics via entity index query
+  const electronics = yield* db.entities.Products.byCategory({ category: "electronics" }).collect()
 
   // Greater-than filter on scan
   const expensive = yield* db.entities.Products.scan()

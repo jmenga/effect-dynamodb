@@ -10,7 +10,7 @@
 
 import { execSync } from "node:child_process"
 import { readdirSync } from "node:fs"
-import { resolve, join } from "node:path"
+import { join, resolve } from "node:path"
 import { describe, it } from "vitest"
 
 const ENDPOINT = process.env.DYNAMODB_ENDPOINT ?? "http://localhost:8000"

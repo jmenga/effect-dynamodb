@@ -15,7 +15,7 @@
  * Key API patterns demonstrated:
  * - DynamoClient.make({ entities, collections }) typed gateway pattern
  * - db.entities.Entity methods return Effect directly
- * - db.collections.Name(pk) for composing collection queries
+ * - db.entities.Entity.indexName(pk) for composing index queries
  * - db.entities.Entity.update(key, ...combinators) for type-safe updates
  *
  * Prerequisites:
@@ -26,7 +26,6 @@
  */
 
 import { Console, Effect, Layer, Schema } from "effect"
-import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -99,6 +98,13 @@ const Posts = Entity.make({
     pk: { field: "pk", composite: ["postId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byAuthor: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["authorId"],
+      sk: ["postId"],
+    },
+  },
   timestamps: true,
 })
 // #endregion
@@ -111,6 +117,13 @@ const Comments = Entity.make({
     pk: { field: "pk", composite: ["commentId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byPost: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["postId"],
+      sk: ["commentId"],
+    },
+  },
   timestamps: true,
 })
 
@@ -119,23 +132,6 @@ const BlogTable = Table.make({
   entities: { Users, Posts, Comments },
 })
 
-const PostsByAuthor = Collections.make("postsByAuthor", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["authorId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Posts: Collections.member(Posts, { sk: { composite: ["postId"] } }),
-  },
-})
-
-const CommentsByPost = Collections.make("commentsByPost", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["postId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Comments: Collections.member(Comments, { sk: { composite: ["commentId"] } }),
-  },
-})
 // #endregion
 
 // =============================================================================
@@ -147,7 +143,6 @@ const program = Effect.gen(function* () {
   // Typed execution gateway
   const db = yield* DynamoClient.make({
     entities: { Users, Posts, Comments },
-    collections: { PostsByAuthor, CommentsByPost },
   })
 
   yield* db.tables["blog-table"]!.create()
@@ -226,14 +221,10 @@ const program = Effect.gen(function* () {
 
   // #region gsi-queries
   // Posts by author
-  const { Posts: alicePosts } = yield* db.collections
-    .PostsByAuthor({ authorId: "alice-1" })
-    .collect()
+  const alicePosts = yield* db.entities.Posts.byAuthor({ authorId: "alice-1" }).collect()
 
   // Comments on a post
-  const { Comments: postComments } = yield* db.collections
-    .CommentsByPost({ postId: "post-1" })
-    .collect()
+  const postComments = yield* db.entities.Comments.byPost({ postId: "post-1" }).collect()
   // #endregion
   yield* Console.log(`Alice's posts (${alicePosts.length}):`)
   for (const p of alicePosts) {
@@ -316,9 +307,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Pattern 6: Collection Queries ===\n")
 
   // Query comments on a post via the collection.
-  const { Comments: commentsResult } = yield* db.collections
-    .CommentsByPost({ postId: "post-1" })
-    .collect()
+  const commentsResult = yield* db.entities.Comments.byPost({ postId: "post-1" }).collect()
   yield* Console.log(`Collection query — comments on post-1: ${commentsResult.length}`)
   for (const c of commentsResult) {
     yield* Console.log(`  ${c.commentId}: "${c.body}"\n`)

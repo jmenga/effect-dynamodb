@@ -104,6 +104,13 @@ const Posts = Entity.make({
     pk: { field: "pk", composite: ["postId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byAuthor: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["authorId"],
+      sk: ["postId"],
+    },
+  },
   timestamps: true,
 })
 ```
@@ -120,30 +127,19 @@ const Comments = Entity.make({
     pk: { field: "pk", composite: ["commentId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byPost: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["postId"],
+      sk: ["commentId"],
+    },
+  },
   timestamps: true,
 })
 
 const BlogTable = Table.make({
   schema: BlogSchema,
   entities: { Users, Posts, Comments },
-})
-
-const PostsByAuthor = Collections.make("postsByAuthor", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["authorId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Posts: Collections.member(Posts, { sk: { composite: ["postId"] } }),
-  },
-})
-
-const CommentsByPost = Collections.make("commentsByPost", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["postId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Comments: Collections.member(Comments, { sk: { composite: ["commentId"] } }),
-  },
 })
 ```
 
@@ -165,7 +161,6 @@ GSI1 is **overloaded** -- Posts use it for `PostsByAuthor` (partitioned by `auth
 // Typed execution gateway
 const db = yield* DynamoClient.make({
   entities: { Users, Posts, Comments },
-  collections: { PostsByAuthor, CommentsByPost },
 })
 
 yield* db.tables["blog-table"]!.create()
@@ -212,14 +207,10 @@ Query posts by author and comments by post using Collections:
 
 ```typescript region="gsi-queries" example="blog.ts"
 // Posts by author
-const { Posts: alicePosts } = yield* db.collections
-  .PostsByAuthor({ authorId: "alice-1" })
-  .collect()
+const alicePosts = yield* db.entities.Posts.byAuthor({ authorId: "alice-1" }).collect()
 
 // Comments on a post
-const { Comments: postComments } = yield* db.collections
-  .CommentsByPost({ postId: "post-1" })
-  .collect()
+const postComments = yield* db.entities.Comments.byPost({ postId: "post-1" }).collect()
 ```
 
 ### Pipeable Updates

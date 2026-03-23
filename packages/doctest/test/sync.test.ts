@@ -1,5 +1,5 @@
-import { readdirSync, existsSync } from "node:fs"
-import { resolve, join } from "node:path"
+import { existsSync, readdirSync } from "node:fs"
+import { join, resolve } from "node:path"
 import { describe, expect, it } from "vitest"
 import { extractFromFile } from "../src/extract.js"
 import { verifySyncForPage } from "../src/sync.js"
@@ -20,7 +20,9 @@ function findSyncablePages(): Array<{ mdxPath: string; slug: string }> {
         walk(fullPath)
       } else if (entry.name.endsWith(".mdx")) {
         const page = extractFromFile(fullPath)
-        const hasRegions = page.blocks.some((b) => b.region !== undefined && b.example !== undefined)
+        const hasRegions = page.blocks.some(
+          (b) => b.region !== undefined && b.example !== undefined,
+        )
         if (hasRegions) {
           pages.push({ mdxPath: fullPath, slug: page.slug })
         }

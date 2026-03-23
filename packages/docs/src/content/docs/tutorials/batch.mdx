@@ -67,19 +67,17 @@ const Orders = Entity.make({
     pk: { field: "pk", composite: ["orderId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byUser: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["userId"],
+      sk: ["orderId"],
+    },
+  },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Users, Orders } })
-
-const OrdersByUser = Collections.make("ordersByUser", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["userId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Orders: Collections.member(Orders, { sk: { composite: ["orderId"] } }),
-  },
-})
 ```
 
 ---

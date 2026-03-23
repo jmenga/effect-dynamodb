@@ -17,7 +17,6 @@
 import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
-import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
@@ -66,6 +65,13 @@ const EmployeeEntity = Entity.make({
     pk: { field: "pk", composite: ["employeeId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byEmail: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["email"],
+      sk: [],
+    },
+  },
   unique: { email: ["email"] },
   timestamps: true,
   versioned: true,
@@ -78,6 +84,14 @@ const TaskEntity = Entity.make({
     pk: { field: "pk", composite: ["taskId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byProject: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      type: "clustered",
+      composite: ["projectId"],
+      sk: ["status"],
+    },
+  },
   timestamps: true,
 })
 
@@ -86,24 +100,6 @@ const MainTable = Table.make({
   entities: { EmployeeEntity, TaskEntity },
 })
 
-const EmployeesByEmail = Collections.make("employeesByEmail", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["email"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    EmployeeEntity: Collections.member(EmployeeEntity, { sk: { composite: [] } }),
-  },
-})
-
-const TasksByProject = Collections.make("tasksByProject", {
-  index: "gsi1",
-  type: "clustered",
-  pk: { field: "gsi1pk", composite: ["projectId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    TaskEntity: Collections.member(TaskEntity, { sk: { composite: ["status"] } }),
-  },
-})
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -194,7 +190,6 @@ const testPutOperation = Effect.gen(function* () {
 
   const db = yield* DynamoClient.make({
     entities: { EmployeeEntity, TaskEntity },
-    collections: { EmployeesByEmail, TasksByProject },
   })
 
   const result = yield* db.entities.EmployeeEntity.put({
@@ -236,7 +231,6 @@ const testErrorPath = Effect.gen(function* () {
 
   const db = yield* DynamoClient.make({
     entities: { EmployeeEntity, TaskEntity },
-    collections: { EmployeesByEmail, TasksByProject },
   })
 
   const result = yield* db.entities.EmployeeEntity.put({
@@ -302,11 +296,9 @@ const testQueryResults = Effect.gen(function* () {
 
   const db = yield* DynamoClient.make({
     entities: { EmployeeEntity, TaskEntity },
-    collections: { EmployeesByEmail, TasksByProject },
   })
 
-  const { TaskEntity: results } = yield* db.collections
-    .TasksByProject({ projectId: "proj-alpha" })
+  const results = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
     .filter({ status: "active" })
     .collect()
 

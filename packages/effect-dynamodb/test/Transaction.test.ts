@@ -32,15 +32,15 @@ class Order extends Schema.Class<Order>("Order")({
 const UserEntity = Entity.make({
   model: User,
   entityType: "User",
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
     byRole: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["role"] },
-      sk: { field: "gsi1sk", composite: ["userId"] },
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["role"],
+      sk: ["userId"],
     },
   },
 })
@@ -48,15 +48,15 @@ const UserEntity = Entity.make({
 const OrderEntity = Entity.make({
   model: Order,
   entityType: "Order",
+  primaryKey: {
+    pk: { field: "pk", composite: ["orderId"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["orderId"] },
-      sk: { field: "sk", composite: [] },
-    },
     byUser: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["userId"] },
-      sk: { field: "gsi1sk", composite: ["orderId"] },
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["userId"],
+      sk: ["orderId"],
     },
   },
 })
@@ -645,15 +645,15 @@ describe("Transaction", () => {
         const SparseEntity = Entity.make({
           model: SparseItem,
           entityType: "SparseItem",
+          primaryKey: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
           indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
-            },
             byTenant: {
-              index: "gsi1",
-              pk: { field: "gsi1pk", composite: ["tenantId"] },
-              sk: { field: "gsi1sk", composite: [] },
+              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+              composite: ["tenantId"],
+              sk: [],
             },
           },
         })

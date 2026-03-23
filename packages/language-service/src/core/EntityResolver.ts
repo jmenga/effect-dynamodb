@@ -284,8 +284,16 @@ function tryResolveTableMake(
 
   const args = expr.arguments
   if (args.length < 1) return undefined
-  const tableConfig = args[0]!
-  if (!ts.isObjectLiteralExpression(tableConfig)) return undefined
+
+  // New signature: Table.make({ schema, entities }) — first arg is string name
+  // Legacy signature: Table.make({ schema, entities }) — first arg is config object
+  let tableConfig: ts.ObjectLiteralExpression | undefined
+  if (args.length >= 2 && ts.isStringLiteral(args[0]!) && ts.isObjectLiteralExpression(args[1]!)) {
+    tableConfig = args[1]!
+  } else if (ts.isObjectLiteralExpression(args[0]!)) {
+    tableConfig = args[0]! as ts.ObjectLiteralExpression
+  }
+  if (!tableConfig) return undefined
 
   let schemaExpr: ts.Expression | undefined
   let entitiesExpr: ts.Expression | undefined
@@ -563,7 +571,7 @@ function tryResolveCollectionMake(
   varName: string,
   expr: ts.Expression,
 ): ResolvedCollection | undefined {
-  // Match: Collections.make("name", { index, pk, sk, members })
+  // Match: Collections.make({ name, index: { name, pk, sk }, composite, members })
   if (!ts.isCallExpression(expr)) return undefined
   const callee = expr.expression
   if (!ts.isPropertyAccessExpression(callee)) return undefined
@@ -573,57 +581,62 @@ function tryResolveCollectionMake(
   if (!ts.isIdentifier(target) || target.text !== "Collections") return undefined
 
   const args = expr.arguments
-  if (args.length < 2) return undefined
+  if (args.length < 1) return undefined
 
-  const collectionName = extractStringLiteral(ts, args[0]!)
-  if (!collectionName) return undefined
-
-  const configArg = args[1]!
+  const configArg = args[0]!
   if (!ts.isObjectLiteralExpression(configArg)) return undefined
 
-  let index: string | undefined
-  let type: "clustered" | "isolated" = "clustered"
-  let pk: KeyPart | undefined
+  let collectionName: string | undefined
+  let indexName: string | undefined
+  let pkField: string | undefined
   let skField: string | undefined
+  let type: "clustered" | "isolated" = "clustered"
+  let composite: ReadonlyArray<string> | undefined
   let membersExpr: ts.Expression | undefined
 
   for (const prop of configArg.properties) {
     if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
     switch (prop.name.text) {
-      case "index":
-        index = extractStringLiteral(ts, prop.initializer)
+      case "name":
+        collectionName = extractStringLiteral(ts, prop.initializer)
         break
-      case "type":
-        type =
-          (extractStringLiteral(ts, prop.initializer) as "clustered" | "isolated") ?? "clustered"
-        break
-      case "pk":
-        pk = resolveKeyPart(ts, prop.initializer)
-        break
-      case "sk": {
-        // sk: { field: "gsi3sk" } — just a field, no composite
+      case "index": {
+        // index: { name: "gsi3", pk: "gsi3pk", sk: "gsi3sk" }
         if (ts.isObjectLiteralExpression(prop.initializer)) {
-          for (const skProp of prop.initializer.properties) {
-            if (
-              ts.isPropertyAssignment(skProp) &&
-              ts.isIdentifier(skProp.name) &&
-              skProp.name.text === "field"
-            ) {
-              skField = extractStringLiteral(ts, skProp.initializer)
+          for (const idxProp of prop.initializer.properties) {
+            if (!ts.isPropertyAssignment(idxProp) || !ts.isIdentifier(idxProp.name)) continue
+            switch (idxProp.name.text) {
+              case "name":
+                indexName = extractStringLiteral(ts, idxProp.initializer)
+                break
+              case "pk":
+                pkField = extractStringLiteral(ts, idxProp.initializer)
+                break
+              case "sk":
+                skField = extractStringLiteral(ts, idxProp.initializer)
+                break
             }
           }
         }
         break
       }
+      case "type":
+        type =
+          (extractStringLiteral(ts, prop.initializer) as "clustered" | "isolated") ?? "clustered"
+        break
+      case "composite":
+        composite = extractStringArray(ts, prop.initializer)
+        break
       case "members":
         membersExpr = prop.initializer
         break
     }
   }
 
-  if (!index || !pk || !skField || !membersExpr) return undefined
+  if (!collectionName || !indexName || !pkField || !skField || !composite || !membersExpr)
+    return undefined
 
-  // Parse members: { Name: Collections.member(Entity, { sk: { composite: [...] } }) }
+  // Parse members: { Name: Collections.member(Entity, [...skComposites]) }
   const members: Record<string, ResolvedCollectionMember> = {}
   if (ts.isObjectLiteralExpression(membersExpr)) {
     for (const prop of membersExpr.properties) {
@@ -639,9 +652,9 @@ function tryResolveCollectionMake(
   return {
     variableName: varName,
     collectionName,
-    index,
+    index: indexName,
     type,
-    pk,
+    pk: { field: pkField, composite: [...composite] },
     sk: { field: skField },
     members,
   }
@@ -651,7 +664,7 @@ function tryResolveCollectionMember(
   ts: typeof import("typescript"),
   expr: ts.Expression,
 ): ResolvedCollectionMember | undefined {
-  // Match: Collections.member(EntityRef, { sk: { composite: [...] } })
+  // Match: Collections.member(EntityRef, [...skComposites])
   if (!ts.isCallExpression(expr)) return undefined
   const callee = expr.expression
   if (!ts.isPropertyAccessExpression(callee)) return undefined
@@ -668,27 +681,9 @@ function tryResolveCollectionMember(
   }
   if (!entityVariableName) return undefined
 
-  // Second arg: { sk: { composite: [...] } }
-  const configArg = args[1]!
-  if (!ts.isObjectLiteralExpression(configArg)) return undefined
-
-  let composite: ReadonlyArray<string> | undefined
-
-  for (const prop of configArg.properties) {
-    if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
-    if (prop.name.text === "sk" && ts.isObjectLiteralExpression(prop.initializer)) {
-      for (const skProp of prop.initializer.properties) {
-        if (
-          ts.isPropertyAssignment(skProp) &&
-          ts.isIdentifier(skProp.name) &&
-          skProp.name.text === "composite"
-        ) {
-          composite = extractStringArray(ts, skProp.initializer)
-        }
-      }
-    }
-  }
-
+  // Second arg: string array of SK composites
+  const compositeArg = args[1]!
+  const composite = extractStringArray(ts, compositeArg)
   if (!composite) return undefined
 
   return { entityVariableName, sk: { composite } }

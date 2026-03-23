@@ -166,7 +166,11 @@ describe("Table", () => {
         collection: { index: "gsi2", sk: { field: "gsi2sk" } },
         listIndex: undefined,
       }
-      const table = Table.make({ schema, entities: { entity }, aggregates: { aggregate } })
+      const table = Table.make({
+        schema,
+        entities: { entity },
+        aggregates: { aggregate },
+      })
       const result = Table.definition(table)
 
       expect(result.GlobalSecondaryIndexes).toEqual([
@@ -207,7 +211,11 @@ describe("Table", () => {
           sk: { field: "gsi1sk" },
         },
       }
-      const table = Table.make({ schema, entities: { entity }, aggregates: { aggregate } })
+      const table = Table.make({
+        schema,
+        entities: { entity },
+        aggregates: { aggregate },
+      })
       const result = Table.definition(table)
 
       // gsi1 from entity, gsi2 from aggregate collection — no duplicates
@@ -236,7 +244,11 @@ describe("Table", () => {
           sk: { field: "gsi1sk" },
         },
       }
-      const table = Table.make({ schema, entities: { entity }, aggregates: { aggregate } })
+      const table = Table.make({
+        schema,
+        entities: { entity },
+        aggregates: { aggregate },
+      })
       const result = Table.definition(table)
 
       // Both GSIs present

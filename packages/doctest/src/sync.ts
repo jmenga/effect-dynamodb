@@ -37,10 +37,7 @@ export interface SyncCheck {
 /**
  * Verify all region-attributed code blocks in an MDX file match their example.
  */
-export function verifySyncForPage(
-  mdxPath: string,
-  examplesDir: string,
-): SyncResult {
+export function verifySyncForPage(mdxPath: string, examplesDir: string): SyncResult {
   const page = extractFromFile(mdxPath)
   const regionBlocks = page.blocks.filter(
     (b): b is CodeBlock & { region: string; example: string } =>
@@ -84,6 +81,38 @@ export function verifySyncForPage(
 }
 
 /**
+ * Remove single-line and multi-line `yield* Console.log(...)` statements.
+ *
+ * When biome reformats a Console.log call across multiple lines, the opening
+ * line (`yield* Console.log(`) is followed by continuation lines and a closing
+ * `)`. This helper tracks open parentheses to strip the entire statement.
+ */
+function removeConsoleLog(lines: Array<string>): Array<string> {
+  const result: Array<string> = []
+  let depth = 0
+  for (const line of lines) {
+    if (depth === 0) {
+      if (line.trim().startsWith("yield* Console.log")) {
+        // Count unmatched open parens on this line
+        const opens = (line.match(/\(/g) || []).length
+        const closes = (line.match(/\)/g) || []).length
+        depth = opens - closes
+        // If balanced (single-line), depth stays 0 — line is just skipped
+        continue
+      }
+      result.push(line)
+    } else {
+      // Inside a multi-line Console.log — track parens until balanced
+      const opens = (line.match(/\(/g) || []).length
+      const closes = (line.match(/\)/g) || []).length
+      depth += opens - closes
+      // Skip this line (part of the Console.log call)
+    }
+  }
+  return result
+}
+
+/**
  * Normalize code for comparison:
  * - Trim leading/trailing whitespace
  * - Normalize line endings
@@ -93,11 +122,7 @@ export function verifySyncForPage(
  * - Normalize import paths (example relative → package name)
  */
 function normalize(content: string): string {
-  const lines = content
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    // Remove Console.log lines
-    .filter((line) => !line.trim().startsWith("yield* Console.log"))
+  const lines = removeConsoleLog(content.replace(/\r\n/g, "\n").split("\n"))
     // Remove empty for loops left after Console.log removal
     .join("\n")
     .replace(/\s*for\s*\([^)]*\)\s*\{\s*\}/g, "")
@@ -105,19 +130,21 @@ function normalize(content: string): string {
     // Remove blank lines for comparison (whitespace is not semantic)
     .filter((line) => line.trim().length > 0)
 
-  return lines
-    // Remove assert/assertEq lines (test infrastructure, not doc content)
-    .filter((line) => !line.trim().startsWith("assertEq(") && !line.trim().startsWith("assert("))
-    // Remove nested #region/#endregion markers
-    .filter((line) => !line.trim().match(/^\/\/\s*#(end)?region/))
-    // Normalize indentation: trim all leading whitespace per line
-    .map((line) => line.trimStart())
-    .join("\n")
-    .trim()
-    // Remove inline output comments (e.g., "// → name: ...", "// State: ...", "// Current version: ...")
-    .replace(/\n\/\/\s*(?:→|State:|Current|Error:|Latest:|Reconstructed:|v\d+:)[^\n]*/g, "")
-    // Remove inline result annotations (e.g., "// coffee.category -> ...")
-    .replace(/\n\/\/\s*\w+\.\w+\s*→[^\n]*/g, "")
-    // Normalize import paths
-    .replace(/from\s+["']\.\.\/src\/[^"']+["']/g, 'from "effect-dynamodb"')
+  return (
+    lines
+      // Remove assert/assertEq lines (test infrastructure, not doc content)
+      .filter((line) => !line.trim().startsWith("assertEq(") && !line.trim().startsWith("assert("))
+      // Remove nested #region/#endregion markers
+      .filter((line) => !line.trim().match(/^\/\/\s*#(end)?region/))
+      // Normalize indentation: trim all leading whitespace per line
+      .map((line) => line.trimStart())
+      .join("\n")
+      .trim()
+      // Remove inline output comments (e.g., "// → name: ...", "// State: ...", "// Current version: ...")
+      .replace(/\n\/\/\s*(?:→|State:|Current|Error:|Latest:|Reconstructed:|v\d+:)[^\n]*/g, "")
+      // Remove inline result annotations (e.g., "// coffee.category -> ...")
+      .replace(/\n\/\/\s*\w+\.\w+\s*→[^\n]*/g, "")
+      // Normalize import paths
+      .replace(/from\s+["']\.\.\/src\/[^"']+["']/g, 'from "effect-dynamodb"')
+  )
 }

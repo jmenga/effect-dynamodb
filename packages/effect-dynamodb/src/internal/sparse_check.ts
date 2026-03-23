@@ -65,15 +65,15 @@ class Employee extends Schema.Class<Employee>("Employee")({
 const Employees = Entity.make({
   model: Employee,
   entityType: "Employee",
+  primaryKey: {
+    pk: { field: "pk" as const, composite: ["employeeId"] as const },
+    sk: { field: "sk" as const, composite: [] as const },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk" as const, composite: ["employeeId"] as const },
-      sk: { field: "sk" as const, composite: [] as const },
-    },
     byTenant: {
-      index: "gsi1" as const,
-      pk: { field: "gsi1pk" as const, composite: ["tenantId"] as const },
-      sk: { field: "gsi1sk" as const, composite: ["region"] as const },
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["tenantId"],
+      sk: ["region"],
     },
   },
 })

@@ -22,7 +22,6 @@
 import { Console, Duration, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
-import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
@@ -68,6 +67,13 @@ const Employees = Entity.make({
     pk: { field: "pk", composite: ["employeeId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byTenant: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["tenantId"],
+      sk: ["department", "employeeId"],
+    },
+  },
   timestamps: true,
   versioned: { retain: true, ttl: Duration.days(90) },
   softDelete: { ttl: Duration.days(30) },
@@ -98,15 +104,6 @@ const MainTable = Table.make({
   schema: AppSchema,
   entities: { Employees, EmployeesReserve },
 })
-
-const EmployeesByTenant = Collections.make("employeesByTenant", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["tenantId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Employees: Collections.member(Employees, { sk: { composite: ["department", "employeeId"] } }),
-  },
-})
 // #endregion
 
 // =============================================================================
@@ -134,7 +131,6 @@ const assertEq = <T>(actual: T, expected: T, label: string): void => {
 const program = Effect.gen(function* () {
   const db = yield* DynamoClient.make({
     entities: { Employees, EmployeesReserve },
-    collections: { EmployeesByTenant },
   })
 
   yield* db.tables["lifecycle-table"]!.create()
@@ -189,10 +185,8 @@ const program = Effect.gen(function* () {
   assertEq(getResult, "not-found", "alice not found via normal get")
 
   // #region query-invisible
-  // Collection query also returns empty — deleted items fall out of indexes
-  const { Employees: tenantEmployees } = yield* db.collections
-    .EmployeesByTenant({ tenantId: "t-acme" })
-    .collect()
+  // Index query also returns empty — deleted items fall out of indexes
+  const tenantEmployees = yield* db.entities.Employees.byTenant({ tenantId: "t-acme" }).collect()
   yield* Console.log(`Tenant query after delete: ${tenantEmployees.length} results`)
   // #endregion
   assertEq(tenantEmployees.length, 0, "tenant query empty after delete")
@@ -227,10 +221,8 @@ const program = Effect.gen(function* () {
   assertEq(restored.displayName, "Alice Baker", "restored display name")
 
   // #region restore-visible
-  // Item is back in collection queries
-  const { Employees: tenantAfterRestore } = yield* db.collections
-    .EmployeesByTenant({ tenantId: "t-acme" })
-    .collect()
+  // Item is back in index queries
+  const tenantAfterRestore = yield* db.entities.Employees.byTenant({ tenantId: "t-acme" }).collect()
   yield* Console.log(`Tenant query after restore: ${tenantAfterRestore.length} results`)
   // #endregion
   assertEq(tenantAfterRestore.length, 1, "alice back in tenant query")

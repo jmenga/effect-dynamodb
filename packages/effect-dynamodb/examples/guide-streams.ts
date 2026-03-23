@@ -18,7 +18,6 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { Console, Effect, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
-import * as Collections from "../src/Collections.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -63,6 +62,13 @@ const EmployeeEntity = Entity.make({
     pk: { field: "pk", composite: ["employeeId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byDepartment: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["department"],
+      sk: ["displayName"],
+    },
+  },
   timestamps: true,
   versioned: true,
 })
@@ -74,30 +80,19 @@ const TaskEntity = Entity.make({
     pk: { field: "pk", composite: ["taskId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byEmployee: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["employeeId"],
+      sk: ["status"],
+    },
+  },
   timestamps: true,
 })
 
 const _MainTable = Table.make({
   schema: AppSchema,
   entities: { EmployeeEntity, TaskEntity },
-})
-
-const _EmployeesByDepartment = Collections.make("employeesByDepartment", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["department"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    EmployeeEntity: Collections.member(EmployeeEntity, { sk: { composite: ["displayName"] } }),
-  },
-})
-
-const _TasksByEmployee = Collections.make("tasksByEmployee", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["employeeId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    TaskEntity: Collections.member(TaskEntity, { sk: { composite: ["status"] } }),
-  },
 })
 // #endregion
 

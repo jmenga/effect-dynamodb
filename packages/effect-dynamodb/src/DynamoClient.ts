@@ -103,12 +103,6 @@ import {
 import { Config, Effect, Layer, type Schema, ServiceMap } from "effect"
 import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
 import { bind as aggregateBind } from "./Aggregate.js"
-import type {
-  Collection as CollectionDef,
-  CollectionMember,
-  CollectionResult,
-} from "./Collections.js"
-import { buildMemberIndexDef } from "./Collections.js"
 import * as DynamoSchema from "./DynamoSchema.js"
 import type { BoundEntity, Entity as EntityType } from "./Entity.js"
 import { bind as entityBind } from "./Entity.js"
@@ -387,22 +381,26 @@ export class DynamoClient extends ServiceMap.Service<DynamoClient, DynamoClientS
     // --- Overload 1: Table shortcut (existing, checked first) ---
     <T extends Table>(table: T): Effect.Effect<TypedClient<T>, never, DynamoClient | TableConfig>
 
-    // --- Overload 2a: Entity-centric with collections ---
+    // --- Overload 2a: Entity-centric with tables ---
     <
       TEntities extends Record<string, { readonly _tag: "Entity" }>,
-      TCollections extends Record<string, CollectionDef>,
+      TTables extends Record<string, TableLike>,
     >(config: {
       readonly entities: TEntities
-      readonly collections: TCollections
-    }): Effect.Effect<TypedClientV2<TEntities, TCollections>, never, DynamoClient | TableConfig>
+      readonly tables: TTables
+    }): Effect.Effect<TypedClientV2<TEntities, TTables>, never, DynamoClient | TableConfig>
 
-    // --- Overload 2b: Entity-centric (no collections) ---
+    // --- Overload 2b: Entity-centric (no tables) ---
     <TEntities extends Record<string, { readonly _tag: "Entity" }>>(config: {
       readonly entities: TEntities
-    }): Effect.Effect<TypedClientV2<TEntities, {}>, never, DynamoClient | TableConfig>
+    }): Effect.Effect<
+      TypedClientV2<TEntities, Record<string, TableLike>>,
+      never,
+      DynamoClient | TableConfig
+    >
   } = (configOrTable: any): any => {
-    // Detect which overload: Table objects have _tag
-    if (configOrTable._tag !== undefined || !("entities" in configOrTable)) {
+    // Detect which overload: Table objects have _tag = "Table"
+    if (configOrTable._tag === "Table") {
       return makeFromTable(configOrTable)
     }
     return makeFromConfig(configOrTable)
@@ -453,6 +451,15 @@ export type TypedClient<T extends Table> = {
 // TypedClientV2 — mapped type for entity-centric DynamoClient.make() return
 // ---------------------------------------------------------------------------
 
+/** Minimal structural type for tables used in DynamoClient.make() config. */
+export interface TableLike {
+  readonly _tag: "Table"
+  readonly schema: import("./DynamoSchema.js").DynamoSchema
+  readonly entities: Record<string, { readonly _tag: "Entity" }>
+  readonly aggregates: Record<string, unknown>
+  readonly Tag: ServiceMap.Service<TableConfig, TableConfig>
+}
+
 /**
  * Collection query — returned by `db.collections.Name(composites)`.
  * `.collect()` returns the grouped result directly (not an array).
@@ -489,14 +496,15 @@ export interface CollectionQuery<TResult> {
 }
 
 /**
- * Typed client returned by `DynamoClient.make({ entities, collections })`.
+ * Typed client returned by `DynamoClient.make({ entities, tables })`.
  * Namespaced under `entities`, `collections`, and `tables`.
+ * Collections are auto-discovered from entity index `collection` properties.
  */
 export type TypedClientV2<
   TEntities extends Record<string, { readonly _tag: "Entity" }>,
-  TCollections extends Record<string, CollectionDef>,
+  TTables extends Record<string, TableLike> = Record<string, TableLike>,
 > = {
-  /** Bound entities with CRUD ops + query accessors from collections. */
+  /** Bound entities with CRUD + query accessors for each index. */
   readonly entities: {
     readonly [K in keyof TEntities]: TEntities[K] extends EntityType<
       infer M,
@@ -512,25 +520,121 @@ export type TypedClientV2<
       ? BoundEntity<M, I, R> & {
           /** Scan this entity. Returns a BoundQuery for building scan queries. */
           readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
-            import("effect").Schema.Schema.Type<M>,
+            Schema.Schema.Type<M>,
             never,
-            import("effect").Schema.Schema.Type<M>
+            Schema.Schema.Type<M>
           >
-        }
+        } & EntityIndexAccessors<M, I>
       : never
   }
 
-  /** Collection accessors — grouped result queries. */
+  /**
+   * Collection accessors — auto-discovered from entity index `collection` properties.
+   * Access by collection name: `db.collections.assignments({ employee: "x" }).collect()`
+   *
+   * Each accessor returns a `CollectionQuery` with grouped results keyed by entity name.
+   * Type safety for collection results requires explicit type annotation at the call site.
+   */
   readonly collections: {
-    readonly [K in keyof TCollections]: (
-      composites: Record<string, unknown>,
-    ) => CollectionQuery<
-      CollectionResult<TCollections[K] extends CollectionDef<any, infer M> ? M : never>
-    >
+    readonly [K: string]: (composites: Record<string, unknown>) => CollectionQuery<any>
   }
 
-  /** Table operations keyed by resolved table name. */
-  readonly tables: Record<string, TableOperations>
+  /** Table operations keyed by table record keys. */
+  readonly tables: {
+    readonly [K in keyof TTables]: TableOperations
+  }
+}
+
+/**
+ * Collection accessors interface. Uses an interface (not mapped type) so that
+ * `noUncheckedIndexedAccess` does not add `| undefined` to each access.
+ * Collections are auto-discovered from entity index `collection` properties
+ * and guaranteed to exist at runtime.
+ */
+export interface CollectionAccessors {
+  [collectionName: string]: (
+    composites: Record<string, unknown>,
+  ) => CollectionQuery<Record<string, unknown[]>>
+}
+
+// ---------------------------------------------------------------------------
+// Collection type computation from entity indexes
+// ---------------------------------------------------------------------------
+
+/** Extract all collection names from a single entity's indexes. */
+type EntityCollectionNames<E> =
+  E extends EntityType<any, any, infer I, any, any, any, any, any, any>
+    ? I extends Record<string, IndexDefinition>
+      ? {
+          [K in keyof I]: I[K] extends { readonly collection: infer C }
+            ? C extends string
+              ? C
+              : C extends ReadonlyArray<string>
+                ? C[number]
+                : never
+            : never
+        }[keyof I]
+      : never
+    : never
+
+/** Extract all collection names from all entities. */
+type AllCollectionNames<TEntities extends Record<string, { readonly _tag: "Entity" }>> = {
+  [K in keyof TEntities]: EntityCollectionNames<TEntities[K]>
+}[keyof TEntities]
+
+/** Build the grouped result type for a collection: { EntityKey: Array<ModelType> } for each entity that has this collection. */
+type CollectionGroupedResult<
+  TEntities extends Record<string, { readonly _tag: "Entity" }>,
+  CollName extends string,
+> = {
+  readonly [K in keyof TEntities as EntityHasCollection<TEntities[K], CollName> extends true
+    ? K
+    : never]: TEntities[K] extends EntityType<infer M, any, any, any, any, any, any, any, any>
+    ? Array<Schema.Schema.Type<M>>
+    : never
+}
+
+/** Check if an entity has a specific collection name in any of its indexes. */
+type EntityHasCollection<E, CollName extends string> =
+  E extends EntityType<any, any, infer I, any, any, any, any, any, any>
+    ? I extends Record<string, IndexDefinition>
+      ? {
+          [K in keyof I]: I[K] extends { readonly collection: infer C }
+            ? C extends string
+              ? C extends CollName
+                ? true
+                : false
+              : C extends ReadonlyArray<string>
+                ? CollName extends C[number]
+                  ? true
+                  : false
+                : false
+            : false
+        }[keyof I] extends false
+        ? false
+        : true
+      : false
+    : false
+
+/**
+ * Auto-discovered collection accessors. Keyed by collection name extracted
+ * from entity index `collection` properties.
+ */
+type DiscoveredCollections<TEntities extends Record<string, { readonly _tag: "Entity" }>> = {
+  readonly [CollName in AllCollectionNames<TEntities> & string]: (
+    composites: Record<string, unknown>,
+  ) => CollectionQuery<CollectionGroupedResult<TEntities, CollName>>
+}
+
+/** Compute entity query accessors for each index (non-primary). */
+type EntityIndexAccessors<M extends Schema.Top, I extends Record<string, IndexDefinition>> = {
+  readonly [K in Exclude<keyof I, "primary"> & string]: (
+    composites: Record<string, unknown>,
+  ) => import("./internal/BoundQuery.js").BoundQuery<
+    Schema.Schema.Type<M>,
+    never,
+    Schema.Schema.Type<M>
+  >
 }
 
 /**
@@ -643,95 +747,95 @@ interface EntityLike {
   }
 }
 
-const makeFromConfig = <
-  TEntities extends Record<string, EntityType>,
-  TCollections extends Record<string, CollectionDef>,
->(config: {
-  readonly entities: TEntities
-  readonly collections?: TCollections
-}): Effect.Effect<TypedClientV2<TEntities, TCollections>, never, DynamoClient | TableConfig> =>
+const makeFromConfig = (config: {
+  readonly entities: Record<string, EntityType>
+  readonly tables?: Record<string, TableLike>
+}): Effect.Effect<any, never, DynamoClient | TableConfig> =>
   Effect.gen(function* () {
-    const collections = (config.collections ?? {}) as Record<string, CollectionDef>
-
-    // 1. Inject collection indexes into member entities
-    for (const [collName, collection] of Object.entries(collections)) {
-      for (const [memberKey, m] of Object.entries(collection.members)) {
-        const member = m as CollectionMember
-        const entity = member.entity as unknown as EntityLike
-        const indexDef = buildMemberIndexDef(collection, memberKey, member)
-        entity._injectIndex(collName, indexDef)
-      }
-    }
-
-    // 2. Resolve the provide function from context
+    // 1. Resolve the provide function from context
     const ctx = yield* Effect.services<DynamoClient | TableConfig>()
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
 
-    // 3. Bind entities
+    // Helper: build a BoundQuery for a single-entity index query
+    const buildEntityQueryAccessor = (
+      entityLike: EntityLike,
+      _indexName: string,
+      indexDef: IndexDefinition,
+    ) => {
+      return (composites: Record<string, unknown>) => {
+        const pkValue = KeyComposer.composePk(
+          entityLike._schema,
+          entityLike.entityType,
+          indexDef,
+          composites,
+        )
+        const query = Query.make({
+          tableName: "",
+          indexName: indexDef.index,
+          pkField: indexDef.pk.field,
+          pkValue,
+          skField: indexDef.sk.field,
+          entityTypes: [entityLike.entityType],
+          decoder: (raw) => entityLike._decodeRecord(raw),
+          resolveTableName: entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
+        })
+
+        // Apply SK prefix from provided composites
+        const hasSkComposites = indexDef.sk.composite.some(
+          (attr: string) => composites[attr] !== undefined,
+        )
+        const finalQuery = hasSkComposites
+          ? Query.where(query, {
+              beginsWith: KeyComposer.composeSortKeyPrefix(
+                entityLike._schema,
+                entityLike.entityType,
+                1,
+                indexDef,
+                composites,
+              ),
+            })
+          : query
+
+        const pathBuilder = createPathBuilder()
+        const conditionOps = createConditionOps()
+        const bqConfig: BoundQueryConfig<unknown> = { pathBuilder, conditionOps, provide }
+        return new BoundQueryImpl(finalQuery, bqConfig)
+      }
+    }
+
+    // 2. Bind entities + build entity query accessors
     const boundEntities: Record<string, unknown> = {}
+    // Track collection memberships for auto-discovery
+    // collectionName → { entityKey, entityLike, indexName, indexDef }[]
+    const collectionMembers = new Map<
+      string,
+      Array<{ entityKey: string; entityLike: EntityLike; indexDef: IndexDefinition }>
+    >()
+
     for (const [key, entity] of Object.entries(config.entities)) {
       const bound = yield* entityBind(entity as EntityType)
-
-      // Inject collection-derived query accessors
       const entityLike = entity as unknown as EntityLike
       const accessors: Record<string, unknown> = {}
 
-      for (const [collName, collection] of Object.entries(collections)) {
-        // Check if this entity is a member of this collection
-        for (const [, m] of Object.entries(collection.members)) {
-          const member = m as CollectionMember
-          if ((member.entity as unknown as EntityLike).entityType !== entityLike.entityType)
-            continue
+      // Add query accessor for each non-primary index
+      for (const [indexName, indexDef] of Object.entries(entityLike.indexes)) {
+        if (indexName === "primary") continue
+        if (!indexDef) continue
 
-          // Build query accessor for this collection membership
-          accessors[collName] = (composites: Record<string, unknown>) => {
-            const indexDef = entityLike.indexes[collName]
-            if (!indexDef) return undefined
+        accessors[indexName] = buildEntityQueryAccessor(entityLike, indexName, indexDef)
 
-            const pkValue = KeyComposer.composePk(
-              entityLike._schema,
-              entityLike.entityType,
-              indexDef,
-              composites,
-            )
-            const query = Query.make({
-              tableName: "",
-              indexName: indexDef.index,
-              pkField: indexDef.pk.field,
-              pkValue,
-              skField: indexDef.sk.field,
-              entityTypes: [entityLike.entityType],
-              decoder: (raw) => entityLike._decodeRecord(raw),
-              resolveTableName: entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
-            })
-
-            // Apply SK prefix from provided composites
-            const hasSkComposites = indexDef.sk.composite.some(
-              (attr: string) => composites[attr] !== undefined,
-            )
-            const finalQuery = hasSkComposites
-              ? Query.where(query, {
-                  beginsWith: KeyComposer.composeSortKeyPrefix(
-                    entityLike._schema,
-                    entityLike.entityType,
-                    1,
-                    indexDef,
-                    composites,
-                  ),
-                })
-              : query
-
-            // Build BoundQuery config
-            const pathBuilder = createPathBuilder()
-            const conditionOps = createConditionOps()
-            const bqConfig: BoundQueryConfig<unknown> = {
-              pathBuilder,
-              conditionOps,
-              provide,
+        // Track collection membership for auto-discovery
+        if (indexDef.collection) {
+          const collNames = Array.isArray(indexDef.collection)
+            ? indexDef.collection
+            : [indexDef.collection]
+          for (const collName of collNames) {
+            if (!collectionMembers.has(collName)) {
+              collectionMembers.set(collName, [])
             }
-            return new BoundQueryImpl(finalQuery, bqConfig)
+            collectionMembers.get(collName)!.push({ entityKey: key, entityLike, indexDef })
           }
         }
       }
@@ -747,41 +851,30 @@ const makeFromConfig = <
         })
         const pathBuilder = createPathBuilder()
         const conditionOps = createConditionOps()
-        const bqConfig: BoundQueryConfig<unknown> = {
-          pathBuilder,
-          conditionOps,
-          provide,
-        }
+        const bqConfig: BoundQueryConfig<unknown> = { pathBuilder, conditionOps, provide }
         return new BoundQueryImpl(scanQuery, bqConfig)
       }
 
       boundEntities[key] = { ...bound, ...accessors }
     }
 
-    // 4. Build collection accessors
+    // 3. Build auto-discovered collection accessors
     const boundCollections: Record<string, unknown> = {}
-    for (const [collName, collection] of Object.entries(collections)) {
+    for (const [collName, members] of collectionMembers) {
       boundCollections[collName] = (composites: Record<string, unknown>) => {
-        // Get the first member to extract schema and PK info
-        const firstMember = Object.values(collection.members)[0] as CollectionMember
-        const firstEntity = firstMember.entity as unknown as EntityLike
-        const indexDef = firstEntity.indexes[collName]
-        if (!indexDef)
-          throw new Error(
-            `Collection '${collName}' index not found on entity '${firstEntity.entityType}'`,
-          )
+        // Use the first member for PK composition
+        const firstMember = members[0]!
+        const indexDef = firstMember.indexDef
 
-        // Build entity type → member key lookup
+        // Build entity type → entity key lookup
         const memberByType = new Map<string, string>()
         const entityTypes: string[] = []
-        for (const [memberKey, m] of Object.entries(collection.members)) {
-          const member = m as CollectionMember
-          const entity = member.entity as unknown as EntityLike
-          memberByType.set(entity.entityType, memberKey)
-          entityTypes.push(entity.entityType)
+        for (const member of members) {
+          memberByType.set(member.entityLike.entityType, member.entityKey)
+          entityTypes.push(member.entityLike.entityType)
         }
 
-        // Collection decoder: decode and group by member key
+        // Collection decoder: decode and group by entity key
         const collDecoder = (raw: Record<string, unknown>) => {
           const entityType = raw.__edd_e__ as string | undefined
           if (!entityType) {
@@ -793,34 +886,27 @@ const makeFromConfig = <
               }),
             )
           }
-          const memberKey = memberByType.get(entityType)
-          if (!memberKey) {
+          const entityKey = memberByType.get(entityType)
+          if (!entityKey) {
             return Effect.succeed({ _memberKey: "__unknown__", _decoded: raw })
           }
-          // Find the member's entity and decode through its record schema
-          for (const [mk, m] of Object.entries(collection.members)) {
-            const member = m as CollectionMember
-            const entity = member.entity as unknown as EntityLike
-            if (entity.entityType === entityType) {
-              return entity._decodeRecord(raw).pipe(
-                Effect.map((decoded: unknown) => ({
-                  _memberKey: mk,
-                  _decoded: decoded,
-                })),
-              )
-            }
+          const member = members.find((m) => m.entityLike.entityType === entityType)
+          if (!member) {
+            return Effect.succeed({ _memberKey: "__unknown__", _decoded: raw })
           }
-          return Effect.succeed({ _memberKey: "__unknown__", _decoded: raw })
+          return member.entityLike
+            ._decodeRecord(raw)
+            .pipe(Effect.map((decoded: unknown) => ({ _memberKey: entityKey, _decoded: decoded })))
         }
 
         const pkValue = KeyComposer.composePk(
-          firstEntity._schema,
-          firstEntity.entityType,
+          firstMember.entityLike._schema,
+          firstMember.entityLike.entityType,
           indexDef,
           composites,
         )
 
-        // For clustered collections, add begins_with on collection SK prefix
+        // Always isolated — begins_with on collection SK prefix
         let query = Query.make({
           tableName: "",
           indexName: indexDef.index,
@@ -829,25 +915,25 @@ const makeFromConfig = <
           skField: indexDef.sk.field,
           entityTypes,
           decoder: collDecoder as any,
-          resolveTableName: firstEntity._tableTag.useSync((tc: TableConfig) => tc.name),
+          resolveTableName: firstMember.entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
         })
 
-        if (collection.type === "clustered" && indexDef.sk.field) {
-          const skPrefix = DynamoSchema.composeCollectionKey(firstEntity._schema, collName, [], {
-            casing: indexDef.casing ?? firstEntity._schema.casing,
-          })
+        // Add begins_with on collection prefix
+        if (indexDef.sk.field) {
+          const skPrefix = DynamoSchema.composeCollectionKey(
+            firstMember.entityLike._schema,
+            collName,
+            [],
+            { casing: indexDef.casing ?? firstMember.entityLike._schema.casing },
+          )
           query = Query.where(query, { beginsWith: skPrefix })
         }
 
-        // Wrap in a BoundQuery that groups results by member key
+        // Wrap in BoundQuery that groups results by entity key
         const pathBuilder = createPathBuilder()
         const conditionOps = createConditionOps()
-
-        // Custom provide that also groups results
         const collectionProvide = <X, E>(eff: Effect.Effect<X, E, any>) =>
           Effect.provide(eff, ctx) as Effect.Effect<X, E, never>
-
-        // Return a custom BoundQuery that transforms collect/fetch results
         const bqConfig: BoundQueryConfig<unknown> = {
           pathBuilder,
           conditionOps,
@@ -860,8 +946,8 @@ const makeFromConfig = <
         ;(bq as any).collect = () =>
           Effect.map(originalCollect(), (items: any[]) => {
             const result: Record<string, unknown[]> = {}
-            for (const [memberKey] of Object.entries(collection.members)) {
-              result[memberKey] = []
+            for (const member of members) {
+              result[member.entityKey] = []
             }
             for (const item of items) {
               const memberKey = (item as any)._memberKey
@@ -876,34 +962,56 @@ const makeFromConfig = <
       }
     }
 
-    // 5. Build table operations
+    // 4. Build table operations
     const client = yield* DynamoClient
     const tables: Record<string, TableOperations> = {}
 
-    // Collect unique tables from entities
-    const seenTags = new Set<string>()
-    for (const [, entity] of Object.entries(config.entities)) {
-      const entityLike = entity as unknown as EntityLike
-      const tagId = entityLike._tableTag.key
-      if (seenTags.has(tagId)) continue
-      seenTags.add(tagId)
-
-      const tableConfig = yield* entityLike._tableTag
-      const tableName = tableConfig.name
-
-      tables[tableName] = buildTableOperations(tableName, client)
+    if (config.tables) {
+      for (const [tableKey, table] of Object.entries(config.tables)) {
+        const tableConfig = yield* table.Tag
+        tables[tableKey] = buildTableOperationsFromTable(
+          tableConfig.name,
+          table as unknown as Table,
+          client,
+        )
+      }
+    } else {
+      const seenTags = new Set<string>()
+      for (const [, entity] of Object.entries(config.entities)) {
+        const entityLike = entity as unknown as EntityLike
+        const tagId = entityLike._tableTag.key
+        if (seenTags.has(tagId)) continue
+        seenTags.add(tagId)
+        const tableConfig = yield* entityLike._tableTag
+        tables[tableConfig.name] = buildTableOperations(tableConfig.name, client)
+      }
     }
 
-    return {
-      entities: boundEntities,
-      collections: boundCollections,
-      tables,
-    } as unknown as TypedClientV2<TEntities, TCollections>
+    return { entities: boundEntities, collections: boundCollections, tables } as any
   })
 
 // ---------------------------------------------------------------------------
 // buildTableOperations — pre-bound table management
 // ---------------------------------------------------------------------------
+
+const buildTableOperationsFromTable = (
+  tableName: string,
+  table: Table,
+  client: DynamoClientService,
+): TableOperations => {
+  const def = tableDefinition(table)
+  return {
+    ...buildTableOperations(tableName, client),
+    create: (options?: CreateTableOptions) =>
+      client
+        .createTable({
+          TableName: tableName,
+          BillingMode: options?.billingMode ?? "PAY_PER_REQUEST",
+          ...def,
+        })
+        .pipe(Effect.asVoid),
+  }
+}
 
 const buildTableOperations = (tableName: string, client: DynamoClientService): TableOperations => ({
   create: (options?: CreateTableOptions) =>

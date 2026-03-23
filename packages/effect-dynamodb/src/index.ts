@@ -5,18 +5,9 @@ export * as Batch from "./Batch.js"
 export type { Collection as CollectionType } from "./Collection.js"
 export * as Collection from "./Collection.js"
 export type {
-  Collection as CollectionsDefinition,
-  CollectionConfig,
-  CollectionEntityLike,
-  CollectionMember,
-  CollectionPkInput,
-  CollectionResult,
-  CollectionType as CollectionsType,
-} from "./Collections.js"
-export * as Collections from "./Collections.js"
-export type {
   DynamoClientError,
   DynamoClientService,
+  TableLike,
   TableOperations,
   TypedClient,
   TypedClientV2,
@@ -108,7 +99,7 @@ export type {
   SizeOperand,
 } from "./internal/PathBuilder.js"
 export { compilePath, createPathBuilder, isPath } from "./internal/PathBuilder.js"
-export type { IndexDefinition, KeyPart } from "./KeyComposer.js"
+export type { GsiConfig, GsiIndex, IndexDefinition, KeyPart } from "./KeyComposer.js"
 export * as KeyComposer from "./KeyComposer.js"
 export * as Marshaller from "./Marshaller.js"
 export type { ProjectionResult } from "./Projection.js"

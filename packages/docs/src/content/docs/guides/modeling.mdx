@@ -198,6 +198,19 @@ const Employees = Entity.make({
     pk: { field: "pk", composite: ["employeeId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byTenant: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      type: "clustered",
+      composite: ["tenantId"],
+      sk: ["department", "hireDate"],
+    },
+    byEmail: {
+      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+      composite: ["email"],
+      sk: [],
+    },
+  },
   unique: { email: ["email"] },
   timestamps: true,
   versioned: { retain: true, ttl: Duration.days(90) },

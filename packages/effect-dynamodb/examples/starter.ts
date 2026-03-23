@@ -4,10 +4,10 @@
  * Demonstrates the foundational building blocks:
  *   - Pure domain models with Schema.Class
  *   - DynamoSchema + Table + Entity definitions
- *   - Collections for GSI access patterns
+ *   - Entity-level indexes for GSI access patterns
  *   - DynamoClient.make() — the typed execution gateway
  *   - Basic CRUD: put, get, update, delete
- *   - GSI query via Collections and BoundQuery builder
+ *   - GSI query via entity index accessors and BoundQuery builder
  *   - Table infrastructure derived from entity definitions
  *   - Layer-based dependency injection
  *
@@ -21,7 +21,6 @@
 import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
-import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
@@ -80,6 +79,13 @@ const Users = Entity.make({
     pk: { field: "pk", composite: ["userId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byEmail: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["email"],
+      sk: [],
+    },
+  },
   unique: { email: ["email"] },
   timestamps: true,
   versioned: true,
@@ -92,28 +98,17 @@ const Tasks = Entity.make({
     pk: { field: "pk", composite: ["taskId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byUser: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["userId"],
+      sk: ["status"],
+    },
+  },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Users, Tasks } })
-
-const UsersByEmail = Collections.make("usersByEmail", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["email"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Users: Collections.member(Users, { sk: { composite: [] } }),
-  },
-})
-
-const TasksByUser = Collections.make("tasksByUser", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["userId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Tasks: Collections.member(Tasks, { sk: { composite: ["status"] } }),
-  },
-})
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -125,7 +120,6 @@ const program = Effect.gen(function* () {
   // Get typed client — binds all entities and collections
   const db = yield* DynamoClient.make({
     entities: { Users, Tasks },
-    collections: { UsersByEmail, TasksByUser },
   })
 
   // --- Create the table (derived from entity definitions) ---
@@ -186,7 +180,7 @@ const program = Effect.gen(function* () {
   // --- Query: tasks by user via collection ---
   yield* Console.log("=== Query: Tasks by User (GSI) ===\n")
 
-  const { Tasks: aliceTasks } = yield* db.collections.TasksByUser({ userId: "u-alice" }).collect()
+  const aliceTasks = yield* db.entities.Tasks.byUser({ userId: "u-alice" }).collect()
   yield* Console.log(`Alice's tasks (${aliceTasks.length}):`)
   for (const t of aliceTasks) {
     yield* Console.log(`  ${t.taskId}: "${t.title}" — ${t.status}`)

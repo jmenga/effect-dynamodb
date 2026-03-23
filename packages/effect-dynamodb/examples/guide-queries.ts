@@ -3,7 +3,7 @@
  *
  * Demonstrates the query API as documented in the Queries guide:
  *   - Entity scan via BoundQuery: db.entities.Entity.scan()
- *   - Collection queries via db.collections.Name({...})
+ *   - Entity index queries via db.entities.Entity.indexName({...})
  *   - Post-query filtering (callback and shorthand)
  *   - Pagination: collect, single page (fetch), cursor-based, streaming
  *   - Scan: basic, filtered, limited, consistent read, stream
@@ -20,7 +20,6 @@
 import { Console, Effect, Layer, Schema, Stream } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
-import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -49,7 +48,7 @@ class Task extends Schema.Class<Task>("Task")({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 2. Schema + Entity + Collections + Table
+// 2. Schema + Entity + Table
 // ---------------------------------------------------------------------------
 
 // #region entities
@@ -62,25 +61,19 @@ const TaskEntity = Entity.make({
     pk: { field: "pk", composite: ["taskId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byProject: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["projectId"],
+      sk: ["status", "createdAt"],
+    },
+    byAssignee: {
+      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+      composite: ["assigneeId"],
+      sk: ["status", "createdAt"],
+    },
+  },
   timestamps: true,
-})
-
-const ByProject = Collections.make("byProject", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["projectId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Tasks: Collections.member(TaskEntity, { sk: { composite: ["status", "createdAt"] } }),
-  },
-})
-
-const ByAssignee = Collections.make("byAssignee", {
-  index: "gsi2",
-  pk: { field: "gsi2pk", composite: ["assigneeId"] },
-  sk: { field: "gsi2sk" },
-  members: {
-    Tasks: Collections.member(TaskEntity, { sk: { composite: ["status", "createdAt"] } }),
-  },
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { TaskEntity } })
@@ -94,7 +87,6 @@ const MainTable = Table.make({ schema: AppSchema, entities: { TaskEntity } })
 const program = Effect.gen(function* () {
   const db = yield* DynamoClient.make({
     entities: { TaskEntity },
-    collections: { ByProject, ByAssignee },
   })
   const tasks = db.entities.TaskEntity
 
@@ -195,13 +187,13 @@ const program = Effect.gen(function* () {
   // Primary key lookup (not a query — returns single item)
   const task = yield* tasks.get({ taskId: "t-001" })
 
-  // Named collection queries — on the db.collections gateway
-  const { Tasks: projectTasks } = yield* db.collections
-    .ByProject({ projectId: "proj-alpha" })
-    .collect()
-  const { Tasks: assigneeTasks } = yield* db.collections
-    .ByAssignee({ assigneeId: "emp-alice" })
-    .collect()
+  // Named index queries — via entity index accessors
+  const projectTasks = yield* db.entities.TaskEntity.byProject({
+    projectId: "proj-alpha",
+  }).collect()
+  const assigneeTasks = yield* db.entities.TaskEntity.byAssignee({
+    assigneeId: "emp-alice",
+  }).collect()
   // #endregion
   yield* Console.log(`Got task: "${task.title}" (${task.status})`)
   yield* Console.log(`Project proj-alpha: ${projectTasks.length} tasks`)
@@ -214,8 +206,7 @@ const program = Effect.gen(function* () {
 
   // #region filter-callback
   // Shorthand — AND-equality on multiple fields
-  const { Tasks: highPriActive } = yield* db.collections
-    .ByProject({ projectId: "proj-alpha" })
+  const highPriActive = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
     .filter({ status: "active", priority: "high" })
     .collect()
   // #endregion
@@ -226,8 +217,7 @@ const program = Effect.gen(function* () {
 
   // #region filter-shorthand
   // Shorthand — simple AND-equality
-  const { Tasks: activeShorthand } = yield* db.collections
-    .ByProject({ projectId: "proj-alpha" })
+  const activeShorthand = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
     .filter({ status: "active" })
     .collect()
   // #endregion
@@ -240,33 +230,36 @@ const program = Effect.gen(function* () {
 
   // #region collect-all
   // Collect all items across all pages
-  const { Tasks: allProjectTasks } = yield* db.collections
-    .ByProject({ projectId: "proj-alpha" })
-    .collect()
+  const allProjectTasks = yield* db.entities.TaskEntity.byProject({
+    projectId: "proj-alpha",
+  }).collect()
   // #endregion
   yield* Console.log(`Collect all: ${allProjectTasks.length} tasks in proj-alpha`)
 
   // #region single-page
   // Single page with limit — returns page with items and cursor
-  const page = yield* db.collections.ByProject({ projectId: "proj-alpha" }).limit(3).fetch()
+  const page = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" }).limit(3).fetch()
   // page.items: { Tasks: Task[] } (up to 3 items)
   // page.cursor: string | null (pass to startFrom for next page)
   // #endregion
   yield* Console.log(
-    `Single page (limit 3): ${page.items.Tasks.length} items, cursor: ${page.cursor != null ? "present" : "null"}`,
+    `Single page (limit 3): ${page.items.length} items, cursor: ${page.cursor != null ? "present" : "null"}`,
   )
 
   // #region cursor-pagination
   // Cursor-based pagination
-  const page1 = yield* db.collections.ByProject({ projectId: "proj-alpha" }).limit(3).fetch()
+  const page1 = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+    .limit(3)
+    .fetch()
 
   if (page1.cursor) {
-    const page2 = yield* db.collections
-      .ByProject({ projectId: "proj-alpha" })
+    const page2 = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
       .limit(3)
       .startFrom(page1.cursor)
       .fetch()
-    yield* Console.log(`Cursor pagination: page1=${page1.items.Tasks.length} items, page2=${page2.items.Tasks.length} items`)
+    yield* Console.log(
+      `Cursor pagination: page1=${page1.items.length} items, page2=${page2.items.length} items`,
+    )
   }
   // #endregion
 
@@ -343,8 +336,7 @@ const program = Effect.gen(function* () {
 
   // #region reverse
   // Most recent tasks first (descending sort key order)
-  const { Tasks: recent } = yield* db.collections
-    .ByProject({ projectId: "proj-alpha" })
+  const recent = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
     .reverse()
     .limit(3)
     .collect()

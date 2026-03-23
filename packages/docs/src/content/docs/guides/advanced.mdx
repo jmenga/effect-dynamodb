@@ -238,8 +238,7 @@ Type-safe conditions, filters, and projections using `PathBuilder`:
 Products.condition((t, { eq, gt, and }) => and(eq(t.category, "peripherals"), gt(t.stock, 0)))
 
 // Filter — shorthand applied to collection queries
-const { Products: filtered } = yield* db.collections
-  .ProductsByCategory({ category: "peripherals" })
+const filtered = yield* db.entities.Products.byCategory({ category: "peripherals" })
   .filter({ name: "Widget Pro" })
   .collect()
 

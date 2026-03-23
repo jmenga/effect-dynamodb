@@ -7,7 +7,7 @@
  *   - DynamoSchema for application namespace and key prefixing
  *   - Table.make for physical table declaration
  *   - Entity.make with primaryKey, system fields, and unique constraints
- *   - Collections.make for GSI access patterns
+ *   - Entity-level indexes for GSI access patterns
  *   - Derived types: Model, Record, Input, Update, Key
  *   - Schema accessors for DynamoDB Streams consumption
  *
@@ -21,7 +21,6 @@
 import { Console, Duration, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
-import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
@@ -81,6 +80,19 @@ const Employees = Entity.make({
     pk: { field: "pk", composite: ["employeeId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byTenant: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      type: "clustered",
+      composite: ["tenantId"],
+      sk: ["department", "hireDate"],
+    },
+    byEmail: {
+      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+      composite: ["email"],
+      sk: [],
+    },
+  },
   unique: { email: ["email"] },
   timestamps: true,
   versioned: { retain: true, ttl: Duration.days(90) },
@@ -89,30 +101,11 @@ const Employees = Entity.make({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 5. Collections — GSI access patterns
+// 5. Entity indexes — GSI access patterns (defined on Entity.make above)
 // ---------------------------------------------------------------------------
 
 // #region collections
-const ByTenant = Collections.make("TenantMembers", {
-  index: "gsi1",
-  type: "clustered",
-  pk: { field: "gsi1pk", composite: ["tenantId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Employees: Collections.member(Employees, {
-      sk: { composite: ["department", "hireDate"] },
-    }),
-  },
-})
 
-const ByEmail = Collections.make("byEmail", {
-  index: "gsi2",
-  pk: { field: "gsi2pk", composite: ["email"] },
-  sk: { field: "gsi2sk" },
-  members: {
-    Employees: Collections.member(Employees, { sk: { composite: [] } }),
-  },
-})
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -131,7 +124,6 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Employees } })
 const program = Effect.gen(function* () {
   const db = yield* DynamoClient.make({
     entities: { Employees },
-    collections: { ByTenant, ByEmail },
   })
 
   // --- Setup ---
@@ -169,9 +161,9 @@ const program = Effect.gen(function* () {
   yield* Console.log(`Updated: ${updated.displayName}, dept=${updated.department}`)
 
   // --- Query: employees by tenant via collection ---
-  const { Employees: acmeEmployees } = yield* db.collections
-    .ByTenant({ tenantId: "tenant-acme" as any })
-    .collect()
+  const acmeEmployees = yield* db.entities.Employees.byTenant({
+    tenantId: "tenant-acme" as any,
+  }).collect()
   yield* Console.log(`Acme employees: ${acmeEmployees.length}`)
 
   // --- Cleanup ---

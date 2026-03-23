@@ -19,7 +19,6 @@
 import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
-import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -78,20 +77,18 @@ const Products = Entity.make({
     pk: { field: "pk", composite: ["productId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byCategory: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["category"],
+      sk: ["productId"],
+    },
+  },
   timestamps: true,
   versioned: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Products } })
-
-const ProductsByCategory = Collections.make("productsByCategory", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["category"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Products: Collections.member(Products, { sk: { composite: ["productId"] } }),
-  },
-})
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -101,7 +98,6 @@ const ProductsByCategory = Collections.make("productsByCategory", {
 const program = Effect.gen(function* () {
   const db = yield* DynamoClient.make({
     entities: { Products },
-    collections: { ProductsByCategory },
   })
 
   // --- Setup ---
@@ -244,9 +240,8 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Filter Expressions — Callback API ===\n")
 
   // #region filter-callback
-  // Filter on collection query — shorthand for equality
-  const { Products: activeElectronics } = yield* db.collections
-    .ProductsByCategory({ category: "electronics" })
+  // Filter on entity index query — shorthand for equality
+  const activeElectronics = yield* db.entities.Products.byCategory({ category: "electronics" })
     .filter({ status: "active" })
     .collect()
 
@@ -400,15 +395,14 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Key Condition Expressions ===\n")
 
   // #region key-condition-query
-  // Access via collection query
-  const { Products: byCategory } = yield* db.collections
-    .ProductsByCategory({ category: "electronics" })
-    .collect()
+  // Access via entity index query
+  const byCategory = yield* db.entities.Products.byCategory({ category: "electronics" }).collect()
 
   // Partial SK composites narrow with begins_with automatically
-  const { Products: byCategoryAndId } = yield* db.collections
-    .ProductsByCategory({ category: "electronics", productId: "p-1" })
-    .collect()
+  const byCategoryAndId = yield* db.entities.Products.byCategory({
+    category: "electronics",
+    productId: "p-1",
+  }).collect()
   // #endregion
 
   yield* Console.log(`By category: ${byCategory.length} products`)
@@ -421,14 +415,15 @@ const program = Effect.gen(function* () {
 
   // #region key-condition-where
   // Pass SK composites to narrow with begins_with automatically
-  const { Products: narrowed } = yield* db.collections
-    .ProductsByCategory({ category: "electronics", productId: "p-1" })
-    .collect()
+  const narrowed = yield* db.entities.Products.byCategory({
+    category: "electronics",
+    productId: "p-1",
+  }).collect()
 
   // All products in category (no SK narrowing)
-  const { Products: allInCategory } = yield* db.collections
-    .ProductsByCategory({ category: "electronics" })
-    .collect()
+  const allInCategory = yield* db.entities.Products.byCategory({
+    category: "electronics",
+  }).collect()
   // #endregion
 
   yield* Console.log(`Narrowed (productId p-1): ${narrowed.length} products`)

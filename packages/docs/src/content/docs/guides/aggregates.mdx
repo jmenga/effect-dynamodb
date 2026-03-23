@@ -65,6 +65,13 @@ const SquadSelections = Entity.make({
     pk: { field: "pk", composite: ["squadId"] },
     sk: { field: "sk", composite: ["selectionNumber"] },
   },
+  indexes: {
+    byPlayer: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["playerId"],
+      sk: ["squadId", "selectionNumber"],
+    },
+  },
   refs: {
     team: { entity: Teams },
     player: { entity: Players },

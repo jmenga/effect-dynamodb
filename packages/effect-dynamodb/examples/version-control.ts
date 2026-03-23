@@ -23,7 +23,6 @@
  */
 
 import { Console, Effect, Layer, Schema } from "effect"
-import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -95,6 +94,14 @@ const Users = Entity.make({
     pk: { field: "pk", composite: ["username"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    owned: {
+      collection: "owned",
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["username"],
+      sk: [],
+    },
+  },
   timestamps: true,
 })
 // #endregion
@@ -106,6 +113,20 @@ const Repositories = Entity.make({
   primaryKey: {
     pk: { field: "pk", composite: ["repoOwner"] },
     sk: { field: "sk", composite: ["repoName"] },
+  },
+  indexes: {
+    owned: {
+      collection: "owned",
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["username"],
+      sk: ["repoName"],
+    },
+    activity: {
+      collection: "activity",
+      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+      composite: ["repoOwner", "repoName"],
+      sk: [],
+    },
   },
   timestamps: true,
 })
@@ -119,6 +140,20 @@ const Issues = Entity.make({
     pk: { field: "pk", composite: ["repoOwner", "repoName"] },
     sk: { field: "sk", composite: ["issueNumber"] },
   },
+  indexes: {
+    managed: {
+      collection: "managed",
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["username"],
+      sk: ["status", "issueNumber"],
+    },
+    activity: {
+      collection: "activity",
+      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+      composite: ["repoOwner", "repoName"],
+      sk: ["status", "issueNumber"],
+    },
+  },
   timestamps: true,
 })
 // #endregion
@@ -130,6 +165,20 @@ const PullRequests = Entity.make({
   primaryKey: {
     pk: { field: "pk", composite: ["repoOwner", "repoName"] },
     sk: { field: "sk", composite: ["pullRequestNumber"] },
+  },
+  indexes: {
+    managed: {
+      collection: "managed",
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["username"],
+      sk: ["status", "pullRequestNumber"],
+    },
+    activity: {
+      collection: "activity",
+      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+      composite: ["repoOwner", "repoName"],
+      sk: ["status", "pullRequestNumber"],
+    },
   },
   timestamps: true,
 })
@@ -147,40 +196,9 @@ const VcsTable = Table.make({
 // #endregion
 
 // #region collections
-const Owned = Collections.make("owned", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["username"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Users: Collections.member(Users, { sk: { composite: [] } }),
-    Repositories: Collections.member(Repositories, { sk: { composite: ["repoName"] } }),
-  },
-})
-
-const Managed = Collections.make("managed", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["username"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Issues: Collections.member(Issues, { sk: { composite: ["status", "issueNumber"] } }),
-    PullRequests: Collections.member(PullRequests, {
-      sk: { composite: ["status", "pullRequestNumber"] },
-    }),
-  },
-})
-
-const Activity = Collections.make("activity", {
-  index: "gsi2",
-  pk: { field: "gsi2pk", composite: ["repoOwner", "repoName"] },
-  sk: { field: "gsi2sk" },
-  members: {
-    Repositories: Collections.member(Repositories, { sk: { composite: [] } }),
-    Issues: Collections.member(Issues, { sk: { composite: ["status", "issueNumber"] } }),
-    PullRequests: Collections.member(PullRequests, {
-      sk: { composite: ["status", "pullRequestNumber"] },
-    }),
-  },
-})
+// GSI access patterns are now defined as entity-level indexes above.
+// Multi-entity collections (owned, managed, activity) are auto-discovered
+// from matching collection names across entities.
 // #endregion
 
 // =============================================================================
@@ -296,7 +314,6 @@ const program = Effect.gen(function* () {
   // Typed execution gateway — binds all entities and collections
   const db = yield* DynamoClient.make({
     entities: { Users, Repositories, Issues, PullRequests },
-    collections: { Owned, Managed, Activity },
   })
 
   // --- Setup: create table ---
@@ -361,19 +378,19 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 3: User's Owned Repos (gsi1 collection)")
 
   // #region pattern-3
-  const { Repositories: octocatRepos } = yield* db.collections
-    .Owned({ username: "octocat" })
-    .collect()
+  const { Repositories: octocatRepos } = yield* db.collections.Owned!({
+    username: "octocat",
+  }).collect()
   assertEq(octocatRepos.length, 1, "octocat has 1 repo")
   assertEq(octocatRepos[0]!.repoName, "hello-world", "octocat repo name")
 
-  const { Repositories: torvaldsRepos } = yield* db.collections
-    .Owned({ username: "torvalds" })
-    .collect()
+  const { Repositories: torvaldsRepos } = yield* db.collections.Owned!({
+    username: "torvalds",
+  }).collect()
   assertEq(torvaldsRepos.length, 1, "torvalds has 1 repo")
   assertEq(torvaldsRepos[0]!.repoName, "linux", "torvalds repo name")
 
-  const { Users: octocatProfile } = yield* db.collections.Owned({ username: "octocat" }).collect()
+  const { Users: octocatProfile } = yield* db.collections.Owned!({ username: "octocat" }).collect()
   assertEq(octocatProfile.length, 1, "owned collection returns 1 user")
   assertEq(octocatProfile[0]!.fullName, "The Octocat", "owned user fullName")
   // #endregion
@@ -439,28 +456,30 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 6: User's Managed Items (gsi1 collection)")
 
   // #region pattern-6
-  const { Issues: torvaldsIssues } = yield* db.collections
-    .Managed({ username: "torvalds" })
-    .collect()
+  const { Issues: torvaldsIssues } = yield* db.collections.Managed!({
+    username: "torvalds",
+  }).collect()
 
-  const { PullRequests: torvaldsPRs } = yield* db.collections
-    .Managed({ username: "torvalds" })
-    .collect()
+  const { PullRequests: torvaldsPRs } = yield* db.collections.Managed!({
+    username: "torvalds",
+  }).collect()
 
-  const { Issues: octocatIssues } = yield* db.collections.Managed({ username: "octocat" }).collect()
+  const { Issues: octocatIssues } = yield* db.collections.Managed!({
+    username: "octocat",
+  }).collect()
 
-  const { PullRequests: octocatPRs } = yield* db.collections
-    .Managed({ username: "octocat" })
-    .collect()
+  const { PullRequests: octocatPRs } = yield* db.collections.Managed!({
+    username: "octocat",
+  }).collect()
   // #endregion
   assertEq(torvaldsIssues.length, 2, "torvalds has 2 issues")
-  const torvaldsIssueSubjects = torvaldsIssues.map((i) => i.subject).sort()
+  const torvaldsIssueSubjects = torvaldsIssues.map((i: any) => i.subject).sort()
   assert(
-    torvaldsIssueSubjects.some((s) => s.includes("README has typo")),
+    torvaldsIssueSubjects.some((s: any) => s.includes("README has typo")),
     "torvalds has typo issue",
   )
   assert(
-    torvaldsIssueSubjects.some((s) => s.includes("CI pipeline")),
+    torvaldsIssueSubjects.some((s: any) => s.includes("CI pipeline")),
     "torvalds has CI issue",
   )
   assertEq(torvaldsPRs.length, 1, "torvalds has 1 PR")
@@ -475,37 +494,42 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 7: Repository Activity (gsi2 collection)")
 
   // #region pattern-7
-  const { Issues: hwIssues } = yield* db.collections
-    .Activity({ repoOwner: "octocat", repoName: "hello-world" })
-    .collect()
+  const { Issues: hwIssues } = yield* db.collections.Activity!({
+    repoOwner: "octocat",
+    repoName: "hello-world",
+  }).collect()
 
-  const hwOpenIssues = hwIssues.filter((i) => i.status === "Open")
+  const hwOpenIssues = hwIssues.filter((i: any) => i.status === "Open")
 
-  const { PullRequests: hwPRs } = yield* db.collections
-    .Activity({ repoOwner: "octocat", repoName: "hello-world" })
-    .collect()
+  const { PullRequests: hwPRs } = yield* db.collections.Activity!({
+    repoOwner: "octocat",
+    repoName: "hello-world",
+  }).collect()
 
-  const { Issues: linuxIssues } = yield* db.collections
-    .Activity({ repoOwner: "torvalds", repoName: "linux" })
-    .collect()
+  const { Issues: linuxIssues } = yield* db.collections.Activity!({
+    repoOwner: "torvalds",
+    repoName: "linux",
+  }).collect()
 
-  const { PullRequests: linuxPRs } = yield* db.collections
-    .Activity({ repoOwner: "torvalds", repoName: "linux" })
-    .collect()
+  const { PullRequests: linuxPRs } = yield* db.collections.Activity!({
+    repoOwner: "torvalds",
+    repoName: "linux",
+  }).collect()
 
-  const { Repositories: hwRepoActivity } = yield* db.collections
-    .Activity({ repoOwner: "octocat", repoName: "hello-world" })
-    .collect()
+  const { Repositories: hwRepoActivity } = yield* db.collections.Activity!({
+    repoOwner: "octocat",
+    repoName: "hello-world",
+  }).collect()
   // #endregion
   assertEq(hwIssues.length, 3, "hello-world has 3 issues")
   assertEq(hwOpenIssues.length, 1, "hello-world has 1 open issue")
   assertEq(hwOpenIssues[0]!.issueNumber, "1", "open issue is #1")
-  const hwClosedIssues = hwIssues.filter((i) => i.status === "Closed")
+  const hwClosedIssues = hwIssues.filter((i: any) => i.status === "Closed")
   assertEq(hwClosedIssues.length, 2, "hello-world has 2 closed issues")
   assertEq(hwPRs.length, 2, "hello-world has 2 PRs")
-  const hwOpenPRs = hwPRs.filter((pr) => pr.status === "Open")
+  const hwOpenPRs = hwPRs.filter((pr: any) => pr.status === "Open")
   assertEq(hwOpenPRs.length, 1, "hello-world has 1 open PR")
-  const hwClosedPRs = hwPRs.filter((pr) => pr.status === "Closed")
+  const hwClosedPRs = hwPRs.filter((pr: any) => pr.status === "Closed")
   assertEq(hwClosedPRs.length, 1, "hello-world has 1 closed PR")
   assertEq(linuxIssues.length, 1, "linux has 1 issue")
   assertEq(linuxIssues[0]!.status, "Open", "linux issue is Open")
@@ -543,13 +567,15 @@ const program = Effect.gen(function* () {
   ])
 
   // Both created atomically — verify via activity collection
-  const { Issues: linuxIssuesAfter } = yield* db.collections
-    .Activity({ repoOwner: "torvalds", repoName: "linux" })
-    .collect()
+  const { Issues: linuxIssuesAfter } = yield* db.collections.Activity!({
+    repoOwner: "torvalds",
+    repoName: "linux",
+  }).collect()
 
-  const { PullRequests: linuxPRsAfter } = yield* db.collections
-    .Activity({ repoOwner: "torvalds", repoName: "linux" })
-    .collect()
+  const { PullRequests: linuxPRsAfter } = yield* db.collections.Activity!({
+    repoOwner: "torvalds",
+    repoName: "linux",
+  }).collect()
   // #endregion
 
   const txIssue = yield* db.entities.Issues.get({

@@ -20,7 +20,6 @@ import { Console, Effect, Layer, Schema } from "effect"
 // Import from geo package source (use "@effect-dynamodb/geo" when published)
 import { GeoIndex, H3 } from "../../effect-dynamodb-geo/src/index.js"
 // Import from source (use "effect-dynamodb" when published)
-import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -56,19 +55,17 @@ const Vehicles = Entity.make({
     pk: { field: "pk", composite: ["vehicleId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    vehiclesByCell: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["parentCell", "timePartition"],
+      sk: ["cell"],
+    },
+  },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Vehicles } })
-
-const VehiclesByCell = Collections.make("vehiclesByCell", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["parentCell", "timePartition"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Vehicles: Collections.member(Vehicles, { sk: { composite: ["cell"] } }),
-  },
-})
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -102,7 +99,6 @@ const VehicleGeo = GeoIndex.make({
 const program = Effect.gen(function* () {
   const db = yield* DynamoClient.make({
     entities: { Vehicles },
-    collections: { VehiclesByCell },
   })
 
   yield* Console.log("=== Setup ===\n")

@@ -49,18 +49,17 @@ const Products = Entity.make({
     pk: { field: "pk", composite: ["productId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byCategory: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["category"],
+      sk: ["productId"],
+    },
+  },
   timestamps: true,
   versioned: true,
 })
 const MainTable = Table.make({ schema: AppSchema, entities: { Products } })
-const ProductsByCategory = Collections.make("productsByCategory", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["category"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Products: Collections.member(Products, { sk: { composite: ["productId"] } }),
-  },
-})
 ```
 
 `versioned: true` enables optimistic locking -- every write increments a `version` counter, and `expectedVersion()` can enforce it.
@@ -213,10 +212,8 @@ Filter expressions narrow query and scan results. They are applied server-side a
 `Products.filter()` uses the same callback + shorthand API as `Products.condition()`, applied as a combinator on queries and scans:
 
 ```typescript region="filters" example="expressions.ts"
-// All electronics via collection query
-const { Products: electronics } = yield* db.collections
-  .ProductsByCategory({ category: "electronics" })
-  .collect()
+// All electronics via entity index query
+const electronics = yield* db.entities.Products.byCategory({ category: "electronics" }).collect()
 // Greater-than filter on scan
 const expensive = yield* db.entities.Products.scan()
   .filter((t, { gt }) => gt(t.price, 30))

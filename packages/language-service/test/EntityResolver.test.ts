@@ -242,13 +242,12 @@ describe("EntityResolver", () => {
   describe("resolveCollections", () => {
     it("should resolve a basic collection", () => {
       const source = `
-        const Assignments = Collections.make("assignments", {
-          index: "gsi3",
-          pk: { field: "gsi3pk", composite: ["employee"] },
-          sk: { field: "gsi3sk" },
+        const Assignments = Collections.make({ name: "assignments",
+          index: { name: "gsi3", pk: "gsi3pk", sk: "gsi3sk" },
+          composite: ["employee"],
           members: {
-            Employees: Collections.member(Employees, { sk: { composite: [] } }),
-            Tasks: Collections.member(Tasks, { sk: { composite: ["project", "task"] } }),
+            Employees: Collections.member(Employees, []),
+            Tasks: Collections.member(Tasks, ["project", "task"]),
           },
         })
       `
@@ -278,13 +277,12 @@ describe("EntityResolver", () => {
 
     it("should resolve isolated collection type", () => {
       const source = `
-        const ManagerView = Collections.make("managerView", {
+        const ManagerView = Collections.make({ name: "managerView",
           type: "isolated",
-          index: "gsi2",
-          pk: { field: "gsi2pk", composite: ["manager"] },
-          sk: { field: "gsi2sk" },
+          index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+          composite: ["manager"],
           members: {
-            Employees: Collections.member(Employees, { sk: { composite: [] } }),
+            Employees: Collections.member(Employees, []),
           },
         })
       `
@@ -297,12 +295,11 @@ describe("EntityResolver", () => {
 
     it("should resolve single-member collection", () => {
       const source = `
-        const TasksByProject = Collections.make("tasksByProject", {
-          index: "gsi1",
-          pk: { field: "gsi1pk", composite: ["project"] },
-          sk: { field: "gsi1sk" },
+        const TasksByProject = Collections.make({ name: "tasksByProject",
+          index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+          composite: ["project"],
           members: {
-            Tasks: Collections.member(Tasks, { sk: { composite: ["employee", "task"] } }),
+            Tasks: Collections.member(Tasks, ["employee", "task"]),
           },
         })
       `

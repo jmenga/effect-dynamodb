@@ -67,6 +67,13 @@ const Users = Entity.make({
     pk: { field: "pk", composite: ["userId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byRole: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["role"],
+      sk: ["userId"],
+    },
+  },
   timestamps: true,
   versioned: { retain: true },
 })
@@ -78,6 +85,13 @@ const Tasks = Entity.make({
     pk: { field: "pk", composite: ["taskId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byUser: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["userId"],
+      sk: ["status", "taskId"],
+    },
+  },
   timestamps: true,
   versioned: true,
   softDelete: true,
@@ -86,24 +100,6 @@ const Tasks = Entity.make({
 const MainTable = Table.make({
   schema: AppSchema,
   entities: { Users, Tasks },
-})
-
-const UsersByRole = Collections.make("usersByRole", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["role"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Users: Collections.member(Users, { sk: { composite: ["userId"] } }),
-  },
-})
-
-const TasksByUser = Collections.make("tasksByUser", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["userId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Tasks: Collections.member(Tasks, { sk: { composite: ["status", "taskId"] } }),
-  },
 })
 ```
 
@@ -123,7 +119,6 @@ Before calling any entity operations, obtain a typed client via `DynamoClient.ma
 // Typed execution gateway — binds all entities and collections
 const db = yield* DynamoClient.make({
   entities: { Users, Tasks, Projects, Employees },
-  collections: { UsersByRole, TasksByUser, ProjectsByOwner, EmployeesByTenant },
 })
 ```
 
@@ -249,8 +244,9 @@ Bound entity methods return `Effect` directly, so you can pipe to Effect combina
 Query a collection by providing the partition key composites. Use `.collect()` to gather all results as a grouped object:
 
 ```typescript region="query" example="crud.ts"
-const { Tasks: aliceTasks } = yield* db.collections.TasksByUser({ userId: "u-alice" }).collect()
-const { Users: admins } = yield* db.collections.UsersByRole({ role: "admin" }).collect()
+const aliceTasks = yield* db.entities.Tasks.byUser({ userId: "u-alice" }).collect()
+
+const admins = yield* db.entities.Users.byRole({ role: "admin" }).collect()
 ```
 
 ### Query Combinators
@@ -259,14 +255,10 @@ Compose query behavior with fluent combinators:
 
 ```typescript region="query-combinators" example="crud.ts"
 // Reverse sort order
-const { Tasks: reversedTasks } = yield* db.collections
-  .TasksByUser({ userId: "u-alice" })
-  .reverse()
-  .collect()
+const reversedTasks = yield* db.entities.Tasks.byUser({ userId: "u-alice" }).reverse().collect()
 
 // Filter expression (post-read filter)
-const { Tasks: todoTasks } = yield* db.collections
-  .TasksByUser({ userId: "u-alice" })
+const todoTasks = yield* db.entities.Tasks.byUser({ userId: "u-alice" })
   .filter({ status: "todo" })
   .collect()
 ```
@@ -338,16 +330,14 @@ const Projects = Entity.make({
     pk: { field: "pk", composite: ["projectId"] },
     sk: { field: "sk", composite: [] },
   },
-  timestamps: true,
-})
-
-const ProjectsByOwner = Collections.make("projectsByOwner", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["ownerId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Projects: Collections.member(Projects, { sk: { composite: ["department"] } }),
+  indexes: {
+    byOwner: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["ownerId"],
+      sk: ["department"],
+    },
   },
+  timestamps: true,
 })
 ```
 
@@ -370,9 +360,7 @@ const unassigned = yield* db.entities.Projects.put({
 })
 
 // Query only returns assigned projects
-const { Projects: ownerProjects } = yield* db.collections
-  .ProjectsByOwner({ ownerId: "u-alice" })
-  .collect()
+const ownerProjects = yield* db.entities.Projects.byOwner({ ownerId: "u-alice" }).collect()
 // → [{ projectId: "p-1", name: "Alpha" }]
 // "Beta" is absent — sparse index at work
 ```
@@ -456,9 +444,7 @@ For entities with `softDelete: true`, `Entity.delete` archives the item instead 
 yield* db.entities.Tasks.delete({ taskId: "t-1" })
 
 // No longer in collection queries
-const { Tasks: aliceTasksAfterDelete } = yield* db.collections
-  .TasksByUser({ userId: "u-alice" })
-  .collect()
+const aliceTasksAfterDelete = yield* db.entities.Tasks.byUser({ userId: "u-alice" }).collect()
 // t-1 is absent
 
 // But retrievable via deleted.get
@@ -476,9 +462,7 @@ const restored = yield* db.entities.Tasks.restore({ taskId: "t-1" })
 // restored.status → "done"
 
 // Back in collection queries
-const { Tasks: aliceTasksAfterRestore } = yield* db.collections
-  .TasksByUser({ userId: "u-alice" })
-  .collect()
+const aliceTasksAfterRestore = yield* db.entities.Tasks.byUser({ userId: "u-alice" }).collect()
 // t-1 is back
 ```
 

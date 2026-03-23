@@ -2,7 +2,7 @@
  * Collections — Explicit GSI access pattern definitions.
  *
  * `Collections.make()` defines ALL GSI-based access patterns. A collection owns
- * the index definition (GSI name, PK field, PK composites, SK field) and each
+ * the index definition (GSI name, PK/SK fields), shared PK composites, and each
  * member entity specifies only its own SK composites.
  *
  * A collection can have one member (entity-specific access pattern) or multiple
@@ -35,26 +35,26 @@ export interface CollectionEntityLike {
 // CollectionMember — entity + its SK composites within a collection
 // ---------------------------------------------------------------------------
 
-/** A member binding within a collection: entity reference + SK composite config. */
+/** A member binding within a collection: entity reference + SK composite attributes. */
 export interface CollectionMember<E extends CollectionEntityLike = CollectionEntityLike> {
   readonly _tag: "CollectionMember"
   readonly entity: E
-  readonly sk: { readonly composite: ReadonlyArray<string> }
+  readonly sk: ReadonlyArray<string>
 }
 
 /**
- * Bind an entity to a collection with its SK composites.
+ * Bind an entity to a collection with its SK composite attributes.
  *
  * @param entity - The entity to bind
- * @param config - SK composite configuration for this entity within the collection
+ * @param sk - SK composite attribute names for this entity within the collection
  */
 export const member = <E extends CollectionEntityLike>(
   entity: E,
-  config: { readonly sk: { readonly composite: ReadonlyArray<string> } },
+  sk: ReadonlyArray<string>,
 ): CollectionMember<E> => ({
   _tag: "CollectionMember" as const,
   entity,
-  sk: config.sk,
+  sk,
 })
 
 // ---------------------------------------------------------------------------
@@ -64,14 +64,27 @@ export const member = <E extends CollectionEntityLike>(
 /** Collection type (clustered or isolated). */
 export type CollectionType = "clustered" | "isolated"
 
-/** Collection configuration passed to `Collections.make()`. */
-export interface CollectionConfig<TMembers extends Record<string, CollectionMember>> {
+/** GSI index definition for a collection. */
+export interface CollectionIndex {
   /** Physical GSI name (e.g., `"gsi3"`). */
-  readonly index: string
-  /** Partition key field and composite attributes (shared by all members). */
-  readonly pk: KeyPart
-  /** Sort key field (shared by all members). */
-  readonly sk: { readonly field: string }
+  readonly name: string
+  /** PK field name (e.g., `"gsi3pk"`). */
+  readonly pk: string
+  /** SK field name (e.g., `"gsi3sk"`). */
+  readonly sk: string
+}
+
+/** Collection configuration passed to `Collections.make()`. */
+export interface CollectionConfig<
+  TName extends string,
+  TMembers extends Record<string, CollectionMember>,
+> {
+  /** Collection name — used as SK prefix in clustered mode. Changing this breaks existing data. */
+  readonly name: TName
+  /** Physical GSI definition: index name + PK/SK field names. */
+  readonly index: CollectionIndex
+  /** Shared PK composite attributes (e.g., `["employee"]`). */
+  readonly composite: ReadonlyArray<string>
   /** Collection type: `"clustered"` (default) or `"isolated"`. */
   readonly type?: CollectionType
   /** Named record mapping member names to `Collections.member()` declarations. */
@@ -88,9 +101,8 @@ export interface Collection<
 > {
   readonly _tag: "Collection"
   readonly name: TName
-  readonly index: string
-  readonly pk: KeyPart
-  readonly sk: { readonly field: string }
+  readonly index: CollectionIndex
+  readonly composite: ReadonlyArray<string>
   readonly type: CollectionType
   readonly members: TMembers
 }
@@ -118,9 +130,9 @@ type ModelFields<M extends Schema.Top> = M extends { readonly fields: infer F } 
 /** Pick composite fields from the model, making them required. */
 export type CollectionPkInput<
   TMembers extends Record<string, CollectionMember>,
-  TPk extends KeyPart,
+  TComposite extends ReadonlyArray<string>,
 > = {
-  readonly [K in TPk["composite"][number]]: PickFieldType<FirstMemberModel<TMembers>, K>
+  readonly [K in TComposite[number]]: PickFieldType<FirstMemberModel<TMembers>, K>
 }
 
 /** Get the first member's model type (for PK composite type inference). */
@@ -138,19 +150,18 @@ type PickFieldType<M extends Schema.Top, K extends string> =
 /**
  * Create a Collection definition with explicit GSI access pattern.
  *
- * @param name - Collection name (used as SK prefix in clustered mode)
- * @param config - Index configuration + member declarations
+ * @param config - Collection configuration
  * @returns A Collection definition carrying typed member info
  *
  * @example
  * ```ts
- * const Assignments = Collections.make("assignments", {
- *   index: "gsi3",
- *   pk: { field: "gsi3pk", composite: ["employee"] },
- *   sk: { field: "gsi3sk" },
+ * const assignments = Collections.make({
+ *   name: "assignments",
+ *   index: { name: "gsi3", pk: "gsi3pk", sk: "gsi3sk" },
+ *   composite: ["employee"],
  *   members: {
- *     Employees: Collections.member(Employees, { sk: { composite: [] } }),
- *     Tasks: Collections.member(Tasks, { sk: { composite: ["project", "task"] } }),
+ *     Employees: Collections.member(Employees, []),
+ *     Tasks: Collections.member(Tasks, ["project", "task"]),
  *   },
  * })
  * ```
@@ -159,8 +170,7 @@ export const make = <
   const TName extends string,
   const TMembers extends Record<string, CollectionMember>,
 >(
-  name: TName,
-  config: CollectionConfig<TMembers>,
+  config: CollectionConfig<TName, TMembers>,
 ): Collection<TName, TMembers> => {
   const memberEntries = Object.entries(config.members)
   const collectionType = config.type ?? "clustered"
@@ -169,7 +179,7 @@ export const make = <
 
   // At least one member
   if (memberEntries.length === 0) {
-    throw new Error(`Collection '${name}' requires at least 1 member`)
+    throw new Error(`Collection '${config.name}' requires at least 1 member`)
   }
 
   // No duplicate entity types
@@ -177,26 +187,26 @@ export const make = <
   for (const [memberName, m] of memberEntries) {
     if (entityTypes.has(m.entity.entityType)) {
       throw new Error(
-        `Entity type '${m.entity.entityType}' appears in multiple members of collection '${name}'`,
+        `Entity type '${m.entity.entityType}' appears in multiple members of collection '${config.name}' (member '${memberName}')`,
       )
     }
     entityTypes.add(m.entity.entityType)
 
     // Validate PK composites exist on entity model
     const fields = getModelFieldNames(m.entity.model)
-    for (const attr of config.pk.composite) {
+    for (const attr of config.composite) {
       if (!fields.has(attr)) {
         throw new Error(
-          `Attribute '${attr}' not found on ${m.entity.entityType} model (collection '${name}', member '${memberName}')`,
+          `Attribute '${attr}' not found on ${m.entity.entityType} model (collection '${config.name}', member '${memberName}')`,
         )
       }
     }
 
     // Validate SK composites exist on entity model
-    for (const attr of m.sk.composite) {
+    for (const attr of m.sk) {
       if (!fields.has(attr)) {
         throw new Error(
-          `Attribute '${attr}' not found on ${m.entity.entityType} model (collection '${name}', member '${memberName}')`,
+          `Attribute '${attr}' not found on ${m.entity.entityType} model (collection '${config.name}', member '${memberName}')`,
         )
       }
     }
@@ -204,10 +214,9 @@ export const make = <
 
   return {
     _tag: "Collection" as const,
-    name,
+    name: config.name,
     index: config.index,
-    pk: config.pk,
-    sk: config.sk,
+    composite: config.composite,
     type: collectionType,
     members: config.members,
   }
@@ -225,16 +234,15 @@ export const make = <
  */
 export const buildMemberIndexDef = (
   collection: Collection,
-  _memberKey: string,
   m: CollectionMember,
 ): IndexDefinition => ({
-  index: collection.index,
+  index: collection.index.name,
   collection: collection.name,
   type: collection.type,
-  pk: collection.pk,
+  pk: { field: collection.index.pk, composite: [...collection.composite] },
   sk: {
-    field: collection.sk.field,
-    composite: [...m.sk.composite],
+    field: collection.index.sk,
+    composite: [...m.sk],
   },
 })
 

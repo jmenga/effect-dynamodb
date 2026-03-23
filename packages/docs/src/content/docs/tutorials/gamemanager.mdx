@@ -256,20 +256,9 @@ const MainTable = Table.make({
   schema: CricketSchema,
   entities: { Teams, Players, Coaches, Venues, SquadSelections },
 })
-
-const SquadsByPlayer = Collections.make("squadsByPlayer", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["playerId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    SquadSelections: Collections.member(SquadSelections, {
-      sk: { composite: ["squadId", "selectionNumber"] },
-    }),
-  },
-})
 ```
 
-> **Concept: Single-table design** — All entities share one DynamoDB table. The schema's `name` and `version` become part of every key prefix (`$cricket#v1#...`), preventing collisions between entity types. `Table.make` registers entities up front — you'll add more to the `entities` record as you create them throughout this tutorial.
+> **Concept: Single-table design** — All entities share one DynamoDB table. The schema's `name` and `version` become part of every key prefix (`$cricket#v1#...`), preventing collisions between entity types. `Table.make(...)` registers entities up front — you'll add more to the `entities` record as you create them throughout this tutorial.
 
 > **Note:** Entity files don't import the table. Entities are pure definitions. The dependency flows the other way: `Schema.ts` imports entities and registers them on the table. In the service layer, `DynamoClient.make(MainTable)` binds all registered entities and returns a typed client where every operation has `R = never`.
 
@@ -1411,7 +1400,7 @@ export const CricketSchema = DynamoSchema.make({ name: "cricketapp", version: 1 
 export const MainTable = Table.make({ schema: CricketSchema, entities: { Teams, Players, Coaches, Umpires, Venues } })
 ```
 
-> **Growing the table** — Each time you add entities, register them in the `entities` record on `Table.make`. `DynamoClient.make(MainTable)` will then return a typed client that includes all registered entities.
+> **Growing the table** — Each time you add entities, register them in the `entities` record on `Table.make(...)`. `DynamoClient.make(MainTable)` will then return a typed client that includes all registered entities.
 
 Update `Api.ts` to add all groups:
 
@@ -1762,6 +1751,13 @@ const SquadSelections = Entity.make({
   primaryKey: {
     pk: { field: "pk", composite: ["squadId"] },
     sk: { field: "sk", composite: ["selectionNumber"] },
+  },
+  indexes: {
+    byPlayer: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["playerId"],
+      sk: ["squadId", "selectionNumber"],
+    },
   },
   refs: {
     team: { entity: Teams },
@@ -2460,7 +2456,7 @@ export const MainTable = Table.make({
 })
 ```
 
-> **Aggregates on the table** — Like entities, aggregates are registered on `Table.make` and bound via `DynamoClient.make(MainTable)`. The typed client includes both bound entities and bound aggregates — all with `R = never`.
+> **Aggregates on the table** — Like entities, aggregates are registered on `Table.make(...)` and bound via `DynamoClient.make(MainTable)`. The typed client includes both bound entities and bound aggregates — all with `R = never`.
 
 Update `Api.ts`:
 

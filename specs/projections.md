@@ -272,13 +272,13 @@ const partial = yield* tasks.get(
 ```typescript
 // Without select
 const results = yield* tasks.collect(
-  Tasks.byProject({ projectId: "proj-alpha" }),
+  Tasks.query.byProject({ projectId: "proj-alpha" }),
 )
 // results: Array<Task>
 
 // With select
 const results = yield* tasks.collect(
-  Tasks.byProject({ projectId: "proj-alpha" }),
+  Tasks.query.byProject({ projectId: "proj-alpha" }),
   Tasks.select((t) => [t.title, t.priority, t.address.city]),
   Query.limit(25),
 )
@@ -303,7 +303,7 @@ const stream = tasks.scanPaginate(
 
 ```typescript
 const stream = tasks.paginate(
-  Tasks.byProject({ projectId: "proj-alpha" }),
+  Tasks.query.byProject({ projectId: "proj-alpha" }),
   Tasks.select((t) => [t.title, t.status]),
 )
 // stream: Stream<{ title: string; status: string }>
@@ -312,7 +312,7 @@ const stream = tasks.paginate(
 ### 5.5 On Single-Page Query Execution
 
 ```typescript
-const page = yield* Tasks.byProject({ projectId: "proj-alpha" }).pipe(
+const page = yield* Tasks.query.byProject({ projectId: "proj-alpha" }).pipe(
   Tasks.select((t) => [t.title, t.status]),
   Query.limit(25),
   Query.execute,
@@ -337,7 +337,7 @@ const partial = yield* tasks.get(
 
 ```typescript
 yield* tasks.collect(
-  Tasks.byProject({ projectId: "proj-alpha" }),
+  Tasks.query.byProject({ projectId: "proj-alpha" }),
   Tasks.filter((t, { eq }) => eq(t.status, "active")),
   Tasks.select((t) => [t.title, t.priority]),
   Query.limit(25),
@@ -353,7 +353,7 @@ Note: `Tasks.filter()` can reference attributes not in the `select` projection â
 
 ```typescript
 yield* tasks.collect(
-  Tasks.byProject(
+  Tasks.query.byProject(
     { projectId: "proj-alpha", status: "active" },
     (sk, { gte }) => gte(sk.createdAt, "2024-03-01"),
   ),
@@ -379,7 +379,7 @@ Projection is the last step â€” conditions, filters, and SK conditions can refer
 
 ```typescript
 yield* tasks.collect(
-  Tasks.byProject({ projectId: "proj-alpha" }),
+  Tasks.query.byProject({ projectId: "proj-alpha" }),
   Tasks.filter((t, { eq }) => eq(t.status, "active")),      // status not in select
   Tasks.select((t) => [t.title]),                             // only title projected
 )
@@ -572,7 +572,7 @@ const program = Effect.gen(function* () {
 
   // --- Query with projection + filter ---
   const directory = yield* employees.collect(
-    Employees.byDepartment({ department: "engineering" }),
+    Employees.query.byDepartment({ department: "engineering" }),
     Employees.filter((t, { gte }) => gte(t.salary, 100000)),
     Employees.select((t) => [t.name, t.title, t.email]),
   )
@@ -580,7 +580,7 @@ const program = Effect.gen(function* () {
 
   // --- Query with projection + SK condition ---
   const specific = yield* employees.collect(
-    Employees.byDepartment(
+    Employees.query.byDepartment(
       { department: "engineering" },
       (sk, { gte }) => gte(sk.employeeId, "e-100"),
     ),
@@ -597,7 +597,7 @@ const program = Effect.gen(function* () {
 
   // --- Paginate with projection ---
   const stream = employees.paginate(
-    Employees.byDepartment({ department: "engineering" }),
+    Employees.query.byDepartment({ department: "engineering" }),
     Employees.select((t) => [t.name, t.email]),
   )
   // stream: Stream<{ name: string; email: string }>

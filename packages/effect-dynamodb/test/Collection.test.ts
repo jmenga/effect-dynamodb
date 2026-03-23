@@ -31,17 +31,16 @@ class Order extends Schema.Class<Order>("Order")({
 const UserEntity = Entity.make({
   model: User,
   entityType: "User",
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
     byTenant: {
-      index: "gsi1",
       collection: "TenantItems",
-      type: "clustered",
-      pk: { field: "gsi1pk", composite: ["tenantId"] },
-      sk: { field: "gsi1sk", composite: [] },
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["tenantId"],
+      sk: [],
     },
   },
 })
@@ -49,17 +48,16 @@ const UserEntity = Entity.make({
 const OrderEntity = Entity.make({
   model: Order,
   entityType: "Order",
+  primaryKey: {
+    pk: { field: "pk", composite: ["orderId"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["orderId"] },
-      sk: { field: "sk", composite: [] },
-    },
     byTenant: {
-      index: "gsi1",
       collection: "TenantItems",
-      type: "clustered",
-      pk: { field: "gsi1pk", composite: ["tenantId"] },
-      sk: { field: "gsi1sk", composite: [] },
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["tenantId"],
+      sk: [],
     },
   },
 })
@@ -141,11 +139,9 @@ describe("Collection", () => {
       const UnlinkedEntity = Entity.make({
         model: User,
         entityType: "Unlinked",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
         },
       })
       UnlinkedEntity._configure(AppSchema, MainTable.Tag)
@@ -312,36 +308,30 @@ describe("Collection", () => {
   // Isolated vs Clustered modes
   // -------------------------------------------------------------------------
 
-  describe("clustered mode", () => {
-    it("collection query includes begins_with SK condition", () => {
+  describe("isolated mode (entity-level indexes default to isolated)", () => {
+    it("collection query uses PK-only (no SK condition) for isolated indexes", () => {
       const TenantItems = Collection.make("TenantItems", {
         users: UserEntity,
         orders: OrderEntity,
       })
 
       const q = TenantItems.query({ tenantId: "t-1" })
-      expect(q._state.skConditions).toHaveLength(1)
-      expect(q._state.skConditions[0]?.condition).toHaveProperty("beginsWith")
-      // The SK prefix should be the collection prefix: $myapp#v1#tenantitems
-      const beginsWith = (q._state.skConditions[0]?.condition as { beginsWith: string }).beginsWith
-      expect(beginsWith).toContain("tenantitems")
+      // Entity-level indexes normalize to type: "isolated" — no SK condition
+      expect(q._state.skConditions).toHaveLength(0)
     })
 
-    it("entity selector includes entity-specific begins_with SK condition", () => {
+    it("entity selector uses PK-only (no SK condition) for isolated indexes", () => {
       const TenantItems = Collection.make("TenantItems", {
         users: UserEntity,
         orders: OrderEntity,
       })
 
       const q = TenantItems.users({ tenantId: "t-1" })
-      expect(q._state.skConditions).toHaveLength(1)
-      const beginsWith = (q._state.skConditions[0]?.condition as { beginsWith: string }).beginsWith
-      // Entity selector prefix includes collection + entity type: $myapp#v1#tenantitems#user_1
-      expect(beginsWith).toContain("tenantitems")
-      expect(beginsWith).toContain("user_1")
+      // Isolated mode — entity selector also uses PK-only
+      expect(q._state.skConditions).toHaveLength(0)
     })
 
-    it.effect("clustered query passes begins_with to DynamoDB", () =>
+    it.effect("isolated query uses PK-only KeyConditionExpression", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({ Items: [], LastEvaluatedKey: undefined })
 
@@ -353,7 +343,8 @@ describe("Collection", () => {
         yield* Query.collect(TenantItems.query({ tenantId: "t-1" }))
 
         const call = mockQuery.mock.calls[0]![0]
-        expect(call.KeyConditionExpression).toContain("begins_with(#sk, :sk)")
+        // Isolated mode — no begins_with on SK
+        expect(call.KeyConditionExpression).not.toContain("begins_with")
       }).pipe(Effect.provide(TestLayer)),
     )
   })
@@ -362,17 +353,16 @@ describe("Collection", () => {
     const IsolatedUser = Entity.make({
       model: User,
       entityType: "User",
+      primaryKey: {
+        pk: { field: "pk", composite: ["userId"] },
+        sk: { field: "sk", composite: [] },
+      },
       indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["userId"] },
-          sk: { field: "sk", composite: [] },
-        },
         byTenant: {
-          index: "gsi1",
           collection: "IsolatedTenantItems",
-          type: "isolated",
-          pk: { field: "gsi1pk", composite: ["tenantId"] },
-          sk: { field: "gsi1sk", composite: [] },
+          index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+          composite: ["tenantId"],
+          sk: [],
         },
       },
     })
@@ -381,17 +371,16 @@ describe("Collection", () => {
     const IsolatedOrder = Entity.make({
       model: Order,
       entityType: "Order",
+      primaryKey: {
+        pk: { field: "pk", composite: ["orderId"] },
+        sk: { field: "sk", composite: [] },
+      },
       indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["orderId"] },
-          sk: { field: "sk", composite: [] },
-        },
         byTenant: {
-          index: "gsi1",
           collection: "IsolatedTenantItems",
-          type: "isolated",
-          pk: { field: "gsi1pk", composite: ["tenantId"] },
-          sk: { field: "gsi1sk", composite: [] },
+          index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+          composite: ["tenantId"],
+          sk: [],
         },
       },
     })

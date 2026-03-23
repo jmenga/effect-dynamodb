@@ -44,8 +44,9 @@ import {
   parseSimpleShorthand,
 } from "./internal/Expr.js"
 import { compilePath, createPathBuilder } from "./internal/PathBuilder.js"
-import type { IndexDefinition, KeyPart } from "./KeyComposer.js"
+import type { GsiConfig, IndexDefinition, KeyPart } from "./KeyComposer.js"
 import * as KeyComposer from "./KeyComposer.js"
+import { normalizeGsiConfig } from "./KeyComposer.js"
 import {
   deserializeDateFromDynamo,
   fromAttributeMap,
@@ -934,6 +935,18 @@ type InvalidComposites<F extends string, TIndexes> = Exclude<
   F
 >
 
+/** Compute the normalized indexes type from primaryKey + optional GSI configs. */
+type NormalizedIndexes<
+  TPrimaryKey extends PrimaryKeyDef,
+  TGsiIndexes extends globalThis.Record<string, GsiConfig>,
+> = keyof TGsiIndexes extends never
+  ? { readonly primary: TPrimaryKey }
+  : { readonly primary: TPrimaryKey } & {
+      readonly [K in keyof TGsiIndexes & string]: IndexDefinition & {
+        readonly collection: TGsiIndexes[K]["collection"]
+      }
+    }
+
 /** Primary key definition — used in the new `primaryKey` config form. */
 type PrimaryKeyDef = IndexDefinition &
   (
@@ -944,97 +957,40 @@ type PrimaryKeyDef = IndexDefinition &
 /**
  * Create an Entity definition.
  *
- * Overload 1: `primaryKey` — entity defines only its primary key. GSI definitions
- * are owned by `Collections.make()` and injected at `DynamoClient.make()` time.
+ * `primaryKey` defines the table's primary key. `indexes` optionally defines GSI
+ * access patterns. GSIs with a `collection` property are auto-discovered as
+ * cross-entity collections by `DynamoClient.make()`.
  *
- * Overload 2: `indexes` — legacy form where all indexes (primary + GSIs) are defined
- * on the entity. Still supported for backward compatibility.
+ * @example
+ * ```typescript
+ * const Tasks = Entity.make({
+ *   model: Task,
+ *   entityType: "Task",
+ *   primaryKey: {
+ *     pk: { field: "pk", composite: ["taskId"] },
+ *     sk: { field: "sk", composite: [] },
+ *   },
+ *   indexes: {
+ *     byProject: {
+ *       index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+ *       composite: ["projectId"],
+ *       sk: ["status"],
+ *     },
+ *     assigned: {
+ *       collection: "assignments",
+ *       index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+ *       composite: ["employee"],
+ *       sk: ["project"],
+ *     },
+ *   },
+ * })
+ * ```
  */
-export const make: {
-  // --- Overload 1: primaryKey (new) ---
-  <
-    TModel extends Schema.Top,
-    const TEntityType extends string,
-    const TPrimaryKey extends PrimaryKeyDef,
-    const TTimestamps extends TimestampsConfig | undefined = undefined,
-    const TVersioned extends VersionedConfig | undefined = undefined,
-    const TSoftDelete extends SoftDeleteConfig | undefined = undefined,
-    const TUnique extends UniqueConfig | undefined = undefined,
-    const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
-    const TAttrs extends {} = {},
-  >(config: {
-    readonly model: TModel | ConfiguredModel<TModel, TAttrs>
-    readonly entityType: TEntityType
-    readonly primaryKey: TPrimaryKey
-    readonly timestamps?: TTimestamps
-    readonly versioned?: TVersioned
-    readonly softDelete?: TSoftDelete
-    readonly unique?: TUnique
-    readonly refs?: TRefs
-  }): Entity<
-    TModel,
-    TEntityType,
-    { readonly primary: TPrimaryKey },
-    TTimestamps,
-    TVersioned,
-    TSoftDelete,
-    TUnique,
-    TRefs,
-    ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>
-  >
-
-  // --- Overload 2: indexes (legacy) ---
-  <
-    TModel extends Schema.Top,
-    const TEntityType extends string,
-    const TIndexes extends globalThis.Record<string, IndexDefinition> & {
-      readonly primary: PrimaryKeyDef
-    },
-    const TTimestamps extends TimestampsConfig | undefined = undefined,
-    const TVersioned extends VersionedConfig | undefined = undefined,
-    const TSoftDelete extends SoftDeleteConfig | undefined = undefined,
-    const TUnique extends UniqueConfig | undefined = undefined,
-    const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
-    const TAttrs extends {} = {},
-  >(config: {
-    readonly model: TModel | ConfiguredModel<TModel, TAttrs>
-    readonly entityType: TEntityType
-    readonly indexes: [InvalidComposites<ValidCompositeAttr<TModel, TRefs>, TIndexes>] extends [
-      never,
-    ]
-      ? TIndexes
-      : TIndexes & {
-          readonly [K in keyof TIndexes]: {
-            readonly pk: { readonly composite: ReadonlyArray<ValidCompositeAttr<TModel, TRefs>> }
-            readonly sk: { readonly composite: ReadonlyArray<ValidCompositeAttr<TModel, TRefs>> }
-          }
-        }
-    readonly timestamps?: TTimestamps
-    readonly versioned?: TVersioned
-    readonly softDelete?: TSoftDelete
-    readonly unique?: TUnique
-    readonly refs?: TRefs
-  }): Entity<
-    TModel,
-    TEntityType,
-    TIndexes,
-    TTimestamps,
-    TVersioned,
-    TSoftDelete,
-    TUnique,
-    TRefs,
-    ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>
-  >
-} = <
+export const make = <
   TModel extends Schema.Top,
   const TEntityType extends string,
-  const TIndexes extends globalThis.Record<string, IndexDefinition> & {
-    readonly primary: IndexDefinition &
-      (
-        | { readonly pk: { readonly composite: readonly [string, ...string[]] } }
-        | { readonly sk: { readonly composite: readonly [string, ...string[]] } }
-      )
-  },
+  const TPrimaryKey extends PrimaryKeyDef,
+  const TGsiIndexes extends globalThis.Record<string, GsiConfig> = {},
   const TTimestamps extends TimestampsConfig | undefined = undefined,
   const TVersioned extends VersionedConfig | undefined = undefined,
   const TSoftDelete extends SoftDeleteConfig | undefined = undefined,
@@ -1044,17 +1000,8 @@ export const make: {
 >(config: {
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
   readonly entityType: TEntityType
-  readonly indexes?: [InvalidComposites<ValidCompositeAttr<TModel, TRefs>, TIndexes>] extends [
-    never,
-  ]
-    ? TIndexes
-    : TIndexes & {
-        readonly [K in keyof TIndexes]: {
-          readonly pk: { readonly composite: ReadonlyArray<ValidCompositeAttr<TModel, TRefs>> }
-          readonly sk: { readonly composite: ReadonlyArray<ValidCompositeAttr<TModel, TRefs>> }
-        }
-      }
-  readonly primaryKey?: IndexDefinition
+  readonly primaryKey: TPrimaryKey
+  readonly indexes?: TGsiIndexes
   readonly timestamps?: TTimestamps
   readonly versioned?: TVersioned
   readonly softDelete?: TSoftDelete
@@ -1063,7 +1010,7 @@ export const make: {
 }): Entity<
   TModel,
   TEntityType,
-  TIndexes,
+  NormalizedIndexes<TPrimaryKey, TGsiIndexes>,
   TTimestamps,
   TVersioned,
   TSoftDelete,
@@ -1071,17 +1018,17 @@ export const make: {
   TRefs,
   ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>
 > => {
-  // Normalize: if primaryKey is provided, wrap it as { primary: primaryKey }
-  const normalizedConfig = config.primaryKey
-    ? { ...config, indexes: { primary: config.primaryKey } as unknown as typeof config.indexes }
-    : config
-  if (!normalizedConfig.indexes) {
-    throw new Error(
-      `Entity "${config.entityType}": either 'indexes' or 'primaryKey' must be provided`,
-    )
+  // Normalize GSI configs to internal IndexDefinition format
+  const gsiIndexes: globalThis.Record<string, IndexDefinition> = {}
+  if (config.indexes) {
+    for (const [name, gsi] of Object.entries(config.indexes)) {
+      gsiIndexes[name] = normalizeGsiConfig(gsi)
+    }
   }
+
+  const indexes = { primary: config.primaryKey, ...gsiIndexes } as any
   // Delegate to the internal implementation with normalized indexes
-  return makeImpl(normalizedConfig as any) as any
+  return makeImpl({ ...config, indexes }) as any
 }
 
 const makeImpl = <

@@ -67,6 +67,13 @@ const Users = Entity.make({
     pk: { field: "pk", composite: ["userId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byEmail: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["email"],
+      sk: [],
+    },
+  },
   unique: { email: ["email"] },
   timestamps: true,
   versioned: true,
@@ -79,28 +86,17 @@ const Tasks = Entity.make({
     pk: { field: "pk", composite: ["taskId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byUser: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["userId"],
+      sk: ["status"],
+    },
+  },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Users, Tasks } })
-
-const UsersByEmail = Collections.make("usersByEmail", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["email"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Users: Collections.member(Users, { sk: { composite: [] } }),
-  },
-})
-
-const TasksByUser = Collections.make("tasksByUser", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["userId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Tasks: Collections.member(Tasks, { sk: { composite: ["status"] } }),
-  },
-})
 ```
 
 Key design decisions:
@@ -122,7 +118,6 @@ const program = Effect.gen(function* () {
   // Get typed client — binds all entities and collections
   const db = yield* DynamoClient.make({
     entities: { Users, Tasks },
-    collections: { UsersByEmail, TasksByUser },
   })
 
   // --- Create the table (derived from entity definitions) ---
@@ -172,7 +167,7 @@ const program = Effect.gen(function* () {
 
   // --- Query: tasks by user via collection ---
 
-  const { Tasks: aliceTasks } = yield* db.collections.TasksByUser({ userId: "u-alice" }).collect()
+  const aliceTasks = yield* db.entities.Tasks.byUser({ userId: "u-alice" }).collect()
 
   // --- Delete ---
 

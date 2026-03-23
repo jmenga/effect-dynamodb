@@ -124,6 +124,30 @@ const Employees = Entity.make({
     pk: { field: "pk", composite: ["employee"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    workplaces: {
+      collection: "workplaces",
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["office"],
+      sk: ["team", "title", "employee"],
+    },
+    assignments: {
+      collection: "assignments",
+      index: { name: "gsi3", pk: "gsi3pk", sk: "gsi3sk" },
+      composite: ["employee"],
+      sk: [],
+    },
+    byRole: {
+      index: { name: "gsi4", pk: "gsi4pk", sk: "gsi4sk" },
+      composite: ["title"],
+      sk: ["salary", "employee"],
+    },
+    byManager: {
+      index: { name: "gsi5", pk: "gsi5pk", sk: "gsi5sk" },
+      composite: ["manager"],
+      sk: ["team", "office", "employee"],
+    },
+  },
   timestamps: true,
   versioned: true,
   softDelete: true,
@@ -144,6 +168,19 @@ const Tasks = Entity.make({
     pk: { field: "pk", composite: ["task"] },
     sk: { field: "sk", composite: ["project", "employee"] },
   },
+  indexes: {
+    byProject: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["project"],
+      sk: ["employee", "task"],
+    },
+    assignments: {
+      collection: "assignments",
+      index: { name: "gsi3", pk: "gsi3pk", sk: "gsi3sk" },
+      composite: ["employee"],
+      sk: ["project", "task"],
+    },
+  },
   timestamps: true,
 })
 ```
@@ -157,6 +194,19 @@ const Offices = Entity.make({
   primaryKey: {
     pk: { field: "pk", composite: ["office"] },
     sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    workplaces: {
+      collection: "workplaces",
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["office"],
+      sk: [],
+    },
+    byLocation: {
+      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+      composite: ["country", "state"],
+      sk: ["city", "zip", "office"],
+    },
   },
   timestamps: true,
 })
@@ -175,80 +225,12 @@ const HrTable = Table.make({
 
 ### Collections
 
-Collections define all GSI access patterns. Each collection owns the index definition and member entities specify their SK composites:
+GSI access patterns are now defined as entity-level indexes. Multi-entity collections (workplaces, assignments) are auto-discovered from matching collection names across entities:
 
 ```typescript title="collections.ts" region="collections" example="hr.ts"
-const Workplaces = Collections.make("workplaces", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["office"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Employees: Collections.member(Employees, {
-      sk: { composite: ["team", "title", "employee"] },
-    }),
-    Offices: Collections.member(Offices, { sk: { composite: [] } }),
-  },
-})
-
-const TasksByProject = Collections.make("tasksByProject", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["project"] },
-  sk: { field: "gsi1sk" },
-  type: "isolated",
-  members: {
-    Tasks: Collections.member(Tasks, {
-      sk: { composite: ["employee", "task"] },
-    }),
-  },
-})
-
-const Assignments = Collections.make("assignments", {
-  index: "gsi3",
-  pk: { field: "gsi3pk", composite: ["employee"] },
-  sk: { field: "gsi3sk" },
-  members: {
-    Employees: Collections.member(Employees, { sk: { composite: [] } }),
-    Tasks: Collections.member(Tasks, {
-      sk: { composite: ["project", "task"] },
-    }),
-  },
-})
-
-const Roles = Collections.make("roles", {
-  index: "gsi4",
-  pk: { field: "gsi4pk", composite: ["title"] },
-  sk: { field: "gsi4sk" },
-  type: "isolated",
-  members: {
-    Employees: Collections.member(Employees, {
-      sk: { composite: ["salary", "employee"] },
-    }),
-  },
-})
-
-const DirectReports = Collections.make("directReports", {
-  index: "gsi5",
-  pk: { field: "gsi5pk", composite: ["manager"] },
-  sk: { field: "gsi5sk" },
-  type: "isolated",
-  members: {
-    Employees: Collections.member(Employees, {
-      sk: { composite: ["team", "office", "employee"] },
-    }),
-  },
-})
-
-const OfficesByLocation = Collections.make("officesByLocation", {
-  index: "gsi2",
-  pk: { field: "gsi2pk", composite: ["country", "state"] },
-  sk: { field: "gsi2sk" },
-  type: "isolated",
-  members: {
-    Offices: Collections.member(Offices, {
-      sk: { composite: ["city", "zip", "office"] },
-    }),
-  },
-})
+// GSI access patterns are now defined as entity-level indexes above.
+// Multi-entity collections (workplaces, assignments) are auto-discovered
+// from matching collection names across entities.
 ```
 
 Key design decisions:
@@ -363,14 +345,6 @@ const tasks = {
 ```typescript title="seed.ts" region="seed-execution" example="hr.ts"
 const db = yield* DynamoClient.make({
   entities: { Employees, Tasks, Offices },
-  collections: {
-    Workplaces,
-    TasksByProject,
-    Assignments,
-    Roles,
-    DirectReports,
-    OfficesByLocation,
-  },
 })
 
 // --- Setup: create table ---
@@ -424,13 +398,11 @@ Because Employee has `softDelete: true`, the delete doesn't destroy the record �
 Employee and Office share GSI1 via the `Workplaces` collection. Both use `office` as the partition key, so a single partition holds the office record and all employees at that location.
 
 ```typescript region="workplaces" example="hr.ts"
-const { Employees: gwZooEmployees } = yield* db.collections
-  .Workplaces({ office: "gw-zoo" })
-  .collect()
+const { Employees: gwZooEmployees } = yield* db.collections.Workplaces!({
+  office: "gw-zoo",
+}).collect()
 
-const { Offices: gwZooOffice } = yield* db.collections
-  .Workplaces({ office: "gw-zoo" })
-  .collect()
+const { Offices: gwZooOffice } = yield* db.collections.Workplaces!({ office: "gw-zoo" }).collect()
 ```
 
 Both queries hit GSI1 with the same partition key (`office: "gw-zoo"`). The collection query returns a grouped result with arrays keyed by member name.
@@ -442,13 +414,13 @@ Both queries hit GSI1 with the same partition key (`office: "gw-zoo"`). The coll
 Employee and Task share GSI3 via the `Assignments` collection. Both use `employee` as the partition key.
 
 ```typescript region="assignments" example="hr.ts"
-const { Tasks: dfinlayTasks } = yield* db.collections
-  .Assignments({ employee: "dfinlay" })
-  .collect()
+const { Tasks: dfinlayTasks } = yield* db.collections.Assignments!({
+  employee: "dfinlay",
+}).collect()
 
-const { Employees: dfinlayInfo } = yield* db.collections
-  .Assignments({ employee: "dfinlay" })
-  .collect()
+const { Employees: dfinlayInfo } = yield* db.collections.Assignments!({
+  employee: "dfinlay",
+}).collect()
 ```
 
 ### Requirement 4: Tasks by Project
@@ -458,13 +430,9 @@ const { Employees: dfinlayInfo } = yield* db.collections
 Task's `TasksByProject` collection on GSI1 uses `project` as the partition key. This is **index overloading** — the same physical GSI1 serves the `Workplaces` collection (Employee + Office by office) and `TasksByProject` (Task by project), each with different partition keys. The `type: "isolated"` setting prevents sort key prefix clashes between the two collections.
 
 ```typescript region="tasks-by-project" example="hr.ts"
-const { Tasks: feedingTasks } = yield* db.collections
-  .TasksByProject({ project: "feeding" })
-  .collect()
+const feedingTasks = yield* db.entities.Tasks.byProject({ project: "feeding" }).collect()
 
-const { Tasks: fundraiserTasks } = yield* db.collections
-  .TasksByProject({ project: "fundraiser" })
-  .collect()
+const fundraiserTasks = yield* db.entities.Tasks.byProject({ project: "fundraiser" }).collect()
 ```
 
 ### Requirement 5: Offices by Location
@@ -474,13 +442,9 @@ const { Tasks: fundraiserTasks } = yield* db.collections
 The `OfficesByLocation` collection on GSI2 uses `country + state` as the partition key and `city + zip + office` as the sort key, enabling location-based queries with progressively finer granularity.
 
 ```typescript region="offices-by-location" example="hr.ts"
-const { Offices: flOffices } = yield* db.collections
-  .OfficesByLocation({ country: "US", state: "FL" })
-  .collect()
+const flOffices = yield* db.entities.Offices.byLocation({ country: "US", state: "FL" }).collect()
 
-const { Offices: okOffices } = yield* db.collections
-  .OfficesByLocation({ country: "US", state: "OK" })
-  .collect()
+const okOffices = yield* db.entities.Offices.byLocation({ country: "US", state: "OK" }).collect()
 ```
 
 ### Requirement 6: Employees by Title + Salary Range
@@ -490,14 +454,10 @@ const { Offices: okOffices } = yield* db.collections
 The `Roles` collection on GSI4 has `title` as the partition key and `salary + employee` as the sort key composites. Because salary is zero-padded (`"000150.00"`), it sorts lexicographically in the correct numeric order. Query via `db.collections.Roles(...)` and filter by salary range in application code.
 
 ```typescript region="salary-range" example="hr.ts"
-const { Employees: zookeepers } = yield* db.collections
-  .Roles({ title: "Zookeeper" })
-  .collect()
+const zookeepers = yield* db.entities.Employees.byRole({ title: "Zookeeper" }).collect()
 
 // All directors — filter by salary range in application code
-const { Employees: allDirectors } = yield* db.collections
-  .Roles({ title: "Director" })
-  .collect()
+const allDirectors = yield* db.entities.Employees.byRole({ title: "Director" }).collect()
 const directorsBySalary = allDirectors.filter(
   (e) => e.salary >= "000000.00" && e.salary <= "999999.99",
 )
@@ -510,13 +470,9 @@ const directorsBySalary = allDirectors.filter(
 The `DirectReports` collection on GSI5 uses `manager` as the partition key.
 
 ```typescript region="direct-reports" example="hr.ts"
-const { Employees: jloweReports } = yield* db.collections
-  .DirectReports({ manager: "jlowe" })
-  .collect()
+const jloweReports = yield* db.entities.Employees.byManager({ manager: "jlowe" }).collect()
 
-const { Employees: cbaskinReports } = yield* db.collections
-  .DirectReports({ manager: "cbaskin" })
-  .collect()
+const cbaskinReports = yield* db.entities.Employees.byManager({ manager: "cbaskin" }).collect()
 ```
 
 ### Requirement 8: Employee Transfer (All-or-None GSI Constraints)
@@ -537,13 +493,9 @@ const transferred = yield* db.entities.Employees.update(
   }),
 )
 
-const { Employees: newReports } = yield* db.collections
-  .DirectReports({ manager: "cbaskin" })
-  .collect()
+const newReports = yield* db.entities.Employees.byManager({ manager: "cbaskin" }).collect()
 
-const { Employees: jloweReportsAfter } = yield* db.collections
-  .DirectReports({ manager: "jlowe" })
-  .collect()
+const jloweReportsAfter = yield* db.entities.Employees.byManager({ manager: "jlowe" }).collect()
 ```
 
 What happens if you provide only some composites? The type system warns you, and at runtime `extractComposites` fails with a `ValidationError` naming the violating index:
@@ -585,9 +537,9 @@ yield* Transaction.transactWrite([
 
 const newHire = yield* db.entities.Employees.get({ employee: "rstarr" })
 
-const { Tasks: onboardingTasks } = yield* db.collections
-  .Assignments({ employee: "rstarr" })
-  .collect()
+const { Tasks: onboardingTasks } = yield* db.collections.Assignments!({
+  employee: "rstarr",
+}).collect()
 ```
 
 ### Requirement 10: Termination + Rehire (Soft Delete + Restore)
@@ -599,9 +551,9 @@ Because Employee has `softDelete: true`, deleting an employee **archives** the r
 ```typescript region="soft-delete" example="hr.ts"
 yield* db.entities.Employees.delete({ employee: "hschreibvogel" })
 
-const { Employees: cbaskinReportsAfterTermination } = yield* db.collections
-  .DirectReports({ manager: "cbaskin" })
-  .collect()
+const cbaskinReportsAfterTermination = yield* db.entities.Employees.byManager({
+  manager: "cbaskin",
+}).collect()
 
 const terminatedRecord = yield* db.entities.Employees.deleted.get({
   employee: "hschreibvogel",
@@ -609,9 +561,9 @@ const terminatedRecord = yield* db.entities.Employees.deleted.get({
 
 const rehired = yield* db.entities.Employees.restore({ employee: "hschreibvogel" })
 
-const { Employees: reportsAfterRehire } = yield* db.collections
-  .DirectReports({ manager: "cbaskin" })
-  .collect()
+const reportsAfterRehire = yield* db.entities.Employees.byManager({
+  manager: "cbaskin",
+}).collect()
 ```
 
 ---

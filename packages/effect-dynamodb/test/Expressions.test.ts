@@ -66,15 +66,15 @@ const Teams = withConfig(
   Entity.make({
     model: TeamModel,
     entityType: "Team",
+    primaryKey: {
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
+    },
     indexes: {
-      primary: {
-        pk: { field: "pk", composite: ["id"] },
-        sk: { field: "sk", composite: [] },
-      },
       byStatus: {
-        index: "gsi1",
-        pk: { field: "gsi1pk", composite: ["status"] },
-        sk: { field: "gsi1sk", composite: [] },
+        index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+        composite: ["status"],
+        sk: [],
       },
     },
     timestamps: true,

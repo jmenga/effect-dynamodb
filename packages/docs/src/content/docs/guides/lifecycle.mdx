@@ -30,6 +30,13 @@ const Employees = Entity.make({
     pk: { field: "pk", composite: ["employeeId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byTenant: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["tenantId"],
+      sk: ["department", "employeeId"],
+    },
+  },
   timestamps: true,
   versioned: { retain: true, ttl: Duration.days(90) },
   softDelete: { ttl: Duration.days(30) },
@@ -91,11 +98,8 @@ yield* Console.log(`Normal get after delete: ${getResult}`)
 Collection queries also return empty — deleted items fall out of indexes:
 
 ```typescript region="query-invisible" example="guide-lifecycle.ts"
-// Collection query also returns empty — deleted items fall out of indexes
-const { Employees: tenantEmployees } = yield* db.collections
-  .EmployeesByTenant({ tenantId: "t-acme" })
-  .collect()
-yield* Console.log(`Tenant query after delete: ${tenantEmployees.length} results`)
+// Index query also returns empty — deleted items fall out of indexes
+const tenantEmployees = yield* db.entities.Employees.byTenant({ tenantId: "t-acme" }).collect()
 ```
 
 ### Accessing Deleted Items
@@ -153,11 +157,8 @@ yield* Console.log(`Restored: ${restored.displayName} (v${v(restored)})`)
 5. Item reappears in all secondary indexes and collections
 
 ```typescript region="restore-visible" example="guide-lifecycle.ts"
-// Item is back in collection queries
-const { Employees: tenantAfterRestore } = yield* db.collections
-  .EmployeesByTenant({ tenantId: "t-acme" })
-  .collect()
-yield* Console.log(`Tenant query after restore: ${tenantAfterRestore.length} results`)
+// Item is back in index queries
+const tenantAfterRestore = yield* db.entities.Employees.byTenant({ tenantId: "t-acme" }).collect()
 ```
 
 ### Error Handling

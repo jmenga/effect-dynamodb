@@ -53,19 +53,17 @@ const Vehicles = Entity.make({
     pk: { field: "pk", composite: ["vehicleId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    vehiclesByCell: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["parentCell", "timePartition"],
+      sk: ["cell"],
+    },
+  },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Vehicles } })
-
-const VehiclesByCell = Collections.make("vehiclesByCell", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["parentCell", "timePartition"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Vehicles: Collections.member(Vehicles, { sk: { composite: ["cell"] } }),
-  },
-})
 ```
 
 ### 3. Create GeoIndex

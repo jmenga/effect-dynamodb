@@ -34,13 +34,13 @@ Query accessors live on `db.collections` (for GSI queries) and `db.entities` (fo
 // Primary key lookup (not a query — returns single item)
 const task = yield* tasks.get({ taskId: "t-001" })
 
-// Named collection queries — on the db.collections gateway
-const { Tasks: projectTasks } = yield* db.collections
-  .ByProject({ projectId: "proj-alpha" })
-  .collect()
-const { Tasks: assigneeTasks } = yield* db.collections
-  .ByAssignee({ assigneeId: "emp-alice" })
-  .collect()
+// Named index queries — via entity index accessors
+const projectTasks = yield* db.entities.TaskEntity.byProject({
+  projectId: "proj-alpha",
+}).collect()
+const assigneeTasks = yield* db.entities.TaskEntity.byAssignee({
+  assigneeId: "emp-alice",
+}).collect()
 ```
 
 ### Generated Accessor Mapping
@@ -48,8 +48,8 @@ const { Tasks: assigneeTasks } = yield* db.collections
 | Definition | Accessor | Argument Type |
 |-----------|----------|---------------|
 | `primaryKey: { pk: { composite: ["taskId"] }, ... }` | `tasks.get(...)` | `{ taskId: string }` |
-| `Collections.make("ByProject", { pk: { composite: ["projectId"] }, ... })` | `db.collections.ByProject(...)` | `{ projectId: string }` |
-| `Collections.make("ByAssignee", { pk: { composite: ["assigneeId"] }, ... })` | `db.collections.ByAssignee(...)` | `{ assigneeId: string }` |
+| `Collections.make({ name: "ByProject", pk: { composite: ["projectId"] }, ... })` | `db.collections.ByProject(...)` | `{ projectId: string }` |
+| `Collections.make({ name: "ByAssignee", pk: { composite: ["assigneeId"] }, ... })` | `db.collections.ByAssignee(...)` | `{ assigneeId: string }` |
 
 ## Post-Query Filtering
 
@@ -57,16 +57,14 @@ const { Tasks: assigneeTasks } = yield* db.collections
 
 ```typescript region="filter-callback" example="guide-queries.ts"
 // Shorthand — AND-equality on multiple fields
-const { Tasks: highPriActive } = yield* db.collections
-  .ByProject({ projectId: "proj-alpha" })
+const highPriActive = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
   .filter({ status: "active", priority: "high" })
   .collect()
 ```
 
 ```typescript region="filter-shorthand" example="guide-queries.ts"
 // Shorthand — simple AND-equality
-const { Tasks: activeShorthand } = yield* db.collections
-  .ByProject({ projectId: "proj-alpha" })
+const activeShorthand = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
   .filter({ status: "active" })
   .collect()
 ```
@@ -123,9 +121,9 @@ const assignments = yield* db.collections
 
 ```typescript region="collect-all" example="guide-queries.ts"
 // Collect all items across all pages
-const { Tasks: allProjectTasks } = yield* db.collections
-  .ByProject({ projectId: "proj-alpha" })
-  .collect()
+const allProjectTasks = yield* db.entities.TaskEntity.byProject({
+  projectId: "proj-alpha",
+}).collect()
 ```
 
 ### Single Page
@@ -134,7 +132,7 @@ const { Tasks: allProjectTasks } = yield* db.collections
 
 ```typescript region="single-page" example="guide-queries.ts"
 // Single page with limit — returns page with items and cursor
-const page = yield* db.collections.ByProject({ projectId: "proj-alpha" }).limit(3).fetch()
+const page = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" }).limit(3).fetch()
 // page.items: { Tasks: Task[] } (up to 3 items)
 // page.cursor: string | null (pass to startFrom for next page)
 ```
@@ -145,11 +143,12 @@ Use `.startFrom()` to resume from a previous page's cursor:
 
 ```typescript region="cursor-pagination" example="guide-queries.ts"
 // Cursor-based pagination
-const page1 = yield* db.collections.ByProject({ projectId: "proj-alpha" }).limit(3).fetch()
+const page1 = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+  .limit(3)
+  .fetch()
 
 if (page1.cursor) {
-  const page2 = yield* db.collections
-    .ByProject({ projectId: "proj-alpha" })
+  const page2 = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
     .limit(3)
     .startFrom(page1.cursor)
     .fetch()
@@ -234,8 +233,7 @@ By default, results are in ascending sort key order. Use `.reverse()` for descen
 
 ```typescript region="reverse" example="guide-queries.ts"
 // Most recent tasks first (descending sort key order)
-const { Tasks: recent } = yield* db.collections
-  .ByProject({ projectId: "proj-alpha" })
+const recent = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
   .reverse()
   .limit(3)
   .collect()

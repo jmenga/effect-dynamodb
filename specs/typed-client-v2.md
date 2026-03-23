@@ -51,7 +51,7 @@ This provides:
 ### 2.2 API
 
 ```typescript
-const Assignments = Collections.make("assignments", {
+const Assignments = Collections.make({ name: "assignments",
   index: "gsi3",
   pk: { field: "gsi3pk", composite: ["employee"] },
   sk: { field: "gsi3sk" },
@@ -146,7 +146,7 @@ Multiple isolated collections can share the same GSI with different member sets.
 
 ```typescript
 // Broad scope — everything about a manager's reports
-const ManagerView = Collections.make("managerView", {
+const ManagerView = Collections.make({ name: "managerView",
   type: "isolated",
   index: "gsi2",
   pk: { field: "gsi2pk", composite: ["manager"] },
@@ -160,7 +160,7 @@ const ManagerView = Collections.make("managerView", {
 })
 
 // Narrow scope — just assignments
-const ManagerAssignments = Collections.make("managerAssignments", {
+const ManagerAssignments = Collections.make({ name: "managerAssignments",
   type: "isolated",
   index: "gsi2",
   pk: { field: "gsi2pk", composite: ["manager"] },
@@ -216,7 +216,7 @@ const Tasks = Entity.make({
 })
 
 // ALL access patterns as collections (single-member = entity query, multi-member = cross-entity query)
-const Assignments = Collections.make("assignments", {
+const Assignments = Collections.make({ name: "assignments",
   index: "gsi3",
   pk: { field: "gsi3pk", composite: ["employee"] },
   sk: { field: "gsi3sk" },
@@ -226,7 +226,7 @@ const Assignments = Collections.make("assignments", {
   },
 })
 
-const TasksByProject = Collections.make("tasksByProject", {
+const TasksByProject = Collections.make({ name: "tasksByProject",
   index: "gsi1",
   pk: { field: "gsi1pk", composite: ["project"] },
   sk: { field: "gsi1sk" },
@@ -235,7 +235,7 @@ const TasksByProject = Collections.make("tasksByProject", {
   },
 })
 
-const EmployeesByRole = Collections.make("employeesByRole", {
+const EmployeesByRole = Collections.make({ name: "employeesByRole",
   index: "gsi4",
   pk: { field: "gsi4pk", composite: ["title"] },
   sk: { field: "gsi4sk" },
@@ -271,7 +271,7 @@ Members can belong to different tables. Each table has its own physical GSI, but
 const ManagementTable = Table.make({ schema, entities: { DeviceMetadata } })
 const TelemetryTable = Table.make({ schema, entities: { DeviceTelemetry } })
 
-const DeviceStatus = Collections.make("deviceStatus", {
+const DeviceStatus = Collections.make({ name: "deviceStatus",
   index: "gsi1",
   pk: { field: "gsi1pk", composite: ["deviceId"] },
   sk: { field: "gsi1sk" },
@@ -429,7 +429,7 @@ Query accessors on `BoundEntity` are derived from collection memberships. When a
 
 ```typescript
 // Collection definition
-const TasksByProject = Collections.make("tasksByProject", {
+const TasksByProject = Collections.make({ name: "tasksByProject",
   index: "gsi1",
   pk: { field: "gsi1pk", composite: ["project"] },
   sk: { field: "gsi1sk" },
@@ -990,7 +990,7 @@ const HrTable = Table.make({
 // --- Collections (ALL access patterns — single and multi-entity) ---
 
 // Multi-entity: employee + their assigned tasks
-const Assignments = Collections.make("assignments", {
+const Assignments = Collections.make({ name: "assignments",
   index: "gsi3",
   pk: { field: "gsi3pk", composite: ["employee"] },
   sk: { field: "gsi3sk" },
@@ -1001,7 +1001,7 @@ const Assignments = Collections.make("assignments", {
 })
 
 // Multi-entity: office with its employees
-const Workplaces = Collections.make("workplaces", {
+const Workplaces = Collections.make({ name: "workplaces",
   index: "gsi1",
   pk: { field: "gsi1pk", composite: ["office"] },
   sk: { field: "gsi1sk" },
@@ -1012,7 +1012,7 @@ const Workplaces = Collections.make("workplaces", {
 })
 
 // Single-entity: tasks by project
-const TasksByProject = Collections.make("tasksByProject", {
+const TasksByProject = Collections.make({ name: "tasksByProject",
   index: "gsi2",
   pk: { field: "gsi2pk", composite: ["project"] },
   sk: { field: "gsi2sk" },
@@ -1022,7 +1022,7 @@ const TasksByProject = Collections.make("tasksByProject", {
 })
 
 // Single-entity: employees by role/title
-const EmployeesByRole = Collections.make("employeesByRole", {
+const EmployeesByRole = Collections.make({ name: "employeesByRole",
   index: "gsi4",
   pk: { field: "gsi4pk", composite: ["title"] },
   sk: { field: "gsi4sk" },
@@ -1032,7 +1032,7 @@ const EmployeesByRole = Collections.make("employeesByRole", {
 })
 
 // Single-entity: direct reports by manager
-const DirectReports = Collections.make("directReports", {
+const DirectReports = Collections.make({ name: "directReports",
   index: "gsi5",
   pk: { field: "gsi5pk", composite: ["manager"] },
   sk: { field: "gsi5sk" },
@@ -1233,7 +1233,7 @@ const MatchPlayer = Entity.make({
   },
 })
 
-const MatchPlayersByPlayer = Collections.make("matchPlayersByPlayer", {
+const MatchPlayersByPlayer = Collections.make({ name: "matchPlayersByPlayer",
   index: "gsi2",
   pk: { field: "gsi2pk", composite: ["playerId"] },
   sk: { field: "gsi2sk" },

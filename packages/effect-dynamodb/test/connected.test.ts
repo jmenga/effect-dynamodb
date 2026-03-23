@@ -80,21 +80,17 @@ const tableName = `connected-test-${Date.now()}`
 const Users = Entity.make({
   model: UserModel,
   entityType: "User",
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
     byRole: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["role"] },
-      sk: { field: "gsi1sk", composite: ["userId"] },
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["role"],
+      sk: ["userId"],
     },
-    byEmail: {
-      index: "gsi2",
-      pk: { field: "gsi2pk", composite: ["email"] },
-      sk: { field: "gsi2sk", composite: [] },
-    },
+    byEmail: { index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" }, composite: ["email"], sk: [] },
   },
   unique: { email: ["email"] },
   timestamps: true,
@@ -104,15 +100,15 @@ const Users = Entity.make({
 const Tasks = Entity.make({
   model: Task,
   entityType: "Task",
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
     byUser: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["userId"] },
-      sk: { field: "gsi1sk", composite: ["status", "taskId"] },
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["userId"],
+      sk: ["status", "taskId"],
     },
   },
   timestamps: true,
@@ -172,26 +168,24 @@ const aggTableName = `agg-test-${Date.now()}`
 const Authors = Entity.make({
   model: Author,
   entityType: "Author",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const Articles = Entity.make({
   model: Article,
   entityType: "Article",
+  primaryKey: {
+    pk: { field: "pk", composite: ["articleId"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["articleId"] },
-      sk: { field: "sk", composite: [] },
-    },
     byAuthor: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["authorId"] },
-      sk: { field: "gsi1sk", composite: ["articleId"] },
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["authorId"],
+      sk: ["articleId"],
     },
   },
   refs: {

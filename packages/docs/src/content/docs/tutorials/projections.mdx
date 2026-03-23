@@ -42,19 +42,17 @@ const Employees = Entity.make({
     pk: { field: "pk", composite: ["employeeId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byDepartment: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["department"],
+      sk: ["employeeId"],
+    },
+  },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Employees } })
-
-const EmployeesByDepartment = Collections.make("employeesByDepartment", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["department"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Employees: Collections.member(Employees, { sk: { composite: ["employeeId"] } }),
-  },
-})
 ```
 
 ---
@@ -64,7 +62,6 @@ const EmployeesByDepartment = Collections.make("employeesByDepartment", {
 ```typescript title="seed.ts" region="seed-data" example="projections.ts"
 const db = yield* DynamoClient.make({
   entities: { Employees },
-  collections: { EmployeesByDepartment },
 })
 
 const client = yield* DynamoClient

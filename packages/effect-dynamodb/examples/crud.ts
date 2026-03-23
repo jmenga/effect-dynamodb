@@ -1,9 +1,9 @@
 /**
- * CRUD example — effect-dynamodb (v2 Collections API)
+ * CRUD example — effect-dynamodb
  *
  * Demonstrates the full high-level API:
- *   - Collections.make() for GSI access patterns (entities only define primary keys)
- *   - DynamoClient.make({ entities, collections }) returns typed gateway
+ *   - Entity-level indexes for GSI access patterns
+ *   - DynamoClient.make({ entities }) returns typed gateway
  *   - Terminal-selected return types: yield* returns clean model (User),
  *     pipe to asRecord/asItem/asNative for richer decode modes
  *   - Simplified updates: db.entities.Users.update(key, fields) with pipeable combinators
@@ -23,7 +23,6 @@
 import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
-import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
@@ -77,6 +76,13 @@ const Users = Entity.make({
     pk: { field: "pk", composite: ["userId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byRole: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["role"],
+      sk: ["userId"],
+    },
+  },
   timestamps: true,
   versioned: { retain: true },
 })
@@ -88,6 +94,13 @@ const Tasks = Entity.make({
     pk: { field: "pk", composite: ["taskId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byUser: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["userId"],
+      sk: ["status", "taskId"],
+    },
+  },
   timestamps: true,
   versioned: true,
   softDelete: true,
@@ -96,24 +109,6 @@ const Tasks = Entity.make({
 const MainTable = Table.make({
   schema: AppSchema,
   entities: { Users, Tasks },
-})
-
-const UsersByRole = Collections.make("usersByRole", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["role"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Users: Collections.member(Users, { sk: { composite: ["userId"] } }),
-  },
-})
-
-const TasksByUser = Collections.make("tasksByUser", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["userId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Tasks: Collections.member(Tasks, { sk: { composite: ["status", "taskId"] } }),
-  },
 })
 // #endregion
 
@@ -135,16 +130,14 @@ const Projects = Entity.make({
     pk: { field: "pk", composite: ["projectId"] },
     sk: { field: "sk", composite: [] },
   },
-  timestamps: true,
-})
-
-const ProjectsByOwner = Collections.make("projectsByOwner", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["ownerId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Projects: Collections.member(Projects, { sk: { composite: ["department"] } }),
+  indexes: {
+    byOwner: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["ownerId"],
+      sk: ["department"],
+    },
   },
+  timestamps: true,
 })
 // #endregion
 
@@ -163,14 +156,12 @@ const Employees = Entity.make({
     pk: { field: "pk", composite: ["employeeId"] },
     sk: { field: "sk", composite: [] },
   },
-})
-
-const EmployeesByTenant = Collections.make("employeesByTenant", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["tenantId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Employees: Collections.member(Employees, { sk: { composite: ["region"] } }),
+  indexes: {
+    byTenant: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["tenantId"],
+      sk: ["region"],
+    },
   },
 })
 // #endregion
@@ -195,7 +186,6 @@ const program = Effect.gen(function* () {
   // Typed execution gateway — binds all entities and collections
   const db = yield* DynamoClient.make({
     entities: { Users, Tasks, Projects, Employees },
-    collections: { UsersByRole, TasksByUser, ProjectsByOwner, EmployeesByTenant },
   })
   // #endregion
 
@@ -335,9 +325,9 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Collection Queries — GSI Queries ===\n")
 
   // #region query
-  const { Tasks: aliceTasks } = yield* db.collections.TasksByUser({ userId: "u-alice" }).collect()
+  const aliceTasks = yield* db.entities.Tasks.byUser({ userId: "u-alice" }).collect()
 
-  const { Users: admins } = yield* db.collections.UsersByRole({ role: "admin" }).collect()
+  const admins = yield* db.entities.Users.byRole({ role: "admin" }).collect()
   // #endregion
   yield* Console.log(`Alice's tasks (${aliceTasks.length}):`)
   for (const t of aliceTasks) {
@@ -346,7 +336,7 @@ const program = Effect.gen(function* () {
 
   yield* Console.log(`\nAdmins: ${admins.length} (Alice was demoted to member)`)
 
-  const { Users: members } = yield* db.collections.UsersByRole({ role: "member" }).collect()
+  const members = yield* db.entities.Users.byRole({ role: "member" }).collect()
   yield* Console.log(`Members: ${members.length}`)
   for (const u of members) {
     yield* Console.log(`  ${u.userId}: ${u.displayName}`)
@@ -358,14 +348,10 @@ const program = Effect.gen(function* () {
 
   // #region query-combinators
   // Reverse sort order
-  const { Tasks: reversedTasks } = yield* db.collections
-    .TasksByUser({ userId: "u-alice" })
-    .reverse()
-    .collect()
+  const reversedTasks = yield* db.entities.Tasks.byUser({ userId: "u-alice" }).reverse().collect()
 
   // Filter expression (post-read filter)
-  const { Tasks: todoTasks } = yield* db.collections
-    .TasksByUser({ userId: "u-alice" })
+  const todoTasks = yield* db.entities.Tasks.byUser({ userId: "u-alice" })
     .filter({ status: "todo" })
     .collect()
   // #endregion
@@ -444,9 +430,7 @@ const program = Effect.gen(function* () {
   })
 
   // Query only returns assigned projects
-  const { Projects: ownerProjects } = yield* db.collections
-    .ProjectsByOwner({ ownerId: "u-alice" })
-    .collect()
+  const ownerProjects = yield* db.entities.Projects.byOwner({ ownerId: "u-alice" }).collect()
   // → [{ projectId: "p-1", name: "Alpha" }]
   // "Beta" is absent — sparse index at work
   // #endregion
@@ -547,9 +531,7 @@ const program = Effect.gen(function* () {
   yield* db.entities.Tasks.delete({ taskId: "t-1" })
 
   // No longer in collection queries
-  const { Tasks: aliceTasksAfterDelete } = yield* db.collections
-    .TasksByUser({ userId: "u-alice" })
-    .collect()
+  const aliceTasksAfterDelete = yield* db.entities.Tasks.byUser({ userId: "u-alice" }).collect()
   // t-1 is absent
 
   // But retrievable via deleted.get
@@ -571,9 +553,7 @@ const program = Effect.gen(function* () {
   // restored.status → "done"
 
   // Back in collection queries
-  const { Tasks: aliceTasksAfterRestore } = yield* db.collections
-    .TasksByUser({ userId: "u-alice" })
-    .collect()
+  const aliceTasksAfterRestore = yield* db.entities.Tasks.byUser({ userId: "u-alice" }).collect()
   // t-1 is back
   // #endregion
   yield* Console.log(`Restored Task: "${restored.title}" (status: ${restored.status})`)

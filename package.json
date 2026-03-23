@@ -13,7 +13,8 @@
     "docs:build": "pnpm --filter @effect-dynamodb/docs build"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.4.4"
+    "@biomejs/biome": "^2.4.4",
+    "tsx": "^4.21.0"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

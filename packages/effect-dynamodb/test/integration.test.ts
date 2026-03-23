@@ -42,15 +42,15 @@ class Order extends Schema.Class<Order>("Order")({
 const UserEntity = Entity.make({
   model: User,
   entityType: "User",
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
     byRole: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["role"] },
-      sk: { field: "gsi1sk", composite: ["userId"] },
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["role"],
+      sk: ["userId"],
     },
   },
 })
@@ -58,15 +58,15 @@ const UserEntity = Entity.make({
 const OrderEntity = Entity.make({
   model: Order,
   entityType: "Order",
+  primaryKey: {
+    pk: { field: "pk", composite: ["orderId"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["orderId"] },
-      sk: { field: "sk", composite: [] },
-    },
     byUser: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["userId"] },
-      sk: { field: "gsi1sk", composite: ["orderId"] },
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["userId"],
+      sk: ["orderId"],
     },
   },
 })
@@ -755,11 +755,9 @@ describe("Integration: Entity.create", () => {
   const TimestampedUser = Entity.make({
     model: User,
     entityType: "User",
-    indexes: {
-      primary: {
-        pk: { field: "pk", composite: ["userId"] },
-        sk: { field: "sk", composite: [] },
-      },
+    primaryKey: {
+      pk: { field: "pk", composite: ["userId"] },
+      sk: { field: "sk", composite: [] },
     },
     timestamps: true,
   })
@@ -899,11 +897,9 @@ describe("Integration: Timestamps + Versioning", () => {
   const VersionedItem = Entity.make({
     model: Item,
     entityType: "VersionedItem",
-    indexes: {
-      primary: {
-        pk: { field: "pk", composite: ["itemId"] },
-        sk: { field: "sk", composite: [] },
-      },
+    primaryKey: {
+      pk: { field: "pk", composite: ["itemId"] },
+      sk: { field: "sk", composite: [] },
     },
     timestamps: true,
     versioned: true,
@@ -967,11 +963,9 @@ describe("Integration: Entity Refs", () => {
   const TeamEntity = Entity.make({
     model: Team,
     entityType: "Team",
-    indexes: {
-      primary: {
-        pk: { field: "pk", composite: ["teamId"] },
-        sk: { field: "sk", composite: [] },
-      },
+    primaryKey: {
+      pk: { field: "pk", composite: ["teamId"] },
+      sk: { field: "sk", composite: [] },
     },
   })
   TeamEntity._configure(AppSchema, MainTable.Tag)
@@ -979,11 +973,9 @@ describe("Integration: Entity Refs", () => {
   const PlayerEntity = Entity.make({
     model: Player,
     entityType: "Player",
-    indexes: {
-      primary: {
-        pk: { field: "pk", composite: ["playerId"] },
-        sk: { field: "sk", composite: [] },
-      },
+    primaryKey: {
+      pk: { field: "pk", composite: ["playerId"] },
+      sk: { field: "sk", composite: [] },
     },
   })
   PlayerEntity._configure(AppSchema, MainTable.Tag)
@@ -991,11 +983,9 @@ describe("Integration: Entity Refs", () => {
   const SelectionEntity = Entity.make({
     model: Selection,
     entityType: "Selection",
-    indexes: {
-      primary: {
-        pk: { field: "pk", composite: ["selectionId"] },
-        sk: { field: "sk", composite: [] },
-      },
+    primaryKey: {
+      pk: { field: "pk", composite: ["selectionId"] },
+      sk: { field: "sk", composite: [] },
     },
     refs: {
       team: { entity: TeamEntity },
@@ -1127,11 +1117,9 @@ describe("Integration: Cascade Updates", () => {
   const CascadeTeamEntity = Entity.make({
     model: CascadeTeam,
     entityType: "CascadeTeam",
-    indexes: {
-      primary: {
-        pk: { field: "pk", composite: ["teamId"] },
-        sk: { field: "sk", composite: [] },
-      },
+    primaryKey: {
+      pk: { field: "pk", composite: ["teamId"] },
+      sk: { field: "sk", composite: [] },
     },
   })
   CascadeTeamEntity._configure(AppSchema, MainTable.Tag)
@@ -1139,11 +1127,9 @@ describe("Integration: Cascade Updates", () => {
   const CascadePlayerEntity = Entity.make({
     model: CascadePlayer,
     entityType: "CascadePlayer",
-    indexes: {
-      primary: {
-        pk: { field: "pk", composite: ["playerId"] },
-        sk: { field: "sk", composite: [] },
-      },
+    primaryKey: {
+      pk: { field: "pk", composite: ["playerId"] },
+      sk: { field: "sk", composite: [] },
     },
   })
   CascadePlayerEntity._configure(AppSchema, MainTable.Tag)
@@ -1151,11 +1137,9 @@ describe("Integration: Cascade Updates", () => {
   const CascadeSelectionEntity = Entity.make({
     model: CascadeSelection,
     entityType: "CascadeSelection",
-    indexes: {
-      primary: {
-        pk: { field: "pk", composite: ["selectionId"] },
-        sk: { field: "sk", composite: [] },
-      },
+    primaryKey: {
+      pk: { field: "pk", composite: ["selectionId"] },
+      sk: { field: "sk", composite: [] },
     },
     refs: {
       player: {
@@ -1269,11 +1253,9 @@ describe("Integration: Cascade Updates", () => {
       const CascadeMatchPlayerEntity = Entity.make({
         model: CascadeMatchPlayer,
         entityType: "CascadeMatchPlayer",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["matchPlayerId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["matchPlayerId"] },
+          sk: { field: "sk", composite: [] },
         },
         refs: {
           player: {
@@ -1339,11 +1321,9 @@ describe("Integration: Unique Constraint Update Rotation", () => {
   const AccountEntity = Entity.make({
     model: Account,
     entityType: "Account",
-    indexes: {
-      primary: {
-        pk: { field: "pk", composite: ["accountId"] },
-        sk: { field: "sk", composite: [] },
-      },
+    primaryKey: {
+      pk: { field: "pk", composite: ["accountId"] },
+      sk: { field: "sk", composite: [] },
     },
     unique: { email: ["email"], username: ["username"] },
     versioned: true,

@@ -129,6 +129,14 @@ const Authors = Entity.make({
     pk: { field: "pk", composite: ["authorLastName"] },
     sk: { field: "sk", composite: ["authorFirstName"] },
   },
+  indexes: {
+    works: {
+      collection: "works",
+      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+      composite: ["authorLastName", "authorFirstName"],
+      sk: [],
+    },
+  },
   timestamps: true,
 })
 ```
@@ -144,6 +152,26 @@ const Books = Entity.make({
   primaryKey: {
     pk: { field: "pk", composite: ["isbn"] },
     sk: { field: "sk", composite: ["bookId"] },
+  },
+  indexes: {
+    account: {
+      collection: "account",
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["memberId"],
+      sk: ["loanEndDate"],
+    },
+    works: {
+      collection: "works",
+      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+      composite: ["authorLastName", "authorFirstName"],
+      sk: ["bookId"],
+    },
+    titles: {
+      collection: "titles",
+      index: { name: "gsi3", pk: "gsi3pk", sk: "gsi3sk" },
+      composite: ["bookTitle"],
+      sk: ["releaseDate"],
+    },
   },
   timestamps: true,
 })
@@ -161,6 +189,25 @@ const Genres = Entity.make({
     pk: { field: "pk", composite: ["isbn"] },
     sk: { field: "sk", composite: ["genre", "subgenre"] },
   },
+  indexes: {
+    byGenre: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["genre"],
+      sk: ["subgenre"],
+    },
+    works: {
+      collection: "works",
+      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+      composite: ["authorLastName", "authorFirstName"],
+      sk: ["genre"],
+    },
+    titles: {
+      collection: "titles",
+      index: { name: "gsi3", pk: "gsi3pk", sk: "gsi3sk" },
+      composite: ["bookTitle"],
+      sk: ["genre", "subgenre"],
+    },
+  },
   timestamps: true,
 })
 ```
@@ -177,55 +224,26 @@ const Members = Entity.make({
     pk: { field: "pk", composite: ["memberId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    account: {
+      collection: "account",
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["memberId"],
+      sk: [],
+    },
+  },
   timestamps: true,
 })
 ```
 
 ### Collections -- GSI Access Patterns
 
-All GSI access patterns are defined via `Collections.make()`:
+GSI access patterns are now defined as entity-level indexes. Multi-entity collections (account, works, titles) are auto-discovered from matching collection names across entities:
 
 ```typescript title="collections.ts" region="collections" example="library-system.ts"
-const Account = Collections.make("account", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["memberId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Members: Collections.member(Members, { sk: { composite: [] } }),
-    Books: Collections.member(Books, { sk: { composite: ["loanEndDate"] } }),
-  },
-})
-
-const Categories = Collections.make("categories", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["genre"] },
-  sk: { field: "gsi1sk" },
-  type: "isolated",
-  members: {
-    Genres: Collections.member(Genres, { sk: { composite: ["subgenre"] } }),
-  },
-})
-
-const Works = Collections.make("works", {
-  index: "gsi2",
-  pk: { field: "gsi2pk", composite: ["authorLastName", "authorFirstName"] },
-  sk: { field: "gsi2sk" },
-  members: {
-    Authors: Collections.member(Authors, { sk: { composite: [] } }),
-    Books: Collections.member(Books, { sk: { composite: ["bookId"] } }),
-    Genres: Collections.member(Genres, { sk: { composite: ["genre"] } }),
-  },
-})
-
-const Titles = Collections.make("titles", {
-  index: "gsi3",
-  pk: { field: "gsi3pk", composite: ["bookTitle"] },
-  sk: { field: "gsi3sk" },
-  members: {
-    Books: Collections.member(Books, { sk: { composite: ["releaseDate"] } }),
-    Genres: Collections.member(Genres, { sk: { composite: ["genre", "subgenre"] } }),
-  },
-})
+// GSI access patterns are now defined as entity-level indexes above.
+// Multi-entity collections (account, works, titles) are auto-discovered
+// from matching collection names across entities.
 ```
 
 Key design decisions:
@@ -336,7 +354,6 @@ const members = {
 // Typed execution gateway — binds all entities and collections
 const db = yield* DynamoClient.make({
   entities: { Authors, Books, Genres, Members },
-  collections: { Account, Categories, Works, Titles },
 })
 
 // --- Setup: create table ---
@@ -415,22 +432,22 @@ Author, Book, and Genre share GSI2 via the `Works` collection. All three use `au
 
 ```typescript region="works-collection" example="library-system.ts"
 // Asimov's books
-const { Books: asimovBooks } = yield* db.collections
-  .Works({ authorLastName: "Asimov", authorFirstName: "Isaac" })
-  .collect()
-// → [{ bookTitle: "Foundation", ... }, { bookTitle: "I, Robot", ... }]
+const { Books: asimovBooks } = yield* db.collections.Works!({
+  authorLastName: "Asimov",
+  authorFirstName: "Isaac",
+}).collect()
 
 // Asimov's genres
-const { Genres: asimovGenres } = yield* db.collections
-  .Works({ authorLastName: "Asimov", authorFirstName: "Isaac" })
-  .collect()
-// → [{ subgenre: "Space Opera", ... }, { subgenre: "Robotics", ... }]
+const { Genres: asimovGenres } = yield* db.collections.Works!({
+  authorLastName: "Asimov",
+  authorFirstName: "Isaac",
+}).collect()
 
 // Author's own record in the works collection
-const { Authors: tolkienInfo } = yield* db.collections
-  .Works({ authorLastName: "Tolkien", authorFirstName: "J.R.R." })
-  .collect()
-// → [{ birthday: "1892-01-03", bio: "...", ... }]
+const { Authors: tolkienInfo } = yield* db.collections.Works!({
+  authorLastName: "Tolkien",
+  authorFirstName: "J.R.R.",
+}).collect()
 ```
 
 All three queries hit GSI2 with the same partition key. DynamoDB serves them from the same item collection -- three entity types, one efficient read.
@@ -443,12 +460,12 @@ Member and Book share GSI1 via the `Account` collection. Both use `memberId` as 
 
 ```typescript region="account-collection" example="library-system.ts"
 // Member profile
-const { Members: aliceAccount } = yield* db.collections.Account({ memberId: "m-alice" }).collect()
-// → [{ memberId: "m-alice", city: "New York", state: "NY", ... }]
+const { Members: aliceAccount } = yield* db.collections.Account!({
+  memberId: "m-alice",
+}).collect()
 
 // Alice's loaned books (initially empty -- sparse index)
-const { Books: aliceLoans } = yield* db.collections.Account({ memberId: "m-alice" }).collect()
-// → [] (no books loaned yet)
+const { Books: aliceLoans } = yield* db.collections.Account!({ memberId: "m-alice" }).collect()
 ```
 
 Books only appear in the `Account` collection when `memberId` and `loanEndDate` are populated. This is the sparse index pattern in action.
@@ -460,15 +477,13 @@ Books only appear in the `Account` collection when `memberId` and `loanEndDate` 
 Book and Genre share GSI3 via the `Titles` collection. Both use `bookTitle` as the partition key.
 
 ```typescript region="titles-collection" example="library-system.ts"
-const { Books: foundationByTitle } = yield* db.collections
-  .Titles({ bookTitle: "Foundation" })
-  .collect()
-// → [{ isbn: "978-0-553-293357", releaseDate: "1951-06-01", ... }]
+const { Books: foundationByTitle } = yield* db.collections.Titles!({
+  bookTitle: "Foundation",
+}).collect()
 
-const { Genres: foundationGenresByTitle } = yield* db.collections
-  .Titles({ bookTitle: "Foundation" })
-  .collect()
-// → [{ genre: "Sci-Fi", subgenre: "Space Opera", ... }]
+const { Genres: foundationGenresByTitle } = yield* db.collections.Titles!({
+  bookTitle: "Foundation",
+}).collect()
 ```
 
 ### Requirement 6: Genre Categories
@@ -479,18 +494,14 @@ The `Categories` collection on GSI1 is an **isolated** collection for standalone
 
 ```typescript region="genre-categories" example="library-system.ts"
 // All Sci-Fi subgenres
-const { Genres: sciFiGenres } = yield* db.collections
-  .Categories({ genre: "Sci-Fi" })
-  .collect()
+const sciFiGenres = yield* db.entities.Genres.byGenre({ genre: "Sci-Fi" }).collect()
 // → [
 //   { subgenre: "Robotics", bookTitle: "I, Robot", ... },
 //   { subgenre: "Space Opera", bookTitle: "Foundation", ... },
 // ]
 
 // All Fantasy subgenres
-const { Genres: fantasyGenres } = yield* db.collections
-  .Categories({ genre: "Fantasy" })
-  .collect()
+const fantasyGenres = yield* db.entities.Genres.byGenre({ genre: "Fantasy" }).collect()
 // → [{ subgenre: "High Fantasy", bookTitle: "The Hobbit", ... }]
 ```
 
@@ -515,14 +526,12 @@ yield* db.entities.Books.update(
 )
 
 // Now the book appears in Alice's loans
-const { Books: aliceLoansAfter } = yield* db.collections
-  .Account({ memberId: "m-alice" })
-  .collect()
-// → [{ bookTitle: "The Hobbit", isbn: "978-0-547-928227", ... }]
+const { Books: aliceLoansAfter } = yield* db.collections.Account!({
+  memberId: "m-alice",
+}).collect()
 
 // Bob still has no loans
-const { Books: bobLoans } = yield* db.collections.Account({ memberId: "m-bob" }).collect()
-// → []
+const { Books: bobLoans } = yield* db.collections.Account!({ memberId: "m-bob" }).collect()
 ```
 
 When you update fields that participate in GSI composites, you must provide **all** composites for every affected GSI. Here the update touches `memberId` (Account GSI1), so `loanEndDate` is also required. The author and title fields are needed for GSI2 and GSI3 recomposition.
@@ -549,24 +558,21 @@ yield* Transaction.transactWrite([
 ])
 
 // Book is no longer in Alice's loans
-const { Books: aliceLoansCleared } = yield* db.collections
-  .Account({ memberId: "m-alice" })
-  .collect()
-// → []
+const { Books: aliceLoansCleared } = yield* db.collections.Account!({
+  memberId: "m-alice",
+}).collect()
 
 // But the book still exists and is intact
 const returnedHobbit = yield* db.entities.Books.get({
   isbn: "978-0-547-928227",
   bookId: "b-hobbit",
 })
-// returnedHobbit.bookTitle → "The Hobbit"
-// returnedHobbit.memberId → undefined (cleared)
 
 // And still appears in author's works
-const { Books: tolkienBooksAfter } = yield* db.collections
-  .Works({ authorLastName: "Tolkien", authorFirstName: "J.R.R." })
-  .collect()
-// → [{ bookTitle: "The Hobbit", ... }]
+const { Books: tolkienBooksAfter } = yield* db.collections.Works!({
+  authorLastName: "Tolkien",
+  authorFirstName: "J.R.R.",
+}).collect()
 ```
 
 ---

@@ -12,7 +12,7 @@ Key condition expressions narrow query results at the storage layer — DynamoDB
 - **Sort key condition** — optional, one of 7 operators
 
 This spec covers:
-1. **Entity query accessors** — `Tasks.byProject(...)` flattened from `Tasks.query.byProject(...)`
+1. **Entity query accessors** — `Tasks.query.byProject(...)` namespaced under `.query` on entity definitions
 2. **Typed sort key conditions** — callback API consistent with condition/filter expressions
 3. **Bound entity execution** — `tasks.collect(query)`, `tasks.paginate(query)`, `tasks.scanCollect()`, `tasks.scanPaginate()`
 4. **`Query<A>` as composable data type** — returned by entity accessors, consumed by bound entity terminals
@@ -60,24 +60,22 @@ When partial composites are provided (e.g., only `status` but not `createdAt`), 
 
 ## 3. Entity Query Accessors
 
-### 3.1 Flattened Namespace
+### 3.1 Query Namespace
 
-Query accessors live directly on the **entity definition** — no `.query` namespace:
+Query accessors live under the `.query` namespace on the **entity definition**:
 
 ```typescript
-// Before (current API)
-TaskEntity.query.byProject({ projectId: "proj-alpha" })
-
-// After (proposed API)
-Tasks.byProject({ projectId: "proj-alpha" })
+Tasks.query.byProject({ projectId: "proj-alpha" })
 ```
 
-Each non-primary index defined on the entity generates a named accessor. The accessor name matches the index name.
+Each non-primary index defined on the entity generates a named accessor under `.query`. The accessor name matches the index name.
+
+The `.query` namespace avoids naming conflicts with other entity definition properties (`filter`, `condition`, `select`, `scan`, `set`, `versions`, `deleted`, etc.).
 
 ### 3.2 Accessor Signature
 
 ```typescript
-Tasks.byProject(
+Tasks.query.byProject(
   pk: { projectId: string; status?: string; createdAt?: string },
   skCondition?: SkCallback | SkShorthand,
 ): Query<Task>
@@ -114,10 +112,10 @@ const Tasks = Entity.make({
 })
 ```
 
-| Index Definition | Accessor | PK Argument | SK Composites |
+| Index Definition | Query Accessor | PK Argument | SK Composites |
 |---|---|---|---|
-| `byProject` | `Tasks.byProject(...)` | `{ projectId: string }` (required) | `status?: string`, `createdAt?: string` |
-| `byAssignee` | `Tasks.byAssignee(...)` | `{ assigneeId: string }` (required) | `priority?: string`, `dueDate?: string` |
+| `byProject` | `Tasks.query.byProject(...)` | `{ projectId: string }` (required) | `status?: string`, `createdAt?: string` |
+| `byAssignee` | `Tasks.query.byAssignee(...)` | `{ assigneeId: string }` (required) | `priority?: string`, `dueDate?: string` |
 
 Primary index does not generate a query accessor — primary key lookups go through `tasks.get(key)`.
 
@@ -142,16 +140,16 @@ When SK composites are provided in the first argument and no explicit SK conditi
 
 ```typescript
 // Only PK — no SK condition
-Tasks.byProject({ projectId: "proj-alpha" })
+Tasks.query.byProject({ projectId: "proj-alpha" })
 // KeyConditionExpression: gsi1pk = :pk
 
 // PK + first SK composite — auto begins_with
-Tasks.byProject({ projectId: "proj-alpha", status: "active" })
+Tasks.query.byProject({ projectId: "proj-alpha", status: "active" })
 // KeyConditionExpression: gsi1pk = :pk AND begins_with(gsi1sk, :skPrefix)
 // where :skPrefix = "$myapp#v1#task#active"
 
 // PK + all SK composites — auto begins_with on full composed value
-Tasks.byProject({ projectId: "proj-alpha", status: "active", createdAt: "2024-03-15" })
+Tasks.query.byProject({ projectId: "proj-alpha", status: "active", createdAt: "2024-03-15" })
 // KeyConditionExpression: gsi1pk = :pk AND begins_with(gsi1sk, :skPrefix)
 // where :skPrefix = "$myapp#v1#task#active#2024-03-15"
 ```
@@ -163,7 +161,7 @@ Tasks.byProject({ projectId: "proj-alpha", status: "active", createdAt: "2024-03
 The optional second argument to a query accessor is a sort key condition, expressed as a callback consistent with the condition/filter API:
 
 ```typescript
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha", status: "active" },
   (sk, { gte }) => gte(sk.createdAt, "2024-03-01"),
 )
@@ -182,7 +180,7 @@ The `sk` parameter provides typed access to the SK composite attributes that wer
 // First arg provides: { status: "active" }
 // → sk exposes: { createdAt: Path<string> }
 
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha", status: "active" },
   (sk, { gte }) => gte(sk.createdAt, "2024-03-01"),
   //                    ^^^^^^^^^^^^^ typed as Path<string>
@@ -194,7 +192,7 @@ If the first argument provides all SK composites, the callback is not needed and
 If the first argument provides no SK composites, `sk` exposes all of them:
 
 ```typescript
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha" },
   (sk, { beginsWith }) => beginsWith(sk.status, "act"),
 )
@@ -232,7 +230,7 @@ The provided SK composites form a **prefix**. The callback operator is applied t
 // Index: byProject, sk.composite: ["status", "createdAt"]
 
 // gte on createdAt (status provided in first arg)
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha", status: "active" },
   (sk, { gte }) => gte(sk.createdAt, "2024-03-01"),
 )
@@ -242,7 +240,7 @@ Tasks.byProject(
 //   KeyConditionExpression: gsi1pk = :pk AND gsi1sk >= :skValue
 
 // between on createdAt
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha", status: "active" },
   (sk, { between }) => between(sk.createdAt, "2024-01-01", "2024-06-30"),
 )
@@ -252,7 +250,7 @@ Tasks.byProject(
 //   KeyConditionExpression: gsi1pk = :pk AND gsi1sk BETWEEN :lo AND :hi
 
 // beginsWith on status (no SK composites provided)
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha" },
   (sk, { beginsWith }) => beginsWith(sk.status, "act"),
 )
@@ -262,7 +260,7 @@ Tasks.byProject(
 //   KeyConditionExpression: gsi1pk = :pk AND begins_with(gsi1sk, :skPrefix)
 
 // eq on createdAt (exact match)
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha", status: "active" },
   (sk, { eq }) => eq(sk.createdAt, "2024-03-15T10:00:00Z"),
 )
@@ -277,20 +275,20 @@ The callback can only target the **first unprovided** SK composite. You cannot s
 // sk.composite: ["status", "createdAt"]
 
 // ✅ Provide status, condition on createdAt
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha", status: "active" },
   (sk, { gte }) => gte(sk.createdAt, "2024-01-01"),
 )
 
 // ✅ No SK composites provided, condition on status
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha" },
   (sk, { beginsWith }) => beginsWith(sk.status, "act"),
 )
 
 // ❌ Cannot skip status and condition on createdAt
 // (This would not be meaningful — composed SK has status before createdAt)
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha" },
   (sk, { gte }) => gte(sk.createdAt, "2024-01-01"),
   //                    ^^^^^^^^^^^^^ Type error: createdAt not in SkPath
@@ -306,13 +304,13 @@ For simple cases, a shorthand object can be used instead of a callback:
 
 ```typescript
 // Shorthand — operator on the next SK composite
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha", status: "active" },
   { gte: "2024-03-01" },
 )
 
 // Equivalent callback
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha", status: "active" },
   (sk, { gte }) => gte(sk.createdAt, "2024-03-01"),
 )
@@ -355,14 +353,14 @@ const { Tasks: tasks } = yield* DynamoClient.make(MainTable)
 
 // collect — fetch all pages, return flat array
 const results: Array<Task> = yield* tasks.collect(
-  Tasks.byProject({ projectId: "proj-alpha" }),
+  Tasks.query.byProject({ projectId: "proj-alpha" }),
   Tasks.filter((t, { eq }) => eq(t.priority, "high")),
   Query.limit(25),
 )
 
 // paginate — return Stream for lazy pagination
 const stream: Stream<Task> = tasks.paginate(
-  Tasks.byProject({ projectId: "proj-alpha" }),
+  Tasks.query.byProject({ projectId: "proj-alpha" }),
   Query.reverse,
 )
 ```
@@ -431,9 +429,11 @@ The entity definition provides query construction and typed combinators:
 
 ```typescript
 interface EntityDefinition<E> {
-  // --- Query accessors (one per non-primary index) ---
-  byProject(pk: ByProjectArg, skCondition?: SkCallback | SkShorthand): Query<Entity.Record<E>>
-  byAssignee(pk: ByAssigneeArg, skCondition?: SkCallback | SkShorthand): Query<Entity.Record<E>>
+  // --- Query namespace (one accessor per non-primary index) ---
+  query: {
+    byProject(pk: ByProjectArg, skCondition?: SkCallback | SkShorthand): Query<Entity.Record<E>>
+    byAssignee(pk: ByAssigneeArg, skCondition?: SkCallback | SkShorthand): Query<Entity.Record<E>>
+  }
 
   // --- Typed combinators ---
   filter(cb: (t: PathBuilder<Model>, ops: ConditionOps) => Expr): QueryCombinator
@@ -536,7 +536,7 @@ Sort key conditions and filter expressions serve different purposes and compose 
 
 ```typescript
 yield* tasks.collect(
-  Tasks.byProject(
+  Tasks.query.byProject(
     { projectId: "proj-alpha", status: "active" },
     (sk, { gte }) => gte(sk.createdAt, "2024-03-01"),
   ),
@@ -553,11 +553,11 @@ If the second argument (SK condition) is provided, it **overrides** the auto `be
 
 ```typescript
 // Auto begins_with from composites (no second arg)
-Tasks.byProject({ projectId: "proj-alpha", status: "active" })
+Tasks.query.byProject({ projectId: "proj-alpha", status: "active" })
 // → begins_with(gsi1sk, "$myapp#v1#task#active")
 
 // Explicit gte overrides auto begins_with
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha", status: "active" },
   (sk, { gte }) => gte(sk.createdAt, "2024-03-01"),
 )
@@ -569,7 +569,7 @@ Tasks.byProject(
 ```typescript
 // Most recent tasks first, up to 10
 yield* tasks.collect(
-  Tasks.byProject(
+  Tasks.query.byProject(
     { projectId: "proj-alpha", status: "active" },
     (sk, { gte }) => gte(sk.createdAt, "2024-01-01"),
   ),
@@ -582,7 +582,7 @@ yield* tasks.collect(
 
 ```typescript
 // First page
-const page1 = yield* Tasks.byProject(
+const page1 = yield* Tasks.query.byProject(
   { projectId: "proj-alpha", status: "active" },
   { gte: "2024-01-01" },
 ).pipe(
@@ -592,7 +592,7 @@ const page1 = yield* Tasks.byProject(
 
 // Next page
 if (page1.cursor) {
-  const page2 = yield* Tasks.byProject(
+  const page2 = yield* Tasks.query.byProject(
     { projectId: "proj-alpha", status: "active" },
     { gte: "2024-01-01" },
   ).pipe(
@@ -609,10 +609,10 @@ if (page1.cursor) {
 
 ```typescript
 // ✅ projectId is PK composite — required
-Tasks.byProject({ projectId: "proj-alpha" })
+Tasks.query.byProject({ projectId: "proj-alpha" })
 
 // ❌ Missing required PK composite
-Tasks.byProject({ status: "active" })
+Tasks.query.byProject({ status: "active" })
 // Type error: Property 'projectId' is missing
 ```
 
@@ -620,13 +620,13 @@ Tasks.byProject({ status: "active" })
 
 ```typescript
 // ✅ No SK composites
-Tasks.byProject({ projectId: "proj-alpha" })
+Tasks.query.byProject({ projectId: "proj-alpha" })
 
 // ✅ First SK composite
-Tasks.byProject({ projectId: "proj-alpha", status: "active" })
+Tasks.query.byProject({ projectId: "proj-alpha", status: "active" })
 
 // ✅ All SK composites
-Tasks.byProject({ projectId: "proj-alpha", status: "active", createdAt: "2024-03-15" })
+Tasks.query.byProject({ projectId: "proj-alpha", status: "active", createdAt: "2024-03-15" })
 
 // ❌ Cannot skip status and provide createdAt
 // (Allowed by TypeScript since both are optional, but runtime validation rejects it
@@ -643,19 +643,19 @@ The `sk` parameter only exposes the **next unprovided** SK composite:
 // sk.composite: ["status", "createdAt"]
 
 // Provide status → sk has createdAt
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha", status: "active" },
   (sk, { gte }) => gte(sk.createdAt, "2024-03-01"),  // ✅
 )
 
 // Provide nothing → sk has status
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha" },
   (sk, { beginsWith }) => beginsWith(sk.status, "act"),  // ✅
 )
 
 // Provide status → sk does NOT have status
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha", status: "active" },
   (sk, { eq }) => eq(sk.status, "active"),  // ❌ Type error: status not in sk
 )
@@ -665,12 +665,12 @@ Tasks.byProject(
 
 ```typescript
 // createdAt is typed as string in the model
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha", status: "active" },
   (sk, { gte }) => gte(sk.createdAt, "2024-03-01"),  // ✅ string
 )
 
-Tasks.byProject(
+Tasks.query.byProject(
   { projectId: "proj-alpha", status: "active" },
   (sk, { gte }) => gte(sk.createdAt, 42),  // ❌ number ≠ string
 )
@@ -707,11 +707,11 @@ Collection queries may gain typed SK conditions in a future spec.
 
 | Current API | Proposed API | Notes |
 |---|---|---|
-| `TaskEntity.query.byProject({ projectId })` | `Tasks.byProject({ projectId })` | Flattened namespace |
-| `TaskEntity.query.byProject({ projectId, status })` | `Tasks.byProject({ projectId, status })` | Same auto `begins_with` |
+| `TaskEntity.query.byProject({ projectId })` | `Tasks.query.byProject({ projectId })` | Renamed entity variable |
+| `TaskEntity.query.byProject({ projectId, status })` | `Tasks.query.byProject({ projectId, status })` | Same auto `begins_with` |
 | `TaskEntity.scan()` | `tasks.scanCollect()` / `tasks.scanPaginate()` | On bound entity |
-| `tasks.collect(TaskEntity.query.byProject({...}))` | `tasks.collect(Tasks.byProject({...}))` | Flattened namespace |
-| `tasks.paginate(TaskEntity.query.byProject({...}))` | `tasks.paginate(Tasks.byProject({...}))` | Flattened namespace |
+| `tasks.collect(TaskEntity.query.byProject({...}))` | `tasks.collect(Tasks.query.byProject({...}))` | Renamed entity variable |
+| `tasks.paginate(TaskEntity.query.byProject({...}))` | `tasks.paginate(Tasks.query.byProject({...}))` | Renamed entity variable |
 | `Query.where({ beginsWith: prefix })` | Auto `begins_with` from SK composites | No manual prefix needed |
 | `Query.where({ gte: manualComposed })` | `(sk, { gte }) => gte(sk.attr, value)` | Typed, auto-composed |
 | `KeyComposer.composeSortKeyPrefix(...)` + `Query.where(...)` | `(sk, { between }) => between(sk.attr, lo, hi)` | Framework composes internally |
@@ -720,7 +720,6 @@ Collection queries may gain typed SK conditions in a future spec.
 
 ### What's Removed
 
-- `Tasks.query` namespace — replaced by direct accessors on entity definition
 - `Tasks.scan()` — replaced by `tasks.scanCollect()` / `tasks.scanPaginate()` on bound entity
 - `Query.where(condition)` — replaced by SK callback/shorthand on query accessors
 - Manual `KeyComposer.composeSortKeyPrefix()` calls — framework composes internally
@@ -783,17 +782,17 @@ const program = Effect.gen(function* () {
 
   // --- Basic query (PK only) ---
   const allProjectTasks = yield* tasks.collect(
-    Tasks.byProject({ projectId: "proj-alpha" }),
+    Tasks.query.byProject({ projectId: "proj-alpha" }),
   )
 
   // --- Auto begins_with from SK composites ---
   const activeTasks = yield* tasks.collect(
-    Tasks.byProject({ projectId: "proj-alpha", status: "active" }),
+    Tasks.query.byProject({ projectId: "proj-alpha", status: "active" }),
   )
 
   // --- Typed SK condition: gte ---
   const recentActive = yield* tasks.collect(
-    Tasks.byProject(
+    Tasks.query.byProject(
       { projectId: "proj-alpha", status: "active" },
       (sk, { gte }) => gte(sk.createdAt, "2024-03-01"),
     ),
@@ -801,7 +800,7 @@ const program = Effect.gen(function* () {
 
   // --- Typed SK condition: between ---
   const q1Tasks = yield* tasks.collect(
-    Tasks.byProject(
+    Tasks.query.byProject(
       { projectId: "proj-alpha", status: "active" },
       (sk, { between }) => between(sk.createdAt, "2024-01-01", "2024-03-31"),
     ),
@@ -809,7 +808,7 @@ const program = Effect.gen(function* () {
 
   // --- SK shorthand ---
   const recentShorthand = yield* tasks.collect(
-    Tasks.byProject(
+    Tasks.query.byProject(
       { projectId: "proj-alpha", status: "active" },
       { gte: "2024-03-01" },
     ),
@@ -817,7 +816,7 @@ const program = Effect.gen(function* () {
 
   // --- SK condition + filter + limit + reverse ---
   const topPriority = yield* tasks.collect(
-    Tasks.byProject(
+    Tasks.query.byProject(
       { projectId: "proj-alpha", status: "active" },
       (sk, { gte }) => gte(sk.createdAt, "2024-01-01"),
     ),
@@ -828,7 +827,7 @@ const program = Effect.gen(function* () {
 
   // --- Paginate with SK condition ---
   const stream = tasks.paginate(
-    Tasks.byProject(
+    Tasks.query.byProject(
       { projectId: "proj-alpha", status: "active" },
       (sk, { gte }) => gte(sk.createdAt, "2024-01-01"),
     ),
@@ -839,7 +838,7 @@ const program = Effect.gen(function* () {
   )
 
   // --- Single page with cursor ---
-  const page1 = yield* Tasks.byProject(
+  const page1 = yield* Tasks.query.byProject(
     { projectId: "proj-alpha", status: "active" },
   ).pipe(
     Query.limit(25),
@@ -896,7 +895,7 @@ const { data } = await Task.query.byProject({ projectId: "proj-alpha" }).go()
 
 // effect-dynamodb
 const data = yield* tasks.collect(
-  Tasks.byProject({ projectId: "proj-alpha" }),
+  Tasks.query.byProject({ projectId: "proj-alpha" }),
 )
 ```
 
@@ -910,7 +909,7 @@ const { data } = await Task.query
 
 // effect-dynamodb
 const data = yield* tasks.collect(
-  Tasks.byProject({ projectId: "proj-alpha", status: "active" }),
+  Tasks.query.byProject({ projectId: "proj-alpha", status: "active" }),
 )
 ```
 
@@ -925,7 +924,7 @@ const { data } = await Task.query
 
 // effect-dynamodb — callback
 const data = yield* tasks.collect(
-  Tasks.byProject(
+  Tasks.query.byProject(
     { projectId: "proj-alpha", status: "active" },
     (sk, { gte }) => gte(sk.createdAt, "2024-03-01"),
   ),
@@ -933,7 +932,7 @@ const data = yield* tasks.collect(
 
 // effect-dynamodb — shorthand
 const data = yield* tasks.collect(
-  Tasks.byProject(
+  Tasks.query.byProject(
     { projectId: "proj-alpha", status: "active" },
     { gte: "2024-03-01" },
   ),
@@ -954,7 +953,7 @@ const { data } = await Task.query
 
 // effect-dynamodb
 const data = yield* tasks.collect(
-  Tasks.byProject(
+  Tasks.query.byProject(
     { projectId: "proj-alpha", status: "active" },
     (sk, { between }) => between(sk.createdAt, "2024-01-01", "2024-06-30"),
   ),
@@ -973,7 +972,7 @@ const { data } = await Task.query
 
 // effect-dynamodb
 const data = yield* tasks.collect(
-  Tasks.byProject(
+  Tasks.query.byProject(
     { projectId: "proj-alpha", status: "active" },
     (sk, { gte }) => gte(sk.createdAt, "2024-03-01"),
   ),

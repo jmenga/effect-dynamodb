@@ -51,6 +51,13 @@ const Products = Entity.make({
     pk: { field: "pk", composite: ["productId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byCategory: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["category"],
+      sk: ["productId"],
+    },
+  },
   timestamps: true,
 })
 
@@ -61,28 +68,17 @@ const Reviews = Entity.make({
     pk: { field: "pk", composite: ["reviewId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byProduct: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["productId"],
+      sk: ["reviewId"],
+    },
+  },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Products, Reviews } })
-
-const ProductsByCategory = Collections.make("productsByCategory", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["category"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Products: Collections.member(Products, { sk: { composite: ["productId"] } }),
-  },
-})
-
-const ReviewsByProduct = Collections.make("reviewsByProduct", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["productId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Reviews: Collections.member(Reviews, { sk: { composite: ["reviewId"] } }),
-  },
-})
 ```
 
 Note that both entities overload GSI1 -- Products use it for category lookups while Reviews use it for product lookups. This is standard single-table design.

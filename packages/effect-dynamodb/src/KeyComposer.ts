@@ -21,7 +21,7 @@ export interface KeyPart {
   readonly composite: ReadonlyArray<string>
 }
 
-/** Index definition for primary or secondary index */
+/** Index definition for primary or secondary index (internal format) */
 export interface IndexDefinition {
   readonly index?: string | undefined // Physical GSI name (omit for primary)
   readonly collection?: string | ReadonlyArray<string> | undefined
@@ -30,6 +30,37 @@ export interface IndexDefinition {
   readonly sk: KeyPart
   readonly casing?: DynamoSchema.Casing | undefined
 }
+
+/** Physical GSI field names. */
+export interface GsiIndex {
+  /** Physical GSI name (e.g., `"gsi1"`). */
+  readonly name: string
+  /** PK field name (e.g., `"gsi1pk"`). */
+  readonly pk: string
+  /** SK field name (e.g., `"gsi1sk"`). */
+  readonly sk: string
+}
+
+/** GSI definition as specified on Entity.make() indexes config. */
+export interface GsiConfig {
+  /** Optional collection name. String for single, array for sub-collections. */
+  readonly collection?: string | ReadonlyArray<string> | undefined
+  /** Physical GSI definition: index name + PK/SK field names. */
+  readonly index: GsiIndex
+  /** Shared PK composite attributes. */
+  readonly composite: ReadonlyArray<string>
+  /** SK composite attributes for this entity. */
+  readonly sk: ReadonlyArray<string>
+}
+
+/** Normalize a GsiConfig (entity input) to an IndexDefinition (internal format). */
+export const normalizeGsiConfig = (config: GsiConfig): IndexDefinition => ({
+  index: config.index.name,
+  collection: config.collection,
+  type: "isolated",
+  pk: { field: config.index.pk, composite: [...config.composite] },
+  sk: { field: config.index.sk, composite: [...config.sk] },
+})
 
 /**
  * Extract composite attribute values from an entity record.

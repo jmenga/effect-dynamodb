@@ -18,10 +18,9 @@ describe("Example type-checking", () => {
       })
     } catch (err: unknown) {
       const error = err as { stdout?: Buffer; stderr?: Buffer }
-      const output = [
-        error.stdout?.toString() ?? "",
-        error.stderr?.toString() ?? "",
-      ].join("\n").trim()
+      const output = [error.stdout?.toString() ?? "", error.stderr?.toString() ?? ""]
+        .join("\n")
+        .trim()
       expect.fail(`Type-check failed:\n${output}`)
     }
   })

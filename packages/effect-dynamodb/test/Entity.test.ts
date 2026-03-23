@@ -114,11 +114,9 @@ describe("Entity", () => {
       const UserEntity = Entity.make({
         model: User,
         entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
         },
       })
 
@@ -131,15 +129,15 @@ describe("Entity", () => {
       const UserEntity = Entity.make({
         model: User,
         entityType: "User",
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
+        },
         indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
           byEmail: {
-            index: "gsi1",
-            pk: { field: "gsi1pk", composite: ["email"] },
-            sk: { field: "gsi1sk", composite: [] },
+            index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+            composite: ["email"],
+            sk: [],
           },
         },
       })
@@ -154,11 +152,9 @@ describe("Entity", () => {
       const UserEntity = Entity.make({
         model: User,
         entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
         },
         timestamps: true,
       })
@@ -174,11 +170,9 @@ describe("Entity", () => {
           model: User,
           entityType: "User",
           // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- bypass compile-time check for runtime test
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: [] },
-              sk: { field: "sk", composite: [] },
-            },
+          primaryKey: {
+            pk: { field: "pk", composite: [] },
+            sk: { field: "sk", composite: [] },
           } as any,
         }),
       ).toThrow("primary index must have at least one composite attribute across pk and sk")
@@ -189,11 +183,9 @@ describe("Entity", () => {
         Entity.make({
           model: User,
           entityType: "User",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: [] },
-              sk: { field: "sk", composite: ["userId"] },
-            },
+          primaryKey: {
+            pk: { field: "pk", composite: [] },
+            sk: { field: "sk", composite: ["userId"] },
           },
         }),
       ).not.toThrow()
@@ -203,11 +195,9 @@ describe("Entity", () => {
       const UserEntity = Entity.make({
         model: User,
         entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
         },
         versioned: true,
       })
@@ -220,11 +210,9 @@ describe("Entity", () => {
       const UserEntity = Entity.make({
         model: User,
         entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
         },
         softDelete: true,
       })
@@ -236,11 +224,9 @@ describe("Entity", () => {
       const UserEntity = Entity.make({
         model: User,
         entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
         },
         unique: { email: ["email"] },
       })
@@ -252,11 +238,9 @@ describe("Entity", () => {
       const UserEntity = Entity.make({
         model: User,
         entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
         },
       })
 
@@ -279,11 +263,9 @@ describe("Entity", () => {
       const UserEntity = Entity.make({
         model: User,
         entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
         },
         timestamps: true,
       })
@@ -296,11 +278,9 @@ describe("Entity", () => {
       const UserEntity = Entity.make({
         model: User,
         entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
         },
         timestamps: { created: "registeredAt", updated: "modifiedAt" },
       })
@@ -313,11 +293,9 @@ describe("Entity", () => {
       const UserEntity = Entity.make({
         model: User,
         entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
         },
         versioned: true,
       })
@@ -329,11 +307,9 @@ describe("Entity", () => {
       const UserEntity = Entity.make({
         model: User,
         entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
         },
         versioned: { field: "revision" },
       })
@@ -345,11 +321,9 @@ describe("Entity", () => {
       const UserEntity = Entity.make({
         model: User,
         entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
         },
         versioned: { retain: true },
       })
@@ -368,15 +342,15 @@ describe("Entity", () => {
       Entity.make({
         model: User,
         entityType: "User",
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
+        },
         indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
           byEmail: {
-            index: "gsi1",
-            pk: { field: "gsi1pk", composite: ["email"] },
-            sk: { field: "gsi1sk", composite: [] },
+            index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+            composite: ["email"],
+            sk: [],
           },
         },
         timestamps: true,
@@ -520,11 +494,9 @@ describe("Entity", () => {
         Entity.make({
           model: UserWithImmutableModel,
           entityType: "UserImm",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
           },
         }),
       )
@@ -546,11 +518,9 @@ describe("Entity", () => {
         Entity.make({
           model: UserWithImmutableModel,
           entityType: "UserImm",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
           },
         }),
       )
@@ -570,11 +540,9 @@ describe("Entity", () => {
         Entity.make({
           model: UserWithImmutableModel,
           entityType: "UserImm",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
           },
         }),
       )
@@ -600,15 +568,15 @@ describe("Entity", () => {
         Entity.make({
           model: User,
           entityType: "User",
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
           indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
             byEmail: {
-              index: "gsi1",
-              pk: { field: "gsi1pk", composite: ["email"] },
-              sk: { field: "gsi1sk", composite: [] },
+              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+              composite: ["email"],
+              sk: [],
             },
           },
         }),
@@ -629,11 +597,9 @@ describe("Entity", () => {
         Entity.make({
           model: TenantUser,
           entityType: "TenantUser",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["tenantId"] },
-              sk: { field: "sk", composite: ["userId"] },
-            },
+          primaryKey: {
+            pk: { field: "pk", composite: ["tenantId"] },
+            sk: { field: "sk", composite: ["userId"] },
           },
         }),
       )
@@ -648,15 +614,15 @@ describe("Entity", () => {
         Entity.make({
           model: User,
           entityType: "User",
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
           indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
             byEmail: {
-              index: "gsi1",
-              pk: { field: "gsi1pk", composite: ["email"] },
-              sk: { field: "gsi1sk", composite: [] },
+              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+              composite: ["email"],
+              sk: [],
             },
           },
         }),
@@ -674,15 +640,15 @@ describe("Entity", () => {
         Entity.make({
           model: User,
           entityType: "User",
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
           indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
             byEmail: {
-              index: "gsi1",
-              pk: { field: "gsi1pk", composite: ["email"] },
-              sk: { field: "gsi1sk", composite: [] },
+              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+              composite: ["email"],
+              sk: [],
             },
           },
         }),
@@ -704,20 +670,20 @@ describe("Entity", () => {
         Entity.make({
           model: User,
           entityType: "User",
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
           indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
             byEmail: {
-              index: "gsi1",
-              pk: { field: "gsi1pk", composite: ["email"] },
-              sk: { field: "gsi1sk", composite: [] },
+              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+              composite: ["email"],
+              sk: [],
             },
             byRole: {
-              index: "gsi2",
-              pk: { field: "gsi2pk", composite: ["role"] },
-              sk: { field: "gsi2sk", composite: ["userId"] },
+              index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+              composite: ["role"],
+              sk: ["userId"],
             },
           },
         }),
@@ -734,24 +700,23 @@ describe("Entity", () => {
         Entity.make({
           model: User,
           entityType: "User",
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
           indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
             byTenant: {
-              index: "gsi1",
               collection: "TenantItems",
-              type: "clustered",
-              pk: { field: "gsi1pk", composite: ["role"] },
-              sk: { field: "gsi1sk", composite: [] },
+              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+              composite: ["role"],
+              sk: [],
             },
           },
         }),
       )
 
       expect(UserEntity.indexes.byTenant.collection).toBe("TenantItems")
-      expect(UserEntity.indexes.byTenant.type).toBe("clustered")
+      expect(UserEntity.indexes.byTenant.type).toBe("isolated")
     })
   })
 
@@ -765,11 +730,9 @@ describe("Entity", () => {
         Entity.make({
           model: User,
           entityType: "User",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
           },
           unique: { email: ["email"] },
         }),
@@ -789,11 +752,9 @@ describe("Entity", () => {
         Entity.make({
           model: TenantUser,
           entityType: "TenantUser",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
           },
           unique: {
             email: ["email"],
@@ -819,11 +780,9 @@ describe("Entity", () => {
         Entity.make({
           model: User,
           entityType: "User",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
           },
         }),
       )
@@ -839,20 +798,20 @@ describe("Entity", () => {
         Entity.make({
           model: User,
           entityType: "User",
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
           indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
             byEmail: {
-              index: "gsi1",
-              pk: { field: "gsi1pk", composite: ["email"] },
-              sk: { field: "gsi1sk", composite: [] },
+              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+              composite: ["email"],
+              sk: [],
             },
             byRole: {
-              index: "gsi2",
-              pk: { field: "gsi2pk", composite: ["role"] },
-              sk: { field: "gsi2sk", composite: ["userId"] },
+              index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+              composite: ["role"],
+              sk: ["userId"],
             },
           },
         }),
@@ -869,15 +828,15 @@ describe("Entity", () => {
         Entity.make({
           model: User,
           entityType: "User",
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
           indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
             byEmail: {
-              index: "gsi1",
-              pk: { field: "gsi1pk", composite: ["email"] },
-              sk: { field: "gsi1sk", composite: [] },
+              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+              composite: ["email"],
+              sk: [],
             },
           },
         }),
@@ -898,11 +857,9 @@ describe("Entity", () => {
         Entity.make({
           model: SimpleItem,
           entityType: "SimpleItem",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
-            },
+          primaryKey: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
           },
         }),
       )
@@ -924,15 +881,15 @@ describe("Entity", () => {
       Entity.make({
         model: User,
         entityType: "User",
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
+        },
         indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
           byEmail: {
-            index: "gsi1",
-            pk: { field: "gsi1pk", composite: ["email"] },
-            sk: { field: "gsi1sk", composite: [] },
+            index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+            composite: ["email"],
+            sk: [],
           },
         },
         timestamps: true,
@@ -1015,11 +972,9 @@ describe("Entity", () => {
       Entity.make({
         model: User,
         entityType: "User",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
         },
         timestamps: true,
         versioned: true,
@@ -1108,11 +1063,9 @@ describe("Entity", () => {
         Entity.make({
           model: ItemStruct,
           entityType: "Item",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["itemId"] },
-              sk: { field: "sk", composite: [] },
-            },
+          primaryKey: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
           },
         }),
       )
@@ -1134,11 +1087,9 @@ describe("Entity", () => {
       Entity.make({
         model: SimpleItem,
         entityType: "SimpleItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     )
@@ -1223,15 +1174,15 @@ describe("Entity", () => {
           Entity.make({
             model: User,
             entityType: "User",
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
             indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["userId"] },
-                sk: { field: "sk", composite: [] },
-              },
               byEmail: {
-                index: "gsi1",
-                pk: { field: "gsi1pk", composite: ["email"] },
-                sk: { field: "gsi1sk", composite: [] },
+                index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+                composite: ["email"],
+                sk: [],
               },
             },
           }),
@@ -1255,11 +1206,9 @@ describe("Entity", () => {
           Entity.make({
             model: StructModel,
             entityType: "StructItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
           }),
         )
@@ -1293,15 +1242,15 @@ describe("Entity", () => {
         Entity.make({
           model: User,
           entityType: "User",
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
           indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
             byEmail: {
-              index: "gsi2",
-              pk: { field: "gsi2pk", composite: ["email"] },
-              sk: { field: "gsi2sk", composite: [] },
+              index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+              composite: ["email"],
+              sk: [],
             },
           },
           timestamps: true,
@@ -1346,11 +1295,9 @@ describe("Entity", () => {
       Entity.make({
         model: SimpleItem,
         entityType: "SimpleItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     )
@@ -1380,11 +1327,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "TSItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
             timestamps: true,
           }),
@@ -1406,11 +1351,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "VerItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
             versioned: true,
           }),
@@ -1451,11 +1394,9 @@ describe("Entity", () => {
           Entity.make({
             model: User,
             entityType: "UniqueUser",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["userId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
             },
             unique: { email: ["email"] },
           }),
@@ -1491,11 +1432,9 @@ describe("Entity", () => {
           Entity.make({
             model: User,
             entityType: "UniqueUser",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["userId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
             },
             unique: { email: ["email"] },
           }),
@@ -1530,11 +1469,9 @@ describe("Entity", () => {
           Entity.make({
             model: User,
             entityType: "OverflowUser",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["userId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
             },
             unique: uniqueConstraints,
           }),
@@ -1576,11 +1513,9 @@ describe("Entity", () => {
       Entity.make({
         model: SimpleItem,
         entityType: "SimpleItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     )
@@ -1634,11 +1569,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "TSItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
             timestamps: true,
             versioned: true,
@@ -1675,11 +1608,9 @@ describe("Entity", () => {
       Entity.make({
         model: SimpleItem,
         entityType: "SimpleItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     )
@@ -1751,11 +1682,9 @@ describe("Entity", () => {
       Entity.make({
         model: SimpleItem,
         entityType: "SimpleItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     )
@@ -1840,11 +1769,9 @@ describe("Entity", () => {
       Entity.make({
         model: SimpleItem,
         entityType: "SimpleItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     )
@@ -1881,11 +1808,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "VerItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
             versioned: true,
           }),
@@ -1919,11 +1844,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "VerItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
             versioned: true,
           }),
@@ -1957,11 +1880,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "VerItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
             versioned: true,
           }),
@@ -2005,11 +1926,9 @@ describe("Entity", () => {
       Entity.make({
         model: User,
         entityType: "UniqueUser",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
         },
         unique: { email: ["email"] },
         versioned: true,
@@ -2168,11 +2087,9 @@ describe("Entity", () => {
           Entity.make({
             model: User,
             entityType: "RetainUniqueUser",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["userId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
             },
             unique: { email: ["email"] },
             versioned: { retain: true },
@@ -2220,11 +2137,9 @@ describe("Entity", () => {
       Entity.make({
         model: SimpleItem,
         entityType: "SimpleItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     )
@@ -2248,11 +2163,9 @@ describe("Entity", () => {
           Entity.make({
             model: User,
             entityType: "UniqueUser",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["userId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
             },
             unique: { email: ["email"] },
           }),
@@ -2301,15 +2214,15 @@ describe("Entity", () => {
         Entity.make({
           model: User,
           entityType: "User",
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
           indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
             byEmail: {
-              index: "gsi1",
-              pk: { field: "gsi1pk", composite: ["email"] },
-              sk: { field: "gsi1sk", composite: [] },
+              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+              composite: ["email"],
+              sk: [],
             },
           },
         }),
@@ -2327,15 +2240,15 @@ describe("Entity", () => {
         Entity.make({
           model: User,
           entityType: "User",
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
           indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
             byRole: {
-              index: "gsi2",
-              pk: { field: "gsi2pk", composite: ["role"] },
-              sk: { field: "gsi2sk", composite: ["userId"] },
+              index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+              composite: ["role"],
+              sk: ["userId"],
             },
           },
         }),
@@ -2373,15 +2286,15 @@ describe("Entity", () => {
           Entity.make({
             model: User,
             entityType: "User",
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
             indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["userId"] },
-                sk: { field: "sk", composite: [] },
-              },
               byEmail: {
-                index: "gsi1",
-                pk: { field: "gsi1pk", composite: ["email"] },
-                sk: { field: "gsi1sk", composite: [] },
+                index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+                composite: ["email"],
+                sk: [],
               },
             },
           }),
@@ -2400,15 +2313,15 @@ describe("Entity", () => {
         Entity.make({
           model: User,
           entityType: "User",
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
           indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
             byRole: {
-              index: "gsi2",
-              pk: { field: "gsi2pk", composite: ["role"] },
-              sk: { field: "gsi2sk", composite: ["userId"] },
+              index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+              composite: ["role"],
+              sk: ["userId"],
             },
           },
         }),
@@ -2423,15 +2336,15 @@ describe("Entity", () => {
         Entity.make({
           model: User,
           entityType: "User",
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
           indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
             byRole: {
-              index: "gsi2",
-              pk: { field: "gsi2pk", composite: ["role"] },
-              sk: { field: "gsi2sk", composite: ["userId", "email"] },
+              index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+              composite: ["role"],
+              sk: ["userId", "email"],
             },
           },
         }),
@@ -2450,15 +2363,15 @@ describe("Entity", () => {
         Entity.make({
           model: User,
           entityType: "User",
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
           indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
             byRole: {
-              index: "gsi2",
-              pk: { field: "gsi2pk", composite: ["role"] },
-              sk: { field: "gsi2sk", composite: ["userId", "email"] },
+              index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+              composite: ["role"],
+              sk: ["userId", "email"],
             },
           },
         }),
@@ -2509,11 +2422,9 @@ describe("Entity", () => {
       Entity.make({
         model: SimpleItem,
         entityType: "SimpleItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     )
@@ -2597,11 +2508,9 @@ describe("Entity", () => {
       Entity.make({
         model: SimpleItem,
         entityType: "SimpleItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     )
@@ -2695,11 +2604,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "SimpleItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
             versioned: true,
           }),
@@ -2762,11 +2669,9 @@ describe("Entity", () => {
       Entity.make({
         model: SimpleItem,
         entityType: "SimpleItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     )
@@ -2809,11 +2714,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "SimpleItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
             timestamps: true,
           }),
@@ -2840,11 +2743,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "SimpleItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
             versioned: true,
           }),
@@ -2887,11 +2788,9 @@ describe("Entity", () => {
       Entity.make({
         model: SimpleItem,
         entityType: "SimpleItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     )
@@ -3003,11 +2902,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "SimpleItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
             versioned: true,
           }),
@@ -3070,11 +2967,9 @@ describe("Entity", () => {
       Entity.make({
         model: SimpleItem,
         entityType: "SimpleItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     )
@@ -3112,11 +3007,9 @@ describe("Entity", () => {
       Entity.make({
         model: SimpleItem,
         entityType: "SimpleItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     )
@@ -3192,15 +3085,15 @@ describe("Entity", () => {
       Entity.make({
         model: TenantItem,
         entityType: "TenantItem",
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
+        },
         indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
           byTenant: {
-            index: "gsi1",
-            pk: { field: "gsi1pk", composite: ["tenantId"] },
-            sk: { field: "gsi1sk", composite: ["region"] },
+            index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+            composite: ["tenantId"],
+            sk: ["region"],
           },
         },
       }),
@@ -3273,15 +3166,15 @@ describe("Entity", () => {
       Entity.make({
         model: TenantUser,
         entityType: "TenantUser",
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
+        },
         indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
           byTenant: {
-            index: "gsi1",
-            pk: { field: "gsi1pk", composite: ["tenantId"] },
-            sk: { field: "gsi1sk", composite: ["region"] },
+            index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+            composite: ["tenantId"],
+            sk: ["region"],
           },
         },
       }),
@@ -3430,20 +3323,20 @@ describe("Entity", () => {
           Entity.make({
             model: MultiGsiUser,
             entityType: "MultiGsiUser",
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
             indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["userId"] },
-                sk: { field: "sk", composite: [] },
-              },
               byTenant: {
-                index: "gsi1",
-                pk: { field: "gsi1pk", composite: ["tenantId"] },
-                sk: { field: "gsi1sk", composite: ["region"] },
+                index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+                composite: ["tenantId"],
+                sk: ["region"],
               },
               byDepartment: {
-                index: "gsi2",
-                pk: { field: "gsi2pk", composite: ["department"] },
-                sk: { field: "gsi2sk", composite: [] },
+                index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+                composite: ["department"],
+                sk: [],
               },
             },
           }),
@@ -3490,11 +3383,9 @@ describe("Entity", () => {
       Entity.make({
         model: SimpleItem,
         entityType: "RetainItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
         },
         timestamps: true,
         versioned: { retain: true },
@@ -3534,11 +3425,9 @@ describe("Entity", () => {
           Entity.make({
             model: User,
             entityType: "UniqueRetain",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["userId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
             },
             versioned: { retain: true },
             unique: { email: ["email"] },
@@ -3714,11 +3603,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "TtlRetain",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
             versioned: { retain: true, ttl: Duration.days(90) },
           }),
@@ -3744,11 +3631,9 @@ describe("Entity", () => {
       Entity.make({
         model: SimpleItem,
         entityType: "SoftItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
         },
         timestamps: true,
         versioned: true,
@@ -3797,11 +3682,9 @@ describe("Entity", () => {
           Entity.make({
             model: User,
             entityType: "SoftUnique",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["userId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
             },
             softDelete: true,
             unique: { email: ["email"] },
@@ -3837,11 +3720,9 @@ describe("Entity", () => {
           Entity.make({
             model: User,
             entityType: "PreserveUniq",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["userId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
             },
             softDelete: { preserveUnique: true },
             unique: { email: ["email"] },
@@ -3875,11 +3756,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "SoftRetain",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
             versioned: { retain: true },
             softDelete: true,
@@ -3971,11 +3850,9 @@ describe("Entity", () => {
       Entity.make({
         model: SimpleItem,
         entityType: "RestoreItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
         },
         timestamps: true,
         versioned: true,
@@ -4029,11 +3906,9 @@ describe("Entity", () => {
           Entity.make({
             model: User,
             entityType: "RestoreUniq",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["userId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
             },
             versioned: true,
             softDelete: true,
@@ -4076,11 +3951,9 @@ describe("Entity", () => {
           Entity.make({
             model: User,
             entityType: "RestoreUniq",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["userId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
             },
             versioned: true,
             softDelete: true,
@@ -4128,11 +4001,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "RestoreRetain",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
             versioned: { retain: true },
             softDelete: true,
@@ -4231,11 +4102,9 @@ describe("Entity", () => {
       Entity.make({
         model: SimpleItem,
         entityType: "PurgeItem",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["itemId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     )
@@ -4280,11 +4149,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "PurgeSoft",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
             softDelete: true,
           }),
@@ -4361,11 +4228,9 @@ describe("Entity", () => {
       Entity.make({
         model: Event,
         entityType: "Event",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["eventId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["eventId"] },
+          sk: { field: "sk", composite: [] },
         },
         timestamps: true,
       }),
@@ -4375,11 +4240,9 @@ describe("Entity", () => {
       Entity.make({
         model: EventEpoch,
         entityType: "EventEpoch",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["eventId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["eventId"] },
+          sk: { field: "sk", composite: [] },
         },
         timestamps: true,
       }),
@@ -4389,11 +4252,9 @@ describe("Entity", () => {
       Entity.make({
         model: EventStoredAsEpoch,
         entityType: "EventStoredAs",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["eventId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["eventId"] },
+          sk: { field: "sk", composite: [] },
         },
         timestamps: true,
       }),
@@ -4522,15 +4383,15 @@ describe("Entity", () => {
           Entity.make({
             model: EventEpoch,
             entityType: "EventEpoch",
+            primaryKey: {
+              pk: { field: "pk", composite: ["eventId"] },
+              sk: { field: "sk", composite: [] },
+            },
             indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["eventId"] },
-                sk: { field: "sk", composite: [] },
-              },
               byEvent: {
-                index: "gsi1",
-                pk: { field: "gsi1pk", composite: ["eventId"] },
-                sk: { field: "gsi1sk", composite: [] },
+                index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+                composite: ["eventId"],
+                sk: [],
               },
             },
             timestamps: true,
@@ -4593,11 +4454,9 @@ describe("Entity", () => {
       Entity.make({
         model: DeviceModel,
         entityType: "Device",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["id"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
         },
         timestamps: true,
       }),
@@ -4657,11 +4516,9 @@ describe("Entity", () => {
       Entity.make({
         model: OrderModel,
         entityType: "Order",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["orderId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["orderId"] },
+          sk: { field: "sk", composite: [] },
         },
         timestamps: true,
       }),
@@ -4713,11 +4570,9 @@ describe("Entity", () => {
       Entity.make({
         model: OrderModelFull,
         entityType: "OrderFull",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["orderId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["orderId"] },
+          sk: { field: "sk", composite: [] },
         },
         timestamps: true,
       }),
@@ -4805,11 +4660,9 @@ describe("Entity", () => {
           Entity.make({
             model: Metric,
             entityType: "Metric",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["metricId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["metricId"] },
+              sk: { field: "sk", composite: [] },
             },
             timestamps: {
               created: DynamoModel.DateString,
@@ -4843,11 +4696,9 @@ describe("Entity", () => {
           Entity.make({
             model: Metric,
             entityType: "Metric2",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["metricId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["metricId"] },
+              sk: { field: "sk", composite: [] },
             },
             timestamps: {
               created: "registeredAt",
@@ -4873,11 +4724,9 @@ describe("Entity", () => {
           Entity.make({
             model: Metric,
             entityType: "Metric3",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["metricId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["metricId"] },
+              sk: { field: "sk", composite: [] },
             },
             timestamps: {
               updated: {
@@ -4912,11 +4761,9 @@ describe("Entity", () => {
           Entity.make({
             model: User,
             entityType: "User",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["userId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
             },
             timestamps: true,
             versioned: true,
@@ -4955,11 +4802,9 @@ describe("Entity", () => {
           Entity.make({
             model: User,
             entityType: "User",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["userId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
             },
             timestamps: true,
             versioned: true,
@@ -4985,11 +4830,9 @@ describe("Entity", () => {
           Entity.make({
             model: User,
             entityType: "User",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["userId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
             },
             timestamps: true,
             versioned: true,
@@ -5032,11 +4875,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "SimpleItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
           }),
         )
@@ -5057,11 +4898,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "SimpleItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
           }),
         )
@@ -5086,11 +4925,9 @@ describe("Entity", () => {
           Entity.make({
             model: UserWithImmutableModel,
             entityType: "UserImm",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["userId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
             },
             timestamps: true,
             versioned: true,
@@ -5145,11 +4982,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "SimpleItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
             timestamps: true,
           }),
@@ -5183,11 +5018,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "SimpleItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
             versioned: true,
           }),
@@ -5221,11 +5054,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "SimpleItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
           }),
         )
@@ -5257,11 +5088,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "SimpleItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
           }),
         )
@@ -5293,11 +5122,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "SimpleItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
           }),
         )
@@ -5328,11 +5155,9 @@ describe("Entity", () => {
           Entity.make({
             model: SimpleItem,
             entityType: "SimpleItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
           }),
         )
@@ -5364,11 +5189,9 @@ describe("Entity", () => {
           Entity.make({
             model: ItemWithHidden,
             entityType: "HiddenItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
           }),
         )
@@ -5397,11 +5220,9 @@ describe("Entity", () => {
           Entity.make({
             model: ItemWithHidden,
             entityType: "HiddenItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
             timestamps: true,
           }),
@@ -5434,11 +5255,9 @@ describe("Entity", () => {
           Entity.make({
             model: ItemWithHidden,
             entityType: "HiddenItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
           }),
         )
@@ -5467,11 +5286,9 @@ describe("Entity", () => {
           Entity.make({
             model: ItemWithHidden,
             entityType: "HiddenItem",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["itemId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
             },
           }),
         )
@@ -5516,11 +5333,9 @@ describe("Entity", () => {
       Entity.make({
         model: Team,
         entityType: "Team",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["id"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     )
@@ -5529,11 +5344,9 @@ describe("Entity", () => {
       Entity.make({
         model: Player,
         entityType: "Player",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["id"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     )
@@ -5542,11 +5355,9 @@ describe("Entity", () => {
       Entity.make({
         model: TeamPlayerSelection,
         entityType: "TeamPlayerSelection",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["selectionId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["selectionId"] },
+          sk: { field: "sk", composite: [] },
         },
         refs: {
           team: { entity: TeamEntity },
@@ -5566,11 +5377,9 @@ describe("Entity", () => {
           Entity.make({
             model: BadModel,
             entityType: "BadModel",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["id"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["id"] },
+              sk: { field: "sk", composite: [] },
             },
             refs: { team: { entity: TeamEntity } } as any,
           }),
@@ -5588,11 +5397,9 @@ describe("Entity", () => {
         Entity.make({
           model: NoIdEntity,
           entityType: "NoIdEntity",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["code"] },
-              sk: { field: "sk", composite: [] },
-            },
+          primaryKey: {
+            pk: { field: "pk", composite: ["code"] },
+            sk: { field: "sk", composite: [] },
           },
         }),
       )
@@ -5607,11 +5414,9 @@ describe("Entity", () => {
           Entity.make({
             model: RefModel,
             entityType: "RefModel",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["id"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["id"] },
+              sk: { field: "sk", composite: [] },
             },
             refs: { ref: { entity: NoIdEntityDef } } as any,
           }),
@@ -5741,11 +5546,9 @@ describe("Entity", () => {
           Entity.make({
             model: Team,
             entityType: "TeamTS",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["id"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["id"] },
+              sk: { field: "sk", composite: [] },
             },
             timestamps: true,
           }),
@@ -5794,11 +5597,9 @@ describe("Entity", () => {
           Entity.make({
             model: SelectionWithTSTeam,
             entityType: "SelectionWithTSTeam",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["selectionId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["selectionId"] },
+              sk: { field: "sk", composite: [] },
             },
             refs: {
               team: { entity: TeamWithTimestamps },
@@ -5944,11 +5745,9 @@ describe("Entity", () => {
           Entity.make({
             model: TeamPlayerSelection,
             entityType: "Test",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["selectionId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["selectionId"] },
+              sk: { field: "sk", composite: [] },
             },
             refs: { nonexistent: { entity: TeamEntity } } as any,
           }),
@@ -6016,11 +5815,9 @@ describe("Entity", () => {
         Entity.make({
           model: BTeam,
           entityType: "BTeam",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["id"] },
-              sk: { field: "sk", composite: [] },
-            },
+          primaryKey: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
           },
         }),
       )
@@ -6029,11 +5826,9 @@ describe("Entity", () => {
         Entity.make({
           model: BPlayer,
           entityType: "BPlayer",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["id"] },
-              sk: { field: "sk", composite: [] },
-            },
+          primaryKey: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
           },
         }),
       )
@@ -6042,11 +5837,9 @@ describe("Entity", () => {
         Entity.make({
           model: BSel,
           entityType: "BSel",
-          indexes: {
-            primary: {
-              pk: { field: "pk", composite: ["id"] },
-              sk: { field: "sk", composite: [] },
-            },
+          primaryKey: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
           },
           refs: {
             team: { entity: BTeamEntity },
@@ -6096,11 +5889,9 @@ describe("Entity", () => {
       Entity.make({
         model: CascadePlayer,
         entityType: "CascadePlayer",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["playerId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["playerId"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     )
@@ -6109,11 +5900,9 @@ describe("Entity", () => {
       Entity.make({
         model: CascadeSelection,
         entityType: "CascadeSelection",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["selectionId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["selectionId"] },
+          sk: { field: "sk", composite: [] },
         },
         refs: {
           player: {
@@ -6128,11 +5917,9 @@ describe("Entity", () => {
       Entity.make({
         model: CascadeMatchPlayer,
         entityType: "CascadeMatchPlayer",
-        indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["matchPlayerId"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: ["matchPlayerId"] },
+          sk: { field: "sk", composite: [] },
         },
         refs: {
           player: {
@@ -6442,11 +6229,9 @@ describe("Entity", () => {
           Entity.make({
             model: Unrelated,
             entityType: "Unrelated",
-            indexes: {
-              primary: {
-                pk: { field: "pk", composite: ["unrelatedId"] },
-                sk: { field: "sk", composite: [] },
-              },
+            primaryKey: {
+              pk: { field: "pk", composite: ["unrelatedId"] },
+              sk: { field: "sk", composite: [] },
             },
           }),
         )

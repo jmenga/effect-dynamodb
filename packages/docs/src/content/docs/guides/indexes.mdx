@@ -17,6 +17,18 @@ const Tasks = Entity.make({
     pk: { field: "pk", composite: ["taskId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byProject: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["projectId"],
+      sk: ["priority"],
+    },
+    byAssignee: {
+      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+      composite: ["assigneeId"],
+      sk: ["priority"],
+    },
+  },
   timestamps: true,
 })
 ```
@@ -43,28 +55,11 @@ primaryKey: {
 | `sk.field` | `string` | Yes | Physical DynamoDB attribute name |
 | `sk.composite` | `string[]` | Yes | Model attributes composing the sort key |
 
-### GSI Access Patterns via Collections
+### GSI Access Patterns via Entity Indexes
 
-GSI access patterns are defined using `Collections.make()`. Each collection owns the index definition and member entities specify their SK composites:
+GSI access patterns are now defined directly on the entity via the `indexes` property. Each index specifies the physical GSI, PK composites, and SK composites:
 
 ```typescript region="task-collections" example="guide-indexes.ts"
-const ByProject = Collections.make("byProject", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["projectId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Tasks: Collections.member(Tasks, { sk: { composite: ["priority"] } }),
-  },
-})
-
-const ByAssignee = Collections.make("byAssignee", {
-  index: "gsi2",
-  pk: { field: "gsi2pk", composite: ["assigneeId"] },
-  sk: { field: "gsi2sk" },
-  members: {
-    Tasks: Collections.member(Tasks, { sk: { composite: ["priority"] } }),
-  },
-})
 ```
 
 ### Logical Names as API Surface
@@ -73,13 +68,9 @@ Collection names become query accessors on the typed client:
 
 ```typescript region="query-accessors" example="guide-indexes.ts"
 // Logical names become query accessors — no physical index names in code
-const { Tasks: alphaTasks } = yield* basic.collections
-  .ByProject({ projectId: "proj-alpha" })
-  .collect()
+const alphaTasks = yield* basic.entities.Tasks.byProject({ projectId: "proj-alpha" }).collect()
 
-const { Tasks: aliceTasks } = yield* basic.collections
-  .ByAssignee({ assigneeId: "emp-alice" })
-  .collect()
+const aliceTasks = yield* basic.entities.Tasks.byAssignee({ assigneeId: "emp-alice" }).collect()
 ```
 
 You never reference physical index names (`gsi1`, `gsi2`) in application code.
@@ -155,6 +146,14 @@ const IsolatedEmployees = Entity.make({
     pk: { field: "pk", composite: ["employeeId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    departmentStaff: {
+      collection: "departmentStaff",
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["department"],
+      sk: ["hireDate"],
+    },
+  },
   timestamps: true,
 })
 
@@ -172,21 +171,19 @@ const Equipments = Entity.make({
     pk: { field: "pk", composite: ["equipmentId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    departmentStaff: {
+      collection: "departmentStaff",
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["department"],
+      sk: ["purchaseDate"],
+    },
+  },
   timestamps: true,
 })
 ```
 
 ```typescript region="isolated-collection" example="guide-indexes.ts"
-const DepartmentStaff = Collections.make("DepartmentStaff", {
-  index: "gsi1",
-  type: "isolated",
-  pk: { field: "gsi1pk", composite: ["department"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    employees: Collections.member(IsolatedEmployees, { sk: { composite: ["hireDate"] } }),
-    equipments: Collections.member(Equipments, { sk: { composite: ["purchaseDate"] } }),
-  },
-})
 ```
 
 **Sort key format (isolated):**
@@ -217,6 +214,15 @@ const ClusteredEmployees = Entity.make({
     pk: { field: "pk", composite: ["employeeId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    tenantMembers: {
+      collection: "tenantMembers",
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      type: "clustered",
+      composite: ["tenantId"],
+      sk: ["department", "hireDate"],
+    },
+  },
   timestamps: true,
 })
 
@@ -227,25 +233,20 @@ const ClusteredTasks = Entity.make({
     pk: { field: "pk", composite: ["taskId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    tenantMembers: {
+      collection: "tenantMembers",
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      type: "clustered",
+      composite: ["tenantId"],
+      sk: ["projectId", "taskId"],
+    },
+  },
   timestamps: true,
 })
 ```
 
 ```typescript region="clustered-collection" example="guide-indexes.ts"
-const TenantMembers = Collections.make("TenantMembers", {
-  index: "gsi1",
-  type: "clustered",
-  pk: { field: "gsi1pk", composite: ["tenantId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    employees: Collections.member(ClusteredEmployees, {
-      sk: { composite: ["department", "hireDate"] },
-    }),
-    tasks: Collections.member(ClusteredTasks, {
-      sk: { composite: ["projectId", "taskId"] },
-    }),
-  },
-})
 ```
 
 **Sort key format (clustered):**
@@ -279,6 +280,15 @@ const SubEmployee = Entity.make({
     pk: { field: "pk", composite: ["employeeId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    contributions: {
+      collection: "contributions",
+      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+      type: "clustered",
+      composite: ["employeeId"],
+      sk: ["department"],
+    },
+  },
   timestamps: true,
 })
 
@@ -288,6 +298,15 @@ const SubTasks = Entity.make({
   primaryKey: {
     pk: { field: "pk", composite: ["taskId"] },
     sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    assignments: {
+      collection: "assignments",
+      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+      type: "clustered",
+      composite: ["employeeId"],
+      sk: ["projectId", "taskId"],
+    },
   },
   timestamps: true,
 })
@@ -299,33 +318,20 @@ const SubProjectMembers = Entity.make({
     pk: { field: "pk", composite: ["employeeId", "projectId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    assignments: {
+      collection: "assignments",
+      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+      type: "clustered",
+      composite: ["employeeId"],
+      sk: ["projectId"],
+    },
+  },
   timestamps: true,
 })
 ```
 
 ```typescript region="subcollection-collections" example="guide-indexes.ts"
-const Contributions = Collections.make("contributions", {
-  index: "gsi2",
-  type: "clustered",
-  pk: { field: "gsi2pk", composite: ["employeeId"] },
-  sk: { field: "gsi2sk" },
-  members: {
-    employees: Collections.member(SubEmployee, { sk: { composite: ["department"] } }),
-    tasks: Collections.member(SubTasks, { sk: { composite: ["projectId", "taskId"] } }),
-    projectMembers: Collections.member(SubProjectMembers, { sk: { composite: ["projectId"] } }),
-  },
-})
-
-const Assignments = Collections.make("assignments", {
-  index: "gsi2",
-  type: "clustered",
-  pk: { field: "gsi2pk", composite: ["employeeId"] },
-  sk: { field: "gsi2sk" },
-  members: {
-    tasks: Collections.member(SubTasks, { sk: { composite: ["projectId", "taskId"] } }),
-    projectMembers: Collections.member(SubProjectMembers, { sk: { composite: ["projectId"] } }),
-  },
-})
 ```
 
 **Sort key hierarchy:**
@@ -352,7 +358,7 @@ $contributions
 Collections are defined with `Collections.make()`. Each collection owns the full GSI definition (index name, PK field/composites, SK field) and each member entity specifies only its SK composites:
 
 ```typescript
-const MyCollection = Collections.make("collectionName", {
+const MyCollection = Collections.make({ name: "collectionName",
   index: "gsi1",                    // Physical GSI name
   pk: { field: "gsi1pk", composite: ["tenantId"] },  // Shared PK
   sk: { field: "gsi1sk" },         // Shared SK field

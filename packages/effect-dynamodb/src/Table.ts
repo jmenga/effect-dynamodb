@@ -65,6 +65,7 @@ export interface Table<
   TEntities extends Record<string, EntityLike> = Record<string, EntityLike>,
   TAggregates extends Record<string, AggregateLike> = Record<string, AggregateLike>,
 > {
+  readonly _tag: "Table"
   readonly schema: DynamoSchema.DynamoSchema
   /** Named entity members registered on this table. */
   readonly entities: TEntities
@@ -125,6 +126,7 @@ export const make = <
   }
 
   return {
+    _tag: "Table" as const,
     schema: config.schema,
     entities,
     aggregates,
@@ -134,8 +136,8 @@ export const make = <
       Layer.effect(
         Tag,
         Effect.gen(function* () {
-          const name = yield* configDef.name
-          return { name }
+          const tableName = yield* configDef.name
+          return { name: tableName }
         }),
       ),
   }

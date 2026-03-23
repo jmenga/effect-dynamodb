@@ -19,7 +19,6 @@ import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import * as Batch from "../src/Batch.js"
-import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -76,19 +75,17 @@ const Orders = Entity.make({
     pk: { field: "pk", composite: ["orderId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byUser: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["userId"],
+      sk: ["orderId"],
+    },
+  },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Users, Orders } })
-
-const OrdersByUser = Collections.make("ordersByUser", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["userId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Orders: Collections.member(Orders, { sk: { composite: ["orderId"] } }),
-  },
-})
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -98,7 +95,6 @@ const OrdersByUser = Collections.make("ordersByUser", {
 const program = Effect.gen(function* () {
   const db = yield* DynamoClient.make({
     entities: { Users, Orders },
-    collections: { OrdersByUser },
   })
 
   // --- Create the table ---

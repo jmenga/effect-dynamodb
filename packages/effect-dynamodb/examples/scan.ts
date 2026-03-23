@@ -18,7 +18,6 @@
 import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
-import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -59,6 +58,13 @@ const Products = Entity.make({
     pk: { field: "pk", composite: ["productId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byCategory: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["category"],
+      sk: ["productId"],
+    },
+  },
   timestamps: true,
 })
 
@@ -69,28 +75,17 @@ const Reviews = Entity.make({
     pk: { field: "pk", composite: ["reviewId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byProduct: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["productId"],
+      sk: ["reviewId"],
+    },
+  },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Products, Reviews } })
-
-const ProductsByCategory = Collections.make("productsByCategory", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["category"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Products: Collections.member(Products, { sk: { composite: ["productId"] } }),
-  },
-})
-
-const ReviewsByProduct = Collections.make("reviewsByProduct", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["productId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Reviews: Collections.member(Reviews, { sk: { composite: ["reviewId"] } }),
-  },
-})
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -101,7 +96,6 @@ const program = Effect.gen(function* () {
   // Typed execution gateway — binds all entities and collections
   const db = yield* DynamoClient.make({
     entities: { Products, Reviews },
-    collections: { ProductsByCategory, ReviewsByProduct },
   })
 
   // --- Setup ---

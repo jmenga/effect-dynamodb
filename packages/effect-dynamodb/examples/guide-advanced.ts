@@ -23,7 +23,6 @@ import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import * as Batch from "../src/Batch.js"
-import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
@@ -79,6 +78,13 @@ const Products = Entity.make({
     pk: { field: "pk", composite: ["productId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byCategory: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["category"],
+      sk: ["productId"],
+    },
+  },
   timestamps: true,
   versioned: true,
 })
@@ -108,15 +114,6 @@ const MainTable = Table.make({
   schema: AppSchema,
   entities: { Products, Users, Tasks },
 })
-
-const ProductsByCategory = Collections.make("productsByCategory", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["category"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Products: Collections.member(Products, { sk: { composite: ["productId"] } }),
-  },
-})
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -126,7 +123,6 @@ const ProductsByCategory = Collections.make("productsByCategory", {
 const program = Effect.gen(function* () {
   const db = yield* DynamoClient.make({
     entities: { Products, Users, Tasks },
-    collections: { ProductsByCategory },
   })
 
   // --- Setup ---
@@ -353,8 +349,7 @@ const program = Effect.gen(function* () {
   Products.condition((t, { eq, gt, and }) => and(eq(t.category, "peripherals"), gt(t.stock, 0)))
 
   // Filter — shorthand applied to collection queries
-  const { Products: filtered } = yield* db.collections
-    .ProductsByCategory({ category: "peripherals" })
+  const filtered = yield* db.entities.Products.byCategory({ category: "peripherals" })
     .filter({ name: "Widget Pro" })
     .collect()
 

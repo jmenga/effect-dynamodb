@@ -143,9 +143,8 @@ Filter expressions narrow query and scan results **after** items are read from d
 `Entity.filter()` works identically to `Entity.condition()` but returns a `Query` combinator:
 
 ```typescript region="filter-callback" example="guide-expressions.ts"
-// Filter on collection query — shorthand for equality
-const { Products: activeElectronics } = yield* db.collections
-  .ProductsByCategory({ category: "electronics" })
+// Filter on entity index query — shorthand for equality
+const activeElectronics = yield* db.entities.Products.byCategory({ category: "electronics" })
   .filter({ status: "active" })
   .collect()
 

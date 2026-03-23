@@ -123,6 +123,14 @@ const Users = Entity.make({
     pk: { field: "pk", composite: ["username"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    owned: {
+      collection: "owned",
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["username"],
+      sk: [],
+    },
+  },
   timestamps: true,
 })
 ```
@@ -138,6 +146,20 @@ const Repositories = Entity.make({
   primaryKey: {
     pk: { field: "pk", composite: ["repoOwner"] },
     sk: { field: "sk", composite: ["repoName"] },
+  },
+  indexes: {
+    owned: {
+      collection: "owned",
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["username"],
+      sk: ["repoName"],
+    },
+    activity: {
+      collection: "activity",
+      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+      composite: ["repoOwner", "repoName"],
+      sk: [],
+    },
   },
   timestamps: true,
 })
@@ -155,6 +177,20 @@ const Issues = Entity.make({
     pk: { field: "pk", composite: ["repoOwner", "repoName"] },
     sk: { field: "sk", composite: ["issueNumber"] },
   },
+  indexes: {
+    managed: {
+      collection: "managed",
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["username"],
+      sk: ["status", "issueNumber"],
+    },
+    activity: {
+      collection: "activity",
+      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+      composite: ["repoOwner", "repoName"],
+      sk: ["status", "issueNumber"],
+    },
+  },
   timestamps: true,
 })
 ```
@@ -171,49 +207,32 @@ const PullRequests = Entity.make({
     pk: { field: "pk", composite: ["repoOwner", "repoName"] },
     sk: { field: "sk", composite: ["pullRequestNumber"] },
   },
+  indexes: {
+    managed: {
+      collection: "managed",
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["username"],
+      sk: ["status", "pullRequestNumber"],
+    },
+    activity: {
+      collection: "activity",
+      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
+      composite: ["repoOwner", "repoName"],
+      sk: ["status", "pullRequestNumber"],
+    },
+  },
   timestamps: true,
 })
 ```
 
 ### Collections
 
-GSI access patterns are defined as Collections. Each collection owns the index definition and member SK composites:
+GSI access patterns are now defined as entity-level indexes. Multi-entity collections (owned, managed, activity) are auto-discovered from matching collection names across entities:
 
 ```typescript title="collections.ts" region="collections" example="version-control.ts"
-const Owned = Collections.make("owned", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["username"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Users: Collections.member(Users, { sk: { composite: [] } }),
-    Repositories: Collections.member(Repositories, { sk: { composite: ["repoName"] } }),
-  },
-})
-
-const Managed = Collections.make("managed", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["username"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Issues: Collections.member(Issues, { sk: { composite: ["status", "issueNumber"] } }),
-    PullRequests: Collections.member(PullRequests, {
-      sk: { composite: ["status", "pullRequestNumber"] },
-    }),
-  },
-})
-
-const Activity = Collections.make("activity", {
-  index: "gsi2",
-  pk: { field: "gsi2pk", composite: ["repoOwner", "repoName"] },
-  sk: { field: "gsi2sk" },
-  members: {
-    Repositories: Collections.member(Repositories, { sk: { composite: [] } }),
-    Issues: Collections.member(Issues, { sk: { composite: ["status", "issueNumber"] } }),
-    PullRequests: Collections.member(PullRequests, {
-      sk: { composite: ["status", "pullRequestNumber"] },
-    }),
-  },
-})
+// GSI access patterns are now defined as entity-level indexes above.
+// Multi-entity collections (owned, managed, activity) are auto-discovered
+// from matching collection names across entities.
 ```
 
 Key design decisions:
@@ -370,18 +389,15 @@ const linux = yield* db.entities.Repositories.get({ repoOwner: "torvalds", repoN
 User and Repository share GSI1 via the `Owned` collection. Both use the owner's username as the partition key, so a single partition holds the user profile and all their repositories.
 
 ```typescript region="pattern-3" example="version-control.ts"
-const { Repositories: octocatRepos } = yield* db.collections
-  .Owned({ username: "octocat" })
-  .collect()
-// → octocatRepos: [{ repoName: "hello-world", ... }]
+const { Repositories: octocatRepos } = yield* db.collections.Owned!({
+  username: "octocat",
+}).collect()
 
-const { Repositories: torvaldsRepos } = yield* db.collections
-  .Owned({ username: "torvalds" })
-  .collect()
-// → torvaldsRepos: [{ repoName: "linux", ... }]
+const { Repositories: torvaldsRepos } = yield* db.collections.Owned!({
+  username: "torvalds",
+}).collect()
 
-const { Users: octocatProfile } = yield* db.collections.Owned({ username: "octocat" }).collect()
-// → octocatProfile: [{ fullName: "The Octocat", ... }]
+const { Users: octocatProfile } = yield* db.collections.Owned!({ username: "octocat" }).collect()
 ```
 
 Both queries hit GSI1 with the same partition key. DynamoDB serves both from the same item collection.
@@ -445,23 +461,21 @@ const closedPR = yield* db.entities.PullRequests.update(
 Issue and PullRequest share GSI1 via the `Managed` collection. Both use `username` as the partition key. The collection returns grouped results with all member types.
 
 ```typescript region="pattern-6" example="version-control.ts"
-const { Issues: torvaldsIssues } = yield* db.collections
-  .Managed({ username: "torvalds" })
-  .collect()
-// → 2 issues (hello-world #1 Open, hello-world #3 Closed)
+const { Issues: torvaldsIssues } = yield* db.collections.Managed!({
+  username: "torvalds",
+}).collect()
 
-const { PullRequests: torvaldsPRs } = yield* db.collections
-  .Managed({ username: "torvalds" })
-  .collect()
-// → [{ pullRequestNumber: "1", subject: "Fix README typo", status: "Open" }]
+const { PullRequests: torvaldsPRs } = yield* db.collections.Managed!({
+  username: "torvalds",
+}).collect()
 
-const { Issues: octocatIssues } = yield* db.collections.Managed({ username: "octocat" }).collect()
-// → 2 issues (hello-world #2 Closed, linux #1 Open)
+const { Issues: octocatIssues } = yield* db.collections.Managed!({
+  username: "octocat",
+}).collect()
 
-const { PullRequests: octocatPRs } = yield* db.collections
-  .Managed({ username: "octocat" })
-  .collect()
-// → 2 PRs (linux #1 Open, hello-world #2 Closed)
+const { PullRequests: octocatPRs } = yield* db.collections.Managed!({
+  username: "octocat",
+}).collect()
 ```
 
 ### Pattern 7: Repository Activity (GSI2 -- `activity` Collection)
@@ -471,33 +485,32 @@ const { PullRequests: octocatPRs } = yield* db.collections
 Repository, Issue, and PullRequest share GSI2 via the `Activity` collection. All use `repoOwner + repoName` as the partition key, grouping everything related to a repository in one partition.
 
 ```typescript region="pattern-7" example="version-control.ts"
-const { Issues: hwIssues } = yield* db.collections
-  .Activity({ repoOwner: "octocat", repoName: "hello-world" })
-  .collect()
-// → 3 issues: #1 (Open), #2 (Closed), #3 (Closed)
+const { Issues: hwIssues } = yield* db.collections.Activity!({
+  repoOwner: "octocat",
+  repoName: "hello-world",
+}).collect()
 
-const hwOpenIssues = hwIssues.filter((i) => i.status === "Open")
-// → [{ issueNumber: "1", ... }]
+const hwOpenIssues = hwIssues.filter((i: any) => i.status === "Open")
 
-const { PullRequests: hwPRs } = yield* db.collections
-  .Activity({ repoOwner: "octocat", repoName: "hello-world" })
-  .collect()
-// → 2 PRs: #1 (Open), #2 (Closed)
+const { PullRequests: hwPRs } = yield* db.collections.Activity!({
+  repoOwner: "octocat",
+  repoName: "hello-world",
+}).collect()
 
-const { Issues: linuxIssues } = yield* db.collections
-  .Activity({ repoOwner: "torvalds", repoName: "linux" })
-  .collect()
-// → [{ issueNumber: "1", status: "Open", ... }]
+const { Issues: linuxIssues } = yield* db.collections.Activity!({
+  repoOwner: "torvalds",
+  repoName: "linux",
+}).collect()
 
-const { PullRequests: linuxPRs } = yield* db.collections
-  .Activity({ repoOwner: "torvalds", repoName: "linux" })
-  .collect()
-// → [{ pullRequestNumber: "1", status: "Open", ... }]
+const { PullRequests: linuxPRs } = yield* db.collections.Activity!({
+  repoOwner: "torvalds",
+  repoName: "linux",
+}).collect()
 
-const { Repositories: hwRepoActivity } = yield* db.collections
-  .Activity({ repoOwner: "octocat", repoName: "hello-world" })
-  .collect()
-// → [{ repoName: "hello-world", ... }]
+const { Repositories: hwRepoActivity } = yield* db.collections.Activity!({
+  repoOwner: "octocat",
+  repoName: "hello-world",
+}).collect()
 ```
 
 Because `status` is in the sort key for Issues and PullRequests on GSI2, items within a partition naturally group by status. Open items sort before Closed items.
@@ -531,15 +544,15 @@ yield* Transaction.transactWrite([
 ])
 
 // Both created atomically — verify via activity collection
-const { Issues: linuxIssuesAfter } = yield* db.collections
-  .Activity({ repoOwner: "torvalds", repoName: "linux" })
-  .collect()
-// → 2 issues now
+const { Issues: linuxIssuesAfter } = yield* db.collections.Activity!({
+  repoOwner: "torvalds",
+  repoName: "linux",
+}).collect()
 
-const { PullRequests: linuxPRsAfter } = yield* db.collections
-  .Activity({ repoOwner: "torvalds", repoName: "linux" })
-  .collect()
-// → 2 PRs now
+const { PullRequests: linuxPRsAfter } = yield* db.collections.Activity!({
+  repoOwner: "torvalds",
+  repoName: "linux",
+}).collect()
 ```
 
 ---

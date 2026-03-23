@@ -21,7 +21,6 @@
 import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
-import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -58,19 +57,17 @@ const Employees = Entity.make({
     pk: { field: "pk", composite: ["employeeId"] },
     sk: { field: "sk", composite: [] },
   },
+  indexes: {
+    byDepartment: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["department"],
+      sk: ["employeeId"],
+    },
+  },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Employees } })
-
-const EmployeesByDepartment = Collections.make("employeesByDepartment", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["department"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    Employees: Collections.member(Employees, { sk: { composite: ["employeeId"] } }),
-  },
-})
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -81,7 +78,6 @@ const program = Effect.gen(function* () {
   // #region seed-data
   const db = yield* DynamoClient.make({
     entities: { Employees },
-    collections: { EmployeesByDepartment },
   })
 
   const client = yield* DynamoClient

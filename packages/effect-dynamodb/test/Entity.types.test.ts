@@ -27,15 +27,15 @@ class User extends Schema.Class<User>("User")({
 const UserEntity = Entity.make({
   model: User,
   entityType: "User",
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
     byRole: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["role"] },
-      sk: { field: "gsi1sk", composite: ["userId"] },
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["role"],
+      sk: ["userId"],
     },
   },
 })
@@ -44,11 +44,9 @@ const UserEntity = Entity.make({
 const VersionedUserEntity = Entity.make({
   model: User,
   entityType: "VersionedUser",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: true,
@@ -64,11 +62,9 @@ class Membership extends Schema.Class<Membership>("Membership")({
 const MembershipEntity = Entity.make({
   model: Membership,
   entityType: "Membership",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["orgId"] },
-      sk: { field: "sk", composite: ["userId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["orgId"] },
+    sk: { field: "sk", composite: ["userId"] },
   },
 })
 
@@ -95,33 +91,27 @@ class Selection extends Schema.Class<Selection>("Selection")({
 const TeamEntity = Entity.make({
   model: Team,
   entityType: "Team",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["teamId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["teamId"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const PlayerEntity = Entity.make({
   model: Player,
   entityType: "Player",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["playerId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["playerId"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const SelectionEntity = Entity.make({
   model: Selection,
   entityType: "Selection",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["selectionId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["selectionId"] },
+    sk: { field: "sk", composite: [] },
   },
   refs: {
     team: { entity: TeamEntity },
@@ -158,11 +148,9 @@ const BrandedTeamEntity = Entity.make({
     id: { field: "teamId", identifier: true },
   }),
   entityType: "BrandedTeam",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
@@ -171,11 +159,9 @@ const BrandedPlayerEntity = Entity.make({
     id: { field: "playerId", identifier: true },
   }),
   entityType: "BrandedPlayer",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
@@ -186,11 +172,9 @@ const BrandedSelectionEntity = Entity.make({
     player: { ref: true },
   }),
   entityType: "BrandedSelection",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
   refs: {
     team: { entity: BrandedTeamEntity },
@@ -586,12 +570,9 @@ describe("Entity type extractors", () => {
       Entity.make({
         model: User,
         entityType: "User",
-        indexes: {
-          // @ts-expect-error — primary index must have at least one composite in pk or sk
-          primary: {
-            pk: { field: "pk", composite: [] as const },
-            sk: { field: "sk", composite: [] as const },
-          },
+        primaryKey: {
+          pk: { field: "pk", composite: [] as const },
+          sk: { field: "sk", composite: [] as const },
         },
       }),
     ).toThrow()
@@ -601,11 +582,9 @@ describe("Entity type extractors", () => {
     Entity.make({
       model: User,
       entityType: "User",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: [] },
-          sk: { field: "sk", composite: ["userId"] },
-        },
+      primaryKey: {
+        pk: { field: "pk", composite: [] },
+        sk: { field: "sk", composite: ["userId"] },
       },
     })
   })
@@ -614,11 +593,9 @@ describe("Entity type extractors", () => {
     Entity.make({
       model: User,
       entityType: "User",
-      indexes: {
-        primary: {
-          pk: { field: "pk", composite: ["userId"] },
-          sk: { field: "sk", composite: [] },
-        },
+      primaryKey: {
+        pk: { field: "pk", composite: ["userId"] },
+        sk: { field: "sk", composite: [] },
       },
     })
   })
@@ -628,12 +605,10 @@ describe("Entity type extractors", () => {
       Entity.make({
         model: User,
         entityType: "User",
-        indexes: {
-          primary: {
-            // @ts-expect-error — "nonExistent" is not a field on User
-            pk: { field: "pk", composite: ["nonExistent"] },
-            sk: { field: "sk", composite: [] },
-          },
+        primaryKey: {
+          // @ts-expect-error — "nonExistent" is not a field on User
+          pk: { field: "pk", composite: ["nonExistent"] },
+          sk: { field: "sk", composite: [] },
         },
       }),
     ).toThrow()
@@ -644,16 +619,15 @@ describe("Entity type extractors", () => {
       Entity.make({
         model: User,
         entityType: "User",
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
+        },
         indexes: {
-          primary: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
-          },
           byBogus: {
-            index: "gsi1",
-            // @ts-expect-error — "bogus" is not a field on User
-            pk: { field: "gsi1pk", composite: ["bogus"] },
-            sk: { field: "gsi1sk", composite: [] },
+            index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+            composite: ["bogus"],
+            sk: [],
           },
         },
       }),

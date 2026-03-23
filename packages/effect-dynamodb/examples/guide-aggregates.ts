@@ -24,7 +24,6 @@
 
 import { Console, Effect, Layer, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
-import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
@@ -146,24 +145,19 @@ const SquadSelections = Entity.make({
     pk: { field: "pk", composite: ["squadId"] },
     sk: { field: "sk", composite: ["selectionNumber"] },
   },
+  indexes: {
+    byPlayer: {
+      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      composite: ["playerId"],
+      sk: ["squadId", "selectionNumber"],
+    },
+  },
   refs: {
     team: { entity: Teams },
     player: { entity: Players },
   },
 })
 // #endregion
-
-const SquadByPlayer = Collections.make("squadByPlayer", {
-  index: "gsi1",
-  pk: { field: "gsi1pk", composite: ["playerId"] },
-  sk: { field: "gsi1sk" },
-  members: {
-    SquadSelections: Collections.member(SquadSelections, {
-      sk: { composite: ["squadId", "selectionNumber"] },
-    }),
-  },
-})
-
 const MainTable = Table.make({
   schema: CricketSchema,
   entities: { Teams, Players, Coaches, Venues, SquadSelections },
@@ -218,7 +212,6 @@ void (undefined as MatchKey | undefined)
 const program = Effect.gen(function* () {
   const db = yield* DynamoClient.make({
     entities: { Teams, Players, Coaches, Venues, SquadSelections },
-    collections: { SquadByPlayer },
   })
   const client = yield* DynamoClient
   const tableConfig = yield* MainTable.Tag
