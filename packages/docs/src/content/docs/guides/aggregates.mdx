@@ -61,16 +61,9 @@ When creating an entity with ref fields, provide a `refs` config mapping field n
 const SquadSelections = Entity.make({
   model: SquadSelection,
   entityType: "SquadSelection",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["squadId"] },
-      sk: { field: "sk", composite: ["selectionNumber"] },
-    },
-    byPlayer: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["playerId"] },
-      sk: { field: "gsi1sk", composite: ["squadId", "selectionNumber"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["squadId"] },
+    sk: { field: "sk", composite: ["selectionNumber"] },
   },
   refs: {
     team: { entity: Teams },
@@ -91,7 +84,7 @@ Ref fields transform across Entity's derived types:
 
 ```typescript region="ref-put-get" example="guide-aggregates.ts"
 // Input accepts IDs — not full objects
-yield* db.SquadSelections.put({
+yield* db.entities.SquadSelections.put({
   squadId: "aus#2024-25#BGT",
   selectionNumber: 1,
   teamId: "aus",
@@ -101,7 +94,7 @@ yield* db.SquadSelections.put({
 })
 
 // Record returns full domain objects
-const selection = yield* db.SquadSelections.get({
+const selection = yield* db.entities.SquadSelections.get({
   squadId: "aus#2024-25#BGT",
   selectionNumber: 1,
 })
@@ -117,7 +110,7 @@ On `put` and `update`, Entity automatically:
 
 ```typescript region="ref-not-found" example="guide-aggregates.ts"
 // RefNotFound when a ref doesn't resolve
-const refError = yield* db.SquadSelections.put({
+const refError = yield* db.entities.SquadSelections.put({
   squadId: "aus#2024-25#BGT",
   selectionNumber: 99,
   teamId: "aus",
@@ -451,7 +444,7 @@ When denormalized data changes at the source (e.g., a player's name is corrected
 Attach a cascade to an `EntityUpdate` operation. After the source entity update completes, the cascade finds and updates all target items:
 
 ```typescript region="cascade-basic" example="guide-aggregates.ts"
-const updatedPlayer = yield* db.Players.update(
+const updatedPlayer = yield* db.entities.Players.update(
   { id: "smith-01" },
   Entity.set({ firstName: "Steven" }),
   Entity.cascade({ targets: [SquadSelections] }),
@@ -478,7 +471,7 @@ Entity.cascade({
 **Eventual (default):** Batch-updates target items. No item limit. Partial failures are possible.
 
 ```typescript region="cascade-eventual" example="guide-aggregates.ts"
-yield* db.Players.update(
+yield* db.entities.Players.update(
   { id: "smith-01" },
   Entity.set({ firstName: "Steven" }),
   Entity.cascade({ targets: [SquadSelections], mode: "eventual" }),
@@ -488,7 +481,7 @@ yield* db.Players.update(
 **Transactional:** Atomic update via `transactWriteItems`. All target items updated in a single transaction. Maximum 100 items.
 
 ```typescript region="cascade-transactional" example="guide-aggregates.ts"
-yield* db.Players.update(
+yield* db.entities.Players.update(
   { id: "smith-01" },
   Entity.set({ firstName: "Steven" }),
   Entity.cascade({ targets: [SquadSelections], mode: "transactional" }),
@@ -507,7 +500,7 @@ For cascade to work, the target entity must:
 In eventual mode, partial failures return `CascadePartialFailure`:
 
 ```typescript
-yield* db.Players.update(
+yield* db.entities.Players.update(
   { id: "smith-01" },
   Entity.set({ firstName: "Steven" }),
   Entity.cascade({ targets: [SquadSelections] }),
@@ -534,7 +527,7 @@ In transactional mode, a failure rolls back the entire cascade (but not the sour
 Cascade to multiple entity types in a single operation:
 
 ```typescript
-yield* db.Players.update(
+yield* db.entities.Players.update(
   { id: "smith-01" },
   Entity.set({ firstName: "Steven" }),
   Entity.cascade({ targets: [SquadSelections, MatchPlayers, ContractRecords] }),

@@ -194,23 +194,9 @@ The Entity binds a model to a table. It defines:
 const Employees = Entity.make({
   model: EmployeeModel,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byTenant: {
-      index: "gsi1",
-      collection: "TenantMembers",
-      type: "clustered",
-      pk: { field: "gsi1pk", composite: ["tenantId"] },
-      sk: { field: "gsi1sk", composite: ["department", "hireDate"] },
-    },
-    byEmail: {
-      index: "gsi2",
-      pk: { field: "gsi2pk", composite: ["email"] },
-      sk: { field: "gsi2sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId"] },
+    sk: { field: "sk", composite: [] },
   },
   unique: { email: ["email"] },
   timestamps: true,
@@ -219,29 +205,26 @@ const Employees = Entity.make({
 })
 ```
 
-### Index Definition
+### Primary Key Definition
 
-Each index has a logical name (e.g., `byTenant`) that becomes a query accessor on the entity. Indexes follow the ElectroDB pattern:
+The `primaryKey` defines how the entity's partition key and sort key are composed from model attributes:
 
 ```typescript
-byTenant: {
-  index: "gsi1",              // Physical GSI name (omit for primary index)
-  collection: "TenantMembers", // Collection membership (see Indexes guide)
-  type: "clustered",           // "clustered" (default) or "isolated"
+primaryKey: {
   pk: {
-    field: "gsi1pk",           // Physical DynamoDB attribute name
-    composite: ["tenantId"],   // Model attributes that compose this key
+    field: "pk",               // Physical DynamoDB attribute name
+    composite: ["employeeId"], // Model attributes that compose the partition key
   },
   sk: {
-    field: "gsi1sk",
-    composite: ["department", "hireDate"],
+    field: "sk",
+    composite: [],             // Empty = one item per partition key value
   },
 }
 ```
 
-The `composite` array is an ordered list of model attribute names. The system generates the key value automatically: `$projmgmt#v1#employee#engineering#2024-01-15`.
+The `composite` array is an ordered list of model attribute names. The system generates the key value automatically: `$projmgmt#v1#employee#emp-alice`.
 
-See [Indexes & Collections](/effect-dynamodb/guides/indexes/) for full details.
+GSI access patterns are defined separately using `Collections.make()`. See [Indexes & Collections](/effect-dynamodb/guides/indexes/) for full details.
 
 ### System Fields
 

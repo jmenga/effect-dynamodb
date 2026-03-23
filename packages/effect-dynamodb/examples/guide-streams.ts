@@ -1,5 +1,5 @@
 /**
- * DynamoDB Streams guide example — effect-dynamodb
+ * DynamoDB Streams guide example — effect-dynamodb v2
  *
  * Demonstrates:
  *   - Entity.decodeMarshalledItem() for decoding AttributeValue format
@@ -18,6 +18,7 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { Console, Effect, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
+import * as Collections from "../src/Collections.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -49,7 +50,7 @@ class Task extends Schema.Class<Task>("Task")({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 2. Schema + Table + Entities
+// 2. Schema + Table + Entities + Collections
 // ---------------------------------------------------------------------------
 
 // #region entities
@@ -58,16 +59,9 @@ const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
 const EmployeeEntity = Entity.make({
   model: EmployeeModel,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byDepartment: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["department"] },
-      sk: { field: "gsi1sk", composite: ["displayName"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: true,
@@ -76,16 +70,9 @@ const EmployeeEntity = Entity.make({
 const TaskEntity = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byEmployee: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["employeeId"] },
-      sk: { field: "gsi1sk", composite: ["status"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -93,6 +80,24 @@ const TaskEntity = Entity.make({
 const _MainTable = Table.make({
   schema: AppSchema,
   entities: { EmployeeEntity, TaskEntity },
+})
+
+const _EmployeesByDepartment = Collections.make("employeesByDepartment", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["department"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    EmployeeEntity: Collections.member(EmployeeEntity, { sk: { composite: ["displayName"] } }),
+  },
+})
+
+const _TasksByEmployee = Collections.make("tasksByEmployee", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["employeeId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    TaskEntity: Collections.member(TaskEntity, { sk: { composite: ["status"] } }),
+  },
 })
 // #endregion
 
@@ -138,9 +143,7 @@ const handleEmployeeStream = (event: DynamoDBStreamEvent) =>
 // #region decode-unmarshalled
 const employeeFromItem = Entity.itemSchema(EmployeeEntity)
 
-const decodeUnmarshalledEmployee = (
-  marshalledImage: Record<string, AttributeValue>,
-) => {
+const decodeUnmarshalledEmployee = (marshalledImage: Record<string, AttributeValue>) => {
   const unmarshalled = Marshaller.fromAttributeMap(marshalledImage)
   return Schema.decodeUnknownSync(employeeFromItem)(unmarshalled)
 }
@@ -178,10 +181,7 @@ const handleStreamEvent = (event: DynamoDBStreamEvent) =>
       const entityType = image["__edd_e__"]?.S
       switch (entityType) {
         case "Employee": {
-          const emp = yield* Entity.decodeMarshalledItem(
-            EmployeeEntity,
-            image,
-          )
+          const emp = yield* Entity.decodeMarshalledItem(EmployeeEntity, image)
           yield* handleEmployeeChange(emp as Entity.Record<typeof EmployeeEntity>)
           break
         }

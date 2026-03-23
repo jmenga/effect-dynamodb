@@ -24,6 +24,7 @@
 
 import { Console, Effect, Layer, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
@@ -104,44 +105,36 @@ const CricketSchema = DynamoSchema.make({ name: "cricket", version: 1 })
 const Teams = Entity.make({
   model: DynamoModel.configure(Team, { id: { field: "teamId" } }),
   entityType: "Team",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const Players = Entity.make({
   model: DynamoModel.configure(Player, { id: { field: "playerId" } }),
   entityType: "Player",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const Coaches = Entity.make({
   model: DynamoModel.configure(Coach, { id: { field: "coachId" } }),
   entityType: "Coach",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const Venues = Entity.make({
   model: DynamoModel.configure(Venue, { id: { field: "venueId" } }),
   entityType: "Venue",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
@@ -149,16 +142,9 @@ const Venues = Entity.make({
 const SquadSelections = Entity.make({
   model: SquadSelection,
   entityType: "SquadSelection",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["squadId"] },
-      sk: { field: "sk", composite: ["selectionNumber"] },
-    },
-    byPlayer: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["playerId"] },
-      sk: { field: "gsi1sk", composite: ["squadId", "selectionNumber"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["squadId"] },
+    sk: { field: "sk", composite: ["selectionNumber"] },
   },
   refs: {
     team: { entity: Teams },
@@ -166,6 +152,17 @@ const SquadSelections = Entity.make({
   },
 })
 // #endregion
+
+const SquadByPlayer = Collections.make("squadByPlayer", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["playerId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    SquadSelections: Collections.member(SquadSelections, {
+      sk: { composite: ["squadId", "selectionNumber"] },
+    }),
+  },
+})
 
 const MainTable = Table.make({
   schema: CricketSchema,
@@ -219,7 +216,10 @@ void (undefined as MatchKey | undefined)
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { Teams, Players, Coaches, Venues, SquadSelections },
+    collections: { SquadByPlayer },
+  })
   const client = yield* DynamoClient
   const tableConfig = yield* MainTable.Tag
 
@@ -269,18 +269,33 @@ const program = Effect.gen(function* () {
   yield* Console.log("--- Part 1: Entity References ---\n")
 
   // Seed reference data
-  yield* db.Teams.put({ id: "aus", name: "Australia", country: "Australia", ranking: 1 })
-  yield* db.Teams.put({ id: "ind", name: "India", country: "India", ranking: 2 })
-  yield* db.Players.put({ id: "smith-01", firstName: "Steve", lastName: "Smith", role: "batter" })
-  yield* db.Players.put({ id: "cummins-01", firstName: "Pat", lastName: "Cummins", role: "bowler" })
-  yield* db.Players.put({ id: "kohli-01", firstName: "Virat", lastName: "Kohli", role: "batter" })
-  yield* db.Coaches.put({ id: "mcdonald", name: "Andrew McDonald" })
-  yield* db.Coaches.put({ id: "gambhir", name: "Gautam Gambhir" })
-  yield* db.Venues.put({ id: "mcg", name: "Melbourne Cricket Ground", city: "Melbourne" })
+  yield* db.entities.Teams.put({ id: "aus", name: "Australia", country: "Australia", ranking: 1 })
+  yield* db.entities.Teams.put({ id: "ind", name: "India", country: "India", ranking: 2 })
+  yield* db.entities.Players.put({
+    id: "smith-01",
+    firstName: "Steve",
+    lastName: "Smith",
+    role: "batter",
+  })
+  yield* db.entities.Players.put({
+    id: "cummins-01",
+    firstName: "Pat",
+    lastName: "Cummins",
+    role: "bowler",
+  })
+  yield* db.entities.Players.put({
+    id: "kohli-01",
+    firstName: "Virat",
+    lastName: "Kohli",
+    role: "batter",
+  })
+  yield* db.entities.Coaches.put({ id: "mcdonald", name: "Andrew McDonald" })
+  yield* db.entities.Coaches.put({ id: "gambhir", name: "Gautam Gambhir" })
+  yield* db.entities.Venues.put({ id: "mcg", name: "Melbourne Cricket Ground", city: "Melbourne" })
 
   // #region ref-put-get
   // Input accepts IDs — not full objects
-  yield* db.SquadSelections.put({
+  yield* db.entities.SquadSelections.put({
     squadId: "aus#2024-25#BGT",
     selectionNumber: 1,
     teamId: "aus",
@@ -290,7 +305,7 @@ const program = Effect.gen(function* () {
   })
 
   // Record returns full domain objects
-  const selection = yield* db.SquadSelections.get({
+  const selection = yield* db.entities.SquadSelections.get({
     squadId: "aus#2024-25#BGT",
     selectionNumber: 1,
   })
@@ -299,7 +314,7 @@ const program = Effect.gen(function* () {
   yield* Console.log(`  Role: ${selection.player.role}`)
   // #endregion
 
-  yield* db.SquadSelections.put({
+  yield* db.entities.SquadSelections.put({
     squadId: "aus#2024-25#BGT",
     selectionNumber: 2,
     teamId: "aus",
@@ -307,7 +322,7 @@ const program = Effect.gen(function* () {
     squadRole: "batter",
     isCaptain: false,
   })
-  yield* db.SquadSelections.put({
+  yield* db.entities.SquadSelections.put({
     squadId: "ind#2024-25#BGT",
     selectionNumber: 1,
     teamId: "ind",
@@ -318,7 +333,7 @@ const program = Effect.gen(function* () {
 
   // #region ref-not-found
   // RefNotFound when a ref doesn't resolve
-  const refError = yield* db.SquadSelections.put({
+  const refError = yield* db.entities.SquadSelections.put({
     squadId: "aus#2024-25#BGT",
     selectionNumber: 99,
     teamId: "aus",
@@ -441,7 +456,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("\n--- Part 3: Cascade Updates ---\n")
 
   // #region cascade-basic
-  const updatedPlayer = yield* db.Players.update(
+  const updatedPlayer = yield* db.entities.Players.update(
     { id: "smith-01" },
     Entity.set({ firstName: "Steven" }),
     Entity.cascade({ targets: [SquadSelections] }),
@@ -451,7 +466,7 @@ const program = Effect.gen(function* () {
   yield* Console.log(`Updated player: ${updatedPlayer.firstName} ${updatedPlayer.lastName}`)
 
   // Verify cascade propagated
-  const afterCascade = yield* db.SquadSelections.get({
+  const afterCascade = yield* db.entities.SquadSelections.get({
     squadId: "aus#2024-25#BGT",
     selectionNumber: 2,
   })
@@ -460,7 +475,7 @@ const program = Effect.gen(function* () {
   )
 
   // #region cascade-eventual
-  yield* db.Players.update(
+  yield* db.entities.Players.update(
     { id: "smith-01" },
     Entity.set({ firstName: "Steven" }),
     Entity.cascade({ targets: [SquadSelections], mode: "eventual" }),
@@ -468,7 +483,7 @@ const program = Effect.gen(function* () {
   // #endregion
 
   // #region cascade-transactional
-  yield* db.Players.update(
+  yield* db.entities.Players.update(
     { id: "smith-01" },
     Entity.set({ firstName: "Steven" }),
     Entity.cascade({ targets: [SquadSelections], mode: "transactional" }),
@@ -477,7 +492,7 @@ const program = Effect.gen(function* () {
 
   // --- Cleanup ---
   yield* Console.log("\nCleaning up...")
-  yield* db.deleteTable()
+  yield* db.tables["guide-aggregates-table"]!.delete()
   yield* Console.log("Done.")
 })
 

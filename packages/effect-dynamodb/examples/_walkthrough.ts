@@ -94,55 +94,45 @@ const CricketSchema = DynamoSchema.make({ name: "cricket", version: 1 })
 const Teams = Entity.make({
   model: DynamoModel.configure(Team, { id: { field: "teamId" } }),
   entityType: "Team",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const Players = Entity.make({
   model: DynamoModel.configure(Player, { id: { field: "playerId" } }),
   entityType: "Player",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const Coaches = Entity.make({
   model: DynamoModel.configure(Coach, { id: { field: "coachId" } }),
   entityType: "Coach",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const Venues = Entity.make({
   model: DynamoModel.configure(Venue, { id: { field: "venueId" } }),
   entityType: "Venue",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const SquadSelections = Entity.make({
   model: SquadSelection,
   entityType: "SquadSelection",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["squadId"] },
-      sk: { field: "sk", composite: ["selectionNumber"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["squadId"] },
+    sk: { field: "sk", composite: ["selectionNumber"] },
   },
   refs: {
     team: { entity: Teams },
@@ -283,33 +273,35 @@ const step0 = Effect.gen(function* () {
 })
 
 const step1 = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { Teams, Players },
+  })
 
   yield* Console.log("STEP 1: Creating reference entities (Teams + Players)\n")
   yield* Console.log(
     "  Model uses 'id', DB stores as 'teamId'/'playerId' via DynamoModel.configure.\n",
   )
-  yield* db.Teams.put({ id: "aus", name: "Australia", country: "Australia", ranking: 1 })
-  yield* db.Teams.put({ id: "ind", name: "India", country: "India", ranking: 2 })
-  yield* db.Players.put({
+  yield* db.entities.Teams.put({ id: "aus", name: "Australia", country: "Australia", ranking: 1 })
+  yield* db.entities.Teams.put({ id: "ind", name: "India", country: "India", ranking: 2 })
+  yield* db.entities.Players.put({
     id: "smith-01",
     firstName: "Steve",
     lastName: "Smith",
     role: "batter",
   })
-  yield* db.Players.put({
+  yield* db.entities.Players.put({
     id: "cummins-01",
     firstName: "Pat",
     lastName: "Cummins",
     role: "bowler",
   })
-  yield* db.Players.put({
+  yield* db.entities.Players.put({
     id: "kohli-01",
     firstName: "Virat",
     lastName: "Kohli",
     role: "batter",
   })
-  yield* db.Players.put({
+  yield* db.entities.Players.put({
     id: "bumrah-01",
     firstName: "Jasprit",
     lastName: "Bumrah",
@@ -319,7 +311,9 @@ const step1 = Effect.gen(function* () {
 })
 
 const step2 = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { SquadSelections },
+  })
 
   yield* Console.log("STEP 2: Creating SquadSelection entries (Entity Refs)\n")
   yield* Console.log("  A SquadSelection picks a player to a team's squad for a series/season.")
@@ -328,7 +322,7 @@ const step2 = Effect.gen(function* () {
   yield* Console.log("  Entity auto-hydrates: fetches full Team + Player, embeds as maps.\n")
 
   // Australia's squad for BGT 2024-25
-  yield* db.SquadSelections.put({
+  yield* db.entities.SquadSelections.put({
     squadId: "aus#2024-25#BGT",
     selectionNumber: 1,
     teamId: "aus",
@@ -337,7 +331,7 @@ const step2 = Effect.gen(function* () {
     isCaptain: true,
     isViceCaptain: false,
   })
-  yield* db.SquadSelections.put({
+  yield* db.entities.SquadSelections.put({
     squadId: "aus#2024-25#BGT",
     selectionNumber: 2,
     teamId: "aus",
@@ -348,7 +342,7 @@ const step2 = Effect.gen(function* () {
   })
 
   // India's squad for BGT 2024-25
-  yield* db.SquadSelections.put({
+  yield* db.entities.SquadSelections.put({
     squadId: "ind#2024-25#BGT",
     selectionNumber: 1,
     teamId: "ind",
@@ -357,7 +351,7 @@ const step2 = Effect.gen(function* () {
     isCaptain: true,
     isViceCaptain: false,
   })
-  yield* db.SquadSelections.put({
+  yield* db.entities.SquadSelections.put({
     squadId: "ind#2024-25#BGT",
     selectionNumber: 2,
     teamId: "ind",
@@ -370,7 +364,7 @@ const step2 = Effect.gen(function* () {
   yield* scanTable("After Step 2: SquadSelections (note embedded team + player maps)")
 
   yield* Console.log("  Entity.get returns hydrated objects:")
-  const sel = yield* db.SquadSelections.get({
+  const sel = yield* db.entities.SquadSelections.get({
     squadId: "aus#2024-25#BGT",
     selectionNumber: 1,
   })

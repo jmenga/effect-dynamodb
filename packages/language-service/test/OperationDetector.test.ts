@@ -1,6 +1,6 @@
 import ts from "typescript"
 import { describe, expect, it } from "vitest"
-import type { ResolvedEntity } from "../src/core/EntityResolver"
+import type { ResolvedCollection, ResolvedEntity } from "../src/core/EntityResolver"
 import { detectOperation } from "../src/core/OperationDetector"
 
 function parseSource(source: string): ts.SourceFile {
@@ -237,5 +237,99 @@ describe("OperationDetector", () => {
 
     expect(op).toBeDefined()
     expect(op!.type).toBe("scan")
+  })
+
+  // --- V2 patterns ---
+
+  const mockCollection: ResolvedCollection = {
+    variableName: "TasksByUser",
+    collectionName: "tasksByUser",
+    index: "gsi1",
+    type: "clustered",
+    pk: { field: "gsi1pk", composite: ["userId"] },
+    sk: { field: "gsi1sk" },
+    members: {
+      Tasks: { entityVariableName: "Tasks", sk: { composite: ["status", "taskId"] } },
+    },
+  }
+
+  const assignmentsCollection: ResolvedCollection = {
+    variableName: "Assignments",
+    collectionName: "assignments",
+    index: "gsi3",
+    type: "clustered",
+    pk: { field: "gsi3pk", composite: ["employee"] },
+    sk: { field: "gsi3sk" },
+    members: {
+      Employees: { entityVariableName: "Users", sk: { composite: [] } },
+      Tasks: { entityVariableName: "Tasks", sk: { composite: ["project", "task"] } },
+    },
+  }
+
+  const collections = [mockCollection, assignmentsCollection]
+
+  it("should detect db.entities.Tasks.tasksByUser(...) as entity-query-accessor", () => {
+    const source = `db.entities.Tasks.tasksByUser({ userId: "u-1" })`
+    const sf = parseSource(source)
+    // Position on "tasksByUser" (18..29)
+    const op = detectOperation(ts, sf, 22, entities, collections)
+
+    expect(op).toBeDefined()
+    expect(op!.type).toBe("entity-query-accessor")
+    expect(op!.entity?.variableName).toBe("Tasks")
+    expect(op!.collectionName).toBe("tasksByUser")
+  })
+
+  it("should detect db.collections.Assignments(...) as collection-accessor", () => {
+    const source = `db.collections.Assignments({ employee: "dfinlay" })`
+    const sf = parseSource(source)
+    // Position on "Assignments" (15..26)
+    const op = detectOperation(ts, sf, 18, entities, collections)
+
+    expect(op).toBeDefined()
+    expect(op!.type).toBe("collection-accessor")
+    expect(op!.collectionName).toBe("assignments")
+  })
+
+  it("should detect .collect() on entity query accessor as bound-query-terminal", () => {
+    const source = `db.entities.Tasks.tasksByUser({ userId: "u-1" }).collect()`
+    const sf = parseSource(source)
+    // Position on "collect" (49..56)
+    const op = detectOperation(ts, sf, 50, entities, collections)
+
+    expect(op).toBeDefined()
+    expect(op!.type).toBe("bound-query-terminal")
+    expect(op!.terminalName).toBe("collect")
+    expect(op!.entity?.variableName).toBe("Tasks")
+  })
+
+  it("should detect db.entities.Tasks.scan() via v2 path", () => {
+    const source = `db.entities.Tasks.scan()`
+    const sf = parseSource(source)
+    const op = detectOperation(ts, sf, 19, entities, collections)
+
+    expect(op).toBeDefined()
+    expect(op!.type).toBe("scan")
+    expect(op!.entity?.variableName).toBe("Tasks")
+  })
+
+  it("should detect db.tables.HrTable as table-accessor", () => {
+    const source = `db.tables.HrTable`
+    const sf = parseSource(source)
+    const op = detectOperation(ts, sf, 11, entities, collections)
+
+    expect(op).toBeDefined()
+    expect(op!.type).toBe("table-accessor")
+    expect(op!.tableName).toBe("HrTable")
+  })
+
+  it("should detect db.entities.Users.get via v2 entities namespace", () => {
+    const source = `db.entities.Users.get({ userId: "u-1" })`
+    const sf = parseSource(source)
+    const op = detectOperation(ts, sf, 19, entities, collections)
+
+    expect(op).toBeDefined()
+    expect(op!.type).toBe("get")
+    expect(op!.entity?.variableName).toBe("Users")
   })
 })

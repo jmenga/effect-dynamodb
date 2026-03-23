@@ -4,9 +4,10 @@
  * Demonstrates the foundational building blocks:
  *   - Pure domain models with Schema.Class
  *   - DynamoSchema + Table + Entity definitions
+ *   - Collections for GSI access patterns
  *   - DynamoClient.make() — the typed execution gateway
  *   - Basic CRUD: put, get, update, delete
- *   - GSI query
+ *   - GSI query via Collections and BoundQuery builder
  *   - Table infrastructure derived from entity definitions
  *   - Layer-based dependency injection
  *
@@ -20,6 +21,7 @@
 import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
@@ -67,23 +69,16 @@ const AppSchema = DynamoSchema.make({ name: "starter", version: 1 })
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 3. Entity definitions — pure definitions, no table reference
+// 3. Entity definitions — primary key only, no GSIs
 // ---------------------------------------------------------------------------
 
 // #region entities
 const Users = Entity.make({
   model: UserModel,
   entityType: "User",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byEmail: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["email"] },
-      sk: { field: "gsi1sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
   },
   unique: { email: ["email"] },
   timestamps: true,
@@ -93,23 +88,32 @@ const Users = Entity.make({
 const Tasks = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byUser: {
-      index: "gsi1",
-      collection: "UserItems",
-      type: "clustered",
-      pk: { field: "gsi1pk", composite: ["userId"] },
-      sk: { field: "gsi1sk", composite: ["status"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Users, Tasks } })
+
+const UsersByEmail = Collections.make("usersByEmail", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["email"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Users: Collections.member(Users, { sk: { composite: [] } }),
+  },
+})
+
+const TasksByUser = Collections.make("tasksByUser", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["userId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Tasks: Collections.member(Tasks, { sk: { composite: ["status"] } }),
+  },
+})
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -118,19 +122,22 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Users, Tasks } })
 
 // #region program
 const program = Effect.gen(function* () {
-  // Get typed client — binds all table members
-  const db = yield* DynamoClient.make(MainTable)
+  // Get typed client — binds all entities and collections
+  const db = yield* DynamoClient.make({
+    entities: { Users, Tasks },
+    collections: { UsersByEmail, TasksByUser },
+  })
 
   // --- Create the table (derived from entity definitions) ---
   yield* Console.log("=== Setup ===\n")
 
-  yield* db.createTable()
+  yield* db.tables["starter-table"]!.create()
   yield* Console.log("Table created\n")
 
   // --- Put: create items ---
   yield* Console.log("=== Put ===\n")
 
-  const alice = yield* db.Users.put({
+  const alice = yield* db.entities.Users.put({
     userId: "u-alice",
     email: "alice@example.com",
     displayName: "Alice",
@@ -139,7 +146,7 @@ const program = Effect.gen(function* () {
   })
   yield* Console.log(`Created user: ${alice.displayName} (${alice.email})`)
 
-  yield* db.Tasks.put({
+  yield* db.entities.Tasks.put({
     taskId: "t-1",
     userId: "u-alice",
     title: "Learn effect-dynamodb",
@@ -147,7 +154,7 @@ const program = Effect.gen(function* () {
     priority: 1,
   })
 
-  yield* db.Tasks.put({
+  yield* db.entities.Tasks.put({
     taskId: "t-2",
     userId: "u-alice",
     title: "Build something cool",
@@ -159,10 +166,10 @@ const program = Effect.gen(function* () {
   // --- Get: read by primary key ---
   yield* Console.log("=== Get ===\n")
 
-  const user = yield* db.Users.get({ userId: "u-alice" })
+  const user = yield* db.entities.Users.get({ userId: "u-alice" })
   yield* Console.log(`Got user: ${user.displayName} (role: ${user.role})`)
 
-  const task = yield* db.Tasks.get({ taskId: "t-1" })
+  const task = yield* db.entities.Tasks.get({ taskId: "t-1" })
   yield* Console.log(`Got task: "${task.title}" (status: ${task.status})\n`)
 
   // --- Update ---
@@ -170,16 +177,16 @@ const program = Effect.gen(function* () {
 
   // Note: status is a GSI composite, so we must also provide userId
   // (all composites for the GSI) so the key can be recomposed
-  const updated = yield* db.Tasks.update(
+  const updated = yield* db.entities.Tasks.update(
     { taskId: "t-1" },
     Entity.set({ status: "done", userId: "u-alice" }),
   )
   yield* Console.log(`Updated task: "${updated.title}" -> ${updated.status}\n`)
 
-  // --- Query: tasks by user via GSI ---
+  // --- Query: tasks by user via collection ---
   yield* Console.log("=== Query: Tasks by User (GSI) ===\n")
 
-  const aliceTasks = yield* db.Tasks.collect(Tasks.query.byUser({ userId: "u-alice" }))
+  const { Tasks: aliceTasks } = yield* db.collections.TasksByUser({ userId: "u-alice" }).collect()
   yield* Console.log(`Alice's tasks (${aliceTasks.length}):`)
   for (const t of aliceTasks) {
     yield* Console.log(`  ${t.taskId}: "${t.title}" — ${t.status}`)
@@ -189,13 +196,13 @@ const program = Effect.gen(function* () {
   // --- Delete ---
   yield* Console.log("=== Delete ===\n")
 
-  yield* db.Tasks.delete({ taskId: "t-1" })
-  yield* db.Tasks.delete({ taskId: "t-2" })
-  yield* db.Users.delete({ userId: "u-alice" })
+  yield* db.entities.Tasks.delete({ taskId: "t-1" })
+  yield* db.entities.Tasks.delete({ taskId: "t-2" })
+  yield* db.entities.Users.delete({ userId: "u-alice" })
   yield* Console.log("Deleted all items\n")
 
   // --- Cleanup ---
-  yield* db.deleteTable()
+  yield* db.tables["starter-table"]!.delete()
   yield* Console.log("Table deleted.")
 })
 // #endregion

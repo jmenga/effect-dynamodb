@@ -1,6 +1,6 @@
 ---
 title: "Example: CRUD Operations"
-description: "Full high-level API with entity operations, variadic combinator updates, GSI queries, transactions, version history, soft delete, and purge"
+description: "Full high-level API with entity operations, variadic combinator updates, collection queries, transactions, version history, soft delete, and purge"
 ---
 
 A comprehensive example demonstrating the full effect-dynamodb high-level API. Starting from model definitions through to advanced lifecycle features, this example covers every major operation you will use when building applications.
@@ -9,7 +9,7 @@ A comprehensive example demonstrating the full effect-dynamodb high-level API. S
 - Creating items with `put` and reading with `get`
 - Updates with variadic combinators: `update(key, Entity.set(...), Entity.expectedVersion(n))`
 - Error handling with tagged errors (`ItemNotFound`, `OptimisticLockError`)
-- GSI queries with combinators (`where`, `reverse`, `collect`)
+- Collection queries with fluent combinators (`reverse`, `filter`, `collect`)
 - Atomic transactions with `Transaction.transactWrite` and `transactGet`
 - Sparse GSI behavior and the all-or-none update constraint
 - Version history with `versioned: { retain: true }`
@@ -53,7 +53,9 @@ class Task extends Schema.Class<Task>("Task")({
 
 ---
 
-## Step 2: Schema, Table, and Entities
+## Step 2: Entities, Table, and Collections
+
+Entities define only their primary key. GSI access patterns are owned by Collections:
 
 ```typescript region="entities" example="crud.ts"
 const AppSchema = DynamoSchema.make({ name: "crud-demo", version: 1 })
@@ -61,16 +63,9 @@ const AppSchema = DynamoSchema.make({ name: "crud-demo", version: 1 })
 const Users = Entity.make({
   model: UserModel,
   entityType: "User",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byRole: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["role"] },
-      sk: { field: "gsi1sk", composite: ["userId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: { retain: true },
@@ -79,45 +74,64 @@ const Users = Entity.make({
 const Tasks = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byUser: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["userId"] },
-      sk: { field: "gsi1sk", composite: ["status", "taskId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: true,
   softDelete: true,
 })
+
+const MainTable = Table.make({
+  schema: AppSchema,
+  entities: { Users, Tasks },
+})
+
+const UsersByRole = Collections.make("usersByRole", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["role"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Users: Collections.member(Users, { sk: { composite: ["userId"] } }),
+  },
+})
+
+const TasksByUser = Collections.make("tasksByUser", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["userId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Tasks: Collections.member(Tasks, { sk: { composite: ["status", "taskId"] } }),
+  },
+})
 ```
 
 Key configuration:
 - **Users** have `versioned: { retain: true }` -- every mutation creates a version snapshot in the same partition, enabling full audit history
-- **Users** have a `byRole` GSI for querying users by their role
+- **UsersByRole** collection defines the GSI access pattern for querying users by role
 - **Tasks** have `softDelete: true` -- deleting archives the item rather than destroying it
-- **Tasks** have `status` and `taskId` in the sort key composite, so tasks for a user are sorted by status
+- **TasksByUser** collection has `status` and `taskId` in the sort key composite, so tasks for a user are sorted by status
 
 ---
 
 ## Step 3: Typed Client and Create Items
 
-Before calling any entity operations, obtain a typed client via `DynamoClient.make(MainTable)` to resolve the `DynamoClient` and `TableConfig` dependencies. The returned client provides bound entities where all operations have `R = never`:
+Before calling any entity operations, obtain a typed client via `DynamoClient.make({ entities, collections })` to resolve the `DynamoClient` and `TableConfig` dependencies. The returned client provides bound entities and collection accessors where all operations have `R = never`:
 
 ```typescript region="client" example="crud.ts"
-// Typed execution gateway — binds all table members
-const db = yield* DynamoClient.make(MainTable)
+// Typed execution gateway — binds all entities and collections
+const db = yield* DynamoClient.make({
+  entities: { Users, Tasks, Projects, Employees },
+  collections: { UsersByRole, TasksByUser, ProjectsByOwner, EmployeesByTenant },
+})
 ```
 
 Create items with `put` -- returns the model type (e.g. `User`):
 
 ```typescript region="put" example="crud.ts"
 // Default: yield* returns the model type (User) — clean, no system fields
-const alice = yield* db.Users.put({
+const alice = yield* db.entities.Users.put({
   userId: "u-alice",
   email: "alice@example.com",
   displayName: "Alice",
@@ -127,7 +141,7 @@ const alice = yield* db.Users.put({
 // alice: User — has userId, email, displayName, role, createdBy
 
 // For asRecord decode mode, use entity definitions with Effect.provide
-const bob = yield* db.Users.put({
+const bob = yield* db.entities.Users.put({
   userId: "u-bob",
   email: "bob@example.com",
   displayName: "Bob",
@@ -140,7 +154,7 @@ The same pattern applies to Tasks:
 
 ```typescript region="put-tasks" example="crud.ts"
 // Tasks: bare yield* returns Task
-const task1 = yield* db.Tasks.put({
+const task1 = yield* db.entities.Tasks.put({
   taskId: "t-1",
   userId: "u-alice",
   title: "Design the API",
@@ -148,7 +162,7 @@ const task1 = yield* db.Tasks.put({
   priority: 1,
 })
 
-yield* db.Tasks.put({
+yield* db.entities.Tasks.put({
   taskId: "t-2",
   userId: "u-alice",
   title: "Write tests",
@@ -165,7 +179,7 @@ yield* db.Tasks.put({
 
 ```typescript region="get" example="crud.ts"
 // Default: clean domain type — no keys, no system fields, no __edd_e__
-const userModel = yield* db.Users.get({ userId: "u-alice" })
+const userModel = yield* db.entities.Users.get({ userId: "u-alice" })
 // userModel: User
 ```
 
@@ -176,15 +190,15 @@ const userModel = yield* db.Users.get({ userId: "u-alice" })
 `update(key, ...combinators)` accepts `Entity.set()`, `Entity.expectedVersion()`, and other combinators as variadic rest arguments:
 
 ```typescript region="update" example="crud.ts"
-// db.Users.update(key, ...combinators) — update via bound entity
-const updatedAlice = yield* db.Users.update(
+// db.entities.Users.update(key, ...combinators) — update via bound entity
+const updatedAlice = yield* db.entities.Users.update(
   { userId: "u-alice" },
   Entity.set({ role: "member", displayName: "Alice W." }),
 )
 // updatedAlice: User — clean model type
 
 // Second update
-const updatedAlice2 = yield* db.Users.update(
+const updatedAlice2 = yield* db.entities.Users.update(
   { userId: "u-alice" },
   Entity.set({ displayName: "Alice Wu" }),
 )
@@ -199,15 +213,13 @@ const updatedAlice2 = yield* db.Users.update(
 
 ```typescript region="locking" example="crud.ts"
 // expectedVersion(n) composes with update
-const lockResult = yield* db.Users.update(
+const lockResult = yield* db.entities.Users.update(
   { userId: "u-alice" },
   Entity.set({ displayName: "Alice Wrong" }),
   Entity.expectedVersion(1), // version is now 3 — this will fail
 ).pipe(
   Effect.catchTag("OptimisticLockError", (e) =>
-    Effect.succeed(
-      `Expected v${e.expectedVersion}, item has been updated`,
-    ),
+    Effect.succeed(`Expected v${e.expectedVersion}, item has been updated`),
   ),
 )
 ```
@@ -220,7 +232,7 @@ All errors are tagged, enabling precise `catchTag` handling. `ItemNotFound` is t
 
 ```typescript region="error-handling" example="crud.ts"
 // Bound methods return Effects — error types flow through pipe
-const notFoundResult = yield* db.Users.get({ userId: "u-nonexistent" }).pipe(
+const notFoundResult = yield* db.entities.Users.get({ userId: "u-nonexistent" }).pipe(
   Effect.map((u) => `Found: ${u.userId}`),
   Effect.catchTag("ItemNotFound", (e) =>
     Effect.succeed(`Not found: entity=${e.entityType}, key=${JSON.stringify(e.key)}`),
@@ -232,35 +244,34 @@ Bound entity methods return `Effect` directly, so you can pipe to Effect combina
 
 ---
 
-## Step 8: GSI Queries
+## Step 8: Collection Queries
 
-Query a GSI by providing the partition key composites. Use `Query.collect` to gather all results:
+Query a collection by providing the partition key composites. Use `.collect()` to gather all results as a grouped object:
 
 ```typescript region="query" example="crud.ts"
-const aliceTasks = yield* db.Tasks.collect(Tasks.query.byUser({ userId: "u-alice" }))
-
-const admins = yield* db.Users.collect(Users.query.byRole({ role: "admin" }))
+const { Tasks: aliceTasks } = yield* db.collections.TasksByUser({ userId: "u-alice" }).collect()
+const { Users: admins } = yield* db.collections.UsersByRole({ role: "admin" }).collect()
 ```
 
 ### Query Combinators
 
-Compose query behavior with pipeable combinators:
+Compose query behavior with fluent combinators:
 
 ```typescript region="query-combinators" example="crud.ts"
 // Reverse sort order
-const reversedTasks = yield* db.Tasks.collect(
-  Tasks.query.byUser({ userId: "u-alice" }).pipe(Query.reverse),
-)
+const { Tasks: reversedTasks } = yield* db.collections
+  .TasksByUser({ userId: "u-alice" })
+  .reverse()
+  .collect()
 
-// Sort key prefix filter (beginsWith)
-const todoTasks = yield* db.Tasks.collect(
-  Tasks.query
-    .byUser({ userId: "u-alice" })
-    .pipe(Query.where({ beginsWith: "$crud-demo#v1#task#todo" })),
-)
+// Filter expression (post-read filter)
+const { Tasks: todoTasks } = yield* db.collections
+  .TasksByUser({ userId: "u-alice" })
+  .filter({ status: "todo" })
+  .collect()
 ```
 
-`Query.reverse` flips the scan direction. `Query.where` adds a sort key condition -- here, `beginsWith` filters to tasks with a `todo` status prefix in the sort key.
+`.reverse()` flips the scan direction. `.filter()` adds a post-read filter expression -- here, only tasks with `status: "todo"` are returned.
 
 ---
 
@@ -323,43 +334,45 @@ class Project extends Schema.Class<Project>("Project")({
 const Projects = Entity.make({
   model: Project,
   entityType: "Project",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["projectId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byOwner: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["ownerId"] },
-      sk: { field: "gsi1sk", composite: ["department"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["projectId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
+})
+
+const ProjectsByOwner = Collections.make("projectsByOwner", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["ownerId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Projects: Collections.member(Projects, { sk: { composite: ["department"] } }),
+  },
 })
 ```
 
 Put items with and without optional GSI composites:
 
 ```typescript region="sparse-put" example="crud.ts"
-// Assigned project — appears in byOwner GSI
-const assigned = yield* db.Projects.put({
+// Assigned project — appears in ProjectsByOwner collection
+const assigned = yield* db.entities.Projects.put({
   projectId: "p-1",
   name: "Alpha",
   ownerId: "u-alice",
   department: "engineering",
 })
 
-// Unassigned project — does NOT appear in byOwner GSI (sparse)
-const unassigned = yield* db.Projects.put({
+// Unassigned project — does NOT appear in ProjectsByOwner (sparse)
+const unassigned = yield* db.entities.Projects.put({
   projectId: "p-2",
   name: "Beta",
   // ownerId and department omitted
 })
 
 // Query only returns assigned projects
-const ownerProjects = yield* db.Projects.collect(
-  Projects.query.byOwner({ ownerId: "u-alice" }),
-)
+const { Projects: ownerProjects } = yield* db.collections
+  .ProjectsByOwner({ ownerId: "u-alice" })
+  .collect()
 // → [{ projectId: "p-1", name: "Alpha" }]
 // "Beta" is absent — sparse index at work
 ```
@@ -370,16 +383,16 @@ When updating, if the payload includes ANY composite for a GSI, ALL composites f
 
 ```typescript region="sparse-update" example="crud.ts"
 // GOOD: Update without touching GSI composites
-yield* db.Employees.update({ employeeId: "e-1" }, Entity.set({ name: "Alice W." }))
+yield* db.entities.Employees.update({ employeeId: "e-1" }, Entity.set({ name: "Alice W." }))
 
 // GOOD: Update ALL composites of a GSI
-yield* db.Employees.update(
+yield* db.entities.Employees.update(
   { employeeId: "e-1" },
   Entity.set({ tenantId: "t-2", region: "eu-west-1" }),
 )
 
 // BAD: Partial GSI composites — runtime ValidationError
-yield* db.Employees.update(
+yield* db.entities.Employees.update(
   { employeeId: "e-1" },
   Entity.set({ tenantId: "t-3" }), // missing region!
 ).pipe(
@@ -396,10 +409,10 @@ yield* db.Employees.update(
 For entities without `softDelete`, `Entity.delete` permanently removes the item:
 
 ```typescript region="delete" example="crud.ts"
-yield* db.Users.delete({ userId: "u-charlie" })
+yield* db.entities.Users.delete({ userId: "u-charlie" })
 
 // Confirm deletion
-const afterDelete = yield* db.Users.get({ userId: "u-charlie" }).pipe(
+const afterDelete = yield* db.entities.Users.get({ userId: "u-charlie" }).pipe(
   Effect.map(() => "still exists!"),
   Effect.catchTag("ItemNotFound", () => Effect.succeed("confirmed deleted")),
 )
@@ -413,18 +426,18 @@ With `versioned: { retain: true }`, every put and update creates a snapshot in t
 
 ```typescript region="versions" example="crud.ts"
 // Fetch a specific version
-const aliceV1 = yield* db.Users.getVersion({ userId: "u-alice" }, 1)
+const aliceV1 = yield* db.entities.Users.getVersion({ userId: "u-alice" }, 1)
 // aliceV1.displayName → "Alice", aliceV1.role → "admin"
 
-const aliceV2 = yield* db.Users.getVersion({ userId: "u-alice" }, 2)
+const aliceV2 = yield* db.entities.Users.getVersion({ userId: "u-alice" }, 2)
 // aliceV2.displayName → "Alice W.", aliceV2.role → "member"
 
 // Query all version snapshots
-const allVersions = yield* db.Users.collect(Users.versions({ userId: "u-alice" }))
+const allVersions = yield* db.entities.Users.collect(Users.versions({ userId: "u-alice" }))
 // → [{ version: 1, ... }, { version: 2, ... }, { version: 3, ... }]
 
 // Non-existent version → ItemNotFound
-yield* db.Users.getVersion({ userId: "u-alice" }, 99).pipe(
+yield* db.entities.Users.getVersion({ userId: "u-alice" }, 99).pipe(
   Effect.catchTag("ItemNotFound", () => Effect.succeed("not found")),
 )
 ```
@@ -437,17 +450,19 @@ Version snapshots share the primary partition key but use a version-specific sor
 
 ### Soft Delete
 
-For entities with `softDelete: true`, `Entity.delete` archives the item instead of destroying it. GSI keys are stripped, so the item vanishes from all index queries:
+For entities with `softDelete: true`, `Entity.delete` archives the item instead of destroying it. GSI keys are stripped, so the item vanishes from all collection queries:
 
 ```typescript region="soft-delete" example="crud.ts"
-yield* db.Tasks.delete({ taskId: "t-1" })
+yield* db.entities.Tasks.delete({ taskId: "t-1" })
 
-// No longer in GSI queries
-const aliceTasksAfterDelete = yield* db.Tasks.collect(Tasks.query.byUser({ userId: "u-alice" }))
+// No longer in collection queries
+const { Tasks: aliceTasksAfterDelete } = yield* db.collections
+  .TasksByUser({ userId: "u-alice" })
+  .collect()
 // t-1 is absent
 
 // But retrievable via deleted.get
-const deletedTask = yield* db.Tasks.deleted.get({ taskId: "t-1" })
+const deletedTask = yield* db.entities.Tasks.deleted.get({ taskId: "t-1" })
 // deletedTask.title → "Design the API"
 ```
 
@@ -456,12 +471,14 @@ const deletedTask = yield* db.Tasks.deleted.get({ taskId: "t-1" })
 Restore recomposes all keys, increments the version, and brings the item back to life:
 
 ```typescript region="restore" example="crud.ts"
-const restored = yield* db.Tasks.restore({ taskId: "t-1" })
+const restored = yield* db.entities.Tasks.restore({ taskId: "t-1" })
 // restored.title → "Design the API"
 // restored.status → "done"
 
-// Back in GSI queries
-const aliceTasksAfterRestore = yield* db.Tasks.collect(Tasks.query.byUser({ userId: "u-alice" }))
+// Back in collection queries
+const { Tasks: aliceTasksAfterRestore } = yield* db.collections
+  .TasksByUser({ userId: "u-alice" })
+  .collect()
 // t-1 is back
 ```
 
@@ -470,10 +487,10 @@ const aliceTasksAfterRestore = yield* db.Tasks.collect(Tasks.query.byUser({ user
 Purge permanently removes everything for a partition key -- the current item, all version snapshots, and any soft-deleted copies:
 
 ```typescript region="purge" example="crud.ts"
-yield* db.Users.purge({ userId: "u-bob" })
+yield* db.entities.Users.purge({ userId: "u-bob" })
 
 // Completely gone — no item, no versions, no snapshots
-yield* db.Users.get({ userId: "u-bob" }).pipe(
+yield* db.entities.Users.get({ userId: "u-bob" }).pipe(
   Effect.catchTag("ItemNotFound", () => Effect.succeed("completely gone")),
 )
 ```
@@ -508,6 +525,7 @@ const AppLayer = Layer.mergeAll(
     credentials: { accessKeyId: "local", secretAccessKey: "local" },
   }),
   MainTable.layer({ name: "crud-demo-table" }),
+  ProjectTable.layer({ name: "crud-demo-table" }),
 )
 
 const main = program.pipe(Effect.provide(AppLayer))
@@ -524,16 +542,16 @@ Effect.runPromise(main).then(
 
 | Concept | How it's used |
 |---------|---------------|
-| **Typed client** | `const db = yield* DynamoClient.make(MainTable)` resolves dependencies; all ops have `R = never` |
-| **Variadic combinator updates** | `db.Users.update(key, Entity.set(...), Entity.expectedVersion(n))` — combinators as rest args |
+| **Typed client** | `const db = yield* DynamoClient.make({ entities, collections })` resolves dependencies; all ops have `R = never` |
+| **Variadic combinator updates** | `db.entities.Users.update(key, Entity.set(...), Entity.expectedVersion(n))` — combinators as rest args |
 | **Optimistic locking** | `Entity.expectedVersion(n)` composes with `Entity.set()` as variadic combinators |
 | **Tagged error handling** | `Effect.catchTag("ItemNotFound", ...)` for precise recovery — bound methods return `Effect` directly |
-| **GSI queries** | `Users.query.byRole(composites)` on entity definition, `db.Users.collect(query)` on bound entity |
+| **Collection queries** | `db.collections.TasksByUser(composites).collect()` returns grouped results; `.reverse()`, `.filter()` for combinators |
 | **Transactions** | `transactWrite` for atomic multi-entity creates; `transactGet` for typed tuple reads |
 | **Sparse GSI** | Optional composites produce sparse indexes; all-or-none constraint prevents stale keys |
-| **Version history** | `versioned: { retain: true }` creates snapshots; `db.Users.getVersion(key, n)` and `Users.versions(key)` for retrieval |
-| **Soft delete + restore** | `softDelete: true` archives items; `db.Tasks.restore(key)` recomposes all keys |
-| **Purge** | `db.Users.purge(key)` permanently removes item + versions + soft-deleted copies |
+| **Version history** | `versioned: { retain: true }` creates snapshots; `db.entities.Users.getVersion(key, n)` and `Users.versions(key)` for retrieval |
+| **Soft delete + restore** | `softDelete: true` archives items; `db.entities.Tasks.restore(key)` recomposes all keys |
+| **Purge** | `db.entities.Users.purge(key)` permanently removes item + versions + soft-deleted copies |
 
 ## What's Next?
 

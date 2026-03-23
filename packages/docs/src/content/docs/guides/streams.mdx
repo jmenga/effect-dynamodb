@@ -51,16 +51,9 @@ const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
 const EmployeeEntity = Entity.make({
   model: EmployeeModel,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byDepartment: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["department"] },
-      sk: { field: "gsi1sk", composite: ["displayName"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: true,
@@ -69,16 +62,9 @@ const EmployeeEntity = Entity.make({
 const TaskEntity = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byEmployee: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["employeeId"] },
-      sk: { field: "gsi1sk", composite: ["status"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -86,6 +72,24 @@ const TaskEntity = Entity.make({
 const _MainTable = Table.make({
   schema: AppSchema,
   entities: { EmployeeEntity, TaskEntity },
+})
+
+const _EmployeesByDepartment = Collections.make("employeesByDepartment", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["department"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    EmployeeEntity: Collections.member(EmployeeEntity, { sk: { composite: ["displayName"] } }),
+  },
+})
+
+const _TasksByEmployee = Collections.make("tasksByEmployee", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["employeeId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    TaskEntity: Collections.member(TaskEntity, { sk: { composite: ["status"] } }),
+  },
 })
 ```
 
@@ -115,9 +119,7 @@ If you've already unmarshalled the item (e.g., using `Marshaller.fromAttributeMa
 ```typescript region="decode-unmarshalled" example="guide-streams.ts"
 const employeeFromItem = Entity.itemSchema(EmployeeEntity)
 
-const decodeUnmarshalledEmployee = (
-  marshalledImage: Record<string, AttributeValue>,
-) => {
+const decodeUnmarshalledEmployee = (marshalledImage: Record<string, AttributeValue>) => {
   const unmarshalled = Marshaller.fromAttributeMap(marshalledImage)
   return Schema.decodeUnknownSync(employeeFromItem)(unmarshalled)
 }
@@ -155,10 +157,7 @@ const handleStreamEvent = (event: DynamoDBStreamEvent) =>
       const entityType = image["__edd_e__"]?.S
       switch (entityType) {
         case "Employee": {
-          const emp = yield* Entity.decodeMarshalledItem(
-            EmployeeEntity,
-            image,
-          )
+          const emp = yield* Entity.decodeMarshalledItem(EmployeeEntity, image)
           yield* handleEmployeeChange(emp as Entity.Record<typeof EmployeeEntity>)
           break
         }

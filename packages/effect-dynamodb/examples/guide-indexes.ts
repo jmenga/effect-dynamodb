@@ -2,13 +2,13 @@
  * Indexes & Collections Guide — effect-dynamodb
  *
  * Demonstrates every index pattern from the Indexes & Collections guide:
- *   - Primary index and GSI definitions
+ *   - Primary key definitions on entities
  *   - Key generation (composite keys, empty composites)
- *   - Logical query accessors
+ *   - Collections.make() for GSI access patterns
+ *   - Logical query accessors via collections
  *   - Isolated collections
  *   - Clustered collections
  *   - Sub-collections (clustered only)
- *   - Collection.make() and entity selectors
  *   - Worked example: multi-tenant project management
  *
  * Prerequisites:
@@ -21,11 +21,10 @@
 import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
-import * as Collection from "../src/Collection.js"
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 
 // =============================================================================
@@ -77,30 +76,38 @@ const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
 // #endregion
 
 // =============================================================================
-// 3. Entity definitions — primary + GSI indexes
+// 3. Entity definitions — primary keys only
 // =============================================================================
 
 // #region task-entity
 const Tasks = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byProject: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["projectId"] },
-      sk: { field: "gsi1sk", composite: ["priority"] },
-    },
-    byAssignee: {
-      index: "gsi2",
-      pk: { field: "gsi2pk", composite: ["assigneeId"] },
-      sk: { field: "gsi2sk", composite: ["priority"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
+})
+// #endregion
+
+// #region task-collections
+const ByProject = Collections.make("byProject", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["projectId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Tasks: Collections.member(Tasks, { sk: { composite: ["priority"] } }),
+  },
+})
+
+const ByAssignee = Collections.make("byAssignee", {
+  index: "gsi2",
+  pk: { field: "gsi2pk", composite: ["assigneeId"] },
+  sk: { field: "gsi2sk" },
+  members: {
+    Tasks: Collections.member(Tasks, { sk: { composite: ["priority"] } }),
+  },
 })
 // #endregion
 
@@ -108,18 +115,9 @@ const Tasks = Entity.make({
 const IsolatedEmployees = Entity.make({
   model: Employee,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byDepartment: {
-      index: "gsi1",
-      collection: "DepartmentStaff",
-      type: "isolated",
-      pk: { field: "gsi1pk", composite: ["department"] },
-      sk: { field: "gsi1sk", composite: ["hireDate"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -134,20 +132,24 @@ class Equipment extends Schema.Class<Equipment>("Equipment")({
 const Equipments = Entity.make({
   model: Equipment,
   entityType: "Equipment",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["equipmentId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byDepartment: {
-      index: "gsi1",
-      collection: "DepartmentStaff",
-      type: "isolated",
-      pk: { field: "gsi1pk", composite: ["department"] },
-      sk: { field: "gsi1sk", composite: ["purchaseDate"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["equipmentId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
+})
+// #endregion
+
+// #region isolated-collection
+const DepartmentStaff = Collections.make("DepartmentStaff", {
+  index: "gsi1",
+  type: "isolated",
+  pk: { field: "gsi1pk", composite: ["department"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    employees: Collections.member(IsolatedEmployees, { sk: { composite: ["hireDate"] } }),
+    equipments: Collections.member(Equipments, { sk: { composite: ["purchaseDate"] } }),
+  },
 })
 // #endregion
 
@@ -155,18 +157,9 @@ const Equipments = Entity.make({
 const ClusteredEmployees = Entity.make({
   model: Employee,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byTenant: {
-      index: "gsi1",
-      collection: "TenantMembers",
-      type: "clustered",
-      pk: { field: "gsi1pk", composite: ["tenantId"] },
-      sk: { field: "gsi1sk", composite: ["department", "hireDate"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -174,20 +167,28 @@ const ClusteredEmployees = Entity.make({
 const ClusteredTasks = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byTenant: {
-      index: "gsi1",
-      collection: "TenantMembers",
-      type: "clustered",
-      pk: { field: "gsi1pk", composite: ["tenantId"] },
-      sk: { field: "gsi1sk", composite: ["projectId", "taskId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
+})
+// #endregion
+
+// #region clustered-collection
+const TenantMembers = Collections.make("TenantMembers", {
+  index: "gsi1",
+  type: "clustered",
+  pk: { field: "gsi1pk", composite: ["tenantId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    employees: Collections.member(ClusteredEmployees, {
+      sk: { composite: ["department", "hireDate"] },
+    }),
+    tasks: Collections.member(ClusteredTasks, {
+      sk: { composite: ["projectId", "taskId"] },
+    }),
+  },
 })
 // #endregion
 
@@ -195,18 +196,9 @@ const ClusteredTasks = Entity.make({
 const SubEmployee = Entity.make({
   model: Employee,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byEmployee: {
-      index: "gsi2",
-      collection: "contributions",
-      type: "clustered",
-      pk: { field: "gsi2pk", composite: ["employeeId"] },
-      sk: { field: "gsi2sk", composite: ["department"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -214,18 +206,9 @@ const SubEmployee = Entity.make({
 const SubTasks = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byAssignee: {
-      index: "gsi2",
-      collection: ["contributions", "assignments"],
-      type: "clustered",
-      pk: { field: "gsi2pk", composite: ["assigneeId"] },
-      sk: { field: "gsi2sk", composite: ["projectId", "taskId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -233,48 +216,46 @@ const SubTasks = Entity.make({
 const SubProjectMembers = Entity.make({
   model: ProjectMember,
   entityType: "ProjectMember",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId", "projectId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byMember: {
-      index: "gsi2",
-      collection: ["contributions", "assignments"],
-      type: "clustered",
-      pk: { field: "gsi2pk", composite: ["employeeId"] },
-      sk: { field: "gsi2sk", composite: ["projectId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId", "projectId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 // #endregion
 
+// #region subcollection-collections
+const Contributions = Collections.make("contributions", {
+  index: "gsi2",
+  type: "clustered",
+  pk: { field: "gsi2pk", composite: ["employeeId"] },
+  sk: { field: "gsi2sk" },
+  members: {
+    employees: Collections.member(SubEmployee, { sk: { composite: ["department"] } }),
+    tasks: Collections.member(SubTasks, { sk: { composite: ["projectId", "taskId"] } }),
+    projectMembers: Collections.member(SubProjectMembers, { sk: { composite: ["projectId"] } }),
+  },
+})
+
+const Assignments = Collections.make("assignments", {
+  index: "gsi2",
+  type: "clustered",
+  pk: { field: "gsi2pk", composite: ["employeeId"] },
+  sk: { field: "gsi2sk" },
+  members: {
+    tasks: Collections.member(SubTasks, { sk: { composite: ["projectId", "taskId"] } }),
+    projectMembers: Collections.member(SubProjectMembers, { sk: { composite: ["projectId"] } }),
+  },
+})
+// #endregion
+
 // =============================================================================
-// 4. Collection definitions
+// 4. Collection definitions (combined region for docs)
 // =============================================================================
 
 // #region collection-make
-const DepartmentStaff = Collection.make("DepartmentStaff", {
-  employees: IsolatedEmployees,
-  equipments: Equipments,
-})
-
-const TenantMembers = Collection.make("TenantMembers", {
-  employees: ClusteredEmployees,
-  tasks: ClusteredTasks,
-})
-
-const Contributions = Collection.make("contributions", {
-  employees: SubEmployee,
-  tasks: SubTasks,
-  projectMembers: SubProjectMembers,
-})
-
-const Assignments = Collection.make("assignments", {
-  tasks: SubTasks,
-  projectMembers: SubProjectMembers,
-})
+// (See individual collection definitions above:
+//   DepartmentStaff, TenantMembers, Contributions, Assignments)
 // #endregion
 
 // =============================================================================
@@ -315,12 +296,15 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Part A: Primary + GSI Indexes ===\n")
 
   // #region basic-setup
-  const basic = yield* DynamoClient.make(BasicTable)
-  yield* basic.createTable()
+  const basic = yield* DynamoClient.make({
+    entities: { Tasks },
+    collections: { ByProject, ByAssignee },
+  })
+  yield* basic.tables["guide-indexes-basic"]!.create()
   // #endregion
 
   // #region basic-seed
-  yield* basic.Tasks.put({
+  yield* basic.entities.Tasks.put({
     taskId: "t-001",
     tenantId: "t-acme",
     projectId: "proj-alpha",
@@ -329,7 +313,7 @@ const program = Effect.gen(function* () {
     priority: 1,
   })
 
-  yield* basic.Tasks.put({
+  yield* basic.entities.Tasks.put({
     taskId: "t-002",
     tenantId: "t-acme",
     projectId: "proj-alpha",
@@ -338,7 +322,7 @@ const program = Effect.gen(function* () {
     priority: 2,
   })
 
-  yield* basic.Tasks.put({
+  yield* basic.entities.Tasks.put({
     taskId: "t-003",
     tenantId: "t-acme",
     projectId: "proj-beta",
@@ -350,9 +334,13 @@ const program = Effect.gen(function* () {
 
   // #region query-accessors
   // Logical names become query accessors — no physical index names in code
-  const alphaTasks = yield* basic.Tasks.collect(Tasks.query.byProject({ projectId: "proj-alpha" }))
+  const { Tasks: alphaTasks } = yield* basic.collections
+    .ByProject({ projectId: "proj-alpha" })
+    .collect()
 
-  const aliceTasks = yield* basic.Tasks.collect(Tasks.query.byAssignee({ assigneeId: "emp-alice" }))
+  const { Tasks: aliceTasks } = yield* basic.collections
+    .ByAssignee({ assigneeId: "emp-alice" })
+    .collect()
   // #endregion
 
   assertEq(alphaTasks.length, 2, "proj-alpha has 2 tasks")
@@ -360,7 +348,7 @@ const program = Effect.gen(function* () {
   yield* Console.log(`  byProject (proj-alpha): ${alphaTasks.length} tasks`)
   yield* Console.log(`  byAssignee (emp-alice): ${aliceTasks.length} tasks`)
 
-  yield* basic.deleteTable()
+  yield* basic.tables["guide-indexes-basic"]!.delete()
   yield* Console.log("  Basic index demo — OK\n")
 
   // -------------------------------------------------------------------------
@@ -370,10 +358,13 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Part B: Isolated Collections ===\n")
 
   // #region isolated-setup
-  const isolated = yield* DynamoClient.make(IsolatedTable)
-  yield* isolated.createTable()
+  const isolated = yield* DynamoClient.make({
+    entities: { IsolatedEmployees, Equipments },
+    collections: { DepartmentStaff },
+  })
+  yield* isolated.tables["guide-indexes-isolated"]!.create()
 
-  yield* isolated.IsolatedEmployees.put({
+  yield* isolated.entities.IsolatedEmployees.put({
     employeeId: "emp-alice",
     tenantId: "t-acme",
     email: "alice@acme.com",
@@ -382,7 +373,7 @@ const program = Effect.gen(function* () {
     hireDate: "2020-01-15",
   })
 
-  yield* isolated.IsolatedEmployees.put({
+  yield* isolated.entities.IsolatedEmployees.put({
     employeeId: "emp-bob",
     tenantId: "t-acme",
     email: "bob@acme.com",
@@ -391,14 +382,14 @@ const program = Effect.gen(function* () {
     hireDate: "2023-06-01",
   })
 
-  yield* isolated.Equipments.put({
+  yield* isolated.entities.Equipments.put({
     equipmentId: "eq-laptop-1",
     department: "engineering",
     name: "MacBook Pro",
     purchaseDate: "2023-01-10",
   })
 
-  yield* isolated.Equipments.put({
+  yield* isolated.entities.Equipments.put({
     equipmentId: "eq-monitor-1",
     department: "engineering",
     name: "Dell UltraSharp",
@@ -407,35 +398,18 @@ const program = Effect.gen(function* () {
   // #endregion
 
   // #region isolated-queries
-  // Entity-scoped queries — each entity owns its sort key prefix
-  const engEmployees = yield* isolated.IsolatedEmployees.collect(
-    IsolatedEmployees.query.byDepartment({ department: "engineering" }),
-  )
-
-  const engEquipment = yield* isolated.Equipments.collect(
-    Equipments.query.byDepartment({ department: "engineering" }),
-  )
-
-  // Collection query via entity selectors
-  const deptEmployees = yield* Query.collect(
-    DepartmentStaff.employees({ department: "engineering" }),
-  )
-
-  const deptEquipment = yield* Query.collect(
-    DepartmentStaff.equipments({ department: "engineering" }),
-  )
+  // Collection query — returns grouped results by member
+  const { employees: engEmployees, equipments: engEquipment } = yield* isolated.collections
+    .DepartmentStaff({ department: "engineering" })
+    .collect()
   // #endregion
 
   assertEq(engEmployees.length, 2, "engineering has 2 employees")
   assertEq(engEquipment.length, 2, "engineering has 2 equipment items")
-  assertEq(deptEmployees.length, 2, "dept selector returns 2 employees")
-  assertEq(deptEquipment.length, 2, "dept selector returns 2 equipment items")
   yield* Console.log(`  Employees in engineering: ${engEmployees.length}`)
   yield* Console.log(`  Equipment in engineering: ${engEquipment.length}`)
-  yield* Console.log(`  Collection selector (employees): ${deptEmployees.length}`)
-  yield* Console.log(`  Collection selector (equipment): ${deptEquipment.length}`)
 
-  yield* isolated.deleteTable()
+  yield* isolated.tables["guide-indexes-isolated"]!.delete()
   yield* Console.log("  Isolated collection demo — OK\n")
 
   // -------------------------------------------------------------------------
@@ -445,10 +419,13 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Part C: Clustered Collections ===\n")
 
   // #region clustered-setup
-  const clustered = yield* DynamoClient.make(ClusteredTable)
-  yield* clustered.createTable()
+  const clustered = yield* DynamoClient.make({
+    entities: { ClusteredEmployees, ClusteredTasks },
+    collections: { TenantMembers },
+  })
+  yield* clustered.tables["guide-indexes-clustered"]!.create()
 
-  yield* clustered.ClusteredEmployees.put({
+  yield* clustered.entities.ClusteredEmployees.put({
     employeeId: "emp-alice",
     tenantId: "t-acme",
     email: "alice@acme.com",
@@ -457,7 +434,7 @@ const program = Effect.gen(function* () {
     hireDate: "2024-01-15",
   })
 
-  yield* clustered.ClusteredEmployees.put({
+  yield* clustered.entities.ClusteredEmployees.put({
     employeeId: "emp-bob",
     tenantId: "t-acme",
     email: "bob@acme.com",
@@ -466,7 +443,7 @@ const program = Effect.gen(function* () {
     hireDate: "2023-06-01",
   })
 
-  yield* clustered.ClusteredTasks.put({
+  yield* clustered.entities.ClusteredTasks.put({
     taskId: "t-001",
     tenantId: "t-acme",
     projectId: "proj-alpha",
@@ -475,7 +452,7 @@ const program = Effect.gen(function* () {
     priority: 1,
   })
 
-  yield* clustered.ClusteredTasks.put({
+  yield* clustered.entities.ClusteredTasks.put({
     taskId: "t-002",
     tenantId: "t-acme",
     projectId: "proj-alpha",
@@ -486,31 +463,18 @@ const program = Effect.gen(function* () {
   // #endregion
 
   // #region clustered-queries
-  // Entity-scoped queries within the clustered collection
-  const acmeEmployees = yield* clustered.ClusteredEmployees.collect(
-    ClusteredEmployees.query.byTenant({ tenantId: "t-acme" }),
-  )
-
-  const acmeTasks = yield* clustered.ClusteredTasks.collect(
-    ClusteredTasks.query.byTenant({ tenantId: "t-acme" }),
-  )
-
-  // Cross-entity collection queries
-  const allTenantEmployees = yield* Query.collect(TenantMembers.employees({ tenantId: "t-acme" }))
-
-  const allTenantTasks = yield* Query.collect(TenantMembers.tasks({ tenantId: "t-acme" }))
+  // Cross-entity collection query — returns both entity types grouped
+  const { employees: acmeEmployees, tasks: acmeTasks } = yield* clustered.collections
+    .TenantMembers({ tenantId: "t-acme" })
+    .collect()
   // #endregion
 
   assertEq(acmeEmployees.length, 2, "t-acme has 2 employees")
   assertEq(acmeTasks.length, 2, "t-acme has 2 tasks")
-  assertEq(allTenantEmployees.length, 2, "collection employees = 2")
-  assertEq(allTenantTasks.length, 2, "collection tasks = 2")
   yield* Console.log(`  Employees in t-acme: ${acmeEmployees.length}`)
   yield* Console.log(`  Tasks in t-acme: ${acmeTasks.length}`)
-  yield* Console.log(`  Collection (employees): ${allTenantEmployees.length}`)
-  yield* Console.log(`  Collection (tasks): ${allTenantTasks.length}`)
 
-  yield* clustered.deleteTable()
+  yield* clustered.tables["guide-indexes-clustered"]!.delete()
   yield* Console.log("  Clustered collection demo — OK\n")
 
   // -------------------------------------------------------------------------
@@ -520,10 +484,13 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Part D: Sub-Collections ===\n")
 
   // #region subcollection-setup
-  const sub = yield* DynamoClient.make(SubCollectionTable)
-  yield* sub.createTable()
+  const sub = yield* DynamoClient.make({
+    entities: { SubEmployee, SubTasks, SubProjectMembers },
+    collections: { Contributions, Assignments },
+  })
+  yield* sub.tables["guide-indexes-subcollection"]!.create()
 
-  yield* sub.SubEmployee.put({
+  yield* sub.entities.SubEmployee.put({
     employeeId: "emp-alice",
     tenantId: "t-acme",
     email: "alice@acme.com",
@@ -532,7 +499,7 @@ const program = Effect.gen(function* () {
     hireDate: "2024-01-15",
   })
 
-  yield* sub.SubTasks.put({
+  yield* sub.entities.SubTasks.put({
     taskId: "t-001",
     tenantId: "t-acme",
     projectId: "proj-alpha",
@@ -541,7 +508,7 @@ const program = Effect.gen(function* () {
     priority: 1,
   })
 
-  yield* sub.SubTasks.put({
+  yield* sub.entities.SubTasks.put({
     taskId: "t-002",
     tenantId: "t-acme",
     projectId: "proj-beta",
@@ -550,7 +517,7 @@ const program = Effect.gen(function* () {
     priority: 2,
   })
 
-  yield* sub.SubProjectMembers.put({
+  yield* sub.entities.SubProjectMembers.put({
     employeeId: "emp-alice",
     projectId: "proj-alpha",
     role: "lead",
@@ -559,16 +526,14 @@ const program = Effect.gen(function* () {
 
   // #region subcollection-queries
   // Top-level collection: everything for an employee
-  const allContributions = yield* Query.collect(
-    Contributions.employees({ employeeId: "emp-alice" }),
-  )
+  const { employees: allContributions } = yield* sub.collections
+    .Contributions({ employeeId: "emp-alice" })
+    .collect()
 
   // Sub-collection: only assignments (tasks + project members)
-  const assignedTasks = yield* Query.collect(Assignments.tasks({ employeeId: "emp-alice" }))
-
-  const projectMemberships = yield* Query.collect(
-    Assignments.projectMembers({ employeeId: "emp-alice" }),
-  )
+  const { tasks: assignedTasks, projectMembers: projectMemberships } = yield* sub.collections
+    .Assignments({ employeeId: "emp-alice" })
+    .collect()
   // #endregion
 
   assertEq(allContributions.length, 1, "contributions has 1 employee record")
@@ -578,7 +543,7 @@ const program = Effect.gen(function* () {
   yield* Console.log(`  Assignments (tasks): ${assignedTasks.length}`)
   yield* Console.log(`  Assignments (project members): ${projectMemberships.length}`)
 
-  yield* sub.deleteTable()
+  yield* sub.tables["guide-indexes-subcollection"]!.delete()
   yield* Console.log("  Sub-collection demo — OK\n")
 
   yield* Console.log("All index & collection patterns passed.")

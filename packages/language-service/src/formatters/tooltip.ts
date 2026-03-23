@@ -1,6 +1,11 @@
 import type { DynamoDBParams } from "../core/ParamsBuilder"
 
 export function formatTooltip(params: DynamoDBParams): string {
+  // V2 info-based tooltips — return info directly for new patterns
+  if (params.info) {
+    return params.info
+  }
+
   const lines: Array<string> = []
 
   lines.push(`${params.command}({`)

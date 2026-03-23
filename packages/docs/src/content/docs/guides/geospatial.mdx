@@ -49,21 +49,23 @@ const AppSchema = DynamoSchema.make({ name: "fleet", version: 1 })
 const Vehicles = Entity.make({
   model: Vehicle,
   entityType: "Vehicle",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["vehicleId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byCell: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["parentCell", "timePartition"] },
-      sk: { field: "gsi1sk", composite: ["cell"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["vehicleId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Vehicles } })
+
+const VehiclesByCell = Collections.make("vehiclesByCell", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["parentCell", "timePartition"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Vehicles: Collections.member(Vehicles, { sk: { composite: ["cell"] } }),
+  },
+})
 ```
 
 ### 3. Create GeoIndex
@@ -73,7 +75,7 @@ Bind geo configuration to the entity:
 ```typescript region="geo-index" example="guide-geospatial.ts"
 const VehicleGeo = GeoIndex.make({
   entity: Vehicles,
-  index: "byCell",
+  index: "vehiclesByCell",
   coordinates: (item) =>
     item.latitude !== undefined && item.longitude !== undefined
       ? { latitude: item.latitude, longitude: item.longitude }
@@ -95,7 +97,7 @@ const VehicleGeo = GeoIndex.make({
 | Field | Description |
 |-------|-------------|
 | `entity` | The effect-dynamodb Entity to bind to |
-| `index` | Name of the GSI to use for geo queries |
+| `index` | Name of the collection to use for geo queries |
 | `coordinates` | Extractor function — returns `{ latitude, longitude }` or `undefined` for items without location |
 | `fields.cell` | Fine-grained H3 cell (sort key). Resolution 15 is ~1m precision |
 | `fields.parentCell` | Coarse H3 cell (partition key). Resolution 3 is ~12km hexagons |

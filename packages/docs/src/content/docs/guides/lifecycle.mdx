@@ -26,16 +26,9 @@ Add a TTL to auto-purge deleted items after a duration:
 const Employees = Entity.make({
   model: EmployeeModel,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byTenant: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["tenantId"] },
-      sk: { field: "gsi1sk", composite: ["department", "employeeId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: { retain: true, ttl: Duration.days(90) },
@@ -49,16 +42,9 @@ With `preserveUnique` to control unique constraint behavior on delete:
 const EmployeesReserve = Entity.make({
   model: EmployeeModel,
   entityType: "EmployeeReserve",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byTenant: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["tenantId"] },
-      sk: { field: "gsi1sk", composite: ["department", "employeeId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: { retain: true },
@@ -71,7 +57,7 @@ const EmployeesReserve = Entity.make({
 
 ```typescript region="soft-delete" example="guide-lifecycle.ts"
 // Soft delete (version 3) — item disappears from GSI queries
-yield* db.Employees.delete({ employeeId: "emp-alice" })
+yield* db.entities.Employees.delete({ employeeId: "emp-alice" })
 yield* Console.log("Soft-deleted alice")
 ```
 
@@ -85,30 +71,30 @@ yield* Console.log("Soft-deleted alice")
 
 | Access Path | Sees Deleted Items? |
 |-------------|---------------------|
-| `employees.get(key)` | No |
-| `Employees.query.byTenant(...)` | No |
+| `db.entities.Employees.get(key)` | No |
+| `db.collections.EmployeesByTenant(...)` | No |
 | Collection queries | No |
-| `employees.deleted.get(key)` | Yes |
+| `db.entities.Employees.deleted.get(key)` | Yes |
 | `Employees.deleted.list(key)` | Yes |
 
 Normal get returns `ItemNotFound`:
 
 ```typescript region="invisible" example="guide-lifecycle.ts"
 // Normal get returns ItemNotFound
-const getResult = yield* db.Employees.get({ employeeId: "emp-alice" }).pipe(
+const getResult = yield* db.entities.Employees.get({ employeeId: "emp-alice" }).pipe(
   Effect.map(() => "found" as const),
   Effect.catchTag("ItemNotFound", () => Effect.succeed("not-found" as const)),
 )
 yield* Console.log(`Normal get after delete: ${getResult}`)
 ```
 
-GSI queries also return empty — deleted items fall out of indexes:
+Collection queries also return empty — deleted items fall out of indexes:
 
 ```typescript region="query-invisible" example="guide-lifecycle.ts"
-// GSI query also returns empty — deleted items fall out of indexes
-const tenantEmployees = yield* db.Employees.collect(
-  Employees.query.byTenant({ tenantId: "t-acme" }),
-)
+// Collection query also returns empty — deleted items fall out of indexes
+const { Employees: tenantEmployees } = yield* db.collections
+  .EmployeesByTenant({ tenantId: "t-acme" })
+  .collect()
 yield* Console.log(`Tenant query after delete: ${tenantEmployees.length} results`)
 ```
 
@@ -116,13 +102,13 @@ yield* Console.log(`Tenant query after delete: ${tenantEmployees.length} results
 
 ```typescript region="deleted-get" example="guide-lifecycle.ts"
 // Access the soft-deleted item directly
-const deleted = yield* db.Employees.deleted.get({ employeeId: "emp-alice" })
+const deleted = yield* db.entities.Employees.deleted.get({ employeeId: "emp-alice" })
 yield* Console.log(`Deleted item: ${deleted.displayName} (deletedAt present)`)
 ```
 
 ```typescript region="deleted-list" example="guide-lifecycle.ts"
 // List all deleted items in the partition
-const allDeleted = yield* db.Employees.collect(
+const allDeleted = yield* db.entities.Employees.collect(
   Employees.deleted.list({ employeeId: "emp-alice" }),
   Query.limit(20),
 )
@@ -156,7 +142,7 @@ Restore brings a soft-deleted item back to active status.
 
 ```typescript region="restore" example="guide-lifecycle.ts"
 // Restore the soft-deleted item (version 4) — recomposes all index keys
-const restored = yield* db.Employees.restore({ employeeId: "emp-alice" })
+const restored = yield* db.entities.Employees.restore({ employeeId: "emp-alice" })
 yield* Console.log(`Restored: ${restored.displayName} (v${v(restored)})`)
 ```
 
@@ -167,10 +153,10 @@ yield* Console.log(`Restored: ${restored.displayName} (v${v(restored)})`)
 5. Item reappears in all secondary indexes and collections
 
 ```typescript region="restore-visible" example="guide-lifecycle.ts"
-// Item is back in GSI queries
-const tenantAfterRestore = yield* db.Employees.collect(
-  Employees.query.byTenant({ tenantId: "t-acme" }),
-)
+// Item is back in collection queries
+const { Employees: tenantAfterRestore } = yield* db.collections
+  .EmployeesByTenant({ tenantId: "t-acme" })
+  .collect()
 yield* Console.log(`Tenant query after restore: ${tenantAfterRestore.length} results`)
 ```
 
@@ -180,7 +166,7 @@ Restore can fail if unique values were claimed while the item was deleted, or if
 
 ```typescript region="restore-error" example="guide-lifecycle.ts"
 // Attempting to restore a non-existent deleted item
-const restoreResult = yield* db.Employees.restore({ employeeId: "emp-nobody" }).pipe(
+const restoreResult = yield* db.entities.Employees.restore({ employeeId: "emp-nobody" }).pipe(
   Effect.map(() => "restored" as const),
   Effect.catchTag("ItemNotFound", () => Effect.succeed("not-in-recycle-bin" as const)),
 )
@@ -193,7 +179,7 @@ Purge permanently removes an item and all associated data. This is irreversible.
 
 ```typescript region="purge" example="guide-lifecycle.ts"
 // Purge permanently removes the item, all version history, and sentinels
-yield* db.Employees.purge({ employeeId: "emp-bob" })
+yield* db.entities.Employees.purge({ employeeId: "emp-bob" })
 yield* Console.log("\nPurged bob — item + version history permanently removed")
 ```
 
@@ -233,13 +219,13 @@ All versions share the same partition key — single-partition operations for ef
 
 ```typescript region="get-version" example="guide-lifecycle.ts"
 // Get a specific version snapshot
-const v1 = yield* db.Employees.getVersion({ employeeId: "emp-alice" }, 1)
+const v1 = yield* db.entities.Employees.getVersion({ employeeId: "emp-alice" }, 1)
 yield* Console.log(`\nVersion 1: ${v1.displayName} (v${v(v1)})`)
 ```
 
 ```typescript region="version-history" example="guide-lifecycle.ts"
 // Browse version history (most recent first)
-const history = yield* db.Employees.collect(
+const history = yield* db.entities.Employees.collect(
   Employees.versions({ employeeId: "emp-alice" }),
   Query.reverse,
 )
@@ -319,10 +305,13 @@ The full program demonstrating create, update, soft delete, restore, version his
 
 ```typescript title="main.ts"
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { Employees },
+    collections: { EmployeesByTenant },
+  })
 
   // Create (version 1)
-  const alice = yield* db.Employees.put({
+  const alice = yield* db.entities.Employees.put({
     employeeId: "emp-alice",
     tenantId: "t-acme",
     email: "alice@acme.com",
@@ -331,25 +320,25 @@ const program = Effect.gen(function* () {
   })
 
   // Update (version 2)
-  yield* db.Employees.update(
+  yield* db.entities.Employees.update(
     { employeeId: "emp-alice" },
     Entity.set({ displayName: "Alice Baker", department: "Engineering", tenantId: "t-acme" }),
   )
 
   // Soft delete (version 3)
-  yield* db.Employees.delete({ employeeId: "emp-alice" })
+  yield* db.entities.Employees.delete({ employeeId: "emp-alice" })
 
   // Not found via normal get
-  // yield* db.Employees.get({ employeeId: "emp-alice" })  // ItemNotFound!
+  // yield* db.entities.Employees.get({ employeeId: "emp-alice" })  // ItemNotFound!
 
   // Found via deleted access
-  const deleted = yield* db.Employees.deleted.get({ employeeId: "emp-alice" })
+  const deleted = yield* db.entities.Employees.deleted.get({ employeeId: "emp-alice" })
 
   // Restore (version 4)
-  const restored = yield* db.Employees.restore({ employeeId: "emp-alice" })
+  const restored = yield* db.entities.Employees.restore({ employeeId: "emp-alice" })
 
   // View full version history
-  const history = yield* db.Employees.collect(
+  const history = yield* db.entities.Employees.collect(
     Employees.versions({ employeeId: "emp-alice" }),
     Query.reverse,
   )

@@ -7,17 +7,16 @@
  * Access patterns:
  * 1. Get user by userId               -> Primary key
  * 2. Get post by postId               -> Primary key
- * 3. Get all posts by a user          -> GSI1: byAuthor
- * 4. Get all comments on a post       -> GSI1: byPost
+ * 3. Get all posts by a user          -> GSI1: byAuthor (collection)
+ * 4. Get all comments on a post       -> GSI1: byPost (collection)
  * 5. Atomic reads/writes              -> Transactions
  * 6. Multi-entity collection queries  -> Collection on GSI1
  *
  * Key API patterns demonstrated:
- * - DynamoClient.make(table) typed gateway pattern
- * - BoundEntity methods return Effect directly
- * - Entity.query.indexName(pk) for composing query descriptors
- * - db.Entity.collect(Entity.query...) for executing queries
- * - db.Entity.update(key, ...combinators) for type-safe updates
+ * - DynamoClient.make({ entities, collections }) typed gateway pattern
+ * - db.entities.Entity methods return Effect directly
+ * - db.collections.Name(pk) for composing collection queries
+ * - db.entities.Entity.update(key, ...combinators) for type-safe updates
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -27,6 +26,7 @@
  */
 
 import { Console, Effect, Layer, Schema } from "effect"
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -75,18 +75,16 @@ const BlogSchema = DynamoSchema.make({ name: "blog", version: 1 })
 // #endregion
 
 // =============================================================================
-// 3. Entity definitions — pure definitions with composite indexes
+// 3. Entity definitions — primary key only, no GSIs
 // =============================================================================
 
 // #region user-entity
 const Users = Entity.make({
   model: User,
   entityType: "User",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: true,
@@ -97,16 +95,9 @@ const Users = Entity.make({
 const Posts = Entity.make({
   model: Post,
   entityType: "Post",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["postId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byAuthor: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["authorId"] },
-      sk: { field: "gsi1sk", composite: ["postId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["postId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -116,16 +107,9 @@ const Posts = Entity.make({
 const Comments = Entity.make({
   model: Comment,
   entityType: "Comment",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["commentId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byPost: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["postId"] },
-      sk: { field: "gsi1sk", composite: ["commentId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["commentId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -133,6 +117,24 @@ const Comments = Entity.make({
 const BlogTable = Table.make({
   schema: BlogSchema,
   entities: { Users, Posts, Comments },
+})
+
+const PostsByAuthor = Collections.make("postsByAuthor", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["authorId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Posts: Collections.member(Posts, { sk: { composite: ["postId"] } }),
+  },
+})
+
+const CommentsByPost = Collections.make("commentsByPost", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["postId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Comments: Collections.member(Comments, { sk: { composite: ["commentId"] } }),
+  },
 })
 // #endregion
 
@@ -143,12 +145,15 @@ const BlogTable = Table.make({
 const program = Effect.gen(function* () {
   // #region seed-data
   // Typed execution gateway
-  const db = yield* DynamoClient.make(BlogTable)
+  const db = yield* DynamoClient.make({
+    entities: { Users, Posts, Comments },
+    collections: { PostsByAuthor, CommentsByPost },
+  })
 
-  yield* db.createTable()
+  yield* db.tables["blog-table"]!.create()
 
   // yield* returns User — clean class name, no system fields
-  const alice = yield* db.Users.put({
+  const alice = yield* db.entities.Users.put({
     userId: "alice-1",
     email: "alice@blog.com",
     displayName: "Alice",
@@ -156,7 +161,7 @@ const program = Effect.gen(function* () {
   })
 
   // get returns model instance by default, with system fields available
-  const aliceWithMeta = yield* db.Users.get({ userId: "alice-1" })
+  const aliceWithMeta = yield* db.entities.Users.get({ userId: "alice-1" })
   // #endregion
 
   // --- Setup ---
@@ -172,7 +177,7 @@ const program = Effect.gen(function* () {
   // --- Pattern 2: Multiple entity types in one table ---
   yield* Console.log("=== Pattern 2: Multi-Entity Single Table ===\n")
 
-  const post1 = yield* db.Posts.put({
+  const post1 = yield* db.entities.Posts.put({
     postId: "post-1",
     authorId: "alice-1",
     title: "Getting Started with Effect TS",
@@ -182,7 +187,7 @@ const program = Effect.gen(function* () {
   })
   yield* Console.log(`Created post: "${post1.title}" (${post1.status})`)
 
-  yield* db.Posts.put({
+  yield* db.entities.Posts.put({
     postId: "post-2",
     authorId: "alice-1",
     title: "DynamoDB Single-Table Design",
@@ -191,7 +196,7 @@ const program = Effect.gen(function* () {
     commentCount: 0,
   })
 
-  yield* db.Posts.put({
+  yield* db.entities.Posts.put({
     postId: "post-3",
     authorId: "alice-1",
     title: "Draft Post",
@@ -201,14 +206,14 @@ const program = Effect.gen(function* () {
   })
   yield* Console.log("Created posts: post-1, post-2, post-3")
 
-  yield* db.Comments.put({
+  yield* db.entities.Comments.put({
     commentId: "comment-1",
     postId: "post-1",
     authorId: "bob-1",
     body: "Great article!",
   })
 
-  yield* db.Comments.put({
+  yield* db.entities.Comments.put({
     commentId: "comment-2",
     postId: "post-1",
     authorId: "charlie-1",
@@ -221,10 +226,14 @@ const program = Effect.gen(function* () {
 
   // #region gsi-queries
   // Posts by author
-  const alicePosts = yield* db.Posts.collect(Posts.query.byAuthor({ authorId: "alice-1" }))
+  const { Posts: alicePosts } = yield* db.collections
+    .PostsByAuthor({ authorId: "alice-1" })
+    .collect()
 
   // Comments on a post
-  const postComments = yield* db.Comments.collect(Comments.query.byPost({ postId: "post-1" }))
+  const { Comments: postComments } = yield* db.collections
+    .CommentsByPost({ postId: "post-1" })
+    .collect()
   // #endregion
   yield* Console.log(`Alice's posts (${alicePosts.length}):`)
   for (const p of alicePosts) {
@@ -241,8 +250,8 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Pattern 4: Pipeable Updates ===\n")
 
   // #region update
-  // db.Users.update(key, ...combinators) — type-safe
-  const updatedAlice = yield* db.Users.update(
+  // db.entities.Users.update(key, ...combinators) — type-safe
+  const updatedAlice = yield* db.entities.Users.update(
     { userId: "alice-1" },
     Entity.set({ displayName: "Alice B.", postCount: 3 }),
   )
@@ -253,7 +262,7 @@ const program = Effect.gen(function* () {
   )
 
   // Multiple combinators in update
-  const aliceV2 = yield* db.Users.update(
+  const aliceV2 = yield* db.entities.Users.update(
     { userId: "alice-1" },
     Entity.set({ bio: "Effect TS enthusiast" }),
   )
@@ -261,7 +270,7 @@ const program = Effect.gen(function* () {
 
   // #region optimistic-locking
   // expectedVersion for optimistic locking
-  const lockResult = yield* db.Users.update(
+  const lockResult = yield* db.entities.Users.update(
     { userId: "alice-1" },
     Entity.set({ displayName: "Wrong Name" }),
     Entity.expectedVersion(1), // version is now 2 — this will fail
@@ -306,9 +315,10 @@ const program = Effect.gen(function* () {
   // --- Pattern 6: Collection queries ---
   yield* Console.log("=== Pattern 6: Collection Queries ===\n")
 
-  // Query comments on a post via the entity's own query method.
-  // Comments.query.byPost hits the same GSI as a Collection query would.
-  const commentsResult = yield* db.Comments.collect(Comments.query.byPost({ postId: "post-1" }))
+  // Query comments on a post via the collection.
+  const { Comments: commentsResult } = yield* db.collections
+    .CommentsByPost({ postId: "post-1" })
+    .collect()
   yield* Console.log(`Collection query — comments on post-1: ${commentsResult.length}`)
   for (const c of commentsResult) {
     yield* Console.log(`  ${c.commentId}: "${c.body}"\n`)
@@ -317,22 +327,22 @@ const program = Effect.gen(function* () {
   // --- Pattern 7: Model instances returned by default ---
   yield* Console.log("=== Pattern 7: Model Instances ===\n")
 
-  const post1Retrieved = yield* db.Posts.get({ postId: "post-1" })
+  const post1Retrieved = yield* db.entities.Posts.get({ postId: "post-1" })
   yield* Console.log(`Retrieved post: "${post1Retrieved?.title}"`)
   yield* Console.log(`  Status: ${post1Retrieved?.status}\n`)
 
   // --- Cleanup ---
   yield* Console.log("=== Cleanup ===\n")
 
-  yield* db.Users.delete({ userId: "alice-1" })
-  yield* db.Posts.delete({ postId: "post-1" })
-  yield* db.Posts.delete({ postId: "post-2" })
-  yield* db.Posts.delete({ postId: "post-4" })
-  yield* db.Comments.delete({ commentId: "comment-1" })
-  yield* db.Comments.delete({ commentId: "comment-2" })
+  yield* db.entities.Users.delete({ userId: "alice-1" })
+  yield* db.entities.Posts.delete({ postId: "post-1" })
+  yield* db.entities.Posts.delete({ postId: "post-2" })
+  yield* db.entities.Posts.delete({ postId: "post-4" })
+  yield* db.entities.Comments.delete({ commentId: "comment-1" })
+  yield* db.entities.Comments.delete({ commentId: "comment-2" })
   yield* Console.log("Deleted all items")
 
-  yield* db.deleteTable()
+  yield* db.tables["blog-table"]!.delete()
   yield* Console.log("Table deleted.")
 })
 

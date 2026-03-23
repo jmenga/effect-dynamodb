@@ -1,13 +1,13 @@
 /**
  * Guide: Queries — effect-dynamodb
  *
- * Demonstrates the pipeable Query API as documented in the Queries guide:
- *   - Entity query accessors (named index queries)
- *   - Sort key conditions: beginsWith, between, eq
+ * Demonstrates the query API as documented in the Queries guide:
+ *   - Entity scan via BoundQuery: db.entities.Entity.scan()
+ *   - Collection queries via db.collections.Name({...})
  *   - Post-query filtering (callback and shorthand)
- *   - Pagination: collect, single page, cursor-based, streaming
+ *   - Pagination: collect, single page (fetch), cursor-based, streaming
  *   - Scan: basic, filtered, limited, consistent read, stream
- *   - Consistent reads on get, query, and scan
+ *   - Consistent reads on get and scan
  *   - Reverse ordering
  *
  * Prerequisites:
@@ -20,11 +20,10 @@
 import { Console, Effect, Layer, Schema, Stream } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import * as KeyComposer from "../src/KeyComposer.js"
-import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 
 // ---------------------------------------------------------------------------
@@ -50,7 +49,7 @@ class Task extends Schema.Class<Task>("Task")({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 2. Schema + Entity + Table
+// 2. Schema + Entity + Collections + Table
 // ---------------------------------------------------------------------------
 
 // #region entities
@@ -59,23 +58,29 @@ const AppSchema = DynamoSchema.make({ name: "guide-queries", version: 1 })
 const TaskEntity = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byProject: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["projectId"] },
-      sk: { field: "gsi1sk", composite: ["status", "createdAt"] },
-    },
-    byAssignee: {
-      index: "gsi2",
-      pk: { field: "gsi2pk", composite: ["assigneeId"] },
-      sk: { field: "gsi2sk", composite: ["status", "createdAt"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
+})
+
+const ByProject = Collections.make("byProject", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["projectId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Tasks: Collections.member(TaskEntity, { sk: { composite: ["status", "createdAt"] } }),
+  },
+})
+
+const ByAssignee = Collections.make("byAssignee", {
+  index: "gsi2",
+  pk: { field: "gsi2pk", composite: ["assigneeId"] },
+  sk: { field: "gsi2sk" },
+  members: {
+    Tasks: Collections.member(TaskEntity, { sk: { composite: ["status", "createdAt"] } }),
+  },
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { TaskEntity } })
@@ -87,12 +92,15 @@ const MainTable = Table.make({ schema: AppSchema, entities: { TaskEntity } })
 
 // #region program
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
-  const tasks = db.TaskEntity
+  const db = yield* DynamoClient.make({
+    entities: { TaskEntity },
+    collections: { ByProject, ByAssignee },
+  })
+  const tasks = db.entities.TaskEntity
 
   // --- Setup ---
   yield* Console.log("=== Setup ===\n")
-  yield* db.createTable()
+  yield* db.tables["guide-queries-table"]!.create()
   yield* Console.log("Table created")
 
   // Seed data
@@ -179,7 +187,7 @@ const program = Effect.gen(function* () {
   yield* Console.log(`Seeded ${seedTasks.length} tasks\n`)
 
   // -------------------------------------------------------------------------
-  // Entity Queries — accessors live on the entity definition
+  // Entity Queries — via collection accessors
   // -------------------------------------------------------------------------
   yield* Console.log("=== Entity Queries ===\n")
 
@@ -187,64 +195,17 @@ const program = Effect.gen(function* () {
   // Primary key lookup (not a query — returns single item)
   const task = yield* tasks.get({ taskId: "t-001" })
 
-  // Named index queries (return Query<A>) — on the entity definition
-  const projectTasks = yield* tasks.collect(TaskEntity.query.byProject({ projectId: "proj-alpha" }))
-  const assigneeTasks = yield* tasks.collect(
-    TaskEntity.query.byAssignee({ assigneeId: "emp-alice" }),
-  )
+  // Named collection queries — on the db.collections gateway
+  const { Tasks: projectTasks } = yield* db.collections
+    .ByProject({ projectId: "proj-alpha" })
+    .collect()
+  const { Tasks: assigneeTasks } = yield* db.collections
+    .ByAssignee({ assigneeId: "emp-alice" })
+    .collect()
   // #endregion
   yield* Console.log(`Got task: "${task.title}" (${task.status})`)
   yield* Console.log(`Project proj-alpha: ${projectTasks.length} tasks`)
   yield* Console.log(`Assignee emp-alice: ${assigneeTasks.length} tasks\n`)
-
-  // -------------------------------------------------------------------------
-  // Sort Key Conditions — Query.where
-  // -------------------------------------------------------------------------
-  yield* Console.log("=== Sort Key Conditions ===\n")
-
-  // #region begins-with
-  // beginsWith — match tasks with "active" status prefix in the sort key
-  const activePrefix = KeyComposer.composeSortKeyPrefix(
-    AppSchema,
-    "Task",
-    1,
-    TaskEntity.indexes.byProject,
-    { status: "active" },
-  )
-  const activeTasks = yield* tasks.collect(
-    TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-    Query.where({ beginsWith: activePrefix }),
-  )
-  // #endregion
-  yield* Console.log(`Active tasks in proj-alpha (beginsWith): ${activeTasks.length}`)
-  for (const t of activeTasks) {
-    yield* Console.log(`  ${t.taskId}: "${t.title}" — ${t.status}`)
-  }
-
-  // #region between
-  // between — range on the composed sort key
-  const startDate = "2025-02-01"
-  const endDate = "2025-02-28"
-  const lo = KeyComposer.composeSortKeyPrefix(AppSchema, "Task", 1, TaskEntity.indexes.byProject, {
-    status: "active",
-    createdAt: startDate,
-  })
-  const hi = KeyComposer.composeSortKeyPrefix(AppSchema, "Task", 1, TaskEntity.indexes.byProject, {
-    status: "active",
-    createdAt: endDate,
-  })
-  const activeInRange = yield* tasks.collect(
-    TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-    Query.where({ between: [lo, hi] }),
-  )
-  // #endregion
-  yield* Console.log(
-    `\nActive tasks in proj-alpha (between ${startDate} – ${endDate}): ${activeInRange.length}`,
-  )
-  for (const t of activeInRange) {
-    yield* Console.log(`  ${t.taskId}: "${t.title}" — created ${t.createdAt}`)
-  }
-  yield* Console.log("")
 
   // -------------------------------------------------------------------------
   // Post-Query Filtering
@@ -252,11 +213,11 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Post-Query Filtering ===\n")
 
   // #region filter-callback
-  // Callback — type-safe, supports nested paths, OR/NOT, all operators
-  const highPriActive = yield* tasks.collect(
-    TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-    TaskEntity.filter((t, { and, eq }) => and(eq(t.status, "active"), eq(t.priority, "high"))),
-  )
+  // Shorthand — AND-equality on multiple fields
+  const { Tasks: highPriActive } = yield* db.collections
+    .ByProject({ projectId: "proj-alpha" })
+    .filter({ status: "active", priority: "high" })
+    .collect()
   // #endregion
   yield* Console.log(`High-priority active tasks (callback filter): ${highPriActive.length}`)
   for (const t of highPriActive) {
@@ -265,10 +226,10 @@ const program = Effect.gen(function* () {
 
   // #region filter-shorthand
   // Shorthand — simple AND-equality
-  const activeShorthand = yield* tasks.collect(
-    TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-    TaskEntity.filter({ status: "active" }),
-  )
+  const { Tasks: activeShorthand } = yield* db.collections
+    .ByProject({ projectId: "proj-alpha" })
+    .filter({ status: "active" })
+    .collect()
   // #endregion
   yield* Console.log(`\nActive tasks (shorthand filter): ${activeShorthand.length}\n`)
 
@@ -279,44 +240,39 @@ const program = Effect.gen(function* () {
 
   // #region collect-all
   // Collect all items across all pages
-  const allProjectTasks = yield* tasks.collect(
-    TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-  )
+  const { Tasks: allProjectTasks } = yield* db.collections
+    .ByProject({ projectId: "proj-alpha" })
+    .collect()
   // #endregion
   yield* Console.log(`Collect all: ${allProjectTasks.length} tasks in proj-alpha`)
 
   // #region single-page
-  // Single page with limit — returns Page<A> with items and cursor
-  const page = yield* TaskEntity.query
-    .byProject({ projectId: "proj-alpha" })
-    .pipe(Query.limit(3), Query.execute)
-  // page.items: Task[] (up to 3 items)
-  // page.cursor: string | null (pass to Query.startFrom for next page)
+  // Single page with limit — returns page with items and cursor
+  const page = yield* db.collections.ByProject({ projectId: "proj-alpha" }).limit(3).fetch()
+  // page.items: { Tasks: Task[] } (up to 3 items)
+  // page.cursor: string | null (pass to startFrom for next page)
   // #endregion
   yield* Console.log(
-    `Single page (limit 3): ${page.items.length} items, cursor: ${page.cursor != null ? "present" : "null"}`,
+    `Single page (limit 3): ${page.items.Tasks.length} items, cursor: ${page.cursor != null ? "present" : "null"}`,
   )
 
   // #region cursor-pagination
   // Cursor-based pagination
-  const page1 = yield* TaskEntity.query
-    .byProject({ projectId: "proj-alpha" })
-    .pipe(Query.limit(3), Query.execute)
+  const page1 = yield* db.collections.ByProject({ projectId: "proj-alpha" }).limit(3).fetch()
 
   if (page1.cursor) {
-    const page2 = yield* TaskEntity.query
-      .byProject({ projectId: "proj-alpha" })
-      .pipe(Query.limit(3), Query.startFrom(page1.cursor), Query.execute)
-    yield* Console.log(
-      `Cursor pagination: page1=${page1.items.length} items, page2=${page2.items.length} items`,
-    )
+    const page2 = yield* db.collections
+      .ByProject({ projectId: "proj-alpha" })
+      .limit(3)
+      .startFrom(page1.cursor)
+      .fetch()
+    yield* Console.log(`Cursor pagination: page1=${page1.items.Tasks.length} items, page2=${page2.items.Tasks.length} items`)
   }
   // #endregion
 
   // #region streaming
   // Streaming — automatic pagination via Stream
-  const stream = tasks.paginate(TaskEntity.query.byProject({ projectId: "proj-alpha" }))
-
+  const stream = tasks.scan().paginate()
   const allFromStream = yield* Stream.runCollect(stream)
   yield* Console.log(`Stream collect: ${allFromStream.length} tasks\n`)
   // #endregion
@@ -328,34 +284,31 @@ const program = Effect.gen(function* () {
 
   // #region scan-basic
   // Basic scan — all items of this entity type
-  const allTasks = yield* tasks.collect(TaskEntity.scan())
+  const allTasks = yield* tasks.scan().collect()
   // #endregion
   yield* Console.log(`Basic scan: ${allTasks.length} tasks`)
 
   // #region scan-filter
   // Scan with filter
-  const activeScan = yield* tasks.collect(
-    TaskEntity.scan(),
-    TaskEntity.filter({ status: "active" }),
-  )
+  const activeScan = yield* tasks.scan().filter({ status: "active" }).collect()
   // #endregion
   yield* Console.log(`Scan with filter (active): ${activeScan.length} tasks`)
 
   // #region scan-limit
   // Scan with limit
-  const firstPage = yield* tasks.collect(TaskEntity.scan(), Query.limit(3))
+  const firstPage = yield* tasks.scan().limit(3).collect()
   // #endregion
   yield* Console.log(`Scan with limit (3): ${firstPage.length} tasks`)
 
   // #region scan-consistent
   // Scan with consistent read
-  const consistent = yield* tasks.collect(TaskEntity.scan(), Query.consistentRead)
+  const consistent = yield* tasks.scan().consistentRead().collect()
   // #endregion
   yield* Console.log(`Scan with consistent read: ${consistent.length} tasks`)
 
   // #region scan-stream
   // Stream-based scan
-  const scanStream = tasks.paginate(TaskEntity.scan())
+  const scanStream = tasks.scan().paginate()
   yield* Stream.runForEach(scanStream, (t) => Console.log(`  Scanned: ${t.taskId} — "${t.title}"`))
   // #endregion
   yield* Console.log("")
@@ -372,17 +325,14 @@ const program = Effect.gen(function* () {
   yield* Console.log(`Consistent get: "${consistentTask.title}"`)
 
   // #region consistent-query
-  // Consistent read on query
-  const consistentQuery = yield* tasks.collect(
-    TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-    Query.consistentRead,
-  )
+  // Consistent read on scan (applies to any BoundQuery)
+  const consistentQuery = yield* tasks.scan().consistentRead().collect()
   // #endregion
   yield* Console.log(`Consistent query: ${consistentQuery.length} tasks`)
 
   // #region consistent-scan
   // Consistent read on scan
-  const consistentScan = yield* tasks.collect(TaskEntity.scan(), Query.consistentRead)
+  const consistentScan = yield* tasks.scan().consistentRead().collect()
   // #endregion
   yield* Console.log(`Consistent scan: ${consistentScan.length} tasks\n`)
 
@@ -393,11 +343,11 @@ const program = Effect.gen(function* () {
 
   // #region reverse
   // Most recent tasks first (descending sort key order)
-  const recent = yield* tasks.collect(
-    TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-    Query.reverse,
-    Query.limit(3),
-  )
+  const { Tasks: recent } = yield* db.collections
+    .ByProject({ projectId: "proj-alpha" })
+    .reverse()
+    .limit(3)
+    .collect()
   // #endregion
   yield* Console.log("Most recent 3 tasks in proj-alpha (reversed):")
   for (const t of recent) {
@@ -406,7 +356,7 @@ const program = Effect.gen(function* () {
 
   // --- Cleanup ---
   yield* Console.log("\n=== Cleanup ===\n")
-  yield* db.deleteTable()
+  yield* db.tables["guide-queries-table"]!.delete()
   yield* Console.log("Table deleted.")
 })
 // #endregion

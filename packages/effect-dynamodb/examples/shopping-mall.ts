@@ -5,7 +5,7 @@
  * https://electrodb.dev/en/examples/shopping-mall/
  *
  * Demonstrates effect-dynamodb patterns:
- * - Single entity (MallStore) with 3 indexes (primary + 2 GSIs)
+ * - Single entity (MallStore) with primary key + 2 GSI collections
  * - Composite primary key with 2 PK composites and 2 SK composites
  * - GSI queries for finding stores in a mall or building
  * - Date range queries on lease end dates via GSI2
@@ -19,11 +19,10 @@
  */
 
 import { Console, Effect, Layer, Schema } from "effect"
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import * as KeyComposer from "../src/KeyComposer.js"
-import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 
 // =============================================================================
@@ -64,37 +63,56 @@ const MallSchema = DynamoSchema.make({ name: "mall", version: 1 })
 // #endregion
 
 // =============================================================================
-// 3. Entity definition — 1 entity, 2 GSIs
+// 3. Entity definition — primary key only
 //
-// Primary `stores`:  pk=[cityId, mallId], sk=[buildingId, storeId]
-// GSI1 `units`:      pk=[mallId],         sk=[buildingId, unitId]
-// GSI2 `leases`:     pk=[storeId],        sk=[leaseEndDate]
+// Primary key: pk=[cityId, mallId], sk=[buildingId, storeId]
 // =============================================================================
 
 // #region entity
 const MallStores = Entity.make({
   model: MallStore,
   entityType: "MallStore",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["cityId", "mallId"] },
-      sk: { field: "sk", composite: ["buildingId", "storeId"] },
-    },
-    units: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["mallId"] },
-      sk: { field: "gsi1sk", composite: ["buildingId", "unitId"] },
-    },
-    leases: {
-      index: "gsi2",
-      pk: { field: "gsi2pk", composite: ["storeId"] },
-      sk: { field: "gsi2sk", composite: ["leaseEndDate"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["cityId", "mallId"] },
+    sk: { field: "sk", composite: ["buildingId", "storeId"] },
   },
   timestamps: true,
 })
 
 const MallTable = Table.make({ schema: MallSchema, entities: { MallStores } })
+// #endregion
+
+// =============================================================================
+// 4. Collections — GSI access patterns
+//
+// GSI1 `units`:  pk=[mallId],   sk=[buildingId, unitId]
+// GSI2 `leases`: pk=[storeId],  sk=[leaseEndDate]
+// =============================================================================
+
+// #region collections
+const Units = Collections.make("units", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["mallId"] },
+  sk: { field: "gsi1sk" },
+  type: "isolated",
+  members: {
+    MallStores: Collections.member(MallStores, {
+      sk: { composite: ["buildingId", "unitId"] },
+    }),
+  },
+})
+
+const Leases = Collections.make("leases", {
+  index: "gsi2",
+  pk: { field: "gsi2pk", composite: ["storeId"] },
+  sk: { field: "gsi2sk" },
+  type: "isolated",
+  members: {
+    MallStores: Collections.member(MallStores, {
+      sk: { composite: ["leaseEndDate"] },
+    }),
+  },
+})
 // #endregion
 
 // =============================================================================
@@ -199,14 +217,17 @@ const assertEq = <T>(actual: T, expected: T, label: string): void => {
 
 const program = Effect.gen(function* () {
   // #region seed-loop
-  const db = yield* DynamoClient.make(MallTable)
+  const db = yield* DynamoClient.make({
+    entities: { MallStores },
+    collections: { Units, Leases },
+  })
 
   // --- Setup: create table ---
-  yield* db.createTable()
+  yield* db.tables["mall-table"]!.create()
 
   // --- Seed data ---
   for (const store of Object.values(stores)) {
-    yield* db.MallStores.put(store)
+    yield* db.entities.MallStores.put(store)
   }
   // #endregion
 
@@ -216,7 +237,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 1: Get Specific Store (primary key)")
 
   // #region pattern-1
-  const coffee = yield* db.MallStores.get({
+  const coffee = yield* db.entities.MallStores.get({
     cityId: "atlanta",
     mallId: "eastpointe",
     buildingId: "bldg-a",
@@ -234,19 +255,19 @@ const program = Effect.gen(function* () {
   yield* Console.log("  Get star-coffee by primary key — OK")
 
   // -------------------------------------------------------------------------
-  // Pattern 2: Find all stores in a mall (GSI1 — units index)
+  // Pattern 2: Find all stores in a mall (GSI1 — units collection)
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 2: All Stores in a Mall (gsi1)")
 
   // #region pattern-2
-  const eastpointeStores = yield* db.MallStores.collect(
-    MallStores.query.units({ mallId: "eastpointe" }),
-  )
+  const { MallStores: eastpointeStores } = yield* db.collections
+    .Units({ mallId: "eastpointe" })
+    .collect()
   // → 4 stores: star-coffee, burger-barn, tech-zone, trendy-threads
 
-  const westgateStores = yield* db.MallStores.collect(
-    MallStores.query.units({ mallId: "westgate" }),
-  )
+  const { MallStores: westgateStores } = yield* db.collections
+    .Units({ mallId: "westgate" })
+    .collect()
   // → 2 stores: mega-mart, gifts-galore
   // #endregion
   assertEq(eastpointeStores.length, 4, "eastpointe has 4 stores")
@@ -267,23 +288,14 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 3: Stores in a Building (gsi1 + beginsWith)")
 
   // #region pattern-3
-  const unitsIndex = MallStores.indexes.units
-  const bldgAPrefix = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, unitsIndex, {
-    buildingId: "bldg-a",
-  })
-
-  const bldgAStores = yield* db.MallStores.collect(
-    MallStores.query.units({ mallId: "eastpointe" }).pipe(Query.where({ beginsWith: bldgAPrefix })),
-  )
+  const { MallStores: bldgAStores } = yield* db.collections
+    .Units({ mallId: "eastpointe", buildingId: "bldg-a" })
+    .collect()
   // → 2 stores: star-coffee, burger-barn
 
-  const bldgBPrefix = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, unitsIndex, {
-    buildingId: "bldg-b",
-  })
-
-  const bldgBStores = yield* db.MallStores.collect(
-    MallStores.query.units({ mallId: "eastpointe" }).pipe(Query.where({ beginsWith: bldgBPrefix })),
-  )
+  const { MallStores: bldgBStores } = yield* db.collections
+    .Units({ mallId: "eastpointe", buildingId: "bldg-b" })
+    .collect()
   // → 2 stores: tech-zone, trendy-threads
   // #endregion
   assertEq(bldgAStores.length, 2, "bldg-a has 2 stores")
@@ -300,48 +312,35 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 4: Lease Renewals by Date Range (gsi2)")
 
   // #region pattern-4
-  const leasesIndex = MallStores.indexes.leases
-
-  // Q1 2025 bounds
-  const q1Lo = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, leasesIndex, {
-    leaseEndDate: "2025-01-01",
-  })
-  const q1Hi = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, leasesIndex, {
-    leaseEndDate: "2025-03-31",
-  })
-
   // star-coffee lease ends 2025-03-31 — within Q1
-  const starCoffeeQ1 = yield* db.MallStores.collect(
-    MallStores.query
-      .leases({ storeId: "star-coffee" })
-      .pipe(Query.where({ between: [q1Lo, q1Hi] })),
+  const { MallStores: starCoffeeLeases } = yield* db.collections
+    .Leases({ storeId: "star-coffee" })
+    .collect()
+  const starCoffeeQ1 = starCoffeeLeases.filter(
+    (s) => s.leaseEndDate >= "2025-01-01" && s.leaseEndDate <= "2025-03-31",
   )
   // → 1 result (lease ends 2025-03-31)
 
   // tech-zone lease ends 2025-09-30 — NOT in Q1
-  const techZoneQ1 = yield* db.MallStores.collect(
-    MallStores.query.leases({ storeId: "tech-zone" }).pipe(Query.where({ between: [q1Lo, q1Hi] })),
+  const { MallStores: techZoneLeases } = yield* db.collections
+    .Leases({ storeId: "tech-zone" })
+    .collect()
+  const techZoneQ1 = techZoneLeases.filter(
+    (s) => s.leaseEndDate >= "2025-01-01" && s.leaseEndDate <= "2025-03-31",
   )
   // → 0 results
 
   // Q3 2025 bounds for tech-zone
-  const q3Lo = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, leasesIndex, {
-    leaseEndDate: "2025-07-01",
-  })
-  const q3Hi = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, leasesIndex, {
-    leaseEndDate: "2025-09-30",
-  })
-
-  const techZoneQ3 = yield* db.MallStores.collect(
-    MallStores.query.leases({ storeId: "tech-zone" }).pipe(Query.where({ between: [q3Lo, q3Hi] })),
+  const techZoneQ3 = techZoneLeases.filter(
+    (s) => s.leaseEndDate >= "2025-07-01" && s.leaseEndDate <= "2025-09-30",
   )
   // → 1 result (lease ends 2025-09-30)
   // #endregion
 
   // All leases for burger-barn
-  const burgerLeases = yield* db.MallStores.collect(
-    MallStores.query.leases({ storeId: "burger-barn" }),
-  )
+  const { MallStores: burgerLeases } = yield* db.collections
+    .Leases({ storeId: "burger-barn" })
+    .collect()
   assertEq(burgerLeases.length, 1, "burger-barn has 1 lease record")
   assertEq(burgerLeases[0]!.leaseEndDate, "2025-06-30", "burger-barn lease end date")
   assertEq(starCoffeeQ1.length, 1, "star-coffee has 1 lease in Q1 2025")
@@ -357,7 +356,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 5: Update Store Rent")
 
   // #region pattern-5
-  const updated = yield* db.MallStores.update(
+  const updated = yield* db.entities.MallStores.update(
     {
       cityId: "atlanta",
       mallId: "eastpointe",
@@ -379,7 +378,7 @@ const program = Effect.gen(function* () {
   assertEq(updated.category, "food/coffee", "update preserves category")
 
   // Verify via get
-  const refetched = yield* db.MallStores.get({
+  const refetched = yield* db.entities.MallStores.get({
     cityId: "atlanta",
     mallId: "eastpointe",
     buildingId: "bldg-a",
@@ -395,7 +394,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 6: Delete Store")
 
   // #region pattern-6
-  yield* db.MallStores.delete({
+  yield* db.entities.MallStores.delete({
     cityId: "atlanta",
     mallId: "westgate",
     buildingId: "bldg-c",
@@ -403,11 +402,13 @@ const program = Effect.gen(function* () {
   })
 
   // Verify: westgate now has 1 store
-  const westgateAfter = yield* db.MallStores.collect(MallStores.query.units({ mallId: "westgate" }))
+  const { MallStores: westgateAfter } = yield* db.collections
+    .Units({ mallId: "westgate" })
+    .collect()
   // → 1 store: mega-mart
   // #endregion
 
-  const deleted = yield* db.MallStores.get({
+  const deleted = yield* db.entities.MallStores.get({
     cityId: "atlanta",
     mallId: "westgate",
     buildingId: "bldg-c",
@@ -422,7 +423,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("  Delete gifts-galore, westgate now has 1 store — OK")
 
   // --- Cleanup ---
-  yield* db.deleteTable()
+  yield* db.tables["mall-table"]!.delete()
   yield* Console.log("\nAll 6 patterns passed.")
 })
 
@@ -448,4 +449,4 @@ Effect.runPromise(main).then(
 )
 // #endregion
 
-export { program, MallTable, MallStores, MallStore, MallSchema }
+export { program, MallTable, MallStores, MallStore, MallSchema, Units, Leases }

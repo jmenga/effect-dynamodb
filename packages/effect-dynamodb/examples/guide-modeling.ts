@@ -6,7 +6,8 @@
  *   - DynamoModel.configure for field-level DynamoDB overrides
  *   - DynamoSchema for application namespace and key prefixing
  *   - Table.make for physical table declaration
- *   - Entity.make with composite key indexes, system fields, and unique constraints
+ *   - Entity.make with primaryKey, system fields, and unique constraints
+ *   - Collections.make for GSI access patterns
  *   - Derived types: Model, Record, Input, Update, Key
  *   - Schema accessors for DynamoDB Streams consumption
  *
@@ -20,6 +21,7 @@
 import { Console, Duration, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
@@ -68,30 +70,16 @@ const AppSchema = DynamoSchema.make({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 4. Entity definition — composite indexes, system fields, unique constraints
+// 4. Entity definition — primaryKey only, system fields, unique constraints
 // ---------------------------------------------------------------------------
 
 // #region entity
 const Employees = Entity.make({
   model: EmployeeModel,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byTenant: {
-      index: "gsi1",
-      collection: "TenantMembers",
-      type: "clustered",
-      pk: { field: "gsi1pk", composite: ["tenantId"] },
-      sk: { field: "gsi1sk", composite: ["department", "hireDate"] },
-    },
-    byEmail: {
-      index: "gsi2",
-      pk: { field: "gsi2pk", composite: ["email"] },
-      sk: { field: "gsi2sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId"] },
+    sk: { field: "sk", composite: [] },
   },
   unique: { email: ["email"] },
   timestamps: true,
@@ -101,7 +89,34 @@ const Employees = Entity.make({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 5. Table — declares the physical table and its entities
+// 5. Collections — GSI access patterns
+// ---------------------------------------------------------------------------
+
+// #region collections
+const ByTenant = Collections.make("TenantMembers", {
+  index: "gsi1",
+  type: "clustered",
+  pk: { field: "gsi1pk", composite: ["tenantId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Employees: Collections.member(Employees, {
+      sk: { composite: ["department", "hireDate"] },
+    }),
+  },
+})
+
+const ByEmail = Collections.make("byEmail", {
+  index: "gsi2",
+  pk: { field: "gsi2pk", composite: ["email"] },
+  sk: { field: "gsi2sk" },
+  members: {
+    Employees: Collections.member(Employees, { sk: { composite: [] } }),
+  },
+})
+// #endregion
+
+// ---------------------------------------------------------------------------
+// 6. Table — declares the physical table and its entities
 // ---------------------------------------------------------------------------
 
 // #region table
@@ -109,19 +124,22 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Employees } })
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 6. Main program — demonstrates CRUD + derived types
+// 7. Main program — demonstrates CRUD + derived types
 // ---------------------------------------------------------------------------
 
 // #region program
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { Employees },
+    collections: { ByTenant, ByEmail },
+  })
 
   // --- Setup ---
-  yield* db.createTable()
+  yield* db.tables["modeling-guide-table"]!.create()
   yield* Console.log("Table created\n")
 
   // --- Put: create an employee ---
-  const alice = yield* db.Employees.put({
+  const alice = yield* db.entities.Employees.put({
     employeeId: "emp-alice" as any,
     tenantId: "tenant-acme" as any,
     email: "alice@acme.com",
@@ -133,38 +151,38 @@ const program = Effect.gen(function* () {
   yield* Console.log(`Created: ${alice.displayName} (${alice.email})`)
 
   // --- Get: read by primary key ---
-  const employee = yield* db.Employees.get({ employeeId: "emp-alice" as any })
+  const employee = yield* db.entities.Employees.get({ employeeId: "emp-alice" as any })
   yield* Console.log(`Got: ${employee.displayName}, dept=${employee.department}`)
 
   // --- Update: only updateable fields ---
   // (createdBy excluded — immutable; employeeId excluded — primary key)
-  const updated = yield* db.Employees.update(
+  const updated = yield* db.entities.Employees.update(
     { employeeId: "emp-alice" as any },
     Entity.set({
       displayName: "Alice C.",
       department: "Platform",
-      // Must provide all GSI composites for byTenant:
+      // Must provide all GSI composites for ByTenant:
       tenantId: "tenant-acme" as any,
       hireDate: "2024-01-15T00:00:00.000Z" as any,
     }),
   )
   yield* Console.log(`Updated: ${updated.displayName}, dept=${updated.department}`)
 
-  // --- Query: employees by tenant via GSI ---
-  const acmeEmployees = yield* db.Employees.collect(
-    Employees.query.byTenant({ tenantId: "tenant-acme" as any }),
-  )
+  // --- Query: employees by tenant via collection ---
+  const { Employees: acmeEmployees } = yield* db.collections
+    .ByTenant({ tenantId: "tenant-acme" as any })
+    .collect()
   yield* Console.log(`Acme employees: ${acmeEmployees.length}`)
 
   // --- Cleanup ---
-  yield* db.Employees.delete({ employeeId: "emp-alice" as any })
-  yield* db.deleteTable()
+  yield* db.entities.Employees.delete({ employeeId: "emp-alice" as any })
+  yield* db.tables["modeling-guide-table"]!.delete()
   yield* Console.log("\nDone — table deleted.")
 })
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 7. Provide dependencies and run
+// 8. Provide dependencies and run
 // ---------------------------------------------------------------------------
 
 // #region run

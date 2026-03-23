@@ -199,44 +199,36 @@ The entity binds your pure model to DynamoDB with indexes, key composition, and 
 const Teams = Entity.make({
   model: DynamoModel.configure(Team, { id: { field: "teamId" } }),
   entityType: "Team",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const Players = Entity.make({
   model: DynamoModel.configure(Player, { id: { field: "playerId" } }),
   entityType: "Player",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const Coaches = Entity.make({
   model: DynamoModel.configure(Coach, { id: { field: "coachId" } }),
   entityType: "Coach",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const Venues = Entity.make({
   model: DynamoModel.configure(Venue, { id: { field: "venueId" } }),
   entityType: "Venue",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 ```
@@ -247,9 +239,9 @@ Let's break down what each piece does:
 
 - **`entityType: "Team"`** — A discriminator value stored as `__edd_e__` on every item. Used to identify which entity type an item belongs to during queries.
 
-- **`indexes.primary`** — The table's primary key. `pk` is composed from the `id` field. `sk` has an empty composite (the library fills it with the entity type).
+- **`primaryKey`** — The table's primary key. `pk` is composed from the `id` field. `sk` has an empty composite (the library fills it with the entity type).
 
-> **Key concept:** `Entity.make` returns a **pure entity definition** — no table reference, no executable operations. The entity declares its model, indexes, and configuration. Table association happens when you register it on a `Table.make({ entities: { Teams } })`, which we'll create next.
+> **Key concept:** `Entity.make` returns a **pure entity definition** — no table reference, no executable operations. The entity declares its model, primary key, and configuration. GSI access patterns are declared separately as Collections. Table association happens when you register it on a `Table.make({ entities: { Teams } })`, which we'll create next.
 
 ### 2.5 Schema and Table
 
@@ -263,6 +255,17 @@ const CricketSchema = DynamoSchema.make({ name: "cricket", version: 1 })
 const MainTable = Table.make({
   schema: CricketSchema,
   entities: { Teams, Players, Coaches, Venues, SquadSelections },
+})
+
+const SquadsByPlayer = Collections.make("squadsByPlayer", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["playerId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    SquadSelections: Collections.member(SquadSelections, {
+      sk: { composite: ["squadId", "selectionNumber"] },
+    }),
+  },
 })
 ```
 
@@ -1756,16 +1759,9 @@ The `team` and `player` fields use `DynamoModel.ref` — this marks them as refe
 const SquadSelections = Entity.make({
   model: SquadSelection,
   entityType: "SquadSelection",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["squadId"] },
-      sk: { field: "sk", composite: ["selectionNumber"] },
-    },
-    byPlayer: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["playerId"] },
-      sk: { field: "gsi1sk", composite: ["squadId", "selectionNumber"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["squadId"] },
+    sk: { field: "sk", composite: ["selectionNumber"] },
   },
   refs: {
     team: { entity: Teams },
@@ -1776,7 +1772,7 @@ const SquadSelections = Entity.make({
 
 - **`refs`** — Maps ref fields to their source entities. Each ref field declared with `DynamoModel.ref` on the model is bound to its source entity here. The value `{ entity: Teams }` tells the library to hydrate the `team` field by looking up the referenced Team entity.
 
-- **`byPlayer` GSI** — A secondary index keyed by `playerId`, allowing queries like "find all squad selections for a given player".
+- **`SquadsByPlayer` collection** — Defined separately via `Collections.make`, this GSI is keyed by `playerId`, allowing queries like "find all squad selections for a given player". In the v2 API, GSI access patterns are declared as Collections rather than inline on the entity.
 
 ### 4.3 Adding cascade to TeamService
 

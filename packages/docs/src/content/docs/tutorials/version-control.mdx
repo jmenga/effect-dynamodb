@@ -113,23 +113,15 @@ const VcsTable = Table.make({
 
 ### User Entity
 
-User has a primary index and participates in the `owned` collection on GSI1:
+User has a simple primary key:
 
 ```typescript title="entities.ts" region="user-entity" example="version-control.ts"
 const Users = Entity.make({
   model: User,
   entityType: "User",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["username"] },
-      sk: { field: "sk", composite: [] },
-    },
-    owned: {
-      index: "gsi1",
-      collection: "owned",
-      pk: { field: "gsi1pk", composite: ["username"] },
-      sk: { field: "gsi1sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["username"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -137,100 +129,98 @@ const Users = Entity.make({
 
 ### Repository Entity
 
-Repository participates in both collections -- `owned` on GSI1 (repos by owner) and `activity` on GSI2 (repo + issues + PRs):
+Repository has a composite primary key (owner + name):
 
 ```typescript title="entities.ts" region="repository-entity" example="version-control.ts"
 const Repositories = Entity.make({
   model: Repository,
   entityType: "Repository",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["repoOwner"] },
-      sk: { field: "sk", composite: ["repoName"] },
-    },
-    created: {
-      index: "gsi1",
-      collection: "owned",
-      pk: { field: "gsi1pk", composite: ["repoOwner"] },
-      sk: { field: "gsi1sk", composite: ["repoName"] },
-    },
-    activity: {
-      index: "gsi2",
-      collection: "activity",
-      pk: { field: "gsi2pk", composite: ["repoOwner", "repoName"] },
-      sk: { field: "gsi2sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["repoOwner"] },
+    sk: { field: "sk", composite: ["repoName"] },
   },
   timestamps: true,
 })
 ```
 
-The `owned` collection works because User's GSI1 PK uses `username` and Repository's uses `repoOwner` -- when these values match, both entities appear in the same partition.
-
 ### Issue Entity
 
-Issue participates in the `managed` collection on GSI1 (issues by creator) and the `activity` collection on GSI2 (issues by repo). Both sort keys include `status` for prefix-based filtering:
+Issue uses a composite primary key (repo + issue number):
 
 ```typescript title="entities.ts" region="issue-entity" example="version-control.ts"
 const Issues = Entity.make({
   model: Issue,
   entityType: "Issue",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["repoOwner", "repoName"] },
-      sk: { field: "sk", composite: ["issueNumber"] },
-    },
-    created: {
-      index: "gsi1",
-      collection: "managed",
-      pk: { field: "gsi1pk", composite: ["username"] },
-      sk: { field: "gsi1sk", composite: ["status", "issueNumber"] },
-    },
-    todos: {
-      index: "gsi2",
-      collection: "activity",
-      pk: { field: "gsi2pk", composite: ["repoOwner", "repoName"] },
-      sk: { field: "gsi2sk", composite: ["status", "issueNumber"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["repoOwner", "repoName"] },
+    sk: { field: "sk", composite: ["issueNumber"] },
   },
   timestamps: true,
 })
 ```
 
-Key design decisions:
-- **`created` (GSI1)** shares the `managed` collection with PullRequest -- both use `username` as the partition key
-- **`todos` (GSI2)** shares the `activity` collection with Repository and PullRequest -- all use `repoOwner + repoName` as the partition key
-- **`status` in the sort key** means items naturally group by status within a partition
-
 ### PullRequest Entity
 
-PullRequest mirrors Issue's index structure -- same two collections, same status-based sort keys:
+PullRequest mirrors Issue's primary key structure:
 
 ```typescript title="entities.ts" region="pullrequest-entity" example="version-control.ts"
 const PullRequests = Entity.make({
   model: PullRequest,
   entityType: "PullRequest",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["repoOwner", "repoName"] },
-      sk: { field: "sk", composite: ["pullRequestNumber"] },
-    },
-    created: {
-      index: "gsi1",
-      collection: "managed",
-      pk: { field: "gsi1pk", composite: ["username"] },
-      sk: { field: "gsi1sk", composite: ["status", "pullRequestNumber"] },
-    },
-    enhancements: {
-      index: "gsi2",
-      collection: "activity",
-      pk: { field: "gsi2pk", composite: ["repoOwner", "repoName"] },
-      sk: { field: "gsi2sk", composite: ["status", "pullRequestNumber"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["repoOwner", "repoName"] },
+    sk: { field: "sk", composite: ["pullRequestNumber"] },
   },
   timestamps: true,
 })
 ```
+
+### Collections
+
+GSI access patterns are defined as Collections. Each collection owns the index definition and member SK composites:
+
+```typescript title="collections.ts" region="collections" example="version-control.ts"
+const Owned = Collections.make("owned", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["username"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Users: Collections.member(Users, { sk: { composite: [] } }),
+    Repositories: Collections.member(Repositories, { sk: { composite: ["repoName"] } }),
+  },
+})
+
+const Managed = Collections.make("managed", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["username"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Issues: Collections.member(Issues, { sk: { composite: ["status", "issueNumber"] } }),
+    PullRequests: Collections.member(PullRequests, {
+      sk: { composite: ["status", "pullRequestNumber"] },
+    }),
+  },
+})
+
+const Activity = Collections.make("activity", {
+  index: "gsi2",
+  pk: { field: "gsi2pk", composite: ["repoOwner", "repoName"] },
+  sk: { field: "gsi2sk" },
+  members: {
+    Repositories: Collections.member(Repositories, { sk: { composite: [] } }),
+    Issues: Collections.member(Issues, { sk: { composite: ["status", "issueNumber"] } }),
+    PullRequests: Collections.member(PullRequests, {
+      sk: { composite: ["status", "pullRequestNumber"] },
+    }),
+  },
+})
+```
+
+Key design decisions:
+- **`Owned` (GSI1)** groups User + Repository by owner -- both use `username`/`repoOwner` as the partition key
+- **`Managed` (GSI1)** groups Issue + PullRequest by creator -- both use `username` as the partition key
+- **`Activity` (GSI2)** groups Repository + Issue + PullRequest by repo -- all use `repoOwner + repoName` as the partition key
+- **`status` in the sort key** means items naturally group by status within a partition
 
 ---
 
@@ -325,16 +315,16 @@ const pullRequests = {
 
 ```typescript title="seed.ts" region="seed-execute" example="version-control.ts"
 for (const user of Object.values(users)) {
-  yield* db.Users.put(user)
+  yield* db.entities.Users.put(user)
 }
 for (const repo of Object.values(repos)) {
-  yield* db.Repositories.put(repo)
+  yield* db.entities.Repositories.put(repo)
 }
 for (const issue of Object.values(issues)) {
-  yield* db.Issues.put(issue)
+  yield* db.entities.Issues.put(issue)
 }
 for (const pr of Object.values(pullRequests)) {
-  yield* db.PullRequests.put(pr)
+  yield* db.entities.PullRequests.put(pr)
 }
 ```
 
@@ -347,12 +337,12 @@ for (const pr of Object.values(pullRequests)) {
 > Look up a user by their username (primary key).
 
 ```typescript region="pattern-1" example="version-control.ts"
-const octocat = yield* db.Users.get({ username: "octocat" })
+const octocat = yield* db.entities.Users.get({ username: "octocat" })
 // octocat.fullName → "The Octocat"
 // octocat.bio → "GitHub mascot"
 // octocat.location → "San Francisco, CA"
 
-const torvalds = yield* db.Users.get({ username: "torvalds" })
+const torvalds = yield* db.entities.Users.get({ username: "torvalds" })
 // torvalds.fullName → "Linus Torvalds"
 ```
 
@@ -361,11 +351,14 @@ const torvalds = yield* db.Users.get({ username: "torvalds" })
 > Look up a repository by owner and name (composite primary key).
 
 ```typescript region="pattern-2" example="version-control.ts"
-const helloWorld = yield* db.Repositories.get({ repoOwner: "octocat", repoName: "hello-world" })
+const helloWorld = yield* db.entities.Repositories.get({
+  repoOwner: "octocat",
+  repoName: "hello-world",
+})
 // helloWorld.about → "My first repository on GitHub!"
 // helloWorld.defaultBranch → "main"
 
-const linux = yield* db.Repositories.get({ repoOwner: "torvalds", repoName: "linux" })
+const linux = yield* db.entities.Repositories.get({ repoOwner: "torvalds", repoName: "linux" })
 // linux.about → "Linux kernel source tree"
 // linux.defaultBranch → "master"
 ```
@@ -374,21 +367,21 @@ const linux = yield* db.Repositories.get({ repoOwner: "torvalds", repoName: "lin
 
 > See all repositories owned by a user.
 
-User and Repository share GSI1 via the `owned` collection. Both use the owner's username as the partition key, so a single partition holds the user profile and all their repositories.
+User and Repository share GSI1 via the `Owned` collection. Both use the owner's username as the partition key, so a single partition holds the user profile and all their repositories.
 
 ```typescript region="pattern-3" example="version-control.ts"
-const octocatRepos = yield* db.Repositories.collect(
-  Repositories.query.created({ repoOwner: "octocat" }),
-)
-// → [{ repoName: "hello-world", ... }]
+const { Repositories: octocatRepos } = yield* db.collections
+  .Owned({ username: "octocat" })
+  .collect()
+// → octocatRepos: [{ repoName: "hello-world", ... }]
 
-const torvaldsRepos = yield* db.Repositories.collect(
-  Repositories.query.created({ repoOwner: "torvalds" }),
-)
-// → [{ repoName: "linux", ... }]
+const { Repositories: torvaldsRepos } = yield* db.collections
+  .Owned({ username: "torvalds" })
+  .collect()
+// → torvaldsRepos: [{ repoName: "linux", ... }]
 
-const octocatProfile = yield* db.Users.collect(Users.query.owned({ username: "octocat" }))
-// → [{ fullName: "The Octocat", ... }]
+const { Users: octocatProfile } = yield* db.collections.Owned({ username: "octocat" }).collect()
+// → octocatProfile: [{ fullName: "The Octocat", ... }]
 ```
 
 Both queries hit GSI1 with the same partition key. DynamoDB serves both from the same item collection.
@@ -400,7 +393,7 @@ Both queries hit GSI1 with the same partition key. DynamoDB serves both from the
 Creating an issue is a simple `put`. Closing it requires an `update` with `set()`. Because `status` appears in GSI sort keys, changing it triggers GSI key recomposition -- the all-or-none rule means you must provide all composites for affected GSIs.
 
 ```typescript region="pattern-4" example="version-control.ts"
-const newIssue = yield* db.Issues.put({
+const newIssue = yield* db.entities.Issues.put({
   issueNumber: "3",
   repoName: "hello-world",
   repoOwner: "octocat",
@@ -411,7 +404,7 @@ const newIssue = yield* db.Issues.put({
 })
 // newIssue.status → "Open"
 
-const closedIssue = yield* db.Issues.update(
+const closedIssue = yield* db.entities.Issues.update(
   { repoOwner: "octocat", repoName: "hello-world", issueNumber: "3" },
   Entity.set({ status: "Closed", username: "torvalds" }),
 )
@@ -419,7 +412,7 @@ const closedIssue = yield* db.Issues.update(
 // closedIssue.subject → "Enhancement: Add CI pipeline" (preserved)
 ```
 
-The `username` field must be included in the `set()` even though it hasn't changed -- it's a composite of the `created` GSI alongside `status`, and the all-or-none rule requires all composites for any GSI that's being recomposed.
+The `username` field must be included in the `set()` even though it hasn't changed -- it's a composite of the `managed` collection alongside `status`, and the all-or-none rule requires all composites for any GSI that's being recomposed.
 
 ### Pattern 5: Create Pull Request + Close
 
@@ -428,7 +421,7 @@ The `username` field must be included in the `set()` even though it hasn't chang
 The same pattern as issues -- `status` in the sort key means the GSI keys must be fully recomposed on status change.
 
 ```typescript region="pattern-5" example="version-control.ts"
-const newPR = yield* db.PullRequests.put({
+const newPR = yield* db.entities.PullRequests.put({
   pullRequestNumber: "2",
   repoName: "hello-world",
   repoOwner: "octocat",
@@ -438,7 +431,7 @@ const newPR = yield* db.PullRequests.put({
   status: "Open",
 })
 
-const closedPR = yield* db.PullRequests.update(
+const closedPR = yield* db.entities.PullRequests.update(
   { repoOwner: "octocat", repoName: "hello-world", pullRequestNumber: "2" },
   Entity.set({ status: "Closed", username: "octocat" }),
 )
@@ -449,23 +442,25 @@ const closedPR = yield* db.PullRequests.update(
 
 > See all issues and PRs created by a user.
 
-Issue and PullRequest share GSI1 via the `managed` collection. Both use `username` as the partition key. Query each entity type separately to see a user's work items.
+Issue and PullRequest share GSI1 via the `Managed` collection. Both use `username` as the partition key. The collection returns grouped results with all member types.
 
 ```typescript region="pattern-6" example="version-control.ts"
-const torvaldsIssues = yield* db.Issues.collect(Issues.query.created({ username: "torvalds" }))
+const { Issues: torvaldsIssues } = yield* db.collections
+  .Managed({ username: "torvalds" })
+  .collect()
 // → 2 issues (hello-world #1 Open, hello-world #3 Closed)
 
-const torvaldsPRs = yield* db.PullRequests.collect(
-  PullRequests.query.created({ username: "torvalds" }),
-)
+const { PullRequests: torvaldsPRs } = yield* db.collections
+  .Managed({ username: "torvalds" })
+  .collect()
 // → [{ pullRequestNumber: "1", subject: "Fix README typo", status: "Open" }]
 
-const octocatIssues = yield* db.Issues.collect(Issues.query.created({ username: "octocat" }))
+const { Issues: octocatIssues } = yield* db.collections.Managed({ username: "octocat" }).collect()
 // → 2 issues (hello-world #2 Closed, linux #1 Open)
 
-const octocatPRs = yield* db.PullRequests.collect(
-  PullRequests.query.created({ username: "octocat" }),
-)
+const { PullRequests: octocatPRs } = yield* db.collections
+  .Managed({ username: "octocat" })
+  .collect()
 // → 2 PRs (linux #1 Open, hello-world #2 Closed)
 ```
 
@@ -473,35 +468,35 @@ const octocatPRs = yield* db.PullRequests.collect(
 
 > See all issues and PRs for a specific repository.
 
-Repository, Issue, and PullRequest share GSI2 via the `activity` collection. All use `repoOwner + repoName` as the partition key, grouping everything related to a repository in one partition.
+Repository, Issue, and PullRequest share GSI2 via the `Activity` collection. All use `repoOwner + repoName` as the partition key, grouping everything related to a repository in one partition.
 
 ```typescript region="pattern-7" example="version-control.ts"
-const hwIssues = yield* db.Issues.collect(
-  Issues.query.todos({ repoOwner: "octocat", repoName: "hello-world" }),
-)
+const { Issues: hwIssues } = yield* db.collections
+  .Activity({ repoOwner: "octocat", repoName: "hello-world" })
+  .collect()
 // → 3 issues: #1 (Open), #2 (Closed), #3 (Closed)
 
 const hwOpenIssues = hwIssues.filter((i) => i.status === "Open")
 // → [{ issueNumber: "1", ... }]
 
-const hwPRs = yield* db.PullRequests.collect(
-  PullRequests.query.enhancements({ repoOwner: "octocat", repoName: "hello-world" }),
-)
+const { PullRequests: hwPRs } = yield* db.collections
+  .Activity({ repoOwner: "octocat", repoName: "hello-world" })
+  .collect()
 // → 2 PRs: #1 (Open), #2 (Closed)
 
-const linuxIssues = yield* db.Issues.collect(
-  Issues.query.todos({ repoOwner: "torvalds", repoName: "linux" }),
-)
+const { Issues: linuxIssues } = yield* db.collections
+  .Activity({ repoOwner: "torvalds", repoName: "linux" })
+  .collect()
 // → [{ issueNumber: "1", status: "Open", ... }]
 
-const linuxPRs = yield* db.PullRequests.collect(
-  PullRequests.query.enhancements({ repoOwner: "torvalds", repoName: "linux" }),
-)
+const { PullRequests: linuxPRs } = yield* db.collections
+  .Activity({ repoOwner: "torvalds", repoName: "linux" })
+  .collect()
 // → [{ pullRequestNumber: "1", status: "Open", ... }]
 
-const hwRepoActivity = yield* db.Repositories.collect(
-  Repositories.query.activity({ repoOwner: "octocat", repoName: "hello-world" }),
-)
+const { Repositories: hwRepoActivity } = yield* db.collections
+  .Activity({ repoOwner: "octocat", repoName: "hello-world" })
+  .collect()
 // → [{ repoName: "hello-world", ... }]
 ```
 
@@ -535,15 +530,15 @@ yield* Transaction.transactWrite([
   }),
 ])
 
-// Both created atomically — verify via activity index
-const linuxIssuesAfter = yield* db.Issues.collect(
-  Issues.query.todos({ repoOwner: "torvalds", repoName: "linux" }),
-)
+// Both created atomically — verify via activity collection
+const { Issues: linuxIssuesAfter } = yield* db.collections
+  .Activity({ repoOwner: "torvalds", repoName: "linux" })
+  .collect()
 // → 2 issues now
 
-const linuxPRsAfter = yield* db.PullRequests.collect(
-  PullRequests.query.enhancements({ repoOwner: "torvalds", repoName: "linux" }),
-)
+const { PullRequests: linuxPRsAfter } = yield* db.collections
+  .Activity({ repoOwner: "torvalds", repoName: "linux" })
+  .collect()
 // → 2 PRs now
 ```
 
@@ -590,10 +585,10 @@ Effect.runPromise(main).then(
 | Concept | How it's used |
 |---------|---------------|
 | **Single-table design** | 4 entities, 1 table, structured key values |
-| **Index overloading** | GSI1 serves `owned` (User + Repository) and `managed` (Issue + PullRequest) collections |
-| **3 collections** | `owned` (GSI1), `managed` (GSI1), `activity` (GSI2) enable cross-entity queries |
+| **Index overloading** | GSI1 serves `Owned` (User + Repository) and `Managed` (Issue + PullRequest) collections |
+| **3 collections** | `Owned` (GSI1), `Managed` (GSI1), `Activity` (GSI2) enable cross-entity queries |
 | **Status in sort key** | `status` as first sort key composite groups items by Open/Closed within a partition |
-| **GSI all-or-none** | Changing `status` requires providing all composites for affected GSIs (e.g., `username` for GSI1) |
+| **GSI all-or-none** | Changing `status` requires providing all composites for affected GSIs (e.g., `username` for Managed) |
 | **Transactions** | Atomic multi-entity writes for issue + PR creation |
 | **Composite primary keys** | Repository, Issue, and PullRequest use multi-attribute partition and sort keys |
 

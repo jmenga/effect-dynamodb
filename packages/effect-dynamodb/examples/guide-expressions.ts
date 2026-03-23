@@ -1,11 +1,11 @@
 /**
- * Guide: Expressions — effect-dynamodb v4
+ * Guide: Expressions — effect-dynamodb v2
  *
  * Companion example for the Expressions guide. Demonstrates:
  *   - Condition expressions: callback API + shorthand syntax
  *   - Filter expressions: callback API + shorthand syntax
  *   - Update expressions: record-based + path-based combinators
- *   - Key condition expressions: query accessors + Query.where
+ *   - Key condition expressions: collection queries + Query.where
  *   - Projection expressions: Entity.select callback + string array shorthand
  *   - PathBuilder: nested maps, array elements, size()
  *
@@ -19,10 +19,10 @@
 import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 
 // ---------------------------------------------------------------------------
@@ -65,7 +65,7 @@ class Product extends Schema.Class<Product>("Product")({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 2. Schema + Table + Entity
+// 2. Schema + Table + Entity + Collections
 // ---------------------------------------------------------------------------
 
 // #region entities
@@ -74,22 +74,24 @@ const AppSchema = DynamoSchema.make({ name: "guide-expr", version: 1 })
 const Products = Entity.make({
   model: Product,
   entityType: "Product",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["productId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byCategory: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["category"] },
-      sk: { field: "gsi1sk", composite: ["productId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["productId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Products } })
+
+const ProductsByCategory = Collections.make("productsByCategory", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["category"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Products: Collections.member(Products, { sk: { composite: ["productId"] } }),
+  },
+})
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -97,10 +99,13 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Products } })
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { Products },
+    collections: { ProductsByCategory },
+  })
 
   // --- Setup ---
-  yield* db.createTable()
+  yield* db.tables["guide-expr-table"]!.create()
   yield* Console.log("Table created\n")
 
   // Seed products
@@ -118,7 +123,7 @@ const program = Effect.gen(function* () {
     metadata: { temporary: "yes" },
   } as const
 
-  yield* db.Products.put({
+  yield* db.entities.Products.put({
     ...baseProduct,
     productId: "p-1",
     name: "Widget",
@@ -127,7 +132,7 @@ const program = Effect.gen(function* () {
     stock: 100,
     email: "widget@store.com",
   })
-  yield* db.Products.put({
+  yield* db.entities.Products.put({
     ...baseProduct,
     productId: "p-2",
     name: "Gadget",
@@ -136,7 +141,7 @@ const program = Effect.gen(function* () {
     stock: 25,
     email: "gadget@store.com",
   })
-  yield* db.Products.put({
+  yield* db.entities.Products.put({
     ...baseProduct,
     productId: "p-3",
     name: "USB Cable",
@@ -144,7 +149,7 @@ const program = Effect.gen(function* () {
     price: 9.99,
     stock: 500,
   })
-  yield* db.Products.put({
+  yield* db.entities.Products.put({
     ...baseProduct,
     productId: "p-4",
     name: "Phone Case",
@@ -192,7 +197,7 @@ const program = Effect.gen(function* () {
 
   // #region condition-on-operations
   // On put
-  yield* db.Products.put(
+  yield* db.entities.Products.put(
     {
       ...baseProduct,
       productId: "p-5",
@@ -205,7 +210,7 @@ const program = Effect.gen(function* () {
   )
 
   // On update (ANDed with optimistic lock)
-  yield* db.Products.update(
+  yield* db.entities.Products.update(
     { productId: "p-1" },
     Products.set({ name: "Widget Pro" }),
     Products.expectedVersion(1),
@@ -213,7 +218,7 @@ const program = Effect.gen(function* () {
   )
 
   // On delete
-  yield* db.Products.delete(
+  yield* db.entities.Products.delete(
     { productId: "p-4" },
     Products.condition((t, { eq }) => eq(t.stock, 0)),
   )
@@ -239,26 +244,24 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Filter Expressions — Callback API ===\n")
 
   // #region filter-callback
-  // Filter on query
-  const expensive = yield* db.Products.collect(
-    Products.query.byCategory({ category: "electronics" }),
-    Products.filter((t, { gt }) => gt(t.price, 30)),
-  )
+  // Filter on collection query — shorthand for equality
+  const { Products: activeElectronics } = yield* db.collections
+    .ProductsByCategory({ category: "electronics" })
+    .filter({ status: "active" })
+    .collect()
 
-  // Filter on scan
-  const withWidget = yield* db.Products.collect(
-    Products.scan(),
-    Products.filter((t, { contains }) => contains(t.name, "Widget")),
-  )
+  // Filter on scan — callback with typed PathBuilder
+  const withWidget = yield* db.entities.Products.scan()
+    .filter((t, { contains }) => contains(t.name, "Widget"))
+    .collect()
 
   // Complex filter with OR
-  const activeOrPending = yield* db.Products.collect(
-    Products.scan(),
-    Products.filter((t, { or, eq }) => or(eq(t.status, "active"), eq(t.status, "pending"))),
-  )
+  const activeOrPending = yield* db.entities.Products.scan()
+    .filter((t, { or, eq }) => or(eq(t.status, "active"), eq(t.status, "pending")))
+    .collect()
   // #endregion
 
-  yield* Console.log(`Electronics > $30: ${expensive.length} products`)
+  yield* Console.log(`Active electronics: ${activeElectronics.length} products`)
   yield* Console.log(`Containing "Widget": ${withWidget.length} products`)
   yield* Console.log(`Active or pending: ${activeOrPending.length} products\n`)
 
@@ -280,7 +283,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Update Expressions — Record-Based ===\n")
 
   // Re-seed p-4 for further demos
-  yield* db.Products.put({
+  yield* db.entities.Products.put({
     ...baseProduct,
     productId: "p-4",
     name: "Phone Case",
@@ -296,25 +299,31 @@ const program = Effect.gen(function* () {
 
   // #region update-record
   // SET — assign values
-  yield* db.Products.update(
+  yield* db.entities.Products.update(
     { productId: "p-1" },
     Entity.set({ name: "Widget Deluxe", price: 34.99 }),
   )
 
   // REMOVE — delete attributes
-  yield* db.Products.update({ productId: "p-4" }, Entity.remove(["description", "temporaryFlag"]))
+  yield* db.entities.Products.update(
+    { productId: "p-4" },
+    Entity.remove(["description", "temporaryFlag"]),
+  )
 
   // ADD — atomic increment (numbers) or union (sets)
-  yield* db.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1, stock: 50 }))
+  yield* db.entities.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1, stock: 50 }))
 
   // Subtract — SET field = field - value
-  yield* db.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
+  yield* db.entities.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
 
   // Append — SET field = list_append(field, value)
-  yield* db.Products.update({ productId: "p-1" }, Entity.append({ tags: ["on-sale", "featured"] }))
+  yield* db.entities.Products.update(
+    { productId: "p-1" },
+    Entity.append({ tags: ["on-sale", "featured"] }),
+  )
 
   // DELETE — remove elements from a set
-  yield* db.Products.update(
+  yield* db.entities.Products.update(
     { productId: "p-4" },
     Entity.deleteFromSet({ categories: new Set(["obsolete"]) }),
   )
@@ -328,7 +337,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Composing Multiple Update Types ===\n")
 
   // #region update-composed
-  yield* db.Products.update(
+  yield* db.entities.Products.update(
     { productId: "p-1" },
     Entity.set({ name: "Updated Widget", price: 24.99 }),
     Entity.add({ viewCount: 1 }),
@@ -348,17 +357,17 @@ const program = Effect.gen(function* () {
 
   // #region update-path
   // SET nested path
-  yield* db.Products.update({ productId: "p-1" }, (op) =>
+  yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
     Entity.pathSet(op, { segments: ["address", "city"], value: "NYC", isPath: false }),
   )
 
   // SET array element
-  yield* db.Products.update({ productId: "p-1" }, (op) =>
+  yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
     Entity.pathSet(op, { segments: ["roster", 0, "position"], value: "captain", isPath: false }),
   )
 
   // Copy attribute to attribute
-  yield* db.Products.update({ productId: "p-1" }, (op) =>
+  yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
     Entity.pathSet(op, {
       segments: ["backup_email"],
       value: undefined,
@@ -368,17 +377,17 @@ const program = Effect.gen(function* () {
   )
 
   // REMOVE nested attribute
-  yield* db.Products.update({ productId: "p-1" }, (op) =>
+  yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
     Entity.pathRemove(op, ["metadata", "temporary"]),
   )
 
   // PREPEND to list
-  yield* db.Products.update({ productId: "p-1" }, (op) =>
+  yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
     Entity.pathPrepend(op, { segments: ["tags"], value: ["URGENT"] }),
   )
 
   // if_not_exists — set only if the attribute doesn't exist
-  yield* db.Products.update({ productId: "p-1" }, (op) =>
+  yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
     Entity.pathIfNotExists(op, { segments: ["createdBy"], value: "system" }),
   )
   // #endregion
@@ -386,20 +395,20 @@ const program = Effect.gen(function* () {
   yield* Console.log("Path-based updates applied\n")
 
   // -----------------------------------------------------------------------
-  // Key Condition Expressions — Query Accessors
+  // Key Condition Expressions — Collection Queries
   // -----------------------------------------------------------------------
   yield* Console.log("=== Key Condition Expressions ===\n")
 
   // #region key-condition-query
-  // Access via query namespace
-  const byCategory = yield* db.Products.collect(
-    Products.query.byCategory({ category: "electronics" }),
-  )
+  // Access via collection query
+  const { Products: byCategory } = yield* db.collections
+    .ProductsByCategory({ category: "electronics" })
+    .collect()
 
   // Partial SK composites narrow with begins_with automatically
-  const byCategoryAndId = yield* db.Products.collect(
-    Products.query.byCategory({ category: "electronics", productId: "p-1" }),
-  )
+  const { Products: byCategoryAndId } = yield* db.collections
+    .ProductsByCategory({ category: "electronics", productId: "p-1" })
+    .collect()
   // #endregion
 
   yield* Console.log(`By category: ${byCategory.length} products`)
@@ -411,21 +420,19 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Query.where ===\n")
 
   // #region key-condition-where
-  // Range comparison on sort key
-  const rangeQuery = Products.query
-    .byCategory({ category: "electronics" })
-    .pipe(Query.where({ gte: "p-1" }))
+  // Pass SK composites to narrow with begins_with automatically
+  const { Products: narrowed } = yield* db.collections
+    .ProductsByCategory({ category: "electronics", productId: "p-1" })
+    .collect()
 
-  // Prefix match on sort key
-  const prefixQuery = Products.query
-    .byCategory({ category: "electronics" })
-    .pipe(Query.where({ beginsWith: "p-" }))
+  // All products in category (no SK narrowing)
+  const { Products: allInCategory } = yield* db.collections
+    .ProductsByCategory({ category: "electronics" })
+    .collect()
   // #endregion
 
-  const rangeResults = yield* db.Products.collect(rangeQuery)
-  const prefixResults = yield* db.Products.collect(prefixQuery)
-  yield* Console.log(`Range (gte p-1): ${rangeResults.length} products`)
-  yield* Console.log(`Prefix (beginsWith p-): ${prefixResults.length} products\n`)
+  yield* Console.log(`Narrowed (productId p-1): ${narrowed.length} products`)
+  yield* Console.log(`All in category: ${allInCategory.length} products\n`)
 
   // -----------------------------------------------------------------------
   // Projection Expressions — Callback API
@@ -451,21 +458,17 @@ const program = Effect.gen(function* () {
   // -----------------------------------------------------------------------
 
   // #region select-on-queries
-  // Project on query
-  const projected = yield* db.Products.collect(
-    Products.query.byCategory({ category: "electronics" }),
-    Products.select((t) => [t.name, t.price]),
-  )
+  // Project on scan — callback
+  const projected = yield* db.entities.Products.scan()
+    .select((t) => [t.name, t.price])
+    .collect()
 
-  // Project on scan
-  const scanned = yield* db.Products.collect(
-    Products.scan(),
-    Products.select((t) => [t.name, t.status]),
-  )
+  // Project on scan — string array shorthand
+  const scanned = yield* db.entities.Products.scan().select(["name", "status"]).collect()
   // #endregion
 
-  yield* Console.log(`Projected query: ${projected.length} items`)
-  yield* Console.log(`Projected scan: ${scanned.length} items\n`)
+  yield* Console.log(`Projected scan (callback): ${projected.length} items`)
+  yield* Console.log(`Projected scan (shorthand): ${scanned.length} items\n`)
 
   // -----------------------------------------------------------------------
   // Projection Expressions — String Array Shorthand
@@ -498,7 +501,7 @@ const program = Effect.gen(function* () {
 
   // --- Cleanup ---
   yield* Console.log("=== Cleanup ===\n")
-  yield* db.deleteTable()
+  yield* db.tables["guide-expr-table"]!.delete()
   yield* Console.log("Table deleted.")
 })
 

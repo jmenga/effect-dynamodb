@@ -259,6 +259,14 @@ export interface Entity<
     tableTag: import("effect").ServiceMap.Service<TableConfig, TableConfig>,
   ) => void
 
+  /**
+   * @internal Inject a GSI index definition into this entity.
+   * Called by Collections binding or DynamoClient.make() to add collection-owned indexes.
+   * The injected index becomes available to all entity operations (put, update, etc.)
+   * for key composition.
+   */
+  readonly _injectIndex: (name: string, def: IndexDefinition) => void
+
   /** @internal Injected DynamoSchema — available after _configure(). Used by cascade. */
   readonly _schema: DynamoSchema.DynamoSchema
   /** @internal Injected TableConfig tag — available after _configure(). Used by cascade. */
@@ -826,7 +834,9 @@ export interface BoundEntity<
    * ```
    */
   readonly scanFetch: (
-    ...combinators: ReadonlyArray<(q: Query.Query<ModelType<TModel>>) => Query.Query<ModelType<TModel>>>
+    ...combinators: ReadonlyArray<
+      (q: Query.Query<ModelType<TModel>>) => Query.Query<ModelType<TModel>>
+    >
   ) => Effect.Effect<Query.Page<ModelType<TModel>>, DynamoClientError | ValidationError, never>
 }
 
@@ -924,7 +934,98 @@ type InvalidComposites<F extends string, TIndexes> = Exclude<
   F
 >
 
-export const make = <
+/** Primary key definition — used in the new `primaryKey` config form. */
+type PrimaryKeyDef = IndexDefinition &
+  (
+    | { readonly pk: { readonly composite: readonly [string, ...string[]] } }
+    | { readonly sk: { readonly composite: readonly [string, ...string[]] } }
+  )
+
+/**
+ * Create an Entity definition.
+ *
+ * Overload 1: `primaryKey` — entity defines only its primary key. GSI definitions
+ * are owned by `Collections.make()` and injected at `DynamoClient.make()` time.
+ *
+ * Overload 2: `indexes` — legacy form where all indexes (primary + GSIs) are defined
+ * on the entity. Still supported for backward compatibility.
+ */
+export const make: {
+  // --- Overload 1: primaryKey (new) ---
+  <
+    TModel extends Schema.Top,
+    const TEntityType extends string,
+    const TPrimaryKey extends PrimaryKeyDef,
+    const TTimestamps extends TimestampsConfig | undefined = undefined,
+    const TVersioned extends VersionedConfig | undefined = undefined,
+    const TSoftDelete extends SoftDeleteConfig | undefined = undefined,
+    const TUnique extends UniqueConfig | undefined = undefined,
+    const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
+    const TAttrs extends {} = {},
+  >(config: {
+    readonly model: TModel | ConfiguredModel<TModel, TAttrs>
+    readonly entityType: TEntityType
+    readonly primaryKey: TPrimaryKey
+    readonly timestamps?: TTimestamps
+    readonly versioned?: TVersioned
+    readonly softDelete?: TSoftDelete
+    readonly unique?: TUnique
+    readonly refs?: TRefs
+  }): Entity<
+    TModel,
+    TEntityType,
+    { readonly primary: TPrimaryKey },
+    TTimestamps,
+    TVersioned,
+    TSoftDelete,
+    TUnique,
+    TRefs,
+    ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>
+  >
+
+  // --- Overload 2: indexes (legacy) ---
+  <
+    TModel extends Schema.Top,
+    const TEntityType extends string,
+    const TIndexes extends globalThis.Record<string, IndexDefinition> & {
+      readonly primary: PrimaryKeyDef
+    },
+    const TTimestamps extends TimestampsConfig | undefined = undefined,
+    const TVersioned extends VersionedConfig | undefined = undefined,
+    const TSoftDelete extends SoftDeleteConfig | undefined = undefined,
+    const TUnique extends UniqueConfig | undefined = undefined,
+    const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
+    const TAttrs extends {} = {},
+  >(config: {
+    readonly model: TModel | ConfiguredModel<TModel, TAttrs>
+    readonly entityType: TEntityType
+    readonly indexes: [InvalidComposites<ValidCompositeAttr<TModel, TRefs>, TIndexes>] extends [
+      never,
+    ]
+      ? TIndexes
+      : TIndexes & {
+          readonly [K in keyof TIndexes]: {
+            readonly pk: { readonly composite: ReadonlyArray<ValidCompositeAttr<TModel, TRefs>> }
+            readonly sk: { readonly composite: ReadonlyArray<ValidCompositeAttr<TModel, TRefs>> }
+          }
+        }
+    readonly timestamps?: TTimestamps
+    readonly versioned?: TVersioned
+    readonly softDelete?: TSoftDelete
+    readonly unique?: TUnique
+    readonly refs?: TRefs
+  }): Entity<
+    TModel,
+    TEntityType,
+    TIndexes,
+    TTimestamps,
+    TVersioned,
+    TSoftDelete,
+    TUnique,
+    TRefs,
+    ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>
+  >
+} = <
   TModel extends Schema.Top,
   const TEntityType extends string,
   const TIndexes extends globalThis.Record<string, IndexDefinition> & {
@@ -943,7 +1044,9 @@ export const make = <
 >(config: {
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
   readonly entityType: TEntityType
-  readonly indexes: [InvalidComposites<ValidCompositeAttr<TModel, TRefs>, TIndexes>] extends [never]
+  readonly indexes?: [InvalidComposites<ValidCompositeAttr<TModel, TRefs>, TIndexes>] extends [
+    never,
+  ]
     ? TIndexes
     : TIndexes & {
         readonly [K in keyof TIndexes]: {
@@ -951,6 +1054,56 @@ export const make = <
           readonly sk: { readonly composite: ReadonlyArray<ValidCompositeAttr<TModel, TRefs>> }
         }
       }
+  readonly primaryKey?: IndexDefinition
+  readonly timestamps?: TTimestamps
+  readonly versioned?: TVersioned
+  readonly softDelete?: TSoftDelete
+  readonly unique?: TUnique
+  readonly refs?: TRefs
+}): Entity<
+  TModel,
+  TEntityType,
+  TIndexes,
+  TTimestamps,
+  TVersioned,
+  TSoftDelete,
+  TUnique,
+  TRefs,
+  ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>
+> => {
+  // Normalize: if primaryKey is provided, wrap it as { primary: primaryKey }
+  const normalizedConfig = config.primaryKey
+    ? { ...config, indexes: { primary: config.primaryKey } as unknown as typeof config.indexes }
+    : config
+  if (!normalizedConfig.indexes) {
+    throw new Error(
+      `Entity "${config.entityType}": either 'indexes' or 'primaryKey' must be provided`,
+    )
+  }
+  // Delegate to the internal implementation with normalized indexes
+  return makeImpl(normalizedConfig as any) as any
+}
+
+const makeImpl = <
+  TModel extends Schema.Top,
+  const TEntityType extends string,
+  const TIndexes extends globalThis.Record<string, IndexDefinition> & {
+    readonly primary: IndexDefinition &
+      (
+        | { readonly pk: { readonly composite: readonly [string, ...string[]] } }
+        | { readonly sk: { readonly composite: readonly [string, ...string[]] } }
+      )
+  },
+  const TTimestamps extends TimestampsConfig | undefined = undefined,
+  const TVersioned extends VersionedConfig | undefined = undefined,
+  const TSoftDelete extends SoftDeleteConfig | undefined = undefined,
+  const TUnique extends UniqueConfig | undefined = undefined,
+  const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
+  const TAttrs extends {} = {},
+>(config: {
+  readonly model: TModel | ConfiguredModel<TModel, TAttrs>
+  readonly entityType: TEntityType
+  readonly indexes: typeof undefined extends never ? never : TIndexes
   readonly timestamps?: TTimestamps
   readonly versioned?: TVersioned
   readonly softDelete?: TSoftDelete
@@ -1077,10 +1230,10 @@ export const make = <
       }
     }
   }
-  const allIndexes: typeof config.indexes = {
+  let allIndexes: globalThis.Record<string, IndexDefinition> = {
     ...config.indexes,
     ...cascadeIndexes,
-  } as typeof config.indexes
+  }
 
   // Build immutable fields set from ConfiguredModel (for update schema exclusion + upsert if_not_exists wrapping)
   const immutableFields = new Set<string>()
@@ -3711,7 +3864,9 @@ export const make = <
     _tag: "Entity" as const,
     model: config.model,
     entityType: config.entityType,
-    indexes: allIndexes,
+    get indexes() {
+      return allIndexes
+    },
     timestamps: config.timestamps as TTimestamps,
     versioned: config.versioned as TVersioned,
     softDelete: config.softDelete as TSoftDelete,
@@ -3726,6 +3881,9 @@ export const make = <
     ) => {
       schema = injectedSchema
       tableTag = injectedTableTag
+    },
+    _injectIndex: (name: string, def: IndexDefinition) => {
+      allIndexes = { ...allIndexes, [name]: def }
     },
     get _schema() {
       return schema

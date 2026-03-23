@@ -19,6 +19,7 @@ import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import * as Batch from "../src/Batch.js"
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -52,7 +53,7 @@ class Order extends Schema.Class<Order>("Order")({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 2. Schema + Entities + Table
+// 2. Schema + Entities + Collections
 // ---------------------------------------------------------------------------
 
 // #region entities
@@ -61,11 +62,9 @@ const AppSchema = DynamoSchema.make({ name: "batch-demo", version: 1 })
 const Users = Entity.make({
   model: User,
   entityType: "User",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -73,21 +72,23 @@ const Users = Entity.make({
 const Orders = Entity.make({
   model: Order,
   entityType: "Order",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["orderId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byUser: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["userId"] },
-      sk: { field: "gsi1sk", composite: ["orderId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["orderId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Users, Orders } })
+
+const OrdersByUser = Collections.make("ordersByUser", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["userId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Orders: Collections.member(Orders, { sk: { composite: ["orderId"] } }),
+  },
+})
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -95,12 +96,15 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Users, Orders } })
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { Users, Orders },
+    collections: { OrdersByUser },
+  })
 
   // --- Create the table ---
   yield* Console.log("=== Setup ===\n")
 
-  yield* db.createTable()
+  yield* db.tables["batch-demo-table"]!.create()
   yield* Console.log("Table created: batch-demo-table\n")
 
   // --- Batch.write — create multiple items at once ---
@@ -222,7 +226,7 @@ const program = Effect.gen(function* () {
 
   // --- Cleanup ---
   yield* Console.log("=== Cleanup ===\n")
-  yield* db.deleteTable()
+  yield* db.tables["batch-demo-table"]!.delete()
   yield* Console.log("Table deleted.")
 })
 

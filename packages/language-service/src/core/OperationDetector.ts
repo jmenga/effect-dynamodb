@@ -1,14 +1,30 @@
 import type ts from "typescript"
-import type { ResolvedEntity } from "./EntityResolver"
+import type { ResolvedCollection, ResolvedEntity } from "./EntityResolver"
 
-export type OperationType = "get" | "put" | "create" | "update" | "delete" | "query" | "scan"
+export type OperationType =
+  | "get"
+  | "put"
+  | "create"
+  | "update"
+  | "delete"
+  | "query"
+  | "scan"
+  | "entity-query-accessor"
+  | "collection-accessor"
+  | "bound-query-terminal"
+  | "table-accessor"
 
 export interface DetectedOperation {
-  readonly entity: ResolvedEntity
+  readonly entity?: ResolvedEntity | undefined
   readonly type: OperationType
   readonly indexName?: string | undefined
   readonly arguments?: Record<string, unknown> | undefined
   readonly updateCombinators?: UpdateCombinators | undefined
+  // v2 fields
+  readonly collection?: ResolvedCollection | undefined
+  readonly collectionName?: string | undefined
+  readonly terminalName?: string | undefined
+  readonly tableName?: string | undefined
 }
 
 export interface UpdateCombinators {
@@ -27,6 +43,7 @@ export function detectOperation(
   sourceFile: ts.SourceFile,
   position: number,
   entities: ReadonlyArray<ResolvedEntity>,
+  collections: ReadonlyArray<ResolvedCollection> = [],
 ): DetectedOperation | undefined {
   const token = findTokenAtPosition(ts, sourceFile, position)
   if (!token) return undefined
@@ -36,6 +53,10 @@ export function detectOperation(
 
   // Try to detect from current node and parents
   while (node) {
+    // Try v2 patterns first (more specific), then fall back to v1
+    const v2Result = tryDetectV2Pattern(ts, node, entities, collections)
+    if (v2Result) return v2Result
+
     const result = tryDetectFromNode(ts, node, entities)
     if (result) return result
     if (node === sourceFile) break
@@ -58,6 +79,220 @@ function findTokenAtPosition(
     return child ?? node
   }
   return find(sourceFile)
+}
+
+// ---------------------------------------------------------------------------
+// V2 pattern detection — db.entities.*, db.collections.*, BoundQuery terminals
+// ---------------------------------------------------------------------------
+
+function tryDetectV2Pattern(
+  ts: typeof import("typescript"),
+  node: ts.Node,
+  entities: ReadonlyArray<ResolvedEntity>,
+  collections: ReadonlyArray<ResolvedCollection>,
+): DetectedOperation | undefined {
+  if (collections.length === 0) return undefined
+
+  // Only process call expressions and property access expressions
+  if (!ts.isCallExpression(node) && !ts.isPropertyAccessExpression(node)) return undefined
+
+  // For call expressions, check the callee chain
+  const callNode = ts.isCallExpression(node) ? node : undefined
+  const accessNode = callNode
+    ? ts.isPropertyAccessExpression(callNode.expression)
+      ? callNode.expression
+      : undefined
+    : ts.isPropertyAccessExpression(node)
+      ? node
+      : undefined
+
+  if (!accessNode) return undefined
+
+  // Walk the property access chain to build the path
+  const chain = buildPropertyAccessChain(ts, accessNode)
+
+  // Pattern 1: db.entities.Tasks.byProject(...) — 4+ segments: [db, entities, Tasks, byProject]
+  if (chain.length >= 4 && chain[1] === "entities" && callNode) {
+    const entityName = chain[2]!
+    const accessorName = chain[3]!
+    const entity = findEntity(entityName, entities)
+
+    if (entity) {
+      // Check if accessorName matches a collection name
+      const collection = collections.find((c) => c.collectionName === accessorName)
+      if (collection) {
+        const args =
+          callNode.arguments.length > 0 ? extractCallArgs(ts, callNode.arguments[0]!) : undefined
+        return {
+          entity,
+          type: "entity-query-accessor",
+          collection,
+          collectionName: accessorName,
+          arguments: args,
+        }
+      }
+
+      // Check for scan()
+      if (accessorName === "scan") {
+        return { entity, type: "scan" }
+      }
+
+      // Check for CRUD methods via entities namespace: db.entities.Users.get(...)
+      const opType = methodToOpType(accessorName)
+      if (opType) {
+        const args =
+          callNode.arguments.length > 0 ? extractCallArgs(ts, callNode.arguments[0]!) : undefined
+        const updateCombs = opType === "update" ? extractUpdateCombinators(ts, callNode) : undefined
+        return { entity, type: opType, arguments: args, updateCombinators: updateCombs }
+      }
+    }
+  }
+
+  // Pattern 2: db.collections.Assignments(...) — 3+ segments: [db, collections, Assignments]
+  if (chain.length >= 3 && chain[1] === "collections" && callNode) {
+    const collectionVarName = chain[2]!
+    const collection = collections.find((c) => c.variableName === collectionVarName)
+    if (collection) {
+      const args =
+        callNode.arguments.length > 0 ? extractCallArgs(ts, callNode.arguments[0]!) : undefined
+      return {
+        type: "collection-accessor",
+        collection,
+        collectionName: collection.collectionName,
+        arguments: args,
+      }
+    }
+  }
+
+  // Pattern 3: BoundQuery terminals — .collect(), .fetch(), .paginate(), .count() on a chain
+  if (callNode && chain.length >= 1) {
+    const terminalName = chain[chain.length - 1]
+    if (
+      terminalName === "collect" ||
+      terminalName === "fetch" ||
+      terminalName === "paginate" ||
+      terminalName === "count"
+    ) {
+      // Walk up to find if this is chained on an entity accessor or collection accessor
+      const parentOp = tryDetectV2ChainRoot(ts, accessNode.expression, entities, collections)
+      if (parentOp) {
+        return {
+          ...parentOp,
+          type: "bound-query-terminal",
+          terminalName,
+        }
+      }
+    }
+  }
+
+  // Pattern 4: db.tables.TableName — 3 segments: [db, tables, TableName]
+  if (chain.length >= 3 && chain[1] === "tables") {
+    const tableName = chain[2]!
+    return { type: "table-accessor", tableName }
+  }
+
+  return undefined
+}
+
+/**
+ * Build a property access chain from a PropertyAccessExpression.
+ * e.g., `db.entities.Tasks.byProject` → ["db", "entities", "Tasks", "byProject"]
+ */
+function buildPropertyAccessChain(
+  ts: typeof import("typescript"),
+  node: ts.Expression,
+): ReadonlyArray<string> {
+  const parts: string[] = []
+  let current: ts.Expression = node
+  while (ts.isPropertyAccessExpression(current)) {
+    parts.unshift(current.name.text)
+    current = current.expression
+  }
+  if (ts.isIdentifier(current)) {
+    parts.unshift(current.text)
+  }
+  return parts
+}
+
+/**
+ * Try to find the root of a BoundQuery chain (entity accessor or collection accessor).
+ */
+function tryDetectV2ChainRoot(
+  ts: typeof import("typescript"),
+  expr: ts.Expression,
+  entities: ReadonlyArray<ResolvedEntity>,
+  collections: ReadonlyArray<ResolvedCollection>,
+): DetectedOperation | undefined {
+  // If it's a call expression, recurse into it
+  if (ts.isCallExpression(expr)) {
+    const callee = expr.expression
+    if (ts.isPropertyAccessExpression(callee)) {
+      const chain = buildPropertyAccessChain(ts, callee)
+
+      // db.entities.Tasks.byProject(...)
+      if (chain.length >= 4 && chain[1] === "entities") {
+        const entityName = chain[2]!
+        const accessorName = chain[3]!
+        const entity = findEntity(entityName, entities)
+        if (entity) {
+          const collection = collections.find((c) => c.collectionName === accessorName)
+          if (collection) {
+            const args =
+              expr.arguments.length > 0 ? extractCallArgs(ts, expr.arguments[0]!) : undefined
+            return {
+              entity,
+              type: "entity-query-accessor",
+              collection,
+              collectionName: accessorName,
+              arguments: args,
+            }
+          }
+          if (accessorName === "scan") {
+            return { entity, type: "scan" }
+          }
+        }
+      }
+
+      // db.collections.Assignments(...)
+      if (chain.length >= 3 && chain[1] === "collections") {
+        const collectionVarName = chain[2]!
+        const collection = collections.find((c) => c.variableName === collectionVarName)
+        if (collection) {
+          const args =
+            expr.arguments.length > 0 ? extractCallArgs(ts, expr.arguments[0]!) : undefined
+          return {
+            type: "collection-accessor",
+            collection,
+            collectionName: collection.collectionName,
+            arguments: args,
+          }
+        }
+      }
+
+      // Intermediate chain: .limit(10).collect() → try the chain's own parent
+      const methodName = chain[chain.length - 1]
+      if (
+        methodName === "limit" ||
+        methodName === "reverse" ||
+        methodName === "filter" ||
+        methodName === "where" ||
+        methodName === "select" ||
+        methodName === "maxPages" ||
+        methodName === "startFrom" ||
+        methodName === "consistentRead" ||
+        methodName === "ignoreOwnership"
+      ) {
+        return tryDetectV2ChainRoot(ts, callee.expression, entities, collections)
+      }
+    }
+  }
+
+  // If it's a property access on a call (chaining through a combinator result)
+  if (ts.isPropertyAccessExpression(expr)) {
+    return tryDetectV2ChainRoot(ts, expr.expression, entities, collections)
+  }
+
+  return undefined
 }
 
 function tryDetectFromNode(
@@ -124,10 +359,7 @@ function tryDetectDirectCall(
         }
 
         // collect/paginate: db.Entity.collect(Entity.query.index(pk), ...)
-        if (
-          (methodName === "collect" || methodName === "paginate") &&
-          call.arguments.length > 0
-        ) {
+        if ((methodName === "collect" || methodName === "paginate") && call.arguments.length > 0) {
           const queryArg = call.arguments[0]!
           if (ts.isCallExpression(queryArg)) {
             return tryDetectDirectCall(ts, queryArg, entities)

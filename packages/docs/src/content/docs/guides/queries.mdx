@@ -1,190 +1,100 @@
 ---
 title: "Queries"
-description: "Pipeable Query API — construct, filter, paginate, and collect queries"
+description: "Query API — construct, filter, paginate, and collect queries"
 ---
 
-This guide covers the pipeable Query API: how to construct queries, apply sort key conditions, filter results, paginate, and collect.
+This guide covers the Query API: how to construct queries, apply sort key conditions, filter results, paginate, and collect.
 
-## Query\<A\> — A Composable Data Type
+## BoundQuery — A Fluent Chain
 
-Queries in effect-dynamodb are **data types**, not builders. A `Query<A>` is a pure description of what to fetch — no DynamoDB calls happen until you execute it. This follows Effect TS idioms: queries are testable, inspectable, and composable via `pipe`.
+Queries in effect-dynamodb are **fluent chains** with pre-resolved services. A collection query or entity scan returns a `BoundQuery` that you chain combinators onto, then terminate with `.collect()`, `.fetch()`, or `.paginate()`.
 
 ```typescript
-import { Query, DynamoClient } from "effect-dynamodb"
+import { Collections, DynamoClient } from "effect-dynamodb"
 
-const { TaskEntity: tasks } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { TaskEntity },
+  collections: { ByProject },
+})
 
-// Construct a query (no execution yet)
-const query = TaskEntity.query.byProject({ projectId: "proj-alpha" })
-
-// Compose with combinators
-const composed = query.pipe(
-  Query.where({ beginsWith: activePrefix }),
-  Query.limit(25),
-  Query.reverse,
-)
-
-// Execute via bound entity (crosses into Effect)
-const results = yield* tasks.collect(composed)
+// Construct and execute a query in one chain
+const { Tasks: results } = yield* db.collections
+  .ByProject({ projectId: "proj-alpha" })
+  .filter({ status: "active" })
+  .limit(25)
+  .reverse()
+  .collect()
 ```
 
 ## Entity Queries
 
-Query accessors live on the **entity definition** (`TaskEntity`), not the bound entity. The accessor argument type is derived from the index's `pk.composite`. The bound entity (`tasks`) provides `get`, `collect`, and `paginate` for execution.
+Query accessors live on `db.collections` (for GSI queries) and `db.entities` (for primary key lookups and scans). Collection queries return grouped results; entity operations return single items.
 
 ```typescript region="entity-queries" example="guide-queries.ts"
 // Primary key lookup (not a query — returns single item)
 const task = yield* tasks.get({ taskId: "t-001" })
 
-// Named index queries (return Query<A>) — on the entity definition
-const projectTasks = yield* tasks.collect(TaskEntity.query.byProject({ projectId: "proj-alpha" }))
-const assigneeTasks = yield* tasks.collect(
-  TaskEntity.query.byAssignee({ assigneeId: "emp-alice" }),
-)
+// Named collection queries — on the db.collections gateway
+const { Tasks: projectTasks } = yield* db.collections
+  .ByProject({ projectId: "proj-alpha" })
+  .collect()
+const { Tasks: assigneeTasks } = yield* db.collections
+  .ByAssignee({ assigneeId: "emp-alice" })
+  .collect()
 ```
 
 ### Generated Accessor Mapping
 
-| Index Definition | Accessor | Argument Type |
-|------------------|----------|---------------|
-| `primary: { pk: { composite: ["taskId"] }, ... }` | `tasks.get(...)` | `{ taskId: string }` |
-| `byProject: { pk: { composite: ["projectId"] }, ... }` | `TaskEntity.query.byProject(...)` | `{ projectId: string }` |
-| `byAssignee: { pk: { composite: ["assigneeId"] }, ... }` | `TaskEntity.query.byAssignee(...)` | `{ assigneeId: string }` |
-
-## Sort Key Conditions with `Query.where`
-
-`Query.where` maps to DynamoDB's `KeyConditionExpression` on the **composed sort key string**. It efficiently narrows results at the storage layer (reduces items read from the index).
-
-The condition operates on the full composed sort key value — not on individual composite field names. Use `KeyComposer.composeSortKeyPrefix` to build prefixes from composite attributes.
-
-**beginsWith** — match tasks whose composed sort key starts with a prefix:
-
-```typescript region="begins-with" example="guide-queries.ts"
-// beginsWith — match tasks with "active" status prefix in the sort key
-const activePrefix = KeyComposer.composeSortKeyPrefix(
-  AppSchema,
-  "Task",
-  1,
-  TaskEntity.indexes.byProject,
-  { status: "active" },
-)
-const activeTasks = yield* tasks.collect(
-  TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-  Query.where({ beginsWith: activePrefix }),
-)
-```
-
-**between** — inclusive range on the composed sort key:
-
-```typescript region="between" example="guide-queries.ts"
-// between — range on the composed sort key
-const startDate = "2025-02-01"
-const endDate = "2025-02-28"
-const lo = KeyComposer.composeSortKeyPrefix(AppSchema, "Task", 1, TaskEntity.indexes.byProject, {
-  status: "active",
-  createdAt: startDate,
-})
-const hi = KeyComposer.composeSortKeyPrefix(AppSchema, "Task", 1, TaskEntity.indexes.byProject, {
-  status: "active",
-  createdAt: endDate,
-})
-const activeInRange = yield* tasks.collect(
-  TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-  Query.where({ between: [lo, hi] }),
-)
-```
-
-**eq** — exact match on the full sort key value:
-
-```typescript
-yield* tasks.collect(
-  TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-  Query.where({ eq: exactSortKeyValue }),
-)
-```
-
-### SortKeyCondition Type
-
-```typescript
-type SortKeyCondition =
-  | { eq: string }              // exact equality
-  | { lt: string }              // <
-  | { lte: string }             // <=
-  | { gt: string }              // >
-  | { gte: string }             // >=
-  | { between: [string, string] }  // inclusive range
-  | { beginsWith: string }     // prefix match
-```
-
-All values are **composed sort key strings** — use `KeyComposer.composeSortKeyPrefix` to build them from composite attributes.
+| Definition | Accessor | Argument Type |
+|-----------|----------|---------------|
+| `primaryKey: { pk: { composite: ["taskId"] }, ... }` | `tasks.get(...)` | `{ taskId: string }` |
+| `Collections.make("ByProject", { pk: { composite: ["projectId"] }, ... })` | `db.collections.ByProject(...)` | `{ projectId: string }` |
+| `Collections.make("ByAssignee", { pk: { composite: ["assigneeId"] }, ... })` | `db.collections.ByAssignee(...)` | `{ assigneeId: string }` |
 
 ## Post-Query Filtering
 
-`FilterExpression` is applied after items are read from the index — it does **not** reduce read capacity, only network transfer. Use it for conditions on non-key attributes.
+`.filter()` applies a `FilterExpression` after items are read from the index -- it does **not** reduce read capacity, only network transfer. Use it for conditions on non-key attributes.
 
 ```typescript region="filter-callback" example="guide-queries.ts"
-// Callback — type-safe, supports nested paths, OR/NOT, all operators
-const highPriActive = yield* tasks.collect(
-  TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-  TaskEntity.filter((t, { and, eq }) => and(eq(t.status, "active"), eq(t.priority, "high"))),
-)
+// Shorthand — AND-equality on multiple fields
+const { Tasks: highPriActive } = yield* db.collections
+  .ByProject({ projectId: "proj-alpha" })
+  .filter({ status: "active", priority: "high" })
+  .collect()
 ```
 
 ```typescript region="filter-shorthand" example="guide-queries.ts"
 // Shorthand — simple AND-equality
-const activeShorthand = yield* tasks.collect(
-  TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-  TaskEntity.filter({ status: "active" }),
-)
+const { Tasks: activeShorthand } = yield* db.collections
+  .ByProject({ projectId: "proj-alpha" })
+  .filter({ status: "active" })
+  .collect()
 ```
 
-**When to use `where` vs `filter`:**
+**When to use SK composites vs `filter`:**
 
-| Combinator | DynamoDB Mapping | Reduces Read Capacity? | Use For |
-|------------|------------------|----------------------|---------|
-| `Query.where` | `KeyConditionExpression` | Yes | Composed sort key string (prefix, range, exact) |
-| `Entity.filter()` | `FilterExpression` | No | Any attribute (post-read) |
+| Approach | DynamoDB Mapping | Reduces Read Capacity? | Use For |
+|----------|------------------|----------------------|---------|
+| SK composites in accessor | `KeyConditionExpression` | Yes | Narrowing by sort key prefix |
+| `.filter()` | `FilterExpression` | No | Any attribute (post-read) |
 
 See the [Expressions Guide](/effect-dynamodb/guides/expressions/) for the complete operator reference and DynamoDB mapping tables.
 
 ## Collection Queries
 
-Collection queries return all member entity types, grouped by entity name.
+Collection queries return all member entity types, grouped by member name.
 
 ```typescript
-import { Collection } from "effect-dynamodb"
-
-const TenantMembers = Collection.make("TenantMembers", {
-  employees: EmployeeEntity,
-  tasks: TaskEntity,
+const db = yield* DynamoClient.make({
+  entities: { EmployeeEntity, TaskEntity },
+  collections: { TenantMembers },
 })
 
 // All entities in the collection
-const all = yield* TenantMembers.query({ tenantId: "t-acme" }).pipe(
-  Query.execute,
-)
-// { employees: Employee[], tasks: Task[] }
-```
-
-### Entity Selectors
-
-Narrow a collection query to a single entity type using typed selectors:
-
-```typescript
-// Only employees
-const employees = yield* TenantMembers.query({ tenantId: "t-acme" }).pipe(
-  TenantMembers.employees,
-  Query.execute,
-)
-// Employee[]
-
-// Only employees hired recently
-const recent = yield* TenantMembers.query({ tenantId: "t-acme" }).pipe(
-  TenantMembers.employees,
-  Query.where({ beginsWith: hireDatePrefix }),
-  Query.execute,
-)
-// Employee[]
+const { employees, tasks } = yield* db.collections
+  .TenantMembers({ tenantId: "t-acme" })
+  .collect()
+// employees: Employee[], tasks: Task[]
 ```
 
 ### Sub-Collection Queries
@@ -193,110 +103,96 @@ Query at different depths of the collection hierarchy:
 
 ```typescript
 // All contributions (Employee + Task + ProjectMember)
-yield* Contributions.query({ employeeId: "emp-alice" }).pipe(Query.execute)
+const all = yield* db.collections
+  .Contributions({ employeeId: "emp-alice" })
+  .collect()
 // { employees: Employee[], tasks: Task[], projectMembers: ProjectMember[] }
 
 // Only assignments (Task + ProjectMember) — sub-collection
-yield* Assignments.query({ employeeId: "emp-alice" }).pipe(Query.execute)
+const assignments = yield* db.collections
+  .Assignments({ employeeId: "emp-alice" })
+  .collect()
 // { tasks: Task[], projectMembers: ProjectMember[] }
-
-// Tasks from assignments, filtered by project
-yield* Assignments.query({ employeeId: "emp-alice" }).pipe(
-  Assignments.tasks,
-  TaskEntity.filter({ projectId: "proj-alpha" }),
-  Query.execute,
-)
-// Task[]
 ```
 
 ## Pagination
 
 ### Collect All Items
 
-`collect` fetches all pages and flattens into a single array:
+`.collect()` fetches all pages and flattens into a single array (or grouped result for collections):
 
 ```typescript region="collect-all" example="guide-queries.ts"
 // Collect all items across all pages
-const allProjectTasks = yield* tasks.collect(
-  TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-)
+const { Tasks: allProjectTasks } = yield* db.collections
+  .ByProject({ projectId: "proj-alpha" })
+  .collect()
 ```
 
 ### Single Page
 
-`Query.execute` as a pipe terminal returns a `Page<A>` containing matching items (up to the `limit`) and an optional cursor for pagination:
+`.fetch()` returns a page containing matching items (up to the `limit`) and an optional cursor for pagination:
 
 ```typescript region="single-page" example="guide-queries.ts"
-// Single page with limit — returns Page<A> with items and cursor
-const page = yield* TaskEntity.query
-  .byProject({ projectId: "proj-alpha" })
-  .pipe(Query.limit(3), Query.execute)
-// page.items: Task[] (up to 3 items)
-// page.cursor: string | null (pass to Query.startFrom for next page)
+// Single page with limit — returns page with items and cursor
+const page = yield* db.collections.ByProject({ projectId: "proj-alpha" }).limit(3).fetch()
+// page.items: { Tasks: Task[] } (up to 3 items)
+// page.cursor: string | null (pass to startFrom for next page)
 ```
 
 ### Cursor-Based Pagination
 
-Use `Query.startFrom` to resume from a previous page's cursor:
+Use `.startFrom()` to resume from a previous page's cursor:
 
 ```typescript region="cursor-pagination" example="guide-queries.ts"
 // Cursor-based pagination
-const page1 = yield* TaskEntity.query
-  .byProject({ projectId: "proj-alpha" })
-  .pipe(Query.limit(3), Query.execute)
+const page1 = yield* db.collections.ByProject({ projectId: "proj-alpha" }).limit(3).fetch()
 
 if (page1.cursor) {
-  const page2 = yield* TaskEntity.query
-    .byProject({ projectId: "proj-alpha" })
-    .pipe(Query.limit(3), Query.startFrom(page1.cursor), Query.execute)
-  yield* Console.log(
-    `Cursor pagination: page1=${page1.items.length} items, page2=${page2.items.length} items`,
-  )
+  const page2 = yield* db.collections
+    .ByProject({ projectId: "proj-alpha" })
+    .limit(3)
+    .startFrom(page1.cursor)
+    .fetch()
 }
 ```
 
 ### Streaming
 
-`paginate` returns a `Stream<A>`, automatically handling DynamoDB pagination:
+`.paginate()` returns a `Stream<A>`, automatically handling DynamoDB pagination:
 
 ```typescript region="streaming" example="guide-queries.ts"
 // Streaming — automatic pagination via Stream
-const stream = tasks.paginate(TaskEntity.query.byProject({ projectId: "proj-alpha" }))
-
+const stream = tasks.scan().paginate()
 const allFromStream = yield* Stream.runCollect(stream)
-yield* Console.log(`Stream collect: ${allFromStream.length} tasks\n`)
 ```
 
 ## Scan
 
-The entity definition's `scan()` method reads the entire table (or index) and returns items matching the entity type. It returns a `Query<Entity.Record>`, so all Query combinators and terminals work with scans.
+Entity scans read the entire table and return items matching the entity type. `db.entities.Entity.scan()` returns a `BoundQuery`, so all combinators and terminals work with scans.
 
 ```typescript region="scan-basic" example="guide-queries.ts"
 // Basic scan — all items of this entity type
-const allTasks = yield* tasks.collect(TaskEntity.scan())
+const allTasks = yield* tasks.scan().collect()
 ```
 
 ```typescript region="scan-filter" example="guide-queries.ts"
 // Scan with filter
-const activeScan = yield* tasks.collect(
-  TaskEntity.scan(),
-  TaskEntity.filter({ status: "active" }),
-)
+const activeScan = yield* tasks.scan().filter({ status: "active" }).collect()
 ```
 
 ```typescript region="scan-limit" example="guide-queries.ts"
 // Scan with limit
-const firstPage = yield* tasks.collect(TaskEntity.scan(), Query.limit(3))
+const firstPage = yield* tasks.scan().limit(3).collect()
 ```
 
 ```typescript region="scan-consistent" example="guide-queries.ts"
 // Scan with consistent read
-const consistent = yield* tasks.collect(TaskEntity.scan(), Query.consistentRead)
+const consistent = yield* tasks.scan().consistentRead().collect()
 ```
 
 ```typescript region="scan-stream" example="guide-queries.ts"
 // Stream-based scan
-const scanStream = tasks.paginate(TaskEntity.scan())
+const scanStream = tasks.scan().paginate()
 yield* Stream.runForEach(scanStream, (t) => Console.log(`  Scanned: ${t.taskId} — "${t.title}"`))
 ```
 
@@ -309,7 +205,7 @@ yield* Stream.runForEach(scanStream, (t) => Console.log(`  Scanned: ${t.taskId} 
 | Cost | Low (proportional to results) | High (proportional to table size) |
 | Use cases | Normal application queries | Admin tools, migrations, data exports, analytics |
 
-Scan automatically filters by `__edd_e__` — even in a single-table design, `ProductEntity.scan()` only returns Product items.
+Scan automatically filters by `__edd_e__` -- even in a single-table design, `Products.scan()` only returns Product items.
 
 ## Consistent Reads
 
@@ -321,71 +217,68 @@ const consistentTask = yield* TaskEntity.get({ taskId: "t-001" }).pipe(Entity.co
 ```
 
 ```typescript region="consistent-query" example="guide-queries.ts"
-// Consistent read on query
-const consistentQuery = yield* tasks.collect(
-  TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-  Query.consistentRead,
-)
+// Consistent read on scan (applies to any BoundQuery)
+const consistentQuery = yield* tasks.scan().consistentRead().collect()
 ```
 
 ```typescript region="consistent-scan" example="guide-queries.ts"
 // Consistent read on scan
-const consistentScan = yield* tasks.collect(TaskEntity.scan(), Query.consistentRead)
+const consistentScan = yield* tasks.scan().consistentRead().collect()
 ```
 
 Consistent reads cost 2x the read capacity of eventually-consistent reads. Use them when you need read-after-write consistency (e.g., immediately after a put or update).
 
 ## Ordering
 
-By default, results are in ascending sort key order. Use `Query.reverse` for descending:
+By default, results are in ascending sort key order. Use `.reverse()` for descending:
 
 ```typescript region="reverse" example="guide-queries.ts"
 // Most recent tasks first (descending sort key order)
-const recent = yield* tasks.collect(
-  TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-  Query.reverse,
-  Query.limit(3),
-)
+const { Tasks: recent } = yield* db.collections
+  .ByProject({ projectId: "proj-alpha" })
+  .reverse()
+  .limit(3)
+  .collect()
 ```
 
 ## Complete Example
 
 ```typescript
 import { Effect, Layer, Stream } from "effect"
-import { Collection, Query, DynamoClient } from "effect-dynamodb"
+import { Collections, DynamoClient } from "effect-dynamodb"
 
 const program = Effect.gen(function* () {
-  const { TaskEntity: tasks } = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { TaskEntity },
+    collections: { ByProject, ByAssignee, TenantMembers },
+  })
 
-  // --- Single entity query with sort key condition ---
-  const activeTasks = yield* tasks.collect(
-    TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-    Query.where({ beginsWith: activePrefix }),
-    Query.limit(50),
-  )
+  // --- Single entity scan with filter ---
+  const activeTasks = yield* db.entities.TaskEntity.scan()
+    .filter({ status: "active" })
+    .limit(50)
+    .collect()
 
-  // --- Single entity query, reversed, with filter ---
-  const recentHighPriority = yield* tasks.collect(
-    TaskEntity.query.byAssignee({ assigneeId: "emp-alice" }),
-    TaskEntity.filter({ priority: "high", title: { contains: "API" } }),
-    Query.reverse,
-    Query.limit(10),
-  )
+  // --- Collection query, reversed, with filter ---
+  const { Tasks: recentHighPriority } = yield* db.collections
+    .ByAssignee({ assigneeId: "emp-alice" })
+    .filter({ priority: "high" })
+    .reverse()
+    .limit(10)
+    .collect()
 
   // --- Collection query: all tenant members ---
-  const allMembers = yield* TenantMembers.query({ tenantId: "t-acme" }).pipe(
-    Query.execute,
-  )
-  // { employees: Employee[], tasks: Task[] }
+  const { employees, tasks } = yield* db.collections
+    .TenantMembers({ tenantId: "t-acme" })
+    .collect()
+  // employees: Employee[], tasks: Task[]
 
-  // --- Collection query: narrow to employees, stream ---
-  const employeeStream = yield* TenantMembers.query({ tenantId: "t-acme" }).pipe(
-    TenantMembers.employees,
-    EmployeeEntity.filter({ department: "Engineering" }),
-    Query.paginate,
-  )
-  yield* Stream.runForEach(employeeStream, (emp) =>
-    Effect.log(`Employee: ${emp.displayName}`)
+  // --- Scan with streaming ---
+  const scanStream = db.entities.TaskEntity.scan()
+    .filter({ status: "active" })
+    .paginate()
+  yield* Stream.runForEach(scanStream, (t) =>
+    Effect.log(`Task: ${t.title}`)
   )
 })
 
@@ -401,8 +294,8 @@ const main = program.pipe(
 
 ## What's Next?
 
-- [Expressions](/effect-dynamodb/guides/expressions/) — Complete reference for condition, filter, update, and projection expressions with DynamoDB mapping tables
-- [Data Integrity](/effect-dynamodb/guides/data-integrity/) — Unique constraints, versioning, and optimistic concurrency
-- [Lifecycle](/effect-dynamodb/guides/lifecycle/) — Soft delete, restore, purge, and version retention
-- [Advanced](/effect-dynamodb/guides/advanced/) — Rich updates, batch operations, conditional writes
-- [DynamoDB Streams](/effect-dynamodb/guides/streams/) — Decode stream records into typed domain objects
+- [Expressions](/effect-dynamodb/guides/expressions/) -- Complete reference for condition, filter, update, and projection expressions with DynamoDB mapping tables
+- [Data Integrity](/effect-dynamodb/guides/data-integrity/) -- Unique constraints, versioning, and optimistic concurrency
+- [Lifecycle](/effect-dynamodb/guides/lifecycle/) -- Soft delete, restore, purge, and version retention
+- [Advanced](/effect-dynamodb/guides/advanced/) -- Rich updates, batch operations, conditional writes
+- [DynamoDB Streams](/effect-dynamodb/guides/streams/) -- Decode stream records into typed domain objects

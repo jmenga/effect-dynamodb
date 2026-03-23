@@ -57,11 +57,9 @@ const AppSchema = DynamoSchema.make({ name: "updates-demo", version: 1 })
 const Products = Entity.make({
   model: ProductModel,
   entityType: "Product",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["productId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["productId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: true,
@@ -75,17 +73,17 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Products } })
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({ entities: { Products } })
 
   // --- Setup ---
   yield* Console.log("=== Setup ===\n")
 
-  yield* db.createTable()
+  yield* db.tables["updates-demo-table"]!.create()
   yield* Console.log("Table created\n")
 
   // Create initial product
   // #region setup
-  const product = yield* db.Products.put({
+  const product = yield* db.entities.Products.put({
     productId: "p-1",
     name: "Wireless Mouse",
     description: "Ergonomic wireless mouse",
@@ -106,10 +104,13 @@ const program = Effect.gen(function* () {
   // ADD atomically increments a number. If the attribute doesn't exist,
   // it's initialized to the provided value. Thread-safe — no read-modify-write.
   // #region add
-  const afterAdd = yield* db.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1 }))
+  const afterAdd = yield* db.entities.Products.update(
+    { productId: "p-1" },
+    Entity.add({ viewCount: 1 }),
+  )
 
   // Multiple adds compose
-  const afterMultiAdd = yield* db.Products.update(
+  const afterMultiAdd = yield* db.entities.Products.update(
     { productId: "p-1" },
     Entity.add({ viewCount: 5, stock: 50 }),
   )
@@ -125,7 +126,10 @@ const program = Effect.gen(function* () {
   // Subtract synthesizes SET #field = #field - :val
   // (DynamoDB has no native SUBTRACT — this is a convenience wrapper)
   // #region subtract
-  const afterSub = yield* db.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
+  const afterSub = yield* db.entities.Products.update(
+    { productId: "p-1" },
+    Entity.subtract({ stock: 3 }),
+  )
   // #endregion
   yield* Console.log(
     `After subtract(stock: 3): stock = ${afterSub.stock} (was ${afterMultiAdd.stock})\n`,
@@ -137,7 +141,7 @@ const program = Effect.gen(function* () {
   // Append uses list_append to add elements to the end of a list.
   // The value must be an array.
   // #region append
-  const afterAppend = yield* db.Products.update(
+  const afterAppend = yield* db.entities.Products.update(
     { productId: "p-1" },
     Entity.append({ tags: ["on-sale", "featured"] }),
   )
@@ -151,7 +155,7 @@ const program = Effect.gen(function* () {
   // REMOVE deletes attributes entirely from the item.
   // The attribute no longer exists after removal (undefined, not null).
   // #region remove
-  const afterRemove = yield* db.Products.update(
+  const afterRemove = yield* db.entities.Products.update(
     { productId: "p-1" },
     Entity.remove(["description"]),
   )
@@ -177,7 +181,7 @@ const program = Effect.gen(function* () {
   // All update combinators compose in a single pipe.
   // They are merged into one UpdateItem call to DynamoDB.
   // #region composed
-  const composed = yield* db.Products.update(
+  const composed = yield* db.entities.Products.update(
     { productId: "p-1" },
     Products.set({ name: "Premium Wireless Mouse", price: 39.99 }),
     Entity.add({ viewCount: 10 }),
@@ -198,14 +202,14 @@ const program = Effect.gen(function* () {
   // Use expectedVersion to guard against concurrent writes.
   // After the previous mutations (put + 4 updates), the version is 6.
   // #region locking
-  const locked = yield* db.Products.update(
+  const locked = yield* db.entities.Products.update(
     { productId: "p-1" },
     Entity.add({ viewCount: 1 }),
     Products.expectedVersion(6),
   )
 
   // Wrong version → OptimisticLockError
-  const lockFail = yield* db.Products.update(
+  const lockFail = yield* db.entities.Products.update(
     { productId: "p-1" },
     Entity.add({ viewCount: 1 }),
     Products.expectedVersion(1),
@@ -221,7 +225,7 @@ const program = Effect.gen(function* () {
 
   // --- Cleanup ---
   yield* Console.log("=== Cleanup ===\n")
-  yield* db.deleteTable()
+  yield* db.tables["updates-demo-table"]!.delete()
   yield* Console.log("Table deleted.")
 })
 

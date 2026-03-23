@@ -30,7 +30,7 @@ class Employee extends Schema.Class<Employee>("Employee")({
 
 ---
 
-## Step 2: Schema, Table, and Entity
+## Step 2: Schema, Entity, Table, and Collections
 
 ```typescript title="entities.ts" region="schema-entity-table" example="projections.ts"
 const AppSchema = DynamoSchema.make({ name: "proj-demo", version: 1 })
@@ -38,21 +38,23 @@ const AppSchema = DynamoSchema.make({ name: "proj-demo", version: 1 })
 const Employees = Entity.make({
   model: Employee,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byDepartment: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["department"] },
-      sk: { field: "gsi1sk", composite: ["employeeId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Employees } })
+
+const EmployeesByDepartment = Collections.make("employeesByDepartment", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["department"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Employees: Collections.member(Employees, { sk: { composite: ["employeeId"] } }),
+  },
+})
 ```
 
 ---
@@ -60,14 +62,17 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Employees } })
 ## Step 3: Seed Data
 
 ```typescript title="seed.ts" region="seed-data" example="projections.ts"
-const db = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { Employees },
+  collections: { EmployeesByDepartment },
+})
 
 const client = yield* DynamoClient
 const tableConfig = yield* MainTable.Tag
 
-yield* db.createTable()
+yield* db.tables["proj-demo-table"]!.create()
 
-yield* db.Employees.put({
+yield* db.entities.Employees.put({
   employeeId: "e-1",
   name: "Alice",
   email: "alice@company.com",
@@ -75,7 +80,7 @@ yield* db.Employees.put({
   salary: 120000,
   title: "Senior Engineer",
 })
-yield* db.Employees.put({
+yield* db.entities.Employees.put({
   employeeId: "e-2",
   name: "Bob",
   email: "bob@company.com",
@@ -83,7 +88,7 @@ yield* db.Employees.put({
   salary: 95000,
   title: "Engineer",
 })
-yield* db.Employees.put({
+yield* db.entities.Employees.put({
   employeeId: "e-3",
   name: "Charlie",
   email: "charlie@company.com",

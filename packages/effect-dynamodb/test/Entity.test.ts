@@ -181,7 +181,7 @@ describe("Entity", () => {
             },
           } as any,
         }),
-      ).toThrow('primary index must have at least one composite attribute across pk and sk')
+      ).toThrow("primary index must have at least one composite attribute across pk and sk")
     })
 
     it("allows primary index with empty pk composite if sk has composites", () => {

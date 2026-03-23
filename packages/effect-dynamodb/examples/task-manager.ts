@@ -27,11 +27,10 @@
  */
 
 import { Console, Effect, Layer, Schema } from "effect"
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import * as KeyComposer from "../src/KeyComposer.js"
-import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 
@@ -91,91 +90,39 @@ const TmSchema = DynamoSchema.make({ name: "taskman", version: 1 })
 // #endregion
 
 // =============================================================================
-// 3. Entity definitions — pure, no table reference
-//
-// Key difference vs HR: Employee has `teams` (gsi2) and Task has `statuses`
-// (gsi4), plus Task includes `status` and `points` fields.
+// 3. Entity definitions — primary key only
 // =============================================================================
 
 /**
- * Employee — 6 indexes (primary + 5 GSIs)
+ * Employee — primary key only
  *
- * Full ElectroDB Task Manager index set including:
- * - gsi2 `teams`: pk=[team], sk=[dateHired, title] — NOT in HR example
+ * GSI access patterns are defined via Collections below.
  */
 // #region employee-entity
 const Employees = Entity.make({
   model: Employee,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employee"] },
-      sk: { field: "sk", composite: [] },
-    },
-    coworkers: {
-      index: "gsi1",
-      collection: "workplaces",
-      pk: { field: "gsi1pk", composite: ["office"] },
-      sk: { field: "gsi1sk", composite: ["team", "title", "employee"] },
-    },
-    teams: {
-      index: "gsi2",
-      pk: { field: "gsi2pk", composite: ["team"] },
-      sk: { field: "gsi2sk", composite: ["dateHired", "title"] },
-    },
-    employeeLookup: {
-      index: "gsi3",
-      collection: "assignments",
-      pk: { field: "gsi3pk", composite: ["employee"] },
-      sk: { field: "gsi3sk", composite: [] },
-    },
-    roles: {
-      index: "gsi4",
-      pk: { field: "gsi4pk", composite: ["title"] },
-      sk: { field: "gsi4sk", composite: ["salary"] },
-    },
-    directReports: {
-      index: "gsi5",
-      pk: { field: "gsi5pk", composite: ["manager"] },
-      sk: { field: "gsi5sk", composite: ["team", "office"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employee"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 // #endregion
 
 /**
- * Task — 4 indexes (primary + 3 GSIs)
+ * Task — primary key only
  *
- * Full ElectroDB Task Manager index set including:
- * - gsi4 `statuses`: pk=[status], sk=[project, employee] — NOT in HR example
- * - `points` field (Schema.Number) for point-based filtering
+ * GSI access patterns are defined via Collections below.
+ * Uses `versioned` and `softDelete` for lifecycle management.
  */
 // #region task-entity
 const Tasks = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["task"] },
-      sk: { field: "sk", composite: ["project", "employee"] },
-    },
-    project: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["project"] },
-      sk: { field: "gsi1sk", composite: ["employee", "status"] },
-    },
-    assigned: {
-      index: "gsi3",
-      collection: "assignments",
-      pk: { field: "gsi3pk", composite: ["employee"] },
-      sk: { field: "gsi3sk", composite: ["project", "status"] },
-    },
-    statuses: {
-      index: "gsi4",
-      pk: { field: "gsi4pk", composite: ["status"] },
-      sk: { field: "gsi4sk", composite: ["project", "employee"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["task"] },
+    sk: { field: "sk", composite: ["project", "employee"] },
   },
   timestamps: true,
   versioned: true,
@@ -184,36 +131,114 @@ const Tasks = Entity.make({
 // #endregion
 
 /**
- * Office — 2 indexes (primary + 1 GSI)
+ * Office — primary key only
  *
- * gsi1 is shared with Employee via the "workplaces" collection.
+ * GSI1 shared with Employee via the "workplaces" collection.
  */
 // #region office-entity
 const Offices = Entity.make({
   model: Office,
   entityType: "Office",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["office"] },
-      sk: { field: "sk", composite: [] },
-    },
-    workplace: {
-      index: "gsi1",
-      collection: "workplaces",
-      pk: { field: "gsi1pk", composite: ["office"] },
-      sk: { field: "gsi1sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["office"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 // #endregion
 
 // =============================================================================
-// 4. Table definition — declares all members
+// 4. Table + Collections — GSI access patterns
 // =============================================================================
 
 // #region table
 const TmTable = Table.make({ schema: TmSchema, entities: { Employees, Tasks, Offices } })
+// #endregion
+
+// #region collections
+const Workplaces = Collections.make("workplaces", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["office"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Employees: Collections.member(Employees, {
+      sk: { composite: ["team", "title", "employee"] },
+    }),
+    Offices: Collections.member(Offices, { sk: { composite: [] } }),
+  },
+})
+
+const TasksByProject = Collections.make("tasksByProject", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["project"] },
+  sk: { field: "gsi1sk" },
+  type: "isolated",
+  members: {
+    Tasks: Collections.member(Tasks, {
+      sk: { composite: ["employee", "status"] },
+    }),
+  },
+})
+
+const Teams = Collections.make("teams", {
+  index: "gsi2",
+  pk: { field: "gsi2pk", composite: ["team"] },
+  sk: { field: "gsi2sk" },
+  type: "isolated",
+  members: {
+    Employees: Collections.member(Employees, {
+      sk: { composite: ["dateHired", "title"] },
+    }),
+  },
+})
+
+const Assignments = Collections.make("assignments", {
+  index: "gsi3",
+  pk: { field: "gsi3pk", composite: ["employee"] },
+  sk: { field: "gsi3sk" },
+  members: {
+    Employees: Collections.member(Employees, { sk: { composite: [] } }),
+    Tasks: Collections.member(Tasks, {
+      sk: { composite: ["project", "status"] },
+    }),
+  },
+})
+
+const Roles = Collections.make("roles", {
+  index: "gsi4",
+  pk: { field: "gsi4pk", composite: ["title"] },
+  sk: { field: "gsi4sk" },
+  type: "isolated",
+  members: {
+    Employees: Collections.member(Employees, {
+      sk: { composite: ["salary"] },
+    }),
+  },
+})
+
+const Statuses = Collections.make("statuses", {
+  index: "gsi4",
+  pk: { field: "gsi4pk", composite: ["status"] },
+  sk: { field: "gsi4sk" },
+  type: "isolated",
+  members: {
+    Tasks: Collections.member(Tasks, {
+      sk: { composite: ["project", "employee"] },
+    }),
+  },
+})
+
+const DirectReports = Collections.make("directReports", {
+  index: "gsi5",
+  pk: { field: "gsi5pk", composite: ["manager"] },
+  sk: { field: "gsi5sk" },
+  type: "isolated",
+  members: {
+    Employees: Collections.member(Employees, {
+      sk: { composite: ["team", "office"] },
+    }),
+  },
+})
 // #endregion
 
 // =============================================================================
@@ -358,22 +383,25 @@ const assertEq = <T>(actual: T, expected: T, label: string): void => {
 // =============================================================================
 
 const program = Effect.gen(function* () {
-  // Typed execution gateway — binds all table members
-  const db = yield* DynamoClient.make(TmTable)
+  // Typed execution gateway — binds all entities and collections
+  const db = yield* DynamoClient.make({
+    entities: { Employees, Tasks, Offices },
+    collections: { Workplaces, TasksByProject, Teams, Assignments, Roles, Statuses, DirectReports },
+  })
 
   // --- Setup: create table ---
-  yield* db.createTable()
+  yield* db.tables["taskman-table"]!.create()
 
   // --- Seed data ---
   // #region seed-exec
   for (const office of Object.values(offices)) {
-    yield* db.Offices.put(office)
+    yield* db.entities.Offices.put(office)
   }
   for (const emp of Object.values(employees)) {
-    yield* db.Employees.put(emp)
+    yield* db.entities.Employees.put(emp)
   }
   for (const task of Object.values(tasks)) {
-    yield* db.Tasks.put(task)
+    yield* db.entities.Tasks.put(task)
   }
   // #endregion
 
@@ -383,13 +411,13 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 1: CRUD")
 
   // #region crud
-  const tyler = yield* db.Employees.get({ employee: "tyler" })
+  const tyler = yield* db.entities.Employees.get({ employee: "tyler" })
   assertEq(tyler.firstName, "Tyler", "get firstName")
   assertEq(tyler.lastName, "Walch", "get lastName")
   assertEq(tyler.title, "Senior Engineer", "get title")
   assertEq(tyler.team, "development", "get team")
 
-  const buildApi = yield* db.Tasks.get({
+  const buildApi = yield* db.entities.Tasks.get({
     task: "build-api",
     project: "platform",
     employee: "tyler",
@@ -399,7 +427,7 @@ const program = Effect.gen(function* () {
   assertEq(buildApi.points, 8, "get task points")
 
   // Update employee title — must provide all GSI composites for affected indexes
-  const promoted = yield* db.Employees.update(
+  const promoted = yield* db.entities.Employees.update(
     { employee: "tyler" },
     Entity.set({
       office: "portland",
@@ -414,10 +442,10 @@ const program = Effect.gen(function* () {
   assertEq(promoted.salary, "000140.00", "update salary")
   assertEq(promoted.firstName, "Tyler", "update preserves unchanged fields")
 
-  yield* db.Employees.delete({ employee: "tyler" })
+  yield* db.entities.Employees.delete({ employee: "tyler" })
   // #endregion
   // #region crud-delete-check
-  const deleted = yield* db.Employees.get({ employee: "tyler" }).pipe(
+  const deleted = yield* db.entities.Employees.get({ employee: "tyler" }).pipe(
     Effect.map(() => false),
     Effect.catchTag("ItemNotFound", () => Effect.succeed(true)),
   )
@@ -425,7 +453,7 @@ const program = Effect.gen(function* () {
   assert(deleted, "delete removes item")
 
   // Re-create for subsequent patterns (with original data)
-  yield* db.Employees.put(employees.tyler)
+  yield* db.entities.Employees.put(employees.tyler)
   yield* Console.log("  CRUD: get, update, delete, re-put on Employee + Task — OK")
 
   // -------------------------------------------------------------------------
@@ -436,11 +464,13 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 2: Workplaces (gsi1 collection)")
 
   // #region workplaces
-  const portlandEmployees = yield* db.Employees.collect(
-    Employees.query.coworkers({ office: "portland" }),
-  )
+  const { Employees: portlandEmployees } = yield* db.collections
+    .Workplaces({ office: "portland" })
+    .collect()
 
-  const portlandOffice = yield* db.Offices.collect(Offices.query.workplace({ office: "portland" }))
+  const { Offices: portlandOffice } = yield* db.collections
+    .Workplaces({ office: "portland" })
+    .collect()
   // #endregion
   assertEq(portlandEmployees.length, 2, "portland has 2 employees")
   const portlandIds = portlandEmployees.map((e) => e.employee).sort()
@@ -457,14 +487,14 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 3: Assignments (gsi3 collection)")
 
   // #region assignments
-  const tylerTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "tyler" }))
+  const { Tasks: tylerTasks } = yield* db.collections.Assignments({ employee: "tyler" }).collect()
 
   // Verify points field (numeric) comes through correctly
   const totalTylerPoints = tylerTasks.reduce((sum, t) => sum + t.points, 0)
 
-  const tylerInfo = yield* db.Employees.collect(
-    Employees.query.employeeLookup({ employee: "tyler" }),
-  )
+  const { Employees: tylerInfo } = yield* db.collections
+    .Assignments({ employee: "tyler" })
+    .collect()
   // #endregion
   assertEq(tylerTasks.length, 2, "tyler has 2 tasks")
   const tylerTaskIds = tylerTasks.map((t) => t.task).sort()
@@ -484,39 +514,33 @@ const program = Effect.gen(function* () {
 
   // #region teams
   // All development team members
-  const devTeam = yield* db.Employees.collect(Employees.query.teams({ team: "development" }))
+  const { Employees: devTeam } = yield* db.collections.Teams({ team: "development" }).collect()
 
   // Range query: development team members hired between 2020 and 2023
-  const teamsIndex = Employees.indexes.teams
-  const loHired = KeyComposer.composeSortKeyPrefix(TmSchema, "Employee", 1, teamsIndex, {
-    dateHired: "2020-01-01",
-  })
-  const hiHired = KeyComposer.composeSortKeyPrefix(TmSchema, "Employee", 1, teamsIndex, {
-    dateHired: "2023-12-31",
-  })
-
-  const recentDevHires = yield* db.Employees.collect(
-    Employees.query
-      .teams({ team: "development" })
-      .pipe(Query.where({ between: [loHired, hiHired] })),
+  const { Employees: allDevForRange } = yield* db.collections
+    .Teams({ team: "development" })
+    .collect()
+  const recentDevHires = allDevForRange.filter(
+    (e) => e.dateHired >= "2020-01-01" && e.dateHired <= "2023-12-31",
   )
 
   // Reverse sort: development team by most recently hired first
-  const devReversed = yield* db.Employees.collect(
-    Employees.query.teams({ team: "development" }).pipe(Query.reverse),
-  )
+  const { Employees: devReversed } = yield* db.collections
+    .Teams({ team: "development" })
+    .reverse()
+    .collect()
   // #endregion
   assertEq(devTeam.length, 2, "development team has 2 members")
   const devNames = devTeam.map((e) => e.firstName).sort()
   assertEq(devNames, ["Sean", "Tyler"], "development team names")
 
   // Product team — should just be Morgan
-  const productTeam = yield* db.Employees.collect(Employees.query.teams({ team: "product" }))
+  const { Employees: productTeam } = yield* db.collections.Teams({ team: "product" }).collect()
   assertEq(productTeam.length, 1, "product team has 1 member")
   assertEq(productTeam[0]!.employee, "morgan", "product team member")
 
   // Marketing team — should just be Alex
-  const marketingTeam = yield* db.Employees.collect(Employees.query.teams({ team: "marketing" }))
+  const { Employees: marketingTeam } = yield* db.collections.Teams({ team: "marketing" }).collect()
   assertEq(marketingTeam.length, 1, "marketing team has 1 member")
   assertEq(marketingTeam[0]!.employee, "alex", "marketing team member")
 
@@ -540,16 +564,18 @@ const program = Effect.gen(function* () {
 
   // #region statuses
   // All open tasks across all projects
-  const openTasks = yield* db.Tasks.collect(Tasks.query.statuses({ status: "open" }))
+  const { Tasks: openTasks } = yield* db.collections.Statuses({ status: "open" }).collect()
 
   // Verify points are present on status-queried tasks
   const totalOpenPoints = openTasks.reduce((sum, t) => sum + t.points, 0)
 
   // In-progress tasks
-  const inProgressTasks = yield* db.Tasks.collect(Tasks.query.statuses({ status: "in-progress" }))
+  const { Tasks: inProgressTasks } = yield* db.collections
+    .Statuses({ status: "in-progress" })
+    .collect()
 
   // Closed tasks
-  const closedTasks = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
+  const { Tasks: closedTasks } = yield* db.collections.Statuses({ status: "closed" }).collect()
   // #endregion
   assertEq(openTasks.length, 4, "4 open tasks total")
   const openTaskIds = openTasks.map((t) => t.task).sort()
@@ -567,14 +593,10 @@ const program = Effect.gen(function* () {
   assertEq(closedTasks[0]!.points, 3, "closed task points")
 
   // #region statuses-by-project
-  // Open tasks in a specific project using SK prefix (beginsWith)
-  const statusesIndex = Tasks.indexes.statuses
-  const platformPrefix = KeyComposer.composeSortKeyPrefix(TmSchema, "Task", 1, statusesIndex, {
-    project: "platform",
-  })
-  const openPlatformTasks = yield* db.Tasks.collect(
-    Tasks.query.statuses({ status: "open" }).pipe(Query.where({ beginsWith: platformPrefix })),
-  )
+  // Open tasks in a specific project — pass SK composites for auto begins_with
+  const { Tasks: openPlatformTasks } = yield* db.collections
+    .Statuses({ status: "open", project: "platform" })
+    .collect()
   // #endregion
   assertEq(openPlatformTasks.length, 3, "3 open platform tasks")
   const openPlatformIds = openPlatformTasks.map((t) => t.task).sort()
@@ -591,30 +613,34 @@ const program = Effect.gen(function* () {
 
   // #region workflow
   // Move build-api from open -> in-progress
-  const inProgress = yield* db.Tasks.update(
+  const inProgress = yield* db.entities.Tasks.update(
     { task: "build-api", project: "platform", employee: "tyler" },
     Entity.set({ status: "in-progress" }),
   )
 
   // Verify: open tasks decreased by 1
-  const openAfterTransition = yield* db.Tasks.collect(Tasks.query.statuses({ status: "open" }))
+  const { Tasks: openAfterTransition } = yield* db.collections
+    .Statuses({ status: "open" })
+    .collect()
 
   // Verify: in-progress tasks increased by 1
-  const inProgressAfterTransition = yield* db.Tasks.collect(
-    Tasks.query.statuses({ status: "in-progress" }),
-  )
+  const { Tasks: inProgressAfterTransition } = yield* db.collections
+    .Statuses({ status: "in-progress" })
+    .collect()
 
   // Move build-api from in-progress -> closed
-  const closed = yield* db.Tasks.update(
+  const closed = yield* db.entities.Tasks.update(
     { task: "build-api", project: "platform", employee: "tyler" },
     Entity.set({ status: "closed" }),
   )
 
   // Verify: closed tasks increased
-  const closedAfterWorkflow = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
+  const { Tasks: closedAfterWorkflow } = yield* db.collections
+    .Statuses({ status: "closed" })
+    .collect()
 
   // Restore build-api to original state for clean assertions below
-  yield* db.Tasks.update(
+  yield* db.entities.Tasks.update(
     { task: "build-api", project: "platform", employee: "tyler" },
     Entity.set({ status: "open" }),
   )
@@ -639,20 +665,16 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 7: Employee Roles (gsi4)")
 
   // #region roles
-  const engineers = yield* db.Employees.collect(Employees.query.roles({ title: "Senior Engineer" }))
+  const { Employees: engineers } = yield* db.collections
+    .Roles({ title: "Senior Engineer" })
+    .collect()
 
-  // Salary range query across all Product Managers
-  const rolesIndex = Employees.indexes.roles
-  const loSalary = KeyComposer.composeSortKeyPrefix(TmSchema, "Employee", 1, rolesIndex, {
-    salary: "000100.00",
-  })
-  const hiSalary = KeyComposer.composeSortKeyPrefix(TmSchema, "Employee", 1, rolesIndex, {
-    salary: "000200.00",
-  })
-  const wellPaidPMs = yield* db.Employees.collect(
-    Employees.query
-      .roles({ title: "Product Manager" })
-      .pipe(Query.where({ between: [loSalary, hiSalary] })),
+  // Salary range query across all Product Managers — filter on salary
+  const { Employees: allPMs } = yield* db.collections
+    .Roles({ title: "Product Manager" })
+    .collect()
+  const wellPaidPMs = allPMs.filter(
+    (e) => e.salary >= "000100.00" && e.salary <= "000200.00",
   )
   // #endregion
   assertEq(engineers.length, 1, "1 Senior Engineer")
@@ -691,17 +713,19 @@ const program = Effect.gen(function* () {
   ])
 
   // Verify both items created atomically
-  const newHire = yield* db.Employees.get({ employee: "jordan" })
+  const newHire = yield* db.entities.Employees.get({ employee: "jordan" })
 
-  const onboardingTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "jordan" }))
+  const { Tasks: onboardingTasks } = yield* db.collections
+    .Assignments({ employee: "jordan" })
+    .collect()
 
   // Verify new hire appears in teams query
-  const devTeamAfterHire = yield* db.Employees.collect(
-    Employees.query.teams({ team: "development" }),
-  )
+  const { Employees: devTeamAfterHire } = yield* db.collections
+    .Teams({ team: "development" })
+    .collect()
 
   // Verify new open task appears in statuses query
-  const openAfterHire = yield* db.Tasks.collect(Tasks.query.statuses({ status: "open" }))
+  const { Tasks: openAfterHire } = yield* db.collections.Statuses({ status: "open" }).collect()
   // #endregion
   assertEq(newHire.firstName, "Jordan", "transaction employee firstName")
   assertEq(newHire.title, "Junior Engineer", "transaction employee title")
@@ -727,16 +751,18 @@ const program = Effect.gen(function* () {
 
   // #region archival
   // Archive the closed "user-research" task
-  yield* db.Tasks.delete({ task: "user-research", project: "website", employee: "morgan" })
+  yield* db.entities.Tasks.delete({ task: "user-research", project: "website", employee: "morgan" })
 
   // Verify: closed tasks no longer include the archived one
-  const closedAfterArchive = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
+  const { Tasks: closedAfterArchive } = yield* db.collections
+    .Statuses({ status: "closed" })
+    .collect()
 
   // Verify: morgan's assignments no longer include the archived task
-  const morganTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "morgan" }))
+  const { Tasks: morganTasks } = yield* db.collections.Assignments({ employee: "morgan" }).collect()
 
   // But the archived task is still retrievable via deleted.get
-  const archivedTask = yield* db.Tasks.deleted.get({
+  const archivedTask = yield* db.entities.Tasks.deleted.get({
     task: "user-research",
     project: "website",
     employee: "morgan",
@@ -752,14 +778,16 @@ const program = Effect.gen(function* () {
 
   // #region restore
   // Restore if needed (e.g., task was archived by mistake)
-  const unarchived = yield* db.Tasks.restore({
+  const unarchived = yield* db.entities.Tasks.restore({
     task: "user-research",
     project: "website",
     employee: "morgan",
   })
 
   // Verify: task is back in status queries
-  const closedAfterRestore = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
+  const { Tasks: closedAfterRestore } = yield* db.collections
+    .Statuses({ status: "closed" })
+    .collect()
   // #endregion
   assertEq(unarchived.status, "closed", "restored task retains original status")
   assert(
@@ -769,7 +797,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("  Archive + restore: soft-delete, audit lookup, restore — OK")
 
   // --- Cleanup ---
-  yield* db.deleteTable()
+  yield* db.tables["taskman-table"]!.delete()
   yield* Console.log("\nAll 9 patterns passed.")
 })
 
@@ -795,4 +823,21 @@ Effect.runPromise(main).then(
 )
 // #endregion
 
-export { program, TmTable, TmSchema, Employees, Tasks, Offices, Employee, Task, Office }
+export {
+  program,
+  TmTable,
+  TmSchema,
+  Employees,
+  Tasks,
+  Offices,
+  Employee,
+  Task,
+  Office,
+  Workplaces,
+  TasksByProject,
+  Teams,
+  Assignments,
+  Roles,
+  Statuses,
+  DirectReports,
+}

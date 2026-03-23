@@ -14,7 +14,7 @@ Beyond `Entity.set()`, effect-dynamodb provides combinators for all DynamoDB upd
 Deletes attributes entirely from the item:
 
 ```typescript region="remove" example="guide-advanced.ts"
-yield* db.Products.update({ productId: "p-1" }, Entity.remove(["description"]))
+yield* db.entities.Products.update({ productId: "p-1" }, Entity.remove(["description"]))
 ```
 
 ### Atomic Increment
@@ -22,7 +22,7 @@ yield* db.Products.update({ productId: "p-1" }, Entity.remove(["description"]))
 Atomically increments numeric attributes. Thread-safe — no read-modify-write cycle:
 
 ```typescript region="add" example="guide-advanced.ts"
-yield* db.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1, stock: 50 }))
+yield* db.entities.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1, stock: 50 }))
 ```
 
 ### Atomic Decrement
@@ -30,7 +30,7 @@ yield* db.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1, stock
 Synthesizes `SET #field = #field - :val` (DynamoDB has no native subtract):
 
 ```typescript region="subtract" example="guide-advanced.ts"
-yield* db.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
+yield* db.entities.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
 ```
 
 ### Appending to Lists
@@ -38,7 +38,10 @@ yield* db.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
 Appends elements to the end of a list attribute using `list_append`:
 
 ```typescript region="append" example="guide-advanced.ts"
-yield* db.Products.update({ productId: "p-1" }, Entity.append({ tags: ["on-sale", "featured"] }))
+yield* db.entities.Products.update(
+  { productId: "p-1" },
+  Entity.append({ tags: ["on-sale", "featured"] }),
+)
 ```
 
 ### Removing from Sets
@@ -46,7 +49,7 @@ yield* db.Products.update({ productId: "p-1" }, Entity.append({ tags: ["on-sale"
 Removes specific elements from a DynamoDB Set attribute (StringSet, NumberSet):
 
 ```typescript region="delete-from-set" example="guide-advanced.ts"
-yield* db.Products.update(
+yield* db.entities.Products.update(
   { productId: "p-1" },
   Entity.deleteFromSet({ categories: new Set(["obsolete"]) }),
 )
@@ -57,7 +60,7 @@ yield* db.Products.update(
 All update combinators compose as arguments — they are merged into one `UpdateItem` call:
 
 ```typescript region="composed-updates" example="guide-advanced.ts"
-yield* db.Products.update(
+yield* db.entities.Products.update(
   { productId: "p-1" },
   Entity.set({ name: "Premium Mouse", price: 39.99 }),
   Entity.add({ viewCount: 10 }),
@@ -101,7 +104,7 @@ Conditional put — only if item doesn't already exist:
 
 ```typescript region="conditional-put" example="guide-advanced.ts"
 // Conditional put — only if item doesn't already exist
-const condPutResult = yield* db.Users.put(
+const condPutResult = yield* db.entities.Users.put(
   { userId: "u-10", email: "new@example.com", displayName: "New User" },
   Users.condition((t, { notExists }) => notExists(t.email)),
 ).pipe(
@@ -116,7 +119,7 @@ Conditional delete — only if a specific attribute value matches:
 
 ```typescript region="conditional-delete" example="guide-advanced.ts"
 // Conditional delete — only if stock is zero
-const condDeleteResult = yield* db.Products.delete(
+const condDeleteResult = yield* db.entities.Products.delete(
   { productId: "p-1" },
   Products.condition((t, { eq }) => eq(t.stock, 0)),
 ).pipe(
@@ -131,7 +134,7 @@ Conditional update — only if status matches:
 
 ```typescript region="conditional-update" example="guide-advanced.ts"
 // Conditional update — only if status is "active"
-yield* db.Tasks.update(
+yield* db.entities.Tasks.update(
   { taskId: "t-1" },
   Entity.set({ status: "done" }),
   Tasks.condition((t, { eq }) => eq(t.status, "active")),
@@ -143,7 +146,7 @@ yield* db.Tasks.update(
 When using `condition()` on an update that also has `Entity.expectedVersion()`, the user condition is ANDed with the version check:
 
 ```typescript region="optimistic-condition" example="guide-advanced.ts"
-yield* db.Products.update(
+yield* db.entities.Products.update(
   { productId: "p-1" },
   Entity.set({ price: 24.99 }),
   Products.expectedVersion(6),
@@ -157,7 +160,7 @@ yield* db.Products.update(
 Use `Entity.create()` for typed `ConditionalCheckFailed` error handling — `create()` includes this error in its typed error channel:
 
 ```typescript region="handle-conditional" example="guide-advanced.ts"
-const result = yield* db.Users.create({
+const result = yield* db.entities.Users.create({
   userId: "u-10",
   email: "new@example.com",
   displayName: "New User",
@@ -170,14 +173,14 @@ const result = yield* db.Users.create({
 
 ```typescript region="create-safely" example="guide-advanced.ts"
 // Create — fails with ConditionalCheckFailed if item already exists
-const user = yield* db.Users.create({
+const user = yield* db.entities.Users.create({
   userId: "u-20",
   email: "alice@example.com",
   displayName: "Alice",
 })
 
 // Duplicate — caught gracefully
-const dup = yield* db.Users.create({
+const dup = yield* db.entities.Users.create({
   userId: "u-20",
   email: "alice@example.com",
   displayName: "Alice",
@@ -234,17 +237,16 @@ Type-safe conditions, filters, and projections using `PathBuilder`:
 // Condition — type-safe, nested paths, OR/NOT composition
 Products.condition((t, { eq, gt, and }) => and(eq(t.category, "peripherals"), gt(t.stock, 0)))
 
-// Filter — same API, applied to queries/scans
-const filtered = yield* db.Products.collect(
-  Products.query.byCategory({ category: "peripherals" }),
-  Products.filter((t, { contains }) => contains(t.name, "Widget")),
-)
+// Filter — shorthand applied to collection queries
+const { Products: filtered } = yield* db.collections
+  .ProductsByCategory({ category: "peripherals" })
+  .filter({ name: "Widget Pro" })
+  .collect()
 
 // Projection — select specific attributes
-const projected = yield* db.Products.collect(
-  Products.scan(),
-  Products.select((t) => [t.name, t.price]),
-)
+const projected = yield* db.entities.Products.scan()
+  .select((t) => [t.name, t.price])
+  .collect()
 ```
 
 ### Low-Level Builders

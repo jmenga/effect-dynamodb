@@ -1,5 +1,5 @@
 /**
- * Projections example — effect-dynamodb v3 (client gateway pattern)
+ * Projections example — effect-dynamodb v2
  *
  * Demonstrates:
  *   - Projection.projection(): build a ProjectionExpression from attribute names
@@ -21,6 +21,7 @@
 import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -44,7 +45,7 @@ class Employee extends Schema.Class<Employee>("Employee")({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 2. Schema + Entity + Table
+// 2. Schema + Entity + Table + Collections
 // ---------------------------------------------------------------------------
 
 // #region schema-entity-table
@@ -53,21 +54,23 @@ const AppSchema = DynamoSchema.make({ name: "proj-demo", version: 1 })
 const Employees = Entity.make({
   model: Employee,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byDepartment: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["department"] },
-      sk: { field: "gsi1sk", composite: ["employeeId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Employees } })
+
+const EmployeesByDepartment = Collections.make("employeesByDepartment", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["department"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Employees: Collections.member(Employees, { sk: { composite: ["employeeId"] } }),
+  },
+})
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -76,14 +79,17 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Employees } })
 
 const program = Effect.gen(function* () {
   // #region seed-data
-  const db = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { Employees },
+    collections: { EmployeesByDepartment },
+  })
 
   const client = yield* DynamoClient
   const tableConfig = yield* MainTable.Tag
 
-  yield* db.createTable()
+  yield* db.tables["proj-demo-table"]!.create()
 
-  yield* db.Employees.put({
+  yield* db.entities.Employees.put({
     employeeId: "e-1",
     name: "Alice",
     email: "alice@company.com",
@@ -91,7 +97,7 @@ const program = Effect.gen(function* () {
     salary: 120000,
     title: "Senior Engineer",
   })
-  yield* db.Employees.put({
+  yield* db.entities.Employees.put({
     employeeId: "e-2",
     name: "Bob",
     email: "bob@company.com",
@@ -99,7 +105,7 @@ const program = Effect.gen(function* () {
     salary: 95000,
     title: "Engineer",
   })
-  yield* db.Employees.put({
+  yield* db.entities.Employees.put({
     employeeId: "e-3",
     name: "Charlie",
     email: "charlie@company.com",
@@ -197,7 +203,7 @@ const program = Effect.gen(function* () {
 
   // --- Cleanup ---
   yield* Console.log("=== Cleanup ===\n")
-  yield* db.deleteTable()
+  yield* db.tables["proj-demo-table"]!.delete()
   yield* Console.log("Table deleted.")
 })
 

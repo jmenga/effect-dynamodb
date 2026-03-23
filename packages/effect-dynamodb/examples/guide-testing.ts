@@ -17,6 +17,7 @@
 import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
@@ -61,16 +62,9 @@ const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
 const EmployeeEntity = Entity.make({
   model: EmployeeModel,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byEmail: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["email"] },
-      sk: { field: "gsi1sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId"] },
+    sk: { field: "sk", composite: [] },
   },
   unique: { email: ["email"] },
   timestamps: true,
@@ -80,17 +74,9 @@ const EmployeeEntity = Entity.make({
 const TaskEntity = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byProject: {
-      index: "gsi1",
-      type: "clustered",
-      pk: { field: "gsi1pk", composite: ["projectId"] },
-      sk: { field: "gsi1sk", composite: ["status"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -98,6 +84,25 @@ const TaskEntity = Entity.make({
 const MainTable = Table.make({
   schema: AppSchema,
   entities: { EmployeeEntity, TaskEntity },
+})
+
+const EmployeesByEmail = Collections.make("employeesByEmail", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["email"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    EmployeeEntity: Collections.member(EmployeeEntity, { sk: { composite: [] } }),
+  },
+})
+
+const TasksByProject = Collections.make("tasksByProject", {
+  index: "gsi1",
+  type: "clustered",
+  pk: { field: "gsi1pk", composite: ["projectId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    TaskEntity: Collections.member(TaskEntity, { sk: { composite: ["status"] } }),
+  },
 })
 // #endregion
 
@@ -155,6 +160,22 @@ const MockDynamoClient = Layer.succeed(DynamoClient, {
   createTable: () => Effect.die("not used"),
   deleteTable: () => Effect.die("not used"),
   describeTable: () => Effect.die("not used"),
+  updateTable: () => Effect.die("not used"),
+  listTables: () => Effect.die("not used"),
+  createBackup: () => Effect.die("not used"),
+  deleteBackup: () => Effect.die("not used"),
+  listBackups: () => Effect.die("not used"),
+  restoreTableFromBackup: () => Effect.die("not used"),
+  describeContinuousBackups: () => Effect.die("not used"),
+  updateContinuousBackups: () => Effect.die("not used"),
+  restoreTableToPointInTime: () => Effect.die("not used"),
+  exportTableToPointInTime: () => Effect.die("not used"),
+  describeExport: () => Effect.die("not used"),
+  updateTimeToLive: () => Effect.die("not used"),
+  describeTimeToLive: () => Effect.die("not used"),
+  tagResource: () => Effect.die("not used"),
+  untagResource: () => Effect.die("not used"),
+  listTagsOfResource: () => Effect.die("not used"),
 })
 
 const TestLayer = Layer.merge(MockDynamoClient, MainTable.layer({ name: "test-table" }))
@@ -171,9 +192,12 @@ const testPutOperation = Effect.gen(function* () {
   // EmployeeEntity has unique constraints, so it uses transactWriteItems
   transactWriteItemsResponse = Effect.succeed({})
 
-  const { EmployeeEntity: employees } = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { EmployeeEntity, TaskEntity },
+    collections: { EmployeesByEmail, TasksByProject },
+  })
 
-  const result = yield* employees.put({
+  const result = yield* db.entities.EmployeeEntity.put({
     employeeId: "emp-1",
     email: "alice@acme.com",
     displayName: "Alice",
@@ -210,17 +234,18 @@ const testErrorPath = Effect.gen(function* () {
     }),
   )
 
-  const { EmployeeEntity: employees } = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { EmployeeEntity, TaskEntity },
+    collections: { EmployeesByEmail, TasksByProject },
+  })
 
-  const result = yield* employees
-    .put({
-      employeeId: "emp-2",
-      email: "taken@example.com",
-      displayName: "Bob",
-      department: "Sales",
-      createdBy: "admin",
-    })
-    .pipe(Effect.flip)
+  const result = yield* db.entities.EmployeeEntity.put({
+    employeeId: "emp-2",
+    email: "taken@example.com",
+    displayName: "Bob",
+    department: "Sales",
+    createdBy: "admin",
+  }).pipe(Effect.flip)
 
   // The entity layer translates the DynamoDB error to a domain error
   console.assert(
@@ -247,7 +272,7 @@ const testQueryResults = Effect.gen(function* () {
         pk: "$myapp#v1#task#t-1",
         sk: "$myapp#v1#task",
         gsi1pk: "$myapp#v1#task#proj-alpha",
-        gsi1sk: "$myapp#v1#task#active",
+        gsi1sk: "$myapp#v1#tasksByProject#task#active",
         __edd_e__: "Task",
         taskId: "t-1",
         projectId: "proj-alpha",
@@ -261,7 +286,7 @@ const testQueryResults = Effect.gen(function* () {
         pk: "$myapp#v1#task#t-2",
         sk: "$myapp#v1#task",
         gsi1pk: "$myapp#v1#task#proj-alpha",
-        gsi1sk: "$myapp#v1#task#active",
+        gsi1sk: "$myapp#v1#tasksByProject#task#active",
         __edd_e__: "Task",
         taskId: "t-2",
         projectId: "proj-alpha",
@@ -275,12 +300,15 @@ const testQueryResults = Effect.gen(function* () {
     LastEvaluatedKey: undefined,
   })
 
-  const { TaskEntity: tasks } = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { EmployeeEntity, TaskEntity },
+    collections: { EmployeesByEmail, TasksByProject },
+  })
 
-  const results = yield* tasks.collect(
-    TaskEntity.query.byProject({ projectId: "proj-alpha" }),
-    TaskEntity.filter({ status: "active" }),
-  )
+  const { TaskEntity: results } = yield* db.collections
+    .TasksByProject({ projectId: "proj-alpha" })
+    .filter({ status: "active" })
+    .collect()
 
   // Verify decoded results
   console.assert(results.length === 2, `expected 2 results, got ${results.length}`)

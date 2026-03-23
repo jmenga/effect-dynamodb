@@ -23,6 +23,7 @@
  */
 
 import { Console, Effect, Layer, Schema } from "effect"
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -83,24 +84,16 @@ const VcsSchema = DynamoSchema.make({ name: "vcs", version: 1 })
 // #endregion
 
 // =============================================================================
-// 3. Entity definitions — pure, no table reference
+// 3. Entity definitions — primary key only, no GSIs
 // =============================================================================
 
 // #region user-entity
 const Users = Entity.make({
   model: User,
   entityType: "User",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["username"] },
-      sk: { field: "sk", composite: [] },
-    },
-    owned: {
-      index: "gsi1",
-      collection: "owned",
-      pk: { field: "gsi1pk", composite: ["username"] },
-      sk: { field: "gsi1sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["username"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -110,23 +103,9 @@ const Users = Entity.make({
 const Repositories = Entity.make({
   model: Repository,
   entityType: "Repository",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["repoOwner"] },
-      sk: { field: "sk", composite: ["repoName"] },
-    },
-    created: {
-      index: "gsi1",
-      collection: "owned",
-      pk: { field: "gsi1pk", composite: ["repoOwner"] },
-      sk: { field: "gsi1sk", composite: ["repoName"] },
-    },
-    activity: {
-      index: "gsi2",
-      collection: "activity",
-      pk: { field: "gsi2pk", composite: ["repoOwner", "repoName"] },
-      sk: { field: "gsi2sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["repoOwner"] },
+    sk: { field: "sk", composite: ["repoName"] },
   },
   timestamps: true,
 })
@@ -136,23 +115,9 @@ const Repositories = Entity.make({
 const Issues = Entity.make({
   model: Issue,
   entityType: "Issue",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["repoOwner", "repoName"] },
-      sk: { field: "sk", composite: ["issueNumber"] },
-    },
-    created: {
-      index: "gsi1",
-      collection: "managed",
-      pk: { field: "gsi1pk", composite: ["username"] },
-      sk: { field: "gsi1sk", composite: ["status", "issueNumber"] },
-    },
-    todos: {
-      index: "gsi2",
-      collection: "activity",
-      pk: { field: "gsi2pk", composite: ["repoOwner", "repoName"] },
-      sk: { field: "gsi2sk", composite: ["status", "issueNumber"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["repoOwner", "repoName"] },
+    sk: { field: "sk", composite: ["issueNumber"] },
   },
   timestamps: true,
 })
@@ -162,36 +127,59 @@ const Issues = Entity.make({
 const PullRequests = Entity.make({
   model: PullRequest,
   entityType: "PullRequest",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["repoOwner", "repoName"] },
-      sk: { field: "sk", composite: ["pullRequestNumber"] },
-    },
-    created: {
-      index: "gsi1",
-      collection: "managed",
-      pk: { field: "gsi1pk", composite: ["username"] },
-      sk: { field: "gsi1sk", composite: ["status", "pullRequestNumber"] },
-    },
-    enhancements: {
-      index: "gsi2",
-      collection: "activity",
-      pk: { field: "gsi2pk", composite: ["repoOwner", "repoName"] },
-      sk: { field: "gsi2sk", composite: ["status", "pullRequestNumber"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["repoOwner", "repoName"] },
+    sk: { field: "sk", composite: ["pullRequestNumber"] },
   },
   timestamps: true,
 })
 // #endregion
 
 // =============================================================================
-// 4. Table definition — declares all entities as members
+// 4. Table + Collections — GSI access patterns
 // =============================================================================
 
 // #region table
 const VcsTable = Table.make({
   schema: VcsSchema,
   entities: { Users, Repositories, Issues, PullRequests },
+})
+// #endregion
+
+// #region collections
+const Owned = Collections.make("owned", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["username"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Users: Collections.member(Users, { sk: { composite: [] } }),
+    Repositories: Collections.member(Repositories, { sk: { composite: ["repoName"] } }),
+  },
+})
+
+const Managed = Collections.make("managed", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["username"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Issues: Collections.member(Issues, { sk: { composite: ["status", "issueNumber"] } }),
+    PullRequests: Collections.member(PullRequests, {
+      sk: { composite: ["status", "pullRequestNumber"] },
+    }),
+  },
+})
+
+const Activity = Collections.make("activity", {
+  index: "gsi2",
+  pk: { field: "gsi2pk", composite: ["repoOwner", "repoName"] },
+  sk: { field: "gsi2sk" },
+  members: {
+    Repositories: Collections.member(Repositories, { sk: { composite: [] } }),
+    Issues: Collections.member(Issues, { sk: { composite: ["status", "issueNumber"] } }),
+    PullRequests: Collections.member(PullRequests, {
+      sk: { composite: ["status", "pullRequestNumber"] },
+    }),
+  },
 })
 // #endregion
 
@@ -305,25 +293,28 @@ const assertEq = <T>(actual: T, expected: T, label: string): void => {
 // =============================================================================
 
 const program = Effect.gen(function* () {
-  // Typed execution gateway — binds all table members
-  const db = yield* DynamoClient.make(VcsTable)
+  // Typed execution gateway — binds all entities and collections
+  const db = yield* DynamoClient.make({
+    entities: { Users, Repositories, Issues, PullRequests },
+    collections: { Owned, Managed, Activity },
+  })
 
   // --- Setup: create table ---
-  yield* db.createTable()
+  yield* db.tables["vcs-table"]!.create()
 
   // --- Seed data ---
   // #region seed-execute
   for (const user of Object.values(users)) {
-    yield* db.Users.put(user)
+    yield* db.entities.Users.put(user)
   }
   for (const repo of Object.values(repos)) {
-    yield* db.Repositories.put(repo)
+    yield* db.entities.Repositories.put(repo)
   }
   for (const issue of Object.values(issues)) {
-    yield* db.Issues.put(issue)
+    yield* db.entities.Issues.put(issue)
   }
   for (const pr of Object.values(pullRequests)) {
-    yield* db.PullRequests.put(pr)
+    yield* db.entities.PullRequests.put(pr)
   }
   // #endregion
 
@@ -333,12 +324,12 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 1: Get User Profile")
 
   // #region pattern-1
-  const octocat = yield* db.Users.get({ username: "octocat" })
+  const octocat = yield* db.entities.Users.get({ username: "octocat" })
   assertEq(octocat.fullName, "The Octocat", "octocat fullName")
   assertEq(octocat.bio, "GitHub mascot", "octocat bio")
   assertEq(octocat.location, "San Francisco, CA", "octocat location")
 
-  const torvalds = yield* db.Users.get({ username: "torvalds" })
+  const torvalds = yield* db.entities.Users.get({ username: "torvalds" })
   assertEq(torvalds.fullName, "Linus Torvalds", "torvalds fullName")
   assertEq(torvalds.location, "Portland, OR", "torvalds location")
   // #endregion
@@ -350,12 +341,15 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 2: Get Repository")
 
   // #region pattern-2
-  const helloWorld = yield* db.Repositories.get({ repoOwner: "octocat", repoName: "hello-world" })
+  const helloWorld = yield* db.entities.Repositories.get({
+    repoOwner: "octocat",
+    repoName: "hello-world",
+  })
   assertEq(helloWorld.about, "My first repository on GitHub!", "hello-world about")
   assertEq(helloWorld.isPrivate, false, "hello-world isPrivate")
   assertEq(helloWorld.defaultBranch, "main", "hello-world defaultBranch")
 
-  const linux = yield* db.Repositories.get({ repoOwner: "torvalds", repoName: "linux" })
+  const linux = yield* db.entities.Repositories.get({ repoOwner: "torvalds", repoName: "linux" })
   assertEq(linux.about, "Linux kernel source tree", "linux about")
   assertEq(linux.defaultBranch, "master", "linux defaultBranch")
   // #endregion
@@ -367,19 +361,19 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 3: User's Owned Repos (gsi1 collection)")
 
   // #region pattern-3
-  const octocatRepos = yield* db.Repositories.collect(
-    Repositories.query.created({ repoOwner: "octocat" }),
-  )
+  const { Repositories: octocatRepos } = yield* db.collections
+    .Owned({ username: "octocat" })
+    .collect()
   assertEq(octocatRepos.length, 1, "octocat has 1 repo")
   assertEq(octocatRepos[0]!.repoName, "hello-world", "octocat repo name")
 
-  const torvaldsRepos = yield* db.Repositories.collect(
-    Repositories.query.created({ repoOwner: "torvalds" }),
-  )
+  const { Repositories: torvaldsRepos } = yield* db.collections
+    .Owned({ username: "torvalds" })
+    .collect()
   assertEq(torvaldsRepos.length, 1, "torvalds has 1 repo")
   assertEq(torvaldsRepos[0]!.repoName, "linux", "torvalds repo name")
 
-  const octocatProfile = yield* db.Users.collect(Users.query.owned({ username: "octocat" }))
+  const { Users: octocatProfile } = yield* db.collections.Owned({ username: "octocat" }).collect()
   assertEq(octocatProfile.length, 1, "owned collection returns 1 user")
   assertEq(octocatProfile[0]!.fullName, "The Octocat", "owned user fullName")
   // #endregion
@@ -391,7 +385,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 4: Create Issue + Update Status")
 
   // #region pattern-4
-  const newIssue = yield* db.Issues.put({
+  const newIssue = yield* db.entities.Issues.put({
     issueNumber: "3",
     repoName: "hello-world",
     repoOwner: "octocat",
@@ -403,7 +397,7 @@ const program = Effect.gen(function* () {
   assertEq(newIssue.issueNumber, "3", "new issue number")
   assertEq(newIssue.status, "Open", "new issue status")
 
-  const closedIssue = yield* db.Issues.update(
+  const closedIssue = yield* db.entities.Issues.update(
     { repoOwner: "octocat", repoName: "hello-world", issueNumber: "3" },
     Entity.set({ status: "Closed", username: "torvalds" }),
   )
@@ -418,7 +412,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 5: Create Pull Request + Close")
 
   // #region pattern-5
-  const newPR = yield* db.PullRequests.put({
+  const newPR = yield* db.entities.PullRequests.put({
     pullRequestNumber: "2",
     repoName: "hello-world",
     repoOwner: "octocat",
@@ -430,7 +424,7 @@ const program = Effect.gen(function* () {
   assertEq(newPR.pullRequestNumber, "2", "new PR number")
   assertEq(newPR.status, "Open", "new PR status")
 
-  const closedPR = yield* db.PullRequests.update(
+  const closedPR = yield* db.entities.PullRequests.update(
     { repoOwner: "octocat", repoName: "hello-world", pullRequestNumber: "2" },
     Entity.set({ status: "Closed", username: "octocat" }),
   )
@@ -445,17 +439,19 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 6: User's Managed Items (gsi1 collection)")
 
   // #region pattern-6
-  const torvaldsIssues = yield* db.Issues.collect(Issues.query.created({ username: "torvalds" }))
+  const { Issues: torvaldsIssues } = yield* db.collections
+    .Managed({ username: "torvalds" })
+    .collect()
 
-  const torvaldsPRs = yield* db.PullRequests.collect(
-    PullRequests.query.created({ username: "torvalds" }),
-  )
+  const { PullRequests: torvaldsPRs } = yield* db.collections
+    .Managed({ username: "torvalds" })
+    .collect()
 
-  const octocatIssues = yield* db.Issues.collect(Issues.query.created({ username: "octocat" }))
+  const { Issues: octocatIssues } = yield* db.collections.Managed({ username: "octocat" }).collect()
 
-  const octocatPRs = yield* db.PullRequests.collect(
-    PullRequests.query.created({ username: "octocat" }),
-  )
+  const { PullRequests: octocatPRs } = yield* db.collections
+    .Managed({ username: "octocat" })
+    .collect()
   // #endregion
   assertEq(torvaldsIssues.length, 2, "torvalds has 2 issues")
   const torvaldsIssueSubjects = torvaldsIssues.map((i) => i.subject).sort()
@@ -479,27 +475,27 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 7: Repository Activity (gsi2 collection)")
 
   // #region pattern-7
-  const hwIssues = yield* db.Issues.collect(
-    Issues.query.todos({ repoOwner: "octocat", repoName: "hello-world" }),
-  )
+  const { Issues: hwIssues } = yield* db.collections
+    .Activity({ repoOwner: "octocat", repoName: "hello-world" })
+    .collect()
 
   const hwOpenIssues = hwIssues.filter((i) => i.status === "Open")
 
-  const hwPRs = yield* db.PullRequests.collect(
-    PullRequests.query.enhancements({ repoOwner: "octocat", repoName: "hello-world" }),
-  )
+  const { PullRequests: hwPRs } = yield* db.collections
+    .Activity({ repoOwner: "octocat", repoName: "hello-world" })
+    .collect()
 
-  const linuxIssues = yield* db.Issues.collect(
-    Issues.query.todos({ repoOwner: "torvalds", repoName: "linux" }),
-  )
+  const { Issues: linuxIssues } = yield* db.collections
+    .Activity({ repoOwner: "torvalds", repoName: "linux" })
+    .collect()
 
-  const linuxPRs = yield* db.PullRequests.collect(
-    PullRequests.query.enhancements({ repoOwner: "torvalds", repoName: "linux" }),
-  )
+  const { PullRequests: linuxPRs } = yield* db.collections
+    .Activity({ repoOwner: "torvalds", repoName: "linux" })
+    .collect()
 
-  const hwRepoActivity = yield* db.Repositories.collect(
-    Repositories.query.activity({ repoOwner: "octocat", repoName: "hello-world" }),
-  )
+  const { Repositories: hwRepoActivity } = yield* db.collections
+    .Activity({ repoOwner: "octocat", repoName: "hello-world" })
+    .collect()
   // #endregion
   assertEq(hwIssues.length, 3, "hello-world has 3 issues")
   assertEq(hwOpenIssues.length, 1, "hello-world has 1 open issue")
@@ -546,17 +542,17 @@ const program = Effect.gen(function* () {
     }),
   ])
 
-  // Both created atomically — verify via activity index
-  const linuxIssuesAfter = yield* db.Issues.collect(
-    Issues.query.todos({ repoOwner: "torvalds", repoName: "linux" }),
-  )
+  // Both created atomically — verify via activity collection
+  const { Issues: linuxIssuesAfter } = yield* db.collections
+    .Activity({ repoOwner: "torvalds", repoName: "linux" })
+    .collect()
 
-  const linuxPRsAfter = yield* db.PullRequests.collect(
-    PullRequests.query.enhancements({ repoOwner: "torvalds", repoName: "linux" }),
-  )
+  const { PullRequests: linuxPRsAfter } = yield* db.collections
+    .Activity({ repoOwner: "torvalds", repoName: "linux" })
+    .collect()
   // #endregion
 
-  const txIssue = yield* db.Issues.get({
+  const txIssue = yield* db.entities.Issues.get({
     repoOwner: "torvalds",
     repoName: "linux",
     issueNumber: "2",
@@ -564,7 +560,7 @@ const program = Effect.gen(function* () {
   assertEq(txIssue.subject, "Track: Memory leak in driver", "transaction issue subject")
   assertEq(txIssue.status, "Open", "transaction issue status")
 
-  const txPR = yield* db.PullRequests.get({
+  const txPR = yield* db.entities.PullRequests.get({
     repoOwner: "torvalds",
     repoName: "linux",
     pullRequestNumber: "2",
@@ -576,7 +572,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("  Atomic create: issue #2 + PR #2 on linux — OK")
 
   // --- Cleanup ---
-  yield* db.deleteTable()
+  yield* db.tables["vcs-table"]!.delete()
   yield* Console.log("\nAll 8 patterns passed.")
 })
 

@@ -42,26 +42,25 @@ class Product extends Schema.Class<Product>("Product")({
 
 ```typescript title="entities.ts" region="entities" example="expressions.ts"
 const AppSchema = DynamoSchema.make({ name: "expr-demo", version: 1 })
-
 const Products = Entity.make({
   model: Product,
   entityType: "Product",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["productId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byCategory: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["category"] },
-      sk: { field: "gsi1sk", composite: ["productId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["productId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: true,
 })
-
 const MainTable = Table.make({ schema: AppSchema, entities: { Products } })
+const ProductsByCategory = Collections.make("productsByCategory", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["category"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Products: Collections.member(Products, { sk: { composite: ["productId"] } }),
+  },
+})
 ```
 
 `versioned: true` enables optimistic locking -- every write increments a `version` counter, and `expectedVersion()` can enforce it.
@@ -77,16 +76,15 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Products } })
 ```typescript region="create" example="expressions.ts"
 // create() is put() + automatic attribute_not_exists on primary key.
 // It fails with ConditionalCheckFailed if an item already exists.
-const widget = yield* db.Products.create({
+const widget = yield* db.entities.Products.create({
   productId: "p-1",
   name: "Widget",
   category: "electronics",
   price: 29.99,
   stock: 100,
 })
-
 // Try to create the same item again — should fail
-const duplicateResult = yield* db.Products.create({
+const duplicateResult = yield* db.entities.Products.create({
   productId: "p-1",
   name: "Widget Duplicate",
   category: "electronics",
@@ -109,7 +107,7 @@ BoundEntity methods return `Effect` directly, so you can pipe to `Effect.catchTa
 ```typescript region="conditional-put" example="expressions.ts"
 // Products.condition() adds a ConditionExpression to a put operation.
 // The condition is evaluated server-side. If it fails, the put is rejected.
-const condPutResult = yield* db.Products.put(
+const condPutResult = yield* db.entities.Products.put(
   {
     productId: "p-5",
     name: "New Product",
@@ -130,7 +128,7 @@ Delete an item only when a condition is met. Here we delete only if the product 
 // Delete only if the item's stock is 0 (don't delete items with stock).
 // Products.condition() maps ConditionalCheckFailedException at runtime.
 // Use Effect.match to handle both success and failure paths.
-const condDeleteResult = yield* db.Products.delete(
+const condDeleteResult = yield* db.entities.Products.delete(
   { productId: "p-4" },
   Products.condition((t, { eq }) => eq(t.stock, 0)),
 ).pipe(
@@ -139,9 +137,8 @@ const condDeleteResult = yield* db.Products.delete(
     onSuccess: () => "deleted (stock was 0)",
   }),
 )
-
 // Try to conditionally delete an item with stock > 0
-const condDeleteFail = yield* db.Products.delete(
+const condDeleteFail = yield* db.entities.Products.delete(
   { productId: "p-1" },
   Products.condition((t, { eq }) => eq(t.stock, 0)),
 ).pipe(
@@ -159,7 +156,7 @@ Combine `Products.condition()` with `expectedVersion()` and `set()`. The user co
 ```typescript region="conditional-update" example="expressions.ts"
 // Combine condition() with expectedVersion() and set().
 // The user condition is ANDed with the optimistic lock condition.
-const updated = yield* db.Products.update(
+const updated = yield* db.entities.Products.update(
   { productId: "p-1" },
   Products.set({ price: 24.99 }),
   Products.expectedVersion(1),
@@ -171,7 +168,7 @@ When the condition fails, you get a `ConditionalCheckFailed` error:
 
 ```typescript region="conditional-update-fail" example="expressions.ts"
 // Condition fails: update only if stock > 1000 (it's 100)
-const condUpdateFail = yield* db.Products.update(
+const condUpdateFail = yield* db.entities.Products.update(
   { productId: "p-1" },
   Products.set({ price: 19.99 }),
   Products.condition((t, { gt }) => gt(t.stock, 1000)),
@@ -190,15 +187,14 @@ There are two ways to build conditions -- a **callback API** using a type-safe P
 ```typescript region="condition-callback" example="expressions.ts"
 // The callback API provides type-safe conditions using PathBuilder.
 // First argument `t` is a path proxy, second `ops` has comparison functions.
-const conditionUpdated = yield* db.Products.update(
+const conditionUpdated = yield* db.entities.Products.update(
   { productId: "p-2" },
   Products.set({ price: 79.99 }),
   // Type-safe: t.stock is typed as number, "active" would be a type error
   Products.condition((t, { gt }) => gt(t.stock, 0)),
 )
-
 // Shorthand condition — plain object for simple equality
-const shorthandResult = yield* db.Products.update(
+const shorthandResult = yield* db.entities.Products.update(
   { productId: "p-2" },
   Products.set({ price: 84.99 }),
   Products.condition({ category: "electronics" }),
@@ -217,52 +213,39 @@ Filter expressions narrow query and scan results. They are applied server-side a
 `Products.filter()` uses the same callback + shorthand API as `Products.condition()`, applied as a combinator on queries and scans:
 
 ```typescript region="filters" example="expressions.ts"
-// Equality filter
-const electronics = yield* db.Products.collect(
-  Products.query.byCategory({ category: "electronics" }),
-)
-
-// Greater-than filter
-const expensive = yield* db.Products.collect(
-  Products.query.byCategory({ category: "electronics" }),
-  Products.filter((t, { gt }) => gt(t.price, 30)),
-)
-
-// Between filter
-const midRange = yield* db.Products.collect(
-  Products.query.byCategory({ category: "electronics" }),
-  Products.filter((t, { between }) => between(t.price, 20, 50)),
-)
-
-// Contains filter (string substring match)
-const withWidget = yield* db.Products.collect(
-  Products.scan(),
-  Products.filter((t, { contains }) => contains(t.name, "Widget")),
-)
-
+// All electronics via collection query
+const { Products: electronics } = yield* db.collections
+  .ProductsByCategory({ category: "electronics" })
+  .collect()
+// Greater-than filter on scan
+const expensive = yield* db.entities.Products.scan()
+  .filter((t, { gt }) => gt(t.price, 30))
+  .collect()
+// Between filter on scan
+const midRange = yield* db.entities.Products.scan()
+  .filter((t, { between }) => between(t.price, 20, 50))
+  .collect()
+// Contains filter (string substring match) on scan
+const withWidget = yield* db.entities.Products.scan()
+  .filter((t, { contains }) => contains(t.name, "Widget"))
+  .collect()
 // Attribute exists/not exists
-const allWithStock = yield* db.Products.collect(
-  Products.scan(),
-  Products.filter((t, { exists }) => exists(t.stock)),
-)
+const allWithStock = yield* db.entities.Products.scan()
+  .filter((t, { exists }) => exists(t.stock))
+  .collect()
 ```
 
 Filter with callback supports nested paths, OR composition, and all DynamoDB operators:
 
 ```typescript region="filter-callback" example="expressions.ts"
-// Filter with callback — supports nested paths, OR, and all DynamoDB operators
-const expensiveProducts = yield* db.Products.collect(
-  Products.query.byCategory({ category: "electronics" }),
-  Products.filter((t, { gt }) => gt(t.price, 30)),
-)
-
-// OR composition in filter
-const multiCategory = yield* db.Products.collect(
-  Products.scan(),
-  Products.filter((t, { or, eq }) =>
-    or(eq(t.category, "electronics"), eq(t.category, "accessories")),
-  ),
-)
+// Filter with callback on scan — supports nested paths, OR, and all DynamoDB operators
+const expensiveProducts = yield* db.entities.Products.scan()
+  .filter((t, { gt }) => gt(t.price, 30))
+  .collect()
+// OR composition in filter — scan with filter
+const multiCategory = yield* db.entities.Products.scan()
+  .filter((t, { or, eq }) => or(eq(t.category, "electronics"), eq(t.category, "accessories")))
+  .collect()
 ```
 
 ### Projections with `Entity.select()`
@@ -270,17 +253,12 @@ const multiCategory = yield* db.Products.collect(
 Select specific attributes to reduce network transfer:
 
 ```typescript region="select" example="expressions.ts"
-// Path-based projection — type-safe attribute selection
-const namesAndPrices = yield* db.Products.collect(
-  Products.scan(),
-  Products.select((t) => [t.name, t.price]),
-)
-
-// String array shorthand
-const nameOnly = yield* db.Products.collect(
-  Products.scan(),
-  Products.select(["name", "category"]),
-)
+// Path-based projection — type-safe attribute selection on scan
+const namesAndPrices = yield* db.entities.Products.scan()
+  .select((t) => [t.name, t.price])
+  .collect()
+// String array shorthand on scan
+const nameOnly = yield* db.entities.Products.scan().select(["name", "category"]).collect()
 ```
 
 ### Low-Level Expression Builders
@@ -290,7 +268,6 @@ The `Expression` module exposes the raw builders used internally. These are usef
 ```typescript region="expression-builders" example="expressions.ts"
 // Expression.condition() builds raw ConditionExpression strings.
 // These are what Products.condition() uses under the hood.
-
 const cond1 = Expression.condition({
   eq: { status: "active" },
   gt: { stock: 0 },
@@ -298,12 +275,10 @@ const cond1 = Expression.condition({
 // cond1.expression → "#status = :status AND #stock > :stock"
 // cond1.names      → { "#status": "status", "#stock": "stock" }
 // cond1.values     → { ":status": { S: "active" }, ":stock": { N: "0" } }
-
 const cond2 = Expression.condition({
   between: { price: [10, 50] },
   attributeExists: "category",
 })
-
 // Update expression with SET, REMOVE, and ADD clauses
 const upd = Expression.update({
   set: { name: "New Name", price: 39.99 },
@@ -342,9 +317,7 @@ const AppLayer = Layer.mergeAll(
   }),
   MainTable.layer({ name: "expr-demo-table" }),
 )
-
 const main = program.pipe(Effect.provide(AppLayer))
-
 Effect.runPromise(main).then(
   () => console.log("\nDone."),
   (err) => console.error("\nFailed:", err),

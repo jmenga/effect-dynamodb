@@ -18,10 +18,10 @@
  *   GSI3: gsi3pk/gsi3sk — titles (Book+Genre)
  *
  * Collections:
- *   detail:  Book + Genre by isbn         (primary index)
  *   works:   Author + Book + Genre by author name (gsi2)
- *   account: Member + Book by memberId    (gsi1)
- *   titles:  Book + Genre by bookTitle    (gsi3)
+ *   account: Member + Book by memberId           (gsi1)
+ *   titles:  Book + Genre by bookTitle            (gsi3)
+ *   categories: Genre by genre                    (gsi1, isolated)
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -31,6 +31,7 @@
  */
 
 import { Console, Effect, Layer, Schema } from "effect"
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -89,148 +90,126 @@ const LibSchema = DynamoSchema.make({ name: "library", version: 1 })
 // #endregion
 
 // =============================================================================
-// 3. Entity definitions — 4 entities, 3 GSIs, 4 collections
+// 3. Entity definitions — primary key only
 // =============================================================================
 
 /**
- * Author — 2 indexes (primary + gsi2)
+ * Author — primary key only
  *
  * Primary: identity key by last name + first name
- * GSI2: "works" collection — author's books and genres
  */
 // #region author-entity
 const Authors = Entity.make({
   model: Author,
   entityType: "Author",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["authorLastName"] },
-      sk: { field: "sk", composite: ["authorFirstName"] },
-    },
-    info: {
-      index: "gsi2",
-      collection: "works",
-      pk: { field: "gsi2pk", composite: ["authorLastName", "authorFirstName"] },
-      sk: { field: "gsi2sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["authorLastName"] },
+    sk: { field: "sk", composite: ["authorFirstName"] },
   },
   timestamps: true,
 })
 // #endregion
 
 /**
- * Book — 4 indexes (primary + 3 GSIs)
+ * Book — primary key only
  *
- * Primary: copies by isbn + bookId (part of "detail" collection concept)
- * GSI1: loans — sparse index using optional memberId/loanEndDate
- *        When a book is not loaned, memberId is absent, so it won't appear.
- *        Part of "account" collection with Member.
- * GSI2: "works" collection — author's books alongside Author and Genre
- * GSI3: "titles" collection — books and genres by title
+ * Primary: copies by isbn + bookId
  */
 // #region book-entity
 const Books = Entity.make({
   model: Book,
   entityType: "Book",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["isbn"] },
-      sk: { field: "sk", composite: ["bookId"] },
-    },
-    loans: {
-      index: "gsi1",
-      collection: "account",
-      pk: { field: "gsi1pk", composite: ["memberId"] },
-      sk: { field: "gsi1sk", composite: ["loanEndDate"] },
-    },
-    author: {
-      index: "gsi2",
-      collection: "works",
-      pk: { field: "gsi2pk", composite: ["authorLastName", "authorFirstName"] },
-      sk: { field: "gsi2sk", composite: ["bookId"] },
-    },
-    releases: {
-      index: "gsi3",
-      collection: "titles",
-      pk: { field: "gsi3pk", composite: ["bookTitle"] },
-      sk: { field: "gsi3sk", composite: ["releaseDate"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["isbn"] },
+    sk: { field: "sk", composite: ["bookId"] },
   },
   timestamps: true,
 })
 // #endregion
 
 /**
- * Genre — 4 indexes (primary + 3 GSIs)
+ * Genre — primary key only
  *
- * Primary: genres by isbn + genre + subgenre (alongside Book in "detail" concept)
- * GSI1: categories — standalone genre browsing
- * GSI2: "works" collection — genres alongside Author and Book
- * GSI3: "titles" collection — genres alongside Book by title
+ * Primary: genres by isbn + genre + subgenre
  */
 // #region genre-entity
 const Genres = Entity.make({
   model: Genre,
   entityType: "Genre",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["isbn"] },
-      sk: { field: "sk", composite: ["genre", "subgenre"] },
-    },
-    categories: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["genre"] },
-      sk: { field: "gsi1sk", composite: ["subgenre"] },
-    },
-    author: {
-      index: "gsi2",
-      collection: "works",
-      pk: { field: "gsi2pk", composite: ["authorLastName", "authorFirstName"] },
-      sk: { field: "gsi2sk", composite: ["genre"] },
-    },
-    title: {
-      index: "gsi3",
-      collection: "titles",
-      pk: { field: "gsi3pk", composite: ["bookTitle"] },
-      sk: { field: "gsi3sk", composite: ["genre", "subgenre"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["isbn"] },
+    sk: { field: "sk", composite: ["genre", "subgenre"] },
   },
   timestamps: true,
 })
 // #endregion
 
 /**
- * Member — 2 indexes (primary + gsi1)
+ * Member — primary key only
  *
  * Primary: identity key by memberId
- * GSI1: "account" collection — member info alongside their loaned books
  */
 // #region member-entity
 const Members = Entity.make({
   model: Member,
   entityType: "Member",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["memberId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    account: {
-      index: "gsi1",
-      collection: "account",
-      pk: { field: "gsi1pk", composite: ["memberId"] },
-      sk: { field: "gsi1sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["memberId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 // #endregion
 
 // =============================================================================
-// 4. Table definition — declares all entity members
+// 4. Table + Collections — GSI access patterns
 // =============================================================================
 
 // #region table
 const LibTable = Table.make({ schema: LibSchema, entities: { Authors, Books, Genres, Members } })
+// #endregion
+
+// #region collections
+const Account = Collections.make("account", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["memberId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Members: Collections.member(Members, { sk: { composite: [] } }),
+    Books: Collections.member(Books, { sk: { composite: ["loanEndDate"] } }),
+  },
+})
+
+const Categories = Collections.make("categories", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["genre"] },
+  sk: { field: "gsi1sk" },
+  type: "isolated",
+  members: {
+    Genres: Collections.member(Genres, { sk: { composite: ["subgenre"] } }),
+  },
+})
+
+const Works = Collections.make("works", {
+  index: "gsi2",
+  pk: { field: "gsi2pk", composite: ["authorLastName", "authorFirstName"] },
+  sk: { field: "gsi2sk" },
+  members: {
+    Authors: Collections.member(Authors, { sk: { composite: [] } }),
+    Books: Collections.member(Books, { sk: { composite: ["bookId"] } }),
+    Genres: Collections.member(Genres, { sk: { composite: ["genre"] } }),
+  },
+})
+
+const Titles = Collections.make("titles", {
+  index: "gsi3",
+  pk: { field: "gsi3pk", composite: ["bookTitle"] },
+  sk: { field: "gsi3sk" },
+  members: {
+    Books: Collections.member(Books, { sk: { composite: ["releaseDate"] } }),
+    Genres: Collections.member(Genres, { sk: { composite: ["genre", "subgenre"] } }),
+  },
+})
 // #endregion
 
 // =============================================================================
@@ -351,24 +330,27 @@ const assertEq = <T>(actual: T, expected: T, label: string): void => {
 
 const program = Effect.gen(function* () {
   // #region seed-insert
-  // Typed execution gateway — binds all table members
-  const db = yield* DynamoClient.make(LibTable)
+  // Typed execution gateway — binds all entities and collections
+  const db = yield* DynamoClient.make({
+    entities: { Authors, Books, Genres, Members },
+    collections: { Account, Categories, Works, Titles },
+  })
 
   // --- Setup: create table ---
-  yield* db.createTable()
+  yield* db.tables["library-table"]!.create()
 
   // --- Seed data ---
   for (const author of Object.values(authors)) {
-    yield* db.Authors.put(author)
+    yield* db.entities.Authors.put(author)
   }
   for (const book of Object.values(books)) {
-    yield* db.Books.put(book)
+    yield* db.entities.Books.put(book)
   }
   for (const g of Object.values(genres)) {
-    yield* db.Genres.put(g)
+    yield* db.entities.Genres.put(g)
   }
   for (const member of Object.values(members)) {
-    yield* db.Members.put(member)
+    yield* db.entities.Members.put(member)
   }
   // #endregion
 
@@ -378,14 +360,14 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 1: Get Author by Name (primary)")
 
   // #region get-author
-  const tolkien = yield* db.Authors.get({
+  const tolkien = yield* db.entities.Authors.get({
     authorLastName: "Tolkien",
     authorFirstName: "J.R.R.",
   })
   // tolkien.birthday → "1892-01-03"
   // tolkien.bio → "English writer and philologist..."
 
-  const asimov = yield* db.Authors.get({
+  const asimov = yield* db.entities.Authors.get({
     authorLastName: "Asimov",
     authorFirstName: "Isaac",
   })
@@ -409,7 +391,7 @@ const program = Effect.gen(function* () {
 
   // #region detail-by-isbn
   // Get the book
-  const hobbit = yield* db.Books.get({
+  const hobbit = yield* db.entities.Books.get({
     isbn: "978-0-547-928227",
     bookId: "b-hobbit",
   })
@@ -417,7 +399,7 @@ const program = Effect.gen(function* () {
   // hobbit.publisher → "George Allen & Unwin"
 
   // Get the genre for the same ISBN
-  const hobbitGenre = yield* db.Genres.get({
+  const hobbitGenre = yield* db.entities.Genres.get({
     isbn: "978-0-547-928227",
     genre: "Fantasy",
     subgenre: "High Fantasy",
@@ -438,28 +420,28 @@ const program = Effect.gen(function* () {
   // Pattern 3: Author's works — books + genres by author (gsi2 "works")
   //
   // The "works" collection on gsi2 groups Author, Book, and Genre by
-  // authorLastName + authorFirstName. Query each entity's GSI method
-  // to retrieve all of an author's associated items.
+  // authorLastName + authorFirstName. Query the collection to retrieve
+  // all of an author's associated items.
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 3: Author's Works (gsi2 — works collection)")
 
   // #region works-collection
   // Asimov's books
-  const asimovBooks = yield* db.Books.collect(
-    Books.query.author({ authorLastName: "Asimov", authorFirstName: "Isaac" }),
-  )
+  const { Books: asimovBooks } = yield* db.collections
+    .Works({ authorLastName: "Asimov", authorFirstName: "Isaac" })
+    .collect()
   // → [{ bookTitle: "Foundation", ... }, { bookTitle: "I, Robot", ... }]
 
   // Asimov's genres
-  const asimovGenres = yield* db.Genres.collect(
-    Genres.query.author({ authorLastName: "Asimov", authorFirstName: "Isaac" }),
-  )
+  const { Genres: asimovGenres } = yield* db.collections
+    .Works({ authorLastName: "Asimov", authorFirstName: "Isaac" })
+    .collect()
   // → [{ subgenre: "Space Opera", ... }, { subgenre: "Robotics", ... }]
 
   // Author's own record in the works collection
-  const tolkienInfo = yield* db.Authors.collect(
-    Authors.query.info({ authorLastName: "Tolkien", authorFirstName: "J.R.R." }),
-  )
+  const { Authors: tolkienInfo } = yield* db.collections
+    .Works({ authorLastName: "Tolkien", authorFirstName: "J.R.R." })
+    .collect()
   // → [{ birthday: "1892-01-03", bio: "...", ... }]
   // #endregion
   assertEq(asimovBooks.length, 2, "Asimov has 2 books")
@@ -469,9 +451,9 @@ const program = Effect.gen(function* () {
   const asimovSubgenres = asimovGenres.map((g) => g.subgenre).sort()
   assertEq(asimovSubgenres, ["Robotics", "Space Opera"], "Asimov subgenres")
 
-  const tolkienBooks = yield* db.Books.collect(
-    Books.query.author({ authorLastName: "Tolkien", authorFirstName: "J.R.R." }),
-  )
+  const { Books: tolkienBooks } = yield* db.collections
+    .Works({ authorLastName: "Tolkien", authorFirstName: "J.R.R." })
+    .collect()
   assertEq(tolkienBooks.length, 1, "Tolkien has 1 book")
   assertEq(tolkienBooks[0]!.bookTitle, "The Hobbit", "Tolkien book title")
   assertEq(tolkienInfo.length, 1, "Tolkien has 1 author record in works")
@@ -481,23 +463,19 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   // Pattern 4: Member account — member info + loaned books (gsi1 "account")
   //
-  // Before any loans, Member.query.account returns the member only.
-  // After loaning a book, Book.query.loans returns the loaned book.
+  // Before any loans, the account collection returns only the member.
+  // After loaning a book, the loaned book appears in the collection too.
   // Both share gsi1 via the "account" collection.
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 4: Member Account (gsi1 — account collection)")
 
   // #region account-collection
   // Member profile
-  const aliceAccount = yield* db.Members.collect(
-    Members.query.account({ memberId: "m-alice" }),
-  )
+  const { Members: aliceAccount } = yield* db.collections.Account({ memberId: "m-alice" }).collect()
   // → [{ memberId: "m-alice", city: "New York", state: "NY", ... }]
 
   // Alice's loaned books (initially empty -- sparse index)
-  const aliceLoans = yield* db.Books.collect(
-    Books.query.loans({ memberId: "m-alice" }),
-  )
+  const { Books: aliceLoans } = yield* db.collections.Account({ memberId: "m-alice" }).collect()
   // → [] (no books loaned yet)
   // #endregion
   assertEq(aliceAccount.length, 1, "Alice has 1 account record (no loans yet)")
@@ -509,20 +487,20 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   // Pattern 5: Books by title (gsi3 "titles" collection)
   //
-  // Book and Genre share gsi3 with PK=bookTitle. Query each entity's
-  // GSI method to find items by title.
+  // Book and Genre share gsi3 with PK=bookTitle. Query the collection
+  // to find items by title.
   // -------------------------------------------------------------------------
   yield* Console.log("Pattern 5: Books by Title (gsi3 — titles collection)")
 
   // #region titles-collection
-  const foundationByTitle = yield* db.Books.collect(
-    Books.query.releases({ bookTitle: "Foundation" }),
-  )
+  const { Books: foundationByTitle } = yield* db.collections
+    .Titles({ bookTitle: "Foundation" })
+    .collect()
   // → [{ isbn: "978-0-553-293357", releaseDate: "1951-06-01", ... }]
 
-  const foundationGenresByTitle = yield* db.Genres.collect(
-    Genres.query.title({ bookTitle: "Foundation" }),
-  )
+  const { Genres: foundationGenresByTitle } = yield* db.collections
+    .Titles({ bookTitle: "Foundation" })
+    .collect()
   // → [{ genre: "Sci-Fi", subgenre: "Space Opera", ... }]
   // #endregion
   assertEq(foundationByTitle.length, 1, "1 book titled Foundation")
@@ -543,18 +521,18 @@ const program = Effect.gen(function* () {
 
   // #region genre-categories
   // All Sci-Fi subgenres
-  const sciFiGenres = yield* db.Genres.collect(
-    Genres.query.categories({ genre: "Sci-Fi" }),
-  )
+  const { Genres: sciFiGenres } = yield* db.collections
+    .Categories({ genre: "Sci-Fi" })
+    .collect()
   // → [
   //   { subgenre: "Robotics", bookTitle: "I, Robot", ... },
   //   { subgenre: "Space Opera", bookTitle: "Foundation", ... },
   // ]
 
   // All Fantasy subgenres
-  const fantasyGenres = yield* db.Genres.collect(
-    Genres.query.categories({ genre: "Fantasy" }),
-  )
+  const { Genres: fantasyGenres } = yield* db.collections
+    .Categories({ genre: "Fantasy" })
+    .collect()
   // → [{ subgenre: "High Fantasy", bookTitle: "The Hobbit", ... }]
   // #endregion
   assertEq(sciFiGenres.length, 2, "2 Sci-Fi genres")
@@ -574,7 +552,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 7: Loan a Book (update — sparse index)")
 
   // #region loan-book
-  yield* db.Books.update(
+  yield* db.entities.Books.update(
     { isbn: "978-0-547-928227", bookId: "b-hobbit" },
     Entity.set({
       memberId: "m-alice",
@@ -588,15 +566,13 @@ const program = Effect.gen(function* () {
   )
 
   // Now the book appears in Alice's loans
-  const aliceLoansAfter = yield* db.Books.collect(
-    Books.query.loans({ memberId: "m-alice" }),
-  )
+  const { Books: aliceLoansAfter } = yield* db.collections
+    .Account({ memberId: "m-alice" })
+    .collect()
   // → [{ bookTitle: "The Hobbit", isbn: "978-0-547-928227", ... }]
 
   // Bob still has no loans
-  const bobLoans = yield* db.Books.collect(
-    Books.query.loans({ memberId: "m-bob" }),
-  )
+  const { Books: bobLoans } = yield* db.collections.Account({ memberId: "m-bob" }).collect()
   // → []
   // #endregion
   assertEq(aliceLoansAfter.length, 1, "Alice now has 1 loaned book")
@@ -630,13 +606,13 @@ const program = Effect.gen(function* () {
   ])
 
   // Book is no longer in Alice's loans
-  const aliceLoansCleared = yield* db.Books.collect(
-    Books.query.loans({ memberId: "m-alice" }),
-  )
+  const { Books: aliceLoansCleared } = yield* db.collections
+    .Account({ memberId: "m-alice" })
+    .collect()
   // → []
 
   // But the book still exists and is intact
-  const returnedHobbit = yield* db.Books.get({
+  const returnedHobbit = yield* db.entities.Books.get({
     isbn: "978-0-547-928227",
     bookId: "b-hobbit",
   })
@@ -644,9 +620,9 @@ const program = Effect.gen(function* () {
   // returnedHobbit.memberId → undefined (cleared)
 
   // And still appears in author's works
-  const tolkienBooksAfter = yield* db.Books.collect(
-    Books.query.author({ authorLastName: "Tolkien", authorFirstName: "J.R.R." }),
-  )
+  const { Books: tolkienBooksAfter } = yield* db.collections
+    .Works({ authorLastName: "Tolkien", authorFirstName: "J.R.R." })
+    .collect()
   // → [{ bookTitle: "The Hobbit", ... }]
   // #endregion
   assertEq(aliceLoansCleared.length, 0, "Alice has 0 loans after return")
@@ -659,7 +635,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("  Return: Book removed from loans index, still in works — OK")
 
   // --- Cleanup ---
-  yield* db.deleteTable()
+  yield* db.tables["library-table"]!.delete()
   yield* Console.log("\nAll 8 patterns passed.")
 })
 
@@ -697,4 +673,8 @@ export {
   Book,
   Genre,
   Member,
+  Account,
+  Categories,
+  Works,
+  Titles,
 }

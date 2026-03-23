@@ -1,6 +1,6 @@
 import ts from "typescript"
 import { describe, expect, it } from "vitest"
-import { resolveEntities } from "../src/core/EntityResolver"
+import { resolveCollections, resolveEntities } from "../src/core/EntityResolver"
 
 function parseSource(source: string): ts.SourceFile {
   return ts.createSourceFile("test.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
@@ -208,6 +208,110 @@ describe("EntityResolver", () => {
       expect(entities).toHaveLength(1)
       expect(entities[0]!.softDelete).toEqual({ ttl: 86400 })
       expect(entities[0]!.unique).toEqual({ email: { fields: ["email"] } })
+    })
+
+    it("should resolve entity with primaryKey (v2 API)", () => {
+      const source = `
+        const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
+
+        const Users = Entity.make({
+          model: User,
+          entityType: "User",
+          primaryKey: {
+            pk: { field: "pk", composite: ["userId"] },
+            sk: { field: "sk", composite: [] },
+          },
+        })
+
+        const MainTable = Table.make({ schema: AppSchema, entities: { Users } })
+      `
+      const sf = parseSource(source)
+      const entities = resolveEntities(ts, sf)
+
+      expect(entities).toHaveLength(1)
+      expect(entities[0]!.variableName).toBe("Users")
+      expect(entities[0]!.entityType).toBe("User")
+      expect(entities[0]!.indexes.primary).toBeDefined()
+      expect(entities[0]!.indexes.primary!.pk).toEqual({
+        field: "pk",
+        composite: ["userId"],
+      })
+    })
+  })
+
+  describe("resolveCollections", () => {
+    it("should resolve a basic collection", () => {
+      const source = `
+        const Assignments = Collections.make("assignments", {
+          index: "gsi3",
+          pk: { field: "gsi3pk", composite: ["employee"] },
+          sk: { field: "gsi3sk" },
+          members: {
+            Employees: Collections.member(Employees, { sk: { composite: [] } }),
+            Tasks: Collections.member(Tasks, { sk: { composite: ["project", "task"] } }),
+          },
+        })
+      `
+      const sf = parseSource(source)
+      const collections = resolveCollections(ts, sf)
+
+      expect(collections).toHaveLength(1)
+      expect(collections[0]!.variableName).toBe("Assignments")
+      expect(collections[0]!.collectionName).toBe("assignments")
+      expect(collections[0]!.index).toBe("gsi3")
+      expect(collections[0]!.type).toBe("clustered")
+      expect(collections[0]!.pk).toEqual({
+        field: "gsi3pk",
+        composite: ["employee"],
+      })
+      expect(collections[0]!.sk).toEqual({ field: "gsi3sk" })
+      expect(Object.keys(collections[0]!.members)).toEqual(["Employees", "Tasks"])
+      expect(collections[0]!.members.Employees).toEqual({
+        entityVariableName: "Employees",
+        sk: { composite: [] },
+      })
+      expect(collections[0]!.members.Tasks).toEqual({
+        entityVariableName: "Tasks",
+        sk: { composite: ["project", "task"] },
+      })
+    })
+
+    it("should resolve isolated collection type", () => {
+      const source = `
+        const ManagerView = Collections.make("managerView", {
+          type: "isolated",
+          index: "gsi2",
+          pk: { field: "gsi2pk", composite: ["manager"] },
+          sk: { field: "gsi2sk" },
+          members: {
+            Employees: Collections.member(Employees, { sk: { composite: [] } }),
+          },
+        })
+      `
+      const sf = parseSource(source)
+      const collections = resolveCollections(ts, sf)
+
+      expect(collections).toHaveLength(1)
+      expect(collections[0]!.type).toBe("isolated")
+    })
+
+    it("should resolve single-member collection", () => {
+      const source = `
+        const TasksByProject = Collections.make("tasksByProject", {
+          index: "gsi1",
+          pk: { field: "gsi1pk", composite: ["project"] },
+          sk: { field: "gsi1sk" },
+          members: {
+            Tasks: Collections.member(Tasks, { sk: { composite: ["employee", "task"] } }),
+          },
+        })
+      `
+      const sf = parseSource(source)
+      const collections = resolveCollections(ts, sf)
+
+      expect(collections).toHaveLength(1)
+      expect(collections[0]!.collectionName).toBe("tasksByProject")
+      expect(Object.keys(collections[0]!.members)).toEqual(["Tasks"])
     })
   })
 })

@@ -21,11 +21,10 @@
  */
 
 import { Console, Effect, Layer, Schema } from "effect"
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import * as KeyComposer from "../src/KeyComposer.js"
-import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 
@@ -83,40 +82,16 @@ const HrSchema = DynamoSchema.make({ name: "hr", version: 1 })
 // #endregion
 
 // =============================================================================
-// 3. Entity definitions
+// 3. Entity definitions — primary key only
 // =============================================================================
 
 // #region employee-entity
 const Employees = Entity.make({
   model: Employee,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employee"] },
-      sk: { field: "sk", composite: [] },
-    },
-    coworkers: {
-      index: "gsi1",
-      collection: "workplaces",
-      pk: { field: "gsi1pk", composite: ["office"] },
-      sk: { field: "gsi1sk", composite: ["team", "title", "employee"] },
-    },
-    employeeLookup: {
-      index: "gsi3",
-      collection: "assignments",
-      pk: { field: "gsi3pk", composite: ["employee"] },
-      sk: { field: "gsi3sk", composite: [] },
-    },
-    roles: {
-      index: "gsi4",
-      pk: { field: "gsi4pk", composite: ["title"] },
-      sk: { field: "gsi4sk", composite: ["salary", "employee"] },
-    },
-    directReports: {
-      index: "gsi5",
-      pk: { field: "gsi5pk", composite: ["manager"] },
-      sk: { field: "gsi5sk", composite: ["team", "office", "employee"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employee"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: true,
@@ -128,22 +103,9 @@ const Employees = Entity.make({
 const Tasks = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["task"] },
-      sk: { field: "sk", composite: ["project", "employee"] },
-    },
-    project: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["project"] },
-      sk: { field: "gsi1sk", composite: ["employee", "task"] },
-    },
-    assigned: {
-      index: "gsi3",
-      collection: "assignments",
-      pk: { field: "gsi3pk", composite: ["employee"] },
-      sk: { field: "gsi3sk", composite: ["project", "task"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["task"] },
+    sk: { field: "sk", composite: ["project", "employee"] },
   },
   timestamps: true,
 })
@@ -153,35 +115,96 @@ const Tasks = Entity.make({
 const Offices = Entity.make({
   model: Office,
   entityType: "Office",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["office"] },
-      sk: { field: "sk", composite: [] },
-    },
-    workplace: {
-      index: "gsi1",
-      collection: "workplaces",
-      pk: { field: "gsi1pk", composite: ["office"] },
-      sk: { field: "gsi1sk", composite: [] },
-    },
-    byLocation: {
-      index: "gsi2",
-      pk: { field: "gsi2pk", composite: ["country", "state"] },
-      sk: { field: "gsi2sk", composite: ["city", "zip", "office"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["office"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 // #endregion
 
 // =============================================================================
-// 4. Table — declares entities
+// 4. Table + Collections — GSI access patterns
 // =============================================================================
 
 // #region table
 const HrTable = Table.make({
   schema: HrSchema,
   entities: { Employees, Tasks, Offices },
+})
+// #endregion
+
+// #region collections
+const Workplaces = Collections.make("workplaces", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["office"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Employees: Collections.member(Employees, {
+      sk: { composite: ["team", "title", "employee"] },
+    }),
+    Offices: Collections.member(Offices, { sk: { composite: [] } }),
+  },
+})
+
+const TasksByProject = Collections.make("tasksByProject", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["project"] },
+  sk: { field: "gsi1sk" },
+  type: "isolated",
+  members: {
+    Tasks: Collections.member(Tasks, {
+      sk: { composite: ["employee", "task"] },
+    }),
+  },
+})
+
+const Assignments = Collections.make("assignments", {
+  index: "gsi3",
+  pk: { field: "gsi3pk", composite: ["employee"] },
+  sk: { field: "gsi3sk" },
+  members: {
+    Employees: Collections.member(Employees, { sk: { composite: [] } }),
+    Tasks: Collections.member(Tasks, {
+      sk: { composite: ["project", "task"] },
+    }),
+  },
+})
+
+const Roles = Collections.make("roles", {
+  index: "gsi4",
+  pk: { field: "gsi4pk", composite: ["title"] },
+  sk: { field: "gsi4sk" },
+  type: "isolated",
+  members: {
+    Employees: Collections.member(Employees, {
+      sk: { composite: ["salary", "employee"] },
+    }),
+  },
+})
+
+const DirectReports = Collections.make("directReports", {
+  index: "gsi5",
+  pk: { field: "gsi5pk", composite: ["manager"] },
+  sk: { field: "gsi5sk" },
+  type: "isolated",
+  members: {
+    Employees: Collections.member(Employees, {
+      sk: { composite: ["team", "office", "employee"] },
+    }),
+  },
+})
+
+const OfficesByLocation = Collections.make("officesByLocation", {
+  index: "gsi2",
+  pk: { field: "gsi2pk", composite: ["country", "state"] },
+  sk: { field: "gsi2sk" },
+  type: "isolated",
+  members: {
+    Offices: Collections.member(Offices, {
+      sk: { composite: ["city", "zip", "office"] },
+    }),
+  },
 })
 // #endregion
 
@@ -303,22 +326,32 @@ const assertEq = <T>(actual: T, expected: T, label: string): void => {
 // =============================================================================
 
 const program = Effect.gen(function* () {
-  // Typed execution gateway — binds all entities
+  // Typed execution gateway — binds all entities and collections
   // #region seed-execution
-  const db = yield* DynamoClient.make(HrTable)
+  const db = yield* DynamoClient.make({
+    entities: { Employees, Tasks, Offices },
+    collections: {
+      Workplaces,
+      TasksByProject,
+      Assignments,
+      Roles,
+      DirectReports,
+      OfficesByLocation,
+    },
+  })
 
   // --- Setup: create table ---
-  yield* db.createTable()
+  yield* db.tables["hr-table"]!.create()
 
   // --- Seed data ---
   for (const office of Object.values(offices)) {
-    yield* db.Offices.put(office)
+    yield* db.entities.Offices.put(office)
   }
   for (const emp of Object.values(employees)) {
-    yield* db.Employees.put(emp)
+    yield* db.entities.Employees.put(emp)
   }
   for (const task of Object.values(tasks)) {
-    yield* db.Tasks.put(task)
+    yield* db.entities.Tasks.put(task)
   }
   // #endregion
 
@@ -326,9 +359,9 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 1: CRUD")
 
   // #region crud
-  const joe = yield* db.Employees.get({ employee: "jlowe" })
+  const joe = yield* db.entities.Employees.get({ employee: "jlowe" })
 
-  const updated = yield* db.Employees.update(
+  const updated = yield* db.entities.Employees.update(
     { employee: "jlowe" },
     Entity.set({
       office: "gw-zoo",
@@ -339,9 +372,9 @@ const program = Effect.gen(function* () {
     }),
   )
 
-  yield* db.Employees.delete({ employee: "jlowe" })
+  yield* db.entities.Employees.delete({ employee: "jlowe" })
 
-  yield* db.Employees.put(employees.jlowe)
+  yield* db.entities.Employees.put(employees.jlowe)
   // #endregion
   assertEq(joe.firstName, "Joe", "get firstName")
   assertEq(joe.lastName, "Lowe", "get lastName")
@@ -357,11 +390,13 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 2: Workplaces (gsi1 collection)")
 
   // #region workplaces
-  const gwZooEmployees = yield* db.Employees.collect(
-    Employees.query.coworkers({ office: "gw-zoo" }),
-  )
+  const { Employees: gwZooEmployees } = yield* db.collections
+    .Workplaces({ office: "gw-zoo" })
+    .collect()
 
-  const gwZooOffice = yield* db.Offices.collect(Offices.query.workplace({ office: "gw-zoo" }))
+  const { Offices: gwZooOffice } = yield* db.collections
+    .Workplaces({ office: "gw-zoo" })
+    .collect()
   // #endregion
   assertEq(gwZooEmployees.length, 2, "gw-zoo has 2 employees")
   const gwZooIds = gwZooEmployees.map((e) => e.employee).sort()
@@ -375,11 +410,13 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 3: Assignments (gsi3 collection)")
 
   // #region assignments
-  const dfinlayTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "dfinlay" }))
+  const { Tasks: dfinlayTasks } = yield* db.collections
+    .Assignments({ employee: "dfinlay" })
+    .collect()
 
-  const dfinlayInfo = yield* db.Employees.collect(
-    Employees.query.employeeLookup({ employee: "dfinlay" }),
-  )
+  const { Employees: dfinlayInfo } = yield* db.collections
+    .Assignments({ employee: "dfinlay" })
+    .collect()
   // #endregion
   assertEq(dfinlayTasks.length, 1, "dfinlay has 1 task")
   assertEq(dfinlayTasks[0]!.task, "feed-cats", "dfinlay task ID")
@@ -392,9 +429,13 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 4: Tasks by Project (gsi1)")
 
   // #region tasks-by-project
-  const feedingTasks = yield* db.Tasks.collect(Tasks.query.project({ project: "feeding" }))
+  const { Tasks: feedingTasks } = yield* db.collections
+    .TasksByProject({ project: "feeding" })
+    .collect()
 
-  const fundraiserTasks = yield* db.Tasks.collect(Tasks.query.project({ project: "fundraiser" }))
+  const { Tasks: fundraiserTasks } = yield* db.collections
+    .TasksByProject({ project: "fundraiser" })
+    .collect()
   // #endregion
   assertEq(feedingTasks.length, 2, "feeding project has 2 tasks")
   const feedingTaskIds = feedingTasks.map((t) => t.task).sort()
@@ -406,13 +447,13 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 5: Offices by Location (gsi2)")
 
   // #region offices-by-location
-  const flOffices = yield* db.Offices.collect(
-    Offices.query.byLocation({ country: "US", state: "FL" }),
-  )
+  const { Offices: flOffices } = yield* db.collections
+    .OfficesByLocation({ country: "US", state: "FL" })
+    .collect()
 
-  const okOffices = yield* db.Offices.collect(
-    Offices.query.byLocation({ country: "US", state: "OK" }),
-  )
+  const { Offices: okOffices } = yield* db.collections
+    .OfficesByLocation({ country: "US", state: "OK" })
+    .collect()
   // #endregion
   assertEq(flOffices.length, 1, "Florida has 1 office")
   assertEq(flOffices[0]!.office, "big-cat-rescue", "FL office ID")
@@ -425,20 +466,16 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 6: Salary Range Query (gsi4)")
 
   // #region salary-range
-  const zookeepers = yield* db.Employees.collect(Employees.query.roles({ title: "Zookeeper" }))
+  const { Employees: zookeepers } = yield* db.collections
+    .Roles({ title: "Zookeeper" })
+    .collect()
 
-  const rolesIndex = Employees.indexes.roles
-  const loPrefix = KeyComposer.composeSortKeyPrefix(HrSchema, "Employee", 1, rolesIndex, {
-    salary: "000000.00",
-  })
-  const hiPrefix = KeyComposer.composeSortKeyPrefix(HrSchema, "Employee", 1, rolesIndex, {
-    salary: "999999.99",
-  })
-
-  const directorsBySalary = yield* db.Employees.collect(
-    Employees.query
-      .roles({ title: "Director" })
-      .pipe(Query.where({ between: [loPrefix, hiPrefix] })),
+  // All directors — filter by salary range in application code
+  const { Employees: allDirectors } = yield* db.collections
+    .Roles({ title: "Director" })
+    .collect()
+  const directorsBySalary = allDirectors.filter(
+    (e) => e.salary >= "000000.00" && e.salary <= "999999.99",
   )
   // #endregion
   assertEq(zookeepers.length, 1, "1 Zookeeper")
@@ -453,13 +490,13 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 7: Direct Reports (gsi5)")
 
   // #region direct-reports
-  const jloweReports = yield* db.Employees.collect(
-    Employees.query.directReports({ manager: "jlowe" }),
-  )
+  const { Employees: jloweReports } = yield* db.collections
+    .DirectReports({ manager: "jlowe" })
+    .collect()
 
-  const cbaskinReports = yield* db.Employees.collect(
-    Employees.query.directReports({ manager: "cbaskin" }),
-  )
+  const { Employees: cbaskinReports } = yield* db.collections
+    .DirectReports({ manager: "cbaskin" })
+    .collect()
   // #endregion
   assertEq(jloweReports.length, 2, "jlowe has 2 reports (including self)")
   const jloweReportIds = jloweReports.map((e) => e.employee).sort()
@@ -473,7 +510,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 8: Employee Transfer (All-or-None)")
 
   // #region transfer
-  const transferred = yield* db.Employees.update(
+  const transferred = yield* db.entities.Employees.update(
     { employee: "dfinlay" },
     Entity.set({
       office: "big-cat-rescue",
@@ -484,13 +521,13 @@ const program = Effect.gen(function* () {
     }),
   )
 
-  const newReports = yield* db.Employees.collect(
-    Employees.query.directReports({ manager: "cbaskin" }),
-  )
+  const { Employees: newReports } = yield* db.collections
+    .DirectReports({ manager: "cbaskin" })
+    .collect()
 
-  const jloweReportsAfter = yield* db.Employees.collect(
-    Employees.query.directReports({ manager: "jlowe" }),
-  )
+  const { Employees: jloweReportsAfter } = yield* db.collections
+    .DirectReports({ manager: "jlowe" })
+    .collect()
   // #endregion
   assertEq(transferred.office, "big-cat-rescue", "transfer office")
   assertEq(transferred.team, "saturn", "transfer team")
@@ -508,14 +545,14 @@ const program = Effect.gen(function* () {
 
   // Partial GSI update fails at runtime
   // #region partial-gsi-error
-  const partialError = yield* db.Employees.update(
+  const partialError = yield* db.entities.Employees.update(
     { employee: "dfinlay" },
     Entity.set({ office: "gw-zoo" } as any),
   ).pipe(Effect.flip)
   // #endregion
   assertEq(partialError._tag, "ValidationError", "partial GSI update fails with ValidationError")
   assert(
-    String((partialError as any).cause).includes("coworkers"),
+    String((partialError as any).cause).includes("Workplaces"),
     "error references the violating index",
   )
   yield* Console.log("  Transfer + all-or-none runtime guard — OK")
@@ -545,9 +582,11 @@ const program = Effect.gen(function* () {
     }),
   ])
 
-  const newHire = yield* db.Employees.get({ employee: "rstarr" })
+  const newHire = yield* db.entities.Employees.get({ employee: "rstarr" })
 
-  const onboardingTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "rstarr" }))
+  const { Tasks: onboardingTasks } = yield* db.collections
+    .Assignments({ employee: "rstarr" })
+    .collect()
   // #endregion
   assertEq(newHire.firstName, "Rick", "transaction employee firstName")
   assertEq(newHire.title, "Trainee", "transaction employee title")
@@ -561,19 +600,21 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 10: Termination + Rehire (Soft Delete + Restore)")
 
   // #region soft-delete
-  yield* db.Employees.delete({ employee: "hschreibvogel" })
+  yield* db.entities.Employees.delete({ employee: "hschreibvogel" })
 
-  const cbaskinReportsAfterTermination = yield* db.Employees.collect(
-    Employees.query.directReports({ manager: "cbaskin" }),
-  )
+  const { Employees: cbaskinReportsAfterTermination } = yield* db.collections
+    .DirectReports({ manager: "cbaskin" })
+    .collect()
 
-  const terminatedRecord = yield* db.Employees.deleted.get({ employee: "hschreibvogel" })
+  const terminatedRecord = yield* db.entities.Employees.deleted.get({
+    employee: "hschreibvogel",
+  })
 
-  const rehired = yield* db.Employees.restore({ employee: "hschreibvogel" })
+  const rehired = yield* db.entities.Employees.restore({ employee: "hschreibvogel" })
 
-  const reportsAfterRehire = yield* db.Employees.collect(
-    Employees.query.directReports({ manager: "cbaskin" }),
-  )
+  const { Employees: reportsAfterRehire } = yield* db.collections
+    .DirectReports({ manager: "cbaskin" })
+    .collect()
   // #endregion
   const terminatedReportIds = cbaskinReportsAfterTermination.map((e) => e.employee).sort()
   assert(
@@ -591,7 +632,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("  Terminate + rehire: soft-delete, audit lookup, restore — OK")
 
   // --- Cleanup ---
-  yield* db.deleteTable()
+  yield* db.tables["hr-table"]!.delete()
   yield* Console.log("\nAll 10 patterns passed.")
 })
 

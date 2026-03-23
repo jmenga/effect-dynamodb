@@ -6,13 +6,13 @@ description: "3 entities with 5 GSIs, team queries, task status workflows, range
 A task management application with **employees**, **tasks**, and **offices** in a single DynamoDB table. Adapted from the [ElectroDB Task Manager example](https://electrodb.dev/en/examples/task-manager/) to showcase effect-dynamodb's approach to status-driven workflows, range queries, and task archival.
 
 **What you'll learn:**
-- 3 entities sharing one table with 5 GSIs
+- 3 entities sharing one table with 5 GSIs via Collections
 - Team queries with date-hired range filtering (GSI2)
 - Task status index for cross-project status queries (GSI4)
 - Task status workflow: open -> in-progress -> closed
 - Soft delete for task archival with restore capability
 - Atomic onboarding via transactions
-- Sort key range queries using `KeyComposer.composeSortKeyPrefix`
+- Application-level range filtering on date and salary fields
 
 ---
 
@@ -110,7 +110,7 @@ Key modeling decisions:
 
 ---
 
-## Step 2: Schema, Table, and Entities
+## Step 2: Schema, Table, Entities, and Collections
 
 ### Schema and Table
 
@@ -124,80 +124,31 @@ const TmTable = Table.make({ schema: TmSchema, entities: { Employees, Tasks, Off
 
 ### Employee Entity
 
-Employee has 6 indexes -- primary key plus 5 GSIs. The `teams` index (GSI2) is the key differentiator from the HR example, enabling team-based queries with date-hired range filtering:
+Employee defines only a primary key. All GSI access patterns are defined via Collections:
 
 ```typescript title="entities.ts" region="employee-entity" example="task-manager.ts"
 const Employees = Entity.make({
   model: Employee,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employee"] },
-      sk: { field: "sk", composite: [] },
-    },
-    coworkers: {
-      index: "gsi1",
-      collection: "workplaces",
-      pk: { field: "gsi1pk", composite: ["office"] },
-      sk: { field: "gsi1sk", composite: ["team", "title", "employee"] },
-    },
-    teams: {
-      index: "gsi2",
-      pk: { field: "gsi2pk", composite: ["team"] },
-      sk: { field: "gsi2sk", composite: ["dateHired", "title"] },
-    },
-    employeeLookup: {
-      index: "gsi3",
-      collection: "assignments",
-      pk: { field: "gsi3pk", composite: ["employee"] },
-      sk: { field: "gsi3sk", composite: [] },
-    },
-    roles: {
-      index: "gsi4",
-      pk: { field: "gsi4pk", composite: ["title"] },
-      sk: { field: "gsi4sk", composite: ["salary"] },
-    },
-    directReports: {
-      index: "gsi5",
-      pk: { field: "gsi5pk", composite: ["manager"] },
-      sk: { field: "gsi5sk", composite: ["team", "office"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employee"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 ```
 
-The `teams` index is designed for team leads: partition by `team`, sort by `dateHired + title`. This enables queries like "all development team members" and "development team members hired between 2020 and 2023".
-
 ### Task Entity
 
-Task has 4 indexes. The `statuses` index (GSI4) enables cross-project status queries. Task also uses `versioned` and `softDelete` for lifecycle management:
+Task defines only a primary key. The `statuses` collection (GSI4) enables cross-project status queries. Task also uses `versioned` and `softDelete` for lifecycle management:
 
 ```typescript title="entities.ts" region="task-entity" example="task-manager.ts"
 const Tasks = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["task"] },
-      sk: { field: "sk", composite: ["project", "employee"] },
-    },
-    project: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["project"] },
-      sk: { field: "gsi1sk", composite: ["employee", "status"] },
-    },
-    assigned: {
-      index: "gsi3",
-      collection: "assignments",
-      pk: { field: "gsi3pk", composite: ["employee"] },
-      sk: { field: "gsi3sk", composite: ["project", "status"] },
-    },
-    statuses: {
-      index: "gsi4",
-      pk: { field: "gsi4pk", composite: ["status"] },
-      sk: { field: "gsi4sk", composite: ["project", "employee"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["task"] },
+    sk: { field: "sk", composite: ["project", "employee"] },
   },
   timestamps: true,
   versioned: true,
@@ -206,7 +157,6 @@ const Tasks = Entity.make({
 ```
 
 Key design decisions:
-- **`statuses` (GSI4)** partitions by `status`, sorts by `project + employee` -- enables "all open tasks" and "open tasks for a specific project" queries
 - **`softDelete: true`** enables task archival -- closed tasks can be archived (removed from all indexes) while remaining retrievable for audit
 - **`versioned: true`** creates version snapshots on updates for audit trail
 
@@ -216,21 +166,107 @@ Key design decisions:
 const Offices = Entity.make({
   model: Office,
   entityType: "Office",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["office"] },
-      sk: { field: "sk", composite: [] },
-    },
-    workplace: {
-      index: "gsi1",
-      collection: "workplaces",
-      pk: { field: "gsi1pk", composite: ["office"] },
-      sk: { field: "gsi1sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["office"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 ```
+
+### Collections -- GSI Access Patterns
+
+All GSI access patterns are defined via `Collections.make()`. Each collection owns its index definition and member SK composites:
+
+```typescript title="collections.ts" region="collections" example="task-manager.ts"
+const Workplaces = Collections.make("workplaces", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["office"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Employees: Collections.member(Employees, {
+      sk: { composite: ["team", "title", "employee"] },
+    }),
+    Offices: Collections.member(Offices, { sk: { composite: [] } }),
+  },
+})
+
+const TasksByProject = Collections.make("tasksByProject", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["project"] },
+  sk: { field: "gsi1sk" },
+  type: "isolated",
+  members: {
+    Tasks: Collections.member(Tasks, {
+      sk: { composite: ["employee", "status"] },
+    }),
+  },
+})
+
+const Teams = Collections.make("teams", {
+  index: "gsi2",
+  pk: { field: "gsi2pk", composite: ["team"] },
+  sk: { field: "gsi2sk" },
+  type: "isolated",
+  members: {
+    Employees: Collections.member(Employees, {
+      sk: { composite: ["dateHired", "title"] },
+    }),
+  },
+})
+
+const Assignments = Collections.make("assignments", {
+  index: "gsi3",
+  pk: { field: "gsi3pk", composite: ["employee"] },
+  sk: { field: "gsi3sk" },
+  members: {
+    Employees: Collections.member(Employees, { sk: { composite: [] } }),
+    Tasks: Collections.member(Tasks, {
+      sk: { composite: ["project", "status"] },
+    }),
+  },
+})
+
+const Roles = Collections.make("roles", {
+  index: "gsi4",
+  pk: { field: "gsi4pk", composite: ["title"] },
+  sk: { field: "gsi4sk" },
+  type: "isolated",
+  members: {
+    Employees: Collections.member(Employees, {
+      sk: { composite: ["salary"] },
+    }),
+  },
+})
+
+const Statuses = Collections.make("statuses", {
+  index: "gsi4",
+  pk: { field: "gsi4pk", composite: ["status"] },
+  sk: { field: "gsi4sk" },
+  type: "isolated",
+  members: {
+    Tasks: Collections.member(Tasks, {
+      sk: { composite: ["project", "employee"] },
+    }),
+  },
+})
+
+const DirectReports = Collections.make("directReports", {
+  index: "gsi5",
+  pk: { field: "gsi5pk", composite: ["manager"] },
+  sk: { field: "gsi5sk" },
+  type: "isolated",
+  members: {
+    Employees: Collections.member(Employees, {
+      sk: { composite: ["team", "office"] },
+    }),
+  },
+})
+```
+
+The `Teams` collection is designed for team leads: partition by `team`, sort by `dateHired + title`. This enables queries like "all development team members" and "development team members hired between 2020 and 2023".
+
+The `Statuses` collection partitions by `status`, sorts by `project + employee` -- enables "all open tasks" and "open tasks for a specific project" queries.
 
 ---
 
@@ -357,13 +393,13 @@ const tasks = {
 
 ```typescript title="seed.ts" region="seed-exec" example="task-manager.ts"
 for (const office of Object.values(offices)) {
-  yield* db.Offices.put(office)
+  yield* db.entities.Offices.put(office)
 }
 for (const emp of Object.values(employees)) {
-  yield* db.Employees.put(emp)
+  yield* db.entities.Employees.put(emp)
 }
 for (const task of Object.values(tasks)) {
-  yield* db.Tasks.put(task)
+  yield* db.entities.Tasks.put(task)
 }
 ```
 
@@ -376,11 +412,11 @@ for (const task of Object.values(tasks)) {
 > Create, read, update, and delete employees and tasks.
 
 ```typescript region="crud" example="task-manager.ts"
-const tyler = yield* db.Employees.get({ employee: "tyler" })
+const tyler = yield* db.entities.Employees.get({ employee: "tyler" })
 // tyler.title → "Senior Engineer"
 // tyler.team → "development"
 
-const buildApi = yield* db.Tasks.get({
+const buildApi = yield* db.entities.Tasks.get({
   task: "build-api",
   project: "platform",
   employee: "tyler",
@@ -389,7 +425,7 @@ const buildApi = yield* db.Tasks.get({
 // buildApi.points → 8
 
 // Update employee title — must provide all GSI composites for affected indexes
-const promoted = yield* db.Employees.update(
+const promoted = yield* db.entities.Employees.update(
   { employee: "tyler" },
   Entity.set({
     office: "portland",
@@ -401,13 +437,13 @@ const promoted = yield* db.Employees.update(
   }),
 )
 
-yield* db.Employees.delete({ employee: "tyler" })
+yield* db.entities.Employees.delete({ employee: "tyler" })
 ```
 
 Note that the `get` call on a deleted item returns an `ItemNotFound` error. Use `catchTag` to handle it:
 
 ```typescript region="crud-delete-check" example="task-manager.ts"
-const deleted = yield* db.Employees.get({ employee: "tyler" }).pipe(
+const deleted = yield* db.entities.Employees.get({ employee: "tyler" }).pipe(
   Effect.map(() => false),
   Effect.catchTag("ItemNotFound", () => Effect.succeed(true)),
 )
@@ -417,15 +453,17 @@ const deleted = yield* db.Employees.get({ employee: "tyler" }).pipe(
 
 > As a regional manager, see office details and all employees at a location.
 
-Employee and Office share GSI1 via the `workplaces` collection. Both use `office` as the partition key.
+Employee and Office share GSI1 via the `Workplaces` collection. Both use `office` as the partition key.
 
 ```typescript region="workplaces" example="task-manager.ts"
-const portlandEmployees = yield* db.Employees.collect(
-  Employees.query.coworkers({ office: "portland" }),
-)
+const { Employees: portlandEmployees } = yield* db.collections
+  .Workplaces({ office: "portland" })
+  .collect()
 // → [{ employee: "sean", ... }, { employee: "tyler", ... }]
 
-const portlandOffice = yield* db.Offices.collect(Offices.query.workplace({ office: "portland" }))
+const { Offices: portlandOffice } = yield* db.collections
+  .Workplaces({ office: "portland" })
+  .collect()
 // → [{ office: "portland", city: "Portland", state: "OR", ... }]
 ```
 
@@ -433,19 +471,19 @@ const portlandOffice = yield* db.Offices.collect(Offices.query.workplace({ offic
 
 > As a project manager, find an employee's details and their assigned tasks.
 
-Employee and Task share GSI3 via the `assignments` collection. Both use `employee` as the partition key.
+Employee and Task share GSI3 via the `Assignments` collection. Both use `employee` as the partition key.
 
 ```typescript region="assignments" example="task-manager.ts"
-const tylerTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "tyler" }))
+const { Tasks: tylerTasks } = yield* db.collections.Assignments({ employee: "tyler" }).collect()
 // → [{ task: "build-api", points: 8 }, { task: "code-review", points: 2 }]
 
 // Verify points field (numeric) comes through correctly
 const totalTylerPoints = tylerTasks.reduce((sum, t) => sum + t.points, 0)
 // → 10
 
-const tylerInfo = yield* db.Employees.collect(
-  Employees.query.employeeLookup({ employee: "tyler" }),
-)
+const { Employees: tylerInfo } = yield* db.collections
+  .Assignments({ employee: "tyler" })
+  .collect()
 // → [{ firstName: "Tyler", title: "Senior Engineer", ... }]
 ```
 
@@ -453,112 +491,86 @@ const tylerInfo = yield* db.Employees.collect(
 
 > As a team lead, find all members of a team and filter by hire date.
 
-Employee's `teams` index on GSI2 uses `team` as PK and `dateHired + title` as SK. This enables both full team listings and date-range filtering.
+The `Teams` collection on GSI2 uses `team` as PK and `dateHired + title` as SK. This enables both full team listings and date-range filtering.
 
 ```typescript region="teams" example="task-manager.ts"
 // All development team members
-const devTeam = yield* db.Employees.collect(Employees.query.teams({ team: "development" }))
-
+const { Employees: devTeam } = yield* db.collections.Teams({ team: "development" }).collect()
 // Range query: development team members hired between 2020 and 2023
-const teamsIndex = Employees.indexes.teams
-const loHired = KeyComposer.composeSortKeyPrefix(TmSchema, "Employee", 1, teamsIndex, {
-  dateHired: "2020-01-01",
-})
-const hiHired = KeyComposer.composeSortKeyPrefix(TmSchema, "Employee", 1, teamsIndex, {
-  dateHired: "2023-12-31",
-})
-
-const recentDevHires = yield* db.Employees.collect(
-  Employees.query
-    .teams({ team: "development" })
-    .pipe(Query.where({ between: [loHired, hiHired] })),
+const { Employees: allDevForRange } = yield* db.collections
+  .Teams({ team: "development" })
+  .collect()
+const recentDevHires = allDevForRange.filter(
+  (e) => e.dateHired >= "2020-01-01" && e.dateHired <= "2023-12-31",
 )
-// → [{ employee: "sean", dateHired: "2022-06-01" }]
-
 // Reverse sort: development team by most recently hired first
-const devReversed = yield* db.Employees.collect(
-  Employees.query.teams({ team: "development" }).pipe(Query.reverse),
-)
-// → [{ employee: "sean", ... }, { employee: "tyler", ... }]
+const { Employees: devReversed } = yield* db.collections
+  .Teams({ team: "development" })
+  .reverse()
+  .collect()
 ```
 
-`KeyComposer.composeSortKeyPrefix` builds the structured sort key prefix (`$taskman#v1#employee#2020-01-01`) used for `between` range bounds. This works because date strings in ISO format sort lexicographically in chronological order.
+Date-range filtering is done in application code after collecting results. This works because date strings in ISO format sort lexicographically in chronological order.
 
 ### Requirement 5: Tasks by Status
 
 > As a scrum master, see all tasks by status across all projects.
 
-Task's `statuses` index on GSI4 uses `status` as PK and `project + employee` as SK. This is the other key differentiator from the HR example.
+The `Statuses` collection on GSI4 uses `status` as PK and `project + employee` as SK. This is the other key differentiator from the HR example.
 
 ```typescript region="statuses" example="task-manager.ts"
 // All open tasks across all projects
-const openTasks = yield* db.Tasks.collect(Tasks.query.statuses({ status: "open" }))
-// → 4 tasks: build-api, code-review, deploy-ci, design-landing
-
+const { Tasks: openTasks } = yield* db.collections.Statuses({ status: "open" }).collect()
 // Verify points are present on status-queried tasks
 const totalOpenPoints = openTasks.reduce((sum, t) => sum + t.points, 0)
-// → 28 (8 + 2 + 5 + 13)
-
 // In-progress tasks
-const inProgressTasks = yield* db.Tasks.collect(Tasks.query.statuses({ status: "in-progress" }))
-// → [{ task: "write-tests", points: 5 }]
-
+const { Tasks: inProgressTasks } = yield* db.collections
+  .Statuses({ status: "in-progress" })
+  .collect()
 // Closed tasks
-const closedTasks = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
-// → [{ task: "user-research", points: 3 }]
+const { Tasks: closedTasks } = yield* db.collections.Statuses({ status: "closed" }).collect()
 ```
 
 You can narrow by project using a sort key prefix:
 
 ```typescript region="statuses-by-project" example="task-manager.ts"
-// Open tasks in a specific project using SK prefix (beginsWith)
-const statusesIndex = Tasks.indexes.statuses
-const platformPrefix = KeyComposer.composeSortKeyPrefix(TmSchema, "Task", 1, statusesIndex, {
-  project: "platform",
-})
-const openPlatformTasks = yield* db.Tasks.collect(
-  Tasks.query.statuses({ status: "open" }).pipe(Query.where({ beginsWith: platformPrefix })),
-)
-// → [{ task: "build-api" }, { task: "code-review" }, { task: "deploy-ci" }]
+// Open tasks in a specific project — pass SK composites for auto begins_with
+const { Tasks: openPlatformTasks } = yield* db.collections
+  .Statuses({ status: "open", project: "platform" })
+  .collect()
 ```
 
 ### Requirement 6: Task Status Workflow
 
 > As a developer, move a task through the lifecycle: open -> in-progress -> closed.
 
-Updating a task's `status` field triggers GSI recomposition on every index that includes `status` as a composite. The task moves between partitions in the `statuses` GSI4 index.
+Updating a task's `status` field triggers GSI recomposition on every index that includes `status` as a composite. The task moves between partitions in the `Statuses` GSI4 collection.
 
 ```typescript region="workflow" example="task-manager.ts"
 // Move build-api from open -> in-progress
-const inProgress = yield* db.Tasks.update(
+const inProgress = yield* db.entities.Tasks.update(
   { task: "build-api", project: "platform", employee: "tyler" },
   Entity.set({ status: "in-progress" }),
 )
-// inProgress.status → "in-progress"
-
 // Verify: open tasks decreased by 1
-const openAfterTransition = yield* db.Tasks.collect(Tasks.query.statuses({ status: "open" }))
-// → 3 open tasks (was 4)
-
+const { Tasks: openAfterTransition } = yield* db.collections
+  .Statuses({ status: "open" })
+  .collect()
 // Verify: in-progress tasks increased by 1
-const inProgressAfterTransition = yield* db.Tasks.collect(
-  Tasks.query.statuses({ status: "in-progress" }),
-)
-// → [{ task: "build-api" }, { task: "write-tests" }]
-
+const { Tasks: inProgressAfterTransition } = yield* db.collections
+  .Statuses({ status: "in-progress" })
+  .collect()
 // Move build-api from in-progress -> closed
-const closed = yield* db.Tasks.update(
+const closed = yield* db.entities.Tasks.update(
   { task: "build-api", project: "platform", employee: "tyler" },
   Entity.set({ status: "closed" }),
 )
-// closed.status → "closed"
-
 // Verify: closed tasks increased
-const closedAfterWorkflow = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
-// → [{ task: "build-api" }, { task: "user-research" }]
-
+const { Tasks: closedAfterWorkflow } = yield* db.collections
+  .Statuses({ status: "closed" })
+  .collect()
 // Restore build-api to original state for clean assertions below
-yield* db.Tasks.update(
+yield* db.entities.Tasks.update(
   { task: "build-api", project: "platform", employee: "tyler" },
   Entity.set({ status: "open" }),
 )
@@ -570,26 +582,19 @@ Because `employee` and `project` are primary key fields (provided in the update 
 
 > As a hiring manager, find employees by title with salary range queries.
 
-Employee's `roles` index on GSI4 has `title` as PK and `salary` as SK. Zero-padded salary strings ensure correct lexicographic ordering.
+The `Roles` collection on GSI4 has `title` as PK and `salary` as SK. Zero-padded salary strings ensure correct lexicographic ordering.
 
 ```typescript region="roles" example="task-manager.ts"
-const engineers = yield* db.Employees.collect(Employees.query.roles({ title: "Senior Engineer" }))
-// → [{ employee: "tyler", salary: "000120.00" }]
-
-// Salary range query across all Product Managers
-const rolesIndex = Employees.indexes.roles
-const loSalary = KeyComposer.composeSortKeyPrefix(TmSchema, "Employee", 1, rolesIndex, {
-  salary: "000100.00",
-})
-const hiSalary = KeyComposer.composeSortKeyPrefix(TmSchema, "Employee", 1, rolesIndex, {
-  salary: "000200.00",
-})
-const wellPaidPMs = yield* db.Employees.collect(
-  Employees.query
-    .roles({ title: "Product Manager" })
-    .pipe(Query.where({ between: [loSalary, hiSalary] })),
+const { Employees: engineers } = yield* db.collections
+  .Roles({ title: "Senior Engineer" })
+  .collect()
+// Salary range query across all Product Managers — filter on salary
+const { Employees: allPMs } = yield* db.collections
+  .Roles({ title: "Product Manager" })
+  .collect()
+const wellPaidPMs = allPMs.filter(
+  (e) => e.salary >= "000100.00" && e.salary <= "000200.00",
 )
-// → [{ employee: "morgan", salary: "000110.00" }]
 ```
 
 ### Requirement 8: Atomic Onboarding
@@ -620,22 +625,17 @@ yield* Transaction.transactWrite([
     points: 3,
   }),
 ])
-
 // Verify both items created atomically
-const newHire = yield* db.Employees.get({ employee: "jordan" })
-// → { firstName: "Jordan", title: "Junior Engineer", team: "development" }
-
-const onboardingTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "jordan" }))
-// → [{ task: "onboarding", points: 3 }]
-
+const newHire = yield* db.entities.Employees.get({ employee: "jordan" })
+const { Tasks: onboardingTasks } = yield* db.collections
+  .Assignments({ employee: "jordan" })
+  .collect()
 // Verify new hire appears in teams query
-const devTeamAfterHire = yield* db.Employees.collect(
-  Employees.query.teams({ team: "development" }),
-)
-// → 3 members (was 2)
-
+const { Employees: devTeamAfterHire } = yield* db.collections
+  .Teams({ team: "development" })
+  .collect()
 // Verify new open task appears in statuses query
-const openAfterHire = yield* db.Tasks.collect(Tasks.query.statuses({ status: "open" }))
+const { Tasks: openAfterHire } = yield* db.collections.Statuses({ status: "open" }).collect()
 ```
 
 ### Requirement 9: Task Archival (Soft Delete + Restore)
@@ -646,37 +646,34 @@ Because Task has `softDelete: true`, deleting a task **archives** it. GSI keys a
 
 ```typescript region="archival" example="task-manager.ts"
 // Archive the closed "user-research" task
-yield* db.Tasks.delete({ task: "user-research", project: "website", employee: "morgan" })
-
+yield* db.entities.Tasks.delete({ task: "user-research", project: "website", employee: "morgan" })
 // Verify: closed tasks no longer include the archived one
-const closedAfterArchive = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
-// → [] (user-research was the only closed task)
-
+const { Tasks: closedAfterArchive } = yield* db.collections
+  .Statuses({ status: "closed" })
+  .collect()
 // Verify: morgan's assignments no longer include the archived task
-const morganTasks = yield* db.Tasks.collect(Tasks.query.assigned({ employee: "morgan" }))
-
+const { Tasks: morganTasks } = yield* db.collections.Assignments({ employee: "morgan" }).collect()
 // But the archived task is still retrievable via deleted.get
-const archivedTask = yield* db.Tasks.deleted.get({
+const archivedTask = yield* db.entities.Tasks.deleted.get({
   task: "user-research",
   project: "website",
   employee: "morgan",
 })
-// → { description: "Conduct user research interviews", deletedAt: ..., ... }
 ```
 
 If a task was archived by mistake, restore it:
 
 ```typescript region="restore" example="task-manager.ts"
 // Restore if needed (e.g., task was archived by mistake)
-const unarchived = yield* db.Tasks.restore({
+const unarchived = yield* db.entities.Tasks.restore({
   task: "user-research",
   project: "website",
   employee: "morgan",
 })
-// unarchived.status → "closed" (original status preserved)
-
 // Verify: task is back in status queries
-const closedAfterRestore = yield* db.Tasks.collect(Tasks.query.statuses({ status: "closed" }))
+const { Tasks: closedAfterRestore } = yield* db.collections
+  .Statuses({ status: "closed" })
+  .collect()
 ```
 
 This is the natural end of the task lifecycle: **open -> in-progress -> closed -> archived**. Soft delete strips all GSI keys, so archived tasks are invisible to every query while the data is preserved.
@@ -725,10 +722,10 @@ Effect.runPromise(main).then(
 |---------|---------------|
 | **Single-table design** | 3 entities, 1 table, 5 GSIs with structured key values |
 | **Index overloading** | GSI1 serves employees-by-office, tasks-by-project, and offices-by-office |
-| **Collections** | `workplaces` (GSI1) and `assignments` (GSI3) enable cross-entity queries |
-| **Teams index (GSI2)** | Partition by team, sort by dateHired for range queries |
-| **Status index (GSI4)** | Partition by status for cross-project task visibility |
-| **Sort key range queries** | `KeyComposer.composeSortKeyPrefix` + `Query.where({ between })` for date and salary ranges |
+| **Collections** | `Workplaces` (GSI1) and `Assignments` (GSI3) enable cross-entity queries |
+| **Teams collection (GSI2)** | Partition by team, sort by dateHired for range queries |
+| **Statuses collection (GSI4)** | Partition by status for cross-project task visibility |
+| **Range filtering** | Collect from collection, filter in application code for date and salary ranges |
 | **Status workflow** | Updating `status` triggers automatic GSI recomposition across all affected indexes |
 | **Soft delete archival** | Closed tasks archived via `softDelete` -- invisible to queries, preserved for audit |
 | **Restore** | `Entity.restore` recomposes all keys, returning archived items to full index visibility |

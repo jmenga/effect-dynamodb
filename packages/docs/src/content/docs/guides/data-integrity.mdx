@@ -15,11 +15,9 @@ Unique constraints ensure that a field (or combination of fields) has a unique v
 const Users = Entity.make({
   model: User,
   entityType: "User",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   unique: {
@@ -59,7 +57,7 @@ All mutations involving unique constraints are automatically wrapped in DynamoDB
 When a unique value is already taken, the write fails with `UniqueConstraintViolation`:
 
 ```typescript region="unique-error-handling" example="guide-data-integrity.ts"
-yield* db.Users.put({
+yield* db.entities.Users.put({
   userId: "u-1",
   email: "alice@example.com",
   username: "alice",
@@ -68,7 +66,7 @@ yield* db.Users.put({
 })
 
 // Same email → UniqueConstraintViolation
-const duplicateResult = yield* db.Users.put({
+const duplicateResult = yield* db.entities.Users.put({
   userId: "u-2",
   email: "alice@example.com",
   username: "bob",
@@ -121,11 +119,9 @@ With version retention and optional TTL:
 const VersionedUsers = Entity.make({
   model: User,
   entityType: "VersionedUser",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: {
@@ -171,13 +167,11 @@ All versions are co-located (same partition key) for efficient access. Version n
 
 ```typescript region="querying-versions" example="guide-data-integrity.ts"
 // Get a specific version snapshot
-const v1 = yield* db.VersionedUsers.getVersion({ userId: "v-1" }, 1)
+const v1 = yield* db.entities.VersionedUsers.getVersion({ userId: "v-1" }, 1)
 
 // Query version history (most recent first)
-const history = yield* db.VersionedUsers.collect(
+const history = yield* db.entities.VersionedUsers.collect(
   VersionedUsers.versions({ userId: "v-1" }),
-  Query.limit(10),
-  Query.reverse,
 )
 ```
 
@@ -191,7 +185,7 @@ Versioning enables optimistic locking. Pass `expectedVersion` on update to ensur
 
 ```typescript region="optimistic-concurrency" example="guide-data-integrity.ts"
 // Create a versioned user
-const user = yield* db.VersionedUsers.put({
+const user = yield* db.entities.VersionedUsers.put({
   userId: "v-1",
   email: "versioned@example.com",
   username: "versioned-alice",
@@ -201,17 +195,20 @@ const user = yield* db.VersionedUsers.put({
 // user.version === 1
 
 // Update twice to build history
-yield* db.VersionedUsers.update({ userId: "v-1" }, Entity.set({ displayName: "Alice V2" }))
+yield* db.entities.VersionedUsers.update(
+  { userId: "v-1" },
+  Entity.set({ displayName: "Alice V2" }),
+)
 // version is now 2
 
-const current = yield* db.VersionedUsers.update(
+const current = yield* db.entities.VersionedUsers.update(
   { userId: "v-1" },
   Entity.set({ displayName: "Alice V3" }),
 )
 // current.version === 3
 
 // Update with optimistic lock — must match current version
-yield* db.VersionedUsers.update(
+yield* db.entities.VersionedUsers.update(
   { userId: "v-1" },
   Entity.set({ displayName: "Alice V4" }),
   Entity.expectedVersion(3),
@@ -223,7 +220,7 @@ If another process updated the item between your read and write, the version wil
 
 ```typescript region="optimistic-lock-error" example="guide-data-integrity.ts"
 // Stale version → OptimisticLockError
-const lockResult = yield* db.VersionedUsers.update(
+const lockResult = yield* db.entities.VersionedUsers.update(
   { userId: "v-1" },
   Entity.set({ displayName: "Stale Update" }),
   Entity.expectedVersion(2),
@@ -257,11 +254,9 @@ Idempotency keys prevent duplicate processing of the same request. In effect-dyn
 const Payments = Entity.make({
   model: Payment,
   entityType: "Payment",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["paymentId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["paymentId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   unique: {
@@ -292,7 +287,7 @@ class Payment extends Schema.Class<Payment>("Payment")({
 const requestId = "idem-abc-123"
 
 // First request — succeeds
-const payment = yield* db.Payments.put({
+const payment = yield* db.entities.Payments.put({
   paymentId: "pay-001",
   amount: 99.99,
   currency: "USD",
@@ -300,7 +295,7 @@ const payment = yield* db.Payments.put({
 })
 
 // Retry with same idempotency key → blocked
-const retry = yield* db.Payments.put({
+const retry = yield* db.entities.Payments.put({
   paymentId: "pay-002",
   amount: 99.99,
   currency: "USD",

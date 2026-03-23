@@ -2,9 +2,9 @@
  * Scan example — effect-dynamodb v2
  *
  * Demonstrates:
- *   - Entity.scan(): returns a Query<Entity.Record> that uses DynamoDB Scan
- *   - Scan shares all Query combinators: filter, limit, consistentRead
- *   - Scan shares all terminals: execute, paginate
+ *   - Entity scan via BoundQuery: db.entities.Entity.scan() returns a BoundQuery
+ *   - Scan shares all BoundQuery combinators: filter, limit, consistentRead
+ *   - Scan shares all terminals: collect, fetch, paginate
  *   - Entity type filtering: scan only returns items matching the entity type
  *   - Scan vs Query: scan reads entire table, query targets a specific partition
  *
@@ -18,10 +18,10 @@
 import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 
 // ---------------------------------------------------------------------------
@@ -46,7 +46,7 @@ class Review extends Schema.Class<Review>("Review")({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 2. Schema + Entities + Table
+// 2. Schema + Entities + Collections
 // ---------------------------------------------------------------------------
 
 // #region entities
@@ -55,16 +55,9 @@ const AppSchema = DynamoSchema.make({ name: "scan-demo", version: 1 })
 const Products = Entity.make({
   model: Product,
   entityType: "Product",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["productId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byCategory: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["category"] },
-      sk: { field: "gsi1sk", composite: ["productId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["productId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -72,21 +65,32 @@ const Products = Entity.make({
 const Reviews = Entity.make({
   model: Review,
   entityType: "Review",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["reviewId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byProduct: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["productId"] },
-      sk: { field: "gsi1sk", composite: ["reviewId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["reviewId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Products, Reviews } })
+
+const ProductsByCategory = Collections.make("productsByCategory", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["category"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Products: Collections.member(Products, { sk: { composite: ["productId"] } }),
+  },
+})
+
+const ReviewsByProduct = Collections.make("reviewsByProduct", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["productId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Reviews: Collections.member(Reviews, { sk: { composite: ["reviewId"] } }),
+  },
+})
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -94,58 +98,70 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Products, Reviews 
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
-  // Typed execution gateway — binds all entities
-  const db = yield* DynamoClient.make(MainTable)
+  // Typed execution gateway — binds all entities and collections
+  const db = yield* DynamoClient.make({
+    entities: { Products, Reviews },
+    collections: { ProductsByCategory, ReviewsByProduct },
+  })
 
   // --- Setup ---
   yield* Console.log("=== Setup ===\n")
 
-  yield* db.createTable()
+  yield* db.tables["scan-demo-table"]!.create()
   yield* Console.log("Table created\n")
 
   // Seed data
   // #region seed
-  yield* db.Products.put({
+  yield* db.entities.Products.put({
     productId: "p-1",
     name: "Wireless Mouse",
     category: "electronics",
     price: 29.99,
     inStock: true,
   })
-  yield* db.Products.put({
+  yield* db.entities.Products.put({
     productId: "p-2",
     name: "Mechanical Keyboard",
     category: "electronics",
     price: 89.99,
     inStock: true,
   })
-  yield* db.Products.put({
+  yield* db.entities.Products.put({
     productId: "p-3",
     name: "USB-C Cable",
     category: "accessories",
     price: 9.99,
     inStock: false,
   })
-  yield* db.Products.put({
+  yield* db.entities.Products.put({
     productId: "p-4",
     name: "Monitor Stand",
     category: "accessories",
     price: 49.99,
     inStock: true,
   })
-  yield* db.Reviews.put({ reviewId: "r-1", productId: "p-1", rating: 5, comment: "Great mouse!" })
-  yield* db.Reviews.put({ reviewId: "r-2", productId: "p-2", rating: 4, comment: "Good keyboard" })
+  yield* db.entities.Reviews.put({
+    reviewId: "r-1",
+    productId: "p-1",
+    rating: 5,
+    comment: "Great mouse!",
+  })
+  yield* db.entities.Reviews.put({
+    reviewId: "r-2",
+    productId: "p-2",
+    rating: 4,
+    comment: "Good keyboard",
+  })
   // #endregion
   yield* Console.log("Seeded 4 products + 2 reviews\n")
 
   // --- Basic scan ---
   yield* Console.log("=== Entity.scan() — All Products ===\n")
 
-  // scan() returns a Query<Entity.Record> just like query accessors.
-  // It reads the entire table but filters by __edd_e__ to return only
-  // items matching this entity type.
+  // scan() returns a BoundQuery that reads the entire table but filters
+  // by __edd_e__ to return only items matching this entity type.
   // #region basic-scan
-  const allProducts = yield* db.Products.collect(Products.scan())
+  const allProducts = yield* db.entities.Products.scan().collect()
   // #endregion
   yield* Console.log(`Found ${allProducts.length} products:`)
   for (const p of allProducts) {
@@ -156,13 +172,10 @@ const program = Effect.gen(function* () {
   // --- Scan with filter ---
   yield* Console.log("=== Scan with Filter — In-Stock Products ===\n")
 
-  // Entity.filter() applies a FilterExpression server-side to reduce network transfer.
+  // filter() applies a FilterExpression server-side to reduce network transfer.
   // Note: filters don't reduce read capacity (DynamoDB still reads every item).
   // #region scan-filter
-  const inStockProducts = yield* db.Products.collect(
-    Products.scan(),
-    Products.filter({ inStock: true }),
-  )
+  const inStockProducts = yield* db.entities.Products.scan().filter({ inStock: true }).collect()
   // #endregion
   yield* Console.log(`In-stock products: ${inStockProducts.length}`)
   for (const p of inStockProducts) {
@@ -175,7 +188,7 @@ const program = Effect.gen(function* () {
 
   // Limit controls the page size (how many items DynamoDB evaluates per request).
   // #region scan-limit
-  const firstTwo = yield* db.Products.collect(Products.scan().pipe(Query.limit(2)))
+  const firstTwo = yield* db.entities.Products.scan().limit(2).collect()
   // #endregion
   yield* Console.log(`First 2 products (limit=2): ${firstTwo.length}`)
   for (const p of firstTwo) {
@@ -189,7 +202,7 @@ const program = Effect.gen(function* () {
   // ConsistentRead on scan ensures you read the most recent data.
   // Costs 2x the read capacity of eventually-consistent reads.
   // #region scan-consistent
-  const consistent = yield* db.Products.collect(Products.scan().pipe(Query.consistentRead))
+  const consistent = yield* db.entities.Products.scan().consistentRead().collect()
   // #endregion
   yield* Console.log(`Consistent scan: ${consistent.length} products\n`)
 
@@ -199,8 +212,8 @@ const program = Effect.gen(function* () {
   // Even though Products and Reviews share the same table,
   // Products.scan() only returns Product items (filtered by __edd_e__).
   // #region entity-isolation
-  const productScan = yield* db.Products.collect(Products.scan())
-  const reviewScan = yield* db.Reviews.collect(Reviews.scan())
+  const productScan = yield* db.entities.Products.scan().collect()
+  const reviewScan = yield* db.entities.Reviews.scan().collect()
   // #endregion
   yield* Console.log(`Products.scan(): ${productScan.length} items`)
   yield* Console.log(`Reviews.scan():  ${reviewScan.length} items`)
@@ -208,7 +221,7 @@ const program = Effect.gen(function* () {
 
   // --- Cleanup ---
   yield* Console.log("=== Cleanup ===\n")
-  yield* db.deleteTable()
+  yield* db.tables["scan-demo-table"]!.delete()
   yield* Console.log("Table deleted.")
 })
 

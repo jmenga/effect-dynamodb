@@ -1,25 +1,17 @@
 ---
-title: "Example: Getting Started"
-description: "Model definition, schema/table/entity setup, DynamoClient.make, and basic CRUD operations"
+title: Getting Started
+description: Build your first effect-dynamodb application — from domain models to typed CRUD operations.
+sidebar:
+  order: 1
 ---
 
-A minimal starter example that walks through the foundational building blocks of effect-dynamodb: defining pure domain models, creating a schema and table, defining entities with composite key indexes, obtaining a typed client via `DynamoClient.make`, and performing basic CRUD operations.
+import { Aside } from "@astrojs/starlight/components"
 
-**What you'll learn:**
-- Defining pure domain models with `Schema.Class`
-- Configuring field-level behavior with `DynamoModel.configure`
-- Creating an application namespace (`DynamoSchema`) and table (`Table`)
-- Defining entities via `Entity.make` with composite key indexes
-- Obtaining a typed client via `DynamoClient.make(MainTable)` — the required gateway for all operations
-- Basic CRUD: put, get, update, delete
-- GSI queries
-- Wiring dependencies with Effect Layers
+Define domain models, register entities on a table, obtain a typed client, and run CRUD operations — all in a single file.
 
----
+## Step 1: Domain Models
 
-## Step 1: Define Pure Domain Models
-
-Models are plain Effect Schema classes with no DynamoDB concepts -- just your domain fields:
+Pure TypeScript classes with Effect Schema — no DynamoDB concepts:
 
 ```typescript title="models.ts" region="models" example="starter.ts"
 const Role = { Admin: "admin", Member: "member" } as const
@@ -49,13 +41,11 @@ class Task extends Schema.Class<Task>("Task")({
 }) {}
 ```
 
-`DynamoModel.configure` applies field-level overrides without modifying the model itself. Here, `createdBy` is marked `immutable` -- once set on creation, it cannot be changed by subsequent updates.
+Models are pure domain objects — no DynamoDB attributes, no key definitions. `DynamoModel.configure` marks `createdBy` as immutable (can't be changed after creation).
 
 ---
 
-## Step 2: Application Namespace
-
-Every effect-dynamodb application needs a **schema** (application namespace for key prefixing):
+## Step 2: Application Schema
 
 ```typescript title="setup.ts" region="schema" example="starter.ts"
 const AppSchema = DynamoSchema.make({ name: "starter", version: 1 })
@@ -65,24 +55,17 @@ const AppSchema = DynamoSchema.make({ name: "starter", version: 1 })
 
 ---
 
-## Step 3: Entity and Table Definitions
+## Step 3: Entity, Table, and Collection Definitions
 
-Entities map models to DynamoDB with composite key rules for the primary index and any GSIs. The table declares which entities it contains:
+Entities define their primary key only. GSI access patterns are declared as Collections. The table declares which entities it contains:
 
 ```typescript title="entities.ts" region="entities" example="starter.ts"
 const Users = Entity.make({
   model: UserModel,
   entityType: "User",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byEmail: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["email"] },
-      sk: { field: "gsi1sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
   },
   unique: { email: ["email"] },
   timestamps: true,
@@ -92,49 +75,63 @@ const Users = Entity.make({
 const Tasks = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byUser: {
-      index: "gsi1",
-      collection: "UserItems",
-      type: "clustered",
-      pk: { field: "gsi1pk", composite: ["userId"] },
-      sk: { field: "gsi1sk", composite: ["status"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Users, Tasks } })
+
+const UsersByEmail = Collections.make("usersByEmail", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["email"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Users: Collections.member(Users, { sk: { composite: [] } }),
+  },
+})
+
+const TasksByUser = Collections.make("tasksByUser", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["userId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Tasks: Collections.member(Tasks, { sk: { composite: ["status"] } }),
+  },
+})
 ```
 
 Key design decisions:
 - **Users** have a `unique` constraint on `email` -- the ORM enforces uniqueness atomically using a sentinel item
 - **Users** have `versioned: true` for optimistic locking via a `version` field
-- **Tasks** use a `collection: "UserItems"` on GSI1, enabling cross-entity queries that fetch all items for a user
-- **Tasks** have `status` in the sort key composite, so tasks for a user are grouped by status
+- **TasksByUser** defines a GSI access pattern — query tasks by userId, sorted by status
+- **Collections own GSI definitions** — entities stay pure (primary key only)
 
-`Entity.make` returns a **definition** -- it describes how the entity maps to DynamoDB but does not provide executable operations. To actually read and write data, you need to obtain a **typed client** via `DynamoClient.make` (next step).
+`Entity.make` returns a **definition** -- it describes how the entity maps to DynamoDB but does not provide executable operations. `Collections.make` defines how entities are indexed. To actually read and write data, you need to obtain a **typed client** via `DynamoClient.make` (next step).
 
 ---
 
 ## Step 4: Typed Client and Use
 
-`DynamoClient.make(MainTable)` is the typed execution gateway. It resolves dependencies and returns a client with bound entities where every method is ready to call.
+`DynamoClient.make({ entities, collections })` is the typed execution gateway. It resolves dependencies, injects collection indexes into entities, and returns a client with bound entities where every method is ready to call.
 
 ```typescript title="main.ts" region="program" example="starter.ts"
 const program = Effect.gen(function* () {
-  // Get typed client — binds all table members
-  const db = yield* DynamoClient.make(MainTable)
+  // Get typed client — binds all entities and collections
+  const db = yield* DynamoClient.make({
+    entities: { Users, Tasks },
+    collections: { UsersByEmail, TasksByUser },
+  })
 
   // --- Create the table (derived from entity definitions) ---
-  yield* db.createTable()
+
+  yield* db.tables["starter-table"]!.create()
 
   // --- Put: create items ---
-  const alice = yield* db.Users.put({
+
+  const alice = yield* db.entities.Users.put({
     userId: "u-alice",
     email: "alice@example.com",
     displayName: "Alice",
@@ -142,7 +139,7 @@ const program = Effect.gen(function* () {
     createdBy: "system",
   })
 
-  yield* db.Tasks.put({
+  yield* db.entities.Tasks.put({
     taskId: "t-1",
     userId: "u-alice",
     title: "Learn effect-dynamodb",
@@ -150,7 +147,7 @@ const program = Effect.gen(function* () {
     priority: 1,
   })
 
-  yield* db.Tasks.put({
+  yield* db.entities.Tasks.put({
     taskId: "t-2",
     userId: "u-alice",
     title: "Build something cool",
@@ -159,35 +156,39 @@ const program = Effect.gen(function* () {
   })
 
   // --- Get: read by primary key ---
-  const user = yield* db.Users.get({ userId: "u-alice" })
 
-  const task = yield* db.Tasks.get({ taskId: "t-1" })
+  const user = yield* db.entities.Users.get({ userId: "u-alice" })
+
+  const task = yield* db.entities.Tasks.get({ taskId: "t-1" })
 
   // --- Update ---
+
   // Note: status is a GSI composite, so we must also provide userId
   // (all composites for the GSI) so the key can be recomposed
-  const updated = yield* db.Tasks.update(
+  const updated = yield* db.entities.Tasks.update(
     { taskId: "t-1" },
     Entity.set({ status: "done", userId: "u-alice" }),
   )
 
-  // --- Query: tasks by user via GSI ---
-  const aliceTasks = yield* db.Tasks.collect(Tasks.query.byUser({ userId: "u-alice" }))
+  // --- Query: tasks by user via collection ---
+
+  const { Tasks: aliceTasks } = yield* db.collections.TasksByUser({ userId: "u-alice" }).collect()
 
   // --- Delete ---
-  yield* db.Tasks.delete({ taskId: "t-1" })
-  yield* db.Tasks.delete({ taskId: "t-2" })
-  yield* db.Users.delete({ userId: "u-alice" })
+
+  yield* db.entities.Tasks.delete({ taskId: "t-1" })
+  yield* db.entities.Tasks.delete({ taskId: "t-2" })
+  yield* db.entities.Users.delete({ userId: "u-alice" })
 
   // --- Cleanup ---
-  yield* db.deleteTable()
+  yield* db.tables["starter-table"]!.delete()
 })
 ```
 
-`DynamoClient.make(MainTable)` requires `DynamoClient` and `TableConfig` in the Effect context -- you provide these as Layers when you run the program.
+`DynamoClient.make({ entities, collections })` requires `DynamoClient` and `TableConfig` in the Effect context -- you provide these as Layers when you run the program.
 
 :::note[Why DynamoClient.make?]
-The gateway pattern separates **definition** from **execution**. `Entity.make()` returns a definition carrying type information, schemas, and index config. `Table.make({ schema, entities: {...} })` declares members. `DynamoClient.make(table)` resolves the runtime dependencies (DynamoDB client, table name), binds all registered entities, and returns a typed client where every method is ready to call. This matches the `HttpApiClient.make(api)` pattern from Effect v4.
+The gateway pattern separates **definition** from **execution**. `Entity.make()` returns a definition carrying type information, schemas, and key config. `Table.make({ schema, entities: {...} })` declares members. `Collections.make()` defines GSI access patterns. `DynamoClient.make({ entities, collections })` resolves the runtime dependencies (DynamoDB client, table name), injects collection indexes into entities, binds everything, and returns a typed client where every method is ready to call. This matches the `HttpApiClient.make(api)` pattern from Effect v4.
 :::
 
 ---
@@ -214,43 +215,14 @@ Effect.runPromise(main).then(
 )
 ```
 
-`DynamoClient.layer` creates the AWS SDK client. `MainTable.layer` injects the physical table name. Both are provided to the program via `Effect.provide`.
+<Aside type="tip">
+  For production, use `DynamoClient.layerConfig(...)` to read region, endpoint, and credentials from Effect Config providers (environment variables, config files, etc.).
+</Aside>
 
 ---
 
-## Running the Example
+## Next Steps
 
-The complete runnable example is at [`examples/starter.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/examples/starter.ts) in the repository.
-
-Start DynamoDB Local:
-
-```bash
-docker run -d -p 8000:8000 amazon/dynamodb-local
-```
-
-Run the example:
-
-```bash
-npx tsx examples/starter.ts
-```
-
----
-
-## Key Takeaways
-
-| Concept | How it's used |
-|---------|---------------|
-| **Pure domain models** | `Schema.Class` with no DynamoDB concepts -- Entity handles the binding |
-| **DynamoModel.configure** | Field-level overrides (`immutable`) without modifying the model |
-| **DynamoSchema** | Application namespace for key prefixing (`$starter#v1#...`) |
-| **Composite key indexes** | `pk` and `sk` composites define how attributes map to DynamoDB keys |
-| **DynamoClient.make(table)** | Typed execution gateway -- resolves dependencies, returns client with bound entities |
-| **Unique constraints** | `unique: { email: ["email"] }` enforces uniqueness via sentinel items |
-| **Collections** | `collection: "UserItems"` groups multiple entity types under the same GSI partition |
-| **Layer-based DI** | `DynamoClient.layer` + `Table.layer` -- no global config |
-
-## What's Next?
-
-- [CRUD Operations](/effect-dynamodb/tutorials/crud/) -- Full high-level API with put, get, update, delete, queries, and more
-- [Modeling Guide](/effect-dynamodb/guides/modeling/) -- Deep dive into models, schemas, tables, and entities
-- [Indexes & Collections](/effect-dynamodb/guides/indexes/) -- Access pattern design and collection patterns
+- [CRUD Operations](/tutorials/crud) — Deep dive into put, get, update, delete with combinators
+- [Indexes & Queries](/guides/indexes) — Design GSI access patterns with Collections
+- [Expressions](/tutorials/expressions) — Conditions, filters, and projections

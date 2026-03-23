@@ -3,11 +3,12 @@ title: "Example: Scan Operations"
 description: "Full-table scans with filters, limits, consistent reads, and entity-type isolation in a single-table design"
 ---
 
-A product and review catalog that demonstrates **scan operations** -- reading all items from a table without targeting a specific partition key. Scans are the broadest read operation in DynamoDB, and effect-dynamodb makes them composable with the same `Query` combinators used for index queries.
+A product and review catalog that demonstrates **scan operations** -- reading all items from a table without targeting a specific partition key. Scans are the broadest read operation in DynamoDB, and effect-dynamodb makes them composable with the same BoundQuery combinators used for index queries.
 
 **What you'll learn:**
-- `Entity.scan()` on entity definitions -- full-table scan descriptor
-- `collect()` / `paginate()` on bound entities -- executing scans with `Entity.filter()`, `Query.limit()`, and `Query.consistentRead` combinators
+- `db.entities.Entity.scan()` -- full-table scan returning a BoundQuery
+- BoundQuery combinators: `.filter()`, `.limit()`, `.consistentRead()` on scans
+- Terminals: `.collect()`, `.fetch()`, `.paginate()` for executing scans
 - Entity-type isolation -- scans automatically filter by `__edd_e__` so each entity only sees its own items
 - When to use scan vs query
 
@@ -36,9 +37,9 @@ class Review extends Schema.Class<Review>("Review")({
 
 ---
 
-## Step 2: Schema, Table, and Entities
+## Step 2: Schema, Entities, and Collections
 
-Both entities share one table with a GSI for category/product lookups:
+Both entities share one table with GSI collections for category/product lookups:
 
 ```typescript title="entities.ts" region="entities" example="scan.ts"
 const AppSchema = DynamoSchema.make({ name: "scan-demo", version: 1 })
@@ -46,16 +47,9 @@ const AppSchema = DynamoSchema.make({ name: "scan-demo", version: 1 })
 const Products = Entity.make({
   model: Product,
   entityType: "Product",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["productId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byCategory: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["category"] },
-      sk: { field: "gsi1sk", composite: ["productId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["productId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -63,21 +57,32 @@ const Products = Entity.make({
 const Reviews = Entity.make({
   model: Review,
   entityType: "Review",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["reviewId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byProduct: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["productId"] },
-      sk: { field: "gsi1sk", composite: ["reviewId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["reviewId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Products, Reviews } })
+
+const ProductsByCategory = Collections.make("productsByCategory", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["category"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Products: Collections.member(Products, { sk: { composite: ["productId"] } }),
+  },
+})
+
+const ReviewsByProduct = Collections.make("reviewsByProduct", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["productId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Reviews: Collections.member(Reviews, { sk: { composite: ["reviewId"] } }),
+  },
+})
 ```
 
 Note that both entities overload GSI1 -- Products use it for category lookups while Reviews use it for product lookups. This is standard single-table design.
@@ -87,36 +92,46 @@ Note that both entities overload GSI1 -- Products use it for category lookups wh
 ## Step 3: Seed Data
 
 ```typescript title="seed.ts" region="seed" example="scan.ts"
-yield* db.Products.put({
+yield* db.entities.Products.put({
   productId: "p-1",
   name: "Wireless Mouse",
   category: "electronics",
   price: 29.99,
   inStock: true,
 })
-yield* db.Products.put({
+yield* db.entities.Products.put({
   productId: "p-2",
   name: "Mechanical Keyboard",
   category: "electronics",
   price: 89.99,
   inStock: true,
 })
-yield* db.Products.put({
+yield* db.entities.Products.put({
   productId: "p-3",
   name: "USB-C Cable",
   category: "accessories",
   price: 9.99,
   inStock: false,
 })
-yield* db.Products.put({
+yield* db.entities.Products.put({
   productId: "p-4",
   name: "Monitor Stand",
   category: "accessories",
   price: 49.99,
   inStock: true,
 })
-yield* db.Reviews.put({ reviewId: "r-1", productId: "p-1", rating: 5, comment: "Great mouse!" })
-yield* db.Reviews.put({ reviewId: "r-2", productId: "p-2", rating: 4, comment: "Good keyboard" })
+yield* db.entities.Reviews.put({
+  reviewId: "r-1",
+  productId: "p-1",
+  rating: 5,
+  comment: "Great mouse!",
+})
+yield* db.entities.Reviews.put({
+  reviewId: "r-2",
+  productId: "p-2",
+  rating: 4,
+  comment: "Good keyboard",
+})
 ```
 
 The table now has 6 items: 4 products and 2 reviews.
@@ -127,39 +142,36 @@ The table now has 6 items: 4 products and 2 reviews.
 
 ### Basic Scan
 
-`Products.scan()` on the entity definition returns a `Query<Entity.Record>` descriptor that reads the entire table. Pass it to `collect()` on the bound entity to execute it. Despite sharing a table with reviews, `Products.scan()` only returns product items -- the ORM automatically adds a `FilterExpression` on `__edd_e__`:
+`db.entities.Products.scan()` returns a BoundQuery that reads the entire table. Call `.collect()` to execute it. Despite sharing a table with reviews, the scan only returns product items -- the ORM automatically adds a `FilterExpression` on `__edd_e__`:
 
 ```typescript region="basic-scan" example="scan.ts"
-const allProducts = yield* db.Products.collect(Products.scan())
+const allProducts = yield* db.entities.Products.scan().collect()
 ```
 
 ### Scan with Filter
 
-Scans support all `Query` combinators, including entity-level `filter()`. Pass combinators as additional arguments to `collect()` -- they are applied to the scan descriptor before execution. The filter is applied server-side after items are read, reducing network transfer:
+Scans support all BoundQuery combinators, including `.filter()`. Chain combinators on the BoundQuery before calling `.collect()`. The filter is applied server-side after items are read, reducing network transfer:
 
 ```typescript region="scan-filter" example="scan.ts"
-const inStockProducts = yield* db.Products.collect(
-  Products.scan(),
-  Products.filter({ inStock: true }),
-)
+const inStockProducts = yield* db.entities.Products.scan().filter({ inStock: true }).collect()
 ```
 
 Note that filters do **not** reduce read capacity -- DynamoDB still reads every item in the table. Use queries with partition keys when you need efficient reads.
 
 ### Scan with Limit
 
-`Query.limit()` controls how many items DynamoDB evaluates per request. Combined with `collect()`, it caps the total results:
+`.limit()` controls how many items DynamoDB evaluates per request. Combined with `.collect()`, it caps the total results:
 
 ```typescript region="scan-limit" example="scan.ts"
-const firstTwo = yield* db.Products.collect(Products.scan().pipe(Query.limit(2)))
+const firstTwo = yield* db.entities.Products.scan().limit(2).collect()
 ```
 
 ### Scan with Consistent Read
 
-`Query.consistentRead` passes `ConsistentRead: true` to DynamoDB, ensuring you read the most recent data. This costs 2x the read capacity of eventually-consistent reads:
+`.consistentRead()` passes `ConsistentRead: true` to DynamoDB, ensuring you read the most recent data. This costs 2x the read capacity of eventually-consistent reads:
 
 ```typescript region="scan-consistent" example="scan.ts"
-const consistent = yield* db.Products.collect(Products.scan().pipe(Query.consistentRead))
+const consistent = yield* db.entities.Products.scan().consistentRead().collect()
 ```
 
 ### Entity-Type Isolation
@@ -167,8 +179,8 @@ const consistent = yield* db.Products.collect(Products.scan().pipe(Query.consist
 The key feature of scans in a single-table design: each entity's scan only returns its own items. The `__edd_e__` discriminator attribute is automatically included in the `FilterExpression`:
 
 ```typescript region="entity-isolation" example="scan.ts"
-const productScan = yield* db.Products.collect(Products.scan())
-const reviewScan = yield* db.Reviews.collect(Reviews.scan())
+const productScan = yield* db.entities.Products.scan().collect()
+const reviewScan = yield* db.entities.Reviews.scan().collect()
 ```
 
 Even though both scans read the same physical table, each returns only items matching its entity type.
@@ -230,11 +242,11 @@ Effect.runPromise(main).then(
 
 | Concept | How it's used |
 |---------|---------------|
-| **Entity.scan()** | On entity definitions -- returns `Query<Entity.Record>` descriptor, composable with all Query combinators |
-| **collect() / paginate()** | On bound entities -- executes a scan (or query) with optional variadic combinators |
-| **Entity.filter()** | Server-side FilterExpression on scans -- reduces network transfer |
-| **Query.limit()** | Caps items evaluated per DynamoDB request |
-| **Query.consistentRead** | Strongly consistent reads at 2x RCU cost |
+| **`db.entities.Entity.scan()`** | Returns a BoundQuery -- composable with all BoundQuery combinators |
+| **`.collect()` / `.paginate()`** | Terminals on BoundQuery -- execute a scan (or query) |
+| **`.filter()`** | Server-side FilterExpression on scans -- reduces network transfer |
+| **`.limit()`** | Caps items evaluated per DynamoDB request |
+| **`.consistentRead()`** | Strongly consistent reads at 2x RCU cost |
 | **Entity-type isolation** | `__edd_e__` filter ensures scans return only the matching entity type |
 | **Scan vs Query** | Scans read the whole table; queries target a partition -- prefer queries for app patterns |
 

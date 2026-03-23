@@ -23,6 +23,7 @@ import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import * as Batch from "../src/Batch.js"
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
@@ -74,16 +75,9 @@ const AppSchema = DynamoSchema.make({ name: "advanced-demo", version: 1 })
 const Products = Entity.make({
   model: ProductModel,
   entityType: "Product",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["productId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byCategory: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["category"] },
-      sk: { field: "gsi1sk", composite: ["productId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["productId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: true,
@@ -92,11 +86,9 @@ const Products = Entity.make({
 const Users = Entity.make({
   model: User,
   entityType: "User",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -104,11 +96,9 @@ const Users = Entity.make({
 const Tasks = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: true,
@@ -118,6 +108,15 @@ const MainTable = Table.make({
   schema: AppSchema,
   entities: { Products, Users, Tasks },
 })
+
+const ProductsByCategory = Collections.make("productsByCategory", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["category"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Products: Collections.member(Products, { sk: { composite: ["productId"] } }),
+  },
+})
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -125,15 +124,18 @@ const MainTable = Table.make({
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { Products, Users, Tasks },
+    collections: { ProductsByCategory },
+  })
 
   // --- Setup ---
   yield* Console.log("=== Setup ===\n")
-  yield* db.createTable()
+  yield* db.tables["advanced-demo-table"]!.create()
   yield* Console.log("Table created\n")
 
   // Seed a product
-  yield* db.Products.put({
+  yield* db.entities.Products.put({
     productId: "p-1",
     name: "Wireless Mouse",
     description: "Ergonomic wireless mouse",
@@ -150,7 +152,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Entity.remove() ===\n")
 
   // #region remove
-  yield* db.Products.update({ productId: "p-1" }, Entity.remove(["description"]))
+  yield* db.entities.Products.update({ productId: "p-1" }, Entity.remove(["description"]))
   // #endregion
   yield* Console.log("Removed description from p-1\n")
 
@@ -158,7 +160,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Entity.add() ===\n")
 
   // #region add
-  yield* db.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1, stock: 50 }))
+  yield* db.entities.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1, stock: 50 }))
   // #endregion
   yield* Console.log("Incremented viewCount by 1, stock by 50\n")
 
@@ -166,7 +168,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Entity.subtract() ===\n")
 
   // #region subtract
-  yield* db.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
+  yield* db.entities.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
   // #endregion
   yield* Console.log("Decremented stock by 3\n")
 
@@ -174,7 +176,10 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Entity.append() ===\n")
 
   // #region append
-  yield* db.Products.update({ productId: "p-1" }, Entity.append({ tags: ["on-sale", "featured"] }))
+  yield* db.entities.Products.update(
+    { productId: "p-1" },
+    Entity.append({ tags: ["on-sale", "featured"] }),
+  )
   // #endregion
   yield* Console.log("Appended tags\n")
 
@@ -182,7 +187,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Entity.deleteFromSet() ===\n")
 
   // #region delete-from-set
-  yield* db.Products.update(
+  yield* db.entities.Products.update(
     { productId: "p-1" },
     Entity.deleteFromSet({ categories: new Set(["obsolete"]) }),
   )
@@ -193,7 +198,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Composed Updates ===\n")
 
   // #region composed-updates
-  yield* db.Products.update(
+  yield* db.entities.Products.update(
     { productId: "p-1" },
     Entity.set({ name: "Premium Mouse", price: 39.99 }),
     Entity.add({ viewCount: 10 }),
@@ -233,12 +238,16 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Conditional Writes ===\n")
 
   // Seed users and tasks for conditional write demos
-  yield* db.Users.put({ userId: "u-10", email: "new@example.com", displayName: "New User" })
-  yield* db.Tasks.put({ taskId: "t-1", title: "Build feature", status: "active" })
+  yield* db.entities.Users.put({
+    userId: "u-10",
+    email: "new@example.com",
+    displayName: "New User",
+  })
+  yield* db.entities.Tasks.put({ taskId: "t-1", title: "Build feature", status: "active" })
 
   // #region conditional-put
   // Conditional put — only if item doesn't already exist
-  const condPutResult = yield* db.Users.put(
+  const condPutResult = yield* db.entities.Users.put(
     { userId: "u-10", email: "new@example.com", displayName: "New User" },
     Users.condition((t, { notExists }) => notExists(t.email)),
   ).pipe(
@@ -252,7 +261,7 @@ const program = Effect.gen(function* () {
 
   // #region conditional-delete
   // Conditional delete — only if stock is zero
-  const condDeleteResult = yield* db.Products.delete(
+  const condDeleteResult = yield* db.entities.Products.delete(
     { productId: "p-1" },
     Products.condition((t, { eq }) => eq(t.stock, 0)),
   ).pipe(
@@ -266,7 +275,7 @@ const program = Effect.gen(function* () {
 
   // #region conditional-update
   // Conditional update — only if status is "active"
-  yield* db.Tasks.update(
+  yield* db.entities.Tasks.update(
     { taskId: "t-1" },
     Entity.set({ status: "done" }),
     Tasks.condition((t, { eq }) => eq(t.status, "active")),
@@ -278,7 +287,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Condition + Optimistic Locking ===\n")
 
   // #region optimistic-condition
-  yield* db.Products.update(
+  yield* db.entities.Products.update(
     { productId: "p-1" },
     Entity.set({ price: 24.99 }),
     Products.expectedVersion(6),
@@ -292,7 +301,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Handling ConditionalCheckFailed ===\n")
 
   // #region handle-conditional
-  const result = yield* db.Users.create({
+  const result = yield* db.entities.Users.create({
     userId: "u-10",
     email: "new@example.com",
     displayName: "New User",
@@ -305,14 +314,14 @@ const program = Effect.gen(function* () {
 
   // #region create-safely
   // Create — fails with ConditionalCheckFailed if item already exists
-  const user = yield* db.Users.create({
+  const user = yield* db.entities.Users.create({
     userId: "u-20",
     email: "alice@example.com",
     displayName: "Alice",
   })
 
   // Duplicate — caught gracefully
-  const dup = yield* db.Users.create({
+  const dup = yield* db.entities.Users.create({
     userId: "u-20",
     email: "alice@example.com",
     displayName: "Alice",
@@ -328,7 +337,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Entity-Level Expressions ===\n")
 
   // Seed more products for expression demos
-  yield* db.Products.create({
+  yield* db.entities.Products.create({
     productId: "p-2",
     name: "Widget Pro",
     price: 49.99,
@@ -343,17 +352,16 @@ const program = Effect.gen(function* () {
   // Condition — type-safe, nested paths, OR/NOT composition
   Products.condition((t, { eq, gt, and }) => and(eq(t.category, "peripherals"), gt(t.stock, 0)))
 
-  // Filter — same API, applied to queries/scans
-  const filtered = yield* db.Products.collect(
-    Products.query.byCategory({ category: "peripherals" }),
-    Products.filter((t, { contains }) => contains(t.name, "Widget")),
-  )
+  // Filter — shorthand applied to collection queries
+  const { Products: filtered } = yield* db.collections
+    .ProductsByCategory({ category: "peripherals" })
+    .filter({ name: "Widget Pro" })
+    .collect()
 
   // Projection — select specific attributes
-  const projected = yield* db.Products.collect(
-    Products.scan(),
-    Products.select((t) => [t.name, t.price]),
-  )
+  const projected = yield* db.entities.Products.scan()
+    .select((t) => [t.name, t.price])
+    .collect()
   // #endregion
   yield* Console.log(`Filtered products containing 'Widget': ${filtered.length}`)
   yield* Console.log(`Projected items: ${projected.length}\n`)
@@ -387,7 +395,7 @@ const program = Effect.gen(function* () {
 
   // --- Cleanup ---
   yield* Console.log("=== Cleanup ===\n")
-  yield* db.deleteTable()
+  yield* db.tables["advanced-demo-table"]!.delete()
   yield* Console.log("Table deleted.")
 })
 

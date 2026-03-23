@@ -35,6 +35,7 @@
 
 import { Console, Effect, Layer, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
@@ -139,44 +140,36 @@ const CricketSchema = DynamoSchema.make({ name: "cricket", version: 1 })
 const Teams = Entity.make({
   model: DynamoModel.configure(Team, { id: { field: "teamId" } }),
   entityType: "Team",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const Players = Entity.make({
   model: DynamoModel.configure(Player, { id: { field: "playerId" } }),
   entityType: "Player",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const Coaches = Entity.make({
   model: DynamoModel.configure(Coach, { id: { field: "coachId" } }),
   entityType: "Coach",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 
 const Venues = Entity.make({
   model: DynamoModel.configure(Venue, { id: { field: "venueId" } }),
   entityType: "Venue",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
 })
 // #endregion
@@ -185,16 +178,9 @@ const Venues = Entity.make({
 const SquadSelections = Entity.make({
   model: SquadSelection,
   entityType: "SquadSelection",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["squadId"] },
-      sk: { field: "sk", composite: ["selectionNumber"] },
-    },
-    byPlayer: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["playerId"] },
-      sk: { field: "gsi1sk", composite: ["squadId", "selectionNumber"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["squadId"] },
+    sk: { field: "sk", composite: ["selectionNumber"] },
   },
   refs: {
     team: { entity: Teams },
@@ -205,13 +191,24 @@ const SquadSelections = Entity.make({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 4. Table definition — declare entities as members
+// 4. Table + Collections
 // ---------------------------------------------------------------------------
 
 // #region table
 const MainTable = Table.make({
   schema: CricketSchema,
   entities: { Teams, Players, Coaches, Venues, SquadSelections },
+})
+
+const SquadsByPlayer = Collections.make("squadsByPlayer", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["playerId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    SquadSelections: Collections.member(SquadSelections, {
+      sk: { composite: ["squadId", "selectionNumber"] },
+    }),
+  },
 })
 // #endregion
 
@@ -274,8 +271,11 @@ void _matchType
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
-  // Get typed client — binds all table members
-  const db = yield* DynamoClient.make(MainTable)
+  // Get typed client — binds all entities and collections
+  const db = yield* DynamoClient.make({
+    entities: { Teams, Players, Coaches, Venues, SquadSelections },
+    collections: { SquadsByPlayer },
+  })
 
   // Keep raw client + table config for manual table creation (LSI required)
   const client = yield* DynamoClient
@@ -330,24 +330,24 @@ const program = Effect.gen(function* () {
   // #region seed-data
   // --- Create teams (model uses 'id', DB stores as 'teamId') ---
   yield* Console.log("Creating teams...")
-  yield* db.Teams.put({ id: "aus", name: "Australia", country: "Australia", ranking: 1 })
-  yield* db.Teams.put({ id: "ind", name: "India", country: "India", ranking: 2 })
+  yield* db.entities.Teams.put({ id: "aus", name: "Australia", country: "Australia", ranking: 1 })
+  yield* db.entities.Teams.put({ id: "ind", name: "India", country: "India", ranking: 2 })
 
   // --- Create players (model uses 'id', DB stores as 'playerId') ---
   yield* Console.log("Creating players...")
-  yield* db.Players.put({
+  yield* db.entities.Players.put({
     id: "smith-01",
     firstName: "Steve",
     lastName: "Smith",
     role: "batter",
   })
-  yield* db.Players.put({
+  yield* db.entities.Players.put({
     id: "cummins-01",
     firstName: "Pat",
     lastName: "Cummins",
     role: "bowler",
   })
-  yield* db.Players.put({
+  yield* db.entities.Players.put({
     id: "kohli-01",
     firstName: "Virat",
     lastName: "Kohli",
@@ -356,19 +356,19 @@ const program = Effect.gen(function* () {
 
   // --- Create coaches ---
   yield* Console.log("Creating coaches...")
-  yield* db.Coaches.put({ id: "mcdonald", name: "Andrew McDonald" })
-  yield* db.Coaches.put({ id: "gambhir", name: "Gautam Gambhir" })
+  yield* db.entities.Coaches.put({ id: "mcdonald", name: "Andrew McDonald" })
+  yield* db.entities.Coaches.put({ id: "gambhir", name: "Gautam Gambhir" })
 
   // --- Create venues ---
   yield* Console.log("Creating venues...")
-  yield* db.Venues.put({ id: "mcg", name: "Melbourne Cricket Ground", city: "Melbourne" })
+  yield* db.entities.Venues.put({ id: "mcg", name: "Melbourne Cricket Ground", city: "Melbourne" })
   // #endregion
 
   // #region squad-refs
   // --- Create squad selections with ref IDs ---
   yield* Console.log("\nCreating squad selections (AUS BGT 2024-25)...")
 
-  yield* db.SquadSelections.put({
+  yield* db.entities.SquadSelections.put({
     squadId: "aus#2024-25#BGT",
     selectionNumber: 1,
     teamId: "aus",
@@ -378,7 +378,7 @@ const program = Effect.gen(function* () {
     isViceCaptain: false,
   })
 
-  yield* db.SquadSelections.put({
+  yield* db.entities.SquadSelections.put({
     squadId: "aus#2024-25#BGT",
     selectionNumber: 2,
     teamId: "aus",
@@ -388,7 +388,7 @@ const program = Effect.gen(function* () {
     isViceCaptain: true,
   })
 
-  yield* db.SquadSelections.put({
+  yield* db.entities.SquadSelections.put({
     squadId: "ind#2024-25#BGT",
     selectionNumber: 1,
     teamId: "ind",
@@ -400,7 +400,10 @@ const program = Effect.gen(function* () {
 
   // --- Get returns full embedded data ---
   yield* Console.log("\nRetrieving squad selection...")
-  const captain = yield* db.SquadSelections.get({ squadId: "aus#2024-25#BGT", selectionNumber: 1 })
+  const captain = yield* db.entities.SquadSelections.get({
+    squadId: "aus#2024-25#BGT",
+    selectionNumber: 1,
+  })
   yield* Console.log(`Captain: ${captain.player.firstName} ${captain.player.lastName}`)
   yield* Console.log(`  Team: ${captain.team.name} (${captain.team.country})`)
   yield* Console.log(`  Role: ${captain.player.role}`)
@@ -410,7 +413,7 @@ const program = Effect.gen(function* () {
   // #region ref-not-found
   // --- RefNotFound when ref doesn't exist ---
   yield* Console.log("\nAttempting to create selection with nonexistent player...")
-  const refError = yield* db.SquadSelections.put({
+  const refError = yield* db.entities.SquadSelections.put({
     squadId: "aus#2024-25#BGT",
     selectionNumber: 99,
     teamId: "aus",
@@ -436,7 +439,7 @@ const program = Effect.gen(function* () {
 
   // #region cascade
   // Update the player and cascade to all SquadSelections that embed this player
-  const updatedPlayer = yield* db.Players.update(
+  const updatedPlayer = yield* db.entities.Players.update(
     { id: "smith-01" },
     Entity.set({ firstName: "Steven" }),
     Entity.cascade({ targets: [SquadSelections] }),
@@ -445,7 +448,7 @@ const program = Effect.gen(function* () {
   yield* Console.log(`Updated player: ${updatedPlayer.firstName} ${updatedPlayer.lastName}`)
 
   // Verify cascade propagated — the squad selection should have the updated name
-  const afterCascade = yield* db.SquadSelections.get({
+  const afterCascade = yield* db.entities.SquadSelections.get({
     squadId: "aus#2024-25#BGT",
     selectionNumber: 2,
   })
@@ -563,7 +566,7 @@ const program = Effect.gen(function* () {
 
   // --- Cleanup ---
   yield* Console.log("\nCleaning up...")
-  yield* db.deleteTable()
+  yield* db.tables["cricket-table"]!.delete()
   yield* Console.log("\n=== Done ===")
 })
 

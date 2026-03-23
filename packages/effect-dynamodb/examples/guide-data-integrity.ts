@@ -21,7 +21,6 @@ import { Console, Duration, Effect, Layer, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 
 // ---------------------------------------------------------------------------
@@ -61,11 +60,9 @@ const AppSchema = DynamoSchema.make({ name: "integrity-demo", version: 1 })
 const Users = Entity.make({
   model: User,
   entityType: "User",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   unique: {
@@ -80,11 +77,9 @@ const Users = Entity.make({
 const VersionedUsers = Entity.make({
   model: User,
   entityType: "VersionedUser",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: {
@@ -102,11 +97,9 @@ const VersionedUsers = Entity.make({
 const Payments = Entity.make({
   model: Payment,
   entityType: "Payment",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["paymentId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["paymentId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   unique: {
@@ -131,10 +124,10 @@ const MainTable = Table.make({
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({ entities: { Users, VersionedUsers, Payments } })
 
   yield* Console.log("=== Setup ===\n")
-  yield* db.createTable()
+  yield* db.tables["integrity-demo-table"]!.create()
   yield* Console.log("Table created\n")
 
   // -------------------------------------------------------------------------
@@ -143,7 +136,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Unique Constraints ===\n")
 
   // #region unique-error-handling
-  yield* db.Users.put({
+  yield* db.entities.Users.put({
     userId: "u-1",
     email: "alice@example.com",
     username: "alice",
@@ -152,7 +145,7 @@ const program = Effect.gen(function* () {
   })
 
   // Same email → UniqueConstraintViolation
-  const duplicateResult = yield* db.Users.put({
+  const duplicateResult = yield* db.entities.Users.put({
     userId: "u-2",
     email: "alice@example.com",
     username: "bob",
@@ -173,7 +166,7 @@ const program = Effect.gen(function* () {
   yield* Console.log(`Duplicate email: ${duplicateResult}`)
 
   // Compound constraint allows same email in different tenants
-  yield* db.Users.put({
+  yield* db.entities.Users.put({
     userId: "u-3",
     email: "alice@example.com",
     username: "alice-other",
@@ -193,7 +186,7 @@ const program = Effect.gen(function* () {
 
   // #region optimistic-concurrency
   // Create a versioned user
-  const user = yield* db.VersionedUsers.put({
+  const user = yield* db.entities.VersionedUsers.put({
     userId: "v-1",
     email: "versioned@example.com",
     username: "versioned-alice",
@@ -203,17 +196,20 @@ const program = Effect.gen(function* () {
   // user.version === 1
 
   // Update twice to build history
-  yield* db.VersionedUsers.update({ userId: "v-1" }, Entity.set({ displayName: "Alice V2" }))
+  yield* db.entities.VersionedUsers.update(
+    { userId: "v-1" },
+    Entity.set({ displayName: "Alice V2" }),
+  )
   // version is now 2
 
-  const current = yield* db.VersionedUsers.update(
+  const current = yield* db.entities.VersionedUsers.update(
     { userId: "v-1" },
     Entity.set({ displayName: "Alice V3" }),
   )
   // current.version === 3
 
   // Update with optimistic lock — must match current version
-  yield* db.VersionedUsers.update(
+  yield* db.entities.VersionedUsers.update(
     { userId: "v-1" },
     Entity.set({ displayName: "Alice V4" }),
     Entity.expectedVersion(3),
@@ -225,7 +221,7 @@ const program = Effect.gen(function* () {
 
   // #region optimistic-lock-error
   // Stale version → OptimisticLockError
-  const lockResult = yield* db.VersionedUsers.update(
+  const lockResult = yield* db.entities.VersionedUsers.update(
     { userId: "v-1" },
     Entity.set({ displayName: "Stale Update" }),
     Entity.expectedVersion(2),
@@ -245,13 +241,11 @@ const program = Effect.gen(function* () {
 
   // #region querying-versions
   // Get a specific version snapshot
-  const v1 = yield* db.VersionedUsers.getVersion({ userId: "v-1" }, 1)
+  const v1 = yield* db.entities.VersionedUsers.getVersion({ userId: "v-1" }, 1)
 
   // Query version history (most recent first)
-  const history = yield* db.VersionedUsers.collect(
+  const history = yield* db.entities.VersionedUsers.collect(
     VersionedUsers.versions({ userId: "v-1" }),
-    Query.limit(10),
-    Query.reverse,
   )
   // #endregion
   yield* Console.log(`Version 1 snapshot: ${v1.displayName}`)
@@ -270,7 +264,7 @@ const program = Effect.gen(function* () {
   const requestId = "idem-abc-123"
 
   // First request — succeeds
-  const payment = yield* db.Payments.put({
+  const payment = yield* db.entities.Payments.put({
     paymentId: "pay-001",
     amount: 99.99,
     currency: "USD",
@@ -278,7 +272,7 @@ const program = Effect.gen(function* () {
   })
 
   // Retry with same idempotency key → blocked
-  const retry = yield* db.Payments.put({
+  const retry = yield* db.entities.Payments.put({
     paymentId: "pay-002",
     amount: 99.99,
     currency: "USD",
@@ -299,7 +293,7 @@ const program = Effect.gen(function* () {
 
   // --- Cleanup ---
   yield* Console.log("=== Cleanup ===\n")
-  yield* db.deleteTable()
+  yield* db.tables["integrity-demo-table"]!.delete()
   yield* Console.log("Table deleted.")
 })
 

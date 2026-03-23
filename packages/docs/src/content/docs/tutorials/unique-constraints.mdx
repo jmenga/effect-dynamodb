@@ -50,7 +50,7 @@ No DynamoDB concepts here — uniqueness is declared at the entity level, not in
 import { DynamoSchema, Table } from "effect-dynamodb"
 
 const AppSchema = DynamoSchema.make({ name: "unique-demo", version: 1 })
-const MainTable = Table.make({ schema: AppSchema })
+const MainTable = Table.make({ schema: AppSchema, entities: { Users, ApiRequests } })
 ```
 
 ### Users Entity — Multiple Unique Constraints
@@ -64,11 +64,9 @@ The `unique` config declares which fields must be globally unique. Each key name
 const Users = Entity.make({
   model: User,
   entityType: "User",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   unique: {
@@ -91,11 +89,9 @@ For idempotency keys, you want the constraint to expire after a window. Pass an 
 const ApiRequests = Entity.make({
   model: ApiRequest,
   entityType: "ApiRequest",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["requestId"] },
-      sk: { field: "sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["requestId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   unique: {
@@ -118,7 +114,7 @@ The sentinel item gets a `_ttl` attribute set to 30 minutes in the future. Dynam
 Create the first user normally. Attempting to create a second user with the same email is blocked:
 
 ```typescript region="create-user" example="unique-constraints.ts"
-const alice = yield* db.Users.put({
+const alice = yield* db.entities.Users.put({
   userId: "u-1",
   email: "alice@example.com",
   username: "alice",
@@ -127,7 +123,7 @@ const alice = yield* db.Users.put({
 })
 
 // Same email → UniqueConstraintViolation
-const duplicateEmail = yield* db.Users.put({
+const duplicateEmail = yield* db.entities.Users.put({
   userId: "u-2",
   email: "alice@example.com", // Same email as Alice!
   username: "bob",
@@ -135,9 +131,7 @@ const duplicateEmail = yield* db.Users.put({
   name: "Bob",
 }).pipe(
   Effect.catchTag("UniqueConstraintViolation", (e) =>
-    Effect.succeed(
-      `Blocked: constraint="${e.constraint}", fields=${JSON.stringify(e.fields)}`,
-    ),
+    Effect.succeed(`Blocked: constraint="${e.constraint}", fields=${JSON.stringify(e.fields)}`),
   ),
 )
 // Blocked: constraint="email", fields={"email":"alice@example.com"}
@@ -149,7 +143,7 @@ Username uniqueness works identically — same email but duplicate username is a
 
 ```typescript region="duplicate-username" example="unique-constraints.ts"
 // Different email, same username → UniqueConstraintViolation
-const bob = yield* db.Users.put({
+const bob = yield* db.entities.Users.put({
   userId: "u-2",
   email: "bob@example.com", // Different email — OK
   username: "alice", // Same username as Alice!
@@ -163,7 +157,7 @@ const bob = yield* db.Users.put({
 // Blocked: constraint="username"
 
 // Both different → succeeds
-const charlie = yield* db.Users.put({
+const charlie = yield* db.entities.Users.put({
   userId: "u-2",
   email: "bob@example.com",
   username: "bob",
@@ -179,7 +173,7 @@ The TTL-based constraint prevents duplicate request processing. The first reques
 
 ```typescript region="idempotency" example="unique-constraints.ts"
 // First request — succeeds
-const req1 = yield* db.ApiRequests.put({
+const req1 = yield* db.entities.ApiRequests.put({
   requestId: "r-1",
   idempotencyKey: "idem-abc-123",
   payload: '{"action":"charge","amount":100}',
@@ -187,7 +181,7 @@ const req1 = yield* db.ApiRequests.put({
 })
 
 // Retry with same idempotency key → blocked
-const retry = yield* db.ApiRequests.put({
+const retry = yield* db.entities.ApiRequests.put({
   requestId: "r-2",
   idempotencyKey: "idem-abc-123", // Same idempotency key!
   payload: '{"action":"charge","amount":100}',
@@ -201,7 +195,7 @@ const retry = yield* db.ApiRequests.put({
 // After expiry, the same key can be reused
 
 // Different idempotency key — succeeds immediately
-const req2 = yield* db.ApiRequests.put({
+const req2 = yield* db.entities.ApiRequests.put({
   requestId: "r-2",
   idempotencyKey: "idem-def-456",
   payload: '{"action":"refund","amount":50}',
@@ -215,10 +209,10 @@ When you update a unique field, effect-dynamodb atomically **removes** the old s
 
 ```typescript region="sentinel-rotation" example="unique-constraints.ts"
 // Update Alice's email
-yield* db.Users.update({ userId: "u-1" }, Users.set({ email: "alice-new@example.com" }))
+yield* db.entities.Users.update({ userId: "u-1" }, Users.set({ email: "alice-new@example.com" }))
 
 // The old email "alice@example.com" is now free
-const newUser = yield* db.Users.put({
+const newUser = yield* db.entities.Users.put({
   userId: "u-3",
   email: "alice@example.com", // Previously Alice's — now available
   username: "charlie",
@@ -228,7 +222,7 @@ const newUser = yield* db.Users.put({
 // Created: Charlie
 
 // But Alice's new email is still protected
-const conflict = yield* db.Users.update(
+const conflict = yield* db.entities.Users.update(
   { userId: "u-2" },
   Users.set({ email: "alice-new@example.com" }),
 ).pipe(

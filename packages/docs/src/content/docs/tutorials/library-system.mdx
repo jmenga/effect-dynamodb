@@ -51,9 +51,10 @@ GSI1 is **overloaded** -- it serves Book loans (sparse), Genre categories (stand
 
 | Collection | Index | Partition Key | Entities |
 |------------|-------|---------------|----------|
-| `works` | GSI2 | authorLastName + authorFirstName | Author, Book, Genre |
-| `account` | GSI1 | memberId | Member, Book |
-| `titles` | GSI3 | bookTitle | Book, Genre |
+| `Works` | GSI2 | authorLastName + authorFirstName | Author, Book, Genre |
+| `Account` | GSI1 | memberId | Member, Book |
+| `Titles` | GSI3 | bookTitle | Book, Genre |
+| `Categories` | GSI1 | genre | Genre (isolated) |
 
 ---
 
@@ -104,7 +105,7 @@ Note that Book has two **optional** fields -- `memberId` and `loanEndDate`. When
 
 ---
 
-## Step 2: Schema, Table, and Entities
+## Step 2: Schema, Table, Entities, and Collections
 
 ### Schema and Table
 
@@ -118,23 +119,15 @@ const LibTable = Table.make({ schema: LibSchema, entities: { Authors, Books, Gen
 
 ### Author Entity
 
-Author has 2 indexes -- primary key plus GSI2 participating in the `works` collection:
+Author defines only a primary key by last name + first name:
 
 ```typescript title="entities.ts" region="author-entity" example="library-system.ts"
 const Authors = Entity.make({
   model: Author,
   entityType: "Author",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["authorLastName"] },
-      sk: { field: "sk", composite: ["authorFirstName"] },
-    },
-    info: {
-      index: "gsi2",
-      collection: "works",
-      pk: { field: "gsi2pk", composite: ["authorLastName", "authorFirstName"] },
-      sk: { field: "gsi2sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["authorLastName"] },
+    sk: { field: "sk", composite: ["authorFirstName"] },
   },
   timestamps: true,
 })
@@ -142,75 +135,31 @@ const Authors = Entity.make({
 
 ### Book Entity
 
-Book has 4 indexes -- the most complex entity. The `loans` index on GSI1 uses optional fields, creating a **sparse index**:
+Book defines only a primary key. The `loans` collection on GSI1 uses optional fields, creating a **sparse index**:
 
 ```typescript title="entities.ts" region="book-entity" example="library-system.ts"
 const Books = Entity.make({
   model: Book,
   entityType: "Book",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["isbn"] },
-      sk: { field: "sk", composite: ["bookId"] },
-    },
-    loans: {
-      index: "gsi1",
-      collection: "account",
-      pk: { field: "gsi1pk", composite: ["memberId"] },
-      sk: { field: "gsi1sk", composite: ["loanEndDate"] },
-    },
-    author: {
-      index: "gsi2",
-      collection: "works",
-      pk: { field: "gsi2pk", composite: ["authorLastName", "authorFirstName"] },
-      sk: { field: "gsi2sk", composite: ["bookId"] },
-    },
-    releases: {
-      index: "gsi3",
-      collection: "titles",
-      pk: { field: "gsi3pk", composite: ["bookTitle"] },
-      sk: { field: "gsi3sk", composite: ["releaseDate"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["isbn"] },
+    sk: { field: "sk", composite: ["bookId"] },
   },
   timestamps: true,
 })
 ```
 
-Key design decisions:
-- **`loans` (GSI1)** uses `memberId` and `loanEndDate` as composites -- both are `Schema.optional`, so books without a loan are invisible in this index (sparse index pattern)
-- **`author` (GSI2)** shares the `works` collection with Author and Genre, grouping everything by author name
-- **`releases` (GSI3)** shares the `titles` collection with Genre, grouping books and genres by title
-
 ### Genre Entity
 
-Genre has 4 indexes. It participates in three collection patterns plus a standalone category index:
+Genre defines only a primary key. It participates in three collection patterns plus a standalone category collection:
 
 ```typescript title="entities.ts" region="genre-entity" example="library-system.ts"
 const Genres = Entity.make({
   model: Genre,
   entityType: "Genre",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["isbn"] },
-      sk: { field: "sk", composite: ["genre", "subgenre"] },
-    },
-    categories: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["genre"] },
-      sk: { field: "gsi1sk", composite: ["subgenre"] },
-    },
-    author: {
-      index: "gsi2",
-      collection: "works",
-      pk: { field: "gsi2pk", composite: ["authorLastName", "authorFirstName"] },
-      sk: { field: "gsi2sk", composite: ["genre"] },
-    },
-    title: {
-      index: "gsi3",
-      collection: "titles",
-      pk: { field: "gsi3pk", composite: ["bookTitle"] },
-      sk: { field: "gsi3sk", composite: ["genre", "subgenre"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["isbn"] },
+    sk: { field: "sk", composite: ["genre", "subgenre"] },
   },
   timestamps: true,
 })
@@ -218,27 +167,72 @@ const Genres = Entity.make({
 
 ### Member Entity
 
-Member has 2 indexes. GSI1 participates in the `account` collection alongside Book loans:
+Member defines only a primary key. GSI1 participates in the `Account` collection alongside Book loans:
 
 ```typescript title="entities.ts" region="member-entity" example="library-system.ts"
 const Members = Entity.make({
   model: Member,
   entityType: "Member",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["memberId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    account: {
-      index: "gsi1",
-      collection: "account",
-      pk: { field: "gsi1pk", composite: ["memberId"] },
-      sk: { field: "gsi1sk", composite: [] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["memberId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 ```
+
+### Collections -- GSI Access Patterns
+
+All GSI access patterns are defined via `Collections.make()`:
+
+```typescript title="collections.ts" region="collections" example="library-system.ts"
+const Account = Collections.make("account", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["memberId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Members: Collections.member(Members, { sk: { composite: [] } }),
+    Books: Collections.member(Books, { sk: { composite: ["loanEndDate"] } }),
+  },
+})
+
+const Categories = Collections.make("categories", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["genre"] },
+  sk: { field: "gsi1sk" },
+  type: "isolated",
+  members: {
+    Genres: Collections.member(Genres, { sk: { composite: ["subgenre"] } }),
+  },
+})
+
+const Works = Collections.make("works", {
+  index: "gsi2",
+  pk: { field: "gsi2pk", composite: ["authorLastName", "authorFirstName"] },
+  sk: { field: "gsi2sk" },
+  members: {
+    Authors: Collections.member(Authors, { sk: { composite: [] } }),
+    Books: Collections.member(Books, { sk: { composite: ["bookId"] } }),
+    Genres: Collections.member(Genres, { sk: { composite: ["genre"] } }),
+  },
+})
+
+const Titles = Collections.make("titles", {
+  index: "gsi3",
+  pk: { field: "gsi3pk", composite: ["bookTitle"] },
+  sk: { field: "gsi3sk" },
+  members: {
+    Books: Collections.member(Books, { sk: { composite: ["releaseDate"] } }),
+    Genres: Collections.member(Genres, { sk: { composite: ["genre", "subgenre"] } }),
+  },
+})
+```
+
+Key design decisions:
+- **`Account` (GSI1)** uses `memberId` as PK. Book's `loanEndDate` is `Schema.optional`, so books without a loan are invisible in this index (sparse index pattern)
+- **`Works` (GSI2)** groups Author, Book, and Genre by author name -- three entity types in one partition
+- **`Titles` (GSI3)** groups Books and Genres by title
+- **`Categories` (GSI1)** is `isolated` -- standalone genre browsing, not clustered with Account
 
 ---
 
@@ -339,24 +333,27 @@ const members = {
 ```
 
 ```typescript title="seed.ts" region="seed-insert" example="library-system.ts"
-// Typed execution gateway — binds all table members
-const db = yield* DynamoClient.make(LibTable)
+// Typed execution gateway — binds all entities and collections
+const db = yield* DynamoClient.make({
+  entities: { Authors, Books, Genres, Members },
+  collections: { Account, Categories, Works, Titles },
+})
 
 // --- Setup: create table ---
-yield* db.createTable()
+yield* db.tables["library-table"]!.create()
 
 // --- Seed data ---
 for (const author of Object.values(authors)) {
-  yield* db.Authors.put(author)
+  yield* db.entities.Authors.put(author)
 }
 for (const book of Object.values(books)) {
-  yield* db.Books.put(book)
+  yield* db.entities.Books.put(book)
 }
 for (const g of Object.values(genres)) {
-  yield* db.Genres.put(g)
+  yield* db.entities.Genres.put(g)
 }
 for (const member of Object.values(members)) {
-  yield* db.Members.put(member)
+  yield* db.entities.Members.put(member)
 }
 ```
 
@@ -371,14 +368,14 @@ for (const member of Object.values(members)) {
 Author's primary key uses `authorLastName` as PK and `authorFirstName` as SK, enabling direct gets by full name.
 
 ```typescript region="get-author" example="library-system.ts"
-const tolkien = yield* db.Authors.get({
+const tolkien = yield* db.entities.Authors.get({
   authorLastName: "Tolkien",
   authorFirstName: "J.R.R.",
 })
 // tolkien.birthday → "1892-01-03"
 // tolkien.bio → "English writer and philologist..."
 
-const asimov = yield* db.Authors.get({
+const asimov = yield* db.entities.Authors.get({
   authorLastName: "Asimov",
   authorFirstName: "Isaac",
 })
@@ -393,7 +390,7 @@ Book and Genre share the same primary partition key (`isbn`). Querying each enti
 
 ```typescript region="detail-by-isbn" example="library-system.ts"
 // Get the book
-const hobbit = yield* db.Books.get({
+const hobbit = yield* db.entities.Books.get({
   isbn: "978-0-547-928227",
   bookId: "b-hobbit",
 })
@@ -401,7 +398,7 @@ const hobbit = yield* db.Books.get({
 // hobbit.publisher → "George Allen & Unwin"
 
 // Get the genre for the same ISBN
-const hobbitGenre = yield* db.Genres.get({
+const hobbitGenre = yield* db.entities.Genres.get({
   isbn: "978-0-547-928227",
   genre: "Fantasy",
   subgenre: "High Fantasy",
@@ -414,25 +411,25 @@ const hobbitGenre = yield* db.Genres.get({
 
 > As a catalog system, retrieve all of an author's books and genres.
 
-Author, Book, and Genre share GSI2 via the `works` collection. All three use `authorLastName + authorFirstName` as the partition key, so a single partition holds the author's complete catalog.
+Author, Book, and Genre share GSI2 via the `Works` collection. All three use `authorLastName + authorFirstName` as the partition key, so a single partition holds the author's complete catalog.
 
 ```typescript region="works-collection" example="library-system.ts"
 // Asimov's books
-const asimovBooks = yield* db.Books.collect(
-  Books.query.author({ authorLastName: "Asimov", authorFirstName: "Isaac" }),
-)
+const { Books: asimovBooks } = yield* db.collections
+  .Works({ authorLastName: "Asimov", authorFirstName: "Isaac" })
+  .collect()
 // → [{ bookTitle: "Foundation", ... }, { bookTitle: "I, Robot", ... }]
 
 // Asimov's genres
-const asimovGenres = yield* db.Genres.collect(
-  Genres.query.author({ authorLastName: "Asimov", authorFirstName: "Isaac" }),
-)
+const { Genres: asimovGenres } = yield* db.collections
+  .Works({ authorLastName: "Asimov", authorFirstName: "Isaac" })
+  .collect()
 // → [{ subgenre: "Space Opera", ... }, { subgenre: "Robotics", ... }]
 
 // Author's own record in the works collection
-const tolkienInfo = yield* db.Authors.collect(
-  Authors.query.info({ authorLastName: "Tolkien", authorFirstName: "J.R.R." }),
-)
+const { Authors: tolkienInfo } = yield* db.collections
+  .Works({ authorLastName: "Tolkien", authorFirstName: "J.R.R." })
+  .collect()
 // → [{ birthday: "1892-01-03", bio: "...", ... }]
 ```
 
@@ -442,39 +439,35 @@ All three queries hit GSI2 with the same partition key. DynamoDB serves them fro
 
 > As an account system, show a member's profile alongside their loaned books.
 
-Member and Book share GSI1 via the `account` collection. Both use `memberId` as the partition key.
+Member and Book share GSI1 via the `Account` collection. Both use `memberId` as the partition key.
 
 ```typescript region="account-collection" example="library-system.ts"
 // Member profile
-const aliceAccount = yield* db.Members.collect(
-  Members.query.account({ memberId: "m-alice" }),
-)
+const { Members: aliceAccount } = yield* db.collections.Account({ memberId: "m-alice" }).collect()
 // → [{ memberId: "m-alice", city: "New York", state: "NY", ... }]
 
 // Alice's loaned books (initially empty -- sparse index)
-const aliceLoans = yield* db.Books.collect(
-  Books.query.loans({ memberId: "m-alice" }),
-)
+const { Books: aliceLoans } = yield* db.collections.Account({ memberId: "m-alice" }).collect()
 // → [] (no books loaned yet)
 ```
 
-Books only appear in the `loans` index when `memberId` and `loanEndDate` are populated. This is the sparse index pattern in action.
+Books only appear in the `Account` collection when `memberId` and `loanEndDate` are populated. This is the sparse index pattern in action.
 
 ### Requirement 5: Books by Title (Titles Collection)
 
 > Search for books and genres by title.
 
-Book and Genre share GSI3 via the `titles` collection. Both use `bookTitle` as the partition key.
+Book and Genre share GSI3 via the `Titles` collection. Both use `bookTitle` as the partition key.
 
 ```typescript region="titles-collection" example="library-system.ts"
-const foundationByTitle = yield* db.Books.collect(
-  Books.query.releases({ bookTitle: "Foundation" }),
-)
+const { Books: foundationByTitle } = yield* db.collections
+  .Titles({ bookTitle: "Foundation" })
+  .collect()
 // → [{ isbn: "978-0-553-293357", releaseDate: "1951-06-01", ... }]
 
-const foundationGenresByTitle = yield* db.Genres.collect(
-  Genres.query.title({ bookTitle: "Foundation" }),
-)
+const { Genres: foundationGenresByTitle } = yield* db.collections
+  .Titles({ bookTitle: "Foundation" })
+  .collect()
 // → [{ genre: "Sci-Fi", subgenre: "Space Opera", ... }]
 ```
 
@@ -482,22 +475,22 @@ const foundationGenresByTitle = yield* db.Genres.collect(
 
 > Browse all books in a genre category.
 
-Genre's `categories` index on GSI1 is a **standalone** index (not part of a collection). It uses `genre` as PK and `subgenre` as SK for hierarchical browsing.
+The `Categories` collection on GSI1 is an **isolated** collection for standalone genre browsing. It uses `genre` as PK and `subgenre` as SK for hierarchical browsing.
 
 ```typescript region="genre-categories" example="library-system.ts"
 // All Sci-Fi subgenres
-const sciFiGenres = yield* db.Genres.collect(
-  Genres.query.categories({ genre: "Sci-Fi" }),
-)
+const { Genres: sciFiGenres } = yield* db.collections
+  .Categories({ genre: "Sci-Fi" })
+  .collect()
 // → [
 //   { subgenre: "Robotics", bookTitle: "I, Robot", ... },
 //   { subgenre: "Space Opera", bookTitle: "Foundation", ... },
 // ]
 
 // All Fantasy subgenres
-const fantasyGenres = yield* db.Genres.collect(
-  Genres.query.categories({ genre: "Fantasy" }),
-)
+const { Genres: fantasyGenres } = yield* db.collections
+  .Categories({ genre: "Fantasy" })
+  .collect()
 // → [{ subgenre: "High Fantasy", bookTitle: "The Hobbit", ... }]
 ```
 
@@ -505,10 +498,10 @@ const fantasyGenres = yield* db.Genres.collect(
 
 > As circulation, loan a book to a member so it appears in their account.
 
-Updating a book's `memberId` and `loanEndDate` populates the GSI1 composites, causing the book to **appear** in the loans sparse index. Before the update, those fields are absent, so the book is invisible in GSI1.
+Updating a book's `memberId` and `loanEndDate` populates the GSI1 composites, causing the book to **appear** in the Account collection's sparse index. Before the update, those fields are absent, so the book is invisible in GSI1.
 
 ```typescript region="loan-book" example="library-system.ts"
-yield* db.Books.update(
+yield* db.entities.Books.update(
   { isbn: "978-0-547-928227", bookId: "b-hobbit" },
   Entity.set({
     memberId: "m-alice",
@@ -522,25 +515,23 @@ yield* db.Books.update(
 )
 
 // Now the book appears in Alice's loans
-const aliceLoansAfter = yield* db.Books.collect(
-  Books.query.loans({ memberId: "m-alice" }),
-)
+const { Books: aliceLoansAfter } = yield* db.collections
+  .Account({ memberId: "m-alice" })
+  .collect()
 // → [{ bookTitle: "The Hobbit", isbn: "978-0-547-928227", ... }]
 
 // Bob still has no loans
-const bobLoans = yield* db.Books.collect(
-  Books.query.loans({ memberId: "m-bob" }),
-)
+const { Books: bobLoans } = yield* db.collections.Account({ memberId: "m-bob" }).collect()
 // → []
 ```
 
-When you update fields that participate in GSI composites, you must provide **all** composites for every affected GSI. Here the update touches `memberId` (loans GSI1), so `loanEndDate` is also required. The author and title fields are needed for GSI2 and GSI3 recomposition.
+When you update fields that participate in GSI composites, you must provide **all** composites for every affected GSI. Here the update touches `memberId` (Account GSI1), so `loanEndDate` is also required. The author and title fields are needed for GSI2 and GSI3 recomposition.
 
 ### Requirement 8: Return a Book (Transaction)
 
 > As circulation, return a book by clearing the loan and removing it from the loans index.
 
-To return a book, re-put it without the loan fields. Since `memberId` and `loanEndDate` are omitted, the book drops out of the sparse loans index. `Transaction.transactWrite` ensures the operation is atomic.
+To return a book, re-put it without the loan fields. Since `memberId` and `loanEndDate` are omitted, the book drops out of the sparse Account collection. `Transaction.transactWrite` ensures the operation is atomic.
 
 ```typescript region="return-book" example="library-system.ts"
 yield* Transaction.transactWrite([
@@ -558,13 +549,13 @@ yield* Transaction.transactWrite([
 ])
 
 // Book is no longer in Alice's loans
-const aliceLoansCleared = yield* db.Books.collect(
-  Books.query.loans({ memberId: "m-alice" }),
-)
+const { Books: aliceLoansCleared } = yield* db.collections
+  .Account({ memberId: "m-alice" })
+  .collect()
 // → []
 
 // But the book still exists and is intact
-const returnedHobbit = yield* db.Books.get({
+const returnedHobbit = yield* db.entities.Books.get({
   isbn: "978-0-547-928227",
   bookId: "b-hobbit",
 })
@@ -572,9 +563,9 @@ const returnedHobbit = yield* db.Books.get({
 // returnedHobbit.memberId → undefined (cleared)
 
 // And still appears in author's works
-const tolkienBooksAfter = yield* db.Books.collect(
-  Books.query.author({ authorLastName: "Tolkien", authorFirstName: "J.R.R." }),
-)
+const { Books: tolkienBooksAfter } = yield* db.collections
+  .Works({ authorLastName: "Tolkien", authorFirstName: "J.R.R." })
+  .collect()
 // → [{ bookTitle: "The Hobbit", ... }]
 ```
 
@@ -622,8 +613,8 @@ Effect.runPromise(main).then(
 |---------|---------------|
 | **Single-table design** | 4 entities, 1 table, structured key values |
 | **Index overloading** | GSI1 serves book loans, genre categories, and member accounts |
-| **Collections** | `works` (GSI2), `account` (GSI1), and `titles` (GSI3) enable cross-entity queries |
-| **Sparse index** | Book loans GSI only populated when `memberId` + `loanEndDate` are present |
+| **Collections** | `Works` (GSI2), `Account` (GSI1), and `Titles` (GSI3) enable cross-entity queries |
+| **Sparse index** | Book loans collection only populated when `memberId` + `loanEndDate` are present |
 | **All-or-none GSI updates** | Loaning a book requires all composites for every affected GSI |
 | **Transactions** | Atomic book returns via `Transaction.transactWrite` |
 | **Optional fields drive visibility** | `Schema.optional` fields control sparse index membership |

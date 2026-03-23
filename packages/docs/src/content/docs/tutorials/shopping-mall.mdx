@@ -1,15 +1,15 @@
 ---
 title: "Example: Shopping Mall"
-description: "Single entity with composite keys, 2 GSIs, sort key prefix queries, and date range queries"
+description: "Single entity with composite keys, 2 GSI collections, and date range queries"
 ---
 
 A shopping mall directory application managing **mall stores** in a single DynamoDB table. Adapted from the [ElectroDB Shopping Mall example](https://electrodb.dev/en/examples/shopping-mall/) to showcase effect-dynamodb's approach to the same problem.
 
 **What you'll learn:**
 - Single entity with a composite primary key (2 PK + 2 SK composites)
-- 2 GSIs for different access patterns on the same entity
-- Sort key prefix queries with `beginsWith` to filter by building
-- Date range queries with `between` for lease expiration windows
+- 2 GSI collections for different access patterns on the same entity
+- Sort key prefix queries to filter by building
+- Date range queries for lease expiration windows
 - CRUD operations with composite keys
 - Layer-based dependency injection
 
@@ -19,12 +19,12 @@ A shopping mall directory application managing **mall stores** in a single Dynam
 
 This example supports six access patterns on a single entity:
 
-1. **Get store** — Look up a specific store by city, mall, building, and store ID (primary key)
-2. **Stores in a mall** — Find all stores in a given mall (GSI1)
-3. **Stores in a building** — Narrow to a specific building within a mall (GSI1 + `beginsWith`)
-4. **Lease renewals** — Find leases expiring within a date range (GSI2 + `between`)
-5. **Update store** — Change rent and discount for a store
-6. **Delete store** — Remove a store from the directory
+1. **Get store** -- Look up a specific store by city, mall, building, and store ID (primary key)
+2. **Stores in a mall** -- Find all stores in a given mall (GSI1 collection)
+3. **Stores in a building** -- Narrow to a specific building within a mall (GSI1 collection + SK composites)
+4. **Lease renewals** -- Find leases expiring within a date range (GSI2 collection)
+5. **Update store** -- Change rent and discount for a store
+6. **Delete store** -- Remove a store from the directory
 
 ---
 
@@ -59,13 +59,13 @@ class MallStore extends Schema.Class<MallStore>("MallStore")({
 
 Key modeling decisions:
 - **`category`** uses a const object + `Schema.Literals(Object.values(...))` for a constrained set of store types
-- **`discount`** has a decoding default of `"0.00"` — if omitted during `put`, it defaults automatically
-- **`deposit`** is optional — not every store has one
+- **`discount`** has a decoding default of `"0.00"` -- if omitted during `put`, it defaults automatically
+- **`deposit`** is optional -- not every store has one
 - **`rent`**, **`leaseEndDate`** are strings for lexicographic sort key ordering in GSI queries
 
 ---
 
-## Step 2: Schema, Table, and Entity
+## Step 2: Schema, Entity, Table, and Collections
 
 ### Schema
 
@@ -75,27 +75,15 @@ const MallSchema = DynamoSchema.make({ name: "mall", version: 1 })
 
 ### MallStore Entity and Table
 
-The entity defines three indexes — a composite primary key plus two GSIs. The table declares the entity as a member:
+The entity defines only a composite primary key. The table declares the entity as a member:
 
 ```typescript title="entities.ts" region="entity" example="shopping-mall.ts"
 const MallStores = Entity.make({
   model: MallStore,
   entityType: "MallStore",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["cityId", "mallId"] },
-      sk: { field: "sk", composite: ["buildingId", "storeId"] },
-    },
-    units: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["mallId"] },
-      sk: { field: "gsi1sk", composite: ["buildingId", "unitId"] },
-    },
-    leases: {
-      index: "gsi2",
-      pk: { field: "gsi2pk", composite: ["storeId"] },
-      sk: { field: "gsi2sk", composite: ["leaseEndDate"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["cityId", "mallId"] },
+    sk: { field: "sk", composite: ["buildingId", "storeId"] },
   },
   timestamps: true,
 })
@@ -103,13 +91,42 @@ const MallStores = Entity.make({
 const MallTable = Table.make({ schema: MallSchema, entities: { MallStores } })
 ```
 
-| Index | PK composites | SK composites | Access pattern |
-|-------|--------------|---------------|----------------|
-| **primary** | `cityId`, `mallId` | `buildingId`, `storeId` | Get a specific store |
-| **units** (GSI1) | `mallId` | `buildingId`, `unitId` | Stores in a mall or building |
-| **leases** (GSI2) | `storeId` | `leaseEndDate` | Lease expiration queries |
+### Collections -- GSI Access Patterns
 
-The composite primary key uses four attributes — `cityId` and `mallId` form the partition key, while `buildingId` and `storeId` form the sort key. This means a `get` requires all four values.
+GSI access patterns are defined via `Collections.make()`. Each collection owns its index definition and member SK composites:
+
+```typescript title="collections.ts" region="collections" example="shopping-mall.ts"
+const Units = Collections.make("units", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["mallId"] },
+  sk: { field: "gsi1sk" },
+  type: "isolated",
+  members: {
+    MallStores: Collections.member(MallStores, {
+      sk: { composite: ["buildingId", "unitId"] },
+    }),
+  },
+})
+
+const Leases = Collections.make("leases", {
+  index: "gsi2",
+  pk: { field: "gsi2pk", composite: ["storeId"] },
+  sk: { field: "gsi2sk" },
+  type: "isolated",
+  members: {
+    MallStores: Collections.member(MallStores, {
+      sk: { composite: ["leaseEndDate"] },
+    }),
+  },
+})
+```
+
+| Collection | Index | PK composites | SK composites | Access pattern |
+|------------|-------|--------------|---------------|----------------|
+| **Units** (GSI1) | `gsi1` | `mallId` | `buildingId`, `unitId` | Stores in a mall or building |
+| **Leases** (GSI2) | `gsi2` | `storeId` | `leaseEndDate` | Lease expiration queries |
+
+The composite primary key uses four attributes -- `cityId` and `mallId` form the partition key, while `buildingId` and `storeId` form the sort key. This means a `get` requires all four values.
 
 ---
 
@@ -196,14 +213,17 @@ const stores = {
 Six stores across two malls (EastPointe and WestGate) in Atlanta, with leases expiring at different times throughout 2025.
 
 ```typescript title="seed.ts" region="seed-loop" example="shopping-mall.ts"
-const db = yield* DynamoClient.make(MallTable)
+const db = yield* DynamoClient.make({
+  entities: { MallStores },
+  collections: { Units, Leases },
+})
 
 // --- Setup: create table ---
-yield* db.createTable()
+yield* db.tables["mall-table"]!.create()
 
 // --- Seed data ---
 for (const store of Object.values(stores)) {
-  yield* db.MallStores.put(store)
+  yield* db.entities.MallStores.put(store)
 }
 ```
 
@@ -213,10 +233,10 @@ for (const store of Object.values(stores)) {
 
 ### Pattern 1: Get Store by Primary Key
 
-The composite primary key requires all four attributes — `cityId`, `mallId`, `buildingId`, and `storeId`:
+The composite primary key requires all four attributes -- `cityId`, `mallId`, `buildingId`, and `storeId`:
 
 ```typescript region="pattern-1" example="shopping-mall.ts"
-const coffee = yield* db.MallStores.get({
+const coffee = yield* db.entities.MallStores.get({
   cityId: "atlanta",
   mallId: "eastpointe",
   buildingId: "bldg-a",
@@ -227,88 +247,66 @@ const coffee = yield* db.MallStores.get({
 // coffee.deposit → 7000
 ```
 
-### Pattern 2: All Stores in a Mall (GSI1)
+### Pattern 2: All Stores in a Mall (GSI1 Collection)
 
-The `units` index on GSI1 uses `mallId` as the partition key. Querying with just the PK composites returns all stores in that mall:
+The `Units` collection on GSI1 uses `mallId` as the partition key. Querying with just the PK composites returns all stores in that mall:
 
 ```typescript region="pattern-2" example="shopping-mall.ts"
-const eastpointeStores = yield* db.MallStores.collect(
-  MallStores.query.units({ mallId: "eastpointe" }),
-)
+const { MallStores: eastpointeStores } = yield* db.collections
+  .Units({ mallId: "eastpointe" })
+  .collect()
 // → 4 stores: star-coffee, burger-barn, tech-zone, trendy-threads
 
-const westgateStores = yield* db.MallStores.collect(
-  MallStores.query.units({ mallId: "westgate" }),
-)
+const { MallStores: westgateStores } = yield* db.collections
+  .Units({ mallId: "westgate" })
+  .collect()
 // → 2 stores: mega-mart, gifts-galore
 ```
 
-### Pattern 3: Stores in a Building (GSI1 + beginsWith)
+### Pattern 3: Stores in a Building (GSI1 Collection + SK Composites)
 
-To narrow to a specific building, compose a sort key prefix with `KeyComposer.composeSortKeyPrefix` and use `Query.where({ beginsWith })`:
+To narrow to a specific building, pass `buildingId` as an additional composite in the collection query:
 
 ```typescript region="pattern-3" example="shopping-mall.ts"
-const unitsIndex = MallStores.indexes.units
-const bldgAPrefix = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, unitsIndex, {
-  buildingId: "bldg-a",
-})
-
-const bldgAStores = yield* db.MallStores.collect(
-  MallStores.query.units({ mallId: "eastpointe" }).pipe(Query.where({ beginsWith: bldgAPrefix })),
-)
+const { MallStores: bldgAStores } = yield* db.collections
+  .Units({ mallId: "eastpointe", buildingId: "bldg-a" })
+  .collect()
 // → 2 stores: star-coffee, burger-barn
 
-const bldgBPrefix = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, unitsIndex, {
-  buildingId: "bldg-b",
-})
-
-const bldgBStores = yield* db.MallStores.collect(
-  MallStores.query.units({ mallId: "eastpointe" }).pipe(Query.where({ beginsWith: bldgBPrefix })),
-)
+const { MallStores: bldgBStores } = yield* db.collections
+  .Units({ mallId: "eastpointe", buildingId: "bldg-b" })
+  .collect()
 // → 2 stores: tech-zone, trendy-threads
 ```
 
-The sort key for `units` is composed from `buildingId + unitId`. By composing a prefix from just `buildingId`, the `beginsWith` condition matches all stores in that building regardless of `unitId`.
+The sort key for `Units` is composed from `buildingId + unitId`. Passing `buildingId` as an additional parameter filters stores to that building.
 
-### Pattern 4: Lease Renewals by Date Range (GSI2)
+### Pattern 4: Lease Renewals by Date Range (GSI2 Collection)
 
-The `leases` index on GSI2 uses `storeId` as the partition key and `leaseEndDate` as the sort key. Compose sort key bounds to query a date range with `between`:
+The `Leases` collection on GSI2 uses `storeId` as the partition key and `leaseEndDate` as the sort key. Query by store and filter the results by date range:
 
 ```typescript region="pattern-4" example="shopping-mall.ts"
-const leasesIndex = MallStores.indexes.leases
-
-// Q1 2025 bounds
-const q1Lo = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, leasesIndex, {
-  leaseEndDate: "2025-01-01",
-})
-const q1Hi = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, leasesIndex, {
-  leaseEndDate: "2025-03-31",
-})
-
 // star-coffee lease ends 2025-03-31 — within Q1
-const starCoffeeQ1 = yield* db.MallStores.collect(
-  MallStores.query
-    .leases({ storeId: "star-coffee" })
-    .pipe(Query.where({ between: [q1Lo, q1Hi] })),
+const { MallStores: starCoffeeLeases } = yield* db.collections
+  .Leases({ storeId: "star-coffee" })
+  .collect()
+const starCoffeeQ1 = starCoffeeLeases.filter(
+  (s) => s.leaseEndDate >= "2025-01-01" && s.leaseEndDate <= "2025-03-31",
 )
 // → 1 result (lease ends 2025-03-31)
 
 // tech-zone lease ends 2025-09-30 — NOT in Q1
-const techZoneQ1 = yield* db.MallStores.collect(
-  MallStores.query.leases({ storeId: "tech-zone" }).pipe(Query.where({ between: [q1Lo, q1Hi] })),
+const { MallStores: techZoneLeases } = yield* db.collections
+  .Leases({ storeId: "tech-zone" })
+  .collect()
+const techZoneQ1 = techZoneLeases.filter(
+  (s) => s.leaseEndDate >= "2025-01-01" && s.leaseEndDate <= "2025-03-31",
 )
 // → 0 results
 
 // Q3 2025 bounds for tech-zone
-const q3Lo = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, leasesIndex, {
-  leaseEndDate: "2025-07-01",
-})
-const q3Hi = KeyComposer.composeSortKeyPrefix(MallSchema, "MallStore", 1, leasesIndex, {
-  leaseEndDate: "2025-09-30",
-})
-
-const techZoneQ3 = yield* db.MallStores.collect(
-  MallStores.query.leases({ storeId: "tech-zone" }).pipe(Query.where({ between: [q3Lo, q3Hi] })),
+const techZoneQ3 = techZoneLeases.filter(
+  (s) => s.leaseEndDate >= "2025-07-01" && s.leaseEndDate <= "2025-09-30",
 )
 // → 1 result (lease ends 2025-09-30)
 ```
@@ -320,7 +318,7 @@ Because `leaseEndDate` is an ISO date string, it sorts lexicographically in chro
 Update non-key attributes with `Entity.set()`. The composite key identifies which item to update:
 
 ```typescript region="pattern-5" example="shopping-mall.ts"
-const updated = yield* db.MallStores.update(
+const updated = yield* db.entities.MallStores.update(
   {
     cityId: "atlanta",
     mallId: "eastpointe",
@@ -342,7 +340,7 @@ const updated = yield* db.MallStores.update(
 Delete requires the full composite key:
 
 ```typescript region="pattern-6" example="shopping-mall.ts"
-yield* db.MallStores.delete({
+yield* db.entities.MallStores.delete({
   cityId: "atlanta",
   mallId: "westgate",
   buildingId: "bldg-c",
@@ -350,7 +348,9 @@ yield* db.MallStores.delete({
 })
 
 // Verify: westgate now has 1 store
-const westgateAfter = yield* db.MallStores.collect(MallStores.query.units({ mallId: "westgate" }))
+const { MallStores: westgateAfter } = yield* db.collections
+  .Units({ mallId: "westgate" })
+  .collect()
 // → 1 store: mega-mart
 ```
 
@@ -399,9 +399,9 @@ Effect.runPromise(main).then(
 | Concept | How it's used |
 |---------|---------------|
 | **Composite primary key** | 4 attributes (2 PK + 2 SK) uniquely identify each store |
-| **GSI for alternate access** | GSI1 (`units`) queries by mall; GSI2 (`leases`) queries by store + date |
-| **Sort key prefix queries** | `beginsWith` on `buildingId` filters stores within a building |
-| **Date range queries** | `between` on `leaseEndDate` finds leases expiring in a date window |
+| **Collections for GSI access** | `Units` collection queries by mall; `Leases` collection queries by store + date |
+| **SK composite filtering** | Passing `buildingId` to `Units` collection filters stores within a building |
+| **Date range queries** | Lease expiration date filtering for date windows |
 | **Schema defaults** | `discount` defaults to `"0.00"` via `Schema.withDecodingDefaultKey` |
 | **Optional fields** | `deposit` is `Schema.optional` -- not every store requires one |
 

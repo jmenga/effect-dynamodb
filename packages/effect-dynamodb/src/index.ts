@@ -4,7 +4,23 @@ export type { BatchRetryConfig } from "./Batch.js"
 export * as Batch from "./Batch.js"
 export type { Collection as CollectionType } from "./Collection.js"
 export * as Collection from "./Collection.js"
-export type { DynamoClientError, DynamoClientService, TypedClient } from "./DynamoClient.js"
+export type {
+  Collection as CollectionsDefinition,
+  CollectionConfig,
+  CollectionEntityLike,
+  CollectionMember,
+  CollectionPkInput,
+  CollectionResult,
+  CollectionType as CollectionsType,
+} from "./Collections.js"
+export * as Collections from "./Collections.js"
+export type {
+  DynamoClientError,
+  DynamoClientService,
+  TableOperations,
+  TypedClient,
+  TypedClientV2,
+} from "./DynamoClient.js"
 export { DynamoClient } from "./DynamoClient.js"
 export * as DynamoModel from "./DynamoModel.js"
 export type { Casing, DynamoSchema as DynamoSchemaType } from "./DynamoSchema.js"
@@ -48,6 +64,13 @@ export type {
   UpdateInput,
 } from "./Expression.js"
 export * as Expression from "./Expression.js"
+export type {
+  BoundQuery,
+  BoundQueryBase,
+  BoundQueryWithWhere,
+  SkConditionOps,
+} from "./internal/BoundQuery.js"
+export { makeBoundQuery } from "./internal/BoundQuery.js"
 export type {
   EntityInputType,
   EntityKeyType,

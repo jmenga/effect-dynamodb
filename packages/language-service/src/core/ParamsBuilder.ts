@@ -1,4 +1,10 @@
-import type { Casing, IndexDefinition, ResolvedEntity, SchemaConfig } from "./EntityResolver"
+import type {
+  Casing,
+  IndexDefinition,
+  ResolvedCollection,
+  ResolvedEntity,
+  SchemaConfig,
+} from "./EntityResolver"
 import type { DetectedOperation, UpdateCombinators } from "./OperationDetector"
 
 export interface DynamoDBParams {
@@ -14,26 +20,36 @@ export interface DynamoDBParams {
   readonly ExpressionAttributeNames?: Record<string, string> | undefined
   readonly ExpressionAttributeValues?: Record<string, string> | undefined
   readonly entityType: string
+  // v2 fields
+  readonly info?: string | undefined
 }
 
-export function buildParams(op: DetectedOperation): DynamoDBParams {
+export function buildParams(op: DetectedOperation): DynamoDBParams | undefined {
   const { entity, type } = op
 
   switch (type) {
     case "get":
-      return buildGetParams(entity, op.arguments)
+      return entity ? buildGetParams(entity, op.arguments) : undefined
     case "put":
-      return buildPutParams(entity, op.arguments)
+      return entity ? buildPutParams(entity, op.arguments) : undefined
     case "create":
-      return buildCreateParams(entity, op.arguments)
+      return entity ? buildCreateParams(entity, op.arguments) : undefined
     case "update":
-      return buildUpdateParams(entity, op.arguments, op.updateCombinators)
+      return entity ? buildUpdateParams(entity, op.arguments, op.updateCombinators) : undefined
     case "delete":
-      return buildDeleteParams(entity, op.arguments)
+      return entity ? buildDeleteParams(entity, op.arguments) : undefined
     case "query":
-      return buildQueryParams(entity, op.indexName, op.arguments)
+      return entity ? buildQueryParams(entity, op.indexName, op.arguments) : undefined
     case "scan":
-      return buildScanParams(entity)
+      return entity ? buildScanParams(entity) : undefined
+    case "entity-query-accessor":
+      return buildEntityAccessorParams(op.entity, op.collection, op.collectionName, op.arguments)
+    case "collection-accessor":
+      return buildCollectionAccessorParams(op.collection, op.collectionName, op.arguments)
+    case "bound-query-terminal":
+      return buildBoundQueryTerminalParams(op)
+    case "table-accessor":
+      return buildTableAccessorParams(op.tableName)
   }
 }
 
@@ -461,4 +477,141 @@ function extractCompositeValues(
     if (value === undefined || value === null) return `{${attr}}`
     return String(value)
   })
+}
+
+// ---------------------------------------------------------------------------
+// V2 param builders — entity accessors, collection accessors, BoundQuery terminals
+// ---------------------------------------------------------------------------
+
+function buildEntityAccessorParams(
+  entity: ResolvedEntity | undefined,
+  collection: ResolvedCollection | undefined,
+  collectionName: string | undefined,
+  args: Record<string, unknown> | undefined,
+): DynamoDBParams {
+  if (!entity || !collection) {
+    return {
+      command: "QueryCommand",
+      TableName: "<table>",
+      entityType: entity?.entityType ?? "unknown",
+      info: `Query accessor '${collectionName ?? "unknown"}'`,
+    }
+  }
+
+  const pkComposites = collection.pk.composite.join(", ")
+  const memberEntry = Object.entries(collection.members).find(
+    ([, m]) => m.entityVariableName === entity.variableName,
+  )
+  const skComposites = memberEntry ? memberEntry[1].sk.composite.join(", ") : ""
+
+  const info = [
+    `Query accessor '${collectionName}'`,
+    `  Index: ${collection.index} (collection: ${collection.collectionName}, ${collection.type})`,
+    `  PK: ${pkComposites} (required)`,
+    skComposites ? `  SK: ${skComposites} (optional begins_with)` : undefined,
+    `  Returns: BoundQuery<${entity.entityType}>`,
+  ]
+    .filter(Boolean)
+    .join("\n")
+
+  // Build actual query params if we have arguments
+  if (args && entity.schema) {
+    const indexDef: IndexDefinition = {
+      index: collection.index,
+      collection: collection.collectionName,
+      type: collection.type,
+      pk: collection.pk,
+      sk: {
+        field: collection.sk.field,
+        composite: memberEntry ? [...memberEntry[1].sk.composite] : [],
+      },
+    }
+    const pkValue = composePkValue(entity.schema, entity.entityType, indexDef, args)
+    const names: Record<string, string> = { "#pk": indexDef.pk.field }
+    const values: Record<string, string> = { ":pk": pkValue }
+
+    return {
+      command: "QueryCommand",
+      TableName: "<table>",
+      IndexName: collection.index,
+      KeyConditionExpression: "#pk = :pk",
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
+      entityType: entity.entityType,
+      info,
+    }
+  }
+
+  return {
+    command: "QueryCommand",
+    TableName: "<table>",
+    IndexName: collection.index,
+    entityType: entity.entityType,
+    info,
+  }
+}
+
+function buildCollectionAccessorParams(
+  collection: ResolvedCollection | undefined,
+  collectionName: string | undefined,
+  _args: Record<string, unknown> | undefined,
+): DynamoDBParams {
+  if (!collection) {
+    return {
+      command: "QueryCommand",
+      TableName: "<table>",
+      entityType: "collection",
+      info: `Collection '${collectionName ?? "unknown"}'`,
+    }
+  }
+
+  const memberLines = Object.entries(collection.members).map(
+    ([key, m]) => `    ${key}: ${m.entityVariableName} (sk: [${m.sk.composite.join(", ")}])`,
+  )
+
+  const info = [
+    `Collection '${collection.collectionName}'`,
+    `  Index: ${collection.index} (${collection.type})`,
+    `  PK: ${collection.pk.composite.join(", ")} (required)`,
+    `  Members:`,
+    ...memberLines,
+    `  Returns: { ${Object.keys(collection.members).join(", ")} }`,
+  ].join("\n")
+
+  return {
+    command: "QueryCommand",
+    TableName: "<table>",
+    IndexName: collection.index,
+    entityType: "collection",
+    info,
+  }
+}
+
+function buildBoundQueryTerminalParams(op: DetectedOperation): DynamoDBParams {
+  const terminalDescriptions: Record<string, string> = {
+    collect: "Collect all pages into Array",
+    fetch: "Execute single DynamoDB page → Page<T> with cursor",
+    paginate: "Lazy Stream of items, auto-paginates",
+    count: "Count-only query (no items returned)",
+  }
+
+  const desc = terminalDescriptions[op.terminalName ?? ""] ?? op.terminalName ?? "unknown"
+  const entityType = op.entity?.entityType ?? op.collection?.collectionName ?? "unknown"
+
+  return {
+    command: op.terminalName === "count" ? "QueryCommand (SELECT: COUNT)" : "QueryCommand",
+    TableName: "<table>",
+    IndexName: op.collection?.index,
+    entityType,
+    info: `BoundQuery terminal: .${op.terminalName}()\n  ${desc}`,
+  }
+}
+
+function buildTableAccessorParams(tableName: string | undefined): DynamoDBParams {
+  return {
+    command: "TableOperations",
+    TableName: tableName ?? "<table>",
+    entityType: "table",
+    info: `Table '${tableName ?? "unknown"}'\n  Operations: create, delete, describe, update, backup, enableTTL, tag, ...`,
+  }
 }

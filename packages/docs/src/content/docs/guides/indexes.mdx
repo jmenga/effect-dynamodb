@@ -5,70 +5,81 @@ description: "Define access patterns using indexes, key generation, and collecti
 
 This guide covers how to define access patterns using indexes, how key generation works, and how to use collections for cross-entity queries.
 
-## Index Definition
+## Entity Primary Key
 
-Indexes are defined on the Entity using an ElectroDB-style declaration. Each index has a **logical name** (used in code) that maps to a **physical index** (on the DynamoDB table).
+Entities define only their **primary key**. GSI access patterns are defined separately via `Collections.make()`.
 
 ```typescript region="task-entity" example="guide-indexes.ts"
 const Tasks = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byProject: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["projectId"] },
-      sk: { field: "gsi1sk", composite: ["priority"] },
-    },
-    byAssignee: {
-      index: "gsi2",
-      pk: { field: "gsi2pk", composite: ["assigneeId"] },
-      sk: { field: "gsi2sk", composite: ["priority"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 ```
 
-### Anatomy of an Index
+### Anatomy of a Primary Key
 
 ```typescript
-byProject: {
-  index: "gsi1",                       // Physical GSI name (omit for primary)
+primaryKey: {
   pk: {
-    field: "gsi1pk",                    // Physical DynamoDB attribute
-    composite: ["projectId"],           // Model attributes → partition key
+    field: "pk",                         // Physical DynamoDB attribute
+    composite: ["taskId"],               // Model attributes -> partition key
   },
   sk: {
-    field: "gsi1sk",
-    composite: ["priority"],            // Model attributes → sort key
+    field: "sk",
+    composite: [],                       // Empty = one item per partition key
   },
 }
 ```
 
 | Property | Type | Required | Description |
 |----------|------|----------|-------------|
-| `index` | `string` | No (primary only) | Physical GSI/LSI name from Table |
 | `pk.field` | `string` | Yes | Physical DynamoDB attribute name |
 | `pk.composite` | `string[]` | Yes | Model attributes composing the partition key |
 | `sk.field` | `string` | Yes | Physical DynamoDB attribute name |
 | `sk.composite` | `string[]` | Yes | Model attributes composing the sort key |
-| `collection` | `string \| string[]` | No | Collection membership |
-| `type` | `"isolated" \| "clustered"` | No | Collection type (default: `"clustered"`) |
-| `casing` | `"lowercase" \| "uppercase" \| "preserve"` | No | Casing override for this index |
+
+### GSI Access Patterns via Collections
+
+GSI access patterns are defined using `Collections.make()`. Each collection owns the index definition and member entities specify their SK composites:
+
+```typescript region="task-collections" example="guide-indexes.ts"
+const ByProject = Collections.make("byProject", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["projectId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Tasks: Collections.member(Tasks, { sk: { composite: ["priority"] } }),
+  },
+})
+
+const ByAssignee = Collections.make("byAssignee", {
+  index: "gsi2",
+  pk: { field: "gsi2pk", composite: ["assigneeId"] },
+  sk: { field: "gsi2sk" },
+  members: {
+    Tasks: Collections.member(Tasks, { sk: { composite: ["priority"] } }),
+  },
+})
+```
 
 ### Logical Names as API Surface
 
-The logical index name becomes a query accessor on the Entity:
+Collection names become query accessors on the typed client:
 
 ```typescript region="query-accessors" example="guide-indexes.ts"
 // Logical names become query accessors — no physical index names in code
-const alphaTasks = yield* basic.Tasks.collect(Tasks.query.byProject({ projectId: "proj-alpha" }))
+const { Tasks: alphaTasks } = yield* basic.collections
+  .ByProject({ projectId: "proj-alpha" })
+  .collect()
 
-const aliceTasks = yield* basic.Tasks.collect(Tasks.query.byAssignee({ assigneeId: "emp-alice" }))
+const { Tasks: aliceTasks } = yield* basic.collections
+  .ByAssignee({ assigneeId: "emp-alice" })
+  .collect()
 ```
 
 You never reference physical index names (`gsi1`, `gsi2`) in application code.
@@ -124,8 +135,8 @@ Attribute values are always preserved as-is.
 ```typescript
 // With casing: "lowercase" and entityType: "Employee"
 // PK: $myapp#v1#employee#emp-Alice
-//     ^^^^^^^^ ^^ ^^^^^^^^          ← structural (lowercased)
-//                          ^^^^^^^^^ ← attribute value (preserved)
+//     ^^^^^^^^ ^^ ^^^^^^^^          <- structural (lowercased)
+//                          ^^^^^^^^^ <- attribute value (preserved)
 ```
 
 ## Collections
@@ -140,18 +151,9 @@ Each entity owns its sort key prefix. Collection queries use only the partition 
 const IsolatedEmployees = Entity.make({
   model: Employee,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byDepartment: {
-      index: "gsi1",
-      collection: "DepartmentStaff",
-      type: "isolated",
-      pk: { field: "gsi1pk", composite: ["department"] },
-      sk: { field: "gsi1sk", composite: ["hireDate"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -166,28 +168,32 @@ class Equipment extends Schema.Class<Equipment>("Equipment")({
 const Equipments = Entity.make({
   model: Equipment,
   entityType: "Equipment",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["equipmentId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byDepartment: {
-      index: "gsi1",
-      collection: "DepartmentStaff",
-      type: "isolated",
-      pk: { field: "gsi1pk", composite: ["department"] },
-      sk: { field: "gsi1sk", composite: ["purchaseDate"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["equipmentId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
+})
+```
+
+```typescript region="isolated-collection" example="guide-indexes.ts"
+const DepartmentStaff = Collections.make("DepartmentStaff", {
+  index: "gsi1",
+  type: "isolated",
+  pk: { field: "gsi1pk", composite: ["department"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    employees: Collections.member(IsolatedEmployees, { sk: { composite: ["hireDate"] } }),
+    equipments: Collections.member(Equipments, { sk: { composite: ["purchaseDate"] } }),
+  },
 })
 ```
 
 **Sort key format (isolated):**
 
 ```
-$myapp#v1#employee_1#2020-01-15     ← Employee entity owns its SK
-$myapp#v1#equipment_1#2023-06-01    ← Equipment entity owns its SK
+$myapp#v1#employee_1#2020-01-15     <- Employee entity owns its SK
+$myapp#v1#equipment_1#2023-06-01    <- Equipment entity owns its SK
 ```
 
 **Query behavior:**
@@ -207,18 +213,9 @@ The collection name sits at the top of every entity's sort key. All entities sha
 const ClusteredEmployees = Entity.make({
   model: Employee,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byTenant: {
-      index: "gsi1",
-      collection: "TenantMembers",
-      type: "clustered",
-      pk: { field: "gsi1pk", composite: ["tenantId"] },
-      sk: { field: "gsi1sk", composite: ["department", "hireDate"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -226,20 +223,28 @@ const ClusteredEmployees = Entity.make({
 const ClusteredTasks = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byTenant: {
-      index: "gsi1",
-      collection: "TenantMembers",
-      type: "clustered",
-      pk: { field: "gsi1pk", composite: ["tenantId"] },
-      sk: { field: "gsi1sk", composite: ["projectId", "taskId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
+})
+```
+
+```typescript region="clustered-collection" example="guide-indexes.ts"
+const TenantMembers = Collections.make("TenantMembers", {
+  index: "gsi1",
+  type: "clustered",
+  pk: { field: "gsi1pk", composite: ["tenantId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    employees: Collections.member(ClusteredEmployees, {
+      sk: { composite: ["department", "hireDate"] },
+    }),
+    tasks: Collections.member(ClusteredTasks, {
+      sk: { composite: ["projectId", "taskId"] },
+    }),
+  },
 })
 ```
 
@@ -264,24 +269,15 @@ collection prefix (shared)
 
 ### Sub-Collections (Clustered Only)
 
-Sub-collections create a hierarchy within the sort key. An entity joins multiple collections by declaring an array:
+Sub-collections create a hierarchy within the sort key. Multiple collections share the same index, with members grouped at different depths:
 
 ```typescript region="subcollection-entities" example="guide-indexes.ts"
 const SubEmployee = Entity.make({
   model: Employee,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byEmployee: {
-      index: "gsi2",
-      collection: "contributions",
-      type: "clustered",
-      pk: { field: "gsi2pk", composite: ["employeeId"] },
-      sk: { field: "gsi2sk", composite: ["department"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -289,18 +285,9 @@ const SubEmployee = Entity.make({
 const SubTasks = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byAssignee: {
-      index: "gsi2",
-      collection: ["contributions", "assignments"],
-      type: "clustered",
-      pk: { field: "gsi2pk", composite: ["assigneeId"] },
-      sk: { field: "gsi2sk", composite: ["projectId", "taskId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
@@ -308,20 +295,36 @@ const SubTasks = Entity.make({
 const SubProjectMembers = Entity.make({
   model: ProjectMember,
   entityType: "ProjectMember",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId", "projectId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byMember: {
-      index: "gsi2",
-      collection: ["contributions", "assignments"],
-      type: "clustered",
-      pk: { field: "gsi2pk", composite: ["employeeId"] },
-      sk: { field: "gsi2sk", composite: ["projectId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId", "projectId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
+})
+```
+
+```typescript region="subcollection-collections" example="guide-indexes.ts"
+const Contributions = Collections.make("contributions", {
+  index: "gsi2",
+  type: "clustered",
+  pk: { field: "gsi2pk", composite: ["employeeId"] },
+  sk: { field: "gsi2sk" },
+  members: {
+    employees: Collections.member(SubEmployee, { sk: { composite: ["department"] } }),
+    tasks: Collections.member(SubTasks, { sk: { composite: ["projectId", "taskId"] } }),
+    projectMembers: Collections.member(SubProjectMembers, { sk: { composite: ["projectId"] } }),
+  },
+})
+
+const Assignments = Collections.make("assignments", {
+  index: "gsi2",
+  type: "clustered",
+  pk: { field: "gsi2pk", composite: ["employeeId"] },
+  sk: { field: "gsi2sk" },
+  members: {
+    tasks: Collections.member(SubTasks, { sk: { composite: ["projectId", "taskId"] } }),
+    projectMembers: Collections.member(SubProjectMembers, { sk: { composite: ["projectId"] } }),
+  },
 })
 ```
 
@@ -329,11 +332,11 @@ const SubProjectMembers = Entity.make({
 
 ```
 $contributions
-├── #assignments
-│   ├── #projectmembers_1#proj-alpha
-│   ├── #tasks_1#proj-alpha#t-001
-│   └── #tasks_1#proj-beta#t-002
-└── #employees_1#engineering
++-- #assignments
+|   +-- #projectmembers_1#proj-alpha
+|   +-- #tasks_1#proj-alpha#t-001
+|   +-- #tasks_1#proj-beta#t-002
++-- #employees_1#engineering
 ```
 
 **Query at any depth:**
@@ -346,26 +349,22 @@ $contributions
 
 ### Defining Collections
 
-```typescript region="collection-make" example="guide-indexes.ts"
-const DepartmentStaff = Collection.make("DepartmentStaff", {
-  employees: IsolatedEmployees,
-  equipments: Equipments,
-})
+Collections are defined with `Collections.make()`. Each collection owns the full GSI definition (index name, PK field/composites, SK field) and each member entity specifies only its SK composites:
 
-const TenantMembers = Collection.make("TenantMembers", {
-  employees: ClusteredEmployees,
-  tasks: ClusteredTasks,
-})
-
-const Contributions = Collection.make("contributions", {
-  employees: SubEmployee,
-  tasks: SubTasks,
-  projectMembers: SubProjectMembers,
-})
-
-const Assignments = Collection.make("assignments", {
-  tasks: SubTasks,
-  projectMembers: SubProjectMembers,
+```typescript
+const MyCollection = Collections.make("collectionName", {
+  index: "gsi1",                    // Physical GSI name
+  pk: { field: "gsi1pk", composite: ["tenantId"] },  // Shared PK
+  sk: { field: "gsi1sk" },         // Shared SK field
+  type: "clustered",               // "clustered" (default) or "isolated"
+  members: {
+    Employees: Collections.member(EmployeeEntity, {
+      sk: { composite: ["department", "hireDate"] },
+    }),
+    Tasks: Collections.member(TaskEntity, {
+      sk: { composite: ["projectId", "taskId"] },
+    }),
+  },
 })
 ```
 
@@ -373,22 +372,22 @@ const Assignments = Collection.make("assignments", {
 
 - All entities in a collection must share the same PK composite on that index
 - All entities sharing an index must agree on the type (no mixing isolated/clustered)
-- Sub-collection members must include parent: `["contributions", "assignments"]`
-- All collection members must be on the same table
+- Sub-collections sharing an index must use the same PK and SK fields
+- No duplicate entity types within a single collection
 
 ## Worked Example: Multi-Tenant Project Management
 
 ### Access Patterns
 
-| Pattern | Index | PK | SK |
-|---------|-------|----|----|
-| Get employee by ID | primary | `employeeId` | — |
-| Get task by ID | primary | `taskId` | — |
-| Employees in tenant | gsi1 (TenantMembers) | `tenantId` | `department`, `hireDate` |
-| Tasks in tenant | gsi1 (TenantMembers) | `tenantId` | `projectId`, `taskId` |
-| All tenant items | gsi1 (TenantMembers) | `tenantId` | — |
-| Employee by email | gsi2 | `email` | — |
-| Tasks by assignee | gsi2 | `assigneeId` | `priority` |
+| Pattern | Collection | PK | SK |
+|---------|-----------|----|----|
+| Get employee by ID | primary | `employeeId` | -- |
+| Get task by ID | primary | `taskId` | -- |
+| Employees in tenant | TenantMembers (gsi1) | `tenantId` | `department`, `hireDate` |
+| Tasks in tenant | TenantMembers (gsi1) | `tenantId` | `projectId`, `taskId` |
+| All tenant items | TenantMembers (gsi1) | `tenantId` | -- |
+| Employee by email | ByEmail (gsi2) | `email` | -- |
+| Tasks by assignee | ByAssignee (gsi2) | `assigneeId` | `priority` |
 
 ### DynamoDB Items
 
@@ -400,6 +399,6 @@ const Assignments = Collection.make("assignments", {
 
 ## What's Next?
 
-- [Queries](/effect-dynamodb/guides/queries/) — Query by index, filter by sort key composites, paginate results
-- [Data Integrity](/effect-dynamodb/guides/data-integrity/) — Unique constraints and optimistic concurrency
-- [Lifecycle](/effect-dynamodb/guides/lifecycle/) — Soft delete and version retention
+- [Queries](/effect-dynamodb/guides/queries/) -- Query by index, filter by sort key composites, paginate results
+- [Data Integrity](/effect-dynamodb/guides/data-integrity/) -- Unique constraints and optimistic concurrency
+- [Lifecycle](/effect-dynamodb/guides/lifecycle/) -- Soft delete and version retention

@@ -1,6 +1,6 @@
 import type ts from "typescript"
 import * as Cache from "../core/Cache"
-import { resolveEntities } from "../core/EntityResolver"
+import { resolveCollections, resolveEntities } from "../core/EntityResolver"
 import { detectOperation } from "../core/OperationDetector"
 import { buildParams } from "../core/ParamsBuilder"
 import { formatTooltip } from "../formatters/tooltip"
@@ -19,24 +19,27 @@ export function enhanceQuickInfo(
     const sourceFile = program.getSourceFile(fileName)
     if (!sourceFile) return prior
 
-    // Get or resolve entity configs for this file (with version-based caching)
+    // Get or resolve entity + collection configs for this file (with version-based caching)
     const scriptInfo = info.project.getScriptInfo(fileName)
     const version = scriptInfo ? Number(scriptInfo.getLatestVersion()) : 0
     let entities = Cache.getEntities(fileName, version)
+    let collections = Cache.getCollections(fileName, version)
 
     if (!entities) {
       entities = resolveEntitiesFromAllSources(typescript, program, sourceFile)
-      Cache.setEntities(fileName, version, entities)
+      collections = resolveCollectionsFromAllSources(typescript, program, sourceFile)
+      Cache.setEntities(fileName, version, entities, collections ?? [])
     }
 
-    if (entities.length === 0) return prior
+    if (entities.length === 0 && (!collections || collections.length === 0)) return prior
 
-    // Detect operation at cursor
-    const operation = detectOperation(typescript, sourceFile, position, entities)
+    // Detect operation at cursor (pass both entities and collections)
+    const operation = detectOperation(typescript, sourceFile, position, entities, collections ?? [])
     if (!operation) return prior
 
     // Build DynamoDB params and format tooltip
     const params = buildParams(operation)
+    if (!params) return prior
     const tooltip = formatTooltip(params)
 
     // Append to existing quickinfo
@@ -98,6 +101,56 @@ function resolveEntitiesFromAllSources(
   }
 
   return entities
+}
+
+function resolveCollectionsFromAllSources(
+  typescript: typeof ts,
+  program: ts.Program,
+  currentFile: ts.SourceFile,
+) {
+  const collections = [...resolveCollections(typescript, currentFile)]
+  const resolvedFiles = new Set<string>([currentFile.fileName])
+  const checker = program.getTypeChecker()
+
+  for (const stmt of currentFile.statements) {
+    if (!typescript.isImportDeclaration(stmt)) continue
+    if (!typescript.isStringLiteral(stmt.moduleSpecifier)) continue
+
+    const filesToCheck = new Set<string>()
+
+    const moduleSym = checker.getSymbolAtLocation(stmt.moduleSpecifier)
+    if (moduleSym) {
+      for (const decl of moduleSym.getDeclarations() ?? []) {
+        filesToCheck.add(decl.getSourceFile().fileName)
+      }
+    }
+
+    if (
+      stmt.importClause?.namedBindings &&
+      typescript.isNamedImports(stmt.importClause.namedBindings)
+    ) {
+      for (const specifier of stmt.importClause.namedBindings.elements) {
+        const sym = checker.getSymbolAtLocation(specifier.name)
+        if (!sym) continue
+        const aliased =
+          sym.flags & typescript.SymbolFlags.Alias ? checker.getAliasedSymbol(sym) : sym
+        for (const decl of aliased.getDeclarations() ?? []) {
+          filesToCheck.add(decl.getSourceFile().fileName)
+        }
+      }
+    }
+
+    for (const fileName of filesToCheck) {
+      if (resolvedFiles.has(fileName)) continue
+      resolvedFiles.add(fileName)
+      const importedFile = program.getSourceFile(fileName)
+      if (importedFile) {
+        collections.push(...resolveCollections(typescript, importedFile))
+      }
+    }
+  }
+
+  return collections
 }
 
 function appendToQuickInfo(

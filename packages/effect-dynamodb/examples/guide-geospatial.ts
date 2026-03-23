@@ -20,6 +20,7 @@ import { Console, Effect, Layer, Schema } from "effect"
 // Import from geo package source (use "@effect-dynamodb/geo" when published)
 import { GeoIndex, H3 } from "../../effect-dynamodb-geo/src/index.js"
 // Import from source (use "effect-dynamodb" when published)
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -51,21 +52,23 @@ const AppSchema = DynamoSchema.make({ name: "fleet", version: 1 })
 const Vehicles = Entity.make({
   model: Vehicle,
   entityType: "Vehicle",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["vehicleId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byCell: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["parentCell", "timePartition"] },
-      sk: { field: "gsi1sk", composite: ["cell"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["vehicleId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Vehicles } })
+
+const VehiclesByCell = Collections.make("vehiclesByCell", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["parentCell", "timePartition"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Vehicles: Collections.member(Vehicles, { sk: { composite: ["cell"] } }),
+  },
+})
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -75,7 +78,7 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Vehicles } })
 // #region geo-index
 const VehicleGeo = GeoIndex.make({
   entity: Vehicles,
-  index: "byCell",
+  index: "vehiclesByCell",
   coordinates: (item) =>
     item.latitude !== undefined && item.longitude !== undefined
       ? { latitude: item.latitude, longitude: item.longitude }
@@ -97,10 +100,13 @@ const VehicleGeo = GeoIndex.make({
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { Vehicles },
+    collections: { VehiclesByCell },
+  })
 
   yield* Console.log("=== Setup ===\n")
-  yield* db.createTable()
+  yield* db.tables["fleet-table"]!.create()
   yield* Console.log("Table created\n")
 
   const now = Date.now()
@@ -191,7 +197,7 @@ const program = Effect.gen(function* () {
   yield* Console.log(`  timePartition=${enriched.timePartition}\n`)
 
   // --- Cleanup ---
-  yield* db.deleteTable()
+  yield* db.tables["fleet-table"]!.delete()
   yield* Console.log("Table deleted.")
 })
 

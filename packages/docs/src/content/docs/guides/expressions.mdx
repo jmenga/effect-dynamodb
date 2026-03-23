@@ -61,7 +61,7 @@ Apply the condition as a combinator on put, update, or delete:
 
 ```typescript region="condition-on-operations" example="guide-expressions.ts"
 // On put
-yield* db.Products.put(
+yield* db.entities.Products.put(
   {
     ...baseProduct,
     productId: "p-5",
@@ -74,7 +74,7 @@ yield* db.Products.put(
 )
 
 // On update (ANDed with optimistic lock)
-yield* db.Products.update(
+yield* db.entities.Products.update(
   { productId: "p-1" },
   Products.set({ name: "Widget Pro" }),
   Products.expectedVersion(1),
@@ -82,7 +82,7 @@ yield* db.Products.update(
 )
 
 // On delete
-yield* db.Products.delete(
+yield* db.entities.Products.delete(
   { productId: "p-4" },
   Products.condition((t, { eq }) => eq(t.stock, 0)),
 )
@@ -143,23 +143,21 @@ Filter expressions narrow query and scan results **after** items are read from d
 `Entity.filter()` works identically to `Entity.condition()` but returns a `Query` combinator:
 
 ```typescript region="filter-callback" example="guide-expressions.ts"
-// Filter on query
-const expensive = yield* db.Products.collect(
-  Products.query.byCategory({ category: "electronics" }),
-  Products.filter((t, { gt }) => gt(t.price, 30)),
-)
+// Filter on collection query — shorthand for equality
+const { Products: activeElectronics } = yield* db.collections
+  .ProductsByCategory({ category: "electronics" })
+  .filter({ status: "active" })
+  .collect()
 
-// Filter on scan
-const withWidget = yield* db.Products.collect(
-  Products.scan(),
-  Products.filter((t, { contains }) => contains(t.name, "Widget")),
-)
+// Filter on scan — callback with typed PathBuilder
+const withWidget = yield* db.entities.Products.scan()
+  .filter((t, { contains }) => contains(t.name, "Widget"))
+  .collect()
 
 // Complex filter with OR
-const activeOrPending = yield* db.Products.collect(
-  Products.scan(),
-  Products.filter((t, { or, eq }) => or(eq(t.status, "active"), eq(t.status, "pending"))),
-)
+const activeOrPending = yield* db.entities.Products.scan()
+  .filter((t, { or, eq }) => or(eq(t.status, "active"), eq(t.status, "pending")))
+  .collect()
 ```
 
 ### Shorthand Syntax
@@ -181,25 +179,31 @@ These accept plain objects with field names — good for top-level attribute upd
 
 ```typescript region="update-record" example="guide-expressions.ts"
 // SET — assign values
-yield* db.Products.update(
+yield* db.entities.Products.update(
   { productId: "p-1" },
   Entity.set({ name: "Widget Deluxe", price: 34.99 }),
 )
 
 // REMOVE — delete attributes
-yield* db.Products.update({ productId: "p-4" }, Entity.remove(["description", "temporaryFlag"]))
+yield* db.entities.Products.update(
+  { productId: "p-4" },
+  Entity.remove(["description", "temporaryFlag"]),
+)
 
 // ADD — atomic increment (numbers) or union (sets)
-yield* db.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1, stock: 50 }))
+yield* db.entities.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1, stock: 50 }))
 
 // Subtract — SET field = field - value
-yield* db.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
+yield* db.entities.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
 
 // Append — SET field = list_append(field, value)
-yield* db.Products.update({ productId: "p-1" }, Entity.append({ tags: ["on-sale", "featured"] }))
+yield* db.entities.Products.update(
+  { productId: "p-1" },
+  Entity.append({ tags: ["on-sale", "featured"] }),
+)
 
 // DELETE — remove elements from a set
-yield* db.Products.update(
+yield* db.entities.Products.update(
   { productId: "p-4" },
   Entity.deleteFromSet({ categories: new Set(["obsolete"]) }),
 )
@@ -210,7 +214,7 @@ yield* db.Products.update(
 All combinators compose as variadic arguments to `update()`. They compile to a single `UpdateExpression` with the appropriate SET, REMOVE, ADD, and DELETE clauses:
 
 ```typescript region="update-composed" example="guide-expressions.ts"
-yield* db.Products.update(
+yield* db.entities.Products.update(
   { productId: "p-1" },
   Entity.set({ name: "Updated Widget", price: 24.99 }),
   Entity.add({ viewCount: 1 }),
@@ -227,17 +231,17 @@ For nested attributes, array elements, and attribute-to-attribute operations, us
 
 ```typescript region="update-path" example="guide-expressions.ts"
 // SET nested path
-yield* db.Products.update({ productId: "p-1" }, (op) =>
+yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
   Entity.pathSet(op, { segments: ["address", "city"], value: "NYC", isPath: false }),
 )
 
 // SET array element
-yield* db.Products.update({ productId: "p-1" }, (op) =>
+yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
   Entity.pathSet(op, { segments: ["roster", 0, "position"], value: "captain", isPath: false }),
 )
 
 // Copy attribute to attribute
-yield* db.Products.update({ productId: "p-1" }, (op) =>
+yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
   Entity.pathSet(op, {
     segments: ["backup_email"],
     value: undefined,
@@ -247,17 +251,17 @@ yield* db.Products.update({ productId: "p-1" }, (op) =>
 )
 
 // REMOVE nested attribute
-yield* db.Products.update({ productId: "p-1" }, (op) =>
+yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
   Entity.pathRemove(op, ["metadata", "temporary"]),
 )
 
 // PREPEND to list
-yield* db.Products.update({ productId: "p-1" }, (op) =>
+yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
   Entity.pathPrepend(op, { segments: ["tags"], value: ["URGENT"] }),
 )
 
 // if_not_exists — set only if the attribute doesn't exist
-yield* db.Products.update({ productId: "p-1" }, (op) =>
+yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
   Entity.pathIfNotExists(op, { segments: ["createdBy"], value: "system" }),
 )
 ```
@@ -374,17 +378,13 @@ Products.select((t) => [t.name, t.address.city, t.tags.at(0)])
 Apply as a combinator on queries and scans:
 
 ```typescript region="select-on-queries" example="guide-expressions.ts"
-// Project on query
-const projected = yield* db.Products.collect(
-  Products.query.byCategory({ category: "electronics" }),
-  Products.select((t) => [t.name, t.price]),
-)
+// Project on scan — callback
+const projected = yield* db.entities.Products.scan()
+  .select((t) => [t.name, t.price])
+  .collect()
 
-// Project on scan
-const scanned = yield* db.Products.collect(
-  Products.scan(),
-  Products.select((t) => [t.name, t.status]),
-)
+// Project on scan — string array shorthand
+const scanned = yield* db.entities.Products.scan().select(["name", "status"]).collect()
 ```
 
 ### String Array Shorthand

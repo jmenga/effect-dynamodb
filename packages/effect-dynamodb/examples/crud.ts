@@ -1,12 +1,13 @@
 /**
- * CRUD example — effect-dynamodb v3 (client gateway pattern)
+ * CRUD example — effect-dynamodb (v2 Collections API)
  *
  * Demonstrates the full high-level API:
- *   - DynamoClient.make(table) returns typed gateway with all table members
+ *   - Collections.make() for GSI access patterns (entities only define primary keys)
+ *   - DynamoClient.make({ entities, collections }) returns typed gateway
  *   - Terminal-selected return types: yield* returns clean model (User),
  *     pipe to asRecord/asItem/asNative for richer decode modes
- *   - Simplified updates: db.Users.update(key, fields) with pipeable combinators
- *   - GSI queries with pipeable combinators
+ *   - Simplified updates: db.entities.Users.update(key, fields) with pipeable combinators
+ *   - Collection queries with fluent combinators
  *   - Atomic transactions
  *   - Version history: versioned: { retain: true } creates snapshots on every mutation
  *   - Soft delete: tasks can be archived and restored
@@ -22,11 +23,11 @@
 import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
+import * as Collections from "../src/Collections.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 
@@ -72,16 +73,9 @@ const AppSchema = DynamoSchema.make({ name: "crud-demo", version: 1 })
 const Users = Entity.make({
   model: UserModel,
   entityType: "User",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byRole: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["role"] },
-      sk: { field: "gsi1sk", composite: ["userId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: { retain: true },
@@ -90,20 +84,36 @@ const Users = Entity.make({
 const Tasks = Entity.make({
   model: Task,
   entityType: "Task",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byUser: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["userId"] },
-      sk: { field: "gsi1sk", composite: ["status", "taskId"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
   versioned: true,
   softDelete: true,
+})
+
+const MainTable = Table.make({
+  schema: AppSchema,
+  entities: { Users, Tasks },
+})
+
+const UsersByRole = Collections.make("usersByRole", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["role"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Users: Collections.member(Users, { sk: { composite: ["userId"] } }),
+  },
+})
+
+const TasksByUser = Collections.make("tasksByUser", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["userId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Tasks: Collections.member(Tasks, { sk: { composite: ["status", "taskId"] } }),
+  },
 })
 // #endregion
 
@@ -121,18 +131,20 @@ class Project extends Schema.Class<Project>("Project")({
 const Projects = Entity.make({
   model: Project,
   entityType: "Project",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["projectId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byOwner: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["ownerId"] },
-      sk: { field: "gsi1sk", composite: ["department"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["projectId"] },
+    sk: { field: "sk", composite: [] },
   },
   timestamps: true,
+})
+
+const ProjectsByOwner = Collections.make("projectsByOwner", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["ownerId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Projects: Collections.member(Projects, { sk: { composite: ["department"] } }),
+  },
 })
 // #endregion
 
@@ -147,16 +159,18 @@ class Employee extends Schema.Class<Employee>("Employee")({
 const Employees = Entity.make({
   model: Employee,
   entityType: "Employee",
-  indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["employeeId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    byTenant: {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["tenantId"] },
-      sk: { field: "gsi1sk", composite: ["region"] },
-    },
+  primaryKey: {
+    pk: { field: "pk", composite: ["employeeId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const EmployeesByTenant = Collections.make("employeesByTenant", {
+  index: "gsi1",
+  pk: { field: "gsi1pk", composite: ["tenantId"] },
+  sk: { field: "gsi1sk" },
+  members: {
+    Employees: Collections.member(Employees, { sk: { composite: ["region"] } }),
   },
 })
 // #endregion
@@ -166,9 +180,9 @@ const Employees = Entity.make({
 // ---------------------------------------------------------------------------
 
 // #region table
-const MainTable = Table.make({
+const ProjectTable = Table.make({
   schema: AppSchema,
-  entities: { Users, Tasks, Projects, Employees },
+  entities: { Projects, Employees },
 })
 // #endregion
 
@@ -178,14 +192,17 @@ const MainTable = Table.make({
 
 const program = Effect.gen(function* () {
   // #region client
-  // Typed execution gateway — binds all table members
-  const db = yield* DynamoClient.make(MainTable)
+  // Typed execution gateway — binds all entities and collections
+  const db = yield* DynamoClient.make({
+    entities: { Users, Tasks, Projects, Employees },
+    collections: { UsersByRole, TasksByUser, ProjectsByOwner, EmployeesByTenant },
+  })
   // #endregion
 
   // --- Create the table ---
   yield* Console.log("=== Setup ===\n")
 
-  yield* db.createTable()
+  yield* db.tables["crud-demo-table"]!.create()
   yield* Console.log("Table created: crud-demo-table\n")
 
   // --- Entity.put — create items ---
@@ -193,7 +210,7 @@ const program = Effect.gen(function* () {
 
   // #region put
   // Default: yield* returns the model type (User) — clean, no system fields
-  const alice = yield* db.Users.put({
+  const alice = yield* db.entities.Users.put({
     userId: "u-alice",
     email: "alice@example.com",
     displayName: "Alice",
@@ -203,7 +220,7 @@ const program = Effect.gen(function* () {
   // alice: User — has userId, email, displayName, role, createdBy
 
   // For asRecord decode mode, use entity definitions with Effect.provide
-  const bob = yield* db.Users.put({
+  const bob = yield* db.entities.Users.put({
     userId: "u-bob",
     email: "bob@example.com",
     displayName: "Bob",
@@ -216,7 +233,7 @@ const program = Effect.gen(function* () {
 
   // #region put-tasks
   // Tasks: bare yield* returns Task
-  const task1 = yield* db.Tasks.put({
+  const task1 = yield* db.entities.Tasks.put({
     taskId: "t-1",
     userId: "u-alice",
     title: "Design the API",
@@ -224,7 +241,7 @@ const program = Effect.gen(function* () {
     priority: 1,
   })
 
-  yield* db.Tasks.put({
+  yield* db.entities.Tasks.put({
     taskId: "t-2",
     userId: "u-alice",
     title: "Write tests",
@@ -234,14 +251,14 @@ const program = Effect.gen(function* () {
   // #endregion
   yield* Console.log(`Created Task: ${task1.taskId} — "${task1.title}" (${task1.status})`)
 
-  yield* db.Tasks.put({
+  yield* db.entities.Tasks.put({
     taskId: "t-3",
     userId: "u-alice",
     title: "Deploy to production",
     status: "todo",
     priority: 3,
   })
-  yield* db.Tasks.put({
+  yield* db.entities.Tasks.put({
     taskId: "t-4",
     userId: "u-bob",
     title: "Review PRs",
@@ -255,7 +272,7 @@ const program = Effect.gen(function* () {
 
   // #region get
   // Default: clean domain type — no keys, no system fields, no __edd_e__
-  const userModel = yield* db.Users.get({ userId: "u-alice" })
+  const userModel = yield* db.entities.Users.get({ userId: "u-alice" })
   // userModel: User
   // #endregion
   yield* Console.log(`Default (model):  ${userModel.displayName}, role=${userModel.role}`)
@@ -265,15 +282,15 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Entity.update — Pipeable Updates ===\n")
 
   // #region update
-  // db.Users.update(key, ...combinators) — update via bound entity
-  const updatedAlice = yield* db.Users.update(
+  // db.entities.Users.update(key, ...combinators) — update via bound entity
+  const updatedAlice = yield* db.entities.Users.update(
     { userId: "u-alice" },
     Entity.set({ role: "member", displayName: "Alice W." }),
   )
   // updatedAlice: User — clean model type
 
   // Second update
-  const updatedAlice2 = yield* db.Users.update(
+  const updatedAlice2 = yield* db.entities.Users.update(
     { userId: "u-alice" },
     Entity.set({ displayName: "Alice Wu" }),
   )
@@ -288,15 +305,13 @@ const program = Effect.gen(function* () {
 
   // #region locking
   // expectedVersion(n) composes with update
-  const lockResult = yield* db.Users.update(
+  const lockResult = yield* db.entities.Users.update(
     { userId: "u-alice" },
     Entity.set({ displayName: "Alice Wrong" }),
     Entity.expectedVersion(1), // version is now 3 — this will fail
   ).pipe(
     Effect.catchTag("OptimisticLockError", (e) =>
-      Effect.succeed(
-        `Expected v${e.expectedVersion}, item has been updated`,
-      ),
+      Effect.succeed(`Expected v${e.expectedVersion}, item has been updated`),
     ),
   )
   // #endregion
@@ -307,7 +322,7 @@ const program = Effect.gen(function* () {
 
   // #region error-handling
   // Bound methods return Effects — error types flow through pipe
-  const notFoundResult = yield* db.Users.get({ userId: "u-nonexistent" }).pipe(
+  const notFoundResult = yield* db.entities.Users.get({ userId: "u-nonexistent" }).pipe(
     Effect.map((u) => `Found: ${u.userId}`),
     Effect.catchTag("ItemNotFound", (e) =>
       Effect.succeed(`Not found: entity=${e.entityType}, key=${JSON.stringify(e.key)}`),
@@ -316,13 +331,13 @@ const program = Effect.gen(function* () {
   // #endregion
   yield* Console.log(`${notFoundResult}\n`)
 
-  // --- Entity.query — GSI queries ---
-  yield* Console.log("=== Entity.query — GSI Queries ===\n")
+  // --- Collection queries — GSI queries ---
+  yield* Console.log("=== Collection Queries — GSI Queries ===\n")
 
   // #region query
-  const aliceTasks = yield* db.Tasks.collect(Tasks.query.byUser({ userId: "u-alice" }))
+  const { Tasks: aliceTasks } = yield* db.collections.TasksByUser({ userId: "u-alice" }).collect()
 
-  const admins = yield* db.Users.collect(Users.query.byRole({ role: "admin" }))
+  const { Users: admins } = yield* db.collections.UsersByRole({ role: "admin" }).collect()
   // #endregion
   yield* Console.log(`Alice's tasks (${aliceTasks.length}):`)
   for (const t of aliceTasks) {
@@ -331,28 +346,28 @@ const program = Effect.gen(function* () {
 
   yield* Console.log(`\nAdmins: ${admins.length} (Alice was demoted to member)`)
 
-  const members = yield* db.Users.collect(Users.query.byRole({ role: "member" }))
+  const { Users: members } = yield* db.collections.UsersByRole({ role: "member" }).collect()
   yield* Console.log(`Members: ${members.length}`)
   for (const u of members) {
     yield* Console.log(`  ${u.userId}: ${u.displayName}`)
   }
   yield* Console.log("")
 
-  // --- Query combinators — where, reverse ---
-  yield* Console.log("=== Query Combinators — where, reverse ===\n")
+  // --- Query combinators — filter, reverse ---
+  yield* Console.log("=== Query Combinators — filter, reverse ===\n")
 
   // #region query-combinators
   // Reverse sort order
-  const reversedTasks = yield* db.Tasks.collect(
-    Tasks.query.byUser({ userId: "u-alice" }).pipe(Query.reverse),
-  )
+  const { Tasks: reversedTasks } = yield* db.collections
+    .TasksByUser({ userId: "u-alice" })
+    .reverse()
+    .collect()
 
-  // Sort key prefix filter (beginsWith)
-  const todoTasks = yield* db.Tasks.collect(
-    Tasks.query
-      .byUser({ userId: "u-alice" })
-      .pipe(Query.where({ beginsWith: "$crud-demo#v1#task#todo" })),
-  )
+  // Filter expression (post-read filter)
+  const { Tasks: todoTasks } = yield* db.collections
+    .TasksByUser({ userId: "u-alice" })
+    .filter({ status: "todo" })
+    .collect()
   // #endregion
   yield* Console.log(`Alice's tasks (reverse order):`)
   for (const t of reversedTasks) {
@@ -360,7 +375,7 @@ const program = Effect.gen(function* () {
   }
   yield* Console.log("")
 
-  yield* Console.log(`Alice's "todo" tasks (SK beginsWith filter): ${todoTasks.length}`)
+  yield* Console.log(`Alice's "todo" tasks (filter): ${todoTasks.length}`)
   for (const t of todoTasks) {
     yield* Console.log(`  ${t.taskId}: "${t.title}"`)
   }
@@ -390,9 +405,9 @@ const program = Effect.gen(function* () {
   yield* Console.log("transactWrite: atomically created User u-charlie + Task t-5")
 
   // Verify — bound methods return model types
-  const charlie = yield* db.Users.get({ userId: "u-charlie" })
+  const charlie = yield* db.entities.Users.get({ userId: "u-charlie" })
   yield* Console.log(`  User: ${charlie.displayName} (${charlie.role})`)
-  const charlieTask = yield* db.Tasks.get({ taskId: "t-5" })
+  const charlieTask = yield* db.entities.Tasks.get({ taskId: "t-5" })
   yield* Console.log(`  Task: "${charlieTask.title}" (${charlieTask.status})`)
 
   // #region transact-get
@@ -413,32 +428,32 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Sparse GSI — Put ===\n")
 
   // #region sparse-put
-  // Assigned project — appears in byOwner GSI
-  const assigned = yield* db.Projects.put({
+  // Assigned project — appears in ProjectsByOwner collection
+  const assigned = yield* db.entities.Projects.put({
     projectId: "p-1",
     name: "Alpha",
     ownerId: "u-alice",
     department: "engineering",
   })
 
-  // Unassigned project — does NOT appear in byOwner GSI (sparse)
-  const unassigned = yield* db.Projects.put({
+  // Unassigned project — does NOT appear in ProjectsByOwner (sparse)
+  const unassigned = yield* db.entities.Projects.put({
     projectId: "p-2",
     name: "Beta",
     // ownerId and department omitted
   })
 
   // Query only returns assigned projects
-  const ownerProjects = yield* db.Projects.collect(
-    Projects.query.byOwner({ ownerId: "u-alice" }),
-  )
+  const { Projects: ownerProjects } = yield* db.collections
+    .ProjectsByOwner({ ownerId: "u-alice" })
+    .collect()
   // → [{ projectId: "p-1", name: "Alpha" }]
   // "Beta" is absent — sparse index at work
   // #endregion
   yield* Console.log(`Created assigned project: ${assigned.name} (owner: ${assigned.ownerId})`)
-  yield* Console.log(`  → Item appears in byOwner GSI`)
+  yield* Console.log(`  → Item appears in ProjectsByOwner collection`)
   yield* Console.log(`Created unassigned project: ${unassigned.name}`)
-  yield* Console.log(`  → Item does NOT appear in byOwner GSI (sparse)`)
+  yield* Console.log(`  → Item does NOT appear in ProjectsByOwner (sparse)`)
 
   yield* Console.log(`\nProjects owned by Alice: ${ownerProjects.length}`)
   for (const p of ownerProjects) {
@@ -451,7 +466,7 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   yield* Console.log("=== Sparse GSI — Update All-or-None ===\n")
 
-  yield* db.Employees.put({
+  yield* db.entities.Employees.put({
     employeeId: "e-1",
     name: "Alice",
     tenantId: "t-1",
@@ -460,16 +475,16 @@ const program = Effect.gen(function* () {
 
   // #region sparse-update
   // GOOD: Update without touching GSI composites
-  yield* db.Employees.update({ employeeId: "e-1" }, Entity.set({ name: "Alice W." }))
+  yield* db.entities.Employees.update({ employeeId: "e-1" }, Entity.set({ name: "Alice W." }))
 
   // GOOD: Update ALL composites of a GSI
-  yield* db.Employees.update(
+  yield* db.entities.Employees.update(
     { employeeId: "e-1" },
     Entity.set({ tenantId: "t-2", region: "eu-west-1" }),
   )
 
   // BAD: Partial GSI composites — runtime ValidationError
-  yield* db.Employees.update(
+  yield* db.entities.Employees.update(
     { employeeId: "e-1" },
     Entity.set({ tenantId: "t-3" }), // missing region!
   ).pipe(
@@ -485,10 +500,10 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Entity.delete (Hard Delete) ===\n")
 
   // #region delete
-  yield* db.Users.delete({ userId: "u-charlie" })
+  yield* db.entities.Users.delete({ userId: "u-charlie" })
 
   // Confirm deletion
-  const afterDelete = yield* db.Users.get({ userId: "u-charlie" }).pipe(
+  const afterDelete = yield* db.entities.Users.get({ userId: "u-charlie" }).pipe(
     Effect.map(() => "still exists!"),
     Effect.catchTag("ItemNotFound", () => Effect.succeed("confirmed deleted")),
   )
@@ -501,18 +516,18 @@ const program = Effect.gen(function* () {
 
   // #region versions
   // Fetch a specific version
-  const aliceV1 = yield* db.Users.getVersion({ userId: "u-alice" }, 1)
+  const aliceV1 = yield* db.entities.Users.getVersion({ userId: "u-alice" }, 1)
   // aliceV1.displayName → "Alice", aliceV1.role → "admin"
 
-  const aliceV2 = yield* db.Users.getVersion({ userId: "u-alice" }, 2)
+  const aliceV2 = yield* db.entities.Users.getVersion({ userId: "u-alice" }, 2)
   // aliceV2.displayName → "Alice W.", aliceV2.role → "member"
 
   // Query all version snapshots
-  const allVersions = yield* db.Users.collect(Users.versions({ userId: "u-alice" }))
+  const allVersions = yield* db.entities.Users.collect(Users.versions({ userId: "u-alice" }))
   // → [{ version: 1, ... }, { version: 2, ... }, { version: 3, ... }]
 
   // Non-existent version → ItemNotFound
-  yield* db.Users.getVersion({ userId: "u-alice" }, 99).pipe(
+  yield* db.entities.Users.getVersion({ userId: "u-alice" }, 99).pipe(
     Effect.catchTag("ItemNotFound", () => Effect.succeed("not found")),
   )
   // #endregion
@@ -529,14 +544,16 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Soft Delete (Tasks) ===\n")
 
   // #region soft-delete
-  yield* db.Tasks.delete({ taskId: "t-1" })
+  yield* db.entities.Tasks.delete({ taskId: "t-1" })
 
-  // No longer in GSI queries
-  const aliceTasksAfterDelete = yield* db.Tasks.collect(Tasks.query.byUser({ userId: "u-alice" }))
+  // No longer in collection queries
+  const { Tasks: aliceTasksAfterDelete } = yield* db.collections
+    .TasksByUser({ userId: "u-alice" })
+    .collect()
   // t-1 is absent
 
   // But retrievable via deleted.get
-  const deletedTask = yield* db.Tasks.deleted.get({ taskId: "t-1" })
+  const deletedTask = yield* db.entities.Tasks.deleted.get({ taskId: "t-1" })
   // deletedTask.title → "Design the API"
   // #endregion
   yield* Console.log("Soft-deleted Task: t-1 (Design the API)")
@@ -549,19 +566,21 @@ const program = Effect.gen(function* () {
   yield* Console.log("\n=== Restore (Un-Soft-Delete) ===\n")
 
   // #region restore
-  const restored = yield* db.Tasks.restore({ taskId: "t-1" })
+  const restored = yield* db.entities.Tasks.restore({ taskId: "t-1" })
   // restored.title → "Design the API"
   // restored.status → "done"
 
-  // Back in GSI queries
-  const aliceTasksAfterRestore = yield* db.Tasks.collect(Tasks.query.byUser({ userId: "u-alice" }))
+  // Back in collection queries
+  const { Tasks: aliceTasksAfterRestore } = yield* db.collections
+    .TasksByUser({ userId: "u-alice" })
+    .collect()
   // t-1 is back
   // #endregion
   yield* Console.log(`Restored Task: "${restored.title}" (status: ${restored.status})`)
   yield* Console.log(`Alice's active tasks: ${aliceTasksAfterRestore.length} (t-1 is back)`)
 
   // Restore a non-existent soft-deleted item → ItemNotFound
-  const restoreResult = yield* db.Tasks.restore({ taskId: "t-nonexistent" }).pipe(
+  const restoreResult = yield* db.entities.Tasks.restore({ taskId: "t-nonexistent" }).pipe(
     Effect.map(() => "restored!"),
     Effect.catchTag("ItemNotFound", () => Effect.succeed("ItemNotFound (no soft-deleted item)")),
   )
@@ -571,10 +590,10 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Purge (Permanent Removal) ===\n")
 
   // #region purge
-  yield* db.Users.purge({ userId: "u-bob" })
+  yield* db.entities.Users.purge({ userId: "u-bob" })
 
   // Completely gone — no item, no versions, no snapshots
-  yield* db.Users.get({ userId: "u-bob" }).pipe(
+  yield* db.entities.Users.get({ userId: "u-bob" }).pipe(
     Effect.catchTag("ItemNotFound", () => Effect.succeed("completely gone")),
   )
   // #endregion
@@ -582,7 +601,7 @@ const program = Effect.gen(function* () {
 
   // --- Cleanup ---
   yield* Console.log("=== Cleanup ===\n")
-  yield* db.deleteTable()
+  yield* db.tables["crud-demo-table"]!.delete()
   yield* Console.log("Table deleted.")
 })
 
@@ -598,6 +617,7 @@ const AppLayer = Layer.mergeAll(
     credentials: { accessKeyId: "local", secretAccessKey: "local" },
   }),
   MainTable.layer({ name: "crud-demo-table" }),
+  ProjectTable.layer({ name: "crud-demo-table" }),
 )
 
 const main = program.pipe(Effect.provide(AppLayer))
