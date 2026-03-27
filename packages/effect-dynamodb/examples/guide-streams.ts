@@ -64,9 +64,9 @@ const EmployeeEntity = Entity.make({
   },
   indexes: {
     byDepartment: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["department"],
-      sk: ["displayName"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["department"] },
+      sk: { field: "gsi1sk", composite: ["displayName"] },
     },
   },
   timestamps: true,
@@ -82,9 +82,9 @@ const TaskEntity = Entity.make({
   },
   indexes: {
     byEmployee: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["employeeId"],
-      sk: ["status"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["employeeId"] },
+      sk: { field: "gsi1sk", composite: ["status"] },
     },
   },
   timestamps: true,

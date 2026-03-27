@@ -73,7 +73,7 @@ describe("KeyComposer", () => {
         sk: { field: "sk", composite: [] },
       }
       expect(KeyComposer.composePk(schema, "User", index, { userId: "abc-123" })).toBe(
-        "$myapp#v1#user#abc-123",
+        "$myapp#v1#user#userid_abc-123",
       )
     })
 
@@ -93,7 +93,7 @@ describe("KeyComposer", () => {
         sk: { field: "gsi1sk", composite: ["createdAt"] },
       }
       expect(KeyComposer.composePk(schema, "User", index, { tenantId: "t-1" })).toBe(
-        "$myapp#v1#tenantitems#t-1",
+        "$myapp#v1#tenantitems#tenantid_t-1",
       )
     })
   })
@@ -116,7 +116,7 @@ describe("KeyComposer", () => {
         sk: { field: "gsi1sk", composite: ["createdAt"] },
       }
       expect(KeyComposer.composeSk(schema, "User", 1, index, { createdAt: "2024-01-15" })).toBe(
-        "$myapp#v1#tenantitems#user_1#2024-01-15",
+        "$myapp#v1#tenantitems#user_1#createdat_2024-01-15",
       )
     })
 
@@ -129,7 +129,7 @@ describe("KeyComposer", () => {
         sk: { field: "gsi1sk", composite: ["createdAt"] },
       }
       expect(KeyComposer.composeSk(schema, "User", 1, index, { createdAt: "2024-01-15" })).toBe(
-        "$myapp#v1#user_1#2024-01-15",
+        "$myapp#v1#user_1#createdat_2024-01-15",
       )
     })
   })
@@ -142,7 +142,7 @@ describe("KeyComposer", () => {
       }
       const result = KeyComposer.composeIndexKeys(schema, "User", 1, index, { userId: "u-1" })
       expect(result).toEqual({
-        pk: "$myapp#v1#user#u-1",
+        pk: "$myapp#v1#user#userid_u-1",
         sk: "$myapp#v1#user",
       })
     })
@@ -166,9 +166,9 @@ describe("KeyComposer", () => {
         email: "alice@example.com",
       })
       expect(result).toEqual({
-        pk: "$myapp#v1#user#u-1",
+        pk: "$myapp#v1#user#userid_u-1",
         sk: "$myapp#v1#user",
-        gsi1pk: "$myapp#v1#user#alice@example.com",
+        gsi1pk: "$myapp#v1#user#email_alice@example.com",
         gsi1sk: "$myapp#v1#user",
       })
     })
@@ -208,7 +208,7 @@ describe("KeyComposer", () => {
       }
       const result = KeyComposer.tryComposeIndexKeys(schema, "User", 1, index, { email: "a@b.com" })
       expect(result).toEqual({
-        gsi1pk: "$myapp#v1#user#a@b.com",
+        gsi1pk: "$myapp#v1#user#email_a@b.com",
         gsi1sk: "$myapp#v1#user",
       })
     })
@@ -252,7 +252,7 @@ describe("KeyComposer", () => {
         userId: "u-1",
       })
       expect(result).toEqual({
-        pk: "$myapp#v1#user#u-1",
+        pk: "$myapp#v1#user#userid_u-1",
         sk: "$myapp#v1#user",
       })
       expect(result).not.toHaveProperty("gsi1pk")
@@ -293,8 +293,8 @@ describe("KeyComposer", () => {
         email: "a@b.com",
         // tenantId and region missing — gsi2 skipped
       })
-      expect(result.pk).toBe("$myapp#v1#user#u-1")
-      expect(result.gsi1pk).toBe("$myapp#v1#user#a@b.com")
+      expect(result.pk).toBe("$myapp#v1#user#userid_u-1")
+      expect(result.gsi1pk).toBe("$myapp#v1#user#email_a@b.com")
       expect(result).not.toHaveProperty("gsi2pk")
       expect(result).not.toHaveProperty("gsi2sk")
     })
@@ -339,8 +339,8 @@ describe("KeyComposer", () => {
         { tenantId: "t-1", region: "us-east-1" },
         { userId: "u-1" },
       )
-      expect(result.gsi1pk).toBe("$myapp#v1#user#t-1")
-      expect(result.gsi1sk).toBe("$myapp#v1#user#us-east-1")
+      expect(result.gsi1pk).toBe("$myapp#v1#user#tenantid_t-1")
+      expect(result.gsi1sk).toBe("$myapp#v1#user#region_us-east-1")
       expect(result).not.toHaveProperty("gsi2pk")
     })
 
@@ -353,7 +353,7 @@ describe("KeyComposer", () => {
         { email: "new@b.com" },
         { userId: "u-1" },
       )
-      expect(result.gsi2pk).toBe("$myapp#v1#user#new@b.com")
+      expect(result.gsi2pk).toBe("$myapp#v1#user#email_new@b.com")
       expect(result).not.toHaveProperty("gsi1pk")
     })
 
@@ -378,8 +378,8 @@ describe("KeyComposer", () => {
         { role: "admin" },
         { userId: "u-1" },
       )
-      expect(result.gsi1pk).toBe("$myapp#v1#user#admin")
-      expect(result.gsi1sk).toBe("$myapp#v1#user#u-1")
+      expect(result.gsi1pk).toBe("$myapp#v1#user#role_admin")
+      expect(result.gsi1sk).toBe("$myapp#v1#user#userid_u-1")
     })
 
     it("throws PartialGsiCompositeError when only some composites are provided", () => {
@@ -454,7 +454,7 @@ describe("KeyComposer", () => {
       const result = KeyComposer.composeSortKeyPrefix(schema, "Employee", 1, index, {
         department: "engineering",
       })
-      expect(result).toBe("$myapp#v1#tenantitems#employee_1#engineering")
+      expect(result).toBe("$myapp#v1#tenantitems#employee_1#department_engineering")
     })
 
     it("full sk when all composites provided", () => {
@@ -465,7 +465,7 @@ describe("KeyComposer", () => {
       const result = KeyComposer.composeSortKeyPrefix(schema, "Task", 1, index, {
         status: "active",
       })
-      expect(result).toBe("$myapp#v1#task#active")
+      expect(result).toBe("$myapp#v1#task#status_active")
     })
   })
 })

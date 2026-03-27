@@ -126,9 +126,9 @@ const Users = Entity.make({
   indexes: {
     owned: {
       collection: "owned",
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["username"],
-      sk: [],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["username"] },
+      sk: { field: "gsi1sk", composite: [] },
     },
   },
   timestamps: true,
@@ -150,15 +150,15 @@ const Repositories = Entity.make({
   indexes: {
     owned: {
       collection: "owned",
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["username"],
-      sk: ["repoName"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["username"] },
+      sk: { field: "gsi1sk", composite: ["repoName"] },
     },
     activity: {
       collection: "activity",
-      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-      composite: ["repoOwner", "repoName"],
-      sk: [],
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["repoOwner", "repoName"] },
+      sk: { field: "gsi2sk", composite: [] },
     },
   },
   timestamps: true,
@@ -180,15 +180,15 @@ const Issues = Entity.make({
   indexes: {
     managed: {
       collection: "managed",
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["username"],
-      sk: ["status", "issueNumber"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["username"] },
+      sk: { field: "gsi1sk", composite: ["status", "issueNumber"] },
     },
     activity: {
       collection: "activity",
-      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-      composite: ["repoOwner", "repoName"],
-      sk: ["status", "issueNumber"],
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["repoOwner", "repoName"] },
+      sk: { field: "gsi2sk", composite: ["status", "issueNumber"] },
     },
   },
   timestamps: true,
@@ -210,15 +210,15 @@ const PullRequests = Entity.make({
   indexes: {
     managed: {
       collection: "managed",
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["username"],
-      sk: ["status", "pullRequestNumber"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["username"] },
+      sk: { field: "gsi1sk", composite: ["status", "pullRequestNumber"] },
     },
     activity: {
       collection: "activity",
-      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-      composite: ["repoOwner", "repoName"],
-      sk: ["status", "pullRequestNumber"],
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["repoOwner", "repoName"] },
+      sk: { field: "gsi2sk", composite: ["status", "pullRequestNumber"] },
     },
   },
   timestamps: true,

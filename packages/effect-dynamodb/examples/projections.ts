@@ -59,9 +59,9 @@ const Employees = Entity.make({
   },
   indexes: {
     byDepartment: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["department"],
-      sk: ["employeeId"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["department"] },
+      sk: { field: "gsi1sk", composite: ["employeeId"] },
     },
   },
   timestamps: true,

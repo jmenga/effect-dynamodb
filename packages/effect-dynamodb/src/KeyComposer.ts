@@ -31,36 +31,43 @@ export interface IndexDefinition {
   readonly casing?: DynamoSchema.Casing | undefined
 }
 
-/** Physical GSI field names. */
-export interface GsiIndex {
+/** GSI definition as specified on Entity.make() indexes config.
+ * Mirrors the primaryKey structure with an added `name` for the physical GSI. */
+export interface GsiConfig {
   /** Physical GSI name (e.g., `"gsi1"`). */
   readonly name: string
-  /** PK field name (e.g., `"gsi1pk"`). */
-  readonly pk: string
-  /** SK field name (e.g., `"gsi1sk"`). */
-  readonly sk: string
-}
-
-/** GSI definition as specified on Entity.make() indexes config. */
-export interface GsiConfig {
   /** Optional collection name. String for single, array for sub-collections. */
   readonly collection?: string | ReadonlyArray<string> | undefined
-  /** Physical GSI definition: index name + PK/SK field names. */
-  readonly index: GsiIndex
-  /** Shared PK composite attributes. */
-  readonly composite: ReadonlyArray<string>
-  /** SK composite attributes for this entity. */
-  readonly sk: ReadonlyArray<string>
+  /** SK ordering mode. `"isolated"` (default) puts entity type before composites; `"clustered"` puts entity type after composites (required for sub-collections). */
+  readonly type?: "isolated" | "clustered" | undefined
+  /** Partition key: physical field name + composite attributes. */
+  readonly pk: KeyPart
+  /** Sort key: physical field name + composite attributes. */
+  readonly sk: KeyPart
 }
 
 /** Normalize a GsiConfig (entity input) to an IndexDefinition (internal format). */
-export const normalizeGsiConfig = (config: GsiConfig): IndexDefinition => ({
-  index: config.index.name,
-  collection: config.collection,
-  type: "isolated",
-  pk: { field: config.index.pk, composite: [...config.composite] },
-  sk: { field: config.index.sk, composite: [...config.sk] },
-})
+export const normalizeGsiConfig = (config: GsiConfig): IndexDefinition => {
+  // Detect old format and give helpful migration error
+  if ("index" in config && typeof (config as Record<string, unknown>).index === "object") {
+    throw new Error(
+      `[EDD-9003] GsiConfig uses old format with "index" property. ` +
+        `Migrate to: { name: "gsi1", pk: { field: "gsi1pk", composite: [...] }, sk: { field: "gsi1sk", composite: [...] } }`,
+    )
+  }
+  if (!config.name || !config.pk || !config.sk) {
+    throw new Error(
+      `[EDD-9003] Invalid GsiConfig: requires name, pk: { field, composite }, sk: { field, composite }`,
+    )
+  }
+  return {
+    index: config.name,
+    collection: config.collection,
+    type: config.type ?? "isolated",
+    pk: { field: config.pk.field, composite: [...config.pk.composite] },
+    sk: { field: config.sk.field, composite: [...config.sk.composite] },
+  }
+}
 
 /**
  * Extract composite attribute values from an entity record.
@@ -137,16 +144,17 @@ export const composePk = (
   record: Record<string, unknown>,
 ): string => {
   const composites = extractComposites(index.pk.composite, record)
+  const names = [...index.pk.composite]
   const collection = index.collection
 
   if (collection !== undefined) {
     // Collection index — PK uses collection name
     const collectionName = Array.isArray(collection) ? collection[0]! : collection
-    return composeCollectionKey(schema, collectionName, composites, { casing: index.casing })
+    return composeCollectionKey(schema, collectionName, composites, { casing: index.casing, names })
   }
 
   // Regular entity index — PK uses entity type
-  return composeKey(schema, entityType, composites, { casing: index.casing })
+  return composeKey(schema, entityType, composites, { casing: index.casing, names })
 }
 
 /**
@@ -164,6 +172,7 @@ export const composeSk = (
   record: Record<string, unknown>,
 ): string => {
   const composites = extractComposites(index.sk.composite, record)
+  const names = [...index.sk.composite]
   const collection = index.collection
   const collectionType = index.type ?? "clustered"
 
@@ -176,17 +185,18 @@ export const composeSk = (
         entityType,
         entityVersion,
         composites,
-        { casing: index.casing },
+        { casing: index.casing, names },
       )
     }
     // Isolated
     return composeIsolatedSortKey(schema, entityType, entityVersion, composites, {
       casing: index.casing,
+      names,
     })
   }
 
   // Non-collection — simple entity key
-  return composeKey(schema, entityType, composites, { casing: index.casing })
+  return composeKey(schema, entityType, composites, { casing: index.casing, names })
 }
 
 /**
@@ -330,12 +340,14 @@ export const composeSortKeyPrefix = (
   index: IndexDefinition,
   record: Record<string, unknown>,
 ): string => {
-  // Collect available composites (stop at first missing)
+  // Collect available composites and their names (stop at first missing)
   const available: Array<string> = []
+  const names: Array<string> = []
   for (const attr of index.sk.composite) {
     const value = record[attr]
     if (value === undefined || value === null) break
     available.push(serializeValue(value))
+    names.push(attr)
   }
 
   const collection = index.collection
@@ -346,12 +358,14 @@ export const composeSortKeyPrefix = (
       const collectionName = Array.isArray(collection) ? collection[0]! : collection
       return composeClusteredSortKey(schema, collectionName, entityType, entityVersion, available, {
         casing: index.casing,
+        names,
       })
     }
     return composeIsolatedSortKey(schema, entityType, entityVersion, available, {
       casing: index.casing,
+      names,
     })
   }
 
-  return composeKey(schema, entityType, available, { casing: index.casing })
+  return composeKey(schema, entityType, available, { casing: index.casing, names })
 }

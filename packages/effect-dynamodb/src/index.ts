@@ -99,7 +99,7 @@ export type {
   SizeOperand,
 } from "./internal/PathBuilder.js"
 export { compilePath, createPathBuilder, isPath } from "./internal/PathBuilder.js"
-export type { GsiConfig, GsiIndex, IndexDefinition, KeyPart } from "./KeyComposer.js"
+export type { GsiConfig, IndexDefinition, KeyPart } from "./KeyComposer.js"
 export * as KeyComposer from "./KeyComposer.js"
 export * as Marshaller from "./Marshaller.js"
 export type { ProjectionResult } from "./Projection.js"

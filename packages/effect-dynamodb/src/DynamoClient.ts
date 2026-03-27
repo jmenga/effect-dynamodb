@@ -121,6 +121,7 @@ import {
 import { type BoundQueryConfig, BoundQueryImpl } from "./internal/BoundQuery.js"
 import { createConditionOps } from "./internal/Expr.js"
 import { createPathBuilder } from "./internal/PathBuilder.js"
+import type { EntityKeyType, IndexPkInput, IndexSkFields } from "./internal/EntityTypes.js"
 import type { IndexDefinition } from "./KeyComposer.js"
 import * as KeyComposer from "./KeyComposer.js"
 import * as Query from "./Query.js"
@@ -428,7 +429,7 @@ export type TypedClient<T extends Table> = {
     infer R,
     any
   >
-    ? BoundEntity<M, I, R>
+    ? Resolve<BoundEntity<M, I, R, ResolveKey<M, I>>>
     : never
 } & {
   readonly [K in keyof T["aggregates"]]: T["aggregates"][K] extends AggregateType<
@@ -517,14 +518,16 @@ export type TypedClientV2<
       infer R,
       any
     >
-      ? BoundEntity<M, I, R> & {
-          /** Scan this entity. Returns a BoundQuery for building scan queries. */
-          readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
-            Schema.Schema.Type<M>,
-            never,
-            Schema.Schema.Type<M>
-          >
-        } & EntityIndexAccessors<M, I>
+      ? Resolve<
+          BoundEntity<M, I, R, ResolveKey<M, I>> & {
+            /** Scan this entity. Returns a BoundQuery for building scan queries. */
+            readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
+              Schema.Schema.Type<M>,
+              never,
+              Schema.Schema.Type<M>
+            >
+          } & EntityIndexAccessors<M, I>
+        >
       : never
   }
 
@@ -626,13 +629,30 @@ type DiscoveredCollections<TEntities extends Record<string, { readonly _tag: "En
   ) => CollectionQuery<CollectionGroupedResult<TEntities, CollName>>
 }
 
-/** Compute entity query accessors for each index (non-primary). */
+/** Force TypeScript to resolve an interface/intersection into a plain object for clean hover display */
+type Resolve<T> = { [K in keyof T]: T[K] }
+
+/** Resolve EntityKeyType into a plain object type for clean hover display.
+ * Uses conditional type to force eager evaluation by TypeScript. */
+type ResolveKey<M extends Schema.Top, I> =
+  EntityKeyType<M, I> extends infer K ? { [P in keyof K]: K[P] } : never
+
+/** Force eager resolution of remaining SK fields for clean hover display. */
+type ResolveSkFields<M extends Schema.Top, I, K extends keyof I, Provided> =
+  Omit<IndexSkFields<M, I, K>, keyof Provided> extends infer SK
+    ? { readonly [P in keyof SK]: SK[P] }
+    : never
+
+/** Compute entity query accessors for each index (non-primary).
+ * Generic over provided input — `.where()` only exposes SK composites NOT already provided. */
 type EntityIndexAccessors<M extends Schema.Top, I extends Record<string, IndexDefinition>> = {
-  readonly [K in Exclude<keyof I, "primary"> & string]: (
-    composites: Record<string, unknown>,
+  readonly [K in Exclude<keyof I, "primary"> & string]: <
+    Provided extends IndexPkInput<M, I, K>,
+  >(
+    composites: Provided,
   ) => import("./internal/BoundQuery.js").BoundQuery<
     Schema.Schema.Type<M>,
-    never,
+    ResolveSkFields<M, I, K, Provided>,
     Schema.Schema.Type<M>
   >
 }
@@ -714,13 +734,15 @@ const makeFromTable = <T extends Table>(
       ...boundAggregates,
 
       createTable: (options?: CreateTableOptions) =>
-        client
-          .createTable({
-            TableName: tableConfig.name,
-            BillingMode: options?.billingMode ?? "PAY_PER_REQUEST",
-            ...tableDefinition(table),
-          })
-          .pipe(Effect.asVoid),
+        idempotentCreate(
+          client
+            .createTable({
+              TableName: tableConfig.name,
+              BillingMode: options?.billingMode ?? "PAY_PER_REQUEST",
+              ...tableDefinition(table),
+            })
+            .pipe(Effect.asVoid),
+        ),
 
       deleteTable: () => client.deleteTable({ TableName: tableConfig.name }).pipe(Effect.asVoid),
 
@@ -758,6 +780,49 @@ const makeFromConfig = (config: {
       effect: Effect.Effect<A, E, DynamoClient | TableConfig>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
 
+    // Helper: validate query composites at runtime
+    const validateQueryComposites = (
+      indexName: string,
+      indexDef: IndexDefinition,
+      composites: Record<string, unknown>,
+    ): void => {
+      const pkAttrs = indexDef.pk.composite
+      const skAttrs = indexDef.sk.composite
+
+      // 1. All PK composites must be present
+      for (const attr of pkAttrs) {
+        if (composites[attr] === undefined) {
+          throw new Error(
+            `[EDD-9002] Missing required partition key attribute "${attr}" for index "${indexName}"`,
+          )
+        }
+      }
+
+      // 2. SK composites must follow prefix ordering
+      let lastProvided = -1
+      for (let i = 0; i < skAttrs.length; i++) {
+        if (composites[skAttrs[i]!] !== undefined) {
+          if (i !== lastProvided + 1) {
+            const missing = skAttrs.slice(lastProvided + 1, i).join(", ")
+            throw new Error(
+              `[EDD-9004] Sort key composite "${skAttrs[i]}" for index "${indexName}" requires prior composites: ${missing}. Sort key composites must follow prefix ordering.`,
+            )
+          }
+          lastProvided = i
+        }
+      }
+
+      // 3. No excess properties
+      const validKeys = new Set([...pkAttrs, ...skAttrs])
+      for (const key of Object.keys(composites)) {
+        if (!validKeys.has(key)) {
+          throw new Error(
+            `[EDD-9006] Unknown composite attribute "${key}" for index "${indexName}". Valid attributes: ${[...validKeys].join(", ")}`,
+          )
+        }
+      }
+    }
+
     // Helper: build a BoundQuery for a single-entity index query
     const buildEntityQueryAccessor = (
       entityLike: EntityLike,
@@ -765,6 +830,7 @@ const makeFromConfig = (config: {
       indexDef: IndexDefinition,
     ) => {
       return (composites: Record<string, unknown>) => {
+        validateQueryComposites(_indexName, indexDef, composites)
         const pkValue = KeyComposer.composePk(
           entityLike._schema,
           entityLike.entityType,
@@ -800,7 +866,35 @@ const makeFromConfig = (config: {
 
         const pathBuilder = createPathBuilder()
         const conditionOps = createConditionOps()
-        const bqConfig: BoundQueryConfig<unknown> = { pathBuilder, conditionOps, provide }
+
+        // composeSkCondition: prepend the entity SK prefix to user's .where() condition
+        const composeSkCondition = (condition: Query.SortKeyCondition): Query.SortKeyCondition => {
+          const skPrefix = KeyComposer.composeSortKeyPrefix(
+            entityLike._schema,
+            entityLike.entityType,
+            1,
+            indexDef,
+            composites,
+          )
+          const prepend = (value: string) => `${skPrefix}#${value}`
+          if ("eq" in condition) return { eq: prepend(condition.eq) }
+          if ("lt" in condition) return { lt: prepend(condition.lt) }
+          if ("lte" in condition) return { lte: prepend(condition.lte) }
+          if ("gt" in condition) return { gt: prepend(condition.gt) }
+          if ("gte" in condition) return { gte: prepend(condition.gte) }
+          if ("between" in condition)
+            return { between: [prepend(condition.between[0]), prepend(condition.between[1])] }
+          if ("beginsWith" in condition) return { beginsWith: prepend(condition.beginsWith) }
+          return condition
+        }
+
+        const bqConfig: BoundQueryConfig<unknown> = {
+          pathBuilder,
+          conditionOps,
+          provide,
+          composeSkCondition,
+          skFields: indexDef.sk.composite,
+        }
         return new BoundQueryImpl(finalQuery, bqConfig)
       }
     }
@@ -994,6 +1088,18 @@ const makeFromConfig = (config: {
 // buildTableOperations — pre-bound table management
 // ---------------------------------------------------------------------------
 
+/** Check if a DynamoError wraps a ResourceInUseException (table already exists). */
+const isResourceInUse = (err: DynamoClientError): boolean =>
+  err._tag === "DynamoError" &&
+  err.cause != null &&
+  typeof err.cause === "object" &&
+  "name" in err.cause &&
+  (err.cause as { name: string }).name === "ResourceInUseException"
+
+/** Make createTable idempotent — ignore if table already exists. */
+const idempotentCreate = (effect: Effect.Effect<void, DynamoClientError>): Effect.Effect<void, DynamoClientError> =>
+  Effect.catchIf(effect, isResourceInUse, () => Effect.void)
+
 const buildTableOperationsFromTable = (
   tableName: string,
   table: Table,
@@ -1003,32 +1109,36 @@ const buildTableOperationsFromTable = (
   return {
     ...buildTableOperations(tableName, client),
     create: (options?: CreateTableOptions) =>
-      client
-        .createTable({
-          TableName: tableName,
-          BillingMode: options?.billingMode ?? "PAY_PER_REQUEST",
-          ...def,
-        })
-        .pipe(Effect.asVoid),
+      idempotentCreate(
+        client
+          .createTable({
+            TableName: tableName,
+            BillingMode: options?.billingMode ?? "PAY_PER_REQUEST",
+            ...def,
+          })
+          .pipe(Effect.asVoid),
+      ),
   }
 }
 
 const buildTableOperations = (tableName: string, client: DynamoClientService): TableOperations => ({
   create: (options?: CreateTableOptions) =>
-    client
-      .createTable({
-        TableName: tableName,
-        BillingMode: options?.billingMode ?? "PAY_PER_REQUEST",
-        KeySchema: [
-          { AttributeName: "pk", KeyType: "HASH" },
-          { AttributeName: "sk", KeyType: "RANGE" },
-        ],
-        AttributeDefinitions: [
-          { AttributeName: "pk", AttributeType: "S" },
-          { AttributeName: "sk", AttributeType: "S" },
-        ],
-      })
-      .pipe(Effect.asVoid),
+    idempotentCreate(
+      client
+        .createTable({
+          TableName: tableName,
+          BillingMode: options?.billingMode ?? "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: "sk", AttributeType: "S" },
+          ],
+        })
+        .pipe(Effect.asVoid),
+    ),
   delete: () => client.deleteTable({ TableName: tableName }).pipe(Effect.asVoid),
   describe: () => client.describeTable({ TableName: tableName }),
   update: (input) =>

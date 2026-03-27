@@ -63,14 +63,14 @@ const TaskEntity = Entity.make({
   },
   indexes: {
     byProject: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["projectId"],
-      sk: ["status", "createdAt"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["projectId"] },
+      sk: { field: "gsi1sk", composite: ["status", "createdAt"] },
     },
     byAssignee: {
-      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-      composite: ["assigneeId"],
-      sk: ["status", "createdAt"],
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["assigneeId"] },
+      sk: { field: "gsi2sk", composite: ["status", "createdAt"] },
     },
   },
   timestamps: true,

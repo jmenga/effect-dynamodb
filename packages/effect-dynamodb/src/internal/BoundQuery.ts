@@ -22,24 +22,33 @@ import type { Path, PathBuilder } from "./PathBuilder.js"
 // Sort key condition ops for the `where` callback
 // ---------------------------------------------------------------------------
 
-export interface SkConditionOps {
-  readonly eq: (value: string) => Query.SortKeyCondition
-  readonly lt: (value: string) => Query.SortKeyCondition
-  readonly lte: (value: string) => Query.SortKeyCondition
-  readonly gt: (value: string) => Query.SortKeyCondition
-  readonly gte: (value: string) => Query.SortKeyCondition
-  readonly between: (low: string, high: string) => Query.SortKeyCondition
-  readonly beginsWith: (prefix: string) => Query.SortKeyCondition
+/** Sort key condition operators for `.where()` callback.
+ * The `field` parameter accepts values from `t` (e.g. `t.status`). */
+export interface SkConditionOps<SK = Record<string, unknown>> {
+  readonly eq: (field: SK[keyof SK], value: string) => Query.SortKeyCondition
+  readonly lt: (field: SK[keyof SK], value: string) => Query.SortKeyCondition
+  readonly lte: (field: SK[keyof SK], value: string) => Query.SortKeyCondition
+  readonly gt: (field: SK[keyof SK], value: string) => Query.SortKeyCondition
+  readonly gte: (field: SK[keyof SK], value: string) => Query.SortKeyCondition
+  readonly between: (field: SK[keyof SK], low: string, high: string) => Query.SortKeyCondition
+  readonly beginsWith: (field: SK[keyof SK], prefix: string) => Query.SortKeyCondition
 }
 
-const skConditionOps: SkConditionOps = {
-  eq: (value) => ({ eq: value }),
-  lt: (value) => ({ lt: value }),
-  lte: (value) => ({ lte: value }),
-  gt: (value) => ({ gt: value }),
-  gte: (value) => ({ gte: value }),
-  between: (low, high) => ({ between: [low, high] }),
-  beginsWith: (prefix) => ({ beginsWith: prefix }),
+const skConditionOps: SkConditionOps<any> = {
+  eq: (_field, value) => ({ eq: value }),
+  lt: (_field, value) => ({ lt: value }),
+  lte: (_field, value) => ({ lte: value }),
+  gt: (_field, value) => ({ gt: value }),
+  gte: (_field, value) => ({ gte: value }),
+  between: (_field, low, high) => ({ between: [low, high] }),
+  beginsWith: (_field, prefix) => ({ beginsWith: prefix }),
+}
+
+/** Build the runtime sk accessor object — each property returns its field name. */
+const buildSkAccessor = (fields: ReadonlyArray<string>): Record<string, string> => {
+  const acc: Record<string, string> = {}
+  for (const f of fields) acc[f] = f
+  return acc
 }
 
 // ---------------------------------------------------------------------------
@@ -102,9 +111,14 @@ export interface BoundQueryWithWhere<Model, SkRemaining, A> {
   /**
    * Sort key condition on remaining SK composites.
    * Consumes SkRemaining — cannot be called twice.
+   *
+   * ```ts
+   * .where((t, { beginsWith }) => beginsWith(t.status, "d"))
+   * .where((t, { eq }) => eq(t.status, "done"))
+   * ```
    */
   readonly where: (
-    fn: (sk: SkRemaining, ops: SkConditionOps) => Query.SortKeyCondition,
+    fn: (t: SkRemaining, ops: SkConditionOps<SkRemaining>) => Query.SortKeyCondition,
   ) => BoundQuery<Model, never, A>
 }
 
@@ -123,6 +137,8 @@ export type BoundQuery<Model, SkRemaining, A> = BoundQueryBase<Model, SkRemainin
 export interface BoundQueryConfig<Model> {
   readonly pathBuilder: PathBuilder<Model, Model, never>
   readonly conditionOps: ConditionOps<Model>
+  /** SK composite field names for building the SkAccessor in `.where()`. */
+  readonly skFields?: ReadonlyArray<string> | undefined
   readonly provide: <X, E>(eff: Effect.Effect<X, E, any>) => Effect.Effect<X, E, never>
   /** Optional: transform SK condition (e.g., compose prefix for partial composites) */
   readonly composeSkCondition?: (condition: Query.SortKeyCondition) => Query.SortKeyCondition
@@ -141,9 +157,12 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
 
   // --- where ---
   where(
-    fn: (sk: SkRemaining, ops: SkConditionOps) => Query.SortKeyCondition,
+    fn: (t: SkRemaining, ops: SkConditionOps<SkRemaining>) => Query.SortKeyCondition,
   ): BoundQueryImpl<Model, never, A> {
-    const condition = fn(undefined as SkRemaining, skConditionOps)
+    const skAccessor = (this._config.skFields
+      ? buildSkAccessor(this._config.skFields)
+      : {}) as SkRemaining
+    const condition = fn(skAccessor, skConditionOps as SkConditionOps<SkRemaining>)
     const finalCondition = this._config.composeSkCondition
       ? this._config.composeSkCondition(condition)
       : condition

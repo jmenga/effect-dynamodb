@@ -88,14 +88,14 @@ const Tasks = Entity.make({
   },
   indexes: {
     byProject: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["projectId"],
-      sk: ["priority"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["projectId"] },
+      sk: { field: "gsi1sk", composite: ["priority"] },
     },
     byAssignee: {
-      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-      composite: ["assigneeId"],
-      sk: ["priority"],
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["assigneeId"] },
+      sk: { field: "gsi2sk", composite: ["priority"] },
     },
   },
   timestamps: true,
@@ -117,9 +117,9 @@ const IsolatedEmployees = Entity.make({
   indexes: {
     departmentStaff: {
       collection: "departmentStaff",
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["department"],
-      sk: ["hireDate"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["department"] },
+      sk: { field: "gsi1sk", composite: ["hireDate"] },
     },
   },
   timestamps: true,
@@ -142,9 +142,9 @@ const Equipments = Entity.make({
   indexes: {
     departmentStaff: {
       collection: "departmentStaff",
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["department"],
-      sk: ["purchaseDate"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["department"] },
+      sk: { field: "gsi1sk", composite: ["purchaseDate"] },
     },
   },
   timestamps: true,
@@ -165,10 +165,10 @@ const ClusteredEmployees = Entity.make({
   indexes: {
     tenantMembers: {
       collection: "tenantMembers",
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["department", "hireDate"] },
       type: "clustered",
-      composite: ["tenantId"],
-      sk: ["department", "hireDate"],
     },
   },
   timestamps: true,
@@ -184,10 +184,10 @@ const ClusteredTasks = Entity.make({
   indexes: {
     tenantMembers: {
       collection: "tenantMembers",
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["projectId", "taskId"] },
       type: "clustered",
-      composite: ["tenantId"],
-      sk: ["projectId", "taskId"],
     },
   },
   timestamps: true,
@@ -208,10 +208,9 @@ const SubEmployee = Entity.make({
   indexes: {
     contributions: {
       collection: "contributions",
-      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-      type: "clustered",
-      composite: ["employeeId"],
-      sk: ["department"],
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["employeeId"] },
+      sk: { field: "gsi2sk", composite: ["department"] },
     },
   },
   timestamps: true,
@@ -227,10 +226,9 @@ const SubTasks = Entity.make({
   indexes: {
     assignments: {
       collection: "assignments",
-      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-      type: "clustered",
-      composite: ["employeeId"],
-      sk: ["projectId", "taskId"],
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["employeeId"] },
+      sk: { field: "gsi2sk", composite: ["projectId", "taskId"] },
     },
   },
   timestamps: true,
@@ -246,10 +244,9 @@ const SubProjectMembers = Entity.make({
   indexes: {
     assignments: {
       collection: "assignments",
-      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-      type: "clustered",
-      composite: ["employeeId"],
-      sk: ["projectId"],
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["employeeId"] },
+      sk: { field: "gsi2sk", composite: ["projectId"] },
     },
   },
   timestamps: true,

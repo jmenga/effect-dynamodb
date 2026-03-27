@@ -1,3 +1,4 @@
+import type { WhereCondition } from "./OperationDetector"
 import type {
   Casing,
   IndexDefinition,
@@ -43,7 +44,9 @@ export function buildParams(op: DetectedOperation): DynamoDBParams | undefined {
     case "scan":
       return entity ? buildScanParams(entity) : undefined
     case "entity-query-accessor":
-      return buildEntityAccessorParams(op.entity, op.collection, op.collectionName, op.arguments)
+      return op.collection
+        ? buildEntityAccessorParams(op.entity, op.collection, op.collectionName, op.arguments)
+        : buildEntityIndexAccessorParams(op.entity, op.indexName, op.arguments, op.whereCondition)
     case "collection-accessor":
       return buildCollectionAccessorParams(op.collection, op.collectionName, op.arguments)
     case "bound-query-terminal":
@@ -551,6 +554,144 @@ function buildEntityAccessorParams(
   }
 }
 
+function buildEntityIndexAccessorParams(
+  entity: ResolvedEntity | undefined,
+  indexName: string | undefined,
+  args: Record<string, unknown> | undefined,
+  whereCondition?: WhereCondition | undefined,
+): DynamoDBParams {
+  if (!entity || !indexName) {
+    return {
+      command: "QueryCommand",
+      TableName: "<table>",
+      entityType: entity?.entityType ?? "unknown",
+      info: `Query accessor '${indexName ?? "unknown"}'`,
+    }
+  }
+
+  const indexDef = entity.indexes[indexName]
+  if (!indexDef) {
+    return {
+      command: "QueryCommand",
+      TableName: "<table>",
+      entityType: entity.entityType,
+      info: `Query accessor '${indexName}' (index not found)`,
+    }
+  }
+
+  const pkComposites = indexDef.pk.composite.join(", ")
+  const skComposites = indexDef.sk.composite.join(", ")
+
+  const info = [
+    `Query accessor '${indexName}'`,
+    `  Index: ${indexDef.index ?? "primary"} (isolated)`,
+    `  PK: ${pkComposites} (required)`,
+    skComposites ? `  SK: ${skComposites} (optional begins_with)` : undefined,
+    `  Returns: BoundQuery<${entity.entityType}>`,
+  ]
+    .filter(Boolean)
+    .join("\n")
+
+  // Build actual query params if we have arguments
+  if (args && entity.schema) {
+    const pkValue = composePkValue(entity.schema, entity.entityType, indexDef, args)
+    const names: Record<string, string> = { "#pk": indexDef.pk.field }
+    const values: Record<string, string> = { ":pk": pkValue }
+    let keyCondition = "#pk = :pk"
+
+    // Merge .where() condition value into args for SK composition
+    const mergedArgs = whereCondition
+      ? { ...args, [whereCondition.field]: whereCondition.value }
+      : args
+
+    // Add SK condition only if SK composites are actually provided
+    const hasSkComposites =
+      indexDef.sk.composite.length > 0 &&
+      indexDef.sk.composite.some((attr) => mergedArgs[attr] !== undefined)
+
+    if (hasSkComposites) {
+      const allSkProvided = indexDef.sk.composite.every((attr) => mergedArgs[attr] !== undefined)
+
+      if (allSkProvided && !whereCondition) {
+        // All SK composites provided in query input → exact match
+        const skValue = composeSkValue(entity.schema, entity.entityType, indexDef, mergedArgs)
+        names["#sk"] = indexDef.sk.field
+        values[":sk"] = skValue
+        keyCondition += " AND #sk = :sk"
+      } else {
+        // Partial or .where() with range condition → use appropriate SK condition
+        const skPrefix = composeSkPrefixValue(entity.schema, entity.entityType, indexDef, mergedArgs)
+        if (skPrefix) {
+          names["#sk"] = indexDef.sk.field
+          if (whereCondition) {
+            // Use the .where() operator on the composed prefix
+            switch (whereCondition.op) {
+              case "beginsWith":
+                values[":skPrefix"] = skPrefix
+                keyCondition += " AND begins_with(#sk, :skPrefix)"
+                break
+              case "eq":
+                values[":sk"] = skPrefix
+                keyCondition += " AND #sk = :sk"
+                break
+              case "gt":
+                values[":sk"] = skPrefix
+                keyCondition += " AND #sk > :sk"
+                break
+              case "gte":
+                values[":sk"] = skPrefix
+                keyCondition += " AND #sk >= :sk"
+                break
+              case "lt":
+                values[":sk"] = skPrefix
+                keyCondition += " AND #sk < :sk"
+                break
+              case "lte":
+                values[":sk"] = skPrefix
+                keyCondition += " AND #sk <= :sk"
+                break
+              case "between": {
+                const skPrefix2 = whereCondition.value2
+                  ? composeSkPrefixValue(entity.schema, entity.entityType, indexDef, {
+                      ...args,
+                      [whereCondition.field]: whereCondition.value2,
+                    })
+                  : skPrefix
+                values[":skLow"] = skPrefix
+                values[":skHigh"] = skPrefix2 ?? skPrefix
+                keyCondition += " AND #sk BETWEEN :skLow AND :skHigh"
+                break
+              }
+            }
+          } else {
+            values[":skPrefix"] = skPrefix
+            keyCondition += " AND begins_with(#sk, :skPrefix)"
+          }
+        }
+      }
+    }
+
+    return {
+      command: "QueryCommand",
+      TableName: "<table>",
+      IndexName: indexDef.index,
+      KeyConditionExpression: keyCondition,
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
+      entityType: entity.entityType,
+      info,
+    }
+  }
+
+  return {
+    command: "QueryCommand",
+    TableName: "<table>",
+    IndexName: indexDef.index,
+    entityType: entity.entityType,
+    info,
+  }
+}
+
 function buildCollectionAccessorParams(
   collection: ResolvedCollection | undefined,
   collectionName: string | undefined,
@@ -596,14 +737,30 @@ function buildBoundQueryTerminalParams(op: DetectedOperation): DynamoDBParams {
   }
 
   const desc = terminalDescriptions[op.terminalName ?? ""] ?? op.terminalName ?? "unknown"
-  const entityType = op.entity?.entityType ?? op.collection?.collectionName ?? "unknown"
+  const terminalInfo = `BoundQuery terminal: .${op.terminalName}()\n  ${desc}`
 
+  // Build the root query params (without info text)
+  const rootParams = op.collection
+    ? buildEntityAccessorParams(op.entity, op.collection, op.collectionName, op.arguments)
+    : op.entity && op.indexName
+      ? buildEntityIndexAccessorParams(op.entity, op.indexName, op.arguments, op.whereCondition)
+      : undefined
+
+  if (rootParams) {
+    return {
+      ...rootParams,
+      command: op.terminalName === "count" ? "QueryCommand (SELECT: COUNT)" : rootParams.command,
+      info: undefined,
+    }
+  }
+
+  const entityType = op.entity?.entityType ?? op.collection?.collectionName ?? "unknown"
   return {
     command: op.terminalName === "count" ? "QueryCommand (SELECT: COUNT)" : "QueryCommand",
     TableName: "<table>",
     IndexName: op.collection?.index,
     entityType,
-    info: `BoundQuery terminal: .${op.terminalName}()\n  ${desc}`,
+    info: terminalInfo,
   }
 }
 

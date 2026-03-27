@@ -55,9 +55,9 @@ const Vehicles = Entity.make({
   },
   indexes: {
     vehiclesByCell: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["parentCell", "timePartition"],
-      sk: ["cell"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["parentCell", "timePartition"] },
+      sk: { field: "gsi1sk", composite: ["cell"] },
     },
   },
   timestamps: true,

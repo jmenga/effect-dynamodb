@@ -48,9 +48,9 @@ const UserEntity = Entity.make({
   },
   indexes: {
     byRole: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["role"],
-      sk: ["userId"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["role"] },
+      sk: { field: "gsi1sk", composite: ["userId"] },
     },
   },
 })
@@ -64,9 +64,9 @@ const OrderEntity = Entity.make({
   },
   indexes: {
     byUser: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["userId"],
-      sk: ["orderId"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["userId"] },
+      sk: { field: "gsi1sk", composite: ["orderId"] },
     },
   },
 })
@@ -414,10 +414,10 @@ describe("Integration: 2-Entity Single-Table", () => {
       // Verify composed keys in store
       const putCall = mockPutItem.mock.calls[0]![0]
       const storedItem = fromAttributeMap(putCall.Item)
-      expect(storedItem.pk).toBe("$myapp#v1#user#u-1")
+      expect(storedItem.pk).toBe("$myapp#v1#user#userid_u-1")
       expect(storedItem.sk).toBe("$myapp#v1#user")
-      expect(storedItem.gsi1pk).toBe("$myapp#v1#user#admin")
-      expect(storedItem.gsi1sk).toBe("$myapp#v1#user#u-1")
+      expect(storedItem.gsi1pk).toBe("$myapp#v1#user#role_admin")
+      expect(storedItem.gsi1sk).toBe("$myapp#v1#user#userid_u-1")
       expect(storedItem.__edd_e__).toBe("User")
 
       // GET
@@ -450,10 +450,10 @@ describe("Integration: 2-Entity Single-Table", () => {
       // Verify composed keys
       const putCall = mockPutItem.mock.calls[0]![0]
       const storedItem = fromAttributeMap(putCall.Item)
-      expect(storedItem.pk).toBe("$myapp#v1#order#ord-1")
+      expect(storedItem.pk).toBe("$myapp#v1#order#orderid_ord-1")
       expect(storedItem.sk).toBe("$myapp#v1#order")
-      expect(storedItem.gsi1pk).toBe("$myapp#v1#order#u-1")
-      expect(storedItem.gsi1sk).toBe("$myapp#v1#order#ord-1")
+      expect(storedItem.gsi1pk).toBe("$myapp#v1#order#userid_u-1")
+      expect(storedItem.gsi1sk).toBe("$myapp#v1#order#orderid_ord-1")
       expect(storedItem.__edd_e__).toBe("Order")
 
       // GET
@@ -605,12 +605,12 @@ describe("Integration: 2-Entity Single-Table", () => {
       const item = fromAttributeMap(putCall.Item)
 
       // Primary key
-      expect(item.pk).toBe("$myapp#v1#user#u-42")
+      expect(item.pk).toBe("$myapp#v1#user#userid_u-42")
       expect(item.sk).toBe("$myapp#v1#user")
 
       // GSI key (byRole: pk=role, sk=userId)
-      expect(item.gsi1pk).toBe("$myapp#v1#user#member")
-      expect(item.gsi1sk).toBe("$myapp#v1#user#u-42")
+      expect(item.gsi1pk).toBe("$myapp#v1#user#role_member")
+      expect(item.gsi1sk).toBe("$myapp#v1#user#userid_u-42")
 
       // Entity type discriminator
       expect(item.__edd_e__).toBe("User")
@@ -631,7 +631,7 @@ describe("Integration: 2-Entity Single-Table", () => {
 
       const getCall = mockGetItem.mock.calls[0]![0]
       expect(getCall.TableName).toBe("test-table")
-      expect(getCall.Key.pk.S).toBe("$myapp#v1#user#u-1")
+      expect(getCall.Key.pk.S).toBe("$myapp#v1#user#userid_u-1")
       expect(getCall.Key.sk.S).toBe("$myapp#v1#user")
     }).pipe(Effect.provide(TestLayer)),
   )
@@ -649,7 +649,7 @@ describe("Integration: 2-Entity Single-Table", () => {
 
       const deleteCall = mockDeleteItem.mock.calls[0]![0]
       expect(deleteCall.TableName).toBe("test-table")
-      expect(deleteCall.Key.pk.S).toBe("$myapp#v1#user#u-1")
+      expect(deleteCall.Key.pk.S).toBe("$myapp#v1#user#userid_u-1")
       expect(deleteCall.Key.sk.S).toBe("$myapp#v1#user")
     }).pipe(Effect.provide(TestLayer)),
   )

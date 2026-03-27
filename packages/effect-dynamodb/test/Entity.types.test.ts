@@ -8,6 +8,7 @@ import { describe, expect, expectTypeOf, it } from "vitest"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
+import type { IndexPkInput } from "../src/internal/EntityTypes.js"
 import * as Table from "../src/Table.js"
 
 // ---------------------------------------------------------------------------
@@ -33,9 +34,9 @@ const UserEntity = Entity.make({
   },
   indexes: {
     byRole: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["role"],
-      sk: ["userId"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["role"] },
+      sk: { field: "gsi1sk", composite: ["userId"] },
     },
   },
 })
@@ -625,12 +626,32 @@ describe("Entity type extractors", () => {
         },
         indexes: {
           byBogus: {
-            index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-            composite: ["bogus"],
-            sk: [],
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["bogus"] },
+            sk: { field: "gsi1sk", composite: [] },
           },
         },
       }),
     ).toThrow()
+  })
+
+  // -------------------------------------------------------------------------
+  // IndexPkInput — query accessor input type tests
+  // -------------------------------------------------------------------------
+
+  it("IndexPkInput requires PK composites, SK composites optional", () => {
+    type ByRoleInput = IndexPkInput<typeof User, typeof UserEntity.indexes, "byRole">
+
+    // PK only
+    const pkOnly: ByRoleInput = { role: "admin" }
+    expect(pkOnly.role).toBe("admin")
+
+    // PK + optional SK
+    const pkAndSk: ByRoleInput = { role: "admin", userId: "u1" }
+    expect(pkAndSk.role).toBe("admin")
+
+    // Excess property rejected at compile time
+    // @ts-expect-error — bogus is not a valid composite attribute
+    const _excess: ByRoleInput = { role: "admin", bogus: "x" }
   })
 })

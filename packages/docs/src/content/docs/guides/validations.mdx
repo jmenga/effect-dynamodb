@@ -1,0 +1,188 @@
+---
+title: "Validations"
+description: "Compile-time and runtime validation rules with structured error codes"
+---
+
+effect-dynamodb validates entity definitions, index configurations, and query inputs at multiple levels. Each validation has a structured error code (`EDD-XXXX`) for programmatic handling.
+
+## Validation Summary
+
+| Code | Rule | Level | Description |
+|------|------|-------|-------------|
+| EDD-9001 | Empty primary key | Compile + Runtime | Primary key must have at least one composite attribute in pk or sk |
+| EDD-9002 | Unknown composite attribute | Compile + Runtime | Composite attribute references a field not in the model |
+| EDD-9003 | Invalid GSI format | Compile + Runtime | GSI `index` must be `{ name, pk, sk }` object, not a string |
+| EDD-9004 | SK prefix violation | Compile + Runtime | Sort key composites must follow prefix ordering |
+| EDD-9005 | SK composite in filter | Compile | Sort key composite used in `.filter()` instead of query input |
+| EDD-9006 | Unknown query property | Compile + Runtime | Query input contains a property that is not a composite attribute |
+
+**Compile** = Detected by the Language Service Plugin (IDE squiggles before running code)
+**Runtime** = Detected when the code executes (throws `Error` or `ValidationError`)
+
+---
+
+## Entity Definition Validations
+
+### EDD-9001: Empty Primary Key
+
+The primary key must have at least one composite attribute across `pk` and `sk`.
+
+```typescript
+// ❌ Error: primary key must have at least one composite attribute
+const BadEntity = Entity.make({
+  model: User,
+  entityType: "User",
+  primaryKey: {
+    pk: { field: "pk", composite: [] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+```
+
+**Fix:** Add at least one composite attribute to `pk` or `sk`:
+
+```typescript
+// ✅ Correct
+primaryKey: {
+  pk: { field: "pk", composite: ["userId"] },
+  sk: { field: "sk", composite: [] },
+}
+```
+
+### EDD-9002: Unknown Composite Attribute
+
+All composite attributes must exist as fields on the model.
+
+```typescript
+class User extends Schema.Class<User>("User")({
+  userId: Schema.String,
+  name: Schema.String,
+}) {}
+
+// ❌ Error: references unknown attribute "email"
+const Users = Entity.make({
+  model: User,
+  entityType: "User",
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byEmail: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["email"] },  // Not in User model
+      sk: { field: "gsi1sk", composite: [] },
+    },
+  },
+})
+```
+
+**Fix:** Use field names that exist on the model, or add the field to the model.
+
+### EDD-9003: Invalid GSI Format
+
+GSI indexes must use the new format with `name`, `pk: { field, composite }`, and `sk: { field, composite }`.
+
+```typescript
+// ❌ Error: old format with nested index object
+indexes: {
+  byEmail: {
+    index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+    composite: ["email"],
+    sk: [],
+  },
+}
+
+// ✅ Correct
+indexes: {
+  byEmail: {
+    name: "gsi1",
+    pk: { field: "gsi1pk", composite: ["email"] },
+    sk: { field: "gsi1sk", composite: [] },
+  },
+}
+```
+
+---
+
+## Query Validations
+
+### EDD-9004: SK Prefix Violation
+
+Sort key composites must be provided in order. If your SK is `["status", "title"]`, you can provide:
+- `{}` (no SK composites)
+- `{ status }` (first composite only)
+- `{ status, title }` (both composites)
+
+But not `{ title }` (skipping `status`).
+
+```typescript
+const Tasks = Entity.make({
+  // ...
+  indexes: {
+    byProject: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["projectId"] },
+      sk: { field: "gsi1sk", composite: ["status", "title"] },
+    },
+  },
+})
+
+// ❌ Error: "title" requires prior composite "status"
+db.entities.Tasks.byProject({ projectId: "p-1", title: "hello" })
+
+// ✅ Correct — provide composites in order
+db.entities.Tasks.byProject({ projectId: "p-1", status: "active", title: "hello" })
+db.entities.Tasks.byProject({ projectId: "p-1", status: "active" })
+db.entities.Tasks.byProject({ projectId: "p-1" })
+```
+
+### EDD-9005: SK Composite in Filter
+
+When a sort key composite is used in `.filter()` instead of the query input, DynamoDB reads all items matching the PK and then filters client-side. Moving the composite to the query input uses `KeyConditionExpression` for server-side filtering, which is more efficient.
+
+```typescript
+// ⚠️ Warning: "status" is an SK composite — use in query input
+db.entities.Tasks
+  .byProject({ projectId: "p-1" })
+  .filter({ status: "active" })  // Post-read filter (reads ALL items first)
+  .collect()
+
+// ✅ Efficient — SK composite in query input
+db.entities.Tasks
+  .byProject({ projectId: "p-1", status: "active" })  // Key condition (server-side)
+  .collect()
+```
+
+### EDD-9006: Unknown Query Property
+
+Query inputs can only contain composite attributes defined on the index.
+
+```typescript
+// ❌ Error: "bogus" is not a composite attribute for "byProject"
+db.entities.Tasks.byProject({ projectId: "p-1", bogus: "x" })
+
+// Valid attributes for byProject: projectId (PK), status (SK)
+```
+
+---
+
+## Language Service Plugin
+
+The [Language Service Plugin](/effect-dynamodb/getting-started/#language-service-plugin) reports EDD diagnostics as IDE errors and warnings. Install it to get real-time validation as you type:
+
+```bash
+pnpm add -D @effect-dynamodb/language-service
+```
+
+```json
+{
+  "compilerOptions": {
+    "plugins": [{ "name": "@effect-dynamodb/language-service" }]
+  }
+}
+```
+
+Diagnostics appear as:
+- **Errors** (red squiggles): EDD-9001, EDD-9002, EDD-9003, EDD-9004, EDD-9006
+- **Warnings** (yellow squiggles): EDD-9005

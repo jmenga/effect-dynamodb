@@ -51,9 +51,9 @@ const Products = Entity.make({
   },
   indexes: {
     byCategory: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["category"],
-      sk: ["productId"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["category"] },
+      sk: { field: "gsi1sk", composite: ["productId"] },
     },
   },
   timestamps: true,

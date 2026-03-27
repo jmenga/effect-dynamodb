@@ -69,9 +69,9 @@ const Users = Entity.make({
   },
   indexes: {
     byEmail: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["email"],
-      sk: [],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["email"] },
+      sk: { field: "gsi1sk", composite: [] },
     },
   },
   unique: { email: ["email"] },
@@ -88,9 +88,9 @@ const Tasks = Entity.make({
   },
   indexes: {
     byUser: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["userId"],
-      sk: ["status"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["userId"] },
+      sk: { field: "gsi1sk", composite: ["status"] },
     },
   },
   timestamps: true,

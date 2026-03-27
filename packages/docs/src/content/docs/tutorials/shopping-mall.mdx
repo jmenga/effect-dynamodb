@@ -87,14 +87,14 @@ const MallStores = Entity.make({
   },
   indexes: {
     byMall: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["mallId"],
-      sk: ["buildingId", "unitId"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["mallId"] },
+      sk: { field: "gsi1sk", composite: ["buildingId", "unitId"] },
     },
     byStore: {
-      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-      composite: ["storeId"],
-      sk: ["leaseEndDate"],
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["storeId"] },
+      sk: { field: "gsi2sk", composite: ["leaseEndDate"] },
     },
   },
   timestamps: true,

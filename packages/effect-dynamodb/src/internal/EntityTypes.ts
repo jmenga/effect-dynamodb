@@ -130,12 +130,19 @@ export type IndexPkComposites<TIndexes, K extends keyof TIndexes> = TIndexes[K] 
   ? PKC[number]
   : never
 
-/** Extract sk composite names for a specific index */
+/** Extract sk composite names (union) for a specific index */
 export type IndexSkComposites<TIndexes, K extends keyof TIndexes> = TIndexes[K] extends {
   readonly sk: { readonly composite: infer SKC extends ReadonlyArray<string> }
 }
   ? SKC[number]
   : never
+
+/** Pick SK composite fields from the model with their actual types. */
+export type IndexSkFields<
+  TModel extends Schema.Top,
+  TIndexes,
+  K extends keyof TIndexes,
+> = Pick<ModelType<TModel>, IndexSkComposites<TIndexes, K> & keyof ModelType<TModel>>
 
 /**
  * Widen string literal types to include their lowercase variants.
@@ -148,18 +155,26 @@ type CaseInsensitive<T> = T extends string ? T | Lowercase<T> : T
 /** Apply CaseInsensitive to all properties of an object type */
 type CaseInsensitiveProps<T> = { [K in keyof T]: CaseInsensitive<T[K]> }
 
-/** Compute the typed query input for a specific index: PK composites required, SK composites optional.
- * String literal types are widened to include lowercase variants since the key composer
- * applies casing to composite values. */
+/** Flatten an intersection into a plain object type for clean IDE hover display */
+type Simplify<T> = { [K in keyof T]: T[K] } & {}
+
+/**
+ * Compute the typed query input for a specific index.
+ * PK composites are required. SK composites are optional.
+ * SK prefix ordering is enforced at runtime.
+ * String literal types are widened to include lowercase variants.
+ */
 export type IndexPkInput<
   TModel extends Schema.Top,
   TIndexes,
   K extends keyof TIndexes,
-> = CaseInsensitiveProps<
-  Pick<ModelType<TModel>, IndexPkComposites<TIndexes, K> & keyof ModelType<TModel>>
-> &
-  Partial<
-    CaseInsensitiveProps<
-      Pick<ModelType<TModel>, IndexSkComposites<TIndexes, K> & keyof ModelType<TModel>>
+> = Simplify<
+  CaseInsensitiveProps<
+    Pick<ModelType<TModel>, IndexPkComposites<TIndexes, K> & keyof ModelType<TModel>>
+  > &
+    Partial<
+      CaseInsensitiveProps<
+        Pick<ModelType<TModel>, IndexSkComposites<TIndexes, K> & keyof ModelType<TModel>>
+      >
     >
-  >
+>

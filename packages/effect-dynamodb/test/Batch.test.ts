@@ -47,9 +47,9 @@ const OrderEntity = Entity.make({
   },
   indexes: {
     byUser: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["userId"],
-      sk: ["orderId"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["userId"] },
+      sk: { field: "gsi1sk", composite: ["orderId"] },
     },
   },
 })
@@ -101,7 +101,7 @@ describe("Batch", () => {
           email: "alice@example.com",
           name: "Alice",
           role: "admin",
-          pk: "$myapp#v1#user#u-1",
+          pk: "$myapp#v1#user#userid_u-1",
           sk: "$myapp#v1#user",
           __edd_e__: "User",
         })
@@ -111,7 +111,7 @@ describe("Batch", () => {
           product: "Widget",
           quantity: 3,
           status: "pending",
-          pk: "$myapp#v1#order#ord-1",
+          pk: "$myapp#v1#order#orderid_ord-1",
           sk: "$myapp#v1#order",
           __edd_e__: "Order",
         })
@@ -169,7 +169,7 @@ describe("Batch", () => {
           email: "bob@example.com",
           name: "Bob",
           role: "member",
-          pk: "$myapp#v1#user#u-2",
+          pk: "$myapp#v1#user#userid_u-2",
           sk: "$myapp#v1#user",
           __edd_e__: "User",
         })
@@ -178,7 +178,7 @@ describe("Batch", () => {
           email: "alice@example.com",
           name: "Alice",
           role: "admin",
-          pk: "$myapp#v1#user#u-1",
+          pk: "$myapp#v1#user#userid_u-1",
           sk: "$myapp#v1#user",
           __edd_e__: "User",
         })
@@ -206,7 +206,7 @@ describe("Batch", () => {
     it.effect("retries unprocessed keys", () =>
       Effect.gen(function* () {
         const userKey = toAttributeMap({
-          pk: "$myapp#v1#user#u-1",
+          pk: "$myapp#v1#user#userid_u-1",
           sk: "$myapp#v1#user",
         })
         const userItem = toAttributeMap({
@@ -214,7 +214,7 @@ describe("Batch", () => {
           email: "alice@example.com",
           name: "Alice",
           role: "admin",
-          pk: "$myapp#v1#user#u-1",
+          pk: "$myapp#v1#user#userid_u-1",
           sk: "$myapp#v1#user",
           __edd_e__: "User",
         })
@@ -287,7 +287,7 @@ describe("Batch", () => {
           email: "alice@example.com",
           name: "Alice",
           role: "invalid-role", // not "admin" or "member"
-          pk: "$myapp#v1#user#u-1",
+          pk: "$myapp#v1#user#userid_u-1",
           sk: "$myapp#v1#user",
           __edd_e__: "User",
         })
@@ -332,11 +332,11 @@ describe("Batch", () => {
 
         // Verify items have correct keys and discriminator
         const userItem = fromAttributeMap(call.RequestItems["test-table"][0].PutRequest.Item)
-        expect(userItem.pk).toBe("$myapp#v1#user#u-1")
+        expect(userItem.pk).toBe("$myapp#v1#user#userid_u-1")
         expect(userItem.__edd_e__).toBe("User")
 
         const orderItem = fromAttributeMap(call.RequestItems["test-table"][1].PutRequest.Item)
-        expect(orderItem.pk).toBe("$myapp#v1#order#ord-1")
+        expect(orderItem.pk).toBe("$myapp#v1#order#orderid_ord-1")
         expect(orderItem.__edd_e__).toBe("Order")
       }).pipe(Effect.provide(TestLayer)),
     )
@@ -357,7 +357,7 @@ describe("Batch", () => {
         expect(call.RequestItems["test-table"][1].DeleteRequest).toBeDefined()
 
         const deleteKey = fromAttributeMap(call.RequestItems["test-table"][0].DeleteRequest.Key)
-        expect(deleteKey.pk).toBe("$myapp#v1#user#u-1")
+        expect(deleteKey.pk).toBe("$myapp#v1#user#userid_u-1")
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -396,7 +396,7 @@ describe("Batch", () => {
           email: "alice@example.com",
           name: "Alice",
           role: "admin",
-          pk: "$myapp#v1#user#u-1",
+          pk: "$myapp#v1#user#userid_u-1",
           sk: "$myapp#v1#user",
           __edd_e__: "User",
         })
@@ -483,7 +483,7 @@ describe("Batch", () => {
           email: "alice@example.com",
           name: "Alice",
           role: "admin",
-          pk: "$myapp#v1#user#u-1",
+          pk: "$myapp#v1#user#userid_u-1",
           sk: "$myapp#v1#user",
           __edd_e__: "User",
         })
@@ -577,7 +577,7 @@ describe("Batch", () => {
             "test-table": [
               {
                 DeleteRequest: {
-                  Key: toAttributeMap({ pk: "$myapp#v1#user#u-1", sk: "$myapp#v1#user" }),
+                  Key: toAttributeMap({ pk: "$myapp#v1#user#userid_u-1", sk: "$myapp#v1#user" }),
                 },
               },
             ],
@@ -602,7 +602,7 @@ describe("Batch", () => {
           email: "alice@example.com",
           name: "Alice",
           role: "admin",
-          pk: "$myapp#v1#user#u-1",
+          pk: "$myapp#v1#user#userid_u-1",
           sk: "$myapp#v1#user",
           __edd_e__: "User",
         })
@@ -664,9 +664,9 @@ describe("Batch", () => {
           },
           indexes: {
             byTenant: {
-              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-              composite: ["tenantId"],
-              sk: [],
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["tenantId"] },
+              sk: { field: "gsi1sk", composite: [] },
             },
           },
         })
@@ -678,7 +678,7 @@ describe("Batch", () => {
 
         const call = mockBatchWriteItem.mock.calls[0]![0]
         const item = fromAttributeMap(call.RequestItems["test-table"][0].PutRequest.Item)
-        expect(item.pk).toBe("$myapp#v1#sparseitem#i-1")
+        expect(item.pk).toBe("$myapp#v1#sparseitem#itemid_i-1")
         expect(item.__edd_e__).toBe("SparseItem")
         expect(item.gsi1pk).toBeUndefined()
         expect(item.gsi1sk).toBeUndefined()

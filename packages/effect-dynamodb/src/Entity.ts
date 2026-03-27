@@ -631,24 +631,34 @@ export interface Entity<
  * }) {}
  * ```
  */
+/** Combinator that transforms a put/create/upsert operation. */
+export type PutCombinator<M> = (op: EntityPut<M, any, any, any>) => EntityPut<M, any, any, any>
+
+/** Combinator that transforms an update/patch operation. */
+export type UpdateCombinator<M> = (
+  op: EntityUpdate<M, any, any, any, any>,
+) => EntityUpdate<M, any, any, any, any>
+
+/** Combinator that transforms a delete operation. */
+export type DeleteCombinator = (op: EntityDelete<any, any>) => EntityDelete<any, any>
+
 export interface BoundEntity<
   TModel extends Schema.Top,
   TIndexes extends globalThis.Record<string, IndexDefinition>,
   TRefs extends globalThis.Record<string, AnyRefValue> | undefined,
+  TKey = EntityKeyType<TModel, TIndexes>,
 > {
   // --- CRUD Operations ---
 
   /** Fetch an item by primary key. Returns an Effect that resolves to the model type. */
   readonly get: (
-    key: EntityKeyType<TModel, TIndexes>,
+    key: TKey,
   ) => Effect.Effect<ModelType<TModel>, ItemNotFound | DynamoClientError | ValidationError, never>
 
   /** Create or replace an item. Accepts optional combinators (e.g. `Entity.condition(...)`). */
   readonly put: (
     input: EntityRefInputType<TModel, TRefs>,
-    ...combinators: ReadonlyArray<
-      (op: EntityPut<any, any, any, any>) => EntityPut<any, any, any, any>
-    >
+    ...combinators: ReadonlyArray<PutCombinator<ModelType<TModel>>>
   ) => Effect.Effect<
     ModelType<TModel>,
     DynamoClientError | ValidationError | UniqueConstraintViolation | RefErrors<TRefs>,
@@ -658,9 +668,7 @@ export interface BoundEntity<
   /** Create a new item. Fails if primary key already exists. Accepts optional combinators. */
   readonly create: (
     input: EntityRefInputType<TModel, TRefs>,
-    ...combinators: ReadonlyArray<
-      (op: EntityPut<any, any, any, any>) => EntityPut<any, any, any, any>
-    >
+    ...combinators: ReadonlyArray<PutCombinator<ModelType<TModel>>>
   ) => Effect.Effect<
     ModelType<TModel>,
     | DynamoClientError
@@ -679,10 +687,8 @@ export interface BoundEntity<
    * ```
    */
   readonly update: (
-    key: EntityKeyType<TModel, TIndexes>,
-    ...combinators: ReadonlyArray<
-      (op: EntityUpdate<any, any, any, any, any>) => EntityUpdate<any, any, any, any, any>
-    >
+    key: TKey,
+    ...combinators: ReadonlyArray<UpdateCombinator<ModelType<TModel>>>
   ) => Effect.Effect<
     ModelType<TModel>,
     | DynamoClientError
@@ -696,8 +702,8 @@ export interface BoundEntity<
 
   /** Delete an item by primary key. Accepts optional combinators (e.g. `Entity.condition(...)`). */
   readonly delete: (
-    key: EntityKeyType<TModel, TIndexes>,
-    ...combinators: ReadonlyArray<(op: EntityDelete<any, any>) => EntityDelete<any, any>>
+    key: TKey,
+    ...combinators: ReadonlyArray<DeleteCombinator>
   ) => Effect.Effect<void, DynamoClientError | ItemNotFound, never>
 
   /**
@@ -707,9 +713,7 @@ export interface BoundEntity<
    */
   readonly upsert: (
     input: EntityRefInputType<TModel, TRefs>,
-    ...combinators: ReadonlyArray<
-      (op: EntityPut<any, any, any, any>) => EntityPut<any, any, any, any>
-    >
+    ...combinators: ReadonlyArray<PutCombinator<ModelType<TModel>>>
   ) => Effect.Effect<
     ModelType<TModel>,
     DynamoClientError | ValidationError | ItemNotFound | ConditionalCheckFailed | RefErrors<TRefs>,
@@ -725,10 +729,8 @@ export interface BoundEntity<
    * ```
    */
   readonly patch: (
-    key: EntityKeyType<TModel, TIndexes>,
-    ...combinators: ReadonlyArray<
-      (op: EntityUpdate<any, any, any, any, any>) => EntityUpdate<any, any, any, any, any>
-    >
+    key: TKey,
+    ...combinators: ReadonlyArray<UpdateCombinator<ModelType<TModel>>>
   ) => Effect.Effect<
     ModelType<TModel>,
     | DynamoClientError
@@ -743,21 +745,21 @@ export interface BoundEntity<
 
   /** Delete an existing item, fails if not found. Accepts optional combinators. */
   readonly deleteIfExists: (
-    key: EntityKeyType<TModel, TIndexes>,
-    ...combinators: ReadonlyArray<(op: EntityDelete<any, any>) => EntityDelete<any, any>>
+    key: TKey,
+    ...combinators: ReadonlyArray<DeleteCombinator>
   ) => Effect.Effect<void, DynamoClientError | ItemNotFound | ConditionalCheckFailed, never>
 
   // --- Lifecycle Operations ---
 
   /** Fetch a specific version snapshot by version number. */
   readonly getVersion: (
-    key: EntityKeyType<TModel, TIndexes>,
+    key: TKey,
     version: number,
   ) => Effect.Effect<ModelType<TModel>, ItemNotFound | DynamoClientError | ValidationError, never>
 
   /** Restore a soft-deleted item. */
   readonly restore: (
-    key: EntityKeyType<TModel, TIndexes>,
+    key: TKey,
   ) => Effect.Effect<
     ModelType<TModel>,
     ItemNotFound | DynamoClientError | ValidationError | UniqueConstraintViolation,
@@ -766,14 +768,14 @@ export interface BoundEntity<
 
   /** Permanently remove an item plus all version history and sentinels. */
   readonly purge: (
-    key: EntityKeyType<TModel, TIndexes>,
+    key: TKey,
   ) => Effect.Effect<void, DynamoClientError | ValidationError, never>
 
   /** Soft-deleted item accessors. */
   readonly deleted: {
     /** Get a specific soft-deleted item. */
     readonly get: (
-      key: EntityKeyType<TModel, TIndexes>,
+      key: TKey,
     ) => Effect.Effect<ModelType<TModel>, ItemNotFound | DynamoClientError | ValidationError, never>
   }
 
@@ -944,6 +946,8 @@ type NormalizedIndexes<
   : { readonly primary: TPrimaryKey } & {
       readonly [K in keyof TGsiIndexes & string]: IndexDefinition & {
         readonly collection: TGsiIndexes[K]["collection"]
+        readonly pk: { readonly composite: TGsiIndexes[K]["pk"]["composite"] }
+        readonly sk: { readonly composite: TGsiIndexes[K]["sk"]["composite"] }
       }
     }
 
@@ -972,15 +976,15 @@ type PrimaryKeyDef = IndexDefinition &
  *   },
  *   indexes: {
  *     byProject: {
- *       index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
- *       composite: ["projectId"],
- *       sk: ["status"],
+ *       name: "gsi1",
+ *       pk: { field: "gsi1pk", composite: ["projectId"] },
+ *       sk: { field: "gsi1sk", composite: ["status"] },
  *     },
  *     assigned: {
  *       collection: "assignments",
- *       index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
- *       composite: ["employee"],
- *       sk: ["project"],
+ *       name: "gsi2",
+ *       pk: { field: "gsi2pk", composite: ["employee"] },
+ *       sk: { field: "gsi2sk", composite: ["project"] },
  *     },
  *   },
  * })
@@ -1083,7 +1087,7 @@ const makeImpl = <
   const primaryIndex = config.indexes.primary
   if (primaryIndex.pk.composite.length === 0 && primaryIndex.sk.composite.length === 0) {
     throw new Error(
-      `Entity "${config.entityType}": primary index must have at least one composite attribute across pk and sk`,
+      `[EDD-9001] Entity "${config.entityType}": primary key must have at least one composite attribute in pk or sk`,
     )
   }
 
@@ -1099,7 +1103,7 @@ const makeImpl = <
     for (const attr of [...indexDef.pk.composite, ...indexDef.sk.composite]) {
       if (!validCompositeFields.has(attr)) {
         throw new Error(
-          `Entity "${config.entityType}": index "${indexName}" references unknown attribute "${attr}". ` +
+          `[EDD-9002] Entity "${config.entityType}": index "${indexName}" references unknown attribute "${attr}". ` +
             `Valid attributes: ${[...validCompositeFields].sort().join(", ")}`,
         )
       }

@@ -14,12 +14,20 @@ export type OperationType =
   | "bound-query-terminal"
   | "table-accessor"
 
+export interface WhereCondition {
+  readonly op: "eq" | "lt" | "lte" | "gt" | "gte" | "beginsWith" | "between"
+  readonly field: string
+  readonly value: string
+  readonly value2?: string // for between
+}
+
 export interface DetectedOperation {
   readonly entity?: ResolvedEntity | undefined
   readonly type: OperationType
   readonly indexName?: string | undefined
   readonly arguments?: Record<string, unknown> | undefined
   readonly updateCombinators?: UpdateCombinators | undefined
+  readonly whereCondition?: WhereCondition | undefined
   // v2 fields
   readonly collection?: ResolvedCollection | undefined
   readonly collectionName?: string | undefined
@@ -91,8 +99,6 @@ function tryDetectV2Pattern(
   entities: ReadonlyArray<ResolvedEntity>,
   collections: ReadonlyArray<ResolvedCollection>,
 ): DetectedOperation | undefined {
-  if (collections.length === 0) return undefined
-
   // Only process call expressions and property access expressions
   if (!ts.isCallExpression(node) && !ts.isPropertyAccessExpression(node)) return undefined
 
@@ -144,6 +150,19 @@ function tryDetectV2Pattern(
           callNode.arguments.length > 0 ? extractCallArgs(ts, callNode.arguments[0]!) : undefined
         const updateCombs = opType === "update" ? extractUpdateCombinators(ts, callNode) : undefined
         return { entity, type: opType, arguments: args, updateCombinators: updateCombs }
+      }
+
+      // Check for entity index accessor: db.entities.Tasks.byProject(...)
+      // Matches any non-primary index name defined on the entity
+      if (entity.indexes[accessorName] && accessorName !== "primary") {
+        const args =
+          callNode.arguments.length > 0 ? extractCallArgs(ts, callNode.arguments[0]!) : undefined
+        return {
+          entity,
+          type: "entity-query-accessor",
+          indexName: accessorName,
+          arguments: args,
+        }
       }
     }
   }
@@ -250,6 +269,17 @@ function tryDetectV2ChainRoot(
           if (accessorName === "scan") {
             return { entity, type: "scan" }
           }
+          // Entity index accessor (no collection match needed)
+          if (entity.indexes[accessorName] && accessorName !== "primary") {
+            const args =
+              expr.arguments.length > 0 ? extractCallArgs(ts, expr.arguments[0]!) : undefined
+            return {
+              entity,
+              type: "entity-query-accessor",
+              indexName: accessorName,
+              arguments: args,
+            }
+          }
         }
       }
 
@@ -271,11 +301,19 @@ function tryDetectV2ChainRoot(
 
       // Intermediate chain: .limit(10).collect() → try the chain's own parent
       const methodName = chain[chain.length - 1]
+      if (methodName === "where") {
+        // Extract .where() condition and attach to the root operation
+        const rootOp = tryDetectV2ChainRoot(ts, callee.expression, entities, collections)
+        if (rootOp && expr.arguments.length > 0) {
+          const whereCondition = extractWhereCondition(ts, expr.arguments[0]!)
+          if (whereCondition) return { ...rootOp, whereCondition }
+        }
+        return rootOp
+      }
       if (
         methodName === "limit" ||
         methodName === "reverse" ||
         methodName === "filter" ||
-        methodName === "where" ||
         methodName === "select" ||
         methodName === "maxPages" ||
         methodName === "startFrom" ||
@@ -575,4 +613,57 @@ function parsePipeArgs(
   }
 
   return Object.keys(result).length > 0 ? result : {}
+}
+
+/**
+ * Extract a WhereCondition from a .where() callback argument.
+ * Parses: (t, { beginsWith }) => beginsWith(t.status, "d")
+ * Or: (t, { eq }) => eq(t.status, "done")
+ */
+function extractWhereCondition(
+  ts: typeof import("typescript"),
+  arg: ts.Expression,
+): WhereCondition | undefined {
+  // Must be an arrow function or function expression
+  let body: ts.Expression | undefined
+  if (ts.isArrowFunction(arg)) {
+    body = ts.isBlock(arg.body) ? undefined : arg.body
+  }
+  if (!body || !ts.isCallExpression(body)) return undefined
+
+  // The call should be like: beginsWith(t.field, "value") or eq(t.field, "value")
+  const callee = body.expression
+  let opName: string | undefined
+  if (ts.isIdentifier(callee)) {
+    opName = callee.text
+  }
+  if (!opName) return undefined
+
+  const validOps = new Set(["eq", "lt", "lte", "gt", "gte", "beginsWith", "between"])
+  if (!validOps.has(opName)) return undefined
+
+  // First arg: t.field (property access on the first param)
+  if (body.arguments.length < 2) return undefined
+  const fieldArg = body.arguments[0]!
+  let fieldName: string | undefined
+  if (ts.isPropertyAccessExpression(fieldArg) && ts.isIdentifier(fieldArg.name)) {
+    fieldName = fieldArg.name.text
+  }
+  if (!fieldName) return undefined
+
+  // Second arg: value (string literal)
+  const valueArg = body.arguments[1]!
+  const value = extractArgValue(ts, valueArg)
+  if (typeof value !== "string") return undefined
+
+  // For between, extract third arg
+  if (opName === "between") {
+    if (body.arguments.length < 3) return undefined
+    const value2Arg = body.arguments[2]!
+    const value2 = extractArgValue(ts, value2Arg)
+    if (typeof value2 !== "string") return undefined
+    return { op: "between", field: fieldName, value, value2 }
+  }
+
+  return { op: opName as WhereCondition["op"], field: fieldName, value }
 }

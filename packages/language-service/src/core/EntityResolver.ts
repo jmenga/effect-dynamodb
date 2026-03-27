@@ -200,6 +200,9 @@ function resolveEntityConfig(
   let softDelete: boolean | object = false
   let unique: object | undefined
 
+  let primaryKeyDef: IndexDefinition | undefined
+  let gsiIndexes: Record<string, IndexDefinition> | undefined
+
   for (const prop of config.properties) {
     if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
     const name = prop.name.text
@@ -209,12 +212,11 @@ function resolveEntityConfig(
         entityType = extractStringLiteral(ts, prop.initializer)
         break
       case "indexes":
-        indexes = resolveIndexes(ts, prop.initializer)
+        // Try new GsiConfig format first, fall back to old IndexDefinition format
+        gsiIndexes = resolveGsiIndexes(ts, prop.initializer) ?? resolveIndexes(ts, prop.initializer)
         break
       case "primaryKey": {
-        // v2 API: primaryKey is wrapped as { primary: <def> }
-        const pkDef = resolveIndexDefinition(ts, prop.initializer)
-        if (pkDef) indexes = { primary: pkDef }
+        primaryKeyDef = resolveIndexDefinition(ts, prop.initializer)
         break
       }
       case "timestamps":
@@ -230,6 +232,13 @@ function resolveEntityConfig(
         unique = extractObjectLiteral(ts, prop.initializer) ?? undefined
         break
     }
+  }
+
+  // Merge primaryKey + indexes (new API) or use indexes alone (old API)
+  if (primaryKeyDef) {
+    indexes = { primary: primaryKeyDef, ...gsiIndexes }
+  } else if (gsiIndexes) {
+    indexes = gsiIndexes
   }
 
   if (!entityType || !indexes) return undefined
@@ -384,6 +393,78 @@ function resolveIndexes(
   }
 
   return Object.keys(result).length > 0 ? result : undefined
+}
+
+/**
+ * Parse indexes in GsiConfig format:
+ * { byRole: { name: "gsi1", pk: { field, composite }, sk: { field, composite }, collection? } }
+ * Normalizes to IndexDefinition format.
+ */
+function resolveGsiIndexes(
+  ts: typeof import("typescript"),
+  expr: ts.Expression,
+): Record<string, IndexDefinition> | undefined {
+  if (!ts.isObjectLiteralExpression(expr)) return undefined
+  const result: Record<string, IndexDefinition> = {}
+
+  for (const prop of expr.properties) {
+    if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
+    const indexDef = resolveGsiConfig(ts, prop.initializer)
+    if (indexDef) {
+      result[prop.name.text] = indexDef
+    }
+  }
+
+  return Object.keys(result).length > 0 ? result : undefined
+}
+
+/**
+ * Parse a single GsiConfig:
+ * { name: "gsi1", pk: { field: "gsi1pk", composite: [...] }, sk: { field: "gsi1sk", composite: [...] }, collection? }
+ * Returns normalized IndexDefinition.
+ */
+function resolveGsiConfig(
+  ts: typeof import("typescript"),
+  expr: ts.Expression,
+): IndexDefinition | undefined {
+  if (!ts.isObjectLiteralExpression(expr)) return undefined
+
+  let gsiName: string | undefined
+  let pk: KeyPart | undefined
+  let sk: KeyPart | undefined
+  let collection: string | ReadonlyArray<string> | undefined
+  let type: "isolated" | "clustered" | undefined
+
+  for (const prop of expr.properties) {
+    if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
+    switch (prop.name.text) {
+      case "name":
+        gsiName = extractStringLiteral(ts, prop.initializer)
+        break
+      case "pk":
+        pk = resolveKeyPart(ts, prop.initializer)
+        break
+      case "sk":
+        sk = resolveKeyPart(ts, prop.initializer)
+        break
+      case "collection":
+        collection = extractStringOrStringArray(ts, prop.initializer)
+        break
+      case "type":
+        type = extractStringLiteral(ts, prop.initializer) as "isolated" | "clustered" | undefined
+        break
+    }
+  }
+
+  if (!gsiName || !pk || !sk) return undefined
+
+  return {
+    index: gsiName,
+    collection,
+    type: type ?? "isolated",
+    pk,
+    sk,
+  }
 }
 
 function resolveIndexDefinition(

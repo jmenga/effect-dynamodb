@@ -210,6 +210,61 @@ describe("EntityResolver", () => {
       expect(entities[0]!.unique).toEqual({ email: { fields: ["email"] } })
     })
 
+    it("should resolve entity with primaryKey + GsiConfig indexes", () => {
+      const source = `
+        const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
+
+        const Tasks = Entity.make({
+          model: Task,
+          entityType: "Task",
+          primaryKey: {
+            pk: { field: "pk", composite: ["taskId"] },
+            sk: { field: "sk", composite: [] },
+          },
+          indexes: {
+            byProject: {
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["projectId"] },
+              sk: { field: "gsi1sk", composite: ["status"] },
+              collection: "projectTasks",
+            },
+            byStatus: {
+              name: "gsi2",
+              pk: { field: "gsi2pk", composite: ["status"] },
+              sk: { field: "gsi2sk", composite: ["taskId"] },
+            },
+          },
+          timestamps: true,
+        })
+
+        const MainTable = Table.make({ schema: AppSchema, entities: { Tasks } })
+      `
+      const sf = parseSource(source)
+      const entities = resolveEntities(ts, sf)
+
+      expect(entities).toHaveLength(1)
+      const task = entities[0]!
+      expect(task.entityType).toBe("Task")
+
+      // Primary key resolved from primaryKey config
+      expect(task.indexes.primary).toBeDefined()
+      expect(task.indexes.primary!.pk).toEqual({ field: "pk", composite: ["taskId"] })
+
+      // GSI indexes resolved from GsiConfig format
+      expect(task.indexes.byProject).toBeDefined()
+      expect(task.indexes.byProject!.index).toBe("gsi1")
+      expect(task.indexes.byProject!.pk).toEqual({ field: "gsi1pk", composite: ["projectId"] })
+      expect(task.indexes.byProject!.sk).toEqual({ field: "gsi1sk", composite: ["status"] })
+      expect(task.indexes.byProject!.collection).toBe("projectTasks")
+      expect(task.indexes.byProject!.type).toBe("isolated")
+
+      expect(task.indexes.byStatus).toBeDefined()
+      expect(task.indexes.byStatus!.index).toBe("gsi2")
+      expect(task.indexes.byStatus!.pk).toEqual({ field: "gsi2pk", composite: ["status"] })
+      expect(task.indexes.byStatus!.sk).toEqual({ field: "gsi2sk", composite: ["taskId"] })
+      expect(task.indexes.byStatus!.collection).toBeUndefined()
+    })
+
     it("should resolve entity with primaryKey (v2 API)", () => {
       const source = `
         const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })

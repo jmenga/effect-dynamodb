@@ -100,9 +100,9 @@ const Posts = Entity.make({
   },
   indexes: {
     byAuthor: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["authorId"],
-      sk: ["postId"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["authorId"] },
+      sk: { field: "gsi1sk", composite: ["postId"] },
     },
   },
   timestamps: true,
@@ -119,9 +119,9 @@ const Comments = Entity.make({
   },
   indexes: {
     byPost: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["postId"],
-      sk: ["commentId"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["postId"] },
+      sk: { field: "gsi1sk", composite: ["commentId"] },
     },
   },
   timestamps: true,

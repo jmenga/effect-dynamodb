@@ -57,12 +57,14 @@ const PlayerRoleSchema = Schema.Literals(Object.values(PlayerRole))
 // #endregion
 
 // #region model-standalone
+// #region model-team
 class Team extends Schema.Class<Team>("Team")({
   id: Schema.String.pipe(DynamoModel.identifier),
   name: Schema.String,
   country: Schema.String,
   ranking: Schema.Number,
 }) {}
+// #endregion
 
 class Player extends Schema.Class<Player>("Player")({
   id: Schema.String.pipe(DynamoModel.identifier),
@@ -136,6 +138,7 @@ const CricketSchema = DynamoSchema.make({ name: "cricket", version: 1 })
 
 // #region entities
 // #region entity-standalone
+// #region entity-team
 const Teams = Entity.make({
   model: DynamoModel.configure(Team, { id: { field: "teamId" } }),
   entityType: "Team",
@@ -144,6 +147,7 @@ const Teams = Entity.make({
     sk: { field: "sk", composite: [] },
   },
 })
+// #endregion
 
 const Players = Entity.make({
   model: DynamoModel.configure(Player, { id: { field: "playerId" } }),
@@ -183,9 +187,9 @@ const SquadSelections = Entity.make({
   },
   indexes: {
     byPlayer: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["playerId"],
-      sk: ["squadId", "selectionNumber"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["playerId"] },
+      sk: { field: "gsi1sk", composite: ["squadId", "selectionNumber"] },
     },
   },
   refs: {

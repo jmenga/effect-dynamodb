@@ -45,6 +45,29 @@ export const applyCasing = (value: string, casing: Casing): string => {
 }
 
 /**
+ * Format composite values with optional field name prefixes.
+ * With names: `fieldname_value1#fieldname_value2`
+ * Without names: `value1#value2`
+ */
+const formatComposites = (
+  composites: ReadonlyArray<string>,
+  casing: Casing,
+  names?: ReadonlyArray<string> | undefined,
+): string => formatCompositeParts(composites, casing, names).join("#")
+
+/** Format composite values as individual parts (for use in array spreading). */
+const formatCompositeParts = (
+  composites: ReadonlyArray<string>,
+  casing: Casing,
+  names?: ReadonlyArray<string> | undefined,
+): ReadonlyArray<string> =>
+  composites.map((v, i) => {
+    const casedValue = applyCasing(v, casing)
+    const name = names?.[i]
+    return name ? `${applyCasing(name, casing)}_${casedValue}` : casedValue
+  })
+
+/**
  * Build the schema prefix: `$<schema>#v<version>`
  * This is prepended to every generated key.
  */
@@ -77,7 +100,7 @@ export const composeKey = (
   schema: DynamoSchema,
   entityType: string,
   composites: ReadonlyArray<string>,
-  options?: { readonly casing?: Casing | undefined } | undefined,
+  options?: { readonly casing?: Casing | undefined; readonly names?: ReadonlyArray<string> | undefined } | undefined,
 ): string => {
   const {
     casing: effectiveCasing,
@@ -88,8 +111,8 @@ export const composeKey = (
   if (composites.length === 0) {
     return `${pre}#${type}`
   }
-  const casedComposites = composites.map((v) => applyCasing(v, effectiveCasing))
-  return `${pre}#${type}#${casedComposites.join("#")}`
+  const formatted = formatComposites(composites, effectiveCasing, options?.names)
+  return `${pre}#${type}#${formatted}`
 }
 
 /**
@@ -101,7 +124,7 @@ export const composeCollectionKey = (
   schema: DynamoSchema,
   collectionName: string,
   composites: ReadonlyArray<string>,
-  options?: { readonly casing?: Casing | undefined } | undefined,
+  options?: { readonly casing?: Casing | undefined; readonly names?: ReadonlyArray<string> | undefined } | undefined,
 ): string => {
   const {
     casing: effectiveCasing,
@@ -112,8 +135,8 @@ export const composeCollectionKey = (
   if (composites.length === 0) {
     return `${pre}#${collection}`
   }
-  const casedComposites = composites.map((v) => applyCasing(v, effectiveCasing))
-  return `${pre}#${collection}#${casedComposites.join("#")}`
+  const formatted = formatComposites(composites, effectiveCasing, options?.names)
+  return `${pre}#${collection}#${formatted}`
 }
 
 /**
@@ -130,7 +153,7 @@ export const composeClusteredSortKey = (
   entityType: string,
   entityVersion: number,
   composites: ReadonlyArray<string>,
-  options?: { readonly casing?: Casing | undefined } | undefined,
+  options?: { readonly casing?: Casing | undefined; readonly names?: ReadonlyArray<string> | undefined } | undefined,
 ): string => {
   const {
     casing: effectiveCasing,
@@ -140,8 +163,8 @@ export const composeClusteredSortKey = (
   const type = applyCasing(entityType, effectiveCasing)
   const entityPrefix = `${type}_${entityVersion}`
 
-  const casedComposites = composites.map((v) => applyCasing(v, effectiveCasing))
-  const parts = [pre, collection, entityPrefix, ...casedComposites].filter((p) => p.length > 0)
+  const formattedComposites = formatCompositeParts(composites, effectiveCasing, options?.names)
+  const parts = [pre, collection, entityPrefix, ...formattedComposites].filter((p) => p.length > 0)
   return parts.join("#")
 }
 
@@ -155,7 +178,7 @@ export const composeIsolatedSortKey = (
   entityType: string,
   entityVersion: number,
   composites: ReadonlyArray<string>,
-  options?: { readonly casing?: Casing | undefined } | undefined,
+  options?: { readonly casing?: Casing | undefined; readonly names?: ReadonlyArray<string> | undefined } | undefined,
 ): string => {
   const {
     casing: effectiveCasing,
@@ -164,8 +187,8 @@ export const composeIsolatedSortKey = (
   } = resolveKeyPrefix(schema, entityType, options)
   const entityPrefix = `${type}_${entityVersion}`
 
-  const casedComposites = composites.map((v) => applyCasing(v, effectiveCasing))
-  const parts = [pre, entityPrefix, ...casedComposites].filter((p) => p.length > 0)
+  const formattedComposites = formatCompositeParts(composites, effectiveCasing, options?.names)
+  const parts = [pre, entityPrefix, ...formattedComposites].filter((p) => p.length > 0)
   return parts.join("#")
 }
 

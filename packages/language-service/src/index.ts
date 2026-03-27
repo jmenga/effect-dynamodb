@@ -1,4 +1,5 @@
 import type ts from "typescript"
+import { getDiagnostics } from "./features/diagnostics"
 import { enhanceQuickInfo } from "./features/quickinfo"
 
 function init(modules: { typescript: typeof ts }) {
@@ -15,6 +16,11 @@ function init(modules: { typescript: typeof ts }) {
     proxy.getQuickInfoAtPosition = (fileName: string, position: number) => {
       const prior = info.languageService.getQuickInfoAtPosition(fileName, position)
       return enhanceQuickInfo(modules.typescript, info, fileName, position, prior)
+    }
+
+    proxy.getSemanticDiagnostics = (fileName: string) => {
+      const prior = info.languageService.getSemanticDiagnostics(fileName)
+      return getDiagnostics(modules.typescript, info, fileName, prior)
     }
 
     return proxy

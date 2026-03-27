@@ -30,13 +30,13 @@ class Vehicle extends Schema.Class<Vehicle>("Vehicle")({
 const Vehicles = Entity.make({
   model: Vehicle,
   entityType: "Vehicle",
+  primaryKey: {
+    pk: { field: "pk", composite: ["vehicleId"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["vehicleId"] },
-      sk: { field: "sk", composite: [] },
-    },
     byCell: {
-      index: "gsi1",
+      name: "gsi1",
       pk: { field: "gsi1pk", composite: ["parentCell", "timePartition"] },
       sk: { field: "gsi1sk", composite: ["cell"] },
     },

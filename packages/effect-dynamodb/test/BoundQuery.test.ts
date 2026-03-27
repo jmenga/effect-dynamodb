@@ -76,8 +76,18 @@ const makeConfig = (): BoundQueryConfig<TestModel> => ({
     Effect.provide(eff, TestDynamoClient) as Effect.Effect<X, E, never>,
 })
 
+/** SK remaining type for tests — represents available SK composites */
+type TestSkRemaining = { readonly sk: string }
+
+// Update makeConfig to include skFields
+const origMakeConfig = makeConfig
+const makeConfigWithSk = (): BoundQueryConfig<TestModel> => ({
+  ...origMakeConfig(),
+  skFields: ["sk"],
+})
+
 const makeBoundQuery = () =>
-  new BoundQueryImpl<TestModel, string, TestModel>(makeTestQuery(), makeConfig())
+  new BoundQueryImpl<TestModel, TestSkRemaining, TestModel>(makeTestQuery(), makeConfigWithSk())
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -262,14 +272,14 @@ describe("BoundQuery", () => {
 
   describe("where", () => {
     it("applies SK condition to the underlying query", () => {
-      const bq = makeBoundQuery().where((_sk, ops) => ops.beginsWith("prefix"))
+      const bq = makeBoundQuery().where((t, ops) => ops.beginsWith(t.sk, "prefix"))
       expect(bq._query._state.skConditions).toHaveLength(1)
       expect(bq._query._state.skConditions[0]!.condition).toEqual({ beginsWith: "prefix" })
     })
 
     it("uses composeSkCondition when provided", () => {
       const config: BoundQueryConfig<TestModel> = {
-        ...makeConfig(),
+        ...makeConfigWithSk(),
         composeSkCondition: (cond) => {
           if ("beginsWith" in cond) {
             return { beginsWith: `composed#${cond.beginsWith}` }
@@ -277,8 +287,8 @@ describe("BoundQuery", () => {
           return cond
         },
       }
-      const bq = new BoundQueryImpl<TestModel, string, TestModel>(makeTestQuery(), config)
-      const result = bq.where((_sk, ops) => ops.beginsWith("hello"))
+      const bq = new BoundQueryImpl<TestModel, TestSkRemaining, TestModel>(makeTestQuery(), config)
+      const result = bq.where((t, ops) => ops.beginsWith(t.sk, "hello"))
       expect(result._query._state.skConditions).toHaveLength(1)
       expect(result._query._state.skConditions[0]!.condition).toEqual({
         beginsWith: "composed#hello",
@@ -286,32 +296,32 @@ describe("BoundQuery", () => {
     })
 
     it("supports eq condition", () => {
-      const bq = makeBoundQuery().where((_sk, ops) => ops.eq("exact"))
+      const bq = makeBoundQuery().where((t, ops) => ops.eq(t.sk, "exact"))
       expect(bq._query._state.skConditions[0]!.condition).toEqual({ eq: "exact" })
     })
 
     it("supports between condition", () => {
-      const bq = makeBoundQuery().where((_sk, ops) => ops.between("a", "z"))
+      const bq = makeBoundQuery().where((t, ops) => ops.between(t.sk, "a", "z"))
       expect(bq._query._state.skConditions[0]!.condition).toEqual({ between: ["a", "z"] })
     })
 
     it("supports gt condition", () => {
-      const bq = makeBoundQuery().where((_sk, ops) => ops.gt("value"))
+      const bq = makeBoundQuery().where((t, ops) => ops.gt(t.sk, "value"))
       expect(bq._query._state.skConditions[0]!.condition).toEqual({ gt: "value" })
     })
 
     it("supports gte condition", () => {
-      const bq = makeBoundQuery().where((_sk, ops) => ops.gte("value"))
+      const bq = makeBoundQuery().where((t, ops) => ops.gte(t.sk, "value"))
       expect(bq._query._state.skConditions[0]!.condition).toEqual({ gte: "value" })
     })
 
     it("supports lt condition", () => {
-      const bq = makeBoundQuery().where((_sk, ops) => ops.lt("value"))
+      const bq = makeBoundQuery().where((t, ops) => ops.lt(t.sk, "value"))
       expect(bq._query._state.skConditions[0]!.condition).toEqual({ lt: "value" })
     })
 
     it("supports lte condition", () => {
-      const bq = makeBoundQuery().where((_sk, ops) => ops.lte("value"))
+      const bq = makeBoundQuery().where((t, ops) => ops.lte(t.sk, "value"))
       expect(bq._query._state.skConditions[0]!.condition).toEqual({ lte: "value" })
     })
   })
@@ -449,7 +459,7 @@ describe("BoundQuery", () => {
 
     it("chains where + limit + consistentRead", () => {
       const bq = makeBoundQuery()
-        .where((_sk, ops) => ops.beginsWith("2024"))
+        .where((t, ops) => ops.beginsWith(t.sk, "2024"))
         .limit(5)
         .consistentRead()
 

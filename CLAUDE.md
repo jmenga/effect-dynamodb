@@ -6,33 +6,30 @@
 
 Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, composite key composition from entity attributes, type-safe index-aware queries with Stream-based pagination, and DynamoClient as an Effect Service with Layer-based dependency injection.
 
-**Status:** All modules implemented. 800 unit tests, 56 geo tests, 61 connected tests, 17 examples.
+**Status:** All modules implemented. 852 core tests, 56 geo tests, 61 connected tests, 59 language-service tests, 44 doctest tests, 17 examples.
 **Design:** `DESIGN.md` — API specification (source of truth for implementation)
 
 ## Architecture
 
 ### Client Gateway Pattern
 
-`DynamoClient.make({ entities, collections })` is the **typed execution gateway** — the central pattern of this library:
+`DynamoClient.make(table)` is the **typed execution gateway** — the central pattern of this library:
 
-1. `Entity.make({ model, primaryKey })` — entity defines domain model + primary key only (no GSIs)
-2. `Collections.make(name, { index, pk, sk, members })` — ALL GSI access patterns defined here (single-entity or cross-entity)
-3. `Table.make({ schema, entities: { Users, Tasks } })` — registers entities on a physical table
-4. `yield* DynamoClient.make({ entities: { Users, Tasks }, collections: { Assignments } })` — resolves tables, injects collection indexes into entities, binds everything, returns typed client with `R = never`
-5. Access via `db.entities.*` (CRUD + query accessors), `db.collections.*` (cross-entity queries), `db.tables.*` (table management)
-6. Destructure in `ServiceMap.Service` for DI and layer-based testing
+1. `Entity.make({ model, primaryKey, indexes })` — entity defines domain model + primary key + GSI indexes (with optional `collection` property)
+2. `Table.make({ schema, entities: { Users, Tasks } })` — registers entities on a physical table
+3. `yield* DynamoClient.make(MainTable)` — resolves tables, auto-discovers collections from entity indexes, binds everything, returns typed client with `R = never`
+4. Access via `db.entities.*` (CRUD + query accessors), `db.collections.*` (auto-discovered cross-entity queries), `db.tables.*` (table management)
+5. Destructure in `ServiceMap.Service` for DI and layer-based testing
 
 ```
 ┌─────────────────────────────────────┐
-│  DynamoClient.make(config)          │  ← typed gateway (binds all members, R = never)
-├─────────────────────────────────────┤
-│  Collections.make()                 │  ← ALL access patterns (GSI indexes)
+│  DynamoClient.make(table)           │  ← typed gateway (binds all members, R = never)
 ├─────────────────────────────────────┤
 │  Aggregate / GeoIndex / EventStore  │  ← orchestration (decompose, assemble, diff)
 ├─────────────────────────────────────┤
 │  Collection / Transaction / Batch   │  ← multi-entity coordination
 ├─────────────────────────────────────┤
-│  Entity                             │  ← domain model + primary key + CRUD
+│  Entity                             │  ← domain model + primary key + indexes + CRUD
 ├─────────────────────────────────────┤
 │  Table.make()                       │  ← physical table definition (schema + entities)
 ├─────────────────────────────────────┤
@@ -43,12 +40,11 @@ Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table
 ### Adding New Entities
 
 1. Define model with `Schema.Class` (or `Schema.Struct`) — pure domain fields only. Use `DynamoModel.configure(model, { field: { immutable: true } })` for fields that shouldn't change after creation.
-2. Create entity definition with `Entity.make({ model, entityType, primaryKey, timestamps?, versioned?, softDelete?, unique? })` — only primary key, no GSIs.
-3. Define access patterns (GSIs) via `Collections.make(name, { index, pk, sk, members: { MyEntity: Collections.member(MyEntity, { sk: { composite: [...] } }) } })`.
-4. Register entity on a table: `Table.make({ schema, entities: { ..., MyEntity } })`.
-5. Access via typed client: `const db = yield* DynamoClient.make({ entities: { MyEntity }, collections: { MyCollection } })` → `db.entities.MyEntity.get(...)`, `db.entities.MyEntity.put(...)`, `db.entities.MyEntity.myCollection({...}).collect()`.
-6. For services: destructure the client in `ServiceMap.Service` for DI and layer-based testing.
-7. Add unit tests in `test/` and update integration test if needed.
+2. Create entity definition with `Entity.make({ model, entityType, primaryKey, indexes?, timestamps?, versioned?, softDelete?, unique? })` — primary key + GSI indexes. Use `collection` property on indexes for cross-entity queries.
+3. Register entity on a table: `Table.make({ schema, entities: { ..., MyEntity } })`.
+4. Access via typed client: `const db = yield* DynamoClient.make(MainTable)` → `db.entities.MyEntity.get(...)`, `db.entities.MyEntity.put(...)`, `db.entities.MyEntity.byIndex({...}).collect()`. Collections auto-discovered: `db.collections.myCollection({...}).collect()`.
+5. For services: destructure the client in `ServiceMap.Service` for DI and layer-based testing.
+6. Add unit tests in `test/` and update integration test if needed.
 
 ### Module Structure
 
@@ -57,8 +53,8 @@ packages/effect-dynamodb/src/
 ├── DynamoModel.ts      # Schema annotations (Hidden, identifier, ref) and configure() for field overrides (immutable, field rename, storedAs)
 ├── DynamoSchema.ts     # Application namespace (name + version) for key prefixing
 ├── Table.ts            # Table definition: { schema, entities } — registers entities on a physical table
-├── Entity.ts           # Entity definition (model + primaryKey only) + typed operations
-├── Collections.ts      # GSI access pattern definitions — Collections.make() + Collections.member()
+├── Entity.ts           # Entity definition (model + primaryKey + indexes) + typed operations
+├── Collections.ts      # Collection auto-discovery from entity indexes + explicit Collections.make() for advanced use
 ├── KeyComposer.ts      # Composite key composition from index definitions
 ├── Query.ts            # Query descriptor with combinators (limit, reverse, filter, startFrom, consistentRead)
 ├── Collection.ts       # Multi-entity query execution with per-entity Schema decode
@@ -68,7 +64,7 @@ packages/effect-dynamodb/src/
 ├── Projection.ts       # ProjectionExpression builder for selecting specific attributes
 ├── Aggregate.ts        # Graph-based composite domain model (decompose/assemble/diff)
 ├── EventStore.ts       # Event sourcing with ordered event streams per aggregate
-├── DynamoClient.ts     # ServiceMap.Service wrapping AWS SDK + DynamoClient.make({ entities, collections }) typed gateway
+├── DynamoClient.ts     # ServiceMap.Service wrapping AWS SDK + DynamoClient.make(table) typed gateway
 ├── Marshaller.ts       # Thin wrapper around @aws-sdk/util-dynamodb
 ├── Errors.ts           # Tagged errors (DynamoError, ItemNotFound, ConditionalCheckFailed, ValidationError, TransactionCancelled, UniqueConstraintViolation)
 ├── internal/           # Decomposed internals
@@ -95,7 +91,7 @@ Transaction → DynamoClient, Entity, TransactableOps, Marshaller, Expression, E
 Batch → DynamoClient, Entity, TransactableOps, Marshaller, Errors
 EventStore → DynamoClient, DynamoSchema, Table, KeyComposer, Marshaller, Query, Errors
 GeoIndex → Entity, Query (in effect-dynamodb-geo package)
-DynamoClient → effect (ServiceMap, Layer), @aws-sdk/client-dynamodb, Entity, Collections, Aggregate (for make() binding)
+DynamoClient → effect (ServiceMap, Layer), @aws-sdk/client-dynamodb, Entity, Collections, Aggregate (for make() binding + collection auto-discovery)
 Table → DynamoSchema, Entity (type-level for member registration)
 BoundQuery → Query, PathBuilder, Expr (thin typed wrapper over Query<A>)
 Expression → Marshaller (types only — shorthand compilation routes through Expr)
@@ -111,17 +107,17 @@ Errors → effect (Data)
 ### Data Flow
 
 ```
-User code → yield* DynamoClient.make({ entities: { Users, Tasks }, collections: { Assignments } })
-  → resolves DynamoClient service + TableConfig for each unique table from context
-  → injects collection index definitions into member entities (for key composition on writes)
-  → binds entities (CRUD + query accessors from collection memberships)
-  → binds collections (cross-entity query accessors)
+User code → yield* DynamoClient.make(MainTable)
+  → resolves DynamoClient service + TableConfig for each unique table
+  → auto-discovers collections from entity index `collection` properties
+  → binds entities (CRUD + query accessors from index definitions)
+  → binds auto-discovered collections (cross-entity query accessors)
   → builds table operations for each unique table
-  → returns typed client: { entities: { Users, Tasks }, collections: { Assignments }, tables: { HrTable } }
+  → returns typed client: { entities: { Users, Tasks }, collections: { assignments }, tables: { MainTable } }
 
 db.entities.Users.put(inputData)
   → Schema.decode(Entity.Input) — validate input
-  → compose keys (KeyComposer) for primary key + all injected collection indexes
+  → compose keys (KeyComposer) for primary key + all entity indexes
   → add __edd_e__ + timestamps + version
   → marshall to DynamoDB format (Marshaller)
   → DynamoClient.putItem (or transactWriteItems for unique constraints)
@@ -135,7 +131,7 @@ db.entities.Tasks.byProject({ project: "alpha" }).filter(...).limit(10).collect(
     → Stream.paginate (automatic DynamoDB pagination)
     → unmarshall → Schema.decode(Entity.Record) per item
 
-db.collections.Assignments({ employee: "dfinlay" }).collect()
+db.collections.assignments({ employee: "dfinlay" }).collect()
   → queries each member entity's table (parallel for cross-table collections)
   → groups results by member name: { Employees: [...], Tasks: [...] }
 ```
@@ -148,12 +144,12 @@ db.collections.Assignments({ employee: "dfinlay" }).collect()
 | Raw AWS SDK (not @effect-aws) | Avoid extra dependency; thin wrapper is simple enough |
 | Effect Schema as sole schema system | Native Effect integration, bidirectional transforms, branded types |
 | Schema.Class/Struct for models | Pure domain schemas — no DynamoDB concepts in models. Entity derives DynamoDB types |
-| DynamoClient.make({ entities, collections }) as typed gateway | Entity-centric client with namespaced access: `db.entities.*`, `db.collections.*`, `db.tables.*` |
-| Entities define only primary key | `Entity.make({ primaryKey })` — no GSI awareness. All GSIs live in `Collections.make()` |
-| Collections own all GSI definitions | Single source of truth for each GSI. Structural compatibility by construction. Entities stay pure |
+| DynamoClient.make(table) as typed gateway | Table-centric client with namespaced access: `db.entities.*`, `db.collections.*`, `db.tables.*` |
+| Entities define primary key + GSI indexes | `Entity.make({ primaryKey, indexes })` — entity is self-contained. Collections auto-discovered from `collection` property on indexes |
+| Collections auto-discovered from entity indexes | No explicit `Collections.make()` needed. Entities sharing the same `collection` name on the same physical GSI are grouped automatically |
 | BoundQuery fluent builder | `.filter().limit().collect()` — reads naturally, type-safe through method chaining, no `asEffect()` needed |
 | Aggregates compose entity ops | Never touch DynamoClient. Orchestrate Entity, Collection, Transaction |
-| ElectroDB-style composite indexes | `{ pk: { field, composite }, sk: { field, composite } }` — attribute lists not templates |
+| ElectroDB-style composite indexes | `{ index: { name, pk, sk }, composite: [...], sk: [...] }` — GsiConfig with shared PK composites + entity SK composites |
 | `__edd_e__` entity type attribute | Ugly name convention avoids collisions with user model fields |
 | @aws-sdk/util-dynamodb for marshalling | Proven, maintained; Effect Schema handles validation layer above |
 
@@ -318,8 +314,8 @@ Before committing:
 ### Entity Operations
 - **BoundEntity CRUD methods return `Effect` (model type).** Query accessors (from collection memberships) return `BoundQuery`. CRUD ops accept variadic combinators: `db.entities.Users.update(key, Entity.set(...))`, `db.entities.Users.put(input, Entity.condition(...))`.
 - **BoundQuery is a fluent builder.** `db.entities.Tasks.byProject({ project: "alpha" }).filter(...).limit(10).collect()`. Terminals: `.collect()` → `Effect<Array<A>>`, `.fetch()` → `Effect<Page<A>>` (single page + cursor), `.paginate()` → `Stream<A>`, `.count()` → `Effect<number>`. Combinators: `.where()` (SK condition), `.filter()`, `.select()`, `.limit()`, `.maxPages()`, `.reverse()`, `.startFrom()`, `.consistentRead()`, `.ignoreOwnership()`.
-- **Query accessors injected from Collections.** When an entity is a member of a collection, it gets a query accessor named after the collection: `db.entities.Tasks.tasksByProject({...})`. PK composites required, SK composites optional (narrows via auto `begins_with`). `.where()` provides type-safe access to remaining SK composites not already provided.
-- **Collection accessors return grouped results.** `db.collections.Assignments({ employee: "dfinlay" }).collect()` → `Effect<{ Employees: Employee[], Tasks: Task[] }>`. Collection queries support the same BoundQuery combinators (`.filter()`, `.limit()`, etc.) but `.where()` is not available.
+- **Query accessors from entity indexes.** Each GSI index on an entity becomes a query accessor: `db.entities.Tasks.byProject({...})` returns a `BoundQuery`. PK composites required, SK composites optional (narrows via auto `begins_with`). `.where()` provides type-safe access to remaining SK composites not already provided.
+- **Collection accessors auto-discovered.** Entities sharing the same `collection` name on the same GSI are grouped: `db.collections.assignments({ employee: "dfinlay" }).collect()` → `Effect<{ Employees: Employee[], Tasks: Task[] }>`. Collection queries support the same BoundQuery combinators (`.filter()`, `.limit()`, etc.) but `.where()` is not available.
 - **put/get/query return model type from BoundEntity.** Entity definitions return intermediates (`EntityOp`, `EntityDelete`) with `asRecord`/`asNative` terminals for advanced decode modes.
 - **`Entity.create()` = put + attribute_not_exists.** Returns `ConditionalCheckFailed` on duplicate.
 - **Conditional writes via `Entity.condition()`.** Works on `EntityPut`, `EntityUpdate`, `EntityDelete`. User condition ANDed with optimistic lock condition on updates. Two APIs: callback `Products.condition((t, { eq }) => eq(t.status, "active"))` and shorthand `Entity.condition({ eq: { status: "active" } })`.
@@ -327,7 +323,7 @@ Before committing:
 - **Projections on BoundQuery.** Callback `.select((t) => [t.name, t.price])` or shorthand `.select(["name", "price"])`. Returns partial records.
 - **PathBuilder + Expr ADT.** `PathBuilder<Model>` is a recursive Proxy for type-safe attribute path access (nested: `t.address.city`, array: `t.roster.at(0).name`, size: `t.tags.size()`). `Expr` is a 16-node discriminated union compiled to DynamoDB expression strings via `compileExpr()`. `ConditionOps<Model>` provides typed comparison/logical operators for callbacks.
 - **Rich update operations.** Record-based: `Entity.remove(fields)` (REMOVE), `Entity.add(values)` (ADD), `Entity.subtract(values)` (SET subtraction), `Entity.append(values)` (list_append), `Entity.deleteFromSet(values)` (DELETE from set). Path-based: `Entity.pathSet()`, `pathRemove()`, `pathAdd()`, `pathSubtract()`, `pathAppend()`, `pathPrepend()`, `pathIfNotExists()`, `pathDelete()`. All compose with `set()`, `expectedVersion()`, `condition()`.
-- **GSI composites managed by Collections.** Collections inject GSI index definitions into entities at `DynamoClient.make()` time. Entity writes compose keys for primary key + all injected collection indexes automatically.
+- **GSI composites defined on Entity.** Each entity defines its own GSI indexes via `Entity.make({ indexes })`. Entity writes compose keys for primary key + all entity indexes automatically. `DynamoClient.make()` auto-discovers collections from the `collection` property on indexes.
 - **Consistent reads via combinator.** `Entity.consistentRead()` on `EntityGet`, `.consistentRead()` on `BoundQuery`.
 - **Scan via `db.entities.Tasks.scan()`.** Returns `BoundQuery` in scan mode (no `.where()` available).
 - **Batch operations auto-chunk.** `batchGet` at 100, `batchWrite` at 25. Both retry unprocessed items.

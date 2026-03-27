@@ -86,11 +86,11 @@ const Users = Entity.make({
   },
   indexes: {
     byRole: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["role"],
-      sk: ["userId"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["role"] },
+      sk: { field: "gsi1sk", composite: ["userId"] },
     },
-    byEmail: { index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" }, composite: ["email"], sk: [] },
+    byEmail: { name: "gsi2", pk: { field: "gsi2pk", composite: ["email"] }, sk: { field: "gsi2sk", composite: [] } },
   },
   unique: { email: ["email"] },
   timestamps: true,
@@ -106,9 +106,9 @@ const Tasks = Entity.make({
   },
   indexes: {
     byUser: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["userId"],
-      sk: ["status", "taskId"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["userId"] },
+      sk: { field: "gsi1sk", composite: ["status", "taskId"] },
     },
   },
   timestamps: true,
@@ -183,9 +183,9 @@ const Articles = Entity.make({
   },
   indexes: {
     byAuthor: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["authorId"],
-      sk: ["articleId"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["authorId"] },
+      sk: { field: "gsi1sk", composite: ["articleId"] },
     },
   },
   refs: {

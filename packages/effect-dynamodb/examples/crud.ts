@@ -78,9 +78,9 @@ const Users = Entity.make({
   },
   indexes: {
     byRole: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["role"],
-      sk: ["userId"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["role"] },
+      sk: { field: "gsi1sk", composite: ["userId"] },
     },
   },
   timestamps: true,
@@ -96,9 +96,9 @@ const Tasks = Entity.make({
   },
   indexes: {
     byUser: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["userId"],
-      sk: ["status", "taskId"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["userId"] },
+      sk: { field: "gsi1sk", composite: ["status", "taskId"] },
     },
   },
   timestamps: true,
@@ -132,9 +132,9 @@ const Projects = Entity.make({
   },
   indexes: {
     byOwner: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["ownerId"],
-      sk: ["department"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["ownerId"] },
+      sk: { field: "gsi1sk", composite: ["department"] },
     },
   },
   timestamps: true,
@@ -158,9 +158,9 @@ const Employees = Entity.make({
   },
   indexes: {
     byTenant: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["tenantId"],
-      sk: ["region"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["region"] },
     },
   },
 })

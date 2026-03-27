@@ -135,9 +135,9 @@ describe("Entity", () => {
         },
         indexes: {
           byEmail: {
-            index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-            composite: ["email"],
-            sk: [],
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["email"] },
+            sk: { field: "gsi1sk", composite: [] },
           },
         },
       })
@@ -175,7 +175,7 @@ describe("Entity", () => {
             sk: { field: "sk", composite: [] },
           } as any,
         }),
-      ).toThrow("primary index must have at least one composite attribute across pk and sk")
+      ).toThrow("[EDD-9001]")
     })
 
     it("allows primary index with empty pk composite if sk has composites", () => {
@@ -348,9 +348,9 @@ describe("Entity", () => {
         },
         indexes: {
           byEmail: {
-            index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-            composite: ["email"],
-            sk: [],
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["email"] },
+            sk: { field: "gsi1sk", composite: [] },
           },
         },
         timestamps: true,
@@ -574,9 +574,9 @@ describe("Entity", () => {
           },
           indexes: {
             byEmail: {
-              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-              composite: ["email"],
-              sk: [],
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["email"] },
+              sk: { field: "gsi1sk", composite: [] },
             },
           },
         }),
@@ -620,9 +620,9 @@ describe("Entity", () => {
           },
           indexes: {
             byEmail: {
-              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-              composite: ["email"],
-              sk: [],
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["email"] },
+              sk: { field: "gsi1sk", composite: [] },
             },
           },
         }),
@@ -646,9 +646,9 @@ describe("Entity", () => {
           },
           indexes: {
             byEmail: {
-              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-              composite: ["email"],
-              sk: [],
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["email"] },
+              sk: { field: "gsi1sk", composite: [] },
             },
           },
         }),
@@ -676,14 +676,14 @@ describe("Entity", () => {
           },
           indexes: {
             byEmail: {
-              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-              composite: ["email"],
-              sk: [],
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["email"] },
+              sk: { field: "gsi1sk", composite: [] },
             },
             byRole: {
-              index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-              composite: ["role"],
-              sk: ["userId"],
+              name: "gsi2",
+              pk: { field: "gsi2pk", composite: ["role"] },
+              sk: { field: "gsi2sk", composite: ["userId"] },
             },
           },
         }),
@@ -707,9 +707,9 @@ describe("Entity", () => {
           indexes: {
             byTenant: {
               collection: "TenantItems",
-              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-              composite: ["role"],
-              sk: [],
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["role"] },
+              sk: { field: "gsi1sk", composite: [] },
             },
           },
         }),
@@ -804,14 +804,14 @@ describe("Entity", () => {
           },
           indexes: {
             byEmail: {
-              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-              composite: ["email"],
-              sk: [],
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["email"] },
+              sk: { field: "gsi1sk", composite: [] },
             },
             byRole: {
-              index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-              composite: ["role"],
-              sk: ["userId"],
+              name: "gsi2",
+              pk: { field: "gsi2pk", composite: ["role"] },
+              sk: { field: "gsi2sk", composite: ["userId"] },
             },
           },
         }),
@@ -834,9 +834,9 @@ describe("Entity", () => {
           },
           indexes: {
             byEmail: {
-              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-              composite: ["email"],
-              sk: [],
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["email"] },
+              sk: { field: "gsi1sk", composite: [] },
             },
           },
         }),
@@ -887,9 +887,9 @@ describe("Entity", () => {
         },
         indexes: {
           byEmail: {
-            index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-            composite: ["email"],
-            sk: [],
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["email"] },
+            sk: { field: "gsi1sk", composite: [] },
           },
         },
         timestamps: true,
@@ -1180,9 +1180,9 @@ describe("Entity", () => {
             },
             indexes: {
               byEmail: {
-                index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-                composite: ["email"],
-                sk: [],
+                name: "gsi1",
+                pk: { field: "gsi1pk", composite: ["email"] },
+                sk: { field: "gsi1sk", composite: [] },
               },
             },
           }),
@@ -1248,9 +1248,9 @@ describe("Entity", () => {
           },
           indexes: {
             byEmail: {
-              index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-              composite: ["email"],
-              sk: [],
+              name: "gsi2",
+              pk: { field: "gsi2pk", composite: ["email"] },
+              sk: { field: "gsi2sk", composite: [] },
             },
           },
           timestamps: true,
@@ -1314,7 +1314,7 @@ describe("Entity", () => {
 
         const call = mockPutItem.mock.calls[0]![0]
         expect(call.TableName).toBe("test-table")
-        expect(call.Item.pk.S).toBe("$myapp#v1#simpleitem#i-1")
+        expect(call.Item.pk.S).toBe("$myapp#v1#simpleitem#itemid_i-1")
         expect(call.Item.__edd_e__.S).toBe("SimpleItem")
       }).pipe(Effect.provide(TestLayer)),
     )
@@ -1538,7 +1538,7 @@ describe("Entity", () => {
 
         const call = mockGetItem.mock.calls[0]![0]
         expect(call.TableName).toBe("test-table")
-        expect(call.Key.pk.S).toBe("$myapp#v1#simpleitem#i-1")
+        expect(call.Key.pk.S).toBe("$myapp#v1#simpleitem#itemid_i-1")
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -2153,7 +2153,7 @@ describe("Entity", () => {
         expect(mockDeleteItem).toHaveBeenCalledOnce()
         const call = mockDeleteItem.mock.calls[0]![0]
         expect(call.TableName).toBe("test-table")
-        expect(call.Key.pk.S).toBe("$myapp#v1#simpleitem#i-1")
+        expect(call.Key.pk.S).toBe("$myapp#v1#simpleitem#itemid_i-1")
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -2220,9 +2220,9 @@ describe("Entity", () => {
           },
           indexes: {
             byEmail: {
-              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-              composite: ["email"],
-              sk: [],
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["email"] },
+              sk: { field: "gsi1sk", composite: [] },
             },
           },
         }),
@@ -2246,9 +2246,9 @@ describe("Entity", () => {
           },
           indexes: {
             byRole: {
-              index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-              composite: ["role"],
-              sk: ["userId"],
+              name: "gsi2",
+              pk: { field: "gsi2pk", composite: ["role"] },
+              sk: { field: "gsi2sk", composite: ["userId"] },
             },
           },
         }),
@@ -2292,9 +2292,9 @@ describe("Entity", () => {
             },
             indexes: {
               byEmail: {
-                index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-                composite: ["email"],
-                sk: [],
+                name: "gsi1",
+                pk: { field: "gsi1pk", composite: ["email"] },
+                sk: { field: "gsi1sk", composite: [] },
               },
             },
           }),
@@ -2319,9 +2319,9 @@ describe("Entity", () => {
           },
           indexes: {
             byRole: {
-              index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-              composite: ["role"],
-              sk: ["userId"],
+              name: "gsi2",
+              pk: { field: "gsi2pk", composite: ["role"] },
+              sk: { field: "gsi2sk", composite: ["userId"] },
             },
           },
         }),
@@ -2342,9 +2342,9 @@ describe("Entity", () => {
           },
           indexes: {
             byRole: {
-              index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-              composite: ["role"],
-              sk: ["userId", "email"],
+              name: "gsi2",
+              pk: { field: "gsi2pk", composite: ["role"] },
+              sk: { field: "gsi2sk", composite: ["userId", "email"] },
             },
           },
         }),
@@ -2369,9 +2369,9 @@ describe("Entity", () => {
           },
           indexes: {
             byRole: {
-              index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-              composite: ["role"],
-              sk: ["userId", "email"],
+              name: "gsi2",
+              pk: { field: "gsi2pk", composite: ["role"] },
+              sk: { field: "gsi2sk", composite: ["userId", "email"] },
             },
           },
         }),
@@ -3091,9 +3091,9 @@ describe("Entity", () => {
         },
         indexes: {
           byTenant: {
-            index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-            composite: ["tenantId"],
-            sk: ["region"],
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["tenantId"] },
+            sk: { field: "gsi1sk", composite: ["region"] },
           },
         },
       }),
@@ -3113,10 +3113,10 @@ describe("Entity", () => {
         const call = mockPutItem.mock.calls[0]![0]
         const item = call.Item
         // Primary keys present
-        expect(item.pk.S).toBe("$myapp#v1#tenantitem#i-1")
+        expect(item.pk.S).toBe("$myapp#v1#tenantitem#itemid_i-1")
         // GSI keys present
-        expect(item.gsi1pk.S).toBe("$myapp#v1#tenantitem#t-1")
-        expect(item.gsi1sk.S).toBe("$myapp#v1#tenantitem#us-east-1")
+        expect(item.gsi1pk.S).toBe("$myapp#v1#tenantitem#tenantid_t-1")
+        expect(item.gsi1sk.S).toBe("$myapp#v1#tenantitem#region_us-east-1")
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -3129,7 +3129,7 @@ describe("Entity", () => {
         const call = mockPutItem.mock.calls[0]![0]
         const item = call.Item
         // Primary keys present
-        expect(item.pk.S).toBe("$myapp#v1#tenantitem#i-2")
+        expect(item.pk.S).toBe("$myapp#v1#tenantitem#itemid_i-2")
         expect(item.sk.S).toBe("$myapp#v1#tenantitem")
         // GSI keys absent
         expect(item.gsi1pk).toBeUndefined()
@@ -3146,7 +3146,7 @@ describe("Entity", () => {
 
         const call = mockPutItem.mock.calls[0]![0]
         const item = call.Item
-        expect(item.pk.S).toBe("$myapp#v1#tenantitem#i-3")
+        expect(item.pk.S).toBe("$myapp#v1#tenantitem#itemid_i-3")
         expect(item.gsi1pk).toBeUndefined()
         expect(item.gsi1sk).toBeUndefined()
       }).pipe(Effect.provide(TestLayer)),
@@ -3172,9 +3172,9 @@ describe("Entity", () => {
         },
         indexes: {
           byTenant: {
-            index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-            composite: ["tenantId"],
-            sk: ["region"],
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["tenantId"] },
+            sk: { field: "gsi1sk", composite: ["region"] },
           },
         },
       }),
@@ -3189,7 +3189,7 @@ describe("Entity", () => {
             tenantId: "t-1",
             region: "us-east-1",
             email: "a@b.com",
-            pk: "$myapp#v1#tenantuser#u-1",
+            pk: "$myapp#v1#tenantuser#userid_u-1",
             sk: "$myapp#v1#tenantuser",
             __edd_e__: "TenantUser",
           }),
@@ -3217,10 +3217,10 @@ describe("Entity", () => {
             tenantId: "t-2",
             region: "eu-west-1",
             email: "a@b.com",
-            pk: "$myapp#v1#tenantuser#u-1",
+            pk: "$myapp#v1#tenantuser#userid_u-1",
             sk: "$myapp#v1#tenantuser",
-            gsi1pk: "$myapp#v1#tenantuser#t-2",
-            gsi1sk: "$myapp#v1#tenantuser#eu-west-1",
+            gsi1pk: "$myapp#v1#tenantuser#tenantid_t-2",
+            gsi1sk: "$myapp#v1#tenantuser#region_eu-west-1",
             __edd_e__: "TenantUser",
           }),
         })
@@ -3255,8 +3255,8 @@ describe("Entity", () => {
 
         const gsi1pkVal = call.ExpressionAttributeValues[gsi1pkValMatch![1]!]
         const gsi1skVal = call.ExpressionAttributeValues[gsi1skValMatch![1]!]
-        expect(gsi1pkVal.S).toBe("$myapp#v1#tenantuser#t-2")
-        expect(gsi1skVal.S).toBe("$myapp#v1#tenantuser#eu-west-1")
+        expect(gsi1pkVal.S).toBe("$myapp#v1#tenantuser#tenantid_t-2")
+        expect(gsi1skVal.S).toBe("$myapp#v1#tenantuser#region_eu-west-1")
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -3329,14 +3329,14 @@ describe("Entity", () => {
             },
             indexes: {
               byTenant: {
-                index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-                composite: ["tenantId"],
-                sk: ["region"],
+                name: "gsi1",
+                pk: { field: "gsi1pk", composite: ["tenantId"] },
+                sk: { field: "gsi1sk", composite: ["region"] },
               },
               byDepartment: {
-                index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-                composite: ["department"],
-                sk: [],
+                name: "gsi2",
+                pk: { field: "gsi2pk", composite: ["department"] },
+                sk: { field: "gsi2sk", composite: [] },
               },
             },
           }),
@@ -4389,9 +4389,9 @@ describe("Entity", () => {
             },
             indexes: {
               byEvent: {
-                index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-                composite: ["eventId"],
-                sk: [],
+                name: "gsi1",
+                pk: { field: "gsi1pk", composite: ["eventId"] },
+                sk: { field: "gsi1sk", composite: [] },
               },
             },
             timestamps: true,

@@ -1396,7 +1396,7 @@ describe("Aggregate write path", () => {
         // Mock ref hydration via batchGetItem — Batch.get groups by table
         const refItems: Record<string, Record<string, unknown>> = {
           venue: {
-            pk: "$myapp#v1#venue#v-1",
+            pk: "$myapp#v1#venue#venueid_v-1",
             sk: "$myapp#v1#venue",
             __edd_e__: "Venue",
             venueId: "v-1",
@@ -1404,7 +1404,7 @@ describe("Aggregate write path", () => {
             city: "Melbourne",
           },
           "team-aus": {
-            pk: "$myapp#v1#team#t-aus",
+            pk: "$myapp#v1#team#teamid_t-aus",
             sk: "$myapp#v1#team",
             __edd_e__: "Team",
             teamId: "t-aus",
@@ -1412,7 +1412,7 @@ describe("Aggregate write path", () => {
             country: "Australia",
           },
           "team-ind": {
-            pk: "$myapp#v1#team#t-ind",
+            pk: "$myapp#v1#team#teamid_t-ind",
             sk: "$myapp#v1#team",
             __edd_e__: "Team",
             teamId: "t-ind",
@@ -1420,21 +1420,21 @@ describe("Aggregate write path", () => {
             country: "India",
           },
           "coach-1": {
-            pk: "$myapp#v1#coach#c-1",
+            pk: "$myapp#v1#coach#coachid_c-1",
             sk: "$myapp#v1#coach",
             __edd_e__: "Coach",
             coachId: "c-1",
             name: "Andrew McDonald",
           },
           "coach-2": {
-            pk: "$myapp#v1#coach#c-2",
+            pk: "$myapp#v1#coach#coachid_c-2",
             sk: "$myapp#v1#coach",
             __edd_e__: "Coach",
             coachId: "c-2",
             name: "Gautam Gambhir",
           },
           "player-smith": {
-            pk: "$myapp#v1#player#p-smith",
+            pk: "$myapp#v1#player#playerid_p-smith",
             sk: "$myapp#v1#player",
             __edd_e__: "Player",
             playerId: "p-smith",
@@ -1442,7 +1442,7 @@ describe("Aggregate write path", () => {
             role: "batter",
           },
           "player-kohli": {
-            pk: "$myapp#v1#player#p-kohli",
+            pk: "$myapp#v1#player#playerid_p-kohli",
             sk: "$myapp#v1#player",
             __edd_e__: "Player",
             playerId: "p-kohli",
@@ -2256,21 +2256,21 @@ describe("Aggregate write path", () => {
         // Setup ref mocks for umpires via batchGetItem
         const umpireItems: Record<string, Record<string, unknown>> = {
           "u-1": {
-            pk: "$myapp#v1#umpire#u-1",
+            pk: "$myapp#v1#umpire#umpireid_u-1",
             sk: "$myapp#v1#umpire",
             __edd_e__: "Umpire",
             umpireId: "u-1",
             name: "Ravi Bowen",
           },
           "u-2": {
-            pk: "$myapp#v1#umpire#u-2",
+            pk: "$myapp#v1#umpire#umpireid_u-2",
             sk: "$myapp#v1#umpire",
             __edd_e__: "Umpire",
             umpireId: "u-2",
             name: "Kumar D.",
           },
           "u-3": {
-            pk: "$myapp#v1#umpire#u-3",
+            pk: "$myapp#v1#umpire#umpireid_u-3",
             sk: "$myapp#v1#umpire",
             __edd_e__: "Umpire",
             umpireId: "u-3",

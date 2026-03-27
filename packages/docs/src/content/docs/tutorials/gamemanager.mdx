@@ -136,96 +136,37 @@ export const TeamId = Schema.String.pipe(Schema.brand("TeamId"))
 export type TeamId = typeof TeamId.Type
 ```
 
-> **Concept: Schema.brand** — Creates a nominal type that is structurally a `string` but branded at the type level. `TeamId` and `PlayerId` are both strings at runtime, but TypeScript treats them as incompatible types. This catches mix-ups at compile time.
+> **Concept: Schema.brand** — Creates a nominal type that is structurally a `string` but branded at the type level. When you add `PlayerId` later, TypeScript will treat `TeamId` and `PlayerId` as incompatible types even though both are strings at runtime. This catches mix-ups at compile time.
 >
-> These branded types flow through the entire stack: `Entity.Input<typeof Teams>` has `id: TeamId`, `Entity.Key<typeof Teams>` has `id: TeamId`, and ref input types like `Entity.Input<typeof SquadSelections>` have `teamId: TeamId` and `playerId: PlayerId` — ensuring type safety from models through services to API handlers. Each branded ID also doubles as a Schema — use `TeamId` directly in `HttpApiEndpoint` params to decode URL strings into branded types at the API boundary.
+> These branded types flow through the entire stack: `Entity.Input<typeof Teams>` has `id: TeamId`, `Entity.Key<typeof Teams>` has `id: TeamId`. Each branded ID also doubles as a Schema — use `TeamId` directly in `HttpApiEndpoint` params to decode URL strings into branded types at the API boundary.
 
-### 2.2 Enums
+### 2.2 Team model
 
-```ts region="model-enums" example="cricket.ts"
-const PlayerRole = {
-  Batter: "batter",
-  Bowler: "bowler",
-  AllRounder: "all-rounder",
-  WicketKeeper: "wicket-keeper",
-} as const
-const PlayerRoleSchema = Schema.Literals(Object.values(PlayerRole))
-```
-
-> **Pattern: Enum objects with Schema.Literals** — Define enums as `const` objects for autocomplete and referenceability (`PlayerRole.Batter`), then derive a `Schema.Literals` for runtime validation. This gives you two things: a namespace (`PlayerRole.Batter`) and a schema (`PlayerRoleSchema`).
-
-### 2.3 Team model
-
-```ts region="model-standalone" example="cricket.ts"
+```ts title="src/models/Team.ts" region="model-team" example="cricket.ts"
 class Team extends Schema.Class<Team>("Team")({
   id: Schema.String.pipe(DynamoModel.identifier),
   name: Schema.String,
   country: Schema.String,
   ranking: Schema.Number,
 }) {}
-
-class Player extends Schema.Class<Player>("Player")({
-  id: Schema.String.pipe(DynamoModel.identifier),
-  firstName: Schema.String,
-  lastName: Schema.String,
-  role: PlayerRoleSchema,
-}) {}
-
-class Coach extends Schema.Class<Coach>("Coach")({
-  id: Schema.String.pipe(DynamoModel.identifier),
-  name: Schema.String,
-}) {}
-
-class Venue extends Schema.Class<Venue>("Venue")({
-  id: Schema.String.pipe(DynamoModel.identifier),
-  name: Schema.String,
-  city: Schema.String,
-}) {}
 ```
 
-Two things to notice:
+Three things to notice:
 
 1. **`Schema.Class`** — Defines a runtime-validated class. `new Team({ id: "aus", name: "Australia", country: "Australia", ranking: 1 })` validates all fields.
 
-2. **`DynamoModel.identifier`** — Marks the `id` field as the primary business identifier. Other entities can reference this entity by this field. The model stays pure otherwise -- no DynamoDB concepts.
+2. **`DynamoModel.identifier`** — Marks the `id` field as the primary business identifier. Other entities can reference this entity by this field. The model stays pure otherwise — no DynamoDB concepts.
 
 3. **Pure domain model** — No DynamoDB imports or annotations beyond the identifier marker. The model is portable and testable — DynamoDB binding happens later at the entity level.
 
-### 2.4 Teams entity
+### 2.3 Teams entity
 
 The entity binds your pure model to DynamoDB with indexes, key composition, and optional features:
 
-```ts region="entity-standalone" example="cricket.ts"
+```ts title="src/entities/Teams.ts" region="entity-team" example="cricket.ts"
 const Teams = Entity.make({
   model: DynamoModel.configure(Team, { id: { field: "teamId" } }),
   entityType: "Team",
-  primaryKey: {
-    pk: { field: "pk", composite: ["id"] },
-    sk: { field: "sk", composite: [] },
-  },
-})
-
-const Players = Entity.make({
-  model: DynamoModel.configure(Player, { id: { field: "playerId" } }),
-  entityType: "Player",
-  primaryKey: {
-    pk: { field: "pk", composite: ["id"] },
-    sk: { field: "sk", composite: [] },
-  },
-})
-
-const Coaches = Entity.make({
-  model: DynamoModel.configure(Coach, { id: { field: "coachId" } }),
-  entityType: "Coach",
-  primaryKey: {
-    pk: { field: "pk", composite: ["id"] },
-    sk: { field: "sk", composite: [] },
-  },
-})
-
-const Venues = Entity.make({
-  model: DynamoModel.configure(Venue, { id: { field: "venueId" } }),
-  entityType: "Venue",
   primaryKey: {
     pk: { field: "pk", composite: ["id"] },
     sk: { field: "sk", composite: [] },
@@ -243,28 +184,28 @@ Let's break down what each piece does:
 
 > **Key concept:** `Entity.make` returns a **pure entity definition** — no table reference, no executable operations. The entity declares its model, primary key, and configuration. GSI access patterns are declared separately as Collections. Table association happens when you register it on a `Table.make({ entities: { Teams } })`, which we'll create next.
 
-### 2.5 Schema and Table
+### 2.4 Schema and Table
 
 Now that we have an entity, we need a **DynamoSchema** (application namespace) and a **Table** (physical table binding) to assemble it:
 
-```ts region="schema" example="cricket.ts"
+```ts title="src/entities/Schema.ts" region="schema" example="cricket.ts"
 const CricketSchema = DynamoSchema.make({ name: "cricket", version: 1 })
 ```
 
-```ts region="table" example="cricket.ts"
+```ts title="src/entities/Schema.ts"
 const MainTable = Table.make({
   schema: CricketSchema,
-  entities: { Teams, Players, Coaches, Venues, SquadSelections },
+  entities: { Teams },
 })
 ```
 
-> **Concept: Single-table design** — All entities share one DynamoDB table. The schema's `name` and `version` become part of every key prefix (`$cricket#v1#...`), preventing collisions between entity types. `Table.make(...)` registers entities up front — you'll add more to the `entities` record as you create them throughout this tutorial.
+> **Concept: Single-table design** — All entities share one DynamoDB table. The schema's `name` and `version` become part of every key prefix (`$cricket#v1#...`), preventing collisions between entity types. You'll add more entities to `Table.make(...)` as you build them throughout this tutorial.
 
 > **Note:** Entity files don't import the table. Entities are pure definitions. The dependency flows the other way: `Schema.ts` imports entities and registers them on the table. In the service layer, `DynamoClient.make(MainTable)` binds all registered entities and returns a typed client where every operation has `R = never`.
 
 Run `pnpm check` — the model, entity, and table should compile.
 
-### 2.6 Pagination helpers
+### 2.5 Pagination helpers
 
 Before building the service, create shared pagination schemas that will be reused by every entity:
 
@@ -324,18 +265,16 @@ Three things to notice:
 
 > **Concept: Query combinators** — `Query.limit`, `Query.reverse`, and `Query.startFrom` are composable functions that modify a query description. Nothing executes until you call `Query.execute` or `Query.collect`.
 
-### 2.7 List filter schema
+### 2.6 List filter schema
 
 Each entity's list endpoint has its own filter fields. Define these as `Schema.Struct` values — the same schema drives the API endpoint query definition and the service's filter type:
 
 ```ts
 // src/models/Filters.ts
 import { Schema } from "effect"
-import { GenderQuery } from "./Enums.js"
 
 export const TeamListFilter = Schema.Struct({
-  gender: Schema.optionalKey(GenderQuery),
-  league: Schema.optionalKey(Schema.String),
+  country: Schema.optionalKey(Schema.String),
 })
 export type TeamListFilter = typeof TeamListFilter.Type
 ```
@@ -344,7 +283,7 @@ export type TeamListFilter = typeof TeamListFilter.Type
 
 We'll add more filter schemas to this file as we add entities.
 
-### 2.8 TeamService
+### 2.7 TeamService
 
 ```ts
 // src/services/TeamService.ts
@@ -407,7 +346,7 @@ Key patterns:
 
 - **`Query.execute`** — Pipe terminal that executes the query and returns `{ items, cursor }` for pagination. Resolves `DynamoClient | TableConfig` from context.
 
-### 2.9 API error types
+### 2.8 API error types
 
 ```ts
 // src/api/ApiErrors.ts
@@ -436,7 +375,7 @@ export class ApiUnprocessableEntity extends Schema.ErrorClass<ApiUnprocessableEn
 
 > **Concept: Schema.ErrorClass for API errors** — Each error uses `Schema.ErrorClass` — the idiomatic Effect v4 pattern for HTTP API errors. The second argument sets class-level annotations including `httpApiStatus`. This gives you proper Error instances with constructors (`new ApiNotFound({ error: "NotFound", message: "..." })`), clean JSON responses (no `_tag` in the wire format), and status-code-based discrimination — the HttpApi client dispatches by HTTP status code, not by `_tag`, so each error just needs a unique status.
 
-### 2.10 TeamsApi endpoint definitions
+### 2.9 TeamsApi endpoint definitions
 
 ```ts
 // src/api/TeamsApi.ts
@@ -485,7 +424,7 @@ export const TeamsApi = HttpApiGroup.make("teams").add(
 
 > **`Teams.createSchema` and `Teams.updateSchema`** — Every entity exposes typed schemas derived from its model. `createSchema` is the input schema minus primary key composites (the common pattern where IDs are auto-generated). `updateSchema` makes all non-PK fields optional. Both preserve branded types — ref ID fields use `PlayerId`, `TeamId`, etc., not plain `string`. Use these directly as `HttpApiEndpoint` payloads to avoid manually re-specifying field schemas.
 
-### 2.11 API composition and handler wiring
+### 2.10 API composition and handler wiring
 
 ```ts
 // src/api/Api.ts
@@ -597,7 +536,7 @@ export const ApiLayer = HttpApiBuilder.layer(GameManagerApi).pipe(
 
 > **Concept: Layer assembly** — Services are composed into layers. `Layer.effect(TeamService, TeamService.make)` creates a layer that runs `TeamService.make` and provides the result. `Layer.mergeAll` combines independent layers. `Layer.provide` feeds dependencies downward.
 
-### 2.12 Table creation and server entry point
+### 2.11 Table creation and server entry point
 
 ```ts
 // src/create-table.ts
@@ -688,7 +627,7 @@ const Live = HttpRouter.serve(AppWithInfra, {
 Layer.launch(Live).pipe(NodeRuntime.runMain)
 ```
 
-### 2.13 Run it!
+### 2.12 Run it!
 
 Run `pnpm check` to verify everything compiles. Then start DynamoDB Local, create the table, and launch the server:
 
@@ -1754,9 +1693,9 @@ const SquadSelections = Entity.make({
   },
   indexes: {
     byPlayer: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["playerId"],
-      sk: ["squadId", "selectionNumber"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["playerId"] },
+      sk: { field: "gsi1sk", composite: ["squadId", "selectionNumber"] },
     },
   },
   refs: {

@@ -38,9 +38,9 @@ const UserEntity = Entity.make({
   },
   indexes: {
     byRole: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["role"],
-      sk: ["userId"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["role"] },
+      sk: { field: "gsi1sk", composite: ["userId"] },
     },
   },
 })
@@ -54,9 +54,9 @@ const OrderEntity = Entity.make({
   },
   indexes: {
     byUser: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["userId"],
-      sk: ["orderId"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["userId"] },
+      sk: { field: "gsi1sk", composite: ["orderId"] },
     },
   },
 })
@@ -111,7 +111,7 @@ describe("Transaction", () => {
           email: "alice@example.com",
           name: "Alice",
           role: "admin",
-          pk: "$myapp#v1#user#u-1",
+          pk: "$myapp#v1#user#userid_u-1",
           sk: "$myapp#v1#user",
           __edd_e__: "User",
         })
@@ -121,7 +121,7 @@ describe("Transaction", () => {
           product: "Widget",
           quantity: 3,
           status: "pending",
-          pk: "$myapp#v1#order#ord-1",
+          pk: "$myapp#v1#order#orderid_ord-1",
           sk: "$myapp#v1#order",
           __edd_e__: "Order",
         })
@@ -146,11 +146,11 @@ describe("Transaction", () => {
         expect(call.TransactItems).toHaveLength(2)
 
         const userKey = fromAttributeMap(call.TransactItems[0].Get.Key)
-        expect(userKey.pk).toBe("$myapp#v1#user#u-1")
+        expect(userKey.pk).toBe("$myapp#v1#user#userid_u-1")
         expect(userKey.sk).toBe("$myapp#v1#user")
 
         const orderKey = fromAttributeMap(call.TransactItems[1].Get.Key)
-        expect(orderKey.pk).toBe("$myapp#v1#order#ord-1")
+        expect(orderKey.pk).toBe("$myapp#v1#order#orderid_ord-1")
         expect(orderKey.sk).toBe("$myapp#v1#order")
       }).pipe(Effect.provide(TestLayer)),
     )
@@ -215,7 +215,7 @@ describe("Transaction", () => {
           email: "alice@example.com",
           name: "Alice",
           role: "invalid-role", // not "admin" or "member"
-          pk: "$myapp#v1#user#u-1",
+          pk: "$myapp#v1#user#userid_u-1",
           sk: "$myapp#v1#user",
           __edd_e__: "User",
         })
@@ -264,18 +264,18 @@ describe("Transaction", () => {
 
         // Verify composed keys and entity type discriminator
         const userItem = fromAttributeMap(call.TransactItems[0].Put.Item)
-        expect(userItem.pk).toBe("$myapp#v1#user#u-1")
+        expect(userItem.pk).toBe("$myapp#v1#user#userid_u-1")
         expect(userItem.sk).toBe("$myapp#v1#user")
         expect(userItem.__edd_e__).toBe("User")
-        expect(userItem.gsi1pk).toBe("$myapp#v1#user#admin")
-        expect(userItem.gsi1sk).toBe("$myapp#v1#user#u-1")
+        expect(userItem.gsi1pk).toBe("$myapp#v1#user#role_admin")
+        expect(userItem.gsi1sk).toBe("$myapp#v1#user#userid_u-1")
 
         const orderItem = fromAttributeMap(call.TransactItems[1].Put.Item)
-        expect(orderItem.pk).toBe("$myapp#v1#order#ord-1")
+        expect(orderItem.pk).toBe("$myapp#v1#order#orderid_ord-1")
         expect(orderItem.sk).toBe("$myapp#v1#order")
         expect(orderItem.__edd_e__).toBe("Order")
-        expect(orderItem.gsi1pk).toBe("$myapp#v1#order#u-1")
-        expect(orderItem.gsi1sk).toBe("$myapp#v1#order#ord-1")
+        expect(orderItem.gsi1pk).toBe("$myapp#v1#order#userid_u-1")
+        expect(orderItem.gsi1sk).toBe("$myapp#v1#order#orderid_ord-1")
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -291,7 +291,7 @@ describe("Transaction", () => {
         expect(call.TransactItems[0].Delete).toBeDefined()
 
         const deleteKey = fromAttributeMap(call.TransactItems[0].Delete.Key)
-        expect(deleteKey.pk).toBe("$myapp#v1#user#u-1")
+        expect(deleteKey.pk).toBe("$myapp#v1#user#userid_u-1")
         expect(deleteKey.sk).toBe("$myapp#v1#user")
       }).pipe(Effect.provide(TestLayer)),
     )
@@ -546,7 +546,7 @@ describe("Transaction", () => {
           email: "alice@example.com",
           name: "Alice",
           role: "admin",
-          pk: "$myapp#v1#user#u-1",
+          pk: "$myapp#v1#user#userid_u-1",
           sk: "$myapp#v1#user",
           __edd_e__: "User",
         })
@@ -563,7 +563,7 @@ describe("Transaction", () => {
                 product: "Widget",
                 quantity: 3,
                 status: "pending",
-                pk: "$myapp#v1#order#ord-1",
+                pk: "$myapp#v1#order#orderid_ord-1",
                 sk: "$myapp#v1#order",
                 __edd_e__: "Order",
               }),
@@ -651,9 +651,9 @@ describe("Transaction", () => {
           },
           indexes: {
             byTenant: {
-              index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-              composite: ["tenantId"],
-              sk: [],
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["tenantId"] },
+              sk: { field: "gsi1sk", composite: [] },
             },
           },
         })
@@ -665,7 +665,7 @@ describe("Transaction", () => {
 
         const call = mockTransactWriteItems.mock.calls[0]![0]
         const item = fromAttributeMap(call.TransactItems[0].Put.Item)
-        expect(item.pk).toBe("$myapp#v1#sparseitem#i-1")
+        expect(item.pk).toBe("$myapp#v1#sparseitem#itemid_i-1")
         expect(item.__edd_e__).toBe("SparseItem")
         expect(item.gsi1pk).toBeUndefined()
         expect(item.gsi1sk).toBeUndefined()

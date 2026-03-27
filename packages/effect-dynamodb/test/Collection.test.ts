@@ -38,9 +38,9 @@ const UserEntity = Entity.make({
   indexes: {
     byTenant: {
       collection: "TenantItems",
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["tenantId"],
-      sk: [],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: [] },
     },
   },
 })
@@ -55,9 +55,9 @@ const OrderEntity = Entity.make({
   indexes: {
     byTenant: {
       collection: "TenantItems",
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["tenantId"],
-      sk: [],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: [] },
     },
   },
 })
@@ -360,9 +360,9 @@ describe("Collection", () => {
       indexes: {
         byTenant: {
           collection: "IsolatedTenantItems",
-          index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-          composite: ["tenantId"],
-          sk: [],
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["tenantId"] },
+          sk: { field: "gsi1sk", composite: [] },
         },
       },
     })
@@ -378,9 +378,9 @@ describe("Collection", () => {
       indexes: {
         byTenant: {
           collection: "IsolatedTenantItems",
-          index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-          composite: ["tenantId"],
-          sk: [],
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["tenantId"] },
+          sk: { field: "gsi1sk", composite: [] },
         },
       },
     })

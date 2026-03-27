@@ -19,14 +19,14 @@ const Tasks = Entity.make({
   },
   indexes: {
     byProject: {
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["projectId"],
-      sk: ["priority"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["projectId"] },
+      sk: { field: "gsi1sk", composite: ["priority"] },
     },
     byAssignee: {
-      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-      composite: ["assigneeId"],
-      sk: ["priority"],
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["assigneeId"] },
+      sk: { field: "gsi2sk", composite: ["priority"] },
     },
   },
   timestamps: true,
@@ -132,9 +132,9 @@ Attribute values are always preserved as-is.
 
 ## Collections
 
-Collections group multiple entity types that share a partition key, enabling cross-entity queries. Two modes are supported.
+Collections group multiple entity types that share a partition key, enabling cross-entity queries. Two modes are supported: **isolated** (default) and **clustered**.
 
-### Isolated Collections
+### Isolated Collections (Default)
 
 Each entity owns its sort key prefix. Collection queries use only the partition key — no sort key condition.
 
@@ -149,9 +149,9 @@ const IsolatedEmployees = Entity.make({
   indexes: {
     departmentStaff: {
       collection: "departmentStaff",
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["department"],
-      sk: ["hireDate"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["department"] },
+      sk: { field: "gsi1sk", composite: ["hireDate"] },
     },
   },
   timestamps: true,
@@ -174,9 +174,9 @@ const Equipments = Entity.make({
   indexes: {
     departmentStaff: {
       collection: "departmentStaff",
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-      composite: ["department"],
-      sk: ["purchaseDate"],
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["department"] },
+      sk: { field: "gsi1sk", composite: ["purchaseDate"] },
     },
   },
   timestamps: true,
@@ -217,10 +217,10 @@ const ClusteredEmployees = Entity.make({
   indexes: {
     tenantMembers: {
       collection: "tenantMembers",
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["department", "hireDate"] },
       type: "clustered",
-      composite: ["tenantId"],
-      sk: ["department", "hireDate"],
     },
   },
   timestamps: true,
@@ -236,10 +236,10 @@ const ClusteredTasks = Entity.make({
   indexes: {
     tenantMembers: {
       collection: "tenantMembers",
-      index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["projectId", "taskId"] },
       type: "clustered",
-      composite: ["tenantId"],
-      sk: ["projectId", "taskId"],
     },
   },
   timestamps: true,
@@ -268,7 +268,7 @@ collection prefix (shared)
 
 **Best for:** Cross-entity queries, relationship-dense data.
 
-### Sub-Collections (Clustered Only)
+### Sub-Collections (Isolated Only)
 
 Sub-collections create a hierarchy within the sort key. Multiple collections share the same index, with members grouped at different depths:
 
@@ -283,10 +283,9 @@ const SubEmployee = Entity.make({
   indexes: {
     contributions: {
       collection: "contributions",
-      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-      type: "clustered",
-      composite: ["employeeId"],
-      sk: ["department"],
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["employeeId"] },
+      sk: { field: "gsi2sk", composite: ["department"] },
     },
   },
   timestamps: true,
@@ -302,10 +301,9 @@ const SubTasks = Entity.make({
   indexes: {
     assignments: {
       collection: "assignments",
-      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-      type: "clustered",
-      composite: ["employeeId"],
-      sk: ["projectId", "taskId"],
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["employeeId"] },
+      sk: { field: "gsi2sk", composite: ["projectId", "taskId"] },
     },
   },
   timestamps: true,
@@ -321,10 +319,9 @@ const SubProjectMembers = Entity.make({
   indexes: {
     assignments: {
       collection: "assignments",
-      index: { name: "gsi2", pk: "gsi2pk", sk: "gsi2sk" },
-      type: "clustered",
-      composite: ["employeeId"],
-      sk: ["projectId"],
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["employeeId"] },
+      sk: { field: "gsi2sk", composite: ["projectId"] },
     },
   },
   timestamps: true,

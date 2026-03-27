@@ -72,9 +72,9 @@ const Teams = withConfig(
     },
     indexes: {
       byStatus: {
-        index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
-        composite: ["status"],
-        sk: [],
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["status"] },
+        sk: { field: "gsi1sk", composite: [] },
       },
     },
     timestamps: true,
