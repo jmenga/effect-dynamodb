@@ -682,28 +682,51 @@ function extractModelFields(
     const type = checker.getTypeAtLocation(prop.initializer)
     if (!type) return undefined
 
-    // For Schema.Class, the type has a `fields` property or we can get construct signatures
-    // Simpler: get the type's apparent properties
-    const fields = new Set<string>()
+    const fields = extractFieldsFromSchemaType(checker, type, prop.initializer)
+    if (fields && fields.size > 0) return fields
+  }
 
-    // Try to get the Schema type's fields — look for the Type member
-    const typeSymbol = type.getProperty("Type")
-    if (typeSymbol) {
-      const typeType = checker.getTypeOfSymbolAtLocation(typeSymbol, prop.initializer)
-      for (const p of typeType.getProperties()) {
-        fields.add(p.name)
-      }
-      if (fields.size > 0) return fields
-    }
+  return undefined
+}
 
-    // Fallback: try prototype properties
-    for (const p of type.getProperties()) {
-      // Skip internal/method properties
-      if (p.name.startsWith("_") || p.name === "constructor") continue
+/** Extract field names from a Schema.Class type or ConfiguredModel type. */
+function extractFieldsFromSchemaType(
+  checker: import("typescript").TypeChecker,
+  type: import("typescript").Type,
+  location: import("typescript").Node,
+): Set<string> | undefined {
+  const fields = new Set<string>()
+
+  // Try direct Schema.Class: has a `Type` property with the model fields
+  const typeSymbol = type.getProperty("Type")
+  if (typeSymbol) {
+    const typeType = checker.getTypeOfSymbolAtLocation(typeSymbol, location)
+    for (const p of typeType.getProperties()) {
       fields.add(p.name)
     }
     if (fields.size > 0) return fields
   }
+
+  // Try ConfiguredModel: has a `model` property that is the Schema.Class
+  const modelSymbol = type.getProperty("model")
+  if (modelSymbol) {
+    const modelType = checker.getTypeOfSymbolAtLocation(modelSymbol, location)
+    const innerTypeSymbol = modelType.getProperty("Type")
+    if (innerTypeSymbol) {
+      const innerTypeType = checker.getTypeOfSymbolAtLocation(innerTypeSymbol, location)
+      for (const p of innerTypeType.getProperties()) {
+        fields.add(p.name)
+      }
+      if (fields.size > 0) return fields
+    }
+  }
+
+  // Fallback: try prototype properties
+  for (const p of type.getProperties()) {
+    if (p.name.startsWith("_") || p.name === "constructor") continue
+    fields.add(p.name)
+  }
+  if (fields.size > 0) return fields
 
   return undefined
 }

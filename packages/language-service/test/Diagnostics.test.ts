@@ -65,6 +65,65 @@ function mockInfoWithModelFields(sourceFile: ts.SourceFile, fieldNames: string[]
   } as unknown as ts.server.PluginCreateInfo
 }
 
+// Mock that simulates ConfiguredModel (has .model.Type, not .Type directly)
+function mockInfoWithConfiguredModel(sourceFile: ts.SourceFile, fieldNames: string[]) {
+  const properties = fieldNames.map((name) => ({
+    name,
+    getName: () => name,
+    getEscapedName: () => name as ts.__String,
+  }))
+
+  const typeType = {
+    getProperties: () => properties,
+  }
+
+  const innerTypeSymbol = {
+    name: "Type",
+    getName: () => "Type",
+    getEscapedName: () => "Type" as ts.__String,
+  }
+
+  const innerModelType = {
+    getProperty: (name: string) => (name === "Type" ? innerTypeSymbol : undefined),
+    getProperties: () => properties,
+  }
+
+  const modelSymbol = {
+    name: "model",
+    getName: () => "model",
+    getEscapedName: () => "model" as ts.__String,
+  }
+
+  // ConfiguredModel type: has "model" property (not "Type" directly)
+  const configuredModelType = {
+    getProperty: (name: string) => (name === "model" ? modelSymbol : undefined),
+    getProperties: () => [
+      { name: "model", getName: () => "model", getEscapedName: () => "model" as ts.__String },
+      { name: "attributes", getName: () => "attributes", getEscapedName: () => "attributes" as ts.__String },
+    ],
+  }
+
+  const program = {
+    getSourceFile: () => sourceFile,
+    getTypeChecker: () => ({
+      getTypeAtLocation: () => configuredModelType,
+      getTypeOfSymbolAtLocation: (sym: any) => {
+        if (sym.name === "model") return innerModelType
+        if (sym.name === "Type") return typeType
+        return typeType
+      },
+      getSymbolAtLocation: () => undefined,
+    }),
+  } as unknown as ts.Program
+
+  return {
+    languageService: {
+      getProgram: () => program,
+      getSemanticDiagnostics: () => [],
+    },
+  } as unknown as ts.server.PluginCreateInfo
+}
+
 describe("Diagnostics", () => {
   describe("Entity.make validations", () => {
     it("EDD-9003: detects old GSI index format (string instead of object)", () => {
@@ -168,6 +227,29 @@ describe("Diagnostics", () => {
       expect(prefixDiag[0]!.messageText).toContain("`title`")
       expect(prefixDiag[0]!.messageText).toContain("`status`")
       expect(prefixDiag[0]!.category).toBe(ts.DiagnosticCategory.Error)
+    })
+
+    it("resolves model fields through DynamoModel.configure (ConfiguredModel)", () => {
+      const source = `
+        const Teams = Entity.make({
+          model: DynamoModel.configure(Team, { id: { field: "teamId" } }),
+          entityType: "Team",
+          primaryKey: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
+          },
+        })
+      `
+      const sf = parseSource(source)
+      // Use ConfiguredModel mock — type has .model.Type, not .Type directly
+      const info = mockInfoWithConfiguredModel(sf, ["id", "name", "country", "ranking"])
+      const diagnostics = getDiagnostics(ts, info, "test.ts", [])
+
+      // Should NOT produce EDD-9002 for "id" — it should resolve through ConfiguredModel
+      const unknownAttr = diagnostics.filter(
+        (d) => d.code === DiagnosticCode.UNKNOWN_COMPOSITE_ATTR,
+      )
+      expect(unknownAttr).toHaveLength(0)
     })
   })
 
