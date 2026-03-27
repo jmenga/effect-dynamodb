@@ -15,6 +15,7 @@ effect-dynamodb validates entity definitions, index configurations, and query in
 | EDD-9004 | SK prefix violation | Compile + Runtime | Sort key composites must follow prefix ordering |
 | EDD-9005 | SK composite in filter | Compile | Sort key composite used in `.filter()` instead of query input |
 | EDD-9006 | Unknown query property | Compile + Runtime | Query input contains a property that is not a composite attribute |
+| EDD-9007 | Field rename collision | Compile + Runtime | `DynamoModel.configure` renames a field to a name that already exists on the model |
 
 **Compile** = Detected by the Language Service Plugin (IDE squiggles before running code)
 **Runtime** = Detected when the code executes (throws `Error` or `ValidationError`)
@@ -165,6 +166,27 @@ db.entities.Tasks.byProject({ projectId: "p-1", bogus: "x" })
 // Valid attributes for byProject: projectId (PK), status (SK)
 ```
 
+### EDD-9007: Field Rename Collision
+
+`DynamoModel.configure` renames a field to a DynamoDB attribute name that already exists as another field on the model. This causes both model fields to map to the same physical DynamoDB attribute.
+
+```typescript
+class User extends Schema.Class<User>("User")({
+  id: Schema.String,
+  name: Schema.String,
+}) {}
+
+// ❌ Error: renaming `id` to `name` collides with existing model field `name`
+const UserModel = DynamoModel.configure(User, { id: { field: "name" } })
+```
+
+**Fix:** Choose a unique DynamoDB attribute name:
+
+```typescript
+// ✅ Correct — "userId" doesn't collide with any model field
+const UserModel = DynamoModel.configure(User, { id: { field: "userId" } })
+```
+
 ---
 
 ## Language Service Plugin
@@ -184,5 +206,5 @@ pnpm add -D @effect-dynamodb/language-service
 ```
 
 Diagnostics appear as:
-- **Errors** (red squiggles): EDD-9001, EDD-9002, EDD-9003, EDD-9004, EDD-9006
+- **Errors** (red squiggles): EDD-9001, EDD-9002, EDD-9003, EDD-9004, EDD-9006, EDD-9007
 - **Warnings** (yellow squiggles): EDD-9005

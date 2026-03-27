@@ -213,11 +213,11 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
 
   // #region restore
-  // Restore the soft-deleted item (version 4) — recomposes all index keys
+  // Restore the soft-deleted item — recomposes all index keys
   const restored = yield* db.entities.Employees.restore({ employeeId: "emp-alice" })
   yield* Console.log(`Restored: ${restored.displayName} (v${v(restored)})`)
   // #endregion
-  assertEq(v(restored), 4, "restored version 4")
+  assertEq(v(restored), 3, "restored version")
   assertEq(restored.displayName, "Alice Baker", "restored display name")
 
   // #region restore-visible

@@ -54,7 +54,7 @@ class Task extends Schema.Class<Task>("Task")({
   taskId: Schema.String,
   tenantId: Schema.String,
   projectId: Schema.String,
-  assigneeId: Schema.String,
+  employeeId: Schema.String,
   title: Schema.String,
   priority: Schema.Number,
 }) {}
@@ -94,7 +94,7 @@ const Tasks = Entity.make({
     },
     byAssignee: {
       name: "gsi2",
-      pk: { field: "gsi2pk", composite: ["assigneeId"] },
+      pk: { field: "gsi2pk", composite: ["employeeId"] },
       sk: { field: "gsi2sk", composite: ["priority"] },
     },
   },
@@ -315,7 +315,7 @@ const program = Effect.gen(function* () {
     taskId: "t-001",
     tenantId: "t-acme",
     projectId: "proj-alpha",
-    assigneeId: "emp-alice",
+    employeeId: "emp-alice",
     title: "Write API spec",
     priority: 1,
   })
@@ -324,7 +324,7 @@ const program = Effect.gen(function* () {
     taskId: "t-002",
     tenantId: "t-acme",
     projectId: "proj-alpha",
-    assigneeId: "emp-bob",
+    employeeId: "emp-bob",
     title: "Design database",
     priority: 2,
   })
@@ -333,7 +333,7 @@ const program = Effect.gen(function* () {
     taskId: "t-003",
     tenantId: "t-acme",
     projectId: "proj-beta",
-    assigneeId: "emp-alice",
+    employeeId: "emp-alice",
     title: "Build dashboard",
     priority: 1,
   })
@@ -343,7 +343,7 @@ const program = Effect.gen(function* () {
   // Logical names become query accessors — no physical index names in code
   const alphaTasks = yield* basic.entities.Tasks.byProject({ projectId: "proj-alpha" }).collect()
 
-  const aliceTasks = yield* basic.entities.Tasks.byAssignee({ assigneeId: "emp-alice" }).collect()
+  const aliceTasks = yield* basic.entities.Tasks.byAssignee({ employeeId: "emp-alice" }).collect()
   // #endregion
 
   assertEq(alphaTasks.length, 2, "proj-alpha has 2 tasks")
@@ -401,8 +401,8 @@ const program = Effect.gen(function* () {
 
   // #region isolated-queries
   // Collection query — returns grouped results by member
-  const { employees: engEmployees, equipments: engEquipment } = yield* isolated.collections
-    .DepartmentStaff!({ department: "engineering" }).collect()
+  const { IsolatedEmployees: engEmployees, Equipments: engEquipment } = yield* isolated.collections
+    .departmentStaff!({ department: "engineering" }).collect()
   // #endregion
 
   assertEq(engEmployees.length, 2, "engineering has 2 employees")
@@ -447,7 +447,7 @@ const program = Effect.gen(function* () {
     taskId: "t-001",
     tenantId: "t-acme",
     projectId: "proj-alpha",
-    assigneeId: "emp-alice",
+    employeeId: "emp-alice",
     title: "Write API spec",
     priority: 1,
   })
@@ -456,7 +456,7 @@ const program = Effect.gen(function* () {
     taskId: "t-002",
     tenantId: "t-acme",
     projectId: "proj-alpha",
-    assigneeId: "emp-bob",
+    employeeId: "emp-bob",
     title: "Design database",
     priority: 2,
   })
@@ -464,8 +464,8 @@ const program = Effect.gen(function* () {
 
   // #region clustered-queries
   // Cross-entity collection query — returns both entity types grouped
-  const { employees: acmeEmployees, tasks: acmeTasks } = yield* clustered.collections
-    .TenantMembers!({ tenantId: "t-acme" }).collect()
+  const { ClusteredEmployees: acmeEmployees, ClusteredTasks: acmeTasks } = yield* clustered.collections
+    .tenantMembers!({ tenantId: "t-acme" }).collect()
   // #endregion
 
   assertEq(acmeEmployees.length, 2, "t-acme has 2 employees")
@@ -501,7 +501,7 @@ const program = Effect.gen(function* () {
     taskId: "t-001",
     tenantId: "t-acme",
     projectId: "proj-alpha",
-    assigneeId: "emp-alice",
+    employeeId: "emp-alice",
     title: "Write API spec",
     priority: 1,
   })
@@ -510,7 +510,7 @@ const program = Effect.gen(function* () {
     taskId: "t-002",
     tenantId: "t-acme",
     projectId: "proj-beta",
-    assigneeId: "emp-alice",
+    employeeId: "emp-alice",
     title: "Design database",
     priority: 2,
   })
@@ -524,13 +524,13 @@ const program = Effect.gen(function* () {
 
   // #region subcollection-queries
   // Top-level collection: everything for an employee
-  const { employees: allContributions } = yield* sub.collections.Contributions!({
+  const { SubEmployee: allContributions } = yield* sub.collections.contributions!({
     employeeId: "emp-alice",
   }).collect()
 
   // Sub-collection: only assignments (tasks + project members)
-  const { tasks: assignedTasks, projectMembers: projectMemberships } = yield* sub.collections
-    .Assignments!({ employeeId: "emp-alice" }).collect()
+  const { SubTasks: assignedTasks, SubProjectMembers: projectMemberships } = yield* sub.collections
+    .assignments!({ employeeId: "emp-alice" }).collect()
   // #endregion
 
   assertEq(allContributions.length, 1, "contributions has 1 employee record")

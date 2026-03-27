@@ -237,7 +237,7 @@ const conflict = yield* db.entities.Users.update(
 
 ## Running the Example
 
-The complete runnable example is at [`examples/unique-constraints.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/unique-constraints.ts) in the repository.
+The complete runnable example is at [`examples/unique-constraints.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/examples/unique-constraints.ts) in the repository.
 
 ```bash
 docker run -d -p 8000:8000 amazon/dynamodb-local
@@ -284,4 +284,4 @@ Effect.runPromise(main).then(
 
 - [Modeling Guide](/effect-dynamodb/guides/modeling/) — Deep dive into models, schemas, tables, and entities
 - [Data Integrity](/effect-dynamodb/guides/data-integrity/) — Unique constraints, optimistic locking, and conditional writes
-- [Example: Human Resources](/effect-dynamodb/tutorials/human-resources/) — Single-table design with collections, transactions, and soft delete
+- [Example: Human Resources](/effect-dynamodb/examples/human-resources/) — Single-table design with collections, transactions, and soft delete

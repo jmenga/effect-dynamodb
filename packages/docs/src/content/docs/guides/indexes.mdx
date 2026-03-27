@@ -7,7 +7,7 @@ This guide covers how to define access patterns using indexes, how key generatio
 
 ## Entity Primary Key
 
-Entities define only their **primary key**. GSI access patterns are defined separately via `Collections.make()`.
+Entities define their **primary key** and **GSI indexes** together. Collections are auto-discovered from entities sharing the same `collection` name on a GSI.
 
 ```typescript region="task-entity" example="guide-indexes.ts"
 const Tasks = Entity.make({
@@ -25,7 +25,7 @@ const Tasks = Entity.make({
     },
     byAssignee: {
       name: "gsi2",
-      pk: { field: "gsi2pk", composite: ["assigneeId"] },
+      pk: { field: "gsi2pk", composite: ["employeeId"] },
       sk: { field: "gsi2sk", composite: ["priority"] },
     },
   },
@@ -70,7 +70,7 @@ Collection names become query accessors on the typed client:
 // Logical names become query accessors — no physical index names in code
 const alphaTasks = yield* basic.entities.Tasks.byProject({ projectId: "proj-alpha" }).collect()
 
-const aliceTasks = yield* basic.entities.Tasks.byAssignee({ assigneeId: "emp-alice" }).collect()
+const aliceTasks = yield* basic.entities.Tasks.byAssignee({ employeeId: "emp-alice" }).collect()
 ```
 
 You never reference physical index names (`gsi1`, `gsi2`) in application code.
@@ -352,24 +352,33 @@ $contributions
 
 ### Defining Collections
 
-Collections are defined with `Collections.make()`. Each collection owns the full GSI definition (index name, PK field/composites, SK field) and each member entity specifies only its SK composites:
+Collections are defined by adding a `collection` property to entity indexes. Entities sharing the same `collection` name on the same physical GSI are automatically grouped into a collection by `DynamoClient.make()`:
 
 ```typescript
-const MyCollection = Collections.make({ name: "collectionName",
-  index: "gsi1",                    // Physical GSI name
-  pk: { field: "gsi1pk", composite: ["tenantId"] },  // Shared PK
-  sk: { field: "gsi1sk" },         // Shared SK field
-  type: "clustered",               // "clustered" (default) or "isolated"
-  members: {
-    Employees: Collections.member(EmployeeEntity, {
-      sk: { composite: ["department", "hireDate"] },
-    }),
-    Tasks: Collections.member(TaskEntity, {
-      sk: { composite: ["projectId", "taskId"] },
-    }),
+// On EmployeeEntity
+indexes: {
+  tenantMembers: {
+    collection: "tenantMembers",
+    name: "gsi1",
+    pk: { field: "gsi1pk", composite: ["tenantId"] },
+    sk: { field: "gsi1sk", composite: ["department", "hireDate"] },
+    type: "clustered",
   },
-})
+}
+
+// On TaskEntity — same collection name + same GSI
+indexes: {
+  tenantMembers: {
+    collection: "tenantMembers",
+    name: "gsi1",
+    pk: { field: "gsi1pk", composite: ["tenantId"] },
+    sk: { field: "gsi1sk", composite: ["projectId", "taskId"] },
+    type: "clustered",
+  },
+}
 ```
+
+When you call `DynamoClient.make(MainTable)`, the client auto-discovers that both entities share the `tenantMembers` collection and exposes `db.collections.tenantMembers(...)` as a cross-entity query accessor.
 
 ### Validation Rules
 
@@ -390,7 +399,7 @@ const MyCollection = Collections.make({ name: "collectionName",
 | Tasks in tenant | TenantMembers (gsi1) | `tenantId` | `projectId`, `taskId` |
 | All tenant items | TenantMembers (gsi1) | `tenantId` | -- |
 | Employee by email | ByEmail (gsi2) | `email` | -- |
-| Tasks by assignee | ByAssignee (gsi2) | `assigneeId` | `priority` |
+| Tasks by assignee | ByAssignee (gsi2) | `employeeId` | `priority` |
 
 ### DynamoDB Items
 

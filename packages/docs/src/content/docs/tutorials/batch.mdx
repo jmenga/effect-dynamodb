@@ -43,9 +43,9 @@ class Order extends Schema.Class<Order>("Order")({
 
 ---
 
-## Step 2: Schema, Entities, and Collections
+## Step 2: Schema, Entities, and Table
 
-Both entities share a single table. Orders have a GSI collection for querying by user:
+Both entities share a single table. Orders have a GSI index for querying by user:
 
 ```typescript title="entities.ts" region="entities" example="batch.ts"
 const AppSchema = DynamoSchema.make({ name: "batch-demo", version: 1 })
@@ -200,7 +200,7 @@ Note that batch writes are **not transactional** — DynamoDB applies each item 
 
 ## Running the Example
 
-The complete runnable example is at [`examples/batch.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/batch.ts) in the repository.
+The complete runnable example is at [`examples/batch.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/examples/batch.ts) in the repository.
 
 ```bash
 docker run -d -p 8000:8000 amazon/dynamodb-local
@@ -248,5 +248,5 @@ Effect.runPromise(main).then(
 
 - [Modeling Guide](/effect-dynamodb/guides/modeling/) — Deep dive into models, schemas, tables, and entities
 - [Queries](/effect-dynamodb/guides/queries/) — Query combinators and pagination
-- [Example: Rich Updates](/effect-dynamodb/tutorials/updates/) — Atomic increments, decrements, list appends, and composed updates
-- [Example: Human Resources](/effect-dynamodb/tutorials/human-resources/) — Full single-table design with collections, transactions, and soft delete
+- [Example: Rich Updates](/effect-dynamodb/examples/updates/) — Atomic increments, decrements, list appends, and composed updates
+- [Example: Human Resources](/effect-dynamodb/examples/human-resources/) — Full single-table design with collections, transactions, and soft delete

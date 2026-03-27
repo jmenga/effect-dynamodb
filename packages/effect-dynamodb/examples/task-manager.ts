@@ -437,11 +437,11 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 2: Workplaces (gsi1 collection)")
 
   // #region workplaces
-  const { Employees: portlandEmployees } = yield* db.collections.Workplaces!({
+  const { Employees: portlandEmployees } = yield* db.collections.workplaces!({
     office: "portland",
   }).collect()
 
-  const { Offices: portlandOffice } = yield* db.collections.Workplaces!({
+  const { Offices: portlandOffice } = yield* db.collections.workplaces!({
     office: "portland",
   }).collect()
   // #endregion
@@ -460,12 +460,12 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 3: Assignments (gsi3 collection)")
 
   // #region assignments
-  const { Tasks: tylerTasks } = yield* db.collections.Assignments!({ employee: "tyler" }).collect()
+  const { Tasks: tylerTasks } = yield* db.collections.assignments!({ employee: "tyler" }).collect()
 
   // Verify points field (numeric) comes through correctly
   const totalTylerPoints = tylerTasks.reduce((sum: any, t: any) => sum + t.points, 0)
 
-  const { Employees: tylerInfo } = yield* db.collections.Assignments!({
+  const { Employees: tylerInfo } = yield* db.collections.assignments!({
     employee: "tyler",
   }).collect()
   // #endregion
@@ -674,7 +674,7 @@ const program = Effect.gen(function* () {
   // Verify both items created atomically
   const newHire = yield* db.entities.Employees.get({ employee: "jordan" })
 
-  const { Tasks: onboardingTasks } = yield* db.collections.Assignments!({
+  const { Tasks: onboardingTasks } = yield* db.collections.assignments!({
     employee: "jordan",
   }).collect()
 
@@ -714,7 +714,7 @@ const program = Effect.gen(function* () {
   const closedAfterArchive = yield* db.entities.Tasks.byStatus({ status: "closed" }).collect()
 
   // Verify: morgan's assignments no longer include the archived task
-  const { Tasks: morganTasks } = yield* db.collections.Assignments!({
+  const { Tasks: morganTasks } = yield* db.collections.assignments!({
     employee: "morgan",
   }).collect()
 

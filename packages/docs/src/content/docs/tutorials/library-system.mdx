@@ -8,7 +8,7 @@ A library management system with **authors**, **books**, **genres**, and **membe
 **What you'll learn:**
 - 4 entities sharing one table (single-table design)
 - 3 GSIs with index overloading
-- 4 cross-entity collection patterns via shared GSI indexes
+- 4 cross-entity collection patterns via shared `collection` names on entity indexes
 - Sparse index pattern (items appear in a GSI only when optional fields are present)
 - Book loan and return workflows
 - Atomic book returns via transactions
@@ -54,7 +54,7 @@ GSI1 is **overloaded** -- it serves Book loans (sparse), Genre categories (stand
 | `Works` | GSI2 | authorLastName + authorFirstName | Author, Book, Genre |
 | `Account` | GSI1 | memberId | Member, Book |
 | `Titles` | GSI3 | bookTitle | Book, Genre |
-| `Categories` | GSI1 | genre | Genre (isolated) |
+| `byGenre` (index) | GSI1 | genre | Genre (standalone) |
 
 ---
 
@@ -105,7 +105,7 @@ Note that Book has two **optional** fields -- `memberId` and `loanEndDate`. When
 
 ---
 
-## Step 2: Schema, Table, Entities, and Collections
+## Step 2: Schema, Table, and Entities
 
 ### Schema and Table
 
@@ -119,7 +119,7 @@ const LibTable = Table.make({ schema: LibSchema, entities: { Authors, Books, Gen
 
 ### Author Entity
 
-Author defines only a primary key by last name + first name:
+Author defines a primary key by last name + first name, plus a GSI index participating in the `works` collection:
 
 ```typescript title="entities.ts" region="author-entity" example="library-system.ts"
 const Authors = Entity.make({
@@ -143,7 +143,7 @@ const Authors = Entity.make({
 
 ### Book Entity
 
-Book defines only a primary key. The `loans` collection on GSI1 uses optional fields, creating a **sparse index**:
+Book defines a primary key and three GSI indexes. The `account` index on GSI1 uses optional fields, creating a **sparse index**:
 
 ```typescript title="entities.ts" region="book-entity" example="library-system.ts"
 const Books = Entity.make({
@@ -179,7 +179,7 @@ const Books = Entity.make({
 
 ### Genre Entity
 
-Genre defines only a primary key. It participates in three collection patterns plus a standalone category collection:
+Genre defines a primary key and three GSI indexes. It participates in two auto-discovered collections (`works`, `titles`) plus a standalone `byGenre` index for category browsing:
 
 ```typescript title="entities.ts" region="genre-entity" example="library-system.ts"
 const Genres = Entity.make({
@@ -214,7 +214,7 @@ const Genres = Entity.make({
 
 ### Member Entity
 
-Member defines only a primary key. GSI1 participates in the `Account` collection alongside Book loans:
+Member defines a primary key and one GSI index. GSI1 participates in the `account` collection alongside Book loans:
 
 ```typescript title="entities.ts" region="member-entity" example="library-system.ts"
 const Members = Entity.make({
@@ -236,9 +236,9 @@ const Members = Entity.make({
 })
 ```
 
-### Collections -- GSI Access Patterns
+### GSI Access Patterns
 
-GSI access patterns are now defined as entity-level indexes. Multi-entity collections (account, works, titles) are auto-discovered from matching collection names across entities:
+GSI access patterns are defined as entity-level indexes. Multi-entity collections (account, works, titles) are auto-discovered from matching `collection` names across entities:
 
 ```typescript title="collections.ts" region="collections" example="library-system.ts"
 // GSI access patterns are now defined as entity-level indexes above.
@@ -247,10 +247,10 @@ GSI access patterns are now defined as entity-level indexes. Multi-entity collec
 ```
 
 Key design decisions:
-- **`Account` (GSI1)** uses `memberId` as PK. Book's `loanEndDate` is `Schema.optional`, so books without a loan are invisible in this index (sparse index pattern)
-- **`Works` (GSI2)** groups Author, Book, and Genre by author name -- three entity types in one partition
-- **`Titles` (GSI3)** groups Books and Genres by title
-- **`Categories` (GSI1)** is `isolated` -- standalone genre browsing, not clustered with Account
+- **`account` collection (GSI1)** uses `memberId` as PK. Book's `loanEndDate` is `Schema.optional`, so books without a loan are invisible in this index (sparse index pattern)
+- **`works` collection (GSI2)** groups Author, Book, and Genre by author name -- three entity types in one partition
+- **`titles` collection (GSI3)** groups Books and Genres by title
+- **`byGenre` index (GSI1)** is a standalone entity-level index for genre browsing, not part of any collection
 
 ---
 
@@ -432,19 +432,19 @@ Author, Book, and Genre share GSI2 via the `Works` collection. All three use `au
 
 ```typescript region="works-collection" example="library-system.ts"
 // Asimov's books
-const { Books: asimovBooks } = yield* db.collections.Works!({
+const { Books: asimovBooks } = yield* db.collections.works!({
   authorLastName: "Asimov",
   authorFirstName: "Isaac",
 }).collect()
 
 // Asimov's genres
-const { Genres: asimovGenres } = yield* db.collections.Works!({
+const { Genres: asimovGenres } = yield* db.collections.works!({
   authorLastName: "Asimov",
   authorFirstName: "Isaac",
 }).collect()
 
 // Author's own record in the works collection
-const { Authors: tolkienInfo } = yield* db.collections.Works!({
+const { Authors: tolkienInfo } = yield* db.collections.works!({
   authorLastName: "Tolkien",
   authorFirstName: "J.R.R.",
 }).collect()
@@ -460,12 +460,12 @@ Member and Book share GSI1 via the `Account` collection. Both use `memberId` as 
 
 ```typescript region="account-collection" example="library-system.ts"
 // Member profile
-const { Members: aliceAccount } = yield* db.collections.Account!({
+const { Members: aliceAccount } = yield* db.collections.account!({
   memberId: "m-alice",
 }).collect()
 
 // Alice's loaned books (initially empty -- sparse index)
-const { Books: aliceLoans } = yield* db.collections.Account!({ memberId: "m-alice" }).collect()
+const { Books: aliceLoans } = yield* db.collections.account!({ memberId: "m-alice" }).collect()
 ```
 
 Books only appear in the `Account` collection when `memberId` and `loanEndDate` are populated. This is the sparse index pattern in action.
@@ -477,11 +477,11 @@ Books only appear in the `Account` collection when `memberId` and `loanEndDate` 
 Book and Genre share GSI3 via the `Titles` collection. Both use `bookTitle` as the partition key.
 
 ```typescript region="titles-collection" example="library-system.ts"
-const { Books: foundationByTitle } = yield* db.collections.Titles!({
+const { Books: foundationByTitle } = yield* db.collections.titles!({
   bookTitle: "Foundation",
 }).collect()
 
-const { Genres: foundationGenresByTitle } = yield* db.collections.Titles!({
+const { Genres: foundationGenresByTitle } = yield* db.collections.titles!({
   bookTitle: "Foundation",
 }).collect()
 ```
@@ -490,7 +490,7 @@ const { Genres: foundationGenresByTitle } = yield* db.collections.Titles!({
 
 > Browse all books in a genre category.
 
-The `Categories` collection on GSI1 is an **isolated** collection for standalone genre browsing. It uses `genre` as PK and `subgenre` as SK for hierarchical browsing.
+The `byGenre` index on Genre (GSI1) is a standalone entity-level index for genre browsing. It uses `genre` as PK and `subgenre` as SK for hierarchical browsing.
 
 ```typescript region="genre-categories" example="library-system.ts"
 // All Sci-Fi subgenres
@@ -526,12 +526,12 @@ yield* db.entities.Books.update(
 )
 
 // Now the book appears in Alice's loans
-const { Books: aliceLoansAfter } = yield* db.collections.Account!({
+const { Books: aliceLoansAfter } = yield* db.collections.account!({
   memberId: "m-alice",
 }).collect()
 
 // Bob still has no loans
-const { Books: bobLoans } = yield* db.collections.Account!({ memberId: "m-bob" }).collect()
+const { Books: bobLoans } = yield* db.collections.account!({ memberId: "m-bob" }).collect()
 ```
 
 When you update fields that participate in GSI composites, you must provide **all** composites for every affected GSI. Here the update touches `memberId` (Account GSI1), so `loanEndDate` is also required. The author and title fields are needed for GSI2 and GSI3 recomposition.
@@ -558,7 +558,7 @@ yield* Transaction.transactWrite([
 ])
 
 // Book is no longer in Alice's loans
-const { Books: aliceLoansCleared } = yield* db.collections.Account!({
+const { Books: aliceLoansCleared } = yield* db.collections.account!({
   memberId: "m-alice",
 }).collect()
 
@@ -569,7 +569,7 @@ const returnedHobbit = yield* db.entities.Books.get({
 })
 
 // And still appears in author's works
-const { Books: tolkienBooksAfter } = yield* db.collections.Works!({
+const { Books: tolkienBooksAfter } = yield* db.collections.works!({
   authorLastName: "Tolkien",
   authorFirstName: "J.R.R.",
 }).collect()
@@ -579,7 +579,7 @@ const { Books: tolkienBooksAfter } = yield* db.collections.Works!({
 
 ## Running the Example
 
-The complete runnable example is at [`examples/library-system.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/library-system.ts) in the repository. It seeds data, runs all 8 access patterns, and verifies each with assertions.
+The complete runnable example is at [`examples/library-system.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/examples/library-system.ts) in the repository. It seeds data, runs all 8 access patterns, and verifies each with assertions.
 
 ```bash
 docker run -d -p 8000:8000 amazon/dynamodb-local
@@ -629,5 +629,5 @@ Effect.runPromise(main).then(
 
 - [Modeling Guide](/effect-dynamodb/guides/modeling/) -- Deep dive into models, schemas, tables, and entities
 - [Indexes & Collections](/effect-dynamodb/guides/indexes/) -- Access pattern design and collection patterns
-- [Human Resources](/effect-dynamodb/tutorials/human-resources/) -- Similar patterns with soft delete and restore
-- [Task Manager](/effect-dynamodb/tutorials/task-manager/) -- Status workflows, range queries, and soft delete archival
+- [Human Resources](/effect-dynamodb/examples/human-resources/) -- Similar patterns with soft delete and restore
+- [Task Manager](/effect-dynamodb/examples/task-manager/) -- Status workflows, range queries, and soft delete archival

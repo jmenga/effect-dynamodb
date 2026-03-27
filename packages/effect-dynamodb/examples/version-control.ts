@@ -44,6 +44,7 @@ class User extends Schema.Class<User>("User")({
 class Repository extends Schema.Class<Repository>("Repository")({
   repoName: Schema.String,
   repoOwner: Schema.String,
+  username: Schema.String,
   about: Schema.String,
   description: Schema.String,
   isPrivate: Schema.Boolean,
@@ -225,6 +226,7 @@ const repos = {
   helloWorld: {
     repoName: "hello-world",
     repoOwner: "octocat",
+    username: "octocat",
     about: "My first repository on GitHub!",
     description: "A simple hello world project for learning Git",
     isPrivate: false,
@@ -233,6 +235,7 @@ const repos = {
   linux: {
     repoName: "linux",
     repoOwner: "torvalds",
+    username: "torvalds",
     about: "Linux kernel source tree",
     description: "The Linux kernel",
     isPrivate: false,
@@ -378,19 +381,19 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 3: User's Owned Repos (gsi1 collection)")
 
   // #region pattern-3
-  const { Repositories: octocatRepos } = yield* db.collections.Owned!({
+  const { Repositories: octocatRepos } = yield* db.collections.owned!({
     username: "octocat",
   }).collect()
   assertEq(octocatRepos.length, 1, "octocat has 1 repo")
   assertEq(octocatRepos[0]!.repoName, "hello-world", "octocat repo name")
 
-  const { Repositories: torvaldsRepos } = yield* db.collections.Owned!({
+  const { Repositories: torvaldsRepos } = yield* db.collections.owned!({
     username: "torvalds",
   }).collect()
   assertEq(torvaldsRepos.length, 1, "torvalds has 1 repo")
   assertEq(torvaldsRepos[0]!.repoName, "linux", "torvalds repo name")
 
-  const { Users: octocatProfile } = yield* db.collections.Owned!({ username: "octocat" }).collect()
+  const { Users: octocatProfile } = yield* db.collections.owned!({ username: "octocat" }).collect()
   assertEq(octocatProfile.length, 1, "owned collection returns 1 user")
   assertEq(octocatProfile[0]!.fullName, "The Octocat", "owned user fullName")
   // #endregion
@@ -456,19 +459,19 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 6: User's Managed Items (gsi1 collection)")
 
   // #region pattern-6
-  const { Issues: torvaldsIssues } = yield* db.collections.Managed!({
+  const { Issues: torvaldsIssues } = yield* db.collections.managed!({
     username: "torvalds",
   }).collect()
 
-  const { PullRequests: torvaldsPRs } = yield* db.collections.Managed!({
+  const { PullRequests: torvaldsPRs } = yield* db.collections.managed!({
     username: "torvalds",
   }).collect()
 
-  const { Issues: octocatIssues } = yield* db.collections.Managed!({
+  const { Issues: octocatIssues } = yield* db.collections.managed!({
     username: "octocat",
   }).collect()
 
-  const { PullRequests: octocatPRs } = yield* db.collections.Managed!({
+  const { PullRequests: octocatPRs } = yield* db.collections.managed!({
     username: "octocat",
   }).collect()
   // #endregion
@@ -494,29 +497,29 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 7: Repository Activity (gsi2 collection)")
 
   // #region pattern-7
-  const { Issues: hwIssues } = yield* db.collections.Activity!({
+  const { Issues: hwIssues } = yield* db.collections.activity!({
     repoOwner: "octocat",
     repoName: "hello-world",
   }).collect()
 
   const hwOpenIssues = hwIssues.filter((i: any) => i.status === "Open")
 
-  const { PullRequests: hwPRs } = yield* db.collections.Activity!({
+  const { PullRequests: hwPRs } = yield* db.collections.activity!({
     repoOwner: "octocat",
     repoName: "hello-world",
   }).collect()
 
-  const { Issues: linuxIssues } = yield* db.collections.Activity!({
+  const { Issues: linuxIssues } = yield* db.collections.activity!({
     repoOwner: "torvalds",
     repoName: "linux",
   }).collect()
 
-  const { PullRequests: linuxPRs } = yield* db.collections.Activity!({
+  const { PullRequests: linuxPRs } = yield* db.collections.activity!({
     repoOwner: "torvalds",
     repoName: "linux",
   }).collect()
 
-  const { Repositories: hwRepoActivity } = yield* db.collections.Activity!({
+  const { Repositories: hwRepoActivity } = yield* db.collections.activity!({
     repoOwner: "octocat",
     repoName: "hello-world",
   }).collect()
@@ -567,12 +570,12 @@ const program = Effect.gen(function* () {
   ])
 
   // Both created atomically — verify via activity collection
-  const { Issues: linuxIssuesAfter } = yield* db.collections.Activity!({
+  const { Issues: linuxIssuesAfter } = yield* db.collections.activity!({
     repoOwner: "torvalds",
     repoName: "linux",
   }).collect()
 
-  const { PullRequests: linuxPRsAfter } = yield* db.collections.Activity!({
+  const { PullRequests: linuxPRsAfter } = yield* db.collections.activity!({
     repoOwner: "torvalds",
     repoName: "linux",
   }).collect()

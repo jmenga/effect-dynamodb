@@ -111,17 +111,17 @@ Multiple entity types share one physical DynamoDB table. Three mechanisms make t
 // Both entities use gsi1 for different patterns
 const Users = Entity.make({
   // ...
+  primaryKey: { pk: { field: "pk", composite: ["userId"] }, sk: { field: "sk", composite: [] } },
   indexes: {
-    primary: { pk: { field: "pk", composite: ["userId"] }, sk: { field: "sk", composite: [] } },
-    byTenant: { index: "gsi1", pk: { field: "gsi1pk", composite: ["tenantId"] }, sk: { field: "gsi1sk", composite: ["userId"] } },
+    byTenant: { name: "gsi1", pk: { field: "gsi1pk", composite: ["tenantId"] }, sk: { field: "gsi1sk", composite: ["userId"] } },
   },
 })
 
 const Orders = Entity.make({
   // ...
+  primaryKey: { pk: { field: "pk", composite: ["orderId"] }, sk: { field: "sk", composite: [] } },
   indexes: {
-    primary: { pk: { field: "pk", composite: ["orderId"] }, sk: { field: "sk", composite: [] } },
-    byCustomer: { index: "gsi1", pk: { field: "gsi1pk", composite: ["customerId"] }, sk: { field: "gsi1sk", composite: ["createdAt"] } },
+    byCustomer: { name: "gsi1", pk: { field: "gsi1pk", composite: ["customerId"] }, sk: { field: "gsi1sk", composite: ["createdAt"] } },
   },
 })
 ```

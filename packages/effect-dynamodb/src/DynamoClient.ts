@@ -1012,8 +1012,10 @@ const makeFromConfig = (config: {
           resolveTableName: firstMember.entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
         })
 
-        // Add begins_with on collection prefix
-        if (indexDef.sk.field) {
+        // Add begins_with on collection SK prefix for clustered collections.
+        // For isolated collections (default), each entity has its own entity-type
+        // SK prefix, so a collection-name begins_with would filter them all out.
+        if (indexDef.sk.field && indexDef.type === "clustered") {
           const skPrefix = DynamoSchema.composeCollectionKey(
             firstMember.entityLike._schema,
             collName,
@@ -1070,14 +1072,24 @@ const makeFromConfig = (config: {
         )
       }
     } else {
-      const seenTags = new Set<string>()
+      // Group entities by table tag so we can derive full table schema for create()
+      const entitiesByTag = new Map<string, { tag: EntityLike["_tableTag"]; entities: EntityLike[] }>()
       for (const [, entity] of Object.entries(config.entities)) {
         const entityLike = entity as unknown as EntityLike
         const tagId = entityLike._tableTag.key
-        if (seenTags.has(tagId)) continue
-        seenTags.add(tagId)
-        const tableConfig = yield* entityLike._tableTag
-        tables[tableConfig.name] = buildTableOperations(tableConfig.name, client)
+        if (!entitiesByTag.has(tagId)) {
+          entitiesByTag.set(tagId, { tag: entityLike._tableTag, entities: [] })
+        }
+        entitiesByTag.get(tagId)!.entities.push(entityLike)
+      }
+      for (const [, { tag, entities: tableEntities }] of entitiesByTag) {
+        const tableConfig = yield* tag
+        // Build a minimal Table-like object so tableDefinition() can derive GSIs
+        const syntheticTable = {
+          entities: Object.fromEntries(tableEntities.map((e) => [e.entityType, e])),
+          aggregates: {},
+        } as unknown as Table
+        tables[tableConfig.name] = buildTableOperationsFromTable(tableConfig.name, syntheticTable, client)
       }
     }
 

@@ -443,21 +443,21 @@ const program = Effect.gen(function* () {
 
   // #region works-collection
   // Asimov's books
-  const { Books: asimovBooks } = yield* db.collections.Works!({
+  const { Books: asimovBooks } = yield* db.collections.works!({
     authorLastName: "Asimov",
     authorFirstName: "Isaac",
   }).collect()
   // → [{ bookTitle: "Foundation", ... }, { bookTitle: "I, Robot", ... }]
 
   // Asimov's genres
-  const { Genres: asimovGenres } = yield* db.collections.Works!({
+  const { Genres: asimovGenres } = yield* db.collections.works!({
     authorLastName: "Asimov",
     authorFirstName: "Isaac",
   }).collect()
   // → [{ subgenre: "Space Opera", ... }, { subgenre: "Robotics", ... }]
 
   // Author's own record in the works collection
-  const { Authors: tolkienInfo } = yield* db.collections.Works!({
+  const { Authors: tolkienInfo } = yield* db.collections.works!({
     authorLastName: "Tolkien",
     authorFirstName: "J.R.R.",
   }).collect()
@@ -470,7 +470,7 @@ const program = Effect.gen(function* () {
   const asimovSubgenres = asimovGenres.map((g: any) => g.subgenre).sort()
   assertEq(asimovSubgenres, ["Robotics", "Space Opera"], "Asimov subgenres")
 
-  const { Books: tolkienBooks } = yield* db.collections.Works!({
+  const { Books: tolkienBooks } = yield* db.collections.works!({
     authorLastName: "Tolkien",
     authorFirstName: "J.R.R.",
   }).collect()
@@ -491,13 +491,13 @@ const program = Effect.gen(function* () {
 
   // #region account-collection
   // Member profile
-  const { Members: aliceAccount } = yield* db.collections.Account!({
+  const { Members: aliceAccount } = yield* db.collections.account!({
     memberId: "m-alice",
   }).collect()
   // → [{ memberId: "m-alice", city: "New York", state: "NY", ... }]
 
   // Alice's loaned books (initially empty -- sparse index)
-  const { Books: aliceLoans } = yield* db.collections.Account!({ memberId: "m-alice" }).collect()
+  const { Books: aliceLoans } = yield* db.collections.account!({ memberId: "m-alice" }).collect()
   // → [] (no books loaned yet)
   // #endregion
   assertEq(aliceAccount.length, 1, "Alice has 1 account record (no loans yet)")
@@ -515,12 +515,12 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 5: Books by Title (gsi3 — titles collection)")
 
   // #region titles-collection
-  const { Books: foundationByTitle } = yield* db.collections.Titles!({
+  const { Books: foundationByTitle } = yield* db.collections.titles!({
     bookTitle: "Foundation",
   }).collect()
   // → [{ isbn: "978-0-553-293357", releaseDate: "1951-06-01", ... }]
 
-  const { Genres: foundationGenresByTitle } = yield* db.collections.Titles!({
+  const { Genres: foundationGenresByTitle } = yield* db.collections.titles!({
     bookTitle: "Foundation",
   }).collect()
   // → [{ genre: "Sci-Fi", subgenre: "Space Opera", ... }]
@@ -584,13 +584,13 @@ const program = Effect.gen(function* () {
   )
 
   // Now the book appears in Alice's loans
-  const { Books: aliceLoansAfter } = yield* db.collections.Account!({
+  const { Books: aliceLoansAfter } = yield* db.collections.account!({
     memberId: "m-alice",
   }).collect()
   // → [{ bookTitle: "The Hobbit", isbn: "978-0-547-928227", ... }]
 
   // Bob still has no loans
-  const { Books: bobLoans } = yield* db.collections.Account!({ memberId: "m-bob" }).collect()
+  const { Books: bobLoans } = yield* db.collections.account!({ memberId: "m-bob" }).collect()
   // → []
   // #endregion
   assertEq(aliceLoansAfter.length, 1, "Alice now has 1 loaned book")
@@ -624,7 +624,7 @@ const program = Effect.gen(function* () {
   ])
 
   // Book is no longer in Alice's loans
-  const { Books: aliceLoansCleared } = yield* db.collections.Account!({
+  const { Books: aliceLoansCleared } = yield* db.collections.account!({
     memberId: "m-alice",
   }).collect()
   // → []
@@ -638,7 +638,7 @@ const program = Effect.gen(function* () {
   // returnedHobbit.memberId → undefined (cleared)
 
   // And still appears in author's works
-  const { Books: tolkienBooksAfter } = yield* db.collections.Works!({
+  const { Books: tolkienBooksAfter } = yield* db.collections.works!({
     authorLastName: "Tolkien",
     authorFirstName: "J.R.R.",
   }).collect()

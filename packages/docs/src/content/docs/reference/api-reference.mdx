@@ -171,7 +171,7 @@ import { Table } from "effect-dynamodb"
 
 | Export | Type | Description |
 |--------|------|-------------|
-| `make` | `(config: { schema: DynamoSchema }) => Table` | Create a table definition bound to a schema |
+| `make` | `(config: { schema, entities?, aggregates? }) => Table` | Create a table definition with entities and aggregates |
 | `definition` | `(table, entities) => TableDefinition` | Derive `CreateTableCommandInput` fields from entity index declarations |
 
 ### Types
@@ -185,14 +185,14 @@ import { Table } from "effect-dynamodb"
 ### Usage
 
 ```typescript
-const MainTable = Table.make({ schema: AppSchema })
+const MainTable = Table.make({ schema: AppSchema, entities: { UserEntity, TaskEntity } })
 
 // Runtime name injection via Layer
 MainTable.layer({ name: "MyTable" })
 
-// Derive CreateTable input for CloudFormation/CDK/testing
-const def = Table.definition(MainTable, [UserEntity, TaskEntity])
-await client.createTable({ TableName: "MyTable", BillingMode: "PAY_PER_REQUEST", ...def })
+// Typed client auto-derives table schema for creation
+const db = yield* DynamoClient.make(MainTable)
+yield* db.createTable()
 ```
 
 See [Modeling](/effect-dynamodb/guides/modeling/) for details.
@@ -219,7 +219,8 @@ import { Entity } from "effect-dynamodb"
 |----------|------|----------|-------------|
 | `model` | `Schema.Class \| Schema.Struct \| ConfiguredModel` | Yes | Domain model schema (or configured model with field overrides) |
 | `entityType` | `string` | Yes | Discriminator stored as `__edd_e__` |
-| `indexes` | `Record<string, IndexDefinition>` | Yes | Key composition rules (must include `primary`) |
+| `primaryKey` | `{ pk: KeyDef, sk: KeyDef }` | Yes | Primary key composition rules |
+| `indexes` | `Record<string, GsiIndexDef>` | No | GSI index definitions with `name`, `pk`, `sk`, optional `collection` |
 | `timestamps` | `boolean \| { created?, updated? }` | No | Auto-managed `createdAt`/`updatedAt` |
 | `versioned` | `boolean \| { retain?, field?, ttl? }` | No | Auto-increment version with optional snapshot retention |
 | `softDelete` | `boolean \| { ttl?, preserveUnique? }` | No | Soft delete with optional TTL |
@@ -340,7 +341,6 @@ Control what type an operation returns:
 | `compositeAttributes(entity)` | List all composite attribute names across indexes |
 | `itemSchema(entity)` | Get the item-level decode schema |
 | `decodeMarshalledItem(entity, item)` | Decode a marshalled DynamoDB item through entity schema |
-| `decodeMarshalledItem(entity, item)` | Decode a marshalled DynamoDB item through entity schema |
 
 ### Usage
 
@@ -348,13 +348,13 @@ Control what type an operation returns:
 const UserEntity = Entity.make({
   model: User,
   entityType: "User",
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
     byEmail: {
-      index: "gsi1",
+      name: "gsi1",
       pk: { field: "gsi1pk", composite: ["email"] },
       sk: { field: "gsi1sk", composite: [] },
     },
@@ -383,9 +383,13 @@ yield* users.update(
 
 yield* users.delete({ userId: "u-1" })
 
-// Query execution
+// Query execution via bound entity
 const allUsers = yield* users.collect(UserEntity.query.byEmail({ email: "a@b.com" }))
 const stream = users.paginate(UserEntity.scan(), Query.limit(100))
+
+// Or with v2 entity-centric pattern (BoundQuery fluent API):
+// const db = yield* DynamoClient.make({ entities: { UserEntity } })
+// const allUsers = yield* db.entities.UserEntity.byEmail({ email: "a@b.com" }).collect()
 ```
 
 See [Getting Started](/effect-dynamodb/getting-started/) and [Modeling](/effect-dynamodb/guides/modeling/) for details.
@@ -468,9 +472,49 @@ See [Queries](/effect-dynamodb/guides/queries/) for details.
 
 ---
 
-## Collection
+## Collections
 
-Multi-entity queries across a shared index.
+Multi-entity queries across a shared index. Collections are **auto-discovered** from entity indexes that share the same `collection` property.
+
+### Auto-Discovery
+
+When multiple entities define the same `collection` name on the same GSI, they are automatically grouped into a collection accessible via `db.collections.<name>()`:
+
+```typescript
+// Define entities with shared collection
+const Employees = Entity.make({
+  // ...
+  indexes: {
+    byTenant: {
+      collection: "tenantMembers",
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["name"] },
+    },
+  },
+})
+
+const Tasks = Entity.make({
+  // ...
+  indexes: {
+    byTenant: {
+      collection: "tenantMembers",
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["priority"] },
+    },
+  },
+})
+
+// Auto-discovered on the typed client
+const db = yield* DynamoClient.make({ entities: { Employees, Tasks } })
+const result = yield* db.collections.tenantMembers({ tenantId: "t-1" }).collect()
+// result: { Employees: Employee[], Tasks: Task[] }
+```
+
+### Explicit Collections
+
+For advanced use, `Collection.make()` creates collections explicitly:
 
 ```typescript
 import { Collection } from "effect-dynamodb"
@@ -480,34 +524,7 @@ import { Collection } from "effect-dynamodb"
 |--------|------|-------------|
 | `make` | `(name, entities) => Collection` | Create a collection from entities sharing an index |
 
-### Return Value
-
-`Collection.make()` returns an object with:
-
-| Property | Description |
-|----------|-------------|
-| `query(pk)` | Start a collection query returning `{ entityA: A[], entityB: B[] }` |
-| `<entityName>` | Per-entity selector — narrows query to one entity type |
-
-### Usage
-
-```typescript
-const TenantMembers = Collection.make("TenantMembers", {
-  employees: EmployeeEntity,
-  tasks: TaskEntity,
-})
-
-const all = yield* TenantMembers.query({ tenantId: "t-1" }).pipe(Query.execute)
-// { employees: Employee[], tasks: Task[] }
-
-const emps = yield* TenantMembers.query({ tenantId: "t-1" }).pipe(
-  TenantMembers.employees,
-  Query.execute,
-)
-// Employee[]
-```
-
-See [Queries](/effect-dynamodb/guides/queries/) for details.
+See [Indexes & Collections](/effect-dynamodb/guides/indexes/) for details.
 
 ---
 

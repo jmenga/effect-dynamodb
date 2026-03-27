@@ -237,7 +237,7 @@ primaryKey: {
 
 The `composite` array is an ordered list of model attribute names. The system generates the key value automatically: `$projmgmt#v1#employee#emp-alice`.
 
-GSI access patterns are defined separately using `Collections.make()`. See [Indexes & Collections](/effect-dynamodb/guides/indexes/) for full details.
+GSI access patterns are defined on the entity via the `indexes` property. Collections are auto-discovered from entities sharing the same `collection` name on a GSI. See [Indexes & Collections](/effect-dynamodb/guides/indexes/) for full details.
 
 ### System Fields
 

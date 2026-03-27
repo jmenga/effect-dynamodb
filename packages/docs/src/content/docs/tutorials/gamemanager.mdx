@@ -116,7 +116,7 @@ Update `package.json` (keep the dependencies from step 1.2):
 mkdir -p src/models src/entities src/services src/api
 ```
 
-You now have a working TypeScript project. Run `pnpm check` to verify — it should succeed (no source files yet).
+You now have a working TypeScript project. We'll verify compilation after adding our first source file in the next section.
 
 ---
 
@@ -163,13 +163,23 @@ Three things to notice:
 
 The entity binds your pure model to DynamoDB with indexes, key composition, and optional features:
 
-```ts title="src/entities/Teams.ts" region="entity-team" example="cricket.ts"
-const Teams = Entity.make({
+```ts title="src/entities/Teams.ts"
+import { DynamoModel, Entity } from "@effect-dynamodb/core"
+import { Team } from "../models/Team.js"
+
+export const Teams = Entity.make({
   model: DynamoModel.configure(Team, { id: { field: "teamId" } }),
   entityType: "Team",
   primaryKey: {
     pk: { field: "pk", composite: ["id"] },
     sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byAll: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: [] },
+      sk: { field: "gsi1sk", composite: ["country", "name"] },
+    },
   },
 })
 ```
@@ -182,7 +192,9 @@ Let's break down what each piece does:
 
 - **`primaryKey`** — The table's primary key. `pk` is composed from the `id` field. `sk` has an empty composite (the library fills it with the entity type).
 
-> **Key concept:** `Entity.make` returns a **pure entity definition** — no table reference, no executable operations. The entity declares its model, primary key, and configuration. GSI access patterns are declared separately as Collections. Table association happens when you register it on a `Table.make({ entities: { Teams } })`, which we'll create next.
+- **`indexes.byAll`** — A GSI for listing/filtering teams. The PK composite is empty (query returns all teams), the SK composite `["country", "name"]` enables hierarchical prefix filtering: filter by `country` alone, or `country` + `name`.
+
+> **Key concept:** `Entity.make` returns a **pure entity definition** — no table reference, no executable operations. The entity declares its model, primary key, indexes, and configuration. Table association happens when you register it on a `Table.make({ entities: { Teams } })`, which we'll create next.
 
 ### 2.4 Schema and Table
 
@@ -263,7 +275,7 @@ Three things to notice:
 
 3. **`applyPagination`** — Works directly with decoded `PaginationOptions`. No manual parsing — the Schema layer already decoded `count` from string to number via `Schema.NumberFromString`.
 
-> **Concept: Query combinators** — `Query.limit`, `Query.reverse`, and `Query.startFrom` are composable functions that modify a query description. Nothing executes until you call `Query.execute` or `Query.collect`.
+> **Concept: Query combinators** — `Query.limit`, `Query.reverse`, and `Query.startFrom` are composable functions that modify a query description. Nothing executes until you pass the query to a bound entity terminal method like `teams.fetch(query)` or `teams.collect(query)`.
 
 ### 2.6 List filter schema
 
@@ -290,8 +302,8 @@ We'll add more filter schemas to this file as we add entities.
 import { DynamoClient, Entity } from "@effect-dynamodb/core"
 import { type DateTime, Effect, ServiceMap } from "effect"
 import { ulid } from "ulid"
-import { MainTable } from "../entities/Schema.js"
 import { Teams } from "../entities/Teams.js"
+import { MainTable } from "../entities/Schema.js"
 import type { TeamListFilter } from "../models/Filters.js"
 import type { TeamId } from "../models/Ids.js"
 import { applyPagination, type PaginationOptions } from "../models/Pagination.js"
@@ -303,7 +315,8 @@ type UpdateTeamInput = Entity.Update<typeof Teams>
 
 export class TeamService extends ServiceMap.Service<TeamService>()("@gamemanager/TeamService", {
   make: Effect.gen(function* () {
-    const { Teams: teams } = yield* DynamoClient.make(MainTable)
+    const db = yield* DynamoClient.make(MainTable)
+    const teams = db.Teams
     return {
       create: Effect.fn(function* (input: CreateTeamInput) {
         const id = ulid() as TeamId
@@ -317,8 +330,9 @@ export class TeamService extends ServiceMap.Service<TeamService>()("@gamemanager
       delete: (id: TeamId) => teams.delete({ id }),
 
       list: (filter: TeamListFilter = {}, pagination?: PaginationOptions) =>
-        applyPagination(Teams.query.byAll(filter), pagination).pipe(
-          Query.execute,
+        teams.fetch(
+          applyPagination(Teams.query.byAll(filter), pagination),
+        ).pipe(
           Effect.map((page) => ({
             data: page.items,
             count: page.items.length,
@@ -340,11 +354,11 @@ Key patterns:
 
 - **`ulid() as TeamId`** — `ulid()` returns `string`, so we cast it to the branded type. This is the one place you'll need a cast — at the generation boundary where IDs are created.
 
-- **`DynamoClient.make(MainTable)`** — The typed execution gateway. Resolves `DynamoClient | TableConfig` from context, binds all entities registered on the table, and returns a typed client where every operation has `R = never`. Destructure to get bound entities: `const { Teams: teams } = yield* DynamoClient.make(MainTable)`.
+- **`DynamoClient.make(MainTable)`** — The typed execution gateway. Resolves `DynamoClient | TableConfig` from context, binds all entities registered on the table, and returns a typed client where every operation has `R = never`. Access bound entities via `db.Teams`, `db.Players`, etc.
 
 - **Bound entity methods** — `teams.get()`, `teams.update()`, `teams.delete()` return `Effect` with `R = never` — no context requirements.
 
-- **`Query.execute`** — Pipe terminal that executes the query and returns `{ items, cursor }` for pagination. Resolves `DynamoClient | TableConfig` from context.
+- **`teams.fetch(query)`** — Executes a query descriptor and returns `{ items, cursor }` for pagination. The entity definition (`Teams`) provides query descriptors via `Teams.query.byAll(filter)` and `Teams.scan()`. `applyPagination` applies limit, order, and cursor to the query descriptor before execution.
 
 ### 2.8 API error types
 
@@ -489,7 +503,7 @@ const TeamsHandler = HttpApiBuilder.group(
     return handlers
       .handle("list", ({ query }) =>
         Effect.gen(function* () {
-          const filter = query.gender ? { gender: query.gender } : undefined
+          const filter = query.country ? { country: query.country } : undefined
           const result = yield* svc.list(filter, query)
           return {
             data: result.data.map((r) => new Team(r)),
@@ -650,7 +664,7 @@ Test with curl:
 # Create a team — capture the ID from the response
 TEAM_ID=$(curl -s -X POST http://localhost:3000/teams \
   -H "Content-Type: application/json" \
-  -d '{"name": "Australia", "gender": "Male", "league": "ICC"}' \
+  -d '{"name": "Australia", "country": "Australia", "ranking": 1}' \
   | jq -r '.id')
 echo "Created team: $TEAM_ID"
 
@@ -663,7 +677,7 @@ curl -s http://localhost:3000/teams/$TEAM_ID | jq
 # Update a team
 curl -s -X PUT http://localhost:3000/teams/$TEAM_ID \
   -H "Content-Type: application/json" \
-  -d '{"league": "ICC Test"}' | jq
+  -d '{"ranking": 2}' | jq
 
 # Delete a team
 curl -s -X DELETE http://localhost:3000/teams/$TEAM_ID
@@ -737,13 +751,13 @@ export const Players = Entity.make({
   model: DynamoModel.configure(Player, { id: { field: "playerId", identifier: true } }),
   entityType: "Player",
   timestamps: true,
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
     byAll: {
-      index: "gsi1",
+      name: "gsi1",
       pk: { field: "gsi1pk", composite: [] },
       sk: { field: "gsi1sk", composite: ["gender", "name"] },
     },
@@ -785,7 +799,8 @@ export class PlayerService extends ServiceMap.Service<PlayerService>()(
   "@gamemanager/PlayerService",
   {
     make: Effect.gen(function* () {
-      const { Players: players } = yield* DynamoClient.make(MainTable)
+      const db = yield* DynamoClient.make(MainTable)
+      const players = db.Players
       return {
         create: Effect.fn(function* (input: CreatePlayerInput) {
           const id = ulid() as PlayerId
@@ -799,8 +814,9 @@ export class PlayerService extends ServiceMap.Service<PlayerService>()(
         delete: (id: PlayerId) => players.delete({ id }),
 
         list: (filter: PlayerListFilter = {}, pagination?: PaginationOptions) =>
-          applyPagination(Players.query.byAll(filter), pagination).pipe(
-            Query.execute,
+          players.fetch(
+            applyPagination(Players.query.byAll(filter), pagination),
+          ).pipe(
             Effect.map((page) => ({
               data: page.items,
               count: page.items.length,
@@ -902,13 +918,13 @@ export const Coaches = Entity.make({
   model: DynamoModel.configure(Coach, { id: { field: "coachId", identifier: true } }),
   entityType: "Coach",
   timestamps: true,
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
     byAll: {
-      index: "gsi1",
+      name: "gsi1",
       pk: { field: "gsi1pk", composite: [] },
       sk: { field: "gsi1sk", composite: ["gender", "name"] },
     },
@@ -939,7 +955,8 @@ type UpdateCoachInput = Entity.Update<typeof Coaches>
 
 export class CoachService extends ServiceMap.Service<CoachService>()("@gamemanager/CoachService", {
   make: Effect.gen(function* () {
-    const { Coaches: coaches } = yield* DynamoClient.make(MainTable)
+    const db = yield* DynamoClient.make(MainTable)
+    const coaches = db.Coaches
     return {
       create: Effect.fn(function* (input: CreateCoachInput) {
         const id = ulid() as CoachId
@@ -953,8 +970,9 @@ export class CoachService extends ServiceMap.Service<CoachService>()("@gamemanag
       delete: (id: CoachId) => coaches.delete({ id }),
 
       list: (filter: CoachListFilter = {}, pagination?: PaginationOptions) =>
-        applyPagination(Coaches.query.byAll(filter), pagination).pipe(
-          Query.execute,
+        coaches.fetch(
+          applyPagination(Coaches.query.byAll(filter), pagination),
+        ).pipe(
           Effect.map((page) => ({
             data: page.items,
             count: page.items.length,
@@ -1055,13 +1073,13 @@ export const Umpires = Entity.make({
   model: DynamoModel.configure(Umpire, { id: { field: "umpireId", identifier: true } }),
   entityType: "Umpire",
   timestamps: true,
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
     byAll: {
-      index: "gsi1",
+      name: "gsi1",
       pk: { field: "gsi1pk", composite: [] },
       sk: { field: "gsi1sk", composite: ["gender", "name"] },
     },
@@ -1094,7 +1112,8 @@ export class UmpireService extends ServiceMap.Service<UmpireService>()(
   "@gamemanager/UmpireService",
   {
     make: Effect.gen(function* () {
-      const { Umpires: umpires } = yield* DynamoClient.make(MainTable)
+      const db = yield* DynamoClient.make(MainTable)
+      const umpires = db.Umpires
       return {
         create: Effect.fn(function* (input: CreateUmpireInput) {
           const id = ulid() as UmpireId
@@ -1108,8 +1127,9 @@ export class UmpireService extends ServiceMap.Service<UmpireService>()(
         delete: (id: UmpireId) => umpires.delete({ id }),
 
         list: (filter: UmpireListFilter = {}, pagination?: PaginationOptions) =>
-          applyPagination(Umpires.query.byAll(filter), pagination).pipe(
-            Query.execute,
+          umpires.fetch(
+            applyPagination(Umpires.query.byAll(filter), pagination),
+          ).pipe(
             Effect.map((page) => ({
               data: page.items,
               count: page.items.length,
@@ -1213,13 +1233,13 @@ export const Venues = Entity.make({
   model: DynamoModel.configure(Venue, { id: { field: "venueId", identifier: true } }),
   entityType: "Venue",
   timestamps: true,
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["id"] },
-      sk: { field: "sk", composite: [] },
-    },
     byAll: {
-      index: "gsi1",
+      name: "gsi1",
       pk: { field: "gsi1pk", composite: [] },
       sk: { field: "gsi1sk", composite: ["country", "city", "name"] },
     },
@@ -1250,7 +1270,8 @@ type UpdateVenueInput = Entity.Update<typeof Venues>
 
 export class VenueService extends ServiceMap.Service<VenueService>()("@gamemanager/VenueService", {
   make: Effect.gen(function* () {
-    const { Venues: venues } = yield* DynamoClient.make(MainTable)
+    const db = yield* DynamoClient.make(MainTable)
+    const venues = db.Venues
     return {
       create: Effect.fn(function* (input: CreateVenueInput) {
         const id = ulid() as VenueId
@@ -1264,8 +1285,9 @@ export class VenueService extends ServiceMap.Service<VenueService>()("@gamemanag
       delete: (id: VenueId) => venues.delete({ id }),
 
       list: (filter: VenueListFilter = {}, pagination?: PaginationOptions) =>
-        applyPagination(Venues.query.byAll(filter), pagination).pipe(
-          Query.execute,
+        venues.fetch(
+          applyPagination(Venues.query.byAll(filter), pagination),
+        ).pipe(
           Effect.map((page) => ({
             data: page.items,
             count: page.items.length,
@@ -1424,7 +1446,7 @@ const TeamsHandler = HttpApiBuilder.group(
     return handlers
       .handle("list", ({ query }) =>
         Effect.gen(function* () {
-          const filter = query.gender ? { gender: query.gender } : undefined
+          const filter = query.country ? { country: query.country } : undefined
           const result = yield* svc.list(filter, query)
           return {
             data: result.data.map((r) => new Team(r)),
@@ -1667,35 +1689,45 @@ export type SquadSelectionId = typeof SquadSelectionId.Type
 
 ```ts region="model-squad-selection" example="cricket.ts"
 // SquadSelection — a player selected to a team's squad for a series/season.
-// squadId encodes team + season + series (e.g., "aus#2024-25#BGT").
 class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
-  squadId: Schema.String,
-  selectionNumber: Schema.Number,
+  id: Schema.String.pipe(DynamoModel.identifier),
   team: Team.pipe(DynamoModel.ref),
   player: Player.pipe(DynamoModel.ref),
+  season: Schema.String,
+  series: Schema.String,
+  selectionNumber: Schema.Number,
   squadRole: PlayerRoleSchema,
   isCaptain: Schema.Boolean,
   isViceCaptain: Schema.Boolean,
 }) {}
 ```
 
-The `team` and `player` fields use `DynamoModel.ref` — this marks them as reference fields. In the **input** schema, these become `teamId` and `playerId` (you provide the ID). In the **record** schema, they contain the full `Team` and `Player` objects (hydrated on read).
+Three things to notice:
+
+1. **`DynamoModel.identifier`** on `id` — marks the primary business identifier, used for ref resolution from other entities.
+2. **`DynamoModel.ref`** on `team` and `player` — marks them as reference fields. In the **input** schema, these become `teamId` and `playerId` (you provide the ID). In the **record** schema, they contain the full `Team` and `Player` objects (hydrated on read).
+3. **Separate `season` and `series` fields** — instead of encoding them in a composite `squadId` string, each dimension is a proper field that can participate in GSI composites independently.
 
 ### 4.2 SquadSelections entity with refs and cascade indexes
 
 ```ts region="entity-squad-selection" example="cricket.ts"
 const SquadSelections = Entity.make({
-  model: SquadSelection,
+  model: DynamoModel.configure(SquadSelection, { id: { field: "selectionId" } }),
   entityType: "SquadSelection",
   primaryKey: {
-    pk: { field: "pk", composite: ["squadId"] },
-    sk: { field: "sk", composite: ["selectionNumber"] },
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
   indexes: {
-    byPlayer: {
+    byTeamSeries: {
       name: "gsi1",
-      pk: { field: "gsi1pk", composite: ["playerId"] },
-      sk: { field: "gsi1sk", composite: ["squadId", "selectionNumber"] },
+      pk: { field: "gsi1pk", composite: ["teamId", "season", "series"] },
+      sk: { field: "gsi1sk", composite: ["selectionNumber"] },
+    },
+    byPlayer: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["playerId"] },
+      sk: { field: "gsi2sk", composite: ["season", "series"] },
     },
   },
   refs: {
@@ -1705,9 +1737,12 @@ const SquadSelections = Entity.make({
 })
 ```
 
-- **`refs`** — Maps ref fields to their source entities. Each ref field declared with `DynamoModel.ref` on the model is bound to its source entity here. The value `{ entity: Teams }` tells the library to hydrate the `team` field by looking up the referenced Team entity.
+Key design decisions:
 
-- **`SquadsByPlayer` collection** — Defined separately via `Collections.make`, this GSI is keyed by `playerId`, allowing queries like "find all squad selections for a given player". In the v2 API, GSI access patterns are declared as Collections rather than inline on the entity.
+- **`DynamoModel.configure(SquadSelection, { id: { field: "selectionId" } })`** — Renames `id` to `selectionId` in DynamoDB, keeping the REST-friendly single-ID primary key.
+- **`refs`** — Maps ref fields to their source entities. `{ entity: Teams }` tells the library to hydrate the `team` field by looking up the referenced Team entity.
+- **`byTeamSeries` index** — GSI for "all selections for a team in a series". PK composites `["teamId", "season", "series"]` enable hierarchical prefix queries.
+- **`byPlayer` index** — GSI for "all squads a player has been selected for". PK by `playerId`, SK by `season` + `series`.
 
 ### 4.3 Adding cascade to TeamService
 
@@ -1783,20 +1818,21 @@ export class SquadSelectionService extends ServiceMap.Service<SquadSelectionServ
   "@gamemanager/SquadSelectionService",
   {
     make: Effect.gen(function* () {
-      const { SquadSelections: squads } = yield* DynamoClient.make(MainTable)
+      const db = yield* DynamoClient.make(MainTable)
+      const squads = db.SquadSelections
       return {
         create: Effect.fn(function* (input: CreateSquadSelectionInput) {
-          const id = ulid() as SquadSelectionId
-          return yield* squads.put({ ...input, id })
+          return yield* squads.put(input)
         }),
 
-        get: (id: SquadSelectionId) => squads.get({ id }),
+        get: (key: { squadId: string; selectionNumber: number }) => squads.get(key),
 
-        delete: (id: SquadSelectionId) => squads.delete({ id }),
+        delete: (key: { squadId: string; selectionNumber: number }) => squads.delete(key),
 
-        list: (filter: SquadListFilter = {}, pagination?: PaginationOptions) =>
-          applyPagination(SquadSelections.query.byAll(filter), pagination).pipe(
-            Query.execute,
+        listByPlayer: (playerId: string, pagination?: PaginationOptions) =>
+          squads.fetch(
+            applyPagination(SquadSelections.query.byPlayer({ playerId }), pagination),
+          ).pipe(
             Effect.map((page) => ({
               data: page.items,
               count: page.items.length,
@@ -1990,7 +2026,7 @@ Recreate the table, restart the server, and test. First create a team and player
 # Create a team and player to reference
 TEAM_ID=$(curl -s -X POST http://localhost:3000/teams \
   -H "Content-Type: application/json" \
-  -d '{"name": "Australia", "gender": "Male", "league": "ICC"}' \
+  -d '{"name": "Australia", "country": "Australia", "ranking": 1}' \
   | jq -r '.id')
 
 PLAYER_ID=$(curl -s -X POST http://localhost:3000/players \
@@ -2258,7 +2294,9 @@ const validate = (match: Aggregate.Type<typeof MatchAggregate>) =>
 
 export class MatchService extends ServiceMap.Service<MatchService>()("@gamemanager/MatchService", {
   make: Effect.gen(function* () {
-    const { Umpires: boundUmpires, MatchAggregate: matches } = yield* DynamoClient.make(MainTable)
+    const db = yield* DynamoClient.make(MainTable)
+    const boundUmpires = db.Umpires
+    const matches = db.MatchAggregate
     return {
       create: Effect.fn(function* (input: MatchCreate) {
         const id = ulid()
@@ -2588,7 +2626,7 @@ AUS_ID=$(curl -s -X POST http://localhost:3000/teams \
 
 IND_ID=$(curl -s -X POST http://localhost:3000/teams \
   -H "Content-Type: application/json" \
-  -d '{"name": "India", "gender": "Male", "league": "ICC"}' \
+  -d '{"name": "India", "country": "India", "ranking": 2}' \
   | jq -r '.id')
 
 # Create players for Australia
@@ -2772,31 +2810,21 @@ Umpire updates demonstrate cascading updates within an aggregate. The service re
 **Step 5c: Test unique constraint updates.** Rename a team and verify the constraint sentinel updates correctly:
 
 ```bash
-# Verify "Australia" (Male, ICC) is currently taken
-curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:3000/teams \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Australia", "gender": "Male", "league": "ICC"}'
-# → 409
-
 # Rename "Australia" to "Australia XI"
 curl -s -X PUT http://localhost:3000/teams/$AUS_ID \
   -H "Content-Type: application/json" \
   -d '{"name": "Australia XI"}' | jq '.name'
 # → "Australia XI"
 
-# Now "Australia" (Male, ICC) is available — the old constraint sentinel was removed
-curl -s -X POST http://localhost:3000/teams \
+# Verify the update
+curl -s http://localhost:3000/teams/$AUS_ID | jq '.name'
+# → "Australia XI"
+
+# Rename back
+curl -s -X PUT http://localhost:3000/teams/$AUS_ID \
   -H "Content-Type: application/json" \
-  -d '{"name": "Australia", "gender": "Male", "league": "ICC"}' | jq '.name'
+  -d '{"name": "Australia"}' | jq '.name'
 # → "Australia"
-
-# "Australia XI" is still protected
-curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:3000/teams \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Australia XI", "gender": "Male", "league": "ICC"}'
-# → 409
-
-# Clean up: delete the new "Australia" and rename back
 NEW_AUS=$(curl -s "http://localhost:3000/teams?gender=Male" | jq -r '.data[] | select(.name == "Australia") | .id')
 curl -s -X DELETE http://localhost:3000/teams/$NEW_AUS
 curl -s -X PUT http://localhost:3000/teams/$AUS_ID \

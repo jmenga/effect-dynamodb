@@ -3938,24 +3938,24 @@ export const bind = <
     type Key = EntityKeyType<TModel, TIndexes>
     type Input = EntityRefInputType<TModel, TRefs>
 
-    // Helper: apply combinators to an EntityUpdate, then asEffect + provide
+    // Helper: apply combinators to an EntityUpdate, then run in record mode + provide
     const applyUpdate = (
       op: EntityUpdate<any, any, any, any, any>,
       combinators: ReadonlyArray<(op: any) => any>,
     ) => {
       let result: any = op
       for (const fn of combinators) result = fn(result)
-      return provide(result.asEffect())
+      return provide(result._run("record"))
     }
 
-    // Helper: apply combinators to an EntityPut, then asEffect + provide
+    // Helper: apply combinators to an EntityPut, then run in record mode + provide
     const applyPut = (
       op: EntityPut<any, any, any, any>,
       combinators: ReadonlyArray<(op: any) => any>,
     ) => {
       let result: any = op
       for (const fn of combinators) result = fn(result)
-      return provide(result.asEffect())
+      return provide(result._run("record"))
     }
 
     // Helper: apply combinators to an EntityDelete, then asEffect + provide
@@ -3977,7 +3977,7 @@ export const bind = <
 
     return {
       // CRUD — all ops return Effect (auto-wrapped)
-      get: (key: Key) => provide(entity.get(key).asEffect()),
+      get: (key: Key) => provide((entity.get(key) as any)._run("record")),
       put: (input: Input, ...combinators: ReadonlyArray<(op: any) => any>) =>
         applyPut(entity.put(input), combinators),
       create: (input: Input, ...combinators: ReadonlyArray<(op: any) => any>) =>
@@ -3994,11 +3994,11 @@ export const bind = <
         applyDelete(entity.deleteIfExists(key), combinators),
       // Lifecycle
       getVersion: (key: Key, version: number) =>
-        provide(entity.getVersion(key, version).asEffect()),
-      restore: (key: Key) => provide(entity.restore(key).asEffect()),
+        provide((entity.getVersion(key, version) as any)._run("record")),
+      restore: (key: Key) => provide((entity.restore(key) as any)._run("record")),
       purge: (key: Key) => provide(entity.purge(key).asEffect()),
       deleted: {
-        get: (key: Key) => provide(entity.deleted.get(key).asEffect()),
+        get: (key: Key) => provide((entity.deleted.get(key) as any)._run("record")),
       },
       // Query execution
       paginate: <A>(q: Query.Query<A>, ...combinators: ReadonlyArray<(q: any) => any>) => {

@@ -24,12 +24,12 @@ This guide helps ElectroDB users understand effect-dynamodb. It maps ElectroDB c
 | Key templates (`"USER#${userId}"`) | `composite: ["userId"]` | Attribute-list composition, not template strings |
 | `entity.put(data).go()` | `yield* bound.put(data)` | Destructure from `DynamoClient.make(table)`, returns Effect |
 | `entity.get(key).go()` | `yield* bound.get(key)` | Destructure from `DynamoClient.make(table)`, returns Effect |
-| `entity.query.<name>(key).go()` | `bound.collect(EntityDef.query.<name>(key))` | Queries built on entity definition, collected via bound client |
+| `entity.query.<name>(key).go()` | `db.entities.E.indexName(pk).collect()` | Entity index accessor on typed client, BoundQuery terminal |
 | `entity.create(data).go()` | `yield* bound.create(data)` | Put with `attribute_not_exists` condition |
 | `entity.upsert(data).go()` | `yield* bound.upsert(data)` | Create or update with `if_not_exists` for immutable fields |
 | `entity.patch(key).set({}).go()` | `bound.patch(key, Entity.set(...))` | Update with `attribute_exists` — fails if item doesn't exist |
 | `entity.remove(key).go()` | `yield* bound.deleteIfExists(key)` | Delete with `attribute_exists` — fails if item doesn't exist |
-| `entity.scan.go()` | `bound.collect(EntityDef.scan())` | Scan returns Query — compose with filter, limit, etc. |
+| `entity.scan.go()` | `db.entities.E.scan().collect()` | Scan returns BoundQuery — compose with filter, limit, etc. |
 | `.where()` callback | `entity.condition()` / `entity.filter()` | Callback or shorthand syntax on entity definitions |
 | `.set({}).go()` | `bound.update(key, Entity.set(updates))` | Variadic combinators on bound update |
 | `.remove([])` | `Entity.remove(fields)` | Pipeable REMOVE combinator |
@@ -98,13 +98,13 @@ const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
 const UserEntity = Entity.make({
   model: UserModel,
   entityType: "User",
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
     byEmail: {
-      index: "gsi1",
+      name: "gsi1",
       pk: { field: "gsi1pk", composite: ["email"] },
       sk: { field: "gsi1sk", composite: [] },
     },
@@ -189,24 +189,22 @@ do {
 
 **effect-dynamodb:**
 ```typescript
-const { UserEntity: users, TaskEntity: tasks } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make(MainTable)
 
-// Query by index
-const userResults = yield* users.collect(
-  UserEntity.query.byEmail({ email: "a@b.com" }),
-)
+// Query by index — entity accessor returns BoundQuery
+const userResults = yield* db.UserEntity.byEmail({ email: "a@b.com" }).collect()
 
-// With sort key condition and filter
-const taskResults = yield* tasks.collect(
-  TaskEntity.query.byProject({ projectId: "p-1" }),
-  Query.where({ beginsWith: activePrefix }),
-  Query.limit(25),
-)
+// With filter and limit
+const taskResults = yield* db.TaskEntity
+  .byProject({ projectId: "p-1" })
+  .filter((t, { eq }) => eq(t.status, "active"))
+  .limit(25)
+  .collect()
 
 // Stream-based pagination (automatic)
-const stream = yield* TaskEntity.query.byProject({ projectId: "p-1" }).pipe(
-  Query.paginate,
-)
+const stream = db.TaskEntity
+  .byProject({ projectId: "p-1" })
+  .paginate()
 yield* Stream.runForEach(stream, (task) => processItem(task))
 ```
 
@@ -279,13 +277,14 @@ const { data } = await myService.collections.byTenant({ tenantId: "t-1" }).go()
 
 **effect-dynamodb:**
 ```typescript
-const TenantMembers = Collection.make("TenantMembers", {
-  users: UserEntity,
-  orders: OrderEntity,
-})
+// Collections are auto-discovered from entity indexes sharing the same
+// `collection` property. No explicit Collection.make() needed.
+// On UserEntity and OrderEntity, add: collection: "tenantMembers" to the index
 
-const data = yield* TenantMembers.query({ tenantId: "t-1" }).pipe(Query.execute)
-// { users: User[], orders: Order[] }
+const db = yield* DynamoClient.make({ entities: { UserEntity, OrderEntity } })
+
+const data = yield* db.collections.tenantMembers({ tenantId: "t-1" }).collect()
+// { UserEntity: User[], OrderEntity: Order[] }
 ```
 
 ### Transactions
@@ -367,7 +366,7 @@ Features in ElectroDB that work differently or are not available in effect-dynam
 | **Calculated/virtual attributes** | Via watch + set/get | Compute at application layer or with `Schema.transform` |
 | **Key templates** | `"USER#${userId}"` template strings | Attribute-list composition (`composite: ["userId"]`) — more predictable |
 | **Attribute padding** | `padding: { length, char }` | Automatic zero-padding for numeric composites in sort keys |
-| **Fluent chaining** | `entity.query.byEmail(pk).where(...).go()` | Pipe-based: `query.pipe(Query.where(...))` then `bound.collect(query)` |
+| **Fluent chaining** | `entity.query.byEmail(pk).where(...).go()` | Fluent BoundQuery: `db.entities.E.byEmail(pk).where(...).collect()` |
 | **Async/Promise** | Returns Promises | Returns Effects — run via `Effect.runPromise` at the edge |
 
 See the [ElectroDB Comparison](/effect-dynamodb/reference/electrodb-comparison/) for a full feature-by-feature comparison.

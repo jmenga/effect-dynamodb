@@ -1,13 +1,13 @@
 ---
 title: "Example: Shopping Mall"
-description: "Single entity with composite keys, 2 GSI collections, and date range queries"
+description: "Single entity with composite keys, 2 GSI indexes, and date range queries"
 ---
 
 A shopping mall directory application managing **mall stores** in a single DynamoDB table. Adapted from the [ElectroDB Shopping Mall example](https://electrodb.dev/en/examples/shopping-mall/) to showcase effect-dynamodb's approach to the same problem.
 
 **What you'll learn:**
 - Single entity with a composite primary key (2 PK + 2 SK composites)
-- 2 GSI collections for different access patterns on the same entity
+- 2 GSI indexes for different access patterns on the same entity
 - Sort key prefix queries to filter by building
 - Date range queries for lease expiration windows
 - CRUD operations with composite keys
@@ -20,9 +20,9 @@ A shopping mall directory application managing **mall stores** in a single Dynam
 This example supports six access patterns on a single entity:
 
 1. **Get store** -- Look up a specific store by city, mall, building, and store ID (primary key)
-2. **Stores in a mall** -- Find all stores in a given mall (GSI1 collection)
-3. **Stores in a building** -- Narrow to a specific building within a mall (GSI1 collection + SK composites)
-4. **Lease renewals** -- Find leases expiring within a date range (GSI2 collection)
+2. **Stores in a mall** -- Find all stores in a given mall (`byMall` index, GSI1)
+3. **Stores in a building** -- Narrow to a specific building within a mall (`byMall` index + SK composites)
+4. **Lease renewals** -- Find leases expiring within a date range (`byStore` index, GSI2)
 5. **Update store** -- Change rent and discount for a store
 6. **Delete store** -- Remove a store from the directory
 
@@ -65,7 +65,7 @@ Key modeling decisions:
 
 ---
 
-## Step 2: Schema, Entity, Table, and Collections
+## Step 2: Schema, Entity, and Table
 
 ### Schema
 
@@ -75,7 +75,7 @@ const MallSchema = DynamoSchema.make({ name: "mall", version: 1 })
 
 ### MallStore Entity and Table
 
-The entity defines only a composite primary key. The table declares the entity as a member:
+The entity defines a composite primary key and two GSI indexes. The table declares the entity as a member:
 
 ```typescript title="entities.ts" region="entity" example="shopping-mall.ts"
 const MallStores = Entity.make({
@@ -111,10 +111,10 @@ GSI access patterns are now defined as entity-level indexes on the entity defini
 // GSI access patterns are now defined as entity-level indexes above.
 ```
 
-| Collection | Index | PK composites | SK composites | Access pattern |
-|------------|-------|--------------|---------------|----------------|
-| **Units** (GSI1) | `gsi1` | `mallId` | `buildingId`, `unitId` | Stores in a mall or building |
-| **Leases** (GSI2) | `gsi2` | `storeId` | `leaseEndDate` | Lease expiration queries |
+| Index | Physical GSI | PK composites | SK composites | Access pattern |
+|-------|-------------|--------------|---------------|----------------|
+| **`byMall`** | `gsi1` | `mallId` | `buildingId`, `unitId` | Stores in a mall or building |
+| **`byStore`** | `gsi2` | `storeId` | `leaseEndDate` | Lease expiration queries |
 
 The composite primary key uses four attributes -- `cityId` and `mallId` form the partition key, while `buildingId` and `storeId` form the sort key. This means a `get` requires all four values.
 
@@ -236,9 +236,9 @@ const coffee = yield* db.entities.MallStores.get({
 // coffee.deposit → 7000
 ```
 
-### Pattern 2: All Stores in a Mall (GSI1 Collection)
+### Pattern 2: All Stores in a Mall (`byMall` Index)
 
-The `Units` collection on GSI1 uses `mallId` as the partition key. Querying with just the PK composites returns all stores in that mall:
+The `byMall` index on GSI1 uses `mallId` as the partition key. Querying with just the PK composites returns all stores in that mall:
 
 ```typescript region="pattern-2" example="shopping-mall.ts"
 const eastpointeStores = yield* db.entities.MallStores.byMall({ mallId: "eastpointe" }).collect()
@@ -248,9 +248,9 @@ const westgateStores = yield* db.entities.MallStores.byMall({ mallId: "westgate"
 // → 2 stores: mega-mart, gifts-galore
 ```
 
-### Pattern 3: Stores in a Building (GSI1 Collection + SK Composites)
+### Pattern 3: Stores in a Building (`byMall` Index + SK Composites)
 
-To narrow to a specific building, pass `buildingId` as an additional composite in the collection query:
+To narrow to a specific building, pass `buildingId` as an additional composite in the index query:
 
 ```typescript region="pattern-3" example="shopping-mall.ts"
 const bldgAStores = yield* db.entities.MallStores.byMall({
@@ -266,11 +266,11 @@ const bldgBStores = yield* db.entities.MallStores.byMall({
 // → 2 stores: tech-zone, trendy-threads
 ```
 
-The sort key for `Units` is composed from `buildingId + unitId`. Passing `buildingId` as an additional parameter filters stores to that building.
+The sort key for `byMall` is composed from `buildingId + unitId`. Passing `buildingId` as an additional parameter filters stores to that building.
 
-### Pattern 4: Lease Renewals by Date Range (GSI2 Collection)
+### Pattern 4: Lease Renewals by Date Range (`byStore` Index)
 
-The `Leases` collection on GSI2 uses `storeId` as the partition key and `leaseEndDate` as the sort key. Query by store and filter the results by date range:
+The `byStore` index on GSI2 uses `storeId` as the partition key and `leaseEndDate` as the sort key. Query by store and filter the results by date range:
 
 ```typescript region="pattern-4" example="shopping-mall.ts"
 // star-coffee lease ends 2025-03-31 — within Q1
@@ -343,7 +343,7 @@ After deletion, the store disappears from both the primary key and all GSI queri
 
 ## Running the Example
 
-The complete runnable example is at [`examples/shopping-mall.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/shopping-mall.ts) in the repository. It seeds data, runs all 6 access patterns, and verifies each with assertions.
+The complete runnable example is at [`examples/shopping-mall.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/examples/shopping-mall.ts) in the repository. It seeds data, runs all 6 access patterns, and verifies each with assertions.
 
 ```bash
 docker run -d -p 8000:8000 amazon/dynamodb-local
@@ -382,8 +382,8 @@ Effect.runPromise(main).then(
 | Concept | How it's used |
 |---------|---------------|
 | **Composite primary key** | 4 attributes (2 PK + 2 SK) uniquely identify each store |
-| **Collections for GSI access** | `Units` collection queries by mall; `Leases` collection queries by store + date |
-| **SK composite filtering** | Passing `buildingId` to `Units` collection filters stores within a building |
+| **Entity-level GSI indexes** | `byMall` index queries by mall; `byStore` index queries by store + date |
+| **SK composite filtering** | Passing `buildingId` to `byMall` index filters stores within a building |
 | **Date range queries** | Lease expiration date filtering for date windows |
 | **Schema defaults** | `discount` defaults to `"0.00"` via `Schema.withDecodingDefaultKey` |
 | **Optional fields** | `deposit` is `Schema.optional` -- not every store requires one |
@@ -392,5 +392,5 @@ Effect.runPromise(main).then(
 
 - [Modeling Guide](/effect-dynamodb/guides/modeling/) -- Deep dive into models, schemas, tables, and entities
 - [Queries Guide](/effect-dynamodb/guides/queries/) -- Sort key conditions, filters, and pagination
-- [Example: Blog Platform](/effect-dynamodb/tutorials/blog/) -- Multi-entity single-table design with transactions
-- [Example: Human Resources](/effect-dynamodb/tutorials/human-resources/) -- 3 entities, 5 GSIs, collections, and soft delete
+- [Example: Blog Platform](/effect-dynamodb/examples/blog/) -- Multi-entity single-table design with transactions
+- [Example: Human Resources](/effect-dynamodb/examples/human-resources/) -- 3 entities, 5 GSIs, collections, and soft delete

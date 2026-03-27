@@ -37,9 +37,9 @@ class Review extends Schema.Class<Review>("Review")({
 
 ---
 
-## Step 2: Schema, Entities, and Collections
+## Step 2: Schema, Entities, and Table
 
-Both entities share one table with GSI collections for category/product lookups:
+Both entities share one table with GSI indexes for category/product lookups:
 
 ```typescript title="entities.ts" region="entities" example="scan.ts"
 const AppSchema = DynamoSchema.make({ name: "scan-demo", version: 1 })
@@ -198,7 +198,7 @@ Prefer queries for application access patterns. Use scans for administrative ope
 
 ## Running the Example
 
-The complete runnable example is at [`examples/scan.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/scan.ts) in the repository.
+The complete runnable example is at [`examples/scan.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/examples/scan.ts) in the repository.
 
 Start DynamoDB Local:
 
@@ -248,7 +248,7 @@ Effect.runPromise(main).then(
 
 ## What's Next?
 
-- [Example: Conditional Writes & Filters](/effect-dynamodb/tutorials/expressions/) -- Conditional puts, updates, deletes, and filter operators
-- [Example: Projections](/effect-dynamodb/tutorials/projections/) -- Selective attribute retrieval with ProjectionExpression
+- [Example: Conditional Writes & Filters](/effect-dynamodb/examples/expressions/) -- Conditional puts, updates, deletes, and filter operators
+- [Example: Projections](/effect-dynamodb/examples/projections/) -- Selective attribute retrieval with ProjectionExpression
 - [Queries Guide](/effect-dynamodb/guides/queries/) -- Index queries, pagination, sort key conditions, and collections
-- [Example: Human Resources](/effect-dynamodb/tutorials/human-resources/) -- Full single-table design with 3 entities, collections, and transactions
+- [Example: Human Resources](/effect-dynamodb/examples/human-resources/) -- Full single-table design with 3 entities, collections, and transactions

@@ -1,6 +1,6 @@
 ---
 title: "Example: CRUD Operations"
-description: "Full high-level API with entity operations, variadic combinator updates, collection queries, transactions, version history, soft delete, and purge"
+description: "Full high-level API with entity operations, variadic combinator updates, index queries, transactions, version history, soft delete, and purge"
 ---
 
 A comprehensive example demonstrating the full effect-dynamodb high-level API. Starting from model definitions through to advanced lifecycle features, this example covers every major operation you will use when building applications.
@@ -9,7 +9,7 @@ A comprehensive example demonstrating the full effect-dynamodb high-level API. S
 - Creating items with `put` and reading with `get`
 - Updates with variadic combinators: `update(key, Entity.set(...), Entity.expectedVersion(n))`
 - Error handling with tagged errors (`ItemNotFound`, `OptimisticLockError`)
-- Collection queries with fluent combinators (`reverse`, `filter`, `collect`)
+- Index queries with fluent combinators (`reverse`, `filter`, `collect`)
 - Atomic transactions with `Transaction.transactWrite` and `transactGet`
 - Sparse GSI behavior and the all-or-none update constraint
 - Version history with `versioned: { retain: true }`
@@ -53,9 +53,9 @@ class Task extends Schema.Class<Task>("Task")({
 
 ---
 
-## Step 2: Entities, Table, and Collections
+## Step 2: Entities and Table
 
-Entities define only their primary key. GSI access patterns are owned by Collections:
+Entities define their primary key and GSI indexes:
 
 ```typescript region="entities" example="crud.ts"
 const AppSchema = DynamoSchema.make({ name: "crud-demo", version: 1 })
@@ -105,15 +105,15 @@ const MainTable = Table.make({
 
 Key configuration:
 - **Users** have `versioned: { retain: true }` -- every mutation creates a version snapshot in the same partition, enabling full audit history
-- **UsersByRole** collection defines the GSI access pattern for querying users by role
+- **`byRole` index** on Users defines the GSI access pattern for querying users by role
 - **Tasks** have `softDelete: true` -- deleting archives the item rather than destroying it
-- **TasksByUser** collection has `status` and `taskId` in the sort key composite, so tasks for a user are sorted by status
+- **`byUser` index** on Tasks has `status` and `taskId` in the sort key composite, so tasks for a user are sorted by status
 
 ---
 
 ## Step 3: Typed Client and Create Items
 
-Before calling any entity operations, obtain a typed client via `DynamoClient.make({ entities, collections })` to resolve the `DynamoClient` and `TableConfig` dependencies. The returned client provides bound entities and collection accessors where all operations have `R = never`:
+Before calling any entity operations, obtain a typed client via `DynamoClient.make({ entities })` to resolve the `DynamoClient` and `TableConfig` dependencies. The returned client provides bound entities and auto-discovered collection accessors where all operations have `R = never`:
 
 ```typescript region="client" example="crud.ts"
 // Typed execution gateway — binds all entities and collections
@@ -239,9 +239,9 @@ Bound entity methods return `Effect` directly, so you can pipe to Effect combina
 
 ---
 
-## Step 8: Collection Queries
+## Step 8: Index Queries
 
-Query a collection by providing the partition key composites. Use `.collect()` to gather all results as a grouped object:
+Query an entity index by providing the partition key composites. Use `.collect()` to gather all results:
 
 ```typescript region="query" example="crud.ts"
 const aliceTasks = yield* db.entities.Tasks.byUser({ userId: "u-alice" }).collect()
@@ -438,7 +438,7 @@ Version snapshots share the primary partition key but use a version-specific sor
 
 ### Soft Delete
 
-For entities with `softDelete: true`, `Entity.delete` archives the item instead of destroying it. GSI keys are stripped, so the item vanishes from all collection queries:
+For entities with `softDelete: true`, `Entity.delete` archives the item instead of destroying it. GSI keys are stripped, so the item vanishes from all index queries:
 
 ```typescript region="soft-delete" example="crud.ts"
 yield* db.entities.Tasks.delete({ taskId: "t-1" })
@@ -485,7 +485,7 @@ Purge is the nuclear option. Use it for GDPR "right to erasure" or test cleanup.
 
 ## Running the Example
 
-The complete runnable example is at [`examples/crud.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/crud.ts) in the repository.
+The complete runnable example is at [`examples/crud.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/examples/crud.ts) in the repository.
 
 Start DynamoDB Local:
 
@@ -526,11 +526,11 @@ Effect.runPromise(main).then(
 
 | Concept | How it's used |
 |---------|---------------|
-| **Typed client** | `const db = yield* DynamoClient.make({ entities, collections })` resolves dependencies; all ops have `R = never` |
+| **Typed client** | `const db = yield* DynamoClient.make({ entities })` resolves dependencies; all ops have `R = never` |
 | **Variadic combinator updates** | `db.entities.Users.update(key, Entity.set(...), Entity.expectedVersion(n))` — combinators as rest args |
 | **Optimistic locking** | `Entity.expectedVersion(n)` composes with `Entity.set()` as variadic combinators |
 | **Tagged error handling** | `Effect.catchTag("ItemNotFound", ...)` for precise recovery — bound methods return `Effect` directly |
-| **Collection queries** | `db.collections.TasksByUser(composites).collect()` returns grouped results; `.reverse()`, `.filter()` for combinators |
+| **Index queries** | `db.entities.Tasks.byUser(composites).collect()` returns results; `.reverse()`, `.filter()` for combinators |
 | **Transactions** | `transactWrite` for atomic multi-entity creates; `transactGet` for typed tuple reads |
 | **Sparse GSI** | Optional composites produce sparse indexes; all-or-none constraint prevents stale keys |
 | **Version history** | `versioned: { retain: true }` creates snapshots; `db.entities.Users.getVersion(key, n)` and `Users.versions(key)` for retrieval |
@@ -539,7 +539,7 @@ Effect.runPromise(main).then(
 
 ## What's Next?
 
-- [Human Resources Example](/effect-dynamodb/tutorials/human-resources/) -- Single-table design with 3 entities, 5 GSIs, collections, and transactions
+- [Human Resources Example](/effect-dynamodb/examples/human-resources/) -- Single-table design with 3 entities, 5 GSIs, collections, and transactions
 - [Modeling Guide](/effect-dynamodb/guides/modeling/) -- Deep dive into models, schemas, tables, and entities
 - [Lifecycle](/effect-dynamodb/guides/lifecycle/) -- Soft delete, versioning, and TTL
 - [Indexes & Collections](/effect-dynamodb/guides/indexes/) -- Access pattern design and collection patterns

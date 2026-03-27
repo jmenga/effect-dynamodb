@@ -363,11 +363,11 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 2: Workplaces (gsi1 collection)")
 
   // #region workplaces
-  const { Employees: gwZooEmployees } = yield* db.collections.Workplaces!({
+  const { Employees: gwZooEmployees } = yield* db.collections.workplaces!({
     office: "gw-zoo",
   }).collect()
 
-  const { Offices: gwZooOffice } = yield* db.collections.Workplaces!({ office: "gw-zoo" }).collect()
+  const { Offices: gwZooOffice } = yield* db.collections.workplaces!({ office: "gw-zoo" }).collect()
   // #endregion
   assertEq(gwZooEmployees.length, 2, "gw-zoo has 2 employees")
   const gwZooIds = gwZooEmployees.map((e: any) => e.employee).sort()
@@ -381,11 +381,11 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 3: Assignments (gsi3 collection)")
 
   // #region assignments
-  const { Tasks: dfinlayTasks } = yield* db.collections.Assignments!({
+  const { Tasks: dfinlayTasks } = yield* db.collections.assignments!({
     employee: "dfinlay",
   }).collect()
 
-  const { Employees: dfinlayInfo } = yield* db.collections.Assignments!({
+  const { Employees: dfinlayInfo } = yield* db.collections.assignments!({
     employee: "dfinlay",
   }).collect()
   // #endregion
@@ -535,7 +535,7 @@ const program = Effect.gen(function* () {
 
   const newHire = yield* db.entities.Employees.get({ employee: "rstarr" })
 
-  const { Tasks: onboardingTasks } = yield* db.collections.Assignments!({
+  const { Tasks: onboardingTasks } = yield* db.collections.assignments!({
     employee: "rstarr",
   }).collect()
   // #endregion

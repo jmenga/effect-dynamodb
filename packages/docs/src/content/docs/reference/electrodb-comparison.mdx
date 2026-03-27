@@ -60,11 +60,11 @@ ElectroDB is the most feature-rich existing DynamoDB ORM for TypeScript. This co
 | Feature | ElectroDB | effect-dynamodb | Assessment |
 |---------|-----------|-----------------|------------|
 | Get (single item) | `entity.get(pk).go()` | `bound.get(key)` | Parity |
-| Query by access pattern | `entity.query.<name>(pk).go()` | `bound.collect(EntityDef.query.<name>(pk))` | Parity |
+| Query by access pattern | `entity.query.<name>(pk).go()` | `db.entities.E.indexName(pk).collect()` | Parity |
 | Sort key conditions | begins, between, gt, gte, lt, lte | eq, lt, lte, gt, gte, between, beginsWith | Parity |
 | Filter expressions | `.where((attrs, ops) => ...)` callback | `Entity.filter(callback | shorthand)` declarative object | Parity |
-| Scan | `entity.scan.go()` | `bound.collect(EntityDef.scan())` | Parity |
-| Collection query | `service.collections.<name>(pk)` | `Collection.query(pk)` | Parity |
+| Scan | `entity.scan.go()` | `db.entities.E.scan().collect()` | Parity |
+| Collection query | `service.collections.<name>(pk)` | `db.collections.name(pk).collect()` | Parity |
 | Batch get | `entity.get([...]).go()` | `Batch.get(items)` with auto-retry | Parity |
 | Transact get | `service.transaction.get(cb)` | `Transaction.transactGet(items)` | Parity |
 | Consistent reads | `consistent: true` | `Entity.consistentRead()`, `Query.consistentRead()` | Parity |
@@ -108,8 +108,8 @@ ElectroDB is the most feature-rich existing DynamoDB ORM for TypeScript. This co
 | SUBTRACT (decrement) | `.subtract({})` | `Entity.subtract(values)` | Parity |
 | APPEND (add to list) | `.append({})` | `Entity.append(values)` | Parity |
 | DELETE (remove from set) | `.delete({})` | `Entity.deleteFromSet(values)` | Parity |
-| Data callback | `.data((attrs, ops) => ...)` | Not supported — use pipe composition with Effect operators | ElectroDB only |
-| Nested property updates | Dot notation for maps, brackets for lists | Not supported — use full object via `Entity.set()` or `DynamoClient.updateItem` | ElectroDB only |
+| Data callback | `.data((attrs, ops) => ...)` | Variadic combinators: `Entity.set()`, `Entity.add()`, `Entity.pathSet()`, etc. | Parity |
+| Nested property updates | Dot notation for maps, brackets for lists | Path-based combinators: `Entity.pathSet()`, `Entity.pathRemove()`, `Entity.pathAdd()`, etc. | Parity |
 
 ### 6. Lifecycle & Data Integrity
 
@@ -175,7 +175,7 @@ ElectroDB is the most feature-rich existing DynamoDB ORM for TypeScript. This co
 | AWS SDK v3 support | Yes | Yes (via DynamoClient) | Parity |
 | Layer-based DI | N/A (plain JS) | Full Effect Layer/Service integration | **Advantage** |
 | Resource management | Manual client lifecycle | `Effect.acquireRelease` in DynamoClient | **Advantage** |
-| Error handling | `ElectroError` with codes | 18 tagged errors with `catchTag` discrimination | **Advantage** |
+| Error handling | `ElectroError` with codes | 20 tagged errors with `catchTag` discrimination | **Advantage** |
 | Streaming pagination | Not built-in (cursor loops) | `Stream.paginate` integration | **Advantage** |
 | Table definition export | Not built-in | `Table.definition()` for CloudFormation/CDK | **Advantage** |
 | Config-based setup | N/A | `DynamoClient.layerConfig()`, `Table.layerConfig()` via Effect Config | **Advantage** |
@@ -218,7 +218,7 @@ These are capabilities that ElectroDB does not provide:
 
 4. **Event sourcing** — `EventStore.makeStream()` provides append-only event logs with command handlers and state fold projections built on DynamoDB.
 
-5. **Effect integration** — Full Effect ecosystem: Layer-based DI, 18 tagged errors with `catchTag`, Stream-based pagination, resource management, composable pipelines, dual APIs. This is the primary architectural differentiator.
+5. **Effect integration** — Full Effect ecosystem: Layer-based DI, 20 tagged errors with `catchTag`, Stream-based pagination, resource management, composable pipelines, dual APIs. This is the primary architectural differentiator.
 
 6. **9 derived types** — One entity declaration automatically produces Model, Record, Input, Update, Key, Item, Marshalled types plus ref-aware Input and Update variants. ElectroDB has fewer derived types and no marshalled/item distinction.
 
@@ -247,8 +247,8 @@ Features in ElectroDB that are not available in effect-dynamodb, with workaround
 | Key casting (numeric keys) | All keys are strings by design |
 | Index scope | Key namespacing provides sufficient isolation |
 | Attributes as indexes | Use standard composite key definitions |
-| Data callback | Pipe composition with Effect operators |
-| Nested property updates | Full object via `Entity.set()` or `DynamoClient.updateItem` directly |
+| Data callback | Variadic combinators: `Entity.set()`, `Entity.add()`, `Entity.pathSet()`, etc. |
+| Nested property updates | Path-based combinators: `Entity.pathSet()`, `Entity.pathRemove()`, `Entity.pathAdd()`, etc. |
 | Custom params merge | Use `DynamoClient` directly for custom operations |
 | ElectroCLI | N/A — no CLI equivalent |
 | Hydrate (KEYS_ONLY GSI) | Query GSI then compose `Batch.get(keys)` in a pipe |

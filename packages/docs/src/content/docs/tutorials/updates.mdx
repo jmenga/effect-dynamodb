@@ -202,7 +202,7 @@ When the version in DynamoDB does not match the expected version, the update is 
 
 ## Running the Example
 
-The complete runnable example is at [`examples/updates.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/updates.ts) in the repository.
+The complete runnable example is at [`examples/updates.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/examples/updates.ts) in the repository.
 
 ```bash
 docker run -d -p 8000:8000 amazon/dynamodb-local
@@ -250,5 +250,5 @@ Effect.runPromise(main).then(
 
 - [Modeling Guide](/effect-dynamodb/guides/modeling/) — Deep dive into models, schemas, tables, and entities
 - [Queries](/effect-dynamodb/guides/queries/) — Query combinators and pagination
-- [Example: Batch Operations](/effect-dynamodb/tutorials/batch/) — Batch get and write across entities
-- [Example: Human Resources](/effect-dynamodb/tutorials/human-resources/) — Full single-table design with collections, transactions, and soft delete
+- [Example: Batch Operations](/effect-dynamodb/examples/batch/) — Batch get and write across entities
+- [Example: Human Resources](/effect-dynamodb/examples/human-resources/) — Full single-table design with collections, transactions, and soft delete

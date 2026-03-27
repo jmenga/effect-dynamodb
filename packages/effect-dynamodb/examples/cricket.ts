@@ -87,12 +87,13 @@ class Venue extends Schema.Class<Venue>("Venue")({
 
 // #region model-squad-selection
 // SquadSelection — a player selected to a team's squad for a series/season.
-// squadId encodes team + season + series (e.g., "aus#2024-25#BGT").
 class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
-  squadId: Schema.String,
-  selectionNumber: Schema.Number,
+  id: Schema.String.pipe(DynamoModel.identifier),
   team: Team.pipe(DynamoModel.ref),
   player: Player.pipe(DynamoModel.ref),
+  season: Schema.String,
+  series: Schema.String,
+  selectionNumber: Schema.Number,
   squadRole: PlayerRoleSchema,
   isCaptain: Schema.Boolean,
   isViceCaptain: Schema.Boolean,
@@ -179,17 +180,22 @@ const Venues = Entity.make({
 
 // #region entity-squad-selection
 const SquadSelections = Entity.make({
-  model: SquadSelection,
+  model: DynamoModel.configure(SquadSelection, { id: { field: "selectionId" } }),
   entityType: "SquadSelection",
   primaryKey: {
-    pk: { field: "pk", composite: ["squadId"] },
-    sk: { field: "sk", composite: ["selectionNumber"] },
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
   },
   indexes: {
-    byPlayer: {
+    byTeamSeries: {
       name: "gsi1",
-      pk: { field: "gsi1pk", composite: ["playerId"] },
-      sk: { field: "gsi1sk", composite: ["squadId", "selectionNumber"] },
+      pk: { field: "gsi1pk", composite: ["teamId", "season", "series"] },
+      sk: { field: "gsi1sk", composite: ["selectionNumber"] },
+    },
+    byPlayer: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["playerId"] },
+      sk: { field: "gsi2sk", composite: ["season", "series"] },
     },
   },
   refs: {
@@ -296,6 +302,8 @@ const program = Effect.gen(function* () {
       { AttributeName: "lsi1sk", AttributeType: "S" },
       { AttributeName: "gsi1pk", AttributeType: "S" },
       { AttributeName: "gsi1sk", AttributeType: "S" },
+      { AttributeName: "gsi2pk", AttributeType: "S" },
+      { AttributeName: "gsi2sk", AttributeType: "S" },
     ],
     LocalSecondaryIndexes: [
       {
@@ -313,6 +321,14 @@ const program = Effect.gen(function* () {
         KeySchema: [
           { AttributeName: "gsi1pk", KeyType: "HASH" },
           { AttributeName: "gsi1sk", KeyType: "RANGE" },
+        ],
+        Projection: { ProjectionType: "ALL" },
+      },
+      {
+        IndexName: "gsi2",
+        KeySchema: [
+          { AttributeName: "gsi2pk", KeyType: "HASH" },
+          { AttributeName: "gsi2sk", KeyType: "RANGE" },
         ],
         Projection: { ProjectionType: "ALL" },
       },
@@ -367,7 +383,9 @@ const program = Effect.gen(function* () {
   yield* Console.log("\nCreating squad selections (AUS BGT 2024-25)...")
 
   yield* db.entities.SquadSelections.put({
-    squadId: "aus#2024-25#BGT",
+    id: "sel-aus-1",
+    season: "2024-25",
+    series: "BGT",
     selectionNumber: 1,
     teamId: "aus",
     playerId: "cummins-01",
@@ -377,7 +395,9 @@ const program = Effect.gen(function* () {
   })
 
   yield* db.entities.SquadSelections.put({
-    squadId: "aus#2024-25#BGT",
+    id: "sel-aus-2",
+    season: "2024-25",
+    series: "BGT",
     selectionNumber: 2,
     teamId: "aus",
     playerId: "smith-01",
@@ -387,7 +407,9 @@ const program = Effect.gen(function* () {
   })
 
   yield* db.entities.SquadSelections.put({
-    squadId: "ind#2024-25#BGT",
+    id: "sel-ind-1",
+    season: "2024-25",
+    series: "BGT",
     selectionNumber: 1,
     teamId: "ind",
     playerId: "kohli-01",
@@ -396,12 +418,9 @@ const program = Effect.gen(function* () {
     isViceCaptain: false,
   })
 
-  // --- Get returns full embedded data ---
+  // --- Get by ID returns full embedded data ---
   yield* Console.log("\nRetrieving squad selection...")
-  const captain = yield* db.entities.SquadSelections.get({
-    squadId: "aus#2024-25#BGT",
-    selectionNumber: 1,
-  })
+  const captain = yield* db.entities.SquadSelections.get({ id: "sel-aus-1" })
   yield* Console.log(`Captain: ${captain.player.firstName} ${captain.player.lastName}`)
   yield* Console.log(`  Team: ${captain.team.name} (${captain.team.country})`)
   yield* Console.log(`  Role: ${captain.player.role}`)
@@ -412,7 +431,9 @@ const program = Effect.gen(function* () {
   // --- RefNotFound when ref doesn't exist ---
   yield* Console.log("\nAttempting to create selection with nonexistent player...")
   const refError = yield* db.entities.SquadSelections.put({
-    squadId: "aus#2024-25#BGT",
+    id: "sel-bad",
+    season: "2024-25",
+    series: "BGT",
     selectionNumber: 99,
     teamId: "aus",
     playerId: "nonexistent",
@@ -446,10 +467,7 @@ const program = Effect.gen(function* () {
   yield* Console.log(`Updated player: ${updatedPlayer.firstName} ${updatedPlayer.lastName}`)
 
   // Verify cascade propagated — the squad selection should have the updated name
-  const afterCascade = yield* db.entities.SquadSelections.get({
-    squadId: "aus#2024-25#BGT",
-    selectionNumber: 2,
-  })
+  const afterCascade = yield* db.entities.SquadSelections.get({ id: "sel-aus-2" })
   yield* Console.log(
     `Squad selection player after cascade: ${afterCascade.player.firstName} ${afterCascade.player.lastName}`,
   )

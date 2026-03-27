@@ -19,7 +19,7 @@ Both compile to the same DynamoDB expression strings with properly aliased `Expr
 | `ConditionExpression` | Guard writes — fail if condition is false | `Entity.condition()` on put/update/delete |
 | `FilterExpression` | Narrow reads — remove non-matching items from results | `Entity.filter()` on query/scan |
 | `UpdateExpression` | Describe mutations — SET, REMOVE, ADD, DELETE clauses | `Entity.set()`, `remove()`, `add()`, etc. |
-| `KeyConditionExpression` | Select partition + sort key range | `Entity.query.indexName()`, `Query.where()` |
+| `KeyConditionExpression` | Select partition + sort key range | `db.entities.Entity.indexName()`, `.where()` |
 | `ProjectionExpression` | Select attributes to return | `Entity.select()` |
 
 ---
@@ -293,24 +293,24 @@ Each non-primary index defined on an entity generates a named query accessor:
 const Tasks = Entity.make({
   model: Task,
   entityType: "Task",
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
     byProject: {
-      index: "gsi1",
+      name: "gsi1",
       pk: { field: "gsi1pk", composite: ["projectId"] },
       sk: { field: "gsi1sk", composite: ["status", "createdAt"] },
     },
   },
 })
 
-// Access via query namespace
-Tasks.query.byProject({ projectId: "proj-alpha" })
+// Access via entity index accessor on the typed client
+db.entities.Tasks.byProject({ projectId: "proj-alpha" })
 
 // Partial SK composites narrow with begins_with automatically
-Tasks.query.byProject({ projectId: "proj-alpha", status: "active" })
+db.entities.Tasks.byProject({ projectId: "proj-alpha", status: "active" })
 ```
 
 ### Sort Key Conditions with `Query.where`

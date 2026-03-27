@@ -328,10 +328,7 @@ describe("EmployeeEntity", () => {
   it.effect("creates an employee", () =>
     Effect.gen(function* () {
       // ... same pattern as above, but with vi.fn() and expect()
-      const db = yield* DynamoClient.make({
-        entities: { EmployeeEntity, TaskEntity },
-        collections: { EmployeesByEmail, TasksByProject },
-      })
+      const db = yield* DynamoClient.make(MainTable)
 
       const result = yield* db.entities.EmployeeEntity.put({
         employeeId: "emp-1",

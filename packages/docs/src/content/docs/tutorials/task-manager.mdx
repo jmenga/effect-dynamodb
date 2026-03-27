@@ -6,7 +6,7 @@ description: "3 entities with 5 GSIs, team queries, task status workflows, range
 A task management application with **employees**, **tasks**, and **offices** in a single DynamoDB table. Adapted from the [ElectroDB Task Manager example](https://electrodb.dev/en/examples/task-manager/) to showcase effect-dynamodb's approach to status-driven workflows, range queries, and task archival.
 
 **What you'll learn:**
-- 3 entities sharing one table with 5 GSIs via Collections
+- 3 entities sharing one table with 5 GSIs via entity-level indexes
 - Team queries with date-hired range filtering (GSI2)
 - Task status index for cross-project status queries (GSI4)
 - Task status workflow: open -> in-progress -> closed
@@ -110,7 +110,7 @@ Key modeling decisions:
 
 ---
 
-## Step 2: Schema, Table, Entities, and Collections
+## Step 2: Schema, Table, and Entities
 
 ### Schema and Table
 
@@ -124,7 +124,7 @@ const TmTable = Table.make({ schema: TmSchema, entities: { Employees, Tasks, Off
 
 ### Employee Entity
 
-Employee defines only a primary key. All GSI access patterns are defined via Collections:
+Employee defines its primary key and GSI indexes. Multi-entity collections are auto-discovered from matching `collection` names:
 
 ```typescript title="entities.ts" region="employee-entity" example="task-manager.ts"
 const Employees = Entity.make({
@@ -169,7 +169,7 @@ const Employees = Entity.make({
 
 ### Task Entity
 
-Task defines only a primary key. The `statuses` collection (GSI4) enables cross-project status queries. Task also uses `versioned` and `softDelete` for lifecycle management:
+Task defines its primary key and GSI indexes. The `byStatus` index (GSI4) enables cross-project status queries. Task also uses `versioned` and `softDelete` for lifecycle management:
 
 ```typescript title="entities.ts" region="task-entity" example="task-manager.ts"
 const Tasks = Entity.make({
@@ -229,9 +229,9 @@ const Offices = Entity.make({
 })
 ```
 
-### Collections -- GSI Access Patterns
+### GSI Access Patterns
 
-GSI access patterns are now defined as entity-level indexes. Multi-entity collections (workplaces, assignments) are auto-discovered from matching collection names across entities:
+GSI access patterns are defined as entity-level indexes. Multi-entity collections (workplaces, assignments) are auto-discovered from matching `collection` names across entities:
 
 ```typescript title="collections.ts" region="collections" example="task-manager.ts"
 // GSI access patterns are now defined as entity-level indexes above.
@@ -239,9 +239,9 @@ GSI access patterns are now defined as entity-level indexes. Multi-entity collec
 // from matching collection names across entities.
 ```
 
-The `Teams` collection is designed for team leads: partition by `team`, sort by `dateHired + title`. This enables queries like "all development team members" and "development team members hired between 2020 and 2023".
+The `byTeam` index on Employee is designed for team leads: partition by `team`, sort by `dateHired + title`. This enables queries like "all development team members" and "development team members hired between 2020 and 2023".
 
-The `Statuses` collection partitions by `status`, sorts by `project + employee` -- enables "all open tasks" and "open tasks for a specific project" queries.
+The `byStatus` index on Task partitions by `status`, sorts by `project + employee` -- enables "all open tasks" and "open tasks for a specific project" queries.
 
 ---
 
@@ -431,11 +431,11 @@ const deleted = yield* db.entities.Employees.get({ employee: "tyler" }).pipe(
 Employee and Office share GSI1 via the `Workplaces` collection. Both use `office` as the partition key.
 
 ```typescript region="workplaces" example="task-manager.ts"
-const { Employees: portlandEmployees } = yield* db.collections.Workplaces!({
+const { Employees: portlandEmployees } = yield* db.collections.workplaces!({
   office: "portland",
 }).collect()
 
-const { Offices: portlandOffice } = yield* db.collections.Workplaces!({
+const { Offices: portlandOffice } = yield* db.collections.workplaces!({
   office: "portland",
 }).collect()
 ```
@@ -447,12 +447,12 @@ const { Offices: portlandOffice } = yield* db.collections.Workplaces!({
 Employee and Task share GSI3 via the `Assignments` collection. Both use `employee` as the partition key.
 
 ```typescript region="assignments" example="task-manager.ts"
-const { Tasks: tylerTasks } = yield* db.collections.Assignments!({ employee: "tyler" }).collect()
+const { Tasks: tylerTasks } = yield* db.collections.assignments!({ employee: "tyler" }).collect()
 
 // Verify points field (numeric) comes through correctly
 const totalTylerPoints = tylerTasks.reduce((sum: any, t: any) => sum + t.points, 0)
 
-const { Employees: tylerInfo } = yield* db.collections.Assignments!({
+const { Employees: tylerInfo } = yield* db.collections.assignments!({
   employee: "tyler",
 }).collect()
 ```
@@ -461,7 +461,7 @@ const { Employees: tylerInfo } = yield* db.collections.Assignments!({
 
 > As a team lead, find all members of a team and filter by hire date.
 
-The `Teams` collection on GSI2 uses `team` as PK and `dateHired + title` as SK. This enables both full team listings and date-range filtering.
+The `byTeam` index on Employee (GSI2) uses `team` as PK and `dateHired + title` as SK. This enables both full team listings and date-range filtering.
 
 ```typescript region="teams" example="task-manager.ts"
 // All development team members
@@ -485,7 +485,7 @@ Date-range filtering is done in application code after collecting results. This 
 
 > As a scrum master, see all tasks by status across all projects.
 
-The `Statuses` collection on GSI4 uses `status` as PK and `project + employee` as SK. This is the other key differentiator from the HR example.
+The `byStatus` index on Task (GSI4) uses `status` as PK and `project + employee` as SK. This is the other key differentiator from the HR example.
 
 ```typescript region="statuses" example="task-manager.ts"
 // All open tasks across all projects
@@ -515,7 +515,7 @@ const openPlatformTasks = yield* db.entities.Tasks.byStatus({
 
 > As a developer, move a task through the lifecycle: open -> in-progress -> closed.
 
-Updating a task's `status` field triggers GSI recomposition on every index that includes `status` as a composite. The task moves between partitions in the `Statuses` GSI4 collection.
+Updating a task's `status` field triggers GSI recomposition on every index that includes `status` as a composite. The task moves between partitions in the `byStatus` GSI4 index.
 
 ```typescript region="workflow" example="task-manager.ts"
 // Move build-api from open -> in-progress
@@ -554,7 +554,7 @@ Because `employee` and `project` are primary key fields (provided in the update 
 
 > As a hiring manager, find employees by title with salary range queries.
 
-The `Roles` collection on GSI4 has `title` as PK and `salary` as SK. Zero-padded salary strings ensure correct lexicographic ordering.
+The `byRole` index on Employee (GSI4) has `title` as PK and `salary` as SK. Zero-padded salary strings ensure correct lexicographic ordering.
 
 ```typescript region="roles" example="task-manager.ts"
 const engineers = yield* db.entities.Employees.byRole({ title: "Senior Engineer" }).collect()
@@ -595,7 +595,7 @@ yield* Transaction.transactWrite([
 // Verify both items created atomically
 const newHire = yield* db.entities.Employees.get({ employee: "jordan" })
 
-const { Tasks: onboardingTasks } = yield* db.collections.Assignments!({
+const { Tasks: onboardingTasks } = yield* db.collections.assignments!({
   employee: "jordan",
 }).collect()
 
@@ -620,7 +620,7 @@ yield* db.entities.Tasks.delete({ task: "user-research", project: "website", emp
 const closedAfterArchive = yield* db.entities.Tasks.byStatus({ status: "closed" }).collect()
 
 // Verify: morgan's assignments no longer include the archived task
-const { Tasks: morganTasks } = yield* db.collections.Assignments!({
+const { Tasks: morganTasks } = yield* db.collections.assignments!({
   employee: "morgan",
 }).collect()
 
@@ -651,7 +651,7 @@ This is the natural end of the task lifecycle: **open -> in-progress -> closed -
 
 ## Running the Example
 
-The complete runnable example is at [`examples/task-manager.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/task-manager.ts) in the repository. It seeds data, runs all 9 access patterns, and verifies each with assertions.
+The complete runnable example is at [`examples/task-manager.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/examples/task-manager.ts) in the repository. It seeds data, runs all 9 access patterns, and verifies each with assertions.
 
 ```bash
 docker run -d -p 8000:8000 amazon/dynamodb-local
@@ -692,8 +692,8 @@ Effect.runPromise(main).then(
 | **Single-table design** | 3 entities, 1 table, 5 GSIs with structured key values |
 | **Index overloading** | GSI1 serves employees-by-office, tasks-by-project, and offices-by-office |
 | **Collections** | `Workplaces` (GSI1) and `Assignments` (GSI3) enable cross-entity queries |
-| **Teams collection (GSI2)** | Partition by team, sort by dateHired for range queries |
-| **Statuses collection (GSI4)** | Partition by status for cross-project task visibility |
+| **`byTeam` index (GSI2)** | Partition by team, sort by dateHired for range queries |
+| **`byStatus` index (GSI4)** | Partition by status for cross-project task visibility |
 | **Range filtering** | Collect from collection, filter in application code for date and salary ranges |
 | **Status workflow** | Updating `status` triggers automatic GSI recomposition across all affected indexes |
 | **Soft delete archival** | Closed tasks archived via `softDelete` -- invisible to queries, preserved for audit |
@@ -705,5 +705,5 @@ Effect.runPromise(main).then(
 - [Modeling Guide](/effect-dynamodb/guides/modeling/) -- Deep dive into models, schemas, tables, and entities
 - [Indexes & Collections](/effect-dynamodb/guides/indexes/) -- Access pattern design and collection patterns
 - [Lifecycle](/effect-dynamodb/guides/lifecycle/) -- Soft delete, versioning, and TTL
-- [Library System](/effect-dynamodb/tutorials/library-system/) -- Sparse indexes, 4-entity collections, and book loan workflows
-- [Human Resources](/effect-dynamodb/tutorials/human-resources/) -- Full HR system with transfers, termination, and rehire
+- [Library System](/effect-dynamodb/examples/library-system/) -- Sparse indexes, 4-entity collections, and book loan workflows
+- [Human Resources](/effect-dynamodb/examples/human-resources/) -- Full HR system with transfers, termination, and rehire

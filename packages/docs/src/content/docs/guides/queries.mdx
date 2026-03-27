@@ -10,16 +10,13 @@ This guide covers the Query API: how to construct queries, apply sort key condit
 Queries in effect-dynamodb are **fluent chains** with pre-resolved services. A collection query or entity scan returns a `BoundQuery` that you chain combinators onto, then terminate with `.collect()`, `.fetch()`, or `.paginate()`.
 
 ```typescript
-import { Collections, DynamoClient } from "effect-dynamodb"
+import { DynamoClient } from "effect-dynamodb"
 
-const db = yield* DynamoClient.make({
-  entities: { TaskEntity },
-  collections: { ByProject },
-})
+const db = yield* DynamoClient.make(MainTable)
 
 // Construct and execute a query in one chain
-const { Tasks: results } = yield* db.collections
-  .ByProject({ projectId: "proj-alpha" })
+const results = yield* db.entities.TaskEntity
+  .byProject({ projectId: "proj-alpha" })
   .filter({ status: "active" })
   .limit(25)
   .reverse()
@@ -28,7 +25,7 @@ const { Tasks: results } = yield* db.collections
 
 ## Entity Queries
 
-Query accessors live on `db.collections` (for GSI queries) and `db.entities` (for primary key lookups and scans). Collection queries return grouped results; entity operations return single items.
+Query accessors live on `db.entities` (for entity index queries, primary key lookups, and scans) and `db.collections` (for auto-discovered cross-entity queries). Entity index queries return typed arrays; collection queries return grouped results.
 
 ```typescript region="entity-queries" example="guide-queries.ts"
 // Primary key lookup (not a query — returns single item)
@@ -48,8 +45,8 @@ const assigneeTasks = yield* db.entities.TaskEntity.byAssignee({
 | Definition | Accessor | Argument Type |
 |-----------|----------|---------------|
 | `primaryKey: { pk: { composite: ["taskId"] }, ... }` | `tasks.get(...)` | `{ taskId: string }` |
-| `Collections.make({ name: "ByProject", pk: { composite: ["projectId"] }, ... })` | `db.collections.ByProject(...)` | `{ projectId: string }` |
-| `Collections.make({ name: "ByAssignee", pk: { composite: ["assigneeId"] }, ... })` | `db.collections.ByAssignee(...)` | `{ assigneeId: string }` |
+| `indexes: { byProject: { name: "gsi1", pk: { composite: ["projectId"] }, ... } }` | `db.entities.TaskEntity.byProject(...)` | `{ projectId: string }` |
+| `indexes: { byAssignee: { name: "gsi2", pk: { composite: ["assigneeId"] }, ... } }` | `db.entities.TaskEntity.byAssignee(...)` | `{ assigneeId: string }` |
 
 ## Post-Query Filtering
 
@@ -83,16 +80,13 @@ See the [Expressions Guide](/effect-dynamodb/guides/expressions/) for the comple
 Collection queries return all member entity types, grouped by member name.
 
 ```typescript
-const db = yield* DynamoClient.make({
-  entities: { EmployeeEntity, TaskEntity },
-  collections: { TenantMembers },
-})
+const db = yield* DynamoClient.make(MainTable)
 
-// All entities in the collection
-const { employees, tasks } = yield* db.collections
-  .TenantMembers({ tenantId: "t-acme" })
+// All entities in the collection (auto-discovered from entity indexes with collection: "tenantMembers")
+const { ClusteredEmployees, ClusteredTasks } = yield* db.collections
+  .tenantMembers({ tenantId: "t-acme" })
   .collect()
-// employees: Employee[], tasks: Task[]
+// ClusteredEmployees: Employee[], ClusteredTasks: Task[]
 ```
 
 ### Sub-Collection Queries
@@ -102,15 +96,15 @@ Query at different depths of the collection hierarchy:
 ```typescript
 // All contributions (Employee + Task + ProjectMember)
 const all = yield* db.collections
-  .Contributions({ employeeId: "emp-alice" })
+  .contributions({ employeeId: "emp-alice" })
   .collect()
-// { employees: Employee[], tasks: Task[], projectMembers: ProjectMember[] }
+// { SubEmployee: Employee[], SubTasks: Task[], SubProjectMembers: ProjectMember[] }
 
 // Only assignments (Task + ProjectMember) — sub-collection
-const assignments = yield* db.collections
-  .Assignments({ employeeId: "emp-alice" })
+const assignmentResults = yield* db.collections
+  .assignments({ employeeId: "emp-alice" })
   .collect()
-// { tasks: Task[], projectMembers: ProjectMember[] }
+// { SubTasks: Task[], SubProjectMembers: ProjectMember[] }
 ```
 
 ## Pagination
@@ -243,13 +237,10 @@ const recent = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha"
 
 ```typescript
 import { Effect, Layer, Stream } from "effect"
-import { Collections, DynamoClient } from "effect-dynamodb"
+import { DynamoClient } from "effect-dynamodb"
 
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make({
-    entities: { TaskEntity },
-    collections: { ByProject, ByAssignee, TenantMembers },
-  })
+  const db = yield* DynamoClient.make(MainTable)
 
   // --- Single entity scan with filter ---
   const activeTasks = yield* db.entities.TaskEntity.scan()
@@ -257,19 +248,19 @@ const program = Effect.gen(function* () {
     .limit(50)
     .collect()
 
-  // --- Collection query, reversed, with filter ---
-  const { Tasks: recentHighPriority } = yield* db.collections
-    .ByAssignee({ assigneeId: "emp-alice" })
+  // --- Entity index query, reversed, with filter ---
+  const recentHighPriority = yield* db.entities.TaskEntity
+    .byAssignee({ assigneeId: "emp-alice" })
     .filter({ priority: "high" })
     .reverse()
     .limit(10)
     .collect()
 
-  // --- Collection query: all tenant members ---
-  const { employees, tasks } = yield* db.collections
-    .TenantMembers({ tenantId: "t-acme" })
+  // --- Auto-discovered collection query: all tenant members ---
+  const { ClusteredEmployees, ClusteredTasks } = yield* db.collections
+    .tenantMembers({ tenantId: "t-acme" })
     .collect()
-  // employees: Employee[], tasks: Task[]
+  // ClusteredEmployees: Employee[], ClusteredTasks: Task[]
 
   // --- Scan with streaming ---
   const scanStream = db.entities.TaskEntity.scan()

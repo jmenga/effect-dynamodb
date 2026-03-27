@@ -7,7 +7,7 @@ A blog platform managing **users**, **posts**, and **comments** in a single Dyna
 
 **What you'll learn:**
 - 3 entities sharing one table (single-table design)
-- GSI queries for posts by author and comments by post via Collections
+- GSI queries for posts by author and comments by post via entity-level indexes
 - `Entity.set()` for type-safe updates with combinators
 - Optimistic locking with `Entity.expectedVersion()`
 - Atomic multi-entity reads and writes via transactions
@@ -19,8 +19,8 @@ A blog platform managing **users**, **posts**, and **comments** in a single Dyna
 
 1. **Get user** -- Look up a user by `userId` (primary key)
 2. **Get post** -- Look up a post by `postId` (primary key)
-3. **Posts by author** -- Find all posts by a user (GSI1: `PostsByAuthor` collection)
-4. **Comments on a post** -- Find all comments on a post (GSI1: `CommentsByPost` collection)
+3. **Posts by author** -- Find all posts by a user (GSI1: `byAuthor` index)
+4. **Comments on a post** -- Find all comments on a post (GSI1: `byPost` index)
 5. **Atomic operations** -- Read or write multiple entities atomically (transactions)
 6. **Raw inspection** -- View the underlying DynamoDB item for debugging
 
@@ -67,7 +67,7 @@ Key modeling decisions:
 
 ---
 
-## Step 2: Schema, Table, and Entities
+## Step 2: Schema, Entities, and Table
 
 ### Schema
 
@@ -94,7 +94,7 @@ const Users = Entity.make({
 
 ### Post Entity
 
-Posts have a primary key. The GSI for querying by author is defined in the `PostsByAuthor` collection:
+Posts have a primary key and a `byAuthor` GSI index for querying by author:
 
 ```typescript title="entities.ts" region="post-entity" example="blog.ts"
 const Posts = Entity.make({
@@ -115,9 +115,9 @@ const Posts = Entity.make({
 })
 ```
 
-### Comment Entity and Collections
+### Comment Entity
 
-Comments also use GSI1 but with a different partition key -- this is **index overloading**. Posts partition GSI1 by `authorId` (via `PostsByAuthor`), while Comments partition it by `postId` (via `CommentsByPost`):
+Comments also use GSI1 but with a different partition key -- this is **index overloading**. Posts partition GSI1 by `authorId` (via `byAuthor`), while Comments partition it by `postId` (via `byPost`):
 
 ```typescript title="entities.ts" region="comment-entity" example="blog.ts"
 const Comments = Entity.make({
@@ -147,11 +147,11 @@ const BlogTable = Table.make({
 |--------|-------|--------------|---------------|----------------|
 | **User** | primary | `userId` | (empty) | Get user by ID |
 | **Post** | primary | `postId` | (empty) | Get post by ID |
-| **Post** | PostsByAuthor (GSI1) | `authorId` | `postId` | Posts by author |
+| **Post** | `byAuthor` (GSI1) | `authorId` | `postId` | Posts by author |
 | **Comment** | primary | `commentId` | (empty) | Get comment by ID |
-| **Comment** | CommentsByPost (GSI1) | `postId` | `commentId` | Comments on a post |
+| **Comment** | `byPost` (GSI1) | `postId` | `commentId` | Comments on a post |
 
-GSI1 is **overloaded** -- Posts use it for `PostsByAuthor` (partitioned by `authorId`) and Comments use it for `CommentsByPost` (partitioned by `postId`). Different entity types, different partition keys, same physical index.
+GSI1 is **overloaded** -- Posts use it for `byAuthor` (partitioned by `authorId`) and Comments use it for `byPost` (partitioned by `postId`). Different entity types, different partition keys, same physical index.
 
 ---
 
@@ -203,7 +203,7 @@ const aliceRecord = yield* db.entities.Users.get({ userId: "alice-1" }).pipe(Ent
 
 ### GSI Queries
 
-Query posts by author and comments by post using Collections:
+Query posts by author and comments by post using entity-level index accessors:
 
 ```typescript region="gsi-queries" example="blog.ts"
 // Posts by author
@@ -288,7 +288,7 @@ This is useful for verifying how composite keys are composed and inspecting the 
 
 ## Running the Example
 
-The complete runnable example is at [`examples/blog.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/blog.ts) in the repository. It creates all entities, demonstrates each access pattern, and cleans up after itself.
+The complete runnable example is at [`examples/blog.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/examples/blog.ts) in the repository. It creates all entities, demonstrates each access pattern, and cleans up after itself.
 
 ```bash
 docker run -d -p 8000:8000 amazon/dynamodb-local
@@ -338,5 +338,5 @@ Effect.runPromise(main).then(
 
 - [Modeling Guide](/effect-dynamodb/guides/modeling/) -- Deep dive into models, schemas, tables, and entities
 - [Queries Guide](/effect-dynamodb/guides/queries/) -- Sort key conditions, filters, and pagination
-- [Example: Shopping Mall](/effect-dynamodb/tutorials/shopping-mall/) -- Composite keys, `beginsWith`, and date range queries
-- [Example: Human Resources](/effect-dynamodb/tutorials/human-resources/) -- 3 entities, 5 GSIs, collections, and soft delete
+- [Example: Shopping Mall](/effect-dynamodb/examples/shopping-mall/) -- Composite keys, `beginsWith`, and date range queries
+- [Example: Human Resources](/effect-dynamodb/examples/human-resources/) -- 3 entities, 5 GSIs, collections, and soft delete

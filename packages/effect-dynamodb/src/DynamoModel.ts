@@ -560,6 +560,22 @@ type ConfigureAttributes<M extends Schema.Top> = {
 }
 
 /**
+ * Compile-time validation: detects `field` rename targets that collide
+ * with existing model field names. Replaces the `field` type with an
+ * error tuple to produce a readable type error at the call site.
+ */
+type ValidateFieldRenames<
+  Fields extends string,
+  A,
+> = {
+  [K in keyof A]: A[K] extends { readonly field: infer F extends string }
+    ? F extends Exclude<Fields, K & string>
+      ? { readonly field: [`EDD-9007: "${F}" collides with existing model field`] } & Omit<A[K], "field">
+      : A[K]
+    : A[K]
+}
+
+/**
  * Create a configured model with per-field DynamoDB overrides.
  *
  * Separates DynamoDB infrastructure (storage format, field renaming) from
@@ -580,7 +596,7 @@ type ConfigureAttributes<M extends Schema.Top> = {
  */
 export const configure = <M extends Schema.Top, const A extends ConfigureAttributes<M>>(
   model: M,
-  attributes: A,
+  attributes: A & ValidateFieldRenames<keyof Schema.Schema.Type<M> & string, A>,
 ): ConfiguredModel<M, A> => {
   const resolved: globalThis.Record<
     string,
@@ -617,6 +633,30 @@ export const configure = <M extends Schema.Top, const A extends ConfigureAttribu
     }
     resolved[key] = entry
   }
+
+  // Validate: no field rename targets collide with existing model field names
+  const modelFields = new Set<string>()
+  if (
+    "fields" in model &&
+    typeof (model as globalThis.Record<string, unknown>).fields === "object"
+  ) {
+    for (const fieldName of Object.keys(
+      (model as unknown as { fields: globalThis.Record<string, unknown> }).fields,
+    )) {
+      modelFields.add(fieldName)
+    }
+  }
+  if (modelFields.size > 0) {
+    for (const [sourceField, config] of Object.entries(resolved)) {
+      if (config.field && config.field !== sourceField && modelFields.has(config.field)) {
+        throw new Error(
+          `[EDD-9007] DynamoModel.configure: renaming "${sourceField}" to "${config.field}" collides with existing model field "${config.field}". ` +
+            `This would cause both fields to map to the same DynamoDB attribute.`,
+        )
+      }
+    }
+  }
+
   return {
     [ConfiguredModelTag]: true as const,
     model,

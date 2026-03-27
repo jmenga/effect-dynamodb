@@ -23,6 +23,8 @@ export const DiagnosticCode = {
   SK_IN_FILTER: 9005,
   /** Query accessor: unknown property in query input */
   UNKNOWN_QUERY_PROPERTY: 9006,
+  /** DynamoModel.configure: field rename target collides with existing model field */
+  FIELD_RENAME_COLLISION: 9007,
 } as const
 
 // ---------------------------------------------------------------------------
@@ -47,7 +49,10 @@ export function getDiagnostics(
     // 1. Validate Entity.make() calls
     diagnostics.push(...validateEntityMakeCalls(typescript, sourceFile, program))
 
-    // 2. Validate query accessor calls
+    // 2. Validate DynamoModel.configure() field rename collisions
+    diagnostics.push(...validateConfigureCalls(typescript, sourceFile, program))
+
+    // 3. Validate query accessor calls
     const entities = resolveEntities(typescript, sourceFile, program)
     diagnostics.push(...validateQueryAccessorCalls(typescript, sourceFile, entities))
 
@@ -55,6 +60,90 @@ export function getDiagnostics(
   } catch {
     return prior
   }
+}
+
+// ---------------------------------------------------------------------------
+// DynamoModel.configure() field rename collision validation
+// ---------------------------------------------------------------------------
+
+function validateConfigureCalls(
+  ts: typeof import("typescript"),
+  sourceFile: ts.SourceFile,
+  program: ts.Program,
+): ts.Diagnostic[] {
+  const diagnostics: ts.Diagnostic[] = []
+  const checker = program.getTypeChecker()
+
+  ts.forEachChild(sourceFile, function visit(node) {
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression
+      // Match DynamoModel.configure(Model, { ... })
+      if (
+        ts.isPropertyAccessExpression(callee) &&
+        callee.name.text === "configure" &&
+        ts.isIdentifier(callee.expression) &&
+        callee.expression.text === "DynamoModel" &&
+        node.arguments.length >= 2
+      ) {
+        const modelArg = node.arguments[0]!
+        const configArg = node.arguments[1]!
+
+        // Extract model field names from the first argument's type
+        const modelType = checker.getTypeAtLocation(modelArg)
+        const modelFields = new Set<string>()
+        const typeSymbol = modelType.getProperty("Type")
+        if (typeSymbol) {
+          const typeType = checker.getTypeOfSymbolAtLocation(typeSymbol, modelArg)
+          for (const p of typeType.getProperties()) {
+            modelFields.add(p.name)
+          }
+        }
+        if (modelFields.size === 0) {
+          // Fallback: try direct properties
+          for (const p of modelType.getProperties()) {
+            if (!p.name.startsWith("_") && p.name !== "constructor") {
+              modelFields.add(p.name)
+            }
+          }
+        }
+
+        // Walk the config object for { fieldName: { field: "targetName" } }
+        if (ts.isObjectLiteralExpression(configArg) && modelFields.size > 0) {
+          for (const prop of configArg.properties) {
+            if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
+            const sourceField = prop.name.text
+            if (!ts.isObjectLiteralExpression(prop.initializer)) continue
+
+            for (const innerProp of prop.initializer.properties) {
+              if (
+                ts.isPropertyAssignment(innerProp) &&
+                ts.isIdentifier(innerProp.name) &&
+                innerProp.name.text === "field" &&
+                ts.isStringLiteral(innerProp.initializer)
+              ) {
+                const targetField = innerProp.initializer.text
+                // Check if target field name collides with another model field
+                if (targetField !== sourceField && modelFields.has(targetField)) {
+                  diagnostics.push(
+                    makeDiagnostic(
+                      sourceFile,
+                      innerProp.initializer,
+                      DiagnosticCode.FIELD_RENAME_COLLISION,
+                      `DynamoModel.configure: renaming \`${sourceField}\` to \`${targetField}\` collides with existing model field \`${targetField}\`. This will cause both fields to map to the same DynamoDB attribute.`,
+                      ts.DiagnosticCategory.Error,
+                    ),
+                  )
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, visit)
+  })
+
+  return diagnostics
 }
 
 // ---------------------------------------------------------------------------

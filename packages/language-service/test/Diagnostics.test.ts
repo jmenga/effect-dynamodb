@@ -25,6 +25,46 @@ function mockInfo(sourceFile: ts.SourceFile) {
   } as unknown as ts.server.PluginCreateInfo
 }
 
+// Mock that provides model fields via TypeChecker
+function mockInfoWithModelFields(sourceFile: ts.SourceFile, fieldNames: string[]) {
+  const properties = fieldNames.map((name) => ({
+    name,
+    getName: () => name,
+    getEscapedName: () => name as ts.__String,
+  }))
+
+  const typeType = {
+    getProperties: () => properties,
+  }
+
+  const typeSymbol = {
+    name: "Type",
+    getName: () => "Type",
+    getEscapedName: () => "Type" as ts.__String,
+  }
+
+  const modelType = {
+    getProperty: (name: string) => (name === "Type" ? typeSymbol : undefined),
+    getProperties: () => properties,
+  }
+
+  const program = {
+    getSourceFile: () => sourceFile,
+    getTypeChecker: () => ({
+      getTypeAtLocation: () => modelType,
+      getTypeOfSymbolAtLocation: () => typeType,
+      getSymbolAtLocation: () => undefined,
+    }),
+  } as unknown as ts.Program
+
+  return {
+    languageService: {
+      getProgram: () => program,
+      getSemanticDiagnostics: () => [],
+    },
+  } as unknown as ts.server.PluginCreateInfo
+}
+
 describe("Diagnostics", () => {
   describe("Entity.make validations", () => {
     it("EDD-9003: detects old GSI index format (string instead of object)", () => {
@@ -128,6 +168,69 @@ describe("Diagnostics", () => {
       expect(prefixDiag[0]!.messageText).toContain("`title`")
       expect(prefixDiag[0]!.messageText).toContain("`status`")
       expect(prefixDiag[0]!.category).toBe(ts.DiagnosticCategory.Error)
+    })
+  })
+
+  describe("DynamoModel.configure validations", () => {
+    it("EDD-9007: detects field rename collision with existing model field", () => {
+      const source = `
+        class Bar extends Schema.Class<Bar>("Bar")({
+          id: Schema.String,
+          name: Schema.String,
+        }) {}
+
+        const BarModel = DynamoModel.configure(Bar, { id: { field: "name" } })
+      `
+      const sf = parseSource(source)
+      const info = mockInfoWithModelFields(sf, ["id", "name"])
+      const diagnostics = getDiagnostics(ts, info, "test.ts", [])
+
+      const collisionDiag = diagnostics.filter(
+        (d) => d.code === DiagnosticCode.FIELD_RENAME_COLLISION,
+      )
+      expect(collisionDiag).toHaveLength(1)
+      expect(collisionDiag[0]!.messageText).toContain("`id`")
+      expect(collisionDiag[0]!.messageText).toContain("`name`")
+      expect(collisionDiag[0]!.messageText).toContain("collides")
+      expect(collisionDiag[0]!.category).toBe(ts.DiagnosticCategory.Error)
+    })
+
+    it("EDD-9007: no diagnostic when rename target is unique", () => {
+      const source = `
+        class Team extends Schema.Class<Team>("Team")({
+          id: Schema.String,
+          name: Schema.String,
+        }) {}
+
+        const TeamModel = DynamoModel.configure(Team, { id: { field: "teamId" } })
+      `
+      const sf = parseSource(source)
+      const info = mockInfoWithModelFields(sf, ["id", "name"])
+      const diagnostics = getDiagnostics(ts, info, "test.ts", [])
+
+      const collisionDiag = diagnostics.filter(
+        (d) => d.code === DiagnosticCode.FIELD_RENAME_COLLISION,
+      )
+      expect(collisionDiag).toHaveLength(0)
+    })
+
+    it("EDD-9007: no diagnostic when renaming to same name", () => {
+      const source = `
+        class Foo extends Schema.Class<Foo>("Foo")({
+          id: Schema.String,
+          name: Schema.String,
+        }) {}
+
+        const FooModel = DynamoModel.configure(Foo, { id: { field: "id" } })
+      `
+      const sf = parseSource(source)
+      const info = mockInfoWithModelFields(sf, ["id", "name"])
+      const diagnostics = getDiagnostics(ts, info, "test.ts", [])
+
+      const collisionDiag = diagnostics.filter(
+        (d) => d.code === DiagnosticCode.FIELD_RENAME_COLLISION,
+      )
+      expect(collisionDiag).toHaveLength(0)
     })
   })
 })

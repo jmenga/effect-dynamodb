@@ -55,9 +55,9 @@ const AppSchema = DynamoSchema.make({ name: "starter", version: 1 })
 
 ---
 
-## Step 3: Entity, Table, and Collection Definitions
+## Step 3: Entity, Table, and Index Definitions
 
-Entities define their primary key only. GSI access patterns are declared as Collections. The table declares which entities it contains:
+Entities define their primary key and GSI indexes. The table declares which entities it contains:
 
 ```typescript title="entities.ts" region="entities" example="starter.ts"
 const Users = Entity.make({
@@ -102,16 +102,16 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Users, Tasks } })
 Key design decisions:
 - **Users** have a `unique` constraint on `email` -- the ORM enforces uniqueness atomically using a sentinel item
 - **Users** have `versioned: true` for optimistic locking via a `version` field
-- **TasksByUser** defines a GSI access pattern — query tasks by userId, sorted by status
-- **Collections own GSI definitions** — entities stay pure (primary key only)
+- **`byUser` index** on Tasks defines a GSI access pattern — query tasks by userId, sorted by status
+- **Entities declare their own GSI indexes** — each entity is self-contained with primary key + indexes
 
-`Entity.make` returns a **definition** -- it describes how the entity maps to DynamoDB but does not provide executable operations. `Collections.make` defines how entities are indexed. To actually read and write data, you need to obtain a **typed client** via `DynamoClient.make` (next step).
+`Entity.make` returns a **definition** -- it describes how the entity maps to DynamoDB but does not provide executable operations. To actually read and write data, you need to obtain a **typed client** via `DynamoClient.make` (next step).
 
 ---
 
 ## Step 4: Typed Client and Use
 
-`DynamoClient.make({ entities, collections })` is the typed execution gateway. It resolves dependencies, injects collection indexes into entities, and returns a client with bound entities where every method is ready to call.
+`DynamoClient.make({ entities })` is the typed execution gateway. It resolves dependencies, auto-discovers collections from entity index `collection` properties, and returns a client with bound entities where every method is ready to call.
 
 ```typescript title="main.ts" region="program" example="starter.ts"
 const program = Effect.gen(function* () {
@@ -180,10 +180,10 @@ const program = Effect.gen(function* () {
 })
 ```
 
-`DynamoClient.make({ entities, collections })` requires `DynamoClient` and `TableConfig` in the Effect context -- you provide these as Layers when you run the program.
+`DynamoClient.make({ entities })` requires `DynamoClient` and `TableConfig` in the Effect context -- you provide these as Layers when you run the program.
 
 :::note[Why DynamoClient.make?]
-The gateway pattern separates **definition** from **execution**. `Entity.make()` returns a definition carrying type information, schemas, and key config. `Table.make({ schema, entities: {...} })` declares members. `Collections.make()` defines GSI access patterns. `DynamoClient.make({ entities, collections })` resolves the runtime dependencies (DynamoDB client, table name), injects collection indexes into entities, binds everything, and returns a typed client where every method is ready to call. This matches the `HttpApiClient.make(api)` pattern from Effect v4.
+The gateway pattern separates **definition** from **execution**. `Entity.make()` returns a definition carrying type information, schemas, key config, and GSI indexes. `Table.make({ schema, entities: {...} })` declares members. `DynamoClient.make({ entities })` resolves the runtime dependencies (DynamoDB client, table name), auto-discovers collections from entity index `collection` properties, binds everything, and returns a typed client where every method is ready to call. This matches the `HttpApiClient.make(api)` pattern from Effect v4.
 :::
 
 ---
@@ -219,5 +219,5 @@ Effect.runPromise(main).then(
 ## Next Steps
 
 - [CRUD Operations](/tutorials/crud) — Deep dive into put, get, update, delete with combinators
-- [Indexes & Queries](/guides/indexes) — Design GSI access patterns with Collections
+- [Indexes & Queries](/guides/indexes) — Design GSI access patterns with entity-level indexes
 - [Expressions](/tutorials/expressions) — Conditions, filters, and projections

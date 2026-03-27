@@ -104,7 +104,7 @@ Note that `salary` is a `String` — we store it as zero-padded `"000150.00"` fo
 
 ---
 
-## Step 2: Schema, Entities, Table, and Collections
+## Step 2: Schema, Entities, and Table
 
 ### Schema
 
@@ -114,7 +114,7 @@ const HrSchema = DynamoSchema.make({ name: "hr", version: 1 })
 
 ### Employee Entity
 
-Employee defines only its primary key. All GSI access patterns are declared via Collections:
+Employee defines its primary key and GSI indexes. Multi-entity collections are auto-discovered from matching `collection` names across entities:
 
 ```typescript title="entities.ts" region="employee-entity" example="hr.ts"
 const Employees = Entity.make({
@@ -156,7 +156,7 @@ const Employees = Entity.make({
 
 Key design decisions:
 - **`softDelete: true`** enables termination/rehire without destroying records
-- GSI access patterns (`coworkers`, `roles`, `directReports`, etc.) are defined in Collections below
+- GSI access patterns (`workplaces`, `assignments`, `byRole`, `byManager`) are defined as entity-level indexes above
 
 ### Task Entity
 
@@ -223,9 +223,9 @@ const HrTable = Table.make({
 })
 ```
 
-### Collections
+### GSI Access Patterns
 
-GSI access patterns are now defined as entity-level indexes. Multi-entity collections (workplaces, assignments) are auto-discovered from matching collection names across entities:
+GSI access patterns are defined as entity-level indexes. Multi-entity collections (workplaces, assignments) are auto-discovered from matching `collection` names across entities:
 
 ```typescript title="collections.ts" region="collections" example="hr.ts"
 // GSI access patterns are now defined as entity-level indexes above.
@@ -234,10 +234,10 @@ GSI access patterns are now defined as entity-level indexes. Multi-entity collec
 ```
 
 Key design decisions:
-- **`Workplaces` (GSI1)** is a multi-member collection — Employee and Office share the same partition key (`office`), enabling cross-entity queries
-- **`TasksByProject` (GSI1)** uses the same physical index but with a different partition key (`project`). `type: "isolated"` prevents SK prefix clashing with Workplaces. This is **index overloading**.
-- **`Assignments` (GSI3)** is a multi-member collection — Employee and Task share the same partition key (`employee`)
-- **`Roles` (GSI4)** has `salary` in the SK composites for range queries (find employees in a salary band)
+- **`workplaces` (GSI1)** is an auto-discovered collection — Employee and Office share the same `collection: "workplaces"` name and partition key (`office`), enabling cross-entity queries
+- **`byProject` (GSI1)** on Task uses the same physical index but with a different partition key (`project`). Since it has no `collection` property, it is an isolated entity-level index. This is **index overloading**.
+- **`assignments` (GSI3)** is an auto-discovered collection — Employee and Task share the same `collection: "assignments"` name and partition key (`employee`)
+- **`byRole` (GSI4)** on Employee has `salary` in the SK composites for range queries (find employees in a salary band)
 
 ---
 
@@ -398,11 +398,11 @@ Because Employee has `softDelete: true`, the delete doesn't destroy the record �
 Employee and Office share GSI1 via the `Workplaces` collection. Both use `office` as the partition key, so a single partition holds the office record and all employees at that location.
 
 ```typescript region="workplaces" example="hr.ts"
-const { Employees: gwZooEmployees } = yield* db.collections.Workplaces!({
+const { Employees: gwZooEmployees } = yield* db.collections.workplaces!({
   office: "gw-zoo",
 }).collect()
 
-const { Offices: gwZooOffice } = yield* db.collections.Workplaces!({ office: "gw-zoo" }).collect()
+const { Offices: gwZooOffice } = yield* db.collections.workplaces!({ office: "gw-zoo" }).collect()
 ```
 
 Both queries hit GSI1 with the same partition key (`office: "gw-zoo"`). The collection query returns a grouped result with arrays keyed by member name.
@@ -414,11 +414,11 @@ Both queries hit GSI1 with the same partition key (`office: "gw-zoo"`). The coll
 Employee and Task share GSI3 via the `Assignments` collection. Both use `employee` as the partition key.
 
 ```typescript region="assignments" example="hr.ts"
-const { Tasks: dfinlayTasks } = yield* db.collections.Assignments!({
+const { Tasks: dfinlayTasks } = yield* db.collections.assignments!({
   employee: "dfinlay",
 }).collect()
 
-const { Employees: dfinlayInfo } = yield* db.collections.Assignments!({
+const { Employees: dfinlayInfo } = yield* db.collections.assignments!({
   employee: "dfinlay",
 }).collect()
 ```
@@ -427,7 +427,7 @@ const { Employees: dfinlayInfo } = yield* db.collections.Assignments!({
 
 > As a product manager, see all tasks for a project.
 
-Task's `TasksByProject` collection on GSI1 uses `project` as the partition key. This is **index overloading** — the same physical GSI1 serves the `Workplaces` collection (Employee + Office by office) and `TasksByProject` (Task by project), each with different partition keys. The `type: "isolated"` setting prevents sort key prefix clashes between the two collections.
+Task's `byProject` index on GSI1 uses `project` as the partition key. This is **index overloading** — the same physical GSI1 serves the `workplaces` collection (Employee + Office by office) and `byProject` (Task by project), each with different partition keys.
 
 ```typescript region="tasks-by-project" example="hr.ts"
 const feedingTasks = yield* db.entities.Tasks.byProject({ project: "feeding" }).collect()
@@ -439,7 +439,7 @@ const fundraiserTasks = yield* db.entities.Tasks.byProject({ project: "fundraise
 
 > As a client, find a physical office close to me.
 
-The `OfficesByLocation` collection on GSI2 uses `country + state` as the partition key and `city + zip + office` as the sort key, enabling location-based queries with progressively finer granularity.
+The `byLocation` index on Office (GSI2) uses `country + state` as the partition key and `city + zip + office` as the sort key, enabling location-based queries with progressively finer granularity.
 
 ```typescript region="offices-by-location" example="hr.ts"
 const flOffices = yield* db.entities.Offices.byLocation({ country: "US", state: "FL" }).collect()
@@ -451,7 +451,7 @@ const okOffices = yield* db.entities.Offices.byLocation({ country: "US", state: 
 
 > As a hiring manager, find employees with comparable salaries.
 
-The `Roles` collection on GSI4 has `title` as the partition key and `salary + employee` as the sort key composites. Because salary is zero-padded (`"000150.00"`), it sorts lexicographically in the correct numeric order. Query via `db.collections.Roles(...)` and filter by salary range in application code.
+The `byRole` index on Employee (GSI4) has `title` as the partition key and `salary + employee` as the sort key composites. Because salary is zero-padded (`"000150.00"`), it sorts lexicographically in the correct numeric order. Query via `db.entities.Employees.byRole(...)` and filter by salary range in application code.
 
 ```typescript region="salary-range" example="hr.ts"
 const zookeepers = yield* db.entities.Employees.byRole({ title: "Zookeeper" }).collect()
@@ -467,7 +467,7 @@ const directorsBySalary = allDirectors.filter(
 
 > As HR, find all employees that report to a specific manager.
 
-The `DirectReports` collection on GSI5 uses `manager` as the partition key.
+The `byManager` index on Employee (GSI5) uses `manager` as the partition key.
 
 ```typescript region="direct-reports" example="hr.ts"
 const jloweReports = yield* db.entities.Employees.byManager({ manager: "jlowe" }).collect()
@@ -537,7 +537,7 @@ yield* Transaction.transactWrite([
 
 const newHire = yield* db.entities.Employees.get({ employee: "rstarr" })
 
-const { Tasks: onboardingTasks } = yield* db.collections.Assignments!({
+const { Tasks: onboardingTasks } = yield* db.collections.assignments!({
   employee: "rstarr",
 }).collect()
 ```
@@ -570,7 +570,7 @@ const reportsAfterRehire = yield* db.entities.Employees.byManager({
 
 ## Running the Example
 
-The complete runnable example is at [`examples/hr.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/hr.ts) in the repository. It seeds data, runs all 10 access patterns, and verifies each with assertions.
+The complete runnable example is at [`examples/hr.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/examples/hr.ts) in the repository. It seeds data, runs all 10 access patterns, and verifies each with assertions.
 
 ```bash
 docker run -d -p 8000:8000 amazon/dynamodb-local
@@ -609,7 +609,7 @@ Effect.runPromise(main).then(
 | Concept | How it's used |
 |---------|---------------|
 | **Single-table design** | 3 entities, 1 table, structured key values |
-| **Index overloading** | GSI1 serves `Workplaces` (employees + offices by office) and `TasksByProject` (tasks by project) |
+| **Index overloading** | GSI1 serves `workplaces` collection (employees + offices by office) and `byProject` index (tasks by project) |
 | **Collections** | `Workplaces` (GSI1) and `Assignments` (GSI3) enable cross-entity queries with grouped results |
 | **Sort key range queries** | Zero-padded salary in `Roles` (GSI4) SK enables `between` queries via `.where()` |
 | **All-or-none GSI updates** | Updating one GSI composite requires all composites for that index |
@@ -621,4 +621,4 @@ Effect.runPromise(main).then(
 - [Modeling Guide](/effect-dynamodb/guides/modeling/) — Deep dive into models, schemas, tables, and entities
 - [Indexes & Collections](/effect-dynamodb/guides/indexes/) — Access pattern design and collection patterns
 - [Lifecycle](/effect-dynamodb/guides/lifecycle/) — Soft delete, versioning, and TTL
-- [Cricket Match Manager](/effect-dynamodb/tutorials/gamemanager/) — Full end-to-end tutorial building a REST API
+- [Cricket Match Manager](/effect-dynamodb/examples/gamemanager/) — Full end-to-end tutorial building a REST API

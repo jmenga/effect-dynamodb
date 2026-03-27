@@ -30,7 +30,7 @@ class Employee extends Schema.Class<Employee>("Employee")({
 
 ---
 
-## Step 2: Schema, Entity, Table, and Collections
+## Step 2: Schema, Entity, and Table
 
 ```typescript title="entities.ts" region="schema-entity-table" example="projections.ts"
 const AppSchema = DynamoSchema.make({ name: "proj-demo", version: 1 })
@@ -187,7 +187,7 @@ Projections trade type safety for efficiency. Use them at the edges (API respons
 
 ## Running the Example
 
-The complete runnable example is at [`examples/projections.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/projections.ts) in the repository.
+The complete runnable example is at [`examples/projections.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/examples/projections.ts) in the repository.
 
 Start DynamoDB Local:
 
@@ -236,7 +236,7 @@ Effect.runPromise(main).then(
 
 ## What's Next?
 
-- [Example: Conditional Writes & Filters](/effect-dynamodb/tutorials/expressions/) -- Conditional puts, updates, deletes, and filter operators
-- [Example: Scan Operations](/effect-dynamodb/tutorials/scan/) -- Full-table scans with filters, limits, and entity-type isolation
+- [Example: Conditional Writes & Filters](/effect-dynamodb/examples/expressions/) -- Conditional puts, updates, deletes, and filter operators
+- [Example: Scan Operations](/effect-dynamodb/examples/scan/) -- Full-table scans with filters, limits, and entity-type isolation
 - [Queries Guide](/effect-dynamodb/guides/queries/) -- Index queries, pagination, sort key conditions, and collections
-- [Example: Human Resources](/effect-dynamodb/tutorials/human-resources/) -- Full single-table design with 3 entities, collections, and transactions
+- [Example: Human Resources](/effect-dynamodb/examples/human-resources/) -- Full single-table design with 3 entities, collections, and transactions

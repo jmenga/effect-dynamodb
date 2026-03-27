@@ -62,6 +62,7 @@ class User extends Schema.Class<User>("User")({
 class Repository extends Schema.Class<Repository>("Repository")({
   repoName: Schema.String,
   repoOwner: Schema.String,
+  username: Schema.String,
   about: Schema.String,
   description: Schema.String,
   isPrivate: Schema.Boolean,
@@ -265,6 +266,7 @@ const repos = {
   helloWorld: {
     repoName: "hello-world",
     repoOwner: "octocat",
+    username: "octocat",
     about: "My first repository on GitHub!",
     description: "A simple hello world project for learning Git",
     isPrivate: false,
@@ -273,6 +275,7 @@ const repos = {
   linux: {
     repoName: "linux",
     repoOwner: "torvalds",
+    username: "torvalds",
     about: "Linux kernel source tree",
     description: "The Linux kernel",
     isPrivate: false,
@@ -389,15 +392,15 @@ const linux = yield* db.entities.Repositories.get({ repoOwner: "torvalds", repoN
 User and Repository share GSI1 via the `Owned` collection. Both use the owner's username as the partition key, so a single partition holds the user profile and all their repositories.
 
 ```typescript region="pattern-3" example="version-control.ts"
-const { Repositories: octocatRepos } = yield* db.collections.Owned!({
+const { Repositories: octocatRepos } = yield* db.collections.owned!({
   username: "octocat",
 }).collect()
 
-const { Repositories: torvaldsRepos } = yield* db.collections.Owned!({
+const { Repositories: torvaldsRepos } = yield* db.collections.owned!({
   username: "torvalds",
 }).collect()
 
-const { Users: octocatProfile } = yield* db.collections.Owned!({ username: "octocat" }).collect()
+const { Users: octocatProfile } = yield* db.collections.owned!({ username: "octocat" }).collect()
 ```
 
 Both queries hit GSI1 with the same partition key. DynamoDB serves both from the same item collection.
@@ -461,19 +464,19 @@ const closedPR = yield* db.entities.PullRequests.update(
 Issue and PullRequest share GSI1 via the `Managed` collection. Both use `username` as the partition key. The collection returns grouped results with all member types.
 
 ```typescript region="pattern-6" example="version-control.ts"
-const { Issues: torvaldsIssues } = yield* db.collections.Managed!({
+const { Issues: torvaldsIssues } = yield* db.collections.managed!({
   username: "torvalds",
 }).collect()
 
-const { PullRequests: torvaldsPRs } = yield* db.collections.Managed!({
+const { PullRequests: torvaldsPRs } = yield* db.collections.managed!({
   username: "torvalds",
 }).collect()
 
-const { Issues: octocatIssues } = yield* db.collections.Managed!({
+const { Issues: octocatIssues } = yield* db.collections.managed!({
   username: "octocat",
 }).collect()
 
-const { PullRequests: octocatPRs } = yield* db.collections.Managed!({
+const { PullRequests: octocatPRs } = yield* db.collections.managed!({
   username: "octocat",
 }).collect()
 ```
@@ -485,29 +488,29 @@ const { PullRequests: octocatPRs } = yield* db.collections.Managed!({
 Repository, Issue, and PullRequest share GSI2 via the `Activity` collection. All use `repoOwner + repoName` as the partition key, grouping everything related to a repository in one partition.
 
 ```typescript region="pattern-7" example="version-control.ts"
-const { Issues: hwIssues } = yield* db.collections.Activity!({
+const { Issues: hwIssues } = yield* db.collections.activity!({
   repoOwner: "octocat",
   repoName: "hello-world",
 }).collect()
 
 const hwOpenIssues = hwIssues.filter((i: any) => i.status === "Open")
 
-const { PullRequests: hwPRs } = yield* db.collections.Activity!({
+const { PullRequests: hwPRs } = yield* db.collections.activity!({
   repoOwner: "octocat",
   repoName: "hello-world",
 }).collect()
 
-const { Issues: linuxIssues } = yield* db.collections.Activity!({
+const { Issues: linuxIssues } = yield* db.collections.activity!({
   repoOwner: "torvalds",
   repoName: "linux",
 }).collect()
 
-const { PullRequests: linuxPRs } = yield* db.collections.Activity!({
+const { PullRequests: linuxPRs } = yield* db.collections.activity!({
   repoOwner: "torvalds",
   repoName: "linux",
 }).collect()
 
-const { Repositories: hwRepoActivity } = yield* db.collections.Activity!({
+const { Repositories: hwRepoActivity } = yield* db.collections.activity!({
   repoOwner: "octocat",
   repoName: "hello-world",
 }).collect()
@@ -544,12 +547,12 @@ yield* Transaction.transactWrite([
 ])
 
 // Both created atomically — verify via activity collection
-const { Issues: linuxIssuesAfter } = yield* db.collections.Activity!({
+const { Issues: linuxIssuesAfter } = yield* db.collections.activity!({
   repoOwner: "torvalds",
   repoName: "linux",
 }).collect()
 
-const { PullRequests: linuxPRsAfter } = yield* db.collections.Activity!({
+const { PullRequests: linuxPRsAfter } = yield* db.collections.activity!({
   repoOwner: "torvalds",
   repoName: "linux",
 }).collect()
@@ -559,7 +562,7 @@ const { PullRequests: linuxPRsAfter } = yield* db.collections.Activity!({
 
 ## Running the Example
 
-The complete runnable example is at [`examples/version-control.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/tutorials/version-control.ts) in the repository. It seeds data, runs all 8 access patterns, and verifies each with assertions.
+The complete runnable example is at [`examples/version-control.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/examples/version-control.ts) in the repository. It seeds data, runs all 8 access patterns, and verifies each with assertions.
 
 ```bash
 docker run -d -p 8000:8000 amazon/dynamodb-local
@@ -610,4 +613,4 @@ Effect.runPromise(main).then(
 - [Modeling Guide](/effect-dynamodb/guides/modeling/) -- Deep dive into models, schemas, tables, and entities
 - [Indexes & Collections](/effect-dynamodb/guides/indexes/) -- Access pattern design and collection patterns
 - [Queries](/effect-dynamodb/guides/queries/) -- Query combinators, filtering, and pagination
-- [Human Resources Example](/effect-dynamodb/tutorials/human-resources/) -- 3 entities, 5 GSIs, soft delete, and salary range queries
+- [Human Resources Example](/effect-dynamodb/examples/human-resources/) -- 3 entities, 5 GSIs, soft delete, and salary range queries
