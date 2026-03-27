@@ -142,6 +142,11 @@ export type TeamId = typeof TeamId.Type
 
 ### 2.2 Team model
 
+```ts title="src/models/Team.ts"
+import { DynamoModel } from "@effect-dynamodb/core"
+import { Schema } from "effect"
+```
+
 ```ts title="src/models/Team.ts" region="model-team" example="cricket.ts"
 class Team extends Schema.Class<Team>("Team")({
   id: Schema.String.pipe(DynamoModel.identifier),
@@ -150,6 +155,8 @@ class Team extends Schema.Class<Team>("Team")({
   ranking: Schema.Number,
 }) {}
 ```
+
+> **Note:** Add `export` before `class Team` — the region-synced code above omits it because the backing example is a single file. In your multi-file project, all models, entities, and services need to be exported.
 
 Three things to notice:
 
@@ -200,12 +207,17 @@ Let's break down what each piece does:
 
 Now that we have an entity, we need a **DynamoSchema** (application namespace) and a **Table** (physical table binding) to assemble it:
 
+```ts title="src/entities/Schema.ts"
+import { DynamoSchema, Table } from "@effect-dynamodb/core"
+import { Teams } from "./Teams.js"
+```
+
 ```ts title="src/entities/Schema.ts" region="schema" example="cricket.ts"
 const CricketSchema = DynamoSchema.make({ name: "cricket", version: 1 })
 ```
 
 ```ts title="src/entities/Schema.ts"
-const MainTable = Table.make({
+export const MainTable = Table.make({
   schema: CricketSchema,
   entities: { Teams },
 })
@@ -1687,6 +1699,13 @@ export const SquadSelectionId = Schema.String.pipe(Schema.brand("SquadSelectionI
 export type SquadSelectionId = typeof SquadSelectionId.Type
 ```
 
+```ts title="src/models/SquadSelection.ts"
+import { DynamoModel } from "@effect-dynamodb/core"
+import { Schema } from "effect"
+import { Player } from "./Player.js"
+import { Team } from "./Team.js"
+```
+
 ```ts region="model-squad-selection" example="cricket.ts"
 // SquadSelection — a player selected to a team's squad for a series/season.
 class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
@@ -1709,6 +1728,13 @@ Three things to notice:
 3. **Separate `season` and `series` fields** — instead of encoding them in a composite `squadId` string, each dimension is a proper field that can participate in GSI composites independently.
 
 ### 4.2 SquadSelections entity with refs and cascade indexes
+
+```ts title="src/entities/SquadSelections.ts"
+import { DynamoModel, Entity } from "@effect-dynamodb/core"
+import { SquadSelection } from "../models/SquadSelection.js"
+import { Players } from "./Players.js"
+import { Teams } from "./Teams.js"
+```
 
 ```ts region="entity-squad-selection" example="cricket.ts"
 const SquadSelections = Entity.make({
@@ -2069,6 +2095,15 @@ This is the most powerful feature of effect-dynamodb. A Match is a **graph of re
 
 A Match contains two TeamSheets (one per team). Each TeamSheet references a Team, a Coach, and an array of PlayerSheets:
 
+```ts title="src/models/Match.ts"
+import { DynamoModel } from "@effect-dynamodb/core"
+import { Schema } from "effect"
+import { Coach } from "./Coach.js"
+import { Player } from "./Player.js"
+import { Team } from "./Team.js"
+import { Venue } from "./Venue.js"
+```
+
 ```ts region="model-aggregate" example="cricket.ts"
 // Aggregate domain schemas
 class PlayerSheet extends Schema.Class<PlayerSheet>("PlayerSheet")({
@@ -2163,6 +2198,17 @@ The `MatchUpdatePayload` is a custom schema for the update endpoint. Aggregate u
 ### 5.3 The MatchAggregate
 
 This is where the magic happens. The aggregate defines how a complex domain object decomposes into DynamoDB items and reassembles:
+
+```ts title="src/entities/MatchAggregate.ts"
+import { Aggregate } from "@effect-dynamodb/core"
+import { Match } from "../models/Match.js"
+import { TeamSheet } from "../models/TeamSheet.js"
+import { Coaches } from "./Coaches.js"
+import { Players } from "./Players.js"
+import { Teams } from "./Teams.js"
+import { Venues } from "./Venues.js"
+import { CricketSchema, MainTable } from "./Schema.js"
+```
 
 ```ts region="aggregates" example="cricket.ts"
 // Sub-aggregate: a team's composition within a match
