@@ -82,7 +82,7 @@ yield* Console.log("Soft-deleted alice")
 | `db.entities.Employees.byTenant(...)` | No |
 | Collection queries | No |
 | `db.entities.Employees.deleted.get(key)` | Yes |
-| `Employees.deleted.list(key)` | Yes |
+| `db.entities.Employees.deleted.list(key)` | Yes (returns BoundQuery) |
 
 Normal get returns `ItemNotFound`:
 
@@ -111,11 +111,11 @@ yield* Console.log(`Deleted item: ${deleted.displayName} (deletedAt present)`)
 ```
 
 ```typescript region="deleted-list" example="guide-lifecycle.ts"
-// List all deleted items in the partition
-const allDeleted = yield* db.entities.Employees.collect(
-  Employees.deleted.list({ employeeId: "emp-alice" }),
-  Query.limit(20),
-)
+// List all deleted items in the partition — fluent BoundQuery
+const allDeleted = yield* db.entities.Employees
+  .deleted.list({ employeeId: "emp-alice" })
+  .limit(20)
+  .collect()
 yield* Console.log(`Deleted items in partition: ${allDeleted.length}`)
 ```
 
@@ -225,11 +225,11 @@ yield* Console.log(`\nVersion 1: ${v1.displayName} (v${v(v1)})`)
 ```
 
 ```typescript region="version-history" example="guide-lifecycle.ts"
-// Browse version history (most recent first)
-const history = yield* db.entities.Employees.collect(
-  Employees.versions({ employeeId: "emp-alice" }),
-  Query.reverse,
-)
+// Browse version history (most recent first) — fluent BoundQuery
+const history = yield* db.entities.Employees
+  .versions({ employeeId: "emp-alice" })
+  .reverse()
+  .collect()
 yield* Console.log(`\nVersion history (${history.length} snapshots):`)
 for (const snapshot of history) {
   yield* Console.log(`  v${v(snapshot)}: ${snapshot.displayName}`)
@@ -306,7 +306,10 @@ The full program demonstrating create, update, soft delete, restore, version his
 
 ```typescript title="main.ts"
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { Employees },
+    tables: { MainTable },
+  })
 
   // Create (version 1)
   const alice = yield* db.entities.Employees.put({
@@ -336,10 +339,10 @@ const program = Effect.gen(function* () {
   const restored = yield* db.entities.Employees.restore({ employeeId: "emp-alice" })
 
   // View full version history
-  const history = yield* db.entities.Employees.collect(
-    Employees.versions({ employeeId: "emp-alice" }),
-    Query.reverse,
-  )
+  const history = yield* db.entities.Employees
+    .versions({ employeeId: "emp-alice" })
+    .reverse()
+    .collect()
   // [v3 (deleted), v2 (updated), v1 (created)]
 })
 ```

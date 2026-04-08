@@ -33,8 +33,8 @@ pnpm init
 ### 1.2 Install dependencies
 
 ```bash
-pnpm add effect@4.0.0-beta.33 @effect/platform-node@4.0.0-beta.33 @effect-dynamodb/core ulid
-pnpm add -D typescript@^5.9.0 tsx vitest@^4.1.0 @effect/vitest@4.0.0-beta.33 @biomejs/biome@^2.4.4
+pnpm add effect@4.0.0-beta.43 @effect/platform-node@4.0.0-beta.43 effect-dynamodb ulid
+pnpm add -D typescript@^5.9.0 tsx vitest@^4.1.0 @effect/vitest@4.0.0-beta.43 @biomejs/biome@^2.4.4
 ```
 
 ### 1.3 Language Service Plugin
@@ -143,7 +143,7 @@ export type TeamId = typeof TeamId.Type
 ### 2.2 Team model
 
 ```ts title="src/models/Team.ts"
-import { DynamoModel } from "@effect-dynamodb/core"
+import { DynamoModel } from "effect-dynamodb"
 import { Schema } from "effect"
 ```
 
@@ -171,7 +171,7 @@ Three things to notice:
 The entity binds your pure model to DynamoDB with indexes, key composition, and optional features:
 
 ```ts title="src/entities/Teams.ts"
-import { DynamoModel, Entity } from "@effect-dynamodb/core"
+import { DynamoModel, Entity } from "effect-dynamodb"
 import { Team } from "../models/Team.js"
 
 export const Teams = Entity.make({
@@ -208,7 +208,7 @@ Let's break down what each piece does:
 Now that we have an entity, we need a **DynamoSchema** (application namespace) and a **Table** (physical table binding) to assemble it:
 
 ```ts title="src/entities/Schema.ts"
-import { DynamoSchema, Table } from "@effect-dynamodb/core"
+import { DynamoSchema, Table } from "effect-dynamodb"
 import { Teams } from "./Teams.js"
 ```
 
@@ -225,7 +225,7 @@ export const MainTable = Table.make({
 
 > **Concept: Single-table design** — All entities share one DynamoDB table. The schema's `name` and `version` become part of every key prefix (`$cricket#v1#...`), preventing collisions between entity types. You'll add more entities to `Table.make(...)` as you build them throughout this tutorial.
 
-> **Note:** Entity files don't import the table. Entities are pure definitions. The dependency flows the other way: `Schema.ts` imports entities and registers them on the table. In the service layer, `DynamoClient.make(MainTable)` binds all registered entities and returns a typed client where every operation has `R = never`.
+> **Note:** Entity files don't import the table. Entities are pure definitions. The dependency flows the other way: `Schema.ts` imports entities and registers them on the table. In each service file, you call `DynamoClient.make({ entities: { ... }, tables: { MainTable } })` listing the entities that service operates on, and the returned typed client has `R = never` for every operation.
 
 Run `pnpm check` — the model, entity, and table should compile.
 
@@ -235,7 +235,7 @@ Before building the service, create shared pagination schemas that will be reuse
 
 ```ts
 // src/models/Pagination.ts
-import { Query } from "@effect-dynamodb/core"
+import { Query } from "effect-dynamodb"
 import { Schema } from "effect"
 import { identity } from "effect/Function"
 
@@ -311,7 +311,7 @@ We'll add more filter schemas to this file as we add entities.
 
 ```ts
 // src/services/TeamService.ts
-import { DynamoClient, Entity } from "@effect-dynamodb/core"
+import { DynamoClient, Entity } from "effect-dynamodb"
 import { type DateTime, Effect, ServiceMap } from "effect"
 import { ulid } from "ulid"
 import { Teams } from "../entities/Teams.js"
@@ -327,8 +327,8 @@ type UpdateTeamInput = Entity.Update<typeof Teams>
 
 export class TeamService extends ServiceMap.Service<TeamService>()("@gamemanager/TeamService", {
   make: Effect.gen(function* () {
-    const db = yield* DynamoClient.make(MainTable)
-    const teams = db.Teams
+    const db = yield* DynamoClient.make({ entities: { Teams }, tables: { MainTable } })
+    const teams = db.entities.Teams
     return {
       create: Effect.fn(function* (input: CreateTeamInput) {
         const id = ulid() as TeamId
@@ -366,7 +366,7 @@ Key patterns:
 
 - **`ulid() as TeamId`** — `ulid()` returns `string`, so we cast it to the branded type. This is the one place you'll need a cast — at the generation boundary where IDs are created.
 
-- **`DynamoClient.make(MainTable)`** — The typed execution gateway. Resolves `DynamoClient | TableConfig` from context, binds all entities registered on the table, and returns a typed client where every operation has `R = never`. Access bound entities via `db.Teams`, `db.Players`, etc.
+- **`DynamoClient.make({ entities, tables })`** — The typed execution gateway. Resolves `DynamoClient | TableConfig` from context, binds the listed entities, and returns a typed client where every operation has `R = never`. Access bound entities via `db.entities.Teams`, `db.entities.Players`, etc., and table operations via `db.tables.MainTable.create()`. Each service typically only registers the entities it uses.
 
 - **Bound entity methods** — `teams.get()`, `teams.update()`, `teams.delete()` return `Effect` with `R = never` — no context requirements.
 
@@ -468,7 +468,7 @@ export const GameManagerApi = HttpApi.make("gamemanager")
 
 ```ts
 // src/api/App.ts
-import type { ItemNotFound, UniqueConstraintViolation, Table } from "@effect-dynamodb/core"
+import type { ItemNotFound, UniqueConstraintViolation, Table } from "effect-dynamodb"
 import { type DateTime, Effect, Layer } from "effect"
 import { HttpServer } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
@@ -566,14 +566,18 @@ export const ApiLayer = HttpApiBuilder.layer(GameManagerApi).pipe(
 
 ```ts
 // src/create-table.ts
-import { DynamoClient } from "@effect-dynamodb/core"
+import { DynamoClient } from "effect-dynamodb"
 import { Console, Effect } from "effect"
+import { Teams } from "./entities/Teams.js"
 import { MainTable } from "./entities/Schema.js"
 
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { Teams },
+    tables: { MainTable },
+  })
   yield* Console.log("Creating table...")
-  yield* db.createTable()
+  yield* db.tables.MainTable.create()
   yield* Console.log("Table created successfully")
 })
 
@@ -588,16 +592,22 @@ const TableLayer = MainTable.layer({ name: "gamemanager" })
 program.pipe(Effect.provide(DynamoLayer), Effect.provide(TableLayer), Effect.runPromise)
 ```
 
+> **Note:** As you add entities and aggregates throughout this tutorial, register them in the `entities` (and later `aggregates`) record passed to `DynamoClient.make` so `db.tables.MainTable.create()` derives the full GSI configuration.
+
 ```ts
 // src/destroy-table.ts
-import { DynamoClient } from "@effect-dynamodb/core"
+import { DynamoClient } from "effect-dynamodb"
 import { Console, Effect } from "effect"
+import { Teams } from "./entities/Teams.js"
 import { MainTable } from "./entities/Schema.js"
 
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { Teams },
+    tables: { MainTable },
+  })
   yield* Console.log("Destroying table...")
-  yield* db.deleteTable()
+  yield* db.tables.MainTable.delete()
   yield* Console.log("Table destroyed successfully")
 })
 
@@ -612,13 +622,13 @@ const TableLayer = MainTable.layer({ name: "gamemanager" })
 program.pipe(Effect.provide(DynamoLayer), Effect.provide(TableLayer), Effect.runPromise)
 ```
 
-> **Concept: Layer-based DI** — `DynamoClient.layer(...)` creates a Layer that provides the DynamoDB client. `MainTable.layer(...)` provides the physical table name. `DynamoClient.make(MainTable)` resolves both, binds all registered entities, and returns a typed client with `createTable()`, `deleteTable()`, and bound entity accessors — no need to inject `DynamoClient` directly.
+> **Concept: Layer-based DI** — `DynamoClient.layer(...)` creates a Layer that provides the DynamoDB client. `MainTable.layer(...)` provides the physical table name. `DynamoClient.make({ entities, aggregates?, tables })` resolves both, binds the listed entities and aggregates, and returns a typed client with namespaced `entities`, `aggregates`, `collections`, and `tables` accessors — no need to inject `DynamoClient` directly.
 
 ```ts
 // src/server.ts
 import { createServer } from "node:http"
 import { NodeHttpServer, NodeRuntime } from "@effect/platform-node"
-import { DynamoClient } from "@effect-dynamodb/core"
+import { DynamoClient } from "effect-dynamodb"
 import { Effect, Layer } from "effect"
 import { HttpMiddleware, HttpRouter, HttpServerRequest } from "effect/unstable/http"
 import { ApiLayer } from "./api/App.js"
@@ -756,7 +766,7 @@ export class Player extends Schema.Class<Player>("Player")({
 
 ```ts
 // src/entities/Players.ts
-import { DynamoModel, Entity } from "@effect-dynamodb/core"
+import { DynamoModel, Entity } from "effect-dynamodb"
 import { Player } from "../models/Player.js"
 
 export const Players = Entity.make({
@@ -793,7 +803,7 @@ export type PlayerListFilter = typeof PlayerListFilter.Type
 
 ```ts
 // src/services/PlayerService.ts
-import { DynamoClient, Entity } from "@effect-dynamodb/core"
+import { DynamoClient, Entity } from "effect-dynamodb"
 import { type DateTime, Effect, ServiceMap } from "effect"
 import { ulid } from "ulid"
 import type { PlayerListFilter } from "../models/Filters.js"
@@ -811,8 +821,8 @@ export class PlayerService extends ServiceMap.Service<PlayerService>()(
   "@gamemanager/PlayerService",
   {
     make: Effect.gen(function* () {
-      const db = yield* DynamoClient.make(MainTable)
-      const players = db.Players
+      const db = yield* DynamoClient.make({ entities: { Players }, tables: { MainTable } })
+      const players = db.entities.Players
       return {
         create: Effect.fn(function* (input: CreatePlayerInput) {
           const id = ulid() as PlayerId
@@ -923,7 +933,7 @@ export class Coach extends Schema.Class<Coach>("Coach")({
 
 ```ts
 // src/entities/Coaches.ts
-import { DynamoModel, Entity } from "@effect-dynamodb/core"
+import { DynamoModel, Entity } from "effect-dynamodb"
 import { Coach } from "../models/Coach.js"
 
 export const Coaches = Entity.make({
@@ -951,7 +961,7 @@ export const Coaches = Entity.make({
 
 ```ts
 // src/services/CoachService.ts
-import { DynamoClient, Entity } from "@effect-dynamodb/core"
+import { DynamoClient, Entity } from "effect-dynamodb"
 import { type DateTime, Effect, ServiceMap } from "effect"
 import { ulid } from "ulid"
 import { Coaches } from "../entities/Coaches.js"
@@ -967,8 +977,8 @@ type UpdateCoachInput = Entity.Update<typeof Coaches>
 
 export class CoachService extends ServiceMap.Service<CoachService>()("@gamemanager/CoachService", {
   make: Effect.gen(function* () {
-    const db = yield* DynamoClient.make(MainTable)
-    const coaches = db.Coaches
+    const db = yield* DynamoClient.make({ entities: { Coaches }, tables: { MainTable } })
+    const coaches = db.entities.Coaches
     return {
       create: Effect.fn(function* (input: CreateCoachInput) {
         const id = ulid() as CoachId
@@ -1078,7 +1088,7 @@ export class Umpire extends Schema.Class<Umpire>("Umpire")({
 
 ```ts
 // src/entities/Umpires.ts
-import { DynamoModel, Entity } from "@effect-dynamodb/core"
+import { DynamoModel, Entity } from "effect-dynamodb"
 import { Umpire } from "../models/Umpire.js"
 
 export const Umpires = Entity.make({
@@ -1106,7 +1116,7 @@ export const Umpires = Entity.make({
 
 ```ts
 // src/services/UmpireService.ts
-import { DynamoClient, Entity } from "@effect-dynamodb/core"
+import { DynamoClient, Entity } from "effect-dynamodb"
 import { type DateTime, Effect, ServiceMap } from "effect"
 import { ulid } from "ulid"
 import { Umpires } from "../entities/Umpires.js"
@@ -1124,8 +1134,8 @@ export class UmpireService extends ServiceMap.Service<UmpireService>()(
   "@gamemanager/UmpireService",
   {
     make: Effect.gen(function* () {
-      const db = yield* DynamoClient.make(MainTable)
-      const umpires = db.Umpires
+      const db = yield* DynamoClient.make({ entities: { Umpires }, tables: { MainTable } })
+      const umpires = db.entities.Umpires
       return {
         create: Effect.fn(function* (input: CreateUmpireInput) {
           const id = ulid() as UmpireId
@@ -1238,7 +1248,7 @@ export class Venue extends Schema.Class<Venue>("Venue")({
 
 ```ts
 // src/entities/Venues.ts
-import { DynamoModel, Entity } from "@effect-dynamodb/core"
+import { DynamoModel, Entity } from "effect-dynamodb"
 import { Venue } from "../models/Venue.js"
 
 export const Venues = Entity.make({
@@ -1266,7 +1276,7 @@ export const Venues = Entity.make({
 
 ```ts
 // src/services/VenueService.ts
-import { DynamoClient, Entity } from "@effect-dynamodb/core"
+import { DynamoClient, Entity } from "effect-dynamodb"
 import { type DateTime, Effect, ServiceMap } from "effect"
 import { ulid } from "ulid"
 import { Venues } from "../entities/Venues.js"
@@ -1282,8 +1292,8 @@ type UpdateVenueInput = Entity.Update<typeof Venues>
 
 export class VenueService extends ServiceMap.Service<VenueService>()("@gamemanager/VenueService", {
   make: Effect.gen(function* () {
-    const db = yield* DynamoClient.make(MainTable)
-    const venues = db.Venues
+    const db = yield* DynamoClient.make({ entities: { Venues }, tables: { MainTable } })
+    const venues = db.entities.Venues
     return {
       create: Effect.fn(function* (input: CreateVenueInput) {
         const id = ulid() as VenueId
@@ -1362,7 +1372,7 @@ First, register the new entities on the table. Update `Schema.ts`:
 
 ```ts
 // src/entities/Schema.ts
-import { DynamoSchema, Table } from "@effect-dynamodb/core"
+import { DynamoSchema, Table } from "effect-dynamodb"
 import { Coaches } from "./Coaches.js"
 import { Players } from "./Players.js"
 import { Teams } from "./Teams.js"
@@ -1373,7 +1383,7 @@ export const CricketSchema = DynamoSchema.make({ name: "cricketapp", version: 1 
 export const MainTable = Table.make({ schema: CricketSchema, entities: { Teams, Players, Coaches, Umpires, Venues } })
 ```
 
-> **Growing the table** — Each time you add entities, register them in the `entities` record on `Table.make(...)`. `DynamoClient.make(MainTable)` will then return a typed client that includes all registered entities.
+> **Growing the table** — Each time you add entities, register them in the `entities` record on `Table.make(...)`. You also need to add them to the `entities` record passed to `DynamoClient.make(...)` in any service or script that should access them — most notably `create-table.ts` (so `db.tables.MainTable.create()` derives their GSIs) and the App.ts handler layer.
 
 Update `Api.ts` to add all groups:
 
@@ -1403,7 +1413,7 @@ Update `App.ts` — add handler and service layers for each new entity. Each han
 
 ```ts
 // src/api/App.ts
-import type { ItemNotFound, UniqueConstraintViolation, Table } from "@effect-dynamodb/core"
+import type { ItemNotFound, UniqueConstraintViolation, Table } from "effect-dynamodb"
 import { type DateTime, Effect, Layer } from "effect"
 import { HttpServer } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
@@ -1641,10 +1651,19 @@ export const ApiLayer = HttpApiBuilder.layer(GameManagerApi).pipe(
 
 > **Pattern: Repetitive handlers are intentional.** Each handler follows the same structure: access service → handle list/get/create/update/remove with error mapping. The repetition is a feature — each handler is self-contained and easy to understand. Resist the urge to abstract a "generic CRUD handler" — the filter logic differs per entity (gender vs country), and as your app grows, handlers will diverge further (e.g., Match handlers are much more complex).
 
-Update `create-table.ts` to include all entities:
+Update `create-table.ts` to register the four new entities so `db.tables.MainTable.create()` derives their GSIs:
 
 ```ts
-yield* table.create([Teams, Players, Coaches, Umpires, Venues])
+// In create-table.ts — add the new entities
+import { Players } from "./entities/Players.js"
+import { Coaches } from "./entities/Coaches.js"
+import { Umpires } from "./entities/Umpires.js"
+import { Venues } from "./entities/Venues.js"
+
+const db = yield* DynamoClient.make({
+  entities: { Teams, Players, Coaches, Umpires, Venues },
+  tables: { MainTable },
+})
 ```
 
 Run `pnpm check`, then recreate the table (delete the old one first or use a fresh DynamoDB Local) and restart the server:
@@ -1700,7 +1719,7 @@ export type SquadSelectionId = typeof SquadSelectionId.Type
 ```
 
 ```ts title="src/models/SquadSelection.ts"
-import { DynamoModel } from "@effect-dynamodb/core"
+import { DynamoModel } from "effect-dynamodb"
 import { Schema } from "effect"
 import { Player } from "./Player.js"
 import { Team } from "./Team.js"
@@ -1730,7 +1749,7 @@ Three things to notice:
 ### 4.2 SquadSelections entity with refs and cascade indexes
 
 ```ts title="src/entities/SquadSelections.ts"
-import { DynamoModel, Entity } from "@effect-dynamodb/core"
+import { DynamoModel, Entity } from "effect-dynamodb"
 import { SquadSelection } from "../models/SquadSelection.js"
 import { Players } from "./Players.js"
 import { Teams } from "./Teams.js"
@@ -1827,7 +1846,7 @@ export type SquadListFilter = typeof SquadListFilter.Type
 
 ```ts
 // src/services/SquadSelectionService.ts
-import { DynamoClient, Entity } from "@effect-dynamodb/core"
+import { DynamoClient, Entity } from "effect-dynamodb"
 import { type DateTime, Effect, ServiceMap } from "effect"
 import { ulid } from "ulid"
 import { SquadSelections } from "../entities/SquadSelections.js"
@@ -1844,16 +1863,16 @@ export class SquadSelectionService extends ServiceMap.Service<SquadSelectionServ
   "@gamemanager/SquadSelectionService",
   {
     make: Effect.gen(function* () {
-      const db = yield* DynamoClient.make(MainTable)
-      const squads = db.SquadSelections
+      const db = yield* DynamoClient.make({ entities: { SquadSelections }, tables: { MainTable } })
+      const squads = db.entities.SquadSelections
       return {
         create: Effect.fn(function* (input: CreateSquadSelectionInput) {
           return yield* squads.put(input)
         }),
 
-        get: (key: { squadId: string; selectionNumber: number }) => squads.get(key),
+        get: (id: SquadSelectionId) => squads.get({ id }),
 
-        delete: (key: { squadId: string; selectionNumber: number }) => squads.delete(key),
+        delete: (id: SquadSelectionId) => squads.delete({ id }),
 
         listByPlayer: (playerId: string, pagination?: PaginationOptions) =>
           squads.fetch(
@@ -1920,7 +1939,7 @@ Register `SquadSelections` on the table:
 
 ```ts
 // src/entities/Schema.ts
-import { DynamoSchema, Table } from "@effect-dynamodb/core"
+import { DynamoSchema, Table } from "effect-dynamodb"
 import { Coaches } from "./Coaches.js"
 import { Players } from "./Players.js"
 import { SquadSelections } from "./SquadSelections.js"
@@ -1965,7 +1984,7 @@ Update `App.ts` — add the SquadSelectionsHandler and service. Add a `refNotFou
 
 ```ts
 // In App.ts — add imports:
-import type { RefNotFound } from "@effect-dynamodb/core"
+import type { RefNotFound } from "effect-dynamodb"
 import { SquadSelectionService } from "../services/SquadSelectionService.js"
 import { SquadSelection } from "../models/SquadSelection.js"
 import { ApiUnprocessableEntity } from "./ApiErrors.js"
@@ -2038,12 +2057,16 @@ const ServiceLayers = Layer.mergeAll(
 )
 ```
 
-Update `create-table.ts` to include the new entity (which adds gsi3 and gsi4 for cascade):
+Update `create-table.ts` to register `SquadSelections` so `db.tables.MainTable.create()` adds the new GSIs (gsi3 and gsi4 for cascade):
 
 ```ts
+// In create-table.ts — add SquadSelections to the entities record
 import { SquadSelections } from "./entities/SquadSelections.js"
 
-yield* table.create([Teams, Players, Coaches, Umpires, Venues, SquadSelections])
+const db = yield* DynamoClient.make({
+  entities: { Teams, Players, Coaches, Umpires, Venues, SquadSelections },
+  tables: { MainTable },
+})
 ```
 
 Recreate the table, restart the server, and test. First create a team and player to reference (or reuse IDs from Phase 3):
@@ -2096,7 +2119,7 @@ This is the most powerful feature of effect-dynamodb. A Match is a **graph of re
 A Match contains two TeamSheets (one per team). Each TeamSheet references a Team, a Coach, and an array of PlayerSheets:
 
 ```ts title="src/models/Match.ts"
-import { DynamoModel } from "@effect-dynamodb/core"
+import { DynamoModel } from "effect-dynamodb"
 import { Schema } from "effect"
 import { Coach } from "./Coach.js"
 import { Player } from "./Player.js"
@@ -2200,7 +2223,7 @@ The `MatchUpdatePayload` is a custom schema for the update endpoint. Aggregate u
 This is where the magic happens. The aggregate defines how a complex domain object decomposes into DynamoDB items and reassembles:
 
 ```ts title="src/entities/MatchAggregate.ts"
-import { Aggregate } from "@effect-dynamodb/core"
+import { Aggregate } from "effect-dynamodb"
 import { Match } from "../models/Match.js"
 import { TeamSheet } from "../models/TeamSheet.js"
 import { Coaches } from "./Coaches.js"
@@ -2321,9 +2344,10 @@ Update the service to validate matches after create and update using the `Valida
 
 ```ts
 // src/services/MatchService.ts
-import { Aggregate, DynamoClient } from "@effect-dynamodb/core"
+import { Aggregate, DynamoClient } from "effect-dynamodb"
 import { type DateTime, Effect, Schema, ServiceMap } from "effect"
 import { ulid } from "ulid"
+import { Umpires } from "../entities/Umpires.js"
 import { MatchAggregate } from "../entities/MatchAggregate.js"
 import type { UmpireId } from "../models/Ids.js"
 import { type MatchUpdatePayload, ValidatedMatch } from "../models/Match.js"
@@ -2340,9 +2364,13 @@ const validate = (match: Aggregate.Type<typeof MatchAggregate>) =>
 
 export class MatchService extends ServiceMap.Service<MatchService>()("@gamemanager/MatchService", {
   make: Effect.gen(function* () {
-    const db = yield* DynamoClient.make(MainTable)
-    const boundUmpires = db.Umpires
-    const matches = db.MatchAggregate
+    const db = yield* DynamoClient.make({
+      entities: { Umpires },
+      aggregates: { MatchAggregate },
+      tables: { MainTable },
+    })
+    const boundUmpires = db.entities.Umpires
+    const matches = db.aggregates.MatchAggregate
     return {
       create: Effect.fn(function* (input: MatchCreate) {
         const id = ulid()
@@ -2436,7 +2464,7 @@ export class MatchService extends ServiceMap.Service<MatchService>()("@gamemanag
 
 Key differences from entity services:
 
-- **`DynamoClient.make(MainTable)`** — Both entities and aggregates are registered on the table and bound via the same typed gateway. Destructure `Umpires` (bound entity) and `MatchAggregate` (bound aggregate) from a single call — all operations have `R = never`.
+- **`DynamoClient.make({ entities, aggregates, tables })`** — Both entities and aggregates are bound via the same typed gateway. Access bound entities through `db.entities.Umpires` and bound aggregates through `db.aggregates.MatchAggregate` — all operations have `R = never`.
 
 - **`matches.createSchema`** — Like entities, aggregates derive typed schemas. `createSchema` omits PK composites and replaces ref/edge fields with ID fields (`venueId`, `team1.teamId`).
 
@@ -2462,7 +2490,7 @@ Register the `MatchAggregate` on the table:
 
 ```ts
 // src/entities/Schema.ts
-import { DynamoSchema, Table } from "@effect-dynamodb/core"
+import { DynamoSchema, Table } from "effect-dynamodb"
 import { Coaches } from "./Coaches.js"
 import { MatchAggregate } from "./MatchAggregate.js"
 import { Players } from "./Players.js"
@@ -2479,7 +2507,7 @@ export const MainTable = Table.make({
 })
 ```
 
-> **Aggregates on the table** — Like entities, aggregates are registered on `Table.make(...)` and bound via `DynamoClient.make(MainTable)`. The typed client includes both bound entities and bound aggregates — all with `R = never`.
+> **Aggregates on the table** — Aggregates are registered on `Table.make(...)` (so `db.tables.MainTable.create()` knows about their GSIs) and listed under `aggregates` in `DynamoClient.make({ ..., aggregates: { MatchAggregate } })` (so the typed client exposes `db.aggregates.MatchAggregate`). All bound operations have `R = never`.
 
 Update `Api.ts`:
 
@@ -2513,7 +2541,7 @@ Add the MatchesHandler and service in `App.ts`:
 
 ```ts
 // In App.ts — add imports:
-import type { AggregateAssemblyError, ItemNotFound, RefNotFound } from "@effect-dynamodb/core"
+import type { AggregateAssemblyError, ItemNotFound, RefNotFound } from "effect-dynamodb"
 import { Match } from "../models/Match.js"
 import { MatchService } from "../services/MatchService.js"
 import { ApiBadRequest, ApiUnprocessableEntity } from "./ApiErrors.js"
@@ -2532,7 +2560,7 @@ const aggregateNotFound =
     )
 ```
 
-> **Note:** `AggregateAssemblyError` is imported from `@effect-dynamodb/core`. Aggregate operations throw `AggregateAssemblyError` (not `ItemNotFound`) when a partition has no items.
+> **Note:** `AggregateAssemblyError` is imported from `effect-dynamodb`. Aggregate operations throw `AggregateAssemblyError` (not `ItemNotFound`) when a partition has no items.
 
 ```ts
 // In App.ts — add handler (before HandlerLayers):
@@ -2634,19 +2662,20 @@ const ServiceLayers = Layer.mergeAll(
 )
 ```
 
-### 5.7 Update create-table.ts
+### 5.7 Recreate the table
+
+Update `create-table.ts` to register `MatchAggregate` so `db.tables.MainTable.create()` adds the aggregate's collection GSI (`gsi2` with `pk` + `gsi2sk`) and list GSI (`gsi1` with `gsi1pk` + `gsi1sk`) alongside the entity GSIs:
 
 ```ts
-// In create-table.ts — include MatchAggregate alongside entities
+// In create-table.ts — add the aggregates record
 import { MatchAggregate } from "./entities/MatchAggregate.js"
 
-yield* table.create([
-  Teams, Players, Coaches, Umpires, Venues, SquadSelections,
-  MatchAggregate,
-])
+const db = yield* DynamoClient.make({
+  entities: { Teams, Players, Coaches, Umpires, Venues, SquadSelections },
+  aggregates: { MatchAggregate },
+  tables: { MainTable },
+})
 ```
-
-`table.create` accepts both entities and aggregates. It automatically derives KeySchema, AttributeDefinitions, and GSI config — including the aggregate's collection GSI (`gsi2` with `pk` + `gsi2sk`) and list GSI (`gsi1` with `gsi1pk` + `gsi1sk`) alongside entity indexes.
 
 ### 5.8 Recreate table and test
 

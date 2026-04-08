@@ -239,7 +239,7 @@ const program = Effect.gen(function* () {
   // #region single-page
   // Single page with limit — returns page with items and cursor
   const page = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" }).limit(3).fetch()
-  // page.items: { Tasks: Task[] } (up to 3 items)
+  // page.items: Task[] (up to 3 items)
   // page.cursor: string | null (pass to startFrom for next page)
   // #endregion
   yield* Console.log(
@@ -317,14 +317,10 @@ const program = Effect.gen(function* () {
   // #endregion
   yield* Console.log(`Consistent get: "${consistentTask.title}"`)
 
-  // #region consistent-query
-  // Consistent read on scan (applies to any BoundQuery)
-  const consistentQuery = yield* tasks.scan().consistentRead().collect()
-  // #endregion
-  yield* Console.log(`Consistent query: ${consistentQuery.length} tasks`)
-
   // #region consistent-scan
-  // Consistent read on scan
+  // Consistent read on scan (applies to any BoundQuery against the base table).
+  // Note: DynamoDB GSIs do not support consistent reads — only the base table
+  // and local secondary indexes do.
   const consistentScan = yield* tasks.scan().consistentRead().collect()
   // #endregion
   yield* Console.log(`Consistent scan: ${consistentScan.length} tasks\n`)

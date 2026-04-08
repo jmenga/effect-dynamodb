@@ -1,4 +1,4 @@
-import { DynamoClient, DynamoSchema, Entity, Table } from "@effect-dynamodb/core"
+import { DynamoClient, DynamoSchema, Entity, Table } from "effect-dynamodb"
 import { Effect, Layer, Schema } from "effect"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import * as GeoIndex from "../src/GeoIndex.js"

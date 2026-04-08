@@ -95,7 +95,7 @@ const VehicleGeo = GeoIndex.make({
 | Field | Description |
 |-------|-------------|
 | `entity` | The effect-dynamodb Entity to bind to |
-| `index` | Name of the collection to use for geo queries |
+| `index` | Name of the entity GSI to use for geo queries |
 | `coordinates` | Extractor function — returns `{ latitude, longitude }` or `undefined` for items without location |
 | `fields.cell` | Fine-grained H3 cell (sort key). Resolution 15 is ~1m precision |
 | `fields.parentCell` | Coarse H3 cell (partition key). Resolution 3 is ~12km hexagons |

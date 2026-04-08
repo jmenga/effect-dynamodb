@@ -199,11 +199,11 @@ const program = Effect.gen(function* () {
   assertEq(deleted.displayName, "Alice Baker", "deleted record preserved")
 
   // #region deleted-list
-  // List all deleted items in the partition
-  const allDeleted = yield* db.entities.Employees.collect(
-    Employees.deleted.list({ employeeId: "emp-alice" }),
-    Query.limit(20),
-  )
+  // List all deleted items in the partition — fluent BoundQuery
+  const allDeleted = yield* db.entities.Employees
+    .deleted.list({ employeeId: "emp-alice" })
+    .limit(20)
+    .collect()
   yield* Console.log(`Deleted items in partition: ${allDeleted.length}`)
   // #endregion
   assertEq(allDeleted.length, 1, "1 deleted item in partition")
@@ -232,11 +232,11 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
 
   // #region version-history
-  // Browse version history (most recent first)
-  const history = yield* db.entities.Employees.collect(
-    Employees.versions({ employeeId: "emp-alice" }),
-    Query.reverse,
-  )
+  // Browse version history (most recent first) — fluent BoundQuery
+  const history = yield* db.entities.Employees
+    .versions({ employeeId: "emp-alice" })
+    .reverse()
+    .collect()
   yield* Console.log(`\nVersion history (${history.length} snapshots):`)
   for (const snapshot of history) {
     yield* Console.log(`  v${v(snapshot)}: ${snapshot.displayName}`)

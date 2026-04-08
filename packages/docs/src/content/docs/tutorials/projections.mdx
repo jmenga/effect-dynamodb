@@ -113,6 +113,10 @@ const nameAndDept = Projection.projection(["name", "department"])
 
 Apply the projection to a `GetItem` call via `DynamoClient`. DynamoDB returns only the requested attributes, reducing both network transfer and read capacity:
 
+:::caution[Hand-composed keys ahead]
+The example below builds raw partition/sort key strings (`"$proj-demo#v1#employee#e-1"`) so it can call `client.getItem` directly. This couples your code to the **internal key format**, which is implementation-detail of the schema/casing/version layer and is not part of the public API contract. Don't do this in production code unless you're sure you need the raw SDK escape hatch — the typed equivalent (`db.entities.Employees.get({ employeeId: "e-1" })`) computes the same key safely. A future release will expose `Entity.keyFor(...)` so projections can be combined with typed key composition without dropping to the SDK.
+:::
+
 ```typescript region="projected-get-item" example="projections.ts"
 const nameAndDept = Projection.projection(["name", "department"])
 
@@ -236,7 +240,7 @@ Effect.runPromise(main).then(
 
 ## What's Next?
 
-- [Example: Conditional Writes & Filters](/effect-dynamodb/examples/expressions/) -- Conditional puts, updates, deletes, and filter operators
-- [Example: Scan Operations](/effect-dynamodb/examples/scan/) -- Full-table scans with filters, limits, and entity-type isolation
+- [Example: Conditional Writes & Filters](/effect-dynamodb/tutorials/expressions/) -- Conditional puts, updates, deletes, and filter operators
+- [Example: Scan Operations](/effect-dynamodb/tutorials/scan/) -- Full-table scans with filters, limits, and entity-type isolation
 - [Queries Guide](/effect-dynamodb/guides/queries/) -- Index queries, pagination, sort key conditions, and collections
-- [Example: Human Resources](/effect-dynamodb/examples/human-resources/) -- Full single-table design with 3 entities, collections, and transactions
+- [Example: Human Resources](/effect-dynamodb/tutorials/human-resources/) -- Full single-table design with 3 entities, collections, and transactions

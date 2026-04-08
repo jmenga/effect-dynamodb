@@ -10,7 +10,6 @@ export type {
   TableLike,
   TableOperations,
   TypedClient,
-  TypedClientV2,
 } from "./DynamoClient.js"
 export { DynamoClient } from "./DynamoClient.js"
 export * as DynamoModel from "./DynamoModel.js"

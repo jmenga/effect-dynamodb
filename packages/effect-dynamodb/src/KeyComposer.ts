@@ -25,7 +25,7 @@ export interface KeyPart {
 export interface IndexDefinition {
   readonly index?: string | undefined // Physical GSI name (omit for primary)
   readonly collection?: string | ReadonlyArray<string> | undefined
-  readonly type?: "isolated" | "clustered" | undefined // Default: "clustered"
+  readonly type?: "isolated" | "clustered" | undefined // Default: "isolated"
   readonly pk: KeyPart
   readonly sk: KeyPart
   readonly casing?: DynamoSchema.Casing | undefined
@@ -174,14 +174,15 @@ export const composeSk = (
   const composites = extractComposites(index.sk.composite, record)
   const names = [...index.sk.composite]
   const collection = index.collection
-  const collectionType = index.type ?? "clustered"
+  const collectionType = index.type ?? "isolated"
 
   if (collection !== undefined) {
     if (collectionType === "clustered") {
-      const collectionName = Array.isArray(collection) ? collection[0]! : collection
+      // For sub-collections (collection: ["parent", "child"]) the FULL hierarchy
+      // is written into the SK so a begins_with query at any level matches.
       return composeClusteredSortKey(
         schema,
-        collectionName,
+        collection,
         entityType,
         entityVersion,
         composites,
@@ -351,12 +352,13 @@ export const composeSortKeyPrefix = (
   }
 
   const collection = index.collection
-  const collectionType = index.type ?? "clustered"
+  const collectionType = index.type ?? "isolated"
 
   if (collection !== undefined) {
     if (collectionType === "clustered") {
-      const collectionName = Array.isArray(collection) ? collection[0]! : collection
-      return composeClusteredSortKey(schema, collectionName, entityType, entityVersion, available, {
+      // For sub-collections, pass the full hierarchy so the SK prefix matches
+      // the same hierarchy written by composeSk during put.
+      return composeClusteredSortKey(schema, collection, entityType, entityVersion, available, {
         casing: index.casing,
         names,
       })

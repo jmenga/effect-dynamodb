@@ -1,5 +1,5 @@
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import { DynamoClient, DynamoError, DynamoSchema, Entity, Table } from "@effect-dynamodb/core"
+import { DynamoClient, DynamoError, DynamoSchema, Entity, Table } from "effect-dynamodb"
 import { Effect, Layer, Schema } from "effect"
 import * as h3 from "h3-js"
 import { beforeEach, describe, expect, it, vi } from "vitest"

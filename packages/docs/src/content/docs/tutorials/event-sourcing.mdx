@@ -43,7 +43,18 @@ Each class name doubles as the event type discriminator stored in DynamoDB.
 
 ---
 
-## Step 2: Event Stream
+## Step 2: Schema and Table
+
+Define the application schema and a table for the event store. Events live in their own physical table — no entity registration is needed because the stream itself manages the items:
+
+```typescript title="infrastructure.ts" region="infrastructure" example="event-sourcing.ts"
+const AppSchema = DynamoSchema.make({ name: "cricket", version: 1 })
+const EventsTable = Table.make({ schema: AppSchema })
+```
+
+---
+
+## Step 3: Event Stream
 
 An event stream binds events to a table, names the stream, and declares which attributes compose the stream ID (analogous to an aggregate ID):
 
@@ -63,7 +74,7 @@ Under the hood, each event is stored as a DynamoDB item with:
 
 ---
 
-## Step 3: Decider
+## Step 4: Decider
 
 The decider is the core pattern for event sourcing. It defines three things:
 
@@ -158,7 +169,7 @@ The `decide` function is effectful — it can fail with domain errors. The `evol
 
 ---
 
-## Step 4: Command Handler
+## Step 5: Command Handler
 
 `EventStore.commandHandler` wires the decider to an event stream. It handles the read-decide-append cycle with optimistic concurrency:
 
@@ -175,7 +186,7 @@ Each call to `handleMatch`:
 
 ---
 
-## Step 5: Running Commands
+## Step 6: Running Commands
 
 ### Start Match
 
@@ -216,7 +227,7 @@ const r4 = yield* handleMatch(
 
 ---
 
-## Step 6: Reading Events
+## Step 7: Reading Events
 
 ### Read All Events
 
@@ -250,7 +261,7 @@ const version = yield* matchEvents.currentVersion({ matchId: "m-1" })
 
 ---
 
-## Step 7: Fold and Query
+## Step 8: Fold and Query
 
 ### Reconstruct State from Events
 
@@ -277,7 +288,7 @@ const [latestEvent] = latest
 
 ---
 
-## Step 8: Domain Error Handling
+## Step 9: Domain Error Handling
 
 The decider enforces business rules. Sending an invalid command produces a tagged error:
 
@@ -352,5 +363,5 @@ Effect.runPromise(main).then(
 
 - [Modeling Guide](/effect-dynamodb/guides/modeling/) — Deep dive into models, schemas, tables, and entities
 - [Queries Guide](/effect-dynamodb/guides/queries/) — Query combinators, pagination, and filtering
-- [Example: Unique Constraints](/effect-dynamodb/examples/unique-constraints/) — Globally unique fields and idempotency keys
-- [Example: Human Resources](/effect-dynamodb/examples/human-resources/) — Single-table design with collections and transactions
+- [Example: Unique Constraints](/effect-dynamodb/tutorials/unique-constraints/) — Globally unique fields and idempotency keys
+- [Example: Human Resources](/effect-dynamodb/tutorials/human-resources/) — Single-table design with collections and transactions

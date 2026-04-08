@@ -6,7 +6,7 @@
  *   npx tsx examples/vehicle-tracking.ts
  */
 
-import { DynamoClient, DynamoSchema, Entity, Table } from "@effect-dynamodb/core"
+import { DynamoClient, DynamoSchema, Entity, Table } from "effect-dynamodb"
 import { Config, Effect, Layer, Schema } from "effect"
 import { GeoIndex, H3 } from "../src/index.js"
 

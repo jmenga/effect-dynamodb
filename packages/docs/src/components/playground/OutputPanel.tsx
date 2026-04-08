@@ -1,9 +1,10 @@
 import { useState } from "react"
+import type { GeneratedPutItem, GeneratedQuery } from "../../lib/playground-engine"
 
 interface Props {
   composedKeys: Record<string, string> | null
-  putItemParams: { TableName: string; Item: Record<string, unknown> } | null
-  queryParams: ReadonlyArray<{ name: string; params: Record<string, unknown> | null }>
+  putItemParams: GeneratedPutItem | null
+  queryParams: ReadonlyArray<{ name: string; params: GeneratedQuery | null }>
 }
 
 type Tab = "keys" | "putItem" | "query"
@@ -112,10 +113,7 @@ export function OutputPanel({ composedKeys, putItemParams, queryParams }: Props)
                     color: "var(--sl-color-gray-2)",
                   }}
                 >
-                  {name}{" "}
-                  {params && "IndexName" in params
-                    ? `(${(params as Record<string, unknown>).IndexName})`
-                    : "(table)"}
+                  {name} {params?.IndexName ? `(${params.IndexName})` : "(table)"}
                 </div>
                 {params ? (
                   <JsonBlock data={params} />

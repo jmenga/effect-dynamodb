@@ -10,9 +10,9 @@ describe("EntityResolver", () => {
   describe("resolveEntities", () => {
     it("should resolve a basic entity with primary index", () => {
       const source = `
-        import * as DynamoSchema from "@effect-dynamodb/core/DynamoSchema"
-        import * as Table from "@effect-dynamodb/core/Table"
-        import * as Entity from "@effect-dynamodb/core/Entity"
+        import * as DynamoSchema from "effect-dynamodb/DynamoSchema"
+        import * as Table from "effect-dynamodb/Table"
+        import * as Entity from "effect-dynamodb/Entity"
 
         const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
 

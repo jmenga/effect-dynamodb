@@ -43,6 +43,7 @@ import {
   parseShorthand,
   parseSimpleShorthand,
 } from "./internal/Expr.js"
+import { type BoundQueryConfig, BoundQueryImpl } from "./internal/BoundQuery.js"
 import { compilePath, createPathBuilder } from "./internal/PathBuilder.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "./KeyComposer.js"
 import * as KeyComposer from "./KeyComposer.js"
@@ -203,7 +204,7 @@ export type { IndexDefinition, KeyPart }
  * system field configuration, unique constraints, and CRUD operations.
  *
  * Created via {@link make}. Returns a definition with descriptor builders.
- * Table association and binding happen via `DynamoClient.make(table)`.
+ * Table association and binding happen via `DynamoClient.make()`.
  *
  * @typeParam TModel - Effect Schema defining the domain model
  * @typeParam TEntityType - Literal string discriminator stored as `__edd_e__`
@@ -250,6 +251,9 @@ export interface Entity<
   readonly _decodeRecord: (
     raw: globalThis.Record<string, unknown>,
   ) => Effect.Effect<any, ValidationError>
+
+  /** @internal Attach model class prototype to a decoded plain object (no-op for Schema.Struct models). */
+  readonly _attachPrototype: (decoded: any) => any
 
   /**
    * @internal Configure the entity with table schema and tag.
@@ -621,11 +625,12 @@ export interface Entity<
  * ```typescript
  * export class TeamService extends ServiceMap.Service<TeamService>()("TeamService", {
  *   make: Effect.gen(function* () {
- *     const { Teams: teams } = yield* DynamoClient.make(MainTable)
+ *     const db = yield* DynamoClient.make({ entities: { Teams }, tables: { MainTable } })
+ *     const teams = db.entities.Teams
  *     return {
  *       get: (id: TeamId) => teams.get({ id }),           // R = never
  *       create: (input) => teams.create({ ...input }),     // R = never
- *       list: (filter) => teams.execute(teams.query.byAll(filter)), // R = never
+ *       list: (filter) => teams.byAll(filter).collect(),  // R = never
  *     }
  *   }),
  * }) {}
@@ -757,6 +762,27 @@ export interface BoundEntity<
     version: number,
   ) => Effect.Effect<ModelType<TModel>, ItemNotFound | DynamoClientError | ValidationError, never>
 
+  /**
+   * List all version snapshots for an item as a fluent BoundQuery.
+   * Requires `versioned: { retain: true }` on the entity definition.
+   *
+   * ```ts
+   * const all = yield* db.entities.Users.versions({ userId: "u-1" }).collect()
+   * const last5 = yield* db.entities.Users
+   *   .versions({ userId: "u-1" })
+   *   .reverse()
+   *   .limit(5)
+   *   .collect()
+   * ```
+   */
+  readonly versions: (
+    key: TKey,
+  ) => import("./internal/BoundQuery.js").BoundQuery<
+    ModelType<TModel>,
+    never,
+    ModelType<TModel>
+  >
+
   /** Restore a soft-deleted item. */
   readonly restore: (
     key: TKey,
@@ -777,6 +803,23 @@ export interface BoundEntity<
     readonly get: (
       key: TKey,
     ) => Effect.Effect<ModelType<TModel>, ItemNotFound | DynamoClientError | ValidationError, never>
+    /**
+     * List all soft-deleted items in this partition as a fluent BoundQuery.
+     * Requires `softDelete` on the entity definition.
+     *
+     * ```ts
+     * const tombstones = yield* db.entities.Employees.deleted
+     *   .list({ employeeId: "e-1" })
+     *   .collect()
+     * ```
+     */
+    readonly list: (
+      key: TKey,
+    ) => import("./internal/BoundQuery.js").BoundQuery<
+      ModelType<TModel>,
+      never,
+      ModelType<TModel>
+    >
   }
 
   // --- Query Execution ---
@@ -1204,7 +1247,7 @@ const makeImpl = <
     resolvedIdentifier,
   )
   // schema and tableTag are injected via _configure() when the entity is registered
-  // on a Table and bound through DynamoClient.make(table). They are captured by operation
+  // on a Table and bound through DynamoClient.make(). They are captured by operation
   // closures and resolved at runtime (inside Effects), not at definition time.
   // Using definite assignment (!) since _configure is called before any operation executes.
   let schema!: DynamoSchema.DynamoSchema
@@ -1326,15 +1369,17 @@ const makeImpl = <
   const composeAllKeys = (record: globalThis.Record<string, unknown>) =>
     KeyComposer.composeAllKeys(schema, entityType, entityVersion, allIndexes, record)
 
+  /** Attach the model class prototype to a decoded plain object (when model is Schema.Class). */
+  const attachPrototype = (decoded: any) =>
+    isSchemaClass
+      ? Object.assign(Object.create((rawModel as any).prototype), decoded)
+      : decoded
+
   const decodeRecord = (raw: globalThis.Record<string, unknown>) => {
     renameFromDynamo(raw)
     deserializeDateFields(raw)
     return Schema.decodeUnknownEffect(schemas.recordSchema as Schema.Codec<any>)(raw).pipe(
-      Effect.map((decoded) =>
-        isSchemaClass
-          ? Object.assign(Object.create((rawModel as any).prototype), decoded)
-          : decoded,
-      ),
+      Effect.map(attachPrototype),
       Effect.mapError(
         (cause) =>
           new ValidationError({
@@ -1370,7 +1415,7 @@ const makeImpl = <
       Effect.map((decoded) =>
         mode === "model" && isSchemaClass && !hasHiddenFields
           ? new (rawModel as any)(decoded)
-          : decoded,
+          : mode !== "item" ? attachPrototype(decoded) : decoded,
       ),
       Effect.mapError(
         (cause) =>
@@ -3373,6 +3418,7 @@ const makeImpl = <
           if (mode === "native") return result.Items[0]!
           const targetSchema = schemas.deletedRecordSchema
           return yield* Schema.decodeUnknownEffect(targetSchema as Schema.Codec<any>)(raw).pipe(
+            Effect.map(attachPrototype),
             Effect.mapError(
               (cause) =>
                 new ValidationError({
@@ -3395,6 +3441,7 @@ const makeImpl = <
 
     const decodeDeleted = (raw: globalThis.Record<string, unknown>) =>
       Schema.decodeUnknownEffect(schemas.deletedRecordSchema as Schema.Codec<any>)(raw).pipe(
+        Effect.map(attachPrototype),
         Effect.mapError(
           (cause) =>
             new ValidationError({
@@ -3826,6 +3873,7 @@ const makeImpl = <
     _resolvedRefs: resolvedRefs,
     /** @internal Full decode pipeline: rename + date deser + schema decode. Used by Batch/Aggregate. */
     _decodeRecord: decodeRecord,
+    _attachPrototype: attachPrototype,
     _configure: (
       injectedSchema: DynamoSchema.DynamoSchema,
       injectedTableTag: import("effect").ServiceMap.Service<TableConfig, TableConfig>,
@@ -3904,7 +3952,7 @@ const makeImpl = <
  * Bind an Entity to resolved `DynamoClient` and `TableConfig` services.
  * Returns a {@link BoundEntity} where all operations have `R = never`.
  *
- * @internal Used by `DynamoClient.make(table)` to bind entities.
+ * @internal Used by `DynamoClient.make()` to bind entities.
  */
 export const bind = <
   TModel extends Schema.Top,
@@ -3975,6 +4023,23 @@ export const bind = <
       return result as Query.Query<A>
     }
 
+    // Helper: wrap a raw entity-level Query<A> in a BoundQuery with this binding's
+    // pre-resolved provide. Used by `versions` and `deleted.list` accessors so consumers
+    // get the same fluent .collect() / .fetch() / .paginate() / .reverse() / .limit() /
+    // .filter() ergonomics they get from index accessors and `.scan()`.
+    const wrapAsBoundQuery = <A>(q: Query.Query<A>) => {
+      const bqConfig: BoundQueryConfig<unknown> = {
+        pathBuilder: createPathBuilder(),
+        conditionOps: createConditionOps(),
+        provide,
+      }
+      return new BoundQueryImpl(q, bqConfig) as unknown as import("./internal/BoundQuery.js").BoundQuery<
+        A,
+        never,
+        A
+      >
+    }
+
     return {
       // CRUD — all ops return Effect (auto-wrapped)
       get: (key: Key) => provide((entity.get(key) as any)._run("record")),
@@ -3995,10 +4060,12 @@ export const bind = <
       // Lifecycle
       getVersion: (key: Key, version: number) =>
         provide((entity.getVersion(key, version) as any)._run("record")),
+      versions: (key: Key) => wrapAsBoundQuery(entity.versions(key)),
       restore: (key: Key) => provide((entity.restore(key) as any)._run("record")),
       purge: (key: Key) => provide(entity.purge(key).asEffect()),
       deleted: {
         get: (key: Key) => provide((entity.deleted.get(key) as any)._run("record")),
+        list: (key: Key) => wrapAsBoundQuery(entity.deleted.list(key)),
       },
       // Query execution
       paginate: <A>(q: Query.Query<A>, ...combinators: ReadonlyArray<(q: any) => any>) => {
@@ -4202,6 +4269,7 @@ export const compositeAttributes = (entity: EntityLike): ReadonlyArray<string> =
 /** Minimal structural type for schema accessors. */
 interface EntityWithSchemas {
   readonly schemas: DerivedSchemas
+  readonly _attachPrototype?: (decoded: any) => any
 }
 
 /**
@@ -4228,6 +4296,7 @@ export const decodeMarshalledItem = (
   marshalledItem: globalThis.Record<string, AttributeValue>,
 ): Effect.Effect<unknown, ValidationError> =>
   Schema.decodeUnknownEffect(entity.schemas.itemSchema)(fromAttributeMap(marshalledItem)).pipe(
+    Effect.map((decoded) => entity._attachPrototype ? entity._attachPrototype(decoded) : decoded),
     Effect.mapError(
       (cause) =>
         new ValidationError({

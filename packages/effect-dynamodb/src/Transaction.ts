@@ -167,17 +167,7 @@ export const transactGet = <const T extends ReadonlyArray<EntityGet<any, any, an
         continue
       }
 
-      const recordSchema = entity.schemas.recordSchema as Schema.Codec<any>
-      const item = yield* Schema.decodeUnknownEffect(recordSchema)(raw).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ValidationError({
-              entityType: entity.entityType,
-              operation: "transactGet",
-              cause,
-            }),
-        ),
-      )
+      const item = yield* entity._decodeRecord(raw)
       decoded.push(item)
     }
 

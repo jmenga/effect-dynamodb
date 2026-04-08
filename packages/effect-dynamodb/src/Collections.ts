@@ -173,7 +173,7 @@ export const make = <
   config: CollectionConfig<TName, TMembers>,
 ): Collection<TName, TMembers> => {
   const memberEntries = Object.entries(config.members)
-  const collectionType = config.type ?? "clustered"
+  const collectionType = config.type ?? "isolated"
 
   // --- Validation ---
 

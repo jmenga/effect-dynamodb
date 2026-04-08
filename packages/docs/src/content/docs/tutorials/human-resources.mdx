@@ -611,7 +611,7 @@ Effect.runPromise(main).then(
 | **Single-table design** | 3 entities, 1 table, structured key values |
 | **Index overloading** | GSI1 serves `workplaces` collection (employees + offices by office) and `byProject` index (tasks by project) |
 | **Collections** | `Workplaces` (GSI1) and `Assignments` (GSI3) enable cross-entity queries with grouped results |
-| **Sort key range queries** | Zero-padded salary in `Roles` (GSI4) SK enables `between` queries via `.where()` |
+| **Sort key range queries** | Zero-padded salary in `byRole` (GSI4) SK enables `between` queries via `.where()` |
 | **All-or-none GSI updates** | Updating one GSI composite requires all composites for that index |
 | **Transactions** | Atomic multi-entity writes for onboarding |
 | **Soft delete + restore** | Termination archives records; rehire restores them with all keys recomposed |
@@ -621,4 +621,4 @@ Effect.runPromise(main).then(
 - [Modeling Guide](/effect-dynamodb/guides/modeling/) — Deep dive into models, schemas, tables, and entities
 - [Indexes & Collections](/effect-dynamodb/guides/indexes/) — Access pattern design and collection patterns
 - [Lifecycle](/effect-dynamodb/guides/lifecycle/) — Soft delete, versioning, and TTL
-- [Cricket Match Manager](/effect-dynamodb/examples/gamemanager/) — Full end-to-end tutorial building a REST API
+- [Cricket Match Manager](/effect-dynamodb/tutorials/gamemanager/) — Full end-to-end tutorial building a REST API

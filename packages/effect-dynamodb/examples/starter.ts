@@ -177,7 +177,7 @@ const program = Effect.gen(function* () {
   )
   yield* Console.log(`Updated task: "${updated.title}" -> ${updated.status}\n`)
 
-  // --- Query: tasks by user via collection ---
+  // --- Query: tasks by user via GSI index accessor ---
   yield* Console.log("=== Query: Tasks by User (GSI) ===\n")
 
   const aliceTasks = yield* db.entities.Tasks.byUser({ userId: "u-alice" }).collect()

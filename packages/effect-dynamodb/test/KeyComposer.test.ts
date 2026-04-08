@@ -132,6 +132,44 @@ describe("KeyComposer", () => {
         "$myapp#v1#user_1#createdat_2024-01-15",
       )
     })
+
+    it("clustered sub-collection sk writes the full hierarchy", () => {
+      // Sub-collection: collection is a [parent, child] array
+      const index: KeyComposer.IndexDefinition = {
+        index: "gsi2",
+        collection: ["contributions", "assignments"],
+        type: "clustered",
+        pk: { field: "gsi2pk", composite: ["employeeId"] },
+        sk: { field: "gsi2sk", composite: ["projectId"] },
+      }
+      // SK contains BOTH levels — a begins_with at "contributions" or
+      // "contributions#assignments" both match.
+      expect(KeyComposer.composeSk(schema, "Task", 1, index, { projectId: "p-1" })).toBe(
+        "$myapp#v1#contributions#assignments#task_1#projectid_p-1",
+      )
+    })
+
+    it("clustered single-element array collection sk is equivalent to a string", () => {
+      const arrayIndex: KeyComposer.IndexDefinition = {
+        index: "gsi2",
+        collection: ["contributions"],
+        type: "clustered",
+        pk: { field: "gsi2pk", composite: ["employeeId"] },
+        sk: { field: "gsi2sk", composite: ["department"] },
+      }
+      const stringIndex: KeyComposer.IndexDefinition = {
+        ...arrayIndex,
+        collection: "contributions",
+      }
+      const arraySk = KeyComposer.composeSk(schema, "Employee", 1, arrayIndex, {
+        department: "engineering",
+      })
+      const stringSk = KeyComposer.composeSk(schema, "Employee", 1, stringIndex, {
+        department: "engineering",
+      })
+      expect(arraySk).toBe(stringSk)
+      expect(arraySk).toBe("$myapp#v1#contributions#employee_1#department_engineering")
+    })
   })
 
   describe("composeIndexKeys", () => {

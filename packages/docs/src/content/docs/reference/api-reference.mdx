@@ -3,7 +3,7 @@ title: "API Reference"
 description: "Module-by-module reference for all public exports"
 ---
 
-Module-by-module reference for all public exports of `@effect-dynamodb/core`.
+Module-by-module reference for all public exports of `effect-dynamodb`.
 
 ## DynamoModel
 
@@ -172,13 +172,13 @@ import { Table } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `make` | `(config: { schema, entities?, aggregates? }) => Table` | Create a table definition with entities and aggregates |
-| `definition` | `(table, entities) => TableDefinition` | Derive `CreateTableCommandInput` fields from entity index declarations |
+| `definition` | `(table) => TableDefinition` | Derive `CreateTableCommandInput` fields from entity index declarations |
 
 ### Types
 
 | Type | Description |
 |------|-------------|
-| `Table` | Interface with `schema`, `layer()`, and `Tag` for DI |
+| `Table` | Interface with `schema`, `entities`, `aggregates`, `layer()`, `layerConfig()`, and `Tag` for DI |
 | `TableConfig` | `{ name: string }` — runtime table configuration |
 | `TableDefinition` | `{ KeySchema, AttributeDefinitions, GlobalSecondaryIndexes? }` |
 
@@ -191,8 +191,11 @@ const MainTable = Table.make({ schema: AppSchema, entities: { UserEntity, TaskEn
 MainTable.layer({ name: "MyTable" })
 
 // Typed client auto-derives table schema for creation
-const db = yield* DynamoClient.make(MainTable)
-yield* db.createTable()
+const db = yield* DynamoClient.make({
+  entities: { UserEntity, TaskEntity },
+  tables: { MainTable },
+})
+yield* db.tables.MainTable.create()
 ```
 
 See [Modeling](/effect-dynamodb/guides/modeling/) for details.
@@ -249,13 +252,34 @@ These are methods on the entity definition returned by `Entity.make()`. They ret
 | `entity.batchPut(items)` | See Batch module | Batch put items |
 | `entity.batchDelete(keys)` | See Batch module | Batch delete items |
 
+:::caution[A note for Effect v3 users]
+`entity.get`, `entity.put`, `entity.update`, and `entity.delete` return Yieldable **operation descriptors** (`EntityOp` / `EntityDelete`), not `Effect`s directly. This mirrors the Effect v4 convention where types like `Option` are also Yieldable-only — `yield* op` works inside `Effect.gen`, but `op.pipe(Effect.map(...))` will not compile.
+
+```typescript
+// ✅ Works — yieldable in Effect.gen
+yield* UserEntity.get({ userId: "u-1" })
+
+// ❌ Does not compile — descriptor is not an Effect
+UserEntity.get({ userId: "u-1" }).pipe(Effect.map(/* … */))
+
+// ✅ Convert to Effect explicitly when needed
+UserEntity.get({ userId: "u-1" }).asEffect().pipe(Effect.map(/* … */))
+```
+
+**The recommended path is to access entities through `DynamoClient.make()`** — the resulting `BoundEntity` (`db.entities.UserEntity`) auto-wraps each operation into a real `Effect<A, E, never>`, so you get straightforward `Effect.map`/`Effect.flatMap`/`pipe` ergonomics without ever calling `.asEffect()`. Reach for raw entity descriptors only when (a) you need an alternate decode mode (`asRecord`/`asItem`/`asNative`) or (b) you are composing the descriptor into a `Transaction` or `Batch`, both of which consume descriptors directly.
+:::
+
 ### Client Gateway Pattern
 
-`DynamoClient.make(table)` resolves dependencies and returns a typed client with executable operations for all registered entities:
+`DynamoClient.make({ entities, aggregates?, tables? })` resolves dependencies and returns a typed client with executable operations for all listed entities and aggregates, namespaced under `entities`, `aggregates`, `collections`, and `tables`:
 
 ```typescript
 const MainTable = Table.make({ schema: AppSchema, entities: { UserEntity } })
-const { UserEntity: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { UserEntity },
+  tables: { MainTable },
+})
+const users = db.entities.UserEntity
 ```
 
 **Bound entity methods:**
@@ -275,12 +299,14 @@ const { UserEntity: users } = yield* DynamoClient.make(MainTable)
 
 **Bound lifecycle methods** (require matching entity config):
 
-| Method | Requires | Description |
-|--------|----------|-------------|
-| `bound.getVersion(key, version)` | `versioned: { retain: true }` | Get a specific version snapshot |
-| `bound.restore(key)` | `softDelete` | Restore a soft-deleted item |
-| `bound.purge(key)` | Any | Permanently remove item + all versions and sentinels |
-| `bound.deleted.get(key)` | `softDelete` | Get a specific soft-deleted item |
+| Method | Requires | Returns | Description |
+|--------|----------|---------|-------------|
+| `bound.getVersion(key, version)` | `versioned: { retain: true }` | `Effect` | Get a specific version snapshot |
+| `bound.versions(key)` | `versioned: { retain: true }` | `BoundQuery` | List all version snapshots as a fluent BoundQuery — supports `.collect()`, `.fetch()`, `.paginate()`, `.count()`, `.limit()`, `.reverse()`, `.startFrom()`, `.filter()`, `.select()` |
+| `bound.restore(key)` | `softDelete` | `Effect` | Restore a soft-deleted item |
+| `bound.purge(key)` | Any | `Effect` | Permanently remove item + all versions and sentinels |
+| `bound.deleted.get(key)` | `softDelete` | `Effect` | Get a specific soft-deleted item |
+| `bound.deleted.list(key)` | `softDelete` | `BoundQuery` | List all soft-deleted tombstones in the partition as a fluent BoundQuery |
 
 **Entity definition lifecycle operations** (require matching config — listed in Operations table above for query descriptors):
 
@@ -365,7 +391,11 @@ const UserEntity = Entity.make({
 })
 
 // Get typed client with executable operations
-const { UserEntity: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { UserEntity },
+  tables: { MainTable },
+})
+const users = db.entities.UserEntity
 
 // CRUD
 const user = yield* users.put({ userId: "u-1", email: "a@b.com", ... })
@@ -409,7 +439,6 @@ import { Query } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `where(conditions)` | Dual | Add sort key conditions (`KeyConditionExpression`) |
-| `filter(conditions)` | Dual | Add post-read filter (`FilterExpression`) |
 | `limit(n)` | Dual | Set max items per page |
 | `maxPages(n)` | Dual | Limit total number of pages fetched |
 | `reverse` | Combinator | Reverse sort order (descending) |
@@ -457,7 +486,11 @@ Used in entity-level `filter()`:
 ### Usage
 
 ```typescript
-const { TaskEntity: tasks } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { TaskEntity },
+  tables: { MainTable },
+})
+const tasks = db.entities.TaskEntity
 
 const items = yield* tasks.collect(
   TaskEntity.query.byProject({ projectId: "p-1" }),
@@ -469,6 +502,77 @@ const items = yield* tasks.collect(
 ```
 
 See [Queries](/effect-dynamodb/guides/queries/) for details.
+
+---
+
+## BoundQuery
+
+The fluent query builder returned by every entity query accessor on a `BoundEntity` (e.g. `db.entities.Tasks.byProject({...})`) and by `db.entities.Tasks.scan()`. `BoundQuery<Model, SkRemaining, A>` wraps an internal `Query<A>` with pre-resolved services so all terminals return `Effect<..., ..., never>`.
+
+```typescript
+import type { BoundQuery } from "effect-dynamodb"
+```
+
+Combinators are immutable — each call returns a new `BoundQuery`. Terminals execute the query.
+
+### Combinators
+
+| Method | Description |
+|--------|-------------|
+| `.where((t, ops) => …)` | Type-safe sort key condition on remaining SK composites. Only available when SK composites have not all been consumed. Consumes `SkRemaining` (cannot be called twice). Operators: `eq`, `lt`, `lte`, `gt`, `gte`, `between`, `beginsWith`. |
+| `.filter((t, ops) => …)` | Post-read filter expression via callback. Type-safe attribute paths via `t`, condition operators via `ops`. |
+| `.filter(shorthand)` | Post-read filter via shorthand object (e.g. `{ status: "active" }` or `{ gt: { price: 30 } }`). |
+| `.select((t) => […paths])` | Projection expression via callback. Returns `BoundQuery<…, Record<string, unknown>>`. |
+| `.select(["field", …])` | Projection via attribute name array. |
+| `.limit(n)` | Maximum items per DynamoDB page. |
+| `.maxPages(n)` | Maximum number of DynamoDB pages to fetch. |
+| `.reverse()` | Reverse sort order (`ScanIndexForward = false`). |
+| `.startFrom(cursor)` | Resume pagination from an opaque cursor returned by `.fetch()`. |
+| `.consistentRead()` | Enable strongly consistent reads. |
+| `.ignoreOwnership()` | Skip the `__edd_e__` entity-type filter. Use only when querying a polymorphic GSI shared across entity types and you want every item back. |
+
+### Terminals
+
+| Method | Returns |
+|--------|---------|
+| `.collect()` | `Effect<Array<A>, DynamoClientError \| ValidationError, never>` — drain all pages into a single array. |
+| `.fetch()` | `Effect<Page<A>, DynamoClientError \| ValidationError, never>` — single page + opaque cursor. `Page<A>` is `{ items: Array<A>, cursor: string \| undefined }`. |
+| `.paginate()` | `Stream<A, DynamoClientError \| ValidationError, never>` — lazy stream that paginates automatically. |
+| `.count()` | `Effect<number, DynamoClientError, never>` — count-only query (`Select: COUNT`); items are not returned. |
+
+### `where` typing
+
+`.where()` is conditionally available based on the `SkRemaining` type parameter. When the index's SK composites have already been fully consumed (e.g., the entity has no SK composites, or all of them were supplied to the query accessor), `.where()` is **not present** on the type — calling it is a compile error. Once called, `.where()` consumes `SkRemaining` and the resulting `BoundQuery` no longer exposes `.where()`.
+
+### Usage
+
+```typescript
+const db = yield* DynamoClient.make({ entities: { Tasks } })
+
+// Sort key condition + filter + limit
+const recent = yield* db.entities.Tasks
+  .byProject({ projectId: "p-1" })
+  .where((t, { beginsWith }) => beginsWith(t.createdAt, "2026"))
+  .filter((t, { eq }) => eq(t.status, "active"))
+  .limit(50)
+  .collect()
+
+// Single page + cursor
+const page = yield* db.entities.Tasks
+  .byProject({ projectId: "p-1" })
+  .fetch()
+
+// Lazy stream
+yield* db.entities.Tasks
+  .byProject({ projectId: "p-1" })
+  .paginate()
+  .pipe(Stream.runForEach((task) => Console.log(task.title)))
+
+// Count only
+const total = yield* db.entities.Tasks.byProject({ projectId: "p-1" }).count()
+```
+
+See [Queries](/effect-dynamodb/guides/queries/) and [Expressions](/effect-dynamodb/guides/expressions/) for details.
 
 ---
 
@@ -806,7 +910,7 @@ import { DynamoClient } from "effect-dynamodb"
 |--------|------|-------------|
 | `DynamoClient` | `ServiceMap.Service` | Effect service class |
 | `DynamoClient.layer(config)` | `Layer<DynamoClient>` | Create live layer with region + optional endpoint/credentials |
-| `DynamoClient.layerConfig()` | `Layer<DynamoClient>` | Create live layer from Effect Config providers (env vars) |
+| `DynamoClient.layerConfig(config)` | `Layer<DynamoClient, ConfigError>` | Create live layer from Effect `Config` providers. Accepts `{ region, endpoint?, credentials? }` as `Config.Config<...>` values |
 
 ### Service Methods
 
@@ -838,8 +942,11 @@ DynamoClient.layer({
   credentials: { accessKeyId: "local", secretAccessKey: "local" },
 })
 
-// Config-based (reads DYNAMO_REGION, DYNAMO_ENDPOINT from env)
-DynamoClient.layerConfig()
+// Config-based (reads from Effect Config — e.g., env vars)
+DynamoClient.layerConfig({
+  region: Config.string("AWS_REGION"),
+  endpoint: Config.option(Config.string("DYNAMO_ENDPOINT")),
+})
 ```
 
 ---
@@ -941,6 +1048,120 @@ See [Aggregates & Refs](/effect-dynamodb/guides/aggregates/) for details.
 
 ---
 
+## EventStore
+
+Typed, Effect-native event sourcing on DynamoDB. Provides a `Decider` model for command-event-state aggregates, an `EventStream` repository per stream type, optimistic concurrency via stream versioning, and a `commandHandler` combinator for the read-decide-append cycle.
+
+```typescript
+import { EventStore } from "effect-dynamodb"
+```
+
+### Construction
+
+| Export | Description |
+|--------|-------------|
+| `EventStore.makeStream({ table, streamName, events, streamId, metadata? })` | Create an `EventStream<TEvent, TStreamIdFields, TMetadata>` bound to a `Table`. `events` is an array of `Schema.Class` event types, `streamId.composite` lists the stream-id composite fields, optional `metadata` is a Schema. |
+| `EventStore.bind(stream)` | Resolve `DynamoClient` and `TableConfig` from context and return a `BoundEventStream` whose operations have `R = never`. Use inside `ServiceMap.Service` make effects. |
+
+### Decider
+
+A `Decider<State, Command, Event, E = never>` encodes one aggregate's command-event-state triad:
+
+| Field | Type |
+|-------|------|
+| `decide` | `(command: Command, state: State) => Effect<ReadonlyArray<Event>, E>` |
+| `evolve` | `(state: State, event: Event) => State` (pure) |
+| `initialState` | `State` |
+
+### Operations
+
+`EventStream` and `BoundEventStream` expose the same operations. The only difference is the `R` parameter — `EventStream` ops require `DynamoClient | TableConfig`, `BoundEventStream` ops have `R = never`.
+
+| Method | Returns |
+|--------|---------|
+| `append(streamId, events, expectedVersion, options?)` | `Effect<AppendResult<TEvent>, VersionConflict \| DynamoClientError \| ValidationError \| TransactionCancelled, R>` — atomically append events with optimistic concurrency. Each event becomes a `Put` with `attribute_not_exists(pk)` inside a single `TransactWriteItems`. Optional `options.metadata` is validated against the stream's metadata schema. |
+| `read(streamId)` | `Effect<ReadonlyArray<StreamEvent<TEvent>>, DynamoClientError \| ValidationError, R>` — read all events for a stream in version order. |
+| `readFrom(streamId, afterVersion)` | `Effect<ReadonlyArray<StreamEvent<TEvent>>, DynamoClientError \| ValidationError, R>` — read events strictly after a given version. |
+| `currentVersion(streamId)` | `Effect<number, DynamoClientError \| ValidationError, R>` — current head version (0 if the stream is empty). |
+| `query.events(streamId)` | `Query<StreamEvent<TEvent>>` — raw query handle for use with `Query` combinators. |
+
+`BoundEventStream` additionally exposes `provide(effect)` as an escape hatch to push services into an arbitrary effect.
+
+### Command handler
+
+| Export | Description |
+|--------|-------------|
+| `EventStore.commandHandler(decider, stream)` | Build a `(streamId, command, options?) => Effect<CommandHandlerResult, …, R>` that reads, folds, decides, and appends atomically. Dual API: `commandHandler(decider, stream)` (data-first) or `stream.pipe(EventStore.commandHandler(decider))` (data-last). Works with both `EventStream` (R = `DynamoClient \| TableConfig`) and `BoundEventStream` (R = `never`). On a no-op command (`decide` returns `[]`) the handler returns the current state and version without writing. |
+
+### Fold helpers
+
+| Export | Description |
+|--------|-------------|
+| `EventStore.fold(decider, events)` | Pure: fold a list of `StreamEvent<TEvent>` through `decider.evolve` starting from `decider.initialState`. Dual API. |
+| `EventStore.foldFrom(decider, startState, events)` | Pure: fold from a supplied starting state (e.g. snapshot + delta events). Dual API. |
+
+### Types
+
+| Type | Shape |
+|------|-------|
+| `StreamEvent<A>` | `{ streamId, version, eventType, data: A, metadata, timestamp }` |
+| `AppendResult<A>` | `{ version: number, events: ReadonlyArray<A> }` |
+| `CommandHandlerResult<State, Event>` | `AppendResult<Event> & { state: State }` |
+| `EventStream<TEvent, TStreamIdFields, TMetadata>` | Repository interface returned by `makeStream` |
+| `BoundEventStream<TEvent, TStreamIdFields, TMetadata>` | Same shape as `EventStream` with `R = never` on every operation |
+
+### Usage
+
+```typescript
+import { EventStore } from "effect-dynamodb"
+import { Effect, Schema, ServiceMap } from "effect"
+
+class MatchStarted extends Schema.Class<MatchStarted>("MatchStarted")({
+  venue: Schema.String,
+}) {}
+
+class InningsCompleted extends Schema.Class<InningsCompleted>("InningsCompleted")({
+  innings: Schema.Number,
+  runs: Schema.Number,
+}) {}
+
+const MatchEvents = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Match",
+  events: [MatchStarted, InningsCompleted],
+  streamId: { composite: ["matchId"] },
+})
+
+const decider = {
+  initialState: { innings: 0, totalRuns: 0 },
+  decide: (cmd: { _tag: "Start"; venue: string }, _state) =>
+    Effect.succeed([new MatchStarted({ venue: cmd.venue })]),
+  evolve: (state, event) => {
+    if (event._tag === "MatchStarted") return state
+    return { innings: event.innings, totalRuns: state.totalRuns + event.runs }
+  },
+}
+
+class MatchEventService extends ServiceMap.Service<MatchEventService>()(
+  "@app/MatchEventService",
+  {
+    make: Effect.gen(function* () {
+      const stream = yield* EventStore.bind(MatchEvents)
+      const handle = EventStore.commandHandler(decider, stream)
+      return {
+        start: (matchId: string, venue: string) =>
+          handle({ matchId }, { _tag: "Start", venue }),
+        history: (matchId: string) => stream.read({ matchId }),
+      }
+    }),
+  },
+) {}
+```
+
+See [Event Sourcing](/effect-dynamodb/tutorials/event-sourcing/) for a complete tutorial.
+
+---
+
 ## Errors
 
 Tagged error types for precise error handling with `catchTag`.
@@ -985,7 +1206,11 @@ import {
 ### Usage
 
 ```typescript
-const { UserEntity: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { UserEntity },
+  tables: { MainTable },
+})
+const users = db.entities.UserEntity
 
 const user = yield* users.get({ userId: "u-1" }).pipe(
   Effect.catchTag("ItemNotFound", () => Effect.succeed(null)),

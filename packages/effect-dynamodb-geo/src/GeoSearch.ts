@@ -7,8 +7,8 @@
  * @internal Used by GeoIndex — consumers should use `GeoIndex.nearby()`.
  */
 
-import type { DynamoClientError, DynamoSchema, Table } from "@effect-dynamodb/core"
-import { type DynamoClient, KeyComposer, Query, ValidationError } from "@effect-dynamodb/core"
+import type { DynamoClientError, DynamoSchema, Table } from "effect-dynamodb"
+import { type DynamoClient, KeyComposer, Query, ValidationError } from "effect-dynamodb"
 import { Effect, Schema, type ServiceMap } from "effect"
 import * as h3 from "h3-js"
 import type { Coordinates, GeoFields, NearbyOptions, NearbyResult } from "./GeoIndex.js"

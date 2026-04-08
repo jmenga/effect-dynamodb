@@ -88,13 +88,13 @@ GSI indexes must use the new format with `name`, `pk: { field, composite }`, and
 // ❌ Error: old format with nested index object
 indexes: {
   byEmail: {
-    index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+    index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },  // ❌ legacy nested-`index` shape
     composite: ["email"],
     sk: [],
   },
 }
 
-// ✅ Correct
+// ✅ Correct (current shape — `name`, `pk`, `sk` siblings)
 indexes: {
   byEmail: {
     name: "gsi1",

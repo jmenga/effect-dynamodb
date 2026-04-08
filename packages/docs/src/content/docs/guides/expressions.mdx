@@ -313,41 +313,44 @@ db.entities.Tasks.byProject({ projectId: "proj-alpha" })
 db.entities.Tasks.byProject({ projectId: "proj-alpha", status: "active" })
 ```
 
-### Sort Key Conditions with `Query.where`
+### Sort Key Conditions with `.where()`
 
-`Query.where()` adds a sort key condition to the `KeyConditionExpression`:
+`.where()` on a `BoundQuery` adds a typed sort key condition to the `KeyConditionExpression`, using the SK composites that have not yet been provided in the query accessor input. It is only available when remaining SK composites exist, and can only be called once per query.
+
+The callback receives a typed accessor for the remaining SK composites plus a set of SK comparison ops:
 
 ```typescript
-import { Query } from "effect-dynamodb"
+// byProject SK composite: ["status", "createdAt"]
 
-// Exact match
-query.pipe(Query.where({ eq: sortKeyValue }))
+// Provide the PK + no SK composites → .where() sees both { status, createdAt }
+db.entities.Tasks.byProject({ projectId: "p-1" })
+  .where((t, { eq }) => eq(t.status, "active"))
+
+// Provide a leading SK composite → .where() sees only remaining { createdAt }
+db.entities.Tasks.byProject({ projectId: "p-1", status: "active" })
+  .where((t, { between }) => between(t.createdAt, "2025-01", "2025-03"))
 
 // Range comparisons
-query.pipe(Query.where({ gt: sortKeyValue }))
-query.pipe(Query.where({ gte: sortKeyValue }))
-query.pipe(Query.where({ lt: sortKeyValue }))
-query.pipe(Query.where({ lte: sortKeyValue }))
-
-// Inclusive range
-query.pipe(Query.where({ between: [lo, hi] }))
+db.entities.Tasks.byProject({ projectId: "p-1" })
+  .where((t, { gt }) => gt(t.status, "active"))
 
 // Prefix match
-query.pipe(Query.where({ beginsWith: prefix }))
+db.entities.Tasks.byProject({ projectId: "p-1" })
+  .where((t, { beginsWith }) => beginsWith(t.status, "a"))
 ```
 
-| Operator | Syntax | DynamoDB |
+| Operator | Callback | DynamoDB |
 |---|---|---|
-| Equals | `{ eq: value }` | `#sk = :sk` |
-| Less than | `{ lt: value }` | `#sk < :sk` |
-| Less or equal | `{ lte: value }` | `#sk <= :sk` |
-| Greater than | `{ gt: value }` | `#sk > :sk` |
-| Greater or equal | `{ gte: value }` | `#sk >= :sk` |
-| Between | `{ between: [lo, hi] }` | `#sk BETWEEN :lo AND :hi` |
-| Begins with | `{ beginsWith: prefix }` | `begins_with(#sk, :prefix)` |
+| Equals | `eq(t.field, value)` | `#sk = :sk` |
+| Less than | `lt(t.field, value)` | `#sk < :sk` |
+| Less or equal | `lte(t.field, value)` | `#sk <= :sk` |
+| Greater than | `gt(t.field, value)` | `#sk > :sk` |
+| Greater or equal | `gte(t.field, value)` | `#sk >= :sk` |
+| Between | `between(t.field, lo, hi)` | `#sk BETWEEN :lo AND :hi` |
+| Begins with | `beginsWith(t.field, prefix)` | `begins_with(#sk, :prefix)` |
 
 <Aside type="note">
-  Sort key values in effect-dynamodb are **composed strings** that include the schema prefix, entity type, and composite attribute values. You don't construct these manually — use `KeyComposer.composeSortKeyPrefix()` to build the prefix from domain attributes, then pass it to `Query.where({ beginsWith: prefix })`.
+  The `.where()` callback operates on domain-level SK composites — you never construct raw composed sort key strings yourself. effect-dynamodb composes the schema prefix, entity type, and preceding composite values automatically.
 </Aside>
 
 ---

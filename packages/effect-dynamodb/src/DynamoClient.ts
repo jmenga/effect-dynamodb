@@ -358,98 +358,77 @@ export class DynamoClient extends ServiceMap.Service<DynamoClient, DynamoClientS
     )
 
   /**
-   * Create a typed client gateway.
+   * Create a typed client gateway from entities, aggregates, and (optionally) tables.
    *
-   * **Overload 1 — Entity-centric:** `DynamoClient.make({ entities, collections })`
-   * Resolves tables from entities, injects collection indexes, returns a namespaced client
-   * with `entities`, `collections`, and `tables` properties.
-   *
-   * **Overload 2 — Table shortcut:** `DynamoClient.make(table)`
-   * Shortcut equivalent to `DynamoClient.make({ entities: table.entities })`.
+   * Returns a namespaced client with `entities`, `aggregates`, `collections`, and
+   * `tables` properties. Collections are auto-discovered from entity index
+   * `collection` properties — no separate registration needed.
    *
    * @example
    * ```typescript
-   * // Entity-centric
-   * const db = yield* DynamoClient.make({ entities: { Users, Tasks }, collections: { Assignments } })
-   * yield* db.entities.Users.get({ userId: "123" })
+   * const db = yield* DynamoClient.make({
+   *   entities: { Users, Tasks },
+   *   aggregates: { OrderAggregate },
+   *   tables: { MainTable },
+   * })
    *
-   * // Table shortcut (existing pattern)
-   * const db = yield* DynamoClient.make(MainTable)
-   * yield* db.Users.get({ userId: "123" })
+   * yield* db.entities.Users.get({ userId: "123" })
+   * yield* db.aggregates.OrderAggregate.get({ orderId: "o-1" })
+   * yield* db.collections.assignments({ userId: "123" }).collect()
+   * yield* db.tables.MainTable.create()
    * ```
    */
   static readonly make: {
-    // --- Overload 1: Table shortcut (existing, checked first) ---
-    <T extends Table>(table: T): Effect.Effect<TypedClient<T>, never, DynamoClient | TableConfig>
+    <
+      TEntities extends Record<string, { readonly _tag: "Entity" }>,
+      TAggregates extends Record<string, AggregateType<any, any, any>>,
+      TTables extends Record<string, TableLike>,
+    >(config: {
+      readonly entities: TEntities
+      readonly aggregates: TAggregates
+      readonly tables: TTables
+    }): Effect.Effect<
+      TypedClient<TEntities, TAggregates, TTables>,
+      never,
+      DynamoClient | TableConfig
+    >
 
-    // --- Overload 2a: Entity-centric with tables ---
+    <
+      TEntities extends Record<string, { readonly _tag: "Entity" }>,
+      TAggregates extends Record<string, AggregateType<any, any, any>>,
+    >(config: {
+      readonly entities: TEntities
+      readonly aggregates: TAggregates
+    }): Effect.Effect<
+      TypedClient<TEntities, TAggregates, Record<string, TableLike>>,
+      never,
+      DynamoClient | TableConfig
+    >
+
     <
       TEntities extends Record<string, { readonly _tag: "Entity" }>,
       TTables extends Record<string, TableLike>,
     >(config: {
       readonly entities: TEntities
       readonly tables: TTables
-    }): Effect.Effect<TypedClientV2<TEntities, TTables>, never, DynamoClient | TableConfig>
-
-    // --- Overload 2b: Entity-centric (no tables) ---
-    <TEntities extends Record<string, { readonly _tag: "Entity" }>>(config: {
-      readonly entities: TEntities
     }): Effect.Effect<
-      TypedClientV2<TEntities, Record<string, TableLike>>,
+      TypedClient<TEntities, Record<string, never>, TTables>,
       never,
       DynamoClient | TableConfig
     >
-  } = (configOrTable: any): any => {
-    // Detect which overload: Table objects have _tag = "Table"
-    if (configOrTable._tag === "Table") {
-      return makeFromTable(configOrTable)
-    }
-    return makeFromConfig(configOrTable)
-  }
+
+    <TEntities extends Record<string, { readonly _tag: "Entity" }>>(config: {
+      readonly entities: TEntities
+    }): Effect.Effect<
+      TypedClient<TEntities, Record<string, never>, Record<string, TableLike>>,
+      never,
+      DynamoClient | TableConfig
+    >
+  } = (config: any): any => makeFromConfig(config)
 }
 
 // ---------------------------------------------------------------------------
 // TypedClient — mapped type for DynamoClient.make() return value
-// ---------------------------------------------------------------------------
-
-/**
- * Typed client returned by `DynamoClient.make(table)`.
- * Maps each entity key to its BoundEntity type, each aggregate key to its
- * BoundAggregate type, plus table management operations.
- */
-export type TypedClient<T extends Table> = {
-  readonly [K in keyof T["entities"]]: T["entities"][K] extends EntityType<
-    infer M,
-    any,
-    infer I,
-    any,
-    any,
-    any,
-    any,
-    infer R,
-    any
-  >
-    ? Resolve<BoundEntity<M, I, R, ResolveKey<M, I>>>
-    : never
-} & {
-  readonly [K in keyof T["aggregates"]]: T["aggregates"][K] extends AggregateType<
-    infer S,
-    infer TKey,
-    infer TInput
-  >
-    ? BoundAggregate<S, TKey, TInput>
-    : never
-} & {
-  /** Create the physical DynamoDB table from registered entity/aggregate definitions. */
-  readonly createTable: (options?: CreateTableOptions) => Effect.Effect<void, DynamoClientError>
-  /** Delete the physical DynamoDB table. */
-  readonly deleteTable: () => Effect.Effect<void, DynamoClientError>
-  /** Describe the table. */
-  readonly describeTable: () => Effect.Effect<DescribeTableCommandOutput, DynamoClientError>
-}
-
-// ---------------------------------------------------------------------------
-// TypedClientV2 — mapped type for entity-centric DynamoClient.make() return
 // ---------------------------------------------------------------------------
 
 /** Minimal structural type for tables used in DynamoClient.make() config. */
@@ -497,12 +476,13 @@ export interface CollectionQuery<TResult> {
 }
 
 /**
- * Typed client returned by `DynamoClient.make({ entities, tables })`.
- * Namespaced under `entities`, `collections`, and `tables`.
+ * Typed client returned by `DynamoClient.make({ entities, aggregates?, tables? })`.
+ * Namespaced under `entities`, `aggregates`, `collections`, and `tables`.
  * Collections are auto-discovered from entity index `collection` properties.
  */
-export type TypedClientV2<
+export type TypedClient<
   TEntities extends Record<string, { readonly _tag: "Entity" }>,
+  TAggregates extends Record<string, AggregateType<any, any, any>> = Record<string, never>,
   TTables extends Record<string, TableLike> = Record<string, TableLike>,
 > = {
   /** Bound entities with CRUD + query accessors for each index. */
@@ -528,6 +508,17 @@ export type TypedClientV2<
             >
           } & EntityIndexAccessors<M, I>
         >
+      : never
+  }
+
+  /** Bound aggregates with CRUD + list operations (R = never). */
+  readonly aggregates: {
+    readonly [K in keyof TAggregates]: TAggregates[K] extends AggregateType<
+      infer S,
+      infer TKey,
+      infer TInput
+    >
+      ? BoundAggregate<S, TKey, TInput>
       : never
   }
 
@@ -707,50 +698,6 @@ export interface TableOperations {
 }
 
 // ---------------------------------------------------------------------------
-// makeFromTable — existing Table-based make implementation
-// ---------------------------------------------------------------------------
-
-const makeFromTable = <T extends Table>(
-  table: T,
-): Effect.Effect<TypedClient<T>, never, DynamoClient | TableConfig> =>
-  Effect.gen(function* () {
-    const client = yield* DynamoClient
-    const tableConfig = yield* table.Tag
-
-    // Bind each entity
-    const boundEntities: Record<string, unknown> = {}
-    for (const [key, entity] of Object.entries(table.entities)) {
-      boundEntities[key] = yield* entityBind(entity as EntityType)
-    }
-
-    // Bind each aggregate
-    const boundAggregates: Record<string, unknown> = {}
-    for (const [key, aggregate] of Object.entries(table.aggregates)) {
-      boundAggregates[key] = yield* aggregateBind(aggregate as AggregateType<any, any, any>)
-    }
-
-    return {
-      ...boundEntities,
-      ...boundAggregates,
-
-      createTable: (options?: CreateTableOptions) =>
-        idempotentCreate(
-          client
-            .createTable({
-              TableName: tableConfig.name,
-              BillingMode: options?.billingMode ?? "PAY_PER_REQUEST",
-              ...tableDefinition(table),
-            })
-            .pipe(Effect.asVoid),
-        ),
-
-      deleteTable: () => client.deleteTable({ TableName: tableConfig.name }).pipe(Effect.asVoid),
-
-      describeTable: () => client.describeTable({ TableName: tableConfig.name }),
-    } as TypedClient<T>
-  })
-
-// ---------------------------------------------------------------------------
 // makeFromConfig — entity-centric make implementation
 // ---------------------------------------------------------------------------
 
@@ -771,6 +718,7 @@ interface EntityLike {
 
 const makeFromConfig = (config: {
   readonly entities: Record<string, EntityType>
+  readonly aggregates?: Record<string, AggregateType<any, any, any>>
   readonly tables?: Record<string, TableLike>
 }): Effect.Effect<any, never, DynamoClient | TableConfig> =>
   Effect.gen(function* () {
@@ -1015,13 +963,19 @@ const makeFromConfig = (config: {
         // Add begins_with on collection SK prefix for clustered collections.
         // For isolated collections (default), each entity has its own entity-type
         // SK prefix, so a collection-name begins_with would filter them all out.
+        //
+        // For sub-collections (collection: ["parent", "child"]), the SK prefix
+        // includes the full hierarchy from root up to and including the queried
+        // collection name. A query at the parent level matches every descendant.
         if (indexDef.sk.field && indexDef.type === "clustered") {
-          const skPrefix = DynamoSchema.composeCollectionKey(
-            firstMember.entityLike._schema,
-            collName,
-            [],
-            { casing: indexDef.casing ?? firstMember.entityLike._schema.casing },
-          )
+          const coll = indexDef.collection
+          const hierarchy = Array.isArray(coll)
+            ? coll.slice(0, coll.indexOf(collName) + 1)
+            : [collName]
+          const casing = indexDef.casing ?? firstMember.entityLike._schema.casing
+          const pre = DynamoSchema.prefix(firstMember.entityLike._schema)
+          const casedNames = hierarchy.map((n) => DynamoSchema.applyCasing(n, casing))
+          const skPrefix = `${pre}#${casedNames.join("#")}`
           query = Query.where(query, { beginsWith: skPrefix })
         }
 
@@ -1058,7 +1012,15 @@ const makeFromConfig = (config: {
       }
     }
 
-    // 4. Build table operations
+    // 4. Bind aggregates
+    const boundAggregates: Record<string, unknown> = {}
+    if (config.aggregates) {
+      for (const [key, aggregate] of Object.entries(config.aggregates)) {
+        boundAggregates[key] = yield* aggregateBind(aggregate)
+      }
+    }
+
+    // 5. Build table operations
     const client = yield* DynamoClient
     const tables: Record<string, TableOperations> = {}
 
@@ -1072,28 +1034,58 @@ const makeFromConfig = (config: {
         )
       }
     } else {
-      // Group entities by table tag so we can derive full table schema for create()
-      const entitiesByTag = new Map<string, { tag: EntityLike["_tableTag"]; entities: EntityLike[] }>()
+      // Group entities by table tag so we can derive full table schema for create().
+      // Aggregates are also assigned to a table tag via their underlying entities;
+      // we collect them here so create() includes their GSIs.
+      const entitiesByTag = new Map<
+        string,
+        {
+          tag: EntityLike["_tableTag"]
+          entities: EntityLike[]
+          aggregates: AggregateType<any, any, any>[]
+        }
+      >()
       for (const [, entity] of Object.entries(config.entities)) {
         const entityLike = entity as unknown as EntityLike
         const tagId = entityLike._tableTag.key
         if (!entitiesByTag.has(tagId)) {
-          entitiesByTag.set(tagId, { tag: entityLike._tableTag, entities: [] })
+          entitiesByTag.set(tagId, { tag: entityLike._tableTag, entities: [], aggregates: [] })
         }
         entitiesByTag.get(tagId)!.entities.push(entityLike)
       }
-      for (const [, { tag, entities: tableEntities }] of entitiesByTag) {
+      // Attach aggregates to whichever table tag matches their root entity tag.
+      // (Aggregates expose `_tableTag` from their root entity registration.)
+      if (config.aggregates) {
+        for (const [, agg] of Object.entries(config.aggregates)) {
+          const aggTag = (agg as unknown as { _tableTag?: EntityLike["_tableTag"] })._tableTag
+          if (aggTag && entitiesByTag.has(aggTag.key)) {
+            entitiesByTag.get(aggTag.key)!.aggregates.push(agg)
+          }
+        }
+      }
+      for (const [, { tag, entities: tableEntities, aggregates: tableAggregates }] of entitiesByTag) {
         const tableConfig = yield* tag
         // Build a minimal Table-like object so tableDefinition() can derive GSIs
+        // (entities + aggregates).
         const syntheticTable = {
           entities: Object.fromEntries(tableEntities.map((e) => [e.entityType, e])),
-          aggregates: {},
+          aggregates: Object.fromEntries(
+            tableAggregates.map((a, i) => [
+              (a as { name?: string }).name ?? `__aggregate_${i}__`,
+              a,
+            ]),
+          ),
         } as unknown as Table
         tables[tableConfig.name] = buildTableOperationsFromTable(tableConfig.name, syntheticTable, client)
       }
     }
 
-    return { entities: boundEntities, collections: boundCollections, tables } as any
+    return {
+      entities: boundEntities,
+      aggregates: boundAggregates,
+      collections: boundCollections,
+      tables,
+    } as any
   })
 
 // ---------------------------------------------------------------------------

@@ -3595,6 +3595,51 @@ describe("Entity", () => {
       )
     })
 
+    it.effect("BoundEntity.versions returns a fluent BoundQuery", () =>
+      Effect.gen(function* () {
+        // Mock 3 version snapshots returned in ascending version order
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              itemId: "i-1",
+              name: "v1",
+              createdAt: "2024-01-15T00:00:00Z",
+              updatedAt: "2024-01-15T00:00:00Z",
+              version: 1,
+              pk: "$myapp#v1#retainitem#i-1",
+              sk: "$myapp#v1#retainitem#v#0000001",
+              __edd_e__: "RetainItem",
+            }),
+            toAttributeMap({
+              itemId: "i-1",
+              name: "v2",
+              createdAt: "2024-01-15T00:00:00Z",
+              updatedAt: "2024-01-16T00:00:00Z",
+              version: 2,
+              pk: "$myapp#v1#retainitem#i-1",
+              sk: "$myapp#v1#retainitem#v#0000002",
+              __edd_e__: "RetainItem",
+            }),
+          ],
+        })
+
+        const bound = yield* Entity.bind(RetainEntity)
+        const all = yield* bound.versions({ itemId: "i-1" }).limit(10).collect()
+
+        expect(all).toHaveLength(2)
+        expect((all[0]! as { name: string }).name).toBe("v1")
+        expect((all[1]! as { name: string }).name).toBe("v2")
+
+        // Verify the underlying QueryCommandInput shape
+        expect(mockQuery).toHaveBeenCalledOnce()
+        const call = mockQuery.mock.calls[0]![0]
+        expect(call.TableName).toBe("test-table")
+        expect(call.Limit).toBe(10)
+        // No IndexName — versions read from the base table
+        expect(call.IndexName).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("version snapshot has _ttl when versioned with ttl", () =>
       Effect.gen(function* () {
         mockTransactWriteItems.mockResolvedValueOnce({})
@@ -3839,6 +3884,52 @@ describe("Entity", () => {
         "$myapp#v1#softitem#deleted#",
       )
     })
+
+    it.effect("BoundEntity.deleted.list returns a fluent BoundQuery", () =>
+      Effect.gen(function* () {
+        // Mock 2 soft-deleted tombstones in the partition
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              itemId: "i-1",
+              name: "first",
+              createdAt: "2024-01-15T00:00:00Z",
+              updatedAt: "2024-01-16T00:00:00Z",
+              version: 1,
+              deletedAt: "2024-01-16T00:00:00Z",
+              pk: "$myapp#v1#softitem#i-1",
+              sk: "$myapp#v1#softitem#deleted#2024-01-16T00:00:00Z",
+              __edd_e__: "SoftItem",
+            }),
+            toAttributeMap({
+              itemId: "i-1",
+              name: "second",
+              createdAt: "2024-01-17T00:00:00Z",
+              updatedAt: "2024-01-18T00:00:00Z",
+              version: 1,
+              deletedAt: "2024-01-18T00:00:00Z",
+              pk: "$myapp#v1#softitem#i-1",
+              sk: "$myapp#v1#softitem#deleted#2024-01-18T00:00:00Z",
+              __edd_e__: "SoftItem",
+            }),
+          ],
+        })
+
+        const bound = yield* Entity.bind(SoftDeleteEntity)
+        const tombstones = yield* bound.deleted
+          .list({ itemId: "i-1" })
+          .reverse()
+          .collect()
+
+        expect(tombstones).toHaveLength(2)
+        // Verify the underlying QueryCommandInput shape
+        expect(mockQuery).toHaveBeenCalledOnce()
+        const call = mockQuery.mock.calls[0]![0]
+        expect(call.TableName).toBe("test-table")
+        // .reverse() flips ScanIndexForward to false
+        expect(call.ScanIndexForward).toBe(false)
+      }).pipe(Effect.provide(TestLayer)),
+    )
   })
 
   // ---------------------------------------------------------------------------

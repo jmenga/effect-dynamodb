@@ -44,7 +44,7 @@ DynamoDB Local doesn't validate credentials — any values will work. The inline
 ## Installation
 
 ```bash
-pnpm add effect-dynamodb effect @effect/experimental @aws-sdk/client-dynamodb @aws-sdk/util-dynamodb
+pnpm add effect-dynamodb effect @aws-sdk/client-dynamodb @aws-sdk/util-dynamodb
 ```
 
 ## Quick Start: A Single Entity
@@ -167,7 +167,7 @@ Effect.runPromise(main)
 ```
 
 :::note
-`createTable()` uses `PAY_PER_REQUEST` billing by default, which is ideal for development. For production, configure billing mode via `db.createTable({ billingMode: "PROVISIONED" })` or create the table through infrastructure-as-code (CloudFormation, CDK, Terraform).
+`create()` uses `PAY_PER_REQUEST` billing by default, which is ideal for development. For production, configure billing mode via `db.tables.MainTable.create({ billingMode: "PROVISIONED" })` or create the table through infrastructure-as-code (CloudFormation, CDK, Terraform).
 :::
 
 Save this as `quickstart.ts` and run it:
@@ -175,6 +175,12 @@ Save this as `quickstart.ts` and run it:
 ```bash
 npx tsx quickstart.ts
 ```
+
+:::note[Coming from Effect v3?]
+Notice that every operation above is called on `db.entities.TodoEntity` (the **bound entity** returned from `DynamoClient.make(...)`), not on the `TodoEntity` definition directly. That's deliberate. In Effect v4, `TodoEntity.get(...)` returns a Yieldable **operation descriptor**, not an `Effect` — `yield* TodoEntity.get(key)` works inside `Effect.gen`, but `TodoEntity.get(key).pipe(Effect.map(...))` does not (this matches v4's `Option`-is-not-an-Effect convention).
+
+`db.entities.TodoEntity.get(key)` auto-wraps the descriptor into a real `Effect<A, E, never>`, so you get straightforward `pipe`/`Effect.map`/`Effect.flatMap` ergonomics. **Use `db.entities.X` from `DynamoClient.make()` for day-to-day code.** Reach for raw entity descriptors only when you need to compose them into a `Transaction`/`Batch` or to swap decode modes — see the [Entity reference](/effect-dynamodb/reference/api-reference/#entity) for details.
+:::
 
 ### What Gets Stored in DynamoDB
 
@@ -197,7 +203,7 @@ The key format (`$myapp#v1#todo#t-1`) is automatically generated from the schema
 
 ### Language Service Plugin
 
-The TypeScript Language Service Plugin enhances IDE hover tooltips to show the DynamoDB operations that effect-dynamodb will execute. Hover over `Users.get(...)`, `Users.query.byRole(...)`, or any entity operation to see the underlying DynamoDB command, key structure, and index being used.
+The TypeScript Language Service Plugin enhances IDE hover tooltips to show the DynamoDB operations that effect-dynamodb will execute. Hover over `db.entities.Users.get(...)`, `db.entities.Users.byRole(...)`, or any entity operation to see the underlying DynamoDB command, key structure, and index being used.
 
 ```bash
 pnpm add -D @effect-dynamodb/language-service

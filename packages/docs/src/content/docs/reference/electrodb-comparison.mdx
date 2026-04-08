@@ -43,8 +43,8 @@ ElectroDB is the most feature-rich existing DynamoDB ORM for TypeScript. This co
 | Named access patterns | Yes | Yes (index names on Entity) | Parity |
 | Composite key composition | Attribute arrays | ElectroDB-style attribute arrays | Parity |
 | Key casing | `"upper"/"lower"/"none"/"default"` | `"lowercase"/"uppercase"/"preserve"` | Parity |
-| Isolated indexes | `type: "isolated"` (default) | Supported | Parity |
-| Clustered indexes | `type: "clustered"` | Supported (default for collections) | Parity |
+| Isolated indexes | `type: "isolated"` (default) | `type: "isolated"` (default) | Parity |
+| Clustered indexes | `type: "clustered"` | Supported (opt-in via `type: "clustered"`; required for sub-collections) | Parity |
 | Sparse indexes | `condition` callback | Auto-sparse via `tryComposeIndexKeys` (missing composites skip GSI) | Parity |
 | Sub-collections | `collection: ["parent", "child"]` | `collection: ["parent", "child"]` | Parity |
 | Custom key templates | `template: "${attr}_suffix"` | Not supported (attribute-list only) | ElectroDB only — intentional (see note 2) |
@@ -118,7 +118,7 @@ ElectroDB is the most feature-rich existing DynamoDB ORM for TypeScript. This co
 | Entity isolation | `__edb_e__` + `__edb_v__` | `__edd_e__` discriminator | Parity |
 | Schema versioning | `model.version` | `DynamoSchema.version` | Parity |
 | Application namespace | `model.service` | `DynamoSchema.name` | Parity |
-| DynamoDB Streams parsing | `entity.parse()` utility | `Entity.marshalledSchema()`, `Entity.itemSchema()` | Parity |
+| DynamoDB Streams parsing | `entity.parse()` utility | `Entity.itemSchema()` and `Entity.decodeMarshalledItem()` | Parity |
 | Timestamps | Manual (watch/set/default recipe) | Built-in `timestamps` config with configurable storage format | **Advantage** |
 | Version tracking | Not built-in | Built-in `versioned` config with auto-increment | **Advantage** |
 | Version history/snapshots | Not built-in | Built-in `versioned: { retain: true }` — atomic snapshot on every write | **Advantage** |
@@ -220,7 +220,7 @@ These are capabilities that ElectroDB does not provide:
 
 5. **Effect integration** — Full Effect ecosystem: Layer-based DI, 20 tagged errors with `catchTag`, Stream-based pagination, resource management, composable pipelines, dual APIs. This is the primary architectural differentiator.
 
-6. **9 derived types** — One entity declaration automatically produces Model, Record, Input, Update, Key, Item, Marshalled types plus ref-aware Input and Update variants. ElectroDB has fewer derived types and no marshalled/item distinction.
+6. **7 derived types** — One entity declaration automatically produces Model, Record, Input, Update, Key, Item, and Marshalled types (ref-aware Input/Update variants are derived from these). ElectroDB has fewer derived types and no marshalled/item distinction.
 
 7. **Date schema system** — 9 built-in date schemas covering `DateTime.Utc`, `DateTime.Zoned`, and native `Date` with configurable storage formats (ISO string, epoch ms, epoch seconds) and a `storedAs` modifier for runtime format switching.
 

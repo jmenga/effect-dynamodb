@@ -43,7 +43,7 @@
     "lint:fix": "biome check --write ."
   },
   "dependencies": {
-    "@effect-dynamodb/core": "workspace:*",
+    "effect-dynamodb": "workspace:*",
     "effect": "4.0.0-beta.43",
     "h3-js": "^4.2.1"
   },

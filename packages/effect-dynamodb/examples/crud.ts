@@ -506,8 +506,8 @@ const program = Effect.gen(function* () {
   const aliceV2 = yield* db.entities.Users.getVersion({ userId: "u-alice" }, 2)
   // aliceV2.displayName → "Alice W.", aliceV2.role → "member"
 
-  // Query all version snapshots
-  const allVersions = yield* db.entities.Users.collect(Users.versions({ userId: "u-alice" }))
+  // Query all version snapshots — fluent BoundQuery
+  const allVersions = yield* db.entities.Users.versions({ userId: "u-alice" }).collect()
   // → [{ version: 1, ... }, { version: 2, ... }, { version: 3, ... }]
 
   // Non-existent version → ItemNotFound

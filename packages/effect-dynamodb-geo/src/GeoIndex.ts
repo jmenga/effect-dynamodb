@@ -15,7 +15,7 @@ import type {
   Table,
   UniqueConstraintViolation,
   ValidationError,
-} from "@effect-dynamodb/core"
+} from "effect-dynamodb"
 import { Effect, type Schema, type ServiceMap } from "effect"
 import * as _GeoSearch from "./GeoSearch.js"
 import * as H3 from "./H3.js"

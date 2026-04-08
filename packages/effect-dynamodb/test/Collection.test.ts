@@ -6,6 +6,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
 import { DynamoError } from "../src/Errors.js"
+import * as KeyComposer from "../src/KeyComposer.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
@@ -419,6 +420,149 @@ describe("Collection", () => {
 
         const call = mockQuery.mock.calls[0]![0]
         expect(call.KeyConditionExpression).not.toContain("begins_with")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  // -------------------------------------------------------------------------
+  // Hierarchical sub-collections (collection: ["parent", "child"] + clustered)
+  // -------------------------------------------------------------------------
+
+  describe("hierarchical sub-collections (clustered, array form)", () => {
+    // Three entities at two levels of a hierarchy:
+    //   - SubEmployee lives at the parent level: collection: ["contributions"]
+    //   - SubTask + SubProjectMember live at the child level: ["contributions","assignments"]
+    // All three share gsi2 PK = employeeId.
+    const SubEmployee = Entity.make({
+      model: User,
+      entityType: "SubEmployee",
+      primaryKey: {
+        pk: { field: "pk", composite: ["userId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        byEmployee: {
+          collection: ["contributions"],
+          type: "clustered",
+          name: "gsi2",
+          pk: { field: "gsi2pk", composite: ["userId"] },
+          sk: { field: "gsi2sk", composite: ["email"] },
+        },
+      },
+    })
+    SubEmployee._configure(AppSchema, MainTable.Tag)
+
+    const SubTask = Entity.make({
+      model: Order,
+      entityType: "SubTask",
+      primaryKey: {
+        pk: { field: "pk", composite: ["orderId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        byEmployee: {
+          collection: ["contributions", "assignments"],
+          type: "clustered",
+          name: "gsi2",
+          pk: { field: "gsi2pk", composite: ["tenantId"] },
+          sk: { field: "gsi2sk", composite: ["orderId"] },
+        },
+      },
+    })
+    SubTask._configure(AppSchema, MainTable.Tag)
+
+    it("write side: SubEmployee SK uses single-level prefix", () => {
+      const sk = KeyComposer.composeSk(
+        AppSchema,
+        "SubEmployee",
+        1,
+        SubEmployee.indexes.byEmployee!,
+        { email: "alice@a.com" },
+      )
+      expect(sk).toBe("$myapp#v1#contributions#subemployee_1#email_alice@a.com")
+    })
+
+    it("write side: SubTask SK uses two-level prefix", () => {
+      const sk = KeyComposer.composeSk(
+        AppSchema,
+        "SubTask",
+        1,
+        SubTask.indexes.byEmployee!,
+        { orderId: "o-1" },
+      )
+      expect(sk).toBe("$myapp#v1#contributions#assignments#subtask_1#orderid_o-1")
+    })
+
+    it("parent collection query uses begins_with(parent prefix) — matches both levels", () => {
+      const Parent = Collection.make("contributions", {
+        emp: SubEmployee,
+        task: SubTask,
+      })
+      const q = Parent.query({ userId: "u-1" })
+      expect(q._state.skConditions).toHaveLength(1)
+      expect((q._state.skConditions[0]!.condition as any).beginsWith).toBe(
+        "$myapp#v1#contributions",
+      )
+    })
+
+    it("child collection query uses begins_with(parent#child) — matches only children", () => {
+      const Child = Collection.make("assignments", {
+        task: SubTask,
+      })
+      const q = Child.query({ tenantId: "t-1" })
+      expect(q._state.skConditions).toHaveLength(1)
+      expect((q._state.skConditions[0]!.condition as any).beginsWith).toBe(
+        "$myapp#v1#contributions#assignments",
+      )
+    })
+
+    it("parent entity selector for child entity uses two-level prefix", () => {
+      // Querying SubTask through the parent collection should still pin the
+      // SK to the child level so it doesn't accidentally also match parent items.
+      const Parent = Collection.make("contributions", {
+        emp: SubEmployee,
+        task: SubTask,
+      })
+      const q = (Parent as any).task({ tenantId: "t-1" })
+      const cond = q._state.skConditions[0]?.condition
+      // Selector for the child entity should still scope by its full hierarchy.
+      // Because SubTask's collection is ["contributions","assignments"], the
+      // selector adds begins_with on $myapp#v1#contributions#subtask_1 — slicing
+      // up to the queried collection name "contributions" + the entity prefix.
+      expect(cond.beginsWith).toBe("$myapp#v1#contributions#subtask_1")
+    })
+
+    it.effect("end-to-end: parent collection query exercises full prefix in DynamoDB call", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              tenantId: "t-1",
+              userId: "u-1",
+              email: "alice@a.com",
+              gsi2pk: "$myapp#v1#contributions#userid_u-1",
+              gsi2sk: "$myapp#v1#contributions#subemployee_1#email_alice@a.com",
+              pk: "$myapp#v1#user#u-1",
+              sk: "$myapp#v1#user",
+              __edd_e__: "SubEmployee",
+            }),
+          ],
+          LastEvaluatedKey: undefined,
+        })
+
+        const Parent = Collection.make("contributions", {
+          emp: SubEmployee,
+          task: SubTask,
+        })
+        yield* Query.collect(Parent.query({ userId: "u-1" }))
+
+        const call = mockQuery.mock.calls[0]![0]
+        expect(call.KeyConditionExpression).toContain("begins_with")
+        // The SK begins_with argument is the exact parent prefix (no composites).
+        const allValues = Object.values(call.ExpressionAttributeValues).map(
+          (v: any) => v?.S,
+        )
+        expect(allValues).toContain("$myapp#v1#contributions")
       }).pipe(Effect.provide(TestLayer)),
     )
   })

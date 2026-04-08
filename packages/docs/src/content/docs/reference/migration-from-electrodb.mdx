@@ -22,8 +22,8 @@ This guide helps ElectroDB users understand effect-dynamodb. It maps ElectroDB c
 | `default: value` | Schema defaults | `Schema.withDefault(Schema.String, () => "default")` |
 | `validate: RegExp` | `Schema.pattern()` / `.check()` | Composable, named validation |
 | Key templates (`"USER#${userId}"`) | `composite: ["userId"]` | Attribute-list composition, not template strings |
-| `entity.put(data).go()` | `yield* bound.put(data)` | Destructure from `DynamoClient.make(table)`, returns Effect |
-| `entity.get(key).go()` | `yield* bound.get(key)` | Destructure from `DynamoClient.make(table)`, returns Effect |
+| `entity.put(data).go()` | `yield* db.entities.E.put(data)` | Access via `db.entities.*` from `DynamoClient.make({ entities, tables })`, returns Effect |
+| `entity.get(key).go()` | `yield* db.entities.E.get(key)` | Access via `db.entities.*` from `DynamoClient.make({ entities, tables })`, returns Effect |
 | `entity.query.<name>(key).go()` | `db.entities.E.indexName(pk).collect()` | Entity index accessor on typed client, BoundQuery terminal |
 | `entity.create(data).go()` | `yield* bound.create(data)` | Put with `attribute_not_exists` condition |
 | `entity.upsert(data).go()` | `yield* bound.upsert(data)` | Create or update with `if_not_exists` for immutable fields |
@@ -137,7 +137,11 @@ await User.delete({ userId: "u-1" }).go()
 ```typescript
 const program = Effect.gen(function* () {
   // Get typed client with executable operations
-  const { UserEntity: users } = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { UserEntity },
+    tables: { MainTable },
+  })
+  const users = db.entities.UserEntity
 
   // Create
   const user = yield* users.put({
@@ -189,20 +193,23 @@ do {
 
 **effect-dynamodb:**
 ```typescript
-const db = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { UserEntity, TaskEntity },
+  tables: { MainTable },
+})
 
 // Query by index — entity accessor returns BoundQuery
-const userResults = yield* db.UserEntity.byEmail({ email: "a@b.com" }).collect()
+const userResults = yield* db.entities.UserEntity.byEmail({ email: "a@b.com" }).collect()
 
 // With filter and limit
-const taskResults = yield* db.TaskEntity
+const taskResults = yield* db.entities.TaskEntity
   .byProject({ projectId: "p-1" })
   .filter((t, { eq }) => eq(t.status, "active"))
   .limit(25)
   .collect()
 
 // Stream-based pagination (automatic)
-const stream = db.TaskEntity
+const stream = db.entities.TaskEntity
   .byProject({ projectId: "p-1" })
   .paginate()
 yield* Stream.runForEach(stream, (task) => processItem(task))
@@ -224,7 +231,11 @@ await User.update({ userId: "u-1" })
 
 **effect-dynamodb:**
 ```typescript
-const { UserEntity: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { UserEntity },
+  tables: { MainTable },
+})
+const users = db.entities.UserEntity
 
 yield* users.put(data, UserEntity.condition((t, { notExists }) => notExists(t.email)))
 
@@ -250,7 +261,11 @@ await Product.update({ productId: "p-1" })
 
 **effect-dynamodb:**
 ```typescript
-const { ProductEntity: products } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { ProductEntity },
+  tables: { MainTable },
+})
+const products = db.entities.ProductEntity
 
 yield* products.update(
   { productId: "p-1" },
@@ -281,7 +296,10 @@ const { data } = await myService.collections.byTenant({ tenantId: "t-1" }).go()
 // `collection` property. No explicit Collection.make() needed.
 // On UserEntity and OrderEntity, add: collection: "tenantMembers" to the index
 
-const db = yield* DynamoClient.make({ entities: { UserEntity, OrderEntity } })
+const db = yield* DynamoClient.make({
+  entities: { UserEntity, OrderEntity },
+  tables: { MainTable },
+})
 
 const data = yield* db.collections.tenantMembers({ tenantId: "t-1" }).collect()
 // { UserEntity: User[], OrderEntity: Order[] }
@@ -327,7 +345,11 @@ try {
 
 **effect-dynamodb:**
 ```typescript
-const { UserEntity: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { UserEntity },
+  tables: { MainTable },
+})
+const users = db.entities.UserEntity
 
 yield* users.get({ userId: "u-1" }).pipe(
   Effect.catchTag("ItemNotFound", () => Effect.succeed(null)),
@@ -353,7 +375,7 @@ Features that effect-dynamodb provides that ElectroDB does not:
 | **Table definition export** | `Table.definition()` generates `CreateTableCommandInput` for CloudFormation/CDK/testing. |
 | **4 decode modes** | `asModel` (clean domain), `asRecord` (with system fields), `asItem` (with DynamoDB keys), `asNative` (raw AttributeValue). |
 | **Dual APIs** | All public functions support both data-first and data-last (pipeable) calling conventions. |
-| **DynamoDB Streams decode** | `Entity.marshalledSchema()` and `Entity.itemSchema()` for typed stream record processing. |
+| **DynamoDB Streams decode** | `Entity.itemSchema()` and `Entity.decodeMarshalledItem()` for typed stream record processing. |
 
 ## What's Different
 

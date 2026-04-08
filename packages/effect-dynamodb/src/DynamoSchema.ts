@@ -142,29 +142,35 @@ export const composeCollectionKey = (
 /**
  * Compose a sort key for clustered collection indexes.
  *
- * Format: `$<schema>#v<version>#<collectionName>#<entityType>_<entityVersion>#<attr1>#<attr2>`
+ * Format (single collection):
+ *   `$<schema>#v<version>#<collectionName>#<entityType>_<entityVersion>#<attr1>#<attr2>`
+ *
+ * Format (sub-collection — when `collectionName` is an array):
+ *   `$<schema>#v<version>#<parent>#<child>#<entityType>_<entityVersion>#<attr1>#<attr2>`
+ *
+ * The hierarchy elements are joined with `#` so a `begins_with` query at any level
+ * matches every entity in that subtree.
  *
  * The entityVersion is the schema version for the entity type within the collection.
  * This allows different entity types in a collection to have their own sort key namespace.
  */
 export const composeClusteredSortKey = (
   schema: DynamoSchema,
-  collectionName: string,
+  collectionName: string | ReadonlyArray<string>,
   entityType: string,
   entityVersion: number,
   composites: ReadonlyArray<string>,
   options?: { readonly casing?: Casing | undefined; readonly names?: ReadonlyArray<string> | undefined } | undefined,
 ): string => {
-  const {
-    casing: effectiveCasing,
-    pre,
-    label: collection,
-  } = resolveKeyPrefix(schema, collectionName, options)
+  const effectiveCasing = options?.casing ?? schema.casing
+  const pre = prefix(schema)
+  const namesArray = Array.isArray(collectionName) ? collectionName : [collectionName]
+  const collectionParts = namesArray.map((n) => applyCasing(n, effectiveCasing))
   const type = applyCasing(entityType, effectiveCasing)
   const entityPrefix = `${type}_${entityVersion}`
 
   const formattedComposites = formatCompositeParts(composites, effectiveCasing, options?.names)
-  const parts = [pre, collection, entityPrefix, ...formattedComposites].filter((p) => p.length > 0)
+  const parts = [pre, ...collectionParts, entityPrefix, ...formattedComposites].filter((p) => p.length > 0)
   return parts.join("#")
 }
 

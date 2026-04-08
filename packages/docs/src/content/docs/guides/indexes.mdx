@@ -57,10 +57,7 @@ primaryKey: {
 
 ### GSI Access Patterns via Entity Indexes
 
-GSI access patterns are now defined directly on the entity via the `indexes` property. Each index specifies the physical GSI, PK composites, and SK composites:
-
-```typescript region="task-collections" example="guide-indexes.ts"
-```
+GSI access patterns are defined directly on the entity via the `indexes` property. Each index specifies the physical GSI, PK composites, and SK composites — see the `task-entity` block above for the canonical shape.
 
 ### Logical Names as API Surface
 
@@ -82,15 +79,15 @@ effect-dynamodb generates DynamoDB key values automatically from your composite 
 ### Format
 
 ```
-{schema}#{version}#{prefix}#{attr1}#{attr2}
+$<schema>#v<version>#<prefix>#<attrName>_<value>#<attrName>_<value>
 ```
 
-Given `DynamoSchema({ name: "myapp", version: 1 })` and `entityType: "Task"`:
+Each composite value is prefixed with its attribute name (separated by `_`) and segments are joined with `#`. Given `DynamoSchema({ name: "myapp", version: 1 })` and `entityType: "Task"`:
 
 | Composite | Generated Key |
 |-----------|---------------|
-| `["taskId"]` with value `"t-001"` | `$myapp#v1#task#t-001` |
-| `["projectId", "status"]` with values `"proj-alpha"`, `"active"` | `$myapp#v1#task#proj-alpha#active` |
+| `["taskId"]` with value `"t-001"` | `$myapp#v1#task#taskid_t-001` |
+| `["projectId", "status"]` with values `"proj-alpha"`, `"active"` | `$myapp#v1#task#projectid_proj-alpha#status_active` |
 | `[]` (empty) | `$myapp#v1#task` |
 
 ### Empty Composites
@@ -116,25 +113,24 @@ Both `pk.composite` and `sk.composite` can be empty arrays. The entity type pref
 
 ### Casing Resolution
 
-Structural key parts (schema name, entity type, collection name) follow casing rules. Resolution order:
+Casing is applied uniformly across the **entire generated key** — schema name, version prefix, entity type, collection name, **and composite attribute values**. Resolution order:
 
 1. Index-level `casing` (highest priority)
 2. Schema-level `casing` (default: `"lowercase"`)
 
-Attribute values are always preserved as-is.
+This means `"Emp-Alice"` and `"emp-alice"` produce identical keys under the default `"lowercase"` setting. The original attribute value casing is preserved on the stored attribute itself — only the composed key string is cased.
 
 ```typescript
-// With casing: "lowercase" and entityType: "Employee"
-// PK: $myapp#v1#employee#emp-Alice
-//     ^^^^^^^^ ^^ ^^^^^^^^          <- structural (lowercased)
-//                          ^^^^^^^^^ <- attribute value (preserved)
+// With casing: "lowercase", entityType: "Employee", employeeId: "Emp-Alice"
+// Composed PK:      $myapp#v1#employee#emp-alice
+// Stored attribute: employeeId = "Emp-Alice"  (original casing preserved)
 ```
 
 ## Collections
 
-Collections group multiple entity types that share a partition key, enabling cross-entity queries. Two modes are supported: **isolated** (default) and **clustered**.
+Collections group multiple entity types that share a partition key, enabling cross-entity queries. Two modes are supported: **isolated** (default) and **clustered**. Isolated keeps each entity's sort-key namespace separate so single-entity scans remain efficient; clustered places the collection name above each entity's sort key so all members are physically interleaved (required for sub-collections).
 
-### Isolated Collections (Default)
+### Isolated Collections
 
 Each entity owns its sort key prefix. Collection queries use only the partition key — no sort key condition.
 
@@ -183,14 +179,11 @@ const Equipments = Entity.make({
 })
 ```
 
-```typescript region="isolated-collection" example="guide-indexes.ts"
-```
-
 **Sort key format (isolated):**
 
 ```
-$myapp#v1#employee_1#2020-01-15     <- Employee entity owns its SK
-$myapp#v1#equipment_1#2023-06-01    <- Equipment entity owns its SK
+$myapp#v1#employee_1#hiredate_2020-01-15        <- Employee entity owns its SK
+$myapp#v1#equipment_1#purchasedate_2023-06-01   <- Equipment entity owns its SK
 ```
 
 **Query behavior:**
@@ -246,14 +239,11 @@ const ClusteredTasks = Entity.make({
 })
 ```
 
-```typescript region="clustered-collection" example="guide-indexes.ts"
-```
-
 **Sort key format (clustered):**
 
 ```
-$myapp#v1#tenantmembers#employee_1#engineering#2020-01-15
-$myapp#v1#tenantmembers#task_1#proj-alpha#t-001
+$myapp#v1#tenantmembers#employee_1#department_engineering#hiredate_2020-01-15
+$myapp#v1#tenantmembers#task_1#projectid_proj-alpha#taskid_t-001
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
 collection prefix (shared)
 ```
@@ -268,11 +258,21 @@ collection prefix (shared)
 
 **Best for:** Cross-entity queries, relationship-dense data.
 
-### Sub-Collections (Isolated Only)
+### Hierarchical Sub-Collections
 
-Sub-collections create a hierarchy within the sort key. Multiple collections share the same index, with members grouped at different depths:
+True parent/child sub-collections nest the collection hierarchy in the sort key so a `begins_with` query at the parent level returns the parent's items **and** every descendant. Two requirements:
+
+1. Use the array form on the entity index: `collection: ["parent", "child"]` (deeper levels add more elements).
+2. Use `type: "clustered"` so the SK puts the hierarchy above the entity-type prefix.
+
+In the example below, `Employee` lives at the parent level (`["contributions"]`) while `Task` and `ProjectMember` live one level deeper (`["contributions", "assignments"]`). All three share `gsi2` keyed on `employeeId`:
 
 ```typescript region="subcollection-entities" example="guide-indexes.ts"
+// True hierarchical sub-collections via the array form `collection: ["parent", "child"]`
+// + `type: "clustered"`. The full hierarchy is written into the SK so a begins_with
+// query at the parent level matches every descendant — querying "contributions"
+// returns SubEmployee + SubTasks + SubProjectMembers, while "assignments" returns
+// only SubTasks + SubProjectMembers.
 const SubEmployee = Entity.make({
   model: Employee,
   entityType: "Employee",
@@ -282,7 +282,8 @@ const SubEmployee = Entity.make({
   },
   indexes: {
     contributions: {
-      collection: "contributions",
+      collection: ["contributions"],
+      type: "clustered",
       name: "gsi2",
       pk: { field: "gsi2pk", composite: ["employeeId"] },
       sk: { field: "gsi2sk", composite: ["department"] },
@@ -300,7 +301,8 @@ const SubTasks = Entity.make({
   },
   indexes: {
     assignments: {
-      collection: "assignments",
+      collection: ["contributions", "assignments"],
+      type: "clustered",
       name: "gsi2",
       pk: { field: "gsi2pk", composite: ["employeeId"] },
       sk: { field: "gsi2sk", composite: ["projectId", "taskId"] },
@@ -318,7 +320,8 @@ const SubProjectMembers = Entity.make({
   },
   indexes: {
     assignments: {
-      collection: "assignments",
+      collection: ["contributions", "assignments"],
+      type: "clustered",
       name: "gsi2",
       pk: { field: "gsi2pk", composite: ["employeeId"] },
       sk: { field: "gsi2sk", composite: ["projectId"] },
@@ -328,27 +331,40 @@ const SubProjectMembers = Entity.make({
 })
 ```
 
-```typescript region="subcollection-collections" example="guide-indexes.ts"
-```
+**SK shape written by each entity:**
 
-**Sort key hierarchy:**
+| Entity | SK |
+|--------|----|
+| `SubEmployee` | `$myapp#v1#contributions#employee_1#department_engineering` |
+| `SubTasks` | `$myapp#v1#contributions#assignments#task_1#projectid_p-α#taskid_t-001` |
+| `SubProjectMembers` | `$myapp#v1#contributions#assignments#projectmember_1#projectid_p-α` |
 
-```
-$contributions
-+-- #assignments
-|   +-- #projectmembers_1#proj-alpha
-|   +-- #tasks_1#proj-alpha#t-001
-|   +-- #tasks_1#proj-beta#t-002
-+-- #employees_1#engineering
-```
+Both descendant SKs start with the parent prefix `$myapp#v1#contributions`, so a query at the parent level returns all three. The child query uses the longer prefix `$myapp#v1#contributions#assignments` and returns only the two descendant entities.
 
 **Query at any depth:**
 
-| Collection | SK condition | Returns |
-|------------|-------------|---------|
-| `contributions` | `begins_with "$contributions"` | Employee + Task + ProjectMember |
-| `assignments` | `begins_with "$contributions#assignments"` | Task + ProjectMember |
-| Single entity | `begins_with "$contributions#assignments#tasks_1"` | Task only |
+| Collection | begins_with prefix | Returns |
+|------------|-------------------|---------|
+| `contributions` | `$myapp#v1#contributions` | `Employee` + `Task` + `ProjectMember` |
+| `assignments` | `$myapp#v1#contributions#assignments` | `Task` + `ProjectMember` |
+
+```typescript
+// Parent — includes everything
+const contributions = yield* db.collections
+  .contributions({ employeeId: "emp-alice" })
+  .collect()
+// { SubEmployee: Employee[], SubTasks: Task[], SubProjectMembers: ProjectMember[] }
+
+// Child — only descendants
+const assignments = yield* db.collections
+  .assignments({ employeeId: "emp-alice" })
+  .collect()
+// { SubTasks: Task[], SubProjectMembers: ProjectMember[] }
+```
+
+:::note[When to use sub-collections]
+Sub-collections are an advanced pattern — they cost a clustered SK layout and require every entity in the hierarchy to share the same physical GSI. Reach for them when you need a single query to return multiple entity types in a strict parent/child relationship without doing N queries. For independent collections that just happen to share an index, use a single-element string (`collection: "name"`) instead.
+:::
 
 ### Defining Collections
 
@@ -378,7 +394,7 @@ indexes: {
 }
 ```
 
-When you call `DynamoClient.make(MainTable)`, the client auto-discovers that both entities share the `tenantMembers` collection and exposes `db.collections.tenantMembers(...)` as a cross-entity query accessor.
+When you call `DynamoClient.make({ entities, tables })`, the client auto-discovers that both entities share the `tenantMembers` collection and exposes `db.collections.tenantMembers(...)` as a cross-entity query accessor.
 
 ### Validation Rules
 
@@ -403,11 +419,13 @@ When you call `DynamoClient.make(MainTable)`, the client auto-discovers that bot
 
 ### DynamoDB Items
 
+Each composite value in a key is prefixed with its attribute name (e.g., `employeeid_emp-alice`). Structural parts (schema, entity type, collection) are cased according to the schema/index casing rules.
+
 | pk | sk | gsi1pk | gsi1sk | __edd_e__ |
 |----|----|--------|--------|------------|
-| `$myapp#v1#employee#emp-alice` | `$myapp#v1#employee` | `$myapp#v1#tenantmembers#t-acme` | `$myapp#v1#tenantmembers#employee_1#engineering#2024-01-15` | Employee |
-| `$myapp#v1#task#t-001` | `$myapp#v1#task` | `$myapp#v1#tenantmembers#t-acme` | `$myapp#v1#tenantmembers#task_1#proj-alpha#t-001` | Task |
-| `$myapp#v1#employee#emp-bob` | `$myapp#v1#employee` | `$myapp#v1#tenantmembers#t-acme` | `$myapp#v1#tenantmembers#employee_1#sales#2023-06-01` | Employee |
+| `$myapp#v1#employee#employeeid_emp-alice` | `$myapp#v1#employee` | `$myapp#v1#tenantmembers#tenantid_t-acme` | `$myapp#v1#tenantmembers#employee_1#department_engineering#hiredate_2024-01-15` | Employee |
+| `$myapp#v1#task#taskid_t-001` | `$myapp#v1#task` | `$myapp#v1#tenantmembers#tenantid_t-acme` | `$myapp#v1#tenantmembers#task_1#projectid_proj-alpha#taskid_t-001` | Task |
+| `$myapp#v1#employee#employeeid_emp-bob` | `$myapp#v1#employee` | `$myapp#v1#tenantmembers#tenantid_t-acme` | `$myapp#v1#tenantmembers#employee_1#department_sales#hiredate_2023-06-01` | Employee |
 
 ## What's Next?
 

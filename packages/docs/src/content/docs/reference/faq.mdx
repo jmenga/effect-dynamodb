@@ -11,13 +11,17 @@ Common questions and solutions for working with effect-dynamodb.
 
 ### How does the client gateway pattern work?
 
-Entity definitions created with `Entity.make()` are **not executable** — they carry type information, schemas, and index config. To get executable operations, register entities on a table with `Table.make({ schema, entities: {...} })`, then call `DynamoClient.make(table)` to get a typed client. This resolves `DynamoClient` and `TableConfig` from the Effect context and returns bound operations with `R = never`.
+Entity definitions created with `Entity.make()` are **not executable** — they carry type information, schemas, and index config. To get executable operations, register entities on a table with `Table.make({ schema, entities: {...} })`, then call `DynamoClient.make({ entities, tables })` to get a typed client. This resolves `DynamoClient` and `TableConfig` from the Effect context and returns bound operations with `R = never`.
 
 **The typed client provides executable operations:**
 
 ```typescript
 const program = Effect.gen(function* () {
-  const { Users: users } = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { Users },
+    tables: { MainTable },
+  })
+  const users = db.entities.Users
 
   const user = yield* users.get({ userId: "123" })
   yield* users.put({ userId: "456", name: "Alice" })
@@ -28,18 +32,24 @@ const program = Effect.gen(function* () {
 **Bound methods return Effects**, so they work naturally with Effect combinators:
 
 ```typescript
-const { Users: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { Users },
+  tables: { MainTable },
+})
 
 // Effect combinators work directly — no .asEffect() needed
-yield* users.get({ userId: "123" }).pipe(Effect.map((u) => u.name))
+yield* db.entities.Users.get({ userId: "123" }).pipe(Effect.map((u) => u.name))
 ```
 
 **For updates with combinators**, pass them as additional arguments to `update`:
 
 ```typescript
-const { Users: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { Users },
+  tables: { MainTable },
+})
 
-yield* users.update(
+yield* db.entities.Users.update(
   { userId: "123" },
   Entity.set({ name: "Alice" }),
   Entity.expectedVersion(1),
@@ -47,9 +57,9 @@ yield* users.update(
 ```
 
 **Rule of thumb:**
-- Use `DynamoClient.make(MainTable)` at the top of each `Effect.gen` block — destructure all entities you need
-- Use bound methods for all operations (`users.get`, `users.put`, `users.update`, `users.delete`, `users.upsert`, `users.restore`, `users.purge`, etc.)
-- Pass update combinators (`Entity.set`, `Entity.expectedVersion`, `EntityDef.condition`, etc.) as rest arguments to `users.update` / `users.patch`
+- Call `DynamoClient.make({ entities, tables })` at the top of each `Effect.gen` block — access entities via `db.entities.*`
+- Use bound methods for all operations (`db.entities.Users.get`, `.put`, `.update`, `.delete`, `.upsert`, `.restore`, `.purge`, etc.)
+- Pass update combinators (`Entity.set`, `Entity.expectedVersion`, `EntityDef.condition`, etc.) as rest arguments to `db.entities.Users.update` / `.patch`
 
 ---
 
@@ -82,7 +92,11 @@ When updating attributes that participate in a GSI's composite key, you must pro
 **Why?** GSI keys are recomposed from composite attributes on every update. If you provide only some composites, the library cannot build a complete key, and `extractComposites` will fail with an error.
 
 ```typescript
-const { Users: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { Users },
+  tables: { MainTable },
+})
+const users = db.entities.Users
 
 // Entity with GSI: byTenant has composite: ["tenantId", "region"]
 
@@ -137,7 +151,11 @@ const Orders = Entity.make({
 | **`upsert`** | Create-or-update atomically | Creates if missing, updates if exists | UpdateItem (with `if_not_exists`) |
 
 ```typescript
-const { Users: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { Users },
+  tables: { MainTable },
+})
+const users = db.entities.Users
 
 // put: overwrites if exists
 yield* users.put({ userId: "u-1", name: "Alice" })
@@ -180,7 +198,11 @@ const Users = Entity.make({
 **Accessing versions:**
 
 ```typescript
-const { Users: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { Users },
+  tables: { MainTable },
+})
+const users = db.entities.Users
 
 // Get a specific version
 const v2 = yield* users.getVersion({ userId: "u-1" }, 2)
@@ -228,7 +250,11 @@ const Users = Entity.make({
 **Recovery and cleanup:**
 
 ```typescript
-const { Users: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { Users },
+  tables: { MainTable },
+})
+const users = db.entities.Users
 
 // Read a deleted item
 const deleted = yield* users.deleted.get({ userId: "u-1" })
@@ -250,12 +276,16 @@ When an entity has both `softDelete` and `unique` constraints, the `preserveUniq
 
 **Symptom:** Entity operations from `Entity.make()` cannot be yielded or executed directly.
 
-**Cause:** `Entity.make()` returns a definition, not executable operations. You must use `DynamoClient.make(table)` to get a typed client first.
+**Cause:** `Entity.make()` returns a definition, not executable operations. You must use `DynamoClient.make({ entities, tables })` to get a typed client first.
 
-**Solution:** Use `DynamoClient.make(MainTable)` to get a typed client with executable methods:
+**Solution:** Use `DynamoClient.make({ entities, tables })` to get a typed client with executable methods:
 
 ```typescript
-const { Users: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { Users },
+  tables: { MainTable },
+})
+const users = db.entities.Users
 
 // BoundEntity methods return Effects — work with all combinators
 yield* users.get({ userId: "123" }).pipe(Effect.map((u) => u.name))
@@ -275,7 +305,11 @@ yield* users.update({ userId: "123" }, Entity.set({ name: "Alice" }))
 **Solution:** Provide all composite attributes for the affected GSI:
 
 ```typescript
-const { Users: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { Users },
+  tables: { MainTable },
+})
+const users = db.entities.Users
 
 // If the GSI has composite: ["tenantId", "region"]
 // Provide BOTH when updating either one
@@ -295,7 +329,11 @@ If you want to update a non-GSI field without touching the GSI, omit all GSI com
 **Solution:** Choose the appropriate operation for your intent:
 
 ```typescript
-const { Users: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { Users },
+  tables: { MainTable },
+})
+const users = db.entities.Users
 
 // Use put() to overwrite if exists
 yield* users.put({ userId: "u-1", name: "Alice" })
@@ -322,7 +360,11 @@ yield* users.create({ userId: "u-1", name: "Alice" }).pipe(
 **Solution:**
 
 ```typescript
-const { Users: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { Users },
+  tables: { MainTable },
+})
+const users = db.entities.Users
 
 yield* users.put({ userId: "u-1", email: "alice@example.com" }).pipe(
   Effect.catchTag("UniqueConstraintViolation", (e) =>
@@ -346,7 +388,11 @@ To update a unique field, provide the new value in `set()`. The library automati
 **Solution:** Re-read the item and retry:
 
 ```typescript
-const { Users: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { Users },
+  tables: { MainTable },
+})
+const users = db.entities.Users
 
 yield* users.update(
   { userId: "u-1" },
@@ -406,7 +452,11 @@ Check that all items in the partition are consistent. If items were written outs
 **Solution:**
 
 ```typescript
-const { Users: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { Users },
+  tables: { MainTable },
+})
+const users = db.entities.Users
 
 // Read the deleted item
 const item = yield* users.deleted.get({ userId: "u-1" })
@@ -449,7 +499,11 @@ type Result = MyOp extends EntityOp<infer A, any, any, any> ? A : never
 Update combinators (`set`, `expectedVersion`, `remove`, `add`, etc.) are module-level functions on `Entity`, not methods on the update object. Pass them as rest arguments to the bound `update` method:
 
 ```typescript
-const { Users: users } = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { Users },
+  tables: { MainTable },
+})
+const users = db.entities.Users
 
 // Pass combinators as rest arguments
 yield* users.update({ userId: "u-1" }, Entity.set({ name: "Alice" }))

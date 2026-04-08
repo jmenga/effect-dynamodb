@@ -136,8 +136,8 @@ const AppSchema = DynamoSchema.make({
 Schema versioning enables safe migrations. Items with `$projmgmt#v1#...` keys are completely isolated from `$projmgmt#v2#...` keys:
 
 ```
-$projmgmt#v1#employee#emp-alice    ← current production
-$projmgmt#v2#employee#emp-alice    ← new schema version (migration in progress)
+$projmgmt#v1#employee#employeeid_emp-alice    ← current production
+$projmgmt#v2#employee#employeeid_emp-alice    ← new schema version (migration in progress)
 ```
 
 This supports blue/green deployments and gradual rollback.
@@ -147,19 +147,18 @@ This supports blue/green deployments and gradual rollback.
 Multiple applications can share the same DynamoDB table with complete key isolation:
 
 ```
-$projmgmt#v1#employee#emp-alice    ← Project Management app
-$billing#v1#customer#cust-alice    ← Billing app
+$projmgmt#v1#employee#employeeid_emp-alice    ← Project Management app
+$billing#v1#customer#customerid_cust-alice    ← Billing app
 ```
 
 ### Casing
 
-Casing applies to **structural parts** of generated keys: schema name, version prefix, entity type, and collection name. Attribute values are always preserved as-is.
+Casing applies uniformly across the **entire generated key**: schema name, version prefix, entity type, collection name, composite attribute names, **and composite attribute values**. `"Male"` and `"male"` produce identical keys — this is important for case-insensitive lookups. The original attribute casing is preserved on the stored attribute value itself; only the composed key string is cased.
 
 ```typescript
-// With casing: "lowercase" and entityType: "Employee"
-// Key: $projmgmt#v1#employee#emp-alice
-//      ^^^^^^^^ ^^ ^^^^^^^^            ← structural parts (lowercased)
-//                           ^^^^^^^^^  ← attribute value (preserved)
+// With casing: "lowercase", entityType: "Employee", composite value "Emp-Alice"
+// Key:             $projmgmt#v1#employee#employeeid_emp-alice
+// Stored attribute: employeeId = "Emp-Alice"  (original casing preserved)
 ```
 
 ## Declaring the Physical Table
@@ -235,7 +234,7 @@ primaryKey: {
 }
 ```
 
-The `composite` array is an ordered list of model attribute names. The system generates the key value automatically: `$projmgmt#v1#employee#emp-alice`.
+The `composite` array is an ordered list of model attribute names. The system generates the key value automatically: `$projmgmt#v1#employee#employeeid_emp-alice`.
 
 GSI access patterns are defined on the entity via the `indexes` property. Collections are auto-discovered from entities sharing the same `collection` name on a GSI. See [Indexes & Collections](/effect-dynamodb/guides/indexes/) for full details.
 

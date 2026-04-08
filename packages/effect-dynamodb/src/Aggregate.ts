@@ -10,7 +10,7 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import { Effect, type Optic, Schema, SchemaAST } from "effect"
+import { Effect, type Optic, Schema, SchemaAST, type ServiceMap } from "effect"
 import * as Batch from "./Batch.js"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
 import type { DynamoEncoding } from "./DynamoModel.js"
@@ -156,6 +156,13 @@ export interface Aggregate<
   readonly [TypeId]: TypeId
   readonly _tag: "Aggregate"
   readonly schema: TSchema
+
+  /**
+   * @internal Tag of the table this aggregate is bound to. Used by
+   * `DynamoClient.make()` to group aggregates with their table for
+   * `db.tables.X.create()` GSI derivation.
+   */
+  readonly _tableTag: ServiceMap.Service<TableConfig, TableConfig>
 
   /** Primary key field name (e.g., "pk") */
   readonly pkField: string
@@ -584,6 +591,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
   return {
     [TypeId]: TypeId,
     _tag: "Aggregate",
+    _tableTag: config.table.Tag,
     schema,
     pkField: config.pk.field,
     collection: {
@@ -916,7 +924,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
  * Bind an Aggregate to resolved `DynamoClient` and `TableConfig` services.
  * Returns a {@link BoundAggregate} where all operations have `R = never`.
  *
- * @internal Used by `DynamoClient.make(table)` to bind aggregates.
+ * @internal Used by `DynamoClient.make()` to bind aggregates.
  */
 export const bind = <TSchema extends Schema.Top, TKey extends Record<string, unknown>, TInput>(
   aggregate: Aggregate<TSchema, TKey, TInput>,

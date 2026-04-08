@@ -113,7 +113,7 @@ Key configuration:
 
 ## Step 3: Typed Client and Create Items
 
-Before calling any entity operations, obtain a typed client via `DynamoClient.make({ entities })` to resolve the `DynamoClient` and `TableConfig` dependencies. The returned client provides bound entities and auto-discovered collection accessors where all operations have `R = never`:
+Before calling any entity operations, obtain a typed client via `DynamoClient.make({ entities })` to resolve the `DynamoClient` and `TableConfig` dependencies. The returned client provides bound entities (and, when entities declare a `collection` on their indexes, auto-discovered collection accessors) where all operations have `R = never`. None of the entities in this tutorial declare a collection, so `db.collections` is empty here — see the [Collections guide](/effect-dynamodb/guides/indexes/#collections) for the auto-discovery pattern.
 
 ```typescript region="client" example="crud.ts"
 // Typed execution gateway — binds all entities and collections
@@ -420,8 +420,8 @@ const aliceV1 = yield* db.entities.Users.getVersion({ userId: "u-alice" }, 1)
 const aliceV2 = yield* db.entities.Users.getVersion({ userId: "u-alice" }, 2)
 // aliceV2.displayName → "Alice W.", aliceV2.role → "member"
 
-// Query all version snapshots
-const allVersions = yield* db.entities.Users.collect(Users.versions({ userId: "u-alice" }))
+// Query all version snapshots — fluent BoundQuery
+const allVersions = yield* db.entities.Users.versions({ userId: "u-alice" }).collect()
 // → [{ version: 1, ... }, { version: 2, ... }, { version: 3, ... }]
 
 // Non-existent version → ItemNotFound
@@ -539,7 +539,7 @@ Effect.runPromise(main).then(
 
 ## What's Next?
 
-- [Human Resources Example](/effect-dynamodb/examples/human-resources/) -- Single-table design with 3 entities, 5 GSIs, collections, and transactions
+- [Human Resources Example](/effect-dynamodb/tutorials/human-resources/) -- Single-table design with 3 entities, 5 GSIs, collections, and transactions
 - [Modeling Guide](/effect-dynamodb/guides/modeling/) -- Deep dive into models, schemas, tables, and entities
 - [Lifecycle](/effect-dynamodb/guides/lifecycle/) -- Soft delete, versioning, and TTL
 - [Indexes & Collections](/effect-dynamodb/guides/indexes/) -- Access pattern design and collection patterns

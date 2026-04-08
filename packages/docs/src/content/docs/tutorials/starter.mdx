@@ -165,7 +165,7 @@ const program = Effect.gen(function* () {
     Entity.set({ status: "done", userId: "u-alice" }),
   )
 
-  // --- Query: tasks by user via collection ---
+  // --- Query: tasks by user via GSI index accessor ---
 
   const aliceTasks = yield* db.entities.Tasks.byUser({ userId: "u-alice" }).collect()
 
@@ -218,6 +218,6 @@ Effect.runPromise(main).then(
 
 ## Next Steps
 
-- [CRUD Operations](/tutorials/crud) — Deep dive into put, get, update, delete with combinators
-- [Indexes & Queries](/guides/indexes) — Design GSI access patterns with entity-level indexes
-- [Expressions](/tutorials/expressions) — Conditions, filters, and projections
+- [CRUD Operations](/effect-dynamodb/tutorials/crud/) — Deep dive into put, get, update, delete with combinators
+- [Indexes & Queries](/effect-dynamodb/guides/indexes/) — Design GSI access patterns with entity-level indexes
+- [Expressions](/effect-dynamodb/tutorials/expressions/) — Conditions, filters, and projections

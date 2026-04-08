@@ -13,17 +13,17 @@ Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table
 
 ### Client Gateway Pattern
 
-`DynamoClient.make(table)` is the **typed execution gateway** — the central pattern of this library:
+`DynamoClient.make({ entities, aggregates?, tables? })` is the **typed execution gateway** — the central pattern of this library. **There is only one form** — the table-shortcut overload was removed; the entity-centric form is canonical.
 
 1. `Entity.make({ model, primaryKey, indexes })` — entity defines domain model + primary key + GSI indexes (with optional `collection` property)
 2. `Table.make({ schema, entities: { Users, Tasks } })` — registers entities on a physical table
-3. `yield* DynamoClient.make(MainTable)` — resolves tables, auto-discovers collections from entity indexes, binds everything, returns typed client with `R = never`
-4. Access via `db.entities.*` (CRUD + query accessors), `db.collections.*` (auto-discovered cross-entity queries), `db.tables.*` (table management)
-5. Destructure in `ServiceMap.Service` for DI and layer-based testing
+3. `yield* DynamoClient.make({ entities: { Users, Tasks }, aggregates: { OrderAggregate }, tables: { MainTable } })` — binds the listed entities/aggregates, auto-discovers collections from entity indexes, and returns a typed client with `R = never`
+4. Access via `db.entities.*` (CRUD + query accessors), `db.aggregates.*` (bound aggregates), `db.collections.*` (auto-discovered cross-entity queries), `db.tables.*` (table management)
+5. Use the typed client inside `ServiceMap.Service` make effects for DI and layer-based testing
 
 ```
 ┌─────────────────────────────────────┐
-│  DynamoClient.make(table)           │  ← typed gateway (binds all members, R = never)
+│  DynamoClient.make({ entities, ... })│ ← typed gateway (binds all members, R = never)
 ├─────────────────────────────────────┤
 │  Aggregate / GeoIndex / EventStore  │  ← orchestration (decompose, assemble, diff)
 ├─────────────────────────────────────┤
@@ -42,8 +42,8 @@ Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table
 1. Define model with `Schema.Class` (or `Schema.Struct`) — pure domain fields only. Use `DynamoModel.configure(model, { field: { immutable: true } })` for fields that shouldn't change after creation.
 2. Create entity definition with `Entity.make({ model, entityType, primaryKey, indexes?, timestamps?, versioned?, softDelete?, unique? })` — primary key + GSI indexes. Use `collection` property on indexes for cross-entity queries.
 3. Register entity on a table: `Table.make({ schema, entities: { ..., MyEntity } })`.
-4. Access via typed client: `const db = yield* DynamoClient.make(MainTable)` → `db.entities.MyEntity.get(...)`, `db.entities.MyEntity.put(...)`, `db.entities.MyEntity.byIndex({...}).collect()`. Collections auto-discovered: `db.collections.myCollection({...}).collect()`.
-5. For services: destructure the client in `ServiceMap.Service` for DI and layer-based testing.
+4. Access via typed client: `const db = yield* DynamoClient.make({ entities: { MyEntity }, tables: { MainTable } })` → `db.entities.MyEntity.get(...)`, `db.entities.MyEntity.put(...)`, `db.entities.MyEntity.byIndex({...}).collect()`. Collections auto-discovered: `db.collections.myCollection({...}).collect()`.
+5. For services: build the typed client inside `ServiceMap.Service` make effects for DI and layer-based testing.
 6. Add unit tests in `test/` and update integration test if needed.
 
 ### Module Structure
@@ -64,7 +64,7 @@ packages/effect-dynamodb/src/
 ├── Projection.ts       # ProjectionExpression builder for selecting specific attributes
 ├── Aggregate.ts        # Graph-based composite domain model (decompose/assemble/diff)
 ├── EventStore.ts       # Event sourcing with ordered event streams per aggregate
-├── DynamoClient.ts     # ServiceMap.Service wrapping AWS SDK + DynamoClient.make(table) typed gateway
+├── DynamoClient.ts     # ServiceMap.Service wrapping AWS SDK + DynamoClient.make({ entities, aggregates?, tables? }) typed gateway
 ├── Marshaller.ts       # Thin wrapper around @aws-sdk/util-dynamodb
 ├── Errors.ts           # Tagged errors (DynamoError, ItemNotFound, ConditionalCheckFailed, ValidationError, TransactionCancelled, UniqueConstraintViolation)
 ├── internal/           # Decomposed internals
@@ -107,13 +107,13 @@ Errors → effect (Data)
 ### Data Flow
 
 ```
-User code → yield* DynamoClient.make(MainTable)
+User code → yield* DynamoClient.make({ entities: { Users, Tasks }, aggregates: { OrderAggregate }, tables: { MainTable } })
   → resolves DynamoClient service + TableConfig for each unique table
+  → binds the listed entities (CRUD + query accessors from index definitions)
+  → binds the listed aggregates (CRUD + list operations)
   → auto-discovers collections from entity index `collection` properties
-  → binds entities (CRUD + query accessors from index definitions)
-  → binds auto-discovered collections (cross-entity query accessors)
-  → builds table operations for each unique table
-  → returns typed client: { entities: { Users, Tasks }, collections: { assignments }, tables: { MainTable } }
+  → builds table operations for each registered table
+  → returns typed client: { entities: { Users, Tasks }, aggregates: { OrderAggregate }, collections: { assignments }, tables: { MainTable } }
 
 db.entities.Users.put(inputData)
   → Schema.decode(Entity.Input) — validate input
@@ -144,7 +144,7 @@ db.collections.assignments({ employee: "dfinlay" }).collect()
 | Raw AWS SDK (not @effect-aws) | Avoid extra dependency; thin wrapper is simple enough |
 | Effect Schema as sole schema system | Native Effect integration, bidirectional transforms, branded types |
 | Schema.Class/Struct for models | Pure domain schemas — no DynamoDB concepts in models. Entity derives DynamoDB types |
-| DynamoClient.make(table) as typed gateway | Table-centric client with namespaced access: `db.entities.*`, `db.collections.*`, `db.tables.*` |
+| DynamoClient.make({ entities, aggregates?, tables? }) as typed gateway | Entity-centric client with namespaced access: `db.entities.*`, `db.aggregates.*`, `db.collections.*`, `db.tables.*`. The table-shortcut overload was removed — entity-centric is the only form. |
 | Entities define primary key + GSI indexes | `Entity.make({ primaryKey, indexes })` — entity is self-contained. Collections auto-discovered from `collection` property on indexes |
 | Collections auto-discovered from entity indexes | No explicit `Collections.make()` needed. Entities sharing the same `collection` name on the same physical GSI are grouped automatically |
 | BoundQuery fluent builder | `.filter().limit().collect()` — reads naturally, type-safe through method chaining, no `asEffect()` needed |

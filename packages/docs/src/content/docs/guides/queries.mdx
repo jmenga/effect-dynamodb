@@ -12,7 +12,10 @@ Queries in effect-dynamodb are **fluent chains** with pre-resolved services. A c
 ```typescript
 import { DynamoClient } from "effect-dynamodb"
 
-const db = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { TaskEntity },
+  tables: { MainTable },
+})
 
 // Construct and execute a query in one chain
 const results = yield* db.entities.TaskEntity
@@ -44,9 +47,26 @@ const assigneeTasks = yield* db.entities.TaskEntity.byAssignee({
 
 | Definition | Accessor | Argument Type |
 |-----------|----------|---------------|
-| `primaryKey: { pk: { composite: ["taskId"] }, ... }` | `tasks.get(...)` | `{ taskId: string }` |
+| `primaryKey: { pk: { composite: ["taskId"] }, ... }` | `db.entities.TaskEntity.get(...)` | `{ taskId: string }` |
 | `indexes: { byProject: { name: "gsi1", pk: { composite: ["projectId"] }, ... } }` | `db.entities.TaskEntity.byProject(...)` | `{ projectId: string }` |
 | `indexes: { byAssignee: { name: "gsi2", pk: { composite: ["assigneeId"] }, ... } }` | `db.entities.TaskEntity.byAssignee(...)` | `{ assigneeId: string }` |
+
+## Sort Key Conditions
+
+`.where()` adds a `KeyConditionExpression` against a remaining sort key composite — DynamoDB evaluates it on the index server-side, so it **does** reduce read capacity. Use it whenever the condition is on a sort-key composite the accessor hasn't already pinned. Operators: `eq`, `lt`, `lte`, `gt`, `gte`, `between`, `beginsWith`.
+
+```typescript
+// Index: byProject — pk: ["projectId"], sk: ["status", "createdAt"]
+// `.byProject({ projectId })` pins the PK; `status` + `createdAt` remain on the SK.
+
+const recentDone = yield* db.entities.TaskEntity
+  .byProject({ projectId: "proj-alpha" })
+  .where((t, { eq }) => eq(t.status, "done"))
+  .where((t, { gt }) => gt(t.createdAt, "2026-01-01"))
+  .collect()
+```
+
+`.where()` is **only available on a `BoundQuery` whose remaining SK composites are non-empty.** Once you have already supplied every SK composite to the accessor (or after a previous `.where()` consumes them), the method is no longer present on the type — calling it is a compile error. This makes it impossible to issue a sort-key condition that DynamoDB would reject at runtime.
 
 ## Post-Query Filtering
 
@@ -80,7 +100,10 @@ See the [Expressions Guide](/effect-dynamodb/guides/expressions/) for the comple
 Collection queries return all member entity types, grouped by member name.
 
 ```typescript
-const db = yield* DynamoClient.make(MainTable)
+const db = yield* DynamoClient.make({
+  entities: { ClusteredEmployees, ClusteredTasks },
+  tables: { MainTable },
+})
 
 // All entities in the collection (auto-discovered from entity indexes with collection: "tenantMembers")
 const { ClusteredEmployees, ClusteredTasks } = yield* db.collections
@@ -89,23 +112,25 @@ const { ClusteredEmployees, ClusteredTasks } = yield* db.collections
 // ClusteredEmployees: Employee[], ClusteredTasks: Task[]
 ```
 
-### Sub-Collection Queries
+### Hierarchical Sub-Collections
 
-Query at different depths of the collection hierarchy:
+Use the array form `collection: ["parent", "child"]` together with `type: "clustered"` to nest entities in a hierarchy. A query at the parent level returns the parent's items **and** every descendant; a query at a child level returns only items at that level or deeper.
 
 ```typescript
-// All contributions (Employee + Task + ProjectMember)
-const all = yield* db.collections
+// Parent — returns Employee + Task + ProjectMember (everything in the partition)
+const contributions = yield* db.collections
   .contributions({ employeeId: "emp-alice" })
   .collect()
 // { SubEmployee: Employee[], SubTasks: Task[], SubProjectMembers: ProjectMember[] }
 
-// Only assignments (Task + ProjectMember) — sub-collection
-const assignmentResults = yield* db.collections
+// Child — returns only the deeper-level entities
+const assignments = yield* db.collections
   .assignments({ employeeId: "emp-alice" })
   .collect()
 // { SubTasks: Task[], SubProjectMembers: ProjectMember[] }
 ```
+
+For independent collections that just happen to share an index (no parent/child relationship), use a single string instead of an array (`collection: "name"`). See the [Indexes & Collections guide](/effect-dynamodb/guides/indexes/#hierarchical-sub-collections) for the full pattern, SK shape, and trade-offs.
 
 ## Pagination
 
@@ -127,7 +152,7 @@ const allProjectTasks = yield* db.entities.TaskEntity.byProject({
 ```typescript region="single-page" example="guide-queries.ts"
 // Single page with limit — returns page with items and cursor
 const page = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" }).limit(3).fetch()
-// page.items: { Tasks: Task[] } (up to 3 items)
+// page.items: Task[] (up to 3 items)
 // page.cursor: string | null (pass to startFrom for next page)
 ```
 
@@ -198,7 +223,7 @@ yield* Stream.runForEach(scanStream, (t) => Console.log(`  Scanned: ${t.taskId} 
 | Cost | Low (proportional to results) | High (proportional to table size) |
 | Use cases | Normal application queries | Admin tools, migrations, data exports, analytics |
 
-Scan automatically filters by `__edd_e__` -- even in a single-table design, `Products.scan()` only returns Product items.
+Scan automatically filters by `__edd_e__` -- even in a single-table design, `db.entities.Tasks.scan()` only returns Task items.
 
 ## Consistent Reads
 
@@ -209,17 +234,14 @@ By default, DynamoDB reads are eventually consistent. For strong consistency, us
 const consistentTask = yield* TaskEntity.get({ taskId: "t-001" }).pipe(Entity.consistentRead())
 ```
 
-```typescript region="consistent-query" example="guide-queries.ts"
-// Consistent read on scan (applies to any BoundQuery)
-const consistentQuery = yield* tasks.scan().consistentRead().collect()
-```
-
 ```typescript region="consistent-scan" example="guide-queries.ts"
-// Consistent read on scan
+// Consistent read on scan (applies to any BoundQuery against the base table).
+// Note: DynamoDB GSIs do not support consistent reads — only the base table
+// and local secondary indexes do.
 const consistentScan = yield* tasks.scan().consistentRead().collect()
 ```
 
-Consistent reads cost 2x the read capacity of eventually-consistent reads. Use them when you need read-after-write consistency (e.g., immediately after a put or update).
+Consistent reads cost 2x the read capacity of eventually-consistent reads. Use them when you need read-after-write consistency (e.g., immediately after a put or update). **GSIs cannot serve consistent reads** — `consistentRead()` is only valid against the primary table or a local secondary index.
 
 ## Ordering
 
@@ -240,7 +262,10 @@ import { Effect, Layer, Stream } from "effect"
 import { DynamoClient } from "effect-dynamodb"
 
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { TaskEntity, ClusteredEmployees, ClusteredTasks },
+    tables: { MainTable },
+  })
 
   // --- Single entity scan with filter ---
   const activeTasks = yield* db.entities.TaskEntity.scan()

@@ -60,7 +60,11 @@ const assert = (cond: boolean, msg: string) => { if (!cond) throw new Error(`Ass
 const assertEq = <T>(a: T, b: T, msg: string) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`Assertion failed [${msg}]: ${JSON.stringify(a)} !== ${JSON.stringify(b)}`) }
 
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
+  const db = yield* DynamoClient.make({
+    entities: { Teams, Players, Coaches, Venues },
+    aggregates: { MatchAggregate },
+    tables: { MainTable },
+  })
   const client = yield* DynamoClient
   const tableConfig = yield* MainTable.Tag
 
@@ -89,14 +93,14 @@ const program = Effect.gen(function* () {
   })
 
   // Seed reference data
-  yield* db.Teams.put({ id: "aus", name: "Australia", country: "Australia", ranking: 1 })
-  yield* db.Teams.put({ id: "ind", name: "India", country: "India", ranking: 2 })
-  yield* db.Players.put({ id: "smith-01", firstName: "Steve", lastName: "Smith", role: "batter" })
-  yield* db.Players.put({ id: "cummins-01", firstName: "Pat", lastName: "Cummins", role: "bowler" })
-  yield* db.Players.put({ id: "kohli-01", firstName: "Virat", lastName: "Kohli", role: "batter" })
-  yield* db.Coaches.put({ id: "mcdonald", name: "Andrew McDonald" })
-  yield* db.Coaches.put({ id: "gambhir", name: "Gautam Gambhir" })
-  yield* db.Venues.put({ id: "mcg", name: "Melbourne Cricket Ground", city: "Melbourne" })
+  yield* db.entities.Teams.put({ id: "aus", name: "Australia", country: "Australia", ranking: 1 })
+  yield* db.entities.Teams.put({ id: "ind", name: "India", country: "India", ranking: 2 })
+  yield* db.entities.Players.put({ id: "smith-01", firstName: "Steve", lastName: "Smith", role: "batter" })
+  yield* db.entities.Players.put({ id: "cummins-01", firstName: "Pat", lastName: "Cummins", role: "bowler" })
+  yield* db.entities.Players.put({ id: "kohli-01", firstName: "Virat", lastName: "Kohli", role: "batter" })
+  yield* db.entities.Coaches.put({ id: "mcdonald", name: "Andrew McDonald" })
+  yield* db.entities.Coaches.put({ id: "gambhir", name: "Gautam Gambhir" })
+  yield* db.entities.Venues.put({ id: "mcg", name: "Melbourne Cricket Ground", city: "Melbourne" })
 
   // === Test 1: Validate MatchAggregate.createSchema ===
   yield* Console.log("Test 1: MatchAggregate.createSchema")
@@ -126,7 +130,7 @@ const program = Effect.gen(function* () {
 
   // === Test 2: Aggregate.create with ref hydration ===
   yield* Console.log("\nTest 2: Aggregate.create (ref hydration)")
-  const match = yield* MatchAggregate.create(createInput)
+  const match = yield* db.aggregates.MatchAggregate.create(createInput)
   assertEq(match.name, "AUS vs IND, 1st Test", "match name")
   assertEq(match.venue.name, "Melbourne Cricket Ground", "venue name hydrated")
   assertEq(match.team1.team.name, "Australia", "team1 hydrated")
@@ -138,7 +142,7 @@ const program = Effect.gen(function* () {
 
   // === Test 3: Aggregate.get ===
   yield* Console.log("\nTest 3: Aggregate.get")
-  const fetched = yield* MatchAggregate.get({ id: "bgt-2025-test-1" })
+  const fetched = yield* db.aggregates.MatchAggregate.get({ id: "bgt-2025-test-1" })
   assertEq(fetched.name, "AUS vs IND, 1st Test", "fetched match name")
   assertEq(fetched.team1.players.length, 2, "fetched team1 players")
   assertEq(fetched.venue.city, "Melbourne", "fetched venue city")
@@ -146,7 +150,7 @@ const program = Effect.gen(function* () {
 
   // === Test 4: Aggregate.update (cursor) ===
   yield* Console.log("\nTest 4: Aggregate.update (cursor replace)")
-  const renamed = yield* MatchAggregate.update({ id: "bgt-2025-test-1" }, ({ cursor }) =>
+  const renamed = yield* db.aggregates.MatchAggregate.update({ id: "bgt-2025-test-1" }, ({ cursor }) =>
     cursor.key("name").replace("AUS vs IND, Boxing Day Test"),
   )
   assertEq(renamed.name, "AUS vs IND, Boxing Day Test", "renamed match")
@@ -154,7 +158,7 @@ const program = Effect.gen(function* () {
 
   // === Test 5: Aggregate.update (captaincy transfer) ===
   yield* Console.log("\nTest 5: Aggregate.update (mutation)")
-  const updated = yield* MatchAggregate.update({ id: "bgt-2025-test-1" }, ({ cursor }) =>
+  const updated = yield* db.aggregates.MatchAggregate.update({ id: "bgt-2025-test-1" }, ({ cursor }) =>
     cursor.key("team1").key("players").modify((players) =>
       players.map((ps) => ({ ...ps, isCaptain: ps.player.lastName === "Smith" })),
     ),
@@ -167,13 +171,13 @@ const program = Effect.gen(function* () {
 
   // === Test 6: Aggregate.delete ===
   yield* Console.log("\nTest 6: Aggregate.delete")
-  yield* MatchAggregate.delete({ id: "bgt-2025-test-1" })
-  const getResult = yield* MatchAggregate.get({ id: "bgt-2025-test-1" }).pipe(Effect.flip)
+  yield* db.aggregates.MatchAggregate.delete({ id: "bgt-2025-test-1" })
+  const getResult = yield* db.aggregates.MatchAggregate.get({ id: "bgt-2025-test-1" }).pipe(Effect.flip)
   assertEq(getResult._tag, "AggregateAssemblyError", "get after delete fails")
   yield* Console.log("  Delete and verify gone — OK")
 
   // Cleanup
-  yield* db.deleteTable()
+  yield* db.tables.MainTable.delete()
   yield* Console.log("\n=== All 6 tests passed ===")
 })
 

@@ -32,6 +32,9 @@ interface CollectionEntity {
   readonly schemas: {
     readonly recordSchema: Schema.Codec<any>
   }
+  readonly _decodeRecord: (
+    raw: globalThis.Record<string, unknown>,
+  ) => import("effect").Effect.Effect<any, import("./Errors.js").ValidationError>
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +105,7 @@ export const make = <
   let sharedDynamoIndexName: string | undefined
   let sharedSchema: ReturnType<typeof import("./DynamoSchema.js").make> | undefined
 
-  let collectionType: "isolated" | "clustered" = "clustered"
+  let collectionType: "isolated" | "clustered" = "isolated"
 
   for (const [, entity] of entityEntries) {
     for (const [indexName, indexDef] of Object.entries(entity.indexes)) {
@@ -114,7 +117,7 @@ export const make = <
         sharedSkField = indexDef.sk.field
         sharedDynamoIndexName = indexDef.index
         sharedSchema = entity._schema
-        collectionType = indexDef.type ?? "clustered"
+        collectionType = indexDef.type ?? "isolated"
         break
       }
     }
@@ -182,21 +185,12 @@ export const make = <
       )
     }
 
-    const recordSchema = entry.entity.schemas.recordSchema
-    return Schema.decodeUnknownEffect(recordSchema)(raw).pipe(
+    return entry.entity._decodeRecord(raw).pipe(
       Effect.map((decoded) => ({
         _entityKey: entry.key,
         _entityType: entityType,
         _decoded: decoded,
       })),
-      Effect.mapError(
-        (cause) =>
-          new ValidationError({
-            entityType,
-            operation: "collection.decode",
-            cause,
-          }),
-      ),
     )
   }
 
@@ -279,7 +273,6 @@ export const make = <
         pkComposites,
       )
 
-      const recordSchema = entity.schemas.recordSchema
       let q = Query.make({
         tableName: "",
         indexName: sharedDynamoIndexName,
@@ -287,25 +280,19 @@ export const make = <
         pkValue,
         skField: sharedSkField,
         entityTypes: [entity.entityType],
-        decoder: (raw) =>
-          Schema.decodeUnknownEffect(recordSchema)(raw).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ValidationError({
-                  entityType: entity.entityType,
-                  operation: "collection.selector.decode",
-                  cause,
-                }),
-            ),
-          ),
+        decoder: (raw) => entity._decodeRecord(raw),
         resolveTableName: entity._tableTag.useSync((tc: TableConfig) => tc.name),
       })
 
-      // Clustered entity selectors add begins_with on the entity SK prefix
+      // Clustered entity selectors add begins_with on the entity SK prefix.
+      // For sub-collections, the prefix uses the FULL hierarchy from root to
+      // the queried collection name, matching what composeSk writes at put time.
       if (collectionType === "clustered" && collectionSkPrefix) {
+        const coll = indexDef.collection
+        const hierarchy = Array.isArray(coll) ? coll.slice(0, coll.indexOf(name) + 1) : name
         const entitySkPrefix = DynamoSchema.composeClusteredSortKey(
           sharedSchema!,
-          name,
+          hierarchy,
           entity.entityType,
           1,
           [],

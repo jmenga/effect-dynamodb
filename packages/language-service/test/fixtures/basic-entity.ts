@@ -1,7 +1,7 @@
-import * as DynamoModel from "@effect-dynamodb/core/DynamoModel"
-import * as DynamoSchema from "@effect-dynamodb/core/DynamoSchema"
-import * as Entity from "@effect-dynamodb/core/Entity"
-import * as Table from "@effect-dynamodb/core/Table"
+import * as DynamoModel from "effect-dynamodb/DynamoModel"
+import * as DynamoSchema from "effect-dynamodb/DynamoSchema"
+import * as Entity from "effect-dynamodb/Entity"
+import * as Table from "effect-dynamodb/Table"
 import { Schema } from "effect"
 
 class User extends Schema.Class<User>("User")({

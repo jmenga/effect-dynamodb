@@ -105,11 +105,11 @@ describe("Collections.make", () => {
   })
 
   // -----------------------------------------------------------------------
-  // Default type is "clustered"
+  // Default type is "isolated"
   // -----------------------------------------------------------------------
 
-  describe("clustered default", () => {
-    it("defaults type to clustered when not specified", () => {
+  describe("isolated default", () => {
+    it("defaults type to isolated when not specified", () => {
       const col = Collections.make({
         name: "myCol",
         index: { name: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
@@ -119,7 +119,7 @@ describe("Collections.make", () => {
         },
       })
 
-      expect(col.type).toBe("clustered")
+      expect(col.type).toBe("isolated")
     })
   })
 
@@ -278,7 +278,7 @@ describe("Collections.buildMemberIndexDef", () => {
 
     expect(indexDef.index).toBe("gsi3")
     expect(indexDef.collection).toBe("assignments")
-    expect(indexDef.type).toBe("clustered")
+    expect(indexDef.type).toBe("isolated")
     expect(indexDef.pk).toEqual({ field: "gsi3pk", composite: ["employee"] })
     expect(indexDef.sk).toEqual({ field: "gsi3sk", composite: ["project", "task"] })
   })

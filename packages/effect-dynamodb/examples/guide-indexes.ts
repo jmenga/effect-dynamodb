@@ -198,6 +198,11 @@ const ClusteredTasks = Entity.make({
 // #endregion
 
 // #region subcollection-entities
+// True hierarchical sub-collections via the array form `collection: ["parent", "child"]`
+// + `type: "clustered"`. The full hierarchy is written into the SK so a begins_with
+// query at the parent level matches every descendant — querying "contributions"
+// returns SubEmployee + SubTasks + SubProjectMembers, while "assignments" returns
+// only SubTasks + SubProjectMembers.
 const SubEmployee = Entity.make({
   model: Employee,
   entityType: "Employee",
@@ -207,7 +212,8 @@ const SubEmployee = Entity.make({
   },
   indexes: {
     contributions: {
-      collection: "contributions",
+      collection: ["contributions"],
+      type: "clustered",
       name: "gsi2",
       pk: { field: "gsi2pk", composite: ["employeeId"] },
       sk: { field: "gsi2sk", composite: ["department"] },
@@ -225,7 +231,8 @@ const SubTasks = Entity.make({
   },
   indexes: {
     assignments: {
-      collection: "assignments",
+      collection: ["contributions", "assignments"],
+      type: "clustered",
       name: "gsi2",
       pk: { field: "gsi2pk", composite: ["employeeId"] },
       sk: { field: "gsi2sk", composite: ["projectId", "taskId"] },
@@ -243,7 +250,8 @@ const SubProjectMembers = Entity.make({
   },
   indexes: {
     assignments: {
-      collection: "assignments",
+      collection: ["contributions", "assignments"],
+      type: "clustered",
       name: "gsi2",
       pk: { field: "gsi2pk", composite: ["employeeId"] },
       sk: { field: "gsi2sk", composite: ["projectId"] },
@@ -523,22 +531,57 @@ const program = Effect.gen(function* () {
   // #endregion
 
   // #region subcollection-queries
-  // Top-level collection: everything for an employee
-  const { SubEmployee: allContributions } = yield* sub.collections.contributions!({
+  // Top-level collection: returns everything in the hierarchy for an employee.
+  // begins_with("$myapp#v1#contributions") matches the employee record AND all
+  // descendant tasks/project memberships in the same partition.
+  const contributions = yield* sub.collections.contributions!({
     employeeId: "emp-alice",
   }).collect()
 
-  // Sub-collection: only assignments (tasks + project members)
-  const { SubTasks: assignedTasks, SubProjectMembers: projectMemberships } = yield* sub.collections
-    .assignments!({ employeeId: "emp-alice" }).collect()
+  // Sub-collection: returns only items at the assignments level.
+  // begins_with("$myapp#v1#contributions#assignments") narrows to tasks + PMs.
+  const assignments = yield* sub.collections.assignments!({
+    employeeId: "emp-alice",
+  }).collect()
   // #endregion
 
-  assertEq(allContributions.length, 1, "contributions has 1 employee record")
-  assertEq(assignedTasks.length, 2, "assignments has 2 tasks")
-  assertEq(projectMemberships.length, 1, "assignments has 1 project member")
-  yield* Console.log(`  Contributions (employees): ${allContributions.length}`)
-  yield* Console.log(`  Assignments (tasks): ${assignedTasks.length}`)
-  yield* Console.log(`  Assignments (project members): ${projectMemberships.length}`)
+  // Parent collection includes all three entity types
+  assertEq(
+    (contributions as { SubEmployee: Array<unknown> }).SubEmployee.length,
+    1,
+    "contributions has 1 employee record",
+  )
+  assertEq(
+    (contributions as { SubTasks: Array<unknown> }).SubTasks.length,
+    2,
+    "contributions includes 2 tasks (children)",
+  )
+  assertEq(
+    (contributions as { SubProjectMembers: Array<unknown> }).SubProjectMembers.length,
+    1,
+    "contributions includes 1 project member (child)",
+  )
+  // Child collection includes only the deeper levels
+  assertEq(
+    (assignments as { SubTasks: Array<unknown> }).SubTasks.length,
+    2,
+    "assignments has 2 tasks",
+  )
+  assertEq(
+    (assignments as { SubProjectMembers: Array<unknown> }).SubProjectMembers.length,
+    1,
+    "assignments has 1 project member",
+  )
+  yield* Console.log(`  Contributions (parent): ${
+    (contributions as { SubEmployee: Array<unknown> }).SubEmployee.length
+  } employees + ${(contributions as { SubTasks: Array<unknown> }).SubTasks.length} tasks + ${
+    (contributions as { SubProjectMembers: Array<unknown> }).SubProjectMembers.length
+  } project members`)
+  yield* Console.log(`  Assignments (child): ${
+    (assignments as { SubTasks: Array<unknown> }).SubTasks.length
+  } tasks + ${
+    (assignments as { SubProjectMembers: Array<unknown> }).SubProjectMembers.length
+  } project members`)
 
   yield* sub.tables["guide-indexes-subcollection"]!.delete()
   yield* Console.log("  Sub-collection demo — OK\n")

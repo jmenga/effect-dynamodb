@@ -5,7 +5,7 @@
  * a record of named entities (and optionally aggregates).
  * The physical table name is provided at runtime via Effect Layers.
  *
- * Use `DynamoClient.make(table)` to get a typed client with bound entity operations.
+ * Use `DynamoClient.make()` to get a typed client with bound entity operations.
  */
 
 import type { DescribeTableCommandOutput } from "@aws-sdk/client-dynamodb"
@@ -297,7 +297,7 @@ export interface CreateTableOptions {
 /**
  * A bound table with executable operations (`R = never`).
  *
- * @internal Used by `DynamoClient.make(table)`.
+ * @internal Used by `DynamoClient.make()`.
  */
 export interface BoundTable {
   /** Physical table name. */

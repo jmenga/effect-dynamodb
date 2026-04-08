@@ -230,7 +230,7 @@ describe("Transaction", () => {
 
         expect(error._tag).toBe("ValidationError")
         expect((error as ValidationError).entityType).toBe("User")
-        expect((error as ValidationError).operation).toBe("transactGet")
+        expect((error as ValidationError).operation).toBe("decode")
       }).pipe(Effect.provide(TestLayer)),
     )
   })

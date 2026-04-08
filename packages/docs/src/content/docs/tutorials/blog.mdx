@@ -155,7 +155,9 @@ GSI1 is **overloaded** -- Posts use it for `byAuthor` (partitioned by `authorId`
 
 ---
 
-## Step 3: Seed Data
+## Step 3: Gateway, Table, and First Writes
+
+Resolve the typed gateway from the registered entities, create the physical table, and seed an initial user. The gateway (`db = yield* DynamoClient.make(...)`) is what every subsequent operation in this tutorial reaches through:
 
 ```typescript title="seed.ts" region="seed-data" example="blog.ts"
 // Typed execution gateway
@@ -338,5 +340,5 @@ Effect.runPromise(main).then(
 
 - [Modeling Guide](/effect-dynamodb/guides/modeling/) -- Deep dive into models, schemas, tables, and entities
 - [Queries Guide](/effect-dynamodb/guides/queries/) -- Sort key conditions, filters, and pagination
-- [Example: Shopping Mall](/effect-dynamodb/examples/shopping-mall/) -- Composite keys, `beginsWith`, and date range queries
-- [Example: Human Resources](/effect-dynamodb/examples/human-resources/) -- 3 entities, 5 GSIs, collections, and soft delete
+- [Example: Shopping Mall](/effect-dynamodb/tutorials/shopping-mall/) -- Composite keys, `beginsWith`, and date range queries
+- [Example: Human Resources](/effect-dynamodb/tutorials/human-resources/) -- 3 entities, 5 GSIs, collections, and soft delete

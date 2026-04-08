@@ -516,7 +516,7 @@ const { Repositories: hwRepoActivity } = yield* db.collections.activity!({
 }).collect()
 ```
 
-Because `status` is in the sort key for Issues and PullRequests on GSI2, items within a partition naturally group by status. Open items sort before Closed items.
+Because `status` is in the sort key for Issues and PullRequests on GSI2, items within a partition naturally group by status. Closed items sort before Open items (lexicographic order), so issues and PRs cluster by status within each repository partition.
 
 ### Pattern 8: Atomic Create (Transaction)
 
@@ -613,4 +613,4 @@ Effect.runPromise(main).then(
 - [Modeling Guide](/effect-dynamodb/guides/modeling/) -- Deep dive into models, schemas, tables, and entities
 - [Indexes & Collections](/effect-dynamodb/guides/indexes/) -- Access pattern design and collection patterns
 - [Queries](/effect-dynamodb/guides/queries/) -- Query combinators, filtering, and pagination
-- [Human Resources Example](/effect-dynamodb/examples/human-resources/) -- 3 entities, 5 GSIs, soft delete, and salary range queries
+- [Human Resources Example](/effect-dynamodb/tutorials/human-resources/) -- 3 entities, 5 GSIs, soft delete, and salary range queries
