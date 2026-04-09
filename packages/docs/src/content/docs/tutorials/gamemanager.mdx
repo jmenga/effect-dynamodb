@@ -8,8 +8,8 @@ Build a production-grade REST API for managing cricket matches, teams, players, 
 **What you'll build:** A cricket match management system with:
 - 5 standalone entities (Team, Player, Coach, Umpire, Venue)
 - Entity references with cascade updates (SquadSelection)
-- A complex Match aggregate with sub-aggregates (TeamSheet, UmpireSheet)
-- Full CRUD REST API with pagination, error handling, and validation
+- A Match aggregate composed of two TeamSheet sub-aggregates
+- Full CRUD REST API with pagination and error handling
 
 **How this tutorial works:** Rather than building all models, then all entities, then all services — we'll build one entity end-to-end, get the server running, and validate with curl. Then we'll add more entities iteratively, testing as we go.
 
@@ -215,6 +215,8 @@ import { Teams } from "./Teams.js"
 ```ts title="src/entities/Schema.ts" region="schema" example="cricket.ts"
 const CricketSchema = DynamoSchema.make({ name: "cricket", version: 1 })
 ```
+
+> **Note:** Add `export` before `const CricketSchema` — the region-synced code above omits it because the backing example is a single file. In your multi-file project, `Schema.ts` is imported by other modules (e.g., `MatchAggregate.ts` in Phase 5), so the schema must be exported.
 
 ```ts title="src/entities/Schema.ts"
 export const MainTable = Table.make({
@@ -712,6 +714,50 @@ You have a running API with full CRUD for Teams — model validation, branded ty
 ## Phase 3: Adding More Entities
 
 Each new entity follows the same pattern: model → entity → filter → service → API → handler → wire into App.ts. We'll add Player (introducing shared PersonFields), Coach, Umpire, and Venue.
+
+### 3.0 Shared enum schemas
+
+Several entities share enum-typed fields (gender, batting hand, player role). Centralize them in one file so every entity, filter, and curl payload uses the same set of values:
+
+```ts
+// src/models/Enums.ts
+import { Schema } from "effect"
+
+// Gender — used by Player, Coach, Umpire models and their list filters.
+export const GenderSchema = Schema.Literals(["Male", "Female"])
+export type Gender = typeof GenderSchema.Type
+
+// `GenderQuery` is the schema used in list filter query strings. It accepts the
+// same values as `GenderSchema`; we expose it under a separate name so list
+// filter schemas can evolve independently of the storage schema if needed.
+export const GenderQuery = GenderSchema
+export type GenderQuery = typeof GenderQuery.Type
+
+// Batting hand — used by Player.
+export const BattingHandSchema = Schema.Literals(["Left", "Right"])
+export type BattingHand = typeof BattingHandSchema.Type
+
+// Player role — used by SquadSelection (Phase 4) for the selection role.
+// Values match the example file's `PlayerRole` enum.
+export const PlayerRoleSchema = Schema.Literals([
+  "batter",
+  "bowler",
+  "all-rounder",
+  "wicket-keeper",
+])
+export type PlayerRole = typeof PlayerRoleSchema.Type
+```
+
+> **Pattern: Enums via `Schema.Literals`** — `Schema.Literals(["Male", "Female"])` produces a runtime-validated literal union schema whose `.Type` is `"Male" | "Female"`. Use the schema for runtime validation (in `Schema.Class` fields and `Schema.Struct` filters) and the type for TypeScript-only positions.
+
+> **Why a separate `GenderQuery`?** It's an alias of `GenderSchema` today, but having a distinct name for the filter input lets you evolve the two independently — for example, accepting both `"Male"` and `"male"` as query input via a transformed schema, while keeping the storage representation strict.
+
+`Filters.ts` (which we built in Phase 2.6 for `TeamListFilter`) imports `GenderQuery` for the new entity filters added in this phase. Update its imports to add the line below — every `*ListFilter` defined later in this phase relies on it:
+
+```ts
+// In src/models/Filters.ts — add this import alongside the existing `import { Schema } from "effect"`
+import { GenderQuery } from "./Enums.js"
+```
 
 ### 3.1 Shared person fields
 
@@ -1379,7 +1425,7 @@ import { Teams } from "./Teams.js"
 import { Umpires } from "./Umpires.js"
 import { Venues } from "./Venues.js"
 
-export const CricketSchema = DynamoSchema.make({ name: "cricketapp", version: 1 })
+export const CricketSchema = DynamoSchema.make({ name: "cricket", version: 1 })
 export const MainTable = Table.make({ schema: CricketSchema, entities: { Teams, Players, Coaches, Umpires, Venues } })
 ```
 
@@ -1721,6 +1767,7 @@ export type SquadSelectionId = typeof SquadSelectionId.Type
 ```ts title="src/models/SquadSelection.ts"
 import { DynamoModel } from "effect-dynamodb"
 import { Schema } from "effect"
+import { PlayerRoleSchema } from "./Enums.js"
 import { Player } from "./Player.js"
 import { Team } from "./Team.js"
 ```
@@ -1739,6 +1786,8 @@ class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
   isViceCaptain: Schema.Boolean,
 }) {}
 ```
+
+> **Note:** Add `export` before `class SquadSelection` — the region-synced code above omits it because the backing example is a single file.
 
 Three things to notice:
 
@@ -1774,6 +1823,13 @@ const SquadSelections = Entity.make({
       pk: { field: "gsi2pk", composite: ["playerId"] },
       sk: { field: "gsi2sk", composite: ["season", "series"] },
     },
+    // Single-composite GSI keyed on `teamId` — required so `Entity.cascade`
+    // can fan out from a Team update to every SquadSelection that embeds it.
+    byTeam: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["teamId"] },
+      sk: { field: "gsi3sk", composite: [] },
+    },
   },
   refs: {
     team: { entity: Teams },
@@ -1782,12 +1838,15 @@ const SquadSelections = Entity.make({
 })
 ```
 
+> **Note:** Add `export` before `const SquadSelections` — the region-synced code above omits it because the backing example is a single file.
+
 Key design decisions:
 
 - **`DynamoModel.configure(SquadSelection, { id: { field: "selectionId" } })`** — Renames `id` to `selectionId` in DynamoDB, keeping the REST-friendly single-ID primary key.
 - **`refs`** — Maps ref fields to their source entities. `{ entity: Teams }` tells the library to hydrate the `team` field by looking up the referenced Team entity.
 - **`byTeamSeries` index** — GSI for "all selections for a team in a series". PK composites `["teamId", "season", "series"]` enable hierarchical prefix queries.
-- **`byPlayer` index** — GSI for "all squads a player has been selected for". PK by `playerId`, SK by `season` + `series`.
+- **`byPlayer` index** — GSI for "all squads a player has been selected for". PK by `playerId`, SK by `season` + `series`. This is also the single-composite GSI on `playerId` that `Entity.cascade` uses when a Player is updated.
+- **`byTeam` index** — GSI keyed exactly on `teamId`. The cascade engine needs a GSI whose PK composite is **exactly** `[refIdField]` for each ref it cascades through; `byTeamSeries` doesn't qualify because its PK composite is `["teamId", "season", "series"]`. Without this dedicated `byTeam` GSI, `Players.update(..., Entity.cascade({ targets: [SquadSelections] }))` would work but `Teams.update(..., Entity.cascade({ targets: [SquadSelections] }))` would fail with `CascadePartialFailure: no usable GSI`.
 
 ### 4.3 Adding cascade to TeamService
 
@@ -1851,7 +1910,7 @@ import { type DateTime, Effect, ServiceMap } from "effect"
 import { ulid } from "ulid"
 import { SquadSelections } from "../entities/SquadSelections.js"
 import type { SquadListFilter } from "../models/Filters.js"
-import type { SquadSelectionId } from "../models/Ids.js"
+import type { PlayerId, SquadSelectionId } from "../models/Ids.js"
 import { applyPagination, type PaginationOptions } from "../models/Pagination.js"
 import { MainTable } from "../entities/Schema.js"
 
@@ -1867,17 +1926,32 @@ export class SquadSelectionService extends ServiceMap.Service<SquadSelectionServ
       const squads = db.entities.SquadSelections
       return {
         create: Effect.fn(function* (input: CreateSquadSelectionInput) {
-          return yield* squads.put(input)
+          const id = ulid() as SquadSelectionId
+          return yield* squads.put({ ...input, id })
         }),
 
         get: (id: SquadSelectionId) => squads.get({ id }),
 
         delete: (id: SquadSelectionId) => squads.delete({ id }),
 
-        listByPlayer: (playerId: string, pagination?: PaginationOptions) =>
+        // List by player — uses the `byPlayer` GSI for an efficient single-partition query.
+        listByPlayer: (playerId: PlayerId, pagination?: PaginationOptions) =>
           squads.fetch(
             applyPagination(SquadSelections.query.byPlayer({ playerId }), pagination),
           ).pipe(
+            Effect.map((page) => ({
+              data: page.items,
+              count: page.items.length,
+              cursor: page.cursor,
+            })),
+          ),
+
+        // List all squad selections — falls back to a table scan because there
+        // is no GSI keyed on `season` alone. For production workloads where the
+        // season filter is required, define a dedicated GSI and switch this to
+        // `SquadSelections.query.bySeason(...)`.
+        list: (_filter: SquadListFilter = {}, pagination?: PaginationOptions) =>
+          squads.fetch(applyPagination(SquadSelections.scan(), pagination)).pipe(
             Effect.map((page) => ({
               data: page.items,
               count: page.items.length,
@@ -1891,6 +1965,8 @@ export class SquadSelectionService extends ServiceMap.Service<SquadSelectionServ
 ```
 
 > **No update method** — SquadSelections are typically created and deleted, not updated. If you need to change a selection, delete and recreate it. The cascade mechanism handles updates to the *referenced* entities (Team, Player), not to the selection itself.
+
+> **`list` uses `scan()`** — `SquadSelections.scan()` returns a `Query.Query` descriptor that walks the entire table for items matching the SquadSelection entity type. We pass it through `applyPagination` (which operates on `Query.Query`, not `BoundQuery`) so the endpoint still respects `count`/`cursor`/`reverse`. Filtering by `season` is not supported by this scan path because there is no GSI keyed by season — a real production deployment would either add a dedicated GSI or perform server-side filtering using `Entity.filter`.
 
 **API:**
 
@@ -1947,7 +2023,7 @@ import { Teams } from "./Teams.js"
 import { Umpires } from "./Umpires.js"
 import { Venues } from "./Venues.js"
 
-export const CricketSchema = DynamoSchema.make({ name: "cricketapp", version: 1 })
+export const CricketSchema = DynamoSchema.make({ name: "cricket", version: 1 })
 export const MainTable = Table.make({
   schema: CricketSchema,
   entities: { Teams, Players, Coaches, Umpires, Venues, SquadSelections },
@@ -2057,7 +2133,7 @@ const ServiceLayers = Layer.mergeAll(
 )
 ```
 
-Update `create-table.ts` to register `SquadSelections` so `db.tables.MainTable.create()` adds the new GSIs (gsi3 and gsi4 for cascade):
+Update `create-table.ts` to register `SquadSelections` so `db.tables.MainTable.create()` adds the new GSIs (`gsi1` for `byTeamSeries`, `gsi2` for `byPlayer`, and `gsi3` for the dedicated `byTeam` cascade index):
 
 ```ts
 // In create-table.ts — add SquadSelections to the entities record
@@ -2085,13 +2161,20 @@ PLAYER_ID=$(curl -s -X POST http://localhost:3000/players \
     "gender": "Male", "battingHand": "Right"
   }' | jq -r '.id')
 
-# Create a squad selection — the response includes full Team and Player objects
+# Create a squad selection — the response includes full Team and Player objects.
+# Note that SquadSelection requires every business field; the API rejects
+# incomplete payloads with a 422.
 SELECTION_ID=$(curl -s -X POST http://localhost:3000/squads \
   -H "Content-Type: application/json" \
   -d "{
     \"teamId\": \"$TEAM_ID\",
     \"playerId\": \"$PLAYER_ID\",
-    \"season\": \"2024-25\"
+    \"season\": \"2024-25\",
+    \"series\": \"BGT\",
+    \"selectionNumber\": 1,
+    \"squadRole\": \"batter\",
+    \"isCaptain\": false,
+    \"isViceCaptain\": false
   }" | jq -r '.id')
 echo "Created selection: $SELECTION_ID"
 
@@ -2151,72 +2234,31 @@ class Match extends Schema.Class<Match>("Match")({
 }) {}
 ```
 
-### 5.2 Match model with validation
+### 5.2 Exporting the Match model
+
+The region-synced code above defines `PlayerSheet`, `TeamSheet`, and `Match` in a single file (`src/models/Match.ts`) without `export` keywords because the backing example is one file. In your multi-file project, every class needs `export` so other modules (`MatchAggregate.ts`, `MatchService.ts`, `MatchesApi.ts`) can import them. Add `export` before each class:
 
 ```ts
-// src/models/Match.ts
-import { Schema } from "effect"
-import { GenderSchema, MatchTypeSchema } from "./Enums.js"
-import { Team } from "./Team.js"
-import { TeamSheet } from "./TeamSheet.js"
-import { UmpireSheet } from "./UmpireSheet.js"
-import { Venue } from "./Venue.js"
-
-export class Match extends Schema.Class<Match>("Match")({
-  id: Schema.String,
-  name: Schema.String,
-  gender: GenderSchema,
-  matchType: MatchTypeSchema,
-  league: Schema.String,
-  series: Schema.String,
-  season: Schema.String,
-  startDate: Schema.Date,
-  finishDate: Schema.optionalKey(Schema.Date),
-  venue: Venue,
-  team1: TeamSheet,
-  team2: TeamSheet,
-  umpires: Schema.optionalKey(UmpireSheet),
-  toss: Schema.optionalKey(Team),
-  winner: Schema.optionalKey(Team),
-  result: Schema.optionalKey(Schema.String),
-}) {}
-
-// Validation rules
-const differentTeams = Schema.makeFilter<Match>((match) =>
-  match.team1.team.id !== match.team2.team.id
-    ? undefined
-    : "Must have different teams in a match",
-)
-
-const minPlayersPerTeam = Schema.makeFilter<Match>((match) =>
-  match.team1.players.length > 0 && match.team2.players.length > 0
-    ? undefined
-    : "Minimum of one player required per team",
-)
-
-export const ValidatedMatch = Match.check(differentTeams, minPlayersPerTeam)
-
-/** Umpire assignment update — all fields optional, pass only what changes */
-export const UmpireUpdate = Schema.Struct({
-  matchRefereeId: Schema.optionalKey(Schema.String),
-  matchUmpireIds: Schema.optionalKey(Schema.Array(Schema.String)),
-  tvUmpireId: Schema.optionalKey(Schema.String),
-  reserveUmpireId: Schema.optionalKey(Schema.String),
-})
-
-/** Partial update payload for matches — scalar fields + ref IDs resolved from match state */
-export const MatchUpdatePayload = Schema.Struct({
-  result: Schema.optionalKey(Schema.String),
-  finishDate: Schema.optionalKey(Schema.Date),
-  tossId: Schema.optionalKey(Schema.String),
-  winnerId: Schema.optionalKey(Schema.String),
-  umpires: Schema.optionalKey(UmpireUpdate),
-})
+// src/models/Match.ts — add `export` before each class declaration
+export class PlayerSheet extends Schema.Class<PlayerSheet>("PlayerSheet")(/* ... */) {}
+export class TeamSheet extends Schema.Class<TeamSheet>("TeamSheet")(/* ... */) {}
+export class Match extends Schema.Class<Match>("Match")(/* ... */) {}
 ```
 
-The `MatchUpdatePayload` is a custom schema for the update endpoint. Aggregate updates operate on domain objects (`toss: Team`), but the API accepts ref IDs (`tossId: string`). The `UmpireUpdate` uses the same pattern — umpire role fields accept ID strings that the service resolves to full Umpire objects before the mutation (see section 5.5).
+We also need a small custom schema for the update endpoint. Aggregate updates operate on domain objects (`team1: TeamSheet`), but renaming a match only needs the new name — and the API should not require resending the entire match graph. Define a partial update payload alongside the model:
 
-> **Concept: Schema.makeFilter** — Adds validation rules to a schema. Returns `undefined` for valid, or an error message string for invalid. `Match.check(...)` composes multiple filters into a validated schema.
+```ts
+// src/models/Match.ts — add at the bottom
+/** Partial update payload for matches — fields the API exposes for in-place edits */
+export const MatchUpdatePayload = Schema.Struct({
+  name: Schema.optionalKey(Schema.String),
+})
+export type MatchUpdatePayload = typeof MatchUpdatePayload.Type
+```
+
+> **Why a custom payload schema?** `MatchAggregate.updateSchema` accepts the full domain object with refs and edges. For a REST update endpoint we usually want to expose a small set of in-place fields (rename, change start time, etc.) without re-sending team sheets. The service is responsible for translating the partial payload into a cursor mutation against the aggregate.
+
+> **Extending this pattern.** Later you can grow `MatchUpdatePayload` to cover more fields (`startDate`, `result`, `tossId`, etc.) and add validation via `Schema.makeFilter` + `Match.check(...)`. For this tutorial we keep the surface area small so the example file and the doc stay aligned. See **Next Steps** at the end of the tutorial for ideas.
 
 ### 5.3 The MatchAggregate
 
@@ -2224,8 +2266,7 @@ This is where the magic happens. The aggregate defines how a complex domain obje
 
 ```ts title="src/entities/MatchAggregate.ts"
 import { Aggregate } from "effect-dynamodb"
-import { Match } from "../models/Match.js"
-import { TeamSheet } from "../models/TeamSheet.js"
+import { Match, TeamSheet } from "../models/Match.js"
 import { Coaches } from "./Coaches.js"
 import { Players } from "./Players.js"
 import { Teams } from "./Teams.js"
@@ -2277,36 +2318,17 @@ Key aggregate concepts:
 
 ### 5.4 MatchesApi
 
-The MatchesApi follows the same pattern as entity APIs but uses the aggregate's derived schemas:
-
-```ts
-// src/models/Filters.ts — add MatchListFilter
-export const MatchListFilter = Schema.Struct({
-  gender: Schema.optionalKey(GenderQuery),
-  league: Schema.optionalKey(Schema.String),
-})
-export type MatchListFilter = typeof MatchListFilter.Type
-```
+The MatchesApi follows the same pattern as entity APIs but uses the aggregate's derived schemas. The Match aggregate in this tutorial only configures a `collection` (for `get`/`update`/`delete` queries) and not a `list` GSI, so the API exposes create, get, update, and delete — no list endpoint:
 
 ```ts
 // src/api/MatchesApi.ts
 import { Schema } from "effect"
 import { HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi"
 import { MatchAggregate } from "../entities/MatchAggregate.js"
-import { MatchListFilter } from "../models/Filters.js"
 import { Match, MatchUpdatePayload } from "../models/Match.js"
-import { PaginationOptions } from "../models/Pagination.js"
-import { ApiBadRequest, ApiNotFound, ApiUnprocessableEntity } from "./ApiErrors.js"
+import { ApiNotFound, ApiUnprocessableEntity } from "./ApiErrors.js"
 
 export const MatchesApi = HttpApiGroup.make("matches").add(
-  HttpApiEndpoint.get("list", "/matches", {
-    query: { ...MatchListFilter.fields, ...PaginationOptions.fields },
-    success: Schema.Struct({
-      data: Schema.Array(Match),
-      count: Schema.Number,
-      cursor: Schema.NullOr(Schema.String),
-    }),
-  }),
   HttpApiEndpoint.get("get", "/matches/:id", {
     params: { id: Schema.String },
     success: Match,
@@ -2315,13 +2337,13 @@ export const MatchesApi = HttpApiGroup.make("matches").add(
   HttpApiEndpoint.post("create", "/matches", {
     payload: MatchAggregate.createSchema,
     success: Match,
-    error: [ApiBadRequest, ApiUnprocessableEntity],
+    error: ApiUnprocessableEntity,
   }),
   HttpApiEndpoint.put("update", "/matches/:id", {
     params: { id: Schema.String },
     payload: MatchUpdatePayload,
     success: Match,
-    error: [ApiBadRequest, ApiNotFound, ApiUnprocessableEntity],
+    error: ApiNotFound,
   }),
   HttpApiEndpoint.delete("remove", "/matches/:id", {
     params: { id: Schema.String },
@@ -2332,26 +2354,23 @@ export const MatchesApi = HttpApiGroup.make("matches").add(
 
 Key points:
 
-- **`MatchAggregate.createSchema`** — The payload schema for creating matches. Derived from the aggregate's domain model: PK composites (`id`) are omitted, entity refs become ID fields (`venueId`, `team1.teamId`, `team1.coachId`, `team1.players[].playerId`, etc.), and dates accept ISO 8601 strings.
+- **`MatchAggregate.createSchema`** — The payload schema for creating matches. Derived from the aggregate's domain model: PK composites (`id`) are omitted, entity refs become ID fields (`venueId`, `team1.teamId`, `team1.coachId`, `team1.players[].playerId`, etc.).
 
-- **`MatchUpdatePayload`** — A custom schema with the fields updatable via API: `result`, `finishDate`, `tossId`, `winnerId`, and `umpires` (with per-role umpire IDs). We use a custom schema rather than `MatchAggregate.updateSchema` because aggregate updates operate on domain objects (with full `Team` and `Umpire` refs), while the API accepts ref IDs. The service translates between the two formats.
+- **`MatchUpdatePayload`** — The custom partial-update schema we defined in section 5.2. The API accepts a small subset of fields (just `name` for now); the service translates these into a cursor-based mutation against the aggregate.
 
-- **Multiple error types** — Endpoints can declare multiple error schemas as an array. The create endpoint uses `ApiBadRequest` for validation failures (e.g., teams must be different) and `ApiUnprocessableEntity` for ref hydration failures (e.g., invalid `venueId`). The update endpoint uses `ApiBadRequest` for validation and `ApiNotFound` for missing matches.
+- **Ref hydration errors** — The create endpoint uses `ApiUnprocessableEntity` (422) for ref hydration failures (e.g., `venueId` doesn't point to an existing venue).
 
-### 5.5 MatchService with validation
+### 5.5 MatchService
 
-Update the service to validate matches after create and update using the `ValidatedMatch` schema from section 5.2:
+The service binds the aggregate to the typed client and translates the partial `MatchUpdatePayload` into a cursor-based mutation:
 
 ```ts
 // src/services/MatchService.ts
 import { Aggregate, DynamoClient } from "effect-dynamodb"
-import { type DateTime, Effect, Schema, ServiceMap } from "effect"
+import { type DateTime, Effect, type Schema, ServiceMap } from "effect"
 import { ulid } from "ulid"
-import { Umpires } from "../entities/Umpires.js"
 import { MatchAggregate } from "../entities/MatchAggregate.js"
-import type { UmpireId } from "../models/Ids.js"
-import { type MatchUpdatePayload, ValidatedMatch } from "../models/Match.js"
-import type { PaginationOptions } from "../models/Pagination.js"
+import type { MatchUpdatePayload } from "../models/Match.js"
 import { MainTable } from "../entities/Schema.js"
 
 export type { DateTime }
@@ -2359,104 +2378,35 @@ export type { DateTime }
 type MatchKey = Aggregate.Key<typeof MatchAggregate>
 type MatchCreate = Schema.Schema.Type<typeof MatchAggregate.createSchema>
 
-const validate = (match: Aggregate.Type<typeof MatchAggregate>) =>
-  Schema.decodeUnknownEffect(ValidatedMatch)(match)
-
 export class MatchService extends ServiceMap.Service<MatchService>()("@gamemanager/MatchService", {
   make: Effect.gen(function* () {
     const db = yield* DynamoClient.make({
-      entities: { Umpires },
+      entities: {},
       aggregates: { MatchAggregate },
       tables: { MainTable },
     })
-    const boundUmpires = db.entities.Umpires
     const matches = db.aggregates.MatchAggregate
     return {
-      create: Effect.fn(function* (input: MatchCreate) {
+      create: Effect.fn(function* (input: Omit<MatchCreate, "id">) {
         const id = ulid()
-        const match = yield* matches.create({ ...input, id })
-        yield* validate(match)
-        return match
+        return yield* matches.create({ ...input, id } as MatchCreate)
       }),
 
       get: (key: MatchKey) => matches.get(key),
 
-      update: (key: MatchKey, payload: typeof MatchUpdatePayload.Type) =>
-        Effect.gen(function* () {
-          // Resolve umpire IDs to full objects before the mutation
-          const umpireUpdates = payload.umpires
-          const resolvedUmpires = umpireUpdates
-            ? yield* Effect.gen(function* () {
-                const matchReferee = umpireUpdates.matchRefereeId
-                  ? yield* boundUmpires.get({ id: umpireUpdates.matchRefereeId as UmpireId })
-                  : undefined
-                const matchUmpire = umpireUpdates.matchUmpireIds
-                  ? yield* Effect.all(
-                      umpireUpdates.matchUmpireIds.map((id) =>
-                        boundUmpires.get({ id: id as UmpireId }),
-                      ),
-                    )
-                  : undefined
-                const tvUmpire = umpireUpdates.tvUmpireId
-                  ? yield* boundUmpires.get({ id: umpireUpdates.tvUmpireId as UmpireId })
-                  : undefined
-                const reserveUmpire = umpireUpdates.reserveUmpireId
-                  ? yield* boundUmpires.get({ id: umpireUpdates.reserveUmpireId as UmpireId })
-                  : undefined
-                return { matchReferee, matchUmpire, tvUmpire, reserveUmpire }
-              })
-            : undefined
-
-        const match = yield* matches.update(key, ({ state }) => {
-          const patched = { ...state }
-          if (payload.result !== undefined) patched.result = payload.result
-          if (payload.finishDate !== undefined) patched.finishDate = payload.finishDate
-          if (payload.tossId !== undefined) {
-            if (state.team1.team.id === payload.tossId) patched.toss = state.team1.team
-            else if (state.team2.team.id === payload.tossId) patched.toss = state.team2.team
+      // The partial payload only supports `name` today. Each optional field
+      // becomes a `cursor.key(...).replace(...)` call inside the mutation.
+      // The callback must return the next state — either the replaced value
+      // or the original state when nothing in the payload matches.
+      update: (key: MatchKey, payload: MatchUpdatePayload) =>
+        matches.update(key, ({ cursor, state }) => {
+          if (payload.name !== undefined) {
+            return cursor.key("name").replace(payload.name)
           }
-          if (payload.winnerId !== undefined) {
-            if (state.team1.team.id === payload.winnerId) patched.winner = state.team1.team
-            else if (state.team2.team.id === payload.winnerId) patched.winner = state.team2.team
-          }
-          if (resolvedUmpires) {
-            const currentUmpires = state.umpires ?? {}
-            patched.umpires = {
-              ...currentUmpires,
-              ...(resolvedUmpires.matchReferee !== undefined && {
-                matchReferee: resolvedUmpires.matchReferee,
-              }),
-              ...(resolvedUmpires.matchUmpire !== undefined && {
-                matchUmpire: resolvedUmpires.matchUmpire,
-              }),
-              ...(resolvedUmpires.tvUmpire !== undefined && {
-                tvUmpire: resolvedUmpires.tvUmpire,
-              }),
-              ...(resolvedUmpires.reserveUmpire !== undefined && {
-                reserveUmpire: resolvedUmpires.reserveUmpire,
-              }),
-            }
-          }
-          return patched
-        })
-        yield* validate(match)
-        return match
-      }),
+          return state
+        }),
 
       delete: (key: MatchKey) => matches.delete(key),
-
-      list: (filter?: { gender?: string; league?: string }, pagination?: PaginationOptions) =>
-        matches.list(
-          filter?.gender
-            ? { gender: filter.gender, ...(filter.league ? { league: filter.league } : {}) }
-            : undefined,
-          { limit: pagination?.count, cursor: pagination?.cursor },
-        ).pipe(
-          Effect.map((result) => ({
-            ...result,
-            count: result.data.length,
-          })),
-        ),
     }
   }),
 }) {}
@@ -2464,7 +2414,7 @@ export class MatchService extends ServiceMap.Service<MatchService>()("@gamemanag
 
 Key differences from entity services:
 
-- **`DynamoClient.make({ entities, aggregates, tables })`** — Both entities and aggregates are bound via the same typed gateway. Access bound entities through `db.entities.Umpires` and bound aggregates through `db.aggregates.MatchAggregate` — all operations have `R = never`.
+- **`DynamoClient.make({ entities: {}, aggregates, tables })`** — Aggregates are bound via the same typed gateway. `entities` is required by every overload, so we pass an empty record when the service only touches an aggregate. Access aggregates through `db.aggregates.MatchAggregate` — all operations have `R = never`.
 
 - **`matches.createSchema`** — Like entities, aggregates derive typed schemas. `createSchema` omits PK composites and replaces ref/edge fields with ID fields (`venueId`, `team1.teamId`).
 
@@ -2472,42 +2422,15 @@ Key differences from entity services:
 
 - **`matches.get(key)`** — Queries all items in the aggregate's partition, then assembles them back into the full Match domain object.
 
-- **`matches.update(key, fn)`** — The update function receives `{ state }` (the current Match as a plain object) and returns the modified state. The library diffs the old and new states, determines which items changed, and writes only the changes atomically.
+- **`matches.update(key, fn)`** — The update function receives an `UpdateContext` with a `cursor` optic pre-bound to the aggregate root, plus `state` (the current decoded state). `cursor.key("name").replace(...)` rewrites the `name` field and returns the next state; the library diffs the old and new states and writes only the changed items. The callback **must return** the next state — return `cursor.key(...).replace(...)` for an edit, or return `state` unchanged when there is nothing to do.
 
-- **Ref resolution from state** — The `tossId` and `winnerId` in the API payload are ref IDs, but the aggregate mutation operates on domain objects. The service resolves these by matching against the match's existing `team1.team` and `team2.team` — the toss/winner must be one of the two playing teams, so no additional DB lookup is needed.
-
-- **Umpire resolution via entity lookup** — Unlike toss/winner (which can be resolved from the match's existing state), umpire updates reference umpires by ID that may not be in the current match state. The service resolves these by calling `boundUmpires.get()` *before* the mutation function. If an umpire ID doesn't exist, `ItemNotFound` is raised and caught as a 422 in the handler.
-
-- **`MatchAggregate.list(filter, options)`** — Supports cursor-based pagination via `Aggregate.ListOptions`. Returns `Aggregate.ListResult<Match>` with `{ data, cursor }`.
-
-- **`validate`** — Decodes the assembled `Match` through `ValidatedMatch`, which runs the `differentTeams` and `minPlayersPerTeam` checks. If validation fails, the schema decode produces a `SchemaError`. The `validationFailed` error helper in `App.ts` catches this and returns a `400 Bad Request` with the validation message. In a production system you'd validate *before* writing, but this pattern demonstrates the concept clearly.
-
-> **Concept: Post-assembly validation** — The aggregate handles decomposition, storage, and assembly. Validation is a service concern applied to the assembled domain object. This keeps the aggregate focused on data mapping and the service focused on business rules.
+- **No list method** — The `MatchAggregate` in this tutorial only configures a `collection` (for partition reads), not a `list` GSI. To support `MatchAggregate.list(filter, options)` you would add a `list: { index, name, pk, sk }` block to the aggregate config and a corresponding GSI in `create-table.ts`.
 
 ### 5.6 Wire up MatchesApi
 
-Register the `MatchAggregate` on the table:
+`Schema.ts` does **not** change in this phase. The `MatchAggregate` is wired to the table via its `table: MainTable` field inside `Aggregate.make` (section 5.3), and it's registered on the typed client in every service, handler, and script that uses it (`MatchService`, `create-table.ts`) via `DynamoClient.make({ aggregates: { MatchAggregate }, ... })`.
 
-```ts
-// src/entities/Schema.ts
-import { DynamoSchema, Table } from "effect-dynamodb"
-import { Coaches } from "./Coaches.js"
-import { MatchAggregate } from "./MatchAggregate.js"
-import { Players } from "./Players.js"
-import { SquadSelections } from "./SquadSelections.js"
-import { Teams } from "./Teams.js"
-import { Umpires } from "./Umpires.js"
-import { Venues } from "./Venues.js"
-
-export const CricketSchema = DynamoSchema.make({ name: "cricketapp", version: 1 })
-export const MainTable = Table.make({
-  schema: CricketSchema,
-  entities: { Teams, Players, Coaches, Umpires, Venues, SquadSelections },
-  aggregates: { MatchAggregate },
-})
-```
-
-> **Aggregates on the table** — Aggregates are registered on `Table.make(...)` (so `db.tables.MainTable.create()` knows about their GSIs) and listed under `aggregates` in `DynamoClient.make({ ..., aggregates: { MatchAggregate } })` (so the typed client exposes `db.aggregates.MatchAggregate`). All bound operations have `R = never`.
+> **Why not register the aggregate on `Table.make(...)`?** — In a multi-file project, `MatchAggregate.ts` already imports `MainTable` from `Schema.ts` (it needs the table for `Aggregate.make({ table: MainTable, ... })`). If `Schema.ts` also imported `MatchAggregate` to register it on `Table.make`, you would create a circular import between `Schema.ts` and `MatchAggregate.ts` and TypeScript would fail with `TS7022: 'MatchAggregate' implicitly has type 'any' because it does not have a type annotation and is referenced directly or indirectly in its own initializer`. Registering aggregates on the typed client via `DynamoClient.make(...)` avoids the cycle and `db.tables.MainTable.create()` still detects and provisions the aggregate's indexes at runtime (LSIs are auto-detected from the aggregate's collection config).
 
 Update `Api.ts`:
 
@@ -2541,10 +2464,8 @@ Add the MatchesHandler and service in `App.ts`:
 
 ```ts
 // In App.ts — add imports:
-import type { AggregateAssemblyError, ItemNotFound, RefNotFound } from "effect-dynamodb"
-import { Match } from "../models/Match.js"
+import type { AggregateAssemblyError, RefNotFound } from "effect-dynamodb"
 import { MatchService } from "../services/MatchService.js"
-import { ApiBadRequest, ApiUnprocessableEntity } from "./ApiErrors.js"
 ```
 
 ```ts
@@ -2570,59 +2491,14 @@ const MatchesHandler = HttpApiBuilder.group(
   Effect.fn(function* (handlers) {
     const svc = yield* MatchService
     return handlers
-      .handle("list", ({ query }) =>
-        Effect.gen(function* () {
-          const filter = query.gender ? { gender: query.gender, league: query.league } : undefined
-          const result = yield* svc.list(filter, query)
-          return {
-            data: result.data.map((r) => new Match(r)),
-            count: result.count,
-            cursor: result.cursor,
-          }
-        }).pipe(Effect.orDie),
-      )
       .handle("get", ({ params: { id } }) =>
         svc.get({ id }).pipe(aggregateNotFound("Match", id)),
       )
       .handle("create", ({ payload }) =>
-        svc.create(payload).pipe(
-          Effect.catchTags(
-            {
-              SchemaError: (e) =>
-                Effect.fail(
-                  new ApiBadRequest({ error: "BadRequest", message: String(e).replace(/^SchemaError\(/, "").replace(/\)$/, "") }),
-                ),
-              RefNotFound: (caught) => {
-                const e = caught as RefNotFound
-                return Effect.fail(
-                  new ApiUnprocessableEntity({ error: "UnprocessableEntity", message: `${e.refEntity} not found: ${e.refId}` }),
-                )
-              },
-            },
-            (e) => Effect.die(e),
-          ),
-        ),
+        svc.create(payload).pipe(refNotFound),
       )
       .handle("update", ({ params: { id }, payload }) =>
-        svc.update({ id }, payload).pipe(
-          Effect.catchTags(
-            {
-              SchemaError: (e) =>
-                Effect.fail(
-                  new ApiBadRequest({ error: "BadRequest", message: String(e).replace(/^SchemaError\(/, "").replace(/\)$/, "") }),
-                ),
-              AggregateAssemblyError: () =>
-                Effect.fail(
-                  new ApiNotFound({ error: "NotFound", message: `Match not found: ${id}` }),
-                ),
-              ItemNotFound: (e) =>
-                Effect.fail(
-                  new ApiUnprocessableEntity({ error: "UnprocessableEntity", message: `Umpire not found: ${JSON.stringify((e as ItemNotFound).key)}` }),
-                ),
-            },
-            (e) => Effect.die(e),
-          ),
-        ),
+        svc.update({ id }, payload).pipe(aggregateNotFound("Match", id)),
       )
       .handle("remove", ({ params: { id } }) =>
         svc.delete({ id }).pipe(aggregateNotFound("Match", id)),
@@ -2634,10 +2510,9 @@ const MatchesHandler = HttpApiBuilder.group(
 Key differences from entity handlers:
 
 - **`svc.get({ id })`** — Aggregate keys are objects (not scalar IDs), matching the PK composite structure.
-- **`svc.update({ id }, payload)`** — Passes the `MatchUpdatePayload` directly to the service. The service resolves toss/winner from the match's existing teams, and umpire IDs via entity lookup (see section 5.5).
-- **`aggregateNotFound`** — Catches `AggregateAssemblyError` instead of `ItemNotFound`.
-- **`ItemNotFound` catch** — When the service resolves an umpire ID that doesn't exist, the `Umpires.get()` call raises `ItemNotFound`. The handler catches this and returns a `422 Unprocessable Entity` with the failed key.
-- **`Effect.catchTags`** — When a handler can produce multiple error types, use `Effect.catchTags` to handle them all in one combinator. This avoids the pitfall of piping individual `Effect.catchTag` helpers — each helper's fallback `(e) => Effect.die(e)` converts ALL unmatched errors to defects, preventing downstream handlers from catching them. `Effect.catchTags` handles all specified tags atomically, with a single fallback for everything else.
+- **`svc.update({ id }, payload)`** — Passes the `MatchUpdatePayload` directly to the service, which translates the partial payload into a cursor mutation against the aggregate.
+- **`aggregateNotFound`** — Catches `AggregateAssemblyError` instead of `ItemNotFound`. Aggregates raise this when no items exist in the target partition.
+- **`refNotFound` reused** — Match creation hydrates refs (`venueId`, `teamId`, `coachId`, `playerId`). The same `refNotFound` helper from Phase 4 maps `RefNotFound` to a 422.
 
 ```ts
 // In App.ts — update HandlerLayers and ServiceLayers:
@@ -2664,17 +2539,41 @@ const ServiceLayers = Layer.mergeAll(
 
 ### 5.7 Recreate the table
 
-Update `create-table.ts` to register `MatchAggregate` so `db.tables.MainTable.create()` adds the aggregate's collection GSI (`gsi2` with `pk` + `gsi2sk`) and list GSI (`gsi1` with `gsi1pk` + `gsi1sk`) alongside the entity GSIs:
+Update `create-table.ts` to register `MatchAggregate` alongside the entities. The library merges the runtime-registered aggregates into the supplied table when computing the create-time schema, so `db.tables.MainTable.create()` provisions the aggregate's `lsi1` (the LSI used by its `collection` index) alongside the existing entity GSIs:
 
 ```ts
-// In create-table.ts — add the aggregates record
+// src/create-table.ts
+import { DynamoClient } from "effect-dynamodb"
+import { Console, Effect } from "effect"
+import { Coaches } from "./entities/Coaches.js"
 import { MatchAggregate } from "./entities/MatchAggregate.js"
+import { Players } from "./entities/Players.js"
+import { SquadSelections } from "./entities/SquadSelections.js"
+import { Teams } from "./entities/Teams.js"
+import { Umpires } from "./entities/Umpires.js"
+import { Venues } from "./entities/Venues.js"
+import { MainTable } from "./entities/Schema.js"
 
-const db = yield* DynamoClient.make({
-  entities: { Teams, Players, Coaches, Umpires, Venues, SquadSelections },
-  aggregates: { MatchAggregate },
-  tables: { MainTable },
+const program = Effect.gen(function* () {
+  const db = yield* DynamoClient.make({
+    entities: { Teams, Players, Coaches, Umpires, Venues, SquadSelections },
+    aggregates: { MatchAggregate },
+    tables: { MainTable },
+  })
+  yield* Console.log("Creating table...")
+  yield* db.tables.MainTable.create()
+  yield* Console.log("Table created successfully")
 })
+
+const DynamoLayer = DynamoClient.layer({
+  region: "local",
+  endpoint: "http://localhost:8000",
+  credentials: { accessKeyId: "local", secretAccessKey: "local" },
+})
+
+const TableLayer = MainTable.layer({ name: "gamemanager" })
+
+program.pipe(Effect.provide(DynamoLayer), Effect.provide(TableLayer), Effect.runPromise)
 ```
 
 ### 5.8 Recreate table and test
@@ -2690,13 +2589,13 @@ pnpm db:create
 pnpm dev
 ```
 
-**Step 1: Create reference data.** Matches reference teams, players, coaches, umpires, and venues — all must exist first:
+**Step 1: Create reference data.** Matches reference teams, players, coaches, and venues — all must exist first:
 
 ```bash
 # Create two teams
 AUS_ID=$(curl -s -X POST http://localhost:3000/teams \
   -H "Content-Type: application/json" \
-  -d '{"name": "Australia", "gender": "Male", "league": "ICC"}' \
+  -d '{"name": "Australia", "country": "Australia", "ranking": 1}' \
   | jq -r '.id')
 
 IND_ID=$(curl -s -X POST http://localhost:3000/teams \
@@ -2737,22 +2636,6 @@ IND_COACH=$(curl -s -X POST http://localhost:3000/coaches \
   -d '{"firstName":"Gautam","lastName":"Gambhir","name":"Gautam Gambhir","gender":"Male"}' \
   | jq -r '.id')
 
-# Create umpires
-UMP1=$(curl -s -X POST http://localhost:3000/umpires \
-  -H "Content-Type: application/json" \
-  -d '{"firstName":"Kumar","lastName":"Dharmasena","name":"Kumar Dharmasena","gender":"Male"}' \
-  | jq -r '.id')
-
-UMP2=$(curl -s -X POST http://localhost:3000/umpires \
-  -H "Content-Type: application/json" \
-  -d '{"firstName":"Richard","lastName":"Kettleborough","name":"Richard Kettleborough","gender":"Male"}' \
-  | jq -r '.id')
-
-UMP_REF=$(curl -s -X POST http://localhost:3000/umpires \
-  -H "Content-Type: application/json" \
-  -d '{"firstName":"Richie","lastName":"Richardson","name":"Richie Richardson","gender":"Male"}' \
-  | jq -r '.id')
-
 # Create a venue
 VENUE=$(curl -s -X POST http://localhost:3000/venues \
   -H "Content-Type: application/json" \
@@ -2763,7 +2646,6 @@ echo "Reference data created:"
 echo "  Teams:   AUS=$AUS_ID IND=$IND_ID"
 echo "  Players: AUS_P1=$AUS_P1 AUS_P2=$AUS_P2 IND_P1=$IND_P1 IND_P2=$IND_P2"
 echo "  Coaches: AUS_COACH=$AUS_COACH IND_COACH=$IND_COACH"
-echo "  Umpires: UMP1=$UMP1 UMP2=$UMP2 UMP_REF=$UMP_REF"
 echo "  Venue:   VENUE=$VENUE"
 ```
 
@@ -2774,12 +2656,6 @@ MATCH_ID=$(curl -s -X POST http://localhost:3000/matches \
   -H "Content-Type: application/json" \
   -d "{
     \"name\": \"Boxing Day Test 2025\",
-    \"gender\": \"Male\",
-    \"matchType\": \"Test\",
-    \"league\": \"ICC\",
-    \"series\": \"Border-Gavaskar Trophy\",
-    \"season\": \"2025-26\",
-    \"startDate\": \"2025-12-26T00:00:00.000Z\",
     \"venueId\": \"$VENUE\",
     \"team1\": {
       \"teamId\": \"$AUS_ID\",
@@ -2796,12 +2672,8 @@ MATCH_ID=$(curl -s -X POST http://localhost:3000/matches \
       \"homeTeam\": false,
       \"players\": [
         {\"playerId\": \"$IND_P1\", \"battingPosition\": 4, \"isCaptain\": true},
-        {\"playerId\": \"$IND_P2\", \"battingPosition\": 11}
+        {\"playerId\": \"$IND_P2\", \"battingPosition\": 11, \"isCaptain\": false}
       ]
-    },
-    \"umpires\": {
-      \"matchRefereeId\": \"$UMP_REF\",
-      \"matchUmpireIds\": [\"$UMP1\", \"$UMP2\"]
     }
   }" | jq -r '.id')
 echo "Created match: $MATCH_ID"
@@ -2812,8 +2684,6 @@ Notice how the create payload maps to the aggregate's edge structure:
 - `team1.team: Team` → `team1.teamId: string`
 - `team1.coach: Coach` → `team1.coachId: string`
 - `team1.players[].player: Player` → `team1.players[].playerId: string`
-- `umpires.matchReferee: Umpire` → `umpires.matchRefereeId: string`
-- `umpires.matchUmpire: Umpire[]` → `umpires.matchUmpireIds: string[]` (via `inputField`)
 
 **Step 3: Get a match.** The response is the fully assembled domain object — all refs hydrated:
 
@@ -2821,181 +2691,50 @@ Notice how the create payload maps to the aggregate's edge structure:
 curl -s http://localhost:3000/matches/$MATCH_ID | jq
 ```
 
-The response contains full `Team`, `Player`, `Coach`, `Umpire`, and `Venue` objects — not IDs. This is a single `get` call that queries the aggregate's collection GSI, fetches all items sharing the partition key, and assembles them into the domain graph.
+The response contains full `Team`, `Player`, `Coach`, and `Venue` objects — not IDs. This is a single `get` call that queries the aggregate's `lsi1` collection index, fetches all items sharing the partition key, and assembles them into the domain graph.
 
-**Step 4: List matches with filtering and pagination.**
-
-```bash
-# List all matches
-curl -s http://localhost:3000/matches | jq
-
-# Filter by gender
-curl -s "http://localhost:3000/matches?gender=Male" | jq
-
-# Filter by gender and league (SK prefix)
-curl -s "http://localhost:3000/matches?gender=Male&league=ICC" | jq
-
-# Paginate: first page of 1
-curl -s "http://localhost:3000/matches?count=1" | jq '.cursor'
-# Returns a cursor string (or null if only one match)
-```
-
-The list GSI SK composite is `["gender", "league", "name"]`, so filtering works as a hierarchical prefix: `gender` alone, `gender` + `league`, or all three.
-
-**Step 5: Update a match.** Assign the toss winner and update the result:
+**Step 4: Update a match.** The current `MatchUpdatePayload` only exposes the `name` field; we'll rename the match in place:
 
 ```bash
-# Assign toss winner (Australia) — uses ref: pass team ID
+# Rename the match
 curl -s -X PUT http://localhost:3000/matches/$MATCH_ID \
   -H "Content-Type: application/json" \
-  -d "{\"tossId\": \"$AUS_ID\"}" | jq '.toss.name'
-# → "Australia"
+  -d '{"name": "Boxing Day Test"}' | jq '.name'
+# → "Boxing Day Test"
 
-# Record match result
-curl -s -X PUT http://localhost:3000/matches/$MATCH_ID \
-  -H "Content-Type: application/json" \
-  -d "{\"winnerId\": \"$IND_ID\", \"result\": \"India won by 185 runs\"}" | jq '{winner: .winner.name, result: .result}'
-# → {"winner": "India", "result": "India won by 185 runs"}
-
-# Verify the full match state
-curl -s http://localhost:3000/matches/$MATCH_ID | jq '{name, toss: .toss.name, winner: .winner.name, result}'
+# Verify the rename — refs are still hydrated
+curl -s http://localhost:3000/matches/$MATCH_ID | jq '{name, venue: .venue.name, team1: .team1.team.name, team2: .team2.team.name}'
 ```
 
-The update handler spreads the partial payload over current state. The aggregate diffs old vs new and writes only changed items — if only `toss` changed, only the root item is updated.
+The aggregate's update engine diffs old state vs new and writes only the changed item — renaming a match touches just the root `MatchItem`, leaving every team sheet, coach, player, and venue item untouched.
 
-**Step 5b: Update umpires.** Assign a TV umpire (not set during creation) and swap the match referee:
+> **Extending the update payload.** To support more in-place edits (start date, result, toss, winner, etc.) you can grow `MatchUpdatePayload` and add matching `cursor.key(...).replace(...)` branches in `MatchService.update`. Validation rules belong on the assembled `Match` via `Schema.makeFilter` + `Match.check(...)`. See **Next Steps** at the end of the tutorial for ideas.
 
-```bash
-# Assign TV umpire and change match referee
-curl -s -X PUT http://localhost:3000/matches/$MATCH_ID \
-  -H "Content-Type: application/json" \
-  -d "{\"umpires\": {\"tvUmpireId\": \"$UMP2\", \"matchRefereeId\": \"$UMP1\"}}" \
-  | jq '{matchReferee: .umpires.matchReferee.name, tvUmpire: .umpires.tvUmpire.name}'
-# → {"matchReferee": "Kumar Dharmasena", "tvUmpire": "Richard Kettleborough"}
-
-# Try an invalid umpire ID — should get 422
-curl -s -X PUT http://localhost:3000/matches/$MATCH_ID \
-  -H "Content-Type: application/json" \
-  -d '{"umpires": {"tvUmpireId": "nonexistent-umpire-id"}}' | jq
-# → 422: { "error": "UnprocessableEntity", "message": "Umpire not found: ..." }
-```
-
-Umpire updates demonstrate cascading updates within an aggregate. The service resolves umpire IDs to full objects before the mutation, then the aggregate engine diffs old vs new and rewrites only the changed umpire sub-aggregate items — the team sheets and venue items are untouched.
-
-**Step 5c: Test unique constraint updates.** Rename a team and verify the constraint sentinel updates correctly:
+**Step 5: Test ref-not-found.** Creating a match with an invalid `venueId` should produce a 422:
 
 ```bash
-# Rename "Australia" to "Australia XI"
-curl -s -X PUT http://localhost:3000/teams/$AUS_ID \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Australia XI"}' | jq '.name'
-# → "Australia XI"
-
-# Verify the update
-curl -s http://localhost:3000/teams/$AUS_ID | jq '.name'
-# → "Australia XI"
-
-# Rename back
-curl -s -X PUT http://localhost:3000/teams/$AUS_ID \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Australia"}' | jq '.name'
-# → "Australia"
-NEW_AUS=$(curl -s "http://localhost:3000/teams?gender=Male" | jq -r '.data[] | select(.name == "Australia") | .id')
-curl -s -X DELETE http://localhost:3000/teams/$NEW_AUS
-curl -s -X PUT http://localhost:3000/teams/$AUS_ID \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Australia"}' | jq '.name'
-# → "Australia"
-```
-
-When you update a field that participates in a unique constraint, the entity engine atomically removes the old sentinel and creates a new one. This ensures the old name slot is freed and the new one is occupied — no window where both exist or neither does.
-
-**Step 6: Test validation rules.**
-
-```bash
-# Try to create a match with the same team on both sides — should fail validation
-curl -s -X POST http://localhost:3000/matches \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"name\": \"Invalid Match\",
-    \"gender\": \"Male\",
-    \"matchType\": \"T20\",
-    \"league\": \"ICC\",
-    \"series\": \"Test\",
-    \"season\": \"2025-26\",
-    \"startDate\": \"2025-12-26T00:00:00.000Z\",
-    \"venueId\": \"$VENUE\",
-    \"team1\": {
-      \"teamId\": \"$AUS_ID\",
-      \"coachId\": \"$AUS_COACH\",
-      \"homeTeam\": true,
-      \"players\": [{\"playerId\": \"$AUS_P1\"}]
-    },
-    \"team2\": {
-      \"teamId\": \"$AUS_ID\",
-      \"coachId\": \"$IND_COACH\",
-      \"homeTeam\": false,
-      \"players\": [{\"playerId\": \"$IND_P1\"}]
-    }
-  }" | jq
-# → 400: { "error": "BadRequest", "message": "Must have different teams in a match" }
-
-# Try to create a match with no players — should fail validation
-curl -s -X POST http://localhost:3000/matches \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"name\": \"Empty Match\",
-    \"gender\": \"Male\",
-    \"matchType\": \"T20\",
-    \"league\": \"ICC\",
-    \"series\": \"Test\",
-    \"season\": \"2025-26\",
-    \"startDate\": \"2025-12-26T00:00:00.000Z\",
-    \"venueId\": \"$VENUE\",
-    \"team1\": {
-      \"teamId\": \"$AUS_ID\",
-      \"coachId\": \"$AUS_COACH\",
-      \"homeTeam\": true,
-      \"players\": []
-    },
-    \"team2\": {
-      \"teamId\": \"$IND_ID\",
-      \"coachId\": \"$IND_COACH\",
-      \"homeTeam\": false,
-      \"players\": []
-    }
-  }" | jq
-# → 400: { "error": "BadRequest", "message": "Minimum of one player required per team" }
-
-# Try to create a match with a bad venue ID — should get ref not found
 curl -s -X POST http://localhost:3000/matches \
   -H "Content-Type: application/json" \
   -d "{
     \"name\": \"Bad Ref Match\",
-    \"gender\": \"Male\",
-    \"matchType\": \"T20\",
-    \"league\": \"ICC\",
-    \"series\": \"Test\",
-    \"season\": \"2025-26\",
-    \"startDate\": \"2025-12-26T00:00:00.000Z\",
     \"venueId\": \"nonexistent-venue-id\",
     \"team1\": {
       \"teamId\": \"$AUS_ID\",
       \"coachId\": \"$AUS_COACH\",
       \"homeTeam\": true,
-      \"players\": [{\"playerId\": \"$AUS_P1\"}]
+      \"players\": [{\"playerId\": \"$AUS_P1\", \"battingPosition\": 1, \"isCaptain\": true}]
     },
     \"team2\": {
       \"teamId\": \"$IND_ID\",
       \"coachId\": \"$IND_COACH\",
       \"homeTeam\": false,
-      \"players\": [{\"playerId\": \"$IND_P1\"}]
+      \"players\": [{\"playerId\": \"$IND_P1\", \"battingPosition\": 1, \"isCaptain\": true}]
     }
   }" | jq
 # → 422: { "error": "UnprocessableEntity", "message": "Venue not found: nonexistent-venue-id" }
 ```
 
-**Step 7: Delete a match.**
+**Step 6: Delete a match.**
 
 ```bash
 # Delete the match — removes all items in the aggregate's partition
@@ -3006,7 +2745,7 @@ curl -s http://localhost:3000/matches/$MATCH_ID | jq
 # → 404: { "error": "NotFound", "message": "Match not found: ..." }
 ```
 
-You now have the complete cricket match management system running — with CRUD for all entity types, ref hydration, cascade updates, and aggregate-based match management with validation.
+You now have the complete cricket match management system running — with CRUD for all entity types, ref hydration, cascade updates, and aggregate-based match management.
 
 ---
 
@@ -3017,28 +2756,25 @@ You now have the complete cricket match management system running — with CRUD 
 | **Schema.Class** | Runtime-validated domain model | Every model file |
 | **Schema.brand** | Branded nominal types for IDs — preserved through Entity.Input, Entity.Key, and ref types | Ids.ts, services, API params |
 | **Schema.optionalKey** | Optional property key (may be absent) | All optional fields |
+| **Schema.Literals** | Runtime literal union schema | Enums.ts |
 | **DynamoModel.configure** | Rename fields, mark identifier/ref at entity level | Every entity |
 | **DynamoSchema + Table** | Application namespace + physical table binding | Schema.ts |
 | **Entity.make** | Binds model to table with indexes | Every entity |
 | **Entity.createSchema** | Derived schema: input fields minus PK composites, ref-aware | API create payloads |
 | **Entity.updateSchema** | Derived schema: optional non-key fields, ref-aware | API update payloads |
 | **Entity.cascade** | Propagate updates to referencing entities | TeamService, PlayerService |
+| **Single-composite cascade GSI** | Required for cascade — PK composite must be exactly `[refIdField]` | SquadSelections `byPlayer`/`byTeam` |
 | **Query combinators** | Composable query building | Pagination helpers, services |
 | **ServiceMap.Service** | Dependency-injectable service | Every service |
 | **Aggregate.make** | Graph-based composite entity | MatchAggregate |
 | **Aggregate.createSchema** | Derived schema: input minus PK, edges→IDs | MatchService create |
-| **Aggregate.updateSchema** | Derived schema: all input fields optional | MatchService update |
-| **Aggregate.list** | Cursor-based paginated listing | MatchService list |
-| **Aggregate.ListOptions / ListResult** | Pagination input/output types | MatchService list |
-| **Aggregate.ref** | Inline reference hydration | Match toss/winner |
 | **Aggregate.one / many** | Decompose to separate items | Venue, Coach, Players |
 | **Sub-aggregate + discriminator** | Reuse aggregate structure with differentiation | team1/team2 TeamSheets |
-| **Schema.makeFilter + check** | Composable validation rules on domain models | Match differentTeams, minPlayers |
+| **Aggregate cursor optic** | Targeted in-place mutation inside `update` | MatchService update |
 | **Table.definition (aggregates)** | Include aggregate GSIs in table creation | create-table.ts |
 | **AggregateAssemblyError** | Error when aggregate partition has no items | MatchesHandler not-found |
 | **Schema.ErrorClass API errors** | Typed HTTP errors with constructors, status codes, clean JSON | ApiErrors.ts |
 | **Effect.catchTag** | Convert domain errors to HTTP errors | App.ts error helpers |
-| **validationFailed** | Catch SchemaError from `.check()`, return 400 | Match create/update handlers |
 | **Layer composition** | Wire everything together at runtime | App.ts, server.ts |
 
 ---
@@ -3047,9 +2783,11 @@ You now have the complete cricket match management system running — with CRUD 
 
 From here you can extend the application:
 
-- **Add more enums** — The full gamemanager-v2 uses rich enum types (BowlingStyle, PlayingRole, MatchType, Season) for stronger validation.
-- **Add more validation rules** — Captain limits per team, date ordering (finishDate > startDate), toss/winner must be one of team1/team2.
-- **Add pre-write validation** — Move validation before the aggregate write (currently post-assembly) to prevent invalid data from being persisted.
+- **Grow the Match model** — Add fields like `gender`, `matchType`, `series`, `season`, `startDate`, `finishDate`, `toss`, `winner`, `result`, and an `umpires` sub-aggregate. Each new ref field becomes a `${name}Id` in `MatchAggregate.createSchema`.
+- **Aggregate-level validation** — Define `Schema.makeFilter<Match>(...)` rules (e.g. team1.team.id !== team2.team.id, ≥1 player per team) and compose them with `Match.check(...)`. Decode the assembled match through the validated schema in `MatchService.create`/`update`, mapping `SchemaError` to a 400.
+- **Aggregate list endpoint** — Add a `list: { index, name, pk, sk }` block to `MatchAggregate` and a matching GSI in `create-table.ts`. The service can then call `matches.list(filter, { limit, cursor })` to expose `GET /matches`.
+- **Richer update payloads** — Extend `MatchUpdatePayload` with more fields (date changes, toss, winner) and add corresponding `cursor.key(...).replace(...)` branches in `MatchService.update`. For ref fields like `tossId`, resolve the target via the cursor's current state or via an entity lookup before applying the mutation.
+- **Add more enums** — Stronger validation via richer literal unions (`BowlingStyle`, `PlayingRole`, `MatchType`, `Season`).
 - **Add tests** — Use `vi.fn()` to mock `DynamoClient` methods and test services/handlers without a real database.
 
 See the full implementation at `goals/gamemanager-v2/` for the complete application with all features.

@@ -9,6 +9,7 @@ import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
 import type { IndexPkInput } from "../src/internal/EntityTypes.js"
+import type * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 
 // ---------------------------------------------------------------------------
@@ -183,6 +184,57 @@ const BrandedSelectionEntity = Entity.make({
   },
 })
 
+/**
+ * Repro fixture for the bug where GSI pk/sk composites that reference a
+ * ref's renamed db field name (e.g. `teamId` from a `team: Team.pipe(ref)`
+ * field) used to silently collapse `IndexPkInput` to `Pick<Model, never>`.
+ *
+ * Mirrors the gamemanager tutorial's `SquadSelection` shape: identifier
+ * field renamed via `DynamoModel.configure({ id: { field: "selectionId" } })`,
+ * two ref fields (`team`, `player`), and GSIs whose pk composites use the
+ * derived `${ref}Id` names.
+ */
+class BrandedRefSelection extends Schema.Class<BrandedRefSelection>("BrandedRefSelection")({
+  id: Schema.String,
+  team: BrandedTeam,
+  player: BrandedPlayer,
+  season: Schema.String,
+  series: Schema.String,
+  selectionNumber: Schema.Number,
+  squadRole: Schema.Literals(["batter", "bowler", "allrounder", "wicketkeeper"]),
+  isCaptain: Schema.Boolean,
+  isViceCaptain: Schema.Boolean,
+}) {}
+
+const BrandedRefSelectionEntity = Entity.make({
+  model: DynamoModel.configure(BrandedRefSelection, {
+    id: { field: "selectionId", identifier: true },
+    team: { ref: true },
+    player: { ref: true },
+  }),
+  entityType: "BrandedRefSelection",
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byTeamSeries: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["teamId", "season", "series"] },
+      sk: { field: "gsi1sk", composite: ["selectionNumber"] },
+    },
+    byPlayer: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["playerId"] },
+      sk: { field: "gsi2sk", composite: ["season", "series"] },
+    },
+  },
+  refs: {
+    team: { entity: BrandedTeamEntity },
+    player: { entity: BrandedPlayerEntity },
+  },
+})
+
 const _MainTable = Table.make({
   schema: AppSchema,
   entities: {
@@ -195,6 +247,7 @@ const _MainTable = Table.make({
     BrandedTeamEntity,
     BrandedPlayerEntity,
     BrandedSelectionEntity,
+    BrandedRefSelectionEntity,
   },
 })
 
@@ -653,5 +706,93 @@ describe("Entity type extractors", () => {
     // Excess property rejected at compile time
     // @ts-expect-error — bogus is not a valid composite attribute
     const _excess: ByRoleInput = { role: "admin", bogus: "x" }
+  })
+
+  // -------------------------------------------------------------------------
+  // IndexPkInput — ref-renamed composite attribute resolution
+  // -------------------------------------------------------------------------
+  //
+  // Regression: an entity that uses `DynamoModel.ref` for a field (e.g.
+  // `team: Team`) and references the ref's renamed db field (`teamId`) in a
+  // GSI's pk composite previously collapsed `IndexPkInput` to
+  // `Pick<Model, never>`, silently dropping the required composite. The fix
+  // resolves ref-renamed composite names against the referenced entity's
+  // identifier value type.
+  //
+  // The conditional must be applied INLINE at the call site (not via an
+  // intermediate `type Refs = ...` alias) so that TypeScript preserves the
+  // literal `TRefs` shape. This mirrors how `Entity.query.byPlayer` is typed
+  // internally — `IndexPkInput<M, I, K, TRefs>` is computed inside the
+  // `Entity.query` mapped type, not via post-hoc inference.
+  it("IndexPkInput resolves ref-renamed composites for both pk and sk", () => {
+    type ProbeIndex<E, K extends string> =
+      E extends Entity.Entity<
+        infer M extends Schema.Top,
+        any,
+        infer I,
+        any,
+        any,
+        any,
+        any,
+        infer R,
+        any
+      >
+        ? K extends keyof I
+          ? IndexPkInput<M, I, K, R>
+          : never
+        : never
+
+    type SquadByPlayer = ProbeIndex<typeof BrandedRefSelectionEntity, "byPlayer">
+    type SquadByTeamSeries = ProbeIndex<typeof BrandedRefSelectionEntity, "byTeamSeries">
+
+    // pk-only ref-renamed composite is required (not silently dropped).
+    // Before the fix, `IndexPkInput` collapsed to just `{ season?, series? }`
+    // because `playerId` did not exist on the raw model — only on the refs.
+    expectTypeOf<SquadByPlayer>().toHaveProperty("playerId")
+    expectTypeOf<SquadByPlayer>().toHaveProperty("season")
+    expectTypeOf<SquadByPlayer>().toHaveProperty("series")
+
+    // The branded `BrandedPlayerId` flows through (with the `IndexPkInput`
+    // CaseInsensitive widening applying `| Lowercase<...>` for string types,
+    // which is intentional and shared with all other index input types).
+    type PlayerIdField = SquadByPlayer["playerId"]
+    expectTypeOf<BrandedPlayerId>().toMatchTypeOf<PlayerIdField>()
+
+    // Mixed pk: ref-renamed composite + regular model fields all required.
+    expectTypeOf<SquadByTeamSeries>().toHaveProperty("teamId")
+    expectTypeOf<SquadByTeamSeries>().toHaveProperty("season")
+    expectTypeOf<SquadByTeamSeries>().toHaveProperty("series")
+    type TeamIdField = SquadByTeamSeries["teamId"]
+    expectTypeOf<BrandedTeamId>().toMatchTypeOf<TeamIdField>()
+
+    // SK composite (`selectionNumber`) appears as an optional field.
+    expectTypeOf<SquadByTeamSeries>().toHaveProperty("selectionNumber")
+  })
+
+  it("query accessors accept ref-renamed pk composites at compile time", () => {
+    // Compile-time only — these expressions should typecheck without error.
+    // Each call exercises a query accessor whose pk composite uses the
+    // renamed `${ref}Id` form (e.g. `playerId` for a `player: Player.pipe(ref)` field).
+    const _byPlayer = (): Query.Query<unknown> =>
+      BrandedRefSelectionEntity.query.byPlayer({
+        playerId: "p1" as BrandedPlayerId,
+      })
+    // `byTeamSeries` requires all pk composites: teamId (ref-renamed), season, series.
+    const _byTeamSeries = (): Query.Query<unknown> =>
+      BrandedRefSelectionEntity.query.byTeamSeries({
+        teamId: "t1" as BrandedTeamId,
+        season: "2026",
+        series: "ipl",
+      })
+    // SK composites of the same index are optional — `selectionNumber` may be omitted.
+    const _byTeamSeriesNoSk = (): Query.Query<unknown> =>
+      BrandedRefSelectionEntity.query.byTeamSeries({
+        teamId: "t1" as BrandedTeamId,
+        season: "2026",
+        series: "ipl",
+      })
+    expect(typeof _byPlayer).toBe("function")
+    expect(typeof _byTeamSeries).toBe("function")
+    expect(typeof _byTeamSeriesNoSk).toBe("function")
   })
 })

@@ -151,7 +151,7 @@ describe("Table", () => {
       )
     })
 
-    it("includes aggregate collection GSI", () => {
+    it("includes aggregate collection as LSI when its PK matches the table primary PK", () => {
       const entity = {
         indexes: {
           primary: {
@@ -163,6 +163,53 @@ describe("Table", () => {
       const aggregate = {
         _tag: "Aggregate" as const,
         pkField: "pk",
+        collection: { index: "lsi1", sk: { field: "lsi1sk" } },
+        listIndex: undefined,
+      }
+      const table = Table.make({
+        schema,
+        entities: { entity },
+        aggregates: { aggregate },
+      })
+      const result = Table.definition(table)
+
+      // Collection index is auto-detected as an LSI because its PK (pk) equals
+      // the table's primary PK (pk). DynamoDB LSIs share the base table's HASH key.
+      expect(result.LocalSecondaryIndexes).toEqual([
+        {
+          IndexName: "lsi1",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "lsi1sk", KeyType: "RANGE" },
+          ],
+          Projection: { ProjectionType: "ALL" },
+        },
+      ])
+      // No GSI entry for lsi1
+      expect(result.GlobalSecondaryIndexes).toBeUndefined()
+      // pk, sk, lsi1sk
+      expect(result.AttributeDefinitions).toHaveLength(3)
+      expect(result.AttributeDefinitions.map((a) => a.AttributeName)).toEqual([
+        "lsi1sk",
+        "pk",
+        "sk",
+      ])
+    })
+
+    it("emits aggregate collection as a GSI when its PK does NOT match the table primary PK", () => {
+      // Preserves legacy behaviour for aggregates whose collection uses a
+      // distinct PK attribute — those cannot be LSIs per DynamoDB rules.
+      const entity = {
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
+          },
+        },
+      }
+      const aggregate = {
+        _tag: "Aggregate" as const,
+        pkField: "gsi2pk",
         collection: { index: "gsi2", sk: { field: "gsi2sk" } },
         listIndex: undefined,
       }
@@ -177,17 +224,18 @@ describe("Table", () => {
         {
           IndexName: "gsi2",
           KeySchema: [
-            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "gsi2pk", KeyType: "HASH" },
             { AttributeName: "gsi2sk", KeyType: "RANGE" },
           ],
           Projection: { ProjectionType: "ALL" },
         },
       ])
-      // pk, sk, gsi2sk
-      expect(result.AttributeDefinitions).toHaveLength(3)
+      expect(result.LocalSecondaryIndexes).toBeUndefined()
+      // pk, sk, gsi2pk, gsi2sk
+      expect(result.AttributeDefinitions).toHaveLength(4)
     })
 
-    it("includes aggregate list GSI alongside collection GSI", () => {
+    it("emits collection as LSI and list index as GSI simultaneously", () => {
       const entity = {
         indexes: {
           primary: {
@@ -204,7 +252,9 @@ describe("Table", () => {
       const aggregate = {
         _tag: "Aggregate" as const,
         pkField: "pk",
-        collection: { index: "gsi2", sk: { field: "gsi2sk" } },
+        // Collection shares base pk -> LSI
+        collection: { index: "lsi1", sk: { field: "lsi1sk" } },
+        // List index has its own PK -> GSI
         listIndex: {
           index: "gsi1",
           pk: { field: "gsi1pk" },
@@ -218,14 +268,15 @@ describe("Table", () => {
       })
       const result = Table.definition(table)
 
-      // gsi1 from entity, gsi2 from aggregate collection — no duplicates
-      expect(result.GlobalSecondaryIndexes).toHaveLength(2)
-      expect(result.GlobalSecondaryIndexes!.map((g) => g.IndexName)).toEqual(["gsi1", "gsi2"])
-      // pk, sk, gsi1pk, gsi1sk, gsi2sk
+      expect(result.GlobalSecondaryIndexes).toHaveLength(1)
+      expect(result.GlobalSecondaryIndexes!.map((g) => g.IndexName)).toEqual(["gsi1"])
+      expect(result.LocalSecondaryIndexes).toHaveLength(1)
+      expect(result.LocalSecondaryIndexes!.map((g) => g.IndexName)).toEqual(["lsi1"])
+      // pk, sk, gsi1pk, gsi1sk, lsi1sk
       expect(result.AttributeDefinitions).toHaveLength(5)
     })
 
-    it("includes aggregate list GSI when entity does not define it", () => {
+    it("emits list GSI when no entity defines it", () => {
       const entity = {
         indexes: {
           primary: {
@@ -237,7 +288,7 @@ describe("Table", () => {
       const aggregate = {
         _tag: "Aggregate" as const,
         pkField: "pk",
-        collection: { index: "gsi2", sk: { field: "gsi2sk" } },
+        collection: { index: "lsi1", sk: { field: "lsi1sk" } },
         listIndex: {
           index: "gsi1",
           pk: { field: "gsi1pk" },
@@ -251,11 +302,85 @@ describe("Table", () => {
       })
       const result = Table.definition(table)
 
-      // Both GSIs present
-      expect(result.GlobalSecondaryIndexes).toHaveLength(2)
-      expect(result.GlobalSecondaryIndexes!.map((g) => g.IndexName)).toEqual(["gsi1", "gsi2"])
-      // pk, sk, gsi1pk, gsi1sk, gsi2sk
+      expect(result.GlobalSecondaryIndexes).toHaveLength(1)
+      expect(result.GlobalSecondaryIndexes!.map((g) => g.IndexName)).toEqual(["gsi1"])
+      expect(result.LocalSecondaryIndexes).toHaveLength(1)
+      expect(result.LocalSecondaryIndexes!.map((g) => g.IndexName)).toEqual(["lsi1"])
+      // pk, sk, gsi1pk, gsi1sk, lsi1sk
       expect(result.AttributeDefinitions).toHaveLength(5)
+    })
+
+    it("produces a CreateTable-shaped input for a cricket-style LSI aggregate", () => {
+      // Round-trip test: build a synthetic table the way DynamoClient.ts does
+      // for `db.tables.*.create()` and assert the output is shaped like what
+      // DynamoDB CreateTable would accept.
+      const rootEntity = {
+        entityType: "MatchItem",
+        indexes: {
+          primary: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
+          },
+        },
+      }
+      const matchAggregate = {
+        _tag: "Aggregate" as const,
+        name: "Match",
+        pkField: "pk",
+        collection: { index: "lsi1", sk: { field: "lsi1sk" } },
+        listIndex: undefined,
+      }
+      // Simulate the synthetic Table assembled inside DynamoClient.make()
+      const table = Table.make({
+        schema,
+        entities: { MatchItem: rootEntity },
+        aggregates: { Match: matchAggregate },
+      })
+      const def = Table.definition(table)
+
+      // KeySchema — base table HASH/RANGE
+      expect(def.KeySchema).toEqual([
+        { AttributeName: "pk", KeyType: "HASH" },
+        { AttributeName: "sk", KeyType: "RANGE" },
+      ])
+
+      // AttributeDefinitions — all referenced key attributes as String
+      expect(def.AttributeDefinitions).toEqual([
+        { AttributeName: "lsi1sk", AttributeType: "S" },
+        { AttributeName: "pk", AttributeType: "S" },
+        { AttributeName: "sk", AttributeType: "S" },
+      ])
+
+      // LocalSecondaryIndexes — lsi1 with base pk + lsi1sk, projected ALL
+      expect(def.LocalSecondaryIndexes).toEqual([
+        {
+          IndexName: "lsi1",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "lsi1sk", KeyType: "RANGE" },
+          ],
+          Projection: { ProjectionType: "ALL" },
+        },
+      ])
+
+      // No GSIs expected
+      expect(def.GlobalSecondaryIndexes).toBeUndefined()
+
+      // Shape sanity: building a CreateTable input with these fields + a
+      // TableName should be valid for DynamoDB's CreateTableCommand.
+      const createInput = {
+        TableName: "cricket-test",
+        BillingMode: "PAY_PER_REQUEST" as const,
+        ...def,
+      }
+      expect(createInput.TableName).toBe("cricket-test")
+      expect(createInput.KeySchema[0]!.AttributeName).toBe("pk")
+      expect(createInput.LocalSecondaryIndexes).toHaveLength(1)
+      expect(createInput.LocalSecondaryIndexes![0]!.IndexName).toBe("lsi1")
+      // The LSI HASH attribute MUST match the base table's HASH key
+      expect(createInput.LocalSecondaryIndexes![0]!.KeySchema[0]!.AttributeName).toBe(
+        createInput.KeySchema[0]!.AttributeName,
+      )
     })
   })
 })

@@ -166,6 +166,13 @@ export interface GlobalSecondaryIndex {
   readonly Projection: { readonly ProjectionType: "ALL" }
 }
 
+/** LSI definition for CreateTable input. */
+export interface LocalSecondaryIndex {
+  readonly IndexName: string
+  readonly KeySchema: Array<KeySchemaElement>
+  readonly Projection: { readonly ProjectionType: "ALL" }
+}
+
 /**
  * Derived CreateTable input (minus TableName) computed from entity index definitions.
  * Produced by {@link definition}. Mutable arrays for direct compatibility with
@@ -175,6 +182,7 @@ export interface TableDefinition {
   readonly KeySchema: Array<KeySchemaElement>
   readonly AttributeDefinitions: Array<AttributeDefinition>
   readonly GlobalSecondaryIndexes?: Array<GlobalSecondaryIndex> | undefined
+  readonly LocalSecondaryIndexes?: Array<LocalSecondaryIndex> | undefined
 }
 
 /**
@@ -183,10 +191,19 @@ export interface TableDefinition {
  * Scans all entity index definitions and aggregate GSI configs to produce:
  * - KeySchema (from primary index)
  * - AttributeDefinitions (all unique key attributes)
- * - GlobalSecondaryIndexes (from non-primary indexes + aggregate collection/list indexes)
+ * - GlobalSecondaryIndexes (from non-primary entity indexes + aggregate list indexes,
+ *   plus aggregate collection indexes whose PK does not match the base table PK)
+ * - LocalSecondaryIndexes (from aggregate collection indexes whose PK equals the base
+ *   table PK — DynamoDB LSIs by definition share the base table's partition key)
  *
  * The physical table name is omitted — that's deployment config.
  * All key attributes are typed as "S" (String) since generated keys are always strings.
+ *
+ * LSI auto-detection: an aggregate's `collection` GSI config is emitted as an LSI
+ * iff `agg.pkField` equals the table's primary PK field (determined from the first
+ * entity's primary index). This matches DynamoDB semantics — any index that shares
+ * the base table's partition key IS an LSI — and makes `lsi1`..`lsi5`-style indexes
+ * on aggregates work transparently with `db.tables.*.create()`.
  */
 export const definition = (table: Table): TableDefinition => {
   const members: ReadonlyArray<EntityLike | AggregateLike> = [
@@ -198,30 +215,63 @@ export const definition = (table: Table): TableDefinition => {
     throw new Error("Table.definition requires at least one entity or aggregate")
   }
 
-  // Collect all unique key field names and GSI definitions
-  const attributeNames = new Set<string>()
-  const gsiMap = new Map<string, { pk: string; sk: string }>()
+  // Pass 1: determine the table's primary PK/SK from the first entity's primary index.
+  // This is needed before we can classify aggregate collection indexes as LSI vs GSI.
   let primaryPk: string | undefined
   let primarySk: string | undefined
+  for (const member of members) {
+    if ("_tag" in member && member._tag === "Aggregate") continue
+    const entity = member as EntityLike
+    const primary = entity.indexes.primary
+    if (primary) {
+      primaryPk = primary.pk.field
+      primarySk = primary.sk.field
+      break
+    }
+  }
+
+  if (primaryPk === undefined) {
+    throw new Error("No primary index found on any entity")
+  }
+
+  // Pass 2: collect attribute names and classify indexes (GSI vs LSI).
+  const attributeNames = new Set<string>()
+  const gsiMap = new Map<string, { pk: string; sk: string }>()
+  const lsiMap = new Map<string, { pk: string; sk: string }>()
+
+  // Always include the primary key fields in attribute definitions.
+  attributeNames.add(primaryPk)
+  if (primarySk !== undefined && primarySk !== primaryPk) {
+    attributeNames.add(primarySk)
+  }
 
   for (const member of members) {
     if ("_tag" in member && member._tag === "Aggregate") {
-      // Aggregate — extract collection and list GSI configs
+      // Aggregate — extract collection and list index configs
       const agg = member as AggregateLike
 
-      // Collection GSI: PK = aggregate's pkField, SK = collection sk field
+      // Collection index: PK = aggregate's pkField, SK = collection sk field.
+      // If pkField matches the table's primary PK, emit as an LSI (DynamoDB requires
+      // LSIs to share the base table's HASH key). Otherwise fall back to GSI — this
+      // preserves behaviour for any user whose collection uses a distinct PK attribute.
       const collectionIndex = agg.collection.index
       attributeNames.add(agg.pkField)
       attributeNames.add(agg.collection.sk.field)
-      if (!gsiMap.has(collectionIndex)) {
-        gsiMap.set(collectionIndex, { pk: agg.pkField, sk: agg.collection.sk.field })
+      if (agg.pkField === primaryPk) {
+        if (!lsiMap.has(collectionIndex) && !gsiMap.has(collectionIndex)) {
+          lsiMap.set(collectionIndex, { pk: agg.pkField, sk: agg.collection.sk.field })
+        }
+      } else {
+        if (!gsiMap.has(collectionIndex) && !lsiMap.has(collectionIndex)) {
+          gsiMap.set(collectionIndex, { pk: agg.pkField, sk: agg.collection.sk.field })
+        }
       }
 
-      // List GSI (if configured)
+      // List GSI (if configured) — always a GSI; has its own PK attribute.
       if (agg.listIndex) {
         attributeNames.add(agg.listIndex.pk.field)
         attributeNames.add(agg.listIndex.sk.field)
-        if (!gsiMap.has(agg.listIndex.index)) {
+        if (!gsiMap.has(agg.listIndex.index) && !lsiMap.has(agg.listIndex.index)) {
           gsiMap.set(agg.listIndex.index, {
             pk: agg.listIndex.pk.field,
             sk: agg.listIndex.sk.field,
@@ -238,23 +288,18 @@ export const definition = (table: Table): TableDefinition => {
         attributeNames.add(index.sk.field)
 
         if (indexName === "primary") {
-          // First entity's primary index determines table key schema
-          if (primaryPk === undefined) {
-            primaryPk = index.pk.field
-            primarySk = index.sk.field
-          }
-        } else if (index.index) {
-          // GSI — collect by physical index name
-          if (!gsiMap.has(index.index)) {
+          // Primary key already captured in pass 1.
+          continue
+        }
+        if (index.index) {
+          // Entity-declared secondary index — always a GSI. Entity index definitions
+          // don't carry LSI semantics; LSIs are only introduced via aggregate collections.
+          if (!gsiMap.has(index.index) && !lsiMap.has(index.index)) {
             gsiMap.set(index.index, { pk: index.pk.field, sk: index.sk.field })
           }
         }
       }
     }
-  }
-
-  if (primaryPk === undefined) {
-    throw new Error("No primary index found on any entity")
   }
 
   const KeySchema: Array<KeySchemaElement> = [{ AttributeName: primaryPk, KeyType: "HASH" }]
@@ -280,9 +325,29 @@ export const definition = (table: Table): TableDefinition => {
           }))
       : undefined
 
-  return GlobalSecondaryIndexes
-    ? { KeySchema, AttributeDefinitions, GlobalSecondaryIndexes }
-    : { KeySchema, AttributeDefinitions }
+  const LocalSecondaryIndexes: Array<LocalSecondaryIndex> | undefined =
+    lsiMap.size > 0
+      ? Array.from(lsiMap.entries())
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([indexName, keys]) => ({
+            IndexName: indexName,
+            KeySchema: [
+              { AttributeName: keys.pk, KeyType: "HASH" as const },
+              { AttributeName: keys.sk, KeyType: "RANGE" as const },
+            ],
+            Projection: { ProjectionType: "ALL" as const },
+          }))
+      : undefined
+
+  const result: {
+    KeySchema: Array<KeySchemaElement>
+    AttributeDefinitions: Array<AttributeDefinition>
+    GlobalSecondaryIndexes?: Array<GlobalSecondaryIndex>
+    LocalSecondaryIndexes?: Array<LocalSecondaryIndex>
+  } = { KeySchema, AttributeDefinitions }
+  if (GlobalSecondaryIndexes) result.GlobalSecondaryIndexes = GlobalSecondaryIndexes
+  if (LocalSecondaryIndexes) result.LocalSecondaryIndexes = LocalSecondaryIndexes
+  return result
 }
 
 // ---------------------------------------------------------------------------

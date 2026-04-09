@@ -506,7 +506,7 @@ export type TypedClient<
               never,
               Schema.Schema.Type<M>
             >
-          } & EntityIndexAccessors<M, I>
+          } & EntityIndexAccessors<M, I, R>
         >
       : never
   }
@@ -629,21 +629,25 @@ type ResolveKey<M extends Schema.Top, I> =
   EntityKeyType<M, I> extends infer K ? { [P in keyof K]: K[P] } : never
 
 /** Force eager resolution of remaining SK fields for clean hover display. */
-type ResolveSkFields<M extends Schema.Top, I, K extends keyof I, Provided> =
-  Omit<IndexSkFields<M, I, K>, keyof Provided> extends infer SK
+type ResolveSkFields<M extends Schema.Top, I, K extends keyof I, Provided, R = undefined> =
+  Omit<IndexSkFields<M, I, K, R>, keyof Provided> extends infer SK
     ? { readonly [P in keyof SK]: SK[P] }
     : never
 
 /** Compute entity query accessors for each index (non-primary).
- * Generic over provided input — `.where()` only exposes SK composites NOT already provided. */
-type EntityIndexAccessors<M extends Schema.Top, I extends Record<string, IndexDefinition>> = {
-  readonly [K in Exclude<keyof I, "primary"> & string]: <
-    Provided extends IndexPkInput<M, I, K>,
-  >(
+ * Generic over provided input — `.where()` only exposes SK composites NOT already provided.
+ * `R` (refs) lets ref-derived composite names (e.g. `playerId`) resolve to their
+ * branded identifier types instead of being silently dropped. */
+type EntityIndexAccessors<
+  M extends Schema.Top,
+  I extends Record<string, IndexDefinition>,
+  R = undefined,
+> = {
+  readonly [K in Exclude<keyof I, "primary"> & string]: <Provided extends IndexPkInput<M, I, K, R>>(
     composites: Provided,
   ) => import("./internal/BoundQuery.js").BoundQuery<
     Schema.Schema.Type<M>,
-    ResolveSkFields<M, I, K, Provided>,
+    ResolveSkFields<M, I, K, Provided, R>,
     Schema.Schema.Type<M>
   >
 }
@@ -1027,11 +1031,38 @@ const makeFromConfig = (config: {
     if (config.tables) {
       for (const [tableKey, table] of Object.entries(config.tables)) {
         const tableConfig = yield* table.Tag
-        tables[tableKey] = buildTableOperationsFromTable(
-          tableConfig.name,
-          table as unknown as Table,
-          client,
-        )
+        // Merge any runtime-registered aggregates from `config.aggregates` whose
+        // `_tableTag` matches this table's tag. Users may intentionally omit
+        // aggregates from `Table.make({ aggregates })` to sidestep the multi-file
+        // circular-import problem, registering them on `DynamoClient.make` instead.
+        // Without this merge, `tableDefinition()` would never see those aggregates
+        // and `db.tables.*.create()` would silently drop their (L|G)SIs.
+        let mergedTable = table as unknown as Table
+        if (config.aggregates) {
+          const tableTagKey = table.Tag.key
+          const existingAggs = table.aggregates as Record<string, unknown>
+          const existingAggSet = new Set(Object.values(existingAggs))
+          const extraAggregateEntries: Array<[string, unknown]> = []
+          for (const [aggKey, agg] of Object.entries(config.aggregates)) {
+            const aggTag = (agg as unknown as { _tableTag?: EntityLike["_tableTag"] })._tableTag
+            if (aggTag === undefined) continue
+            if (aggTag.key !== tableTagKey) continue
+            // Skip if this aggregate is already registered on the table object
+            // (reference equality) so we don't emit duplicate LSI/GSI entries.
+            if (existingAggSet.has(agg)) continue
+            extraAggregateEntries.push([aggKey, agg])
+          }
+          if (extraAggregateEntries.length > 0) {
+            mergedTable = {
+              ...(table as unknown as Table),
+              aggregates: {
+                ...existingAggs,
+                ...Object.fromEntries(extraAggregateEntries),
+              },
+            } as unknown as Table
+          }
+        }
+        tables[tableKey] = buildTableOperationsFromTable(tableConfig.name, mergedTable, client)
       }
     } else {
       // Group entities by table tag so we can derive full table schema for create().

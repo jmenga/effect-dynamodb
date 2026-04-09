@@ -137,12 +137,34 @@ export type IndexSkComposites<TIndexes, K extends keyof TIndexes> = TIndexes[K] 
   ? SKC[number]
   : never
 
-/** Pick SK composite fields from the model with their actual types. */
+/**
+ * Map a refs config object to its derived `${ref}Id` field map.
+ *
+ * For `{ team: { entity: TeamEntity }, player: { entity: PlayerEntity } }` this yields
+ * `{ teamId: TeamId, playerId: PlayerId }`, using each referenced entity's identifier
+ * value type (branded when available, falling back to `string`).
+ */
+type RefIdFields<TRefs> = [TRefs] extends [undefined]
+  ? {}
+  : { readonly [K in keyof TRefs & string as `${K}Id`]: EntityIdentifierValue<TRefs[K]> }
+
+/**
+ * Composite-resolvable fields for an entity: model fields plus the derived ref-id
+ * fields. This is the canonical lookup table for resolving the value type of a
+ * composite key name like `playerId` (which lives on the ref, not on the model).
+ */
+type CompositeFields<TModel extends Schema.Top, TRefs> = ModelType<TModel> & RefIdFields<TRefs>
+
+/** Pick SK composite fields from the model (or refs) with their actual types. */
 export type IndexSkFields<
   TModel extends Schema.Top,
   TIndexes,
   K extends keyof TIndexes,
-> = Pick<ModelType<TModel>, IndexSkComposites<TIndexes, K> & keyof ModelType<TModel>>
+  TRefs = undefined,
+> = Pick<
+  CompositeFields<TModel, TRefs>,
+  IndexSkComposites<TIndexes, K> & keyof CompositeFields<TModel, TRefs>
+>
 
 /**
  * Widen string literal types to include their lowercase variants.
@@ -163,18 +185,30 @@ type Simplify<T> = { [K in keyof T]: T[K] } & {}
  * PK composites are required. SK composites are optional.
  * SK prefix ordering is enforced at runtime.
  * String literal types are widened to include lowercase variants.
+ *
+ * When `TRefs` is provided, ref-derived composite names (e.g. `teamId` for a
+ * `team: Team.pipe(DynamoModel.ref)` field) resolve to the referenced entity's
+ * branded identifier type. Without this, an index whose pk composite references
+ * a renamed ref field would silently collapse to `Pick<Model, never>`.
  */
 export type IndexPkInput<
   TModel extends Schema.Top,
   TIndexes,
   K extends keyof TIndexes,
+  TRefs = undefined,
 > = Simplify<
   CaseInsensitiveProps<
-    Pick<ModelType<TModel>, IndexPkComposites<TIndexes, K> & keyof ModelType<TModel>>
+    Pick<
+      CompositeFields<TModel, TRefs>,
+      IndexPkComposites<TIndexes, K> & keyof CompositeFields<TModel, TRefs>
+    >
   > &
     Partial<
       CaseInsensitiveProps<
-        Pick<ModelType<TModel>, IndexSkComposites<TIndexes, K> & keyof ModelType<TModel>>
+        Pick<
+          CompositeFields<TModel, TRefs>,
+          IndexSkComposites<TIndexes, K> & keyof CompositeFields<TModel, TRefs>
+        >
       >
     >
 >

@@ -522,7 +522,7 @@ export interface Entity<
   /** Index query accessors. Each non-primary index becomes a method that accepts PK composites and returns a {@link Query.Query}. */
   readonly query: {
     readonly [K in Exclude<keyof TIndexes, "primary">]: (
-      pk: IndexPkInput<TModel, TIndexes, K>,
+      pk: IndexPkInput<TModel, TIndexes, K, TRefs>,
     ) => Query.Query<ModelType<TModel>>
   }
 
@@ -1572,18 +1572,33 @@ const makeImpl = <
    * Find a GSI on a target entity whose PK composite includes the source entity's
    * identifier field name (e.g., "playerId"). This GSI is used to query all target
    * items that reference the source entity.
+   *
+   * Selection priority:
+   *   1. A GSI whose PK composite is exactly `[idFieldName]` (single attribute).
+   *      This is the only shape that can be recomposed from the source identifier
+   *      alone, so it's always safe for cascade.
+   *   2. Otherwise, the first GSI whose PK composite contains `idFieldName`.
+   *      This is a fallback for backwards compatibility — `executeCascade`
+   *      validates that all extra composites can be supplied at runtime and
+   *      raises a clear error if they cannot.
    */
   const findCascadeIndex = (
     target: CascadeTarget,
     idFieldName: string,
   ): { readonly indexName: string; readonly indexDef: IndexDefinition } | undefined => {
+    let fallback: { readonly indexName: string; readonly indexDef: IndexDefinition } | undefined
     for (const [indexName, indexDef] of Object.entries(target.indexes)) {
       if (indexName === "primary") continue
-      if (indexDef.pk.composite.includes(idFieldName)) {
+      const composite = indexDef.pk.composite
+      if (composite.length === 1 && composite[0] === idFieldName) {
+        // Exact match — preferred. PK is fully determined by the source id.
         return { indexName, indexDef }
       }
+      if (fallback === undefined && composite.includes(idFieldName)) {
+        fallback = { indexName, indexDef }
+      }
     }
-    return undefined
+    return fallback
   }
 
   /** Cached source entity identifier field name (e.g., "playerId") */
@@ -1623,6 +1638,31 @@ const makeImpl = <
         // Find GSI on target whose PK composite includes the ref's ID field
         const cascadeIdx = findCascadeIndex(target, matchingRef.idFieldName)
         if (!cascadeIdx) continue
+
+        // The cascade can only recompose a GSI PK from the source identifier
+        // if every composite attribute is satisfied. The source entity (e.g. a
+        // Team) only carries its own identifier (e.g. teamId), so any GSI whose
+        // PK includes additional composites (e.g. season, series) is unusable
+        // for cascade. findCascadeIndex prefers the safe shape, but the
+        // fallback may still hand back an over-composed GSI when no exact
+        // match exists. Detect that here and fail with a clear, tagged error
+        // rather than throwing deep inside KeyComposer.composePk.
+        const cascadePkComposite = cascadeIdx.indexDef.pk.composite
+        if (cascadePkComposite.length !== 1 || cascadePkComposite[0] !== matchingRef.idFieldName) {
+          return yield* new CascadePartialFailure({
+            sourceEntity: sourceEntityType,
+            sourceId: sourceIdValue,
+            succeeded: 0,
+            failed: 0,
+            errors: [
+              `Cascade target "${target.entityType}" has no GSI usable for cascade from "${sourceEntityType}". ` +
+                `The chosen index "${cascadeIdx.indexName}" (${cascadeIdx.indexDef.index}) has PK composite ` +
+                `[${cascadePkComposite.join(", ")}], but cascade requires a GSI whose PK composite is exactly ` +
+                `["${matchingRef.idFieldName}"]. Add a single-attribute GSI keyed on "${matchingRef.idFieldName}" ` +
+                `(or use the refs.${matchingRef.fieldName}.cascade config to auto-generate one).`,
+            ],
+          })
+        }
 
         // Resolve target table name
         const { name: targetTableName } = yield* target._tableTag

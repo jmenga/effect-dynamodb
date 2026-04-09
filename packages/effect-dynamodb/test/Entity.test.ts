@@ -6544,5 +6544,203 @@ describe("Entity", () => {
         expect(mockQuery.mock.calls[1]![0].IndexName).toBe("gsi3")
       }).pipe(Effect.provide(TestLayer)),
     )
+
+    // -------------------------------------------------------------------------
+    // Cascade GSI selection — exact-match preference
+    //
+    // Regression tests for the bug where findCascadeIndex returned the FIRST
+    // GSI whose PK composite contained the source's identifier field, even if
+    // that GSI also had additional composites the source couldn't supply.
+    // This caused KeyComposer.composePk to throw "Missing composite attribute"
+    // at runtime whenever a target had a multi-composite GSI listed before a
+    // single-composite cascade-friendly GSI.
+    // -------------------------------------------------------------------------
+    describe("cascade GSI selection", () => {
+      // SquadSelections-style entity: a multi-composite GSI on `playerId`
+      // (declared FIRST so the legacy first-match logic would pick it) plus a
+      // single-composite GSI on `playerId` (the cascade-safe shape).
+      class CascadeSquadSelection extends Schema.Class<CascadeSquadSelection>(
+        "CascadeSquadSelection",
+      )({
+        squadSelectionId: Schema.String,
+        player: CascadePlayer.pipe(DynamoModel.ref),
+        season: Schema.String,
+        series: Schema.String,
+        selectionNumber: Schema.Number,
+      }) {}
+
+      const CascadeSquadSelectionEntity = withConfig(
+        Entity.make({
+          model: CascadeSquadSelection,
+          entityType: "CascadeSquadSelection",
+          primaryKey: {
+            pk: { field: "pk", composite: ["squadSelectionId"] },
+            sk: { field: "sk", composite: [] },
+          },
+          indexes: {
+            // Multi-composite GSI declared first — must NOT be picked.
+            byPlayerSeries: {
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["playerId", "season", "series"] },
+              sk: { field: "gsi1sk", composite: ["selectionNumber"] },
+            },
+            // Single-composite GSI on the same identifier — MUST be picked.
+            byPlayer: {
+              name: "gsi2",
+              pk: { field: "gsi2pk", composite: ["playerId"] },
+              sk: { field: "gsi2sk", composite: ["season", "series"] },
+            },
+          },
+          refs: {
+            player: { entity: CascadePlayerEntity },
+          },
+        }),
+      )
+
+      it.effect(
+        "prefers single-composite GSI even when multi-composite GSI is declared first",
+        () =>
+          Effect.gen(function* () {
+            // Source update succeeds — returns the new player domain data.
+            mockUpdateItem.mockResolvedValueOnce({
+              Attributes: toAttributeMap({
+                pk: "$myapp#v1#CascadePlayer#p-1",
+                sk: "$myapp#v1#CascadePlayer",
+                playerId: "p-1",
+                displayName: "Steven Smith",
+                position: "Batter",
+                __edd_e__: "CascadePlayer",
+              }),
+            })
+
+            // Cascade GSI query returns one matching squad selection.
+            mockQuery.mockResolvedValueOnce({
+              Items: [
+                toAttributeMap({
+                  pk: "$myapp#v1#CascadeSquadSelection#sq-1",
+                  sk: "$myapp#v1#CascadeSquadSelection",
+                  squadSelectionId: "sq-1",
+                  player: { playerId: "p-1", displayName: "Steve Smith", position: "Batter" },
+                  season: "2026",
+                  series: "Ashes",
+                  selectionNumber: 1,
+                  __edd_e__: "CascadeSquadSelection",
+                  gsi1pk: "$myapp#v1#CascadeSquadSelection#p-1#2026#Ashes",
+                  gsi1sk: "$myapp#v1#CascadeSquadSelection#1",
+                  gsi2pk: "$myapp#v1#CascadeSquadSelection#p-1",
+                  gsi2sk: "$myapp#v1#CascadeSquadSelection#2026#Ashes",
+                }),
+              ],
+              LastEvaluatedKey: undefined,
+            })
+
+            // Cascade target update succeeds.
+            mockUpdateItem.mockResolvedValueOnce({})
+
+            yield* CascadePlayerEntity.update({ playerId: "p-1" }).pipe(
+              Entity.set({ displayName: "Steven Smith" }),
+              Entity.cascade({ targets: [CascadeSquadSelectionEntity] }),
+              Entity.asModel,
+            )
+
+            // Verify cascade GSI query was issued and chose the SINGLE-composite
+            // GSI (gsi2 / byPlayer), not the multi-composite one (gsi1).
+            expect(mockQuery).toHaveBeenCalledTimes(1)
+            const queryCall = mockQuery.mock.calls[0]![0]
+            expect(queryCall.IndexName).toBe("gsi2")
+            expect(queryCall.ExpressionAttributeNames["#pk"]).toBe("gsi2pk")
+            // The :pk value must contain the player id and NOT contain a
+            // season/series segment (which would prove the multi-composite GSI
+            // had been picked instead).
+            const pkValue = queryCall.ExpressionAttributeValues[":pk"].S as string
+            expect(pkValue).toContain("p-1")
+            expect(pkValue).not.toContain("2026")
+            expect(pkValue).not.toContain("Ashes")
+
+            // Verify cascade target update fired with the new player ref data.
+            expect(mockUpdateItem).toHaveBeenCalledTimes(2)
+            const cascadeUpdate = mockUpdateItem.mock.calls[1]![0]
+            expect(cascadeUpdate.UpdateExpression).toBe("SET #ref = :refData")
+            expect(cascadeUpdate.ExpressionAttributeNames["#ref"]).toBe("player")
+            const refData = cascadeUpdate.ExpressionAttributeValues[":refData"]
+            expect(refData.M.playerId.S).toBe("p-1")
+            expect(refData.M.displayName.S).toBe("Steven Smith")
+          }).pipe(Effect.provide(TestLayer)),
+      )
+
+      // -----------------------------------------------------------------------
+      // Defensive case: target has ONLY a multi-composite GSI containing the
+      // source identifier (no exact-match GSI exists). The original buggy code
+      // would crash with "Missing composite attribute" deep inside KeyComposer.
+      // The fix instead surfaces a tagged CascadePartialFailure that explains
+      // exactly what's wrong.
+      // -----------------------------------------------------------------------
+      class CascadeOverComposed extends Schema.Class<CascadeOverComposed>("CascadeOverComposed")({
+        ocId: Schema.String,
+        player: CascadePlayer.pipe(DynamoModel.ref),
+        season: Schema.String,
+        series: Schema.String,
+      }) {}
+
+      const CascadeOverComposedEntity = withConfig(
+        Entity.make({
+          model: CascadeOverComposed,
+          entityType: "CascadeOverComposed",
+          primaryKey: {
+            pk: { field: "pk", composite: ["ocId"] },
+            sk: { field: "sk", composite: [] },
+          },
+          indexes: {
+            // Only GSI containing playerId — but with extra composites the
+            // source CascadePlayer entity can't supply.
+            byPlayerSeries: {
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["playerId", "season", "series"] },
+              sk: { field: "gsi1sk", composite: [] },
+            },
+          },
+          refs: {
+            player: { entity: CascadePlayerEntity },
+          },
+        }),
+      )
+
+      it.effect("raises CascadePartialFailure when no usable GSI exists", () =>
+        Effect.gen(function* () {
+          mockUpdateItem.mockResolvedValueOnce({
+            Attributes: toAttributeMap({
+              pk: "$myapp#v1#CascadePlayer#p-1",
+              sk: "$myapp#v1#CascadePlayer",
+              playerId: "p-1",
+              displayName: "Steven Smith",
+              position: "Batter",
+              __edd_e__: "CascadePlayer",
+            }),
+          })
+
+          const error = yield* CascadePlayerEntity.update({ playerId: "p-1" })
+            .pipe(
+              Entity.set({ displayName: "Steven Smith" }),
+              Entity.cascade({ targets: [CascadeOverComposedEntity] }),
+            )
+            .asEffect()
+            .pipe(Effect.flip)
+
+          expect(error._tag).toBe("CascadePartialFailure")
+          if (error._tag === "CascadePartialFailure") {
+            expect(error.sourceEntity).toBe("CascadePlayer")
+            expect(error.sourceId).toBe("p-1")
+            expect(error.errors).toHaveLength(1)
+            const message = String(error.errors[0])
+            expect(message).toContain("CascadeOverComposed")
+            expect(message).toContain("playerId")
+            // The cascade should NOT have queried or updated anything.
+            expect(mockQuery).not.toHaveBeenCalled()
+            // Source update was the only updateItem call.
+            expect(mockUpdateItem).toHaveBeenCalledTimes(1)
+          }
+        }).pipe(Effect.provide(TestLayer)),
+      )
+    })
   })
 })

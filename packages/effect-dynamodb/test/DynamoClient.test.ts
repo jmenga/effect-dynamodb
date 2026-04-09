@@ -1,11 +1,14 @@
 import { describe, expect, it } from "@effect/vitest"
-import { Config, ConfigProvider, Effect, Layer } from "effect"
+import { Config, ConfigProvider, Effect, Layer, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 
 const configFromMap = (entries: Record<string, string>) =>
   ConfigProvider.layer(ConfigProvider.fromUnknown(entries))
 
+import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
+import * as DynamoSchema from "../src/DynamoSchema.js"
+import * as Entity from "../src/Entity.js"
 import {
   DynamoError,
   DynamoValidationError,
@@ -17,6 +20,7 @@ import {
   ResourceNotFoundError,
   ThrottlingError,
 } from "../src/Errors.js"
+import * as Table from "../src/Table.js"
 
 // Create a mock DynamoClient layer for testing
 const mockPutItem = vi.fn()
@@ -367,5 +371,208 @@ describe("DynamoClient", () => {
         expect(error.cause).toBe(unknownError)
       }).pipe(Effect.provide(ClassifiedDynamoClient)),
     )
+  })
+
+  // -------------------------------------------------------------------------
+  // make({ tables, aggregates }) — aggregate→table merge for LSI auto-detection
+  //
+  // Regression guard for: aggregates passed via `DynamoClient.make({ aggregates })`
+  // but NOT registered on `Table.make({ aggregates })` were silently dropped in the
+  // `if (config.tables)` branch, so `db.tables.*.create()` never provisioned their
+  // LSIs and downstream aggregate ops failed with "table does not have index lsi1".
+  // -------------------------------------------------------------------------
+  describe("make — aggregate→table LSI merge", () => {
+    // Minimal reusable fixtures
+    const AppSchema = DynamoSchema.make({ name: "testapp", version: 1 })
+
+    class MatchItem extends Schema.Class<MatchItem>("MatchItem")({
+      id: Schema.String,
+      name: Schema.String,
+    }) {}
+
+    class Venue extends Schema.Class<Venue>("Venue")({
+      venueId: Schema.String,
+      name: Schema.String,
+    }) {}
+
+    const MatchItemEntity = Entity.make({
+      model: MatchItem,
+      entityType: "MatchItem",
+      primaryKey: {
+        pk: { field: "pk", composite: ["id"] },
+        sk: { field: "sk", composite: [] },
+      },
+    })
+
+    const VenueEntity = Entity.make({
+      model: Venue,
+      entityType: "Venue",
+      primaryKey: {
+        pk: { field: "pk", composite: ["venueId"] },
+        sk: { field: "sk", composite: [] },
+      },
+    })
+
+    /**
+     * Build a layered DynamoClient that captures `createTable` calls into
+     * the provided ref array. All other ops die (they should not be called
+     * during `db.tables.*.create()`).
+     */
+    const makeCapturingClient = (captured: Array<unknown>) =>
+      Layer.succeed(DynamoClient, {
+        putItem: () => Effect.die("not used"),
+        getItem: () => Effect.die("not used"),
+        deleteItem: () => Effect.die("not used"),
+        updateItem: () => Effect.die("not used"),
+        query: () => Effect.die("not used"),
+        batchGetItem: () => Effect.die("not used"),
+        batchWriteItem: () => Effect.die("not used"),
+        transactGetItems: () => Effect.die("not used"),
+        transactWriteItems: () => Effect.die("not used"),
+        createTable: (input) =>
+          Effect.sync(() => {
+            captured.push(input)
+            return {} as never
+          }),
+        deleteTable: () => Effect.die("not used"),
+        describeTable: () => Effect.die("not used"),
+        scan: () => Effect.die("not used"),
+      })
+
+    it.effect("merges config.aggregates into user-supplied table so LSIs are provisioned", () => {
+      // IMPORTANT: the user does NOT register MatchAggregate on Table.make. This
+      // is the circular-import workaround used by the gamemanager tutorial.
+      const MainTable = Table.make({
+        schema: AppSchema,
+        entities: { MatchItem: MatchItemEntity },
+      })
+
+      const MatchAggregate = Aggregate.make(MatchItem, {
+        table: MainTable,
+        schema: AppSchema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: {
+          index: "lsi1",
+          name: "match",
+          sk: { field: "lsi1sk", composite: ["name"] },
+        },
+        root: { entityType: "MatchItem" },
+        edges: {},
+      })
+
+      const captured: Array<any> = []
+      const ClientLayer = makeCapturingClient(captured)
+      const TableLayer = MainTable.layer({ name: "merge-test-table" })
+
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { MatchItem: MatchItemEntity },
+          aggregates: { MatchAggregate },
+          tables: { MainTable },
+        })
+        yield* db.tables.MainTable.create()
+
+        expect(captured).toHaveLength(1)
+        const input = captured[0]
+        expect(input.TableName).toBe("merge-test-table")
+
+        // The LSI MUST be present — this is the regression guard.
+        expect(input.LocalSecondaryIndexes).toBeDefined()
+        expect(input.LocalSecondaryIndexes).toHaveLength(1)
+        expect(input.LocalSecondaryIndexes[0].IndexName).toBe("lsi1")
+        // LSI HASH key must match the base table's HASH key per DynamoDB rules.
+        expect(input.LocalSecondaryIndexes[0].KeySchema[0]).toEqual({
+          AttributeName: "pk",
+          KeyType: "HASH",
+        })
+        expect(input.LocalSecondaryIndexes[0].KeySchema[1]).toEqual({
+          AttributeName: "lsi1sk",
+          KeyType: "RANGE",
+        })
+
+        // lsi1sk must appear in the attribute definitions.
+        const attrNames = (input.AttributeDefinitions as Array<{ AttributeName: string }>).map(
+          (a) => a.AttributeName,
+        )
+        expect(attrNames).toContain("lsi1sk")
+      }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+    })
+
+    it.effect("without aggregates produces a createTable call with no LSI (regression guard)", () => {
+      // Same entity/table setup but no `aggregates` on DynamoClient.make — the
+      // table should come back with zero LSIs, proving the merge is the only
+      // path that introduces them in the `tables` branch.
+      const MainTable = Table.make({
+        schema: AppSchema,
+        entities: { MatchItem: MatchItemEntity },
+      })
+
+      const captured: Array<any> = []
+      const ClientLayer = makeCapturingClient(captured)
+      const TableLayer = MainTable.layer({ name: "no-agg-test-table" })
+
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { MatchItem: MatchItemEntity },
+          tables: { MainTable },
+        })
+        yield* db.tables.MainTable.create()
+
+        expect(captured).toHaveLength(1)
+        const input = captured[0]
+        expect(input.TableName).toBe("no-agg-test-table")
+        expect(input.LocalSecondaryIndexes).toBeUndefined()
+        expect(input.GlobalSecondaryIndexes).toBeUndefined()
+      }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+    })
+
+    it.effect("aggregates whose _tableTag does not match any supplied table are silently skipped", () => {
+      // MainTable is supplied; OtherTable is NOT, but the aggregate is built
+      // against OtherTable. The merge loop must skip it without erroring,
+      // and MainTable's createTable call must have no LSI (since no matching
+      // aggregate contributes one).
+      const MainTable = Table.make({
+        schema: AppSchema,
+        entities: { Venue: VenueEntity },
+      })
+
+      const OtherTable = Table.make({
+        schema: AppSchema,
+        entities: { MatchItem: MatchItemEntity },
+      })
+
+      const OrphanAggregate = Aggregate.make(MatchItem, {
+        table: OtherTable, // belongs to OtherTable
+        schema: AppSchema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: {
+          index: "lsi1",
+          name: "match",
+          sk: { field: "lsi1sk", composite: ["name"] },
+        },
+        root: { entityType: "MatchItem" },
+        edges: {},
+      })
+
+      const captured: Array<any> = []
+      const ClientLayer = makeCapturingClient(captured)
+      // Only MainTable gets a layer — OtherTable's Tag is never resolved.
+      const TableLayer = MainTable.layer({ name: "orphan-test-table" })
+
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { Venue: VenueEntity },
+          aggregates: { OrphanAggregate },
+          tables: { MainTable },
+        })
+        // The orphan aggregate's LSI must NOT leak into MainTable's definition.
+        yield* db.tables.MainTable.create()
+
+        expect(captured).toHaveLength(1)
+        const input = captured[0]
+        expect(input.TableName).toBe("orphan-test-table")
+        expect(input.LocalSecondaryIndexes).toBeUndefined()
+      }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+    })
   })
 })

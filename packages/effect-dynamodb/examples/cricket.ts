@@ -197,6 +197,13 @@ const SquadSelections = Entity.make({
       pk: { field: "gsi2pk", composite: ["playerId"] },
       sk: { field: "gsi2sk", composite: ["season", "series"] },
     },
+    // Single-composite GSI keyed on `teamId` — required so `Entity.cascade`
+    // can fan out from a Team update to every SquadSelection that embeds it.
+    byTeam: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["teamId"] },
+      sk: { field: "gsi3sk", composite: [] },
+    },
   },
   refs: {
     team: { entity: Teams },
@@ -304,6 +311,8 @@ const program = Effect.gen(function* () {
       { AttributeName: "gsi1sk", AttributeType: "S" },
       { AttributeName: "gsi2pk", AttributeType: "S" },
       { AttributeName: "gsi2sk", AttributeType: "S" },
+      { AttributeName: "gsi3pk", AttributeType: "S" },
+      { AttributeName: "gsi3sk", AttributeType: "S" },
     ],
     LocalSecondaryIndexes: [
       {
@@ -329,6 +338,14 @@ const program = Effect.gen(function* () {
         KeySchema: [
           { AttributeName: "gsi2pk", KeyType: "HASH" },
           { AttributeName: "gsi2sk", KeyType: "RANGE" },
+        ],
+        Projection: { ProjectionType: "ALL" },
+      },
+      {
+        IndexName: "gsi3",
+        KeySchema: [
+          { AttributeName: "gsi3pk", KeyType: "HASH" },
+          { AttributeName: "gsi3sk", KeyType: "RANGE" },
         ],
         Projection: { ProjectionType: "ALL" },
       },
