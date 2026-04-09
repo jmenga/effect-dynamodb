@@ -59,7 +59,7 @@ const PlayerRoleSchema = Schema.Literals(Object.values(PlayerRole))
 // #region model-standalone
 // #region model-team
 class Team extends Schema.Class<Team>("Team")({
-  id: Schema.String.pipe(DynamoModel.identifier),
+  id: Schema.String,
   name: Schema.String,
   country: Schema.String,
   ranking: Schema.Number,
@@ -88,7 +88,7 @@ class Venue extends Schema.Class<Venue>("Venue")({
 // #region model-squad-selection
 // SquadSelection — a player selected to a team's squad for a series/season.
 class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
-  id: Schema.String.pipe(DynamoModel.identifier),
+  id: Schema.String,
   team: Team.pipe(DynamoModel.ref),
   player: Player.pipe(DynamoModel.ref),
   season: Schema.String,
@@ -141,7 +141,7 @@ const CricketSchema = DynamoSchema.make({ name: "cricket", version: 1 })
 // #region entity-standalone
 // #region entity-team
 const Teams = Entity.make({
-  model: DynamoModel.configure(Team, { id: { field: "teamId" } }),
+  model: DynamoModel.configure(Team, { id: { field: "teamId", identifier: true } }),
   entityType: "Team",
   primaryKey: {
     pk: { field: "pk", composite: ["id"] },
@@ -180,7 +180,7 @@ const Venues = Entity.make({
 
 // #region entity-squad-selection
 const SquadSelections = Entity.make({
-  model: DynamoModel.configure(SquadSelection, { id: { field: "selectionId" } }),
+  model: DynamoModel.configure(SquadSelection, { id: { field: "selectionId", identifier: true } }),
   entityType: "SquadSelection",
   primaryKey: {
     pk: { field: "pk", composite: ["id"] },
