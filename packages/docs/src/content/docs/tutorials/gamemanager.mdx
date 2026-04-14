@@ -142,11 +142,9 @@ export type TeamId = typeof TeamId.Type
 
 ### 2.2 Team model
 
-```ts title="src/models/Team.ts"
-import { Schema } from "effect"
-```
-
 ```ts title="src/models/Team.ts" region="model-team" example="cricket.ts"
+import { Schema } from "effect"
+
 class Team extends Schema.Class<Team>("Team")({
   id: Schema.String,
   name: Schema.String,
@@ -155,7 +153,7 @@ class Team extends Schema.Class<Team>("Team")({
 }) {}
 ```
 
-> **Note:** Add `export` before `class Team` — the region-synced code above omits it because the backing example is a single file. In your multi-file project, all models, entities, and services need to be exported.
+> **Note:** Add `export` before `class Team` — the region-synced code above omits `export` because the backing example is a single file. In your multi-file project, all models, entities, and services need to be exported.
 
 Two things to notice:
 
@@ -204,16 +202,14 @@ Let's break down what each piece does:
 
 Now that we have an entity, we need a **DynamoSchema** (application namespace) and a **Table** (physical table binding) to assemble it:
 
-```ts title="src/entities/Schema.ts"
+```ts title="src/entities/Schema.ts" region="schema" example="cricket.ts"
 import { DynamoSchema, Table } from "effect-dynamodb"
 import { Teams } from "./Teams.js"
-```
 
-```ts title="src/entities/Schema.ts" region="schema" example="cricket.ts"
 const CricketSchema = DynamoSchema.make({ name: "cricket", version: 1 })
 ```
 
-> **Note:** Add `export` before `const CricketSchema` — the region-synced code above omits it because the backing example is a single file. In your multi-file project, `Schema.ts` is imported by other modules (e.g., `MatchAggregate.ts` in Phase 5), so the schema must be exported.
+> **Note:** Add `export` before `const CricketSchema` — the region-synced code above omits `export` because the backing example is a single file. In your multi-file project, `Schema.ts` is imported by other modules (e.g., `MatchAggregate.ts` in Phase 5), so the schema must be exported.
 
 ```ts title="src/entities/Schema.ts"
 export const MainTable = Table.make({
@@ -311,7 +307,7 @@ We'll add more filter schemas to this file as we add entities.
 ```ts
 // src/services/TeamService.ts
 import { DynamoClient, Entity } from "effect-dynamodb"
-import { type DateTime, Effect, ServiceMap } from "effect"
+import { type DateTime, Effect, Context } from "effect"
 import { ulid } from "ulid"
 import { Teams } from "../entities/Teams.js"
 import { MainTable } from "../entities/Schema.js"
@@ -324,7 +320,7 @@ export type { DateTime }
 type CreateTeamInput = Entity.Create<typeof Teams>
 type UpdateTeamInput = Entity.Update<typeof Teams>
 
-export class TeamService extends ServiceMap.Service<TeamService>()("@gamemanager/TeamService", {
+export class TeamService extends Context.Service<TeamService>()("@gamemanager/TeamService", {
   make: Effect.gen(function* () {
     const db = yield* DynamoClient.make({ entities: { Teams }, tables: { MainTable } })
     const teams = db.entities.Teams
@@ -357,7 +353,7 @@ export class TeamService extends ServiceMap.Service<TeamService>()("@gamemanager
 
 Key patterns:
 
-- **`ServiceMap.Service`** — Declares a service with a tag and a `make` effect that produces the implementation. Consumers access it via `yield* TeamService`.
+- **`Context.Service`** — Declares a service with a tag and a `make` effect that produces the implementation. Consumers access it via `yield* TeamService`.
 
 - **`Entity.Create<typeof Teams>`** — Omits the identifier field (declared via `DynamoModel.configure`) from the input type — the common "create" payload where IDs are auto-generated.
 
@@ -847,7 +843,7 @@ export type PlayerListFilter = typeof PlayerListFilter.Type
 ```ts
 // src/services/PlayerService.ts
 import { DynamoClient, Entity } from "effect-dynamodb"
-import { type DateTime, Effect, ServiceMap } from "effect"
+import { type DateTime, Effect, Context } from "effect"
 import { ulid } from "ulid"
 import type { PlayerListFilter } from "../models/Filters.js"
 import { Players } from "../entities/Players.js"
@@ -860,7 +856,7 @@ export type { DateTime }
 type CreatePlayerInput = Entity.Create<typeof Players>
 type UpdatePlayerInput = Entity.Update<typeof Players>
 
-export class PlayerService extends ServiceMap.Service<PlayerService>()(
+export class PlayerService extends Context.Service<PlayerService>()(
   "@gamemanager/PlayerService",
   {
     make: Effect.gen(function* () {
@@ -1005,7 +1001,7 @@ export const Coaches = Entity.make({
 ```ts
 // src/services/CoachService.ts
 import { DynamoClient, Entity } from "effect-dynamodb"
-import { type DateTime, Effect, ServiceMap } from "effect"
+import { type DateTime, Effect, Context } from "effect"
 import { ulid } from "ulid"
 import { Coaches } from "../entities/Coaches.js"
 import type { CoachListFilter } from "../models/Filters.js"
@@ -1018,7 +1014,7 @@ export type { DateTime }
 type CreateCoachInput = Entity.Create<typeof Coaches>
 type UpdateCoachInput = Entity.Update<typeof Coaches>
 
-export class CoachService extends ServiceMap.Service<CoachService>()("@gamemanager/CoachService", {
+export class CoachService extends Context.Service<CoachService>()("@gamemanager/CoachService", {
   make: Effect.gen(function* () {
     const db = yield* DynamoClient.make({ entities: { Coaches }, tables: { MainTable } })
     const coaches = db.entities.Coaches
@@ -1160,7 +1156,7 @@ export const Umpires = Entity.make({
 ```ts
 // src/services/UmpireService.ts
 import { DynamoClient, Entity } from "effect-dynamodb"
-import { type DateTime, Effect, ServiceMap } from "effect"
+import { type DateTime, Effect, Context } from "effect"
 import { ulid } from "ulid"
 import { Umpires } from "../entities/Umpires.js"
 import type { UmpireListFilter } from "../models/Filters.js"
@@ -1173,7 +1169,7 @@ export type { DateTime }
 type CreateUmpireInput = Entity.Create<typeof Umpires>
 type UpdateUmpireInput = Entity.Update<typeof Umpires>
 
-export class UmpireService extends ServiceMap.Service<UmpireService>()(
+export class UmpireService extends Context.Service<UmpireService>()(
   "@gamemanager/UmpireService",
   {
     make: Effect.gen(function* () {
@@ -1320,7 +1316,7 @@ export const Venues = Entity.make({
 ```ts
 // src/services/VenueService.ts
 import { DynamoClient, Entity } from "effect-dynamodb"
-import { type DateTime, Effect, ServiceMap } from "effect"
+import { type DateTime, Effect, Context } from "effect"
 import { ulid } from "ulid"
 import { Venues } from "../entities/Venues.js"
 import type { VenueListFilter } from "../models/Filters.js"
@@ -1333,7 +1329,7 @@ export type { DateTime }
 type CreateVenueInput = Entity.Create<typeof Venues>
 type UpdateVenueInput = Entity.Update<typeof Venues>
 
-export class VenueService extends ServiceMap.Service<VenueService>()("@gamemanager/VenueService", {
+export class VenueService extends Context.Service<VenueService>()("@gamemanager/VenueService", {
   make: Effect.gen(function* () {
     const db = yield* DynamoClient.make({ entities: { Venues }, tables: { MainTable } })
     const venues = db.entities.Venues
@@ -1761,15 +1757,13 @@ export const SquadSelectionId = Schema.String.pipe(Schema.brand("SquadSelectionI
 export type SquadSelectionId = typeof SquadSelectionId.Type
 ```
 
-```ts title="src/models/SquadSelection.ts"
+```ts title="src/models/SquadSelection.ts" region="model-squad-selection" example="cricket.ts"
 import { DynamoModel } from "effect-dynamodb"
 import { Schema } from "effect"
 import { PlayerRoleSchema } from "./Enums.js"
 import { Player } from "./Player.js"
 import { Team } from "./Team.js"
-```
 
-```ts region="model-squad-selection" example="cricket.ts"
 // SquadSelection — a player selected to a team's squad for a series/season.
 class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
   id: Schema.String,
@@ -1784,7 +1778,7 @@ class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
 }) {}
 ```
 
-> **Note:** Add `export` before `class SquadSelection` — the region-synced code above omits it because the backing example is a single file.
+> **Note:** Add `export` before `class SquadSelection` — the region-synced code above omits `export` because the backing example is a single file.
 
 Two things to notice:
 
@@ -1793,14 +1787,12 @@ Two things to notice:
 
 ### 4.2 SquadSelections entity with refs and cascade indexes
 
-```ts title="src/entities/SquadSelections.ts"
+```ts title="src/entities/SquadSelections.ts" region="entity-squad-selection" example="cricket.ts"
 import { DynamoModel, Entity } from "effect-dynamodb"
 import { SquadSelection } from "../models/SquadSelection.js"
 import { Players } from "./Players.js"
 import { Teams } from "./Teams.js"
-```
 
-```ts region="entity-squad-selection" example="cricket.ts"
 const SquadSelections = Entity.make({
   model: DynamoModel.configure(SquadSelection, { id: { field: "selectionId", identifier: true } }),
   entityType: "SquadSelection",
@@ -1902,7 +1894,7 @@ export type SquadListFilter = typeof SquadListFilter.Type
 ```ts
 // src/services/SquadSelectionService.ts
 import { DynamoClient, Entity } from "effect-dynamodb"
-import { type DateTime, Effect, ServiceMap } from "effect"
+import { type DateTime, Effect, Context } from "effect"
 import { ulid } from "ulid"
 import { SquadSelections } from "../entities/SquadSelections.js"
 import type { SquadListFilter } from "../models/Filters.js"
@@ -1914,7 +1906,7 @@ export type { DateTime }
 
 type CreateSquadSelectionInput = Entity.Create<typeof SquadSelections>
 
-export class SquadSelectionService extends ServiceMap.Service<SquadSelectionService>()(
+export class SquadSelectionService extends Context.Service<SquadSelectionService>()(
   "@gamemanager/SquadSelectionService",
   {
     make: Effect.gen(function* () {
@@ -2197,16 +2189,14 @@ This is the most powerful feature of effect-dynamodb. A Match is a **graph of re
 
 A Match contains two TeamSheets (one per team). Each TeamSheet references a Team, a Coach, and an array of PlayerSheets:
 
-```ts title="src/models/Match.ts"
+```ts title="src/models/Match.ts" region="model-aggregate" example="cricket.ts"
 import { DynamoModel } from "effect-dynamodb"
 import { Schema } from "effect"
 import { Coach } from "./Coach.js"
 import { Player } from "./Player.js"
 import { Team } from "./Team.js"
 import { Venue } from "./Venue.js"
-```
 
-```ts region="model-aggregate" example="cricket.ts"
 // Aggregate domain schemas
 class PlayerSheet extends Schema.Class<PlayerSheet>("PlayerSheet")({
   player: Player.pipe(DynamoModel.ref),
@@ -2260,7 +2250,7 @@ export type MatchUpdatePayload = typeof MatchUpdatePayload.Type
 
 This is where the magic happens. The aggregate defines how a complex domain object decomposes into DynamoDB items and reassembles:
 
-```ts title="src/entities/MatchAggregate.ts"
+```ts title="src/entities/MatchAggregate.ts" region="aggregates" example="cricket.ts"
 import { Aggregate } from "effect-dynamodb"
 import { Match, TeamSheet } from "../models/Match.js"
 import { Coaches } from "./Coaches.js"
@@ -2268,9 +2258,7 @@ import { Players } from "./Players.js"
 import { Teams } from "./Teams.js"
 import { Venues } from "./Venues.js"
 import { CricketSchema, MainTable } from "./Schema.js"
-```
 
-```ts region="aggregates" example="cricket.ts"
 // Sub-aggregate: a team's composition within a match
 const TeamSheetAggregate = Aggregate.make(TeamSheet, {
   root: { entityType: "MatchTeam" },
@@ -2363,7 +2351,7 @@ The service binds the aggregate to the typed client and translates the partial `
 ```ts
 // src/services/MatchService.ts
 import { Aggregate, DynamoClient } from "effect-dynamodb"
-import { type DateTime, Effect, type Schema, ServiceMap } from "effect"
+import { type DateTime, Effect, type Schema, Context } from "effect"
 import { ulid } from "ulid"
 import { MatchAggregate } from "../entities/MatchAggregate.js"
 import type { MatchUpdatePayload } from "../models/Match.js"
@@ -2374,7 +2362,7 @@ export type { DateTime }
 type MatchKey = Aggregate.Key<typeof MatchAggregate>
 type MatchCreate = Schema.Schema.Type<typeof MatchAggregate.createSchema>
 
-export class MatchService extends ServiceMap.Service<MatchService>()("@gamemanager/MatchService", {
+export class MatchService extends Context.Service<MatchService>()("@gamemanager/MatchService", {
   make: Effect.gen(function* () {
     const db = yield* DynamoClient.make({
       entities: {},
@@ -2761,7 +2749,7 @@ You now have the complete cricket match management system running — with CRUD 
 | **Entity.cascade** | Propagate updates to referencing entities | TeamService, PlayerService |
 | **Single-composite cascade GSI** | Required for cascade — PK composite must be exactly `[refIdField]` | SquadSelections `byPlayer`/`byTeam` |
 | **Query combinators** | Composable query building | Pagination helpers, services |
-| **ServiceMap.Service** | Dependency-injectable service | Every service |
+| **Context.Service** | Dependency-injectable service | Every service |
 | **Aggregate.make** | Graph-based composite entity | MatchAggregate |
 | **Aggregate.createSchema** | Derived schema: input minus PK, edges→IDs | MatchService create |
 | **Aggregate.one / many** | Decompose to separate items | Venue, Coach, Players |

@@ -908,7 +908,7 @@ import { DynamoClient } from "effect-dynamodb"
 
 | Export | Type | Description |
 |--------|------|-------------|
-| `DynamoClient` | `ServiceMap.Service` | Effect service class |
+| `DynamoClient` | `Context.Service` | Effect service class |
 | `DynamoClient.layer(config)` | `Layer<DynamoClient>` | Create live layer with region + optional endpoint/credentials |
 | `DynamoClient.layerConfig(config)` | `Layer<DynamoClient, ConfigError>` | Create live layer from Effect `Config` providers. Accepts `{ region, endpoint?, credentials? }` as `Config.Config<...>` values |
 
@@ -1061,7 +1061,7 @@ import { EventStore } from "effect-dynamodb"
 | Export | Description |
 |--------|-------------|
 | `EventStore.makeStream({ table, streamName, events, streamId, metadata? })` | Create an `EventStream<TEvent, TStreamIdFields, TMetadata>` bound to a `Table`. `events` is an array of `Schema.Class` event types, `streamId.composite` lists the stream-id composite fields, optional `metadata` is a Schema. |
-| `EventStore.bind(stream)` | Resolve `DynamoClient` and `TableConfig` from context and return a `BoundEventStream` whose operations have `R = never`. Use inside `ServiceMap.Service` make effects. |
+| `EventStore.bind(stream)` | Resolve `DynamoClient` and `TableConfig` from context and return a `BoundEventStream` whose operations have `R = never`. Use inside `Context.Service` make effects. |
 
 ### Decider
 
@@ -1114,7 +1114,7 @@ A `Decider<State, Command, Event, E = never>` encodes one aggregate's command-ev
 
 ```typescript
 import { EventStore } from "effect-dynamodb"
-import { Effect, Schema, ServiceMap } from "effect"
+import { Effect, Schema, Context } from "effect"
 
 class MatchStarted extends Schema.Class<MatchStarted>("MatchStarted")({
   venue: Schema.String,
@@ -1142,7 +1142,7 @@ const decider = {
   },
 }
 
-class MatchEventService extends ServiceMap.Service<MatchEventService>()(
+class MatchEventService extends Context.Service<MatchEventService>()(
   "@app/MatchEventService",
   {
     make: Effect.gen(function* () {

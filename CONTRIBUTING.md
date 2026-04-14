@@ -82,7 +82,7 @@ npx tsx packages/effect-dynamodb/examples/starter.ts
 - **Strict TypeScript** — `strict: true`, `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`
 - **ESM only** — `"type": "module"` with NodeNext resolution
 - **Biome** for linting and formatting — run `pnpm lint:fix` before committing
-- **Effect patterns** — Tagged errors (`Data.TaggedError`), `ServiceMap.Service` for services, `Function.dual` for public APIs
+- **Effect patterns** — Tagged errors (`Data.TaggedError`), `Context.Service` for services, `Function.dual` for public APIs
 - **Barrel exports** — `src/index.ts` is the sole public entry point
 
 ## Pull Request Guidelines

@@ -19,7 +19,7 @@ Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table
 2. `Table.make({ schema, entities: { Users, Tasks } })` — registers entities on a physical table
 3. `yield* DynamoClient.make({ entities: { Users, Tasks }, aggregates: { OrderAggregate }, tables: { MainTable } })` — binds the listed entities/aggregates, auto-discovers collections from entity indexes, and returns a typed client with `R = never`
 4. Access via `db.entities.*` (CRUD + query accessors), `db.aggregates.*` (bound aggregates), `db.collections.*` (auto-discovered cross-entity queries), `db.tables.*` (table management)
-5. Use the typed client inside `ServiceMap.Service` make effects for DI and layer-based testing
+5. Use the typed client inside `Context.Service` make effects for DI and layer-based testing
 
 ```
 ┌─────────────────────────────────────┐
@@ -43,7 +43,7 @@ Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table
 2. Create entity definition with `Entity.make({ model, entityType, primaryKey, indexes?, timestamps?, versioned?, softDelete?, unique? })` — primary key + GSI indexes. Use `collection` property on indexes for cross-entity queries.
 3. Register entity on a table: `Table.make({ schema, entities: { ..., MyEntity } })`.
 4. Access via typed client: `const db = yield* DynamoClient.make({ entities: { MyEntity }, tables: { MainTable } })` → `db.entities.MyEntity.get(...)`, `db.entities.MyEntity.put(...)`, `db.entities.MyEntity.byIndex({...}).collect()`. Collections auto-discovered: `db.collections.myCollection({...}).collect()`.
-5. For services: build the typed client inside `ServiceMap.Service` make effects for DI and layer-based testing.
+5. For services: build the typed client inside `Context.Service` make effects for DI and layer-based testing.
 6. Add unit tests in `test/` and update integration test if needed.
 
 ### Module Structure
@@ -64,7 +64,7 @@ packages/effect-dynamodb/src/
 ├── Projection.ts       # ProjectionExpression builder for selecting specific attributes
 ├── Aggregate.ts        # Graph-based composite domain model (decompose/assemble/diff)
 ├── EventStore.ts       # Event sourcing with ordered event streams per aggregate
-├── DynamoClient.ts     # ServiceMap.Service wrapping AWS SDK + DynamoClient.make({ entities, aggregates?, tables? }) typed gateway
+├── DynamoClient.ts     # Context.Service wrapping AWS SDK + DynamoClient.make({ entities, aggregates?, tables? }) typed gateway
 ├── Marshaller.ts       # Thin wrapper around @aws-sdk/util-dynamodb
 ├── Errors.ts           # Tagged errors (DynamoError, ItemNotFound, ConditionalCheckFailed, ValidationError, TransactionCancelled, UniqueConstraintViolation)
 ├── internal/           # Decomposed internals
@@ -91,7 +91,7 @@ Transaction → DynamoClient, Entity, TransactableOps, Marshaller, Expression, E
 Batch → DynamoClient, Entity, TransactableOps, Marshaller, Errors
 EventStore → DynamoClient, DynamoSchema, Table, KeyComposer, Marshaller, Query, Errors
 GeoIndex → Entity, Query (in effect-dynamodb-geo package)
-DynamoClient → effect (ServiceMap, Layer), @aws-sdk/client-dynamodb, Entity, Collections, Aggregate (for make() binding + collection auto-discovery)
+DynamoClient → effect (Context, Layer), @aws-sdk/client-dynamodb, Entity, Collections, Aggregate (for make() binding + collection auto-discovery)
 Table → DynamoSchema, Entity (type-level for member registration)
 BoundQuery → Query, PathBuilder, Expr (thin typed wrapper over Query<A>)
 Expression → Marshaller (types only — shorthand compilation routes through Expr)
@@ -199,7 +199,7 @@ All commands run from the repo root.
 - **Effect<A, E, R>** — Success, Error, Requirements. Effects are lazy and immutable.
 - **Generator style** (`Effect.gen`) for sequential logic; **pipe style** for short transformations.
 - **Tagged errors** via `Data.TaggedError` — all errors must be tagged for discrimination. Tagged errors are **yieldable**: prefer `yield* new ErrorClass(...)` over `yield* Effect.fail(new ErrorClass(...))` in generators.
-- **Service pattern** — `ServiceMap.Service` for all service definitions. Service methods have `R = never`. Tag identifiers use `@package/ServiceName` format.
+- **Service pattern** — `Context.Service` for all service definitions. Service methods have `R = never`. Tag identifiers use `@package/ServiceName` format.
 - **Schema** — `Schema.Class` or `Schema.Struct` for domain models (pure, no DynamoDB concepts). Entity derives DynamoDB-specific types. Use `Schema.decodeUnknownEffect` (not `Sync`) inside effectful code. `Schema.Literals([...])` for literal unions (not `Schema.Literal(...spread)`). `Schema.Union([...])` takes an array. Validation via `.check()` with named check factories.
 - **Custom annotations** — Use `Symbol.for()` for identifiers, never string keys. This project uses custom annotations for `DynamoModel.Hidden`, `DynamoModel.identifier`, `DynamoModel.ref`.
 - **Dual APIs** — Public library functions transforming a data type must use `Function.dual` for data-first and data-last (pipeable) support.
@@ -221,7 +221,7 @@ Do NOT:
 - Have service methods with `R != never` — resolve deps in Layer
 - Use `Schema.decodeUnknownSync` in effectful code — use `Schema.decodeUnknownEffect`
 - Use `yield* ref` / `yield* deferred` / `yield* fiber` — use `Ref.get`/`Deferred.await`/`Fiber.join` (not Yieldable)
-- Use v3 service APIs (`Context.Tag`, `Effect.Service`) — use `ServiceMap.Service`
+- Use v3 service APIs (`Context.Tag`, `Effect.Service`) — use `Context.Service`
 - Use v3 Schema APIs (`Schema.filter`, `Schema.fromKey`, `Schema.Literal`) — use `.check()`, `.withKey()`, `Schema.Literals`
 - Put DynamoDB concepts in domain models — keep models pure, Entity handles DynamoDB binding
 - Extract `A`/`E`/`R` from entity ops via `Effect.Effect<infer A>` — match against `EntityOp<infer A, ...>` instead
@@ -306,7 +306,7 @@ Before committing:
 5. `npx tsx examples/<name>.ts` — examples run against DynamoDB Local (`docker run -p 8000:8000 amazon/dynamodb-local`). Run after changes to Entity, Query, Table, DynamoSchema, KeyComposer, Collection, Transaction, or Errors.
 6. New modules must have corresponding test files in `test/`
 7. New errors must use `Data.TaggedError`
-8. New services must follow `ServiceMap.Service` pattern
+8. New services must follow `Context.Service` pattern
 9. New or updated doc pages must have a backing example file with region markers
 
 ## Behavioral Notes

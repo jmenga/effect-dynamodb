@@ -83,7 +83,7 @@ const MainTable = Table.make({
 
 ## Set Up a Mock DynamoDB Client
 
-effect-dynamodb uses `DynamoClient` as an Effect Service (`ServiceMap.Service`). In tests, provide a mock implementation via `Layer.succeed`. Each method receives the raw AWS SDK input and returns an `Effect`:
+effect-dynamodb uses `DynamoClient` as an Effect Service (`Context.Service`). In tests, provide a mock implementation via `Layer.succeed`. Each method receives the raw AWS SDK input and returns an `Effect`:
 
 ```typescript title="mock-client.ts" region="mock-client" example="guide-testing.ts"
 // Track calls for assertions

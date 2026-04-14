@@ -52,7 +52,7 @@ class MallStore extends Schema.Class<MallStore>("MallStore")({
   category: StoreCategorySchema,
   leaseEndDate: Schema.String,
   rent: Schema.String,
-  discount: Schema.String.pipe(Schema.withDecodingDefaultKey(() => "0.00")),
+  discount: Schema.String.pipe(Schema.withDecodingDefaultKey(Effect.succeed("0.00"))),
   deposit: Schema.optional(Schema.Number),
 }) {}
 ```

@@ -50,7 +50,7 @@ packages/effect-dynamodb/src/
 ├── Expression.ts       # Condition, filter, and update expression builders (ConditionInput / UpdateInput)
 ├── Transaction.ts      # TransactGetItems + TransactWriteItems (atomic multi-item ops)
 ├── Projection.ts       # ProjectionExpression builder for selecting specific attributes
-├── DynamoClient.ts     # ServiceMap.Service wrapping AWS SDK + DynamoClient.make(table) typed gateway
+├── DynamoClient.ts     # Context.Service wrapping AWS SDK + DynamoClient.make(table) typed gateway
 ├── Marshaller.ts       # Thin wrapper around @aws-sdk/util-dynamodb
 ├── Errors.ts           # Tagged errors
 ├── internal/           # Decomposed internals
@@ -133,7 +133,7 @@ Expression → Marshaller
 Table → DynamoSchema, Entity (type-level for member registration)
 DynamoSchema → (standalone, no internal deps)
 DynamoModel → effect (Schema) — provides annotations (Hidden, identifier, ref) and configure()
-DynamoClient → effect (ServiceMap, Layer), @aws-sdk/client-dynamodb, Entity (for make() binding)
+DynamoClient → effect (Context, Layer), @aws-sdk/client-dynamodb, Entity (for make() binding)
 KeyComposer → (standalone, no internal deps)
 Marshaller → @aws-sdk/util-dynamodb
 Errors → effect (Data)
@@ -391,10 +391,10 @@ The typed client provides:
 
 ### Service Pattern
 
-Wrap `DynamoClient.make(table)` in `ServiceMap.Service` for dependency injection and testability. Destructure to access only the entities you need:
+Wrap `DynamoClient.make(table)` in `Context.Service` for dependency injection and testability. Destructure to access only the entities you need:
 
 ```typescript
-export class TeamService extends ServiceMap.Service<TeamService>()("@gamemanager/TeamService", {
+export class TeamService extends Context.Service<TeamService>()("@gamemanager/TeamService", {
   make: Effect.gen(function* () {
     const { Teams } = yield* DynamoClient.make(MainTable)
     return {
@@ -1093,7 +1093,7 @@ Internally, `DynamoClient.make` resolves `DynamoClient` service + `TableConfig` 
 As a service for testability:
 
 ```typescript
-class MatchService extends ServiceMap.Service<MatchService>()("@gamemanager/MatchService", {
+class MatchService extends Context.Service<MatchService>()("@gamemanager/MatchService", {
   make: Effect.gen(function* () {
     const { Matches } = yield* DynamoClient.make(MainTable)
     return {
@@ -1250,7 +1250,7 @@ const program = Effect.gen(function* () {
 As a service:
 
 ```typescript
-class MatchEventStream extends ServiceMap.Service<MatchEventStream>()("@gamemanager/MatchEventStream", {
+class MatchEventStream extends Context.Service<MatchEventStream>()("@gamemanager/MatchEventStream", {
   make: Effect.gen(function* () {
     const { MatchEvents } = yield* DynamoClient.make(EventsTable)
     return MatchEvents
@@ -1312,7 +1312,7 @@ const program = Effect.gen(function* () {
 As a service:
 
 ```typescript
-class VehicleSearch extends ServiceMap.Service<VehicleSearch>()("@fleet/VehicleSearch", {
+class VehicleSearch extends Context.Service<VehicleSearch>()("@fleet/VehicleSearch", {
   make: Effect.gen(function* () {
     const { VehicleGeo } = yield* DynamoClient.make(MainTable)
     return VehicleGeo

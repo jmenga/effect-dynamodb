@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Breaking (consumers of `effect@4.0.0-beta.48`)
+
+- **`ServiceMap` → `Context` rename** — Effect v4 beta.48 renamed the
+  `ServiceMap` module to `Context`. `effect-dynamodb` now imports
+  `Context` throughout and requires `effect >= 4.0.0-beta.48`. Consumer
+  code using `ServiceMap.Service<MyService>()(…)` must rename to
+  `Context.Service<MyService>()(…)` and update any `ServiceMap` type
+  references to `Context`.
+- **`Effect.services<R>()` → `Effect.context<R>()`** — the full-runtime
+  context accessor was renamed. Only affects library internals; no
+  observable change for consumers of `DynamoClient.make`.
+
 ## 0.1.0 (Unreleased)
 
 Initial release of `@effect-dynamodb/core`.
@@ -18,7 +32,7 @@ Initial release of `@effect-dynamodb/core`.
 - **Projection** — ProjectionExpression builder for selecting specific attributes
 - **KeyComposer** — Composite key composition from index definitions
 - **Marshaller** — Thin wrapper around `@aws-sdk/util-dynamodb`
-- **DynamoClient** — Effect `ServiceMap.Service` wrapping AWS SDK DynamoDBClient with `layer()` and `layerConfig()`
+- **DynamoClient** — Effect `Context.Service` wrapping AWS SDK DynamoDBClient with `layer()` and `layerConfig()`
 - **Errors** — 9 tagged error types: `DynamoError`, `ItemNotFound`, `ConditionalCheckFailed`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ItemDeleted`, `ItemNotDeleted`
 
 ### Features
