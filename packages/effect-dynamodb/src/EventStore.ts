@@ -464,7 +464,7 @@ export const makeStream = <
  *
  * @example
  * ```typescript
- * export class MatchEventService extends ServiceMap.Service<MatchEventService>()("MatchEventService", {
+ * export class MatchEventService extends Context.Service<MatchEventService>()("MatchEventService", {
  *   make: Effect.gen(function* () {
  *     const stream = yield* EventStore.bind(MatchEvents)
  *     return {
@@ -526,7 +526,7 @@ export interface BoundEventStream<
  * Bind an EventStream to resolved `DynamoClient` and `TableConfig` services.
  * Returns a {@link BoundEventStream} where all operations have `R = never`.
  *
- * Use inside `ServiceMap.Service` make effects to prevent service methods
+ * Use inside `Context.Service` make effects to prevent service methods
  * from leaking infrastructure requirements.
  *
  * @example
@@ -544,7 +544,7 @@ export const bind = <TEvent, TStreamIdFields extends ReadonlyArray<string>, TMet
   DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
-    const ctx = yield* Effect.services<DynamoClient | TableConfig>()
+    const ctx = yield* Effect.context<DynamoClient | TableConfig>()
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)

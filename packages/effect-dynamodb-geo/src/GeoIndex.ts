@@ -16,7 +16,7 @@ import type {
   UniqueConstraintViolation,
   ValidationError,
 } from "effect-dynamodb"
-import { Effect, type Schema, type ServiceMap } from "effect"
+import { Effect, type Schema, type Context } from "effect"
 import * as _GeoSearch from "./GeoSearch.js"
 import * as H3 from "./H3.js"
 import type { LatLng } from "./Spherical.js"
@@ -62,7 +62,7 @@ export interface NearbyResult<A> {
 /** Structural type for the entity properties GeoIndex needs */
 export interface GeoEntity<A, P> {
   readonly _schema: DynamoSchema.DynamoSchema
-  readonly _tableTag: ServiceMap.Service<Table.TableConfig, Table.TableConfig>
+  readonly _tableTag: Context.Service<Table.TableConfig, Table.TableConfig>
   readonly entityType: string
   readonly indexes: Record<string, KeyComposer.IndexDefinition>
   readonly schemas: { readonly recordSchema: Schema.Codec<any> }
@@ -200,7 +200,7 @@ export const bind = <A, P>(
   geoIndex: GeoIndex<A, P>,
 ): Effect.Effect<BoundGeoIndex<A>, never, DynamoClient | Table.TableConfig> =>
   Effect.gen(function* () {
-    const ctx = yield* Effect.services<DynamoClient | Table.TableConfig>()
+    const ctx = yield* Effect.context<DynamoClient | Table.TableConfig>()
     const provide = <B, E>(
       effect: Effect.Effect<B, E, DynamoClient | Table.TableConfig>,
     ): Effect.Effect<B, E, never> => Effect.provide(effect, ctx) as Effect.Effect<B, E, never>

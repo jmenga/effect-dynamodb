@@ -28,7 +28,7 @@ interface CollectionEntity {
   readonly entityType: string
   readonly indexes: Record<string, IndexDefinition>
   readonly _schema: DynamoSchema.DynamoSchema
-  readonly _tableTag: import("effect").ServiceMap.Service<TableConfig, TableConfig>
+  readonly _tableTag: import("effect").Context.Service<TableConfig, TableConfig>
   readonly schemas: {
     readonly recordSchema: Schema.Codec<any>
   }

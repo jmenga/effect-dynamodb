@@ -10,7 +10,7 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import { Effect, type Optic, Schema, SchemaAST, type ServiceMap } from "effect"
+import { Effect, type Optic, Schema, SchemaAST, type Context } from "effect"
 import * as Batch from "./Batch.js"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
 import type { DynamoEncoding } from "./DynamoModel.js"
@@ -162,7 +162,7 @@ export interface Aggregate<
    * `DynamoClient.make()` to group aggregates with their table for
    * `db.tables.X.create()` GSI derivation.
    */
-  readonly _tableTag: ServiceMap.Service<TableConfig, TableConfig>
+  readonly _tableTag: Context.Service<TableConfig, TableConfig>
 
   /** Primary key field name (e.g., "pk") */
   readonly pkField: string
@@ -930,7 +930,7 @@ export const bind = <TSchema extends Schema.Top, TKey extends Record<string, unk
   aggregate: Aggregate<TSchema, TKey, TInput>,
 ): Effect.Effect<BoundAggregate<TSchema, TKey, TInput>, never, DynamoClient | TableConfig> =>
   Effect.gen(function* () {
-    const ctx = yield* Effect.services<DynamoClient | TableConfig>()
+    const ctx = yield* Effect.context<DynamoClient | TableConfig>()
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)

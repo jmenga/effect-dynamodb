@@ -100,7 +100,7 @@ import {
   UpdateTableCommand,
   UpdateTimeToLiveCommand,
 } from "@aws-sdk/client-dynamodb"
-import { Config, Effect, Layer, type Schema, ServiceMap } from "effect"
+import { Config, Effect, Layer, type Schema, Context } from "effect"
 import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
 import { bind as aggregateBind } from "./Aggregate.js"
 import * as DynamoSchema from "./DynamoSchema.js"
@@ -296,7 +296,7 @@ export interface DynamoClientService {
 }
 
 /**
- * Effect ServiceMap.Service for the DynamoDB client service.
+ * Effect Context.Service for the DynamoDB client service.
  *
  * Use `DynamoClient.layer(config)` to construct a live Layer that manages
  * the underlying AWS SDK client lifecycle with `Effect.acquireRelease`.
@@ -307,7 +307,7 @@ export interface DynamoClientService {
  * pipe(program, Effect.provide(live), Effect.runPromise)
  * ```
  */
-export class DynamoClient extends ServiceMap.Service<DynamoClient, DynamoClientService>()(
+export class DynamoClient extends Context.Service<DynamoClient, DynamoClientService>()(
   "@effect-dynamodb/DynamoClient",
 ) {
   /**
@@ -437,7 +437,7 @@ export interface TableLike {
   readonly schema: import("./DynamoSchema.js").DynamoSchema
   readonly entities: Record<string, { readonly _tag: "Entity" }>
   readonly aggregates: Record<string, unknown>
-  readonly Tag: ServiceMap.Service<TableConfig, TableConfig>
+  readonly Tag: Context.Service<TableConfig, TableConfig>
 }
 
 /**
@@ -712,7 +712,7 @@ interface EntityLike {
   readonly model: Schema.Top
   readonly indexes: Record<string, IndexDefinition>
   readonly _schema: DynamoSchema.DynamoSchema
-  readonly _tableTag: ServiceMap.Service<TableConfig, TableConfig>
+  readonly _tableTag: Context.Service<TableConfig, TableConfig>
   readonly _injectIndex: (name: string, def: IndexDefinition) => void
   readonly _decodeRecord: (raw: Record<string, unknown>) => Effect.Effect<any, any>
   readonly schemas: {
@@ -727,7 +727,7 @@ const makeFromConfig = (config: {
 }): Effect.Effect<any, never, DynamoClient | TableConfig> =>
   Effect.gen(function* () {
     // 1. Resolve the provide function from context
-    const ctx = yield* Effect.services<DynamoClient | TableConfig>()
+    const ctx = yield* Effect.context<DynamoClient | TableConfig>()
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)

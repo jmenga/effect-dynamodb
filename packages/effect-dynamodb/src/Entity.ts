@@ -261,7 +261,7 @@ export interface Entity<
    */
   readonly _configure: (
     schema: DynamoSchema.DynamoSchema,
-    tableTag: import("effect").ServiceMap.Service<TableConfig, TableConfig>,
+    tableTag: import("effect").Context.Service<TableConfig, TableConfig>,
   ) => void
 
   /**
@@ -275,7 +275,7 @@ export interface Entity<
   /** @internal Injected DynamoSchema — available after _configure(). Used by cascade. */
   readonly _schema: DynamoSchema.DynamoSchema
   /** @internal Injected TableConfig tag — available after _configure(). Used by cascade. */
-  readonly _tableTag: import("effect").ServiceMap.Service<TableConfig, TableConfig>
+  readonly _tableTag: import("effect").Context.Service<TableConfig, TableConfig>
 
   /** Resolved system field names */
   readonly systemFields: ResolvedSystemFields
@@ -623,7 +623,7 @@ export interface Entity<
  *
  * @example
  * ```typescript
- * export class TeamService extends ServiceMap.Service<TeamService>()("TeamService", {
+ * export class TeamService extends Context.Service<TeamService>()("TeamService", {
  *   make: Effect.gen(function* () {
  *     const db = yield* DynamoClient.make({ entities: { Teams }, tables: { MainTable } })
  *     const teams = db.entities.Teams
@@ -1251,7 +1251,7 @@ const makeImpl = <
   // closures and resolved at runtime (inside Effects), not at definition time.
   // Using definite assignment (!) since _configure is called before any operation executes.
   let schema!: DynamoSchema.DynamoSchema
-  let tableTag!: import("effect").ServiceMap.Service<TableConfig, TableConfig>
+  let tableTag!: import("effect").Context.Service<TableConfig, TableConfig>
 
   const entityType = config.entityType
   const entityVersion = 1
@@ -3916,7 +3916,7 @@ const makeImpl = <
     _attachPrototype: attachPrototype,
     _configure: (
       injectedSchema: DynamoSchema.DynamoSchema,
-      injectedTableTag: import("effect").ServiceMap.Service<TableConfig, TableConfig>,
+      injectedTableTag: import("effect").Context.Service<TableConfig, TableConfig>,
     ) => {
       schema = injectedSchema
       tableTag = injectedTableTag
@@ -4018,7 +4018,7 @@ export const bind = <
   >,
 ): Effect.Effect<BoundEntity<TModel, TIndexes, TRefs>, never, DynamoClient | TableConfig> =>
   Effect.gen(function* () {
-    const ctx = yield* Effect.services<DynamoClient | TableConfig>()
+    const ctx = yield* Effect.context<DynamoClient | TableConfig>()
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)

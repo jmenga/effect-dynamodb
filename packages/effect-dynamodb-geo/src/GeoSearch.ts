@@ -9,7 +9,7 @@
 
 import type { DynamoClientError, DynamoSchema, Table } from "effect-dynamodb"
 import { type DynamoClient, KeyComposer, Query, ValidationError } from "effect-dynamodb"
-import { Effect, Schema, type ServiceMap } from "effect"
+import { Effect, Schema, type Context } from "effect"
 import * as h3 from "h3-js"
 import type { Coordinates, GeoFields, NearbyOptions, NearbyResult } from "./GeoIndex.js"
 import * as H3 from "./H3.js"
@@ -19,7 +19,7 @@ import * as Spherical from "./Spherical.js"
 export interface SearchConfig<A> {
   readonly entity: {
     readonly _schema: DynamoSchema.DynamoSchema
-    readonly _tableTag: ServiceMap.Service<Table.TableConfig, Table.TableConfig>
+    readonly _tableTag: Context.Service<Table.TableConfig, Table.TableConfig>
     readonly entityType: string
     readonly indexes: Record<string, KeyComposer.IndexDefinition>
     readonly schemas: { readonly recordSchema: Schema.Codec<any> }

@@ -52,7 +52,7 @@ export interface CascadeTarget {
   readonly entityType: string
   readonly indexes: globalThis.Record<string, IndexDefinition>
   readonly _schema: DynamoSchema.DynamoSchema
-  readonly _tableTag: import("effect").ServiceMap.Service<TableConfig, TableConfig>
+  readonly _tableTag: import("effect").Context.Service<TableConfig, TableConfig>
   readonly _resolvedRefs: ReadonlyArray<{
     readonly fieldName: string
     readonly idFieldName: string

@@ -9,7 +9,7 @@
  */
 
 import type { DescribeTableCommandOutput } from "@aws-sdk/client-dynamodb"
-import { type Config, Effect, Layer, ServiceMap } from "effect"
+import { type Config, Effect, Layer, Context } from "effect"
 import type { DynamoClientError } from "./DynamoClient.js"
 import type * as DynamoSchema from "./DynamoSchema.js"
 import type { IndexDefinition } from "./KeyComposer.js"
@@ -22,7 +22,7 @@ export interface TableConfig {
 
 /**
  * Counter for generating unique Tag identifiers.
- * Each `make()` call increments this to ensure distinct ServiceMap.Service tags.
+ * Each `make()` call increments this to ensure distinct Context.Service tags.
  */
 let tableCounter = 0
 
@@ -32,7 +32,7 @@ interface EntityLike {
   readonly indexes: Record<string, IndexDefinition>
   readonly _configure: (
     schema: DynamoSchema.DynamoSchema,
-    tableTag: ServiceMap.Service<TableConfig, TableConfig>,
+    tableTag: Context.Service<TableConfig, TableConfig>,
   ) => void
 }
 
@@ -71,8 +71,8 @@ export interface Table<
   readonly entities: TEntities
   /** Named aggregate members registered on this table. */
   readonly aggregates: TAggregates
-  /** Effect ServiceMap.Service tag for this table's runtime config */
-  readonly Tag: ServiceMap.Service<TableConfig, TableConfig>
+  /** Effect Context.Service tag for this table's runtime config */
+  readonly Tag: Context.Service<TableConfig, TableConfig>
   /** Provide the physical table name */
   readonly layer: (config: TableConfig) => Layer.Layer<TableConfig>
   /** Provide the physical table name from Effect Config */
@@ -84,7 +84,7 @@ export interface Table<
 /**
  * Create a new Table definition with optional entity and aggregate members.
  *
- * Each call to `make` creates a new unique ServiceMap.Service, so different tables
+ * Each call to `make` creates a new unique Context.Service, so different tables
  * produce independent runtime configurations even when sharing the same schema.
  *
  * Entities are automatically configured with the table's schema and tag.
@@ -113,7 +113,7 @@ export const make = <
   readonly aggregates?: TAggregates
 }): Table<TEntities, TAggregates> => {
   const id = tableCounter++
-  const Tag = ServiceMap.Service<TableConfig>(`@effect-dynamodb/Table/${config.schema.name}/${id}`)
+  const Tag = Context.Service<TableConfig>(`@effect-dynamodb/Table/${config.schema.name}/${id}`)
 
   const entities = (config.entities ?? {}) as TEntities
   const aggregates = (config.aggregates ?? {}) as TAggregates
