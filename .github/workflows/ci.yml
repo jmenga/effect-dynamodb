@@ -8,6 +8,11 @@ jobs:
   ci:
     name: Typecheck, Lint, Test, Build
     runs-on: ubuntu-latest
+    services:
+      dynamodb-local:
+        image: amazon/dynamodb-local:latest
+        ports:
+          - 8000:8000
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,6 +38,27 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+      - name: Wait for DynamoDB Local
+        run: |
+          for i in {1..30}; do
+            if curl -sSf -o /dev/null -w "%{http_code}" http://localhost:8000 | grep -qE '^(200|400|404)$'; then
+              echo "DynamoDB Local is reachable"
+              exit 0
+            fi
+            echo "Waiting for DynamoDB Local... ($i/30)"
+            sleep 1
+          done
+          echo "DynamoDB Local did not become reachable in time"
+          exit 1
+
+      - name: Integration tests (connected)
+        env:
+          DYNAMODB_ENDPOINT: http://localhost:8000
+          AWS_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: dummy
+          AWS_SECRET_ACCESS_KEY: dummy
+        run: pnpm -r --if-present test:connected
 
       - name: Build
         run: pnpm build
