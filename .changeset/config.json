@@ -12,5 +12,8 @@
   "access": "public",
   "baseBranch": "main",
   "updateInternalDependencies": "patch",
-  "ignore": ["@effect-dynamodb/docs", "@effect-dynamodb/doctest"]
+  "ignore": ["@effect-dynamodb/docs", "@effect-dynamodb/doctest"],
+  "___experimentalUnsafeOptions_WILL_CHANGE_IN_PATCH": {
+    "onlyUpdatePeerDependentsWhenOutOfRange": true
+  }
 }

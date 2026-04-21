@@ -13,7 +13,7 @@
  */
 
 import { it } from "@effect/vitest"
-import { Effect, Layer, Schema, Stream } from "effect"
+import { DateTime, Duration, Effect, Layer, Schema, Stream } from "effect"
 import { afterAll, beforeAll, describe, expect } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
@@ -1267,6 +1267,367 @@ describeConnected("Connected integration tests", () => {
       }).pipe(provide),
     )
   })
+})
+
+// ===========================================================================
+// Time-series Connected Tests (separate table; one current + N event items)
+// ===========================================================================
+
+class Telemetry extends Schema.Class<Telemetry>("Telemetry")({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  accountId: Schema.optional(Schema.String),
+  timestamp: Schema.DateTimeUtc,
+  location: Schema.optional(Schema.String),
+  alert: Schema.optional(Schema.Boolean),
+  gpio: Schema.optional(Schema.Number),
+}) {}
+
+const TelemetryAppendInput = Schema.Struct({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  timestamp: Schema.DateTimeUtc,
+  location: Schema.optional(Schema.String),
+  alert: Schema.optional(Schema.Boolean),
+  gpio: Schema.optional(Schema.Number),
+})
+
+const tsSchema = DynamoSchema.make({ name: "ts-test", version: 1 })
+const tsTableName = `ts-test-${Date.now()}`
+
+const Telemetries = Entity.make({
+  model: Telemetry,
+  entityType: "Telemetry",
+  primaryKey: {
+    pk: { field: "pk", composite: ["channel", "deviceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byAccount: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["accountId"] },
+      sk: { field: "gsi1sk", composite: ["deviceId"] },
+    },
+  },
+  timestamps: true,
+  timeSeries: {
+    orderBy: "timestamp",
+    ttl: Duration.days(7),
+    appendInput: TelemetryAppendInput,
+  },
+})
+
+const TsTable = Table.make({ schema: tsSchema, entities: { Telemetries } })
+const TsTestLayer = Layer.mergeAll(ClientLayer, TsTable.layer({ name: tsTableName }))
+const provideTs = Effect.provide(TsTestLayer)
+
+describeConnected("timeSeries integration tests", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: tsTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(TsTable),
+        })
+      }).pipe(provideTs, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: tsTableName })
+      }).pipe(
+        provideTs,
+        Effect.scoped,
+        Effect.catchTag("DynamoError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("append round-trip: current reflects latest orderBy", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Telemetries },
+        tables: { TsTable },
+      })
+
+      const t1 = DateTime.makeUnsafe("2026-04-22T10:00:00.000Z")
+      const r = yield* db.entities.Telemetries.append({
+        channel: "c-round",
+        deviceId: "d-1",
+        timestamp: t1,
+        location: "rack-1",
+      })
+      expect(r.applied).toBe(true)
+      if (r.applied) expect(r.current.channel).toBe("c-round")
+
+      const fetched = yield* db.entities.Telemetries.get({
+        channel: "c-round",
+        deviceId: "d-1",
+      })
+      expect(fetched.location).toBe("rack-1")
+    }).pipe(provideTs),
+  )
+
+  it.effect("sequential monotone appends reflected in history", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Telemetries },
+        tables: { TsTable },
+      })
+
+      const t1 = DateTime.makeUnsafe("2026-04-22T10:00:00.000Z")
+      const t2 = DateTime.makeUnsafe("2026-04-22T10:05:00.000Z")
+      const t3 = DateTime.makeUnsafe("2026-04-22T10:10:00.000Z")
+
+      for (const ts of [t1, t2, t3]) {
+        const r = yield* db.entities.Telemetries.append({
+          channel: "c-seq",
+          deviceId: "d-1",
+          timestamp: ts,
+        })
+        expect(r.applied).toBe(true)
+      }
+
+      const history = yield* db.entities.Telemetries.history({
+        channel: "c-seq",
+        deviceId: "d-1",
+      }).collect()
+      expect(history).toHaveLength(3)
+    }).pipe(provideTs),
+  )
+
+  it.effect("stale append: older orderBy returns { applied: false, reason: 'stale' }", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Telemetries },
+        tables: { TsTable },
+      })
+
+      const newer = DateTime.makeUnsafe("2026-04-22T12:00:00.000Z")
+      const older = DateTime.makeUnsafe("2026-04-22T11:00:00.000Z")
+
+      const first = yield* db.entities.Telemetries.append({
+        channel: "c-stale",
+        deviceId: "d-1",
+        timestamp: newer,
+      })
+      expect(first.applied).toBe(true)
+
+      const second = yield* db.entities.Telemetries.append({
+        channel: "c-stale",
+        deviceId: "d-1",
+        timestamp: older,
+      })
+      expect(second.applied).toBe(false)
+      if (!second.applied) expect(second.reason).toBe("stale")
+
+      const history = yield* db.entities.Telemetries.history({
+        channel: "c-stale",
+        deviceId: "d-1",
+      }).collect()
+      expect(history).toHaveLength(1) // the winning event only
+    }).pipe(provideTs),
+  )
+
+  it.effect("duplicate orderBy is strictly < (second is stale, no dup event)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Telemetries },
+        tables: { TsTable },
+      })
+
+      const same = DateTime.makeUnsafe("2026-04-22T13:00:00.000Z")
+
+      const first = yield* db.entities.Telemetries.append({
+        channel: "c-dup",
+        deviceId: "d-1",
+        timestamp: same,
+      })
+      expect(first.applied).toBe(true)
+
+      const second = yield* db.entities.Telemetries.append({
+        channel: "c-dup",
+        deviceId: "d-1",
+        timestamp: same,
+      })
+      expect(second.applied).toBe(false)
+
+      const history = yield* db.entities.Telemetries.history({
+        channel: "c-dup",
+        deviceId: "d-1",
+      }).collect()
+      expect(history).toHaveLength(1)
+    }).pipe(provideTs),
+  )
+
+  it.effect("enrichment preservation: put sets accountId, append leaves it intact", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Telemetries },
+        tables: { TsTable },
+      })
+
+      const t0 = DateTime.makeUnsafe("2026-04-22T14:00:00.000Z")
+      // Seed the current row using append — accountId is NOT in appendInput.
+      // Attach accountId enrichment via .update().
+      yield* db.entities.Telemetries.append({
+        channel: "c-enrich",
+        deviceId: "d-1",
+        timestamp: t0,
+        location: "rack-A",
+      })
+      yield* db.entities.Telemetries.update(
+        { channel: "c-enrich", deviceId: "d-1" },
+        Telemetries.set({ accountId: "acct-1" }),
+      )
+
+      // Append without accountId in input — must not overwrite enrichment.
+      const t1 = DateTime.makeUnsafe("2026-04-22T14:05:00.000Z")
+      yield* db.entities.Telemetries.append({
+        channel: "c-enrich",
+        deviceId: "d-1",
+        timestamp: t1,
+        location: "rack-B",
+      })
+
+      const fetched = yield* db.entities.Telemetries.get({
+        channel: "c-enrich",
+        deviceId: "d-1",
+      })
+      expect(fetched.accountId).toBe("acct-1")
+      expect(fetched.location).toBe("rack-B")
+    }).pipe(provideTs),
+  )
+
+  it.effect("GSI on current: byAccount query returns current item, not events", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Telemetries },
+        tables: { TsTable },
+      })
+
+      // Use .put() to set a complete row with accountId populated.
+      yield* db.entities.Telemetries.put({
+        channel: "c-gsi",
+        deviceId: "d-1",
+        timestamp: DateTime.makeUnsafe("2026-04-22T15:00:00.000Z"),
+        accountId: "acct-gsi",
+      })
+
+      const later = DateTime.makeUnsafe("2026-04-22T15:05:00.000Z")
+      yield* db.entities.Telemetries.append({
+        channel: "c-gsi",
+        deviceId: "d-1",
+        timestamp: later,
+      })
+
+      const rows = yield* db.entities.Telemetries.byAccount({ accountId: "acct-gsi" }).collect()
+      // One row — the current; events don't carry GSI keys.
+      expect(rows).toHaveLength(1)
+      expect(rows[0]!.deviceId).toBe("d-1")
+    }).pipe(provideTs),
+  )
+
+  it.effect("history range via .where(between)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Telemetries },
+        tables: { TsTable },
+      })
+
+      // Seed 5 events over a ~1-hour window.
+      const base = new Date("2026-04-22T16:00:00.000Z").getTime()
+      for (let i = 0; i < 5; i++) {
+        yield* db.entities.Telemetries.append({
+          channel: "c-range",
+          deviceId: "d-1",
+          timestamp: DateTime.makeUnsafe(new Date(base + i * 15 * 60_000).toISOString()),
+        })
+      }
+
+      // Window covers events 1..3 (indices 1,2,3 — three events).
+      const from = new Date(base + 10 * 60_000).toISOString()
+      const to = new Date(base + 50 * 60_000).toISOString()
+
+      const window = yield* db.entities.Telemetries.history({ channel: "c-range", deviceId: "d-1" })
+        .where((t, { between }) => between(t.timestamp, from, to))
+        .collect()
+      expect(window).toHaveLength(3)
+    }).pipe(provideTs),
+  )
+
+  it.effect("_ttl attribute present on event items with sensible epoch value", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Telemetries },
+        tables: { TsTable },
+      })
+
+      yield* db.entities.Telemetries.append({
+        channel: "c-ttl",
+        deviceId: "d-1",
+        timestamp: DateTime.makeUnsafe("2026-04-22T17:00:00.000Z"),
+      })
+
+      const raw = yield* (yield* DynamoClient).query({
+        TableName: tsTableName,
+        KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
+        ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk" },
+        ExpressionAttributeValues: {
+          ":pk": { S: "$ts-test#v1#telemetry#channel_c-ttl#deviceid_d-1" },
+          ":skPrefix": { S: "$ts-test#v1#telemetry#e#" },
+        },
+      })
+      expect(raw.Items).toBeDefined()
+      expect(raw.Items!.length).toBeGreaterThanOrEqual(1)
+      const event = raw.Items![0]!
+      const ttl = event._ttl?.N ? Number(event._ttl.N) : undefined
+      expect(ttl).toBeDefined()
+      const now = Math.floor(Date.now() / 1000)
+      // Roughly 7 days out (Duration.days(7)).
+      expect(ttl!).toBeGreaterThan(now + 6 * 86400)
+      expect(ttl!).toBeLessThan(now + 8 * 86400)
+    }).pipe(provideTs),
+  )
+
+  it.effect("concurrent appenders: final current = max(orderBy)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Telemetries },
+        tables: { TsTable },
+      })
+
+      const ts = (iso: string) => DateTime.makeUnsafe(iso)
+      const times = [
+        "2026-04-22T18:00:00.000Z",
+        "2026-04-22T18:00:05.000Z",
+        "2026-04-22T18:00:10.000Z",
+      ]
+      yield* Effect.all(
+        times.map((iso) =>
+          db.entities.Telemetries.append({
+            channel: "c-concur",
+            deviceId: "d-1",
+            timestamp: ts(iso),
+          }),
+        ),
+        { concurrency: "unbounded" },
+      )
+
+      const current = yield* db.entities.Telemetries.get({
+        channel: "c-concur",
+        deviceId: "d-1",
+      })
+      // The latest timestamp is `18:00:10`.
+      const iso = DateTime.formatIso(current.timestamp)
+      expect(iso).toBe("2026-04-22T18:00:10.000Z")
+    }).pipe(provideTs),
+  )
 })
 
 // ===========================================================================

@@ -64,6 +64,7 @@ export type {
   CascadeIndexConfig,
   RefValue,
   SoftDeleteConfig,
+  TimeSeriesConfig,
   TimestampFieldConfig,
   TimestampsConfig,
   UniqueConfig,
@@ -152,6 +153,7 @@ import {
 import type {
   CascadeIndexConfig,
   SoftDeleteConfig,
+  TimeSeriesConfig,
   TimestampsConfig,
   UniqueConfig,
   VersionedConfig,
@@ -159,7 +161,7 @@ import type {
 
 /** A ref config object: the entity and optional cascade index config. */
 interface AnyRefValue {
-  readonly entity: Entity<any, any, any, any, any, any, any, any, any>
+  readonly entity: Entity<any, any, any, any, any, any, any, any, any, any>
   readonly cascade?: CascadeIndexConfig
 }
 
@@ -176,6 +178,8 @@ import {
   resolveUniqueFields,
 } from "./internal/EntitySchemas.js"
 import type {
+  AppendInputType,
+  AppendResult as AppendResultType,
   EntityInputType,
   EntityKeyType,
   EntityRecordType,
@@ -228,6 +232,7 @@ export interface Entity<
   TUnique extends UniqueConfig | undefined = UniqueConfig | undefined,
   TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
   TIdentifier extends string | undefined = undefined,
+  TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
 > {
   readonly _tag: "Entity"
   readonly model: TModel
@@ -238,6 +243,7 @@ export interface Entity<
   readonly softDelete: TSoftDelete
   readonly unique: TUnique
   readonly identifier: TIdentifier
+  readonly timeSeries: TTimeSeries
 
   /** @internal Resolved ref metadata — used by cascade to inspect target entities */
   readonly _resolvedRefs: ReadonlyArray<{
@@ -477,6 +483,44 @@ export interface Entity<
     ) => Query.Query<EntityRecordType<TModel, TTimestamps, TVersioned>>
   }
 
+  // --- Time-series Operations (only when `timeSeries` is configured) ---
+
+  /**
+   * Append an event to a time-series entity. Atomically updates the "current"
+   * item (scoped SET on `appendInput` fields only + CAS on `orderBy`) and
+   * writes an immutable event item under the same partition.
+   *
+   * Returns a discriminated union — stale writes are a success value, not an
+   * error. See {@link AppendResultType} and the `guides/timeseries.mdx` doc.
+   *
+   * The optional `condition` argument is ANDed onto the CAS ConditionExpression.
+   * On CAS failure OR user-condition failure, the result is
+   * `{ applied: false, reason: "stale", current }` — v1 does not distinguish
+   * between the two failure modes.
+   *
+   * Only available when the entity was built with `timeSeries: { ... }`.
+   */
+  readonly append: [TTimeSeries] extends [TimeSeriesConfig<infer TAI extends Schema.Top>]
+    ? (
+        input: AppendInputType<TAI>,
+        condition?: Expr | ConditionInput,
+      ) => Effect.Effect<
+        AppendResultType<TModel>,
+        DynamoClientError | ValidationError,
+        DynamoClient | TableConfig
+      >
+    : never
+
+  /**
+   * Query the event history of a time-series entity partition. Returns a
+   * `Query.Query` auto-scoped via `begins_with(<currentSk>#e#)`.
+   *
+   * Only available when the entity was built with `timeSeries: { ... }`.
+   */
+  readonly history: [TTimeSeries] extends [TimeSeriesConfig<any>]
+    ? (key: EntityKeyType<TModel, TIndexes>) => Query.Query<ModelType<TModel>>
+    : never
+
   // --- Update Combinators (entity-scoped, type-safe in both paths) ---
 
   /**
@@ -652,6 +696,7 @@ export interface BoundEntity<
   TIndexes extends globalThis.Record<string, IndexDefinition>,
   TRefs extends globalThis.Record<string, AnyRefValue> | undefined,
   TKey = EntityKeyType<TModel, TIndexes>,
+  TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
 > {
   // --- CRUD Operations ---
 
@@ -811,6 +856,50 @@ export interface BoundEntity<
       key: TKey,
     ) => import("./internal/BoundQuery.js").BoundQuery<ModelType<TModel>, never, ModelType<TModel>>
   }
+
+  // --- Time-series Operations (only when `timeSeries` is configured) ---
+
+  /**
+   * Append an event to a time-series entity. Atomically updates the "current"
+   * item (scoped SET on `appendInput` fields only + CAS on `orderBy`) and
+   * writes an immutable event item under the same partition.
+   *
+   * Returns a discriminated union — stale writes are a success value, not an
+   * error. See `guides/timeseries.mdx`.
+   *
+   * ```ts
+   * const r = yield* db.entities.Telemetry.append({ channel, deviceId, timestamp, location })
+   * if (r.applied) { /* r.current is the new state */ /*}
+   * else           { /* r.current is the winning state (stale) */ /*}
+   * ```
+   *
+   * Only available when the entity was built with `timeSeries: { ... }`.
+   */
+  readonly append: [TTimeSeries] extends [TimeSeriesConfig<infer TAI extends Schema.Top>]
+    ? (
+        input: AppendInputType<TAI>,
+        condition?: Expr | ConditionInput,
+      ) => Effect.Effect<AppendResultType<TModel>, DynamoClientError | ValidationError, never>
+    : never
+
+  /**
+   * Query the event history of a time-series entity partition. Returns a
+   * {@link import("./internal/BoundQuery.js").BoundQuery} auto-scoped to event
+   * items via `begins_with(<currentSk>#e#)`. `.where()` is typed to the
+   * configured `orderBy` attribute only; `.filter()` works on any model
+   * attribute.
+   *
+   * Only available when the entity was built with `timeSeries: { ... }`.
+   */
+  readonly history: [TTimeSeries] extends [TimeSeriesConfig<any>]
+    ? (
+        key: TKey,
+      ) => import("./internal/BoundQuery.js").BoundQuery<
+        ModelType<TModel>,
+        { readonly [K in NonNullable<TTimeSeries>["orderBy"] & string]: string },
+        ModelType<TModel>
+      >
+    : never
 
   // --- Query Execution ---
 
@@ -1014,6 +1103,7 @@ export const make = <
   const TSoftDelete extends SoftDeleteConfig | undefined = undefined,
   const TUnique extends UniqueConfig | undefined = undefined,
   const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
+  const TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   const TAttrs extends {} = {},
 >(config: {
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
@@ -1025,6 +1115,7 @@ export const make = <
   readonly softDelete?: TSoftDelete
   readonly unique?: TUnique
   readonly refs?: TRefs
+  readonly timeSeries?: TTimeSeries
 }): Entity<
   TModel,
   TEntityType,
@@ -1034,7 +1125,8 @@ export const make = <
   TSoftDelete,
   TUnique,
   TRefs,
-  ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>
+  ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
+  TTimeSeries
 > => {
   // Normalize GSI configs to internal IndexDefinition format
   const gsiIndexes: globalThis.Record<string, IndexDefinition> = {}
@@ -1064,6 +1156,7 @@ const makeImpl = <
   const TSoftDelete extends SoftDeleteConfig | undefined = undefined,
   const TUnique extends UniqueConfig | undefined = undefined,
   const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
+  const TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   const TAttrs extends {} = {},
 >(config: {
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
@@ -1074,6 +1167,7 @@ const makeImpl = <
   readonly softDelete?: TSoftDelete
   readonly unique?: TUnique
   readonly refs?: TRefs
+  readonly timeSeries?: TTimeSeries
 }): Entity<
   TModel,
   TEntityType,
@@ -1083,7 +1177,8 @@ const makeImpl = <
   TSoftDelete,
   TUnique,
   TRefs,
-  ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>
+  ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
+  TTimeSeries
 > => {
   // Unwrap ConfiguredModel to get the raw model and attribute overrides
   const configured = isConfiguredModel(config.model) ? config.model : undefined
@@ -1092,7 +1187,7 @@ const makeImpl = <
   const isSchemaClass = typeof rawModel === "function"
   const modelFields = getFields(rawModel)
   const hasHiddenFields = Object.values(modelFields).some(isHidden)
-  const systemFields = resolveSystemFields(config.timestamps, config.versioned)
+  const systemFields = resolveSystemFields(config.timestamps, config.versioned, config.timeSeries)
 
   // ---------------------------------------------------------------------------
   // Validate indexes
@@ -1120,6 +1215,113 @@ const makeImpl = <
           `[EDD-9002] Entity "${config.entityType}": index "${indexName}" references unknown attribute "${attr}". ` +
             `Valid attributes: ${[...validCompositeFields].sort().join(", ")}`,
         )
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Validate timeSeries config (EDD-9010..9016)
+  // ---------------------------------------------------------------------------
+  if (config.timeSeries !== undefined && config.timeSeries !== null) {
+    const ts = config.timeSeries as TimeSeriesConfig<any>
+    const orderBy = ts.orderBy
+
+    // EDD-9010: orderBy must name a model field
+    if (!(orderBy in modelFields)) {
+      throw new Error(
+        `[EDD-9010] Entity "${config.entityType}": timeSeries.orderBy "${orderBy}" does not name a model field. ` +
+          `Valid model fields: ${Object.keys(modelFields).sort().join(", ")}`,
+      )
+    }
+
+    // EDD-9011: orderBy must not be a primary-key composite (PK or SK)
+    const primary = config.indexes.primary
+    const pkSkComposites = new Set([...primary.pk.composite, ...primary.sk.composite])
+    if (pkSkComposites.has(orderBy)) {
+      throw new Error(
+        `[EDD-9011] Entity "${config.entityType}": timeSeries.orderBy "${orderBy}" must not appear ` +
+          `in the primary key pk or sk composite — it shadows the #e# event-SK infix.`,
+      )
+    }
+
+    // EDD-9012: mutually exclusive with versioned
+    if (config.versioned !== undefined && config.versioned !== null && config.versioned !== false) {
+      throw new Error(
+        `[EDD-9012] Entity "${config.entityType}": timeSeries and versioned are mutually exclusive. ` +
+          `Pick one consistency model per entity.`,
+      )
+    }
+
+    // EDD-9015: mutually exclusive with softDelete
+    if (
+      config.softDelete !== undefined &&
+      config.softDelete !== null &&
+      config.softDelete !== false
+    ) {
+      throw new Error(
+        `[EDD-9015] Entity "${config.entityType}": timeSeries and softDelete are mutually exclusive. ` +
+          `Append on a soft-deleted item would land on a new empty row — not a sound resurrection model.`,
+      )
+    }
+
+    // EDD-9016: appendInput is required
+    if (ts.appendInput === undefined || ts.appendInput === null) {
+      throw new Error(
+        `[EDD-9016] Entity "${config.entityType}": timeSeries.appendInput is required. ` +
+          `Define a Schema.Struct whose fields are the subset of the model allowed in .append() input. ` +
+          `Fields outside appendInput are preserved on the current item — this is the enrichment-preservation guarantee. ` +
+          `To opt out (dangerous), pass the full model schema explicitly.`,
+      )
+    }
+
+    const appendInputFields = (() => {
+      const ai = ts.appendInput as Schema.Top
+      if ("fields" in ai && typeof (ai as any).fields === "object") {
+        return Object.keys((ai as any).fields)
+      }
+      throw new Error(
+        `[EDD-9016] Entity "${config.entityType}": timeSeries.appendInput must be a Schema.Struct or Schema.Class (.fields required).`,
+      )
+    })()
+    const appendInputFieldSet = new Set(appendInputFields)
+
+    // EDD-9013: appendInput must include orderBy + all PK/SK composites
+    if (!appendInputFieldSet.has(orderBy)) {
+      throw new Error(
+        `[EDD-9013] Entity "${config.entityType}": timeSeries.appendInput must include orderBy "${orderBy}". ` +
+          `Without it .append() cannot evaluate the CAS condition.`,
+      )
+    }
+    for (const composite of pkSkComposites) {
+      if (!appendInputFieldSet.has(composite)) {
+        throw new Error(
+          `[EDD-9013] Entity "${config.entityType}": timeSeries.appendInput missing primary-key composite "${composite}". ` +
+            `Every PK/SK composite must appear in appendInput so the event can be addressed.`,
+        )
+      }
+    }
+
+    // EDD-9014: orderBy must not name a ref field or ref-derived ${name}Id field
+    for (const fieldName of Object.keys(modelFields)) {
+      if (isRefField(fieldName, config.model as Schema.Top)) {
+        if (orderBy === fieldName || orderBy === `${fieldName}Id`) {
+          throw new Error(
+            `[EDD-9014] Entity "${config.entityType}": timeSeries.orderBy "${orderBy}" names a ref ` +
+              `or ref-derived id field. Refs are create-time denormalisations and cannot serve as the event clock.`,
+          )
+        }
+      }
+    }
+    // Also: appendInput must not declare any ref-derived ${name}Id field —
+    // ref changes go through .update(), not .append() (§4.6).
+    for (const fieldName of Object.keys(modelFields)) {
+      if (isRefField(fieldName, config.model as Schema.Top)) {
+        if (appendInputFieldSet.has(`${fieldName}Id`)) {
+          throw new Error(
+            `[EDD-9014] Entity "${config.entityType}": timeSeries.appendInput must not include ref-derived ` +
+              `"${fieldName}Id" — refs cannot be reassigned via .append(). Use .update() to change a ref.`,
+          )
+        }
       }
     }
   }
@@ -1216,6 +1418,7 @@ const makeImpl = <
     resolvedRefs,
     immutableFields,
     resolvedIdentifier,
+    config.timeSeries,
   )
   // schema and tableTag are injected via _configure() when the entity is registered
   // on a Table and bound through DynamoClient.make(). They are captured by operation
@@ -3250,6 +3453,314 @@ const makeImpl = <
     )
 
   // ---------------------------------------------------------------------------
+  // append operation — time-series primitive (only when `timeSeries` configured)
+  //
+  // Two-item `TransactWriteItems`:
+  //  - UpdateItem on current: scoped SET (appendInput fields only) + CAS on
+  //    `orderBy`, with GSI keys recomposed when any appendInput field is a
+  //    GSI composite. `createdAt` uses if_not_exists on first append.
+  //  - Put of event: full decoded input + __edd_e__ + _ttl (if configured),
+  //    GSI keys stripped, SK replaced with `<currentSk>#e#<orderByValue>`.
+  //
+  // On TransactionCancelled or ConditionalCheckFailed, we issue a follow-up
+  // GetItem on the primary key and return `{ applied: false, reason: "stale",
+  // current }`. On success, same follow-up GetItem yields the post-append
+  // current. See `docs/designs/timeseries.md` §4.
+  // ---------------------------------------------------------------------------
+
+  const timeSeriesConfig = config.timeSeries as TimeSeriesConfig<any> | undefined
+
+  const append = (input: unknown, userCondition?: Expr | ConditionInput) =>
+    Effect.gen(function* () {
+      if (!timeSeriesConfig) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "append",
+          cause: "Entity is not configured with timeSeries. .append() requires timeSeries config.",
+        })
+      }
+      const client = yield* DynamoClient
+      const { name: tableName } = yield* tableTag
+      const orderByField = timeSeriesConfig.orderBy
+      const ttlDuration = timeSeriesConfig.ttl
+      const appendInputSchema = schemas.appendInputSchema as Schema.Codec<any>
+
+      // Decode input via appendInputSchema
+      const decodedInput = yield* Schema.decodeUnknownEffect(appendInputSchema)(input).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ValidationError({
+              entityType,
+              operation: "append.decode",
+              cause,
+            }),
+        ),
+      )
+      const decoded = decodedInput as globalThis.Record<string, unknown>
+
+      // Compose current-item primary key (pk + sk derived from PK/SK composites in decoded)
+      const primary = config.indexes.primary
+      const pkValue = KeyComposer.composePk(schema, entityType, primary, decoded)
+      const currentSk = KeyComposer.composeSk(schema, entityType, entityVersion, primary, decoded)
+      const marshalledKey = toAttributeMap({
+        [primary.pk.field]: pkValue,
+        [primary.sk.field]: currentSk,
+      })
+
+      // Prepare domain-serialised values for the item build.
+      // Build a shallow copy and apply date serialization (per fieldEncodings)
+      // before marshalling. This mirrors the put path.
+      const serialisedInput: globalThis.Record<string, unknown> = { ...decoded }
+      serializeDateFields(serialisedInput)
+
+      // ---------- Build UpdateItem (scoped SET + CAS) ----------
+      const setClauses: Array<string> = []
+      const names: globalThis.Record<string, string> = {}
+      const values: globalThis.Record<string, AttributeValue> = {}
+      let counter = 0
+
+      // Only fields named in appendInput (the serialisedInput object). This is
+      // the enrichment-preservation contract — fields outside appendInput are
+      // never touched. PK composites ARE included: they're stored as regular
+      // attributes on the item (mirrors `.put()`), and though their values
+      // never change, writing them on every append makes the first append
+      // (where the row doesn't yet exist) materialise the row correctly.
+      const pkCompositeSet = new Set(primaryKeyComposites(config.indexes))
+      for (const [attr, val] of Object.entries(serialisedInput)) {
+        if (val === undefined) continue
+        const nameKey = `#a${counter}`
+        const valKey = `:a${counter}`
+        names[nameKey] = resolveDbName(attr)
+        values[valKey] = toAttributeValue(val)
+        setClauses.push(`${nameKey} = ${valKey}`)
+        counter++
+      }
+
+      // GSI key recomposition: any GSI whose composites are touched by input.
+      // Reuses the same machinery as `.update()`. PK composites are excluded
+      // from the update payload: they're already in the key and never change
+      // during an append. Non-PK composites that overlap between appendInput
+      // and a GSI trigger recomposition, which requires the full GSI composite
+      // set (partial presence raises `PartialGsiCompositeError`).
+      const nonPkAppendFields: globalThis.Record<string, unknown> = {}
+      for (const [attr, val] of Object.entries(decoded)) {
+        if (!pkCompositeSet.has(attr)) {
+          nonPkAppendFields[attr] = val
+        }
+      }
+      let gsiKeys: globalThis.Record<string, string>
+      try {
+        gsiKeys = KeyComposer.composeGsiKeysForUpdate(
+          schema,
+          entityType,
+          entityVersion,
+          allIndexes,
+          nonPkAppendFields,
+          decoded,
+        )
+      } catch (e) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "append.gsiComposites",
+          cause: e instanceof Error ? e.message : e,
+        })
+      }
+      for (const [field, value] of Object.entries(gsiKeys)) {
+        const nameKey = `#a${counter}`
+        const valKey = `:a${counter}`
+        names[nameKey] = field
+        values[valKey] = toAttributeValue(value)
+        setClauses.push(`${nameKey} = ${valKey}`)
+        counter++
+      }
+
+      // Entity type discriminator — idempotent; ensures existing items
+      // without __edd_e__ still get tagged on first append.
+      {
+        const nameKey = `#a${counter}`
+        const valKey = `:a${counter}`
+        names[nameKey] = "__edd_e__"
+        values[valKey] = toAttributeValue(entityType)
+        setClauses.push(`${nameKey} = ${valKey}`)
+        counter++
+      }
+
+      // createdAt (if configured) — if_not_exists so subsequent appends leave it alone
+      if (systemFields.createdAt) {
+        const nameKey = `#a${counter}`
+        const valKey = `:a${counter}`
+        names[nameKey] = systemFields.createdAt
+        values[valKey] = toAttributeValue(generateTimestamp(systemFields.createdAtEncoding))
+        setClauses.push(`${nameKey} = if_not_exists(${nameKey}, ${valKey})`)
+        counter++
+      }
+
+      // CAS condition: attribute_not_exists(#pk) OR #ob < :newOb
+      names["#_tspk"] = primary.pk.field
+      names["#_tsob"] = resolveDbName(orderByField)
+      // The comparison uses the stored domain-value representation — for
+      // DateTime.Utc this is ISO (lexicographic == chronological), for numbers
+      // it's numeric, for strings it's lexicographic. Matches how the current
+      // item stores `orderByField`.
+      const newObValue = serialisedInput[orderByField]
+      values[":_tsNewOb"] = toAttributeValue(newObValue)
+
+      const casCondition = "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb"
+      let finalCondition = casCondition
+      if (userCondition !== undefined) {
+        const uc = compileCondition(userCondition, resolveDbName)!
+        finalCondition = `(${casCondition}) AND (${uc.expression})`
+        Object.assign(names, uc.names)
+        Object.assign(values, uc.values)
+      }
+
+      const updateExpression = `SET ${setClauses.join(", ")}`
+
+      // ---------- Build Put of event item ----------
+      const eventSk = KeyComposer.composeEventSk(currentSk, newObValue, schema.casing)
+      const eventItem: globalThis.Record<string, unknown> = { ...decoded }
+      // Serialise date fields to storage format for the Put
+      serializeDateFields(eventItem)
+      // Rename domain → DB names for the Put (matches put path)
+      renameToDynamo(eventItem)
+      // pk + sk (event)
+      eventItem[primary.pk.field] = pkValue
+      eventItem[primary.sk.field] = eventSk
+      // __edd_e__
+      eventItem.__edd_e__ = entityType
+      // _ttl
+      if (ttlDuration) {
+        eventItem._ttl = Math.floor(Date.now() / 1000) + Duration.toSeconds(ttlDuration)
+      }
+      // Events never participate in indexes: strip any GSI key fields that the
+      // naive spread above may have carried over. gsiKeys weren't written into
+      // eventItem (only decoded fields are), but defensively clear them.
+      for (const field of gsiKeyFields()) {
+        delete eventItem[field]
+      }
+
+      const marshalledEventItem = toAttributeMap(eventItem)
+
+      // ---------- Execute TransactWriteItems ----------
+      const transactResult = yield* client
+        .transactWriteItems({
+          TransactItems: [
+            {
+              Update: {
+                TableName: tableName,
+                Key: marshalledKey,
+                UpdateExpression: updateExpression,
+                ConditionExpression: finalCondition,
+                ExpressionAttributeNames: names,
+                ExpressionAttributeValues: values,
+              },
+            },
+            {
+              Put: {
+                TableName: tableName,
+                Item: marshalledEventItem,
+              },
+            },
+          ],
+        })
+        .pipe(
+          Effect.matchEffect({
+            onSuccess: () => Effect.succeed({ stale: false as const }),
+            onFailure: (err) => {
+              // TransactionCancelled or ConditionalCheckFailed at the transaction
+              // level both map to "stale" (can't distinguish CAS from user-cond
+              // in v1 — see §12 decision 5).
+              if (isAwsTransactionCancelled(err.cause) || isAwsConditionalCheckFailed(err.cause)) {
+                return Effect.succeed({ stale: true as const })
+              }
+              return Effect.fail(err)
+            },
+          }),
+        )
+
+      // Follow-up GetItem to read the current (post-append on success, winning
+      // state on stale). One read is required either way — the contract
+      // returns `Model` which demands the full row including enrichment.
+      const followUp = yield* client.getItem({
+        TableName: tableName,
+        Key: marshalledKey,
+      })
+      if (!followUp.Item) {
+        // TTL race or out-of-band delete — surface as a DynamoClientError
+        // (the previous state vanished under us). This is NOT a stale result.
+        return yield* Effect.fail(
+          new ValidationError({
+            entityType,
+            operation: "append.followUp",
+            cause: "Current item not found after append — possible TTL race or concurrent delete.",
+          }),
+        )
+      }
+
+      const rawCurrent = fromAttributeMap(followUp.Item) as globalThis.Record<string, unknown>
+      const currentModel = yield* decodeAs(rawCurrent, followUp.Item, "model")
+
+      if (transactResult.stale) {
+        return {
+          applied: false as const,
+          reason: "stale" as const,
+          current: currentModel as ModelType<TModel>,
+        }
+      }
+      return { applied: true as const, current: currentModel as ModelType<TModel> }
+    })
+
+  // ---------------------------------------------------------------------------
+  // history operation — BoundQuery for event items only
+  // ---------------------------------------------------------------------------
+
+  const history = (key: unknown) => {
+    if (!timeSeriesConfig) {
+      throw new Error(
+        `[EDD-9010] Entity "${entityType}": .history() requires timeSeries config on the entity.`,
+      )
+    }
+    const decodedKey = Schema.decodeUnknownSync(schemas.keySchema as Schema.Codec<any>)(key)
+    const primary = config.indexes.primary
+    const pkValue = KeyComposer.composePk(schema, entityType, primary, decodedKey)
+    const currentSk = KeyComposer.composeSk(
+      schema,
+      entityType,
+      entityVersion,
+      primary,
+      decodedKey as globalThis.Record<string, unknown>,
+    )
+    const prefix = KeyComposer.composeEventSkPrefix(currentSk, schema.casing)
+
+    const decodeHistory = (raw: globalThis.Record<string, unknown>) => {
+      renameFromDynamo(raw)
+      deserializeDateFields(raw)
+      return Schema.decodeUnknownEffect(schemas.historyRecordSchema as Schema.Codec<any>)(raw).pipe(
+        Effect.map(attachPrototype),
+        Effect.mapError(
+          (cause) =>
+            new ValidationError({
+              entityType,
+              operation: "history.decode",
+              cause,
+            }),
+        ),
+      )
+    }
+
+    return Query.make({
+      tableName: "",
+      indexName: undefined,
+      pkField: primary.pk.field,
+      pkValue,
+      skField: primary.sk.field,
+      entityTypes: [entityType],
+      decoder: (raw) => decodeHistory(raw),
+      resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
+    }).pipe(Query.where({ beginsWith: prefix }))
+  }
+
+  // ---------------------------------------------------------------------------
   // query namespace
   // ---------------------------------------------------------------------------
 
@@ -3881,6 +4392,7 @@ const makeImpl = <
     softDelete: config.softDelete as TSoftDelete,
     unique: config.unique as TUnique,
     identifier: resolvedIdentifier as ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
+    timeSeries: config.timeSeries as TTimeSeries,
     _resolvedRefs: resolvedRefs,
     /** @internal Full decode pipeline: rename + date deser + schema decode. Used by Batch/Aggregate. */
     _decodeRecord: decodeRecord,
@@ -3921,6 +4433,8 @@ const makeImpl = <
     restore,
     purge,
     deleted: { get: deletedGet, list: deletedList },
+    append,
+    history,
 
     set,
     expectedVersion,
@@ -3944,7 +4458,8 @@ const makeImpl = <
     TSoftDelete,
     TUnique,
     TRefs,
-    ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>
+    ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
+    TTimeSeries
   >
 
   // Assign self so operation closures can reference the entity
@@ -3975,6 +4490,7 @@ export const bind = <
   TUnique extends UniqueConfig | undefined,
   TRefs extends globalThis.Record<string, AnyRefValue> | undefined,
   TIdentifier extends string | undefined,
+  TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
 >(
   entity: Entity<
     TModel,
@@ -3985,9 +4501,14 @@ export const bind = <
     TSoftDelete,
     TUnique,
     TRefs,
-    TIdentifier
+    TIdentifier,
+    TTimeSeries
   >,
-): Effect.Effect<BoundEntity<TModel, TIndexes, TRefs>, never, DynamoClient | TableConfig> =>
+): Effect.Effect<
+  BoundEntity<TModel, TIndexes, TRefs, EntityKeyType<TModel, TIndexes>, TTimeSeries>,
+  never,
+  DynamoClient | TableConfig
+> =>
   Effect.gen(function* () {
     const ctx = yield* Effect.context<DynamoClient | TableConfig>()
     const provide = <A, E>(
@@ -4077,6 +4598,67 @@ export const bind = <
         get: (key: Key) => provide((entity.deleted.get(key) as any)._run("record")),
         list: (key: Key) => wrapAsBoundQuery(entity.deleted.list(key)),
       },
+      // Time-series (no-ops when entity is not configured; runtime check in
+      // the entity-level `append` returns a ValidationError).
+      append: (input: unknown, condition?: Expr | ConditionInput) =>
+        provide(
+          (
+            entity.append as any as (
+              i: unknown,
+              c?: Expr | ConditionInput,
+            ) => Effect.Effect<any, any, any>
+          )(input, condition),
+        ),
+      history: (key: Key) => {
+        const q = (entity.history as any as (k: Key) => Query.Query<any>)(key)
+        const pathBuilder = createPathBuilder()
+        const conditionOps = createConditionOps()
+        const ts = (entity as unknown as { readonly timeSeries?: TimeSeriesConfig<any> }).timeSeries
+        const orderBy = ts?.orderBy
+        const entityInternals = entity as unknown as {
+          readonly _schema: DynamoSchema.DynamoSchema
+          readonly entityType: string
+        }
+        const schemaRef = entityInternals._schema
+        const entityTypeRef = entityInternals.entityType
+
+        // composeSkCondition: rewrite user's .where() values by prefixing
+        // with `<currentSk>#e#` and applying serialisation + casing to the
+        // user-supplied orderBy value.
+        const primary = entity.indexes.primary!
+        const composeSkCondition = (cond: Query.SortKeyCondition): Query.SortKeyCondition => {
+          // We need the `currentSk` + prefix. The user's `key` lets us derive
+          // `currentSk` via the same primary SK composer used by `history()`.
+          const currentSk = KeyComposer.composeSk(
+            schemaRef,
+            entityTypeRef,
+            1,
+            primary,
+            key as globalThis.Record<string, unknown>,
+          )
+          const prefix = KeyComposer.composeEventSkPrefix(currentSk, schemaRef.casing)
+          const rewrite = (v: unknown) =>
+            `${prefix}${DynamoSchema.applyCasing(KeyComposer.serializeValue(v), schemaRef.casing)}`
+          if ("eq" in cond) return { eq: rewrite(cond.eq) }
+          if ("lt" in cond) return { lt: rewrite(cond.lt) }
+          if ("lte" in cond) return { lte: rewrite(cond.lte) }
+          if ("gt" in cond) return { gt: rewrite(cond.gt) }
+          if ("gte" in cond) return { gte: rewrite(cond.gte) }
+          if ("between" in cond)
+            return { between: [rewrite(cond.between[0]), rewrite(cond.between[1])] }
+          if ("beginsWith" in cond) return { beginsWith: rewrite(cond.beginsWith) }
+          return cond
+        }
+
+        const bqConfig: BoundQueryConfig<unknown> = {
+          pathBuilder,
+          conditionOps,
+          provide,
+          skFields: orderBy ? [orderBy] : [],
+          composeSkCondition,
+        }
+        return new BoundQueryImpl(q, bqConfig)
+      },
       // Query execution
       paginate: <A>(q: Query.Query<A>, ...combinators: ReadonlyArray<(q: any) => any>) => {
         const final = applyQuery(q, combinators)
@@ -4090,7 +4672,13 @@ export const bind = <
         provide(Query.execute(applyQuery(q, combinators))),
       scanFetch: (...combinators: ReadonlyArray<(q: any) => any>) =>
         provide(Query.execute(applyQuery(entity.scan(), combinators))),
-    } as unknown as BoundEntity<TModel, TIndexes, TRefs>
+    } as unknown as BoundEntity<
+      TModel,
+      TIndexes,
+      TRefs,
+      EntityKeyType<TModel, TIndexes>,
+      TTimeSeries
+    >
   })
 
 // ---------------------------------------------------------------------------
@@ -4153,6 +4741,19 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
 }
 
 // ---------------------------------------------------------------------------
+// Time-series public type alias
+// ---------------------------------------------------------------------------
+
+/**
+ * The return type of `BoundEntity.append()` — a discriminated union.
+ *
+ * - `{ applied: true, current }` — transaction succeeded.
+ * - `{ applied: false, reason: "stale", current }` — CAS rejected the write;
+ *   `current` is the winning state (obtained via follow-up `GetItem`).
+ */
+export type AppendResult<TModel extends Schema.Top> = AppendResultType<TModel>
+
+// ---------------------------------------------------------------------------
 // Type extractors — the 7 derived types
 // ---------------------------------------------------------------------------
 
@@ -4170,8 +4771,13 @@ export type Model<E extends { readonly model: Schema.Top }> = ModelType<E["model
  */
 // eslint-disable-next-line @typescript-eslint/no-shadow
 export type Record<
-  E extends { readonly model: Schema.Top; readonly timestamps: any; readonly versioned: any },
-> = EntityRecordType<E["model"], E["timestamps"], E["versioned"]>
+  E extends {
+    readonly model: Schema.Top
+    readonly timestamps: any
+    readonly versioned: any
+    readonly timeSeries?: any
+  },
+> = EntityRecordType<E["model"], E["timestamps"], E["versioned"], E["timeSeries"]>
 
 /**
  * Extract the input type from an Entity. Ref-aware: when refs are present,

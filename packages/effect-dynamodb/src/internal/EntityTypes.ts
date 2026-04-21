@@ -24,12 +24,20 @@ export type PrimaryKeyComposites<TIndexes> = TIndexes extends {
   ? PKC[number] | SKC[number]
   : string
 
-/** Compute system fields added by timestamps and versioned config */
-export type SystemFieldsType<TTimestamps, TVersioned> = ([TTimestamps] extends [undefined]
+/** Compute system fields added by timestamps and versioned config.
+ *
+ * Time-series entities auto-suppress `updatedAt` — the `orderBy` attribute IS
+ * the update clock. `createdAt` is preserved and set via `if_not_exists`.
+ */
+export type SystemFieldsType<TTimestamps, TVersioned, TTimeSeries = undefined> = ([
+  TTimestamps,
+] extends [undefined]
   ? {}
   : [TTimestamps] extends [false]
     ? {}
-    : { readonly createdAt: DateTime.Utc; readonly updatedAt: DateTime.Utc }) &
+    : [TTimeSeries] extends [undefined | false]
+      ? { readonly createdAt: DateTime.Utc; readonly updatedAt: DateTime.Utc }
+      : { readonly createdAt: DateTime.Utc }) &
   ([TVersioned] extends [undefined]
     ? {}
     : [TVersioned] extends [false]
@@ -47,7 +55,8 @@ export type EntityRecordType<
   TModel extends Schema.Top,
   TTimestamps,
   TVersioned,
-> = ModelType<TModel> & SystemFieldsType<TTimestamps, TVersioned>
+  TTimeSeries = undefined,
+> = ModelType<TModel> & SystemFieldsType<TTimestamps, TVersioned, TTimeSeries>
 
 /** Entity input type: same as model fields (system fields auto-managed) */
 export type EntityInputType<TModel extends Schema.Top> = ModelType<TModel>
@@ -65,6 +74,33 @@ export type EntityCreateType<
 export type EntityUpdateType<TModel extends Schema.Top, TIndexes> = Partial<
   Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes>>
 >
+
+/**
+ * Input type for `.append()` on a time-series entity.
+ *
+ * Derived from the required `appendInput` schema. Always includes `orderBy`
+ * plus all PK/SK composite fields (enforced at `Entity.make()` time).
+ */
+export type AppendInputType<TAppendInput> = [TAppendInput] extends [Schema.Top]
+  ? Schema.Schema.Type<TAppendInput>
+  : never
+
+/**
+ * Return type of `.append()` — a discriminated union.
+ *
+ * - `{ applied: true, current }` — transaction succeeded; `current` is the new state.
+ * - `{ applied: false, reason: "stale", current }` — CAS rejected the write;
+ *    `current` is the winning state (obtained via follow-up GetItem).
+ *
+ * Errors on the Effect error channel: `DynamoClientError`, `ValidationError`.
+ */
+export type AppendResult<TModel extends Schema.Top> =
+  | { readonly applied: true; readonly current: ModelType<TModel> }
+  | {
+      readonly applied: false
+      readonly reason: "stale"
+      readonly current: ModelType<TModel>
+    }
 
 // ---------------------------------------------------------------------------
 // Ref-aware type computations

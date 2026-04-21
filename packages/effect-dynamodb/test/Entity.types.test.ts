@@ -796,3 +796,119 @@ describe("Entity type extractors", () => {
     expect(typeof _byTeamSeriesNoSk).toBe("function")
   })
 })
+
+// ---------------------------------------------------------------------------
+// Time-series (`timeSeries`) type-level tests
+// ---------------------------------------------------------------------------
+
+describe("Entity types — timeSeries", () => {
+  class Telemetry extends Schema.Class<Telemetry>("Telemetry")({
+    channel: Schema.String,
+    deviceId: Schema.String,
+    timestamp: Schema.DateTimeUtc,
+    accountId: Schema.optional(Schema.String),
+    location: Schema.optional(Schema.String),
+  }) {}
+
+  const TelemetryAppendInput = Schema.Struct({
+    channel: Schema.String,
+    deviceId: Schema.String,
+    timestamp: Schema.DateTimeUtc,
+    location: Schema.optional(Schema.String),
+  })
+
+  const TsEntity = Entity.make({
+    model: Telemetry,
+    entityType: "Telemetry",
+    primaryKey: {
+      pk: { field: "pk", composite: ["channel", "deviceId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    timeSeries: {
+      orderBy: "timestamp",
+      appendInput: TelemetryAppendInput,
+    },
+  })
+
+  // Fabricate a BoundEntity type from the Entity — we don't need a runtime bind
+  // for type-level tests.
+  type TsBound = import("../src/Entity.js").BoundEntity<
+    typeof Telemetry,
+    typeof TsEntity.indexes,
+    undefined,
+    { readonly channel: string; readonly deviceId: string },
+    typeof TsEntity.timeSeries
+  >
+
+  it("BoundEntity.append input narrows to appendInput schema fields", () => {
+    // Type-level: append accepts appendInput shape.
+    type AppendFn = TsBound["append"]
+    type AppendArg = AppendFn extends (input: infer A, ...args: any[]) => any ? A : never
+    type Expected = Schema.Schema.Type<typeof TelemetryAppendInput>
+
+    expectTypeOf<AppendArg>().toEqualTypeOf<Expected>()
+    // `accountId` (model-only field) must NOT be in the input.
+    type HasAccountId = "accountId" extends keyof AppendArg ? true : false
+    expectTypeOf<HasAccountId>().toEqualTypeOf<false>()
+  })
+
+  it("append return type is the discriminated union", () => {
+    type AppendFn = TsBound["append"]
+    type R = AppendFn extends (...args: any[]) => import("effect").Effect.Effect<infer A, any, any>
+      ? A
+      : never
+    // Must be the two-branch discriminated union.
+    type SuccessBranch = { readonly applied: true; readonly current: Telemetry }
+    type StaleBranch = {
+      readonly applied: false
+      readonly reason: "stale"
+      readonly current: Telemetry
+    }
+    expectTypeOf<R>().toEqualTypeOf<SuccessBranch | StaleBranch>()
+  })
+
+  it(".history() callback `t` has only orderBy keys", () => {
+    type HistoryFn = TsBound["history"]
+    // Call signature returns BoundQuery<Model, { timestamp: string }, Model>.
+    type HistoryResult = HistoryFn extends (key: any) => infer R ? R : never
+    type WhereFn = HistoryResult extends { readonly where: infer W } ? W : never
+    // The callback's first arg is `SkRemaining` = { readonly timestamp: string }.
+    type SkArg = WhereFn extends (fn: (t: infer T, ops: any) => any) => any ? T : never
+    // Must include `timestamp`.
+    type HasTimestamp = "timestamp" extends keyof SkArg ? true : false
+    expectTypeOf<HasTimestamp>().toEqualTypeOf<true>()
+    // Must NOT include other model fields.
+    type HasChannel = "channel" extends keyof SkArg ? true : false
+    expectTypeOf<HasChannel>().toEqualTypeOf<false>()
+  })
+
+  it("second .where() on history is a type error (SkRemaining exhausted)", () => {
+    type HistoryFn = TsBound["history"]
+    type HistoryResult = HistoryFn extends (key: any) => infer R ? R : never
+    type WhereFn = HistoryResult extends { readonly where: infer W } ? W : never
+    type AfterWhere = WhereFn extends (fn: any) => infer R ? R : never
+    // After one .where(), SkRemaining = never and `where` no longer exists.
+    type HasWhere = "where" extends keyof AfterWhere ? true : false
+    expectTypeOf<HasWhere>().toEqualTypeOf<false>()
+  })
+
+  it("entity without timeSeries: .append is `never`", () => {
+    const Plain = Entity.make({
+      model: Telemetry,
+      entityType: "Telemetry",
+      primaryKey: {
+        pk: { field: "pk", composite: ["channel", "deviceId"] },
+        sk: { field: "sk", composite: [] },
+      },
+    })
+    type PlainBound = import("../src/Entity.js").BoundEntity<
+      typeof Telemetry,
+      typeof Plain.indexes,
+      undefined,
+      { readonly channel: string; readonly deviceId: string },
+      undefined
+    >
+    expectTypeOf<PlainBound["append"]>().toEqualTypeOf<never>()
+    expectTypeOf<PlainBound["history"]>().toEqualTypeOf<never>()
+  })
+})
