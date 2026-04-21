@@ -565,7 +565,7 @@ type ResolveSkFields<M extends Schema.Top, I, K extends keyof I, Provided, R = u
     ? { readonly [P in keyof SK]: SK[P] }
     : never
 
-/** Compute entity query accessors for each index (non-primary).
+/** Compute entity query accessors for each index — including `primary`.
  * Generic over provided input — `.where()` only exposes SK composites NOT already provided.
  * `R` (refs) lets ref-derived composite names (e.g. `playerId`) resolve to their
  * branded identifier types instead of being silently dropped. */
@@ -574,7 +574,7 @@ type EntityIndexAccessors<
   I extends Record<string, IndexDefinition>,
   R = undefined,
 > = {
-  readonly [K in Exclude<keyof I, "primary"> & string]: <Provided extends IndexPkInput<M, I, K, R>>(
+  readonly [K in keyof I & string]: <Provided extends IndexPkInput<M, I, K, R>>(
     composites: Provided,
   ) => import("./internal/BoundQuery.js").BoundQuery<
     Schema.Schema.Type<M>,
@@ -796,9 +796,8 @@ const makeFromConfig = (config: {
       const entityLike = entity as unknown as EntityLike
       const accessors: Record<string, unknown> = {}
 
-      // Add query accessor for each non-primary index
+      // Add query accessor for each index — including `primary`.
       for (const [indexName, indexDef] of Object.entries(entityLike.indexes)) {
-        if (indexName === "primary") continue
         if (!indexDef) continue
 
         accessors[indexName] = buildEntityQueryAccessor(entityLike, indexName, indexDef)

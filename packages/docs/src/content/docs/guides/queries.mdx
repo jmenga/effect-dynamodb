@@ -43,13 +43,50 @@ const assigneeTasks = yield* db.entities.TaskEntity.byAssignee({
 }).collect()
 ```
 
+Every entity also exposes a `.primary(...)` accessor for the primary index — same contract as GSI accessors (required PK composites, optional SK composites with `begins_with` prefix matching):
+
+```typescript
+// Primary-index query — list every item under a shared primary partition.
+// Used when multiple items share the primary PK and are distinguished by SK
+// (the join-table single-table pattern).
+const allMembers = yield* db.entities.Memberships.primary({
+  orgId: "org-acme",
+}).collect()
+```
+
 ### Generated Accessor Mapping
+
+Every index — **including `primary`** — gets a query accessor. Accessors accept required PK composites and optional SK composites (partial SK composites apply `begins_with` prefix matching). `.get(fullKey)` remains the dedicated `GetItem` path for single-item fetches by full primary key.
 
 | Definition | Accessor | Argument Type |
 |-----------|----------|---------------|
 | `primaryKey: { pk: { composite: ["taskId"] }, ... }` | `db.entities.TaskEntity.get(...)` | `{ taskId: string }` |
+| `primaryKey: { pk: { composite: ["orgId"] }, sk: { composite: ["userId"] } }` | `db.entities.Memberships.primary(...)` | `{ orgId: string; userId?: string }` |
 | `indexes: { byProject: { name: "gsi1", pk: { composite: ["projectId"] }, ... } }` | `db.entities.TaskEntity.byProject(...)` | `{ projectId: string }` |
 | `indexes: { byAssignee: { name: "gsi2", pk: { composite: ["assigneeId"] }, ... } }` | `db.entities.TaskEntity.byAssignee(...)` | `{ assigneeId: string }` |
+
+### `.primary()` vs `.get()`
+
+Use `.get(fullKey)` when you know the full primary composite key and want a single item — it's a strongly-consistent `GetItem`, cheaper than a `Query`. Use `.primary(partialKey)` when you want to list items that share a primary partition key, for example a join-table where one partition holds many items distinguished by the sort key:
+
+```typescript
+// `Memberships` primary key: pk = orgId, sk = userId
+//
+// List every membership in an organization — PK only, SK composites omitted
+const allMembers = yield* db.entities.Memberships.primary({
+  orgId: "org-acme",
+}).collect()
+
+// Narrow by sort-key prefix — equivalent to `.get()` here because the full SK
+// composite is provided, but returns an array (possibly empty) rather than
+// failing with `ItemNotFound`.
+const bobs = yield* db.entities.Memberships.primary({
+  orgId: "org-acme",
+  userId: "u-bob",
+}).collect()
+```
+
+Behavior is symmetric with GSI accessors: `.where()`, `.filter()`, `.select()`, `.limit()`, `.reverse()`, `.startFrom()`, `.consistentRead()`, `.collect()`, `.fetch()`, `.paginate()`, and `.count()` all chain off the returned `BoundQuery`.
 
 ## Sort Key Conditions
 
