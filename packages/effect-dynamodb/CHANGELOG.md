@@ -1,6 +1,6 @@
 # effect-dynamodb
 
-## 2.0.0
+## 1.1.0
 
 ### Minor Changes
 
@@ -16,8 +16,6 @@
   - **`appendInput` is required** (`EDD-9016`) — forces the enrichment-preservation choice to be visible at the entity definition.
 
   Not source-breaking: the `Entity<...>` generic signature gains a new optional type parameter at the end (`TTimeSeries`, defaults to `undefined`). Existing code compiles unchanged. The semantic change is additive.
-
-  Note on version: per the established workflow in this repo, the peer-dep cascade between `@effect-dynamodb/geo` and `effect-dynamodb` promotes this minor into a synchronized major version bump across all three fixed-lockstep publishable packages.
 
 ## 1.0.0
 
