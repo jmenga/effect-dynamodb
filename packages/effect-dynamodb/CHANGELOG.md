@@ -1,5 +1,24 @@
 # effect-dynamodb
 
+## 2.0.0
+
+### Minor Changes
+
+- feat(Entity): `timeSeries` primitive for event-driven workloads
+
+  Adds a new `timeSeries` configuration primitive on `Entity.make()` for IoT-style workloads that need the split-item pattern: one "current" item per partition (latest state, index-visible) plus N immutable "event" items (TTL-bounded, time-queryable).
+
+  - **New API:** `Entity.make({ timeSeries: { orderBy, ttl?, appendInput } })`
+  - **`.append(input, condition?)`** — atomic `TransactWriteItems` (UpdateItem current + Put event) with CAS `attribute_not_exists(pk) OR #orderBy < :newOb`. Returns a discriminated union `{ applied: true | false, current }` — stale writes are a success value, not an error.
+  - **`.history(key)`** — `BoundQuery` auto-scoped via `begins_with(<currentSk>#e#)`, with `.where()` restricted to the configured `orderBy` attribute.
+  - **Enrichment preservation** — `.append()`'s `SET` clause covers only fields declared in `appendInput`. Model fields outside `appendInput` (e.g. background-assigned `accountId`) are never touched.
+  - **Mutually exclusive** with `versioned` (`EDD-9012`) and `softDelete` (`EDD-9015`).
+  - **`appendInput` is required** (`EDD-9016`) — forces the enrichment-preservation choice to be visible at the entity definition.
+
+  Not source-breaking: the `Entity<...>` generic signature gains a new optional type parameter at the end (`TTimeSeries`, defaults to `undefined`). Existing code compiles unchanged. The semantic change is additive.
+
+  Note on version: per the established workflow in this repo, the peer-dep cascade between `@effect-dynamodb/geo` and `effect-dynamodb` promotes this minor into a synchronized major version bump across all three fixed-lockstep publishable packages.
+
 ## 1.0.0
 
 ### Minor Changes

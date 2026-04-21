@@ -1,5 +1,12 @@
 # @effect-dynamodb/geo
 
+## 2.0.0
+
+### Patch Changes
+
+- Updated dependencies []:
+  - effect-dynamodb@2.0.0
+
 ## 1.0.0
 
 ### Minor Changes

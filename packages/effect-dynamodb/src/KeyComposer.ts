@@ -9,6 +9,7 @@
 import { DateTime } from "effect"
 import type * as DynamoSchema from "./DynamoSchema.js"
 import {
+  applyCasing,
   composeClusteredSortKey,
   composeCollectionKey,
   composeIsolatedSortKey,
@@ -367,3 +368,36 @@ export const composeSortKeyPrefix = (
 
   return composeKey(schema, entityType, available, { casing: index.casing, names })
 }
+
+// ---------------------------------------------------------------------------
+// Time-series key helpers (used by `Entity.append()` / `.history()`).
+// Event item SK format: `<currentSk>#e#<serialised-orderBy-value>`.
+// Casing is applied to both the `#e#` infix and the value for consistency with
+// the rest of the SK — matches how every other composite segment is cased.
+// ---------------------------------------------------------------------------
+
+const EVENT_SK_INFIX = "e"
+
+/**
+ * Compose an event-item sort key by decorating the current-item SK.
+ *
+ * Given `currentSk = "$app#v1#telemetry_1"` and `orderByValue = 42`, returns
+ * `"$app#v1#telemetry_1#e#0000000000000042"` (with default lowercase casing).
+ */
+export const composeEventSk = (
+  currentSk: string,
+  orderByValue: unknown,
+  casing: DynamoSchema.Casing = "lowercase",
+): string =>
+  `${currentSk}#${applyCasing(EVENT_SK_INFIX, casing)}#${applyCasing(serializeValue(orderByValue), casing)}`
+
+/**
+ * Compose the prefix used to scope `.history()` queries to event items only.
+ *
+ * Given `currentSk = "$app#v1#telemetry_1"`, returns
+ * `"$app#v1#telemetry_1#e#"`.
+ */
+export const composeEventSkPrefix = (
+  currentSk: string,
+  casing: DynamoSchema.Casing = "lowercase",
+): string => `${currentSk}#${applyCasing(EVENT_SK_INFIX, casing)}#`

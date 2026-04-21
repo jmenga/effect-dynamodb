@@ -1,0 +1,230 @@
+---
+title: "Time-series entities"
+description: "One current + N immutable events per partition, CAS-ordered by caller-supplied clock, with enrichment preservation."
+---
+
+This guide covers the `timeSeries` entity primitive — a split-item pattern where each partition holds **one current item** (latest state) plus **N immutable event items** (history, TTL-bounded). Event-time ordering is controlled by a caller-supplied monotonic attribute (the `orderBy` field), and late arrivals are dropped via CAS with no retry.
+
+Use `timeSeries` when you need:
+
+- IoT/telemetry-style workloads where devices publish events at their own clock
+- A "latest state + history" pattern that can't tolerate out-of-order writes overwriting newer data
+- **Enrichment preservation** — background processes that decorate the current item (e.g. `accountId`, analytics tags) must not be clobbered by regular event ingestion
+
+Use `versioned: { retain: true }` instead when you need server-order (monotonic integer) versioning with full audit history.
+
+## When to use `timeSeries` vs `versioned`
+
+| | `timeSeries` | `versioned: { retain: true }` |
+|---|---|---|
+| Ordering | Caller-supplied (`orderBy` attribute) | Server-monotonic integer |
+| Writes | `UpdateItem` + `Put` (scoped SET) | Full `PutItem` |
+| Late writes | Silently dropped (stale value) | Optimistic-lock retry |
+| Enrichment fields | Preserved (never touched) | **Wiped** every write |
+| History shape | Event items under same PK, `#e#` SK infix | Snapshots, `#v#` SK infix |
+| Retention | Per-event TTL | Per-snapshot TTL |
+
+## Item-on-disk layout
+
+For a partition `{ channel: "c-1", deviceId: "d-7" }` the table contains:
+
+- **One current item** — SK `$app#v1#telemetry`, all GSI keys present, latest `orderBy` value
+- **N event items** — SK `$app#v1#telemetry#e#<serialised-orderBy>`, GSI keys stripped, `_ttl` set
+
+The `#e#` infix on the event SK means a `begins_with(<currentSk>#e#)` query isolates events from the current without visiting any other partition.
+
+## Configuring an entity
+
+```typescript region="model" example="guide-timeseries.ts"
+class TelemetryRecord extends Schema.Class<TelemetryRecord>("TelemetryRecord")({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  // `timestamp` is the caller-supplied monotonic clock used for CAS ordering.
+  timestamp: Schema.DateTimeUtc,
+  // Device-reported fields (flow through `.append()` — in appendInput):
+  location: Schema.optional(Schema.String),
+  alert: Schema.optional(Schema.Boolean),
+  gpio: Schema.optional(Schema.Number),
+  // Enrichment fields (set by background jobs — NOT in appendInput):
+  accountId: Schema.optional(Schema.String),
+  diagnostics: Schema.optional(Schema.String),
+}) {}
+
+// Only these fields are accepted by .append() — other model fields (accountId,
+// diagnostics) are never overwritten. This is the enrichment-preservation
+// contract. See guides/timeseries.mdx § "Enrichment Preservation".
+const TelemetryAppendInput = Schema.Struct({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  timestamp: Schema.DateTimeUtc,
+  location: Schema.optional(Schema.String),
+  alert: Schema.optional(Schema.Boolean),
+  gpio: Schema.optional(Schema.Number),
+})
+```
+
+```typescript region="define" example="guide-timeseries.ts"
+const Telemetries = Entity.make({
+  model: TelemetryRecord,
+  entityType: "Telemetry",
+  primaryKey: {
+    pk: { field: "pk", composite: ["channel", "deviceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byAccount: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["accountId"] },
+      sk: { field: "gsi1sk", composite: ["deviceId"] },
+    },
+  },
+  timestamps: { created: "createdAt" }, // `updated` auto-disabled by timeSeries
+  timeSeries: {
+    orderBy: "timestamp",
+    ttl: Duration.days(7),
+    appendInput: TelemetryAppendInput,
+  },
+})
+```
+
+**Required fields on `timeSeries`:**
+
+- `orderBy`: the model attribute used as the monotonic clock. Must not be a primary-key composite (`EDD-9011`) or a ref field (`EDD-9014`).
+- `appendInput`: a `Schema.Struct` (or trimmed `Schema.Class`) enumerating which fields `.append()` accepts and writes. **Required** — omission fails `Entity.make()` with `EDD-9016`. Must include `orderBy` plus all primary-key composites.
+
+**Optional:**
+
+- `ttl`: `Duration` applied to event items (not current). Omit for retention-forever.
+
+### Mutual-exclusion rules
+
+| Combination | Error |
+|---|---|
+| `timeSeries` + `versioned` | `EDD-9012` |
+| `timeSeries` + `softDelete` | `EDD-9015` |
+
+Time-series entities auto-suppress `updatedAt` — the `orderBy` attribute IS the update clock. `createdAt` is preserved and materialised via `if_not_exists` on the first append.
+
+## `.append()` — the stale branch
+
+```typescript region="append" example="guide-timeseries.ts"
+const r = yield* db.entities.Telemetries.append({
+  channel: "c-1",
+  deviceId: "d-7",
+  timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+  location: "cabinet-A",
+  gpio: 1,
+})
+if (r.applied) {
+  yield* Console.log(`Applied. Current timestamp: ${DateTime.formatIso(r.current.timestamp)}`)
+} else {
+  // Stale — someone beat us to the CAS. `r.current` is the winner.
+  yield* Console.log(`Stale (reason=${r.reason}).`)
+}
+```
+
+Internally, `.append(input)` issues a single `TransactWriteItems` with two items:
+
+1. **UpdateItem** on the current — scoped `SET` covers only `appendInput` fields + recomposed GSI keys + optional `#createdAt = if_not_exists(#createdAt, :now)`. The ConditionExpression is `attribute_not_exists(#pk) OR #orderBy < :newOrderBy`.
+2. **Put** of the event — full decoded input + `__edd_e__` + `_ttl` (if configured), GSI keys stripped, SK replaced with `<currentSk>#e#<orderByValue>`.
+
+`.append()` returns a **discriminated union** — stale is a success value, not an error:
+
+```ts
+type AppendResult<Model> =
+  | { readonly applied: true;  readonly current: Model }
+  | { readonly applied: false; readonly reason: "stale"; readonly current: Model }
+```
+
+The stale `current` is populated via a follow-up `GetItem` so reconciliation flows always know what won. If the follow-up read itself fails (network, TTL race), the error surfaces on the `Effect` error channel — it is not reported as a stale drop.
+
+**Why not a tagged error?** In a fleet of 100 devices publishing every second with some clock skew, you expect ~10% of appends to no-op. Modelling that as `Effect.fail` forces every caller to `Effect.catchTag` at every call-site — ceremony for a value. The discriminated-union return makes the stale branch impossible to forget (TypeScript exhaustiveness on `applied`) while keeping the error channel for genuinely broken conditions.
+
+## Enrichment preservation
+
+`.append()`'s `UpdateExpression` `SET` clause enumerates ONLY the fields declared in `appendInput`. Fields in the model but outside `appendInput` are never referenced — DynamoDB's UpdateItem semantics guarantee unnamed attributes are left alone.
+
+```typescript region="enrichment" example="guide-timeseries.ts"
+// Device appends (no accountId in appendInput — cannot touch enrichment):
+yield* db.entities.Telemetries.append({
+  channel: "c-1",
+  deviceId: "d-7",
+  timestamp: DateTime.makeUnsafe("2026-04-22T10:05:00.000Z"),
+  location: "cabinet-C",
+})
+
+// Background job enriches with accountId (via `.update()`, not `.append()`):
+yield* db.entities.Telemetries.update(
+  { channel: "c-1", deviceId: "d-7" },
+  Telemetries.set({ accountId: "acct-1" }),
+)
+
+// Device appends again — accountId is preserved even though the device
+// doesn't know about it.
+yield* db.entities.Telemetries.append({
+  channel: "c-1",
+  deviceId: "d-7",
+  timestamp: DateTime.makeUnsafe("2026-04-22T10:10:00.000Z"),
+  location: "cabinet-D",
+})
+
+const cur = yield* db.entities.Telemetries.get({
+  channel: "c-1",
+  deviceId: "d-7",
+})
+yield* Console.log(`accountId preserved: ${cur.accountId}`)
+```
+
+**What NOT to do.** Do not pass the full model schema as `appendInput` unless you genuinely want every append to overwrite every field. The whole point of `timeSeries` over `versioned` is that enrichment survives ingestion. The `Entity.make()` validator rejects a missing `appendInput` (`EDD-9016`) precisely to make the decision visible at the entity definition.
+
+## `.history(key).where(...)` — range queries
+
+```typescript region="history" example="guide-timeseries.ts"
+const fromIso = "2026-04-22T10:00:00.000Z"
+const toIso = "2026-04-22T10:10:00.000Z"
+const range = yield* db.entities.Telemetries.history({
+  channel: "c-1",
+  deviceId: "d-7",
+})
+  .where((t, { between }) => between(t.timestamp, fromIso, toIso))
+  .collect()
+yield* Console.log(`History in range: ${range.length} events`)
+```
+
+`.history(key)` returns a `BoundQuery` auto-scoped via `begins_with(<currentSk>#e#)`. The `.where()` callback's `t` exposes only the `orderBy` attribute (here `t.timestamp`); attempting to constrain other attributes via `.where()` is a compile-time error. For non-orderBy attribute conditions, chain `.filter(...)`:
+
+```ts
+const alerts = yield* db.entities.Telemetries.history({ channel, deviceId })
+  .where((t, { gte }) => gte(t.timestamp, since))
+  .filter({ alert: true })
+  .collect()
+```
+
+Terminals are the standard `BoundQuery` set: `.collect()`, `.fetch()`, `.paginate()`, `.count()`. Ordering is lexicographic on the stored `orderBy` value — for `DateTime.Utc` this equals chronological ordering. Call `.reverse()` to iterate newest-first.
+
+## TTL and retention
+
+`ttl: Duration.days(N)` on `TimeSeriesConfig` sets a `_ttl` attribute on each event item at `Math.floor(Date.now()/1000) + toSeconds(ttl)`. DynamoDB's built-in TTL processor prunes expired events asynchronously (typically within 48 hours of expiration).
+
+The current item never has `_ttl` — it is the live projection and must not expire.
+
+## Multi-stream per partition
+
+If one device publishes two distinct event streams (e.g. `"status"`, `"diagnostics"`) you can co-locate them in the same partition by adding a stream discriminator to the primary-key SK composite:
+
+```ts
+primaryKey: {
+  pk: { field: "pk", composite: ["channel", "deviceId"] },
+  sk: { field: "sk", composite: ["stream"] }, // ← discriminator
+},
+timeSeries: { orderBy: "timestamp", appendInput: ... },
+```
+
+Current SKs become `$app#v1#telemetry#status` and `$app#v1#telemetry#diagnostics`; event SKs extend to `$app#v1#telemetry#status#e#<value>` etc. `.history({ channel, deviceId, stream: "status" })` narrows to one stream. The `stream` field must also appear in `appendInput` so each append can address a specific stream.
+
+## Known limits (v1)
+
+- **Not transactable.** `.append()` is a `BoundEntity`-only terminal and cannot be composed into user-authored `Transaction.transactWrite` in v1.
+- **No resurrection via append.** `.append()` + `softDelete` is rejected at `Entity.make()` time (`EDD-9015`).
+- **User conditions via `Entity.condition(...)`** are ANDed onto the CAS predicate. A user-condition failure returns `{ applied: false, reason: "stale" }` — v1 does not distinguish it from a true CAS stale.
+- **No automated migration from `versioned` to `timeSeries`.** The on-disk SK formats differ (`#v#0000001` vs `#e#<orderBy>`); switching requires a bespoke backfill.

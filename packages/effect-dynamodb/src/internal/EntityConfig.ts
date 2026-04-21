@@ -65,6 +65,40 @@ export type SoftDeleteConfig =
       readonly preserveUnique?: boolean | undefined
     }
 
+/**
+ * Time-series configuration. When set, the entity stores one "current" item
+ * per partition and many immutable "event" items. See guides/timeseries.mdx.
+ *
+ * Current-item SK matches the primary index SK. Event-item SK is
+ * `<currentSk>#e#<orderBy-value>`, GSI keys stripped, `_ttl` set.
+ *
+ * `.append(input)` is a `TransactWriteItems` (UpdateItem current + Put event)
+ * with CAS `attribute_not_exists(pk) OR #orderBy < :newOb`. Returns
+ * `{ applied: true | false, current }` — stale is a value, not an error.
+ *
+ * Mutually exclusive with `versioned` (EDD-9012) and `softDelete` (EDD-9015).
+ */
+export type TimeSeriesConfig<TAppendInput extends Schema.Top = Schema.Top> = {
+  /** Model attribute used as the monotonic clock for CAS and event SK decoration. Required. */
+  readonly orderBy: string
+  /** TTL applied to event items (not current). Omit for retention-forever. */
+  readonly ttl?: Duration.Duration | undefined
+  /**
+   * REQUIRED schema restricting which model fields are allowed in `.append()`
+   * input AND which fields are written into the current-item SET clause.
+   * The schema MUST include `orderBy` plus all PK/SK composite fields.
+   *
+   * Fields in the model but NOT in this schema are never referenced by
+   * `.append()`'s UpdateExpression and therefore cannot be overwritten — this
+   * is the enrichment-preservation contract.
+   *
+   * Omitting `appendInput` is a hard error at `make()` time (EDD-9016).
+   * Users who genuinely want every append to overwrite every model field
+   * must pass the full model schema explicitly.
+   */
+  readonly appendInput: TAppendInput
+}
+
 /** An array of model field names that together form a unique constraint. */
 export type UniqueFieldsDef = ReadonlyArray<string>
 

@@ -62,6 +62,8 @@ export type {
 } from "./internal/BoundQuery.js"
 export { makeBoundQuery } from "./internal/BoundQuery.js"
 export type {
+  AppendInputType,
+  AppendResult,
   EntityInputType,
   EntityKeyType,
   EntityRecordType,

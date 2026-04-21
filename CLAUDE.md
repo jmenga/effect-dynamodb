@@ -283,6 +283,7 @@ Do NOT:
 | `guides/indexes.mdx` | `examples/guide-indexes.ts` |
 | `guides/queries.mdx` | `examples/guide-queries.ts` |
 | `guides/expressions.mdx` | `examples/guide-expressions.ts` |
+| `guides/timeseries.mdx` | `examples/guide-timeseries.ts` |
 | ... (all other tutorials/guides follow the same pattern) | |
 
 ### Sync normalization
@@ -382,6 +383,7 @@ Each of the three publishable packages must be configured on npmjs.com with this
 - **Scan via `db.entities.Tasks.scan()`.** Returns `BoundQuery` in scan mode (no `.where()` available).
 - **Batch operations auto-chunk.** `batchGet` at 100, `batchWrite` at 25. Both retry unprocessed items.
 - **Table operations via `db.tables.*`.** `create()`, `delete()`, `describe()`, backup/restore, PITR, TTL, tags, export.
+- **`.history(key)` for time-series entities.** Returns a `BoundQuery` auto-scoped to event items via `begins_with("<currentSk>#e#")`. `.where()` restricted to the configured `orderBy` attribute; `.filter()` works on any model attribute.
 
 ### Lifecycle Operations
 - **Opt-in.** `versioned: { retain: true }` for version snapshots. `softDelete: true` (or `{ ttl, preserveUnique }`) for soft-delete.
@@ -390,6 +392,8 @@ Each of the three publishable packages must be configured on npmjs.com with this
 - **Restore recomposes all keys.** Re-establishes unique constraint sentinels atomically.
 - **Purge deletes everything in the partition.** Queries all items, resolves unique sentinels, batch-deletes in chunks of 25.
 - **Retain-aware operations use transactWriteItems.** put/update/delete with retain create snapshots atomically.
+- **Time-series via `timeSeries: { orderBy, ttl?, appendInput }`.** Current-item SK unchanged; event items SK is `<currentSk>#e#<orderBy-value>`, GSI keys stripped, `_ttl` set. `.append(input)` is a `TransactWriteItems` (UpdateItem current + Put event) with CAS `attribute_not_exists(pk) OR #orderBy < :newOb`. Returns `{ applied: true | false, current }` — stale is a value, not an error. Mutually exclusive with `versioned` (EDD-9012) and `softDelete` (EDD-9015).
+- **Time-series enrichment preservation.** `.append()` SET clause enumerates only fields in `appendInput` (required at `make()` time — EDD-9016). Fields outside `appendInput` are never touched on the current item. `appendInput` must include `orderBy` plus all PK/SK composites (EDD-9013).
 
 ### Aggregate Operations
 - **Edge entities are first-class.** Own models, keys, indexes, and configuration. Composed via `Aggregate.one()`, `Aggregate.many()`, `BoundSubAggregate`.

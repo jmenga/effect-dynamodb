@@ -8,6 +8,7 @@ import { Schema, SchemaAST } from "effect"
 import { type DynamoEncoding, getEncoding, isHidden } from "../DynamoModel.js"
 import type { IndexDefinition } from "../KeyComposer.js"
 import type {
+  TimeSeriesConfig,
   TimestampFieldConfig,
   TimestampsConfig,
   UniqueConstraintDef,
@@ -54,6 +55,7 @@ const resolveTimestampField = (
 export const resolveSystemFields = (
   timestamps?: TimestampsConfig | undefined,
   versioned?: VersionedConfig | undefined,
+  timeSeries?: TimeSeriesConfig<any> | undefined,
 ): ResolvedSystemFields => {
   let createdAt: string | null = null
   let createdAtEncoding: DynamoEncoding | null = null
@@ -73,6 +75,26 @@ export const resolveSystemFields = (
     version = "version"
   } else if (typeof versioned === "object" && versioned !== null) {
     version = versioned.field ?? "version"
+  }
+
+  // Time-series entities auto-suppress `updatedAt` — the `orderBy` attribute
+  // serves as the update clock. `createdAt` is preserved.
+  if (timeSeries !== undefined && timeSeries !== null) {
+    if (updatedAt !== null) {
+      if (
+        typeof timestamps === "object" &&
+        timestamps !== null &&
+        (timestamps as { updated?: unknown }).updated !== undefined
+      ) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          "[effect-dynamodb] timeSeries entity: `timestamps.updated` is ignored — " +
+            "the `orderBy` attribute is the event-time clock.",
+        )
+      }
+      updatedAt = null
+      updatedAtEncoding = null
+    }
   }
 
   return { createdAt, createdAtEncoding, updatedAt, updatedAtEncoding, version }
@@ -189,6 +211,17 @@ export interface DerivedSchemas {
   readonly itemSchema: Schema.Codec<any>
   /** Record fields + deletedAt for soft-deleted items */
   readonly deletedRecordSchema: Schema.Codec<any>
+  /**
+   * `appendInput` schema for `.append()` on time-series entities.
+   * `null` when the entity is not configured with `timeSeries`.
+   */
+  readonly appendInputSchema: Schema.Codec<any> | null
+  /**
+   * Record schema for history/event items. Same shape as `recordSchema` minus
+   * `updatedAt` (time-series auto-suppresses it). `null` when the entity is
+   * not configured with `timeSeries`.
+   */
+  readonly historyRecordSchema: Schema.Codec<any> | null
 }
 
 /**
@@ -218,6 +251,7 @@ export const buildDerivedSchemas = (
   }> = [],
   immutableFields: ReadonlySet<string> = new Set(),
   identifierField: string | undefined = undefined,
+  timeSeries: TimeSeriesConfig<any> | undefined = undefined,
 ): DerivedSchemas => {
   // --- Build fromSelf field map for date fields ---
   // These replace transform schemas with their "from self" variants so
@@ -377,6 +411,32 @@ export const buildDerivedSchemas = (
       )
     : recordSchema
 
+  // --- Time-series derived schemas ---
+  // `appendInputSchema`: the user-supplied schema directly. `Entity.make()`
+  //    enforces that every PK/SK composite + `orderBy` appears in its fields.
+  // `historyRecordSchema`: event-item shape. Model fields (with fromSelf for
+  //    date-annotated) + createdAt (when configured, no updatedAt ever since
+  //    timeSeries auto-suppresses). No GSI key attrs — events strip GSI keys.
+  const timeSeriesEnabled = timeSeries !== undefined && timeSeries !== null
+  const appendInputSchema = timeSeriesEnabled ? timeSeries.appendInput : null
+  // Events are point-in-time facts keyed by `orderBy`. They do NOT carry
+  // `createdAt` or `updatedAt` (§4.5 — events already carry `orderBy` as the
+  // temporal anchor). Schema is just model fields with fromSelf for dates.
+  const historyRecordSchema = timeSeriesEnabled
+    ? (() => {
+        const hiddenFilter = (record: globalThis.Record<string, Schema.Top>) =>
+          hasHiddenFields
+            ? Object.fromEntries(Object.entries(record).filter(([k]) => !hiddenFieldNames.has(k)))
+            : record
+        return Schema.Struct(
+          hiddenFilter({
+            ...modelFields,
+            ...fromSelfFields,
+          }) as Schema.Struct.Fields,
+        )
+      })()
+    : null
+
   // All schemas are built from concrete field schemas (Schema.String, Schema.Number,
   // Schema.DateTimeUtcFromString, etc.) which all have R = never. TypeScript cannot infer this
   // because the fields are stored in dynamically-typed records, so we cast.
@@ -391,6 +451,8 @@ export const buildDerivedSchemas = (
     keySchema: keySchema as unknown as S,
     itemSchema: itemSchema as unknown as S,
     deletedRecordSchema: deletedRecordSchema as unknown as S,
+    appendInputSchema: appendInputSchema as unknown as S | null,
+    historyRecordSchema: historyRecordSchema as unknown as S | null,
   }
 }
 
