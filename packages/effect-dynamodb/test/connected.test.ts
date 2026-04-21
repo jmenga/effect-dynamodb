@@ -120,7 +120,25 @@ const Tasks = Entity.make({
   softDelete: true,
 })
 
-const MainTable = Table.make({ schema: AppSchema, entities: { Users, Tasks } })
+// Shared-PK join-table fixture — exercises the `.primary()` accessor where
+// many items live under one partition key and are distinguished by SK.
+class Membership extends Schema.Class<Membership>("Membership")({
+  orgId: Schema.String,
+  userId: Schema.String,
+  role: Schema.Literals(["owner", "admin", "member"]),
+  joinedAt: Schema.String,
+}) {}
+
+const Memberships = Entity.make({
+  model: Membership,
+  entityType: "Membership",
+  primaryKey: {
+    pk: { field: "pk", composite: ["orgId"] },
+    sk: { field: "sk", composite: ["userId"] },
+  },
+})
+
+const MainTable = Table.make({ schema: AppSchema, entities: { Users, Tasks, Memberships } })
 
 // ---------------------------------------------------------------------------
 // Aggregate + Ref models
@@ -725,6 +743,175 @@ describeConnected("Connected integration tests", () => {
       Effect.gen(function* () {
         const count = yield* Tasks.query.byUser({ userId: "u-query" }).pipe(Query.count)
         expect(count).toBe(2)
+      }).pipe(provide),
+    )
+  })
+
+  // -------------------------------------------------------------------------
+  // Primary index query accessor (.primary) — GH #2.
+  //
+  // Symmetric to GSI accessors: required PK composites, optional SK composites
+  // (prefix-ordered). Exercises the shared-PK join-table pattern where many
+  // items live under one partition key and are distinguished by SK.
+  // -------------------------------------------------------------------------
+
+  describe(".primary() accessor (bound client)", () => {
+    // Use unique orgIds per describe block so we don't collide with other
+    // describe blocks that happen to reuse `Memberships`. Each primary test
+    // seeds its own partition explicitly; no cross-test dependencies.
+    const seedAcmeMemberships = Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Memberships },
+        tables: { MainTable },
+      })
+      yield* db.entities.Memberships.put({
+        orgId: "org-acme",
+        userId: "u-alice",
+        role: "owner",
+        joinedAt: "2025-01-01",
+      })
+      yield* db.entities.Memberships.put({
+        orgId: "org-acme",
+        userId: "u-bob",
+        role: "admin",
+        joinedAt: "2025-02-01",
+      })
+      yield* db.entities.Memberships.put({
+        orgId: "org-acme",
+        userId: "u-carol",
+        role: "member",
+        joinedAt: "2025-03-01",
+      })
+      yield* db.entities.Memberships.put({
+        orgId: "org-other",
+        userId: "u-alice",
+        role: "admin",
+        joinedAt: "2025-01-15",
+      })
+    })
+
+    it.effect("lists all items under a shared primary partition key", () =>
+      Effect.gen(function* () {
+        yield* seedAcmeMemberships
+
+        const db = yield* DynamoClient.make({
+          entities: { Memberships },
+          tables: { MainTable },
+        })
+
+        const acmeMembers = yield* db.entities.Memberships.primary({
+          orgId: "org-acme",
+        }).collect()
+
+        expect(acmeMembers).toHaveLength(3)
+        expect(acmeMembers.every((m) => m.orgId === "org-acme")).toBe(true)
+        expect(acmeMembers.map((m) => m.userId).sort()).toEqual(["u-alice", "u-bob", "u-carol"])
+
+        // Cross-partition isolation — org-other should not leak into org-acme.
+        const otherMembers = yield* db.entities.Memberships.primary({
+          orgId: "org-other",
+        }).collect()
+        expect(otherMembers).toHaveLength(1)
+        expect(otherMembers[0]!.userId).toBe("u-alice")
+      }).pipe(provide),
+    )
+
+    it.effect("PK + full SK composite narrows to a single item", () =>
+      Effect.gen(function* () {
+        yield* seedAcmeMemberships
+
+        const db = yield* DynamoClient.make({
+          entities: { Memberships },
+          tables: { MainTable },
+        })
+
+        const bobs = yield* db.entities.Memberships.primary({
+          orgId: "org-acme",
+          userId: "u-bob",
+        }).collect()
+
+        expect(bobs).toHaveLength(1)
+        expect(bobs[0]!.role).toBe("admin")
+      }).pipe(provide),
+    )
+
+    it.effect("chains .filter() to post-filter results by a non-key attribute", () =>
+      Effect.gen(function* () {
+        yield* seedAcmeMemberships
+
+        const db = yield* DynamoClient.make({
+          entities: { Memberships },
+          tables: { MainTable },
+        })
+
+        const admins = yield* db.entities.Memberships.primary({ orgId: "org-acme" })
+          .filter({ role: "admin" })
+          .collect()
+
+        expect(admins).toHaveLength(1)
+        expect(admins[0]!.userId).toBe("u-bob")
+      }).pipe(provide),
+    )
+
+    it.effect("chains .limit() + .reverse() + .fetch() for paged descending reads", () =>
+      Effect.gen(function* () {
+        yield* seedAcmeMemberships
+
+        const db = yield* DynamoClient.make({
+          entities: { Memberships },
+          tables: { MainTable },
+        })
+
+        const page = yield* db.entities.Memberships.primary({ orgId: "org-acme" })
+          .reverse()
+          .limit(1)
+          .fetch()
+
+        expect(page.items).toHaveLength(1)
+        // Reversed SK sort: u-carol sorts last ascending, so it comes first reversed.
+        expect(page.items[0]!.userId).toBe("u-carol")
+        expect(page.cursor).not.toBeNull()
+      }).pipe(provide),
+    )
+
+    it.effect(".count() returns the number of items in the partition", () =>
+      Effect.gen(function* () {
+        yield* seedAcmeMemberships
+
+        const db = yield* DynamoClient.make({
+          entities: { Memberships },
+          tables: { MainTable },
+        })
+
+        const count = yield* db.entities.Memberships.primary({ orgId: "org-acme" }).count()
+        expect(count).toBe(3)
+      }).pipe(provide),
+    )
+
+    it.effect("works for entities with no SK composites (single-item partitions)", () =>
+      // Use Tasks — its primary key has `sk: { composite: [] }` (empty SK
+      // composites) and `versioned: true` WITHOUT retain, so there are no
+      // snapshot items polluting the partition.
+      Effect.gen(function* () {
+        yield* Tasks.put({
+          taskId: "t-primary-single-1",
+          userId: "u-primary-single",
+          title: "Primary-only task",
+          status: "todo",
+          priority: 1,
+        }).asEffect()
+
+        const db = yield* DynamoClient.make({
+          entities: { Tasks },
+          tables: { MainTable },
+        })
+
+        const result = yield* db.entities.Tasks.primary({
+          taskId: "t-primary-single-1",
+        }).collect()
+        expect(result).toHaveLength(1)
+        expect(result[0]!.taskId).toBe("t-primary-single-1")
+        expect(result[0]!.title).toBe("Primary-only task")
       }).pipe(provide),
     )
   })

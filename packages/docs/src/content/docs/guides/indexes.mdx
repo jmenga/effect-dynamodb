@@ -55,6 +55,28 @@ primaryKey: {
 | `sk.field` | `string` | Yes | Physical DynamoDB attribute name |
 | `sk.composite` | `string[]` | Yes | Model attributes composing the sort key |
 
+### Access Patterns via the Primary Index
+
+Every entity exposes a `.primary(...)` query accessor on the bound client — the primary index is treated symmetrically with GSI indexes. Pass the required PK composites (and optionally one or more SK composites) to return a `BoundQuery`:
+
+```typescript
+// `Memberships` primary key: pk = orgId, sk = userId
+//
+// List all items under a shared primary partition key (PK only)
+const allMembers = yield* db.entities.Memberships.primary({
+  orgId: "org-acme",
+}).collect()
+
+// Narrow by partial SK composite (begins_with prefix match)
+const acmeAdmins = yield* db.entities.Memberships.primary({
+  orgId: "org-acme",
+})
+  .filter({ role: "admin" })
+  .collect()
+```
+
+This is the natural access pattern for shared-PK single-table designs — for example a join table that holds many channel grants under one `accountId`. Use `.get(fullKey)` when you want a strongly-consistent single-item fetch by the full composite key; use `.primary(partialKey)` when you want a `Query` that returns every item in the partition (or a prefix-matched subset).
+
 ### GSI Access Patterns via Entity Indexes
 
 GSI access patterns are defined directly on the entity via the `indexes` property. Each index specifies the physical GSI, PK composites, and SK composites — see the `task-entity` block above for the canonical shape.

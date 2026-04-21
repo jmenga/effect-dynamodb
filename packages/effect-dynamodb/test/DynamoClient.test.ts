@@ -581,4 +581,204 @@ describe("DynamoClient", () => {
       },
     )
   })
+
+  // -------------------------------------------------------------------------
+  // .primary() accessor — symmetric query accessor for the primary index.
+  //
+  // Mirrors the GSI accessor contract: required PK composites, optional SK
+  // composites (prefix-ordered), returns a BoundQuery. Prior to this, the
+  // primary index was excluded from accessor generation and the only way to
+  // query a shared primary partition was via a raw `Query.Query` escape
+  // hatch. See GH issue #2.
+  // -------------------------------------------------------------------------
+  describe(".primary() accessor", () => {
+    const AppSchema = DynamoSchema.make({ name: "primary-accessor", version: 1 })
+
+    class AccountChannel extends Schema.Class<AccountChannel>("AccountChannel")({
+      accountId: Schema.String,
+      channelId: Schema.String,
+      grantedBy: Schema.String,
+    }) {}
+
+    const AccountChannelEntity = Entity.make({
+      model: AccountChannel,
+      entityType: "AccountChannel",
+      // Shared-PK join-table pattern: many channels per account.
+      primaryKey: {
+        pk: { field: "pk", composite: ["accountId"] },
+        sk: { field: "sk", composite: ["channelId"] },
+      },
+    })
+
+    const MainTable = Table.make({
+      schema: AppSchema,
+      entities: { AccountChannel: AccountChannelEntity },
+    })
+
+    /** Build a client layer that captures `query` inputs into the provided array. */
+    const makeQueryCapturingClient = (captured: Array<unknown>) =>
+      Layer.succeed(DynamoClient, {
+        putItem: () => Effect.die("not used"),
+        getItem: () => Effect.die("not used"),
+        deleteItem: () => Effect.die("not used"),
+        updateItem: () => Effect.die("not used"),
+        query: (input) =>
+          Effect.sync(() => {
+            captured.push(input)
+            return { Items: [], Count: 0 } as never
+          }),
+        batchGetItem: () => Effect.die("not used"),
+        batchWriteItem: () => Effect.die("not used"),
+        transactGetItems: () => Effect.die("not used"),
+        transactWriteItems: () => Effect.die("not used"),
+        createTable: () => Effect.die("not used"),
+        deleteTable: () => Effect.die("not used"),
+        describeTable: () => Effect.die("not used"),
+        scan: () => Effect.die("not used"),
+      })
+
+    it.effect("PK-only query on primary targets the base table (no IndexName)", () => {
+      const captured: Array<any> = []
+      const ClientLayer = makeQueryCapturingClient(captured)
+      const TableLayer = MainTable.layer({ name: "primary-test-table" })
+
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { AccountChannel: AccountChannelEntity },
+          tables: { MainTable },
+        })
+
+        yield* db.entities.AccountChannel.primary({ accountId: "acct-1" }).collect()
+
+        expect(captured).toHaveLength(1)
+        const input = captured[0]
+        // Base table query — IndexName must be omitted.
+        expect(input.IndexName).toBeUndefined()
+        expect(input.TableName).toBe("primary-test-table")
+        // KeyConditionExpression pins the partition key only.
+        expect(input.KeyConditionExpression).toContain("#pk")
+        expect(input.KeyConditionExpression).not.toContain("begins_with")
+        expect(input.ExpressionAttributeNames["#pk"]).toBe("pk")
+        // PK value is the composed entity-type-prefixed key.
+        const pkValue = input.ExpressionAttributeValues[":pk"].S as string
+        expect(pkValue).toContain("accountchannel")
+        expect(pkValue).toContain("acct-1")
+      }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+    })
+
+    it.effect("PK + partial SK applies begins_with on the composed SK prefix", () => {
+      const captured: Array<any> = []
+      const ClientLayer = makeQueryCapturingClient(captured)
+      const TableLayer = MainTable.layer({ name: "primary-test-table" })
+
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { AccountChannel: AccountChannelEntity },
+          tables: { MainTable },
+        })
+
+        yield* db.entities.AccountChannel.primary({
+          accountId: "acct-1",
+          channelId: "ch-42",
+        }).collect()
+
+        expect(captured).toHaveLength(1)
+        const input = captured[0]
+        expect(input.IndexName).toBeUndefined()
+        // begins_with is used even when the full SK composite is provided — the
+        // accessor treats any SK composite value as a prefix, consistent with
+        // how GSI accessors handle partial SK composites.
+        expect(input.KeyConditionExpression).toContain("begins_with")
+        const skValue = input.ExpressionAttributeValues[":sk"].S as string
+        expect(skValue).toContain("ch-42")
+      }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+    })
+
+    it.effect(".primary() returns a BoundQuery that supports chained combinators", () => {
+      const captured: Array<any> = []
+      const ClientLayer = makeQueryCapturingClient(captured)
+      const TableLayer = MainTable.layer({ name: "primary-test-table" })
+
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { AccountChannel: AccountChannelEntity },
+          tables: { MainTable },
+        })
+
+        // .filter() and .limit() must chain without type errors and propagate
+        // to the underlying DynamoDB query input.
+        yield* db.entities.AccountChannel.primary({ accountId: "acct-1" })
+          .filter({ grantedBy: "admin" })
+          .limit(5)
+          .collect()
+
+        expect(captured).toHaveLength(1)
+        const input = captured[0]
+        expect(input.Limit).toBe(5)
+        expect(input.FilterExpression).toBeDefined()
+        // Attribute names are placeholder-aliased (#e0 etc.); look up the
+        // actual field via ExpressionAttributeNames values.
+        expect(Object.values(input.ExpressionAttributeNames)).toContain("grantedBy")
+        expect(
+          Object.values(input.ExpressionAttributeValues).some((v: any) => v.S === "admin"),
+        ).toBe(true)
+      }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+    })
+
+    it.effect("entities with empty SK composites query by PK only", () => {
+      class User extends Schema.Class<User>("User")({
+        userId: Schema.String,
+        email: Schema.String,
+      }) {}
+
+      const UserEntity = Entity.make({
+        model: User,
+        entityType: "User",
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
+        },
+      })
+
+      const SimpleTable = Table.make({ schema: AppSchema, entities: { User: UserEntity } })
+
+      const captured: Array<any> = []
+      const ClientLayer = makeQueryCapturingClient(captured)
+      const TableLayer = SimpleTable.layer({ name: "simple-table" })
+
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { User: UserEntity },
+          tables: { SimpleTable },
+        })
+
+        yield* db.entities.User.primary({ userId: "u-1" }).collect()
+
+        expect(captured).toHaveLength(1)
+        const input = captured[0]
+        expect(input.IndexName).toBeUndefined()
+        // No begins_with clause when the entity has no SK composites.
+        expect(input.KeyConditionExpression).not.toContain("begins_with")
+      }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+    })
+
+    it.effect("missing PK composite throws at runtime via validateQueryComposites", () => {
+      const ClientLayer = makeQueryCapturingClient([])
+      const TableLayer = MainTable.layer({ name: "primary-test-table" })
+
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { AccountChannel: AccountChannelEntity },
+          tables: { MainTable },
+        })
+
+        // Calling .primary() without the required PK composite throws
+        // synchronously — same contract as GSI accessors.
+        expect(() =>
+          // @ts-expect-error — accountId is required
+          db.entities.AccountChannel.primary({}),
+        ).toThrow(/EDD-9002.*accountId/)
+      }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+    })
+  })
 })
