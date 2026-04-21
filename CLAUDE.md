@@ -309,6 +309,60 @@ Before committing:
 8. New services must follow `Context.Service` pattern
 9. New or updated doc pages must have a backing example file with region markers
 
+## Release Workflow
+
+This repo uses [Changesets](https://github.com/changesets/changesets) with **fixed lockstep versioning** across the three publishable packages (`effect-dynamodb`, `@effect-dynamodb/geo`, `@effect-dynamodb/language-service`). Publishing is automated: every push to `main` runs `.github/workflows/release.yml`, which detects packages whose `package.json` version is ahead of npm and publishes them via Trusted Publishing (OIDC — no `NPM_TOKEN`).
+
+**There is no "Version Packages" bot PR.** The required process is:
+
+### Bump PRs (Option A — the required workflow)
+
+Any PR that is intended to trigger a release **must run `pnpm changeset version` as part of that PR**. This means the PR includes, in the same commit set:
+
+1. **The feature/fix code change itself.**
+2. **A changeset file** (`.changeset/<name>.md`) created with `pnpm changeset` — declares which packages bump and at what semver level.
+3. **The result of `pnpm changeset version`**:
+   - The changeset file is **deleted** (consumed).
+   - Each affected `package.json` has its `version` bumped (lockstep → all three move together).
+   - Each affected package's `CHANGELOG.md` is regenerated with the consumed entry.
+
+The typical authoring loop:
+
+```bash
+# 1. Make code changes, tests, docs
+# 2. Declare the bump
+pnpm changeset                          # interactive — pick packages + semver level
+git add .changeset/<generated-name>.md
+git commit -m "..."
+
+# 3. Apply the bump in this same PR
+pnpm changeset version                  # consumes changeset, bumps versions, writes CHANGELOG
+git add -A
+git commit -m "Version Packages 0.X.0"
+git push
+```
+
+When the PR merges, `release.yml` detects the version bump, builds, tests, and publishes. No second PR.
+
+### Chore PRs (no release)
+
+CI-only, test-hygiene, or doc-only changes that should **not** trigger a release still need to satisfy CI's "Require changeset or version bump" gate. Add an **empty changeset** (empty frontmatter, no packages listed) as the explicit "no-release" signal:
+
+```markdown
+---
+---
+
+Chore: <one-line summary>. No version change.
+```
+
+### CI enforcement
+
+`ci.yml` runs `pnpm changeset status` on every PR. If it reports any **unconsumed release-declaring changeset** (a file with packages listed in its frontmatter), CI fails with a message telling the author to run `pnpm changeset version` and commit the result. Empty chore changesets pass through.
+
+### Trusted Publishing setup
+
+Each of the three publishable packages must be configured on npmjs.com with this repo + `release.yml` as a trusted publisher. No `NPM_TOKEN` is required. The workflow uses `npm publish --provenance --access public` to emit a signed provenance attestation on each publish — verifiable by consumers.
+
 ## Behavioral Notes
 
 ### Entity Operations

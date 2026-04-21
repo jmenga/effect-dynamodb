@@ -1,6 +1,6 @@
 {
   "name": "effect-dynamodb",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Effect TS ORM for DynamoDB — schema-driven entity modeling, single-table design, composite keys, transactions, and Stream-based pagination",
   "type": "module",
   "license": "MIT",
