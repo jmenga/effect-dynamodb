@@ -34,7 +34,7 @@ const Telemetry = Entity.make({
   timeSeries: {
     orderBy: "timestamp",
     ttl: Duration.days(7),
-    appendInput: TelemetryAppendInput, // omit -> defaults to full model
+    appendInput: TelemetryAppendInput, // required — see §12 decision 2
   },
 })
 
@@ -75,18 +75,26 @@ Added to `packages/effect-dynamodb/src/internal/EntityConfig.ts` after `SoftDele
  * Time-series configuration. When set, the entity stores one "current" item
  * per partition and many immutable "event" items. See guides/timeseries.mdx.
  */
-export type TimeSeriesConfig<TAppendInput extends Schema.Top | undefined = undefined> = {
+export type TimeSeriesConfig<TAppendInput extends Schema.Top> = {
   /** Model attribute used as the monotonic clock for CAS and event SK decoration. Required. */
   readonly orderBy: string
   /** TTL applied to event items (not current). Omit for retention-forever. */
   readonly ttl?: Duration.Duration | undefined
   /**
-   * Optional schema restricting which model fields are allowed in `.append()`
+   * REQUIRED schema restricting which model fields are allowed in `.append()`
    * input AND which fields are written into the current-item SET clause.
-   * When omitted, defaults to the full model (no enrichment preservation).
    * The schema MUST include `orderBy` plus all PK/SK composite fields.
+   *
+   * Fields in the model but NOT in this schema are never referenced by
+   * `.append()`'s UpdateExpression and therefore cannot be overwritten — this
+   * is the enrichment-preservation contract. See §4.3.
+   *
+   * Omitting `appendInput` is a hard error at `make()` time (EDD-9016).
+   * Users who genuinely want every append to overwrite every model field
+   * must pass the full model schema explicitly — that choice must be visible
+   * at the Entity definition, not inherited silently from a default.
    */
-  readonly appendInput?: TAppendInput | undefined
+  readonly appendInput: TAppendInput
 }
 ```
 
@@ -94,7 +102,7 @@ Rationale for each field:
 
 - `orderBy` is a string (a model attribute name), not a schema — the attribute's runtime type (number, DateTime.Utc, bigint, string) is looked up from `modelFields[orderBy]` at `make()` time and serialised through the existing `KeyComposer.serializeValue` (which already handles zero-padding for numbers, 38-digit padding for bigints, and ISO formatting for DateTime/Date — see `packages/effect-dynamodb/src/KeyComposer.ts:120-132`). This matches the casing-and-padding rules every other composite attribute obeys, and means `between(t.timestamp, …)` works identically whether `timestamp` is a `DateTime.Utc` or a `number`.
 - `ttl` is `Duration.Duration`, mirroring `VersionedConfig.ttl` and `SoftDeleteConfig.ttl` in `EntityConfig.ts:51` and `:65` verbatim.
-- `appendInput` is a `Schema.Top` so users can write either `Schema.Struct({ … })` or a trimmed `Schema.Class`. It's optional: omit → "full model" (no enrichment preservation, every append overwrites every non-key field).
+- `appendInput` is a `Schema.Top` so users can write either `Schema.Struct({ … })` or a trimmed `Schema.Class`. **Required** — see §12 decision 2.
 
 ### 2.2 Integration with `Entity.make()` signature
 
@@ -141,7 +149,8 @@ Fail fast inside `makeImpl` (`Entity.ts:1096-1125`). New error codes:
 | `EDD-9012` | `timeSeries` and `versioned` both set — mutually exclusive |
 | `EDD-9013` | `timeSeries.appendInput` schema omits `orderBy` or any PK/SK composite |
 | `EDD-9014` | `timeSeries.orderBy` names a ref field or ref-derived `${name}Id` field |
-| `EDD-9015` | `timeSeries` + `softDelete` both set — pending design resolution (see §12 open questions) |
+| `EDD-9015` | `timeSeries` + `softDelete` both set — mutually exclusive |
+| `EDD-9016` | `timeSeries.appendInput` is missing — required, no default |
 
 All fail with `throw new Error("[EDD-90xx] …")`, matching the existing pattern at `Entity.ts:1104` and `KeyComposer.ts:54`.
 
@@ -243,13 +252,13 @@ where `#pk` is the primary-key PK field name (e.g. `"pk"`) and `#ob` is the Dyna
 
 ### 4.3 SET clause — correctness-critical enrichment preservation
 
-The SET clause enumerates exactly the fields named in `resolvedAppendInput` (the schema-derived field list). Concretely:
+The SET clause enumerates exactly the fields named in `appendInput` (the required schema). Concretely:
 
 ```
 fields_in_set = fields(appendInputSchema) ∪ {orderBy}   // orderBy implicit
 ```
 
-(If `appendInput` is omitted, `fields_in_set = fields(model)` — the full model, explicitly NO enrichment preservation, documented as a footgun in the guide.)
+`appendInput` is required at `make()` time (`EDD-9016`). Users who genuinely want every append to overwrite every model field must pass the full model as `appendInput` explicitly — that choice must be visible at the Entity definition, not inherited silently from a default. See §12 decision 2.
 
 **Fields in the model but NOT in `appendInput` are never mentioned in the UpdateExpression.** They are not in `ExpressionAttributeNames`, not in `ExpressionAttributeValues`, and therefore cannot be touched by this operation. DynamoDB's UpdateItem semantics guarantee unnamed attributes are left alone.
 
@@ -632,7 +641,7 @@ const cur = yield* db.entities.Telemetry.get({ channel, deviceId })
 Under `## Behavioral Notes > ### Lifecycle Operations` (line 387 of `CLAUDE.md`), add two bullets:
 
 - **Time-series via `timeSeries: { orderBy, ttl?, appendInput? }`.** Current-item SK unchanged; event items SK is `<currentSk>#e#<orderBy-value>`, GSI keys stripped, `_ttl` set. `.append(input)` is a TransactWriteItems (UpdateItem current + Put event) with CAS `attribute_not_exists(pk) OR #orderBy < :newOb`. Returns `{ applied: true | false, current }` — stale is a value, not an error.
-- **Time-series enrichment preservation.** `.append()` SET clause enumerates only fields in `appendInput` (defaults to full model when omitted). Fields outside `appendInput` are never touched.
+- **Time-series enrichment preservation.** `.append()` SET clause enumerates only fields in `appendInput` (required at `make()` time). Fields outside `appendInput` are never touched.
 
 Under `## Behavioral Notes > ### Entity Operations`, add one bullet in the query-accessor section:
 - **`.history(key)` for time-series entities.** Returns a `BoundQuery` auto-scoped to event items via `begins_with("#e#")`. `.where()` restricted to the configured `orderBy` attribute; `.filter()` works on any model attribute.
@@ -648,19 +657,37 @@ Run `pnpm --filter @effect-dynamodb/doctest test` as part of the PR's quality ga
 
 ---
 
-## 12. Open questions — need decisions before implementation
+## 12. Decisions
 
-1. **`timeSeries` + `softDelete` combination.** (§4.10.) Three options: (a) forbid at `make()` with `EDD-9015` [safest, proposed default]; (b) allow, with "appending on a soft-deleted entity resurrects it" semantics; (c) allow, with "append on soft-deleted returns ItemNotFound". Recommendation: (a). Confirm with reviewer.
+Resolved during design review. Each decision below is binding for the v1 implementation.
 
-2. **`appendInput` default behaviour.** Issue says "default to full model"; this design honours that. Confirm that a missing `appendInput` is acceptable UX given that it nullifies enrichment preservation entirely. Alternative would be to require `appendInput` and raise `EDD-9016` when omitted, forcing the user to make an explicit call. Recommendation: honour the issue's default, but emit a one-time `console.warn` at `make()` when `appendInput` is absent pointing to the guide.
+### 1. `timeSeries` + `softDelete` — rejected at `make()` (`EDD-9015`)
 
-3. **`.history()` decode mode default.** This design picks `asModel`. Alternative: `asRecord`. (Records include system fields; `createdAt` would be `undefined` on events if we follow §4.5 and don't set it, causing decode failures.) Recommendation: stick with `asModel`. Confirm.
+Combining the two has surprising semantics: a soft-deleted current item has its SK rewritten to `…#deleted#<timestamp>`, so an `.append()` UpdateItem targeting the live SK would land on a new empty row — effectively "un-delete-by-append," which is not a sound resurrection model. A future design can address resurrection semantics explicitly. Until then, the two are mutually exclusive at `make()` time.
 
-4. **`.append()` inside user-authored `Transaction.transactWrite`.** This design excludes it (§4.12). Confirm that's acceptable for the v1 cut.
+### 2. `appendInput` — required (`EDD-9016` when omitted)
 
-5. **User conditions via `Entity.condition(...)` on `.append()`.** Not discussed in the issue. The CAS is already expressing one condition; ANDing a user condition onto the UpdateItem's ConditionExpression is mechanically straightforward. Recommendation: include it (symmetry with `.update()`, `.put()`). Confirm.
+Shifted from the issue's literal "default to full model." Enrichment preservation is the feature's motivating correctness guarantee, and making it opt-in via a schema default that silently nullifies the guarantee is a footgun exactly where correctness matters most. `appendInput` is a required field on `TimeSeriesConfig`; omitting it fails `make()` with `EDD-9016`. Users who genuinely want every append to overwrite every model field must pass the full model schema as `appendInput` explicitly — that choice has to be visible at the Entity definition, not inherited silently from a default.
 
-6. **Return mode for the stale branch's `current`.** To obtain `current` in the stale branch we must do a follow-up `GetItem`. This adds latency (1 RTT) and costs an extra RCU. Alternative: omit `current` from the stale branch (`{ applied: false, reason: "stale" }` only) and let the caller fetch if they want. Recommendation: include `current` — IoT reconciliation flows almost always want to know what won. The extra RCU is cheap compared to the UpdateItem + Put WCU. Confirm.
+### 3. `.history()` decode mode — `asModel`
+
+Events are full model snapshots written by `.append()`. Callers who construct with `new TelemetryRecord({ … })` get `TelemetryRecord` instances back (prototype attached) with their methods. Matches every other `BoundQuery` terminal in the library. `asRecord` would include system fields, but `createdAt` is deliberately not written on events (§4.5), so `asRecord` would fail decode.
+
+### 4. `.append()` NOT exposed to user-authored `Transaction.transactWrite` in v1
+
+`.append()` is already internally a 2-item `TransactWriteItems`. Exposing it as a transactable intermediate means (a) a new `EntityAppend` op type with extraction logic in `Transaction.ts`, (b) a redesign of the stale-return contract to survive user-transaction cancellation, and (c) the follow-up `GetItem` for `current` cannot happen inside the transaction. Cut scope for v1; revisit when a concrete cross-entity-atomicity use case emerges. `.append()` in v1 is a `BoundEntity`-only terminal operation that builds and executes its own transaction.
+
+### 5. User conditions via `Entity.condition(...)` on `.append()` — **included**
+
+Symmetry with `.put()`, `.update()`, `.delete()`. ANDed onto the UpdateItem's ConditionExpression alongside the CAS predicate. A user condition that fails cancels the transaction the same way the CAS condition does; we cannot distinguish "stale" from "user-condition failed" from the cancellation reason code alone. For v1, both failures map to `{ applied: false, reason: "stale", current }`.
+
+> **Follow-up consideration** (not blocking v1): if users need to distinguish "stale" from "my explicit condition failed," the return discriminant can grow a third variant (`reason: "condition"`). Defer until someone asks.
+
+### 6. Stale branch `current` — included via follow-up `GetItem`
+
+The stale branch of the return discriminant includes `current: Model`, populated by a follow-up `GetItem` on the primary key after the transaction cancels. Reconciliation workflows almost always need to know what won in order to decide next steps (retry with bumped clock, enqueue reconciliation, log-and-move-on). The extra RCU is cheap compared to the UpdateItem + Put WCU of the original append.
+
+If the follow-up `GetItem` itself fails, or the row has vanished (TTL edge case), the error is surfaced on the `Effect` Error channel as `DynamoClientError` — not as `{ applied: false }`. That distinguishes "you lost the CAS" from "something broke after you lost the CAS."
 
 ---
 
