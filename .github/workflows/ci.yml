@@ -33,6 +33,13 @@ jobs:
       - name: Lint
         run: pnpm lint
 
+      # Build must run before `check` and `test` — @effect-dynamodb/geo imports
+      # `effect-dynamodb` as a workspace dependency that resolves to
+      # `dist/index.d.ts`. Without a build, `tsc` can't find the types and the
+      # check step fails with TS2307 on a fresh checkout.
+      - name: Build
+        run: pnpm build
+
       - name: Type check
         run: pnpm check
 
@@ -59,9 +66,6 @@ jobs:
           AWS_ACCESS_KEY_ID: dummy
           AWS_SECRET_ACCESS_KEY: dummy
         run: pnpm -r --if-present test:connected
-
-      - name: Build
-        run: pnpm build
 
       - name: Require changeset or version bump
         run: |
