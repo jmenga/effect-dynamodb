@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted Publishing requires npm CLI >= 11.5.1; Node 22 ships with npm 10.x.
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Detect packages with new versions
+        id: detect
+        run: |
+          node <<'EOF' > /tmp/publish.json
+          const { execSync } = require('child_process');
+          const PUBLISHABLE = ['effect-dynamodb', '@effect-dynamodb/geo', '@effect-dynamodb/language-service'];
+          const workspace = JSON.parse(execSync('pnpm -r list --depth -1 --json', { encoding: 'utf8' }));
+          const toPublish = [];
+          for (const name of PUBLISHABLE) {
+            const entry = workspace.find((p) => p.name === name);
+            if (!entry) {
+              console.error(`Workspace package not found: ${name}`);
+              process.exit(1);
+            }
+            const current = entry.version;
+            let published = '0.0.0';
+            try {
+              published = execSync(`npm view ${name}@latest version`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim() || '0.0.0';
+            } catch { /* not yet published */ }
+            if (current !== published) {
+              console.error(`${name}: ${published} -> ${current} (will publish)`);
+              toPublish.push({ name, version: current, dir: entry.path });
+            } else {
+              console.error(`${name}: ${current} already published, skipping`);
+            }
+          }
+          process.stdout.write(JSON.stringify(toPublish));
+          EOF
+          COUNT=$(node -p "require('/tmp/publish.json').length")
+          if [ "$COUNT" = "0" ]; then
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        if: steps.detect.outputs.should_publish == 'true'
+        run: pnpm build
+
+      - name: Test
+        if: steps.detect.outputs.should_publish == 'true'
+        run: pnpm test
+
+      # Authentication uses npm Trusted Publishing (OIDC) — no NPM_TOKEN required.
+      # Each package must be configured at npmjs.com with this repo + workflow as a trusted publisher.
+      - name: Publish to NPM
+        if: steps.detect.outputs.should_publish == 'true'
+        run: |
+          node <<'EOF'
+          const { execSync } = require('child_process');
+          const targets = require('/tmp/publish.json');
+          for (const { name, version, dir } of targets) {
+            console.log(`Publishing ${name}@${version} from ${dir}`);
+            execSync('npm publish --provenance --access public', { cwd: dir, stdio: 'inherit' });
+          }
+          EOF
+
+      - name: Create GitHub Releases
+        if: steps.detect.outputs.should_publish == 'true'
+        run: |
+          node -e "console.log(JSON.stringify(require('/tmp/publish.json')))" > /tmp/targets.json
+          for ROW in $(node -e "for (const t of require('/tmp/targets.json')) console.log(t.name + '@' + t.version)"); do
+            git tag "$ROW"
+            git push origin "$ROW"
+            gh release create "$ROW" --title "$ROW" --generate-notes
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

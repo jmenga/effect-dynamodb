@@ -1,7 +1,7 @@
 import ts from "typescript"
 import { describe, expect, it } from "vitest"
-import { DiagnosticCode, getDiagnostics } from "../src/features/diagnostics"
 import { resolveEntities } from "../src/core/EntityResolver"
+import { DiagnosticCode, getDiagnostics } from "../src/features/diagnostics"
 
 function parseSource(source: string): ts.SourceFile {
   return ts.createSourceFile("test.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
@@ -99,7 +99,11 @@ function mockInfoWithConfiguredModel(sourceFile: ts.SourceFile, fieldNames: stri
     getProperty: (name: string) => (name === "model" ? modelSymbol : undefined),
     getProperties: () => [
       { name: "model", getName: () => "model", getEscapedName: () => "model" as ts.__String },
-      { name: "attributes", getName: () => "attributes", getEscapedName: () => "attributes" as ts.__String },
+      {
+        name: "attributes",
+        getName: () => "attributes",
+        getEscapedName: () => "attributes" as ts.__String,
+      },
     ],
   }
 
@@ -183,7 +187,7 @@ describe("Diagnostics", () => {
         const active = db.entities.Tasks.byProject({ projectId: "p-1" }).filter({ status: "active" }).collect()
       `
       const sf = parseSource(source)
-      const entities = resolveEntities(ts, sf)
+      const _entities = resolveEntities(ts, sf)
       const info = mockInfo(sf)
       const diagnostics = getDiagnostics(ts, info, "test.ts", [])
 

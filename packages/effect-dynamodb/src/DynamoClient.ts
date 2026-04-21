@@ -100,7 +100,7 @@ import {
   UpdateTableCommand,
   UpdateTimeToLiveCommand,
 } from "@aws-sdk/client-dynamodb"
-import { Config, Effect, Layer, type Schema, Context } from "effect"
+import { Config, Context, Effect, Layer, type Schema } from "effect"
 import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
 import { bind as aggregateBind } from "./Aggregate.js"
 import * as DynamoSchema from "./DynamoSchema.js"
@@ -119,9 +119,9 @@ import {
   ValidationError,
 } from "./Errors.js"
 import { type BoundQueryConfig, BoundQueryImpl } from "./internal/BoundQuery.js"
+import type { EntityKeyType, IndexPkInput, IndexSkFields } from "./internal/EntityTypes.js"
 import { createConditionOps } from "./internal/Expr.js"
 import { createPathBuilder } from "./internal/PathBuilder.js"
-import type { EntityKeyType, IndexPkInput, IndexSkFields } from "./internal/EntityTypes.js"
 import type { IndexDefinition } from "./KeyComposer.js"
 import * as KeyComposer from "./KeyComposer.js"
 import * as Query from "./Query.js"
@@ -549,75 +549,6 @@ export interface CollectionAccessors {
   [collectionName: string]: (
     composites: Record<string, unknown>,
   ) => CollectionQuery<Record<string, unknown[]>>
-}
-
-// ---------------------------------------------------------------------------
-// Collection type computation from entity indexes
-// ---------------------------------------------------------------------------
-
-/** Extract all collection names from a single entity's indexes. */
-type EntityCollectionNames<E> =
-  E extends EntityType<any, any, infer I, any, any, any, any, any, any>
-    ? I extends Record<string, IndexDefinition>
-      ? {
-          [K in keyof I]: I[K] extends { readonly collection: infer C }
-            ? C extends string
-              ? C
-              : C extends ReadonlyArray<string>
-                ? C[number]
-                : never
-            : never
-        }[keyof I]
-      : never
-    : never
-
-/** Extract all collection names from all entities. */
-type AllCollectionNames<TEntities extends Record<string, { readonly _tag: "Entity" }>> = {
-  [K in keyof TEntities]: EntityCollectionNames<TEntities[K]>
-}[keyof TEntities]
-
-/** Build the grouped result type for a collection: { EntityKey: Array<ModelType> } for each entity that has this collection. */
-type CollectionGroupedResult<
-  TEntities extends Record<string, { readonly _tag: "Entity" }>,
-  CollName extends string,
-> = {
-  readonly [K in keyof TEntities as EntityHasCollection<TEntities[K], CollName> extends true
-    ? K
-    : never]: TEntities[K] extends EntityType<infer M, any, any, any, any, any, any, any, any>
-    ? Array<Schema.Schema.Type<M>>
-    : never
-}
-
-/** Check if an entity has a specific collection name in any of its indexes. */
-type EntityHasCollection<E, CollName extends string> =
-  E extends EntityType<any, any, infer I, any, any, any, any, any, any>
-    ? I extends Record<string, IndexDefinition>
-      ? {
-          [K in keyof I]: I[K] extends { readonly collection: infer C }
-            ? C extends string
-              ? C extends CollName
-                ? true
-                : false
-              : C extends ReadonlyArray<string>
-                ? CollName extends C[number]
-                  ? true
-                  : false
-                : false
-            : false
-        }[keyof I] extends false
-        ? false
-        : true
-      : false
-    : false
-
-/**
- * Auto-discovered collection accessors. Keyed by collection name extracted
- * from entity index `collection` properties.
- */
-type DiscoveredCollections<TEntities extends Record<string, { readonly _tag: "Entity" }>> = {
-  readonly [CollName in AllCollectionNames<TEntities> & string]: (
-    composites: Record<string, unknown>,
-  ) => CollectionQuery<CollectionGroupedResult<TEntities, CollName>>
 }
 
 /** Force TypeScript to resolve an interface/intersection into a plain object for clean hover display */
@@ -1094,7 +1025,10 @@ const makeFromConfig = (config: {
           }
         }
       }
-      for (const [, { tag, entities: tableEntities, aggregates: tableAggregates }] of entitiesByTag) {
+      for (const [
+        ,
+        { tag, entities: tableEntities, aggregates: tableAggregates },
+      ] of entitiesByTag) {
         const tableConfig = yield* tag
         // Build a minimal Table-like object so tableDefinition() can derive GSIs
         // (entities + aggregates).
@@ -1107,7 +1041,11 @@ const makeFromConfig = (config: {
             ]),
           ),
         } as unknown as Table
-        tables[tableConfig.name] = buildTableOperationsFromTable(tableConfig.name, syntheticTable, client)
+        tables[tableConfig.name] = buildTableOperationsFromTable(
+          tableConfig.name,
+          syntheticTable,
+          client,
+        )
       }
     }
 
@@ -1132,7 +1070,9 @@ const isResourceInUse = (err: DynamoClientError): boolean =>
   (err.cause as { name: string }).name === "ResourceInUseException"
 
 /** Make createTable idempotent — ignore if table already exists. */
-const idempotentCreate = (effect: Effect.Effect<void, DynamoClientError>): Effect.Effect<void, DynamoClientError> =>
+const idempotentCreate = (
+  effect: Effect.Effect<void, DynamoClientError>,
+): Effect.Effect<void, DynamoClientError> =>
   Effect.catchIf(effect, isResourceInUse, () => Effect.void)
 
 const buildTableOperationsFromTable = (

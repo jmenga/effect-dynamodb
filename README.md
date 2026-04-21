@@ -1,81 +1,71 @@
-# @effect-dynamodb/core
+# effect-dynamodb
 
-Schema-driven DynamoDB ORM for [Effect TS](https://effect.website). Single-table design as a first-class pattern with type-safe entities, composite key composition, Stream-based pagination, and Layer-based dependency injection.
+Schema-driven DynamoDB ORM for [Effect TS](https://effect.website). Single-table design as a first-class pattern, with type-safe entity modeling, composite key composition, Stream-based pagination, and Layer-based dependency injection.
 
-[![npm](https://img.shields.io/npm/v/@effect-dynamodb/core)](https://www.npmjs.com/package/@effect-dynamodb/core)
-[![license](https://img.shields.io/npm/l/@effect-dynamodb/core)](./LICENSE)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.8-blue)](https://www.typescriptlang.org/)
+[![npm](https://img.shields.io/npm/v/effect-dynamodb)](https://www.npmjs.com/package/effect-dynamodb)
+[![license](https://img.shields.io/npm/l/effect-dynamodb)](./LICENSE)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue)](https://www.typescriptlang.org/)
 [![Effect](https://img.shields.io/badge/Effect-4.x-purple)](https://effect.website)
+
+**Documentation:** https://jmenga.github.io/effect-dynamodb
+
+## Packages
+
+| Package | Description |
+|---|---|
+| [`effect-dynamodb`](./packages/effect-dynamodb) | Core ORM — entities, single-table design, queries, transactions, lifecycle |
+| [`@effect-dynamodb/geo`](./packages/effect-dynamodb-geo) | Geospatial index and proximity search using H3 hexagons |
+| [`@effect-dynamodb/language-service`](./packages/language-service) | TypeScript language-service plugin — DynamoDB op details on hover |
 
 ## Features
 
-- **Schema-driven models** — Pure `Schema.Class`/`Schema.Struct` domain models with 7 auto-derived types
-- **Single-table design** — Multiple entity types sharing one table with entity type isolation and index overloading
-- **Composite key composition** — ElectroDB-style `{ pk: { field, composite }, sk: { field, composite } }` index definitions
-- **Pipeable Query API** — `Query<A>` data type with `where`, `limit`, `reverse`, `consistentRead` combinators
-- **Scan** — `Entity.scan()` with full combinator support
-- **Type-safe expressions** — `Entity.condition()`, `Entity.filter()`, `Entity.select()` with PathBuilder callback API
-- **Create (insert-only)** — `Entity.create()` with automatic `attribute_not_exists` condition
-- **Rich update operations** — `Entity.remove()`, `Entity.add()`, `Entity.subtract()`, `Entity.append()`, `Entity.deleteFromSet()`
-- **Batch operations** — `Batch.get` and `Batch.write` with auto-chunking and unprocessed item retry
-- **Transactions** — `Transaction.transactGet` and `Transaction.transactWrite` for atomic multi-item operations
-- **Collections** — Multi-entity queries across entity types with per-entity schema decoding
-- **Unique constraints** — Sentinel-based uniqueness enforcement with atomic transactions
-- **Optimistic locking** — `Entity.expectedVersion()` with automatic version tracking
-- **Versioning** — Auto-increment version with optional snapshot retention
-- **Soft delete** — Mark as deleted, restore, purge — with optional TTL
-- **Timestamps** — Automatic `createdAt`/`updatedAt` management
-- **Stream pagination** — Automatic DynamoDB pagination via Effect `Stream`
-- **Layer-based DI** — Table names and DynamoClient injected via Effect Layers
-- **Tagged errors** — `DynamoError`, `ItemNotFound`, `ConditionalCheckFailed`, and more — all with `catchTag`
-- **Expression builders** — Type-safe condition, filter, update, and projection expressions
-- **DynamoDB Streams** — Decode stream records into typed domain objects
-- **Dual APIs** — All public functions support data-first and data-last (pipeable) calling conventions
+- **Schema-driven models** — pure `Schema.Class`/`Schema.Struct` domain types with 7 derived types per entity (`Model`, `Record`, `Input`, `Update`, `Key`, `Item`, `Marshalled`).
+- **Single-table design as the default path** — multiple entity types share one physical table; the framework handles entity-type isolation, composite key composition, and index overloading.
+- **Entity-centric typed gateway** — `DynamoClient.make({ entities, tables })` returns `db.entities.*`, `db.collections.*`, `db.tables.*` with `R = never`.
+- **Fluent BoundQuery builder** — `db.entities.Tasks.byProject({...}).filter(...).limit(10).collect()`. Terminals: `.collect()`, `.fetch()`, `.paginate()` (Stream), `.count()`.
+- **Index accessors derived from entity GSI definitions** — every GSI becomes a typed query method on the entity.
+- **Cross-entity collections** — entities sharing a `collection` name on the same physical GSI are auto-discovered as `db.collections.<name>(...)` queries.
+- **Type-safe expressions** — condition / filter / projection via PathBuilder callbacks (`(t, { eq, gt }) => and(eq(t.status, "active"), gt(t.priority, 3))`) or shorthand records.
+- **Rich updates** — `Entity.set()`, `remove()`, `add()`, `subtract()`, `append()`, `deleteFromSet()`, plus path-based variants for nested structures.
+- **Lifecycle features (opt-in)** — automatic `createdAt`/`updatedAt`, optimistic locking via auto-incremented version, version snapshot retention, soft delete with optional TTL, restore, purge, unique constraints via sentinel transactions.
+- **Aggregates** — graph-based composite domain models that decompose into entity ops (atomic transactions) and assemble from collection queries; never touches `DynamoClient` directly.
+- **Event sourcing** — append-only `EventStore` with stream replay and snapshots.
+- **Tagged errors** — `ItemNotFound`, `ConditionalCheckFailed`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, and more — all `catchTag`-discriminable.
+- **Stream pagination** — `Stream<A>` from `.paginate()`; the runtime handles DynamoDB's pagination protocol.
+- **Layer-based DI** — physical table names and AWS client config injected via Effect Layers, enabling clean test isolation.
 
-## Installation
+## Quick start
 
 ```bash
-pnpm add @effect-dynamodb/core effect @aws-sdk/client-dynamodb @aws-sdk/util-dynamodb
+pnpm add effect-dynamodb effect @aws-sdk/client-dynamodb @aws-sdk/util-dynamodb
 ```
 
-## Quick Start
+`effect` is a peer dependency — install the version your application uses.
 
 ```typescript
-import { Schema, Effect, Layer, Stream } from "effect"
-import {
-  DynamoModel, DynamoSchema, Table, Entity,
-  Query, DynamoClient,
-} from "@effect-dynamodb/core"
+import { Console, Effect, Layer, Schema } from "effect"
+import { DynamoClient, DynamoSchema, Entity, Table } from "effect-dynamodb"
 
-// 1. Define a model — pure domain schema, no DynamoDB concepts
+// 1. Pure domain model — no DynamoDB concepts
 class Task extends Schema.Class<Task>("Task")({
   taskId:    Schema.String,
   projectId: Schema.String,
   title:     Schema.NonEmptyString,
   status:    Schema.Literals(["todo", "active", "done"]),
   priority:  Schema.Number,
-  createdBy: Schema.String,
 }) {}
 
-// 2. Configure DynamoDB-specific overrides (separate from model)
-const TaskModel = DynamoModel.configure(Task, {
-  createdBy: { immutable: true },
-})
-
-// 3. Create schema
-const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
-
-// 4. Define entity — indexes, timestamps, versioning
+// 2. Entity — primary key + GSI access patterns
 const Tasks = Entity.make({
-  model: TaskModel,
+  model: Task,
   entityType: "Task",
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["taskId"] },
-      sk: { field: "sk", composite: [] },
-    },
     byProject: {
-      index: "gsi1",
+      name: "gsi1",
       pk: { field: "gsi1pk", composite: ["projectId"] },
       sk: { field: "gsi1sk", composite: ["status", "taskId"] },
     },
@@ -84,214 +74,166 @@ const Tasks = Entity.make({
   versioned: true,
 })
 
-// 5. Register entities on the table
+// 3. Table — register entities under an app namespace
+const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
 const MainTable = Table.make({ schema: AppSchema, entities: { Tasks } })
 
-// 6. Use it
+// 4. Use the typed gateway
 const program = Effect.gen(function* () {
-  const { Tasks: tasks } = yield* DynamoClient.make(MainTable)
-
-  // Create
-  const task = yield* tasks.put({
-    taskId: "t-1",
-    projectId: "p-1",
-    title: "Ship v1.0",
-    status: "active",
-    priority: 1,
-    createdBy: "alice",
+  const db = yield* DynamoClient.make({
+    entities: { Tasks },
+    tables: { MainTable },
   })
 
-  // Read
-  const found = yield* tasks.get({ taskId: "t-1" })
-
-  // Query with filter
-  const active = yield* tasks.collect(
-    Tasks.query.byProject({ projectId: "p-1" }),
-    Tasks.filter((t, { gte }) => gte(t.priority, 1)),
-    Query.limit(25),
+  yield* db.tables.MainTable.describe().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => db.tables.MainTable.create()),
   )
 
-  // Update with combinators
-  yield* tasks.update(
+  // Create
+  yield* db.entities.Tasks.put({
+    taskId: "t-1", projectId: "p-1", title: "Ship v1.0",
+    status: "active", priority: 1,
+  })
+
+  // Read by primary key
+  const task = yield* db.entities.Tasks.get({ taskId: "t-1" })
+
+  // Query a GSI — fluent BoundQuery
+  const active = yield* db.entities.Tasks
+    .byProject({ projectId: "p-1", status: "active" })
+    .limit(25)
+    .collect()
+
+  // Update (provide all GSI composites that participate in the SK so keys can be recomposed)
+  yield* db.entities.Tasks.update(
     { taskId: "t-1" },
-    Entity.set({ status: "done" }),
+    Entity.set({ status: "done", projectId: "p-1" }),
   )
 
-  // Condition expression (callback API — type-safe)
-  yield* tasks.update(
+  // Conditional write
+  yield* db.entities.Tasks.update(
     { taskId: "t-1" },
-    Entity.set({ status: "active" }),
+    Entity.set({ status: "active", projectId: "p-1" }),
     Tasks.condition((t, { eq }) => eq(t.status, "done")),
   )
 
-  // Filter expression (callback API)
-  const highPriority = yield* tasks.collect(
-    Tasks.query.byProject({ projectId: "p-1" }),
-    Tasks.filter((t, { gt }) => gt(t.priority, 3)),
-  )
-
   // Delete
-  yield* tasks.delete({ taskId: "t-1" })
+  yield* db.entities.Tasks.delete({ taskId: "t-1" })
 
-  // Scan all tasks
-  const all = yield* tasks.collect(Tasks.scan())
-
-  // Stream pagination
-  const stream = tasks.paginate(
-    Tasks.query.byProject({ projectId: "p-1" }),
-    Query.limit(25),
-  )
-  yield* Stream.runForEach(stream, (t) =>
-    Effect.log(`Task: ${t.title}`)
-  )
+  yield* Console.log(`Found ${active.length} active tasks`)
 })
 
-// Provide dependencies via Layers
-const main = program.pipe(
-  Effect.provide(
-    Layer.mergeAll(
-      DynamoClient.layer({ region: "us-east-1" }),
-      MainTable.layer({ name: "MainTable" }),
-    )
-  ),
+const AppLayer = Layer.mergeAll(
+  DynamoClient.layer({
+    region: "us-east-1",
+    endpoint: "http://localhost:8000",
+    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  }),
+  MainTable.layer({ name: "my-app-table" }),
 )
 
-Effect.runPromise(main)
+Effect.runPromise(program.pipe(Effect.provide(AppLayer)))
 ```
 
-### What you get from one entity definition
+### Cross-entity collections
 
-From the `Tasks` entity above, effect-dynamodb derives **7 types automatically**:
-
-| Type | What it is |
-|------|------------|
-| `Entity.Model<typeof Tasks>` | Pure domain object (`Task`) |
-| `Entity.Record<typeof Tasks>` | Domain + system fields (version, timestamps) |
-| `Entity.Input<typeof Tasks>` | Creation input (no system fields) |
-| `Entity.Update<typeof Tasks>` | Mutable fields only (keys + immutable excluded) |
-| `Entity.Key<typeof Tasks>` | Primary key attributes (`{ taskId }`) |
-| `Entity.Item<typeof Tasks>` | Full unmarshalled DynamoDB item |
-| `Entity.Marshalled<typeof Tasks>` | DynamoDB `AttributeValue` format |
-
-Plus: CRUD operations, index queries, scan, batch, transactions, versioning, and soft delete — all type-safe.
-
-## Key Concepts
-
-**Four declarations drive everything:**
-
-```
-Schema.Class  →  DynamoSchema  →  Table  →  Entity
-(domain)         (namespace)      (physical)  (binding)
-```
-
-1. **Model** — A standard `Schema.Class` defining your domain fields. No DynamoDB concepts.
-2. **DynamoSchema** — Application namespace and version. Prefixes every generated key.
-3. **Table** — Physical DynamoDB table with Layer-based name injection at runtime.
-4. **Entity** — Binds model to table with index definitions, system fields, unique constraints, and collections.
-
-## API at a Glance
-
-| Module | Description |
-|--------|-------------|
-| [`DynamoModel`](./docs/api-reference.md#dynamomodel) | `Immutable` field annotation |
-| [`DynamoSchema`](./docs/api-reference.md#dynamoschema) | Application namespace and key prefixing |
-| [`Table`](./docs/api-reference.md#table) | Table definition with Layer-based name injection |
-| [`Entity`](./docs/api-reference.md#entity) | Model-to-table binding, CRUD, queries, lifecycle management |
-| [`Query`](./docs/api-reference.md#query) | Pipeable `Query<A>` data type with composable combinators |
-| [`Collection`](./docs/api-reference.md#collection) | Multi-entity queries across shared indexes |
-| [`Transaction`](./docs/api-reference.md#transaction) | Atomic multi-item get and write operations |
-| [`Aggregate`](./docs/api-reference.md#aggregate) | Graph-based composite domain models with edges and ref hydration |
-| [`Batch`](./docs/api-reference.md#batch) | Batch get/write with auto-chunking and retry |
-| [`EventStore`](./docs/api-reference.md#eventstore) | Append-only event store with stream replay and snapshots |
-| [`Expression`](./docs/api-reference.md#expression) | Condition, filter, and update expression builders |
-| [`Projection`](./docs/api-reference.md#projection) | ProjectionExpression builder |
-| [`KeyComposer`](./docs/api-reference.md#keycomposer) | Composite key composition utilities |
-| [`Marshaller`](./docs/api-reference.md#marshaller) | DynamoDB marshal/unmarshal wrapper |
-| [`DynamoClient`](./docs/api-reference.md#dynamoclient) | Effect Service wrapping AWS SDK DynamoDBClient |
-| [Errors](./docs/api-reference.md#errors) | 20 tagged error types for precise `catchTag` handling |
-
-## Error Handling
-
-All errors are tagged for precise discrimination:
+When two entities share a `collection` name on the same physical GSI, they group automatically:
 
 ```typescript
-const { Users: users } = yield* DynamoClient.make(MainTable)
-const user = yield* users.get({ userId: "u-1" }).pipe(
+const Employees = Entity.make({ /* ... */
+  indexes: {
+    workplaces: {
+      collection: "workplaces",
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["office"] },
+      sk: { field: "gsi1sk", composite: ["team", "title", "employee"] },
+    },
+  },
+})
+
+const Offices = Entity.make({ /* ... */
+  indexes: {
+    workplaces: {
+      collection: "workplaces",
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["office"] },
+      sk: { field: "gsi1sk", composite: [] },
+    },
+  },
+})
+
+const db = yield* DynamoClient.make({ entities: { Employees, Offices }, tables: { MainTable } })
+
+const { Employees: staff, Offices: office } = yield* db.collections.workplaces({
+  office: "gw-zoo",
+}).collect()
+```
+
+## Error handling
+
+```typescript
+const result = yield* db.entities.Users.get({ userId: "u-1" }).pipe(
   Effect.catchTag("ItemNotFound", () => Effect.succeed(null)),
-  Effect.catchTag("ValidationError", (e) =>
-    Effect.die(`Schema error: ${e.message}`)
-  ),
-  Effect.catchTag("DynamoError", (e) =>
-    Effect.die(`AWS error in ${e.operation}: ${e.cause}`)
-  ),
+  Effect.catchTag("ValidationError", (e) => Effect.die(`Schema error: ${e.message}`)),
+  Effect.catchTag("DynamoError", (e) => Effect.die(`AWS error in ${e.operation}`)),
 )
 ```
 
-Available errors: `DynamoError`, `ItemNotFound`, `ConditionalCheckFailed`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `TransactionOverflow`, `RefNotFound`, `ItemDeleted`, `ItemNotDeleted`, `VersionConflict`, `AggregateAssemblyError`, `AggregateDecompositionError`, `AggregateTransactionOverflow`, `CascadePartialFailure`, and more.
-
-## Documentation
-
-| Guide | Description |
-|-------|-------------|
-| [Getting Started](./docs/getting-started.md) | Prerequisites, installation, 5-minute walkthrough |
-| [Modeling](./docs/modeling.md) | Models, schemas, tables, entities, derived types |
-| [Indexes & Collections](./docs/indexes.md) | Access patterns, composite keys, isolated vs clustered collections |
-| [Queries](./docs/queries.md) | Query API, sort key conditions, scan, consistent reads, pagination |
-| [Data Integrity](./docs/data-integrity.md) | Unique constraints, versioning, optimistic concurrency |
-| [Lifecycle](./docs/lifecycle.md) | Soft delete, restore, purge, version retention |
-| [Advanced](./docs/advanced.md) | Conditional writes, create, rich updates, DynamoDB Streams, testing, expressions |
-| [API Reference](./docs/api-reference.md) | Module-by-module export reference |
-| [FAQ & Troubleshooting](./docs/faq-troubleshooting.md) | Common questions, error solutions, and debugging tips |
-| [Migration from ElectroDB](./docs/migration-from-electrodb.md) | Concept mapping and side-by-side examples |
+Available errors include `DynamoError`, `ItemNotFound`, `ConditionalCheckFailed`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `TransactionOverflow`, `RefNotFound`, `ItemDeleted`, `VersionConflict`, and others — see the [API Reference](https://jmenga.github.io/effect-dynamodb/reference/api-reference) for the complete list.
 
 ## Examples
 
-17 runnable examples demonstrating all major features. Run against DynamoDB Local:
+[`packages/effect-dynamodb/examples/`](./packages/effect-dynamodb/examples/) contains 17+ runnable programs that double as the source of truth for documentation snippets:
 
 ```bash
 docker run -p 8000:8000 amazon/dynamodb-local
-npx tsx examples/<name>.ts
+npx tsx packages/effect-dynamodb/examples/starter.ts
 ```
 
-| Example | Description |
-|---------|-------------|
-| [`starter.ts`](./examples/starter.ts) | Minimal single-entity setup |
-| [`crud.ts`](./examples/crud.ts) | Put, get, update, delete operations |
-| [`hr.ts`](./examples/hr.ts) | Multi-entity HR system with collections and queries |
-| [`task-manager.ts`](./examples/task-manager.ts) | Task management with indexes and sort key conditions |
-| [`blog.ts`](./examples/blog.ts) | Blog with posts and comments, sub-collections |
-| [`shopping-mall.ts`](./examples/shopping-mall.ts) | Multi-tenant e-commerce with index overloading |
-| [`library-system.ts`](./examples/library-system.ts) | Library with versioning, soft delete, and unique constraints |
-| [`version-control.ts`](./examples/version-control.ts) | Version retention and snapshot queries |
-| [`batch.ts`](./examples/batch.ts) | Batch get and write with auto-chunking |
-| [`scan.ts`](./examples/scan.ts) | Entity scan with filters, limits, and consistent reads |
-| [`projections.ts`](./examples/projections.ts) | ProjectionExpression for selective attribute reads |
-| [`expressions.ts`](./examples/expressions.ts) | Conditional writes, create, and filter expressions |
-| [`unique-constraints.ts`](./examples/unique-constraints.ts) | Unique constraint enforcement and violation handling |
-| [`updates.ts`](./examples/updates.ts) | Rich updates: remove, add, subtract, append, deleteFromSet |
-| [`cricket.ts`](./examples/cricket.ts) | Aggregate CRUD with entity refs and cascade updates |
-| [`event-sourcing.ts`](./examples/event-sourcing.ts) | EventStore with decider pattern and stream replay |
-| [`_walkthrough.ts`](./examples/_walkthrough.ts) | Step-by-step walkthrough (STEP=1..5) |
+| Example | Topic |
+|---|---|
+| `starter.ts` | Minimal setup |
+| `crud.ts` | Full CRUD with versioning and soft delete |
+| `expressions.ts` | Conditional writes, create, filter expressions |
+| `updates.ts` | Rich updates: remove, add, subtract, append |
+| `batch.ts` | Batch get/write with auto-chunking |
+| `unique-constraints.ts` | Sentinel-based uniqueness |
+| `hr.ts` | Multi-entity HR system, collections, queries |
+| `blog.ts` | Posts and comments with sub-collections |
+| `shopping-mall.ts` | Multi-tenant e-commerce, index overloading |
+| `cricket.ts` | Aggregate CRUD with ref hydration and cascade updates |
+| `event-sourcing.ts` | EventStore with the decider pattern |
 
 ## vs ElectroDB
 
-effect-dynamodb is designed for teams already using [Effect TS](https://effect.website). If you're comparing with [ElectroDB](https://electrodb.dev):
+If you're choosing between this and [ElectroDB](https://electrodb.dev):
 
-| | effect-dynamodb | ElectroDB |
-|---|-----------------|-----------|
-| **Type safety** | 7 derived types, branded types, Schema ecosystem | Good inference, fewer derived types |
-| **Lifecycle management** | Built-in versioning, soft delete, restore, purge, unique constraints | Manual implementation |
+|  | effect-dynamodb | ElectroDB |
+|---|---|---|
+| **Native to** | Effect TS ecosystem | TypeScript |
+| **Type derivation** | 7 derived types per entity | Inferred input/output |
+| **Lifecycle features** | Built-in versioning, snapshots, soft delete, restore, purge, unique constraints | Manual implementation |
 | **Concurrency** | Built-in optimistic locking | Manual |
-| **Composability** | Effect pipelines, Stream pagination, Layer DI, dual APIs | Fluent chaining |
-| **Error handling** | Tagged errors with `catchTag` | Error codes |
-| **DX for simple cases** | More setup (Schema + DynamoSchema + Table + Entity) | Less boilerplate |
-| **DX for complex cases** | Effect composition scales better | Callback chains |
+| **Composition** | Effect pipelines, `Stream` pagination, Layer DI | Fluent chaining |
+| **Errors** | Tagged errors with `catchTag` | Error codes |
+| **Setup overhead** | More upfront (`Schema` + `DynamoSchema` + `Table` + `Entity`) | Less |
+| **Pays off when** | Multiple entities, complex composition, Effect-native codebase | Simple cases, non-Effect codebase |
 
-See [Migration from ElectroDB](./docs/migration-from-electrodb.md) for detailed concept mapping and side-by-side examples.
+See the [Migration from ElectroDB](https://jmenga.github.io/effect-dynamodb/reference/migration-from-electrodb) guide for concept mapping and side-by-side examples.
 
-## Contributing
+## Development
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for setup, commands, and guidelines.
+This is a pnpm workspace monorepo:
+
+```bash
+pnpm install
+pnpm build
+pnpm check    # typecheck
+pnpm lint     # biome
+pnpm test     # all packages
+```
+
+See [`PUBLISH.md`](./PUBLISH.md) for the release flow and one-time GitHub setup.
 
 ## License
 

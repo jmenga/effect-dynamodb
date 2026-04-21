@@ -483,13 +483,9 @@ describe("Collection", () => {
     })
 
     it("write side: SubTask SK uses two-level prefix", () => {
-      const sk = KeyComposer.composeSk(
-        AppSchema,
-        "SubTask",
-        1,
-        SubTask.indexes.byEmployee!,
-        { orderId: "o-1" },
-      )
+      const sk = KeyComposer.composeSk(AppSchema, "SubTask", 1, SubTask.indexes.byEmployee!, {
+        orderId: "o-1",
+      })
       expect(sk).toBe("$myapp#v1#contributions#assignments#subtask_1#orderid_o-1")
     })
 
@@ -559,9 +555,7 @@ describe("Collection", () => {
         const call = mockQuery.mock.calls[0]![0]
         expect(call.KeyConditionExpression).toContain("begins_with")
         // The SK begins_with argument is the exact parent prefix (no composites).
-        const allValues = Object.values(call.ExpressionAttributeValues).map(
-          (v: any) => v?.S,
-        )
+        const allValues = Object.values(call.ExpressionAttributeValues).map((v: any) => v?.S)
         expect(allValues).toContain("$myapp#v1#contributions")
       }).pipe(Effect.provide(TestLayer)),
     )

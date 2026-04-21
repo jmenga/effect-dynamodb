@@ -9,7 +9,7 @@
  * transactGet returns a typed tuple inferred per-position.
  */
 
-import { Effect, Function as Fn, Schema } from "effect"
+import { Effect, Function as Fn } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import type { Entity, EntityDelete, EntityGet, EntityPut } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
@@ -17,7 +17,7 @@ import {
   DynamoError,
   isAwsTransactionCancelled,
   TransactionCancelled,
-  ValidationError,
+  type ValidationError,
 } from "./Errors.js"
 import type { ExpressionResult } from "./Expression.js"
 import {

@@ -35,6 +35,7 @@ import {
   ValidationError,
 } from "./Errors.js"
 import type { ConditionInput } from "./Expression.js"
+import { type BoundQueryConfig, BoundQueryImpl } from "./internal/BoundQuery.js"
 import {
   compileExpr,
   createConditionOps,
@@ -43,7 +44,6 @@ import {
   parseShorthand,
   parseSimpleShorthand,
 } from "./internal/Expr.js"
-import { type BoundQueryConfig, BoundQueryImpl } from "./internal/BoundQuery.js"
 import { compilePath, createPathBuilder } from "./internal/PathBuilder.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "./KeyComposer.js"
 import * as KeyComposer from "./KeyComposer.js"
@@ -777,11 +777,7 @@ export interface BoundEntity<
    */
   readonly versions: (
     key: TKey,
-  ) => import("./internal/BoundQuery.js").BoundQuery<
-    ModelType<TModel>,
-    never,
-    ModelType<TModel>
-  >
+  ) => import("./internal/BoundQuery.js").BoundQuery<ModelType<TModel>, never, ModelType<TModel>>
 
   /** Restore a soft-deleted item. */
   readonly restore: (
@@ -793,9 +789,7 @@ export interface BoundEntity<
   >
 
   /** Permanently remove an item plus all version history and sentinels. */
-  readonly purge: (
-    key: TKey,
-  ) => Effect.Effect<void, DynamoClientError | ValidationError, never>
+  readonly purge: (key: TKey) => Effect.Effect<void, DynamoClientError | ValidationError, never>
 
   /** Soft-deleted item accessors. */
   readonly deleted: {
@@ -815,11 +809,7 @@ export interface BoundEntity<
      */
     readonly list: (
       key: TKey,
-    ) => import("./internal/BoundQuery.js").BoundQuery<
-      ModelType<TModel>,
-      never,
-      ModelType<TModel>
-    >
+    ) => import("./internal/BoundQuery.js").BoundQuery<ModelType<TModel>, never, ModelType<TModel>>
   }
 
   // --- Query Execution ---
@@ -961,25 +951,6 @@ const checkTransactionLimit = (
  * })
  * ```
  */
-/** Valid composite attribute names: model fields + ref-derived ID fields (e.g., `playerId` from ref field `player`). */
-type ValidCompositeAttr<TModel extends Schema.Top, TRefs> =
-  | (string & keyof Schema.Schema.Type<TModel>)
-  | ([TRefs] extends [globalThis.Record<infer K extends string, any>] ? `${K}Id` : never)
-
-/** Extract all composite attribute names from an index definition. */
-type IndexComposites<T> = T extends {
-  readonly pk: { readonly composite: ReadonlyArray<infer P extends string> }
-  readonly sk: { readonly composite: ReadonlyArray<infer S extends string> }
-}
-  ? P | S
-  : never
-
-/** Find invalid composite attributes across all indexes. */
-type InvalidComposites<F extends string, TIndexes> = Exclude<
-  IndexComposites<TIndexes[keyof TIndexes]>,
-  F
->
-
 /** Compute the normalized indexes type from primaryKey + optional GSI configs. */
 type NormalizedIndexes<
   TPrimaryKey extends PrimaryKeyDef,
@@ -1371,9 +1342,7 @@ const makeImpl = <
 
   /** Attach the model class prototype to a decoded plain object (when model is Schema.Class). */
   const attachPrototype = (decoded: any) =>
-    isSchemaClass
-      ? Object.assign(Object.create((rawModel as any).prototype), decoded)
-      : decoded
+    isSchemaClass ? Object.assign(Object.create((rawModel as any).prototype), decoded) : decoded
 
   const decodeRecord = (raw: globalThis.Record<string, unknown>) => {
     renameFromDynamo(raw)
@@ -1415,7 +1384,9 @@ const makeImpl = <
       Effect.map((decoded) =>
         mode === "model" && isSchemaClass && !hasHiddenFields
           ? new (rawModel as any)(decoded)
-          : mode !== "item" ? attachPrototype(decoded) : decoded,
+          : mode !== "item"
+            ? attachPrototype(decoded)
+            : decoded,
       ),
       Effect.mapError(
         (cause) =>
@@ -4073,11 +4044,10 @@ export const bind = <
         conditionOps: createConditionOps(),
         provide,
       }
-      return new BoundQueryImpl(q, bqConfig) as unknown as import("./internal/BoundQuery.js").BoundQuery<
-        A,
-        never,
-        A
-      >
+      return new BoundQueryImpl(
+        q,
+        bqConfig,
+      ) as unknown as import("./internal/BoundQuery.js").BoundQuery<A, never, A>
     }
 
     return {
@@ -4336,7 +4306,7 @@ export const decodeMarshalledItem = (
   marshalledItem: globalThis.Record<string, AttributeValue>,
 ): Effect.Effect<unknown, ValidationError> =>
   Schema.decodeUnknownEffect(entity.schemas.itemSchema)(fromAttributeMap(marshalledItem)).pipe(
-    Effect.map((decoded) => entity._attachPrototype ? entity._attachPrototype(decoded) : decoded),
+    Effect.map((decoded) => (entity._attachPrototype ? entity._attachPrototype(decoded) : decoded)),
     Effect.mapError(
       (cause) =>
         new ValidationError({

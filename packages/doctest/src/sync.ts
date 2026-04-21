@@ -136,6 +136,12 @@ function normalize(content: string): string {
       .filter((line) => !line.trim().startsWith("assertEq(") && !line.trim().startsWith("assert("))
       // Remove nested #region/#endregion markers
       .filter((line) => !line.trim().match(/^\/\/\s*#(end)?region/))
+      // Remove `import ... from "..."` statements. Examples colocate imports
+      // at the top of a single file, while tutorial code blocks may include
+      // their own inline imports (necessary for multi-file projects). The
+      // sync check is about substantive code, not boilerplate, so we drop
+      // imports on both sides.
+      .filter((line) => !line.trim().match(/^import\s/))
       // Normalize indentation: trim all leading whitespace per line
       .map((line) => line.trimStart())
       .join("\n")
@@ -144,7 +150,5 @@ function normalize(content: string): string {
       .replace(/\n\/\/\s*(?:→|State:|Current|Error:|Latest:|Reconstructed:|v\d+:)[^\n]*/g, "")
       // Remove inline result annotations (e.g., "// coffee.category -> ...")
       .replace(/\n\/\/\s*\w+\.\w+\s*→[^\n]*/g, "")
-      // Normalize import paths
-      .replace(/from\s+["']\.\.\/src\/[^"']+["']/g, 'from "effect-dynamodb"')
   )
 }

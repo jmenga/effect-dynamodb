@@ -1,9 +1,9 @@
 import type ts from "typescript"
 import {
-  type ResolvedEntity,
-  resolveEntities,
   extractStringArray,
   extractStringLiteral,
+  type ResolvedEntity,
+  resolveEntities,
 } from "../core/EntityResolver"
 
 // ---------------------------------------------------------------------------
@@ -218,16 +218,12 @@ function tryValidateEntityMake(
 
   // Validate primary key
   if (primaryKeyNode && ts.isObjectLiteralExpression(primaryKeyNode)) {
-    diagnostics.push(
-      ...validatePrimaryKey(ts, sourceFile, entityType, primaryKeyNode, modelFields),
-    )
+    diagnostics.push(...validatePrimaryKey(ts, sourceFile, entityType, primaryKeyNode, modelFields))
   }
 
   // Validate GSI indexes
   if (indexesNode && ts.isObjectLiteralExpression(indexesNode)) {
-    diagnostics.push(
-      ...validateGsiIndexes(ts, sourceFile, entityType, indexesNode, modelFields),
-    )
+    diagnostics.push(...validateGsiIndexes(ts, sourceFile, entityType, indexesNode, modelFields))
   }
 
   return diagnostics
@@ -334,7 +330,7 @@ function validateGsiIndexes(
     const indexName = prop.name.text
     if (!ts.isObjectLiteralExpression(prop.initializer)) continue
 
-    let nameProp: ts.Expression | undefined
+    let _nameProp: ts.Expression | undefined
     let pkNode: ts.Expression | undefined
     let skNode: ts.Expression | undefined
     let pkCompositeNode: ts.Node | undefined
@@ -347,7 +343,7 @@ function validateGsiIndexes(
       if (!ts.isPropertyAssignment(idxProp) || !ts.isIdentifier(idxProp.name)) continue
       switch (idxProp.name.text) {
         case "name":
-          nameProp = idxProp.initializer
+          _nameProp = idxProp.initializer
           break
         case "index":
           // Detect old format: index: { name, pk, sk }
@@ -508,9 +504,7 @@ function tryValidateQueryChain(
         if (indexDef && indexName !== "primary" && callExpr.arguments.length > 0) {
           const queryArg = callExpr.arguments[0]!
           if (ts.isObjectLiteralExpression(queryArg)) {
-            diagnostics.push(
-              ...validateQueryInput(ts, sourceFile, indexName, indexDef, queryArg),
-            )
+            diagnostics.push(...validateQueryInput(ts, sourceFile, indexName, indexDef, queryArg))
           }
         }
       }
@@ -649,10 +643,7 @@ function validateQueryInput(
 // Helpers
 // ---------------------------------------------------------------------------
 
-function buildChain(
-  ts: typeof import("typescript"),
-  node: ts.Expression,
-): Array<ts.Identifier> {
+function buildChain(ts: typeof import("typescript"), node: ts.Expression): Array<ts.Identifier> {
   const parts: Array<ts.Identifier> = []
   let current: ts.Expression = node
   while (ts.isPropertyAccessExpression(current)) {

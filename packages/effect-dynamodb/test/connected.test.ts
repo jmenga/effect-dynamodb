@@ -90,7 +90,11 @@ const Users = Entity.make({
       pk: { field: "gsi1pk", composite: ["role"] },
       sk: { field: "gsi1sk", composite: ["userId"] },
     },
-    byEmail: { name: "gsi2", pk: { field: "gsi2pk", composite: ["email"] }, sk: { field: "gsi2sk", composite: [] } },
+    byEmail: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["email"] },
+      sk: { field: "gsi2sk", composite: [] },
+    },
   },
   unique: { email: ["email"] },
   timestamps: true,

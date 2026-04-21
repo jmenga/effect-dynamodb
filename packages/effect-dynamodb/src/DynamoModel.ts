@@ -564,13 +564,13 @@ type ConfigureAttributes<M extends Schema.Top> = {
  * with existing model field names. Replaces the `field` type with an
  * error tuple to produce a readable type error at the call site.
  */
-type ValidateFieldRenames<
-  Fields extends string,
-  A,
-> = {
+type ValidateFieldRenames<Fields extends string, A> = {
   [K in keyof A]: A[K] extends { readonly field: infer F extends string }
     ? F extends Exclude<Fields, K & string>
-      ? { readonly field: [`EDD-9007: "${F}" collides with existing model field`] } & Omit<A[K], "field">
+      ? { readonly field: [`EDD-9007: "${F}" collides with existing model field`] } & Omit<
+          A[K],
+          "field"
+        >
       : A[K]
     : A[K]
 }

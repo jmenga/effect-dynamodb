@@ -498,81 +498,87 @@ describe("DynamoClient", () => {
       }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
     })
 
-    it.effect("without aggregates produces a createTable call with no LSI (regression guard)", () => {
-      // Same entity/table setup but no `aggregates` on DynamoClient.make — the
-      // table should come back with zero LSIs, proving the merge is the only
-      // path that introduces them in the `tables` branch.
-      const MainTable = Table.make({
-        schema: AppSchema,
-        entities: { MatchItem: MatchItemEntity },
-      })
-
-      const captured: Array<any> = []
-      const ClientLayer = makeCapturingClient(captured)
-      const TableLayer = MainTable.layer({ name: "no-agg-test-table" })
-
-      return Effect.gen(function* () {
-        const db = yield* DynamoClient.make({
+    it.effect(
+      "without aggregates produces a createTable call with no LSI (regression guard)",
+      () => {
+        // Same entity/table setup but no `aggregates` on DynamoClient.make — the
+        // table should come back with zero LSIs, proving the merge is the only
+        // path that introduces them in the `tables` branch.
+        const MainTable = Table.make({
+          schema: AppSchema,
           entities: { MatchItem: MatchItemEntity },
-          tables: { MainTable },
         })
-        yield* db.tables.MainTable.create()
 
-        expect(captured).toHaveLength(1)
-        const input = captured[0]
-        expect(input.TableName).toBe("no-agg-test-table")
-        expect(input.LocalSecondaryIndexes).toBeUndefined()
-        expect(input.GlobalSecondaryIndexes).toBeUndefined()
-      }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
-    })
+        const captured: Array<any> = []
+        const ClientLayer = makeCapturingClient(captured)
+        const TableLayer = MainTable.layer({ name: "no-agg-test-table" })
 
-    it.effect("aggregates whose _tableTag does not match any supplied table are silently skipped", () => {
-      // MainTable is supplied; OtherTable is NOT, but the aggregate is built
-      // against OtherTable. The merge loop must skip it without erroring,
-      // and MainTable's createTable call must have no LSI (since no matching
-      // aggregate contributes one).
-      const MainTable = Table.make({
-        schema: AppSchema,
-        entities: { Venue: VenueEntity },
-      })
+        return Effect.gen(function* () {
+          const db = yield* DynamoClient.make({
+            entities: { MatchItem: MatchItemEntity },
+            tables: { MainTable },
+          })
+          yield* db.tables.MainTable.create()
 
-      const OtherTable = Table.make({
-        schema: AppSchema,
-        entities: { MatchItem: MatchItemEntity },
-      })
+          expect(captured).toHaveLength(1)
+          const input = captured[0]
+          expect(input.TableName).toBe("no-agg-test-table")
+          expect(input.LocalSecondaryIndexes).toBeUndefined()
+          expect(input.GlobalSecondaryIndexes).toBeUndefined()
+        }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+      },
+    )
 
-      const OrphanAggregate = Aggregate.make(MatchItem, {
-        table: OtherTable, // belongs to OtherTable
-        schema: AppSchema,
-        pk: { field: "pk", composite: ["id"] },
-        collection: {
-          index: "lsi1",
-          name: "match",
-          sk: { field: "lsi1sk", composite: ["name"] },
-        },
-        root: { entityType: "MatchItem" },
-        edges: {},
-      })
-
-      const captured: Array<any> = []
-      const ClientLayer = makeCapturingClient(captured)
-      // Only MainTable gets a layer — OtherTable's Tag is never resolved.
-      const TableLayer = MainTable.layer({ name: "orphan-test-table" })
-
-      return Effect.gen(function* () {
-        const db = yield* DynamoClient.make({
+    it.effect(
+      "aggregates whose _tableTag does not match any supplied table are silently skipped",
+      () => {
+        // MainTable is supplied; OtherTable is NOT, but the aggregate is built
+        // against OtherTable. The merge loop must skip it without erroring,
+        // and MainTable's createTable call must have no LSI (since no matching
+        // aggregate contributes one).
+        const MainTable = Table.make({
+          schema: AppSchema,
           entities: { Venue: VenueEntity },
-          aggregates: { OrphanAggregate },
-          tables: { MainTable },
         })
-        // The orphan aggregate's LSI must NOT leak into MainTable's definition.
-        yield* db.tables.MainTable.create()
 
-        expect(captured).toHaveLength(1)
-        const input = captured[0]
-        expect(input.TableName).toBe("orphan-test-table")
-        expect(input.LocalSecondaryIndexes).toBeUndefined()
-      }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
-    })
+        const OtherTable = Table.make({
+          schema: AppSchema,
+          entities: { MatchItem: MatchItemEntity },
+        })
+
+        const OrphanAggregate = Aggregate.make(MatchItem, {
+          table: OtherTable, // belongs to OtherTable
+          schema: AppSchema,
+          pk: { field: "pk", composite: ["id"] },
+          collection: {
+            index: "lsi1",
+            name: "match",
+            sk: { field: "lsi1sk", composite: ["name"] },
+          },
+          root: { entityType: "MatchItem" },
+          edges: {},
+        })
+
+        const captured: Array<any> = []
+        const ClientLayer = makeCapturingClient(captured)
+        // Only MainTable gets a layer — OtherTable's Tag is never resolved.
+        const TableLayer = MainTable.layer({ name: "orphan-test-table" })
+
+        return Effect.gen(function* () {
+          const db = yield* DynamoClient.make({
+            entities: { Venue: VenueEntity },
+            aggregates: { OrphanAggregate },
+            tables: { MainTable },
+          })
+          // The orphan aggregate's LSI must NOT leak into MainTable's definition.
+          yield* db.tables.MainTable.create()
+
+          expect(captured).toHaveLength(1)
+          const input = captured[0]
+          expect(input.TableName).toBe("orphan-test-table")
+          expect(input.LocalSecondaryIndexes).toBeUndefined()
+        }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+      },
+    )
   })
 })

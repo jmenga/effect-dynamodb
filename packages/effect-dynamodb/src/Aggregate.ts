@@ -10,7 +10,7 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import { Effect, type Optic, Schema, SchemaAST, type Context } from "effect"
+import { type Context, Effect, type Optic, Schema, SchemaAST } from "effect"
 import * as Batch from "./Batch.js"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
 import type { DynamoEncoding } from "./DynamoModel.js"

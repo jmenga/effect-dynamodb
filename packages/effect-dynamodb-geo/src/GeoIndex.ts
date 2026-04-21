@@ -7,6 +7,7 @@
  * - `enrich` — lower-level geo field computation (for transactions/batch writes)
  */
 
+import { type Context, Effect, type Schema } from "effect"
 import type {
   DynamoClient,
   DynamoClientError,
@@ -16,7 +17,6 @@ import type {
   UniqueConstraintViolation,
   ValidationError,
 } from "effect-dynamodb"
-import { Effect, type Schema, type Context } from "effect"
 import * as _GeoSearch from "./GeoSearch.js"
 import * as H3 from "./H3.js"
 import type { LatLng } from "./Spherical.js"

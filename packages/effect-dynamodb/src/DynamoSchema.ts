@@ -100,7 +100,9 @@ export const composeKey = (
   schema: DynamoSchema,
   entityType: string,
   composites: ReadonlyArray<string>,
-  options?: { readonly casing?: Casing | undefined; readonly names?: ReadonlyArray<string> | undefined } | undefined,
+  options?:
+    | { readonly casing?: Casing | undefined; readonly names?: ReadonlyArray<string> | undefined }
+    | undefined,
 ): string => {
   const {
     casing: effectiveCasing,
@@ -124,7 +126,9 @@ export const composeCollectionKey = (
   schema: DynamoSchema,
   collectionName: string,
   composites: ReadonlyArray<string>,
-  options?: { readonly casing?: Casing | undefined; readonly names?: ReadonlyArray<string> | undefined } | undefined,
+  options?:
+    | { readonly casing?: Casing | undefined; readonly names?: ReadonlyArray<string> | undefined }
+    | undefined,
 ): string => {
   const {
     casing: effectiveCasing,
@@ -160,7 +164,9 @@ export const composeClusteredSortKey = (
   entityType: string,
   entityVersion: number,
   composites: ReadonlyArray<string>,
-  options?: { readonly casing?: Casing | undefined; readonly names?: ReadonlyArray<string> | undefined } | undefined,
+  options?:
+    | { readonly casing?: Casing | undefined; readonly names?: ReadonlyArray<string> | undefined }
+    | undefined,
 ): string => {
   const effectiveCasing = options?.casing ?? schema.casing
   const pre = prefix(schema)
@@ -170,7 +176,9 @@ export const composeClusteredSortKey = (
   const entityPrefix = `${type}_${entityVersion}`
 
   const formattedComposites = formatCompositeParts(composites, effectiveCasing, options?.names)
-  const parts = [pre, ...collectionParts, entityPrefix, ...formattedComposites].filter((p) => p.length > 0)
+  const parts = [pre, ...collectionParts, entityPrefix, ...formattedComposites].filter(
+    (p) => p.length > 0,
+  )
   return parts.join("#")
 }
 
@@ -184,7 +192,9 @@ export const composeIsolatedSortKey = (
   entityType: string,
   entityVersion: number,
   composites: ReadonlyArray<string>,
-  options?: { readonly casing?: Casing | undefined; readonly names?: ReadonlyArray<string> | undefined } | undefined,
+  options?:
+    | { readonly casing?: Casing | undefined; readonly names?: ReadonlyArray<string> | undefined }
+    | undefined,
 ): string => {
   const {
     casing: effectiveCasing,

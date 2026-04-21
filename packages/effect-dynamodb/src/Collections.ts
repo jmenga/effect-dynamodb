@@ -14,7 +14,7 @@
 
 import type { Schema } from "effect"
 import { getFields } from "./internal/EntitySchemas.js"
-import type { IndexDefinition, KeyPart } from "./KeyComposer.js"
+import type { IndexDefinition } from "./KeyComposer.js"
 
 // ---------------------------------------------------------------------------
 // Structural entity constraint — minimal type for entities used in Collections

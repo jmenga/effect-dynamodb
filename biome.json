@@ -54,6 +54,33 @@
       "linter": {
         "enabled": false
       }
+    },
+    {
+      "includes": ["packages/**/examples/**"],
+      "formatter": {
+        "enabled": false
+      },
+      "assist": {
+        "actions": {
+          "source": {
+            "organizeImports": {
+              "level": "off"
+            }
+          }
+        }
+      },
+      "linter": {
+        "rules": {
+          "correctness": {
+            "noUnusedVariables": "off",
+            "noUnusedFunctionParameters": "off",
+            "noUnusedImports": "off"
+          },
+          "complexity": {
+            "useLiteralKeys": "off"
+          }
+        }
+      }
     }
   ]
 }

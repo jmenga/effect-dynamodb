@@ -4,9 +4,18 @@
   "description": "Effect TS ORM for DynamoDB — schema-driven entity modeling, single-table design, composite keys, transactions, and Stream-based pagination",
   "type": "module",
   "license": "MIT",
+  "author": "Justin Menga",
   "repository": {
     "type": "git",
-    "url": "https://github.com/effect-dynamodb/core"
+    "url": "https://github.com/jmenga/effect-dynamodb",
+    "directory": "packages/effect-dynamodb"
+  },
+  "homepage": "https://jmenga.github.io/effect-dynamodb",
+  "bugs": {
+    "url": "https://github.com/jmenga/effect-dynamodb/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "keywords": [
     "effect",
@@ -47,12 +56,15 @@
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.700.0",
-    "@aws-sdk/util-dynamodb": "^3.700.0",
-    "effect": "4.0.0-beta.48"
+    "@aws-sdk/util-dynamodb": "^3.700.0"
+  },
+  "peerDependencies": {
+    "effect": "^4.0.0-beta.48"
   },
   "devDependencies": {
     "@effect/vitest": "4.0.0-beta.48",
     "@types/node": "^25.5.0",
+    "effect": "4.0.0-beta.48",
     "typescript": "^5.7.0",
     "vitest": "^4.1.0"
   }

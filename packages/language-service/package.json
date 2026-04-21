@@ -3,10 +3,32 @@
   "version": "0.1.0",
   "description": "TypeScript Language Service Plugin for effect-dynamodb — shows DynamoDB operations on hover",
   "license": "MIT",
+  "author": "Justin Menga",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jmenga/effect-dynamodb",
+    "directory": "packages/language-service"
+  },
+  "homepage": "https://jmenga.github.io/effect-dynamodb",
+  "bugs": {
+    "url": "https://github.com/jmenga/effect-dynamodb/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "effect-dynamodb",
+    "typescript",
+    "language-service",
+    "ts-plugin",
+    "dynamodb"
+  ],
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc",

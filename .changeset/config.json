@@ -1,0 +1,16 @@
+{
+  "$schema": "https://unpkg.com/@changesets/config@3.1.2/schema.json",
+  "changelog": [
+    "@changesets/changelog-github",
+    { "repo": "jmenga/effect-dynamodb" }
+  ],
+  "commit": false,
+  "fixed": [
+    ["effect-dynamodb", "@effect-dynamodb/geo", "@effect-dynamodb/language-service"]
+  ],
+  "linked": [],
+  "access": "public",
+  "baseBranch": "main",
+  "updateInternalDependencies": "patch",
+  "ignore": ["@effect-dynamodb/docs", "@effect-dynamodb/doctest"]
+}

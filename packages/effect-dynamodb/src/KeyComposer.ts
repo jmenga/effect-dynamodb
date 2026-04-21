@@ -180,14 +180,10 @@ export const composeSk = (
     if (collectionType === "clustered") {
       // For sub-collections (collection: ["parent", "child"]) the FULL hierarchy
       // is written into the SK so a begins_with query at any level matches.
-      return composeClusteredSortKey(
-        schema,
-        collection,
-        entityType,
-        entityVersion,
-        composites,
-        { casing: index.casing, names },
-      )
+      return composeClusteredSortKey(schema, collection, entityType, entityVersion, composites, {
+        casing: index.casing,
+        names,
+      })
     }
     // Isolated
     return composeIsolatedSortKey(schema, entityType, entityVersion, composites, {

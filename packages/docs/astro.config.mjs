@@ -5,7 +5,7 @@ import react from "@astrojs/react"
 import tailwindcss from "@tailwindcss/vite"
 
 export default defineConfig({
-  site: "https://example.github.io",
+  site: "https://jmenga.github.io",
   base: "/effect-dynamodb",
   integrations: [
     starlight({

@@ -1,4 +1,3 @@
-import type { WhereCondition } from "./OperationDetector"
 import type {
   Casing,
   IndexDefinition,
@@ -6,7 +5,7 @@ import type {
   ResolvedEntity,
   SchemaConfig,
 } from "./EntityResolver"
-import type { DetectedOperation, UpdateCombinators } from "./OperationDetector"
+import type { DetectedOperation, UpdateCombinators, WhereCondition } from "./OperationDetector"
 
 export interface DynamoDBParams {
   readonly command: string
@@ -620,7 +619,12 @@ function buildEntityIndexAccessorParams(
         keyCondition += " AND #sk = :sk"
       } else {
         // Partial or .where() with range condition → use appropriate SK condition
-        const skPrefix = composeSkPrefixValue(entity.schema, entity.entityType, indexDef, mergedArgs)
+        const skPrefix = composeSkPrefixValue(
+          entity.schema,
+          entity.entityType,
+          indexDef,
+          mergedArgs,
+        )
         if (skPrefix) {
           names["#sk"] = indexDef.sk.field
           if (whereCondition) {

@@ -9,7 +9,6 @@ import { DynamoError } from "../src/Errors.js"
 import {
   compileExpr,
   createConditionOps,
-  type Expr,
   isExpr,
   parseShorthand,
   parseSimpleShorthand,
@@ -377,7 +376,7 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
       try: () => mockTransactWriteItems(input),
       catch: (e) => new DynamoError({ operation: "TransactWriteItems", cause: e }),
     }),
-  transactGetItems: (input) =>
+  transactGetItems: (_input) =>
     Effect.tryPromise({
       try: () => ({}),
       catch: (e) => new DynamoError({ operation: "TransactGetItems", cause: e }),
@@ -392,17 +391,17 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
       try: () => mockBatchGetItem(input),
       catch: (e) => new DynamoError({ operation: "BatchGetItem", cause: e }),
     }),
-  createTable: (input) =>
+  createTable: (_input) =>
     Effect.tryPromise({
       try: () => ({}),
       catch: (e) => new DynamoError({ operation: "CreateTable", cause: e }),
     }),
-  deleteTable: (input) =>
+  deleteTable: (_input) =>
     Effect.tryPromise({
       try: () => ({}),
       catch: (e) => new DynamoError({ operation: "DeleteTable", cause: e }),
     }),
-  describeTable: (input) =>
+  describeTable: (_input) =>
     Effect.tryPromise({
       try: () => ({}),
       catch: (e) => new DynamoError({ operation: "DescribeTable", cause: e }),

@@ -8,7 +8,7 @@
  * Collections are built from Entity index definitions that share a `collection` name.
  */
 
-import { Effect, Schema } from "effect"
+import { Effect, type Schema } from "effect"
 import * as DynamoSchema from "./DynamoSchema.js"
 import { ValidationError } from "./Errors.js"
 import type { IndexDefinition } from "./KeyComposer.js"

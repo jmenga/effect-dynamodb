@@ -159,9 +159,9 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
   where(
     fn: (t: SkRemaining, ops: SkConditionOps<SkRemaining>) => Query.SortKeyCondition,
   ): BoundQueryImpl<Model, never, A> {
-    const skAccessor = (this._config.skFields
-      ? buildSkAccessor(this._config.skFields)
-      : {}) as SkRemaining
+    const skAccessor = (
+      this._config.skFields ? buildSkAccessor(this._config.skFields) : {}
+    ) as SkRemaining
     const condition = fn(skAccessor, skConditionOps as SkConditionOps<SkRemaining>)
     const finalCondition = this._config.composeSkCondition
       ? this._config.composeSkCondition(condition)

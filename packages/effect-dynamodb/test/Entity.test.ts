@@ -3916,10 +3916,7 @@ describe("Entity", () => {
         })
 
         const bound = yield* Entity.bind(SoftDeleteEntity)
-        const tombstones = yield* bound.deleted
-          .list({ itemId: "i-1" })
-          .reverse()
-          .collect()
+        const tombstones = yield* bound.deleted.list({ itemId: "i-1" }).reverse().collect()
 
         expect(tombstones).toHaveLength(2)
         // Verify the underlying QueryCommandInput shape

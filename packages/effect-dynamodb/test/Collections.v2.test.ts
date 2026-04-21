@@ -1,7 +1,6 @@
 import { describe, expect, it } from "@effect/vitest"
 import { Schema } from "effect"
 import * as Collections from "../src/Collections.js"
-import type { IndexDefinition } from "../src/KeyComposer.js"
 
 // ---------------------------------------------------------------------------
 // Test models and entities
@@ -46,7 +45,7 @@ const makeEntityLike = (
 
 const Employees = makeEntityLike(EmployeeModel, "Employee")
 const Tasks = makeEntityLike(TaskModel, "Task")
-const Projects = makeEntityLike(ProjectModel, "Project")
+const _Projects = makeEntityLike(ProjectModel, "Project")
 
 // ---------------------------------------------------------------------------
 // Tests
