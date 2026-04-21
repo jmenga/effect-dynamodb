@@ -252,7 +252,7 @@ describeConnected("Connected integration tests", () => {
         yield* client.createTable({
           TableName: tableName,
           BillingMode: "PAY_PER_REQUEST",
-          ...Table.definition(MainTable, [Users, Tasks]),
+          ...Table.definition(MainTable),
         })
       }).pipe(provide, Effect.scoped),
     )
@@ -685,9 +685,13 @@ describeConnected("Connected integration tests", () => {
 
     it.effect("query with sort key beginsWith filters correctly", () =>
       Effect.gen(function* () {
+        // KeyComposer prefixes each composite value with its attribute name
+        // (`status_<value>`), so the full SK prefix for Tasks with status=todo
+        // under byUser (gsi1sk composite: ["status", "taskId"]) is
+        // `$<schema>#v1#<entity>#status_<value>`.
         const todos = yield* Tasks.query.byUser({ userId: "u-query" }).pipe(
           Query.where({
-            beginsWith: `$connected-test#v1#task#todo`,
+            beginsWith: `$connected-test#v1#task#status_todo`,
           }),
           Query.collect,
         )
@@ -1084,14 +1088,19 @@ describeConnected("Connected integration tests", () => {
 
 describeConnected("Entity refs and Aggregate integration tests", () => {
   beforeAll(async () => {
+    // Go through DynamoClient.make so the aggregate→table auto-merge wires
+    // `BlogPostAggregate`'s gsi2 collection index into the CreateTable call.
+    // `BlogPostAggregate` can't be registered on `Table.make` directly because
+    // it references `AggTable` — the classic circular-reference case that the
+    // `DynamoClient.make({ aggregates, tables })` merge was designed for.
     await Effect.runPromise(
       Effect.gen(function* () {
-        const client = yield* DynamoClient
-        yield* client.createTable({
-          TableName: aggTableName,
-          BillingMode: "PAY_PER_REQUEST",
-          ...Table.definition(AggTable, [Authors, Articles, BlogPostAggregate]),
+        const db = yield* DynamoClient.make({
+          entities: { Authors, Articles },
+          aggregates: { BlogPostAggregate },
+          tables: { AggTable },
         })
+        yield* db.tables.AggTable.create()
       }).pipe(provideAgg, Effect.scoped),
     )
   }, 15000)
