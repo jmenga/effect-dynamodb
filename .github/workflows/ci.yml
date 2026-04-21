@@ -14,15 +14,15 @@ jobs:
         ports:
           - 8000:8000
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v5
         with:
           version: latest
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: pnpm
@@ -67,9 +67,51 @@ jobs:
           AWS_SECRET_ACCESS_KEY: dummy
         run: pnpm -r --if-present test:connected
 
+      # Enforce Option A (see CLAUDE.md > Release Workflow): any PR declaring a
+      # release must run `pnpm changeset version` as part of that same PR, so
+      # the changeset is consumed and package.json versions are bumped in the
+      # PR itself — not in a follow-up bot PR. Empty chore changesets (no
+      # packages listed) are fine and are allowed through.
+      - name: Enforce changeset-version consumption
+        run: |
+          node <<'EOF'
+          const fs = require('fs');
+          const path = require('path');
+          const dir = '.changeset';
+          const files = fs.existsSync(dir)
+            ? fs.readdirSync(dir).filter((f) => f.endsWith('.md') && f !== 'README.md')
+            : [];
+
+          const pending = [];
+          for (const f of files) {
+            const raw = fs.readFileSync(path.join(dir, f), 'utf8');
+            // Extract frontmatter between the first pair of `---` lines.
+            const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+            if (!match) continue;
+            const body = match[1];
+            // A release-declaring line looks like: "pkg-name": patch|minor|major
+            const hasRelease = /^"[^"]+"\s*:\s*(patch|minor|major)\s*$/m.test(body);
+            if (hasRelease) pending.push(f);
+          }
+
+          if (pending.length > 0) {
+            console.error('::error::Unconsumed release-declaring changesets found:');
+            for (const f of pending) console.error(`::error::  .changeset/${f}`);
+            console.error(
+              '::error::Per CLAUDE.md > Release Workflow, every PR that bumps a release must run ' +
+                "'pnpm changeset version' as part of that same PR. Run it locally and commit the " +
+                'result (bumped package.json versions, regenerated CHANGELOG.md, deleted changeset) ' +
+                'before merging.',
+            );
+            process.exit(1);
+          }
+          EOF
+
       - name: Require changeset or version bump
         run: |
-          # Pass if there's a changeset file (any *.md other than README.md)
+          # Pass if there's a changeset file (any *.md other than README.md).
+          # The step above has already confirmed none of them declare an
+          # unconsumed release.
           HAS_CHANGESET=false
           if ls .changeset/*.md 1>/dev/null 2>&1; then
             EXTRA=$(ls .changeset/*.md | grep -v '/README.md$' || true)
