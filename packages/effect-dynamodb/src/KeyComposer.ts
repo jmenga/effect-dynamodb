@@ -22,6 +22,29 @@ export interface KeyPart {
   readonly composite: ReadonlyArray<string>
 }
 
+/**
+ * Per-composite policy value controlling how `Entity.update` and time-series
+ * `.append` handle a composite attribute that is absent from the merged update
+ * payload.
+ *
+ * - `"sparse"` — absent → REMOVE `gsiNpk`/`gsiNsk`; item drops out of the GSI.
+ * - `"preserve"` — absent → leave the stored GSI key field untouched.
+ *
+ * Attributes not covered by an `indexPolicy` default to `"preserve"`. See
+ * `DESIGN.md §7 Policy-Aware GSI Composition` for full decision rules.
+ */
+export type IndexPolicyAttr = "sparse" | "preserve"
+
+/**
+ * Function form of an index policy. Receives the merged record
+ * (`primaryKey + payload` at update time, `primaryKey + appendInput` at append
+ * time) and returns a per-attribute policy map. Only keys corresponding to
+ * composite attributes of this GSI are consulted; additional keys are ignored.
+ */
+export type IndexPolicy = (
+  item: Readonly<Record<string, unknown>>,
+) => Partial<Record<string, IndexPolicyAttr>>
+
 /** Index definition for primary or secondary index (internal format) */
 export interface IndexDefinition {
   readonly index?: string | undefined // Physical GSI name (omit for primary)
@@ -30,6 +53,12 @@ export interface IndexDefinition {
   readonly pk: KeyPart
   readonly sk: KeyPart
   readonly casing?: DynamoSchema.Casing | undefined
+  /**
+   * Optional per-composite policy for `Entity.update` and `.append`. Not
+   * consulted on `put()` — put always omits a GSI's keys when any of its
+   * composites is missing.
+   */
+  readonly indexPolicy?: IndexPolicy | undefined
 }
 
 /** GSI definition as specified on Entity.make() indexes config.
@@ -45,6 +74,16 @@ export interface GsiConfig {
   readonly pk: KeyPart
   /** Sort key: physical field name + composite attributes. */
   readonly sk: KeyPart
+  /**
+   * Per-composite sparse/preserve policy. Applied by `Entity.update` and
+   * time-series `.append`. Defaults to `"preserve"` for any composite the
+   * function does not specify. Not applied on `put()`.
+   *
+   * At append-time, returned keys must be members of the `appendInput`
+   * schema (enforced at `Entity.make()`) — composites owned by other writers
+   * cannot have policy at append-time, since `.append` cannot touch them.
+   */
+  readonly indexPolicy?: IndexPolicy | undefined
 }
 
 /** Normalize a GsiConfig (entity input) to an IndexDefinition (internal format). */
@@ -67,6 +106,7 @@ export const normalizeGsiConfig = (config: GsiConfig): IndexDefinition => {
     type: config.type ?? "isolated",
     pk: { field: config.pk.field, composite: [...config.pk.composite] },
     sk: { field: config.sk.field, composite: [...config.sk.composite] },
+    indexPolicy: config.indexPolicy,
   }
 }
 
@@ -254,74 +294,114 @@ export const composeAllKeys = (
 }
 
 /**
- * Compose GSI keys for indexes whose composites appear in an update payload.
- * For each non-primary index, checks if ANY of its composite attributes are in
- * the update payload. If so, composes the full GSI keys using values merged from
- * keyRecord (primary key composites) and updatePayload.
+ * Result of policy-aware GSI update composition.
  *
- * Used by Entity.update to recompose GSI keys when the update touches GSI composites.
- * Callers should filter out indexes whose composites are targeted by REMOVE operations
- * before calling — otherwise `extractComposites` will throw on the missing values.
+ * - `sets`: map of GSI key field name → composed value (emit as SET clauses).
+ * - `removes`: list of GSI key field names to REMOVE (item drops out of GSI).
+ *
+ * `sets` and `removes` are mutually exclusive — a single field never appears
+ * in both for the same update.
  */
-export const composeGsiKeysForUpdate = (
+export interface GsiUpdateResult {
+  readonly sets: Record<string, string>
+  readonly removes: ReadonlyArray<string>
+}
+
+/**
+ * Policy-aware GSI key composition for `Entity.update` and time-series
+ * `.append`.
+ *
+ * Each touched GSI is resolved via its `indexPolicy` (if any) and returns a
+ * combination of SET and REMOVE operations for the index's key fields. See
+ * `DESIGN.md §7 Policy-Aware GSI Composition` for the full decision table.
+ *
+ * Rules (per touched GSI):
+ * 1. **Cascade (REMOVE of a composite attr)** — any composite in `removedSet`
+ *    forces REMOVE of both key fields, overriding `indexPolicy`.
+ * 2. **Sparse wins** — if any composite is absent and its policy is `"sparse"`,
+ *    REMOVE both key fields.
+ * 3. **Full recompose** — if all composites are present, SET both halves.
+ * 4. **Mixed (some `"preserve"` absent, no `"sparse"` absent)** — evaluate pk
+ *    and sk independently: the half whose composites are all present is SET;
+ *    the half missing a preserve attr is left alone (no SET, no REMOVE).
+ *
+ * A GSI is considered "touched" when any of its composites appears in
+ * `updatePayload` or `removedSet`. Untouched GSIs are skipped.
+ */
+export const composeGsiKeysForUpdatePolicyAware = (
   schema: DynamoSchema.DynamoSchema,
   entityType: string,
   entityVersion: number,
   indexes: Record<string, IndexDefinition>,
   updatePayload: Record<string, unknown>,
   keyRecord: Record<string, unknown>,
-): Record<string, string> => {
-  const result: Record<string, string> = {}
+  options?: { readonly removedSet?: ReadonlySet<string> | undefined },
+): GsiUpdateResult => {
+  const sets: Record<string, string> = {}
+  const removes: Array<string> = []
+  const removedSet = options?.removedSet
+
   for (const [indexName, index] of Object.entries(indexes)) {
     if (indexName === "primary") continue
-    const allComposites = [...index.pk.composite, ...index.sk.composite]
-    const touchedComposites = allComposites.filter((attr) => attr in updatePayload)
-    if (touchedComposites.length > 0) {
-      const merged = { ...keyRecord, ...updatePayload }
-      const missingComposites = allComposites.filter(
-        (attr) => merged[attr] === undefined || merged[attr] === null,
-      )
-      if (missingComposites.length > 0) {
-        throw new PartialGsiCompositeError(
-          indexName,
-          touchedComposites,
-          missingComposites,
-          allComposites,
-        )
-      }
-      Object.assign(result, composeIndexKeys(schema, entityType, entityVersion, index, merged))
+
+    const pkComposites = index.pk.composite
+    const skComposites = index.sk.composite
+    const allComposites = [...pkComposites, ...skComposites]
+
+    const cascadeRemove =
+      removedSet !== undefined && allComposites.some((attr) => removedSet.has(attr))
+    const touchedByPayload = allComposites.some((attr) => attr in updatePayload)
+    // GSIs that declare an `indexPolicy` are always evaluated — the policy is a
+    // declarative statement about the GSI's membership invariant, so "attr not
+    // in payload" is treated as "attr not set" per the policy (sparse → drop,
+    // preserve → leave that half alone). GSIs without a policy keep the
+    // conventional touched gate: skip unless a composite is in the payload.
+    const hasPolicy = index.indexPolicy !== undefined
+
+    if (!cascadeRemove && !touchedByPayload && !hasPolicy) continue
+
+    // Cascade takes precedence over policy.
+    if (cascadeRemove) {
+      removes.push(index.pk.field, index.sk.field)
+      continue
+    }
+
+    const merged = { ...keyRecord, ...updatePayload }
+    const policy = index.indexPolicy?.(merged) ?? {}
+
+    const isPresent = (attr: string): boolean => {
+      const v = merged[attr]
+      return v !== undefined && v !== null
+    }
+
+    // Sparse wins across the whole GSI.
+    const anySparseMissing = allComposites.some(
+      (attr) => !isPresent(attr) && policy[attr] === "sparse",
+    )
+    if (anySparseMissing) {
+      removes.push(index.pk.field, index.sk.field)
+      continue
+    }
+
+    const pkAllPresent = pkComposites.every(isPresent)
+    const skAllPresent = skComposites.every(isPresent)
+
+    if (pkAllPresent && skAllPresent) {
+      Object.assign(sets, composeIndexKeys(schema, entityType, entityVersion, index, merged))
+      continue
+    }
+
+    // Half-wise preservation: SET halves whose composites are all present;
+    // leave halves with a missing-preserve attr untouched (no partial rewrite).
+    if (pkAllPresent) {
+      sets[index.pk.field] = composePk(schema, entityType, index, merged)
+    }
+    if (skAllPresent) {
+      sets[index.sk.field] = composeSk(schema, entityType, entityVersion, index, merged)
     }
   }
-  return result
-}
 
-/**
- * Thrown when an update provides some but not all composite attributes for a GSI.
- * Caught by Entity.update and converted to a tagged `ValidationError`.
- */
-export class PartialGsiCompositeError extends Error {
-  readonly indexName: string
-  readonly provided: ReadonlyArray<string>
-  readonly missing: ReadonlyArray<string>
-  readonly required: ReadonlyArray<string>
-
-  constructor(
-    indexName: string,
-    provided: ReadonlyArray<string>,
-    missing: ReadonlyArray<string>,
-    required: ReadonlyArray<string>,
-  ) {
-    super(
-      `Partial GSI composite update on index "${indexName}": ` +
-        `provided [${provided.join(", ")}] but missing [${missing.join(", ")}]. ` +
-        `When updating any composite for a GSI, all composites must be provided: [${required.join(", ")}]`,
-    )
-    this.name = "PartialGsiCompositeError"
-    this.indexName = indexName
-    this.provided = provided
-    this.missing = missing
-    this.required = required
-  }
+  return { sets, removes }
 }
 
 /**

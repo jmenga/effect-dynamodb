@@ -864,7 +864,7 @@ import { KeyComposer } from "effect-dynamodb"
 | `composeIndexKeys` | `(schema, entity, index, record) => Record` | Compose all key attributes for an index |
 | `tryComposeIndexKeys` | `(schema, entity, index, record) => Record \| undefined` | Non-throwing variant for sparse GSIs |
 | `composeAllKeys` | `(schema, entity, indexes, record) => Record` | Compose keys for all indexes |
-| `composeGsiKeysForUpdate` | `(schema, entity, indexes, record, updates) => Record` | Compose GSI keys for update payloads |
+| `composeGsiKeysForUpdatePolicyAware` | `(schema, entity, indexes, updates, keyRecord, { removedSet? }) => { sets, removes }` | Policy-aware GSI key composition for update/append (sparse/preserve per `indexPolicy`) |
 | `composeSortKeyPrefix` | `(schema, entity, index, composites) => string` | Partial SK prefix for `begins_with` queries |
 | `extractComposites` | `(keyPart, record) => string[]` | Extract composite attribute values from a record |
 | `tryExtractComposites` | `(keyPart, record) => string[] \| undefined` | Non-throwing variant |
@@ -875,7 +875,10 @@ import { KeyComposer } from "effect-dynamodb"
 | Type | Description |
 |------|-------------|
 | `KeyPart` | `{ field: string, composite: string[] }` |
-| `IndexDefinition` | `{ pk: KeyPart, sk: KeyPart, index?, collection?, type?, casing? }` |
+| `IndexDefinition` | `{ pk: KeyPart, sk: KeyPart, index?, collection?, type?, casing?, indexPolicy? }` |
+| `IndexPolicyAttr` | `"sparse" \| "preserve"` |
+| `IndexPolicy` | `(item) => Partial<Record<string, IndexPolicyAttr>>` |
+| `GsiUpdateResult` | `{ sets: Record<string, string>, removes: ReadonlyArray<string> }` |
 
 ---
 

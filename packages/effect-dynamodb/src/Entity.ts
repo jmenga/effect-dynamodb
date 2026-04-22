@@ -2698,56 +2698,6 @@ const makeImpl = <
             counter++
           }
 
-          // Shared sets for GSI removal detection (used by both compose and REMOVE)
-          const removedSet = uState.remove ? new Set(uState.remove) : undefined
-          const pkCompositeSet = new Set(primaryKeyComposites(config.indexes))
-
-          // Compose GSI keys for indexes whose composites are in the update,
-          // filtering out any GSI whose composites are targeted by REMOVE
-          const indexesForGsiUpdate = removedSet
-            ? (() => {
-                const filtered: globalThis.Record<string, IndexDefinition> = {}
-                for (const [indexName, indexDef] of Object.entries(allIndexes)) {
-                  if (!("index" in indexDef)) {
-                    filtered[indexName] = indexDef
-                    continue
-                  }
-                  const gsiComposites = [...indexDef.pk.composite, ...indexDef.sk.composite].filter(
-                    (attr) => !pkCompositeSet.has(attr),
-                  )
-                  if (!gsiComposites.some((attr) => removedSet.has(attr))) {
-                    filtered[indexName] = indexDef
-                  }
-                }
-                return filtered
-              })()
-            : allIndexes
-          let gsiKeys: globalThis.Record<string, string>
-          try {
-            gsiKeys = KeyComposer.composeGsiKeysForUpdate(
-              schema,
-              entityType,
-              entityVersion,
-              indexesForGsiUpdate,
-              hydratedUpdates as globalThis.Record<string, unknown>,
-              decodedKey as globalThis.Record<string, unknown>,
-            )
-          } catch (e) {
-            return yield* new ValidationError({
-              entityType,
-              operation: "update.gsiComposites",
-              cause: e instanceof Error ? e.message : e,
-            })
-          }
-          for (const [field, value] of Object.entries(gsiKeys)) {
-            const nameKey = `#u${counter}`
-            const valKey = `:u${counter}`
-            names[nameKey] = field
-            values[valKey] = toAttributeValue(value)
-            setClauses.push(`${nameKey} = ${valKey}`)
-            counter++
-          }
-
           // Add updatedAt timestamp (encoding-aware)
           if (systemFields.updatedAt) {
             const nameKey = `#u${counter}`
@@ -2797,6 +2747,7 @@ const makeImpl = <
           }
 
           // REMOVE
+          const removedSet = uState.remove ? new Set(uState.remove) : undefined
           if (uState.remove) {
             for (const attr of uState.remove) {
               const nameKey = `#r${removeClauses.length}`
@@ -2805,23 +2756,31 @@ const makeImpl = <
             }
           }
 
-          // Cascade REMOVE to GSI key fields: when a removed attribute is a GSI
-          // composite, the GSI pk/sk fields must also be removed so the item drops
-          // out of the sparse index.
-          if (removedSet) {
-            for (const [, indexDef] of Object.entries(allIndexes)) {
-              if (!("index" in indexDef)) continue
-              const gsiComposites = [...indexDef.pk.composite, ...indexDef.sk.composite].filter(
-                (attr) => !pkCompositeSet.has(attr),
-              )
-              if (gsiComposites.some((attr) => removedSet.has(attr))) {
-                for (const keyField of [indexDef.pk.field, indexDef.sk.field]) {
-                  const nameKey = `#r${removeClauses.length}`
-                  names[nameKey] = keyField
-                  removeClauses.push(nameKey)
-                }
-              }
-            }
+          // Policy-aware GSI key composition. One call covers SETs (full
+          // recompose or half-wise), sparse dropout REMOVEs, and cascade
+          // REMOVEs when an Entity.remove() targets a GSI composite.
+          // See DESIGN.md §7 Policy-Aware GSI Composition.
+          const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+            schema,
+            entityType,
+            entityVersion,
+            allIndexes,
+            hydratedUpdates as globalThis.Record<string, unknown>,
+            decodedKey as globalThis.Record<string, unknown>,
+            { removedSet },
+          )
+          for (const [field, value] of Object.entries(gsiUpdate.sets)) {
+            const nameKey = `#u${counter}`
+            const valKey = `:u${counter}`
+            names[nameKey] = field
+            values[valKey] = toAttributeValue(value)
+            setClauses.push(`${nameKey} = ${valKey}`)
+            counter++
+          }
+          for (const keyField of gsiUpdate.removes) {
+            const nameKey = `#r${removeClauses.length}`
+            names[nameKey] = keyField
+            removeClauses.push(nameKey)
           }
 
           // ADD (atomic numeric increment / set addition)
@@ -3537,40 +3496,73 @@ const makeImpl = <
       }
 
       // GSI key recomposition: any GSI whose composites are touched by input.
-      // Reuses the same machinery as `.update()`. PK composites are excluded
-      // from the update payload: they're already in the key and never change
-      // during an append. Non-PK composites that overlap between appendInput
-      // and a GSI trigger recomposition, which requires the full GSI composite
-      // set (partial presence raises `PartialGsiCompositeError`).
+      // Reuses the policy-aware helper from `.update()`. PK composites are
+      // excluded from the update payload — they're already in the key and
+      // never change during an append. Non-PK composites in appendInput that
+      // overlap a GSI's composites trigger per-GSI resolution via indexPolicy.
       const nonPkAppendFields: globalThis.Record<string, unknown> = {}
       for (const [attr, val] of Object.entries(decoded)) {
         if (!pkCompositeSet.has(attr)) {
           nonPkAppendFields[attr] = val
         }
       }
-      let gsiKeys: globalThis.Record<string, string>
-      try {
-        gsiKeys = KeyComposer.composeGsiKeysForUpdate(
-          schema,
-          entityType,
-          entityVersion,
-          allIndexes,
-          nonPkAppendFields,
-          decoded,
-        )
-      } catch (e) {
-        return yield* new ValidationError({
-          entityType,
-          operation: "append.gsiComposites",
-          cause: e instanceof Error ? e.message : e,
-        })
+
+      // At append-time, indexPolicy is restricted to composites that are
+      // members of appendInput. Non-appendInput composites are owned by
+      // other writers and are by contract never touched by .append(); their
+      // policy cannot fire at append-time. Each GSI's indexPolicy return is
+      // filtered to appendInput attrs only — non-appendInput keys fall through
+      // to the implicit `"preserve"` default, leaving the half containing
+      // them untouched.
+      const appendInputFieldSet = new Set<string>(
+        Object.keys(
+          (appendInputSchema as unknown as { fields?: globalThis.Record<string, unknown> })
+            .fields ?? {},
+        ),
+      )
+      const policyAwareIndexes: globalThis.Record<string, IndexDefinition> = {}
+      for (const [indexName, indexDef] of Object.entries(allIndexes)) {
+        if (!indexDef.indexPolicy) {
+          policyAwareIndexes[indexName] = indexDef
+          continue
+        }
+        const originalPolicy = indexDef.indexPolicy
+        policyAwareIndexes[indexName] = {
+          ...indexDef,
+          indexPolicy: (item) => {
+            const raw = originalPolicy(item)
+            const filtered: Partial<globalThis.Record<string, KeyComposer.IndexPolicyAttr>> = {}
+            for (const [attr, policy] of Object.entries(raw)) {
+              if (appendInputFieldSet.has(attr) && policy !== undefined) {
+                filtered[attr] = policy
+              }
+            }
+            return filtered
+          },
+        }
       }
-      for (const [field, value] of Object.entries(gsiKeys)) {
+
+      const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        entityType,
+        entityVersion,
+        policyAwareIndexes,
+        nonPkAppendFields,
+        decoded,
+      )
+      for (const [field, value] of Object.entries(gsiUpdate.sets)) {
         const nameKey = `#a${counter}`
         const valKey = `:a${counter}`
         names[nameKey] = field
         values[valKey] = toAttributeValue(value)
         setClauses.push(`${nameKey} = ${valKey}`)
+        counter++
+      }
+      const appendRemoveClauses: Array<string> = []
+      for (const keyField of gsiUpdate.removes) {
+        const nameKey = `#a${counter}`
+        names[nameKey] = keyField
+        appendRemoveClauses.push(nameKey)
         counter++
       }
 
@@ -3614,7 +3606,10 @@ const makeImpl = <
         Object.assign(values, uc.values)
       }
 
-      const updateExpression = `SET ${setClauses.join(", ")}`
+      const exprParts: Array<string> = []
+      if (setClauses.length > 0) exprParts.push(`SET ${setClauses.join(", ")}`)
+      if (appendRemoveClauses.length > 0) exprParts.push(`REMOVE ${appendRemoveClauses.join(", ")}`)
+      const updateExpression = exprParts.join(" ")
 
       // ---------- Build Put of event item ----------
       const eventSk = KeyComposer.composeEventSk(currentSk, newObValue, schema.casing)

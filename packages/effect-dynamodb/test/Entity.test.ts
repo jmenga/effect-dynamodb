@@ -3316,17 +3316,141 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("update with partial GSI composites causes natural key composition error", () =>
-      Effect.gen(function* () {
-        // Partial composites (tenantId without region) causes extractComposites
-        // to throw during GSI key recomposition — surfaces as a defect (Die)
-        const exit = yield* SparseUpdateEntity.update({ userId: "u-1" })
-          .pipe(Entity.set({ tenantId: "t-2" }))
-          .asEffect()
-          .pipe(Effect.exit)
+    it.effect(
+      "update with partial GSI composites (default preserve) touches only the provided half",
+      () =>
+        Effect.gen(function* () {
+          mockUpdateItem.mockResolvedValueOnce({
+            Attributes: toAttributeMap({
+              userId: "u-1",
+              name: "Test",
+              tenantId: "t-2",
+              region: "us-east-1",
+              email: "a@b.com",
+              pk: "$myapp#v1#tenantuser#userid_u-1",
+              sk: "$myapp#v1#tenantuser",
+              __edd_e__: "TenantUser",
+            }),
+          })
 
-        // extractComposites throws synchronously → becomes a fiber defect
-        expect(exit._tag).toBe("Failure")
+          // Only tenantId provided; region (sk composite) is missing. With the
+          // default `preserve` policy, pk is SET (fully resolvable) and sk is
+          // left alone — the stored gsi1sk is preserved. No throw.
+          yield* SparseUpdateEntity.update({ userId: "u-1" }).pipe(
+            Entity.set({ tenantId: "t-2" }),
+            Entity.asModel,
+          )
+
+          const call = mockUpdateItem.mock.calls[0]![0]
+          const names = Object.values(call.ExpressionAttributeNames) as string[]
+          // pk half SET
+          expect(names).toContain("gsi1pk")
+          // sk half neither SET nor REMOVEd — preserved
+          expect(names).not.toContain("gsi1sk")
+          // No REMOVE clause for GSI fields
+          const expr = call.UpdateExpression as string
+          if (expr.includes("REMOVE")) {
+            expect(expr).not.toMatch(/REMOVE[^S]*gsi1/)
+          }
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("update with indexPolicy sparse drops item out of the GSI on partial", () =>
+      Effect.gen(function* () {
+        const SparseDropEntity = withConfig(
+          Entity.make({
+            model: TenantUser,
+            entityType: "TenantUser",
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            indexes: {
+              byTenant: {
+                name: "gsi1",
+                pk: { field: "gsi1pk", composite: ["tenantId"] },
+                sk: { field: "gsi1sk", composite: ["region"] },
+                indexPolicy: () => ({ region: "sparse" as const }),
+              },
+            },
+          }),
+        )
+
+        mockUpdateItem.mockResolvedValueOnce({
+          Attributes: toAttributeMap({
+            userId: "u-1",
+            name: "Test",
+            tenantId: "t-2",
+            region: "us-east-1",
+            email: "a@b.com",
+            pk: "$myapp#v1#tenantuser#userid_u-1",
+            sk: "$myapp#v1#tenantuser",
+            __edd_e__: "TenantUser",
+          }),
+        })
+
+        // region is 'sparse' and missing → REMOVE both gsi1 key fields.
+        yield* SparseDropEntity.update({ userId: "u-1" }).pipe(
+          Entity.set({ tenantId: "t-2" }),
+          Entity.asModel,
+        )
+
+        const call = mockUpdateItem.mock.calls[0]![0]
+        const names = Object.values(call.ExpressionAttributeNames) as string[]
+        expect(names).toContain("gsi1pk")
+        expect(names).toContain("gsi1sk")
+        const expr = call.UpdateExpression as string
+        // REMOVE clause should cover both GSI key fields (the item drops out)
+        expect(expr).toContain("REMOVE")
+        // gsi1pk and gsi1sk appear only in REMOVE, not SET
+        expect(expr).not.toMatch(/SET[^R]*gsi1pk/)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("update with indexPolicy preserve (explicit) leaves GSI untouched on partial", () =>
+      Effect.gen(function* () {
+        const ExplicitPreserveEntity = withConfig(
+          Entity.make({
+            model: TenantUser,
+            entityType: "TenantUser",
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            indexes: {
+              byTenant: {
+                name: "gsi1",
+                pk: { field: "gsi1pk", composite: ["tenantId"] },
+                sk: { field: "gsi1sk", composite: ["region"] },
+                indexPolicy: () => ({ tenantId: "preserve" as const, region: "preserve" as const }),
+              },
+            },
+          }),
+        )
+
+        mockUpdateItem.mockResolvedValueOnce({
+          Attributes: toAttributeMap({
+            userId: "u-1",
+            name: "Updated",
+            tenantId: "t-1",
+            region: "us-east-1",
+            email: "a@b.com",
+            pk: "$myapp#v1#tenantuser#userid_u-1",
+            sk: "$myapp#v1#tenantuser",
+            __edd_e__: "TenantUser",
+          }),
+        })
+
+        // region missing, tenantId provided — pk set, sk untouched (preserve).
+        yield* ExplicitPreserveEntity.update({ userId: "u-1" }).pipe(
+          Entity.set({ tenantId: "t-2" }),
+          Entity.asModel,
+        )
+
+        const call = mockUpdateItem.mock.calls[0]![0]
+        const names = Object.values(call.ExpressionAttributeNames) as string[]
+        expect(names).toContain("gsi1pk")
+        expect(names).not.toContain("gsi1sk")
       }).pipe(Effect.provide(TestLayer)),
     )
 

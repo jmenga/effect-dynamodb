@@ -1994,3 +1994,224 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
     )
   })
 })
+
+// ---------------------------------------------------------------------------
+// indexPolicy integration tests — hybrid-writer GSI semantics against a
+// real DynamoDB Local. Mirrors the telemetry pipeline motivating example
+// from issue #11: one GSI is sparse on a per-event attr (alertState), a
+// second is preserved across writers (tenantId). Proves end-to-end that:
+//   - Sparse drop-out during update makes items disappear from GSI queries.
+//   - Preserve leaves stored GSI keys intact and items remain queryable.
+//   - Re-adding a sparse composite re-indexes the item.
+//   - Two writers with disjoint attrs don't clobber each other's GSI state.
+// ---------------------------------------------------------------------------
+
+class Device extends Schema.Class<Device>("Device")({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  tenantId: Schema.optional(Schema.String),
+  alertState: Schema.optional(Schema.Literals(["active", "cleared"])),
+  region: Schema.optional(Schema.String),
+  label: Schema.optional(Schema.String),
+}) {}
+
+const ipSchema = DynamoSchema.make({ name: "ip-test", version: 1 })
+const ipTableName = `ip-test-${Date.now()}`
+
+const Devices = Entity.make({
+  model: Device,
+  entityType: "Device",
+  primaryKey: {
+    pk: { field: "pk", composite: ["channel", "deviceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    // Sparse: ingest events may or may not include alertState. When absent,
+    // the item drops out of the index. When present, recompose.
+    byAlert: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["alertState"] },
+      sk: { field: "gsi1sk", composite: ["deviceId"] },
+      indexPolicy: () => ({ alertState: "sparse" as const }),
+    },
+    // Preserve: tenantId is owned by an enrichment writer. Ingest-side
+    // updates that touch other composites (e.g. deviceId via key merge)
+    // must not disturb the pk half.
+    byTenant: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["tenantId"] },
+      sk: { field: "gsi2sk", composite: ["deviceId"] },
+      indexPolicy: () =>
+        ({ tenantId: "preserve" as const, deviceId: "preserve" as const }) as const,
+    },
+  },
+  timestamps: true,
+})
+
+const IpTable = Table.make({ schema: ipSchema, entities: { Devices } })
+const IpTestLayer = Layer.mergeAll(ClientLayer, IpTable.layer({ name: ipTableName }))
+const provideIp = Effect.provide(IpTestLayer)
+
+describeConnected("indexPolicy integration tests", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: ipTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(IpTable),
+        })
+      }).pipe(provideIp, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: ipTableName })
+      }).pipe(
+        provideIp,
+        Effect.scoped,
+        Effect.catchTag("DynamoError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("put with all composites → item queryable via both GSIs", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { Devices }, tables: { IpTable } })
+
+      yield* db.entities.Devices.put({
+        channel: "c-1",
+        deviceId: "d-1",
+        tenantId: "acme",
+        alertState: "active",
+        region: "us-east-1",
+        label: "initial",
+      })
+
+      const byAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
+      expect(byAlert).toHaveLength(1)
+      expect(byAlert[0]!.deviceId).toBe("d-1")
+
+      const byTenant = yield* db.entities.Devices.byTenant({ tenantId: "acme" }).collect()
+      expect(byTenant).toHaveLength(1)
+      expect(byTenant[0]!.deviceId).toBe("d-1")
+    }).pipe(provideIp),
+  )
+
+  it.effect("update with alertState null + sparse policy → item drops out of byAlert", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { Devices }, tables: { IpTable } })
+
+      // Pre-seed an indexed item.
+      yield* db.entities.Devices.put({
+        channel: "c-2",
+        deviceId: "d-2",
+        tenantId: "acme",
+        alertState: "active",
+        region: "us-east-1",
+      })
+      const before = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
+      expect(before.some((d) => d.deviceId === "d-2")).toBe(true)
+
+      // Update explicitly nulling alertState — sparse policy must drop the item.
+      yield* db.entities.Devices.update(
+        { channel: "c-2", deviceId: "d-2" },
+        Entity.set({ alertState: undefined, label: "cleared" }),
+      )
+
+      const afterDrop = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
+      expect(afterDrop.some((d) => d.deviceId === "d-2")).toBe(false)
+
+      // byTenant unaffected — preserve policy left its keys intact.
+      const tenant = yield* db.entities.Devices.byTenant({ tenantId: "acme" }).collect()
+      expect(tenant.some((d) => d.deviceId === "d-2")).toBe(true)
+    }).pipe(provideIp),
+  )
+
+  it.effect("re-adding alertState → item reappears in byAlert", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { Devices }, tables: { IpTable } })
+
+      yield* db.entities.Devices.update(
+        { channel: "c-2", deviceId: "d-2" },
+        Entity.set({ alertState: "cleared" }),
+      )
+
+      const byCleared = yield* db.entities.Devices.byAlert({ alertState: "cleared" }).collect()
+      expect(byCleared.some((d) => d.deviceId === "d-2")).toBe(true)
+    }).pipe(provideIp),
+  )
+
+  it.effect(
+    "update touching non-composite attr only: sparse GSI drops, preserve GSI untouched",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: { Devices }, tables: { IpTable } })
+
+        yield* db.entities.Devices.put({
+          channel: "c-3",
+          deviceId: "d-3",
+          tenantId: "globex",
+          alertState: "active",
+        })
+
+        // Sanity check: item initially indexed in both.
+        const initialAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
+        const initialTenant = yield* db.entities.Devices.byTenant({ tenantId: "globex" }).collect()
+        expect(initialAlert.some((d) => d.deviceId === "d-3")).toBe(true)
+        expect(initialTenant.some((d) => d.deviceId === "d-3")).toBe(true)
+
+        // Update sets only `label` — neither alertState nor tenantId in payload.
+        // byAlert declares sparse on alertState → always evaluated → alertState
+        // absent from payload → REMOVE (drops from sparse GSI).
+        // byTenant declares preserve on tenantId → always evaluated → tenantId
+        // absent + preserve → leave half alone (stays in GSI).
+        yield* db.entities.Devices.update(
+          { channel: "c-3", deviceId: "d-3" },
+          Entity.set({ label: "labelled" }),
+        )
+
+        const byAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
+        const byTenant = yield* db.entities.Devices.byTenant({ tenantId: "globex" }).collect()
+        expect(byAlert.some((d) => d.deviceId === "d-3")).toBe(false)
+        expect(byTenant.some((d) => d.deviceId === "d-3")).toBe(true)
+      }).pipe(provideIp),
+  )
+
+  it.effect("hybrid writers: ingest + enrichment updates preserve each other's GSI state", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { Devices }, tables: { IpTable } })
+
+      // Initial state: neither tenantId nor alertState known — item not in either GSI.
+      yield* db.entities.Devices.put({ channel: "c-4", deviceId: "d-4" })
+
+      // Enrichment writer: sets tenantId.
+      yield* db.entities.Devices.update(
+        { channel: "c-4", deviceId: "d-4" },
+        Entity.set({ tenantId: "initech" }),
+      )
+
+      // Verify byTenant now has the item.
+      const afterEnrich = yield* db.entities.Devices.byTenant({ tenantId: "initech" }).collect()
+      expect(afterEnrich.some((d) => d.deviceId === "d-4")).toBe(true)
+
+      // Ingest writer: sets alertState without touching tenantId (not in payload).
+      // tenantId has preserve policy → byTenant remains intact.
+      yield* db.entities.Devices.update(
+        { channel: "c-4", deviceId: "d-4" },
+        Entity.set({ alertState: "active" }),
+      )
+
+      const byAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
+      const byTenant = yield* db.entities.Devices.byTenant({ tenantId: "initech" }).collect()
+
+      expect(byAlert.some((d) => d.deviceId === "d-4")).toBe(true)
+      // Critical: byTenant still populated — ingest didn't clobber the enrichment-owned half.
+      expect(byTenant.some((d) => d.deviceId === "d-4")).toBe(true)
+    }).pipe(provideIp),
+  )
+})

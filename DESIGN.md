@@ -600,6 +600,80 @@ PK: (same as current item)
 SK: ${schema}#{version}#{entityType}#deleted#{isoTimestamp}
 ```
 
+### Policy-Aware GSI Composition (update & append)
+
+**Problem.** GSI composite attributes can be owned by different writers ("hybrid GSIs"). A device-ingest writer owns `timestamp` + `alertState`; an enrichment writer owns `accountId`. A GSI with composites `[accountId, alertState]` on one half and `[timestamp]` on the other is touched by *every* ingest event (via `timestamp`), but the ingest writer can't supply `accountId` without an extra read. Three semantically distinct intents share one signal ("composite X is absent from the update payload"):
+
+| Intent | Library action | Stored key attr |
+|---|---|---|
+| **Sparse** — item no longer belongs in this GSI | `REMOVE gsiNpk, gsiNsk` | Deleted |
+| **Preserve** — another writer owns this composite; leave alone | Do not touch `gsiNpk`/`gsiNsk` | Untouched |
+| **Recompose** — all composites present | SET both keys | Rewritten |
+
+**API.** Each GSI may declare an `indexPolicy`:
+
+```ts
+indexes: {
+  byAccountAlert: {
+    name: "gsi6",
+    pk: { field: "gsi6pk", composite: ["accountId", "alertState"] },
+    sk: { field: "gsi6sk", composite: ["timestamp"] },
+    indexPolicy: (item) => ({
+      accountId:  "preserve",   // enrichment-owned, ingest never touches
+      alertState: "preserve",   // set on alert events; plain ingest doesn't touch
+      timestamp:  "sparse",     // if somehow absent, drop from GSI
+    }),
+  },
+}
+```
+
+- Per-attribute map of composite attr → `'sparse' | 'preserve'`.
+- Default for any composite not returned by the function (or when no function is declared): `'preserve'`.
+- Only `'sparse'` and `'preserve'` are valid values. There is no `'required'` policy; consumers who want strict caller-error validation enforce it in their own update layer.
+
+**Decision rules.** For each GSI touched by an update/append, given merged payload `M = { ...primaryKey, ...payload }`:
+
+1. Resolve per-composite policy: `p(a) = indexPolicy?.(M)?.[a] ?? "preserve"`.
+2. Classify each composite `a`:
+   - `present` if `a` in `M` and `M[a]` is not null/undefined.
+   - `missing-sparse` if absent and `p(a) === "sparse"`.
+   - `missing-preserve` if absent and `p(a) === "preserve"`.
+3. Decide the GSI's fate:
+   - **Any `missing-sparse`** → REMOVE `gsiNpk` and `gsiNsk`. Sparse wins.
+   - **All composites present** → SET both halves (recompose).
+   - **Mixed (some `missing-preserve`, no `missing-sparse`)** → evaluate pk and sk *independently*:
+     - Half fully present → SET that half.
+     - Half has a `missing-preserve` composite → leave that half alone (no SET, no REMOVE). This avoids the `acc#undefined` garbage that partial rewriting would produce.
+
+**`Entity.remove([attr])` cascade.** When an update's REMOVE list contains a composite attribute, the whole GSI is dropped (REMOVE both keys) regardless of `indexPolicy`. This is existing behavior and takes precedence — `remove(["tenantId"])` means "the item no longer belongs in the tenant index."
+
+**Evaluation gate.** Determines when a GSI is evaluated on update/append:
+
+- **GSI declares `indexPolicy`** → evaluated on **every** update/append. Policy-first semantics: the declaration is a statement about the GSI's membership invariant, so the library applies it unconditionally — absence from payload is equivalent to absence from the item, per the policy. This matches TypeScript's `exactOptionalPropertyTypes` intuition where `{ foo: undefined }` and `{}` are structurally distinct at the type level but should behave identically at runtime under declarative policy.
+- **GSI has no `indexPolicy`** → evaluated only when at least one of its composites is in the update payload, or when `Entity.remove([attr])` names one of its composites. Preserves conventional DynamoDB partial-update semantics for entities that haven't opted into policy-driven indexing.
+
+**`put()` semantics (unchanged).** `put()` does not consult `indexPolicy`. It writes a complete item from scratch — any missing composite means "this item is not in that GSI." The existing `tryComposeIndexKeys` path (omit GSI keys when any composite is absent) is preserved as-is. `indexPolicy` exists specifically to resolve the update/append ambiguity, not the put case.
+
+**`.append()` semantics (time-series).** `indexPolicy` applies. The policy function is invoked with `item = { ...primaryKey, ...appendInput }` — not a merged current item (append intentionally does no read). Two constraints enforced at `Entity.make()`:
+
+1. Returned policy keys must be composites of the GSI (same check as update).
+2. At append, returned keys must additionally be members of `appendInput`. Composites outside `appendInput` cannot have policy at append-time — they are by contract never changed by an append, and their half is always either (a) untouched (preserve default) if partial, or (b) fully recomposed if the other half's composites are all in appendInput.
+
+The library-managed REMOVE of `gsiNpk`/`gsiNsk` on sparse-policy dropout *does* write fields outside `appendInput`, but those are key-management fields, not user data — the `appendInput` enrichment-preservation contract applies to user-data fields only.
+
+**Decision table (worked).** GSI with `pk.composite = [A]`, `sk.composite = [B, C]`:
+
+| Policy | Payload | Result |
+|---|---|---|
+| no policy | `{A, B, C}` | SET both halves |
+| no policy | `{A}` | SET pk; sk untouched |
+| no policy | `{B}` | pk untouched; sk untouched (C missing, preserve) |
+| no policy | `{B, C}` | pk untouched; SET sk |
+| `A: 'sparse'` | `{B, C}` | REMOVE both (A missing sparse) |
+| `B: 'sparse', C: 'preserve'` | `{A, C}` | REMOVE both (B missing sparse) |
+| `A: 'preserve'` explicit | `{B, C}` | pk untouched; SET sk (same as default) |
+| cascade: REMOVE `[A]` | any | REMOVE both (cascade overrides policy) |
+
 ---
 
 ## 8. Date & Time Handling

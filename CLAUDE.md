@@ -281,6 +281,7 @@ Do NOT:
 | `tutorials/human-resources.mdx` | `examples/hr.ts` |
 | `guides/modeling.mdx` | `examples/guide-modeling.ts` |
 | `guides/indexes.mdx` | `examples/guide-indexes.ts` |
+| `guides/index-policy.mdx` | `examples/guide-index-policy.ts` |
 | `guides/queries.mdx` | `examples/guide-queries.ts` |
 | `guides/expressions.mdx` | `examples/guide-expressions.ts` |
 | `guides/timeseries.mdx` | `examples/guide-timeseries.ts` |
