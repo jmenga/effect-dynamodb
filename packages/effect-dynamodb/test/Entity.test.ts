@@ -1915,6 +1915,62 @@ describe("Entity", () => {
         expect(error._tag).toBe("ItemNotFound")
       }).pipe(Effect.provide(TestLayer)),
     )
+
+    // Regression: update SET values marshalled via toAttributeValue previously
+    // threw on Schema.Class instances because convertClassInstanceToMap was not
+    // passed. https://github.com/jmenga/effect-dynamodb/issues/12
+    it.effect("SET accepts a Schema.Class-valued field (nested class instance)", () => {
+      class Point extends Schema.Class<Point>("Point")({
+        type: Schema.Literal("Point"),
+        coordinates: Schema.Array(Schema.Number),
+      }) {}
+      class Device extends Schema.Class<Device>("Device")({
+        deviceId: Schema.String,
+        location: Schema.optional(Point),
+      }) {}
+      const DeviceEntity = withConfig(
+        Entity.make({
+          model: Device,
+          entityType: "Device",
+          primaryKey: {
+            pk: { field: "pk", composite: ["deviceId"] },
+            sk: { field: "sk", composite: [] },
+          },
+        }),
+      )
+
+      return Effect.gen(function* () {
+        mockUpdateItem.mockResolvedValueOnce({
+          Attributes: toAttributeMap({
+            deviceId: "d-1",
+            location: { type: "Point", coordinates: [-87.6298, 41.8781] },
+            pk: "$myapp#v1#device#d-1",
+            sk: "$myapp#v1#device",
+            __edd_e__: "Device",
+          }),
+        })
+
+        const point = new Point({ type: "Point", coordinates: [-87.6298, 41.8781] })
+        yield* DeviceEntity.update({ deviceId: "d-1" }).pipe(
+          Entity.set({ location: point }),
+          Entity.asModel,
+        )
+
+        expect(mockUpdateItem).toHaveBeenCalledOnce()
+        const call = mockUpdateItem.mock.calls[0]![0]
+        // The class instance marshalls as a map with the inner Point as a nested map.
+        const valueKey = Object.keys(call.ExpressionAttributeValues).find(
+          (k) => call.ExpressionAttributeValues[k].M,
+        )
+        expect(valueKey).toBeDefined()
+        expect(call.ExpressionAttributeValues[valueKey!]).toEqual({
+          M: {
+            type: { S: "Point" },
+            coordinates: { L: [{ N: "-87.6298" }, { N: "41.8781" }] },
+          },
+        })
+      }).pipe(Effect.provide(TestLayer))
+    })
   })
 
   // ---------------------------------------------------------------------------

@@ -456,4 +456,80 @@ describe("TimeSeries — append payload shape", () => {
       expect(nameVals).toContain("gpio")
     }).pipe(Effect.provide(layer))
   })
+
+  // Regression: class-instance values in appendInput were marshalled via
+  // toAttributeValue without convertClassInstanceToMap, throwing at runtime.
+  // https://github.com/jmenga/effect-dynamodb/issues/12
+  it.effect("append accepts a nested Schema.Class instance in the SET clause", () => {
+    class Point extends Schema.Class<Point>("Point")({
+      type: Schema.Literal("Point"),
+      coordinates: Schema.Array(Schema.Number),
+    }) {}
+    class Reading extends Schema.Class<Reading>("Reading")({
+      channel: Schema.String,
+      deviceId: Schema.String,
+      timestamp: Schema.DateTimeUtc,
+      geometry: Schema.optional(Point),
+    }) {}
+    const AppendInput = Schema.Struct({
+      channel: Schema.String,
+      deviceId: Schema.String,
+      timestamp: Schema.DateTimeUtc,
+      geometry: Schema.optional(Point),
+    })
+
+    const entity = Entity.make({
+      model: Reading,
+      entityType: "Reading",
+      primaryKey: {
+        pk: { field: "pk", composite: ["channel", "deviceId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      timeSeries: {
+        orderBy: "timestamp",
+        appendInput: AppendInput,
+      },
+    })
+    const { entity: wired, tableLayer } = makeEntityWithTag(entity)
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      mockTransactWriteItems.mockResolvedValueOnce({})
+      mockGetItem.mockResolvedValueOnce({
+        Item: {
+          pk: { S: "$tsapp#v1#reading#c-1#d-7" },
+          sk: { S: "$tsapp#v1#reading_1" },
+          channel: { S: "c-1" },
+          deviceId: { S: "d-7" },
+          timestamp: { S: "2026-04-22T10:00:00.000Z" },
+          geometry: {
+            M: {
+              type: { S: "Point" },
+              coordinates: { L: [{ N: "-87.6298" }, { N: "41.8781" }] },
+            },
+          },
+          __edd_e__: { S: "Reading" },
+        },
+      })
+
+      yield* wired.append({
+        channel: "c-1",
+        deviceId: "d-7",
+        timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+        geometry: new Point({ type: "Point", coordinates: [-87.6298, 41.8781] }),
+      })
+
+      const call = mockTransactWriteItems.mock.calls[0]![0]
+      // Update SET clause marshalls the class instance as a map.
+      const update = call.TransactItems[0].Update
+      const mapValue = Object.values(update.ExpressionAttributeValues).find(
+        (v: any) => v.M?.type?.S === "Point",
+      ) as any
+      expect(mapValue).toBeDefined()
+      expect(mapValue.M.coordinates.L).toEqual([{ N: "-87.6298" }, { N: "41.8781" }])
+      // Put of event item also marshalls through toAttributeMap (already worked).
+      const put = call.TransactItems[1].Put
+      expect(put.Item.geometry.M.type.S).toBe("Point")
+    }).pipe(Effect.provide(layer))
+  })
 })
