@@ -124,6 +124,10 @@ jobs:
           PREV_TAG=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -vx "$AGG_TAG" | head -1 || true)
           echo "Previous aggregate tag: ${PREV_TAG:-<none>}"
 
+          # Annotated tags require a committer identity; runners don't have one
+          # by default. Use the GitHub Actions bot identity.
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
           git tag -a "$AGG_TAG" -m "$AGG_TAG"
           git push origin "$AGG_TAG"
 
