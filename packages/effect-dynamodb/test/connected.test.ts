@@ -2146,38 +2146,40 @@ describeConnected("indexPolicy integration tests", () => {
     }).pipe(provideIp),
   )
 
-  it.effect("update touching non-composite attr only: sparse GSI drops, preserve GSI untouched", () =>
-    Effect.gen(function* () {
-      const db = yield* DynamoClient.make({ entities: { Devices }, tables: { IpTable } })
+  it.effect(
+    "update touching non-composite attr only: sparse GSI drops, preserve GSI untouched",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: { Devices }, tables: { IpTable } })
 
-      yield* db.entities.Devices.put({
-        channel: "c-3",
-        deviceId: "d-3",
-        tenantId: "globex",
-        alertState: "active",
-      })
+        yield* db.entities.Devices.put({
+          channel: "c-3",
+          deviceId: "d-3",
+          tenantId: "globex",
+          alertState: "active",
+        })
 
-      // Sanity check: item initially indexed in both.
-      const initialAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
-      const initialTenant = yield* db.entities.Devices.byTenant({ tenantId: "globex" }).collect()
-      expect(initialAlert.some((d) => d.deviceId === "d-3")).toBe(true)
-      expect(initialTenant.some((d) => d.deviceId === "d-3")).toBe(true)
+        // Sanity check: item initially indexed in both.
+        const initialAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
+        const initialTenant = yield* db.entities.Devices.byTenant({ tenantId: "globex" }).collect()
+        expect(initialAlert.some((d) => d.deviceId === "d-3")).toBe(true)
+        expect(initialTenant.some((d) => d.deviceId === "d-3")).toBe(true)
 
-      // Update sets only `label` — neither alertState nor tenantId in payload.
-      // byAlert declares sparse on alertState → always evaluated → alertState
-      // absent from payload → REMOVE (drops from sparse GSI).
-      // byTenant declares preserve on tenantId → always evaluated → tenantId
-      // absent + preserve → leave half alone (stays in GSI).
-      yield* db.entities.Devices.update(
-        { channel: "c-3", deviceId: "d-3" },
-        Entity.set({ label: "labelled" }),
-      )
+        // Update sets only `label` — neither alertState nor tenantId in payload.
+        // byAlert declares sparse on alertState → always evaluated → alertState
+        // absent from payload → REMOVE (drops from sparse GSI).
+        // byTenant declares preserve on tenantId → always evaluated → tenantId
+        // absent + preserve → leave half alone (stays in GSI).
+        yield* db.entities.Devices.update(
+          { channel: "c-3", deviceId: "d-3" },
+          Entity.set({ label: "labelled" }),
+        )
 
-      const byAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
-      const byTenant = yield* db.entities.Devices.byTenant({ tenantId: "globex" }).collect()
-      expect(byAlert.some((d) => d.deviceId === "d-3")).toBe(false)
-      expect(byTenant.some((d) => d.deviceId === "d-3")).toBe(true)
-    }).pipe(provideIp),
+        const byAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
+        const byTenant = yield* db.entities.Devices.byTenant({ tenantId: "globex" }).collect()
+        expect(byAlert.some((d) => d.deviceId === "d-3")).toBe(false)
+        expect(byTenant.some((d) => d.deviceId === "d-3")).toBe(true)
+      }).pipe(provideIp),
   )
 
   it.effect("hybrid writers: ingest + enrichment updates preserve each other's GSI state", () =>
