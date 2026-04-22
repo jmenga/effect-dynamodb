@@ -114,6 +114,7 @@ Key design decisions:
 `DynamoClient.make({ entities })` is the typed execution gateway. It resolves dependencies, auto-discovers collections from entity index `collection` properties, and returns a client with bound entities where every method is ready to call.
 
 ```typescript title="main.ts" region="program" example="starter.ts"
+// #region program
 const program = Effect.gen(function* () {
   // Get typed client — binds all entities and collections
   const db = yield* DynamoClient.make({
@@ -121,10 +122,13 @@ const program = Effect.gen(function* () {
   })
 
   // --- Create the table (derived from entity definitions) ---
+  yield* Console.log("=== Setup ===\n")
 
   yield* db.tables["starter-table"]!.create()
+  yield* Console.log("Table created\n")
 
   // --- Put: create items ---
+  yield* Console.log("=== Put ===\n")
 
   const alice = yield* db.entities.Users.put({
     userId: "u-alice",
@@ -133,6 +137,7 @@ const program = Effect.gen(function* () {
     role: "admin",
     createdBy: "system",
   })
+  yield* Console.log(`Created user: ${alice.displayName} (${alice.email})`)
 
   yield* db.entities.Tasks.put({
     taskId: "t-1",
@@ -149,34 +154,49 @@ const program = Effect.gen(function* () {
     status: "in-progress",
     priority: 2,
   })
+  yield* Console.log("Created tasks: t-1, t-2\n")
 
   // --- Get: read by primary key ---
+  yield* Console.log("=== Get ===\n")
 
   const user = yield* db.entities.Users.get({ userId: "u-alice" })
+  yield* Console.log(`Got user: ${user.displayName} (role: ${user.role})`)
 
   const task = yield* db.entities.Tasks.get({ taskId: "t-1" })
+  yield* Console.log(`Got task: "${task.title}" (status: ${task.status})\n`)
 
   // --- Update ---
+  yield* Console.log("=== Update ===\n")
 
   // Note: status is a GSI composite, so we must also provide userId
   // (all composites for the GSI) so the key can be recomposed
-  const updated = yield* db.entities.Tasks.update(
-    { taskId: "t-1" },
-    Entity.set({ status: "done", userId: "u-alice" }),
-  )
+  const updated = yield* db.entities.Tasks.update({ taskId: "t-1" }).set({
+    status: "done",
+    userId: "u-alice",
+  })
+  yield* Console.log(`Updated task: "${updated.title}" -> ${updated.status}\n`)
 
   // --- Query: tasks by user via GSI index accessor ---
+  yield* Console.log("=== Query: Tasks by User (GSI) ===\n")
 
   const aliceTasks = yield* db.entities.Tasks.byUser({ userId: "u-alice" }).collect()
+  yield* Console.log(`Alice's tasks (${aliceTasks.length}):`)
+  for (const t of aliceTasks) {
+    yield* Console.log(`  ${t.taskId}: "${t.title}" — ${t.status}`)
+  }
+  yield* Console.log("")
 
   // --- Delete ---
+  yield* Console.log("=== Delete ===\n")
 
   yield* db.entities.Tasks.delete({ taskId: "t-1" })
   yield* db.entities.Tasks.delete({ taskId: "t-2" })
   yield* db.entities.Users.delete({ userId: "u-alice" })
+  yield* Console.log("Deleted all items\n")
 
   // --- Cleanup ---
   yield* db.tables["starter-table"]!.delete()
+  yield* Console.log("Table deleted.")
 })
 ```
 

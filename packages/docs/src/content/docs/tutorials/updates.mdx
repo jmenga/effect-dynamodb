@@ -86,15 +86,13 @@ const product = yield* db.entities.Products.put({
 `ADD` atomically increments a numeric attribute. If the attribute does not exist, DynamoDB initializes it to the provided value. This is thread-safe — no read-modify-write cycle needed.
 
 ```typescript region="add" example="updates.ts"
-const afterAdd = yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Entity.add({ viewCount: 1 }),
-)
-// Multiple adds compose
-const afterMultiAdd = yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Entity.add({ viewCount: 5, stock: 50 }),
-)
+  const afterAdd = yield* db.entities.Products.update({ productId: "p-1" }).add({ viewCount: 1 })
+
+  // Multiple adds compose
+  const afterMultiAdd = yield* db.entities.Products.update({ productId: "p-1" }).add({
+    viewCount: 5,
+    stock: 50,
+  })
 ```
 
 ---
@@ -104,10 +102,7 @@ const afterMultiAdd = yield* db.entities.Products.update(
 DynamoDB has no native `SUBTRACT` action. `Entity.subtract()` synthesizes `SET #field = #field - :val` for you:
 
 ```typescript region="subtract" example="updates.ts"
-const afterSub = yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Entity.subtract({ stock: 3 }),
-)
+  const afterSub = yield* db.entities.Products.update({ productId: "p-1" }).subtract({ stock: 3 })
 ```
 
 ---
@@ -117,10 +112,9 @@ const afterSub = yield* db.entities.Products.update(
 Appends elements to the end of a list attribute using DynamoDB's `list_append` function:
 
 ```typescript region="append" example="updates.ts"
-const afterAppend = yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Entity.append({ tags: ["on-sale", "featured"] }),
-)
+  const afterAppend = yield* db.entities.Products.update({ productId: "p-1" }).append({
+    tags: ["on-sale", "featured"],
+  })
 ```
 
 The value must be an array — each element is appended to the existing list.
@@ -132,10 +126,9 @@ The value must be an array — each element is appended to the existing list.
 `REMOVE` deletes attributes entirely from the item. The attribute no longer exists after removal (it becomes `undefined`, not `null`):
 
 ```typescript region="remove" example="updates.ts"
-const afterRemove = yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Entity.remove(["description"]),
-)
+  const afterRemove = yield* db.entities.Products.update({ productId: "p-1" }).remove([
+    "description",
+  ])
 ```
 
 ---
@@ -157,13 +150,11 @@ Entity.deleteFromSet({ fieldName: new Set(["value-to-remove"]) })
 All update combinators chain as methods on the `BoundUpdate` builder. They are merged into one `UpdateItem` call to DynamoDB:
 
 ```typescript region="composed" example="updates.ts"
-const composed = yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Products.set({ name: "Premium Wireless Mouse", price: 39.99 }),
-  Entity.add({ viewCount: 10 }),
-  Entity.subtract({ stock: 5 }),
-  Entity.append({ tags: ["premium"] }),
-)
+  const composed = yield* db.entities.Products.update({ productId: "p-1" })
+    .set({ name: "Premium Wireless Mouse", price: 39.99 })
+    .add({ viewCount: 10 })
+    .subtract({ stock: 5 })
+    .append({ tags: ["premium"] })
 ```
 
 One DynamoDB call produces: `name: "Premium Wireless Mouse"`, `price: 39.99`, `viewCount: 16` (was 6, added 10), `stock: 142` (was 147, subtracted 5), `tags: ["electronics", "accessories", "on-sale", "featured", "premium"]`.
@@ -177,23 +168,21 @@ This is a single atomic DynamoDB operation — all changes apply together or non
 Rich updates compose with `Entity.expectedVersion()` for concurrency control:
 
 ```typescript region="locking" example="updates.ts"
-const locked = yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Entity.add({ viewCount: 1 }),
-  Products.expectedVersion(6),
-)
+  const locked = yield* db.entities.Products.update({ productId: "p-1" })
+    .add({ viewCount: 1 })
+    .expectedVersion(6)
 
-// Wrong version → OptimisticLockError
-const lockFail = yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Entity.add({ viewCount: 1 }),
-  Products.expectedVersion(1),
-).pipe(
-  Effect.map(() => "updated"),
-  Effect.catchTag("OptimisticLockError", (e) =>
-    Effect.succeed(`OptimisticLockError: expected v${e.expectedVersion}`),
-  ),
-)
+  // Wrong version → OptimisticLockError
+  const lockFail = yield* db.entities.Products.update({ productId: "p-1" })
+    .add({ viewCount: 1 })
+    .expectedVersion(1)
+    .asEffect()
+    .pipe(
+      Effect.map(() => "updated"),
+      Effect.catchTag("OptimisticLockError", (e) =>
+        Effect.succeed(`OptimisticLockError: expected v${e.expectedVersion}`),
+      ),
+    )
 ```
 
 When the version in DynamoDB does not match the expected version, the update is rejected with an `OptimisticLockError`. This prevents lost updates in concurrent scenarios.

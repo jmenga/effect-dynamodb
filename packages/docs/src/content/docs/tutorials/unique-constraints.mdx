@@ -114,27 +114,30 @@ The sentinel item gets a `_ttl` attribute set to 30 minutes in the future. Dynam
 Create the first user normally. Attempting to create a second user with the same email is blocked:
 
 ```typescript region="create-user" example="unique-constraints.ts"
-const alice = yield* db.entities.Users.put({
-  userId: "u-1",
-  email: "alice@example.com",
-  username: "alice",
-  tenantId: "t-1",
-  name: "Alice",
-})
+  // #region create-user
+  const alice = yield* db.entities.Users.put({
+    userId: "u-1",
+    email: "alice@example.com",
+    username: "alice",
+    tenantId: "t-1",
+    name: "Alice",
+  })
 
-// Same email → UniqueConstraintViolation
-const duplicateEmail = yield* db.entities.Users.put({
-  userId: "u-2",
-  email: "alice@example.com", // Same email as Alice!
-  username: "bob",
-  tenantId: "t-1",
-  name: "Bob",
-}).pipe(
-  Effect.catchTag("UniqueConstraintViolation", (e) =>
-    Effect.succeed(`Blocked: constraint="${e.constraint}", fields=${JSON.stringify(e.fields)}`),
-  ),
-)
-// Blocked: constraint="email", fields={"email":"alice@example.com"}
+  // Same email → UniqueConstraintViolation
+  const duplicateEmail = yield* db.entities.Users.put({
+    userId: "u-2",
+    email: "alice@example.com", // Same email as Alice!
+    username: "bob",
+    tenantId: "t-1",
+    name: "Bob",
+  })
+    .asEffect()
+    .pipe(
+      Effect.catchTag("UniqueConstraintViolation", (e) =>
+        Effect.succeed(`Blocked: constraint="${e.constraint}", fields=${JSON.stringify(e.fields)}`),
+      ),
+    )
+  // Blocked: constraint="email", fields={"email":"alice@example.com"}
 ```
 
 The error includes the constraint name and the conflicting field values, making it straightforward to produce user-facing messages.
@@ -142,29 +145,32 @@ The error includes the constraint name and the conflicting field values, making 
 Username uniqueness works identically — same email but duplicate username is also blocked:
 
 ```typescript region="duplicate-username" example="unique-constraints.ts"
-// Different email, same username → UniqueConstraintViolation
-const bob = yield* db.entities.Users.put({
-  userId: "u-2",
-  email: "bob@example.com", // Different email — OK
-  username: "alice", // Same username as Alice!
-  tenantId: "t-1",
-  name: "Bob",
-}).pipe(
-  Effect.catchTag("UniqueConstraintViolation", (e) =>
-    Effect.succeed(`Blocked: constraint="${e.constraint}"`),
-  ),
-)
-// Blocked: constraint="username"
+  // #region duplicate-username
+  // Different email, same username → UniqueConstraintViolation
+  const bob = yield* db.entities.Users.put({
+    userId: "u-2",
+    email: "bob@example.com", // Different email — OK
+    username: "alice", // Same username as Alice!
+    tenantId: "t-1",
+    name: "Bob",
+  })
+    .asEffect()
+    .pipe(
+      Effect.catchTag("UniqueConstraintViolation", (e) =>
+        Effect.succeed(`Blocked: constraint="${e.constraint}"`),
+      ),
+    )
+  // Blocked: constraint="username"
 
-// Both different → succeeds
-const charlie = yield* db.entities.Users.put({
-  userId: "u-2",
-  email: "bob@example.com",
-  username: "bob",
-  tenantId: "t-1",
-  name: "Bob",
-})
-// Created: Bob
+  // Both different → succeeds
+  const charlie = yield* db.entities.Users.put({
+    userId: "u-2",
+    email: "bob@example.com",
+    username: "bob",
+    tenantId: "t-1",
+    name: "Bob",
+  })
+  // Created: Bob
 ```
 
 ### Idempotency Key Pattern
@@ -172,35 +178,38 @@ const charlie = yield* db.entities.Users.put({
 The TTL-based constraint prevents duplicate request processing. The first request succeeds; retries with the same key are blocked until the sentinel expires:
 
 ```typescript region="idempotency" example="unique-constraints.ts"
-// First request — succeeds
-const req1 = yield* db.entities.ApiRequests.put({
-  requestId: "r-1",
-  idempotencyKey: "idem-abc-123",
-  payload: '{"action":"charge","amount":100}',
-  status: "completed",
-})
+  // #region idempotency
+  // First request — succeeds
+  const req1 = yield* db.entities.ApiRequests.put({
+    requestId: "r-1",
+    idempotencyKey: "idem-abc-123",
+    payload: '{"action":"charge","amount":100}',
+    status: "completed",
+  })
 
-// Retry with same idempotency key → blocked
-const retry = yield* db.entities.ApiRequests.put({
-  requestId: "r-2",
-  idempotencyKey: "idem-abc-123", // Same idempotency key!
-  payload: '{"action":"charge","amount":100}',
-  status: "pending",
-}).pipe(
-  Effect.catchTag("UniqueConstraintViolation", (e) =>
-    Effect.succeed(`Blocked: constraint="${e.constraint}" — duplicate request prevented`),
-  ),
-)
-// The sentinel has a TTL of 30 minutes
-// After expiry, the same key can be reused
+  // Retry with same idempotency key → blocked
+  const retry = yield* db.entities.ApiRequests.put({
+    requestId: "r-2",
+    idempotencyKey: "idem-abc-123", // Same idempotency key!
+    payload: '{"action":"charge","amount":100}',
+    status: "pending",
+  })
+    .asEffect()
+    .pipe(
+      Effect.catchTag("UniqueConstraintViolation", (e) =>
+        Effect.succeed(`Blocked: constraint="${e.constraint}" — duplicate request prevented`),
+      ),
+    )
+  // The sentinel has a TTL of 30 minutes
+  // After expiry, the same key can be reused
 
-// Different idempotency key — succeeds immediately
-const req2 = yield* db.entities.ApiRequests.put({
-  requestId: "r-2",
-  idempotencyKey: "idem-def-456",
-  payload: '{"action":"refund","amount":50}',
-  status: "completed",
-})
+  // Different idempotency key — succeeds immediately
+  const req2 = yield* db.entities.ApiRequests.put({
+    requestId: "r-2",
+    idempotencyKey: "idem-def-456",
+    payload: '{"action":"refund","amount":50}',
+    status: "completed",
+  })
 ```
 
 ### Sentinel Rotation on Update
@@ -208,29 +217,30 @@ const req2 = yield* db.entities.ApiRequests.put({
 When you update a unique field, effect-dynamodb atomically **removes** the old sentinel and **creates** a new one. The old value becomes available for other items:
 
 ```typescript region="sentinel-rotation" example="unique-constraints.ts"
-// Update Alice's email
-yield* db.entities.Users.update({ userId: "u-1" }).set({ email: "alice-new@example.com" })
+  // #region sentinel-rotation
+  // Update Alice's email
+  yield* db.entities.Users.update({ userId: "u-1" }).set({ email: "alice-new@example.com" })
 
-// The old email "alice@example.com" is now free
-const newUser = yield* db.entities.Users.put({
-  userId: "u-3",
-  email: "alice@example.com", // Previously Alice's — now available
-  username: "charlie",
-  tenantId: "t-1",
-  name: "Charlie",
-})
-// Created: Charlie
+  // The old email "alice@example.com" is now free
+  const newUser = yield* db.entities.Users.put({
+    userId: "u-3",
+    email: "alice@example.com", // Previously Alice's — now available
+    username: "charlie",
+    tenantId: "t-1",
+    name: "Charlie",
+  })
+  // Created: Charlie
 
-// But Alice's new email is still protected
-const conflict = yield* db.entities.Users.update(
-  { userId: "u-2" },
-  Users.set({ email: "alice-new@example.com" }),
-).pipe(
-  Effect.catchTag("UniqueConstraintViolation", (e) =>
-    Effect.succeed(`Blocked: constraint="${e.constraint}"`),
-  ),
-)
-// Blocked: constraint="email"
+  // But Alice's new email is still protected
+  const conflict = yield* db.entities.Users.update({ userId: "u-2" })
+    .set({ email: "alice-new@example.com" })
+    .asEffect()
+    .pipe(
+      Effect.catchTag("UniqueConstraintViolation", (e) =>
+        Effect.succeed(`Blocked: constraint="${e.constraint}"`),
+      ),
+    )
+  // Blocked: constraint="email"
 ```
 
 ---

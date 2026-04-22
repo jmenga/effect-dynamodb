@@ -60,32 +60,25 @@ Products.condition((t, { or, not, eq }) =>
 Apply the condition as a combinator on put, update, or delete:
 
 ```typescript region="condition-on-operations" example="guide-expressions.ts"
-// On put
-yield* db.entities.Products.put(
-  {
+  // #region condition-on-operations
+  // On put
+  yield* db.entities.Products.put({
     ...baseProduct,
     productId: "p-5",
     name: "New Product",
     category: "electronics",
     price: 49.99,
     stock: 10,
-  },
-  Products.condition((t, { notExists }) => notExists(t.productId)),
-)
+  }).condition((t, { notExists }) => notExists(t.productId))
 
-// On update (ANDed with optimistic lock)
-yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Products.set({ name: "Widget Pro" }),
-  Products.expectedVersion(1),
-  Products.condition((t, { gt }) => gt(t.stock, 0)),
-)
+  // On update (ANDed with optimistic lock)
+  yield* db.entities.Products.update({ productId: "p-1" })
+    .set({ name: "Widget Pro" })
+    .expectedVersion(1)
+    .condition((t, { gt }) => gt(t.stock, 0))
 
-// On delete
-yield* db.entities.Products.delete(
-  { productId: "p-4" },
-  Products.condition((t, { eq }) => eq(t.stock, 0)),
-)
+  // On delete
+  yield* db.entities.Products.delete({ productId: "p-4" }).condition((t, { eq }) => eq(t.stock, 0))
 ```
 
 ### Shorthand Syntax
@@ -177,33 +170,31 @@ Update expressions describe how to modify item attributes. DynamoDB supports fou
 These accept plain objects with field names — good for top-level attribute updates:
 
 ```typescript region="update-record" example="guide-expressions.ts"
-// SET — assign values
-yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Entity.set({ name: "Widget Deluxe", price: 34.99 }),
-)
+  // #region update-record
+  // SET — assign values
+  yield* db.entities.Products.update({ productId: "p-1" }).set({
+    name: "Widget Deluxe",
+    price: 34.99,
+  })
 
-// REMOVE — delete attributes
-yield* db.entities.Products.update(
-  { productId: "p-4" },
-  Entity.remove(["description", "temporaryFlag"]),
-)
+  // REMOVE — delete attributes
+  yield* db.entities.Products.update({ productId: "p-4" }).remove(["description", "temporaryFlag"])
 
-// ADD — atomic increment (numbers) or union (sets)
-yield* db.entities.Products.update({ productId: "p-1" }).add({ viewCount: 1, stock: 50 })
+  // ADD — atomic increment (numbers) or union (sets)
+  yield* db.entities.Products.update({ productId: "p-1" }).add({ viewCount: 1, stock: 50 })
 
-// Subtract — SET field = field - value
-yield* db.entities.Products.update({ productId: "p-1" }).subtract({ stock: 3 })
+  // Subtract — SET field = field - value
+  yield* db.entities.Products.update({ productId: "p-1" }).subtract({ stock: 3 })
 
-// Append — SET field = list_append(field, value)
-yield* db.entities.Products.update({ productId: "p-1" }).append({ tags: ["on-sale", "featured"] })
-)
+  // Append — SET field = list_append(field, value)
+  yield* db.entities.Products.update({ productId: "p-1" }).append({
+    tags: ["on-sale", "featured"],
+  })
 
-// DELETE — remove elements from a set
-yield* db.entities.Products.update(
-  { productId: "p-4" },
-  Entity.deleteFromSet({ categories: new Set(["obsolete"]) }),
-)
+  // DELETE — remove elements from a set
+  yield* db.entities.Products.update({ productId: "p-4" }).deleteFromSet({
+    categories: new Set(["obsolete"]),
+  })
 ```
 
 ### Composing Multiple Update Types
@@ -211,15 +202,14 @@ yield* db.entities.Products.update(
 All combinators chain as methods on the `BoundUpdate` builder. They compile to a single `UpdateExpression` with the appropriate SET, REMOVE, ADD, and DELETE clauses:
 
 ```typescript region="update-composed" example="guide-expressions.ts"
-yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Entity.set({ name: "Updated Widget", price: 24.99 }),
-  Entity.add({ viewCount: 1 }),
-  Entity.subtract({ stock: 3 }),
-  Entity.append({ tags: ["clearance"] }),
-  Entity.remove(["temporaryFlag"]),
-  Products.expectedVersion(5),
-)
+  // #region update-composed
+  yield* db.entities.Products.update({ productId: "p-1" })
+    .set({ name: "Updated Widget", price: 24.99 })
+    .add({ viewCount: 1 })
+    .subtract({ stock: 3 })
+    .append({ tags: ["clearance"] })
+    .remove(["temporaryFlag"])
+    .expectedVersion(5)
 ```
 
 ### Path-Based Combinators
@@ -227,40 +217,43 @@ yield* db.entities.Products.update(
 For nested attributes, array elements, and attribute-to-attribute operations, use the path-based combinators. These take the update operation as the first argument, so wrap them in a lambda when passing as a combinator to `update()`:
 
 ```typescript region="update-path" example="guide-expressions.ts"
-// SET nested path
-yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
-  Entity.pathSet(op, { segments: ["address", "city"], value: "NYC", isPath: false }),
-)
+  // #region update-path
+  // SET nested path
+  yield* db.entities.Products.update({ productId: "p-1" }).pathSet({
+    segments: ["address", "city"],
+    value: "NYC",
+    isPath: false,
+  })
 
-// SET array element
-yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
-  Entity.pathSet(op, { segments: ["roster", 0, "position"], value: "captain", isPath: false }),
-)
+  // SET array element
+  yield* db.entities.Products.update({ productId: "p-1" }).pathSet({
+    segments: ["roster", 0, "position"],
+    value: "captain",
+    isPath: false,
+  })
 
-// Copy attribute to attribute
-yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
-  Entity.pathSet(op, {
+  // Copy attribute to attribute
+  yield* db.entities.Products.update({ productId: "p-1" }).pathSet({
     segments: ["backup_email"],
     value: undefined,
     isPath: true,
     valueSegments: ["email"],
-  }),
-)
+  })
 
-// REMOVE nested attribute
-yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
-  Entity.pathRemove(op, ["metadata", "temporary"]),
-)
+  // REMOVE nested attribute
+  yield* db.entities.Products.update({ productId: "p-1" }).pathRemove(["metadata", "temporary"])
 
-// PREPEND to list
-yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
-  Entity.pathPrepend(op, { segments: ["tags"], value: ["URGENT"] }),
-)
+  // PREPEND to list
+  yield* db.entities.Products.update({ productId: "p-1" }).pathPrepend({
+    segments: ["tags"],
+    value: ["URGENT"],
+  })
 
-// if_not_exists — set only if the attribute doesn't exist
-yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
-  Entity.pathIfNotExists(op, { segments: ["createdBy"], value: "system" }),
-)
+  // if_not_exists — set only if the attribute doesn't exist
+  yield* db.entities.Products.update({ productId: "p-1" }).pathIfNotExists({
+    segments: ["createdBy"],
+    value: "system",
+  })
 ```
 
 ### Update Expression Reference

@@ -387,32 +387,36 @@ for (const task of Object.values(tasks)) {
 > Create, read, update, and delete employees and tasks.
 
 ```typescript region="crud" example="task-manager.ts"
-const tyler = yield* db.entities.Employees.get({ employee: "tyler" })
-// tyler.title → "Senior Engineer"
-// tyler.team → "development"
+  // #region crud
+  const tyler = yield* db.entities.Employees.get({ employee: "tyler" })
+  assertEq(tyler.firstName, "Tyler", "get firstName")
+  assertEq(tyler.lastName, "Walch", "get lastName")
+  assertEq(tyler.title, "Senior Engineer", "get title")
+  assertEq(tyler.team, "development", "get team")
 
-const buildApi = yield* db.entities.Tasks.get({
-  task: "build-api",
-  project: "platform",
-  employee: "tyler",
-})
-// buildApi.status → "open"
-// buildApi.points → 8
+  const buildApi = yield* db.entities.Tasks.get({
+    task: "build-api",
+    project: "platform",
+    employee: "tyler",
+  })
+  assertEq(buildApi.description, "Build the REST API for the platform", "get task description")
+  assertEq(buildApi.status, "open", "get task status")
+  assertEq(buildApi.points, 8, "get task points")
 
-// Update employee title — must provide all GSI composites for affected indexes
-const promoted = yield* db.entities.Employees.update(
-  { employee: "tyler" },
-  Entity.set({
+  // Update employee title — must provide all GSI composites for affected indexes
+  const promoted = yield* db.entities.Employees.update({ employee: "tyler" }).set({
     office: "portland",
     team: "development",
     title: "Staff Engineer",
     salary: "000140.00",
     manager: "tyler",
     dateHired: "2019-03-15",
-  }),
-)
+  })
+  assertEq(promoted.title, "Staff Engineer", "update title")
+  assertEq(promoted.salary, "000140.00", "update salary")
+  assertEq(promoted.firstName, "Tyler", "update preserves unchanged fields")
 
-yield* db.entities.Employees.delete({ employee: "tyler" })
+  yield* db.entities.Employees.delete({ employee: "tyler" })
 ```
 
 Note that the `get` call on a deleted item returns an `ItemNotFound` error. Use `catchTag` to handle it:
@@ -518,34 +522,38 @@ const openPlatformTasks = yield* db.entities.Tasks.byStatus({
 Updating a task's `status` field triggers GSI recomposition on every index that includes `status` as a composite. The task moves between partitions in the `byStatus` GSI4 index.
 
 ```typescript region="workflow" example="task-manager.ts"
-// Move build-api from open -> in-progress
-const inProgress = yield* db.entities.Tasks.update(
-  { task: "build-api", project: "platform", employee: "tyler" },
-  Entity.set({ status: "in-progress" }),
-)
+  // #region workflow
+  // Move build-api from open -> in-progress
+  const inProgress = yield* db.entities.Tasks.update({
+    task: "build-api",
+    project: "platform",
+    employee: "tyler",
+  }).set({ status: "in-progress" })
 
-// Verify: open tasks decreased by 1
-const openAfterTransition = yield* db.entities.Tasks.byStatus({ status: "open" }).collect()
+  // Verify: open tasks decreased by 1
+  const openAfterTransition = yield* db.entities.Tasks.byStatus({ status: "open" }).collect()
 
-// Verify: in-progress tasks increased by 1
-const inProgressAfterTransition = yield* db.entities.Tasks.byStatus({
-  status: "in-progress",
-}).collect()
+  // Verify: in-progress tasks increased by 1
+  const inProgressAfterTransition = yield* db.entities.Tasks.byStatus({
+    status: "in-progress",
+  }).collect()
 
-// Move build-api from in-progress -> closed
-const closed = yield* db.entities.Tasks.update(
-  { task: "build-api", project: "platform", employee: "tyler" },
-  Entity.set({ status: "closed" }),
-)
+  // Move build-api from in-progress -> closed
+  const closed = yield* db.entities.Tasks.update({
+    task: "build-api",
+    project: "platform",
+    employee: "tyler",
+  }).set({ status: "closed" })
 
-// Verify: closed tasks increased
-const closedAfterWorkflow = yield* db.entities.Tasks.byStatus({ status: "closed" }).collect()
+  // Verify: closed tasks increased
+  const closedAfterWorkflow = yield* db.entities.Tasks.byStatus({ status: "closed" }).collect()
 
-// Restore build-api to original state for clean assertions below
-yield* db.entities.Tasks.update(
-  { task: "build-api", project: "platform", employee: "tyler" },
-  Entity.set({ status: "open" }),
-)
+  // Restore build-api to original state for clean assertions below
+  yield* db.entities.Tasks.update({
+    task: "build-api",
+    project: "platform",
+    employee: "tyler",
+  }).set({ status: "open" })
 ```
 
 Because `employee` and `project` are primary key fields (provided in the update key), they are automatically reused for GSI recomposition. Only `status` -- the GSI-only composite -- needs to be in `set()`.

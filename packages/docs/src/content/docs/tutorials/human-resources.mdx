@@ -371,22 +371,20 @@ for (const task of Object.values(tasks)) {
 > Create, read, update, and delete employees.
 
 ```typescript region="crud" example="hr.ts"
-const joe = yield* db.entities.Employees.get({ employee: "jlowe" })
+  // #region crud
+  const joe = yield* db.entities.Employees.get({ employee: "jlowe" })
 
-const updated = yield* db.entities.Employees.update(
-  { employee: "jlowe" },
-  Entity.set({
+  const updated = yield* db.entities.Employees.update({ employee: "jlowe" }).set({
     office: "gw-zoo",
     team: "jupiter",
     title: "Head Zookeeper",
     salary: "000055.00",
     manager: "jlowe",
-  }),
-)
+  })
 
-yield* db.entities.Employees.delete({ employee: "jlowe" })
+  yield* db.entities.Employees.delete({ employee: "jlowe" })
 
-yield* db.entities.Employees.put(employees.jlowe)
+  yield* db.entities.Employees.put(employees.jlowe)
 ```
 
 Because Employee has `softDelete: true`, the delete doesn't destroy the record — it archives it. The employee vanishes from all GSI queries but remains retrievable for audit. See [Requirement 10](#requirement-10-termination--rehire) for the full soft delete workflow.
@@ -482,29 +480,27 @@ const cbaskinReports = yield* db.entities.Employees.byManager({ manager: "cbaski
 Transferring an employee touches composites across multiple GSIs. When you update a field that appears in a GSI's composite key, you must provide **all** composites for that GSI — otherwise the index key can't be recomposed. This is the "fetch-merge" pattern.
 
 ```typescript region="transfer" example="hr.ts"
-const transferred = yield* db.entities.Employees.update(
-  { employee: "dfinlay" },
-  Entity.set({
+  // #region transfer
+  const transferred = yield* db.entities.Employees.update({ employee: "dfinlay" }).set({
     office: "big-cat-rescue",
     team: "saturn",
     title: "Handler",
     salary: "000035.00",
     manager: "cbaskin",
-  }),
-)
+  })
 
-const newReports = yield* db.entities.Employees.byManager({ manager: "cbaskin" }).collect()
+  const newReports = yield* db.entities.Employees.byManager({ manager: "cbaskin" }).collect()
 
-const jloweReportsAfter = yield* db.entities.Employees.byManager({ manager: "jlowe" }).collect()
+  const jloweReportsAfter = yield* db.entities.Employees.byManager({ manager: "jlowe" }).collect()
 ```
 
 What happens if you provide only some composites? The type system warns you, and at runtime `extractComposites` fails with a `ValidationError` naming the violating index:
 
 ```typescript region="partial-gsi-error" example="hr.ts"
-const partialError = yield* db.entities.Employees.update(
-  { employee: "dfinlay" },
-  Entity.set({ office: "gw-zoo" } as any),
-).pipe(Effect.flip)
+  const partialError = yield* db.entities.Employees.update({ employee: "dfinlay" })
+    .set({ office: "gw-zoo" } as any)
+    .asEffect()
+    .pipe(Effect.flip)
 ```
 
 ### Requirement 9: Atomic Onboarding (Transaction)

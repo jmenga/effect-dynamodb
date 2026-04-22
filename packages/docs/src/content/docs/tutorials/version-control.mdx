@@ -412,23 +412,26 @@ Both queries hit GSI1 with the same partition key. DynamoDB serves both from the
 Creating an issue is a simple `put`. Closing it requires an `update` with `set()`. Because `status` appears in GSI sort keys, changing it triggers GSI key recomposition -- the all-or-none rule means you must provide all composites for affected GSIs.
 
 ```typescript region="pattern-4" example="version-control.ts"
-const newIssue = yield* db.entities.Issues.put({
-  issueNumber: "3",
-  repoName: "hello-world",
-  repoOwner: "octocat",
-  username: "torvalds",
-  subject: "Enhancement: Add CI pipeline",
-  body: "We should add GitHub Actions for CI/CD.",
-  status: "Open",
-})
-// newIssue.status → "Open"
+  // #region pattern-4
+  const newIssue = yield* db.entities.Issues.put({
+    issueNumber: "3",
+    repoName: "hello-world",
+    repoOwner: "octocat",
+    username: "torvalds",
+    subject: "Enhancement: Add CI pipeline",
+    body: "We should add GitHub Actions for CI/CD.",
+    status: "Open",
+  })
+  assertEq(newIssue.issueNumber, "3", "new issue number")
+  assertEq(newIssue.status, "Open", "new issue status")
 
-const closedIssue = yield* db.entities.Issues.update(
-  { repoOwner: "octocat", repoName: "hello-world", issueNumber: "3" },
-  Entity.set({ status: "Closed", username: "torvalds" }),
-)
-// closedIssue.status → "Closed"
-// closedIssue.subject → "Enhancement: Add CI pipeline" (preserved)
+  const closedIssue = yield* db.entities.Issues.update({
+    repoOwner: "octocat",
+    repoName: "hello-world",
+    issueNumber: "3",
+  }).set({ status: "Closed", username: "torvalds" })
+  assertEq(closedIssue.status, "Closed", "closed issue status")
+  assertEq(closedIssue.subject, "Enhancement: Add CI pipeline", "closed issue preserves subject")
 ```
 
 The `username` field must be included in the `set()` even though it hasn't changed -- it's a composite of the `managed` collection alongside `status`, and the all-or-none rule requires all composites for any GSI that's being recomposed.
@@ -440,21 +443,26 @@ The `username` field must be included in the `set()` even though it hasn't chang
 The same pattern as issues -- `status` in the sort key means the GSI keys must be fully recomposed on status change.
 
 ```typescript region="pattern-5" example="version-control.ts"
-const newPR = yield* db.entities.PullRequests.put({
-  pullRequestNumber: "2",
-  repoName: "hello-world",
-  repoOwner: "octocat",
-  username: "octocat",
-  subject: "Add CONTRIBUTING.md",
-  body: "Adds a contributing guide as requested in issue #2.",
-  status: "Open",
-})
+  // #region pattern-5
+  const newPR = yield* db.entities.PullRequests.put({
+    pullRequestNumber: "2",
+    repoName: "hello-world",
+    repoOwner: "octocat",
+    username: "octocat",
+    subject: "Add CONTRIBUTING.md",
+    body: "Adds a contributing guide as requested in issue #2.",
+    status: "Open",
+  })
+  assertEq(newPR.pullRequestNumber, "2", "new PR number")
+  assertEq(newPR.status, "Open", "new PR status")
 
-const closedPR = yield* db.entities.PullRequests.update(
-  { repoOwner: "octocat", repoName: "hello-world", pullRequestNumber: "2" },
-  Entity.set({ status: "Closed", username: "octocat" }),
-)
-// closedPR.status → "Closed"
+  const closedPR = yield* db.entities.PullRequests.update({
+    repoOwner: "octocat",
+    repoName: "hello-world",
+    pullRequestNumber: "2",
+  }).set({ status: "Closed", username: "octocat" })
+  assertEq(closedPR.status, "Closed", "closed PR status")
+  assertEq(closedPR.subject, "Add CONTRIBUTING.md", "closed PR preserves subject")
 ```
 
 ### Pattern 6: User's Managed Items (GSI1 -- `managed` Collection)

@@ -73,28 +73,32 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Products } })
 `Entity.create()` is `put()` with an automatic `attribute_not_exists` condition on the primary key. If the item already exists, it fails with `ConditionalCheckFailed`:
 
 ```typescript region="create" example="expressions.ts"
-// create() is put() + automatic attribute_not_exists on primary key.
-// It fails with ConditionalCheckFailed if an item already exists.
-const widget = yield* db.entities.Products.create({
-  productId: "p-1",
-  name: "Widget",
-  category: "electronics",
-  price: 29.99,
-  stock: 100,
-})
-// Try to create the same item again — should fail
-const duplicateResult = yield* db.entities.Products.create({
-  productId: "p-1",
-  name: "Widget Duplicate",
-  category: "electronics",
-  price: 19.99,
-  stock: 50,
-}).pipe(
-  Effect.map(() => "unexpected success"),
-  Effect.catchTag("ConditionalCheckFailed", () =>
-    Effect.succeed("ConditionalCheckFailed — duplicate prevented!"),
-  ),
-)
+  // #region create
+  // create() is put() + automatic attribute_not_exists on primary key.
+  // It fails with ConditionalCheckFailed if an item already exists.
+  const widget = yield* db.entities.Products.create({
+    productId: "p-1",
+    name: "Widget",
+    category: "electronics",
+    price: 29.99,
+    stock: 100,
+  })
+
+  // Try to create the same item again — should fail
+  const duplicateResult = yield* db.entities.Products.create({
+    productId: "p-1",
+    name: "Widget Duplicate",
+    category: "electronics",
+    price: 19.99,
+    stock: 50,
+  })
+    .asEffect()
+    .pipe(
+      Effect.map(() => "unexpected success"),
+      Effect.catchTag("ConditionalCheckFailed", () =>
+        Effect.succeed("ConditionalCheckFailed — duplicate prevented!"),
+      ),
+    )
 ```
 
 BoundEntity methods return `Effect` directly, so you can pipe to `Effect.catchTag` and other combinators.
@@ -104,19 +108,18 @@ BoundEntity methods return `Effect` directly, so you can pipe to `Effect.catchTa
 `Products.condition()` adds a server-side `ConditionExpression` to any write operation. The condition is evaluated atomically -- if it fails, the write is rejected with `ConditionalCheckFailed`:
 
 ```typescript region="conditional-put" example="expressions.ts"
-// Products.condition() adds a ConditionExpression to a put operation.
-// The condition is evaluated server-side. If it fails, the put is rejected.
-const condPutResult = yield* db.entities.Products.put(
-  {
+  // #region conditional-put
+  // .condition() adds a ConditionExpression to a put operation.
+  // The condition is evaluated server-side. If it fails, the put is rejected.
+  const condPutResult = yield* db.entities.Products.put({
     productId: "p-5",
     name: "New Product",
     category: "electronics",
     price: 49.99,
     stock: 10,
-  },
-  // Only put if item doesn't already exist (same as create, but explicit)
-  Products.condition((t, { notExists }) => notExists(t.productId)),
-)
+  })
+    // Only put if item doesn't already exist (same as create, but explicit)
+    .condition((t, { notExists }) => notExists(t.productId))
 ```
 
 ### Conditional Delete
@@ -124,28 +127,30 @@ const condPutResult = yield* db.entities.Products.put(
 Delete an item only when a condition is met. Here we delete only if the product has zero stock:
 
 ```typescript region="conditional-delete" example="expressions.ts"
-// Delete only if the item's stock is 0 (don't delete items with stock).
-// Products.condition() maps ConditionalCheckFailedException at runtime.
-// Use Effect.match to handle both success and failure paths.
-const condDeleteResult = yield* db.entities.Products.delete(
-  { productId: "p-4" },
-  Products.condition((t, { eq }) => eq(t.stock, 0)),
-).pipe(
-  Effect.match({
-    onFailure: (e) => `Failed: ${e._tag}`,
-    onSuccess: () => "deleted (stock was 0)",
-  }),
-)
-// Try to conditionally delete an item with stock > 0
-const condDeleteFail = yield* db.entities.Products.delete(
-  { productId: "p-1" },
-  Products.condition((t, { eq }) => eq(t.stock, 0)),
-).pipe(
-  Effect.match({
-    onFailure: (e) => `${e._tag} — item has stock (correct!)`,
-    onSuccess: () => "deleted",
-  }),
-)
+  // #region conditional-delete
+  // Delete only if the item's stock is 0 (don't delete items with stock).
+  // .condition() maps ConditionalCheckFailedException at runtime.
+  // Use Effect.match to handle both success and failure paths.
+  const condDeleteResult = yield* db.entities.Products.delete({ productId: "p-4" })
+    .condition((t, { eq }) => eq(t.stock, 0))
+    .asEffect()
+    .pipe(
+      Effect.match({
+        onFailure: (e) => `Failed: ${e._tag}`,
+        onSuccess: () => "deleted (stock was 0)",
+      }),
+    )
+
+  // Try to conditionally delete an item with stock > 0
+  const condDeleteFail = yield* db.entities.Products.delete({ productId: "p-1" })
+    .condition((t, { eq }) => eq(t.stock, 0))
+    .asEffect()
+    .pipe(
+      Effect.match({
+        onFailure: (e) => `${e._tag} — item has stock (correct!)`,
+        onSuccess: () => "deleted",
+      }),
+    )
 ```
 
 ### Conditional Update + Optimistic Locking
@@ -153,30 +158,30 @@ const condDeleteFail = yield* db.entities.Products.delete(
 Combine `Products.condition()` with `expectedVersion()` and `set()`. The user condition is ANDed with the optimistic lock condition:
 
 ```typescript region="conditional-update" example="expressions.ts"
-// Combine condition() with expectedVersion() and set().
-// The user condition is ANDed with the optimistic lock condition.
-const updated = yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Products.set({ price: 24.99 }),
-  Products.expectedVersion(1),
-  Products.condition((t, { gt }) => gt(t.stock, 0)),
-)
+  // #region conditional-update
+  // Combine .condition() with .expectedVersion() and .set().
+  // The user condition is ANDed with the optimistic lock condition.
+  const updated = yield* db.entities.Products.update({ productId: "p-1" })
+    .set({ price: 24.99 })
+    .expectedVersion(1)
+    .condition((t, { gt }) => gt(t.stock, 0))
 ```
 
 When the condition fails, you get a `ConditionalCheckFailed` error:
 
 ```typescript region="conditional-update-fail" example="expressions.ts"
-// Condition fails: update only if stock > 1000 (it's 100)
-const condUpdateFail = yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Products.set({ price: 19.99 }),
-  Products.condition((t, { gt }) => gt(t.stock, 1000)),
-).pipe(
-  Effect.match({
-    onFailure: (e) => `${e._tag} — stock not > 1000`,
-    onSuccess: () => "updated",
-  }),
-)
+  // #region conditional-update-fail
+  // Condition fails: update only if stock > 1000 (it's 100)
+  const condUpdateFail = yield* db.entities.Products.update({ productId: "p-1" })
+    .set({ price: 19.99 })
+    .condition((t, { gt }) => gt(t.stock, 1000))
+    .asEffect()
+    .pipe(
+      Effect.match({
+        onFailure: (e) => `${e._tag} — stock not > 1000`,
+        onSuccess: () => "updated",
+      }),
+    )
 ```
 
 ### Callback and Shorthand Conditions
@@ -184,25 +189,25 @@ const condUpdateFail = yield* db.entities.Products.update(
 There are two ways to build conditions -- a **callback API** using a type-safe PathBuilder, and a **shorthand** with plain objects:
 
 ```typescript region="condition-callback" example="expressions.ts"
-// The callback API provides type-safe conditions using PathBuilder.
-// First argument `t` is a path proxy, second `ops` has comparison functions.
-const conditionUpdated = yield* db.entities.Products.update(
-  { productId: "p-2" },
-  Products.set({ price: 79.99 }),
-  // Type-safe: t.stock is typed as number, "active" would be a type error
-  Products.condition((t, { gt }) => gt(t.stock, 0)),
-)
-// Shorthand condition — plain object for simple equality
-const shorthandResult = yield* db.entities.Products.update(
-  { productId: "p-2" },
-  Products.set({ price: 84.99 }),
-  Products.condition({ category: "electronics" }),
-).pipe(
-  Effect.match({
-    onFailure: (e) => `Failed: ${e._tag}`,
-    onSuccess: (p) => `Shorthand condition: ${p.name} price=$${p.price}`,
-  }),
-)
+  // #region condition-callback
+  // The callback API provides type-safe conditions using PathBuilder.
+  // First argument `t` is a path proxy, second `ops` has comparison functions.
+  const conditionUpdated = yield* db.entities.Products.update({ productId: "p-2" })
+    .set({ price: 79.99 })
+    // Type-safe: t.stock is typed as number, "active" would be a type error
+    .condition((t, { gt }) => gt(t.stock, 0))
+
+  // Shorthand condition — plain object for simple equality
+  const shorthandResult = yield* db.entities.Products.update({ productId: "p-2" })
+    .set({ price: 84.99 })
+    .condition({ category: "electronics" })
+    .asEffect()
+    .pipe(
+      Effect.match({
+        onFailure: (e) => `Failed: ${e._tag}`,
+        onSuccess: (p) => `Shorthand condition: ${p.name} price=$${p.price}`,
+      }),
+    )
 ```
 
 ### Filter Expressions

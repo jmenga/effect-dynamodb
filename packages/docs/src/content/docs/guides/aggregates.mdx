@@ -116,21 +116,24 @@ On `put` and `update`, Entity automatically:
 4. Returns `RefNotFound` if any referenced entity doesn't exist
 
 ```typescript region="ref-not-found" example="guide-aggregates.ts"
-// RefNotFound when a ref doesn't resolve
-const refError = yield* db.entities.SquadSelections.put({
-  squadId: "aus#2024-25#BGT",
-  selectionNumber: 99,
-  teamId: "aus",
-  playerId: "nonexistent",
-  squadRole: "batter",
-  isCaptain: false,
-}).pipe(Effect.flip)
+  // #region ref-not-found
+  // RefNotFound when a ref doesn't resolve
+  const refError = yield* db.entities.SquadSelections.put({
+    squadId: "aus#2024-25#BGT",
+    selectionNumber: 99,
+    teamId: "aus",
+    playerId: "nonexistent",
+    squadRole: "batter",
+    isCaptain: false,
+  })
+    .asEffect()
+    .pipe(Effect.flip)
 
-if (refError._tag === "RefNotFound") {
-  // refError.field     → "player"
-  // refError.refId     → "nonexistent"
-  // refError.refEntity → "Player"
-}
+  if (refError._tag === "RefNotFound") {
+    // refError.field     → "player"
+    // refError.refId     → "nonexistent"
+    // refError.refEntity → "Player"
+  }
 ```
 
 ### DynamoDB Storage
@@ -451,11 +454,10 @@ When denormalized data changes at the source (e.g., a player's name is corrected
 Attach a cascade to an `EntityUpdate` operation. After the source entity update completes, the cascade finds and updates all target items:
 
 ```typescript region="cascade-basic" example="guide-aggregates.ts"
-const updatedPlayer = yield* db.entities.Players.update(
-  { id: "smith-01" },
-  Entity.set({ firstName: "Steven" }),
-  Entity.cascade({ targets: [SquadSelections] }),
-)
+  // #region cascade-basic
+  const updatedPlayer = yield* db.entities.Players.update({ id: "smith-01" })
+    .set({ firstName: "Steven" })
+    .cascade({ targets: [SquadSelections] })
 ```
 
 After updating the player, the cascade:
@@ -478,21 +480,19 @@ Entity.cascade({
 **Eventual (default):** Batch-updates target items. No item limit. Partial failures are possible.
 
 ```typescript region="cascade-eventual" example="guide-aggregates.ts"
-yield* db.entities.Players.update(
-  { id: "smith-01" },
-  Entity.set({ firstName: "Steven" }),
-  Entity.cascade({ targets: [SquadSelections], mode: "eventual" }),
-)
+  // #region cascade-eventual
+  yield* db.entities.Players.update({ id: "smith-01" })
+    .set({ firstName: "Steven" })
+    .cascade({ targets: [SquadSelections], mode: "eventual" })
 ```
 
 **Transactional:** Atomic update via `transactWriteItems`. All target items updated in a single transaction. Maximum 100 items.
 
 ```typescript region="cascade-transactional" example="guide-aggregates.ts"
-yield* db.entities.Players.update(
-  { id: "smith-01" },
-  Entity.set({ firstName: "Steven" }),
-  Entity.cascade({ targets: [SquadSelections], mode: "transactional" }),
-)
+  // #region cascade-transactional
+  yield* db.entities.Players.update({ id: "smith-01" })
+    .set({ firstName: "Steven" })
+    .cascade({ targets: [SquadSelections], mode: "transactional" })
 ```
 
 ### Cascade Prerequisites
