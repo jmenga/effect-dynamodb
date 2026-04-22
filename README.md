@@ -238,3 +238,6 @@ See [`PUBLISH.md`](./PUBLISH.md) for the release flow and one-time GitHub setup.
 ## License
 
 [MIT](./LICENSE)
+
+
+<!-- Fix #19 -->
