@@ -1,6 +1,6 @@
 {
   "name": "@effect-dynamodb/language-service",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "TypeScript Language Service Plugin for effect-dynamodb — shows DynamoDB operations on hover",
   "license": "MIT",
   "author": "Justin Menga",
