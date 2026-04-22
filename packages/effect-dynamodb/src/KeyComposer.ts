@@ -351,8 +351,14 @@ export const composeGsiKeysForUpdatePolicyAware = (
     const cascadeRemove =
       removedSet !== undefined && allComposites.some((attr) => removedSet.has(attr))
     const touchedByPayload = allComposites.some((attr) => attr in updatePayload)
+    // GSIs that declare an `indexPolicy` are always evaluated — the policy is a
+    // declarative statement about the GSI's membership invariant, so "attr not
+    // in payload" is treated as "attr not set" per the policy (sparse → drop,
+    // preserve → leave that half alone). GSIs without a policy keep the
+    // conventional touched gate: skip unless a composite is in the payload.
+    const hasPolicy = index.indexPolicy !== undefined
 
-    if (!cascadeRemove && !touchedByPayload) continue
+    if (!cascadeRemove && !touchedByPayload && !hasPolicy) continue
 
     // Cascade takes precedence over policy.
     if (cascadeRemove) {

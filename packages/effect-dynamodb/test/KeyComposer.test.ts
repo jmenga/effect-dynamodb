@@ -557,12 +557,43 @@ describe("KeyComposer", () => {
 
     // --- 4. Touched gate ---
 
-    it("untouched GSI is skipped (no composites in payload, no cascade)", () => {
+    it("GSI without indexPolicy + no composites in payload → skipped", () => {
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(), // no indexPolicy
+        { unrelated: "x" },
+        { id: "i-1" },
+      )
+      expect(result.sets).toEqual({})
+      expect(result.removes).toEqual([])
+    })
+
+    it("GSI WITH indexPolicy is always evaluated, even when no composite in payload (sparse drop)", () => {
+      // Declaring indexPolicy opts the GSI into event-style evaluation: the
+      // policy fires on every update. Absent from payload = absent from the
+      // event = sparse rule applies.
       const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
         schema,
         "E",
         1,
         makeIndexes(() => ({ A: "sparse" })),
+        { unrelated: "x" }, // A, B, C all absent from payload
+        { id: "i-1" },
+      )
+      expect(result.sets).toEqual({})
+      expect(result.removes).toEqual(["gsi1pk", "gsi1sk"])
+    })
+
+    it("GSI with indexPolicy (all preserve) + no composite in payload → halves left alone", () => {
+      // Preserve policy + absent composites → leave halves alone. Evaluated
+      // but no writes emitted.
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(() => ({ A: "preserve", B: "preserve", C: "preserve" })),
         { unrelated: "x" },
         { id: "i-1" },
       )

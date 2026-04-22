@@ -132,11 +132,13 @@ const program = Effect.gen(function* () {
   )
 
   // #region sparse-drop
-  // Update without providing alertState (i.e. alertState becomes undefined in
-  // the merged payload). Policy says 'sparse' → REMOVE gsi1pk/gsi1sk.
+  // Update WITHOUT alertState in the payload. Because byAlert declares an
+  // `indexPolicy` with alertState 'sparse', the GSI is always evaluated on
+  // every update — alertState absent from payload is treated as "not set"
+  // per the policy → REMOVE gsi1pk/gsi1sk. The item drops out of byAlert.
   yield* db.entities.Devices.update(
     { channel: "c-1", deviceId: "d-1" },
-    Entity.set({ alertState: undefined, label: "quiet" }),
+    Entity.set({ label: "quiet" }),
   )
 
   const afterDrop = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()

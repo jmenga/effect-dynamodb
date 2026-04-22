@@ -2146,7 +2146,7 @@ describeConnected("indexPolicy integration tests", () => {
     }).pipe(provideIp),
   )
 
-  it.effect("update touching non-GSI attr only → neither GSI keys touched", () =>
+  it.effect("update touching non-composite attr only: sparse GSI drops, preserve GSI untouched", () =>
     Effect.gen(function* () {
       const db = yield* DynamoClient.make({ entities: { Devices }, tables: { IpTable } })
 
@@ -2157,15 +2157,25 @@ describeConnected("indexPolicy integration tests", () => {
         alertState: "active",
       })
 
+      // Sanity check: item initially indexed in both.
+      const initialAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
+      const initialTenant = yield* db.entities.Devices.byTenant({ tenantId: "globex" }).collect()
+      expect(initialAlert.some((d) => d.deviceId === "d-3")).toBe(true)
+      expect(initialTenant.some((d) => d.deviceId === "d-3")).toBe(true)
+
+      // Update sets only `label` — neither alertState nor tenantId in payload.
+      // byAlert declares sparse on alertState → always evaluated → alertState
+      // absent from payload → REMOVE (drops from sparse GSI).
+      // byTenant declares preserve on tenantId → always evaluated → tenantId
+      // absent + preserve → leave half alone (stays in GSI).
       yield* db.entities.Devices.update(
         { channel: "c-3", deviceId: "d-3" },
         Entity.set({ label: "labelled" }),
       )
 
-      // Still in byAlert + byTenant with original composite values.
       const byAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
       const byTenant = yield* db.entities.Devices.byTenant({ tenantId: "globex" }).collect()
-      expect(byAlert.some((d) => d.deviceId === "d-3")).toBe(true)
+      expect(byAlert.some((d) => d.deviceId === "d-3")).toBe(false)
       expect(byTenant.some((d) => d.deviceId === "d-3")).toBe(true)
     }).pipe(provideIp),
   )

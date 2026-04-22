@@ -61,19 +61,23 @@ The policy is a function so it can branch on the item's current state (e.g. retu
 
 ## Sparse drop-out
 
-Providing an `indexPolicy` that marks an attr `"sparse"` makes partial updates able to drop the item from the GSI:
+Declaring `indexPolicy` opts the GSI into **event-style evaluation**: the policy is consulted on every update, regardless of which attributes appear in the payload. "Absent from the payload" is treated as "not set" per the policy — so a `sparse` composite that isn't in the update payload triggers the drop-out rule:
 
 ```typescript region="sparse-drop" example="guide-index-policy.ts"
-// Update without providing alertState (i.e. alertState becomes undefined in
-// the merged payload). Policy says 'sparse' → REMOVE gsi1pk/gsi1sk.
+// Update WITHOUT alertState in the payload. Because byAlert declares an
+// `indexPolicy` with alertState 'sparse', the GSI is always evaluated on
+// every update — alertState absent from payload is treated as "not set"
+// per the policy → REMOVE gsi1pk/gsi1sk. The item drops out of byAlert.
 yield* db.entities.Devices.update(
   { channel: "c-1", deviceId: "d-1" },
-  Entity.set({ alertState: undefined, label: "quiet" }),
+  Entity.set({ label: "quiet" }),
 )
 
 const afterDrop = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
 // →  afterDrop is empty — item dropped out of the alert GSI
 ```
+
+This is the key semantic shift: with `exactOptionalPropertyTypes: true`, a TypeScript object that omits `alertState` is distinct from one that sets `alertState: undefined`. Both now behave identically at runtime — the policy treats both as "not currently set." You don't need to remember to explicitly pass `undefined` to signal drop intent.
 
 Re-adding the attr re-indexes the item transparently:
 
@@ -118,11 +122,18 @@ The ingest writer's `Entity.set({ alertState: "active" })` touches `byAlert` (re
 
 ## Decision rules
 
-For each GSI touched by an update, the library computes the merged record (primary key + update payload) and applies these rules, in order:
+### When is a GSI evaluated?
 
-1. **`Entity.remove()` cascade** — if the update REMOVEs any composite attribute of this GSI, REMOVE both `gsiNpk` and `gsiNsk`. This takes precedence over `indexPolicy` (removing a composite attribute means "I want this item out of that GSI").
-2. **Sparse wins** — if any composite is absent and its policy is `"sparse"`, REMOVE both halves. One sparse-missing attr drops the whole GSI entry.
-3. **Full recompose** — all composites present → SET both halves. No policy needed.
+- **GSI declares `indexPolicy`** → evaluated on **every** update. Policy-first semantics: "what the policy says, regardless of payload."
+- **GSI has no `indexPolicy`** → evaluated only when at least one of its composites appears in the update payload, or when `Entity.remove([attr])` names one of its composites. Matches conventional partial-update semantics.
+
+### Per-GSI resolution
+
+For each evaluated GSI, the library computes the merged record (primary key + update payload) and applies these rules, in order:
+
+1. **`Entity.remove()` cascade** — if the update REMOVEs any composite attribute of this GSI, REMOVE both `gsiNpk` and `gsiNsk`. Takes precedence over `indexPolicy`.
+2. **Sparse wins** — if any composite is absent and its policy is `"sparse"`, REMOVE both halves.
+3. **Full recompose** — all composites present → SET both halves.
 4. **Half-wise preserve** — some composites missing with policy `"preserve"`, none with `"sparse"`:
    - If a half's composites are all present, SET that half.
    - If a half has a missing-preserve composite, leave that half alone (no SET, no REMOVE).

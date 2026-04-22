@@ -647,7 +647,10 @@ indexes: {
 
 **`Entity.remove([attr])` cascade.** When an update's REMOVE list contains a composite attribute, the whole GSI is dropped (REMOVE both keys) regardless of `indexPolicy`. This is existing behavior and takes precedence — `remove(["tenantId"])` means "the item no longer belongs in the tenant index."
 
-**Touched gate.** A GSI is only processed if at least one of its composites is in the update payload *or* in the REMOVE list. Updates that don't touch any composite of a GSI leave it alone. `indexPolicy` is consulted only when the GSI is touched.
+**Evaluation gate.** Determines when a GSI is evaluated on update/append:
+
+- **GSI declares `indexPolicy`** → evaluated on **every** update/append. Policy-first semantics: the declaration is a statement about the GSI's membership invariant, so the library applies it unconditionally — absence from payload is equivalent to absence from the item, per the policy. This matches TypeScript's `exactOptionalPropertyTypes` intuition where `{ foo: undefined }` and `{}` are structurally distinct at the type level but should behave identically at runtime under declarative policy.
+- **GSI has no `indexPolicy`** → evaluated only when at least one of its composites is in the update payload, or when `Entity.remove([attr])` names one of its composites. Preserves conventional DynamoDB partial-update semantics for entities that haven't opted into policy-driven indexing.
 
 **`put()` semantics (unchanged).** `put()` does not consult `indexPolicy`. It writes a complete item from scratch — any missing composite means "this item is not in that GSI." The existing `tryComposeIndexKeys` path (omit GSI keys when any composite is absent) is preserved as-is. `indexPolicy` exists specifically to resolve the update/append ambiguity, not the put case.
 
