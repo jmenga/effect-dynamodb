@@ -14,6 +14,110 @@ import type { RefNotFound } from "../Errors.js"
 /** Extract the model's Type directly — preserves Schema.Class name (e.g. `User`) */
 export type ModelType<TModel extends Schema.Top> = Schema.Schema.Type<TModel>
 
+/**
+ * Flatten an intersection of object types into a single object literal for
+ * cleaner hover/IntelliSense display. Pure identity at the type level —
+ * `Simplify<A & B>` is assignable to `A & B` and vice versa.
+ */
+export type Simplify<T> = { [K in keyof T]: T[K] } & {}
+
+/** Detect the `any` type — needed to short-circuit conditional type computations
+ *  that would otherwise distribute over `any` and produce nonsense shapes. */
+type IsAny<T> = 0 extends 1 & T ? true : false
+
+// ---------------------------------------------------------------------------
+// Type-level resolution of system field names from config
+// ---------------------------------------------------------------------------
+// These mirror `resolveSystemFields` / `resolveTimestampField`. They cover
+// the common config shapes so that type-level collision adjustments match
+// the runtime. Custom field names configured via `{ field: "..." }` are
+// resolved; schema-only configs (`{ schema: ... }`) fall back to default names.
+
+type TimestampFieldName<C, Default extends string> = [C] extends [undefined]
+  ? Default
+  : C extends string
+    ? C
+    : C extends { readonly field: infer F extends string }
+      ? F
+      : Default
+
+type CreatedAtFieldName<TTimestamps> = [TTimestamps] extends [undefined | false]
+  ? never
+  : TTimestamps extends true
+    ? "createdAt"
+    : TTimestamps extends { readonly created?: infer C }
+      ? TimestampFieldName<C, "createdAt">
+      : "createdAt"
+
+type UpdatedAtFieldName<TTimestamps, TTimeSeries = undefined> = [TTimeSeries] extends [
+  undefined | false,
+]
+  ? [TTimestamps] extends [undefined | false]
+    ? never
+    : TTimestamps extends true
+      ? "updatedAt"
+      : TTimestamps extends { readonly updated?: infer U }
+        ? TimestampFieldName<U, "updatedAt">
+        : "updatedAt"
+  : never // time-series entities auto-suppress updatedAt
+
+type VersionFieldName<TVersioned> = [TVersioned] extends [undefined | false]
+  ? never
+  : TVersioned extends true
+    ? "version"
+    : TVersioned extends { readonly field: infer F extends string }
+      ? F
+      : "version"
+
+/**
+ * Apply system-field collision adjustments to an input/create type:
+ *   - Colliding `createdAt`/`updatedAt` become optional (caller may supply or
+ *     let the library auto-generate).
+ *   - Colliding `version` is stripped entirely (optimistic locking requires
+ *     library-managed increment).
+ */
+export type WithSystemCollisions<T, TTimestamps, TVersioned, TTimeSeries = undefined> =
+  IsAny<T> extends true
+    ? T
+    : IsAny<TTimestamps> extends true
+      ? T
+      : IsAny<TVersioned> extends true
+        ? T
+        : Simplify<
+            Omit<
+              T,
+              | (CreatedAtFieldName<TTimestamps> & keyof T)
+              | (UpdatedAtFieldName<TTimestamps, TTimeSeries> & keyof T)
+              | (VersionFieldName<TVersioned> & keyof T)
+            > &
+              Partial<
+                Pick<
+                  T,
+                  | (CreatedAtFieldName<TTimestamps> & keyof T)
+                  | (UpdatedAtFieldName<TTimestamps, TTimeSeries> & keyof T)
+                >
+              >
+          >
+
+/**
+ * Apply system-field collision adjustments to an update type. `createdAt` is
+ * treated as immutable (stripped entirely); `updatedAt` stays optional (it
+ * already is, via `Partial`); `version` is stripped.
+ */
+export type WithSystemCollisionsForUpdate<T, TTimestamps, TVersioned> =
+  IsAny<T> extends true
+    ? T
+    : IsAny<TTimestamps> extends true
+      ? T
+      : IsAny<TVersioned> extends true
+        ? T
+        : Simplify<
+            Omit<
+              T,
+              (CreatedAtFieldName<TTimestamps> & keyof T) | (VersionFieldName<TVersioned> & keyof T)
+            >
+          >
+
 /** Extract primary key composite attribute names as a string union */
 export type PrimaryKeyComposites<TIndexes> = TIndexes extends {
   readonly primary: {
@@ -58,21 +162,41 @@ export type EntityRecordType<
   TTimeSeries = undefined,
 > = ModelType<TModel> & SystemFieldsType<TTimestamps, TVersioned, TTimeSeries>
 
-/** Entity input type: same as model fields (system fields auto-managed) */
-export type EntityInputType<TModel extends Schema.Top> = ModelType<TModel>
+/** Entity input type: model fields with system-colliding fields adjusted. */
+export type EntityInputType<
+  TModel extends Schema.Top,
+  TTimestamps = undefined,
+  TVersioned = undefined,
+  TTimeSeries = undefined,
+> = WithSystemCollisions<ModelType<TModel>, TTimestamps, TVersioned, TTimeSeries>
 
 /** Entity create type: input fields minus identifier (or PK composites as fallback) */
 export type EntityCreateType<
   TModel extends Schema.Top,
   TIndexes,
   TIdentifier extends string | undefined,
-> = [TIdentifier] extends [string]
-  ? Omit<ModelType<TModel>, TIdentifier>
-  : Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes>>
+  TTimestamps = undefined,
+  TVersioned = undefined,
+  TTimeSeries = undefined,
+> = WithSystemCollisions<
+  [TIdentifier] extends [string]
+    ? Omit<ModelType<TModel>, TIdentifier>
+    : Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes>>,
+  TTimestamps,
+  TVersioned,
+  TTimeSeries
+>
 
 /** Entity update type: partial model fields minus primary key composites */
-export type EntityUpdateType<TModel extends Schema.Top, TIndexes> = Partial<
-  Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes>>
+export type EntityUpdateType<
+  TModel extends Schema.Top,
+  TIndexes,
+  TTimestamps = undefined,
+  TVersioned = undefined,
+> = WithSystemCollisionsForUpdate<
+  Partial<Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes>>>,
+  TTimestamps,
+  TVersioned
 >
 
 /**
@@ -129,11 +253,22 @@ type EntityIdentifierValue<E> =
     : string
 
 /** Entity ref input type: when refs present, replace ref fields with branded ID fields */
-export type EntityRefInputType<TModel extends Schema.Top, TRefs> = [TRefs] extends [undefined]
-  ? ModelType<TModel>
-  : Omit<ModelType<TModel>, keyof TRefs & string> & {
-      readonly [K in keyof TRefs & string as `${K}Id`]: EntityIdentifierValue<TRefs[K]>
-    }
+export type EntityRefInputType<
+  TModel extends Schema.Top,
+  TRefs,
+  TTimestamps = undefined,
+  TVersioned = undefined,
+  TTimeSeries = undefined,
+> = [TRefs] extends [undefined]
+  ? EntityInputType<TModel, TTimestamps, TVersioned, TTimeSeries>
+  : WithSystemCollisions<
+      Omit<ModelType<TModel>, keyof TRefs & string> & {
+        readonly [K in keyof TRefs & string as `${K}Id`]: EntityIdentifierValue<TRefs[K]>
+      },
+      TTimestamps,
+      TVersioned,
+      TTimeSeries
+    >
 
 /** Entity ref create type: input minus identifier (or PK composites), ref-aware */
 export type EntityRefCreateType<
@@ -141,20 +276,46 @@ export type EntityRefCreateType<
   TIndexes,
   TRefs,
   TIdentifier extends string | undefined,
+  TTimestamps = undefined,
+  TVersioned = undefined,
+  TTimeSeries = undefined,
 > = [TRefs] extends [undefined]
-  ? EntityCreateType<TModel, TIndexes, TIdentifier>
-  : [TIdentifier] extends [string]
-    ? Omit<EntityRefInputType<TModel, TRefs>, TIdentifier>
-    : Omit<EntityRefInputType<TModel, TRefs>, PrimaryKeyComposites<TIndexes>>
+  ? EntityCreateType<TModel, TIndexes, TIdentifier, TTimestamps, TVersioned, TTimeSeries>
+  : WithSystemCollisions<
+      [TIdentifier] extends [string]
+        ? Omit<
+            Omit<ModelType<TModel>, keyof TRefs & string> & {
+              readonly [K in keyof TRefs & string as `${K}Id`]: EntityIdentifierValue<TRefs[K]>
+            },
+            TIdentifier
+          >
+        : Omit<
+            Omit<ModelType<TModel>, keyof TRefs & string> & {
+              readonly [K in keyof TRefs & string as `${K}Id`]: EntityIdentifierValue<TRefs[K]>
+            },
+            PrimaryKeyComposites<TIndexes>
+          >,
+      TTimestamps,
+      TVersioned,
+      TTimeSeries
+    >
 
 /** Entity ref update type: when refs present, swap ref fields for optional branded ID fields */
-export type EntityRefUpdateType<TModel extends Schema.Top, TIndexes, TRefs> = [TRefs] extends [
-  undefined,
-]
-  ? EntityUpdateType<TModel, TIndexes>
-  : Partial<Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes> | (keyof TRefs & string)>> & {
-      readonly [K in keyof TRefs & string as `${K}Id`]?: EntityIdentifierValue<TRefs[K]>
-    }
+export type EntityRefUpdateType<
+  TModel extends Schema.Top,
+  TIndexes,
+  TRefs,
+  TTimestamps = undefined,
+  TVersioned = undefined,
+> = [TRefs] extends [undefined]
+  ? EntityUpdateType<TModel, TIndexes, TTimestamps, TVersioned>
+  : WithSystemCollisionsForUpdate<
+      Partial<Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes> | (keyof TRefs & string)>> & {
+        readonly [K in keyof TRefs & string as `${K}Id`]?: EntityIdentifierValue<TRefs[K]>
+      },
+      TTimestamps,
+      TVersioned
+    >
 
 /** Error type contribution from refs — never when no refs, RefNotFound when refs present */
 export type RefErrors<TRefs> = [TRefs] extends [undefined] ? never : RefNotFound
@@ -212,9 +373,6 @@ type CaseInsensitive<T> = T extends string ? T | Lowercase<T> : T
 
 /** Apply CaseInsensitive to all properties of an object type */
 type CaseInsensitiveProps<T> = { [K in keyof T]: CaseInsensitive<T[K]> }
-
-/** Flatten an intersection into a plain object type for clean IDE hover display */
-type Simplify<T> = { [K in keyof T]: T[K] } & {}
 
 /**
  * Compute the typed query input for a specific index.

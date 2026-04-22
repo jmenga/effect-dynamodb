@@ -4533,7 +4533,7 @@ describe("Entity", () => {
         mockPutItem.mockResolvedValue({})
         yield* EventEntity.put({
           eventId: "e-1",
-          occurredAt: "2024-01-01T00:00:00.000Z",
+          occurredAt: DateTime.makeUnsafe("2024-01-01T00:00:00.000Z"),
         }).asEffect()
 
         const call = mockPutItem.mock.calls[0]![0]
@@ -4547,7 +4547,7 @@ describe("Entity", () => {
         mockPutItem.mockResolvedValue({})
         yield* EventEpochEntity.put({
           eventId: "e-1",
-          occurredAt: 1704067200,
+          occurredAt: DateTime.makeUnsafe(1704067200000),
         }).asEffect()
 
         const call = mockPutItem.mock.calls[0]![0]
@@ -4561,7 +4561,7 @@ describe("Entity", () => {
         mockPutItem.mockResolvedValue({})
         yield* EventStoredAsEntity.put({
           eventId: "e-1",
-          occurredAt: "2024-01-01T00:00:00.000Z",
+          occurredAt: DateTime.makeUnsafe("2024-01-01T00:00:00.000Z"),
         }).asEffect()
 
         const call = mockPutItem.mock.calls[0]![0]
@@ -4691,7 +4691,7 @@ describe("Entity", () => {
         })
 
         const result = yield* EventEpochEntity.update({ eventId: "e-1" }).pipe(
-          Entity.set({ occurredAt: 1704153600 }),
+          Entity.set({ occurredAt: DateTime.makeUnsafe(1704153600000) }),
           Entity.asModel,
         )
         expect(DateTime.isDateTime(result.occurredAt)).toBe(true)
@@ -4797,8 +4797,8 @@ describe("Entity", () => {
         mockPutItem.mockResolvedValue({})
         yield* OrderEntity.put({
           orderId: "o-1",
-          placedAt: "2024-01-01T00:00:00.000Z",
-          expiresAt: "2024-02-01T00:00:00.000Z",
+          placedAt: DateTime.makeUnsafe("2024-01-01T00:00:00.000Z"),
+          expiresAt: DateTime.makeUnsafe("2024-02-01T00:00:00.000Z"),
         }).asEffect()
         const call = mockPutItem.mock.calls[0]![0]
         const item = call.Item
@@ -4851,8 +4851,8 @@ describe("Entity", () => {
         mockPutItem.mockResolvedValue({})
         yield* OrderFullEntity.put({
           orderId: "o-1",
-          placedAt: "2024-01-01T00:00:00.000Z",
-          expiresAt: "2024-02-01T00:00:00.000Z",
+          placedAt: DateTime.makeUnsafe("2024-01-01T00:00:00.000Z"),
+          expiresAt: DateTime.makeUnsafe("2024-02-01T00:00:00.000Z"),
         }).asEffect()
         const call = mockPutItem.mock.calls[0]![0]
         const item = call.Item
@@ -6918,6 +6918,195 @@ describe("Entity", () => {
           }
         }).pipe(Effect.provide(TestLayer)),
       )
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // Domain-value input decode (issue #19) + timestamps optional-input
+  // ---------------------------------------------------------------------------
+
+  describe("domain-value input decode & timestamp collision", () => {
+    // Reporter's repro (github issue #19): model declares createdAt as a
+    // date-annotated schema, put() accepts a domain DateTime.Utc.
+    class Account extends Schema.Class<Account>("Account")({
+      id: Schema.String,
+      createdAt: Schema.DateTimeUtcFromString,
+    }) {}
+
+    const AccountEntity = withConfig(
+      Entity.make({
+        model: Account,
+        entityType: "Account",
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+        timestamps: false,
+      }),
+    )
+
+    it.effect("put: accepts domain DateTime.Utc for model-declared date field (#19)", () =>
+      Effect.gen(function* () {
+        mockPutItem.mockResolvedValue({})
+        const createdAt = DateTime.makeUnsafe("2024-01-01T00:00:00.000Z")
+        yield* AccountEntity.put({ id: "a-1", createdAt }).asEffect()
+        const item = mockPutItem.mock.calls[0]![0].Item
+        expect(item.createdAt).toEqual({ S: "2024-01-01T00:00:00.000Z" })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // Optional-input: model declares createdAt + timestamps:true. User may
+    // omit the field (library generates) or supply it (user value wins).
+    class AuditedDoc extends Schema.Class<AuditedDoc>("AuditedDoc")({
+      id: Schema.String,
+      title: Schema.String,
+      createdAt: Schema.DateTimeUtcFromString,
+      updatedAt: Schema.DateTimeUtcFromString,
+    }) {}
+
+    const AuditedDocEntity = withConfig(
+      Entity.make({
+        model: AuditedDoc,
+        entityType: "AuditedDoc",
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+        timestamps: true,
+      }),
+    )
+
+    it.effect("put: caller may omit colliding timestamp — library generates", () =>
+      Effect.gen(function* () {
+        mockPutItem.mockResolvedValue({})
+        yield* AuditedDocEntity.put({ id: "d-1", title: "hello" }).asEffect()
+        const item = mockPutItem.mock.calls[0]![0].Item
+        expect(item.createdAt.S).toBeTypeOf("string")
+        expect(item.updatedAt.S).toBeTypeOf("string")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("put: caller-supplied timestamp wins over library-generated", () =>
+      Effect.gen(function* () {
+        mockPutItem.mockResolvedValue({})
+        const fixed = DateTime.makeUnsafe("2020-06-15T12:00:00.000Z")
+        yield* AuditedDocEntity.put({
+          id: "d-2",
+          title: "imported",
+          createdAt: fixed,
+          updatedAt: fixed,
+        }).asEffect()
+        const item = mockPutItem.mock.calls[0]![0].Item
+        expect(item.createdAt).toEqual({ S: "2020-06-15T12:00:00.000Z" })
+        expect(item.updatedAt).toEqual({ S: "2020-06-15T12:00:00.000Z" })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("update: .set({ updatedAt }) — user value flows through", () =>
+      Effect.gen(function* () {
+        mockUpdateItem.mockResolvedValue({
+          Attributes: toAttributeMap({
+            pk: "$myapp#v1#auditeddoc#d-3",
+            sk: "$myapp#v1#auditeddoc",
+            id: "d-3",
+            title: "x",
+            createdAt: "2024-01-01T00:00:00.000Z",
+            updatedAt: "2024-06-01T00:00:00.000Z",
+            __edd_e__: "AuditedDoc",
+          }),
+        })
+        const pinned = DateTime.makeUnsafe("2024-06-01T00:00:00.000Z")
+        yield* AuditedDocEntity.update({ id: "d-3" })
+          .pipe(Entity.set({ updatedAt: pinned }))
+          .asEffect()
+        const call = mockUpdateItem.mock.calls[0]![0]
+        const uaValueKey = Object.keys(call.ExpressionAttributeValues).find(
+          (k) =>
+            (call.ExpressionAttributeValues as Record<string, { S?: string }>)[k]?.S ===
+            "2024-06-01T00:00:00.000Z",
+        )
+        expect(uaValueKey).toBeDefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // Domain-adaptive generation: model declares createdAt with a non-default
+    // encoding (epoch seconds). Library-generated value uses that storage.
+    class EpochDoc extends Schema.Class<EpochDoc>("EpochDoc")({
+      id: Schema.String,
+      createdAt: Schema.DateTimeUtcFromString.pipe(
+        DynamoModel.storedAs(DynamoModel.DateEpochSeconds),
+      ),
+    }) {}
+
+    const EpochDocEntity = withConfig(
+      Entity.make({
+        model: EpochDoc,
+        entityType: "EpochDoc",
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+        timestamps: true,
+      }),
+    )
+
+    it.effect("put: library-generated timestamp respects model field encoding", () =>
+      Effect.gen(function* () {
+        mockPutItem.mockResolvedValue({})
+        yield* EpochDocEntity.put({ id: "e-1" }).asEffect()
+        const item = mockPutItem.mock.calls[0]![0].Item
+        // createdAt stored as epoch-seconds number (not ISO string) because the
+        // model field declares DateEpochSeconds storage.
+        expect(item.createdAt.N).toBeTypeOf("string")
+        expect(Number.parseInt(item.createdAt.N as string, 10)).toBeGreaterThan(1_700_000_000)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // Non-date collision: library silently yields the field to the user.
+    it.effect("put: non-date createdAt collision — user owns the field", () =>
+      Effect.gen(function* () {
+        class Log extends Schema.Class<Log>("Log")({
+          id: Schema.String,
+          createdAt: Schema.String, // user-owned "2025-01-15" string, not a timestamp
+        }) {}
+        const LogEntity = withConfig(
+          Entity.make({
+            model: Log,
+            entityType: "Log",
+            primaryKey: {
+              pk: { field: "pk", composite: ["id"] },
+              sk: { field: "sk", composite: ["createdAt"] },
+            },
+            timestamps: true, // still active; library manages `updatedAt`
+          }),
+        )
+        mockPutItem.mockResolvedValue({})
+        yield* LogEntity.put({ id: "l-1", createdAt: "2025-01-15" }).asEffect()
+        const item = mockPutItem.mock.calls[0]![0].Item
+        // User's value stored as-is (not overwritten by a library-generated timestamp).
+        expect(item.createdAt).toEqual({ S: "2025-01-15" })
+        // `updatedAt` is still library-managed (not colliding).
+        expect(item.updatedAt.S).toBeTypeOf("string")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // Collision validation.
+    it("Entity.make: errors when `version` is declared in the model alongside versioned (EDD-9021)", () => {
+      class Bad extends Schema.Class<Bad>("Bad")({
+        id: Schema.String,
+        version: Schema.Number,
+      }) {}
+      expect(() =>
+        Entity.make({
+          model: Bad,
+          entityType: "Bad",
+          primaryKey: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
+          },
+          versioned: true,
+        }),
+      ).toThrow(/EDD-9021/)
     })
   })
 })

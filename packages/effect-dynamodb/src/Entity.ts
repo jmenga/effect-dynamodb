@@ -8,7 +8,7 @@
  */
 
 import type { AttributeValue, DeleteItemCommandInput } from "@aws-sdk/client-dynamodb"
-import { Duration, Effect, Schema, Stream } from "effect"
+import { DateTime, Duration, Effect, Schema, Stream } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import {
   type ConfiguredModel,
@@ -259,6 +259,9 @@ export interface Entity<
     raw: globalThis.Record<string, unknown>,
   ) => Effect.Effect<any, ValidationError>
 
+  /** @internal Convert domain date-annotated fields to storage primitives in place. Used by Transaction/Batch. */
+  readonly _serializeDateFields: (item: globalThis.Record<string, unknown>) => void
+
   /** @internal Attach model class prototype to a decoded plain object (no-op for Schema.Struct models). */
   readonly _attachPrototype: (decoded: any) => any
 
@@ -301,7 +304,9 @@ export interface Entity<
    * })
    * ```
    */
-  readonly inputSchema: Schema.Codec<EntityRefInputType<TModel, TRefs>>
+  readonly inputSchema: Schema.Codec<
+    EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>
+  >
 
   /**
    * Typed create schema. Input fields minus primary key composites — the common
@@ -315,13 +320,17 @@ export interface Entity<
    * })
    * ```
    */
-  readonly createSchema: Schema.Codec<EntityRefCreateType<TModel, TIndexes, TRefs, TIdentifier>>
+  readonly createSchema: Schema.Codec<
+    EntityRefCreateType<TModel, TIndexes, TRefs, TIdentifier, TTimestamps, TVersioned, TTimeSeries>
+  >
 
   /**
    * Typed update schema. Partial fields minus primary key composites and immutable fields.
    * Ref fields are replaced with optional branded ID fields.
    */
-  readonly updateSchema: Schema.Codec<EntityRefUpdateType<TModel, TIndexes, TRefs>>
+  readonly updateSchema: Schema.Codec<
+    EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>
+  >
 
   // --- CRUD Operations ---
 
@@ -337,7 +346,7 @@ export interface Entity<
 
   /** Create or replace an item. Returns a lazy {@link EntityPut} intermediate. */
   readonly put: (
-    input: EntityRefInputType<TModel, TRefs>,
+    input: EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
   ) => EntityPut<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
@@ -354,7 +363,7 @@ export interface Entity<
   ) => EntityUpdate<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
-    EntityRefUpdateType<TModel, TIndexes, TRefs>,
+    EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
     | DynamoClientError
     | ItemNotFound
     | OptimisticLockError
@@ -374,7 +383,7 @@ export interface Entity<
    * primary key already exists. Equivalent to `put(input)` with an `attribute_not_exists` condition.
    */
   readonly create: (
-    input: EntityRefInputType<TModel, TRefs>,
+    input: EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
   ) => EntityPut<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
@@ -395,7 +404,7 @@ export interface Entity<
   ) => EntityUpdate<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
-    EntityRefUpdateType<TModel, TIndexes, TRefs>,
+    EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
     | DynamoClientError
     | ItemNotFound
     | OptimisticLockError
@@ -426,7 +435,7 @@ export interface Entity<
    * Does NOT support unique constraints or retain (cannot determine if item existed).
    */
   readonly upsert: (
-    input: EntityRefInputType<TModel, TRefs>,
+    input: EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
   ) => EntityPut<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
@@ -542,11 +551,11 @@ export interface Entity<
    */
   readonly set: {
     (
-      updates: EntityRefUpdateType<TModel, TIndexes, TRefs>,
+      updates: EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
     ): <A, Rec, U, E, R>(self: EntityUpdate<A, Rec, U, E, R>) => EntityUpdate<A, Rec, U, E, R>
     <A, Rec, U, E, R>(
       self: EntityUpdate<A, Rec, U, E, R>,
-      updates: EntityRefUpdateType<TModel, TIndexes, TRefs>,
+      updates: EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
     ): EntityUpdate<A, Rec, U, E, R>
   }
 
@@ -687,6 +696,8 @@ export interface BoundEntity<
   TRefs extends globalThis.Record<string, AnyRefValue> | undefined,
   TKey = EntityKeyType<TModel, TIndexes>,
   TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
+  TTimestamps extends TimestampsConfig | undefined = undefined,
+  TVersioned extends VersionedConfig | undefined = undefined,
 > {
   // --- CRUD Operations ---
 
@@ -705,7 +716,7 @@ export interface BoundEntity<
    * ```
    */
   readonly put: (
-    input: EntityRefInputType<TModel, TRefs>,
+    input: EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
   ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
     ModelType<TModel>,
@@ -717,7 +728,7 @@ export interface BoundEntity<
    * primary key already exists. Returns a fluent {@link BoundPut}.
    */
   readonly create: (
-    input: EntityRefInputType<TModel, TRefs>,
+    input: EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
   ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
     ModelType<TModel>,
@@ -742,7 +753,7 @@ export interface BoundEntity<
   ) => import("./internal/BoundCrud.js").BoundUpdate<
     ModelType<TModel>,
     ModelType<TModel>,
-    EntityRefUpdateType<TModel, TIndexes, TRefs>,
+    EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
     | DynamoClientError
     | ItemNotFound
     | OptimisticLockError
@@ -773,7 +784,7 @@ export interface BoundEntity<
    * createdAt so they're only set on first creation.
    */
   readonly upsert: (
-    input: EntityRefInputType<TModel, TRefs>,
+    input: EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
   ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
     ModelType<TModel>,
@@ -793,7 +804,7 @@ export interface BoundEntity<
   ) => import("./internal/BoundCrud.js").BoundUpdate<
     ModelType<TModel>,
     ModelType<TModel>,
-    EntityRefUpdateType<TModel, TIndexes, TRefs>,
+    EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
     | DynamoClientError
     | ItemNotFound
     | OptimisticLockError
@@ -1199,7 +1210,26 @@ const makeImpl = <
   const isSchemaClass = typeof rawModel === "function"
   const modelFields = getFields(rawModel)
   const hasHiddenFields = Object.values(modelFields).some(isHidden)
-  const systemFields = resolveSystemFields(config.timestamps, config.versioned, config.timeSeries)
+  const systemFields = resolveSystemFields(
+    config.timestamps,
+    config.versioned,
+    config.timeSeries,
+    modelFields,
+    configuredAttributes,
+  )
+
+  // System-field collision validation (EDD-9021).
+  // Timestamp collisions with a non-date model field silently yield the field
+  // to the user (see `resolveSystemFields`). `version` is different — there's
+  // no compatible "user owns this" pattern because optimistic locking requires
+  // library-managed increment.
+  if (systemFields.versionCollision && systemFields.version) {
+    throw new Error(
+      `[EDD-9021] Entity "${config.entityType}": model field "${systemFields.version}" ` +
+        `collides with the versioned system field. Remove it from the model — the library ` +
+        `manages \`version\` automatically when \`versioned\` is configured.`,
+    )
+  }
 
   // ---------------------------------------------------------------------------
   // Validate indexes
@@ -1619,11 +1649,34 @@ const makeImpl = <
   /**
    * Generate a timestamp value appropriate for the field's encoding.
    * Default (no encoding): ISO string. Custom encoding: serialized primitive.
+   *
+   * Used for non-colliding system fields (field not declared in model) — the
+   * value is written straight into the DynamoDB item and is NOT routed through
+   * `serializeDateFields` (because the field is absent from `fieldEncodings`).
    */
   const generateTimestamp = (encoding: DynamoEncoding | null): string | number => {
     if (!encoding) return nowIso()
     const now = new Date()
     return serializeDateForDynamo(now, encoding)
+  }
+
+  /**
+   * Generate a timestamp as a domain value (DateTime.Utc / DateTime.Zoned / Date),
+   * matching the field's declared domain. Used for system fields that COLLIDE
+   * with a model-declared field — the value flows through `serializeDateFields`
+   * (which requires a domain value) alongside any user-supplied override.
+   */
+  const generateDomainTimestamp = (
+    encoding: DynamoEncoding,
+  ): DateTime.Utc | DateTime.Zoned | Date => {
+    switch (encoding.domain) {
+      case "DateTime.Utc":
+        return DateTime.makeUnsafe(new Date())
+      case "DateTime.Zoned":
+        return DateTime.makeZonedUnsafe(new Date(), { timeZone: "UTC" })
+      case "Date":
+        return new Date()
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -2000,7 +2053,7 @@ const makeImpl = <
 
           // Decode input
           const decodedInput = yield* Schema.decodeUnknownEffect(
-            schemas.inputSchema as Schema.Codec<any>,
+            schemas.inputDecodeSchema as Schema.Codec<any>,
           )(input).pipe(
             Effect.mapError(
               (cause) =>
@@ -2023,11 +2076,29 @@ const makeImpl = <
           // Build the DynamoDB item
           const item: globalThis.Record<string, unknown> = { ...decoded }
 
-          // Add system fields (encoding-aware timestamps)
-          if (systemFields.createdAt)
-            item[systemFields.createdAt] = generateTimestamp(systemFields.createdAtEncoding)
-          if (systemFields.updatedAt)
-            item[systemFields.updatedAt] = generateTimestamp(systemFields.updatedAtEncoding)
+          // Add system fields. When a timestamp field collides with a
+          // model-declared field, the user may have supplied their own value
+          // (see `inputDecodeSchema` — optional on collision). Respect their
+          // value if present; otherwise generate. In the collision path the
+          // value is a DOMAIN value (DateTime.Utc / Date / ...) so it flows
+          // through `serializeDateFields` downstream. Non-colliding fields
+          // get a storage primitive directly (no `serializeDateFields` pass).
+          if (systemFields.createdAt) {
+            if (item[systemFields.createdAt] === undefined) {
+              item[systemFields.createdAt] =
+                systemFields.createdAtCollision && systemFields.createdAtEncoding
+                  ? generateDomainTimestamp(systemFields.createdAtEncoding)
+                  : generateTimestamp(systemFields.createdAtEncoding)
+            }
+          }
+          if (systemFields.updatedAt) {
+            if (item[systemFields.updatedAt] === undefined) {
+              item[systemFields.updatedAt] =
+                systemFields.updatedAtCollision && systemFields.updatedAtEncoding
+                  ? generateDomainTimestamp(systemFields.updatedAtEncoding)
+                  : generateTimestamp(systemFields.updatedAtEncoding)
+            }
+          }
           if (systemFields.version) item[systemFields.version] = 1
 
           // Add entity type discriminator
@@ -2327,7 +2398,7 @@ const makeImpl = <
 
           // Decode updates
           const decodedUpdates = yield* Schema.decodeUnknownEffect(
-            schemas.updateSchema as Schema.Codec<any>,
+            schemas.updateDecodeSchema as Schema.Codec<any>,
           )(updates ?? {}).pipe(
             Effect.mapError(
               (cause) =>
@@ -2448,11 +2519,20 @@ const makeImpl = <
               }
             }
 
-            // Increment version and update timestamp
+            // Increment version and update timestamp. If the caller supplied a
+            // value for `updatedAt` (allowed when the field collides with a
+            // model-declared field), respect it; else generate.
             const newVersion = currentVersion + 1
             if (systemFields.version) newItem[systemFields.version] = newVersion
-            if (systemFields.updatedAt)
-              newItem[systemFields.updatedAt] = generateTimestamp(systemFields.updatedAtEncoding)
+            if (systemFields.updatedAt) {
+              const userSupplied = (hydratedUpdates as globalThis.Record<string, unknown>)[
+                systemFields.updatedAt
+              ]
+              newItem[systemFields.updatedAt] =
+                userSupplied !== undefined
+                  ? userSupplied
+                  : generateTimestamp(systemFields.updatedAtEncoding)
+            }
 
             // Convert DynamoDB attribute names to domain names for key composition
             // and sentinel value comparison (newItem was built from currentRaw which
@@ -2697,11 +2777,22 @@ const makeImpl = <
           const values: globalThis.Record<string, AttributeValue> = {}
           let counter = 0
 
+          // Serialize any domain-value date fields in updates to storage primitives.
+          // Without this, a `.set({ occurredAt: DateTime.Utc })` would marshal as a
+          // class-instance map.
+          const serializedUpdates = { ...hydratedUpdates } as globalThis.Record<string, unknown>
+          serializeDateFields(serializedUpdates)
+
+          // System-colliding updatedAt is handled by the system-field block below.
+          // createdAt and version are already excluded by `updateDecodeSchema`.
+          const updateSystemColliders = new Set<string>()
+          if (systemFields.updatedAtCollision && systemFields.updatedAt)
+            updateSystemColliders.add(systemFields.updatedAt)
+
           // Add user-provided updates
-          for (const [attr, val] of Object.entries(
-            hydratedUpdates as globalThis.Record<string, unknown>,
-          )) {
+          for (const [attr, val] of Object.entries(serializedUpdates)) {
             if (val === undefined) continue
+            if (updateSystemColliders.has(attr)) continue
             const nameKey = `#u${counter}`
             const valKey = `:u${counter}`
             names[nameKey] = resolveDbName(attr)
@@ -2710,12 +2801,18 @@ const makeImpl = <
             counter++
           }
 
-          // Add updatedAt timestamp (encoding-aware)
+          // Add updatedAt timestamp. User-supplied value wins (pre-serialized
+          // above); else fall back to a freshly generated storage primitive.
           if (systemFields.updatedAt) {
+            const userSupplied = serializedUpdates[systemFields.updatedAt]
             const nameKey = `#u${counter}`
             const valKey = `:u${counter}`
             names[nameKey] = systemFields.updatedAt
-            values[valKey] = toAttributeValue(generateTimestamp(systemFields.updatedAtEncoding))
+            values[valKey] = toAttributeValue(
+              userSupplied !== undefined
+                ? userSupplied
+                : generateTimestamp(systemFields.updatedAtEncoding),
+            )
             setClauses.push(`${nameKey} = ${valKey}`)
             counter++
           }
@@ -3268,7 +3365,7 @@ const makeImpl = <
 
           // Decode input
           const decodedInput = yield* Schema.decodeUnknownEffect(
-            schemas.inputSchema as Schema.Codec<any>,
+            schemas.inputDecodeSchema as Schema.Codec<any>,
           )(input).pipe(
             Effect.mapError(
               (cause) =>
@@ -3300,6 +3397,16 @@ const makeImpl = <
           // Determine primary key composite attribute names
           const pkComposites = new Set(primaryKeyComposites(config.indexes))
 
+          // System-colliding fields are written below in the system-field block
+          // (so their semantics — if_not_exists / always-set — stay consistent).
+          const systemColliders = new Set<string>()
+          if (systemFields.createdAtCollision && systemFields.createdAt)
+            systemColliders.add(systemFields.createdAt)
+          if (systemFields.updatedAtCollision && systemFields.updatedAt)
+            systemColliders.add(systemFields.updatedAt)
+          if (systemFields.versionCollision && systemFields.version)
+            systemColliders.add(systemFields.version)
+
           // Serialize date fields on the decoded item
           if (hasDateFields) {
             serializeDateFields(item)
@@ -3308,6 +3415,7 @@ const makeImpl = <
           // All model fields (excluding PK composites, which are in the Key)
           for (const [attr, val] of Object.entries(item)) {
             if (pkComposites.has(attr)) continue
+            if (systemColliders.has(attr)) continue
             if (val === undefined) continue
 
             const nameKey = `#u${counter}`
@@ -3351,22 +3459,34 @@ const makeImpl = <
             counter++
           }
 
-          // Add createdAt with if_not_exists — only set on first create
+          // Add createdAt with if_not_exists — only set on first create.
+          // User-supplied value wins (domain input → already serialized above);
+          // else fall back to a freshly generated storage primitive.
           if (systemFields.createdAt) {
+            const userSupplied = item[systemFields.createdAt]
             const nameKey = `#u${counter}`
             const valKey = `:u${counter}`
             names[nameKey] = systemFields.createdAt
-            values[valKey] = toAttributeValue(generateTimestamp(systemFields.createdAtEncoding))
+            values[valKey] = toAttributeValue(
+              userSupplied !== undefined
+                ? userSupplied
+                : generateTimestamp(systemFields.createdAtEncoding),
+            )
             setClauses.push(`${nameKey} = if_not_exists(${nameKey}, ${valKey})`)
             counter++
           }
 
-          // Add updatedAt — always set to current time
+          // Add updatedAt — user-supplied wins, else always set to current time.
           if (systemFields.updatedAt) {
+            const userSupplied = item[systemFields.updatedAt]
             const nameKey = `#u${counter}`
             const valKey = `:u${counter}`
             names[nameKey] = systemFields.updatedAt
-            values[valKey] = toAttributeValue(generateTimestamp(systemFields.updatedAtEncoding))
+            values[valKey] = toAttributeValue(
+              userSupplied !== undefined
+                ? userSupplied
+                : generateTimestamp(systemFields.updatedAtEncoding),
+            )
             setClauses.push(`${nameKey} = ${valKey}`)
             counter++
           }
@@ -4403,6 +4523,7 @@ const makeImpl = <
     _resolvedRefs: resolvedRefs,
     /** @internal Full decode pipeline: rename + date deser + schema decode. Used by Batch/Aggregate. */
     _decodeRecord: decodeRecord,
+    _serializeDateFields: serializeDateFields,
     _attachPrototype: attachPrototype,
     _configure: (
       injectedSchema: DynamoSchema.DynamoSchema,
@@ -4512,7 +4633,15 @@ export const bind = <
     TTimeSeries
   >,
 ): Effect.Effect<
-  BoundEntity<TModel, TIndexes, TRefs, EntityKeyType<TModel, TIndexes>, TTimeSeries>,
+  BoundEntity<
+    TModel,
+    TIndexes,
+    TRefs,
+    EntityKeyType<TModel, TIndexes>,
+    TTimeSeries,
+    TTimestamps,
+    TVersioned
+  >,
   never,
   DynamoClient | TableConfig
 > =>
@@ -4523,7 +4652,7 @@ export const bind = <
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
 
     type Key = EntityKeyType<TModel, TIndexes>
-    type Input = EntityRefInputType<TModel, TRefs>
+    type Input = EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>
 
     // Shared config for the bound-CRUD builders — pre-resolved services plus
     // a typed PathBuilder/ConditionOps so `.condition((t, ops) => ...)` works.
@@ -4655,7 +4784,9 @@ export const bind = <
       TIndexes,
       TRefs,
       EntityKeyType<TModel, TIndexes>,
-      TTimeSeries
+      TTimeSeries,
+      TTimestamps,
+      TVersioned
     >
   })
 

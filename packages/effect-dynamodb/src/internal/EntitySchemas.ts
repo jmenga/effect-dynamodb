@@ -23,9 +23,65 @@ import type {
 export interface ResolvedSystemFields {
   readonly createdAt: string | null
   readonly createdAtEncoding: DynamoEncoding | null
+  /** True when the model declares a field whose name matches `createdAt`. */
+  readonly createdAtCollision: boolean
   readonly updatedAt: string | null
   readonly updatedAtEncoding: DynamoEncoding | null
+  /** True when the model declares a field whose name matches `updatedAt`. */
+  readonly updatedAtCollision: boolean
   readonly version: string | null
+  /** True when the model declares a field whose name matches `version`. */
+  readonly versionCollision: boolean
+}
+
+/**
+ * Minimal shape of the `attributes` record on a ConfiguredModel — we only need
+ * `encoding` here. Declared locally to avoid importing ConfiguredModel types.
+ */
+export type ConfiguredAttributeEncodings = globalThis.Record<
+  string,
+  { readonly encoding?: DynamoEncoding }
+>
+
+/**
+ * Resolve the effective DynamoEncoding for a model-declared field, applying
+ * ConfiguredModel storage overrides on top of schema-level annotations.
+ *
+ * Precedence: schema annotation (getEncoding) > inferred default (Effect date
+ * schemas) > none. ConfiguredModel `storedAs` then overrides storage only,
+ * preserving the domain from the schema side when present.
+ *
+ * Returns `null` if the field is not a date-compatible schema.
+ */
+export const resolveFieldEncoding = (
+  fieldSchema: Schema.Top,
+  override: DynamoEncoding | undefined,
+): DynamoEncoding | null => {
+  let encoding: DynamoEncoding | null =
+    getEncoding(fieldSchema) ?? inferDefaultEncoding(fieldSchema) ?? null
+  if (override) {
+    encoding = {
+      storage: override.storage,
+      domain: encoding?.domain ?? override.domain,
+    }
+  }
+  return encoding
+}
+
+/**
+ * Build the field → DynamoEncoding map for a set of model fields, merging
+ * ConfiguredModel storage overrides. Used at `Entity.make()` time.
+ */
+export const buildFieldEncodings = (
+  modelFields: SchemaFields,
+  configuredAttributes: ConfiguredAttributeEncodings,
+): globalThis.Record<string, DynamoEncoding> => {
+  const encodings: globalThis.Record<string, DynamoEncoding> = {}
+  for (const [fieldName, fieldSchema] of Object.entries(modelFields)) {
+    const encoding = resolveFieldEncoding(fieldSchema, configuredAttributes[fieldName]?.encoding)
+    if (encoding) encodings[fieldName] = encoding
+  }
+  return encodings
 }
 
 /** Check if a value is a Schema (has .ast property) vs a plain config object */
@@ -56,6 +112,8 @@ export const resolveSystemFields = (
   timestamps?: TimestampsConfig | undefined,
   versioned?: VersionedConfig | undefined,
   timeSeries?: TimeSeriesConfig<any> | undefined,
+  modelFields: SchemaFields = {},
+  configuredAttributes: ConfiguredAttributeEncodings = {},
 ): ResolvedSystemFields => {
   let createdAt: string | null = null
   let createdAtEncoding: DynamoEncoding | null = null
@@ -97,7 +155,57 @@ export const resolveSystemFields = (
     }
   }
 
-  return { createdAt, createdAtEncoding, updatedAt, updatedAtEncoding, version }
+  // Collision detection: when the model declares a field whose name matches
+  // an active system field, there are two cases:
+  //   (a) Date-compatible schema → library-managed with user override
+  //       support. Encoding reads from the model field (precedence over
+  //       `timestamps` config default).
+  //   (b) Non-date schema → user owns the field entirely. Library skips
+  //       timestamp management for this field (effectively as if the
+  //       corresponding `timestamps.created`/`updated` was never set).
+  //       This preserves existing patterns where users declare `createdAt`
+  //       as a plain string composite.
+  let createdAtCollision = false
+  if (createdAt && createdAt in modelFields) {
+    const modelEncoding = resolveFieldEncoding(
+      modelFields[createdAt]!,
+      configuredAttributes[createdAt]?.encoding,
+    )
+    if (modelEncoding) {
+      createdAtEncoding = modelEncoding
+      createdAtCollision = true
+    } else {
+      // Non-date collision: user owns the field.
+      createdAt = null
+      createdAtEncoding = null
+    }
+  }
+  let updatedAtCollision = false
+  if (updatedAt && updatedAt in modelFields) {
+    const modelEncoding = resolveFieldEncoding(
+      modelFields[updatedAt]!,
+      configuredAttributes[updatedAt]?.encoding,
+    )
+    if (modelEncoding) {
+      updatedAtEncoding = modelEncoding
+      updatedAtCollision = true
+    } else {
+      updatedAt = null
+      updatedAtEncoding = null
+    }
+  }
+  const versionCollision = !!(version && version in modelFields)
+
+  return {
+    createdAt,
+    createdAtEncoding,
+    createdAtCollision,
+    updatedAt,
+    updatedAtEncoding,
+    updatedAtCollision,
+    version,
+    versionCollision,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -199,12 +307,28 @@ export interface DerivedSchemas {
   readonly modelDecodeSchema: Schema.Codec<any>
   /** Model + system fields schema */
   readonly recordSchema: Schema.Codec<any>
-  /** Same as model (system fields auto-managed) */
+  /**
+   * Typed input schema — the public payload type users see. Ref-aware (ref
+   * fields swapped for ID fields). System-colliding `createdAt`/`updatedAt`
+   * are marked optional; `version` (if colliding) is stripped.
+   */
   readonly inputSchema: Schema.Codec<any>
+  /**
+   * Runtime input decode schema. Same shape as `inputSchema` but with fromSelf
+   * variants for date fields so decode accepts domain values (matches the TS
+   * contract). Used by put/create/upsert at runtime.
+   */
+  readonly inputDecodeSchema: Schema.Codec<any>
   /** Input fields minus primary key composites — the common "create" payload */
   readonly createSchema: Schema.Codec<any>
   /** Optional model fields minus keys and immutable */
   readonly updateSchema: Schema.Codec<any>
+  /**
+   * Runtime update decode schema. Same shape as `updateSchema` but with
+   * fromSelf variants for date fields so decode accepts domain values. Used
+   * by update at runtime.
+   */
+  readonly updateDecodeSchema: Schema.Codec<any>
   /** Primary key composites only */
   readonly keySchema: Schema.Codec<any>
   /** Record + key attrs + __edd_e__ */
@@ -300,23 +424,56 @@ export const buildDerivedSchemas = (
     ...systemSchemaFields,
   })
 
+  // --- System-collision handling for input/update schemas ---
+  // When the model declares a field whose name matches an active system field,
+  // the input shape changes:
+  //   - createdAt / updatedAt → marked optional (user may supply a value or
+  //     leave absent and let the library generate).
+  //   - version → stripped entirely (optimistic locking requires library-
+  //     managed increment; user-supplied values would break the mechanic).
+  // `createdAt` is also treated as immutable in the update schema.
+  const optionalOnCollide = new Set<string>()
+  if (systemFields.createdAtCollision && systemFields.createdAt)
+    optionalOnCollide.add(systemFields.createdAt)
+  if (systemFields.updatedAtCollision && systemFields.updatedAt)
+    optionalOnCollide.add(systemFields.updatedAt)
+  const strippedFromInput = new Set<string>()
+  if (systemFields.versionCollision && systemFields.version)
+    strippedFromInput.add(systemFields.version)
+  const strippedFromUpdate = new Set<string>(strippedFromInput)
+  if (systemFields.createdAtCollision && systemFields.createdAt)
+    strippedFromUpdate.add(systemFields.createdAt)
+
+  const applySystemCollisionAdjustments = (
+    fieldName: string,
+    fieldSchema: Schema.Top,
+    kind: "input" | "update",
+  ): Schema.Top | null => {
+    const strippedSet = kind === "update" ? strippedFromUpdate : strippedFromInput
+    if (strippedSet.has(fieldName)) return null
+    if (optionalOnCollide.has(fieldName)) return Schema.optional(fieldSchema)
+    return fieldSchema
+  }
+
   // --- Input Schema: ref-aware (swap ref fields for ID fields when refs present) ---
   const refFieldSet = new Set(resolvedRefs.map((r) => r.fieldName))
-  const inputSchema =
-    resolvedRefs.length > 0
-      ? (() => {
-          const inputFields: globalThis.Record<string, Schema.Top> = {}
-          for (const [key, field] of Object.entries(modelFields)) {
-            if (refFieldSet.has(key)) continue // skip ref fields
-            inputFields[key] = field
-          }
-          // Add ID fields for each ref (uses the ref entity's identifier schema for branded types)
-          for (const ref of resolvedRefs) {
-            inputFields[ref.idFieldName] = ref.identifierSchema
-          }
-          return Schema.Struct(inputFields)
-        })()
-      : modelSchema
+  const buildInputFieldsAcc = (
+    dateVariant: "transform" | "fromSelf",
+  ): globalThis.Record<string, Schema.Top> => {
+    const acc: globalThis.Record<string, Schema.Top> = {}
+    for (const [key, field] of Object.entries(modelFields)) {
+      if (refFieldSet.has(key)) continue
+      const base = dateVariant === "fromSelf" && fromSelfFields[key] ? fromSelfFields[key] : field
+      const adjusted = applySystemCollisionAdjustments(key, base, "input")
+      if (adjusted !== null) acc[key] = adjusted
+    }
+    for (const ref of resolvedRefs) {
+      acc[ref.idFieldName] = ref.identifierSchema
+    }
+    return acc
+  }
+  const inputSchema = Schema.Struct(buildInputFieldsAcc("transform") as Schema.Struct.Fields)
+  const inputDecodeSchema = Schema.Struct(buildInputFieldsAcc("fromSelf") as Schema.Struct.Fields)
 
   // --- Create Schema: input fields minus identifier (or PK composites as fallback) ---
   const pkComposites = new Set(primaryKeyComposites(indexes))
@@ -325,7 +482,8 @@ export const buildDerivedSchemas = (
   for (const [key, field] of Object.entries(modelFields)) {
     if (createOmitFields.has(key)) continue // skip identifier/PK composites (auto-generated)
     if (refFieldSet.has(key)) continue // skip ref fields (replaced by ID fields)
-    createFieldsAcc[key] = field
+    const adjusted = applySystemCollisionAdjustments(key, field, "input")
+    if (adjusted !== null) createFieldsAcc[key] = adjusted
   }
   // Add ID fields for each ref (skip if the ref field is an omitted field)
   for (const ref of resolvedRefs) {
@@ -335,20 +493,27 @@ export const buildDerivedSchemas = (
   const createSchema = Schema.Struct(createFieldsAcc as Schema.Struct.Fields)
 
   // --- Update Schema: optional model fields minus key composites & immutable ---
-  const updateFieldsAcc: globalThis.Record<string, Schema.Top> = {}
-  for (const [key, field] of Object.entries(modelFields)) {
-    if (pkComposites.has(key)) continue
-    if (immutableFields.has(key)) continue
-    if (refFieldSet.has(key)) continue // skip ref fields in update (replaced by ID fields)
-    updateFieldsAcc[key] = Schema.optional(field)
+  const buildUpdateFieldsAcc = (
+    dateVariant: "transform" | "fromSelf",
+  ): globalThis.Record<string, Schema.Top> => {
+    const acc: globalThis.Record<string, Schema.Top> = {}
+    for (const [key, field] of Object.entries(modelFields)) {
+      if (pkComposites.has(key)) continue
+      if (immutableFields.has(key)) continue
+      if (refFieldSet.has(key)) continue
+      if (strippedFromUpdate.has(key)) continue
+      const base = dateVariant === "fromSelf" && fromSelfFields[key] ? fromSelfFields[key] : field
+      acc[key] = Schema.optional(base)
+    }
+    for (const ref of resolvedRefs) {
+      if (pkComposites.has(ref.fieldName)) continue
+      if (immutableFields.has(ref.fieldName)) continue
+      acc[ref.idFieldName] = Schema.optional(ref.identifierSchema)
+    }
+    return acc
   }
-  // Add optional ID fields for each ref in update (uses ref entity's identifier schema)
-  for (const ref of resolvedRefs) {
-    if (pkComposites.has(ref.fieldName)) continue // ref on PK composite — skip
-    if (immutableFields.has(ref.fieldName)) continue // immutable ref — skip
-    updateFieldsAcc[ref.idFieldName] = Schema.optional(ref.identifierSchema)
-  }
-  const updateSchema = Schema.Struct(updateFieldsAcc as Schema.Struct.Fields)
+  const updateSchema = Schema.Struct(buildUpdateFieldsAcc("transform") as Schema.Struct.Fields)
+  const updateDecodeSchema = Schema.Struct(buildUpdateFieldsAcc("fromSelf") as Schema.Struct.Fields)
 
   // --- Key Schema: primary key composite attributes only ---
   const keyCompositeNames = primaryKeyComposites(indexes)
@@ -446,8 +611,10 @@ export const buildDerivedSchemas = (
     modelDecodeSchema: modelDecodeVisibleSchema as unknown as S,
     recordSchema: recordVisibleSchema as unknown as S,
     inputSchema: inputSchema as unknown as S,
+    inputDecodeSchema: inputDecodeSchema as unknown as S,
     createSchema: createSchema as unknown as S,
     updateSchema: updateSchema as unknown as S,
+    updateDecodeSchema: updateDecodeSchema as unknown as S,
     keySchema: keySchema as unknown as S,
     itemSchema: itemSchema as unknown as S,
     deletedRecordSchema: deletedRecordSchema as unknown as S,
