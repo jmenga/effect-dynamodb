@@ -7,14 +7,15 @@ This guide covers rich update operations, batch operations, multi-table design, 
 
 ## Updating Items
 
-Beyond `Entity.set()`, effect-dynamodb provides combinators for all DynamoDB update expression types. All compose as variadic arguments to `update()` and execute as one `UpdateItem` call.
+Beyond `.set()`, effect-dynamodb provides combinators for all DynamoDB update expression types. Chain them on the `BoundUpdate` builder from `db.entities.X.update(key)` — they compile to one `UpdateItem` call.
 
 ### Removing Attributes
 
 Deletes attributes entirely from the item:
 
 ```typescript region="remove" example="guide-advanced.ts"
-yield* db.entities.Products.update({ productId: "p-1" }, Entity.remove(["description"]))
+  // #region remove
+  yield* db.entities.Products.update({ productId: "p-1" }).remove(["description"])
 ```
 
 ### Atomic Increment
@@ -22,7 +23,7 @@ yield* db.entities.Products.update({ productId: "p-1" }, Entity.remove(["descrip
 Atomically increments numeric attributes. Thread-safe — no read-modify-write cycle:
 
 ```typescript region="add" example="guide-advanced.ts"
-yield* db.entities.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1, stock: 50 }))
+yield* db.entities.Products.update({ productId: "p-1" }).add({ viewCount: 1, stock: 50 })
 ```
 
 ### Atomic Decrement
@@ -30,7 +31,7 @@ yield* db.entities.Products.update({ productId: "p-1" }, Entity.add({ viewCount:
 Synthesizes `SET #field = #field - :val` (DynamoDB has no native subtract):
 
 ```typescript region="subtract" example="guide-advanced.ts"
-yield* db.entities.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
+yield* db.entities.Products.update({ productId: "p-1" }).subtract({ stock: 3 })
 ```
 
 ### Appending to Lists
@@ -38,10 +39,10 @@ yield* db.entities.Products.update({ productId: "p-1" }, Entity.subtract({ stock
 Appends elements to the end of a list attribute using `list_append`:
 
 ```typescript region="append" example="guide-advanced.ts"
-yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Entity.append({ tags: ["on-sale", "featured"] }),
-)
+  // #region append
+  yield* db.entities.Products.update({ productId: "p-1" }).append({
+    tags: ["on-sale", "featured"],
+  })
 ```
 
 ### Removing from Sets
@@ -49,10 +50,10 @@ yield* db.entities.Products.update(
 Removes specific elements from a DynamoDB Set attribute (StringSet, NumberSet):
 
 ```typescript region="delete-from-set" example="guide-advanced.ts"
-yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Entity.deleteFromSet({ categories: new Set(["obsolete"]) }),
-)
+  // #region delete-from-set
+  yield* db.entities.Products.update({ productId: "p-1" }).deleteFromSet({
+    categories: new Set(["obsolete"]),
+  })
 ```
 
 ### Composing Multiple Update Types
@@ -60,15 +61,14 @@ yield* db.entities.Products.update(
 All update combinators compose as arguments — they are merged into one `UpdateItem` call:
 
 ```typescript region="composed-updates" example="guide-advanced.ts"
-yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Entity.set({ name: "Premium Mouse", price: 39.99 }),
-  Entity.add({ viewCount: 10 }),
-  Entity.subtract({ stock: 5 }),
-  Entity.append({ tags: ["premium"] }),
-  Entity.remove(["description"]),
-  Entity.expectedVersion(5),
-)
+  // #region composed-updates
+  yield* db.entities.Products.update({ productId: "p-1" })
+    .set({ name: "Premium Mouse", price: 39.99 })
+    .add({ viewCount: 10 })
+    .subtract({ stock: 5 })
+    .append({ tags: ["premium"] })
+    .remove(["description"])
+    .expectedVersion(5)
 ```
 
 ## Working in Bulk
@@ -103,42 +103,47 @@ Entity-level `condition()` adds a `ConditionExpression` to any mutation (put, up
 Conditional put — only if item doesn't already exist:
 
 ```typescript region="conditional-put" example="guide-advanced.ts"
-// Conditional put — only if item doesn't already exist
-const condPutResult = yield* db.entities.Users.put(
-  { userId: "u-10", email: "new@example.com", displayName: "New User" },
-  Users.condition((t, { notExists }) => notExists(t.email)),
-).pipe(
-  Effect.match({
-    onFailure: (e) => `${e._tag} — already exists`,
-    onSuccess: (u) => `created ${u.displayName}`,
-  }),
-)
+  // #region conditional-put
+  // Conditional put — only if item doesn't already exist
+  const condPutResult = yield* db.entities.Users.put({
+    userId: "u-10",
+    email: "new@example.com",
+    displayName: "New User",
+  })
+    .condition((t, { notExists }) => notExists(t.email))
+    .asEffect()
+    .pipe(
+      Effect.match({
+        onFailure: (e) => `${e._tag} — already exists`,
+        onSuccess: (u) => `created ${u.displayName}`,
+      }),
+    )
 ```
 
 Conditional delete — only if a specific attribute value matches:
 
 ```typescript region="conditional-delete" example="guide-advanced.ts"
-// Conditional delete — only if stock is zero
-const condDeleteResult = yield* db.entities.Products.delete(
-  { productId: "p-1" },
-  Products.condition((t, { eq }) => eq(t.stock, 0)),
-).pipe(
-  Effect.match({
-    onFailure: (e) => `${e._tag} — stock not zero, delete prevented`,
-    onSuccess: () => "deleted (stock was 0)",
-  }),
-)
+  // #region conditional-delete
+  // Conditional delete — only if stock is zero
+  const condDeleteResult = yield* db.entities.Products.delete({ productId: "p-1" })
+    .condition((t, { eq }) => eq(t.stock, 0))
+    .asEffect()
+    .pipe(
+      Effect.match({
+        onFailure: (e) => `${e._tag} — stock not zero, delete prevented`,
+        onSuccess: () => "deleted (stock was 0)",
+      }),
+    )
 ```
 
 Conditional update — only if status matches:
 
 ```typescript region="conditional-update" example="guide-advanced.ts"
-// Conditional update — only if status is "active"
-yield* db.entities.Tasks.update(
-  { taskId: "t-1" },
-  Entity.set({ status: "done" }),
-  Tasks.condition((t, { eq }) => eq(t.status, "active")),
-)
+  // #region conditional-update
+  // Conditional update — only if status is "active"
+  yield* db.entities.Tasks.update({ taskId: "t-1" })
+    .set({ status: "done" })
+    .condition((t, { eq }) => eq(t.status, "active"))
 ```
 
 ### Composing with Optimistic Locking
@@ -146,13 +151,12 @@ yield* db.entities.Tasks.update(
 When using `condition()` on an update that also has `Entity.expectedVersion()`, the user condition is ANDed with the version check:
 
 ```typescript region="optimistic-condition" example="guide-advanced.ts"
-yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Entity.set({ price: 24.99 }),
-  Products.expectedVersion(6),
-  Products.condition((t, { gt }) => gt(t.stock, 0)),
-)
-// ConditionExpression: (#version = :v_lock) AND (#stock > :v0)
+  // #region optimistic-condition
+  yield* db.entities.Products.update({ productId: "p-1" })
+    .set({ price: 24.99 })
+    .expectedVersion(6)
+    .condition((t, { gt }) => gt(t.stock, 0))
+  // ConditionExpression: (#version = :v_lock) AND (#stock > :v0)
 ```
 
 ### Handling ConditionalCheckFailed
@@ -160,11 +164,14 @@ yield* db.entities.Products.update(
 Use `Entity.create()` for typed `ConditionalCheckFailed` error handling — `create()` includes this error in its typed error channel:
 
 ```typescript region="handle-conditional" example="guide-advanced.ts"
-const result = yield* db.entities.Users.create({
-  userId: "u-10",
-  email: "new@example.com",
-  displayName: "New User",
-}).pipe(Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("already exists")))
+  // #region handle-conditional
+  const result = yield* db.entities.Users.create({
+    userId: "u-10",
+    email: "new@example.com",
+    displayName: "New User",
+  })
+    .asEffect()
+    .pipe(Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("already exists")))
 ```
 
 ## Creating Items Safely
@@ -172,22 +179,25 @@ const result = yield* db.entities.Users.create({
 `Entity.create()` is a convenience for "put if not exists" — it's `Entity.put()` with an automatic `attribute_not_exists` condition on the primary key:
 
 ```typescript region="create-safely" example="guide-advanced.ts"
-// Create — fails with ConditionalCheckFailed if item already exists
-const user = yield* db.entities.Users.create({
-  userId: "u-20",
-  email: "alice@example.com",
-  displayName: "Alice",
-})
+  // #region create-safely
+  // Create — fails with ConditionalCheckFailed if item already exists
+  const user = yield* db.entities.Users.create({
+    userId: "u-20",
+    email: "alice@example.com",
+    displayName: "Alice",
+  })
 
-// Duplicate — caught gracefully
-const dup = yield* db.entities.Users.create({
-  userId: "u-20",
-  email: "alice@example.com",
-  displayName: "Alice",
-}).pipe(
-  Effect.map(() => "created"),
-  Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("already exists")),
-)
+  // Duplicate — caught gracefully
+  const dup = yield* db.entities.Users.create({
+    userId: "u-20",
+    email: "alice@example.com",
+    displayName: "Alice",
+  })
+    .asEffect()
+    .pipe(
+      Effect.map(() => "created"),
+      Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("already exists")),
+    )
 ```
 
 ## Working with Multiple Tables

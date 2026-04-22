@@ -64,17 +64,15 @@ The policy is a function so it can branch on the item's current state (e.g. retu
 Declaring `indexPolicy` opts the GSI into **event-style evaluation**: the policy is consulted on every update, regardless of which attributes appear in the payload. "Absent from the payload" is treated as "not set" per the policy — so a `sparse` composite that isn't in the update payload triggers the drop-out rule:
 
 ```typescript region="sparse-drop" example="guide-index-policy.ts"
-// Update WITHOUT alertState in the payload. Because byAlert declares an
-// `indexPolicy` with alertState 'sparse', the GSI is always evaluated on
-// every update — alertState absent from payload is treated as "not set"
-// per the policy → REMOVE gsi1pk/gsi1sk. The item drops out of byAlert.
-yield* db.entities.Devices.update(
-  { channel: "c-1", deviceId: "d-1" },
-  Entity.set({ label: "quiet" }),
-)
+  // #region sparse-drop
+  // Update WITHOUT alertState in the payload. Because byAlert declares an
+  // `indexPolicy` with alertState 'sparse', the GSI is always evaluated on
+  // every update — alertState absent from payload is treated as "not set"
+  // per the policy → REMOVE gsi1pk/gsi1sk. The item drops out of byAlert.
+  yield* db.entities.Devices.update({ channel: "c-1", deviceId: "d-1" }).set({ label: "quiet" })
 
-const afterDrop = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
-// →  afterDrop is empty — item dropped out of the alert GSI
+  const afterDrop = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
+  // →  afterDrop is empty — item dropped out of the alert GSI
 ```
 
 This is the key semantic shift: with `exactOptionalPropertyTypes: true`, a TypeScript object that omits `alertState` is distinct from one that sets `alertState: undefined`. Both now behave identically at runtime — the policy treats both as "not currently set." You don't need to remember to explicitly pass `undefined` to signal drop intent.
@@ -82,13 +80,13 @@ This is the key semantic shift: with `exactOptionalPropertyTypes: true`, a TypeS
 Re-adding the attr re-indexes the item transparently:
 
 ```typescript region="sparse-rehydrate" example="guide-index-policy.ts"
-yield* db.entities.Devices.update(
-  { channel: "c-1", deviceId: "d-1" },
-  Entity.set({ alertState: "cleared" }),
-)
+  // #region sparse-rehydrate
+  yield* db.entities.Devices.update({ channel: "c-1", deviceId: "d-1" }).set({
+    alertState: "cleared",
+  })
 
-const cleared = yield* db.entities.Devices.byAlert({ alertState: "cleared" }).collect()
-// →  cleared contains d-1 under its new alertState
+  const cleared = yield* db.entities.Devices.byAlert({ alertState: "cleared" }).collect()
+  // →  cleared contains d-1 under its new alertState
 ```
 
 ## Preserve — the default
@@ -96,26 +94,25 @@ const cleared = yield* db.entities.Devices.byAlert({ alertState: "cleared" }).co
 With the `preserve` default, a writer that doesn't own every composite of a GSI can still freely update other attrs without touching the GSI:
 
 ```typescript region="hybrid" example="guide-index-policy.ts"
-// Start with an un-indexed device (no tenantId, no alertState).
-yield* db.entities.Devices.put({ channel: "c-2", deviceId: "d-2" })
+  // #region hybrid
+  // Start with an un-indexed device (no tenantId, no alertState).
+  yield* db.entities.Devices.put({ channel: "c-2", deviceId: "d-2" })
 
-// Enrichment writer assigns tenantId.
-yield* db.entities.Devices.update(
-  { channel: "c-2", deviceId: "d-2" },
-  Entity.set({ tenantId: "initech" }),
-)
+  // Enrichment writer assigns tenantId.
+  yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).set({
+    tenantId: "initech",
+  })
 
-// Later, ingest writer sets alertState. tenantId is NOT in this payload,
-// but the preserve policy on byTenant leaves its stored keys alone.
-yield* db.entities.Devices.update(
-  { channel: "c-2", deviceId: "d-2" },
-  Entity.set({ alertState: "active" }),
-)
+  // Later, ingest writer sets alertState. tenantId is NOT in this payload,
+  // but the preserve policy on byTenant leaves its stored keys alone.
+  yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).set({
+    alertState: "active",
+  })
 
-// Both indexes correct — neither writer clobbered the other's composites.
-const finalAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
-const finalTenant = yield* db.entities.Devices.byTenant({ tenantId: "initech" }).collect()
-// →  both queries return d-2
+  // Both indexes correct — neither writer clobbered the other's composites.
+  const finalAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
+  const finalTenant = yield* db.entities.Devices.byTenant({ tenantId: "initech" }).collect()
+  // →  both queries return d-2
 ```
 
 The ingest writer's `Entity.set({ alertState: "active" })` touches `byAlert` (recomposes its keys) and **also** touches `byTenant` (because `byTenant.sk` has `deviceId`, which is in the primary key → always in the merged payload). Because `tenantId` is `"preserve"` and missing from the payload, the library leaves `byTenant`'s stored keys alone rather than rewriting them with a junk value. That's the whole point.
@@ -168,15 +165,13 @@ indexes: {
 ## Cascade precedence
 
 ```typescript region="cascade" example="guide-index-policy.ts"
-// Regardless of indexPolicy, removing a GSI composite attribute drops the
-// item out of that GSI. Cascade takes precedence over preserve/sparse.
-yield* db.entities.Devices.update(
-  { channel: "c-2", deviceId: "d-2" },
-  Entity.remove(["tenantId"]),
-)
+  // #region cascade
+  // Regardless of indexPolicy, removing a GSI composite attribute drops the
+  // item out of that GSI. Cascade takes precedence over preserve/sparse.
+  yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).remove(["tenantId"])
 
-const tenantAfterRemove = yield* db.entities.Devices.byTenant({ tenantId: "initech" }).collect()
-// →  tenantAfterRemove is empty — cascade overrode the preserve policy
+  const tenantAfterRemove = yield* db.entities.Devices.byTenant({ tenantId: "initech" }).collect()
+  // →  tenantAfterRemove is empty — cascade overrode the preserve policy
 ```
 
 An explicit `Entity.remove(["tenantId"])` always REMOVEs every GSI whose composites include `tenantId`, regardless of whether those composites are otherwise marked `"preserve"`. Think of it as: `remove` is the explicit way to opt out of an index, and it overrides the declarative policy.

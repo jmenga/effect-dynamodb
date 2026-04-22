@@ -136,10 +136,7 @@ const program = Effect.gen(function* () {
   // `indexPolicy` with alertState 'sparse', the GSI is always evaluated on
   // every update — alertState absent from payload is treated as "not set"
   // per the policy → REMOVE gsi1pk/gsi1sk. The item drops out of byAlert.
-  yield* db.entities.Devices.update(
-    { channel: "c-1", deviceId: "d-1" },
-    Entity.set({ label: "quiet" }),
-  )
+  yield* db.entities.Devices.update({ channel: "c-1", deviceId: "d-1" }).set({ label: "quiet" })
 
   const afterDrop = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
   // →  afterDrop is empty — item dropped out of the alert GSI
@@ -156,10 +153,9 @@ const program = Effect.gen(function* () {
   yield* Console.log("\n=== 3. Re-adding the sparse composite re-indexes the item ===")
 
   // #region sparse-rehydrate
-  yield* db.entities.Devices.update(
-    { channel: "c-1", deviceId: "d-1" },
-    Entity.set({ alertState: "cleared" }),
-  )
+  yield* db.entities.Devices.update({ channel: "c-1", deviceId: "d-1" }).set({
+    alertState: "cleared",
+  })
 
   const cleared = yield* db.entities.Devices.byAlert({ alertState: "cleared" }).collect()
   // →  cleared contains d-1 under its new alertState
@@ -175,17 +171,15 @@ const program = Effect.gen(function* () {
   yield* db.entities.Devices.put({ channel: "c-2", deviceId: "d-2" })
 
   // Enrichment writer assigns tenantId.
-  yield* db.entities.Devices.update(
-    { channel: "c-2", deviceId: "d-2" },
-    Entity.set({ tenantId: "initech" }),
-  )
+  yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).set({
+    tenantId: "initech",
+  })
 
   // Later, ingest writer sets alertState. tenantId is NOT in this payload,
   // but the preserve policy on byTenant leaves its stored keys alone.
-  yield* db.entities.Devices.update(
-    { channel: "c-2", deviceId: "d-2" },
-    Entity.set({ alertState: "active" }),
-  )
+  yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).set({
+    alertState: "active",
+  })
 
   // Both indexes correct — neither writer clobbered the other's composites.
   const finalAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
@@ -202,10 +196,7 @@ const program = Effect.gen(function* () {
   // #region cascade
   // Regardless of indexPolicy, removing a GSI composite attribute drops the
   // item out of that GSI. Cascade takes precedence over preserve/sparse.
-  yield* db.entities.Devices.update(
-    { channel: "c-2", deviceId: "d-2" },
-    Entity.remove(["tenantId"]),
-  )
+  yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).remove(["tenantId"])
 
   const tenantAfterRemove = yield* db.entities.Devices.byTenant({ tenantId: "initech" }).collect()
   // →  tenantAfterRemove is empty — cascade overrode the preserve policy

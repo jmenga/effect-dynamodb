@@ -303,21 +303,19 @@ Because `leaseEndDate` is an ISO date string, it sorts lexicographically in chro
 Update non-key attributes with `Entity.set()`. The composite key identifies which item to update:
 
 ```typescript region="pattern-5" example="shopping-mall.ts"
-const updated = yield* db.entities.MallStores.update(
-  {
+  // #region pattern-5
+  const updated = yield* db.entities.MallStores.update({
     cityId: "atlanta",
     mallId: "eastpointe",
     buildingId: "bldg-a",
     storeId: "star-coffee",
-  },
-  Entity.set({
+  }).set({
     rent: "4000.00",
     discount: "100.00",
-  }),
-)
-// updated.rent → "4000.00"
-// updated.discount → "100.00"
-// updated.category → "food/coffee" (preserved)
+  })
+  // updated.rent → "4000.00"
+  // updated.discount → "100.00"
+  // updated.category → "food/coffee" (preserved)
 ```
 
 ### Pattern 6: Delete Store

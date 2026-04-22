@@ -148,7 +148,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Entity.remove() ===\n")
 
   // #region remove
-  yield* db.entities.Products.update({ productId: "p-1" }, Entity.remove(["description"]))
+  yield* db.entities.Products.update({ productId: "p-1" }).remove(["description"])
   // #endregion
   yield* Console.log("Removed description from p-1\n")
 
@@ -156,7 +156,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Entity.add() ===\n")
 
   // #region add
-  yield* db.entities.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1, stock: 50 }))
+  yield* db.entities.Products.update({ productId: "p-1" }).add({ viewCount: 1, stock: 50 })
   // #endregion
   yield* Console.log("Incremented viewCount by 1, stock by 50\n")
 
@@ -164,7 +164,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Entity.subtract() ===\n")
 
   // #region subtract
-  yield* db.entities.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
+  yield* db.entities.Products.update({ productId: "p-1" }).subtract({ stock: 3 })
   // #endregion
   yield* Console.log("Decremented stock by 3\n")
 
@@ -172,10 +172,9 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Entity.append() ===\n")
 
   // #region append
-  yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Entity.append({ tags: ["on-sale", "featured"] }),
-  )
+  yield* db.entities.Products.update({ productId: "p-1" }).append({
+    tags: ["on-sale", "featured"],
+  })
   // #endregion
   yield* Console.log("Appended tags\n")
 
@@ -183,10 +182,9 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Entity.deleteFromSet() ===\n")
 
   // #region delete-from-set
-  yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Entity.deleteFromSet({ categories: new Set(["obsolete"]) }),
-  )
+  yield* db.entities.Products.update({ productId: "p-1" }).deleteFromSet({
+    categories: new Set(["obsolete"]),
+  })
   // #endregion
   yield* Console.log("Removed 'obsolete' from categories set\n")
 
@@ -194,15 +192,13 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Composed Updates ===\n")
 
   // #region composed-updates
-  yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Entity.set({ name: "Premium Mouse", price: 39.99 }),
-    Entity.add({ viewCount: 10 }),
-    Entity.subtract({ stock: 5 }),
-    Entity.append({ tags: ["premium"] }),
-    Entity.remove(["description"]),
-    Entity.expectedVersion(5),
-  )
+  yield* db.entities.Products.update({ productId: "p-1" })
+    .set({ name: "Premium Mouse", price: 39.99 })
+    .add({ viewCount: 10 })
+    .subtract({ stock: 5 })
+    .append({ tags: ["premium"] })
+    .remove(["description"])
+    .expectedVersion(5)
   // #endregion
   yield* Console.log("Applied composed update to p-1\n")
 
@@ -243,39 +239,41 @@ const program = Effect.gen(function* () {
 
   // #region conditional-put
   // Conditional put — only if item doesn't already exist
-  const condPutResult = yield* db.entities.Users.put(
-    { userId: "u-10", email: "new@example.com", displayName: "New User" },
-    Users.condition((t, { notExists }) => notExists(t.email)),
-  ).pipe(
-    Effect.match({
-      onFailure: (e) => `${e._tag} — already exists`,
-      onSuccess: (u) => `created ${u.displayName}`,
-    }),
-  )
+  const condPutResult = yield* db.entities.Users.put({
+    userId: "u-10",
+    email: "new@example.com",
+    displayName: "New User",
+  })
+    .condition((t, { notExists }) => notExists(t.email))
+    .asEffect()
+    .pipe(
+      Effect.match({
+        onFailure: (e) => `${e._tag} — already exists`,
+        onSuccess: (u) => `created ${u.displayName}`,
+      }),
+    )
   // #endregion
   yield* Console.log(`Conditional put: ${condPutResult}`)
 
   // #region conditional-delete
   // Conditional delete — only if stock is zero
-  const condDeleteResult = yield* db.entities.Products.delete(
-    { productId: "p-1" },
-    Products.condition((t, { eq }) => eq(t.stock, 0)),
-  ).pipe(
-    Effect.match({
-      onFailure: (e) => `${e._tag} — stock not zero, delete prevented`,
-      onSuccess: () => "deleted (stock was 0)",
-    }),
-  )
+  const condDeleteResult = yield* db.entities.Products.delete({ productId: "p-1" })
+    .condition((t, { eq }) => eq(t.stock, 0))
+    .asEffect()
+    .pipe(
+      Effect.match({
+        onFailure: (e) => `${e._tag} — stock not zero, delete prevented`,
+        onSuccess: () => "deleted (stock was 0)",
+      }),
+    )
   // #endregion
   yield* Console.log(`Conditional delete: ${condDeleteResult}`)
 
   // #region conditional-update
   // Conditional update — only if status is "active"
-  yield* db.entities.Tasks.update(
-    { taskId: "t-1" },
-    Entity.set({ status: "done" }),
-    Tasks.condition((t, { eq }) => eq(t.status, "active")),
-  )
+  yield* db.entities.Tasks.update({ taskId: "t-1" })
+    .set({ status: "done" })
+    .condition((t, { eq }) => eq(t.status, "active"))
   // #endregion
   yield* Console.log("Conditional writes completed\n")
 
@@ -283,12 +281,10 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Condition + Optimistic Locking ===\n")
 
   // #region optimistic-condition
-  yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Entity.set({ price: 24.99 }),
-    Products.expectedVersion(6),
-    Products.condition((t, { gt }) => gt(t.stock, 0)),
-  )
+  yield* db.entities.Products.update({ productId: "p-1" })
+    .set({ price: 24.99 })
+    .expectedVersion(6)
+    .condition((t, { gt }) => gt(t.stock, 0))
   // ConditionExpression: (#version = :v_lock) AND (#stock > :v0)
   // #endregion
   yield* Console.log("Updated with combined condition + version check\n")
@@ -301,7 +297,9 @@ const program = Effect.gen(function* () {
     userId: "u-10",
     email: "new@example.com",
     displayName: "New User",
-  }).pipe(Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("already exists")))
+  })
+    .asEffect()
+    .pipe(Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("already exists")))
   // #endregion
   yield* Console.log(`Result: ${result}\n`)
 
@@ -321,10 +319,12 @@ const program = Effect.gen(function* () {
     userId: "u-20",
     email: "alice@example.com",
     displayName: "Alice",
-  }).pipe(
-    Effect.map(() => "created"),
-    Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("already exists")),
-  )
+  })
+    .asEffect()
+    .pipe(
+      Effect.map(() => "created"),
+      Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("already exists")),
+    )
   // #endregion
   yield* Console.log(`Created user: ${user.displayName}`)
   yield* Console.log(`Duplicate attempt: ${dup}\n`)

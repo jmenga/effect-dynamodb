@@ -272,18 +272,17 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Entity.update — Pipeable Updates ===\n")
 
   // #region update
-  // db.entities.Users.update(key, ...combinators) — update via bound entity
-  const updatedAlice = yield* db.entities.Users.update(
-    { userId: "u-alice" },
-    Entity.set({ role: "member", displayName: "Alice W." }),
-  )
+  // db.entities.Users.update(key).set(...) — update via bound entity
+  const updatedAlice = yield* db.entities.Users.update({ userId: "u-alice" }).set({
+    role: "member",
+    displayName: "Alice W.",
+  })
   // updatedAlice: User — clean model type
 
   // Second update
-  const updatedAlice2 = yield* db.entities.Users.update(
-    { userId: "u-alice" },
-    Entity.set({ displayName: "Alice Wu" }),
-  )
+  const updatedAlice2 = yield* db.entities.Users.update({ userId: "u-alice" }).set({
+    displayName: "Alice Wu",
+  })
   // updatedAlice2.createdBy → "system" (immutable — unchanged)
   // #endregion
   yield* Console.log(`Updated User: ${updatedAlice.displayName} (role: ${updatedAlice.role})`)
@@ -294,16 +293,16 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Optimistic Locking ===\n")
 
   // #region locking
-  // expectedVersion(n) composes with update
-  const lockResult = yield* db.entities.Users.update(
-    { userId: "u-alice" },
-    Entity.set({ displayName: "Alice Wrong" }),
-    Entity.expectedVersion(1), // version is now 3 — this will fail
-  ).pipe(
-    Effect.catchTag("OptimisticLockError", (e) =>
-      Effect.succeed(`Expected v${e.expectedVersion}, item has been updated`),
-    ),
-  )
+  // .expectedVersion(n) composes with .set(...)
+  const lockResult = yield* db.entities.Users.update({ userId: "u-alice" })
+    .set({ displayName: "Alice Wrong" })
+    .expectedVersion(1) // version is now 3 — this will fail
+    .asEffect()
+    .pipe(
+      Effect.catchTag("OptimisticLockError", (e) =>
+        Effect.succeed(`Expected v${e.expectedVersion}, item has been updated`),
+      ),
+    )
   // #endregion
   yield* Console.log(`${lockResult}\n`)
 
@@ -459,23 +458,23 @@ const program = Effect.gen(function* () {
 
   // #region sparse-update
   // GOOD: Update without touching GSI composites
-  yield* db.entities.Employees.update({ employeeId: "e-1" }, Entity.set({ name: "Alice W." }))
+  yield* db.entities.Employees.update({ employeeId: "e-1" }).set({ name: "Alice W." })
 
   // GOOD: Update ALL composites of a GSI
-  yield* db.entities.Employees.update(
-    { employeeId: "e-1" },
-    Entity.set({ tenantId: "t-2", region: "eu-west-1" }),
-  )
+  yield* db.entities.Employees.update({ employeeId: "e-1" }).set({
+    tenantId: "t-2",
+    region: "eu-west-1",
+  })
 
   // BAD: Partial GSI composites — runtime ValidationError
-  yield* db.entities.Employees.update(
-    { employeeId: "e-1" },
-    Entity.set({ tenantId: "t-3" }), // missing region!
-  ).pipe(
-    Effect.catchTag("ValidationError", (e) =>
-      Effect.succeed(`Must provide both tenantId AND region, or neither`),
-    ),
-  )
+  yield* db.entities.Employees.update({ employeeId: "e-1" })
+    .set({ tenantId: "t-3" }) // missing region!
+    .asEffect()
+    .pipe(
+      Effect.catchTag("ValidationError", (e) =>
+        Effect.succeed(`Must provide both tenantId AND region, or neither`),
+      ),
+    )
   // #endregion
   yield* Console.log(`Updated name only (GSI keys unchanged)`)
   yield* Console.log(`Transferred to t-2/eu-west-1 (GSI keys recomposed)\n`)

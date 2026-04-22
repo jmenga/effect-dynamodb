@@ -27,16 +27,16 @@ This guide helps ElectroDB users understand effect-dynamodb. It maps ElectroDB c
 | `entity.query.<name>(key).go()` | `db.entities.E.indexName(pk).collect()` | Entity index accessor on typed client, BoundQuery terminal |
 | `entity.create(data).go()` | `yield* bound.create(data)` | Put with `attribute_not_exists` condition |
 | `entity.upsert(data).go()` | `yield* bound.upsert(data)` | Create or update with `if_not_exists` for immutable fields |
-| `entity.patch(key).set({}).go()` | `bound.patch(key, Entity.set(...))` | Update with `attribute_exists` — fails if item doesn't exist |
+| `entity.patch(key).set({}).go()` | `bound.patch(key).set(...)` | Update with `attribute_exists` — fails if item doesn't exist |
 | `entity.remove(key).go()` | `yield* bound.deleteIfExists(key)` | Delete with `attribute_exists` — fails if item doesn't exist |
 | `entity.scan.go()` | `db.entities.E.scan().collect()` | Scan returns BoundQuery — compose with filter, limit, etc. |
-| `.where()` callback | `entity.condition()` / `entity.filter()` | Callback or shorthand syntax on entity definitions |
-| `.set({}).go()` | `bound.update(key, Entity.set(updates))` | Variadic combinators on bound update |
-| `.remove([])` | `Entity.remove(fields)` | Pipeable REMOVE combinator |
-| `.add({})` | `Entity.add(values)` | Pipeable ADD combinator |
-| `.subtract({})` | `Entity.subtract(values)` | Pipeable SUBTRACT combinator |
-| `.append({})` | `Entity.append(values)` | Pipeable APPEND combinator |
-| `.delete({})` | `Entity.deleteFromSet(values)` | Pipeable DELETE combinator |
+| `.where()` callback | `.condition()` / `.filter()` | Callback or shorthand syntax, chained on builders |
+| `.set({}).go()` | `bound.update(key).set(updates)` | Fluent builder: chain combinators as methods |
+| `.remove([])` | `.remove(fields)` on `BoundUpdate` | Chainable REMOVE |
+| `.add({})` | `.add(values)` on `BoundUpdate` | Chainable ADD |
+| `.subtract({})` | `.subtract(values)` on `BoundUpdate` | Chainable SUBTRACT |
+| `.append({})` | `.append(values)` on `BoundUpdate` | Chainable APPEND |
+| `.delete({})` | `.deleteFromSet(values)` on `BoundUpdate` | Chainable DELETE from set |
 | `consistent: true` | `Entity.consistentRead` / `Query.consistentRead` | Composable combinator |
 | `response: "all_old"` | `Entity.returnValues("allOld")` | Control DynamoDB ReturnValues on update/delete |
 | `pages: N` | `Query.maxPages(n)` | Limit total pages fetched |
@@ -151,8 +151,8 @@ const program = Effect.gen(function* () {
   // Get
   const found = yield* users.get({ userId: "u-1" })
 
-  // Update (bound method)
-  yield* users.update({ userId: "u-1" }, Entity.set({ email: "new@b.com" }))
+  // Update (fluent builder on bound client)
+  yield* users.update({ userId: "u-1" }).set({ email: "new@b.com" })
 
   // Delete
   yield* users.delete({ userId: "u-1" })
@@ -237,13 +237,11 @@ const db = yield* DynamoClient.make({
 })
 const users = db.entities.UserEntity
 
-yield* users.put(data, UserEntity.condition((t, { notExists }) => notExists(t.email)))
+yield* users.put(data).condition((t, { notExists }) => notExists(t.email))
 
-yield* users.update(
-  { userId: "u-1" },
-  Entity.set({ status: "active" }),
-  UserEntity.condition((t, { eq }) => eq(t.status, "pending")),
-)
+yield* users.update({ userId: "u-1" })
+  .set({ status: "active" })
+  .condition((t, { eq }) => eq(t.status, "pending"))
 ```
 
 ### Update Expressions
@@ -267,14 +265,12 @@ const db = yield* DynamoClient.make({
 })
 const products = db.entities.ProductEntity
 
-yield* products.update(
-  { productId: "p-1" },
-  Entity.set({ name: "New Name" }),
-  Entity.add({ viewCount: 1 }),
-  Entity.remove(["description"]),
-  Entity.append({ tags: ["new-tag"] }),
-  Entity.subtract({ stock: 3 }),
-)
+yield* products.update({ productId: "p-1" })
+  .set({ name: "New Name" })
+  .add({ viewCount: 1 })
+  .remove(["description"])
+  .append({ tags: ["new-tag"] })
+  .subtract({ stock: 3 })
 ```
 
 ### Collections (Service)
@@ -367,7 +363,7 @@ Features that effect-dynamodb provides that ElectroDB does not:
 | **Built-in versioning** | `versioned: true` auto-increments version on every write. `versioned: { retain: true }` keeps version snapshots. |
 | **Built-in soft delete** | `softDelete: true` marks items as deleted instead of physical deletion. Includes `restore()` and `purge()`. |
 | **Built-in unique constraints** | `unique: { email: ["email"] }` enforces field-level uniqueness via sentinel items in atomic transactions. |
-| **Built-in optimistic locking** | `Entity.expectedVersion(n)` fails the write if the current version doesn't match. |
+| **Built-in optimistic locking** | `.expectedVersion(n)` on `BoundUpdate` fails the write if the current version doesn't match. |
 | **7 derived types** | `Model`, `Record`, `Input`, `Update`, `Key`, `Item`, `Marshalled` — all auto-derived from one entity declaration. |
 | **Stream pagination** | `Query.paginate` returns an Effect `Stream` for lazy, composable pagination. |
 | **Layer-based DI** | Table names and DynamoDB client injected at runtime via Effect Layers — no hardcoded config. |

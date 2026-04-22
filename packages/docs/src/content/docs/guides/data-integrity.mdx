@@ -57,32 +57,35 @@ All mutations involving unique constraints are automatically wrapped in DynamoDB
 When a unique value is already taken, the write fails with `UniqueConstraintViolation`:
 
 ```typescript region="unique-error-handling" example="guide-data-integrity.ts"
-yield* db.entities.Users.put({
-  userId: "u-1",
-  email: "alice@example.com",
-  username: "alice",
-  tenantId: "t-acme",
-  displayName: "Alice",
-})
+  // #region unique-error-handling
+  yield* db.entities.Users.put({
+    userId: "u-1",
+    email: "alice@example.com",
+    username: "alice",
+    tenantId: "t-acme",
+    displayName: "Alice",
+  })
 
-// Same email → UniqueConstraintViolation
-const duplicateResult = yield* db.entities.Users.put({
-  userId: "u-2",
-  email: "alice@example.com",
-  username: "bob",
-  tenantId: "t-acme",
-  displayName: "Bob",
-}).pipe(
-  Effect.catchTag("UniqueConstraintViolation", (e) => {
-    // e.entityType === "User"
-    // e.constraint === "email" or "username"
-    // e.fields === { email: "alice@example.com" }
-    return Effect.succeed(
-      `Blocked: constraint="${e.constraint}", fields=${JSON.stringify(e.fields)}`,
+  // Same email → UniqueConstraintViolation
+  const duplicateResult = yield* db.entities.Users.put({
+    userId: "u-2",
+    email: "alice@example.com",
+    username: "bob",
+    tenantId: "t-acme",
+    displayName: "Bob",
+  })
+    .asEffect()
+    .pipe(
+      Effect.catchTag("UniqueConstraintViolation", (e) => {
+        // e.entityType === "User"
+        // e.constraint === "email" or "username"
+        // e.fields === { email: "alice@example.com" }
+        return Effect.succeed(
+          `Blocked: constraint="${e.constraint}", fields=${JSON.stringify(e.fields)}`,
+        )
+      }),
     )
-  }),
-)
-// Blocked: constraint="email", fields={"email":"alice@example.com"}
+  // Blocked: constraint="email", fields={"email":"alice@example.com"}
 ```
 
 ### Compound Constraints
@@ -184,52 +187,48 @@ With `ttl: Duration.days(90)`, version snapshots get a DynamoDB TTL attribute. D
 Versioning enables optimistic locking. Pass `expectedVersion` on update to ensure no one else has modified the item since you read it.
 
 ```typescript region="optimistic-concurrency" example="guide-data-integrity.ts"
-// Create a versioned user
-const user = yield* db.entities.VersionedUsers.put({
-  userId: "v-1",
-  email: "versioned@example.com",
-  username: "versioned-alice",
-  tenantId: "t-acme",
-  displayName: "Alice",
-})
-// user.version === 1
+  // #region optimistic-concurrency
+  // Create a versioned user
+  const user = yield* db.entities.VersionedUsers.put({
+    userId: "v-1",
+    email: "versioned@example.com",
+    username: "versioned-alice",
+    tenantId: "t-acme",
+    displayName: "Alice",
+  })
+  // user.version === 1
 
-// Update twice to build history
-yield* db.entities.VersionedUsers.update(
-  { userId: "v-1" },
-  Entity.set({ displayName: "Alice V2" }),
-)
-// version is now 2
+  // Update twice to build history
+  yield* db.entities.VersionedUsers.update({ userId: "v-1" }).set({ displayName: "Alice V2" })
+  // version is now 2
 
-const current = yield* db.entities.VersionedUsers.update(
-  { userId: "v-1" },
-  Entity.set({ displayName: "Alice V3" }),
-)
-// current.version === 3
+  const current = yield* db.entities.VersionedUsers.update({ userId: "v-1" }).set({
+    displayName: "Alice V3",
+  })
+  // current.version === 3
 
-// Update with optimistic lock — must match current version
-yield* db.entities.VersionedUsers.update(
-  { userId: "v-1" },
-  Entity.set({ displayName: "Alice V4" }),
-  Entity.expectedVersion(3),
-)
-// Succeeds: version was 3, now 4
+  // Update with optimistic lock — must match current version
+  yield* db.entities.VersionedUsers.update({ userId: "v-1" })
+    .set({ displayName: "Alice V4" })
+    .expectedVersion(3)
+  // Succeeds: version was 3, now 4
 ```
 
 If another process updated the item between your read and write, the version will have changed and the update fails:
 
 ```typescript region="optimistic-lock-error" example="guide-data-integrity.ts"
-// Stale version → OptimisticLockError
-const lockResult = yield* db.entities.VersionedUsers.update(
-  { userId: "v-1" },
-  Entity.set({ displayName: "Stale Update" }),
-  Entity.expectedVersion(2),
-).pipe(
-  Effect.catchTag("OptimisticLockError", (e) =>
-    Effect.succeed(`Blocked: expected version ${e.expectedVersion}, actual ${e.actualVersion}`),
-  ),
-)
-// Blocked: expected version 2, actual 4
+  // #region optimistic-lock-error
+  // Stale version → OptimisticLockError
+  const lockResult = yield* db.entities.VersionedUsers.update({ userId: "v-1" })
+    .set({ displayName: "Stale Update" })
+    .expectedVersion(2)
+    .asEffect()
+    .pipe(
+      Effect.catchTag("OptimisticLockError", (e) =>
+        Effect.succeed(`Blocked: expected version ${e.expectedVersion}, actual ${e.actualVersion}`),
+      ),
+    )
+  // Blocked: expected version 2, actual 4
 ```
 
 ### Under the Hood
@@ -284,31 +283,34 @@ class Payment extends Schema.Class<Payment>("Payment")({
 4. After the TTL expires, DynamoDB deletes the sentinel, allowing the key to be reused.
 
 ```typescript region="idempotency-usage" example="guide-data-integrity.ts"
-const requestId = "idem-abc-123"
+  // #region idempotency-usage
+  const requestId = "idem-abc-123"
 
-// First request — succeeds
-const payment = yield* db.entities.Payments.put({
-  paymentId: "pay-001",
-  amount: 99.99,
-  currency: "USD",
-  idempotencyKey: requestId,
-})
+  // First request — succeeds
+  const payment = yield* db.entities.Payments.put({
+    paymentId: "pay-001",
+    amount: 99.99,
+    currency: "USD",
+    idempotencyKey: requestId,
+  })
 
-// Retry with same idempotency key → blocked
-const retry = yield* db.entities.Payments.put({
-  paymentId: "pay-002",
-  amount: 99.99,
-  currency: "USD",
-  idempotencyKey: requestId,
-}).pipe(
-  Effect.catchTag("UniqueConstraintViolation", (e) =>
-    e.constraint === "idempotencyKey"
-      ? Effect.succeed("Duplicate request prevented")
-      : Effect.fail(e),
-  ),
-)
-// The sentinel has a TTL of 1 hour
-// After expiry, the same key can be reused
+  // Retry with same idempotency key → blocked
+  const retry = yield* db.entities.Payments.put({
+    paymentId: "pay-002",
+    amount: 99.99,
+    currency: "USD",
+    idempotencyKey: requestId,
+  })
+    .asEffect()
+    .pipe(
+      Effect.catchTag("UniqueConstraintViolation", (e) =>
+        e.constraint === "idempotencyKey"
+          ? Effect.succeed("Duplicate request prevented")
+          : Effect.fail(e),
+      ),
+    )
+  // The sentinel has a TTL of 1 hour
+  // After expiry, the same key can be reused
 ```
 
 ## Transaction Item Budget

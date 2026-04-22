@@ -171,10 +171,10 @@ const program = Effect.gen(function* () {
 
   // Note: status is a GSI composite, so we must also provide userId
   // (all composites for the GSI) so the key can be recomposed
-  const updated = yield* db.entities.Tasks.update(
-    { taskId: "t-1" },
-    Entity.set({ status: "done", userId: "u-alice" }),
-  )
+  const updated = yield* db.entities.Tasks.update({ taskId: "t-1" }).set({
+    status: "done",
+    userId: "u-alice",
+  })
   yield* Console.log(`Updated task: "${updated.title}" -> ${updated.status}\n`)
 
   // --- Query: tasks by user via GSI index accessor ---

@@ -142,7 +142,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("Found", found)
 
   // Update
-  yield* db.entities.TodoEntity.update({ todoId: "t-1" }, Entity.set({ done: true }))
+  yield* db.entities.TodoEntity.update({ todoId: "t-1" }).set({ done: true })
 
   // Delete
   yield* db.entities.TodoEntity.delete({ todoId: "t-1" })

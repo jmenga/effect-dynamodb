@@ -1,13 +1,13 @@
 ---
 title: "Example: CRUD Operations"
-description: "Full high-level API with entity operations, variadic combinator updates, index queries, transactions, version history, soft delete, and purge"
+description: "Full high-level API with entity operations, fluent builder updates, index queries, transactions, version history, soft delete, and purge"
 ---
 
 A comprehensive example demonstrating the full effect-dynamodb high-level API. Starting from model definitions through to advanced lifecycle features, this example covers every major operation you will use when building applications.
 
 **What you'll learn:**
 - Creating items with `put` and reading with `get`
-- Updates with variadic combinators: `update(key, Entity.set(...), Entity.expectedVersion(n))`
+- Updates with fluent builders: `update(key).set(...).expectedVersion(n)`
 - Error handling with tagged errors (`ItemNotFound`, `OptimisticLockError`)
 - Index queries with fluent combinators (`reverse`, `filter`, `collect`)
 - Atomic transactions with `Transaction.transactWrite` and `transactGet`
@@ -182,41 +182,42 @@ const userModel = yield* db.entities.Users.get({ userId: "u-alice" })
 
 ## Step 5: Updates with Variadic Combinators
 
-`update(key, ...combinators)` accepts `Entity.set()`, `Entity.expectedVersion()`, and other combinators as variadic rest arguments:
+`update(key)` returns a `BoundUpdate` builder. Chain `.set(...)`, `.expectedVersion(n)`, `.condition(...)`, `.remove([...])`, and other combinators as methods:
 
 ```typescript region="update" example="crud.ts"
-// db.entities.Users.update(key, ...combinators) — update via bound entity
-const updatedAlice = yield* db.entities.Users.update(
-  { userId: "u-alice" },
-  Entity.set({ role: "member", displayName: "Alice W." }),
-)
-// updatedAlice: User — clean model type
+  // #region update
+  // db.entities.Users.update(key).set(...) — update via bound entity
+  const updatedAlice = yield* db.entities.Users.update({ userId: "u-alice" }).set({
+    role: "member",
+    displayName: "Alice W.",
+  })
+  // updatedAlice: User — clean model type
 
-// Second update
-const updatedAlice2 = yield* db.entities.Users.update(
-  { userId: "u-alice" },
-  Entity.set({ displayName: "Alice Wu" }),
-)
-// updatedAlice2.createdBy → "system" (immutable — unchanged)
+  // Second update
+  const updatedAlice2 = yield* db.entities.Users.update({ userId: "u-alice" }).set({
+    displayName: "Alice Wu",
+  })
+  // updatedAlice2.createdBy → "system" (immutable — unchanged)
 ```
 
 ---
 
 ## Step 6: Optimistic Locking
 
-`Entity.expectedVersion()` composes with `Entity.set()` as variadic combinators. If the item's current version does not match, the update fails with `OptimisticLockError`:
+`.expectedVersion(n)` chains with `.set(...)` on the builder. If the item's current version does not match, the update fails with `OptimisticLockError`:
 
 ```typescript region="locking" example="crud.ts"
-// expectedVersion(n) composes with update
-const lockResult = yield* db.entities.Users.update(
-  { userId: "u-alice" },
-  Entity.set({ displayName: "Alice Wrong" }),
-  Entity.expectedVersion(1), // version is now 3 — this will fail
-).pipe(
-  Effect.catchTag("OptimisticLockError", (e) =>
-    Effect.succeed(`Expected v${e.expectedVersion}, item has been updated`),
-  ),
-)
+  // #region locking
+  // .expectedVersion(n) composes with .set(...)
+  const lockResult = yield* db.entities.Users.update({ userId: "u-alice" })
+    .set({ displayName: "Alice Wrong" })
+    .expectedVersion(1) // version is now 3 — this will fail
+    .asEffect()
+    .pipe(
+      Effect.catchTag("OptimisticLockError", (e) =>
+        Effect.succeed(`Expected v${e.expectedVersion}, item has been updated`),
+      ),
+    )
 ```
 
 ---
@@ -370,24 +371,25 @@ const ownerProjects = yield* db.entities.Projects.byOwner({ ownerId: "u-alice" }
 When updating, if the payload includes ANY composite for a GSI, ALL composites for that GSI must be present. This prevents stale GSI entries:
 
 ```typescript region="sparse-update" example="crud.ts"
-// GOOD: Update without touching GSI composites
-yield* db.entities.Employees.update({ employeeId: "e-1" }, Entity.set({ name: "Alice W." }))
+  // #region sparse-update
+  // GOOD: Update without touching GSI composites
+  yield* db.entities.Employees.update({ employeeId: "e-1" }).set({ name: "Alice W." })
 
-// GOOD: Update ALL composites of a GSI
-yield* db.entities.Employees.update(
-  { employeeId: "e-1" },
-  Entity.set({ tenantId: "t-2", region: "eu-west-1" }),
-)
+  // GOOD: Update ALL composites of a GSI
+  yield* db.entities.Employees.update({ employeeId: "e-1" }).set({
+    tenantId: "t-2",
+    region: "eu-west-1",
+  })
 
-// BAD: Partial GSI composites — runtime ValidationError
-yield* db.entities.Employees.update(
-  { employeeId: "e-1" },
-  Entity.set({ tenantId: "t-3" }), // missing region!
-).pipe(
-  Effect.catchTag("ValidationError", (e) =>
-    Effect.succeed(`Must provide both tenantId AND region, or neither`),
-  ),
-)
+  // BAD: Partial GSI composites — runtime ValidationError
+  yield* db.entities.Employees.update({ employeeId: "e-1" })
+    .set({ tenantId: "t-3" }) // missing region!
+    .asEffect()
+    .pipe(
+      Effect.catchTag("ValidationError", (e) =>
+        Effect.succeed(`Must provide both tenantId AND region, or neither`),
+      ),
+    )
 ```
 
 ---
@@ -527,8 +529,8 @@ Effect.runPromise(main).then(
 | Concept | How it's used |
 |---------|---------------|
 | **Typed client** | `const db = yield* DynamoClient.make({ entities })` resolves dependencies; all ops have `R = never` |
-| **Variadic combinator updates** | `db.entities.Users.update(key, Entity.set(...), Entity.expectedVersion(n))` — combinators as rest args |
-| **Optimistic locking** | `Entity.expectedVersion(n)` composes with `Entity.set()` as variadic combinators |
+| **Fluent builder updates** | `db.entities.Users.update(key).set(...).expectedVersion(n)` — chain combinators as methods on a `BoundUpdate` builder |
+| **Optimistic locking** | `.expectedVersion(n)` on `BoundUpdate` — composes with `.set(...)`, `.condition(...)` on the same builder |
 | **Tagged error handling** | `Effect.catchTag("ItemNotFound", ...)` for precise recovery — bound methods return `Effect` directly |
 | **Index queries** | `db.entities.Tasks.byUser(composites).collect()` returns results; `.reverse()`, `.filter()` for combinators |
 | **Transactions** | `transactWrite` for atomic multi-entity creates; `transactGet` for typed tuple reads |

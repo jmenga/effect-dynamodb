@@ -457,7 +457,9 @@ const program = Effect.gen(function* () {
     squadRole: "batter",
     isCaptain: false,
     isViceCaptain: false,
-  }).pipe(Effect.flip)
+  })
+    .asEffect()
+    .pipe(Effect.flip)
 
   if (refError._tag === "RefNotFound") {
     yield* Console.log(
@@ -475,11 +477,9 @@ const program = Effect.gen(function* () {
 
   // #region cascade
   // Update the player and cascade to all SquadSelections that embed this player
-  const updatedPlayer = yield* db.entities.Players.update(
-    { id: "smith-01" },
-    Entity.set({ firstName: "Steven" }),
-    Entity.cascade({ targets: [SquadSelections] }),
-  )
+  const updatedPlayer = yield* db.entities.Players.update({ id: "smith-01" })
+    .set({ firstName: "Steven" })
+    .cascade({ targets: [SquadSelections] })
 
   yield* Console.log(`Updated player: ${updatedPlayer.firstName} ${updatedPlayer.lastName}`)
 

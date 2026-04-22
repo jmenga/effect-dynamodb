@@ -151,16 +151,18 @@ const program = Effect.gen(function* () {
     username: "bob",
     tenantId: "t-acme",
     displayName: "Bob",
-  }).pipe(
-    Effect.catchTag("UniqueConstraintViolation", (e) => {
-      // e.entityType === "User"
-      // e.constraint === "email" or "username"
-      // e.fields === { email: "alice@example.com" }
-      return Effect.succeed(
-        `Blocked: constraint="${e.constraint}", fields=${JSON.stringify(e.fields)}`,
-      )
-    }),
-  )
+  })
+    .asEffect()
+    .pipe(
+      Effect.catchTag("UniqueConstraintViolation", (e) => {
+        // e.entityType === "User"
+        // e.constraint === "email" or "username"
+        // e.fields === { email: "alice@example.com" }
+        return Effect.succeed(
+          `Blocked: constraint="${e.constraint}", fields=${JSON.stringify(e.fields)}`,
+        )
+      }),
+    )
   // Blocked: constraint="email", fields={"email":"alice@example.com"}
   // #endregion
   yield* Console.log(`Duplicate email: ${duplicateResult}`)
@@ -172,11 +174,13 @@ const program = Effect.gen(function* () {
     username: "alice-other",
     tenantId: "t-other",
     displayName: "Alice (Other Tenant)",
-  }).pipe(
-    Effect.catchTag("UniqueConstraintViolation", (e) =>
-      Effect.succeed(`Blocked: constraint="${e.constraint}"`),
-    ),
-  )
+  })
+    .asEffect()
+    .pipe(
+      Effect.catchTag("UniqueConstraintViolation", (e) =>
+        Effect.succeed(`Blocked: constraint="${e.constraint}"`),
+      ),
+    )
   yield* Console.log("Same email, different tenant: blocked by single-field email constraint\n")
 
   // -------------------------------------------------------------------------
@@ -196,24 +200,18 @@ const program = Effect.gen(function* () {
   // user.version === 1
 
   // Update twice to build history
-  yield* db.entities.VersionedUsers.update(
-    { userId: "v-1" },
-    Entity.set({ displayName: "Alice V2" }),
-  )
+  yield* db.entities.VersionedUsers.update({ userId: "v-1" }).set({ displayName: "Alice V2" })
   // version is now 2
 
-  const current = yield* db.entities.VersionedUsers.update(
-    { userId: "v-1" },
-    Entity.set({ displayName: "Alice V3" }),
-  )
+  const current = yield* db.entities.VersionedUsers.update({ userId: "v-1" }).set({
+    displayName: "Alice V3",
+  })
   // current.version === 3
 
   // Update with optimistic lock — must match current version
-  yield* db.entities.VersionedUsers.update(
-    { userId: "v-1" },
-    Entity.set({ displayName: "Alice V4" }),
-    Entity.expectedVersion(3),
-  )
+  yield* db.entities.VersionedUsers.update({ userId: "v-1" })
+    .set({ displayName: "Alice V4" })
+    .expectedVersion(3)
   // Succeeds: version was 3, now 4
   // #endregion
   yield* Console.log(`Created versioned user: ${user.displayName} (version starts at 1)`)
@@ -221,15 +219,15 @@ const program = Effect.gen(function* () {
 
   // #region optimistic-lock-error
   // Stale version → OptimisticLockError
-  const lockResult = yield* db.entities.VersionedUsers.update(
-    { userId: "v-1" },
-    Entity.set({ displayName: "Stale Update" }),
-    Entity.expectedVersion(2),
-  ).pipe(
-    Effect.catchTag("OptimisticLockError", (e) =>
-      Effect.succeed(`Blocked: expected version ${e.expectedVersion}, actual ${e.actualVersion}`),
-    ),
-  )
+  const lockResult = yield* db.entities.VersionedUsers.update({ userId: "v-1" })
+    .set({ displayName: "Stale Update" })
+    .expectedVersion(2)
+    .asEffect()
+    .pipe(
+      Effect.catchTag("OptimisticLockError", (e) =>
+        Effect.succeed(`Blocked: expected version ${e.expectedVersion}, actual ${e.actualVersion}`),
+      ),
+    )
   // Blocked: expected version 2, actual 4
   // #endregion
   yield* Console.log(`Optimistic lock: ${lockResult}\n`)
@@ -277,13 +275,15 @@ const program = Effect.gen(function* () {
     amount: 99.99,
     currency: "USD",
     idempotencyKey: requestId,
-  }).pipe(
-    Effect.catchTag("UniqueConstraintViolation", (e) =>
-      e.constraint === "idempotencyKey"
-        ? Effect.succeed("Duplicate request prevented")
-        : Effect.fail(e),
-    ),
-  )
+  })
+    .asEffect()
+    .pipe(
+      Effect.catchTag("UniqueConstraintViolation", (e) =>
+        e.constraint === "idempotencyKey"
+          ? Effect.succeed("Duplicate request prevented")
+          : Effect.fail(e),
+      ),
+    )
   // The sentinel has a TTL of 1 hour
   // After expiry, the same key can be reused
   // #endregion

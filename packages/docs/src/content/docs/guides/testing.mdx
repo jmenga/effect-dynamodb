@@ -205,6 +205,7 @@ const testPutOperation = Effect.gen(function* () {
 Mock the client to return a failure and use `Effect.flip` to inspect the error channel. When a unique constraint entity receives a `TransactionCanceledException`, effect-dynamodb translates it to a `UniqueConstraintViolation`:
 
 ```typescript region="test-error" example="guide-testing.ts"
+// #region test-error
 const testErrorPath = Effect.gen(function* () {
   resetMocks()
 
@@ -230,7 +231,9 @@ const testErrorPath = Effect.gen(function* () {
     displayName: "Bob",
     department: "Sales",
     createdBy: "admin",
-  }).pipe(Effect.flip)
+  })
+    .asEffect()
+    .pipe(Effect.flip)
 
   // The entity layer translates the DynamoDB error to a domain error
   console.assert(

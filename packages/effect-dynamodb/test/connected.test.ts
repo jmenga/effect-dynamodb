@@ -1481,10 +1481,9 @@ describeConnected("timeSeries integration tests", () => {
         timestamp: t0,
         location: "rack-A",
       })
-      yield* db.entities.Telemetries.update(
-        { channel: "c-enrich", deviceId: "d-1" },
-        Telemetries.set({ accountId: "acct-1" }),
-      )
+      yield* db.entities.Telemetries.update({ channel: "c-enrich", deviceId: "d-1" }).set({
+        accountId: "acct-1",
+      })
 
       // Append without accountId in input — must not overwrite enrichment.
       const t1 = DateTime.makeUnsafe("2026-04-22T14:05:00.000Z")
@@ -2118,10 +2117,10 @@ describeConnected("indexPolicy integration tests", () => {
       expect(before.some((d) => d.deviceId === "d-2")).toBe(true)
 
       // Update explicitly nulling alertState — sparse policy must drop the item.
-      yield* db.entities.Devices.update(
-        { channel: "c-2", deviceId: "d-2" },
-        Entity.set({ alertState: undefined, label: "cleared" }),
-      )
+      yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).set({
+        alertState: undefined,
+        label: "cleared",
+      })
 
       const afterDrop = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
       expect(afterDrop.some((d) => d.deviceId === "d-2")).toBe(false)
@@ -2136,10 +2135,9 @@ describeConnected("indexPolicy integration tests", () => {
     Effect.gen(function* () {
       const db = yield* DynamoClient.make({ entities: { Devices }, tables: { IpTable } })
 
-      yield* db.entities.Devices.update(
-        { channel: "c-2", deviceId: "d-2" },
-        Entity.set({ alertState: "cleared" }),
-      )
+      yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).set({
+        alertState: "cleared",
+      })
 
       const byCleared = yield* db.entities.Devices.byAlert({ alertState: "cleared" }).collect()
       expect(byCleared.some((d) => d.deviceId === "d-2")).toBe(true)
@@ -2170,10 +2168,9 @@ describeConnected("indexPolicy integration tests", () => {
         // absent from payload → REMOVE (drops from sparse GSI).
         // byTenant declares preserve on tenantId → always evaluated → tenantId
         // absent + preserve → leave half alone (stays in GSI).
-        yield* db.entities.Devices.update(
-          { channel: "c-3", deviceId: "d-3" },
-          Entity.set({ label: "labelled" }),
-        )
+        yield* db.entities.Devices.update({ channel: "c-3", deviceId: "d-3" }).set({
+          label: "labelled",
+        })
 
         const byAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
         const byTenant = yield* db.entities.Devices.byTenant({ tenantId: "globex" }).collect()
@@ -2190,10 +2187,9 @@ describeConnected("indexPolicy integration tests", () => {
       yield* db.entities.Devices.put({ channel: "c-4", deviceId: "d-4" })
 
       // Enrichment writer: sets tenantId.
-      yield* db.entities.Devices.update(
-        { channel: "c-4", deviceId: "d-4" },
-        Entity.set({ tenantId: "initech" }),
-      )
+      yield* db.entities.Devices.update({ channel: "c-4", deviceId: "d-4" }).set({
+        tenantId: "initech",
+      })
 
       // Verify byTenant now has the item.
       const afterEnrich = yield* db.entities.Devices.byTenant({ tenantId: "initech" }).collect()
@@ -2201,10 +2197,9 @@ describeConnected("indexPolicy integration tests", () => {
 
       // Ingest writer: sets alertState without touching tenantId (not in payload).
       // tenantId has preserve policy → byTenant remains intact.
-      yield* db.entities.Devices.update(
-        { channel: "c-4", deviceId: "d-4" },
-        Entity.set({ alertState: "active" }),
-      )
+      yield* db.entities.Devices.update({ channel: "c-4", deviceId: "d-4" }).set({
+        alertState: "active",
+      })
 
       const byAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
       const byTenant = yield* db.entities.Devices.byTenant({ tenantId: "initech" }).collect()

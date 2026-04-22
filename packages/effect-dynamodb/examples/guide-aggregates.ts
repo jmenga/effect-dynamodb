@@ -333,7 +333,9 @@ const program = Effect.gen(function* () {
     playerId: "nonexistent",
     squadRole: "batter",
     isCaptain: false,
-  }).pipe(Effect.flip)
+  })
+    .asEffect()
+    .pipe(Effect.flip)
 
   if (refError._tag === "RefNotFound") {
     // refError.field     → "player"
@@ -449,11 +451,9 @@ const program = Effect.gen(function* () {
   yield* Console.log("\n--- Part 3: Cascade Updates ---\n")
 
   // #region cascade-basic
-  const updatedPlayer = yield* db.entities.Players.update(
-    { id: "smith-01" },
-    Entity.set({ firstName: "Steven" }),
-    Entity.cascade({ targets: [SquadSelections] }),
-  )
+  const updatedPlayer = yield* db.entities.Players.update({ id: "smith-01" })
+    .set({ firstName: "Steven" })
+    .cascade({ targets: [SquadSelections] })
   // #endregion
 
   yield* Console.log(`Updated player: ${updatedPlayer.firstName} ${updatedPlayer.lastName}`)
@@ -468,19 +468,15 @@ const program = Effect.gen(function* () {
   )
 
   // #region cascade-eventual
-  yield* db.entities.Players.update(
-    { id: "smith-01" },
-    Entity.set({ firstName: "Steven" }),
-    Entity.cascade({ targets: [SquadSelections], mode: "eventual" }),
-  )
+  yield* db.entities.Players.update({ id: "smith-01" })
+    .set({ firstName: "Steven" })
+    .cascade({ targets: [SquadSelections], mode: "eventual" })
   // #endregion
 
   // #region cascade-transactional
-  yield* db.entities.Players.update(
-    { id: "smith-01" },
-    Entity.set({ firstName: "Steven" }),
-    Entity.cascade({ targets: [SquadSelections], mode: "transactional" }),
-  )
+  yield* db.entities.Players.update({ id: "smith-01" })
+    .set({ firstName: "Steven" })
+    .cascade({ targets: [SquadSelections], mode: "transactional" })
   // #endregion
 
   // --- Cleanup ---

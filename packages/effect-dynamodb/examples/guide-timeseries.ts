@@ -158,10 +158,9 @@ const program = Effect.gen(function* () {
   })
 
   // Background job enriches with accountId (via `.update()`, not `.append()`):
-  yield* db.entities.Telemetries.update(
-    { channel: "c-1", deviceId: "d-7" },
-    Telemetries.set({ accountId: "acct-1" }),
-  )
+  yield* db.entities.Telemetries.update({ channel: "c-1", deviceId: "d-7" }).set({
+    accountId: "acct-1",
+  })
 
   // Device appends again — accountId is preserved even though the device
   // doesn't know about it.

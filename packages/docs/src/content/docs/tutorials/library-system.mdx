@@ -512,9 +512,8 @@ const fantasyGenres = yield* db.entities.Genres.byGenre({ genre: "Fantasy" }).co
 Updating a book's `memberId` and `loanEndDate` populates the GSI1 composites, causing the book to **appear** in the Account collection's sparse index. Before the update, those fields are absent, so the book is invisible in GSI1.
 
 ```typescript region="loan-book" example="library-system.ts"
-yield* db.entities.Books.update(
-  { isbn: "978-0-547-928227", bookId: "b-hobbit" },
-  Entity.set({
+  // #region loan-book
+  yield* db.entities.Books.update({ isbn: "978-0-547-928227", bookId: "b-hobbit" }).set({
     memberId: "m-alice",
     loanEndDate: "2025-04-01",
     // Must provide all GSI composites for affected indexes
@@ -522,16 +521,17 @@ yield* db.entities.Books.update(
     authorFirstName: "J.R.R.",
     bookTitle: "The Hobbit",
     releaseDate: "1937-09-21",
-  }),
-)
+  })
 
-// Now the book appears in Alice's loans
-const { Books: aliceLoansAfter } = yield* db.collections.account!({
-  memberId: "m-alice",
-}).collect()
+  // Now the book appears in Alice's loans
+  const { Books: aliceLoansAfter } = yield* db.collections.account!({
+    memberId: "m-alice",
+  }).collect()
+  // → [{ bookTitle: "The Hobbit", isbn: "978-0-547-928227", ... }]
 
-// Bob still has no loans
-const { Books: bobLoans } = yield* db.collections.account!({ memberId: "m-bob" }).collect()
+  // Bob still has no loans
+  const { Books: bobLoans } = yield* db.collections.account!({ memberId: "m-bob" }).collect()
+  // → []
 ```
 
 When you update fields that participate in GSI composites, you must provide **all** composites for every affected GSI. Here the update touches `memberId` (Account GSI1), so `loanEndDate` is also required. The author and title fields are needed for GSI2 and GSI3 recomposition.

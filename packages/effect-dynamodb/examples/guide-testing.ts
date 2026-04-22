@@ -239,7 +239,9 @@ const testErrorPath = Effect.gen(function* () {
     displayName: "Bob",
     department: "Sales",
     createdBy: "admin",
-  }).pipe(Effect.flip)
+  })
+    .asEffect()
+    .pipe(Effect.flip)
 
   // The entity layer translates the DynamoDB error to a domain error
   console.assert(

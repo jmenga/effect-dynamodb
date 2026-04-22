@@ -417,10 +417,11 @@ const program = Effect.gen(function* () {
   assertEq(newIssue.issueNumber, "3", "new issue number")
   assertEq(newIssue.status, "Open", "new issue status")
 
-  const closedIssue = yield* db.entities.Issues.update(
-    { repoOwner: "octocat", repoName: "hello-world", issueNumber: "3" },
-    Entity.set({ status: "Closed", username: "torvalds" }),
-  )
+  const closedIssue = yield* db.entities.Issues.update({
+    repoOwner: "octocat",
+    repoName: "hello-world",
+    issueNumber: "3",
+  }).set({ status: "Closed", username: "torvalds" })
   assertEq(closedIssue.status, "Closed", "closed issue status")
   assertEq(closedIssue.subject, "Enhancement: Add CI pipeline", "closed issue preserves subject")
   // #endregion
@@ -444,10 +445,11 @@ const program = Effect.gen(function* () {
   assertEq(newPR.pullRequestNumber, "2", "new PR number")
   assertEq(newPR.status, "Open", "new PR status")
 
-  const closedPR = yield* db.entities.PullRequests.update(
-    { repoOwner: "octocat", repoName: "hello-world", pullRequestNumber: "2" },
-    Entity.set({ status: "Closed", username: "octocat" }),
-  )
+  const closedPR = yield* db.entities.PullRequests.update({
+    repoOwner: "octocat",
+    repoName: "hello-world",
+    pullRequestNumber: "2",
+  }).set({ status: "Closed", username: "octocat" })
   assertEq(closedPR.status, "Closed", "closed PR status")
   assertEq(closedPR.subject, "Add CONTRIBUTING.md", "closed PR preserves subject")
   // #endregion

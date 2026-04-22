@@ -1,5 +1,44 @@
 # effect-dynamodb
 
+## 1.2.0
+
+### Minor Changes
+
+- Fluent bound-CRUD builders + per-GSI indexPolicy.
+
+  **Fluent bound-CRUD builders (breaking)**
+
+  `db.entities.X.{put,create,upsert,update,patch,delete,deleteIfExists}` now return fluent builders (`BoundPut`, `BoundUpdate`, `BoundDelete`) instead of accepting variadic `...combinators` rest args. Chain combinators as methods and yield the builder to execute.
+
+  ```ts
+  // Before
+  yield* db.entities.Tasks.update(key, Entity.set({...}), Entity.expectedVersion(3))
+  yield* db.entities.Tasks.put(input, Entity.condition({...}))
+  yield* db.entities.Tasks.delete(key, Entity.condition({...}))
+
+  // After
+  yield* db.entities.Tasks.update(key).set({...}).expectedVersion(3)
+  yield* db.entities.Tasks.put(input).condition({...})
+  yield* db.entities.Tasks.delete(key).condition({...})
+  ```
+
+  Use `.asEffect()` before piping into Effect combinators (`Effect.catchTag`, `Effect.map`, etc.). Unbound `Entity.make(...)` return values and module-level combinators (`Entity.set`, `Entity.condition`, `Entity.expectedVersion`, `Entity.pathSet`, …) are unchanged — `Transaction.transactWrite(...)` and `Batch.write(...)` consumers keep working without modification. `PutCombinator`, `UpdateCombinator`, `DeleteCombinator` type aliases removed from the public API.
+
+  **Per-GSI `indexPolicy` (breaking)**
+
+  Adds `indexPolicy?: (item) => Partial<Record<attr, "sparse" | "preserve">>` to each GSI definition. Resolves the previously ambiguous "composite missing from update payload" signal into three explicit intents (sparse dropout, enrichment preserve, strict recompose). Default when unspecified: `"preserve"` for every composite.
+
+  - `Entity.update()` and time-series `.append()` no longer throw `PartialGsiCompositeError` on partial composites — that class has been removed. Consumers relying on strict caller-error validation should declare `indexPolicy: () => ({ attr: "sparse" })` or enforce validation in their own update layer.
+  - GSIs that declare an `indexPolicy` are always evaluated on every update — "attr not in payload" is treated as "attr not set" per the policy. GSIs without a policy keep the existing touched-gate semantics (only evaluated when a composite appears in the payload).
+  - `put()` semantics unchanged (still sparse-by-default for any missing composite; `indexPolicy` not consulted).
+  - `Entity.remove([attr])` cascade still drops the GSI entry regardless of policy.
+
+  Closes [#11](https://github.com/jmenga/effect-dynamodb/issues/11).
+
+  **Other**
+
+  Fixes `Marshaller.toAttributeValue` to pass `convertClassInstanceToMap: true` and `removeUndefinedValues: true`, matching `toAttributeMap`. Without this, `update()`/`append()` SET clauses and condition/filter values threw at runtime when the value was a `Schema.Class` instance (or contained one). Fixes [#12](https://github.com/jmenga/effect-dynamodb/issues/12).
+
 ## 1.1.0
 
 ### Minor Changes

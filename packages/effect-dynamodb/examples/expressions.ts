@@ -108,12 +108,14 @@ const program = Effect.gen(function* () {
     category: "electronics",
     price: 19.99,
     stock: 50,
-  }).pipe(
-    Effect.map(() => "unexpected success"),
-    Effect.catchTag("ConditionalCheckFailed", () =>
-      Effect.succeed("ConditionalCheckFailed — duplicate prevented!"),
-    ),
-  )
+  })
+    .asEffect()
+    .pipe(
+      Effect.map(() => "unexpected success"),
+      Effect.catchTag("ConditionalCheckFailed", () =>
+        Effect.succeed("ConditionalCheckFailed — duplicate prevented!"),
+      ),
+    )
   // #endregion
 
   // Seed more products
@@ -144,19 +146,17 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Conditional Put ===\n")
 
   // #region conditional-put
-  // Products.condition() adds a ConditionExpression to a put operation.
+  // .condition() adds a ConditionExpression to a put operation.
   // The condition is evaluated server-side. If it fails, the put is rejected.
-  const condPutResult = yield* db.entities.Products.put(
-    {
-      productId: "p-5",
-      name: "New Product",
-      category: "electronics",
-      price: 49.99,
-      stock: 10,
-    },
+  const condPutResult = yield* db.entities.Products.put({
+    productId: "p-5",
+    name: "New Product",
+    category: "electronics",
+    price: 49.99,
+    stock: 10,
+  })
     // Only put if item doesn't already exist (same as create, but explicit)
-    Products.condition((t, { notExists }) => notExists(t.productId)),
-  )
+    .condition((t, { notExists }) => notExists(t.productId))
   // #endregion
 
   // --- Conditional delete ---
@@ -164,42 +164,40 @@ const program = Effect.gen(function* () {
 
   // #region conditional-delete
   // Delete only if the item's stock is 0 (don't delete items with stock).
-  // Products.condition() maps ConditionalCheckFailedException at runtime.
+  // .condition() maps ConditionalCheckFailedException at runtime.
   // Use Effect.match to handle both success and failure paths.
-  const condDeleteResult = yield* db.entities.Products.delete(
-    { productId: "p-4" },
-    Products.condition((t, { eq }) => eq(t.stock, 0)),
-  ).pipe(
-    Effect.match({
-      onFailure: (e) => `Failed: ${e._tag}`,
-      onSuccess: () => "deleted (stock was 0)",
-    }),
-  )
+  const condDeleteResult = yield* db.entities.Products.delete({ productId: "p-4" })
+    .condition((t, { eq }) => eq(t.stock, 0))
+    .asEffect()
+    .pipe(
+      Effect.match({
+        onFailure: (e) => `Failed: ${e._tag}`,
+        onSuccess: () => "deleted (stock was 0)",
+      }),
+    )
 
   // Try to conditionally delete an item with stock > 0
-  const condDeleteFail = yield* db.entities.Products.delete(
-    { productId: "p-1" },
-    Products.condition((t, { eq }) => eq(t.stock, 0)),
-  ).pipe(
-    Effect.match({
-      onFailure: (e) => `${e._tag} — item has stock (correct!)`,
-      onSuccess: () => "deleted",
-    }),
-  )
+  const condDeleteFail = yield* db.entities.Products.delete({ productId: "p-1" })
+    .condition((t, { eq }) => eq(t.stock, 0))
+    .asEffect()
+    .pipe(
+      Effect.match({
+        onFailure: (e) => `${e._tag} — item has stock (correct!)`,
+        onSuccess: () => "deleted",
+      }),
+    )
   // #endregion
 
   // --- Conditional update with optimistic locking ---
   yield* Console.log("=== Conditional Update + Optimistic Locking ===\n")
 
   // #region conditional-update
-  // Combine condition() with expectedVersion() and set().
+  // Combine .condition() with .expectedVersion() and .set().
   // The user condition is ANDed with the optimistic lock condition.
-  const updated = yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Products.set({ price: 24.99 }),
-    Products.expectedVersion(1),
-    Products.condition((t, { gt }) => gt(t.stock, 0)),
-  )
+  const updated = yield* db.entities.Products.update({ productId: "p-1" })
+    .set({ price: 24.99 })
+    .expectedVersion(1)
+    .condition((t, { gt }) => gt(t.stock, 0))
   // #endregion
 
   yield* Console.log(
@@ -208,16 +206,16 @@ const program = Effect.gen(function* () {
 
   // #region conditional-update-fail
   // Condition fails: update only if stock > 1000 (it's 100)
-  const condUpdateFail = yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Products.set({ price: 19.99 }),
-    Products.condition((t, { gt }) => gt(t.stock, 1000)),
-  ).pipe(
-    Effect.match({
-      onFailure: (e) => `${e._tag} — stock not > 1000`,
-      onSuccess: () => "updated",
-    }),
-  )
+  const condUpdateFail = yield* db.entities.Products.update({ productId: "p-1" })
+    .set({ price: 19.99 })
+    .condition((t, { gt }) => gt(t.stock, 1000))
+    .asEffect()
+    .pipe(
+      Effect.match({
+        onFailure: (e) => `${e._tag} — stock not > 1000`,
+        onSuccess: () => "updated",
+      }),
+    )
   // #endregion
 
   // --- Filter expressions ---
@@ -266,24 +264,22 @@ const program = Effect.gen(function* () {
   // #region condition-callback
   // The callback API provides type-safe conditions using PathBuilder.
   // First argument `t` is a path proxy, second `ops` has comparison functions.
-  const conditionUpdated = yield* db.entities.Products.update(
-    { productId: "p-2" },
-    Products.set({ price: 79.99 }),
+  const conditionUpdated = yield* db.entities.Products.update({ productId: "p-2" })
+    .set({ price: 79.99 })
     // Type-safe: t.stock is typed as number, "active" would be a type error
-    Products.condition((t, { gt }) => gt(t.stock, 0)),
-  )
+    .condition((t, { gt }) => gt(t.stock, 0))
 
   // Shorthand condition — plain object for simple equality
-  const shorthandResult = yield* db.entities.Products.update(
-    { productId: "p-2" },
-    Products.set({ price: 84.99 }),
-    Products.condition({ category: "electronics" }),
-  ).pipe(
-    Effect.match({
-      onFailure: (e) => `Failed: ${e._tag}`,
-      onSuccess: (p) => `Shorthand condition: ${p.name} price=$${p.price}`,
-    }),
-  )
+  const shorthandResult = yield* db.entities.Products.update({ productId: "p-2" })
+    .set({ price: 84.99 })
+    .condition({ category: "electronics" })
+    .asEffect()
+    .pipe(
+      Effect.match({
+        onFailure: (e) => `Failed: ${e._tag}`,
+        onSuccess: (p) => `Shorthand condition: ${p.name} price=$${p.price}`,
+      }),
+    )
   // #endregion
   yield* Console.log(
     `Callback condition update: ${conditionUpdated.name} price=$${conditionUpdated.price}`,

@@ -338,18 +338,15 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 5: Update Store Rent")
 
   // #region pattern-5
-  const updated = yield* db.entities.MallStores.update(
-    {
-      cityId: "atlanta",
-      mallId: "eastpointe",
-      buildingId: "bldg-a",
-      storeId: "star-coffee",
-    },
-    Entity.set({
-      rent: "4000.00",
-      discount: "100.00",
-    }),
-  )
+  const updated = yield* db.entities.MallStores.update({
+    cityId: "atlanta",
+    mallId: "eastpointe",
+    buildingId: "bldg-a",
+    storeId: "star-coffee",
+  }).set({
+    rent: "4000.00",
+    discount: "100.00",
+  })
   // updated.rent → "4000.00"
   // updated.discount → "100.00"
   // updated.category → "food/coffee" (preserved)

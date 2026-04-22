@@ -104,16 +104,13 @@ const program = Effect.gen(function* () {
   // ADD atomically increments a number. If the attribute doesn't exist,
   // it's initialized to the provided value. Thread-safe — no read-modify-write.
   // #region add
-  const afterAdd = yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Entity.add({ viewCount: 1 }),
-  )
+  const afterAdd = yield* db.entities.Products.update({ productId: "p-1" }).add({ viewCount: 1 })
 
   // Multiple adds compose
-  const afterMultiAdd = yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Entity.add({ viewCount: 5, stock: 50 }),
-  )
+  const afterMultiAdd = yield* db.entities.Products.update({ productId: "p-1" }).add({
+    viewCount: 5,
+    stock: 50,
+  })
   // #endregion
   yield* Console.log(`After add(viewCount: 1): viewCount = ${afterAdd.viewCount}`)
   yield* Console.log(
@@ -126,10 +123,7 @@ const program = Effect.gen(function* () {
   // Subtract synthesizes SET #field = #field - :val
   // (DynamoDB has no native SUBTRACT — this is a convenience wrapper)
   // #region subtract
-  const afterSub = yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Entity.subtract({ stock: 3 }),
-  )
+  const afterSub = yield* db.entities.Products.update({ productId: "p-1" }).subtract({ stock: 3 })
   // #endregion
   yield* Console.log(
     `After subtract(stock: 3): stock = ${afterSub.stock} (was ${afterMultiAdd.stock})\n`,
@@ -141,10 +135,9 @@ const program = Effect.gen(function* () {
   // Append uses list_append to add elements to the end of a list.
   // The value must be an array.
   // #region append
-  const afterAppend = yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Entity.append({ tags: ["on-sale", "featured"] }),
-  )
+  const afterAppend = yield* db.entities.Products.update({ productId: "p-1" }).append({
+    tags: ["on-sale", "featured"],
+  })
   // #endregion
   yield* Console.log(`After append(tags: ["on-sale", "featured"]):`)
   yield* Console.log(`  tags = ${JSON.stringify(afterAppend.tags)}\n`)
@@ -155,10 +148,9 @@ const program = Effect.gen(function* () {
   // REMOVE deletes attributes entirely from the item.
   // The attribute no longer exists after removal (undefined, not null).
   // #region remove
-  const afterRemove = yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Entity.remove(["description"]),
-  )
+  const afterRemove = yield* db.entities.Products.update({ productId: "p-1" }).remove([
+    "description",
+  ])
   // #endregion
   yield* Console.log(`After remove(["description"]):`)
   yield* Console.log(
@@ -181,13 +173,11 @@ const program = Effect.gen(function* () {
   // All update combinators compose in a single pipe.
   // They are merged into one UpdateItem call to DynamoDB.
   // #region composed
-  const composed = yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Products.set({ name: "Premium Wireless Mouse", price: 39.99 }),
-    Entity.add({ viewCount: 10 }),
-    Entity.subtract({ stock: 5 }),
-    Entity.append({ tags: ["premium"] }),
-  )
+  const composed = yield* db.entities.Products.update({ productId: "p-1" })
+    .set({ name: "Premium Wireless Mouse", price: 39.99 })
+    .add({ viewCount: 10 })
+    .subtract({ stock: 5 })
+    .append({ tags: ["premium"] })
   // #endregion
   yield* Console.log(`Composed update:`)
   yield* Console.log(`  name: ${composed.name}`)
@@ -202,23 +192,21 @@ const program = Effect.gen(function* () {
   // Use expectedVersion to guard against concurrent writes.
   // After the previous mutations (put + 4 updates), the version is 6.
   // #region locking
-  const locked = yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Entity.add({ viewCount: 1 }),
-    Products.expectedVersion(6),
-  )
+  const locked = yield* db.entities.Products.update({ productId: "p-1" })
+    .add({ viewCount: 1 })
+    .expectedVersion(6)
 
   // Wrong version → OptimisticLockError
-  const lockFail = yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Entity.add({ viewCount: 1 }),
-    Products.expectedVersion(1),
-  ).pipe(
-    Effect.map(() => "updated"),
-    Effect.catchTag("OptimisticLockError", (e) =>
-      Effect.succeed(`OptimisticLockError: expected v${e.expectedVersion}`),
-    ),
-  )
+  const lockFail = yield* db.entities.Products.update({ productId: "p-1" })
+    .add({ viewCount: 1 })
+    .expectedVersion(1)
+    .asEffect()
+    .pipe(
+      Effect.map(() => "updated"),
+      Effect.catchTag("OptimisticLockError", (e) =>
+        Effect.succeed(`OptimisticLockError: expected v${e.expectedVersion}`),
+      ),
+    )
   // #endregion
   yield* Console.log(`Update with expectedVersion(6): viewCount = ${locked.viewCount}`)
   yield* Console.log(`Wrong version: ${lockFail}\n`)
