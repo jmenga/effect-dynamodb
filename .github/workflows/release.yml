@@ -89,14 +89,61 @@ jobs:
           }
           EOF
 
-      - name: Create GitHub Releases
+      - name: Create per-package GitHub Releases
         if: steps.detect.outputs.should_publish == 'true'
         run: |
-          node -e "console.log(JSON.stringify(require('/tmp/publish.json')))" > /tmp/targets.json
-          for ROW in $(node -e "for (const t of require('/tmp/targets.json')) console.log(t.name + '@' + t.version)"); do
+          for ROW in $(node -e "for (const t of require('/tmp/publish.json')) console.log(t.name + '@' + t.version)"); do
             git tag "$ROW"
             git push origin "$ROW"
             gh release create "$ROW" --title "$ROW" --generate-notes
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # When all three lockstep packages bump to the same version, also cut a
+      # single aggregate vX.Y.Z tag + release and label every PR merged into
+      # this release window with vX.Y.Z for downstream traceability.
+      - name: Create aggregate vX.Y.Z tag, release, and PR labels
+        if: steps.detect.outputs.should_publish == 'true'
+        run: |
+          AGG_VER=$(node -e "
+            const PUBLISHABLE = ['effect-dynamodb', '@effect-dynamodb/geo', '@effect-dynamodb/language-service'];
+            const targets = require('/tmp/publish.json');
+            const byName = Object.fromEntries(targets.map(t => [t.name, t.version]));
+            const allPresent = PUBLISHABLE.every(n => byName[n]);
+            const versions = new Set(PUBLISHABLE.map(n => byName[n]));
+            if (allPresent && versions.size === 1) process.stdout.write([...versions][0]);
+          ")
+          if [ -z "$AGG_VER" ]; then
+            echo "Not a lockstep bump across all three packages; skipping aggregate tag."
+            exit 0
+          fi
+          AGG_TAG="v$AGG_VER"
+          echo "Aggregate release tag: $AGG_TAG"
+
+          PREV_TAG=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -vx "$AGG_TAG" | head -1 || true)
+          echo "Previous aggregate tag: ${PREV_TAG:-<none>}"
+
+          git tag -a "$AGG_TAG" -m "$AGG_TAG"
+          git push origin "$AGG_TAG"
+
+          if [ -n "$PREV_TAG" ]; then
+            gh release create "$AGG_TAG" --title "$AGG_TAG" --generate-notes --notes-start-tag "$PREV_TAG"
+            RANGE="$PREV_TAG..HEAD"
+          else
+            gh release create "$AGG_TAG" --title "$AGG_TAG" --generate-notes
+            RANGE="HEAD"
+          fi
+
+          gh label create "$AGG_TAG" --color 0366d6 --description "Shipped in $AGG_TAG" 2>/dev/null || true
+
+          git log --pretty=%H "$RANGE" | while read SHA; do
+            gh api "repos/${{ github.repository }}/commits/$SHA/pulls" --jq '.[].number' 2>/dev/null || true
+          done | sort -u | while read PR; do
+            if [ -n "$PR" ]; then
+              echo "Labeling PR #$PR with $AGG_TAG"
+              gh pr edit "$PR" --add-label "$AGG_TAG" || true
+            fi
           done
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
