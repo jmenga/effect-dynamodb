@@ -479,6 +479,326 @@ describe("KeyComposer", () => {
     })
   })
 
+  describe("composeGsiKeysForUpdatePolicyAware", () => {
+    // pk.composite = [A], sk.composite = [B, C]  — canonical shape for the matrix below
+    const makeIndexes = (
+      indexPolicy?: KeyComposer.IndexPolicy,
+    ): Record<string, KeyComposer.IndexDefinition> => ({
+      primary: {
+        pk: { field: "pk", composite: ["id"] },
+        sk: { field: "sk", composite: [] },
+      },
+      byABC: {
+        index: "gsi1",
+        pk: { field: "gsi1pk", composite: ["A"] },
+        sk: { field: "gsi1sk", composite: ["B", "C"] },
+        indexPolicy,
+      },
+    })
+
+    // --- 1. Default policy (no indexPolicy) — all attrs preserve ---
+
+    it("all composites present → SET both halves (no policy)", () => {
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(),
+        { A: "a", B: "b", C: "c" },
+        { id: "i-1" },
+      )
+      expect(result.sets).toHaveProperty("gsi1pk")
+      expect(result.sets).toHaveProperty("gsi1sk")
+      expect(result.removes).toEqual([])
+    })
+
+    it("only A in payload, no policy → SET pk; sk untouched (preserve default)", () => {
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(),
+        { A: "a" },
+        { id: "i-1" },
+      )
+      expect(result.sets).toHaveProperty("gsi1pk")
+      expect(result.sets).not.toHaveProperty("gsi1sk")
+      expect(result.removes).toEqual([])
+    })
+
+    it("only B in payload, no policy → both halves untouched (C missing preserve)", () => {
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(),
+        { B: "b" },
+        { id: "i-1" },
+      )
+      expect(result.sets).toEqual({})
+      expect(result.removes).toEqual([])
+    })
+
+    it("{A, B} in payload, no policy → SET pk; sk untouched (C missing preserve)", () => {
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(),
+        { A: "a", B: "b" },
+        { id: "i-1" },
+      )
+      expect(result.sets).toHaveProperty("gsi1pk")
+      expect(result.sets).not.toHaveProperty("gsi1sk")
+      expect(result.removes).toEqual([])
+    })
+
+    it("{B, C} in payload, no policy → SET sk; pk untouched (A missing preserve)", () => {
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(),
+        { B: "b", C: "c" },
+        { id: "i-1" },
+      )
+      expect(result.sets).not.toHaveProperty("gsi1pk")
+      expect(result.sets).toHaveProperty("gsi1sk")
+      expect(result.removes).toEqual([])
+    })
+
+    // --- 2. Sparse policy ---
+
+    it("A sparse + A missing → REMOVE both halves (sparse wins)", () => {
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(() => ({ A: "sparse" })),
+        { B: "b", C: "c" },
+        { id: "i-1" },
+      )
+      expect(result.sets).toEqual({})
+      expect(result.removes).toEqual(["gsi1pk", "gsi1sk"])
+    })
+
+    it("A sparse + A present → SET both halves (no dropout)", () => {
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(() => ({ A: "sparse" })),
+        { A: "a", B: "b", C: "c" },
+        { id: "i-1" },
+      )
+      expect(result.sets).toHaveProperty("gsi1pk")
+      expect(result.sets).toHaveProperty("gsi1sk")
+      expect(result.removes).toEqual([])
+    })
+
+    it("B sparse + C preserve, C present, B missing → REMOVE both (sparse wins)", () => {
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(() => ({ B: "sparse", C: "preserve" })),
+        { A: "a", C: "c" },
+        { id: "i-1" },
+      )
+      expect(result.sets).toEqual({})
+      expect(result.removes).toEqual(["gsi1pk", "gsi1sk"])
+    })
+
+    it("B preserve + C sparse, B present, C missing → REMOVE both (sparse wins)", () => {
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(() => ({ B: "preserve", C: "sparse" })),
+        { A: "a", B: "b" },
+        { id: "i-1" },
+      )
+      expect(result.sets).toEqual({})
+      expect(result.removes).toEqual(["gsi1pk", "gsi1sk"])
+    })
+
+    it("explicit A preserve with {B, C} → SET sk; pk untouched (same as default)", () => {
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(() => ({ A: "preserve" })),
+        { B: "b", C: "c" },
+        { id: "i-1" },
+      )
+      expect(result.sets).not.toHaveProperty("gsi1pk")
+      expect(result.sets).toHaveProperty("gsi1sk")
+      expect(result.removes).toEqual([])
+    })
+
+    it("A explicit null in merged is treated as missing (sparse)", () => {
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(() => ({ A: "sparse" })),
+        { A: null, B: "b", C: "c" },
+        { id: "i-1" },
+      )
+      expect(result.sets).toEqual({})
+      expect(result.removes).toEqual(["gsi1pk", "gsi1sk"])
+    })
+
+    // --- 3. Policy function behaviour ---
+
+    it("policy function returns empty → all attrs preserve", () => {
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(() => ({})),
+        { A: "a" },
+        { id: "i-1" },
+      )
+      expect(result.sets).toHaveProperty("gsi1pk")
+      expect(result.sets).not.toHaveProperty("gsi1sk")
+      expect(result.removes).toEqual([])
+    })
+
+    it("policy function receives merged record for item-dependent decisions", () => {
+      const received: Array<Record<string, unknown>> = []
+      const policy: KeyComposer.IndexPolicy = (item) => {
+        received.push(item as Record<string, unknown>)
+        return item.A === "x" ? { A: "sparse" } : { A: "preserve" }
+      }
+      // Case 1: A === "x" → sparse → REMOVE
+      const r1 = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(policy),
+        { A: "x", B: "b", C: "c" }, // A present but policy recomputes; both halves present → SET (sparse only fires when missing)
+        { id: "i-1" },
+      )
+      expect(r1.sets).toHaveProperty("gsi1pk")
+      expect(r1.sets).toHaveProperty("gsi1sk")
+
+      // Case 2: A missing, policy returns sparse based on B value → REMOVE
+      const r2 = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes((item) => (item.B === "drop" ? { A: "sparse" } : {})),
+        { B: "drop" },
+        { id: "i-1" },
+      )
+      expect(r2.removes).toEqual(["gsi1pk", "gsi1sk"])
+      expect(received.length).toBeGreaterThan(0)
+    })
+
+    // --- 4. Touched gate ---
+
+    it("untouched GSI is skipped (no composites in payload, no cascade)", () => {
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(() => ({ A: "sparse" })),
+        { unrelated: "x" },
+        { id: "i-1" },
+      )
+      expect(result.sets).toEqual({})
+      expect(result.removes).toEqual([])
+    })
+
+    // --- 5. Cascade REMOVE (Entity.remove of composite) ---
+
+    it("REMOVE cascade of composite A → REMOVE both halves regardless of policy", () => {
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(() => ({ A: "preserve" })), // preserve says don't touch…
+        {},
+        { id: "i-1" },
+        { removedSet: new Set(["A"]) }, // …but cascade overrides
+      )
+      expect(result.sets).toEqual({})
+      expect(result.removes).toEqual(["gsi1pk", "gsi1sk"])
+    })
+
+    it("REMOVE cascade without any payload still fires (cascade is a touch signal)", () => {
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeIndexes(),
+        {},
+        { id: "i-1" },
+        { removedSet: new Set(["B"]) },
+      )
+      expect(result.removes).toEqual(["gsi1pk", "gsi1sk"])
+    })
+
+    // --- 6. Multiple GSIs with independent evaluation ---
+
+    it("two GSIs with different policies are evaluated independently", () => {
+      const indexes: Record<string, KeyComposer.IndexDefinition> = {
+        primary: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+        g1: {
+          index: "gsi1",
+          pk: { field: "gsi1pk", composite: ["A"] },
+          sk: { field: "gsi1sk", composite: ["B"] },
+          indexPolicy: () => ({ A: "sparse", B: "sparse" }),
+        },
+        g2: {
+          index: "gsi2",
+          pk: { field: "gsi2pk", composite: ["C"] },
+          sk: { field: "gsi2sk", composite: ["D"] },
+          indexPolicy: () => ({ C: "preserve", D: "preserve" }),
+        },
+      }
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        indexes,
+        { A: "a", C: "c" }, // g1: B missing sparse → REMOVE; g2: D missing preserve + C present → SET pk, sk untouched
+        { id: "i-1" },
+      )
+      expect(result.removes).toContain("gsi1pk")
+      expect(result.removes).toContain("gsi1sk")
+      expect(result.sets).toHaveProperty("gsi2pk")
+      expect(result.sets).not.toHaveProperty("gsi2sk")
+    })
+
+    // --- 7. keyRecord merging ---
+
+    it("PK composites from keyRecord fill in for GSI composites", () => {
+      const indexes: Record<string, KeyComposer.IndexDefinition> = {
+        primary: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        byUserRole: {
+          index: "gsi1",
+          pk: { field: "gsi1pk", composite: ["role"] },
+          sk: { field: "gsi1sk", composite: ["userId"] },
+        },
+      }
+      const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "User",
+        1,
+        indexes,
+        { role: "admin" },
+        { userId: "u-1" },
+      )
+      expect(result.sets.gsi1pk).toBeDefined()
+      expect(result.sets.gsi1sk).toBeDefined()
+    })
+  })
+
   describe("composeSortKeyPrefix", () => {
     it("partial sk for begins_with queries", () => {
       const index: KeyComposer.IndexDefinition = {
