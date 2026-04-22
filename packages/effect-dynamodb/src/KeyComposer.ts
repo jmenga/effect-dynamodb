@@ -294,48 +294,6 @@ export const composeAllKeys = (
 }
 
 /**
- * Compose GSI keys for indexes whose composites appear in an update payload.
- * For each non-primary index, checks if ANY of its composite attributes are in
- * the update payload. If so, composes the full GSI keys using values merged from
- * keyRecord (primary key composites) and updatePayload.
- *
- * Used by Entity.update to recompose GSI keys when the update touches GSI composites.
- * Callers should filter out indexes whose composites are targeted by REMOVE operations
- * before calling — otherwise `extractComposites` will throw on the missing values.
- */
-export const composeGsiKeysForUpdate = (
-  schema: DynamoSchema.DynamoSchema,
-  entityType: string,
-  entityVersion: number,
-  indexes: Record<string, IndexDefinition>,
-  updatePayload: Record<string, unknown>,
-  keyRecord: Record<string, unknown>,
-): Record<string, string> => {
-  const result: Record<string, string> = {}
-  for (const [indexName, index] of Object.entries(indexes)) {
-    if (indexName === "primary") continue
-    const allComposites = [...index.pk.composite, ...index.sk.composite]
-    const touchedComposites = allComposites.filter((attr) => attr in updatePayload)
-    if (touchedComposites.length > 0) {
-      const merged = { ...keyRecord, ...updatePayload }
-      const missingComposites = allComposites.filter(
-        (attr) => merged[attr] === undefined || merged[attr] === null,
-      )
-      if (missingComposites.length > 0) {
-        throw new PartialGsiCompositeError(
-          indexName,
-          touchedComposites,
-          missingComposites,
-          allComposites,
-        )
-      }
-      Object.assign(result, composeIndexKeys(schema, entityType, entityVersion, index, merged))
-    }
-  }
-  return result
-}
-
-/**
  * Result of policy-aware GSI update composition.
  *
  * - `sets`: map of GSI key field name → composed value (emit as SET clauses).
@@ -353,11 +311,9 @@ export interface GsiUpdateResult {
  * Policy-aware GSI key composition for `Entity.update` and time-series
  * `.append`.
  *
- * Replaces the strict `composeGsiKeysForUpdate` — instead of throwing on
- * partial composites, each GSI is resolved via its `indexPolicy` (if any) and
- * returns a combination of SET and REMOVE operations for the index's key
- * fields. See `DESIGN.md §7 Policy-Aware GSI Composition` for the full
- * decision table.
+ * Each touched GSI is resolved via its `indexPolicy` (if any) and returns a
+ * combination of SET and REMOVE operations for the index's key fields. See
+ * `DESIGN.md §7 Policy-Aware GSI Composition` for the full decision table.
  *
  * Rules (per touched GSI):
  * 1. **Cascade (REMOVE of a composite attr)** — any composite in `removedSet`
@@ -440,40 +396,6 @@ export const composeGsiKeysForUpdatePolicyAware = (
   }
 
   return { sets, removes }
-}
-
-/**
- * Thrown when an update provides some but not all composite attributes for a GSI.
- * Caught by Entity.update and converted to a tagged `ValidationError`.
- *
- * @deprecated Scheduled for removal. With the introduction of `indexPolicy`
- * (default `"preserve"`), partial composites no longer throw — they leave
- * the GSI's stored keys untouched. Consumers wanting strict caller-error
- * validation should enforce it in their own update layer.
- */
-export class PartialGsiCompositeError extends Error {
-  readonly indexName: string
-  readonly provided: ReadonlyArray<string>
-  readonly missing: ReadonlyArray<string>
-  readonly required: ReadonlyArray<string>
-
-  constructor(
-    indexName: string,
-    provided: ReadonlyArray<string>,
-    missing: ReadonlyArray<string>,
-    required: ReadonlyArray<string>,
-  ) {
-    super(
-      `Partial GSI composite update on index "${indexName}": ` +
-        `provided [${provided.join(", ")}] but missing [${missing.join(", ")}]. ` +
-        `When updating any composite for a GSI, all composites must be provided: [${required.join(", ")}]`,
-    )
-    this.name = "PartialGsiCompositeError"
-    this.indexName = indexName
-    this.provided = provided
-    this.missing = missing
-    this.required = required
-  }
 }
 
 /**
