@@ -379,7 +379,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
   indexes: Record<string, IndexDefinition>,
   updatePayload: Record<string, unknown>,
   keyRecord: Record<string, unknown>,
-  options?: { readonly removedSet?: ReadonlySet<string> },
+  options?: { readonly removedSet?: ReadonlySet<string> | undefined },
 ): GsiUpdateResult => {
   const sets: Record<string, string> = {}
   const removes: Array<string> = []

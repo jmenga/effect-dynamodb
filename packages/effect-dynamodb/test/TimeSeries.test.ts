@@ -533,3 +533,153 @@ describe("TimeSeries — append payload shape", () => {
     }).pipe(Effect.provide(layer))
   })
 })
+
+// ---------------------------------------------------------------------------
+// 4. indexPolicy during .append() — hybrid-writer GSI semantics
+// ---------------------------------------------------------------------------
+
+describe("TimeSeries — indexPolicy on append", () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+  })
+
+  // A hybrid GSI like `byAccountAlert` from issue #11: pk has enrichment-owned
+  // attrs (not in appendInput), sk has the event clock (in appendInput).
+  const buildHybridEntity = () => {
+    const entity = Entity.make({
+      model: Telemetry,
+      entityType: "Telemetry",
+      primaryKey: {
+        pk: { field: "pk", composite: ["channel", "deviceId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        byAccountAlert: {
+          name: "gsi6",
+          pk: { field: "gsi6pk", composite: ["accountId", "alert"] },
+          sk: { field: "gsi6sk", composite: ["timestamp"] },
+          // User specifies policy for both update and append callers. At
+          // append-time the library filters down to appendInput attrs only:
+          // `accountId` is dropped (not in appendInput), leaving `alert` and
+          // `timestamp`. With no sparse-missing (appendInput has both), and
+          // accountId missing from item at append-time but filtered out of
+          // policy → implicit preserve → pk half left alone; sk half (only
+          // timestamp composite) present → SET.
+          indexPolicy: () =>
+            ({
+              accountId: "preserve" as const,
+              alert: "preserve" as const,
+              timestamp: "preserve" as const,
+            }) as const,
+        },
+      },
+      timestamps: true,
+      timeSeries: {
+        orderBy: "timestamp",
+        appendInput: TelemetryAppendInput,
+      },
+    })
+    return makeEntityWithTag(entity)
+  }
+
+  it.effect("hybrid GSI: non-appendInput pk composite is preserved; sk recomposes", () => {
+    const { entity, tableLayer } = buildHybridEntity()
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      mockTransactWriteItems.mockResolvedValueOnce({})
+      mockGetItem.mockResolvedValueOnce({
+        Item: {
+          pk: { S: "$tsapp#v1#telemetry#c-1#d-7" },
+          sk: { S: "$tsapp#v1#telemetry_1" },
+          channel: { S: "c-1" },
+          deviceId: { S: "d-7" },
+          timestamp: { S: "2026-04-22T10:00:00.000Z" },
+          __edd_e__: { S: "Telemetry" },
+        },
+      })
+
+      // Ingest-style append: only clock + event fields. `accountId` is not in
+      // appendInput — owned by a separate enrichment writer.
+      yield* entity.append({
+        channel: "c-1",
+        deviceId: "d-7",
+        timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+        alert: true,
+      })
+
+      const call = mockTransactWriteItems.mock.calls[0]![0]
+      const update = call.TransactItems[0].Update
+      const nameVals: Array<string> = Object.values(update.ExpressionAttributeNames)
+      const expr = update.UpdateExpression as string
+
+      // gsi6pk must NOT be SET (accountId missing, preserved).
+      // `alert` composite alone cannot build the pk (accountId missing), so the
+      // half is untouched.
+      expect(expr).not.toMatch(/SET[^R]*gsi6pk/)
+      // gsi6sk (timestamp) must be SET — the clock half is fully present.
+      expect(nameVals).toContain("gsi6sk")
+      // No REMOVE of gsi6 keys (the item stays in the index with its existing pk).
+      expect(expr).not.toMatch(/REMOVE[^S]*gsi6pk/)
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("appendInput-owned composite with sparse policy drops item from GSI", () => {
+    const entity = Entity.make({
+      model: Telemetry,
+      entityType: "Telemetry",
+      primaryKey: {
+        pk: { field: "pk", composite: ["channel", "deviceId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        byAlert: {
+          name: "gsi2",
+          pk: { field: "gsi2pk", composite: ["alert"] },
+          sk: { field: "gsi2sk", composite: ["timestamp"] },
+          indexPolicy: () => ({ alert: "sparse" as const }),
+        },
+      },
+      timestamps: true,
+      timeSeries: {
+        orderBy: "timestamp",
+        appendInput: TelemetryAppendInput,
+      },
+    })
+    const { tableLayer } = makeEntityWithTag(entity)
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      mockTransactWriteItems.mockResolvedValueOnce({})
+      mockGetItem.mockResolvedValueOnce({
+        Item: {
+          pk: { S: "$tsapp#v1#telemetry#c-1#d-7" },
+          sk: { S: "$tsapp#v1#telemetry_1" },
+          channel: { S: "c-1" },
+          deviceId: { S: "d-7" },
+          timestamp: { S: "2026-04-22T10:00:00.000Z" },
+          __edd_e__: { S: "Telemetry" },
+        },
+      })
+
+      // Ingest event without `alert` — sparse policy forces drop-out.
+      yield* entity.append({
+        channel: "c-1",
+        deviceId: "d-7",
+        timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+      })
+
+      const call = mockTransactWriteItems.mock.calls[0]![0]
+      const update = call.TransactItems[0].Update
+      const expr = update.UpdateExpression as string
+      const nameVals: Array<string> = Object.values(update.ExpressionAttributeNames)
+
+      // gsi2 keys must be REMOVEd.
+      expect(expr).toContain("REMOVE")
+      expect(nameVals).toContain("gsi2pk")
+      expect(nameVals).toContain("gsi2sk")
+      // And NOT SET.
+      expect(expr).not.toMatch(/SET[^R]*gsi2pk/)
+    }).pipe(Effect.provide(layer))
+  })
+})
