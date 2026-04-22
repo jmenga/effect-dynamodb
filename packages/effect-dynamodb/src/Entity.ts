@@ -3516,7 +3516,8 @@ const makeImpl = <
       // them untouched.
       const appendInputFieldSet = new Set<string>(
         Object.keys(
-          (appendInputSchema as unknown as { fields?: globalThis.Record<string, unknown> }).fields ?? {},
+          (appendInputSchema as unknown as { fields?: globalThis.Record<string, unknown> })
+            .fields ?? {},
         ),
       )
       const policyAwareIndexes: globalThis.Record<string, IndexDefinition> = {}
@@ -3607,8 +3608,7 @@ const makeImpl = <
 
       const exprParts: Array<string> = []
       if (setClauses.length > 0) exprParts.push(`SET ${setClauses.join(", ")}`)
-      if (appendRemoveClauses.length > 0)
-        exprParts.push(`REMOVE ${appendRemoveClauses.join(", ")}`)
+      if (appendRemoveClauses.length > 0) exprParts.push(`REMOVE ${appendRemoveClauses.join(", ")}`)
       const updateExpression = exprParts.join(" ")
 
       // ---------- Build Put of event item ----------
