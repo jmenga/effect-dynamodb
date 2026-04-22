@@ -7,14 +7,14 @@ This guide covers rich update operations, batch operations, multi-table design, 
 
 ## Updating Items
 
-Beyond `Entity.set()`, effect-dynamodb provides combinators for all DynamoDB update expression types. All compose as variadic arguments to `update()` and execute as one `UpdateItem` call.
+Beyond `.set()`, effect-dynamodb provides combinators for all DynamoDB update expression types. Chain them on the `BoundUpdate` builder from `db.entities.X.update(key)` — they compile to one `UpdateItem` call.
 
 ### Removing Attributes
 
 Deletes attributes entirely from the item:
 
 ```typescript region="remove" example="guide-advanced.ts"
-yield* db.entities.Products.update({ productId: "p-1" }, Entity.remove(["description"]))
+yield* db.entities.Products.update({ productId: "p-1" }).remove(["description"])
 ```
 
 ### Atomic Increment
@@ -22,7 +22,7 @@ yield* db.entities.Products.update({ productId: "p-1" }, Entity.remove(["descrip
 Atomically increments numeric attributes. Thread-safe — no read-modify-write cycle:
 
 ```typescript region="add" example="guide-advanced.ts"
-yield* db.entities.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1, stock: 50 }))
+yield* db.entities.Products.update({ productId: "p-1" }).add({ viewCount: 1, stock: 50 })
 ```
 
 ### Atomic Decrement
@@ -30,7 +30,7 @@ yield* db.entities.Products.update({ productId: "p-1" }, Entity.add({ viewCount:
 Synthesizes `SET #field = #field - :val` (DynamoDB has no native subtract):
 
 ```typescript region="subtract" example="guide-advanced.ts"
-yield* db.entities.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
+yield* db.entities.Products.update({ productId: "p-1" }).subtract({ stock: 3 })
 ```
 
 ### Appending to Lists

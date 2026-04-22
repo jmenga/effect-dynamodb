@@ -154,7 +154,7 @@ Entity.deleteFromSet({ fieldName: new Set(["value-to-remove"]) })
 
 ## Step 9: Composing Multiple Update Types
 
-All update combinators compose as variadic arguments to `update()`. They are merged into one `UpdateItem` call to DynamoDB:
+All update combinators chain as methods on the `BoundUpdate` builder. They are merged into one `UpdateItem` call to DynamoDB:
 
 ```typescript region="composed" example="updates.ts"
 const composed = yield* db.entities.Products.update(
@@ -243,8 +243,8 @@ Effect.runPromise(main).then(
 | **`Entity.append()`** | `list_append` for adding elements to list attributes |
 | **`Entity.remove()`** | `REMOVE` to delete attributes entirely from an item |
 | **`Entity.deleteFromSet()`** | `DELETE` to remove elements from DynamoDB Set types |
-| **Composition** | All combinators compose as variadic arguments to `update()` — one atomic `UpdateItem` call |
-| **Optimistic locking** | `expectedVersion()` composes with any update combinator for concurrency safety |
+| **Composition** | All combinators chain as methods on `BoundUpdate` — compiled into one atomic `UpdateItem` call |
+| **Optimistic locking** | `.expectedVersion(n)` chains with any other combinator on the builder for concurrency safety |
 
 ## What's Next?
 

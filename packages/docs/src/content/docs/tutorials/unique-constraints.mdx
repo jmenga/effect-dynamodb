@@ -209,7 +209,7 @@ When you update a unique field, effect-dynamodb atomically **removes** the old s
 
 ```typescript region="sentinel-rotation" example="unique-constraints.ts"
 // Update Alice's email
-yield* db.entities.Users.update({ userId: "u-1" }, Users.set({ email: "alice-new@example.com" }))
+yield* db.entities.Users.update({ userId: "u-1" }).set({ email: "alice-new@example.com" })
 
 // The old email "alice@example.com" is now free
 const newUser = yield* db.entities.Users.put({

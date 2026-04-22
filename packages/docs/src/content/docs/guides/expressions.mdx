@@ -190,15 +190,13 @@ yield* db.entities.Products.update(
 )
 
 // ADD — atomic increment (numbers) or union (sets)
-yield* db.entities.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1, stock: 50 }))
+yield* db.entities.Products.update({ productId: "p-1" }).add({ viewCount: 1, stock: 50 })
 
 // Subtract — SET field = field - value
-yield* db.entities.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
+yield* db.entities.Products.update({ productId: "p-1" }).subtract({ stock: 3 })
 
 // Append — SET field = list_append(field, value)
-yield* db.entities.Products.update(
-  { productId: "p-1" },
-  Entity.append({ tags: ["on-sale", "featured"] }),
+yield* db.entities.Products.update({ productId: "p-1" }).append({ tags: ["on-sale", "featured"] })
 )
 
 // DELETE — remove elements from a set
@@ -210,7 +208,7 @@ yield* db.entities.Products.update(
 
 ### Composing Multiple Update Types
 
-All combinators compose as variadic arguments to `update()`. They compile to a single `UpdateExpression` with the appropriate SET, REMOVE, ADD, and DELETE clauses:
+All combinators chain as methods on the `BoundUpdate` builder. They compile to a single `UpdateExpression` with the appropriate SET, REMOVE, ADD, and DELETE clauses:
 
 ```typescript region="update-composed" example="guide-expressions.ts"
 yield* db.entities.Products.update(
