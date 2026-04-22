@@ -37,6 +37,7 @@ export default defineConfig({
           items: [
             { label: "Modeling", slug: "guides/modeling" },
             { label: "Indexes & Collections", slug: "guides/indexes" },
+            { label: "indexPolicy — Sparse & Preserved GSIs", slug: "guides/index-policy" },
             { label: "Queries", slug: "guides/queries" },
             { label: "Expressions", slug: "guides/expressions" },
             { label: "Data Integrity", slug: "guides/data-integrity" },

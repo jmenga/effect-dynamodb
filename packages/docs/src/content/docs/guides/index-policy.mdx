@@ -1,0 +1,199 @@
+---
+title: "indexPolicy — Sparse & Preserved GSIs"
+description: "Control how updates and appends handle missing GSI composites: sparse drops out, preserve leaves alone"
+---
+
+import { Aside, Code } from "@astrojs/starlight/components"
+
+`Entity.update` and time-series `.append` let you write partial payloads — you don't have to supply every attribute of every GSI composite. But what should the library *do* when a GSI's composites are only partially present? Three intents share one signal:
+
+| Intent | Library action |
+|---|---|
+| **Sparse** — the item no longer belongs in this GSI | `REMOVE gsiNpk, gsiNsk` — item drops out |
+| **Preserve** — another writer owns this composite; leave the stored keys alone | Do not touch `gsiNpk`/`gsiNsk` |
+| **Recompose** — all composites present | SET both halves |
+
+`indexPolicy` is how you tell the library which intent applies to each composite attribute of a given GSI. Default: `preserve` for every attr on every GSI. Declare `sparse` only where you want an update to be able to drop the item out of that GSI.
+
+## When you need it
+
+- **Hybrid-writer GSIs.** A device-ingest writer sets `alertState` per-event; an enrichment writer sets `tenantId` once. Both writers' updates touch the same device item. Without `indexPolicy`, every ingest update would attempt to recompose the `byTenant` GSI and — since ingest doesn't supply `tenantId` — silently leave the half un-rewritten. That's the default `preserve` behavior, which is what you want. But if you also want `byAlert` to clear when an alert is resolved (alertState cleared from the payload), you need `sparse` on `alertState`.
+- **Conditional indexing.** An item should be in a GSI only when a specific attribute is populated (e.g., `status === "active"`). Set `sparse` on that attribute; when an update nulls it, the item drops out.
+- **Migration / backfill scripts.** Default `preserve` lets you run partial updates without worrying about accidentally blanking GSIs the script doesn't know about.
+
+## Declaring a policy
+
+```typescript region="entity" example="guide-index-policy.ts"
+const Devices = Entity.make({
+  model: Device,
+  entityType: "Device",
+  primaryKey: {
+    pk: { field: "pk", composite: ["channel", "deviceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    // byAlert — sparse on alertState.
+    // When an ingest event omits alertState (plain telemetry), the policy
+    // REMOVEs the GSI keys so the device drops out of the alert view.
+    byAlert: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["alertState"] },
+      sk: { field: "gsi1sk", composite: ["deviceId"] },
+      indexPolicy: () => ({ alertState: "sparse" as const }),
+    },
+    // byTenant — preserve on tenantId.
+    // Ingest writers never touch tenantId. When an ingest-side update fires,
+    // the preserve policy leaves the stored gsi2pk/gsi2sk untouched so the
+    // device remains queryable via the enrichment writer's tenant assignment.
+    byTenant: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["tenantId"] },
+      sk: { field: "gsi2sk", composite: ["deviceId"] },
+      indexPolicy: () =>
+        ({ tenantId: "preserve" as const, deviceId: "preserve" as const }) as const,
+    },
+  },
+  timestamps: true,
+})
+```
+
+The policy is a function so it can branch on the item's current state (e.g. return `"sparse"` only when `item.status === "draft"`). If you return nothing or don't declare `indexPolicy` at all, every composite defaults to `"preserve"`.
+
+## Sparse drop-out
+
+Providing an `indexPolicy` that marks an attr `"sparse"` makes partial updates able to drop the item from the GSI:
+
+```typescript region="sparse-drop" example="guide-index-policy.ts"
+// Update without providing alertState (i.e. alertState becomes undefined in
+// the merged payload). Policy says 'sparse' → REMOVE gsi1pk/gsi1sk.
+yield* db.entities.Devices.update(
+  { channel: "c-1", deviceId: "d-1" },
+  Entity.set({ alertState: undefined, label: "quiet" }),
+)
+
+const afterDrop = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
+// →  afterDrop is empty — item dropped out of the alert GSI
+```
+
+Re-adding the attr re-indexes the item transparently:
+
+```typescript region="sparse-rehydrate" example="guide-index-policy.ts"
+yield* db.entities.Devices.update(
+  { channel: "c-1", deviceId: "d-1" },
+  Entity.set({ alertState: "cleared" }),
+)
+
+const cleared = yield* db.entities.Devices.byAlert({ alertState: "cleared" }).collect()
+// →  cleared contains d-1 under its new alertState
+```
+
+## Preserve — the default
+
+With the `preserve` default, a writer that doesn't own every composite of a GSI can still freely update other attrs without touching the GSI:
+
+```typescript region="hybrid" example="guide-index-policy.ts"
+// Start with an un-indexed device (no tenantId, no alertState).
+yield* db.entities.Devices.put({ channel: "c-2", deviceId: "d-2" })
+
+// Enrichment writer assigns tenantId.
+yield* db.entities.Devices.update(
+  { channel: "c-2", deviceId: "d-2" },
+  Entity.set({ tenantId: "initech" }),
+)
+
+// Later, ingest writer sets alertState. tenantId is NOT in this payload,
+// but the preserve policy on byTenant leaves its stored keys alone.
+yield* db.entities.Devices.update(
+  { channel: "c-2", deviceId: "d-2" },
+  Entity.set({ alertState: "active" }),
+)
+
+// Both indexes correct — neither writer clobbered the other's composites.
+const finalAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
+const finalTenant = yield* db.entities.Devices.byTenant({ tenantId: "initech" }).collect()
+// →  both queries return d-2
+```
+
+The ingest writer's `Entity.set({ alertState: "active" })` touches `byAlert` (recomposes its keys) and **also** touches `byTenant` (because `byTenant.sk` has `deviceId`, which is in the primary key → always in the merged payload). Because `tenantId` is `"preserve"` and missing from the payload, the library leaves `byTenant`'s stored keys alone rather than rewriting them with a junk value. That's the whole point.
+
+## Decision rules
+
+For each GSI touched by an update, the library computes the merged record (primary key + update payload) and applies these rules, in order:
+
+1. **`Entity.remove()` cascade** — if the update REMOVEs any composite attribute of this GSI, REMOVE both `gsiNpk` and `gsiNsk`. This takes precedence over `indexPolicy` (removing a composite attribute means "I want this item out of that GSI").
+2. **Sparse wins** — if any composite is absent and its policy is `"sparse"`, REMOVE both halves. One sparse-missing attr drops the whole GSI entry.
+3. **Full recompose** — all composites present → SET both halves. No policy needed.
+4. **Half-wise preserve** — some composites missing with policy `"preserve"`, none with `"sparse"`:
+   - If a half's composites are all present, SET that half.
+   - If a half has a missing-preserve composite, leave that half alone (no SET, no REMOVE).
+
+The "half-wise" behavior is what makes hybrid GSIs work: your primary key's `deviceId` alone is enough to recompose the sk half of `byTenant` (if the sk's only composite is `deviceId`), while the pk half — which requires `tenantId` — stays untouched.
+
+## Interaction with `put()`
+
+`put()` does NOT consult `indexPolicy`. It always omits a GSI's keys when any of its composites is missing (unchanged pre-existing behavior). `indexPolicy` only resolves the update/append ambiguity, because those operations have a stored item to reason about. A fresh `put()` doesn't — missing composite = not in this index.
+
+## Interaction with time-series `.append()`
+
+`indexPolicy` is applied during `.append()` too, with one extra constraint: returned policy keys must be members of `appendInput`. Composites outside `appendInput` are by contract never changed by an append, so their policy can't fire at append-time — they default to `"preserve"` unconditionally, leaving the half that contains them untouched.
+
+This means a GSI like `byAccountAlert` with `pk.composite: ["accountId", "alertState"]` where `accountId` is enrichment-owned (not in `appendInput`) behaves correctly under ingest-side `.append()` calls: the pk half is left alone (accountId preserve, untouched), while any sk composite (e.g. `timestamp`) in `appendInput` is recomposed on every event.
+
+```typescript
+indexes: {
+  byAccountAlert: {
+    name: "gsi6",
+    pk: { field: "gsi6pk", composite: ["accountId", "alertState"] },
+    sk: { field: "gsi6sk", composite: ["timestamp"] },
+    indexPolicy: () => ({
+      accountId:  "preserve" as const,  // Not in appendInput — always preserve at append
+      alertState: "preserve" as const,  // In appendInput, but keep existing when omitted
+      timestamp:  "preserve" as const,  // In appendInput; always provided (orderBy)
+    }),
+  },
+}
+```
+
+## Cascade precedence
+
+```typescript region="cascade" example="guide-index-policy.ts"
+// Regardless of indexPolicy, removing a GSI composite attribute drops the
+// item out of that GSI. Cascade takes precedence over preserve/sparse.
+yield* db.entities.Devices.update(
+  { channel: "c-2", deviceId: "d-2" },
+  Entity.remove(["tenantId"]),
+)
+
+const tenantAfterRemove = yield* db.entities.Devices.byTenant({ tenantId: "initech" }).collect()
+// →  tenantAfterRemove is empty — cascade overrode the preserve policy
+```
+
+An explicit `Entity.remove(["tenantId"])` always REMOVEs every GSI whose composites include `tenantId`, regardless of whether those composites are otherwise marked `"preserve"`. Think of it as: `remove` is the explicit way to opt out of an index, and it overrides the declarative policy.
+
+## Quick reference
+
+| Scenario | Policy | Payload | Result |
+|---|---|---|---|
+| Full recompose | any | all composites present | SET both halves |
+| Default partial update | none (all preserve) | some composites missing | SET halves fully present; leave halves with missing attrs alone |
+| Sparse dropout | `"sparse"` on attr A | A missing | REMOVE both halves |
+| Explicit preserve | `"preserve"` on attr A | A missing | Same as default preserve |
+| Mixed sparse + preserve | `A: "sparse", B: "preserve"` | A missing | REMOVE (sparse wins) |
+| `Entity.remove(["A"])` cascade | any | any | REMOVE both halves (cascade overrides) |
+
+## Runnable example
+
+Full working program (requires DynamoDB Local):
+
+```bash
+docker run -p 8000:8000 amazon/dynamodb-local
+npx tsx examples/guide-index-policy.ts
+```
+
+See [`examples/guide-index-policy.ts`](https://github.com/jmenga/effect-dynamodb/blob/main/packages/effect-dynamodb/examples/guide-index-policy.ts) for the full source.
+
+## What's Next?
+
+- [Indexes & Collections](/effect-dynamodb/guides/indexes/) — How GSI composites and collections are defined
+- [Time Series](/effect-dynamodb/guides/timeseries/) — `.append` details and enrichment preservation
+- [Queries](/effect-dynamodb/guides/queries/) — Query by index, filter by SK composites
