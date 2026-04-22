@@ -944,8 +944,75 @@ const results = yield* db.Users.execute(
 
 ```typescript
 yield* db.Users.put({ userId: "abc-123", email: "alice@example.com", displayName: "Alice", role: "admin" })
-yield* db.Users.update({ userId: "abc-123" }, { displayName: "Alice B" })
+yield* db.Users.update({ userId: "abc-123" }).set({ displayName: "Alice B" })
 ```
+
+#### Fluent bound-CRUD builders
+
+Bound-client CRUD methods return **fluent builders** that mirror the `BoundQuery` contract on the read side. This replaces the variadic `...combinators` form used prior to v0.9.
+
+```typescript
+// Update + optimistic lock
+yield* db.entities.Tasks.update({ taskId: "t-1" })
+  .set({ status: "done" })
+  .expectedVersion(3)
+
+// Put with a condition
+yield* db.entities.Users.put(input)
+  .condition({ status: "active" })
+
+// Create (attribute_not_exists) with a callback condition
+yield* db.entities.Users.create(input)
+  .condition((t, { eq }) => eq(t.status, "active"))
+
+// Delete with a condition
+yield* db.entities.Products.delete({ productId: "p-1" })
+  .condition({ status: "archived" })
+
+// Upsert — same shape as put
+yield* db.entities.Counters.upsert({ counterId: "c-1", total: 0 })
+
+// Patch — update with attribute_exists guard
+yield* db.entities.Tasks.patch({ taskId: "t-1" })
+  .set({ status: "blocked" })
+
+// Composed update
+yield* db.entities.Products.update({ productId: "p-1" })
+  .set({ name: "Updated", price: 24.99 })
+  .add({ viewCount: 1 })
+  .subtract({ stock: 3 })
+  .append({ tags: ["clearance"] })
+  .remove(["temporaryFlag"])
+  .expectedVersion(5)
+```
+
+**Yieldable, not Effect.** Builders implement `Pipeable.Pipeable` and `[Symbol.iterator]` (via `Utils.SingleShotGen`) — the same contract as the unbound `EntityOp` and `EntityDelete` intermediates. You execute them by `yield*`ing inside `Effect.gen`. For interop with Effect combinators (`Effect.map`, `Effect.flip`, etc.) use `.asEffect()`.
+
+**Immutable accumulator.** Every chainable call returns a new builder — same semantics as `BoundQuery`.
+
+**Method surface per builder**
+
+| Builder | Method | Accepts |
+|---|---|---|
+| `BoundPut` / `BoundCreate` / `BoundUpsert` | `.condition(cond)` | callback `(t, ops) => Expr` or shorthand record |
+| `BoundDelete` | `.condition(cond)` | same as above |
+| `BoundDelete` | `.returnValues(mode)` | `"none"` or `"allOld"` |
+| `BoundUpdate` / `BoundPatch` | `.set(updates)` | partial record |
+| `BoundUpdate` / `BoundPatch` | `.remove(fields)` | `ReadonlyArray<string>` |
+| `BoundUpdate` / `BoundPatch` | `.add(values)` | `Record<string, number>` |
+| `BoundUpdate` / `BoundPatch` | `.subtract(values)` | `Record<string, number>` |
+| `BoundUpdate` / `BoundPatch` | `.append(values)` | `Record<string, ReadonlyArray<unknown>>` |
+| `BoundUpdate` / `BoundPatch` | `.deleteFromSet(values)` | `Record<string, unknown>` |
+| `BoundUpdate` / `BoundPatch` | `.expectedVersion(n)` | `number` |
+| `BoundUpdate` / `BoundPatch` | `.condition(cond)` | callback or shorthand |
+| `BoundUpdate` / `BoundPatch` | `.returnValues(mode)` | any `ReturnValuesMode` |
+| `BoundUpdate` / `BoundPatch` | `.cascade(config)` | cascade targets |
+| `BoundUpdate` / `BoundPatch` | `.pathSet(op)` / `.pathRemove(segs)` / `.pathAdd(op)` / `.pathSubtract(op)` / `.pathAppend(op)` / `.pathPrepend(op)` / `.pathIfNotExists(op)` / `.pathDelete(op)` | same payloads as the unbound `Entity.path*` combinators |
+| all builders | `.asEffect()` | — |
+
+**Implementation strategy.** The builders are thin wrappers. Internally each holds an `EntityOp` (or `EntityDelete`) from the unbound entity plus a pre-resolved `provide` for `DynamoClient + TableConfig`. Every chainable method forwards into the existing `Entity.set/remove/add/condition/…` combinators. On `yield*` (or `.asEffect()`) the builder calls `op._run("record")` (or `op.asEffect()` for deletes) and pipes through `provide` so the final `Effect` has `R = never`.
+
+**Why hard-break over dual.** Carrying both the variadic overload and the fluent builder would double the surface area of `BoundEntity`, degrade hover tooltips, and force contributors to remember two shapes. The read side settled on builders for the same reasons. The change is batched into the next major alongside other breaking changes.
 
 #### Lifecycle Operations
 
