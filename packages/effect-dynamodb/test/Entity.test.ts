@@ -7090,23 +7090,57 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    // Collision validation.
-    it("Entity.make: errors when `version` is declared in the model alongside versioned (EDD-9021)", () => {
-      class Bad extends Schema.Class<Bad>("Bad")({
-        id: Schema.String,
-        version: Schema.Number,
-      }) {}
-      expect(() =>
-        Entity.make({
-          model: Bad,
-          entityType: "Bad",
-          primaryKey: {
-            pk: { field: "pk", composite: ["id"] },
-            sk: { field: "sk", composite: [] },
-          },
-          versioned: true,
-        }),
-      ).toThrow(/EDD-9021/)
-    })
+    // `version` declared in the model is allowed when `versioned: true` —
+    // purely for type-level visibility (Schema.Class round-tripping, reads).
+    // Library retains full control of the write path.
+    class VersionedDoc extends Schema.Class<VersionedDoc>("VersionedDoc")({
+      id: Schema.String,
+      title: Schema.String,
+      version: Schema.Number,
+    }) {}
+
+    const VersionedDocEntity = withConfig(
+      Entity.make({
+        model: VersionedDoc,
+        entityType: "VersionedDoc",
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+        versioned: true,
+      }),
+    )
+
+    it.effect("put: `version` in model — library sets to 1, caller cannot override", () =>
+      Effect.gen(function* () {
+        mockPutItem.mockResolvedValue({})
+        // `version` is stripped from inputSchema — TS would error on
+        // `put({ id, title, version: 42 })`. Library writes 1 on first put.
+        yield* VersionedDocEntity.put({ id: "v-1", title: "first" }).asEffect()
+        const item = mockPutItem.mock.calls[0]![0].Item
+        expect(item.version).toEqual({ N: "1" })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("update: `version` in model — library auto-increments, stripped from .set()", () =>
+      Effect.gen(function* () {
+        mockUpdateItem.mockResolvedValue({
+          Attributes: toAttributeMap({
+            pk: "$myapp#v1#versioneddoc#v-2",
+            sk: "$myapp#v1#versioneddoc",
+            id: "v-2",
+            title: "updated",
+            version: 2,
+            __edd_e__: "VersionedDoc",
+          }),
+        })
+        yield* VersionedDocEntity.update({ id: "v-2" })
+          .pipe(Entity.set({ title: "updated" }))
+          .asEffect()
+        const call = mockUpdateItem.mock.calls[0]![0]
+        // UpdateExpression contains the version-increment clause
+        expect(call.UpdateExpression).toContain("+ :vinc")
+      }).pipe(Effect.provide(TestLayer)),
+    )
   })
 })

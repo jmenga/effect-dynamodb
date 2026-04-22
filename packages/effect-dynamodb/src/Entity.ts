@@ -1218,18 +1218,19 @@ const makeImpl = <
     configuredAttributes,
   )
 
-  // System-field collision validation (EDD-9021).
-  // Timestamp collisions with a non-date model field silently yield the field
-  // to the user (see `resolveSystemFields`). `version` is different — there's
-  // no compatible "user owns this" pattern because optimistic locking requires
-  // library-managed increment.
-  if (systemFields.versionCollision && systemFields.version) {
-    throw new Error(
-      `[EDD-9021] Entity "${config.entityType}": model field "${systemFields.version}" ` +
-        `collides with the versioned system field. Remove it from the model — the library ` +
-        `manages \`version\` automatically when \`versioned\` is configured.`,
-    )
-  }
+  // System-field collision policy:
+  //   - Timestamp collisions with a non-date model field silently yield the
+  //     field to the user (see `resolveSystemFields`).
+  //   - `version` collision is allowed. The field is stripped from
+  //     `inputSchema` / `createSchema` / `updateSchema` (see
+  //     `buildDerivedSchemas`), so user code cannot supply it via `put` /
+  //     `create` / `.set()`. Library continues to own the write path
+  //     (auto-increment + `.expectedVersion()` optimistic locking). The model
+  //     declaration is purely for type-level visibility — callers can
+  //     construct Schema.Class instances and read `version` off the record.
+  //   - Manual version fixups remain available by dropping to the raw
+  //     `DynamoClient` service; they deliberately do not appear on the
+  //     `Entity` surface to keep the locking invariant visibly inviolable.
 
   // ---------------------------------------------------------------------------
   // Validate indexes

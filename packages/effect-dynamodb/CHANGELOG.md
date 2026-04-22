@@ -16,9 +16,7 @@
 
   **New: user-owned non-date fields that collide with a system field name.** If your model declares e.g. `createdAt: Schema.String` (as a user-managed composite value, not a timestamp), the library detects the non-date collision and yields the field to the user — library timestamp management applies only to non-colliding fields (e.g. `updatedAt`). Preserves existing patterns that use `createdAt` as a plain string SK composite.
 
-  **Errors:**
-
-  - `EDD-9021` — the `version` field cannot be declared in the model alongside `versioned: true`, because optimistic locking requires library-managed increment.
+  **New: declare `version` in your domain model for read-side ergonomics.** `version: Schema.Number` alongside `versioned: true` is now allowed. The field is stripped from `inputSchema` / `createSchema` / `updateSchema` so callers cannot override via `put` / `create` / `.set()` — the library retains full control of the write path (auto-increment + `.expectedVersion()` optimistic locking). The declaration is purely for type-level visibility: `new MyEntity({ ..., version: 1 })` typechecks, reducers and round-tripping through Schema.Class work as expected. Manual version fixups remain available by dropping to the raw `DynamoClient` service.
 
   **Type ergonomics.** The exposed `inputSchema` / `createSchema` / `updateSchema` codec types (and the corresponding `Entity.put` / `create` / `update` call signatures) now flatten into plain object literals in hover tooltips instead of showing as wrapped generic aliases.
 
