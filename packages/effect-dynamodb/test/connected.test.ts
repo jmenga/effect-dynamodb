@@ -1481,10 +1481,9 @@ describeConnected("timeSeries integration tests", () => {
         timestamp: t0,
         location: "rack-A",
       })
-      yield* db.entities.Telemetries.update(
-        { channel: "c-enrich", deviceId: "d-1" },
-        Telemetries.set({ accountId: "acct-1" }),
-      )
+      yield* db.entities.Telemetries.update({ channel: "c-enrich", deviceId: "d-1" }).set({
+        accountId: "acct-1",
+      })
 
       // Append without accountId in input — must not overwrite enrichment.
       const t1 = DateTime.makeUnsafe("2026-04-22T14:05:00.000Z")
