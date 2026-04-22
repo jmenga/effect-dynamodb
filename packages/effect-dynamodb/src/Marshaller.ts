@@ -18,7 +18,8 @@ export const fromAttributeMap = (item: Record<string, AttributeValue>): Record<s
   unmarshall(item)
 
 /** Marshall a single value to a DynamoDB attribute value */
-export const toAttributeValue = (value: unknown): AttributeValue => marshall({ v: value }).v!
+export const toAttributeValue = (value: unknown): AttributeValue =>
+  marshall({ v: value }, { removeUndefinedValues: true, convertClassInstanceToMap: true }).v!
 
 /** Unmarshall a single DynamoDB attribute value */
 export const fromAttributeValue = (value: AttributeValue): unknown => unmarshall({ v: value }).v
