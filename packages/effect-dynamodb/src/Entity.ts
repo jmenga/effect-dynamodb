@@ -35,6 +35,7 @@ import {
   ValidationError,
 } from "./Errors.js"
 import type { ConditionInput } from "./Expression.js"
+import { makeBoundDelete, makeBoundPut, makeBoundUpdate } from "./internal/BoundCrud.js"
 import { type BoundQueryConfig, BoundQueryImpl } from "./internal/BoundQuery.js"
 import {
   compileExpr,
@@ -680,17 +681,6 @@ export interface Entity<
  * }) {}
  * ```
  */
-/** Combinator that transforms a put/create/upsert operation. */
-export type PutCombinator<M> = (op: EntityPut<M, any, any, any>) => EntityPut<M, any, any, any>
-
-/** Combinator that transforms an update/patch operation. */
-export type UpdateCombinator<M> = (
-  op: EntityUpdate<M, any, any, any, any>,
-) => EntityUpdate<M, any, any, any, any>
-
-/** Combinator that transforms a delete operation. */
-export type DeleteCombinator = (op: EntityDelete<any, any>) => EntityDelete<any, any>
-
 export interface BoundEntity<
   TModel extends Schema.Top,
   TIndexes extends globalThis.Record<string, IndexDefinition>,
@@ -705,99 +695,121 @@ export interface BoundEntity<
     key: TKey,
   ) => Effect.Effect<ModelType<TModel>, ItemNotFound | DynamoClientError | ValidationError, never>
 
-  /** Create or replace an item. Accepts optional combinators (e.g. `Entity.condition(...)`). */
+  /**
+   * Create or replace an item. Returns a fluent {@link BoundPut} — yield to execute,
+   * chain `.condition(...)` to add a condition expression.
+   *
+   * ```ts
+   * yield* db.entities.Users.put(input)
+   * yield* db.entities.Users.put(input).condition({ status: "active" })
+   * ```
+   */
   readonly put: (
     input: EntityRefInputType<TModel, TRefs>,
-    ...combinators: ReadonlyArray<PutCombinator<ModelType<TModel>>>
-  ) => Effect.Effect<
+  ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
-    DynamoClientError | ValidationError | UniqueConstraintViolation | RefErrors<TRefs>,
-    never
+    ModelType<TModel>,
+    DynamoClientError | ValidationError | UniqueConstraintViolation | RefErrors<TRefs>
   >
 
-  /** Create a new item. Fails if primary key already exists. Accepts optional combinators. */
+  /**
+   * Create a new item. Fails with {@link ConditionalCheckFailed} if an item with the same
+   * primary key already exists. Returns a fluent {@link BoundPut}.
+   */
   readonly create: (
     input: EntityRefInputType<TModel, TRefs>,
-    ...combinators: ReadonlyArray<PutCombinator<ModelType<TModel>>>
-  ) => Effect.Effect<
+  ) => import("./internal/BoundCrud.js").BoundPut<
+    ModelType<TModel>,
     ModelType<TModel>,
     | DynamoClientError
     | ValidationError
     | UniqueConstraintViolation
     | ConditionalCheckFailed
-    | RefErrors<TRefs>,
-    never
+    | RefErrors<TRefs>
   >
 
   /**
-   * Update an existing item. Applies combinators and returns an Effect.
+   * Begin an update on an existing item. Returns a fluent {@link BoundUpdate} — chain
+   * `.set(...)`, `.remove(...)`, `.add(...)`, `.condition(...)`, `.expectedVersion(...)`,
+   * then `yield*`.
    *
    * ```ts
-   * yield* teams.update({ id }, Entity.set(updates), Entity.expectedVersion(3))
+   * yield* db.entities.Tasks.update({ id }).set(updates).expectedVersion(3)
    * ```
    */
   readonly update: (
     key: TKey,
-    ...combinators: ReadonlyArray<UpdateCombinator<ModelType<TModel>>>
-  ) => Effect.Effect<
+  ) => import("./internal/BoundCrud.js").BoundUpdate<
     ModelType<TModel>,
+    ModelType<TModel>,
+    EntityRefUpdateType<TModel, TIndexes, TRefs>,
     | DynamoClientError
     | ItemNotFound
     | OptimisticLockError
     | UniqueConstraintViolation
     | ValidationError
-    | RefErrors<TRefs>,
-    never
+    | RefErrors<TRefs>
   >
 
-  /** Delete an item by primary key. Accepts optional combinators (e.g. `Entity.condition(...)`). */
+  /**
+   * Delete an item by primary key. Returns a fluent {@link BoundDelete} — yield to execute,
+   * chain `.condition(...)` and/or `.returnValues(...)`.
+   *
+   * ```ts
+   * yield* db.entities.Tasks.delete(key)
+   * yield* db.entities.Tasks.delete(key).condition({ status: "archived" })
+   * ```
+   */
   readonly delete: (
     key: TKey,
-    ...combinators: ReadonlyArray<DeleteCombinator>
-  ) => Effect.Effect<void, DynamoClientError | ItemNotFound, never>
+  ) => import("./internal/BoundCrud.js").BoundDelete<
+    ModelType<TModel>,
+    DynamoClientError | ItemNotFound
+  >
 
   /**
-   * Create or update an item atomically. Uses DynamoDB UpdateItem with `if_not_exists()`
-   * for immutable fields and createdAt so they're only set on first creation.
-   * Accepts optional combinators.
+   * Create or update an item atomically. Returns a fluent {@link BoundPut}.
+   * Uses DynamoDB UpdateItem with `if_not_exists()` for immutable fields and
+   * createdAt so they're only set on first creation.
    */
   readonly upsert: (
     input: EntityRefInputType<TModel, TRefs>,
-    ...combinators: ReadonlyArray<PutCombinator<ModelType<TModel>>>
-  ) => Effect.Effect<
+  ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
-    DynamoClientError | ValidationError | ItemNotFound | ConditionalCheckFailed | RefErrors<TRefs>,
-    never
+    ModelType<TModel>,
+    DynamoClientError | ValidationError | ItemNotFound | ConditionalCheckFailed | RefErrors<TRefs>
   >
 
   /**
-   * Update an existing item. Fails with `ConditionalCheckFailed` if the item doesn't exist.
-   * Applies combinators and returns an Effect.
+   * Update an existing item. Fails with {@link ConditionalCheckFailed} if the item doesn't exist.
+   * Returns a fluent {@link BoundUpdate}.
    *
    * ```ts
-   * yield* teams.patch({ id }, Entity.set(updates))
+   * yield* db.entities.Tasks.patch({ id }).set(updates)
    * ```
    */
   readonly patch: (
     key: TKey,
-    ...combinators: ReadonlyArray<UpdateCombinator<ModelType<TModel>>>
-  ) => Effect.Effect<
+  ) => import("./internal/BoundCrud.js").BoundUpdate<
     ModelType<TModel>,
+    ModelType<TModel>,
+    EntityRefUpdateType<TModel, TIndexes, TRefs>,
     | DynamoClientError
     | ItemNotFound
     | OptimisticLockError
     | UniqueConstraintViolation
     | ValidationError
     | ConditionalCheckFailed
-    | RefErrors<TRefs>,
-    never
+    | RefErrors<TRefs>
   >
 
-  /** Delete an existing item, fails if not found. Accepts optional combinators. */
+  /** Delete an existing item, fails if not found. Returns a fluent {@link BoundDelete}. */
   readonly deleteIfExists: (
     key: TKey,
-    ...combinators: ReadonlyArray<DeleteCombinator>
-  ) => Effect.Effect<void, DynamoClientError | ItemNotFound | ConditionalCheckFailed, never>
+  ) => import("./internal/BoundCrud.js").BoundDelete<
+    ModelType<TModel>,
+    DynamoClientError | ItemNotFound | ConditionalCheckFailed
+  >
 
   // --- Lifecycle Operations ---
 
@@ -4513,34 +4525,12 @@ export const bind = <
     type Key = EntityKeyType<TModel, TIndexes>
     type Input = EntityRefInputType<TModel, TRefs>
 
-    // Helper: apply combinators to an EntityUpdate, then run in record mode + provide
-    const applyUpdate = (
-      op: EntityUpdate<any, any, any, any, any>,
-      combinators: ReadonlyArray<(op: any) => any>,
-    ) => {
-      let result: any = op
-      for (const fn of combinators) result = fn(result)
-      return provide(result._run("record"))
-    }
-
-    // Helper: apply combinators to an EntityPut, then run in record mode + provide
-    const applyPut = (
-      op: EntityPut<any, any, any, any>,
-      combinators: ReadonlyArray<(op: any) => any>,
-    ) => {
-      let result: any = op
-      for (const fn of combinators) result = fn(result)
-      return provide(result._run("record"))
-    }
-
-    // Helper: apply combinators to an EntityDelete, then asEffect + provide
-    const applyDelete = (
-      op: EntityDelete<any, any>,
-      combinators: ReadonlyArray<(op: any) => any>,
-    ) => {
-      let result: any = op
-      for (const fn of combinators) result = fn(result)
-      return provide(result.asEffect())
+    // Shared config for the bound-CRUD builders — pre-resolved services plus
+    // a typed PathBuilder/ConditionOps so `.condition((t, ops) => ...)` works.
+    const boundCrudConfig: import("./internal/BoundCrud.js").BoundCrudConfig<unknown> = {
+      pathBuilder: createPathBuilder(),
+      conditionOps: createConditionOps(),
+      provide,
     }
 
     // Helper: apply query combinators then execute
@@ -4567,22 +4557,15 @@ export const bind = <
     }
 
     return {
-      // CRUD — all ops return Effect (auto-wrapped)
+      // CRUD — fluent bound builders (yieldable, no .run() terminal)
       get: (key: Key) => provide((entity.get(key) as any)._run("record")),
-      put: (input: Input, ...combinators: ReadonlyArray<(op: any) => any>) =>
-        applyPut(entity.put(input), combinators),
-      create: (input: Input, ...combinators: ReadonlyArray<(op: any) => any>) =>
-        applyPut(entity.create(input), combinators),
-      update: (key: Key, ...combinators: ReadonlyArray<(op: any) => any>) =>
-        applyUpdate(entity.update(key), combinators),
-      delete: (key: Key, ...combinators: ReadonlyArray<(op: any) => any>) =>
-        applyDelete(entity.delete(key), combinators),
-      upsert: (input: Input, ...combinators: ReadonlyArray<(op: any) => any>) =>
-        applyPut(entity.upsert(input), combinators),
-      patch: (key: Key, ...combinators: ReadonlyArray<(op: any) => any>) =>
-        applyUpdate(entity.patch(key), combinators),
-      deleteIfExists: (key: Key, ...combinators: ReadonlyArray<(op: any) => any>) =>
-        applyDelete(entity.deleteIfExists(key), combinators),
+      put: (input: Input) => makeBoundPut(entity.put(input), boundCrudConfig),
+      create: (input: Input) => makeBoundPut(entity.create(input), boundCrudConfig),
+      update: (key: Key) => makeBoundUpdate(entity.update(key), boundCrudConfig),
+      delete: (key: Key) => makeBoundDelete(entity.delete(key), boundCrudConfig),
+      upsert: (input: Input) => makeBoundPut(entity.upsert(input), boundCrudConfig),
+      patch: (key: Key) => makeBoundUpdate(entity.patch(key), boundCrudConfig),
+      deleteIfExists: (key: Key) => makeBoundDelete(entity.deleteIfExists(key), boundCrudConfig),
       // Lifecycle
       getVersion: (key: Key, version: number) =>
         provide((entity.getVersion(key, version) as any)._run("record")),
