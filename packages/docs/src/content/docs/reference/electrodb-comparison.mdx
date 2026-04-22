@@ -88,28 +88,28 @@ ElectroDB is the most feature-rich existing DynamoDB ORM for TypeScript. This co
 | Put (create/overwrite) | `entity.put(data).go()` | `bound.put(input)` | Parity |
 | Create (fail if exists) | `entity.create(data).go()` | `bound.create(input)` | Parity |
 | Upsert (create or update) | `entity.upsert(data).go()` | `bound.upsert(input)` | Parity |
-| Update | `entity.update(pk).set({}).go()` | `bound.update(key, Entity.set(updates))` | Parity |
-| Patch (fail if not exists) | `entity.patch(pk).set({}).go()` | `bound.patch(key, Entity.set(updates))` | Parity |
+| Update | `entity.update(pk).set({}).go()` | `bound.update(key).set(updates)` | Parity |
+| Patch (fail if not exists) | `entity.patch(pk).set({}).go()` | `bound.patch(key).set(updates)` | Parity |
 | Delete | `entity.delete(pk).go()` | `bound.delete(key)` | Parity |
 | Remove (fail if not exists) | `entity.remove(pk).go()` | `bound.deleteIfExists(key)` | Parity |
-| Conditional writes | `.where()` on any mutation | `Entity.condition(callback \| shorthand)` on put/update/delete | Parity |
+| Conditional writes | `.where()` on any mutation | `.condition(callback \| shorthand)` on put/update/delete builders | Parity |
 | Batch put/delete | `entity.put([...]).go()`, `entity.delete([...]).go()` | `Batch.write(ops)` with auto-retry | Parity |
 | Transact write | `service.transaction.write(cb)` | `Transaction.transactWrite(ops)` | Parity |
 | Condition check (transaction) | `.check().where().commit()` | `Transaction.check(condition)` | Parity |
-| Return values control | `response: "all_old"/"all_new"/etc.` | `Entity.returnValues(mode)` | Parity |
+| Return values control | `response: "all_old"/"all_new"/etc.` | `.returnValues(mode)` on `BoundUpdate`/`BoundDelete` | Parity |
 
 ### 5. Update Expression Builders
 
 | Feature | ElectroDB | effect-dynamodb | Assessment |
 |---------|-----------|-----------------|------------|
-| SET (replace values) | `.set({})` | `Entity.set(updates)` | Parity |
-| REMOVE (delete attributes) | `.remove([])` | `Entity.remove(fields)` | Parity |
-| ADD (increment / add to set) | `.add({})` | `Entity.add(values)` | Parity |
-| SUBTRACT (decrement) | `.subtract({})` | `Entity.subtract(values)` | Parity |
-| APPEND (add to list) | `.append({})` | `Entity.append(values)` | Parity |
-| DELETE (remove from set) | `.delete({})` | `Entity.deleteFromSet(values)` | Parity |
-| Data callback | `.data((attrs, ops) => ...)` | Variadic combinators: `Entity.set()`, `Entity.add()`, `Entity.pathSet()`, etc. | Parity |
-| Nested property updates | Dot notation for maps, brackets for lists | Path-based combinators: `Entity.pathSet()`, `Entity.pathRemove()`, `Entity.pathAdd()`, etc. | Parity |
+| SET (replace values) | `.set({})` | `.set(updates)` on `BoundUpdate` | Parity |
+| REMOVE (delete attributes) | `.remove([])` | `.remove(fields)` on `BoundUpdate` | Parity |
+| ADD (increment / add to set) | `.add({})` | `.add(values)` on `BoundUpdate` | Parity |
+| SUBTRACT (decrement) | `.subtract({})` | `.subtract(values)` on `BoundUpdate` | Parity |
+| APPEND (add to list) | `.append({})` | `.append(values)` on `BoundUpdate` | Parity |
+| DELETE (remove from set) | `.delete({})` | `.deleteFromSet(values)` on `BoundUpdate` | Parity |
+| Data callback | `.data((attrs, ops) => ...)` | Fluent methods on `BoundUpdate`: `.set()`, `.add()`, `.pathSet()`, etc. | Parity |
+| Nested property updates | Dot notation for maps, brackets for lists | Path-based methods on `BoundUpdate`: `.pathSet()`, `.pathRemove()`, `.pathAdd()`, etc. | Parity |
 
 ### 6. Lifecycle & Data Integrity
 
@@ -128,7 +128,7 @@ ElectroDB is the most feature-rich existing DynamoDB ORM for TypeScript. This co
 | Purge (full partition) | Not built-in | `Entity.purge(key)` — deletes item + versions + sentinels | **Advantage** |
 | Soft-deleted item access | Not built-in | `Entity.deleted.get(key)`, `Entity.deleted.list(key)` | **Advantage** |
 | Unique constraints | Manual via transactions | Built-in `unique` config — sentinel-based with atomic transactions | **Advantage** |
-| Optimistic locking | Not built-in | Built-in `Entity.expectedVersion(n)` | **Advantage** |
+| Optimistic locking | Not built-in | Built-in `.expectedVersion(n)` on `BoundUpdate` | **Advantage** |
 | Idempotency | Manual via transaction tokens | Built-in via unique constraints | **Advantage** |
 | Conversion utilities | Composites ↔ Keys ↔ Cursors | Use `KeyComposer` functions directly | Different approach |
 | Event listeners/logging | `listeners`/`logger` callbacks | Use Effect tracing/logging (`Effect.tap`, `Effect.log`, spans) | Different approach |
@@ -247,8 +247,8 @@ Features in ElectroDB that are not available in effect-dynamodb, with workaround
 | Key casting (numeric keys) | All keys are strings by design |
 | Index scope | Key namespacing provides sufficient isolation |
 | Attributes as indexes | Use standard composite key definitions |
-| Data callback | Variadic combinators: `Entity.set()`, `Entity.add()`, `Entity.pathSet()`, etc. |
-| Nested property updates | Path-based combinators: `Entity.pathSet()`, `Entity.pathRemove()`, `Entity.pathAdd()`, etc. |
+| Data callback | Fluent methods on `BoundUpdate`: `.set()`, `.add()`, `.pathSet()`, etc. |
+| Nested property updates | Path-based methods on `BoundUpdate`: `.pathSet()`, `.pathRemove()`, `.pathAdd()`, etc. |
 | Custom params merge | Use `DynamoClient` directly for custom operations |
 | ElectroCLI | N/A — no CLI equivalent |
 | Hydrate (KEYS_ONLY GSI) | Query GSI then compose `Batch.get(keys)` in a pipe |

@@ -29,7 +29,7 @@ const program = Effect.gen(function* () {
 })
 ```
 
-**Bound methods return Effects**, so they work naturally with Effect combinators:
+**Bound methods return fluent builders** (or `Effect` for simple reads), yieldable in `Effect.gen`. Chain combinators as methods:
 
 ```typescript
 const db = yield* DynamoClient.make({
@@ -37,11 +37,11 @@ const db = yield* DynamoClient.make({
   tables: { MainTable },
 })
 
-// Effect combinators work directly — no .asEffect() needed
+// get() returns an Effect — Effect combinators work directly
 yield* db.entities.Users.get({ userId: "123" }).pipe(Effect.map((u) => u.name))
 ```
 
-**For updates with combinators**, pass them as additional arguments to `update`:
+**For updates with combinators**, chain them on the builder:
 
 ```typescript
 const db = yield* DynamoClient.make({
@@ -49,17 +49,26 @@ const db = yield* DynamoClient.make({
   tables: { MainTable },
 })
 
-yield* db.entities.Users.update(
-  { userId: "123" },
-  Entity.set({ name: "Alice" }),
-  Entity.expectedVersion(1),
-)
+yield* db.entities.Users.update({ userId: "123" })
+  .set({ name: "Alice" })
+  .expectedVersion(1)
+```
+
+For `Effect.map`/`Effect.catchTag`/etc. after the builder, call `.asEffect()` first:
+
+```typescript
+yield* db.entities.Users.update({ userId: "123" })
+  .set({ name: "Alice" })
+  .expectedVersion(1)
+  .asEffect()
+  .pipe(Effect.catchTag("OptimisticLockError", () => Effect.succeed(undefined)))
 ```
 
 **Rule of thumb:**
 - Call `DynamoClient.make({ entities, tables })` at the top of each `Effect.gen` block — access entities via `db.entities.*`
 - Use bound methods for all operations (`db.entities.Users.get`, `.put`, `.update`, `.delete`, `.upsert`, `.restore`, `.purge`, etc.)
-- Pass update combinators (`Entity.set`, `Entity.expectedVersion`, `EntityDef.condition`, etc.) as rest arguments to `db.entities.Users.update` / `.patch`
+- Chain combinators as methods on the builder (`.set(...).expectedVersion(3).condition(...)`)
+- `yield*` the builder to execute; `.asEffect()` for interop with Effect combinators
 
 ---
 
@@ -101,10 +110,10 @@ const users = db.entities.Users
 // Entity with GSI: byTenant has composite: ["tenantId", "region"]
 
 // WRONG: partial GSI composites — will error
-yield* users.update({ userId: "u-1" }, Entity.set({ tenantId: "t-new" }))  // Missing "region"!
+yield* users.update({ userId: "u-1" }).set({ tenantId: "t-new" })  // Missing "region"!
 
 // CORRECT: provide all composites for the GSI
-yield* users.update({ userId: "u-1" }, Entity.set({ tenantId: "t-new", region: "us-east-1" }))
+yield* users.update({ userId: "u-1" }).set({ tenantId: "t-new", region: "us-east-1" })
 ```
 
 **What about `Entity.remove()`?** When you remove a GSI composite attribute, the corresponding GSI key fields (pk/sk) are automatically removed so the item drops out of the sparse index. If SET and REMOVE target composites of the same GSI, removal wins.
@@ -287,11 +296,11 @@ const db = yield* DynamoClient.make({
 })
 const users = db.entities.Users
 
-// BoundEntity methods return Effects — work with all combinators
+// BoundEntity methods are yieldable builders (or Effects for .get)
 yield* users.get({ userId: "123" }).pipe(Effect.map((u) => u.name))
 
-// Updates accept combinators as rest arguments
-yield* users.update({ userId: "123" }, Entity.set({ name: "Alice" }))
+// Updates are fluent: chain combinators as methods
+yield* users.update({ userId: "123" }).set({ name: "Alice" })
 ```
 
 ---
@@ -313,7 +322,7 @@ const users = db.entities.Users
 
 // If the GSI has composite: ["tenantId", "region"]
 // Provide BOTH when updating either one
-yield* users.update({ userId: "u-1" }, Entity.set({ tenantId: "t-new", region: "us-east-1" }))
+yield* users.update({ userId: "u-1" }).set({ tenantId: "t-new", region: "us-east-1" })
 ```
 
 If you want to update a non-GSI field without touching the GSI, omit all GSI composites and the GSI key will not be recomposed.
@@ -394,25 +403,23 @@ const db = yield* DynamoClient.make({
 })
 const users = db.entities.Users
 
-yield* users.update(
-  { userId: "u-1" },
-  Entity.set({ name: "Updated" }),
-  Entity.expectedVersion(3),
-).pipe(
-  Effect.catchTag("OptimisticLockError", (e) =>
-    // e.expectedVersion — what you expected
-    // e.actualVersion — what DynamoDB has
-    Effect.gen(function* () {
-      // Re-read and retry with the current version
-      const current = yield* users.get({ userId: "u-1" })
-      return yield* users.update(
-        { userId: "u-1" },
-        Entity.set({ name: "Updated" }),
-        Entity.expectedVersion(current.version),
-      )
-    })
-  ),
-)
+yield* users.update({ userId: "u-1" })
+  .set({ name: "Updated" })
+  .expectedVersion(3)
+  .asEffect()
+  .pipe(
+    Effect.catchTag("OptimisticLockError", (e) =>
+      // e.expectedVersion — what you expected
+      // e.actualVersion — what DynamoDB has
+      Effect.gen(function* () {
+        // Re-read and retry with the current version
+        const current = yield* users.get({ userId: "u-1" })
+        return yield* users.update({ userId: "u-1" })
+          .set({ name: "Updated" })
+          .expectedVersion(current.version)
+      })
+    ),
+  )
 ```
 
 ---
@@ -494,9 +501,16 @@ type Result = MyOp extends Effect.Effect<infer A> ? A : never  // resolves to ne
 type Result = MyOp extends EntityOp<infer A, any, any, any> ? A : never
 ```
 
-**"Property 'set' does not exist on EntityUpdate"**
+**"Property 'set' does not exist on EntityUpdate" (unbound entities)**
 
-Update combinators (`set`, `expectedVersion`, `remove`, `add`, etc.) are module-level functions on `Entity`, not methods on the update object. Pass them as rest arguments to the bound `update` method:
+On unbound entities (`Entity.make({...})` return value), update combinators (`Entity.set`, `Entity.expectedVersion`, `Entity.remove`, `Entity.add`, etc.) are module-level pipeable functions. Pipe them into the update:
+
+```typescript
+// Unbound entity — use Entity.* combinators via .pipe()
+yield* Users.update({ userId: "u-1" }).pipe(Entity.set({ name: "Alice" }))
+```
+
+On the **bound** client (`db.entities.*`), chain combinators as methods directly:
 
 ```typescript
 const db = yield* DynamoClient.make({
@@ -505,14 +519,12 @@ const db = yield* DynamoClient.make({
 })
 const users = db.entities.Users
 
-// Pass combinators as rest arguments
-yield* users.update({ userId: "u-1" }, Entity.set({ name: "Alice" }))
+// Bound client — fluent methods on the builder
+yield* users.update({ userId: "u-1" }).set({ name: "Alice" })
 
-// Multiple combinators
-yield* users.update(
-  { userId: "u-1" },
-  Entity.set({ name: "Alice" }),
-  Entity.expectedVersion(3),
-  Users.condition((t, { exists }) => exists(t.email)),
-)
+// Multiple combinators chained
+yield* users.update({ userId: "u-1" })
+  .set({ name: "Alice" })
+  .expectedVersion(3)
+  .condition((t, { exists }) => exists(t.email))
 ```
