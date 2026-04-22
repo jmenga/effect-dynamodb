@@ -311,6 +311,10 @@ Before committing:
 8. New services must follow `Context.Service` pattern
 9. New or updated doc pages must have a backing example file with region markers
 
+## PR Conventions
+
+Every PR that resolves a tracked issue **MUST** reference the issue(s) it closes using a GitHub closing keyword (`Closes #N`, `Fixes #N`, or `Resolves #N`) in the PR body. This is non-negotiable — without a closing keyword, the issue stays open after merge and drifts out of sync with reality. A bare `#N` mention (e.g. "relates to #N") does **not** auto-close; use one of the keywords above, one per issue. If a PR only partially addresses an issue, reference it without a closing keyword and say so explicitly in the PR body.
+
 ## Release Workflow
 
 This repo uses [Changesets](https://github.com/changesets/changesets) with **fixed lockstep versioning** across the three publishable packages (`effect-dynamodb`, `@effect-dynamodb/geo`, `@effect-dynamodb/language-service`). Publishing is automated: every push to `main` runs `.github/workflows/release.yml`, which detects packages whose `package.json` version is ahead of npm and publishes them via Trusted Publishing (OIDC — no `NPM_TOKEN`).
