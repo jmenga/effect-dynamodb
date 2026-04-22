@@ -241,11 +241,11 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Pattern 4: Pipeable Updates ===\n")
 
   // #region update
-  // db.entities.Users.update(key, ...combinators) — type-safe
-  const updatedAlice = yield* db.entities.Users.update(
-    { userId: "alice-1" },
-    Entity.set({ displayName: "Alice B.", postCount: 3 }),
-  )
+  // db.entities.Users.update(key).set(...) — fluent, type-safe
+  const updatedAlice = yield* db.entities.Users.update({ userId: "alice-1" }).set({
+    displayName: "Alice B.",
+    postCount: 3,
+  })
   // #endregion
   // updatedAlice: User
   yield* Console.log(
@@ -253,24 +253,23 @@ const program = Effect.gen(function* () {
   )
 
   // Multiple combinators in update
-  const aliceV2 = yield* db.entities.Users.update(
-    { userId: "alice-1" },
-    Entity.set({ bio: "Effect TS enthusiast" }),
-  )
+  const aliceV2 = yield* db.entities.Users.update({ userId: "alice-1" }).set({
+    bio: "Effect TS enthusiast",
+  })
   yield* Console.log(`  updated bio: ${aliceV2.bio}`)
 
   // #region optimistic-locking
   // expectedVersion for optimistic locking
-  const lockResult = yield* db.entities.Users.update(
-    { userId: "alice-1" },
-    Entity.set({ displayName: "Wrong Name" }),
-    Entity.expectedVersion(1), // version is now 2 — this will fail
-  ).pipe(
-    Effect.map(() => "unexpected success"),
-    Effect.catchTag("OptimisticLockError", (e) =>
-      Effect.succeed(`Caught OptimisticLockError: expected v${e.expectedVersion}`),
-    ),
-  )
+  const lockResult = yield* db.entities.Users.update({ userId: "alice-1" })
+    .set({ displayName: "Wrong Name" })
+    .expectedVersion(1) // version is now 2 — this will fail
+    .asEffect()
+    .pipe(
+      Effect.map(() => "unexpected success"),
+      Effect.catchTag("OptimisticLockError", (e) =>
+        Effect.succeed(`Caught OptimisticLockError: expected v${e.expectedVersion}`),
+      ),
+    )
   // #endregion
   yield* Console.log(`  ${lockResult}\n`)
 

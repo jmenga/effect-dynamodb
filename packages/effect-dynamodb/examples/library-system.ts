@@ -570,18 +570,15 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 7: Loan a Book (update — sparse index)")
 
   // #region loan-book
-  yield* db.entities.Books.update(
-    { isbn: "978-0-547-928227", bookId: "b-hobbit" },
-    Entity.set({
-      memberId: "m-alice",
-      loanEndDate: "2025-04-01",
-      // Must provide all GSI composites for affected indexes
-      authorLastName: "Tolkien",
-      authorFirstName: "J.R.R.",
-      bookTitle: "The Hobbit",
-      releaseDate: "1937-09-21",
-    }),
-  )
+  yield* db.entities.Books.update({ isbn: "978-0-547-928227", bookId: "b-hobbit" }).set({
+    memberId: "m-alice",
+    loanEndDate: "2025-04-01",
+    // Must provide all GSI composites for affected indexes
+    authorLastName: "Tolkien",
+    authorFirstName: "J.R.R.",
+    bookTitle: "The Hobbit",
+    releaseDate: "1937-09-21",
+  })
 
   // Now the book appears in Alice's loans
   const { Books: aliceLoansAfter } = yield* db.collections.account!({

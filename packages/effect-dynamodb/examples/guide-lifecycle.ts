@@ -155,14 +155,11 @@ const program = Effect.gen(function* () {
 
   // #region update
   // Update employee (version 2)
-  const updated = yield* db.entities.Employees.update(
-    { employeeId: "emp-alice" },
-    Entity.set({
-      displayName: "Alice Baker",
-      department: "Engineering",
-      tenantId: "t-acme",
-    }),
-  )
+  const updated = yield* db.entities.Employees.update({ employeeId: "emp-alice" }).set({
+    displayName: "Alice Baker",
+    department: "Engineering",
+    tenantId: "t-acme",
+  })
   yield* Console.log(`Updated: ${updated.displayName} (v${v(updated)})`)
   // #endregion
   assertEq(v(updated), 2, "alice version 2")
@@ -265,14 +262,11 @@ const program = Effect.gen(function* () {
     department: "Sales",
   })
 
-  yield* db.entities.Employees.update(
-    { employeeId: "emp-bob" },
-    Entity.set({
-      displayName: "Bob Smith",
-      department: "Sales",
-      tenantId: "t-acme",
-    }),
-  )
+  yield* db.entities.Employees.update({ employeeId: "emp-bob" }).set({
+    displayName: "Bob Smith",
+    department: "Sales",
+    tenantId: "t-acme",
+  })
 
   yield* db.entities.Employees.delete({ employeeId: "emp-bob" })
 

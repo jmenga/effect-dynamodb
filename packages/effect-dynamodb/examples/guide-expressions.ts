@@ -193,31 +193,23 @@ const program = Effect.gen(function* () {
 
   // #region condition-on-operations
   // On put
-  yield* db.entities.Products.put(
-    {
-      ...baseProduct,
-      productId: "p-5",
-      name: "New Product",
-      category: "electronics",
-      price: 49.99,
-      stock: 10,
-    },
-    Products.condition((t, { notExists }) => notExists(t.productId)),
-  )
+  yield* db.entities.Products.put({
+    ...baseProduct,
+    productId: "p-5",
+    name: "New Product",
+    category: "electronics",
+    price: 49.99,
+    stock: 10,
+  }).condition((t, { notExists }) => notExists(t.productId))
 
   // On update (ANDed with optimistic lock)
-  yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Products.set({ name: "Widget Pro" }),
-    Products.expectedVersion(1),
-    Products.condition((t, { gt }) => gt(t.stock, 0)),
-  )
+  yield* db.entities.Products.update({ productId: "p-1" })
+    .set({ name: "Widget Pro" })
+    .expectedVersion(1)
+    .condition((t, { gt }) => gt(t.stock, 0))
 
   // On delete
-  yield* db.entities.Products.delete(
-    { productId: "p-4" },
-    Products.condition((t, { eq }) => eq(t.stock, 0)),
-  )
+  yield* db.entities.Products.delete({ productId: "p-4" }).condition((t, { eq }) => eq(t.stock, 0))
   // #endregion
 
   yield* Console.log("Conditional put, update, and delete succeeded\n")
@@ -294,34 +286,29 @@ const program = Effect.gen(function* () {
 
   // #region update-record
   // SET — assign values
-  yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Entity.set({ name: "Widget Deluxe", price: 34.99 }),
-  )
+  yield* db.entities.Products.update({ productId: "p-1" }).set({
+    name: "Widget Deluxe",
+    price: 34.99,
+  })
 
   // REMOVE — delete attributes
-  yield* db.entities.Products.update(
-    { productId: "p-4" },
-    Entity.remove(["description", "temporaryFlag"]),
-  )
+  yield* db.entities.Products.update({ productId: "p-4" }).remove(["description", "temporaryFlag"])
 
   // ADD — atomic increment (numbers) or union (sets)
-  yield* db.entities.Products.update({ productId: "p-1" }, Entity.add({ viewCount: 1, stock: 50 }))
+  yield* db.entities.Products.update({ productId: "p-1" }).add({ viewCount: 1, stock: 50 })
 
   // Subtract — SET field = field - value
-  yield* db.entities.Products.update({ productId: "p-1" }, Entity.subtract({ stock: 3 }))
+  yield* db.entities.Products.update({ productId: "p-1" }).subtract({ stock: 3 })
 
   // Append — SET field = list_append(field, value)
-  yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Entity.append({ tags: ["on-sale", "featured"] }),
-  )
+  yield* db.entities.Products.update({ productId: "p-1" }).append({
+    tags: ["on-sale", "featured"],
+  })
 
   // DELETE — remove elements from a set
-  yield* db.entities.Products.update(
-    { productId: "p-4" },
-    Entity.deleteFromSet({ categories: new Set(["obsolete"]) }),
-  )
+  yield* db.entities.Products.update({ productId: "p-4" }).deleteFromSet({
+    categories: new Set(["obsolete"]),
+  })
   // #endregion
 
   yield* Console.log("Record-based updates applied\n")
@@ -332,15 +319,13 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Composing Multiple Update Types ===\n")
 
   // #region update-composed
-  yield* db.entities.Products.update(
-    { productId: "p-1" },
-    Entity.set({ name: "Updated Widget", price: 24.99 }),
-    Entity.add({ viewCount: 1 }),
-    Entity.subtract({ stock: 3 }),
-    Entity.append({ tags: ["clearance"] }),
-    Entity.remove(["temporaryFlag"]),
-    Products.expectedVersion(5),
-  )
+  yield* db.entities.Products.update({ productId: "p-1" })
+    .set({ name: "Updated Widget", price: 24.99 })
+    .add({ viewCount: 1 })
+    .subtract({ stock: 3 })
+    .append({ tags: ["clearance"] })
+    .remove(["temporaryFlag"])
+    .expectedVersion(5)
   // #endregion
 
   yield* Console.log("Composed update applied\n")
@@ -352,39 +337,41 @@ const program = Effect.gen(function* () {
 
   // #region update-path
   // SET nested path
-  yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
-    Entity.pathSet(op, { segments: ["address", "city"], value: "NYC", isPath: false }),
-  )
+  yield* db.entities.Products.update({ productId: "p-1" }).pathSet({
+    segments: ["address", "city"],
+    value: "NYC",
+    isPath: false,
+  })
 
   // SET array element
-  yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
-    Entity.pathSet(op, { segments: ["roster", 0, "position"], value: "captain", isPath: false }),
-  )
+  yield* db.entities.Products.update({ productId: "p-1" }).pathSet({
+    segments: ["roster", 0, "position"],
+    value: "captain",
+    isPath: false,
+  })
 
   // Copy attribute to attribute
-  yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
-    Entity.pathSet(op, {
-      segments: ["backup_email"],
-      value: undefined,
-      isPath: true,
-      valueSegments: ["email"],
-    }),
-  )
+  yield* db.entities.Products.update({ productId: "p-1" }).pathSet({
+    segments: ["backup_email"],
+    value: undefined,
+    isPath: true,
+    valueSegments: ["email"],
+  })
 
   // REMOVE nested attribute
-  yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
-    Entity.pathRemove(op, ["metadata", "temporary"]),
-  )
+  yield* db.entities.Products.update({ productId: "p-1" }).pathRemove(["metadata", "temporary"])
 
   // PREPEND to list
-  yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
-    Entity.pathPrepend(op, { segments: ["tags"], value: ["URGENT"] }),
-  )
+  yield* db.entities.Products.update({ productId: "p-1" }).pathPrepend({
+    segments: ["tags"],
+    value: ["URGENT"],
+  })
 
   // if_not_exists — set only if the attribute doesn't exist
-  yield* db.entities.Products.update({ productId: "p-1" }, (op) =>
-    Entity.pathIfNotExists(op, { segments: ["createdBy"], value: "system" }),
-  )
+  yield* db.entities.Products.update({ productId: "p-1" }).pathIfNotExists({
+    segments: ["createdBy"],
+    value: "system",
+  })
   // #endregion
 
   yield* Console.log("Path-based updates applied\n")

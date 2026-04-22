@@ -148,16 +148,13 @@ const program = Effect.gen(function* () {
 
   // --- Update: only updateable fields ---
   // (createdBy excluded — immutable; employeeId excluded — primary key)
-  const updated = yield* db.entities.Employees.update(
-    { employeeId: "emp-alice" as any },
-    Entity.set({
-      displayName: "Alice C.",
-      department: "Platform",
-      // Must provide all GSI composites for ByTenant:
-      tenantId: "tenant-acme" as any,
-      hireDate: "2024-01-15T00:00:00.000Z" as any,
-    }),
-  )
+  const updated = yield* db.entities.Employees.update({ employeeId: "emp-alice" as any }).set({
+    displayName: "Alice C.",
+    department: "Platform",
+    // Must provide all GSI composites for ByTenant:
+    tenantId: "tenant-acme" as any,
+    hireDate: "2024-01-15T00:00:00.000Z" as any,
+  })
   yield* Console.log(`Updated: ${updated.displayName}, dept=${updated.department}`)
 
   // --- Query: employees by tenant via collection ---

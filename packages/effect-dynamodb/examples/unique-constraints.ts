@@ -143,11 +143,13 @@ const program = Effect.gen(function* () {
     username: "bob",
     tenantId: "t-1",
     name: "Bob",
-  }).pipe(
-    Effect.catchTag("UniqueConstraintViolation", (e) =>
-      Effect.succeed(`Blocked: constraint="${e.constraint}", fields=${JSON.stringify(e.fields)}`),
-    ),
-  )
+  })
+    .asEffect()
+    .pipe(
+      Effect.catchTag("UniqueConstraintViolation", (e) =>
+        Effect.succeed(`Blocked: constraint="${e.constraint}", fields=${JSON.stringify(e.fields)}`),
+      ),
+    )
   // Blocked: constraint="email", fields={"email":"alice@example.com"}
   // #endregion
   yield* Console.log(`Created: ${alice.name} (email: ${alice.email}, username: ${alice.username})`)
@@ -164,11 +166,13 @@ const program = Effect.gen(function* () {
     username: "alice", // Same username as Alice!
     tenantId: "t-1",
     name: "Bob",
-  }).pipe(
-    Effect.catchTag("UniqueConstraintViolation", (e) =>
-      Effect.succeed(`Blocked: constraint="${e.constraint}"`),
-    ),
-  )
+  })
+    .asEffect()
+    .pipe(
+      Effect.catchTag("UniqueConstraintViolation", (e) =>
+        Effect.succeed(`Blocked: constraint="${e.constraint}"`),
+      ),
+    )
   // Blocked: constraint="username"
 
   // Both different → succeeds
@@ -202,11 +206,13 @@ const program = Effect.gen(function* () {
     idempotencyKey: "idem-abc-123", // Same idempotency key!
     payload: '{"action":"charge","amount":100}',
     status: "pending",
-  }).pipe(
-    Effect.catchTag("UniqueConstraintViolation", (e) =>
-      Effect.succeed(`Blocked: constraint="${e.constraint}" — duplicate request prevented`),
-    ),
-  )
+  })
+    .asEffect()
+    .pipe(
+      Effect.catchTag("UniqueConstraintViolation", (e) =>
+        Effect.succeed(`Blocked: constraint="${e.constraint}" — duplicate request prevented`),
+      ),
+    )
   // The sentinel has a TTL of 30 minutes
   // After expiry, the same key can be reused
 
@@ -229,7 +235,7 @@ const program = Effect.gen(function* () {
 
   // #region sentinel-rotation
   // Update Alice's email
-  yield* db.entities.Users.update({ userId: "u-1" }, Users.set({ email: "alice-new@example.com" }))
+  yield* db.entities.Users.update({ userId: "u-1" }).set({ email: "alice-new@example.com" })
 
   // The old email "alice@example.com" is now free
   const newUser = yield* db.entities.Users.put({
@@ -242,14 +248,14 @@ const program = Effect.gen(function* () {
   // Created: Charlie
 
   // But Alice's new email is still protected
-  const conflict = yield* db.entities.Users.update(
-    { userId: "u-2" },
-    Users.set({ email: "alice-new@example.com" }),
-  ).pipe(
-    Effect.catchTag("UniqueConstraintViolation", (e) =>
-      Effect.succeed(`Blocked: constraint="${e.constraint}"`),
-    ),
-  )
+  const conflict = yield* db.entities.Users.update({ userId: "u-2" })
+    .set({ email: "alice-new@example.com" })
+    .asEffect()
+    .pipe(
+      Effect.catchTag("UniqueConstraintViolation", (e) =>
+        Effect.succeed(`Blocked: constraint="${e.constraint}"`),
+      ),
+    )
   // Blocked: constraint="email"
   // #endregion
   const updatedAlice = yield* db.entities.Users.get({ userId: "u-1" })

@@ -334,16 +334,13 @@ const program = Effect.gen(function* () {
   // #region crud
   const joe = yield* db.entities.Employees.get({ employee: "jlowe" })
 
-  const updated = yield* db.entities.Employees.update(
-    { employee: "jlowe" },
-    Entity.set({
-      office: "gw-zoo",
-      team: "jupiter",
-      title: "Head Zookeeper",
-      salary: "000055.00",
-      manager: "jlowe",
-    }),
-  )
+  const updated = yield* db.entities.Employees.update({ employee: "jlowe" }).set({
+    office: "gw-zoo",
+    team: "jupiter",
+    title: "Head Zookeeper",
+    salary: "000055.00",
+    manager: "jlowe",
+  })
 
   yield* db.entities.Employees.delete({ employee: "jlowe" })
 
@@ -465,16 +462,13 @@ const program = Effect.gen(function* () {
   yield* Console.log("Pattern 8: Employee Transfer (All-or-None)")
 
   // #region transfer
-  const transferred = yield* db.entities.Employees.update(
-    { employee: "dfinlay" },
-    Entity.set({
-      office: "big-cat-rescue",
-      team: "saturn",
-      title: "Handler",
-      salary: "000035.00",
-      manager: "cbaskin",
-    }),
-  )
+  const transferred = yield* db.entities.Employees.update({ employee: "dfinlay" }).set({
+    office: "big-cat-rescue",
+    team: "saturn",
+    title: "Handler",
+    salary: "000035.00",
+    manager: "cbaskin",
+  })
 
   const newReports = yield* db.entities.Employees.byManager({ manager: "cbaskin" }).collect()
 
@@ -496,10 +490,10 @@ const program = Effect.gen(function* () {
 
   // Partial GSI update fails at runtime
   // #region partial-gsi-error
-  const partialError = yield* db.entities.Employees.update(
-    { employee: "dfinlay" },
-    Entity.set({ office: "gw-zoo" } as any),
-  ).pipe(Effect.flip)
+  const partialError = yield* db.entities.Employees.update({ employee: "dfinlay" })
+    .set({ office: "gw-zoo" } as any)
+    .asEffect()
+    .pipe(Effect.flip)
   // #endregion
   assertEq(partialError._tag, "ValidationError", "partial GSI update fails with ValidationError")
   assert(

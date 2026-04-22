@@ -400,17 +400,14 @@ const program = Effect.gen(function* () {
   assertEq(buildApi.points, 8, "get task points")
 
   // Update employee title — must provide all GSI composites for affected indexes
-  const promoted = yield* db.entities.Employees.update(
-    { employee: "tyler" },
-    Entity.set({
-      office: "portland",
-      team: "development",
-      title: "Staff Engineer",
-      salary: "000140.00",
-      manager: "tyler",
-      dateHired: "2019-03-15",
-    }),
-  )
+  const promoted = yield* db.entities.Employees.update({ employee: "tyler" }).set({
+    office: "portland",
+    team: "development",
+    title: "Staff Engineer",
+    salary: "000140.00",
+    manager: "tyler",
+    dateHired: "2019-03-15",
+  })
   assertEq(promoted.title, "Staff Engineer", "update title")
   assertEq(promoted.salary, "000140.00", "update salary")
   assertEq(promoted.firstName, "Tyler", "update preserves unchanged fields")
@@ -582,10 +579,11 @@ const program = Effect.gen(function* () {
 
   // #region workflow
   // Move build-api from open -> in-progress
-  const inProgress = yield* db.entities.Tasks.update(
-    { task: "build-api", project: "platform", employee: "tyler" },
-    Entity.set({ status: "in-progress" }),
-  )
+  const inProgress = yield* db.entities.Tasks.update({
+    task: "build-api",
+    project: "platform",
+    employee: "tyler",
+  }).set({ status: "in-progress" })
 
   // Verify: open tasks decreased by 1
   const openAfterTransition = yield* db.entities.Tasks.byStatus({ status: "open" }).collect()
@@ -596,19 +594,21 @@ const program = Effect.gen(function* () {
   }).collect()
 
   // Move build-api from in-progress -> closed
-  const closed = yield* db.entities.Tasks.update(
-    { task: "build-api", project: "platform", employee: "tyler" },
-    Entity.set({ status: "closed" }),
-  )
+  const closed = yield* db.entities.Tasks.update({
+    task: "build-api",
+    project: "platform",
+    employee: "tyler",
+  }).set({ status: "closed" })
 
   // Verify: closed tasks increased
   const closedAfterWorkflow = yield* db.entities.Tasks.byStatus({ status: "closed" }).collect()
 
   // Restore build-api to original state for clean assertions below
-  yield* db.entities.Tasks.update(
-    { task: "build-api", project: "platform", employee: "tyler" },
-    Entity.set({ status: "open" }),
-  )
+  yield* db.entities.Tasks.update({
+    task: "build-api",
+    project: "platform",
+    employee: "tyler",
+  }).set({ status: "open" })
   // #endregion
   assertEq(inProgress.status, "in-progress", "build-api now in-progress")
   assertEq(inProgress.points, 8, "points preserved after status update")
