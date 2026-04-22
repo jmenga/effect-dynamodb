@@ -2477,13 +2477,26 @@ const makeImpl = <
               })
             }
 
-            // Build new item: merge current + updates + rich ops + recompose keys
+            // Build new item: merge current + updates + rich ops + recompose keys.
+            //
+            // Pre-serialize domain date values from `hydratedUpdates` (decoded
+            // via `fromSelf`, so DateTime.Utc / Date instances) into storage
+            // primitives BEFORE merging into `newItem`. `currentRaw` is already
+            // storage-primitive (it came straight from `fromAttributeMap`), so
+            // we need both halves in the same shape — otherwise the final
+            // `toAttributeMap(newItem)` marshals the DateTime class instances
+            // as DynamoDB Maps (via AWS SDK's `convertClassInstanceToMap`),
+            // which corrupts the write and makes subsequent reads fail to
+            // decode.
+            const serializedRetainUpdates = {
+              ...(hydratedUpdates as globalThis.Record<string, unknown>),
+            }
+            serializeDateFields(serializedRetainUpdates)
+
             const newItem: globalThis.Record<string, unknown> = {
               ...(currentRaw as globalThis.Record<string, unknown>),
             }
-            for (const [attr, val] of Object.entries(
-              hydratedUpdates as globalThis.Record<string, unknown>,
-            )) {
+            for (const [attr, val] of Object.entries(serializedRetainUpdates)) {
               if (val !== undefined) newItem[attr] = val
             }
 
@@ -2522,13 +2535,13 @@ const makeImpl = <
 
             // Increment version and update timestamp. If the caller supplied a
             // value for `updatedAt` (allowed when the field collides with a
-            // model-declared field), respect it; else generate.
+            // model-declared field), respect it; else generate. Read from the
+            // pre-serialized map so both branches produce a storage primitive
+            // (ISO string / epoch number) — not a domain DateTime instance.
             const newVersion = currentVersion + 1
             if (systemFields.version) newItem[systemFields.version] = newVersion
             if (systemFields.updatedAt) {
-              const userSupplied = (hydratedUpdates as globalThis.Record<string, unknown>)[
-                systemFields.updatedAt
-              ]
+              const userSupplied = serializedRetainUpdates[systemFields.updatedAt]
               newItem[systemFields.updatedAt] =
                 userSupplied !== undefined
                   ? userSupplied

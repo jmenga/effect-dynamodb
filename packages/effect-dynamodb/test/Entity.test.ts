@@ -7142,5 +7142,92 @@ describe("Entity", () => {
         expect(call.UpdateExpression).toContain("+ :vinc")
       }).pipe(Effect.provide(TestLayer)),
     )
+
+    // Regression for v1.3.0: retain-path `update` was marshalling domain
+    // DateTime.Utc values (from decoded updates + user-supplied colliding
+    // `updatedAt`) as DynamoDB Maps via `convertClassInstanceToMap`, because
+    // the path never called `serializeDateFields` on the merged `newItem`
+    // before `toAttributeMap`. Subsequent reads then failed with
+    // `deserializeDateFromDynamo: expected string for DateTime.Utc/string, got object`.
+    class RetainDoc extends Schema.Class<RetainDoc>("RetainDoc")({
+      id: Schema.String,
+      title: Schema.String,
+      occurredAt: Schema.DateTimeUtcFromString,
+      updatedAt: Schema.DateTimeUtcFromString,
+    }) {}
+
+    const RetainDocEntity = withConfig(
+      Entity.make({
+        model: RetainDoc,
+        entityType: "RetainDoc",
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+        timestamps: true,
+        versioned: { retain: true },
+      }),
+    )
+
+    it.effect("update (retain): domain date updates serialize to ISO strings, not Maps", () =>
+      Effect.gen(function* () {
+        // getItem returns the current state (library reads before transact-write in retain path).
+        mockGetItem.mockResolvedValueOnce({
+          Item: toAttributeMap({
+            pk: "$myapp#v1#retaindoc#r-1",
+            sk: "$myapp#v1#retaindoc",
+            id: "r-1",
+            title: "before",
+            occurredAt: "2024-01-01T00:00:00.000Z",
+            createdAt: "2024-01-01T00:00:00.000Z",
+            updatedAt: "2024-01-01T00:00:00.000Z",
+            __edd_e__: "RetainDoc",
+            version: 1,
+          }),
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        const newOccurred = DateTime.makeUnsafe("2024-06-15T00:00:00.000Z")
+        const pinnedUpdatedAt = DateTime.makeUnsafe("2024-06-15T12:00:00.000Z")
+        yield* RetainDocEntity.update({ id: "r-1" })
+          .pipe(Entity.set({ occurredAt: newOccurred, updatedAt: pinnedUpdatedAt }))
+          .asEffect()
+
+        const putItem = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Put.Item
+        // Neither field should be serialized as a DynamoDB Map (`M`).
+        expect(putItem.occurredAt).toEqual({ S: "2024-06-15T00:00:00.000Z" })
+        expect(putItem.updatedAt).toEqual({ S: "2024-06-15T12:00:00.000Z" })
+        // Sanity: the old `M` shape would have these keys; confirm absence.
+        expect(putItem.occurredAt.M).toBeUndefined()
+        expect(putItem.updatedAt.M).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "update (retain): library-generated updatedAt is a storage primitive, not a Map",
+      () =>
+        Effect.gen(function* () {
+          mockGetItem.mockResolvedValueOnce({
+            Item: toAttributeMap({
+              pk: "$myapp#v1#retaindoc#r-2",
+              sk: "$myapp#v1#retaindoc",
+              id: "r-2",
+              title: "before",
+              occurredAt: "2024-01-01T00:00:00.000Z",
+              createdAt: "2024-01-01T00:00:00.000Z",
+              updatedAt: "2024-01-01T00:00:00.000Z",
+              __edd_e__: "RetainDoc",
+              version: 1,
+            }),
+          })
+          mockTransactWriteItems.mockResolvedValueOnce({})
+          // No user-supplied updatedAt — library must generate.
+          yield* RetainDocEntity.update({ id: "r-2" })
+            .pipe(Entity.set({ title: "after" }))
+            .asEffect()
+          const putItem = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Put.Item
+          expect(typeof putItem.updatedAt.S).toBe("string")
+          expect(putItem.updatedAt.M).toBeUndefined()
+        }).pipe(Effect.provide(TestLayer)),
+    )
   })
 })
