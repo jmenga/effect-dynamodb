@@ -43,14 +43,16 @@ The sentinel contains a back-reference to the entity's primary key, enabling cle
 
 ### Transactional Enforcement
 
-All mutations involving unique constraints are automatically wrapped in DynamoDB transactions:
+All mutations involving unique constraints are automatically wrapped in DynamoDB transactions. Sentinel operations are **sparse** — they are emitted only for constraints whose composing fields are all present on the record (see [Sparse Constraints](#sparse-constraints) below).
 
 | Operation | Transaction Items |
 |-----------|-------------------|
-| **Put** | Entity item + sentinel per unique field (`condition: attribute_not_exists(pk)`) |
-| **Update** (unique field changed) | Entity item + delete old sentinel + put new sentinel |
+| **Put** | Entity item + sentinel per unique field whose composites are all set (`condition: attribute_not_exists(pk)`) |
 | **Update** (unique field unchanged) | Entity item only (no sentinel operations) |
-| **Delete** | Entity item + delete sentinel per unique field |
+| **Update** (`undefined` → defined) | Entity item + put new sentinel |
+| **Update** (defined → `undefined`) | Entity item + delete old sentinel |
+| **Update** (defined → defined, changed) | Entity item + delete old sentinel + put new sentinel |
+| **Delete** | Entity item + delete sentinel per unique field whose composites were set |
 
 ### Error Handling
 
@@ -100,6 +102,62 @@ unique: {
 ```
 
 This allows `alice@example.com` to exist in different tenants but not twice within the same tenant.
+
+### Sparse Constraints
+
+A unique constraint is **sparse** with respect to its composing fields: a sentinel is only written when every field is present on the record. If any composite is `undefined` or `null`, the constraint is silently skipped — the record is excluded from that constraint, just as a [sparse GSI](/effect-dynamodb/guides/indexes/) excludes records with missing key composites.
+
+This matters for any unique constraint that references an [optional](https://effect.website/docs/schema/basic-usage/#optional-fields) model field:
+
+```typescript
+class Vehicle extends Schema.Class<Vehicle>("Vehicle")({
+  vehicleId: Schema.String,
+  accountId: Schema.String,
+  name: Schema.NonEmptyString,
+  deviceBinding: Schema.optional(Schema.String),  // optional
+  transponderId: Schema.optional(Schema.String),  // optional
+}) {}
+
+const Vehicles = Entity.make({
+  model: Vehicle,
+  entityType: "Vehicle",
+  primaryKey: { pk: { field: "pk", composite: ["vehicleId"] }, sk: { field: "sk", composite: [] } },
+  unique: {
+    nameInAccount: ["accountId", "name"],   // required composites — always enforced
+    deviceBinding: ["deviceBinding"],        // sparse — only enforced when set
+    transponderId: ["transponderId"],        // sparse — only enforced when set
+  },
+})
+```
+
+Two records can coexist with the same constraint left unset:
+
+```typescript
+// Both succeed — no sentinel is written for deviceBinding/transponderId on either record
+yield* db.entities.Vehicles.create({ vehicleId: "v-1", accountId: "acct-1", name: "Truck A" })
+yield* db.entities.Vehicles.create({ vehicleId: "v-2", accountId: "acct-1", name: "Truck B" })
+```
+
+Update transitions claim and release the sentinel as the field becomes set or unset:
+
+```typescript
+// undefined → defined: the new value is now reserved
+yield* db.entities.Vehicles.update({ vehicleId: "v-1" }).set({ deviceBinding: "device-xyz" })
+
+// Another record trying to claim the same value is blocked
+const conflict = yield* db.entities.Vehicles.update({ vehicleId: "v-2" })
+  .set({ deviceBinding: "device-xyz" })
+  .asEffect()
+  .pipe(Effect.catchTag("UniqueConstraintViolation", (e) => Effect.succeed(e.constraint)))
+// "deviceBinding"
+
+// defined → undefined: the value is released and can be claimed elsewhere
+yield* db.entities.Vehicles.update({ vehicleId: "v-1" }).pipe(Entity.remove(["deviceBinding"]))
+yield* db.entities.Vehicles.update({ vehicleId: "v-2" }).set({ deviceBinding: "device-xyz" })
+// Succeeds — v-1 released the value
+```
+
+Sparse semantics mean you can declare a unique constraint on any optional field without worrying that records leaving that field unset will collide on a synthesized "missing value" key.
 
 ## Versioning
 

@@ -288,6 +288,7 @@ Effect.runPromise(main).then(
 | **UniqueConstraintViolation** | Tagged error with `constraint` name and `fields` for precise error handling |
 | **TTL-based uniqueness** | `{ fields: [...], ttl: Duration.minutes(30) }` for expiring constraints like idempotency keys |
 | **Sentinel rotation** | Updating a unique field atomically releases the old value and claims the new one |
+| **Sparse constraints** | Constraints on optional fields skip the sentinel when any composite is unset — see [Data Integrity → Sparse Constraints](/effect-dynamodb/guides/data-integrity/#sparse-constraints) |
 | **No extra indexes** | Sentinels live in the same table using structured key values — no GSIs needed |
 
 ## What's Next?

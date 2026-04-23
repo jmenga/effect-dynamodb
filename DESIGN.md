@@ -463,6 +463,13 @@ unique: {
 }
 ```
 
+Constraints are **sparse**: a sentinel is only written when every composing
+field is present on the record. Mirrors GSI sparse semantics — a record with a
+missing optional composite is silently excluded from the constraint, allowing
+multiple records to coexist with the field unset (no false collision on a
+literal `"undefined"` key). Update transitions claim/release the sentinel as
+the field becomes set/unset.
+
 ---
 
 ## 6. Entity-Derived Types
@@ -1030,13 +1037,19 @@ yield* db.Users.deleted.list()                        // list all soft-deleted i
 
 #### Unique Constraints
 
-Enforcement uses sentinel items with transactional writes:
+Enforcement uses sentinel items with transactional writes. **Sparse** — a
+sentinel is only written when every composing field is present on the record;
+constraints whose fields are unset are silently skipped (mirrors GSI sparse
+semantics):
 
 | Operation | Transaction Items |
 |-----------|-------------------|
-| Put | Entity item + sentinel per unique field (`condition: attribute_not_exists(pk)`) |
-| Update (unique field changed) | Entity item + delete old sentinel + put new sentinel |
-| Delete | Entity item + delete sentinel per unique field |
+| Put | Entity item + sentinel per unique field whose composites are all set (`condition: attribute_not_exists(pk)`) |
+| Update — composites unchanged | Entity item only (no sentinel ops) |
+| Update — undefined → defined | Entity item + put new sentinel |
+| Update — defined → undefined | Entity item + delete old sentinel |
+| Update — defined → defined (changed) | Entity item + delete old sentinel + put new sentinel |
+| Delete | Entity item + delete sentinel per unique field whose composites were set |
 
 #### Optimistic Concurrency
 
