@@ -1046,6 +1046,104 @@ describe("Entity", () => {
         expect(error.operation).toBe("decodeMarshalledItem")
       }),
     )
+
+    // Regression: #16 — sparse GSIs stripped from NewImage must not crash decode.
+    // A common stream-handler pattern: decode a DynamoDB Stream NewImage for an
+    // item whose GSI composites haven't been filled yet (e.g. enrichment-owned
+    // attributes). Before the fix, itemSchema required every GSI pk/sk as
+    // `Schema.String`, so decodeMarshalledItem rejected the NewImage with
+    // `MissingKey` on the sparse GSI attribute.
+    describe("sparse GSI (issue #16)", () => {
+      class Device extends Schema.Class<Device>("Device")({
+        channel: Schema.String,
+        deviceId: Schema.String,
+        timestamp: Schema.Number,
+        accountId: Schema.optional(Schema.String),
+      }) {}
+
+      const DeviceEntity = withConfig(
+        Entity.make({
+          model: Device,
+          entityType: "device",
+          primaryKey: {
+            pk: { field: "pk", composite: ["channel", "deviceId"] },
+            sk: { field: "sk", composite: [] },
+          },
+          indexes: {
+            byAccount: {
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["accountId"] },
+              sk: { field: "gsi1sk", composite: ["channel", "deviceId"] },
+            },
+          },
+        }),
+      )
+
+      it.effect("decodeMarshalledItem succeeds when GSI keys are absent", () =>
+        Effect.gen(function* () {
+          // NewImage for a device ingested before enrichment stamped accountId:
+          // no gsi1pk / gsi1sk — sparse GSI, legitimate item state.
+          const streamNewImage = toAttributeMap({
+            pk: "$myapp#v1#device#c_channel-a#deviceid_d-1",
+            sk: "$myapp#v1#device",
+            __edd_e__: "device",
+            channel: "channel-a",
+            deviceId: "d-1",
+            timestamp: 1700000000,
+          })
+          const decoded = yield* Entity.decodeMarshalledItem(DeviceEntity, streamNewImage)
+          expect(decoded).toMatchObject({
+            channel: "channel-a",
+            deviceId: "d-1",
+            timestamp: 1700000000,
+            __edd_e__: "device",
+          })
+          // Absent GSI keys stay absent — not coerced to undefined-valued props.
+          expect("gsi1pk" in (decoded as object)).toBe(false)
+          expect("gsi1sk" in (decoded as object)).toBe(false)
+        }),
+      )
+
+      it.effect("decodeMarshalledItem still decodes GSI keys when present", () =>
+        Effect.gen(function* () {
+          const streamNewImage = toAttributeMap({
+            pk: "$myapp#v1#device#c_channel-a#deviceid_d-1",
+            sk: "$myapp#v1#device",
+            gsi1pk: "$myapp#v1#device#acct_a-1",
+            gsi1sk: "$myapp#v1#device#c_channel-a#deviceid_d-1",
+            __edd_e__: "device",
+            channel: "channel-a",
+            deviceId: "d-1",
+            timestamp: 1700000000,
+            accountId: "a-1",
+          })
+          const decoded = yield* Entity.decodeMarshalledItem(DeviceEntity, streamNewImage)
+          expect(decoded).toMatchObject({
+            gsi1pk: "$myapp#v1#device#acct_a-1",
+            gsi1sk: "$myapp#v1#device#c_channel-a#deviceid_d-1",
+            accountId: "a-1",
+          })
+        }),
+      )
+
+      it.effect("decodeMarshalledItem still rejects missing primary pk", () =>
+        Effect.gen(function* () {
+          // Primary pk stays required even after the sparse-GSI relaxation.
+          const streamNewImage = toAttributeMap({
+            sk: "$myapp#v1#device",
+            __edd_e__: "device",
+            channel: "channel-a",
+            deviceId: "d-1",
+            timestamp: 1700000000,
+          })
+          const error = yield* Entity.decodeMarshalledItem(DeviceEntity, streamNewImage).pipe(
+            Effect.flip,
+          )
+          expect(error._tag).toBe("ValidationError")
+          expect(error.operation).toBe("decodeMarshalledItem")
+        }),
+      )
+    })
   })
 
   // ---------------------------------------------------------------------------

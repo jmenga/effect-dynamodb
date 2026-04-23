@@ -525,9 +525,22 @@ export const buildDerivedSchemas = (
   const keySchema = Schema.Struct(keyFields)
 
   // --- Item Schema: record + key attrs (pk, sk, gsi*) + __edd_e__ ---
+  // Primary pk/sk are guaranteed present on every live item. GSI key fields
+  // are sparse: they're written only when every source composite resolves, and
+  // dropped when any composite is missing or indexPolicy evicts the index.
+  // Stream NewImage / raw query results therefore routinely lack GSI keys —
+  // mark them optional so decodeMarshalledItem decodes sparse items cleanly.
+  const primaryKeyFieldNames = new Set<string>()
+  const primary = indexes.primary
+  if (primary) {
+    primaryKeyFieldNames.add(primary.pk.field)
+    primaryKeyFieldNames.add(primary.sk.field)
+  }
   const keyAttrFields: globalThis.Record<string, Schema.Top> = {}
   for (const fieldName of allKeyFieldNames(indexes)) {
-    keyAttrFields[fieldName] = Schema.String
+    keyAttrFields[fieldName] = primaryKeyFieldNames.has(fieldName)
+      ? Schema.String
+      : Schema.optional(Schema.String)
   }
   const itemSchema = Schema.Struct({
     ...modelFields,
