@@ -13,8 +13,21 @@ jobs:
     permissions:
       contents: write
       id-token: write
+      # Needed by the aggregate-tag step: `gh label create` (issues) and
+      # `gh pr edit --add-label` (pull-requests). Without these, both calls
+      # fail silently under `|| true` — the label never gets created and no
+      # PRs get tagged with the vX.Y.Z marker.
+      issues: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Full history + tags so the aggregate-tag step can resolve
+          # `PREV_TAG` and walk `git log PREV_TAG..HEAD` to find every PR
+          # merged in this release window. Default shallow clone yields one
+          # commit, so only the triggering merge gets labeled.
+          fetch-depth: 0
+          fetch-tags: true
 
       - uses: pnpm/action-setup@v5
         with:
