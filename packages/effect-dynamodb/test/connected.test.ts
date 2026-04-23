@@ -138,7 +138,36 @@ const Memberships = Entity.make({
   },
 })
 
-const MainTable = Table.make({ schema: AppSchema, entities: { Users, Tasks, Memberships } })
+// Sparse-unique fixture — issue #25. Two unique constraints reference optional
+// model fields; omitting them must not synthesize a "_unique.<name>#undefined"
+// sentinel that collides across records.
+class Vehicle extends Schema.Class<Vehicle>("Vehicle")({
+  vehicleId: Schema.String,
+  accountId: Schema.String,
+  name: Schema.NonEmptyString,
+  deviceBinding: Schema.optional(Schema.String),
+  transponderId: Schema.optional(Schema.String),
+}) {}
+
+const Vehicles = Entity.make({
+  model: Vehicle,
+  entityType: "Vehicle",
+  primaryKey: {
+    pk: { field: "pk", composite: ["vehicleId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  unique: {
+    nameInAccount: ["accountId", "name"],
+    deviceBinding: ["deviceBinding"],
+    transponderId: ["transponderId"],
+  },
+  timestamps: true,
+})
+
+const MainTable = Table.make({
+  schema: AppSchema,
+  entities: { Users, Tasks, Memberships, Vehicles },
+})
 
 // ---------------------------------------------------------------------------
 // Aggregate + Ref models
@@ -625,6 +654,112 @@ describeConnected("Connected integration tests", () => {
         // Original value unchanged
         const unchanged = yield* Users.get({ userId: "u-uniq-claim" }).asEffect()
         expect(unchanged.email).toBe("old-email@test.com")
+      }).pipe(provide),
+    )
+  })
+
+  // -------------------------------------------------------------------------
+  // Sparse unique constraints — issue #25
+  //
+  // End-to-end coverage of the four transition states for an entity with two
+  // unique constraints on optional fields (deviceBinding, transponderId) and
+  // one on a required compound (nameInAccount). Verifies against real DynamoDB
+  // that no false collisions occur for unset fields and that sentinels rotate
+  // correctly across undefined↔defined transitions.
+  // -------------------------------------------------------------------------
+
+  describe("Sparse unique constraints (issue #25)", () => {
+    it.effect("two records with omitted optional unique fields both succeed", () =>
+      Effect.gen(function* () {
+        // Under the v1.3.1 bug, the second create here failed with a false
+        // UniqueConstraintViolation on `deviceBinding` (and on `transponderId`).
+        yield* Vehicles.create({
+          vehicleId: "veh-sparse-1",
+          accountId: "acct-sparse",
+          name: "v1",
+        }).asEffect()
+        yield* Vehicles.create({
+          vehicleId: "veh-sparse-2",
+          accountId: "acct-sparse",
+          name: "v2",
+        }).asEffect()
+
+        const v1 = yield* Vehicles.get({ vehicleId: "veh-sparse-1" }).asEffect()
+        const v2 = yield* Vehicles.get({ vehicleId: "veh-sparse-2" }).asEffect()
+        expect(v1.deviceBinding).toBeUndefined()
+        expect(v2.deviceBinding).toBeUndefined()
+      }).pipe(provide),
+    )
+
+    it.effect("required compound constraint still enforced when optional ones are sparse", () =>
+      Effect.gen(function* () {
+        const err = yield* Vehicles.create({
+          vehicleId: "veh-sparse-3",
+          accountId: "acct-sparse",
+          name: "v1", // collides with veh-sparse-1
+        })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(err._tag).toBe("UniqueConstraintViolation")
+        if (err._tag === "UniqueConstraintViolation") {
+          expect(err.constraint).toBe("nameInAccount")
+        }
+      }).pipe(provide),
+    )
+
+    it.effect("update undefined → defined claims the sentinel (and blocks collisions)", () =>
+      Effect.gen(function* () {
+        yield* Vehicles.update({ vehicleId: "veh-sparse-1" }).pipe(
+          Vehicles.set({ deviceBinding: "device-xyz" }),
+          (op) => op.asEffect(),
+        )
+
+        const err = yield* Vehicles.update({ vehicleId: "veh-sparse-2" }).pipe(
+          Vehicles.set({ deviceBinding: "device-xyz" }),
+          (op) => op.asEffect(),
+          Effect.flip,
+        )
+        expect(err._tag).toBe("UniqueConstraintViolation")
+        if (err._tag === "UniqueConstraintViolation") {
+          expect(err.constraint).toBe("deviceBinding")
+          expect(err.fields).toEqual({ deviceBinding: "device-xyz" })
+        }
+      }).pipe(provide),
+    )
+
+    it.effect("update defined → undefined releases the sentinel for re-use", () =>
+      Effect.gen(function* () {
+        yield* Vehicles.update({ vehicleId: "veh-sparse-1" }).pipe(
+          Entity.remove(["deviceBinding"]),
+          (op) => op.asEffect(),
+        )
+
+        yield* Vehicles.update({ vehicleId: "veh-sparse-2" }).pipe(
+          Vehicles.set({ deviceBinding: "device-xyz" }),
+          (op) => op.asEffect(),
+        )
+        const v2 = yield* Vehicles.get({ vehicleId: "veh-sparse-2" }).asEffect()
+        expect(v2.deviceBinding).toBe("device-xyz")
+      }).pipe(provide),
+    )
+
+    it.effect("delete with undefined unique fields succeeds", () =>
+      Effect.gen(function* () {
+        yield* Vehicles.delete({ vehicleId: "veh-sparse-1" }).asEffect()
+        const err = yield* Vehicles.get({ vehicleId: "veh-sparse-1" }).asEffect().pipe(Effect.flip)
+        expect(err._tag).toBe("ItemNotFound")
+      }).pipe(provide),
+    )
+
+    it.effect("name freed by delete is reusable", () =>
+      Effect.gen(function* () {
+        yield* Vehicles.create({
+          vehicleId: "veh-sparse-4",
+          accountId: "acct-sparse",
+          name: "v1",
+        }).asEffect()
+        const v4 = yield* Vehicles.get({ vehicleId: "veh-sparse-4" }).asEffect()
+        expect(v4.name).toBe("v1")
       }).pipe(provide),
     )
   })

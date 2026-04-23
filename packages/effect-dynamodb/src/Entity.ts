@@ -157,6 +157,7 @@ import type {
   TimeSeriesConfig,
   TimestampsConfig,
   UniqueConfig,
+  UniqueConstraintDef,
   VersionedConfig,
 } from "./internal/EntityConfig.js"
 
@@ -199,6 +200,53 @@ import type {
 // ---------------------------------------------------------------------------
 
 export type { IndexDefinition, KeyPart }
+
+// ---------------------------------------------------------------------------
+// Sparse-aware unique sentinel composition
+// ---------------------------------------------------------------------------
+
+/**
+ * Compose a unique-constraint sentinel key, returning `undefined` when any
+ * composing field is missing (`undefined` or `null`) on the source record.
+ *
+ * Mirrors GSI sparse semantics (`tryComposeIndexKeys`): a sentinel is only
+ * written/deleted/checked when every composing field is present, so multiple
+ * records can coexist with the field unset and an entity write doesn't synthesize
+ * a literal `"undefined"` collision key.
+ *
+ * `lookup` overrides the field-value reader. The update path passes a lookup that
+ * falls back from the domain field name to the renamed DB column name, since
+ * `currentRaw` (read from DynamoDB) carries DB names rather than domain names.
+ */
+const composeUniqueSentinel = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  constraintName: string,
+  constraintDef: UniqueConstraintDef,
+  source: globalThis.Record<string, unknown>,
+  lookup?: (source: globalThis.Record<string, unknown>, field: string) => unknown,
+):
+  | {
+      readonly key: { readonly pk: string; readonly sk: string }
+      readonly fieldsRecord: globalThis.Record<string, string>
+    }
+  | undefined => {
+  const fields = resolveUniqueFields(constraintDef)
+  const get = lookup ?? ((s, f) => s[f])
+  const serialized: Array<string> = []
+  const fieldsRecord: globalThis.Record<string, string> = {}
+  for (const f of fields) {
+    const raw = get(source, f)
+    if (raw === undefined || raw === null) return undefined
+    const s = KeyComposer.serializeValue(raw)
+    serialized.push(s)
+    fieldsRecord[f] = s
+  }
+  return {
+    key: DynamoSchema.composeUniqueKey(schema, entityType, constraintName, serialized),
+    fieldsRecord,
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Entity interface — the return type of Entity.make()
@@ -2150,24 +2198,25 @@ const makeImpl = <
             }
             transactItems.push({ Put: mainPut })
 
-            // Unique constraint sentinels
+            // Unique constraint sentinels (sparse — skip when any composing field is missing)
+            const sentinelConstraints: Array<string> = []
             if (hasUniqueConstraints) {
               for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
-                const fields = resolveUniqueFields(constraintDef)
-                const fieldValues = fields.map((f) => KeyComposer.serializeValue(decoded[f]))
-                const uniqueKey = DynamoSchema.composeUniqueKey(
+                const sentinel = composeUniqueSentinel(
                   schema,
                   entityType,
                   constraintName,
-                  fieldValues,
+                  constraintDef,
+                  decoded as globalThis.Record<string, unknown>,
                 )
-
+                if (!sentinel) continue
+                sentinelConstraints.push(constraintName)
                 transactItems.push({
                   Put: {
                     TableName: tableName,
                     Item: toAttributeMap({
-                      [config.indexes.primary.pk.field]: uniqueKey.pk,
-                      [config.indexes.primary.sk.field]: uniqueKey.sk,
+                      [config.indexes.primary.pk.field]: sentinel.key.pk,
+                      [config.indexes.primary.sk.field]: sentinel.key.sk,
                       __edd_e__: `${entityType}._unique.${constraintName}`,
                       _entity_pk: keys[config.indexes.primary.pk.field],
                       _entity_sk: keys[config.indexes.primary.sk.field],
@@ -2213,18 +2262,21 @@ const makeImpl = <
                             key: decoded,
                           })
                         }
-                        // Sentinel items start at index 1
+                        // Sentinel items start at index 1, in the order recorded in
+                        // `sentinelConstraints` (skipped sparse entries are absent)
                         for (let i = 1; i < reasons.length; i++) {
                           if (reasons[i]?.Code === "ConditionalCheckFailed") {
-                            const constraintNames = Object.keys(config.unique!)
-                            const constraintName = constraintNames[i - 1] ?? "unknown"
-                            const constraintDef = config.unique![constraintName]
+                            const constraintName = sentinelConstraints[i - 1] ?? "unknown"
+                            const constraintDef = config.unique?.[constraintName]
                             const uniqueFields = constraintDef
                               ? resolveUniqueFields(constraintDef)
                               : []
                             const fieldsRecord: globalThis.Record<string, string> = {}
                             for (const f of uniqueFields) {
-                              fieldsRecord[f] = KeyComposer.serializeValue(decoded[f])
+                              const v = decoded[f]
+                              if (v !== undefined && v !== null) {
+                                fieldsRecord[f] = KeyComposer.serializeValue(v)
+                              }
                             }
                             return new UniqueConstraintViolation({
                               entityType,
@@ -2560,46 +2612,50 @@ const makeImpl = <
             // Compute sentinel rotation values while newItem is in domain names.
             // currentRaw uses DynamoDB names, so resolve via resolveDbName for
             // fields that may have been renamed (e.g. id → teamId).
+            // Sparse-aware rotation: each constraint may transition through one of four
+            // states between old and new — both-missing (no-op), missing→present (Put only),
+            // present→missing (Delete only), present→present (Delete + Put if changed).
             type SentinelRotation = {
               constraintName: string
-              oldUniqueKey: { readonly pk: string; readonly sk: string }
-              newUniqueKey: { readonly pk: string; readonly sk: string }
-              newFieldsRecord: globalThis.Record<string, string>
+              oldUniqueKey: { readonly pk: string; readonly sk: string } | undefined
+              newUniqueKey: { readonly pk: string; readonly sk: string } | undefined
+              newFieldsRecord: globalThis.Record<string, string> | undefined
             }
             const sentinelRotations: Array<SentinelRotation> = []
             if (touchesUniqueFields) {
               const currentRawRecord = currentRaw as globalThis.Record<string, unknown>
               for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
-                const fields = resolveUniqueFields(constraintDef)
-                const oldFieldValues = fields.map((f) =>
-                  KeyComposer.serializeValue(
-                    currentRawRecord[f] ?? currentRawRecord[resolveDbName(f)],
-                  ),
+                const oldSentinel = composeUniqueSentinel(
+                  schema,
+                  entityType,
+                  constraintName,
+                  constraintDef,
+                  currentRawRecord,
+                  (s, f) => s[f] ?? s[resolveDbName(f)],
                 )
-                const newFieldValues = fields.map((f) => KeyComposer.serializeValue(newItem[f]))
+                const newSentinel = composeUniqueSentinel(
+                  schema,
+                  entityType,
+                  constraintName,
+                  constraintDef,
+                  newItem,
+                )
 
-                const changed = oldFieldValues.some((v, i) => v !== newFieldValues[i])
-                if (!changed) continue
-
-                const newFieldsRecord: globalThis.Record<string, string> = {}
-                for (const f of fields) {
-                  newFieldsRecord[f] = KeyComposer.serializeValue(newItem[f])
+                if (!oldSentinel && !newSentinel) continue
+                if (
+                  oldSentinel &&
+                  newSentinel &&
+                  oldSentinel.key.pk === newSentinel.key.pk &&
+                  oldSentinel.key.sk === newSentinel.key.sk
+                ) {
+                  continue
                 }
+
                 sentinelRotations.push({
                   constraintName,
-                  oldUniqueKey: DynamoSchema.composeUniqueKey(
-                    schema,
-                    entityType,
-                    constraintName,
-                    oldFieldValues,
-                  ),
-                  newUniqueKey: DynamoSchema.composeUniqueKey(
-                    schema,
-                    entityType,
-                    constraintName,
-                    newFieldValues,
-                  ),
-                  newFieldsRecord,
+                  oldUniqueKey: oldSentinel?.key,
+                  newUniqueKey: newSentinel?.key,
+                  newFieldsRecord: newSentinel?.fieldsRecord,
                 })
               }
             }
@@ -2674,43 +2730,47 @@ const makeImpl = <
               })
             }
 
-            // Apply sentinel rotations computed earlier
+            // Apply sentinel rotations computed earlier. Delete and Put are emitted
+            // independently — a sparse field that becomes set emits Put only; a sparse
+            // field that becomes unset emits Delete only.
             const sentinelPutIndices: Array<{
               index: number
               constraintName: string
               newFieldsRecord: globalThis.Record<string, string>
             }> = []
             for (const rotation of sentinelRotations) {
-              // Delete old sentinel
-              transactItems.push({
-                Delete: {
-                  TableName: tableName,
-                  Key: toAttributeMap({
-                    [config.indexes.primary.pk.field]: rotation.oldUniqueKey.pk,
-                    [config.indexes.primary.sk.field]: rotation.oldUniqueKey.sk,
-                  }),
-                },
-              })
+              if (rotation.oldUniqueKey) {
+                transactItems.push({
+                  Delete: {
+                    TableName: tableName,
+                    Key: toAttributeMap({
+                      [config.indexes.primary.pk.field]: rotation.oldUniqueKey.pk,
+                      [config.indexes.primary.sk.field]: rotation.oldUniqueKey.sk,
+                    }),
+                  },
+                })
+              }
 
-              // Put new sentinel with uniqueness check
-              sentinelPutIndices.push({
-                index: transactItems.length,
-                constraintName: rotation.constraintName,
-                newFieldsRecord: rotation.newFieldsRecord,
-              })
-              transactItems.push({
-                Put: {
-                  TableName: tableName,
-                  Item: toAttributeMap({
-                    [config.indexes.primary.pk.field]: rotation.newUniqueKey.pk,
-                    [config.indexes.primary.sk.field]: rotation.newUniqueKey.sk,
-                    __edd_e__: `${entityType}._unique.${rotation.constraintName}`,
-                    _entity_pk: primaryKey[config.indexes.primary.pk.field],
-                    _entity_sk: primaryKey[config.indexes.primary.sk.field],
-                  }),
-                  ConditionExpression: "attribute_not_exists(pk)",
-                },
-              })
+              if (rotation.newUniqueKey && rotation.newFieldsRecord) {
+                sentinelPutIndices.push({
+                  index: transactItems.length,
+                  constraintName: rotation.constraintName,
+                  newFieldsRecord: rotation.newFieldsRecord,
+                })
+                transactItems.push({
+                  Put: {
+                    TableName: tableName,
+                    Item: toAttributeMap({
+                      [config.indexes.primary.pk.field]: rotation.newUniqueKey.pk,
+                      [config.indexes.primary.sk.field]: rotation.newUniqueKey.sk,
+                      __edd_e__: `${entityType}._unique.${rotation.constraintName}`,
+                      _entity_pk: primaryKey[config.indexes.primary.pk.field],
+                      _entity_sk: primaryKey[config.indexes.primary.sk.field],
+                    }),
+                    ConditionExpression: "attribute_not_exists(pk)",
+                  },
+                })
+              }
             }
 
             yield* checkTransactionLimit(entityType, "update", transactItems)
@@ -3237,24 +3297,24 @@ const makeImpl = <
               })
             }
 
-            // Delete sentinels if not preserving unique
+            // Delete sentinels if not preserving unique. Sparse — fields that were
+            // unset on the live item never had a sentinel, so nothing to delete.
             if (hasUniqueConstraints && !preserveUnique()) {
               for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
-                const fields = resolveUniqueFields(constraintDef)
-                const fieldValues = fields.map((f) => KeyComposer.serializeValue(raw[f]))
-                const uniqueKey = DynamoSchema.composeUniqueKey(
+                const sentinel = composeUniqueSentinel(
                   schema,
                   entityType,
                   constraintName,
-                  fieldValues,
+                  constraintDef,
+                  raw,
                 )
-
+                if (!sentinel) continue
                 transactItems.push({
                   Delete: {
                     TableName: tableName,
                     Key: toAttributeMap({
-                      [primary.pk.field]: uniqueKey.pk,
-                      [primary.sk.field]: uniqueKey.sk,
+                      [primary.pk.field]: sentinel.key.pk,
+                      [primary.sk.field]: sentinel.key.sk,
                     }),
                   },
                 })
@@ -3291,23 +3351,23 @@ const makeImpl = <
               Delete: { TableName: tableName, Key: marshalledKey },
             })
 
-            // Delete sentinels
+            // Delete sentinels (sparse — skip constraints whose fields were unset
+            // on the live item; no sentinel was ever written for those)
             for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
-              const fields = resolveUniqueFields(constraintDef)
-              const fieldValues = fields.map((f) => KeyComposer.serializeValue(raw[f]))
-              const uniqueKey = DynamoSchema.composeUniqueKey(
+              const sentinel = composeUniqueSentinel(
                 schema,
                 entityType,
                 constraintName,
-                fieldValues,
+                constraintDef,
+                raw,
               )
-
+              if (!sentinel) continue
               transactItems.push({
                 Delete: {
                   TableName: tableName,
                   Key: toAttributeMap({
-                    [primary.pk.field]: uniqueKey.pk,
-                    [primary.sk.field]: uniqueKey.sk,
+                    [primary.pk.field]: sentinel.key.pk,
+                    [primary.sk.field]: sentinel.key.sk,
                   }),
                 },
               })
@@ -4249,24 +4309,26 @@ const makeImpl = <
             })
           }
 
-          // Re-establish unique constraint sentinels
+          // Re-establish unique constraint sentinels (sparse — fields that are
+          // unset on the restored item don't get a sentinel; matches put semantics)
+          const sentinelConstraints: Array<string> = []
           if (config.unique && Object.keys(config.unique).length > 0) {
             for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
-              const fields = resolveUniqueFields(constraintDef)
-              const fieldValues = fields.map((f) => KeyComposer.serializeValue(restoredItem[f]))
-              const uniqueKey = DynamoSchema.composeUniqueKey(
+              const sentinel = composeUniqueSentinel(
                 schema,
                 entityType,
                 constraintName,
-                fieldValues,
+                constraintDef,
+                restoredItem,
               )
-
+              if (!sentinel) continue
+              sentinelConstraints.push(constraintName)
               transactItems.push({
                 Put: {
                   TableName: tableName,
                   Item: toAttributeMap({
-                    [primary.pk.field]: uniqueKey.pk,
-                    [primary.sk.field]: uniqueKey.sk,
+                    [primary.pk.field]: sentinel.key.pk,
+                    [primary.sk.field]: sentinel.key.sk,
                     __edd_e__: `${entityType}._unique.${constraintName}`,
                     _entity_pk: restoredKeys[primary.pk.field],
                     _entity_sk: restoredKeys[primary.sk.field],
@@ -4288,17 +4350,20 @@ const makeImpl = <
                 if (isAwsTransactionCancelled(err.cause)) {
                   const reasons = err.cause.CancellationReasons
                   if (reasons && config.unique) {
-                    // Sentinel items are after Delete + Put + optional snapshot
+                    // Sentinel Puts come after Delete + Put + optional snapshot, in the
+                    // order recorded in `sentinelConstraints` (sparse-skipped entries absent)
                     const sentinelStart = isRetainEnabled() ? 3 : 2
-                    const constraintNames = Object.keys(config.unique)
                     for (let i = sentinelStart; i < reasons.length; i++) {
                       if (reasons[i]?.Code === "ConditionalCheckFailed") {
-                        const constraintName = constraintNames[i - sentinelStart] ?? "unknown"
+                        const constraintName = sentinelConstraints[i - sentinelStart] ?? "unknown"
                         const constraintDef = config.unique[constraintName]
                         const uniqueFields = constraintDef ? resolveUniqueFields(constraintDef) : []
                         const fieldsRecord: globalThis.Record<string, string> = {}
                         for (const f of uniqueFields) {
-                          fieldsRecord[f] = KeyComposer.serializeValue(restoredItem[f])
+                          const v = restoredItem[f]
+                          if (v !== undefined && v !== null) {
+                            fieldsRecord[f] = KeyComposer.serializeValue(v)
+                          }
                         }
                         return new UniqueConstraintViolation({
                           entityType,
@@ -4417,20 +4482,21 @@ const makeImpl = <
             }
 
             if (entityItem) {
-              // Add sentinel keys to delete list
+              // Add sentinel keys to delete list (sparse — fields that were unset
+              // never had a sentinel written, so nothing to enqueue)
               for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
-                const fields = resolveUniqueFields(constraintDef)
-                const fieldValues = fields.map((f) => KeyComposer.serializeValue(entityItem![f]))
-                const uniqueKey = DynamoSchema.composeUniqueKey(
+                const sentinel = composeUniqueSentinel(
                   schema,
                   entityType,
                   constraintName,
-                  fieldValues,
+                  constraintDef,
+                  entityItem,
                 )
+                if (!sentinel) continue
                 allItems.push(
                   toAttributeMap({
-                    [primary.pk.field]: uniqueKey.pk,
-                    [primary.sk.field]: uniqueKey.sk,
+                    [primary.pk.field]: sentinel.key.pk,
+                    [primary.sk.field]: sentinel.key.sk,
                   }),
                 )
               }

@@ -1603,6 +1603,333 @@ describe("Entity", () => {
   })
 
   // ---------------------------------------------------------------------------
+  // Sparse unique constraints — issue #25
+  //
+  // When a unique constraint references an optional model field, omitting the
+  // field on a write must NOT compose a sentinel keyed on the literal string
+  // "undefined". Sentinels are sparse — emitted only when every composing field
+  // is present. This mirrors GSI sparse semantics (`tryComposeIndexKeys`).
+  // ---------------------------------------------------------------------------
+
+  describe("sparse unique constraints", () => {
+    class OptionalUser extends Schema.Class<OptionalUser>("OptionalUser")({
+      userId: Schema.String,
+      email: Schema.String,
+      deviceBinding: Schema.optional(Schema.String),
+      transponderId: Schema.optional(Schema.String),
+    }) {}
+
+    const SparseEntity = withConfig(
+      Entity.make({
+        model: OptionalUser,
+        entityType: "SparseUser",
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        unique: {
+          email: ["email"],
+          deviceBinding: ["deviceBinding"],
+          transponderId: ["transponderId"],
+        },
+        versioned: true,
+      }),
+    )
+
+    // -------------------------------------------------------------------------
+    // put — sparse skip
+    // -------------------------------------------------------------------------
+
+    it.effect("put: omits sentinel for unique constraint with undefined field", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* SparseEntity.put({
+          userId: "u-1",
+          email: "alice@test.com",
+          // deviceBinding + transponderId omitted
+        }).asEffect()
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        // entity item + email sentinel only — no deviceBinding/transponderId sentinels
+        expect(call.TransactItems).toHaveLength(2)
+
+        const sentinelTags = call.TransactItems.slice(1).map(
+          (t: any) => t.Put.Item.__edd_e__.S as string,
+        )
+        expect(sentinelTags).toEqual(["SparseUser._unique.email"])
+
+        // Critically: no sentinel keyed on the literal string "undefined"
+        for (const item of call.TransactItems as Array<any>) {
+          expect(item.Put.Item.pk.S).not.toContain("undefined")
+        }
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("put: two records omitting the same optional unique field don't collide", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* SparseEntity.put({ userId: "u-1", email: "alice@test.com" }).asEffect()
+        yield* SparseEntity.put({ userId: "u-2", email: "bob@test.com" }).asEffect()
+
+        // Neither call writes a deviceBinding sentinel — second put would fail with
+        // false UniqueConstraintViolation under the v1.3.1 buggy behavior.
+        const allItems = [
+          ...(mockTransactWriteItems.mock.calls[0]![0].TransactItems as Array<any>),
+          ...(mockTransactWriteItems.mock.calls[1]![0].TransactItems as Array<any>),
+        ]
+        const sentinelTags = allItems
+          .map((t) => t.Put?.Item?.__edd_e__?.S as string | undefined)
+          .filter((s): s is string => s?.includes("_unique") ?? false)
+        expect(sentinelTags).toEqual(["SparseUser._unique.email", "SparseUser._unique.email"])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("put: emits sentinel only for the optional field that is defined", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* SparseEntity.put({
+          userId: "u-1",
+          email: "alice@test.com",
+          deviceBinding: "device-abc",
+          // transponderId omitted
+        }).asEffect()
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(call.TransactItems).toHaveLength(3) // entity + email + deviceBinding
+        const sentinelTags = call.TransactItems.slice(1).map(
+          (t: any) => t.Put.Item.__edd_e__.S as string,
+        )
+        expect(sentinelTags.sort()).toEqual([
+          "SparseUser._unique.deviceBinding",
+          "SparseUser._unique.email",
+        ])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("put: maps cancellation reasons to the correct sparse-skipped constraint", () =>
+      Effect.gen(function* () {
+        // Two sentinels emitted (email + deviceBinding); transponderId is sparse-skipped.
+        // Simulate the deviceBinding sentinel (index 2) failing — error must report
+        // "deviceBinding", not be confused by the constraint that wasn't emitted.
+        const txError = new Error("TransactionCanceledException")
+        ;(txError as any).name = "TransactionCanceledException"
+        ;(txError as any).CancellationReasons = [
+          { Code: "None" }, // entity put
+          { Code: "None" }, // email sentinel
+          { Code: "ConditionalCheckFailed" }, // deviceBinding sentinel
+        ]
+        mockTransactWriteItems.mockRejectedValueOnce(txError)
+
+        const error = yield* SparseEntity.put({
+          userId: "u-1",
+          email: "alice@test.com",
+          deviceBinding: "taken-device",
+        })
+          .asEffect()
+          .pipe(Effect.flip)
+
+        expect(error._tag).toBe("UniqueConstraintViolation")
+        if (error._tag === "UniqueConstraintViolation") {
+          expect(error.constraint).toBe("deviceBinding")
+          expect(error.fields).toEqual({ deviceBinding: "taken-device" })
+        }
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // -------------------------------------------------------------------------
+    // update — 4-state transition coverage
+    // -------------------------------------------------------------------------
+
+    /** Mock the read-then-transact path for a current record with the given fields. */
+    const mockCurrentItem = (current: globalThis.Record<string, unknown>) => {
+      mockGetItem.mockResolvedValueOnce({
+        Item: toAttributeMap({
+          pk: `$myapp#v1#sparseuser#${current.userId}`,
+          sk: "$myapp#v1#sparseuser",
+          __edd_e__: "SparseUser",
+          version: 1,
+          ...current,
+        }),
+      })
+      mockTransactWriteItems.mockResolvedValueOnce({})
+    }
+
+    /**
+     * Pull (Delete-key, Put-tag) tuples from the most recent transactWriteItems call.
+     * Constraint names are extracted from the lowercased PK path (Delete) or from the
+     * cased `__edd_e__` tag (Put), then lowercased for stable comparison.
+     */
+    const sentinelOpsFromLastCall = (): Array<{
+      kind: "Delete" | "Put"
+      constraint: string | undefined
+      pk: string
+    }> => {
+      const calls = mockTransactWriteItems.mock.calls
+      const call = calls[calls.length - 1]![0]
+      const ops: Array<{ kind: "Delete" | "Put"; constraint: string | undefined; pk: string }> = []
+      for (const item of call.TransactItems as Array<any>) {
+        if (item.Delete) {
+          const pk = item.Delete.Key.pk.S as string
+          const m = pk.match(/sparseuser\.(\w+)/)
+          ops.push({ kind: "Delete", constraint: m?.[1], pk })
+        } else if (item.Put) {
+          const tag = item.Put.Item?.__edd_e__?.S as string | undefined
+          const m = tag?.match(/_unique\.(\w+)/)
+          if (m) ops.push({ kind: "Put", constraint: m[1]!.toLowerCase(), pk: item.Put.Item.pk.S })
+        }
+      }
+      return ops
+    }
+
+    it.effect("update: undefined → defined emits Put only (no Delete)", () =>
+      Effect.gen(function* () {
+        mockCurrentItem({ userId: "u-1", email: "alice@test.com" })
+
+        yield* SparseEntity.update({ userId: "u-1" }).pipe(
+          Entity.set({ deviceBinding: "device-abc" }),
+          Entity.asModel,
+        )
+
+        const ops = sentinelOpsFromLastCall()
+        // PK casing is lowercase per schema config — constraint names are lowercased
+        expect(ops).toEqual([{ kind: "Put", constraint: "devicebinding", pk: expect.any(String) }])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("update: defined → undefined emits Delete only (no Put)", () =>
+      Effect.gen(function* () {
+        mockCurrentItem({
+          userId: "u-1",
+          email: "alice@test.com",
+          deviceBinding: "device-abc",
+        })
+
+        yield* SparseEntity.update({ userId: "u-1" }).pipe(
+          Entity.remove(["deviceBinding"]),
+          Entity.asModel,
+        )
+
+        const ops = sentinelOpsFromLastCall()
+        expect(ops).toEqual([
+          { kind: "Delete", constraint: "devicebinding", pk: expect.any(String) },
+        ])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("update: defined → defined (changed) emits Delete + Put", () =>
+      Effect.gen(function* () {
+        mockCurrentItem({
+          userId: "u-1",
+          email: "alice@test.com",
+          deviceBinding: "device-old",
+        })
+
+        yield* SparseEntity.update({ userId: "u-1" }).pipe(
+          Entity.set({ deviceBinding: "device-new" }),
+          Entity.asModel,
+        )
+
+        const ops = sentinelOpsFromLastCall()
+        expect(ops).toEqual([
+          {
+            kind: "Delete",
+            constraint: "devicebinding",
+            pk: expect.stringContaining("device-old"),
+          },
+          { kind: "Put", constraint: "devicebinding", pk: expect.stringContaining("device-new") },
+        ])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // -------------------------------------------------------------------------
+    // delete — sparse skip on cleanup
+    // -------------------------------------------------------------------------
+
+    it.effect("delete: skips sentinel cleanup for fields that were unset", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({
+          Item: toAttributeMap({
+            userId: "u-1",
+            email: "alice@test.com",
+            // deviceBinding + transponderId never set
+            pk: "$myapp#v1#sparseuser#u-1",
+            sk: "$myapp#v1#sparseuser",
+            __edd_e__: "SparseUser",
+            version: 1,
+          }),
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* SparseEntity.delete({ userId: "u-1" }).asEffect()
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        // Delete entity + Delete email sentinel only — no deviceBinding/transponderId deletes
+        expect(call.TransactItems).toHaveLength(2)
+        for (const item of call.TransactItems as Array<any>) {
+          expect(item.Delete.Key.pk.S).not.toContain("undefined")
+        }
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // -------------------------------------------------------------------------
+    // restore — sparse skip on re-establish
+    // -------------------------------------------------------------------------
+
+    it.effect("restore: skips sentinel re-establish for fields that were unset", () =>
+      Effect.gen(function* () {
+        const SoftDeletedSparse = withConfig(
+          Entity.make({
+            model: OptionalUser,
+            entityType: "SparseUser",
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            unique: {
+              email: ["email"],
+              deviceBinding: ["deviceBinding"],
+            },
+            softDelete: true,
+            versioned: true,
+          }),
+        )
+
+        // Soft-deleted item: SK rewritten to deleted form
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              userId: "u-1",
+              email: "alice@test.com",
+              // deviceBinding never set
+              pk: "$myapp#v1#sparseuser#u-1",
+              sk: "$myapp#v1#sparseuser#deleted#1700000000000",
+              __edd_e__: "SparseUser",
+              version: 1,
+              deletedAt: "2026-04-22T00:00:00.000Z",
+            }),
+          ],
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* SoftDeletedSparse.restore({ userId: "u-1" }).asEffect()
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        const sentinelPuts = (call.TransactItems as Array<any>).filter(
+          (t) =>
+            t.Put?.Item?.__edd_e__?.S != null &&
+            (t.Put.Item.__edd_e__.S as string).includes("_unique"),
+        )
+        expect(sentinelPuts).toHaveLength(1)
+        expect(sentinelPuts[0].Put.Item.__edd_e__.S).toBe("SparseUser._unique.email")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  // ---------------------------------------------------------------------------
   // get operation
   // ---------------------------------------------------------------------------
 
