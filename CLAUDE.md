@@ -192,6 +192,18 @@ pnpm lint:fix     # Auto-fix lint + format issues (biome check --write)
 
 All commands run from the repo root.
 
+## Agent Workflow
+
+**All agent work MUST be performed on a Git worktree** — never directly on the user's main checkout.
+
+Use `git worktree add ../effect-dynamodb-<branch-name> -b <branch-name>` (or reuse an existing worktree) so the user's working tree, current branch, and any uncommitted in-flight work remain untouched. This isolation matters because:
+
+- The user routinely has uncommitted WIP on the main checkout for parallel tracks (e.g. `fix/sparse-unique-constraints` alongside an unrelated fix). Agent branch switches on the shared checkout drag that WIP across branches, force repeated `git stash push/pop` juggling, and risk losing changes via stash conflicts or `.DS_Store`-style untracked collisions.
+- Worktrees give the agent an independent filesystem path for `pnpm install`, `pnpm test`, and editor state — no contention with whatever the user is running in the main checkout.
+- Cleanup is explicit: `git worktree remove <path>` when the PR is merged or abandoned, leaving no orphaned branches on the main checkout.
+
+If the `Agent` tool's `isolation: "worktree"` parameter is available for the task, prefer it. Otherwise, create the worktree explicitly as the first step of any code-modifying task.
+
 ## Coding Conventions
 
 ### Effect TS Patterns
