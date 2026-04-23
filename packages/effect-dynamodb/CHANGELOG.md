@@ -1,5 +1,11 @@
 # effect-dynamodb
 
+## 1.3.2
+
+### Patch Changes
+
+- fix(entity): `decodeMarshalledItem` tolerates missing GSI key attributes on sparse-indexed items. `itemSchema` previously required every GSI pk/sk field as `Schema.String`, so decoding a DynamoDB Stream `NewImage` for an item whose GSI composites haven't been stamped yet (e.g. ingest-before-enrichment patterns) failed with `ValidationError: MissingKey`. GSI key fields are now `Schema.optional(Schema.String)` in `itemSchema`; primary pk/sk remain required. Closes [#16](https://github.com/jmenga/effect-dynamodb/issues/16).
+
 ## 1.3.1
 
 ### Patch Changes
@@ -27,7 +33,6 @@
   **Fixes [#19](https://github.com/jmenga/effect-dynamodb/issues/19)** — `Entity.put/create/update/upsert` (and `Transaction`/`Batch` put paths) now correctly decode domain values. Previously, TypeScript said "pass me a `DateTime.Utc`" but the runtime decoded via a transform schema that expected an ISO string — callers who followed the TS contract hit a `ValidationError`. The runtime decode now uses `fromSelf` variants for date-annotated fields, matching the TS contract.
 
   **New: declare system-field-colliding timestamps in your model.** If your domain model declares `createdAt` / `updatedAt` with a date-compatible schema (e.g. `Schema.DateTimeUtcFromString`, `Schema.DateFromString`, `Schema.DateTimeUtc`), and `timestamps: true` is set:
-
   - The input type marks the colliding fields as optional — caller may omit them (library auto-generates) or supply their own value (user value wins, useful for imports/backfill).
   - The library-generated timestamp respects the model field's storage encoding, so declaring `createdAt: Schema.DateTimeUtcFromString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))` yields epoch-seconds storage even though the library is generating the value.
   - `createdAt` is treated as immutable in the update schema (stripped entirely).
@@ -65,7 +70,6 @@
   **Per-GSI `indexPolicy` (breaking)**
 
   Adds `indexPolicy?: (item) => Partial<Record<attr, "sparse" | "preserve">>` to each GSI definition. Resolves the previously ambiguous "composite missing from update payload" signal into three explicit intents (sparse dropout, enrichment preserve, strict recompose). Default when unspecified: `"preserve"` for every composite.
-
   - `Entity.update()` and time-series `.append()` no longer throw `PartialGsiCompositeError` on partial composites — that class has been removed. Consumers relying on strict caller-error validation should declare `indexPolicy: () => ({ attr: "sparse" })` or enforce validation in their own update layer.
   - GSIs that declare an `indexPolicy` are always evaluated on every update — "attr not in payload" is treated as "attr not set" per the policy. GSIs without a policy keep the existing touched-gate semantics (only evaluated when a composite appears in the payload).
   - `put()` semantics unchanged (still sparse-by-default for any missing composite; `indexPolicy` not consulted).
@@ -84,7 +88,6 @@
 - feat(Entity): `timeSeries` primitive for event-driven workloads
 
   Adds a new `timeSeries` configuration primitive on `Entity.make()` for IoT-style workloads that need the split-item pattern: one "current" item per partition (latest state, index-visible) plus N immutable "event" items (TTL-bounded, time-queryable).
-
   - **New API:** `Entity.make({ timeSeries: { orderBy, ttl?, appendInput } })`
   - **`.append(input, condition?)`** — atomic `TransactWriteItems` (UpdateItem current + Put event) with CAS `attribute_not_exists(pk) OR #orderBy < :newOb`. Returns a discriminated union `{ applied: true | false, current }` — stale writes are a success value, not an error.
   - **`.history(key)`** — `BoundQuery` auto-scoped via `begins_with(<currentSk>#e#)`, with `.where()` restricted to the configured `orderBy` attribute.
