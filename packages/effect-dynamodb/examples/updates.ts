@@ -190,11 +190,12 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Rich Updates + Optimistic Locking ===\n")
 
   // Use expectedVersion to guard against concurrent writes.
-  // After the previous mutations (put + 4 updates), the version is 6.
+  // After put + 6 updates above (add, add, subtract, append, remove,
+  // composed), the version is 7 — pass that to guard the next write.
   // #region locking
   const locked = yield* db.entities.Products.update({ productId: "p-1" })
     .add({ viewCount: 1 })
-    .expectedVersion(6)
+    .expectedVersion(7)
 
   // Wrong version → OptimisticLockError
   const lockFail = yield* db.entities.Products.update({ productId: "p-1" })
@@ -208,7 +209,7 @@ const program = Effect.gen(function* () {
       ),
     )
   // #endregion
-  yield* Console.log(`Update with expectedVersion(6): viewCount = ${locked.viewCount}`)
+  yield* Console.log(`Update with expectedVersion(7): viewCount = ${locked.viewCount}`)
   yield* Console.log(`Wrong version: ${lockFail}\n`)
 
   // --- Cleanup ---

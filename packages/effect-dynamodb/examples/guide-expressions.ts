@@ -318,6 +318,9 @@ const program = Effect.gen(function* () {
   // -----------------------------------------------------------------------
   yield* Console.log("=== Composing Multiple Update Types ===\n")
 
+  // p-1 has gone through put + 5 updates above (set, add, subtract, append,
+  // and the earlier `set({ name: "Widget Pro" })` guarded by version 1) —
+  // so the next guarded write expects version 6.
   // #region update-composed
   yield* db.entities.Products.update({ productId: "p-1" })
     .set({ name: "Updated Widget", price: 24.99 })
@@ -325,7 +328,7 @@ const program = Effect.gen(function* () {
     .subtract({ stock: 3 })
     .append({ tags: ["clearance"] })
     .remove(["temporaryFlag"])
-    .expectedVersion(5)
+    .expectedVersion(6)
   // #endregion
 
   yield* Console.log("Composed update applied\n")

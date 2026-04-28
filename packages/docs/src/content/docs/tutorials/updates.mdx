@@ -170,7 +170,7 @@ Rich updates compose with `Entity.expectedVersion()` for concurrency control:
 ```typescript region="locking" example="updates.ts"
   const locked = yield* db.entities.Products.update({ productId: "p-1" })
     .add({ viewCount: 1 })
-    .expectedVersion(6)
+    .expectedVersion(7)
 
   // Wrong version → OptimisticLockError
   const lockFail = yield* db.entities.Products.update({ productId: "p-1" })
