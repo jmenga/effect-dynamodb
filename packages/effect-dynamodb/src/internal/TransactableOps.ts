@@ -5,26 +5,27 @@
  * and put-item construction (validation + key composition + system fields).
  */
 
-import { DateTime, Effect, Schema } from "effect"
+import { Effect, Schema } from "effect"
 import type { DynamoEncoding } from "../DynamoModel.js"
 import type { Entity } from "../Entity.js"
 import { ValidationError } from "../Errors.js"
 import * as KeyComposer from "../KeyComposer.js"
-import { serializeDateForDynamo, toAttributeMap } from "../Marshaller.js"
+import { toAttributeMap } from "../Marshaller.js"
 
-const generateTimestampPrimitive = (encoding: DynamoEncoding | null): string | number =>
-  encoding ? serializeDateForDynamo(new Date(), encoding) : new Date().toISOString()
-
-const generateDomainTimestamp = (
-  encoding: DynamoEncoding,
-): DateTime.Utc | DateTime.Zoned | Date => {
-  switch (encoding.domain) {
-    case "DateTime.Utc":
-      return DateTime.makeUnsafe(new Date())
-    case "DateTime.Zoned":
-      return DateTime.makeZonedUnsafe(new Date(), { timeZone: "UTC" })
-    case "Date":
-      return new Date()
+/**
+ * Generate a wire-form timestamp value for the configured encoding.
+ * No-encoding default: ISO string. Custom encoding: serialized primitive.
+ */
+const generateTimestampPrimitive = (encoding: DynamoEncoding | null): string | number => {
+  if (!encoding) return new Date().toISOString()
+  const now = Date.now()
+  switch (encoding.storage) {
+    case "string":
+      return new Date(now).toISOString()
+    case "epochMs":
+      return now
+    case "epochSeconds":
+      return Math.floor(now / 1000)
   }
 }
 
@@ -60,6 +61,11 @@ export const composePrimaryKey = (
 
 /**
  * Validate input, compose all keys, and build a marshalled put item.
+ *
+ * Encodes the user-supplied domain payload to wire format via
+ * `Schema.encode(inputSchema)`, then assembles the DynamoDB item with system
+ * fields and composite keys. Substituted self-date schemas + RedactedFromValue
+ * are handled in the encode pass — no per-field serialization needed.
  */
 export const validateAndBuildPutItem = (
   entity: Entity,
@@ -70,8 +76,14 @@ export const validateAndBuildPutItem = (
   ValidationError
 > =>
   Effect.gen(function* () {
-    const inputDecodeSchema = entity.schemas.inputDecodeSchema as Schema.Codec<any>
-    const validated = yield* Schema.decodeUnknownEffect(inputDecodeSchema)(input).pipe(
+    const inputSchema = entity.schemas.inputSchema as Schema.Codec<any>
+    // Encode → fall back to decode-then-encode (mirrors Entity.put).
+    const encoded = yield* Schema.encodeUnknownEffect(inputSchema)(input).pipe(
+      Effect.catch(() =>
+        Schema.decodeUnknownEffect(inputSchema)(input).pipe(
+          Effect.flatMap((decoded) => Schema.encodeUnknownEffect(inputSchema)(decoded)),
+        ),
+      ),
       Effect.mapError(
         (cause) =>
           new ValidationError({
@@ -82,7 +94,7 @@ export const validateAndBuildPutItem = (
       ),
     )
 
-    const item: Record<string, unknown> = { ...validated }
+    const item: Record<string, unknown> = { ...(encoded as Record<string, unknown>) }
     item.__edd_e__ = entity.entityType
 
     const keys = KeyComposer.composeAllKeys(
@@ -90,33 +102,26 @@ export const validateAndBuildPutItem = (
       entity.entityType,
       1,
       entity.indexes,
-      validated,
+      encoded as Record<string, unknown>,
     )
     Object.assign(item, keys)
 
-    // System fields (collision-aware). See Entity.put for the canonical logic.
+    // System fields (collision-aware). When a timestamp field collides with a
+    // model-declared field, the user may have supplied their own value
+    // (already encoded to wire by `Schema.encode`); else generate a wire
+    // primitive directly.
     const sf = entity.systemFields
     if (sf.createdAt) {
       if (item[sf.createdAt] === undefined) {
-        item[sf.createdAt] =
-          sf.createdAtCollision && sf.createdAtEncoding
-            ? generateDomainTimestamp(sf.createdAtEncoding)
-            : generateTimestampPrimitive(sf.createdAtEncoding)
+        item[sf.createdAt] = generateTimestampPrimitive(sf.createdAtEncoding)
       }
     }
     if (sf.updatedAt) {
       if (item[sf.updatedAt] === undefined) {
-        item[sf.updatedAt] =
-          sf.updatedAtCollision && sf.updatedAtEncoding
-            ? generateDomainTimestamp(sf.updatedAtEncoding)
-            : generateTimestampPrimitive(sf.updatedAtEncoding)
+        item[sf.updatedAt] = generateTimestampPrimitive(sf.updatedAtEncoding)
       }
     }
     if (sf.version) item[sf.version] = 1
-
-    // Convert any domain-value date fields to storage primitives (both user-
-    // supplied model fields and domain-generated system fields).
-    entity._serializeDateFields(item)
 
     return toAttributeMap(item)
   })

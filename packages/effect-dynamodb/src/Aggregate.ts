@@ -541,8 +541,11 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
   // Detect date encodings for all root schema fields (once, at make() time).
   // Fields with Date/DateTime types need serialization before DynamoDB
-  // marshalling and deserialization before Schema decode, matching Entity's
-  // serializeDateFields/deserializeDateFields pattern.
+  // marshalling and deserialization before Schema decode. The Aggregate
+  // path uses the @internal `serializeDateForDynamo` / `deserializeDateFromDynamo`
+  // helpers from Marshaller — Entity has migrated to substituted bidirectional
+  // schemas, but the Aggregate's per-field decompose/assemble flow still uses
+  // the per-field helpers.
   const dateEncodings: Record<string, DynamoEncoding> = {}
   const schemaFields = (schema as Record<string, unknown>).fields as
     | Record<string, Schema.Top>

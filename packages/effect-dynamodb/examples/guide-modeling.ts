@@ -18,7 +18,7 @@
  *   npx tsx examples/guide-modeling.ts
  */
 
-import { Console, Duration, Effect, Layer, Schema } from "effect"
+import { Console, DateTime, Duration, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -38,7 +38,9 @@ class Employee extends Schema.Class<Employee>("Employee")({
   email: Schema.String,
   displayName: Schema.NonEmptyString,
   department: Schema.String,
-  hireDate: Schema.DateTimeUtcFromString,
+  // Self schema — wire format chosen by the storage override below
+  // (transforms paired with `storedAs` are rejected at Entity.make time).
+  hireDate: Schema.DateTimeUtc,
   createdBy: Schema.String,
 }) {}
 // #endregion
@@ -137,7 +139,7 @@ const program = Effect.gen(function* () {
     email: "alice@acme.com",
     displayName: "Alice Chen",
     department: "Engineering",
-    hireDate: "2024-01-15T00:00:00.000Z" as any,
+    hireDate: DateTime.makeUnsafe("2024-01-15T00:00:00.000Z"),
     createdBy: "system",
   })
   yield* Console.log(`Created: ${alice.displayName} (${alice.email})`)
@@ -153,7 +155,7 @@ const program = Effect.gen(function* () {
     department: "Platform",
     // Must provide all GSI composites for ByTenant:
     tenantId: "tenant-acme" as any,
-    hireDate: "2024-01-15T00:00:00.000Z" as any,
+    hireDate: DateTime.makeUnsafe("2024-01-15T00:00:00.000Z"),
   })
   yield* Console.log(`Updated: ${updated.displayName}, dept=${updated.department}`)
 

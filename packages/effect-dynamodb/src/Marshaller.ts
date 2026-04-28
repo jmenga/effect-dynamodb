@@ -29,7 +29,14 @@ export const fromAttributeValue = (value: AttributeValue): unknown => unmarshall
 // ---------------------------------------------------------------------------
 
 /**
+ * @internal
+ *
  * Convert a domain date value to the storage primitive based on DynamoEncoding.
+ *
+ * No longer used by Entity (which now uses substituted bidirectional schemas
+ * and Schema.encode end-to-end). Retained for Aggregate's per-field root
+ * attribute serialization, which is decomposed at write time and re-assembled
+ * at read time without going through Schema.encode/decode of a single schema.
  *
  * Domain types supported:
  * - `DateTime.Utc` → ISO string, epoch ms, or epoch seconds
@@ -67,7 +74,13 @@ export const serializeDateForDynamo = (
 }
 
 /**
+ * @internal
+ *
  * Convert a DynamoDB storage primitive back to the domain value based on DynamoEncoding.
+ *
+ * No longer used by Entity (which now uses substituted bidirectional schemas
+ * and Schema.decode end-to-end). Retained for Aggregate's per-field root
+ * attribute deserialization.
  */
 export const deserializeDateFromDynamo = (
   stored: unknown,

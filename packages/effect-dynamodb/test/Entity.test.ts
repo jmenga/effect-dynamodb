@@ -4912,9 +4912,12 @@ describe("Entity", () => {
       occurredAt: DynamoModel.DateEpochSeconds,
     }) {}
 
+    // Self schema + storedAs annotation drives the wire format. Transforms
+    // paired with a different storage (e.g. DateString + DateEpochSeconds
+    // override) are rejected at Entity.make() time.
     class EventStoredAsEpoch extends Schema.Class<EventStoredAsEpoch>("EventStoredAsEpoch")({
       eventId: Schema.String,
-      occurredAt: DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds)),
+      occurredAt: Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds)),
     }) {}
 
     const EventEntity = withConfig(
@@ -5194,11 +5197,13 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    // ConfiguredModel with storage override (no field rename)
+    // ConfiguredModel with storage override (no field rename).
+    // Using self schemas (Schema.DateTimeUtc) so the storage override applies;
+    // transforms paired with overrides are rejected at Entity.make() time.
     class Order extends Schema.Class<Order>("Order")({
       orderId: Schema.String,
-      placedAt: Schema.DateTimeUtcFromString,
-      expiresAt: Schema.DateTimeUtcFromString,
+      placedAt: Schema.DateTimeUtc,
+      expiresAt: Schema.DateTimeUtc,
     }) {}
 
     const OrderModel = DynamoModel.configure(Order, {
@@ -7456,11 +7461,11 @@ describe("Entity", () => {
 
     // Domain-adaptive generation: model declares createdAt with a non-default
     // encoding (epoch seconds). Library-generated value uses that storage.
+    // Self schema + `storedAs` annotation drives the wire format; transforms
+    // paired with `storedAs` would be rejected at Entity.make() time.
     class EpochDoc extends Schema.Class<EpochDoc>("EpochDoc")({
       id: Schema.String,
-      createdAt: Schema.DateTimeUtcFromString.pipe(
-        DynamoModel.storedAs(DynamoModel.DateEpochSeconds),
-      ),
+      createdAt: Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds)),
     }) {}
 
     const EpochDocEntity = withConfig(
