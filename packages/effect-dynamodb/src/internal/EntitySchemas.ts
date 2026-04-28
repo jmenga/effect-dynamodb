@@ -399,8 +399,10 @@ const toWirePrimitive = (value: unknown, encoding: DynamoEncoding): string | num
  * primitive. This makes both `Schema.encode(substituted)` and
  * `Schema.decode(substituted)` work end-to-end regardless of whether the
  * caller passed wire-form or domain-form.
+ *
+ * @internal
  */
-const buildDateTransform = (encoding: DynamoEncoding): Schema.Top => {
+export const buildDateTransform = (encoding: DynamoEncoding): Schema.Top => {
   const targetSchema = (() => {
     switch (encoding.domain) {
       case "DateTime.Utc":

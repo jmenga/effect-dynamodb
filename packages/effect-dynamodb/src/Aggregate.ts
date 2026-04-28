@@ -27,14 +27,9 @@ import {
   TransactionCancelled,
   ValidationError,
 } from "./Errors.js"
+import { buildDateTransform, validateNoTransformOverride } from "./internal/EntitySchemas.js"
 import * as KeyComposer from "./KeyComposer.js"
-import {
-  deserializeDateFromDynamo,
-  fromAttributeMap,
-  serializeDateForDynamo,
-  toAttributeMap,
-  toAttributeValue,
-} from "./Marshaller.js"
+import { fromAttributeMap, toAttributeMap, toAttributeValue } from "./Marshaller.js"
 import type { Table, TableConfig } from "./Table.js"
 
 export type { Cursor, DiscriminatorConfig, UpdateContext } from "./internal/AggregateCursor.js"
@@ -539,28 +534,51 @@ const makeAggregate = <TSchema extends Schema.Top>(
   const aggregateName = config.root.entityType
   const contextFields = config.context ?? []
 
-  // Detect date encodings for all root schema fields (once, at make() time).
-  // Fields with Date/DateTime types need serialization before DynamoDB
-  // marshalling and deserialization before Schema decode. The Aggregate
-  // path uses the @internal `serializeDateForDynamo` / `deserializeDateFromDynamo`
-  // helpers from Marshaller — Entity has migrated to substituted bidirectional
-  // schemas, but the Aggregate's per-field decompose/assemble flow still uses
-  // the per-field helpers.
-  const dateEncodings: Record<string, DynamoEncoding> = {}
+  // Detect date encodings for all root schema fields (once, at make() time)
+  // and build a per-field bidirectional substitute schema.
+  //
+  // Aggregates decompose/assemble at the root-attribute level — each date
+  // field is converted in isolation (write: domain → wire primitive; read:
+  // wire primitive → domain). To stay schema-driven (issue #29), we route
+  // the conversion through the same `buildDateTransform` substitute used by
+  // Entity. `Schema.encodeUnknownSync` produces the wire form on writes and
+  // `Schema.decodeUnknownSync` lifts the wire form back on reads — wire
+  // format is byte-identical to the legacy per-field helpers.
+  //
+  // Policy: aggregate fields that already carry a date transform schema
+  // (e.g. `Schema.DateTimeUtcFromString`) cannot be combined with a
+  // `DynamoModel.storedAs(...)` annotation that conflicts with the
+  // transform's wire kind — same rule as Entity.
+  const dateEncoders: Record<string, (value: unknown) => unknown> = {}
+  const dateDecoders: Record<string, (stored: unknown) => unknown> = {}
   const schemaFields = (schema as Record<string, unknown>).fields as
     | Record<string, Schema.Top>
     | undefined
   if (schemaFields) {
+    // Reject transform + storedAs annotation conflicts (Option (b) policy).
+    // Aggregates do not currently support `DynamoModel.configure` overrides,
+    // so we pass an empty `configuredAttributes` map — only the schema-level
+    // annotation conflict is checked.
+    validateNoTransformOverride(schemaFields, {})
+
     for (const field of Object.keys(schemaFields)) {
       const fieldSchema = schemaFields[field]!
       const explicit = DynamoModel.getEncoding(fieldSchema)
+      let encoding: DynamoEncoding | undefined
       if (explicit) {
-        dateEncodings[field] = explicit
+        encoding = explicit
       } else {
         // Infer for standard Effect date schemas (Schema.Date, DateTime, etc.)
         // For optional fields (Union with Undefined), unwrap to find the inner type.
         const inferred = inferDateEncoding(fieldSchema.ast)
-        if (inferred) dateEncodings[field] = inferred
+        if (inferred) encoding = inferred
+      }
+      if (encoding) {
+        const transform = buildDateTransform(encoding)
+        const encode = Schema.encodeUnknownSync(transform as Schema.Codec<any>)
+        const decode = Schema.decodeUnknownSync(transform as Schema.Codec<any>)
+        dateEncoders[field] = (value) => encode(value)
+        dateDecoders[field] = (stored) => decode(stored)
       }
     }
   }
@@ -629,7 +647,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           rootNode,
           allItems,
           contextFields,
-          dateEncodings,
+          dateDecoders,
           key,
           aggregateName,
         )
@@ -669,7 +687,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           assembled,
           rootNode,
           contextFields,
-          dateEncodings,
+          dateEncoders,
           aggregateName,
         )
 
@@ -706,7 +724,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           rootNode,
           allItems,
           contextFields,
-          dateEncodings,
+          dateDecoders,
           key,
           aggregateName,
         )
@@ -742,14 +760,14 @@ const makeAggregate = <TSchema extends Schema.Top>(
           assembledOld,
           rootNode,
           contextFields,
-          dateEncodings,
+          dateEncoders,
           aggregateName,
         )
         const newGroups = yield* decomposeAggregate(
           assembledNew,
           rootNode,
           contextFields,
-          dateEncodings,
+          dateEncoders,
           aggregateName,
         )
 
@@ -903,7 +921,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
               rootNode,
               allItems,
               contextFields,
-              dateEncodings,
+              dateDecoders,
               key,
               aggregateName,
             )
@@ -1114,7 +1132,7 @@ const assembleAggregate = (
   rootNode: ResolvedNode,
   allItems: Array<Record<string, unknown>>,
   _contextFields: ReadonlyArray<string>,
-  dateEncodings: Record<string, DynamoEncoding>,
+  dateDecoders: Record<string, (stored: unknown) => unknown>,
   key: Record<string, unknown>,
   aggregateName: string,
 ): Effect.Effect<unknown, AggregateAssemblyError | ValidationError> =>
@@ -1179,9 +1197,11 @@ const assembleAggregate = (
 
     // Deserialize date context fields from DynamoDB storage primitives to domain values.
     // Schema.decodeUnknownEffect expects domain types (Date, DateTime), not encoded strings.
-    for (const [field, encoding] of Object.entries(dateEncodings)) {
+    // The decoder is the substituted bidirectional date schema built at make() time —
+    // identical wire format to the legacy `deserializeDateFromDynamo` helper.
+    for (const [field, decode] of Object.entries(dateDecoders)) {
       if (field in rootFields && rootFields[field] != null) {
-        rootFields[field] = deserializeDateFromDynamo(rootFields[field], encoding)
+        rootFields[field] = decode(rootFields[field])
       }
     }
 
@@ -1568,7 +1588,7 @@ const decomposeAggregate = (
   assembled: Record<string, unknown>,
   rootNode: ResolvedNode,
   contextFields: ReadonlyArray<string>,
-  dateEncodings: Record<string, DynamoEncoding>,
+  dateEncoders: Record<string, (value: unknown) => unknown>,
   aggregateName: string,
 ): Effect.Effect<ReadonlyArray<TransactionGroup>, AggregateDecompositionError> =>
   Effect.gen(function* () {
@@ -1577,12 +1597,12 @@ const decomposeAggregate = (
     // Extract context values from the root, serializing date fields for DynamoDB storage.
     // Domain Date/DateTime objects must be encoded before toAttributeMap() marshalling,
     // otherwise Date objects become { M: {} } (no enumerable properties).
+    // The encoder is the substituted bidirectional date schema built at make() time.
     const contextValues: Record<string, unknown> = {}
     for (const field of contextFields) {
       const value = assembled[field]
-      const encoding = dateEncodings[field]
-      contextValues[field] =
-        encoding && value != null ? serializeDateForDynamo(value, encoding) : value
+      const encode = dateEncoders[field]
+      contextValues[field] = encode && value != null ? encode(value) : value
     }
 
     // Root item: fields not claimed by edges
@@ -1591,8 +1611,8 @@ const decomposeAggregate = (
     for (const [key, value] of Object.entries(assembled)) {
       if (edgeFieldNames.has(key)) continue
       // Serialize date fields in root attributes (same as context values)
-      const encoding = dateEncodings[key]
-      rootAttrs[key] = encoding && value != null ? serializeDateForDynamo(value, encoding) : value
+      const encode = dateEncoders[key]
+      rootAttrs[key] = encode && value != null ? encode(value) : value
     }
 
     items.push({
