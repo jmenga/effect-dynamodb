@@ -4,7 +4,16 @@
  * Extracted from Entity.ts for decomposition. Not part of the public API.
  */
 
-import { Schema, SchemaAST } from "effect"
+import {
+  DateTime,
+  Effect,
+  Option,
+  Redacted,
+  Schema,
+  SchemaAST,
+  SchemaGetter,
+  SchemaIssue,
+} from "effect"
 import { type DynamoEncoding, getEncoding, isHidden } from "../DynamoModel.js"
 import type { IndexDefinition } from "../KeyComposer.js"
 import type {
@@ -297,38 +306,386 @@ export const inferDefaultEncoding = (schema: Schema.Top): DynamoEncoding | undef
 }
 
 // ---------------------------------------------------------------------------
+// Self vs. transform schema detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true when the schema is a "self" schema — i.e. it carries no
+ * encoding transformation. Self schemas have `ast.encoding === undefined`.
+ *
+ * - `Schema.DateTimeUtc` — self
+ * - `Schema.DateTimeUtcFromString` — transform (encodes to string)
+ * - `Schema.RedactedFromValue(...)` — transform
+ * - any `.pipe(Schema.decodeTo(...))` chain — transform
+ */
+export const isSelfSchema = (schema: Schema.Top): boolean => schema.ast.encoding === undefined
+
+/**
+ * True if the schema is a self DateTime/Date schema that can have its storage
+ * configured via a DynamoEncoding annotation. Distinguished from a transform
+ * by `ast.encoding === undefined`.
+ */
+export const isSelfDateSchema = (schema: Schema.Top): boolean => {
+  if (!isSelfSchema(schema)) return false
+  // The self-schema check is necessary but not sufficient — also confirm the
+  // type constructor matches one of the supported date domains.
+  return inferDefaultEncoding(schema) !== undefined
+}
+
+/**
+ * Returns true when the schema is a transform schema with a date typeConstructor
+ * (e.g. `Schema.DateTimeUtcFromString`, `DynamoModel.DateEpochSeconds`).
+ * Used to enforce the "transform owns the wire format" policy at Entity.make().
+ */
+export const isDateTransform = (schema: Schema.Top): boolean => {
+  if (isSelfSchema(schema)) return false
+  return inferDefaultEncoding(schema) !== undefined
+}
+
+// ---------------------------------------------------------------------------
+// Self-date schema substitution
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert any input value (string / number / DateTime / Date) to the wire
+ * primitive for a given encoding. Used by date substitutes' `encode` path.
+ *
+ * Wire format precisely matches the legacy `serializeDateForDynamo` output:
+ * - `string` storage → ISO 8601 string (UTC for DateTime.Utc / Date; extended
+ *   format for DateTime.Zoned)
+ * - `epochMs` storage → integer milliseconds since the Unix epoch
+ * - `epochSeconds` storage → integer seconds since the Unix epoch (TTL format)
+ */
+const toWirePrimitive = (value: unknown, encoding: DynamoEncoding): string | number => {
+  let epochMs: number
+  let zoned: DateTime.Zoned | undefined
+  if (DateTime.isDateTime(value)) {
+    if (DateTime.isZoned(value)) zoned = value
+    epochMs = DateTime.toEpochMillis(value)
+  } else if (value instanceof Date) {
+    epochMs = value.getTime()
+  } else if (typeof value === "string") {
+    epochMs = new Date(value).getTime()
+  } else if (typeof value === "number") {
+    // Numeric inputs are interpreted in the encoding's storage scale already.
+    if (encoding.storage === "epochSeconds") epochMs = value * 1000
+    else epochMs = value
+  } else {
+    throw new Error(
+      `[effect-dynamodb] toWirePrimitive: unsupported input ${typeof value} for ${encoding.domain}/${encoding.storage}`,
+    )
+  }
+  switch (encoding.storage) {
+    case "string":
+      if (encoding.domain === "DateTime.Zoned" && zoned) return DateTime.formatIsoZoned(zoned)
+      return new Date(epochMs).toISOString()
+    case "epochMs":
+      return epochMs
+    case "epochSeconds":
+      return Math.floor(epochMs / 1000)
+  }
+}
+
+/**
+ * Build a bidirectional Schema for a given DynamoEncoding.
+ *
+ * The encoded side is `Schema.Any` so `decode` tolerates either:
+ * - the wire primitive (string / number) — the storage-shape input, OR
+ * - a domain value (`DateTime.Utc`, `Date`, etc.) — what users typically pass
+ *   into `entity.put({...})` and `.set({...})`.
+ *
+ * The `decode` direction always lifts to the domain type (DateTime.Utc /
+ * DateTime.Zoned / Date). The `encode` direction always produces the wire
+ * primitive. This makes both `Schema.encode(substituted)` and
+ * `Schema.decode(substituted)` work end-to-end regardless of whether the
+ * caller passed wire-form or domain-form.
+ *
+ * @internal
+ */
+export const buildDateTransform = (encoding: DynamoEncoding): Schema.Top => {
+  const targetSchema = (() => {
+    switch (encoding.domain) {
+      case "DateTime.Utc":
+        return Schema.DateTimeUtc as unknown as Schema.Top
+      case "DateTime.Zoned":
+        return Schema.DateTimeZoned as unknown as Schema.Top
+      case "Date":
+        return Schema.DateValid as unknown as Schema.Top
+    }
+  })()
+  const liftToDomain = (value: unknown): unknown => {
+    if (DateTime.isDateTime(value)) return value
+    if (value instanceof Date) {
+      switch (encoding.domain) {
+        case "DateTime.Utc":
+          return DateTime.makeUnsafe(value)
+        case "DateTime.Zoned":
+          return DateTime.makeZonedUnsafe(value, { timeZone: "UTC" })
+        case "Date":
+          return value
+      }
+    }
+    if (typeof value === "string") {
+      switch (encoding.domain) {
+        case "DateTime.Utc":
+          return DateTime.makeUnsafe(value)
+        case "DateTime.Zoned": {
+          const match = value.match(/^(.+)\[(.+)\]$/)
+          if (match) {
+            const utc = DateTime.makeUnsafe(match[1]!)
+            return DateTime.makeZonedUnsafe(utc, { timeZone: match[2]! })
+          }
+          const utc = DateTime.makeUnsafe(value)
+          return DateTime.makeZonedUnsafe(utc, { timeZone: "UTC" })
+        }
+        case "Date":
+          return new Date(value)
+      }
+    }
+    if (typeof value === "number") {
+      const ms = encoding.storage === "epochSeconds" ? value * 1000 : value
+      switch (encoding.domain) {
+        case "DateTime.Utc":
+          return DateTime.makeUnsafe(ms)
+        case "DateTime.Zoned":
+          return DateTime.makeZonedUnsafe(new Date(ms), { timeZone: "UTC" })
+        case "Date":
+          return new Date(ms)
+      }
+    }
+    return value
+  }
+  return Schema.Any.pipe(
+    Schema.decodeTo(targetSchema, {
+      decode: SchemaGetter.transformOrFail((value: unknown) => {
+        try {
+          return Effect.succeed(liftToDomain(value))
+        } catch {
+          return Effect.fail(new SchemaIssue.InvalidType(Schema.Any.ast, Option.some(value)))
+        }
+      }),
+      encode: SchemaGetter.transformOrFail((value: unknown) => {
+        try {
+          return Effect.succeed(toWirePrimitive(value, encoding))
+        } catch {
+          return Effect.fail(new SchemaIssue.InvalidType(Schema.Any.ast, Option.some(value)))
+        }
+      }),
+    } as any),
+  ) as unknown as Schema.Top
+}
+
+/**
+ * Detects `Schema.RedactedFromValue(inner)` fields (and `Schema.Redacted`).
+ * The encoded form of these schemas is "Forbidden" by Effect v4 design —
+ * encoding bails out to prevent accidental leaks. To make the round-trip work
+ * for our use case (write to DynamoDB, read back with Redacted on the domain
+ * side), we substitute with a custom transform that explicitly extracts the
+ * inner value via `Redacted.value` on encode and rewraps via `Redacted.make`
+ * on decode.
+ *
+ * Returns the inner schema (the wire-format schema) when the field is a
+ * Redacted-typed schema, otherwise undefined.
+ */
+const tryGetRedactedInner = (schema: Schema.Top): Schema.Top | undefined => {
+  const resolved = SchemaAST.resolve(schema.ast) as
+    | { typeConstructor?: { _tag?: string } }
+    | undefined
+  if (resolved?.typeConstructor?._tag !== "effect/Redacted") return undefined
+  // The decoded type is `Redacted<T>` where the inner schema is at
+  // `ast.typeParameters[0]`. Walk the AST and rebuild the Schema via
+  // `Schema.make` so we get a fully-functional Schema (with `.pipe`).
+  const ast = schema.ast as unknown as { typeParameters?: ReadonlyArray<unknown> }
+  const params = ast.typeParameters
+  if (!params || params.length === 0) return undefined
+  const innerAst = params[0] as Schema.Top["ast"]
+  return Schema.make<Schema.Top>(innerAst)
+}
+
+/**
+ * Build a substitute Schema for a `Schema.RedactedFromValue(inner)` field.
+ *
+ * The substitute round-trips: produces `Redacted<T>` on the domain side and
+ * the inner wire primitive on the encoded side. Both directions tolerate
+ * either form on input — a user passing a plain inner value is wrapped via
+ * `Redacted.make`; a user passing a `Redacted<T>` instance is unwrapped on
+ * encode via `Redacted.value`. This permissive shape lets the put/update
+ * paths handle the mixed wire/domain payloads users typically construct
+ * (e.g. `.put({ secret: Redacted.make(...) })`).
+ *
+ * The encoded side is `Schema.Any` so decode tolerates either form; the
+ * branch logic in `decode`/`encode` then steers the value to the right
+ * representation.
+ */
+const buildRedactedSubstitute = (inner: Schema.Top): Schema.Top => {
+  return Schema.Any.pipe(
+    Schema.decodeTo(
+      Schema.Redacted(inner) as unknown as Schema.Top,
+      {
+        decode: SchemaGetter.transform((value: unknown) =>
+          Redacted.isRedacted(value) ? value : Redacted.make(value),
+        ),
+        encode: SchemaGetter.transform((r: unknown) =>
+          Redacted.isRedacted(r) ? Redacted.value(r as Redacted.Redacted<unknown>) : r,
+        ),
+      } as any,
+    ),
+  ) as unknown as Schema.Top
+}
+
+/**
+ * Substitute model fields with bidirectional transforms where needed:
+ *
+ *  - Self date schemas with an effective encoding (annotation or override)
+ *    → tolerant date transform that accepts either wire form (string/number)
+ *    or domain form (DateTime / Date) on decode, and always produces the
+ *    configured wire primitive on encode.
+ *  - `Schema.RedactedFromValue(inner)` fields → tolerant Redacted transform
+ *    that accepts either form on decode and unwraps to wire primitive on
+ *    encode (Effect v4's `RedactedFromValue` forbids encoding by default;
+ *    our substitution makes the round-trip work for storage).
+ *
+ * Existing transform schemas (other than `RedactedFromValue`) are passed
+ * through unchanged — the user-declared transform IS the wire format.
+ *
+ * Schema.Class fields (and Schema.Class fields nested inside Schema.Array,
+ * Schema.optional, etc.) are NOT substituted here. Instead, callers run
+ * `decode → encode` against the substituted schema: `Schema.decode` is
+ * forgiving for Schema.Class (lifts plain objects to instances), and the
+ * tolerant date / Redacted substitutes make the decode pass accept both
+ * wire and domain values. The subsequent `Schema.encode` produces the
+ * canonical wire shape.
+ *
+ * @internal
+ */
+export const substituteSchemas = (
+  modelFields: SchemaFields,
+  fieldEncodings: globalThis.Record<string, DynamoEncoding>,
+): SchemaFields => {
+  const out: SchemaFields = {}
+  for (const [name, schema] of Object.entries(modelFields)) {
+    // 1. Self-date substitution. Pattern A: user declared `Schema.DateTimeUtc`
+    //    and chose a wire format via annotation. We substitute with the
+    //    tolerant date transform so the encode pipeline produces the right
+    //    wire primitive.
+    if (isSelfDateSchema(schema)) {
+      const enc = fieldEncodings[name]
+      if (enc) {
+        out[name] = buildDateTransform(enc)
+        continue
+      }
+    }
+    // 2. RedactedFromValue substitution. Effect v4's `RedactedFromValue`
+    //    forbids encoding by design; substitute with a tolerant Redacted
+    //    transform so the round-trip works for storage.
+    const redactedInner = tryGetRedactedInner(schema)
+    if (redactedInner !== undefined) {
+      out[name] = buildRedactedSubstitute(redactedInner)
+      continue
+    }
+    // Default: pass through unchanged. Pattern B transforms (DynamoModel.*,
+    // Schema.DateTimeUtcFromString, Schema.NumberFromString, …) own their
+    // wire format directly — `Schema.encode` handles the conversion.
+    out[name] = schema
+  }
+  return out
+}
+
+/**
+ * Validate that no model field combines a transform schema with a storage
+ * override. The two configuration paths are mutually exclusive: either declare
+ * a self schema (`Schema.DateTimeUtc`) and let the annotation drive storage,
+ * OR declare a transform and own the wire format yourself — not both.
+ *
+ * Two override sources are checked:
+ *
+ *  1. `ConfiguredModel.storedAs` (configured attributes) — surfaces the
+ *     override via `configuredAttributes[name].encoding`.
+ *
+ *  2. `DynamoModel.storedAs(...)` modifier piped onto the field schema —
+ *     adds a `DynamoEncoding` annotation directly to the AST. We detect this
+ *     by checking whether the field-level annotation disagrees with the
+ *     transform's actual wire format (the `inferDefaultEncoding` of the
+ *     transform). For an unmodified transform (e.g. `DynamoModel.DateString`
+ *     with a matching ISO-string annotation), the two agree and the field is
+ *     accepted.
+ *
+ * Throws at `Entity.make()` time if the conflict is detected.
+ *
+ * @internal
+ */
+export const validateNoTransformOverride = (
+  modelFields: SchemaFields,
+  configuredAttributes: ConfiguredAttributeEncodings,
+): void => {
+  const conflictMessage = (name: string) =>
+    `[effect-dynamodb] Field "${name}": cannot apply DynamoEncoding storage override to a transform schema. ` +
+    `Either declare a self schema (Schema.DateTimeUtc) and let the annotation drive storage, OR declare a transform and own the wire format — not both.`
+
+  for (const [name, schema] of Object.entries(modelFields)) {
+    if (!isDateTransform(schema)) continue
+
+    // 1. ConfiguredModel.storedAs override?
+    const configOverride = configuredAttributes[name]?.encoding
+    if (configOverride !== undefined) {
+      throw new Error(conflictMessage(name))
+    }
+
+    // 2. DynamoModel.storedAs() modifier on the schema itself? The modifier
+    //    applies a `DynamoEncoding` annotation to the AST. Detect a conflict
+    //    by comparing the annotation's storage with the transform's actual
+    //    wire format (read from `ast.encoding[last].to._tag`). Granularity:
+    //    we can distinguish "string" vs "number" wire forms; we cannot
+    //    distinguish epochMs vs epochSeconds at this layer. The string-vs-
+    //    number mismatch covers the most common breaking case.
+    const annotated = getEncoding(schema)
+    if (annotated === undefined) continue
+    const transformWire = transformWireKind(schema)
+    if (transformWire === undefined) continue
+    const annotatedKind = annotated.storage === "string" ? "string" : "number"
+    if (transformWire !== annotatedKind) {
+      throw new Error(conflictMessage(name))
+    }
+  }
+}
+
+/**
+ * Read the wire form ("string" or "number") that a transform schema actually
+ * encodes to, by walking the encoding chain. Returns undefined when the chain
+ * is missing or the leaf isn't a String / Number node.
+ */
+const transformWireKind = (schema: Schema.Top): "string" | "number" | undefined => {
+  const enc = (schema.ast as { encoding?: ReadonlyArray<{ to: { _tag: string } }> }).encoding
+  if (!enc || enc.length === 0) return undefined
+  const leaf = enc[enc.length - 1]
+  if (!leaf) return undefined
+  const tag = leaf.to._tag
+  if (tag === "String") return "string"
+  if (tag === "Number") return "number"
+  return undefined
+}
+
+// ---------------------------------------------------------------------------
 // Build derived schemas at make() time
 // ---------------------------------------------------------------------------
 
 export interface DerivedSchemas {
-  /** Pure model fields schema (wire format — for input validation) */
+  /** Pure model fields schema (substituted — used for both validation and decode) */
   readonly modelSchema: Schema.Codec<any>
-  /** Model fields with fromSelf for date-annotated fields (for decode after deserialization) */
-  readonly modelDecodeSchema: Schema.Codec<any>
   /** Model + system fields schema */
   readonly recordSchema: Schema.Codec<any>
   /**
    * Typed input schema — the public payload type users see. Ref-aware (ref
    * fields swapped for ID fields). System-colliding `createdAt`/`updatedAt`
    * are marked optional; `version` (if colliding) is stripped.
+   *
+   * Used both as the public type and as the runtime encode/decode schema.
    */
   readonly inputSchema: Schema.Codec<any>
-  /**
-   * Runtime input decode schema. Same shape as `inputSchema` but with fromSelf
-   * variants for date fields so decode accepts domain values (matches the TS
-   * contract). Used by put/create/upsert at runtime.
-   */
-  readonly inputDecodeSchema: Schema.Codec<any>
   /** Input fields minus primary key composites — the common "create" payload */
   readonly createSchema: Schema.Codec<any>
   /** Optional model fields minus keys and immutable */
   readonly updateSchema: Schema.Codec<any>
-  /**
-   * Runtime update decode schema. Same shape as `updateSchema` but with
-   * fromSelf variants for date fields so decode accepts domain values. Used
-   * by update at runtime.
-   */
-  readonly updateDecodeSchema: Schema.Codec<any>
   /** Primary key composites only */
   readonly keySchema: Schema.Codec<any>
   /** Record + key attrs + __edd_e__ */
@@ -348,22 +705,6 @@ export interface DerivedSchemas {
   readonly historyRecordSchema: Schema.Codec<any> | null
 }
 
-/**
- * Map a DynamoEncoding domain type to its "from self" Schema.
- * Used in record/item schemas so Schema.decode accepts domain values
- * directly (after deserializeDateFields has converted storage→domain).
- */
-const dateFromSelfSchema = (encoding: DynamoEncoding): Schema.Top => {
-  switch (encoding.domain) {
-    case "DateTime.Utc":
-      return Schema.DateTimeUtc
-    case "DateTime.Zoned":
-      return Schema.DateTimeZoned
-    case "Date":
-      return Schema.DateValid
-  }
-}
-
 export const buildDerivedSchemas = (
   modelFields: SchemaFields,
   indexes: globalThis.Record<string, IndexDefinition>,
@@ -376,51 +717,40 @@ export const buildDerivedSchemas = (
   immutableFields: ReadonlySet<string> = new Set(),
   identifierField: string | undefined = undefined,
   timeSeries: TimeSeriesConfig<any> | undefined = undefined,
+  fieldEncodings: globalThis.Record<string, DynamoEncoding> = {},
 ): DerivedSchemas => {
-  // --- Build fromSelf field map for date fields ---
-  // These replace transform schemas with their "from self" variants so
-  // Schema.decode accepts domain values after storage→domain conversion.
-  // Checks both explicit DynamoEncoding annotations AND inferred defaults
-  // from standard Effect date schemas (Pattern B: pure model).
-  const fromSelfFields: globalThis.Record<string, Schema.Top> = {}
-  for (const [fieldName, fieldSchema] of Object.entries(modelFields)) {
-    const encoding = getEncoding(fieldSchema) ?? inferDefaultEncoding(fieldSchema)
-    if (encoding) {
-      fromSelfFields[fieldName] = dateFromSelfSchema(encoding)
-    }
-  }
+  // --- Substitute model fields ---
+  // Self date schemas (with effective encoding) are replaced with bidirectional
+  // transforms that produce the configured wire primitive. RedactedFromValue
+  // fields are replaced with a custom bidirectional transform so encoding
+  // round-trips. All other transform schemas are passed through — the user's
+  // transform IS the wire format and we never override it.
+  const fields = substituteSchemas(modelFields, fieldEncodings)
 
-  // --- Model Schema: pure model fields (accepts wire format for input decode) ---
-  const modelSchema = Schema.Struct(modelFields)
-
-  // --- Model Decode Schema: model fields with fromSelf for date-annotated fields ---
-  // Used in decodeAs after deserializeDateFields has converted storage→domain.
-  const modelDecodeSchema =
-    Object.keys(fromSelfFields).length > 0
-      ? Schema.Struct({ ...modelFields, ...fromSelfFields })
-      : modelSchema
+  // --- Model Schema: pure model fields (for input decode/encode) ---
+  const modelSchema = Schema.Struct(fields)
 
   // --- Record Schema: model + system fields ---
-  // For date-annotated fields, use "from self" schemas (accept domain values directly)
+  // System timestamp fields use Schema.DateTimeUtcFromString as the canonical
+  // wire ↔ domain transform when they're library-managed. When the field
+  // collides with a model-declared field, the model's substituted schema is
+  // already in `fields` and we don't add a system-schema entry.
   const systemSchemaFields: globalThis.Record<string, Schema.Top> = {}
-  if (systemFields.createdAt) {
-    // Custom encoding → use fromSelf (deserializeDateFields handles storage→domain)
-    // Default → use DateTimeUtcFromString (ISO string → DateTime.Utc)
+  if (systemFields.createdAt && !systemFields.createdAtCollision) {
     systemSchemaFields[systemFields.createdAt] = systemFields.createdAtEncoding
-      ? Schema.DateTimeUtc
+      ? buildDateTransform(systemFields.createdAtEncoding)
       : Schema.DateTimeUtcFromString
   }
-  if (systemFields.updatedAt) {
+  if (systemFields.updatedAt && !systemFields.updatedAtCollision) {
     systemSchemaFields[systemFields.updatedAt] = systemFields.updatedAtEncoding
-      ? Schema.DateTimeUtc
+      ? buildDateTransform(systemFields.updatedAtEncoding)
       : Schema.DateTimeUtcFromString
   }
-  if (systemFields.version) {
+  if (systemFields.version && !systemFields.versionCollision) {
     systemSchemaFields[systemFields.version] = Schema.Number
   }
   const recordSchema = Schema.Struct({
-    ...modelFields,
-    ...fromSelfFields,
+    ...fields,
     ...systemSchemaFields,
   })
 
@@ -457,14 +787,11 @@ export const buildDerivedSchemas = (
 
   // --- Input Schema: ref-aware (swap ref fields for ID fields when refs present) ---
   const refFieldSet = new Set(resolvedRefs.map((r) => r.fieldName))
-  const buildInputFieldsAcc = (
-    dateVariant: "transform" | "fromSelf",
-  ): globalThis.Record<string, Schema.Top> => {
+  const buildInputFieldsAcc = (): globalThis.Record<string, Schema.Top> => {
     const acc: globalThis.Record<string, Schema.Top> = {}
-    for (const [key, field] of Object.entries(modelFields)) {
+    for (const [key, field] of Object.entries(fields)) {
       if (refFieldSet.has(key)) continue
-      const base = dateVariant === "fromSelf" && fromSelfFields[key] ? fromSelfFields[key] : field
-      const adjusted = applySystemCollisionAdjustments(key, base, "input")
+      const adjusted = applySystemCollisionAdjustments(key, field, "input")
       if (adjusted !== null) acc[key] = adjusted
     }
     for (const ref of resolvedRefs) {
@@ -472,14 +799,13 @@ export const buildDerivedSchemas = (
     }
     return acc
   }
-  const inputSchema = Schema.Struct(buildInputFieldsAcc("transform") as Schema.Struct.Fields)
-  const inputDecodeSchema = Schema.Struct(buildInputFieldsAcc("fromSelf") as Schema.Struct.Fields)
+  const inputSchema = Schema.Struct(buildInputFieldsAcc() as Schema.Struct.Fields)
 
   // --- Create Schema: input fields minus identifier (or PK composites as fallback) ---
   const pkComposites = new Set(primaryKeyComposites(indexes))
   const createOmitFields = identifierField ? new Set([identifierField]) : pkComposites
   const createFieldsAcc: globalThis.Record<string, Schema.Top> = {}
-  for (const [key, field] of Object.entries(modelFields)) {
+  for (const [key, field] of Object.entries(fields)) {
     if (createOmitFields.has(key)) continue // skip identifier/PK composites (auto-generated)
     if (refFieldSet.has(key)) continue // skip ref fields (replaced by ID fields)
     const adjusted = applySystemCollisionAdjustments(key, field, "input")
@@ -493,17 +819,14 @@ export const buildDerivedSchemas = (
   const createSchema = Schema.Struct(createFieldsAcc as Schema.Struct.Fields)
 
   // --- Update Schema: optional model fields minus key composites & immutable ---
-  const buildUpdateFieldsAcc = (
-    dateVariant: "transform" | "fromSelf",
-  ): globalThis.Record<string, Schema.Top> => {
+  const buildUpdateFieldsAcc = (): globalThis.Record<string, Schema.Top> => {
     const acc: globalThis.Record<string, Schema.Top> = {}
-    for (const [key, field] of Object.entries(modelFields)) {
+    for (const [key, field] of Object.entries(fields)) {
       if (pkComposites.has(key)) continue
       if (immutableFields.has(key)) continue
       if (refFieldSet.has(key)) continue
       if (strippedFromUpdate.has(key)) continue
-      const base = dateVariant === "fromSelf" && fromSelfFields[key] ? fromSelfFields[key] : field
-      acc[key] = Schema.optional(base)
+      acc[key] = Schema.optional(field)
     }
     for (const ref of resolvedRefs) {
       if (pkComposites.has(ref.fieldName)) continue
@@ -512,14 +835,13 @@ export const buildDerivedSchemas = (
     }
     return acc
   }
-  const updateSchema = Schema.Struct(buildUpdateFieldsAcc("transform") as Schema.Struct.Fields)
-  const updateDecodeSchema = Schema.Struct(buildUpdateFieldsAcc("fromSelf") as Schema.Struct.Fields)
+  const updateSchema = Schema.Struct(buildUpdateFieldsAcc() as Schema.Struct.Fields)
 
   // --- Key Schema: primary key composite attributes only ---
   const keyCompositeNames = primaryKeyComposites(indexes)
   const keyFields: globalThis.Record<string, Schema.Top> = {}
   for (const name of keyCompositeNames) {
-    const field = modelFields[name]
+    const field = fields[name]
     if (field) keyFields[name] = field
   }
   const keySchema = Schema.Struct(keyFields)
@@ -543,8 +865,7 @@ export const buildDerivedSchemas = (
       : Schema.optional(Schema.String)
   }
   const itemSchema = Schema.Struct({
-    ...modelFields,
-    ...fromSelfFields,
+    ...fields,
     ...systemSchemaFields,
     ...keyAttrFields,
     __edd_e__: Schema.String,
@@ -552,8 +873,7 @@ export const buildDerivedSchemas = (
 
   // --- Deleted Record Schema: record + deletedAt ---
   const deletedRecordSchema = Schema.Struct({
-    ...modelFields,
-    ...fromSelfFields,
+    ...fields,
     ...systemSchemaFields,
     deletedAt: Schema.String,
   })
@@ -567,22 +887,17 @@ export const buildDerivedSchemas = (
   }
   const hasHiddenFields = hiddenFieldNames.size > 0
 
-  const modelDecodeVisibleSchema = hasHiddenFields
+  const modelVisibleSchema = hasHiddenFields
     ? Schema.Struct(
-        Object.fromEntries(
-          Object.entries({ ...modelFields, ...fromSelfFields }).filter(
-            ([k]) => !hiddenFieldNames.has(k),
-          ),
-        ),
+        Object.fromEntries(Object.entries(fields).filter(([k]) => !hiddenFieldNames.has(k))),
       )
-    : modelDecodeSchema
+    : modelSchema
 
   const recordVisibleSchema = hasHiddenFields
     ? Schema.Struct(
         Object.fromEntries(
           Object.entries({
-            ...modelFields,
-            ...fromSelfFields,
+            ...fields,
             ...systemSchemaFields,
           }).filter(([k]) => !hiddenFieldNames.has(k)),
         ),
@@ -590,28 +905,32 @@ export const buildDerivedSchemas = (
     : recordSchema
 
   // --- Time-series derived schemas ---
-  // `appendInputSchema`: the user-supplied schema directly. `Entity.make()`
+  // `appendInputSchema`: the user-supplied schema, with the same substitution
+  //    rules applied as the model fields (self date schemas → tolerant
+  //    transforms, RedactedFromValue → tolerant Redacted). `Entity.make()`
   //    enforces that every PK/SK composite + `orderBy` appears in its fields.
-  // `historyRecordSchema`: event-item shape. Model fields (with fromSelf for
-  //    date-annotated) + createdAt (when configured, no updatedAt ever since
-  //    timeSeries auto-suppresses). No GSI key attrs — events strip GSI keys.
+  // `historyRecordSchema`: event-item shape. Substituted model fields + no
+  //    system fields (events are point-in-time facts keyed by `orderBy`).
   const timeSeriesEnabled = timeSeries !== undefined && timeSeries !== null
-  const appendInputSchema = timeSeriesEnabled ? timeSeries.appendInput : null
-  // Events are point-in-time facts keyed by `orderBy`. They do NOT carry
-  // `createdAt` or `updatedAt` (§4.5 — events already carry `orderBy` as the
-  // temporal anchor). Schema is just model fields with fromSelf for dates.
+  const appendInputSchema = timeSeriesEnabled
+    ? (() => {
+        const userSchema = timeSeries.appendInput as Schema.Top
+        const userFields = (userSchema as unknown as { fields?: SchemaFields }).fields
+        if (!userFields) return userSchema
+        // Compute encodings for the appendInput fields (annotation +
+        // inferred from typeConstructor for self schemas).
+        const appendEncodings = buildFieldEncodings(userFields, {})
+        const subbedFields = substituteSchemas(userFields, appendEncodings)
+        return Schema.Struct(subbedFields as Schema.Struct.Fields) as unknown as Schema.Top
+      })()
+    : null
   const historyRecordSchema = timeSeriesEnabled
     ? (() => {
         const hiddenFilter = (record: globalThis.Record<string, Schema.Top>) =>
           hasHiddenFields
             ? Object.fromEntries(Object.entries(record).filter(([k]) => !hiddenFieldNames.has(k)))
             : record
-        return Schema.Struct(
-          hiddenFilter({
-            ...modelFields,
-            ...fromSelfFields,
-          }) as Schema.Struct.Fields,
-        )
+        return Schema.Struct(hiddenFilter({ ...fields }) as Schema.Struct.Fields)
       })()
     : null
 
@@ -620,14 +939,11 @@ export const buildDerivedSchemas = (
   // because the fields are stored in dynamically-typed records, so we cast.
   type S = Schema.Codec<any>
   return {
-    modelSchema: modelSchema as unknown as S,
-    modelDecodeSchema: modelDecodeVisibleSchema as unknown as S,
+    modelSchema: modelVisibleSchema as unknown as S,
     recordSchema: recordVisibleSchema as unknown as S,
     inputSchema: inputSchema as unknown as S,
-    inputDecodeSchema: inputDecodeSchema as unknown as S,
     createSchema: createSchema as unknown as S,
     updateSchema: updateSchema as unknown as S,
-    updateDecodeSchema: updateDecodeSchema as unknown as S,
     keySchema: keySchema as unknown as S,
     itemSchema: itemSchema as unknown as S,
     deletedRecordSchema: deletedRecordSchema as unknown as S,

@@ -93,14 +93,17 @@ class Event extends Schema.Class<Event>("Event")({
   scheduledAt: DynamoModel.DateTimeZoned,            // with timezone
 }) {}
 
-// storedAs — override storage format
+// storedAs — override storage format on a SELF schema (not a transform).
+// `Schema.DateTimeUtc` is the self schema; the annotation drives storage.
 class Order extends Schema.Class<Order>("Order")({
   orderId: Schema.String,
-  // Wire: ISO string, stored in DynamoDB as epoch seconds (for TTL)
-  expiresAt: DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds)),
+  // Domain: DateTime.Utc, stored as epoch seconds (e.g. for DynamoDB TTL).
+  // Applying `storedAs` to a transform schema (e.g. DateString or
+  // DateTimeUtcFromString) is rejected at Entity.make() time.
+  expiresAt: Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds)),
 }) {}
 
-// configure — field renaming + storage overrides
+// configure — field renaming + storage overrides (self-schema only for storedAs)
 const OrderModel = DynamoModel.configure(Order, {
   expiresAt: { field: "ttl", storedAs: DynamoModel.DateEpochSeconds },
 })

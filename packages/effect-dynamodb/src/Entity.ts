@@ -8,13 +8,12 @@
  */
 
 import type { AttributeValue, DeleteItemCommandInput } from "@aws-sdk/client-dynamodb"
-import { DateTime, Duration, Effect, Schema, Stream } from "effect"
+import { Duration, Effect, Schema, Stream } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import {
   type ConfiguredModel,
   type DynamoEncoding,
   type ExtractIdentifier,
-  getEncoding,
   getIdentifierField,
   isConfiguredModel,
   isHidden,
@@ -49,13 +48,7 @@ import { compilePath, createPathBuilder } from "./internal/PathBuilder.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "./KeyComposer.js"
 import * as KeyComposer from "./KeyComposer.js"
 import { normalizeGsiConfig } from "./KeyComposer.js"
-import {
-  deserializeDateFromDynamo,
-  fromAttributeMap,
-  serializeDateForDynamo,
-  toAttributeMap,
-  toAttributeValue,
-} from "./Marshaller.js"
+import { fromAttributeMap, toAttributeMap, toAttributeValue } from "./Marshaller.js"
 import * as Query from "./Query.js"
 import { filterExpr, selectPaths } from "./Query.js"
 import type { TableConfig } from "./Table.js"
@@ -171,13 +164,14 @@ import {
   allCompositeAttributes,
   allKeyFieldNames,
   buildDerivedSchemas,
+  buildFieldEncodings,
   type DerivedSchemas,
   getFields,
-  inferDefaultEncoding,
   primaryKeyComposites,
   type ResolvedSystemFields,
   resolveSystemFields,
   resolveUniqueFields,
+  validateNoTransformOverride,
 } from "./internal/EntitySchemas.js"
 import type {
   AppendInputType,
@@ -249,6 +243,58 @@ const composeUniqueSentinel = (
 }
 
 // ---------------------------------------------------------------------------
+// Encode-or-decode-encode helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate user input and produce wire-form output, accepting both Type and
+ * Encoded shapes. Strategy:
+ *
+ *   1. Try `Schema.encode(input)`. This is the canonical Type → Encoded
+ *      conversion and works when the user passes Type values for transforms
+ *      (e.g. a `DateTime.Utc` for `Schema.DateTimeUtcFromString`, a `number`
+ *      for `Schema.NumberFromString`, a `Redacted<string>` for our
+ *      RedactedFromValue substitute).
+ *
+ *   2. On encode failure, fall back to `Schema.decode → Schema.encode`. This
+ *      lifts plain inputs to the Type shape first (`Schema.Class` decode is
+ *      forgiving — it constructs a class instance from a plain object), then
+ *      re-encodes back to wire form. Required for nested `Schema.Class`
+ *      fields whose Type is a class instance but whose Encoded is a plain
+ *      object — users typically construct the plain object directly.
+ *
+ * Returns the Encoded shape (a plain object whose values are wire
+ * primitives), ready for `toAttributeMap`.
+ *
+ * @internal
+ */
+const encodeOrDecodeEncode = (
+  schema: Schema.Codec<any>,
+  input: unknown,
+  entityType: string,
+  operation: string,
+): Effect.Effect<unknown, ValidationError> =>
+  Schema.encodeUnknownEffect(schema)(input).pipe(
+    Effect.catch((primaryCause) =>
+      Schema.decodeUnknownEffect(schema)(input).pipe(
+        Effect.flatMap((decoded) => Schema.encodeUnknownEffect(schema)(decoded)),
+        // On fallback failure, surface the original encode error — its
+        // message is keyed on the caller's input shape, which is what the
+        // user expects to see.
+        Effect.catch(() =>
+          Effect.fail(
+            new ValidationError({
+              entityType,
+              operation: `${operation}.decode`,
+              cause: primaryCause,
+            }),
+          ),
+        ),
+      ),
+    ),
+  )
+
+// ---------------------------------------------------------------------------
 // Entity interface — the return type of Entity.make()
 // ---------------------------------------------------------------------------
 
@@ -302,13 +348,10 @@ export interface Entity<
     readonly refEntityType: string
   }>
 
-  /** @internal Full decode pipeline: rename + date deser + schema decode. Used by Batch/Aggregate. */
+  /** @internal Full decode pipeline: rename + schema decode. Used by Batch/Aggregate. */
   readonly _decodeRecord: (
     raw: globalThis.Record<string, unknown>,
   ) => Effect.Effect<any, ValidationError>
-
-  /** @internal Convert domain date-annotated fields to storage primitives in place. Used by Transaction/Batch. */
-  readonly _serializeDateFields: (item: globalThis.Record<string, unknown>) => void
 
   /** @internal Attach model class prototype to a decoded plain object (no-op for Schema.Struct models). */
   readonly _attachPrototype: (decoded: any) => any
@@ -1502,6 +1545,16 @@ const makeImpl = <
   // Resolve identifier field name from model annotation
   const resolvedIdentifier = getIdentifierField(config.model as Schema.Top)?.name
 
+  // Validate: no model field combines a transform schema with a ConfiguredModel
+  // storage override. The two configuration paths are mutually exclusive.
+  validateNoTransformOverride(modelFields, configuredAttributes)
+
+  // Resolve effective field encodings (annotation + ConfiguredModel override).
+  // Used by buildDerivedSchemas to substitute self date schemas with bidirectional
+  // transforms, and (below) by system-field generation to produce the right
+  // wire primitive when the field is library-managed.
+  const fieldEncodings = buildFieldEncodings(modelFields, configuredAttributes)
+
   const schemas = buildDerivedSchemas(
     modelFields,
     allIndexes,
@@ -1510,6 +1563,7 @@ const makeImpl = <
     immutableFields,
     resolvedIdentifier,
     config.timeSeries,
+    fieldEncodings,
   )
   // schema and tableTag are injected via _configure() when the entity is registered
   // on a Table and bound through DynamoClient.make(). They are captured by operation
@@ -1521,36 +1575,10 @@ const makeImpl = <
   const entityType = config.entityType
   const entityVersion = 1
 
-  // ---------------------------------------------------------------------------
-  // DynamoEncoding map: field name → encoding for date-annotated fields
-  // Merges schema annotations with ConfiguredModel storage overrides.
-  // ---------------------------------------------------------------------------
-
-  const fieldEncodings: globalThis.Record<string, DynamoEncoding> = {}
-  for (const [fieldName, fieldSchema] of Object.entries(modelFields)) {
-    const encoding = getEncoding(fieldSchema)
-    if (encoding) {
-      fieldEncodings[fieldName] = encoding
-    } else {
-      // Auto-detect standard Effect date schemas (Pattern B: pure model)
-      const inferred = inferDefaultEncoding(fieldSchema)
-      if (inferred) fieldEncodings[fieldName] = inferred
-    }
-  }
-  // Apply ConfiguredModel storage overrides (takes precedence over schema annotations)
-  for (const [fieldName, attrConfig] of Object.entries(configuredAttributes)) {
-    if (attrConfig.encoding) {
-      const existing = fieldEncodings[fieldName]
-      fieldEncodings[fieldName] = {
-        storage: attrConfig.encoding.storage,
-        domain: existing?.domain ?? attrConfig.encoding.domain,
-      }
-    }
-  }
-  // Note: System timestamp encodings are NOT added to fieldEncodings.
-  // generateTimestamp() handles serialization directly for timestamps.
-  // This avoids double-serialization in serializeDateFields.
-  const hasDateFields = Object.keys(fieldEncodings).length > 0
+  // Note: `fieldEncodings` is resolved earlier (above buildDerivedSchemas) and
+  // used to substitute self date schemas in derived schemas. System timestamp
+  // encodings are NOT in `fieldEncodings`; `generateTimestamp` produces wire
+  // primitives directly for non-colliding system fields.
 
   // ---------------------------------------------------------------------------
   // Field renaming: domain name → DynamoDB attribute name (from ConfiguredModel)
@@ -1593,32 +1621,6 @@ const makeImpl = <
   /** Resolve a domain field name to its DynamoDB attribute name. */
   const resolveDbName = (domainName: string): string => fieldRenames[domainName] ?? domainName
 
-  /**
-   * Convert domain date values to storage primitives for DynamoEncoding-annotated fields.
-   * Called before toAttributeMap (put path).
-   */
-  const serializeDateFields = (item: globalThis.Record<string, unknown>): void => {
-    if (!hasDateFields) return
-    for (const [field, encoding] of Object.entries(fieldEncodings)) {
-      if (field in item && item[field] != null) {
-        item[field] = serializeDateForDynamo(item[field], encoding)
-      }
-    }
-  }
-
-  /**
-   * Convert storage primitives back to domain values for DynamoEncoding-annotated fields.
-   * Called after fromAttributeMap (get path).
-   */
-  const deserializeDateFields = (raw: globalThis.Record<string, unknown>): void => {
-    if (!hasDateFields) return
-    for (const [field, encoding] of Object.entries(fieldEncodings)) {
-      if (field in raw && raw[field] != null) {
-        raw[field] = deserializeDateFromDynamo(raw[field], encoding)
-      }
-    }
-  }
-
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
@@ -1640,7 +1642,6 @@ const makeImpl = <
 
   const decodeRecord = (raw: globalThis.Record<string, unknown>) => {
     renameFromDynamo(raw)
-    deserializeDateFields(raw)
     return Schema.decodeUnknownEffect(schemas.recordSchema as Schema.Codec<any>)(raw).pipe(
       Effect.map(attachPrototype),
       Effect.mapError(
@@ -1661,16 +1662,12 @@ const makeImpl = <
     mode: DecodeMode,
   ) => {
     if (mode === "native") return Effect.succeed(marshalled)
-    // Rename DynamoDB attributes back to domain field names
+    // Rename DynamoDB attributes back to domain field names. Substituted
+    // schemas handle wire→domain conversion (date primitives, Redacted, etc.).
     renameFromDynamo(raw)
-    // Convert date storage primitives to domain values before Schema decode.
-    // recordSchema/itemSchema use fromSelf variants for annotated fields,
-    // so they accept domain values directly. modelSchema also uses fromSelf
-    // for the decode path after deserialization.
-    deserializeDateFields(raw)
     const targetSchema =
       mode === "model"
-        ? schemas.modelDecodeSchema
+        ? schemas.modelSchema
         : mode === "record"
           ? schemas.recordSchema
           : schemas.itemSchema
@@ -1696,35 +1693,25 @@ const makeImpl = <
   const nowIso = () => new Date().toISOString()
 
   /**
-   * Generate a timestamp value appropriate for the field's encoding.
+   * Generate a timestamp value as a wire primitive ready for marshalling.
    * Default (no encoding): ISO string. Custom encoding: serialized primitive.
    *
-   * Used for non-colliding system fields (field not declared in model) — the
-   * value is written straight into the DynamoDB item and is NOT routed through
-   * `serializeDateFields` (because the field is absent from `fieldEncodings`).
+   * Used for system fields whether colliding or not — the value is always a
+   * wire primitive (string or number) ready for `toAttributeMap`.
    */
   const generateTimestamp = (encoding: DynamoEncoding | null): string | number => {
     if (!encoding) return nowIso()
-    const now = new Date()
-    return serializeDateForDynamo(now, encoding)
-  }
-
-  /**
-   * Generate a timestamp as a domain value (DateTime.Utc / DateTime.Zoned / Date),
-   * matching the field's declared domain. Used for system fields that COLLIDE
-   * with a model-declared field — the value flows through `serializeDateFields`
-   * (which requires a domain value) alongside any user-supplied override.
-   */
-  const generateDomainTimestamp = (
-    encoding: DynamoEncoding,
-  ): DateTime.Utc | DateTime.Zoned | Date => {
-    switch (encoding.domain) {
-      case "DateTime.Utc":
-        return DateTime.makeUnsafe(new Date())
-      case "DateTime.Zoned":
-        return DateTime.makeZonedUnsafe(new Date(), { timeZone: "UTC" })
-      case "Date":
-        return new Date()
+    const now = Date.now()
+    switch (encoding.storage) {
+      case "string":
+        // For DateTime.Zoned this would need the extended ISO format, but
+        // system timestamps generated here are UTC — DateTime.Zoned-typed
+        // collision fields are rare and not previously special-cased either.
+        return new Date(now).toISOString()
+      case "epochMs":
+        return now
+      case "epochSeconds":
+        return Math.floor(now / 1000)
     }
   }
 
@@ -2100,52 +2087,50 @@ const makeImpl = <
           const client = yield* DynamoClient
           const { name: tableName } = yield* tableTag
 
-          // Decode input
-          const decodedInput = yield* Schema.decodeUnknownEffect(
-            schemas.inputDecodeSchema as Schema.Codec<any>,
-          )(input).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ValidationError({
-                  entityType,
-                  operation: "put.decode",
-                  cause,
-                }),
-            ),
+          // Encode user input → wire form. Users typically construct domain
+          // values for transforms (DateTime, Redacted, Number) and plain
+          // objects for Schema.Class fields. To handle both:
+          //   1. Try `encode` directly — the canonical Type → Encoded
+          //      conversion. Works when the input is fully Type-shaped
+          //      (which is the case for the transforms that issue #29
+          //      surfaced: RedactedFromValue, NumberFromString, etc.).
+          //   2. On failure, fall back to `decode → encode` — `decode` is
+          //      forgiving for Schema.Class (lifts plain objects to
+          //      instances) and the substituted date/Redacted transforms
+          //      tolerate either form. The subsequent `encode` produces
+          //      the canonical wire shape.
+          const encodedInput = yield* encodeOrDecodeEncode(
+            schemas.inputSchema as Schema.Codec<any>,
+            input,
+            entityType,
+            "put",
           )
 
-          // Compose all keys BEFORE ref hydration (ID fields are still present)
-          const keys = composeAllKeys(decodedInput as globalThis.Record<string, unknown>)
+          // Compose all keys from the encoded input (ID fields still present
+          // and key composites are wire-format strings/numbers).
+          const keys = composeAllKeys(encodedInput as globalThis.Record<string, unknown>)
 
           // Hydrate refs: replace ID fields with full entity domain data
-          const decoded = hasRefs
-            ? yield* hydrateRefs(decodedInput as globalThis.Record<string, unknown>)
-            : decodedInput
+          const encoded: globalThis.Record<string, unknown> = hasRefs
+            ? yield* hydrateRefs(encodedInput as globalThis.Record<string, unknown>)
+            : (encodedInput as globalThis.Record<string, unknown>)
 
-          // Build the DynamoDB item
-          const item: globalThis.Record<string, unknown> = { ...decoded }
+          // Build the DynamoDB item — already in wire-format after encode
+          const item: globalThis.Record<string, unknown> = { ...encoded }
 
           // Add system fields. When a timestamp field collides with a
           // model-declared field, the user may have supplied their own value
-          // (see `inputDecodeSchema` — optional on collision). Respect their
-          // value if present; otherwise generate. In the collision path the
-          // value is a DOMAIN value (DateTime.Utc / Date / ...) so it flows
-          // through `serializeDateFields` downstream. Non-colliding fields
-          // get a storage primitive directly (no `serializeDateFields` pass).
+          // (optional on collision in `inputSchema`). Respect their value if
+          // present (already encoded to wire); otherwise generate a wire
+          // primitive directly.
           if (systemFields.createdAt) {
             if (item[systemFields.createdAt] === undefined) {
-              item[systemFields.createdAt] =
-                systemFields.createdAtCollision && systemFields.createdAtEncoding
-                  ? generateDomainTimestamp(systemFields.createdAtEncoding)
-                  : generateTimestamp(systemFields.createdAtEncoding)
+              item[systemFields.createdAt] = generateTimestamp(systemFields.createdAtEncoding)
             }
           }
           if (systemFields.updatedAt) {
             if (item[systemFields.updatedAt] === undefined) {
-              item[systemFields.updatedAt] =
-                systemFields.updatedAtCollision && systemFields.updatedAtEncoding
-                  ? generateDomainTimestamp(systemFields.updatedAtEncoding)
-                  : generateTimestamp(systemFields.updatedAtEncoding)
+              item[systemFields.updatedAt] = generateTimestamp(systemFields.updatedAtEncoding)
             }
           }
           if (systemFields.version) item[systemFields.version] = 1
@@ -2156,8 +2141,6 @@ const makeImpl = <
           // Apply composed keys
           Object.assign(item, keys)
 
-          // Convert date fields from domain values to storage primitives
-          serializeDateFields(item)
           // Rename domain fields to DynamoDB attribute names
           renameToDynamo(item)
 
@@ -2207,7 +2190,7 @@ const makeImpl = <
                   entityType,
                   constraintName,
                   constraintDef,
-                  decoded as globalThis.Record<string, unknown>,
+                  encoded as globalThis.Record<string, unknown>,
                 )
                 if (!sentinel) continue
                 sentinelConstraints.push(constraintName)
@@ -2259,7 +2242,7 @@ const makeImpl = <
                         if (opts.condition && reasons[0]?.Code === "ConditionalCheckFailed") {
                           return new ConditionalCheckFailed({
                             entityType,
-                            key: decoded,
+                            key: encoded as globalThis.Record<string, unknown>,
                           })
                         }
                         // Sentinel items start at index 1, in the order recorded in
@@ -2273,7 +2256,7 @@ const makeImpl = <
                               : []
                             const fieldsRecord: globalThis.Record<string, string> = {}
                             for (const f of uniqueFields) {
-                              const v = decoded[f]
+                              const v = (encoded as globalThis.Record<string, unknown>)[f]
                               if (v !== undefined && v !== null) {
                                 fieldsRecord[f] = KeyComposer.serializeValue(v)
                               }
@@ -2313,7 +2296,10 @@ const makeImpl = <
             yield* client.putItem(putInput).pipe(
               Effect.mapError((err): DynamoClientError | ConditionalCheckFailed => {
                 if (opts.condition && isAwsConditionalCheckFailed(err.cause)) {
-                  return new ConditionalCheckFailed({ entityType, key: decoded })
+                  return new ConditionalCheckFailed({
+                    entityType,
+                    key: encoded as globalThis.Record<string, unknown>,
+                  })
                 }
                 return err
               }),
@@ -2449,27 +2435,21 @@ const makeImpl = <
             ),
           )
 
-          // Decode updates
-          const decodedUpdates = yield* Schema.decodeUnknownEffect(
-            schemas.updateDecodeSchema as Schema.Codec<any>,
-          )(updates ?? {}).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ValidationError({
-                  entityType,
-                  operation: "update.decodeUpdates",
-                  cause,
-                }),
-            ),
+          // Encode update payload → wire form (see `put` for the strategy).
+          const encodedUpdates = yield* encodeOrDecodeEncode(
+            schemas.updateSchema as Schema.Codec<any>,
+            updates ?? {},
+            entityType,
+            "update",
           )
 
           // Hydrate refs in updates: for any ${field}Id present, fetch and embed
-          let hydratedUpdates = decodedUpdates as globalThis.Record<string, unknown>
+          let hydratedUpdates = encodedUpdates as globalThis.Record<string, unknown>
           if (hasRefs) {
             const refsToHydrate = resolvedRefs.filter(
               (ref) =>
-                ref.idFieldName in (decodedUpdates as globalThis.Record<string, unknown>) &&
-                (decodedUpdates as globalThis.Record<string, unknown>)[ref.idFieldName] !==
+                ref.idFieldName in (encodedUpdates as globalThis.Record<string, unknown>) &&
+                (encodedUpdates as globalThis.Record<string, unknown>)[ref.idFieldName] !==
                   undefined,
             )
             if (refsToHydrate.length > 0) {
@@ -2530,25 +2510,19 @@ const makeImpl = <
             }
 
             // Build new item: merge current + updates + rich ops + recompose keys.
-            //
-            // Pre-serialize domain date values from `hydratedUpdates` (decoded
-            // via `fromSelf`, so DateTime.Utc / Date instances) into storage
-            // primitives BEFORE merging into `newItem`. `currentRaw` is already
-            // storage-primitive (it came straight from `fromAttributeMap`), so
-            // we need both halves in the same shape — otherwise the final
-            // `toAttributeMap(newItem)` marshals the DateTime class instances
-            // as DynamoDB Maps (via AWS SDK's `convertClassInstanceToMap`),
-            // which corrupts the write and makes subsequent reads fail to
-            // decode.
-            const serializedRetainUpdates = {
-              ...(hydratedUpdates as globalThis.Record<string, unknown>),
-            }
-            serializeDateFields(serializedRetainUpdates)
-
-            const newItem: globalThis.Record<string, unknown> = {
+            // `currentRaw` uses DynamoDB attribute names (e.g. `dn`, `hd`);
+            // `hydratedUpdates` uses domain names. To avoid the merge leaving
+            // both names (which would later have the rename clobber the user's
+            // value), translate the current item's keys to domain names first
+            // so the spread + assign overlay cleanly.
+            const currentDomainItem = {
               ...(currentRaw as globalThis.Record<string, unknown>),
             }
-            for (const [attr, val] of Object.entries(serializedRetainUpdates)) {
+            renameFromDynamo(currentDomainItem)
+            const newItem: globalThis.Record<string, unknown> = { ...currentDomainItem }
+            for (const [attr, val] of Object.entries(
+              hydratedUpdates as globalThis.Record<string, unknown>,
+            )) {
               if (val !== undefined) newItem[attr] = val
             }
 
@@ -2587,25 +2561,23 @@ const makeImpl = <
 
             // Increment version and update timestamp. If the caller supplied a
             // value for `updatedAt` (allowed when the field collides with a
-            // model-declared field), respect it; else generate. Read from the
-            // pre-serialized map so both branches produce a storage primitive
-            // (ISO string / epoch number) — not a domain DateTime instance.
+            // model-declared field), respect it (already wire-form via encode);
+            // else generate a fresh wire primitive.
             const newVersion = currentVersion + 1
             if (systemFields.version) newItem[systemFields.version] = newVersion
             if (systemFields.updatedAt) {
-              const userSupplied = serializedRetainUpdates[systemFields.updatedAt]
+              const userSupplied = (hydratedUpdates as globalThis.Record<string, unknown>)[
+                systemFields.updatedAt
+              ]
               newItem[systemFields.updatedAt] =
                 userSupplied !== undefined
                   ? userSupplied
                   : generateTimestamp(systemFields.updatedAtEncoding)
             }
 
-            // Convert DynamoDB attribute names to domain names for key composition
-            // and sentinel value comparison (newItem was built from currentRaw which
-            // uses DynamoDB names; composites and unique fields use domain names)
-            renameFromDynamo(newItem)
-
-            // Recompose all keys with updated attributes
+            // `newItem` is already in domain names (the merge built it from
+            // `currentDomainItem` + domain-keyed updates) — no rename needed
+            // here. Recompose all keys with the updated attributes.
             const newKeys = composeAllKeys(newItem)
             Object.assign(newItem, newKeys)
 
@@ -2851,20 +2823,19 @@ const makeImpl = <
           const values: globalThis.Record<string, AttributeValue> = {}
           let counter = 0
 
-          // Serialize any domain-value date fields in updates to storage primitives.
-          // Without this, a `.set({ occurredAt: DateTime.Utc })` would marshal as a
-          // class-instance map.
-          const serializedUpdates = { ...hydratedUpdates } as globalThis.Record<string, unknown>
-          serializeDateFields(serializedUpdates)
+          // `hydratedUpdates` was produced by `Schema.encode(updateSchema)` and
+          // is already in wire-format (ISO string / epoch number / etc.). Use
+          // it directly — no `serializeDateFields` pass required.
+          const encodedUpdatesMap = hydratedUpdates as globalThis.Record<string, unknown>
 
           // System-colliding updatedAt is handled by the system-field block below.
-          // createdAt and version are already excluded by `updateDecodeSchema`.
+          // createdAt and version are already excluded by `updateSchema`.
           const updateSystemColliders = new Set<string>()
           if (systemFields.updatedAtCollision && systemFields.updatedAt)
             updateSystemColliders.add(systemFields.updatedAt)
 
           // Add user-provided updates
-          for (const [attr, val] of Object.entries(serializedUpdates)) {
+          for (const [attr, val] of Object.entries(encodedUpdatesMap)) {
             if (val === undefined) continue
             if (updateSystemColliders.has(attr)) continue
             const nameKey = `#u${counter}`
@@ -2875,10 +2846,11 @@ const makeImpl = <
             counter++
           }
 
-          // Add updatedAt timestamp. User-supplied value wins (pre-serialized
-          // above); else fall back to a freshly generated storage primitive.
+          // Add updatedAt timestamp. User-supplied value wins (already in wire
+          // form via encode); else fall back to a freshly generated wire
+          // primitive.
           if (systemFields.updatedAt) {
-            const userSupplied = serializedUpdates[systemFields.updatedAt]
+            const userSupplied = encodedUpdatesMap[systemFields.updatedAt]
             const nameKey = `#u${counter}`
             const valKey = `:u${counter}`
             names[nameKey] = systemFields.updatedAt
@@ -3437,26 +3409,20 @@ const makeImpl = <
           const client = yield* DynamoClient
           const { name: tableName } = yield* tableTag
 
-          // Decode input
-          const decodedInput = yield* Schema.decodeUnknownEffect(
-            schemas.inputDecodeSchema as Schema.Codec<any>,
-          )(input).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ValidationError({
-                  entityType,
-                  operation: "upsert.decode",
-                  cause,
-                }),
-            ),
+          // Encode user input → wire form (see `put` for strategy).
+          const encodedInput = yield* encodeOrDecodeEncode(
+            schemas.inputSchema as Schema.Codec<any>,
+            input,
+            entityType,
+            "upsert",
           )
 
           // Hydrate refs: replace ID fields with full entity domain data
-          const decoded = hasRefs
-            ? yield* hydrateRefs(decodedInput as globalThis.Record<string, unknown>)
-            : decodedInput
+          const encoded = hasRefs
+            ? yield* hydrateRefs(encodedInput as globalThis.Record<string, unknown>)
+            : encodedInput
 
-          const item = decoded as globalThis.Record<string, unknown>
+          const item = encoded as globalThis.Record<string, unknown>
 
           // Compose primary key
           const primaryKey = composePrimaryKey(item)
@@ -3481,10 +3447,7 @@ const makeImpl = <
           if (systemFields.versionCollision && systemFields.version)
             systemColliders.add(systemFields.version)
 
-          // Serialize date fields on the decoded item
-          if (hasDateFields) {
-            serializeDateFields(item)
-          }
+          // `item` is already in wire-form via `Schema.encode(inputSchema)`.
 
           // All model fields (excluding PK composites, which are in the Key)
           for (const [attr, val] of Object.entries(item)) {
@@ -3650,33 +3613,26 @@ const makeImpl = <
       const ttlDuration = timeSeriesConfig.ttl
       const appendInputSchema = schemas.appendInputSchema as Schema.Codec<any>
 
-      // Decode input via appendInputSchema
-      const decodedInput = yield* Schema.decodeUnknownEffect(appendInputSchema)(input).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ValidationError({
-              entityType,
-              operation: "append.decode",
-              cause,
-            }),
-        ),
+      // Encode user input via appendInputSchema (see `put` for strategy).
+      const encodedInput = yield* encodeOrDecodeEncode(
+        appendInputSchema,
+        input,
+        entityType,
+        "append",
       )
-      const decoded = decodedInput as globalThis.Record<string, unknown>
+      const encoded = encodedInput as globalThis.Record<string, unknown>
 
-      // Compose current-item primary key (pk + sk derived from PK/SK composites in decoded)
+      // Compose current-item primary key (pk + sk derived from PK/SK composites)
       const primary = config.indexes.primary
-      const pkValue = KeyComposer.composePk(schema, entityType, primary, decoded)
-      const currentSk = KeyComposer.composeSk(schema, entityType, entityVersion, primary, decoded)
+      const pkValue = KeyComposer.composePk(schema, entityType, primary, encoded)
+      const currentSk = KeyComposer.composeSk(schema, entityType, entityVersion, primary, encoded)
       const marshalledKey = toAttributeMap({
         [primary.pk.field]: pkValue,
         [primary.sk.field]: currentSk,
       })
 
-      // Prepare domain-serialised values for the item build.
-      // Build a shallow copy and apply date serialization (per fieldEncodings)
-      // before marshalling. This mirrors the put path.
-      const serialisedInput: globalThis.Record<string, unknown> = { ...decoded }
-      serializeDateFields(serialisedInput)
+      // `encoded` is already in wire-form via Schema.encode — used directly.
+      const serialisedInput: globalThis.Record<string, unknown> = { ...encoded }
 
       // ---------- Build UpdateItem (scoped SET + CAS) ----------
       const setClauses: Array<string> = []
@@ -3707,7 +3663,7 @@ const makeImpl = <
       // never change during an append. Non-PK composites in appendInput that
       // overlap a GSI's composites trigger per-GSI resolution via indexPolicy.
       const nonPkAppendFields: globalThis.Record<string, unknown> = {}
-      for (const [attr, val] of Object.entries(decoded)) {
+      for (const [attr, val] of Object.entries(encoded)) {
         if (!pkCompositeSet.has(attr)) {
           nonPkAppendFields[attr] = val
         }
@@ -3754,7 +3710,7 @@ const makeImpl = <
         entityVersion,
         policyAwareIndexes,
         nonPkAppendFields,
-        decoded,
+        encoded,
       )
       for (const [field, value] of Object.entries(gsiUpdate.sets)) {
         const nameKey = `#a${counter}`
@@ -3819,9 +3775,9 @@ const makeImpl = <
 
       // ---------- Build Put of event item ----------
       const eventSk = KeyComposer.composeEventSk(currentSk, newObValue, schema.casing)
-      const eventItem: globalThis.Record<string, unknown> = { ...decoded }
-      // Serialise date fields to storage format for the Put
-      serializeDateFields(eventItem)
+      // `encoded` is already in wire-form via Schema.encode; no extra
+      // serialisation step is required for the Put.
+      const eventItem: globalThis.Record<string, unknown> = { ...encoded }
       // Rename domain → DB names for the Put (matches put path)
       renameToDynamo(eventItem)
       // pk + sk (event)
@@ -3935,7 +3891,6 @@ const makeImpl = <
 
     const decodeHistory = (raw: globalThis.Record<string, unknown>) => {
       renameFromDynamo(raw)
-      deserializeDateFields(raw)
       return Schema.decodeUnknownEffect(schemas.historyRecordSchema as Schema.Codec<any>)(raw).pipe(
         Effect.map(attachPrototype),
         Effect.mapError(
@@ -4601,9 +4556,8 @@ const makeImpl = <
     identifier: resolvedIdentifier as ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
     timeSeries: config.timeSeries as TTimeSeries,
     _resolvedRefs: resolvedRefs,
-    /** @internal Full decode pipeline: rename + date deser + schema decode. Used by Batch/Aggregate. */
+    /** @internal Full decode pipeline: rename + schema decode. Used by Batch/Aggregate. */
     _decodeRecord: decodeRecord,
-    _serializeDateFields: serializeDateFields,
     _attachPrototype: attachPrototype,
     _configure: (
       injectedSchema: DynamoSchema.DynamoSchema,

@@ -16,7 +16,9 @@ class Employee extends Schema.Class<Employee>("Employee")({
   email: Schema.String,
   displayName: Schema.NonEmptyString,
   department: Schema.String,
-  hireDate: Schema.DateTimeUtcFromString,
+  // Self schema — wire format chosen by the storage override below
+  // (transforms paired with `storedAs` are rejected at Entity.make time).
+  hireDate: Schema.DateTimeUtc,
   createdBy: Schema.String,
 }) {}
 ```
@@ -64,7 +66,7 @@ const EmployeeModel = DynamoModel.configure(Employee, {
 
 ### Storage Encoding
 
-Override how a field is stored in DynamoDB, independent of its wire format. The domain type must match (enforced at compile time):
+Override how a field is stored in DynamoDB. The domain type must match (enforced at compile time):
 
 ```typescript
 const EmployeeModel = DynamoModel.configure(Employee, {
@@ -74,6 +76,17 @@ const EmployeeModel = DynamoModel.configure(Employee, {
 ```
 
 Available date schemas: `DynamoModel.DateString` (ISO), `DynamoModel.DateEpochMs`, `DynamoModel.DateEpochSeconds`, `DynamoModel.DateTimeZoned`. See [Advanced](/effect-dynamodb/guides/advanced/) for the full date schema reference.
+
+#### Self schemas vs. transforms
+
+**Storage overrides only apply to self date schemas.** If you declared a transform schema (e.g. `Schema.DateTimeUtcFromString`), that transform IS the wire format — `storedAs` and other `DynamoEncoding` annotations are rejected at `Entity.make()` time. The two configuration paths are mutually exclusive: either declare a self schema (`Schema.DateTimeUtc`) and let the annotation drive storage, OR declare a transform and own the wire format yourself.
+
+| Pattern | Domain type | Wire format source |
+|---|---|---|
+| Self + annotation | `Schema.DateTimeUtc` | `storedAs` (configure) or `pipe(DynamoModel.storedAs(...))` annotation — `string` (default), `epochMs`, or `epochSeconds` |
+| Transform | `Schema.DateTimeUtcFromString`, `DynamoModel.DateString`, `DynamoModel.DateEpochSeconds`, … | The transform itself — `storedAs` is rejected |
+
+Applying `storedAs(DynamoModel.DateEpochSeconds)` on top of `Schema.DateTimeUtcFromString` (which already encodes to a string) used to silently override the transform's wire format. After the codec direction fix in v1.4, this combination raises a clear error at `Entity.make()` time. Migrate to a self schema (`Schema.DateTimeUtc.pipe(DynamoModel.storedAs(...))`) or drop the override.
 
 ### Immutable Fields
 
