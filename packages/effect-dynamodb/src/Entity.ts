@@ -3412,13 +3412,16 @@ const makeImpl = <
           }
           const conditionExpression = condParts.length > 0 ? condParts.join(" AND ") : undefined
 
+          // DynamoDB rejects an empty `ExpressionAttributeValues` map. When
+          // the UpdateExpression is REMOVE-only (e.g. clearMap with no other
+          // combinators), `values` may be empty — omit the property entirely.
           const result = yield* client
             .updateItem({
               TableName: tableName,
               Key: marshalledKey,
               UpdateExpression: updateExpression,
               ExpressionAttributeNames: names,
-              ExpressionAttributeValues: values,
+              ExpressionAttributeValues: Object.keys(values).length > 0 ? values : undefined,
               ConditionExpression: conditionExpression,
               ReturnValues: returnValuesMap[uState.returnValues ?? "allNew"],
             })
@@ -4346,6 +4349,11 @@ const makeImpl = <
     const prefix = KeyComposer.composeEventSkPrefix(currentSk, schema.casing)
 
     const decodeHistory = (raw: globalThis.Record<string, unknown>) => {
+      // Sparse fields are aggregate state, not event state — event items DO
+      // NOT carry `<prefix>#*` attributes. `deserializeSparseFields` populates
+      // empty `{}` Records under the domain field names so the historyRecord
+      // schema (which still includes the sparse Record fields) decodes.
+      deserializeSparseFields(raw)
       renameFromDynamo(raw)
       return Schema.decodeUnknownEffect(schemas.historyRecordSchema as Schema.Codec<any>)(raw).pipe(
         Effect.map(attachPrototype),
@@ -4550,6 +4558,11 @@ const makeImpl = <
           // Soft-deleted items have GSI keys stripped — always use deletedRecordSchema
           // (itemSchema would fail because it expects GSI key fields that aren't present)
           if (mode === "native") return result.Items[0]!
+          // Sparse Map fields: rebuild domain Records from flattened attrs so
+          // soft-deleted items decode correctly. Sparse data is preserved
+          // verbatim across soft-delete (GSI keys are stripped, sparse data is
+          // not).
+          deserializeSparseFields(raw)
           const targetSchema = schemas.deletedRecordSchema
           return yield* Schema.decodeUnknownEffect(targetSchema as Schema.Codec<any>)(raw).pipe(
             Effect.map(attachPrototype),
@@ -4573,8 +4586,11 @@ const makeImpl = <
     const pkValue = KeyComposer.composePk(schema, entityType, primary, decodedKey)
     const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
 
-    const decodeDeleted = (raw: globalThis.Record<string, unknown>) =>
-      Schema.decodeUnknownEffect(schemas.deletedRecordSchema as Schema.Codec<any>)(raw).pipe(
+    const decodeDeleted = (raw: globalThis.Record<string, unknown>) => {
+      // Sparse fields are domain data and are preserved across soft-delete.
+      // Rebuild Records from flattened attrs before schema decode.
+      deserializeSparseFields(raw)
+      return Schema.decodeUnknownEffect(schemas.deletedRecordSchema as Schema.Codec<any>)(raw).pipe(
         Effect.map(attachPrototype),
         Effect.mapError(
           (cause) =>
@@ -4585,6 +4601,7 @@ const makeImpl = <
             }),
         ),
       )
+    }
 
     return Query.make({
       tableName: "",

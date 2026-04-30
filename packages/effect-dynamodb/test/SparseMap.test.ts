@@ -868,8 +868,10 @@ describe("SparseMap — time-series interaction", () => {
         }) as Effect.Effect<any, any, any>
       }).pipe(Effect.provide(TMLayers, { local: true })),
     )
-    expect(r.applied).toBe(true)
-    // The current item carries the sparse field as a domain Record.
+    // Stale-as-error contract: success returns `{ current }` directly with the
+    // domain-shaped model. The current item carries the sparse field as a
+    // rebuilt domain Record.
+    expect(r.current).toBeDefined()
     expect(r.current.counters).toEqual({ hits: 100 })
 
     // Inspect the event-item Put: must NOT carry counters or counters#*.
