@@ -63,8 +63,8 @@ class Page extends Schema.Class<Page>("Page")({
 }) {}
 
 const PageModel = DynamoModel.configure(Page, {
-  totals: { storedAs: "sparse" },
-  metrics: { storedAs: "sparse" },
+  totals: { storedAs: DynamoModel.SparseMap() },
+  metrics: { storedAs: DynamoModel.SparseMap() },
 })
 
 const Pages = Entity.make({
@@ -104,7 +104,7 @@ class Telemetry extends Schema.Class<Telemetry>("Telemetry")({
 }) {}
 
 const TelemetryModel = DynamoModel.configure(Telemetry, {
-  counters: { storedAs: "sparse" },
+  counters: { storedAs: DynamoModel.SparseMap() },
 })
 
 const Telemetries = Entity.make({

@@ -7,6 +7,8 @@
  * - `DynamoEncoding` annotation — controls how date fields are stored in DynamoDB
  * - Date schemas — wire ↔ domain ↔ storage transformations for DateTime.Utc, DateTime.Zoned, Date
  * - `storedAs` modifier — overrides DynamoDB storage format via annotation
+ * - `SparseMap()` — opt a `Schema.Record` field into flattened storage (one
+ *                   top-level attribute per entry)
  *
  * See docs/design-dynamo-model.md for the three-layer model (wire → domain → storage).
  */
@@ -492,16 +494,66 @@ export const ConfiguredModelTag: unique symbol = Symbol.for("effect-dynamodb/Con
 
 /**
  * Sparse-map configuration carried on a `ConfiguredModel` attribute when the
- * field is marked `storedAs: 'sparse'`.
+ * field is marked `storedAs: DynamoModel.SparseMap()`.
  *
  * - `prefix` — top-level attribute name prefix; defaults to the model field name.
  *   Each Record entry is stored as a separate top-level attribute named
- *   `<prefix>#<key>`. The default prefix can be overridden via the
- *   `prefix` option to `configure()`.
+ *   `<prefix>#<key>`. The default prefix can be overridden by passing
+ *   `{ prefix }` to {@link SparseMap}.
  */
 export interface SparseConfig {
   readonly prefix: string
 }
+
+/** Brand symbol identifying a {@link SparseMapConfig} produced by {@link SparseMap}. */
+const SparseMapTag: unique symbol = Symbol.for("effect-dynamodb/SparseMap")
+
+/**
+ * Typed config object returned by {@link SparseMap}. Pass as the `storedAs`
+ * value on a `Schema.Record` field in {@link configure} to opt into sparse
+ * map storage — each Record entry is flattened into a top-level DynamoDB
+ * attribute named `<prefix>#<key>`.
+ */
+export interface SparseMapConfig {
+  readonly [SparseMapTag]: true
+  readonly prefix?: string | undefined
+}
+
+/**
+ * Opt a `Schema.Record` field into sparse map storage.
+ *
+ * Each Record entry becomes an independently addressable top-level DynamoDB
+ * attribute (`<prefix>#<key>`) — concurrent writers to disjoint buckets
+ * never race, counters can `ADD` on a fresh item with no parent-map dance,
+ * and `attribute_exists`/`attribute_not_exists` work natively per entry.
+ *
+ * @example
+ * ```ts
+ * DynamoModel.configure(Page, {
+ *   metrics: { storedAs: DynamoModel.SparseMap() },
+ *   totals:  { storedAs: DynamoModel.SparseMap({ prefix: "t" }) },
+ * })
+ * ```
+ *
+ * @param options.prefix - Override the top-level attribute name prefix.
+ *   Defaults to the model field name. Distinct sparse fields on the same
+ *   entity must have distinct prefixes (EDD-9023).
+ *
+ * See `DESIGN.md §7.5 Sparse Map Storage`.
+ */
+export const SparseMap = (options?: { readonly prefix?: string | undefined }): SparseMapConfig => {
+  const cfg: SparseMapConfig = { [SparseMapTag]: true }
+  if (options?.prefix !== undefined) {
+    return { ...cfg, prefix: options.prefix }
+  }
+  return cfg
+}
+
+/** Type guard — returns true iff `value` is a {@link SparseMapConfig}. */
+export const isSparseMapConfig = (value: unknown): value is SparseMapConfig =>
+  typeof value === "object" &&
+  value !== null &&
+  (value as globalThis.Record<symbol, unknown>)[SparseMapTag] === true
 
 /**
  * A model wrapped with DynamoDB-specific attribute overrides.
@@ -509,8 +561,9 @@ export interface SparseConfig {
  * Carries the original model plus per-field configuration:
  * - `field` — rename domain field → DynamoDB attribute name
  * - `storedAs` — override DynamoDB storage encoding (resolved to DynamoEncoding)
- *               OR `'sparse'` to flatten a `Schema.Record` field into per-entry
- *               top-level attributes (see {@link SparseConfig}).
+ *               OR a {@link SparseMapConfig} (via {@link SparseMap}) to
+ *               flatten a `Schema.Record` field into per-entry top-level
+ *               attributes (see {@link SparseConfig}).
  * - `immutable` — mark field as read-only after creation (excluded from Entity.Update)
  * - `identifier` — mark field as the identity field for ref resolution
  * - `ref` — mark field as a denormalized reference to another entity
@@ -552,7 +605,7 @@ export const isConfiguredModel = (value: unknown): value is ConfiguredModel<Sche
 
 /**
  * Resolve sparse-map configuration for every field on a model that is marked
- * `storedAs: 'sparse'` via {@link configure}.
+ * `storedAs: DynamoModel.SparseMap()` via {@link configure}.
  *
  * Returns `Record<fieldName, SparseConfig>`. Empty when no sparse fields are
  * configured.
@@ -617,20 +670,22 @@ export const isRecordAst = (valueAst: unknown): boolean => {
 /**
  * Attribute override for a single field in `DynamoModel.configure`.
  *
- * - `field` — Rename the domain field to a different DynamoDB attribute name
+ * - `field` — Rename the domain field to a different DynamoDB attribute name.
  * - `storedAs` — Override DynamoDB storage format via a DynamoModel date schema,
- *                or `'sparse'` to flatten a `Schema.Record` into per-entry
- *                top-level attributes (see {@link SparseConfig}).
- * - `prefix` — Top-level attribute name prefix when `storedAs: 'sparse'`.
- *               Defaults to the model field name.
- * - `immutable` — Mark as read-only after creation (excluded from Entity.Update)
- * - `identifier` — Mark as the identity field for ref resolution
- * - `ref` — Mark as a denormalized reference field
+ *                or {@link SparseMap}() to flatten a `Schema.Record` into
+ *                per-entry top-level attributes (see {@link SparseConfig}).
+ * - `immutable` — Mark as read-only after creation (excluded from Entity.Update).
+ * - `identifier` — Mark as the identity field for ref resolution.
+ * - `ref` — Mark as a denormalized reference field.
+ *
+ * Note: the `prefix` option moved into the {@link SparseMap} config in 1.6 —
+ * pass `storedAs: DynamoModel.SparseMap({ prefix })` instead of declaring
+ * `prefix` as a sibling here. The sibling form had no meaning for non-sparse
+ * `storedAs` values and was a footgun.
  */
 type AttributeConfig<A> = {
   readonly field?: string
-  readonly storedAs?: Schema.Schema<A> | "sparse"
-  readonly prefix?: string
+  readonly storedAs?: Schema.Schema<A> | SparseMapConfig
   readonly immutable?: boolean
   readonly identifier?: boolean
   readonly ref?: boolean
@@ -695,10 +750,7 @@ export const configure = <M extends Schema.Top, const A extends ConfigureAttribu
     }
   > = {}
   for (const [key, config] of Object.entries(
-    attributes as globalThis.Record<
-      string,
-      AttributeConfig<unknown> & { readonly prefix?: string }
-    >,
+    attributes as globalThis.Record<string, AttributeConfig<unknown>>,
   )) {
     const entry: {
       field?: string
@@ -712,13 +764,13 @@ export const configure = <M extends Schema.Top, const A extends ConfigureAttribu
     if (config.immutable) entry.immutable = true
     if (config.identifier) entry.identifier = true
     if (config.ref) entry.ref = true
-    if (config.storedAs === "sparse") {
+    if (isSparseMapConfig(config.storedAs)) {
       // Sparse Map storage: each entry is stored as a top-level attribute named
       // `<prefix>#<key>`. Validation that the field is a Schema.Record happens
       // at Entity.make() time (EDD-9020) — configure() can't introspect the
       // model's schema field types reliably without committing to a single
       // representation, so we keep configure() permissive and defer enforcement.
-      const prefix = config.prefix ?? key
+      const prefix = config.storedAs.prefix ?? key
       if (typeof prefix !== "string" || prefix.length === 0) {
         throw new Error(
           `DynamoModel.configure: sparse field "${key}" must have a non-empty string prefix`,

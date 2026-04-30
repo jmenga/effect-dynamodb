@@ -2,7 +2,7 @@
  * Unit tests for the SparseMap storage primitive.
  *
  * Covers:
- *   - Configuration parsing (configure with storedAs: 'sparse')
+ *   - Configuration parsing (configure with storedAs: DynamoModel.SparseMap())
  *   - Entity.make() validation (EDD-9020..9023)
  *   - Marshaller encode/decode round-trip
  *   - Record-style writes (whole-bucket replace)
@@ -42,8 +42,8 @@ class Page extends Schema.Class<Page>("Page")({
 }) {}
 
 const PageModel = DynamoModel.configure(Page, {
-  metrics: { storedAs: "sparse" },
-  totals: { storedAs: "sparse" },
+  metrics: { storedAs: DynamoModel.SparseMap() },
+  totals: { storedAs: DynamoModel.SparseMap() },
 })
 
 // ---------------------------------------------------------------------------
@@ -64,7 +64,7 @@ describe("SparseMap — configuration", () => {
       metrics: Schema.Record(Schema.String, Schema.Number),
     }) {}
     const M = DynamoModel.configure(P, {
-      metrics: { storedAs: "sparse", prefix: "m" },
+      metrics: { storedAs: DynamoModel.SparseMap({ prefix: "m" }) },
     })
     const sparse = DynamoModel.getSparseFields(M as unknown as Schema.Top)
     expect(sparse.metrics).toEqual({ prefix: "m" })
@@ -77,7 +77,7 @@ describe("SparseMap — configuration", () => {
     }) {}
     expect(() =>
       DynamoModel.configure(P, {
-        metrics: { storedAs: "sparse", prefix: "" },
+        metrics: { storedAs: DynamoModel.SparseMap({ prefix: "" }) },
       }),
     ).toThrow(/non-empty/)
   })
@@ -89,7 +89,7 @@ describe("SparseMap — configuration", () => {
     }) {}
     expect(() =>
       DynamoModel.configure(P, {
-        metrics: { storedAs: "sparse", prefix: "bad#prefix" },
+        metrics: { storedAs: DynamoModel.SparseMap({ prefix: "bad#prefix" }) },
       }),
     ).toThrow(/must not contain '#'/)
   })
@@ -100,15 +100,15 @@ describe("SparseMap — configuration", () => {
 // ---------------------------------------------------------------------------
 
 describe("SparseMap — Entity.make() validation", () => {
-  it("EDD-9020: storedAs: 'sparse' rejected on non-Record fields", () => {
+  it("EDD-9020: storedAs: DynamoModel.SparseMap() rejected on non-Record fields", () => {
     class Bad extends Schema.Class<Bad>("Bad")({
       id: Schema.String,
       notARecord: Schema.String,
     }) {}
     const Configured = DynamoModel.configure(Bad, {
-      // Cast — at configure time we accept the literal 'sparse' broadly;
+      // Cast — at configure time we accept the SparseMap config broadly;
       // EDD-9020 fires at Entity.make() time on schema-shape mismatch.
-      notARecord: { storedAs: "sparse" } as any,
+      notARecord: { storedAs: DynamoModel.SparseMap() } as any,
     })
     expect(() =>
       Entity.make({
@@ -128,7 +128,7 @@ describe("SparseMap — Entity.make() validation", () => {
       doubleNested: Schema.Record(Schema.String, Schema.Record(Schema.String, Schema.Number)),
     }) {}
     const Configured = DynamoModel.configure(Nested, {
-      doubleNested: { storedAs: "sparse" },
+      doubleNested: { storedAs: DynamoModel.SparseMap() },
     })
     expect(() =>
       Entity.make({
@@ -148,7 +148,7 @@ describe("SparseMap — Entity.make() validation", () => {
       tags: Schema.Record(Schema.String, Schema.String),
     }) {}
     const Configured = DynamoModel.configure(P, {
-      tags: { storedAs: "sparse" },
+      tags: { storedAs: DynamoModel.SparseMap() },
     })
     expect(() =>
       Entity.make({
@@ -168,7 +168,7 @@ describe("SparseMap — Entity.make() validation", () => {
       tags: Schema.Record(Schema.String, Schema.String),
     }) {}
     const Configured = DynamoModel.configure(P, {
-      tags: { storedAs: "sparse" },
+      tags: { storedAs: DynamoModel.SparseMap() },
     })
     expect(() =>
       Entity.make({
@@ -195,7 +195,7 @@ describe("SparseMap — Entity.make() validation", () => {
       flags: Schema.Record(Schema.String, Schema.Boolean),
     }) {}
     const Configured = DynamoModel.configure(P, {
-      flags: { storedAs: "sparse" },
+      flags: { storedAs: DynamoModel.SparseMap() },
     })
     expect(() =>
       Entity.make({
@@ -217,8 +217,8 @@ describe("SparseMap — Entity.make() validation", () => {
       b: Schema.Record(Schema.String, Schema.Number),
     }) {}
     const Configured = DynamoModel.configure(P, {
-      a: { storedAs: "sparse", prefix: "x" },
-      b: { storedAs: "sparse", prefix: "x" },
+      a: { storedAs: DynamoModel.SparseMap({ prefix: "x" }) },
+      b: { storedAs: DynamoModel.SparseMap({ prefix: "x" }) },
     })
     expect(() =>
       Entity.make({
@@ -239,7 +239,7 @@ describe("SparseMap — Entity.make() validation", () => {
       counts: Schema.Record(Schema.String, Schema.Number),
     }) {}
     const Configured = DynamoModel.configure(P, {
-      counts: { storedAs: "sparse", prefix: "name" },
+      counts: { storedAs: DynamoModel.SparseMap({ prefix: "name" }) },
     })
     expect(() =>
       Entity.make({
@@ -725,7 +725,7 @@ describe("SparseMap — null is not REMOVE", () => {
       name: Schema.optional(Schema.String),
       tags: Schema.optionalKey(Schema.Record(Schema.String, Schema.String)),
     }) {}
-    const PM = DynamoModel.configure(P, { tags: { storedAs: "sparse" } })
+    const PM = DynamoModel.configure(P, { tags: { storedAs: DynamoModel.SparseMap() } })
     const Ent = Entity.make({
       model: PM,
       entityType: "P",
@@ -804,7 +804,7 @@ describe("SparseMap — time-series interaction", () => {
       counters: Schema.Record(Schema.String, Schema.Number),
     }) {}
     const TMModel = DynamoModel.configure(TM, {
-      counters: { storedAs: "sparse" },
+      counters: { storedAs: DynamoModel.SparseMap() },
     })
     const TMSchema = DynamoSchema.make({ name: "tm", version: 1 })
     const Telemetries = Entity.make({
