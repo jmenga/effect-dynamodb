@@ -852,19 +852,36 @@ describe("Entity types — timeSeries", () => {
     expectTypeOf<HasAccountId>().toEqualTypeOf<false>()
   })
 
-  it("append return type is the discriminated union", () => {
+  it("append default-path success type is { current: Model }", () => {
     type AppendFn = TsBound["append"]
-    type R = AppendFn extends (...args: any[]) => import("effect").Effect.Effect<infer A, any, any>
-      ? A
-      : never
-    // Must be the two-branch discriminated union.
-    type SuccessBranch = { readonly applied: true; readonly current: Telemetry }
-    type StaleBranch = {
-      readonly applied: false
-      readonly reason: "stale"
-      readonly current: Telemetry
-    }
-    expectTypeOf<R>().toEqualTypeOf<SuccessBranch | StaleBranch>()
+    type Builder = AppendFn extends (...args: any[]) => infer R ? R : never
+    // BoundAppend.asEffect() yields the success type.
+    type AsEffectFn = Builder extends { readonly asEffect: () => infer E } ? E : never
+    type Success = AsEffectFn extends import("effect").Effect.Effect<infer A, any, any> ? A : never
+
+    type Expected = { readonly current: Telemetry }
+    expectTypeOf<Success>().toEqualTypeOf<Expected>()
+  })
+
+  it("append .skipFollowUp() narrows success to void", () => {
+    type AppendFn = TsBound["append"]
+    type Builder = AppendFn extends (...args: any[]) => infer R ? R : never
+    type Skipped = Builder extends { readonly skipFollowUp: () => infer S } ? S : never
+    type AsEffectFn = Skipped extends { readonly asEffect: () => infer E } ? E : never
+    type Success = AsEffectFn extends import("effect").Effect.Effect<infer A, any, any> ? A : never
+    expectTypeOf<Success>().toEqualTypeOf<void>()
+  })
+
+  it("append errors include StaleAppend on default path", () => {
+    type AppendFn = TsBound["append"]
+    type Builder = AppendFn extends (...args: any[]) => infer R ? R : never
+    type AsEffectFn = Builder extends { readonly asEffect: () => infer E } ? E : never
+    type Errors = AsEffectFn extends import("effect").Effect.Effect<any, infer E, any> ? E : never
+    // Project errors to their `_tag` discriminators and assert StaleAppend
+    // is present.
+    type ErrorTags = Errors extends { readonly _tag: infer T } ? T : never
+    type HasStale = "StaleAppend" extends ErrorTags ? true : false
+    expectTypeOf<HasStale>().toEqualTypeOf<true>()
   })
 
   it(".history() callback `t` has only orderBy keys", () => {

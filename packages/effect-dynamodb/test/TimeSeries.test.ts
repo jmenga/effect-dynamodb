@@ -13,7 +13,7 @@
  */
 
 import { describe, expect, it } from "@effect/vitest"
-import { DateTime, Duration, Effect, Layer, Schema } from "effect"
+import { DateTime, Duration, Effect, Layer, Option, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
@@ -355,7 +355,8 @@ describe("TimeSeries — append payload shape", () => {
       // TTL present
       expect(put.Item._ttl).toBeDefined()
 
-      expect(result.applied).toBe(true)
+      // Stale-as-error contract: success returns `{ current }` directly.
+      expect(result.current).toBeDefined()
     }).pipe(Effect.provide(layer))
   })
 
@@ -388,7 +389,7 @@ describe("TimeSeries — append payload shape", () => {
     }).pipe(Effect.provide(layer))
   })
 
-  it.effect("stale: TransactionCancelled → { applied: false, reason: 'stale' }", () => {
+  it.effect("stale: TransactionCancelled (older orderBy) → fails with StaleAppend", () => {
     const { entity, tableLayer } = buildEntity()
     const layer = Layer.merge(TestDynamoClient, tableLayer)
 
@@ -397,6 +398,7 @@ describe("TimeSeries — append payload shape", () => {
         name: "TransactionCanceledException",
         CancellationReasons: [{ Code: "ConditionalCheckFailed" }, { Code: "None" }],
       })
+      // Stored orderBy is NEWER than attempted → CAS fired.
       mockGetItem.mockResolvedValueOnce({
         Item: {
           pk: { S: "$tsapp#v1#telemetry#c-1#d-7" },
@@ -408,17 +410,277 @@ describe("TimeSeries — append payload shape", () => {
         },
       })
 
-      const result = yield* entity.append({
-        channel: "c-1",
-        deviceId: "d-7",
-        timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+      const result = yield* entity
+        .append({
+          channel: "c-1",
+          deviceId: "d-7",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+        })
+        .pipe(Effect.flip)
+
+      expect(result._tag).toBe("StaleAppend")
+      if (result._tag === "StaleAppend") {
+        expect(result.entityType).toBe("Telemetry")
+        expect(result.orderByField).toBe("timestamp")
+        expect(Option.isSome(result.current)).toBe(true)
+      }
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("stale: equal orderBy (strict <) → fails with StaleAppend", () => {
+    const { entity, tableLayer } = buildEntity()
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      mockTransactWriteItems.mockRejectedValueOnce({
+        name: "TransactionCanceledException",
+        CancellationReasons: [{ Code: "ConditionalCheckFailed" }, { Code: "None" }],
+      })
+      // Stored orderBy is EQUAL to attempted → CAS fired (strict <).
+      mockGetItem.mockResolvedValueOnce({
+        Item: {
+          pk: { S: "$tsapp#v1#telemetry#c-1#d-7" },
+          sk: { S: "$tsapp#v1#telemetry_1" },
+          channel: { S: "c-1" },
+          deviceId: { S: "d-7" },
+          timestamp: { S: "2026-04-22T10:00:00.000Z" },
+          __edd_e__: { S: "Telemetry" },
+        },
       })
 
-      expect(result.applied).toBe(false)
-      if (!result.applied) {
-        expect(result.reason).toBe("stale")
-        expect(result.current).toBeDefined()
-      }
+      const result = yield* entity
+        .append({
+          channel: "c-1",
+          deviceId: "d-7",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+        })
+        .pipe(Effect.flip)
+
+      expect(result._tag).toBe("StaleAppend")
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect(
+    "user-condition rejection (CAS held, stored < attempted) → fails with ConditionalCheckFailed",
+    () => {
+      const { entity, tableLayer } = buildEntity()
+      const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+      return Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce({
+          name: "TransactionCanceledException",
+          CancellationReasons: [{ Code: "ConditionalCheckFailed" }, { Code: "None" }],
+        })
+        // Stored orderBy is OLDER than attempted → CAS would have HELD, so the
+        // user-supplied condition is the only thing that could have rejected.
+        mockGetItem.mockResolvedValueOnce({
+          Item: {
+            pk: { S: "$tsapp#v1#telemetry#c-1#d-7" },
+            sk: { S: "$tsapp#v1#telemetry_1" },
+            channel: { S: "c-1" },
+            deviceId: { S: "d-7" },
+            timestamp: { S: "2026-04-22T09:00:00.000Z" },
+            __edd_e__: { S: "Telemetry" },
+          },
+        })
+
+        const result = yield* (entity as any)
+          .append(
+            {
+              channel: "c-1",
+              deviceId: "d-7",
+              timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+            },
+            // User condition (any plausible shorthand)
+            { eq: { location: "rack-1" } },
+          )
+          .pipe(Effect.flip)
+
+        expect(result._tag).toBe("ConditionalCheckFailed")
+        if (result._tag === "ConditionalCheckFailed") {
+          expect(result.entityType).toBe("Telemetry")
+          expect(Option.isSome(result.current)).toBe(true)
+        }
+      }).pipe(Effect.provide(layer))
+    },
+  )
+
+  it.effect(
+    "stale takes precedence: CAS-fail AND user-condition-fail (stored >= attempted) → StaleAppend",
+    () => {
+      const { entity, tableLayer } = buildEntity()
+      const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+      return Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce({
+          name: "TransactionCanceledException",
+          CancellationReasons: [{ Code: "ConditionalCheckFailed" }, { Code: "None" }],
+        })
+        // Stored orderBy is NEWER than attempted → CAS fired. We don't know if
+        // user-condition would also have rejected; CAS takes precedence.
+        mockGetItem.mockResolvedValueOnce({
+          Item: {
+            pk: { S: "$tsapp#v1#telemetry#c-1#d-7" },
+            sk: { S: "$tsapp#v1#telemetry_1" },
+            channel: { S: "c-1" },
+            deviceId: { S: "d-7" },
+            timestamp: { S: "2026-04-22T12:00:00.000Z" },
+            __edd_e__: { S: "Telemetry" },
+          },
+        })
+
+        const result = yield* (entity as any)
+          .append(
+            {
+              channel: "c-1",
+              deviceId: "d-7",
+              timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+            },
+            { eq: { location: "rack-1" } },
+          )
+          .pipe(Effect.flip)
+
+        expect(result._tag).toBe("StaleAppend")
+      }).pipe(Effect.provide(layer))
+    },
+  )
+
+  it.effect("skipFollowUp on success: returns void, no GetItem issued", () => {
+    const { entity, tableLayer } = buildEntity()
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      mockTransactWriteItems.mockResolvedValueOnce({})
+      // Note: NO mockGetItem.mockResolvedValueOnce — if GetItem is called,
+      // mockGetItem returns undefined and the test will fail differently.
+
+      const result = yield* (entity as any).append(
+        {
+          channel: "c-1",
+          deviceId: "d-7",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+        },
+        undefined,
+        true,
+      )
+
+      expect(result).toBeUndefined()
+      expect(mockGetItem).not.toHaveBeenCalled()
+      expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect(
+    "skipFollowUp on stale: fails with StaleAppend(current=Option.none), no GetItem",
+    () => {
+      const { entity, tableLayer } = buildEntity()
+      const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+      return Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce({
+          name: "TransactionCanceledException",
+          CancellationReasons: [{ Code: "ConditionalCheckFailed" }, { Code: "None" }],
+        })
+
+        const result = yield* (entity as any)
+          .append(
+            {
+              channel: "c-1",
+              deviceId: "d-7",
+              timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+            },
+            undefined,
+            true,
+          )
+          .pipe(Effect.flip)
+
+        expect(result._tag).toBe("StaleAppend")
+        if (result._tag === "StaleAppend") {
+          expect(Option.isNone(result.current)).toBe(true)
+        }
+        expect(mockGetItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(layer))
+    },
+  )
+
+  it.effect(
+    "skipFollowUp on user-condition rejection: also fails with StaleAppend (cannot disambiguate)",
+    () => {
+      const { entity, tableLayer } = buildEntity()
+      const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+      return Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce({
+          name: "TransactionCanceledException",
+          CancellationReasons: [{ Code: "ConditionalCheckFailed" }, { Code: "None" }],
+        })
+
+        const result = yield* (entity as any)
+          .append(
+            {
+              channel: "c-1",
+              deviceId: "d-7",
+              timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+            },
+            { eq: { location: "rack-1" } },
+            true, // skipFollowUp
+          )
+          .pipe(Effect.flip)
+
+        // Without the follow-up GetItem we cannot tell CAS-stale from
+        // user-condition rejection. Both modes collapse to StaleAppend.
+        expect(result._tag).toBe("StaleAppend")
+      }).pipe(Effect.provide(layer))
+    },
+  )
+
+  it.effect(
+    "TTL race / row vanished after success: fails with ValidationError(append.followUp)",
+    () => {
+      const { entity, tableLayer } = buildEntity()
+      const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+      return Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        // Item vanished from the table between transaction and GetItem.
+        mockGetItem.mockResolvedValueOnce({})
+
+        const result = yield* entity
+          .append({
+            channel: "c-1",
+            deviceId: "d-7",
+            timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+          })
+          .pipe(Effect.flip)
+
+        expect(result._tag).toBe("ValidationError")
+        if (result._tag === "ValidationError") {
+          expect(result.operation).toBe("append.followUp")
+        }
+      }).pipe(Effect.provide(layer))
+    },
+  )
+
+  it.effect("TTL race on skipFollowUp path: succeeds silently (undetected)", () => {
+    const { entity, tableLayer } = buildEntity()
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      mockTransactWriteItems.mockResolvedValueOnce({})
+
+      const result = yield* (entity as any).append(
+        {
+          channel: "c-1",
+          deviceId: "d-7",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+        },
+        undefined,
+        true,
+      )
+
+      // No detection on skipFollowUp — GetItem was never issued.
+      expect(result).toBeUndefined()
+      expect(mockGetItem).not.toHaveBeenCalled()
     }).pipe(Effect.provide(layer))
   })
 

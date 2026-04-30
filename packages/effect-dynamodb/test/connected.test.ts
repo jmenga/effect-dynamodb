@@ -13,7 +13,7 @@
  */
 
 import { it } from "@effect/vitest"
-import { DateTime, Duration, Effect, Layer, Schema, Stream } from "effect"
+import { DateTime, Duration, Effect, Layer, Option, Schema, Stream } from "effect"
 import { afterAll, beforeAll, describe, expect } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
@@ -1497,8 +1497,7 @@ describeConnected("timeSeries integration tests", () => {
         timestamp: t1,
         location: "rack-1",
       })
-      expect(r.applied).toBe(true)
-      if (r.applied) expect(r.current.channel).toBe("c-round")
+      expect(r.current.channel).toBe("c-round")
 
       const fetched = yield* db.entities.Telemetries.get({
         channel: "c-round",
@@ -1525,7 +1524,7 @@ describeConnected("timeSeries integration tests", () => {
           deviceId: "d-1",
           timestamp: ts,
         })
-        expect(r.applied).toBe(true)
+        expect(r.current.channel).toBe("c-seq")
       }
 
       const history = yield* db.entities.Telemetries.history({
@@ -1536,7 +1535,7 @@ describeConnected("timeSeries integration tests", () => {
     }).pipe(provideTs),
   )
 
-  it.effect("stale append: older orderBy returns { applied: false, reason: 'stale' }", () =>
+  it.effect("stale append: older orderBy fails with StaleAppend on the error channel", () =>
     Effect.gen(function* () {
       const db = yield* DynamoClient.make({
         entities: { Telemetries },
@@ -1546,20 +1545,24 @@ describeConnected("timeSeries integration tests", () => {
       const newer = DateTime.makeUnsafe("2026-04-22T12:00:00.000Z")
       const older = DateTime.makeUnsafe("2026-04-22T11:00:00.000Z")
 
-      const first = yield* db.entities.Telemetries.append({
+      yield* db.entities.Telemetries.append({
         channel: "c-stale",
         deviceId: "d-1",
         timestamp: newer,
       })
-      expect(first.applied).toBe(true)
 
-      const second = yield* db.entities.Telemetries.append({
+      const result = yield* db.entities.Telemetries.append({
         channel: "c-stale",
         deviceId: "d-1",
         timestamp: older,
       })
-      expect(second.applied).toBe(false)
-      if (!second.applied) expect(second.reason).toBe("stale")
+        .asEffect()
+        .pipe(Effect.flip)
+
+      expect(result._tag).toBe("StaleAppend")
+      if (result._tag === "StaleAppend") {
+        expect(Option.isSome(result.current)).toBe(true)
+      }
 
       const history = yield* db.entities.Telemetries.history({
         channel: "c-stale",
@@ -1569,7 +1572,7 @@ describeConnected("timeSeries integration tests", () => {
     }).pipe(provideTs),
   )
 
-  it.effect("duplicate orderBy is strictly < (second is stale, no dup event)", () =>
+  it.effect("duplicate orderBy is strictly < (second fails with StaleAppend, no dup event)", () =>
     Effect.gen(function* () {
       const db = yield* DynamoClient.make({
         entities: { Telemetries },
@@ -1578,25 +1581,114 @@ describeConnected("timeSeries integration tests", () => {
 
       const same = DateTime.makeUnsafe("2026-04-22T13:00:00.000Z")
 
-      const first = yield* db.entities.Telemetries.append({
+      yield* db.entities.Telemetries.append({
         channel: "c-dup",
         deviceId: "d-1",
         timestamp: same,
       })
-      expect(first.applied).toBe(true)
 
-      const second = yield* db.entities.Telemetries.append({
+      const result = yield* db.entities.Telemetries.append({
         channel: "c-dup",
         deviceId: "d-1",
         timestamp: same,
       })
-      expect(second.applied).toBe(false)
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(result._tag).toBe("StaleAppend")
 
       const history = yield* db.entities.Telemetries.history({
         channel: "c-dup",
         deviceId: "d-1",
       }).collect()
       expect(history).toHaveLength(1)
+    }).pipe(provideTs),
+  )
+
+  it.effect(
+    "user-condition violation (CAS held) fails with ConditionalCheckFailed carrying current",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { Telemetries },
+          tables: { TsTable },
+        })
+
+        // Seed an item with a known location.
+        yield* db.entities.Telemetries.append({
+          channel: "c-cond",
+          deviceId: "d-1",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+          location: "rack-A",
+        })
+
+        // Attempt an append with a NEWER orderBy (CAS would hold) but a
+        // condition that does not match the current.
+        const result = yield* (db.entities.Telemetries.append as any)({
+          channel: "c-cond",
+          deviceId: "d-1",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:01:00.000Z"),
+          location: "rack-B",
+        })
+          .condition({ eq: { location: "rack-Z" } })
+          .asEffect()
+          .pipe(Effect.flip)
+
+        expect(result._tag).toBe("ConditionalCheckFailed")
+        if (result._tag === "ConditionalCheckFailed") {
+          expect(Option.isSome(result.current)).toBe(true)
+        }
+      }).pipe(provideTs),
+  )
+
+  it.effect("skipFollowUp on success: returns void", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Telemetries },
+        tables: { TsTable },
+      })
+
+      const result = yield* db.entities.Telemetries.append({
+        channel: "c-skip",
+        deviceId: "d-1",
+        timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+      }).skipFollowUp()
+      expect(result).toBeUndefined()
+
+      // Round-trip — the row was written even though we didn't read it back.
+      const fetched = yield* db.entities.Telemetries.get({
+        channel: "c-skip",
+        deviceId: "d-1",
+      })
+      expect(fetched.deviceId).toBe("d-1")
+    }).pipe(provideTs),
+  )
+
+  it.effect("skipFollowUp on stale: fails with StaleAppend(current=Option.none)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Telemetries },
+        tables: { TsTable },
+      })
+
+      yield* db.entities.Telemetries.append({
+        channel: "c-skip-stale",
+        deviceId: "d-1",
+        timestamp: DateTime.makeUnsafe("2026-04-22T12:00:00.000Z"),
+      })
+
+      const result = yield* db.entities.Telemetries.append({
+        channel: "c-skip-stale",
+        deviceId: "d-1",
+        timestamp: DateTime.makeUnsafe("2026-04-22T11:00:00.000Z"),
+      })
+        .skipFollowUp()
+        .asEffect()
+        .pipe(Effect.flip)
+
+      expect(result._tag).toBe("StaleAppend")
+      if (result._tag === "StaleAppend") {
+        expect(Option.isNone(result.current)).toBe(true)
+      }
     }).pipe(provideTs),
   )
 
@@ -1748,7 +1840,11 @@ describeConnected("timeSeries integration tests", () => {
             channel: "c-concur",
             deviceId: "d-1",
             timestamp: ts(iso),
-          }),
+          })
+            .asEffect()
+            // Some concurrent attempts will lose the CAS; surface that as a
+            // value so Effect.all doesn't short-circuit on StaleAppend.
+            .pipe(Effect.catchTag("StaleAppend", () => Effect.void)),
         ),
         { concurrency: "unbounded" },
       )
