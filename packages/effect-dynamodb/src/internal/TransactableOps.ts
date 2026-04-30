@@ -135,6 +135,5 @@ export const validateAndBuildPutItem = (
       })
     }
 
-
     return toAttributeMap(item)
   })

@@ -378,7 +378,6 @@ export interface Entity<
    */
   readonly _serializeSparseFields: (item: globalThis.Record<string, unknown>) => void
 
-
   /** @internal Attach model class prototype to a decoded plain object (no-op for Schema.Struct models). */
   readonly _attachPrototype: (decoded: any) => any
 
@@ -1772,7 +1771,6 @@ const makeImpl = <
     if (!hasSparseFields) return
     decodeSparseFields(raw, sparseFields)
   }
-
 
   // ---------------------------------------------------------------------------
   // Helpers
