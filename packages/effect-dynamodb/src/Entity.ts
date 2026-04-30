@@ -27,6 +27,7 @@ import {
 import * as DynamoSchema from "./DynamoSchema.js"
 import {
   CascadePartialFailure,
+  CompositeKeyHoleError,
   ConditionalCheckFailed,
   ItemNotFound,
   isAwsConditionalCheckFailed,
@@ -2783,8 +2784,68 @@ const makeImpl = <
             // `newItem` is already in domain names (the merge built it from
             // `currentDomainItem` + domain-keyed updates) — no rename needed
             // here. Recompose all keys with the updated attributes.
-            const newKeys = composeAllKeys(newItem)
-            Object.assign(newItem, newKeys)
+            //
+            // Primary key always recomposes from `newItem` (Put-style).
+            const primaryKeyMap = composePrimaryKey(newItem)
+            Object.assign(newItem, primaryKeyMap)
+
+            // GSI keys: route through the policy-aware composer so explicit
+            // clears (`set({ attr: null | undefined })`) and `Entity.remove`
+            // cascades match the v2 semantics applied on the standard update
+            // path. `newItem` carries stored values for any composite the
+            // user did not touch — passing it as `keyRecord` lets the
+            // composer treat omissions as no-ops (the half stays untouched
+            // because the stored value is present), while still firing the
+            // explicit-clear cascade and the SK preserve-truncation rule.
+            // See DESIGN.md §7 + §7.6.
+            const retainRemovedSet = uState.remove ? new Set(uState.remove) : undefined
+            try {
+              const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+                schema,
+                entityType,
+                entityVersion,
+                allIndexes,
+                hydratedUpdates as globalThis.Record<string, unknown>,
+                newItem,
+                { removedSet: retainRemovedSet },
+              )
+              for (const [field, value] of Object.entries(gsiUpdate.sets)) {
+                newItem[field] = value
+              }
+              for (const field of gsiUpdate.removes) {
+                delete newItem[field]
+              }
+              // Untouched GSIs (no policy + no payload + no cascade): retain
+              // path semantics are Put-style — recompose from `newItem` and
+              // drop both keys when any composite is missing. Matches the
+              // existing `composeAllKeys` behavior for those GSIs.
+              const addressed = new Set<string>([
+                ...Object.keys(gsiUpdate.sets),
+                ...gsiUpdate.removes,
+              ])
+              for (const [indexName, indexDef] of Object.entries(allIndexes)) {
+                if (indexName === "primary") continue
+                if (addressed.has(indexDef.pk.field) || addressed.has(indexDef.sk.field)) continue
+                const keys = KeyComposer.tryComposeIndexKeys(
+                  schema,
+                  entityType,
+                  entityVersion,
+                  indexDef,
+                  newItem,
+                )
+                if (keys) {
+                  Object.assign(newItem, keys)
+                } else {
+                  delete newItem[indexDef.pk.field]
+                  delete newItem[indexDef.sk.field]
+                }
+              }
+            } catch (e) {
+              if (e instanceof CompositeKeyHoleError) {
+                return yield* e
+              }
+              throw e
+            }
 
             // Compute sentinel rotation values while newItem is in domain names.
             // currentRaw uses DynamoDB names, so resolve via resolveDbName for
@@ -3153,18 +3214,31 @@ const makeImpl = <
           }
 
           // Policy-aware GSI key composition. One call covers SETs (full
-          // recompose or half-wise), sparse dropout REMOVEs, and cascade
-          // REMOVEs when an Entity.remove() targets a GSI composite.
-          // See DESIGN.md §7 Policy-Aware GSI Composition.
-          const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
-            schema,
-            entityType,
-            entityVersion,
-            allIndexes,
-            hydratedUpdates as globalThis.Record<string, unknown>,
-            decodedKey as globalThis.Record<string, unknown>,
-            { removedSet },
-          )
+          // recompose, half-wise, or SK truncation), sparse dropout REMOVEs,
+          // and cascade REMOVEs when an Entity.remove() targets a GSI
+          // composite. See DESIGN.md §7 Policy-Aware GSI Composition.
+          //
+          // The composer throws CompositeKeyHoleError (EDD-9024) when the
+          // payload describes a hole pattern (a cleared composite at SK
+          // position i with a present composite at j > i). Catch it
+          // synchronously and surface as a typed Effect failure.
+          let gsiUpdate: KeyComposer.GsiUpdateResult
+          try {
+            gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+              schema,
+              entityType,
+              entityVersion,
+              allIndexes,
+              hydratedUpdates as globalThis.Record<string, unknown>,
+              decodedKey as globalThis.Record<string, unknown>,
+              { removedSet },
+            )
+          } catch (e) {
+            if (e instanceof CompositeKeyHoleError) {
+              return yield* e
+            }
+            throw e
+          }
           for (const [field, value] of Object.entries(gsiUpdate.sets)) {
             const nameKey = `#u${counter}`
             const valKey = `:u${counter}`
@@ -4098,14 +4172,24 @@ const makeImpl = <
         }
       }
 
-      const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
-        schema,
-        entityType,
-        entityVersion,
-        policyAwareIndexes,
-        nonPkAppendFields,
-        encoded,
-      )
+      // The composer can throw CompositeKeyHoleError (EDD-9024) on a hole
+      // pattern. Surface it as a typed Effect failure.
+      let gsiUpdate: KeyComposer.GsiUpdateResult
+      try {
+        gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          entityType,
+          entityVersion,
+          policyAwareIndexes,
+          nonPkAppendFields,
+          encoded,
+        )
+      } catch (e) {
+        if (e instanceof CompositeKeyHoleError) {
+          return yield* e
+        }
+        throw e
+      }
       for (const [field, value] of Object.entries(gsiUpdate.sets)) {
         const nameKey = `#a${counter}`
         const valKey = `:a${counter}`
