@@ -2707,8 +2707,7 @@ const makeImpl = <
                 val !== null &&
                 typeof val === "object"
               ) {
-                const existing =
-                  (newItem[attr] as globalThis.Record<string, unknown>) ?? {}
+                const existing = (newItem[attr] as globalThis.Record<string, unknown>) ?? {}
                 newItem[attr] = { ...existing, ...(val as globalThis.Record<string, unknown>) }
               } else {
                 newItem[attr] = val
@@ -2725,9 +2724,7 @@ const makeImpl = <
             if (uState.sparseRemoveEntries) {
               for (const op of uState.sparseRemoveEntries) {
                 if (!hasSparseFields || !(op.field in sparseFields)) continue
-                const bucket = newItem[op.field] as
-                  | globalThis.Record<string, unknown>
-                  | undefined
+                const bucket = newItem[op.field] as globalThis.Record<string, unknown> | undefined
                 if (!bucket) continue
                 for (const k of op.keys) delete bucket[k]
               }
@@ -3782,9 +3779,7 @@ const makeImpl = <
               for (const [k, v] of Object.entries(val as globalThis.Record<string, unknown>)) {
                 try {
                   if (typeof k !== "string" || k.length === 0 || k.includes("#")) {
-                    throw new Error(
-                      `Sparse map "${attr}": invalid key ${JSON.stringify(k)}`,
-                    )
+                    throw new Error(`Sparse map "${attr}": invalid key ${JSON.stringify(k)}`)
                   }
                 } catch (e) {
                   return yield* new ValidationError({

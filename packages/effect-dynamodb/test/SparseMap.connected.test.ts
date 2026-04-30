@@ -241,9 +241,7 @@ describeConnected("SparseMap — connected integration", () => {
       const before = yield* db.entities.VPages.get({ pageId: id })
       expect(Object.keys(before.metrics).sort()).toEqual(["2026-01", "2026-02"])
 
-      yield* db.entities.VPages.update({ pageId: id })
-        .clearMap("metrics")
-        .set({ status: "reset" })
+      yield* db.entities.VPages.update({ pageId: id }).clearMap("metrics").set({ status: "reset" })
       const after = yield* db.entities.VPages.get({ pageId: id })
       expect(after.metrics).toEqual({})
       expect(after.status).toEqual("reset")

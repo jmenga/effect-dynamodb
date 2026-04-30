@@ -560,9 +560,7 @@ export const isConfiguredModel = (value: unknown): value is ConfiguredModel<Sche
  * Walks `ConfiguredModel.attributes` only — schema-level annotations are not
  * supported for sparse (it's a deployment concern, not a domain one).
  */
-export const getSparseFields = (
-  model: Schema.Top,
-): globalThis.Record<string, SparseConfig> => {
+export const getSparseFields = (model: Schema.Top): globalThis.Record<string, SparseConfig> => {
   if (!isConfiguredModel(model)) return {}
   const out: globalThis.Record<string, SparseConfig> = {}
   for (const [name, attr] of Object.entries(model.attributes)) {
@@ -581,9 +579,7 @@ export const getSparseFields = (
  * `Entity.make()` to validate sparse-map fields and detect nested sparse
  * (a Record whose value is itself a Record).
  */
-export const isRecordSchema = (
-  schema: Schema.Top,
-): { readonly valueAst: unknown } | undefined => {
+export const isRecordSchema = (schema: Schema.Top): { readonly valueAst: unknown } | undefined => {
   const ast = schema.ast as unknown as {
     readonly _tag?: string
     readonly propertySignatures?: ReadonlyArray<unknown>

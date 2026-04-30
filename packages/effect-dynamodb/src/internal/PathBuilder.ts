@@ -159,11 +159,7 @@ export const createPathBuilder = <Model>(
         // The previous segment must be a top-level field name marked sparse.
         // We look up its prefix and bake the segment as `<prefix>#<key>`.
         const last = segments[segments.length - 1]
-        if (
-          typeof last !== "string" ||
-          !sparseFields ||
-          !(last in sparseFields)
-        ) {
+        if (typeof last !== "string" || !sparseFields || !(last in sparseFields)) {
           // No-op for non-sparse fields — return a function that throws so
           // misuse is loud and clear.
           return (_key: string) => {
@@ -178,9 +174,7 @@ export const createPathBuilder = <Model>(
             throw new Error(`PathBuilder.entry: key must be a non-empty string`)
           }
           if (key.includes("#")) {
-            throw new Error(
-              `PathBuilder.entry: key "${key}" must not contain '#'`,
-            )
+            throw new Error(`PathBuilder.entry: key "${key}" must not contain '#'`)
           }
           // Drop the parent field segment and replace with the flattened
           // `<prefix>#<key>` literal segment. Subsequent property accesses

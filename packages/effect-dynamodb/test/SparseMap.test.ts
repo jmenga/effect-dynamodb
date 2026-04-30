@@ -22,10 +22,7 @@ import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
 import { DynamoError, ValidationError } from "../src/Errors.js"
-import {
-  decodeSparseFields,
-  encodeSparseFields,
-} from "../src/Marshaller.js"
+import { decodeSparseFields, encodeSparseFields } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 
 // ---------------------------------------------------------------------------
@@ -128,10 +125,7 @@ describe("SparseMap — Entity.make() validation", () => {
   it("EDD-9021: nested sparse Record (Record-of-Record) is rejected", () => {
     class Nested extends Schema.Class<Nested>("Nested")({
       id: Schema.String,
-      doubleNested: Schema.Record(
-        Schema.String,
-        Schema.Record(Schema.String, Schema.Number),
-      ),
+      doubleNested: Schema.Record(Schema.String, Schema.Record(Schema.String, Schema.Number)),
     }) {}
     const Configured = DynamoModel.configure(Nested, {
       doubleNested: { storedAs: "sparse" },
@@ -348,7 +342,11 @@ describe("SparseMap — encode/decode round-trip", () => {
       metrics: { "2026-01": { views: 5, clicks: 2 }, "2026-12": { views: 0, clicks: 0 } },
       totals: { "2026-01": 7, "2026-12": 3 },
     }
-    const item: Record<string, unknown> = { ...original, metrics: { ...original.metrics }, totals: { ...original.totals } }
+    const item: Record<string, unknown> = {
+      ...original,
+      metrics: { ...original.metrics },
+      totals: { ...original.totals },
+    }
     encodeSparseFields(item, sparse)
     decodeSparseFields(item, sparse)
     expect(item).toEqual(original)
@@ -463,10 +461,7 @@ describe("SparseMap — put", () => {
         totals: {},
       })
         .asEffect()
-        .pipe(
-          Effect.flip,
-          Effect.provide(TestLayers, { local: true }),
-        ),
+        .pipe(Effect.flip, Effect.provide(TestLayers, { local: true })),
     )
     expect(result).toBeInstanceOf(ValidationError)
     expect((result as ValidationError).operation).toMatch(/sparse/)
@@ -553,9 +548,7 @@ describe("SparseMap — path-style writes", () => {
     expect(call.UpdateExpression).toMatch(/ADD /)
     // The pathAdd path expression resolves to a single ExpressionAttributeNames
     // entry whose value is the literal flattened attr name.
-    const namesValues = Object.values(
-      call.ExpressionAttributeNames as Record<string, string>,
-    )
+    const namesValues = Object.values(call.ExpressionAttributeNames as Record<string, string>)
     expect(namesValues).toContain("totals#2026-01")
   })
 })
@@ -792,9 +785,7 @@ describe("SparseMap — conditional ops", () => {
     )
     const call = mockUpdateItem.mock.calls[0]![0]
     expect(call.ConditionExpression).toMatch(/attribute_exists\(/)
-    const namesValues = Object.values(
-      call.ExpressionAttributeNames as Record<string, string>,
-    )
+    const namesValues = Object.values(call.ExpressionAttributeNames as Record<string, string>)
     expect(namesValues).toContain("metrics#2026-01")
   })
 })

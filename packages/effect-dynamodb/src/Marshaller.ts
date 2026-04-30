@@ -45,9 +45,7 @@ export const fromAttributeValue = (value: AttributeValue): unknown => unmarshall
  */
 const validateSparseKey = (field: string, prefix: string, key: string): void => {
   if (typeof key !== "string") {
-    throw new Error(
-      `Sparse map "${field}": key must be a string, got ${typeof key}`,
-    )
+    throw new Error(`Sparse map "${field}": key must be a string, got ${typeof key}`)
   }
   if (key.length === 0) {
     throw new Error(`Sparse map "${field}": key must be non-empty`)
@@ -94,9 +92,7 @@ export const encodeSparseFields = (
       continue
     }
     if (typeof value !== "object") {
-      throw new Error(
-        `Sparse map "${fieldName}": expected an object/record, got ${typeof value}`,
-      )
+      throw new Error(`Sparse map "${fieldName}": expected an object/record, got ${typeof value}`)
     }
     const record = value as Record<string, unknown>
     for (const [k, v] of Object.entries(record)) {
