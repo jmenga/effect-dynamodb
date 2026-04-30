@@ -3,7 +3,13 @@ title: "Sparse Maps"
 description: "Flattened storage for logical Record fields — independently addressable per key, no parent-map ceremony."
 ---
 
-This guide covers the `storedAs: 'sparse'` storage primitive — a logical `Record<K, V>` field on the domain model is physically stored as **independently addressable top-level DynamoDB attributes**, one per map entry.
+import { Aside } from "@astrojs/starlight/components"
+
+<Aside type="caution" title="This 'sparse' is not the indexPolicy 'sparse'">
+This guide covers the **SparseMap storage primitive** (`storedAs: DynamoModel.SparseMap()`) — flattening a logical `Record<K, V>` into per-entry top-level DynamoDB attributes. It is unrelated to the `'sparse'` value of `indexPolicy` (`indexPolicy: () => ({ attr: 'sparse' })`), which controls whether an *update* drops a *GSI* membership when a composite is missing. The two were spelled the same up to 1.5.0 and that collision was a frequent source of confusion. See [indexPolicy](/effect-dynamodb/guides/index-policy/) if you're looking for GSI membership rules.
+</Aside>
+
+This guide covers the `storedAs: DynamoModel.SparseMap()` storage primitive — a logical `Record<K, V>` field on the domain model is physically stored as **independently addressable top-level DynamoDB attributes**, one per map entry.
 
 Use sparse maps when you need:
 
@@ -48,8 +54,8 @@ class Page extends Schema.Class<Page>("Page")({
 }) {}
 
 const PageModel = DynamoModel.configure(Page, {
-  metrics: { storedAs: "sparse" },
-  totals: { storedAs: "sparse" },
+  metrics: { storedAs: DynamoModel.SparseMap() },
+  totals: { storedAs: DynamoModel.SparseMap() },
 })
 ```
 
@@ -76,19 +82,30 @@ const VPages = Entity.make({
 
 **Configuration options:**
 
-- `storedAs: 'sparse'` — only valid on a `Schema.Record` field. Inner value can be any DynamoDB-native shape (scalar, `Schema.Struct`, `Schema.Array`, `Schema.Set`). Nested sparse Records are rejected (`EDD-9021`).
-- `prefix?: string` — optional override for the top-level attribute name prefix. Defaults to the field name. Distinct sparse fields must have distinct prefixes (`EDD-9023`).
+- `storedAs: DynamoModel.SparseMap(options?)` — only valid on a `Schema.Record` field. Inner value can be any DynamoDB-native shape (scalar, `Schema.Struct`, `Schema.Array`, `Schema.Set`). Nested sparse Records are rejected (`EDD-9021`). Pass `{ prefix }` to override the default attribute-name prefix:
+
+  ```typescript
+  DynamoModel.configure(Page, {
+    totals: { storedAs: DynamoModel.SparseMap({ prefix: "t" }) },
+  })
+  ```
+
+  The callable form (rather than a magic string) puts options where they semantically belong: inside the SparseMap declaration. Distinct sparse fields must have distinct prefixes (`EDD-9023`).
 
 **Constraints (enforced at `Entity.make()`):**
 
 | Code | Constraint |
 |---|---|
-| `EDD-9020` | `storedAs: 'sparse'` is only valid on `Schema.Record` fields. |
+| `EDD-9020` | `storedAs: DynamoModel.SparseMap()` is only valid on `Schema.Record` fields. |
 | `EDD-9021` | Inner value schema must be DynamoDB-native; nested sparse Records are rejected. |
 | `EDD-9022` | Sparse fields cannot participate in primary key, GSI composites, or unique constraints. |
 | `EDD-9023` | Multiple sparse fields must have distinct prefixes that don't collide with non-sparse field names. |
 
 User-supplied keys must not contain `#` (validated at write time — the library does not silently escape).
+
+<Aside type="note" title="Migrating from 1.5.0">
+1.6.0 renames the opt-in from the magic string `storedAs: "sparse"` to the typed callable `storedAs: DynamoModel.SparseMap()`. The `prefix` option moves from a sibling on `ConfigureAttributes` into the SparseMap config object — pass `DynamoModel.SparseMap({ prefix: "t" })` instead of `{ storedAs: "sparse", prefix: "t" }`. The magic string is no longer recognised; mechanical replacement.
+</Aside>
 
 ## Counter increment — the headline win
 
