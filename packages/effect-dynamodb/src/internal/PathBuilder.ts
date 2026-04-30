@@ -60,6 +60,29 @@ export interface ArrayPath<
 }
 
 // ---------------------------------------------------------------------------
+// SparsePath — Path for sparse-map (Record) attributes with .entry(key) accessor
+// ---------------------------------------------------------------------------
+
+/**
+ * Path produced by a sparse-map field. Carries `.entry(key)` to address an
+ * individual bucket. Each entry is stored as a top-level DynamoDB attribute
+ * named `<prefix>#<key>`, so the resulting path is a single literal segment
+ * (the bucket attribute itself), with optional further property access for
+ * struct-valued buckets.
+ */
+export interface SparsePath<
+  Root,
+  Value,
+  Keys extends ReadonlyArray<string | number> = ReadonlyArray<string | number>,
+> extends Path<Root, globalThis.Record<string, Value>, Keys> {
+  readonly entry: (
+    key: string,
+  ) => NonNullable<Value> extends globalThis.Record<string, any>
+    ? PathBuilder<Root, NonNullable<Value>> & Path<Root, NonNullable<Value>>
+    : Path<Root, NonNullable<Value>>
+}
+
+// ---------------------------------------------------------------------------
 // PathBuilder — recursive mapped type that creates typed path accessors
 // ---------------------------------------------------------------------------
 
@@ -69,13 +92,23 @@ export interface ArrayPath<
  * - `Path<Root, V>` for leaf values (string, number, boolean, etc.)
  * - `PathBuilder<Root, V> & Path<Root, V>` for nested objects
  * - `ArrayPath<Root, E>` for arrays
+ *
+ * Sparse-map fields (`storedAs: 'sparse'`) produce a `SparsePath<Root, V>`
+ * with `.entry(key)` accessor.
  */
 export type PathBuilder<Root, Model, Keys extends ReadonlyArray<string | number> = []> = {
   readonly [K in keyof Model]-?: NonNullable<Model[K]> extends ReadonlyArray<infer E>
     ? ArrayPath<Root, E, [...Keys, K & string]>
-    : NonNullable<Model[K]> extends globalThis.Record<string, any>
-      ? PathBuilder<Root, NonNullable<Model[K]>, [...Keys, K & string]> &
-          Path<Root, NonNullable<Model[K]>, [...Keys, K & string]>
+    : NonNullable<Model[K]> extends globalThis.Record<infer KK, infer V>
+      ? string extends KK
+        ? // String-indexed Record — treat as a sparse-map candidate. The
+          // runtime decides whether `.entry()` is actually wired (driven by
+          // the sparseFields map). For non-sparse Records, callers won't
+          // typically reach for `.entry`; for sparse ones, `.entry` is the
+          // expected entry point.
+          SparsePath<Root, V, [...Keys, K & string]>
+        : PathBuilder<Root, NonNullable<Model[K]>, [...Keys, K & string]> &
+            Path<Root, NonNullable<Model[K]>, [...Keys, K & string]>
       : Path<Root, NonNullable<Model[K]>, [...Keys, K & string]>
 }
 
@@ -91,11 +124,19 @@ export const isPath = (value: unknown): value is Path =>
  * Create a PathBuilder proxy that tracks attribute path segments.
  *
  * @param segments - Initial segments (default: [])
- * @param resolveDbName - Optional function to resolve domain names to DynamoDB attribute names
+ * @param resolveDbName - Optional function to resolve domain names to DynamoDB
+ *   attribute names. Segments containing `#` are treated as raw literal
+ *   attribute names and bypass `resolveDbName` (this is how sparse-map entry
+ *   segments survive through compilation as a single placeholder).
+ * @param sparseFields - Optional map of sparse-map field names to their
+ *   prefix configuration. When the proxy walks into a sparse field at the
+ *   first level, the next access is expected to be `.entry(key)`, which
+ *   produces a literal `<prefix>#<key>` segment.
  */
 export const createPathBuilder = <Model>(
   segments: ReadonlyArray<string | number> = [],
   resolveDbName?: (name: string) => string,
+  sparseFields?: globalThis.Record<string, { readonly prefix: string }>,
 ): PathBuilder<Model, Model> => {
   const handler: ProxyHandler<object> = {
     get(_target, prop) {
@@ -111,13 +152,43 @@ export const createPathBuilder = <Model>(
         })
       }
       if (prop === "at") {
-        return (index: number) => createPathBuilder([...segments, index], resolveDbName)
+        return (index: number) =>
+          createPathBuilder([...segments, index], resolveDbName, sparseFields)
+      }
+      if (prop === "entry") {
+        // The previous segment must be a top-level field name marked sparse.
+        // We look up its prefix and bake the segment as `<prefix>#<key>`.
+        const last = segments[segments.length - 1]
+        if (typeof last !== "string" || !sparseFields || !(last in sparseFields)) {
+          // No-op for non-sparse fields — return a function that throws so
+          // misuse is loud and clear.
+          return (_key: string) => {
+            throw new Error(
+              `PathBuilder.entry: field "${String(last)}" is not configured as a sparse map`,
+            )
+          }
+        }
+        const prefix = sparseFields[last]!.prefix
+        return (key: string) => {
+          if (typeof key !== "string" || key.length === 0) {
+            throw new Error(`PathBuilder.entry: key must be a non-empty string`)
+          }
+          if (key.includes("#")) {
+            throw new Error(`PathBuilder.entry: key "${key}" must not contain '#'`)
+          }
+          // Drop the parent field segment and replace with the flattened
+          // `<prefix>#<key>` literal segment. Subsequent property accesses
+          // (e.g. `.views` on a struct bucket) chain normally and compile to
+          // dotted nested-Map paths.
+          const newSegments = [...segments.slice(0, -1), `${prefix}#${key}`]
+          return createPathBuilder(newSegments, resolveDbName, sparseFields)
+        }
       }
       // Pipe/iterator/Symbol access — return undefined to avoid interference
       if (typeof prop === "symbol") return undefined
       if (prop === "pipe" || prop === "toJSON" || prop === "then") return undefined
       if (typeof prop === "string") {
-        return createPathBuilder([...segments, prop], resolveDbName)
+        return createPathBuilder([...segments, prop], resolveDbName, sparseFields)
       }
       return undefined
     },
@@ -139,7 +210,10 @@ export const createPathBuilder = <Model>(
  * @param names - Mutable names map to populate
  * @param prefix - Placeholder prefix (e.g., "p" for paths, "e" for expressions)
  * @param counter - Mutable counter object for unique placeholder generation
- * @param resolveDbName - Optional function to resolve domain names to DynamoDB attribute names
+ * @param resolveDbName - Optional function to resolve domain names to DynamoDB
+ *   attribute names. **Segments containing `#` bypass `resolveDbName`** —
+ *   they are already literal DynamoDB attribute names (used by sparse-map
+ *   entry segments shaped `<prefix>#<key>`).
  * @returns The expression path string (e.g., "#p0.#p1" or "#p0[2].#p1")
  */
 export const compilePath = (
@@ -156,7 +230,11 @@ export const compilePath = (
       parts.push(`[${seg}]`)
     } else {
       const key = `#${prefix}${counter.value++}`
-      names[key] = resolveDbName ? resolveDbName(seg) : seg
+      // Segments containing `#` are literal attribute names (sparse-map
+      // entry: `<prefix>#<key>`). They are emitted as-is — `resolveDbName`
+      // is never invoked because the segment was generated by the library,
+      // not by user-provided field references.
+      names[key] = seg.includes("#") ? seg : resolveDbName ? resolveDbName(seg) : seg
       parts.push(key)
     }
   }

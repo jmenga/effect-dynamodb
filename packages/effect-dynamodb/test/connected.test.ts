@@ -13,7 +13,7 @@
  */
 
 import { it } from "@effect/vitest"
-import { DateTime, Duration, Effect, Layer, Option, Schema, Stream } from "effect"
+import { Config, DateTime, Duration, Effect, Layer, Option, Schema, Stream } from "effect"
 import { afterAll, beforeAll, describe, expect } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
@@ -30,7 +30,11 @@ import * as Transaction from "../src/Transaction.js"
 // Skip if DynamoDB Local is not available
 // ---------------------------------------------------------------------------
 
-const ENDPOINT = process.env.DYNAMODB_ENDPOINT ?? "http://localhost:8000"
+const ENDPOINT = Effect.runSync(
+  Effect.fromYieldable(
+    Config.string("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+  ),
+)
 
 let dynamoAvailable = false
 try {
@@ -313,7 +317,7 @@ describeConnected("Connected integration tests", () => {
       }).pipe(
         provide,
         Effect.scoped,
-        Effect.catchTag("DynamoError", () => Effect.void),
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
       ),
     )
   }, 15000)
@@ -1478,7 +1482,7 @@ describeConnected("timeSeries integration tests", () => {
       }).pipe(
         provideTs,
         Effect.scoped,
-        Effect.catchTag("DynamoError", () => Effect.void),
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
       ),
     )
   }, 15000)
@@ -1891,7 +1895,7 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
       }).pipe(
         provideAgg,
         Effect.scoped,
-        Effect.catchTag("DynamoError", () => Effect.void),
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
       ),
     )
   }, 15000)
@@ -2304,7 +2308,7 @@ describeConnected("indexPolicy integration tests", () => {
       }).pipe(
         provideIp,
         Effect.scoped,
-        Effect.catchTag("DynamoError", () => Effect.void),
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
       ),
     )
   }, 15000)

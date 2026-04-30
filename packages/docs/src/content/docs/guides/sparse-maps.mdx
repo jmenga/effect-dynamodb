@@ -1,0 +1,214 @@
+---
+title: "Sparse Maps"
+description: "Flattened storage for logical Record fields — independently addressable per key, no parent-map ceremony."
+---
+
+This guide covers the `storedAs: 'sparse'` storage primitive — a logical `Record<K, V>` field on the domain model is physically stored as **independently addressable top-level DynamoDB attributes**, one per map entry.
+
+Use sparse maps when you need:
+
+- **Per-bucket atomic counters** — `views: Record<MonthKey, number>` → `ADD views#2026-01 :1` works on a fresh item, no parent-map dance.
+- **Per-tenant/region/key flags** — writable independently per key without read-modify-write.
+- **Time-bucketed metrics** — concurrent writers updating different months never race.
+- **Per-key existence checks** — `attribute_exists(views#2026-01)` becomes trivial because each entry is a top-level attribute.
+
+The native DynamoDB Map type (`M`) requires the parent attribute to exist before nested update/condition expressions can target it. Sparse maps remove that constraint by promoting each entry to a top-level attribute.
+
+## Wire format
+
+For a domain value `{ pageId: "p1", metrics: { "2026-01": { views: 5, clicks: 2 } } }` the table contains:
+
+```
+pk            = '$schema#v1#page#p1'
+sk            = '$schema#v1#page'
+__edd_e__     = 'page'
+pageId        = 'p1'
+metrics#2026-01 = M { views: N(5), clicks: N(2) }
+```
+
+Domain reads are transparent — `get`, `query`, `scan`, batch, and stream paths all rebuild the `Record<K, V>` from flattened attributes by walking the marshalled item once.
+
+## Configuring an entity
+
+Domain model declares a normal `Schema.Record`. Storage flattening is opt-in via `DynamoModel.configure`.
+
+```typescript region="model" example="guide-sparse-maps.ts"
+class Page extends Schema.Class<Page>("Page")({
+  pageId: Schema.String,
+  status: Schema.optional(Schema.String),
+  // Sparse map of struct buckets — each month is a DynamoDB Map attribute.
+  metrics: Schema.Record(
+    Schema.String,
+    Schema.Struct({ views: Schema.Number, clicks: Schema.Number }),
+  ),
+  // Sparse map of scalar buckets — each month is a Number attribute.
+  // The bucket attribute IS the scalar, so `ADD totals#<month> :1` works on
+  // a fresh item with no parent-map dance.
+  totals: Schema.Record(Schema.String, Schema.Number),
+}) {}
+
+const PageModel = DynamoModel.configure(Page, {
+  metrics: { storedAs: "sparse" },
+  totals: { storedAs: "sparse" },
+})
+```
+
+```typescript region="define" example="guide-sparse-maps.ts"
+const Pages = Entity.make({
+  model: PageModel,
+  entityType: "Page",
+  primaryKey: {
+    pk: { field: "pk", composite: ["pageId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const VPages = Entity.make({
+  model: PageModel,
+  entityType: "VPage",
+  primaryKey: {
+    pk: { field: "pk", composite: ["pageId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  versioned: { retain: true },
+})
+```
+
+**Configuration options:**
+
+- `storedAs: 'sparse'` — only valid on a `Schema.Record` field. Inner value can be any DynamoDB-native shape (scalar, `Schema.Struct`, `Schema.Array`, `Schema.Set`). Nested sparse Records are rejected (`EDD-9021`).
+- `prefix?: string` — optional override for the top-level attribute name prefix. Defaults to the field name. Distinct sparse fields must have distinct prefixes (`EDD-9023`).
+
+**Constraints (enforced at `Entity.make()`):**
+
+| Code | Constraint |
+|---|---|
+| `EDD-9020` | `storedAs: 'sparse'` is only valid on `Schema.Record` fields. |
+| `EDD-9021` | Inner value schema must be DynamoDB-native; nested sparse Records are rejected. |
+| `EDD-9022` | Sparse fields cannot participate in primary key, GSI composites, or unique constraints. |
+| `EDD-9023` | Multiple sparse fields must have distinct prefixes that don't collide with non-sparse field names. |
+
+User-supplied keys must not contain `#` (validated at write time — the library does not silently escape).
+
+## Counter increment — the headline win
+
+For scalar-valued sparse maps, the bucket attribute IS the scalar. `ADD totals#2026-04 :1` works on a fresh item with no parent ceremony. Concurrent ADDs on the same bucket sum atomically; concurrent ADDs on different buckets never race.
+
+```typescript region="bootstrap" example="guide-sparse-maps.ts"
+yield* db.entities.Pages.put({
+  pageId: "p-1",
+  metrics: {},
+  totals: {},
+})
+```
+
+```typescript region="counter" example="guide-sparse-maps.ts"
+yield* db.entities.Pages.update({ pageId: "p-1" }).pathAdd({
+  segments: ["totals#2026-04"],
+  value: 1,
+})
+yield* db.entities.Pages.update({ pageId: "p-1" }).pathAdd({
+  segments: ["totals#2026-04"],
+  value: 1,
+})
+```
+
+Each increment compiles to `ADD totals#2026-04 :v` on the existing row. The `#` literal in the segment survives compilation as a single `ExpressionAttributeNames` placeholder.
+
+## Record-style writes — whole-bucket replace
+
+Record-style `.set({ field: { ... } })` decomposes into one SET clause per bucket. Concurrent writes to **different** buckets are safe; concurrent writes to the **same** bucket race (last-write-wins on that bucket). Drop to path-style for finer-grained merge.
+
+```typescript region="record-style" example="guide-sparse-maps.ts"
+yield* db.entities.Pages.update({ pageId: "p-1" }).set({
+  metrics: {
+    "2026-04": { views: 100, clicks: 10 },
+    "2026-05": { views: 80, clicks: 8 },
+  },
+})
+```
+
+`null` in record-style input is **NOT** interpreted as REMOVE. Removal is always explicit via `.removeEntries(field, keys)`.
+
+## Path-style writes — per-leaf within a bucket
+
+Use path-style for atomic updates to inner fields within a known bucket. The path resolves to `<prefix>#<key>.<field>` using DynamoDB's native nested-Map syntax.
+
+```typescript region="path-style" example="guide-sparse-maps.ts"
+yield* db.entities.Pages.update({ pageId: "p-1" }).pathAdd({
+  segments: ["metrics#2026-04", "views"],
+  value: 1,
+})
+```
+
+**Caveat:** nested-Map operations on inner fields require the bucket attribute to exist. Use record-style for new buckets, path-style for buckets known to exist. This mirrors DynamoDB's native semantics — the library does not paper over it.
+
+For scalar-valued sparse maps (counter case), there's no inner field — the bucket attribute itself is the scalar. `pathAdd` works on a fresh item with no parent.
+
+## `removeEntries` — explicit per-key REMOVE
+
+Removing an entry that doesn't exist is a no-op (DynamoDB REMOVE semantics).
+
+```typescript region="remove-entries" example="guide-sparse-maps.ts"
+yield* db.entities.Pages.update({ pageId: "p-1" }).removeEntries("metrics", ["2026-05"])
+```
+
+## `clearMap` — erase all entries
+
+DynamoDB has no `REMOVE prefix#*` syntax, and the library doesn't statically know which bucket keys exist. `clearMap` is a **two-op helper** presented as a single API call:
+
+1. `GetItem` (consistent read) to discover which `<prefix>#*` attributes exist
+2. `UpdateItem` with an explicit `REMOVE <prefix>#k1, <prefix>#k2, ...` clause built from the read
+
+`clearMap` **chains** with other update combinators — the REMOVE list folds into the same `UpdateItem` that performs other SETs/ADDs (one physical write, not two).
+
+```typescript region="clear-map" example="guide-sparse-maps.ts"
+yield* db.entities.VPages.put({
+  pageId: "v-1",
+  metrics: {
+    "2026-04": { views: 100, clicks: 10 },
+    "2026-05": { views: 80, clicks: 8 },
+  },
+  totals: {},
+})
+yield* db.entities.VPages.update({ pageId: "v-1" })
+  .clearMap("metrics")
+  .set({ status: "reset" })
+```
+
+**Race window:** between the read and the update, a concurrent writer can add a new bucket. The new bucket survives the clear.
+
+- **`versioned: { retain: true }`** — the existing optimistic-lock CAS closes the race automatically. Clear fails on stale version, retry resolves.
+- **Non-versioned** — clear is best-effort (documented). If atomic clear is critical for a non-versioned entity, opt into versioning.
+
+## Conditional ops
+
+`attribute_exists(<prefix>#<key>)` and `attribute_not_exists(<prefix>#<key>)` work natively because each entry is a top-level attribute. Exposed via the path API and the `PathBuilder.entry(key)` accessor:
+
+```typescript
+yield* db.entities.Pages.update({ pageId: "p-1" })
+  .set({ status: "updated" })
+  .condition((t, { exists }) => exists(t.metrics.entry("2026-01")))
+```
+
+## Lifecycle interactions
+
+- **`versioned: { retain: true }`** — snapshots preserve flattened attributes verbatim. No special handling needed.
+- **`softDelete`** — GSI keys are stripped on soft-delete; sparse attributes are domain data and are **preserved**. Restore is a no-op for sparse attributes.
+- **Unique constraints** — sparse fields cannot be referenced in `unique:` composites (same reason as keys — composite values aren't known at make-time).
+- **`timeSeries`** — sparse fields are **aggregate state, not event state**. They live on the **current item only** and are preserved across `.append()` (untouched, since they're outside `appendInput`). Event items (`#e#<orderBy>`) **DO NOT** carry sparse attributes — same treatment as enrichment fields outside `appendInput`.
+
+## Decisions
+
+| Decision | Rationale |
+|---|---|
+| Sparseness is one level deep | Inner values can be Maps/Structs/scalars stored natively; nested sparse Records add complexity without a clear use case. |
+| Record-style writes are whole-bucket replace | One SET per bucket. Concurrent disjoint-bucket writes are safe; same-bucket writes race. For finer-grained merge within a bucket, drop to path-style. |
+| Removal is explicit | `null` in record-style input is **not** interpreted as REMOVE (too footgunny — would lose data on every write for models that legitimately use `null`). |
+| Clear is a two-op helper | Single physical write via folded REMOVE clauses. Atomic for versioned entities; best-effort for non-versioned. A future opt-in sidecar keys-set could make clear single-op, but the per-write attribute overhead isn't worth paying by default. |
+
+## Out of scope
+
+- **Sidecar keys-set** for single-op atomic clear — defer until clearing is shown to be a hot path.
+- **Deeper sparse nesting** (sparse-of-sparse) — keeps wire format symmetric and decode simple.
+- **Wildcard projections** (`metrics#*` in `ProjectionExpression`) — DynamoDB does not support this.
