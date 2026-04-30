@@ -491,11 +491,26 @@ export const storedAs = <A>(
 export const ConfiguredModelTag: unique symbol = Symbol.for("effect-dynamodb/ConfiguredModel")
 
 /**
+ * Sparse-map configuration carried on a `ConfiguredModel` attribute when the
+ * field is marked `storedAs: 'sparse'`.
+ *
+ * - `prefix` — top-level attribute name prefix; defaults to the model field name.
+ *   Each Record entry is stored as a separate top-level attribute named
+ *   `<prefix>#<key>`. The default prefix can be overridden via the
+ *   `prefix` option to `configure()`.
+ */
+export interface SparseConfig {
+  readonly prefix: string
+}
+
+/**
  * A model wrapped with DynamoDB-specific attribute overrides.
  *
  * Carries the original model plus per-field configuration:
  * - `field` — rename domain field → DynamoDB attribute name
  * - `storedAs` — override DynamoDB storage encoding (resolved to DynamoEncoding)
+ *               OR `'sparse'` to flatten a `Schema.Record` field into per-entry
+ *               top-level attributes (see {@link SparseConfig}).
  * - `immutable` — mark field as read-only after creation (excluded from Entity.Update)
  * - `identifier` — mark field as the identity field for ref resolution
  * - `ref` — mark field as a denormalized reference to another entity
@@ -515,6 +530,7 @@ export interface ConfiguredModel<
       readonly immutable?: boolean
       readonly identifier?: boolean
       readonly ref?: boolean
+      readonly sparse?: SparseConfig
     }
   >
 }
@@ -535,17 +551,90 @@ export const isConfiguredModel = (value: unknown): value is ConfiguredModel<Sche
   (value as globalThis.Record<symbol, unknown>)[ConfiguredModelTag] === true
 
 /**
+ * Resolve sparse-map configuration for every field on a model that is marked
+ * `storedAs: 'sparse'` via {@link configure}.
+ *
+ * Returns `Record<fieldName, SparseConfig>`. Empty when no sparse fields are
+ * configured.
+ *
+ * Walks `ConfiguredModel.attributes` only — schema-level annotations are not
+ * supported for sparse (it's a deployment concern, not a domain one).
+ */
+export const getSparseFields = (
+  model: Schema.Top,
+): globalThis.Record<string, SparseConfig> => {
+  if (!isConfiguredModel(model)) return {}
+  const out: globalThis.Record<string, SparseConfig> = {}
+  for (const [name, attr] of Object.entries(model.attributes)) {
+    if (attr.sparse) out[name] = attr.sparse
+  }
+  return out
+}
+
+/**
+ * Inspect a Schema field to determine whether it is shaped like a `Schema.Record`.
+ *
+ * Effect v4 `Schema.Record(K, V)` produces an AST `Objects` node with no
+ * `propertySignatures` and a single `indexSignatures` entry (string-keyed).
+ *
+ * Returns the value AST on match, otherwise `undefined`. Used by
+ * `Entity.make()` to validate sparse-map fields and detect nested sparse
+ * (a Record whose value is itself a Record).
+ */
+export const isRecordSchema = (
+  schema: Schema.Top,
+): { readonly valueAst: unknown } | undefined => {
+  const ast = schema.ast as unknown as {
+    readonly _tag?: string
+    readonly propertySignatures?: ReadonlyArray<unknown>
+    readonly indexSignatures?: ReadonlyArray<{ readonly type?: unknown }>
+  }
+  if (!ast || ast._tag !== "Objects") return undefined
+  const propertySignatures = ast.propertySignatures
+  const indexSignatures = ast.indexSignatures
+  if (!Array.isArray(propertySignatures) || !Array.isArray(indexSignatures)) return undefined
+  if (propertySignatures.length !== 0 || indexSignatures.length !== 1) return undefined
+  const sig = indexSignatures[0]!
+  return { valueAst: sig.type }
+}
+
+/** True iff `schema` is shaped like `Schema.Record(K, V)`. */
+export const isRecord = (schema: Schema.Top): boolean => isRecordSchema(schema) !== undefined
+
+/** True iff `valueAst` (raw AST from a Record value position) is itself a Record AST. */
+export const isRecordAst = (valueAst: unknown): boolean => {
+  if (!valueAst || typeof valueAst !== "object") return false
+  const ast = valueAst as {
+    readonly _tag?: string
+    readonly propertySignatures?: ReadonlyArray<unknown>
+    readonly indexSignatures?: ReadonlyArray<unknown>
+  }
+  if (ast._tag !== "Objects") return false
+  return (
+    Array.isArray(ast.propertySignatures) &&
+    Array.isArray(ast.indexSignatures) &&
+    ast.propertySignatures.length === 0 &&
+    ast.indexSignatures.length === 1
+  )
+}
+
+/**
  * Attribute override for a single field in `DynamoModel.configure`.
  *
  * - `field` — Rename the domain field to a different DynamoDB attribute name
- * - `storedAs` — Override DynamoDB storage format via a DynamoModel date schema
+ * - `storedAs` — Override DynamoDB storage format via a DynamoModel date schema,
+ *                or `'sparse'` to flatten a `Schema.Record` into per-entry
+ *                top-level attributes (see {@link SparseConfig}).
+ * - `prefix` — Top-level attribute name prefix when `storedAs: 'sparse'`.
+ *               Defaults to the model field name.
  * - `immutable` — Mark as read-only after creation (excluded from Entity.Update)
  * - `identifier` — Mark as the identity field for ref resolution
  * - `ref` — Mark as a denormalized reference field
  */
 type AttributeConfig<A> = {
   readonly field?: string
-  readonly storedAs?: Schema.Schema<A>
+  readonly storedAs?: Schema.Schema<A> | "sparse"
+  readonly prefix?: string
   readonly immutable?: boolean
   readonly identifier?: boolean
   readonly ref?: boolean
@@ -606,10 +695,14 @@ export const configure = <M extends Schema.Top, const A extends ConfigureAttribu
       readonly immutable?: boolean
       readonly identifier?: boolean
       readonly ref?: boolean
+      readonly sparse?: SparseConfig
     }
   > = {}
   for (const [key, config] of Object.entries(
-    attributes as globalThis.Record<string, AttributeConfig<unknown>>,
+    attributes as globalThis.Record<
+      string,
+      AttributeConfig<unknown> & { readonly prefix?: string }
+    >,
   )) {
     const entry: {
       field?: string
@@ -617,12 +710,31 @@ export const configure = <M extends Schema.Top, const A extends ConfigureAttribu
       immutable?: boolean
       identifier?: boolean
       ref?: boolean
+      sparse?: SparseConfig
     } = {}
     if (config.field) entry.field = config.field
     if (config.immutable) entry.immutable = true
     if (config.identifier) entry.identifier = true
     if (config.ref) entry.ref = true
-    if (config.storedAs) {
+    if (config.storedAs === "sparse") {
+      // Sparse Map storage: each entry is stored as a top-level attribute named
+      // `<prefix>#<key>`. Validation that the field is a Schema.Record happens
+      // at Entity.make() time (EDD-9020) — configure() can't introspect the
+      // model's schema field types reliably without committing to a single
+      // representation, so we keep configure() permissive and defer enforcement.
+      const prefix = config.prefix ?? key
+      if (typeof prefix !== "string" || prefix.length === 0) {
+        throw new Error(
+          `DynamoModel.configure: sparse field "${key}" must have a non-empty string prefix`,
+        )
+      }
+      if (prefix.includes("#")) {
+        throw new Error(
+          `DynamoModel.configure: sparse field "${key}" prefix "${prefix}" must not contain '#'`,
+        )
+      }
+      entry.sparse = { prefix }
+    } else if (config.storedAs !== undefined) {
       const encoding = getEncoding(config.storedAs as Schema.Top)
       if (!encoding) {
         throw new Error(
