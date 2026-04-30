@@ -211,52 +211,61 @@ const program = Effect.gen(function* () {
     tenantAfterRemove.some((d) => d.deviceId === "d-2")
   }`)
 
-  yield* Console.log("\n=== 6. Hierarchical SK pruning — preserve-clear demotes, doesn't evict ===")
+  yield* Console.log("\nAll indexPolicy scenarios passed.")
 
-  // #region hierarchy-model
-  // A geographic asset hierarchy: region → country → city → site. Clearing a
-  // trailing SK composite under preserve policy *truncates* gsi1sk to the
-  // leading prefix instead of dropping the GSI entirely. The asset stays
-  // queryable at the parent (coarser) hierarchy depth.
-  class Asset extends Schema.Class<Asset>("Asset")({
-    assetId: Schema.String,
-    region: Schema.String,
-    country: Schema.optional(Schema.String),
-    city: Schema.optional(Schema.String),
-    site: Schema.optional(Schema.String),
-  }) {}
+  yield* db.tables.AppTable.delete()
+})
 
-  const Assets = Entity.make({
-    model: Asset,
-    entityType: "Asset",
-    primaryKey: {
-      pk: { field: "pk", composite: ["assetId"] },
-      sk: { field: "sk", composite: [] },
+// =============================================================================
+// 4. Hierarchical SK pruning demo (separate program — uses its own table)
+// =============================================================================
+
+// #region hierarchy-model
+// A geographic asset hierarchy: region → country → city → site. Clearing a
+// trailing SK composite under preserve policy *truncates* gsi3sk to the
+// leading prefix instead of dropping the GSI entirely. The asset stays
+// queryable at the parent (coarser) hierarchy depth.
+class Asset extends Schema.Class<Asset>("Asset")({
+  assetId: Schema.String,
+  region: Schema.String,
+  country: Schema.optional(Schema.String),
+  city: Schema.optional(Schema.String),
+  site: Schema.optional(Schema.String),
+}) {}
+
+const Assets = Entity.make({
+  model: Asset,
+  entityType: "Asset",
+  primaryKey: {
+    pk: { field: "pk", composite: ["assetId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byLocation: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["region"] },
+      sk: { field: "gsi3sk", composite: ["country", "city", "site"] },
+      indexPolicy: () => ({
+        region: "preserve" as const,
+        country: "preserve" as const,
+        city: "preserve" as const,
+        site: "preserve" as const,
+      }),
     },
-    indexes: {
-      byLocation: {
-        name: "gsi3",
-        pk: { field: "gsi3pk", composite: ["region"] },
-        sk: { field: "gsi3sk", composite: ["country", "city", "site"] },
-        indexPolicy: () => ({
-          region: "preserve" as const,
-          country: "preserve" as const,
-          city: "preserve" as const,
-          site: "preserve" as const,
-        }),
-      },
-    },
-  })
-  // #endregion
+  },
+})
+// #endregion
 
-  // The example wires Assets through a separate table for clarity. To keep
-  // the demo self-contained we register the entity directly via DynamoClient.
-  const HierarchyTable = Table.make({ schema: AppSchema, entities: { Assets } })
+const HierarchyTable = Table.make({ schema: AppSchema, entities: { Assets } })
+
+const hierarchyProgram = Effect.gen(function* () {
   const dbHier = yield* DynamoClient.make({
     entities: { Assets },
     tables: { HierarchyTable },
   })
   yield* dbHier.tables.HierarchyTable.create()
+
+  yield* Console.log("\n=== 6. Hierarchical SK pruning — preserve-clear demotes, doesn't evict ===")
 
   // #region hierarchy-demo
   // Initial state — full hierarchy populated.
@@ -285,10 +294,6 @@ const program = Effect.gen(function* () {
   }`)
 
   yield* dbHier.tables.HierarchyTable.delete()
-
-  yield* Console.log("\nAll indexPolicy scenarios passed.")
-
-  yield* db.tables.AppTable.delete()
 })
 
 // =============================================================================
@@ -296,16 +301,22 @@ const program = Effect.gen(function* () {
 // =============================================================================
 
 // #region run
-const AppLayer = Layer.mergeAll(
-  DynamoClient.layer({
-    region: "us-east-1",
-    endpoint: "http://localhost:8000",
-    credentials: { accessKeyId: "local", secretAccessKey: "local" },
-  }),
-  AppTable.layer({ name: "indexpolicy-demo" }),
+const ClientLayer = DynamoClient.layer({
+  region: "us-east-1",
+  endpoint: "http://localhost:8000",
+  credentials: { accessKeyId: "local", secretAccessKey: "local" },
+})
+
+const AppLayer = Layer.mergeAll(ClientLayer, AppTable.layer({ name: "indexpolicy-demo" }))
+const HierarchyLayer = Layer.mergeAll(
+  ClientLayer,
+  HierarchyTable.layer({ name: "indexpolicy-demo-hier" }),
 )
 
-const main = program.pipe(Effect.provide(AppLayer))
+const main = Effect.gen(function* () {
+  yield* program.pipe(Effect.provide(AppLayer))
+  yield* hierarchyProgram.pipe(Effect.provide(HierarchyLayer))
+})
 
 Effect.runPromise(main).then(
   () => console.log("\nDone."),
