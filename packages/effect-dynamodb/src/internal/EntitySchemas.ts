@@ -836,9 +836,7 @@ export const buildDerivedSchemas = (
     for (const ref of resolvedRefs) {
       if (pkComposites.has(ref.fieldName)) continue
       if (immutableFields.has(ref.fieldName)) continue
-      acc[ref.idFieldName] = Schema.optional(
-        Schema.NullishOr(ref.identifierSchema as Schema.Top),
-      )
+      acc[ref.idFieldName] = Schema.optional(Schema.NullishOr(ref.identifierSchema as Schema.Top))
     }
     return acc
   }

@@ -1033,14 +1033,7 @@ describe("KeyComposer", () => {
         pk: { field: "gsi1pk", composite: ["A"] },
         sk: { field: "gsi1sk", composite: ["B", "C"] },
       }
-      const result = KeyComposer.composeSkPrefixUpTo(
-        schema,
-        "E",
-        1,
-        index,
-        { B: "b", C: "c" },
-        0,
-      )
+      const result = KeyComposer.composeSkPrefixUpTo(schema, "E", 1, index, { B: "b", C: "c" }, 0)
       expect(result).toBe("$myapp#v1#e")
     })
 

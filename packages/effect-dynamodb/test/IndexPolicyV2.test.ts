@@ -11,9 +11,9 @@
  * the SET / REMOVE clauses and key composition.
  */
 
+import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import { Effect, Layer, Schema } from "effect"
-import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -97,8 +97,7 @@ const makeMockClient = (capture: Capture) => ({
   listTagsOfResource: () => Effect.die("listTagsOfResource not used"),
 })
 
-const makeLayer = (capture: Capture) =>
-  Layer.succeed(DynamoClient, makeMockClient(capture) as any)
+const makeLayer = (capture: Capture) => Layer.succeed(DynamoClient, makeMockClient(capture) as any)
 
 // ---------------------------------------------------------------------------
 // Fixture: geographic asset hierarchy
@@ -148,36 +147,33 @@ const TableLayer = AppTable.layer({ name: "app-table" })
 // ---------------------------------------------------------------------------
 
 describe("Entity update — indexPolicy v2 wiring", () => {
-  it.effect(
-    "explicit clear of trailing SK composite truncates gsi1sk on retain path",
-    () => {
-      const capture: Capture = {}
-      return Effect.gen(function* () {
-        const db = yield* DynamoClient.make({
-          entities: { Assets },
-          tables: { AppTable },
-        })
-        // Asset leaves the datacenter — clear `site`.
-        yield* db.entities.Assets.update({ assetId: "a-1" }).set({ site: null })
+  it.effect("explicit clear of trailing SK composite truncates gsi1sk on retain path", () => {
+    const capture: Capture = {}
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Assets },
+        tables: { AppTable },
+      })
+      // Asset leaves the datacenter — clear `site`.
+      yield* db.entities.Assets.update({ assetId: "a-1" }).set({ site: null })
 
-        // Retain path uses transactWriteItems.
-        const tx = capture.transactWriteItems
-        expect(tx).toBeDefined()
-        const items = (tx as { TransactItems?: Array<unknown> }).TransactItems
-        expect(items?.length).toBeGreaterThan(0)
-        const mainPut = items?.[0] as { Put?: { Item?: Record<string, AttributeValue> } }
-        const item = mainPut.Put?.Item
-        expect(item).toBeDefined()
-        // SK truncated at site (position 2): leading prefix [country, city] →
-        // "$app#v1#asset#country_us#city_sf"
-        expect(item!.gsi1sk).toEqual({ S: "$app#v1#asset#country_us#city_sf" })
-        // PK side is unchanged (region still present from stored value).
-        expect(item!.gsi1pk).toEqual({ S: "$app#v1#asset#region_americas" })
-        // The site attribute itself: cleared by user via null. It writes NULL.
-        // (Not the focus of this test, just noting it.)
-      }).pipe(Effect.provide(Layer.mergeAll(makeLayer(capture), TableLayer)), Effect.scoped)
-    },
-  )
+      // Retain path uses transactWriteItems.
+      const tx = capture.transactWriteItems
+      expect(tx).toBeDefined()
+      const items = (tx as { TransactItems?: Array<unknown> }).TransactItems
+      expect(items?.length).toBeGreaterThan(0)
+      const mainPut = items?.[0] as { Put?: { Item?: Record<string, AttributeValue> } }
+      const item = mainPut.Put?.Item
+      expect(item).toBeDefined()
+      // SK truncated at site (position 2): leading prefix [country, city] →
+      // "$app#v1#asset#country_us#city_sf"
+      expect(item!.gsi1sk).toEqual({ S: "$app#v1#asset#country_us#city_sf" })
+      // PK side is unchanged (region still present from stored value).
+      expect(item!.gsi1pk).toEqual({ S: "$app#v1#asset#region_americas" })
+      // The site attribute itself: cleared by user via null. It writes NULL.
+      // (Not the focus of this test, just noting it.)
+    }).pipe(Effect.provide(Layer.mergeAll(makeLayer(capture), TableLayer)), Effect.scoped)
+  })
 
   it.effect("explicit clear of multiple trailing SK composites truncates further", () => {
     const capture: Capture = {}
@@ -189,9 +185,8 @@ describe("Entity update — indexPolicy v2 wiring", () => {
       yield* db.entities.Assets.update({ assetId: "a-1" }).set({ city: null, site: null })
       const tx = capture.transactWriteItems
       const item = (
-        (tx as { TransactItems: Array<{ Put: { Item: Record<string, AttributeValue> } }> })
-          .TransactItems[0]!.Put.Item
-      )
+        tx as { TransactItems: Array<{ Put: { Item: Record<string, AttributeValue> } }> }
+      ).TransactItems[0]!.Put.Item
       expect(item.gsi1sk).toEqual({ S: "$app#v1#asset#country_us" })
       expect(item.gsi1pk).toEqual({ S: "$app#v1#asset#region_americas" })
     }).pipe(Effect.provide(Layer.mergeAll(makeLayer(capture), TableLayer)), Effect.scoped)
@@ -207,9 +202,8 @@ describe("Entity update — indexPolicy v2 wiring", () => {
       yield* db.entities.Assets.update({ assetId: "a-1" }).remove(["country"])
       const tx = capture.transactWriteItems
       const item = (
-        (tx as { TransactItems: Array<{ Put: { Item: Record<string, AttributeValue> } }> })
-          .TransactItems[0]!.Put.Item
-      )
+        tx as { TransactItems: Array<{ Put: { Item: Record<string, AttributeValue> } }> }
+      ).TransactItems[0]!.Put.Item
       // Both GSI key fields should be absent from the Put item (full drop).
       expect(item.gsi1pk).toBeUndefined()
       expect(item.gsi1sk).toBeUndefined()

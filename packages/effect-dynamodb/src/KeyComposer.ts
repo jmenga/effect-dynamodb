@@ -485,9 +485,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
     }
 
     // SK composite cleared with sparse policy.
-    const skClearSparse = skComposites.some(
-      (attr) => isCleared(attr) && policy[attr] === "sparse",
-    )
+    const skClearSparse = skComposites.some((attr) => isCleared(attr) && policy[attr] === "sparse")
     if (skClearSparse) {
       removes.push(index.pk.field, index.sk.field)
       continue
