@@ -40,6 +40,7 @@ export {
   OptimisticLockError,
   RefNotFound,
   ResourceNotFoundError,
+  StaleAppend,
   ThrottlingError,
   TransactionCancelled,
   TransactionOverflow,
@@ -63,7 +64,7 @@ export type {
 export { makeBoundQuery } from "./internal/BoundQuery.js"
 export type {
   AppendInputType,
-  AppendResult,
+  AppendSuccess,
   EntityInputType,
   EntityKeyType,
   EntityRecordType,

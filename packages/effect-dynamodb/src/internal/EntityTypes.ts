@@ -210,21 +210,17 @@ export type AppendInputType<TAppendInput> = [TAppendInput] extends [Schema.Top]
   : never
 
 /**
- * Return type of `.append()` — a discriminated union.
+ * Success type of `.append()` (default path) — `{ current: Model }`.
  *
- * - `{ applied: true, current }` — transaction succeeded; `current` is the new state.
- * - `{ applied: false, reason: "stale", current }` — CAS rejected the write;
- *    `current` is the winning state (obtained via follow-up GetItem).
- *
- * Errors on the Effect error channel: `DynamoClientError`, `ValidationError`.
+ * Stale outcomes are surfaced on the Effect ERROR channel as
+ * `StaleAppend` (CAS rejected) or `ConditionalCheckFailed` (user-supplied
+ * `.condition()` rejected while CAS held). `.skipFollowUp()` narrows the
+ * success channel to `void` and collapses both error modes into
+ * `StaleAppend` (cannot disambiguate without the follow-up GetItem).
  */
-export type AppendResult<TModel extends Schema.Top> =
-  | { readonly applied: true; readonly current: ModelType<TModel> }
-  | {
-      readonly applied: false
-      readonly reason: "stale"
-      readonly current: ModelType<TModel>
-    }
+export type AppendSuccess<TModel extends Schema.Top> = {
+  readonly current: ModelType<TModel>
+}
 
 // ---------------------------------------------------------------------------
 // Ref-aware type computations

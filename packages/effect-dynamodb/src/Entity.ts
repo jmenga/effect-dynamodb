@@ -8,7 +8,7 @@
  */
 
 import type { AttributeValue, DeleteItemCommandInput } from "@aws-sdk/client-dynamodb"
-import { Duration, Effect, Schema, Stream } from "effect"
+import { DateTime, Duration, Effect, Option, Schema, Stream } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import {
   type ConfiguredModel,
@@ -29,12 +29,18 @@ import {
   isAwsTransactionCancelled,
   OptimisticLockError,
   RefNotFound,
+  StaleAppend,
   TransactionOverflow,
   UniqueConstraintViolation,
   ValidationError,
 } from "./Errors.js"
 import type { ConditionInput } from "./Expression.js"
-import { makeBoundDelete, makeBoundPut, makeBoundUpdate } from "./internal/BoundCrud.js"
+import {
+  makeBoundAppend,
+  makeBoundDelete,
+  makeBoundPut,
+  makeBoundUpdate,
+} from "./internal/BoundCrud.js"
 import { type BoundQueryConfig, BoundQueryImpl } from "./internal/BoundQuery.js"
 import {
   compileExpr,
@@ -175,7 +181,7 @@ import {
 } from "./internal/EntitySchemas.js"
 import type {
   AppendInputType,
-  AppendResult as AppendResultType,
+  AppendSuccess as AppendSuccessType,
   EntityInputType,
   EntityKeyType,
   EntityRecordType,
@@ -591,25 +597,40 @@ export interface Entity<
    * item (scoped SET on `appendInput` fields only + CAS on `orderBy`) and
    * writes an immutable event item under the same partition.
    *
-   * Returns a discriminated union — stale writes are a success value, not an
-   * error. See {@link AppendResultType} and the `guides/timeseries.mdx` doc.
+   * **Stale-as-error contract:** on CAS rejection the Effect fails with
+   * {@link StaleAppend} (carrying `current: Option.some(...)` from the
+   * follow-up GetItem). When a user-supplied `condition` rejected the write
+   * but the CAS held, the Effect fails with {@link ConditionalCheckFailed}
+   * (also carrying `current`). This supersedes the v1 stale-as-value design.
    *
    * The optional `condition` argument is ANDed onto the CAS ConditionExpression.
-   * On CAS failure OR user-condition failure, the result is
-   * `{ applied: false, reason: "stale", current }` — v1 does not distinguish
-   * between the two failure modes.
+   * The optional `skipFollowUp` flag suppresses the post-transaction GetItem;
+   * success becomes `void` and CAS / user-condition failures collapse into
+   * `StaleAppend(current: Option.none())` (cannot disambiguate without the
+   * GetItem). See `guides/timeseries.mdx`.
    *
    * Only available when the entity was built with `timeSeries: { ... }`.
    */
   readonly append: [TTimeSeries] extends [TimeSeriesConfig<infer TAI extends Schema.Top>]
-    ? (
-        input: AppendInputType<TAI>,
-        condition?: Expr | ConditionInput,
-      ) => Effect.Effect<
-        AppendResultType<TModel>,
-        DynamoClientError | ValidationError,
-        DynamoClient | TableConfig
-      >
+    ? {
+        (
+          input: AppendInputType<TAI>,
+          condition?: Expr | ConditionInput,
+        ): Effect.Effect<
+          { readonly current: ModelType<TModel> },
+          DynamoClientError | ValidationError | StaleAppend | ConditionalCheckFailed,
+          DynamoClient | TableConfig
+        >
+        (
+          input: AppendInputType<TAI>,
+          condition: Expr | ConditionInput | undefined,
+          skipFollowUp: true,
+        ): Effect.Effect<
+          void,
+          DynamoClientError | ValidationError | StaleAppend,
+          DynamoClient | TableConfig
+        >
+      }
     : never
 
   /**
@@ -978,13 +999,19 @@ export interface BoundEntity<
    * item (scoped SET on `appendInput` fields only + CAS on `orderBy`) and
    * writes an immutable event item under the same partition.
    *
-   * Returns a discriminated union — stale writes are a success value, not an
-   * error. See `guides/timeseries.mdx`.
+   * Returns a fluent {@link BoundAppend} — yield to execute, or chain
+   * `.condition(...)` and/or `.skipFollowUp()`.
+   *
+   * **Stale-as-error contract:** on CAS rejection the Effect fails with
+   * {@link StaleAppend}; user-condition rejection (when CAS held) fails with
+   * {@link ConditionalCheckFailed}. `.skipFollowUp()` collapses both into
+   * `StaleAppend(current: Option.none())` because no follow-up GetItem
+   * runs.
    *
    * ```ts
-   * const r = yield* db.entities.Telemetry.append({ channel, deviceId, timestamp, location })
-   * if (r.applied) { /* r.current is the new state */ /*}
-   * else           { /* r.current is the winning state (stale) */ /*}
+   * const { current } = yield* db.entities.Telemetry.append(input)
+   * yield* db.entities.Telemetry.append(input).condition({ status: "active" })
+   * yield* db.entities.Telemetry.append(input).skipFollowUp() // → void
    * ```
    *
    * Only available when the entity was built with `timeSeries: { ... }`.
@@ -992,8 +1019,12 @@ export interface BoundEntity<
   readonly append: [TTimeSeries] extends [TimeSeriesConfig<infer TAI extends Schema.Top>]
     ? (
         input: AppendInputType<TAI>,
-        condition?: Expr | ConditionInput,
-      ) => Effect.Effect<AppendResultType<TModel>, DynamoClientError | ValidationError, never>
+      ) => import("./internal/BoundCrud.js").BoundAppend<
+        ModelType<TModel>,
+        { readonly current: ModelType<TModel> },
+        DynamoClientError | ValidationError | StaleAppend | ConditionalCheckFailed,
+        DynamoClientError | ValidationError | StaleAppend
+      >
     : never
 
   /**
@@ -3580,6 +3611,47 @@ const makeImpl = <
       input as globalThis.Record<string, unknown>,
     )
 
+  /**
+   * @internal Compare stored vs attempted `orderBy` to decide whether the CAS
+   * predicate `attribute_not_exists(pk) OR stored < attempted` failed.
+   *
+   * Returns `true` (CAS failed → stale) when `stored >= attempted`.
+   * Returns `false` (CAS held; the user's `.condition()` is the rejecter)
+   * when `stored < attempted` or when `stored` is missing.
+   *
+   * `stored` arrives as a decoded domain value matching the configured schema
+   * for the attribute: a `DateTime.Utc` for `Schema.DateTimeUtc`, a `Date` for
+   * `Schema.Date`, a `number`/`bigint` for numeric schemas, a `string` for
+   * lexicographic comparisons.
+   */
+  const isCasFailure = (stored: unknown, attempted: unknown): boolean => {
+    if (stored == null) return false
+    // DateTime.Utc — compare epoch ms.
+    if (DateTime.isDateTime(stored) && DateTime.isDateTime(attempted)) {
+      return DateTime.toEpochMillis(stored) >= DateTime.toEpochMillis(attempted)
+    }
+    // Date — compare epoch ms.
+    if (stored instanceof Date && attempted instanceof Date) {
+      return stored.getTime() >= attempted.getTime()
+    }
+    // Numeric — number or bigint (cast comparable via JS coercion).
+    if (typeof stored === "number" && typeof attempted === "number") {
+      return stored >= attempted
+    }
+    if (typeof stored === "bigint" && typeof attempted === "bigint") {
+      return stored >= attempted
+    }
+    // Strings — lexicographic.
+    if (typeof stored === "string" && typeof attempted === "string") {
+      return stored >= attempted
+    }
+    // Mixed / unknown shapes — fall back to string compare on String(...).
+    // Defensive: return true so we report StaleAppend (the safer default —
+    // never suppress a CAS rejection by mis-classifying it as a user-condition
+    // rejection).
+    return String(stored) >= String(attempted)
+  }
+
   // ---------------------------------------------------------------------------
   // append operation — time-series primitive (only when `timeSeries` configured)
   //
@@ -3590,15 +3662,27 @@ const makeImpl = <
   //  - Put of event: full decoded input + __edd_e__ + _ttl (if configured),
   //    GSI keys stripped, SK replaced with `<currentSk>#e#<orderByValue>`.
   //
-  // On TransactionCancelled or ConditionalCheckFailed, we issue a follow-up
-  // GetItem on the primary key and return `{ applied: false, reason: "stale",
-  // current }`. On success, same follow-up GetItem yields the post-append
-  // current. See `docs/designs/timeseries.md` §4.
+  // Concurrency outcome (stale-as-error contract — supersedes
+  // `docs/designs/timeseries.md` §4.7 v1 stale-as-value):
+  //
+  // - Success path (default): on transaction success, issue a follow-up
+  //   GetItem and return `{ current }` (decoded model).
+  // - Stale path (default): on TransactionCancelled, issue a follow-up
+  //   GetItem to disambiguate. If the stored `orderBy >= attempted`, the CAS
+  //   fired → fail with `StaleAppend(current: Option.some)`. Otherwise the
+  //   user-supplied `.condition()` rejected the write → fail with
+  //   `ConditionalCheckFailed(current: Option.some)`.
+  // - skipFollowUp success path: return `void`.
+  // - skipFollowUp stale path: cannot disambiguate (no GetItem), so fail
+  //   with `StaleAppend(current: Option.none)` for both cancellation modes.
+  //   Documented as a deliberate trade-off in `guides/timeseries.mdx`.
+  // - TTL-race / row vanished after success: surface as
+  //   `ValidationError("append.followUp")`. Undetected on skipFollowUp path.
   // ---------------------------------------------------------------------------
 
   const timeSeriesConfig = config.timeSeries as TimeSeriesConfig<any> | undefined
 
-  const append = (input: unknown, userCondition?: Expr | ConditionInput) =>
+  const append = (input: unknown, userCondition?: Expr | ConditionInput, skipFollowUp = false) =>
     Effect.gen(function* () {
       if (!timeSeriesConfig) {
         return yield* new ValidationError({
@@ -3825,8 +3909,8 @@ const makeImpl = <
             onSuccess: () => Effect.succeed({ stale: false as const }),
             onFailure: (err) => {
               // TransactionCancelled or ConditionalCheckFailed at the transaction
-              // level both map to "stale" (can't distinguish CAS from user-cond
-              // in v1 — see §12 decision 5).
+              // level both surface here. Disambiguation between CAS and
+              // user-condition happens after the follow-up GetItem (when run).
               if (isAwsTransactionCancelled(err.cause) || isAwsConditionalCheckFailed(err.cause)) {
                 return Effect.succeed({ stale: true as const })
               }
@@ -3835,36 +3919,79 @@ const makeImpl = <
           }),
         )
 
-      // Follow-up GetItem to read the current (post-append on success, winning
-      // state on stale). One read is required either way — the contract
-      // returns `Model` which demands the full row including enrichment.
+      // -----------------------------------------------------------------
+      // skipFollowUp branch — no GetItem, cannot decode current, cannot
+      // disambiguate CAS vs user-condition cancellation. Both modes
+      // collapse to StaleAppend(current: Option.none) — documented.
+      // -----------------------------------------------------------------
+      if (skipFollowUp) {
+        if (transactResult.stale) {
+          return yield* new StaleAppend({
+            entityType,
+            orderByField,
+            attemptedOrderBy: newObValue,
+            current: Option.none(),
+          })
+        }
+        return undefined
+      }
+
+      // -----------------------------------------------------------------
+      // Default branch — one follow-up GetItem either way. Carries:
+      //   - Decoded model on success (the post-append current).
+      //   - Disambiguation data on cancellation (stored orderBy vs attempted)
+      //     plus a model snapshot to attach to the error for the caller.
+      // -----------------------------------------------------------------
       const followUp = yield* client.getItem({
         TableName: tableName,
         Key: marshalledKey,
       })
       if (!followUp.Item) {
-        // TTL race or out-of-band delete — surface as a DynamoClientError
-        // (the previous state vanished under us). This is NOT a stale result.
-        return yield* Effect.fail(
-          new ValidationError({
-            entityType,
-            operation: "append.followUp",
-            cause: "Current item not found after append — possible TTL race or concurrent delete.",
-          }),
-        )
+        // TTL race or out-of-band delete — the previous state vanished
+        // under us. Distinct from a CAS-stale outcome.
+        return yield* new ValidationError({
+          entityType,
+          operation: "append.followUp",
+          cause: "Current item not found after append — possible TTL race or concurrent delete.",
+        })
       }
 
       const rawCurrent = fromAttributeMap(followUp.Item) as globalThis.Record<string, unknown>
       const currentModel = yield* decodeAs(rawCurrent, followUp.Item, "model")
 
       if (transactResult.stale) {
-        return {
-          applied: false as const,
-          reason: "stale" as const,
-          current: currentModel as ModelType<TModel>,
+        // Disambiguate CAS-stale from user-condition rejection. We compare
+        // in the WIRE form (what DynamoDB actually evaluated): `newObValue`
+        // is the encoded value passed to the CAS, and `rawCurrent` carries
+        // the encoded values read back. `decodeAs` mutated `rawCurrent` to
+        // rename DB columns to domain field names, so `rawCurrent[orderByField]`
+        // is the wire-form value under its domain name. Wire-form
+        // comparison matches DynamoDB's evaluation: ISO-8601 strings sort
+        // lexicographically (= chronologically), numbers/bigints are
+        // numeric, strings are lexicographic.
+        const storedOrderBy = (rawCurrent as globalThis.Record<string, unknown>)[orderByField]
+        const attempted = newObValue
+        const casFired = isCasFailure(storedOrderBy, attempted)
+
+        if (!casFired && userCondition !== undefined) {
+          // CAS held; the user's `.condition()` is the only thing that
+          // could have rejected.
+          return yield* new ConditionalCheckFailed({
+            entityType,
+            key: encoded as globalThis.Record<string, unknown>,
+            current: Option.some(currentModel),
+          })
         }
+        // Either CAS fired, or no user condition was supplied (CAS is the
+        // only possibility) — both map to StaleAppend.
+        return yield* new StaleAppend({
+          entityType,
+          orderByField,
+          attemptedOrderBy: attempted,
+          current: Option.some(currentModel),
+        })
       }
-      return { applied: true as const, current: currentModel as ModelType<TModel> }
+      return { current: currentModel as ModelType<TModel> }
     })
 
   // ---------------------------------------------------------------------------
@@ -4741,15 +4868,22 @@ export const bind = <
       },
       // Time-series (no-ops when entity is not configured; runtime check in
       // the entity-level `append` returns a ValidationError).
-      append: (input: unknown, condition?: Expr | ConditionInput) =>
-        provide(
-          (
-            entity.append as any as (
-              i: unknown,
-              c?: Expr | ConditionInput,
-            ) => Effect.Effect<any, any, any>
-          )(input, condition),
-        ),
+      append: (input: unknown) => {
+        const appendCfg: import("./internal/BoundCrud.js").BoundAppendConfig<unknown> = {
+          ...boundCrudConfig,
+          run: (opts) =>
+            provide(
+              (
+                entity.append as unknown as (
+                  i: unknown,
+                  c: Expr | ConditionInput | undefined,
+                  s: boolean,
+                ) => Effect.Effect<any, any, any>
+              )(opts.input, opts.condition, opts.skipFollowUp),
+            ),
+        }
+        return makeBoundAppend(input, appendCfg)
+      },
       history: (key: Key) => {
         const q = (entity.history as any as (k: Key) => Query.Query<any>)(key)
         const pathBuilder = createPathBuilder()
@@ -4888,13 +5022,13 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
 // ---------------------------------------------------------------------------
 
 /**
- * The return type of `BoundEntity.append()` — a discriminated union.
+ * Success type of `BoundEntity.append()` on the default path — carries the
+ * post-append `current` (decoded model).
  *
- * - `{ applied: true, current }` — transaction succeeded.
- * - `{ applied: false, reason: "stale", current }` — CAS rejected the write;
- *   `current` is the winning state (obtained via follow-up `GetItem`).
+ * `.skipFollowUp()` narrows this to `void`. Stale outcomes are on the error
+ * channel — see {@link StaleAppend} and {@link ConditionalCheckFailed}.
  */
-export type AppendResult<TModel extends Schema.Top> = AppendResultType<TModel>
+export type AppendSuccess<TModel extends Schema.Top> = AppendSuccessType<TModel>
 
 // ---------------------------------------------------------------------------
 // Type extractors — the 7 derived types
