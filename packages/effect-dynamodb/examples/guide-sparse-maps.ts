@@ -205,8 +205,7 @@ const program = Effect.gen(function* () {
 // 5. Run
 // =============================================================================
 
-Effect.runPromise(program.pipe(Effect.provide(AppLayer))).catch((error: unknown) => {
-  // eslint-disable-next-line no-console
-  console.error("error:", error)
-  process.exit(1)
-})
+Effect.runPromise(program.pipe(Effect.provide(AppLayer))).then(
+  () => console.log("Done."),
+  (error: unknown) => console.error("Failed:", error),
+)

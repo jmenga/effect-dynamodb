@@ -1,4 +1,4 @@
-import { Effect, Layer, Schema } from "effect"
+import { Config, Effect, Layer, Schema } from "effect"
 import { DynamoClient, DynamoSchema, Entity, Table } from "effect-dynamodb"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import * as GeoIndex from "../src/GeoIndex.js"
@@ -8,7 +8,11 @@ import * as H3 from "../src/H3.js"
 // Check DynamoDB Local availability
 // ---------------------------------------------------------------------------
 
-const ENDPOINT = process.env.DYNAMODB_ENDPOINT ?? "http://localhost:8000"
+const ENDPOINT = Effect.runSync(
+  Effect.fromYieldable(
+    Config.string("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+  ),
+)
 
 let dynamoAvailable = false
 try {
@@ -111,7 +115,7 @@ describeConnected("GeoSearch (connected)", () => {
       }).pipe(
         provide,
         Effect.scoped,
-        Effect.catchTag("DynamoError", () => Effect.void),
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
       ),
     )
   }, 15000)

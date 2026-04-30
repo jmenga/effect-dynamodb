@@ -11,9 +11,14 @@
 import { execSync } from "node:child_process"
 import { readdirSync } from "node:fs"
 import { join, resolve } from "node:path"
+import { Config, Effect } from "effect"
 import { describe, it } from "vitest"
 
-const ENDPOINT = process.env.DYNAMODB_ENDPOINT ?? "http://localhost:8000"
+const ENDPOINT = Effect.runSync(
+  Effect.fromYieldable(
+    Config.string("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+  ),
+)
 const EXAMPLES_DIR = resolve(import.meta.dirname, "../../effect-dynamodb/examples")
 
 // Skip all tests if DynamoDB Local is not available
@@ -38,14 +43,12 @@ describeConnected("Example runtime execution", () => {
   for (const file of exampleFiles) {
     it(`examples/${file} runs successfully`, () => {
       const filePath = join(EXAMPLES_DIR, file)
+      // Inherit parent env naturally — DYNAMODB_ENDPOINT (if set) flows through;
+      // otherwise the child resolves its own Config.withDefault.
       execSync(`npx tsx ${filePath}`, {
         timeout: 30_000,
         cwd: resolve(EXAMPLES_DIR, ".."),
         stdio: "pipe",
-        env: {
-          ...process.env,
-          DYNAMODB_ENDPOINT: ENDPOINT,
-        },
       })
     })
   }

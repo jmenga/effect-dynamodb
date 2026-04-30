@@ -3,7 +3,7 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import { Console, Effect, Layer, Schema } from "effect"
+import { Config, Console, Effect, Layer, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
@@ -231,7 +231,6 @@ const scanPartition = (label: string, pkValue: string) =>
     yield* Console.log(`\n${"═".repeat(70)}\n`)
   })
 
-const step = parseInt(process.env.STEP ?? "0", 10)
 const matchId = "bgt-2025-test-1"
 const pkValue = DynamoSchema.composeCollectionKey(CricketSchema, "match", [matchId])
 
@@ -244,7 +243,7 @@ const step0 = Effect.gen(function* () {
   const tableConfig = yield* MainTable.Tag
   yield* client
     .deleteTable({ TableName: tableConfig.name })
-    .pipe(Effect.catchTag("DynamoError", () => Effect.void))
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
   yield* Console.log("Creating table:", tableConfig.name)
   yield* client.createTable({
     TableName: tableConfig.name,
@@ -604,6 +603,7 @@ const step5 = Effect.gen(function* () {
 
 const steps = [step0, step1, step2, step3, step4, step5]
 const program = Effect.gen(function* () {
+  const step = yield* Config.int("STEP").pipe(Config.withDefault(0))
   for (let i = 0; i <= step; i++) {
     yield* steps[i]!
   }

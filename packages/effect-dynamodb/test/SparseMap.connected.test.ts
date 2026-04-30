@@ -15,7 +15,7 @@
  */
 
 import { it } from "@effect/vitest"
-import { DateTime, Effect, Layer, Schema } from "effect"
+import { Config, DateTime, Effect, Layer, Schema } from "effect"
 import { afterAll, beforeAll, describe, expect } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
@@ -27,7 +27,11 @@ import * as Table from "../src/Table.js"
 // Skip when DynamoDB Local isn't reachable
 // ---------------------------------------------------------------------------
 
-const ENDPOINT = process.env.DYNAMODB_ENDPOINT ?? "http://localhost:8000"
+const ENDPOINT = Effect.runSync(
+  Effect.fromYieldable(
+    Config.string("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+  ),
+)
 
 let dynamoAvailable = false
 try {
@@ -164,7 +168,7 @@ describeConnected("SparseMap — connected integration", () => {
       }).pipe(
         provide,
         Effect.scoped,
-        Effect.catchTag("DynamoError", () => Effect.void),
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
       ),
     )
   }, 15000)
