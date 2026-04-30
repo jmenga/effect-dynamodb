@@ -1,4 +1,4 @@
-import { Data } from "effect"
+import { Data, type Option } from "effect"
 
 /** Wraps AWS SDK errors from DynamoDB operations */
 export class DynamoError extends Data.TaggedError("DynamoError")<{
@@ -36,10 +36,53 @@ export class ItemNotFound extends Data.TaggedError("ItemNotFound")<{
   readonly key: Record<string, unknown>
 }> {}
 
-/** PutItem/DeleteItem conditional check failed */
+/**
+ * PutItem/DeleteItem/UpdateItem conditional check failed.
+ *
+ * On `Entity.append()` (time-series), this is surfaced when a user-supplied
+ * `condition` rejected the write while the CAS predicate held. In that case
+ * `current` is `Option.some(<decoded post-state>)` carrying the live current
+ * item snapshot read via the follow-up GetItem. For non-append paths and for
+ * append calls that opted out via `.skipFollowUp()`, `current` is omitted /
+ * `Option.none()` (no follow-up GetItem was issued).
+ *
+ * On the `.skipFollowUp()` path of `.append()`, user-condition failures cannot
+ * be distinguished from CAS failures, so they are reported as
+ * {@link StaleAppend} instead — see that error's docs.
+ */
 export class ConditionalCheckFailed extends Data.TaggedError("ConditionalCheckFailed")<{
   readonly entityType: string
   readonly key: Record<string, unknown>
+  readonly current?: Option.Option<unknown>
+}> {}
+
+/**
+ * `Entity.append()` was rejected because the CAS predicate
+ * (`attribute_not_exists(pk) OR <orderBy> < :newOrderBy`) did not hold —
+ * i.e. another writer has already advanced the current item past
+ * `attemptedOrderBy`. This is an EXPECTED outcome under newer-wins
+ * concurrency; callers typically `Effect.catchTag("StaleAppend", ...)` and
+ * treat it as a no-op.
+ *
+ * `current` carries the winning state when the follow-up GetItem ran:
+ * - `Option.some(<raw decoded item>)` on the default path.
+ * - `Option.none()` when the caller opted out via `.skipFollowUp()`.
+ *
+ * The value is typed as `unknown` because `StaleAppend` has no model
+ * generic; callers that need a typed value can decode it with the entity's
+ * record schema themselves.
+ *
+ * NOTE on the `skipFollowUp` path: a user-supplied `.condition()` failure
+ * also raises `StaleAppend` (not {@link ConditionalCheckFailed}) because no
+ * follow-up GetItem ran, so the two cancellation modes are
+ * indistinguishable. If you need the disambiguation, do not call
+ * `.skipFollowUp()`.
+ */
+export class StaleAppend extends Data.TaggedError("StaleAppend")<{
+  readonly entityType: string
+  readonly orderByField: string
+  readonly attemptedOrderBy: unknown
+  readonly current: Option.Option<unknown>
 }> {}
 
 /** Schema decode/encode validation failed */
