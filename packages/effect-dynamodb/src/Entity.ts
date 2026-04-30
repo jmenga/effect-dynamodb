@@ -136,6 +136,7 @@ export {
   asNative,
   asRecord,
   cascade,
+  clearMap,
   consistentRead,
   deleteFromSet,
   expectedVersion,
@@ -149,6 +150,7 @@ export {
   pathSubtract,
   project,
   remove,
+  removeEntries,
   returnValues,
   set,
   subtract,
@@ -2719,6 +2721,27 @@ const makeImpl = <
                 delete newItem[attr]
               }
             }
+            // Sparse-map removes: drop named entries from the in-memory Record.
+            if (uState.sparseRemoveEntries) {
+              for (const op of uState.sparseRemoveEntries) {
+                if (!hasSparseFields || !(op.field in sparseFields)) continue
+                const bucket = newItem[op.field] as
+                  | globalThis.Record<string, unknown>
+                  | undefined
+                if (!bucket) continue
+                for (const k of op.keys) delete bucket[k]
+              }
+            }
+            // Sparse-map clear: blow away the entire bucket Record. The retain
+            // path always reads-then-writes the full item, so the version CAS
+            // already gives clearMap atomic semantics for free — no per-bucket
+            // GET dance needed here.
+            if (uState.sparseClearFields) {
+              for (const field of uState.sparseClearFields) {
+                if (!hasSparseFields || !(field in sparseFields)) continue
+                newItem[field] = {}
+              }
+            }
             if (uState.add) {
               for (const [attr, val] of Object.entries(uState.add)) {
                 newItem[attr] = ((newItem[attr] as number) ?? 0) + val
@@ -3284,6 +3307,75 @@ const makeImpl = <
               values[valKey] = toAttributeValue(op.value)
               deleteClauses.push(`${pathExpr} ${valKey}`)
             }
+          }
+
+          // Sparse-map .removeEntries — explicit REMOVE on `<prefix>#<key>`.
+          // Each key emits one REMOVE clause through ExpressionAttributeNames
+          // (the literal "#" survives via compilePath's raw-segment escape).
+          if (uState.sparseRemoveEntries) {
+            for (const op of uState.sparseRemoveEntries) {
+              if (!hasSparseFields || !(op.field in sparseFields)) {
+                return yield* new ValidationError({
+                  entityType,
+                  operation: "update.removeEntries",
+                  cause: `field "${op.field}" is not configured as a sparse map`,
+                })
+              }
+              const sparse = sparseFields[op.field]!
+              for (const k of op.keys) {
+                if (typeof k !== "string" || k.length === 0 || k.includes("#")) {
+                  return yield* new ValidationError({
+                    entityType,
+                    operation: "update.removeEntries",
+                    cause: `Sparse map "${op.field}": invalid key ${JSON.stringify(k)}`,
+                  })
+                }
+                const nameKey = `#sr${removeClauses.length}`
+                names[nameKey] = `${sparse.prefix}#${k}`
+                removeClauses.push(nameKey)
+              }
+            }
+          }
+
+          // Sparse-map .clearMap — Get-then-Update helper. Reads the current
+          // item with a consistent read to discover which `<prefix>#*` attrs
+          // exist, then folds the resulting REMOVEs into this same UpdateItem.
+          // The version CAS (when configured) provides atomicity; non-versioned
+          // entities are best-effort (a concurrent writer can add a new bucket
+          // between the read and the update — that bucket survives).
+          if (uState.sparseClearFields && uState.sparseClearFields.length > 0) {
+            for (const field of uState.sparseClearFields) {
+              if (!hasSparseFields || !(field in sparseFields)) {
+                return yield* new ValidationError({
+                  entityType,
+                  operation: "update.clearMap",
+                  cause: `field "${field}" is not configured as a sparse map`,
+                })
+              }
+            }
+            // Read once for all clearMap fields combined.
+            const clearGetResult = yield* client.getItem({
+              TableName: tableName,
+              Key: marshalledKey,
+              ConsistentRead: true,
+            })
+            if (clearGetResult.Item) {
+              const clearItemKeys = Object.keys(clearGetResult.Item)
+              for (const field of uState.sparseClearFields) {
+                const sparse = sparseFields[field]!
+                const prefixWithDelim = `${sparse.prefix}#`
+                for (const attrName of clearItemKeys) {
+                  if (attrName.startsWith(prefixWithDelim)) {
+                    const nameKey = `#sc${removeClauses.length}`
+                    names[nameKey] = attrName
+                    removeClauses.push(nameKey)
+                  }
+                }
+              }
+            }
+            // If the item doesn't exist, clearMap is a no-op — the subsequent
+            // UpdateItem will create the row (with whatever other clauses the
+            // builder accumulated) per DynamoDB UpdateItem semantics.
           }
 
           const hasAnyUpdate =
@@ -4847,7 +4939,9 @@ const makeImpl = <
   // Expression combinators: condition, filter, select
   // ---------------------------------------------------------------------------
 
-  const entityPathBuilder = createPathBuilder<any>([], resolveDbName)
+  // Sparse-field map used by createPathBuilder to wire `.entry(key)` accessors.
+  const sparseFieldsForPath = hasSparseFields ? sparseFields : undefined
+  const entityPathBuilder = createPathBuilder<any>([], resolveDbName, sparseFieldsForPath)
   const entityConditionOps = createConditionOps<any>()
 
   /**
@@ -5053,10 +5147,17 @@ export const bind = <
     type Key = EntityKeyType<TModel, TIndexes>
     type Input = EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>
 
+    // Sparse-field map (if any) — extracted from the Entity's configured model
+    // so the PathBuilder used by `.condition((t, ops) => ...)` exposes
+    // `.entry(key)` accessors on sparse-map fields.
+    const boundSparseFields = getSparseFields(entity.model as Schema.Top)
+    const boundSparseFieldsForPath =
+      Object.keys(boundSparseFields).length > 0 ? boundSparseFields : undefined
+
     // Shared config for the bound-CRUD builders — pre-resolved services plus
     // a typed PathBuilder/ConditionOps so `.condition((t, ops) => ...)` works.
     const boundCrudConfig: import("./internal/BoundCrud.js").BoundCrudConfig<unknown> = {
-      pathBuilder: createPathBuilder(),
+      pathBuilder: createPathBuilder(undefined, undefined, boundSparseFieldsForPath),
       conditionOps: createConditionOps(),
       provide,
     }

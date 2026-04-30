@@ -546,3 +546,87 @@ export const pathDelete = <A, Rec, U, E, R>(
   self: EntityUpdate<A, Rec, U, E, R>,
   op: PathDeleteOp,
 ): EntityUpdate<A, Rec, U, E, R> => addPathOp(self, "pathDeletes", op)
+
+// ---------------------------------------------------------------------------
+// Sparse-map combinators
+// ---------------------------------------------------------------------------
+
+/**
+ * Remove specific entries from a sparse-map field. Compiles to
+ * `REMOVE <prefix>#k1, <prefix>#k2, ...` clauses appended to the
+ * UpdateExpression. Removing an entry that doesn't exist is a no-op
+ * (DynamoDB REMOVE semantics).
+ *
+ * Multiple `removeEntries` calls accumulate.
+ */
+export const removeEntries: {
+  (
+    field: string,
+    keys: ReadonlyArray<string>,
+  ): <A, Rec, U, E, R>(self: EntityUpdate<A, Rec, U, E, R>) => EntityUpdate<A, Rec, U, E, R>
+  <A, Rec, U, E, R>(
+    self: EntityUpdate<A, Rec, U, E, R>,
+    field: string,
+    keys: ReadonlyArray<string>,
+  ): EntityUpdate<A, Rec, U, E, R>
+} = Fn.dual(
+  3,
+  <A, Rec, U, E, R>(
+    self: EntityUpdate<A, Rec, U, E, R>,
+    field: string,
+    keys: ReadonlyArray<string>,
+  ): EntityUpdate<A, Rec, U, E, R> => {
+    const existing = self._updateState.sparseRemoveEntries ?? []
+    return new EntityUpdateImpl<A, Rec, U, E, R>(
+      self._builder as any,
+      {
+        ...self._updateState,
+        sparseRemoveEntries: [...existing, { field, keys }],
+      },
+      self._entity,
+      self._key,
+    ) as any
+  },
+)
+
+/**
+ * Clear all entries of a sparse-map field. Two-op helper: the executor reads
+ * the current item to discover which `<prefix>#*` attributes exist, then
+ * folds REMOVE clauses for those attributes into the same final
+ * `UpdateItem` as the rest of the builder's combinators.
+ *
+ * Atomic via the version CAS for `versioned` entities; best-effort for
+ * non-versioned (a concurrent writer may add a new bucket between the read
+ * and the update — that bucket survives the clear).
+ *
+ * Multiple `clearMap(field)` calls dedupe by field.
+ */
+export const clearMap: {
+  (
+    field: string,
+  ): <A, Rec, U, E, R>(self: EntityUpdate<A, Rec, U, E, R>) => EntityUpdate<A, Rec, U, E, R>
+  <A, Rec, U, E, R>(
+    self: EntityUpdate<A, Rec, U, E, R>,
+    field: string,
+  ): EntityUpdate<A, Rec, U, E, R>
+} = Fn.dual(
+  2,
+  <A, Rec, U, E, R>(
+    self: EntityUpdate<A, Rec, U, E, R>,
+    field: string,
+  ): EntityUpdate<A, Rec, U, E, R> => {
+    const existing = self._updateState.sparseClearFields ?? []
+    if (existing.includes(field)) {
+      return self
+    }
+    return new EntityUpdateImpl<A, Rec, U, E, R>(
+      self._builder as any,
+      {
+        ...self._updateState,
+        sparseClearFields: [...existing, field],
+      },
+      self._entity,
+      self._key,
+    ) as any
+  },
+)

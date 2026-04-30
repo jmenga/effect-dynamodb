@@ -17,6 +17,7 @@ import {
   add as addCombinator,
   append as appendCombinator,
   cascade as cascadeCombinator,
+  clearMap as clearMapCombinator,
   condition as conditionCombinator,
   deleteFromSet as deleteFromSetCombinator,
   expectedVersion as expectedVersionCombinator,
@@ -29,6 +30,7 @@ import {
   pathSet as pathSetCombinator,
   pathSubtract as pathSubtractCombinator,
   remove as removeCombinator,
+  removeEntries as removeEntriesCombinator,
   returnValues as returnValuesCombinator,
   set as setCombinator,
   subtract as subtractCombinator,
@@ -244,6 +246,22 @@ export interface BoundUpdate<Model, A, U, E> extends Pipeable.Pipeable {
   readonly pathIfNotExists: (op: PathIfNotExistsOp) => BoundUpdate<Model, A, U, E>
   /** Path-based DELETE (set removal). */
   readonly pathDelete: (op: PathDeleteOp) => BoundUpdate<Model, A, U, E>
+  /**
+   * Remove specific entries from a sparse-map field. Compiles to
+   * `REMOVE <prefix>#k1, <prefix>#k2, ...`. Removing an entry that doesn't
+   * exist is a no-op (DynamoDB REMOVE semantics).
+   */
+  readonly removeEntries: (
+    field: string,
+    keys: ReadonlyArray<string>,
+  ) => BoundUpdate<Model, A, U, E>
+  /**
+   * Clear all entries of a sparse-map field. Two-op helper: reads the current
+   * item, then folds REMOVE clauses for the discovered `<prefix>#*` attrs into
+   * the same final UpdateItem. Atomic via the version CAS for `versioned`
+   * entities; best-effort for non-versioned.
+   */
+  readonly clearMap: (field: string) => BoundUpdate<Model, A, U, E>
   /** Convert to an executable Effect for Effect combinator interop. */
   readonly asEffect: () => Effect.Effect<A, E, never>
   /** Yield support for `Effect.gen`. */
@@ -338,6 +356,14 @@ export class BoundUpdateImpl<Model, A, U, E> implements BoundUpdate<Model, A, U,
 
   pathDelete(op: PathDeleteOp): BoundUpdateImpl<Model, A, U, E> {
     return this._with(pathDeleteCombinator(this._op, op))
+  }
+
+  removeEntries(field: string, keys: ReadonlyArray<string>): BoundUpdateImpl<Model, A, U, E> {
+    return this._with(removeEntriesCombinator(this._op, field, keys))
+  }
+
+  clearMap(field: string): BoundUpdateImpl<Model, A, U, E> {
+    return this._with(clearMapCombinator(this._op, field))
   }
 
   asEffect(): Effect.Effect<A, E, never> {

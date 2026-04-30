@@ -68,6 +68,12 @@ export interface CascadeConfig {
   readonly mode?: "eventual" | "transactional" | undefined
 }
 
+/** @internal Sparse-map remove operation: REMOVE <prefix>#<k> for each k. */
+export interface SparseRemoveEntriesOp {
+  readonly field: string
+  readonly keys: ReadonlyArray<string>
+}
+
 /** @internal */
 export interface UpdateState {
   readonly updates: unknown
@@ -89,6 +95,20 @@ export interface UpdateState {
   readonly pathPrepends: ReadonlyArray<PathPrependOp> | undefined
   readonly pathIfNotExists: ReadonlyArray<PathIfNotExistsOp> | undefined
   readonly pathDeletes: ReadonlyArray<PathDeleteOp> | undefined
+  // Sparse-map operations
+  /**
+   * Explicit per-key REMOVEs on a sparse-map field. Each entry compiles to
+   * `REMOVE <prefix>#<key>` clauses appended to the UpdateExpression.
+   */
+  readonly sparseRemoveEntries: ReadonlyArray<SparseRemoveEntriesOp> | undefined
+  /**
+   * Sparse-map fields to clear in their entirety. Each field triggers a
+   * Get-then-Update sequence at execution time: the helper reads the current
+   * item to discover which `<prefix>#*` attributes exist, then folds the
+   * generated REMOVE clauses into the same UpdateItem as the rest of the
+   * builder's combinators (single physical write, not two).
+   */
+  readonly sparseClearFields: ReadonlyArray<string> | undefined
 }
 
 /** @internal Path-based SET operation */
@@ -156,6 +176,8 @@ export const emptyUpdateState: UpdateState = {
   pathPrepends: undefined,
   pathIfNotExists: undefined,
   pathDeletes: undefined,
+  sparseRemoveEntries: undefined,
+  sparseClearFields: undefined,
 }
 
 // ---------------------------------------------------------------------------
