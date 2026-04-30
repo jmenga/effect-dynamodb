@@ -15,10 +15,14 @@ import {
   type DynamoEncoding,
   type ExtractIdentifier,
   getIdentifierField,
+  getSparseFields,
   isConfiguredModel,
   isHidden,
+  isRecordAst,
+  isRecordSchema,
   isRef,
   isRefField,
+  type SparseConfig,
 } from "./DynamoModel.js"
 import * as DynamoSchema from "./DynamoSchema.js"
 import {
@@ -54,7 +58,13 @@ import { compilePath, createPathBuilder } from "./internal/PathBuilder.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "./KeyComposer.js"
 import * as KeyComposer from "./KeyComposer.js"
 import { normalizeGsiConfig } from "./KeyComposer.js"
-import { fromAttributeMap, toAttributeMap, toAttributeValue } from "./Marshaller.js"
+import {
+  decodeSparseFields,
+  encodeSparseFields,
+  fromAttributeMap,
+  toAttributeMap,
+  toAttributeValue,
+} from "./Marshaller.js"
 import * as Query from "./Query.js"
 import { filterExpr, selectPaths } from "./Query.js"
 import type { TableConfig } from "./Table.js"
@@ -358,6 +368,14 @@ export interface Entity<
   readonly _decodeRecord: (
     raw: globalThis.Record<string, unknown>,
   ) => Effect.Effect<any, ValidationError>
+
+  /**
+   * @internal Flatten sparse-map fields into per-entry top-level attributes.
+   * Mutates the item in place. Used by Transaction/Batch put builders.
+   * Throws on invalid keys.
+   */
+  readonly _serializeSparseFields: (item: globalThis.Record<string, unknown>) => void
+
 
   /** @internal Attach model class prototype to a decoded plain object (no-op for Schema.Struct models). */
   readonly _attachPrototype: (decoded: any) => any
@@ -1612,6 +1630,84 @@ const makeImpl = <
   // primitives directly for non-colliding system fields.
 
   // ---------------------------------------------------------------------------
+  // Sparse Map fields (storedAs: 'sparse') — validation + resolution
+  // ---------------------------------------------------------------------------
+
+  const sparseFields: globalThis.Record<string, SparseConfig> = getSparseFields(
+    config.model as Schema.Top,
+  )
+  const hasSparseFields = Object.keys(sparseFields).length > 0
+  if (hasSparseFields) {
+    // EDD-9020: storedAs: 'sparse' is only valid on Schema.Record fields.
+    for (const fieldName of Object.keys(sparseFields)) {
+      const fieldSchema = modelFields[fieldName]
+      if (!fieldSchema) {
+        throw new Error(
+          `[EDD-9020] Entity "${config.entityType}": sparse field "${fieldName}" does not exist on the model`,
+        )
+      }
+      const recordInfo = isRecordSchema(fieldSchema)
+      if (!recordInfo) {
+        throw new Error(
+          `[EDD-9020] Entity "${config.entityType}": sparse field "${fieldName}" must be a Schema.Record. ` +
+            `Got a non-Record schema. Sparse storage flattens Record entries into per-key top-level attributes.`,
+        )
+      }
+      // EDD-9021: inner value must not be another Record (no nested sparse).
+      if (isRecordAst(recordInfo.valueAst)) {
+        throw new Error(
+          `[EDD-9021] Entity "${config.entityType}": sparse field "${fieldName}" has a Record-typed value schema. ` +
+            `Nested sparse Records are not supported — use Schema.Struct, Schema.Number, etc. for the inner value.`,
+        )
+      }
+    }
+
+    // EDD-9022: sparse fields cannot participate in primary key, GSI composites,
+    // or unique constraints — keys aren't statically known at make() time.
+    const allComposites = new Set<string>(allCompositeAttributes(allIndexes))
+    for (const fieldName of Object.keys(sparseFields)) {
+      if (allComposites.has(fieldName)) {
+        throw new Error(
+          `[EDD-9022] Entity "${config.entityType}": sparse field "${fieldName}" cannot be a primary-key or GSI composite. ` +
+            `Composite values must be known at make() time; sparse-map keys are not.`,
+        )
+      }
+    }
+    if (config.unique) {
+      const sparseSet = new Set(Object.keys(sparseFields))
+      for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
+        const fields = resolveUniqueFields(constraintDef)
+        for (const f of fields) {
+          if (sparseSet.has(f)) {
+            throw new Error(
+              `[EDD-9022] Entity "${config.entityType}": unique constraint "${constraintName}" cannot reference sparse field "${f}".`,
+            )
+          }
+        }
+      }
+    }
+
+    // EDD-9023: sparse prefixes must be unique among themselves and must not
+    // collide with non-sparse top-level model field names.
+    const seenPrefix = new Map<string, string>() // prefix → fieldName
+    for (const [fieldName, sparse] of Object.entries(sparseFields)) {
+      const existing = seenPrefix.get(sparse.prefix)
+      if (existing) {
+        throw new Error(
+          `[EDD-9023] Entity "${config.entityType}": sparse fields "${existing}" and "${fieldName}" share prefix "${sparse.prefix}". Prefixes must be distinct.`,
+        )
+      }
+      seenPrefix.set(sparse.prefix, fieldName)
+      // Prefix must not collide with another (non-sparse) model field name.
+      if (sparse.prefix !== fieldName && sparse.prefix in modelFields) {
+        throw new Error(
+          `[EDD-9023] Entity "${config.entityType}": sparse field "${fieldName}" prefix "${sparse.prefix}" collides with non-sparse field "${sparse.prefix}".`,
+        )
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Field renaming: domain name → DynamoDB attribute name (from ConfiguredModel)
   // ---------------------------------------------------------------------------
 
@@ -1652,6 +1748,30 @@ const makeImpl = <
   /** Resolve a domain field name to its DynamoDB attribute name. */
   const resolveDbName = (domainName: string): string => fieldRenames[domainName] ?? domainName
 
+  /**
+   * Flatten sparse Map fields into per-entry top-level attributes.
+   * Called on the write path after rename + date serialization, before
+   * `toAttributeMap`. No-op when the entity has no sparse fields.
+   *
+   * Throws on key validation errors (caught by callers and translated into
+   * tagged `ValidationError` at the entity boundary).
+   */
+  const serializeSparseFields = (item: globalThis.Record<string, unknown>): void => {
+    if (!hasSparseFields) return
+    encodeSparseFields(item, sparseFields)
+  }
+
+  /**
+   * Rebuild sparse Map fields from flattened top-level attributes.
+   * Called on the read path after `fromAttributeMap`, before rename + date
+   * deserialization. No-op when the entity has no sparse fields.
+   */
+  const deserializeSparseFields = (raw: globalThis.Record<string, unknown>): void => {
+    if (!hasSparseFields) return
+    decodeSparseFields(raw, sparseFields)
+  }
+
+
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
@@ -1672,6 +1792,7 @@ const makeImpl = <
     isSchemaClass ? Object.assign(Object.create((rawModel as any).prototype), decoded) : decoded
 
   const decodeRecord = (raw: globalThis.Record<string, unknown>) => {
+    deserializeSparseFields(raw)
     renameFromDynamo(raw)
     return Schema.decodeUnknownEffect(schemas.recordSchema as Schema.Codec<any>)(raw).pipe(
       Effect.map(attachPrototype),
@@ -1693,6 +1814,10 @@ const makeImpl = <
     mode: DecodeMode,
   ) => {
     if (mode === "native") return Effect.succeed(marshalled)
+    // Collect flattened sparse-map attributes back into the domain Record.
+    // Must happen before rename so the rebuilt Record sits at the domain field
+    // name (sparse field renaming is not supported).
+    deserializeSparseFields(raw)
     // Rename DynamoDB attributes back to domain field names. Substituted
     // schemas handle wire→domain conversion (date primitives, Redacted, etc.).
     renameFromDynamo(raw)
@@ -2174,6 +2299,17 @@ const makeImpl = <
 
           // Rename domain fields to DynamoDB attribute names
           renameToDynamo(item)
+          // Flatten sparse Map fields into per-entry top-level attributes.
+          // Wrapped to surface key-validation errors as ValidationError.
+          try {
+            serializeSparseFields(item)
+          } catch (e) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "put.sparse",
+              cause: e instanceof Error ? e.message : String(e),
+            })
+          }
 
           const marshalledItem = toAttributeMap(item)
 
@@ -2550,11 +2686,31 @@ const makeImpl = <
               ...(currentRaw as globalThis.Record<string, unknown>),
             }
             renameFromDynamo(currentDomainItem)
+            // Rebuild sparse Map fields from flattened attrs into domain Records.
+            // Done in-place on the renamed domain item so subsequent merge logic
+            // operates on domain shape and re-flattening happens once at the end.
+            deserializeSparseFields(currentDomainItem)
             const newItem: globalThis.Record<string, unknown> = { ...currentDomainItem }
+            // Apply user updates. For sparse fields, merge bucket-by-bucket
+            // rather than whole-field replace — concurrent writers to disjoint
+            // buckets must coexist (the version CAS protects against same-bucket
+            // races). Non-sparse fields use the existing replace semantics.
             for (const [attr, val] of Object.entries(
               hydratedUpdates as globalThis.Record<string, unknown>,
             )) {
-              if (val !== undefined) newItem[attr] = val
+              if (val === undefined) continue
+              if (
+                hasSparseFields &&
+                attr in sparseFields &&
+                val !== null &&
+                typeof val === "object"
+              ) {
+                const existing =
+                  (newItem[attr] as globalThis.Record<string, unknown>) ?? {}
+                newItem[attr] = { ...existing, ...(val as globalThis.Record<string, unknown>) }
+              } else {
+                newItem[attr] = val
+              }
             }
 
             // Apply rich operations to in-memory item
@@ -2665,6 +2821,16 @@ const makeImpl = <
 
             // Convert back to DynamoDB attribute names for storage
             renameToDynamo(newItem)
+            // Flatten sparse Map fields into per-entry top-level attributes.
+            try {
+              serializeSparseFields(newItem)
+            } catch (e) {
+              return yield* new ValidationError({
+                entityType,
+                operation: "update.sparse",
+                cause: e instanceof Error ? e.message : String(e),
+              })
+            }
 
             const marshalledNewItem = toAttributeMap(newItem)
 
@@ -2869,6 +3035,32 @@ const makeImpl = <
           for (const [attr, val] of Object.entries(encodedUpdatesMap)) {
             if (val === undefined) continue
             if (updateSystemColliders.has(attr)) continue
+
+            // Sparse fields: emit one SET per bucket. Whole-bucket replace
+            // semantics — concurrent writers to disjoint buckets are safe.
+            // `null` is NOT REMOVE — that's footgunny; explicit removal goes
+            // through `.removeEntries(field, keys)`.
+            if (hasSparseFields && attr in sparseFields) {
+              if (val === null || typeof val !== "object") continue
+              const sparse = sparseFields[attr]!
+              for (const [k, v] of Object.entries(val as globalThis.Record<string, unknown>)) {
+                if (typeof k !== "string" || k.length === 0 || k.includes("#")) {
+                  return yield* new ValidationError({
+                    entityType,
+                    operation: "update.sparse",
+                    cause: `Sparse map "${attr}": invalid key ${JSON.stringify(k)}`,
+                  })
+                }
+                const nameKey = `#u${counter}`
+                const valKey = `:u${counter}`
+                names[nameKey] = `${sparse.prefix}#${k}`
+                values[valKey] = toAttributeValue(v)
+                setClauses.push(`${nameKey} = ${valKey}`)
+                counter++
+              }
+              continue
+            }
+
             const nameKey = `#u${counter}`
             const valKey = `:u${counter}`
             names[nameKey] = resolveDbName(attr)
@@ -3486,6 +3678,36 @@ const makeImpl = <
             if (systemColliders.has(attr)) continue
             if (val === undefined) continue
 
+            // Sparse fields: expand into one SET per bucket. Each bucket
+            // attribute is named `<prefix>#<key>` and goes through
+            // ExpressionAttributeNames as a literal (the `#` survives).
+            if (hasSparseFields && attr in sparseFields) {
+              if (val === null || typeof val !== "object") continue
+              const sparse = sparseFields[attr]!
+              for (const [k, v] of Object.entries(val as globalThis.Record<string, unknown>)) {
+                try {
+                  if (typeof k !== "string" || k.length === 0 || k.includes("#")) {
+                    throw new Error(
+                      `Sparse map "${attr}": invalid key ${JSON.stringify(k)}`,
+                    )
+                  }
+                } catch (e) {
+                  return yield* new ValidationError({
+                    entityType,
+                    operation: "upsert.sparse",
+                    cause: e instanceof Error ? e.message : String(e),
+                  })
+                }
+                const nameKey = `#u${counter}`
+                const valKey = `:u${counter}`
+                names[nameKey] = `${sparse.prefix}#${k}`
+                values[valKey] = toAttributeValue(v)
+                setClauses.push(`${nameKey} = ${valKey}`)
+                counter++
+              }
+              continue
+            }
+
             const nameKey = `#u${counter}`
             const valKey = `:u${counter}`
             names[nameKey] = resolveDbName(attr)
@@ -3878,6 +4100,21 @@ const makeImpl = <
       // eventItem (only decoded fields are), but defensively clear them.
       for (const field of gsiKeyFields()) {
         delete eventItem[field]
+      }
+      // Sparse-map fields are aggregate state, not event state. They live on
+      // the current item only — strip from event items entirely. (Same
+      // treatment as enrichment fields outside `appendInput`. By design,
+      // `appendInput` cannot include sparse fields, so this is defensive.)
+      if (hasSparseFields) {
+        for (const fieldName of Object.keys(sparseFields)) {
+          delete eventItem[fieldName]
+          // Also strip any flattened bucket attrs that might have leaked in
+          // via a future code change — defensive cleanup.
+          const prefixWithDelim = `${sparseFields[fieldName]!.prefix}#`
+          for (const k of Object.keys(eventItem)) {
+            if (k.startsWith(prefixWithDelim)) delete eventItem[k]
+          }
+        }
       }
 
       const marshalledEventItem = toAttributeMap(eventItem)
@@ -4685,6 +4922,7 @@ const makeImpl = <
     _resolvedRefs: resolvedRefs,
     /** @internal Full decode pipeline: rename + schema decode. Used by Batch/Aggregate. */
     _decodeRecord: decodeRecord,
+    _serializeSparseFields: serializeSparseFields,
     _attachPrototype: attachPrototype,
     _configure: (
       injectedSchema: DynamoSchema.DynamoSchema,

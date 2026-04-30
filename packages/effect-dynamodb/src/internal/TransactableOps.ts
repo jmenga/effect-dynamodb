@@ -123,5 +123,18 @@ export const validateAndBuildPutItem = (
     }
     if (sf.version) item[sf.version] = 1
 
+    // Flatten sparse-map fields into per-entry top-level attributes. Throws
+    // on invalid keys; surface as ValidationError at the entity boundary.
+    try {
+      entity._serializeSparseFields(item)
+    } catch (e) {
+      return yield* new ValidationError({
+        entityType: entity.entityType,
+        operation,
+        cause: e instanceof Error ? e.message : String(e),
+      })
+    }
+
+
     return toAttributeMap(item)
   })
