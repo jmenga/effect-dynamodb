@@ -1,9 +1,10 @@
 # Design: `timeSeries` entity primitive
 
-**Issue:** [#8](https://github.com/jmenga/effect-dynamodb/issues/8)
-**Status:** Proposed — ready for review
+**Issue:** [#8](https://github.com/jmenga/effect-dynamodb/issues/8) (initial design),
+[#33](https://github.com/jmenga/effect-dynamodb/issues/33) (stale-as-error + `.skipFollowUp()` revision)
+**Status:** Implemented. Revised in v2 (April 2026) — see §4.7 / §6.2 / §12.5–6 for the revision and the v1 decisions it overturns.
 **Affected package:** `packages/effect-dynamodb` only
-**Semver impact:** `minor`
+**Semver impact:** `minor` (lockstep at 0.x.0; the API change to `append`'s return type is technically breaking but pre-1.0 the convention is a minor bump)
 
 ---
 
@@ -286,26 +287,120 @@ Refs are a create-time denormalisation; once frozen on the current by an earlier
 
 Concretely: `appendInput` is forbidden from declaring any `${ref}Id` field. Validation `EDD-9014` (§2.5) enforces this at `make()` time.
 
-### 4.7 Return type — why "stale" is a Success
+### 4.7 Return type — stale-as-error (REVISED, supersedes v1 stale-as-value)
+
+> **Revision history.** v1 modelled stale outcomes as success values
+> (`{ applied: false, reason: "stale", current }` discriminated against
+> `{ applied: true, current }`). After several months of real use, that
+> shape was overturned: it routinely produced bugs where callers
+> destructured `r.current` without inspecting `r.applied`, and it
+> bypassed Effect's idiomatic error handling (`catchTag` / `retry` /
+> `orElse`) on a contract whose only purpose is to model write failure.
+> v2 (issue #33) puts stale and user-condition rejection on the
+> Effect ERROR channel as tagged errors. The v1 rationale below is
+> preserved for posterity in §12 decisions 5 and 6.
+
+**v2 contract — `BoundAppend` builder + tagged errors.**
+
+`db.entities.X.append(input)` returns a fluent **`BoundAppend`** builder
+(matching `BoundPut` / `BoundUpdate` / `BoundDelete`) that is yieldable in
+`Effect.gen` and exposes:
+
+- `.condition(...)` — AND a user condition onto the CAS predicate.
+- `.skipFollowUp()` — skip the post-transaction `GetItem`. Narrows the
+  success channel to `void` and collapses error disambiguation (see below).
+- `.asEffect()` — convert to `Effect` for combinator interop
+  (`Effect.catchTag`, `Effect.map`, etc.).
+
+The Effect type produced by yielding the builder:
 
 ```ts
-type AppendResult<Model> =
-  | { readonly applied: true;  readonly current: Model }
-  | { readonly applied: false; readonly reason: "stale"; readonly current: Model }
+// Default path:
+yield* db.entities.Telemetry.append(input)
+//  ↳ Effect<{ readonly current: Model },
+//           DynamoClientError | ValidationError | StaleAppend | ConditionalCheckFailed,
+//           never>
 
-readonly append: (input: AppendInput) =>
-  Effect.Effect<AppendResult<Model>, DynamoClientError | ValidationError, never>
+// .skipFollowUp() path:
+yield* db.entities.Telemetry.append(input).skipFollowUp()
+//  ↳ Effect<void,
+//           DynamoClientError | ValidationError | StaleAppend,
+//           never>
 ```
 
-`current` in the stale branch is obtained via a follow-up `GetItem` — when AWS returns `TransactionCancelledException` with `reasons[0].Code === "ConditionalCheckFailed"`, we issue a second `GetItem` on the primary key and decode it with the record schema before returning `{ applied: false, reason: "stale", current: <decoded> }`. If that follow-up read itself fails or the item has vanished (possible during TTL edge cases), return a plain `DynamoClientError` in the Error channel (the stream snapshot disappeared out from under us — not a stale-drop).
+**Two new tagged errors** (additions to `Errors.ts`):
 
-**Why not a tagged error?** Stale is an EXPECTED outcome — in a 100-device fleet all publishing every second with some clock skew, you want ~10% of appends to no-op cheaply. Modelling that as an `Effect.fail` forces every caller to `Effect.catchTag("StaleAppend", …)` at every call-site, which is ceremony for a value. The discriminated-union return makes the stale branch impossible to forget (TypeScript exhaustiveness on `applied`) while keeping the Error channel for genuinely broken conditions (network, throttle, malformed input).
+```ts
+export class StaleAppend extends Data.TaggedError("StaleAppend")<{
+  readonly entityType: string
+  readonly orderByField: string
+  readonly attemptedOrderBy: unknown
+  readonly current: Option.Option<unknown>
+}> {}
 
-This mirrors Effect's own `Queue.offer` pattern (boolean-result, not error).
+// ConditionalCheckFailed augmented with optional `current` field:
+export class ConditionalCheckFailed extends Data.TaggedError("ConditionalCheckFailed")<{
+  readonly entityType: string
+  readonly key: Record<string, unknown>
+  readonly current?: Option.Option<unknown>
+}> {}
+```
+
+`current` is typed `Option<unknown>` (not `Option<Model>`) because tagged
+errors in this library don't carry the entity's model generic; callers that
+need a typed value can decode it with the entity's record schema themselves.
+
+**Disambiguation algorithm** (default path):
+
+1. `TransactWriteItems` succeeds → success branch, return
+   `{ current }` from a follow-up `GetItem`.
+2. `TransactWriteItems` cancels (CAS or user condition) → issue the
+   follow-up `GetItem` regardless. Then:
+   - If the stored `orderBy >= attempted`, the CAS predicate fired →
+     fail with `StaleAppend(current: Option.some(<winner>))`.
+   - Otherwise (`stored < attempted`), the CAS would have held, so the
+     user-supplied `.condition()` is the only thing that could have
+     rejected → fail with
+     `ConditionalCheckFailed(current: Option.some(<winner>))`.
+   - If no user condition was supplied, only the CAS could have fired →
+     `StaleAppend`.
+3. **CAS takes precedence.** When both conditions could plausibly have
+   rejected (stored is newer AND user condition would also have
+   matched/not-matched the live state), we report `StaleAppend`. The CAS
+   is the foundational invariant; user conditions are an opt-in layer
+   on top. Callers should treat `StaleAppend` as the more general
+   outcome and retry with a fresher clock.
+4. If the follow-up `GetItem` itself returns no Item (TTL race or
+   out-of-band delete), surface `ValidationError("append.followUp")` on
+   the error channel — distinct from a CAS-stale outcome.
+
+**`.skipFollowUp()` semantics.** No `GetItem` is issued, so:
+
+- Success channel narrows to `void`.
+- We cannot disambiguate CAS-stale from user-condition rejection, so
+  BOTH cancellation modes collapse to
+  `StaleAppend(current: Option.none())`. Documented in
+  `guides/timeseries.mdx`.
+- TTL races are undetected — the post-transaction state is never read.
+
+This is the right trade-off for high-volume ingest pipelines that don't
+read the result and where the CAS is overwhelmingly the more likely
+rejection cause.
+
+**Why on the error channel (revising v1).** Stale and user-condition
+rejection are PROGRAM-LEVEL FAILURES — the write the caller intended
+did not happen. Effect's error channel exists precisely to make those
+failures visible to typed combinators (`Effect.catchTag`,
+`Effect.retry`, `Effect.orElse`) and impossible to forget at the type
+level. The v1 stale-as-value design hid the failure inside a value;
+v2 surfaces it where Effect's error-handling vocabulary applies
+naturally. Callers that want to ignore stale outcomes write
+`Effect.catchTag("StaleAppend", () => Effect.void)` once at the top of
+their pipeline.
 
 ### 4.8 Duplicate `orderBy` handling — strict `<`
 
-The CAS uses strict `<`, not `<=`. A second append with the same `orderBy` value as what's already on the current returns `{ applied: false, reason: "stale", current }`. The Put of the event is inside the same transaction and is cancelled with the UpdateItem, so no duplicate event is ever written.
+The CAS uses strict `<`, not `<=`. A second append with the same `orderBy` value as what's already on the current fails with `StaleAppend` (carrying the live state in `current: Option.some(...)`). The Put of the event is inside the same transaction and is cancelled with the UpdateItem, so no duplicate event is ever written.
 
 **Rationale:** idempotence. An IoT publisher retrying the same message (at-least-once delivery) must not create duplicate events. Duplicates in the event log are a data-quality disaster downstream. The issue explicitly calls for strict `<`; this design confirms it.
 
@@ -414,15 +509,34 @@ export type AppendInputType<TModel extends Schema.Top, TAppendInput> =
     : ModelType<TModel>
 ```
 
-### 6.2 Return discriminated union
+### 6.2 Return type — `BoundAppend` builder + tagged errors (REVISED)
+
+> **Revised in v2.** The original `AppendResult<Model>` discriminated
+> union has been removed. See §4.7 for the rationale.
 
 ```ts
-export type AppendResult<TModel extends Schema.Top> =
-  | { readonly applied: true;  readonly current: ModelType<TModel> }
-  | { readonly applied: false; readonly reason: "stale"; readonly current: ModelType<TModel> }
+// Public success-only type extractor (replaces AppendResult<Model>):
+export type AppendSuccess<TModel extends Schema.Top> = {
+  readonly current: ModelType<TModel>
+}
 ```
 
-Exported from `packages/effect-dynamodb/src/Entity.ts` alongside `Model`, `Record`, etc. (top-level type extractor set at `Entity.ts:4164`).
+The full surface is the fluent `BoundAppend` builder (defined in
+`internal/BoundCrud.ts`):
+
+```ts
+export interface BoundAppend<Model, A, E, ESkip> extends Pipeable.Pipeable {
+  readonly condition: (cond: ConditionArg<Model>) => BoundAppend<Model, A, E, ESkip>
+  readonly skipFollowUp: () => BoundAppend<Model, void, ESkip, ESkip>
+  readonly asEffect: () => Effect.Effect<A, E, never>
+  readonly [Symbol.iterator]: () => Iterator<Effect.Effect<A, E, never>, A>
+}
+```
+
+Errors flow through `E` / `ESkip` so the type-level success channel
+narrows correctly under `.skipFollowUp()`. Both `StaleAppend` and the
+augmented `ConditionalCheckFailed` are exported from the barrel
+(`packages/effect-dynamodb/src/index.ts`).
 
 ### 6.3 `.history(key)` parameter
 
@@ -439,12 +553,13 @@ The PathBuilder on `.where()` exposes exactly `{ [orderBy]: string }` — nothin
 ### 7.1 Reused
 
 - `DynamoClientError` — network / throttle / generic AWS failure on TransactWriteItems or the follow-up GetItem
-- `ValidationError` — input decode failure, partial GSI composite on append
+- `ValidationError` — input decode failure, partial GSI composite on append, and TTL race on the default path (`operation: "append.followUp"`)
 - `TransactionOverflow` — if the transaction payload (append + event + sentinel rotations) somehow exceeds 100 items
 
-### 7.2 NOT introduced
+### 7.2 Introduced (REVISED — v1 said NOT introduced)
 
-- **No `StaleAppendError`.** As argued in §4.7, stale is a value in the return type, not an error.
+- **`StaleAppend`** — fires when the CAS predicate (`stored < attempted`) rejected the write, or when `.skipFollowUp()` collapses both rejection modes into one. Carries `entityType`, `orderByField`, `attemptedOrderBy`, and `current: Option.Option<unknown>`.
+- **`ConditionalCheckFailed`** (augmented) — gains an optional `current?: Option.Option<unknown>` field for the append disambiguation case (CAS held, user condition rejected). Existing call sites pass `key`/`entityType` only and are unaffected (the field is optional).
 - **No `HistoryDecodeError`.** `ValidationError` covers it.
 
 ### 7.3 Configuration errors at `Entity.make()`
@@ -677,17 +792,59 @@ Events are full model snapshots written by `.append()`. Callers who construct wi
 
 `.append()` is already internally a 2-item `TransactWriteItems`. Exposing it as a transactable intermediate means (a) a new `EntityAppend` op type with extraction logic in `Transaction.ts`, (b) a redesign of the stale-return contract to survive user-transaction cancellation, and (c) the follow-up `GetItem` for `current` cannot happen inside the transaction. Cut scope for v1; revisit when a concrete cross-entity-atomicity use case emerges. `.append()` in v1 is a `BoundEntity`-only terminal operation that builds and executes its own transaction.
 
-### 5. User conditions via `Entity.condition(...)` on `.append()` — **included**
+### 5. User conditions via `.condition(...)` on `.append()` — **included** (REVISED in v2)
 
-Symmetry with `.put()`, `.update()`, `.delete()`. ANDed onto the UpdateItem's ConditionExpression alongside the CAS predicate. A user condition that fails cancels the transaction the same way the CAS condition does; we cannot distinguish "stale" from "user-condition failed" from the cancellation reason code alone. For v1, both failures map to `{ applied: false, reason: "stale", current }`.
+Symmetry with `.put()`, `.update()`, `.delete()`. ANDed onto the UpdateItem's
+ConditionExpression alongside the CAS predicate.
 
-> **Follow-up consideration** (not blocking v1): if users need to distinguish "stale" from "my explicit condition failed," the return discriminant can grow a third variant (`reason: "condition"`). Defer until someone asks.
+**v1 behaviour:** A user condition that fails cancels the transaction the
+same way the CAS condition does; without a follow-up GetItem we cannot
+distinguish "stale" from "user-condition failed" from the cancellation
+reason code alone. v1 collapsed both failures into
+`{ applied: false, reason: "stale", current }`.
 
-### 6. Stale branch `current` — included via follow-up `GetItem`
+**v2 behaviour:** The default-path follow-up `GetItem` is now used for
+disambiguation as well as for surfacing `current` (see §4.7). With
+`stored` and `attempted` in hand, we report:
 
-The stale branch of the return discriminant includes `current: Model`, populated by a follow-up `GetItem` on the primary key after the transaction cancels. Reconciliation workflows almost always need to know what won in order to decide next steps (retry with bumped clock, enqueue reconciliation, log-and-move-on). The extra RCU is cheap compared to the UpdateItem + Put WCU of the original append.
+- `StaleAppend(current)` when the stored `orderBy >= attempted` (CAS
+  fired, or both fired — CAS takes precedence).
+- `ConditionalCheckFailed(current)` when stored `orderBy < attempted`
+  AND a user condition was supplied (CAS held → user condition is the
+  rejecter).
 
-If the follow-up `GetItem` itself fails, or the row has vanished (TTL edge case), the error is surfaced on the `Effect` Error channel as `DynamoClientError` — not as `{ applied: false }`. That distinguishes "you lost the CAS" from "something broke after you lost the CAS."
+The `.skipFollowUp()` path retains the v1-style collapse — both modes
+map to `StaleAppend(current: Option.none())` because the GetItem that
+would disambiguate did not run.
+
+### 6. Stale `current` — via follow-up `GetItem`, opt-out via `.skipFollowUp()` (REVISED)
+
+**v1 behaviour:** The stale branch of the return discriminant always
+included `current: Model`, populated by a mandatory follow-up
+`GetItem`. The extra RCU was justified as cheap compared to the
+UpdateItem + Put WCU of the original append.
+
+**v2 behaviour:** The follow-up GetItem is still on by default, and now
+serves a dual purpose (carrying `current` AND disambiguating CAS vs
+user-condition rejection). But callers who don't need `current` —
+high-volume telemetry pipelines, fire-and-forget ingest paths — can
+opt out via `.skipFollowUp()` per issue #33's analysis. The trade-off
+is documented in `guides/timeseries.mdx`:
+
+| | Default | `.skipFollowUp()` |
+|---|---|---|
+| TransactWriteItems | issued | issued |
+| Follow-up GetItem | issued | **skipped** |
+| Success channel | `{ current: Model }` | `void` |
+| `StaleAppend.current` | `Option.some(<winner>)` | `Option.none()` |
+| `ConditionalCheckFailed` distinguishable | yes | no — collapses to `StaleAppend` |
+| TTL race detection | yes (→ `ValidationError`) | no — undetected |
+
+If the follow-up `GetItem` itself fails (network, throttle), the error
+surfaces on the `Effect` Error channel as `DynamoClientError`. If the
+GetItem returns no Item (TTL race or out-of-band delete), it surfaces
+as `ValidationError("append.followUp")`. Both are distinct from
+`StaleAppend`.
 
 ---
 

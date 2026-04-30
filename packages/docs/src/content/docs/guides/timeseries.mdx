@@ -105,22 +105,17 @@ const Telemetries = Entity.make({
 
 Time-series entities auto-suppress `updatedAt` — the `orderBy` attribute IS the update clock. `createdAt` is preserved and materialised via `if_not_exists` on the first append.
 
-## `.append()` — the stale branch
+## `.append()` — success type and stale-as-error
 
 ```typescript region="append" example="guide-timeseries.ts"
-const r = yield* db.entities.Telemetries.append({
+const { current } = yield* db.entities.Telemetries.append({
   channel: "c-1",
   deviceId: "d-7",
   timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
   location: "cabinet-A",
   gpio: 1,
 })
-if (r.applied) {
-  yield* Console.log(`Applied. Current timestamp: ${DateTime.formatIso(r.current.timestamp)}`)
-} else {
-  // Stale — someone beat us to the CAS. `r.current` is the winner.
-  yield* Console.log(`Stale (reason=${r.reason}).`)
-}
+yield* Console.log(`Applied. Current timestamp: ${DateTime.formatIso(current.timestamp)}`)
 ```
 
 Internally, `.append(input)` issues a single `TransactWriteItems` with two items:
@@ -128,17 +123,64 @@ Internally, `.append(input)` issues a single `TransactWriteItems` with two items
 1. **UpdateItem** on the current — scoped `SET` covers only `appendInput` fields + recomposed GSI keys + optional `#createdAt = if_not_exists(#createdAt, :now)`. The ConditionExpression is `attribute_not_exists(#pk) OR #orderBy < :newOrderBy`.
 2. **Put** of the event — full decoded input + `__edd_e__` + `_ttl` (if configured), GSI keys stripped, SK replaced with `<currentSk>#e#<orderByValue>`.
 
-`.append()` returns a **discriminated union** — stale is a success value, not an error:
+The success channel is `{ readonly current: Model }`. **Stale outcomes are surfaced on the Effect error channel** — handle them with `Effect.catchTag`:
 
-```ts
-type AppendResult<Model> =
-  | { readonly applied: true;  readonly current: Model }
-  | { readonly applied: false; readonly reason: "stale"; readonly current: Model }
+```typescript region="stale" example="guide-timeseries.ts"
+const result = yield* db.entities.Telemetries.append({
+  channel: "c-1",
+  deviceId: "d-7",
+  timestamp: DateTime.makeUnsafe("2026-04-22T09:00:00.000Z"),
+  location: "cabinet-B",
+}).asEffect().pipe(
+  Effect.catchTag("StaleAppend", (e) =>
+    Effect.succeed({
+      applied: false as const,
+      // `e.current` is `Option<unknown>` — use Option.match to handle the
+      // skipFollowUp case where it is `Option.none()`.
+      winner: Option.getOrUndefined(e.current),
+    }),
+  ),
+)
+yield* Console.log(`Stale append surfaced: applied=${"applied" in result}`)
 ```
 
-The stale `current` is populated via a follow-up `GetItem` so reconciliation flows always know what won. If the follow-up read itself fails (network, TTL race), the error surfaces on the `Effect` error channel — it is not reported as a stale drop.
+Two error tags can fire:
 
-**Why not a tagged error?** In a fleet of 100 devices publishing every second with some clock skew, you expect ~10% of appends to no-op. Modelling that as `Effect.fail` forces every caller to `Effect.catchTag` at every call-site — ceremony for a value. The discriminated-union return makes the stale branch impossible to forget (TypeScript exhaustiveness on `applied`) while keeping the error channel for genuinely broken conditions.
+- **`StaleAppend`** — the CAS predicate (`stored < attempted`) rejected the write. `error.current` is `Option.some(<post-state model>)` carrying the winning state from a follow-up `GetItem`. This is the EXPECTED outcome of out-of-order arrivals.
+- **`ConditionalCheckFailed`** — only fires when you supplied an `Entity.condition()` AND that condition rejected the write while the CAS held. `error.current` is `Option.some(<live current>)`.
+
+Both errors carry `current` as `Option<unknown>` rather than `Option<Model>` because tagged errors don't capture the entity's model generic; decode it with the entity's record schema if you need a typed value.
+
+**Why on the error channel?** Stale and user-condition rejection are PROGRAM-LEVEL FAILURES — the write you intended did not happen. Effect's error channel exists precisely to make those failures visible to typed combinators (`Effect.catchTag`, `Effect.retry`, `Effect.orElse`) and impossible to forget at the type level. The previous discriminated-union return hid the failure inside a value, which routinely produced bugs where callers destructured `r.current` without inspecting `r.applied`.
+
+### `.skipFollowUp()` — fire-and-forget ingest
+
+For high-volume ingest paths that don't need `current`, chain `.skipFollowUp()` to suppress the post-transaction `GetItem`. The success channel narrows to `void`:
+
+```typescript region="skip" example="guide-timeseries.ts"
+yield* db.entities.Telemetries.append({
+  channel: "c-1",
+  deviceId: "d-7",
+  timestamp: DateTime.makeUnsafe("2026-04-22T10:01:00.000Z"),
+  gpio: 0,
+})
+  .skipFollowUp()
+  .asEffect()
+  .pipe(
+    Effect.catchTag("StaleAppend", () => Effect.void),
+  )
+```
+
+| | Default | `.skipFollowUp()` |
+|---|---|---|
+| TransactWriteItems | issued | issued |
+| Follow-up GetItem | issued | **skipped** |
+| Success channel | `{ current: Model }` | `void` |
+| `StaleAppend.current` | `Option.some(<winner>)` | `Option.none()` |
+| `ConditionalCheckFailed` | distinguishable | **collapses into `StaleAppend`** |
+| TTL race / row vanished | surfaces as `ValidationError` | **undetected** |
+
+The trade-off is one read saved per append at the cost of (a) losing the disambiguation between CAS and user-condition rejection and (b) losing TTL-race detection. For a telemetry pipeline doing tens of thousands of appends per minute, none of which read the result, this is the right default.
 
 ## Enrichment preservation
 
@@ -225,5 +267,5 @@ Current SKs become `$app#v1#telemetry#status` and `$app#v1#telemetry#diagnostics
 
 - **Not transactable.** `.append()` is a `BoundEntity`-only terminal and cannot be composed into user-authored `Transaction.transactWrite` in v1.
 - **No resurrection via append.** `.append()` + `softDelete` is rejected at `Entity.make()` time (`EDD-9015`).
-- **User conditions via `Entity.condition(...)`** are ANDed onto the CAS predicate. A user-condition failure returns `{ applied: false, reason: "stale" }` — v1 does not distinguish it from a true CAS stale.
+- **User conditions** via `.condition(...)` are ANDed onto the CAS predicate. On the default path, a user-condition failure surfaces as `ConditionalCheckFailed` (distinguishable from `StaleAppend`). On the `.skipFollowUp()` path, both modes collapse into `StaleAppend` — see the table above.
 - **No automated migration from `versioned` to `timeSeries`.** The on-disk SK formats differ (`#v#0000001` vs `#e#<orderBy>`); switching requires a bespoke backfill.

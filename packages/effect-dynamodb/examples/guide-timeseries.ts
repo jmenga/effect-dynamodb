@@ -16,7 +16,7 @@
  *   npx tsx examples/guide-timeseries.ts
  */
 
-import { Console, DateTime, Duration, Effect, Layer, Schema } from "effect"
+import { Console, DateTime, Duration, Effect, Layer, Option, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -123,29 +123,54 @@ const program = Effect.gen(function* () {
 
   // ---------- Append an event ----------
   // #region append
-  const r = yield* db.entities.Telemetries.append({
+  const { current } = yield* db.entities.Telemetries.append({
     channel: "c-1",
     deviceId: "d-7",
     timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
     location: "cabinet-A",
     gpio: 1,
   })
-  if (r.applied) {
-    yield* Console.log(`Applied. Current timestamp: ${DateTime.formatIso(r.current.timestamp)}`)
-  } else {
-    // Stale — someone beat us to the CAS. `r.current` is the winner.
-    yield* Console.log(`Stale (reason=${r.reason}).`)
-  }
+  yield* Console.log(`Applied. Current timestamp: ${DateTime.formatIso(current.timestamp)}`)
   // #endregion
 
-  // A second append with an OLDER orderBy is a stale drop — no error.
-  const stale = yield* db.entities.Telemetries.append({
+  // A second append with an OLDER orderBy is a CAS rejection — surfaced on
+  // the Effect error channel as `StaleAppend`.
+  // #region stale
+  const result = yield* db.entities.Telemetries.append({
     channel: "c-1",
     deviceId: "d-7",
     timestamp: DateTime.makeUnsafe("2026-04-22T09:00:00.000Z"),
     location: "cabinet-B",
+  }).asEffect().pipe(
+    Effect.catchTag("StaleAppend", (e) =>
+      Effect.succeed({
+        applied: false as const,
+        // `e.current` is `Option<unknown>` — use Option.match to handle the
+        // skipFollowUp case where it is `Option.none()`.
+        winner: Option.getOrUndefined(e.current),
+      }),
+    ),
+  )
+  yield* Console.log(`Stale append surfaced: applied=${"applied" in result}`)
+  // #endregion
+
+  // ---------- skipFollowUp — fire-and-forget ingest ----------
+  // High-volume ingest paths that don't need `current` save one RCU per call.
+  // CAS / user-condition rejection still fires `StaleAppend` (current is
+  // Option.none — we cannot disambiguate without the follow-up GetItem).
+  // #region skip
+  yield* db.entities.Telemetries.append({
+    channel: "c-1",
+    deviceId: "d-7",
+    timestamp: DateTime.makeUnsafe("2026-04-22T10:01:00.000Z"),
+    gpio: 0,
   })
-  yield* Console.log(`Second append applied=${stale.applied}`)
+    .skipFollowUp()
+    .asEffect()
+    .pipe(
+      Effect.catchTag("StaleAppend", () => Effect.void),
+    )
+  // #endregion
 
   // ---------- Enrichment preservation ----------
   // #region enrichment

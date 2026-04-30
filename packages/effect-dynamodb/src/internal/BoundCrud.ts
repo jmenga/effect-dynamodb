@@ -376,3 +376,88 @@ export const makeBoundUpdate = <Model, A, U, E>(
   op: EntityUpdate<A, any, U, E, any>,
   config: BoundCrudConfig<Model>,
 ): BoundUpdate<Model, A, U, E> => new BoundUpdateImpl(op, config)
+
+// ---------------------------------------------------------------------------
+// BoundAppend — time-series append() builder
+// ---------------------------------------------------------------------------
+
+/**
+ * Fluent builder for `Entity.append()` on time-series entities.
+ *
+ * `.append(input)` returns a `BoundAppend` carrying `{ current }` on success
+ * and failing with `StaleAppend` (CAS) or `ConditionalCheckFailed`
+ * (user-condition rejected, default path only) on the error channel.
+ *
+ * Combinators:
+ * - `.condition(...)` — AND a user condition onto the CAS predicate.
+ * - `.skipFollowUp()` — skip the post-transaction GetItem; success is `void`,
+ *   user-condition failures collapse into `StaleAppend` (cannot disambiguate).
+ *
+ * ```ts
+ * yield* db.entities.Telemetry.append(input)                 // → { current }
+ * yield* db.entities.Telemetry.append(input).condition(c)    // → { current }
+ * yield* db.entities.Telemetry.append(input).skipFollowUp()  // → void
+ * yield* db.entities.Telemetry.append(input).condition(c).skipFollowUp() // → void
+ * ```
+ */
+export interface BoundAppend<Model, A, E, ESkip> extends Pipeable.Pipeable {
+  /** Add a condition expression. Callback or shorthand. */
+  readonly condition: (cond: ConditionArg<Model>) => BoundAppend<Model, A, E, ESkip>
+  /** Skip the follow-up GetItem; success becomes `void`. */
+  readonly skipFollowUp: () => BoundAppend<Model, void, ESkip, ESkip>
+  /** Convert to an executable Effect for Effect combinator interop. */
+  readonly asEffect: () => Effect.Effect<A, E, never>
+  /** Yield support for `Effect.gen`. */
+  readonly [Symbol.iterator]: () => Iterator<Effect.Effect<A, E, never>, A>
+}
+
+/** @internal Execution wiring for the time-series append() path. */
+export interface BoundAppendConfig<Model> extends BoundCrudConfig<Model> {
+  /** Run the entity's append() Effect with assembled options. */
+  readonly run: (opts: {
+    readonly input: unknown
+    readonly condition: Expr | undefined
+    readonly skipFollowUp: boolean
+  }) => Effect.Effect<unknown, unknown, never>
+}
+
+/** @internal */
+export class BoundAppendImpl<Model, A, E, ESkip> implements BoundAppend<Model, A, E, ESkip> {
+  constructor(
+    readonly _input: unknown,
+    readonly _config: BoundAppendConfig<Model>,
+    readonly _condition: Expr | undefined = undefined,
+    readonly _skip: boolean = false,
+  ) {}
+
+  condition(cond: ConditionArg<Model>): BoundAppendImpl<Model, A, E, ESkip> {
+    const compiled = buildCondition(this._config, cond)
+    return new BoundAppendImpl(this._input, this._config, compiled, this._skip)
+  }
+
+  skipFollowUp(): BoundAppendImpl<Model, void, ESkip, ESkip> {
+    return new BoundAppendImpl(this._input, this._config, this._condition, true)
+  }
+
+  asEffect(): Effect.Effect<A, E, never> {
+    return this._config.run({
+      input: this._input,
+      condition: this._condition,
+      skipFollowUp: this._skip,
+    }) as Effect.Effect<A, E, never>
+  }
+
+  [Symbol.iterator]() {
+    return new Utils.SingleShotGen(this.asEffect()) as any
+  }
+
+  pipe() {
+    return Pipeable.pipeArguments(this, arguments)
+  }
+}
+
+/** @internal */
+export const makeBoundAppend = <Model, A, E, ESkip>(
+  input: unknown,
+  config: BoundAppendConfig<Model>,
+): BoundAppend<Model, A, E, ESkip> => new BoundAppendImpl<Model, A, E, ESkip>(input, config)
