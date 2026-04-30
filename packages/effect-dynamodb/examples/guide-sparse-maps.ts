@@ -1,7 +1,7 @@
 /**
  * Sparse Map Guide Example — effect-dynamodb v2
  *
- * Demonstrates the `storedAs: 'sparse'` storage primitive:
+ * Demonstrates the `storedAs: DynamoModel.SparseMap()` storage primitive:
  *   - Configuring a Record<K, V> field as a sparse map
  *   - Counter ADD on a fresh item (no parent-map ceremony)
  *   - Record-style writes: one SET per bucket (whole-bucket replace)
@@ -46,8 +46,8 @@ class Page extends Schema.Class<Page>("Page")({
 }) {}
 
 const PageModel = DynamoModel.configure(Page, {
-  metrics: { storedAs: "sparse" },
-  totals: { storedAs: "sparse" },
+  metrics: { storedAs: DynamoModel.SparseMap() },
+  totals: { storedAs: DynamoModel.SparseMap() },
 })
 // #endregion
 

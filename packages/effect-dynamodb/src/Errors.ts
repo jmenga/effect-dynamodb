@@ -244,3 +244,54 @@ export class VersionConflict extends Data.TaggedError("VersionConflict")<{
   readonly streamId: string
   readonly expectedVersion: number
 }> {}
+
+/**
+ * EDD-9024 — A GSI composite at hierarchy position `i` was cleared (or
+ * omitted-with-`sparse`) while a composite at position `j > i` was still
+ * present in the composed payload. Composed keys can't carry holes
+ * meaningfully — `acc#A#child#Y` with `parent` cleared composes to a
+ * syntactically invalid prefix that no `begins_with` query would match.
+ *
+ * Raised at write time (Entity.update / time-series .append). The error
+ * names the GSI, the cleared/omitted composite at position `i`, and the
+ * still-present trailing composite at position `j` so callers can locate
+ * the offending payload field.
+ *
+ * See `DESIGN.md §7 Policy-Aware GSI Composition` (hole detection) and
+ * `§7.6 Hierarchical SK Pruning` (the supported trailing-clear case).
+ */
+export class CompositeKeyHoleError extends Data.TaggedError("CompositeKeyHoleError")<{
+  readonly entityType: string
+  readonly indexName: string
+  readonly clearedComposite: string
+  readonly trailingComposite: string
+  readonly clearedPosition: number
+  readonly trailingPosition: number
+  readonly half: "pk" | "sk"
+  /** Human-readable description, prefixed with `EDD-9024`. */
+  readonly message: string
+}> {}
+
+/**
+ * Build a {@link CompositeKeyHoleError} with a formatted message. Centralises
+ * the message format so call sites (KeyComposer, Entity) stay consistent.
+ */
+export const makeCompositeKeyHoleError = (params: {
+  readonly entityType: string
+  readonly indexName: string
+  readonly clearedComposite: string
+  readonly trailingComposite: string
+  readonly clearedPosition: number
+  readonly trailingPosition: number
+  readonly half: "pk" | "sk"
+}): CompositeKeyHoleError =>
+  new CompositeKeyHoleError({
+    ...params,
+    message:
+      `[EDD-9024] Composite key hole on GSI "${params.indexName}" of entity "${params.entityType}": ` +
+      `composite "${params.clearedComposite}" at ${params.half} position ${params.clearedPosition} was cleared ` +
+      `(or omitted under sparse policy), but composite "${params.trailingComposite}" at ${params.half} position ${params.trailingPosition} is still present. ` +
+      `Composed keys cannot carry holes — either supply a value for "${params.clearedComposite}", ` +
+      `clear all trailing composites (>= position ${params.trailingPosition}) too, ` +
+      `or use Entity.remove(["${params.clearedComposite}"]) to drop the whole GSI.`,
+  })

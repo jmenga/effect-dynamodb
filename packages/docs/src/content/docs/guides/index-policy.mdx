@@ -1,25 +1,69 @@
 ---
-title: "indexPolicy — Sparse & Preserved GSIs"
-description: "Control how updates and appends handle missing GSI composites: sparse drops out, preserve leaves alone"
+title: "indexPolicy — Per-Composite GSI Membership Rules"
+description: "Per-composite policy controlling what update payload omission and explicit clears mean for GSI keys. Three-way classification, hierarchical SK pruning, hole detection."
 ---
 
-import { Aside, Code } from "@astrojs/starlight/components"
+import { Aside } from "@astrojs/starlight/components"
 
-`Entity.update` and time-series `.append` let you write partial payloads — you don't have to supply every attribute of every GSI composite. But what should the library *do* when a GSI's composites are only partially present? Three intents share one signal:
+<Aside type="caution" title="This 'sparse' is not the SparseMap 'sparse'">
+This guide covers `indexPolicy: () => ({ attr: 'sparse' | 'preserve' })` — controlling whether an *update* drops a *GSI* membership when a composite is missing. It is unrelated to the **SparseMap storage primitive** (`storedAs: DynamoModel.SparseMap()`), which controls how a `Schema.Record` field is *physically stored* on disk. The two were spelled the same up to 1.5.0 and that collision was a frequent source of confusion. See [Sparse Maps](/effect-dynamodb/guides/sparse-maps/) if you're looking for the storage primitive.
+</Aside>
 
-| Intent | Library action |
-|---|---|
-| **Sparse** — the item no longer belongs in this GSI | `REMOVE gsiNpk, gsiNsk` — item drops out |
-| **Preserve** — another writer owns this composite; leave the stored keys alone | Do not touch `gsiNpk`/`gsiNsk` |
-| **Recompose** — all composites present | SET both halves |
+`Entity.update` and time-series `.append` accept partial payloads. `indexPolicy` lets you state, **per composite attribute**, what an *omission* means for the GSI's membership — and the library treats *explicit clears* (`set({ attr: null | undefined })`) as a separate, unconditional cascade signal.
 
-`indexPolicy` is how you tell the library which intent applies to each composite attribute of a given GSI. Default: `preserve` for every attr on every GSI. Declare `sparse` only where you want an update to be able to drop the item out of that GSI.
+## Mental model — unified attribute hierarchy
 
-## When you need it
+Every GSI is a single ordered hierarchy of composite attributes:
 
-- **Hybrid-writer GSIs.** A device-ingest writer sets `alertState` per-event; an enrichment writer sets `tenantId` once. Both writers' updates touch the same device item. Without `indexPolicy`, every ingest update would attempt to recompose the `byTenant` GSI and — since ingest doesn't supply `tenantId` — silently leave the half un-rewritten. That's the default `preserve` behavior, which is what you want. But if you also want `byAlert` to clear when an alert is resolved (alertState cleared from the payload), you need `sparse` on `alertState`.
-- **Conditional indexing.** An item should be in a GSI only when a specific attribute is populated (e.g., `status === "active"`). Set `sparse` on that attribute; when an update nulls it, the item drops out.
-- **Migration / backfill scripts.** Default `preserve` lets you run partial updates without worrying about accidentally blanking GSIs the script doesn't know about.
+```
+[pk_1, ..., pk_n,  sk_1, ..., sk_m]
+└─ partition prefix ─┘└─ sort/begins_with extension ─┘
+```
+
+PK composites form the partition prefix; SK composites extend it for sort and `begins_with` queries. **Policy is per attribute**, but outcomes roll up to the two stored key fields (`gsiNpk`, `gsiNsk`). Reasoning follows position in the hierarchy:
+
+- Clearing a leaf SK composite is a **demotion** — the item stays at coarser scope.
+- Clearing an interior PK composite is a **partition migration** — almost always wrong, hence treated unconditionally as "drop the GSI".
+
+This single-hierarchy framing is the key shift in v2. The pre-1.6 "two halves, mostly independent" framing didn't surface these distinctions and led to silent footguns.
+
+## Three-way payload classification
+
+The runtime distinguishes three states for each composite attribute. Collapsing any two would be a footgun:
+
+| Payload state | What library does | Policy consulted? |
+|---|---|---|
+| `attr: <value>` | Use the value when composing the key | No |
+| `attr: null` *or* `attr: undefined` (explicit clear) | Treat as explicit clear. The two collapse — `null` vs `undefined` was a long-running source of dev confusion. **Cascades unconditionally; policy does not protect an explicit clear.** | No (always cascade) |
+| (key omitted from payload) | Defer to policy for this attribute | **Yes** |
+
+This is the core change in v2: **omission is the only ambiguous signal**, so it's the only signal `indexPolicy` resolves. Explicit `null`/`undefined` is now an unambiguous "remove this composite from the key now" instruction.
+
+## Per-attribute outcomes
+
+### Omission (attr not in payload)
+
+| Policy | Composite is in PK | Composite is in SK |
+|---|---|---|
+| `'sparse'` | REMOVE both keys (item drops from GSI) | REMOVE both keys |
+| `'preserve'` (default) | No-op — leave stored GSI key attributes untouched | No-op |
+
+### Explicit clear (`attr: null` or `attr: undefined`)
+
+Policy is bypassed; cascade is unconditional.
+
+| Policy | Composite is in PK | Composite is in SK |
+|---|---|---|
+| `'sparse'` | REMOVE both keys | REMOVE both keys |
+| `'preserve'` | REMOVE both keys (degrades to sparse on PK — see below) | **Truncate `gsiNsk`** at this composite — see [Hierarchical SK Pruning](#hierarchical-sk-pruning) |
+
+### Cascade — `Entity.remove([attr])`
+
+Always REMOVEs both key fields for any GSI containing the named attribute, regardless of policy or position. This is the explicit *full drop* primitive.
+
+### PK/SK asymmetry on `preserve` clear
+
+PK composites form the partition prefix; clearing one and "preserving" everything else would migrate the item to a different partition, silently breaking queries against the prior partition. The library treats `preserve` on a PK composite, when that composite is explicitly cleared, as **degraded to `sparse`**: drop the GSI entirely. The narrow case where you genuinely want to migrate partitions can do so via `Entity.remove([attr])` plus a follow-up update with the new value — but the default refuses to do it silently.
 
 ## Declaring a policy
 
@@ -57,11 +101,78 @@ const Devices = Entity.make({
 })
 ```
 
-The policy is a function so it can branch on the item's current state (e.g. return `"sparse"` only when `item.status === "draft"`). If you return nothing or don't declare `indexPolicy` at all, every composite defaults to `"preserve"`.
+The policy is a function so it can branch on the item's current state (e.g. return `'sparse'` only when `item.status === 'draft'`). If you don't declare `indexPolicy` at all, every composite defaults to `'preserve'`.
 
-## Sparse drop-out
+## Hierarchical SK pruning
 
-Declaring `indexPolicy` opts the GSI into **event-style evaluation**: the policy is consulted on every update, regardless of which attributes appear in the payload. "Absent from the payload" is treated as "not set" per the policy — so a `sparse` composite that isn't in the update payload triggers the drop-out rule:
+When you explicitly clear a *trailing* SK composite whose `indexPolicy` is `preserve`, the library **truncates `gsiNsk`** at that composite — recomposes the SK from the leading prefix instead of dropping the whole GSI. The PK half is recomposed normally if its composites are all present. The item stays queryable in the GSI, just at a *coarser depth* than before.
+
+This unlocks the **demote-don't-evict** pattern across many real-world hierarchies:
+
+| Domain | SK composite hierarchy | Trailing-clear meaning |
+|---|---|---|
+| Geographic | `[region, country, city, site]` | Asset leaves a site but stays queryable at city/country/region |
+| Org | `[division, department, team, squad]` | Engineer rotates off a squad, stays queryable at team/department/division |
+| Workflow | `[stage, subStage, step]` | Approval step retracted; item stays queryable at parent stage |
+| Content | `[category, subcategory, tag]` | Leaf tag dropped; item stays in subcategory listings |
+| Permission | `[org, project, resource]` | Resource access lost; project-level access preserved |
+| Order grouping | `[customerId, orderId]` | After clearing `orderId`, group-by-customer queries via `begins_with(sk, "customer#C#")` still work |
+
+The unifying property: leaf composites are *refinements* of the parent context; the parent context remains queryable after pruning.
+
+### Worked example — geographic asset hierarchy
+
+```typescript
+indexes: {
+  byLocation: {
+    name: 'gsi1',
+    pk: { field: 'gsi1pk', composite: ['region'] },
+    sk: { field: 'gsi1sk', composite: ['country', 'city', 'site'] },
+    indexPolicy: () => ({
+      region: 'preserve',
+      country: 'preserve',
+      city: 'preserve',
+      site: 'preserve',
+    }),
+  },
+}
+
+// Initial state: asset is at /us/sf/datacenter-1
+// Stored: gsi1sk = "$app#v1#asset#country_us#city_sf#site_datacenter-1"
+
+// Asset leaves the datacenter — clear `site`. Item stays queryable at city level.
+yield* db.entities.Assets.update(key).set({ site: null })
+// gsi1sk truncated to "$app#v1#asset#country_us#city_sf"
+// begins_with(gsi1sk, "$app#v1#asset#country_us#city_sf") still finds this asset.
+
+// Asset leaves the city entirely — clear `city` AND `site`.
+yield* db.entities.Assets.update(key).set({ city: null, site: null })
+// gsi1sk truncated to "$app#v1#asset#country_us"
+
+// Decommission — drop from the index entirely.
+yield* db.entities.Assets.update(key).remove(['country'])
+// REMOVE gsi1pk, gsi1sk — full drop, cascade overrides truncation.
+```
+
+### Hole detection (EDD-9024)
+
+A "hole" is an SK composite cleared at position `i` with another SK composite at position `j > i` still present. Composed keys can't carry holes meaningfully — `acc#A#child#Y` with `parent` cleared composes to a syntactically invalid prefix that no `begins_with` query would match.
+
+The library throws `CompositeKeyHoleError` (EDD-9024) at write time, naming the GSI, the cleared composite at position `i`, and the still-present trailing composite at position `j`:
+
+```typescript
+// Hole pattern — throws at write time:
+yield* db.entities.Assets.update(key).set({ city: null, site: 'datacenter-2' })
+// → CompositeKeyHoleError [EDD-9024]:
+//   composite "city" at sk position 1 was cleared, but composite "site" at
+//   sk position 2 is still present.
+```
+
+To resolve: either supply a value for the cleared composite, clear all trailing composites too, or use `Entity.remove([attr])` to drop the whole GSI explicitly.
+
+## Sparse drop-out (the original `'sparse'`)
+
+Declaring `indexPolicy` opts the GSI into **always-evaluated** semantics. Omission is treated as "not set" per the policy — so a `sparse` composite that isn't in the update payload triggers the drop-out rule:
 
 ```typescript region="sparse-drop" example="guide-index-policy.ts"
   // #region sparse-drop
@@ -74,8 +185,6 @@ Declaring `indexPolicy` opts the GSI into **event-style evaluation**: the policy
   const afterDrop = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
   // →  afterDrop is empty — item dropped out of the alert GSI
 ```
-
-This is the key semantic shift: with `exactOptionalPropertyTypes: true`, a TypeScript object that omits `alertState` is distinct from one that sets `alertState: undefined`. Both now behave identically at runtime — the policy treats both as "not currently set." You don't need to remember to explicitly pass `undefined` to signal drop intent.
 
 Re-adding the attr re-indexes the item transparently:
 
@@ -91,7 +200,7 @@ Re-adding the attr re-indexes the item transparently:
 
 ## Preserve — the default
 
-With the `preserve` default, a writer that doesn't own every composite of a GSI can still freely update other attrs without touching the GSI:
+With `preserve`, a writer that doesn't own every composite of a GSI can update other attrs without touching the GSI's keys:
 
 ```typescript region="hybrid" example="guide-index-policy.ts"
   // #region hybrid
@@ -115,52 +224,7 @@ With the `preserve` default, a writer that doesn't own every composite of a GSI 
   // →  both queries return d-2
 ```
 
-The ingest writer's `Entity.set({ alertState: "active" })` touches `byAlert` (recomposes its keys) and **also** touches `byTenant` (because `byTenant.sk` has `deviceId`, which is in the primary key → always in the merged payload). Because `tenantId` is `"preserve"` and missing from the payload, the library leaves `byTenant`'s stored keys alone rather than rewriting them with a junk value. That's the whole point.
-
-## Decision rules
-
-### When is a GSI evaluated?
-
-- **GSI declares `indexPolicy`** → evaluated on **every** update. Policy-first semantics: "what the policy says, regardless of payload."
-- **GSI has no `indexPolicy`** → evaluated only when at least one of its composites appears in the update payload, or when `Entity.remove([attr])` names one of its composites. Matches conventional partial-update semantics.
-
-### Per-GSI resolution
-
-For each evaluated GSI, the library computes the merged record (primary key + update payload) and applies these rules, in order:
-
-1. **`Entity.remove()` cascade** — if the update REMOVEs any composite attribute of this GSI, REMOVE both `gsiNpk` and `gsiNsk`. Takes precedence over `indexPolicy`.
-2. **Sparse wins** — if any composite is absent and its policy is `"sparse"`, REMOVE both halves.
-3. **Full recompose** — all composites present → SET both halves.
-4. **Half-wise preserve** — some composites missing with policy `"preserve"`, none with `"sparse"`:
-   - If a half's composites are all present, SET that half.
-   - If a half has a missing-preserve composite, leave that half alone (no SET, no REMOVE).
-
-The "half-wise" behavior is what makes hybrid GSIs work: your primary key's `deviceId` alone is enough to recompose the sk half of `byTenant` (if the sk's only composite is `deviceId`), while the pk half — which requires `tenantId` — stays untouched.
-
-## Interaction with `put()`
-
-`put()` does NOT consult `indexPolicy`. It always omits a GSI's keys when any of its composites is missing (unchanged pre-existing behavior). `indexPolicy` only resolves the update/append ambiguity, because those operations have a stored item to reason about. A fresh `put()` doesn't — missing composite = not in this index.
-
-## Interaction with time-series `.append()`
-
-`indexPolicy` is applied during `.append()` too, with one extra constraint: returned policy keys must be members of `appendInput`. Composites outside `appendInput` are by contract never changed by an append, so their policy can't fire at append-time — they default to `"preserve"` unconditionally, leaving the half that contains them untouched.
-
-This means a GSI like `byAccountAlert` with `pk.composite: ["accountId", "alertState"]` where `accountId` is enrichment-owned (not in `appendInput`) behaves correctly under ingest-side `.append()` calls: the pk half is left alone (accountId preserve, untouched), while any sk composite (e.g. `timestamp`) in `appendInput` is recomposed on every event.
-
-```typescript
-indexes: {
-  byAccountAlert: {
-    name: "gsi6",
-    pk: { field: "gsi6pk", composite: ["accountId", "alertState"] },
-    sk: { field: "gsi6sk", composite: ["timestamp"] },
-    indexPolicy: () => ({
-      accountId:  "preserve" as const,  // Not in appendInput — always preserve at append
-      alertState: "preserve" as const,  // In appendInput, but keep existing when omitted
-      timestamp:  "preserve" as const,  // In appendInput; always provided (orderBy)
-    }),
-  },
-}
-```
+The ingest writer's `Entity.set({ alertState: "active" })` touches `byAlert` (recomposes its keys) and **also** touches `byTenant` (because `byTenant.sk` has `deviceId`, which is in the primary key → always in the merged payload). Because `tenantId` is `'preserve'` and missing from the payload, the library leaves `byTenant`'s stored keys alone rather than rewriting them with a junk value.
 
 ## Cascade precedence
 
@@ -174,7 +238,37 @@ indexes: {
   // →  tenantAfterRemove is empty — cascade overrode the preserve policy
 ```
 
-An explicit `Entity.remove(["tenantId"])` always REMOVEs every GSI whose composites include `tenantId`, regardless of whether those composites are otherwise marked `"preserve"`. Think of it as: `remove` is the explicit way to opt out of an index, and it overrides the declarative policy.
+`Entity.remove(["tenantId"])` always REMOVEs every GSI whose composites include `tenantId`, regardless of `'preserve'` or `'sparse'`. Cascade is the explicit way to opt out of an index entirely; explicit-clear-with-`preserve` on an SK composite is the *demote to coarser scope* primitive.
+
+## Decision rules — full algorithm
+
+For each evaluated GSI, given merged payload `M` (primary key + update payload):
+
+1. **Cascade override.** If any composite is in `removedSet` (named in `Entity.remove([...])`) → REMOVE both keys. Done.
+2. **Per-composite outcome:**
+   - If attr is in `clearedSet` (explicit `null` or `undefined` in payload): cascade unconditionally — flag for **full drop** if PK or `sparse`-SK; flag for **SK truncation at position i** if `preserve`-SK.
+   - Else if attr is present (with value): use value at this position.
+   - Else (omitted): consult policy. `sparse` → flag for full drop. `preserve` → no-op for this attribute.
+3. **Hole check.** If any attr at hierarchy position `i` is flagged for drop/truncation while an attr at `j > i` is present → throw EDD-9024.
+4. **Roll up.**
+   - Full drop → REMOVE both keys.
+   - SK truncation at position `i` → SET `gsiNsk` to leading prefix `[pk_1..pk_n, sk_1..sk_(i-1)]`. SET `gsiNpk` if all PK composites are present.
+   - Else recompose normally — SET each half whose composites are all present, no-op for halves with a missing-preserve composite.
+
+## When is a GSI evaluated?
+
+- **GSI declares `indexPolicy`** → evaluated on **every** update. Policy-first: the declaration is a statement about membership invariant.
+- **GSI has no `indexPolicy`** → evaluated only when at least one of its composites is in the update payload (present, or explicitly cleared), or when `Entity.remove([attr])` names one of its composites. Matches conventional partial-update semantics.
+
+## Interaction with `put()`
+
+`put()` does NOT consult `indexPolicy`. It writes a complete item from scratch — any missing composite means "this item is not in that GSI." Unchanged from prior versions.
+
+## Interaction with time-series `.append()`
+
+`indexPolicy` is applied during `.append()` too, with one extra constraint: returned policy keys must be members of `appendInput`. Composites outside `appendInput` are by contract never changed by an append, so their policy can't fire at append-time — they default to `'preserve'` unconditionally, leaving the half that contains them untouched.
+
+This means a GSI like `byAccountAlert` with `pk.composite: ["accountId", "alertState"]` where `accountId` is enrichment-owned (not in `appendInput`) behaves correctly under ingest-side `.append()` calls: the pk half is left alone (accountId preserve, untouched), while any sk composite (e.g. `timestamp`) in `appendInput` is recomposed on every event.
 
 ## Quick reference
 
@@ -182,10 +276,21 @@ An explicit `Entity.remove(["tenantId"])` always REMOVEs every GSI whose composi
 |---|---|---|---|
 | Full recompose | any | all composites present | SET both halves |
 | Default partial update | none (all preserve) | some composites missing | SET halves fully present; leave halves with missing attrs alone |
-| Sparse dropout | `"sparse"` on attr A | A missing | REMOVE both halves |
-| Explicit preserve | `"preserve"` on attr A | A missing | Same as default preserve |
-| Mixed sparse + preserve | `A: "sparse", B: "preserve"` | A missing | REMOVE (sparse wins) |
+| Sparse omission | `'sparse'` on attr A | A missing | REMOVE both halves |
+| Sparse clear | `'sparse'` on attr A | A null/undefined | REMOVE both halves |
+| Preserve clear of PK composite | `'preserve'` on PK A | A null/undefined | REMOVE both halves (degrades to sparse on PK) |
+| Preserve clear of trailing SK composite | `'preserve'` on SK X | X null/undefined; trailing composites absent | **Truncate `gsiNsk`** to leading prefix; SET pk normally |
+| Hole pattern | `'preserve'` on SK X | X null/undefined; trailing composite present | **THROW EDD-9024** |
 | `Entity.remove(["A"])` cascade | any | any | REMOVE both halves (cascade overrides) |
+
+## Migrating from 1.5.0
+
+Two semantic changes to be aware of when upgrading:
+
+1. **Null and undefined collapse, both cascade unconditionally.** If you previously relied on `set({ attr: null })` going through `'preserve'` and quietly leaving GSI keys stale, that's now a cascade drop. Audit any null-write paths; intent is now unambiguous. The pre-1.6 behavior was a footgun; 1.6 closes it.
+2. **`'sparse'` policies that aren't really membership-driving should switch to `'preserve'`.** The pre-1.6 footgun was: `'sparse'` fired on every update regardless of whether the caller touched that composite. With v2, `'sparse'` still does that on omission — which is correct *only* when the GSI's membership genuinely is driven by that attribute being set. If you used `'sparse'` to mean "drop on actual absence" but always supply the value when you intend the item to stay, your code is fine; if you used it on a hybrid GSI where the attribute is owned by another writer, switch to `'preserve'`.
+
+Hierarchical SK pruning (preserve-clear on trailing SK composite → truncate) is **new and additive**. Existing entities that don't explicitly clear SK composites see no change.
 
 ## Runnable example
 
@@ -200,6 +305,7 @@ See [`examples/guide-index-policy.ts`](https://github.com/jmenga/effect-dynamodb
 
 ## What's Next?
 
+- [Sparse Maps](/effect-dynamodb/guides/sparse-maps/) — the *storage* primitive (different "sparse")
 - [Indexes & Collections](/effect-dynamodb/guides/indexes/) — How GSI composites and collections are defined
 - [Time Series](/effect-dynamodb/guides/timeseries/) — `.append` details and enrichment preservation
 - [Queries](/effect-dynamodb/guides/queries/) — Query by index, filter by SK composites
