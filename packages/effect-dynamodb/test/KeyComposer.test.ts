@@ -716,4 +716,351 @@ describe("KeyComposer", () => {
       expect(result).toBe("$myapp#v1#task#status_active")
     })
   })
+
+  // ---------------------------------------------------------------------------
+  // v2 — three-way classification + hierarchical SK pruning + hole detection
+  // (DESIGN.md §7 + §7.6, refs #36)
+  // ---------------------------------------------------------------------------
+
+  describe("composeGsiKeysForUpdatePolicyAware — v2 three-way classification", () => {
+    // Hierarchical-friendly shape: pk.composite=[A], sk.composite=[B, C, D]
+    const makeHierIndexes = (
+      indexPolicy?: KeyComposer.IndexPolicy,
+    ): Record<string, KeyComposer.IndexDefinition> => ({
+      primary: {
+        pk: { field: "pk", composite: ["id"] },
+        sk: { field: "sk", composite: [] },
+      },
+      hier: {
+        index: "gsi1",
+        pk: { field: "gsi1pk", composite: ["A"] },
+        sk: { field: "gsi1sk", composite: ["B", "C", "D"] },
+        indexPolicy,
+      },
+    })
+
+    // --- Three-way classification: null ≡ undefined; auto-derived clearedSet ---
+
+    it("explicit null and explicit undefined collapse — both behave as cleared", () => {
+      // Null on PK composite → drop.
+      const r1 = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeHierIndexes(() => ({ A: "preserve" })),
+        { A: null, B: "b", C: "c", D: "d" },
+        { id: "i-1" },
+      )
+      expect(r1.removes).toEqual(["gsi1pk", "gsi1sk"])
+
+      // Undefined on PK composite → drop (collapse with null).
+      const r2 = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeHierIndexes(() => ({ A: "preserve" })),
+        { A: undefined, B: "b", C: "c", D: "d" },
+        { id: "i-1" },
+      )
+      expect(r2.removes).toEqual(["gsi1pk", "gsi1sk"])
+    })
+
+    it("clearedSet auto-derives from null/undefined values in updatePayload", () => {
+      // No explicit clearedSet passed; derived from B: null → SK truncate.
+      const r = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeHierIndexes(() => ({ A: "preserve", B: "preserve", C: "preserve", D: "preserve" })),
+        { A: "a", B: null },
+        { id: "i-1" },
+      )
+      // pk fully present → SET. sk truncated at position 0 (B) → empty leading
+      // prefix → SET to bare entity prefix.
+      expect(r.sets.gsi1pk).toBeDefined()
+      expect(r.sets.gsi1sk).toBe("$myapp#v1#e")
+      expect(r.removes).toEqual([])
+    })
+
+    it("explicit clearedSet option drives truncation even when payload has no nulls", () => {
+      // D explicitly cleared via option (not via null in payload). With B
+      // and C present and D being the last SK composite, this is a clean
+      // trailing truncation.
+      const r = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeHierIndexes(() => ({ A: "preserve", B: "preserve", C: "preserve", D: "preserve" })),
+        { A: "a", B: "b", C: "c" },
+        { id: "i-1" },
+        { clearedSet: new Set(["D"]) },
+      )
+      // SK truncated at D (position 2) → leading prefix [B, C].
+      expect(r.sets.gsi1sk).toBe("$myapp#v1#e#b_b#c_c")
+      expect(r.sets.gsi1pk).toBe("$myapp#v1#e#a_a")
+      expect(r.removes).toEqual([])
+    })
+
+    // --- PK clear cascades unconditionally regardless of policy ---
+
+    it("PK composite explicit-cleared with preserve policy → DROP (PK degrades to sparse)", () => {
+      const r = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeHierIndexes(() => ({ A: "preserve" })),
+        { A: null, B: "b", C: "c", D: "d" },
+        { id: "i-1" },
+      )
+      expect(r.sets).toEqual({})
+      expect(r.removes).toEqual(["gsi1pk", "gsi1sk"])
+    })
+
+    // --- SK preserve-truncate + sparse-drop ---
+
+    it("SK trailing composite cleared with preserve → SK truncates", () => {
+      // Stored values: A, B, C, D all present; user clears D.
+      const r = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeHierIndexes(() => ({ A: "preserve", B: "preserve", C: "preserve", D: "preserve" })),
+        { D: null },
+        { id: "i-1", A: "a", B: "b", C: "c" },
+      )
+      // SK truncated at D (position 2) → leading prefix [B, C].
+      expect(r.sets.gsi1sk).toBe("$myapp#v1#e#b_b#c_c")
+      // PK side recomposes (all PK present).
+      expect(r.sets.gsi1pk).toBe("$myapp#v1#e#a_a")
+      expect(r.removes).toEqual([])
+    })
+
+    it("SK middle composite cleared with preserve and trailing absent → truncate", () => {
+      // User clears C; D not in payload and not in stored merge.
+      const r = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeHierIndexes(() => ({ A: "preserve", B: "preserve", C: "preserve", D: "preserve" })),
+        { C: null },
+        { id: "i-1", A: "a", B: "b" },
+      )
+      // SK truncated at C (position 1) → leading prefix [B].
+      expect(r.sets.gsi1sk).toBe("$myapp#v1#e#b_b")
+      expect(r.removes).toEqual([])
+    })
+
+    it("SK first composite cleared with preserve → truncate to base prefix", () => {
+      const r = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeHierIndexes(() => ({ A: "preserve", B: "preserve", C: "preserve", D: "preserve" })),
+        { B: null },
+        { id: "i-1", A: "a" },
+      )
+      // SK truncated at B (position 0) → leading prefix is empty.
+      expect(r.sets.gsi1sk).toBe("$myapp#v1#e")
+      expect(r.sets.gsi1pk).toBe("$myapp#v1#e#a_a")
+    })
+
+    it("SK composite cleared with sparse policy → DROP (not truncate)", () => {
+      const r = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeHierIndexes(() => ({ B: "preserve", C: "sparse", D: "preserve" })),
+        { C: null },
+        { id: "i-1", A: "a", B: "b" },
+      )
+      expect(r.sets).toEqual({})
+      expect(r.removes).toEqual(["gsi1pk", "gsi1sk"])
+    })
+
+    // --- Hole detection ---
+
+    it("hole — clear at position i with present at j > i → throw EDD-9024", () => {
+      expect(() =>
+        KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "E",
+          1,
+          makeHierIndexes(() => ({ A: "preserve", B: "preserve", C: "preserve", D: "preserve" })),
+          // B cleared at SK position 0; C present at position 1 (a hole).
+          { B: null },
+          { id: "i-1", A: "a", C: "c" },
+        ),
+      ).toThrow(/EDD-9024/)
+    })
+
+    it("hole error names the GSI, the cleared composite, and the (first) trailing composite", () => {
+      try {
+        KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "E",
+          1,
+          makeHierIndexes(() => ({ A: "preserve", B: "preserve", C: "preserve", D: "preserve" })),
+          // B cleared at SK position 0; both C and D still present. The error
+          // reports the first trailing composite found (C at position 1).
+          { B: null },
+          { id: "i-1", A: "a", C: "c", D: "d" },
+        )
+      } catch (e) {
+        expect(e).toMatchObject({
+          _tag: "CompositeKeyHoleError",
+          indexName: "gsi1",
+          clearedComposite: "B",
+          trailingComposite: "C",
+          half: "sk",
+        })
+        const msg = (e as { message: string }).message
+        expect(msg).toContain("EDD-9024")
+        expect(msg).toContain("gsi1")
+        expect(msg).toContain('"B"')
+        expect(msg).toContain('"C"')
+        return
+      }
+      throw new Error("expected throw")
+    })
+
+    it("multi-clear at consecutive trailing positions is OK (no hole)", () => {
+      // Clear C and D, both trailing. No hole.
+      const r = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeHierIndexes(() => ({ A: "preserve", B: "preserve", C: "preserve", D: "preserve" })),
+        { C: null, D: null },
+        { id: "i-1", A: "a", B: "b" },
+      )
+      expect(r.sets.gsi1sk).toBe("$myapp#v1#e#b_b")
+      expect(r.sets.gsi1pk).toBe("$myapp#v1#e#a_a")
+      expect(r.removes).toEqual([])
+    })
+
+    // --- Cascade override unchanged ---
+
+    it("cascade Entity.remove([attr]) overrides preserve-truncate", () => {
+      const r = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        makeHierIndexes(() => ({ A: "preserve", B: "preserve", C: "preserve", D: "preserve" })),
+        { B: null },
+        { id: "i-1", A: "a" },
+        { removedSet: new Set(["B"]) },
+      )
+      // Cascade wins → DROP, not truncate.
+      expect(r.sets).toEqual({})
+      expect(r.removes).toEqual(["gsi1pk", "gsi1sk"])
+    })
+
+    // --- Reproducer of the consumer footgun (issue #36) ---
+
+    it("partial-update payload that omits sparse-policied composites does NOT generate REMOVE under preserve", () => {
+      // Captured shape from consumer report: a 5-GSI entity with mostly
+      // `preserve` policies. A partial update that doesn't mention the
+      // sparse-policied composites should not REMOVE their key fields.
+      const indexes: Record<string, KeyComposer.IndexDefinition> = {
+        primary: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+        // Three GSIs that previously mis-fired sparse on every partial update.
+        // Under v2, switching them to preserve makes them no-ops on omission.
+        gA: {
+          index: "gsi1",
+          pk: { field: "gsi1pk", composite: ["X"] },
+          sk: { field: "gsi1sk", composite: ["id"] },
+          indexPolicy: () => ({ X: "preserve" }),
+        },
+        gB: {
+          index: "gsi2",
+          pk: { field: "gsi2pk", composite: ["Y"] },
+          sk: { field: "gsi2sk", composite: ["id"] },
+          indexPolicy: () => ({ Y: "preserve" }),
+        },
+        gC: {
+          index: "gsi3",
+          pk: { field: "gsi3pk", composite: ["Z"] },
+          sk: { field: "gsi3sk", composite: ["id"] },
+          indexPolicy: () => ({ Z: "preserve" }),
+        },
+      }
+      // User updates only `name` — never mentions X, Y, Z.
+      const r = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "E",
+        1,
+        indexes,
+        { name: "new-name" },
+        { id: "i-1" },
+      )
+      // Zero REMOVEs — the v1 footgun is closed.
+      expect(r.removes).toEqual([])
+      // The id-bearing SK halves recompose (PK halves no-op because X/Y/Z
+      // are absent and preserve).
+      expect(r.sets.gsi1sk).toBeDefined()
+      expect(r.sets.gsi2sk).toBeDefined()
+      expect(r.sets.gsi3sk).toBeDefined()
+      expect(r.sets.gsi1pk).toBeUndefined()
+      expect(r.sets.gsi2pk).toBeUndefined()
+      expect(r.sets.gsi3pk).toBeUndefined()
+    })
+  })
+
+  describe("composeSkPrefixUpTo", () => {
+    it("composes leading prefix for non-collection isolated SK", () => {
+      const index: KeyComposer.IndexDefinition = {
+        index: "gsi1",
+        pk: { field: "gsi1pk", composite: ["A"] },
+        sk: { field: "gsi1sk", composite: ["B", "C", "D"] },
+      }
+      const result = KeyComposer.composeSkPrefixUpTo(
+        schema,
+        "E",
+        1,
+        index,
+        { B: "b-val", C: "c-val", D: "d-val" },
+        2, // truncate at D position → keep [B, C]
+      )
+      expect(result).toBe("$myapp#v1#e#b_b-val#c_c-val")
+    })
+
+    it("composes empty leading prefix when stopBefore is 0", () => {
+      const index: KeyComposer.IndexDefinition = {
+        index: "gsi1",
+        pk: { field: "gsi1pk", composite: ["A"] },
+        sk: { field: "gsi1sk", composite: ["B", "C"] },
+      }
+      const result = KeyComposer.composeSkPrefixUpTo(
+        schema,
+        "E",
+        1,
+        index,
+        { B: "b", C: "c" },
+        0,
+      )
+      expect(result).toBe("$myapp#v1#e")
+    })
+
+    it("composes leading prefix for clustered collection SK", () => {
+      const index: KeyComposer.IndexDefinition = {
+        index: "gsi1",
+        collection: "Org",
+        type: "clustered",
+        pk: { field: "gsi1pk", composite: ["division"] },
+        sk: { field: "gsi1sk", composite: ["department", "team", "squad"] },
+      }
+      const result = KeyComposer.composeSkPrefixUpTo(
+        schema,
+        "Engineer",
+        1,
+        index,
+        { department: "platform", team: "infra", squad: "storage" },
+        2, // keep [department, team]
+      )
+      expect(result).toBe("$myapp#v1#org#engineer_1#department_platform#team_infra")
+    })
+  })
 })

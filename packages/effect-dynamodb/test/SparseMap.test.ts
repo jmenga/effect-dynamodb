@@ -50,6 +50,50 @@ const PageModel = DynamoModel.configure(Page, {
 // 1. Configuration parsing
 // ---------------------------------------------------------------------------
 
+describe("SparseMap — DynamoModel.SparseMap() helper", () => {
+  it("SparseMap() returns a tagged config object", () => {
+    const cfg = DynamoModel.SparseMap()
+    expect(DynamoModel.isSparseMapConfig(cfg)).toBe(true)
+    expect(cfg.prefix).toBeUndefined()
+  })
+
+  it("SparseMap({ prefix }) carries the prefix through", () => {
+    const cfg = DynamoModel.SparseMap({ prefix: "foo" })
+    expect(DynamoModel.isSparseMapConfig(cfg)).toBe(true)
+    expect(cfg.prefix).toBe("foo")
+  })
+
+  it("isSparseMapConfig returns false for non-SparseMap values", () => {
+    expect(DynamoModel.isSparseMapConfig(undefined)).toBe(false)
+    expect(DynamoModel.isSparseMapConfig(null)).toBe(false)
+    expect(DynamoModel.isSparseMapConfig("sparse")).toBe(false)
+    expect(DynamoModel.isSparseMapConfig({ prefix: "x" })).toBe(false)
+    expect(DynamoModel.isSparseMapConfig({})).toBe(false)
+  })
+
+  it("the legacy 'sparse' string literal is no longer recognised", () => {
+    // Pre-1.6 used the string literal "sparse"; under v2 the union
+    // `Schema.Schema<A> | SparseMapConfig` excludes the string literal at the
+    // type level. At runtime, isSparseMapConfig returns false for the string,
+    // so configure() falls into the schema branch and throws when it tries
+    // to read the (non-existent) DynamoEncoding annotation. The exact error
+    // message isn't load-bearing; the important contract is that the magic
+    // string no longer activates the sparse-map path.
+    class P extends Schema.Class<P>("P")({
+      id: Schema.String,
+      metrics: Schema.Record(Schema.String, Schema.Number),
+    }) {}
+    expect(() =>
+      DynamoModel.configure(P, {
+        metrics: { storedAs: "sparse" as unknown as Schema.Schema<unknown> },
+      }),
+    ).toThrow()
+    // And the Schema's getSparseFields would NOT report metrics as sparse if
+    // configure had recognised it (it didn't — it threw above), proving the
+    // magic string is dead.
+  })
+})
+
 describe("SparseMap — configuration", () => {
   it("DynamoModel.configure attaches sparse config with default prefix", () => {
     const sparse = DynamoModel.getSparseFields(PageModel as unknown as Schema.Top)

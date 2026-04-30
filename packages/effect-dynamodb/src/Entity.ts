@@ -2696,16 +2696,20 @@ const makeImpl = <
             // rather than whole-field replace — concurrent writers to disjoint
             // buckets must coexist (the version CAS protects against same-bucket
             // races). Non-sparse fields use the existing replace semantics.
+            //
+            // null and undefined collapse: both signal explicit clear under
+            // indexPolicy v2 (DESIGN.md §7). For the in-memory item we DELETE
+            // the attribute (mirrors a DynamoDB REMOVE), so subsequent decode
+            // sees the field as absent rather than as a typed null that the
+            // model schema may not permit.
             for (const [attr, val] of Object.entries(
               hydratedUpdates as globalThis.Record<string, unknown>,
             )) {
-              if (val === undefined) continue
-              if (
-                hasSparseFields &&
-                attr in sparseFields &&
-                val !== null &&
-                typeof val === "object"
-              ) {
+              if (val === null || val === undefined) {
+                delete newItem[attr]
+                continue
+              }
+              if (hasSparseFields && attr in sparseFields && typeof val === "object") {
                 const existing = (newItem[attr] as globalThis.Record<string, unknown>) ?? {}
                 newItem[attr] = { ...existing, ...(val as globalThis.Record<string, unknown>) }
               } else {
@@ -3110,17 +3114,31 @@ const makeImpl = <
           if (systemFields.updatedAtCollision && systemFields.updatedAt)
             updateSystemColliders.add(systemFields.updatedAt)
 
-          // Add user-provided updates
+          // Add user-provided updates. Buffered REMOVE clauses for explicit
+          // clears land in `removeClauses` below — under indexPolicy v2,
+          // `set({ attr: null | undefined })` means "remove this attribute
+          // now" (the same intent as `Entity.remove([attr])`). The two paths
+          // differ only in syntax; both surface in the UpdateExpression as
+          // REMOVE clauses, and both cascade through the policy-aware GSI
+          // composer (clearedSet auto-derived from null/undefined values).
+          // See DESIGN.md §7 for the three-way payload classification.
+          const explicitClears: Array<string> = []
           for (const [attr, val] of Object.entries(encodedUpdatesMap)) {
-            if (val === undefined) continue
             if (updateSystemColliders.has(attr)) continue
+
+            if (val === null || val === undefined) {
+              // Sparse fields: clearing a sparse field with null is a no-op
+              // here — the `.removeEntries` API is the explicit per-key
+              // remove. Skip to avoid REMOVE'ing the whole prefix erroneously.
+              if (hasSparseFields && attr in sparseFields) continue
+              explicitClears.push(attr)
+              continue
+            }
 
             // Sparse fields: emit one SET per bucket. Whole-bucket replace
             // semantics — concurrent writers to disjoint buckets are safe.
-            // `null` is NOT REMOVE — that's footgunny; explicit removal goes
-            // through `.removeEntries(field, keys)`.
             if (hasSparseFields && attr in sparseFields) {
-              if (val === null || typeof val !== "object") continue
+              if (typeof val !== "object") continue
               const sparse = sparseFields[attr]!
               for (const [k, v] of Object.entries(val as globalThis.Record<string, unknown>)) {
                 if (typeof k !== "string" || k.length === 0 || k.includes("#")) {
@@ -3204,6 +3222,16 @@ const makeImpl = <
           }
 
           // REMOVE
+          // Two channels feed REMOVE clauses:
+          //  1. `Entity.remove([attr])` cascade — drops the GSI for any
+          //     containing composite. Tracked in `removedSet` so the
+          //     policy-aware composer can apply the cascade rule.
+          //  2. Explicit clears in the user payload (`set({ attr: null })`).
+          //     These also REMOVE the attribute, but they do NOT cascade to
+          //     the whole GSI — instead, the policy-aware composer's
+          //     three-way classification consumes them via the auto-derived
+          //     clearedSet (preserve → truncate, sparse → drop). This
+          //     distinction is what makes hierarchical SK pruning work.
           const removedSet = uState.remove ? new Set(uState.remove) : undefined
           if (uState.remove) {
             for (const attr of uState.remove) {
@@ -3211,6 +3239,11 @@ const makeImpl = <
               names[nameKey] = resolveDbName(attr)
               removeClauses.push(nameKey)
             }
+          }
+          for (const attr of explicitClears) {
+            const nameKey = `#r${removeClauses.length}`
+            names[nameKey] = resolveDbName(attr)
+            removeClauses.push(nameKey)
           }
 
           // Policy-aware GSI key composition. One call covers SETs (full
