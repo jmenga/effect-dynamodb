@@ -187,14 +187,27 @@ export type EntityCreateType<
   TTimeSeries
 >
 
-/** Entity update type: partial model fields minus primary key composites */
+/**
+ * Entity update type: partial model fields minus primary key composites.
+ *
+ * Each field's value type is widened to `T | null | undefined` to support
+ * indexPolicy v2's three-way payload classification: passing `null` or
+ * `undefined` is an explicit clear signal that cascades to the GSI keys
+ * (REMOVE the attribute, drop or truncate the GSI per policy). See
+ * `DESIGN.md §7 Policy-Aware GSI Composition`.
+ */
 export type EntityUpdateType<
   TModel extends Schema.Top,
   TIndexes,
   TTimestamps = undefined,
   TVersioned = undefined,
 > = WithSystemCollisionsForUpdate<
-  Partial<Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes>>>,
+  {
+    [K in keyof Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes>>]?:
+      | Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes>>[K]
+      | null
+      | undefined
+  },
   TTimestamps,
   TVersioned
 >

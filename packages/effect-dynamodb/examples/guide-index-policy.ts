@@ -211,6 +211,81 @@ const program = Effect.gen(function* () {
     tenantAfterRemove.some((d) => d.deviceId === "d-2")
   }`)
 
+  yield* Console.log("\n=== 6. Hierarchical SK pruning — preserve-clear demotes, doesn't evict ===")
+
+  // #region hierarchy-model
+  // A geographic asset hierarchy: region → country → city → site. Clearing a
+  // trailing SK composite under preserve policy *truncates* gsi1sk to the
+  // leading prefix instead of dropping the GSI entirely. The asset stays
+  // queryable at the parent (coarser) hierarchy depth.
+  class Asset extends Schema.Class<Asset>("Asset")({
+    assetId: Schema.String,
+    region: Schema.String,
+    country: Schema.optional(Schema.String),
+    city: Schema.optional(Schema.String),
+    site: Schema.optional(Schema.String),
+  }) {}
+
+  const Assets = Entity.make({
+    model: Asset,
+    entityType: "Asset",
+    primaryKey: {
+      pk: { field: "pk", composite: ["assetId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    indexes: {
+      byLocation: {
+        name: "gsi3",
+        pk: { field: "gsi3pk", composite: ["region"] },
+        sk: { field: "gsi3sk", composite: ["country", "city", "site"] },
+        indexPolicy: () => ({
+          region: "preserve" as const,
+          country: "preserve" as const,
+          city: "preserve" as const,
+          site: "preserve" as const,
+        }),
+      },
+    },
+  })
+  // #endregion
+
+  // The example wires Assets through a separate table for clarity. To keep
+  // the demo self-contained we register the entity directly via DynamoClient.
+  const HierarchyTable = Table.make({ schema: AppSchema, entities: { Assets } })
+  const dbHier = yield* DynamoClient.make({
+    entities: { Assets },
+    tables: { HierarchyTable },
+  })
+  yield* dbHier.tables.HierarchyTable.create()
+
+  // #region hierarchy-demo
+  // Initial state — full hierarchy populated.
+  yield* dbHier.entities.Assets.put({
+    assetId: "rack-42",
+    region: "americas",
+    country: "us",
+    city: "sf",
+    site: "datacenter-1",
+  })
+  // gsi3sk = "$indexpolicy-demo#v1#asset#country_us#city_sf#site_datacenter-1"
+
+  // Asset leaves the datacenter — clear `site`. SK truncates at site (position 2).
+  yield* dbHier.entities.Assets.update({ assetId: "rack-42" }).set({ site: null })
+  // gsi3sk = "$indexpolicy-demo#v1#asset#country_us#city_sf"  ← preserved at city level
+  // #endregion
+
+  // Verify: query at the region level still finds the asset (it's still in
+  // the GSI — gsi3sk just got pruned to the parent prefix).
+  const atRegion = yield* dbHier.entities.Assets.byLocation({
+    region: "americas",
+  }).collect()
+  assertEq(atRegion.some((a) => a.assetId === "rack-42"), true, "rack-42 still in GSI after prune")
+  yield* Console.log(`  After clear-site: byLocation(americas) finds rack-42: ${
+    atRegion.some((a) => a.assetId === "rack-42")
+  }`)
+
+  yield* dbHier.tables.HierarchyTable.delete()
+
   yield* Console.log("\nAll indexPolicy scenarios passed.")
 
   yield* db.tables.AppTable.delete()
