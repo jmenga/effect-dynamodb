@@ -609,25 +609,22 @@ SK: ${schema}#{version}#{entityType}#deleted#{isoTimestamp}
 
 ### Policy-Aware GSI Composition (update & append)
 
-**Problem.** GSI composite attributes can be owned by different writers ("hybrid GSIs"). A device-ingest writer owns `timestamp` + `alertState`; an enrichment writer owns `accountId`. A GSI with `pk.composite = [accountId, alertState]` and `sk.composite = [timestamp]` is touched by *every* ingest event (via `timestamp`), but the ingest writer can't supply `accountId` without an extra read. The library needs a way to express what an *update payload* means for the GSI's stored keys when only some composites are in scope.
+**Problem.** GSI composite attributes can be owned by different writers ("hybrid GSIs"). A device-ingest writer owns `alertState` + `timestamp`; an enrichment writer owns `accountId`. A GSI with `pk.composite = [accountId]` and `sk.composite = [alertState, timestamp]` is touched by *every* ingest event (via `timestamp`), but the ingest writer can't supply `accountId` without an extra read. The library needs a way to express what an *update payload* means for the GSI's stored keys when only some composites are in scope — *and* must not let one writer's update silently corrupt the half another writer owns.
 
-**Two drop triggers, two policy values, one structural composition rule.** v3 has exactly two drop mechanisms — both predictable, both tied to clear caller intent — driving the lifetime of a GSI's `gsiNpk`/`gsiNsk` pair:
+**Mental model — three contracts.** v1.7.1 expresses GSI maintenance as three independent contracts, all per-half:
 
-| Trigger | Granularity | Where it lives | Intent |
-|---|---|---|---|
-| `Entity.remove([attr])` cascade | per-attribute | per-call, explicit | "this attribute no longer applies — cascade drop everywhere it appears" |
-| `'sparse'` policy + whole-half-empty | per-half | per-GSI declaration, implicit | "this index entry requires at least the leading composite — fall out otherwise" |
+> `'preserve'` is a contract with **other writers** ("don't disturb my key when you fire"); `'sparse'` is a contract with **yourself as the half's owner** ("drop my key if I touch this half but can't compose it"); `Entity.remove([attr])` is the explicit signal that a composite is gone — the library REMOVEs the half(s) containing the cleared attribute.
 
-Both are visible at design or call time. The v1.6 footgun wasn't *"implicit drops are bad"* — it was *"per-composite implicit drops fire across writers that didn't intend to touch the GSI."* v3 keeps the implicit drop pattern but narrows its trigger to **whole-half-empty**, which only writers that genuinely intended to clear that half ever produce. Multi-writer entities stop leaking; single-writer-per-half consumers get sparse semantics that fire exactly when intended.
+Per-half is the unifying property: declaration (`{ pk, sk }`), evaluation gate (per-half "touched?"), outcome (per-half SET / noop / REMOVE), and cascade (per-half via `removedSet`). There is no GSI-wide cascade left in the model — the v1.6 holdover that bug-1 of v1.7.0 inherited is gone.
 
-**API — per-half policy declaration.** Each GSI may declare an `indexPolicy`:
+**API — per-half policy declaration (unchanged from v1.7.0).** Each GSI may declare an `indexPolicy`:
 
 ```ts
 indexes: {
   byAccountAlert: {
     name: "gsi6",
-    pk: { field: "gsi6pk", composite: ["accountId", "alertState"] },
-    sk: { field: "gsi6sk", composite: ["timestamp"] },
+    pk: { field: "gsi6pk", composite: ["accountId"] },
+    sk: { field: "gsi6sk", composite: ["alertState", "timestamp"] },
     indexPolicy: { pk: "preserve", sk: "sparse" },
   },
 }
@@ -636,79 +633,123 @@ indexes: {
 - `indexPolicy: { pk: 'sparse' | 'preserve', sk: 'sparse' | 'preserve' }`. Both halves default to `'preserve'` if `indexPolicy` is omitted entirely or either half is unspecified.
 - The standard composition path has no per-composite information to discriminate within a half (it has only the merged payload, no read-before-write), so per-attribute policy callbacks were removed. A half is a single concatenated string; per-attribute mixing within a half has no coherent semantic.
 
-**Two-way payload classification.** v3 collapses the v1.6 three-way classification (present / explicit-clear / omitted) to two states: **present** or **absent**. `attr: null`, `attr: undefined`, and "key omitted from payload" all mean "absent" for GSI-composition purposes.
+**Two-way payload classification.** v1.7.x collapses the v1.6 three-way classification (present / explicit-clear / omitted) to two states: **present** or **absent**. `attr: null`, `attr: undefined`, and "key omitted from payload" all mean "absent" for GSI-composition purposes.
 
 | Payload state | What library does for GSI composition |
 |---|---|
 | `attr: <value>` | Use the value as a slot in the composed half |
 | `attr: null` *or* `attr: undefined` *or* (key omitted) | Treat as **absent** — the composition is built from the leading prefix of present values |
 
-`set({ attr: null })` is no longer a separate "drop signal" — it still REMOVEs the attribute from the item (the data-attribute REMOVE clause), but it does not separately cascade-drop the GSI keys. Drop-via-cascade goes through `Entity.remove([attr])` instead. Drop-via-implicit-sparse fires only when the whole half's composites are all absent.
+`set({ attr: null })` is no longer a separate "drop signal" — it still REMOVEs the attribute from the item (the data-attribute REMOVE clause), but it does not separately cascade-drop the GSI keys. Drop-via-cascade goes through `Entity.remove([attr])` instead.
 
-**Structural composition — longest valid leading prefix.** For each GSI half (PK and SK independently), walk the composite list left-to-right and build the longest valid leading prefix from values present in the merged record (`{ ...storedKeyAttrs, ...payload }`). The rule is **identical for PK and SK** — the v1.6 PK-clear-degrades-to-sparse asymmetry is gone. The composed half is whatever's reachable from the leading run of present composites:
+**Per-half evaluation gate (NEW in v1.7.1 — closes the multi-writer leak).** Before the structural rule even runs, each half is checked for whether the writer touched it. **If a half is untouched, it is skipped entirely — no SET, no REMOVE, no policy fires.** A half is "touched" iff at least one of its composite names appears in the update payload (regardless of value, including `undefined`) OR appears in `Entity.remove([...])`:
+
+```ts
+const halfTouched =
+  halfComposites.some((c) => c in updatePayload) ||
+  halfComposites.some((c) => removedSet?.has(c))
+if (!halfTouched) continue  // leave this half's key attribute alone
+```
+
+Why: `'sparse'`'s contract is *with the half's owner*. If the writer doesn't touch any of the half's composites, they aren't claiming ownership of this half on this call — sparse shouldn't fire. The writer-scope concept #38 was reaching for falls out of payload contents naturally.
+
+End-to-end consequences for the canonical multi-writer scenarios:
+
+- **Stamps** writing only `{ published: {...} }` → no half is touched → both halves left alone. (v1.7.0 bug-3: stamps blew away the sparse GSI half.)
+- **Enrichment** writing `{ accountId: 'X' }` → pk touched, sk untouched.
+- **Telemetry** writing `{ alertState: 'active', timestamp: T }` → pk untouched, sk touched.
+
+**Structural composition — longest valid leading prefix.** For each *touched* GSI half (PK and SK independently), walk the composite list left-to-right and build the longest valid leading prefix from values present in the merged record (`{ ...storedKeyAttrs, ...payload }`). The rule is **identical for PK and SK** — the v1.6 PK-clear-degrades-to-sparse asymmetry is gone. The composed half is whatever's reachable from the leading run of present composites:
 
 | Composite state | Result for that half |
 |---|---|
 | All composites present | Recompose the half with all values |
 | Trailing composites absent (`[A, B, _, _]`) | Truncate to the leading prefix `[A, B]` |
-| Whole half empty (no leading composites available) | Empty prefix → policy decides (see "Whole-half-empty" below) |
-| Hole pattern (`[A, _, C]`) | Policy decides between truncate and throw (see "Hole detection" below) |
+| Whole half empty (no leading composites available) | Empty prefix → can't compose → see "Per-half outcome" below |
+| Hole pattern (`[A, _, C]`) | Leading prefix is `[A]`, but a present trailing composite would be silently dropped → treated as can't-compose → see "Per-half outcome" below |
 
-Truncation on PK is the same hierarchical demotion as truncation on SK — an item with `pk.composite = ['accountId', 'fleetId']` and `fleetId` cleared composes a partition key of `account#A` and stays queryable at the account scope. The "partition migration is dangerous" objection that v1.6 used to justify the PK asymmetry is addressed differently in v3: clear-via-null is no longer a clear signal at all, so the case the v1.6 asymmetry was protecting against (consumer confusion about `set({pk: null})` semantics) is now closed at the type level (see EDD-9025 below).
+Truncation on PK is the same hierarchical demotion as truncation on SK — an item with `pk.composite = ['accountId', 'fleetId']` and `fleetId` cleared composes a partition key of `account#A` and stays queryable at the account scope.
 
-**Hole detection (policy-aware).** A "hole" is a composite at position `i` that is absent while a composite at position `j > i` is present (e.g. `[A, _, C]`). Composed keys can't carry holes meaningfully — `acc#A#child#Y` with `parent` cleared would compose to a syntactically invalid prefix that no `begins_with` query would match. Behavior depends on the half's policy:
+#### Per-half outcome (unified can't-compose rule — NEW in v1.7.1)
 
-| Policy | Hole pattern (`[A, _, C]`) | Hole pattern starting at position 0 (`[_, C]`) |
+When the structural rule **can compose** (leading prefix is non-empty and there's no information loss), the half SETs its key — full or truncated. When the structural rule **can't compose** (empty leading prefix, OR a hole pattern that would lose trailing data), the per-half outcome is decided by policy + cascade:
+
+| Outcome for this half's key attribute | Conditions |
+|---|---|
+| **noop** (leave key alone) | No composite of this half is in the payload AND none in `Entity.remove([...])` (per-half evaluation gate) |
+| **SET full** | Half touched + all composites have values supplied in payload (or available from primary key) |
+| **SET truncated** to leading prefix | Half touched + some leading composites have values, trailing absent, no hole |
+| **REMOVE** this half's key | Half touched + can't compose (empty leading prefix OR hole pattern), AND policy is `'sparse'` OR a composite is in `Entity.remove([...])` (cascade override) |
+| **noop** (stored key may go stale) | Half touched + can't compose, policy is `'preserve'`, AND no composite is in `Entity.remove` |
+
+The roll-up is **per-key** — each half's outcome applies to its own key attribute only. PK dropping doesn't drop SK; SK dropping doesn't drop PK. The item may be invisible in the GSI during a single-half-dropped period (DDB needs both for projection — the projection invariant for readers, not a library behavior), but the surviving half's value persists. When the missing half is later composed again (e.g. telemetry writes `{ alertState, timestamp }` after a clear), the item rejoins the GSI under the still-current other half *without that other writer needing to re-fire* — the v1.7.0 multi-writer bug (#41 bug-1) is closed.
+
+**Cascade override under preserve.** If a half is touched via `removedSet` AND the structural rule would no-op (preserve + can't-compose), the outcome is **REMOVE** instead of noop. Rationale: the consumer's explicit signal trumps stale-data preservation. `Entity.remove(["alertState"])` means "alertState is gone" — preserving the stored key with a value derived from the now-removed composite would lie to readers.
+
+**Hole patterns collapse into can't-compose.** A "hole" (composite at position `i` absent while a composite at position `j > i` is present, e.g. `[A, _, C]`) was a separate v1.7.0 outcome (truncate-or-throw). Under v1.7.1, holes follow the unified rule above: drop under sparse (or cascade), noop under preserve (no cascade). The previous "truncate to `[A]` and silently discard `C`" sparse behavior is gone — silent data loss is a worse failure mode than dropping the half. The previous "throw EDD-9024 under preserve" is also gone — see "EDD-9024 deprecation" below.
+
+#### The set/remove asymmetry (worth memorising)
+
+> `set` provides values to compose with. `remove` invalidates a composite without providing a replacement. The library has no read-before-write — so `remove` without surrounding `set` context can't truncate (it doesn't know what to truncate *to*) and instead REMOVEs the half's key entirely.
+
+```ts
+// Truncation works — surviving composites supplied via set, leaf invalidated via remove
+update(key).set({ region, country, city }).remove(["site"])
+// → SET gsi1sk truncated to "region#APAC#country#AU#city#Sydney"
+// (site is in removedSet → cascade override fires, but the surviving leading prefix
+// is non-empty → the structural rule composes the prefix and SETs.)
+
+// REMOVE — surviving composites not supplied
+update(key).remove(["site"])
+// → REMOVE gsi1sk entirely (library has no way to compose [region, country, city] —
+// no values supplied, and the library does not read-before-write to discover them).
+```
+
+If you want to demote (truncate) hierarchically, you must `set` the surviving composites in the same call — the `remove` invalidates the leaf without providing a replacement, but the surviving prefix is non-empty so the structural rule composes it.
+
+#### How to drop a half (call-site syntax)
+
+| Composite is... | Method 1: `Entity.remove` (always works) | Method 2: `set` with `undefined` |
 |---|---|---|
-| `'sparse'` | Truncate to leading prefix `[A]`; trailing values ignored. Consistent with sparse's "compose what you can" intent. | Leading prefix is empty → collapses to whole-half-empty → drop both halves (consistent with sparse-on-empty). |
-| `'preserve'` | Throw `CompositeKeyHoleError` (EDD-9024) at write time. Consistent with preserve's "don't move things on me — surface ambiguity loudly" intent. | Same — throw EDD-9024. |
+| **Required** in model (e.g. `Schema.String`) | `update(key).remove(["composite"])` | not available — TS rejects `undefined` for non-optional fields under `exactOptionalPropertyTypes` (the v1.7.0 NullishOr revert ensures payload types match model declarations) |
+| **Optional** in model (`Schema.optional(...)`) | `update(key).remove(["composite"])` | `update(key).set({ composite: undefined })` |
 
-The error names the GSI, the absent composite at position `i`, and the still-present trailing composite at `j`, so callers can locate the offending payload.
+Naming any one composite of a half is enough — `Entity.remove` doesn't require enumerating all of them. `null` is **never** valid for a composite (EDD-9025 rejects nullable composites at make-time).
 
-**Whole-half-empty.** When a half has no composites in scope at all (every composite is absent under the structural rule), policy decides:
+**`Entity.remove([attr])` cascade is per-half (NEW in v1.7.1).** When an update's REMOVE list contains a composite attribute, the cascade applies only to the half(s) containing that attribute. Other halves follow the per-half evaluation gate (untouched → noop). v1.7.0 issued a GSI-wide REMOVE (both `gsiNpk` AND `gsiNsk`) for any composite in the cascade set — that GSI-wide blast radius is gone in v1.7.1. The cascade still REMOVEs the affected half's key; if the surrounding `set` provides values for the half's other composites, the structural rule may still compose a truncated prefix (see set/remove asymmetry).
 
-- `'sparse'` → REMOVE both `gsiNpk` and `gsiNsk` (the item drops out of the GSI). This is the *implicit drop trigger*.
-- `'preserve'` → no-op (no SET, no REMOVE — leave the stored values intact). The half stays whatever it was before the update.
+**Decision algorithm (per GSI).** Given merged record `M = { ...storedKeyAttrs, ...payload }` (treating `null`/`undefined` payload values as absent) and `removedSet` (composites named in `Entity.remove([...])`):
 
-This is the *only* case in v3 where policy alone changes behavior. Note the symmetry: a sparse policy on a single half drops both `gsiNpk` and `gsiNsk` together — there's no notion of writing only one half of a key pair.
+For each half (PK then SK), independently:
 
-**`Entity.remove([attr])` cascade — unchanged.** When an update's REMOVE list contains a composite attribute of any GSI, that whole GSI is dropped (REMOVE both `gsiNpk` and `gsiNsk`) regardless of `indexPolicy`. This is the *explicit drop trigger*. `remove(["tenantId"])` means "the item no longer belongs in any index containing `tenantId`."
+1. **Evaluation gate.** If no composite of this half is in `payload` AND no composite of this half is in `removedSet` → `noop` (skip — leave the stored key untouched). Otherwise the half is **touched**, continue.
+2. **Structural rule.** Walk the half's composite list left-to-right. Find the longest leading prefix of present values in `M`.
+3. **Classify the outcome:**
+   - **Compose succeeded** (leading prefix is non-empty AND no hole — i.e. all absent composites are at trailing positions): SET this half's key from the leading prefix. Done.
+   - **Compose failed** (empty leading prefix OR hole pattern):
+     - Policy is `'sparse'` → `REMOVE` this half's key.
+     - Policy is `'preserve'` AND any composite of this half is in `removedSet` → `REMOVE` this half's key (cascade override).
+     - Policy is `'preserve'` AND no composite of this half is in `removedSet` → `noop` (preserve preservation; stored key may be stale).
 
-**Decision algorithm (per touched GSI).** Given merged record `M = { ...storedKeyAttrs, ...payload }` (treating `null`/`undefined` payload values as absent) and the cascade-remove set `R` (attrs named in `Entity.remove([...])`):
-
-1. **Cascade override.** If any composite of this GSI is in `R`, REMOVE both key fields. Done.
-2. **For each half (PK then SK), independently:**
-   - Walk the half's composite list left-to-right. Find the longest prefix of present values.
-   - If the prefix covers every composite → SET the half from the full composition.
-   - If the prefix is shorter than the full composite list AND no trailing composite is present → trailing-truncate. SET the half from the leading prefix (or, if the prefix is empty, fall through to whole-half-empty handling below).
-   - If the prefix is shorter than the full composite list AND a trailing composite is present (hole pattern) → consult policy. `'sparse'` truncates to the leading prefix; `'preserve'` throws `CompositeKeyHoleError` (EDD-9024).
-3. **Whole-half-empty handling.** If a half ended up with no composites composable (empty leading prefix and no trailing values either) → consult that half's policy. `'sparse'` REMOVEs both `gsiNpk` and `gsiNsk` (whole GSI drop). `'preserve'` is a no-op for that half.
-4. **Roll up.** The final outcome per GSI is one of:
-   - REMOVE both keys (cascade or sparse-on-empty),
-   - SET both keys (both halves have something composable),
-   - SET only one key (the other half no-ops under preserve-on-empty), or
-   - No writes at all (both halves preserve, both empty).
-
-**Evaluation gate.** Determines when a GSI is evaluated on update/append:
-
-- **GSI declares `indexPolicy`** → evaluated on **every** update/append. The declaration is a statement about the GSI's membership invariant; the library applies it unconditionally so the implicit-drop trigger fires consistently.
-- **GSI has no `indexPolicy`** → evaluated only when at least one of its composites is in the update payload, or when `Entity.remove([attr])` names one of its composites. Preserves conventional DynamoDB partial-update semantics for entities that haven't opted into policy-driven indexing.
+The two halves' outcomes are emitted independently — each affects only its own key attribute. There is no GSI-wide cascade. There is no longer a `'hole-throw'` outcome (EDD-9024 deprecated — see below).
 
 **`put()` semantics (unchanged).** `put()` does not consult `indexPolicy`. It writes a complete item from scratch — any missing composite means "this item is not in that GSI." The existing `tryComposeIndexKeys` path (omit GSI keys when any composite is absent) is preserved as-is. `indexPolicy` exists specifically to resolve the update/append ambiguity, not the put case.
 
-**`.append()` semantics (time-series) — same composer.** v3 unifies append with update. `.append(input)` calls the same composer as `.update(...).set(...)`, with `appendInput` as the payload. Composites outside `appendInput` are simply absent under the structural rule. There is no per-call policy filter wrapper (the v1.6 wrapper that filtered policy returns to `appendInput` members is gone — under v3's per-half model, there's nothing to filter).
+**`.append()` semantics (time-series) — same composer.** v1.7.x unifies append with update. `.append(input)` calls the same composer as `.update(...).set(...)`, with `appendInput` as the payload. Composites outside `appendInput` are simply absent under the structural rule, and the per-half evaluation gate applies — halves whose composites are entirely outside `appendInput` are untouched and follow the noop branch.
 
-For sparse GSIs whose composites are entirely outside `appendInput`, the relevant half empties → drop. This matches the consumer-side multi-writer recommendation: sparse GSIs should be single-writer-per-half by design. If `.append()` doesn't write any of a sparse GSI's composites, the GSI is effectively not in append's scope, and either (a) the half should be declared `'preserve'`, or (b) the GSI should drop on the append because the writer lacks the data to populate it.
+For sparse GSIs whose composites are entirely outside `appendInput`, the half is untouched → noop (under v1.7.1). Sparse only fires when the writer touches the half but can't compose it. This matches the consumer-side multi-writer recommendation: sparse GSIs should be single-writer-per-half by design.
 
-**EDD-9025 — composite attribute schemas must not include `null`.** At `Entity.make()` time, the library walks every composite across `primaryKey`, every entry in `indexes`, and every entry in `unique` constraints. For each composite attribute it inspects the field's Schema AST and throws `CompositeNullableError` (EDD-9025) if `null` is reachable in the type union (`Schema.NullOr`, `Schema.NullishOr`, `Schema.Union` with a Null branch, custom-named field via `DynamoModel.configure({ field })` rename that resolves to a nullable schema, etc.).
+**EDD-9024 (`CompositeKeyHoleError`) deprecation — runtime-irrelevant in v1.7.1.** The class is kept exported for back-compat but no longer thrown at runtime. The original v1.7.0 throw protected against an `[A, _, C]` shape under preserve — but the type system already catches the only "wrong" case the throw was guarding (required composites can't be omitted under `exactOptionalPropertyTypes` since v1.7.0 reverted the NullishOr widening; the only legitimate runtime hole is "optional leading composite absent + present trailing composite," which is a normal write the consumer expressly chose). Under v1.7.1 the hole pattern collapses into the unified can't-compose rule (drop under sparse, noop-or-cascade-override under preserve). See `Errors.ts` for the deprecation note on the class.
+
+**EDD-9025 — composite attribute schemas must not include `null` (unchanged from v1.7.0).** At `Entity.make()` time, the library walks every composite across `primaryKey`, every entry in `indexes`, and every entry in `unique` constraints. For each composite attribute it inspects the field's Schema AST and throws `CompositeNullableError` (EDD-9025) if `null` is reachable in the type union (`Schema.NullOr`, `Schema.NullishOr`, `Schema.Union` with a Null branch, custom-named field via `DynamoModel.configure({ field })` rename that resolves to a nullable schema, etc.).
 
 The semantic justification: composites participate in string composition (`acc#X#alert#Y`); null is not a meaningful slot value, only present-with-value or absent. Allowing `Schema.NullOr` on a composite would let `set({ composite: null })` typecheck and then immediately blow up at runtime (or worse, silently produce a key with the literal string `"null"` as a slot). EDD-9025 catches this at make-time.
 
-The sparse pattern is still expressible — use `Schema.optional(...)`, which produces `T | undefined` (without `null`). `undefined` is "absent" under the v3 two-way classification.
+The sparse pattern is still expressible — use `Schema.optional(...)`, which produces `T | undefined` (without `null`). `undefined` is "absent" under the two-way classification.
 
-**Footgun closed at the type level — `set({ composite: null })` no longer compiles.** Two changes work together:
+**Footgun closed at the type level — `set({ composite: null })` no longer compiles.** Two changes work together (both shipped in v1.7.0, kept in v1.7.1):
 
-1. v3 reverts the v1.6 update-payload type widening. The v1.6 schemas wrapped each update field in `Schema.optional(Schema.NullishOr(field))` to support the v1.6 three-way classification. v3 drops the `NullishOr` wrap — update payload field types match the model's declarations exactly (just wrapped in `Schema.optional` so the key can be omitted entirely).
+1. v1.7.x reverts the v1.6 update-payload type widening. The v1.6 schemas wrapped each update field in `Schema.optional(Schema.NullishOr(field))` to support the v1.6 three-way classification. v1.7.x drops the `NullishOr` wrap — update payload field types match the model's declarations exactly (just wrapped in `Schema.optional` so the key can be omitted entirely).
 2. EDD-9025 prevents the model from declaring a composite as nullable in the first place.
 
 Together: `set({ composite: null })` for a composite is a TypeScript error two ways — the model can't widen the composite to include `null`, and the update payload type isn't widened beyond the model. The stale-GSI-keys-via-`set-null` concern dissolves entirely at the type level. No runtime path is reachable from typed callers.
@@ -720,33 +761,31 @@ Together: `set({ composite: null })` for a composite is a TypeScript error two w
 // or an SK-truncate signal under preserve.
 entity.update(key).set({ alertState: null }).asEffect()
 
-// v3 — explicit per-attribute drop (per call) — atomic remove + GSI cascade.
+// v1.7.x — explicit per-attribute drop (per call) — atomic remove + per-half cascade.
 entity.update(key).remove(['alertState']).asEffect()
 
-// v3 — for "drop when this index has nothing to compose" intent,
+// v1.7.x — for "drop when this index has nothing to compose" intent,
 // declare the GSI half as 'sparse' once at the index definition.
 //   indexPolicy: { pk: 'sparse', sk: 'preserve' }
-// Then any update that doesn't supply the PK half's composites drops the GSI
-// implicitly per the whole-half-empty rule.
+// Then any update that touches the PK half but can't compose it drops the GSI
+// implicitly per the per-half can't-compose rule.
 ```
 
-**Decision table (worked).** GSI with `pk.composite = [A]`, `sk.composite = [B, C]`, casing `lowercase`. "absent" means the value isn't reachable in the merged record (key omitted, or `null`/`undefined`).
+**Final per-half decision table (worked).** GSI with `pk.composite = [accountId]`, `sk.composite = [alertState, timestamp]`, `indexPolicy = { pk: 'preserve', sk: 'sparse' }`. Item exists with `accountId = "acme"`, `alertState = "active"`, `timestamp = T1`. Both GSI keys composed.
 
-| Policy | Payload (merged with stored key attrs) | Result |
-|---|---|---|
-| no policy *(both preserve)* | `{A, B, C}` (all present) | SET both halves |
-| no policy | `{A}`, B+C absent | SET pk; sk no-op (preserve + empty SK half = no-op) |
-| no policy | `{B, C}`, A absent | pk no-op; SET sk |
-| no policy | `{A, B}`, C trailing-absent | SET pk; SET sk truncated to `[B]` |
-| no policy | `{A, C}`, B absent (hole) | **THROW EDD-9024** (preserve + hole) |
-| `{ pk: 'sparse', sk: 'preserve' }` | `{B, C}`, A absent | REMOVE both halves (PK whole-half-empty + sparse) |
-| `{ pk: 'preserve', sk: 'sparse' }` | `{A}`, B+C absent | REMOVE both halves (SK whole-half-empty + sparse) |
-| `{ pk: 'preserve', sk: 'sparse' }` | `{A, B}`, C trailing-absent | SET pk; SET sk truncated to `[B]` (sparse + non-empty leading = compose what you can) |
-| `{ pk: 'preserve', sk: 'sparse' }` | `{A, C}`, B absent (hole) | SET pk; SET sk truncated to empty (sparse hole = truncate) |
-| `{ pk: 'sparse', sk: 'sparse' }` | `{}`, A+B+C all absent | REMOVE both halves (both halves whole-half-empty + sparse) |
-| any policy | `Entity.remove(["A"])` | REMOVE both halves (cascade overrides policy) |
+| Writer | Payload | pk outcome | sk outcome | Item state in GSI |
+|---|---|---|---|---|
+| Enrichment | `{ accountId: "newAcct" }` | touched, SET full → new `account#newAcct` | untouched, **noop** | Visible under new account, sk position unchanged |
+| Telemetry (active alert) | `{ alertState: "active", timestamp: T2 }` | untouched, **noop** | touched, SET full → fresh `alert#active#ts#T2` | Visible under last accountId, fresh sk |
+| Telemetry (no alert) | `{ timestamp: T2 }` (alertState omitted, optional) | untouched, **noop** | touched (timestamp), can't compose (hole) + sparse → REMOVE gsi1sk | Invisible (DDB needs both); gsi1pk preserved |
+| Telemetry (explicit clear) | `{ alertState: undefined, timestamp: T2 }` | untouched, **noop** | touched, can't compose + sparse → REMOVE gsi1sk | Same — invisible, gsi1pk preserved |
+| Stamp (unrelated write) | `{ published: {...} }` | untouched, **noop** | untouched, **noop** | Unchanged — both halves preserved (the v1.7.0 leak is closed) |
+| Telemetry (rejoin) | `{ alertState: "active", timestamp: T3 }` | untouched, **noop** | touched, SET full → `alert#active#ts#T3` | Re-visible under preserved gsi1pk + new gsi1sk; **no enrichment re-fire needed** |
+| Hierarchical demote (different entity, multi-composite SK) | `update(key).set({ region, country, city }).remove(["site"])` | n/a | touched (set + removedSet), trailing-absent → SET truncated to `region#APAC#country#AU#city#Sydney` | Re-indexed at city scope |
+| Explicit drop | `update(key).remove(["alertState"])` | untouched, **noop** | touched (alertState in removedSet), can't compose → REMOVE gsi1sk | Invisible; gsi1pk preserved (per-half cascade — no longer GSI-wide) |
+| Cascade override under preserve | `{ pk: "preserve" }`, `update(key).remove(["accountId"])` (no surviving pk composites) | touched (cascade), can't compose + preserve + cascade override → REMOVE gsi1pk | untouched, **noop** | gsi1pk REMOVE'd via cascade override |
 
-**Multi-writer entity design rule.** Each GSI half should be entirely owned by a single writer's domain. The library does not paper over cross-writer composite ownership — that's a consumer-side modeling discipline. With v3's per-half policy and the structural composition rule, a writer that doesn't own a GSI's composites simply doesn't supply them, and the half no-ops under `preserve` or drops under `sparse` per its declaration. There is no per-composite leakage across writers like in v1.6.
+**Multi-writer entity design rule.** Each GSI half should be entirely owned by a single writer's domain. The library does not paper over cross-writer composite ownership — that's a consumer-side modeling discipline. With v1.7.1's per-half evaluation gate and the per-half outcome rule, a writer that doesn't touch a GSI's composites simply doesn't supply them, and the half no-ops regardless of policy. There is no per-composite leakage across writers like in v1.6, and no GSI-wide blast radius like in v1.7.0.
 
 ### Sparse Map Storage (`storedAs: DynamoModel.SparseMap()`)
 
@@ -997,7 +1036,7 @@ Hierarchical truncation — leaf composites being *refinements* that should *dem
 | Order grouping | `[customerId, orderId]` | After clearing `orderId`, group-by-customer queries still work |
 | Multi-tenant fleet | `[accountId, fleetId]` (PK) | Vehicle leaves a fleet but stays queryable at account scope |
 
-Under v3 (§7), this is the default behavior of the structural composition rule — there is no separate "pruning" code path. A trailing-absent composite simply truncates the half to its leading prefix, regardless of which half (PK or SK) and regardless of policy. PK and SK behave identically. The only asymmetry left is the policy-controlled handling of the *empty* leading prefix (`'sparse'` drops, `'preserve'` no-ops) and the *hole* pattern (`'sparse'` truncates, `'preserve'` throws EDD-9024).
+Under v1.7.1 (§7), trailing-absent truncation is part of the structural composition rule — there is no separate "pruning" code path. A trailing-absent composite simply truncates the half to its leading prefix, regardless of which half (PK or SK). PK and SK behave identically. The set/remove asymmetry (§7) governs how to invoke truncation: `set` provides surviving composites; `remove` invalidates the leaf — both must appear in the same call for truncation to happen, otherwise `remove` alone REMOVEs the half (no read-before-write).
 
 **Worked example — geographic asset hierarchy (PK + SK, both preserve).**
 
@@ -1015,40 +1054,49 @@ indexes: {
 // Stored: gsi1pk = "$app#v1#asset#region_americas",
 //         gsi1sk = "$app#v1#asset#country_us#city_sf#site_datacenter-1"
 
-// Asset leaves the datacenter — explicit per-attribute drop.
-// Use Entity.remove for the per-attribute, atomic remove + GSI cascade.
-yield* db.entities.Assets.update(key).remove(['site'])
-// REMOVE the whole gsi1pk/gsi1sk pair (cascade — `site` is a composite of gsi1).
+// Asset leaves the datacenter — *demote* (truncate, stay queryable at city scope).
+// Supply the surviving composites via `set` AND invalidate the leaf via `remove`
+// in the same call — the structural rule then composes the truncated leading prefix.
+yield* db.entities.Assets.update(key).set({ country: 'us', city: 'sf' }).remove(['site'])
+// gsi1pk unchanged (region untouched — pk half is not in the payload).
+// gsi1sk truncated to "$app#v1#asset#country_us#city_sf"
+// begins_with(gsi1sk, "$app#v1#asset#country_us#city_sf") still finds this asset.
 
-// Or, for a *demote-don't-evict* on `site`: omit it from the payload (or set
-// it to undefined). Under the structural rule, the SK half truncates to the
-// leading prefix.
-yield* db.entities.Assets.update(key).set({ city: 'la' })   // implicit: site omitted
-// gsi1pk unchanged (region still in stored attrs).
-// gsi1sk truncated to "$app#v1#asset#country_us#city_la"
-// begins_with(gsi1sk, "$app#v1#asset#country_us#city_la") still finds this asset.
+// Asset leaves the datacenter — *evict* (drop the whole half).
+// Without surviving composites in `set`, the library can't compose anything;
+// the cascade fires and REMOVEs gsi1sk entirely.
+yield* db.entities.Assets.update(key).remove(['site'])
+// pk untouched, noop. sk touched via removedSet, can't-compose (no surviving values),
+// preserve + removedSet → cascade override → REMOVE gsi1sk.
+// gsi1pk preserved; the per-half cascade no longer drops gsi1pk.
 
 // PK-side demotion — multi-composite PK example.
 //   pk.composite = ['accountId', 'fleetId']  (preserve on both halves)
 // Vehicle leaves a fleet but stays under the account scope:
-yield* db.entities.Vehicles.update(key).set({ accountId: 'acct-1' })
+yield* db.entities.Vehicles.update(key).set({ accountId: 'acct-1' }).remove(['fleetId'])
 // PK truncated to "$app#v1#vehicle#accountid_acct-1" — vehicle still queryable
 // by account, just not by the prior fleet. Same hierarchical demotion as SK,
-// applied symmetrically to PK under v3.
+// applied symmetrically to PK.
 
-// Decommission — drop from the index entirely.
-yield* db.entities.Assets.update(key).remove(['country'])
-// REMOVE gsi1pk, gsi1sk — cascade overrides any truncation.
+// Decommission — drop from the index entirely (sparse policy on the relevant half),
+// or use Entity.remove on every composite of the half to force the cascade.
+yield* db.entities.Assets.update(key).remove(['country', 'city', 'site'])
+// sk touched (multiple composites in removedSet), no surviving composites → REMOVE gsi1sk.
+// pk untouched (no pk composites in removedSet), noop. Item invisible in the GSI
+// (DDB projection rule: needs both keys), gsi1pk value retained for future rejoin.
 
-// Hole pattern under preserve — throws EDD-9024:
-// yield* db.entities.Assets.update(key).remove(['city']).set({ site: 'datacenter-2' })
-// → throws: composite "city" at sk position 1 was cleared, but composite
-//   "site" at position 2 is still present.
+// Hole pattern under preserve — collapses into can't-compose, no throw, no SET.
+// `city` invalidated, `site` supplied → would compose `[country_us, _, site_dc2]` (hole).
+// Per v1.7.1: hole = can't-compose; preserve + removedSet contains city → cascade
+// override → REMOVE gsi1sk.
+// yield* db.entities.Assets.update(key).remove(['city']).set({ country: 'us', site: 'datacenter-2' })
+// → REMOVE gsi1sk. (v1.7.0 would have thrown EDD-9024; that throw is now deprecated.)
 
-// Hole pattern under sparse — truncates to leading prefix:
+// Hole pattern under sparse — same outcome, REMOVE gsi1sk:
 //   indexPolicy: { pk: 'preserve', sk: 'sparse' }
-// yield* db.entities.Assets.update(key).remove(['city']).set({ site: 'datacenter-2' })
-// → SK truncated to "$app#v1#asset#country_us"; site value ignored.
+// yield* db.entities.Assets.update(key).remove(['city']).set({ country: 'us', site: 'datacenter-2' })
+// → REMOVE gsi1sk. Note: site value is invalidated (data loss in the index) —
+// this is the unified rule's "no silent partial composition on holes" intent.
 ```
 
 ---
