@@ -24,27 +24,38 @@ export interface KeyPart {
 }
 
 /**
- * Per-composite policy value controlling how `Entity.update` and time-series
- * `.append` handle a composite attribute that is absent from the merged update
- * payload.
+ * Per-half policy value controlling how `Entity.update` and time-series
+ * `.append` handle a GSI half whose composites are absent from the merged
+ * update payload.
  *
- * - `"sparse"` — absent → REMOVE `gsiNpk`/`gsiNsk`; item drops out of the GSI.
- * - `"preserve"` — absent → leave the stored GSI key field untouched.
+ * - `"sparse"` — when the half's composites are entirely absent (whole-half
+ *   empty), REMOVE both `gsiNpk` and `gsiNsk` (item drops out of the GSI).
+ *   On a hole pattern (`[A, _, C]`), truncate the half to the leading prefix
+ *   `[A]` and ignore trailing values.
+ * - `"preserve"` — whole-half-empty is a no-op; the stored values for that
+ *   half stay intact. On a hole pattern, throw `CompositeKeyHoleError`
+ *   (EDD-9024) at write time.
  *
- * Attributes not covered by an `indexPolicy` default to `"preserve"`. See
- * `DESIGN.md §7 Policy-Aware GSI Composition` for full decision rules.
+ * Halves not declared in `indexPolicy` default to `"preserve"`. See
+ * `DESIGN.md §7 Policy-Aware GSI Composition` for the full decision rules
+ * (structural composition, two drop triggers, decision table).
  */
-export type IndexPolicyAttr = "sparse" | "preserve"
+export type IndexPolicyHalf = "sparse" | "preserve"
 
 /**
- * Function form of an index policy. Receives the merged record
- * (`primaryKey + payload` at update time, `primaryKey + appendInput` at append
- * time) and returns a per-attribute policy map. Only keys corresponding to
- * composite attributes of this GSI are consulted; additional keys are ignored.
+ * Per-half index policy declaration. Both halves default to `"preserve"`
+ * when omitted (or when `indexPolicy` is omitted entirely from the GSI
+ * config).
+ *
+ * The standard composition path has only payload-level information (no
+ * read-before-write), so per-attribute policy callbacks were removed in
+ * v3 — within a single half, per-attribute mixing has no coherent semantic
+ * because a half is a single concatenated string.
  */
-export type IndexPolicy = (
-  item: Readonly<Record<string, unknown>>,
-) => Partial<Record<string, IndexPolicyAttr>>
+export interface IndexPolicy {
+  readonly pk?: IndexPolicyHalf | undefined
+  readonly sk?: IndexPolicyHalf | undefined
+}
 
 /** Index definition for primary or secondary index (internal format) */
 export interface IndexDefinition {
@@ -55,9 +66,9 @@ export interface IndexDefinition {
   readonly sk: KeyPart
   readonly casing?: DynamoSchema.Casing | undefined
   /**
-   * Optional per-composite policy for `Entity.update` and `.append`. Not
-   * consulted on `put()` — put always omits a GSI's keys when any of its
-   * composites is missing.
+   * Optional per-half policy for `Entity.update` and `.append`. Not consulted
+   * on `put()` — put always omits a GSI's keys when any of its composites is
+   * missing.
    */
   readonly indexPolicy?: IndexPolicy | undefined
 }
@@ -76,13 +87,9 @@ export interface GsiConfig {
   /** Sort key: physical field name + composite attributes. */
   readonly sk: KeyPart
   /**
-   * Per-composite sparse/preserve policy. Applied by `Entity.update` and
-   * time-series `.append`. Defaults to `"preserve"` for any composite the
-   * function does not specify. Not applied on `put()`.
-   *
-   * At append-time, returned keys must be members of the `appendInput`
-   * schema (enforced at `Entity.make()`) — composites owned by other writers
-   * cannot have policy at append-time, since `.append` cannot touch them.
+   * Per-half sparse/preserve policy. Applied by `Entity.update` and
+   * time-series `.append`. Defaults to `"preserve"` on each half. Not
+   * applied on `put()`. See `DESIGN.md §7 Policy-Aware GSI Composition`.
    */
   readonly indexPolicy?: IndexPolicy | undefined
 }
@@ -309,17 +316,51 @@ export interface GsiUpdateResult {
 }
 
 /**
+ * Compose a partition key from the leading prefix
+ * `[pk_0, ..., pk_(stopBefore-1)]` of an index's PK composites. Used by v3's
+ * structural composition rule when a trailing PK composite is absent and the
+ * half's `indexPolicy.pk` is `"preserve"` (or absent — defaults to preserve).
+ *
+ * `stopBefore === 0` produces the bare entity/collection prefix with no
+ * composite values.
+ */
+const composePkPrefixUpTo = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  index: IndexDefinition,
+  record: Record<string, unknown>,
+  stopBefore: number,
+): string => {
+  const slice = index.pk.composite.slice(0, stopBefore)
+  const composites = extractComposites(slice, record)
+  const collection = index.collection
+
+  if (collection !== undefined) {
+    const collectionName = Array.isArray(collection) ? collection[0]! : collection
+    return composeCollectionKey(schema, collectionName, composites, {
+      casing: index.casing,
+      names: [...slice],
+    })
+  }
+
+  return composeKey(schema, entityType, composites, {
+    casing: index.casing,
+    names: [...slice],
+  })
+}
+
+/**
  * Compose a sort key from the leading prefix `[sk_0, ..., sk_(stopBefore-1)]`
- * of an index's SK composites. Used by hierarchical SK pruning when a
- * trailing SK composite is explicitly cleared with `preserve` policy — the
- * resulting `gsiNsk` keeps the parent context and the item stays queryable
- * at the coarser depth.
+ * of an index's SK composites. Used by v3's structural composition rule when a
+ * trailing SK composite is absent and the half's `indexPolicy.sk` is
+ * `"preserve"` (or absent — defaults to preserve), or when a hole pattern is
+ * encountered under `"sparse"`.
  *
  * `stopBefore === 0` produces the bare entity/collection prefix with no
  * composite values (the item still belongs to the GSI but at the broadest
  * scope — `begins_with(sk, "<prefix>")` matches it).
  *
- * See `DESIGN.md §7.6 Hierarchical SK Pruning`.
+ * See `DESIGN.md §7 Policy-Aware GSI Composition`.
  */
 export const composeSkPrefixUpTo = (
   schema: DynamoSchema.DynamoSchema,
@@ -354,46 +395,135 @@ export const composeSkPrefixUpTo = (
 }
 
 /**
- * Policy-aware GSI key composition for `Entity.update` and time-series
- * `.append`.
+ * Per-half outcome of the structural composition rule.
  *
- * Implements the v2 unified-hierarchy three-way payload classification:
+ * - `kind: "set"` — the half composed to a (possibly truncated) value.
+ *   `length` is the number of leading composites included.
+ * - `kind: "noop"` — preserve policy + whole-half-empty: leave the stored
+ *   key field untouched.
+ * - `kind: "drop"` — sparse policy + whole-half-empty: REMOVE the half (and,
+ *   per the GSI roll-up rule, also REMOVE the other half).
+ * - `kind: "hole-throw"` — preserve policy + hole pattern: throw EDD-9024.
+ *   The position is the absent composite; trailingPosition is the first
+ *   present trailing composite.
+ */
+type HalfOutcome =
+  | { readonly kind: "set"; readonly length: number }
+  | { readonly kind: "noop" }
+  | { readonly kind: "drop" }
+  | {
+      readonly kind: "hole-throw"
+      readonly absentPosition: number
+      readonly trailingPosition: number
+    }
+
+/**
+ * Apply v3's structural composition rule to a single half.
+ *
+ * Walks the composite list left-to-right, finds the longest leading prefix of
+ * present values, and classifies the result based on whether the prefix is
+ * partial, whether trailing values are present (hole), and whether the half
+ * is empty. Policy is consulted only for hole + whole-half-empty cases.
+ */
+const classifyHalf = (
+  composites: ReadonlyArray<string>,
+  record: Record<string, unknown>,
+  policy: IndexPolicyHalf,
+): HalfOutcome => {
+  // No composites at all (e.g. sk.composite = []) — emit a SET of length 0
+  // (the bare entity prefix). Policy is irrelevant in this case; this is the
+  // standard "primary key with empty SK composite" shape.
+  if (composites.length === 0) {
+    return { kind: "set", length: 0 }
+  }
+
+  let leadingLen = 0
+  while (leadingLen < composites.length) {
+    const v = record[composites[leadingLen]!]
+    if (v === undefined || v === null) break
+    leadingLen++
+  }
+
+  // All present → SET full length.
+  if (leadingLen === composites.length) {
+    return { kind: "set", length: leadingLen }
+  }
+
+  // Some absent. Check for hole (a present composite after the absent run).
+  let firstTrailingPresent = -1
+  for (let j = leadingLen + 1; j < composites.length; j++) {
+    const v = record[composites[j]!]
+    if (v !== undefined && v !== null) {
+      firstTrailingPresent = j
+      break
+    }
+  }
+
+  if (firstTrailingPresent !== -1) {
+    // Hole pattern. Policy decides.
+    if (policy === "preserve") {
+      return {
+        kind: "hole-throw",
+        absentPosition: leadingLen,
+        trailingPosition: firstTrailingPresent,
+      }
+    }
+    // sparse → truncate to leading prefix.
+    return { kind: "set", length: leadingLen }
+  }
+
+  // No hole — pure trailing-absent. If the leading prefix is empty, the whole
+  // half is empty; policy decides.
+  if (leadingLen === 0) {
+    return policy === "sparse" ? { kind: "drop" } : { kind: "noop" }
+  }
+
+  // Non-empty leading prefix with trailing absent → truncate. Same outcome
+  // under both policies.
+  return { kind: "set", length: leadingLen }
+}
+
+/**
+ * Resolve the per-half policy for an index. Defaults each half to `"preserve"`
+ * when omitted (or when `indexPolicy` is omitted entirely).
+ */
+const resolveIndexPolicy = (
+  policy: IndexPolicy | undefined,
+): { pk: IndexPolicyHalf; sk: IndexPolicyHalf } => ({
+  pk: policy?.pk ?? "preserve",
+  sk: policy?.sk ?? "preserve",
+})
+
+/**
+ * Policy-aware GSI key composition for `Entity.update` and time-series
+ * `.append` — v3 per-half structural composition.
+ *
+ * Implements two-way payload classification:
  * - **present** (`attr: <value>` in payload, or inherited from `keyRecord`)
  *   — value is used in composition.
- * - **explicit clear** (`attr: null` or `attr: undefined` in payload) —
- *   `null` and `undefined` collapse and cascade unconditionally; policy is
- *   bypassed for explicit clears.
- * - **omitted** (key not in payload at all) — `indexPolicy` is consulted.
- *   Default policy is `"preserve"` for any composite not declared.
+ * - **absent** (key omitted, or `attr: null`, or `attr: undefined`) — the
+ *   structural rule treats all three identically.
  *
- * Per-attribute outcomes (per touched GSI):
- *
- * | State         | PK composite              | SK composite                                 |
- * | ------------- | ------------------------- | -------------------------------------------- |
- * | omitted+sparse| Drop the GSI              | Drop the GSI                                 |
- * | omitted+preserve | No-op for that half     | No-op for that half                          |
- * | clear+sparse  | Drop the GSI              | Drop the GSI                                 |
- * | clear+preserve| Drop the GSI (degrades to sparse on PK — partition migration is almost always wrong) | **Truncate `gsiNsk`** at this composite (hierarchical pruning) |
+ * For each touched GSI half (PK and SK independently), walk the composite
+ * list left-to-right and build the longest valid leading prefix. Policy is
+ * consulted only for the hole pattern (truncate under sparse, throw EDD-9024
+ * under preserve) and the whole-half-empty case (drop both keys under
+ * sparse, no-op under preserve).
  *
  * Cascade (`Entity.remove([attr])`) overrides everything: any composite in
- * `removedSet` forces a full GSI drop.
- *
- * **Hole detection.** Throws `CompositeKeyHoleError` (EDD-9024) when an SK
- * composite at position `i` is cleared (with preserve) while a composite at
- * position `j > i` is still present in the merged payload — composed keys
- * cannot carry holes.
+ * `removedSet` forces a full GSI drop (REMOVE both `gsiNpk` and `gsiNsk`).
  *
  * A GSI is considered "touched" when any of its composites appears in
- * `updatePayload` (present, explicit clear, or omitted-with-`indexPolicy`),
- * or `removedSet`. GSIs without an `indexPolicy` are skipped when none of
- * their composites are touched. GSIs with a policy are always evaluated —
- * the policy is a declarative statement about the GSI's membership.
+ * `updatePayload`, or `removedSet`. GSIs without an `indexPolicy` are skipped
+ * when none of their composites are touched. GSIs with a policy are always
+ * evaluated — the policy is a declarative statement about the GSI's
+ * membership invariant.
  *
  * See `DESIGN.md §7 Policy-Aware GSI Composition` for the full decision
- * algorithm and worked decision table, and `§7.6 Hierarchical SK Pruning`
- * for the trailing-clear truncation contract.
+ * algorithm, decision table, and the two-drop-trigger framing.
  *
- * @throws {CompositeKeyHoleError} EDD-9024 on hole-pattern detection.
+ * @throws {CompositeKeyHoleError} EDD-9024 on hole-pattern detection under
+ *   `'preserve'` policy.
  */
 export const composeGsiKeysForUpdatePolicyAware = (
   schema: DynamoSchema.DynamoSchema,
@@ -404,30 +534,11 @@ export const composeGsiKeysForUpdatePolicyAware = (
   keyRecord: Record<string, unknown>,
   options?: {
     readonly removedSet?: ReadonlySet<string> | undefined
-    /**
-     * Attributes that appear in `updatePayload` with value `null` or
-     * `undefined` — i.e. the consumer explicitly cleared them. The library
-     * distinguishes this from omission to give consumers an unambiguous
-     * "drop this composite from the key" instruction; `null` and
-     * `undefined` collapse here to eliminate the long-standing footgun of
-     * dev confusion between the two in TypeScript with
-     * `exactOptionalPropertyTypes`.
-     */
-    readonly clearedSet?: ReadonlySet<string> | undefined
   },
 ): GsiUpdateResult => {
   const sets: Record<string, string> = {}
   const removes: Array<string> = []
   const removedSet = options?.removedSet
-  // Derive clearedSet: any payload entry whose value is null or undefined.
-  // `null` and `undefined` collapse — both signal "explicit clear, drop this
-  // composite from the key now". The caller may also supply an explicit
-  // clearedSet for cases where the cleared signal arrives outside of
-  // `updatePayload` (e.g. computed paths). The two are unioned.
-  const clearedSet: Set<string> = new Set(options?.clearedSet ?? [])
-  for (const [k, v] of Object.entries(updatePayload)) {
-    if (v === null || v === undefined) clearedSet.add(k)
-  }
 
   for (const [indexName, index] of Object.entries(indexes)) {
     if (indexName === "primary") continue
@@ -449,125 +560,74 @@ export const composeGsiKeysForUpdatePolicyAware = (
       continue
     }
 
-    // Build merged record for value extraction. Cleared attrs are excluded so
-    // their value is undefined when composed.
+    // Build merged record for value extraction. Two-way classification: any
+    // payload value that is `null` or `undefined` is treated as absent (the
+    // attribute is excluded from `merged`). `keyRecord` provides values for
+    // composites the consumer didn't touch.
     const merged: Record<string, unknown> = { ...keyRecord }
     for (const [k, v] of Object.entries(updatePayload)) {
-      if (clearedSet.has(k)) continue // cleared → exclude
+      if (v === null || v === undefined) {
+        delete merged[k]
+        continue
+      }
       merged[k] = v
     }
-    const policy = index.indexPolicy?.(merged) ?? {}
 
-    const isPresent = (attr: string): boolean => {
-      const v = merged[attr]
-      return v !== undefined && v !== null
+    const policy = resolveIndexPolicy(index.indexPolicy)
+    const pkOutcome = classifyHalf(pkComposites, merged, policy.pk)
+    const skOutcome = classifyHalf(skComposites, merged, policy.sk)
+
+    // Hole-throw on either half raises EDD-9024 with the offending location.
+    if (pkOutcome.kind === "hole-throw") {
+      throw makeCompositeKeyHoleError({
+        entityType,
+        indexName: index.index ?? indexName,
+        clearedComposite: pkComposites[pkOutcome.absentPosition]!,
+        trailingComposite: pkComposites[pkOutcome.trailingPosition]!,
+        clearedPosition: pkOutcome.absentPosition,
+        trailingPosition: pkOutcome.trailingPosition,
+        half: "pk",
+      })
     }
-    const isCleared = (attr: string): boolean => clearedSet.has(attr)
-    const isOmitted = (attr: string): boolean => !(attr in updatePayload) && !isPresent(attr)
+    if (skOutcome.kind === "hole-throw") {
+      throw makeCompositeKeyHoleError({
+        entityType,
+        indexName: index.index ?? indexName,
+        clearedComposite: skComposites[skOutcome.absentPosition]!,
+        trailingComposite: skComposites[skOutcome.trailingPosition]!,
+        clearedPosition: skOutcome.absentPosition,
+        trailingPosition: skOutcome.trailingPosition,
+        half: "sk",
+      })
+    }
 
-    // ---- Drop signals (any → REMOVE both keys, then continue) ----
-
-    // PK composite cleared (any policy degrades to sparse — partition
-    // migration is almost always wrong, see DESIGN.md §7).
-    const pkClear = pkComposites.some(isCleared)
-    if (pkClear) {
+    // Whole-GSI drop: any half declared sparse + whole-half-empty drops both
+    // halves together. This is the implicit drop trigger.
+    if (pkOutcome.kind === "drop" || skOutcome.kind === "drop") {
       removes.push(index.pk.field, index.sk.field)
       continue
     }
 
-    // PK composite omitted with sparse policy.
-    const pkOmittedSparse = pkComposites.some(
-      (attr) => isOmitted(attr) && policy[attr] === "sparse",
-    )
-    if (pkOmittedSparse) {
-      removes.push(index.pk.field, index.sk.field)
-      continue
+    // Per-half SET / no-op. Halves are emitted independently — preserve +
+    // empty leaves the stored value alone.
+    if (pkOutcome.kind === "set") {
+      sets[index.pk.field] =
+        pkOutcome.length === pkComposites.length
+          ? composePk(schema, entityType, index, merged)
+          : composePkPrefixUpTo(schema, entityType, index, merged, pkOutcome.length)
     }
-
-    // SK composite cleared with sparse policy.
-    const skClearSparse = skComposites.some((attr) => isCleared(attr) && policy[attr] === "sparse")
-    if (skClearSparse) {
-      removes.push(index.pk.field, index.sk.field)
-      continue
-    }
-
-    // SK composite omitted with sparse policy.
-    const skOmittedSparse = skComposites.some(
-      (attr) => isOmitted(attr) && policy[attr] === "sparse",
-    )
-    if (skOmittedSparse) {
-      removes.push(index.pk.field, index.sk.field)
-      continue
-    }
-
-    // ---- Hierarchical SK truncation: SK clear with preserve ----
-
-    // First SK position cleared under preserve. Earlier sparse-clear case
-    // already handled above, so any cleared SK attr at this point is preserve.
-    let truncateAt = -1
-    for (let i = 0; i < skComposites.length; i++) {
-      const attr = skComposites[i]!
-      if (isCleared(attr)) {
-        truncateAt = i
-        break
-      }
-    }
-
-    if (truncateAt !== -1) {
-      // Hole check: any SK composite at position j > truncateAt that is
-      // present in the composed payload would compose to a syntactically
-      // invalid prefix. Throw EDD-9024 with location info.
-      for (let j = truncateAt + 1; j < skComposites.length; j++) {
-        const attr = skComposites[j]!
-        if (isPresent(attr)) {
-          throw makeCompositeKeyHoleError({
-            entityType,
-            indexName: index.index ?? indexName,
-            clearedComposite: skComposites[truncateAt]!,
-            trailingComposite: attr,
-            clearedPosition: truncateAt,
-            trailingPosition: j,
-            half: "sk",
-          })
-        }
-      }
-
-      // Truncation requires the leading prefix attrs to be present (in merged).
-      // Any missing-preserve in the leading prefix collapses to the half-wise
-      // preserve rule for the SK — leave SK alone instead of truncating.
-      const leadingAllPresent = skComposites.slice(0, truncateAt).every(isPresent)
-      if (leadingAllPresent) {
-        sets[index.sk.field] = composeSkPrefixUpTo(
-          schema,
-          entityType,
-          entityVersion,
-          index,
-          merged,
-          truncateAt,
-        )
-      }
-
-      // PK side recomposes if all PK composites are present (no SET if any
-      // PK composite is omitted-with-preserve — same as the half-wise rule).
-      if (pkComposites.every(isPresent)) {
-        sets[index.pk.field] = composePk(schema, entityType, index, merged)
-      }
-      continue
-    }
-
-    // ---- No drop, no truncation: standard half-wise recompose ----
-    const pkAllPresent = pkComposites.every(isPresent)
-    const skAllPresent = skComposites.every(isPresent)
-
-    if (pkAllPresent && skAllPresent) {
-      Object.assign(sets, composeIndexKeys(schema, entityType, entityVersion, index, merged))
-      continue
-    }
-    if (pkAllPresent) {
-      sets[index.pk.field] = composePk(schema, entityType, index, merged)
-    }
-    if (skAllPresent) {
-      sets[index.sk.field] = composeSk(schema, entityType, entityVersion, index, merged)
+    if (skOutcome.kind === "set") {
+      sets[index.sk.field] =
+        skOutcome.length === skComposites.length
+          ? composeSk(schema, entityType, entityVersion, index, merged)
+          : composeSkPrefixUpTo(
+              schema,
+              entityType,
+              entityVersion,
+              index,
+              merged,
+              skOutcome.length,
+            )
     }
   }
 
