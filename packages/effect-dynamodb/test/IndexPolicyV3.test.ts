@@ -1,14 +1,21 @@
 /**
- * Entity-level integration tests for indexPolicy v3 semantics (refs #39).
+ * Entity-level integration tests for indexPolicy v1.7.1 semantics (closes #41).
  *
  * Covers the wiring through `Entity.update` (standard updateItem path),
  * `Entity.update` retain path, and `.append()`. KeyComposer-level unit tests
- * live in `KeyComposer.test.ts`; this file proves the v3 semantics make it
+ * live in `KeyComposer.test.ts`; this file proves the v1.7.1 semantics make it
  * through the Entity layer to the wire (UpdateExpression / TransactItems).
  *
  * The tests are mock-based (no DynamoDB) — they capture the request payload
  * sent to `client.updateItem` / `client.transactWriteItems` and assert on
  * the SET / REMOVE clauses and key composition.
+ *
+ * Renamed scenarios from the v1.7.0 file:
+ *   - "GSI-wide cascade" → "per-half cascade" (v1.7.1 bug-1 fix)
+ *   - "EDD-9024 throw under preserve" → "noop or REMOVE depending on cascade
+ *     override" (v1.7.1 bug-2 fix)
+ *   - "always-evaluated under policy" → "per-half evaluation gate" (v1.7.1
+ *     bug-3 fix)
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -17,7 +24,7 @@ import { Effect, Layer, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import { CompositeKeyHoleError, CompositeNullableError } from "../src/Errors.js"
+import { CompositeNullableError } from "../src/Errors.js"
 import * as Table from "../src/Table.js"
 
 // ---------------------------------------------------------------------------
@@ -139,44 +146,130 @@ const TableLayer = AppTable.layer({ name: "app-table" })
 // The Asset fixture uses retain: true so retain-path semantics are exercised.
 // ---------------------------------------------------------------------------
 
-describe("Entity update — indexPolicy v3 wiring (retain path)", () => {
-  it.effect("Entity.remove(['site']) cascades — drops both GSI keys", () => {
-    const capture: Capture = {}
-    return Effect.gen(function* () {
-      const db = yield* DynamoClient.make({
-        entities: { Assets },
-        tables: { AppTable },
-      })
-      yield* db.entities.Assets.update({ assetId: "a-1" }).remove(["site"])
+describe("Entity update — indexPolicy v1.7.1 wiring (retain path)", () => {
+  it.effect(
+    "Entity.remove(['site']) — per-half cascade on SK; structural rule truncates from stored composites",
+    () => {
+      // v1.7.1: cascade is per-half. `site` is in the SK composite list only.
+      // SK touched via removedSet → on the RETAIN path the stored country/city
+      // are available in newItem (read-then-write), so the structural rule
+      // composes the leading prefix [country, city] → SET sk truncated. The
+      // cascade override fires only when the rule CAN'T compose; here it can.
+      //
+      // This is the retain-path-specific outcome — on the standard path
+      // without surviving composites in the same call, `Entity.remove(['site'])`
+      // alone REMOVEs sk (set/remove asymmetry — see KeyComposer tests).
+      //
+      // PK untouched (region not in removedSet, not in payload) → noop,
+      // keeps the stored value.
+      //
+      // (v1.7.0 would have REMOVE'd both gsi1pk AND gsi1sk via the GSI-wide
+      // cascade. This test asserts the v1.7.1 behavior change — pk preserved,
+      // sk truncates not drops.)
+      const capture: Capture = {}
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { Assets },
+          tables: { AppTable },
+        })
+        yield* db.entities.Assets.update({ assetId: "a-1" }).remove(["site"])
 
-      const tx = capture.transactWriteItems
-      expect(tx).toBeDefined()
-      const items = (tx as { TransactItems?: Array<unknown> }).TransactItems
-      expect(items?.length).toBeGreaterThan(0)
-      const mainPut = items?.[0] as { Put?: { Item?: Record<string, AttributeValue> } }
-      const item = mainPut.Put?.Item
-      expect(item).toBeDefined()
-      expect(item!.gsi1pk).toBeUndefined()
-      expect(item!.gsi1sk).toBeUndefined()
-    }).pipe(Effect.provide(Layer.mergeAll(makeLayer(capture), TableLayer)), Effect.scoped)
-  })
+        const tx = capture.transactWriteItems
+        expect(tx).toBeDefined()
+        const items = (tx as { TransactItems?: Array<unknown> }).TransactItems
+        expect(items?.length).toBeGreaterThan(0)
+        const mainPut = items?.[0] as { Put?: { Item?: Record<string, AttributeValue> } }
+        const item = mainPut.Put?.Item
+        expect(item).toBeDefined()
+        // gsi1pk preserved (region untouched). v1.7.1 critical assertion.
+        expect(item!.gsi1pk).toBeDefined()
+        expect(item!.gsi1pk).toEqual({ S: "$app#v1#asset#region_americas" })
+        // gsi1sk truncated to [country, city] via structural rule (the retain
+        // path supplies surviving composites from stored attrs).
+        expect(item!.gsi1sk).toBeDefined()
+        expect((item!.gsi1sk as { S: string }).S).toBe("$app#v1#asset#country_us#city_sf")
+      }).pipe(Effect.provide(Layer.mergeAll(makeLayer(capture), TableLayer)), Effect.scoped)
+    },
+  )
 
-  it.effect("Entity.remove(['country']) cascades the whole GSI", () => {
-    const capture: Capture = {}
-    return Effect.gen(function* () {
-      const db = yield* DynamoClient.make({
-        entities: { Assets },
-        tables: { AppTable },
-      })
-      yield* db.entities.Assets.update({ assetId: "a-1" }).remove(["country"])
-      const tx = capture.transactWriteItems
-      const item = (
-        tx as { TransactItems: Array<{ Put: { Item: Record<string, AttributeValue> } }> }
-      ).TransactItems[0]!.Put.Item
-      expect(item.gsi1pk).toBeUndefined()
-      expect(item.gsi1sk).toBeUndefined()
-    }).pipe(Effect.provide(Layer.mergeAll(makeLayer(capture), TableLayer)), Effect.scoped)
-  })
+  it.effect(
+    "Entity.remove(['country']) — per-half cascade on SK; can't compose (hole) → REMOVE sk; PK preserved",
+    () => {
+      // country is at sk[0]. Removing it leaves [_, city, site] — hole at
+      // sk[0]. Hole = can't compose. Preserve + cascade override (country in
+      // removedSet) → REMOVE sk. PK preserved (region untouched).
+      const capture: Capture = {}
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { Assets },
+          tables: { AppTable },
+        })
+        yield* db.entities.Assets.update({ assetId: "a-1" }).remove(["country"])
+        const tx = capture.transactWriteItems
+        const item = (
+          tx as { TransactItems: Array<{ Put: { Item: Record<string, AttributeValue> } }> }
+        ).TransactItems[0]!.Put.Item
+        // gsi1pk preserved (region untouched).
+        expect(item.gsi1pk).toBeDefined()
+        // gsi1sk REMOVE'd via per-half cascade override (preserve + can't-
+        // compose + country in removedSet).
+        expect(item.gsi1sk).toBeUndefined()
+      }).pipe(Effect.provide(Layer.mergeAll(makeLayer(capture), TableLayer)), Effect.scoped)
+    },
+  )
+
+  it.effect(
+    "Entity.remove(['region']) — per-half cascade on PK; SK preserved",
+    () => {
+      // region is in pk only. Per-half cascade hits PK; SK preserved.
+      const capture: Capture = {}
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { Assets },
+          tables: { AppTable },
+        })
+        yield* db.entities.Assets.update({ assetId: "a-1" }).remove(["region"])
+        const tx = capture.transactWriteItems
+        const item = (
+          tx as { TransactItems: Array<{ Put: { Item: Record<string, AttributeValue> } }> }
+        ).TransactItems[0]!.Put.Item
+        // gsi1pk REMOVE'd via per-half cascade override (preserve + can't-
+        // compose + region in removedSet).
+        expect(item.gsi1pk).toBeUndefined()
+        // gsi1sk preserved (untouched). v1.7.1 critical assertion.
+        expect(item.gsi1sk).toBeDefined()
+      }).pipe(Effect.provide(Layer.mergeAll(makeLayer(capture), TableLayer)), Effect.scoped)
+    },
+  )
+
+  it.effect(
+    "Hierarchical demote — set surviving composites + remove leaf → SET sk truncated",
+    () => {
+      // Set/remove asymmetry. Supply country+city via set, invalidate site via
+      // remove. SK touched (set + removedSet), structural rule succeeds with
+      // leading prefix [country, city] → SET sk truncated (no cascade — the
+      // rule composed something).
+      const capture: Capture = {}
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { Assets },
+          tables: { AppTable },
+        })
+        yield* db.entities.Assets.update({ assetId: "a-1" })
+          .set({ country: "us", city: "sf" })
+          .remove(["site"])
+        const tx = capture.transactWriteItems
+        const item = (
+          tx as { TransactItems: Array<{ Put: { Item: Record<string, AttributeValue> } }> }
+        ).TransactItems[0]!.Put.Item
+        // gsi1pk preserved (region untouched, not in payload, not in removedSet).
+        expect(item.gsi1pk).toBeDefined()
+        // gsi1sk SET to truncated leading prefix [country, city].
+        expect(item.gsi1sk).toBeDefined()
+        expect((item.gsi1sk as { S: string }).S).toBe("$app#v1#asset#country_us#city_sf")
+      }).pipe(Effect.provide(Layer.mergeAll(makeLayer(capture), TableLayer)), Effect.scoped)
+    },
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -229,9 +322,9 @@ const makePagesMock = (capture: Capture) => ({
   getItem: () => Effect.die("getItem not expected on standard path"),
 })
 
-describe("Entity update — standard path migration regression (issue #36 / #39)", () => {
+describe("Entity update — standard path migration regression (issue #36 / #41)", () => {
   it.effect(
-    "partial update that omits preserve-policied composites does NOT generate REMOVE",
+    "partial update that omits preserve-policied composites does NOT generate REMOVE for any GSI key",
     () => {
       const capture: Capture = {}
       const layer = Layer.mergeAll(
@@ -243,12 +336,10 @@ describe("Entity update — standard path migration regression (issue #36 / #39)
           entities: { Pages },
           tables: { PagesTable },
         })
-        // Update only `name` — never mentions X, Y, Z. Pre-1.6 with sparse on
-        // those composites generated REMOVE gsi1pk/sk + gsi2pk/sk + gsi3pk/sk
-        // (six unwanted REMOVEs). Under v3 with all halves preserve, a partial
-        // update that doesn't touch X/Y/Z is a no-op for those PK halves (the
-        // SK halves recompose because they share the primary key composite
-        // pageId).
+        // Update only `name` — never mentions X, Y, Z, or pageId. Under
+        // v1.7.1 the per-half evaluation gate skips ALL halves of all three
+        // GSIs (none has a composite touched). The footgun stays closed:
+        // zero gsi*pk / gsi*sk REMOVEs in the UpdateExpression.
         yield* db.entities.Pages.update({ pageId: "p-1" }).set({ name: "new-name" })
         const ui = capture.updateItem as {
           UpdateExpression?: string
@@ -263,6 +354,17 @@ describe("Entity update — standard path migration regression (issue #36 / #39)
           .filter((s) => s.length > 0)
           .map((alias) => ui.ExpressionAttributeNames?.[alias] ?? alias)
         for (const name of physicalRemoves) {
+          expect(name).not.toMatch(/^gsi\d(pk|sk)$/)
+        }
+        // v1.7.1 additional assertion: no SETs on gsi*pk / gsi*sk either —
+        // halves are untouched, so the composer emits nothing.
+        const setClause = expr.match(/SET\s+(.*?)(?:\s+REMOVE|$)/i)?.[1] ?? ""
+        const setNames = setClause
+          .split(",")
+          .map((s) => s.split("=")[0]?.trim() ?? "")
+          .filter((s) => s.startsWith("#"))
+          .map((alias) => ui.ExpressionAttributeNames?.[alias] ?? alias)
+        for (const name of setNames) {
           expect(name).not.toMatch(/^gsi\d(pk|sk)$/)
         }
       }).pipe(Effect.provide(layer), Effect.scoped)
@@ -323,35 +425,31 @@ const makeHolesMock = (capture: Capture) => ({
   getItem: () => Effect.die("getItem not expected (no retain)"),
 })
 
-describe("Entity update — hole detection (v3 policy-aware)", () => {
-  it.effect("preserve + hole pattern surfaces as CompositeKeyHoleError (EDD-9024)", () => {
-    const capture: Capture = {}
-    const layer = Layer.mergeAll(
-      Layer.succeed(DynamoClient, makeHolesMock(capture) as any),
-      HolesTableLayer,
-    )
-    return Effect.gen(function* () {
-      const db = yield* DynamoClient.make({
-        entities: { PreserveHoles, SparseHoles },
-        tables: { HolesTable },
-      })
-      // city absent (omitted), site present → hole on SK at position 0.
-      const error = yield* db.entities.PreserveHoles.update({ assetId: "a-1" })
-        .set({ country: "us", site: "datacenter-2" })
-        .asEffect()
-        .pipe(Effect.flip)
-      expect(error).toBeInstanceOf(CompositeKeyHoleError)
-      const e = error as CompositeKeyHoleError
-      expect(e.indexName).toBe("gsi1")
-      expect(e.clearedComposite).toBe("city")
-      expect(e.trailingComposite).toBe("site")
-      expect(e.key).toBe("sk")
-    }).pipe(Effect.provide(layer), Effect.scoped)
-  })
+// Helper for parsing the captured UpdateExpression's REMOVE clause into a
+// set of physical attribute names.
+const parseRemoves = (ui: {
+  UpdateExpression?: string
+  ExpressionAttributeNames?: Record<string, string>
+}): Set<string> => {
+  const expr = ui.UpdateExpression ?? ""
+  const removeIdx = expr.indexOf("REMOVE")
+  if (removeIdx === -1) return new Set()
+  const removeTail = expr.slice(removeIdx + "REMOVE".length).trim()
+  const removeAliases = removeTail
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && s.startsWith("#"))
+  return new Set(removeAliases.map((a) => ui.ExpressionAttributeNames?.[a] ?? a))
+}
 
+describe("Entity update — hole pattern under v1.7.1 (no throw, unified can't-compose)", () => {
   it.effect(
-    "sparse + hole pattern with empty leading prefix → drops both halves (no error)",
+    "preserve + hole pattern (no removedSet) → noop sk (NOT a throw — EDD-9024 deprecated)",
     () => {
+      // city absent (omitted), site present → hole on SK at position 0.
+      // v1.7.0 threw EDD-9024 here. v1.7.1: hole collapses into can't-
+      // compose; preserve + no removedSet → noop sk. PK touched (country in
+      // payload) → SET pk. Critical assertion: no error AND no gsi1sk REMOVE.
       const capture: Capture = {}
       const layer = Layer.mergeAll(
         Layer.succeed(DynamoClient, makeHolesMock(capture) as any),
@@ -362,8 +460,79 @@ describe("Entity update — hole detection (v3 policy-aware)", () => {
           entities: { PreserveHoles, SparseHoles },
           tables: { HolesTable },
         })
-        // Same hole pattern (city absent, site present), but sk is sparse and
-        // the leading prefix is empty → collapses to whole-half-empty + drop.
+        yield* db.entities.PreserveHoles.update({ assetId: "a-1" }).set({
+          country: "us",
+          site: "datacenter-2",
+        })
+        const ui = capture.updateItem as {
+          UpdateExpression?: string
+          ExpressionAttributeNames?: Record<string, string>
+        }
+        const removed = parseRemoves(ui)
+        // No EDD-9024. No gsi1sk REMOVE (preserve + no cascade → noop).
+        expect(removed.has("gsi1sk")).toBe(false)
+        // gsi1pk is touched (country in payload, where country IS a pk
+        // composite for PreserveHoles? checking — yes, pk = [country]) →
+        // SET. No REMOVE on gsi1pk.
+        expect(removed.has("gsi1pk")).toBe(false)
+      }).pipe(Effect.provide(layer), Effect.scoped)
+    },
+  )
+
+  it.effect(
+    "preserve + hole pattern + Entity.remove(['city']) → REMOVE sk via cascade override",
+    () => {
+      // Same hole pattern, but now city is in removedSet. SK touched (set has
+      // site, removedSet has city), can't compose → preserve + cascade
+      // override → REMOVE sk only. (Per-half cascade — pk untouched per the
+      // gate on this fixture; country is the pk composite and IS in the
+      // payload, so pk is also touched and SETs.)
+      const capture: Capture = {}
+      const layer = Layer.mergeAll(
+        Layer.succeed(DynamoClient, makeHolesMock(capture) as any),
+        HolesTableLayer,
+      )
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { PreserveHoles, SparseHoles },
+          tables: { HolesTable },
+        })
+        yield* db.entities.PreserveHoles.update({ assetId: "a-1" })
+          .set({ country: "us", site: "datacenter-2" })
+          .remove(["city"])
+        const ui = capture.updateItem as {
+          UpdateExpression?: string
+          ExpressionAttributeNames?: Record<string, string>
+        }
+        const removed = parseRemoves(ui)
+        // gsi1sk REMOVE'd via cascade override (preserve + can't-compose +
+        // city in removedSet).
+        expect(removed.has("gsi1sk")).toBe(true)
+        // gsi1pk NOT removed — country is the pk composite, touched, SETs.
+        expect(removed.has("gsi1pk")).toBe(false)
+        // city itself is also REMOVE'd from the item (the standard remove
+        // clause).
+        expect(removed.has("city")).toBe(true)
+      }).pipe(Effect.provide(layer), Effect.scoped)
+    },
+  )
+
+  it.effect(
+    "sparse + hole pattern (empty leading prefix) → REMOVE sk only (per-half, NOT GSI-wide)",
+    () => {
+      // SparseHoles: pk preserve, sk sparse. city absent + site present →
+      // hole + sparse → REMOVE sk only. Critical v1.7.1 assertion: gsi1pk
+      // is NOT REMOVE'd (the v1.7.0 GSI-wide cascade is gone).
+      const capture: Capture = {}
+      const layer = Layer.mergeAll(
+        Layer.succeed(DynamoClient, makeHolesMock(capture) as any),
+        HolesTableLayer,
+      )
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { PreserveHoles, SparseHoles },
+          tables: { HolesTable },
+        })
         yield* db.entities.SparseHoles.update({ assetId: "a-1" }).set({
           country: "us",
           site: "datacenter-2",
@@ -372,20 +541,13 @@ describe("Entity update — hole detection (v3 policy-aware)", () => {
           UpdateExpression?: string
           ExpressionAttributeNames?: Record<string, string>
         }
-        // gsi1pk + gsi1sk should be REMOVE'd, not SET. Pull the REMOVE-clause
-        // tokens directly: they're the aliases whose names map back to gsi1pk
-        // and gsi1sk. The expression has shape "SET ... REMOVE #r0, #r1".
         expect(ui.UpdateExpression).toMatch(/\bREMOVE\b/)
-        const expr = ui.UpdateExpression!
-        const removeIdx = expr.indexOf("REMOVE")
-        const removeTail = expr.slice(removeIdx + "REMOVE".length).trim()
-        const removeAliases = removeTail
-          .split(/[,\s]+/)
-          .map((s) => s.trim())
-          .filter((s) => s.length > 0 && s.startsWith("#"))
-        const removed = removeAliases.map((a) => ui.ExpressionAttributeNames?.[a] ?? a)
-        expect(removed).toContain("gsi1pk")
-        expect(removed).toContain("gsi1sk")
+        const removed = parseRemoves(ui)
+        // sk REMOVE'd via sparse + can't-compose.
+        expect(removed.has("gsi1sk")).toBe(true)
+        // pk NOT REMOVE'd — preserve + the country composite of pk is in
+        // payload → pk touched, SETs. v1.7.1 critical: NOT GSI-wide cascade.
+        expect(removed.has("gsi1pk")).toBe(false)
       }).pipe(Effect.provide(layer), Effect.scoped)
     },
   )
