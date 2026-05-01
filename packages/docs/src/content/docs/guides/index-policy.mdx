@@ -123,7 +123,8 @@ The unifying property: leaf composites are *refinements* of the parent context; 
   // gsi3sk = "$indexpolicy-demo#v1#asset#country_us#city_sf#site_datacenter-1"
 
   // Asset leaves the datacenter — omit `site` (or set it to undefined).
-  // Under the structural rule, the SK truncates at the leading prefix [country, city].
+  // Under the structural rule, the SK truncates at the leading prefix
+  // [country, city] — no separate "pruning" code path.
   yield* dbHier.entities.Assets.update({ assetId: "rack-42" }).set({
     country: "us",
     city: "sf",
