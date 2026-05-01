@@ -345,7 +345,7 @@ describe("Entity update — hole detection (v3 policy-aware)", () => {
       expect(e.indexName).toBe("gsi1")
       expect(e.clearedComposite).toBe("city")
       expect(e.trailingComposite).toBe("site")
-      expect(e.half).toBe("sk")
+      expect(e.key).toBe("sk")
     }).pipe(Effect.provide(layer), Effect.scoped)
   })
 

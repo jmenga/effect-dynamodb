@@ -40,7 +40,7 @@ export interface KeyPart {
  * `DESIGN.md §7 Policy-Aware GSI Composition` for the full decision rules
  * (structural composition, two drop triggers, decision table).
  */
-export type IndexPolicyHalf = "sparse" | "preserve"
+export type IndexPolicyKey = "sparse" | "preserve"
 
 /**
  * Per-half index policy declaration. Both halves default to `"preserve"`
@@ -53,8 +53,8 @@ export type IndexPolicyHalf = "sparse" | "preserve"
  * because a half is a single concatenated string.
  */
 export interface IndexPolicy {
-  readonly pk?: IndexPolicyHalf | undefined
-  readonly sk?: IndexPolicyHalf | undefined
+  readonly pk?: IndexPolicyKey | undefined
+  readonly sk?: IndexPolicyKey | undefined
 }
 
 /** Index definition for primary or secondary index (internal format) */
@@ -428,7 +428,7 @@ type HalfOutcome =
 const classifyHalf = (
   composites: ReadonlyArray<string>,
   record: Record<string, unknown>,
-  policy: IndexPolicyHalf,
+  policy: IndexPolicyKey,
 ): HalfOutcome => {
   // No composites at all (e.g. sk.composite = []) — emit a SET of length 0
   // (the bare entity prefix). Policy is irrelevant in this case; this is the
@@ -491,7 +491,7 @@ const classifyHalf = (
  */
 const resolveIndexPolicy = (
   policy: IndexPolicy | undefined,
-): { pk: IndexPolicyHalf; sk: IndexPolicyHalf } => ({
+): { pk: IndexPolicyKey; sk: IndexPolicyKey } => ({
   pk: policy?.pk ?? "preserve",
   sk: policy?.sk ?? "preserve",
 })
@@ -588,7 +588,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
         trailingComposite: pkComposites[pkOutcome.trailingPosition]!,
         clearedPosition: pkOutcome.absentPosition,
         trailingPosition: pkOutcome.trailingPosition,
-        half: "pk",
+        key: "pk",
       })
     }
     if (skOutcome.kind === "hole-throw") {
@@ -599,7 +599,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
         trailingComposite: skComposites[skOutcome.trailingPosition]!,
         clearedPosition: skOutcome.absentPosition,
         trailingPosition: skOutcome.trailingPosition,
-        half: "sk",
+        key: "sk",
       })
     }
 

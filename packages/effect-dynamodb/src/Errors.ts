@@ -263,8 +263,8 @@ export class VersionConflict extends Data.TaggedError("VersionConflict")<{
  * payload field.
  *
  * Resolutions: supply a value for the absent composite, clear (omit or
- * `Entity.remove(...)`) all trailing composites too, or declare the half as
- * `'sparse'` to opt into truncate-on-hole semantics.
+ * `Entity.remove(...)`) all trailing composites too, or set
+ * `indexPolicy.<key>` to `'sparse'` to opt into truncate-on-hole semantics.
  *
  * See `DESIGN.md §7 Policy-Aware GSI Composition`.
  */
@@ -275,7 +275,8 @@ export class CompositeKeyHoleError extends Data.TaggedError("CompositeKeyHoleErr
   readonly trailingComposite: string
   readonly clearedPosition: number
   readonly trailingPosition: number
-  readonly half: "pk" | "sk"
+  /** Which GSI key attribute the hole is in — `"pk"` (gsiNpk) or `"sk"` (gsiNsk). */
+  readonly key: "pk" | "sk"
   /** Human-readable description, prefixed with `EDD-9024`. */
   readonly message: string
 }> {}
@@ -291,18 +292,18 @@ export const makeCompositeKeyHoleError = (params: {
   readonly trailingComposite: string
   readonly clearedPosition: number
   readonly trailingPosition: number
-  readonly half: "pk" | "sk"
+  readonly key: "pk" | "sk"
 }): CompositeKeyHoleError =>
   new CompositeKeyHoleError({
     ...params,
     message:
       `[EDD-9024] Composite key hole on GSI "${params.indexName}" of entity "${params.entityType}": ` +
-      `composite "${params.clearedComposite}" at ${params.half} position ${params.clearedPosition} is absent, ` +
-      `but composite "${params.trailingComposite}" at ${params.half} position ${params.trailingPosition} is still present, ` +
-      `and the ${params.half} half's indexPolicy is 'preserve'. ` +
+      `composite "${params.clearedComposite}" at ${params.key} position ${params.clearedPosition} is absent, ` +
+      `but composite "${params.trailingComposite}" at ${params.key} position ${params.trailingPosition} is still present, ` +
+      `and indexPolicy.${params.key} is 'preserve'. ` +
       `Composed keys cannot carry holes — either supply a value for "${params.clearedComposite}", ` +
       `clear all trailing composites (>= position ${params.trailingPosition}) too, ` +
-      `declare the ${params.half} half as 'sparse' to opt into truncate-on-hole, ` +
+      `set indexPolicy.${params.key} = 'sparse' to opt into truncate-on-hole, ` +
       `or use Entity.remove(["${params.clearedComposite}"]) to drop the whole GSI.`,
   })
 

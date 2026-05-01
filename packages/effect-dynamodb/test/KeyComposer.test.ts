@@ -616,7 +616,7 @@ describe("KeyComposer", () => {
             indexName: "gsi1",
             clearedComposite: "B",
             trailingComposite: "C",
-            half: "sk",
+            key: "sk",
             clearedPosition: 0,
             trailingPosition: 1,
           })
@@ -692,7 +692,7 @@ describe("KeyComposer", () => {
           expect(e).toMatchObject({
             _tag: "CompositeKeyHoleError",
             indexName: "gsi1",
-            half: "pk",
+            key: "pk",
           })
           return
         }

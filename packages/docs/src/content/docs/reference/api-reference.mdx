@@ -879,8 +879,8 @@ import { KeyComposer } from "effect-dynamodb"
 |------|-------------|
 | `KeyPart` | `{ field: string, composite: string[] }` |
 | `IndexDefinition` | `{ pk: KeyPart, sk: KeyPart, index?, collection?, type?, casing?, indexPolicy? }` |
-| `IndexPolicyHalf` | `"sparse" \| "preserve"` |
-| `IndexPolicy` | `{ pk?: IndexPolicyHalf, sk?: IndexPolicyHalf }` (each half defaults to `"preserve"` when omitted) |
+| `IndexPolicyKey` | `"sparse" \| "preserve"` |
+| `IndexPolicy` | `{ pk?: IndexPolicyKey, sk?: IndexPolicyKey }` (each key defaults to `"preserve"` when omitted) |
 | `GsiUpdateResult` | `{ sets: Record<string, string>, removes: ReadonlyArray<string> }` |
 
 ---
