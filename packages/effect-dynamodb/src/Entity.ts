@@ -27,7 +27,6 @@ import {
 import * as DynamoSchema from "./DynamoSchema.js"
 import {
   CascadePartialFailure,
-  CompositeKeyHoleError,
   ConditionalCheckFailed,
   ItemNotFound,
   isAwsConditionalCheckFailed,
@@ -2902,60 +2901,60 @@ const makeImpl = <
             const primaryKeyMap = composePrimaryKey(newItem)
             Object.assign(newItem, primaryKeyMap)
 
-            // GSI keys: route through the policy-aware composer so the v3
-            // structural rule + `Entity.remove` cascade match the standard
-            // update path. `newItem` carries stored values for any composite
-            // the user did not touch — passing it as `keyRecord` lets the
-            // composer treat omissions as no-ops (the half stays untouched
-            // because the stored value is present), while still firing the
-            // cascade and the structural truncation rule. See DESIGN.md §7.
+            // GSI keys: route through the policy-aware composer so the
+            // v1.7.1 per-half evaluation gate, structural rule, and per-half
+            // cascade match the standard update path. `newItem` carries
+            // stored values for any composite the user did not touch — used
+            // as the merged record for the structural rule. The composer
+            // emits per-half SETs/REMOVEs/noops that we apply directly to
+            // `newItem` (which becomes the put-style item written back).
+            //
+            // No try/catch needed — EDD-9024 was deprecated in v1.7.1 and
+            // the composer no longer throws.
             const retainRemovedSet = uState.remove ? new Set(uState.remove) : undefined
-            try {
-              const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+            const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+              schema,
+              entityType,
+              entityVersion,
+              allIndexes,
+              hydratedUpdates as globalThis.Record<string, unknown>,
+              newItem,
+              { removedSet: retainRemovedSet },
+            )
+            for (const [field, value] of Object.entries(gsiUpdate.sets)) {
+              newItem[field] = value
+            }
+            for (const field of gsiUpdate.removes) {
+              delete newItem[field]
+            }
+            // GSIs where neither half was touched (per the v1.7.1 evaluation
+            // gate): retain path semantics are Put-style — recompose from
+            // `newItem` and drop both keys when any composite is missing.
+            // For touched halves, trust the composer's per-half decision
+            // (SET / REMOVE / leave-stored-value-on-newItem-alone for noop).
+            const addressed = new Set<string>([
+              ...Object.keys(gsiUpdate.sets),
+              ...gsiUpdate.removes,
+            ])
+            for (const [indexName, indexDef] of Object.entries(allIndexes)) {
+              if (indexName === "primary") continue
+              // If either half was addressed, the composer made the per-half
+              // decision; the other half's stored value already lives on
+              // `newItem` from the read-then-write merge above.
+              if (addressed.has(indexDef.pk.field) || addressed.has(indexDef.sk.field)) continue
+              const keys = KeyComposer.tryComposeIndexKeys(
                 schema,
                 entityType,
                 entityVersion,
-                allIndexes,
-                hydratedUpdates as globalThis.Record<string, unknown>,
+                indexDef,
                 newItem,
-                { removedSet: retainRemovedSet },
               )
-              for (const [field, value] of Object.entries(gsiUpdate.sets)) {
-                newItem[field] = value
+              if (keys) {
+                Object.assign(newItem, keys)
+              } else {
+                delete newItem[indexDef.pk.field]
+                delete newItem[indexDef.sk.field]
               }
-              for (const field of gsiUpdate.removes) {
-                delete newItem[field]
-              }
-              // Untouched GSIs (no policy + no payload + no cascade): retain
-              // path semantics are Put-style — recompose from `newItem` and
-              // drop both keys when any composite is missing. Matches the
-              // existing `composeAllKeys` behavior for those GSIs.
-              const addressed = new Set<string>([
-                ...Object.keys(gsiUpdate.sets),
-                ...gsiUpdate.removes,
-              ])
-              for (const [indexName, indexDef] of Object.entries(allIndexes)) {
-                if (indexName === "primary") continue
-                if (addressed.has(indexDef.pk.field) || addressed.has(indexDef.sk.field)) continue
-                const keys = KeyComposer.tryComposeIndexKeys(
-                  schema,
-                  entityType,
-                  entityVersion,
-                  indexDef,
-                  newItem,
-                )
-                if (keys) {
-                  Object.assign(newItem, keys)
-                } else {
-                  delete newItem[indexDef.pk.field]
-                  delete newItem[indexDef.sk.field]
-                }
-              }
-            } catch (e) {
-              if (e instanceof CompositeKeyHoleError) {
-                return yield* e
-              }
-              throw e
             }
 
             // Compute sentinel rotation values while newItem is in domain names.
@@ -3355,33 +3354,25 @@ const makeImpl = <
             removeClauses.push(nameKey)
           }
 
-          // Policy-aware GSI key composition (v3 — per-half structural rule).
-          // One call covers SETs (full recompose, truncated leading prefix,
-          // or no-op), sparse whole-half-empty REMOVEs, and cascade REMOVEs
-          // when an Entity.remove() targets a GSI composite. See DESIGN.md
-          // §7 Policy-Aware GSI Composition.
+          // Policy-aware GSI key composition (v1.7.1 — per-half evaluation
+          // gate, structural rule, and per-half cascade). One call covers
+          // SETs (full recompose, truncated leading prefix), per-half REMOVEs
+          // (sparse can't-compose, or preserve + cascade override), and
+          // per-half noops (preserve + can't-compose without cascade). See
+          // DESIGN.md §7 Policy-Aware GSI Composition.
           //
-          // The composer throws CompositeKeyHoleError (EDD-9024) when the
-          // merged payload describes a hole pattern AND the relevant half's
-          // policy is `'preserve'`. Under `'sparse'`, holes silently truncate.
-          // Catch the error synchronously and surface as a typed Effect failure.
-          let gsiUpdate: KeyComposer.GsiUpdateResult
-          try {
-            gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
-              schema,
-              entityType,
-              entityVersion,
-              allIndexes,
-              hydratedUpdates as globalThis.Record<string, unknown>,
-              decodedKey as globalThis.Record<string, unknown>,
-              { removedSet },
-            )
-          } catch (e) {
-            if (e instanceof CompositeKeyHoleError) {
-              return yield* e
-            }
-            throw e
-          }
+          // No try/catch — EDD-9024 was deprecated in v1.7.1 and the
+          // composer no longer throws. Hole patterns collapse into the
+          // unified can't-compose rule.
+          const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+            schema,
+            entityType,
+            entityVersion,
+            allIndexes,
+            hydratedUpdates as globalThis.Record<string, unknown>,
+            decodedKey as globalThis.Record<string, unknown>,
+            { removedSet },
+          )
           for (const [field, value] of Object.entries(gsiUpdate.sets)) {
             const nameKey = `#u${counter}`
             const valKey = `:u${counter}`
@@ -4282,26 +4273,19 @@ const makeImpl = <
         }
       }
 
-      // The composer can throw CompositeKeyHoleError (EDD-9024) when a hole
-      // pattern is encountered AND the relevant half's policy is `'preserve'`.
-      // Under `'sparse'`, holes silently truncate. Surface the error as a
-      // typed Effect failure.
-      let gsiUpdate: KeyComposer.GsiUpdateResult
-      try {
-        gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
-          schema,
-          entityType,
-          entityVersion,
-          allIndexes,
-          nonPkAppendFields,
-          encoded,
-        )
-      } catch (e) {
-        if (e instanceof CompositeKeyHoleError) {
-          return yield* e
-        }
-        throw e
-      }
+      // No try/catch — EDD-9024 was deprecated in v1.7.1 and the composer
+      // no longer throws. Per-half evaluation gate skips halves whose
+      // composites are entirely outside `appendInput`; touched halves
+      // follow the unified per-half outcome rule (sparse drops; preserve
+      // noops or cascades).
+      const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        entityType,
+        entityVersion,
+        allIndexes,
+        nonPkAppendFields,
+        encoded,
+      )
       for (const [field, value] of Object.entries(gsiUpdate.sets)) {
         const nameKey = `#a${counter}`
         const valKey = `:a${counter}`
