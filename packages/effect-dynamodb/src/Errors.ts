@@ -246,27 +246,38 @@ export class VersionConflict extends Data.TaggedError("VersionConflict")<{
 }> {}
 
 /**
- * EDD-9024 — A GSI composite at half-position `i` was absent while a composite
- * at position `j > i` was still present, AND the half's `indexPolicy` is
- * `'preserve'`. Composed keys can't carry holes meaningfully — `acc#A#child#Y`
- * with `parent` cleared composes to a syntactically invalid prefix that no
- * `begins_with` query would match. Under `'preserve'`, the library refuses to
- * silently drop the trailing composite and raises this error instead. Under
- * `'sparse'`, the trailing composite is silently truncated to the leading
- * prefix and no error is raised (and when the leading prefix is empty,
- * the half collapses to whole-half-empty which sparse drops together with
- * the other half).
+ * EDD-9024 — DEPRECATED in v1.7.1.
  *
- * Raised at write time (Entity.update / time-series .append). The error
- * names the GSI, the absent composite at position `i`, and the still-present
- * trailing composite at position `j` so callers can locate the offending
- * payload field.
+ * @deprecated Since v1.7.1, this error is no longer thrown at runtime. It is
+ *   kept as an exported class for back-compat with consumers who type-imported
+ *   it (e.g. inside `Effect.catchTag("CompositeKeyHoleError", ...)` blocks).
+ *   No code path constructs or throws this error anymore.
  *
- * Resolutions: supply a value for the absent composite, clear (omit or
- * `Entity.remove(...)`) all trailing composites too, or set
- * `indexPolicy.<key>` to `'sparse'` to opt into truncate-on-hole semantics.
+ * **Why deprecated.** v1.7.0's "throw under preserve on hole pattern" was a
+ * defensive runtime safety net for a case the type system already catches:
+ * required composites can't be omitted under `exactOptionalPropertyTypes`
+ * since v1.7.0 reverted the v1.6 NullishOr widening. The only remaining
+ * runtime "hole" shape is "optional leading composite absent + present
+ * trailing composite," which is a normal write the consumer expressly chose.
  *
- * See `DESIGN.md §7 Policy-Aware GSI Composition`.
+ * **What replaces it.** Hole patterns now collapse into the unified per-half
+ * can't-compose rule:
+ * - `'sparse'` half → REMOVE that half's key (drops the half).
+ * - `'preserve'` half + composite of the half is in `Entity.remove([...])`
+ *   → REMOVE that half's key (cascade override fires).
+ * - `'preserve'` half + no composite in `Entity.remove([...])` → noop (the
+ *   stored key is left untouched; may be stale until the next write that
+ *   touches the half supplies enough composites to recompose, or an
+ *   `Entity.remove` cascade fires).
+ *
+ * See `DESIGN.md §7 Policy-Aware GSI Composition` (v1.7.1 unified rule).
+ *
+ * **Migration.** Remove any `Effect.catchTag("CompositeKeyHoleError", ...)`
+ * handlers — the throw site is gone and the catch is dead code. If you were
+ * relying on the throw to detect bad payloads, switch to declaring the
+ * relevant GSI half as `'sparse'` (the consumer-side semantic that always
+ * matches the throw's intent — drop the index entry on can't-compose) or
+ * supply the surviving composites via `set` in the same update.
  */
 export class CompositeKeyHoleError extends Data.TaggedError("CompositeKeyHoleError")<{
   readonly entityType: string
@@ -282,8 +293,11 @@ export class CompositeKeyHoleError extends Data.TaggedError("CompositeKeyHoleErr
 }> {}
 
 /**
- * Build a {@link CompositeKeyHoleError} with a formatted message. Centralises
- * the message format so call sites (KeyComposer, Entity) stay consistent.
+ * Build a {@link CompositeKeyHoleError} with a formatted message.
+ *
+ * @deprecated Since v1.7.1 this builder is unused — no code path raises EDD-9024
+ *   at runtime. Kept exported only for back-compat with consumers who imported
+ *   the helper. See {@link CompositeKeyHoleError} for the migration path.
  */
 export const makeCompositeKeyHoleError = (params: {
   readonly entityType: string
@@ -297,14 +311,11 @@ export const makeCompositeKeyHoleError = (params: {
   new CompositeKeyHoleError({
     ...params,
     message:
-      `[EDD-9024] Composite key hole on GSI "${params.indexName}" of entity "${params.entityType}": ` +
+      `[EDD-9024 — DEPRECATED] Composite key hole on GSI "${params.indexName}" of entity "${params.entityType}": ` +
       `composite "${params.clearedComposite}" at ${params.key} position ${params.clearedPosition} is absent, ` +
-      `but composite "${params.trailingComposite}" at ${params.key} position ${params.trailingPosition} is still present, ` +
-      `and indexPolicy.${params.key} is 'preserve'. ` +
-      `Composed keys cannot carry holes — either supply a value for "${params.clearedComposite}", ` +
-      `clear all trailing composites (>= position ${params.trailingPosition}) too, ` +
-      `set indexPolicy.${params.key} = 'sparse' to opt into truncate-on-hole, ` +
-      `or use Entity.remove(["${params.clearedComposite}"]) to drop the whole GSI.`,
+      `but composite "${params.trailingComposite}" at ${params.key} position ${params.trailingPosition} is still present. ` +
+      `Since v1.7.1 this error is no longer thrown — hole patterns collapse into the unified per-half can't-compose rule ` +
+      `(REMOVE the half under 'sparse' or removedSet cascade; noop under 'preserve' without removedSet).`,
   })
 
 /**

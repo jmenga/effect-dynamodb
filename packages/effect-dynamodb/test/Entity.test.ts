@@ -3780,57 +3780,73 @@ describe("Entity", () => {
         }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("update with indexPolicy sparse drops item out of the GSI on partial", () =>
-      Effect.gen(function* () {
-        const SparseDropEntity = withConfig(
-          Entity.make({
-            model: TenantUser,
-            entityType: "TenantUser",
-            primaryKey: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
-            indexes: {
-              byTenant: {
-                name: "gsi1",
-                pk: { field: "gsi1pk", composite: ["tenantId"] },
-                sk: { field: "gsi1sk", composite: ["region"] },
-                // v3 per-half: SK is sparse; whole-SK-empty triggers drop.
-                indexPolicy: { pk: "preserve", sk: "sparse" },
+    it.effect(
+      "update with indexPolicy sparse + touched-but-can't-compose drops only that half (v1.7.1)",
+      () =>
+        Effect.gen(function* () {
+          const SparseDropEntity = withConfig(
+            Entity.make({
+              model: TenantUser,
+              entityType: "TenantUser",
+              primaryKey: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
               },
-            },
-          }),
-        )
+              indexes: {
+                byTenant: {
+                  name: "gsi1",
+                  pk: { field: "gsi1pk", composite: ["tenantId"] },
+                  sk: { field: "gsi1sk", composite: ["region"] },
+                  // v1.7.1: per-half SK is sparse. SK touched (via undefined)
+                  // and can't compose → REMOVE gsi1sk only. pk is independent.
+                  indexPolicy: { pk: "preserve", sk: "sparse" },
+                },
+              },
+            }),
+          )
 
-        mockUpdateItem.mockResolvedValueOnce({
-          Attributes: toAttributeMap({
-            userId: "u-1",
-            name: "Test",
-            tenantId: "t-2",
-            region: "us-east-1",
-            email: "a@b.com",
-            pk: "$myapp#v1#tenantuser#userid_u-1",
-            sk: "$myapp#v1#tenantuser",
-            __edd_e__: "TenantUser",
-          }),
-        })
+          mockUpdateItem.mockResolvedValueOnce({
+            Attributes: toAttributeMap({
+              userId: "u-1",
+              name: "Test",
+              tenantId: "t-2",
+              region: "us-east-1",
+              email: "a@b.com",
+              pk: "$myapp#v1#tenantuser#userid_u-1",
+              sk: "$myapp#v1#tenantuser",
+              __edd_e__: "TenantUser",
+            }),
+          })
 
-        // region is 'sparse' and missing → REMOVE both gsi1 key fields.
-        yield* SparseDropEntity.update({ userId: "u-1" }).pipe(
-          Entity.set({ tenantId: "t-2" }),
-          Entity.asModel,
-        )
+          // Touch sk's region with undefined → sk evaluated. Empty leading
+          // prefix → sparse → REMOVE sk only. pk touched (tenantId in
+          // payload) → SET. v1.7.1 critical: pk is NOT removed.
+          yield* SparseDropEntity.update({ userId: "u-1" }).pipe(
+            Entity.set({ tenantId: "t-2", region: undefined }),
+            Entity.asModel,
+          )
 
-        const call = mockUpdateItem.mock.calls[0]![0]
-        const names = Object.values(call.ExpressionAttributeNames) as string[]
-        expect(names).toContain("gsi1pk")
-        expect(names).toContain("gsi1sk")
-        const expr = call.UpdateExpression as string
-        // REMOVE clause should cover both GSI key fields (the item drops out)
-        expect(expr).toContain("REMOVE")
-        // gsi1pk and gsi1sk appear only in REMOVE, not SET
-        expect(expr).not.toMatch(/SET[^R]*gsi1pk/)
-      }).pipe(Effect.provide(TestLayer)),
+          const call = mockUpdateItem.mock.calls[0]![0]
+          const expr = call.UpdateExpression as string
+          const eanEntries = Object.entries(call.ExpressionAttributeNames) as Array<
+            [string, string]
+          >
+          const aliasOf = (physical: string) => eanEntries.find(([_, v]) => v === physical)?.[0]
+          const gsi1pkAlias = aliasOf("gsi1pk")
+          const gsi1skAlias = aliasOf("gsi1sk")
+          expect(gsi1pkAlias).toBeDefined()
+          expect(gsi1skAlias).toBeDefined()
+          // Determine which clause each alias appears in.
+          const removeIdx = expr.indexOf("REMOVE")
+          const setExpr = removeIdx === -1 ? expr : expr.slice(0, removeIdx)
+          const remExpr = removeIdx === -1 ? "" : expr.slice(removeIdx)
+          // v1.7.1 critical: gsi1pk is SET (not REMOVE'd).
+          expect(setExpr.includes(gsi1pkAlias!)).toBe(true)
+          expect(remExpr.includes(gsi1pkAlias!)).toBe(false)
+          // gsi1sk is REMOVE'd (not SET).
+          expect(remExpr.includes(gsi1skAlias!)).toBe(true)
+          expect(setExpr.includes(gsi1skAlias!)).toBe(false)
+        }).pipe(Effect.provide(TestLayer)),
     )
 
     it.effect("update with indexPolicy preserve (explicit) leaves GSI untouched on partial", () =>
@@ -3880,103 +3896,119 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("remove of GSI composite cascades to GSI key field removal", () =>
-      Effect.gen(function* () {
-        mockUpdateItem.mockResolvedValueOnce({
-          Attributes: toAttributeMap({
-            userId: "u-1",
-            name: "Test",
-            tenantId: "t-1",
-            region: "us-east-1",
-            email: "a@b.com",
-            pk: "$myapp#v1#tenantuser#u-1",
-            sk: "$myapp#v1#tenantuser",
-            __edd_e__: "TenantUser",
-          }),
-        })
+    it.effect(
+      "remove of GSI composite cascades to that half's GSI key only (per-half — v1.7.1)",
+      () =>
+        Effect.gen(function* () {
+          // v1.7.1: cascade is per-half. tenantId is in pk composites of
+          // byTenant (pk=[tenantId], sk=[region]). PK touched via removedSet,
+          // can't compose → preserve + cascade override → REMOVE gsi1pk.
+          // SK untouched (region not in payload, not in removedSet) → noop.
+          //
+          // (v1.7.0 would have REMOVE'd both halves via the GSI-wide cascade.
+          // This test asserts the v1.7.1 behavior change.)
+          mockUpdateItem.mockResolvedValueOnce({
+            Attributes: toAttributeMap({
+              userId: "u-1",
+              name: "Test",
+              tenantId: "t-1",
+              region: "us-east-1",
+              email: "a@b.com",
+              pk: "$myapp#v1#tenantuser#u-1",
+              sk: "$myapp#v1#tenantuser",
+              __edd_e__: "TenantUser",
+            }),
+          })
 
-        yield* SparseUpdateEntity.update({ userId: "u-1" }).pipe(
-          Entity.remove(["tenantId"]),
-          Entity.asModel,
-        )
+          yield* SparseUpdateEntity.update({ userId: "u-1" }).pipe(
+            Entity.remove(["tenantId"]),
+            Entity.asModel,
+          )
 
-        const call = mockUpdateItem.mock.calls[0]![0]
-        const names = call.ExpressionAttributeNames as Record<string, string>
-        const nameValues = Object.values(names)
-        // The removed attribute itself
-        expect(nameValues).toContain("tenantId")
-        // GSI key fields should also be removed
-        expect(nameValues).toContain("gsi1pk")
-        expect(nameValues).toContain("gsi1sk")
-        // All should appear in REMOVE clause
-        const expr = call.UpdateExpression as string
-        expect(expr).toContain("REMOVE")
-      }).pipe(Effect.provide(TestLayer)),
+          const call = mockUpdateItem.mock.calls[0]![0]
+          const names = call.ExpressionAttributeNames as Record<string, string>
+          const nameValues = Object.values(names)
+          // The removed attribute itself.
+          expect(nameValues).toContain("tenantId")
+          // pk's GSI key REMOVE'd via per-half cascade override.
+          expect(nameValues).toContain("gsi1pk")
+          // sk's GSI key NOT addressed (region untouched per the per-half gate).
+          expect(nameValues).not.toContain("gsi1sk")
+          const expr = call.UpdateExpression as string
+          expect(expr).toContain("REMOVE")
+        }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("remove of one GSI composite doesn't affect other GSIs", () =>
-      Effect.gen(function* () {
-        // Entity with two GSIs
-        class MultiGsiUser extends Schema.Class<MultiGsiUser>("MultiGsiUser")({
-          userId: Schema.String,
-          name: Schema.String,
-          tenantId: Schema.String,
-          region: Schema.String,
-          department: Schema.String,
-        }) {}
+    it.effect(
+      "remove of one GSI composite doesn't affect other GSIs (and only the touched half — v1.7.1)",
+      () =>
+        Effect.gen(function* () {
+          // Entity with two GSIs.
+          class MultiGsiUser extends Schema.Class<MultiGsiUser>("MultiGsiUser")({
+            userId: Schema.String,
+            name: Schema.String,
+            tenantId: Schema.String,
+            region: Schema.String,
+            department: Schema.String,
+          }) {}
 
-        const MultiGsiEntity = withConfig(
-          Entity.make({
-            model: MultiGsiUser,
-            entityType: "MultiGsiUser",
-            primaryKey: {
-              pk: { field: "pk", composite: ["userId"] },
-              sk: { field: "sk", composite: [] },
-            },
-            indexes: {
-              byTenant: {
-                name: "gsi1",
-                pk: { field: "gsi1pk", composite: ["tenantId"] },
-                sk: { field: "gsi1sk", composite: ["region"] },
+          const MultiGsiEntity = withConfig(
+            Entity.make({
+              model: MultiGsiUser,
+              entityType: "MultiGsiUser",
+              primaryKey: {
+                pk: { field: "pk", composite: ["userId"] },
+                sk: { field: "sk", composite: [] },
               },
-              byDepartment: {
-                name: "gsi2",
-                pk: { field: "gsi2pk", composite: ["department"] },
-                sk: { field: "gsi2sk", composite: [] },
+              indexes: {
+                byTenant: {
+                  name: "gsi1",
+                  pk: { field: "gsi1pk", composite: ["tenantId"] },
+                  sk: { field: "gsi1sk", composite: ["region"] },
+                },
+                byDepartment: {
+                  name: "gsi2",
+                  pk: { field: "gsi2pk", composite: ["department"] },
+                  sk: { field: "gsi2sk", composite: [] },
+                },
               },
-            },
-          }),
-        )
+            }),
+          )
 
-        mockUpdateItem.mockResolvedValueOnce({
-          Attributes: toAttributeMap({
-            userId: "u-1",
-            name: "Test",
-            tenantId: "t-1",
-            region: "us-east-1",
-            department: "eng",
-            pk: "$myapp#v1#multigsiuser#u-1",
-            sk: "$myapp#v1#multigsiuser",
-            __edd_e__: "MultiGsiUser",
-          }),
-        })
+          mockUpdateItem.mockResolvedValueOnce({
+            Attributes: toAttributeMap({
+              userId: "u-1",
+              name: "Test",
+              tenantId: "t-1",
+              region: "us-east-1",
+              department: "eng",
+              pk: "$myapp#v1#multigsiuser#u-1",
+              sk: "$myapp#v1#multigsiuser",
+              __edd_e__: "MultiGsiUser",
+            }),
+          })
 
-        // Remove tenantId (affects byTenant GSI) but not department (byDepartment should be untouched)
-        yield* MultiGsiEntity.update({ userId: "u-1" }).pipe(
-          Entity.remove(["tenantId"]),
-          Entity.asModel,
-        )
+          // Remove tenantId. byTenant: pk's tenantId in removedSet → pk
+          // touched, can't compose → preserve + cascade override → REMOVE
+          // gsi1pk. sk untouched (region not in payload, not in removedSet)
+          // → noop. byDepartment: department not in removedSet, not in
+          // payload → both halves untouched → noop.
+          yield* MultiGsiEntity.update({ userId: "u-1" }).pipe(
+            Entity.remove(["tenantId"]),
+            Entity.asModel,
+          )
 
-        const call = mockUpdateItem.mock.calls[0]![0]
-        const names = call.ExpressionAttributeNames as Record<string, string>
-        const nameValues = Object.values(names)
-        // byTenant GSI keys removed
-        expect(nameValues).toContain("gsi1pk")
-        expect(nameValues).toContain("gsi1sk")
-        // byDepartment GSI keys NOT removed
-        expect(nameValues).not.toContain("gsi2pk")
-        expect(nameValues).not.toContain("gsi2sk")
-      }).pipe(Effect.provide(TestLayer)),
+          const call = mockUpdateItem.mock.calls[0]![0]
+          const names = call.ExpressionAttributeNames as Record<string, string>
+          const nameValues = Object.values(names)
+          // byTenant pk REMOVE'd via per-half cascade.
+          expect(nameValues).toContain("gsi1pk")
+          // v1.7.1 critical: sk's gsi1sk NOT removed (the half wasn't touched).
+          expect(nameValues).not.toContain("gsi1sk")
+          // byDepartment GSI keys completely untouched.
+          expect(nameValues).not.toContain("gsi2pk")
+          expect(nameValues).not.toContain("gsi2sk")
+        }).pipe(Effect.provide(TestLayer)),
     )
   })
 

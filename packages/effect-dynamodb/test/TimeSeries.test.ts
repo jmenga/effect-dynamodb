@@ -881,65 +881,93 @@ describe("TimeSeries — indexPolicy on append", () => {
     }).pipe(Effect.provide(layer))
   })
 
-  it.effect("appendInput-owned composite with sparse policy drops item from GSI", () => {
-    const entity = Entity.make({
-      model: Telemetry,
-      entityType: "Telemetry",
-      primaryKey: {
-        pk: { field: "pk", composite: ["channel", "deviceId"] },
-        sk: { field: "sk", composite: [] },
-      },
-      indexes: {
-        byAlert: {
-          name: "gsi2",
-          pk: { field: "gsi2pk", composite: ["alert"] },
-          sk: { field: "gsi2sk", composite: ["timestamp"] },
-          // v3 per-half: sparse on pk (alert is the membership key — when
-          // an event omits it, the GSI drops). sk has timestamp in appendInput
-          // so it's always present.
-          indexPolicy: { pk: "sparse", sk: "preserve" },
+  it.effect(
+    "appendInput-owned composite with sparse + touched-but-can't-compose drops only that half (v1.7.1)",
+    () => {
+      // v1.7.1 behavior change: sparse only fires when the writer touches the
+      // half (per-half evaluation gate). A bare omission of `alert` from the
+      // appendInput payload no longer fires sparse on the byAlert.pk half —
+      // the half is untouched. To force a drop, declare `alert` in
+      // appendInput so the writer's "no alert this event" intent is
+      // explicitly signalled (alert: undefined in the payload), or use
+      // Entity.remove(['alert']) on the next update.
+      //
+      // For a writer-owned sparse half that's actually IN appendInput,
+      // touching the half with undefined → can't-compose → REMOVE that half
+      // only. We exercise that here by adding `alert: undefined` to the
+      // append payload.
+      const entity = Entity.make({
+        model: Telemetry,
+        entityType: "Telemetry",
+        primaryKey: {
+          pk: { field: "pk", composite: ["channel", "deviceId"] },
+          sk: { field: "sk", composite: [] },
         },
-      },
-      timestamps: true,
-      timeSeries: {
-        orderBy: "timestamp",
-        appendInput: TelemetryAppendInput,
-      },
-    })
-    const { tableLayer } = makeEntityWithTag(entity)
-    const layer = Layer.merge(TestDynamoClient, tableLayer)
-
-    return Effect.gen(function* () {
-      mockTransactWriteItems.mockResolvedValueOnce({})
-      mockGetItem.mockResolvedValueOnce({
-        Item: {
-          pk: { S: "$tsapp#v1#telemetry#c-1#d-7" },
-          sk: { S: "$tsapp#v1#telemetry_1" },
-          channel: { S: "c-1" },
-          deviceId: { S: "d-7" },
-          timestamp: { S: "2026-04-22T10:00:00.000Z" },
-          __edd_e__: { S: "Telemetry" },
+        indexes: {
+          byAlert: {
+            name: "gsi2",
+            pk: { field: "gsi2pk", composite: ["alert"] },
+            sk: { field: "gsi2sk", composite: ["timestamp"] },
+            // v1.7.1: per-half SK preserve, PK sparse. PK touched (alert in
+            // appendInput, supplied as undefined) and can't compose → REMOVE
+            // gsi2pk only. SK touched (timestamp present) → SET sk.
+            indexPolicy: { pk: "sparse", sk: "preserve" },
+          },
+        },
+        timestamps: true,
+        timeSeries: {
+          orderBy: "timestamp",
+          appendInput: TelemetryAppendInput,
         },
       })
+      const { tableLayer } = makeEntityWithTag(entity)
+      const layer = Layer.merge(TestDynamoClient, tableLayer)
 
-      // Ingest event without `alert` — sparse policy forces drop-out.
-      yield* entity.append({
-        channel: "c-1",
-        deviceId: "d-7",
-        timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
-      })
+      return Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        mockGetItem.mockResolvedValueOnce({
+          Item: {
+            pk: { S: "$tsapp#v1#telemetry#c-1#d-7" },
+            sk: { S: "$tsapp#v1#telemetry_1" },
+            channel: { S: "c-1" },
+            deviceId: { S: "d-7" },
+            timestamp: { S: "2026-04-22T10:00:00.000Z" },
+            __edd_e__: { S: "Telemetry" },
+          },
+        })
 
-      const call = mockTransactWriteItems.mock.calls[0]![0]
-      const update = call.TransactItems[0].Update
-      const expr = update.UpdateExpression as string
-      const nameVals: Array<string> = Object.values(update.ExpressionAttributeNames)
+        // Ingest event with `alert: undefined` — the writer explicitly
+        // signals "no alert this event," sk's pk half is touched (in
+        // operator true on undefined), can't compose → sparse → REMOVE pk.
+        // sk is touched (timestamp present) → SET sk.
+        yield* entity.append({
+          channel: "c-1",
+          deviceId: "d-7",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+          alert: undefined,
+        })
 
-      // gsi2 keys must be REMOVEd.
-      expect(expr).toContain("REMOVE")
-      expect(nameVals).toContain("gsi2pk")
-      expect(nameVals).toContain("gsi2sk")
-      // And NOT SET.
-      expect(expr).not.toMatch(/SET[^R]*gsi2pk/)
-    }).pipe(Effect.provide(layer))
-  })
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        const update = call.TransactItems[0].Update
+        const expr = update.UpdateExpression as string
+        const eanEntries = Object.entries(update.ExpressionAttributeNames) as Array<
+          [string, string]
+        >
+        const aliasOf = (physical: string) => eanEntries.find(([_, v]) => v === physical)?.[0]
+        const gsi2pkAlias = aliasOf("gsi2pk")
+        const gsi2skAlias = aliasOf("gsi2sk")
+        expect(gsi2pkAlias).toBeDefined()
+        expect(gsi2skAlias).toBeDefined()
+        // gsi2pk REMOVE'd via sparse + can't-compose. gsi2sk SET (timestamp).
+        const removeIdx = expr.indexOf("REMOVE")
+        const setExpr = removeIdx === -1 ? expr : expr.slice(0, removeIdx)
+        const remExpr = removeIdx === -1 ? "" : expr.slice(removeIdx)
+        expect(remExpr.includes(gsi2pkAlias!)).toBe(true)
+        expect(setExpr.includes(gsi2pkAlias!)).toBe(false)
+        // v1.7.1 critical: per-half drop. gsi2sk SET (NOT removed).
+        expect(setExpr.includes(gsi2skAlias!)).toBe(true)
+        expect(remExpr.includes(gsi2skAlias!)).toBe(false)
+      }).pipe(Effect.provide(layer))
+    },
+  )
 })

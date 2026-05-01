@@ -15,7 +15,7 @@ import {
   composeIsolatedSortKey,
   composeKey,
 } from "./DynamoSchema.js"
-import { type CompositeKeyHoleError, makeCompositeKeyHoleError } from "./Errors.js"
+import type { CompositeKeyHoleError } from "./Errors.js"
 
 /** Index key part definition (pk or sk of an index) */
 export interface KeyPart {
@@ -25,20 +25,30 @@ export interface KeyPart {
 
 /**
  * Per-half policy value controlling how `Entity.update` and time-series
- * `.append` handle a GSI half whose composites are absent from the merged
- * update payload.
+ * `.append` handle a GSI half the writer touches but can't compose.
  *
- * - `"sparse"` — when the half's composites are entirely absent (whole-half
- *   empty), REMOVE both `gsiNpk` and `gsiNsk` (item drops out of the GSI).
- *   On a hole pattern (`[A, _, C]`), truncate the half to the leading prefix
- *   `[A]` and ignore trailing values.
- * - `"preserve"` — whole-half-empty is a no-op; the stored values for that
- *   half stay intact. On a hole pattern, throw `CompositeKeyHoleError`
- *   (EDD-9024) at write time.
+ * Per-half evaluation gate (v1.7.1): a half is *touched* iff at least one of
+ * its composite names appears in the update payload (regardless of value,
+ * including `undefined`) OR appears in `Entity.remove([...])`. Untouched
+ * halves are skipped entirely — no SET, no REMOVE, no policy fires.
+ *
+ * For *touched* halves the policy decides the outcome when the structural
+ * rule can't compose (empty leading prefix OR hole pattern):
+ * - `"sparse"` — REMOVE this half's key attribute (the half drops out of the
+ *   GSI). The other half follows its own per-half outcome independently —
+ *   there is no GSI-wide cascade. The DDB projection rule means an item with
+ *   only one key attribute is invisible in the GSI; the surviving half's
+ *   value is preserved for rejoin without other writers re-firing.
+ * - `"preserve"` — noop (leave the stored key for this half untouched). The
+ *   stored value may go stale until either (a) the next write that touches
+ *   this half supplies enough composites to recompose, or (b) a composite of
+ *   this half is named in `Entity.remove([...])` — the cascade override
+ *   then REMOVEs this half's key.
  *
  * Halves not declared in `indexPolicy` default to `"preserve"`. See
  * `DESIGN.md §7 Policy-Aware GSI Composition` for the full decision rules
- * (structural composition, two drop triggers, decision table).
+ * (per-half evaluation gate, per-half outcome, cascade override, decision
+ * table).
  */
 export type IndexPolicyKey = "sparse" | "preserve"
 
@@ -395,44 +405,62 @@ export const composeSkPrefixUpTo = (
 }
 
 /**
- * Per-half outcome of the structural composition rule.
+ * Per-half outcome of the v1.7.1 structural composition rule.
  *
  * - `kind: "set"` — the half composed to a (possibly truncated) value.
  *   `length` is the number of leading composites included.
- * - `kind: "noop"` — preserve policy + whole-half-empty: leave the stored
- *   key field untouched.
- * - `kind: "drop"` — sparse policy + whole-half-empty: REMOVE the half (and,
- *   per the GSI roll-up rule, also REMOVE the other half).
- * - `kind: "hole-throw"` — preserve policy + hole pattern: throw EDD-9024.
- *   The position is the absent composite; trailingPosition is the first
- *   present trailing composite.
+ * - `kind: "noop"` — preserve policy + can't-compose AND no composite of this
+ *   half is in `removedSet`: leave the stored key field untouched (stored
+ *   value may go stale).
+ * - `kind: "drop"` — REMOVE this half's key. Fires when the half is touched
+ *   AND the structural rule can't compose AND either (a) policy is
+ *   `'sparse'` OR (b) a composite of this half is in `removedSet` (cascade
+ *   override under preserve).
+ *
+ * No `hole-throw` outcome — EDD-9024 was deprecated in v1.7.1 (hole patterns
+ * collapse into can't-compose under the unified rule).
  */
 type HalfOutcome =
   | { readonly kind: "set"; readonly length: number }
   | { readonly kind: "noop" }
   | { readonly kind: "drop" }
-  | {
-      readonly kind: "hole-throw"
-      readonly absentPosition: number
-      readonly trailingPosition: number
-    }
 
 /**
- * Apply v3's structural composition rule to a single half.
+ * Apply v1.7.1's structural composition rule to a single *touched* half.
+ *
+ * The caller is responsible for the per-half evaluation gate — `classifyHalf`
+ * is only called once the half is known to be touched (some composite of the
+ * half appears in payload OR in `removedSet`).
  *
  * Walks the composite list left-to-right, finds the longest leading prefix of
- * present values, and classifies the result based on whether the prefix is
- * partial, whether trailing values are present (hole), and whether the half
- * is empty. Policy is consulted only for hole + whole-half-empty cases.
+ * present values in `record`, and classifies the result:
+ *
+ * - **Compose succeeded** (non-empty leading prefix AND no hole — i.e. all
+ *   absent composites are at trailing positions only): SET.
+ * - **Compose failed** (empty leading prefix OR hole pattern): outcome
+ *   depends on `policy` and whether any composite of this half is in
+ *   `removedSet`:
+ *   - `'sparse'` → drop.
+ *   - `'preserve'` AND any composite in `removedSet` → drop (cascade
+ *     override under preserve — the consumer's explicit signal trumps
+ *     stale-data preservation).
+ *   - `'preserve'` AND no composite in `removedSet` → noop (preserve
+ *     preservation; stored key may be stale).
+ *
+ * Hole patterns collapse into can't-compose — silent partial composition
+ * (truncate-and-discard-trailing) is a worse failure mode than dropping the
+ * half because it would lie about the data shape to readers. The previous
+ * v1.7.0 sparse-truncate-on-hole behavior is gone.
  */
 const classifyHalf = (
   composites: ReadonlyArray<string>,
   record: Record<string, unknown>,
   policy: IndexPolicyKey,
+  halfHasRemoved: boolean,
 ): HalfOutcome => {
   // No composites at all (e.g. sk.composite = []) — emit a SET of length 0
-  // (the bare entity prefix). Policy is irrelevant in this case; this is the
-  // standard "primary key with empty SK composite" shape.
+  // (the bare entity prefix). Policy is irrelevant; this is the standard
+  // "primary key with empty SK composite" shape.
   if (composites.length === 0) {
     return { kind: "set", length: 0 }
   }
@@ -450,39 +478,25 @@ const classifyHalf = (
   }
 
   // Some absent. Check for hole (a present composite after the absent run).
-  let firstTrailingPresent = -1
+  let hasHole = false
   for (let j = leadingLen + 1; j < composites.length; j++) {
     const v = record[composites[j]!]
     if (v !== undefined && v !== null) {
-      firstTrailingPresent = j
+      hasHole = true
       break
     }
   }
 
-  if (firstTrailingPresent !== -1) {
-    // Hole pattern. Policy decides.
-    if (policy === "preserve") {
-      return {
-        kind: "hole-throw",
-        absentPosition: leadingLen,
-        trailingPosition: firstTrailingPresent,
-      }
-    }
-    // sparse → truncate to leading prefix. If the leading prefix is empty
-    // (the absent run starts at position 0), this collapses to whole-half-
-    // empty, which sparse drops.
-    return leadingLen === 0 ? { kind: "drop" } : { kind: "set", length: leadingLen }
+  // Compose-can-succeed iff non-empty leading prefix AND no hole.
+  // (Trailing-absent without a hole is a clean truncation.)
+  if (!hasHole && leadingLen > 0) {
+    return { kind: "set", length: leadingLen }
   }
 
-  // No hole — pure trailing-absent. If the leading prefix is empty, the whole
-  // half is empty; policy decides.
-  if (leadingLen === 0) {
-    return policy === "sparse" ? { kind: "drop" } : { kind: "noop" }
-  }
-
-  // Non-empty leading prefix with trailing absent → truncate. Same outcome
-  // under both policies.
-  return { kind: "set", length: leadingLen }
+  // Compose failed (empty leading prefix OR hole pattern). Per-half outcome:
+  if (policy === "sparse") return { kind: "drop" }
+  // preserve — cascade override under removedSet, otherwise noop.
+  return halfHasRemoved ? { kind: "drop" } : { kind: "noop" }
 }
 
 /**
@@ -498,34 +512,51 @@ const resolveIndexPolicy = (
 
 /**
  * Policy-aware GSI key composition for `Entity.update` and time-series
- * `.append` — v3 per-half structural composition.
+ * `.append` — v1.7.1 per-half structural composition with per-half evaluation
+ * gate and per-half cascade.
  *
- * Implements two-way payload classification:
+ * **Per-half evaluation gate (v1.7.1).** Each half (PK and SK) is independently
+ * checked for whether the writer touched it. A half is "touched" iff at least
+ * one of its composite names appears in `updatePayload` (regardless of value,
+ * including `undefined`) OR appears in `removedSet`. **Untouched halves are
+ * skipped entirely — no SET, no REMOVE, no policy fires.** This closes the
+ * v1.7.0 multi-writer leak where a "stamp" writer that doesn't touch a GSI's
+ * composites would still trigger the policy and blow away another writer's
+ * key.
+ *
+ * **Two-way payload classification.**
  * - **present** (`attr: <value>` in payload, or inherited from `keyRecord`)
  *   — value is used in composition.
  * - **absent** (key omitted, or `attr: null`, or `attr: undefined`) — the
  *   structural rule treats all three identically.
  *
- * For each touched GSI half (PK and SK independently), walk the composite
- * list left-to-right and build the longest valid leading prefix. Policy is
- * consulted only for the hole pattern (truncate under sparse, throw EDD-9024
- * under preserve) and the whole-half-empty case (drop both keys under
- * sparse, no-op under preserve).
+ * **Per-half outcome (v1.7.1 unified rule).** For each touched half:
+ * 1. Run the structural rule (longest leading prefix of present values in
+ *    the merged record).
+ * 2. If the prefix is non-empty AND there's no hole → SET (full or truncated).
+ * 3. Otherwise (empty leading prefix OR hole pattern):
+ *    - `'sparse'` → REMOVE this half's key.
+ *    - `'preserve'` AND any composite of this half is in `removedSet` →
+ *      REMOVE (cascade override under preserve).
+ *    - `'preserve'` AND no composite in `removedSet` → noop (stored key
+ *      retained, may be stale until next write touches the half).
  *
- * Cascade (`Entity.remove([attr])`) overrides everything: any composite in
- * `removedSet` forces a full GSI drop (REMOVE both `gsiNpk` and `gsiNsk`).
+ * **Per-half roll-up (v1.7.1).** Each half's outcome applies to its own key
+ * attribute only. PK dropping doesn't drop SK; SK dropping doesn't drop PK.
+ * The item may be invisible in the GSI during a single-half-dropped period
+ * (DDB projection rule needs both keys for query visibility), but the
+ * surviving half's value persists for rejoin without other writers re-firing.
+ * The v1.7.0 GSI-wide cascade is gone.
  *
- * A GSI is considered "touched" when any of its composites appears in
- * `updatePayload`, or `removedSet`. GSIs without an `indexPolicy` are skipped
- * when none of their composites are touched. GSIs with a policy are always
- * evaluated — the policy is a declarative statement about the GSI's
- * membership invariant.
+ * **`Entity.remove([attr])` cascade (v1.7.1: per-half).** Composites in
+ * `removedSet` contribute to the merged record as "absent" (same as
+ * undefined-in-payload) AND make their containing half "touched" for the
+ * evaluation gate AND trigger the cascade override under preserve. The
+ * cascade no longer drops both halves of every GSI containing the cleared
+ * attribute — only the half(s) whose composite list contains it.
  *
  * See `DESIGN.md §7 Policy-Aware GSI Composition` for the full decision
- * algorithm, decision table, and the two-drop-trigger framing.
- *
- * @throws {CompositeKeyHoleError} EDD-9024 on hole-pattern detection under
- *   `'preserve'` policy.
+ * table and worked multi-writer examples.
  */
 export const composeGsiKeysForUpdatePolicyAware = (
   schema: DynamoSchema.DynamoSchema,
@@ -547,25 +578,26 @@ export const composeGsiKeysForUpdatePolicyAware = (
 
     const pkComposites = index.pk.composite
     const skComposites = index.sk.composite
-    const allComposites = [...pkComposites, ...skComposites]
 
-    const cascadeRemove =
-      removedSet !== undefined && allComposites.some((attr) => removedSet.has(attr))
-    const touchedByPayload = allComposites.some((attr) => attr in updatePayload)
-    const hasPolicy = index.indexPolicy !== undefined
+    // Per-half evaluation gate (v1.7.1). A half is touched iff at least one
+    // of its composite names appears in `updatePayload` (regardless of value)
+    // OR in `removedSet`. Untouched halves are skipped — leave the stored
+    // key attribute alone.
+    const pkHasRemoved =
+      removedSet !== undefined && pkComposites.some((attr) => removedSet.has(attr))
+    const skHasRemoved =
+      removedSet !== undefined && skComposites.some((attr) => removedSet.has(attr))
+    const pkTouched = pkHasRemoved || pkComposites.some((attr) => attr in updatePayload)
+    const skTouched = skHasRemoved || skComposites.some((attr) => attr in updatePayload)
 
-    if (!cascadeRemove && !touchedByPayload && !hasPolicy) continue
-
-    // Cascade takes precedence over policy.
-    if (cascadeRemove) {
-      removes.push(index.pk.field, index.sk.field)
-      continue
-    }
+    if (!pkTouched && !skTouched) continue
 
     // Build merged record for value extraction. Two-way classification: any
-    // payload value that is `null` or `undefined` is treated as absent (the
-    // attribute is excluded from `merged`). `keyRecord` provides values for
-    // composites the consumer didn't touch.
+    // payload value that is `null` or `undefined` is treated as absent. Any
+    // composite in `removedSet` is also treated as absent (the cascade
+    // signal). `keyRecord` provides values for composites the consumer did
+    // not touch (typically the entity's primary-key composites pulled
+    // through to GSI composites that share the names).
     const merged: Record<string, unknown> = { ...keyRecord }
     for (const [k, v] of Object.entries(updatePayload)) {
       if (v === null || v === undefined) {
@@ -574,55 +606,45 @@ export const composeGsiKeysForUpdatePolicyAware = (
       }
       merged[k] = v
     }
+    if (removedSet !== undefined) {
+      for (const attr of removedSet) {
+        delete merged[attr]
+      }
+    }
 
     const policy = resolveIndexPolicy(index.indexPolicy)
-    const pkOutcome = classifyHalf(pkComposites, merged, policy.pk)
-    const skOutcome = classifyHalf(skComposites, merged, policy.sk)
 
-    // Hole-throw on either half raises EDD-9024 with the offending location.
-    if (pkOutcome.kind === "hole-throw") {
-      throw makeCompositeKeyHoleError({
-        entityType,
-        indexName: index.index ?? indexName,
-        clearedComposite: pkComposites[pkOutcome.absentPosition]!,
-        trailingComposite: pkComposites[pkOutcome.trailingPosition]!,
-        clearedPosition: pkOutcome.absentPosition,
-        trailingPosition: pkOutcome.trailingPosition,
-        key: "pk",
-      })
-    }
-    if (skOutcome.kind === "hole-throw") {
-      throw makeCompositeKeyHoleError({
-        entityType,
-        indexName: index.index ?? indexName,
-        clearedComposite: skComposites[skOutcome.absentPosition]!,
-        trailingComposite: skComposites[skOutcome.trailingPosition]!,
-        clearedPosition: skOutcome.absentPosition,
-        trailingPosition: skOutcome.trailingPosition,
-        key: "sk",
-      })
+    if (pkTouched) {
+      const pkOutcome = classifyHalf(pkComposites, merged, policy.pk, pkHasRemoved)
+      if (pkOutcome.kind === "drop") {
+        removes.push(index.pk.field)
+      } else if (pkOutcome.kind === "set") {
+        sets[index.pk.field] =
+          pkOutcome.length === pkComposites.length
+            ? composePk(schema, entityType, index, merged)
+            : composePkPrefixUpTo(schema, entityType, index, merged, pkOutcome.length)
+      }
+      // noop — emit nothing for this half.
     }
 
-    // Whole-GSI drop: any half declared sparse + whole-half-empty drops both
-    // halves together. This is the implicit drop trigger.
-    if (pkOutcome.kind === "drop" || skOutcome.kind === "drop") {
-      removes.push(index.pk.field, index.sk.field)
-      continue
-    }
-
-    // Per-half SET / no-op. Halves are emitted independently — preserve +
-    // empty leaves the stored value alone.
-    if (pkOutcome.kind === "set") {
-      sets[index.pk.field] =
-        pkOutcome.length === pkComposites.length
-          ? composePk(schema, entityType, index, merged)
-          : composePkPrefixUpTo(schema, entityType, index, merged, pkOutcome.length)
-    }
-    if (skOutcome.kind === "set") {
-      sets[index.sk.field] =
-        skOutcome.length === skComposites.length
-          ? composeSk(schema, entityType, entityVersion, index, merged)
-          : composeSkPrefixUpTo(schema, entityType, entityVersion, index, merged, skOutcome.length)
+    if (skTouched) {
+      const skOutcome = classifyHalf(skComposites, merged, policy.sk, skHasRemoved)
+      if (skOutcome.kind === "drop") {
+        removes.push(index.sk.field)
+      } else if (skOutcome.kind === "set") {
+        sets[index.sk.field] =
+          skOutcome.length === skComposites.length
+            ? composeSk(schema, entityType, entityVersion, index, merged)
+            : composeSkPrefixUpTo(
+                schema,
+                entityType,
+                entityVersion,
+                index,
+                merged,
+                skOutcome.length,
+              )
+      }
+      // noop — emit nothing for this half.
     }
   }
 
