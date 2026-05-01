@@ -2260,23 +2260,24 @@ const Devices = Entity.make({
     sk: { field: "sk", composite: [] },
   },
   indexes: {
-    // Sparse: ingest events may or may not include alertState. When absent,
-    // the item drops out of the index. When present, recompose.
+    // Sparse pk: alertState is the only pk composite. When absent (caller
+    // omits or sets to null/undefined), pk is whole-half-empty and sparse
+    // drops the item from the GSI. sk = [deviceId] always present (deviceId
+    // is in the primary key) so sk's policy is moot.
     byAlert: {
       name: "gsi1",
       pk: { field: "gsi1pk", composite: ["alertState"] },
       sk: { field: "gsi1sk", composite: ["deviceId"] },
-      indexPolicy: () => ({ alertState: "sparse" as const }),
+      indexPolicy: { pk: "sparse" },
     },
-    // Preserve: tenantId is owned by an enrichment writer. Ingest-side
-    // updates that touch other composites (e.g. deviceId via key merge)
-    // must not disturb the pk half.
+    // Preserve everywhere: tenantId is owned by an enrichment writer.
+    // Ingest-side updates that don't touch tenantId leave the pk half
+    // alone (whole-half-empty + preserve = no-op).
     byTenant: {
       name: "gsi2",
       pk: { field: "gsi2pk", composite: ["tenantId"] },
       sk: { field: "gsi2sk", composite: ["deviceId"] },
-      indexPolicy: () =>
-        ({ tenantId: "preserve" as const, deviceId: "preserve" as const }) as const,
+      indexPolicy: { pk: "preserve", sk: "preserve" },
     },
   },
   timestamps: true,
