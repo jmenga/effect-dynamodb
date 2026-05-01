@@ -1203,7 +1203,7 @@ import {
 | `OptimisticLockError` | `"OptimisticLockError"` | Version mismatch on `expectedVersion()` |
 | `ItemDeleted` | `"ItemDeleted"` | Item is soft-deleted (get returns this instead of the item) |
 | `ItemNotDeleted` | `"ItemNotDeleted"` | Restore called on an item that isn't soft-deleted |
-| `CompositeKeyHoleError` | `"CompositeKeyHoleError"` | EDD-9024 — hole pattern under `'preserve'` policy on a half (an absent composite at position `i` with a present composite at `j > i`). Carries `entityType`, `indexName`, `clearedComposite`, `trailingComposite`, positions, `half` (`"pk"` or `"sk"`). |
+| `CompositeKeyHoleError` | `"CompositeKeyHoleError"` | EDD-9024 — **deprecated in v1.7.1**, no longer thrown at runtime. Class export retained for back-compat with consumers who type-imported it for `Effect.catchTag` handlers. Hole patterns now collapse into the unified per-half can't-compose rule (drop under sparse, noop-or-cascade-override under preserve). |
 | `CompositeNullableError` | `"CompositeNullableError"` | EDD-9025 — composite attribute Schema includes `null`. Raised at `Entity.make()` time. Carries `entityType`, `surface` (e.g. `"primaryKey"`, `"index:..."`, `"unique:..."`), `compositeAttribute`, `schemaPath`. |
 | `RefNotFound` | `"RefNotFound"` | Referenced entity not found during ref hydration (`entity`, `field`, `refEntity`, `refId`) |
 | `AggregateAssemblyError` | `"AggregateAssemblyError"` | Aggregate read path failed — missing items, structural violations, or decode errors (`aggregate`, `reason`, `key`) |
