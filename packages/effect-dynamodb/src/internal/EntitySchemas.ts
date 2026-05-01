@@ -819,11 +819,15 @@ export const buildDerivedSchemas = (
   const createSchema = Schema.Struct(createFieldsAcc as Schema.Struct.Fields)
 
   // --- Update Schema: optional model fields minus key composites & immutable ---
-  // Each field wraps `Schema.NullishOr` so consumers can pass `null` or
-  // `undefined` as an explicit clear signal — under indexPolicy v2, both
-  // collapse to "clear this composite from the key now" (DESIGN.md §7).
-  // The outer `Schema.optional` lets the key be omitted entirely (defers
-  // to policy on omission).
+  // Each field is wrapped in `Schema.optional` so the key may be omitted
+  // entirely (the structural composer treats absent keys as absent for GSI
+  // composition under v3's two-way classification). The field's value type
+  // matches the model declaration exactly — there is no `null` widening,
+  // because EDD-9025 prevents composites from declaring `null` and the
+  // standard update payload follows the same shape. If the model declares a
+  // non-composite attribute as `Schema.NullOr(X)`, `set({ attr: null })`
+  // still typechecks; the v1.6 `NullishOr` wrap that allowed null on
+  // arbitrary fields (regardless of model declaration) is removed.
   const buildUpdateFieldsAcc = (): globalThis.Record<string, Schema.Top> => {
     const acc: globalThis.Record<string, Schema.Top> = {}
     for (const [key, field] of Object.entries(fields)) {
@@ -831,12 +835,12 @@ export const buildDerivedSchemas = (
       if (immutableFields.has(key)) continue
       if (refFieldSet.has(key)) continue
       if (strippedFromUpdate.has(key)) continue
-      acc[key] = Schema.optional(Schema.NullishOr(field as Schema.Top))
+      acc[key] = Schema.optional(field as Schema.Top)
     }
     for (const ref of resolvedRefs) {
       if (pkComposites.has(ref.fieldName)) continue
       if (immutableFields.has(ref.fieldName)) continue
-      acc[ref.idFieldName] = Schema.optional(Schema.NullishOr(ref.identifierSchema as Schema.Top))
+      acc[ref.idFieldName] = Schema.optional(ref.identifierSchema as Schema.Top)
     }
     return acc
   }

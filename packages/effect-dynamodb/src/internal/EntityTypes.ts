@@ -190,11 +190,13 @@ export type EntityCreateType<
 /**
  * Entity update type: partial model fields minus primary key composites.
  *
- * Each field's value type is widened to `T | null | undefined` to support
- * indexPolicy v2's three-way payload classification: passing `null` or
- * `undefined` is an explicit clear signal that cascades to the GSI keys
- * (REMOVE the attribute, drop or truncate the GSI per policy). See
- * `DESIGN.md §7 Policy-Aware GSI Composition`.
+ * Each field's value type matches the model declaration exactly — under v3
+ * there is no `null` widening. The v1.6 widening to `T | null | undefined`
+ * existed to support the v1.6 three-way payload classification, which is
+ * collapsed in v3 to two-way (null = undefined = absent). Combined with the
+ * EDD-9025 make-time check (composite attribute schemas must not include
+ * `null`), `set({ composite: null })` no longer compiles and the stale-GSI
+ * footgun is closed at the type level. See `DESIGN.md §7`.
  */
 export type EntityUpdateType<
   TModel extends Schema.Top,
@@ -203,10 +205,10 @@ export type EntityUpdateType<
   TVersioned = undefined,
 > = WithSystemCollisionsForUpdate<
   {
-    [K in keyof Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes>>]?:
-      | Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes>>[K]
-      | null
-      | undefined
+    [K in keyof Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes>>]?: Omit<
+      ModelType<TModel>,
+      PrimaryKeyComposites<TIndexes>
+    >[K]
   },
   TTimestamps,
   TVersioned
