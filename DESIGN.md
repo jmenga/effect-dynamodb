@@ -658,10 +658,10 @@ Truncation on PK is the same hierarchical demotion as truncation on SK — an it
 
 **Hole detection (policy-aware).** A "hole" is a composite at position `i` that is absent while a composite at position `j > i` is present (e.g. `[A, _, C]`). Composed keys can't carry holes meaningfully — `acc#A#child#Y` with `parent` cleared would compose to a syntactically invalid prefix that no `begins_with` query would match. Behavior depends on the half's policy:
 
-| Policy | Hole pattern (`[A, _, C]`) |
-|---|---|
-| `'sparse'` | Truncate to leading prefix `[A]`; trailing values ignored. Consistent with sparse's "compose what you can" intent. |
-| `'preserve'` | Throw `CompositeKeyHoleError` (EDD-9024) at write time. Consistent with preserve's "don't move things on me — surface ambiguity loudly" intent. |
+| Policy | Hole pattern (`[A, _, C]`) | Hole pattern starting at position 0 (`[_, C]`) |
+|---|---|---|
+| `'sparse'` | Truncate to leading prefix `[A]`; trailing values ignored. Consistent with sparse's "compose what you can" intent. | Leading prefix is empty → collapses to whole-half-empty → drop both halves (consistent with sparse-on-empty). |
+| `'preserve'` | Throw `CompositeKeyHoleError` (EDD-9024) at write time. Consistent with preserve's "don't move things on me — surface ambiguity loudly" intent. | Same — throw EDD-9024. |
 
 The error names the GSI, the absent composite at position `i`, and the still-present trailing composite at `j`, so callers can locate the offending payload.
 

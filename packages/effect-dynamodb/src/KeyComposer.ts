@@ -468,8 +468,12 @@ const classifyHalf = (
         trailingPosition: firstTrailingPresent,
       }
     }
-    // sparse → truncate to leading prefix.
-    return { kind: "set", length: leadingLen }
+    // sparse → truncate to leading prefix. If the leading prefix is empty
+    // (the absent run starts at position 0), this collapses to whole-half-
+    // empty, which sparse drops.
+    return leadingLen === 0
+      ? { kind: "drop" }
+      : { kind: "set", length: leadingLen }
   }
 
   // No hole — pure trailing-absent. If the leading prefix is empty, the whole

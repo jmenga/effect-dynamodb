@@ -3795,7 +3795,8 @@ describe("Entity", () => {
                 name: "gsi1",
                 pk: { field: "gsi1pk", composite: ["tenantId"] },
                 sk: { field: "gsi1sk", composite: ["region"] },
-                indexPolicy: () => ({ region: "sparse" as const }),
+                // v3 per-half: SK is sparse; whole-SK-empty triggers drop.
+                indexPolicy: { pk: "preserve", sk: "sparse" },
               },
             },
           }),
@@ -3847,7 +3848,7 @@ describe("Entity", () => {
                 name: "gsi1",
                 pk: { field: "gsi1pk", composite: ["tenantId"] },
                 sk: { field: "gsi1sk", composite: ["region"] },
-                indexPolicy: () => ({ tenantId: "preserve" as const, region: "preserve" as const }),
+                indexPolicy: { pk: "preserve", sk: "preserve" },
               },
             },
           }),

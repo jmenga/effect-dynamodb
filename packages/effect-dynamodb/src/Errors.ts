@@ -253,7 +253,9 @@ export class VersionConflict extends Data.TaggedError("VersionConflict")<{
  * `begins_with` query would match. Under `'preserve'`, the library refuses to
  * silently drop the trailing composite and raises this error instead. Under
  * `'sparse'`, the trailing composite is silently truncated to the leading
- * prefix and no error is raised.
+ * prefix and no error is raised (and when the leading prefix is empty,
+ * the half collapses to whole-half-empty which sparse drops together with
+ * the other half).
  *
  * Raised at write time (Entity.update / time-series .append). The error
  * names the GSI, the absent composite at position `i`, and the still-present

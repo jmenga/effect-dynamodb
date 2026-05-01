@@ -818,13 +818,15 @@ describe("TimeSeries — indexPolicy on append", () => {
       indexes: {
         byAccountAlert: {
           name: "gsi6",
-          pk: { field: "gsi6pk", composite: ["accountId", "alert"] },
-          sk: { field: "gsi6sk", composite: ["timestamp"] },
-          // v3 per-half policy: both halves preserve. `accountId` is owned by
-          // an enrichment writer (not in appendInput); on an ingest append the
-          // pk half's leading prefix is empty (accountId absent) → preserve
-          // no-ops, leaving the stored gsi6pk untouched. The sk half's
-          // `timestamp` is in appendInput → SET.
+          // v3 design rule: each GSI half should be entirely owned by a single
+          // writer's domain. PK is enrichment-owned (accountId, set out-of-band);
+          // SK is ingest-owned (alert + timestamp, set on every event).
+          pk: { field: "gsi6pk", composite: ["accountId"] },
+          sk: { field: "gsi6sk", composite: ["alert", "timestamp"] },
+          // PK preserve: when an ingest append fires without accountId in
+          // appendInput, the half's leading prefix is empty → no-op → stored
+          // gsi6pk left untouched. SK preserve: alert + timestamp are both in
+          // appendInput → SET on every append.
           indexPolicy: { pk: "preserve", sk: "preserve" },
         },
       },
