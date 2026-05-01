@@ -8,7 +8,7 @@
  */
 
 import type { AttributeValue, DeleteItemCommandInput } from "@aws-sdk/client-dynamodb"
-import { DateTime, Duration, Effect, Option, Schema, Stream } from "effect"
+import { DateTime, Duration, Effect, Option, Schema, SchemaAST, Stream } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import {
   type ConfiguredModel,
@@ -32,6 +32,7 @@ import {
   ItemNotFound,
   isAwsConditionalCheckFailed,
   isAwsTransactionCancelled,
+  makeCompositeNullableError,
   OptimisticLockError,
   RefNotFound,
   StaleAppend,
@@ -1405,6 +1406,115 @@ const makeImpl = <
   }
 
   // ---------------------------------------------------------------------------
+  // EDD-9025: composite attribute schemas must not include `null`.
+  //
+  // Composites participate in string composition (`acc#X#alert#Y`); `null` is
+  // not a meaningful slot value. Allowing `Schema.NullOr` / `NullishOr` /
+  // `Schema.Union([..., Schema.Null])` on a composite would let
+  // `set({ composite: null })` typecheck (after the v1.6 update-payload
+  // widening was reverted), then either blow up at runtime or silently
+  // produce a key with the literal string `"null"` as a slot.
+  //
+  // Sparse pattern is still expressible via `Schema.optional(...)` (T |
+  // undefined), which produces no Null AST node. See DESIGN.md §7.
+  // ---------------------------------------------------------------------------
+
+  // Resolve the AST for a domain composite name. For ref-derived `${name}Id`
+  // composites, the schema is the referenced entity's identifier schema (not
+  // the model field). For all other composites, it's the model field's
+  // schema. Returns undefined when the composite isn't declared on the model
+  // (already caught by EDD-9002 above, so this is defensive).
+  const resolveCompositeSchemaForNullCheck = (
+    compositeAttr: string,
+  ): { readonly schema: Schema.Top; readonly source: string } | undefined => {
+    if (compositeAttr in modelFields) {
+      return { schema: modelFields[compositeAttr] as Schema.Top, source: `model field` }
+    }
+    // Ref-derived ${name}Id composite — look up the identifier schema on the
+    // referenced entity's model. We can't use the resolvedRefs array here
+    // (it's built later); recompute inline against config.refs.
+    if (config.refs) {
+      for (const [refFieldName, refValue] of Object.entries(config.refs)) {
+        if (`${refFieldName}Id` !== compositeAttr) continue
+        const refEntity = (refValue as { entity: Entity }).entity
+        const idField = getIdentifierField(refEntity.model as Schema.Top)
+        if (!idField) return undefined
+        return { schema: idField.schema, source: `ref "${refFieldName}" identifier` }
+      }
+    }
+    return undefined
+  }
+
+  // Recursively walk an AST and return a path-string if `null` is reachable
+  // in the type union (anywhere — direct, nested in Union, behind Suspend).
+  // `Schema.optional(X)` produces `T | undefined` (no Null) and is allowed.
+  // `Schema.NullOr(X)` produces `T | null` and is rejected.
+  const findNullInAst = (
+    ast: SchemaAST.AST,
+    path: string,
+    seen: Set<SchemaAST.AST> = new Set(),
+  ): string | undefined => {
+    if (seen.has(ast)) return undefined
+    seen.add(ast)
+    if (SchemaAST.isNull(ast)) return `${path}.Null`
+    if (SchemaAST.isUnion(ast)) {
+      for (let i = 0; i < ast.types.length; i++) {
+        const found = findNullInAst(ast.types[i]!, `${path}.Union[${i}]`, seen)
+        if (found) return found
+      }
+    }
+    // Other AST shapes (Declaration, String, Number, Suspend, ...) cannot
+    // introduce `null` themselves. Suspend wrappers are handled
+    // conservatively — we don't recurse into thunks because the EDD-9025
+    // check is about static type unions, and recursive schemas wrapping
+    // composite-eligible scalars are pathological for keys anyway.
+    return undefined
+  }
+
+  const checkCompositeForNull = (
+    surface: string,
+    compositeAttr: string,
+  ): void => {
+    const resolved = resolveCompositeSchemaForNullCheck(compositeAttr)
+    if (!resolved) return // EDD-9002 already caught the unknown-attribute case
+    const found = findNullInAst(resolved.schema.ast, resolved.source)
+    if (found) {
+      throw makeCompositeNullableError({
+        entityType: config.entityType,
+        surface,
+        compositeAttribute: compositeAttr,
+        schemaPath: found,
+      })
+    }
+  }
+
+  // primaryKey composites
+  for (const attr of [
+    ...config.indexes.primary.pk.composite,
+    ...config.indexes.primary.sk.composite,
+  ]) {
+    checkCompositeForNull("primaryKey", attr)
+  }
+  // GSI composites (each index)
+  for (const [indexName, indexDef] of Object.entries(config.indexes)) {
+    if (indexName === "primary") continue
+    for (const attr of [...indexDef.pk.composite, ...indexDef.sk.composite]) {
+      checkCompositeForNull(`index "${indexName}"`, attr)
+    }
+  }
+  // Unique constraint composites — `unique` is keyed by constraint name,
+  // value is a single field name OR an array of field names OR a config
+  // object. resolveUniqueFields normalises all three to a list of field names.
+  if (config.unique) {
+    for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
+      const fields = resolveUniqueFields(constraintDef)
+      for (const f of fields) {
+        checkCompositeForNull(`unique:${constraintName}`, f)
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Validate timeSeries config (EDD-9010..9016)
   // ---------------------------------------------------------------------------
   if (config.timeSeries !== undefined && config.timeSeries !== null) {
@@ -2697,11 +2807,13 @@ const makeImpl = <
             // buckets must coexist (the version CAS protects against same-bucket
             // races). Non-sparse fields use the existing replace semantics.
             //
-            // null and undefined collapse: both signal explicit clear under
-            // indexPolicy v2 (DESIGN.md §7). For the in-memory item we DELETE
-            // the attribute (mirrors a DynamoDB REMOVE), so subsequent decode
-            // sees the field as absent rather than as a typed null that the
-            // model schema may not permit.
+            // null and undefined collapse: both mean "absent" under v3's
+            // two-way classification (DESIGN.md §7). For the in-memory item
+            // we DELETE the attribute (mirrors a DynamoDB REMOVE), so
+            // subsequent decode sees the field as absent rather than as a
+            // typed null that the model schema may not permit. The composer
+            // below sees the attr as absent in `newItem` and applies the
+            // structural rule.
             for (const [attr, val] of Object.entries(
               hydratedUpdates as globalThis.Record<string, unknown>,
             )) {
@@ -2793,15 +2905,13 @@ const makeImpl = <
             const primaryKeyMap = composePrimaryKey(newItem)
             Object.assign(newItem, primaryKeyMap)
 
-            // GSI keys: route through the policy-aware composer so explicit
-            // clears (`set({ attr: null | undefined })`) and `Entity.remove`
-            // cascades match the v2 semantics applied on the standard update
-            // path. `newItem` carries stored values for any composite the
-            // user did not touch — passing it as `keyRecord` lets the
+            // GSI keys: route through the policy-aware composer so the v3
+            // structural rule + `Entity.remove` cascade match the standard
+            // update path. `newItem` carries stored values for any composite
+            // the user did not touch — passing it as `keyRecord` lets the
             // composer treat omissions as no-ops (the half stays untouched
             // because the stored value is present), while still firing the
-            // explicit-clear cascade and the SK preserve-truncation rule.
-            // See DESIGN.md §7 + §7.6.
+            // cascade and the structural truncation rule. See DESIGN.md §7.
             const retainRemovedSet = uState.remove ? new Set(uState.remove) : undefined
             try {
               const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
@@ -3114,15 +3224,16 @@ const makeImpl = <
           if (systemFields.updatedAtCollision && systemFields.updatedAt)
             updateSystemColliders.add(systemFields.updatedAt)
 
-          // Add user-provided updates. Buffered REMOVE clauses for explicit
-          // clears land in `removeClauses` below — under indexPolicy v2,
-          // `set({ attr: null | undefined })` means "remove this attribute
-          // now" (the same intent as `Entity.remove([attr])`). The two paths
-          // differ only in syntax; both surface in the UpdateExpression as
-          // REMOVE clauses, and both cascade through the policy-aware GSI
-          // composer (clearedSet auto-derived from null/undefined values).
-          // See DESIGN.md §7 for the three-way payload classification.
-          const explicitClears: Array<string> = []
+          // Add user-provided updates. Buffered REMOVE clauses for null
+          // payload entries land in `removeClauses` below — under v3,
+          // `set({ attr: null | undefined })` REMOVEs the attribute from the
+          // item but does NOT separately cascade-drop GSI keys. The structural
+          // composer treats the cleared attribute as absent and recomposes
+          // (or truncates / drops / no-ops) per the half's policy.
+          // EDD-9025 guarantees no composite is nullable, so `set` of `null`
+          // is only reachable for non-composite, model-declared-nullable
+          // attributes. See DESIGN.md §7.
+          const nullClears: Array<string> = []
           for (const [attr, val] of Object.entries(encodedUpdatesMap)) {
             if (updateSystemColliders.has(attr)) continue
 
@@ -3131,7 +3242,7 @@ const makeImpl = <
               // here — the `.removeEntries` API is the explicit per-key
               // remove. Skip to avoid REMOVE'ing the whole prefix erroneously.
               if (hasSparseFields && attr in sparseFields) continue
-              explicitClears.push(attr)
+              nullClears.push(attr)
               continue
             }
 
@@ -3223,15 +3334,16 @@ const makeImpl = <
 
           // REMOVE
           // Two channels feed REMOVE clauses:
-          //  1. `Entity.remove([attr])` cascade — drops the GSI for any
-          //     containing composite. Tracked in `removedSet` so the
-          //     policy-aware composer can apply the cascade rule.
-          //  2. Explicit clears in the user payload (`set({ attr: null })`).
-          //     These also REMOVE the attribute, but they do NOT cascade to
-          //     the whole GSI — instead, the policy-aware composer's
-          //     three-way classification consumes them via the auto-derived
-          //     clearedSet (preserve → truncate, sparse → drop). This
-          //     distinction is what makes hierarchical SK pruning work.
+          //  1. `Entity.remove([attr])` — explicit per-attribute drop. Cascades
+          //     to drop the GSI keys for any GSI containing the attr as a
+          //     composite (one of v3's two drop triggers — see DESIGN.md §7).
+          //     Tracked in `removedSet` so the composer can apply the cascade
+          //     rule.
+          //  2. Null payload entries (`set({ attr: null })`). These REMOVE the
+          //     attribute from the item only. They do NOT cascade GSI drops —
+          //     under v3 two-way classification, the structural composer just
+          //     treats the attribute as absent. (EDD-9025 guarantees these
+          //     are never composites.)
           const removedSet = uState.remove ? new Set(uState.remove) : undefined
           if (uState.remove) {
             for (const attr of uState.remove) {
@@ -3240,21 +3352,22 @@ const makeImpl = <
               removeClauses.push(nameKey)
             }
           }
-          for (const attr of explicitClears) {
+          for (const attr of nullClears) {
             const nameKey = `#r${removeClauses.length}`
             names[nameKey] = resolveDbName(attr)
             removeClauses.push(nameKey)
           }
 
-          // Policy-aware GSI key composition. One call covers SETs (full
-          // recompose, half-wise, or SK truncation), sparse dropout REMOVEs,
-          // and cascade REMOVEs when an Entity.remove() targets a GSI
-          // composite. See DESIGN.md §7 Policy-Aware GSI Composition.
+          // Policy-aware GSI key composition (v3 — per-half structural rule).
+          // One call covers SETs (full recompose, truncated leading prefix,
+          // or no-op), sparse whole-half-empty REMOVEs, and cascade REMOVEs
+          // when an Entity.remove() targets a GSI composite. See DESIGN.md
+          // §7 Policy-Aware GSI Composition.
           //
           // The composer throws CompositeKeyHoleError (EDD-9024) when the
-          // payload describes a hole pattern (a cleared composite at SK
-          // position i with a present composite at j > i). Catch it
-          // synchronously and surface as a typed Effect failure.
+          // merged payload describes a hole pattern AND the relevant half's
+          // policy is `'preserve'`. Under `'sparse'`, holes silently truncate.
+          // Catch the error synchronously and surface as a typed Effect failure.
           let gsiUpdate: KeyComposer.GsiUpdateResult
           try {
             gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
@@ -4158,11 +4271,13 @@ const makeImpl = <
         counter++
       }
 
-      // GSI key recomposition: any GSI whose composites are touched by input.
-      // Reuses the policy-aware helper from `.update()`. PK composites are
-      // excluded from the update payload — they're already in the key and
-      // never change during an append. Non-PK composites in appendInput that
-      // overlap a GSI's composites trigger per-GSI resolution via indexPolicy.
+      // GSI key recomposition. v3 unifies append with update — both call
+      // the same composer. PK composites are excluded from the update
+      // payload — they're already in the key and never change during an
+      // append. The composer treats composites outside `appendInput` as
+      // absent under the structural rule (per-half policy decides whether
+      // a half empties to drop or no-op). See DESIGN.md §7 — "append uses
+      // the same composer."
       const nonPkAppendFields: globalThis.Record<string, unknown> = {}
       for (const [attr, val] of Object.entries(encoded)) {
         if (!pkCompositeSet.has(attr)) {
@@ -4170,50 +4285,17 @@ const makeImpl = <
         }
       }
 
-      // At append-time, indexPolicy is restricted to composites that are
-      // members of appendInput. Non-appendInput composites are owned by
-      // other writers and are by contract never touched by .append(); their
-      // policy cannot fire at append-time. Each GSI's indexPolicy return is
-      // filtered to appendInput attrs only — non-appendInput keys fall through
-      // to the implicit `"preserve"` default, leaving the half containing
-      // them untouched.
-      const appendInputFieldSet = new Set<string>(
-        Object.keys(
-          (appendInputSchema as unknown as { fields?: globalThis.Record<string, unknown> })
-            .fields ?? {},
-        ),
-      )
-      const policyAwareIndexes: globalThis.Record<string, IndexDefinition> = {}
-      for (const [indexName, indexDef] of Object.entries(allIndexes)) {
-        if (!indexDef.indexPolicy) {
-          policyAwareIndexes[indexName] = indexDef
-          continue
-        }
-        const originalPolicy = indexDef.indexPolicy
-        policyAwareIndexes[indexName] = {
-          ...indexDef,
-          indexPolicy: (item) => {
-            const raw = originalPolicy(item)
-            const filtered: Partial<globalThis.Record<string, KeyComposer.IndexPolicyAttr>> = {}
-            for (const [attr, policy] of Object.entries(raw)) {
-              if (appendInputFieldSet.has(attr) && policy !== undefined) {
-                filtered[attr] = policy
-              }
-            }
-            return filtered
-          },
-        }
-      }
-
-      // The composer can throw CompositeKeyHoleError (EDD-9024) on a hole
-      // pattern. Surface it as a typed Effect failure.
+      // The composer can throw CompositeKeyHoleError (EDD-9024) when a hole
+      // pattern is encountered AND the relevant half's policy is `'preserve'`.
+      // Under `'sparse'`, holes silently truncate. Surface the error as a
+      // typed Effect failure.
       let gsiUpdate: KeyComposer.GsiUpdateResult
       try {
         gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
           schema,
           entityType,
           entityVersion,
-          policyAwareIndexes,
+          allIndexes,
           nonPkAppendFields,
           encoded,
         )

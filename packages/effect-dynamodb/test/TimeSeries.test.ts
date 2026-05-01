@@ -820,19 +820,12 @@ describe("TimeSeries — indexPolicy on append", () => {
           name: "gsi6",
           pk: { field: "gsi6pk", composite: ["accountId", "alert"] },
           sk: { field: "gsi6sk", composite: ["timestamp"] },
-          // User specifies policy for both update and append callers. At
-          // append-time the library filters down to appendInput attrs only:
-          // `accountId` is dropped (not in appendInput), leaving `alert` and
-          // `timestamp`. With no sparse-missing (appendInput has both), and
-          // accountId missing from item at append-time but filtered out of
-          // policy → implicit preserve → pk half left alone; sk half (only
-          // timestamp composite) present → SET.
-          indexPolicy: () =>
-            ({
-              accountId: "preserve" as const,
-              alert: "preserve" as const,
-              timestamp: "preserve" as const,
-            }) as const,
+          // v3 per-half policy: both halves preserve. `accountId` is owned by
+          // an enrichment writer (not in appendInput); on an ingest append the
+          // pk half's leading prefix is empty (accountId absent) → preserve
+          // no-ops, leaving the stored gsi6pk untouched. The sk half's
+          // `timestamp` is in appendInput → SET.
+          indexPolicy: { pk: "preserve", sk: "preserve" },
         },
       },
       timestamps: true,
@@ -899,7 +892,10 @@ describe("TimeSeries — indexPolicy on append", () => {
           name: "gsi2",
           pk: { field: "gsi2pk", composite: ["alert"] },
           sk: { field: "gsi2sk", composite: ["timestamp"] },
-          indexPolicy: () => ({ alert: "sparse" as const }),
+          // v3 per-half: sparse on pk (alert is the membership key — when
+          // an event omits it, the GSI drops). sk has timestamp in appendInput
+          // so it's always present.
+          indexPolicy: { pk: "sparse", sk: "preserve" },
         },
       },
       timestamps: true,
