@@ -349,43 +349,46 @@ describe("Entity update — hole detection (v3 policy-aware)", () => {
     }).pipe(Effect.provide(layer), Effect.scoped)
   })
 
-  it.effect("sparse + hole pattern with empty leading prefix → drops both halves (no error)", () => {
-    const capture: Capture = {}
-    const layer = Layer.mergeAll(
-      Layer.succeed(DynamoClient, makeHolesMock(capture) as any),
-      HolesTableLayer,
-    )
-    return Effect.gen(function* () {
-      const db = yield* DynamoClient.make({
-        entities: { PreserveHoles, SparseHoles },
-        tables: { HolesTable },
-      })
-      // Same hole pattern (city absent, site present), but sk is sparse and
-      // the leading prefix is empty → collapses to whole-half-empty + drop.
-      yield* db.entities.SparseHoles.update({ assetId: "a-1" }).set({
-        country: "us",
-        site: "datacenter-2",
-      })
-      const ui = capture.updateItem as {
-        UpdateExpression?: string
-        ExpressionAttributeNames?: Record<string, string>
-      }
-      // gsi1pk + gsi1sk should be REMOVE'd, not SET. Pull the REMOVE-clause
-      // tokens directly: they're the aliases whose names map back to gsi1pk
-      // and gsi1sk. The expression has shape "SET ... REMOVE #r0, #r1".
-      expect(ui.UpdateExpression).toMatch(/\bREMOVE\b/)
-      const expr = ui.UpdateExpression!
-      const removeIdx = expr.indexOf("REMOVE")
-      const removeTail = expr.slice(removeIdx + "REMOVE".length).trim()
-      const removeAliases = removeTail
-        .split(/[,\s]+/)
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0 && s.startsWith("#"))
-      const removed = removeAliases.map((a) => ui.ExpressionAttributeNames?.[a] ?? a)
-      expect(removed).toContain("gsi1pk")
-      expect(removed).toContain("gsi1sk")
-    }).pipe(Effect.provide(layer), Effect.scoped)
-  })
+  it.effect(
+    "sparse + hole pattern with empty leading prefix → drops both halves (no error)",
+    () => {
+      const capture: Capture = {}
+      const layer = Layer.mergeAll(
+        Layer.succeed(DynamoClient, makeHolesMock(capture) as any),
+        HolesTableLayer,
+      )
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { PreserveHoles, SparseHoles },
+          tables: { HolesTable },
+        })
+        // Same hole pattern (city absent, site present), but sk is sparse and
+        // the leading prefix is empty → collapses to whole-half-empty + drop.
+        yield* db.entities.SparseHoles.update({ assetId: "a-1" }).set({
+          country: "us",
+          site: "datacenter-2",
+        })
+        const ui = capture.updateItem as {
+          UpdateExpression?: string
+          ExpressionAttributeNames?: Record<string, string>
+        }
+        // gsi1pk + gsi1sk should be REMOVE'd, not SET. Pull the REMOVE-clause
+        // tokens directly: they're the aliases whose names map back to gsi1pk
+        // and gsi1sk. The expression has shape "SET ... REMOVE #r0, #r1".
+        expect(ui.UpdateExpression).toMatch(/\bREMOVE\b/)
+        const expr = ui.UpdateExpression!
+        const removeIdx = expr.indexOf("REMOVE")
+        const removeTail = expr.slice(removeIdx + "REMOVE".length).trim()
+        const removeAliases = removeTail
+          .split(/[,\s]+/)
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0 && s.startsWith("#"))
+        const removed = removeAliases.map((a) => ui.ExpressionAttributeNames?.[a] ?? a)
+        expect(removed).toContain("gsi1pk")
+        expect(removed).toContain("gsi1sk")
+      }).pipe(Effect.provide(layer), Effect.scoped)
+    },
+  )
 })
 
 // ---------------------------------------------------------------------------

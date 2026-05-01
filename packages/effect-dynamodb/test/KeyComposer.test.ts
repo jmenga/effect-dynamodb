@@ -986,7 +986,6 @@ describe("KeyComposer", () => {
     })
   })
 
-
   describe("composeSkPrefixUpTo", () => {
     it("composes leading prefix for non-collection isolated SK", () => {
       const index: KeyComposer.IndexDefinition = {

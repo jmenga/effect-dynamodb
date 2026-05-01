@@ -471,9 +471,7 @@ const classifyHalf = (
     // sparse → truncate to leading prefix. If the leading prefix is empty
     // (the absent run starts at position 0), this collapses to whole-half-
     // empty, which sparse drops.
-    return leadingLen === 0
-      ? { kind: "drop" }
-      : { kind: "set", length: leadingLen }
+    return leadingLen === 0 ? { kind: "drop" } : { kind: "set", length: leadingLen }
   }
 
   // No hole — pure trailing-absent. If the leading prefix is empty, the whole
@@ -624,14 +622,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
       sets[index.sk.field] =
         skOutcome.length === skComposites.length
           ? composeSk(schema, entityType, entityVersion, index, merged)
-          : composeSkPrefixUpTo(
-              schema,
-              entityType,
-              entityVersion,
-              index,
-              merged,
-              skOutcome.length,
-            )
+          : composeSkPrefixUpTo(schema, entityType, entityVersion, index, merged, skOutcome.length)
     }
   }
 

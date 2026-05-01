@@ -1471,10 +1471,7 @@ const makeImpl = <
     return undefined
   }
 
-  const checkCompositeForNull = (
-    surface: string,
-    compositeAttr: string,
-  ): void => {
+  const checkCompositeForNull = (surface: string, compositeAttr: string): void => {
     const resolved = resolveCompositeSchemaForNullCheck(compositeAttr)
     if (!resolved) return // EDD-9002 already caught the unknown-attribute case
     const found = findNullInAst(resolved.schema.ast, resolved.source)
