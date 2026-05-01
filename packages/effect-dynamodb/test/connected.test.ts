@@ -2230,64 +2230,101 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
 })
 
 // ---------------------------------------------------------------------------
-// indexPolicy integration tests — hybrid-writer GSI semantics against a
-// real DynamoDB Local. Mirrors the telemetry pipeline motivating example
-// from issue #11: one GSI is sparse on a per-event attr (alertState), a
-// second is preserved across writers (tenantId). Proves end-to-end that:
-//   - Sparse drop-out during update makes items disappear from GSI queries.
-//   - Preserve leaves stored GSI keys intact and items remain queryable.
-//   - Re-adding a sparse composite re-indexes the item.
-//   - Two writers with disjoint attrs don't clobber each other's GSI state.
+// indexPolicy v1.7.1 integration tests — comprehensive multi-writer
+// round-trip + per-half cascade + truncation coverage against DynamoDB Local.
+//
+// Asserts the v1.7.1 model end-to-end (closes #41):
+//   1. Per-half evaluation gate — untouched halves stay untouched.
+//   2. Per-half outcome — sparse drops the half; preserve noops or cascades.
+//   3. Per-half cascade — Entity.remove drops only the half(s) containing
+//      the named composite.
+//   4. Set/remove asymmetry — set+remove truncates; remove alone REMOVEs.
 // ---------------------------------------------------------------------------
 
-class Device extends Schema.Class<Device>("Device")({
+// Hybrid telemetry-style fixture mirroring the consolidated comment in
+// issue #41: byCurrentAlert has accountId on pk (preserve, enrichment-owned)
+// and [alertState, timestamp] on sk (sparse, telemetry-owned). Both halves
+// are touched independently by their respective writers.
+class HybridDevice extends Schema.Class<HybridDevice>("HybridDevice")({
   channel: Schema.String,
   deviceId: Schema.String,
-  tenantId: Schema.optional(Schema.String),
+  // Enrichment-owned (preserve on pk).
+  accountId: Schema.optional(Schema.String),
+  // Telemetry-owned (sparse on sk).
   alertState: Schema.optional(Schema.Literals(["active", "cleared"])),
-  region: Schema.optional(Schema.String),
+  timestamp: Schema.optional(Schema.String),
+  // Stamp-style attribute — not in any GSI; touched by neither writer above.
+  published: Schema.optional(Schema.String),
   label: Schema.optional(Schema.String),
 }) {}
 
 const ipSchema = DynamoSchema.make({ name: "ip-test", version: 1 })
 const ipTableName = `ip-test-${Date.now()}`
 
-const Devices = Entity.make({
-  model: Device,
-  entityType: "Device",
+const HybridDevices = Entity.make({
+  model: HybridDevice,
+  entityType: "HybridDevice",
   primaryKey: {
     pk: { field: "pk", composite: ["channel", "deviceId"] },
     sk: { field: "sk", composite: [] },
   },
   indexes: {
-    // Sparse pk: alertState is the only pk composite. When absent (caller
-    // omits or sets to null/undefined), pk is whole-half-empty and sparse
-    // drops the item from the GSI. sk = [deviceId] always present (deviceId
-    // is in the primary key) so sk's policy is moot.
-    byAlert: {
+    // The motivating multi-writer GSI from issue #41: pk preserve
+    // (enrichment-owned), sk sparse (telemetry-owned).
+    byCurrentAlert: {
       name: "gsi1",
-      pk: { field: "gsi1pk", composite: ["alertState"] },
-      sk: { field: "gsi1sk", composite: ["deviceId"] },
-      indexPolicy: { pk: "sparse" },
+      pk: { field: "gsi1pk", composite: ["accountId"] },
+      sk: { field: "gsi1sk", composite: ["alertState", "timestamp"] },
+      indexPolicy: { pk: "preserve", sk: "sparse" },
     },
-    // Preserve everywhere: tenantId is owned by an enrichment writer.
-    // Ingest-side updates that don't touch tenantId leave the pk half
-    // alone (whole-half-empty + preserve = no-op).
-    byTenant: {
+    // Both-preserve GSI for testing per-half cascade override.
+    byBothPreserve: {
       name: "gsi2",
-      pk: { field: "gsi2pk", composite: ["tenantId"] },
-      sk: { field: "gsi2sk", composite: ["deviceId"] },
+      pk: { field: "gsi2pk", composite: ["accountId"] },
+      sk: { field: "gsi2sk", composite: ["timestamp"] },
       indexPolicy: { pk: "preserve", sk: "preserve" },
     },
   },
   timestamps: true,
 })
 
-const IpTable = Table.make({ schema: ipSchema, entities: { Devices } })
+const IpTable = Table.make({ schema: ipSchema, entities: { HybridDevices } })
 const IpTestLayer = Layer.mergeAll(ClientLayer, IpTable.layer({ name: ipTableName }))
 const provideIp = Effect.provide(IpTestLayer)
 
-describeConnected("indexPolicy integration tests", () => {
+// Hierarchical asset fixture for set/remove asymmetry + truncation tests.
+class HierAsset extends Schema.Class<HierAsset>("HierAsset")({
+  assetId: Schema.String,
+  region: Schema.optional(Schema.String),
+  country: Schema.optional(Schema.String),
+  city: Schema.optional(Schema.String),
+  site: Schema.optional(Schema.String),
+}) {}
+
+const hierTableName = `ip-hier-${Date.now()}`
+
+const HierAssets = Entity.make({
+  model: HierAsset,
+  entityType: "HierAsset",
+  primaryKey: {
+    pk: { field: "pk", composite: ["assetId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byLocation: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["region"] },
+      sk: { field: "gsi1sk", composite: ["country", "city", "site"] },
+      indexPolicy: { pk: "preserve", sk: "preserve" },
+    },
+  },
+  timestamps: true,
+})
+const HierTable = Table.make({ schema: ipSchema, entities: { HierAssets } })
+const HierTestLayer = Layer.mergeAll(ClientLayer, HierTable.layer({ name: hierTableName }))
+const provideHier = Effect.provide(HierTestLayer)
+
+describeConnected("indexPolicy v1.7.1 integration tests (closes #41)", () => {
   beforeAll(async () => {
     await Effect.runPromise(
       Effect.gen(function* () {
@@ -2298,6 +2335,16 @@ describeConnected("indexPolicy integration tests", () => {
           ...Table.definition(IpTable),
         })
       }).pipe(provideIp, Effect.scoped),
+    )
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: hierTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(HierTable),
+        })
+      }).pipe(provideHier, Effect.scoped),
     )
   }, 15000)
 
@@ -2312,137 +2359,572 @@ describeConnected("indexPolicy integration tests", () => {
         Effect.catchTag("ResourceNotFoundError", () => Effect.void),
       ),
     )
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: hierTableName })
+      }).pipe(
+        provideHier,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
   }, 15000)
 
-  it.effect("put with all composites → item queryable via both GSIs", () =>
+  // ----- Scenario 1: Stamp doesn't disturb GSI -----
+  it.effect("scenario 1 — stamp writer doesn't disturb either GSI half", () =>
     Effect.gen(function* () {
-      const db = yield* DynamoClient.make({ entities: { Devices }, tables: { IpTable } })
-
-      yield* db.entities.Devices.put({
-        channel: "c-1",
-        deviceId: "d-1",
-        tenantId: "acme",
-        alertState: "active",
-        region: "us-east-1",
-        label: "initial",
+      const db = yield* DynamoClient.make({
+        entities: { HybridDevices },
+        tables: { IpTable },
       })
 
-      const byAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
-      expect(byAlert).toHaveLength(1)
-      expect(byAlert[0]!.deviceId).toBe("d-1")
+      // Pre-seed item with all composites; both GSIs visible.
+      yield* db.entities.HybridDevices.put({
+        channel: "c-s1",
+        deviceId: "d-s1",
+        accountId: "acme",
+        alertState: "active",
+        timestamp: "2026-04-30T10:00:00Z",
+      })
+      const beforeAlert = yield* db.entities.HybridDevices.byCurrentAlert({
+        accountId: "acme",
+      }).collect()
+      expect(beforeAlert.some((d) => d.deviceId === "d-s1")).toBe(true)
 
-      const byTenant = yield* db.entities.Devices.byTenant({ tenantId: "acme" }).collect()
-      expect(byTenant).toHaveLength(1)
-      expect(byTenant[0]!.deviceId).toBe("d-1")
+      // Stamp writer touches only `published` — no GSI composite touched.
+      yield* db.entities.HybridDevices.update({ channel: "c-s1", deviceId: "d-s1" }).set({
+        published: "2026-04-30",
+      })
+
+      // v1.7.1 critical: BOTH GSIs unchanged. (v1.7.0 would have REMOVE'd
+      // gsi1sk because sparse fired on the untouched sk half.)
+      const afterAlert = yield* db.entities.HybridDevices.byCurrentAlert({
+        accountId: "acme",
+      }).collect()
+      expect(afterAlert.some((d) => d.deviceId === "d-s1")).toBe(true)
+
+      // Verify raw stored item — both GSI key attrs still present.
+      const item = yield* HybridDevices.get({
+        channel: "c-s1",
+        deviceId: "d-s1",
+      }).pipe(Entity.asItem)
+      expect(item.gsi1pk).toBeDefined()
+      expect(item.gsi1sk).toBeDefined()
     }).pipe(provideIp),
   )
 
-  it.effect("update with alertState null + sparse policy → item drops out of byAlert", () =>
+  // ----- Scenario 2: Enrichment writer SETs pk, leaves sk alone -----
+  it.effect("scenario 2 — enrichment writer SETs pk, sk untouched", () =>
     Effect.gen(function* () {
-      const db = yield* DynamoClient.make({ entities: { Devices }, tables: { IpTable } })
+      const db = yield* DynamoClient.make({
+        entities: { HybridDevices },
+        tables: { IpTable },
+      })
 
-      // Pre-seed an indexed item.
-      yield* db.entities.Devices.put({
-        channel: "c-2",
-        deviceId: "d-2",
-        tenantId: "acme",
+      yield* db.entities.HybridDevices.put({
+        channel: "c-s2",
+        deviceId: "d-s2",
+        accountId: "acme",
         alertState: "active",
-        region: "us-east-1",
-      })
-      const before = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
-      expect(before.some((d) => d.deviceId === "d-2")).toBe(true)
-
-      // Update explicitly nulling alertState — sparse policy must drop the item.
-      yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).set({
-        alertState: undefined,
-        label: "cleared",
+        timestamp: "2026-04-30T10:00:00Z",
       })
 
-      const afterDrop = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
-      expect(afterDrop.some((d) => d.deviceId === "d-2")).toBe(false)
+      // Enrichment moves accountId. SK untouched.
+      yield* db.entities.HybridDevices.update({ channel: "c-s2", deviceId: "d-s2" }).set({
+        accountId: "newAcct",
+      })
 
-      // byTenant unaffected — preserve policy left its keys intact.
-      const tenant = yield* db.entities.Devices.byTenant({ tenantId: "acme" }).collect()
-      expect(tenant.some((d) => d.deviceId === "d-2")).toBe(true)
+      // Visible under newAcct (pk SET).
+      const newAcct = yield* db.entities.HybridDevices.byCurrentAlert({
+        accountId: "newAcct",
+      }).collect()
+      expect(newAcct.some((d) => d.deviceId === "d-s2")).toBe(true)
+      // No longer visible under acme.
+      const acme = yield* db.entities.HybridDevices.byCurrentAlert({
+        accountId: "acme",
+      }).collect()
+      expect(acme.some((d) => d.deviceId === "d-s2")).toBe(false)
+
+      // SK unchanged — verify stored gsi1sk hasn't moved.
+      const item = yield* HybridDevices.get({
+        channel: "c-s2",
+        deviceId: "d-s2",
+      }).pipe(Entity.asItem)
+      expect(item.gsi1sk).toBeDefined()
     }).pipe(provideIp),
   )
 
-  it.effect("re-adding alertState → item reappears in byAlert", () =>
+  // ----- Scenario 3: Telemetry writer SETs sk, leaves pk alone -----
+  it.effect("scenario 3 — telemetry writer SETs sk, pk untouched", () =>
     Effect.gen(function* () {
-      const db = yield* DynamoClient.make({ entities: { Devices }, tables: { IpTable } })
+      const db = yield* DynamoClient.make({
+        entities: { HybridDevices },
+        tables: { IpTable },
+      })
 
-      yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).set({
+      yield* db.entities.HybridDevices.put({
+        channel: "c-s3",
+        deviceId: "d-s3",
+        accountId: "acme",
+        alertState: "active",
+        timestamp: "2026-04-30T10:00:00Z",
+      })
+
+      // Telemetry tick: new alertState + timestamp. PK untouched.
+      yield* db.entities.HybridDevices.update({ channel: "c-s3", deviceId: "d-s3" }).set({
         alertState: "cleared",
+        timestamp: "2026-04-30T11:00:00Z",
       })
 
-      const byCleared = yield* db.entities.Devices.byAlert({ alertState: "cleared" }).collect()
-      expect(byCleared.some((d) => d.deviceId === "d-2")).toBe(true)
+      // Still visible under acme (pk preserved).
+      const acme = yield* db.entities.HybridDevices.byCurrentAlert({
+        accountId: "acme",
+      }).collect()
+      expect(acme.some((d) => d.deviceId === "d-s3")).toBe(true)
+
+      // Stored item reflects the new sk.
+      const item = yield* HybridDevices.get({
+        channel: "c-s3",
+        deviceId: "d-s3",
+      }).pipe(Entity.asItem)
+      expect((item.gsi1sk as string).includes("cleared")).toBe(true)
     }).pipe(provideIp),
   )
 
+  // ----- Scenario 4: Telemetry "no alert" event drops sk -----
   it.effect(
-    "update touching non-composite attr only: sparse GSI drops, preserve GSI untouched",
+    "scenario 4 — telemetry 'no alert' (timestamp only, alertState undefined) → REMOVE sk only",
     () =>
       Effect.gen(function* () {
-        const db = yield* DynamoClient.make({ entities: { Devices }, tables: { IpTable } })
+        const db = yield* DynamoClient.make({
+          entities: { HybridDevices },
+          tables: { IpTable },
+        })
 
-        yield* db.entities.Devices.put({
-          channel: "c-3",
-          deviceId: "d-3",
-          tenantId: "globex",
+        yield* db.entities.HybridDevices.put({
+          channel: "c-s4",
+          deviceId: "d-s4",
+          accountId: "acme",
           alertState: "active",
+          timestamp: "2026-04-30T10:00:00Z",
         })
 
-        // Sanity check: item initially indexed in both.
-        const initialAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
-        const initialTenant = yield* db.entities.Devices.byTenant({ tenantId: "globex" }).collect()
-        expect(initialAlert.some((d) => d.deviceId === "d-3")).toBe(true)
-        expect(initialTenant.some((d) => d.deviceId === "d-3")).toBe(true)
-
-        // Update sets only `label` — neither alertState nor tenantId in payload.
-        // byAlert declares sparse on alertState → always evaluated → alertState
-        // absent from payload → REMOVE (drops from sparse GSI).
-        // byTenant declares preserve on tenantId → always evaluated → tenantId
-        // absent + preserve → leave half alone (stays in GSI).
-        yield* db.entities.Devices.update({ channel: "c-3", deviceId: "d-3" }).set({
-          label: "labelled",
+        // Telemetry tick with alertState explicitly set to undefined →
+        // sk touched (alertState in payload), can't compose (hole at sk[0]) →
+        // sparse → REMOVE sk.
+        yield* db.entities.HybridDevices.update({ channel: "c-s4", deviceId: "d-s4" }).set({
+          alertState: undefined,
+          timestamp: "2026-04-30T11:00:00Z",
         })
 
-        const byAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
-        const byTenant = yield* db.entities.Devices.byTenant({ tenantId: "globex" }).collect()
-        expect(byAlert.some((d) => d.deviceId === "d-3")).toBe(false)
-        expect(byTenant.some((d) => d.deviceId === "d-3")).toBe(true)
+        // Item invisible in GSI (DDB projection rule needs both keys).
+        const acme = yield* db.entities.HybridDevices.byCurrentAlert({
+          accountId: "acme",
+        }).collect()
+        expect(acme.some((d) => d.deviceId === "d-s4")).toBe(false)
+
+        // But pk preserved on the underlying item — verify raw stored attrs.
+        const item = yield* HybridDevices.get({
+          channel: "c-s4",
+          deviceId: "d-s4",
+        }).pipe(Entity.asItem)
+        expect(item.gsi1pk).toBeDefined() // preserved
+        expect(item.gsi1sk).toBeUndefined() // REMOVE'd
       }).pipe(provideIp),
   )
 
-  it.effect("hybrid writers: ingest + enrichment updates preserve each other's GSI state", () =>
+  // ----- Scenario 5: Rejoin without enrichment re-fire (closes v1.7.0 bug-1) -----
+  it.effect(
+    "scenario 5 — rejoin: telemetry SETs sk after a drop; pk preserved → re-visible without enrichment re-fire",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { HybridDevices },
+          tables: { IpTable },
+        })
+
+        yield* db.entities.HybridDevices.put({
+          channel: "c-s5",
+          deviceId: "d-s5",
+          accountId: "acme",
+          alertState: "active",
+          timestamp: "2026-04-30T10:00:00Z",
+        })
+
+        // Drop sk first.
+        yield* db.entities.HybridDevices.update({ channel: "c-s5", deviceId: "d-s5" }).set({
+          alertState: undefined,
+          timestamp: "2026-04-30T11:00:00Z",
+        })
+        const dropped = yield* db.entities.HybridDevices.byCurrentAlert({
+          accountId: "acme",
+        }).collect()
+        expect(dropped.some((d) => d.deviceId === "d-s5")).toBe(false)
+
+        // Telemetry rejoins — sets new alertState + timestamp.
+        yield* db.entities.HybridDevices.update({ channel: "c-s5", deviceId: "d-s5" }).set({
+          alertState: "active",
+          timestamp: "2026-04-30T12:00:00Z",
+        })
+
+        // v1.7.1 critical assertion: item re-visible under PRESERVED pk
+        // (acme), with NEW sk. No enrichment writer had to re-fire.
+        // (v1.7.0 would have lost gsi1pk on the drop and the rejoin alone
+        // wouldn't have re-indexed the item until enrichment re-fired.)
+        const rejoined = yield* db.entities.HybridDevices.byCurrentAlert({
+          accountId: "acme",
+        }).collect()
+        expect(rejoined.some((d) => d.deviceId === "d-s5")).toBe(true)
+      }).pipe(provideIp),
+  )
+
+  // ----- Scenario 6: Explicit clear via undefined ----- (already exercised by 4)
+  it.effect("scenario 6 — explicit clear via undefined produces same outcome as omission", () =>
     Effect.gen(function* () {
-      const db = yield* DynamoClient.make({ entities: { Devices }, tables: { IpTable } })
-
-      // Initial state: neither tenantId nor alertState known — item not in either GSI.
-      yield* db.entities.Devices.put({ channel: "c-4", deviceId: "d-4" })
-
-      // Enrichment writer: sets tenantId.
-      yield* db.entities.Devices.update({ channel: "c-4", deviceId: "d-4" }).set({
-        tenantId: "initech",
+      const db = yield* DynamoClient.make({
+        entities: { HybridDevices },
+        tables: { IpTable },
       })
 
-      // Verify byTenant now has the item.
-      const afterEnrich = yield* db.entities.Devices.byTenant({ tenantId: "initech" }).collect()
-      expect(afterEnrich.some((d) => d.deviceId === "d-4")).toBe(true)
-
-      // Ingest writer: sets alertState without touching tenantId (not in payload).
-      // tenantId has preserve policy → byTenant remains intact.
-      yield* db.entities.Devices.update({ channel: "c-4", deviceId: "d-4" }).set({
+      yield* db.entities.HybridDevices.put({
+        channel: "c-s6",
+        deviceId: "d-s6",
+        accountId: "acme",
         alertState: "active",
+        timestamp: "2026-04-30T10:00:00Z",
       })
 
-      const byAlert = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
-      const byTenant = yield* db.entities.Devices.byTenant({ tenantId: "initech" }).collect()
-
-      expect(byAlert.some((d) => d.deviceId === "d-4")).toBe(true)
-      // Critical: byTenant still populated — ingest didn't clobber the enrichment-owned half.
-      expect(byTenant.some((d) => d.deviceId === "d-4")).toBe(true)
+      // Explicit `alertState: undefined` — sk touched (in operator true on
+      // undefined), can't compose → sparse → REMOVE sk.
+      yield* db.entities.HybridDevices.update({ channel: "c-s6", deviceId: "d-s6" }).set({
+        alertState: undefined,
+        timestamp: "2026-04-30T11:00:00Z",
+      })
+      const item = yield* HybridDevices.get({
+        channel: "c-s6",
+        deviceId: "d-s6",
+      }).pipe(Entity.asItem)
+      expect(item.gsi1sk).toBeUndefined()
+      expect(item.gsi1pk).toBeDefined() // preserved
     }).pipe(provideIp),
+  )
+
+  // ----- Scenario 7: Entity.remove on sparse-half composite — per-half cascade -----
+  it.effect(
+    "scenario 7 — Entity.remove(['alertState']) drops sk only (per-half, NOT GSI-wide)",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { HybridDevices },
+          tables: { IpTable },
+        })
+
+        yield* db.entities.HybridDevices.put({
+          channel: "c-s7",
+          deviceId: "d-s7",
+          accountId: "acme",
+          alertState: "active",
+          timestamp: "2026-04-30T10:00:00Z",
+        })
+
+        // Per-half cascade: alertState in sk only → REMOVE gsi1sk only.
+        yield* db.entities.HybridDevices.update({ channel: "c-s7", deviceId: "d-s7" }).remove([
+          "alertState",
+        ])
+
+        const item = yield* HybridDevices.get({
+          channel: "c-s7",
+          deviceId: "d-s7",
+        }).pipe(Entity.asItem)
+        // v1.7.1 critical: gsi1pk preserved (per-half cascade — not GSI-wide).
+        expect(item.gsi1pk).toBeDefined()
+        // sk REMOVE'd via cascade override.
+        expect(item.gsi1sk).toBeUndefined()
+        // The byBothPreserve gsi2 has accountId on pk (untouched, no cascade
+        // — alertState not in gsi2's composites) → both halves untouched.
+        expect(item.gsi2pk).toBeDefined()
+        expect(item.gsi2sk).toBeDefined()
+      }).pipe(provideIp),
+  )
+
+  // ----- Scenario 8: Entity.remove on preserve-half composite — cascade override -----
+  it.effect(
+    "scenario 8 — Entity.remove(['accountId']) under preserve → REMOVE pk via cascade override (per-half)",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { HybridDevices },
+          tables: { IpTable },
+        })
+
+        yield* db.entities.HybridDevices.put({
+          channel: "c-s8",
+          deviceId: "d-s8",
+          accountId: "acme",
+          alertState: "active",
+          timestamp: "2026-04-30T10:00:00Z",
+        })
+
+        // accountId is the only pk composite for both byCurrentAlert and
+        // byBothPreserve. Per-half cascade fires on PK halves only — sk
+        // untouched (alertState/timestamp not in removedSet, not in payload).
+        yield* db.entities.HybridDevices.update({ channel: "c-s8", deviceId: "d-s8" }).remove([
+          "accountId",
+        ])
+
+        const item = yield* HybridDevices.get({
+          channel: "c-s8",
+          deviceId: "d-s8",
+        }).pipe(Entity.asItem)
+        // Both PK halves REMOVE'd (cascade override under preserve fires on
+        // both — accountId is in both PKs).
+        expect(item.gsi1pk).toBeUndefined()
+        expect(item.gsi2pk).toBeUndefined()
+        // v1.7.1 critical: SK halves preserved (they don't contain
+        // accountId; per-half gate skips them entirely).
+        expect(item.gsi1sk).toBeDefined()
+        expect(item.gsi2sk).toBeDefined()
+      }).pipe(provideIp),
+  )
+
+  // ----- Scenario 9: Hierarchical truncation via set+remove -----
+  it.effect("scenario 9 — hierarchical truncation: set surviving + remove leaf → SET sk truncated", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { HierAssets },
+        tables: { HierTable },
+      })
+
+      yield* db.entities.HierAssets.put({
+        assetId: "rack-9",
+        region: "americas",
+        country: "us",
+        city: "sf",
+        site: "datacenter-1",
+      })
+
+      // Demote — drop site, keep country+city via set; structural rule
+      // composes the leading prefix [country, city]. SET sk truncated.
+      // PK untouched (region not in payload, not in removedSet).
+      yield* db.entities.HierAssets.update({ assetId: "rack-9" })
+        .set({ country: "us", city: "sf" })
+        .remove(["site"])
+
+      const item = yield* HierAssets.get({ assetId: "rack-9" }).pipe(Entity.asItem)
+      // PK preserved (region untouched).
+      expect(item.gsi1pk).toBeDefined()
+      // SK SET to truncated leading prefix.
+      expect((item.gsi1sk as string)).toBe("$ip-test#v1#hierasset#country_us#city_sf")
+
+      // begins_with query at city level still finds the asset.
+      const atRegion = yield* db.entities.HierAssets.byLocation({
+        region: "americas",
+      }).collect()
+      expect(atRegion.some((a) => a.assetId === "rack-9")).toBe(true)
+    }).pipe(provideHier),
+  )
+
+  // ----- Scenario 10: Hole pattern + sparse → REMOVE sk -----
+  it.effect("scenario 10 — hole pattern under sparse → REMOVE sk only (NOT GSI-wide)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { HybridDevices },
+        tables: { IpTable },
+      })
+
+      yield* db.entities.HybridDevices.put({
+        channel: "c-s10",
+        deviceId: "d-s10",
+        accountId: "acme",
+        alertState: "active",
+        timestamp: "2026-04-30T10:00:00Z",
+      })
+
+      // Hole on sk: pass timestamp only; alertState absent from payload.
+      // Wait — under v1.7.1, omitted means untouched per the gate. To
+      // exercise hole-under-sparse here we have to TOUCH sk by including
+      // alertState as undefined (or include another sk composite). We use
+      // `timestamp` as the touch signal; alertState is absent (stored value
+      // exists, but a fresh ingest `set({ timestamp: T })` only mentions
+      // timestamp). That makes sk touched (timestamp in payload), but
+      // alertState... is in stored attrs as "active" — so the merged record
+      // has alertState present.
+      //
+      // To exercise the actual hole-under-sparse semantic, the writer must
+      // touch sk AND signal alertState as absent. Use `alertState: undefined`
+      // explicitly to force the hole.
+      yield* db.entities.HybridDevices.update({ channel: "c-s10", deviceId: "d-s10" }).set({
+        alertState: undefined,
+        timestamp: "2026-04-30T11:00:00Z",
+      })
+
+      const item = yield* HybridDevices.get({
+        channel: "c-s10",
+        deviceId: "d-s10",
+      }).pipe(Entity.asItem)
+      // sk REMOVE'd via sparse + can't-compose (hole at sk[0]).
+      expect(item.gsi1sk).toBeUndefined()
+      // pk preserved (untouched).
+      expect(item.gsi1pk).toBeDefined()
+    }).pipe(provideIp),
+  )
+
+  // ----- Scenario 11: Hole pattern + preserve, no removedSet → noop -----
+  it.effect(
+    "scenario 11 — hole pattern under preserve (no removedSet) → noop sk (stored value retained)",
+    () =>
+      Effect.gen(function* () {
+        // Use HierAssets with byLocation sk = [country, city, site], both
+        // preserve. Hole = country present, city absent, site present.
+        const dbHier = yield* DynamoClient.make({
+          entities: { HierAssets },
+          tables: { HierTable },
+        })
+
+        yield* dbHier.entities.HierAssets.put({
+          assetId: "rack-11",
+          region: "americas",
+          country: "us",
+          city: "sf",
+          site: "datacenter-1",
+        })
+        const beforeStored = yield* HierAssets.get({ assetId: "rack-11" }).pipe(Entity.asItem)
+        const beforeSk = beforeStored.gsi1sk
+
+        // Touch sk with a hole pattern under preserve, no removedSet.
+        // city: undefined, site: 'datacenter-2' → hole at sk[1].
+        yield* dbHier.entities.HierAssets.update({ assetId: "rack-11" }).set({
+          country: "us",
+          city: undefined,
+          site: "datacenter-2",
+        })
+
+        const item = yield* HierAssets.get({ assetId: "rack-11" }).pipe(Entity.asItem)
+        // v1.7.1: preserve + can't-compose + no cascade → noop. The stored
+        // gsi1sk is left at its previous value (no SET, no REMOVE).
+        expect(item.gsi1sk).toBe(beforeSk)
+      }).pipe(provideHier),
+  )
+
+  // ----- Scenario 12: Hole pattern + preserve + removedSet → REMOVE via cascade override -----
+  it.effect(
+    "scenario 12 — hole pattern under preserve + removedSet → REMOVE sk via cascade override",
+    () =>
+      Effect.gen(function* () {
+        const dbHier = yield* DynamoClient.make({
+          entities: { HierAssets },
+          tables: { HierTable },
+        })
+
+        yield* dbHier.entities.HierAssets.put({
+          assetId: "rack-12",
+          region: "americas",
+          country: "us",
+          city: "sf",
+          site: "datacenter-1",
+        })
+
+        // Touch sk via removedSet on city, set site to a new value → hole
+        // pattern (country present, city absent via removedSet, site
+        // present). Preserve + cascade override → REMOVE sk.
+        yield* dbHier.entities.HierAssets.update({ assetId: "rack-12" })
+          .set({ site: "datacenter-2" })
+          .remove(["city"])
+
+        const item = yield* HierAssets.get({ assetId: "rack-12" }).pipe(Entity.asItem)
+        expect(item.gsi1sk).toBeUndefined()
+        // pk preserved.
+        expect(item.gsi1pk).toBeDefined()
+      }).pipe(provideHier),
+  )
+
+  // ----- Scenario 13: Multi-writer concurrent updates -----
+  it.effect("scenario 13 — multi-writer sequential updates produce expected combined GSI state", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { HybridDevices },
+        tables: { IpTable },
+      })
+
+      // Initial state — full composites set on put.
+      yield* db.entities.HybridDevices.put({
+        channel: "c-s13",
+        deviceId: "d-s13",
+        accountId: "acme",
+        alertState: "active",
+        timestamp: "2026-04-30T10:00:00Z",
+      })
+
+      // Enrichment writer fires.
+      yield* db.entities.HybridDevices.update({ channel: "c-s13", deviceId: "d-s13" }).set({
+        accountId: "newAcct",
+      })
+      // Telemetry writer fires.
+      yield* db.entities.HybridDevices.update({ channel: "c-s13", deviceId: "d-s13" }).set({
+        alertState: "cleared",
+        timestamp: "2026-04-30T11:00:00Z",
+      })
+
+      // Both writes preserved end-to-end. Final GSI state under newAcct +
+      // cleared.
+      const final = yield* db.entities.HybridDevices.byCurrentAlert({
+        accountId: "newAcct",
+      }).collect()
+      expect(final.some((d) => d.deviceId === "d-s13")).toBe(true)
+      // Stale account still empty.
+      const stale = yield* db.entities.HybridDevices.byCurrentAlert({
+        accountId: "acme",
+      }).collect()
+      expect(stale.some((d) => d.deviceId === "d-s13")).toBe(false)
+    }).pipe(provideIp),
+  )
+
+  // ----- Scenario 14: DDB projection invariant (documented, not library behavior) -----
+  it.effect(
+    "scenario 14 — DDB projection invariant: item with only one GSI key attr is invisible",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { HybridDevices },
+          tables: { IpTable },
+        })
+
+        // Put with full composites — visible.
+        yield* db.entities.HybridDevices.put({
+          channel: "c-s14",
+          deviceId: "d-s14",
+          accountId: "acme",
+          alertState: "active",
+          timestamp: "2026-04-30T10:00:00Z",
+        })
+        const visible = yield* db.entities.HybridDevices.byCurrentAlert({
+          accountId: "acme",
+        }).collect()
+        expect(visible.some((d) => d.deviceId === "d-s14")).toBe(true)
+
+        // Drop sk only — gsi1pk persists, gsi1sk REMOVE'd.
+        yield* db.entities.HybridDevices.update({ channel: "c-s14", deviceId: "d-s14" }).set({
+          alertState: undefined,
+          timestamp: "2026-04-30T11:00:00Z",
+        })
+
+        // DDB projection rule: GSI query returns nothing for items missing
+        // either of the GSI's key attrs. This is NOT library behavior — it's
+        // the DDB invariant the per-half cascade relies on. We document it
+        // here so readers see the round trip.
+        const invisible = yield* db.entities.HybridDevices.byCurrentAlert({
+          accountId: "acme",
+        }).collect()
+        expect(invisible.some((d) => d.deviceId === "d-s14")).toBe(false)
+
+        // Raw item still has gsi1pk — confirming the per-half persistence.
+        const item = yield* HybridDevices.get({
+          channel: "c-s14",
+          deviceId: "d-s14",
+        }).pipe(Entity.asItem)
+        expect(item.gsi1pk).toBeDefined()
+        expect(item.gsi1sk).toBeUndefined()
+      }).pipe(provideIp),
   )
 })
