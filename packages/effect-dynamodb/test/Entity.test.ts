@@ -3831,8 +3831,7 @@ describe("Entity", () => {
           const eanEntries = Object.entries(call.ExpressionAttributeNames) as Array<
             [string, string]
           >
-          const aliasOf = (physical: string) =>
-            eanEntries.find(([_, v]) => v === physical)?.[0]
+          const aliasOf = (physical: string) => eanEntries.find(([_, v]) => v === physical)?.[0]
           const gsi1pkAlias = aliasOf("gsi1pk")
           const gsi1skAlias = aliasOf("gsi1sk")
           expect(gsi1pkAlias).toBeDefined()

@@ -218,29 +218,26 @@ describe("Entity update — indexPolicy v1.7.1 wiring (retain path)", () => {
     },
   )
 
-  it.effect(
-    "Entity.remove(['region']) — per-half cascade on PK; SK preserved",
-    () => {
-      // region is in pk only. Per-half cascade hits PK; SK preserved.
-      const capture: Capture = {}
-      return Effect.gen(function* () {
-        const db = yield* DynamoClient.make({
-          entities: { Assets },
-          tables: { AppTable },
-        })
-        yield* db.entities.Assets.update({ assetId: "a-1" }).remove(["region"])
-        const tx = capture.transactWriteItems
-        const item = (
-          tx as { TransactItems: Array<{ Put: { Item: Record<string, AttributeValue> } }> }
-        ).TransactItems[0]!.Put.Item
-        // gsi1pk REMOVE'd via per-half cascade override (preserve + can't-
-        // compose + region in removedSet).
-        expect(item.gsi1pk).toBeUndefined()
-        // gsi1sk preserved (untouched). v1.7.1 critical assertion.
-        expect(item.gsi1sk).toBeDefined()
-      }).pipe(Effect.provide(Layer.mergeAll(makeLayer(capture), TableLayer)), Effect.scoped)
-    },
-  )
+  it.effect("Entity.remove(['region']) — per-half cascade on PK; SK preserved", () => {
+    // region is in pk only. Per-half cascade hits PK; SK preserved.
+    const capture: Capture = {}
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Assets },
+        tables: { AppTable },
+      })
+      yield* db.entities.Assets.update({ assetId: "a-1" }).remove(["region"])
+      const tx = capture.transactWriteItems
+      const item = (
+        tx as { TransactItems: Array<{ Put: { Item: Record<string, AttributeValue> } }> }
+      ).TransactItems[0]!.Put.Item
+      // gsi1pk REMOVE'd via per-half cascade override (preserve + can't-
+      // compose + region in removedSet).
+      expect(item.gsi1pk).toBeUndefined()
+      // gsi1sk preserved (untouched). v1.7.1 critical assertion.
+      expect(item.gsi1sk).toBeDefined()
+    }).pipe(Effect.provide(Layer.mergeAll(makeLayer(capture), TableLayer)), Effect.scoped)
+  })
 
   it.effect(
     "Hierarchical demote — set surviving composites + remove leaf → SET sk truncated",

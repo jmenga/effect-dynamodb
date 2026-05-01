@@ -953,8 +953,7 @@ describe("TimeSeries — indexPolicy on append", () => {
         const eanEntries = Object.entries(update.ExpressionAttributeNames) as Array<
           [string, string]
         >
-        const aliasOf = (physical: string) =>
-          eanEntries.find(([_, v]) => v === physical)?.[0]
+        const aliasOf = (physical: string) => eanEntries.find(([_, v]) => v === physical)?.[0]
         const gsi2pkAlias = aliasOf("gsi2pk")
         const gsi2skAlias = aliasOf("gsi2sk")
         expect(gsi2pkAlias).toBeDefined()

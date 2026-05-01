@@ -635,7 +635,14 @@ export const composeGsiKeysForUpdatePolicyAware = (
         sets[index.sk.field] =
           skOutcome.length === skComposites.length
             ? composeSk(schema, entityType, entityVersion, index, merged)
-            : composeSkPrefixUpTo(schema, entityType, entityVersion, index, merged, skOutcome.length)
+            : composeSkPrefixUpTo(
+                schema,
+                entityType,
+                entityVersion,
+                index,
+                merged,
+                skOutcome.length,
+              )
       }
       // noop — emit nothing for this half.
     }

@@ -2689,40 +2689,42 @@ describeConnected("indexPolicy v1.7.1 integration tests (closes #41)", () => {
   )
 
   // ----- Scenario 9: Hierarchical truncation via set+remove -----
-  it.effect("scenario 9 — hierarchical truncation: set surviving + remove leaf → SET sk truncated", () =>
-    Effect.gen(function* () {
-      const db = yield* DynamoClient.make({
-        entities: { HierAssets },
-        tables: { HierTable },
-      })
+  it.effect(
+    "scenario 9 — hierarchical truncation: set surviving + remove leaf → SET sk truncated",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { HierAssets },
+          tables: { HierTable },
+        })
 
-      yield* db.entities.HierAssets.put({
-        assetId: "rack-9",
-        region: "americas",
-        country: "us",
-        city: "sf",
-        site: "datacenter-1",
-      })
+        yield* db.entities.HierAssets.put({
+          assetId: "rack-9",
+          region: "americas",
+          country: "us",
+          city: "sf",
+          site: "datacenter-1",
+        })
 
-      // Demote — drop site, keep country+city via set; structural rule
-      // composes the leading prefix [country, city]. SET sk truncated.
-      // PK untouched (region not in payload, not in removedSet).
-      yield* db.entities.HierAssets.update({ assetId: "rack-9" })
-        .set({ country: "us", city: "sf" })
-        .remove(["site"])
+        // Demote — drop site, keep country+city via set; structural rule
+        // composes the leading prefix [country, city]. SET sk truncated.
+        // PK untouched (region not in payload, not in removedSet).
+        yield* db.entities.HierAssets.update({ assetId: "rack-9" })
+          .set({ country: "us", city: "sf" })
+          .remove(["site"])
 
-      const item = yield* HierAssets.get({ assetId: "rack-9" }).pipe(Entity.asItem)
-      // PK preserved (region untouched).
-      expect(item.gsi1pk).toBeDefined()
-      // SK SET to truncated leading prefix.
-      expect((item.gsi1sk as string)).toBe("$ip-test#v1#hierasset#country_us#city_sf")
+        const item = yield* HierAssets.get({ assetId: "rack-9" }).pipe(Entity.asItem)
+        // PK preserved (region untouched).
+        expect(item.gsi1pk).toBeDefined()
+        // SK SET to truncated leading prefix.
+        expect(item.gsi1sk as string).toBe("$ip-test#v1#hierasset#country_us#city_sf")
 
-      // begins_with query at city level still finds the asset.
-      const atRegion = yield* db.entities.HierAssets.byLocation({
-        region: "americas",
-      }).collect()
-      expect(atRegion.some((a) => a.assetId === "rack-9")).toBe(true)
-    }).pipe(provideHier),
+        // begins_with query at city level still finds the asset.
+        const atRegion = yield* db.entities.HierAssets.byLocation({
+          region: "americas",
+        }).collect()
+        expect(atRegion.some((a) => a.assetId === "rack-9")).toBe(true)
+      }).pipe(provideHier),
   )
 
   // ----- Scenario 10: Hole pattern + sparse → REMOVE sk -----
@@ -2840,44 +2842,46 @@ describeConnected("indexPolicy v1.7.1 integration tests (closes #41)", () => {
   )
 
   // ----- Scenario 13: Multi-writer concurrent updates -----
-  it.effect("scenario 13 — multi-writer sequential updates produce expected combined GSI state", () =>
-    Effect.gen(function* () {
-      const db = yield* DynamoClient.make({
-        entities: { HybridDevices },
-        tables: { IpTable },
-      })
+  it.effect(
+    "scenario 13 — multi-writer sequential updates produce expected combined GSI state",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { HybridDevices },
+          tables: { IpTable },
+        })
 
-      // Initial state — full composites set on put.
-      yield* db.entities.HybridDevices.put({
-        channel: "c-s13",
-        deviceId: "d-s13",
-        accountId: "acme",
-        alertState: "active",
-        timestamp: "2026-04-30T10:00:00Z",
-      })
+        // Initial state — full composites set on put.
+        yield* db.entities.HybridDevices.put({
+          channel: "c-s13",
+          deviceId: "d-s13",
+          accountId: "acme",
+          alertState: "active",
+          timestamp: "2026-04-30T10:00:00Z",
+        })
 
-      // Enrichment writer fires.
-      yield* db.entities.HybridDevices.update({ channel: "c-s13", deviceId: "d-s13" }).set({
-        accountId: "newAcct",
-      })
-      // Telemetry writer fires.
-      yield* db.entities.HybridDevices.update({ channel: "c-s13", deviceId: "d-s13" }).set({
-        alertState: "cleared",
-        timestamp: "2026-04-30T11:00:00Z",
-      })
+        // Enrichment writer fires.
+        yield* db.entities.HybridDevices.update({ channel: "c-s13", deviceId: "d-s13" }).set({
+          accountId: "newAcct",
+        })
+        // Telemetry writer fires.
+        yield* db.entities.HybridDevices.update({ channel: "c-s13", deviceId: "d-s13" }).set({
+          alertState: "cleared",
+          timestamp: "2026-04-30T11:00:00Z",
+        })
 
-      // Both writes preserved end-to-end. Final GSI state under newAcct +
-      // cleared.
-      const final = yield* db.entities.HybridDevices.byCurrentAlert({
-        accountId: "newAcct",
-      }).collect()
-      expect(final.some((d) => d.deviceId === "d-s13")).toBe(true)
-      // Stale account still empty.
-      const stale = yield* db.entities.HybridDevices.byCurrentAlert({
-        accountId: "acme",
-      }).collect()
-      expect(stale.some((d) => d.deviceId === "d-s13")).toBe(false)
-    }).pipe(provideIp),
+        // Both writes preserved end-to-end. Final GSI state under newAcct +
+        // cleared.
+        const final = yield* db.entities.HybridDevices.byCurrentAlert({
+          accountId: "newAcct",
+        }).collect()
+        expect(final.some((d) => d.deviceId === "d-s13")).toBe(true)
+        // Stale account still empty.
+        const stale = yield* db.entities.HybridDevices.byCurrentAlert({
+          accountId: "acme",
+        }).collect()
+        expect(stale.some((d) => d.deviceId === "d-s13")).toBe(false)
+      }).pipe(provideIp),
   )
 
   // ----- Scenario 14: DDB projection invariant (documented, not library behavior) -----
