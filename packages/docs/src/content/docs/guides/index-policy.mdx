@@ -115,7 +115,7 @@ The "noop with stale risk" row is the one place sparse vs preserve actually diff
 // Lifecycle: alertState is the only sk composite, and it's owned by a
 // single ingest writer. Declaring sk: sparse means "if my event doesn't
 // have an alertState, drop my sk key — the item shouldn't be in this GSI."
-yield* db.entities.AlertEvents.put({
+yield* db.entities.Devices.put({
   channel: "c-1",
   deviceId: "d-1",
   accountId: "acme",
@@ -126,7 +126,7 @@ yield* db.entities.AlertEvents.put({
 // "No alert this event" — alertState explicitly undefined. sk touched
 // (alertState is in payload), can't compose (empty leading prefix) →
 // sparse → REMOVE sk. pk untouched → preserved.
-yield* db.entities.AlertEvents.update({ channel: "c-1", deviceId: "d-1" }).set({
+yield* db.entities.Devices.update({ channel: "c-1", deviceId: "d-1" }).set({
   alertState: undefined,
   timestamp: "2026-04-30T11:00:00Z",
 })
@@ -139,9 +139,9 @@ yield* db.entities.AlertEvents.update({ channel: "c-1", deviceId: "d-1" }).set({
 
 ```typescript region="multi-writer" example="guide-index-policy.ts"
 // Item exists with all composites populated.
-yield* db.entities.AlertEvents.put({
-  channel: "c-1",
-  deviceId: "d-1",
+yield* db.entities.Devices.put({
+  channel: "c-2",
+  deviceId: "d-2",
   accountId: "acme",
   alertState: "active",
   timestamp: "2026-04-30T10:00:00Z",
@@ -150,7 +150,7 @@ yield* db.entities.AlertEvents.put({
 // Stamp writer — touches a non-composite attribute. Both halves untouched
 // → both preserved. (v1.7.0 would have REMOVE'd sk because sparse fired
 // on the untouched sk half.)
-yield* db.entities.AlertEvents.update({ channel: "c-1", deviceId: "d-1" }).set({
+yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).set({
   published: "2026-04-30",
 })
 // Item still visible in GSI under acme + active.
@@ -158,20 +158,20 @@ yield* db.entities.AlertEvents.update({ channel: "c-1", deviceId: "d-1" }).set({
 // Enrichment writer rotates the account. pk touched → SET pk full
 // (account#newAcct). sk untouched → noop. Item re-indexes under newAcct;
 // stored gsi1sk unchanged.
-yield* db.entities.AlertEvents.update({ channel: "c-1", deviceId: "d-1" }).set({
+yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).set({
   accountId: "newAcct",
 })
 
 // Telemetry writer fires fresh. sk touched → SET sk full
 // (alert#active#ts#T2). pk untouched → noop.
-yield* db.entities.AlertEvents.update({ channel: "c-1", deviceId: "d-1" }).set({
+yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).set({
   alertState: "active",
   timestamp: "2026-04-30T11:00:00Z",
 })
 
 // Telemetry "no alert" event — sk touched, can't compose, sparse →
 // REMOVE sk. pk preserved. Item invisible in GSI but gsi1pk persists.
-yield* db.entities.AlertEvents.update({ channel: "c-1", deviceId: "d-1" }).set({
+yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).set({
   alertState: undefined,
   timestamp: "2026-04-30T12:00:00Z",
 })
@@ -180,7 +180,7 @@ yield* db.entities.AlertEvents.update({ channel: "c-1", deviceId: "d-1" }).set({
 // untouched, value still acme from way back. Item re-visible under
 // newAcct + new sk — WITHOUT the enrichment writer re-firing. This is
 // the critical multi-writer property the v1.7.1 per-key roll-up enables.
-yield* db.entities.AlertEvents.update({ channel: "c-1", deviceId: "d-1" }).set({
+yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).set({
   alertState: "active",
   timestamp: "2026-04-30T13:00:00Z",
 })
