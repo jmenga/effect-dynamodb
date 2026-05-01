@@ -867,7 +867,7 @@ import { KeyComposer } from "effect-dynamodb"
 | `composeIndexKeys` | `(schema, entity, index, record) => Record` | Compose all key attributes for an index |
 | `tryComposeIndexKeys` | `(schema, entity, index, record) => Record \| undefined` | Non-throwing variant for sparse GSIs |
 | `composeAllKeys` | `(schema, entity, indexes, record) => Record` | Compose keys for all indexes |
-| `composeGsiKeysForUpdatePolicyAware` | `(schema, entity, indexes, updates, keyRecord, { removedSet? }) => { sets, removes }` | Policy-aware GSI key composition for update/append (sparse/preserve per `indexPolicy`) |
+| `composeGsiKeysForUpdatePolicyAware` | `(schema, entity, indexes, updates, keyRecord, { removedSet? }) => { sets, removes }` | Policy-aware GSI key composition for update/append. Implements v3 per-half structural composition + policy-aware hole detection (see `indexPolicy` guide). |
 | `composeSortKeyPrefix` | `(schema, entity, index, composites) => string` | Partial SK prefix for `begins_with` queries |
 | `extractComposites` | `(keyPart, record) => string[]` | Extract composite attribute values from a record |
 | `tryExtractComposites` | `(keyPart, record) => string[] \| undefined` | Non-throwing variant |
@@ -879,8 +879,8 @@ import { KeyComposer } from "effect-dynamodb"
 |------|-------------|
 | `KeyPart` | `{ field: string, composite: string[] }` |
 | `IndexDefinition` | `{ pk: KeyPart, sk: KeyPart, index?, collection?, type?, casing?, indexPolicy? }` |
-| `IndexPolicyAttr` | `"sparse" \| "preserve"` |
-| `IndexPolicy` | `(item) => Partial<Record<string, IndexPolicyAttr>>` |
+| `IndexPolicyKey` | `"sparse" \| "preserve"` |
+| `IndexPolicy` | `{ pk?: IndexPolicyKey, sk?: IndexPolicyKey }` (each key defaults to `"preserve"` when omitted) |
 | `GsiUpdateResult` | `{ sets: Record<string, string>, removes: ReadonlyArray<string> }` |
 
 ---
@@ -1180,6 +1180,7 @@ import {
   ValidationError, TransactionCancelled, TransactionOverflow,
   UniqueConstraintViolation, OptimisticLockError,
   ItemDeleted, ItemNotDeleted,
+  CompositeKeyHoleError, CompositeNullableError,
   RefNotFound, AggregateAssemblyError,
   AggregateDecompositionError, AggregateTransactionOverflow,
   CascadePartialFailure, VersionConflict,
@@ -1202,6 +1203,8 @@ import {
 | `OptimisticLockError` | `"OptimisticLockError"` | Version mismatch on `expectedVersion()` |
 | `ItemDeleted` | `"ItemDeleted"` | Item is soft-deleted (get returns this instead of the item) |
 | `ItemNotDeleted` | `"ItemNotDeleted"` | Restore called on an item that isn't soft-deleted |
+| `CompositeKeyHoleError` | `"CompositeKeyHoleError"` | EDD-9024 — hole pattern under `'preserve'` policy on a half (an absent composite at position `i` with a present composite at `j > i`). Carries `entityType`, `indexName`, `clearedComposite`, `trailingComposite`, positions, `half` (`"pk"` or `"sk"`). |
+| `CompositeNullableError` | `"CompositeNullableError"` | EDD-9025 — composite attribute Schema includes `null`. Raised at `Entity.make()` time. Carries `entityType`, `surface` (e.g. `"primaryKey"`, `"index:..."`, `"unique:..."`), `compositeAttribute`, `schemaPath`. |
 | `RefNotFound` | `"RefNotFound"` | Referenced entity not found during ref hydration (`entity`, `field`, `refEntity`, `refId`) |
 | `AggregateAssemblyError` | `"AggregateAssemblyError"` | Aggregate read path failed — missing items, structural violations, or decode errors (`aggregate`, `reason`, `key`) |
 | `AggregateDecompositionError` | `"AggregateDecompositionError"` | Aggregate write path failed — schema validation or structural error (`aggregate`, `member`, `reason`) |

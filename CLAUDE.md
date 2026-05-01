@@ -315,13 +315,16 @@ pnpm --filter @effect-dynamodb/doctest test:connected  # Runtime execution (need
 Before committing:
 1. `pnpm lint` — zero lint/format errors (Biome)
 2. `pnpm check` — zero type errors
-3. `pnpm test` — all tests pass
-4. `pnpm --filter @effect-dynamodb/doctest test` — doc snippet sync verification passes
-5. `npx tsx examples/<name>.ts` — examples run against DynamoDB Local (`docker run -p 8000:8000 amazon/dynamodb-local`). Run after changes to Entity, Query, Table, DynamoSchema, KeyComposer, Collection, Transaction, or Errors.
-6. New modules must have corresponding test files in `test/`
-7. New errors must use `Data.TaggedError`
-8. New services must follow `Context.Service` pattern
-9. New or updated doc pages must have a backing example file with region markers
+3. `pnpm test` — all unit tests pass (uses `vitest.config.ts`; does NOT run the connected suite)
+4. `pnpm --filter effect-dynamodb test:connected` — **all integration tests pass against DynamoDB Local** (uses `vitest.connected.ts`; requires `docker run -d --rm -p 8000:8000 amazon/dynamodb-local`). **Mandatory** for any PR that touches `KeyComposer`, `Entity`, `Query`, `Collection`, `Transaction`, `Aggregate`, `EventStore`, `Errors`, the `internal/` Entity helpers, or any test fixture. Do NOT skip on the assumption that unit tests cover the same ground — the connected suite catches end-to-end fixture drift, schema-level type widening that only fails on real DDB writes, and policy-aware GSI behavior that mocks can't reproduce.
+5. `pnpm --filter @effect-dynamodb/doctest test` — doc snippet sync verification passes
+6. `npx tsx examples/<name>.ts` — examples run against DynamoDB Local (`docker run -p 8000:8000 amazon/dynamodb-local`). Run after changes to Entity, Query, Table, DynamoSchema, KeyComposer, Collection, Transaction, or Errors. **Note: running an example successfully is NOT a substitute for gate 4** — examples exercise one or two scenarios; the connected suite covers the cross-product of behaviors. An agent that runs examples and skips `test:connected` has not satisfied this gate.
+7. New modules must have corresponding test files in `test/`
+8. New errors must use `Data.TaggedError`
+9. New services must follow `Context.Service` pattern
+10. New or updated doc pages must have a backing example file with region markers
+
+> **For agents:** all of the above gates must run successfully before reporting a task complete. The single most common gap is skipping gate 4 — `pnpm test:connected` requires DDB Local Docker running and is genuinely time-consuming, but it is mandatory for the modules listed there. Reporting "examples ran end-to-end against DDB Local ✓" does NOT satisfy gate 4. CI will catch the gap, but it costs a CI cycle, a stale PR review, and the agent's credibility. Run it before pushing.
 
 ## PR Conventions
 

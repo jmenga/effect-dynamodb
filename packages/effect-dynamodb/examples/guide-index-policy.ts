@@ -1,13 +1,12 @@
 /**
- * indexPolicy Guide — effect-dynamodb
+ * indexPolicy v3 Guide — effect-dynamodb
  *
- * Demonstrates per-GSI `indexPolicy` for controlling how `Entity.update` and
- * time-series `.append` handle missing composite attributes:
- *   - Default `preserve` — missing composites leave the GSI's keys alone.
- *   - Explicit `"sparse"` — missing composites REMOVE the GSI keys (item drops out).
- *   - Explicit `"preserve"` — same as default, declared for documentation.
- *   - Hybrid writers — ingest and enrichment each own disjoint composite attrs.
- *   - REMOVE cascade precedence — `Entity.remove(attr)` always drops the GSI.
+ * Demonstrates per-half `indexPolicy` for controlling how `Entity.update` and
+ * time-series `.append` handle absent composite attributes:
+ *   - Default `preserve` on both halves — absent composites leave the GSI's keys alone.
+ *   - `'sparse'` on a half — when the half is whole-half-empty, REMOVE both gsiNpk/gsiNsk.
+ *   - Hierarchical truncation (PK and SK symmetric) — absent trailing composites truncate the half to its leading prefix.
+ *   - Two drop triggers in action: `Entity.remove([attr])` cascade vs `'sparse'` + whole-half-empty.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -43,6 +42,9 @@ class Device extends Schema.Class<Device>("Device")({
   channel: Schema.String,
   deviceId: Schema.String,
   // Owned by an enrichment writer (set once, rarely changes).
+  // Schema.optional → T | undefined. EDD-9025 forbids Schema.NullOr on a
+  // composite, but Schema.optional is the right way to express "this attr
+  // may be absent."
   tenantId: Schema.optional(Schema.String),
   // Owned by the ingest writer; per-event, may be absent on non-alert events.
   alertState: Schema.optional(Schema.Literals(["active", "cleared"])),
@@ -51,7 +53,7 @@ class Device extends Schema.Class<Device>("Device")({
 // #endregion
 
 // =============================================================================
-// 2. Schema + Entity with indexPolicy on each GSI
+// 2. Schema + Entity with per-half indexPolicy on each GSI
 // =============================================================================
 
 // #region schema
@@ -67,25 +69,22 @@ const Devices = Entity.make({
     sk: { field: "sk", composite: [] },
   },
   indexes: {
-    // byAlert — sparse on alertState.
-    // When an ingest event omits alertState (plain telemetry), the policy
-    // REMOVEs the GSI keys so the device drops out of the alert view.
+    // byAlert — the membership key is `alertState`. When an event omits
+    // alertState, the PK half is whole-half-empty and sparse drops the GSI.
     byAlert: {
       name: "gsi1",
       pk: { field: "gsi1pk", composite: ["alertState"] },
       sk: { field: "gsi1sk", composite: ["deviceId"] },
-      indexPolicy: () => ({ alertState: "sparse" as const }),
+      indexPolicy: { pk: "sparse", sk: "preserve" },
     },
-    // byTenant — preserve on tenantId.
-    // Ingest writers never touch tenantId. When an ingest-side update fires,
-    // the preserve policy leaves the stored gsi2pk/gsi2sk untouched so the
-    // device remains queryable via the enrichment writer's tenant assignment.
+    // byTenant — enrichment-owned. Ingest writers never supply tenantId; on
+    // every ingest update the PK half is whole-half-empty under preserve →
+    // no-op (the enrichment writer's stored gsi2pk is left untouched).
     byTenant: {
       name: "gsi2",
       pk: { field: "gsi2pk", composite: ["tenantId"] },
       sk: { field: "gsi2sk", composite: ["deviceId"] },
-      indexPolicy: () =>
-        ({ tenantId: "preserve" as const, deviceId: "preserve" as const }) as const,
+      indexPolicy: { pk: "preserve", sk: "preserve" },
     },
   },
   timestamps: true,
@@ -104,7 +103,6 @@ const program = Effect.gen(function* () {
     tables: { AppTable },
   })
 
-  // Fresh table for the demo.
   yield* db.tables.AppTable.create()
 
   yield* Console.log("\n=== 1. put with full composites — item indexed under both GSIs ===")
@@ -128,14 +126,13 @@ const program = Effect.gen(function* () {
   yield* Console.log(`  byAlert(active): ${alertActive.length}, byTenant(acme): ${acmeTenant.length}`)
 
   yield* Console.log(
-    "\n=== 2. sparse dropout — clearing alertState removes item from byAlert ===",
+    "\n=== 2. sparse drop — omitting alertState empties the PK half + drops the GSI ===",
   )
 
   // #region sparse-drop
-  // Update WITHOUT alertState in the payload. Because byAlert declares an
-  // `indexPolicy` with alertState 'sparse', the GSI is always evaluated on
-  // every update — alertState absent from payload is treated as "not set"
-  // per the policy → REMOVE gsi1pk/gsi1sk. The item drops out of byAlert.
+  // Update WITHOUT alertState in the payload. Because byAlert declares
+  // `{ pk: 'sparse', sk: 'preserve' }`, the PK half is whole-half-empty
+  // (alertState absent) → sparse drops both gsi1pk/gsi1sk.
   yield* db.entities.Devices.update({ channel: "c-1", deviceId: "d-1" }).set({ label: "quiet" })
 
   const afterDrop = yield* db.entities.Devices.byAlert({ alertState: "active" }).collect()
@@ -145,7 +142,8 @@ const program = Effect.gen(function* () {
   assertEq(afterDrop.length, 0, "d-1 dropped from byAlert")
   yield* Console.log(`  byAlert(active) after clearing: ${afterDrop.length}`)
 
-  // byTenant preserved — the enrichment-owned half was left alone.
+  // byTenant preserved — the enrichment-owned half was left alone (preserve +
+  // whole-half-empty = no-op).
   const tenantStillThere = yield* db.entities.Devices.byTenant({ tenantId: "acme" }).collect()
   assertEq(tenantStillThere.length, 1, "byTenant still has d-1")
   yield* Console.log(`  byTenant(acme) preserved: ${tenantStillThere.length}`)
@@ -175,8 +173,9 @@ const program = Effect.gen(function* () {
     tenantId: "initech",
   })
 
-  // Later, ingest writer sets alertState. tenantId is NOT in this payload,
-  // but the preserve policy on byTenant leaves its stored keys alone.
+  // Later, ingest writer sets alertState. tenantId is NOT in this payload.
+  // byTenant's PK half is whole-half-empty under preserve → no-op (the
+  // stored gsi2pk is left intact).
   yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).set({
     alertState: "active",
   })
@@ -191,7 +190,7 @@ const program = Effect.gen(function* () {
   assertEq(finalTenant.some((d) => d.deviceId === "d-2"), true, "hybrid: d-2 in byTenant")
   yield* Console.log(`  After hybrid updates: byAlert has d-2 + byTenant has d-2`)
 
-  yield* Console.log("\n=== 5. Entity.remove() cascade — always drops the GSI ===")
+  yield* Console.log("\n=== 5. Entity.remove() cascade — explicit per-attribute drop ===")
 
   // #region cascade
   // Regardless of indexPolicy, removing a GSI composite attribute drops the
@@ -211,20 +210,20 @@ const program = Effect.gen(function* () {
     tenantAfterRemove.some((d) => d.deviceId === "d-2")
   }`)
 
-  yield* Console.log("\nAll indexPolicy scenarios passed.")
+  yield* Console.log("\nAll indexPolicy v3 scenarios passed.")
 
   yield* db.tables.AppTable.delete()
 })
 
 // =============================================================================
-// 4. Hierarchical SK pruning demo (separate program — uses its own table)
+// 4. Hierarchical SK truncation demo (separate program — uses its own table)
 // =============================================================================
 
 // #region hierarchy-model
-// A geographic asset hierarchy: region → country → city → site. Clearing a
-// trailing SK composite under preserve policy *truncates* gsi3sk to the
-// leading prefix instead of dropping the GSI entirely. The asset stays
-// queryable at the parent (coarser) hierarchy depth.
+// A geographic asset hierarchy: country → city → site. Omitting a trailing
+// SK composite (preserve policy) truncates gsi3sk to the leading prefix
+// instead of dropping the GSI entirely. The asset stays queryable at the
+// parent (coarser) hierarchy depth.
 class Asset extends Schema.Class<Asset>("Asset")({
   assetId: Schema.String,
   region: Schema.String,
@@ -245,12 +244,7 @@ const Assets = Entity.make({
       name: "gsi3",
       pk: { field: "gsi3pk", composite: ["region"] },
       sk: { field: "gsi3sk", composite: ["country", "city", "site"] },
-      indexPolicy: () => ({
-        region: "preserve" as const,
-        country: "preserve" as const,
-        city: "preserve" as const,
-        site: "preserve" as const,
-      }),
+      indexPolicy: { pk: "preserve", sk: "preserve" },
     },
   },
 })
@@ -265,7 +259,7 @@ const hierarchyProgram = Effect.gen(function* () {
   })
   yield* dbHier.tables.HierarchyTable.create()
 
-  yield* Console.log("\n=== 6. Hierarchical SK pruning — preserve-clear demotes, doesn't evict ===")
+  yield* Console.log("\n=== 6. Hierarchical SK truncation — preserve + trailing-absent demotes ===")
 
   // #region hierarchy-demo
   // Initial state — full hierarchy populated.
@@ -278,8 +272,13 @@ const hierarchyProgram = Effect.gen(function* () {
   })
   // gsi3sk = "$indexpolicy-demo#v1#asset#country_us#city_sf#site_datacenter-1"
 
-  // Asset leaves the datacenter — clear `site`. SK truncates at site (position 2).
-  yield* dbHier.entities.Assets.update({ assetId: "rack-42" }).set({ site: null })
+  // Asset leaves the datacenter — omit `site` (or set it to undefined).
+  // Under the structural rule, the SK truncates at the leading prefix
+  // [country, city] — no separate "pruning" code path.
+  yield* dbHier.entities.Assets.update({ assetId: "rack-42" }).set({
+    country: "us",
+    city: "sf",
+  })
   // gsi3sk = "$indexpolicy-demo#v1#asset#country_us#city_sf"  ← preserved at city level
   // #endregion
 
@@ -289,7 +288,7 @@ const hierarchyProgram = Effect.gen(function* () {
     region: "americas",
   }).collect()
   assertEq(atRegion.some((a) => a.assetId === "rack-42"), true, "rack-42 still in GSI after prune")
-  yield* Console.log(`  After clear-site: byLocation(americas) finds rack-42: ${
+  yield* Console.log(`  After implicit-omit-site: byLocation(americas) finds rack-42: ${
     atRegion.some((a) => a.assetId === "rack-42")
   }`)
 
@@ -297,7 +296,72 @@ const hierarchyProgram = Effect.gen(function* () {
 })
 
 // =============================================================================
-// 4. Layer + run
+// 5. Hierarchical PK truncation demo — additive in v3
+// =============================================================================
+
+// #region pk-truncate-model
+// A vehicle assigned to a fleet under an account. The PK is multi-composite —
+// under v3, the structural rule applies symmetrically to PK, so omitting a
+// trailing PK composite truncates the partition key to its leading prefix.
+// Vehicle leaves a fleet but stays queryable at the account scope.
+class Vehicle extends Schema.Class<Vehicle>("Vehicle")({
+  vehicleId: Schema.String,
+  accountId: Schema.optional(Schema.String),
+  fleetId: Schema.optional(Schema.String),
+}) {}
+
+const Vehicles = Entity.make({
+  model: Vehicle,
+  entityType: "Vehicle",
+  primaryKey: {
+    pk: { field: "pk", composite: ["vehicleId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byAccountFleet: {
+      name: "gsi4",
+      pk: { field: "gsi4pk", composite: ["accountId", "fleetId"] },
+      sk: { field: "gsi4sk", composite: [] },
+      indexPolicy: { pk: "preserve", sk: "preserve" },
+    },
+  },
+})
+// #endregion
+
+const FleetTable = Table.make({ schema: AppSchema, entities: { Vehicles } })
+
+const fleetProgram = Effect.gen(function* () {
+  const dbFleet = yield* DynamoClient.make({
+    entities: { Vehicles },
+    tables: { FleetTable },
+  })
+  yield* dbFleet.tables.FleetTable.create()
+
+  yield* Console.log("\n=== 7. Hierarchical PK truncation — symmetric with SK in v3 ===")
+
+  // #region pk-truncate-demo
+  // Initial state — vehicle assigned to a fleet under an account.
+  yield* dbFleet.entities.Vehicles.put({
+    vehicleId: "v-1",
+    accountId: "acct-1",
+    fleetId: "fleet-7",
+  })
+  // gsi4pk = "$indexpolicy-demo#v1#vehicle#accountid_acct-1#fleetid_fleet-7"
+
+  // Vehicle leaves the fleet but stays under the account — omit fleetId.
+  // PK truncates to the leading prefix [accountId] under the structural rule.
+  yield* dbFleet.entities.Vehicles.update({ vehicleId: "v-1" }).set({
+    accountId: "acct-1",
+  })
+  // gsi4pk = "$indexpolicy-demo#v1#vehicle#accountid_acct-1"
+  // Vehicle still queryable by account; just not by the prior fleet.
+  // #endregion
+
+  yield* dbFleet.tables.FleetTable.delete()
+})
+
+// =============================================================================
+// 6. Layer + run
 // =============================================================================
 
 // #region run
@@ -312,10 +376,12 @@ const HierarchyLayer = Layer.mergeAll(
   ClientLayer,
   HierarchyTable.layer({ name: "indexpolicy-demo-hier" }),
 )
+const FleetLayer = Layer.mergeAll(ClientLayer, FleetTable.layer({ name: "indexpolicy-demo-fleet" }))
 
 const main = Effect.gen(function* () {
   yield* program.pipe(Effect.provide(AppLayer))
   yield* hierarchyProgram.pipe(Effect.provide(HierarchyLayer))
+  yield* fleetProgram.pipe(Effect.provide(FleetLayer))
 })
 
 Effect.runPromise(main).then(

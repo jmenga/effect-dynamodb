@@ -6,7 +6,7 @@ description: "Flattened storage for logical Record fields — independently addr
 import { Aside } from "@astrojs/starlight/components"
 
 <Aside type="caution" title="This 'sparse' is not the indexPolicy 'sparse'">
-This guide covers the **SparseMap storage primitive** (`storedAs: DynamoModel.SparseMap()`) — flattening a logical `Record<K, V>` into per-entry top-level DynamoDB attributes. It is unrelated to the `'sparse'` value of `indexPolicy` (`indexPolicy: () => ({ attr: 'sparse' })`), which controls whether an *update* drops a *GSI* membership when a composite is missing. The two were spelled the same up to 1.5.0 and that collision was a frequent source of confusion. See [indexPolicy](/effect-dynamodb/guides/index-policy/) if you're looking for GSI membership rules.
+This guide covers the **SparseMap storage primitive** (`storedAs: DynamoModel.SparseMap()`) — flattening a logical `Record<K, V>` into per-entry top-level DynamoDB attributes. It is unrelated to the `'sparse'` value of `indexPolicy` (`indexPolicy: { pk: 'sparse', sk: 'sparse' }`), which controls whether an *update* drops a *GSI* membership when a half's composites are absent. The two were spelled the same up to 1.5.0 and that collision was a frequent source of confusion. See [indexPolicy](/effect-dynamodb/guides/index-policy/) if you're looking for GSI membership rules.
 </Aside>
 
 This guide covers the `storedAs: DynamoModel.SparseMap()` storage primitive — a logical `Record<K, V>` field on the domain model is physically stored as **independently addressable top-level DynamoDB attributes**, one per map entry.

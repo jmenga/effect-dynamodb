@@ -818,21 +818,16 @@ describe("TimeSeries — indexPolicy on append", () => {
       indexes: {
         byAccountAlert: {
           name: "gsi6",
-          pk: { field: "gsi6pk", composite: ["accountId", "alert"] },
-          sk: { field: "gsi6sk", composite: ["timestamp"] },
-          // User specifies policy for both update and append callers. At
-          // append-time the library filters down to appendInput attrs only:
-          // `accountId` is dropped (not in appendInput), leaving `alert` and
-          // `timestamp`. With no sparse-missing (appendInput has both), and
-          // accountId missing from item at append-time but filtered out of
-          // policy → implicit preserve → pk half left alone; sk half (only
-          // timestamp composite) present → SET.
-          indexPolicy: () =>
-            ({
-              accountId: "preserve" as const,
-              alert: "preserve" as const,
-              timestamp: "preserve" as const,
-            }) as const,
+          // v3 design rule: each GSI half should be entirely owned by a single
+          // writer's domain. PK is enrichment-owned (accountId, set out-of-band);
+          // SK is ingest-owned (alert + timestamp, set on every event).
+          pk: { field: "gsi6pk", composite: ["accountId"] },
+          sk: { field: "gsi6sk", composite: ["alert", "timestamp"] },
+          // PK preserve: when an ingest append fires without accountId in
+          // appendInput, the half's leading prefix is empty → no-op → stored
+          // gsi6pk left untouched. SK preserve: alert + timestamp are both in
+          // appendInput → SET on every append.
+          indexPolicy: { pk: "preserve", sk: "preserve" },
         },
       },
       timestamps: true,
@@ -899,7 +894,10 @@ describe("TimeSeries — indexPolicy on append", () => {
           name: "gsi2",
           pk: { field: "gsi2pk", composite: ["alert"] },
           sk: { field: "gsi2sk", composite: ["timestamp"] },
-          indexPolicy: () => ({ alert: "sparse" as const }),
+          // v3 per-half: sparse on pk (alert is the membership key — when
+          // an event omits it, the GSI drops). sk has timestamp in appendInput
+          // so it's always present.
+          indexPolicy: { pk: "sparse", sk: "preserve" },
         },
       },
       timestamps: true,

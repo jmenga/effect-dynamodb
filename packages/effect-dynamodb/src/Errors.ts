@@ -246,19 +246,27 @@ export class VersionConflict extends Data.TaggedError("VersionConflict")<{
 }> {}
 
 /**
- * EDD-9024 — A GSI composite at hierarchy position `i` was cleared (or
- * omitted-with-`sparse`) while a composite at position `j > i` was still
- * present in the composed payload. Composed keys can't carry holes
- * meaningfully — `acc#A#child#Y` with `parent` cleared composes to a
- * syntactically invalid prefix that no `begins_with` query would match.
+ * EDD-9024 — A GSI composite at half-position `i` was absent while a composite
+ * at position `j > i` was still present, AND the half's `indexPolicy` is
+ * `'preserve'`. Composed keys can't carry holes meaningfully — `acc#A#child#Y`
+ * with `parent` cleared composes to a syntactically invalid prefix that no
+ * `begins_with` query would match. Under `'preserve'`, the library refuses to
+ * silently drop the trailing composite and raises this error instead. Under
+ * `'sparse'`, the trailing composite is silently truncated to the leading
+ * prefix and no error is raised (and when the leading prefix is empty,
+ * the half collapses to whole-half-empty which sparse drops together with
+ * the other half).
  *
  * Raised at write time (Entity.update / time-series .append). The error
- * names the GSI, the cleared/omitted composite at position `i`, and the
- * still-present trailing composite at position `j` so callers can locate
- * the offending payload field.
+ * names the GSI, the absent composite at position `i`, and the still-present
+ * trailing composite at position `j` so callers can locate the offending
+ * payload field.
  *
- * See `DESIGN.md §7 Policy-Aware GSI Composition` (hole detection) and
- * `§7.6 Hierarchical SK Pruning` (the supported trailing-clear case).
+ * Resolutions: supply a value for the absent composite, clear (omit or
+ * `Entity.remove(...)`) all trailing composites too, or set
+ * `indexPolicy.<key>` to `'sparse'` to opt into truncate-on-hole semantics.
+ *
+ * See `DESIGN.md §7 Policy-Aware GSI Composition`.
  */
 export class CompositeKeyHoleError extends Data.TaggedError("CompositeKeyHoleError")<{
   readonly entityType: string
@@ -267,7 +275,8 @@ export class CompositeKeyHoleError extends Data.TaggedError("CompositeKeyHoleErr
   readonly trailingComposite: string
   readonly clearedPosition: number
   readonly trailingPosition: number
-  readonly half: "pk" | "sk"
+  /** Which GSI key attribute the hole is in — `"pk"` (gsiNpk) or `"sk"` (gsiNsk). */
+  readonly key: "pk" | "sk"
   /** Human-readable description, prefixed with `EDD-9024`. */
   readonly message: string
 }> {}
@@ -283,15 +292,71 @@ export const makeCompositeKeyHoleError = (params: {
   readonly trailingComposite: string
   readonly clearedPosition: number
   readonly trailingPosition: number
-  readonly half: "pk" | "sk"
+  readonly key: "pk" | "sk"
 }): CompositeKeyHoleError =>
   new CompositeKeyHoleError({
     ...params,
     message:
       `[EDD-9024] Composite key hole on GSI "${params.indexName}" of entity "${params.entityType}": ` +
-      `composite "${params.clearedComposite}" at ${params.half} position ${params.clearedPosition} was cleared ` +
-      `(or omitted under sparse policy), but composite "${params.trailingComposite}" at ${params.half} position ${params.trailingPosition} is still present. ` +
+      `composite "${params.clearedComposite}" at ${params.key} position ${params.clearedPosition} is absent, ` +
+      `but composite "${params.trailingComposite}" at ${params.key} position ${params.trailingPosition} is still present, ` +
+      `and indexPolicy.${params.key} is 'preserve'. ` +
       `Composed keys cannot carry holes — either supply a value for "${params.clearedComposite}", ` +
       `clear all trailing composites (>= position ${params.trailingPosition}) too, ` +
+      `set indexPolicy.${params.key} = 'sparse' to opt into truncate-on-hole, ` +
       `or use Entity.remove(["${params.clearedComposite}"]) to drop the whole GSI.`,
+  })
+
+/**
+ * EDD-9025 — A composite attribute on `primaryKey`, `indexes`, or a `unique`
+ * constraint has a Schema whose type union includes `null`. Composites
+ * participate in string composition (`acc#X#alert#Y`); `null` is not a
+ * meaningful slot value — only present-with-value or absent. Allowing
+ * `Schema.NullOr` / `Schema.NullishOr` / `Schema.Union([..., Schema.Null])`
+ * on a composite would let `set({ composite: null })` typecheck, then either
+ * blow up at runtime or silently produce a key with the literal string
+ * `"null"` as a slot.
+ *
+ * Raised at `Entity.make()` time. The error names the entity, the
+ * surface where the composite is declared (primary key / a GSI / a unique
+ * constraint), the offending composite attribute, and the resolved Schema
+ * path that contains `null`.
+ *
+ * Resolution: declare the attribute as `Schema.optional(...)` (which
+ * produces `T | undefined` without `null`). Sparse-pattern usage is fully
+ * supported under v3's two-way payload classification — `undefined` is
+ * "absent" for GSI composition purposes.
+ *
+ * See `DESIGN.md §7 Policy-Aware GSI Composition` (EDD-9025 footgun gate).
+ */
+export class CompositeNullableError extends Data.TaggedError("CompositeNullableError")<{
+  readonly entityType: string
+  /** "primaryKey" | "index:<name>" | "unique:<name>" */
+  readonly surface: string
+  readonly compositeAttribute: string
+  /** Resolved schema path that revealed the `null` branch. */
+  readonly schemaPath: string
+  /** Human-readable description, prefixed with `EDD-9025`. */
+  readonly message: string
+}> {}
+
+/**
+ * Build a {@link CompositeNullableError} with a formatted message. Centralises
+ * the message format so call sites (Entity.make validation paths) stay
+ * consistent.
+ */
+export const makeCompositeNullableError = (params: {
+  readonly entityType: string
+  readonly surface: string
+  readonly compositeAttribute: string
+  readonly schemaPath: string
+}): CompositeNullableError =>
+  new CompositeNullableError({
+    ...params,
+    message:
+      `[EDD-9025] Entity "${params.entityType}": composite attribute "${params.compositeAttribute}" ` +
+      `on ${params.surface} resolves to a Schema that includes \`null\` (${params.schemaPath}). ` +
+      `Composites participate in string composition and cannot be null — only present-with-value or absent. ` +
+      `Replace the nullable wrapper with \`Schema.optional(...)\` (T | undefined) to express the sparse ` +
+      `pattern, or supply a non-nullable schema for "${params.compositeAttribute}".`,
   })
