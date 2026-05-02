@@ -1002,3 +1002,193 @@ describe("Entity append — PK-composites-only GSI shape (closes #43)", () => {
     },
   )
 })
+
+// ---------------------------------------------------------------------------
+// v1.7.3 — empty-composite halves are always evaluated (closes #46)
+// ---------------------------------------------------------------------------
+//
+// Canonical fixture for #46: a Vehicle entity with the exact reproducer
+// shape — `byDeviceBinding: { pk: [deviceBinding], sk: { composite: [] } }`.
+// The SK half is a constant entity prefix. Pre-v1.7.3 the gate skipped this
+// half on every update, leaving items with `gsi3pk` SET and `gsi3sk` missing
+// → invisible to the GSI. Post-v1.7.3 the skip-predicate's `length > 0`
+// short-circuit keeps empty halves un-skipped, and `classifyHalf` (which
+// already handled empty composites correctly as `{ kind: 'set', length: 0 }`)
+// is finally reached.
+
+class Vehicle extends Schema.Class<Vehicle>("Vehicle")({
+  id: Schema.String,
+  deviceBinding: Schema.optional(Schema.String),
+  // Mixed-shape companion: a tenant-scoped GSI to prove other GSIs on the
+  // same entity continue to follow multi-writer protection.
+  tenantId: Schema.optional(Schema.String),
+  status: Schema.optional(Schema.String),
+}) {}
+
+const VehicleSchema = DynamoSchema.make({ name: "vehicle-test", version: 1 })
+
+const Vehicles = Entity.make({
+  model: Vehicle,
+  entityType: "Vehicle",
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    // Empty-composite-SK GSI — the #46 repro shape.
+    byDeviceBinding: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["deviceBinding"] },
+      sk: { field: "gsi3sk", composite: [] },
+    },
+    // Multi-writer-protected companion GSI to prove other halves still
+    // follow the skip-predicate's multi-writer protection. tenantId is NOT
+    // an entity-PK composite, so the gate must skip both halves when no
+    // payload mentions them — preserving the v1.7.1 #41 fix.
+    byTenant: {
+      name: "gsi4",
+      pk: { field: "gsi4pk", composite: ["tenantId"] },
+      sk: { field: "gsi4sk", composite: ["status"] },
+      indexPolicy: { pk: "preserve", sk: "preserve" },
+    },
+  },
+})
+
+const VehicleTable = Table.make({ schema: VehicleSchema, entities: { Vehicles } })
+const VehicleTableLayer = VehicleTable.layer({ name: "vehicle-table" })
+
+const makeVehicleMock = (capture: Capture) => ({
+  ...makeMockClient(capture),
+  getItem: () =>
+    Effect.succeed({
+      Item: {
+        pk: { S: "$vehicle-test#v1#vehicle#id_veh-1" } as AttributeValue,
+        sk: { S: "$vehicle-test#v1#vehicle" } as AttributeValue,
+        id: { S: "veh-1" } as AttributeValue,
+        __edd_e__: { S: "Vehicle" } as AttributeValue,
+      },
+    }),
+  updateItem: (input: Record<string, unknown>) => {
+    capture.updateItem = input
+    return Effect.succeed({
+      Attributes: {
+        pk: { S: "$vehicle-test#v1#vehicle#id_veh-1" } as AttributeValue,
+        sk: { S: "$vehicle-test#v1#vehicle" } as AttributeValue,
+        id: { S: "veh-1" } as AttributeValue,
+        deviceBinding: { S: "cloud#dev-1" } as AttributeValue,
+        __edd_e__: { S: "Vehicle" } as AttributeValue,
+      },
+    })
+  },
+})
+
+describe("Entity update — empty-composite-half GSI shape (closes #46)", () => {
+  it.effect(
+    "Entity.update().set({ deviceBinding }) on entity with sk: { composite: [] } produces SET clauses for BOTH gsi3pk AND gsi3sk",
+    () => {
+      // The exact #46 reproducer. Pre-v1.7.3: gsi3pk SET, gsi3sk skipped
+      // → vehicle invisible to byDeviceBinding queries. Post-v1.7.3:
+      // both halves SET; the empty SK composite produces the constant
+      // entity prefix.
+      const capture: Capture = {}
+      const layer = Layer.mergeAll(
+        Layer.succeed(DynamoClient, makeVehicleMock(capture) as any),
+        VehicleTableLayer,
+      )
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { Vehicles },
+          tables: { VehicleTable },
+        })
+        yield* db.entities.Vehicles.update({ id: "veh-1" }).set({
+          deviceBinding: "cloud#dev-1",
+        })
+        const ui = capture.updateItem as {
+          UpdateExpression?: string
+          ExpressionAttributeNames?: Record<string, string>
+          ExpressionAttributeValues?: Record<string, AttributeValue>
+        }
+        expect(ui.UpdateExpression).toBeDefined()
+        const expr = ui.UpdateExpression!
+        const setClause = expr.match(/SET\s+(.*?)(?:\s+REMOVE|$)/i)?.[1] ?? ""
+        const setNames = setClause
+          .split(",")
+          .map((s) => s.trim())
+          .map((s) => s.split("=")[0]?.trim() ?? "")
+          .filter((s) => s.startsWith("#"))
+          .map((alias) => ui.ExpressionAttributeNames?.[alias] ?? alias)
+        const setSet = new Set(setNames)
+        // v1.7.3 critical assertions for #46.
+        expect(setSet.has("gsi3pk")).toBe(true)
+        expect(setSet.has("gsi3sk")).toBe(true)
+        // No REMOVE on either half.
+        const removed = parseRemoves(ui)
+        expect(removed.has("gsi3pk")).toBe(false)
+        expect(removed.has("gsi3sk")).toBe(false)
+        // Mixed-shape negative: byTenant is NOT touched on this update —
+        // tenantId / status are absent from payload AND keyRecord, so the
+        // multi-writer protection path skips both halves (#41 preserved).
+        expect(setSet.has("gsi4pk")).toBe(false)
+        expect(setSet.has("gsi4sk")).toBe(false)
+        expect(removed.has("gsi4pk")).toBe(false)
+        expect(removed.has("gsi4sk")).toBe(false)
+      }).pipe(Effect.provide(layer), Effect.scoped)
+    },
+  )
+
+  it.effect(
+    "Entity.update().set({ unrelated }) — empty SK composite still SET (constant prefix); gsi3pk skipped (multi-writer protection)",
+    () => {
+      // Negative test for the empty-composite shape. The PK half of
+      // byDeviceBinding is NOT touched (deviceBinding is absent from
+      // payload AND keyRecord) — multi-writer protection applies → gsi3pk
+      // skipped. But the SK half IS empty-composite → always evaluated →
+      // constant prefix SET regardless. This proves the per-half nature
+      // of the gate is preserved under the reframe.
+      //
+      // Note: this asymmetry (one half SET, the other not) is correct
+      // behavior — the SK is a constant prefix that's safe to re-write
+      // every time, while the PK belongs to a writer that owns the
+      // deviceBinding attribute. If the GSI was previously composed,
+      // gsi3pk's stored value is preserved (preserve policy default);
+      // gsi3sk gets re-stamped with the same constant.
+      const capture: Capture = {}
+      const layer = Layer.mergeAll(
+        Layer.succeed(DynamoClient, makeVehicleMock(capture) as any),
+        VehicleTableLayer,
+      )
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { Vehicles },
+          tables: { VehicleTable },
+        })
+        yield* db.entities.Vehicles.update({ id: "veh-1" }).set({
+          status: "active", // touches byTenant.sk only — but tenantId absent
+        })
+        const ui = capture.updateItem as {
+          UpdateExpression?: string
+          ExpressionAttributeNames?: Record<string, string>
+        }
+        const expr = ui.UpdateExpression!
+        const setClause = expr.match(/SET\s+(.*?)(?:\s+REMOVE|$)/i)?.[1] ?? ""
+        const setNames = setClause
+          .split(",")
+          .map((s) => s.trim())
+          .map((s) => s.split("=")[0]?.trim() ?? "")
+          .filter((s) => s.startsWith("#"))
+          .map((alias) => ui.ExpressionAttributeNames?.[alias] ?? alias)
+        const setSet = new Set(setNames)
+        // PK half of byDeviceBinding skipped (multi-writer protection).
+        expect(setSet.has("gsi3pk")).toBe(false)
+        // SK half (empty composite) ALWAYS evaluated → constant prefix SET.
+        expect(setSet.has("gsi3sk")).toBe(true)
+        // byTenant.sk is touched (status in payload), but tenantId is NOT
+        // in payload OR keyRecord. Per the structural rule on the SK half
+        // alone: the SK half evaluates, but the PK half is skipped. SK
+        // value composes (status alone — see existing v1.7.1 truncation
+        // semantics). PK gsi4pk skipped (multi-writer protection).
+        expect(setSet.has("gsi4pk")).toBe(false)
+      }).pipe(Effect.provide(layer), Effect.scoped)
+    },
+  )
+})

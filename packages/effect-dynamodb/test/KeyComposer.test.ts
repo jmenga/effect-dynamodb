@@ -1301,6 +1301,202 @@ describe("KeyComposer", () => {
         expect(result.removes).toEqual([])
       })
     })
+
+    // ----------------------------------------------------------------------
+    // v1.7.3 — empty-composite halves are always evaluated (issue #46)
+    // ----------------------------------------------------------------------
+    //
+    // Canonical fixture for #46: a GSI half declared with `composite: []`.
+    // The half's value is a *constant* (the bare entity prefix) — there is
+    // no per-call decision to make and no other writer to clobber. The
+    // pre-v1.7.3 touched-predicate's `.some(...)` clauses all returned
+    // `false` for an empty composite array, classifying the half as
+    // untouched and skipping it. v1.7.3's skip-predicate short-circuits on
+    // `composites.length > 0` — empty halves are always evaluated, and
+    // `classifyHalf` (which already handled empty composites correctly as
+    // `{ kind: 'set', length: 0 }`) is finally reached.
+
+    describe("empty-composite halves are always evaluated (issue #46)", () => {
+      const emptySkIndexes = (
+        indexPolicy?: KeyComposer.IndexPolicy,
+      ): Record<string, KeyComposer.IndexDefinition> => ({
+        primary: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+        byDeviceBinding: {
+          index: "gsi3",
+          pk: { field: "gsi3pk", composite: ["deviceBinding"] },
+          sk: { field: "gsi3sk", composite: [] }, // ← empty SK composite
+          ...(indexPolicy ? { indexPolicy } : {}),
+        },
+      })
+
+      it("update touching the PK half → empty SK half ALSO emits SET (constant prefix)", () => {
+        // The exact #46 reproducer scenario. Pre-v1.7.3: gsi3pk SET,
+        // gsi3sk silently skipped. Post-v1.7.3: both halves SET.
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Vehicle",
+          1,
+          emptySkIndexes(),
+          { deviceBinding: "cloud#dev-1" },
+          { id: "veh-1" },
+        )
+        expect(result.sets.gsi3pk).toBe("$myapp#v1#vehicle#devicebinding_cloud#dev-1")
+        expect(result.sets.gsi3sk).toBe("$myapp#v1#vehicle")
+        expect(result.removes).toEqual([])
+      })
+
+      it("update with empty payload (untouched PK) still evaluates empty SK half (constant prefix)", () => {
+        // Even when no GSI composite is touched at all, the empty SK half
+        // is always evaluated — it's a constant prefix, no skipping
+        // possible. The PK half is touched via the multi-writer leak fix
+        // surface (no payload, no removedSet, no keyRecord membership) ⇒
+        // the PK half is still skipped under the multi-writer protection
+        // path. The SK half — being empty — is NOT skipped.
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Vehicle",
+          1,
+          emptySkIndexes(),
+          { unrelated: "x" },
+          { id: "veh-1" },
+        )
+        // PK skipped (multi-writer protection — composite NOT touched).
+        expect(result.sets).not.toHaveProperty("gsi3pk")
+        // SK empty composite → always evaluated → constant prefix SET.
+        expect(result.sets.gsi3sk).toBe("$myapp#v1#vehicle")
+        expect(result.removes).toEqual([])
+      })
+
+      it("symmetric — empty PK composite + non-empty SK composite", () => {
+        // Symmetry check: the gate is per-half. An empty PK composite must
+        // also always be evaluated.
+        const indexes: Record<string, KeyComposer.IndexDefinition> = {
+          primary: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+          allItems: {
+            index: "gsi1",
+            pk: { field: "gsi1pk", composite: [] }, // ← empty PK composite
+            sk: { field: "gsi1sk", composite: ["createdAt"] },
+          },
+        }
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Item",
+          1,
+          indexes,
+          { createdAt: "2026-04-30T00:00:00Z" },
+          { id: "i-1" },
+        )
+        expect(result.sets.gsi1pk).toBe("$myapp#v1#item")
+        // Default casing is "lowercase" — keys are lowercased end-to-end.
+        expect(result.sets.gsi1sk).toBe("$myapp#v1#item#createdat_2026-04-30t00:00:00z")
+        expect(result.removes).toEqual([])
+      })
+
+      it("both halves empty → both SET as constant prefixes", () => {
+        // Degenerate-but-valid: both halves are bare entity prefixes.
+        // Useful for "all items of an entity type" lookup GSIs.
+        const indexes: Record<string, KeyComposer.IndexDefinition> = {
+          primary: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+          allByType: {
+            index: "gsi1",
+            pk: { field: "gsi1pk", composite: [] },
+            sk: { field: "gsi1sk", composite: [] },
+          },
+        }
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Item",
+          1,
+          indexes,
+          {},
+          { id: "i-1" },
+        )
+        expect(result.sets.gsi1pk).toBe("$myapp#v1#item")
+        expect(result.sets.gsi1sk).toBe("$myapp#v1#item")
+        expect(result.removes).toEqual([])
+      })
+
+      it("empty SK composite + sparse policy → SET (policy irrelevant for empty composites)", () => {
+        // `classifyHalf`'s contract: empty composites return
+        // { kind: 'set', length: 0 } regardless of policy. The skip-
+        // predicate now reaches that branch even under sparse.
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Vehicle",
+          1,
+          emptySkIndexes({ pk: "sparse", sk: "sparse" }),
+          { deviceBinding: "cloud#dev-1" },
+          { id: "veh-1" },
+        )
+        expect(result.sets.gsi3pk).toBe("$myapp#v1#vehicle#devicebinding_cloud#dev-1")
+        expect(result.sets.gsi3sk).toBe("$myapp#v1#vehicle")
+        expect(result.removes).toEqual([])
+      })
+
+      it("empty SK composite + Entity.remove on PK composite → PK REMOVE'd, empty SK still SET", () => {
+        // Cascade override on the PK half should not affect the empty SK
+        // half. SK is always evaluated; PK structural rule fires under
+        // cascade and (since deviceBinding is now removed → no leading
+        // prefix) the cascade override drops the PK key.
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Vehicle",
+          1,
+          emptySkIndexes({ pk: "preserve", sk: "preserve" }),
+          {},
+          { id: "veh-1" },
+          { removedSet: new Set(["deviceBinding"]) },
+        )
+        // PK touched via removedSet, can't compose → cascade override → REMOVE.
+        expect(result.removes).toContain("gsi3pk")
+        // SK empty composite → still always evaluated → constant prefix SET.
+        expect(result.sets.gsi3sk).toBe("$myapp#v1#vehicle")
+      })
+
+      it("regression equivalence — multi-writer leak still closed under empty-half symmetry", () => {
+        // Two GSIs on the same entity: one with non-empty composites
+        // (multi-writer-protected) and one with an empty SK composite.
+        // The stamp-style writer touches neither GSI's payload composites
+        // — the multi-writer GSI's halves stay skipped (preserves #41
+        // fix), but the empty-SK-composite half on the OTHER GSI is still
+        // evaluated.
+        const indexes: Record<string, KeyComposer.IndexDefinition> = {
+          primary: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+          byCurrentAlert: {
+            index: "gsi1",
+            pk: { field: "gsi1pk", composite: ["accountId"] },
+            sk: { field: "gsi1sk", composite: ["alertState"] },
+            indexPolicy: { pk: "preserve", sk: "sparse" },
+          },
+          byDeviceBinding: {
+            index: "gsi3",
+            pk: { field: "gsi3pk", composite: ["deviceBinding"] },
+            sk: { field: "gsi3sk", composite: [] },
+            indexPolicy: { pk: "preserve", sk: "preserve" },
+          },
+        }
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Vehicle",
+          1,
+          indexes,
+          { published: "2026-04-30" }, // stamp writer — non-composite
+          { id: "veh-1" },
+        )
+        // Multi-writer GSI: both halves untouched → noop. v1.7.1 fix preserved.
+        expect(result.sets).not.toHaveProperty("gsi1pk")
+        expect(result.sets).not.toHaveProperty("gsi1sk")
+        expect(result.removes).not.toContain("gsi1pk")
+        expect(result.removes).not.toContain("gsi1sk")
+        // byDeviceBinding: PK untouched → skipped (multi-writer protection),
+        // SK empty composite → always evaluated → constant prefix SET.
+        expect(result.sets).not.toHaveProperty("gsi3pk")
+        expect(result.sets.gsi3sk).toBe("$myapp#v1#vehicle")
+      })
+    })
   })
 
   describe("composeSkPrefixUpTo", () => {
