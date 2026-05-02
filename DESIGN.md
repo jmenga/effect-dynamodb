@@ -642,19 +642,45 @@ indexes: {
 
 `set({ attr: null })` is no longer a separate "drop signal" — it still REMOVEs the attribute from the item (the data-attribute REMOVE clause), but it does not separately cascade-drop the GSI keys. Drop-via-cascade goes through `Entity.remove([attr])` instead.
 
-**Per-half evaluation gate (v1.7.1, broadened in v1.7.2 — closes the multi-writer leak AND the PK-composites-only regression).** Before the structural rule even runs, each half is checked for whether the writer touched it. **If a half is untouched, it is skipped entirely — no SET, no REMOVE, no policy fires.** A half is "touched" iff at least one of its composite names appears in the update payload (regardless of value, including `undefined`) OR appears in `keyRecord` (the entity primary-key attributes carried into the composer alongside the payload) OR appears in `Entity.remove([...])`:
+**Per-half evaluation gate (reframed in v1.7.3 as a skip-predicate — closes the empty-composite-half regression AND the class of degenerate-case bugs).** Before the structural rule even runs, each half is asked a single question: *can this half be safely skipped?* The answer depends only on whether the gate's purpose — **multi-writer protection** — actually applies. **If the half cannot be safely skipped, it is evaluated** (SET / REMOVE / noop per the structural rule). The skip predicate is:
 
 ```ts
-const halfTouched =
-  halfComposites.some((c) => c in updatePayload) ||
-  halfComposites.some((c) => c in keyRecord) ||   // v1.7.2 (closes #43)
-  halfComposites.some((c) => removedSet?.has(c))
-if (!halfTouched) continue  // leave this half's key attribute alone
+// Skip evaluation only when multi-writer protection actually applies:
+// composites exist (otherwise the half value is a constant prefix and
+// nothing to multi-writer-clobber); no explicit removal of one of the
+// half's composites; AND every composite is absent from both
+// `updatePayload` and `keyRecord` (so this writer is genuinely not
+// claiming ownership of this half on this call).
+const shouldSkip =
+  halfComposites.length > 0 &&
+  !halfHasRemoved &&
+  halfComposites.every((c) => !(c in updatePayload) && !(c in keyRecord))
+if (shouldSkip) continue  // leave this half's key attribute alone
 ```
 
-Why two input sources, not one: composites that are *also* entity primary-key composites (e.g. `byChannel: { pk: [channel], sk: [deviceId] }` on an entity with `primaryKey: [channel, deviceId]`) arrive through `keyRecord`, never through `updatePayload` — the writer addresses the row by key, doesn't restate those values in `.set({...})`, and `.append()` deliberately separates structural fields from the SET clause. The v1.7.1 gate looked only at `updatePayload` and so classified such halves as "untouched" on every call, skipping evaluation entirely; the half's `gsiNpk` / `gsiNsk` were never composed and the item was invisible to the GSI. v1.7.2 broadens "touched" to also count `keyRecord` membership: any GSI half whose composites are entity-PK composites is now evaluated on every write that has a `keyRecord`, and the structural rule composes the half from the always-present PK values. The behavior is idempotent — re-SETting the same composed value from immutable PK composites produces the same key — so there is no multi-writer regression from broadening the gate (see issue #43 for the full analysis and the multi-writer preservation argument).
+**Why a skip-predicate, not a touched-predicate.** The gate exists for exactly one reason: to prevent writer A from clobbering keys for halves it doesn't own when writer B does own them. The skip-predicate states that purpose *directly* — "skip iff multi-writer protection applies." Every degenerate case (empty composite list, composites entirely entity-PK, future shapes) negates `shouldSkip` for an obvious structural reason, without enumeration. The pre-v1.7.3 framing inverted the question into a "touched" predicate that had to enumerate every case for which the half *should* be evaluated as a chain of `||` clauses. Each missed shape required another tactical patch — v1.7.1 missed the multi-writer leak (#41), v1.7.2 missed the PK-composites-only case (#43), v1.7.2 then missed the empty-composite-half case (#46). The skip-predicate closes the entire class structurally.
 
-Why: `'sparse'`'s contract is *with the half's owner*. If the writer doesn't touch any of the half's composites — neither in payload, nor through the key-addressed structural inputs — they aren't claiming ownership of this half on this call. The writer-scope concept #38 was reaching for falls out of payload-plus-keyRecord contents naturally.
+**Walk-through against the canonical shapes.** Each row confirms the skip-predicate is observably equivalent to the cumulative tactical fixes of v1.7.1 + v1.7.2 (no API changes, no behavior changes for existing inputs):
+
+| Half shape | Skip-predicate evaluates to | Outcome |
+|---|---|---|
+| Empty composite list (`composite: []`) | `length > 0` is false → not skipped | Evaluate (constant entity prefix) — **closes #46** |
+| PK-composites-only (composite ∈ keyRecord) | `every(NOT in keyRecord)` is false → not skipped | Evaluate (idempotent SET) — preserves v1.7.2 #43 fix |
+| Multi-writer not touching this half | `every()` true, length > 0, !hasRemoved → **skipped** | Skip — preserves v1.7.1 #41 fix |
+| Caller asserts authority via payload | `every(NOT in payload)` is false → not skipped | Evaluate |
+| Caller invalidates via `Entity.remove([...])` | `!halfHasRemoved` is false → not skipped | Evaluate (cascade override may apply under preserve) |
+
+**Why two input sources are checked, not one** (preserved from v1.7.2). Composites that are *also* entity primary-key composites (e.g. `byChannel: { pk: [channel], sk: [deviceId] }` on an entity with `primaryKey: [channel, deviceId]`) arrive through `keyRecord`, never through `updatePayload` — the writer addresses the row by key, doesn't restate those values in `.set({...})`, and `.append()` deliberately separates structural fields from the SET clause. The skip-predicate's `every(NOT in keyRecord)` clause keeps these halves un-skipped on every write, and the structural rule composes them from the always-present PK values. The behavior is idempotent — re-SETting the same composed value from immutable PK composites produces the same key — so there is no multi-writer regression (see issue #43).
+
+**Why empty composite lists are always evaluated** (NEW in v1.7.3). For a half with `composite: []`, the value is a *constant* (the bare entity / collection prefix). There is nothing for another writer to clobber, no per-call decision to make. The pre-v1.7.3 touched-predicate's `.some(...)` clauses all returned `false` for an empty array, classifying the half as untouched and skipping it — leaving items with one half SET and the other missing, invisible to the GSI (#46). The skip-predicate's leading `length > 0` guard short-circuits before `every()` is ever asked, and `classifyHalf` (which already correctly handled empty composites as `{ kind: 'set', length: 0 }`) is finally reached.
+
+**Why `'sparse'` still works.** `'sparse'`'s contract is *with the half's owner*. If the writer doesn't touch any of the half's composites — neither in payload, nor through the key-addressed structural inputs — they aren't claiming ownership of this half on this call, and the skip-predicate skips the half exactly as before. The writer-scope concept #38 was reaching for falls out of payload-plus-keyRecord contents naturally.
+
+**Design history.** The gate has been progressively reframed:
+- **v1.7.0** introduced the touched-predicate (`updatePayload`-only) to fix the v1.6 GSI-wide cascade. Closed the original GSI-blast bug but introduced the multi-writer leak.
+- **v1.7.1** added the `removedSet` arm to the touched-predicate (multi-writer leak fix — #41).
+- **v1.7.2** added the `keyRecord` arm to the touched-predicate (PK-composites-only fix — #43).
+- **v1.7.3** reframed the predicate from "list cases for which to evaluate" to "list the single condition for which it is safe to skip." Closes the empty-composite-half regression (#46) and any future degenerate-case gap of the same shape — the skip predicate's negation is the cumulative `||`-chain of all prior tactical fixes plus the structural `length === 0` short-circuit.
 
 End-to-end consequences for the canonical multi-writer scenarios:
 
@@ -725,7 +751,7 @@ Naming any one composite of a half is enough — `Entity.remove` doesn't require
 
 For each half (PK then SK), independently:
 
-1. **Evaluation gate.** If no composite of this half is in `payload` AND no composite of this half is in `keyRecord` AND no composite of this half is in `removedSet` → `noop` (skip — leave the stored key untouched). Otherwise the half is **touched**, continue. (`keyRecord` membership is the v1.7.2 broadening — see #43; entity-PK composites are always present in `keyRecord` and so any GSI half whose composites are entity-PK composites is touched on every write.)
+1. **Evaluation gate (skip-predicate, v1.7.3).** If the half's composite list is non-empty AND no composite is in `removedSet` AND every composite is absent from both `payload` AND `keyRecord` → `noop` (skip — leave the stored key untouched, multi-writer protection applies). Otherwise the half is **evaluated**, continue. (Halves with empty composite lists short-circuit on the leading `length > 0` guard and are always evaluated — the value is a constant prefix; closes #46. Halves whose composites are entity-PK composites fail the `every(NOT in keyRecord)` clause and are always evaluated — the structural rule composes idempotently from the immutable PK values; closes #43.)
 2. **Structural rule.** Walk the half's composite list left-to-right. Find the longest leading prefix of present values in `M`.
 3. **Classify the outcome:**
    - **Compose succeeded** (leading prefix is non-empty AND no hole — i.e. all absent composites are at trailing positions): SET this half's key from the leading prefix. Done.
@@ -794,15 +820,18 @@ entity.update(key).remove(['alertState']).asEffect()
 
 **v1.7.0 / v1.7.1 → v1.7.2 PK-composites-only regression callout (closes #43).** The v1.7.1 per-half gate consulted only `updatePayload`. For GSI halves whose composites are entity-PK composites (a common pattern: tenant-scoped queries, entity-key-projected GSIs), `updatePayload` never carried those composites — the writer addresses the row by key, never restates them in `.set({...})`, and `.append()` further filtered PK composites out of its payload before passing to the composer. The gate saw both halves as untouched, skipped GSI evaluation entirely, and never wrote `gsiNpk` / `gsiNsk`. Items written under v1.7.0 / v1.7.1 against such GSIs were invisible to GSI queries. v1.7.2 fixes this in two places: the gate now also counts `keyRecord` membership (so PK composites carried alongside the payload count as "touched"), AND `Entity.append()` no longer filters PK composites out of the payload it passes to the composer (the filter never solved a real problem and silently broke this pattern). Affected items repair on the next `Entity.update()` against them — the gate now fires, the structural rule composes the immutable PK values, and the missing GSI keys are SET. No data migration needed; reads via the GSI start returning these items as their next update lands.
 
+**v1.7.0 / v1.7.1 / v1.7.2 → v1.7.3 empty-composite-half regression callout (closes #46).** The v1.7.2 per-half gate, even after the `keyRecord` broadening, still classified halves with **empty composite lists** as untouched. For an empty composite array, every `.some(...)` clause in the touched-predicate trivially returned `false`, so `Entity.update()` would skip composing the half entirely — leaving items with one half SET and the other missing, invisible to the GSI. The shape is common in single-table designs: a sparse "lookup" GSI like `byDeviceBinding: { pk: [deviceBinding], sk: { composite: [] } }` writes the SK as a constant entity prefix on every visible item, but the v1.7.0–v1.7.2 gate skipped the SK because no composite of an empty list can be "in" anything. v1.7.3 reframes the gate as a skip-predicate keyed on the gate's actual purpose (multi-writer protection); the leading `length > 0` guard short-circuits empty-composite halves to *always evaluated*, and `classifyHalf` (which already handled empty composites correctly as `{ kind: 'set', length: 0 }`) is finally reached. Affected items repair on the next `Entity.update()` — the next write composes the missing half from the constant prefix and the item rejoins the GSI. No data migration needed.
+
 #### Canonical GSI-composite test-fixture shapes
 
-Test coverage for the policy-aware composer must span the canonical GSI-composite shapes. Missing one shape (as the v1.7.1 fixture matrix did with PK-composites-only) leads to consumer-facing regressions. Future work in this area must verify each shape:
+Test coverage for the policy-aware composer must span the canonical GSI-composite shapes. Missing one shape (as the v1.7.1 fixture matrix did with PK-composites-only, and as the v1.7.2 matrix did with empty-composite halves) leads to consumer-facing regressions. Future work in this area must verify each shape:
 
 1. **Multi-writer GSI** — composites split across writers (e.g. enrichment-owned PK composite + telemetry-owned SK composites). The per-half gate must skip halves the current writer doesn't touch. Anchor scenario for the `'preserve'` contract.
 2. **PK-composites-only GSI** — composites entirely subset of the entity primary key (e.g. `byChannel: { pk: [channel], sk: [deviceId] }` on `primaryKey: [channel, deviceId]`). The per-half gate must fire via `keyRecord` membership and SET on every write. Regression scenario for #43 — must be present in unit, entity-level integration, and connected suites.
 3. **Hierarchical GSI** — composites form a parent → child hierarchy (e.g. `[region, country, city, site]`). The structural rule must truncate via `set({ parents }).remove(["leaf"])`.
 4. **Hole pattern GSI** — optional leading composite + present trailing composite. Must collapse into the unified can't-compose rule (drop under `'sparse'`, noop or cascade-override under `'preserve'`).
 5. **All composites mutable** — every composite is a non-PK model field, and `appendInput` / update payloads carry them all. The standard case; the gate fires through the payload.
+6. **Empty-composite half** — at least one half is `composite: []` (e.g. `byDeviceBinding: { pk: [deviceBinding], sk: { composite: [] } }`, common in single-table designs where the SK is just the entity prefix). The per-half gate must always evaluate the empty half (the value is a constant prefix; multi-writer protection does not apply). Regression scenario for #46 — must be present in unit, entity-level integration, and connected suites.
 
 ### Sparse Map Storage (`storedAs: DynamoModel.SparseMap()`)
 

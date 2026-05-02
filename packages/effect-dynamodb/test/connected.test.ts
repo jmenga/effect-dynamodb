@@ -3294,3 +3294,345 @@ describeConnected("indexPolicy v1.7.1 integration tests (closes #41)", () => {
       }).pipe(provideIp),
   )
 })
+
+// ===========================================================================
+// Empty-composite-half GSI shape — closes #46 (v1.7.3 skip-predicate reframe)
+// ===========================================================================
+//
+// The bug (#46): GSI halves declared with `composite: []` had every
+// `.some(...)` clause in the touched-predicate trivially return false, so
+// `Entity.update()` skipped composing the half entirely. Items written via
+// .put() (which uses the separate composeAllKeys/composeIndexKeys path) had
+// the half correctly populated, but any subsequent .update() that touched
+// the OTHER half left the empty-composite half untouched — and worse, an
+// .update() that bound a previously-sparse GSI for the first time wrote
+// only the PK half, leaving the SK half missing → invisible to the GSI.
+//
+// v1.7.3 reframes the gate as a skip-predicate keyed on the gate's actual
+// purpose (multi-writer protection). The leading `length > 0` guard
+// short-circuits empty-composite halves to "always evaluated," and
+// classifyHalf (which already handled empty composites correctly as
+// { kind: 'set', length: 0 }) is finally reached.
+//
+// These tests exercise the v1.7.3 fix end-to-end against DDB Local. They
+// reproduce the #46 scenario exactly: a Vehicle entity with a sparse
+// byDeviceBinding GSI whose SK composite is empty.
+// ===========================================================================
+
+class VehicleConnected extends Schema.Class<VehicleConnected>("VehicleConnected")({
+  vehicleId: Schema.String,
+  deviceBinding: Schema.optional(Schema.String),
+  // Companion non-PK composites for the mixed-shape test.
+  tenantId: Schema.optional(Schema.String),
+  status: Schema.optional(Schema.String),
+  // Plain payload field — used to drive .update() calls that don't touch
+  // any GSI composite directly.
+  label: Schema.optional(Schema.String),
+}) {}
+
+const vehicleSchema = DynamoSchema.make({ name: "vehicle-empty", version: 1 })
+const vehicleTableName = `vehicle-empty-${Date.now()}`
+
+// The exact #46 reproducer entity.
+const VehiclesByDevice = Entity.make({
+  model: VehicleConnected,
+  entityType: "VehicleByDevice",
+  primaryKey: {
+    pk: { field: "pk", composite: ["vehicleId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byDeviceBinding: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["deviceBinding"] },
+      sk: { field: "gsi3sk", composite: [] },
+    },
+  },
+  timestamps: true,
+})
+
+// Mixed entity: ONE empty-SK GSI (byDeviceBinding) + ONE multi-writer GSI
+// with non-PK composites (byTenant). Used to prove the empty-composite-
+// half fix coexists with the v1.7.1 multi-writer protection (#41).
+const VehiclesMixed = Entity.make({
+  model: VehicleConnected,
+  entityType: "VehicleMixed",
+  primaryKey: {
+    pk: { field: "pk", composite: ["vehicleId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byDeviceBinding: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["deviceBinding"] },
+      sk: { field: "gsi3sk", composite: [] },
+    },
+    byTenant: {
+      name: "gsi4",
+      pk: { field: "gsi4pk", composite: ["tenantId"] },
+      sk: { field: "gsi4sk", composite: ["status"] },
+      indexPolicy: { pk: "preserve", sk: "preserve" },
+    },
+  },
+  timestamps: true,
+})
+
+const VehicleTable = Table.make({
+  schema: vehicleSchema,
+  entities: { VehiclesByDevice, VehiclesMixed },
+})
+const VehicleTestLayer = Layer.mergeAll(ClientLayer, VehicleTable.layer({ name: vehicleTableName }))
+const provideVehicle = Effect.provide(VehicleTestLayer)
+
+describeConnected("Empty-composite-half GSI shape (closes #46)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: vehicleTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(VehicleTable),
+        })
+      }).pipe(provideVehicle, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: vehicleTableName })
+      }).pipe(
+        provideVehicle,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  // ----- Scenario 1: #46 reproducer end-to-end -----
+  it.effect(
+    "scenario 1 — put without deviceBinding, update binds it, byDeviceBinding query returns the item",
+    () =>
+      Effect.gen(function* () {
+        // The exact #46 reproducer. Pre-v1.7.3: vehicle invisible after the
+        // update because gsi3sk was never written.
+        const db = yield* DynamoClient.make({
+          entities: { VehiclesByDevice },
+          tables: { VehicleTable },
+        })
+
+        // Step 1: put without deviceBinding → sparse, no gsi3 keys composed.
+        yield* db.entities.VehiclesByDevice.put({
+          vehicleId: "veh-46-1",
+          // deviceBinding intentionally omitted
+        })
+
+        // Step 2: bind the device via .update().
+        yield* db.entities.VehiclesByDevice.update({ vehicleId: "veh-46-1" }).set({
+          deviceBinding: "cloud#dev-46-1",
+        })
+
+        // v1.7.3 critical: byDeviceBinding query MUST return the vehicle.
+        // Pre-v1.7.3 this returned 0 items because gsi3sk was never written.
+        const rows = yield* db.entities.VehiclesByDevice.byDeviceBinding({
+          deviceBinding: "cloud#dev-46-1",
+        }).collect()
+        expect(rows).toHaveLength(1)
+        expect(rows[0]!.vehicleId).toBe("veh-46-1")
+
+        // Verify the raw item — both halves of gsi3 must be present.
+        const raw = yield* (yield* DynamoClient).getItem({
+          TableName: vehicleTableName,
+          Key: {
+            pk: { S: "$vehicle-empty#v1#vehiclebydevice#vehicleid_veh-46-1" },
+            sk: { S: "$vehicle-empty#v1#vehiclebydevice" },
+          },
+        })
+        expect(raw.Item).toBeDefined()
+        expect(raw.Item!.gsi3pk?.S).toBe(
+          "$vehicle-empty#v1#vehiclebydevice#devicebinding_cloud#dev-46-1",
+        )
+        // The empty-composite half — gsi3sk MUST be the constant entity prefix.
+        expect(raw.Item!.gsi3sk?.S).toBe("$vehicle-empty#v1#vehiclebydevice")
+      }).pipe(provideVehicle),
+  )
+
+  // ----- Scenario 2: Idempotent re-update -----
+  it.effect("scenario 2 — multiple sequential updates keep gsi3 keys consistent", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { VehiclesByDevice },
+        tables: { VehicleTable },
+      })
+
+      yield* db.entities.VehiclesByDevice.put({
+        vehicleId: "veh-46-2",
+        deviceBinding: "cloud#dev-initial",
+      })
+
+      // Three updates: change deviceBinding, change a label, change
+      // deviceBinding again. Each one must keep gsi3pk consistent with the
+      // CURRENT deviceBinding and gsi3sk consistent with the constant
+      // entity prefix.
+      yield* db.entities.VehiclesByDevice.update({ vehicleId: "veh-46-2" }).set({
+        deviceBinding: "cloud#dev-second",
+      })
+      yield* db.entities.VehiclesByDevice.update({ vehicleId: "veh-46-2" }).set({
+        label: "stamped",
+      })
+      yield* db.entities.VehiclesByDevice.update({ vehicleId: "veh-46-2" }).set({
+        deviceBinding: "cloud#dev-third",
+      })
+
+      // Final state — vehicle visible under cloud#dev-third only.
+      const third = yield* db.entities.VehiclesByDevice.byDeviceBinding({
+        deviceBinding: "cloud#dev-third",
+      }).collect()
+      expect(third).toHaveLength(1)
+      expect(third[0]!.vehicleId).toBe("veh-46-2")
+      expect(third[0]!.label).toBe("stamped")
+
+      // Older bindings — no rows.
+      const initial = yield* db.entities.VehiclesByDevice.byDeviceBinding({
+        deviceBinding: "cloud#dev-initial",
+      }).collect()
+      expect(initial).toHaveLength(0)
+      const second = yield* db.entities.VehiclesByDevice.byDeviceBinding({
+        deviceBinding: "cloud#dev-second",
+      }).collect()
+      expect(second).toHaveLength(0)
+
+      // gsi3sk must remain the constant entity prefix across all updates.
+      const raw = yield* (yield* DynamoClient).getItem({
+        TableName: vehicleTableName,
+        Key: {
+          pk: { S: "$vehicle-empty#v1#vehiclebydevice#vehicleid_veh-46-2" },
+          sk: { S: "$vehicle-empty#v1#vehiclebydevice" },
+        },
+      })
+      expect(raw.Item!.gsi3sk?.S).toBe("$vehicle-empty#v1#vehiclebydevice")
+    }).pipe(provideVehicle),
+  )
+
+  // ----- Scenario 3: Mixed entity (#46 fix + #41 multi-writer fix coexist) -----
+  it.effect(
+    "scenario 3 — mixed entity: empty-SK GSI fixes; multi-writer GSI on same entity untouched by stamps",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { VehiclesMixed },
+          tables: { VehicleTable },
+        })
+
+        // Seed: full vehicle with deviceBinding + tenantId + status.
+        yield* db.entities.VehiclesMixed.put({
+          vehicleId: "veh-46-3",
+          deviceBinding: "cloud#dev-mixed",
+          tenantId: "tenant-1",
+          status: "active",
+        })
+
+        // Capture baseline byTenant key composition.
+        const baseline = yield* (yield* DynamoClient).getItem({
+          TableName: vehicleTableName,
+          Key: {
+            pk: { S: "$vehicle-empty#v1#vehiclemixed#vehicleid_veh-46-3" },
+            sk: { S: "$vehicle-empty#v1#vehiclemixed" },
+          },
+        })
+        const baselineGsi4pk = baseline.Item?.gsi4pk?.S
+        const baselineGsi4sk = baseline.Item?.gsi4sk?.S
+        expect(baselineGsi4pk).toBeDefined()
+        expect(baselineGsi4sk).toBeDefined()
+
+        // Stamp update: only label changes. Neither byDeviceBinding's
+        // composites (deviceBinding) nor byTenant's composites (tenantId,
+        // status) are in the payload.
+        // - byDeviceBinding.pk: skipped (multi-writer protection — composite
+        //   absent). gsi3pk preserved.
+        // - byDeviceBinding.sk: empty composite → ALWAYS evaluated → constant
+        //   prefix re-SET. gsi3sk preserved with the same value.
+        // - byTenant.pk + sk: skipped (multi-writer protection). gsi4pk +
+        //   gsi4sk preserved untouched. v1.7.1 #41 fix preserved.
+        yield* db.entities.VehiclesMixed.update({ vehicleId: "veh-46-3" }).set({
+          label: "stamped",
+        })
+
+        const after = yield* (yield* DynamoClient).getItem({
+          TableName: vehicleTableName,
+          Key: {
+            pk: { S: "$vehicle-empty#v1#vehiclemixed#vehicleid_veh-46-3" },
+            sk: { S: "$vehicle-empty#v1#vehiclemixed" },
+          },
+        })
+        // byTenant unchanged — multi-writer fix preserved across stamp.
+        expect(after.Item?.gsi4pk?.S).toBe(baselineGsi4pk)
+        expect(after.Item?.gsi4sk?.S).toBe(baselineGsi4sk)
+        // byDeviceBinding still visible under cloud#dev-mixed.
+        const byDev = yield* db.entities.VehiclesMixed.byDeviceBinding({
+          deviceBinding: "cloud#dev-mixed",
+        }).collect()
+        expect(byDev.some((v) => v.vehicleId === "veh-46-3")).toBe(true)
+        // byTenant still visible.
+        const byTen = yield* db.entities.VehiclesMixed.byTenant({
+          tenantId: "tenant-1",
+        }).collect()
+        expect(byTen.some((v) => v.vehicleId === "veh-46-3")).toBe(true)
+
+        // gsi3sk constant prefix preserved.
+        expect(after.Item?.gsi3sk?.S).toBe("$vehicle-empty#v1#vehiclemixed")
+      }).pipe(provideVehicle),
+  )
+
+  // ----- Scenario 4: Entity.remove on the empty-composite-half GSI's PK -----
+  it.effect(
+    "scenario 4 — Entity.remove(['deviceBinding']) on empty-SK GSI: PK REMOVE'd via cascade, SK still SET (constant prefix)",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { VehiclesByDevice },
+          tables: { VehicleTable },
+        })
+
+        // Seed: vehicle with deviceBinding.
+        yield* db.entities.VehiclesByDevice.put({
+          vehicleId: "veh-46-4",
+          deviceBinding: "cloud#dev-to-remove",
+        })
+
+        // Item visible.
+        const before = yield* db.entities.VehiclesByDevice.byDeviceBinding({
+          deviceBinding: "cloud#dev-to-remove",
+        }).collect()
+        expect(before).toHaveLength(1)
+
+        // Remove the deviceBinding attribute. PK half touched via
+        // removedSet, can't compose without deviceBinding → preserve +
+        // cascade override → REMOVE gsi3pk. SK half (empty composite) →
+        // always evaluated → constant prefix re-SET.
+        yield* db.entities.VehiclesByDevice.update({ vehicleId: "veh-46-4" }).remove([
+          "deviceBinding",
+        ])
+
+        // Item invisible (DDB needs both keys for projection).
+        const after = yield* db.entities.VehiclesByDevice.byDeviceBinding({
+          deviceBinding: "cloud#dev-to-remove",
+        }).collect()
+        expect(after).toHaveLength(0)
+
+        // Raw item: gsi3pk REMOVE'd, gsi3sk still present (constant prefix).
+        const raw = yield* (yield* DynamoClient).getItem({
+          TableName: vehicleTableName,
+          Key: {
+            pk: { S: "$vehicle-empty#v1#vehiclebydevice#vehicleid_veh-46-4" },
+            sk: { S: "$vehicle-empty#v1#vehiclebydevice" },
+          },
+        })
+        expect(raw.Item).toBeDefined()
+        expect(raw.Item!.gsi3pk).toBeUndefined()
+        expect(raw.Item!.gsi3sk?.S).toBe("$vehicle-empty#v1#vehiclebydevice")
+      }).pipe(provideVehicle),
+  )
+})

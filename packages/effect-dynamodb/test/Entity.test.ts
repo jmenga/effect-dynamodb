@@ -3940,10 +3940,14 @@ describe("Entity", () => {
     )
 
     it.effect(
-      "remove of one GSI composite doesn't affect other GSIs (and only the touched half — v1.7.1)",
+      "remove of one GSI composite affects only the cascaded half on the multi-composite GSI; other GSI's empty-composite half is always evaluated (v1.7.3)",
       () =>
         Effect.gen(function* () {
-          // Entity with two GSIs.
+          // Entity with two GSIs:
+          //   byTenant — both halves have non-empty composites (multi-writer
+          //              protection applies)
+          //   byDepartment — pk: [department], sk: { composite: [] } (the SK
+          //              is an empty-composite half — v1.7.3 #46 case)
           class MultiGsiUser extends Schema.Class<MultiGsiUser>("MultiGsiUser")({
             userId: Schema.String,
             name: Schema.String,
@@ -3988,11 +3992,20 @@ describe("Entity", () => {
             }),
           })
 
-          // Remove tenantId. byTenant: pk's tenantId in removedSet → pk
-          // touched, can't compose → preserve + cascade override → REMOVE
-          // gsi1pk. sk untouched (region not in payload, not in removedSet)
-          // → noop. byDepartment: department not in removedSet, not in
-          // payload → both halves untouched → noop.
+          // Remove tenantId. Per the v1.7.3 skip-predicate:
+          //   byTenant.pk: tenantId in removedSet → !skipPk → evaluate.
+          //                Can't compose without tenantId → preserve +
+          //                cascade override → REMOVE gsi1pk.
+          //   byTenant.sk: region not in payload, not in keyRecord, not in
+          //                removedSet, length > 0 → SKIPPED (multi-writer
+          //                protection — preserves #41 fix).
+          //   byDepartment.pk: department not in payload, not in keyRecord,
+          //                    not in removedSet, length > 0 → SKIPPED
+          //                    (multi-writer protection).
+          //   byDepartment.sk: length === 0 → !skipSk → evaluate. Constant
+          //                    prefix → SET gsi2sk. (v1.7.3 — closes #46;
+          //                    pre-v1.7.3 the empty-composite half was
+          //                    silently skipped.)
           yield* MultiGsiEntity.update({ userId: "u-1" }).pipe(
             Entity.remove(["tenantId"]),
             Entity.asModel,
@@ -4001,13 +4014,17 @@ describe("Entity", () => {
           const call = mockUpdateItem.mock.calls[0]![0]
           const names = call.ExpressionAttributeNames as Record<string, string>
           const nameValues = Object.values(names)
-          // byTenant pk REMOVE'd via per-half cascade.
+          // byTenant.pk REMOVE'd via per-half cascade override.
           expect(nameValues).toContain("gsi1pk")
-          // v1.7.1 critical: sk's gsi1sk NOT removed (the half wasn't touched).
+          // byTenant.sk SKIPPED — multi-writer protection (preserves #41).
           expect(nameValues).not.toContain("gsi1sk")
-          // byDepartment GSI keys completely untouched.
+          // byDepartment.pk SKIPPED — multi-writer protection (department
+          // composite not touched).
           expect(nameValues).not.toContain("gsi2pk")
-          expect(nameValues).not.toContain("gsi2sk")
+          // byDepartment.sk EVALUATED — empty composite list is always
+          // evaluated under v1.7.3's skip-predicate (#46 fix). The constant
+          // entity prefix is SET regardless.
+          expect(nameValues).toContain("gsi2sk")
         }).pipe(Effect.provide(TestLayer)),
     )
   })
