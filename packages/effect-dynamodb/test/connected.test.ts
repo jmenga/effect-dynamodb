@@ -2010,28 +2010,30 @@ describeConnected("PK-composites-only GSI shape (closes #43)", () => {
     )
   }, 15000)
 
-  it.effect("Entity.append() writes gsi1pk + gsi1sk on PK-composites-only GSI; byChannel query returns the item", () =>
-    Effect.gen(function* () {
-      const db = yield* DynamoClient.make({
-        entities: { ChannelDevicesTs },
-        tables: { CdTable },
-      })
+  it.effect(
+    "Entity.append() writes gsi1pk + gsi1sk on PK-composites-only GSI; byChannel query returns the item",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { ChannelDevicesTs },
+          tables: { CdTable },
+        })
 
-      yield* db.entities.ChannelDevicesTs.append({
-        channel: "ch-append",
-        deviceId: "d-append-1",
-        timestamp: DateTime.makeUnsafe("2026-04-30T10:00:00.000Z"),
-        reading: 42,
-      })
+        yield* db.entities.ChannelDevicesTs.append({
+          channel: "ch-append",
+          deviceId: "d-append-1",
+          timestamp: DateTime.makeUnsafe("2026-04-30T10:00:00.000Z"),
+          reading: 42,
+        })
 
-      // Pre-v1.7.2 this query returned 0 items because gsi1pk / gsi1sk
-      // were never written by .append().
-      const rows = yield* db.entities.ChannelDevicesTs.byChannel({
-        channel: "ch-append",
-      }).collect()
-      expect(rows).toHaveLength(1)
-      expect(rows[0]!.deviceId).toBe("d-append-1")
-    }).pipe(provideCd),
+        // Pre-v1.7.2 this query returned 0 items because gsi1pk / gsi1sk
+        // were never written by .append().
+        const rows = yield* db.entities.ChannelDevicesTs.byChannel({
+          channel: "ch-append",
+        }).collect()
+        expect(rows).toHaveLength(1)
+        expect(rows[0]!.deviceId).toBe("d-append-1")
+      }).pipe(provideCd),
   )
 
   it.effect(
@@ -2070,54 +2072,52 @@ describeConnected("PK-composites-only GSI shape (closes #43)", () => {
       }).pipe(provideCd),
   )
 
-  it.effect(
-    "Multiple sequential updates idempotently re-SET the same gsi key values",
-    () =>
-      Effect.gen(function* () {
-        const db = yield* DynamoClient.make({
-          entities: { ChannelDevicesPlain },
-          tables: { CdTable },
-        })
+  it.effect("Multiple sequential updates idempotently re-SET the same gsi key values", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { ChannelDevicesPlain },
+        tables: { CdTable },
+      })
 
-        yield* db.entities.ChannelDevicesPlain.put({
+      yield* db.entities.ChannelDevicesPlain.put({
+        channel: "ch-idem",
+        deviceId: "d-idem-1",
+        timestamp: DateTime.makeUnsafe("2026-04-30T10:00:00.000Z"),
+      }).asEffect()
+
+      // Multiple updates — each one SETs gsi2pk and gsi2sk to the same
+      // composed value (PK composites are immutable). DDB SET to the
+      // same value is a noop on the byte representation but a billable
+      // write — that's expected and acknowledged in DESIGN.md §7.
+      for (const i of [1, 2, 3]) {
+        yield* db.entities.ChannelDevicesPlain.update({
           channel: "ch-idem",
           deviceId: "d-idem-1",
-          timestamp: DateTime.makeUnsafe("2026-04-30T10:00:00.000Z"),
-        }).asEffect()
+        }).set({ otherField: `update-${i}` })
+      }
 
-        // Multiple updates — each one SETs gsi2pk and gsi2sk to the same
-        // composed value (PK composites are immutable). DDB SET to the
-        // same value is a noop on the byte representation but a billable
-        // write — that's expected and acknowledged in DESIGN.md §7.
-        for (const i of [1, 2, 3]) {
-          yield* db.entities.ChannelDevicesPlain.update({
-            channel: "ch-idem",
-            deviceId: "d-idem-1",
-          }).set({ otherField: `update-${i}` })
-        }
+      const rows = yield* db.entities.ChannelDevicesPlain.byChannel({
+        channel: "ch-idem",
+      }).collect()
+      expect(rows).toHaveLength(1)
+      expect(rows[0]!.deviceId).toBe("d-idem-1")
+      expect(rows[0]!.otherField).toBe("update-3")
 
-        const rows = yield* db.entities.ChannelDevicesPlain.byChannel({
-          channel: "ch-idem",
-        }).collect()
-        expect(rows).toHaveLength(1)
-        expect(rows[0]!.deviceId).toBe("d-idem-1")
-        expect(rows[0]!.otherField).toBe("update-3")
-
-        // Sanity-check the actual GSI keys via a direct query — they must
-        // hold the composed values across the three SETs.
-        const raw = yield* (yield* DynamoClient).getItem({
-          TableName: cdTableName,
-          Key: {
-            pk: {
-              S: "$cd-test#v1#channeldeviceplain#channel_ch-idem#deviceid_d-idem-1",
-            },
-            sk: { S: "$cd-test#v1#channeldeviceplain" },
+      // Sanity-check the actual GSI keys via a direct query — they must
+      // hold the composed values across the three SETs.
+      const raw = yield* (yield* DynamoClient).getItem({
+        TableName: cdTableName,
+        Key: {
+          pk: {
+            S: "$cd-test#v1#channeldeviceplain#channel_ch-idem#deviceid_d-idem-1",
           },
-        })
-        expect(raw.Item).toBeDefined()
-        expect(raw.Item!.gsi2pk?.S).toBe("$cd-test#v1#channeldeviceplain#channel_ch-idem")
-        expect(raw.Item!.gsi2sk?.S).toBe("$cd-test#v1#channeldeviceplain#deviceid_d-idem-1")
-      }).pipe(provideCd),
+          sk: { S: "$cd-test#v1#channeldeviceplain" },
+        },
+      })
+      expect(raw.Item).toBeDefined()
+      expect(raw.Item!.gsi2pk?.S).toBe("$cd-test#v1#channeldeviceplain#channel_ch-idem")
+      expect(raw.Item!.gsi2sk?.S).toBe("$cd-test#v1#channeldeviceplain#deviceid_d-idem-1")
+    }).pipe(provideCd),
   )
 
   it.effect(
@@ -2176,12 +2176,8 @@ describeConnected("PK-composites-only GSI shape (closes #43)", () => {
         expect(after.Item?.gsi4sk?.S).toBe(baselineGsi4sk)
         // byChannel keys (gsi3, PK-composites-only) SET on every write
         // (idempotent) — values unchanged but the SET clause was emitted.
-        expect(after.Item?.gsi3pk?.S).toBe(
-          "$cd-test#v1#channeldevicemixed#channel_ch-mixed-mw",
-        )
-        expect(after.Item?.gsi3sk?.S).toBe(
-          "$cd-test#v1#channeldevicemixed#deviceid_d-mw-1",
-        )
+        expect(after.Item?.gsi3pk?.S).toBe("$cd-test#v1#channeldevicemixed#channel_ch-mixed-mw")
+        expect(after.Item?.gsi3sk?.S).toBe("$cd-test#v1#channeldevicemixed#deviceid_d-mw-1")
       }).pipe(provideCd),
   )
 
