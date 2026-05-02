@@ -6,7 +6,7 @@
   "scripts": {
     "build": "pnpm -r build",
     "test": "pnpm -r test",
-    "check": "pnpm -r check",
+    "check": "pnpm --filter effect-dynamodb build && pnpm -r check",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "docs:dev": "pnpm --filter @effect-dynamodb/docs dev",
