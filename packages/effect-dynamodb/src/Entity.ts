@@ -4248,7 +4248,6 @@ const makeImpl = <
       // attributes on the item (mirrors `.put()`), and though their values
       // never change, writing them on every append makes the first append
       // (where the row doesn't yet exist) materialise the row correctly.
-      const pkCompositeSet = new Set(primaryKeyComposites(config.indexes))
       for (const [attr, val] of Object.entries(serialisedInput)) {
         if (val === undefined) continue
         const nameKey = `#a${counter}`
@@ -4260,30 +4259,28 @@ const makeImpl = <
       }
 
       // GSI key recomposition. v3 unifies append with update — both call
-      // the same composer. PK composites are excluded from the update
-      // payload — they're already in the key and never change during an
-      // append. The composer treats composites outside `appendInput` as
-      // absent under the structural rule (per-half policy decides whether
-      // a half empties to drop or no-op). See DESIGN.md §7 — "append uses
-      // the same composer."
-      const nonPkAppendFields: globalThis.Record<string, unknown> = {}
-      for (const [attr, val] of Object.entries(encoded)) {
-        if (!pkCompositeSet.has(attr)) {
-          nonPkAppendFields[attr] = val
-        }
-      }
-
+      // the same composer. v1.7.2 (closes #43): the full encoded record is
+      // passed as both `updatePayload` and `keyRecord`. The previous
+      // v1.7.0 / v1.7.1 path filtered PK composites out of the payload on
+      // the rationale that they "never change during an append" — but
+      // combined with v1.7.1's per-half evaluation gate (which only looked
+      // at `updatePayload`), that filter caused any GSI half whose
+      // composites are entirely entity-PK composites to be classified as
+      // untouched on every append, silently skipping GSI evaluation. The
+      // PK exclusion never solved a real problem (the composer doesn't
+      // emit redundant SETs for the underlying composite fields, and
+      // idempotent recomposition from immutable PK composites is fine), so
+      // it's removed. The gate now broadens its "touched" check to also
+      // count `keyRecord` membership, so PK-composite-only halves are
+      // touched on every write and the structural rule composes them.
       // No try/catch — EDD-9024 was deprecated in v1.7.1 and the composer
-      // no longer throws. Per-half evaluation gate skips halves whose
-      // composites are entirely outside `appendInput`; touched halves
-      // follow the unified per-half outcome rule (sparse drops; preserve
-      // noops or cascades).
+      // no longer throws.
       const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
         schema,
         entityType,
         entityVersion,
         allIndexes,
-        nonPkAppendFields,
+        encoded,
         encoded,
       )
       for (const [field, value] of Object.entries(gsiUpdate.sets)) {

@@ -20,7 +20,7 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
-import { Effect, Layer, Schema } from "effect"
+import { DateTime, Duration, Effect, Layer, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -319,9 +319,9 @@ const makePagesMock = (capture: Capture) => ({
   getItem: () => Effect.die("getItem not expected on standard path"),
 })
 
-describe("Entity update — standard path migration regression (issue #36 / #41)", () => {
+describe("Entity update — standard path migration regression (issue #36 / #41 / #43)", () => {
   it.effect(
-    "partial update that omits preserve-policied composites does NOT generate REMOVE for any GSI key",
+    "partial update that omits preserve-policied composites does NOT generate REMOVE for any GSI key (footgun stays closed); SK halves SET via keyRecord membership (v1.7.2 — closes #43)",
     () => {
       const capture: Capture = {}
       const layer = Layer.mergeAll(
@@ -333,10 +333,15 @@ describe("Entity update — standard path migration regression (issue #36 / #41)
           entities: { Pages },
           tables: { PagesTable },
         })
-        // Update only `name` — never mentions X, Y, Z, or pageId. Under
-        // v1.7.1 the per-half evaluation gate skips ALL halves of all three
-        // GSIs (none has a composite touched). The footgun stays closed:
-        // zero gsi*pk / gsi*sk REMOVEs in the UpdateExpression.
+        // Update only `name` — never mentions X, Y, Z, or pageId in the
+        // payload. Under v1.7.1 the per-half evaluation gate skipped ALL
+        // halves of all three GSIs because the gate only consulted
+        // `updatePayload`. Under v1.7.2 (closes #43) the gate also counts
+        // `keyRecord` membership: `pageId` is in keyRecord (it's the
+        // entity-PK composite), so all three SK halves are touched →
+        // structural rule composes from `pageId` → SET. The PK halves
+        // (X/Y/Z) are non-PK composites — not in payload, not in keyRecord
+        // → noop. The original footgun stays closed: zero gsi*pk REMOVEs.
         yield* db.entities.Pages.update({ pageId: "p-1" }).set({ name: "new-name" })
         const ui = capture.updateItem as {
           UpdateExpression?: string
@@ -350,20 +355,28 @@ describe("Entity update — standard path migration regression (issue #36 / #41)
           .map((s) => s.trim())
           .filter((s) => s.length > 0)
           .map((alias) => ui.ExpressionAttributeNames?.[alias] ?? alias)
+        // Footgun assertion: no GSI key REMOVE'd. Stays closed under v1.7.2.
         for (const name of physicalRemoves) {
           expect(name).not.toMatch(/^gsi\d(pk|sk)$/)
         }
-        // v1.7.1 additional assertion: no SETs on gsi*pk / gsi*sk either —
-        // halves are untouched, so the composer emits nothing.
+        // Per-half partition (v1.7.2): PK halves (X/Y/Z — non-PK composites,
+        // not in keyRecord, not in payload) → noop. SK halves (pageId — the
+        // entity-PK composite, in keyRecord) → touched → SET.
         const setClause = expr.match(/SET\s+(.*?)(?:\s+REMOVE|$)/i)?.[1] ?? ""
         const setNames = setClause
           .split(",")
           .map((s) => s.split("=")[0]?.trim() ?? "")
           .filter((s) => s.startsWith("#"))
           .map((alias) => ui.ExpressionAttributeNames?.[alias] ?? alias)
-        for (const name of setNames) {
-          expect(name).not.toMatch(/^gsi\d(pk|sk)$/)
-        }
+        const setSet = new Set(setNames)
+        // No SET on PK halves of any GSI.
+        expect(setSet.has("gsi1pk")).toBe(false)
+        expect(setSet.has("gsi2pk")).toBe(false)
+        expect(setSet.has("gsi3pk")).toBe(false)
+        // SET on every GSI's SK half via keyRecord membership.
+        expect(setSet.has("gsi1sk")).toBe(true)
+        expect(setSet.has("gsi2sk")).toBe(true)
+        expect(setSet.has("gsi3sk")).toBe(true)
       }).pipe(Effect.provide(layer), Effect.scoped)
     },
   )
@@ -708,7 +721,7 @@ describe("Entity.make() — EDD-9025 composite null check", () => {
     ).not.toThrow()
   })
 
-  it("allows plain non-nullable schemas on composites", () => {
+  it("allows plain non-nullable schemas on composites (sanity)", () => {
     class OkModel extends Schema.Class<OkModel>("OkModel")({
       id: Schema.String,
       tenantId: Schema.String,
@@ -750,4 +763,242 @@ describe("Entity.make() — EDD-9025 composite null check", () => {
       }),
     ).not.toThrow()
   })
+})
+
+// ---------------------------------------------------------------------------
+// Issue #43 — PK-composites-only GSI shape (entity-level wiring)
+// ---------------------------------------------------------------------------
+//
+// The bug: GSIs whose composites are entirely entity-PK composites (e.g.
+// `byChannel: { pk: [channel], sk: [deviceId] }` on an entity with
+// `primaryKey: [channel, deviceId]`) had their `gsi*pk` / `gsi*sk` keys
+// silently skipped under v1.7.0 / v1.7.1 — the per-half evaluation gate
+// only consulted `updatePayload`, and PK composites never appear there.
+// v1.7.2 broadens the gate to also count `keyRecord` membership AND
+// removes the PK-composite filter from `Entity.append()`'s payload.
+//
+// These tests prove the wiring through both Entity.update (standard path)
+// and Entity.append (time-series path) — verifying the resulting wire-form
+// expressions carry SETs for the PK-composite-only GSI keys.
+// ---------------------------------------------------------------------------
+
+class Sensor extends Schema.Class<Sensor>("Sensor")({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  // A non-composite payload field used to trigger updates without restating
+  // the PK composites. Modeled as Schema.optional so updates can include it
+  // selectively.
+  otherField: Schema.optional(Schema.String),
+}) {}
+
+const SensorSchema = DynamoSchema.make({ name: "sensor-test", version: 1 })
+
+const Sensors = Entity.make({
+  model: Sensor,
+  entityType: "Sensor",
+  primaryKey: {
+    pk: { field: "pk", composite: ["channel", "deviceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    // PK-composites-only GSI shape — the #43 repro.
+    byChannel: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["channel"] },
+      sk: { field: "gsi1sk", composite: ["deviceId"] },
+      indexPolicy: { pk: "preserve", sk: "preserve" },
+    },
+  },
+})
+
+const SensorTable = Table.make({ schema: SensorSchema, entities: { Sensors } })
+const SensorTableLayer = SensorTable.layer({ name: "sensor-table" })
+
+// Mock client that pretends a stored Sensor exists with no GSI keys (mirrors
+// items written under v1.7.0 / v1.7.1 — the bug state). Returns
+// Sensor-shaped Attributes from updateItem so the Schema decode succeeds.
+const makeSensorMock = (capture: Capture) => ({
+  ...makeMockClient(capture),
+  getItem: () =>
+    Effect.succeed({
+      Item: {
+        pk: { S: "$sensor-test#v1#sensor#channel_c-1#deviceid_d-1" } as AttributeValue,
+        sk: { S: "$sensor-test#v1#sensor" } as AttributeValue,
+        channel: { S: "c-1" } as AttributeValue,
+        deviceId: { S: "d-1" } as AttributeValue,
+        __edd_e__: { S: "Sensor" } as AttributeValue,
+      },
+    }),
+  updateItem: (input: Record<string, unknown>) => {
+    capture.updateItem = input
+    return Effect.succeed({
+      Attributes: {
+        pk: { S: "$sensor-test#v1#sensor#channel_c-1#deviceid_d-1" } as AttributeValue,
+        sk: { S: "$sensor-test#v1#sensor" } as AttributeValue,
+        channel: { S: "c-1" } as AttributeValue,
+        deviceId: { S: "d-1" } as AttributeValue,
+        otherField: { S: "X" } as AttributeValue,
+        __edd_e__: { S: "Sensor" } as AttributeValue,
+      },
+    })
+  },
+})
+
+describe("Entity update — PK-composites-only GSI shape (closes #43)", () => {
+  it.effect(
+    "Entity.update().set({ otherField }) on entity with byChannel: {pk:[channel], sk:[deviceId]} produces SET clauses for gsi1pk AND gsi1sk",
+    () => {
+      // Standard update path. `set({ otherField: ... })` doesn't mention
+      // channel or deviceId in the payload — they live in keyRecord. Pre-
+      // v1.7.2 the per-half gate skipped both halves of byChannel and the
+      // UpdateExpression had no SET for gsi1pk / gsi1sk. v1.7.2 fixes this.
+      const capture: Capture = {}
+      const layer = Layer.mergeAll(
+        Layer.succeed(DynamoClient, makeSensorMock(capture) as any),
+        SensorTableLayer,
+      )
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { Sensors },
+          tables: { SensorTable },
+        })
+        yield* db.entities.Sensors.update({ channel: "c-1", deviceId: "d-1" }).set({
+          otherField: "X",
+        })
+        const ui = capture.updateItem as {
+          UpdateExpression?: string
+          ExpressionAttributeNames?: Record<string, string>
+          ExpressionAttributeValues?: Record<string, AttributeValue>
+        }
+        expect(ui.UpdateExpression).toBeDefined()
+        const expr = ui.UpdateExpression!
+        // Parse the SET clause and resolve aliases to physical names.
+        const setClause = expr.match(/SET\s+(.*?)(?:\s+REMOVE|$)/i)?.[1] ?? ""
+        const setAssignments = setClause.split(",").map((s) => s.trim())
+        const setNames = setAssignments
+          .map((s) => s.split("=")[0]?.trim() ?? "")
+          .filter((s) => s.startsWith("#"))
+          .map((alias) => ui.ExpressionAttributeNames?.[alias] ?? alias)
+        const setSet = new Set(setNames)
+        // v1.7.2 critical assertions: both halves of byChannel SET via the
+        // per-half gate's keyRecord branch.
+        expect(setSet.has("gsi1pk")).toBe(true)
+        expect(setSet.has("gsi1sk")).toBe(true)
+        // No REMOVE on either half.
+        const removed = parseRemoves(ui)
+        expect(removed.has("gsi1pk")).toBe(false)
+        expect(removed.has("gsi1sk")).toBe(false)
+      }).pipe(Effect.provide(layer), Effect.scoped)
+    },
+  )
+})
+
+// Time-series append path uses transactWriteItems. Same entity shape but
+// with `timeSeries` configuration. The SET clauses live in the
+// TransactItems[0].Update.UpdateExpression.
+
+class TelemetryFixture extends Schema.Class<TelemetryFixture>("TelemetryFixture")({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  timestamp: Schema.DateTimeUtc,
+  reading: Schema.optional(Schema.Number),
+}) {}
+
+const TelemetryFixtureAppendInput = Schema.Struct({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  timestamp: Schema.DateTimeUtc,
+  reading: Schema.optional(Schema.Number),
+})
+
+const TelemetryFixtureSchema = DynamoSchema.make({ name: "telemetry-fixture", version: 1 })
+
+const TelemetryFixtureEntity = Entity.make({
+  model: TelemetryFixture,
+  entityType: "TelemetryFixture",
+  primaryKey: {
+    pk: { field: "pk", composite: ["channel", "deviceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byChannel: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["channel"] },
+      sk: { field: "gsi1sk", composite: ["deviceId"] },
+      indexPolicy: { pk: "preserve", sk: "preserve" },
+    },
+  },
+  timestamps: true,
+  timeSeries: {
+    orderBy: "timestamp",
+    ttl: Duration.days(7),
+    appendInput: TelemetryFixtureAppendInput,
+  },
+})
+
+const TelemetryFixtureTable = Table.make({
+  schema: TelemetryFixtureSchema,
+  entities: { TelemetryFixtureEntity },
+})
+const TelemetryFixtureTableLayer = TelemetryFixtureTable.layer({ name: "telemetry-fixture-table" })
+
+const makeTelemetryFixtureMock = (capture: Capture) => ({
+  ...makeMockClient(capture),
+  getItem: () => Effect.die("getItem not used on append path"),
+  // The append path's follow-up GET (when not skipFollowUp) needs a stored
+  // record. Provide a minimally complete one — the test only inspects the
+  // captured TransactWriteItems.
+  // The follow-up uses getItem too, but we can return the same shape.
+})
+
+describe("Entity append — PK-composites-only GSI shape (closes #43)", () => {
+  it.effect(
+    "Entity.append() on time-series entity with byChannel: {pk:[channel], sk:[deviceId]} produces SET clauses for gsi1pk AND gsi1sk in the current-row UpdateItem",
+    () => {
+      const capture: Capture = {}
+      const layer = Layer.mergeAll(
+        Layer.succeed(DynamoClient, makeTelemetryFixtureMock(capture) as any),
+        TelemetryFixtureTableLayer,
+      )
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { TelemetryFixtureEntity },
+          tables: { TelemetryFixtureTable },
+        })
+        // Use skipFollowUp so the test doesn't need to mock the follow-up
+        // GetItem. We're only inspecting the TransactWriteItems wire form.
+        yield* db.entities.TelemetryFixtureEntity.append({
+          channel: "c-1",
+          deviceId: "d-1",
+          timestamp: DateTime.makeUnsafe("2026-04-30T10:00:00.000Z"),
+          reading: 42,
+        }).skipFollowUp()
+
+        const tx = capture.transactWriteItems
+        expect(tx).toBeDefined()
+        const items = (tx as { TransactItems?: Array<unknown> }).TransactItems
+        expect(items?.length).toBe(2) // Update current + Put event
+        const update = (items?.[0] as { Update?: Record<string, unknown> }).Update
+        expect(update).toBeDefined()
+        const expr = (update as { UpdateExpression?: string }).UpdateExpression!
+        const names = (update as { ExpressionAttributeNames?: Record<string, string> })
+          .ExpressionAttributeNames!
+        // Parse SET clause and resolve aliases.
+        const setClause = expr.match(/SET\s+(.*?)(?:\s+REMOVE|$)/i)?.[1] ?? ""
+        const setNames = setClause
+          .split(",")
+          .map((s) => s.trim())
+          .map((s) => s.split("=")[0]?.trim() ?? "")
+          .filter((s) => s.startsWith("#"))
+          .map((alias) => names[alias] ?? alias)
+        const setSet = new Set(setNames)
+        // v1.7.2 critical assertions for #43: both halves of byChannel SET
+        // via the per-half gate's keyRecord branch (Option B) AND because
+        // append no longer filters PK composites out of its payload (Option
+        // A). v1.7.0 / v1.7.1 had neither SET — items invisible to GSI.
+        expect(setSet.has("gsi1pk")).toBe(true)
+        expect(setSet.has("gsi1sk")).toBe(true)
+      }).pipe(Effect.provide(layer), Effect.scoped)
+    },
+  )
 })

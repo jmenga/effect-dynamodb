@@ -79,19 +79,24 @@ For each *touched* half (PK and SK independently), the library walks the composi
 
 Truncation on PK is the same hierarchical demotion as truncation on SK. An item with `pk.composite = ['accountId', 'fleetId']` and `fleetId` absent composes a partition key of `account#A` and stays queryable at the account scope.
 
-### Per-half evaluation gate (NEW in v1.7.1)
+### Per-half evaluation gate (v1.7.1, broadened in v1.7.2)
 
 Before the structural rule even runs, each half is checked for whether the writer touched it. **If a half is untouched, it is skipped entirely — no SET, no REMOVE, no policy fires.**
 
-A half is *touched* iff at least one of its composite names appears in the update payload (regardless of value, including `undefined`) OR appears in `Entity.remove([...])`.
+A half is *touched* iff at least one of its composite names appears in:
+- the update payload (regardless of value, including `undefined`), OR
+- the `keyRecord` carried alongside the payload — i.e. the entity primary-key composites used to address the row (added in **v1.7.2** to close [#43](https://github.com/jmenga/effect-dynamodb/issues/43); see the *byChannel* pitfall below), OR
+- `Entity.remove([...])`.
 
 This is what makes the multi-writer story work end-to-end:
 
 | Writer | Payload | byCurrentAlert eval |
 |---|---|---|
-| Stamp | `{ published: "2026-04-30" }` | Both halves untouched → noop, both halves preserved |
+| Stamp | `{ published: "2026-04-30" }` | Both halves untouched (composites are not in payload, not in keyRecord, not in `Entity.remove`) → noop, both halves preserved |
 | Enrichment | `{ accountId: "newAcct" }` | pk touched (SET); sk untouched (noop) |
 | Telemetry | `{ alertState: "active", timestamp: T }` | pk untouched (noop); sk touched (SET) |
+
+Why `keyRecord` is in the gate (v1.7.2): GSI halves whose composites are entity primary-key composites — for example `byChannel: { pk: [channel], sk: [deviceId] }` on an entity with `primaryKey: [channel, deviceId]` — never receive those composites via the update payload. The writer addresses the row by key, never restates the values in `.set({...})`, and `.append()` separates structural fields from the SET clause. The v1.7.1 gate looked only at the payload and so silently classified such halves as untouched on every write — `gsi*pk` / `gsi*sk` were never composed and the item was invisible to the GSI. v1.7.2 broadens the check to also count `keyRecord` membership; the resulting SET is idempotent for entity-PK composites because they're immutable.
 
 ## 6. Per-key outcome rolls up to per-key storage
 
@@ -281,6 +286,18 @@ In v1.7.0, a stamp writer that touched only a non-composite attribute (e.g. `set
 
 v1.7.1's per-half evaluation gate fixes this: untouched halves are skipped entirely. The stamp writer above leaves both halves alone.
 
+### `byChannel` GSI returns 0 items in v1.7.0 / v1.7.1 (PK-composites-only regression, fixed in v1.7.2)
+
+In v1.7.0 and v1.7.1, GSIs whose composites are entirely entity primary-key composites — e.g. `byChannel: { pk: [channel], sk: [deviceId] }` on a Telemetry entity with `primaryKey: [channel, deviceId]` — were silently skipped on every write. The per-half evaluation gate consulted only the update payload, but PK composites never appear there: the writer addresses the row by key, never restates them in `.set({...})`, and `.append()` separates structural fields from the SET clause. The composer ran but the gate classified both halves as untouched → `gsi*pk` / `gsi*sk` were never written → channel-scoped GSI queries returned nothing.
+
+v1.7.2 fixes this in two places:
+1. The per-half evaluation gate now also counts `keyRecord` membership, so PK-composite-only halves are touched on every write that has a `keyRecord`.
+2. `Entity.append()` no longer filters PK composites out of the payload it passes to the composer (the filter never solved a real problem and combined with #1 to silently break this pattern).
+
+**Affected items:** items written to PK-composites-only GSIs under v1.7.0 or v1.7.1 will repair themselves on the next `Entity.update()` against them. The gate now fires correctly, the structural rule composes the immutable PK values, and the missing GSI keys are SET. No data migration is needed; reads via the GSI start returning these items as their next update lands. If you have items that aren't naturally updated, a one-shot bulk `set({ otherField: ... })` or `Entity.update(key).set({})` (touching no fields, just bumping `updatedAt` + version) is enough to repair them.
+
+This pattern is common — tenant-scoped queries (`byTenant: { pk: [tenantId] }`), entity-key-projected GSIs, channel-scoped time-series. Test coverage for the policy-aware composer must always include the PK-composites-only shape; missing it (as the v1.7.1 fixture matrix did) is what produced this regression.
+
 ## 10. Make-time guarantees
 
 ### EDD-9025 — composite attributes can't be nullable
@@ -326,9 +343,14 @@ The error class is still exported for back-compat with consumers who type-import
 
 ## When is a GSI evaluated?
 
-Per the [per-half evaluation gate](#per-half-evaluation-gate-new-in-v171), each *half* is evaluated only when at least one of its composites is in the update payload, or when `Entity.remove([attr])` names one of its composites. Halves whose composites are entirely outside the payload are skipped — no SET, no REMOVE, no policy fires.
+Per the [per-half evaluation gate](#per-half-evaluation-gate-v171-broadened-in-v172), each *half* is evaluated when at least one of its composites is:
+- in the update payload, OR
+- in `keyRecord` (the entity primary-key attributes used to address the row — added in **v1.7.2**, [#43](https://github.com/jmenga/effect-dynamodb/issues/43)), OR
+- in `Entity.remove([attr])`.
 
-The presence of an `indexPolicy` declaration does **not** force evaluation of every update under v1.7.1 (this is a behavior change from v1.7.0). The per-half gate is the same regardless of whether `indexPolicy` is declared.
+Halves whose composites satisfy none of those conditions are skipped — no SET, no REMOVE, no policy fires.
+
+The presence of an `indexPolicy` declaration does **not** force evaluation of every update under v1.7.1+ (this is a behavior change from v1.7.0). The per-half gate is the same regardless of whether `indexPolicy` is declared.
 
 ## Interaction with `put()`
 
@@ -336,7 +358,9 @@ The presence of an `indexPolicy` declaration does **not** force evaluation of ev
 
 ## Interaction with time-series `.append()`
 
-v1.7.x unifies `.append()` with `.update()` — both call the same composer with the same per-half evaluation gate. Composites outside `appendInput` are absent under the structural rule, AND the half is untouched per the gate (composite name is not in payload, not in removedSet). Halves whose composites are entirely outside `appendInput` are skipped.
+v1.7.x unifies `.append()` with `.update()` — both call the same composer with the same per-half evaluation gate. Composites outside `appendInput` are absent under the structural rule, AND the half is untouched per the gate (composite name is not in payload, not in keyRecord, not in removedSet). Halves whose composites are entirely outside `appendInput` *and* entirely outside the entity primary key are skipped.
+
+For GSIs whose composites are entirely entity-PK composites (e.g. `byChannel: { pk: [channel], sk: [deviceId] }` on `primaryKey: [channel, deviceId]`), the half is always touched via keyRecord membership and the structural rule composes from the immutable PK values on every append. The resulting SET is idempotent. (v1.7.0 / v1.7.1 silently skipped these GSIs — see the *byChannel* pitfall above; closes [#43](https://github.com/jmenga/effect-dynamodb/issues/43).)
 
 A multi-writer entity should declare its GSI shape so each half is owned by a single writer's domain — that's the design rule and the natural fit with per-half policy.
 
@@ -348,9 +372,19 @@ With per-half policy, the per-half evaluation gate, and the structural compositi
 
 Concretely: if you have a hybrid GSI with `pk = [accountId, alertState]` where `accountId` is enrichment-owned and `alertState` is ingest-owned, restructure to put each writer's composites on its own half — `pk = [accountId]`, `sk = [alertState, ...]` — so each half has a single owner. The per-half policy then expresses each writer's intent cleanly, and the per-half gate ensures one writer never disturbs the other's key.
 
+## Migrating from 1.7.1 (or 1.7.0)
+
+v1.7.2 is a patch release fixing the PK-composites-only GSI regression introduced by v1.7.1's per-half evaluation gate (closes [#43](https://github.com/jmenga/effect-dynamodb/issues/43)). **No API changes** — same `indexPolicy: { pk, sk }` declaration, same `Entity.remove([...])` API, same EDD-9025 invariants.
+
+**Behavior change** (strictly more correct than v1.7.1):
+
+- **Per-half evaluation gate now also counts `keyRecord` membership.** GSI halves whose composites are entirely entity primary-key composites are now correctly classified as touched on every write, and the structural rule composes their keys from the immutable PK values. The resulting SET is idempotent. Items written under v1.7.0 / v1.7.1 against such GSIs (where the gate silently skipped them) repair themselves on the next `Entity.update()` against them — no data migration needed; reads via the GSI start returning these items as their next update lands.
+
+If you used the `byChannel`-style pattern (GSI composites = subset of entity PK) under v1.7.0 or v1.7.1 and noticed channel-scoped queries returning no items, this is the fix. Re-run any item that should be in the GSI through any update touching any field, and the GSI key composition will land.
+
 ## Migrating from 1.7.0
 
-v1.7.1 is a patch release fixing three connected bugs in the v1.7.0 roll-up. **No API changes** — same `indexPolicy: { pk, sk }` declaration, same `Entity.remove([...])` API, same EDD-9025 invariants.
+v1.7.1 was a patch release fixing three connected bugs in the v1.7.0 roll-up. **No API changes** — same `indexPolicy: { pk, sk }` declaration, same `Entity.remove([...])` API, same EDD-9025 invariants.
 
 **Behavior changes** (all bug fixes — strictly more correct than v1.7.0):
 

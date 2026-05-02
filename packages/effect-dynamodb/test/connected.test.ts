@@ -1865,6 +1865,368 @@ describeConnected("timeSeries integration tests", () => {
 })
 
 // ===========================================================================
+// PK-composites-only GSI shape — closes #43
+// ===========================================================================
+//
+// The bug: GSIs whose composites are entirely entity-PK composites (e.g.
+// `byChannel: { pk: [channel], sk: [deviceId] }` on an entity with
+// `primaryKey: [channel, deviceId]`) had their `gsi*pk` / `gsi*sk` keys
+// silently skipped under v1.7.0 / v1.7.1. Items written through `.append()`
+// (and updates that didn't restate the PK composites in payload) were
+// invisible to channel-scoped GSI queries.
+//
+// These tests exercise the v1.7.2 fix end-to-end against DDB Local: the
+// items must be visible to byChannel queries after both `.append()` and
+// `.update()` writes, and the GSI keys must be preserved across multiple
+// updates (idempotent re-SET).
+// ===========================================================================
+
+class ChannelDevice extends Schema.Class<ChannelDevice>("ChannelDevice")({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  accountId: Schema.optional(Schema.String),
+  alertState: Schema.optional(Schema.String),
+  timestamp: Schema.DateTimeUtc,
+  reading: Schema.optional(Schema.Number),
+  otherField: Schema.optional(Schema.String),
+}) {}
+
+const ChannelDeviceAppendInput = Schema.Struct({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  timestamp: Schema.DateTimeUtc,
+  reading: Schema.optional(Schema.Number),
+})
+
+const cdSchema = DynamoSchema.make({ name: "cd-test", version: 1 })
+const cdTableName = `cd-test-${Date.now()}`
+
+// PK-composites-only GSI shape — the #43 bug repro entity. Time-series
+// because that was the originally-reported failure surface.
+const ChannelDevicesTs = Entity.make({
+  model: ChannelDevice,
+  entityType: "ChannelDeviceTs",
+  primaryKey: {
+    pk: { field: "pk", composite: ["channel", "deviceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byChannel: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["channel"] },
+      sk: { field: "gsi1sk", composite: ["deviceId"] },
+      indexPolicy: { pk: "preserve", sk: "preserve" },
+    },
+  },
+  timestamps: true,
+  timeSeries: {
+    orderBy: "timestamp",
+    ttl: Duration.days(7),
+    appendInput: ChannelDeviceAppendInput,
+  },
+})
+
+// Same shape but no time-series — exercises the standard `.update()` path.
+const ChannelDevicesPlain = Entity.make({
+  model: ChannelDevice,
+  entityType: "ChannelDevicePlain",
+  primaryKey: {
+    pk: { field: "pk", composite: ["channel", "deviceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byChannel: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["channel"] },
+      sk: { field: "gsi2sk", composite: ["deviceId"] },
+      indexPolicy: { pk: "preserve", sk: "preserve" },
+    },
+  },
+  timestamps: true,
+})
+
+// Multi-writer entity: TWO GSIs — one PK-composites-only (byChannel on gsi3),
+// one multi-writer with non-PK composites (byCurrentAlert on gsi4). Used to
+// verify both behaviors coexist — PK-only fires every write (idempotent SET),
+// multi-writer GSI is untouched by stamps.
+const ChannelDevicesMixed = Entity.make({
+  model: ChannelDevice,
+  entityType: "ChannelDeviceMixed",
+  primaryKey: {
+    pk: { field: "pk", composite: ["channel", "deviceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byChannel: {
+      // PK-composites-only — must fire on every write (#43).
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["channel"] },
+      sk: { field: "gsi3sk", composite: ["deviceId"] },
+      indexPolicy: { pk: "preserve", sk: "preserve" },
+    },
+    byCurrentAlert: {
+      // Multi-writer — neither composite is in the PK; stamp updates must
+      // leave both halves untouched (v1.7.1 multi-writer fix preserved).
+      name: "gsi4",
+      pk: { field: "gsi4pk", composite: ["accountId"] },
+      sk: { field: "gsi4sk", composite: ["alertState"] },
+      indexPolicy: { pk: "preserve", sk: "preserve" },
+    },
+  },
+  timestamps: true,
+})
+
+const CdTable = Table.make({
+  schema: cdSchema,
+  entities: { ChannelDevicesTs, ChannelDevicesPlain, ChannelDevicesMixed },
+})
+const CdLayer = Layer.mergeAll(ClientLayer, CdTable.layer({ name: cdTableName }))
+const provideCd = Effect.provide(CdLayer)
+
+describeConnected("PK-composites-only GSI shape (closes #43)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: cdTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(CdTable),
+        })
+      }).pipe(provideCd, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: cdTableName })
+      }).pipe(
+        provideCd,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect(
+    "Entity.append() writes gsi1pk + gsi1sk on PK-composites-only GSI; byChannel query returns the item",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { ChannelDevicesTs },
+          tables: { CdTable },
+        })
+
+        yield* db.entities.ChannelDevicesTs.append({
+          channel: "ch-append",
+          deviceId: "d-append-1",
+          timestamp: DateTime.makeUnsafe("2026-04-30T10:00:00.000Z"),
+          reading: 42,
+        })
+
+        // Pre-v1.7.2 this query returned 0 items because gsi1pk / gsi1sk
+        // were never written by .append().
+        const rows = yield* db.entities.ChannelDevicesTs.byChannel({
+          channel: "ch-append",
+        }).collect()
+        expect(rows).toHaveLength(1)
+        expect(rows[0]!.deviceId).toBe("d-append-1")
+      }).pipe(provideCd),
+  )
+
+  it.effect(
+    "Entity.update().set() preserves gsi keys on PK-composites-only GSI; byChannel still returns the item",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { ChannelDevicesTs },
+          tables: { CdTable },
+        })
+
+        // Seed via append.
+        yield* db.entities.ChannelDevicesTs.append({
+          channel: "ch-update",
+          deviceId: "d-update-1",
+          timestamp: DateTime.makeUnsafe("2026-04-30T10:00:00.000Z"),
+        })
+
+        // Issue an update that doesn't mention channel or deviceId in the
+        // payload. Pre-v1.7.2 the per-half gate skipped both halves and
+        // the gsi keys persisted unchanged (correct here only because
+        // append already wrote them — but pre-v1.7.2 append didn't, so the
+        // item was invisible from the start). Post-v1.7.2 the SK halves
+        // SET via the broadened gate using keyRecord membership.
+        yield* db.entities.ChannelDevicesTs.update({
+          channel: "ch-update",
+          deviceId: "d-update-1",
+        }).set({ otherField: "X" })
+
+        const rows = yield* db.entities.ChannelDevicesTs.byChannel({
+          channel: "ch-update",
+        }).collect()
+        expect(rows).toHaveLength(1)
+        expect(rows[0]!.deviceId).toBe("d-update-1")
+        expect(rows[0]!.otherField).toBe("X")
+      }).pipe(provideCd),
+  )
+
+  it.effect("Multiple sequential updates idempotently re-SET the same gsi key values", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { ChannelDevicesPlain },
+        tables: { CdTable },
+      })
+
+      yield* db.entities.ChannelDevicesPlain.put({
+        channel: "ch-idem",
+        deviceId: "d-idem-1",
+        timestamp: DateTime.makeUnsafe("2026-04-30T10:00:00.000Z"),
+      }).asEffect()
+
+      // Multiple updates — each one SETs gsi2pk and gsi2sk to the same
+      // composed value (PK composites are immutable). DDB SET to the
+      // same value is a noop on the byte representation but a billable
+      // write — that's expected and acknowledged in DESIGN.md §7.
+      for (const i of [1, 2, 3]) {
+        yield* db.entities.ChannelDevicesPlain.update({
+          channel: "ch-idem",
+          deviceId: "d-idem-1",
+        }).set({ otherField: `update-${i}` })
+      }
+
+      const rows = yield* db.entities.ChannelDevicesPlain.byChannel({
+        channel: "ch-idem",
+      }).collect()
+      expect(rows).toHaveLength(1)
+      expect(rows[0]!.deviceId).toBe("d-idem-1")
+      expect(rows[0]!.otherField).toBe("update-3")
+
+      // Sanity-check the actual GSI keys via a direct query — they must
+      // hold the composed values across the three SETs.
+      const raw = yield* (yield* DynamoClient).getItem({
+        TableName: cdTableName,
+        Key: {
+          pk: {
+            S: "$cd-test#v1#channeldeviceplain#channel_ch-idem#deviceid_d-idem-1",
+          },
+          sk: { S: "$cd-test#v1#channeldeviceplain" },
+        },
+      })
+      expect(raw.Item).toBeDefined()
+      expect(raw.Item!.gsi2pk?.S).toBe("$cd-test#v1#channeldeviceplain#channel_ch-idem")
+      expect(raw.Item!.gsi2sk?.S).toBe("$cd-test#v1#channeldeviceplain#deviceid_d-idem-1")
+    }).pipe(provideCd),
+  )
+
+  it.effect(
+    "Multi-writer GSI (NOT PK-composites-only) — stamp update leaves byCurrentAlert untouched",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { ChannelDevicesMixed },
+          tables: { CdTable },
+        })
+
+        // Seed: enrichment sets accountId, telemetry sets alertState.
+        yield* db.entities.ChannelDevicesMixed.put({
+          channel: "ch-mixed-mw",
+          deviceId: "d-mw-1",
+          accountId: "acct-1",
+          alertState: "active",
+          timestamp: DateTime.makeUnsafe("2026-04-30T10:00:00.000Z"),
+        }).asEffect()
+
+        // Capture the byCurrentAlert key composition baseline.
+        const baseline = yield* (yield* DynamoClient).getItem({
+          TableName: cdTableName,
+          Key: {
+            pk: {
+              S: "$cd-test#v1#channeldevicemixed#channel_ch-mixed-mw#deviceid_d-mw-1",
+            },
+            sk: { S: "$cd-test#v1#channeldevicemixed" },
+          },
+        })
+        const baselineGsi4pk = baseline.Item?.gsi4pk?.S
+        const baselineGsi4sk = baseline.Item?.gsi4sk?.S
+        expect(baselineGsi4pk).toBeDefined()
+        expect(baselineGsi4sk).toBeDefined()
+
+        // Stamp writer — touches a non-composite. byCurrentAlert (gsi4)
+        // composites (accountId, alertState) are NOT in the payload AND
+        // NOT in keyRecord (only channel/deviceId are). Per-half gate must
+        // skip both halves of byCurrentAlert. v1.7.1 multi-writer fix.
+        yield* db.entities.ChannelDevicesMixed.update({
+          channel: "ch-mixed-mw",
+          deviceId: "d-mw-1",
+        }).set({ otherField: "stamp-value" })
+
+        const after = yield* (yield* DynamoClient).getItem({
+          TableName: cdTableName,
+          Key: {
+            pk: {
+              S: "$cd-test#v1#channeldevicemixed#channel_ch-mixed-mw#deviceid_d-mw-1",
+            },
+            sk: { S: "$cd-test#v1#channeldevicemixed" },
+          },
+        })
+        // byCurrentAlert keys unchanged — multi-writer fix preserved.
+        expect(after.Item?.gsi4pk?.S).toBe(baselineGsi4pk)
+        expect(after.Item?.gsi4sk?.S).toBe(baselineGsi4sk)
+        // byChannel keys (gsi3, PK-composites-only) SET on every write
+        // (idempotent) — values unchanged but the SET clause was emitted.
+        expect(after.Item?.gsi3pk?.S).toBe("$cd-test#v1#channeldevicemixed#channel_ch-mixed-mw")
+        expect(after.Item?.gsi3sk?.S).toBe("$cd-test#v1#channeldevicemixed#deviceid_d-mw-1")
+      }).pipe(provideCd),
+  )
+
+  it.effect(
+    "Mixed entity (PK-composites-only + multi-writer GSIs) — both behaviors coexist on the same write",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { ChannelDevicesMixed },
+          tables: { CdTable },
+        })
+
+        yield* db.entities.ChannelDevicesMixed.put({
+          channel: "ch-mixed",
+          deviceId: "d-mixed-1",
+          accountId: "acct-2",
+          alertState: "warning",
+          timestamp: DateTime.makeUnsafe("2026-04-30T11:00:00.000Z"),
+        }).asEffect()
+
+        // Stamp update: only otherField changes. byChannel (gsi3,
+        // PK-composites-only) must SET (idempotent re-compose).
+        // byCurrentAlert (gsi4, multi-writer) must noop.
+        yield* db.entities.ChannelDevicesMixed.update({
+          channel: "ch-mixed",
+          deviceId: "d-mixed-1",
+        }).set({ otherField: "stamped" })
+
+        // byChannel query (gsi3) returns the item — proves PK-composites-only
+        // SET happened.
+        const byChannelRows = yield* db.entities.ChannelDevicesMixed.byChannel({
+          channel: "ch-mixed",
+        }).collect()
+        expect(byChannelRows).toHaveLength(1)
+        expect(byChannelRows[0]!.deviceId).toBe("d-mixed-1")
+        expect(byChannelRows[0]!.otherField).toBe("stamped")
+
+        // byCurrentAlert query (gsi4) also returns the item — proves the
+        // multi-writer GSI keys were preserved across the stamp update.
+        const byAlertRows = yield* db.entities.ChannelDevicesMixed.byCurrentAlert({
+          accountId: "acct-2",
+        }).collect()
+        expect(byAlertRows).toHaveLength(1)
+        expect(byAlertRows[0]!.alertState).toBe("warning")
+      }).pipe(provideCd),
+  )
+})
+
+// ===========================================================================
 // Entity Refs + Aggregate Connected Tests (separate table with GSI for aggregates)
 // ===========================================================================
 

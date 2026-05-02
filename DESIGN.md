@@ -642,16 +642,19 @@ indexes: {
 
 `set({ attr: null })` is no longer a separate "drop signal" — it still REMOVEs the attribute from the item (the data-attribute REMOVE clause), but it does not separately cascade-drop the GSI keys. Drop-via-cascade goes through `Entity.remove([attr])` instead.
 
-**Per-half evaluation gate (NEW in v1.7.1 — closes the multi-writer leak).** Before the structural rule even runs, each half is checked for whether the writer touched it. **If a half is untouched, it is skipped entirely — no SET, no REMOVE, no policy fires.** A half is "touched" iff at least one of its composite names appears in the update payload (regardless of value, including `undefined`) OR appears in `Entity.remove([...])`:
+**Per-half evaluation gate (v1.7.1, broadened in v1.7.2 — closes the multi-writer leak AND the PK-composites-only regression).** Before the structural rule even runs, each half is checked for whether the writer touched it. **If a half is untouched, it is skipped entirely — no SET, no REMOVE, no policy fires.** A half is "touched" iff at least one of its composite names appears in the update payload (regardless of value, including `undefined`) OR appears in `keyRecord` (the entity primary-key attributes carried into the composer alongside the payload) OR appears in `Entity.remove([...])`:
 
 ```ts
 const halfTouched =
   halfComposites.some((c) => c in updatePayload) ||
+  halfComposites.some((c) => c in keyRecord) ||   // v1.7.2 (closes #43)
   halfComposites.some((c) => removedSet?.has(c))
 if (!halfTouched) continue  // leave this half's key attribute alone
 ```
 
-Why: `'sparse'`'s contract is *with the half's owner*. If the writer doesn't touch any of the half's composites, they aren't claiming ownership of this half on this call — sparse shouldn't fire. The writer-scope concept #38 was reaching for falls out of payload contents naturally.
+Why two input sources, not one: composites that are *also* entity primary-key composites (e.g. `byChannel: { pk: [channel], sk: [deviceId] }` on an entity with `primaryKey: [channel, deviceId]`) arrive through `keyRecord`, never through `updatePayload` — the writer addresses the row by key, doesn't restate those values in `.set({...})`, and `.append()` deliberately separates structural fields from the SET clause. The v1.7.1 gate looked only at `updatePayload` and so classified such halves as "untouched" on every call, skipping evaluation entirely; the half's `gsiNpk` / `gsiNsk` were never composed and the item was invisible to the GSI. v1.7.2 broadens "touched" to also count `keyRecord` membership: any GSI half whose composites are entity-PK composites is now evaluated on every write that has a `keyRecord`, and the structural rule composes the half from the always-present PK values. The behavior is idempotent — re-SETting the same composed value from immutable PK composites produces the same key — so there is no multi-writer regression from broadening the gate (see issue #43 for the full analysis and the multi-writer preservation argument).
+
+Why: `'sparse'`'s contract is *with the half's owner*. If the writer doesn't touch any of the half's composites — neither in payload, nor through the key-addressed structural inputs — they aren't claiming ownership of this half on this call. The writer-scope concept #38 was reaching for falls out of payload-plus-keyRecord contents naturally.
 
 End-to-end consequences for the canonical multi-writer scenarios:
 
@@ -722,7 +725,7 @@ Naming any one composite of a half is enough — `Entity.remove` doesn't require
 
 For each half (PK then SK), independently:
 
-1. **Evaluation gate.** If no composite of this half is in `payload` AND no composite of this half is in `removedSet` → `noop` (skip — leave the stored key untouched). Otherwise the half is **touched**, continue.
+1. **Evaluation gate.** If no composite of this half is in `payload` AND no composite of this half is in `keyRecord` AND no composite of this half is in `removedSet` → `noop` (skip — leave the stored key untouched). Otherwise the half is **touched**, continue. (`keyRecord` membership is the v1.7.2 broadening — see #43; entity-PK composites are always present in `keyRecord` and so any GSI half whose composites are entity-PK composites is touched on every write.)
 2. **Structural rule.** Walk the half's composite list left-to-right. Find the longest leading prefix of present values in `M`.
 3. **Classify the outcome:**
    - **Compose succeeded** (leading prefix is non-empty AND no hole — i.e. all absent composites are at trailing positions): SET this half's key from the leading prefix. Done.
@@ -735,9 +738,11 @@ The two halves' outcomes are emitted independently — each affects only its own
 
 **`put()` semantics (unchanged).** `put()` does not consult `indexPolicy`. It writes a complete item from scratch — any missing composite means "this item is not in that GSI." The existing `tryComposeIndexKeys` path (omit GSI keys when any composite is absent) is preserved as-is. `indexPolicy` exists specifically to resolve the update/append ambiguity, not the put case.
 
-**`.append()` semantics (time-series) — same composer.** v1.7.x unifies append with update. `.append(input)` calls the same composer as `.update(...).set(...)`, with `appendInput` as the payload. Composites outside `appendInput` are simply absent under the structural rule, and the per-half evaluation gate applies — halves whose composites are entirely outside `appendInput` are untouched and follow the noop branch.
+**`.append()` semantics (time-series) — same composer.** v1.7.x unifies append with update. `.append(input)` calls the same composer as `.update(...).set(...)`, with the encoded append input passed as both `updatePayload` and `keyRecord` (v1.7.2 — see #43; the v1.7.1 path filtered PK composites out of the payload, which combined with the gate-only-checks-payload bug to skip GSI evaluation for any half whose composites are entirely entity-PK composites). Composites outside `appendInput` are simply absent under the structural rule, and the per-half evaluation gate applies — halves whose composites are entirely outside `appendInput` AND outside the entity primary key are untouched and follow the noop branch.
 
-For sparse GSIs whose composites are entirely outside `appendInput`, the half is untouched → noop (under v1.7.1). Sparse only fires when the writer touches the half but can't compose it. This matches the consumer-side multi-writer recommendation: sparse GSIs should be single-writer-per-half by design.
+For sparse GSIs whose composites are entirely outside `appendInput` *and* outside the entity primary key, the half is untouched → noop. Sparse only fires when the writer touches the half but can't compose it. This matches the consumer-side multi-writer recommendation: sparse GSIs should be single-writer-per-half by design.
+
+For GSIs whose composites are entirely entity-PK composites (e.g. `byChannel: { pk: [channel], sk: [deviceId] }` on a Telemetry entity with `primaryKey: [channel, deviceId]`), the half is always touched (PK composites are always in `keyRecord`), the structural rule always composes from the immutable PK values, and the resulting SET is idempotent — every write re-emits the same composed key. This is the correct behavior; v1.7.0 / v1.7.1 silently skipped these GSIs, leaving items invisible to channel-scoped queries.
 
 **EDD-9024 (`CompositeKeyHoleError`) deprecation — runtime-irrelevant in v1.7.1.** The class is kept exported for back-compat but no longer thrown at runtime. The original v1.7.0 throw protected against an `[A, _, C]` shape under preserve — but the type system already catches the only "wrong" case the throw was guarding (required composites can't be omitted under `exactOptionalPropertyTypes` since v1.7.0 reverted the NullishOr widening; the only legitimate runtime hole is "optional leading composite absent + present trailing composite," which is a normal write the consumer expressly chose). Under v1.7.1 the hole pattern collapses into the unified can't-compose rule (drop under sparse, noop-or-cascade-override under preserve). See `Errors.ts` for the deprecation note on the class.
 
@@ -786,6 +791,18 @@ entity.update(key).remove(['alertState']).asEffect()
 | Cascade override under preserve | `{ pk: "preserve" }`, `update(key).remove(["accountId"])` (no surviving pk composites) | touched (cascade), can't compose + preserve + cascade override → REMOVE gsi1pk | untouched, **noop** | gsi1pk REMOVE'd via cascade override |
 
 **Multi-writer entity design rule.** Each GSI half should be entirely owned by a single writer's domain. The library does not paper over cross-writer composite ownership — that's a consumer-side modeling discipline. With v1.7.1's per-half evaluation gate and the per-half outcome rule, a writer that doesn't touch a GSI's composites simply doesn't supply them, and the half no-ops regardless of policy. There is no per-composite leakage across writers like in v1.6, and no GSI-wide blast radius like in v1.7.0.
+
+**v1.7.0 / v1.7.1 → v1.7.2 PK-composites-only regression callout (closes #43).** The v1.7.1 per-half gate consulted only `updatePayload`. For GSI halves whose composites are entity-PK composites (a common pattern: tenant-scoped queries, entity-key-projected GSIs), `updatePayload` never carried those composites — the writer addresses the row by key, never restates them in `.set({...})`, and `.append()` further filtered PK composites out of its payload before passing to the composer. The gate saw both halves as untouched, skipped GSI evaluation entirely, and never wrote `gsiNpk` / `gsiNsk`. Items written under v1.7.0 / v1.7.1 against such GSIs were invisible to GSI queries. v1.7.2 fixes this in two places: the gate now also counts `keyRecord` membership (so PK composites carried alongside the payload count as "touched"), AND `Entity.append()` no longer filters PK composites out of the payload it passes to the composer (the filter never solved a real problem and silently broke this pattern). Affected items repair on the next `Entity.update()` against them — the gate now fires, the structural rule composes the immutable PK values, and the missing GSI keys are SET. No data migration needed; reads via the GSI start returning these items as their next update lands.
+
+#### Canonical GSI-composite test-fixture shapes
+
+Test coverage for the policy-aware composer must span the canonical GSI-composite shapes. Missing one shape (as the v1.7.1 fixture matrix did with PK-composites-only) leads to consumer-facing regressions. Future work in this area must verify each shape:
+
+1. **Multi-writer GSI** — composites split across writers (e.g. enrichment-owned PK composite + telemetry-owned SK composites). The per-half gate must skip halves the current writer doesn't touch. Anchor scenario for the `'preserve'` contract.
+2. **PK-composites-only GSI** — composites entirely subset of the entity primary key (e.g. `byChannel: { pk: [channel], sk: [deviceId] }` on `primaryKey: [channel, deviceId]`). The per-half gate must fire via `keyRecord` membership and SET on every write. Regression scenario for #43 — must be present in unit, entity-level integration, and connected suites.
+3. **Hierarchical GSI** — composites form a parent → child hierarchy (e.g. `[region, country, city, site]`). The structural rule must truncate via `set({ parents }).remove(["leaf"])`.
+4. **Hole pattern GSI** — optional leading composite + present trailing composite. Must collapse into the unified can't-compose rule (drop under `'sparse'`, noop or cascade-override under `'preserve'`).
+5. **All composites mutable** — every composite is a non-PK model field, and `appendInput` / update payloads carry them all. The standard case; the gate fires through the payload.
 
 ### Sparse Map Storage (`storedAs: DynamoModel.SparseMap()`)
 
