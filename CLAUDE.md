@@ -326,6 +326,18 @@ Before committing:
 
 > **For agents:** all of the above gates must run successfully before reporting a task complete. The single most common gap is skipping gate 4 — `pnpm test:connected` requires DDB Local Docker running and is genuinely time-consuming, but it is mandatory for the modules listed there. Reporting "examples ran end-to-end against DDB Local ✓" does NOT satisfy gate 4. CI will catch the gap, but it costs a CI cycle, a stale PR review, and the agent's credibility. Run it before pushing.
 
+### Canonical GSI-composite test-fixture shapes
+
+When changing **`KeyComposer.composeGsiKeysForUpdatePolicyAware`** or any policy-aware composition path (`Entity.update`, `Entity.append`, retain path, BoundUpdate combinators), test coverage MUST span the canonical GSI-composite shapes below. Missing one shape leads directly to consumer-facing regressions — the v1.7.1 fixture matrix missed shape #2 (PK-composites-only) and shipped a regression that left items invisible to channel-scoped queries (#43). Verify each shape in the unit suite (`KeyComposer.test.ts`), at the entity wiring layer (`IndexPolicyV3.test.ts`), AND in the connected suite (`connected.test.ts`).
+
+1. **Multi-writer GSI** — composites split across writers (e.g. enrichment-owned PK composite + telemetry-owned SK composites). The per-half gate must skip halves the current writer doesn't touch. Anchor scenario for the `'preserve'` contract.
+2. **PK-composites-only GSI** — composites entirely subset of the entity primary key (e.g. `byChannel: { pk: [channel], sk: [deviceId] }` on `primaryKey: [channel, deviceId]`). The per-half gate must fire via `keyRecord` membership and SET on every write (idempotent — values are immutable). **This is the #43 regression scenario** — must be present in unit, entity-level, AND connected suites for any composer change.
+3. **Hierarchical GSI** — composites form a parent → child hierarchy (e.g. `[region, country, city, site]`). The structural rule must truncate via `set({ parents }).remove(["leaf"])`.
+4. **Hole pattern GSI** — optional leading composite + present trailing composite. Must collapse into the unified can't-compose rule (drop under `'sparse'`, noop or cascade-override under `'preserve'`).
+5. **All composites mutable** — every composite is a non-PK model field, and `appendInput` / update payloads carry them all. The standard case; the gate fires through the payload.
+
+`DESIGN.md §7` documents the same canonical shapes alongside the policy semantics. Cross-reference both whenever editing the composer.
+
 ## PR Conventions
 
 Every PR that resolves a tracked issue **MUST** reference the issue(s) it closes using a GitHub closing keyword (`Closes #N`, `Fixes #N`, or `Resolves #N`) in the PR body. This is non-negotiable — without a closing keyword, the issue stays open after merge and drifts out of sync with reality. A bare `#N` mention (e.g. "relates to #N") does **not** auto-close; use one of the keywords above, one per issue. If a PR only partially addresses an issue, reference it without a closing keyword and say so explicitly in the PR body.
