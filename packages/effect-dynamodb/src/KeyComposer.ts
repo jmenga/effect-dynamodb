@@ -426,11 +426,13 @@ type HalfOutcome =
   | { readonly kind: "drop" }
 
 /**
- * Apply v1.7.1's structural composition rule to a single *touched* half.
+ * Apply v1.7.1's structural composition rule to a single half that the
+ * skip-predicate gate (v1.7.3) decided not to skip.
  *
  * The caller is responsible for the per-half evaluation gate — `classifyHalf`
- * is only called once the half is known to be touched (some composite of the
- * half appears in payload OR in `removedSet`).
+ * is only called once the gate has decided this half should be evaluated
+ * (the half has no composites; OR a composite is in `removedSet`; OR a
+ * composite is in `updatePayload` or `keyRecord`).
  *
  * Walks the composite list left-to-right, finds the longest leading prefix of
  * present values in `record`, and classifies the result:
@@ -515,18 +517,26 @@ const resolveIndexPolicy = (
  * `.append` — v1.7.1 per-half structural composition with per-half evaluation
  * gate and per-half cascade.
  *
- * **Per-half evaluation gate (v1.7.1; broadened in v1.7.2).** Each half (PK
- * and SK) is independently checked for whether the writer touched it. A half
- * is "touched" iff at least one of its composite names appears in
- * `updatePayload` (regardless of value, including `undefined`) OR appears in
- * `keyRecord` (the entity primary-key attributes carried into the composer
- * alongside the payload) OR appears in `removedSet`. **Untouched halves are
- * skipped entirely — no SET, no REMOVE, no policy fires.** This closes the
- * v1.7.0 multi-writer leak where a "stamp" writer that doesn't touch a GSI's
- * composites would still trigger the policy and blow away another writer's
- * key, AND the v1.7.1 PK-composites-only regression (#43) where GSI halves
- * whose composites are entity-PK composites were silently skipped because
- * those composites arrive via `keyRecord`, not `updatePayload`.
+ * **Per-half evaluation gate (reframed in v1.7.3 as a skip-predicate).** Each
+ * half (PK and SK) is independently asked one question: *can this half be
+ * safely skipped?* The gate exists for exactly one reason — multi-writer
+ * protection: prevent writer A from clobbering keys for halves it doesn't
+ * own when writer B does own them. The skip-predicate states that purpose
+ * directly: skip iff multi-writer protection actually applies (the half has
+ * composites, no composite was explicitly removed, and every composite is
+ * absent from BOTH `updatePayload` AND `keyRecord` — so this writer is
+ * genuinely not claiming ownership of this half on this call). If the half
+ * cannot be safely skipped, it is evaluated by the structural rule.
+ *
+ * Pre-v1.7.3 the predicate was inverted ("list cases for which to evaluate"
+ * as a chain of `||` clauses) and had to enumerate every shape: payload
+ * membership (v1.7.0), `removedSet` membership (v1.7.1), `keyRecord`
+ * membership (v1.7.2). Each missed shape required another tactical patch:
+ * v1.7.1 missed the multi-writer leak (#41), v1.7.2 missed the
+ * PK-composites-only case (#43), v1.7.2 then missed the empty-composite-half
+ * case (#46) because every `.some(...)` clause trivially returned `false`
+ * for an empty composite array. The skip-predicate closes the entire class
+ * of degenerate-case bugs structurally.
  *
  * **Two-way payload classification.**
  * - **present** (`attr: <value>` in payload, or inherited from `keyRecord`)
@@ -583,44 +593,42 @@ export const composeGsiKeysForUpdatePolicyAware = (
     const pkComposites = index.pk.composite
     const skComposites = index.sk.composite
 
-    // Per-half evaluation gate (v1.7.1; broadened in v1.7.2 — closes #43).
-    // A half is touched iff at least one of its composite names appears in
-    // `updatePayload` (regardless of value) OR in `keyRecord` OR in
-    // `removedSet`. Untouched halves are skipped — leave the stored key
-    // attribute alone.
+    // Per-half evaluation gate (reframed in v1.7.3 as a skip-predicate —
+    // closes #46 and the class of degenerate-case bugs that v1.7.0–v1.7.2
+    // were chasing as separate `||` arms). The gate's only purpose is
+    // multi-writer protection — preventing writer A from clobbering keys
+    // for halves it doesn't own when writer B does own them. The skip
+    // predicate states that purpose directly: skip iff
     //
-    // Why `keyRecord` is part of the gate (v1.7.2): GSI halves whose
-    // composites are entity primary-key composites (e.g.
-    // `byChannel: { pk: [channel], sk: [deviceId] }` on an entity with
-    // `primaryKey: [channel, deviceId]`) never receive those composites via
-    // `updatePayload` — the writer addresses the row by key, never restates
-    // the values in `.set({...})`, and `.append()` similarly delivers them
-    // through the structural-keyRecord channel rather than the SET clause.
-    // The v1.7.1 gate looked only at `updatePayload` and so classified such
-    // halves as "untouched" on every call, skipping evaluation entirely.
-    // The half's `gsiNpk` / `gsiNsk` were never composed → items invisible
-    // to the GSI. v1.7.2 also counts `keyRecord` membership so any half
-    // whose composites are entity-PK composites is touched on every write
-    // that has a `keyRecord`. This is idempotent (re-SETting the same
-    // composed value from immutable PK composites produces the same key)
-    // and preserves the v1.7.1 multi-writer fix: stamps still don't have
-    // those composites in EITHER `updatePayload` OR `keyRecord` (those
-    // composites are enrichment-owned model attrs), so their halves
-    // remain untouched. See `DESIGN.md §7` and issue #43.
+    //   - the half has composites (otherwise the value is a constant
+    //     entity/collection prefix — nothing to multi-writer-clobber, so
+    //     skipping would just leave a missing key forever — closes #46),
+    //   - AND no composite of this half was explicitly removed (cascade
+    //     intent must always evaluate),
+    //   - AND every composite is absent from BOTH `updatePayload` AND
+    //     `keyRecord` (so this writer is genuinely not claiming ownership
+    //     of this half on this call — preserves the v1.7.1 multi-writer
+    //     fix #41 and the v1.7.2 PK-composites-only fix #43, since
+    //     entity-PK composites are always present in `keyRecord`).
+    //
+    // The negation `!shouldSkip` is observably equivalent to the previous
+    // touched-predicate `||`-chain extended with `composites.length === 0`:
+    // every fix the touched-predicate accumulated falls out of one of the
+    // skip-predicate's three structural conditions. See `DESIGN.md §7`.
     const pkHasRemoved =
       removedSet !== undefined && pkComposites.some((attr) => removedSet.has(attr))
     const skHasRemoved =
       removedSet !== undefined && skComposites.some((attr) => removedSet.has(attr))
-    const pkTouched =
-      pkHasRemoved ||
-      pkComposites.some((attr) => attr in updatePayload) ||
-      pkComposites.some((attr) => attr in keyRecord)
-    const skTouched =
-      skHasRemoved ||
-      skComposites.some((attr) => attr in updatePayload) ||
-      skComposites.some((attr) => attr in keyRecord)
+    const skipPk =
+      pkComposites.length > 0 &&
+      !pkHasRemoved &&
+      pkComposites.every((attr) => !(attr in updatePayload) && !(attr in keyRecord))
+    const skipSk =
+      skComposites.length > 0 &&
+      !skHasRemoved &&
+      skComposites.every((attr) => !(attr in updatePayload) && !(attr in keyRecord))
 
-    if (!pkTouched && !skTouched) continue
+    if (skipPk && skipSk) continue
 
     // Build merged record for value extraction. Two-way classification: any
     // payload value that is `null` or `undefined` is treated as absent. Any
@@ -644,7 +652,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
 
     const policy = resolveIndexPolicy(index.indexPolicy)
 
-    if (pkTouched) {
+    if (!skipPk) {
       const pkOutcome = classifyHalf(pkComposites, merged, policy.pk, pkHasRemoved)
       if (pkOutcome.kind === "drop") {
         removes.push(index.pk.field)
@@ -657,7 +665,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
       // noop — emit nothing for this half.
     }
 
-    if (skTouched) {
+    if (!skipSk) {
       const skOutcome = classifyHalf(skComposites, merged, policy.sk, skHasRemoved)
       if (skOutcome.kind === "drop") {
         removes.push(index.sk.field)
