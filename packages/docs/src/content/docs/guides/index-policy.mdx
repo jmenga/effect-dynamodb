@@ -79,24 +79,27 @@ For each *touched* half (PK and SK independently), the library walks the composi
 
 Truncation on PK is the same hierarchical demotion as truncation on SK. An item with `pk.composite = ['accountId', 'fleetId']` and `fleetId` absent composes a partition key of `account#A` and stays queryable at the account scope.
 
-### Per-half evaluation gate (v1.7.1, broadened in v1.7.2)
+### Per-half evaluation gate (reframed as a skip-predicate in v1.7.3)
 
-Before the structural rule even runs, each half is checked for whether the writer touched it. **If a half is untouched, it is skipped entirely — no SET, no REMOVE, no policy fires.**
+Before the structural rule even runs, each half is asked one question: *can this half be safely skipped?* The gate exists for one reason — **multi-writer protection**: prevent writer A from clobbering keys for halves it doesn't own when writer B does own them. The skip-predicate states that purpose directly:
 
-A half is *touched* iff at least one of its composite names appears in:
-- the update payload (regardless of value, including `undefined`), OR
-- the `keyRecord` carried alongside the payload — i.e. the entity primary-key composites used to address the row (added in **v1.7.2** to close [#43](https://github.com/jmenga/effect-dynamodb/issues/43); see the *byChannel* pitfall below), OR
-- `Entity.remove([...])`.
+> A half is **skipped** iff multi-writer protection actually applies — composites exist (otherwise the half value is a constant prefix and there's nothing to multi-writer-clobber), no composite was explicitly removed via `Entity.remove([...])`, AND every composite is absent from BOTH the update payload AND the `keyRecord` (the entity primary-key attributes carried alongside the payload). If the half cannot be safely skipped, it is **evaluated** — SET / REMOVE / noop per the structural rule below.
 
 This is what makes the multi-writer story work end-to-end:
 
 | Writer | Payload | byCurrentAlert eval |
 |---|---|---|
-| Stamp | `{ published: "2026-04-30" }` | Both halves untouched (composites are not in payload, not in keyRecord, not in `Entity.remove`) → noop, both halves preserved |
-| Enrichment | `{ accountId: "newAcct" }` | pk touched (SET); sk untouched (noop) |
-| Telemetry | `{ alertState: "active", timestamp: T }` | pk untouched (noop); sk touched (SET) |
+| Stamp | `{ published: "2026-04-30" }` | Both halves skipped (composites not in payload, not in keyRecord, not in `Entity.remove`, both halves have composites) → noop, both halves preserved |
+| Enrichment | `{ accountId: "newAcct" }` | pk evaluated (SET); sk skipped (noop) |
+| Telemetry | `{ alertState: "active", timestamp: T }` | pk skipped (noop); sk evaluated (SET) |
 
-Why `keyRecord` is in the gate (v1.7.2): GSI halves whose composites are entity primary-key composites — for example `byChannel: { pk: [channel], sk: [deviceId] }` on an entity with `primaryKey: [channel, deviceId]` — never receive those composites via the update payload. The writer addresses the row by key, never restates the values in `.set({...})`, and `.append()` separates structural fields from the SET clause. The v1.7.1 gate looked only at the payload and so silently classified such halves as untouched on every write — `gsi*pk` / `gsi*sk` were never composed and the item was invisible to the GSI. v1.7.2 broadens the check to also count `keyRecord` membership; the resulting SET is idempotent for entity-PK composites because they're immutable.
+The skip-predicate has three structural conditions, each closing a different class of regression:
+
+1. **`composites.length > 0`** — empty-composite halves (e.g. `sk: { composite: [] }`) are always evaluated. The half value is a constant prefix; multi-writer protection doesn't apply, and skipping would leave the key permanently missing. Closes [#46](https://github.com/jmenga/effect-dynamodb/issues/46) — see the *empty-composite half* pitfall below.
+2. **`!hasRemoved`** — halves with any composite in `Entity.remove([...])` are always evaluated. Removal intent must run the structural rule (which may then SET-truncate, REMOVE under sparse, or REMOVE under preserve via the cascade override).
+3. **`every(composite NOT in updatePayload AND NOT in keyRecord)`** — only writers genuinely not claiming ownership of the half (composites absent from both input sources) get the skip. Closes [#41](https://github.com/jmenga/effect-dynamodb/issues/41) (multi-writer leak — composites in payload mean ownership) and [#43](https://github.com/jmenga/effect-dynamodb/issues/43) (PK-composites-only — entity-PK composites arrive via `keyRecord`, never via payload, so they correctly fail this clause and are always evaluated). The resulting SET for PK-composites-only halves is idempotent because PK composites are immutable.
+
+The skip-predicate's negation is observably equivalent to the touched-predicate `||`-chain that v1.7.0 → v1.7.2 progressively built up — same SET/REMOVE outcomes for every input. v1.7.3 reframes the gate to make its purpose (multi-writer protection) the *only* thing the predicate checks, so future degenerate-case shapes fall out automatically instead of requiring another `||` arm.
 
 ## 6. Per-key outcome rolls up to per-key storage
 
@@ -104,11 +107,11 @@ The roll-up is **per-key** — each half's outcome applies to its own key attrib
 
 | Outcome for this half's key attribute | Conditions |
 |---|---|
-| **noop** (leave key alone) | The half is *untouched* (no composite in payload, none in `Entity.remove`) |
-| **SET full** | Half touched, all composites composable |
-| **SET truncated** to leading prefix | Half touched, leading prefix non-empty, no hole |
-| **REMOVE** this half's key | Half touched, can't compose (empty leading prefix OR hole pattern), AND policy is `'sparse'` OR a composite is in `Entity.remove([...])` (cascade override under preserve) |
-| **noop** (stored key may go stale) | Half touched, can't compose, policy is `'preserve'`, AND no composite is in `Entity.remove` |
+| **noop** (leave key alone) | Half is **skipped** by the gate (multi-writer protection applies — has composites, no removal, every composite absent from payload AND keyRecord) |
+| **SET full** | Half evaluated, all composites composable |
+| **SET truncated** to leading prefix | Half evaluated, leading prefix non-empty, no hole |
+| **REMOVE** this half's key | Half evaluated, can't compose (empty leading prefix OR hole pattern), AND policy is `'sparse'` OR a composite is in `Entity.remove([...])` (cascade override under preserve) |
+| **noop** (stored key may go stale) | Half evaluated, can't compose, policy is `'preserve'`, AND no composite is in `Entity.remove` |
 
 The "noop with stale risk" row is the one place sparse vs preserve actually differ at runtime. Under preserve, if you `set({ X: undefined })` for an optional composite without supplying surrounding context, the GSI key isn't updated — it retains whatever was stored last. To force a clean cleanup under preserve, use `Entity.remove(["X"])`: the cascade override fires and REMOVEs the half.
 
@@ -298,6 +301,43 @@ v1.7.2 fixes this in two places:
 
 This pattern is common — tenant-scoped queries (`byTenant: { pk: [tenantId] }`), entity-key-projected GSIs, channel-scoped time-series. Test coverage for the policy-aware composer must always include the PK-composites-only shape; missing it (as the v1.7.1 fixture matrix did) is what produced this regression.
 
+### Empty-composite-half GSI returns 0 items in v1.7.0–v1.7.2 (fixed in v1.7.3)
+
+In v1.7.0, v1.7.1, and v1.7.2, GSIs with at least one half declared `composite: []` (the standard "bare entity prefix" pattern, common in single-table-design lookup GSIs) had that half silently skipped on every `Entity.update()`. The per-half evaluation gate used a "touched" predicate built from `.some(...)` clauses — and `.some(...)` over an empty array trivially returns `false`, so the gate classified empty halves as untouched and never composed them. `Entity.put()` worked correctly (it uses the separate `composeAllKeys` path), but any subsequent `.update()` that touched the OTHER half left the empty-composite half missing — and worse, an `.update()` that bound a previously-sparse GSI for the first time (e.g. setting `deviceBinding` on a vehicle that was created without one) wrote only the PK half, leaving the SK missing → invisible to the GSI.
+
+```typescript
+// Reproducer (#46) — Vehicle entity with byDeviceBinding lookup GSI.
+const Vehicles = Entity.make({
+  model: Vehicle,
+  entityType: "Vehicle",
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byDeviceBinding: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["deviceBinding"] },
+      sk: { field: "gsi3sk", composite: [] },   // ← empty SK composite
+    },
+  },
+})
+
+// Pre-v1.7.3:
+yield* db.entities.Vehicles.put({ id: "veh-1" })   // sparse, no gsi3 keys
+yield* db.entities.Vehicles.update({ id: "veh-1" }).set({ deviceBinding: "cloud#dev-1" })
+//   → gsi3pk SET, gsi3sk NEVER written → query returns 0 items.
+
+// v1.7.3:
+//   → gsi3pk SET, gsi3sk SET to constant prefix → query returns the vehicle. ✓
+```
+
+v1.7.3 reframes the per-half gate from a touched-predicate to a skip-predicate keyed on the gate's actual purpose (multi-writer protection). The leading `composites.length > 0` short-circuit keeps empty-composite halves "always evaluated" — the value is a constant prefix, so there's nothing for another writer to clobber, and skipping would just leave a permanently missing key.
+
+**Affected items:** vehicles (or other entities with this shape) that were `.update()`'d under v1.7.0–v1.7.2 with a missing empty-half key will repair themselves on the next `.update()` against them under v1.7.3. The next write composes the missing half from the constant prefix and the item rejoins the GSI. No data migration is needed; reads via the GSI start returning these items as their next update lands. If you have items that aren't naturally updated, a one-shot bulk `set({ otherField: ... })` (touching no GSI composites, just bumping `updatedAt` + version) is enough to repair them.
+
+This shape is common in single-table designs — any GSI used as a flat lookup (`byOwner`, `byEmail`, `byExternalId`) where the SK is just the entity prefix. Test coverage for the policy-aware composer must always include empty-composite halves; missing it (as the v1.7.2 fixture matrix did) is what produced this regression.
+
 ## 10. Make-time guarantees
 
 ### EDD-9025 — composite attributes can't be nullable
@@ -343,12 +383,17 @@ The error class is still exported for back-compat with consumers who type-import
 
 ## When is a GSI evaluated?
 
-Per the [per-half evaluation gate](#per-half-evaluation-gate-v171-broadened-in-v172), each *half* is evaluated when at least one of its composites is:
-- in the update payload, OR
-- in `keyRecord` (the entity primary-key attributes used to address the row — added in **v1.7.2**, [#43](https://github.com/jmenga/effect-dynamodb/issues/43)), OR
-- in `Entity.remove([attr])`.
+Per the [per-half evaluation gate](#per-half-evaluation-gate-reframed-as-a-skip-predicate-in-v173), each *half* is **skipped** iff multi-writer protection actually applies — and **evaluated** otherwise. The skip condition is:
 
-Halves whose composites satisfy none of those conditions are skipped — no SET, no REMOVE, no policy fires.
+- the half has composites (`composites.length > 0`) — empty-composite halves are always evaluated ([#46](https://github.com/jmenga/effect-dynamodb/issues/46)), AND
+- no composite is in `Entity.remove([...])` (cascade intent always evaluates), AND
+- every composite is absent from BOTH the update payload AND the `keyRecord` (the entity primary-key attributes used to address the row).
+
+Equivalently, a half is **evaluated** when ANY of these holds:
+- the half has no composites (constant prefix — always SET), OR
+- a composite is in `Entity.remove([attr])`, OR
+- a composite is in the update payload (the writer is asserting ownership), OR
+- a composite is in `keyRecord` (entity-PK composites — added to the gate in **v1.7.2**, [#43](https://github.com/jmenga/effect-dynamodb/issues/43)).
 
 The presence of an `indexPolicy` declaration does **not** force evaluation of every update under v1.7.1+ (this is a behavior change from v1.7.0). The per-half gate is the same regardless of whether `indexPolicy` is declared.
 
