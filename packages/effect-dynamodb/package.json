@@ -59,12 +59,12 @@
     "@aws-sdk/util-dynamodb": "^3.700.0"
   },
   "peerDependencies": {
-    "effect": "^4.0.0-beta.48"
+    "effect": "^4.0.0-beta.59"
   },
   "devDependencies": {
-    "@effect/vitest": "4.0.0-beta.48",
+    "@effect/vitest": "4.0.0-beta.59",
     "@types/node": "^25.5.0",
-    "effect": "4.0.0-beta.48",
+    "effect": "4.0.0-beta.59",
     "typescript": "^5.7.0",
     "vitest": "^4.1.0"
   }
