@@ -20,7 +20,13 @@ jobs:
 
       - uses: pnpm/action-setup@v5
         with:
-          version: latest
+          # Pin to pnpm 10 — pnpm 11 introduced a stricter
+          # ERR_PNPM_IGNORED_BUILDS check that errors even when
+          # `onlyBuiltDependencies` is declared (in either
+          # `package.json#pnpm` or `pnpm-workspace.yaml`). Move to
+          # `version: latest` once the pnpm 11 install path is
+          # validated end-to-end against this monorepo.
+          version: 10
 
       - uses: actions/setup-node@v6
         with:
