@@ -1865,6 +1865,323 @@ describeConnected("timeSeries integration tests", () => {
 })
 
 // ===========================================================================
+// timeSeries .append().remove() — atomic SET + REMOVE + CAS — closes #49
+// ===========================================================================
+//
+// `.append(input).remove(attrs)` clears `appendInput` attributes in the same
+// UpdateItem as the scoped SET and CAS predicate, closing the race window
+// that the two-write workaround (.append() then .update().remove()) suffered
+// from. Any GSI half whose composite list intersects the removed attribute
+// cascades through `composeGsiKeysForUpdatePolicyAware` via `removedSet`.
+//
+// Fixture entity: sparse-PK GSI keyed on `alertState`, mirroring the issue
+// #49 motivating IoT case. End-to-end: write with alertState, observe via
+// byCurrentAlert; remove alertState, observe item drop from the GSI; item
+// remains addressable via primary key.
+// ===========================================================================
+
+class TsAlertDevice extends Schema.Class<TsAlertDevice>("TsAlertDevice")({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  timestamp: Schema.DateTimeUtc,
+  alertState: Schema.optional(Schema.String),
+  location: Schema.optional(Schema.String),
+  accountId: Schema.optional(Schema.String), // enrichment — not in appendInput
+}) {}
+
+const TsAlertDeviceAppendInput = Schema.Struct({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  timestamp: Schema.DateTimeUtc,
+  alertState: Schema.optional(Schema.String),
+  location: Schema.optional(Schema.String),
+})
+
+const tsAlertSchema = DynamoSchema.make({ name: "ts-alert-test", version: 1 })
+const tsAlertTableName = `ts-alert-test-${Date.now()}`
+
+const TsAlertDevices = Entity.make({
+  model: TsAlertDevice,
+  entityType: "TsAlertDevice",
+  primaryKey: {
+    pk: { field: "pk", composite: ["channel", "deviceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    // Sparse-PK GSI on alertState — the issue #49 motivating shape.
+    byCurrentAlert: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["alertState"] },
+      sk: { field: "gsi1sk", composite: ["timestamp"] },
+      indexPolicy: { pk: "sparse", sk: "preserve" },
+    },
+    // PK-composites-only GSI — must remain populated under .remove() of an
+    // unrelated attribute (preserves the #43 fix under the new code path).
+    byChannel: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["channel"] },
+      sk: { field: "gsi2sk", composite: ["deviceId"] },
+      indexPolicy: { pk: "preserve", sk: "preserve" },
+    },
+  },
+  timeSeries: {
+    orderBy: "timestamp",
+    appendInput: TsAlertDeviceAppendInput,
+  },
+})
+
+const TsAlertTable = Table.make({ schema: tsAlertSchema, entities: { TsAlertDevices } })
+const TsAlertLayer = Layer.mergeAll(ClientLayer, TsAlertTable.layer({ name: tsAlertTableName }))
+const provideTsAlert = Effect.provide(TsAlertLayer)
+
+describeConnected("timeSeries .append().remove() integration tests (closes #49)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: tsAlertTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(TsAlertTable),
+        })
+      }).pipe(provideTsAlert, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: tsAlertTableName })
+      }).pipe(
+        provideTsAlert,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect(
+    "round-trip: .remove() clears the attribute on the current item, item remains addressable",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { TsAlertDevices },
+          tables: { TsAlertTable },
+        })
+
+        // 1. Initial append with alertState set.
+        yield* db.entities.TsAlertDevices.append({
+          channel: "ch-rt",
+          deviceId: "d-rt-1",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+          alertState: "ACTIVE",
+          location: "rack-1",
+        })
+
+        const beforeRemove = yield* db.entities.TsAlertDevices.get({
+          channel: "ch-rt",
+          deviceId: "d-rt-1",
+        })
+        expect(beforeRemove.alertState).toBe("ACTIVE")
+        expect(beforeRemove.location).toBe("rack-1")
+
+        // 2. Append with .remove(['alertState']) clears it atomically.
+        yield* db.entities.TsAlertDevices.append({
+          channel: "ch-rt",
+          deviceId: "d-rt-1",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:05:00.000Z"),
+          location: "rack-2",
+        }).remove(["alertState"])
+
+        const afterRemove = yield* db.entities.TsAlertDevices.get({
+          channel: "ch-rt",
+          deviceId: "d-rt-1",
+        })
+        // alertState absent (Schema.optional decodes to undefined).
+        expect(afterRemove.alertState).toBeUndefined()
+        // Other appendInput field unaffected.
+        expect(afterRemove.location).toBe("rack-2")
+        // orderBy updated.
+        expect(DateTime.formatIso(afterRemove.timestamp)).toBe("2026-04-22T10:05:00.000Z")
+      }).pipe(provideTsAlert),
+  )
+
+  it.effect(
+    "sparse-PK GSI cascade: item drops from byCurrentAlert after .remove(['alertState'])",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { TsAlertDevices },
+          tables: { TsAlertTable },
+        })
+
+        // 1. Initial append → item visible under alertState=ACTIVE.
+        yield* db.entities.TsAlertDevices.append({
+          channel: "ch-drop",
+          deviceId: "d-drop-1",
+          timestamp: DateTime.makeUnsafe("2026-04-22T11:00:00.000Z"),
+          alertState: "ACTIVE",
+        })
+
+        const beforeRows = yield* db.entities.TsAlertDevices.byCurrentAlert({
+          alertState: "ACTIVE",
+        }).collect()
+        expect(beforeRows).toHaveLength(1)
+        expect(beforeRows[0]!.deviceId).toBe("d-drop-1")
+
+        // 2. .remove(['alertState']) cascades a drop on the byCurrentAlert PK
+        //    half via `removedSet` → `'sparse'` → can't-compose → REMOVE.
+        yield* db.entities.TsAlertDevices.append({
+          channel: "ch-drop",
+          deviceId: "d-drop-1",
+          timestamp: DateTime.makeUnsafe("2026-04-22T11:05:00.000Z"),
+        }).remove(["alertState"])
+
+        // 3. Item must no longer be visible to byCurrentAlert(alertState=ACTIVE).
+        const afterRows = yield* db.entities.TsAlertDevices.byCurrentAlert({
+          alertState: "ACTIVE",
+        }).collect()
+        expect(afterRows).toHaveLength(0)
+      }).pipe(provideTsAlert),
+  )
+
+  it.effect(
+    "PK-composites-only GSI preserved: byChannel still returns item after unrelated .remove()",
+    () =>
+      Effect.gen(function* () {
+        // Removing `location` (not part of any GSI composite) must NOT
+        // disturb the byChannel GSI — the #43 fix must hold under this path.
+        const db = yield* DynamoClient.make({
+          entities: { TsAlertDevices },
+          tables: { TsAlertTable },
+        })
+
+        yield* db.entities.TsAlertDevices.append({
+          channel: "ch-preserve",
+          deviceId: "d-preserve-1",
+          timestamp: DateTime.makeUnsafe("2026-04-22T12:00:00.000Z"),
+          location: "rack-X",
+        })
+
+        yield* db.entities.TsAlertDevices.append({
+          channel: "ch-preserve",
+          deviceId: "d-preserve-1",
+          timestamp: DateTime.makeUnsafe("2026-04-22T12:05:00.000Z"),
+        }).remove(["location"])
+
+        const rows = yield* db.entities.TsAlertDevices.byChannel({
+          channel: "ch-preserve",
+        }).collect()
+        expect(rows).toHaveLength(1)
+        expect(rows[0]!.deviceId).toBe("d-preserve-1")
+        // location is gone from the item.
+        expect(rows[0]!.location).toBeUndefined()
+      }).pipe(provideTsAlert),
+  )
+
+  it.effect(
+    "enrichment preservation: .remove(['alertState']) leaves out-of-appendInput accountId intact",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { TsAlertDevices },
+          tables: { TsAlertTable },
+        })
+
+        // Seed via append with alert state.
+        yield* db.entities.TsAlertDevices.append({
+          channel: "ch-enrich",
+          deviceId: "d-enrich-1",
+          timestamp: DateTime.makeUnsafe("2026-04-22T13:00:00.000Z"),
+          alertState: "ACTIVE",
+        })
+
+        // Out-of-band enrichment via .update() — accountId is NOT in appendInput.
+        yield* db.entities.TsAlertDevices.update({
+          channel: "ch-enrich",
+          deviceId: "d-enrich-1",
+        }).set({ accountId: "acct-7" })
+
+        // Append + remove alertState. accountId must survive — it is outside
+        // appendInput, so .append() never touches it (enrichment-preservation
+        // contract). .remove(['alertState']) operates on alertState only.
+        yield* db.entities.TsAlertDevices.append({
+          channel: "ch-enrich",
+          deviceId: "d-enrich-1",
+          timestamp: DateTime.makeUnsafe("2026-04-22T13:05:00.000Z"),
+        }).remove(["alertState"])
+
+        const cur = yield* db.entities.TsAlertDevices.get({
+          channel: "ch-enrich",
+          deviceId: "d-enrich-1",
+        })
+        expect(cur.accountId).toBe("acct-7")
+        expect(cur.alertState).toBeUndefined()
+      }).pipe(provideTsAlert),
+  )
+
+  it.effect("stale .remove(): older orderBy → StaleAppend, REMOVE not applied", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { TsAlertDevices },
+        tables: { TsAlertTable },
+      })
+
+      // Seed at t=14:00 with alertState=ACTIVE.
+      yield* db.entities.TsAlertDevices.append({
+        channel: "ch-stale",
+        deviceId: "d-stale-1",
+        timestamp: DateTime.makeUnsafe("2026-04-22T14:00:00.000Z"),
+        alertState: "ACTIVE",
+      })
+
+      // Stale append with older orderBy + .remove() — CAS fires, transaction
+      // rejected, alertState is NOT cleared.
+      const result = yield* db.entities.TsAlertDevices.append({
+        channel: "ch-stale",
+        deviceId: "d-stale-1",
+        timestamp: DateTime.makeUnsafe("2026-04-22T13:00:00.000Z"),
+      })
+        .remove(["alertState"])
+        .asEffect()
+        .pipe(Effect.flip)
+
+      expect(result._tag).toBe("StaleAppend")
+
+      const cur = yield* db.entities.TsAlertDevices.get({
+        channel: "ch-stale",
+        deviceId: "d-stale-1",
+      })
+      // alertState preserved — the failed remove did not land.
+      expect(cur.alertState).toBe("ACTIVE")
+    }).pipe(provideTsAlert),
+  )
+
+  it.effect(
+    "validation: .remove() of an attribute outside appendInput fails fast with ValidationError",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { TsAlertDevices },
+          tables: { TsAlertTable },
+        })
+
+        const err = yield* db.entities.TsAlertDevices.append({
+          channel: "ch-val",
+          deviceId: "d-val-1",
+          timestamp: DateTime.makeUnsafe("2026-04-22T15:00:00.000Z"),
+        })
+          .remove(["accountId"]) // accountId is NOT in appendInput
+          .asEffect()
+          .pipe(Effect.flip)
+
+        expect(err._tag).toBe("ValidationError")
+      }).pipe(provideTsAlert),
+  )
+})
+
+// ===========================================================================
 // PK-composites-only GSI shape — closes #43
 // ===========================================================================
 //
