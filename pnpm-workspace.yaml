@@ -1,2 +1,12 @@
 packages:
   - "packages/*"
+
+# pnpm 11+ reads `onlyBuiltDependencies` from this file rather than from
+# `package.json`'s `pnpm.onlyBuiltDependencies` field — the latter is still
+# accepted by pnpm 10 but ignored by pnpm 11. CI uses `pnpm/action-setup@v5`
+# with `version: latest`, which jumped to pnpm 11 after PR #48 landed; without
+# this list the install fails with ERR_PNPM_IGNORED_BUILDS.
+onlyBuiltDependencies:
+  - esbuild
+  - msgpackr-extract
+  - sharp
