@@ -172,6 +172,28 @@ const program = Effect.gen(function* () {
     )
   // #endregion
 
+  // ---------- Clear an attribute atomically via .remove() ----------
+  // `.append(input).remove([...])` rides the same UpdateItem as the scoped
+  // SET + CAS. Use it to signal "this attribute should no longer exist on
+  // the current item" — e.g. an IoT device reporting a status event whose
+  // absence of an `alert` field means "no alert this event, clear the
+  // existing alert state". The single TransactWriteItems closes the race
+  // window the previous two-write workaround (`.append()` then
+  // `.update().remove([...])`) exposed.
+  //
+  // Names listed in `.remove()` must be in `appendInput`, must not be
+  // `orderBy` / a PK composite / a ref-derived `${name}Id`, and must not
+  // also appear in the append payload (DDB rejects SET/REMOVE overlap).
+  // #region remove
+  yield* db.entities.Telemetries.append({
+    channel: "c-1",
+    deviceId: "d-7",
+    timestamp: DateTime.makeUnsafe("2026-04-22T10:02:00.000Z"),
+    // Note: `alert` is intentionally omitted from the payload. The .remove()
+    // call below clears it on the current item in the same UpdateItem.
+  }).remove(["alert"])
+  // #endregion
+
   // ---------- Enrichment preservation ----------
   // #region enrichment
   // Device appends (no accountId in appendInput — cannot touch enrichment):

@@ -1,5 +1,46 @@
 # effect-dynamodb
 
+## 1.7.4
+
+### Patch Changes
+
+- **`.append(input).remove(attrs)` — atomic SET + REMOVE + CAS on time-series entities (closes [#49](https://github.com/jmenga/effect-dynamodb/issues/49)).**
+
+  `BoundAppend` gains a `.remove(attrs)` combinator that emits `REMOVE` clauses on the same `UpdateItem` that carries the scoped `SET` and CAS predicate. Use it when an event needs to clear one or more `appendInput` attributes atomically — e.g. an IoT status event whose absence of an `alert` field means "no alert this cycle; drop the existing alert state on the current item."
+
+  **Motivating problem.** Before v1.7.4, callers wanting to clear an `appendInput` attribute were stuck with three unsatisfactory workarounds:
+  - `.append(...)` then `.update().remove([...])` (two writes) — race window: a concurrent writer between the two writes could clobber the cleared state.
+  - Sentinel value (e.g. `alertState: "DISABLED"`) — keeps the attribute set, leaves the item in any `'sparse'`-policied GSI half that composes it.
+  - `Schema.NullOr` + null payload — writes a literal `NULL` into the item; downstream readers must tolerate it.
+
+  `.append(input).remove(attrs)` closes the race window structurally: a single `UpdateItem` carries `SET + REMOVE + CAS`, atomic with the event `Put`.
+
+  **GSI cascade.** Any GSI half whose composite list intersects `attrs` follows the v1.7.1 cascade-override semantics — the half evaluates with the removed composite treated as absent. Under `'sparse'` the half drops; under `'preserve'` it's a no-op (the stored key field is left as-is unless overridden). The motivating shape is a sparse-PK GSI keyed on the cleared attribute — the item drops out of that GSI in the same write.
+
+  **Validation.** Names listed in `.remove()` are checked at execution time. The Effect fails with `ValidationError(operation: "append.remove")` if any name:
+  - is not declared in `appendInput` (enrichment-preservation contract — use `.update().remove([...])` for fields outside `appendInput`);
+  - names `orderBy` (would invalidate the CAS anchor);
+  - names a primary-key composite (would orphan the item);
+  - names a ref field (refs are create-time denormalisations — reassign via `.update()`);
+  - also appears in the encoded payload with a non-`undefined` value (DynamoDB rejects `SET`/`REMOVE` overlap).
+
+  Chained `.remove()` calls accumulate. The combinator composes with `.condition()` and `.skipFollowUp()` in any order.
+
+  **API.** New fluent combinator on `BoundAppend`:
+
+  ```ts
+  yield *
+    db.entities.Telemetry.append({ channel, deviceId, timestamp }).remove([
+      "alertState",
+    ]);
+  ```
+
+  The entity-level unbound `Entity.append()` also gains an optional fourth positional argument (`removeAttrs?: ReadonlyArray<string>`) — used by `BoundAppend`'s `.remove()` wiring; library consumers should prefer the fluent form on `BoundAppend`.
+
+  **No on-disk impact, no backfill required.** Pure feature add — existing time-series entities and existing items are unaffected.
+
+  See `guides/timeseries.mdx` for the documented usage pattern and the issue [#49](https://github.com/jmenga/effect-dynamodb/issues/49) motivating IoT case.
+
 ## 1.7.3
 
 ### Patch Changes

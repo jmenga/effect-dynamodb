@@ -12,7 +12,7 @@
  */
 
 import { describe, expect, it } from "@effect/vitest"
-import { Effect, Layer, Schema } from "effect"
+import { DateTime, Effect, Layer, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
@@ -479,5 +479,168 @@ describe("BoundPatch", () => {
       const call = mockUpdateItem.mock.calls[0]![0]
       expect(call.ConditionExpression).toContain("attribute_exists")
     }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// BoundAppend — fluent .remove() chain (issue #49)
+// ---------------------------------------------------------------------------
+
+class TelemetryFixture extends Schema.Class<TelemetryFixture>("TelemetryFixture")({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  timestamp: Schema.DateTimeUtc,
+  location: Schema.optional(Schema.String),
+  alert: Schema.optional(Schema.Boolean),
+  accountId: Schema.optional(Schema.String),
+}) {}
+
+const TelemetryFixtureAppendInput = Schema.Struct({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  timestamp: Schema.DateTimeUtc,
+  location: Schema.optional(Schema.String),
+  alert: Schema.optional(Schema.Boolean),
+})
+
+const TelemetryFixtureEntity = Entity.make({
+  model: TelemetryFixture,
+  entityType: "TelemetryFixture",
+  primaryKey: {
+    pk: { field: "pk", composite: ["channel", "deviceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  timeSeries: {
+    orderBy: "timestamp",
+    appendInput: TelemetryFixtureAppendInput,
+  },
+})
+
+const TelemetryFixtureTable = Table.make({
+  schema: AppSchema,
+  entities: { TelemetryFixture: TelemetryFixtureEntity },
+})
+
+const mockTransactWriteItems = vi.fn()
+const mockGetItemTs = vi.fn()
+
+const TestClientTs = Layer.succeed(DynamoClient, {
+  putItem: () => Effect.die("not used"),
+  getItem: (input) =>
+    Effect.tryPromise({
+      try: () => mockGetItemTs(input),
+      catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
+    }),
+  deleteItem: () => Effect.die("not used"),
+  updateItem: () => Effect.die("not used"),
+  query: () => Effect.die("not used"),
+  scan: () => Effect.die("not used"),
+  batchGetItem: () => Effect.die("not used"),
+  batchWriteItem: () => Effect.die("not used"),
+  transactGetItems: () => Effect.die("not used"),
+  transactWriteItems: (input) =>
+    Effect.tryPromise({
+      try: () => mockTransactWriteItems(input),
+      catch: (e) => new DynamoError({ operation: "TransactWriteItems", cause: e }),
+    }),
+  createTable: () => Effect.die("not used"),
+  deleteTable: () => Effect.die("not used"),
+  describeTable: () => Effect.die("not used"),
+})
+
+const TableLayerTs = TelemetryFixtureTable.layer({ name: "bound-append-test-table" })
+const TestLayerTs = Layer.merge(TestClientTs, TableLayerTs)
+
+const mockHappyPathTs = () => {
+  mockTransactWriteItems.mockResolvedValueOnce({})
+  mockGetItemTs.mockResolvedValueOnce({
+    Item: {
+      pk: { S: "$testapp#v1#telemetryfixture#c-1#d-7" },
+      sk: { S: "$testapp#v1#telemetryfixture_1" },
+      channel: { S: "c-1" },
+      deviceId: { S: "d-7" },
+      timestamp: { S: "2026-04-22T10:00:00.000Z" },
+      __edd_e__: { S: "TelemetryFixture" },
+    },
+  })
+}
+
+describe("BoundAppend", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it.effect(".append(input).remove([...]) chain emits REMOVE clause", () =>
+    Effect.gen(function* () {
+      mockHappyPathTs()
+      const db = yield* DynamoClient.make({
+        entities: { TelemetryFixture: TelemetryFixtureEntity },
+        tables: { TelemetryFixtureTable },
+      })
+      yield* db.entities.TelemetryFixture.append({
+        channel: "c-1",
+        deviceId: "d-7",
+        timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+      }).remove(["alert"])
+
+      const call = mockTransactWriteItems.mock.calls[0]![0]
+      const expr = call.TransactItems[0].Update.UpdateExpression as string
+      expect(expr).toMatch(/\bREMOVE\b/)
+      const ean = call.TransactItems[0].Update.ExpressionAttributeNames
+      expect(Object.values(ean)).toContain("alert")
+    }).pipe(Effect.provide(TestLayerTs)),
+  )
+
+  it.effect(".remove() composes with .condition() and .skipFollowUp() in any order", () =>
+    Effect.gen(function* () {
+      mockTransactWriteItems.mockResolvedValueOnce({})
+      // No mockGetItemTs — skipFollowUp must not call GetItem.
+
+      const db = yield* DynamoClient.make({
+        entities: { TelemetryFixture: TelemetryFixtureEntity },
+        tables: { TelemetryFixtureTable },
+      })
+      const result = yield* db.entities.TelemetryFixture.append({
+        channel: "c-1",
+        deviceId: "d-7",
+        timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+      })
+        .condition({ eq: { location: "rack-1" } })
+        .remove(["alert"])
+        .skipFollowUp()
+
+      expect(result).toBeUndefined()
+      expect(mockGetItemTs).not.toHaveBeenCalled()
+
+      const call = mockTransactWriteItems.mock.calls[0]![0]
+      const cond = call.TransactItems[0].Update.ConditionExpression as string
+      // CAS AND user condition.
+      expect(cond).toContain("AND")
+      const expr = call.TransactItems[0].Update.UpdateExpression as string
+      expect(expr).toMatch(/\bREMOVE\b/)
+    }).pipe(Effect.provide(TestLayerTs)),
+  )
+
+  it.effect("chained .remove() calls accumulate attribute names", () =>
+    Effect.gen(function* () {
+      mockHappyPathTs()
+      const db = yield* DynamoClient.make({
+        entities: { TelemetryFixture: TelemetryFixtureEntity },
+        tables: { TelemetryFixtureTable },
+      })
+      yield* db.entities.TelemetryFixture.append({
+        channel: "c-1",
+        deviceId: "d-7",
+        timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+      })
+        .remove(["alert"])
+        .remove(["location"])
+
+      const ean = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Update
+        .ExpressionAttributeNames as globalThis.Record<string, string>
+      const physical = new Set(Object.values(ean))
+      expect(physical.has("alert")).toBe(true)
+      expect(physical.has("location")).toBe(true)
+    }).pipe(Effect.provide(TestLayerTs)),
   )
 })

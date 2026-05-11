@@ -636,6 +636,8 @@ export interface Entity<
         (
           input: AppendInputType<TAI>,
           condition?: Expr | ConditionInput,
+          skipFollowUp?: false,
+          removeAttrs?: ReadonlyArray<string>,
         ): Effect.Effect<
           { readonly current: ModelType<TModel> },
           DynamoClientError | ValidationError | StaleAppend | ConditionalCheckFailed,
@@ -645,6 +647,7 @@ export interface Entity<
           input: AppendInputType<TAI>,
           condition: Expr | ConditionInput | undefined,
           skipFollowUp: true,
+          removeAttrs?: ReadonlyArray<string>,
         ): Effect.Effect<
           void,
           DynamoClientError | ValidationError | StaleAppend,
@@ -4200,7 +4203,12 @@ const makeImpl = <
 
   const timeSeriesConfig = config.timeSeries as TimeSeriesConfig<any> | undefined
 
-  const append = (input: unknown, userCondition?: Expr | ConditionInput, skipFollowUp = false) =>
+  const append = (
+    input: unknown,
+    userCondition?: Expr | ConditionInput,
+    skipFollowUp = false,
+    removeAttrs?: ReadonlyArray<string>,
+  ) =>
     Effect.gen(function* () {
       if (!timeSeriesConfig) {
         return yield* new ValidationError({
@@ -4215,6 +4223,61 @@ const makeImpl = <
       const ttlDuration = timeSeriesConfig.ttl
       const appendInputSchema = schemas.appendInputSchema as Schema.Codec<any>
 
+      // ---------- Validate removeAttrs (issue #49) ----------
+      // `.remove(attrs)` clears `appendInput` attributes in the same UpdateItem
+      // as the scoped SET + CAS. Composite-attribute removal cascades through
+      // `composeGsiKeysForUpdatePolicyAware` via the `removedSet` option.
+      // Validation enforces the time-series invariants — orderBy, PK/SK
+      // composites, and ref fields must not be cleared, and the caller cannot
+      // remove enrichment fields outside `appendInput` (that's a `.update()`
+      // operation, not an append).
+      const removedSet =
+        removeAttrs !== undefined && removeAttrs.length > 0 ? new Set(removeAttrs) : undefined
+      if (removedSet !== undefined) {
+        const primary = config.indexes.primary
+        const pkSkComposites = new Set<string>([...primary.pk.composite, ...primary.sk.composite])
+        const appendInputTop = timeSeriesConfig.appendInput as Schema.Top
+        const appendInputFieldSet = new Set<string>(
+          "fields" in appendInputTop && typeof (appendInputTop as any).fields === "object"
+            ? Object.keys((appendInputTop as any).fields)
+            : [],
+        )
+        const model = config.model as Schema.Top
+        for (const attr of removedSet) {
+          if (!appendInputFieldSet.has(attr)) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "append.remove",
+              cause:
+                `Attribute "${attr}" passed to .remove() is not declared in appendInput. ` +
+                `.append().remove() can only clear fields the entity exposes via appendInput. ` +
+                `Use .update().remove([...]) on the entity for enrichment fields outside appendInput.`,
+            })
+          }
+          if (attr === orderByField) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "append.remove",
+              cause: `Attribute "${attr}" is the orderBy clock — removing it would invalidate the CAS anchor.`,
+            })
+          }
+          if (pkSkComposites.has(attr)) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "append.remove",
+              cause: `Attribute "${attr}" is a primary-key composite — removing it would orphan the item.`,
+            })
+          }
+          if (isRefField(attr, model)) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "append.remove",
+              cause: `Attribute "${attr}" is a ref field — refs are create-time denormalisations and cannot be cleared via .append(). Use .update() to reassign.`,
+            })
+          }
+        }
+      }
+
       // Encode user input via appendInputSchema (see `put` for strategy).
       const encodedInput = yield* encodeOrDecodeEncode(
         appendInputSchema,
@@ -4223,6 +4286,28 @@ const makeImpl = <
         "append",
       )
       const encoded = encodedInput as globalThis.Record<string, unknown>
+
+      // After encoding, detect SET/REMOVE conflict — DynamoDB rejects an
+      // UpdateExpression that touches the same attribute in SET and REMOVE.
+      // The SET loop (below) skips entries with `undefined` values, so the
+      // conflict is only real when the payload carries a non-undefined value
+      // for an attribute also named in `.remove()`.
+      if (removedSet !== undefined) {
+        for (const attr of removedSet) {
+          if (
+            attr in encoded &&
+            (encoded as globalThis.Record<string, unknown>)[attr] !== undefined
+          ) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "append.remove",
+              cause:
+                `Attribute "${attr}" appears in both the append payload and .remove(). ` +
+                `Choose one — either set the new value or remove the attribute.`,
+            })
+          }
+        }
+      }
 
       // Compose current-item primary key (pk + sk derived from PK/SK composites)
       const primary = config.indexes.primary
@@ -4282,6 +4367,7 @@ const makeImpl = <
         allIndexes,
         encoded,
         encoded,
+        removedSet !== undefined ? { removedSet } : undefined,
       )
       for (const [field, value] of Object.entries(gsiUpdate.sets)) {
         const nameKey = `#a${counter}`
@@ -4297,6 +4383,19 @@ const makeImpl = <
         names[nameKey] = keyField
         appendRemoveClauses.push(nameKey)
         counter++
+      }
+      // User-supplied attribute REMOVEs (issue #49). Validation above ensured
+      // these are safe — they're appendInput fields, not orderBy / PK
+      // composites / refs, and don't overlap the encoded payload. The cascade
+      // override on any GSI half whose composite list intersects `removedSet`
+      // is already wired through `composeGsiKeysForUpdatePolicyAware` above.
+      if (removedSet !== undefined) {
+        for (const attr of removedSet) {
+          const nameKey = `#a${counter}`
+          names[nameKey] = resolveDbName(attr)
+          appendRemoveClauses.push(nameKey)
+          counter++
+        }
       }
 
       // Entity type discriminator — idempotent; ensures existing items
@@ -5404,8 +5503,9 @@ export const bind = <
                   i: unknown,
                   c: Expr | ConditionInput | undefined,
                   s: boolean,
+                  r: ReadonlyArray<string> | undefined,
                 ) => Effect.Effect<any, any, any>
-              )(opts.input, opts.condition, opts.skipFollowUp),
+              )(opts.input, opts.condition, opts.skipFollowUp, opts.removeAttrs),
             ),
         }
         return makeBoundAppend(input, appendCfg)

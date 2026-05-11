@@ -153,6 +153,42 @@ Both errors carry `current` as `Option<unknown>` rather than `Option<Model>` bec
 
 **Why on the error channel?** Stale and user-condition rejection are PROGRAM-LEVEL FAILURES — the write you intended did not happen. Effect's error channel exists precisely to make those failures visible to typed combinators (`Effect.catchTag`, `Effect.retry`, `Effect.orElse`) and impossible to forget at the type level. The previous discriminated-union return hid the failure inside a value, which routinely produced bugs where callers destructured `r.current` without inspecting `r.applied`.
 
+### `.remove(attrs)` — clear attributes atomically
+
+`.append(input).remove(attrs)` rides the same `UpdateItem` as the scoped `SET` and CAS predicate. Use it when an event should clear one or more `appendInput` attributes on the current item — e.g. a status event whose absence of an `alert` field means "no alert this cycle; drop the existing alert state."
+
+```typescript region="remove" example="guide-timeseries.ts"
+yield* db.entities.Telemetries.append({
+  channel: "c-1",
+  deviceId: "d-7",
+  timestamp: DateTime.makeUnsafe("2026-04-22T10:02:00.000Z"),
+  // Note: `alert` is intentionally omitted from the payload. The .remove()
+  // call below clears it on the current item in the same UpdateItem.
+}).remove(["alert"])
+```
+
+**Why this matters.** Without `.remove()`, callers were stuck with three unsatisfactory workarounds:
+
+| Workaround | Problem |
+|---|---|
+| `.append(...)` then `.update().remove([...])` (two writes) | Race window — a concurrent writer between the two writes can clobber the cleared state |
+| Sentinel value (e.g. `alertState: "DISABLED"`) | Keeps the attribute set; sparse-policied GSIs continue to include the item |
+| `Schema.NullOr` + null payload | Writes a literal `NULL` into the item; downstream readers must tolerate it |
+
+`.remove()` closes the race window structurally — the single `UpdateItem` carries `SET + REMOVE + CAS` atomically.
+
+**GSI cascade.** Any GSI half whose composite list intersects `attrs` follows the v1.7.1 cascade-override semantics: the half evaluates with the removed composite treated as absent. Under `'sparse'` the half drops; under `'preserve'` it's a no-op (the stored key field is left as-is unless overridden). The motivating shape is a sparse-PK GSI keyed on the cleared attribute — the item drops out of that GSI in the same write.
+
+**Validation.** Names listed in `.remove()` are checked at execution time. The Effect fails with `ValidationError(operation: "append.remove")` if any name:
+
+- is not declared in `appendInput` (enrichment-preservation contract — use `.update().remove([...])` for fields outside `appendInput`)
+- names `orderBy` (would invalidate the CAS anchor)
+- names a primary-key composite (would orphan the item)
+- names a ref field (refs are create-time denormalisations — reassign via `.update()`)
+- also appears in the encoded payload with a non-`undefined` value (DynamoDB rejects `SET`/`REMOVE` overlap)
+
+Chained `.remove()` calls accumulate. The combinator composes with `.condition()` and `.skipFollowUp()` in any order.
+
 ### `.skipFollowUp()` — fire-and-forget ingest
 
 For high-volume ingest paths that don't need `current`, chain `.skipFollowUp()` to suppress the post-transaction `GetItem`. The success channel narrows to `void`:

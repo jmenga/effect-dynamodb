@@ -971,3 +971,771 @@ describe("TimeSeries — indexPolicy on append", () => {
     },
   )
 })
+
+// ---------------------------------------------------------------------------
+// 5. .append().remove(attrs) — atomic SET + REMOVE + CAS (issue #49)
+// ---------------------------------------------------------------------------
+//
+// `.remove(attrs)` accumulates REMOVE clauses onto the same UpdateItem that
+// carries the scoped SET and CAS predicate, closing the race window the
+// previous workarounds (two-write pattern, NullOr sentinels) all suffered
+// from. Validation rejects names that would break time-series invariants
+// (orderBy, PK/SK composites, refs) and names outside `appendInput`. Any
+// GSI half whose composite list intersects the removed attribute cascades
+// through `composeGsiKeysForUpdatePolicyAware` via `removedSet`.
+//
+// Covers issue #49.
+// ---------------------------------------------------------------------------
+
+describe("TimeSeries — .append().remove() basic emission", () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+  })
+
+  const buildEntity = () => {
+    const entity = Entity.make({
+      model: Telemetry,
+      entityType: "Telemetry",
+      primaryKey: {
+        pk: { field: "pk", composite: ["channel", "deviceId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      timestamps: true,
+      timeSeries: {
+        orderBy: "timestamp",
+        appendInput: TelemetryAppendInput,
+      },
+    })
+    return makeEntityWithTag(entity)
+  }
+
+  const mockHappyPathReadback = () => {
+    mockTransactWriteItems.mockResolvedValueOnce({})
+    mockGetItem.mockResolvedValueOnce({
+      Item: {
+        pk: { S: "$tsapp#v1#telemetry#c-1#d-7" },
+        sk: { S: "$tsapp#v1#telemetry_1" },
+        channel: { S: "c-1" },
+        deviceId: { S: "d-7" },
+        timestamp: { S: "2026-04-22T10:00:00.000Z" },
+        __edd_e__: { S: "Telemetry" },
+      },
+    })
+  }
+
+  // The unbound entity-level append signature is positional:
+  //   append(input, condition, skipFollowUp, removeAttrs)
+  // BoundAppend tests cover the fluent .remove() chain in BoundCrud.test.ts.
+
+  it.effect("single attr in removeAttrs emits a REMOVE clause naming that attribute", () => {
+    const { entity, tableLayer } = buildEntity()
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      mockHappyPathReadback()
+
+      yield* (entity as any).append(
+        {
+          channel: "c-1",
+          deviceId: "d-7",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+        },
+        undefined,
+        false,
+        ["alert"],
+      )
+
+      const call = mockTransactWriteItems.mock.calls[0]![0]
+      const update = call.TransactItems[0].Update
+      const expr = update.UpdateExpression as string
+      expect(expr).toMatch(/\bREMOVE\b/)
+
+      const ean = update.ExpressionAttributeNames as globalThis.Record<string, string>
+      const removeIdx = expr.indexOf("REMOVE")
+      const remExpr = expr.slice(removeIdx)
+      const alertAlias = Object.entries(ean).find(([_, v]) => v === "alert")?.[0]
+      expect(alertAlias).toBeDefined()
+      expect(remExpr.includes(alertAlias!)).toBe(true)
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("multiple attrs emit a REMOVE list naming each attribute", () => {
+    const { entity, tableLayer } = buildEntity()
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      mockHappyPathReadback()
+
+      yield* (entity as any).append(
+        {
+          channel: "c-1",
+          deviceId: "d-7",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+        },
+        undefined,
+        false,
+        ["alert", "gpio"],
+      )
+
+      const call = mockTransactWriteItems.mock.calls[0]![0]
+      const update = call.TransactItems[0].Update
+      const expr = update.UpdateExpression as string
+      const ean = update.ExpressionAttributeNames as globalThis.Record<string, string>
+      const alertAlias = Object.entries(ean).find(([_, v]) => v === "alert")?.[0]
+      const gpioAlias = Object.entries(ean).find(([_, v]) => v === "gpio")?.[0]
+      const removeIdx = expr.indexOf("REMOVE")
+      const remExpr = expr.slice(removeIdx)
+      expect(remExpr.includes(alertAlias!)).toBe(true)
+      expect(remExpr.includes(gpioAlias!)).toBe(true)
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("removeAttrs still issues a single TransactWriteItems (2 items, atomic)", () => {
+    const { entity, tableLayer } = buildEntity()
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      mockHappyPathReadback()
+
+      yield* (entity as any).append(
+        {
+          channel: "c-1",
+          deviceId: "d-7",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+        },
+        undefined,
+        false,
+        ["alert"],
+      )
+
+      expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      const call = mockTransactWriteItems.mock.calls[0]![0]
+      // Same TransactWriteItems shape: UpdateItem + Put (event).
+      expect(call.TransactItems).toHaveLength(2)
+      const update = call.TransactItems[0].Update
+      // CAS predicate is preserved alongside SET + REMOVE.
+      expect(update.ConditionExpression).toMatch(
+        /attribute_not_exists\(#_tspk\) OR #_tsob < :_tsNewOb/,
+      )
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("removeAttrs composes with user condition (ANDed onto CAS)", () => {
+    const { entity, tableLayer } = buildEntity()
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      mockHappyPathReadback()
+
+      yield* (entity as any).append(
+        {
+          channel: "c-1",
+          deviceId: "d-7",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+        },
+        { eq: { location: "rack-1" } },
+        false,
+        ["alert"],
+      )
+
+      const call = mockTransactWriteItems.mock.calls[0]![0]
+      const update = call.TransactItems[0].Update
+      const cond = update.ConditionExpression as string
+      expect(cond).toContain("attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb")
+      expect(cond).toContain("AND")
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("removeAttrs composes with skipFollowUp — no GetItem, REMOVE clause present", () => {
+    const { entity, tableLayer } = buildEntity()
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      mockTransactWriteItems.mockResolvedValueOnce({})
+      // Note: no mockGetItem — skipFollowUp must not issue one.
+
+      const result = yield* (entity as any).append(
+        {
+          channel: "c-1",
+          deviceId: "d-7",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+        },
+        undefined,
+        true,
+        ["alert"],
+      )
+
+      expect(result).toBeUndefined()
+      expect(mockGetItem).not.toHaveBeenCalled()
+
+      const call = mockTransactWriteItems.mock.calls[0]![0]
+      const expr = call.TransactItems[0].Update.UpdateExpression as string
+      expect(expr).toMatch(/\bREMOVE\b/)
+    }).pipe(Effect.provide(layer))
+  })
+})
+
+describe("TimeSeries — .append().remove() validation", () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+  })
+
+  const buildEntity = () => {
+    const entity = Entity.make({
+      model: Telemetry,
+      entityType: "Telemetry",
+      primaryKey: {
+        pk: { field: "pk", composite: ["channel", "deviceId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      timestamps: true,
+      timeSeries: {
+        orderBy: "timestamp",
+        appendInput: TelemetryAppendInput,
+      },
+    })
+    return makeEntityWithTag(entity)
+  }
+
+  it.effect("rejects an attribute not declared in appendInput (ValidationError)", () => {
+    // `accountId` is in the Telemetry model but NOT in TelemetryAppendInput —
+    // this is the enrichment-preservation contract. `.remove()` cannot cross
+    // it; use `.update().remove([...])` for enrichment fields.
+    const { entity, tableLayer } = buildEntity()
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      const err = yield* (entity as any)
+        .append(
+          {
+            channel: "c-1",
+            deviceId: "d-7",
+            timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+          },
+          undefined,
+          false,
+          ["accountId"],
+        )
+        .pipe(Effect.flip)
+
+      expect(err._tag).toBe("ValidationError")
+      if (err._tag === "ValidationError") {
+        expect(err.operation).toBe("append.remove")
+        expect(String(err.cause)).toContain("appendInput")
+      }
+      // No DynamoDB call should have been issued.
+      expect(mockTransactWriteItems).not.toHaveBeenCalled()
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("rejects orderBy (ValidationError)", () => {
+    const { entity, tableLayer } = buildEntity()
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      const err = yield* (entity as any)
+        .append(
+          {
+            channel: "c-1",
+            deviceId: "d-7",
+            timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+          },
+          undefined,
+          false,
+          ["timestamp"],
+        )
+        .pipe(Effect.flip)
+
+      expect(err._tag).toBe("ValidationError")
+      if (err._tag === "ValidationError") {
+        expect(err.operation).toBe("append.remove")
+        expect(String(err.cause)).toContain("orderBy")
+      }
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("rejects a primary-key composite (ValidationError)", () => {
+    const { entity, tableLayer } = buildEntity()
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      const err = yield* (entity as any)
+        .append(
+          {
+            channel: "c-1",
+            deviceId: "d-7",
+            timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+          },
+          undefined,
+          false,
+          ["channel"],
+        )
+        .pipe(Effect.flip)
+
+      expect(err._tag).toBe("ValidationError")
+      if (err._tag === "ValidationError") {
+        expect(err.operation).toBe("append.remove")
+        expect(String(err.cause)).toContain("primary-key composite")
+      }
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect(
+    "rejects SET/REMOVE conflict — same attribute in payload AND removeAttrs (ValidationError)",
+    () => {
+      const { entity, tableLayer } = buildEntity()
+      const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+      return Effect.gen(function* () {
+        const err = yield* (entity as any)
+          .append(
+            {
+              channel: "c-1",
+              deviceId: "d-7",
+              timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+              // `location` is in the payload AND in removeAttrs — ambiguous.
+              location: "rack-1",
+            },
+            undefined,
+            false,
+            ["location"],
+          )
+          .pipe(Effect.flip)
+
+        expect(err._tag).toBe("ValidationError")
+        if (err._tag === "ValidationError") {
+          expect(err.operation).toBe("append.remove")
+          expect(String(err.cause)).toContain("both")
+        }
+        // Validation rejects before any DDB call.
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(layer))
+    },
+  )
+
+  it.effect(
+    "payload-as-undefined + removeAttrs is NOT a conflict (undefined is skipped from SET)",
+    () => {
+      // `alert: undefined` in the payload is skipped from the SET clause loop
+      // (Entity.ts append builder) — naming it in removeAttrs does not produce
+      // a SET/REMOVE conflict at the DynamoDB level.
+      const { entity, tableLayer } = buildEntity()
+      const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+      return Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        mockGetItem.mockResolvedValueOnce({
+          Item: {
+            pk: { S: "$tsapp#v1#telemetry#c-1#d-7" },
+            sk: { S: "$tsapp#v1#telemetry_1" },
+            channel: { S: "c-1" },
+            deviceId: { S: "d-7" },
+            timestamp: { S: "2026-04-22T10:00:00.000Z" },
+            __edd_e__: { S: "Telemetry" },
+          },
+        })
+
+        yield* (entity as any).append(
+          {
+            channel: "c-1",
+            deviceId: "d-7",
+            timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+            alert: undefined,
+          },
+          undefined,
+          false,
+          ["alert"],
+        )
+
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        const expr = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Update
+          .UpdateExpression as string
+        expect(expr).toMatch(/\bREMOVE\b/)
+      }).pipe(Effect.provide(layer))
+    },
+  )
+
+  it.effect("empty removeAttrs is a no-op — no REMOVE clause, no failure", () => {
+    const { entity, tableLayer } = buildEntity()
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      mockTransactWriteItems.mockResolvedValueOnce({})
+      mockGetItem.mockResolvedValueOnce({
+        Item: {
+          pk: { S: "$tsapp#v1#telemetry#c-1#d-7" },
+          sk: { S: "$tsapp#v1#telemetry_1" },
+          channel: { S: "c-1" },
+          deviceId: { S: "d-7" },
+          timestamp: { S: "2026-04-22T10:00:00.000Z" },
+          __edd_e__: { S: "Telemetry" },
+        },
+      })
+
+      yield* (entity as any).append(
+        {
+          channel: "c-1",
+          deviceId: "d-7",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+        },
+        undefined,
+        false,
+        [],
+      )
+
+      const expr = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Update
+        .UpdateExpression as string
+      // No REMOVE clause when the list is empty (no GSI keys to remove either
+      // because there are no indexes on this fixture).
+      expect(expr).not.toMatch(/\bREMOVE\b/)
+    }).pipe(Effect.provide(layer))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 6. GSI cascade behavior via .append().remove() — issue #49 motivating case
+// ---------------------------------------------------------------------------
+//
+// Per CLAUDE.md "Canonical GSI-composite test-fixture shapes": any change to
+// the policy-aware composer or its callers must span shapes 1, 2, 5, 6.
+// `.append().remove()` is a new caller of `composeGsiKeysForUpdatePolicyAware`
+// with `removedSet` populated — exercise the cascade end-to-end across the
+// shapes that matter for time-series writers.
+// ---------------------------------------------------------------------------
+
+describe("TimeSeries — .append().remove() GSI cascade (canonical shapes)", () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+  })
+
+  // Shape #5 (all-mutable composites) + the issue #49 motivating case:
+  // sparse-PK GSI keyed on alertState. Removing alertState drops gsi3pk.
+  it.effect(
+    "shape #5: sparse PK composite cleared via .remove() → REMOVE gsi3pk (cascade override)",
+    () => {
+      const entity = Entity.make({
+        model: Telemetry,
+        entityType: "Telemetry",
+        primaryKey: {
+          pk: { field: "pk", composite: ["channel", "deviceId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          byCurrentAlert: {
+            name: "gsi3",
+            pk: { field: "gsi3pk", composite: ["alert"] },
+            sk: { field: "gsi3sk", composite: ["timestamp"] },
+            indexPolicy: { pk: "sparse", sk: "preserve" },
+          },
+        },
+        timestamps: true,
+        timeSeries: {
+          orderBy: "timestamp",
+          appendInput: TelemetryAppendInput,
+        },
+      })
+      const { entity: wired, tableLayer } = makeEntityWithTag(entity)
+      const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+      return Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        mockGetItem.mockResolvedValueOnce({
+          Item: {
+            pk: { S: "$tsapp#v1#telemetry#c-1#d-7" },
+            sk: { S: "$tsapp#v1#telemetry_1" },
+            channel: { S: "c-1" },
+            deviceId: { S: "d-7" },
+            timestamp: { S: "2026-04-22T10:00:00.000Z" },
+            __edd_e__: { S: "Telemetry" },
+          },
+        })
+
+        // Append carries the clock but does NOT carry alert. Explicit
+        // removeAttrs ["alert"] signals "drop the alert state". The PK half
+        // is `'sparse'` so cascade override → REMOVE gsi3pk. The SK half is
+        // `'preserve'`; timestamp is present so SET gsi3sk.
+        yield* (wired as any).append(
+          {
+            channel: "c-1",
+            deviceId: "d-7",
+            timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+          },
+          undefined,
+          false,
+          ["alert"],
+        )
+
+        const update = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Update
+        const expr = update.UpdateExpression as string
+        const ean = update.ExpressionAttributeNames as globalThis.Record<string, string>
+        const aliasOf = (physical: string) =>
+          Object.entries(ean).find(([_, v]) => v === physical)?.[0]
+        const gsi3pkAlias = aliasOf("gsi3pk")
+        const gsi3skAlias = aliasOf("gsi3sk")
+        const alertAlias = aliasOf("alert")
+
+        const removeIdx = expr.indexOf("REMOVE")
+        const setExpr = removeIdx === -1 ? expr : expr.slice(0, removeIdx)
+        const remExpr = removeIdx === -1 ? "" : expr.slice(removeIdx)
+
+        // gsi3pk REMOVE'd via cascade override.
+        expect(remExpr.includes(gsi3pkAlias!)).toBe(true)
+        expect(setExpr.includes(gsi3pkAlias!)).toBe(false)
+        // gsi3sk SET (timestamp present).
+        expect(setExpr.includes(gsi3skAlias!)).toBe(true)
+        expect(remExpr.includes(gsi3skAlias!)).toBe(false)
+        // The attribute itself is also REMOVE'd.
+        expect(remExpr.includes(alertAlias!)).toBe(true)
+      }).pipe(Effect.provide(layer))
+    },
+  )
+
+  // Shape #6: empty-composite half (SK is constant prefix). The PK composite
+  // is appendInput-owned and sparse — clearing it via .remove() cascades a
+  // drop on the PK half only; the empty SK half always evaluates.
+  it.effect(
+    "shape #6: empty-composite SK half + sparse PK + .remove() → REMOVE gsi5pk, SET gsi5sk",
+    () => {
+      // Use a fixture entity where the model has `accountId` but appendInput
+      // exposes it (so we can pass it on first write then remove on second).
+      class T extends Schema.Class<T>("T")({
+        channel: Schema.String,
+        deviceId: Schema.String,
+        timestamp: Schema.DateTimeUtc,
+        accountId: Schema.optional(Schema.String),
+      }) {}
+      const TAppendInput = Schema.Struct({
+        channel: Schema.String,
+        deviceId: Schema.String,
+        timestamp: Schema.DateTimeUtc,
+        accountId: Schema.optional(Schema.String),
+      })
+
+      const entity = Entity.make({
+        model: T,
+        entityType: "T",
+        primaryKey: {
+          pk: { field: "pk", composite: ["channel", "deviceId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          byAccount: {
+            name: "gsi5",
+            // Empty-composite SK half — the SK is just the entity prefix.
+            pk: { field: "gsi5pk", composite: ["accountId"] },
+            sk: { field: "gsi5sk", composite: [] },
+            indexPolicy: { pk: "sparse", sk: "preserve" },
+          },
+        },
+        timeSeries: {
+          orderBy: "timestamp",
+          appendInput: TAppendInput,
+        },
+      })
+      const { entity: wired, tableLayer } = makeEntityWithTag(entity)
+      const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+      return Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        mockGetItem.mockResolvedValueOnce({
+          Item: {
+            pk: { S: "$tsapp#v1#t#c-1#d-7" },
+            sk: { S: "$tsapp#v1#t_1" },
+            channel: { S: "c-1" },
+            deviceId: { S: "d-7" },
+            timestamp: { S: "2026-04-22T10:00:00.000Z" },
+            __edd_e__: { S: "T" },
+          },
+        })
+
+        yield* (wired as any).append(
+          {
+            channel: "c-1",
+            deviceId: "d-7",
+            timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+          },
+          undefined,
+          false,
+          ["accountId"],
+        )
+
+        const update = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Update
+        const expr = update.UpdateExpression as string
+        const ean = update.ExpressionAttributeNames as globalThis.Record<string, string>
+        const aliasOf = (physical: string) =>
+          Object.entries(ean).find(([_, v]) => v === physical)?.[0]
+        const gsi5pkAlias = aliasOf("gsi5pk")
+        const gsi5skAlias = aliasOf("gsi5sk")
+
+        const removeIdx = expr.indexOf("REMOVE")
+        const setExpr = removeIdx === -1 ? expr : expr.slice(0, removeIdx)
+        const remExpr = removeIdx === -1 ? "" : expr.slice(removeIdx)
+
+        // PK cascade-removed; empty-composite SK half is still SET because
+        // it has nothing to multi-writer-clobber — closes the v1.7.3 #46
+        // class of bug, preserved by issue #49 work.
+        expect(remExpr.includes(gsi5pkAlias!)).toBe(true)
+        expect(setExpr.includes(gsi5skAlias!)).toBe(true)
+        expect(setExpr.includes(gsi5pkAlias!)).toBe(false)
+      }).pipe(Effect.provide(layer))
+    },
+  )
+
+  // Shape #2: PK-composites-only GSI (`byChannel: pk=[channel], sk=[deviceId]`
+  // on `primaryKey: [channel, deviceId]`). `.remove()` of a non-composite
+  // attribute must NOT cascade-drop a GSI whose composites are entirely PK
+  // composites — the per-half gate must continue to SET both halves
+  // idempotently (preserves the v1.7.2 #43 fix).
+  it.effect("shape #2: .remove() of unrelated attr leaves PK-composites-only GSI fully SET", () => {
+    const entity = Entity.make({
+      model: Telemetry,
+      entityType: "Telemetry",
+      primaryKey: {
+        pk: { field: "pk", composite: ["channel", "deviceId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        byChannel: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["channel"] },
+          sk: { field: "gsi1sk", composite: ["deviceId"] },
+          indexPolicy: { pk: "preserve", sk: "preserve" },
+        },
+      },
+      timestamps: true,
+      timeSeries: {
+        orderBy: "timestamp",
+        appendInput: TelemetryAppendInput,
+      },
+    })
+    const { entity: wired, tableLayer } = makeEntityWithTag(entity)
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      mockTransactWriteItems.mockResolvedValueOnce({})
+      mockGetItem.mockResolvedValueOnce({
+        Item: {
+          pk: { S: "$tsapp#v1#telemetry#c-1#d-7" },
+          sk: { S: "$tsapp#v1#telemetry_1" },
+          channel: { S: "c-1" },
+          deviceId: { S: "d-7" },
+          timestamp: { S: "2026-04-22T10:00:00.000Z" },
+          __edd_e__: { S: "Telemetry" },
+        },
+      })
+
+      // Remove `alert` (not part of byChannel composites).
+      yield* (wired as any).append(
+        {
+          channel: "c-1",
+          deviceId: "d-7",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+        },
+        undefined,
+        false,
+        ["alert"],
+      )
+
+      const update = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Update
+      const expr = update.UpdateExpression as string
+      const ean = update.ExpressionAttributeNames as globalThis.Record<string, string>
+      const aliasOf = (physical: string) =>
+        Object.entries(ean).find(([_, v]) => v === physical)?.[0]
+      const gsi1pkAlias = aliasOf("gsi1pk")
+      const gsi1skAlias = aliasOf("gsi1sk")
+
+      const removeIdx = expr.indexOf("REMOVE")
+      const setExpr = removeIdx === -1 ? expr : expr.slice(0, removeIdx)
+      const remExpr = removeIdx === -1 ? "" : expr.slice(removeIdx)
+
+      // Both halves SET — #43 fix preserved under .remove().
+      expect(setExpr.includes(gsi1pkAlias!)).toBe(true)
+      expect(setExpr.includes(gsi1skAlias!)).toBe(true)
+      expect(remExpr.includes(gsi1pkAlias!)).toBe(false)
+      expect(remExpr.includes(gsi1skAlias!)).toBe(false)
+    }).pipe(Effect.provide(layer))
+  })
+
+  // Shape #1: Multi-writer GSI — PK enrichment-owned (accountId not in
+  // appendInput), SK ingest-owned (alert + timestamp). `.remove(['alert'])`
+  // is an ingest-owned signal that must not touch the enrichment-owned PK
+  // half (multi-writer protection holds), but should cascade-drop the SK
+  // half whose composite list contains `alert`.
+  it.effect(
+    "shape #1: multi-writer GSI — .remove() on ingest composite leaves enrichment PK alone, drops ingest SK",
+    () => {
+      const entity = Entity.make({
+        model: Telemetry,
+        entityType: "Telemetry",
+        primaryKey: {
+          pk: { field: "pk", composite: ["channel", "deviceId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          byAccountAlert: {
+            name: "gsi6",
+            // PK: enrichment-owned (accountId is NOT in appendInput).
+            pk: { field: "gsi6pk", composite: ["accountId"] },
+            // SK: ingest-owned (alert + timestamp ARE in appendInput).
+            sk: { field: "gsi6sk", composite: ["alert", "timestamp"] },
+            indexPolicy: { pk: "preserve", sk: "sparse" },
+          },
+        },
+        timestamps: true,
+        timeSeries: {
+          orderBy: "timestamp",
+          appendInput: TelemetryAppendInput,
+        },
+      })
+      const { entity: wired, tableLayer } = makeEntityWithTag(entity)
+      const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+      return Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        mockGetItem.mockResolvedValueOnce({
+          Item: {
+            pk: { S: "$tsapp#v1#telemetry#c-1#d-7" },
+            sk: { S: "$tsapp#v1#telemetry_1" },
+            channel: { S: "c-1" },
+            deviceId: { S: "d-7" },
+            timestamp: { S: "2026-04-22T10:00:00.000Z" },
+            __edd_e__: { S: "Telemetry" },
+          },
+        })
+
+        yield* (wired as any).append(
+          {
+            channel: "c-1",
+            deviceId: "d-7",
+            timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+          },
+          undefined,
+          false,
+          ["alert"],
+        )
+
+        const update = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Update
+        const expr = update.UpdateExpression as string
+        const ean = update.ExpressionAttributeNames as globalThis.Record<string, string>
+        const aliasOf = (physical: string) =>
+          Object.entries(ean).find(([_, v]) => v === physical)?.[0]
+        const gsi6pkAlias = aliasOf("gsi6pk")
+        const gsi6skAlias = aliasOf("gsi6sk")
+
+        const removeIdx = expr.indexOf("REMOVE")
+        const setExpr = removeIdx === -1 ? expr : expr.slice(0, removeIdx)
+        const remExpr = removeIdx === -1 ? "" : expr.slice(removeIdx)
+
+        // PK half — enrichment-owned, multi-writer protection holds: not
+        // SET, not REMOVE'd. accountId not in payload, not in keyRecord, not
+        // in removedSet → skipPk=true.
+        expect(setExpr.includes(gsi6pkAlias!)).toBe(false)
+        expect(remExpr.includes(gsi6pkAlias!)).toBe(false)
+        // SK half — alert ∈ removedSet → cascade override fires → can't
+        // compose (alert absent from merged) → sparse → REMOVE.
+        expect(remExpr.includes(gsi6skAlias!)).toBe(true)
+        expect(setExpr.includes(gsi6skAlias!)).toBe(false)
+      }).pipe(Effect.provide(layer))
+    },
+  )
+})

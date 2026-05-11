@@ -416,19 +416,43 @@ export const makeBoundUpdate = <Model, A, U, E>(
  *
  * Combinators:
  * - `.condition(...)` — AND a user condition onto the CAS predicate.
+ * - `.remove(attrs)` — emit REMOVE clauses for `appendInput` attributes the
+ *   caller wants cleared atomically. The same UpdateItem carries SET +
+ *   REMOVE + CAS; any GSI half whose composite list intersects `attrs` drops
+ *   via the v1.7.1 cascade override.
  * - `.skipFollowUp()` — skip the post-transaction GetItem; success is `void`,
  *   user-condition failures collapse into `StaleAppend` (cannot disambiguate).
  *
  * ```ts
- * yield* db.entities.Telemetry.append(input)                 // → { current }
- * yield* db.entities.Telemetry.append(input).condition(c)    // → { current }
- * yield* db.entities.Telemetry.append(input).skipFollowUp()  // → void
+ * yield* db.entities.Telemetry.append(input)                        // → { current }
+ * yield* db.entities.Telemetry.append(input).condition(c)           // → { current }
+ * yield* db.entities.Telemetry.append(input).remove(["alertState"]) // → { current }
+ * yield* db.entities.Telemetry.append(input).skipFollowUp()         // → void
  * yield* db.entities.Telemetry.append(input).condition(c).skipFollowUp() // → void
  * ```
  */
 export interface BoundAppend<Model, A, E, ESkip> extends Pipeable.Pipeable {
   /** Add a condition expression. Callback or shorthand. */
   readonly condition: (cond: ConditionArg<Model>) => BoundAppend<Model, A, E, ESkip>
+  /**
+   * Emit REMOVE clauses for `appendInput` attributes the caller wants cleared
+   * on the current item. Cleared attributes also cascade-drop any GSI half
+   * whose composite list intersects `attrs` (v1.7.1 cascade override). The
+   * REMOVE clauses ride the same UpdateItem as the scoped SET + CAS — no
+   * separate write, no race window.
+   *
+   * Validated at execution time:
+   * - Names must appear in `appendInput` (enrichment fields outside
+   *   `appendInput` cannot be cleared via `.append()` — use `.update()`).
+   * - Names must not name `orderBy`, a primary-key composite, or a
+   *   ref-derived `${name}Id` field.
+   * - Names must not overlap the encoded payload (DynamoDB rejects an
+   *   UpdateExpression that touches the same attribute in both SET and
+   *   REMOVE).
+   *
+   * Chained `.remove()` calls accumulate.
+   */
+  readonly remove: (attrs: ReadonlyArray<string>) => BoundAppend<Model, A, E, ESkip>
   /** Skip the follow-up GetItem; success becomes `void`. */
   readonly skipFollowUp: () => BoundAppend<Model, void, ESkip, ESkip>
   /** Convert to an executable Effect for Effect combinator interop. */
@@ -444,6 +468,7 @@ export interface BoundAppendConfig<Model> extends BoundCrudConfig<Model> {
     readonly input: unknown
     readonly condition: Expr | undefined
     readonly skipFollowUp: boolean
+    readonly removeAttrs: ReadonlyArray<string> | undefined
   }) => Effect.Effect<unknown, unknown, never>
 }
 
@@ -454,15 +479,22 @@ export class BoundAppendImpl<Model, A, E, ESkip> implements BoundAppend<Model, A
     readonly _config: BoundAppendConfig<Model>,
     readonly _condition: Expr | undefined = undefined,
     readonly _skip: boolean = false,
+    readonly _removeAttrs: ReadonlyArray<string> | undefined = undefined,
   ) {}
 
   condition(cond: ConditionArg<Model>): BoundAppendImpl<Model, A, E, ESkip> {
     const compiled = buildCondition(this._config, cond)
-    return new BoundAppendImpl(this._input, this._config, compiled, this._skip)
+    return new BoundAppendImpl(this._input, this._config, compiled, this._skip, this._removeAttrs)
+  }
+
+  remove(attrs: ReadonlyArray<string>): BoundAppendImpl<Model, A, E, ESkip> {
+    // Chained `.remove()` calls accumulate.
+    const merged = this._removeAttrs === undefined ? attrs : [...this._removeAttrs, ...attrs]
+    return new BoundAppendImpl(this._input, this._config, this._condition, this._skip, merged)
   }
 
   skipFollowUp(): BoundAppendImpl<Model, void, ESkip, ESkip> {
-    return new BoundAppendImpl(this._input, this._config, this._condition, true)
+    return new BoundAppendImpl(this._input, this._config, this._condition, true, this._removeAttrs)
   }
 
   asEffect(): Effect.Effect<A, E, never> {
@@ -470,6 +502,7 @@ export class BoundAppendImpl<Model, A, E, ESkip> implements BoundAppend<Model, A
       input: this._input,
       condition: this._condition,
       skipFollowUp: this._skip,
+      removeAttrs: this._removeAttrs,
     }) as Effect.Effect<A, E, never>
   }
 
