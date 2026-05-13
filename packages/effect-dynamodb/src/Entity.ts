@@ -68,7 +68,7 @@ import {
 } from "./Marshaller.js"
 import * as Query from "./Query.js"
 import { filterExpr, selectPaths } from "./Query.js"
-import type { TableConfig } from "./Table.js"
+import { resolveTtlAttributeName, type TableConfig } from "./Table.js"
 
 // Internal modules (decomposed from Entity.ts)
 export type {
@@ -2022,12 +2022,17 @@ const makeImpl = <
   /**
    * Build a version snapshot item: same PK, version SK, stripped GSI keys,
    * keeps __edd_e__ for entity type filtering.
+   *
+   * The TTL attribute name is resolved from the caller's TableConfig and
+   * passed in — the snapshot belongs to the same physical table, so it must
+   * align with that table's `TimeToLiveSpecification.AttributeName`.
    */
   const buildSnapshotItem = (
     item: globalThis.Record<string, unknown>,
     version: number,
     _tablePkField: string,
     tableSkField: string,
+    ttlAttrName: string,
   ): globalThis.Record<string, unknown> => {
     const snapshot: globalThis.Record<string, unknown> = { ...item }
 
@@ -2042,7 +2047,7 @@ const makeImpl = <
     // Add optional TTL
     const ttl = retainTtl()
     if (ttl) {
-      snapshot._ttl = Math.floor(Date.now() / 1000) + Duration.toSeconds(ttl)
+      snapshot[ttlAttrName] = Math.floor(Date.now() / 1000) + Duration.toSeconds(ttl)
     }
 
     return snapshot
@@ -2351,7 +2356,9 @@ const makeImpl = <
       (mode: DecodeMode, opts: { readonly condition: Expr | ConditionInput | undefined }) =>
         Effect.gen(function* () {
           const client = yield* DynamoClient
-          const { name: tableName } = yield* tableTag
+          const tc = yield* tableTag
+          const tableName = tc.name
+          const ttlAttrName = resolveTtlAttributeName(tc)
 
           // Encode user input → wire form. Users typically construct domain
           // values for transforms (DateTime, Redacted, Number) and plain
@@ -2494,6 +2501,7 @@ const makeImpl = <
                 1,
                 config.indexes.primary.pk.field,
                 config.indexes.primary.sk.field,
+                ttlAttrName,
               )
               transactItems.push({
                 Put: {
@@ -2696,7 +2704,9 @@ const makeImpl = <
           const evExpected = uState.expectedVersion
           const userCond = uState.condition
           const client = yield* DynamoClient
-          const { name: tableName } = yield* tableTag
+          const tc = yield* tableTag
+          const tableName = tc.name
+          const ttlAttrName = resolveTtlAttributeName(tc)
 
           // Decode key
           const decodedKey = yield* Schema.decodeUnknownEffect(
@@ -3033,6 +3043,7 @@ const makeImpl = <
                   currentVersion,
                   config.indexes.primary.pk.field,
                   config.indexes.primary.sk.field,
+                  ttlAttrName,
                 )
               : undefined
 
@@ -3691,7 +3702,9 @@ const makeImpl = <
       }) =>
         Effect.gen(function* () {
           const client = yield* DynamoClient
-          const { name: tableName } = yield* tableTag
+          const tc = yield* tableTag
+          const tableName = tc.name
+          const ttlAttrName = resolveTtlAttributeName(tc)
 
           // Decode key
           const decodedKey = yield* Schema.decodeUnknownEffect(
@@ -3751,7 +3764,7 @@ const makeImpl = <
             // Add optional TTL
             const sdTtl = softDeleteTtl()
             if (sdTtl) {
-              deletedItem._ttl = Math.floor(Date.now() / 1000) + Duration.toSeconds(sdTtl)
+              deletedItem[ttlAttrName] = Math.floor(Date.now() / 1000) + Duration.toSeconds(sdTtl)
             }
 
             // Build transaction
@@ -3784,6 +3797,7 @@ const makeImpl = <
                 currentVersion,
                 primary.pk.field,
                 primary.sk.field,
+                ttlAttrName,
               )
               transactItems.push({
                 Put: {
@@ -4180,7 +4194,7 @@ const makeImpl = <
   //  - UpdateItem on current: scoped SET (appendInput fields only) + CAS on
   //    `orderBy`, with GSI keys recomposed when any appendInput field is a
   //    GSI composite. `createdAt` uses if_not_exists on first append.
-  //  - Put of event: full decoded input + __edd_e__ + _ttl (if configured),
+  //  - Put of event: full decoded input + __edd_e__ + TTL attr (if configured),
   //    GSI keys stripped, SK replaced with `<currentSk>#e#<orderByValue>`.
   //
   // Concurrency outcome (stale-as-error contract — supersedes
@@ -4218,7 +4232,9 @@ const makeImpl = <
         })
       }
       const client = yield* DynamoClient
-      const { name: tableName } = yield* tableTag
+      const tc = yield* tableTag
+      const tableName = tc.name
+      const ttlAttrName = resolveTtlAttributeName(tc)
       const orderByField = timeSeriesConfig.orderBy
       const ttlDuration = timeSeriesConfig.ttl
       const appendInputSchema = schemas.appendInputSchema as Schema.Codec<any>
@@ -4455,9 +4471,9 @@ const makeImpl = <
       eventItem[primary.sk.field] = eventSk
       // __edd_e__
       eventItem.__edd_e__ = entityType
-      // _ttl
+      // TTL — attribute name comes from TableConfig (default "_ttl")
       if (ttlDuration) {
-        eventItem._ttl = Math.floor(Date.now() / 1000) + Duration.toSeconds(ttlDuration)
+        eventItem[ttlAttrName] = Math.floor(Date.now() / 1000) + Duration.toSeconds(ttlDuration)
       }
       // Events never participate in indexes: strip any GSI key fields that the
       // naive spread above may have carried over. gsiKeys weren't written into
@@ -4893,7 +4909,9 @@ const makeImpl = <
       (mode: DecodeMode, _opts: EntityGetOpts) =>
         Effect.gen(function* () {
           const client = yield* DynamoClient
-          const { name: tableName } = yield* tableTag
+          const tc = yield* tableTag
+          const tableName = tc.name
+          const ttlAttrName = resolveTtlAttributeName(tc)
 
           // Decode key
           const decodedKey = yield* Schema.decodeUnknownEffect(
@@ -4943,12 +4961,12 @@ const makeImpl = <
             ],
           })
 
-          // Build restored item: original SK, recompose all GSI keys, remove deletedAt + _ttl
+          // Build restored item: original SK, recompose all GSI keys, remove deletedAt + TTL
           const restoredItem: globalThis.Record<string, unknown> = {
             ...(deletedRaw as globalThis.Record<string, unknown>),
           }
           delete restoredItem.deletedAt
-          delete restoredItem._ttl
+          delete restoredItem[ttlAttrName]
 
           // Increment version
           const currentVersion = systemFields.version
@@ -4997,6 +5015,7 @@ const makeImpl = <
               currentVersion,
               primary.pk.field,
               primary.sk.field,
+              ttlAttrName,
             )
             transactItems.push({
               Put: {

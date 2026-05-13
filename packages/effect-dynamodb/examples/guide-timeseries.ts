@@ -243,7 +243,76 @@ const program = Effect.gen(function* () {
 })
 
 // =============================================================================
-// 5. Run
+// 5. TTL attribute-name override (issue #51)
+//
+// `TableConfig.ttlAttributeName` overrides the default `_ttl` attribute used
+// across `timeSeries: { ttl }`, `softDelete: { ttl }`, and
+// `versioned: { retain, ttl }` lifecycle features. Use it to align the
+// library's writes with a pre-existing or migrated DynamoDB table whose
+// `TimeToLiveSpecification.AttributeName` differs from the default.
 // =============================================================================
 
-Effect.runPromise(program.pipe(Effect.provide(AppLayer), Effect.scoped))
+const ttlOverrideProgram = Effect.gen(function* () {
+  const client = yield* DynamoClient
+  yield* client.createTable({
+    TableName: "timeseries-demo-table",
+    BillingMode: "PAY_PER_REQUEST",
+    ...Table.definition(MainTable),
+  })
+
+  // #region ttl-attribute-name
+  // Provide the table layer with a non-default TTL attribute name.
+  const overriddenLayer = MainTable.layer({
+    name: "timeseries-demo-table",
+    ttlAttributeName: "ttl",
+  })
+
+  const program = Effect.gen(function* () {
+    const db = yield* DynamoClient.make({ entities: { Telemetries }, tables: { MainTable } })
+    yield* db.entities.Telemetries.append({
+      channel: "c-ttl-demo",
+      deviceId: "d-1",
+      timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+    })
+  })
+
+  yield* program.pipe(Effect.provide(Layer.mergeAll(ClientLayer, overriddenLayer)))
+  // #endregion
+
+  // Assert the event item carries TTL on the configured "ttl" attribute (not "_ttl").
+  const raw = yield* client.query({
+    TableName: "timeseries-demo-table",
+    KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
+    ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk" },
+    ExpressionAttributeValues: {
+      ":pk": { S: "$timeseries-demo#v1#telemetry#channel_c-ttl-demo#deviceid_d-1" },
+      ":skPrefix": { S: "$timeseries-demo#v1#telemetry#e#" },
+    },
+  })
+  if (!raw.Items || raw.Items.length !== 1) {
+    yield* Effect.die(new Error("expected exactly one event item"))
+  }
+  const event = raw.Items![0]!
+  if (event.ttl?.N === undefined) {
+    yield* Effect.die(new Error("expected 'ttl' attribute to be set on event item"))
+  }
+  if (event._ttl !== undefined) {
+    yield* Effect.die(new Error("'_ttl' must be absent when override is in effect"))
+  }
+  yield* Console.log(`TTL written to 'ttl' attribute: ${event.ttl!.N}`)
+
+  yield* client.deleteTable({ TableName: "timeseries-demo-table" })
+})
+
+// =============================================================================
+// 6. Run
+// =============================================================================
+
+// Run the main program first, then the override demo sequentially — both share
+// the `timeseries-demo-table` name, so they must not overlap.
+const runAll = Effect.gen(function* () {
+  yield* program.pipe(Effect.provide(AppLayer), Effect.scoped)
+  yield* ttlOverrideProgram.pipe(Effect.provide(ClientLayer), Effect.scoped)
+})
+
+Effect.runPromise(runAll)

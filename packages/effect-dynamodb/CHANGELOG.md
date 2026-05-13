@@ -1,5 +1,33 @@
 # effect-dynamodb
 
+## 1.8.0
+
+### Minor Changes
+
+- Add `TableConfig.ttlAttributeName` (default `"_ttl"`) so the library writes TTL values to a configurable attribute name instead of the hardcoded `_ttl`. Closes [#51](https://github.com/jmenga/effect-dynamodb/issues/51).
+
+  A single setting applies to every lifecycle feature on the physical table — `timeSeries: { ttl }`, `softDelete: { ttl }`, and `versioned: { retain, ttl }` write to the same attribute and `Entity.restore()` strips it. This matches DynamoDB's per-table `TimeToLiveSpecification.AttributeName`, which permits exactly one TTL attribute.
+
+  ```ts
+  const MainTable = Table.make({ schema, entities: { Users } });
+
+  // Default (unchanged): writes to "_ttl"
+  MainTable.layer({ name: "users-prod" });
+
+  // Override: align with a TimeToLiveSpecification.AttributeName = "ttl"
+  MainTable.layer({ name: "users-prod", ttlAttributeName: "ttl" });
+
+  // Or from Effect Config
+  MainTable.layerConfig({
+    name: Config.string("TABLE_NAME"),
+    ttlAttributeName: Config.string("TTL_ATTR").pipe(
+      Config.withDefault("_ttl"),
+    ),
+  });
+  ```
+
+  This is fully backwards compatible — consumers who don't set the field continue to write to `_ttl`. Use it to align the library's writes with a pre-existing or migrated DynamoDB table whose TTL attribute differs, without the destructive table replacement or multi-deploy DDB rename dance.
+
 ## 1.7.4
 
 ### Patch Changes

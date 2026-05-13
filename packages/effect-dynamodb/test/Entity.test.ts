@@ -100,6 +100,14 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
 const TestTableConfig = MainTable.layer({ name: "test-table" })
 const TestLayer = Layer.merge(TestDynamoClient, TestTableConfig)
 
+/**
+ * Layer fixture for issue #51 — pins {@link Table.TableConfig.ttlAttributeName}
+ * to `"ttl"` instead of the `"_ttl"` default. Used by the lifecycle tests that
+ * assert TTL writes target the configured attribute name.
+ */
+const TestTableConfigCustomTtl = MainTable.layer({ name: "test-table", ttlAttributeName: "ttl" })
+const TestLayerCustomTtl = Layer.merge(TestDynamoClient, TestTableConfigCustomTtl)
+
 // ---------------------------------------------------------------------------
 // Entity.make() basics
 // ---------------------------------------------------------------------------
@@ -4320,6 +4328,33 @@ describe("Entity", () => {
         expect(snapshotPut.Item._ttl.N).toBeDefined()
       }).pipe(Effect.provide(TestLayer)),
     )
+
+    it.effect("version snapshot honours TableConfig.ttlAttributeName override (#51)", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        const TtlRetainEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "TtlRetainCustomAttr",
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            versioned: { retain: true, ttl: Duration.days(90) },
+          }),
+        )
+
+        yield* TtlRetainEntity.put({ itemId: "i-1", name: "Test" }).asEffect()
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        const snapshotPut = call.TransactItems[1].Put
+        // TTL written to "ttl", not "_ttl"
+        expect(snapshotPut.Item.ttl).toBeDefined()
+        expect(snapshotPut.Item.ttl.N).toBeDefined()
+        expect(snapshotPut.Item._ttl).toBeUndefined()
+      }).pipe(Effect.provide(TestLayerCustomTtl)),
+    )
   })
 
   // ---------------------------------------------------------------------------
@@ -4447,6 +4482,77 @@ describe("Entity", () => {
         const call = mockTransactWriteItems.mock.calls[0]![0]
         // 2 items only: Delete current + Put soft-deleted (no sentinel delete)
         expect(call.TransactItems).toHaveLength(2)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("soft delete writes TTL to the configured attribute name (#51)", () =>
+      Effect.gen(function* () {
+        const SoftDeleteTtlEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SoftItemTtl",
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            softDelete: { ttl: Duration.days(30) },
+          }),
+        )
+
+        mockGetItem.mockResolvedValueOnce({
+          Item: toAttributeMap({
+            itemId: "i-1",
+            name: "Test",
+            pk: "$myapp#v1#softitemttl#i-1",
+            sk: "$myapp#v1#softitemttl",
+            __edd_e__: "SoftItemTtl",
+          }),
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* SoftDeleteTtlEntity.delete({ itemId: "i-1" }).asEffect()
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        const softDeletePut = call.TransactItems[1].Put
+        // TTL written to "ttl", not "_ttl"
+        expect(softDeletePut.Item.ttl).toBeDefined()
+        expect(softDeletePut.Item.ttl.N).toBeDefined()
+        expect(softDeletePut.Item._ttl).toBeUndefined()
+      }).pipe(Effect.provide(TestLayerCustomTtl)),
+    )
+
+    it.effect("soft delete defaults TTL attribute to _ttl when override unset", () =>
+      Effect.gen(function* () {
+        const SoftDeleteTtlEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SoftItemDefaultTtl",
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            softDelete: { ttl: Duration.days(30) },
+          }),
+        )
+
+        mockGetItem.mockResolvedValueOnce({
+          Item: toAttributeMap({
+            itemId: "i-1",
+            name: "Test",
+            pk: "$myapp#v1#softitemdefaultttl#i-1",
+            sk: "$myapp#v1#softitemdefaultttl",
+            __edd_e__: "SoftItemDefaultTtl",
+          }),
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* SoftDeleteTtlEntity.delete({ itemId: "i-1" }).asEffect()
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        const softDeletePut = call.TransactItems[1].Put
+        expect(softDeletePut.Item._ttl).toBeDefined()
+        expect(softDeletePut.Item._ttl.N).toBeDefined()
+        expect(softDeletePut.Item.ttl).toBeUndefined()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -4641,6 +4747,45 @@ describe("Entity", () => {
         // Should not have deletedAt
         expect(restoredPut.Item.deletedAt).toBeUndefined()
       }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("restore strips the configured TTL attribute (#51)", () =>
+      Effect.gen(function* () {
+        // The soft-deleted item carries a "ttl" attribute (not "_ttl"). Restore
+        // must strip it so the resurrected current item never inherits an
+        // expiry. We seed both the legacy "_ttl" and the configured "ttl"
+        // attributes on the deleted record — the restore path must strip the
+        // configured name and leave the unrelated attribute untouched.
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              itemId: "i-1",
+              name: "Test",
+              createdAt: "2024-01-15T00:00:00Z",
+              updatedAt: "2024-01-15T00:00:00Z",
+              version: 2,
+              deletedAt: "2024-02-01T10:00:00Z",
+              _ttl: 9_999_999_999,
+              ttl: 9_999_999_999,
+              pk: "$myapp#v1#restoreitem#i-1",
+              sk: "$myapp#v1#restoreitem#deleted#2024-02-01T10:00:00Z",
+              __edd_e__: "RestoreItem",
+            }),
+          ],
+          LastEvaluatedKey: undefined,
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* RestoreEntity.restore({ itemId: "i-1" }).asEffect()
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        const restoredPut = call.TransactItems[1].Put
+        // Configured attribute name is stripped.
+        expect(restoredPut.Item.ttl).toBeUndefined()
+        // Legacy "_ttl" left untouched — only the configured name is the
+        // contract surface.
+        expect(restoredPut.Item._ttl).toBeDefined()
+      }).pipe(Effect.provide(TestLayerCustomTtl)),
     )
 
     it.effect("restore with unique constraints re-establishes sentinels", () =>

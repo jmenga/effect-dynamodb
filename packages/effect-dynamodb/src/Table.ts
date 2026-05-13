@@ -18,7 +18,24 @@ import type { IndexDefinition } from "./KeyComposer.js"
 export interface TableConfig {
   /** Physical DynamoDB table name. */
   readonly name: string
+  /**
+   * Attribute name used for DynamoDB TTL (`TimeToLiveSpecification.AttributeName`).
+   * Lifecycle features (`versioned: { retain, ttl }`, `softDelete: { ttl }`,
+   * `timeSeries: { ttl }`) write the epoch-seconds expiry to this attribute, and
+   * `Entity.restore()` strips it. Defaults to `"_ttl"`. Set this to align with a
+   * pre-existing or migrated table whose TTL attribute is named differently
+   * (e.g. `"ttl"`). DynamoDB allows only one TTL attribute per physical table,
+   * so a single value applies to all lifecycle features on this table.
+   */
+  readonly ttlAttributeName?: string | undefined
 }
+
+/** Default attribute name used for DynamoDB TTL when {@link TableConfig.ttlAttributeName} is unset. */
+export const DEFAULT_TTL_ATTRIBUTE_NAME = "_ttl"
+
+/** Resolve the effective TTL attribute name from a TableConfig. */
+export const resolveTtlAttributeName = (tc: TableConfig): string =>
+  tc.ttlAttributeName ?? DEFAULT_TTL_ATTRIBUTE_NAME
 
 /**
  * Counter for generating unique Tag identifiers.
@@ -75,9 +92,14 @@ export interface Table<
   readonly Tag: Context.Service<TableConfig, TableConfig>
   /** Provide the physical table name */
   readonly layer: (config: TableConfig) => Layer.Layer<TableConfig>
-  /** Provide the physical table name from Effect Config */
+  /**
+   * Provide the physical table name (and optional TTL attribute name) from Effect Config.
+   *
+   * `ttlAttributeName` is optional — omit it to use the `"_ttl"` default.
+   */
   readonly layerConfig: (config: {
     readonly name: Config.Config<string>
+    readonly ttlAttributeName?: Config.Config<string> | undefined
   }) => Layer.Layer<TableConfig, Config.ConfigError>
 }
 
@@ -132,12 +154,22 @@ export const make = <
     aggregates,
     Tag,
     layer: (tableConfig: TableConfig) => Layer.succeed(Tag, tableConfig),
-    layerConfig: (configDef: { readonly name: Config.Config<string> }) =>
+    layerConfig: (configDef: {
+      readonly name: Config.Config<string>
+      readonly ttlAttributeName?: Config.Config<string> | undefined
+    }) =>
       Layer.effect(
         Tag,
         Effect.gen(function* () {
           const tableName = yield* configDef.name
-          return { name: tableName }
+          const ttlAttributeName = configDef.ttlAttributeName
+            ? yield* configDef.ttlAttributeName
+            : undefined
+          const result: TableConfig =
+            ttlAttributeName !== undefined
+              ? { name: tableName, ttlAttributeName }
+              : { name: tableName }
+          return result
         }),
       ),
   }
