@@ -87,6 +87,7 @@ const TestDynamoClient = Layer.succeed(DynamoClient, mockService)
 /** Build a wired entity with a real Table tag. */
 const makeEntityWithTag = <E extends { _configure: (...args: any) => any }>(
   entity: E,
+  opts?: { ttlAttributeName?: string },
 ): { entity: E; tableLayer: Layer.Layer<any> } => {
   // Build a per-test Table definition with only this entity and bind the tag.
   const table = Table.make({
@@ -94,7 +95,11 @@ const makeEntityWithTag = <E extends { _configure: (...args: any) => any }>(
     entities: { Telemetry: entity as any },
   })
   entity._configure(AppSchema, table.Tag)
-  return { entity, tableLayer: table.layer({ name: "test-table" }) }
+  const tableConfig =
+    opts?.ttlAttributeName !== undefined
+      ? { name: "test-table", ttlAttributeName: opts.ttlAttributeName }
+      : { name: "test-table" }
+  return { entity, tableLayer: table.layer(tableConfig) }
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +291,7 @@ describe("TimeSeries — append payload shape", () => {
     vi.resetAllMocks()
   })
 
-  const buildEntity = (opts?: { ttl?: Duration.Duration }) => {
+  const buildEntity = (opts?: { ttl?: Duration.Duration; ttlAttributeName?: string }) => {
     const entity = Entity.make({
       model: Telemetry,
       entityType: "Telemetry",
@@ -301,7 +306,12 @@ describe("TimeSeries — append payload shape", () => {
         appendInput: TelemetryAppendInput,
       },
     })
-    return makeEntityWithTag(entity)
+    return makeEntityWithTag(
+      entity,
+      opts?.ttlAttributeName !== undefined
+        ? { ttlAttributeName: opts.ttlAttributeName }
+        : undefined,
+    )
   }
 
   it.effect("builds exactly 2 TransactWriteItems (Update current + Put event)", () => {
@@ -1738,4 +1748,118 @@ describe("TimeSeries — .append().remove() GSI cascade (canonical shapes)", () 
       }).pipe(Effect.provide(layer))
     },
   )
+})
+
+// ---------------------------------------------------------------------------
+// TTL attribute name override (issue #51)
+// ---------------------------------------------------------------------------
+
+describe("TimeSeries — ttlAttributeName override (#51)", () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+  })
+
+  const buildEntity = (opts?: { ttl?: Duration.Duration; ttlAttributeName?: string }) => {
+    const entity = Entity.make({
+      model: Telemetry,
+      entityType: "Telemetry",
+      primaryKey: {
+        pk: { field: "pk", composite: ["channel", "deviceId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      timestamps: true,
+      timeSeries: {
+        orderBy: "timestamp",
+        ...(opts?.ttl ? { ttl: opts.ttl } : {}),
+        appendInput: TelemetryAppendInput,
+      },
+    })
+    return makeEntityWithTag(
+      entity,
+      opts?.ttlAttributeName !== undefined
+        ? { ttlAttributeName: opts.ttlAttributeName }
+        : undefined,
+    )
+  }
+
+  const seedAppendMocks = () => {
+    mockTransactWriteItems.mockResolvedValueOnce({})
+    mockGetItem.mockResolvedValueOnce({
+      Item: {
+        pk: { S: "$tsapp#v1#telemetry#c-1#d-7" },
+        sk: { S: "$tsapp#v1#telemetry_1" },
+        channel: { S: "c-1" },
+        deviceId: { S: "d-7" },
+        timestamp: { S: "2026-04-22T10:00:00.000Z" },
+        __edd_e__: { S: "Telemetry" },
+      },
+    })
+  }
+
+  it.effect("writes TTL to the configured attribute name (custom 'ttl')", () => {
+    const { entity, tableLayer } = buildEntity({
+      ttl: Duration.days(7),
+      ttlAttributeName: "ttl",
+    })
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      seedAppendMocks()
+
+      yield* entity.append({
+        channel: "c-1",
+        deviceId: "d-7",
+        timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+      })
+
+      const call = mockTransactWriteItems.mock.calls[0]![0]
+      const put = call.TransactItems[1].Put
+      // Custom name is used, default name is absent.
+      expect(put.Item.ttl).toBeDefined()
+      expect(put.Item.ttl.N).toBeDefined()
+      expect(put.Item._ttl).toBeUndefined()
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("falls back to default '_ttl' when ttlAttributeName is unset", () => {
+    const { entity, tableLayer } = buildEntity({ ttl: Duration.days(7) })
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      seedAppendMocks()
+
+      yield* entity.append({
+        channel: "c-1",
+        deviceId: "d-7",
+        timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+      })
+
+      const call = mockTransactWriteItems.mock.calls[0]![0]
+      const put = call.TransactItems[1].Put
+      expect(put.Item._ttl).toBeDefined()
+      expect(put.Item._ttl.N).toBeDefined()
+      // A custom attribute name should not leak when none configured.
+      expect(put.Item.ttl).toBeUndefined()
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("custom attribute name has no effect when timeSeries.ttl is omitted", () => {
+    const { entity, tableLayer } = buildEntity({ ttlAttributeName: "ttl" })
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      seedAppendMocks()
+
+      yield* entity.append({
+        channel: "c-1",
+        deviceId: "d-7",
+        timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+      })
+
+      const call = mockTransactWriteItems.mock.calls[0]![0]
+      const put = call.TransactItems[1].Put
+      expect(put.Item.ttl).toBeUndefined()
+      expect(put.Item._ttl).toBeUndefined()
+    }).pipe(Effect.provide(layer))
+  })
 })

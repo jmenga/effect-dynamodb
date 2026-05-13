@@ -70,7 +70,8 @@ export type SoftDeleteConfig =
  * per partition and many immutable "event" items. See guides/timeseries.mdx.
  *
  * Current-item SK matches the primary index SK. Event-item SK is
- * `<currentSk>#e#<orderBy-value>`, GSI keys stripped, `_ttl` set.
+ * `<currentSk>#e#<orderBy-value>`, GSI keys stripped, TTL attribute set
+ * (attribute name comes from `TableConfig.ttlAttributeName`, default `"_ttl"`).
  *
  * `.append(input)` is a `TransactWriteItems` (UpdateItem current + Put event)
  * with CAS `attribute_not_exists(pk) OR #orderBy < :newOb`. Returns

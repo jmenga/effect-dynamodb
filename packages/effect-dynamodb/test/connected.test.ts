@@ -3953,3 +3953,243 @@ describeConnected("Empty-composite-half GSI shape (closes #46)", () => {
       }).pipe(provideVehicle),
   )
 })
+
+// ---------------------------------------------------------------------------
+// TTL attribute name override (closes #51)
+//
+// Consumers may have pre-existing tables whose `TimeToLiveSpecification.AttributeName`
+// is not `_ttl` (the library default). This describeConnected block verifies the
+// end-to-end behaviour with `TableConfig.ttlAttributeName: "ttl"` across all
+// three lifecycle features that write TTL — `timeSeries: { ttl }`,
+// `softDelete: { ttl }`, and `versioned: { retain, ttl }` — and the restore
+// path that strips the configured name.
+// ---------------------------------------------------------------------------
+
+class TtlEvent extends Schema.Class<TtlEvent>("TtlEvent")({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  timestamp: Schema.DateTimeUtc,
+  reading: Schema.optional(Schema.Number),
+}) {}
+
+const TtlEventAppendInput = Schema.Struct({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  timestamp: Schema.DateTimeUtc,
+  reading: Schema.optional(Schema.Number),
+})
+
+class TtlSoftItem extends Schema.Class<TtlSoftItem>("TtlSoftItem")({
+  itemId: Schema.String,
+  label: Schema.String,
+}) {}
+
+class TtlRetainItem extends Schema.Class<TtlRetainItem>("TtlRetainItem")({
+  itemId: Schema.String,
+  payload: Schema.String,
+}) {}
+
+const ttlSchema = DynamoSchema.make({ name: "ttl-attr-test", version: 1 })
+const ttlTableName = `ttl-attr-test-${Date.now()}`
+
+const TtlEvents = Entity.make({
+  model: TtlEvent,
+  entityType: "TtlEvent",
+  primaryKey: {
+    pk: { field: "pk", composite: ["channel", "deviceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  timestamps: true,
+  timeSeries: {
+    orderBy: "timestamp",
+    ttl: Duration.days(7),
+    appendInput: TtlEventAppendInput,
+  },
+})
+
+const TtlSoftItems = Entity.make({
+  model: TtlSoftItem,
+  entityType: "TtlSoftItem",
+  primaryKey: {
+    pk: { field: "pk", composite: ["itemId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  timestamps: true,
+  versioned: true,
+  softDelete: { ttl: Duration.days(30) },
+})
+
+const TtlRetainItems = Entity.make({
+  model: TtlRetainItem,
+  entityType: "TtlRetainItem",
+  primaryKey: {
+    pk: { field: "pk", composite: ["itemId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  timestamps: true,
+  versioned: { retain: true, ttl: Duration.days(90) },
+})
+
+const TtlTable = Table.make({
+  schema: ttlSchema,
+  entities: { TtlEvents, TtlSoftItems, TtlRetainItems },
+})
+const TtlTestLayer = Layer.mergeAll(
+  ClientLayer,
+  TtlTable.layer({ name: ttlTableName, ttlAttributeName: "ttl" }),
+)
+const provideTtl = Effect.provide(TtlTestLayer)
+
+describeConnected("TableConfig.ttlAttributeName override (closes #51)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: ttlTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(TtlTable),
+        })
+      }).pipe(provideTtl, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: ttlTableName })
+      }).pipe(
+        provideTtl,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("timeSeries event writes TTL to the configured attribute name", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { TtlEvents },
+        tables: { TtlTable },
+      })
+
+      yield* db.entities.TtlEvents.append({
+        channel: "c-cfg-1",
+        deviceId: "d-1",
+        timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+      })
+
+      const raw = yield* (yield* DynamoClient).query({
+        TableName: ttlTableName,
+        KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
+        ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk" },
+        ExpressionAttributeValues: {
+          ":pk": { S: "$ttl-attr-test#v1#ttlevent#channel_c-cfg-1#deviceid_d-1" },
+          ":skPrefix": { S: "$ttl-attr-test#v1#ttlevent#e#" },
+        },
+      })
+      expect(raw.Items).toBeDefined()
+      expect(raw.Items!.length).toBe(1)
+      const event = raw.Items![0]!
+      // Configured attribute "ttl" carries the epoch-seconds expiry.
+      expect(event.ttl?.N).toBeDefined()
+      const ttlVal = Number(event.ttl!.N)
+      const now = Math.floor(Date.now() / 1000)
+      expect(ttlVal).toBeGreaterThan(now + 6 * 86400)
+      expect(ttlVal).toBeLessThan(now + 8 * 86400)
+      // Library default "_ttl" must NOT be written when override is in effect.
+      expect(event._ttl).toBeUndefined()
+    }).pipe(provideTtl),
+  )
+
+  it.effect("soft-deleted item writes TTL to the configured attribute name", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { TtlSoftItems },
+        tables: { TtlTable },
+      })
+
+      yield* db.entities.TtlSoftItems.put({ itemId: "sd-1", label: "to be deleted" })
+      yield* db.entities.TtlSoftItems.delete({ itemId: "sd-1" })
+
+      // Read the soft-deleted record raw to assert the attribute name.
+      const raw = yield* (yield* DynamoClient).query({
+        TableName: ttlTableName,
+        KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
+        ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk" },
+        ExpressionAttributeValues: {
+          ":pk": { S: "$ttl-attr-test#v1#ttlsoftitem#itemid_sd-1" },
+          ":skPrefix": { S: "$ttl-attr-test#v1#ttlsoftitem#deleted#" },
+        },
+      })
+      expect(raw.Items).toBeDefined()
+      expect(raw.Items!.length).toBe(1)
+      const deleted = raw.Items![0]!
+      expect(deleted.ttl?.N).toBeDefined()
+      const ttlVal = Number(deleted.ttl!.N)
+      const now = Math.floor(Date.now() / 1000)
+      // Roughly 30 days from now.
+      expect(ttlVal).toBeGreaterThan(now + 29 * 86400)
+      expect(ttlVal).toBeLessThan(now + 31 * 86400)
+      expect(deleted._ttl).toBeUndefined()
+    }).pipe(provideTtl),
+  )
+
+  it.effect("restore strips the configured TTL attribute from the resurrected item", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { TtlSoftItems },
+        tables: { TtlTable },
+      })
+
+      yield* db.entities.TtlSoftItems.put({ itemId: "sd-2", label: "round-trip" })
+      yield* db.entities.TtlSoftItems.delete({ itemId: "sd-2" })
+      yield* db.entities.TtlSoftItems.restore({ itemId: "sd-2" })
+
+      const raw = yield* (yield* DynamoClient).getItem({
+        TableName: ttlTableName,
+        Key: {
+          pk: { S: "$ttl-attr-test#v1#ttlsoftitem#itemid_sd-2" },
+          sk: { S: "$ttl-attr-test#v1#ttlsoftitem" },
+        },
+      })
+      expect(raw.Item).toBeDefined()
+      // Restored item should not carry the TTL — restore strips the configured name.
+      expect(raw.Item!.ttl).toBeUndefined()
+      expect(raw.Item!._ttl).toBeUndefined()
+    }).pipe(provideTtl),
+  )
+
+  it.effect("versioned snapshot writes TTL to the configured attribute name", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { TtlRetainItems },
+        tables: { TtlTable },
+      })
+
+      // First put produces a v1 snapshot under the retain config (which has ttl).
+      yield* db.entities.TtlRetainItems.put({ itemId: "rt-1", payload: "initial" })
+
+      const raw = yield* (yield* DynamoClient).query({
+        TableName: ttlTableName,
+        KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
+        ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk" },
+        ExpressionAttributeValues: {
+          ":pk": { S: "$ttl-attr-test#v1#ttlretainitem#itemid_rt-1" },
+          ":skPrefix": { S: "$ttl-attr-test#v1#ttlretainitem#v#" },
+        },
+      })
+      expect(raw.Items).toBeDefined()
+      expect(raw.Items!.length).toBe(1)
+      const snapshot = raw.Items![0]!
+      expect(snapshot.ttl?.N).toBeDefined()
+      const ttlVal = Number(snapshot.ttl!.N)
+      const now = Math.floor(Date.now() / 1000)
+      // Roughly 90 days from now.
+      expect(ttlVal).toBeGreaterThan(now + 89 * 86400)
+      expect(ttlVal).toBeLessThan(now + 91 * 86400)
+      expect(snapshot._ttl).toBeUndefined()
+    }).pipe(provideTtl),
+  )
+})

@@ -281,9 +281,55 @@ Terminals are the standard `BoundQuery` set: `.collect()`, `.fetch()`, `.paginat
 
 ## TTL and retention
 
-`ttl: Duration.days(N)` on `TimeSeriesConfig` sets a `_ttl` attribute on each event item at `Math.floor(Date.now()/1000) + toSeconds(ttl)`. DynamoDB's built-in TTL processor prunes expired events asynchronously (typically within 48 hours of expiration).
+`ttl: Duration.days(N)` on `TimeSeriesConfig` sets a TTL attribute on each event item at `Math.floor(Date.now()/1000) + toSeconds(ttl)`. DynamoDB's built-in TTL processor prunes expired events asynchronously (typically within 48 hours of expiration).
 
-The current item never has `_ttl` — it is the live projection and must not expire.
+The current item never has a TTL — it is the live projection and must not expire.
+
+### Aligning with `TimeToLiveSpecification.AttributeName`
+
+By default the library writes the TTL value to an attribute named `_ttl`. DynamoDB tables enable expiry by setting `TimeToLiveSpecification.AttributeName` (the `TTL` configuration on the console / CloudFormation), and that name must match what the library writes. If your table is already provisioned with a different name (e.g. `ttl`), set `ttlAttributeName` when providing the runtime `TableConfig`:
+
+```ts
+// Default: TTL writes go to `_ttl`.
+MainTable.layer({ name: "telemetry-table" })
+
+// Override: align with a table whose TimeToLiveSpecification uses `ttl`.
+MainTable.layer({
+  name: "telemetry-table",
+  ttlAttributeName: "ttl",
+})
+
+// Or from Effect Config (env-driven, optional):
+MainTable.layerConfig({
+  name: Config.string("TABLE_NAME"),
+  ttlAttributeName: Config.string("TTL_ATTRIBUTE").pipe(Config.withDefault("_ttl")),
+})
+```
+
+A single `ttlAttributeName` applies to every lifecycle feature on the physical table — `timeSeries: { ttl }`, `softDelete: { ttl }`, and `versioned: { retain, ttl }` all write to the same attribute, and `Entity.restore()` strips it. DynamoDB allows only one TTL attribute per table, so this matches the underlying constraint by design.
+
+Use this to give yourself a migration path: declare the legacy attribute name in code, deploy without a destructive table replacement, then perform the standard two-step DDB rename later when you can.
+
+The example below provides a `MainTable` layer whose TTL attribute is the non-default `"ttl"`, then asserts the appended event carries the expiry on the configured attribute name:
+
+```ts region="ttl-attribute-name" example="guide-timeseries.ts"
+// Provide the table layer with a non-default TTL attribute name.
+const overriddenLayer = MainTable.layer({
+  name: "timeseries-demo-table",
+  ttlAttributeName: "ttl",
+})
+
+const program = Effect.gen(function* () {
+  const db = yield* DynamoClient.make({ entities: { Telemetries }, tables: { MainTable } })
+  yield* db.entities.Telemetries.append({
+    channel: "c-ttl-demo",
+    deviceId: "d-1",
+    timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+  })
+})
+
+yield* program.pipe(Effect.provide(Layer.mergeAll(ClientLayer, overriddenLayer)))
+```
 
 ## Multi-stream per partition
 
