@@ -15,9 +15,7 @@ import { Config, Effect } from "effect"
 import { describe, it } from "vitest"
 
 const ENDPOINT = Effect.runSync(
-  Effect.fromYieldable(
-    Config.string("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
-  ),
+  Config.string("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
 )
 const EXAMPLES_DIR = resolve(import.meta.dirname, "../../effect-dynamodb/examples")
 

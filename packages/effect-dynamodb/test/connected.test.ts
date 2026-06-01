@@ -31,9 +31,7 @@ import * as Transaction from "../src/Transaction.js"
 // ---------------------------------------------------------------------------
 
 const ENDPOINT = Effect.runSync(
-  Effect.fromYieldable(
-    Config.string("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
-  ),
+  Config.string("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
 )
 
 let dynamoAvailable = false
