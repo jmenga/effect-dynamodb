@@ -168,6 +168,7 @@ import type {
   SoftDeleteConfig,
   TimeSeriesConfig,
   TimestampsConfig,
+  TtlInput,
   UniqueConfig,
   UniqueConstraintDef,
   VersionedConfig,
@@ -215,6 +216,45 @@ import type {
 export type { IndexDefinition, KeyPart }
 
 // ---------------------------------------------------------------------------
+// TTL config normalization
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalize a {@link TtlInput} to a `Duration`. Duration-string literals parse
+ * via `Duration.fromInputUnsafe` (the `TtlInput` type restricts strings to the
+ * valid `` `${number} ${Unit}` `` shape, so this never fails for typed callers).
+ */
+const normalizeTtlInput = (ttl: TtlInput): Duration.Duration =>
+  typeof ttl === "string" ? Duration.fromInputUnsafe(ttl) : ttl
+
+/**
+ * Validate a configured TTL at `make()` time: parseable and finite.
+ * Throws `[EDD-9020]` on an invalid duration string or a non-finite duration
+ * (e.g. `Duration.infinity`) — an infinite TTL epoch is nonsensical for DynamoDB.
+ */
+const validateTtlConfig = (entityType: string, label: string, ttl: TtlInput | undefined): void => {
+  if (ttl === undefined) return
+  let dur: Duration.Duration
+  if (typeof ttl === "string") {
+    const parsed = Duration.fromInput(ttl)
+    if (Option.isNone(parsed)) {
+      throw new Error(
+        `[EDD-9020] Entity "${entityType}": ${label} ttl "${ttl}" is not a valid duration string ` +
+          `(expected e.g. "7 days", "24 hours", "30 minutes").`,
+      )
+    }
+    dur = parsed.value
+  } else {
+    dur = ttl
+  }
+  if (!Duration.isFinite(dur)) {
+    throw new Error(
+      `[EDD-9020] Entity "${entityType}": ${label} ttl must be a finite duration (got infinity).`,
+    )
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Sparse-aware unique sentinel composition
 // ---------------------------------------------------------------------------
 
@@ -260,6 +300,15 @@ const composeUniqueSentinel = (
     fieldsRecord,
   }
 }
+
+/**
+ * The optional relative TTL configured on a unique constraint. Only the object
+ * form (`{ fields, ttl }`) can carry a TTL; a bare field-list array cannot.
+ * When set, the constraint's sentinel item expires after the offset — useful
+ * for temporary reservations (the uniqueness hold is released automatically).
+ */
+const uniqueConstraintTtl = (constraintDef: UniqueConstraintDef): TtlInput | undefined =>
+  Array.isArray(constraintDef) ? undefined : (constraintDef as { readonly ttl?: TtlInput }).ttl
 
 // ---------------------------------------------------------------------------
 // Encode-or-decode-encode helper
@@ -1514,6 +1563,34 @@ const makeImpl = <
   }
 
   // ---------------------------------------------------------------------------
+  // Validate lifecycle TTL configs (EDD-9020): parseable + finite durations
+  // ---------------------------------------------------------------------------
+  if (typeof config.versioned === "object" && config.versioned !== null) {
+    validateTtlConfig(config.entityType, "versioned", config.versioned.ttl)
+  }
+  if (typeof config.softDelete === "object" && config.softDelete !== null) {
+    validateTtlConfig(config.entityType, "softDelete", config.softDelete.ttl)
+  }
+  if (config.timeSeries !== undefined && config.timeSeries !== null) {
+    validateTtlConfig(
+      config.entityType,
+      "timeSeries",
+      (config.timeSeries as TimeSeriesConfig<any>).ttl,
+    )
+  }
+  if (config.unique) {
+    for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
+      if (!Array.isArray(constraintDef)) {
+        validateTtlConfig(
+          config.entityType,
+          `unique:${constraintName}`,
+          (constraintDef as { readonly ttl?: TtlInput }).ttl,
+        )
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Validate timeSeries config (EDD-9010..9016)
   // ---------------------------------------------------------------------------
   if (config.timeSeries !== undefined && config.timeSeries !== null) {
@@ -1987,8 +2064,8 @@ const makeImpl = <
    * Absolute TTL epoch-seconds = `now` + the configured relative offset.
    * `now` is read once per operation from the ambient `Clock` via `DateTime.now`.
    */
-  const ttlEpochSeconds = (now: DateTime.Utc, ttl: Duration.Duration): number =>
-    Math.floor(DateTime.toEpochMillis(now) / 1000) + Duration.toSeconds(ttl)
+  const ttlEpochSeconds = (now: DateTime.Utc, ttl: TtlInput): number =>
+    Math.floor(DateTime.toEpochMillis(now) / 1000) + Duration.toSeconds(normalizeTtlInput(ttl))
 
   // ---------------------------------------------------------------------------
   // Lifecycle config helpers
@@ -2003,14 +2080,14 @@ const makeImpl = <
     config.softDelete === true ||
     (typeof config.softDelete === "object" && config.softDelete !== null)
 
-  const retainTtl = (): Duration.Duration | undefined => {
+  const retainTtl = (): TtlInput | undefined => {
     if (typeof config.versioned !== "object" || config.versioned === null) return undefined
-    return (config.versioned as { ttl?: Duration.Duration }).ttl
+    return (config.versioned as { ttl?: TtlInput }).ttl
   }
 
-  const softDeleteTtl = (): Duration.Duration | undefined => {
+  const softDeleteTtl = (): TtlInput | undefined => {
     if (typeof config.softDelete !== "object" || config.softDelete === null) return undefined
-    return (config.softDelete as { ttl?: Duration.Duration }).ttl
+    return (config.softDelete as { ttl?: TtlInput }).ttl
   }
 
   const preserveUnique = (): boolean => {
@@ -2489,16 +2566,21 @@ const makeImpl = <
                 )
                 if (!sentinel) continue
                 sentinelConstraints.push(constraintName)
+                const sentinelItem: globalThis.Record<string, unknown> = {
+                  [config.indexes.primary.pk.field]: sentinel.key.pk,
+                  [config.indexes.primary.sk.field]: sentinel.key.sk,
+                  __edd_e__: `${entityType}._unique.${constraintName}`,
+                  _entity_pk: keys[config.indexes.primary.pk.field],
+                  _entity_sk: keys[config.indexes.primary.sk.field],
+                }
+                // Optional TTL: sentinel expires after the configured offset,
+                // releasing the uniqueness reservation automatically.
+                const uTtl = uniqueConstraintTtl(constraintDef)
+                if (uTtl !== undefined) sentinelItem[ttlAttrName] = ttlEpochSeconds(now, uTtl)
                 transactItems.push({
                   Put: {
                     TableName: tableName,
-                    Item: toAttributeMap({
-                      [config.indexes.primary.pk.field]: sentinel.key.pk,
-                      [config.indexes.primary.sk.field]: sentinel.key.sk,
-                      __edd_e__: `${entityType}._unique.${constraintName}`,
-                      _entity_pk: keys[config.indexes.primary.pk.field],
-                      _entity_sk: keys[config.indexes.primary.sk.field],
-                    }),
+                    Item: toAttributeMap(sentinelItem),
                     ConditionExpression: "attribute_not_exists(pk)",
                   },
                 })
@@ -3144,16 +3226,24 @@ const makeImpl = <
                   constraintName: rotation.constraintName,
                   newFieldsRecord: rotation.newFieldsRecord,
                 })
+                const rotatedItem: globalThis.Record<string, unknown> = {
+                  [config.indexes.primary.pk.field]: rotation.newUniqueKey.pk,
+                  [config.indexes.primary.sk.field]: rotation.newUniqueKey.sk,
+                  __edd_e__: `${entityType}._unique.${rotation.constraintName}`,
+                  _entity_pk: primaryKey[config.indexes.primary.pk.field],
+                  _entity_sk: primaryKey[config.indexes.primary.sk.field],
+                }
+                // Re-apply the constraint's optional TTL to the rotated sentinel.
+                const rotatedTtl = config.unique
+                  ? uniqueConstraintTtl(config.unique[rotation.constraintName]!)
+                  : undefined
+                if (rotatedTtl !== undefined) {
+                  rotatedItem[ttlAttrName] = ttlEpochSeconds(now, rotatedTtl)
+                }
                 transactItems.push({
                   Put: {
                     TableName: tableName,
-                    Item: toAttributeMap({
-                      [config.indexes.primary.pk.field]: rotation.newUniqueKey.pk,
-                      [config.indexes.primary.sk.field]: rotation.newUniqueKey.sk,
-                      __edd_e__: `${entityType}._unique.${rotation.constraintName}`,
-                      _entity_pk: primaryKey[config.indexes.primary.pk.field],
-                      _entity_sk: primaryKey[config.indexes.primary.sk.field],
-                    }),
+                    Item: toAttributeMap(rotatedItem),
                     ConditionExpression: "attribute_not_exists(pk)",
                   },
                 })
@@ -5071,16 +5161,20 @@ const makeImpl = <
               )
               if (!sentinel) continue
               sentinelConstraints.push(constraintName)
+              const sentinelItem: globalThis.Record<string, unknown> = {
+                [primary.pk.field]: sentinel.key.pk,
+                [primary.sk.field]: sentinel.key.sk,
+                __edd_e__: `${entityType}._unique.${constraintName}`,
+                _entity_pk: restoredKeys[primary.pk.field],
+                _entity_sk: restoredKeys[primary.sk.field],
+              }
+              // Re-apply the constraint's optional TTL to the restored sentinel.
+              const uTtl = uniqueConstraintTtl(constraintDef)
+              if (uTtl !== undefined) sentinelItem[ttlAttrName] = ttlEpochSeconds(now, uTtl)
               transactItems.push({
                 Put: {
                   TableName: tableName,
-                  Item: toAttributeMap({
-                    [primary.pk.field]: sentinel.key.pk,
-                    [primary.sk.field]: sentinel.key.sk,
-                    __edd_e__: `${entityType}._unique.${constraintName}`,
-                    _entity_pk: restoredKeys[primary.pk.field],
-                    _entity_sk: restoredKeys[primary.sk.field],
-                  }),
+                  Item: toAttributeMap(sentinelItem),
                   ConditionExpression: "attribute_not_exists(#pk)",
                   ExpressionAttributeNames: { "#pk": primary.pk.field },
                 },

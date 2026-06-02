@@ -199,6 +199,10 @@ softDelete: { ttl: Duration.days(30) }
 
 The TTL is set on the DynamoDB item's TTL attribute when the item is soft-deleted. DynamoDB's background process handles cleanup.
 
+:::tip[Duration or string]
+Every lifecycle `ttl` (`versioned`, `softDelete`, `timeSeries`, and `unique`) accepts either an Effect `Duration` or a duration-string literal — `ttl: Duration.days(30)` and `ttl: "30 days"` are equivalent. A bare number is rejected at compile time (a `Duration` number means *milliseconds*), and a non-finite duration is rejected at `make()` time (`[EDD-9020]`). The stored expiry is relative: `now + ttl`, where `now` comes from the ambient `Clock`.
+:::
+
 Note: DynamoDB TTL deletion is eventually consistent — items may persist slightly beyond the TTL.
 
 ## Version Retention

@@ -450,8 +450,17 @@ The entity definition still provides type derivation (`Entity.Record<typeof User
 | Config | Type | Fields Added |
 |--------|------|-------------|
 | `timestamps: true` | `boolean \| { created: string, updated: string }` | `createdAt`, `updatedAt` (or custom names) |
-| `versioned: true` | `boolean \| { field?: string, retain?: boolean, ttl?: Duration }` | `version` (or custom name) |
-| `softDelete: true` | `boolean \| { ttl?: Duration, preserveUnique?: boolean }` | `deletedAt` (when soft-deleted) |
+| `versioned: true` | `boolean \| { field?: string, retain?: boolean, ttl?: TtlInput }` | `version` (or custom name) |
+| `softDelete: true` | `boolean \| { ttl?: TtlInput, preserveUnique?: boolean }` | `deletedAt` (when soft-deleted) |
+
+**`TtlInput`** — every lifecycle `ttl` (`versioned`, `softDelete`, `timeSeries`,
+`unique`) accepts `Duration.Duration | \`${number} ${Duration.Unit}\``, i.e. an
+Effect `Duration` (`Duration.days(7)`) **or** a duration-string literal
+(`"7 days"`, `"24 hours"`, `"30 minutes"`). A bare `number` is rejected at compile
+time — `Duration` treats a number as milliseconds, so `3600` would silently mean
+3.6s, not an hour. TTL is **relative**: the stored epoch is `now + offset`, where
+`now` comes from the ambient `Clock` (`DateTime.now`). A non-finite duration
+(e.g. `Duration.infinity`) is rejected at `make()` time with **`[EDD-9020]`**.
 
 ### Unique Constraints
 
@@ -469,6 +478,13 @@ missing optional composite is silently excluded from the constraint, allowing
 multiple records to coexist with the field unset (no false collision on a
 literal `"undefined"` key). Update transitions claim/release the sentinel as
 the field becomes set/unset.
+
+The object form `{ fields, ttl }` gives the sentinel item a relative TTL
+(`now + ttl`): DynamoDB auto-deletes the sentinel after the offset, releasing
+the uniqueness reservation. The TTL is re-applied whenever the sentinel is
+written — on create, on update-rotation to a new value, and on restore. This
+backs the idempotency-key pattern (a time-bounded "processed once" marker). The
+bare field-list form (`["email"]`) never carries a TTL.
 
 ---
 

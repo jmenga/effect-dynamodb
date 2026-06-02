@@ -6,6 +6,18 @@
 
 import type { Duration, Schema } from "effect"
 
+/**
+ * A relative TTL offset accepted by lifecycle configs (`versioned`, `softDelete`,
+ * `timeSeries`, `unique`). Either an Effect `Duration` (e.g. `Duration.days(7)`)
+ * or a duration-string literal (e.g. `"7 days"`, `"24 hours"`, `"30 minutes"`).
+ *
+ * A bare `number` is deliberately NOT accepted: `Duration` treats a number as
+ * milliseconds, so `3600` would silently mean 3.6s rather than an hour. The
+ * `` `${number} ${Duration.Unit}` `` literal type rejects that — and any other
+ * malformed string — at compile time.
+ */
+export type TtlInput = Duration.Duration | `${number} ${Duration.Unit}`
+
 // ---------------------------------------------------------------------------
 // System field configuration types
 // ---------------------------------------------------------------------------
@@ -48,7 +60,7 @@ export type VersionedConfig =
   | {
       readonly field?: string | undefined
       readonly retain?: boolean | undefined
-      readonly ttl?: Duration.Duration | undefined
+      readonly ttl?: TtlInput | undefined
     }
 
 /**
@@ -61,7 +73,7 @@ export type VersionedConfig =
 export type SoftDeleteConfig =
   | boolean
   | {
-      readonly ttl?: Duration.Duration | undefined
+      readonly ttl?: TtlInput | undefined
       readonly preserveUnique?: boolean | undefined
     }
 
@@ -83,7 +95,7 @@ export type TimeSeriesConfig<TAppendInput extends Schema.Top = Schema.Top> = {
   /** Model attribute used as the monotonic clock for CAS and event SK decoration. Required. */
   readonly orderBy: string
   /** TTL applied to event items (not current). Omit for retention-forever. */
-  readonly ttl?: Duration.Duration | undefined
+  readonly ttl?: TtlInput | undefined
   /**
    * REQUIRED schema restricting which model fields are allowed in `.append()`
    * input AND which fields are written into the current-item SET clause.
@@ -109,7 +121,7 @@ export type UniqueFieldsDef = ReadonlyArray<string>
  */
 export type UniqueConstraintDef =
   | UniqueFieldsDef
-  | { readonly fields: UniqueFieldsDef; readonly ttl?: Duration.Duration | undefined }
+  | { readonly fields: UniqueFieldsDef; readonly ttl?: TtlInput | undefined }
 
 /**
  * Map of named unique constraints. Each key is the constraint name,

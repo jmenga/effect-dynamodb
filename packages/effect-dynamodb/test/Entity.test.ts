@@ -730,6 +730,104 @@ describe("Entity", () => {
   })
 
   // ---------------------------------------------------------------------------
+  // TTL config: unique.ttl wiring + Duration|string widening (#58)
+  // ---------------------------------------------------------------------------
+
+  describe("TTL config (#58)", () => {
+    it.effect("unique constraint ttl writes _ttl on the sentinel item", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        const Held = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "HeldUser",
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            unique: { email: { fields: ["email"], ttl: Duration.days(1) } },
+          }),
+        )
+        // Pin the Clock: sentinel _ttl = now + 1 day (relative TTL via #56).
+        yield* TestClock.setTime(1767225600000) // 2026-01-01T00:00:00.000Z
+        yield* Held.put({
+          userId: "u-1",
+          email: "hold@test.com",
+          displayName: "Hold",
+          role: "admin",
+        }).asEffect()
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        // [0] = entity item, [1] = unique sentinel
+        const sentinel = call.TransactItems[1].Put
+        expect(sentinel.Item.__edd_e__.S).toBe("HeldUser._unique.email")
+        expect(Number(sentinel.Item._ttl.N)).toBe(1767225600 + 86400)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a bare field-list unique constraint writes no sentinel ttl", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        const Plain = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "PlainUser",
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            unique: { email: ["email"] },
+          }),
+        )
+        yield* Plain.put({
+          userId: "u-1",
+          email: "a@test.com",
+          displayName: "A",
+          role: "admin",
+        }).asEffect()
+        const sentinel = mockTransactWriteItems.mock.calls[0]![0].TransactItems[1].Put
+        expect(sentinel.Item._ttl).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("ttl accepts a duration string with parity to Duration", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        const StrTtl = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "StrTtlRetain",
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            // String form — "90 days" must equal Duration.days(90).
+            versioned: { retain: true, ttl: "90 days" },
+          }),
+        )
+        yield* TestClock.setTime(1767225600000) // 2026-01-01T00:00:00.000Z
+        yield* StrTtl.put({ itemId: "i-1", name: "Test" }).asEffect()
+        const snapshotPut = mockTransactWriteItems.mock.calls[0]![0].TransactItems[1].Put
+        expect(Number(snapshotPut.Item._ttl.N)).toBe(1767225600 + 90 * 86400)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it("rejects a non-finite ttl at make() time (EDD-9020)", () => {
+      expect(() =>
+        Entity.make({
+          model: SimpleItem,
+          entityType: "InfTtl",
+          primaryKey: {
+            pk: { field: "pk", composite: ["itemId"] },
+            sk: { field: "sk", composite: [] },
+          },
+          versioned: { retain: true, ttl: Duration.infinity },
+        }),
+      ).toThrow(/EDD-9020/)
+    })
+  })
+
+  // ---------------------------------------------------------------------------
   // Unique constraints
   // ---------------------------------------------------------------------------
 

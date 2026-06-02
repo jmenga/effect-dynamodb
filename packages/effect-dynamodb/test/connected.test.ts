@@ -167,9 +167,26 @@ const Vehicles = Entity.make({
   timestamps: true,
 })
 
+// Unique-constraint TTL fixture (#58) — the sentinel item expires after the
+// configured offset, releasing the reservation automatically.
+class Reservation extends Schema.Class<Reservation>("Reservation")({
+  reservationId: Schema.String,
+  slot: Schema.String,
+}) {}
+
+const Reservations = Entity.make({
+  model: Reservation,
+  entityType: "Reservation",
+  primaryKey: {
+    pk: { field: "pk", composite: ["reservationId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  unique: { slot: { fields: ["slot"], ttl: Duration.days(30) } },
+})
+
 const MainTable = Table.make({
   schema: AppSchema,
-  entities: { Users, Tasks, Memberships, Vehicles },
+  entities: { Users, Tasks, Memberships, Vehicles, Reservations },
 })
 
 // ---------------------------------------------------------------------------
@@ -657,6 +674,29 @@ describeConnected("Connected integration tests", () => {
         // Original value unchanged
         const unchanged = yield* Users.get({ userId: "u-uniq-claim" }).asEffect()
         expect(unchanged.email).toBe("old-email@test.com")
+      }).pipe(provide),
+    )
+
+    it.effect("unique constraint ttl persists on the sentinel item (#58)", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { Reservations },
+          tables: { MainTable },
+        })
+        // Pin the Clock: sentinel _ttl = now + 30 days (relative TTL via #56).
+        yield* TestClock.setTime(1767225600000) // 2026-01-01T00:00:00.000Z
+        yield* db.entities.Reservations.put({ reservationId: "r-ttl-1", slot: "slot-ttl-a" })
+
+        // Locate the sentinel by its discriminator and assert the persisted TTL.
+        const raw = yield* (yield* DynamoClient).scan({
+          TableName: tableName,
+          FilterExpression: "#e = :e",
+          ExpressionAttributeNames: { "#e": "__edd_e__" },
+          ExpressionAttributeValues: { ":e": { S: "Reservation._unique.slot" } },
+        })
+        const sentinel = raw.Items?.find((i) => i.__edd_e__?.S === "Reservation._unique.slot")
+        expect(sentinel).toBeDefined()
+        expect(Number(sentinel!._ttl!.N)).toBe(1767225600 + 30 * 86400)
       }).pipe(provide),
     )
   })
