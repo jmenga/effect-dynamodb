@@ -633,18 +633,13 @@ export const getSparseFields = (model: Schema.Top): globalThis.Record<string, Sp
  * (a Record whose value is itself a Record).
  */
 export const isRecordSchema = (schema: Schema.Top): { readonly valueAst: unknown } | undefined => {
-  const ast = schema.ast as unknown as {
-    readonly _tag?: string
-    readonly propertySignatures?: ReadonlyArray<unknown>
-    readonly indexSignatures?: ReadonlyArray<{ readonly type?: unknown }>
-  }
-  if (!ast || ast._tag !== "Objects") return undefined
-  const propertySignatures = ast.propertySignatures
-  const indexSignatures = ast.indexSignatures
-  if (!Array.isArray(propertySignatures) || !Array.isArray(indexSignatures)) return undefined
-  if (propertySignatures.length !== 0 || indexSignatures.length !== 1) return undefined
-  const sig = indexSignatures[0]!
-  return { valueAst: sig.type }
+  const ast = schema.ast
+  // `Record(K, V)` → an `Objects` AST with no property signatures and exactly
+  // one index signature. `SchemaAST.isObjects` narrows to the typed node, so
+  // `propertySignatures`/`indexSignatures` are read without casts.
+  if (!SchemaAST.isObjects(ast)) return undefined
+  if (ast.propertySignatures.length !== 0 || ast.indexSignatures.length !== 1) return undefined
+  return { valueAst: ast.indexSignatures[0]!.type }
 }
 
 /** True iff `schema` is shaped like `Schema.Record(K, V)`. */
@@ -652,19 +647,10 @@ export const isRecord = (schema: Schema.Top): boolean => isRecordSchema(schema) 
 
 /** True iff `valueAst` (raw AST from a Record value position) is itself a Record AST. */
 export const isRecordAst = (valueAst: unknown): boolean => {
-  if (!valueAst || typeof valueAst !== "object") return false
-  const ast = valueAst as {
-    readonly _tag?: string
-    readonly propertySignatures?: ReadonlyArray<unknown>
-    readonly indexSignatures?: ReadonlyArray<unknown>
-  }
-  if (ast._tag !== "Objects") return false
-  return (
-    Array.isArray(ast.propertySignatures) &&
-    Array.isArray(ast.indexSignatures) &&
-    ast.propertySignatures.length === 0 &&
-    ast.indexSignatures.length === 1
-  )
+  if (valueAst == null || typeof valueAst !== "object" || !("_tag" in valueAst)) return false
+  const ast = valueAst as SchemaAST.AST
+  if (!SchemaAST.isObjects(ast)) return false
+  return ast.propertySignatures.length === 0 && ast.indexSignatures.length === 1
 }
 
 /**

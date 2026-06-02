@@ -4,7 +4,7 @@
  * Extracted from Aggregate.ts for decomposition. Not part of the public API.
  */
 
-import { Schema } from "effect"
+import { Schema, SchemaAST } from "effect"
 import { ConfiguredModelTag } from "../DynamoModel.js"
 import type { AggregateEdge, ManyEdge, RefEntity } from "./AggregateEdges.js"
 import type { BoundSubAggregate } from "./AggregateTypes.js"
@@ -90,14 +90,11 @@ export const deriveAggregateSchemas = (
 
 /**
  * Check if a field schema represents an optional field.
- * In Effect v4, Schema.optionalKey(X) sets `ast.context.isOptional = true`.
+ * In Effect v4, `Schema.optionalKey(X)` sets `ast.context.isOptional = true`.
+ * `Base.context` is typed (`Context | undefined`), so no AST cast is needed.
  */
-export const isFieldOptional = (fieldSchema: Schema.Top): boolean => {
-  const ast = (fieldSchema as unknown as Record<string, unknown>).ast as
-    | { context?: { isOptional?: boolean } }
-    | undefined
-  return ast?.context?.isOptional === true
-}
+export const isFieldOptional = (fieldSchema: Schema.Top): boolean =>
+  fieldSchema.ast.context?.isOptional === true
 
 /**
  * Derive a field name from an entity's model identifier.
@@ -190,12 +187,17 @@ export const isSchemaMatchingEntity = (schema: Schema.Top, entity: RefEntity): b
  * Schema.optionalKey(Schema.Array(T)). Returns T.
  *
  * In Effect v4 (beta.71+ reintroduced `.value` on Array/NonEmptyArray):
- * - Schema.Array(T) has `ast._tag === "Arrays"`, `.value === T` (no `.schema`)
- * - Schema.optionalKey(Schema.Array(T)) inherits "Arrays" AST but `.schema === Array(T)`
- *   (the inner array, not the element). The element is `.schema.value`. Its AST has
+ * - `Schema.Array(T)` has an `Arrays` AST and `.value === T` (the element).
+ * - `Schema.optionalKey(Schema.Array(T))` inherits the `Arrays` AST but `.schema`
+ *   is the inner `Array(T)`, whose element is `.schema.value`. Its AST has
  *   `context.isOptional === true`.
+ * - `Schema.optional(Schema.Array(T))` is a `Union` AST; `.schema` is the union
+ *   whose array member carries the element.
  *
- * `.schema` is kept as a fallback for resilience across beta releases.
+ * Uses the typed `SchemaAST` guards (`isArrays`/`isUnion`) rather than raw
+ * `_tag` string comparisons, and reads the element via the wrapper's `.value`
+ * (`.schema` kept as a fallback for resilience across beta releases). This is
+ * the function that regressed on the `.schema`→`.value` move in beta.71.
  */
 const arrayElement = (s: Record<string, unknown>): Schema.Top | undefined => {
   if ("value" in s) return s.value as Schema.Top
@@ -204,10 +206,10 @@ const arrayElement = (s: Record<string, unknown>): Schema.Top | undefined => {
 }
 
 export const extractArrayElement = (fieldSchema: Schema.Top): Schema.Top | undefined => {
+  const ast = fieldSchema.ast
   const s = fieldSchema as unknown as Record<string, unknown>
-  const ast = s.ast as { _tag?: string; context?: { isOptional?: boolean } } | undefined
 
-  if (ast?._tag === "Arrays") {
+  if (SchemaAST.isArrays(ast)) {
     if (ast.context?.isOptional === true && "schema" in s) {
       // optionalKey(Array(T)): s.schema is Array(T), its element is s.schema.value
       return arrayElement(s.schema as Record<string, unknown>)
@@ -216,16 +218,15 @@ export const extractArrayElement = (fieldSchema: Schema.Top): Schema.Top | undef
     return arrayElement(s)
   }
 
-  // Schema.optional(Array(T)): ast._tag is "Union" with context.isOptional,
-  // .schema is Union with .members[0] being Schema.Array(T)
-  if (ast?._tag === "Union" && ast.context?.isOptional === true && "schema" in s) {
+  // Schema.optional(Array(T)): Union AST with context.isOptional; .schema is a
+  // Union whose array member holds the element.
+  if (SchemaAST.isUnion(ast) && ast.context?.isOptional === true && "schema" in s) {
     const unionSchema = s.schema as unknown as Record<string, unknown>
     const members = unionSchema?.members as unknown[] | undefined
     if (Array.isArray(members)) {
       for (const member of members) {
         const m = member as Record<string, unknown>
-        const mAst = m.ast as { _tag?: string } | undefined
-        if (mAst?._tag === "Arrays") {
+        if (m.ast != null && SchemaAST.isArrays(m.ast as SchemaAST.AST)) {
           return arrayElement(m)
         }
       }

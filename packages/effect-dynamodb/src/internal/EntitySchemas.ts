@@ -495,6 +495,11 @@ const tryGetRedactedInner = (schema: Schema.Top): Schema.Top | undefined => {
   // The decoded type is `Redacted<T>` where the inner schema is at
   // `ast.typeParameters[0]`. Walk the AST and rebuild the Schema via
   // `Schema.make` so we get a fully-functional Schema (with `.pipe`).
+  //
+  // NOTE: declaration `typeParameters` has no public typed accessor in v4, so
+  // this raw-AST read is the documented escape hatch — intentionally isolated
+  // in this single helper so a future AST shape change surfaces here (and in
+  // the AST-shape probe test) rather than silently across the codebase.
   const ast = schema.ast as unknown as { typeParameters?: ReadonlyArray<unknown> }
   const params = ast.typeParameters
   if (!params || params.length === 0) return undefined
@@ -655,13 +660,14 @@ export const validateNoTransformOverride = (
  * is missing or the leaf isn't a String / Number node.
  */
 const transformWireKind = (schema: Schema.Top): "string" | "number" | undefined => {
-  const enc = (schema.ast as { encoding?: ReadonlyArray<{ to: { _tag: string } }> }).encoding
+  // `Base.encoding` is typed (`Encoding | undefined`); the leaf `Link.to` is an
+  // AST narrowed via the typed `SchemaAST` guards — no `_tag` string compare.
+  const enc = schema.ast.encoding
   if (!enc || enc.length === 0) return undefined
   const leaf = enc[enc.length - 1]
   if (!leaf) return undefined
-  const tag = leaf.to._tag
-  if (tag === "String") return "string"
-  if (tag === "Number") return "number"
+  if (SchemaAST.isString(leaf.to)) return "string"
+  if (SchemaAST.isNumber(leaf.to)) return "number"
   return undefined
 }
 
