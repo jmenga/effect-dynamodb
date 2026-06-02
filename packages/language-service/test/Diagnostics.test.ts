@@ -255,6 +255,137 @@ describe("Diagnostics", () => {
       )
       expect(unknownAttr).toHaveLength(0)
     })
+
+    it("EDD-9002: no false positive for ref-derived <field>Id composites (#54)", () => {
+      const source = `
+        const TeamPlayerSelections = Entity.make({
+          model: TeamPlayerSelection,
+          entityType: "TeamPlayerSelection",
+          primaryKey: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
+          },
+          indexes: {
+            byTeam: {
+              name: "gsi6",
+              pk: { field: "gsi6pk", composite: ["teamId"] },
+              sk: { field: "gsi6sk", composite: ["league", "season"] },
+            },
+            byPlayer: {
+              name: "gsi7",
+              pk: { field: "gsi7pk", composite: ["playerId"] },
+              sk: { field: "gsi7sk", composite: ["league"] },
+            },
+          },
+          refs: {
+            team: { entity: Teams },
+            player: { entity: Players },
+          },
+        })
+      `
+      const sf = parseSource(source)
+      // Model exposes the bare ref fields `team` / `player` (no `teamId`/`playerId`)
+      const info = mockInfoWithModelFields(sf, [
+        "id",
+        "team",
+        "player",
+        "league",
+        "season",
+        "series",
+        "matchType",
+        "role",
+      ])
+      const diagnostics = getDiagnostics(ts, info, "test.ts", [])
+
+      const unknownAttr = diagnostics.filter(
+        (d) => d.code === DiagnosticCode.UNKNOWN_COMPOSITE_ATTR,
+      )
+      expect(unknownAttr).toHaveLength(0)
+    })
+
+    it("EDD-9002: ref substitution also accepts ref-derived composite in the primary key", () => {
+      const source = `
+        const Memberships = Entity.make({
+          model: Membership,
+          entityType: "Membership",
+          primaryKey: {
+            pk: { field: "pk", composite: ["teamId"] },
+            sk: { field: "sk", composite: ["playerId"] },
+          },
+          refs: {
+            team: { entity: Teams },
+            player: { entity: Players },
+          },
+        })
+      `
+      const sf = parseSource(source)
+      const info = mockInfoWithModelFields(sf, ["team", "player", "joinedAt"])
+      const diagnostics = getDiagnostics(ts, info, "test.ts", [])
+
+      const unknownAttr = diagnostics.filter(
+        (d) => d.code === DiagnosticCode.UNKNOWN_COMPOSITE_ATTR,
+      )
+      expect(unknownAttr).toHaveLength(0)
+    })
+
+    it("EDD-9002: still flags the bare ref field name (replaced by <field>Id)", () => {
+      const source = `
+        const Memberships = Entity.make({
+          model: Membership,
+          entityType: "Membership",
+          primaryKey: {
+            pk: { field: "pk", composite: ["team"] },
+            sk: { field: "sk", composite: [] },
+          },
+          refs: {
+            team: { entity: Teams },
+          },
+        })
+      `
+      const sf = parseSource(source)
+      const info = mockInfoWithModelFields(sf, ["team", "joinedAt"])
+      const diagnostics = getDiagnostics(ts, info, "test.ts", [])
+
+      // The bare `team` is removed from the valid set (replaced by `teamId`), so
+      // referencing it is a genuine error — mirrors what `tsc` rejects.
+      const unknownAttr = diagnostics.filter(
+        (d) => d.code === DiagnosticCode.UNKNOWN_COMPOSITE_ATTR,
+      )
+      expect(unknownAttr).toHaveLength(1)
+      expect(unknownAttr[0]!.messageText).toContain("`team`")
+    })
+
+    it("EDD-9002: still flags genuinely unknown attributes when refs are present", () => {
+      const source = `
+        const TeamPlayerSelections = Entity.make({
+          model: TeamPlayerSelection,
+          entityType: "TeamPlayerSelection",
+          primaryKey: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
+          },
+          indexes: {
+            byTeam: {
+              name: "gsi6",
+              pk: { field: "gsi6pk", composite: ["teamId"] },
+              sk: { field: "gsi6sk", composite: ["nonExistent"] },
+            },
+          },
+          refs: {
+            team: { entity: Teams },
+          },
+        })
+      `
+      const sf = parseSource(source)
+      const info = mockInfoWithModelFields(sf, ["id", "team", "league"])
+      const diagnostics = getDiagnostics(ts, info, "test.ts", [])
+
+      const unknownAttr = diagnostics.filter(
+        (d) => d.code === DiagnosticCode.UNKNOWN_COMPOSITE_ATTR,
+      )
+      expect(unknownAttr).toHaveLength(1)
+      expect(unknownAttr[0]!.messageText).toContain("`nonExistent`")
+    })
   })
 
   describe("DynamoModel.configure validations", () => {

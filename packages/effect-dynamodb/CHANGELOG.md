@@ -1,5 +1,15 @@
 # effect-dynamodb
 
+## 1.8.2
+
+### Patch Changes
+
+- Fix EDD-9002 false positive on ref-derived `<field>Id` composites in the language-service. Closes [#54](https://github.com/jmenga/effect-dynamodb/issues/54).
+
+  Index and primary-key composites that reference a ref's surfaced identifier attribute (e.g. `teamId` for a `team` ref) were incorrectly flagged as unknown attributes. The diagnostic's valid-attribute set was derived only from the model schema's read-side fields and never accounted for the `${field}Id` substitution the runtime applies for `refs`.
+
+  The diagnostic now mirrors the runtime key/input schema: each field listed in the entity's `refs` config is removed from the valid-composite set and replaced by its `<field>Id` form. Referencing the bare ref field name (e.g. `team`) is still reported as an error, matching what `tsc` rejects.
+
 ## 1.8.1
 
 ### Patch Changes
