@@ -497,10 +497,11 @@ export type TypedClient<
       any,
       infer R,
       any,
-      infer TS
+      infer TS,
+      infer GID
     >
       ? Resolve<
-          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V> & {
+          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GID> & {
             /** Scan this entity. Returns a BoundQuery for building scan queries. */
             readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
               Schema.Schema.Type<M>,

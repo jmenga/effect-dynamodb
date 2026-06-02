@@ -460,7 +460,38 @@ Effect `Duration` (`Duration.days(7)`) **or** a duration-string literal
 time — `Duration` treats a number as milliseconds, so `3600` would silently mean
 3.6s, not an hour. TTL is **relative**: the stored epoch is `now + offset`, where
 `now` comes from the ambient `Clock` (`DateTime.now`). A non-finite duration
-(e.g. `Duration.infinity`) is rejected at `make()` time with **`[EDD-9020]`**.
+(e.g. `Duration.infinity`) is rejected at `make()` time with **`[EDD-9017]`**.
+
+### Generated IDs
+
+```typescript
+Entity.make({
+  model: Doc,                 // Doc has an `id: Schema.String` field
+  entityType: "Doc",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  generatedId: { field: "id", version: "v4" },  // version: "v4" (default) | "v7"
+})
+
+// `id` is optional on put/create — omit it and a UUID is generated:
+const doc = yield* db.entities.Doc.put({ title: "Hello" })
+doc.id // "f93de86c-1461-4163-b689-bb8e7d58d219"
+```
+
+`generatedId` fills the named field with a **cryptographically-secure UUID** when
+the caller omits it on `put`/`create`. The value is sourced from the Effect
+`Crypto` service (a default instance backed by the platform Web Crypto CSPRNG,
+built once at module load) — `version: "v4"` (random, default) or `"v7"`
+(time-ordered/sortable). A caller-supplied value always wins.
+
+- The field becomes **optional** in the `put`/`create` input type (and is filled
+  before key composition, so it flows into the key, the stored item, and the
+  decoded record).
+- The field MUST be a model field that participates in the primary key, enforced
+  at `make()` with **`[EDD-9030]`**.
+- Generation uses a concrete `Crypto` instance whose effects have `R = never`, so
+  the bound client's `R = never` guarantee is preserved — no layer wiring needed.
+- Scope: `put`/`create`. `batchWrite`/`transactWrite` puts still require an
+  explicit id.
 
 ### Unique Constraints
 

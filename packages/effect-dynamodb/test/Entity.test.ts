@@ -730,6 +730,97 @@ describe("Entity", () => {
   })
 
   // ---------------------------------------------------------------------------
+  // generatedId — auto-generated UUID primary keys via the Crypto service (#57)
+  // ---------------------------------------------------------------------------
+
+  describe("generatedId (#57)", () => {
+    class Doc extends Schema.Class<Doc>("Doc")({
+      id: Schema.String,
+      name: Schema.String,
+    }) {}
+
+    const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+    const makeDocs = (version?: "v4" | "v7") =>
+      withConfig(
+        Entity.make({
+          model: Doc,
+          entityType: "Doc",
+          primaryKey: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
+          },
+          generatedId: version ? { field: "id", version } : { field: "id" },
+        }),
+      )
+
+    it.effect("auto-fills a UUIDv4 for the configured field when omitted", () =>
+      Effect.gen(function* () {
+        const Docs = makeDocs()
+        mockPutItem.mockResolvedValue({})
+        // `id` omitted — the type makes it optional via the bound entity; here we
+        // exercise the entity-level op (requires a cast) to assert the runtime fill.
+        yield* Docs.put({ name: "Hello" } as any).asEffect()
+        const item = mockPutItem.mock.calls[0]![0].Item
+        const id = item.id.S as string
+        expect(id).toMatch(UUID_V4)
+        // The generated value composes the primary key.
+        expect(item.pk.S).toContain(id)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("respects a caller-supplied id (no overwrite)", () =>
+      Effect.gen(function* () {
+        const Docs = makeDocs()
+        mockPutItem.mockResolvedValue({})
+        yield* Docs.put({ id: "fixed-id", name: "Hello" }).asEffect()
+        const item = mockPutItem.mock.calls[0]![0].Item
+        expect(item.id.S).toBe("fixed-id")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("version: 'v7' generates a time-ordered UUIDv7", () =>
+      Effect.gen(function* () {
+        const Docs = makeDocs("v7")
+        mockPutItem.mockResolvedValue({})
+        yield* Docs.put({ name: "Hello" } as any).asEffect()
+        const id = mockPutItem.mock.calls[0]![0].Item.id.S as string
+        expect(id).toMatch(UUID_V7)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it("rejects generatedId.field not in the model (EDD-9030)", () => {
+      expect(() =>
+        Entity.make({
+          model: Doc,
+          entityType: "BadDoc1",
+          primaryKey: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
+          },
+          generatedId: { field: "nope" },
+        }),
+      ).toThrow(/EDD-9030/)
+    })
+
+    it("rejects generatedId.field not in the primary key (EDD-9030)", () => {
+      expect(() =>
+        Entity.make({
+          model: Doc,
+          entityType: "BadDoc2",
+          primaryKey: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
+          },
+          // `name` is a model field but not part of the primary key.
+          generatedId: { field: "name" },
+        }),
+      ).toThrow(/EDD-9030/)
+    })
+  })
+
+  // ---------------------------------------------------------------------------
   // TTL config: unique.ttl wiring + Duration|string widening (#58)
   // ---------------------------------------------------------------------------
 
@@ -812,7 +903,7 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it("rejects a non-finite ttl at make() time (EDD-9020)", () => {
+    it("rejects a non-finite ttl at make() time (EDD-9017)", () => {
       expect(() =>
         Entity.make({
           model: SimpleItem,
@@ -823,7 +914,7 @@ describe("Entity", () => {
           },
           versioned: { retain: true, ttl: Duration.infinity },
         }),
-      ).toThrow(/EDD-9020/)
+      ).toThrow(/EDD-9017/)
     })
   })
 

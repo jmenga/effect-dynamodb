@@ -8,7 +8,7 @@
  */
 
 import type { AttributeValue, DeleteItemCommandInput } from "@aws-sdk/client-dynamodb"
-import { DateTime, Duration, Effect, Option, Schema, SchemaAST, Stream } from "effect"
+import { Crypto, DateTime, Duration, Effect, Option, Schema, SchemaAST, Stream } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import {
   type ConfiguredModel,
@@ -165,6 +165,7 @@ import {
 } from "./internal/EntityCombinators.js"
 import type {
   CascadeIndexConfig,
+  GeneratedIdConfig,
   SoftDeleteConfig,
   TimeSeriesConfig,
   TimestampsConfig,
@@ -229,7 +230,7 @@ const normalizeTtlInput = (ttl: TtlInput): Duration.Duration =>
 
 /**
  * Validate a configured TTL at `make()` time: parseable and finite.
- * Throws `[EDD-9020]` on an invalid duration string or a non-finite duration
+ * Throws `[EDD-9017]` on an invalid duration string or a non-finite duration
  * (e.g. `Duration.infinity`) — an infinite TTL epoch is nonsensical for DynamoDB.
  */
 const validateTtlConfig = (entityType: string, label: string, ttl: TtlInput | undefined): void => {
@@ -239,7 +240,7 @@ const validateTtlConfig = (entityType: string, label: string, ttl: TtlInput | un
     const parsed = Duration.fromInput(ttl)
     if (Option.isNone(parsed)) {
       throw new Error(
-        `[EDD-9020] Entity "${entityType}": ${label} ttl "${ttl}" is not a valid duration string ` +
+        `[EDD-9017] Entity "${entityType}": ${label} ttl "${ttl}" is not a valid duration string ` +
           `(expected e.g. "7 days", "24 hours", "30 minutes").`,
       )
     }
@@ -249,10 +250,42 @@ const validateTtlConfig = (entityType: string, label: string, ttl: TtlInput | un
   }
   if (!Duration.isFinite(dur)) {
     throw new Error(
-      `[EDD-9020] Entity "${entityType}": ${label} ttl must be a finite duration (got infinity).`,
+      `[EDD-9017] Entity "${entityType}": ${label} ttl must be a finite duration (got infinity).`,
     )
   }
 }
+
+// ---------------------------------------------------------------------------
+// Auto-generated id (generatedId) — cryptographically-secure UUIDs
+// ---------------------------------------------------------------------------
+
+/**
+ * Default cryptographically-secure `Crypto` instance, backed by the platform
+ * Web Crypto CSPRNG (`globalThis.crypto.getRandomValues`). Built once at module
+ * load via the Effect `Crypto` module (beta.68). Its `randomUUIDv4`/`randomUUIDv7`
+ * effects have `R = never`, so id generation needs no service wiring and never
+ * touches the bound client's `R = never` guarantee.
+ *
+ * `digest` is unused — `randomUUIDv4`/`v7` derive purely from `randomBytes`.
+ */
+const defaultCrypto = Crypto.make({
+  randomBytes: (size: number): Uint8Array => {
+    const bytes = new Uint8Array(size)
+    globalThis.crypto.getRandomValues(bytes)
+    return bytes
+  },
+  digest: () =>
+    Effect.die(
+      new Error("Crypto.digest is not provided by effect-dynamodb's default UUID generator"),
+    ),
+})
+
+/**
+ * Generate a UUID for a {@link GeneratedIdConfig}. A CSPRNG failure is a defect
+ * (`orDie`), so this keeps the operation's error channel unchanged.
+ */
+const generateId = (version: "v4" | "v7" | undefined): Effect.Effect<string, never, never> =>
+  (version === "v7" ? defaultCrypto.randomUUIDv7 : defaultCrypto.randomUUIDv4).pipe(Effect.orDie)
 
 // ---------------------------------------------------------------------------
 // Sparse-aware unique sentinel composition
@@ -396,6 +429,7 @@ export interface Entity<
   TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
   TIdentifier extends string | undefined = undefined,
   TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
+  TGeneratedId extends GeneratedIdConfig | undefined = undefined,
 > {
   readonly _tag: "Entity"
   readonly model: TModel
@@ -407,6 +441,7 @@ export interface Entity<
   readonly unique: TUnique
   readonly identifier: TIdentifier
   readonly timeSeries: TTimeSeries
+  readonly generatedId: TGeneratedId
 
   /** @internal Resolved ref metadata — used by cascade to inspect target entities */
   readonly _resolvedRefs: ReadonlyArray<{
@@ -874,6 +909,17 @@ export interface Entity<
  * }) {}
  * ```
  */
+/**
+ * Make the configured `generatedId` field optional in an input type — callers
+ * may omit it and the framework fills a UUID at write time. No-op when no
+ * `generatedId` is configured.
+ */
+export type ApplyGeneratedId<I, TGeneratedId> = TGeneratedId extends {
+  readonly field: infer F extends string
+}
+  ? Omit<I, F> & { readonly [K in F & keyof I]?: I[K] }
+  : I
+
 export interface BoundEntity<
   TModel extends Schema.Top,
   TIndexes extends globalThis.Record<string, IndexDefinition>,
@@ -882,6 +928,7 @@ export interface BoundEntity<
   TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   TTimestamps extends TimestampsConfig | undefined = undefined,
   TVersioned extends VersionedConfig | undefined = undefined,
+  TGeneratedId extends GeneratedIdConfig | undefined = undefined,
 > {
   // --- CRUD Operations ---
 
@@ -900,7 +947,10 @@ export interface BoundEntity<
    * ```
    */
   readonly put: (
-    input: EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+    input: ApplyGeneratedId<
+      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+      TGeneratedId
+    >,
   ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
     ModelType<TModel>,
@@ -912,7 +962,10 @@ export interface BoundEntity<
    * primary key already exists. Returns a fluent {@link BoundPut}.
    */
   readonly create: (
-    input: EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+    input: ApplyGeneratedId<
+      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+      TGeneratedId
+    >,
   ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
     ModelType<TModel>,
@@ -1322,6 +1375,7 @@ export const make = <
   const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
   const TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   const TAttrs extends {} = {},
+  const TGeneratedId extends GeneratedIdConfig | undefined = undefined,
 >(config: {
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
   readonly entityType: TEntityType
@@ -1333,6 +1387,7 @@ export const make = <
   readonly unique?: TUnique
   readonly refs?: TRefs
   readonly timeSeries?: TTimeSeries
+  readonly generatedId?: TGeneratedId
 }): Entity<
   TModel,
   TEntityType,
@@ -1343,7 +1398,8 @@ export const make = <
   TUnique,
   TRefs,
   ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
-  TTimeSeries
+  TTimeSeries,
+  TGeneratedId
 > => {
   // Normalize GSI configs to internal IndexDefinition format
   const gsiIndexes: globalThis.Record<string, IndexDefinition> = {}
@@ -1375,6 +1431,7 @@ const makeImpl = <
   const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
   const TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   const TAttrs extends {} = {},
+  const TGeneratedId extends GeneratedIdConfig | undefined = undefined,
 >(config: {
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
   readonly entityType: TEntityType
@@ -1385,6 +1442,7 @@ const makeImpl = <
   readonly unique?: TUnique
   readonly refs?: TRefs
   readonly timeSeries?: TTimeSeries
+  readonly generatedId?: TGeneratedId
 }): Entity<
   TModel,
   TEntityType,
@@ -1395,7 +1453,8 @@ const makeImpl = <
   TUnique,
   TRefs,
   ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
-  TTimeSeries
+  TTimeSeries,
+  TGeneratedId
 > => {
   // Unwrap ConfiguredModel to get the raw model and attribute overrides
   const configured = isConfiguredModel(config.model) ? config.model : undefined
@@ -1563,7 +1622,7 @@ const makeImpl = <
   }
 
   // ---------------------------------------------------------------------------
-  // Validate lifecycle TTL configs (EDD-9020): parseable + finite durations
+  // Validate lifecycle TTL configs (EDD-9017): parseable + finite durations
   // ---------------------------------------------------------------------------
   if (typeof config.versioned === "object" && config.versioned !== null) {
     validateTtlConfig(config.entityType, "versioned", config.versioned.ttl)
@@ -1587,6 +1646,29 @@ const makeImpl = <
           (constraintDef as { readonly ttl?: TtlInput }).ttl,
         )
       }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Validate generatedId config (EDD-9030): field must be a model field that
+  // participates in the primary key (its value composes pk/sk).
+  // ---------------------------------------------------------------------------
+  const generatedIdCfg = (config as { readonly generatedId?: GeneratedIdConfig }).generatedId
+  if (generatedIdCfg) {
+    const f = generatedIdCfg.field
+    if (!(f in modelFields)) {
+      throw new Error(
+        `[EDD-9030] Entity "${config.entityType}": generatedId.field "${f}" does not name a model field. ` +
+          `Valid model fields: ${Object.keys(modelFields).sort().join(", ")}`,
+      )
+    }
+    const primary = config.indexes.primary
+    const pkSkComposites = new Set([...primary.pk.composite, ...primary.sk.composite])
+    if (!pkSkComposites.has(f)) {
+      throw new Error(
+        `[EDD-9030] Entity "${config.entityType}": generatedId.field "${f}" must participate in the ` +
+          `primary key (appear in the pk or sk composite) — its generated value composes the key.`,
+      )
     }
   }
 
@@ -2459,9 +2541,21 @@ const makeImpl = <
           //      instances) and the substituted date/Redacted transforms
           //      tolerate either form. The subsequent `encode` produces
           //      the canonical wire shape.
+          // generatedId: fill a cryptographically-secure UUID for the configured
+          // key field when the caller omits it. The value then flows through key
+          // composition, the stored item, and the decoded record like any other.
+          const genId = config.generatedId
+          const effectiveInput =
+            genId != null &&
+            typeof input === "object" &&
+            input !== null &&
+            (input as globalThis.Record<string, unknown>)[genId.field] === undefined
+              ? { ...(input as object), [genId.field]: yield* generateId(genId.version) }
+              : input
+
           const encodedInput = yield* encodeOrDecodeEncode(
             schemas.inputSchema as Schema.Codec<any>,
-            input,
+            effectiveInput,
             entityType,
             "put",
           )
@@ -5444,6 +5538,7 @@ const makeImpl = <
     unique: config.unique as TUnique,
     identifier: resolvedIdentifier as ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
     timeSeries: config.timeSeries as TTimeSeries,
+    generatedId: (config as { readonly generatedId?: TGeneratedId }).generatedId as TGeneratedId,
     _resolvedRefs: resolvedRefs,
     /** @internal Full decode pipeline: rename + schema decode. Used by Batch/Aggregate. */
     _decodeRecord: decodeRecord,
@@ -5511,7 +5606,8 @@ const makeImpl = <
     TUnique,
     TRefs,
     ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
-    TTimeSeries
+    TTimeSeries,
+    TGeneratedId
   >
 
   // Assign self so operation closures can reference the entity
@@ -5543,6 +5639,7 @@ export const bind = <
   TRefs extends globalThis.Record<string, AnyRefValue> | undefined,
   TIdentifier extends string | undefined,
   TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
+  TGeneratedId extends GeneratedIdConfig | undefined = undefined,
 >(
   entity: Entity<
     TModel,
@@ -5554,7 +5651,8 @@ export const bind = <
     TUnique,
     TRefs,
     TIdentifier,
-    TTimeSeries
+    TTimeSeries,
+    TGeneratedId
   >,
 ): Effect.Effect<
   BoundEntity<
@@ -5564,7 +5662,8 @@ export const bind = <
     EntityKeyType<TModel, TIndexes>,
     TTimeSeries,
     TTimestamps,
-    TVersioned
+    TVersioned,
+    TGeneratedId
   >,
   never,
   DynamoClient | TableConfig
@@ -5577,6 +5676,8 @@ export const bind = <
 
     type Key = EntityKeyType<TModel, TIndexes>
     type Input = EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>
+    // Put/create accept the input with the generated id field made optional.
+    type PutInput = ApplyGeneratedId<Input, TGeneratedId>
 
     // Sparse-field map (if any) — extracted from the Entity's configured model
     // so the PathBuilder used by `.condition((t, ops) => ...)` exposes
@@ -5619,8 +5720,8 @@ export const bind = <
     return {
       // CRUD — fluent bound builders (yieldable, no .run() terminal)
       get: (key: Key) => provide((entity.get(key) as any)._run("record")),
-      put: (input: Input) => makeBoundPut(entity.put(input), boundCrudConfig),
-      create: (input: Input) => makeBoundPut(entity.create(input), boundCrudConfig),
+      put: (input: PutInput) => makeBoundPut(entity.put(input as Input), boundCrudConfig),
+      create: (input: PutInput) => makeBoundPut(entity.create(input as Input), boundCrudConfig),
       update: (key: Key) => makeBoundUpdate(entity.update(key), boundCrudConfig),
       delete: (key: Key) => makeBoundDelete(entity.delete(key), boundCrudConfig),
       upsert: (input: Input) => makeBoundPut(entity.upsert(input), boundCrudConfig),
@@ -5725,7 +5826,8 @@ export const bind = <
       EntityKeyType<TModel, TIndexes>,
       TTimeSeries,
       TTimestamps,
-      TVersioned
+      TVersioned,
+      TGeneratedId
     >
   })
 

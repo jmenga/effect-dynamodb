@@ -112,6 +112,23 @@ export type TimeSeriesConfig<TAppendInput extends Schema.Top = Schema.Top> = {
   readonly appendInput: TAppendInput
 }
 
+/**
+ * Auto-generated primary-key id configuration.
+ *
+ * When set, the named field is filled with a cryptographically-secure UUID at
+ * `put`/`create` time if the caller omits it. The field MUST be a model field
+ * and MUST participate in the primary key (validated at `make()`, `[EDD-9030]`).
+ * The value flows through key composition, the stored item, and the decoded
+ * record, and is `optional` in the derived input type/schema.
+ *
+ * - `version: "v4"` (default) — random UUIDv4
+ * - `version: "v7"` — time-ordered UUIDv7 (sortable by creation time)
+ */
+export type GeneratedIdConfig = {
+  readonly field: string
+  readonly version?: "v4" | "v7" | undefined
+}
+
 /** An array of model field names that together form a unique constraint. */
 export type UniqueFieldsDef = ReadonlyArray<string>
 

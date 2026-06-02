@@ -273,6 +273,46 @@ softDelete: { ttl: Duration.days(30), preserveUnique: true }
 
 See [Lifecycle](/effect-dynamodb/guides/lifecycle/) for details on versioning and soft delete.
 
+### Generated IDs
+
+Auto-fill a primary-key field with a cryptographically-secure UUID when the caller omits it. Use `version: "v4"` (random, default) or `"v7"` (time-ordered/sortable):
+
+```typescript region="entities" example="generated-id.ts"
+// `id` is filled with a random UUIDv4 when omitted on put/create.
+const Documents = Entity.make({
+  model: Document,
+  entityType: "Document",
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
+  generatedId: { field: "id" },
+})
+
+// `eventId` is filled with a time-ordered UUIDv7 (sortable by creation time).
+const Events = Entity.make({
+  model: Event,
+  entityType: "Event",
+  primaryKey: {
+    pk: { field: "pk", composite: ["eventId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  generatedId: { field: "eventId", version: "v7" },
+})
+```
+
+On `put`/`create` the field becomes optional — omit it and a UUID is generated and returned on the decoded record:
+
+```typescript region="put-without-id" example="generated-id.ts"
+// Omit `id` — the framework generates a crypto-secure UUIDv4.
+const doc = yield* db.entities.Documents.put({ title: "Hello, world" })
+
+// The generated id composes the primary key, so the item is fetchable.
+const fetched = yield* db.entities.Documents.get({ id: doc.id })
+```
+
+The field must participate in the primary key. A caller-supplied value always wins. Generation uses a default `Crypto` instance (Web Crypto CSPRNG), so the bound client keeps `R = never` — no layer wiring required. Scope is `put`/`create`; batch and transaction puts still require an explicit id.
+
 ### Unique Constraints
 
 ```typescript

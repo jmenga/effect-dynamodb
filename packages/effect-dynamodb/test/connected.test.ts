@@ -184,9 +184,26 @@ const Reservations = Entity.make({
   unique: { slot: { fields: ["slot"], ttl: Duration.days(30) } },
 })
 
+// Auto-generated id fixture (#57) — `id` is omitted at write time and filled
+// with a cryptographically-secure UUID via the Crypto service.
+class Doc extends Schema.Class<Doc>("Doc")({
+  id: Schema.String,
+  title: Schema.String,
+}) {}
+
+const Docs = Entity.make({
+  model: Doc,
+  entityType: "Doc",
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
+  generatedId: { field: "id" },
+})
+
 const MainTable = Table.make({
   schema: AppSchema,
-  entities: { Users, Tasks, Memberships, Vehicles, Reservations },
+  entities: { Users, Tasks, Memberships, Vehicles, Reservations, Docs },
 })
 
 // ---------------------------------------------------------------------------
@@ -697,6 +714,31 @@ describeConnected("Connected integration tests", () => {
         const sentinel = raw.Items?.find((i) => i.__edd_e__?.S === "Reservation._unique.slot")
         expect(sentinel).toBeDefined()
         expect(Number(sentinel!._ttl!.N)).toBe(1767225600 + 30 * 86400)
+      }).pipe(provide),
+    )
+  })
+
+  describe("generatedId (#57)", () => {
+    it.effect("auto-generates a UUID id, round-trips, and is queryable by key", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: { Docs }, tables: { MainTable } })
+
+        // `id` omitted — filled with a crypto-secure UUID at write time.
+        const created = yield* db.entities.Docs.put({ title: "Generated" })
+        expect(created.id).toMatch(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+        )
+        expect(created.title).toBe("Generated")
+
+        // The generated id composes the primary key and is fetchable.
+        const fetched = yield* db.entities.Docs.get({ id: created.id })
+        expect(fetched.id).toBe(created.id)
+        expect(fetched.title).toBe("Generated")
+
+        // Two writes without an id get distinct ids (no collision).
+        const a = yield* db.entities.Docs.put({ title: "A" })
+        const b = yield* db.entities.Docs.put({ title: "B" })
+        expect(a.id).not.toBe(b.id)
       }).pipe(provide),
     )
   })
