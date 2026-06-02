@@ -193,8 +193,12 @@ function tryValidateEntityMake(
 
   const diagnostics: ts.Diagnostic[] = []
 
-  // Extract model field names via TypeChecker
-  const modelFields = extractModelFields(ts, configArg, program)
+  // Extract model field names via TypeChecker, then apply ref-derived `${field}Id`
+  // substitution so composites referencing a ref's surfaced ID attribute (e.g.
+  // `teamId` for a `team` ref) are recognised as valid. See applyRefFields.
+  const baseModelFields = extractModelFields(ts, configArg, program)
+  const refFields = extractRefFields(ts, configArg)
+  const modelFields = applyRefFields(baseModelFields, refFields)
 
   // Extract entityType for error messages
   let entityType = "unknown"
@@ -678,6 +682,58 @@ function extractModelFields(
   }
 
   return undefined
+}
+
+/**
+ * Extract the set of ref field names from the `refs` property of an
+ * Entity.make() config: `refs: { team: { entity: Teams }, player: { ... } }`
+ * → `{ team, player }`.
+ *
+ * The runtime surfaces a ref field `team` in the entity's key/input schemas as
+ * `${field}Id` (e.g. `teamId`) and removes the bare field — the `refs` keys are
+ * the authoritative signal for which fields are refs (the runtime builds its
+ * resolvedRefs list solely from `config.refs`). See
+ * `internal/EntitySchemas.ts` (input/create/update ref substitution) and
+ * `Entity.ts` (`idFieldName: \`${fieldName}Id\``).
+ */
+function extractRefFields(
+  ts: typeof import("typescript"),
+  config: ts.ObjectLiteralExpression,
+): ReadonlySet<string> {
+  const refFields = new Set<string>()
+  for (const prop of config.properties) {
+    if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
+    if (prop.name.text !== "refs") continue
+    if (!ts.isObjectLiteralExpression(prop.initializer)) continue
+    for (const refProp of prop.initializer.properties) {
+      if (ts.isPropertyAssignment(refProp) && ts.isIdentifier(refProp.name)) {
+        refFields.add(refProp.name.text)
+      } else if (ts.isShorthandPropertyAssignment(refProp)) {
+        refFields.add(refProp.name.text)
+      }
+    }
+  }
+  return refFields
+}
+
+/**
+ * Apply ref-derived `${field}Id` substitution to the valid-composite set,
+ * mirroring the runtime key/input schema: each ref field is removed and its
+ * surfaced `${field}Id` attribute is added in its place. Composites must
+ * reference `teamId`, not the bare `team`, so the substitution both adds the ID
+ * form and drops the original — matching what `tsc` accepts.
+ */
+function applyRefFields(
+  modelFields: ReadonlySet<string> | undefined,
+  refFields: ReadonlySet<string>,
+): ReadonlySet<string> | undefined {
+  if (!modelFields || refFields.size === 0) return modelFields
+  const adjusted = new Set(modelFields)
+  for (const refField of refFields) {
+    adjusted.delete(refField)
+    adjusted.add(`${refField}Id`)
+  }
+  return adjusted
 }
 
 /** Extract field names from a Schema.Class type or ConfiguredModel type. */

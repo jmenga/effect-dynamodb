@@ -80,6 +80,14 @@ const Users = Entity.make({
 
 **Fix:** Use field names that exist on the model, or add the field to the model.
 
+:::note[Ref-derived composites]
+For a field configured as a [ref](/effect-dynamodb/guides/aggregates/), the composite must reference the
+surfaced identifier attribute `<field>Id`, **not** the bare field name. A `team` ref is
+exposed in the key/input schema as `teamId`, so `composite: ["teamId"]` is correct and
+`composite: ["team"]` is the error. The diagnostic recognises every `${field}Id` derived
+from the entity's `refs` config as a valid composite attribute.
+:::
+
 ### EDD-9003: Invalid GSI Format
 
 GSI indexes must use the new format with `name`, `pk: { field, composite }`, and `sk: { field, composite }`.
