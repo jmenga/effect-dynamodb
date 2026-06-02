@@ -1,5 +1,15 @@
 # effect-dynamodb
 
+## 1.9.0
+
+### Minor Changes
+
+- Post-beta.74 improvements surfaced while reviewing new Effect v4 features.
+  - **`generatedId` ([#57](https://github.com/jmenga/effect-dynamodb/issues/57))** — `Entity.make({ generatedId: { field, version? } })` auto-fills a primary-key field with a cryptographically-secure UUID (v4 default, or time-ordered v7) when omitted on `put`/`create`. Sourced from the Effect `Crypto` module via a default instance, so the bound client keeps `R = never` with no layer wiring. The field is type-level optional on put/create and validated to be a primary-key model field (`[EDD-9030]`).
+  - **TTL: `unique.ttl` + `Duration | string` ([#58](https://github.com/jmenga/effect-dynamodb/issues/58))** — the previously-dead `unique: { fields, ttl }` config now expires the constraint's sentinel item (relative TTL, re-applied on create/rotate/restore). Every lifecycle `ttl` (`versioned`, `softDelete`, `timeSeries`, `unique`) now accepts a duration-string literal (`"30 days"`) alongside `Duration`; a bare number is rejected at compile time and a non-finite duration at `make()` (`[EDD-9017]`).
+  - **`DateTime.now` time source ([#56](https://github.com/jmenga/effect-dynamodb/issues/56))** — all write-path timestamps and TTLs now read the ambient `Clock` via `DateTime.now` instead of raw `Date.now()`/`new Date()` (a standing rule violation). Production behavior is unchanged; timestamps + TTL are now deterministic under `TestClock`.
+  - **Schema AST hardening ([#55](https://github.com/jmenga/effect-dynamodb/issues/55))** — internal schema-derivation reads use the typed `SchemaAST` guards (`isArrays`, `isObjects`, `isString`/`isNumber`) and accessors (`.value`, typed `.fields`/`.context`/`.encoding`) instead of `as any`/raw `_tag` poking, with AST-shape probe tests so a future Effect bump fails loudly instead of silently mis-deriving keys.
+
 ## 1.8.1
 
 ### Patch Changes
