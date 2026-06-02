@@ -189,23 +189,31 @@ export const isSchemaMatchingEntity = (schema: Schema.Top, entity: RefEntity): b
  * Extract the element schema from a field that is Schema.Array(T) or
  * Schema.optionalKey(Schema.Array(T)). Returns T.
  *
- * In Effect v4:
- * - Schema.Array(T) has `ast._tag === "Arrays"`, `.schema === T`
+ * In Effect v4 (beta.71+ reintroduced `.value` on Array/NonEmptyArray):
+ * - Schema.Array(T) has `ast._tag === "Arrays"`, `.value === T` (no `.schema`)
  * - Schema.optionalKey(Schema.Array(T)) inherits "Arrays" AST but `.schema === Array(T)`
- *   (the inner array, not the element). Its AST has `context.isOptional === true`.
+ *   (the inner array, not the element). The element is `.schema.value`. Its AST has
+ *   `context.isOptional === true`.
+ *
+ * `.schema` is kept as a fallback for resilience across beta releases.
  */
+const arrayElement = (s: Record<string, unknown>): Schema.Top | undefined => {
+  if ("value" in s) return s.value as Schema.Top
+  if ("schema" in s) return s.schema as Schema.Top
+  return undefined
+}
+
 export const extractArrayElement = (fieldSchema: Schema.Top): Schema.Top | undefined => {
   const s = fieldSchema as unknown as Record<string, unknown>
   const ast = s.ast as { _tag?: string; context?: { isOptional?: boolean } } | undefined
 
-  if (ast?._tag === "Arrays" && "schema" in s) {
-    if (ast.context?.isOptional === true) {
-      // optionalKey(Array(T)): s.schema is Array(T), s.schema.schema is T
-      const inner = s.schema as unknown as Record<string, unknown>
-      if ("schema" in inner) return inner.schema as Schema.Top
+  if (ast?._tag === "Arrays") {
+    if (ast.context?.isOptional === true && "schema" in s) {
+      // optionalKey(Array(T)): s.schema is Array(T), its element is s.schema.value
+      return arrayElement(s.schema as Record<string, unknown>)
     }
-    // Direct Array(T): s.schema is T (the element)
-    return s.schema as Schema.Top
+    // Direct Array(T): the element is s.value
+    return arrayElement(s)
   }
 
   // Schema.optional(Array(T)): ast._tag is "Union" with context.isOptional,
@@ -217,8 +225,8 @@ export const extractArrayElement = (fieldSchema: Schema.Top): Schema.Top | undef
       for (const member of members) {
         const m = member as Record<string, unknown>
         const mAst = m.ast as { _tag?: string } | undefined
-        if (mAst?._tag === "Arrays" && "schema" in m) {
-          return m.schema as Schema.Top
+        if (mAst?._tag === "Arrays") {
+          return arrayElement(m)
         }
       }
     }

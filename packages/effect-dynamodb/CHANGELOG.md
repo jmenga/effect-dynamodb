@@ -1,5 +1,13 @@
 # effect-dynamodb
 
+## 1.8.1
+
+### Patch Changes
+
+- Upgrade to Effect v4 beta.74 and fix two breaking changes from the bump.
+  - **`Effect.fromYieldable` removal** — `Config<T>` now extends `Effect.Effect<T, ConfigError>` directly, so the `Effect.fromYieldable(config)` wrapper is gone. Config values resolve straight through `Effect.runSync(config)`.
+  - **`Schema.Array` element accessor** — beta.71 reintroduced `.value` on `Schema.Array`/`NonEmptyArray`; the element moved off `.schema`. `Aggregate` input-schema derivation read array elements via `.schema`, which silently broke ref→ID field rewriting (many-edge fields were no longer replaced with ID-string arrays). `extractArrayElement` now reads `.value` (with a `.schema` fallback for resilience across beta releases).
+
 ## 1.8.0
 
 ### Minor Changes
