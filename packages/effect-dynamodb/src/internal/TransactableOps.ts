@@ -5,7 +5,7 @@
  * and put-item construction (validation + key composition + system fields).
  */
 
-import { Effect, Schema } from "effect"
+import { DateTime, Effect, Schema } from "effect"
 import type { DynamoEncoding } from "../DynamoModel.js"
 import type { Entity } from "../Entity.js"
 import { ValidationError } from "../Errors.js"
@@ -15,17 +15,21 @@ import { toAttributeMap } from "../Marshaller.js"
 /**
  * Generate a wire-form timestamp value for the configured encoding.
  * No-encoding default: ISO string. Custom encoding: serialized primitive.
+ * `now` is read once per operation from the ambient `Clock` via `DateTime.now`
+ * (deterministic under `TestClock`).
  */
-const generateTimestampPrimitive = (encoding: DynamoEncoding | null): string | number => {
-  if (!encoding) return new Date().toISOString()
-  const now = Date.now()
+const generateTimestampPrimitive = (
+  now: DateTime.Utc,
+  encoding: DynamoEncoding | null,
+): string | number => {
+  if (!encoding) return DateTime.formatIso(now)
   switch (encoding.storage) {
     case "string":
-      return new Date(now).toISOString()
+      return DateTime.formatIso(now)
     case "epochMs":
-      return now
+      return DateTime.toEpochMillis(now)
     case "epochSeconds":
-      return Math.floor(now / 1000)
+      return Math.floor(DateTime.toEpochMillis(now) / 1000)
   }
 }
 
@@ -111,14 +115,15 @@ export const validateAndBuildPutItem = (
     // (already encoded to wire by `Schema.encode`); else generate a wire
     // primitive directly.
     const sf = entity.systemFields
+    const now = yield* DateTime.now
     if (sf.createdAt) {
       if (item[sf.createdAt] === undefined) {
-        item[sf.createdAt] = generateTimestampPrimitive(sf.createdAtEncoding)
+        item[sf.createdAt] = generateTimestampPrimitive(now, sf.createdAtEncoding)
       }
     }
     if (sf.updatedAt) {
       if (item[sf.updatedAt] === undefined) {
-        item[sf.updatedAt] = generateTimestampPrimitive(sf.updatedAtEncoding)
+        item[sf.updatedAt] = generateTimestampPrimitive(now, sf.updatedAtEncoding)
       }
     }
     if (sf.version) item[sf.version] = 1

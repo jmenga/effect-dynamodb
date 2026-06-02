@@ -12,7 +12,7 @@
  * DynamoClient, Marshaller).
  */
 
-import { Effect, Function, Schema } from "effect"
+import { DateTime, Effect, Function, Schema } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import * as DynamoSchema from "./DynamoSchema.js"
 import {
@@ -260,7 +260,8 @@ export const makeStream = <
       const { name: tableName } = yield* config.table.Tag
 
       const pk = composeStreamPk(streamId as Record<string, unknown>)
-      const now = new Date().toISOString()
+      // Event timestamp from the ambient Clock (TestClock-friendly).
+      const now = DateTime.formatIso(yield* DateTime.now)
 
       // Resolve stream ID string for storage (join composites)
       const streamIdStr = compositeFields

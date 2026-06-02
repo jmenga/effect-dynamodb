@@ -14,6 +14,7 @@
 
 import { it } from "@effect/vitest"
 import { Config, DateTime, Duration, Effect, Layer, Option, Schema, Stream } from "effect"
+import { TestClock } from "effect/testing"
 import { afterAll, beforeAll, describe, expect } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
@@ -1796,6 +1797,10 @@ describeConnected("timeSeries integration tests", () => {
         tables: { TsTable },
       })
 
+      // Pin the ambient Clock so the TTL (now + Duration.days(7)) is exact.
+      // The library reads the Clock via DateTime.now (#56); under it.effect the
+      // ambient clock is the TestClock, so set it to a known instant.
+      yield* TestClock.setTime(1767225600000) // 2026-01-01T00:00:00.000Z
       yield* db.entities.Telemetries.append({
         channel: "c-ttl",
         deviceId: "d-1",
@@ -1816,10 +1821,8 @@ describeConnected("timeSeries integration tests", () => {
       const event = raw.Items![0]!
       const ttl = event._ttl?.N ? Number(event._ttl.N) : undefined
       expect(ttl).toBeDefined()
-      const now = Math.floor(Date.now() / 1000)
-      // Roughly 7 days out (Duration.days(7)).
-      expect(ttl!).toBeGreaterThan(now + 6 * 86400)
-      expect(ttl!).toBeLessThan(now + 8 * 86400)
+      // Exactly 7 days (Duration.days(7)) past the pinned instant.
+      expect(ttl!).toBe(1767225600 + 7 * 86400)
     }).pipe(provideTs),
   )
 
@@ -4072,6 +4075,8 @@ describeConnected("TableConfig.ttlAttributeName override (closes #51)", () => {
         tables: { TtlTable },
       })
 
+      // Pin the ambient Clock so TTL (now + offset, via DateTime.now — #56) is exact.
+      yield* TestClock.setTime(1767225600000) // 2026-01-01T00:00:00.000Z
       yield* db.entities.TtlEvents.append({
         channel: "c-cfg-1",
         deviceId: "d-1",
@@ -4092,10 +4097,8 @@ describeConnected("TableConfig.ttlAttributeName override (closes #51)", () => {
       const event = raw.Items![0]!
       // Configured attribute "ttl" carries the epoch-seconds expiry.
       expect(event.ttl?.N).toBeDefined()
-      const ttlVal = Number(event.ttl!.N)
-      const now = Math.floor(Date.now() / 1000)
-      expect(ttlVal).toBeGreaterThan(now + 6 * 86400)
-      expect(ttlVal).toBeLessThan(now + 8 * 86400)
+      // Exactly 7 days (Duration.days(7)) past the pinned instant.
+      expect(Number(event.ttl!.N)).toBe(1767225600 + 7 * 86400)
       // Library default "_ttl" must NOT be written when override is in effect.
       expect(event._ttl).toBeUndefined()
     }).pipe(provideTtl),
@@ -4108,6 +4111,8 @@ describeConnected("TableConfig.ttlAttributeName override (closes #51)", () => {
         tables: { TtlTable },
       })
 
+      // Pin the ambient Clock so TTL (now + offset, via DateTime.now — #56) is exact.
+      yield* TestClock.setTime(1767225600000) // 2026-01-01T00:00:00.000Z
       yield* db.entities.TtlSoftItems.put({ itemId: "sd-1", label: "to be deleted" })
       yield* db.entities.TtlSoftItems.delete({ itemId: "sd-1" })
 
@@ -4125,11 +4130,8 @@ describeConnected("TableConfig.ttlAttributeName override (closes #51)", () => {
       expect(raw.Items!.length).toBe(1)
       const deleted = raw.Items![0]!
       expect(deleted.ttl?.N).toBeDefined()
-      const ttlVal = Number(deleted.ttl!.N)
-      const now = Math.floor(Date.now() / 1000)
-      // Roughly 30 days from now.
-      expect(ttlVal).toBeGreaterThan(now + 29 * 86400)
-      expect(ttlVal).toBeLessThan(now + 31 * 86400)
+      // Exactly 30 days (Duration.days(30)) past the pinned instant.
+      expect(Number(deleted.ttl!.N)).toBe(1767225600 + 30 * 86400)
       expect(deleted._ttl).toBeUndefined()
     }).pipe(provideTtl),
   )
@@ -4166,6 +4168,8 @@ describeConnected("TableConfig.ttlAttributeName override (closes #51)", () => {
         tables: { TtlTable },
       })
 
+      // Pin the ambient Clock so TTL (now + offset, via DateTime.now — #56) is exact.
+      yield* TestClock.setTime(1767225600000) // 2026-01-01T00:00:00.000Z
       // First put produces a v1 snapshot under the retain config (which has ttl).
       yield* db.entities.TtlRetainItems.put({ itemId: "rt-1", payload: "initial" })
 
@@ -4182,11 +4186,8 @@ describeConnected("TableConfig.ttlAttributeName override (closes #51)", () => {
       expect(raw.Items!.length).toBe(1)
       const snapshot = raw.Items![0]!
       expect(snapshot.ttl?.N).toBeDefined()
-      const ttlVal = Number(snapshot.ttl!.N)
-      const now = Math.floor(Date.now() / 1000)
-      // Roughly 90 days from now.
-      expect(ttlVal).toBeGreaterThan(now + 89 * 86400)
-      expect(ttlVal).toBeLessThan(now + 91 * 86400)
+      // Exactly 90 days (Duration.days(90)) past the pinned instant.
+      expect(Number(snapshot.ttl!.N)).toBe(1767225600 + 90 * 86400)
       expect(snapshot._ttl).toBeUndefined()
     }).pipe(provideTtl),
   )

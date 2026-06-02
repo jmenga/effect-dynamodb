@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest"
 import { DateTime, Duration, Effect, Layer, Schema } from "effect"
+import { TestClock } from "effect/testing"
 import { beforeEach, vi } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "../src/DynamoModel.js"
@@ -4319,13 +4320,16 @@ describe("Entity", () => {
           }),
         )
 
+        // Pin the ambient Clock: TTL = now + offset is now deterministic
+        // (DateTime.now reads the Clock — #56). 2026-01-01T00:00:00Z + 90 days.
+        yield* TestClock.setTime(1767225600000)
         yield* TtlRetainEntity.put({ itemId: "i-1", name: "Test" }).asEffect()
 
         const call = mockTransactWriteItems.mock.calls[0]![0]
         const snapshotPut = call.TransactItems[1].Put
-        // Snapshot should have _ttl
+        // Snapshot _ttl = pinned-now-seconds + 90 days, exactly.
         expect(snapshotPut.Item._ttl).toBeDefined()
-        expect(snapshotPut.Item._ttl.N).toBeDefined()
+        expect(Number(snapshotPut.Item._ttl.N)).toBe(1767225600 + 90 * 24 * 60 * 60)
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -5568,18 +5572,17 @@ describe("Entity", () => {
           }),
         )
 
+        // Pin the ambient Clock so generated timestamps are deterministic.
+        yield* TestClock.setTime(1767225600000) // 2026-01-01T00:00:00.000Z
         mockPutItem.mockResolvedValue({})
         yield* MetricEntity.put({ metricId: "m-1", value: 42 }).asEffect()
         const call = mockPutItem.mock.calls[0]![0]
         const item = call.Item
-        // createdAt: DynamoModel.DateString → stored as ISO string
-        expect(item.createdAt.S).toBeDefined()
-        expect(typeof item.createdAt.S).toBe("string")
+        // createdAt: DynamoModel.DateString → stored as ISO string at the pinned instant
+        expect(item.createdAt.S).toBe("2026-01-01T00:00:00.000Z")
         // updatedAt: storedAs(DateEpochSeconds) → stored as epoch seconds number
         expect(item.updatedAt.N).toBeDefined()
-        const epochVal = Number(item.updatedAt.N)
-        expect(epochVal).toBeGreaterThan(1700000000) // reasonable epoch seconds
-        expect(epochVal).toBeLessThan(2000000000)
+        expect(Number(item.updatedAt.N)).toBe(1767225600)
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -5630,6 +5633,8 @@ describe("Entity", () => {
           }),
         )
 
+        // Pin the ambient Clock so generated timestamps are deterministic.
+        yield* TestClock.setTime(1767225600000) // 2026-01-01T00:00:00.000Z
         mockPutItem.mockResolvedValue({})
         yield* MetricEntity.put({ metricId: "m-1", value: 42 }).asEffect()
         const call = mockPutItem.mock.calls[0]![0]
@@ -5637,8 +5642,7 @@ describe("Entity", () => {
         // updatedAt uses custom name "modifiedAt" and epoch seconds
         expect(item.modifiedAt.N).toBeDefined()
         expect(item.updatedAt).toBeUndefined()
-        const epochVal = Number(item.modifiedAt.N)
-        expect(epochVal).toBeGreaterThan(1700000000)
+        expect(Number(item.modifiedAt.N)).toBe(1767225600)
       }).pipe(Effect.provide(TestLayer)),
     )
   })
@@ -7677,13 +7681,15 @@ describe("Entity", () => {
 
     it.effect("put: library-generated timestamp respects model field encoding", () =>
       Effect.gen(function* () {
+        // Pin the ambient Clock so generated timestamps are deterministic.
+        yield* TestClock.setTime(1767225600000) // 2026-01-01T00:00:00.000Z
         mockPutItem.mockResolvedValue({})
         yield* EpochDocEntity.put({ id: "e-1" }).asEffect()
         const item = mockPutItem.mock.calls[0]![0].Item
         // createdAt stored as epoch-seconds number (not ISO string) because the
         // model field declares DateEpochSeconds storage.
         expect(item.createdAt.N).toBeTypeOf("string")
-        expect(Number.parseInt(item.createdAt.N as string, 10)).toBeGreaterThan(1_700_000_000)
+        expect(Number.parseInt(item.createdAt.N as string, 10)).toBe(1767225600)
       }).pipe(Effect.provide(TestLayer)),
     )
 

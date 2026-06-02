@@ -7,7 +7,7 @@
  * @internal Used by GeoIndex — consumers should use `GeoIndex.nearby()`.
  */
 
-import { type Context, Effect, Schema } from "effect"
+import { Clock, type Context, Effect, Schema } from "effect"
 import type { DynamoClientError, DynamoSchema, Table } from "effect-dynamodb"
 import { type DynamoClient, KeyComposer, Query, ValidationError } from "effect-dynamodb"
 import * as h3 from "h3-js"
@@ -72,8 +72,8 @@ export const nearby = <A>(
     // Step 5: Group into contiguous chunks for BETWEEN queries
     const sortedChunks = H3.sequentialChunk(prunedCells.flat())
 
-    // Step 6: Time partitions
-    const now = Date.now()
+    // Step 6: Time partitions — current time from the ambient Clock.
+    const now = yield* Clock.currentTimeMillis
     const startTime = options.timeWindow?.start ?? now - 15 * 60 * 1000
     const endTime = options.timeWindow?.end ?? now
     const timePartitions = H3.getTimePartitions(startTime, endTime, config.bucketMs)
