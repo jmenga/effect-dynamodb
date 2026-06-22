@@ -56,6 +56,7 @@ import {
   parseSimpleShorthand,
 } from "./internal/Expr.js"
 import { compilePath, createPathBuilder } from "./internal/PathBuilder.js"
+import { generateTimestampPrimitive } from "./internal/TransactableOps.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "./KeyComposer.js"
 import * as KeyComposer from "./KeyComposer.js"
 import { normalizeGsiConfig } from "./KeyComposer.js"
@@ -232,6 +233,56 @@ export type { IndexDefinition, KeyPart }
  * falls back from the domain field name to the renamed DB column name, since
  * `currentRaw` (read from DynamoDB) carries DB names rather than domain names.
  */
+/**
+ * Normalize a TTL config value to whole seconds.
+ *
+ * Accepts a `Duration.Duration` or a humanized string (e.g. `"7 days"`,
+ * `"24 hours"`), parsed via Effect's `Duration` input grammar. A bare `number`
+ * is intentionally NOT accepted at the type level — `Duration.fromInput` treats
+ * a number as **milliseconds**, so `3600` would silently mean 3.6 s (a 1000×
+ * footgun); callers must pass `Duration.seconds(3600)` or `"3600 seconds"`.
+ *
+ * Throws `[EDD-9005]` for a non-finite (infinite) duration — an infinite TTL
+ * epoch is nonsensical. {@link make} validates every configured TTL eagerly via
+ * this helper, so the write path never observes an invalid value.
+ *
+ * @internal
+ */
+export const normalizeTtlSeconds = (input: Duration.Duration | string): number => {
+  let duration: Duration.Duration
+  if (typeof input === "string") {
+    // A free string is wider than `Duration.Input` (a template-literal union);
+    // `fromInput` returns None for anything it cannot parse, which we surface
+    // as a config error rather than letting an unsafe parse throw opaquely.
+    const parsed = Duration.fromInput(input as Duration.Input)
+    if (Option.isNone(parsed)) {
+      throw new Error(
+        `[EDD-9005] TTL string "${input}" is not a valid duration (expected e.g. "7 days", "24 hours", "30 minutes").`,
+      )
+    }
+    duration = parsed.value
+  } else {
+    duration = input
+  }
+  const seconds = Duration.toSeconds(duration)
+  if (!Number.isFinite(seconds)) {
+    const shown = typeof input === "string" ? `"${input}"` : "the provided Duration"
+    throw new Error(
+      `[EDD-9005] TTL must resolve to a finite duration; ${shown} resolves to a non-finite (infinite) TTL, which is not a valid DynamoDB TTL epoch.`,
+    )
+  }
+  return seconds
+}
+
+/**
+ * Extract the optional TTL from a unique-constraint definition. Only the object
+ * form (`{ fields, ttl }`) carries a TTL; the bare-array form never does.
+ *
+ * @internal
+ */
+const resolveUniqueTtl = (def: UniqueConstraintDef): Duration.Duration | string | undefined =>
+  Array.isArray(def) ? undefined : (def as { readonly ttl?: Duration.Duration | string }).ttl
+
 const composeUniqueSentinel = (
   schema: DynamoSchema.DynamoSchema,
   entityType: string,
@@ -1818,6 +1869,28 @@ const makeImpl = <
     }
   }
 
+  // EDD-9005: validate every configured TTL eagerly at make() time. Rejects
+  // non-finite (infinite) durations and unparseable string forms here so the
+  // write path never observes an invalid TTL (it would otherwise surface as a
+  // defect mid-write). Bare numbers are rejected at the type level (footgun).
+  {
+    const configuredTtls: Array<Duration.Duration | string> = []
+    if (typeof config.versioned === "object" && config.versioned?.ttl !== undefined) {
+      configuredTtls.push(config.versioned.ttl)
+    }
+    if (typeof config.softDelete === "object" && config.softDelete?.ttl !== undefined) {
+      configuredTtls.push(config.softDelete.ttl)
+    }
+    if (config.timeSeries?.ttl !== undefined) configuredTtls.push(config.timeSeries.ttl)
+    if (config.unique) {
+      for (const def of Object.values(config.unique)) {
+        const uTtl = resolveUniqueTtl(def)
+        if (uTtl !== undefined) configuredTtls.push(uTtl)
+      }
+    }
+    for (const ttl of configuredTtls) normalizeTtlSeconds(ttl)
+  }
+
   // ---------------------------------------------------------------------------
   // Field renaming: domain name → DynamoDB attribute name (from ConfiguredModel)
   // ---------------------------------------------------------------------------
@@ -1956,7 +2029,7 @@ const makeImpl = <
     )
   }
 
-  const nowIso = () => new Date().toISOString()
+  const nowIso = (now: DateTime.Utc) => DateTime.formatIso(now)
 
   /**
    * Generate a timestamp value as a wire primitive ready for marshalling.
@@ -1964,22 +2037,15 @@ const makeImpl = <
    *
    * Used for system fields whether colliding or not — the value is always a
    * wire primitive (string or number) ready for `toAttributeMap`.
+   *
+   * Time source is the Clock-backed `now: DateTime.Utc` resolved at the write
+   * op's entry (`yield* DateTime.now`) and threaded in — no `Date` constructor,
+   * so timestamps are deterministic under `TestClock`. Delegates to the shared
+   * {@link generateTimestampPrimitive} so the Batch/Transaction path produces
+   * identical output.
    */
-  const generateTimestamp = (encoding: DynamoEncoding | null): string | number => {
-    if (!encoding) return nowIso()
-    const now = Date.now()
-    switch (encoding.storage) {
-      case "string":
-        // For DateTime.Zoned this would need the extended ISO format, but
-        // system timestamps generated here are UTC — DateTime.Zoned-typed
-        // collision fields are rare and not previously special-cased either.
-        return new Date(now).toISOString()
-      case "epochMs":
-        return now
-      case "epochSeconds":
-        return Math.floor(now / 1000)
-    }
-  }
+  const generateTimestamp = (encoding: DynamoEncoding | null, now: DateTime.Utc): string | number =>
+    generateTimestampPrimitive(now, encoding)
 
   // ---------------------------------------------------------------------------
   // Lifecycle config helpers
@@ -1994,14 +2060,14 @@ const makeImpl = <
     config.softDelete === true ||
     (typeof config.softDelete === "object" && config.softDelete !== null)
 
-  const retainTtl = (): Duration.Duration | undefined => {
+  const retainTtl = (): Duration.Duration | string | undefined => {
     if (typeof config.versioned !== "object" || config.versioned === null) return undefined
-    return (config.versioned as { ttl?: Duration.Duration }).ttl
+    return (config.versioned as { ttl?: Duration.Duration | string }).ttl
   }
 
-  const softDeleteTtl = (): Duration.Duration | undefined => {
+  const softDeleteTtl = (): Duration.Duration | string | undefined => {
     if (typeof config.softDelete !== "object" || config.softDelete === null) return undefined
-    return (config.softDelete as { ttl?: Duration.Duration }).ttl
+    return (config.softDelete as { ttl?: Duration.Duration | string }).ttl
   }
 
   const preserveUnique = (): boolean => {
@@ -2033,6 +2099,7 @@ const makeImpl = <
     _tablePkField: string,
     tableSkField: string,
     ttlAttrName: string,
+    now: DateTime.Utc,
   ): globalThis.Record<string, unknown> => {
     const snapshot: globalThis.Record<string, unknown> = { ...item }
 
@@ -2047,7 +2114,8 @@ const makeImpl = <
     // Add optional TTL
     const ttl = retainTtl()
     if (ttl) {
-      snapshot[ttlAttrName] = Math.floor(Date.now() / 1000) + Duration.toSeconds(ttl)
+      snapshot[ttlAttrName] =
+        Math.floor(DateTime.toEpochMillis(now) / 1000) + normalizeTtlSeconds(ttl)
     }
 
     return snapshot
@@ -2391,6 +2459,11 @@ const makeImpl = <
           // Build the DynamoDB item — already in wire-format after encode
           const item: globalThis.Record<string, unknown> = { ...encoded }
 
+          // Clock-backed time source resolved once for this write op and
+          // threaded into every timestamp/TTL computation below — deterministic
+          // under `TestClock`, wall-clock in production.
+          const now = yield* DateTime.now
+
           // Add system fields. When a timestamp field collides with a
           // model-declared field, the user may have supplied their own value
           // (optional on collision in `inputSchema`). Respect their value if
@@ -2398,12 +2471,12 @@ const makeImpl = <
           // primitive directly.
           if (systemFields.createdAt) {
             if (item[systemFields.createdAt] === undefined) {
-              item[systemFields.createdAt] = generateTimestamp(systemFields.createdAtEncoding)
+              item[systemFields.createdAt] = generateTimestamp(systemFields.createdAtEncoding, now)
             }
           }
           if (systemFields.updatedAt) {
             if (item[systemFields.updatedAt] === undefined) {
-              item[systemFields.updatedAt] = generateTimestamp(systemFields.updatedAtEncoding)
+              item[systemFields.updatedAt] = generateTimestamp(systemFields.updatedAtEncoding, now)
             }
           }
           if (systemFields.version) item[systemFields.version] = 1
@@ -2478,16 +2551,25 @@ const makeImpl = <
                 )
                 if (!sentinel) continue
                 sentinelConstraints.push(constraintName)
+                // Optional TTL — when the constraint declares one, the sentinel
+                // auto-expires (time-bounded uniqueness reservation/hold). Uses
+                // the table's resolved TTL attribute name + Clock-backed `now`.
+                const sentinelItem: globalThis.Record<string, unknown> = {
+                  [config.indexes.primary.pk.field]: sentinel.key.pk,
+                  [config.indexes.primary.sk.field]: sentinel.key.sk,
+                  __edd_e__: `${entityType}._unique.${constraintName}`,
+                  _entity_pk: keys[config.indexes.primary.pk.field],
+                  _entity_sk: keys[config.indexes.primary.sk.field],
+                }
+                const uniqueTtl = resolveUniqueTtl(constraintDef)
+                if (uniqueTtl !== undefined) {
+                  sentinelItem[ttlAttrName] =
+                    Math.floor(DateTime.toEpochMillis(now) / 1000) + normalizeTtlSeconds(uniqueTtl)
+                }
                 transactItems.push({
                   Put: {
                     TableName: tableName,
-                    Item: toAttributeMap({
-                      [config.indexes.primary.pk.field]: sentinel.key.pk,
-                      [config.indexes.primary.sk.field]: sentinel.key.sk,
-                      __edd_e__: `${entityType}._unique.${constraintName}`,
-                      _entity_pk: keys[config.indexes.primary.pk.field],
-                      _entity_sk: keys[config.indexes.primary.sk.field],
-                    }),
+                    Item: toAttributeMap(sentinelItem),
                     ConditionExpression: "attribute_not_exists(pk)",
                   },
                 })
@@ -2502,6 +2584,7 @@ const makeImpl = <
                 config.indexes.primary.pk.field,
                 config.indexes.primary.sk.field,
                 ttlAttrName,
+                now,
               )
               transactItems.push({
                 Put: {
@@ -2707,6 +2790,8 @@ const makeImpl = <
           const tc = yield* tableTag
           const tableName = tc.name
           const ttlAttrName = resolveTtlAttributeName(tc)
+          // Clock-backed time source for the updatedAt timestamp + retain snapshot TTL.
+          const now = yield* DateTime.now
 
           // Decode key
           const decodedKey = yield* Schema.decodeUnknownEffect(
@@ -2903,7 +2988,7 @@ const makeImpl = <
               newItem[systemFields.updatedAt] =
                 userSupplied !== undefined
                   ? userSupplied
-                  : generateTimestamp(systemFields.updatedAtEncoding)
+                  : generateTimestamp(systemFields.updatedAtEncoding, now)
             }
 
             // `newItem` is already in domain names (the merge built it from
@@ -3044,6 +3129,7 @@ const makeImpl = <
                   config.indexes.primary.pk.field,
                   config.indexes.primary.sk.field,
                   ttlAttrName,
+                  now,
                 )
               : undefined
 
@@ -3298,7 +3384,7 @@ const makeImpl = <
             values[valKey] = toAttributeValue(
               userSupplied !== undefined
                 ? userSupplied
-                : generateTimestamp(systemFields.updatedAtEncoding),
+                : generateTimestamp(systemFields.updatedAtEncoding, now),
             )
             setClauses.push(`${nameKey} = ${valKey}`)
             counter++
@@ -3745,7 +3831,10 @@ const makeImpl = <
             }
 
             const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
-            const now = nowIso()
+            // Clock-backed time source; `now` is the ISO timestamp used for the
+            // deleted SK + deletedAt, `dtNow` drives the optional TTL + snapshot.
+            const dtNow = yield* DateTime.now
+            const now = nowIso(dtNow)
 
             // Build soft-deleted item: same PK, replace SK with deleted key, strip GSI keys
             const deletedItem: globalThis.Record<string, unknown> = { ...raw }
@@ -3764,7 +3853,8 @@ const makeImpl = <
             // Add optional TTL
             const sdTtl = softDeleteTtl()
             if (sdTtl) {
-              deletedItem[ttlAttrName] = Math.floor(Date.now() / 1000) + Duration.toSeconds(sdTtl)
+              deletedItem[ttlAttrName] =
+                Math.floor(DateTime.toEpochMillis(dtNow) / 1000) + normalizeTtlSeconds(sdTtl)
             }
 
             // Build transaction
@@ -3798,6 +3888,7 @@ const makeImpl = <
                 primary.pk.field,
                 primary.sk.field,
                 ttlAttrName,
+                dtNow,
               )
               transactItems.push({
                 Put: {
@@ -3946,6 +4037,8 @@ const makeImpl = <
         Effect.gen(function* () {
           const client = yield* DynamoClient
           const { name: tableName } = yield* tableTag
+          // Clock-backed time source for createdAt/updatedAt SET clauses.
+          const now = yield* DateTime.now
 
           // Encode user input → wire form (see `put` for strategy).
           const encodedInput = yield* encodeOrDecodeEncode(
@@ -4073,7 +4166,7 @@ const makeImpl = <
             values[valKey] = toAttributeValue(
               userSupplied !== undefined
                 ? userSupplied
-                : generateTimestamp(systemFields.createdAtEncoding),
+                : generateTimestamp(systemFields.createdAtEncoding, now),
             )
             setClauses.push(`${nameKey} = if_not_exists(${nameKey}, ${valKey})`)
             counter++
@@ -4088,7 +4181,7 @@ const makeImpl = <
             values[valKey] = toAttributeValue(
               userSupplied !== undefined
                 ? userSupplied
-                : generateTimestamp(systemFields.updatedAtEncoding),
+                : generateTimestamp(systemFields.updatedAtEncoding, now),
             )
             setClauses.push(`${nameKey} = ${valKey}`)
             counter++
@@ -4238,6 +4331,8 @@ const makeImpl = <
       const orderByField = timeSeriesConfig.orderBy
       const ttlDuration = timeSeriesConfig.ttl
       const appendInputSchema = schemas.appendInputSchema as Schema.Codec<any>
+      // Clock-backed time source for current-item timestamps + event-item TTL.
+      const now = yield* DateTime.now
 
       // ---------- Validate removeAttrs (issue #49) ----------
       // `.remove(attrs)` clears `appendInput` attributes in the same UpdateItem
@@ -4428,7 +4523,7 @@ const makeImpl = <
         const nameKey = `#a${counter}`
         const valKey = `:a${counter}`
         names[nameKey] = systemFields.createdAt
-        values[valKey] = toAttributeValue(generateTimestamp(systemFields.createdAtEncoding))
+        values[valKey] = toAttributeValue(generateTimestamp(systemFields.createdAtEncoding, now))
         setClauses.push(`${nameKey} = if_not_exists(${nameKey}, ${valKey})`)
         counter++
       }
@@ -4471,7 +4566,8 @@ const makeImpl = <
       eventItem.__edd_e__ = entityType
       // TTL — attribute name comes from TableConfig (default "_ttl")
       if (ttlDuration) {
-        eventItem[ttlAttrName] = Math.floor(Date.now() / 1000) + Duration.toSeconds(ttlDuration)
+        eventItem[ttlAttrName] =
+          Math.floor(DateTime.toEpochMillis(now) / 1000) + normalizeTtlSeconds(ttlDuration)
       }
       // Events never participate in indexes: strip any GSI key fields that the
       // naive spread above may have carried over. gsiKeys weren't written into
@@ -4910,6 +5006,8 @@ const makeImpl = <
           const tc = yield* tableTag
           const tableName = tc.name
           const ttlAttrName = resolveTtlAttributeName(tc)
+          // Clock-backed time source for the restored updatedAt + retain snapshot.
+          const now = yield* DateTime.now
 
           // Decode key
           const decodedKey = yield* Schema.decodeUnknownEffect(
@@ -4973,7 +5071,10 @@ const makeImpl = <
           const newVersion = currentVersion + 1
           if (systemFields.version) restoredItem[systemFields.version] = newVersion
           if (systemFields.updatedAt)
-            restoredItem[systemFields.updatedAt] = generateTimestamp(systemFields.updatedAtEncoding)
+            restoredItem[systemFields.updatedAt] = generateTimestamp(
+              systemFields.updatedAtEncoding,
+              now,
+            )
 
           // Recompose all keys (original SK, GSI keys)
           const restoredKeys = composeAllKeys(restoredItem)
@@ -5014,6 +5115,7 @@ const makeImpl = <
               primary.pk.field,
               primary.sk.field,
               ttlAttrName,
+              now,
             )
             transactItems.push({
               Put: {

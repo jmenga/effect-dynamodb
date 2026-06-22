@@ -14,7 +14,18 @@
 
 import { it } from "@effect/vitest"
 import { Config, DateTime, Duration, Effect, Layer, Option, Schema, Stream } from "effect"
+import { TestClock } from "effect/testing"
 import { afterAll, beforeAll, describe, expect } from "vitest"
+
+/**
+ * Fixed instant for TTL/timestamp assertions. `it.effect` runs under a
+ * `TestClock` frozen at epoch 0; the library's `DateTime.now`-backed TTLs are
+ * therefore deterministic once the clock is advanced to a known instant, so
+ * exact `frozen + duration` values can be asserted (2026-06-01T00:00:00Z).
+ */
+const FROZEN_MS = 1_780_272_000_000
+const FROZEN_SECONDS = 1_780_272_000
+
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -1791,6 +1802,7 @@ describeConnected("timeSeries integration tests", () => {
 
   it.effect("_ttl attribute present on event items with sensible epoch value", () =>
     Effect.gen(function* () {
+      yield* TestClock.adjust(Duration.millis(FROZEN_MS))
       const db = yield* DynamoClient.make({
         entities: { Telemetries },
         tables: { TsTable },
@@ -1816,10 +1828,8 @@ describeConnected("timeSeries integration tests", () => {
       const event = raw.Items![0]!
       const ttl = event._ttl?.N ? Number(event._ttl.N) : undefined
       expect(ttl).toBeDefined()
-      const now = Math.floor(Date.now() / 1000)
-      // Roughly 7 days out (Duration.days(7)).
-      expect(ttl!).toBeGreaterThan(now + 6 * 86400)
-      expect(ttl!).toBeLessThan(now + 8 * 86400)
+      // Clock-backed TTL is deterministic under TestClock: exactly frozen + 7 days.
+      expect(ttl!).toBe(FROZEN_SECONDS + 7 * 86400)
     }).pipe(provideTs),
   )
 
@@ -3987,6 +3997,11 @@ class TtlRetainItem extends Schema.Class<TtlRetainItem>("TtlRetainItem")({
   payload: Schema.String,
 }) {}
 
+class TtlUniqueItem extends Schema.Class<TtlUniqueItem>("TtlUniqueItem")({
+  itemId: Schema.String,
+  reservationCode: Schema.String,
+}) {}
+
 const ttlSchema = DynamoSchema.make({ name: "ttl-attr-test", version: 1 })
 const ttlTableName = `ttl-attr-test-${Date.now()}`
 
@@ -4028,9 +4043,22 @@ const TtlRetainItems = Entity.make({
   versioned: { retain: true, ttl: Duration.days(90) },
 })
 
+// Unique constraint with a TTL — the sentinel auto-expires, freeing the
+// reservation (#58: unique.ttl wired up). String form exercises Duration|string.
+const TtlUniqueItems = Entity.make({
+  model: TtlUniqueItem,
+  entityType: "TtlUniqueItem",
+  primaryKey: {
+    pk: { field: "pk", composite: ["itemId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  timestamps: true,
+  unique: { byCode: { fields: ["reservationCode"], ttl: "30 minutes" } },
+})
+
 const TtlTable = Table.make({
   schema: ttlSchema,
-  entities: { TtlEvents, TtlSoftItems, TtlRetainItems },
+  entities: { TtlEvents, TtlSoftItems, TtlRetainItems, TtlUniqueItems },
 })
 const TtlTestLayer = Layer.mergeAll(
   ClientLayer,
@@ -4067,6 +4095,7 @@ describeConnected("TableConfig.ttlAttributeName override (closes #51)", () => {
 
   it.effect("timeSeries event writes TTL to the configured attribute name", () =>
     Effect.gen(function* () {
+      yield* TestClock.adjust(Duration.millis(FROZEN_MS))
       const db = yield* DynamoClient.make({
         entities: { TtlEvents },
         tables: { TtlTable },
@@ -4093,9 +4122,8 @@ describeConnected("TableConfig.ttlAttributeName override (closes #51)", () => {
       // Configured attribute "ttl" carries the epoch-seconds expiry.
       expect(event.ttl?.N).toBeDefined()
       const ttlVal = Number(event.ttl!.N)
-      const now = Math.floor(Date.now() / 1000)
-      expect(ttlVal).toBeGreaterThan(now + 6 * 86400)
-      expect(ttlVal).toBeLessThan(now + 8 * 86400)
+      // Clock-backed TTL is deterministic under TestClock: exactly frozen + 7 days.
+      expect(ttlVal).toBe(FROZEN_SECONDS + 7 * 86400)
       // Library default "_ttl" must NOT be written when override is in effect.
       expect(event._ttl).toBeUndefined()
     }).pipe(provideTtl),
@@ -4103,6 +4131,7 @@ describeConnected("TableConfig.ttlAttributeName override (closes #51)", () => {
 
   it.effect("soft-deleted item writes TTL to the configured attribute name", () =>
     Effect.gen(function* () {
+      yield* TestClock.adjust(Duration.millis(FROZEN_MS))
       const db = yield* DynamoClient.make({
         entities: { TtlSoftItems },
         tables: { TtlTable },
@@ -4126,10 +4155,8 @@ describeConnected("TableConfig.ttlAttributeName override (closes #51)", () => {
       const deleted = raw.Items![0]!
       expect(deleted.ttl?.N).toBeDefined()
       const ttlVal = Number(deleted.ttl!.N)
-      const now = Math.floor(Date.now() / 1000)
-      // Roughly 30 days from now.
-      expect(ttlVal).toBeGreaterThan(now + 29 * 86400)
-      expect(ttlVal).toBeLessThan(now + 31 * 86400)
+      // Clock-backed TTL is deterministic under TestClock: exactly frozen + 30 days.
+      expect(ttlVal).toBe(FROZEN_SECONDS + 30 * 86400)
       expect(deleted._ttl).toBeUndefined()
     }).pipe(provideTtl),
   )
@@ -4161,6 +4188,7 @@ describeConnected("TableConfig.ttlAttributeName override (closes #51)", () => {
 
   it.effect("versioned snapshot writes TTL to the configured attribute name", () =>
     Effect.gen(function* () {
+      yield* TestClock.adjust(Duration.millis(FROZEN_MS))
       const db = yield* DynamoClient.make({
         entities: { TtlRetainItems },
         tables: { TtlTable },
@@ -4183,11 +4211,39 @@ describeConnected("TableConfig.ttlAttributeName override (closes #51)", () => {
       const snapshot = raw.Items![0]!
       expect(snapshot.ttl?.N).toBeDefined()
       const ttlVal = Number(snapshot.ttl!.N)
-      const now = Math.floor(Date.now() / 1000)
-      // Roughly 90 days from now.
-      expect(ttlVal).toBeGreaterThan(now + 89 * 86400)
-      expect(ttlVal).toBeLessThan(now + 91 * 86400)
+      // Clock-backed TTL is deterministic under TestClock: exactly frozen + 90 days.
+      expect(ttlVal).toBe(FROZEN_SECONDS + 90 * 86400)
       expect(snapshot._ttl).toBeUndefined()
+    }).pipe(provideTtl),
+  )
+
+  it.effect("unique sentinel carries the configured TTL (closes #58)", () =>
+    Effect.gen(function* () {
+      yield* TestClock.adjust(Duration.millis(FROZEN_MS))
+      const db = yield* DynamoClient.make({
+        entities: { TtlUniqueItems },
+        tables: { TtlTable },
+      })
+
+      // Write an item with a unique constraint that declares `ttl: "30 minutes"`.
+      yield* db.entities.TtlUniqueItems.put({ itemId: "u-1", reservationCode: "RES-7" })
+
+      // Read the unique sentinel item directly. Key format (lowercased casing):
+      //   pk = "<schema>#<entity>.<constraint>#<value>", sk = "<schema>#<entity>.<constraint>"
+      const sentinel = yield* (yield* DynamoClient).getItem({
+        TableName: ttlTableName,
+        Key: {
+          pk: { S: "$ttl-attr-test#v1#ttluniqueitem.bycode#res-7" },
+          sk: { S: "$ttl-attr-test#v1#ttluniqueitem.bycode" },
+        },
+      })
+      expect(sentinel.Item).toBeDefined()
+      // The configured TTL attribute ("ttl") carries the epoch-seconds expiry,
+      // deterministic under TestClock: exactly frozen + 30 minutes.
+      expect(sentinel.Item!.ttl?.N).toBeDefined()
+      expect(Number(sentinel.Item!.ttl!.N)).toBe(FROZEN_SECONDS + 30 * 60)
+      // Library default "_ttl" must NOT be written when the override is in effect.
+      expect(sentinel.Item!._ttl).toBeUndefined()
     }).pipe(provideTtl),
   )
 })

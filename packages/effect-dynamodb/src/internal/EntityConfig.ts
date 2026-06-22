@@ -48,7 +48,7 @@ export type VersionedConfig =
   | {
       readonly field?: string | undefined
       readonly retain?: boolean | undefined
-      readonly ttl?: Duration.Duration | undefined
+      readonly ttl?: Duration.Duration | string | undefined
     }
 
 /**
@@ -61,7 +61,7 @@ export type VersionedConfig =
 export type SoftDeleteConfig =
   | boolean
   | {
-      readonly ttl?: Duration.Duration | undefined
+      readonly ttl?: Duration.Duration | string | undefined
       readonly preserveUnique?: boolean | undefined
     }
 
@@ -83,7 +83,7 @@ export type TimeSeriesConfig<TAppendInput extends Schema.Top = Schema.Top> = {
   /** Model attribute used as the monotonic clock for CAS and event SK decoration. Required. */
   readonly orderBy: string
   /** TTL applied to event items (not current). Omit for retention-forever. */
-  readonly ttl?: Duration.Duration | undefined
+  readonly ttl?: Duration.Duration | string | undefined
   /**
    * REQUIRED schema restricting which model fields are allowed in `.append()`
    * input AND which fields are written into the current-item SET clause.
@@ -109,7 +109,7 @@ export type UniqueFieldsDef = ReadonlyArray<string>
  */
 export type UniqueConstraintDef =
   | UniqueFieldsDef
-  | { readonly fields: UniqueFieldsDef; readonly ttl?: Duration.Duration | undefined }
+  | { readonly fields: UniqueFieldsDef; readonly ttl?: Duration.Duration | string | undefined }
 
 /**
  * Map of named unique constraints. Each key is the constraint name,

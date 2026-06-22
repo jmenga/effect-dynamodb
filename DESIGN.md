@@ -450,8 +450,26 @@ The entity definition still provides type derivation (`Entity.Record<typeof User
 | Config | Type | Fields Added |
 |--------|------|-------------|
 | `timestamps: true` | `boolean \| { created: string, updated: string }` | `createdAt`, `updatedAt` (or custom names) |
-| `versioned: true` | `boolean \| { field?: string, retain?: boolean, ttl?: Duration }` | `version` (or custom name) |
-| `softDelete: true` | `boolean \| { ttl?: Duration, preserveUnique?: boolean }` | `deletedAt` (when soft-deleted) |
+| `versioned: true` | `boolean \| { field?: string, retain?: boolean, ttl?: Duration \| string }` | `version` (or custom name) |
+| `softDelete: true` | `boolean \| { ttl?: Duration \| string, preserveUnique?: boolean }` | `deletedAt` (when soft-deleted) |
+
+#### TTL configuration (`versioned.ttl`, `softDelete.ttl`, `timeSeries.ttl`, `unique[].ttl`)
+
+Every framework TTL accepts a `Duration.Duration` **or** a humanized string
+(`"7 days"`, `"24 hours"`, `"30 minutes"`), parsed via Effect's `Duration` input
+grammar. Two rules are enforced:
+
+- **No bare `number`** — the type rejects it. Effect's `Duration` grammar treats
+  a number as *milliseconds*, so `3600` would mean 3.6 s, not an hour (a 1000×
+  footgun). Pass `Duration.seconds(3600)` or `"3600 seconds"`.
+- **No infinite / unparseable value** — an infinite TTL epoch is nonsensical;
+  these (and unparseable strings) fail at `Entity.make()` time with **EDD-9005**,
+  so the write path never observes an invalid TTL.
+
+The stored TTL attribute is an absolute epoch-seconds expiry computed from the
+**Clock-backed `DateTime.now`** at write time (deterministic under `TestClock`)
+plus the configured duration, written to the table's configured TTL attribute
+name (`TableConfig.ttlAttributeName`, default `_ttl`).
 
 ### Unique Constraints
 
@@ -460,8 +478,13 @@ unique: {
   email: ["email"],                        // single-field uniqueness
   tenantEmail: ["tenantId", "email"],       // compound uniqueness
   idempotencyKey: { fields: ["idempotencyKey"], ttl: Duration.hours(1) },  // time-bounded
+  reservation: { fields: ["code"], ttl: "30 minutes" },                    // string form
 }
 ```
+
+When a unique constraint declares a `ttl`, the **sentinel item** carries the TTL
+attribute and auto-expires, releasing the uniqueness reservation (e.g. a
+time-bounded hold). Without a `ttl`, sentinels are permanent.
 
 Constraints are **sparse**: a sentinel is only written when every composing
 field is present on the record. Mirrors GSI sparse semantics — a record with a
