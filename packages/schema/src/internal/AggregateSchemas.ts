@@ -7,7 +7,7 @@
 import { Schema } from "effect"
 import { ConfiguredModelTag } from "../DynamoModel.js"
 import type { AggregateEdge, ManyEdge, RefEntity } from "./AggregateEdges.js"
-import type { BoundSubAggregate } from "./AggregateTypes.js"
+import type { AggregateInputType, BoundSubAggregate } from "./AggregateTypes.js"
 import {
   extractArrayElement as extractArrayElementImpl,
   getSchemaFields as getSchemaFieldsImpl,
@@ -28,18 +28,37 @@ import {
  * - PK composite fields are omitted (auto-generated)
  * - `Schema.toCodecJson` is applied at the end so Date fields accept ISO strings
  */
-export interface DerivedAggregateSchemas {
-  readonly inputSchema: Schema.Top
-  readonly updateSchema: Schema.Top
+/**
+ * Precisely-typed derived aggregate schemas. `TInput` is the aggregate's derived
+ * input/create payload type (see {@link AggregateInputType}); `updateSchema` is
+ * the same shape with every field optional. This lets the table-free
+ * `deriveAggregateSchemas` path be as typed as the top-level `Aggregate.make`,
+ * so an AWS-free contract package can read `typeof result.inputSchema.Type`
+ * without fabricating a stub table tag (issue #67).
+ */
+export interface DerivedAggregateSchemas<TInput = unknown> {
+  readonly inputSchema: Schema.Codec<TInput>
+  /** Alias for `inputSchema` — aggregates have no PK-composite stripping on create. */
+  readonly createSchema: Schema.Codec<TInput>
+  readonly updateSchema: Schema.Codec<Partial<TInput>>
 }
 
-export const deriveAggregateSchemas = (
-  schema: Schema.Top,
-  edges: Record<string, AggregateEdge | BoundSubAggregate<any>>,
-  pkComposites: ReadonlyArray<string>,
-): DerivedAggregateSchemas => {
+export const deriveAggregateSchemas = <
+  TSchema extends Schema.Top,
+  const TEdges extends Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
+  const TPK extends ReadonlyArray<string>,
+>(
+  schema: TSchema,
+  edges: TEdges,
+  pkComposites: TPK,
+): DerivedAggregateSchemas<AggregateInputType<Schema.Schema.Type<TSchema>, TEdges, TPK>> => {
+  type Result = DerivedAggregateSchemas<
+    AggregateInputType<Schema.Schema.Type<TSchema>, TEdges, TPK>
+  >
   const fields = getSchemaFields(schema)
-  if (!fields) return { inputSchema: schema, updateSchema: schema }
+  if (!fields) {
+    return { inputSchema: schema, createSchema: schema, updateSchema: schema } as unknown as Result
+  }
 
   const omit = new Set(pkComposites)
   const newFields: Record<string, unknown> = {}
@@ -90,7 +109,10 @@ export const deriveAggregateSchemas = (
   }
   const updateSchema = Schema.toCodecJson(Schema.Struct(optionalFields as any))
 
-  return { inputSchema, updateSchema }
+  // Runtime members are `Schema.Codec<unknown>`-shaped; the precise input type
+  // is a compile-time phantom (`AggregateInputType`) — same approach the
+  // top-level `Aggregate.make` overload uses. `createSchema` aliases `inputSchema`.
+  return { inputSchema, createSchema: inputSchema, updateSchema } as unknown as Result
 }
 
 /**
