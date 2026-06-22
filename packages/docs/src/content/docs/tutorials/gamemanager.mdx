@@ -2663,11 +2663,11 @@ MATCH_ID=$(curl -s -X POST http://localhost:3000/matches \
 echo "Created match: $MATCH_ID"
 ```
 
-Notice how the create payload maps to the aggregate's edge structure:
-- `venue: Venue` → `venueId: string`
-- `team1.team: Team` → `team1.teamId: string`
-- `team1.coach: Coach` → `team1.coachId: string`
-- `team1.players[].player: Player` → `team1.players[].playerId: string`
+Notice how the create payload maps to the aggregate's edge structure. The flattened ref ID fields preserve the referenced entity's branded identifier type (just like `Entity.Input` and `createSchema`) — `MatchAggregate.createSchema` / `inputSchema` expose `venueId: VenueId`, `teamId: TeamId`, etc., not plain `string`:
+- `venue: Venue` → `venueId: VenueId`
+- `team1.team: Team` → `team1.teamId: TeamId`
+- `team1.coach: Coach` → `team1.coachId: CoachId`
+- `team1.players[].player: Player` → `team1.players[].playerId: PlayerId`
 
 **Step 3: Get a match.** The response is the fully assembled domain object — all refs hydrated:
 
