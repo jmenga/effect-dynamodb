@@ -1,10 +1,14 @@
 import { it } from "@effect/vitest"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import {
+  DynamoError,
+  type TransactionCancelled,
+  type ValidationError,
+} from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Layer, Schema } from "effect"
 import { beforeEach, describe, expect, vi } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
-import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import { DynamoError, type TransactionCancelled, type ValidationError } from "../src/Errors.js"
 import * as Expression from "../src/Expression.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"

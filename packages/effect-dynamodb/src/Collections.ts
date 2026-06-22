@@ -12,9 +12,9 @@
  * @module
  */
 
+import { getFields } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import type { Schema } from "effect"
-import { getFields } from "./internal/EntitySchemas.js"
-import type { IndexDefinition } from "./KeyComposer.js"
 
 // ---------------------------------------------------------------------------
 // Structural entity constraint — minimal type for entities used in Collections

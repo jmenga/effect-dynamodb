@@ -1,7 +1,7 @@
 import { it as effectIt } from "@effect/vitest"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Effect, Layer } from "effect"
 import { describe, expect, it } from "vitest"
-import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Table from "../src/Table.js"
 
 describe("Table", () => {

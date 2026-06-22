@@ -48,7 +48,7 @@ export type VersionedConfig =
   | {
       readonly field?: string | undefined
       readonly retain?: boolean | undefined
-      readonly ttl?: Duration.Duration | undefined
+      readonly ttl?: Duration.Duration | string | undefined
     }
 
 /**
@@ -61,7 +61,7 @@ export type VersionedConfig =
 export type SoftDeleteConfig =
   | boolean
   | {
-      readonly ttl?: Duration.Duration | undefined
+      readonly ttl?: Duration.Duration | string | undefined
       readonly preserveUnique?: boolean | undefined
     }
 
@@ -83,7 +83,7 @@ export type TimeSeriesConfig<TAppendInput extends Schema.Top = Schema.Top> = {
   /** Model attribute used as the monotonic clock for CAS and event SK decoration. Required. */
   readonly orderBy: string
   /** TTL applied to event items (not current). Omit for retention-forever. */
-  readonly ttl?: Duration.Duration | undefined
+  readonly ttl?: Duration.Duration | string | undefined
   /**
    * REQUIRED schema restricting which model fields are allowed in `.append()`
    * input AND which fields are written into the current-item SET clause.
@@ -100,6 +100,25 @@ export type TimeSeriesConfig<TAppendInput extends Schema.Top = Schema.Top> = {
   readonly appendInput: TAppendInput
 }
 
+/**
+ * Auto-generated UUID primary-key configuration.
+ *
+ * When set, `put` / `create` / `upsert` fill the named field with a freshly
+ * generated UUID at write time **when the caller omits it** — a caller-supplied
+ * value is always respected. The id is sourced from the bundled `Crypto`
+ * service (`DynamoClient.make` provides a default; override via
+ * `DynamoClient.make({ crypto })`), so bound operations keep `R = never`.
+ *
+ * The `field` MUST exist in the model AND participate in the `primaryKey`
+ * (pk or sk composite). Violations throw EDD-9008 at `make()` time.
+ *
+ * - `version` — `"v4"` (default, random) or `"v7"` (time-ordered).
+ */
+export type GeneratedIdConfig = {
+  readonly field: string
+  readonly version?: "v4" | "v7" | undefined
+}
+
 /** An array of model field names that together form a unique constraint. */
 export type UniqueFieldsDef = ReadonlyArray<string>
 
@@ -109,7 +128,7 @@ export type UniqueFieldsDef = ReadonlyArray<string>
  */
 export type UniqueConstraintDef =
   | UniqueFieldsDef
-  | { readonly fields: UniqueFieldsDef; readonly ttl?: Duration.Duration | undefined }
+  | { readonly fields: UniqueFieldsDef; readonly ttl?: Duration.Duration | string | undefined }
 
 /**
  * Map of named unique constraints. Each key is the constraint name,

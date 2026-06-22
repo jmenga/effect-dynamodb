@@ -10,14 +10,10 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import { type Context, Effect, type Optic, Schema, SchemaAST } from "effect"
-import * as Batch from "./Batch.js"
-import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
-import type { DynamoEncoding } from "./DynamoModel.js"
-import * as DynamoModel from "./DynamoModel.js"
-import type * as DynamoSchemaModule from "./DynamoSchema.js"
-import { composeCollectionKey, composeKey } from "./DynamoSchema.js"
-import type { EntityGet } from "./Entity.js"
+import type { DynamoEncoding } from "@effect-dynamodb/schema/DynamoModel.js"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
+import type * as DynamoSchemaModule from "@effect-dynamodb/schema/DynamoSchema.js"
+import { composeCollectionKey, composeKey } from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   AggregateAssemblyError,
   type AggregateDecompositionError,
@@ -26,13 +22,24 @@ import {
   RefNotFound,
   TransactionCancelled,
   ValidationError,
-} from "./Errors.js"
-import { buildDateTransform, validateNoTransformOverride } from "./internal/EntitySchemas.js"
-import * as KeyComposer from "./KeyComposer.js"
+} from "@effect-dynamodb/schema/Errors.js"
+import {
+  buildDateTransform,
+  validateNoTransformOverride,
+} from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
+import { type Context, Effect, type Optic, Schema, SchemaAST } from "effect"
+import * as Batch from "./Batch.js"
+import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
+import type { EntityGet } from "./Entity.js"
 import { fromAttributeMap, toAttributeMap, toAttributeValue } from "./Marshaller.js"
 import type { Table, TableConfig } from "./Table.js"
 
-export type { Cursor, DiscriminatorConfig, UpdateContext } from "./internal/AggregateCursor.js"
+export type {
+  Cursor,
+  DiscriminatorConfig,
+  UpdateContext,
+} from "@effect-dynamodb/schema/internal/AggregateCursor.js"
 // Internal modules (decomposed from Aggregate.ts)
 export {
   type AggregateEdge,
@@ -47,7 +54,7 @@ export {
   type RefEdge,
   type RefEntity,
   ref,
-} from "./internal/AggregateEdges.js"
+} from "@effect-dynamodb/schema/internal/AggregateEdges.js"
 export {
   type DerivedAggregateSchemas,
   deriveAggregateSchemas,
@@ -58,7 +65,7 @@ export {
   isFieldOptional,
   isSchemaMatchingEntity,
   unwrapModel,
-} from "./internal/AggregateSchemas.js"
+} from "@effect-dynamodb/schema/internal/AggregateSchemas.js"
 export type {
   AggregateInputType,
   BoundSubAggregate,
@@ -67,20 +74,23 @@ export type {
   SubAggregate,
   Type,
   UpdateFn,
-} from "./internal/AggregateTypes.js"
+} from "@effect-dynamodb/schema/internal/AggregateTypes.js"
 
 import {
   type DiscriminatorConfig,
   makeCursor,
   type UpdateContext,
-} from "./internal/AggregateCursor.js"
-import type { AggregateEdge, RefEntity } from "./internal/AggregateEdges.js"
-import { deriveAggregateSchemas, deriveEntityFieldName } from "./internal/AggregateSchemas.js"
+} from "@effect-dynamodb/schema/internal/AggregateCursor.js"
+import type { AggregateEdge, RefEntity } from "@effect-dynamodb/schema/internal/AggregateEdges.js"
+import {
+  deriveAggregateSchemas,
+  deriveEntityFieldName,
+} from "@effect-dynamodb/schema/internal/AggregateSchemas.js"
 import type {
   AggregateInputType,
   BoundSubAggregate,
   SubAggregate,
-} from "./internal/AggregateTypes.js"
+} from "@effect-dynamodb/schema/internal/AggregateTypes.js"
 
 // ---------------------------------------------------------------------------
 // TypeId

@@ -22,10 +22,10 @@ import { Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import { DynamoClient } from "../src/DynamoClient.js"
-import * as DynamoSchema from "../src/DynamoSchema.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
-import * as Projection from "../src/Projection.js"
+import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import * as Table from "../src/Table.js"
 
 // ---------------------------------------------------------------------------

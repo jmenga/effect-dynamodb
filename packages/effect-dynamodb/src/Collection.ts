@@ -8,11 +8,11 @@
  * Collections are built from Entity index definitions that share a `collection` name.
  */
 
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, type Schema } from "effect"
-import * as DynamoSchema from "./DynamoSchema.js"
-import { ValidationError } from "./Errors.js"
-import type { IndexDefinition } from "./KeyComposer.js"
-import * as KeyComposer from "./KeyComposer.js"
 import * as Query from "./Query.js"
 import type { TableConfig } from "./Table.js"
 
@@ -34,7 +34,10 @@ interface CollectionEntity {
   }
   readonly _decodeRecord: (
     raw: globalThis.Record<string, unknown>,
-  ) => import("effect").Effect.Effect<any, import("./Errors.js").ValidationError>
+  ) => import("effect").Effect.Effect<
+    any,
+    import("@effect-dynamodb/schema/Errors.js").ValidationError
+  >
 }
 
 // ---------------------------------------------------------------------------
@@ -103,7 +106,9 @@ export const make = <
   let sharedPkField: string | undefined
   let sharedSkField: string | undefined
   let sharedDynamoIndexName: string | undefined
-  let sharedSchema: ReturnType<typeof import("./DynamoSchema.js").make> | undefined
+  let sharedSchema:
+    | ReturnType<typeof import("@effect-dynamodb/schema/DynamoSchema.js").make>
+    | undefined
 
   let collectionType: "isolated" | "clustered" = "isolated"
 

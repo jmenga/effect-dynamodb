@@ -9,10 +9,10 @@
  */
 
 import type { DescribeTableCommandOutput } from "@aws-sdk/client-dynamodb"
+import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import { type Config, Context, Effect, Layer } from "effect"
 import type { DynamoClientError } from "./DynamoClient.js"
-import type * as DynamoSchema from "./DynamoSchema.js"
-import type { IndexDefinition } from "./KeyComposer.js"
 
 /** Runtime table configuration injected via Effect Layer. */
 export interface TableConfig {

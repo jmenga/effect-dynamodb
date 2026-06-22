@@ -1,6 +1,6 @@
 {
   "name": "effect-dynamodb",
-  "version": "1.8.2",
+  "version": "1.9.0",
   "description": "Effect TS ORM for DynamoDB — schema-driven entity modeling, single-table design, composite keys, transactions, and Stream-based pagination",
   "type": "module",
   "license": "MIT",
@@ -50,21 +50,22 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:connected": "vitest run --config vitest.connected.ts",
-    "check": "tsc --noEmit && tsc --noEmit -p tsconfig.examples.json",
+    "check": "tsc --noEmit && tsc --noEmit -p tsconfig.examples.json && tsc --noEmit -p tsconfig.test.json",
     "lint": "biome check .",
     "lint:fix": "biome check --write ."
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.700.0",
-    "@aws-sdk/util-dynamodb": "^3.700.0"
+    "@aws-sdk/util-dynamodb": "^3.700.0",
+    "@effect-dynamodb/schema": "workspace:^"
   },
   "peerDependencies": {
-    "effect": "^4.0.0-beta.74"
+    "effect": "^4.0.0-beta.85"
   },
   "devDependencies": {
-    "@effect/vitest": "4.0.0-beta.74",
+    "@effect/vitest": "4.0.0-beta.85",
     "@types/node": "^25.5.0",
-    "effect": "4.0.0-beta.74",
+    "effect": "4.0.0-beta.85",
     "typescript": "^5.7.0",
     "vitest": "^4.1.0"
   }

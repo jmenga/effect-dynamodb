@@ -1,11 +1,22 @@
 import { describe, expect, it } from "@effect/vitest"
 import { DateTime, Duration, Effect, Layer, Schema } from "effect"
+import { TestClock } from "effect/testing"
+
+/**
+ * Fixed instant used by timestamp-encoding tests. `it.effect` runs under a
+ * `TestClock` frozen at epoch 0; advancing it to a known instant makes the
+ * library's `DateTime.now`-backed timestamps deterministic and exactly
+ * assertable (2024-06-01T00:00:00.000Z).
+ */
+const FROZEN_MS = 1_717_200_000_000
+const FROZEN_SECONDS = 1_717_200_000
+
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { DynamoError, type TransactionOverflow } from "@effect-dynamodb/schema/Errors.js"
 import { beforeEach, vi } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
-import * as DynamoModel from "../src/DynamoModel.js"
-import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import { DynamoError, type TransactionOverflow } from "../src/Errors.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
@@ -5568,6 +5579,7 @@ describe("Entity", () => {
           }),
         )
 
+        yield* TestClock.adjust(Duration.millis(FROZEN_MS))
         mockPutItem.mockResolvedValue({})
         yield* MetricEntity.put({ metricId: "m-1", value: 42 }).asEffect()
         const call = mockPutItem.mock.calls[0]![0]
@@ -5575,11 +5587,11 @@ describe("Entity", () => {
         // createdAt: DynamoModel.DateString → stored as ISO string
         expect(item.createdAt.S).toBeDefined()
         expect(typeof item.createdAt.S).toBe("string")
-        // updatedAt: storedAs(DateEpochSeconds) → stored as epoch seconds number
+        // updatedAt: storedAs(DateEpochSeconds) → stored as epoch seconds number.
+        // Clock-backed timestamp is deterministic under TestClock → exact value.
         expect(item.updatedAt.N).toBeDefined()
         const epochVal = Number(item.updatedAt.N)
-        expect(epochVal).toBeGreaterThan(1700000000) // reasonable epoch seconds
-        expect(epochVal).toBeLessThan(2000000000)
+        expect(epochVal).toBe(FROZEN_SECONDS)
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -5630,15 +5642,17 @@ describe("Entity", () => {
           }),
         )
 
+        yield* TestClock.adjust(Duration.millis(FROZEN_MS))
         mockPutItem.mockResolvedValue({})
         yield* MetricEntity.put({ metricId: "m-1", value: 42 }).asEffect()
         const call = mockPutItem.mock.calls[0]![0]
         const item = call.Item
-        // updatedAt uses custom name "modifiedAt" and epoch seconds
+        // updatedAt uses custom name "modifiedAt" and epoch seconds — Clock-backed
+        // timestamp is deterministic under TestClock → exact value.
         expect(item.modifiedAt.N).toBeDefined()
         expect(item.updatedAt).toBeUndefined()
         const epochVal = Number(item.modifiedAt.N)
-        expect(epochVal).toBeGreaterThan(1700000000)
+        expect(epochVal).toBe(FROZEN_SECONDS)
       }).pipe(Effect.provide(TestLayer)),
     )
   })
@@ -7677,13 +7691,15 @@ describe("Entity", () => {
 
     it.effect("put: library-generated timestamp respects model field encoding", () =>
       Effect.gen(function* () {
+        yield* TestClock.adjust(Duration.millis(FROZEN_MS))
         mockPutItem.mockResolvedValue({})
         yield* EpochDocEntity.put({ id: "e-1" }).asEffect()
         const item = mockPutItem.mock.calls[0]![0].Item
         // createdAt stored as epoch-seconds number (not ISO string) because the
-        // model field declares DateEpochSeconds storage.
+        // model field declares DateEpochSeconds storage. Clock-backed timestamp
+        // is deterministic under TestClock → exact value.
         expect(item.createdAt.N).toBeTypeOf("string")
-        expect(Number.parseInt(item.createdAt.N as string, 10)).toBeGreaterThan(1_700_000_000)
+        expect(Number.parseInt(item.createdAt.N as string, 10)).toBe(FROZEN_SECONDS)
       }).pipe(Effect.provide(TestLayer)),
     )
 

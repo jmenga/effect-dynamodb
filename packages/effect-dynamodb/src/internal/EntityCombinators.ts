@@ -5,8 +5,8 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import type { CascadePartialFailure } from "@effect-dynamodb/schema/Errors.js"
 import { type Effect, Function as Fn } from "effect"
-import type { CascadePartialFailure } from "../Errors.js"
 import type { ConditionInput } from "../Expression.js"
 import {
   type CascadeConfig,

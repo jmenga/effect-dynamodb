@@ -9,11 +9,11 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import { DynamoError, type ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import type { Entity, EntityDelete, EntityGet, EntityPut } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
-import { DynamoError, type ValidationError } from "./Errors.js"
 import {
   composePrimaryKey,
   resolveTableNames,

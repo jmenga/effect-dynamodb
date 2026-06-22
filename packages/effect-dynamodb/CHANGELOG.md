@@ -1,5 +1,28 @@
 # effect-dynamodb
 
+## 1.9.0
+
+### Minor Changes
+
+- d6bacd7: feat: Clock-backed timestamps/TTL via DateTime.now; wire unique.ttl; accept Duration|string for all TTL configs (closes #56, closes #58).
+  - All write-path timestamps and TTLs now derive from the Clock-backed `DateTime.now` instead of `Date.now()`/`new Date()`, making them deterministic under `TestClock` (`R` stays `never` — Clock is an ambient default service). The two duplicate timestamp generators are unified into one shared helper.
+  - `unique` constraints now honour `ttl` — when set, the unique sentinel item carries the configured TTL attribute and auto-expires (time-bounded uniqueness reservation). Previously the `ttl` field was typed but never consumed.
+  - Every framework TTL config (`versioned.ttl`, `softDelete.ttl`, `timeSeries.ttl`, `unique[].ttl`) now accepts a humanized string (e.g. `"7 days"`) as well as a `Duration`. A bare `number` is rejected at the type level (it would be interpreted as milliseconds), and infinite/unparseable durations fail at `Entity.make()` with **EDD-9005**.
+
+- 6b62366: feat: auto-generated UUID primary keys via Entity.make({ generatedId }) sourced from the Crypto service; R stays never (closes #57)
+- 0e56c83: feat: split pure schema/relationship-derivation layer into the new @effect-dynamodb/schema package (importable without @aws-sdk); effect-dynamodb re-exports it, non-breaking (closes #62).
+  - New `@effect-dynamodb/schema` package owns the AWS-free core: `DynamoModel`, `DynamoSchema`, `KeyComposer`, the tagged `Errors`, `Projection`, the entity/aggregate derivation internals, and pure `Entity.make` / `Aggregate.make` definition builders carrying the derived `inputSchema` / `updateSchema` / `createSchema`. It has ZERO `@aws-sdk` dependency in both its runtime import graph and its emitted `.d.ts` surface — guarded by an automated test.
+  - `effect-dynamodb` depends on and re-exports the entire public surface of `@effect-dynamodb/schema`, then adds the AWS runtime (DynamoClient, CRUD/query operations, Batch/Transaction/Collection, Marshaller). Existing consumers (and `@effect-dynamodb/geo`) are unaffected — every import keeps working unchanged.
+  - Consumers who only need an entity/aggregate's derived schemas (e.g. HttpApi payloads, validation) can now `import { Entity, Aggregate, DynamoModel, DynamoSchema } from "@effect-dynamodb/schema"` without pulling `@aws-sdk/*` into their dependency graph or type surface.
+
+### Patch Changes
+
+- ce36573: chore: harden Effect Schema AST access with typed SchemaAST guards in entity/aggregate derivation (closes #55)
+- 3d4889a: fix: Aggregate inputSchema/updateSchema preserve branded identifier types on flattened edge refs (closes #61).
+- e0cf0ad: chore(deps): upgrade Effect v4 beta.74 → beta.85. No source changes — type-check, unit, lint all green; no breaking upstream changes affect this codebase.
+- Updated dependencies [0e56c83]
+  - @effect-dynamodb/schema@1.9.0
+
 ## 1.8.2
 
 ### Patch Changes

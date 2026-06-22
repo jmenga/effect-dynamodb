@@ -15,13 +15,13 @@
  */
 
 import { describe, expect, it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { DateTime, Effect, Layer, Schema } from "effect"
 import { vi } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
-import * as DynamoModel from "../src/DynamoModel.js"
-import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import { DynamoError, ValidationError } from "../src/Errors.js"
 import { decodeSparseFields, encodeSparseFields } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 

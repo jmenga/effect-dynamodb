@@ -9,13 +9,13 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import { Effect, Function, Option, Pipeable, Stream } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
-import type { ValidationError } from "./Errors.js"
 import { compileExpr, type Expr } from "./internal/Expr.js"
 import { compilePath } from "./internal/PathBuilder.js"
 import { fromAttributeMap, toAttributeValue } from "./Marshaller.js"
-import * as Projection from "./Projection.js"
 
 // ---------------------------------------------------------------------------
 // Sort key condition types

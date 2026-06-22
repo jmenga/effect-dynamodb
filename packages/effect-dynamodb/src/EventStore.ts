@@ -12,16 +12,16 @@
  * DynamoClient, Marshaller).
  */
 
-import { Effect, Function, Schema } from "effect"
-import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
-import * as DynamoSchema from "./DynamoSchema.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   isAwsTransactionCancelled,
   TransactionCancelled,
   ValidationError,
   VersionConflict,
-} from "./Errors.js"
-import * as KeyComposer from "./KeyComposer.js"
+} from "@effect-dynamodb/schema/Errors.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
+import { DateTime, Effect, Function, Schema } from "effect"
+import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import { toAttributeMap } from "./Marshaller.js"
 import * as Query from "./Query.js"
 import type { Table, TableConfig } from "./Table.js"
@@ -260,7 +260,8 @@ export const makeStream = <
       const { name: tableName } = yield* config.table.Tag
 
       const pk = composeStreamPk(streamId as Record<string, unknown>)
-      const now = new Date().toISOString()
+      // Clock-backed timestamp (deterministic under TestClock; wall-clock in prod).
+      const now = DateTime.formatIso(yield* DateTime.now)
 
       // Resolve stream ID string for storage (join composites)
       const streamIdStr = compositeFields

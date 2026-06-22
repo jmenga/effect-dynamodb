@@ -14,8 +14,8 @@
 import { Console, Effect, Layer, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
-import * as DynamoModel from "../src/DynamoModel.js"
-import * as DynamoSchema from "../src/DynamoSchema.js"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
 

@@ -5,10 +5,7 @@ import { beforeEach, vi } from "vitest"
 const configFromMap = (entries: Record<string, string>) =>
   ConfigProvider.layer(ConfigProvider.fromUnknown(entries))
 
-import * as Aggregate from "../src/Aggregate.js"
-import { DynamoClient } from "../src/DynamoClient.js"
-import * as DynamoSchema from "../src/DynamoSchema.js"
-import * as Entity from "../src/Entity.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   DynamoError,
   DynamoValidationError,
@@ -19,7 +16,10 @@ import {
   isAwsValidationError,
   ResourceNotFoundError,
   ThrottlingError,
-} from "../src/Errors.js"
+} from "@effect-dynamodb/schema/Errors.js"
+import * as Aggregate from "../src/Aggregate.js"
+import { DynamoClient } from "../src/DynamoClient.js"
+import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
 
 // Create a mock DynamoClient layer for testing

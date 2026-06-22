@@ -5,27 +5,38 @@
  * and put-item construction (validation + key composition + system fields).
  */
 
-import { Effect, Schema } from "effect"
-import type { DynamoEncoding } from "../DynamoModel.js"
+import type { DynamoEncoding } from "@effect-dynamodb/schema/DynamoModel.js"
+import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
+import { DateTime, Effect, Schema } from "effect"
 import type { Entity } from "../Entity.js"
-import { ValidationError } from "../Errors.js"
-import * as KeyComposer from "../KeyComposer.js"
 import { toAttributeMap } from "../Marshaller.js"
 
 /**
- * Generate a wire-form timestamp value for the configured encoding.
- * No-encoding default: ISO string. Custom encoding: serialized primitive.
+ * Generate a wire-form timestamp value for the configured encoding from a
+ * Clock-backed `now: DateTime.Utc` (resolved by the caller via `yield*
+ * DateTime.now`). No-encoding default: ISO string. Custom encoding: serialized
+ * primitive. Contains no `Date` constructor, so it is deterministic under
+ * `TestClock`.
+ *
+ * Shared by the Entity write path (`Entity.generateTimestamp`) and the
+ * Batch/Transaction path so both produce identical timestamps.
  */
-const generateTimestampPrimitive = (encoding: DynamoEncoding | null): string | number => {
-  if (!encoding) return new Date().toISOString()
-  const now = Date.now()
+export const generateTimestampPrimitive = (
+  now: DateTime.Utc,
+  encoding: DynamoEncoding | null,
+): string | number => {
+  if (!encoding) return DateTime.formatIso(now)
+  const ms = DateTime.toEpochMillis(now)
   switch (encoding.storage) {
     case "string":
-      return new Date(now).toISOString()
+      // System timestamps generated here are UTC; DateTime.Zoned-typed
+      // collision fields are rare and were not previously special-cased.
+      return DateTime.formatIso(now)
     case "epochMs":
-      return now
+      return ms
     case "epochSeconds":
-      return Math.floor(now / 1000)
+      return Math.floor(ms / 1000)
   }
 }
 
@@ -76,6 +87,9 @@ export const validateAndBuildPutItem = (
   ValidationError
 > =>
   Effect.gen(function* () {
+    // Clock-backed time source resolved once per op; threaded into the sync
+    // timestamp builder so the value is deterministic under `TestClock`.
+    const now = yield* DateTime.now
     const inputSchema = entity.schemas.inputSchema as Schema.Codec<any>
     // Encode → fall back to decode-then-encode (mirrors Entity.put).
     const encoded = yield* Schema.encodeUnknownEffect(inputSchema)(input).pipe(
@@ -113,12 +127,12 @@ export const validateAndBuildPutItem = (
     const sf = entity.systemFields
     if (sf.createdAt) {
       if (item[sf.createdAt] === undefined) {
-        item[sf.createdAt] = generateTimestampPrimitive(sf.createdAtEncoding)
+        item[sf.createdAt] = generateTimestampPrimitive(now, sf.createdAtEncoding)
       }
     }
     if (sf.updatedAt) {
       if (item[sf.updatedAt] === undefined) {
-        item[sf.updatedAt] = generateTimestampPrimitive(sf.updatedAtEncoding)
+        item[sf.updatedAt] = generateTimestampPrimitive(now, sf.updatedAtEncoding)
       }
     }
     if (sf.version) item[sf.version] = 1

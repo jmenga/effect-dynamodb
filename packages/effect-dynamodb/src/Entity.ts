@@ -8,8 +8,6 @@
  */
 
 import type { AttributeValue, DeleteItemCommandInput } from "@aws-sdk/client-dynamodb"
-import { DateTime, Duration, Effect, Option, Schema, SchemaAST, Stream } from "effect"
-import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import {
   type ConfiguredModel,
   type DynamoEncoding,
@@ -23,8 +21,8 @@ import {
   isRef,
   isRefField,
   type SparseConfig,
-} from "./DynamoModel.js"
-import * as DynamoSchema from "./DynamoSchema.js"
+} from "@effect-dynamodb/schema/DynamoModel.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   CascadePartialFailure,
   ConditionalCheckFailed,
@@ -38,7 +36,23 @@ import {
   TransactionOverflow,
   UniqueConstraintViolation,
   ValidationError,
-} from "./Errors.js"
+} from "@effect-dynamodb/schema/Errors.js"
+import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
+import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
+import { normalizeGsiConfig } from "@effect-dynamodb/schema/KeyComposer.js"
+import {
+  Context,
+  Crypto,
+  DateTime,
+  type Duration,
+  Effect,
+  Option,
+  Schema,
+  SchemaAST,
+  Stream,
+} from "effect"
+import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import type { ConditionInput } from "./Expression.js"
 import {
   makeBoundAppend,
@@ -56,9 +70,7 @@ import {
   parseSimpleShorthand,
 } from "./internal/Expr.js"
 import { compilePath, createPathBuilder } from "./internal/PathBuilder.js"
-import type { GsiConfig, IndexDefinition, KeyPart } from "./KeyComposer.js"
-import * as KeyComposer from "./KeyComposer.js"
-import { normalizeGsiConfig } from "./KeyComposer.js"
+import { generateTimestampPrimitive } from "./internal/TransactableOps.js"
 import {
   decodeSparseFields,
   encodeSparseFields,
@@ -73,6 +85,7 @@ import { resolveTtlAttributeName, type TableConfig } from "./Table.js"
 // Internal modules (decomposed from Entity.ts)
 export type {
   CascadeIndexConfig,
+  GeneratedIdConfig,
   RefValue,
   SoftDeleteConfig,
   TimeSeriesConfig,
@@ -82,7 +95,7 @@ export type {
   UniqueConstraintDef,
   UniqueFieldsDef,
   VersionedConfig,
-} from "./internal/EntityConfig.js"
+} from "@effect-dynamodb/schema/internal/EntityConfig.js"
 export {
   type CascadeConfig,
   type CascadeTarget,
@@ -107,6 +120,7 @@ export {
   type UpdateState,
 } from "./internal/EntityOps.js"
 
+import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import {
   type CascadeConfig,
   type CascadeTarget,
@@ -127,7 +141,6 @@ import {
   returnValuesMap,
   type UpdateState,
 } from "./internal/EntityOps.js"
-import * as Projection from "./Projection.js"
 
 export {
   add,
@@ -157,21 +170,22 @@ export {
   subtract,
 } from "./internal/EntityCombinators.js"
 
-import {
-  asModel,
-  condition as conditionCombinator,
-  expectedVersion,
-  set,
-} from "./internal/EntityCombinators.js"
 import type {
   CascadeIndexConfig,
+  GeneratedIdConfig,
   SoftDeleteConfig,
   TimeSeriesConfig,
   TimestampsConfig,
   UniqueConfig,
   UniqueConstraintDef,
   VersionedConfig,
-} from "./internal/EntityConfig.js"
+} from "@effect-dynamodb/schema/internal/EntityConfig.js"
+import {
+  asModel,
+  condition as conditionCombinator,
+  expectedVersion,
+  set,
+} from "./internal/EntityCombinators.js"
 
 /** A ref config object: the entity and optional cascade index config. */
 interface AnyRefValue {
@@ -186,12 +200,13 @@ import {
   buildFieldEncodings,
   type DerivedSchemas,
   getFields,
+  getSchemaFields,
   primaryKeyComposites,
   type ResolvedSystemFields,
   resolveSystemFields,
   resolveUniqueFields,
   validateNoTransformOverride,
-} from "./internal/EntitySchemas.js"
+} from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import type {
   AppendInputType,
   AppendSuccess as AppendSuccessType,
@@ -206,7 +221,8 @@ import type {
   ModelType,
   PrimaryKeyComposites,
   RefErrors,
-} from "./internal/EntityTypes.js"
+  WithGeneratedId,
+} from "@effect-dynamodb/schema/internal/EntityTypes.js"
 
 // ---------------------------------------------------------------------------
 // Re-export KeyComposer types for convenience
@@ -231,6 +247,15 @@ export type { IndexDefinition, KeyPart }
  * falls back from the domain field name to the renamed DB column name, since
  * `currentRaw` (read from DynamoDB) carries DB names rather than domain names.
  */
+/**
+ * TTL helpers — pure implementations live in `@effect-dynamodb/schema/Entity`,
+ * imported here for local use on the write path. `normalizeTtlSeconds` is
+ * re-exported below so the public `Entity` namespace surface is unchanged.
+ */
+import { normalizeTtlSeconds, resolveUniqueTtl } from "@effect-dynamodb/schema/Entity.js"
+
+export { normalizeTtlSeconds }
+
 const composeUniqueSentinel = (
   schema: DynamoSchema.DynamoSchema,
   entityType: string,
@@ -347,6 +372,7 @@ export interface Entity<
   TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
   TIdentifier extends string | undefined = undefined,
   TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
+  TGeneratedId extends GeneratedIdConfig | undefined = undefined,
 > {
   readonly _tag: "Entity"
   readonly model: TModel
@@ -358,6 +384,7 @@ export interface Entity<
   readonly unique: TUnique
   readonly identifier: TIdentifier
   readonly timeSeries: TTimeSeries
+  readonly generatedId: TGeneratedId
 
   /** @internal Resolved ref metadata — used by cascade to inspect target entities */
   readonly _resolvedRefs: ReadonlyArray<{
@@ -463,7 +490,10 @@ export interface Entity<
 
   /** Create or replace an item. Returns a lazy {@link EntityPut} intermediate. */
   readonly put: (
-    input: EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+    input: WithGeneratedId<
+      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+      TGeneratedId
+    >,
   ) => EntityPut<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
@@ -500,7 +530,10 @@ export interface Entity<
    * primary key already exists. Equivalent to `put(input)` with an `attribute_not_exists` condition.
    */
   readonly create: (
-    input: EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+    input: WithGeneratedId<
+      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+      TGeneratedId
+    >,
   ) => EntityPut<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
@@ -552,7 +585,10 @@ export interface Entity<
    * Does NOT support unique constraints or retain (cannot determine if item existed).
    */
   readonly upsert: (
-    input: EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+    input: WithGeneratedId<
+      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+      TGeneratedId
+    >,
   ) => EntityPut<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
@@ -833,6 +869,7 @@ export interface BoundEntity<
   TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   TTimestamps extends TimestampsConfig | undefined = undefined,
   TVersioned extends VersionedConfig | undefined = undefined,
+  TGeneratedId extends GeneratedIdConfig | undefined = undefined,
 > {
   // --- CRUD Operations ---
 
@@ -851,7 +888,10 @@ export interface BoundEntity<
    * ```
    */
   readonly put: (
-    input: EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+    input: WithGeneratedId<
+      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+      TGeneratedId
+    >,
   ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
     ModelType<TModel>,
@@ -863,7 +903,10 @@ export interface BoundEntity<
    * primary key already exists. Returns a fluent {@link BoundPut}.
    */
   readonly create: (
-    input: EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+    input: WithGeneratedId<
+      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+      TGeneratedId
+    >,
   ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
     ModelType<TModel>,
@@ -919,7 +962,10 @@ export interface BoundEntity<
    * createdAt so they're only set on first creation.
    */
   readonly upsert: (
-    input: EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+    input: WithGeneratedId<
+      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+      TGeneratedId
+    >,
   ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
     ModelType<TModel>,
@@ -1272,6 +1318,7 @@ export const make = <
   const TUnique extends UniqueConfig | undefined = undefined,
   const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
   const TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
+  const TGeneratedId extends GeneratedIdConfig | undefined = undefined,
   const TAttrs extends {} = {},
 >(config: {
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
@@ -1284,6 +1331,7 @@ export const make = <
   readonly unique?: TUnique
   readonly refs?: TRefs
   readonly timeSeries?: TTimeSeries
+  readonly generatedId?: TGeneratedId
 }): Entity<
   TModel,
   TEntityType,
@@ -1294,7 +1342,8 @@ export const make = <
   TUnique,
   TRefs,
   ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
-  TTimeSeries
+  TTimeSeries,
+  TGeneratedId
 > => {
   // Normalize GSI configs to internal IndexDefinition format
   const gsiIndexes: globalThis.Record<string, IndexDefinition> = {}
@@ -1325,6 +1374,7 @@ const makeImpl = <
   const TUnique extends UniqueConfig | undefined = undefined,
   const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
   const TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
+  const TGeneratedId extends GeneratedIdConfig | undefined = undefined,
   const TAttrs extends {} = {},
 >(config: {
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
@@ -1336,6 +1386,7 @@ const makeImpl = <
   readonly unique?: TUnique
   readonly refs?: TRefs
   readonly timeSeries?: TTimeSeries
+  readonly generatedId?: TGeneratedId
 }): Entity<
   TModel,
   TEntityType,
@@ -1346,7 +1397,8 @@ const makeImpl = <
   TUnique,
   TRefs,
   ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
-  TTimeSeries
+  TTimeSeries,
+  TGeneratedId
 > => {
   // Unwrap ConfiguredModel to get the raw model and attribute overrides
   const configured = isConfiguredModel(config.model) ? config.model : undefined
@@ -1570,9 +1622,8 @@ const makeImpl = <
 
     const appendInputFields = (() => {
       const ai = ts.appendInput as Schema.Top
-      if ("fields" in ai && typeof (ai as any).fields === "object") {
-        return Object.keys((ai as any).fields)
-      }
+      const fields = getSchemaFields(ai)
+      if (fields) return Object.keys(fields)
       throw new Error(
         `[EDD-9016] Entity "${config.entityType}": timeSeries.appendInput must be a Schema.Struct or Schema.Class (.fields required).`,
       )
@@ -1617,6 +1668,37 @@ const makeImpl = <
           )
         }
       }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Validate generatedId config (EDD-9008)
+  // ---------------------------------------------------------------------------
+  // The named field is auto-filled with a UUID at write time when omitted. It
+  // MUST exist in the model AND participate in the primary key (pk or sk
+  // composite) — generating an id that doesn't address the item would be a
+  // silent no-op. Mirrors the timeSeries.orderBy validation style.
+  if (config.generatedId !== undefined && config.generatedId !== null) {
+    const gid = config.generatedId as GeneratedIdConfig
+    const field = gid.field
+
+    // EDD-9008: field must name a model field
+    if (!(field in modelFields)) {
+      throw new Error(
+        `[EDD-9008] Entity "${config.entityType}": generatedId.field "${field}" does not name a model field. ` +
+          `Valid model fields: ${Object.keys(modelFields).sort().join(", ")}`,
+      )
+    }
+
+    // EDD-9008: field must participate in the primary key (pk or sk composite)
+    const primary = config.indexes.primary
+    const pkSkComposites = new Set([...primary.pk.composite, ...primary.sk.composite])
+    if (!pkSkComposites.has(field)) {
+      throw new Error(
+        `[EDD-9008] Entity "${config.entityType}": generatedId.field "${field}" must participate in the ` +
+          `primary key (pk or sk composite). An auto-generated id that does not compose into the primary ` +
+          `key cannot address the item. Primary-key composites: ${[...pkSkComposites].sort().join(", ")}`,
+      )
     }
   }
 
@@ -1715,6 +1797,15 @@ const makeImpl = <
   // wire primitive when the field is library-managed.
   const fieldEncodings = buildFieldEncodings(modelFields, configuredAttributes)
 
+  const generatedIdField =
+    config.generatedId !== undefined && config.generatedId !== null
+      ? (config.generatedId as GeneratedIdConfig).field
+      : undefined
+  const generatedIdVersion =
+    config.generatedId !== undefined && config.generatedId !== null
+      ? ((config.generatedId as GeneratedIdConfig).version ?? "v4")
+      : undefined
+
   const schemas = buildDerivedSchemas(
     modelFields,
     allIndexes,
@@ -1724,6 +1815,7 @@ const makeImpl = <
     resolvedIdentifier,
     config.timeSeries,
     fieldEncodings,
+    generatedIdField,
   )
   // schema and tableTag are injected via _configure() when the entity is registered
   // on a Table and bound through DynamoClient.make(). They are captured by operation
@@ -1818,6 +1910,28 @@ const makeImpl = <
     }
   }
 
+  // EDD-9005: validate every configured TTL eagerly at make() time. Rejects
+  // non-finite (infinite) durations and unparseable string forms here so the
+  // write path never observes an invalid TTL (it would otherwise surface as a
+  // defect mid-write). Bare numbers are rejected at the type level (footgun).
+  {
+    const configuredTtls: Array<Duration.Duration | string> = []
+    if (typeof config.versioned === "object" && config.versioned?.ttl !== undefined) {
+      configuredTtls.push(config.versioned.ttl)
+    }
+    if (typeof config.softDelete === "object" && config.softDelete?.ttl !== undefined) {
+      configuredTtls.push(config.softDelete.ttl)
+    }
+    if (config.timeSeries?.ttl !== undefined) configuredTtls.push(config.timeSeries.ttl)
+    if (config.unique) {
+      for (const def of Object.values(config.unique)) {
+        const uTtl = resolveUniqueTtl(def)
+        if (uTtl !== undefined) configuredTtls.push(uTtl)
+      }
+    }
+    for (const ttl of configuredTtls) normalizeTtlSeconds(ttl)
+  }
+
   // ---------------------------------------------------------------------------
   // Field renaming: domain name → DynamoDB attribute name (from ConfiguredModel)
   // ---------------------------------------------------------------------------
@@ -1897,6 +2011,35 @@ const makeImpl = <
   const composeAllKeys = (record: globalThis.Record<string, unknown>) =>
     KeyComposer.composeAllKeys(schema, entityType, entityVersion, allIndexes, record)
 
+  /**
+   * Fill the auto-generated id field on the raw `put` input when configured and
+   * absent. Sources a UUID from the bundled `Crypto` service. Caller-supplied
+   * values are respected (never overwritten). Returns the input unchanged when
+   * `generatedId` is not configured — entities without it never touch Crypto.
+   *
+   * `Crypto.Crypto` is provided from the context `DynamoClient.make` bundles,
+   * so the bound `put` stays `R = never` despite this yield.
+   */
+  const fillGeneratedId = (input: unknown): Effect.Effect<unknown, never, Crypto.Crypto> => {
+    if (!generatedIdField) return Effect.succeed(input)
+    if (typeof input !== "object" || input === null) return Effect.succeed(input)
+    const rec = input as globalThis.Record<string, unknown>
+    if (rec[generatedIdField] !== undefined && rec[generatedIdField] !== null) {
+      return Effect.succeed(input)
+    }
+    return Effect.gen(function* () {
+      const crypto = yield* Crypto.Crypto
+      const id =
+        generatedIdVersion === "v7" ? yield* crypto.randomUUIDv7 : yield* crypto.randomUUIDv4
+      return { ...rec, [generatedIdField]: id }
+    }).pipe(
+      // randomUUIDv4/v7 surface a PlatformError; the global Crypto wrapper never
+      // fails in practice, so collapse it to a defect rather than widening the
+      // put error channel.
+      Effect.orDie,
+    )
+  }
+
   /** Attach the model class prototype to a decoded plain object (when model is Schema.Class). */
   const attachPrototype = (decoded: any) =>
     isSchemaClass ? Object.assign(Object.create((rawModel as any).prototype), decoded) : decoded
@@ -1956,7 +2099,7 @@ const makeImpl = <
     )
   }
 
-  const nowIso = () => new Date().toISOString()
+  const nowIso = (now: DateTime.Utc) => DateTime.formatIso(now)
 
   /**
    * Generate a timestamp value as a wire primitive ready for marshalling.
@@ -1964,22 +2107,15 @@ const makeImpl = <
    *
    * Used for system fields whether colliding or not — the value is always a
    * wire primitive (string or number) ready for `toAttributeMap`.
+   *
+   * Time source is the Clock-backed `now: DateTime.Utc` resolved at the write
+   * op's entry (`yield* DateTime.now`) and threaded in — no `Date` constructor,
+   * so timestamps are deterministic under `TestClock`. Delegates to the shared
+   * {@link generateTimestampPrimitive} so the Batch/Transaction path produces
+   * identical output.
    */
-  const generateTimestamp = (encoding: DynamoEncoding | null): string | number => {
-    if (!encoding) return nowIso()
-    const now = Date.now()
-    switch (encoding.storage) {
-      case "string":
-        // For DateTime.Zoned this would need the extended ISO format, but
-        // system timestamps generated here are UTC — DateTime.Zoned-typed
-        // collision fields are rare and not previously special-cased either.
-        return new Date(now).toISOString()
-      case "epochMs":
-        return now
-      case "epochSeconds":
-        return Math.floor(now / 1000)
-    }
-  }
+  const generateTimestamp = (encoding: DynamoEncoding | null, now: DateTime.Utc): string | number =>
+    generateTimestampPrimitive(now, encoding)
 
   // ---------------------------------------------------------------------------
   // Lifecycle config helpers
@@ -1994,14 +2130,14 @@ const makeImpl = <
     config.softDelete === true ||
     (typeof config.softDelete === "object" && config.softDelete !== null)
 
-  const retainTtl = (): Duration.Duration | undefined => {
+  const retainTtl = (): Duration.Duration | string | undefined => {
     if (typeof config.versioned !== "object" || config.versioned === null) return undefined
-    return (config.versioned as { ttl?: Duration.Duration }).ttl
+    return (config.versioned as { ttl?: Duration.Duration | string }).ttl
   }
 
-  const softDeleteTtl = (): Duration.Duration | undefined => {
+  const softDeleteTtl = (): Duration.Duration | string | undefined => {
     if (typeof config.softDelete !== "object" || config.softDelete === null) return undefined
-    return (config.softDelete as { ttl?: Duration.Duration }).ttl
+    return (config.softDelete as { ttl?: Duration.Duration | string }).ttl
   }
 
   const preserveUnique = (): boolean => {
@@ -2033,6 +2169,7 @@ const makeImpl = <
     _tablePkField: string,
     tableSkField: string,
     ttlAttrName: string,
+    now: DateTime.Utc,
   ): globalThis.Record<string, unknown> => {
     const snapshot: globalThis.Record<string, unknown> = { ...item }
 
@@ -2047,7 +2184,8 @@ const makeImpl = <
     // Add optional TTL
     const ttl = retainTtl()
     if (ttl) {
-      snapshot[ttlAttrName] = Math.floor(Date.now() / 1000) + Duration.toSeconds(ttl)
+      snapshot[ttlAttrName] =
+        Math.floor(DateTime.toEpochMillis(now) / 1000) + normalizeTtlSeconds(ttl)
     }
 
     return snapshot
@@ -2360,6 +2498,15 @@ const makeImpl = <
           const tableName = tc.name
           const ttlAttrName = resolveTtlAttributeName(tc)
 
+          // Auto-generated id: fill the configured primary-key field with a
+          // fresh UUID BEFORE the encode, but only when the caller omitted it —
+          // a caller-supplied value is always respected. The id is sourced from
+          // the bundled Crypto service (`DynamoClient.make` provides a default),
+          // so this keeps the bound `put` at `R = never`. The filled id then
+          // flows through input validation → key composition → stored item →
+          // returned record in this same pass.
+          const inputWithGeneratedId = yield* fillGeneratedId(input)
+
           // Encode user input → wire form. Users typically construct domain
           // values for transforms (DateTime, Redacted, Number) and plain
           // objects for Schema.Class fields. To handle both:
@@ -2374,7 +2521,7 @@ const makeImpl = <
           //      the canonical wire shape.
           const encodedInput = yield* encodeOrDecodeEncode(
             schemas.inputSchema as Schema.Codec<any>,
-            input,
+            inputWithGeneratedId,
             entityType,
             "put",
           )
@@ -2391,6 +2538,11 @@ const makeImpl = <
           // Build the DynamoDB item — already in wire-format after encode
           const item: globalThis.Record<string, unknown> = { ...encoded }
 
+          // Clock-backed time source resolved once for this write op and
+          // threaded into every timestamp/TTL computation below — deterministic
+          // under `TestClock`, wall-clock in production.
+          const now = yield* DateTime.now
+
           // Add system fields. When a timestamp field collides with a
           // model-declared field, the user may have supplied their own value
           // (optional on collision in `inputSchema`). Respect their value if
@@ -2398,12 +2550,12 @@ const makeImpl = <
           // primitive directly.
           if (systemFields.createdAt) {
             if (item[systemFields.createdAt] === undefined) {
-              item[systemFields.createdAt] = generateTimestamp(systemFields.createdAtEncoding)
+              item[systemFields.createdAt] = generateTimestamp(systemFields.createdAtEncoding, now)
             }
           }
           if (systemFields.updatedAt) {
             if (item[systemFields.updatedAt] === undefined) {
-              item[systemFields.updatedAt] = generateTimestamp(systemFields.updatedAtEncoding)
+              item[systemFields.updatedAt] = generateTimestamp(systemFields.updatedAtEncoding, now)
             }
           }
           if (systemFields.version) item[systemFields.version] = 1
@@ -2478,16 +2630,25 @@ const makeImpl = <
                 )
                 if (!sentinel) continue
                 sentinelConstraints.push(constraintName)
+                // Optional TTL — when the constraint declares one, the sentinel
+                // auto-expires (time-bounded uniqueness reservation/hold). Uses
+                // the table's resolved TTL attribute name + Clock-backed `now`.
+                const sentinelItem: globalThis.Record<string, unknown> = {
+                  [config.indexes.primary.pk.field]: sentinel.key.pk,
+                  [config.indexes.primary.sk.field]: sentinel.key.sk,
+                  __edd_e__: `${entityType}._unique.${constraintName}`,
+                  _entity_pk: keys[config.indexes.primary.pk.field],
+                  _entity_sk: keys[config.indexes.primary.sk.field],
+                }
+                const uniqueTtl = resolveUniqueTtl(constraintDef)
+                if (uniqueTtl !== undefined) {
+                  sentinelItem[ttlAttrName] =
+                    Math.floor(DateTime.toEpochMillis(now) / 1000) + normalizeTtlSeconds(uniqueTtl)
+                }
                 transactItems.push({
                   Put: {
                     TableName: tableName,
-                    Item: toAttributeMap({
-                      [config.indexes.primary.pk.field]: sentinel.key.pk,
-                      [config.indexes.primary.sk.field]: sentinel.key.sk,
-                      __edd_e__: `${entityType}._unique.${constraintName}`,
-                      _entity_pk: keys[config.indexes.primary.pk.field],
-                      _entity_sk: keys[config.indexes.primary.sk.field],
-                    }),
+                    Item: toAttributeMap(sentinelItem),
                     ConditionExpression: "attribute_not_exists(pk)",
                   },
                 })
@@ -2502,6 +2663,7 @@ const makeImpl = <
                 config.indexes.primary.pk.field,
                 config.indexes.primary.sk.field,
                 ttlAttrName,
+                now,
               )
               transactItems.push({
                 Put: {
@@ -2707,6 +2869,8 @@ const makeImpl = <
           const tc = yield* tableTag
           const tableName = tc.name
           const ttlAttrName = resolveTtlAttributeName(tc)
+          // Clock-backed time source for the updatedAt timestamp + retain snapshot TTL.
+          const now = yield* DateTime.now
 
           // Decode key
           const decodedKey = yield* Schema.decodeUnknownEffect(
@@ -2903,7 +3067,7 @@ const makeImpl = <
               newItem[systemFields.updatedAt] =
                 userSupplied !== undefined
                   ? userSupplied
-                  : generateTimestamp(systemFields.updatedAtEncoding)
+                  : generateTimestamp(systemFields.updatedAtEncoding, now)
             }
 
             // `newItem` is already in domain names (the merge built it from
@@ -3044,6 +3208,7 @@ const makeImpl = <
                   config.indexes.primary.pk.field,
                   config.indexes.primary.sk.field,
                   ttlAttrName,
+                  now,
                 )
               : undefined
 
@@ -3298,7 +3463,7 @@ const makeImpl = <
             values[valKey] = toAttributeValue(
               userSupplied !== undefined
                 ? userSupplied
-                : generateTimestamp(systemFields.updatedAtEncoding),
+                : generateTimestamp(systemFields.updatedAtEncoding, now),
             )
             setClauses.push(`${nameKey} = ${valKey}`)
             counter++
@@ -3745,7 +3910,10 @@ const makeImpl = <
             }
 
             const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
-            const now = nowIso()
+            // Clock-backed time source; `now` is the ISO timestamp used for the
+            // deleted SK + deletedAt, `dtNow` drives the optional TTL + snapshot.
+            const dtNow = yield* DateTime.now
+            const now = nowIso(dtNow)
 
             // Build soft-deleted item: same PK, replace SK with deleted key, strip GSI keys
             const deletedItem: globalThis.Record<string, unknown> = { ...raw }
@@ -3764,7 +3932,8 @@ const makeImpl = <
             // Add optional TTL
             const sdTtl = softDeleteTtl()
             if (sdTtl) {
-              deletedItem[ttlAttrName] = Math.floor(Date.now() / 1000) + Duration.toSeconds(sdTtl)
+              deletedItem[ttlAttrName] =
+                Math.floor(DateTime.toEpochMillis(dtNow) / 1000) + normalizeTtlSeconds(sdTtl)
             }
 
             // Build transaction
@@ -3798,6 +3967,7 @@ const makeImpl = <
                 primary.pk.field,
                 primary.sk.field,
                 ttlAttrName,
+                dtNow,
               )
               transactItems.push({
                 Put: {
@@ -3946,6 +4116,8 @@ const makeImpl = <
         Effect.gen(function* () {
           const client = yield* DynamoClient
           const { name: tableName } = yield* tableTag
+          // Clock-backed time source for createdAt/updatedAt SET clauses.
+          const now = yield* DateTime.now
 
           // Encode user input → wire form (see `put` for strategy).
           const encodedInput = yield* encodeOrDecodeEncode(
@@ -4073,7 +4245,7 @@ const makeImpl = <
             values[valKey] = toAttributeValue(
               userSupplied !== undefined
                 ? userSupplied
-                : generateTimestamp(systemFields.createdAtEncoding),
+                : generateTimestamp(systemFields.createdAtEncoding, now),
             )
             setClauses.push(`${nameKey} = if_not_exists(${nameKey}, ${valKey})`)
             counter++
@@ -4088,7 +4260,7 @@ const makeImpl = <
             values[valKey] = toAttributeValue(
               userSupplied !== undefined
                 ? userSupplied
-                : generateTimestamp(systemFields.updatedAtEncoding),
+                : generateTimestamp(systemFields.updatedAtEncoding, now),
             )
             setClauses.push(`${nameKey} = ${valKey}`)
             counter++
@@ -4238,6 +4410,8 @@ const makeImpl = <
       const orderByField = timeSeriesConfig.orderBy
       const ttlDuration = timeSeriesConfig.ttl
       const appendInputSchema = schemas.appendInputSchema as Schema.Codec<any>
+      // Clock-backed time source for current-item timestamps + event-item TTL.
+      const now = yield* DateTime.now
 
       // ---------- Validate removeAttrs (issue #49) ----------
       // `.remove(attrs)` clears `appendInput` attributes in the same UpdateItem
@@ -4254,9 +4428,7 @@ const makeImpl = <
         const pkSkComposites = new Set<string>([...primary.pk.composite, ...primary.sk.composite])
         const appendInputTop = timeSeriesConfig.appendInput as Schema.Top
         const appendInputFieldSet = new Set<string>(
-          "fields" in appendInputTop && typeof (appendInputTop as any).fields === "object"
-            ? Object.keys((appendInputTop as any).fields)
-            : [],
+          Object.keys(getSchemaFields(appendInputTop) ?? {}),
         )
         const model = config.model as Schema.Top
         for (const attr of removedSet) {
@@ -4430,7 +4602,7 @@ const makeImpl = <
         const nameKey = `#a${counter}`
         const valKey = `:a${counter}`
         names[nameKey] = systemFields.createdAt
-        values[valKey] = toAttributeValue(generateTimestamp(systemFields.createdAtEncoding))
+        values[valKey] = toAttributeValue(generateTimestamp(systemFields.createdAtEncoding, now))
         setClauses.push(`${nameKey} = if_not_exists(${nameKey}, ${valKey})`)
         counter++
       }
@@ -4473,7 +4645,8 @@ const makeImpl = <
       eventItem.__edd_e__ = entityType
       // TTL — attribute name comes from TableConfig (default "_ttl")
       if (ttlDuration) {
-        eventItem[ttlAttrName] = Math.floor(Date.now() / 1000) + Duration.toSeconds(ttlDuration)
+        eventItem[ttlAttrName] =
+          Math.floor(DateTime.toEpochMillis(now) / 1000) + normalizeTtlSeconds(ttlDuration)
       }
       // Events never participate in indexes: strip any GSI key fields that the
       // naive spread above may have carried over. gsiKeys weren't written into
@@ -4912,6 +5085,8 @@ const makeImpl = <
           const tc = yield* tableTag
           const tableName = tc.name
           const ttlAttrName = resolveTtlAttributeName(tc)
+          // Clock-backed time source for the restored updatedAt + retain snapshot.
+          const now = yield* DateTime.now
 
           // Decode key
           const decodedKey = yield* Schema.decodeUnknownEffect(
@@ -4975,7 +5150,10 @@ const makeImpl = <
           const newVersion = currentVersion + 1
           if (systemFields.version) restoredItem[systemFields.version] = newVersion
           if (systemFields.updatedAt)
-            restoredItem[systemFields.updatedAt] = generateTimestamp(systemFields.updatedAtEncoding)
+            restoredItem[systemFields.updatedAt] = generateTimestamp(
+              systemFields.updatedAtEncoding,
+              now,
+            )
 
           // Recompose all keys (original SK, GSI keys)
           const restoredKeys = composeAllKeys(restoredItem)
@@ -5016,6 +5194,7 @@ const makeImpl = <
               primary.pk.field,
               primary.sk.field,
               ttlAttrName,
+              now,
             )
             transactItems.push({
               Put: {
@@ -5318,6 +5497,7 @@ const makeImpl = <
     unique: config.unique as TUnique,
     identifier: resolvedIdentifier as ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
     timeSeries: config.timeSeries as TTimeSeries,
+    generatedId: config.generatedId as TGeneratedId,
     _resolvedRefs: resolvedRefs,
     /** @internal Full decode pipeline: rename + schema decode. Used by Batch/Aggregate. */
     _decodeRecord: decodeRecord,
@@ -5385,7 +5565,8 @@ const makeImpl = <
     TUnique,
     TRefs,
     ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
-    TTimeSeries
+    TTimeSeries,
+    TGeneratedId
   >
 
   // Assign self so operation closures can reference the entity
@@ -5417,6 +5598,7 @@ export const bind = <
   TRefs extends globalThis.Record<string, AnyRefValue> | undefined,
   TIdentifier extends string | undefined,
   TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
+  TGeneratedId extends GeneratedIdConfig | undefined = undefined,
 >(
   entity: Entity<
     TModel,
@@ -5428,7 +5610,8 @@ export const bind = <
     TUnique,
     TRefs,
     TIdentifier,
-    TTimeSeries
+    TTimeSeries,
+    TGeneratedId
   >,
 ): Effect.Effect<
   BoundEntity<
@@ -5438,19 +5621,34 @@ export const bind = <
     EntityKeyType<TModel, TIndexes>,
     TTimeSeries,
     TTimestamps,
-    TVersioned
+    TVersioned,
+    TGeneratedId
   >,
   never,
   DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
-    const ctx = yield* Effect.context<DynamoClient | TableConfig>()
+    // Bundle a default `Crypto` service into the captured context. This is how
+    // `generatedId` put auto-fills a UUID while keeping bound `put` at
+    // `R = never`: the entity op yields `Crypto.Crypto`, and `provide` supplies
+    // it from this bundled context rather than surfacing it as a requirement.
+    // The `provide` helper is widened to admit `Crypto.Crypto` so the
+    // Crypto-requiring entity ops typecheck. A platform override supplied via
+    // `DynamoClient.make({ crypto })` is already in `baseCtx` and is respected
+    // (we only fill the default when absent). See `DESIGN.md`.
+    const baseCtx = yield* Effect.context<DynamoClient | TableConfig>()
+    const ctx = Option.isSome(Context.getOption(baseCtx, Crypto.Crypto))
+      ? (baseCtx as Context.Context<DynamoClient | TableConfig | Crypto.Crypto>)
+      : Context.add(baseCtx, Crypto.Crypto, makeDefaultCrypto())
     const provide = <A, E>(
-      effect: Effect.Effect<A, E, DynamoClient | TableConfig>,
+      effect: Effect.Effect<A, E, DynamoClient | TableConfig | Crypto.Crypto>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
 
     type Key = EntityKeyType<TModel, TIndexes>
-    type Input = EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>
+    type Input = WithGeneratedId<
+      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+      TGeneratedId
+    >
 
     // Sparse-field map (if any) — extracted from the Entity's configured model
     // so the PathBuilder used by `.condition((t, ops) => ...)` exposes
@@ -5599,7 +5797,8 @@ export const bind = <
       EntityKeyType<TModel, TIndexes>,
       TTimeSeries,
       TTimestamps,
-      TVersioned
+      TVersioned,
+      TGeneratedId
     >
   })
 

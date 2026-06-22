@@ -1,0 +1,70 @@
+{
+  "name": "@effect-dynamodb/schema",
+  "version": "1.9.0",
+  "description": "Pure Effect Schema-driven entity/aggregate modeling and relationship derivation for effect-dynamodb — importable without @aws-sdk",
+  "type": "module",
+  "license": "MIT",
+  "author": "Justin Menga",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jmenga/effect-dynamodb",
+    "directory": "packages/schema"
+  },
+  "homepage": "https://jmenga.github.io/effect-dynamodb",
+  "bugs": {
+    "url": "https://github.com/jmenga/effect-dynamodb/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "effect",
+    "effect-ts",
+    "dynamodb",
+    "schema",
+    "orm",
+    "single-table",
+    "typescript",
+    "modeling"
+  ],
+  "sideEffects": false,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./internal/*.js": {
+      "types": "./dist/internal/*.d.ts",
+      "import": "./dist/internal/*.js"
+    },
+    "./*.js": {
+      "types": "./dist/*.d.ts",
+      "import": "./dist/*.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "tsc --noEmit",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write ."
+  },
+  "peerDependencies": {
+    "effect": "^4.0.0-beta.85"
+  },
+  "devDependencies": {
+    "@effect/vitest": "4.0.0-beta.85",
+    "@types/node": "^25.5.0",
+    "effect": "4.0.0-beta.85",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.0"
+  }
+}
