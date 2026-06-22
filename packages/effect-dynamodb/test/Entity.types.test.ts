@@ -3,12 +3,12 @@
  * Uses vitest's `expectTypeOf` to verify compile-time type relationships.
  */
 
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import type { IndexPkInput } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import { type DateTime, Schema } from "effect"
 import { describe, expect, expectTypeOf, it } from "vitest"
-import * as DynamoModel from "../src/DynamoModel.js"
-import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import type { IndexPkInput } from "../src/internal/EntityTypes.js"
 import type * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 

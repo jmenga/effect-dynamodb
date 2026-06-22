@@ -26,11 +26,11 @@ import { afterAll, beforeAll, describe, expect } from "vitest"
 const FROZEN_MS = 1_780_272_000_000
 const FROZEN_SECONDS = 1_780_272_000
 
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
-import * as DynamoModel from "../src/DynamoModel.js"
-import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
 import * as Expression from "../src/Expression.js"
 import * as Query from "../src/Query.js"

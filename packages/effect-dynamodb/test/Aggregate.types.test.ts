@@ -12,11 +12,11 @@
  * builds `Schema.String` for id fields (brands are compile-time phantoms).
  */
 
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Schema } from "effect"
 import { describe, expectTypeOf, it } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
-import * as DynamoModel from "../src/DynamoModel.js"
-import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
 

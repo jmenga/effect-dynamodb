@@ -12,16 +12,16 @@
  * DynamoClient, Marshaller).
  */
 
-import { DateTime, Effect, Function, Schema } from "effect"
-import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
-import * as DynamoSchema from "./DynamoSchema.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   isAwsTransactionCancelled,
   TransactionCancelled,
   ValidationError,
   VersionConflict,
-} from "./Errors.js"
-import * as KeyComposer from "./KeyComposer.js"
+} from "@effect-dynamodb/schema/Errors.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
+import { DateTime, Effect, Function, Schema } from "effect"
+import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import { toAttributeMap } from "./Marshaller.js"
 import * as Query from "./Query.js"
 import type { Table, TableConfig } from "./Table.js"

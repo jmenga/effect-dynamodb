@@ -56,7 +56,8 @@
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.700.0",
-    "@aws-sdk/util-dynamodb": "^3.700.0"
+    "@aws-sdk/util-dynamodb": "^3.700.0",
+    "@effect-dynamodb/schema": "workspace:^"
   },
   "peerDependencies": {
     "effect": "^4.0.0-beta.85"

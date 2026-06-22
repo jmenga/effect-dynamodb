@@ -100,12 +100,7 @@ import {
   UpdateTableCommand,
   UpdateTimeToLiveCommand,
 } from "@aws-sdk/client-dynamodb"
-import { Config, Context, Crypto, Effect, Layer, type Schema } from "effect"
-import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
-import { bind as aggregateBind } from "./Aggregate.js"
-import * as DynamoSchema from "./DynamoSchema.js"
-import type { BoundEntity, Entity as EntityType } from "./Entity.js"
-import { bind as entityBind } from "./Entity.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   DynamoError,
   DynamoValidationError,
@@ -117,14 +112,23 @@ import {
   ResourceNotFoundError,
   ThrottlingError,
   ValidationError,
-} from "./Errors.js"
+} from "@effect-dynamodb/schema/Errors.js"
+import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
+import type {
+  EntityKeyType,
+  IndexPkInput,
+  IndexSkFields,
+} from "@effect-dynamodb/schema/internal/EntityTypes.js"
+import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
+import { Config, Context, Crypto, Effect, Layer, type Schema } from "effect"
+import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
+import { bind as aggregateBind } from "./Aggregate.js"
+import type { BoundEntity, Entity as EntityType } from "./Entity.js"
+import { bind as entityBind } from "./Entity.js"
 import { type BoundQueryConfig, BoundQueryImpl } from "./internal/BoundQuery.js"
-import { makeDefaultCrypto } from "./internal/DefaultCrypto.js"
-import type { EntityKeyType, IndexPkInput, IndexSkFields } from "./internal/EntityTypes.js"
 import { createConditionOps } from "./internal/Expr.js"
 import { createPathBuilder } from "./internal/PathBuilder.js"
-import type { IndexDefinition } from "./KeyComposer.js"
-import * as KeyComposer from "./KeyComposer.js"
 import * as Query from "./Query.js"
 import type { CreateTableOptions, Table, TableConfig } from "./Table.js"
 import { definition as tableDefinition } from "./Table.js"
@@ -439,7 +443,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
 /** Minimal structural type for tables used in DynamoClient.make() config. */
 export interface TableLike {
   readonly _tag: "Table"
-  readonly schema: import("./DynamoSchema.js").DynamoSchema
+  readonly schema: import("@effect-dynamodb/schema/DynamoSchema.js").DynamoSchema
   readonly entities: Record<string, { readonly _tag: "Entity" }>
   readonly aggregates: Record<string, unknown>
   readonly Tag: Context.Service<TableConfig, TableConfig>
@@ -453,13 +457,13 @@ export interface CollectionQuery<TResult> {
   /** Execute and collect all pages into a grouped result. */
   readonly collect: () => Effect.Effect<
     TResult,
-    DynamoClientError | import("./Errors.js").ValidationError,
+    DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
     never
   >
   /** Execute a single page. */
   readonly fetch: () => Effect.Effect<
     { items: TResult; cursor: string | null },
-    DynamoClientError | import("./Errors.js").ValidationError,
+    DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
     never
   >
   /** Add a filter expression (post-read). */

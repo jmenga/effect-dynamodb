@@ -11,12 +11,12 @@ import { TestClock } from "effect/testing"
 const FROZEN_MS = 1_717_200_000_000
 const FROZEN_SECONDS = 1_717_200_000
 
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { DynamoError, type TransactionOverflow } from "@effect-dynamodb/schema/Errors.js"
 import { beforeEach, vi } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
-import * as DynamoModel from "../src/DynamoModel.js"
-import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import { DynamoError, type TransactionOverflow } from "../src/Errors.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"

@@ -10,7 +10,7 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { marshall, unmarshall } from "@aws-sdk/util-dynamodb"
-import type { SparseConfig } from "./DynamoModel.js"
+import type { SparseConfig } from "@effect-dynamodb/schema/DynamoModel.js"
 
 /** Marshall a JS object to a DynamoDB attribute map */
 export const toAttributeMap = (item: Record<string, unknown>): Record<string, AttributeValue> =>

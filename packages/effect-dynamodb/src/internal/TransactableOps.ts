@@ -5,11 +5,11 @@
  * and put-item construction (validation + key composition + system fields).
  */
 
+import type { DynamoEncoding } from "@effect-dynamodb/schema/DynamoModel.js"
+import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Effect, Schema } from "effect"
-import type { DynamoEncoding } from "../DynamoModel.js"
 import type { Entity } from "../Entity.js"
-import { ValidationError } from "../Errors.js"
-import * as KeyComposer from "../KeyComposer.js"
 import { toAttributeMap } from "../Marshaller.js"
 
 /**

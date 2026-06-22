@@ -20,11 +20,11 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { CompositeNullableError } from "@effect-dynamodb/schema/Errors.js"
 import { DateTime, Duration, Effect, Layer, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
-import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import { CompositeNullableError } from "../src/Errors.js"
 import * as Table from "../src/Table.js"
 
 // ---------------------------------------------------------------------------

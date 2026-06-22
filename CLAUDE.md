@@ -48,6 +48,18 @@ Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table
 
 ### Module Structure
 
+> **Package split (issue #62):** the pure, AWS-free derivation layer lives in
+> `@effect-dynamodb/schema` (`packages/schema/src/`): `DynamoModel`, `DynamoSchema`,
+> `KeyComposer`, `Errors`, `Projection`, the entity/aggregate derivation internals
+> (`EntityConfig`, `EntityTypes`, `EntitySchemas`, `Aggregate*`, `SchemaAccessors`,
+> `DefaultCrypto`), and a **pure `Entity.make` / `Aggregate.make`** that return a
+> definition carrying the derived `inputSchema` / `updateSchema` / `createSchema`
+> (no CRUD ops). It has ZERO `@aws-sdk` in both its runtime graph and `.d.ts`
+> (guarded by `packages/schema/test/aws-free-guard.test.ts`). `effect-dynamodb`
+> depends on and re-exports the schema package, then adds the AWS runtime below.
+> The operational `Entity`/`Aggregate` types in `effect-dynamodb` carry the CRUD
+> ops; their `make` shares derivation via the schema package's pure helpers.
+
 ```
 packages/effect-dynamodb/src/
 ├── DynamoModel.ts      # Schema annotations (Hidden, identifier, ref) and configure() for field overrides (immutable, field rename, storedAs)
@@ -159,11 +171,16 @@ pnpm workspace monorepo:
 
 ```
 ├── packages/
-│   ├── effect-dynamodb/          # Core library (Entity, Table, Query, etc.)
+│   ├── schema/                   # @effect-dynamodb/schema — pure, AWS-free derivation layer
+│   │   ├── src/                  # DynamoModel, DynamoSchema, KeyComposer, Errors, Projection,
+│   │   │                         #   pure Entity.make/Aggregate.make + derivation internals
+│   │   └── test/                 # incl. aws-free guard test (no @aws-sdk in dist JS or .d.ts)
+│   ├── effect-dynamodb/          # Full library — depends on + re-exports @effect-dynamodb/schema,
+│   │   │                         #   adds the AWS runtime (DynamoClient, ops, Batch/Transaction)
 │   │   ├── src/
 │   │   ├── test/
 │   │   └── examples/             # Runnable examples — source of truth for doc code snippets
-│   ├── effect-dynamodb-geo/      # Geospatial index and search using H3
+│   ├── effect-dynamodb-geo/      # Geospatial index and search using H3 (depends on effect-dynamodb)
 │   │   ├── src/
 │   │   └── test/
 │   ├── docs/                     # Documentation site (Astro + Starlight)
@@ -347,7 +364,7 @@ Every PR that resolves a tracked issue **MUST** reference the issue(s) it closes
 
 ## Release Workflow
 
-This repo uses [Changesets](https://github.com/changesets/changesets) with **fixed lockstep versioning** across the three publishable packages (`effect-dynamodb`, `@effect-dynamodb/geo`, `@effect-dynamodb/language-service`). Publishing is automated: every push to `main` runs `.github/workflows/release.yml`, which detects packages whose `package.json` version is ahead of npm and publishes them via Trusted Publishing (OIDC — no `NPM_TOKEN`).
+This repo uses [Changesets](https://github.com/changesets/changesets) with **fixed lockstep versioning** across the four publishable packages (`effect-dynamodb`, `@effect-dynamodb/schema`, `@effect-dynamodb/geo`, `@effect-dynamodb/language-service`). Publishing is automated: every push to `main` runs `.github/workflows/release.yml`, which detects packages whose `package.json` version is ahead of npm and publishes them via Trusted Publishing (OIDC — no `NPM_TOKEN`).
 
 **There is no "Version Packages" bot PR.** The required process is:
 
@@ -359,7 +376,7 @@ Any PR that is intended to trigger a release **must run `pnpm changeset version`
 2. **A changeset file** (`.changeset/<name>.md`) created with `pnpm changeset` — declares which packages bump and at what semver level.
 3. **The result of `pnpm changeset version`**:
    - The changeset file is **deleted** (consumed).
-   - Each affected `package.json` has its `version` bumped (lockstep → all three move together).
+   - Each affected `package.json` has its `version` bumped (lockstep → all four move together).
    - Each affected package's `CHANGELOG.md` is regenerated with the consumed entry.
 
 The typical authoring loop:
@@ -397,7 +414,7 @@ Chore: <one-line summary>. No version change.
 
 ### Trusted Publishing setup
 
-Each of the three publishable packages must be configured on npmjs.com with this repo + `release.yml` as a trusted publisher. No `NPM_TOKEN` is required. The workflow uses `npm publish --provenance --access public` to emit a signed provenance attestation on each publish — verifiable by consumers.
+Each of the four publishable packages must be configured on npmjs.com with this repo + `release.yml` as a trusted publisher. No `NPM_TOKEN` is required. The workflow uses `npm publish --provenance --access public` to emit a signed provenance attestation on each publish — verifiable by consumers. **`@effect-dynamodb/schema` is new and must be registered as a Trusted Publisher on npmjs.com before its first release** (this cannot be automated from the repo).
 
 ## Behavioral Notes
 

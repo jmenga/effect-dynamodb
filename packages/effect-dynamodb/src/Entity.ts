@@ -9,18 +9,6 @@
 
 import type { AttributeValue, DeleteItemCommandInput } from "@aws-sdk/client-dynamodb"
 import {
-  Context,
-  Crypto,
-  DateTime,
-  Duration,
-  Effect,
-  Option,
-  Schema,
-  SchemaAST,
-  Stream,
-} from "effect"
-import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
-import {
   type ConfiguredModel,
   type DynamoEncoding,
   type ExtractIdentifier,
@@ -33,8 +21,8 @@ import {
   isRef,
   isRefField,
   type SparseConfig,
-} from "./DynamoModel.js"
-import * as DynamoSchema from "./DynamoSchema.js"
+} from "@effect-dynamodb/schema/DynamoModel.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   CascadePartialFailure,
   ConditionalCheckFailed,
@@ -48,7 +36,23 @@ import {
   TransactionOverflow,
   UniqueConstraintViolation,
   ValidationError,
-} from "./Errors.js"
+} from "@effect-dynamodb/schema/Errors.js"
+import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
+import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
+import { normalizeGsiConfig } from "@effect-dynamodb/schema/KeyComposer.js"
+import {
+  Context,
+  Crypto,
+  DateTime,
+  type Duration,
+  Effect,
+  Option,
+  Schema,
+  SchemaAST,
+  Stream,
+} from "effect"
+import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import type { ConditionInput } from "./Expression.js"
 import {
   makeBoundAppend,
@@ -57,7 +61,6 @@ import {
   makeBoundUpdate,
 } from "./internal/BoundCrud.js"
 import { type BoundQueryConfig, BoundQueryImpl } from "./internal/BoundQuery.js"
-import { makeDefaultCrypto } from "./internal/DefaultCrypto.js"
 import {
   compileExpr,
   createConditionOps,
@@ -68,9 +71,6 @@ import {
 } from "./internal/Expr.js"
 import { compilePath, createPathBuilder } from "./internal/PathBuilder.js"
 import { generateTimestampPrimitive } from "./internal/TransactableOps.js"
-import type { GsiConfig, IndexDefinition, KeyPart } from "./KeyComposer.js"
-import * as KeyComposer from "./KeyComposer.js"
-import { normalizeGsiConfig } from "./KeyComposer.js"
 import {
   decodeSparseFields,
   encodeSparseFields,
@@ -95,7 +95,7 @@ export type {
   UniqueConstraintDef,
   UniqueFieldsDef,
   VersionedConfig,
-} from "./internal/EntityConfig.js"
+} from "@effect-dynamodb/schema/internal/EntityConfig.js"
 export {
   type CascadeConfig,
   type CascadeTarget,
@@ -120,6 +120,7 @@ export {
   type UpdateState,
 } from "./internal/EntityOps.js"
 
+import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import {
   type CascadeConfig,
   type CascadeTarget,
@@ -140,7 +141,6 @@ import {
   returnValuesMap,
   type UpdateState,
 } from "./internal/EntityOps.js"
-import * as Projection from "./Projection.js"
 
 export {
   add,
@@ -170,12 +170,6 @@ export {
   subtract,
 } from "./internal/EntityCombinators.js"
 
-import {
-  asModel,
-  condition as conditionCombinator,
-  expectedVersion,
-  set,
-} from "./internal/EntityCombinators.js"
 import type {
   CascadeIndexConfig,
   GeneratedIdConfig,
@@ -185,7 +179,13 @@ import type {
   UniqueConfig,
   UniqueConstraintDef,
   VersionedConfig,
-} from "./internal/EntityConfig.js"
+} from "@effect-dynamodb/schema/internal/EntityConfig.js"
+import {
+  asModel,
+  condition as conditionCombinator,
+  expectedVersion,
+  set,
+} from "./internal/EntityCombinators.js"
 
 /** A ref config object: the entity and optional cascade index config. */
 interface AnyRefValue {
@@ -206,7 +206,7 @@ import {
   resolveSystemFields,
   resolveUniqueFields,
   validateNoTransformOverride,
-} from "./internal/EntitySchemas.js"
+} from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import type {
   AppendInputType,
   AppendSuccess as AppendSuccessType,
@@ -222,7 +222,7 @@ import type {
   PrimaryKeyComposites,
   RefErrors,
   WithGeneratedId,
-} from "./internal/EntityTypes.js"
+} from "@effect-dynamodb/schema/internal/EntityTypes.js"
 
 // ---------------------------------------------------------------------------
 // Re-export KeyComposer types for convenience
@@ -248,54 +248,13 @@ export type { IndexDefinition, KeyPart }
  * `currentRaw` (read from DynamoDB) carries DB names rather than domain names.
  */
 /**
- * Normalize a TTL config value to whole seconds.
- *
- * Accepts a `Duration.Duration` or a humanized string (e.g. `"7 days"`,
- * `"24 hours"`), parsed via Effect's `Duration` input grammar. A bare `number`
- * is intentionally NOT accepted at the type level — `Duration.fromInput` treats
- * a number as **milliseconds**, so `3600` would silently mean 3.6 s (a 1000×
- * footgun); callers must pass `Duration.seconds(3600)` or `"3600 seconds"`.
- *
- * Throws `[EDD-9005]` for a non-finite (infinite) duration — an infinite TTL
- * epoch is nonsensical. {@link make} validates every configured TTL eagerly via
- * this helper, so the write path never observes an invalid value.
- *
- * @internal
+ * TTL helpers — pure implementations live in `@effect-dynamodb/schema/Entity`,
+ * imported here for local use on the write path. `normalizeTtlSeconds` is
+ * re-exported below so the public `Entity` namespace surface is unchanged.
  */
-export const normalizeTtlSeconds = (input: Duration.Duration | string): number => {
-  let duration: Duration.Duration
-  if (typeof input === "string") {
-    // A free string is wider than `Duration.Input` (a template-literal union);
-    // `fromInput` returns None for anything it cannot parse, which we surface
-    // as a config error rather than letting an unsafe parse throw opaquely.
-    const parsed = Duration.fromInput(input as Duration.Input)
-    if (Option.isNone(parsed)) {
-      throw new Error(
-        `[EDD-9005] TTL string "${input}" is not a valid duration (expected e.g. "7 days", "24 hours", "30 minutes").`,
-      )
-    }
-    duration = parsed.value
-  } else {
-    duration = input
-  }
-  const seconds = Duration.toSeconds(duration)
-  if (!Number.isFinite(seconds)) {
-    const shown = typeof input === "string" ? `"${input}"` : "the provided Duration"
-    throw new Error(
-      `[EDD-9005] TTL must resolve to a finite duration; ${shown} resolves to a non-finite (infinite) TTL, which is not a valid DynamoDB TTL epoch.`,
-    )
-  }
-  return seconds
-}
+import { normalizeTtlSeconds, resolveUniqueTtl } from "@effect-dynamodb/schema/Entity.js"
 
-/**
- * Extract the optional TTL from a unique-constraint definition. Only the object
- * form (`{ fields, ttl }`) carries a TTL; the bare-array form never does.
- *
- * @internal
- */
-const resolveUniqueTtl = (def: UniqueConstraintDef): Duration.Duration | string | undefined =>
-  Array.isArray(def) ? undefined : (def as { readonly ttl?: Duration.Duration | string }).ttl
+export { normalizeTtlSeconds }
 
 const composeUniqueSentinel = (
   schema: DynamoSchema.DynamoSchema,

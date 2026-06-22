@@ -90,6 +90,9 @@ importers:
       '@aws-sdk/util-dynamodb':
         specifier: ^3.700.0
         version: 3.990.0(@aws-sdk/client-dynamodb@3.990.0)
+      '@effect-dynamodb/schema':
+        specifier: workspace:^
+        version: link:../schema
     devDependencies:
       '@effect/vitest':
         specifier: 4.0.0-beta.85
@@ -137,6 +140,24 @@ importers:
 
   packages/language-service:
     devDependencies:
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+      vitest:
+        specifier: ^4.1.0
+        version: 4.1.0(@types/node@25.5.0)(vite@7.3.1(@types/node@25.5.0)(jiti@2.6.1)(lightningcss@1.31.1)(tsx@4.21.0)(yaml@2.9.0))
+
+  packages/schema:
+    devDependencies:
+      '@effect/vitest':
+        specifier: 4.0.0-beta.85
+        version: 4.0.0-beta.85(effect@4.0.0-beta.85)(vitest@4.1.0(@types/node@25.5.0)(vite@7.3.1(@types/node@25.5.0)(jiti@2.6.1)(lightningcss@1.31.1)(tsx@4.21.0)(yaml@2.9.0)))
+      '@types/node':
+        specifier: ^25.5.0
+        version: 25.5.0
+      effect:
+        specifier: 4.0.0-beta.85
+        version: 4.0.0-beta.85
       typescript:
         specifier: ^5.7.0
         version: 5.9.3

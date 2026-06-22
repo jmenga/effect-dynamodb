@@ -5,12 +5,12 @@
  */
 
 import type { ReturnValue } from "@aws-sdk/client-dynamodb"
+import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import type { Effect } from "effect"
 import { Pipeable, Utils } from "effect"
-import type * as DynamoSchema from "../DynamoSchema.js"
 import type { ConditionInput } from "../Expression.js"
 import type { Expr } from "../internal/Expr.js"
-import type { IndexDefinition } from "../KeyComposer.js"
 import type { TableConfig } from "../Table.js"
 
 // ---------------------------------------------------------------------------

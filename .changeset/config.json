@@ -6,7 +6,12 @@
   ],
   "commit": false,
   "fixed": [
-    ["effect-dynamodb", "@effect-dynamodb/geo", "@effect-dynamodb/language-service"]
+    [
+      "effect-dynamodb",
+      "@effect-dynamodb/schema",
+      "@effect-dynamodb/geo",
+      "@effect-dynamodb/language-service"
+    ]
   ],
   "linked": [],
   "access": "public",

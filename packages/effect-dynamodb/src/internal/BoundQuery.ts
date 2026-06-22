@@ -10,9 +10,9 @@
  * - Terminals: `fetch`, `collect`, `paginate`, `count`.
  */
 
+import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { type Effect, Stream } from "effect"
 import type { DynamoClientError } from "../DynamoClient.js"
-import type { ValidationError } from "../Errors.js"
 import * as Query from "../Query.js"
 import type { ConditionOps, ConditionShorthand, Expr } from "./Expr.js"
 import { parseSimpleShorthand } from "./Expr.js"

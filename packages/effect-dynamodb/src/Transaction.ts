@@ -9,16 +9,16 @@
  * transactGet returns a typed tuple inferred per-position.
  */
 
-import { Effect, Function as Fn } from "effect"
-import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
-import type { Entity, EntityDelete, EntityGet, EntityPut } from "./Entity.js"
-import { extractTransactable } from "./Entity.js"
 import {
   DynamoError,
   isAwsTransactionCancelled,
   TransactionCancelled,
   type ValidationError,
-} from "./Errors.js"
+} from "@effect-dynamodb/schema/Errors.js"
+import { Effect, Function as Fn } from "effect"
+import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
+import type { Entity, EntityDelete, EntityGet, EntityPut } from "./Entity.js"
+import { extractTransactable } from "./Entity.js"
 import type { ExpressionResult } from "./Expression.js"
 import {
   composePrimaryKey,

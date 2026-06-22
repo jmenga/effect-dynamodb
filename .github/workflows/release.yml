@@ -52,7 +52,7 @@ jobs:
         run: |
           node <<'EOF' > /tmp/publish.json
           const { execSync } = require('child_process');
-          const PUBLISHABLE = ['effect-dynamodb', '@effect-dynamodb/geo', '@effect-dynamodb/language-service'];
+          const PUBLISHABLE = ['effect-dynamodb', '@effect-dynamodb/schema', '@effect-dynamodb/geo', '@effect-dynamodb/language-service'];
           const workspace = JSON.parse(execSync('pnpm -r list --depth -1 --json', { encoding: 'utf8' }));
           const toPublish = [];
           for (const name of PUBLISHABLE) {
@@ -115,14 +115,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # When all three lockstep packages bump to the same version, also cut a
+      # When all four lockstep packages bump to the same version, also cut a
       # single aggregate vX.Y.Z tag + release and label every PR merged into
       # this release window with vX.Y.Z for downstream traceability.
       - name: Create aggregate vX.Y.Z tag, release, and PR labels
         if: steps.detect.outputs.should_publish == 'true'
         run: |
           AGG_VER=$(node -e "
-            const PUBLISHABLE = ['effect-dynamodb', '@effect-dynamodb/geo', '@effect-dynamodb/language-service'];
+            const PUBLISHABLE = ['effect-dynamodb', '@effect-dynamodb/schema', '@effect-dynamodb/geo', '@effect-dynamodb/language-service'];
             const targets = require('/tmp/publish.json');
             const byName = Object.fromEntries(targets.map(t => [t.name, t.version]));
             const allPresent = PUBLISHABLE.every(n => byName[n]);
@@ -130,7 +130,7 @@ jobs:
             if (allPresent && versions.size === 1) process.stdout.write([...versions][0]);
           ")
           if [ -z "$AGG_VER" ]; then
-            echo "Not a lockstep bump across all three packages; skipping aggregate tag."
+            echo "Not a lockstep bump across all four packages; skipping aggregate tag."
             exit 0
           fi
           AGG_TAG="v$AGG_VER"
