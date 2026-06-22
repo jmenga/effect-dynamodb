@@ -266,7 +266,7 @@ describe("Aggregate derived schemas preserve branded identifier types (#61)", ()
 
   it("inputSchema: plain (non-ref) fields are UNAFFECTED", () => {
     // Value object (nested class) passes through intact
-    expectTypeOf<MatchInput["address"]>().toMatchTypeOf<{ line1: string; postcode: string }>()
+    expectTypeOf<MatchInput["address"]>().toExtend<{ line1: string; postcode: string }>()
     // Enum literal union passes through intact
     expectTypeOf<MatchInput["status"]>().toEqualTypeOf<"scheduled" | "live" | "complete">()
     // Plain scalar passes through
