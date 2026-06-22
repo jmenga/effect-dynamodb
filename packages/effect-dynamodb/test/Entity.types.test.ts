@@ -348,7 +348,7 @@ describe("Entity type extractors", () => {
     type UserUpdate = Entity.Update<typeof UserEntity>
 
     // Updatable fields should be optional
-    expectTypeOf<UserUpdate>().toMatchTypeOf<{
+    expectTypeOf<UserUpdate>().toExtend<{
       email?: string
       displayName?: string
       role?: "admin" | "member"
@@ -362,7 +362,7 @@ describe("Entity type extractors", () => {
     type MemberUpdate = Entity.Update<typeof MembershipEntity>
 
     // Only non-key field is role
-    expectTypeOf<MemberUpdate>().toMatchTypeOf<{
+    expectTypeOf<MemberUpdate>().toExtend<{
       role?: "owner" | "admin" | "member"
     }>()
 
@@ -375,7 +375,7 @@ describe("Entity type extractors", () => {
     type SelectionUpdate = Entity.Update<typeof SelectionEntity>
 
     // Non-key, non-ref field is optional
-    expectTypeOf<SelectionUpdate>().toMatchTypeOf<{
+    expectTypeOf<SelectionUpdate>().toExtend<{
       role?: string
     }>()
 
@@ -450,7 +450,7 @@ describe("Entity type extractors", () => {
     type UserMarshalled = Entity.Marshalled<typeof UserEntity>
 
     // Should be a record with AttributeValue-like fields
-    expectTypeOf<UserMarshalled>().toMatchTypeOf<
+    expectTypeOf<UserMarshalled>().toExtend<
       Record<
         string,
         {
@@ -543,8 +543,11 @@ describe("Entity type extractors", () => {
     expectTypeOf<UserCreate>().toHaveProperty("displayName")
     expectTypeOf<UserCreate>().toHaveProperty("role")
 
-    // PK composite should be excluded
-    expectTypeOf<UserCreate>().not.toHaveProperty("userId")
+    // No identifier configured → Create keeps the PK composite "userId": the
+    // caller must supply it to create the item (matches this test's name and
+    // the runtime create() input, exercised in the connected suite). createSchema
+    // only drops a configured `identifier`/`generatedId`, not raw PK composites.
+    expectTypeOf<UserCreate>().toHaveProperty("userId")
   })
 
   it("Entity.Create matches createSchema type", () => {
@@ -581,7 +584,7 @@ describe("Entity type extractors", () => {
     expectTypeOf<InputSchemaType["playerId"]>().toEqualTypeOf<BrandedPlayerId>()
   })
 
-  it("createSchema type is Entity.Input minus PK composites", () => {
+  it("createSchema keeps PK composites when no identifier is configured", () => {
     type CreateSchemaType = Schema.Schema.Type<typeof UserEntity.createSchema>
 
     // Should have non-PK fields
@@ -589,8 +592,10 @@ describe("Entity type extractors", () => {
     expectTypeOf<CreateSchemaType>().toHaveProperty("displayName")
     expectTypeOf<CreateSchemaType>().toHaveProperty("role")
 
-    // Primary key should be excluded
-    expectTypeOf<CreateSchemaType>().not.toHaveProperty("userId")
+    // No identifier configured → the PK composite "userId" stays required (the
+    // caller supplies it to create the item). createSchema drops a configured
+    // `identifier`/`generatedId`, not raw PK composites.
+    expectTypeOf<CreateSchemaType>().toHaveProperty("userId")
   })
 
   it("createSchema type preserves branded ref ID types", () => {
@@ -624,10 +629,13 @@ describe("Entity type extractors", () => {
       Entity.make({
         model: User,
         entityType: "User",
+        // The type now also rejects an entirely-empty primary key at compile
+        // time; cast so the RUNTIME guard is still exercised (defends untyped /
+        // JS callers).
         primaryKey: {
           pk: { field: "pk", composite: [] as const },
           sk: { field: "sk", composite: [] as const },
-        },
+        } as unknown as Parameters<typeof Entity.make>[0]["primaryKey"],
       }),
     ).toThrow()
   })
@@ -655,12 +663,15 @@ describe("Entity type extractors", () => {
   })
 
   it("rejects composite attributes that are not model fields", () => {
+    // Composite-name validation is enforced at runtime (make() throws), not at
+    // the type level — composites may legitimately reference ref-derived
+    // `${field}Id` names that are not raw model fields (see #54), so the type
+    // cannot statically reject every unknown name.
     expect(() =>
       Entity.make({
         model: User,
         entityType: "User",
         primaryKey: {
-          // @ts-expect-error — "nonExistent" is not a field on User
           pk: { field: "pk", composite: ["nonExistent"] },
           sk: { field: "sk", composite: [] },
         },
@@ -756,14 +767,14 @@ describe("Entity type extractors", () => {
     // CaseInsensitive widening applying `| Lowercase<...>` for string types,
     // which is intentional and shared with all other index input types).
     type PlayerIdField = SquadByPlayer["playerId"]
-    expectTypeOf<BrandedPlayerId>().toMatchTypeOf<PlayerIdField>()
+    expectTypeOf<BrandedPlayerId>().toExtend<PlayerIdField>()
 
     // Mixed pk: ref-renamed composite + regular model fields all required.
     expectTypeOf<SquadByTeamSeries>().toHaveProperty("teamId")
     expectTypeOf<SquadByTeamSeries>().toHaveProperty("season")
     expectTypeOf<SquadByTeamSeries>().toHaveProperty("series")
     type TeamIdField = SquadByTeamSeries["teamId"]
-    expectTypeOf<BrandedTeamId>().toMatchTypeOf<TeamIdField>()
+    expectTypeOf<BrandedTeamId>().toExtend<TeamIdField>()
 
     // SK composite (`selectionNumber`) appears as an optional field.
     expectTypeOf<SquadByTeamSeries>().toHaveProperty("selectionNumber")
