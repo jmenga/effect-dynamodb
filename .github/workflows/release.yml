@@ -98,9 +98,26 @@ jobs:
           node <<'EOF'
           const { execSync } = require('child_process');
           const targets = require('/tmp/publish.json');
+          execSync('mkdir -p /tmp/pkgs');
           for (const { name, version, dir } of targets) {
-            console.log(`Publishing ${name}@${version} from ${dir}`);
-            execSync('npm publish --provenance --access public', { cwd: dir, stdio: 'inherit' });
+            console.log(`Packing ${name}@${version} from ${dir}`);
+            // `pnpm pack` rewrites the `workspace:` protocol in dependencies AND
+            // peerDependencies to concrete ranges; a plain `npm publish` does NOT,
+            // which shipped an uninstallable `workspace:^` in 1.9.0 (issue #64).
+            // We publish the packed tarball so the resolved manifest is what ships.
+            const out = execSync('pnpm pack --pack-destination /tmp/pkgs', { cwd: dir, encoding: 'utf8' });
+            const tgz = out.trim().split('\n').pop().trim();
+            // Guard: refuse to publish if any unresolved `workspace:` spec remains.
+            const pkg = JSON.parse(execSync(`tar -xzOf ${tgz} package/package.json`, { encoding: 'utf8' }));
+            for (const field of ['dependencies', 'peerDependencies', 'optionalDependencies']) {
+              for (const [dep, spec] of Object.entries(pkg[field] || {})) {
+                if (String(spec).startsWith('workspace:')) {
+                  throw new Error(`Refusing to publish ${name}: ${field}.${dep} = "${spec}" — unresolved workspace: protocol (issue #64).`);
+                }
+              }
+            }
+            console.log(`Publishing ${tgz}`);
+            execSync(`npm publish ${tgz} --provenance --access public`, { stdio: 'inherit' });
           }
           EOF
 
