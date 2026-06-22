@@ -114,6 +114,55 @@ describe("@effect-dynamodb/schema use-case", () => {
     expect((Roster as unknown as { get?: unknown }).get).toBeUndefined()
   })
 
+  it("authors aggregate edges from pure entity definitions (#66)", () => {
+    // The pure edge constructors must accept pure `EntityDefinition`s — which
+    // have no runtime `get` — so the aggregate edge graph can be built entirely
+    // from `@effect-dynamodb/schema` (no AWS runtime). Before the fix these
+    // failed to type-check ("Property 'get' is missing"). The tsconfig.test.json
+    // gate type-checks this file, so a regression fails the build.
+    const refEdge = Aggregate.ref(Teams)
+    const oneEdge = Aggregate.one("captain", { entityType: "Player", entity: Players })
+    const manyEdge = Aggregate.many("players", { entityType: "Player", entity: Players })
+    expect(refEdge._tag).toBe("RefEdge")
+    expect(oneEdge._tag).toBe("OneEdge")
+    expect(manyEdge._tag).toBe("ManyEdge")
+
+    // ...and they compose into an aggregate authored purely from definitions.
+    const AppSchema = DynamoSchema.make({ name: "squadapp", version: 1 })
+    const Squad = Aggregate.make(Player, {
+      table: { Tag: Symbol.for("test/squad-table") },
+      schema: AppSchema,
+      pk: { field: "pk", composite: ["playerId"] },
+      collection: { index: "gsi1", name: "squad", sk: { field: "gsi1sk", composite: [] } },
+      root: { entityType: "Player" },
+      edges: { team: Aggregate.ref(Teams) },
+    })
+    expect(Squad.inputSchema).toBeDefined()
+  })
+
+  it("deriveAggregateSchemas is typed without a table tag (#67)", () => {
+    // Table-free, AWS-free: no stub `table` tag and no GSI key config — just the
+    // model, edges, and pk composites. The returned schemas must be precisely
+    // typed (NOT `Schema.Top`/`unknown`), so a contract package can read the
+    // derived create payload type directly. Also exercises #66 (pure ref edge).
+    const derived = Aggregate.deriveAggregateSchemas(Player, { team: Aggregate.ref(Teams) }, [
+      "playerId",
+    ])
+    expect(derived.inputSchema).toBeDefined()
+    expect(derived.createSchema).toBeDefined()
+    expect(derived.updateSchema).toBeDefined()
+
+    // Regression guard for #67: the derived input is a precise object type, so
+    // accessing known fields type-checks. If it collapsed to `unknown` (the bug)
+    // these would be compile errors — the schema `tsconfig.test.json` gate
+    // type-checks this file, so a regression fails the build.
+    type DerivedInput = typeof derived.inputSchema.Type
+    const readDisplayName = (i: DerivedInput): string => i.displayName
+    const readTeamId = (i: DerivedInput): string => i.teamId // ref "team" flattened to "teamId"
+    void readDisplayName
+    void readTeamId
+  })
+
   it.effect("aggregate inputSchema decodes a typed payload", () =>
     Effect.gen(function* () {
       const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })

@@ -1391,9 +1391,15 @@ const hydrateAggregateRefs = (
       // Deduplicate IDs for this entity type
       const uniqueIds = [...new Set(reqs.map((r) => r.id))]
 
+      // `RefEntity` is the pure structural bound (no `get` — issue #66) so that
+      // aggregate edges can be authored from AWS-free entity definitions. Ref
+      // hydration is a runtime operation, so narrow back to the get-bearing
+      // runtime entity here — the runtime path always supplies a real entity.
+      const runtimeEntity = entity as RefEntity & { readonly get: (key: any) => any }
+
       // Build EntityGet intermediates for batch fetching
       const getOps = uniqueIds.map(
-        (id) => entity.get({ [identifierName]: id }) as EntityGet<any, any, any, any>,
+        (id) => runtimeEntity.get({ [identifierName]: id }) as EntityGet<any, any, any, any>,
       )
 
       const results = yield* Batch.get(getOps)

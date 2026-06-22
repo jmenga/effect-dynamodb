@@ -1,5 +1,29 @@
 # @effect-dynamodb/geo
 
+## 1.9.2
+
+### Patch Changes
+
+- fix(schema): make the AWS-free pure-authoring path actually usable (closes #66, closes #67).
+
+  Two follow-ups to the #62 schema/runtime split, both blocking its headline use case
+  (deriving a typed aggregate input/create payload from `@effect-dynamodb/schema` with
+  no AWS SDK):
+  - **#66** — the pure edge constructors (`Aggregate.ref` / `one` / `many`) required a
+    `RefEntity` with a runtime `get` method, so aggregate edges could not be authored
+    from pure `Entity.make` definitions (which have no `get`). `RefEntity` is now the
+    minimal structural bound used only for derivation (`_tag`/`entityType`/`model`/
+    `indexes`/`schemas`); the runtime ref-hydration narrows back to a `get`-bearing
+    entity at its single call site.
+  - **#67** — `deriveAggregateSchemas` (the table-free derivation entry point) returned
+    `Schema.Top` members, so `typeof result.inputSchema.Type` collapsed to `unknown`.
+    It is now generic and returns `Schema.Codec<AggregateInputType<…>>` (plus a
+    `createSchema` alias), so the table-free path is as typed as the top-level
+    `Aggregate.make` — no stub `table` tag or GSI key config needed.
+
+  Type-checked regression tests for both land in the schema package's `tsconfig.test.json`
+  gate (now wired into `pnpm check`).
+
 ## 1.9.1
 
 ### Patch Changes

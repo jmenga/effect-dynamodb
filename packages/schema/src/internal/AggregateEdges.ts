@@ -22,6 +22,14 @@ import type { Schema } from "effect"
  * `indexes` mirrors `Entity.indexes` (`{ primary: { pk: { composite } }, ... }`);
  * `RefEntityIdentifierValue` reads `indexes.primary.pk.composite` to recover the
  * branded id type. A wider/looser `indexes` simply falls back to `string`.
+ *
+ * This is a PURE structural bound: edge derivation only reads
+ * `model`/`indexes`/`entityType`/`schemas` to recover the ref-id field and its
+ * (branded) identifier type — it never calls a runtime operation. It must
+ * therefore be satisfiable by a pure `EntityDefinition` (which has no `get`), so
+ * aggregate edges can be authored from `@effect-dynamodb/schema` entities with
+ * no AWS runtime (issue #66). The runtime ref-hydration path narrows back to a
+ * `get`-bearing entity at its single call site.
  */
 export interface RefEntity<M extends Schema.Top = Schema.Top, TIndexes = unknown> {
   readonly _tag: "Entity"
@@ -31,8 +39,6 @@ export interface RefEntity<M extends Schema.Top = Schema.Top, TIndexes = unknown
   readonly schemas: {
     readonly recordSchema: Schema.Codec<any>
   }
-  /** Get an entity by key — uses `any` for structural compatibility with Entity's narrower key type */
-  readonly get: (key: any) => any
 }
 
 // ---------------------------------------------------------------------------
