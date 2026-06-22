@@ -14,6 +14,11 @@
  */
 
 import { DateTime, Effect, Option, Schema, SchemaAST, SchemaGetter, SchemaIssue } from "effect"
+import {
+  getSchemaFields,
+  recordValueAst,
+  recordValueAstFromAst,
+} from "./internal/SchemaAccessors.js"
 
 // ---------------------------------------------------------------------------
 // Identifier annotation
@@ -55,13 +60,8 @@ export const getIdentifierField = (
     const configured = model as ConfiguredModel<Schema.Top>
     for (const [name, attr] of Object.entries(configured.attributes)) {
       if (attr.identifier) {
-        const rawModel = configured.model
-        if (
-          "fields" in rawModel &&
-          typeof (rawModel as globalThis.Record<string, unknown>).fields === "object"
-        ) {
-          const fields = (rawModel as unknown as { fields: globalThis.Record<string, Schema.Top> })
-            .fields
+        const fields = getSchemaFields(configured.model)
+        if (fields) {
           const fieldSchema = fields[name]
           if (fieldSchema) return { name, schema: fieldSchema }
         }
@@ -73,12 +73,8 @@ export const getIdentifierField = (
     return getIdentifierField(configured.model)
   }
 
-  if (
-    !("fields" in model) ||
-    typeof (model as globalThis.Record<string, unknown>).fields !== "object"
-  )
-    return undefined
-  const fields = (model as unknown as { fields: globalThis.Record<string, Schema.Top> }).fields
+  const fields = getSchemaFields(model)
+  if (!fields) return undefined
   for (const [name, fieldSchema] of Object.entries(fields)) {
     if (isIdentifier(fieldSchema)) return { name, schema: fieldSchema }
   }
@@ -148,11 +144,8 @@ export const isRefField = (fieldName: string, model: Schema.Top): boolean => {
     return isRefField(fieldName, configured.model)
   }
   // Check schema-level annotation
-  if (
-    "fields" in model &&
-    typeof (model as globalThis.Record<string, unknown>).fields === "object"
-  ) {
-    const fields = (model as unknown as { fields: globalThis.Record<string, Schema.Top> }).fields
+  const fields = getSchemaFields(model)
+  if (fields) {
     const fieldSchema = fields[fieldName]
     if (fieldSchema) return isRef(fieldSchema)
   }
@@ -633,39 +626,17 @@ export const getSparseFields = (model: Schema.Top): globalThis.Record<string, Sp
  * (a Record whose value is itself a Record).
  */
 export const isRecordSchema = (schema: Schema.Top): { readonly valueAst: unknown } | undefined => {
-  const ast = schema.ast as unknown as {
-    readonly _tag?: string
-    readonly propertySignatures?: ReadonlyArray<unknown>
-    readonly indexSignatures?: ReadonlyArray<{ readonly type?: unknown }>
-  }
-  if (!ast || ast._tag !== "Objects") return undefined
-  const propertySignatures = ast.propertySignatures
-  const indexSignatures = ast.indexSignatures
-  if (!Array.isArray(propertySignatures) || !Array.isArray(indexSignatures)) return undefined
-  if (propertySignatures.length !== 0 || indexSignatures.length !== 1) return undefined
-  const sig = indexSignatures[0]!
-  return { valueAst: sig.type }
+  const valueAst = recordValueAst(schema)
+  if (valueAst === undefined) return undefined
+  return { valueAst }
 }
 
 /** True iff `schema` is shaped like `Schema.Record(K, V)`. */
 export const isRecord = (schema: Schema.Top): boolean => isRecordSchema(schema) !== undefined
 
 /** True iff `valueAst` (raw AST from a Record value position) is itself a Record AST. */
-export const isRecordAst = (valueAst: unknown): boolean => {
-  if (!valueAst || typeof valueAst !== "object") return false
-  const ast = valueAst as {
-    readonly _tag?: string
-    readonly propertySignatures?: ReadonlyArray<unknown>
-    readonly indexSignatures?: ReadonlyArray<unknown>
-  }
-  if (ast._tag !== "Objects") return false
-  return (
-    Array.isArray(ast.propertySignatures) &&
-    Array.isArray(ast.indexSignatures) &&
-    ast.propertySignatures.length === 0 &&
-    ast.indexSignatures.length === 1
-  )
-}
+export const isRecordAst = (valueAst: unknown): boolean =>
+  recordValueAstFromAst(valueAst as SchemaAST.AST | undefined) !== undefined
 
 /**
  * Attribute override for a single field in `DynamoModel.configure`.
@@ -796,13 +767,9 @@ export const configure = <M extends Schema.Top, const A extends ConfigureAttribu
 
   // Validate: no field rename targets collide with existing model field names
   const modelFields = new Set<string>()
-  if (
-    "fields" in model &&
-    typeof (model as globalThis.Record<string, unknown>).fields === "object"
-  ) {
-    for (const fieldName of Object.keys(
-      (model as unknown as { fields: globalThis.Record<string, unknown> }).fields,
-    )) {
+  const fields = getSchemaFields(model)
+  if (fields) {
+    for (const fieldName of Object.keys(fields)) {
       modelFields.add(fieldName)
     }
   }

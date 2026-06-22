@@ -24,6 +24,11 @@ import type {
   UniqueFieldsDef,
   VersionedConfig,
 } from "./EntityConfig.js"
+import {
+  firstTypeParameterAst,
+  getSchemaFields,
+  transformWireKind as transformWireKindImpl,
+} from "./SchemaAccessors.js"
 
 // ---------------------------------------------------------------------------
 // Resolved system field names (internal)
@@ -274,15 +279,17 @@ export const allCompositeAttributes = (
 
 export type SchemaFields = globalThis.Record<string, Schema.Top>
 
-interface SchemaWithFields {
-  readonly fields: SchemaFields
-}
-
-const hasFields = (schema: Schema.Top): schema is Schema.Top & SchemaWithFields =>
-  "fields" in schema && typeof (schema as globalThis.Record<string, unknown>).fields === "object"
+/**
+ * Re-export of the shared typed `.fields` accessor (returns `undefined` for
+ * non-Struct/Class schemas). Use this when the call site has its own
+ * fallback/error handling; use {@link getFields} when a missing `.fields` is a
+ * hard error.
+ */
+export { getSchemaFields }
 
 export const getFields = (model: Schema.Top): SchemaFields => {
-  if (hasFields(model)) return model.fields
+  const fields = getSchemaFields(model)
+  if (fields) return fields
   throw new Error("Entity model must be a Schema.Class or Schema.Struct with .fields")
 }
 
@@ -492,13 +499,12 @@ const tryGetRedactedInner = (schema: Schema.Top): Schema.Top | undefined => {
     | { typeConstructor?: { _tag?: string } }
     | undefined
   if (resolved?.typeConstructor?._tag !== "effect/Redacted") return undefined
-  // The decoded type is `Redacted<T>` where the inner schema is at
-  // `ast.typeParameters[0]`. Walk the AST and rebuild the Schema via
-  // `Schema.make` so we get a fully-functional Schema (with `.pipe`).
-  const ast = schema.ast as unknown as { typeParameters?: ReadonlyArray<unknown> }
-  const params = ast.typeParameters
-  if (!params || params.length === 0) return undefined
-  const innerAst = params[0] as Schema.Top["ast"]
+  // The decoded type is `Redacted<T>` where the inner schema is the first type
+  // parameter. `firstTypeParameterAst` isolates that single untyped AST read
+  // (no public accessor exists); we then rebuild a fully-functional Schema via
+  // `Schema.make` so the result has `.pipe`.
+  const innerAst = firstTypeParameterAst(schema.ast)
+  if (!innerAst) return undefined
   return Schema.make<Schema.Top>(innerAst)
 }
 
@@ -634,10 +640,11 @@ export const validateNoTransformOverride = (
     // 2. DynamoModel.storedAs() modifier on the schema itself? The modifier
     //    applies a `DynamoEncoding` annotation to the AST. Detect a conflict
     //    by comparing the annotation's storage with the transform's actual
-    //    wire format (read from `ast.encoding[last].to._tag`). Granularity:
-    //    we can distinguish "string" vs "number" wire forms; we cannot
-    //    distinguish epochMs vs epochSeconds at this layer. The string-vs-
-    //    number mismatch covers the most common breaking case.
+    //    wire format (resolved via `transformWireKind`, which walks the typed
+    //    `Base.encoding` chain to its leaf). Granularity: we can distinguish
+    //    "string" vs "number" wire forms; we cannot distinguish epochMs vs
+    //    epochSeconds at this layer. The string-vs-number mismatch covers the
+    //    most common breaking case.
     const annotated = getEncoding(schema)
     if (annotated === undefined) continue
     const transformWire = transformWireKind(schema)
@@ -653,17 +660,13 @@ export const validateNoTransformOverride = (
  * Read the wire form ("string" or "number") that a transform schema actually
  * encodes to, by walking the encoding chain. Returns undefined when the chain
  * is missing or the leaf isn't a String / Number node.
+ *
+ * Delegates to {@link SchemaAccessors.transformWireKind}, which uses the typed
+ * `Base.encoding` property and `SchemaAST.isString`/`isNumber` guards on the
+ * leaf `Link.to` AST.
  */
-const transformWireKind = (schema: Schema.Top): "string" | "number" | undefined => {
-  const enc = (schema.ast as { encoding?: ReadonlyArray<{ to: { _tag: string } }> }).encoding
-  if (!enc || enc.length === 0) return undefined
-  const leaf = enc[enc.length - 1]
-  if (!leaf) return undefined
-  const tag = leaf.to._tag
-  if (tag === "String") return "string"
-  if (tag === "Number") return "number"
-  return undefined
-}
+const transformWireKind = (schema: Schema.Top): "string" | "number" | undefined =>
+  transformWireKindImpl(schema)
 
 // ---------------------------------------------------------------------------
 // Build derived schemas at make() time
@@ -924,7 +927,7 @@ export const buildDerivedSchemas = (
   const appendInputSchema = timeSeriesEnabled
     ? (() => {
         const userSchema = timeSeries.appendInput as Schema.Top
-        const userFields = (userSchema as unknown as { fields?: SchemaFields }).fields
+        const userFields = getSchemaFields(userSchema)
         if (!userFields) return userSchema
         // Compute encodings for the appendInput fields (annotation +
         // inferred from typeConstructor for self schemas).

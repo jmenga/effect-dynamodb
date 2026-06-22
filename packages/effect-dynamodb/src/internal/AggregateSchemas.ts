@@ -8,6 +8,11 @@ import { Schema } from "effect"
 import { ConfiguredModelTag } from "../DynamoModel.js"
 import type { AggregateEdge, ManyEdge, RefEntity } from "./AggregateEdges.js"
 import type { BoundSubAggregate } from "./AggregateTypes.js"
+import {
+  extractArrayElement as extractArrayElementImpl,
+  getSchemaFields as getSchemaFieldsImpl,
+  isFieldOptional as isFieldOptionalImpl,
+} from "./SchemaAccessors.js"
 
 // ---------------------------------------------------------------------------
 // Input schema derivation
@@ -90,14 +95,13 @@ export const deriveAggregateSchemas = (
 
 /**
  * Check if a field schema represents an optional field.
- * In Effect v4, Schema.optionalKey(X) sets `ast.context.isOptional = true`.
+ *
+ * Delegates to {@link SchemaAccessors.isFieldOptional}, which uses the stable
+ * `SchemaAST.isOptional` guard. Re-exported here (and from `Aggregate.ts`) for
+ * backwards-compatible access.
  */
-export const isFieldOptional = (fieldSchema: Schema.Top): boolean => {
-  const ast = (fieldSchema as unknown as Record<string, unknown>).ast as
-    | { context?: { isOptional?: boolean } }
-    | undefined
-  return ast?.context?.isOptional === true
-}
+export const isFieldOptional = (fieldSchema: Schema.Top): boolean =>
+  isFieldOptionalImpl(fieldSchema)
 
 /**
  * Derive a field name from an entity's model identifier.
@@ -186,61 +190,23 @@ export const isSchemaMatchingEntity = (schema: Schema.Top, entity: RefEntity): b
 }
 
 /**
- * Extract the element schema from a field that is Schema.Array(T) or
- * Schema.optionalKey(Schema.Array(T)). Returns T.
+ * Extract the element schema from a field that is `Schema.Array(T)`,
+ * `Schema.NonEmptyArray(T)`, `Schema.optionalKey(Schema.Array(T))`, or
+ * `Schema.optional(Schema.Array(T))`. Returns `T`.
  *
- * In Effect v4 (beta.71+ reintroduced `.value` on Array/NonEmptyArray):
- * - Schema.Array(T) has `ast._tag === "Arrays"`, `.value === T` (no `.schema`)
- * - Schema.optionalKey(Schema.Array(T)) inherits "Arrays" AST but `.schema === Array(T)`
- *   (the inner array, not the element). The element is `.schema.value`. Its AST has
- *   `context.isOptional === true`.
- *
- * `.schema` is kept as a fallback for resilience across beta releases.
+ * Delegates to {@link SchemaAccessors.extractArrayElement}, which routes
+ * through `SchemaAST.isArrays`/`isUnion` guards and the typed `.value` /
+ * `.schema` / `.members` accessors. Re-exported here (and from `Aggregate.ts`)
+ * for backwards-compatible access.
  */
-const arrayElement = (s: Record<string, unknown>): Schema.Top | undefined => {
-  if ("value" in s) return s.value as Schema.Top
-  if ("schema" in s) return s.schema as Schema.Top
-  return undefined
-}
-
-export const extractArrayElement = (fieldSchema: Schema.Top): Schema.Top | undefined => {
-  const s = fieldSchema as unknown as Record<string, unknown>
-  const ast = s.ast as { _tag?: string; context?: { isOptional?: boolean } } | undefined
-
-  if (ast?._tag === "Arrays") {
-    if (ast.context?.isOptional === true && "schema" in s) {
-      // optionalKey(Array(T)): s.schema is Array(T), its element is s.schema.value
-      return arrayElement(s.schema as Record<string, unknown>)
-    }
-    // Direct Array(T): the element is s.value
-    return arrayElement(s)
-  }
-
-  // Schema.optional(Array(T)): ast._tag is "Union" with context.isOptional,
-  // .schema is Union with .members[0] being Schema.Array(T)
-  if (ast?._tag === "Union" && ast.context?.isOptional === true && "schema" in s) {
-    const unionSchema = s.schema as unknown as Record<string, unknown>
-    const members = unionSchema?.members as unknown[] | undefined
-    if (Array.isArray(members)) {
-      for (const member of members) {
-        const m = member as Record<string, unknown>
-        const mAst = m.ast as { _tag?: string } | undefined
-        if (mAst?._tag === "Arrays") {
-          return arrayElement(m)
-        }
-      }
-    }
-  }
-
-  return undefined
-}
+export const extractArrayElement = (fieldSchema: Schema.Top): Schema.Top | undefined =>
+  extractArrayElementImpl(fieldSchema)
 
 /**
- * Access .fields on a Schema.Class or Schema.Struct.
+ * Access `.fields` on a Schema.Class or Schema.Struct.
+ *
+ * Delegates to {@link SchemaAccessors.getSchemaFields} (typed `.fields`).
+ * Re-exported here (and from `Aggregate.ts`) for backwards-compatible access.
  */
-export const getSchemaFields = (schema: Schema.Top): Record<string, Schema.Top> | undefined => {
-  if ("fields" in schema && typeof (schema as Record<string, unknown>).fields === "object") {
-    return (schema as unknown as { fields: Record<string, Schema.Top> }).fields
-  }
-  return undefined
-}
+export const getSchemaFields = (schema: Schema.Top): Record<string, Schema.Top> | undefined =>
+  getSchemaFieldsImpl(schema)

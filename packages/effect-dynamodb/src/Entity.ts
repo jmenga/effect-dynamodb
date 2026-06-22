@@ -186,6 +186,7 @@ import {
   buildFieldEncodings,
   type DerivedSchemas,
   getFields,
+  getSchemaFields,
   primaryKeyComposites,
   type ResolvedSystemFields,
   resolveSystemFields,
@@ -1570,9 +1571,8 @@ const makeImpl = <
 
     const appendInputFields = (() => {
       const ai = ts.appendInput as Schema.Top
-      if ("fields" in ai && typeof (ai as any).fields === "object") {
-        return Object.keys((ai as any).fields)
-      }
+      const fields = getSchemaFields(ai)
+      if (fields) return Object.keys(fields)
       throw new Error(
         `[EDD-9016] Entity "${config.entityType}": timeSeries.appendInput must be a Schema.Struct or Schema.Class (.fields required).`,
       )
@@ -4254,9 +4254,7 @@ const makeImpl = <
         const pkSkComposites = new Set<string>([...primary.pk.composite, ...primary.sk.composite])
         const appendInputTop = timeSeriesConfig.appendInput as Schema.Top
         const appendInputFieldSet = new Set<string>(
-          "fields" in appendInputTop && typeof (appendInputTop as any).fields === "object"
-            ? Object.keys((appendInputTop as any).fields)
-            : [],
+          Object.keys(getSchemaFields(appendInputTop) ?? {}),
         )
         const model = config.model as Schema.Top
         for (const attr of removedSet) {
