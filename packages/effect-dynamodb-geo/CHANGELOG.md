@@ -1,5 +1,24 @@
 # @effect-dynamodb/geo
 
+## 1.9.1
+
+### Patch Changes
+
+- fix(release): resolve `workspace:` protocol at publish time (closes #64).
+
+  `1.9.0` shipped with an unresolved `workspace:` spec (`effect-dynamodb`'s
+  `dependencies."@effect-dynamodb/schema": "workspace:^"`, and `@effect-dynamodb/geo`'s
+  `peerDependencies.effect-dynamodb`), making `effect-dynamodb@1.9.0` uninstallable for
+  consumers. Root cause: `release.yml` published via `npm publish`, which does not
+  rewrite the `workspace:` protocol.
+
+  The publish step now packs each package with `pnpm pack` (which rewrites `workspace:`
+  in `dependencies` and `peerDependencies` to concrete ranges) and publishes the
+  resulting tarball via `npm publish` (preserving OIDC Trusted Publishing + provenance),
+  with a guard that refuses to publish if any `workspace:` spec remains in the packed
+  manifest. No runtime/API changes — 1.9.1 republishes 1.9.0 with correctly resolved
+  dependency ranges.
+
 ## 1.9.0
 
 ### Minor Changes
