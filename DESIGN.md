@@ -471,6 +471,34 @@ The stored TTL attribute is an absolute epoch-seconds expiry computed from the
 plus the configured duration, written to the table's configured TTL attribute
 name (`TableConfig.ttlAttributeName`, default `_ttl`).
 
+### Generated IDs
+
+Opt into auto-generated UUID primary keys with `generatedId`:
+
+```ts
+Entity.make({ …, generatedId?: { field: string; version?: "v4" | "v7" } })  // default version: "v4"
+```
+
+| Config | Behavior |
+|--------|----------|
+| `generatedId: { field: "id" }` | On `put`/`create`/`upsert`, fill `id` with a UUIDv4 when the caller omits it. A caller-supplied value is always respected (never overwritten). |
+| `generatedId: { field: "id", version: "v7" }` | As above, but time-ordered UUIDv7. |
+
+**Make-time validation (EDD-9008).** The named `field` MUST exist in the model **AND** participate in the primary key (pk or sk composite). Generating an id that doesn't compose into the primary key would be a silent no-op, so both conditions are enforced at `Entity.make()` time with a thrown `[EDD-9008]` error. EDD-9008 was the next free code (9006/9007 in use; 9008/9009 free; 9010–9016 are the timeSeries range).
+
+**Schema split — input-optional, record-required.** In the derived `inputSchema` the generated-id field is marked **optional** (caller MAY omit it and let the library fill it), reusing the same `applySystemCollisionAdjustments` / `optionalOnCollide` path that makes colliding `createdAt`/`updatedAt` optional. In the `recordSchema` it stays **required** — a decoded record always carries the id. The type-level optionality is mirrored by `WithGeneratedId<Input, TGeneratedId>` so `Entity.inputSchema.Type` and the `put`/`create`/`upsert` parameter types have the field optional.
+
+**Injection point.** The id is filled on the raw `input` **before** the encode in `Entity.put` (the `encodeOrDecodeEncode` call). `create`/`upsert` inherit via delegation. The filled id then flows through input validation → key composition (PK/SK + any GSI composites it participates in) → stored item → returned record in a single pass.
+
+**`R = never` is preserved — the crux.** `DynamoClient.make(...)` returns bound methods with `R = never`, enforced by hard-typed `provide` helpers. Filling the id requires the cryptographically-secure `Crypto` service (`effect/Crypto`), and `effect-core` ships **no default Crypto layer**. Yielding `Crypto.Crypto` in `put` would naively widen `R` to `… | Crypto.Crypto` and fail at runtime with "Service not found".
+
+The chosen solution (Option 1, the issue's recommendation): **bundle a default `Crypto` service into the context the typed client already captures, and widen the `provide` helpers to admit `Crypto.Crypto`.** Concretely:
+
+- A thin default service (`internal/DefaultCrypto.ts`) is built from `Crypto.make({ randomBytes, digest })` over `globalThis.crypto.getRandomValues` / `crypto.subtle.digest` — **no new dependency** (Web Crypto is available on Node 18+, browsers, and edge runtimes).
+- `Entity.bind` (where bound `put` actually runs) and `DynamoClient.makeFromConfig` each add the default via `Context.add(ctx, Crypto.Crypto, makeDefaultCrypto())` and widen their `provide` helper's input type from `Effect<A, E, DynamoClient | TableConfig>` to `… | Crypto.Crypto`. `Entity.bind` only fills the default when Crypto is absent (`Context.getOption`), so an override is respected.
+- Bound `put` stays `R = never`; the public method signatures are unchanged. Entities **without** `generatedId` never yield `Crypto` (the fill helper returns early), so their unbound ops keep `R = DynamoClient | TableConfig` exactly as before.
+- **Optional platform override:** `DynamoClient.make({ …, crypto?: Crypto.Crypto })` accepts a platform implementation (e.g. from `@effect/platform-node`) which takes precedence over the default. Crypto is **never** surfaced in the public `R` (the rejected Option 2).
+
 ### Unique Constraints
 
 ```typescript

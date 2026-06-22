@@ -721,6 +721,7 @@ export const buildDerivedSchemas = (
   identifierField: string | undefined = undefined,
   timeSeries: TimeSeriesConfig<any> | undefined = undefined,
   fieldEncodings: globalThis.Record<string, DynamoEncoding> = {},
+  generatedIdField: string | undefined = undefined,
 ): DerivedSchemas => {
   // --- Substitute model fields ---
   // Self date schemas (with effective encoding) are replaced with bidirectional
@@ -770,6 +771,10 @@ export const buildDerivedSchemas = (
     optionalOnCollide.add(systemFields.createdAt)
   if (systemFields.updatedAtCollision && systemFields.updatedAt)
     optionalOnCollide.add(systemFields.updatedAt)
+  // Auto-generated id: optional in input (caller may omit and let the library
+  // fill it from the Crypto service) but required in recordSchema (a decoded
+  // record always carries it). Reuses the system-collision optionality path.
+  if (generatedIdField) optionalOnCollide.add(generatedIdField)
   const strippedFromInput = new Set<string>()
   if (systemFields.versionCollision && systemFields.version)
     strippedFromInput.add(systemFields.version)

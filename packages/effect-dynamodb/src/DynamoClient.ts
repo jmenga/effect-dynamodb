@@ -100,7 +100,7 @@ import {
   UpdateTableCommand,
   UpdateTimeToLiveCommand,
 } from "@aws-sdk/client-dynamodb"
-import { Config, Context, Effect, Layer, type Schema } from "effect"
+import { Config, Context, Crypto, Effect, Layer, type Schema } from "effect"
 import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
 import { bind as aggregateBind } from "./Aggregate.js"
 import * as DynamoSchema from "./DynamoSchema.js"
@@ -119,6 +119,7 @@ import {
   ValidationError,
 } from "./Errors.js"
 import { type BoundQueryConfig, BoundQueryImpl } from "./internal/BoundQuery.js"
+import { makeDefaultCrypto } from "./internal/DefaultCrypto.js"
 import type { EntityKeyType, IndexPkInput, IndexSkFields } from "./internal/EntityTypes.js"
 import { createConditionOps } from "./internal/Expr.js"
 import { createPathBuilder } from "./internal/PathBuilder.js"
@@ -387,6 +388,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly entities: TEntities
       readonly aggregates: TAggregates
       readonly tables: TTables
+      readonly crypto?: Crypto.Crypto
     }): Effect.Effect<
       TypedClient<TEntities, TAggregates, TTables>,
       never,
@@ -399,6 +401,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
     >(config: {
       readonly entities: TEntities
       readonly aggregates: TAggregates
+      readonly crypto?: Crypto.Crypto
     }): Effect.Effect<
       TypedClient<TEntities, TAggregates, Record<string, TableLike>>,
       never,
@@ -411,6 +414,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
     >(config: {
       readonly entities: TEntities
       readonly tables: TTables
+      readonly crypto?: Crypto.Crypto
     }): Effect.Effect<
       TypedClient<TEntities, Record<string, never>, TTables>,
       never,
@@ -419,6 +423,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
 
     <TEntities extends Record<string, { readonly _tag: "Entity" }>>(config: {
       readonly entities: TEntities
+      readonly crypto?: Crypto.Crypto
     }): Effect.Effect<
       TypedClient<TEntities, Record<string, never>, Record<string, TableLike>>,
       never,
@@ -497,10 +502,11 @@ export type TypedClient<
       any,
       infer R,
       any,
-      infer TS
+      infer TS,
+      infer GenId
     >
       ? Resolve<
-          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V> & {
+          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId> & {
             /** Scan this entity. Returns a BoundQuery for building scan queries. */
             readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
               Schema.Schema.Type<M>,
@@ -656,12 +662,23 @@ const makeFromConfig = (config: {
   readonly entities: Record<string, EntityType>
   readonly aggregates?: Record<string, AggregateType<any, any, any>>
   readonly tables?: Record<string, TableLike>
+  readonly crypto?: Crypto.Crypto
 }): Effect.Effect<any, never, DynamoClient | TableConfig> =>
   Effect.gen(function* () {
-    // 1. Resolve the provide function from context
-    const ctx = yield* Effect.context<DynamoClient | TableConfig>()
+    // 1. Resolve the provide function from context.
+    //
+    // Bundle a `Crypto` service into the captured context so that bound entity
+    // operations (auto-generated UUID primary keys via `generatedId`) resolve a
+    // cryptographically-secure source WITHOUT widening the public `R` of bound
+    // methods — bound `put` stays `R = never`. A caller-supplied `crypto`
+    // override (e.g. `@effect/platform-node`) takes precedence over the default
+    // `globalThis.crypto`-backed wrapper. The `provide` helper is widened to
+    // admit `Crypto.Crypto`. See `DESIGN.md` for the `R = never` rationale.
+    const baseCtx = yield* Effect.context<DynamoClient | TableConfig>()
+    const cryptoService = config.crypto ?? makeDefaultCrypto()
+    const ctx = Context.add(baseCtx, Crypto.Crypto, cryptoService)
     const provide = <A, E>(
-      effect: Effect.Effect<A, E, DynamoClient | TableConfig>,
+      effect: Effect.Effect<A, E, DynamoClient | TableConfig | Crypto.Crypto>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
 
     // Helper: validate query composites at runtime
@@ -793,7 +810,16 @@ const makeFromConfig = (config: {
     >()
 
     for (const [key, entity] of Object.entries(config.entities)) {
-      const bound = yield* entityBind(entity as EntityType)
+      // Provide the resolved Crypto service into the bind so the bound `put`
+      // (which yields `Crypto.Crypto` when `generatedId` is configured) resolves
+      // it from context — keeping the bound method at `R = never`. `bind`
+      // respects an already-present Crypto and only fills its own default when
+      // absent, so this override is honored.
+      const bound = yield* Effect.provideService(
+        entityBind(entity as EntityType),
+        Crypto.Crypto,
+        cryptoService,
+      )
       const entityLike = entity as unknown as EntityLike
       const accessors: Record<string, unknown> = {}
 

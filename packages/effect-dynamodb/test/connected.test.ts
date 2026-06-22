@@ -4247,3 +4247,121 @@ describeConnected("TableConfig.ttlAttributeName override (closes #51)", () => {
     }).pipe(provideTtl),
   )
 })
+
+// ---------------------------------------------------------------------------
+// generatedId — auto-generated UUID primary keys via the Crypto service (#57)
+// ---------------------------------------------------------------------------
+
+const genIdSchema = DynamoSchema.make({ name: "genid-test", version: 1 })
+const genIdTableName = `genid-test-${Date.now()}`
+
+class GenWidget extends Schema.Class<GenWidget>("GenWidget")({
+  widgetId: Schema.String,
+  owner: Schema.String,
+  label: Schema.NonEmptyString,
+}) {}
+
+// The generated `widgetId` composes into BOTH the primary key AND the
+// `byOwner` GSI sort-key — so we can assert the item is queryable by primary
+// key and by the GSI the generated id participates in.
+const GenWidgets = Entity.make({
+  model: GenWidget,
+  entityType: "GenWidget",
+  primaryKey: {
+    pk: { field: "pk", composite: ["widgetId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byOwner: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["owner"] },
+      sk: { field: "gsi1sk", composite: ["widgetId"] },
+    },
+  },
+  generatedId: { field: "widgetId" },
+  timestamps: true,
+})
+
+const GenIdTable = Table.make({ schema: genIdSchema, entities: { GenWidgets } })
+const GenIdTestLayer = Layer.mergeAll(ClientLayer, GenIdTable.layer({ name: genIdTableName }))
+const provideGenId = Effect.provide(GenIdTestLayer)
+
+describeConnected("generatedId integration tests (closes #57)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: genIdTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(GenIdTable),
+        })
+      }).pipe(provideGenId, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: genIdTableName })
+      }).pipe(
+        provideGenId,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  // UUID-validation schema (issue requests Schema.isUUID for the format check).
+  const UUID = Schema.String.check(Schema.isUUID())
+
+  it.effect("put WITHOUT id → read back → id present, valid UUID, queryable by PK + GSI", () =>
+    // The typed client requires NO Crypto layer (R = never end-to-end): the
+    // default Crypto is bundled by DynamoClient.make. GenIdTestLayer provides
+    // only DynamoClient + TableConfig.
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { GenWidgets },
+        tables: { GenIdTable },
+      })
+
+      // No widgetId supplied — the library fills it from the bundled Crypto.
+      const created = yield* db.entities.GenWidgets.put({ owner: "alice", label: "Sprocket" })
+
+      // id present and a valid UUID.
+      expect(typeof created.widgetId).toBe("string")
+      const isUuid = yield* Schema.decodeUnknownEffect(UUID)(created.widgetId).pipe(
+        Effect.as(true),
+        Effect.catch(() => Effect.succeed(false)),
+      )
+      expect(isUuid).toBe(true)
+
+      // Queryable by primary key (the generated id composed into the PK).
+      const fetched = yield* db.entities.GenWidgets.get({ widgetId: created.widgetId })
+      expect(fetched.widgetId).toBe(created.widgetId)
+      expect(fetched.label).toBe("Sprocket")
+
+      // Queryable by the GSI the generated id composes into.
+      const byOwner = yield* db.entities.GenWidgets.byOwner({ owner: "alice" }).collect()
+      expect(byOwner.map((w) => w.widgetId)).toContain(created.widgetId)
+    }).pipe(provideGenId),
+  )
+
+  it.effect("caller-supplied id is respected over auto-generation", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { GenWidgets },
+        tables: { GenIdTable },
+      })
+      const created = yield* db.entities.GenWidgets.put({
+        widgetId: "explicit-widget-1",
+        owner: "bob",
+        label: "Cog",
+      })
+      expect(created.widgetId).toBe("explicit-widget-1")
+      const fetched = yield* db.entities.GenWidgets.get({ widgetId: "explicit-widget-1" })
+      expect(fetched.owner).toBe("bob")
+    }).pipe(provideGenId),
+  )
+})

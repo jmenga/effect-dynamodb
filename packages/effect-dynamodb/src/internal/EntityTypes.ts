@@ -148,6 +148,25 @@ export type SystemFieldsType<TTimestamps, TVersioned, TTimeSeries = undefined> =
       ? {}
       : { readonly version: number })
 
+/**
+ * Make the auto-generated id field optional on an input type.
+ *
+ * When an entity declares `generatedId: { field: "id" }`, the `id` field is
+ * filled by the library at write time when the caller omits it. The input type
+ * therefore marks the field optional (caller MAY supply it to override). The
+ * record/return type keeps it required — a decoded record always carries it.
+ *
+ * `TGeneratedId` is the `generatedId` config (or `undefined`). When absent the
+ * input type is returned unchanged.
+ */
+export type WithGeneratedId<T, TGeneratedId> = [TGeneratedId] extends [undefined]
+  ? T
+  : TGeneratedId extends { readonly field: infer F extends string }
+    ? F extends keyof T
+      ? Simplify<Omit<T, F> & Partial<Pick<T, F>>>
+      : T
+    : T
+
 /** Entity key type: Pick model fields by primary key composites */
 export type EntityKeyType<TModel extends Schema.Top, TIndexes> = Pick<
   ModelType<TModel>,

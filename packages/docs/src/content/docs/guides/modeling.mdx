@@ -273,6 +273,43 @@ softDelete: { ttl: Duration.days(30), preserveUnique: true }
 
 See [Lifecycle](/effect-dynamodb/guides/lifecycle/) for details on versioning and soft delete.
 
+### Generated IDs
+
+Opt into auto-generated UUID primary keys with `generatedId`. The named field is filled with a cryptographically-secure UUID at write time **when the caller omits it** — a caller-supplied value is always respected. The field MUST exist in the model AND participate in the primary key (pk or sk composite); violating either throws `EDD-9008` at `make()` time.
+
+```typescript region="entity" example="generated-id.ts"
+const Widgets = Entity.make({
+  model: Widget,
+  entityType: "Widget",
+  primaryKey: {
+    pk: { field: "pk", composite: ["widgetId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byOwner: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["owner"] },
+      sk: { field: "gsi1sk", composite: ["widgetId"] },
+    },
+  },
+  // Auto-generate `widgetId` with a UUIDv4 when the caller omits it.
+  generatedId: { field: "widgetId" },
+})
+```
+
+`version` defaults to `"v4"` (random); pass `version: "v7"` for time-ordered ids. On `put`/`create`/`upsert` the field is optional in the input — omit it to auto-generate, or supply your own to override:
+
+```typescript region="put" example="generated-id.ts"
+// No `widgetId` supplied — the library fills it from the Crypto service.
+const created = yield* db.entities.Widgets.put({
+  owner: "alice",
+  label: "Sprocket",
+})
+// created.widgetId is a freshly-generated UUID
+```
+
+The id is sourced from the bundled [`Crypto`](https://github.com/Effect-TS/effect-smol) service. `DynamoClient.make` provides a default `globalThis.crypto`-backed implementation (no extra dependency), so bound `put` stays `R = never` — your program needs no Crypto layer. Pass `DynamoClient.make({ crypto })` to override with a platform implementation (e.g. `@effect/platform-node`).
+
 ### Unique Constraints
 
 ```typescript
