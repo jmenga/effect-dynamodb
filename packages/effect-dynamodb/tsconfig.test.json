@@ -5,6 +5,11 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["src", "test/Entity.types.test.ts", "test/Aggregate.types.test.ts"],
+  "include": [
+    "src",
+    "test/Entity.types.test.ts",
+    "test/Aggregate.types.test.ts",
+    "test/PureAuthoring.types.test.ts"
+  ],
   "exclude": ["node_modules", "dist"]
 }

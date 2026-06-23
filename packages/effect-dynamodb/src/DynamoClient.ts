@@ -101,6 +101,7 @@ import {
   UpdateTimeToLiveCommand,
 } from "@aws-sdk/client-dynamodb"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import type { EntityDefinition } from "@effect-dynamodb/schema/Entity.js"
 import {
   DynamoError,
   DynamoValidationError,
@@ -125,7 +126,7 @@ import { Config, Context, Crypto, Effect, Layer, type Schema } from "effect"
 import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
 import { bind as aggregateBind } from "./Aggregate.js"
 import type { BoundEntity, Entity as EntityType } from "./Entity.js"
-import { bind as entityBind } from "./Entity.js"
+import { bind as entityBind, fromDefinition as entityFromDefinition } from "./Entity.js"
 import { type BoundQueryConfig, BoundQueryImpl } from "./internal/BoundQuery.js"
 import { createConditionOps } from "./internal/Expr.js"
 import { createPathBuilder } from "./internal/PathBuilder.js"
@@ -494,7 +495,19 @@ export type TypedClient<
   TAggregates extends Record<string, AggregateType<any, any, any>> = Record<string, never>,
   TTables extends Record<string, TableLike> = Record<string, TableLike>,
 > = {
-  /** Bound entities with CRUD + query accessors for each index. */
+  /**
+   * Bound entities with CRUD + query accessors for each index.
+   *
+   * A member may be a runtime `Entity` (authored with `effect-dynamodb`'s
+   * `Entity.make`) OR a pure `EntityDefinition` (authored with
+   * `@effect-dynamodb/schema`'s `Entity.make` — the AWS-free contract surface).
+   * Both carry the same 11 type parameters, so both map to the same bound shape.
+   * The runtime branch forwards the inferred refs `R`; the pure branch maps refs
+   * to `undefined` — the two packages declare nominally distinct `AnyRefValue`
+   * types, so forwarding a schema-package refs type into the runtime
+   * `BoundEntity` would violate its `TRefs` constraint. `make()` promotes pure
+   * definitions to runtime entities at bind time, so this is type-only.
+   */
   readonly entities: {
     readonly [K in keyof TEntities]: TEntities[K] extends EntityType<
       infer M,
@@ -519,7 +532,30 @@ export type TypedClient<
             >
           } & EntityIndexAccessors<M, I, R>
         >
-      : never
+      : TEntities[K] extends EntityDefinition<
+            infer M,
+            any,
+            infer I,
+            infer Ts,
+            infer V,
+            any,
+            any,
+            any,
+            any,
+            infer TS,
+            infer GenId
+          >
+        ? Resolve<
+            BoundEntity<M, I, undefined, ResolveKey<M, I>, TS, Ts, V, GenId> & {
+              /** Scan this entity. Returns a BoundQuery for building scan queries. */
+              readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
+                Schema.Schema.Type<M>,
+                never,
+                Schema.Schema.Type<M>
+              >
+            } & EntityIndexAccessors<M, I, undefined>
+          >
+        : never
   }
 
   /** Bound aggregates with CRUD + list operations (R = never). */
@@ -813,7 +849,18 @@ const makeFromConfig = (config: {
       Array<{ entityKey: string; entityLike: EntityLike; indexDef: IndexDefinition }>
     >()
 
-    for (const [key, entity] of Object.entries(config.entities)) {
+    for (const [key, rawEntity] of Object.entries(config.entities)) {
+      // A member may be a pure `@effect-dynamodb/schema` EntityDefinition (the
+      // headline output of the schema/runtime split) rather than a runtime
+      // Entity. Pure definitions carry no operations or `_decodeRecord`, so
+      // binding one directly would crash at call time. Promote it to a full
+      // runtime Entity (a thin op-attach over its retained `_data`) so the bound
+      // CRUD, query accessors, and collection decode all work. Runtime-authored
+      // entities already carry `.get` and pass through untouched.
+      const entity =
+        typeof (rawEntity as { get?: unknown }).get === "function"
+          ? rawEntity
+          : entityFromDefinition(rawEntity as unknown as EntityDefinition)
       // Provide the resolved Crypto service into the bind so the bound `put`
       // (which yields `Crypto.Crypto` when `generatedId` is configured) resolves
       // it from context — keeping the bound method at `R = never`. `bind`

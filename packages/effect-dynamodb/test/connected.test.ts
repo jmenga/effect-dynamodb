@@ -28,6 +28,7 @@ const FROZEN_SECONDS = 1_780_272_000
 
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -4363,5 +4364,145 @@ describeConnected("generatedId integration tests (closes #57)", () => {
       const fetched = yield* db.entities.GenWidgets.get({ widgetId: "explicit-widget-1" })
       expect(fetched.owner).toBe("bob")
     }).pipe(provideGenId),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// #69 — pure @effect-dynamodb/schema authoring bound via DynamoClient.make
+//
+// Entities authored with the AWS-free `@effect-dynamodb/schema` `Entity.make`
+// (the headline of the schema/runtime split) must round-trip against real
+// DynamoDB once bound. DynamoClient.make promotes each pure definition to a full
+// runtime entity (a thin op-attach over its retained `_data`). This validates
+// marshalling/decoding end-to-end — the deferred-decode crash class only
+// surfaces on a non-empty read, so every read here returns >= 1 item.
+// ---------------------------------------------------------------------------
+
+class PureUser extends Schema.Class<PureUser>("PureUser")({
+  orgId: Schema.String,
+  userId: Schema.String,
+  email: Schema.String,
+  name: Schema.String,
+}) {}
+
+class PureTeam extends Schema.Class<PureTeam>("PureTeam")({
+  orgId: Schema.String,
+  teamId: Schema.String,
+  label: Schema.String,
+}) {}
+
+const PureUsers = PureEntity.make({
+  model: PureUser,
+  entityType: "PureUser",
+  primaryKey: {
+    pk: { field: "pk", composite: ["orgId"] },
+    sk: { field: "sk", composite: ["userId"] },
+  },
+  indexes: {
+    usersByOrg: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["orgId"] },
+      sk: { field: "gsi1sk", composite: ["userId"] },
+      collection: "pureMembers",
+    },
+  },
+})
+
+const PureTeams = PureEntity.make({
+  model: PureTeam,
+  entityType: "PureTeam",
+  primaryKey: {
+    pk: { field: "pk", composite: ["orgId"] },
+    sk: { field: "sk", composite: ["teamId"] },
+  },
+  indexes: {
+    teamsByOrg: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["orgId"] },
+      sk: { field: "gsi1sk", composite: ["teamId"] },
+      collection: "pureMembers",
+    },
+  },
+})
+
+const PureTable = Table.make({ schema: AppSchema, entities: { PureUsers, PureTeams } })
+const pureTableName = "edd-pure-authoring-connected"
+const PureTestLayer = Layer.mergeAll(ClientLayer, PureTable.layer({ name: pureTableName }))
+const providePure = Effect.provide(PureTestLayer)
+
+describeConnected("#69 — pure schema authoring → DynamoClient.make → real DynamoDB", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client
+          .createTable({
+            TableName: pureTableName,
+            BillingMode: "PAY_PER_REQUEST",
+            ...Table.definition(PureTable),
+          })
+          .pipe(Effect.catch(() => Effect.void))
+      }).pipe(providePure, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: pureTableName })
+      }).pipe(
+        providePure,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("round-trips put/get/query/scan/collection/update/delete", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { PureUsers, PureTeams },
+        tables: { PureTable },
+      })
+
+      yield* db.entities.PureUsers.put({
+        orgId: "acme",
+        userId: "u1",
+        email: "a@x.io",
+        name: "Ann",
+      })
+      yield* db.entities.PureUsers.put({
+        orgId: "acme",
+        userId: "u2",
+        email: "b@x.io",
+        name: "Bob",
+      })
+      yield* db.entities.PureTeams.put({ orgId: "acme", teamId: "t1", label: "Eng" })
+
+      const ann = yield* db.entities.PureUsers.get({ orgId: "acme", userId: "u1" })
+      expect(ann.name).toBe("Ann")
+
+      const usersByOrg = yield* db.entities.PureUsers.usersByOrg({ orgId: "acme" }).collect()
+      expect(usersByOrg.map((u) => u.userId).sort()).toEqual(["u1", "u2"])
+
+      const scanned = yield* db.entities.PureUsers.scan().collect()
+      expect(scanned.length).toBeGreaterThanOrEqual(2)
+
+      const grouped = (yield* db.collections.pureMembers({ orgId: "acme" }).collect()) as {
+        PureUsers: PureUser[]
+        PureTeams: PureTeam[]
+      }
+      expect(grouped.PureUsers.map((u) => u.userId).sort()).toEqual(["u1", "u2"])
+      expect(grouped.PureTeams.map((t) => t.teamId)).toEqual(["t1"])
+
+      yield* db.entities.PureUsers.update({ orgId: "acme", userId: "u1" }).set({ name: "Annie" })
+      const updated = yield* db.entities.PureUsers.get({ orgId: "acme", userId: "u1" })
+      expect(updated.name).toBe("Annie")
+
+      yield* db.entities.PureUsers.delete({ orgId: "acme", userId: "u2" })
+      const remaining = yield* db.entities.PureUsers.usersByOrg({ orgId: "acme" }).collect()
+      expect(remaining.map((u) => u.userId)).toEqual(["u1"])
+    }).pipe(providePure),
   )
 })

@@ -201,6 +201,28 @@ export interface EntityDefinitionData {
 }
 
 /**
+ * @internal The normalized config a definition was built from — model, entity
+ * type, indexes (with `primary`), and all lifecycle/ref configuration. Retained
+ * on the pure definition so the runtime `effect-dynamodb` package can promote it
+ * to a full operational `Entity` (attaching CRUD/query operations) without the
+ * caller re-authoring it. Mirrors the input to {@link buildEntityDefinition}.
+ */
+export interface EntityDefinitionConfig {
+  readonly model: Schema.Top | ConfiguredModel<Schema.Top, any>
+  readonly entityType: string
+  readonly indexes: globalThis.Record<string, IndexDefinition> & {
+    readonly primary: IndexDefinition
+  }
+  readonly timestamps?: TimestampsConfig | undefined
+  readonly versioned?: VersionedConfig | undefined
+  readonly softDelete?: SoftDeleteConfig | undefined
+  readonly unique?: UniqueConfig | undefined
+  readonly refs?: globalThis.Record<string, AnyRefValue> | undefined
+  readonly timeSeries?: TimeSeriesConfig<any> | undefined
+  readonly generatedId?: GeneratedIdConfig | undefined
+}
+
+/**
  * The pure definition produced by {@link make}. Carries the model binding,
  * index definitions, system-field configuration, derived schemas, and the
  * `_configure` / `_injectIndex` hooks used by the runtime binding layer. Does
@@ -261,6 +283,19 @@ export interface EntityDefinition<
   readonly _schema: DynamoSchema.DynamoSchema
   /** @internal Injected TableConfig tag — available after _configure(). */
   readonly _tableTag: unknown
+
+  /**
+   * @internal The normalized config this definition was built from. Used by the
+   * runtime `effect-dynamodb` package to promote a pure definition to a full
+   * operational Entity (see {@link EntityDefinitionConfig}).
+   */
+  readonly _config: EntityDefinitionConfig
+  /**
+   * @internal The derived data bundle (see {@link EntityDefinitionData}). Lets
+   * the runtime attach operations without re-running derivation — promotion is a
+   * thin op-attach rather than a full re-derive.
+   */
+  readonly _data: EntityDefinitionData
 
   /** Resolved system field names */
   readonly systemFields: ResolvedSystemFields
@@ -969,6 +1004,10 @@ const makeDefinitionImpl = (config: {
     inputSchema: data.schemas.inputSchema as any,
     createSchema: data.schemas.createSchema as any,
     updateSchema: data.schemas.updateSchema as any,
+    // Retain the normalized config + derived data so the runtime package can
+    // promote this pure definition into a full operational Entity.
+    _config: config,
+    _data: data,
   }
   return definition as unknown as EntityDefinition
 }

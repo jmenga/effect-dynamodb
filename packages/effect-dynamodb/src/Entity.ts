@@ -14,13 +14,7 @@ import {
   type ExtractIdentifier,
   getIdentifierField,
   getSparseFields,
-  isConfiguredModel,
-  isHidden,
-  isRecordAst,
-  isRecordSchema,
-  isRef,
   isRefField,
-  type SparseConfig,
 } from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
@@ -29,7 +23,6 @@ import {
   ItemNotFound,
   isAwsConditionalCheckFailed,
   isAwsTransactionCancelled,
-  makeCompositeNullableError,
   OptimisticLockError,
   RefNotFound,
   StaleAppend,
@@ -41,17 +34,7 @@ import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypt
 import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { normalizeGsiConfig } from "@effect-dynamodb/schema/KeyComposer.js"
-import {
-  Context,
-  Crypto,
-  DateTime,
-  type Duration,
-  Effect,
-  Option,
-  Schema,
-  SchemaAST,
-  Stream,
-} from "effect"
+import { Context, Crypto, DateTime, type Duration, Effect, Option, Schema, Stream } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import type { ConditionInput } from "./Expression.js"
 import {
@@ -196,16 +179,11 @@ interface AnyRefValue {
 import {
   allCompositeAttributes,
   allKeyFieldNames,
-  buildDerivedSchemas,
-  buildFieldEncodings,
   type DerivedSchemas,
-  getFields,
   getSchemaFields,
   primaryKeyComposites,
   type ResolvedSystemFields,
-  resolveSystemFields,
   resolveUniqueFields,
-  validateNoTransformOverride,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import type {
   AppendInputType,
@@ -252,7 +230,14 @@ export type { IndexDefinition, KeyPart }
  * imported here for local use on the write path. `normalizeTtlSeconds` is
  * re-exported below so the public `Entity` namespace surface is unchanged.
  */
-import { normalizeTtlSeconds, resolveUniqueTtl } from "@effect-dynamodb/schema/Entity.js"
+import {
+  buildEntityDefinition,
+  type EntityDefinition,
+  type EntityDefinitionConfig,
+  type EntityDefinitionData,
+  normalizeTtlSeconds,
+  resolveUniqueTtl,
+} from "@effect-dynamodb/schema/Entity.js"
 
 export { normalizeTtlSeconds }
 
@@ -1358,6 +1343,48 @@ export const make = <
   return makeImpl({ ...config, indexes }) as any
 }
 
+/**
+ * @internal Resolved ref metadata + the operational target entity. Mirrors the
+ * pure-side `ResolvedRef` but types `refEntity` as the runtime {@link Entity}, so
+ * write-time hydration can call its CRUD operations.
+ */
+interface ResolvedRef {
+  readonly fieldName: string
+  readonly idFieldName: string
+  readonly identifierField: string
+  readonly identifierSchema: Schema.Top
+  readonly refEntity: Entity
+  readonly refEntityType: string
+}
+
+/**
+ * Promote a pure `@effect-dynamodb/schema` {@link EntityDefinition} into a full
+ * operational runtime {@link Entity}, attaching CRUD/query operations. The
+ * already-derived data bundle (`def._data`) is reused, so this is a thin
+ * op-attach — no re-validation or re-derivation. The table binding the pure
+ * definition already received (via `Table.make`) is preserved.
+ *
+ * Used by `DynamoClient.make()` to bind pure definitions; idempotent on an
+ * entity that is already operational.
+ *
+ * @internal
+ */
+export const fromDefinition = (def: EntityDefinition): Entity => {
+  const runtime = makeImpl(
+    def._config as unknown as Parameters<typeof makeImpl>[0],
+    def._data,
+  ) as unknown as Entity
+  // Carry over schema + table tag injected into the pure definition (Table.make
+  // calls _configure at table-definition time, before DynamoClient.make runs).
+  if (def._schema !== undefined && def._tableTag !== undefined) {
+    runtime._configure(
+      def._schema,
+      def._tableTag as import("effect").Context.Service<TableConfig, TableConfig>,
+    )
+  }
+  return runtime
+}
+
 const makeImpl = <
   TModel extends Schema.Top,
   const TEntityType extends string,
@@ -1376,18 +1403,21 @@ const makeImpl = <
   const TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   const TGeneratedId extends GeneratedIdConfig | undefined = undefined,
   const TAttrs extends {} = {},
->(config: {
-  readonly model: TModel | ConfiguredModel<TModel, TAttrs>
-  readonly entityType: TEntityType
-  readonly indexes: typeof undefined extends never ? never : TIndexes
-  readonly timestamps?: TTimestamps
-  readonly versioned?: TVersioned
-  readonly softDelete?: TSoftDelete
-  readonly unique?: TUnique
-  readonly refs?: TRefs
-  readonly timeSeries?: TTimeSeries
-  readonly generatedId?: TGeneratedId
-}): Entity<
+>(
+  config: {
+    readonly model: TModel | ConfiguredModel<TModel, TAttrs>
+    readonly entityType: TEntityType
+    readonly indexes: typeof undefined extends never ? never : TIndexes
+    readonly timestamps?: TTimestamps
+    readonly versioned?: TVersioned
+    readonly softDelete?: TSoftDelete
+    readonly unique?: TUnique
+    readonly refs?: TRefs
+    readonly timeSeries?: TTimeSeries
+    readonly generatedId?: TGeneratedId
+  },
+  precomputedData?: EntityDefinitionData,
+): Entity<
   TModel,
   TEntityType,
   TIndexes,
@@ -1400,578 +1430,46 @@ const makeImpl = <
   TTimeSeries,
   TGeneratedId
 > => {
-  // Unwrap ConfiguredModel to get the raw model and attribute overrides
-  const configured = isConfiguredModel(config.model) ? config.model : undefined
-  const rawModel = configured ? configured.model : (config.model as Schema.Top)
-  const configuredAttributes = configured?.attributes ?? {}
-  const isSchemaClass = typeof rawModel === "function"
-  const modelFields = getFields(rawModel)
-  const hasHiddenFields = Object.values(modelFields).some(isHidden)
-  const systemFields = resolveSystemFields(
-    config.timestamps,
-    config.versioned,
-    config.timeSeries,
-    modelFields,
-    configuredAttributes,
-  )
-
-  // System-field collision policy:
-  //   - Timestamp collisions with a non-date model field silently yield the
-  //     field to the user (see `resolveSystemFields`).
-  //   - `version` collision is allowed. The field is stripped from
-  //     `inputSchema` / `createSchema` / `updateSchema` (see
-  //     `buildDerivedSchemas`), so user code cannot supply it via `put` /
-  //     `create` / `.set()`. Library continues to own the write path
-  //     (auto-increment + `.expectedVersion()` optimistic locking). The model
-  //     declaration is purely for type-level visibility — callers can
-  //     construct Schema.Class instances and read `version` off the record.
-  //   - Manual version fixups remain available by dropping to the raw
-  //     `DynamoClient` service; they deliberately do not appear on the
-  //     `Entity` surface to keep the locking invariant visibly inviolable.
-
-  // ---------------------------------------------------------------------------
-  // Validate indexes
-  // ---------------------------------------------------------------------------
-
-  const primaryIndex = config.indexes.primary
-  if (primaryIndex.pk.composite.length === 0 && primaryIndex.sk.composite.length === 0) {
-    throw new Error(
-      `[EDD-9001] Entity "${config.entityType}": primary key must have at least one composite attribute in pk or sk`,
-    )
-  }
-
-  // Build the set of valid composite attribute names: model fields + ref-derived ID fields
-  const validCompositeFields = new Set(Object.keys(modelFields))
-  for (const fieldName of Object.keys(modelFields)) {
-    if (isRefField(fieldName, config.model as Schema.Top)) {
-      validCompositeFields.add(`${fieldName}Id`)
-    }
-  }
-
-  for (const [indexName, indexDef] of Object.entries(config.indexes)) {
-    for (const attr of [...indexDef.pk.composite, ...indexDef.sk.composite]) {
-      if (!validCompositeFields.has(attr)) {
-        throw new Error(
-          `[EDD-9002] Entity "${config.entityType}": index "${indexName}" references unknown attribute "${attr}". ` +
-            `Valid attributes: ${[...validCompositeFields].sort().join(", ")}`,
-        )
-      }
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // EDD-9025: composite attribute schemas must not include `null`.
-  //
-  // Composites participate in string composition (`acc#X#alert#Y`); `null` is
-  // not a meaningful slot value. Allowing `Schema.NullOr` / `NullishOr` /
-  // `Schema.Union([..., Schema.Null])` on a composite would let
-  // `set({ composite: null })` typecheck (after the v1.6 update-payload
-  // widening was reverted), then either blow up at runtime or silently
-  // produce a key with the literal string `"null"` as a slot.
-  //
-  // Sparse pattern is still expressible via `Schema.optional(...)` (T |
-  // undefined), which produces no Null AST node. See DESIGN.md §7.
-  // ---------------------------------------------------------------------------
-
-  // Resolve the AST for a domain composite name. For ref-derived `${name}Id`
-  // composites, the schema is the referenced entity's identifier schema (not
-  // the model field). For all other composites, it's the model field's
-  // schema. Returns undefined when the composite isn't declared on the model
-  // (already caught by EDD-9002 above, so this is defensive).
-  const resolveCompositeSchemaForNullCheck = (
-    compositeAttr: string,
-  ): { readonly schema: Schema.Top; readonly source: string } | undefined => {
-    if (compositeAttr in modelFields) {
-      return { schema: modelFields[compositeAttr] as Schema.Top, source: `model field` }
-    }
-    // Ref-derived ${name}Id composite — look up the identifier schema on the
-    // referenced entity's model. We can't use the resolvedRefs array here
-    // (it's built later); recompute inline against config.refs.
-    if (config.refs) {
-      for (const [refFieldName, refValue] of Object.entries(config.refs)) {
-        if (`${refFieldName}Id` !== compositeAttr) continue
-        const refEntity = (refValue as { entity: Entity }).entity
-        const idField = getIdentifierField(refEntity.model as Schema.Top)
-        if (!idField) return undefined
-        return { schema: idField.schema, source: `ref "${refFieldName}" identifier` }
-      }
-    }
-    return undefined
-  }
-
-  // Recursively walk an AST and return a path-string if `null` is reachable
-  // in the type union (anywhere — direct, nested in Union, behind Suspend).
-  // `Schema.optional(X)` produces `T | undefined` (no Null) and is allowed.
-  // `Schema.NullOr(X)` produces `T | null` and is rejected.
-  const findNullInAst = (
-    ast: SchemaAST.AST,
-    path: string,
-    seen: Set<SchemaAST.AST> = new Set(),
-  ): string | undefined => {
-    if (seen.has(ast)) return undefined
-    seen.add(ast)
-    if (SchemaAST.isNull(ast)) return `${path}.Null`
-    if (SchemaAST.isUnion(ast)) {
-      for (let i = 0; i < ast.types.length; i++) {
-        const found = findNullInAst(ast.types[i]!, `${path}.Union[${i}]`, seen)
-        if (found) return found
-      }
-    }
-    // Other AST shapes (Declaration, String, Number, Suspend, ...) cannot
-    // introduce `null` themselves. Suspend wrappers are handled
-    // conservatively — we don't recurse into thunks because the EDD-9025
-    // check is about static type unions, and recursive schemas wrapping
-    // composite-eligible scalars are pathological for keys anyway.
-    return undefined
-  }
-
-  const checkCompositeForNull = (surface: string, compositeAttr: string): void => {
-    const resolved = resolveCompositeSchemaForNullCheck(compositeAttr)
-    if (!resolved) return // EDD-9002 already caught the unknown-attribute case
-    const found = findNullInAst(resolved.schema.ast, resolved.source)
-    if (found) {
-      throw makeCompositeNullableError({
-        entityType: config.entityType,
-        surface,
-        compositeAttribute: compositeAttr,
-        schemaPath: found,
-      })
-    }
-  }
-
-  // primaryKey composites
-  for (const attr of [
-    ...config.indexes.primary.pk.composite,
-    ...config.indexes.primary.sk.composite,
-  ]) {
-    checkCompositeForNull("primaryKey", attr)
-  }
-  // GSI composites (each index)
-  for (const [indexName, indexDef] of Object.entries(config.indexes)) {
-    if (indexName === "primary") continue
-    for (const attr of [...indexDef.pk.composite, ...indexDef.sk.composite]) {
-      checkCompositeForNull(`index "${indexName}"`, attr)
-    }
-  }
-  // Unique constraint composites — `unique` is keyed by constraint name,
-  // value is a single field name OR an array of field names OR a config
-  // object. resolveUniqueFields normalises all three to a list of field names.
-  if (config.unique) {
-    for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
-      const fields = resolveUniqueFields(constraintDef)
-      for (const f of fields) {
-        checkCompositeForNull(`unique:${constraintName}`, f)
-      }
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Validate timeSeries config (EDD-9010..9016)
-  // ---------------------------------------------------------------------------
-  if (config.timeSeries !== undefined && config.timeSeries !== null) {
-    const ts = config.timeSeries as TimeSeriesConfig<any>
-    const orderBy = ts.orderBy
-
-    // EDD-9010: orderBy must name a model field
-    if (!(orderBy in modelFields)) {
-      throw new Error(
-        `[EDD-9010] Entity "${config.entityType}": timeSeries.orderBy "${orderBy}" does not name a model field. ` +
-          `Valid model fields: ${Object.keys(modelFields).sort().join(", ")}`,
-      )
-    }
-
-    // EDD-9011: orderBy must not be a primary-key composite (PK or SK)
-    const primary = config.indexes.primary
-    const pkSkComposites = new Set([...primary.pk.composite, ...primary.sk.composite])
-    if (pkSkComposites.has(orderBy)) {
-      throw new Error(
-        `[EDD-9011] Entity "${config.entityType}": timeSeries.orderBy "${orderBy}" must not appear ` +
-          `in the primary key pk or sk composite — it shadows the #e# event-SK infix.`,
-      )
-    }
-
-    // EDD-9012: mutually exclusive with versioned
-    if (config.versioned !== undefined && config.versioned !== null && config.versioned !== false) {
-      throw new Error(
-        `[EDD-9012] Entity "${config.entityType}": timeSeries and versioned are mutually exclusive. ` +
-          `Pick one consistency model per entity.`,
-      )
-    }
-
-    // EDD-9015: mutually exclusive with softDelete
-    if (
-      config.softDelete !== undefined &&
-      config.softDelete !== null &&
-      config.softDelete !== false
-    ) {
-      throw new Error(
-        `[EDD-9015] Entity "${config.entityType}": timeSeries and softDelete are mutually exclusive. ` +
-          `Append on a soft-deleted item would land on a new empty row — not a sound resurrection model.`,
-      )
-    }
-
-    // EDD-9016: appendInput is required
-    if (ts.appendInput === undefined || ts.appendInput === null) {
-      throw new Error(
-        `[EDD-9016] Entity "${config.entityType}": timeSeries.appendInput is required. ` +
-          `Define a Schema.Struct whose fields are the subset of the model allowed in .append() input. ` +
-          `Fields outside appendInput are preserved on the current item — this is the enrichment-preservation guarantee. ` +
-          `To opt out (dangerous), pass the full model schema explicitly.`,
-      )
-    }
-
-    const appendInputFields = (() => {
-      const ai = ts.appendInput as Schema.Top
-      const fields = getSchemaFields(ai)
-      if (fields) return Object.keys(fields)
-      throw new Error(
-        `[EDD-9016] Entity "${config.entityType}": timeSeries.appendInput must be a Schema.Struct or Schema.Class (.fields required).`,
-      )
-    })()
-    const appendInputFieldSet = new Set(appendInputFields)
-
-    // EDD-9013: appendInput must include orderBy + all PK/SK composites
-    if (!appendInputFieldSet.has(orderBy)) {
-      throw new Error(
-        `[EDD-9013] Entity "${config.entityType}": timeSeries.appendInput must include orderBy "${orderBy}". ` +
-          `Without it .append() cannot evaluate the CAS condition.`,
-      )
-    }
-    for (const composite of pkSkComposites) {
-      if (!appendInputFieldSet.has(composite)) {
-        throw new Error(
-          `[EDD-9013] Entity "${config.entityType}": timeSeries.appendInput missing primary-key composite "${composite}". ` +
-            `Every PK/SK composite must appear in appendInput so the event can be addressed.`,
-        )
-      }
-    }
-
-    // EDD-9014: orderBy must not name a ref field or ref-derived ${name}Id field
-    for (const fieldName of Object.keys(modelFields)) {
-      if (isRefField(fieldName, config.model as Schema.Top)) {
-        if (orderBy === fieldName || orderBy === `${fieldName}Id`) {
-          throw new Error(
-            `[EDD-9014] Entity "${config.entityType}": timeSeries.orderBy "${orderBy}" names a ref ` +
-              `or ref-derived id field. Refs are create-time denormalisations and cannot serve as the event clock.`,
-          )
-        }
-      }
-    }
-    // Also: appendInput must not declare any ref-derived ${name}Id field —
-    // ref changes go through .update(), not .append() (§4.6).
-    for (const fieldName of Object.keys(modelFields)) {
-      if (isRefField(fieldName, config.model as Schema.Top)) {
-        if (appendInputFieldSet.has(`${fieldName}Id`)) {
-          throw new Error(
-            `[EDD-9014] Entity "${config.entityType}": timeSeries.appendInput must not include ref-derived ` +
-              `"${fieldName}Id" — refs cannot be reassigned via .append(). Use .update() to change a ref.`,
-          )
-        }
-      }
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Validate generatedId config (EDD-9008)
-  // ---------------------------------------------------------------------------
-  // The named field is auto-filled with a UUID at write time when omitted. It
-  // MUST exist in the model AND participate in the primary key (pk or sk
-  // composite) — generating an id that doesn't address the item would be a
-  // silent no-op. Mirrors the timeSeries.orderBy validation style.
-  if (config.generatedId !== undefined && config.generatedId !== null) {
-    const gid = config.generatedId as GeneratedIdConfig
-    const field = gid.field
-
-    // EDD-9008: field must name a model field
-    if (!(field in modelFields)) {
-      throw new Error(
-        `[EDD-9008] Entity "${config.entityType}": generatedId.field "${field}" does not name a model field. ` +
-          `Valid model fields: ${Object.keys(modelFields).sort().join(", ")}`,
-      )
-    }
-
-    // EDD-9008: field must participate in the primary key (pk or sk composite)
-    const primary = config.indexes.primary
-    const pkSkComposites = new Set([...primary.pk.composite, ...primary.sk.composite])
-    if (!pkSkComposites.has(field)) {
-      throw new Error(
-        `[EDD-9008] Entity "${config.entityType}": generatedId.field "${field}" must participate in the ` +
-          `primary key (pk or sk composite). An auto-generated id that does not compose into the primary ` +
-          `key cannot address the item. Primary-key composites: ${[...pkSkComposites].sort().join(", ")}`,
-      )
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Resolve refs at make() time
-  // ---------------------------------------------------------------------------
-
-  interface ResolvedRef {
-    readonly fieldName: string
-    readonly idFieldName: string
-    readonly identifierField: string
-    readonly identifierSchema: Schema.Top
-    readonly refEntity: Entity
-    readonly refEntityType: string
-  }
-
-  const resolvedRefs: ReadonlyArray<ResolvedRef> = config.refs
-    ? Object.entries(config.refs).map(([fieldName, refValue]) => {
-        // Extract entity from shorthand or expanded form
-        const refEntity = refValue.entity as Entity
-
-        // Validate the field exists in the model
-        const fieldSchema = modelFields[fieldName]
-        if (!fieldSchema) {
-          throw new Error(
-            `Entity "${config.entityType}": refs config references field "${fieldName}" which does not exist in the model`,
-          )
-        }
-        // Check for ref annotation — either on the schema field or via DynamoModel.configure
-        if (!isRef(fieldSchema) && !isRefField(fieldName, config.model as Schema.Top)) {
-          throw new Error(
-            `Entity "${config.entityType}": refs config references field "${fieldName}" which does not have the DynamoModel.ref annotation. Add DynamoModel.ref to the model field or set { ref: true } in DynamoModel.configure.`,
-          )
-        }
-
-        // Resolve the identifier field from the referenced entity's model
-        // getIdentifierField handles both schema-level annotations and ConfiguredModel overrides
-        const idField = getIdentifierField(refEntity.model as Schema.Top)
-        if (!idField) {
-          throw new Error(
-            `Entity "${config.entityType}": ref field "${fieldName}" references entity "${refEntity.entityType}" which has no identifier field. Add DynamoModel.identifier to the model field or set { identifier: true } in DynamoModel.configure.`,
-          )
-        }
-
-        return {
-          fieldName,
-          idFieldName: `${fieldName}Id`,
-          identifierField: idField.name,
-          identifierSchema: idField.schema,
-          refEntity: refEntity as Entity,
-          refEntityType: refEntity.entityType,
-        }
-      })
-    : []
-
-  const hasRefs = resolvedRefs.length > 0
-
-  // ---------------------------------------------------------------------------
-  // Auto-generate cascade indexes from expanded ref configs
-  // ---------------------------------------------------------------------------
-
-  const cascadeIndexes: globalThis.Record<string, IndexDefinition> = {}
-  if (config.refs) {
-    for (const [refFieldName, refValue] of Object.entries(config.refs)) {
-      const cascadeConfig = refValue.cascade
-      if (!cascadeConfig) continue
-      const ref = resolvedRefs.find((r) => r.fieldName === refFieldName)!
-      cascadeIndexes[`_cascade_${refFieldName}`] = {
-        index: cascadeConfig.index,
-        pk: { field: cascadeConfig.pk.field, composite: [ref.idFieldName] },
-        sk: { field: cascadeConfig.sk.field, composite: [...config.indexes.primary.pk.composite] },
-      }
-    }
-  }
-  let allIndexes: globalThis.Record<string, IndexDefinition> = {
-    ...config.indexes,
-    ...cascadeIndexes,
-  }
-
-  // Build immutable fields set from ConfiguredModel (for update schema exclusion + upsert if_not_exists wrapping)
-  const immutableFields = new Set<string>()
-  for (const [fieldName, attrConfig] of Object.entries(configuredAttributes)) {
-    if (attrConfig.immutable) immutableFields.add(fieldName)
-  }
-
-  // Resolve identifier field name from model annotation
-  const resolvedIdentifier = getIdentifierField(config.model as Schema.Top)?.name
-
-  // Validate: no model field combines a transform schema with a ConfiguredModel
-  // storage override. The two configuration paths are mutually exclusive.
-  validateNoTransformOverride(modelFields, configuredAttributes)
-
-  // Resolve effective field encodings (annotation + ConfiguredModel override).
-  // Used by buildDerivedSchemas to substitute self date schemas with bidirectional
-  // transforms, and (below) by system-field generation to produce the right
-  // wire primitive when the field is library-managed.
-  const fieldEncodings = buildFieldEncodings(modelFields, configuredAttributes)
-
-  const generatedIdField =
-    config.generatedId !== undefined && config.generatedId !== null
-      ? (config.generatedId as GeneratedIdConfig).field
-      : undefined
-  const generatedIdVersion =
-    config.generatedId !== undefined && config.generatedId !== null
-      ? ((config.generatedId as GeneratedIdConfig).version ?? "v4")
-      : undefined
-
-  const schemas = buildDerivedSchemas(
-    modelFields,
-    allIndexes,
+  // Derivation (validation + schema/ref/sparse/rename resolution) is shared with
+  // the pure `@effect-dynamodb/schema` Entity.make via `buildEntityDefinition`,
+  // giving a single source of truth for the EDD-90xx rules. Promotion of a pure
+  // definition (see `fromDefinition`) passes the already-computed bundle as
+  // `precomputedData`, so derivation runs exactly once per entity.
+  // Cast: the runtime config's `refs` uses the runtime `AnyRefValue` (whose
+  // `entity` is the operational `Entity`), which is nominally distinct from the
+  // schema package's `AnyRefValue` (`entity: EntityDefinition`). buildEntityDefinition
+  // only reads `.model`/`.entityType`/identifier off ref targets, both of which
+  // the runtime Entity carries, so the cast is sound.
+  const data = precomputedData ?? buildEntityDefinition(config as unknown as EntityDefinitionConfig)
+  const {
     systemFields,
-    resolvedRefs,
+    schemas,
+    hasRefs,
     immutableFields,
     resolvedIdentifier,
-    config.timeSeries,
-    fieldEncodings,
     generatedIdField,
-  )
-  // schema and tableTag are injected via _configure() when the entity is registered
-  // on a Table and bound through DynamoClient.make(). They are captured by operation
-  // closures and resolved at runtime (inside Effects), not at definition time.
-  // Using definite assignment (!) since _configure is called before any operation executes.
+    generatedIdVersion,
+    entityType,
+    entityVersion,
+    sparseFields,
+    hasSparseFields,
+    renameToDynamo,
+    renameFromDynamo,
+    resolveDbName,
+    rawModel,
+    isSchemaClass,
+    hasHiddenFields,
+  } = data
+  // resolvedRefs carries the actual ref-target entity objects; at runtime they
+  // are operational Entities (for runtime-authored refs) so write-time hydration
+  // can call their CRUD ops. The pure bundle widens refEntity to EntityDefinition.
+  const resolvedRefs = data.resolvedRefs as unknown as ReadonlyArray<ResolvedRef>
+  // allIndexes is mutable: _injectIndex adds collection-owned GSIs after make().
+  let allIndexes: globalThis.Record<string, IndexDefinition> = { ...data.initialIndexes }
+  // schema + tableTag are injected via _configure() when the entity is registered
+  // on a Table and bound through DynamoClient.make(); captured by operation closures.
   let schema!: DynamoSchema.DynamoSchema
   let tableTag!: import("effect").Context.Service<TableConfig, TableConfig>
-
-  const entityType = config.entityType
-  const entityVersion = 1
-
-  // Note: `fieldEncodings` is resolved earlier (above buildDerivedSchemas) and
-  // used to substitute self date schemas in derived schemas. System timestamp
-  // encodings are NOT in `fieldEncodings`; `generateTimestamp` produces wire
-  // primitives directly for non-colliding system fields.
-
-  // ---------------------------------------------------------------------------
-  // Sparse Map fields (storedAs: 'sparse') — validation + resolution
-  // ---------------------------------------------------------------------------
-
-  const sparseFields: globalThis.Record<string, SparseConfig> = getSparseFields(
-    config.model as Schema.Top,
-  )
-  const hasSparseFields = Object.keys(sparseFields).length > 0
-  if (hasSparseFields) {
-    // EDD-9020: storedAs: 'sparse' is only valid on Schema.Record fields.
-    for (const fieldName of Object.keys(sparseFields)) {
-      const fieldSchema = modelFields[fieldName]
-      if (!fieldSchema) {
-        throw new Error(
-          `[EDD-9020] Entity "${config.entityType}": sparse field "${fieldName}" does not exist on the model`,
-        )
-      }
-      const recordInfo = isRecordSchema(fieldSchema)
-      if (!recordInfo) {
-        throw new Error(
-          `[EDD-9020] Entity "${config.entityType}": sparse field "${fieldName}" must be a Schema.Record. ` +
-            `Got a non-Record schema. Sparse storage flattens Record entries into per-key top-level attributes.`,
-        )
-      }
-      // EDD-9021: inner value must not be another Record (no nested sparse).
-      if (isRecordAst(recordInfo.valueAst)) {
-        throw new Error(
-          `[EDD-9021] Entity "${config.entityType}": sparse field "${fieldName}" has a Record-typed value schema. ` +
-            `Nested sparse Records are not supported — use Schema.Struct, Schema.Number, etc. for the inner value.`,
-        )
-      }
-    }
-
-    // EDD-9022: sparse fields cannot participate in primary key, GSI composites,
-    // or unique constraints — keys aren't statically known at make() time.
-    const allComposites = new Set<string>(allCompositeAttributes(allIndexes))
-    for (const fieldName of Object.keys(sparseFields)) {
-      if (allComposites.has(fieldName)) {
-        throw new Error(
-          `[EDD-9022] Entity "${config.entityType}": sparse field "${fieldName}" cannot be a primary-key or GSI composite. ` +
-            `Composite values must be known at make() time; sparse-map keys are not.`,
-        )
-      }
-    }
-    if (config.unique) {
-      const sparseSet = new Set(Object.keys(sparseFields))
-      for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
-        const fields = resolveUniqueFields(constraintDef)
-        for (const f of fields) {
-          if (sparseSet.has(f)) {
-            throw new Error(
-              `[EDD-9022] Entity "${config.entityType}": unique constraint "${constraintName}" cannot reference sparse field "${f}".`,
-            )
-          }
-        }
-      }
-    }
-
-    // EDD-9023: sparse prefixes must be unique among themselves and must not
-    // collide with non-sparse top-level model field names.
-    const seenPrefix = new Map<string, string>() // prefix → fieldName
-    for (const [fieldName, sparse] of Object.entries(sparseFields)) {
-      const existing = seenPrefix.get(sparse.prefix)
-      if (existing) {
-        throw new Error(
-          `[EDD-9023] Entity "${config.entityType}": sparse fields "${existing}" and "${fieldName}" share prefix "${sparse.prefix}". Prefixes must be distinct.`,
-        )
-      }
-      seenPrefix.set(sparse.prefix, fieldName)
-      // Prefix must not collide with another (non-sparse) model field name.
-      if (sparse.prefix !== fieldName && sparse.prefix in modelFields) {
-        throw new Error(
-          `[EDD-9023] Entity "${config.entityType}": sparse field "${fieldName}" prefix "${sparse.prefix}" collides with non-sparse field "${sparse.prefix}".`,
-        )
-      }
-    }
-  }
-
-  // EDD-9005: validate every configured TTL eagerly at make() time. Rejects
-  // non-finite (infinite) durations and unparseable string forms here so the
-  // write path never observes an invalid TTL (it would otherwise surface as a
-  // defect mid-write). Bare numbers are rejected at the type level (footgun).
-  {
-    const configuredTtls: Array<Duration.Duration | string> = []
-    if (typeof config.versioned === "object" && config.versioned?.ttl !== undefined) {
-      configuredTtls.push(config.versioned.ttl)
-    }
-    if (typeof config.softDelete === "object" && config.softDelete?.ttl !== undefined) {
-      configuredTtls.push(config.softDelete.ttl)
-    }
-    if (config.timeSeries?.ttl !== undefined) configuredTtls.push(config.timeSeries.ttl)
-    if (config.unique) {
-      for (const def of Object.values(config.unique)) {
-        const uTtl = resolveUniqueTtl(def)
-        if (uTtl !== undefined) configuredTtls.push(uTtl)
-      }
-    }
-    for (const ttl of configuredTtls) normalizeTtlSeconds(ttl)
-  }
-
-  // ---------------------------------------------------------------------------
-  // Field renaming: domain name → DynamoDB attribute name (from ConfiguredModel)
-  // ---------------------------------------------------------------------------
-
-  const fieldRenames: globalThis.Record<string, string> = {} // domain → dynamo
-  for (const [domainName, attrConfig] of Object.entries(configuredAttributes)) {
-    if (attrConfig.field) fieldRenames[domainName] = attrConfig.field
-  }
-  const hasRenames = Object.keys(fieldRenames).length > 0
-
-  /**
-   * Rename domain field names to DynamoDB attribute names.
-   * Called before toAttributeMap (put path).
-   */
-  const renameToDynamo = (item: globalThis.Record<string, unknown>): void => {
-    if (!hasRenames) return
-    for (const [domain, dynamo] of Object.entries(fieldRenames)) {
-      if (domain in item) {
-        item[dynamo] = item[domain]
-        delete item[domain]
-      }
-    }
-  }
-
-  /**
-   * Rename DynamoDB attribute names back to domain field names.
-   * Called after fromAttributeMap (get path).
-   */
-  const renameFromDynamo = (item: globalThis.Record<string, unknown>): void => {
-    if (!hasRenames) return
-    for (const [domain, dynamo] of Object.entries(fieldRenames)) {
-      if (dynamo in item) {
-        item[domain] = item[dynamo]
-        delete item[dynamo]
-      }
-    }
-  }
-
-  /** Resolve a domain field name to its DynamoDB attribute name. */
-  const resolveDbName = (domainName: string): string => fieldRenames[domainName] ?? domainName
 
   /**
    * Flatten sparse Map fields into per-entry top-level attributes.

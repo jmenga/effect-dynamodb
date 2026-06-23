@@ -134,6 +134,16 @@ interface AggregateConfig<
  * derived `inputSchema` / `updateSchema` / `createSchema`. Does NOT carry the
  * AWS-coupled CRUD operations — those live on the runtime `effect-dynamodb`
  * `Aggregate` type.
+ *
+ * **Derivation-only.** Unlike the pure {@link EntityDefinition} (which
+ * `DynamoClient.make` promotes to a full operational entity), a pure
+ * `AggregateDefinition` is **not bindable** via `DynamoClient.make`: the
+ * aggregate decompose/assemble engine is AWS-coupled and cannot be reconstructed
+ * from a pure definition. Use this type for its derived schemas (e.g. HttpApi
+ * payloads, validation). To get an operational aggregate (`get`/`create`/
+ * `update`/`delete`/`list`), author it with `effect-dynamodb`'s `Aggregate.make`
+ * and bind that. Passing a pure `AggregateDefinition` to `DynamoClient.make`
+ * is a compile error (it lacks the operational members).
  */
 export interface AggregateDefinition<TSchema extends Schema.Top, TInput = unknown> {
   readonly [TypeId]: TypeId
