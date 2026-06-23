@@ -10,6 +10,7 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import { TypeId as SchemaAggregateTypeId } from "@effect-dynamodb/schema/Aggregate.js"
 import type { DynamoEncoding } from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import type * as DynamoSchemaModule from "@effect-dynamodb/schema/DynamoSchema.js"
@@ -96,8 +97,14 @@ import type {
 // TypeId
 // ---------------------------------------------------------------------------
 
-export const TypeId: unique symbol = Symbol.for("effect-dynamodb/Aggregate")
-export type TypeId = typeof TypeId
+// Re-export the schema package's TypeId rather than declaring a second
+// `unique symbol`. Both resolve to the same registered `Symbol.for` at runtime,
+// but two separate `unique symbol` declarations are NOMINALLY distinct types —
+// which made the runtime `Aggregate` non-assignable to the pure
+// `AggregateDefinition` it is meant to extend. Sharing one symbol type closes
+// that dual-package hazard.
+export const TypeId: typeof SchemaAggregateTypeId = SchemaAggregateTypeId
+export type TypeId = typeof SchemaAggregateTypeId
 
 // ---------------------------------------------------------------------------
 // Internal: Resolved graph node
