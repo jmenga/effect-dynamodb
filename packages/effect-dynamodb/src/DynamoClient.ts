@@ -501,12 +501,12 @@ export type TypedClient<
    * A member may be a runtime `Entity` (authored with `effect-dynamodb`'s
    * `Entity.make`) OR a pure `EntityDefinition` (authored with
    * `@effect-dynamodb/schema`'s `Entity.make` — the AWS-free contract surface).
-   * Both carry the same 11 type parameters, so both map to the same bound shape.
-   * The runtime branch forwards the inferred refs `R`; the pure branch maps refs
-   * to `undefined` — the two packages declare nominally distinct `AnyRefValue`
-   * types, so forwarding a schema-package refs type into the runtime
-   * `BoundEntity` would violate its `TRefs` constraint. `make()` promotes pure
-   * definitions to runtime entities at bind time, so this is type-only.
+   * Both carry the same 11 type parameters, so both map to the same bound shape,
+   * and both branches forward the inferred refs `R` — the two packages now share
+   * one structural `AnyRefValue` (`entity: RefEntity`), so ref-derived composite
+   * types (e.g. `${field}Id`) survive into the bound client for either authoring
+   * style. `make()` promotes pure definitions (and their ref targets) to runtime
+   * entities at bind time, so the type and runtime agree.
    */
   readonly entities: {
     readonly [K in keyof TEntities]: TEntities[K] extends EntityType<
@@ -540,20 +540,20 @@ export type TypedClient<
             infer V,
             any,
             any,
-            any,
+            infer R,
             any,
             infer TS,
             infer GenId
           >
         ? Resolve<
-            BoundEntity<M, I, undefined, ResolveKey<M, I>, TS, Ts, V, GenId> & {
+            BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId> & {
               /** Scan this entity. Returns a BoundQuery for building scan queries. */
               readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
                 Schema.Schema.Type<M>,
                 never,
                 Schema.Schema.Type<M>
               >
-            } & EntityIndexAccessors<M, I, undefined>
+            } & EntityIndexAccessors<M, I, R>
           >
         : never
   }

@@ -4425,7 +4425,42 @@ const PureTeams = PureEntity.make({
   },
 })
 
-const PureTable = Table.make({ schema: AppSchema, entities: { PureUsers, PureTeams } })
+// Pure entity WITH a ref to another pure entity. Write-time ref hydration calls
+// `.get()` on the ref target, so binding must promote the target too (#69).
+class PureProject extends Schema.Class<PureProject>("PureProject")({
+  projectId: Schema.String,
+  projectName: Schema.String,
+}) {}
+
+class PureTask extends Schema.Class<PureTask>("PureTask")({
+  taskId: Schema.String,
+  title: Schema.String,
+  project: DynamoModel.ref(PureProject),
+}) {}
+
+const PureProjects = PureEntity.make({
+  model: DynamoModel.configure(PureProject, { projectId: { identifier: true } }),
+  entityType: "PureProject",
+  primaryKey: {
+    pk: { field: "pk", composite: ["projectId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const PureTasks = PureEntity.make({
+  model: PureTask,
+  entityType: "PureTask",
+  primaryKey: {
+    pk: { field: "pk", composite: ["taskId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  refs: { project: { entity: PureProjects } },
+})
+
+const PureTable = Table.make({
+  schema: AppSchema,
+  entities: { PureUsers, PureTeams, PureProjects, PureTasks },
+})
 const pureTableName = "edd-pure-authoring-connected"
 const PureTestLayer = Layer.mergeAll(ClientLayer, PureTable.layer({ name: pureTableName }))
 const providePure = Effect.provide(PureTestLayer)
@@ -4503,6 +4538,31 @@ describeConnected("#69 — pure schema authoring → DynamoClient.make → real 
       yield* db.entities.PureUsers.delete({ orgId: "acme", userId: "u2" })
       const remaining = yield* db.entities.PureUsers.usersByOrg({ orgId: "acme" }).collect()
       expect(remaining.map((u) => u.userId)).toEqual(["u1"])
+    }).pipe(providePure),
+  )
+
+  it.effect("pure entity with refs hydrates on write (ref target promoted)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { PureUsers, PureTeams, PureProjects, PureTasks },
+        tables: { PureTable },
+      })
+
+      yield* db.entities.PureProjects.put({ projectId: "p1", projectName: "Apollo" })
+
+      // Write a task by ref id — hydration calls PureProjects.get(p1) to
+      // denormalise. Before #69's ref-target promotion this threw
+      // "ref.refEntity.get is not a function".
+      const task = yield* db.entities.PureTasks.put({
+        taskId: "t1",
+        title: "Land",
+        projectId: "p1",
+      })
+      expect(task.project.projectId).toBe("p1")
+      expect(task.project.projectName).toBe("Apollo")
+
+      const fetched = yield* db.entities.PureTasks.get({ taskId: "t1" })
+      expect(fetched.project.projectName).toBe("Apollo")
     }).pipe(providePure),
   )
 })

@@ -154,7 +154,6 @@ export {
 } from "./internal/EntityCombinators.js"
 
 import type {
-  CascadeIndexConfig,
   GeneratedIdConfig,
   SoftDeleteConfig,
   TimeSeriesConfig,
@@ -163,19 +162,6 @@ import type {
   UniqueConstraintDef,
   VersionedConfig,
 } from "@effect-dynamodb/schema/internal/EntityConfig.js"
-import {
-  asModel,
-  condition as conditionCombinator,
-  expectedVersion,
-  set,
-} from "./internal/EntityCombinators.js"
-
-/** A ref config object: the entity and optional cascade index config. */
-interface AnyRefValue {
-  readonly entity: Entity<any, any, any, any, any, any, any, any, any, any>
-  readonly cascade?: CascadeIndexConfig
-}
-
 import {
   allCompositeAttributes,
   allKeyFieldNames,
@@ -201,6 +187,12 @@ import type {
   RefErrors,
   WithGeneratedId,
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
+import {
+  asModel,
+  condition as conditionCombinator,
+  expectedVersion,
+  set,
+} from "./internal/EntityCombinators.js"
 
 // ---------------------------------------------------------------------------
 // Re-export KeyComposer types for convenience
@@ -231,6 +223,7 @@ export type { IndexDefinition, KeyPart }
  * re-exported below so the public `Entity` namespace surface is unchanged.
  */
 import {
+  type AnyRefValue,
   buildEntityDefinition,
   type EntityDefinition,
   type EntityDefinitionConfig,
@@ -1357,6 +1350,20 @@ interface ResolvedRef {
   readonly refEntityType: string
 }
 
+/** @internal A definition that has had its operations attached (has `.get`). */
+const isOperational = (e: { readonly get?: unknown }): boolean => typeof e.get === "function"
+
+/** @internal Copy the schema + table tag a definition received via `_configure`
+ * (Table.make injects them at table-definition time) onto a promoted entity. */
+const carryConfigure = (from: EntityDefinition, to: Entity): void => {
+  if (from._schema !== undefined && from._tableTag !== undefined) {
+    to._configure(
+      from._schema,
+      from._tableTag as import("effect").Context.Service<TableConfig, TableConfig>,
+    )
+  }
+}
+
 /**
  * Promote a pure `@effect-dynamodb/schema` {@link EntityDefinition} into a full
  * operational runtime {@link Entity}, attaching CRUD/query operations. The
@@ -1364,24 +1371,58 @@ interface ResolvedRef {
  * op-attach — no re-validation or re-derivation. The table binding the pure
  * definition already received (via `Table.make`) is preserved.
  *
+ * **Ref targets are promoted too.** Write-time ref hydration calls `.get()` on
+ * each ref target (to denormalise it), so a pure ref target must be operational
+ * or the write crashes with `ref.refEntity.get is not a function`. Each ref
+ * target is promoted one level: `.get` (a read) does not itself hydrate refs, so
+ * the target's *own* ref targets need not be promoted — which also sidesteps
+ * cyclic refs (A→B→A) without recursion. An entity that is itself bound and
+ * written goes through `fromDefinition` independently and gets its own refs
+ * promoted.
+ *
  * Used by `DynamoClient.make()` to bind pure definitions; idempotent on an
  * entity that is already operational.
  *
  * @internal
  */
 export const fromDefinition = (def: EntityDefinition): Entity => {
+  const resolvedRefs = def._data.resolvedRefs
+  // Replace any pure ref target with an operational one so hydration's `.get`
+  // works. Already-operational targets (runtime-authored, or mixed refs once the
+  // shared AnyRefValue lands) pass through unchanged.
+  // Cast: a promoted ref target is a runtime `Entity`, not the pure
+  // `EntityDefinition` that `EntityDefinitionData.resolvedRefs` is typed against.
+  // Hydration only reads `.model`/`.entityType`/`.get` off it (the latter via the
+  // runtime `ResolvedRef` cast inside makeImpl), so this is sound.
+  const data =
+    resolvedRefs.length > 0
+      ? ({
+          ...def._data,
+          resolvedRefs: resolvedRefs.map((r) =>
+            isOperational(r.refEntity as { readonly get?: unknown })
+              ? r
+              : { ...r, refEntity: promoteRefTarget(r.refEntity as unknown as EntityDefinition) },
+          ),
+        } as unknown as EntityDefinitionData)
+      : def._data
+
+  const runtime = makeImpl(
+    def._config as unknown as Parameters<typeof makeImpl>[0],
+    data,
+  ) as unknown as Entity
+  carryConfigure(def, runtime)
+  return runtime
+}
+
+/** @internal Promote a ref target to an operational entity WITHOUT promoting its
+ * own ref targets (one level — see {@link fromDefinition}). The target's table
+ * binding is carried over so `.get` can compose keys. */
+const promoteRefTarget = (def: EntityDefinition): Entity => {
   const runtime = makeImpl(
     def._config as unknown as Parameters<typeof makeImpl>[0],
     def._data,
   ) as unknown as Entity
-  // Carry over schema + table tag injected into the pure definition (Table.make
-  // calls _configure at table-definition time, before DynamoClient.make runs).
-  if (def._schema !== undefined && def._tableTag !== undefined) {
-    runtime._configure(
-      def._schema,
-      def._tableTag as import("effect").Context.Service<TableConfig, TableConfig>,
-    )
-  }
+  carryConfigure(def, runtime)
   return runtime
 }
 

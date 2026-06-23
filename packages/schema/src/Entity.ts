@@ -33,6 +33,7 @@ import {
 } from "./DynamoModel.js"
 import type * as DynamoSchema from "./DynamoSchema.js"
 import { makeCompositeNullableError } from "./Errors.js"
+import type { RefEntity } from "./internal/AggregateEdges.js"
 import type {
   CascadeIndexConfig,
   GeneratedIdConfig,
@@ -69,9 +70,19 @@ import { normalizeGsiConfig } from "./KeyComposer.js"
 
 export type { IndexDefinition, KeyPart }
 
-/** A ref config object: the entity and optional cascade index config. */
+/**
+ * A ref config object: the entity and optional cascade index config.
+ *
+ * `entity` is typed against the structural {@link RefEntity} carrier — the
+ * minimal `{ _tag, entityType, model, indexes, schemas }` shape that BOTH a pure
+ * `EntityDefinition` and a runtime `Entity` satisfy. This is what lets a single
+ * `AnyRefValue` be shared across the schema and runtime packages (the runtime
+ * `Entity` carries `_configure` with a narrower param than the pure definition,
+ * so neither full entity type is assignable to the other — but both satisfy
+ * `RefEntity`). It also means a ref target may be authored in either package.
+ */
 export interface AnyRefValue {
-  readonly entity: EntityDefinition<any, any, any, any, any, any, any, any, any, any>
+  readonly entity: RefEntity
   readonly cascade?: CascadeIndexConfig
 }
 

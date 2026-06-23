@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest"
 // AUTHORED PURELY via @effect-dynamodb/schema — NO AWS import in this section.
 // This is the headline of the schema/runtime split (#62): define the entity once
 // against the AWS-free package, then bind it to the runtime client (#69).
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
@@ -210,5 +211,54 @@ describe("pure @effect-dynamodb/schema authoring bound via DynamoClient.make (#6
       expect(DynamoError).toBeDefined()
       yield* db.entities.Users.put({ orgId: "o1", userId: "u1", email: "a@x.io", name: "Ann" })
     }).pipe(Effect.provide(layers)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Pure entity WITH refs — write-time hydration calls .get() on the ref target,
+// so binding must promote the target too (otherwise: "ref.refEntity.get is not
+// a function"). This is the only refs coverage that runs in CI (the connected
+// refs round-trip is skipped without DynamoDB Local).
+// ---------------------------------------------------------------------------
+
+class Project extends Schema.Class<Project>("Project")({
+  projectId: Schema.String,
+  projectName: Schema.String,
+}) {}
+
+class Task extends Schema.Class<Task>("Task")({
+  taskId: Schema.String,
+  title: Schema.String,
+  project: DynamoModel.ref(Project),
+}) {}
+
+const Projects = PureEntity.make({
+  model: DynamoModel.configure(Project, { projectId: { identifier: true } }),
+  entityType: "Project",
+  primaryKey: { pk: { field: "pk", composite: ["projectId"] }, sk: { field: "sk", composite: [] } },
+})
+
+const Tasks = PureEntity.make({
+  model: Task,
+  entityType: "Task",
+  primaryKey: { pk: { field: "pk", composite: ["taskId"] }, sk: { field: "sk", composite: [] } },
+  refs: { project: { entity: Projects } },
+})
+
+const RefsTable = Table.make({ schema: AppSchema, entities: { Projects, Tasks } })
+const refsLayers = Layer.merge(mockClient, RefsTable.layer({ name: "pure-refs-table" }))
+
+describe("pure entity with refs bound via DynamoClient.make (#69 ref-target promotion)", () => {
+  it.effect("writing by ref id hydrates the (pure) ref target instead of crashing", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { Projects, Tasks }, tables: { RefsTable } })
+
+      yield* db.entities.Projects.put({ projectId: "p1", projectName: "Apollo" })
+
+      // Before ref-target promotion this threw "ref.refEntity.get is not a function".
+      const task = yield* db.entities.Tasks.put({ taskId: "t1", title: "Land", projectId: "p1" })
+      expect(task.project.projectId).toBe("p1")
+      expect(task.project.projectName).toBe("Apollo")
+    }).pipe(Effect.provide(refsLayers)),
   )
 })

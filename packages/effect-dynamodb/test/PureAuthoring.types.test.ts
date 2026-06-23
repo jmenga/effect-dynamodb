@@ -9,6 +9,7 @@
  * if that regresses.
  */
 
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
 import { type Effect, Schema } from "effect"
@@ -73,6 +74,34 @@ type RuntimeDb = Success<ReturnType<typeof makeRuntimeDb>>
 const makeRuntimeDb = () =>
   DynamoClient.make({ entities: { Users: RuntimeUsers }, tables: { RuntimeTable } })
 
+// Pure entity WITH a ref — the bound client must forward ref-derived `${field}Id`
+// composites (not drop refs to `undefined`), which requires the shared AnyRefValue.
+class Project extends Schema.Class<Project>("Project")({
+  projectId: Schema.String.pipe(Schema.brand("ProjectId")),
+  projectName: Schema.String,
+}) {}
+class Task extends Schema.Class<Task>("Task")({
+  taskId: Schema.String,
+  title: Schema.String,
+  project: DynamoModel.ref(Project),
+}) {}
+const PureProjects = PureEntity.make({
+  model: DynamoModel.configure(Project, { projectId: { identifier: true } }),
+  entityType: "Project",
+  primaryKey: { pk: { field: "pk", composite: ["projectId"] }, sk: { field: "sk", composite: [] } },
+})
+const PureTasks = PureEntity.make({
+  model: Task,
+  entityType: "Task",
+  primaryKey: { pk: { field: "pk", composite: ["taskId"] }, sk: { field: "sk", composite: [] } },
+  refs: { project: { entity: PureProjects } },
+})
+const PureRefsTable = Table.make({ schema: AppSchema, entities: { PureProjects, PureTasks } })
+type RefsDb = Success<ReturnType<typeof makeRefsDb>>
+const makeRefsDb = () =>
+  DynamoClient.make({ entities: { PureProjects, PureTasks }, tables: { PureRefsTable } })
+type TaskPutInput = Parameters<RefsDb["entities"]["PureTasks"]["put"]>[0]
+
 describe("#69 — pure EntityDefinition binds to a usable client (type level)", () => {
   it("pure-authored entity does not resolve to never", () => {
     expectTypeOf<PureDb["entities"]["Users"]>().not.toBeNever()
@@ -95,5 +124,13 @@ describe("#69 — pure EntityDefinition binds to a usable client (type level)", 
     expectTypeOf<RuntimeDb["entities"]["Users"]>().not.toBeNever()
     expectTypeOf<RuntimeDb["entities"]["Users"]["get"]>().toBeFunction()
     expectTypeOf<RuntimeDb["entities"]["Users"]["usersByOrg"]>().toBeFunction()
+  })
+
+  it("pure entity with refs forwards the ref-derived id (projectId) into the put input", () => {
+    // The ref-derived id is present...
+    expectTypeOf<TaskPutInput>().toHaveProperty("projectId")
+    // ...and the raw ref field is replaced (not present). Before the fix the pure
+    // branch dropped refs to `undefined`, leaving `project` here instead.
+    expectTypeOf<TaskPutInput>().not.toHaveProperty("project")
   })
 })
