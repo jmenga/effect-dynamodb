@@ -378,14 +378,100 @@ describe("Aggregate codec direction — date matrix", () => {
     )
   })
 
-  // Note: Pattern B (transform schemas like `Schema.DateTimeUtcFromString`)
-  // is intentionally not tested for aggregates — the aggregate's input
-  // validation routes through `Schema.decodeUnknownEffect` on the raw user
-  // schema (not on a substituted shape), so the input form must already be
-  // the transform's encoded side (a string for `DateTimeUtcFromString`).
-  // This is an existing aggregate constraint independent of issue #29 and
-  // its follow-up. Pattern A (self schema + storedAs) is the canonical
-  // aggregate path and is fully covered above.
+  // ------------------- Pattern B — transform DateTimeUtcFromString ----------
+  //
+  // Regression for #72: a Pattern B transform date field on the aggregate root.
+  // Pre-fix, `makeAggregate` installed a `dateDecoders` pre-decoder for EVERY
+  // date-resolving field, so `assembleAggregate` lifted the stored wire string
+  // to a `DateTime` BEFORE the strict `Schema.decodeUnknownEffect(schema)` —
+  // and that strict decoder (the transform's own) expects the string, failing
+  // "Expected string, got DateTime.Utc". The fix skips the pre-decoder for
+  // transform fields (the schema lifts the wire form itself), so the field is
+  // decoded exactly once on read. The transform owns its wire format, so the
+  // create input is the encoded form (a string).
+  describe("Pattern B — transform DateTimeUtcFromString (single-decode on read)", () => {
+    it.effect("DateTimeUtcFromString round-trips without double-decode", () =>
+      Effect.gen(function* () {
+        class M extends Schema.Class<M>("M")({
+          id: Schema.String,
+          ts: Schema.DateTimeUtcFromString,
+        }) {}
+        const Agg = Aggregate.make(M, {
+          table: MainTable,
+          schema: AppSchema,
+          pk: { field: "pk", composite: ["id"] },
+          collection: { index: "lsi1", name: "mb", sk: { field: "lsi1sk", composite: [] } },
+          root: { entityType: "MB" },
+          edges: {},
+        })
+
+        // Write path: the decoded domain DateTime is serialized to the wire
+        // string exactly once (no double-encode).
+        const cap = captureField("ts")
+        yield* Agg.create({ id: "x", ts: isoString } as unknown as { id: string; ts: DateTime.Utc })
+        expect(cap.value()).toBe(isoString)
+
+        // Read path: the stored wire string is decoded exactly once by the
+        // schema's own transform (no dateDecoders pre-decode).
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              pk: "$myapp#v1#mb#x",
+              sk: "$myapp#v1#mb",
+              lsi1sk: "$myapp#v1#mb",
+              __edd_e__: "MB",
+              id: "x",
+              ts: isoString,
+            }),
+          ],
+          LastEvaluatedKey: undefined,
+        })
+        const r = yield* Agg.get({ id: "x" })
+        expect(DateTime.isDateTime((r as M).ts)).toBe(true)
+        expect(DateTime.toEpochMillis((r as M).ts)).toBe(epochMs)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("optional DateTimeUtcFromString is not pre-decoded either", () =>
+      Effect.gen(function* () {
+        class M extends Schema.Class<M>("M")({
+          id: Schema.String,
+          ts: Schema.optional(Schema.DateTimeUtcFromString),
+        }) {}
+        const Agg = Aggregate.make(M, {
+          table: MainTable,
+          schema: AppSchema,
+          pk: { field: "pk", composite: ["id"] },
+          collection: { index: "lsi1", name: "mbo", sk: { field: "lsi1sk", composite: [] } },
+          root: { entityType: "MBO" },
+          edges: {},
+        })
+
+        const cap = captureField("ts")
+        yield* Agg.create({ id: "x", ts: isoString } as unknown as {
+          id: string
+          ts?: DateTime.Utc
+        })
+        expect(cap.value()).toBe(isoString)
+
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              pk: "$myapp#v1#mbo#x",
+              sk: "$myapp#v1#mbo",
+              lsi1sk: "$myapp#v1#mbo",
+              __edd_e__: "MBO",
+              id: "x",
+              ts: isoString,
+            }),
+          ],
+          LastEvaluatedKey: undefined,
+        })
+        const r = yield* Agg.get({ id: "x" })
+        expect(DateTime.isDateTime((r as M).ts)).toBe(true)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------

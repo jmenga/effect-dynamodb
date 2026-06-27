@@ -14,7 +14,13 @@ import {
   SchemaGetter,
   SchemaIssue,
 } from "effect"
-import { type DynamoEncoding, getEncoding, isHidden } from "../DynamoModel.js"
+import {
+  type ConfiguredModel,
+  type DynamoEncoding,
+  getEncoding,
+  isConfiguredModel,
+  isHidden,
+} from "../DynamoModel.js"
 import type { IndexDefinition } from "../KeyComposer.js"
 import type {
   TimeSeriesConfig,
@@ -306,7 +312,9 @@ export const inferDefaultEncoding = (schema: Schema.Top): DynamoEncoding | undef
   const tc = resolved.typeConstructor as { _tag?: string } | undefined
   if (tc?._tag === "effect/DateTime.Utc") return { storage: "string", domain: "DateTime.Utc" }
   if (tc?._tag === "effect/DateTime.Zoned") return { storage: "string", domain: "DateTime.Zoned" }
-  // Check for native Date via meta annotation
+  // Native Date: `Schema.Date` exposes typeConstructor `{ _tag: "Date" }`;
+  // `Schema.DateValid` exposes the `isDateValid` meta annotation. Detect both.
+  if (tc?._tag === "Date") return { storage: "string", domain: "Date" }
   const meta = resolved.meta as { _tag?: string } | undefined
   if (meta?._tag === "isDateValid") return { storage: "string", domain: "Date" }
   return undefined
@@ -539,6 +547,209 @@ const buildRedactedSubstitute = (inner: Schema.Top): Schema.Top => {
   ) as unknown as Schema.Top
 }
 
+/** A schema that exposes declared fields (Schema.Struct or Schema.Class). */
+const schemaFieldsOf = (schema: Schema.Top): SchemaFields | undefined =>
+  (schema as unknown as { readonly fields?: SchemaFields }).fields
+
+/** True when the schema is a Schema.Class (a constructable function carrying fields). */
+const isClassSchema = (schema: Schema.Top): boolean =>
+  typeof schema === "function" && schemaFieldsOf(schema) !== undefined
+
+/** True when the schema is `Schema.Array(...)` (element schema reachable via `.value`). */
+const isArraySchema = (schema: Schema.Top): boolean =>
+  (schema.ast as { readonly _tag?: string })._tag === "Arrays"
+
+/** True when the schema is a substitutable date/Redacted LEAF (not a struct/class). */
+const isSubstitutableLeaf = (schema: Schema.Top, tolerantTransforms?: boolean): boolean =>
+  isSelfDateSchema(schema) ||
+  (tolerantTransforms === true && isDateTransform(schema)) ||
+  tryGetRedactedInner(schema) !== undefined
+
+/**
+ * For an optional field — `Schema.optional(X)` / `Schema.UndefinedOr(X)`, encoded
+ * as a `[X, Undefined]` Union — return the inner schema X WHEN X is a substitutable
+ * date/Redacted leaf. Returns `undefined` for anything else (non-optional unions,
+ * or optionals wrapping a struct/class — which can't be reliably reconstructed).
+ */
+const optionalLeafInner = (
+  schema: Schema.Top,
+  tolerantTransforms?: boolean,
+): Schema.Top | undefined => {
+  const ast = schema.ast as { readonly _tag?: string; readonly types?: ReadonlyArray<unknown> }
+  if (ast._tag !== "Union" || !Array.isArray(ast.types) || ast.types.length !== 2) return undefined
+  const nonUndef = ast.types.filter((m) => (m as { _tag?: string })._tag !== "Undefined")
+  if (nonUndef.length !== 1) return undefined
+  const inner = Schema.make<Schema.Top>(nonUndef[0] as Schema.Top["ast"])
+  if (schemaFieldsOf(inner) !== undefined) return undefined // optional struct/class — skip
+  return isSubstitutableLeaf(inner, tolerantTransforms) ? inner : undefined
+}
+
+/**
+ * Options for {@link substituteSchemaDeep}, applied only at the IMMEDIATE
+ * (top-level) fields of the passed schema — recursion into nested structures
+ * proceeds without them.
+ */
+export interface DeepSubstitutionOptions {
+  /**
+   * Immediate field names to leave untouched (applied only at the top level).
+   */
+  readonly skipTopLevel?: ReadonlySet<string> | undefined
+  /**
+   * Re-point a `DynamoModel.ref` / aggregate-edge field at its target model
+   * (applied only at the top level). The ref annotation is an opaque
+   * `Declaration` that hides the target's fields, so the recursion can't see
+   * into it; callers that know the edge graph supply the resolved target model
+   * here. Return `undefined` to leave the field to the default handling.
+   */
+  readonly resolveRef?: ((name: string, field: Schema.Top) => Schema.Top | undefined) | undefined
+  /**
+   * Also substitute Pattern B transform date schemas (e.g.
+   * `Schema.DateTimeUtcFromString`) with a TOLERANT date transform that accepts
+   * the domain value too on decode. Propagated through the whole recursion.
+   *
+   * Use ONLY for decode-only schemas (the aggregate read/assemble + input
+   * validation path), where the mutated state carries domain `DateTime` values
+   * the transform's encoded-only decoder would reject. NEVER for schemas whose
+   * `encode` produces the stored wire (entity record schemas) — a transform owns
+   * its wire format and must not be overridden there.
+   */
+  readonly tolerantTransforms?: boolean | undefined
+}
+
+/**
+ * Recursively determine whether a schema contains — at any depth reachable
+ * through nested `Schema.Struct` / `Schema.Class` / `Schema.Array` — a leaf that
+ * needs substitution for wire round-tripping (a self-date schema or a
+ * `RedactedFromValue`). Returns false for schemas that don't, so
+ * {@link substituteSchemaDeep} can return them unchanged (zero structural churn).
+ *
+ * Optional / union members are intentionally NOT traversed — reconstructing a
+ * `Schema.optional(Class)` while preserving the nested class is not reliably
+ * supported, so such fields are left exactly as the caller declared them (same
+ * as the pre-existing behavior).
+ */
+const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOptions): boolean => {
+  if (isSelfDateSchema(schema)) return true
+  if (opts?.tolerantTransforms && isDateTransform(schema)) return true
+  if (tryGetRedactedInner(schema) !== undefined) return true
+  if ((schema.ast as { readonly _tag?: string })._tag === "Union") {
+    // Optional date/Redacted leaf — `Schema.optional(Schema.DateTimeUtc)` etc.
+    return optionalLeafInner(schema, opts?.tolerantTransforms) !== undefined
+  }
+  // `tolerantTransforms` propagates through the recursion; `skipTopLevel` /
+  // `resolveRef` apply only at the immediate level (so they're dropped below).
+  const deeper: DeepSubstitutionOptions | undefined = opts?.tolerantTransforms
+    ? { tolerantTransforms: true }
+    : undefined
+  if (isArraySchema(schema)) {
+    return needsDeepSubstitution(
+      (schema as unknown as { readonly value: Schema.Top }).value,
+      deeper,
+    )
+  }
+  const fields = schemaFieldsOf(schema)
+  if (fields) {
+    return Object.entries(fields).some(([name, field]) => {
+      if (opts?.skipTopLevel?.has(name)) return false
+      const resolved = opts?.resolveRef?.(name, field)
+      return needsDeepSubstitution(resolved ?? field, deeper)
+    })
+  }
+  return false
+}
+
+/**
+ * Recursively substitute self-date and `RedactedFromValue` leaves wherever they
+ * appear — including inside nested `Schema.Class` / `Schema.Struct` / `Schema.Array`
+ * fields (e.g. a `DynamoModel.ref` target or an aggregate edge model that carries
+ * a `Schema.DateTimeUtc` field). Nested `Schema.Class` identity is preserved:
+ * the substituted struct decodes to a real class instance via
+ * `Schema.instanceOf` + prototype attach, so consumers still receive instances.
+ *
+ * Returns the input schema unchanged when nothing needs substituting, so callers
+ * that don't have nested transform fields see no structural change at all.
+ *
+ * See {@link DeepSubstitutionOptions} for `skipTopLevel` / `resolveRef`.
+ *
+ * @internal
+ */
+export const substituteSchemaDeep = (
+  schema: Schema.Top,
+  opts?: DeepSubstitutionOptions,
+): Schema.Top => {
+  if (!needsDeepSubstitution(schema, opts)) return schema
+
+  // Leaf: self-date schema → tolerant bidirectional date transform.
+  if (isSelfDateSchema(schema)) {
+    const encoding = getEncoding(schema) ?? inferDefaultEncoding(schema)
+    return encoding ? buildDateTransform(encoding) : schema
+  }
+  // Leaf: Pattern B transform date schema (only under `tolerantTransforms`) →
+  // tolerant date transform whose decode also accepts the already-domain value.
+  if (opts?.tolerantTransforms && isDateTransform(schema)) {
+    const encoding = getEncoding(schema) ?? inferDefaultEncoding(schema)
+    if (encoding) return buildDateTransform(encoding)
+  }
+  // Leaf: RedactedFromValue → tolerant Redacted transform.
+  const redactedInner = tryGetRedactedInner(schema)
+  if (redactedInner !== undefined) return buildRedactedSubstitute(redactedInner)
+
+  // `tolerantTransforms` propagates through the recursion; `skipTopLevel` /
+  // `resolveRef` apply only at this immediate level.
+  const deeper: DeepSubstitutionOptions | undefined = opts?.tolerantTransforms
+    ? { tolerantTransforms: true }
+    : undefined
+
+  // Optional date/Redacted leaf — `Schema.optional(Schema.DateTimeUtc)` etc.
+  // Reconstruct the optional wrapper around the substituted leaf.
+  const optInner = optionalLeafInner(schema, opts?.tolerantTransforms)
+  if (optInner !== undefined) {
+    return Schema.optional(
+      substituteSchemaDeep(optInner, deeper) as Schema.Codec<any>,
+    ) as unknown as Schema.Top
+  }
+
+  // Array: substitute the element schema.
+  if (isArraySchema(schema)) {
+    const element = (schema as unknown as { readonly value: Schema.Top }).value
+    return Schema.Array(
+      substituteSchemaDeep(element, deeper) as Schema.Codec<any>,
+    ) as unknown as Schema.Top
+  }
+
+  // Struct / Class: substitute each field, recursing into nested structures.
+  const fields = schemaFieldsOf(schema)
+  if (fields) {
+    const subFields: SchemaFields = {}
+    for (const [name, field] of Object.entries(fields)) {
+      if (opts?.skipTopLevel?.has(name) === true) {
+        subFields[name] = field
+        continue
+      }
+      const resolved = opts?.resolveRef?.(name, field)
+      subFields[name] = substituteSchemaDeep(resolved ?? field, deeper)
+    }
+    const subStruct = Schema.Struct(subFields as Schema.Struct.Fields)
+    if (!isClassSchema(schema)) return subStruct as unknown as Schema.Top
+    // Preserve the class instance: decode the substituted struct to the original
+    // class via prototype attach (no constructor re-validation, no field re-decode).
+    const ctor = schema as unknown as new (input: unknown) => unknown
+    return subStruct.pipe(
+      Schema.decodeTo(
+        Schema.instanceOf(ctor) as unknown as Schema.Codec<any>,
+        {
+          decode: SchemaGetter.transform((value: unknown) =>
+            Object.assign(Object.create((ctor as { prototype: object }).prototype), value),
+          ),
+          encode: SchemaGetter.transform((instance: unknown) => ({ ...(instance as object) })),
+        } as any,
+      ),
+    ) as unknown as Schema.Top
+  }
+
+  return schema
+}
+
 /**
  * Substitute model fields with bidirectional transforms where needed:
  *
@@ -554,13 +765,13 @@ const buildRedactedSubstitute = (inner: Schema.Top): Schema.Top => {
  * Existing transform schemas (other than `RedactedFromValue`) are passed
  * through unchanged — the user-declared transform IS the wire format.
  *
- * Schema.Class fields (and Schema.Class fields nested inside Schema.Array,
- * Schema.optional, etc.) are NOT substituted here. Instead, callers run
- * `decode → encode` against the substituted schema: `Schema.decode` is
- * forgiving for Schema.Class (lifts plain objects to instances), and the
- * tolerant date / Redacted substitutes make the decode pass accept both
- * wire and domain values. The subsequent `Schema.encode` produces the
- * canonical wire shape.
+ * Nested `Schema.Class` / `Schema.Struct` / `Schema.Array` fields (e.g. a
+ * `DynamoModel.ref` target) are substituted RECURSIVELY via
+ * {@link substituteSchemaDeep}: any self-date or `RedactedFromValue` leaf inside
+ * them is converted so it round-trips through DynamoDB, while the nested class
+ * instance identity is preserved. Fields with no such leaf pass through
+ * untouched. (Nested fields reached only through `Schema.optional` / union
+ * members are left as declared — see `substituteSchemaDeep`.)
  *
  * @internal
  */
@@ -589,10 +800,14 @@ export const substituteSchemas = (
       out[name] = buildRedactedSubstitute(redactedInner)
       continue
     }
-    // Default: pass through unchanged. Pattern B transforms (DynamoModel.*,
-    // Schema.DateTimeUtcFromString, Schema.NumberFromString, …) own their
-    // wire format directly — `Schema.encode` handles the conversion.
-    out[name] = schema
+    // 3. Default: recurse for nested substitution. Pattern B transforms
+    //    (DynamoModel.*, Schema.DateTimeUtcFromString, Schema.NumberFromString, …)
+    //    own their wire format and pass through; primitives pass through. But a
+    //    nested Schema.Class / Schema.Struct / Schema.Array field (e.g. a
+    //    `DynamoModel.ref` target) may itself carry a self-date or Redacted leaf
+    //    — `substituteSchemaDeep` substitutes those while preserving class
+    //    identity, and returns the schema unchanged when nothing nested needs it.
+    out[name] = substituteSchemaDeep(schema)
   }
   return out
 }
@@ -716,6 +931,7 @@ export const buildDerivedSchemas = (
     readonly fieldName: string
     readonly idFieldName: string
     readonly identifierSchema: Schema.Top
+    readonly refEntity?: { readonly model: Schema.Top } | undefined
   }> = [],
   immutableFields: ReadonlySet<string> = new Set(),
   identifierField: string | undefined = undefined,
@@ -730,6 +946,21 @@ export const buildDerivedSchemas = (
   // round-trips. All other transform schemas are passed through — the user's
   // transform IS the wire format and we never override it.
   const fields = substituteSchemas(modelFields, fieldEncodings)
+
+  // Ref fields carry the `DynamoModel.ref` annotation (an opaque Declaration that
+  // hides the target's fields), so `substituteSchemaDeep` above can't see into
+  // them. Re-point each denormalized ref field at its target model, recursively
+  // substituted, so a self-date / Redacted leaf inside a ref target round-trips
+  // (Option A) while the target's class instance identity is preserved. Affects
+  // only model/record/item schemas — input/create/update replace refs with IDs.
+  for (const ref of resolvedRefs) {
+    const targetModel = ref.refEntity?.model
+    if (!targetModel || !(ref.fieldName in fields)) continue
+    const resolved = isConfiguredModel(targetModel)
+      ? ((targetModel as ConfiguredModel<Schema.Top, any>).model as Schema.Top)
+      : targetModel
+    fields[ref.fieldName] = substituteSchemaDeep(resolved)
+  }
 
   // --- Model Schema: pure model fields (for input decode/encode) ---
   const modelSchema = Schema.Struct(fields)
