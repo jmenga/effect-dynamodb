@@ -61,6 +61,22 @@ describe("substituteSchemaDeep", () => {
     expect(substituteSchemaDeep(bOnly)).toBe(bOnly)
   })
 
+  it("does not crash on an optional(Array) wrapper — incl. called directly per-field (#73)", () => {
+    // `substituteSchemas` (entity path) calls `substituteSchemaDeep` on each field
+    // directly; an `optionalKey(Array)` wrapper has the `Arrays` AST but no runtime
+    // `.value`, which previously crashed (`isSelfSchema(undefined)`). It must unwrap
+    // the optional first and return non-date arrays unchanged.
+    expect(() =>
+      substituteSchemaDeep(Schema.optionalKey(Schema.Array(Schema.String))),
+    ).not.toThrow()
+    expect(() => substituteSchemaDeep(Schema.optional(Schema.Array(Schema.String)))).not.toThrow()
+    const st = Schema.Struct({
+      id: Schema.String,
+      tags: Schema.optionalKey(Schema.Array(Schema.String)),
+    })
+    expect(substituteSchemaDeep(st)).toBe(st) // no date leaf → unchanged
+  })
+
   it.effect("skipTopLevel leaves named immediate fields untouched", () =>
     Effect.gen(function* () {
       // With `joinedAt` (the only self-date) skipped, nothing needs substituting,

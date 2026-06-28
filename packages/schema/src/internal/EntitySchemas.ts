@@ -555,9 +555,26 @@ const schemaFieldsOf = (schema: Schema.Top): SchemaFields | undefined =>
 const isClassSchema = (schema: Schema.Top): boolean =>
   typeof schema === "function" && schemaFieldsOf(schema) !== undefined
 
-/** True when the schema is `Schema.Array(...)` (element schema reachable via `.value`). */
+/** True when the schema is `Schema.Array(...)` (AST tag `Arrays`). */
 const isArraySchema = (schema: Schema.Top): boolean =>
   (schema.ast as { readonly _tag?: string })._tag === "Arrays"
+
+/**
+ * The element schema of a `Schema.Array(...)`. Prefers the runtime `.value`
+ * accessor, but falls back to reconstructing from the AST (`rest[0]`) — schemas
+ * recovered through optional-wrapper unwrapping carry the `Arrays` AST without a
+ * runtime `.value`, so the accessor alone is not reliable. Returns `undefined`
+ * if no element can be determined (defensive — never recurse into `undefined`).
+ */
+const arrayElementOf = (schema: Schema.Top): Schema.Top | undefined => {
+  const direct = (schema as { readonly value?: Schema.Top }).value
+  if (direct !== undefined) return direct
+  const rest = (schema.ast as { readonly rest?: ReadonlyArray<unknown> }).rest
+  const item = rest?.[0] as { readonly type?: Schema.Top["ast"] } | Schema.Top["ast"] | undefined
+  const elementAst =
+    (item as { readonly type?: Schema.Top["ast"] })?.type ?? (item as Schema.Top["ast"])
+  return elementAst ? Schema.make<Schema.Top>(elementAst) : undefined
+}
 
 interface OptionalField {
   /** The REAL inner schema X (class/struct/array/leaf) — `.fields` / `.value` /
@@ -599,22 +616,6 @@ const optionalField = (field: Schema.Top): OptionalField | undefined => {
     inner: value,
     rewrap: (s) => Schema.optionalKey(s as Schema.Codec<any>) as unknown as Schema.Top,
   }
-}
-
-/**
- * The schema a struct field should be substituted from — unwrapping an optional
- * wrapper and re-pointing a ref field at its resolved target — paired with the
- * `rewrap` that restores the field's optionality afterward.
- */
-const resolveFieldTarget = (
-  name: string,
-  field: Schema.Top,
-  opts?: DeepSubstitutionOptions,
-): { readonly target: Schema.Top; readonly rewrap: (s: Schema.Top) => Schema.Top } => {
-  const opt = optionalField(field)
-  const innerOrField = opt?.inner ?? field
-  const target = opts?.resolveRef?.(name, innerOrField) ?? innerOrField
-  return { target, rewrap: opt ? opt.rewrap : (s) => s }
 }
 
 /**
@@ -662,6 +663,7 @@ export interface DeepSubstitutionOptions {
  * as the pre-existing behavior).
  */
 const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOptions): boolean => {
+  if (schema == null || (schema as { readonly ast?: unknown }).ast == null) return false
   if (isSelfDateSchema(schema)) return true
   if (opts?.tolerantTransforms && isDateTransform(schema)) return true
   if (tryGetRedactedInner(schema) !== undefined) return true
@@ -670,19 +672,22 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   const deeper: DeepSubstitutionOptions | undefined = opts?.tolerantTransforms
     ? { tolerantTransforms: true }
     : undefined
+  // Optional wrapper — unwrap to the REAL inner BEFORE the array/struct checks
+  // (an `optionalKey(Array)` wrapper has the `Arrays` AST but no runtime `.value`).
+  const opt = optionalField(schema)
+  if (opt !== undefined) return needsDeepSubstitution(opt.inner, deeper)
   if (isArraySchema(schema)) {
-    return needsDeepSubstitution(
-      (schema as unknown as { readonly value: Schema.Top }).value,
-      deeper,
-    )
+    const element = arrayElementOf(schema)
+    return element !== undefined && needsDeepSubstitution(element, deeper)
   }
   const fields = schemaFieldsOf(schema)
   if (fields) {
     return Object.entries(fields).some(([name, field]) => {
       if (opts?.skipTopLevel?.has(name)) return false
-      // Unwrap optional + re-point ref fields, then check the real target.
-      const { target } = resolveFieldTarget(name, field, opts)
-      return needsDeepSubstitution(target, deeper)
+      // Re-point ref edge fields at their target; optionality is handled when the
+      // field itself is recursed into (optional unwrap at the entry above).
+      const refTarget = opts?.resolveRef?.(name, field)
+      return needsDeepSubstitution(refTarget ?? field, deeper)
     })
   }
   return false
@@ -730,19 +735,28 @@ export const substituteSchemaDeep = (
     ? { tolerantTransforms: true }
     : undefined
 
+  // Optional wrapper — unwrap to the REAL inner, substitute it, then re-apply the
+  // same optionality. Handled BEFORE the array/struct checks so an optional array
+  // is unwrapped (its `.value` only exists on the real inner, not the wrapper).
+  const opt = optionalField(schema)
+  if (opt !== undefined) {
+    return opt.rewrap(substituteSchemaDeep(opt.inner, deeper))
+  }
+
   // Array: substitute the element schema.
   if (isArraySchema(schema)) {
-    const element = (schema as unknown as { readonly value: Schema.Top }).value
+    const element = arrayElementOf(schema)
+    if (element === undefined) return schema
     return Schema.Array(
       substituteSchemaDeep(element, deeper) as Schema.Codec<any>,
     ) as unknown as Schema.Top
   }
 
   // Struct / Class: substitute each field, recursing into nested structures.
-  // Each field is unwrapped of any optional wrapper and re-pointed via `resolveRef`
-  // (for ref edges); the substituted result is re-wrapped with the field's original
-  // optionality. The inner is a REAL schema, so nested classes/arrays/leaves are
-  // handled by the recursion (and class instance identity is preserved).
+  // Ref edge fields are re-pointed via `resolveRef` (re-applying any optionality);
+  // every other field recurses (optional wrappers are unwrapped at the entry above).
+  // The inner is always a REAL schema, so nested classes/arrays/leaves are handled
+  // by the recursion (and class instance identity is preserved).
   const fields = schemaFieldsOf(schema)
   if (fields) {
     const subFields: SchemaFields = {}
@@ -751,8 +765,14 @@ export const substituteSchemaDeep = (
         subFields[name] = field
         continue
       }
-      const { target, rewrap } = resolveFieldTarget(name, field, opts)
-      subFields[name] = rewrap(substituteSchemaDeep(target, deeper))
+      const refTarget = opts?.resolveRef?.(name, field)
+      if (refTarget !== undefined) {
+        const fieldOpt = optionalField(field)
+        const sub = substituteSchemaDeep(refTarget, deeper)
+        subFields[name] = fieldOpt ? fieldOpt.rewrap(sub) : sub
+      } else {
+        subFields[name] = substituteSchemaDeep(field, deeper)
+      }
     }
     const subStruct = Schema.Struct(subFields as Schema.Struct.Fields)
     if (!isClassSchema(schema)) return subStruct as unknown as Schema.Top
