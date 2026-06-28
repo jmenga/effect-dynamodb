@@ -1855,6 +1855,163 @@ describe("Aggregate write path", () => {
   })
 
   // -------------------------------------------------------------------------
+  // update — orphan deletes (#74): an edge element removed by the mutation must
+  // emit a Delete (in the same per-group transaction), not just be skipped. A
+  // many-edge element lives in its parent group, so removal shrinks a group —
+  // the diff must be item-level, not group-level.
+  // -------------------------------------------------------------------------
+
+  describe("update — orphan deletes (#74)", () => {
+    class CommentX extends Schema.Class<CommentX>("CommentX")({
+      id: Schema.String, // required → each comment gets a distinct SK composite
+      text: Schema.String,
+    }) {}
+    class PostX extends Schema.Class<PostX>("PostX")({
+      postId: Schema.String,
+      title: Schema.String,
+      comments: Schema.Array(CommentX),
+    }) {}
+    const PostXAggregate = Aggregate.make(PostX, {
+      table: MainTable,
+      schema: AppSchema,
+      pk: { field: "pk", composite: ["postId"] },
+      collection: { index: "lsi1", name: "postx", sk: { field: "lsi1sk", composite: [] } },
+      root: { entityType: "PostXRoot" },
+      edges: { comments: Aggregate.many("comments", { entityType: "PostXComment" }) },
+    })
+
+    // Create (capturing the written rows), then arm the partition query with those
+    // rows so the subsequent update assembles from the real created state.
+    const seed = (input: Parameters<typeof PostXAggregate.create>[0]) =>
+      Effect.gen(function* () {
+        const written: Array<Record<string, unknown>> = []
+        mockTransactWrite.mockImplementation((i: { TransactItems: Array<any> }) => {
+          for (const ti of i.TransactItems) if (ti.Put) written.push(ti.Put.Item)
+          return Promise.resolve({})
+        })
+        yield* PostXAggregate.create(input)
+        mockTransactWrite.mockReset()
+        mockTransactWrite.mockResolvedValue({})
+        mockWriteQuery.mockResolvedValueOnce({ Items: written, LastEvaluatedKey: undefined })
+      })
+
+    const lastTransactItems = (): Array<any> =>
+      (mockTransactWrite.mock.calls[0]![0] as { TransactItems: Array<any> }).TransactItems
+    const skOf = (x: { S?: string } | undefined): string => x?.S ?? ""
+
+    it.effect("removing one element emits a Delete for the orphan + Puts for survivors", () =>
+      Effect.gen(function* () {
+        yield* seed({
+          postId: "p",
+          title: "T",
+          comments: [
+            { id: "c1", text: "a" },
+            { id: "c2", text: "b" },
+          ],
+        })
+
+        yield* PostXAggregate.update({ postId: "p" }, ({ state }) => ({
+          ...state,
+          comments: state.comments.filter((c) => c.id !== "c1"),
+        }))
+
+        expect(mockTransactWrite).toHaveBeenCalledTimes(1)
+        const ti = lastTransactItems()
+        const deletes = ti.filter((x) => x.Delete)
+        const puts = ti.filter((x) => x.Put)
+        expect(deletes).toHaveLength(1)
+        expect(skOf(deletes[0].Delete.Key.sk)).toMatch(/#c1$/)
+        expect(puts.some((p) => /#c2$/.test(skOf(p.Put.Item.sk)))).toBe(true)
+        expect(puts.some((p) => /#c1$/.test(skOf(p.Put.Item.sk)))).toBe(false)
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("removing all elements emits a Delete per orphan, only root remains a Put", () =>
+      Effect.gen(function* () {
+        yield* seed({
+          postId: "p",
+          title: "T",
+          comments: [
+            { id: "c1", text: "a" },
+            { id: "c2", text: "b" },
+          ],
+        })
+
+        yield* PostXAggregate.update({ postId: "p" }, ({ state }) => ({ ...state, comments: [] }))
+
+        const ti = lastTransactItems()
+        expect(ti.filter((x) => x.Delete)).toHaveLength(2)
+        const puts = ti.filter((x) => x.Put)
+        expect(puts).toHaveLength(1) // root only
+        expect(skOf(puts[0].Put.Item.sk)).toMatch(/postxroot$/)
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect(
+      "atomic add + remove: one transaction carries the new Put and the orphan Delete",
+      () =>
+        Effect.gen(function* () {
+          yield* seed({
+            postId: "p",
+            title: "T",
+            comments: [
+              { id: "c1", text: "a" },
+              { id: "c2", text: "b" },
+            ],
+          })
+
+          yield* PostXAggregate.update({ postId: "p" }, ({ state }) => ({
+            ...state,
+            comments: [...state.comments.filter((c) => c.id !== "c1"), { id: "c9", text: "n" }],
+          }))
+
+          expect(mockTransactWrite).toHaveBeenCalledTimes(1)
+          const ti = lastTransactItems()
+          const deletes = ti.filter((x) => x.Delete)
+          expect(deletes).toHaveLength(1)
+          expect(skOf(deletes[0].Delete.Key.sk)).toMatch(/#c1$/)
+          expect(ti.filter((x) => x.Put).some((p) => /#c9$/.test(skOf(p.Put.Item.sk)))).toBe(true)
+        }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("root-field-only update issues Puts only — zero Deletes", () =>
+      Effect.gen(function* () {
+        yield* seed({
+          postId: "p",
+          title: "T",
+          comments: [
+            { id: "c1", text: "a" },
+            { id: "c2", text: "b" },
+          ],
+        })
+
+        yield* PostXAggregate.update({ postId: "p" }, ({ state }) => ({ ...state, title: "T2" }))
+
+        const ti = lastTransactItems()
+        expect(ti.filter((x) => x.Delete)).toHaveLength(0)
+        expect(ti.filter((x) => x.Put).length).toBeGreaterThanOrEqual(1)
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("create path emits Puts only (never a Delete)", () =>
+      Effect.gen(function* () {
+        mockTransactWrite.mockResolvedValue({})
+        yield* PostXAggregate.create({
+          postId: "p2",
+          title: "T",
+          comments: [{ id: "c1", text: "a" }],
+        })
+        for (const call of mockTransactWrite.mock.calls) {
+          for (const ti of (call[0] as { TransactItems: Array<any> }).TransactItems) {
+            expect(ti.Delete).toBeUndefined()
+            expect(ti.Put).toBeDefined()
+          }
+        }
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+  })
+
+  // -------------------------------------------------------------------------
   // Error paths for write operations
   // -------------------------------------------------------------------------
 

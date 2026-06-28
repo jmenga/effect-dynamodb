@@ -2915,6 +2915,321 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
       }).pipe(provideAgg),
     )
   })
+
+  // -------------------------------------------------------------------------
+  // Edge removal via update (#74) — items dropped by the mutation must be
+  // DELETEd, not left as orphan rows that re-appear on the next get. A many-edge
+  // element (and a cleared one-edge) lives in its PARENT's transaction group, so
+  // removing it shrinks a group rather than dropping a whole group; the item-level
+  // diff must therefore emit a Delete for the orphaned row.
+  // -------------------------------------------------------------------------
+
+  describe("Aggregate update — edge removal (#74)", () => {
+    // Raw base-table partition read so we can assert orphan rows are physically
+    // gone — the strongest #74 regression check (get() also re-assembles only
+    // surviving rows, so a left-behind row would re-appear there too).
+    const rawSks = (pk: string) =>
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        const res = yield* client.query({
+          TableName: aggTableName,
+          KeyConditionExpression: "#pk = :pk",
+          ExpressionAttributeNames: { "#pk": "pk" },
+          ExpressionAttributeValues: { ":pk": { S: pk } },
+        })
+        return (res.Items ?? []).map((i) => (i.sk as { S: string }).S)
+      })
+    const blogPk = (id: string) => DynamoSchema.composeCollectionKey(AggSchema, "blogpost", [id])
+    const commentSk = (id: string) => DynamoSchema.composeKey(AggSchema, "BlogPostComment", [id])
+
+    it.effect("removes one many-edge element — re-read + raw partition confirm deletion", () =>
+      Effect.gen(function* () {
+        yield* BlogPostAggregate.create({
+          id: "post-rm-1",
+          title: "RM One",
+          authorId: "alice",
+          meta: { summary: "s", wordCount: 1 },
+          comments: [
+            { id: "c1", text: "a", commenter: "X" },
+            { id: "c2", text: "b", commenter: "Y" },
+            { id: "c3", text: "c", commenter: "Z" },
+          ],
+        })
+
+        const updated = yield* BlogPostAggregate.update({ id: "post-rm-1" }, ({ state }) => ({
+          ...state,
+          comments: state.comments.filter((c) => c.id !== "c2"),
+        }))
+        expect(updated.comments.map((c) => c.id).sort()).toEqual(["c1", "c3"])
+
+        const fetched = yield* BlogPostAggregate.get({ id: "post-rm-1" })
+        expect(fetched.comments).toHaveLength(2)
+        expect(fetched.comments.map((c) => c.id)).not.toContain("c2")
+        expect(fetched.meta.summary).toBe("s") // one-edge preserved
+
+        const sks = yield* rawSks(blogPk("post-rm-1"))
+        expect(sks).not.toContain(commentSk("c2")) // orphan row physically deleted
+        expect(sks).toContain(commentSk("c1"))
+        expect(sks).toContain(commentSk("c3"))
+      }).pipe(provideAgg),
+    )
+
+    it.effect("removes ALL many-edge elements — only root + one-edge survive", () =>
+      Effect.gen(function* () {
+        yield* BlogPostAggregate.create({
+          id: "post-rm-2",
+          title: "RM All",
+          authorId: "alice",
+          meta: { summary: "keep", wordCount: 2 },
+          comments: [
+            { id: "c1", text: "a", commenter: "X" },
+            { id: "c2", text: "b", commenter: "Y" },
+          ],
+        })
+
+        const updated = yield* BlogPostAggregate.update({ id: "post-rm-2" }, ({ state }) => ({
+          ...state,
+          comments: [],
+        }))
+        expect(updated.comments).toHaveLength(0)
+
+        const fetched = yield* BlogPostAggregate.get({ id: "post-rm-2" })
+        expect(fetched.comments).toHaveLength(0)
+        expect(fetched.meta.summary).toBe("keep") // one-edge survives
+
+        const sks = yield* rawSks(blogPk("post-rm-2"))
+        expect(sks).not.toContain(commentSk("c1"))
+        expect(sks).not.toContain(commentSk("c2"))
+        expect(sks).toHaveLength(2) // only root + meta remain
+      }).pipe(provideAgg),
+    )
+
+    it.effect("atomic add + remove in one update", () =>
+      Effect.gen(function* () {
+        yield* BlogPostAggregate.create({
+          id: "post-rm-3",
+          title: "RM Mix",
+          authorId: "alice",
+          meta: { summary: "s", wordCount: 3 },
+          comments: [
+            { id: "c1", text: "a", commenter: "X" },
+            { id: "c2", text: "b", commenter: "Y" },
+          ],
+        })
+
+        const updated = yield* BlogPostAggregate.update({ id: "post-rm-3" }, ({ state }) => ({
+          ...state,
+          comments: [
+            ...state.comments.filter((c) => c.id !== "c1"),
+            { id: "c9", text: "new", commenter: "Zoe" },
+          ],
+        }))
+        expect(updated.comments.map((c) => c.id).sort()).toEqual(["c2", "c9"])
+
+        const fetched = yield* BlogPostAggregate.get({ id: "post-rm-3" })
+        expect(fetched.comments.map((c) => c.id).sort()).toEqual(["c2", "c9"])
+
+        const sks = yield* rawSks(blogPk("post-rm-3"))
+        expect(sks).toContain(commentSk("c2"))
+        expect(sks).toContain(commentSk("c9"))
+        expect(sks).not.toContain(commentSk("c1"))
+      }).pipe(provideAgg),
+    )
+
+    it.effect("root-field-only update preserves all edge rows (no spurious delete)", () =>
+      Effect.gen(function* () {
+        yield* BlogPostAggregate.create({
+          id: "post-rm-4",
+          title: "Before",
+          authorId: "alice",
+          meta: { summary: "s", wordCount: 4 },
+          comments: [
+            { id: "c1", text: "a", commenter: "X" },
+            { id: "c2", text: "b", commenter: "Y" },
+          ],
+        })
+        const before = yield* rawSks(blogPk("post-rm-4"))
+
+        const updated = yield* BlogPostAggregate.update({ id: "post-rm-4" }, ({ state }) => ({
+          ...state,
+          title: "After",
+        }))
+        expect(updated.title).toBe("After")
+        expect(updated.comments).toHaveLength(2)
+
+        const fetched = yield* BlogPostAggregate.get({ id: "post-rm-4" })
+        expect(fetched.title).toBe("After")
+        expect(fetched.comments.map((c) => c.id).sort()).toEqual(["c1", "c2"])
+        expect(fetched.meta.summary).toBe("s")
+
+        const after = yield* rawSks(blogPk("post-rm-4"))
+        expect(after.sort()).toEqual(before.sort()) // no row added or deleted
+      }).pipe(provideAgg),
+    )
+  })
+
+  // -------------------------------------------------------------------------
+  // Sub-aggregate edge removal (#74 — the exact issue repro: team1.players)
+  // -------------------------------------------------------------------------
+
+  describe("Aggregate update — sub-aggregate edge removal (#74 repro)", () => {
+    class SquadCoach extends Schema.Class<SquadCoach>("SquadCoach")({
+      name: Schema.String,
+    }) {}
+    class SquadPlayer extends Schema.Class<SquadPlayer>("SquadPlayer")({
+      id: Schema.String, // required → extractRefIdentifiers gives each player a distinct SK
+      name: Schema.String,
+    }) {}
+    class Squad extends Schema.Class<Squad>("Squad")({
+      coach: Schema.optionalKey(SquadCoach), // optionalKey so it can be cleared
+      players: Schema.Array(SquadPlayer),
+    }) {}
+    class MatchCard extends Schema.Class<MatchCard>("MatchCard")({
+      id: Schema.String,
+      title: Schema.String,
+      team1: Squad,
+      team2: Squad,
+    }) {}
+
+    const SquadAggregate = Aggregate.make(Squad, {
+      root: { entityType: "MatchSquad" },
+      edges: {
+        coach: Aggregate.one("coach", { entityType: "SquadCoach" }),
+        players: Aggregate.many("players", { entityType: "SquadPlayer" }),
+      },
+    })
+    // Reuses the existing gsi2 on AggTable (no CreateTable change). Not bound via
+    // DynamoClient.make — exercised directly like ReviewedPostAggregate above.
+    const MatchCardAggregate = Aggregate.make(MatchCard, {
+      table: AggTable,
+      schema: AggSchema,
+      pk: { field: "pk", composite: ["id"] },
+      collection: {
+        index: "gsi2",
+        name: "matchcard",
+        sk: { field: "gsi2sk", composite: ["title"] },
+      },
+      root: { entityType: "MatchCardRoot" },
+      edges: {
+        team1: SquadAggregate.with({ discriminator: { teamNumber: 1 } }),
+        team2: SquadAggregate.with({ discriminator: { teamNumber: 2 } }),
+      },
+    })
+
+    const matchPk = (id: string) => DynamoSchema.composeCollectionKey(AggSchema, "matchcard", [id])
+    const rawSks = (pk: string) =>
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        const res = yield* client.query({
+          TableName: aggTableName,
+          KeyConditionExpression: "#pk = :pk",
+          ExpressionAttributeNames: { "#pk": "pk" },
+          ExpressionAttributeValues: { ":pk": { S: pk } },
+        })
+        return (res.Items ?? []).map((i) => (i.sk as { S: string }).S)
+      })
+    const playerSks = (sks: ReadonlyArray<string>) =>
+      sks.filter((s) => s.toLowerCase().includes("squadplayer"))
+    const coachSks = (sks: ReadonlyArray<string>) =>
+      sks.filter((s) => s.toLowerCase().includes("squadcoach"))
+
+    it.effect("removes one player from team1.players — team2 untouched", () =>
+      Effect.gen(function* () {
+        yield* MatchCardAggregate.create({
+          id: "mc-1",
+          title: "Final",
+          team1: {
+            coach: { name: "C1" },
+            players: [
+              { id: "p1", name: "A" },
+              { id: "p2", name: "B" },
+            ],
+          },
+          team2: { coach: { name: "C2" }, players: [{ id: "p3", name: "C" }] },
+        })
+
+        const updated = yield* MatchCardAggregate.update({ id: "mc-1" }, ({ state }) => ({
+          ...state,
+          team1: { ...state.team1, players: state.team1.players.filter((p) => p.id !== "p1") },
+        }))
+        expect(updated.team1.players.map((p) => p.id)).toEqual(["p2"])
+        expect(updated.team2.players.map((p) => p.id)).toEqual(["p3"])
+
+        const fetched = yield* MatchCardAggregate.get({ id: "mc-1" })
+        expect(fetched.team1.players.map((p) => p.id)).toEqual(["p2"])
+        expect(fetched.team2.players.map((p) => p.id)).toEqual(["p3"]) // sibling group untouched
+
+        const players = playerSks(yield* rawSks(matchPk("mc-1")))
+        expect(players).toHaveLength(2) // p2 (team1) + p3 (team2)
+        expect(players.some((s) => s.endsWith("#p1"))).toBe(false) // removed row gone
+        expect(players.some((s) => s.endsWith("#p2"))).toBe(true)
+        expect(players.some((s) => s.endsWith("#p3"))).toBe(true)
+      }).pipe(provideAgg),
+    )
+
+    it.effect("removes ALL players from team1 — sub-aggregate root + coach survive", () =>
+      Effect.gen(function* () {
+        yield* MatchCardAggregate.create({
+          id: "mc-2",
+          title: "Semi",
+          team1: {
+            coach: { name: "C1" },
+            players: [
+              { id: "p1", name: "A" },
+              { id: "p2", name: "B" },
+            ],
+          },
+          team2: { coach: { name: "C2" }, players: [{ id: "p3", name: "C" }] },
+        })
+
+        const updated = yield* MatchCardAggregate.update({ id: "mc-2" }, ({ state }) => ({
+          ...state,
+          team1: { ...state.team1, players: [] },
+        }))
+        expect(updated.team1.players).toHaveLength(0)
+
+        const fetched = yield* MatchCardAggregate.get({ id: "mc-2" })
+        expect(fetched.team1.players).toHaveLength(0)
+        expect(fetched.team1.coach?.name).toBe("C1") // one-edge in same group survives
+        expect(fetched.team2.players.map((p) => p.id)).toEqual(["p3"])
+
+        const players = playerSks(yield* rawSks(matchPk("mc-2")))
+        expect(players.some((s) => s.endsWith("#p1"))).toBe(false)
+        expect(players.some((s) => s.endsWith("#p2"))).toBe(false)
+        expect(players.some((s) => s.endsWith("#p3"))).toBe(true) // team2 intact
+      }).pipe(provideAgg),
+    )
+
+    it.effect("clears team1.coach (one-edge) — team2.coach intact", () =>
+      Effect.gen(function* () {
+        yield* MatchCardAggregate.create({
+          id: "mc-3",
+          title: "Group",
+          team1: { coach: { name: "C1" }, players: [{ id: "p1", name: "A" }] },
+          team2: { coach: { name: "C2" }, players: [{ id: "p3", name: "C" }] },
+        })
+
+        const updated = yield* MatchCardAggregate.update({ id: "mc-3" }, ({ state }) => {
+          const team1 = { ...state.team1 } as Record<string, unknown>
+          delete team1.coach
+          return { ...state, team1 } as typeof state
+        })
+        expect(updated.team1.coach).toBeUndefined()
+        expect(updated.team1.players).toHaveLength(1)
+
+        const fetched = yield* MatchCardAggregate.get({ id: "mc-3" })
+        expect(fetched.team1.coach).toBeUndefined()
+        expect(fetched.team1.players.map((p) => p.id)).toEqual(["p1"])
+        expect(fetched.team2.coach?.name).toBe("C2")
+
+        // Exactly one coach row remains (team1's was deleted); get() above proves
+        // it is team2's. The discriminator is zero-padded in the SK, so assert on
+        // count rather than a brittle suffix.
+        const coaches = coachSks(yield* rawSks(matchPk("mc-3")))
+        expect(coaches).toHaveLength(1)
+      }).pipe(provideAgg),
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------
