@@ -664,18 +664,22 @@ export interface DeepSubstitutionOptions {
  */
 const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOptions): boolean => {
   if (schema == null || (schema as { readonly ast?: unknown }).ast == null) return false
-  if (isSelfDateSchema(schema)) return true
-  if (opts?.tolerantTransforms && isDateTransform(schema)) return true
-  if (tryGetRedactedInner(schema) !== undefined) return true
   // `tolerantTransforms` propagates through the recursion; `skipTopLevel` /
   // `resolveRef` apply only at the immediate level (so they're dropped below).
   const deeper: DeepSubstitutionOptions | undefined = opts?.tolerantTransforms
     ? { tolerantTransforms: true }
     : undefined
-  // Optional wrapper — unwrap to the REAL inner BEFORE the array/struct checks
-  // (an `optionalKey(Array)` wrapper has the `Arrays` AST but no runtime `.value`).
+  // Optional wrapper FIRST — unwrap to the REAL inner before the leaf / array /
+  // struct checks. `optionalKey(X)` is a bare AST (Declaration/Arrays) with an
+  // `isOptional` context, so the leaf detectors (which resolve through to the
+  // type constructor) would otherwise treat `optionalKey(date)` as a plain
+  // required date and drop the optionality; and an `optionalKey(Array)` wrapper
+  // has the `Arrays` AST but no runtime `.value`.
   const opt = optionalField(schema)
   if (opt !== undefined) return needsDeepSubstitution(opt.inner, deeper)
+  if (isSelfDateSchema(schema)) return true
+  if (opts?.tolerantTransforms && isDateTransform(schema)) return true
+  if (tryGetRedactedInner(schema) !== undefined) return true
   if (isArraySchema(schema)) {
     const element = arrayElementOf(schema)
     return element !== undefined && needsDeepSubstitution(element, deeper)
@@ -714,6 +718,22 @@ export const substituteSchemaDeep = (
 ): Schema.Top => {
   if (!needsDeepSubstitution(schema, opts)) return schema
 
+  // `tolerantTransforms` propagates through the recursion; `skipTopLevel` /
+  // `resolveRef` apply only at this immediate level.
+  const deeper: DeepSubstitutionOptions | undefined = opts?.tolerantTransforms
+    ? { tolerantTransforms: true }
+    : undefined
+
+  // Optional wrapper FIRST — unwrap to the REAL inner, substitute it, then
+  // re-apply the same optionality. Handled BEFORE the leaf / array / struct
+  // checks: the leaf detectors resolve through an `optionalKey` wrapper and would
+  // otherwise replace `optionalKey(date)` with a plain required transform (losing
+  // the optional key), and an optional array's `.value` lives only on the inner.
+  const opt = optionalField(schema)
+  if (opt !== undefined) {
+    return opt.rewrap(substituteSchemaDeep(opt.inner, deeper))
+  }
+
   // Leaf: self-date schema → tolerant bidirectional date transform.
   if (isSelfDateSchema(schema)) {
     const encoding = getEncoding(schema) ?? inferDefaultEncoding(schema)
@@ -728,20 +748,6 @@ export const substituteSchemaDeep = (
   // Leaf: RedactedFromValue → tolerant Redacted transform.
   const redactedInner = tryGetRedactedInner(schema)
   if (redactedInner !== undefined) return buildRedactedSubstitute(redactedInner)
-
-  // `tolerantTransforms` propagates through the recursion; `skipTopLevel` /
-  // `resolveRef` apply only at this immediate level.
-  const deeper: DeepSubstitutionOptions | undefined = opts?.tolerantTransforms
-    ? { tolerantTransforms: true }
-    : undefined
-
-  // Optional wrapper — unwrap to the REAL inner, substitute it, then re-apply the
-  // same optionality. Handled BEFORE the array/struct checks so an optional array
-  // is unwrapped (its `.value` only exists on the real inner, not the wrapper).
-  const opt = optionalField(schema)
-  if (opt !== undefined) {
-    return opt.rewrap(substituteSchemaDeep(opt.inner, deeper))
-  }
 
   // Array: substitute the element schema.
   if (isArraySchema(schema)) {

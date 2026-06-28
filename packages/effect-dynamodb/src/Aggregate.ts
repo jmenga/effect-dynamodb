@@ -649,12 +649,16 @@ const makeAggregate = <TSchema extends Schema.Top>(
   // preserved (Option A). Returns the raw `schema` unchanged when it carries no
   // date / Redacted leaf at all (zero overhead).
   //
-  // Ref / one / many edge fields carry the opaque `DynamoModel.ref` annotation,
-  // so the substitution can't introspect them — `resolveRef` re-points each to
-  // its edge target model (unwrapping `DynamoModel.configure`).
+  // SINGLE ref/one edge fields carry the opaque `DynamoModel.ref` annotation, so
+  // the substitution can't introspect them — `resolveRef` re-points each to its
+  // edge target model (unwrapping `DynamoModel.configure`). MANY edges are
+  // excluded: their model field is a `Schema.Array(...)` (or a wrapper class) that
+  // `substituteSchemaDeep` introspects directly — re-pointing it at the element
+  // model would drop the `Array` and yield "Expected object, got []" on assemble.
   const edgeRefModels = new Map<string, Schema.Top>()
   for (const [edgeName, edge] of Object.entries(config.edges)) {
     if (!("_tag" in edge)) continue
+    if (edge._tag !== "RefEdge" && edge._tag !== "OneEdge") continue
     const entity = (edge as { readonly entity?: { readonly model?: Schema.Top } }).entity
     const model = entity?.model
     if (!model) continue

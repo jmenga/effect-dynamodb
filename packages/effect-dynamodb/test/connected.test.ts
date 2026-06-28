@@ -4597,6 +4597,16 @@ class EddVenue extends Schema.Class<EddVenue>("EddVenue")({
   id: Schema.String.pipe(DynamoModel.identifier),
   name: Schema.String,
 }) {}
+class EddPlayer extends Schema.Class<EddPlayer>("EddPlayer")({
+  id: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+}) {}
+// Many-edge element: a wrapper class around a ref (mirrors a typical "sheet").
+// The ref field name must match `deriveEntityFieldName(EddPlayers)` = "eddPlayer".
+class EddPlayerSheet extends Schema.Class<EddPlayerSheet>("EddPlayerSheet")({
+  eddPlayer: EddPlayer.pipe(DynamoModel.ref),
+  shirtNumber: Schema.Number,
+}) {}
 class EddArticle extends Schema.Class<EddArticle>("EddArticle")({
   articleId: Schema.String,
   title: Schema.String,
@@ -4606,8 +4616,11 @@ class EddMatch extends Schema.Class<EddMatch>("EddMatch")({
   id: Schema.String,
   name: Schema.String,
   startDate: Schema.DateTimeUtcFromString, // Pattern B root field
+  finishDate: Schema.optionalKey(Schema.DateTimeUtcFromString), // optional root date (#73 #1)
   venue: EddVenue.pipe(DynamoModel.ref),
   coach: EddCoach.pipe(DynamoModel.ref),
+  // Optional MANY edge of a class — must keep its Array wrapper on assemble (#73 #2).
+  players: Schema.optionalKey(Schema.Array(EddPlayerSheet)),
 }) {}
 
 const eddPk = {
@@ -4617,6 +4630,7 @@ const eddPk = {
 const EddAuthors = PureEntity.make({ model: EddAuthor, entityType: "EddAuthor", primaryKey: eddPk })
 const EddCoaches = PureEntity.make({ model: EddCoach, entityType: "EddCoach", primaryKey: eddPk })
 const EddVenues = PureEntity.make({ model: EddVenue, entityType: "EddVenue", primaryKey: eddPk })
+const EddPlayers = PureEntity.make({ model: EddPlayer, entityType: "EddPlayer", primaryKey: eddPk })
 const EddArticles = PureEntity.make({
   model: EddArticle,
   entityType: "EddArticle",
@@ -4625,7 +4639,7 @@ const EddArticles = PureEntity.make({
 })
 const EddTable = Table.make({
   schema: AppSchema,
-  entities: { EddAuthors, EddCoaches, EddVenues, EddArticles },
+  entities: { EddAuthors, EddCoaches, EddVenues, EddPlayers, EddArticles },
 })
 // Aggregate edges reference PURE definitions (no runtime `.get`) — #71.
 const EddMatchAggregate = Aggregate.make(EddMatch, {
@@ -4637,6 +4651,7 @@ const EddMatchAggregate = Aggregate.make(EddMatch, {
   edges: {
     venue: Aggregate.one("venue", { entityType: "EddMatchVenue", entity: EddVenues }),
     coach: Aggregate.one("coach", { entityType: "EddMatchCoach", entity: EddCoaches }),
+    players: Aggregate.many("players", { entityType: "EddMatchPlayer", entity: EddPlayers }),
   },
 })
 const eddTableName = "edd-71-72-connected"
@@ -4723,11 +4738,13 @@ describeConnected("#71/#72 — pure aggregate edges + Pattern B date fields", ()
     () =>
       Effect.gen(function* () {
         const db = yield* DynamoClient.make({
-          entities: { EddAuthors, EddCoaches, EddVenues, EddArticles },
+          entities: { EddAuthors, EddCoaches, EddVenues, EddPlayers, EddArticles },
           aggregates: { EddMatchAggregate },
           tables: { EddTable },
         })
         yield* db.entities.EddVenues.put({ id: "mcg", name: "MCG" })
+        yield* db.entities.EddPlayers.put({ id: "p1", name: "Smith" })
+        yield* db.entities.EddPlayers.put({ id: "p2", name: "Khawaja" })
         yield* db.entities.EddCoaches.put({
           id: "mcd",
           name: "McDonald",
@@ -4737,12 +4754,19 @@ describeConnected("#71/#72 — pure aggregate edges + Pattern B date fields", ()
         })
 
         // #71: pure coach/venue edges must promote at hydrate (was a TypeError).
+        // #73 #1: `finishDate` (optionalKey root date) is OMITTED — must not be
+        //   treated as required during create. #73 #2: `players` is an optional
+        //   MANY edge whose Array wrapper must survive substitution.
         const created = yield* db.aggregates.EddMatchAggregate.create({
           id: "m1",
           name: "M1",
           startDate: "2025-03-01T10:00:00.000Z",
           venueId: "mcg",
           coachId: "mcd",
+          players: [
+            { eddPlayerId: "p1", shirtNumber: 7 },
+            { eddPlayerId: "p2", shirtNumber: 10 },
+          ],
         } as unknown as Parameters<typeof db.aggregates.EddMatchAggregate.create>[0])
         expect((created as EddMatch).coach.name).toBe("McDonald")
         expect(DateTime.isDateTime((created as EddMatch).startDate)).toBe(true)
@@ -4767,6 +4791,15 @@ describeConnected("#71/#72 — pure aggregate edges + Pattern B date fields", ()
         // Option A: an OPTIONAL Pattern A self-date nested in the edge target.
         expect(DateTime.isDateTime(fetched.coach.retiredAt as DateTime.Utc)).toBe(true)
         expect(fetched.venue.name).toBe("MCG")
+        // #73 #1: omitted optionalKey root date stays absent (not "Missing key").
+        expect(fetched.finishDate).toBeUndefined()
+        // #73 #2: the optional many edge keeps its Array wrapper and hydrates.
+        expect(Array.isArray(fetched.players)).toBe(true)
+        expect((fetched.players ?? []).length).toBe(2)
+        expect((fetched.players ?? []).map((p) => p.eddPlayer.name).sort()).toEqual([
+          "Khawaja",
+          "Smith",
+        ])
 
         // #72 update: mutating a non-date field must not trip the Pattern B root
         // re-decode (the mutated state carries a domain `DateTime` for startDate).

@@ -162,5 +162,52 @@ describe("substituteSchemaDeep", () => {
         expect(absent.at).toBeUndefined()
       }),
     )
+
+    // PR #73: an `optionalKey(date)` field is a bare AST with an `isOptional`
+    // context, so the leaf detectors must NOT run before the optional unwrap —
+    // otherwise the field is replaced by a plain REQUIRED date and an omitted
+    // value fails with "Missing key".
+    it.effect("Schema.optionalKey(transform date leaf) stays optional", () =>
+      Effect.gen(function* () {
+        const sub = substituteSchemaDeep(
+          Schema.Struct({
+            id: Schema.String,
+            at: Schema.optionalKey(Schema.DateTimeUtcFromString),
+          }),
+          { tolerantTransforms: true },
+        ) as Schema.Codec<any>
+        const absent: any = yield* Schema.decodeUnknownEffect(sub)({ id: "x" })
+        expect("at" in absent).toBe(false)
+        const present: any = yield* Schema.decodeUnknownEffect(sub)({
+          id: "x",
+          at: "2020-01-01T00:00:00.000Z",
+        })
+        expect(DateTime.isDateTime(present.at)).toBe(true)
+      }),
+    )
+
+    it.effect("Schema.optionalKey(self-date leaf) stays optional", () =>
+      Effect.gen(function* () {
+        const sub = substituteSchemaDeep(
+          Schema.Struct({ id: Schema.String, at: Schema.optionalKey(Schema.DateTimeUtc) }),
+        ) as Schema.Codec<any>
+        const absent: any = yield* Schema.decodeUnknownEffect(sub)({ id: "x" })
+        expect("at" in absent).toBe(false)
+      }),
+    )
+
+    it.effect("Schema.optionalKey(Array(Class)) keeps the Array wrapper", () =>
+      Effect.gen(function* () {
+        const sub = substituteSchemaDeep(
+          Schema.Struct({ coaches: Schema.optionalKey(Schema.Array(Coach)) }),
+          { tolerantTransforms: true },
+        ) as Schema.Codec<any>
+        const present: any = yield* Schema.decodeUnknownEffect(sub)({ coaches: [wireCoach] })
+        expect(Array.isArray(present.coaches)).toBe(true)
+        expectCoach(present.coaches[0])
+        const empty: any = yield* Schema.decodeUnknownEffect(sub)({ coaches: [] })
+        expect(empty.coaches).toEqual([])
+      }),
+    )
   })
 })
