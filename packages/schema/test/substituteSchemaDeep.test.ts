@@ -89,4 +89,62 @@ describe("substituteSchemaDeep", () => {
       expect(DateTime.isDateTime(decoded.coach.joinedAt)).toBe(true)
     }),
   )
+
+  // --- Optional wrappers (the "all use cases" follow-up) ----------------------
+  describe("optional / optionalKey wrappers preserve instance + optionality", () => {
+    const expectCoach = (c: any) => {
+      expect(c).toBeInstanceOf(Coach)
+      expect(c.greet()).toBe("Coach c1")
+      expect(DateTime.isDateTime(c.joinedAt)).toBe(true) // Pattern A self-date
+      expect(DateTime.isDateTime(c.dob)).toBe(true) // Pattern B transform
+    }
+
+    it.effect("Schema.optional(Class) — present and absent", () =>
+      Effect.gen(function* () {
+        const sub = substituteSchemaDeep(Schema.Struct({ coach: Schema.optional(Coach) }), {
+          tolerantTransforms: true,
+        }) as Schema.Codec<any>
+        const present: any = yield* Schema.decodeUnknownEffect(sub)({ coach: wireCoach })
+        expectCoach(present.coach)
+        expect(yield* Schema.encodeUnknownEffect(sub)(present)).toEqual({ coach: wireCoach })
+        const absent: any = yield* Schema.decodeUnknownEffect(sub)({})
+        expect(absent.coach).toBeUndefined()
+      }),
+    )
+
+    it.effect("Schema.optionalKey(Class) — present and absent", () =>
+      Effect.gen(function* () {
+        const sub = substituteSchemaDeep(Schema.Struct({ coach: Schema.optionalKey(Coach) }), {
+          tolerantTransforms: true,
+        }) as Schema.Codec<any>
+        const present: any = yield* Schema.decodeUnknownEffect(sub)({ coach: wireCoach })
+        expectCoach(present.coach)
+        const absent: any = yield* Schema.decodeUnknownEffect(sub)({})
+        expect("coach" in absent).toBe(false)
+      }),
+    )
+
+    it.effect("Schema.optional(Schema.Array(Class))", () =>
+      Effect.gen(function* () {
+        const sub = substituteSchemaDeep(
+          Schema.Struct({ coaches: Schema.optional(Schema.Array(Coach)) }),
+          { tolerantTransforms: true },
+        ) as Schema.Codec<any>
+        const d: any = yield* Schema.decodeUnknownEffect(sub)({ coaches: [wireCoach] })
+        expectCoach(d.coaches[0])
+      }),
+    )
+
+    it.effect("Schema.optional(self-date leaf)", () =>
+      Effect.gen(function* () {
+        const sub = substituteSchemaDeep(
+          Schema.Struct({ at: Schema.optional(Schema.DateTimeUtc) }),
+        ) as Schema.Codec<any>
+        const d: any = yield* Schema.decodeUnknownEffect(sub)({ at: "2020-01-01T00:00:00.000Z" })
+        expect(DateTime.isDateTime(d.at)).toBe(true)
+        const absent: any = yield* Schema.decodeUnknownEffect(sub)({})
+        expect(absent.at).toBeUndefined()
+      }),
+    )
+  })
 })

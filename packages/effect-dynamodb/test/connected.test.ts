@@ -4591,6 +4591,7 @@ class EddCoach extends Schema.Class<EddCoach>("EddCoach")({
   name: Schema.String,
   dateOfBirth: Schema.DateTimeUtcFromString, // Pattern B
   joinedAt: Schema.DateTimeUtc, // Pattern A self-date nested in an edge target (Option A)
+  retiredAt: Schema.optional(Schema.DateTimeUtc), // optional Pattern A nested in an edge target
 }) {}
 class EddVenue extends Schema.Class<EddVenue>("EddVenue")({
   id: Schema.String.pipe(DynamoModel.identifier),
@@ -4732,6 +4733,7 @@ describeConnected("#71/#72 — pure aggregate edges + Pattern B date fields", ()
           name: "McDonald",
           dateOfBirth: "1980-01-02T00:00:00.000Z" as unknown as DateTime.Utc,
           joinedAt: DateTime.makeUnsafe("2010-03-20T00:00:00.000Z"),
+          retiredAt: DateTime.makeUnsafe("2024-09-01T00:00:00.000Z"),
         })
 
         // #71: pure coach/venue edges must promote at hydrate (was a TypeError).
@@ -4762,6 +4764,8 @@ describeConnected("#71/#72 — pure aggregate edges + Pattern B date fields", ()
         expect(DateTime.toEpochMillis(fetched.coach.joinedAt)).toBe(
           DateTime.toEpochMillis(DateTime.makeUnsafe("2010-03-20T00:00:00.000Z")),
         )
+        // Option A: an OPTIONAL Pattern A self-date nested in the edge target.
+        expect(DateTime.isDateTime(fetched.coach.retiredAt as DateTime.Utc)).toBe(true)
         expect(fetched.venue.name).toBe("MCG")
 
         // #72 update: mutating a non-date field must not trip the Pattern B root
