@@ -4566,3 +4566,252 @@ describeConnected("#69 — pure schema authoring → DynamoClient.make → real 
     }).pipe(providePure),
   )
 })
+
+// ===========================================================================
+// #71 + #72 — pure-authored aggregate edges + transform (Pattern B) date fields
+// ===========================================================================
+//
+// #71: aggregate edges authored from PURE `@effect-dynamodb/schema` definitions
+//      carry no runtime `.get`; hydration must promote them (was a TypeError).
+// #72: a `Schema.DateTimeUtcFromString` field on the aggregate root, on a
+//      hydrated aggregate edge, and on a plain Entity ref target must decode
+//      exactly once (was "Expected string, got DateTime.Utc" / corrupt write).
+// Option A: a `Schema.DateTimeUtc` (Pattern A self-date) field INSIDE a ref /
+//      edge target must also round-trip — `substituteSchemaDeep` recurses into
+//      the nested target model while preserving its class instance identity.
+
+class EddAuthor extends Schema.Class<EddAuthor>("EddAuthor")({
+  id: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+  dateOfBirth: Schema.DateTimeUtcFromString, // Pattern B (transform)
+  joinedAt: Schema.DateTimeUtc, // Pattern A self-date nested in a ref target (Option A)
+}) {}
+class EddCoach extends Schema.Class<EddCoach>("EddCoach")({
+  id: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+  dateOfBirth: Schema.DateTimeUtcFromString, // Pattern B
+  joinedAt: Schema.DateTimeUtc, // Pattern A self-date nested in an edge target (Option A)
+  retiredAt: Schema.optional(Schema.DateTimeUtc), // optional Pattern A nested in an edge target
+}) {}
+class EddVenue extends Schema.Class<EddVenue>("EddVenue")({
+  id: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+}) {}
+class EddPlayer extends Schema.Class<EddPlayer>("EddPlayer")({
+  id: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+}) {}
+// Many-edge element: a wrapper class around a ref (mirrors a typical "sheet").
+// The ref field name must match `deriveEntityFieldName(EddPlayers)` = "eddPlayer".
+class EddPlayerSheet extends Schema.Class<EddPlayerSheet>("EddPlayerSheet")({
+  eddPlayer: EddPlayer.pipe(DynamoModel.ref),
+  shirtNumber: Schema.Number,
+}) {}
+class EddArticle extends Schema.Class<EddArticle>("EddArticle")({
+  articleId: Schema.String,
+  title: Schema.String,
+  author: EddAuthor.pipe(DynamoModel.ref),
+}) {}
+class EddMatch extends Schema.Class<EddMatch>("EddMatch")({
+  id: Schema.String,
+  name: Schema.String,
+  startDate: Schema.DateTimeUtcFromString, // Pattern B root field
+  finishDate: Schema.optionalKey(Schema.DateTimeUtcFromString), // optional root date (#73 #1)
+  venue: EddVenue.pipe(DynamoModel.ref),
+  coach: EddCoach.pipe(DynamoModel.ref),
+  // Optional MANY edge of a class — must keep its Array wrapper on assemble (#73 #2).
+  players: Schema.optionalKey(Schema.Array(EddPlayerSheet)),
+}) {}
+
+const eddPk = {
+  pk: { field: "pk", composite: ["id"] },
+  sk: { field: "sk", composite: [] },
+} as const
+const EddAuthors = PureEntity.make({ model: EddAuthor, entityType: "EddAuthor", primaryKey: eddPk })
+const EddCoaches = PureEntity.make({ model: EddCoach, entityType: "EddCoach", primaryKey: eddPk })
+const EddVenues = PureEntity.make({ model: EddVenue, entityType: "EddVenue", primaryKey: eddPk })
+const EddPlayers = PureEntity.make({ model: EddPlayer, entityType: "EddPlayer", primaryKey: eddPk })
+const EddArticles = PureEntity.make({
+  model: EddArticle,
+  entityType: "EddArticle",
+  primaryKey: { pk: { field: "pk", composite: ["articleId"] }, sk: { field: "sk", composite: [] } },
+  refs: { author: { entity: EddAuthors } },
+})
+const EddTable = Table.make({
+  schema: AppSchema,
+  entities: { EddAuthors, EddCoaches, EddVenues, EddPlayers, EddArticles },
+})
+// Aggregate edges reference PURE definitions (no runtime `.get`) — #71.
+const EddMatchAggregate = Aggregate.make(EddMatch, {
+  table: EddTable,
+  schema: AppSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { index: "lsi1", name: "eddmatch", sk: { field: "lsi1sk", composite: ["name"] } },
+  root: { entityType: "EddMatchItem" },
+  edges: {
+    venue: Aggregate.one("venue", { entityType: "EddMatchVenue", entity: EddVenues }),
+    coach: Aggregate.one("coach", { entityType: "EddMatchCoach", entity: EddCoaches }),
+    players: Aggregate.many("players", { entityType: "EddMatchPlayer", entity: EddPlayers }),
+  },
+})
+const eddTableName = "edd-71-72-connected"
+const EddTestLayer = Layer.mergeAll(ClientLayer, EddTable.layer({ name: eddTableName }))
+const provideEdd = Effect.provide(EddTestLayer)
+
+describeConnected("#71/#72 — pure aggregate edges + Pattern B date fields", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client
+          .createTable({
+            TableName: eddTableName,
+            BillingMode: "PAY_PER_REQUEST",
+            KeySchema: [
+              { AttributeName: "pk", KeyType: "HASH" },
+              { AttributeName: "sk", KeyType: "RANGE" },
+            ],
+            AttributeDefinitions: [
+              { AttributeName: "pk", AttributeType: "S" },
+              { AttributeName: "sk", AttributeType: "S" },
+              { AttributeName: "lsi1sk", AttributeType: "S" },
+            ],
+            LocalSecondaryIndexes: [
+              {
+                IndexName: "lsi1",
+                KeySchema: [
+                  { AttributeName: "pk", KeyType: "HASH" },
+                  { AttributeName: "lsi1sk", KeyType: "RANGE" },
+                ],
+                Projection: { ProjectionType: "ALL" },
+              },
+            ],
+          })
+          .pipe(Effect.catch(() => Effect.void))
+      }).pipe(provideEdd, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: eddTableName })
+      }).pipe(
+        provideEdd,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("#72 + Option A: plain Entity ref hydrates Pattern B + nested Pattern A dates", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EddAuthors, EddCoaches, EddVenues, EddArticles },
+        tables: { EddTable },
+      })
+      yield* db.entities.EddAuthors.put({
+        id: "alice",
+        name: "Alice",
+        dateOfBirth: "1990-05-01T00:00:00.000Z" as unknown as DateTime.Utc,
+        joinedAt: DateTime.makeUnsafe("2015-06-15T00:00:00.000Z"),
+      })
+      yield* db.entities.EddArticles.put({ articleId: "a1", title: "T", authorId: "alice" })
+      const got = yield* db.entities.EddArticles.get({ articleId: "a1" })
+      expect(got.author.name).toBe("Alice")
+      // #72: Pattern B transform field in the ref target round-trips.
+      expect(DateTime.isDateTime(got.author.dateOfBirth)).toBe(true)
+      expect(DateTime.toEpochMillis(got.author.dateOfBirth)).toBe(
+        DateTime.toEpochMillis(DateTime.makeUnsafe("1990-05-01T00:00:00.000Z")),
+      )
+      // Option A: Pattern A self-date field nested in the ref target round-trips.
+      expect(DateTime.isDateTime(got.author.joinedAt)).toBe(true)
+      expect(DateTime.toEpochMillis(got.author.joinedAt)).toBe(
+        DateTime.toEpochMillis(DateTime.makeUnsafe("2015-06-15T00:00:00.000Z")),
+      )
+    }).pipe(provideEdd),
+  )
+
+  it.effect(
+    "#71/#72 + Option A: aggregate create + get with pure edges, Pattern B + nested Pattern A",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { EddAuthors, EddCoaches, EddVenues, EddPlayers, EddArticles },
+          aggregates: { EddMatchAggregate },
+          tables: { EddTable },
+        })
+        yield* db.entities.EddVenues.put({ id: "mcg", name: "MCG" })
+        yield* db.entities.EddPlayers.put({ id: "p1", name: "Smith" })
+        yield* db.entities.EddPlayers.put({ id: "p2", name: "Khawaja" })
+        yield* db.entities.EddCoaches.put({
+          id: "mcd",
+          name: "McDonald",
+          dateOfBirth: "1980-01-02T00:00:00.000Z" as unknown as DateTime.Utc,
+          joinedAt: DateTime.makeUnsafe("2010-03-20T00:00:00.000Z"),
+          retiredAt: DateTime.makeUnsafe("2024-09-01T00:00:00.000Z"),
+        })
+
+        // #71: pure coach/venue edges must promote at hydrate (was a TypeError).
+        // #73 #1: `finishDate` (optionalKey root date) is OMITTED — must not be
+        //   treated as required during create. #73 #2: `players` is an optional
+        //   MANY edge whose Array wrapper must survive substitution.
+        const created = yield* db.aggregates.EddMatchAggregate.create({
+          id: "m1",
+          name: "M1",
+          startDate: "2025-03-01T10:00:00.000Z",
+          venueId: "mcg",
+          coachId: "mcd",
+          players: [
+            { eddPlayerId: "p1", shirtNumber: 7 },
+            { eddPlayerId: "p2", shirtNumber: 10 },
+          ],
+        } as unknown as Parameters<typeof db.aggregates.EddMatchAggregate.create>[0])
+        expect((created as EddMatch).coach.name).toBe("McDonald")
+        expect(DateTime.isDateTime((created as EddMatch).startDate)).toBe(true)
+
+        // #72: assemble decodes root startDate and the coach edge date exactly once.
+        const fetched = (yield* db.aggregates.EddMatchAggregate.get({ id: "m1" })) as EddMatch
+        expect(fetched.name).toBe("M1")
+        expect(DateTime.isDateTime(fetched.startDate)).toBe(true)
+        expect(DateTime.toEpochMillis(fetched.startDate)).toBe(
+          DateTime.toEpochMillis(DateTime.makeUnsafe("2025-03-01T10:00:00.000Z")),
+        )
+        expect(fetched.coach.name).toBe("McDonald")
+        expect(DateTime.isDateTime(fetched.coach.dateOfBirth)).toBe(true)
+        expect(DateTime.toEpochMillis(fetched.coach.dateOfBirth)).toBe(
+          DateTime.toEpochMillis(DateTime.makeUnsafe("1980-01-02T00:00:00.000Z")),
+        )
+        // Option A: Pattern A self-date nested in the edge target round-trips.
+        expect(DateTime.isDateTime(fetched.coach.joinedAt)).toBe(true)
+        expect(DateTime.toEpochMillis(fetched.coach.joinedAt)).toBe(
+          DateTime.toEpochMillis(DateTime.makeUnsafe("2010-03-20T00:00:00.000Z")),
+        )
+        // Option A: an OPTIONAL Pattern A self-date nested in the edge target.
+        expect(DateTime.isDateTime(fetched.coach.retiredAt as DateTime.Utc)).toBe(true)
+        expect(fetched.venue.name).toBe("MCG")
+        // #73 #1: omitted optionalKey root date stays absent (not "Missing key").
+        expect(fetched.finishDate).toBeUndefined()
+        // #73 #2: the optional many edge keeps its Array wrapper and hydrates.
+        expect(Array.isArray(fetched.players)).toBe(true)
+        expect((fetched.players ?? []).length).toBe(2)
+        expect((fetched.players ?? []).map((p) => p.eddPlayer.name).sort()).toEqual([
+          "Khawaja",
+          "Smith",
+        ])
+
+        // #72 update: mutating a non-date field must not trip the Pattern B root
+        // re-decode (the mutated state carries a domain `DateTime` for startDate).
+        const updated = (yield* db.aggregates.EddMatchAggregate.update({ id: "m1" }, (c: any) => ({
+          ...c.state,
+          name: "M1-renamed",
+        }))) as EddMatch
+        expect(updated.name).toBe("M1-renamed")
+        expect(DateTime.toEpochMillis(updated.startDate)).toBe(
+          DateTime.toEpochMillis(DateTime.makeUnsafe("2025-03-01T10:00:00.000Z")),
+        )
+        expect(DateTime.isDateTime(updated.coach.joinedAt)).toBe(true)
+      }).pipe(provideEdd),
+  )
+})

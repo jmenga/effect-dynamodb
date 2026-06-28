@@ -1761,7 +1761,7 @@ const makeImpl = <
           const keyInput = { [ref.identifierField]: id }
           // Use asModel to convert EntityGet to Effect<ModelType>
           const getEffect = asModel(ref.refEntity.get(keyInput) as EntityGet<any, any, any, any>)
-          const result = yield* getEffect.pipe(
+          const model = yield* getEffect.pipe(
             Effect.catchTag("ItemNotFound", () =>
               Effect.fail(
                 new RefNotFound({
@@ -1773,14 +1773,35 @@ const makeImpl = <
               ),
             ),
           )
-          return { fieldName: ref.fieldName, idFieldName: ref.idFieldName, data: result }
+          // `asModel` returns the DECODED domain value (transform fields lifted to
+          // their domain form, e.g. `Schema.DateTimeUtcFromString` → `DateTime`).
+          // The parent decodes this nested ref field via the ref target's ORIGINAL
+          // `Schema.Class` (`substituteSchemas` does not recurse into nested
+          // classes), whose Encoded side is the wire primitive. Re-encode through
+          // the ref's substituted `modelSchema` so the spliced value is wire-form:
+          // marshall-safe for `toAttributeMap` AND decoded exactly once by the
+          // parent (issue #72 — without this, a put marshalls a `DateTime` and the
+          // return decode fails "Expected string, got DateTime.Utc").
+          const wire = yield* Schema.encodeUnknownEffect(
+            ref.refEntity.schemas.modelSchema as Schema.Codec<any>,
+          )(model).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ValidationError({
+                  entityType,
+                  operation: "hydrateRefs.encode",
+                  cause,
+                }),
+            ),
+          )
+          return { fieldName: ref.fieldName, idFieldName: ref.idFieldName, data: wire }
         })
       })
 
       const results = yield* Effect.all(fetchEffects, { concurrency: "unbounded" })
       for (const r of results) {
-        // Spread the Schema.Class instance to extract domain data as a plain object
-        hydrated[r.fieldName] = { ...(r.data as object) }
+        // `data` is already a wire-form plain object from the ref's modelSchema.
+        hydrated[r.fieldName] = r.data as object
         delete hydrated[r.idFieldName]
       }
 

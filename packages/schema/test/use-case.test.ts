@@ -6,7 +6,7 @@
  * package.
  */
 import { describe, expect, it } from "@effect/vitest"
-import { Effect, Schema } from "effect"
+import { DateTime, Effect, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
@@ -59,6 +59,34 @@ describe("@effect-dynamodb/schema use-case", () => {
     expect((Teams as unknown as { get?: unknown }).get).toBeUndefined()
     expect((Teams as unknown as { put?: unknown }).put).toBeUndefined()
   })
+
+  it.effect("Entity.make handles optionalKey(Array(...)) fields (#73 regression)", () =>
+    Effect.gen(function* () {
+      // Previously crashed at make() — the deep date substitution recursed into an
+      // `optionalKey(Array)` wrapper's missing `.value`. Construction must succeed,
+      // and the record schema must round-trip both the array and a nested date.
+      class WithArrays extends Schema.Class<WithArrays>("WithArrays")({
+        id: Schema.String,
+        tags: Schema.optionalKey(Schema.Array(Schema.String)),
+        dates: Schema.optionalKey(Schema.Array(Schema.DateTimeUtc)),
+      }) {}
+      const Defn = Entity.make({
+        model: WithArrays,
+        entityType: "WithArrays",
+        primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+      })
+      const decoded: any = yield* Schema.decodeUnknownEffect(Defn.inputSchema)({
+        id: "x",
+        tags: ["a", "b"],
+        dates: ["2020-01-01T00:00:00.000Z"],
+      })
+      expect(decoded.tags).toEqual(["a", "b"])
+      expect(DateTime.isDateTime(decoded.dates[0])).toBe(true)
+      // Absent optional arrays decode cleanly too.
+      const minimal: any = yield* Schema.decodeUnknownEffect(Defn.inputSchema)({ id: "y" })
+      expect(minimal.id).toBe("y")
+    }),
+  )
 
   it.effect("inputSchema decodes input and preserves the branded id type (#61)", () =>
     Effect.gen(function* () {
