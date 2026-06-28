@@ -1,5 +1,20 @@
 # effect-dynamodb
 
+## 1.9.5
+
+### Patch Changes
+
+- fix(aggregate): delete edge items removed by `aggregate.update` (closes [#74](https://github.com/jmenga/effect-dynamodb/issues/74))
+
+  `BoundAggregate.update(key, fn)` previously wrote new/changed edge rows but never **deleted** edge items that the mutation removed. If the returned state dropped an element from a `many` edge (or cleared a `one` edge), the orphaned row was left in the table and re-appeared on the next `get` — adds and updates persisted correctly; only removals were dropped.
+
+  Root cause: the update diff operated at the transaction-**group** level (iterating only the new groups and re-`Put`ting changed ones). But a `many`-edge element — and a cleared `one` edge — lives in its **parent's** transaction group, so removing one element shrinks a group rather than dropping a whole group; a group-level diff therefore never emitted a delete for the orphaned row.
+
+  The diff is now **item-level**: `update` builds the full new and old DynamoDB item sets, and for each changed group applies the surviving `Put`s together with `Delete`s for every old row whose key is absent from the new state — all in one `TransactWriteItems` per group (an add and a sibling removal commit atomically). The orphan check is global across the partition, so an element merely moving between groups is never wrongly deleted, and the root item (constant key) is never removed. Transaction-size validation now spans `Put`s + `Delete`s and runs up-front so an oversized later group fails fast instead of partially committing earlier ones.
+
+- Updated dependencies []:
+  - @effect-dynamodb/schema@1.9.5
+
 ## 1.9.4
 
 ### Patch Changes

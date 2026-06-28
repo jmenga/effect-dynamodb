@@ -785,11 +785,16 @@ const makeAggregate = <TSchema extends Schema.Top>(
           assembled,
         )
 
-        // 6. Build DynamoDB items with composed keys
+        // 6. Build DynamoDB items with composed keys (create only ever PUTs)
         const dynamoGroups = buildDynamoItems(groups, config, pkValue, collectionSkComposites)
 
         // 7. Write via sub-aggregate transactions
-        yield* writeTransactionGroups(client, tableConfig.name, dynamoGroups, aggregateName)
+        yield* writeTransactionGroups(
+          client,
+          tableConfig.name,
+          dynamoGroups.map((g) => ({ group: g.group, puts: g.items, deletes: [] })),
+          aggregateName,
+        )
 
         return decoded as Schema.Schema.Type<TSchema>
       }),
@@ -860,7 +865,14 @@ const makeAggregate = <TSchema extends Schema.Top>(
           aggregateName,
         )
 
-        // 5. Diff: determine which transaction groups changed
+        // 5. Diff at the ITEM (primary-key) level, not just the group level.
+        //    A `many`-edge element — and a cleared `one` edge — lives in its PARENT's
+        //    transaction group, so removing it SHRINKS a group rather than dropping a
+        //    whole group. A group-level diff would rewrite the group's surviving PUTs
+        //    but never DELETE the removed row, leaving an orphan that re-appears on
+        //    read (#74). We therefore compute, per changed group, both the items to
+        //    PUT (new) and the items to DELETE (in old, absent from the entire new
+        //    state), and apply them together in one transaction.
         const oldGroupMap = new Map(oldGroups.map((g) => [g.name, g]))
         const newGroupMap = new Map(newGroups.map((g) => [g.name, g]))
 
@@ -873,34 +885,64 @@ const makeAggregate = <TSchema extends Schema.Top>(
           }
         }
 
-        const groupsToWrite: TransactionGroup[] = []
-        for (const [name, newGroup] of newGroupMap) {
-          if (contextChanged) {
-            groupsToWrite.push(newGroup)
-            continue
-          }
-          const oldGroup = oldGroupMap.get(name)
-          if (!oldGroup || !deepEqualGroups(oldGroup, newGroup)) {
-            groupsToWrite.push(newGroup)
-          }
+        // 6. Build the full new + old DynamoDB item sets (with composed keys). The
+        //    collection SK composites only affect the LSI/GSI mirror attributes,
+        //    never the (pk, sk) identity used to PUT or DELETE, so the old set's
+        //    composites are irrelevant — we read only its (pk, sk) for deletes.
+        const newDynamo = buildDynamoItems(
+          newGroups,
+          config,
+          pkValue,
+          KeyComposer.extractComposites(config.collection.sk.composite, assembledNew),
+        )
+        const oldDynamo = buildDynamoItems(
+          oldGroups,
+          config,
+          pkValue,
+          KeyComposer.extractComposites(config.collection.sk.composite, assembledOld),
+        )
+
+        const skOf = (item: Record<string, AttributeValue>): string =>
+          (item.sk as { S?: string } | undefined)?.S ?? ""
+        const newItemsByGroup = new Map(newDynamo.map((g) => [g.group, g.items]))
+        const oldItemsByGroup = new Map(oldDynamo.map((g) => [g.group, g.items]))
+        // Every sk that survives anywhere in the new decomposition — an old item is
+        // an orphan to DELETE only if its key appears in no new group at all.
+        const survivingSks = new Set<string>()
+        for (const g of newDynamo) {
+          for (const item of g.items) survivingSks.add(skOf(item))
         }
 
-        if (groupsToWrite.length > 0) {
-          // 6. Compose collection SK composites
-          const collectionSkComposites = KeyComposer.extractComposites(
-            config.collection.sk.composite,
-            assembledNew,
-          )
+        // 7. Per group (union of old + new names), collect PUTs + orphan DELETEs.
+        const groupWrites: Array<{
+          group: string
+          puts: ReadonlyArray<Record<string, AttributeValue>>
+          deletes: ReadonlyArray<Record<string, AttributeValue>>
+        }> = []
+        const groupNames = new Set<string>([...newGroupMap.keys(), ...oldGroupMap.keys()])
+        for (const name of groupNames) {
+          const oldGroup = oldGroupMap.get(name)
+          const newGroup = newGroupMap.get(name)
+          const changed =
+            contextChanged ||
+            oldGroup === undefined ||
+            newGroup === undefined ||
+            !deepEqualGroups(oldGroup, newGroup)
+          if (!changed) continue
 
-          // 7. Build and write changed groups
-          const dynamoGroups = buildDynamoItems(
-            groupsToWrite,
-            config,
-            pkValue,
-            collectionSkComposites,
-          )
+          const puts = newItemsByGroup.get(name) ?? []
+          const deletes = (oldItemsByGroup.get(name) ?? [])
+            .filter((item) => !survivingSks.has(skOf(item)))
+            .map((item) => ({
+              [config.pk.field]: item[config.pk.field]!,
+              sk: item.sk!,
+            }))
+          if (puts.length === 0 && deletes.length === 0) continue
+          groupWrites.push({ group: name, puts, deletes })
+        }
 
-          yield* writeTransactionGroups(client, tableConfig.name, dynamoGroups, aggregateName)
+        if (groupWrites.length > 0) {
+          yield* writeTransactionGroups(client, tableConfig.name, groupWrites, aggregateName)
         }
 
         return decoded as Schema.Schema.Type<TSchema>
@@ -2018,27 +2060,42 @@ const buildDynamoItems = (
 const writeTransactionGroups = (
   client: DynamoClientService,
   tableName: string,
-  groups: ReadonlyArray<{ group: string; items: ReadonlyArray<Record<string, AttributeValue>> }>,
+  groups: ReadonlyArray<{
+    group: string
+    puts: ReadonlyArray<Record<string, AttributeValue>>
+    deletes: ReadonlyArray<Record<string, AttributeValue>>
+  }>,
   aggregateName: string,
 ): Effect.Effect<void, AggregateTransactionOverflow | DynamoClientError | TransactionCancelled> =>
   Effect.gen(function* () {
+    // Validate ALL group sizes BEFORE writing any group. Each group is its own
+    // transaction (DynamoDB: 100 items per TransactWriteItems), and the per-group
+    // count now spans Puts AND Deletes together — so an `update` that both adds and
+    // removes many edges roughly doubles the count. Checking up front means an
+    // oversized later group fails fast instead of partially committing earlier ones.
     for (const group of groups) {
-      // Check transaction size limit
-      if (group.items.length > 100) {
+      const itemCount = group.puts.length + group.deletes.length
+      if (itemCount > 100) {
         return yield* new AggregateTransactionOverflow({
           aggregate: aggregateName,
           subgraph: group.group,
-          itemCount: group.items.length,
+          itemCount,
           limit: 100,
         })
       }
+    }
 
-      if (group.items.length === 0) continue
+    for (const group of groups) {
+      // Each group is one transaction — Puts AND Deletes applied atomically, so an
+      // edge add and a sibling edge removal in the same sub-aggregate commit together.
+      const itemCount = group.puts.length + group.deletes.length
+      if (itemCount === 0) continue
 
-      // Build TransactWriteItems request
-      const transactItems = group.items.map((item) => ({
-        Put: { TableName: tableName, Item: item },
-      }))
+      // Build TransactWriteItems request — Puts first, then Deletes for orphans.
+      const transactItems = [
+        ...group.puts.map((item) => ({ Put: { TableName: tableName, Item: item } })),
+        ...group.deletes.map((key) => ({ Delete: { TableName: tableName, Key: key } })),
+      ]
 
       yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
         Effect.mapError((error) => {
