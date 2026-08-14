@@ -238,6 +238,35 @@ export class CascadePartialFailure extends Data.TaggedError("CascadePartialFailu
   readonly errors: ReadonlyArray<unknown>
 }> {}
 
+/**
+ * Embedding generation failed on the vector-search write path.
+ *
+ * Raised either by the user's `Embedder.embed` implementation (`cause` carries
+ * the underlying failure) or by the library when an entity declares
+ * `vectorIndexes` but no `Embedder` was resolvable at `DynamoClient.make` time
+ * and the write did not supply `.withVector(...)`. The `index` field names the
+ * logical vector index the embedding was being produced for.
+ */
+export class EmbeddingError extends Data.TaggedError("EmbeddingError")<{
+  readonly entityType: string
+  readonly index: string
+  readonly reason: string
+  readonly cause?: unknown
+}> {}
+
+/**
+ * `SearchVectors` was called against a vector index that is still backfilling.
+ *
+ * DynamoDB rejects searches until a newly created index reports `ACTIVE` with
+ * `Backfilling: false`. Wait for it with
+ * `db.tables.<Table>.waitForVectorIndex(indexName)` before searching.
+ */
+export class VectorIndexBackfilling extends Data.TaggedError("VectorIndexBackfilling")<{
+  readonly tableName: string
+  readonly indexName: string
+  readonly cause: unknown
+}> {}
+
 /** Optimistic concurrency conflict — stream version did not match */
 export class VersionConflict extends Data.TaggedError("VersionConflict")<{
   readonly streamName: string

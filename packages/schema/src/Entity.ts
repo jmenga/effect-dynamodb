@@ -63,6 +63,8 @@ import type {
 } from "./internal/EntityTypes.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "./KeyComposer.js"
 import { normalizeGsiConfig } from "./KeyComposer.js"
+import type { VectorIndexConfig, VectorIndexDefinition } from "./VectorIndex.js"
+import { normalizeVectorIndexConfig, validateVectorIndexes } from "./VectorIndex.js"
 
 // ---------------------------------------------------------------------------
 // Re-export KeyComposer types for convenience
@@ -209,6 +211,9 @@ export interface EntityDefinitionData {
   readonly resolveDbName: (domainName: string) => string
   readonly generatedIdField: string | undefined
   readonly generatedIdVersion: string | undefined
+  /** Normalized vector index declarations, keyed by logical name. */
+  readonly vectorIndexes: globalThis.Record<string, VectorIndexDefinition>
+  readonly hasVectorIndexes: boolean
 }
 
 /**
@@ -231,6 +236,7 @@ export interface EntityDefinitionConfig {
   readonly refs?: globalThis.Record<string, AnyRefValue> | undefined
   readonly timeSeries?: TimeSeriesConfig<any> | undefined
   readonly generatedId?: GeneratedIdConfig | undefined
+  readonly vectorIndexes?: globalThis.Record<string, VectorIndexConfig> | undefined
 }
 
 /**
@@ -255,6 +261,7 @@ export interface EntityDefinition<
   TIdentifier extends string | undefined = undefined,
   TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   TGeneratedId extends GeneratedIdConfig | undefined = undefined,
+  TVectorIndexes extends globalThis.Record<string, VectorIndexConfig> | undefined = undefined,
 > {
   readonly _tag: "Entity"
   readonly model: TModel
@@ -267,6 +274,8 @@ export interface EntityDefinition<
   readonly identifier: TIdentifier
   readonly timeSeries: TTimeSeries
   readonly generatedId: TGeneratedId
+  /** Vector index declarations as authored (see `DESIGN.md §14`). */
+  readonly vectorIndexes: TVectorIndexes
 
   /** @internal Resolved ref metadata — used by cascade to inspect target entities */
   readonly _resolvedRefs: ReadonlyArray<{
@@ -364,6 +373,7 @@ export const buildEntityDefinition = (config: {
   readonly refs?: globalThis.Record<string, AnyRefValue> | undefined
   readonly timeSeries?: TimeSeriesConfig<any> | undefined
   readonly generatedId?: GeneratedIdConfig | undefined
+  readonly vectorIndexes?: globalThis.Record<string, VectorIndexConfig> | undefined
 }): EntityDefinitionData => {
   // Unwrap ConfiguredModel to get the raw model and attribute overrides
   const configured = isConfiguredModel(config.model) ? config.model : undefined
@@ -612,6 +622,23 @@ export const buildEntityDefinition = (config: {
       )
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // Validate + normalize vector indexes (EDD-903x)
+  // ---------------------------------------------------------------------------
+
+  const vectorIndexes: globalThis.Record<string, VectorIndexDefinition> = {}
+  if (config.vectorIndexes) {
+    for (const [logicalName, vectorConfig] of Object.entries(config.vectorIndexes)) {
+      vectorIndexes[logicalName] = normalizeVectorIndexConfig(vectorConfig)
+    }
+    validateVectorIndexes({
+      entityType: config.entityType,
+      definitions: vectorIndexes,
+      validFields: validCompositeFields,
+    })
+  }
+  const hasVectorIndexes = Object.keys(vectorIndexes).length > 0
 
   // ---------------------------------------------------------------------------
   // Resolve refs at make() time
@@ -867,6 +894,8 @@ export const buildEntityDefinition = (config: {
     resolveDbName,
     generatedIdField,
     generatedIdVersion,
+    vectorIndexes,
+    hasVectorIndexes,
   }
 }
 
@@ -922,6 +951,9 @@ export const make = <
   const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
   const TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   const TGeneratedId extends GeneratedIdConfig | undefined = undefined,
+  const TVectorIndexes extends
+    | globalThis.Record<string, VectorIndexConfig<any>>
+    | undefined = undefined,
   const TAttrs extends {} = {},
 >(config: {
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
@@ -935,6 +967,7 @@ export const make = <
   readonly refs?: TRefs
   readonly timeSeries?: TTimeSeries
   readonly generatedId?: TGeneratedId
+  readonly vectorIndexes?: TVectorIndexes
 }): EntityDefinition<
   TModel,
   TEntityType,
@@ -946,7 +979,8 @@ export const make = <
   TRefs,
   ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
   TTimeSeries,
-  TGeneratedId
+  TGeneratedId,
+  TVectorIndexes
 > => {
   const gsiIndexes: globalThis.Record<string, IndexDefinition> = {}
   if (config.indexes) {
@@ -975,6 +1009,7 @@ const makeDefinitionImpl = (config: {
   readonly refs?: globalThis.Record<string, AnyRefValue> | undefined
   readonly timeSeries?: TimeSeriesConfig<any> | undefined
   readonly generatedId?: GeneratedIdConfig | undefined
+  readonly vectorIndexes?: globalThis.Record<string, VectorIndexConfig> | undefined
 }): EntityDefinition => {
   const data = buildEntityDefinition(config)
 
@@ -997,6 +1032,7 @@ const makeDefinitionImpl = (config: {
     identifier: data.resolvedIdentifier as any,
     timeSeries: config.timeSeries,
     generatedId: config.generatedId,
+    vectorIndexes: config.vectorIndexes,
     _resolvedRefs: data.resolvedRefs.map((r) => ({
       fieldName: r.fieldName,
       idFieldName: r.idFieldName,
