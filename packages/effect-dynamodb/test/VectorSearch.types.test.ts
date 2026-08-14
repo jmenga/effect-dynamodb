@@ -143,10 +143,11 @@ const _typeAssertions = Effect.gen(function* () {
 
   // …and NOT in the channel of an entity without vector indexes, so the entity
   // keeps exactly the error surface it had before vector search existed.
+  // (`@ts-expect-error` suppresses only the next line, so the catchTag call
+  // must sit on it — the multi-line pipe form would leave the directive unused.)
+  const plainPut = db.entities.Plain.put(input).asEffect()
   // @ts-expect-error EmbeddingError is unreachable for an entity with no vectorIndexes.
-  yield* db.entities.Plain.put(input)
-    .asEffect()
-    .pipe(Effect.catchTag("EmbeddingError", () => Effect.void))
+  yield* plainPut.pipe(Effect.catchTag("EmbeddingError", () => Effect.void))
 
   // --- reembed exists only on entities that declare vector indexes ---
   yield* db.entities.Products.reembed({ concurrency: 2 })

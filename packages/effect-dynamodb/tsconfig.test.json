@@ -9,7 +9,8 @@
     "src",
     "test/Entity.types.test.ts",
     "test/Aggregate.types.test.ts",
-    "test/PureAuthoring.types.test.ts"
+    "test/PureAuthoring.types.test.ts",
+    "test/VectorSearch.types.test.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }

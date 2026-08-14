@@ -41,7 +41,7 @@ import type {
   VectorIndexConfig,
   VectorIndexDefinition,
 } from "@effect-dynamodb/schema/VectorIndex.js"
-import { deriveSourceText, touchesSource } from "@effect-dynamodb/schema/VectorIndex.js"
+import { deriveSourceText } from "@effect-dynamodb/schema/VectorIndex.js"
 import { Context, Crypto, DateTime, type Duration, Effect, Option, Schema, Stream } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import type { ConditionInput } from "./Expression.js"
