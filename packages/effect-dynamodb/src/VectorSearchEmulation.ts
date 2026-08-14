@@ -33,6 +33,7 @@ import type {
   SearchVectorsCommandInput,
   SearchVectorsCommandOutput,
 } from "@aws-sdk/client-dynamodb"
+import { DynamoValidationError } from "@effect-dynamodb/schema/Errors.js"
 import type {
   DistanceFunction,
   VectorIndexDefinition,
@@ -52,6 +53,18 @@ export interface EmulatedVectorIndex {
   readonly vectorAttribute: string
   /** Distance function used to score candidates. */
   readonly distance: DistanceFunction
+  /**
+   * The composed HASH attribute. Always a legal `SearchConditionExpression`
+   * operand.
+   */
+  readonly partitionAttribute?: string | undefined
+  /**
+   * `INLINE_FILTER` attributes (STORED names). A condition on anything else is
+   * a `ValidationException` on real DynamoDB, so the emulator rejects it too —
+   * otherwise an undeclared filter would pass every local test and only fail
+   * in production.
+   */
+  readonly filterAttributes?: ReadonlyArray<string> | undefined
 }
 
 /** Minimal structural shape of a `Table` — avoids importing the full type. */
@@ -83,8 +96,8 @@ const buildRegistry = (options: EmulationOptions | undefined): Map<string, Emula
     const merged = mergeVectorIndexes(
       table.entities as unknown as Parameters<typeof mergeVectorIndexes>[0],
     )
-    for (const [indexName, { definition }] of merged) {
-      registry.set(indexName, toEmulated(definition))
+    for (const [indexName, entry] of merged) {
+      registry.set(indexName, toEmulated(entry.definition, entry.filters.map(entry.resolveDbName)))
     }
   }
   for (const [indexName, entry] of Object.entries(options?.indexes ?? {})) {
@@ -94,9 +107,14 @@ const buildRegistry = (options: EmulationOptions | undefined): Map<string, Emula
 }
 
 /** @internal */
-const toEmulated = (definition: VectorIndexDefinition): EmulatedVectorIndex => ({
+const toEmulated = (
+  definition: VectorIndexDefinition,
+  filterAttributes: ReadonlyArray<string>,
+): EmulatedVectorIndex => ({
   vectorAttribute: definition.vectorField,
   distance: definition.distance,
+  partitionAttribute: definition.partitionField,
+  filterAttributes,
 })
 
 // ---------------------------------------------------------------------------
@@ -254,6 +272,24 @@ export const wrap = (
           input.ExpressionAttributeNames,
         )
         const topK = input.TopK ?? 10
+
+        // Real DynamoDB rejects a SearchConditionExpression that names an
+        // attribute which is not the HASH element or a declared INLINE_FILTER.
+        // Reproduce that here — an over-permissive emulator would let an
+        // undeclared filter pass every local test and fail only in production.
+        if (index.filterAttributes !== undefined) {
+          const allowed = new Set<string>(index.filterAttributes)
+          if (index.partitionAttribute !== undefined) allowed.add(index.partitionAttribute)
+          for (const condition of conditions) {
+            if (allowed.has(condition.attribute)) continue
+            return yield* new DynamoValidationError({
+              operation: "SearchVectors",
+              cause:
+                `Attribute "${condition.attribute}" is not a HASH or INLINE_FILTER element of ` +
+                `vector index "${indexName}". Declared: ${[...allowed].sort().join(", ")}.`,
+            })
+          }
+        }
 
         // Exhaustive scan — the emulator trades speed for exactness.
         const candidates: Array<{ item: Record<string, AttributeValue>; score: number }> = []

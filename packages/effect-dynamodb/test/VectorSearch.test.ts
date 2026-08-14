@@ -258,8 +258,11 @@ describe("vector search write path", () => {
           price: 120,
         }).asEffect(),
       )
+      // `EmbeddingError` is in the declared error channel because the entity
+      // declares vectorIndexes — no cast needed to reach `.index`.
       expect(result._tag).toBe("EmbeddingError")
-      expect((result as { index: string }).index).toBe("byDescription")
+      if (result._tag !== "EmbeddingError") throw new Error("expected EmbeddingError")
+      expect(result.index).toBe("byDescription")
     }).pipe(
       Effect.provide(
         Layer.mergeAll(

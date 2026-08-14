@@ -5263,7 +5263,8 @@ describeConnected("vector search integration (closes #78)", () => {
       expect(hits[1]!.similarity).toBeCloseTo(0.5, 5)
       // The decoded item is a full domain record — no __edd_* leakage.
       expect(hits[0]!.item.title).toBe("North")
-      expect((hits[0]!.item as Record<string, unknown>).__edd_v_vec1__).toBeUndefined()
+      expect(Object.keys(hits[0]!.item)).not.toContain("__edd_v_vec1__")
+      expect(Object.keys(hits[0]!.item)).not.toContain("__edd_vp_vec1__")
     }).pipe(provideVec),
   )
 

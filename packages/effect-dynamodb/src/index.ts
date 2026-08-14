@@ -51,6 +51,7 @@ export type {
   PrimaryKeyComposites,
   RefErrors,
   SystemFieldsType,
+  VectorErrors,
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 export type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
 export * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"

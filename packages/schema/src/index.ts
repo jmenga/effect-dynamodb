@@ -75,6 +75,7 @@ export type {
   PrimaryKeyComposites,
   RefErrors,
   SystemFieldsType,
+  VectorErrors,
 } from "./internal/EntityTypes.js"
 export type { GsiConfig, IndexDefinition, KeyPart } from "./KeyComposer.js"
 export * as KeyComposer from "./KeyComposer.js"

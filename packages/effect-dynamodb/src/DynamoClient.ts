@@ -557,7 +557,7 @@ export type TypedClient<
       infer VI
     >
       ? Resolve<
-          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId> & {
+          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI> & {
             /** Scan this entity. Returns a BoundQuery for building scan queries. */
             readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
               Schema.Schema.Type<M>,
@@ -582,7 +582,7 @@ export type TypedClient<
             infer VI
           >
         ? Resolve<
-            BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId> & {
+            BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI> & {
               /** Scan this entity. Returns a BoundQuery for building scan queries. */
               readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
                 Schema.Schema.Type<M>,
@@ -684,6 +684,17 @@ type VectorPartitionInput<M extends Schema.Top, C> = C extends {
   : never
 
 /**
+ * The `INLINE_FILTER` attributes a vector index declares, as a string union.
+ *
+ * Resolves to `never` for an index with no `filters`, which makes `.filter()`
+ * accept only `{}` — matching DynamoDB, where an undeclared filter attribute is
+ * a `ValidationException` rather than a slower query.
+ */
+type VectorFilterNames<C> = C extends { readonly filters: ReadonlyArray<infer K extends string> }
+  ? K
+  : never
+
+/**
  * Vector search accessors injected for each declared vector index, plus the
  * `reembed` maintenance operation. Empty when the entity declares none — so a
  * consumer never sees vector API surface on an entity that has no vectors.
@@ -696,6 +707,7 @@ type EntityVectorAccessors<M extends Schema.Top, VI> =
         ) => BoundVectorQuery<
           Schema.Schema.Type<M>,
           VectorPartitionInput<M, VI[K]>,
+          VectorFilterNames<VI[K]>,
           Schema.Schema.Type<M>
         >
       } & {
@@ -801,6 +813,12 @@ export interface TableOperations {
 // makeFromConfig — entity-centric make implementation
 // ---------------------------------------------------------------------------
 
+/**
+ * Accessor names the bound entity owns outright. A vector index logical name
+ * that lands on one of these would take the corresponding feature offline.
+ */
+const RESERVED_ACCESSOR_NAMES: ReadonlySet<string> = new Set(["scan", "reembed"])
+
 /** @internal Structural entity type for runtime access. */
 interface EntityLike {
   readonly _tag: "Entity"
@@ -808,6 +826,8 @@ interface EntityLike {
   readonly model: Schema.Top
   readonly indexes: Record<string, IndexDefinition>
   readonly _vectorIndexes?: Record<string, VectorIndexDefinition> | undefined
+  /** Domain field name → stored DynamoDB attribute name (`storedAs` renames). */
+  readonly _resolveDbName?: ((domainName: string) => string) | undefined
   readonly _schema: DynamoSchema.DynamoSchema
   readonly _tableTag: Context.Service<TableConfig, TableConfig>
   readonly _injectIndex: (name: string, def: IndexDefinition) => void
@@ -1047,6 +1067,17 @@ const makeFromConfig = (config: {
 
       // Vector search accessors — one per declared vector index.
       for (const [logicalName, definition] of Object.entries(entityLike._vectorIndexes ?? {})) {
+        // Accessors share one namespace on the bound entity. A vector index
+        // named after an existing index accessor (or `scan` / `reembed`) would
+        // silently replace it and take the other feature offline, so make the
+        // collision a construction-time failure instead.
+        if (logicalName in accessors || RESERVED_ACCESSOR_NAMES.has(logicalName)) {
+          throw new Error(
+            `[EDD-9038] Entity "${key}": vector index "${logicalName}" collides with an existing ` +
+              `accessor of the same name. Vector index names share a namespace with GSI query ` +
+              `accessors, \`scan\` and \`reembed\` — rename one of them.`,
+          )
+        }
         const vqConfig: BoundVectorQueryConfig = {
           entityType: entityLike.entityType,
           logicalName,
@@ -1055,6 +1086,7 @@ const makeFromConfig = (config: {
           tableTag: entityLike._tableTag,
           decode: (raw) => entityLike._decodeRecord(raw),
           provide,
+          resolveDbName: entityLike._resolveDbName ?? ((domainName: string) => domainName),
         }
         accessors[logicalName] = (query: string | ReadonlyArray<number>) =>
           makeBoundVectorQuery(vqConfig, query)
@@ -1354,7 +1386,14 @@ const buildTableOperationsFromTable = (
       return client
         .updateTable({
           TableName: tableName,
-          VectorIndexUpdates: [{ Create: toVectorIndexSpec(entry.definition) }],
+          VectorIndexUpdates: [
+            {
+              Create: toVectorIndexSpec(entry.definition, {
+                filters: entry.filters,
+                resolveDbName: entry.resolveDbName,
+              }),
+            },
+          ],
         })
         .pipe(Effect.asVoid)
     },

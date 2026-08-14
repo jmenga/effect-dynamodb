@@ -20,7 +20,11 @@ import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import type { EmbedderService } from "@effect-dynamodb/schema/Embedder.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
-import { EmbeddingError, VectorIndexBackfilling } from "@effect-dynamodb/schema/Errors.js"
+import {
+  EmbeddingError,
+  ValidationError as ValidationErrorClass,
+  VectorIndexBackfilling,
+} from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import type {
   Similarity,
@@ -62,26 +66,31 @@ export type VectorSearchError =
 // ---------------------------------------------------------------------------
 
 /** Combinators available at every stage of the builder. */
-export interface BoundVectorQueryCombinators<Model, Partition, A> {
+export interface BoundVectorQueryCombinators<Model, Partition, Filters extends string, A> {
   /**
    * Equality-only filter over the index's declared `INLINE_FILTER` attributes.
    *
-   * `SearchConditionExpression` supports ONLY the equality operator (API
-   * Reference). The restriction is expressed in one relaxable alias —
-   * `VectorFilterInput` — so widening it when AWS adds range operators is a
-   * single edit.
+   * Two restrictions, both from the API rather than this library:
+   *
+   * 1. Only the equality operator is supported. That lives in one relaxable
+   *    alias — `VectorFilterInput` — so widening it when AWS adds range
+   *    operators for `INLINE_FILTER` is a single edit.
+   * 2. Only attributes declared in the index's `filters: [...]` are filterable.
+   *    `Filters` is that declared tuple as a union, so filtering on an
+   *    undeclared attribute is a compile error rather than a
+   *    `ValidationException` discovered in production.
    */
   readonly filter: (
-    filters: VectorFilterInput<Extract<keyof Model, string>>,
-  ) => BoundVectorQuery<Model, Partition, A>
+    filters: VectorFilterInput<Filters>,
+  ) => BoundVectorQuery<Model, Partition, Filters, A>
 
   /** Number of nearest neighbours to return. Clamped to 1..100; default 10. */
-  readonly topK: (k: number) => BoundVectorQuery<Model, Partition, A>
+  readonly topK: (k: number) => BoundVectorQuery<Model, Partition, Filters, A>
 
   /** Project a subset of attributes. Returns partial records. */
   readonly select: (
     attributes: ReadonlyArray<Extract<keyof Model, string>>,
-  ) => BoundVectorQuery<Model, Partition, Record<string, unknown>>
+  ) => BoundVectorQuery<Model, Partition, Filters, Record<string, unknown>>
 }
 
 /** Terminals — available only once every required partition composite is bound. */
@@ -97,13 +106,13 @@ export interface BoundVectorQueryTerminals<A> {
 }
 
 /** Partition binding — present iff the index declares partition composites. */
-export interface BoundVectorQueryWithPartition<Model, Partition, A> {
+export interface BoundVectorQueryWithPartition<Model, Partition, Filters extends string, A> {
   /**
    * Bind the index's declared partition composites. Required by the types when
    * `partition: [...]` is declared on the vector index — the composed HASH value
    * is mandatory in every `SearchVectors` call once an index has a HASH element.
    */
-  readonly partition: (composites: Partition) => BoundVectorQuery<Model, never, A>
+  readonly partition: (composites: Partition) => BoundVectorQuery<Model, never, Filters, A>
 }
 
 /**
@@ -111,10 +120,12 @@ export interface BoundVectorQueryWithPartition<Model, Partition, A> {
  * so an index with declared partition composites cannot be searched without
  * supplying them.
  */
-export type BoundVectorQuery<Model, Partition, A> = [Partition] extends [never]
-  ? BoundVectorQueryCombinators<Model, Partition, A> & BoundVectorQueryTerminals<A>
-  : BoundVectorQueryCombinators<Model, Partition, A> &
-      BoundVectorQueryWithPartition<Model, Partition, A>
+export type BoundVectorQuery<Model, Partition, Filters extends string, A> = [Partition] extends [
+  never,
+]
+  ? BoundVectorQueryCombinators<Model, Partition, Filters, A> & BoundVectorQueryTerminals<A>
+  : BoundVectorQueryCombinators<Model, Partition, Filters, A> &
+      BoundVectorQueryWithPartition<Model, Partition, Filters, A>
 
 // ---------------------------------------------------------------------------
 // Config + state
@@ -130,6 +141,13 @@ export interface BoundVectorQueryConfig {
   readonly tableTag: import("effect").Context.Service<TableConfig, TableConfig>
   readonly decode: (raw: Record<string, unknown>) => Effect.Effect<any, ValidationError>
   readonly provide: <X, E>(eff: Effect.Effect<X, E, any>) => Effect.Effect<X, E, never>
+  /**
+   * Domain field name → stored DynamoDB attribute name. Filter attributes,
+   * projections and the emitted `SearchSchema` must all use STORED names —
+   * items are written after `renameToDynamo`, so a `storedAs`-renamed field
+   * would otherwise be filtered/projected under a name that is not on disk.
+   */
+  readonly resolveDbName: (domainName: string) => string
 }
 
 /** @internal Immutable accumulated builder state. */
@@ -146,38 +164,40 @@ interface VectorQueryState {
 // ---------------------------------------------------------------------------
 
 /** @internal */
-export class BoundVectorQueryImpl<Model, Partition, A> {
+export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
   constructor(
     readonly _config: BoundVectorQueryConfig,
     readonly _state: VectorQueryState,
   ) {}
 
-  private _with(patch: Partial<VectorQueryState>): BoundVectorQueryImpl<Model, Partition, A> {
+  private _with(
+    patch: Partial<VectorQueryState>,
+  ): BoundVectorQueryImpl<Model, Partition, Filters, A> {
     return new BoundVectorQueryImpl(this._config, { ...this._state, ...patch })
   }
 
-  partition(composites: Record<string, unknown>): BoundVectorQueryImpl<Model, never, A> {
-    return new BoundVectorQueryImpl<Model, never, A>(this._config, {
+  partition(composites: Record<string, unknown>): BoundVectorQueryImpl<Model, never, Filters, A> {
+    return new BoundVectorQueryImpl<Model, never, Filters, A>(this._config, {
       ...this._state,
       partition: composites,
     })
   }
 
-  filter(filters: Record<string, unknown>): BoundVectorQueryImpl<Model, Partition, A> {
+  filter(filters: Record<string, unknown>): BoundVectorQueryImpl<Model, Partition, Filters, A> {
     return this._with({ filters: { ...this._state.filters, ...filters } })
   }
 
-  topK(k: number): BoundVectorQueryImpl<Model, Partition, A> {
+  topK(k: number): BoundVectorQueryImpl<Model, Partition, Filters, A> {
     return this._with({ topK: clampTopK(k) })
   }
 
   select(
     attributes: ReadonlyArray<string>,
-  ): BoundVectorQueryImpl<Model, Partition, Record<string, unknown>> {
-    return new BoundVectorQueryImpl<Model, Partition, Record<string, unknown>>(this._config, {
-      ...this._state,
-      projection: attributes,
-    })
+  ): BoundVectorQueryImpl<Model, Partition, Filters, Record<string, unknown>> {
+    return new BoundVectorQueryImpl<Model, Partition, Filters, Record<string, unknown>>(
+      this._config,
+      { ...this._state, projection: attributes },
+    )
   }
 
   collect(): Effect.Effect<Array<VectorHit<A>>, VectorSearchError, never> {
@@ -190,11 +210,33 @@ export class BoundVectorQueryImpl<Model, Partition, A> {
     VectorSearchError,
     DynamoClient | TableConfig
   > {
-    const { entityType, logicalName, definition, schema, tableTag, decode } = this._config
+    const { entityType, logicalName, definition, schema, tableTag, decode, resolveDbName } =
+      this._config
     const state = this._state
     return Effect.gen(function* () {
       const client = yield* DynamoClient
       const { name: tableName } = yield* tableTag
+
+      // 0. Only attributes declared in `filters: [...]` are INLINE_FILTER
+      //    attributes on the physical index. Filtering on anything else is a
+      //    ValidationException from DynamoDB — catch it here so the failure is
+      //    tagged, local, and names the declared set. (The type-level guard
+      //    covers callers who use the typed accessor; this covers erased or
+      //    dynamically-built filter records.)
+      const declaredFilters = new Set(definition.filters)
+      for (const field of Object.keys(state.filters)) {
+        if (state.filters[field] === undefined) continue
+        if (declaredFilters.has(field)) continue
+        const declared = [...declaredFilters].sort().join(", ")
+        return yield* new ValidationErrorClass({
+          entityType,
+          operation: `vectorSearch.${logicalName}.filter`,
+          cause:
+            `Attribute "${field}" is not an INLINE_FILTER attribute of vector index ` +
+            `"${definition.index}". Declared filters: ${declared.length > 0 ? declared : "(none)"}. ` +
+            `Add it to \`filters: [...]\` on the vector index, or filter after .collect().`,
+        })
+      }
 
       // 1. Resolve the query vector. A string goes through the Embedder; a
       //    number array is used verbatim (pre-computed query embeddings are a
@@ -232,7 +274,9 @@ export class BoundVectorQueryImpl<Model, Partition, A> {
         if (value === undefined) continue
         const nameKey = `#vf${filterIndex}`
         const valueKey = `:vf${filterIndex}`
-        names[nameKey] = field
+        // Stored attribute name — a `storedAs`-renamed field lives on disk (and
+        // in the index's SearchSchema) under its DB name, not its domain name.
+        names[nameKey] = resolveDbName(field)
         values[valueKey] = toAttributeValue(value)
         conditions.push(`${nameKey} = ${valueKey}`)
         filterIndex++
@@ -263,8 +307,9 @@ export class BoundVectorQueryImpl<Model, Partition, A> {
       if (state.projection !== undefined) {
         const projectionParts: Array<string> = []
         state.projection.forEach((attribute, index) => {
-          const nameKey = `#vp${index}`
-          names[nameKey] = attribute
+          const nameKey = `#vpr${index}`
+          // Same stored-name reasoning as the filter attributes above.
+          names[nameKey] = resolveDbName(attribute)
           projectionParts.push(nameKey)
         })
         input.ProjectionExpression = projectionParts.join(", ")
@@ -278,10 +323,16 @@ export class BoundVectorQueryImpl<Model, Partition, A> {
       const hits: Array<VectorHit<A>> = []
       for (const result of output.SearchResults ?? []) {
         if (!result.Item) continue
+        // A result with no Score cannot be ranked or normalized. Coercing it to
+        // 0 would be a lie under DOT_PRODUCT, where 0 is a real (orthogonal)
+        // score — drop it instead.
+        if (result.Score === undefined || result.Score === null) continue
         const raw = fromAttributeMap(result.Item) as Record<string, unknown>
         const decoded =
-          state.projection === undefined ? yield* decode(raw) : (stripManagedAttributes(raw) as A)
-        const rawScore = result.Score ?? 0
+          state.projection === undefined
+            ? yield* decode(raw)
+            : (projectDomainNames(raw, state.projection, resolveDbName) as A)
+        const rawScore = result.Score
         hits.push({
           item: decoded as A,
           similarity: toSimilarity(rawScore, definition.distance),
@@ -347,27 +398,50 @@ const classifyBackfill = (
   indexName: string,
 ): DynamoClientError | VectorIndexBackfilling => {
   const cause = error.cause
-  const message =
-    typeof cause === "object" && cause !== null && "message" in cause
-      ? String((cause as { message: unknown }).message)
-      : String(cause)
+  const fields = (typeof cause === "object" && cause !== null ? cause : {}) as Record<
+    string,
+    unknown
+  >
+  const read = (key: string): string | undefined =>
+    fields[key] === undefined ? undefined : String(fields[key])
+  // Prefer the structured discriminators — an SDK error's `name`/`Code` is
+  // stable, whereas the human-readable message is not. The regex over the
+  // message stays as a fallback for shapes that only carry prose.
+  const name = read("name")
+  const code = read("Code") ?? read("code")
+  if (
+    name === "IndexNotActiveException" ||
+    name === "VectorIndexNotReadyException" ||
+    code === "IndexNotActiveException" ||
+    code === "VectorIndexNotReadyException"
+  ) {
+    return new VectorIndexBackfilling({ tableName, indexName, cause })
+  }
+  const message = read("message") ?? String(cause)
   return /backfill|not active|is being created/i.test(message)
     ? new VectorIndexBackfilling({ tableName, indexName, cause })
     : error
 }
 
 /**
- * @internal Strip library-managed attributes from a projected result.
+ * @internal Rebuild a projected result under DOMAIN field names.
  *
  * Projected results bypass the entity schema decode (they are partial by
- * construction), so the `__edd_*` bookkeeping would otherwise leak into user
- * code the way it never does on the full-record path.
+ * construction), which is also what bypasses the usual DB→domain rename. Read
+ * each requested attribute from its stored name and emit it under the name the
+ * caller asked for, so a `storedAs`-renamed field behaves the same here as on
+ * the full-record path. Library-managed `__edd_*` attributes are never
+ * requested, so they cannot leak.
  */
-const stripManagedAttributes = (raw: Record<string, unknown>): Record<string, unknown> => {
+const projectDomainNames = (
+  raw: Record<string, unknown>,
+  projection: ReadonlyArray<string>,
+  resolveDbName: (domainName: string) => string,
+): Record<string, unknown> => {
   const out: Record<string, unknown> = {}
-  for (const [key, value] of Object.entries(raw)) {
-    if (key.startsWith("__edd_")) continue
-    out[key] = value
+  for (const domainName of projection) {
+    const value = raw[resolveDbName(domainName)]
+    if (value !== undefined) out[domainName] = value
   }
   return out
 }
@@ -377,14 +451,14 @@ const stripManagedAttributes = (raw: Record<string, unknown>): Record<string, un
 // ---------------------------------------------------------------------------
 
 /** @internal Create a vector search builder for a single accessor invocation. */
-export const makeBoundVectorQuery = <Model, Partition, A>(
+export const makeBoundVectorQuery = <Model, Partition, Filters extends string, A>(
   config: BoundVectorQueryConfig,
   query: string | ReadonlyArray<number>,
-): BoundVectorQuery<Model, Partition, A> =>
-  new BoundVectorQueryImpl<Model, Partition, A>(config, {
+): BoundVectorQuery<Model, Partition, Filters, A> =>
+  new BoundVectorQueryImpl<Model, Partition, Filters, A>(config, {
     query,
     partition: undefined,
     filters: {},
     topK: DEFAULT_TOP_K,
     projection: undefined,
-  }) as unknown as BoundVectorQuery<Model, Partition, A>
+  }) as unknown as BoundVectorQuery<Model, Partition, Filters, A>

@@ -13,6 +13,7 @@ import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import type { VectorIndexDefinition } from "@effect-dynamodb/schema/VectorIndex.js"
 import {
+  MAX_INLINE_FILTERS,
   MAX_VECTOR_INDEXES_PER_TABLE,
   toWireDistanceFunction,
 } from "@effect-dynamodb/schema/VectorIndex.js"
@@ -55,6 +56,8 @@ interface EntityLike {
   readonly indexes: Record<string, IndexDefinition>
   /** Normalized vector index definitions (absent on entities without any). */
   readonly _vectorIndexes?: Record<string, VectorIndexDefinition> | undefined
+  /** Domain field name → stored DynamoDB attribute name (`storedAs` renames). */
+  readonly _resolveDbName?: ((domainName: string) => string) | undefined
   readonly _configure: (
     schema: DynamoSchema.DynamoSchema,
     tableTag: Context.Service<TableConfig, TableConfig>,
@@ -208,20 +211,31 @@ export const make = <
  */
 export const mergeVectorIndexes = (
   entities: Record<string, EntityLike>,
-): Map<string, { readonly definition: VectorIndexDefinition; readonly owner: string }> => {
+): Map<string, MergedVectorIndex> => {
   const merged = new Map<
     string,
-    { readonly definition: VectorIndexDefinition; readonly owner: string }
+    {
+      definition: VectorIndexDefinition
+      owner: string
+      filters: Array<string>
+      resolveDbName: (domainName: string) => string
+    }
   >()
 
   for (const [entityKey, entity] of Object.entries(entities)) {
     const declared = entity._vectorIndexes
     if (!declared) continue
     const owner = entity.entityType ?? entityKey
+    const resolveDbName = entity._resolveDbName ?? ((domainName: string) => domainName)
     for (const definition of Object.values(declared)) {
       const existing = merged.get(definition.index)
       if (existing === undefined) {
-        merged.set(definition.index, { definition, owner })
+        merged.set(definition.index, {
+          definition,
+          owner,
+          filters: [...definition.filters],
+          resolveDbName,
+        })
         continue
       }
       if (
@@ -236,6 +250,27 @@ export const mergeVectorIndexes = (
             `immutable on a DynamoDB vector index — every entity sharing one must agree.`,
         )
       }
+      // Filters, unlike dimensions/distance, are per-entity access patterns
+      // rather than a shared physical property — one index can serve several
+      // entities filtering on different attributes. Union them; keeping only
+      // the first entity's set would silently leave the other sharers' filter
+      // attributes out of the SearchSchema (and un-filterable at runtime).
+      for (const filter of definition.filters) {
+        const stored = resolveDbName(filter)
+        if (existing.filters.some((f) => existing.resolveDbName(f) === stored)) continue
+        existing.filters.push(filter)
+      }
+    }
+  }
+
+  for (const [indexName, entry] of merged) {
+    if (entry.filters.length > MAX_INLINE_FILTERS) {
+      throw new Error(
+        `[EDD-9032] Vector index "${indexName}" resolves to ${entry.filters.length} INLINE_FILTER ` +
+          `attributes once unioned across the entities sharing it ` +
+          `(${[...entry.filters].sort().join(", ")}). DynamoDB allows at most ` +
+          `${MAX_INLINE_FILTERS} per vector index.`,
+      )
     }
   }
 
@@ -248,6 +283,18 @@ export const mergeVectorIndexes = (
   }
 
   return merged
+}
+
+/** A physical vector index resolved across every entity that declares it. */
+export interface MergedVectorIndex {
+  /** The first declaring entity's definition — authoritative for dimensions/distance. */
+  readonly definition: VectorIndexDefinition
+  /** Entity type of the first declarer, used in conflict messages. */
+  readonly owner: string
+  /** Union of every sharer's declared `filters` (domain names). */
+  readonly filters: ReadonlyArray<string>
+  /** Stored-name resolver for the first declarer's `storedAs` renames. */
+  readonly resolveDbName: (domainName: string) => string
 }
 
 /** @internal Run {@link mergeVectorIndexes} purely for its validation effect. */
@@ -274,14 +321,32 @@ export interface VectorIndexSpec {
  * Map a normalized {@link VectorIndexDefinition} onto the AWS `VectorIndex`
  * shape. The composed partition attribute is always the single `HASH` element;
  * declared filters follow as `INLINE_FILTER` elements.
+ *
+ * `filters` may be supplied pre-unioned across every entity that shares the
+ * physical index (see {@link mergeVectorIndexes}) — a shared index must declare
+ * the union, or a sharer's filter attribute would simply not be indexed.
+ *
+ * Filter names are emitted as STORED attribute names: an entity may rename a
+ * field with `storedAs`, and the index has to point at what is actually on disk.
  */
-export const toVectorIndexSpec = (definition: VectorIndexDefinition): VectorIndexSpec => {
+export const toVectorIndexSpec = (
+  definition: VectorIndexDefinition,
+  options?: {
+    readonly filters?: ReadonlyArray<string> | undefined
+    readonly resolveDbName?: ((domainName: string) => string) | undefined
+  },
+): VectorIndexSpec => {
+  const resolveDbName = options?.resolveDbName ?? ((domainName: string) => domainName)
+  const filters = options?.filters ?? definition.filters
   const SearchSchema: Array<{
     AttributeName: string
     SearchSchemaElementType: "HASH" | "INLINE_FILTER"
   }> = [{ AttributeName: definition.partitionField, SearchSchemaElementType: "HASH" }]
-  for (const filter of definition.filters) {
-    SearchSchema.push({ AttributeName: filter, SearchSchemaElementType: "INLINE_FILTER" })
+  for (const filter of filters) {
+    SearchSchema.push({
+      AttributeName: resolveDbName(filter),
+      SearchSchemaElementType: "INLINE_FILTER",
+    })
   }
   return {
     IndexName: definition.index,
@@ -500,7 +565,12 @@ export const definition = (table: Table): TableDefinition => {
     mergedVectorIndexes.size > 0
       ? Array.from(mergedVectorIndexes.entries())
           .sort(([a], [b]) => a.localeCompare(b))
-          .map(([, { definition }]) => toVectorIndexSpec(definition))
+          .map(([, entry]) =>
+            toVectorIndexSpec(entry.definition, {
+              filters: entry.filters,
+              resolveDbName: entry.resolveDbName,
+            }),
+          )
       : undefined
 
   const result: {
