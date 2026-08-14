@@ -63,6 +63,8 @@ const Products = Entity.make({
 
 `dimensions` and `distance` are immutable at the DynamoDB level. `Entity.make` validates them (1–4096 dimensions, ≤ 18 filters, all named fields exist on the model), and `Table.make` validates that entities *sharing* a physical vector index agree — sharing is the norm in single-table designs, since the quota is only 5 per table.
 
+`filters` are not a shared physical property, though: they are per-entity access patterns, so entities sharing an index may each declare their own and the emitted `SearchSchema` carries the **union**. The 18-filter limit applies to that union.
+
 ## Partition composition: entity and tenant scoping for free
 
 The vector index HASH attribute is composed by `KeyComposer` with the same prefixing and casing rules as every other key:
@@ -225,7 +227,9 @@ const cookware = yield* db.entities.Products
 
 `.filter()` is **equality-only** — that is an API restriction, not a library one. AWS's own SDK JSDoc already advertises range operators for `INLINE_FILTER`, so the restriction lives in exactly one type alias (`VectorFilterInput`) and widening it will be a one-line change.
 
-Only the attributes declared in `filters: [...]` are filterable. Everything else must be filtered after `.collect()`.
+Only the attributes declared in `filters: [...]` are filterable, and that is enforced three times over: the accessor types the filter keys as the declared tuple, `.collect()` re-checks at runtime with a `ValidationError`, and the emulation layer rejects an undeclared attribute exactly as real DynamoDB does. The point of the third one is that an undeclared filter cannot quietly pass your local test suite and then throw a `ValidationException` in production.
+
+Everything else must be filtered after `.collect()`.
 
 ## Tenant scoping in action
 
@@ -259,9 +263,28 @@ yield* db.entities.Products
   .set({ description: "Insulated waterproof boot for alpine trekking" })
 ```
 
-The gate mirrors the per-half evaluation gate of [policy-aware GSI composition](/guides/index-policy/): a writer that does not name a source field neither pays for an embedding call nor clobbers a vector another writer owns.
+The gate mirrors the per-half evaluation gate of [policy-aware GSI composition](/guides/index-policy/): a writer that does not touch a source field neither pays for an embedding call nor clobbers a vector another writer owns.
 
-When the payload carries only *part* of the source (here `description` but not `name`), the library reads the current item once so the new embedding reflects the complete post-update source text — not the fragment that happened to be in this payload.
+"Touches" covers every channel that can change the source, not just `set()`:
+
+- `.remove(["description"])`
+- `.set({ description: undefined })`
+- `.pathSet({ segments: ["description"], … })` and the other path operations
+
+A clear is a change. An embedding that outlives its source is worse than no embedding — the item stays findable by a description it no longer has.
+
+When the payload carries only *part* of the source (here `description` but not `name`), the library reads the current item once so the new embedding reflects the complete post-update source text — not the fragment that happened to be in this payload. Cleared attributes are subtracted from that merged record.
+
+### Clearing the source removes the item from the index
+
+If the write leaves no source text at all, the vector and partition attributes are `REMOVE`d and the item drops out of the index — sparse semantics are the only way to delete a vector index entry:
+
+```typescript
+yield* db.entities.Products.update(key).remove(["name", "description"])
+// The product still exists. It is no longer searchable.
+```
+
+Supplying `.withVector()` on the same write wins, since an explicit vector is not derived from the source at all.
 
 ## Pre-computed embeddings
 
@@ -278,7 +301,7 @@ yield* db.entities.Products
   .withVector("byDescription", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
 ```
 
-`.withVector(name, vector)` works on `put`, `create`, `upsert` and `update`, and skips the Embedder for that index entirely. `name` is the **logical** index name from `Entity.make`.
+`.withVector(name, vector)` works on `put`, `create`, `upsert` and `update`, and skips the Embedder for that index entirely. `name` is the **logical** index name from `Entity.make` — typed as the declared-name union and re-checked at runtime, so a typo is a compile error rather than a silently ignored call that runs the Embedder anyway.
 
 ## Re-embedding after a model change
 

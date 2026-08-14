@@ -2069,7 +2069,11 @@ Two consequences fall out of this, both deliberate:
    quota is tight for single-table designs; sharing is the norm rather than the
    exception. `Table.make` validates that every entity sharing a physical index
    agrees on `dimensions` and `distance` (they are immutable at the DynamoDB level,
-   so disagreement is unrepresentable).
+   so disagreement is unrepresentable). `filters`, by contrast, are per-entity
+   access patterns rather than a shared physical property, so they are **unioned**
+   across sharers when the `SearchSchema` is emitted — keeping only the first
+   declarer's set would silently leave the other sharers' filter attributes
+   un-indexed. The 18-filter limit is checked against the union.
 
 With `partition: ["tenantId"]`, tenant scoping composes into the same attribute,
 and DynamoDB's per-partition-value throughput ceilings (1 GBps search, 10 MBps
@@ -2114,15 +2118,28 @@ runtime surprise on the thousandth write.
 | Operation | Embedder invoked? |
 |---|---|
 | `put` / `create` | Always (the full item is being written). |
-| `upsert` | Always. |
-| `update` / `patch` | **Only** when at least one `source.fields` member appears in the update payload. |
+| `upsert` | Always — emitted as plain `SET`, never `if_not_exists`, so an upsert that overwrites the source overwrites the vector derived from it. |
+| `update` / `patch` | **Only** when the write touches a `source.fields` member. |
 | `.withVector(name, vector)` | Never — the caller supplies a pre-computed embedding. |
 | `.append()` (time-series) | Never on event items; vector attributes are stripped. |
 
-The update gate deliberately mirrors the policy-aware GSI composition gate (§7):
-a writer that does not touch the source fields must not pay for an embedding call,
-and must not clobber a vector another writer owns. No source change ⇒ no Embedder
-call ⇒ stored vector untouched.
+"Touches" spans every channel that can change the source, not just the `set()`
+payload: a `remove([...])` clearing a source field, a null/undefined payload
+entry, and a path-based operation whose root segment names a source field all
+fire the gate. This is the same discipline the policy-aware GSI composer applies
+to `removedSet` (§7) — a clear IS a change, and an embedding that survives its
+source is worse than no embedding at all.
+
+Otherwise the gate mirrors §7 exactly: a writer that touches none of the source
+must not pay for an embedding call, and must not clobber a vector another writer
+owns. No source change ⇒ no Embedder call ⇒ stored vector untouched.
+
+**Clearing the source removes the item from the index.** When the gate fires but
+the post-update record has no source text left, the write emits `REMOVE` for the
+vector AND partition attributes. Sparse semantics then drop the item out of the
+index — which is the only way to delete a vector index entry. `.withVector()` on
+the same write wins over this, since an explicit vector is not derived from the
+source at all.
 
 The partition attribute is composed on every write that composes keys, exactly
 like a GSI half whose composites are all primary-key members.
@@ -2169,11 +2186,16 @@ Deliberate shape decisions:
   cursor, so `.fetch()`, `.paginate()`, `.startFrom()`, `.maxPages()`, and
   `.reverse()` are *structurally absent* from the type rather than present and
   failing. The builder cannot express an operation the API does not have.
-- **`.filter()` is equality-only.** The API Reference restricts
-  `SearchConditionExpression` to `=` for both HASH and INLINE_FILTER attributes.
-  The restriction lives in exactly one type alias (`VectorFilterInput`) so that
-  when AWS relaxes it — the SDK JSDoc already advertises range operators for
-  INLINE_FILTER — one edit widens the surface.
+- **`.filter()` is equality-only, over declared attributes only.** The API
+  Reference restricts `SearchConditionExpression` to `=` for both HASH and
+  INLINE_FILTER attributes; that restriction lives in exactly one type alias
+  (`VectorFilterInput`) so that when AWS relaxes it — the SDK JSDoc already
+  advertises range operators for INLINE_FILTER — one edit widens the surface.
+  Separately, only attributes listed in the index's `filters: [...]` are
+  filterable: the accessor types the filter keys as that declared tuple, the
+  terminal re-checks at runtime with a `ValidationError`, and the emulation layer
+  rejects an undeclared attribute the way real DynamoDB does. All three exist so
+  an undeclared filter cannot pass locally and fail in production.
 - **`.partition()` is required iff partition composites are declared.** Mirrors
   the "PK composites required" rule on index query accessors, enforced at the type
   level via a conditional on the declared `partition` tuple.

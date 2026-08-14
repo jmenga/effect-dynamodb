@@ -18,6 +18,7 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import { Effect, Layer, Schema } from "effect"
@@ -357,6 +358,198 @@ describe("vector search write path", () => {
     }).pipe(Effect.provide(makeLayer(capture)))
   })
 
+  it.effect("upsert writes the embedding and partition attribute (B1)", () => {
+    const capture: Capture = {}
+    setVector("Trail Boot Waterproof hiking boot", [0, 1, 0, 0])
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Products },
+        tables: { MainTable },
+      })
+      yield* db.entities.Products.upsert({
+        productId: "p-1",
+        tenantId: "t-1",
+        name: "Trail Boot",
+        description: "Waterproof hiking boot",
+        category: "footwear",
+        price: 120,
+      })
+      const names = capture.updateItem?.ExpressionAttributeNames as Record<string, string>
+      const values = capture.updateItem?.ExpressionAttributeValues as Record<string, AttributeValue>
+      const vectorKey = Object.keys(names).find((k) => names[k] === VECTOR_ATTR)
+      const partitionKey = Object.keys(names).find((k) => names[k] === PARTITION_ATTR)
+      expect(vectorKey).toBeDefined()
+      expect(partitionKey).toBeDefined()
+      expect(values[`:${vectorKey!.slice(1)}`]).toEqual({
+        L: [{ N: "0" }, { N: "1" }, { N: "0" }, { N: "0" }],
+      })
+      expect(values[`:${partitionKey!.slice(1)}`]).toEqual({ S: "$app#v1#product#tenantid_t-1" })
+      // Plain SET, never if_not_exists — an upsert that overwrites the source
+      // fields must overwrite the vector derived from them.
+      const expression = capture.updateItem?.UpdateExpression as string
+      expect(expression).toContain(`${vectorKey} = :${vectorKey!.slice(1)}`)
+      expect(expression).not.toContain(`if_not_exists(${vectorKey}`)
+    }).pipe(Effect.provide(makeLayer(capture)))
+  })
+
+  it.effect("upsert honours .withVector (B1)", () => {
+    const capture: Capture = {}
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Products },
+        tables: { MainTable },
+      })
+      yield* db.entities.Products.upsert({
+        productId: "p-1",
+        tenantId: "t-1",
+        name: "Trail Boot",
+        description: "Waterproof hiking boot",
+        category: "footwear",
+        price: 120,
+      }).withVector("byDescription", [0.25, 0.25, 0.25, 0.25])
+      const names = capture.updateItem?.ExpressionAttributeNames as Record<string, string>
+      const values = capture.updateItem?.ExpressionAttributeValues as Record<string, AttributeValue>
+      const vectorKey = Object.keys(names).find((k) => names[k] === VECTOR_ATTR)!
+      expect(values[`:${vectorKey.slice(1)}`]).toEqual({
+        L: [{ N: "0.25" }, { N: "0.25" }, { N: "0.25" }, { N: "0.25" }],
+      })
+      // No Embedder in this stack — arriving here proves it was bypassed.
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(DynamoClient, makeMockClient(capture)),
+          MainTable.layer({ name: "test-table" }),
+        ),
+      ),
+    )
+  })
+
+  it.effect("rejects .withVector with an undeclared index name (S5)", () => {
+    const capture: Capture = {}
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Products },
+        tables: { MainTable },
+      })
+      const error = yield* Effect.flip(
+        db.entities.Products.put({
+          productId: "p-1",
+          tenantId: "t-1",
+          name: "Trail Boot",
+          description: "Waterproof hiking boot",
+          category: "footwear",
+          price: 120,
+        })
+          // Typed as the declared-name union, so this is a compile error for the
+          // typed accessor; the cast reproduces an erased/dynamic call site.
+          .withVector("byDescriptionn" as never, [1, 0, 0, 0])
+          .asEffect(),
+      )
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as { cause: unknown }).cause)).toContain("Unknown vector index")
+      expect(capture.putItem).toBeUndefined()
+    }).pipe(Effect.provide(makeLayer(capture)))
+  })
+
+  it.effect("update re-embeds when remove() clears a source field (S4)", () => {
+    const capture: Capture = {}
+    setVector("Trail Boot", [0, 0, 0, 1])
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Products },
+        tables: { MainTable },
+      })
+      // `remove()` never touches the SET payload, so the payload-only gate used
+      // to miss it entirely and leave the old embedding in place.
+      yield* db.entities.Products.update({ tenantId: "t-1", productId: "p-1" }).remove([
+        "description",
+      ])
+      const names = capture.updateItem?.ExpressionAttributeNames as Record<string, string>
+      const values = capture.updateItem?.ExpressionAttributeValues as Record<string, AttributeValue>
+      const vectorKey = Object.keys(names).find((k) => names[k] === VECTOR_ATTR)!
+      // Source is now just `name` — the stored `description` was subtracted.
+      expect(values[`:${vectorKey.slice(1)}`]).toEqual({
+        L: [{ N: "0" }, { N: "0" }, { N: "0" }, { N: "1" }],
+      })
+    }).pipe(Effect.provide(makeLayer(capture)))
+  })
+
+  it.effect("update re-embeds when a path operation targets a source field (S4)", () => {
+    const capture: Capture = {}
+    setVector("Trail Boot Waterproof hiking boot", [0, 1, 0, 0])
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Products },
+        tables: { MainTable },
+      })
+      yield* db.entities.Products.update({ tenantId: "t-1", productId: "p-1" }).pathSet({
+        segments: ["description"],
+        value: "Waterproof hiking boot",
+        isPath: false,
+      })
+      const names = capture.updateItem?.ExpressionAttributeNames as Record<string, string>
+      expect(Object.values(names)).toContain(VECTOR_ATTR)
+    }).pipe(Effect.provide(makeLayer(capture)))
+  })
+
+  it.effect("clearing every source field REMOVEs the vector and partition (S4)", () => {
+    const capture: Capture = {}
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Products },
+        tables: { MainTable },
+      })
+      yield* db.entities.Products.update({ tenantId: "t-1", productId: "p-1" }).remove([
+        "name",
+        "description",
+      ])
+      const names = capture.updateItem?.ExpressionAttributeNames as Record<string, string>
+      const expression = capture.updateItem?.UpdateExpression as string
+      const removeSection = expression.slice(expression.indexOf("REMOVE"))
+      const removedAttrs = Object.entries(names)
+        .filter(([key]) => removeSection.includes(key))
+        .map(([, attr]) => attr)
+      // Sparse semantics: with no source text there is nothing to embed, so the
+      // item must leave the index rather than answer to a stale description.
+      expect(removedAttrs).toContain(VECTOR_ATTR)
+      expect(removedAttrs).toContain(PARTITION_ATTR)
+      // …and it must not simultaneously SET the partition back.
+      const setSection = expression.slice(0, expression.indexOf("REMOVE"))
+      const setAttrs = Object.entries(names)
+        .filter(([key]) => setSection.includes(`${key} =`))
+        .map(([, attr]) => attr)
+      expect(setAttrs).not.toContain(PARTITION_ATTR)
+    }).pipe(Effect.provide(makeLayer(capture)))
+  })
+
+  it.effect(".withVector on update stores the supplied embedding verbatim", () => {
+    const capture: Capture = {}
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Products },
+        tables: { MainTable },
+      })
+      yield* db.entities.Products.update({ tenantId: "t-1", productId: "p-1" })
+        .set({ price: 99 })
+        .withVector("byDescription", [0, 0, 0.6, 0.8])
+      const names = capture.updateItem?.ExpressionAttributeNames as Record<string, string>
+      const values = capture.updateItem?.ExpressionAttributeValues as Record<string, AttributeValue>
+      const vectorKey = Object.keys(names).find((k) => names[k] === VECTOR_ATTR)!
+      expect(values[`:${vectorKey.slice(1)}`]).toEqual({
+        L: [{ N: "0" }, { N: "0" }, { N: "0.6" }, { N: "0.8" }],
+      })
+      // `price` is not a source field, so only the explicit vector could have
+      // produced this SET — no Embedder is in the layer stack.
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(DynamoClient, makeMockClient(capture)),
+          MainTable.layer({ name: "test-table" }),
+        ),
+      ),
+    )
+  })
+
   it.effect("update leaves the vector untouched when no source field is named", () => {
     const capture: Capture = {}
     return Effect.gen(function* () {
@@ -585,6 +778,366 @@ describe("vector search read path", () => {
       expect(capture.searchVectors?.SearchConditionExpression).toBe("#vp = :vp")
     }).pipe(Effect.provide(makeLayer(capture)))
   })
+
+  it.effect("rejects a filter on an attribute the index does not declare (S2)", () => {
+    const capture: Capture = {}
+    setVector("x", [1, 0, 0, 0])
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Products },
+        tables: { MainTable },
+      })
+      const error = yield* Effect.flip(
+        db.entities.Products.byDescription("x")
+          .partition({ tenantId: "t-1" })
+          // `price` is a model field but NOT in `filters: ["category"]`, so it
+          // is not an INLINE_FILTER attribute on the physical index. The typed
+          // accessor rejects this at compile time; the cast reproduces what a
+          // dynamically-built filter record would do at runtime.
+          .filter({ price: 10 } as never)
+          .collect(),
+      )
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as { cause: unknown }).cause)).toContain("not an INLINE_FILTER")
+      // The request must never have been issued.
+      expect(capture.searchVectors).toBeUndefined()
+    }).pipe(Effect.provide(makeLayer(capture)))
+  })
+
+  it.effect("the emulator rejects an undeclared filter the way real DynamoDB does (S2)", () => {
+    const capture: Capture = { scanItems: [storedItem("only", "footwear", [1, 0, 0, 0])] }
+    return Effect.gen(function* () {
+      // Bypass the builder entirely and hand the emulator a raw request with an
+      // undeclared filter attribute — the emulator must not silently honour it.
+      const client = yield* DynamoClient
+      const error = yield* Effect.flip(
+        client.searchVectors({
+          TableName: "test-table",
+          IndexName: "vec1",
+          SearchVector: [{ N: "1" }, { N: "0" }, { N: "0" }, { N: "0" }],
+          TopK: 10,
+          SearchConditionExpression: "#vp = :vp AND #f0 = :f0",
+          ExpressionAttributeNames: { "#vp": PARTITION_ATTR, "#f0": "price" },
+          ExpressionAttributeValues: {
+            ":vp": { S: "$app#v1#product#tenantid_t-1" },
+            ":f0": { N: "10" },
+          },
+        }),
+      )
+      expect(error._tag).toBe("DynamoValidationError")
+    }).pipe(Effect.provide(makeEmulatedLayer(capture)))
+  })
+
+  it.effect("exposes terminals immediately when the index declares no partition", () => {
+    const capture: Capture = {}
+    setVector("anything", [1, 0, 0, 0])
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Notes },
+        tables: { NoteTable },
+      })
+      // No `.partition(...)` in the chain — the terminal is reachable directly
+      // because the index declares no partition composites. That this compiles
+      // at all IS the assertion for the `[Partition] extends [never]` branch.
+      yield* db.entities.Notes.byBody("anything").collect()
+      // The composed HASH value is still the bare entity prefix, which is what
+      // keeps a shared physical index scoped to one entity type even with no
+      // user-supplied partition composites.
+      expect(
+        (capture.searchVectors?.ExpressionAttributeValues as Record<string, AttributeValue>)[":vp"],
+      ).toEqual({ S: "$app#v1#note" })
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(DynamoClient, makeMockClient(capture)),
+          NoteTable.layer({ name: "test-table" }),
+          FixedEmbedder,
+        ),
+      ),
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 3b. Shared physical index — the "entity scoping for free" headline claim
+// ---------------------------------------------------------------------------
+
+class Note extends Schema.Class<Note>("Note")({
+  noteId: Schema.String,
+  body: Schema.String,
+}) {}
+
+/**
+ * `Table.make` re-binds each member entity's table tag, so an entity may only
+ * belong to one table per test file. The shared-index fixture therefore uses its
+ * own product entity rather than reusing `Products`.
+ */
+const SharedProducts = Entity.make({
+  model: Product,
+  entityType: "sproduct",
+  primaryKey: {
+    pk: { field: "pk", composite: ["tenantId", "productId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  vectorIndexes: {
+    byDescription: {
+      name: "vec1",
+      dimensions: DIMENSIONS,
+      distance: "cosine",
+      source: { fields: ["name", "description"] },
+      partition: ["tenantId"],
+      filters: ["category"],
+    },
+  },
+})
+
+/** Second entity type sharing physical index `vec1` with `SharedProducts`. */
+class Article extends Schema.Class<Article>("Article")({
+  articleId: Schema.String,
+  tenantId: Schema.String,
+  headline: Schema.String,
+  topic: Schema.String,
+}) {}
+
+const Articles = Entity.make({
+  model: Article,
+  entityType: "article",
+  primaryKey: {
+    pk: { field: "pk", composite: ["tenantId", "articleId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  vectorIndexes: {
+    byHeadline: {
+      name: "vec1",
+      dimensions: DIMENSIONS,
+      distance: "cosine",
+      source: { fields: ["headline"] },
+      partition: ["tenantId"],
+      // Deliberately a DIFFERENT filter attribute than Products declares —
+      // the merged SearchSchema must carry the union (S3).
+      filters: ["topic"],
+    },
+  },
+})
+
+const SharedTable = Table.make({ schema: AppSchema, entities: { SharedProducts, Articles } })
+
+/** Partition-less vector index — used to prove terminals appear immediately. */
+const Notes = Entity.make({
+  model: Note,
+  entityType: "note",
+  primaryKey: {
+    pk: { field: "pk", composite: ["noteId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  vectorIndexes: {
+    byBody: { name: "vecn", dimensions: DIMENSIONS, source: { fields: ["body"] } },
+  },
+})
+
+const NoteTable = Table.make({ schema: AppSchema, entities: { Notes } })
+
+const sharedProductItem = (
+  productId: string,
+  vector: ReadonlyArray<number>,
+  tenantId = "t-1",
+): Record<string, AttributeValue> => ({
+  pk: { S: `$app#v1#sproduct#tenantid_${tenantId}#productid_${productId}` },
+  sk: { S: "$app#v1#sproduct" },
+  productId: { S: productId },
+  tenantId: { S: tenantId },
+  name: { S: productId },
+  description: { S: `${productId} description` },
+  category: { S: "footwear" },
+  price: { N: "10" },
+  __edd_e__: { S: "sproduct" },
+  [VECTOR_ATTR]: { L: vector.map((n) => ({ N: String(n) })) },
+  [PARTITION_ATTR]: { S: `$app#v1#sproduct#tenantid_${tenantId}` },
+})
+
+const sharedArticleItem = (
+  articleId: string,
+  vector: ReadonlyArray<number>,
+  tenantId = "t-1",
+): Record<string, AttributeValue> => ({
+  pk: { S: `$app#v1#article#tenantid_${tenantId}#articleid_${articleId}` },
+  sk: { S: "$app#v1#article" },
+  articleId: { S: articleId },
+  tenantId: { S: tenantId },
+  headline: { S: articleId },
+  topic: { S: "news" },
+  __edd_e__: { S: "article" },
+  [VECTOR_ATTR]: { L: vector.map((n) => ({ N: String(n) })) },
+  [PARTITION_ATTR]: { S: `$app#v1#article#tenantid_${tenantId}` },
+})
+
+// ---------------------------------------------------------------------------
+// 3c. Renamed fields (`DynamoModel.configure({ field })`)
+// ---------------------------------------------------------------------------
+
+class Gadget extends Schema.Class<Gadget>("Gadget")({
+  gadgetId: Schema.String,
+  blurb: Schema.String,
+  kind: Schema.String,
+}) {}
+
+/** Both the source field and the filter attribute are stored under short names. */
+const GadgetModel = DynamoModel.configure(Gadget, {
+  blurb: { field: "b" },
+  kind: { field: "k" },
+})
+
+const Gadgets = Entity.make({
+  model: GadgetModel,
+  entityType: "gadget",
+  primaryKey: {
+    pk: { field: "pk", composite: ["gadgetId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  vectorIndexes: {
+    byBlurb: {
+      name: "vecg",
+      dimensions: DIMENSIONS,
+      source: { fields: ["blurb"] },
+      filters: ["kind"],
+    },
+  },
+})
+
+const GadgetTable = Table.make({ schema: AppSchema, entities: { Gadgets } })
+
+describe("vector search with renamed (storedAs) fields", () => {
+  it("emits SearchSchema INLINE_FILTER entries under the STORED attribute name (S7)", () => {
+    const definition = Table.definition(GadgetTable as unknown as Table.Table)
+    expect(definition.VectorIndexes?.[0]?.SearchSchema).toEqual([
+      { AttributeName: "__edd_vp_vecg__", SearchSchemaElementType: "HASH" },
+      // `k`, not `kind` — items are written after renameToDynamo.
+      { AttributeName: "k", SearchSchemaElementType: "INLINE_FILTER" },
+    ])
+  })
+
+  it.effect("filters and projects under STORED names, returning DOMAIN names (S7)", () => {
+    const capture: Capture = {
+      scanItems: [
+        {
+          pk: { S: "$app#v1#gadget#gadgetid_g-1" },
+          sk: { S: "$app#v1#gadget" },
+          gadgetId: { S: "g-1" },
+          b: { S: "a widget" },
+          k: { S: "tool" },
+          __edd_e__: { S: "gadget" },
+          __edd_v_vecg__: { L: [{ N: "1" }, { N: "0" }, { N: "0" }, { N: "0" }] },
+          __edd_vp_vecg__: { S: "$app#v1#gadget" },
+        },
+      ],
+    }
+    setVector("a widget", [1, 0, 0, 0])
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Gadgets },
+        tables: { GadgetTable },
+      })
+      const hits = yield* db.entities.Gadgets.byBlurb("a widget")
+        .filter({ kind: "tool" })
+        .select(["gadgetId", "blurb"])
+        .collect()
+      // The filter matched despite `kind` living on disk as `k`…
+      expect(hits).toHaveLength(1)
+      // …and the projected result comes back under DOMAIN names.
+      expect(hits[0]!.item).toEqual({ gadgetId: "g-1", blurb: "a widget" })
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          VectorSearchEmulation.layer(Layer.succeed(DynamoClient, makeMockClient(capture)), {
+            tables: { GadgetTable },
+          }),
+          GadgetTable.layer({ name: "test-table" }),
+          FixedEmbedder,
+        ),
+      ),
+    )
+  })
+
+  it.effect("writes the embedding derived from the renamed source field (S7)", () => {
+    const capture: Capture = {}
+    setVector("a widget", [0, 0, 1, 0])
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Gadgets },
+        tables: { GadgetTable },
+      })
+      yield* db.entities.Gadgets.put({ gadgetId: "g-1", blurb: "a widget", kind: "tool" })
+      const item = capture.putItem?.Item as Record<string, AttributeValue>
+      expect(item.__edd_v_vecg__).toEqual({
+        L: [{ N: "0" }, { N: "0" }, { N: "1" }, { N: "0" }],
+      })
+      expect(item.b).toEqual({ S: "a widget" })
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(DynamoClient, makeMockClient(capture)),
+          GadgetTable.layer({ name: "test-table" }),
+          FixedEmbedder,
+        ),
+      ),
+    )
+  })
+})
+
+describe("shared physical vector index", () => {
+  it("unions filters from every sharer into one SearchSchema (S3)", () => {
+    const definition = Table.definition(SharedTable as unknown as Table.Table)
+    expect(definition.VectorIndexes).toEqual([
+      {
+        IndexName: "vec1",
+        VectorAttribute: { AttributeName: VECTOR_ATTR },
+        Dimensions: DIMENSIONS,
+        DistanceFunction: "COSINE",
+        Projection: { ProjectionType: "ALL" },
+        SearchSchema: [
+          { AttributeName: PARTITION_ATTR, SearchSchemaElementType: "HASH" },
+          // Products' filter…
+          { AttributeName: "category", SearchSchemaElementType: "INLINE_FILTER" },
+          // …plus Articles', which the first-declarer-wins merge used to drop.
+          { AttributeName: "topic", SearchSchemaElementType: "INLINE_FILTER" },
+        ],
+      },
+    ])
+  })
+
+  it.effect("scopes searches to one entity type without any user-supplied filter", () => {
+    const capture: Capture = {
+      scanItems: [
+        // Both entity types live in the same physical index with identical
+        // embeddings — only the composed partition value tells them apart.
+        sharedProductItem("prod", [1, 0, 0, 0]),
+        sharedArticleItem("art", [1, 0, 0, 0]),
+      ],
+    }
+    setVector("boots", [1, 0, 0, 0])
+    const layer = Layer.mergeAll(
+      VectorSearchEmulation.layer(Layer.succeed(DynamoClient, makeMockClient(capture)), {
+        tables: { SharedTable },
+      }),
+      SharedTable.layer({ name: "test-table" }),
+      FixedEmbedder,
+    )
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SharedProducts, Articles },
+        tables: { SharedTable },
+      })
+      const products = yield* db.entities.SharedProducts.byDescription("boots")
+        .partition({ tenantId: "t-1" })
+        .collect()
+      expect(products.map((h) => h.item.productId)).toEqual(["prod"])
+
+      const articles = yield* db.entities.Articles.byHeadline("boots")
+        .partition({ tenantId: "t-1" })
+        .collect()
+      expect(articles.map((h) => h.item.articleId)).toEqual(["art"])
+    }).pipe(Effect.provide(layer))
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -629,6 +1182,47 @@ describe("Table.definition vector indexes", () => {
     })
     expect(() => Table.make({ schema: AppSchema, entities: { Products, Other } })).toThrow(
       "[EDD-9035]",
+    )
+  })
+
+  it.effect("rejects a vector index whose name collides with another accessor (N4)", () => {
+    // `byOwner` is both a GSI query accessor and a vector index name — binding
+    // both would silently replace one with the other.
+    const Colliding = Entity.make({
+      model: Product,
+      entityType: "colliding",
+      primaryKey: {
+        pk: { field: "pk", composite: ["productId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        byOwner: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["tenantId"] },
+          sk: { field: "gsi1sk", composite: [] },
+        },
+      },
+      vectorIndexes: {
+        byOwner: { name: "vecc", dimensions: DIMENSIONS, source: { fields: ["description"] } },
+      },
+    })
+    const CollidingTable = Table.make({ schema: AppSchema, entities: { Colliding } })
+    return Effect.gen(function* () {
+      const message = yield* Effect.gen(function* () {
+        yield* DynamoClient.make({
+          entities: { Colliding },
+          tables: { CollidingTable },
+        })
+        return "no failure"
+      }).pipe(Effect.catchDefect((defect) => Effect.succeed(String(defect))))
+      expect(message).toContain("EDD-9038")
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(DynamoClient, makeMockClient({})),
+          CollidingTable.layer({ name: "test-table" }),
+        ),
+      ),
     )
   })
 

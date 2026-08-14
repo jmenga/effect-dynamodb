@@ -5456,4 +5456,508 @@ describeConnected("vector search integration (closes #78)", () => {
       yield* db.tables.VecTable.waitForVectorIndex("vec1", { timeout: Duration.seconds(5) })
     }).pipe(provideVec),
   )
+
+  it.effect("upsert makes an item searchable and refreshes a stale vector (closes B1)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { VecDocs }, tables: { VecTable } })
+
+      // First upsert creates the item. Before the fix this wrote no vector at
+      // all, leaving the item permanently invisible to search.
+      yield* db.entities.VecDocs.upsert({
+        docId: "d-upsert",
+        tenantId: "t-9",
+        title: "Marker",
+        body: "north pole",
+        category: "geo",
+      })
+      const created = yield* db.entities.VecDocs.byBody("north star")
+        .partition({ tenantId: "t-9" })
+        .collect()
+      expect(created.map((h) => h.item.docId)).toEqual(["d-upsert"])
+      expect(created[0]!.similarity).toBeCloseTo(1, 5)
+
+      // Second upsert overwrites the source — the vector must follow, not
+      // linger on the previous description.
+      yield* db.entities.VecDocs.upsert({
+        docId: "d-upsert",
+        tenantId: "t-9",
+        title: "Marker",
+        body: "east coast",
+        category: "geo",
+      })
+      const refreshed = yield* db.entities.VecDocs.byBody("east wind")
+        .partition({ tenantId: "t-9" })
+        .collect()
+      expect(refreshed[0]!.similarity).toBeCloseTo(1, 5)
+      const stale = yield* db.entities.VecDocs.byBody("north star")
+        .partition({ tenantId: "t-9" })
+        .collect()
+      expect(stale[0]!.similarity).toBeCloseTo(0.5, 5)
+    }).pipe(provideVec),
+  )
+
+  it.effect(".withVector on update replaces the stored embedding (closes gap 3)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { VecDocs }, tables: { VecTable } })
+
+      yield* db.entities.VecDocs.put({
+        docId: "d-wv",
+        tenantId: "t-10",
+        title: "Marker",
+        body: "north pole",
+        category: "geo",
+      })
+      // `category` is not a source field, so only the explicit vector can move
+      // the item onto the west axis.
+      yield* db.entities.VecDocs.update({ tenantId: "t-10", docId: "d-wv" })
+        .set({ category: "science" })
+        .withVector("byBody", [0, 0, 0, 1])
+
+      const hits = yield* db.entities.VecDocs.byBody([0, 0, 0, 1])
+        .partition({ tenantId: "t-10" })
+        .collect()
+      expect(hits[0]!.item.docId).toBe("d-wv")
+      expect(hits[0]!.similarity).toBeCloseTo(1, 5)
+    }).pipe(provideVec),
+  )
+
+  it.effect("reembed skips items deleted after the scan page (closes S6)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { VecDocs }, tables: { VecTable } })
+
+      yield* db.entities.VecDocs.put({
+        docId: "d-ghost",
+        tenantId: "t-12",
+        title: "Marker",
+        body: "north pole",
+        category: "geo",
+      })
+      yield* db.entities.VecDocs.delete({ tenantId: "t-12", docId: "d-ghost" })
+
+      // The item is gone before reembed runs, so the conditional write must
+      // decline rather than resurrect it as a key + vector fragment.
+      yield* db.entities.VecDocs.reembed({ concurrency: 2 })
+
+      const hits = yield* db.entities.VecDocs.byBody("north star")
+        .partition({ tenantId: "t-12" })
+        .collect()
+      expect(hits).toHaveLength(0)
+    }).pipe(provideVec),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Vector search — two entity types sharing one physical index (closes #78)
+//
+// The headline claim of the partition design is that the composed
+// `__edd_vp_*` value carries the entity type, so a shared physical vector
+// index scopes to one entity for free. That claim is only worth anything if it
+// holds against a real engine with both entity types' items interleaved in the
+// same table, which is what this suite exercises.
+// ---------------------------------------------------------------------------
+
+const sharedVecTableName = "connected-test-vec-shared"
+
+class VecNote extends Schema.Class<VecNote>("VecNote")({
+  noteId: Schema.String,
+  tenantId: Schema.String,
+  body: Schema.String,
+  kind: Schema.String,
+}) {}
+
+const SharedVecDocs = Entity.make({
+  model: VecDoc,
+  entityType: "svecdoc",
+  primaryKey: {
+    pk: { field: "pk", composite: ["tenantId", "docId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  vectorIndexes: {
+    byBody: {
+      name: "vec1",
+      dimensions: VEC_DIMENSIONS,
+      distance: "cosine",
+      source: { fields: ["body"] },
+      partition: ["tenantId"],
+      filters: ["category"],
+    },
+  },
+})
+
+const SharedVecNotes = Entity.make({
+  model: VecNote,
+  entityType: "svecnote",
+  primaryKey: {
+    pk: { field: "pk", composite: ["tenantId", "noteId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  vectorIndexes: {
+    byBody: {
+      name: "vec1",
+      dimensions: VEC_DIMENSIONS,
+      distance: "cosine",
+      source: { fields: ["body"] },
+      partition: ["tenantId"],
+      // A DIFFERENT filter attribute — the merged SearchSchema must union both.
+      filters: ["kind"],
+    },
+  },
+})
+
+const SharedVecTable = Table.make({
+  schema: vecSchema,
+  entities: { SharedVecDocs, SharedVecNotes },
+})
+
+const SharedVecTestLayer = Layer.mergeAll(
+  VectorSearchEmulation.layer(ClientLayer, { tables: { SharedVecTable } }),
+  SharedVecTable.layer({ name: sharedVecTableName }),
+  AxisEmbedder,
+)
+const provideSharedVec = Effect.provide(SharedVecTestLayer)
+
+describeConnected("vector search — shared physical index (closes #78)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { SharedVecDocs, SharedVecNotes },
+          tables: { SharedVecTable },
+        })
+        yield* db.tables.SharedVecTable.create()
+      }).pipe(provideSharedVec, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: sharedVecTableName })
+      }).pipe(
+        provideSharedVec,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("the merged VectorIndex unions filters from both sharers", () => {
+    const definition = Table.definition(SharedVecTable as unknown as Table.Table)
+    const searchSchema = definition.VectorIndexes?.[0]?.SearchSchema ?? []
+    expect(searchSchema.map((element) => element.AttributeName)).toEqual([
+      "__edd_vp_vec1__",
+      "category",
+      "kind",
+    ])
+    return Effect.void
+  })
+
+  it.effect("a search returns only the queried entity type, with no user filter", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SharedVecDocs, SharedVecNotes },
+        tables: { SharedVecTable },
+      })
+
+      // Identical embeddings (same axis word), same tenant, same physical index
+      // — only the composed partition value separates them.
+      yield* db.entities.SharedVecDocs.put({
+        docId: "shared-doc",
+        tenantId: "t-1",
+        title: "Doc",
+        body: "north pole",
+        category: "geo",
+      })
+      yield* db.entities.SharedVecNotes.put({
+        noteId: "shared-note",
+        tenantId: "t-1",
+        body: "north pole",
+        kind: "memo",
+      })
+
+      const docs = yield* db.entities.SharedVecDocs.byBody("north star")
+        .partition({ tenantId: "t-1" })
+        .collect()
+      expect(docs.map((h) => h.item.docId)).toEqual(["shared-doc"])
+
+      const notes = yield* db.entities.SharedVecNotes.byBody("north star")
+        .partition({ tenantId: "t-1" })
+        .collect()
+      expect(notes.map((h) => h.item.noteId)).toEqual(["shared-note"])
+    }).pipe(provideSharedVec),
+  )
+
+  it.effect("each sharer can filter on its own declared INLINE_FILTER attribute", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SharedVecDocs, SharedVecNotes },
+        tables: { SharedVecTable },
+      })
+
+      yield* db.entities.SharedVecNotes.put({
+        noteId: "memo-note",
+        tenantId: "t-2",
+        body: "east coast",
+        kind: "memo",
+      })
+      yield* db.entities.SharedVecNotes.put({
+        noteId: "draft-note",
+        tenantId: "t-2",
+        body: "east coast",
+        kind: "draft",
+      })
+
+      // `kind` is declared only by SharedVecNotes — the union merge is what
+      // keeps it in the physical index's SearchSchema.
+      const drafts = yield* db.entities.SharedVecNotes.byBody("east wind")
+        .partition({ tenantId: "t-2" })
+        .filter({ kind: "draft" })
+        .collect()
+      expect(drafts.map((h) => h.item.noteId)).toEqual(["draft-note"])
+    }).pipe(provideSharedVec),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Vector search — clearing the embedding source (closes #78)
+//
+// The source fields are optional here on purpose: clearing a REQUIRED field
+// would leave an item that cannot decode, which is a different failure. What is
+// under test is the sparse-index story — an item whose source text is gone must
+// leave the index rather than answer to a description it no longer has.
+// ---------------------------------------------------------------------------
+
+const clearVecTableName = "connected-test-vec-clear"
+
+class VecDraft extends Schema.Class<VecDraft>("VecDraft")({
+  draftId: Schema.String,
+  tenantId: Schema.String,
+  body: Schema.optional(Schema.String),
+}) {}
+
+const VecDrafts = Entity.make({
+  model: VecDraft,
+  entityType: "vecdraft",
+  primaryKey: {
+    pk: { field: "pk", composite: ["tenantId", "draftId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  vectorIndexes: {
+    byBody: {
+      name: "vec1",
+      dimensions: VEC_DIMENSIONS,
+      distance: "cosine",
+      source: { fields: ["body"] },
+      partition: ["tenantId"],
+    },
+  },
+})
+
+const ClearVecTable = Table.make({ schema: vecSchema, entities: { VecDrafts } })
+const ClearVecTestLayer = Layer.mergeAll(
+  VectorSearchEmulation.layer(ClientLayer, { tables: { ClearVecTable } }),
+  ClearVecTable.layer({ name: clearVecTableName }),
+  AxisEmbedder,
+)
+const provideClearVec = Effect.provide(ClearVecTestLayer)
+
+describeConnected("vector search — clearing the embedding source (closes #78)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { VecDrafts },
+          tables: { ClearVecTable },
+        })
+        yield* db.tables.ClearVecTable.create()
+      }).pipe(provideClearVec, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: clearVecTableName })
+      }).pipe(
+        provideClearVec,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("remove() of the last source field drops the item out of the index", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { VecDrafts },
+        tables: { ClearVecTable },
+      })
+
+      yield* db.entities.VecDrafts.put({
+        draftId: "d-clear",
+        tenantId: "t-1",
+        body: "south side",
+      })
+      const before = yield* db.entities.VecDrafts.byBody("south wind")
+        .partition({ tenantId: "t-1" })
+        .collect()
+      expect(before.map((h) => h.item.draftId)).toEqual(["d-clear"])
+
+      yield* db.entities.VecDrafts.update({ tenantId: "t-1", draftId: "d-clear" }).remove(["body"])
+
+      const after = yield* db.entities.VecDrafts.byBody("south wind")
+        .partition({ tenantId: "t-1" })
+        .collect()
+      expect(after).toHaveLength(0)
+      // The item itself survives — only its index entry is gone.
+      const stillThere = yield* db.entities.VecDrafts.get({ tenantId: "t-1", draftId: "d-clear" })
+      expect(stillThere.draftId).toBe("d-clear")
+      expect(stillThere.body).toBeUndefined()
+    }).pipe(provideClearVec),
+  )
+
+  it.effect("a null set() of the last source field drops it out of the index too", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { VecDrafts },
+        tables: { ClearVecTable },
+      })
+
+      yield* db.entities.VecDrafts.put({
+        draftId: "d-null",
+        tenantId: "t-2",
+        body: "east coast",
+      })
+      yield* db.entities.VecDrafts.update({ tenantId: "t-2", draftId: "d-null" }).set({
+        body: undefined,
+      })
+
+      const after = yield* db.entities.VecDrafts.byBody("east wind")
+        .partition({ tenantId: "t-2" })
+        .collect()
+      expect(after).toHaveLength(0)
+    }).pipe(provideClearVec),
+  )
+
+  it.effect("re-supplying the source field puts the item back in the index", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { VecDrafts },
+        tables: { ClearVecTable },
+      })
+
+      yield* db.entities.VecDrafts.put({ draftId: "d-back", tenantId: "t-3", body: "north pole" })
+      yield* db.entities.VecDrafts.update({ tenantId: "t-3", draftId: "d-back" }).remove(["body"])
+      expect(
+        yield* db.entities.VecDrafts.byBody("north star").partition({ tenantId: "t-3" }).collect(),
+      ).toHaveLength(0)
+
+      yield* db.entities.VecDrafts.update({ tenantId: "t-3", draftId: "d-back" }).set({
+        body: "west end",
+      })
+      const back = yield* db.entities.VecDrafts.byBody("west gate")
+        .partition({ tenantId: "t-3" })
+        .collect()
+      expect(back.map((h) => h.item.draftId)).toEqual(["d-back"])
+      expect(back[0]!.similarity).toBeCloseTo(1, 5)
+    }).pipe(provideClearVec),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Vector search — soft-delete round trip (closes #78)
+// ---------------------------------------------------------------------------
+
+const softVecTableName = "connected-test-vec-soft"
+
+const SoftVecDocs = Entity.make({
+  model: VecDoc,
+  entityType: "softvecdoc",
+  primaryKey: {
+    pk: { field: "pk", composite: ["tenantId", "docId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  softDelete: true,
+  vectorIndexes: {
+    byBody: {
+      name: "vec1",
+      dimensions: VEC_DIMENSIONS,
+      distance: "cosine",
+      source: { fields: ["body"] },
+      partition: ["tenantId"],
+    },
+  },
+})
+
+const SoftVecTable = Table.make({ schema: vecSchema, entities: { SoftVecDocs } })
+const SoftVecTestLayer = Layer.mergeAll(
+  VectorSearchEmulation.layer(ClientLayer, { tables: { SoftVecTable } }),
+  SoftVecTable.layer({ name: softVecTableName }),
+  AxisEmbedder,
+)
+const provideSoftVec = Effect.provide(SoftVecTestLayer)
+
+describeConnected("vector search — soft delete round trip (closes #78)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { SoftVecDocs },
+          tables: { SoftVecTable },
+        })
+        yield* db.tables.SoftVecTable.create()
+      }).pipe(provideSoftVec, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: softVecTableName })
+      }).pipe(
+        provideSoftVec,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("soft delete removes the item from search; restore brings it back", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SoftVecDocs },
+        tables: { SoftVecTable },
+      })
+
+      yield* db.entities.SoftVecDocs.put({
+        docId: "d-soft",
+        tenantId: "t-1",
+        title: "Doc",
+        body: "west end",
+        category: "geo",
+      })
+      const before = yield* db.entities.SoftVecDocs.byBody("west gate")
+        .partition({ tenantId: "t-1" })
+        .collect()
+      expect(before.map((h) => h.item.docId)).toEqual(["d-soft"])
+
+      // The tombstone strips the indexed attributes and stashes the embedding.
+      yield* db.entities.SoftVecDocs.delete({ tenantId: "t-1", docId: "d-soft" })
+      const during = yield* db.entities.SoftVecDocs.byBody("west gate")
+        .partition({ tenantId: "t-1" })
+        .collect()
+      expect(during).toHaveLength(0)
+
+      // Restore un-stashes it — no Embedder round trip, same vector as before.
+      yield* db.entities.SoftVecDocs.restore({ tenantId: "t-1", docId: "d-soft" })
+      const after = yield* db.entities.SoftVecDocs.byBody("west gate")
+        .partition({ tenantId: "t-1" })
+        .collect()
+      expect(after.map((h) => h.item.docId)).toEqual(["d-soft"])
+      expect(after[0]!.similarity).toBeCloseTo(before[0]!.similarity, 10)
+    }).pipe(provideSoftVec),
+  )
 })
