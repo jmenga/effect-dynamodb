@@ -109,6 +109,11 @@ export interface UpdateState {
    * builder's combinators (single physical write, not two).
    */
   readonly sparseClearFields: ReadonlyArray<string> | undefined
+  /**
+   * Pre-computed embeddings supplied via `.withVector(name, vector)` — the
+   * escape hatch that skips the Embedder for the named vector index.
+   */
+  readonly withVectors: WithVectors | undefined
 }
 
 /** @internal Path-based SET operation */
@@ -178,6 +183,7 @@ export const emptyUpdateState: UpdateState = {
   pathDeletes: undefined,
   sparseRemoveEntries: undefined,
   sparseClearFields: undefined,
+  withVectors: undefined,
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +330,19 @@ export class EntityGetImpl<A, Rec, E, R> implements Pipeable.Pipeable {
   }
 }
 
+/**
+ * @internal Pre-computed embeddings supplied via `.withVector(name, vector)`,
+ * keyed by logical vector index name. An index present here skips the Embedder
+ * entirely on this write.
+ */
+export type WithVectors = globalThis.Record<string, ReadonlyArray<number>>
+
+/** @internal Options threaded into the put builder. */
+export interface EntityPutOpts {
+  readonly condition: Expr | ConditionInput | undefined
+  readonly withVectors?: WithVectors | undefined
+}
+
 export class EntityPutImpl<A, Rec, E, R> implements Pipeable.Pipeable {
   readonly [EntityOpTypeId]: EntityOpTypeId = EntityOpTypeId as EntityOpTypeId
   readonly _opType = "put" as const
@@ -331,21 +350,22 @@ export class EntityPutImpl<A, Rec, E, R> implements Pipeable.Pipeable {
   readonly _entity: EntityBase
   readonly _input: globalThis.Record<string, unknown>
   readonly _condition: Expr | ConditionInput | undefined
+  readonly _withVectors: WithVectors | undefined
   constructor(
-    readonly _builder: (
-      mode: DecodeMode,
-      opts: { readonly condition: Expr | ConditionInput | undefined },
-    ) => Effect.Effect<any, E, R>,
+    readonly _builder: (mode: DecodeMode, opts: EntityPutOpts) => Effect.Effect<any, E, R>,
     entity: EntityBase,
     input: globalThis.Record<string, unknown>,
     condition?: Expr | ConditionInput | undefined,
+    withVectors?: WithVectors | undefined,
   ) {
     this._entity = entity
     this._input = input
     this._condition = condition
+    this._withVectors = withVectors
   }
   get _run(): (mode: DecodeMode) => Effect.Effect<any, E, R> {
-    return (mode) => this._builder(mode, { condition: this._condition })
+    return (mode) =>
+      this._builder(mode, { condition: this._condition, withVectors: this._withVectors })
   }
   asEffect(): Effect.Effect<A, E, R> {
     return this._run("model") as Effect.Effect<A, E, R>

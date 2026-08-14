@@ -257,8 +257,53 @@ export const condition: {
   }
   // EntityPut
   const impl = self as unknown as EntityPutImpl<any, any, any, any>
-  return new EntityPutImpl(impl._builder, impl._entity, impl._input, cond) as unknown as T
+  return new EntityPutImpl(
+    impl._builder,
+    impl._entity,
+    impl._input,
+    cond,
+    impl._withVectors,
+  ) as unknown as T
 })
+
+/** @internal Operations that accept a pre-computed embedding. */
+type WithVectorTarget = EntityPut<any, any, any, any> | EntityUpdate<any, any, any, any, any>
+
+/**
+ * Supply a pre-computed embedding for a named vector index, skipping the
+ * `Embedder` for that index on this write.
+ *
+ * The escape hatch for callers who already hold a vector — a batch re-embedding
+ * job, a model whose output is cached, or a test that wants exact control over
+ * ranking. `name` is the LOGICAL vector index name declared on `Entity.make`.
+ *
+ * See `DESIGN.md §14 Write path`.
+ */
+export const withVector: {
+  (name: string, vector: ReadonlyArray<number>): <T extends WithVectorTarget>(self: T) => T
+  <T extends WithVectorTarget>(self: T, name: string, vector: ReadonlyArray<number>): T
+} = Fn.dual(
+  3,
+  <T extends WithVectorTarget>(self: T, name: string, vector: ReadonlyArray<number>): T => {
+    if (EntityUpdateTypeId in self) {
+      const impl = self as unknown as EntityUpdateImpl<any, any, any, any, any>
+      return new EntityUpdateImpl(
+        impl._builder,
+        {
+          ...impl._updateState,
+          withVectors: { ...(impl._updateState.withVectors ?? {}), [name]: vector },
+        },
+        impl._entity,
+        impl._key,
+      ) as unknown as T
+    }
+    const impl = self as unknown as EntityPutImpl<any, any, any, any>
+    return new EntityPutImpl(impl._builder, impl._entity, impl._input, impl._condition, {
+      ...(impl._withVectors ?? {}),
+      [name]: vector,
+    }) as unknown as T
+  },
+)
 
 /** @internal Helper type for returnValues-compatible operations */
 type ReturnValuesTarget = EntityUpdate<any, any, any, any, any> | EntityDelete<any, any>

@@ -34,6 +34,7 @@ import {
   returnValues as returnValuesCombinator,
   set as setCombinator,
   subtract as subtractCombinator,
+  withVector as withVectorCombinator,
 } from "./EntityCombinators.js"
 import type {
   CascadeTarget,
@@ -94,6 +95,12 @@ const buildCondition = <Model>(cfg: BoundCrudConfig<Model>, arg: ConditionArg<Mo
 export interface BoundPut<Model, A, E> extends Pipeable.Pipeable {
   /** Add a condition expression. Callback or shorthand. */
   readonly condition: (cond: ConditionArg<Model>) => BoundPut<Model, A, E>
+  /**
+   * Supply a pre-computed embedding for a named vector index, skipping the
+   * `Embedder` for that index on this write. `name` is the LOGICAL vector index
+   * name declared on `Entity.make({ vectorIndexes })`.
+   */
+  readonly withVector: (name: string, vector: ReadonlyArray<number>) => BoundPut<Model, A, E>
   /** Convert to an executable Effect for Effect combinator interop. */
   readonly asEffect: () => Effect.Effect<A, E, never>
   /** Yield support for `Effect.gen`. */
@@ -111,6 +118,10 @@ export class BoundPutImpl<Model, A, E> implements BoundPut<Model, A, E> {
     const compiled = buildCondition(this._config, cond)
     const next = conditionCombinator(this._op, compiled)
     return new BoundPutImpl(next, this._config)
+  }
+
+  withVector(name: string, vector: ReadonlyArray<number>): BoundPutImpl<Model, A, E> {
+    return new BoundPutImpl(withVectorCombinator(this._op, name, vector), this._config)
   }
 
   asEffect(): Effect.Effect<A, E, never> {
@@ -222,6 +233,12 @@ export interface BoundUpdate<Model, A, U, E> extends Pipeable.Pipeable {
   readonly expectedVersion: (version: number) => BoundUpdate<Model, A, U, E>
   /** Add a condition expression. Callback or shorthand. */
   readonly condition: (cond: ConditionArg<Model>) => BoundUpdate<Model, A, U, E>
+  /**
+   * Supply a pre-computed embedding for a named vector index, skipping the
+   * `Embedder` for that index on this write. `name` is the LOGICAL vector index
+   * name declared on `Entity.make({ vectorIndexes })`.
+   */
+  readonly withVector: (name: string, vector: ReadonlyArray<number>) => BoundUpdate<Model, A, U, E>
   /** Set ReturnValues mode. */
   readonly returnValues: (mode: ReturnValuesMode) => BoundUpdate<Model, A, U, E>
   /** Configure cascade updates to denormalized target entities. */
@@ -312,6 +329,10 @@ export class BoundUpdateImpl<Model, A, U, E> implements BoundUpdate<Model, A, U,
   condition(cond: ConditionArg<Model>): BoundUpdateImpl<Model, A, U, E> {
     const compiled = buildCondition(this._config, cond)
     return this._with(conditionCombinator(this._op, compiled))
+  }
+
+  withVector(name: string, vector: ReadonlyArray<number>): BoundUpdateImpl<Model, A, U, E> {
+    return this._with(withVectorCombinator(this._op, name, vector))
   }
 
   returnValues(mode: ReturnValuesMode): BoundUpdateImpl<Model, A, U, E> {

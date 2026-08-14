@@ -277,6 +277,13 @@ export interface EntityDefinition<
   /** Vector index declarations as authored (see `DESIGN.md §14`). */
   readonly vectorIndexes: TVectorIndexes
 
+  /**
+   * @internal Normalized vector index definitions keyed by logical name. The
+   * runtime package reads these to emit `CreateTable.VectorIndexes`, compose
+   * partition attributes on writes, and build search accessors.
+   */
+  readonly _vectorIndexes: globalThis.Record<string, VectorIndexDefinition>
+
   /** @internal Resolved ref metadata — used by cascade to inspect target entities */
   readonly _resolvedRefs: ReadonlyArray<{
     readonly fieldName: string
@@ -1033,6 +1040,7 @@ const makeDefinitionImpl = (config: {
     timeSeries: config.timeSeries,
     generatedId: config.generatedId,
     vectorIndexes: config.vectorIndexes,
+    _vectorIndexes: data.vectorIndexes,
     _resolvedRefs: data.resolvedRefs.map((r) => ({
       fieldName: r.fieldName,
       idFieldName: r.idFieldName,

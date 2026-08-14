@@ -132,6 +132,7 @@ const MockDynamoClient = Layer.succeed(DynamoClient, {
   batchWriteItem: () => Effect.die("not used"),
   transactGetItems: () => Effect.die("not used"),
   scan: () => Effect.die("not used"),
+  searchVectors: () => Effect.die("not used"),
   createTable: () => Effect.die("not used"),
   deleteTable: () => Effect.die("not used"),
   describeTable: () => Effect.die("not used"),
