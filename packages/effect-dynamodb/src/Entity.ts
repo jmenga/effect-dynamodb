@@ -4201,8 +4201,17 @@ const makeImpl = <
           const values: globalThis.Record<string, AttributeValue> = {}
           let counter = 0
 
-          // Determine primary key composite attribute names
-          const pkComposites = new Set(primaryKeyComposites(config.indexes))
+          // The physical key attributes (`pk` / `sk`) live in `Key` and cannot
+          // appear in an UpdateExpression. The COMPOSITE SOURCE fields are
+          // ordinary attributes and must be written like any other model field —
+          // skipping them (as this path used to) left the stored item without
+          // e.g. `productId`, so every read of an upserted item failed to decode
+          // with `Missing key`. Their values are fixed by the key, so a plain
+          // SET is idempotent.
+          const keyAttributeFields = new Set([
+            config.indexes.primary.pk.field,
+            config.indexes.primary.sk.field,
+          ])
 
           // System-colliding fields are written below in the system-field block
           // (so their semantics — if_not_exists / always-set — stay consistent).
@@ -4216,9 +4225,9 @@ const makeImpl = <
 
           // `item` is already in wire-form via `Schema.encode(inputSchema)`.
 
-          // All model fields (excluding PK composites, which are in the Key)
+          // All model fields (excluding the physical key attributes themselves)
           for (const [attr, val] of Object.entries(item)) {
-            if (pkComposites.has(attr)) continue
+            if (keyAttributeFields.has(resolveDbName(attr))) continue
             if (systemColliders.has(attr)) continue
             if (val === undefined) continue
 
