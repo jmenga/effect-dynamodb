@@ -43,6 +43,7 @@ export default defineConfig({
             { label: "Data Integrity", slug: "guides/data-integrity" },
             { label: "Lifecycle", slug: "guides/lifecycle" },
             { label: "Aggregates & Refs", slug: "guides/aggregates" },
+            { label: "Vector Search", slug: "guides/vector-search" },
             { label: "Geospatial", slug: "guides/geospatial" },
             { label: "DynamoDB Streams", slug: "guides/streams" },
             { label: "Testing", slug: "guides/testing" },
