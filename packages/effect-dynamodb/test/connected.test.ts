@@ -28,6 +28,7 @@ const FROZEN_SECONDS = 1_780_272_000
 
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
@@ -37,6 +38,7 @@ import * as Expression from "../src/Expression.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
+import * as VectorSearchEmulation from "../src/VectorSearchEmulation.js"
 
 // ---------------------------------------------------------------------------
 // Skip if DynamoDB Local is not available
@@ -5128,5 +5130,329 @@ describeConnected("#71/#72 — pure aggregate edges + Pattern B date fields", ()
         )
         expect(DateTime.isDateTime(updated.coach.joinedAt)).toBe(true)
       }).pipe(provideEdd),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Vector search integration (closes #78)
+//
+// DynamoDB Local does NOT implement vector search — CreateTable silently
+// discards `VectorIndexes` and SearchVectors fails with
+// UnknownOperationException. These tests therefore run through
+// `VectorSearchEmulation.layer`, which replaces `searchVectors` with a
+// Scan + brute-force implementation while every other operation (including
+// every write in this suite) hits real DynamoDB Local.
+//
+// That split is exactly what makes the suite valuable: the WRITE half — key
+// composition, embedding, sparse partition attributes, lifecycle stripping —
+// is exercised against a real engine, and only the ANN ranking is simulated.
+// ---------------------------------------------------------------------------
+
+const vecSchema = DynamoSchema.make({ name: "vecapp", version: 1 })
+const vecTableName = "connected-test-vec"
+const VEC_DIMENSIONS = 4
+
+class VecDoc extends Schema.Class<VecDoc>("VecDoc")({
+  docId: Schema.String,
+  tenantId: Schema.String,
+  title: Schema.String,
+  body: Schema.String,
+  category: Schema.String,
+}) {}
+
+const VecDocs = Entity.make({
+  model: VecDoc,
+  entityType: "vecdoc",
+  primaryKey: {
+    pk: { field: "pk", composite: ["tenantId", "docId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  vectorIndexes: {
+    byBody: {
+      name: "vec1",
+      dimensions: VEC_DIMENSIONS,
+      distance: "cosine",
+      source: { fields: ["title", "body"] },
+      partition: ["tenantId"],
+      filters: ["category"],
+    },
+  },
+})
+
+const VecTable = Table.make({ schema: vecSchema, entities: { VecDocs } })
+
+/**
+ * Deterministic 4-dimension embedder keyed on the axis word in the text, so
+ * ranking assertions are exact rather than probabilistic.
+ */
+const vecAxis: Record<string, ReadonlyArray<number>> = {
+  north: [1, 0, 0, 0],
+  east: [0, 1, 0, 0],
+  south: [0, 0, 1, 0],
+  west: [0, 0, 0, 1],
+}
+const AxisEmbedder = Layer.succeed(Embedder, {
+  dimensions: VEC_DIMENSIONS,
+  embed: (text: string) => {
+    const axis = Object.keys(vecAxis).find((key) => text.toLowerCase().includes(key))
+    return Effect.succeed(axis ? vecAxis[axis]! : [1, 1, 1, 1])
+  },
+})
+
+const VecTestLayer = Layer.mergeAll(
+  VectorSearchEmulation.layer(ClientLayer, { tables: { VecTable } }),
+  VecTable.layer({ name: vecTableName }),
+  AxisEmbedder,
+)
+const provideVec = Effect.provide(VecTestLayer)
+
+describeConnected("vector search integration (closes #78)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { VecDocs },
+          tables: { VecTable },
+        })
+        // DynamoDB Local accepts and discards VectorIndexes — create() must not
+        // fail because of them.
+        yield* db.tables.VecTable.create()
+      }).pipe(provideVec, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: vecTableName })
+      }).pipe(
+        provideVec,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("writes embed + partition attributes and searches them back, ranked", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { VecDocs }, tables: { VecTable } })
+
+      yield* db.entities.VecDocs.put({
+        docId: "d-north",
+        tenantId: "t-1",
+        title: "North",
+        body: "north pole",
+        category: "geo",
+      })
+      yield* db.entities.VecDocs.put({
+        docId: "d-east",
+        tenantId: "t-1",
+        title: "East",
+        body: "east coast",
+        category: "geo",
+      })
+
+      const hits = yield* db.entities.VecDocs.byBody("north star")
+        .partition({ tenantId: "t-1" })
+        .collect()
+
+      expect(hits.map((h) => h.item.docId)).toEqual(["d-north", "d-east"])
+      // Cosine: identical → distance 0 → similarity 1; orthogonal → 1 → 0.5.
+      expect(hits[0]!.similarity).toBeCloseTo(1, 5)
+      expect(hits[1]!.similarity).toBeCloseTo(0.5, 5)
+      // The decoded item is a full domain record — no __edd_* leakage.
+      expect(hits[0]!.item.title).toBe("North")
+      expect((hits[0]!.item as Record<string, unknown>).__edd_v_vec1__).toBeUndefined()
+    }).pipe(provideVec),
+  )
+
+  it.effect("the composed partition attribute scopes results per tenant", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { VecDocs }, tables: { VecTable } })
+
+      yield* db.entities.VecDocs.put({
+        docId: "d-shared",
+        tenantId: "t-2",
+        title: "South",
+        body: "south bank",
+        category: "geo",
+      })
+
+      const t2 = yield* db.entities.VecDocs.byBody("south wind")
+        .partition({ tenantId: "t-2" })
+        .collect()
+      expect(t2.map((h) => h.item.docId)).toEqual(["d-shared"])
+
+      const t1 = yield* db.entities.VecDocs.byBody("south wind")
+        .partition({ tenantId: "t-1" })
+        .collect()
+      expect(t1.map((h) => h.item.docId)).not.toContain("d-shared")
+    }).pipe(provideVec),
+  )
+
+  it.effect("inline filters and topK narrow the result set", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { VecDocs }, tables: { VecTable } })
+
+      yield* db.entities.VecDocs.put({
+        docId: "d-west-geo",
+        tenantId: "t-3",
+        title: "West",
+        body: "west end",
+        category: "geo",
+      })
+      yield* db.entities.VecDocs.put({
+        docId: "d-west-lit",
+        tenantId: "t-3",
+        title: "West",
+        body: "west wing",
+        category: "literature",
+      })
+
+      const filtered = yield* db.entities.VecDocs.byBody("west side")
+        .partition({ tenantId: "t-3" })
+        .filter({ category: "literature" })
+        .collect()
+      expect(filtered.map((h) => h.item.docId)).toEqual(["d-west-lit"])
+
+      const limited = yield* db.entities.VecDocs.byBody("west side")
+        .partition({ tenantId: "t-3" })
+        .topK(1)
+        .collect()
+      expect(limited).toHaveLength(1)
+    }).pipe(provideVec),
+  )
+
+  it.effect("update re-embeds only when a source field is in the payload", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { VecDocs }, tables: { VecTable } })
+
+      // The title carries no axis word, so the embedding is decided purely by
+      // `body` — which is what makes the "partial source ⇒ read-and-merge"
+      // behaviour observable below.
+      yield* db.entities.VecDocs.put({
+        docId: "d-move",
+        tenantId: "t-4",
+        title: "Marker",
+        body: "north pole",
+        category: "geo",
+      })
+
+      // Touching a non-source field must leave the vector alone.
+      yield* db.entities.VecDocs.update({ tenantId: "t-4", docId: "d-move" }).set({
+        category: "science",
+      })
+      const stillNorth = yield* db.entities.VecDocs.byBody("north star")
+        .partition({ tenantId: "t-4" })
+        .collect()
+      expect(stillNorth[0]!.similarity).toBeCloseTo(1, 5)
+
+      // Touching a source field re-embeds — the doc moves to the east axis.
+      yield* db.entities.VecDocs.update({ tenantId: "t-4", docId: "d-move" }).set({
+        body: "east coast",
+      })
+      const nowEast = yield* db.entities.VecDocs.byBody("east wind")
+        .partition({ tenantId: "t-4" })
+        .collect()
+      expect(nowEast[0]!.similarity).toBeCloseTo(1, 5)
+    }).pipe(provideVec),
+  )
+
+  it.effect(".withVector stores a pre-computed embedding verbatim", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { VecDocs }, tables: { VecTable } })
+
+      yield* db.entities.VecDocs.put({
+        docId: "d-manual",
+        tenantId: "t-5",
+        title: "Anything",
+        body: "anything at all",
+        category: "geo",
+      }).withVector("byBody", [0, 0, 0, 1])
+
+      const hits = yield* db.entities.VecDocs.byBody([0, 0, 0, 1])
+        .partition({ tenantId: "t-5" })
+        .collect()
+      expect(hits[0]!.item.docId).toBe("d-manual")
+      expect(hits[0]!.similarity).toBeCloseTo(1, 5)
+    }).pipe(provideVec),
+  )
+
+  it.effect("deleting an item removes it from the index (sparse semantics)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { VecDocs }, tables: { VecTable } })
+
+      yield* db.entities.VecDocs.put({
+        docId: "d-gone",
+        tenantId: "t-6",
+        title: "South",
+        body: "south side",
+        category: "geo",
+      })
+      yield* db.entities.VecDocs.delete({ tenantId: "t-6", docId: "d-gone" })
+
+      const hits = yield* db.entities.VecDocs.byBody("south side")
+        .partition({ tenantId: "t-6" })
+        .collect()
+      expect(hits).toHaveLength(0)
+    }).pipe(provideVec),
+  )
+
+  it.effect("select() returns a projected item without library-managed attributes", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { VecDocs }, tables: { VecTable } })
+
+      yield* db.entities.VecDocs.put({
+        docId: "d-proj",
+        tenantId: "t-7",
+        title: "East",
+        body: "east gate",
+        category: "geo",
+      })
+
+      const hits = yield* db.entities.VecDocs.byBody("east gate")
+        .partition({ tenantId: "t-7" })
+        .select(["docId", "title"])
+        .collect()
+      expect(hits[0]!.item).toEqual({ docId: "d-proj", title: "East" })
+    }).pipe(provideVec),
+  )
+
+  it.effect("reembed rewrites stale vectors in place", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { VecDocs }, tables: { VecTable } })
+
+      // Write a deliberately wrong embedding, then let reembed correct it from
+      // the declared source fields.
+      yield* db.entities.VecDocs.put({
+        docId: "d-stale",
+        tenantId: "t-8",
+        title: "West",
+        body: "west gate",
+        category: "geo",
+      }).withVector("byBody", [1, 0, 0, 0])
+
+      const before = yield* db.entities.VecDocs.byBody("west gate")
+        .partition({ tenantId: "t-8" })
+        .collect()
+      expect(before[0]!.similarity).toBeCloseTo(0.5, 5)
+
+      yield* db.entities.VecDocs.reembed({ concurrency: 2 })
+
+      const after = yield* db.entities.VecDocs.byBody("west gate")
+        .partition({ tenantId: "t-8" })
+        .collect()
+      expect(after[0]!.similarity).toBeCloseTo(1, 5)
+    }).pipe(provideVec),
+  )
+
+  it.effect("waitForVectorIndex resolves immediately where the engine has no vector indexes", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { VecDocs }, tables: { VecTable } })
+      // DynamoDB Local reports no VectorIndexes at all; the poller treats that
+      // as "nothing to wait for" rather than blocking for the full timeout.
+      yield* db.tables.VecTable.waitForVectorIndex("vec1", { timeout: Duration.seconds(5) })
+    }).pipe(provideVec),
   )
 })
