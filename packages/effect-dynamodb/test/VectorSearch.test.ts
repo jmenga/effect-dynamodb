@@ -66,10 +66,21 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Products } })
 
 /** A fixed 4-dimension embedder so ranking assertions are exact. */
 const fixedVectors: Record<string, ReadonlyArray<number>> = {}
+const setVector = (text: string, vector: ReadonlyArray<number>): void => {
+  fixedVectors[text] = vector
+}
 const FixedEmbedder = Layer.succeed(Embedder, {
   dimensions: DIMENSIONS,
   embed: (text: string) => Effect.succeed(fixedVectors[text] ?? [1, 0, 0, 0]),
 })
+
+/**
+ * The developer guide's third reference vector, written the way the guide
+ * writes it (4 dp) rather than as `Math.SQRT1_2`, so the fixture can be checked
+ * against the published table character for character.
+ */
+// biome-ignore lint/suspicious/noApproximativeNumericConstant: matches the published reference table verbatim
+const GUIDE_DIAGONAL: ReadonlyArray<number> = [0.7071, 0.7071, 0, 0]
 
 const VECTOR_ATTR = "__edd_v_vec1__"
 const PARTITION_ATTR = "__edd_vp_vec1__"
@@ -162,7 +173,7 @@ describe("VectorSearchEmulation distance functions", () => {
   const stored = {
     identical: [1, 0, 0, 0],
     scaled: [10, 0, 0, 0],
-    diagonal: [0.7071, 0.7071, 0, 0],
+    diagonal: GUIDE_DIAGONAL,
     opposite: [-1, 0, 0, 0],
   } as const
 
@@ -208,7 +219,7 @@ describe("VectorSearchEmulation distance functions", () => {
 describe("vector search write path", () => {
   it.effect("put writes the embedding and the composed partition attribute", () => {
     const capture: Capture = {}
-    fixedVectors["Trail Boot Waterproof hiking boot"] = [0, 1, 0, 0]
+    setVector("Trail Boot Waterproof hiking boot", [0, 1, 0, 0])
     return Effect.gen(function* () {
       const db = yield* DynamoClient.make({
         entities: { Products },
@@ -323,7 +334,7 @@ describe("vector search write path", () => {
 
   it.effect("update re-embeds when the payload touches a source field", () => {
     const capture: Capture = {}
-    fixedVectors["Trail Boot Now with GORE-TEX"] = [0, 0, 1, 0]
+    setVector("Trail Boot Now with GORE-TEX", [0, 0, 1, 0])
     return Effect.gen(function* () {
       const db = yield* DynamoClient.make({
         entities: { Products },
@@ -398,10 +409,10 @@ describe("vector search read path", () => {
       scanItems: [
         storedItem("far", "footwear", [-1, 0, 0, 0]),
         storedItem("near", "footwear", [1, 0, 0, 0]),
-        storedItem("mid", "footwear", [0.7071, 0.7071, 0, 0]),
+        storedItem("mid", "footwear", GUIDE_DIAGONAL),
       ],
     }
-    fixedVectors["hiking boots"] = [1, 0, 0, 0]
+    setVector("hiking boots", [1, 0, 0, 0])
     return Effect.gen(function* () {
       const db = yield* DynamoClient.make({
         entities: { Products },
@@ -427,7 +438,7 @@ describe("vector search read path", () => {
         storedItem("theirs", "footwear", [1, 0, 0, 0], "t-2"),
       ],
     }
-    fixedVectors["boots"] = [1, 0, 0, 0]
+    setVector("boots", [1, 0, 0, 0])
     return Effect.gen(function* () {
       const db = yield* DynamoClient.make({
         entities: { Products },
@@ -447,7 +458,7 @@ describe("vector search read path", () => {
         storedItem("mug", "kitchen", [1, 0, 0, 0]),
       ],
     }
-    fixedVectors["anything"] = [1, 0, 0, 0]
+    setVector("anything", [1, 0, 0, 0])
     return Effect.gen(function* () {
       const db = yield* DynamoClient.make({
         entities: { Products },
@@ -469,7 +480,7 @@ describe("vector search read path", () => {
         storedItem("c", "footwear", [0.8, 0.2, 0, 0]),
       ],
     }
-    fixedVectors["x"] = [1, 0, 0, 0]
+    setVector("x", [1, 0, 0, 0])
     return Effect.gen(function* () {
       const db = yield* DynamoClient.make({
         entities: { Products },
@@ -518,7 +529,7 @@ describe("vector search read path", () => {
     const capture: Capture = {
       scanItems: [storedItem("only", "footwear", [1, 0, 0, 0])],
     }
-    fixedVectors["x"] = [1, 0, 0, 0]
+    setVector("x", [1, 0, 0, 0])
     return Effect.gen(function* () {
       const db = yield* DynamoClient.make({
         entities: { Products },
@@ -538,7 +549,7 @@ describe("vector search read path", () => {
     const capture: Capture = {
       scanItems: [withoutVector, storedItem("hasvec", "footwear", [1, 0, 0, 0])],
     }
-    fixedVectors["x"] = [1, 0, 0, 0]
+    setVector("x", [1, 0, 0, 0])
     return Effect.gen(function* () {
       const db = yield* DynamoClient.make({
         entities: { Products },
@@ -553,7 +564,7 @@ describe("vector search read path", () => {
 
   it.effect("sends a bare N-array as SearchVector, not an L-wrapped list", () => {
     const capture: Capture = {}
-    fixedVectors["x"] = [1, 0, 0, 0]
+    setVector("x", [1, 0, 0, 0])
     return Effect.gen(function* () {
       const db = yield* DynamoClient.make({
         entities: { Products },
@@ -699,7 +710,7 @@ const transactPuts = (capture: Capture): Array<Record<string, AttributeValue>> =
 describe("vector search lifecycle integration", () => {
   it.effect("version snapshots strip the vector and partition attributes", () => {
     const capture: Capture = {}
-    fixedVectors["Trail Boot Now drier"] = [0, 1, 0, 0]
+    setVector("Trail Boot Now drier", [0, 1, 0, 0])
     return Effect.gen(function* () {
       const db = yield* DynamoClient.make({
         entities: { LifecycleProducts },
