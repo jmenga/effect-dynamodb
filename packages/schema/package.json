@@ -1,6 +1,6 @@
 {
   "name": "@effect-dynamodb/schema",
-  "version": "1.9.5",
+  "version": "1.10.0",
   "description": "Pure Effect Schema-driven entity/aggregate modeling and relationship derivation for effect-dynamodb — importable without @aws-sdk",
   "type": "module",
   "license": "MIT",
@@ -58,12 +58,12 @@
     "lint:fix": "biome check --write ."
   },
   "peerDependencies": {
-    "effect": "^4.0.0-beta.85"
+    "effect": "^4.0.0-rc.109"
   },
   "devDependencies": {
-    "@effect/vitest": "4.0.0-beta.85",
+    "@effect/vitest": "4.0.0-rc.109",
     "@types/node": "^25.5.0",
-    "effect": "4.0.0-beta.85",
+    "effect": "4.0.0-rc.109",
     "typescript": "^5.7.0",
     "vitest": "^4.1.0"
   }

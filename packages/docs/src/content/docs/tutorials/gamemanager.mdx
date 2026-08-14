@@ -33,8 +33,8 @@ pnpm init
 ### 1.2 Install dependencies
 
 ```bash
-pnpm add effect@4.0.0-beta.43 @effect/platform-node@4.0.0-beta.43 effect-dynamodb ulid
-pnpm add -D typescript@^5.9.0 tsx vitest@^4.1.0 @effect/vitest@4.0.0-beta.43 @biomejs/biome@^2.4.4
+pnpm add effect@4.0.0-rc.109 @effect/platform-node@4.0.0-rc.109 effect-dynamodb ulid
+pnpm add -D typescript@^5.9.0 tsx vitest@^4.1.0 @effect/vitest@4.0.0-rc.109 @biomejs/biome@^2.4.4
 ```
 
 ### 1.3 Language Service Plugin
@@ -373,28 +373,28 @@ Key patterns:
 // src/api/ApiErrors.ts
 import { Schema } from "effect"
 
-export class ApiNotFound extends Schema.ErrorClass<ApiNotFound>("ApiNotFound")({
+export class ApiNotFound extends Schema.Error<ApiNotFound>("ApiNotFound")({
   error: Schema.Literal("NotFound"),
   message: Schema.String,
 }, { httpApiStatus: 404 }) {}
 
-export class ApiBadRequest extends Schema.ErrorClass<ApiBadRequest>("ApiBadRequest")({
+export class ApiBadRequest extends Schema.Error<ApiBadRequest>("ApiBadRequest")({
   error: Schema.Literal("BadRequest"),
   message: Schema.String,
 }, { httpApiStatus: 400 }) {}
 
-export class ApiConflict extends Schema.ErrorClass<ApiConflict>("ApiConflict")({
+export class ApiConflict extends Schema.Error<ApiConflict>("ApiConflict")({
   error: Schema.Literal("Conflict"),
   message: Schema.String,
 }, { httpApiStatus: 409 }) {}
 
-export class ApiUnprocessableEntity extends Schema.ErrorClass<ApiUnprocessableEntity>("ApiUnprocessableEntity")({
+export class ApiUnprocessableEntity extends Schema.Error<ApiUnprocessableEntity>("ApiUnprocessableEntity")({
   error: Schema.Literal("UnprocessableEntity"),
   message: Schema.String,
 }, { httpApiStatus: 422 }) {}
 ```
 
-> **Concept: Schema.ErrorClass for API errors** — Each error uses `Schema.ErrorClass` — the idiomatic Effect v4 pattern for HTTP API errors. The second argument sets class-level annotations including `httpApiStatus`. This gives you proper Error instances with constructors (`new ApiNotFound({ error: "NotFound", message: "..." })`), clean JSON responses (no `_tag` in the wire format), and status-code-based discrimination — the HttpApi client dispatches by HTTP status code, not by `_tag`, so each error just needs a unique status.
+> **Concept: Schema.Error for API errors** — Each error uses `Schema.Error` — the idiomatic Effect v4 pattern for HTTP API errors. The second argument sets class-level annotations including `httpApiStatus`. This gives you proper Error instances with constructors (`new ApiNotFound({ error: "NotFound", message: "..." })`), clean JSON responses (no `_tag` in the wire format), and status-code-based discrimination — the HttpApi client dispatches by HTTP status code, not by `_tag`, so each error just needs a unique status.
 
 ### 2.9 TeamsApi endpoint definitions
 
@@ -2757,7 +2757,7 @@ You now have the complete cricket match management system running — with CRUD 
 | **Aggregate cursor optic** | Targeted in-place mutation inside `update` | MatchService update |
 | **Table.definition (aggregates)** | Include aggregate GSIs in table creation | create-table.ts |
 | **AggregateAssemblyError** | Error when aggregate partition has no items | MatchesHandler not-found |
-| **Schema.ErrorClass API errors** | Typed HTTP errors with constructors, status codes, clean JSON | ApiErrors.ts |
+| **Schema.Error API errors** | Typed HTTP errors with constructors, status codes, clean JSON | ApiErrors.ts |
 | **Effect.catchTag** | Convert domain errors to HTTP errors | App.ts error helpers |
 | **Layer composition** | Wire everything together at runtime | App.ts, server.ts |
 

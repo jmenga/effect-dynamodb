@@ -13,7 +13,7 @@
  * See docs/design-dynamo-model.md for the three-layer model (wire → domain → storage).
  */
 
-import { DateTime, Effect, Option, Schema, SchemaAST, SchemaGetter, SchemaIssue } from "effect"
+import { DateTime, Effect, Schema, SchemaAST, SchemaGetter, SchemaIssue } from "effect"
 import {
   getSchemaFields,
   recordValueAst,
@@ -259,9 +259,7 @@ export const DateEpochMs = Schema.Number.pipe(
 export const DateEpochSeconds = Schema.Number.pipe(
   Schema.decodeTo(Schema.DateTimeUtc, {
     decode: SchemaGetter.transform((n: number) => DateTime.makeUnsafe(n * 1000)),
-    encode: SchemaGetter.transform((dt: DateTime.Utc) =>
-      Math.floor(DateTime.toEpochMillis(dt) / 1000),
-    ),
+    encode: SchemaGetter.transform((dt: DateTime.Utc) => DateTime.toEpochSeconds(dt)),
   }),
   Schema.annotate({
     [DynamoEncodingKey]: {
@@ -312,7 +310,7 @@ export const DateEpoch = (options: {
         } catch {
           // fall through
         }
-        return Effect.fail(new SchemaIssue.InvalidType(Schema.Number.ast, Option.some(n)))
+        return Effect.fail(new SchemaIssue.InvalidType(Schema.Number.ast, n))
       }),
       encode: SchemaGetter.transform((dt: DateTime.Utc) =>
         Schema.encodeSync(encodeSchema)(dt as any),
@@ -351,7 +349,7 @@ export const DateTimeZoned = Schema.String.pipe(
           const utc = DateTime.makeUnsafe(dateStr)
           return Effect.succeed(DateTime.makeZonedUnsafe(utc, { timeZone: tzName }))
         } catch {
-          return Effect.fail(new SchemaIssue.InvalidType(Schema.String.ast, Option.some(s)))
+          return Effect.fail(new SchemaIssue.InvalidType(Schema.String.ast, s))
         }
       }
       // Try parsing as offset-only: "2024-01-01T15:00:00+09:00"
@@ -359,7 +357,7 @@ export const DateTimeZoned = Schema.String.pipe(
         const utc = DateTime.makeUnsafe(s)
         return Effect.succeed(DateTime.makeZonedUnsafe(utc, { timeZone: "UTC" }))
       } catch {
-        return Effect.fail(new SchemaIssue.InvalidType(Schema.String.ast, Option.some(s)))
+        return Effect.fail(new SchemaIssue.InvalidType(Schema.String.ast, s))
       }
     }),
     encode: SchemaGetter.transform((dt: DateTime.Zoned) => DateTime.formatIsoZoned(dt)),
@@ -380,7 +378,7 @@ export const DateTimeZoned = Schema.String.pipe(
  * For interop with non-Effect code that expects native JS Date objects.
  */
 export const UnsafeDateString = Schema.String.pipe(
-  Schema.decodeTo(Schema.DateValid, {
+  Schema.decodeTo(Schema.Date, {
     decode: SchemaGetter.transform((s: string) => new Date(s)),
     encode: SchemaGetter.transform((d: Date) => d.toISOString()),
   }),
@@ -395,7 +393,7 @@ export const UnsafeDateString = Schema.String.pipe(
  * Default storage: epoch ms (`N`).
  */
 export const UnsafeDateEpochMs = Schema.Number.pipe(
-  Schema.decodeTo(Schema.DateValid, {
+  Schema.decodeTo(Schema.Date, {
     decode: SchemaGetter.transform((ms: number) => new Date(ms)),
     encode: SchemaGetter.transform((d: Date) => d.getTime()),
   }),
@@ -410,7 +408,7 @@ export const UnsafeDateEpochMs = Schema.Number.pipe(
  * Default storage: epoch seconds (`N`).
  */
 export const UnsafeDateEpochSeconds = Schema.Number.pipe(
-  Schema.decodeTo(Schema.DateValid, {
+  Schema.decodeTo(Schema.Date, {
     decode: SchemaGetter.transform((s: number) => new Date(s * 1000)),
     encode: SchemaGetter.transform((d: Date) => Math.floor(d.getTime() / 1000)),
   }),
