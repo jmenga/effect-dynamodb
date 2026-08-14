@@ -369,7 +369,14 @@ export const buildEntityDefinition = (config: {
   const configured = isConfiguredModel(config.model) ? config.model : undefined
   const rawModel = configured ? configured.model : (config.model as Schema.Top)
   const configuredAttributes = configured?.attributes ?? {}
-  const isSchemaClass = typeof rawModel === "function"
+  // Schema.Class is a constructable function whose AST is a `Declaration`.
+  // The `typeof` check alone is not enough: since Effect 4.0.0-rc,
+  // `Schema.Struct(...)` is also a function (callable make), but its AST is
+  // `Objects` — treating it as a class would run `new Struct(decoded)` on the
+  // decode path and silently produce empty objects.
+  const isSchemaClass =
+    typeof rawModel === "function" &&
+    (rawModel.ast as { readonly _tag?: string })._tag === "Declaration"
   const modelFields = getFields(rawModel)
   const hasHiddenFields = Object.values(modelFields).some(isHidden)
   const systemFields = resolveSystemFields(

@@ -27,6 +27,7 @@ import {
 } from "@effect-dynamodb/schema/Errors.js"
 import {
   buildDateTransform,
+  matchDateRepresentation,
   substituteSchemaDeep,
   validateNoTransformOverride,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
@@ -485,36 +486,6 @@ type ASTNode = Record<string, unknown> & {
 }
 
 /**
- * Try to match a date encoding from a SchemaAST.resolve() result.
- * SchemaAST.resolve flattens annotations to the top level (typeConstructor, meta).
- */
-const matchResolvedDateAST = (resolved: ASTNode): DynamoEncoding | undefined => {
-  const tc = resolved.typeConstructor as { _tag?: string } | undefined
-  if (tc?._tag === "effect/DateTime.Utc") return { storage: "string", domain: "DateTime.Utc" }
-  if (tc?._tag === "effect/DateTime.Zoned") return { storage: "string", domain: "DateTime.Zoned" }
-  if (tc?._tag === "Date") return { storage: "string", domain: "Date" }
-  const meta = resolved.meta as { _tag?: string } | undefined
-  if (meta?._tag === "isDateValid") return { storage: "string", domain: "Date" }
-  return undefined
-}
-
-/**
- * Try to match a date encoding from a raw AST member (Union type member).
- * Raw AST nodes have annotations nested under .annotations (not flattened).
- */
-const matchRawDateAST = (node: ASTNode): DynamoEncoding | undefined => {
-  const ann = node.annotations as Record<string, unknown> | undefined
-  if (!ann) return undefined
-  const tc = ann.typeConstructor as { _tag?: string } | undefined
-  if (tc?._tag === "effect/DateTime.Utc") return { storage: "string", domain: "DateTime.Utc" }
-  if (tc?._tag === "effect/DateTime.Zoned") return { storage: "string", domain: "DateTime.Zoned" }
-  if (tc?._tag === "Date") return { storage: "string", domain: "Date" }
-  const meta = ann.meta as { _tag?: string } | undefined
-  if (meta?._tag === "isDateValid") return { storage: "string", domain: "Date" }
-  return undefined
-}
-
-/**
  * Infer date encoding from a schema AST, handling Schema.optional() wrappers.
  * Optional fields have Union AST with [InnerType, Undefined] — unwrap to find dates.
  */
@@ -522,7 +493,7 @@ const inferDateEncoding = (ast: Schema.Top["ast"]): DynamoEncoding | undefined =
   // Try SchemaAST.resolve first (works for non-optional date fields)
   const resolved = SchemaAST.resolve(ast) as ASTNode | undefined
   if (resolved) {
-    const direct = matchResolvedDateAST(resolved)
+    const direct = matchDateRepresentation(resolved)
     if (direct) return direct
   }
   // Handle optional wrapper: Union with Undefined + inner type.
@@ -536,11 +507,11 @@ const inferDateEncoding = (ast: Schema.Top["ast"]): DynamoEncoding | undefined =
         | ASTNode
         | undefined
       if (memberResolved) {
-        const enc = matchResolvedDateAST(memberResolved)
+        const enc = matchDateRepresentation(memberResolved)
         if (enc) return enc
       }
-      // Fallback: check raw member annotations
-      const enc = matchRawDateAST(member)
+      // Fallback: check raw member annotations (same record shape, nested under .annotations)
+      const enc = matchDateRepresentation(member.annotations)
       if (enc) return enc
     }
   }

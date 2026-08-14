@@ -4,16 +4,7 @@
  * Extracted from Entity.ts for decomposition. Not part of the public API.
  */
 
-import {
-  DateTime,
-  Effect,
-  Option,
-  Redacted,
-  Schema,
-  SchemaAST,
-  SchemaGetter,
-  SchemaIssue,
-} from "effect"
+import { DateTime, Effect, Redacted, Schema, SchemaAST, SchemaGetter, SchemaIssue } from "effect"
 import {
   type ConfiguredModel,
   type DynamoEncoding,
@@ -300,24 +291,37 @@ export const getFields = (model: Schema.Top): SchemaFields => {
 }
 
 /**
+ * Match a date DynamoEncoding from a schema AST annotation record. Effect RC
+ * identifies declaration schemas via the `representation` annotation
+ * (`{ id: "effect/schema/<Name>" }`); both `SchemaAST.resolve()` results and
+ * raw `ast.annotations` records carry it, so one matcher serves both shapes.
+ */
+export const matchDateRepresentation = (
+  annotations: globalThis.Record<string, unknown> | undefined,
+): DynamoEncoding | undefined => {
+  const rep = annotations?.representation as { id?: string } | undefined
+  switch (rep?.id) {
+    case "effect/schema/DateTimeUtc":
+      return { storage: "string", domain: "DateTime.Utc" }
+    case "effect/schema/DateTimeZoned":
+      return { storage: "string", domain: "DateTime.Zoned" }
+    case "effect/schema/Date":
+      return { storage: "string", domain: "Date" }
+    default:
+      return undefined
+  }
+}
+
+/**
  * Infer a default DynamoEncoding for standard Effect date schemas that lack
  * an explicit DynamoEncoding annotation. This enables Pattern B (pure model
  * with Schema.DateTimeUtcFromString etc.) to work without explicit storedAs.
  *
- * Detection uses the typeConstructor annotation from Effect's schema AST.
+ * Detection uses the `representation` annotation from Effect's schema AST.
  */
 export const inferDefaultEncoding = (schema: Schema.Top): DynamoEncoding | undefined => {
   const resolved = SchemaAST.resolve(schema.ast) as globalThis.Record<string, unknown> | undefined
-  if (!resolved) return undefined
-  const tc = resolved.typeConstructor as { _tag?: string } | undefined
-  if (tc?._tag === "effect/DateTime.Utc") return { storage: "string", domain: "DateTime.Utc" }
-  if (tc?._tag === "effect/DateTime.Zoned") return { storage: "string", domain: "DateTime.Zoned" }
-  // Native Date: `Schema.Date` exposes typeConstructor `{ _tag: "Date" }`;
-  // `Schema.DateValid` exposes the `isDateValid` meta annotation. Detect both.
-  if (tc?._tag === "Date") return { storage: "string", domain: "Date" }
-  const meta = resolved.meta as { _tag?: string } | undefined
-  if (meta?._tag === "isDateValid") return { storage: "string", domain: "Date" }
-  return undefined
+  return matchDateRepresentation(resolved)
 }
 
 // ---------------------------------------------------------------------------
@@ -425,7 +429,7 @@ export const buildDateTransform = (encoding: DynamoEncoding): Schema.Top => {
       case "DateTime.Zoned":
         return Schema.DateTimeZoned as unknown as Schema.Top
       case "Date":
-        return Schema.DateValid as unknown as Schema.Top
+        return Schema.Date as unknown as Schema.Top
     }
   })()
   const liftToDomain = (value: unknown): unknown => {
@@ -476,14 +480,14 @@ export const buildDateTransform = (encoding: DynamoEncoding): Schema.Top => {
         try {
           return Effect.succeed(liftToDomain(value))
         } catch {
-          return Effect.fail(new SchemaIssue.InvalidType(Schema.Any.ast, Option.some(value)))
+          return Effect.fail(new SchemaIssue.InvalidType(Schema.Any.ast, value))
         }
       }),
       encode: SchemaGetter.transformOrFail((value: unknown) => {
         try {
           return Effect.succeed(toWirePrimitive(value, encoding))
         } catch {
-          return Effect.fail(new SchemaIssue.InvalidType(Schema.Any.ast, Option.some(value)))
+          return Effect.fail(new SchemaIssue.InvalidType(Schema.Any.ast, value))
         }
       }),
     } as any),
@@ -503,10 +507,8 @@ export const buildDateTransform = (encoding: DynamoEncoding): Schema.Top => {
  * Redacted-typed schema, otherwise undefined.
  */
 const tryGetRedactedInner = (schema: Schema.Top): Schema.Top | undefined => {
-  const resolved = SchemaAST.resolve(schema.ast) as
-    | { typeConstructor?: { _tag?: string } }
-    | undefined
-  if (resolved?.typeConstructor?._tag !== "effect/Redacted") return undefined
+  const resolved = SchemaAST.resolve(schema.ast) as { representation?: { id?: string } } | undefined
+  if (resolved?.representation?.id !== "effect/schema/Redacted") return undefined
   // The decoded type is `Redacted<T>` where the inner schema is the first type
   // parameter. `firstTypeParameterAst` isolates that single untyped AST read
   // (no public accessor exists); we then rebuild a fully-functional Schema via
@@ -551,9 +553,15 @@ const buildRedactedSubstitute = (inner: Schema.Top): Schema.Top => {
 const schemaFieldsOf = (schema: Schema.Top): SchemaFields | undefined =>
   (schema as unknown as { readonly fields?: SchemaFields }).fields
 
-/** True when the schema is a Schema.Class (a constructable function carrying fields). */
+/**
+ * True when the schema is a Schema.Class (a constructable function carrying
+ * fields whose AST is a `Declaration`). The AST check matters: since Effect
+ * 4.0.0-rc, `Schema.Struct(...)` is also a function, but its AST is `Objects`.
+ */
 const isClassSchema = (schema: Schema.Top): boolean =>
-  typeof schema === "function" && schemaFieldsOf(schema) !== undefined
+  typeof schema === "function" &&
+  schemaFieldsOf(schema) !== undefined &&
+  (schema.ast as { readonly _tag?: string })._tag === "Declaration"
 
 /** True when the schema is `Schema.Array(...)` (AST tag `Arrays`). */
 const isArraySchema = (schema: Schema.Top): boolean =>

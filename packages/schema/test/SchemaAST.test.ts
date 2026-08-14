@@ -26,14 +26,14 @@ describe("SchemaAST canary tests", () => {
       expect(enc).toEqual({ storage: "string", domain: "DateTime.Utc" })
     })
 
-    it("has typeConstructor._tag === 'effect/DateTime.Utc' via SchemaAST.resolve", () => {
+    it("has representation.id === 'effect/schema/DateTimeUtc' via SchemaAST.resolve", () => {
       const resolved = SchemaAST.resolve(Schema.DateTimeUtcFromString.ast) as Record<
         string,
         unknown
       >
       expect(resolved).toBeDefined()
-      const tc = resolved.typeConstructor as { _tag: string }
-      expect(tc._tag).toBe("effect/DateTime.Utc")
+      const rep = resolved.representation as { id: string }
+      expect(rep.id).toBe("effect/schema/DateTimeUtc")
     })
   })
 
@@ -43,27 +43,28 @@ describe("SchemaAST canary tests", () => {
       expect(enc).toEqual({ storage: "string", domain: "DateTime.Zoned" })
     })
 
-    it("has typeConstructor._tag === 'effect/DateTime.Zoned' via SchemaAST.resolve", () => {
+    it("has representation.id === 'effect/schema/DateTimeZoned' via SchemaAST.resolve", () => {
       const resolved = SchemaAST.resolve(Schema.DateTimeZoned.ast) as Record<string, unknown>
       expect(resolved).toBeDefined()
-      const tc = resolved.typeConstructor as { _tag: string }
-      expect(tc._tag).toBe("effect/DateTime.Zoned")
+      const rep = resolved.representation as { id: string }
+      expect(rep.id).toBe("effect/schema/DateTimeZoned")
     })
   })
 
   describe("Schema.Date detection", () => {
-    it("Schema.DateValid has meta._tag === 'isDateValid' via SchemaAST.resolve", () => {
-      // Schema.DateValid is the "from self" Date schema used in _EntitySchemas.ts
-      // The isDateValid meta is on the declaration, not the Date codec transform
-      const resolved = SchemaAST.resolve(Schema.DateValid.ast) as Record<string, unknown>
+    it("Schema.Date has representation.id === 'effect/schema/Date' via SchemaAST.resolve", () => {
+      // Schema.Date is the "from self" Date schema used in _EntitySchemas.ts.
+      // Since 4.0.0-rc it rejects invalid dates itself (Schema.DateValid was
+      // removed) and is identified via the `representation` annotation.
+      const resolved = SchemaAST.resolve(Schema.Date.ast) as Record<string, unknown>
       expect(resolved).toBeDefined()
-      const meta = resolved.meta as { _tag: string }
-      expect(meta._tag).toBe("isDateValid")
+      const rep = resolved.representation as { id: string }
+      expect(rep.id).toBe("effect/schema/Date")
     })
 
-    it("inferDefaultEncoding detects Date from Schema.DateValid", () => {
-      // Schema.DateValid is what _EntitySchemas uses for Date detection
-      const enc = inferDefaultEncoding(Schema.DateValid)
+    it("inferDefaultEncoding detects Date from Schema.Date", () => {
+      // Schema.Date is what _EntitySchemas uses for Date detection
+      const enc = inferDefaultEncoding(Schema.Date)
       expect(enc).toEqual({ storage: "string", domain: "Date" })
     })
   })
@@ -305,6 +306,19 @@ describe("AST-shape probe (loud canary for Effect beta drift)", () => {
     class C extends Schema.Class<C>("C")({ x: Schema.Number }) {}
     expect("fields" in C).toBe(true)
     expect(typeof C.fields).toBe("object")
+  })
+
+  it("Class AST is a Declaration; Struct AST is Objects (isSchemaClass discriminator)", () => {
+    // Since 4.0.0-rc `Schema.Struct(...)` is ALSO a function, so `typeof`
+    // alone cannot distinguish a Schema.Class from a Struct. The derivation
+    // layer discriminates on the AST tag — if either tag changes, the decode
+    // path would `new Struct(decoded)` and silently return empty objects.
+    const struct = Schema.Struct({ a: Schema.String })
+    class C extends Schema.Class<C>("C")({ x: Schema.Number }) {}
+    expect(typeof struct).toBe("function")
+    expect(typeof C).toBe("function")
+    expect((struct.ast as { _tag: string })._tag).toBe("Objects")
+    expect((C.ast as { _tag: string })._tag).toBe("Declaration")
   })
 
   it("Record AST is an Objects node with empty propertySignatures + one indexSignature", () => {

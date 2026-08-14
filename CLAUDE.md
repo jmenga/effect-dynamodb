@@ -1,12 +1,12 @@
 # CLAUDE.md — Effect DynamoDB ORM
 
-> **Version:** This project targets **Effect v4** (beta as of 2026-02). Some v4 APIs live under `effect/unstable/*` during beta and may change in minor releases. The v3 codebase is preserved at git tag `effect-dynamodb-v3`.
+> **Version:** This project targets **Effect v4** (4.0.0-rc as of 2026-08 — release candidate, published from the main [Effect-TS/effect](https://github.com/Effect-TS/effect) repo). Some v4 APIs still live under `effect/unstable/*` and may change before stable. The v3 codebase is preserved at git tag `effect-dynamodb-v3`.
 
 ## Project Overview
 
 Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, composite key composition from entity attributes, type-safe index-aware queries with Stream-based pagination, and DynamoClient as an Effect Service with Layer-based dependency injection.
 
-**Status:** All modules implemented. 852 core tests, 56 geo tests, 61 connected tests, 59 language-service tests, 44 doctest tests, 17 examples.
+**Status:** All modules implemented. 940 core tests, 251 schema tests, 56 geo tests, 132 connected tests, 71 language-service tests, 47 doctest tests, 34 examples.
 **Design:** `DESIGN.md` — API specification (source of truth for implementation)
 
 ## Architecture
@@ -458,6 +458,6 @@ Each of the four publishable packages must be configured on npmjs.com with this 
 
 ## MCP Servers
 
-- **effect-docs** — Effect TS documentation search. Use `effect_docs_search` to search and `get_effect_doc` to retrieve specific docs. **Note:** May serve v3 documentation during v4 beta — cross-reference with migration guides.
-- v4 source: https://github.com/Effect-TS/effect-smol — ground truth for v4 APIs
-- v4 migration: https://github.com/Effect-TS/effect-smol/blob/main/MIGRATION.md
+- **effect-docs** — Effect TS documentation search. Use `effect_docs_search` to search and `get_effect_doc` to retrieve specific docs. **Note:** May serve v3 documentation until v4 is stable — cross-reference with migration guides.
+- v4 source: https://github.com/Effect-TS/effect — ground truth for v4 APIs (the RC is published from the main repo; effect-smol was the beta-era home)
+- v4 migration: https://github.com/Effect-TS/effect/blob/main/MIGRATION.md

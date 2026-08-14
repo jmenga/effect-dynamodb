@@ -1723,8 +1723,7 @@ const makeImpl = <
     // Add optional TTL
     const ttl = retainTtl()
     if (ttl) {
-      snapshot[ttlAttrName] =
-        Math.floor(DateTime.toEpochMillis(now) / 1000) + normalizeTtlSeconds(ttl)
+      snapshot[ttlAttrName] = DateTime.toEpochSeconds(now) + normalizeTtlSeconds(ttl)
     }
 
     return snapshot
@@ -2203,7 +2202,7 @@ const makeImpl = <
                 const uniqueTtl = resolveUniqueTtl(constraintDef)
                 if (uniqueTtl !== undefined) {
                   sentinelItem[ttlAttrName] =
-                    Math.floor(DateTime.toEpochMillis(now) / 1000) + normalizeTtlSeconds(uniqueTtl)
+                    DateTime.toEpochSeconds(now) + normalizeTtlSeconds(uniqueTtl)
                 }
                 transactItems.push({
                   Put: {
@@ -3492,8 +3491,7 @@ const makeImpl = <
             // Add optional TTL
             const sdTtl = softDeleteTtl()
             if (sdTtl) {
-              deletedItem[ttlAttrName] =
-                Math.floor(DateTime.toEpochMillis(dtNow) / 1000) + normalizeTtlSeconds(sdTtl)
+              deletedItem[ttlAttrName] = DateTime.toEpochSeconds(dtNow) + normalizeTtlSeconds(sdTtl)
             }
 
             // Build transaction
@@ -4205,8 +4203,7 @@ const makeImpl = <
       eventItem.__edd_e__ = entityType
       // TTL — attribute name comes from TableConfig (default "_ttl")
       if (ttlDuration) {
-        eventItem[ttlAttrName] =
-          Math.floor(DateTime.toEpochMillis(now) / 1000) + normalizeTtlSeconds(ttlDuration)
+        eventItem[ttlAttrName] = DateTime.toEpochSeconds(now) + normalizeTtlSeconds(ttlDuration)
       }
       // Events never participate in indexes: strip any GSI key fields that the
       // naive spread above may have carried over. gsiKeys weren't written into

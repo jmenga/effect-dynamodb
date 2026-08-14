@@ -209,16 +209,16 @@ describe("Aggregate codec direction — date matrix", () => {
     )
   })
 
-  // ------------------- Pattern A — self DateValid (Date domain) --------------
+  // ------------------- Pattern A — self Schema.Date (Date domain) --------------
 
   describe("Pattern A — self Date + storedAs annotation", () => {
     it.effect("Date + string storage round-trips (default inferred encoding)", () =>
       Effect.gen(function* () {
-        // No `storedAs` — Schema.DateValid alone infers default
+        // No `storedAs` — Schema.Date alone infers default
         // `{ storage: "string", domain: "Date" }`.
         class M extends Schema.Class<M>("M")({
           id: Schema.String,
-          ts: Schema.DateValid,
+          ts: Schema.Date,
         }) {}
         const Agg = Aggregate.make(M, {
           table: MainTable,
@@ -256,7 +256,7 @@ describe("Aggregate codec direction — date matrix", () => {
       Effect.gen(function* () {
         class M extends Schema.Class<M>("M")({
           id: Schema.String,
-          ts: Schema.DateValid.pipe(DynamoModel.storedAs(DynamoModel.UnsafeDateEpochMs)),
+          ts: Schema.Date.pipe(DynamoModel.storedAs(DynamoModel.UnsafeDateEpochMs)),
         }) {}
         const Agg = Aggregate.make(M, {
           table: MainTable,
@@ -294,7 +294,7 @@ describe("Aggregate codec direction — date matrix", () => {
       Effect.gen(function* () {
         class M extends Schema.Class<M>("M")({
           id: Schema.String,
-          ts: Schema.DateValid.pipe(DynamoModel.storedAs(DynamoModel.UnsafeDateEpochSeconds)),
+          ts: Schema.Date.pipe(DynamoModel.storedAs(DynamoModel.UnsafeDateEpochSeconds)),
         }) {}
         const Agg = Aggregate.make(M, {
           table: MainTable,

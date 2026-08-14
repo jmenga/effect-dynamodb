@@ -308,7 +308,7 @@ const created = yield* db.entities.Widgets.put({
 // created.widgetId is a freshly-generated UUID
 ```
 
-The id is sourced from the bundled [`Crypto`](https://github.com/Effect-TS/effect-smol) service. `DynamoClient.make` provides a default `globalThis.crypto`-backed implementation (no extra dependency), so bound `put` stays `R = never` — your program needs no Crypto layer. Pass `DynamoClient.make({ crypto })` to override with a platform implementation (e.g. `@effect/platform-node`).
+The id is sourced from the bundled [`Crypto`](https://github.com/Effect-TS/effect) service. `DynamoClient.make` provides a default `globalThis.crypto`-backed implementation (no extra dependency), so bound `put` stays `R = never` — your program needs no Crypto layer. Pass `DynamoClient.make({ crypto })` to override with a platform implementation (e.g. `@effect/platform-node`).
 
 ### Unique Constraints
 

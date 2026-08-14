@@ -166,7 +166,7 @@ describe("Entity codec direction — date matrix", () => {
       Effect.gen(function* () {
         class M extends Schema.Class<M>("M")({
           id: Schema.String,
-          ts: Schema.DateValid.pipe(DynamoModel.storedAs(DynamoModel.UnsafeDateEpochSeconds)),
+          ts: Schema.Date.pipe(DynamoModel.storedAs(DynamoModel.UnsafeDateEpochSeconds)),
         }) {}
         const E = withConfig(
           Entity.make({ model: M, entityType: "M4", primaryKey: baseKey, timestamps: false }),
