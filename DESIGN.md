@@ -2007,7 +2007,247 @@ db.VehicleGeo.nearby(options)
 
 ---
 
-## 14. Error Types
+## 14. Vector Search
+
+### Overview
+
+DynamoDB native vector search (GA 2026-08-05) adds approximate-nearest-neighbour
+retrieval to the table itself: a **vector index** is declared on `CreateTable` /
+`UpdateTable`, DynamoDB maintains it from an ordinary list-of-number attribute on
+each item, and `SearchVectors` returns the top-K most similar items with a score.
+
+effect-dynamodb models this the same way it models GSIs — **declaratively on the
+entity**, with library-managed attributes so the domain model stays pure:
+
+```typescript
+const Products = Entity.make({
+  model: Product,
+  entityType: "product",
+  primaryKey: { pk: { field: "pk", composite: ["productId"] }, sk: { field: "sk", composite: [] } },
+  vectorIndexes: {
+    byDescription: {
+      name: "vec1",                      // physical vector index on the table
+      dimensions: 1024,                  // immutable after CreateTable
+      distance: "cosine",                // cosine | euclidean | dotProduct — immutable
+      source: { fields: ["name", "description"] },
+      partition: ["tenantId"],           // optional extra HASH composites
+      filters: ["category", "status"],   // INLINE_FILTER attributes (equality-only)
+    },
+  },
+})
+```
+
+Two library-managed attributes back each entity/index pair:
+
+| Attribute | Purpose |
+|---|---|
+| `__edd_v_<physicalName>__` | The stored embedding (DynamoDB `L` of `N`). |
+| `__edd_vp_<physicalName>__` | The composed HASH partition value (always present). |
+
+INLINE_FILTER attributes are ordinary model fields — no wrapper attribute. The
+naming mirrors `__edd_e__`: deliberately ugly so it cannot collide with a user
+field, and never surfaced in the domain model or the decoded record.
+
+### Partition composition — entity scoping for free
+
+The vector index HASH attribute is **always** declared and **always** composed by
+`KeyComposer`, using exactly the same prefixing and casing rules as every other
+key:
+
+```
+$schema#v1#<entityType>[#<partition composite values>]
+```
+
+Two consequences fall out of this, both deliberate:
+
+1. **Entity scoping is automatic.** The entity type is baked into the partition
+   value, so a `SearchVectors` call on a shared physical index only ever sees one
+   entity type's items. This is the vector-search analogue of the `__edd_e__`
+   FilterExpression that scopes every Query/Scan — but it costs nothing at read
+   time because it is the partition key, not a filter.
+2. **Multiple entities can share one physical vector index.** The 5-index-per-table
+   quota is tight for single-table designs; sharing is the norm rather than the
+   exception. `Table.make` validates that every entity sharing a physical index
+   agrees on `dimensions` and `distance` (they are immutable at the DynamoDB level,
+   so disagreement is unrepresentable).
+
+With `partition: ["tenantId"]`, tenant scoping composes into the same attribute,
+and DynamoDB's per-partition-value throughput ceilings (1 GBps search, 10 MBps
+write) distribute per tenant rather than per table.
+
+**Sparse semantics.** DynamoDB indexes an item only when it carries BOTH the
+vector attribute and (when declared) the HASH attribute. Removing either removes
+the index entry. The library relies on this for lifecycle stripping (below) —
+there is no "delete from index" operation to call.
+
+### Embedder service
+
+Embedding generation is entirely the application's responsibility (DynamoDB never
+computes or refreshes a vector). The library models the generator as a service:
+
+```typescript
+// @effect-dynamodb/schema — AWS-free
+export interface EmbedderService {
+  readonly embed: (text: string) => Effect.Effect<ReadonlyArray<number>, EmbeddingError>
+  readonly dimensions: number
+}
+export class Embedder extends Context.Service<Embedder, EmbedderService>()(
+  "@effect-dynamodb/Embedder",
+) {}
+```
+
+`Embedder.layerTest({ dimensions })` ships in-library: a deterministic
+hash-based embedder used by the test suite, the connected suite, and the runnable
+examples. A Bedrock-backed implementation is documented as an **example**, not
+shipped — that would drag `@aws-sdk/client-bedrock-runtime` into the runtime graph
+for every consumer.
+
+`DynamoClient.make({ ..., embedder })` accepts an explicit service; otherwise the
+`Embedder` service is resolved from context if present. Resolution mirrors the
+`Crypto` bundling pattern exactly, so bound entity operations stay `R = never`.
+Dimension agreement between the layer and every bound vector index is validated at
+`DynamoClient.make` time — a mismatch is a construction-time failure, never a
+runtime surprise on the thousandth write.
+
+### Write path
+
+| Operation | Embedder invoked? |
+|---|---|
+| `put` / `create` | Always (the full item is being written). |
+| `upsert` | Always. |
+| `update` / `patch` | **Only** when at least one `source.fields` member appears in the update payload. |
+| `.withVector(name, vector)` | Never — the caller supplies a pre-computed embedding. |
+| `.append()` (time-series) | Never on event items; vector attributes are stripped. |
+
+The update gate deliberately mirrors the policy-aware GSI composition gate (§7):
+a writer that does not touch the source fields must not pay for an embedding call,
+and must not clobber a vector another writer owns. No source change ⇒ no Embedder
+call ⇒ stored vector untouched.
+
+The partition attribute is composed on every write that composes keys, exactly
+like a GSI half whose composites are all primary-key members.
+
+**Out-of-band refresh.** `db.entities.Products.reembed({ concurrency })` streams
+the entity's items (Scan scoped by `__edd_e__`), re-derives source text, embeds,
+and writes the vector back. This is the migration path when the embedding model
+changes — DynamoDB will never recompute a vector for you.
+
+### Lifecycle integration
+
+Version snapshots and soft-delete tombstones already strip GSI key attributes so
+they cannot appear in index queries. Vector and partition attributes join the same
+strip set, and sparse semantics do the rest:
+
+- **Version snapshots** (`versioned: { retain: true }`) — vector + partition
+  attributes stripped. A snapshot is never an ANN hit.
+- **Soft delete** — vector + partition attributes stripped, but the vector is
+  **stashed** under `__edd_vs_<physicalName>__` (a non-indexed attribute).
+  `restore()` un-stashes it, so restoring never costs an Embedder call.
+- **Time-series event items** — vector + partition attributes stripped, like GSI
+  keys. Only the current item is searchable.
+- **Purge / hard delete** — nothing to do; deleting the item deletes the entry.
+
+### Query path — `BoundVectorQuery`
+
+Each declared vector index becomes an accessor on the bound entity, in the same
+family as index query accessors:
+
+```typescript
+const hits = yield* db.entities.Products
+  .byDescription("waterproof hiking boots")   // string ⇒ Embedder; number[] accepted directly
+  .partition({ tenantId })                     // required by the types iff partition composites declared
+  .filter({ category: "footwear" })            // equality-only shorthand
+  .topK(25)                                    // clamped to 1..100; default 10
+  .select(["name", "price"])
+  .collect()
+// Array<{ item: Product; similarity: Similarity; rawScore: number }>
+```
+
+Deliberate shape decisions:
+
+- **`.collect()` is the only terminal.** `SearchVectors` has no pagination and no
+  cursor, so `.fetch()`, `.paginate()`, `.startFrom()`, `.maxPages()`, and
+  `.reverse()` are *structurally absent* from the type rather than present and
+  failing. The builder cannot express an operation the API does not have.
+- **`.filter()` is equality-only.** The API Reference restricts
+  `SearchConditionExpression` to `=` for both HASH and INLINE_FILTER attributes.
+  The restriction lives in exactly one type alias (`VectorFilterInput`) so that
+  when AWS relaxes it — the SDK JSDoc already advertises range operators for
+  INLINE_FILTER — one edit widens the surface.
+- **`.partition()` is required iff partition composites are declared.** Mirrors
+  the "PK composites required" rule on index query accessors, enforced at the type
+  level via a conditional on the declared `partition` tuple.
+- **`Similarity` is branded and normalized higher-is-more-similar**, regardless of
+  distance function. `rawScore` preserves the wire value.
+
+| Distance function | Wire score | Direction | `Similarity` |
+|---|---|---|---|
+| `cosine` | 0 … 2 | lower is closer | `1 - raw / 2` → 0 … 1 |
+| `euclidean` | 0 … ∞ | lower is closer | `1 / (1 + raw)` → 0 … 1 |
+| `dotProduct` | −∞ … ∞ | higher is closer | `raw` (already correct) |
+
+Reference ranking for query `[1, 0, 0, 0]` (from the DynamoDB developer guide) —
+reproduced verbatim by the emulation layer's unit tests:
+
+| Stored vector | cosine | euclidean | dotProduct |
+|---|---|---|---|
+| `[1, 0, 0, 0]` | 0.0 | 0.0 | 1.0 |
+| `[10, 0, 0, 0]` | 0.0 | 9.0 | 10.0 |
+| `[0.7071, 0.7071, 0, 0]` | 0.29 | 0.77 | 0.71 |
+| `[-1, 0, 0, 0]` | 2.0 | 2.0 | −1.0 |
+
+**Backfill.** `SearchVectors` errors while a newly added index is backfilling.
+That failure is surfaced as `VectorIndexBackfilling`, whose message points at
+`db.tables.MainTable.waitForVectorIndex(name)`.
+
+### Table operations
+
+- `db.tables.MainTable.create()` emits merged `VectorIndexes` derived from every
+  registered entity's vector index declarations (deduplicated by physical name).
+- `db.tables.MainTable.addVectorIndex(name)` / `.removeVectorIndex(name)` emit
+  `UpdateTable` with `VectorIndexUpdates`.
+- `db.tables.MainTable.waitForVectorIndex(name, options?)` polls `DescribeTable`
+  until the index reports `ACTIVE` and `Backfilling: false`.
+
+Vector search is **on-demand capacity only** and the raw operation needs the new
+`dynamodb:SearchVectors` IAM action — it is NOT covered by existing read policies.
+Endpoint routing to `search-dynamodb.{region}.amazonaws.com` happens automatically
+inside the standard `DynamoDBClient` (an explicit `endpoint` override wins), so
+there is no second client to configure.
+
+### Local emulation
+
+DynamoDB Local does **not** support vector search: `CreateTable` silently accepts
+and discards `VectorIndexes`, and `SearchVectors` fails with
+`UnknownOperationException`. LocalStack wraps DynamoDB Local and inherits the gap.
+
+`VectorSearchEmulation.layer` wraps a `DynamoClient` layer and replaces
+`searchVectors` with a Scan + brute-force implementation: all three distance
+functions with faithful score directions, HASH/INLINE_FILTER equality predicates,
+projection, and TopK. Connected tests and the runnable example execute through it.
+It is the only way to exercise the full write→search round trip without an AWS
+account, and its ranking output is unit-tested against the developer-guide table
+above.
+
+```typescript
+const DdbLocal = DynamoClient.layer({ region: "us-east-1", endpoint: "http://localhost:8000" })
+const Emulated = VectorSearchEmulation.layer(DdbLocal)
+```
+
+### Limits enforced
+
+| Limit | Value | Enforced at |
+|---|---|---|
+| Dimensions | 1 … 4096 | `Entity.make` |
+| Vector indexes per table | 5 | `Table.definition` |
+| INLINE_FILTER attributes per index | 18 | `Entity.make` |
+| HASH attributes per index | 1 (library-composed) | by construction |
+| `TopK` | 1 … 100 (default 10) | `.topK()` clamp |
+| Capacity mode | on-demand only | documented |
+
+---
+
+## 15. Error Types
 
 ### Complete Error Taxonomy
 
@@ -2025,6 +2265,8 @@ db.VehicleGeo.nearby(options)
 | `AggregateDecompositionError` | Decomposition produced items that fail schema validation |
 | `AggregateTransactionOverflow` | Sub-aggregate exceeds 100-item transaction limit |
 | `CascadePartialFailure` | Cascade update partially failed (eventual mode) |
+| `EmbeddingError` | `Embedder.embed` failed, or no `Embedder` was provided for an entity with vector indexes |
+| `VectorIndexBackfilling` | `SearchVectors` called while the vector index is still backfilling |
 
 ### Error Type Narrowing
 
