@@ -30,8 +30,11 @@
 
 import type {
   AttributeValue,
+  CreateTableCommandInput,
   SearchVectorsCommandInput,
   SearchVectorsCommandOutput,
+  UpdateTableCommandInput,
+  UpdateTableCommandOutput,
 } from "@aws-sdk/client-dynamodb"
 import { DynamoValidationError } from "@effect-dynamodb/schema/Errors.js"
 import type {
@@ -252,6 +255,43 @@ export const wrap = (
   const registry = buildRegistry(options)
   return {
     ...service,
+    // Real DynamoDB REQUIRES every vector SearchSchema element in
+    // AttributeDefinitions; DynamoDB Local discards `VectorIndexes`, sees those
+    // definitions as unreferenced, and rejects the table ("The number of
+    // attributes in key schema must match..."). The two backends demand
+    // incompatible inputs, so the emulation strips the vector-only parts down
+    // to what DynamoDB Local understands.
+    createTable: (input: CreateTableCommandInput) => {
+      if (input.VectorIndexes === undefined) return service.createTable(input)
+      const referenced = new Set<string>(
+        [
+          ...(input.KeySchema ?? []),
+          ...(input.GlobalSecondaryIndexes ?? []).flatMap((gsi) => gsi.KeySchema ?? []),
+          ...(input.LocalSecondaryIndexes ?? []).flatMap((lsi) => lsi.KeySchema ?? []),
+        ].flatMap((element) => (element.AttributeName ? [element.AttributeName] : [])),
+      )
+      const { VectorIndexes: _dropped, ...rest } = input
+      return service.createTable({
+        ...rest,
+        AttributeDefinitions: (input.AttributeDefinitions ?? []).filter(
+          (definition) =>
+            definition.AttributeName !== undefined && referenced.has(definition.AttributeName),
+        ),
+      })
+    },
+    updateTable: (input: UpdateTableCommandInput) => {
+      if (input.VectorIndexUpdates === undefined) return service.updateTable(input)
+      const { AttributeDefinitions: _defs, VectorIndexUpdates: _updates, ...rest } = input
+      const hasOtherUpdates = Object.keys(rest).some((key) => key !== "TableName")
+      // A pure vector-index update has nothing DynamoDB Local can apply —
+      // succeed as a no-op so `addVectorIndex` stays usable in local stacks.
+      return hasOtherUpdates
+        ? service.updateTable(rest)
+        : (Effect.succeed({ $metadata: {} }) as Effect.Effect<
+            UpdateTableCommandOutput,
+            DynamoClientError
+          >)
+    },
     searchVectors: (
       input: SearchVectorsCommandInput,
     ): Effect.Effect<SearchVectorsCommandOutput, DynamoClientError> =>

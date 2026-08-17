@@ -2237,6 +2237,20 @@ Endpoint routing to `search-dynamodb.{region}.amazonaws.com` happens automatical
 inside the standard `DynamoDBClient` (an explicit `endpoint` override wins), so
 there is no second client to configure.
 
+**AttributeDefinitions carry the SearchSchema** (verified against the live
+service, 2026-08-17): `CreateTable`/`UpdateTable` reject a vector index whose
+SearchSchema elements are not declared in `AttributeDefinitions` ("One element in
+SearchSchema is not defined in attribute definitions"). `Table.definition` and
+`addVectorIndex` therefore emit an `S` definition for the composed HASH partition
+attribute and a per-field definition for every INLINE_FILTER attribute. Since
+`AttributeDefinitions` admits only scalar types, a filter field must encode to a
+string (`S`) or number (`N`) — derived from the model schema at `Entity.make`
+(EDD-9039; EDD-9040 when entities sharing an index disagree on a stored filter
+attribute's type). DynamoDB Local inverts the requirement — it discards
+`VectorIndexes` and rejects the now-"unreferenced" definitions — so
+`VectorSearchEmulation` strips vector-only `AttributeDefinitions` and
+`VectorIndexes`/`VectorIndexUpdates` before forwarding table operations.
+
 ### Local emulation
 
 DynamoDB Local does **not** support vector search: `CreateTable` silently accepts

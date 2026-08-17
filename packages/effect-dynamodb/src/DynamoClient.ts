@@ -1383,9 +1383,20 @@ const buildTableOperationsFromTable = (
           }),
         )
       }
+      // UpdateTable, like CreateTable, requires every SearchSchema element to
+      // be declared in AttributeDefinitions (the composed HASH partition is
+      // always a string; filter types were derived at Entity.make).
+      const attributeDefinitions = [
+        { AttributeName: entry.definition.partitionField, AttributeType: "S" as const },
+        ...Object.entries(entry.filterStoredTypes).map(([AttributeName, AttributeType]) => ({
+          AttributeName,
+          AttributeType,
+        })),
+      ]
       return client
         .updateTable({
           TableName: tableName,
+          AttributeDefinitions: attributeDefinitions,
           VectorIndexUpdates: [
             {
               Create: toVectorIndexSpec(entry.definition, {

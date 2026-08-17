@@ -186,25 +186,79 @@ export interface VectorIndexDefinition {
   readonly partitionField: string
   /** `__edd_vs_<index>__` — the soft-delete stash. */
   readonly stashField: string
+  /**
+   * Scalar `AttributeDefinitions` type per filter field (domain name).
+   * CreateTable/UpdateTable require every `SearchSchema` element to appear in
+   * `AttributeDefinitions`, which only admits `S`/`N`/`B` — derived from the
+   * model's encoded field type at `Entity.make` (EDD-9039 when underivable).
+   */
+  readonly filterTypes: Readonly<Record<string, VectorFilterAttributeType>>
 }
+
+/** `AttributeDefinitions` scalar type of an INLINE_FILTER attribute. */
+export type VectorFilterAttributeType = "S" | "N"
 
 /**
  * Normalize a {@link VectorIndexConfig} into a {@link VectorIndexDefinition}.
- * Pure — validation lives in {@link validateVectorIndexes}.
+ * Pure — validation lives in {@link validateVectorIndexes}. `filterTypes`
+ * carries the derived `AttributeDefinitions` scalar type per filter field;
+ * callers without model type information may omit it (defaults every filter
+ * to `"S"`), but `Entity.make` always derives it from the model schema.
  */
-export const normalizeVectorIndexConfig = (config: VectorIndexConfig): VectorIndexDefinition => ({
-  index: config.name,
-  dimensions: config.dimensions,
-  distance: config.distance ?? "cosine",
-  sourceFields: [...config.source.fields],
-  compose: config.source.compose,
-  partition: config.partition ? [...config.partition] : [],
-  filters: config.filters ? [...config.filters] : [],
-  casing: config.casing,
-  vectorField: vectorAttributeName(config.name),
-  partitionField: vectorPartitionAttributeName(config.name),
-  stashField: vectorStashAttributeName(config.name),
-})
+export const normalizeVectorIndexConfig = (
+  config: VectorIndexConfig,
+  filterTypes?: Readonly<Record<string, VectorFilterAttributeType>>,
+): VectorIndexDefinition => {
+  const filters = config.filters ? [...config.filters] : []
+  return {
+    index: config.name,
+    dimensions: config.dimensions,
+    distance: config.distance ?? "cosine",
+    sourceFields: [...config.source.fields],
+    compose: config.source.compose,
+    partition: config.partition ? [...config.partition] : [],
+    filters,
+    casing: config.casing,
+    vectorField: vectorAttributeName(config.name),
+    partitionField: vectorPartitionAttributeName(config.name),
+    stashField: vectorStashAttributeName(config.name),
+    filterTypes: filterTypes ?? Object.fromEntries(filters.map((field) => [field, "S" as const])),
+  }
+}
+
+/**
+ * Derive the `AttributeDefinitions` scalar type for each filter field from the
+ * model's encoded schema. DynamoDB requires every `SearchSchema` element in
+ * `AttributeDefinitions` (verified against the live service — DynamoDB Local
+ * silently accepts tables without them), and `AttributeDefinitions` admits
+ * only scalar types, so a filter field must encode to a string or number.
+ *
+ * @throws EDD-9039 when a filter field's encoded type is neither.
+ */
+export const deriveVectorFilterTypes = (
+  entityType: string,
+  logicalName: string,
+  filters: ReadonlyArray<string>,
+  fieldEncodedTag: (field: string) => string | undefined,
+): Record<string, VectorFilterAttributeType> => {
+  const out: Record<string, VectorFilterAttributeType> = {}
+  for (const field of filters) {
+    const tag = fieldEncodedTag(field)
+    if (tag === "String") {
+      out[field] = "S"
+    } else if (tag === "Number") {
+      out[field] = "N"
+    } else {
+      throw new Error(
+        `[EDD-9039] Entity "${entityType}": vector index "${logicalName}" filter field ` +
+          `"${field}" encodes to ${tag ?? "an unknown type"}, but DynamoDB SearchSchema ` +
+          `attributes must appear in AttributeDefinitions as "S" or "N". Use a field that ` +
+          `encodes to a string or number.`,
+      )
+    }
+  }
+  return out
+}
 
 // ---------------------------------------------------------------------------
 // Source text derivation

@@ -219,6 +219,7 @@ export const mergeVectorIndexes = (
       owner: string
       filters: Array<string>
       resolveDbName: (domainName: string) => string
+      filterStoredTypes: Record<string, "S" | "N">
     }
   >()
 
@@ -235,6 +236,9 @@ export const mergeVectorIndexes = (
           owner,
           filters: [...definition.filters],
           resolveDbName,
+          filterStoredTypes: Object.fromEntries(
+            definition.filters.map((f) => [resolveDbName(f), definition.filterTypes[f] ?? "S"]),
+          ),
         })
         continue
       }
@@ -257,6 +261,17 @@ export const mergeVectorIndexes = (
       // attributes out of the SearchSchema (and un-filterable at runtime).
       for (const filter of definition.filters) {
         const stored = resolveDbName(filter)
+        const storedType = definition.filterTypes[filter] ?? "S"
+        const existingType = existing.filterStoredTypes[stored]
+        if (existingType !== undefined && existingType !== storedType) {
+          throw new Error(
+            `[EDD-9040] Vector index "${definition.index}" filter attribute "${stored}" is ` +
+              `declared with AttributeDefinitions type "${existingType}" by entity ` +
+              `"${existing.owner}" and "${storedType}" by entity "${owner}". A shared ` +
+              `SearchSchema attribute must have one scalar type.`,
+          )
+        }
+        existing.filterStoredTypes[stored] = storedType
         if (existing.filters.some((f) => existing.resolveDbName(f) === stored)) continue
         existing.filters.push(filter)
       }
@@ -295,6 +310,12 @@ export interface MergedVectorIndex {
   readonly filters: ReadonlyArray<string>
   /** Stored-name resolver for the first declarer's `storedAs` renames. */
   readonly resolveDbName: (domainName: string) => string
+  /**
+   * `AttributeDefinitions` scalar type per STORED filter attribute name,
+   * merged across sharers (EDD-9040 on conflict). CreateTable/UpdateTable must
+   * declare every SearchSchema element in `AttributeDefinitions`.
+   */
+  readonly filterStoredTypes: Readonly<Record<string, "S" | "N">>
 }
 
 /** @internal Run {@link mergeVectorIndexes} purely for its validation effect. */
@@ -400,8 +421,11 @@ export interface TableDefinition {
   readonly LocalSecondaryIndexes?: Array<LocalSecondaryIndex> | undefined
   /**
    * Merged vector indexes from every registered entity, deduplicated by physical
-   * name. Vector index key attributes are NOT added to `AttributeDefinitions` —
-   * DynamoDB derives them from the `VectorIndex` declaration itself.
+   * name. Every `SearchSchema` element (the composed HASH partition attribute
+   * and each INLINE_FILTER attribute) is also added to `AttributeDefinitions` —
+   * the live service rejects the table otherwise ("One element in SearchSchema
+   * is not defined in attribute definitions"). The vector attribute itself is
+   * NOT declared; DynamoDB derives it from the `VectorIndex` declaration.
    */
   readonly VectorIndexes?: Array<VectorIndexSpec> | undefined
 }
@@ -532,6 +556,27 @@ export const definition = (table: Table): TableDefinition => {
     .sort()
     .map((name) => ({ AttributeName: name, AttributeType: "S" as const }))
 
+  // Every SearchSchema element must appear in AttributeDefinitions (verified
+  // against the live service; DynamoDB Local silently accepts their absence).
+  // The composed HASH partition attribute is always a string; filter types are
+  // derived from the model schema at Entity.make (EDD-9039).
+  const vectorAttributeDefs = (
+    merged: Map<string, MergedVectorIndex>,
+  ): Array<AttributeDefinition> => {
+    const defs = new Map<string, "S" | "N">()
+    for (const entry of merged.values()) {
+      if (!attributeNames.has(entry.definition.partitionField)) {
+        defs.set(entry.definition.partitionField, "S")
+      }
+      for (const [stored, type] of Object.entries(entry.filterStoredTypes)) {
+        if (!attributeNames.has(stored)) defs.set(stored, type)
+      }
+    }
+    return Array.from(defs.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([AttributeName, AttributeType]) => ({ AttributeName, AttributeType }))
+  }
+
   const GlobalSecondaryIndexes: Array<GlobalSecondaryIndex> | undefined =
     gsiMap.size > 0
       ? Array.from(gsiMap.entries())
@@ -572,6 +617,7 @@ export const definition = (table: Table): TableDefinition => {
             }),
           )
       : undefined
+  AttributeDefinitions.push(...vectorAttributeDefs(mergedVectorIndexes))
 
   const result: {
     KeySchema: Array<KeySchemaElement>

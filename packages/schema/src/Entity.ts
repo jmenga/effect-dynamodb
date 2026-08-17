@@ -64,7 +64,11 @@ import type {
 import type { GsiConfig, IndexDefinition, KeyPart } from "./KeyComposer.js"
 import { normalizeGsiConfig } from "./KeyComposer.js"
 import type { VectorIndexConfig, VectorIndexDefinition } from "./VectorIndex.js"
-import { normalizeVectorIndexConfig, validateVectorIndexes } from "./VectorIndex.js"
+import {
+  deriveVectorFilterTypes,
+  normalizeVectorIndexConfig,
+  validateVectorIndexes,
+} from "./VectorIndex.js"
 
 // ---------------------------------------------------------------------------
 // Re-export KeyComposer types for convenience
@@ -636,14 +640,46 @@ export const buildEntityDefinition = (config: {
 
   const vectorIndexes: globalThis.Record<string, VectorIndexDefinition> = {}
   if (config.vectorIndexes) {
+    // Encoded-type tag for a model field, resolving homogeneous literal unions
+    // (e.g. Schema.Literals(["a", "b"]) → "String") so they qualify as filters.
+    const fieldEncodedTag = (field: string): string | undefined => {
+      const fieldSchema = getSchemaFields(rawModel)?.[field] as { ast?: SchemaAST.AST } | undefined
+      if (fieldSchema?.ast === undefined) return undefined
+      const resolveTag = (ast: SchemaAST.AST): string => {
+        const encoded = SchemaAST.toEncoded(ast)
+        if (SchemaAST.isUnion(encoded)) {
+          const memberTags = new Set(encoded.types.map((member) => resolveTag(member)))
+          return (memberTags.size === 1 ? [...memberTags][0] : undefined) ?? "Union"
+        }
+        if (encoded._tag === "Literal") {
+          const literal = (encoded as { literal?: unknown }).literal
+          return typeof literal === "number" ? "Number" : "String"
+        }
+        return encoded._tag
+      }
+      return resolveTag(fieldSchema.ast)
+    }
     for (const [logicalName, vectorConfig] of Object.entries(config.vectorIndexes)) {
       vectorIndexes[logicalName] = normalizeVectorIndexConfig(vectorConfig)
     }
+    // Field-existence validation (EDD-9030..9034) runs before type derivation
+    // so an unknown filter field reports EDD-9031, not a derivation failure.
     validateVectorIndexes({
       entityType: config.entityType,
       definitions: vectorIndexes,
       validFields: validCompositeFields,
     })
+    for (const [logicalName, definition] of Object.entries(vectorIndexes)) {
+      vectorIndexes[logicalName] = {
+        ...definition,
+        filterTypes: deriveVectorFilterTypes(
+          config.entityType,
+          logicalName,
+          definition.filters,
+          fieldEncodedTag,
+        ),
+      }
+    }
   }
   const hasVectorIndexes = Object.keys(vectorIndexes).length > 0
 

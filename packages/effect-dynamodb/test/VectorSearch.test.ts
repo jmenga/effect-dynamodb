@@ -1162,6 +1162,108 @@ describe("Table.definition vector indexes", () => {
     ])
   })
 
+  // The live service rejects CreateTable when a SearchSchema element is absent
+  // from AttributeDefinitions ("One element in SearchSchema is not defined in
+  // attribute definitions") — DynamoDB Local silently accepts it, so this is
+  // pinned at the definition level.
+  it("declares every SearchSchema element in AttributeDefinitions", () => {
+    const definition = Table.definition(MainTable as unknown as Table.Table)
+    expect(definition.AttributeDefinitions).toEqual(
+      expect.arrayContaining([
+        { AttributeName: PARTITION_ATTR, AttributeType: "S" },
+        { AttributeName: "category", AttributeType: "S" },
+      ]),
+    )
+  })
+
+  it("types numeric filter fields as N in AttributeDefinitions", () => {
+    const Priced = Entity.make({
+      model: Product,
+      entityType: "priced",
+      primaryKey: {
+        pk: { field: "pk", composite: ["productId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      vectorIndexes: {
+        byDescription: {
+          name: "vecp",
+          dimensions: DIMENSIONS,
+          source: { fields: ["description"] },
+          filters: ["price", "category"],
+        },
+      },
+    })
+    const PricedTable = Table.make({ schema: AppSchema, entities: { Priced } })
+    const definition = Table.definition(PricedTable as unknown as Table.Table)
+    expect(definition.AttributeDefinitions).toEqual(
+      expect.arrayContaining([
+        { AttributeName: "__edd_vp_vecp__", AttributeType: "S" },
+        { AttributeName: "price", AttributeType: "N" },
+        { AttributeName: "category", AttributeType: "S" },
+      ]),
+    )
+  })
+
+  it("rejects filter fields that don't encode to string or number (EDD-9039)", () => {
+    class Flagged extends Schema.Class<Flagged>("Flagged")({
+      id: Schema.String,
+      body: Schema.String,
+      active: Schema.Boolean,
+    }) {}
+    expect(() =>
+      Entity.make({
+        model: Flagged,
+        entityType: "flagged",
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+        vectorIndexes: {
+          byBody: {
+            name: "vecf",
+            dimensions: DIMENSIONS,
+            source: { fields: ["body"] },
+            filters: ["active"],
+          },
+        },
+      }),
+    ).toThrow("[EDD-9039]")
+  })
+
+  it("rejects sharers declaring one stored filter attribute with two types (EDD-9040)", () => {
+    class Coded extends Schema.Class<Coded>("Coded")({
+      id: Schema.String,
+      body: Schema.String,
+      code: Schema.Number,
+    }) {}
+    const vectorIndex = (filters: ReadonlyArray<"code">) => ({
+      byBody: {
+        name: "vecc",
+        dimensions: DIMENSIONS,
+        source: { fields: ["body"] as const },
+        filters,
+      },
+    })
+    class CodedStr extends Schema.Class<CodedStr>("CodedStr")({
+      id: Schema.String,
+      body: Schema.String,
+      code: Schema.String,
+    }) {}
+    const A = Entity.make({
+      model: Coded,
+      entityType: "coded-n",
+      primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+      vectorIndexes: vectorIndex(["code"]),
+    })
+    const B = Entity.make({
+      model: CodedStr,
+      entityType: "coded-s",
+      primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+      vectorIndexes: vectorIndex(["code"]),
+    })
+    expect(() => Table.make({ schema: AppSchema, entities: { A, B } })).toThrow("[EDD-9040]")
+  })
+
   it("rejects entities that share a physical index with conflicting settings (EDD-9035)", () => {
     const Other = Entity.make({
       model: Product,
