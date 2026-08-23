@@ -1938,6 +1938,81 @@ const result = yield* handler({ matchId: "m-1" }, new StartMatch({ venue: "MCG" 
 // result: { state, version, events }
 ```
 
+### Snapshots
+
+Full design: `docs/designs/eventstore-snapshots.md` (#84). Opt-in via `snapshot` on
+`makeStream`:
+
+```typescript
+const MatchEvents = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Match",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["matchId"] },
+  snapshot: { schema: MatchStateSchema, every: 100 },
+})
+```
+
+**Storage.** One snapshot item per stream, in the stream partition, overwritten in place:
+
+```
+pk           <stream partition key>                     (same as events)
+sk           $<schema>#v<n>#<stream>.snapshot           (never collides with event SKs)
+__edd_e__    "<stream>.snapshot"                        (excluded by event queries' filter)
+streamId     "<composites joined with #>"
+asOfVersion  event version the state reflects
+state        Schema.encodeEffect(snapshot.schema) output
+timestamp    ISO (Clock-backed)
+```
+
+Event read paths (`read`, `readFrom`, `currentVersion`, `query.events`) are additionally
+SK-range-hardened (`begins_with` on the event prefix / `BETWEEN` on versions) so the
+snapshot is excluded at the key-condition level, not just by the `__edd_e__` filter.
+Writes are monotonic: `attribute_not_exists(pk) OR asOfVersion < :new` — a stale
+concurrent snapshot write is a successful no-op.
+
+**Primitives** (also on `BoundEventStream` with `R = never`):
+
+```typescript
+stream.writeSnapshot(streamId, state, asOfVersion)  // Effect<void, ValidationError | DynamoClientError, ...>
+stream.readSnapshot(streamId)                       // Effect<Option<Snapshot<State>>, ...>
+// Snapshot<State> = { state, asOfVersion, timestamp }
+```
+
+State round-trips through the user-supplied `snapshot.schema` — `Schema.encodeEffect`
+on write, `Schema.decodeUnknownEffect` on read — so transforming schemas work.
+
+**Snapshot-aware commandHandler.** When the stream declares `snapshot`, each handler
+invocation runs `readSnapshot → readFrom(asOfVersion) → foldFrom → decide → append`
+instead of a full replay. With `every: N`, the handler writes a fresh snapshot after a
+successful append once ≥ N events accumulated since the last snapshot (best-effort —
+a snapshot-write failure is logged and never fails the command).
+
+### Command Handler Retry
+
+```typescript
+const handler = EventStore.commandHandler(matchDecider, matchEvents, { retry: 3 })
+// or an Effect Schedule:
+EventStore.commandHandler(matchDecider, matchEvents, {
+  retry: Schedule.exponential("50 millis").pipe(Schedule.compose(Schedule.recurs(5))),
+})
+```
+
+On `VersionConflict` the **full read–decide–append cycle re-runs** — never a blind
+re-append of stale events. Only `VersionConflict` is retried; domain errors and
+infrastructure errors fail immediately. A number `n` is shorthand for
+`Schedule.recurs(n)` (n retries after the initial attempt). Default: no retry.
+
+`commandHandler` dispatches data-first vs data-last on the `EventStreamTypeId` brand of
+its second argument, so all four call shapes work:
+
+```typescript
+EventStore.commandHandler(decider, stream)
+EventStore.commandHandler(decider, stream, { retry: 3 })
+stream.pipe(EventStore.commandHandler(decider))
+stream.pipe(EventStore.commandHandler(decider, { retry: 3 }))
+```
+
 ---
 
 ## 13. GeoIndex (effect-dynamodb-geo)
