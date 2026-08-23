@@ -148,13 +148,18 @@ export interface EventStream<TEvent, TStreamIdFields extends ReadonlyArray<strin
 /**
  * Create an EventStream bound to a Table.
  *
+ * Define event schemas with `Schema.TaggedClass` (not plain `Schema.Class`):
+ * stored events are decoded through a `Schema.Union` of the event schemas, and
+ * without a declared `_tag` field the union discriminates structurally — two
+ * event types with identical fields would mis-decode as each other.
+ *
  * @example
  * ```typescript
- * class MatchStarted extends Schema.Class<MatchStarted>("MatchStarted")({
+ * class MatchStarted extends Schema.TaggedClass<MatchStarted>()("MatchStarted", {
  *   venue: Schema.String,
  * }) {}
  *
- * class InningsCompleted extends Schema.Class<InningsCompleted>("InningsCompleted")({
+ * class InningsCompleted extends Schema.TaggedClass<InningsCompleted>()("InningsCompleted", {
  *   innings: Schema.Number,
  *   runs: Schema.Number,
  * }) {}
