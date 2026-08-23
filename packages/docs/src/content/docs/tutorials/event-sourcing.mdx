@@ -330,6 +330,143 @@ yield* handleMatch(streamId, command)
 
 ---
 
+## Step 10: Snapshots
+
+Every command so far replayed the **entire** stream before deciding. That is fine for
+short-lived streams and a scaling cliff for long-lived ones. A snapshot is a cached fold
+of the stream up to some version: the handler reads it, replays only the events *after*
+it, and decides from there.
+
+Snapshots are opt-in. Declare a schema for your state — the snapshot round-trips through
+it, so branded types, `DateTime` fields, and other transforming schemas all work:
+
+```typescript title="state.ts" region="snapshot-schema" example="event-sourcing.ts"
+const MatchStateSchema = Schema.Struct({
+  status: Schema.Literals(["pending", "in-progress", "completed"]),
+  venue: Schema.optionalKey(Schema.String),
+  innings: Schema.Array(Schema.Struct({ runs: Schema.Number, wickets: Schema.Number })),
+  result: Schema.optionalKey(Schema.String),
+})
+```
+
+Then pass it to `makeStream`. `every: N` asks the command handler to write a fresh
+snapshot after a successful append, once at least `N` events have accumulated since the
+last one:
+
+```typescript title="stream.ts" region="snapshot-stream" example="event-sourcing.ts"
+const SnapshotMatchEvents = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "SnapshotMatch",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["matchId"] },
+  snapshot: { schema: MatchStateSchema, every: 3 },
+})
+```
+
+The snapshot is stored as a single item in the stream's own partition, under a sort key
+that can never collide with an event sort key (`$cricket#v1#snapshotmatch.snapshot`). It
+is invisible to `read`, `readFrom`, `currentVersion`, and `query.events`, and it is
+overwritten in place — snapshots are a cache, never history. The event stream stays the
+source of truth, so a snapshot can always be deleted and rebuilt.
+
+:::caution
+A snapshot that no longer decodes through its state schema fails the command with
+`ValidationError` — it is **not** silently discarded in favour of a full replay, because
+that would hide state-schema evolution bugs. When evolving the state schema, either keep
+it backward-tolerant (optional fields with defaults) or delete the snapshots on deploy.
+:::
+
+---
+
+## Step 11: Retrying Version Conflicts
+
+Two concurrent commands on the same stream will race: one wins the optimistic-concurrency
+check and the other fails with `VersionConflict`. The correct recovery is **not** to
+re-append the events you already decided — those were decided against stale state. It is
+to re-read, re-decide, and re-append.
+
+That is exactly what the `retry` option does. Pass a max-attempts number or an Effect
+`Schedule`; only `VersionConflict` is retried, and the retried unit is the whole
+read-decide-append cycle:
+
+```typescript title="handler.ts" region="snapshot-handler" example="event-sourcing.ts"
+const snapshotMatchEvents = yield* EventStore.bind(SnapshotMatchEvents)
+const handleSnapshotMatch = EventStore.commandHandler(matchDecider, snapshotMatchEvents, {
+  retry: 3,
+})
+```
+
+```typescript
+// A Schedule works too — exponential backoff, capped at 5 retries:
+EventStore.commandHandler(matchDecider, snapshotMatchEvents, {
+  retry: Schedule.exponential("50 millis").pipe(Schedule.compose(Schedule.recurs(5))),
+})
+```
+
+Domain errors from your decider and infrastructure errors are never retried — they fail
+immediately. The default is no retry.
+
+Commands run exactly as before. The third one crosses the `every: 3` threshold, so a
+snapshot is written after the append:
+
+```typescript region="snapshot-commands" example="event-sourcing.ts"
+yield* handleSnapshotMatch(
+  { matchId: "m-2" },
+  { _tag: "StartMatch", venue: "SCG", homeTeam: "AUS", awayTeam: "IND" },
+)
+yield* handleSnapshotMatch(
+  { matchId: "m-2" },
+  { _tag: "CompleteInnings", innings: 1, runs: 310, wickets: 8 },
+)
+// The third event crosses the `every: 3` threshold — a snapshot is written.
+const s3 = yield* handleSnapshotMatch(
+  { matchId: "m-2" },
+  { _tag: "CompleteInnings", innings: 2, runs: 275, wickets: 10 },
+)
+```
+
+### Reading a snapshot
+
+```typescript region="read-snapshot" example="event-sourcing.ts"
+const snapshot = yield* snapshotMatchEvents.readSnapshot({ matchId: "m-2" })
+const asOfVersion = Option.match(snapshot, {
+  onNone: () => 0,
+  onSome: (s) => s.asOfVersion,
+})
+// → asOfVersion: 3
+```
+
+`readSnapshot` returns `Option<Snapshot<State>>`, where `Snapshot` carries the decoded
+`state`, the `asOfVersion` it reflects, and a `timestamp`.
+
+The next command folds from that snapshot plus the single event after it, rather than
+replaying all four — and produces exactly the same state:
+
+```typescript region="snapshot-fold" example="event-sourcing.ts"
+const s4 = yield* handleSnapshotMatch(
+  { matchId: "m-2" },
+  { _tag: "EndMatch", result: "AUS won by 35 runs" },
+)
+```
+
+### Writing a snapshot by hand
+
+Omit `every` to keep the cadence under your own control — for example from a backfill job
+— and call `writeSnapshot` yourself:
+
+```typescript region="write-snapshot" example="event-sourcing.ts"
+const events = yield* snapshotMatchEvents.read({ matchId: "m-2" })
+const folded = EventStore.fold(matchDecider, events)
+yield* snapshotMatchEvents.writeSnapshot({ matchId: "m-2" }, folded, s4.version)
+```
+
+Snapshot writes are **monotonic**: if a newer snapshot already exists, the write is a
+successful no-op rather than a regression of the cache. Auto-snapshot writes are
+best-effort — a failure is logged and never fails the command, because the events it
+summarises are already durable.
+
+---
+
 ## Running the Example
 
 The complete runnable example is at [`examples/event-sourcing.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/examples/event-sourcing.ts) in the repository.
@@ -375,6 +512,9 @@ Effect.runPromise(main).then(
 | **Fold** | `EventStore.fold` reconstructs state from events using the decider's `evolve` function |
 | **Query combinators** | `Query.reverse`, `Query.limit`, `Query.collect` work on event stream queries |
 | **Domain errors** | Tagged errors (`AlreadyStarted`, `NotStarted`, `AlreadyEnded`) for precise error handling |
+| **Snapshots** | `snapshot: { schema, every }` caches a fold of the stream; the handler replays only the delta |
+| **Snapshot primitives** | `readSnapshot` / `writeSnapshot` for manual cadence; monotonic writes, never a cache regression |
+| **Retry** | `{ retry }` re-runs the full read-decide-append cycle on `VersionConflict` only |
 
 ## What's Next?
 

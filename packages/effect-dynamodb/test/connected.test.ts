@@ -13,7 +13,18 @@
  */
 
 import { it } from "@effect/vitest"
-import { Config, DateTime, Duration, Effect, Layer, Option, Schema, Stream } from "effect"
+import {
+  Config,
+  Data,
+  DateTime,
+  Duration,
+  Effect,
+  Layer,
+  Option,
+  Schema,
+  SchemaGetter,
+  Stream,
+} from "effect"
 import { TestClock } from "effect/testing"
 import { afterAll, beforeAll, describe, expect } from "vitest"
 
@@ -6388,5 +6399,382 @@ describeConnected("EventStore append guards (closes #82)", () => {
         const events = yield* EsMatchEvents.read({ matchId: "es-stale" })
         expect(events.map((e) => e.version)).toEqual([1, 2])
       }).pipe(provideEsGuard),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// EventStore snapshots + commandHandler retry (closes #84)
+// ---------------------------------------------------------------------------
+
+const esSnapSchema = DynamoSchema.make({ name: "es-snap", version: 1 })
+const esSnapTableName = `es-snap-${Date.now()}`
+const EsSnapTable = Table.make({ schema: esSnapSchema })
+
+// TaggedClass, not Class: the two events are structurally identical, so an
+// untagged union would decode every `Withdrew` back as a `Deposited`.
+class Deposited extends Schema.TaggedClass<Deposited>()("Deposited", {
+  amount: Schema.Number,
+}) {}
+
+class Withdrew extends Schema.TaggedClass<Withdrew>()("Withdrew", {
+  amount: Schema.Number,
+}) {}
+
+type LedgerEvent = Deposited | Withdrew
+
+interface LedgerState {
+  readonly balance: number
+  readonly txCount: number
+}
+
+/**
+ * Deliberately *transforming*: the balance is stored as a `"cents:<n>"` string,
+ * so a snapshot that skipped `Schema.encodeUnknownEffect` / `decodeUnknownEffect`
+ * would fail to round-trip against real DynamoDB.
+ */
+const BalanceFromCents = Schema.String.pipe(
+  Schema.decodeTo(Schema.Number, {
+    decode: SchemaGetter.transform((s: string) => Number(s.replace("cents:", ""))),
+    encode: SchemaGetter.transform((n: number) => `cents:${n}`),
+  }),
+)
+
+const LedgerStateSchema = Schema.Struct({
+  balance: BalanceFromCents,
+  txCount: Schema.Number,
+})
+
+class InsufficientFunds extends Data.TaggedError("InsufficientFunds")<{
+  readonly balance: number
+}> {}
+
+type LedgerCommand =
+  | { readonly _tag: "Deposit"; readonly amount: number }
+  | { readonly _tag: "Withdraw"; readonly amount: number }
+
+const ledgerDecider: EventStore.Decider<
+  LedgerState,
+  LedgerCommand,
+  LedgerEvent,
+  InsufficientFunds
+> = {
+  initialState: { balance: 0, txCount: 0 },
+  decide: (command, state) =>
+    Effect.gen(function* () {
+      if (command._tag === "Deposit") return [new Deposited({ amount: command.amount })]
+      if (state.balance < command.amount) {
+        return yield* new InsufficientFunds({ balance: state.balance })
+      }
+      return [new Withdrew({ amount: command.amount })]
+    }),
+  evolve: (state, event) =>
+    event instanceof Deposited
+      ? { balance: state.balance + event.amount, txCount: state.txCount + 1 }
+      : { balance: state.balance - event.amount, txCount: state.txCount + 1 },
+}
+
+/** No snapshots — the pre-#84 baseline. */
+const PlainLedger = EventStore.makeStream({
+  table: EsSnapTable,
+  streamName: "Plain",
+  events: [Deposited, Withdrew],
+  streamId: { composite: ["accountId"] },
+})
+
+/** Snapshots enabled, auto-snapshot every 3 events. */
+const SnapLedger = EventStore.makeStream({
+  table: EsSnapTable,
+  streamName: "Snap",
+  events: [Deposited, Withdrew],
+  streamId: { composite: ["accountId"] },
+  snapshot: { schema: LedgerStateSchema, every: 3 },
+})
+
+const EsSnapTestLayer = Layer.mergeAll(ClientLayer, EsSnapTable.layer({ name: esSnapTableName }))
+const provideEsSnap = Effect.provide(EsSnapTestLayer)
+
+describeConnected("EventStore snapshots + retry (closes #84)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: esSnapTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: "sk", AttributeType: "S" },
+          ],
+        })
+      }).pipe(provideEsSnap, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: esSnapTableName })
+      }).pipe(
+        provideEsSnap,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("snapshot round-trips through a transforming state schema", () =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+
+      yield* SnapLedger.writeSnapshot({ accountId: "rt-1" }, { balance: 4200, txCount: 7 }, 7)
+
+      const read = yield* SnapLedger.readSnapshot({ accountId: "rt-1" })
+      expect(Option.isSome(read)).toBe(true)
+      const snapshot = Option.getOrThrow(read)
+      expect(snapshot.state).toEqual({ balance: 4200, txCount: 7 })
+      expect(snapshot.asOfVersion).toBe(7)
+      expect(typeof snapshot.timestamp).toBe("string")
+
+      // The *stored* form is the encoded one — proves encode-on-write happened.
+      const raw = yield* client.getItem({
+        TableName: esSnapTableName,
+        Key: {
+          pk: { S: "$es-snap#v1#snap#rt-1" },
+          sk: { S: "$es-snap#v1#snap.snapshot" },
+        },
+        ConsistentRead: true,
+      })
+      expect(raw.Item?.state?.M?.balance?.S).toBe("cents:4200")
+      expect(raw.Item?.__edd_e__?.S).toBe("snap.snapshot")
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("readSnapshot returns None when no snapshot has been written", () =>
+    Effect.gen(function* () {
+      const result = yield* SnapLedger.readSnapshot({ accountId: "absent-1" })
+      expect(Option.isNone(result)).toBe(true)
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("snapshot writes are monotonic — an older asOfVersion is a no-op", () =>
+    Effect.gen(function* () {
+      yield* SnapLedger.writeSnapshot({ accountId: "mono-1" }, { balance: 500, txCount: 5 }, 5)
+      // Losing the race must not regress the cache, and must not fail.
+      yield* SnapLedger.writeSnapshot({ accountId: "mono-1" }, { balance: 100, txCount: 1 }, 1)
+
+      const snapshot = Option.getOrThrow(yield* SnapLedger.readSnapshot({ accountId: "mono-1" }))
+      expect(snapshot.asOfVersion).toBe(5)
+      expect(snapshot.state).toEqual({ balance: 500, txCount: 5 })
+
+      // A strictly newer version does overwrite.
+      yield* SnapLedger.writeSnapshot({ accountId: "mono-1" }, { balance: 900, txCount: 9 }, 9)
+      const newer = Option.getOrThrow(yield* SnapLedger.readSnapshot({ accountId: "mono-1" }))
+      expect(newer.asOfVersion).toBe(9)
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("the snapshot item is invisible to read / readFrom / currentVersion", () =>
+    Effect.gen(function* () {
+      yield* SnapLedger.append(
+        { accountId: "iso-1" },
+        [
+          new Deposited({ amount: 10 }),
+          new Deposited({ amount: 20 }),
+          new Deposited({ amount: 30 }),
+        ],
+        0,
+      )
+      // The snapshot SK sorts AFTER every event SK in the same partition, so a
+      // `Limit`-bearing reverse query would hit it first without SK hardening.
+      yield* SnapLedger.writeSnapshot({ accountId: "iso-1" }, { balance: 30, txCount: 2 }, 2)
+
+      const all = yield* SnapLedger.read({ accountId: "iso-1" })
+      expect(all.map((e) => e.version)).toEqual([1, 2, 3])
+
+      const delta = yield* SnapLedger.readFrom({ accountId: "iso-1" }, 2)
+      expect(delta.map((e) => e.version)).toEqual([3])
+
+      // Without the begins_with bound this returns 0 (the snapshot is evaluated
+      // first, then filtered out by __edd_e__, leaving an empty page).
+      expect(yield* SnapLedger.currentVersion({ accountId: "iso-1" })).toBe(3)
+
+      // ...and events are invisible to readSnapshot.
+      const snapshot = Option.getOrThrow(yield* SnapLedger.readSnapshot({ accountId: "iso-1" }))
+      expect(snapshot.asOfVersion).toBe(2)
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("snapshot-aware handler agrees with a full replay and auto-snapshots", () =>
+    Effect.gen(function* () {
+      const handle = EventStore.commandHandler(ledgerDecider, SnapLedger)
+      const key = { accountId: "auto-1" }
+
+      // every: 3 — v1, v2 stay below the threshold.
+      yield* handle(key, { _tag: "Deposit", amount: 100 })
+      yield* handle(key, { _tag: "Deposit", amount: 50 })
+      expect(Option.isNone(yield* SnapLedger.readSnapshot(key))).toBe(true)
+
+      // v3 crosses it.
+      const r3 = yield* handle(key, { _tag: "Withdraw", amount: 30 })
+      expect(r3.version).toBe(3)
+      expect(r3.state).toEqual({ balance: 120, txCount: 3 })
+
+      const snapshot = Option.getOrThrow(yield* SnapLedger.readSnapshot(key))
+      expect(snapshot.asOfVersion).toBe(3)
+      expect(snapshot.state).toEqual({ balance: 120, txCount: 3 })
+
+      // The next command reads the snapshot and folds only the delta — the
+      // result must be identical to a full replay of the same events.
+      const r4 = yield* handle(key, { _tag: "Deposit", amount: 80 })
+      expect(r4.version).toBe(4)
+      expect(r4.state).toEqual({ balance: 200, txCount: 4 })
+
+      const replayed = EventStore.fold(ledgerDecider, yield* SnapLedger.read(key))
+      expect(replayed).toEqual(r4.state)
+
+      // Still at v3 — only 1 event since the last snapshot.
+      expect(Option.getOrThrow(yield* SnapLedger.readSnapshot(key)).asOfVersion).toBe(3)
+
+      // v6 crosses the threshold again.
+      yield* handle(key, { _tag: "Deposit", amount: 1 })
+      const r6 = yield* handle(key, { _tag: "Deposit", amount: 1 })
+      expect(r6.version).toBe(6)
+      expect(Option.getOrThrow(yield* SnapLedger.readSnapshot(key)).asOfVersion).toBe(6)
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("a snapshot-aware handler and a plain handler reach the same state", () =>
+    Effect.gen(function* () {
+      const snapHandle = EventStore.commandHandler(ledgerDecider, SnapLedger)
+      const plainHandle = EventStore.commandHandler(ledgerDecider, PlainLedger)
+      const commands: ReadonlyArray<LedgerCommand> = [
+        { _tag: "Deposit", amount: 10 },
+        { _tag: "Deposit", amount: 20 },
+        { _tag: "Withdraw", amount: 5 },
+        { _tag: "Deposit", amount: 7 },
+        { _tag: "Withdraw", amount: 2 },
+      ]
+
+      let snapState: LedgerState = ledgerDecider.initialState
+      let plainState: LedgerState = ledgerDecider.initialState
+      for (const command of commands) {
+        snapState = (yield* snapHandle({ accountId: "parity-1" }, command)).state
+        plainState = (yield* plainHandle({ accountId: "parity-1" }, command)).state
+      }
+
+      expect(snapState).toEqual(plainState)
+      expect(snapState).toEqual({ balance: 30, txCount: 5 })
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("domain errors from the decider still fail the handler", () =>
+    Effect.gen(function* () {
+      const handle = EventStore.commandHandler(ledgerDecider, SnapLedger, { retry: 3 })
+      const error = yield* handle({ accountId: "domain-1" }, { _tag: "Withdraw", amount: 10 }).pipe(
+        Effect.flip,
+      )
+      expect(error._tag).toBe("InsufficientFunds")
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("without retry, a real concurrent conflict surfaces as VersionConflict", () =>
+    Effect.gen(function* () {
+      const handle = EventStore.commandHandler(ledgerDecider, PlainLedger)
+      const key = { accountId: "conflict-1" }
+
+      const results = yield* Effect.all(
+        [
+          handle(key, { _tag: "Deposit", amount: 10 }).pipe(Effect.result),
+          handle(key, { _tag: "Deposit", amount: 20 }).pipe(Effect.result),
+        ],
+        { concurrency: 2 },
+      )
+
+      const failures = results.filter((r) => r._tag === "Failure")
+      expect(failures).toHaveLength(1)
+      expect((failures[0] as { failure: { _tag: string } }).failure._tag).toBe("VersionConflict")
+
+      // Only the winner's event landed.
+      expect(yield* PlainLedger.currentVersion(key)).toBe(1)
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("retry resolves a real concurrent VersionConflict by re-deciding", () =>
+    Effect.gen(function* () {
+      const handle = EventStore.commandHandler(ledgerDecider, PlainLedger, { retry: 5 })
+      const key = { accountId: "retry-1" }
+
+      yield* Effect.all(
+        [
+          handle(key, { _tag: "Deposit", amount: 10 }),
+          handle(key, { _tag: "Deposit", amount: 20 }),
+          handle(key, { _tag: "Deposit", amount: 30 }),
+        ],
+        { concurrency: 3 },
+      )
+
+      // All three commands landed exactly once, at consecutive versions — a
+      // blind re-append would have produced duplicates or lost an event.
+      const events = yield* PlainLedger.read(key)
+      expect(events.map((e) => e.version)).toEqual([1, 2, 3])
+      expect(EventStore.fold(ledgerDecider, events)).toEqual({ balance: 60, txCount: 3 })
+      expect(yield* PlainLedger.currentVersion(key)).toBe(3)
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("retry composes with the snapshot-aware read path", () =>
+    Effect.gen(function* () {
+      const handle = EventStore.commandHandler(ledgerDecider, SnapLedger, { retry: 5 })
+      const key = { accountId: "retry-snap-1" }
+
+      yield* Effect.all(
+        [
+          handle(key, { _tag: "Deposit", amount: 100 }),
+          handle(key, { _tag: "Deposit", amount: 200 }),
+          handle(key, { _tag: "Deposit", amount: 300 }),
+          handle(key, { _tag: "Deposit", amount: 400 }),
+        ],
+        { concurrency: 4 },
+      )
+
+      const events = yield* SnapLedger.read(key)
+      expect(events.map((e) => e.version)).toEqual([1, 2, 3, 4])
+      expect(EventStore.fold(ledgerDecider, events)).toEqual({ balance: 1000, txCount: 4 })
+
+      // The auto-snapshot (every: 3) fired and is consistent with the stream.
+      const snapshot = Option.getOrThrow(yield* SnapLedger.readSnapshot(key))
+      expect(snapshot.asOfVersion).toBeGreaterThanOrEqual(3)
+      const upTo = events.filter((e) => e.version <= snapshot.asOfVersion)
+      expect(EventStore.fold(ledgerDecider, upTo)).toEqual(snapshot.state)
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("bind carries the snapshot primitives with R = never", () =>
+    Effect.gen(function* () {
+      const bound = yield* EventStore.bind(SnapLedger)
+      expect(bound.snapshotConfig).toEqual({ every: 3 })
+
+      const program: Effect.Effect<number, unknown, never> = Effect.gen(function* () {
+        yield* bound.writeSnapshot({ accountId: "bind-1" }, { balance: 11, txCount: 1 }, 1)
+        const snapshot = yield* bound.readSnapshot({ accountId: "bind-1" })
+        return Option.getOrThrow(snapshot).state.balance
+      })
+
+      expect(yield* program).toBe(11)
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("data-last commandHandler works against a live stream", () =>
+    Effect.gen(function* () {
+      const handle = PlainLedger.pipe(EventStore.commandHandler(ledgerDecider, { retry: 2 }))
+      const result = yield* handle({ accountId: "datalast-1" }, { _tag: "Deposit", amount: 42 })
+      expect(result.version).toBe(1)
+      expect(result.state).toEqual({ balance: 42, txCount: 1 })
+    }).pipe(provideEsSnap),
   )
 })
