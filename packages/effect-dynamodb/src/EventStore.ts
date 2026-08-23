@@ -49,15 +49,45 @@ export interface Decider<State, Command, Event, E = never> {
 
 /**
  * A persisted event read from a stream, enriched with stream metadata.
+ *
+ * @typeParam A - The decoded event type
+ * @typeParam M - The decoded metadata type (defaults to an untyped record for
+ *   streams without a metadata schema)
  */
-export interface StreamEvent<A> {
+export interface StreamEvent<A, M = Record<string, unknown> | undefined> {
   readonly streamId: string
   readonly version: number
   readonly eventType: string
   readonly data: A
-  readonly metadata: Record<string, unknown> | undefined
+  readonly metadata: M
   readonly timestamp: string
 }
+
+/**
+ * Metadata type carried on {@link StreamEvent} for a stream: the decoded
+ * metadata schema type when the stream declares one, an untyped record
+ * otherwise (events may carry metadata written outside the typed API).
+ */
+export type StreamMetadata<TMetadata> = [TMetadata] extends [undefined]
+  ? Record<string, unknown> | undefined
+  : TMetadata | undefined
+
+// ---------------------------------------------------------------------------
+// Envelope schema — validates the persisted event's system fields on read
+// ---------------------------------------------------------------------------
+
+/**
+ * Schema for the persisted event envelope (system fields written by `append`).
+ * Event `data` and `metadata` are decoded separately through their own schemas.
+ *
+ * @internal
+ */
+const EventEnvelope = Schema.Struct({
+  streamId: Schema.String,
+  version: Schema.Number,
+  eventType: Schema.String,
+  timestamp: Schema.String,
+})
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -118,7 +148,7 @@ export interface EventStream<TEvent, TStreamIdFields extends ReadonlyArray<strin
   readonly read: (
     streamId: StreamIdInput<TStreamIdFields>,
   ) => Effect.Effect<
-    ReadonlyArray<StreamEvent<TEvent>>,
+    ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
     DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
@@ -127,7 +157,7 @@ export interface EventStream<TEvent, TStreamIdFields extends ReadonlyArray<strin
     streamId: StreamIdInput<TStreamIdFields>,
     afterVersion: number,
   ) => Effect.Effect<
-    ReadonlyArray<StreamEvent<TEvent>>,
+    ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
     DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
@@ -137,7 +167,9 @@ export interface EventStream<TEvent, TStreamIdFields extends ReadonlyArray<strin
   ) => Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig>
 
   readonly query: {
-    readonly events: (streamId: StreamIdInput<TStreamIdFields>) => Query.Query<StreamEvent<TEvent>>
+    readonly events: (
+      streamId: StreamIdInput<TStreamIdFields>,
+    ) => Query.Query<StreamEvent<TEvent, StreamMetadata<TMetadata>>>
   }
 }
 
@@ -218,31 +250,88 @@ export const makeStream = <
     DynamoSchema.composeEventVersionKey(schema, entityType, version)
 
   // ---------------------------------------------------------------------------
+  // Codec helpers — write encodes, read decodes (symmetry with Entity/Aggregate)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Resolve the schema to encode an event with. Prefers the exact member
+   * schema (via `instanceof` for `Schema.Class`/`Schema.TaggedClass` events)
+   * over the union so structurally-overlapping members can't shadow each
+   * other; falls back to the union for non-class event schemas.
+   */
+  const memberSchemaFor = (event: unknown): Schema.Top => {
+    if (config.events.length === 1) return config.events[0]!
+    for (const member of config.events) {
+      const ctor = member as unknown as abstract new (...args: never) => unknown
+      if (typeof ctor === "function" && event instanceof ctor) return member
+    }
+    return eventUnion
+  }
+
+  /**
+   * Validate input and produce wire-form output: `Schema.encode` first, with a
+   * `decode → encode` fallback for inputs already in encoded shape. Mirrors
+   * the Entity write path (`encodeOrDecodeEncode` in `Entity.ts`).
+   */
+  const encodeToWire = (
+    codec: Schema.Codec<any>,
+    input: unknown,
+    operation: string,
+  ): Effect.Effect<unknown, ValidationError> =>
+    Schema.encodeUnknownEffect(codec)(input).pipe(
+      Effect.catch((primaryCause) =>
+        Schema.decodeUnknownEffect(codec)(input).pipe(
+          Effect.flatMap((decoded) => Schema.encodeUnknownEffect(codec)(decoded)),
+          // Surface the original encode error — its message is keyed on the
+          // caller's input shape, which is what the user expects to see.
+          Effect.catch(() =>
+            Effect.fail(new ValidationError({ entityType, operation, cause: primaryCause })),
+          ),
+        ),
+      ),
+    )
+
+  // ---------------------------------------------------------------------------
   // Decode a raw DynamoDB item → StreamEvent<TEvent>
   // ---------------------------------------------------------------------------
+
+  const decodeEnvelope = Schema.decodeUnknownEffect(EventEnvelope)
 
   const decodeStreamEvent = (
     raw: Record<string, unknown>,
   ): Effect.Effect<StreamEvent<TEvent>, ValidationError> =>
     Effect.gen(function* () {
+      const toValidationError = (operation: string) => (cause: unknown) =>
+        new ValidationError({ entityType, operation, cause })
+
+      const envelope = yield* decodeEnvelope(raw).pipe(
+        Effect.mapError(toValidationError("EventStore.decode")),
+      )
+
       const decoder = Schema.decodeUnknownEffect(eventUnion as Schema.Schema<TEvent>)
       const data = yield* (decoder(raw.data) as Effect.Effect<TEvent, unknown>).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ValidationError({
-              entityType,
-              operation: "EventStore.decode",
-              cause,
-            }),
-        ),
+        Effect.mapError(toValidationError("EventStore.decode")),
       )
+
+      // Metadata is decoded through its schema when the stream declares one —
+      // the mirror of the encode performed by `append`. Streams without a
+      // metadata schema surface the stored attribute map untouched.
+      let metadata: unknown
+      if (raw.metadata !== undefined) {
+        metadata = metadataSchema
+          ? yield* Schema.decodeUnknownEffect(metadataSchema as Schema.Schema<unknown>)(
+              raw.metadata,
+            ).pipe(Effect.mapError(toValidationError("EventStore.decode.metadata")))
+          : raw.metadata
+      }
+
       return {
-        streamId: raw.streamId as string,
-        version: raw.version as number,
-        eventType: raw.eventType as string,
+        streamId: envelope.streamId,
+        version: envelope.version,
+        eventType: envelope.eventType,
         data,
-        metadata: raw.metadata as Record<string, unknown> | undefined,
-        timestamp: raw.timestamp as string,
+        metadata,
+        timestamp: envelope.timestamp,
       }
     }) as Effect.Effect<StreamEvent<TEvent>, ValidationError>
 
@@ -273,60 +362,65 @@ export const makeStream = <
         .map((f) => (streamId as Record<string, unknown>)[f])
         .join("#")
 
-      // Validate and encode metadata if schema provided
+      // Validate and encode metadata to wire form if schema provided
       let encodedMetadata: Record<string, unknown> | undefined
       if (options?.metadata !== undefined && metadataSchema) {
-        const validated = yield* Schema.decodeUnknownEffect(
-          metadataSchema as Schema.Schema<unknown>,
-        )(options.metadata).pipe(
-          Effect.mapError(
-            (cause) =>
-              new ValidationError({
-                entityType,
-                operation: "EventStore.append.metadata",
-                cause,
-              }),
-          ),
+        const encoded = yield* encodeToWire(
+          metadataSchema as Schema.Codec<any>,
+          options.metadata,
+          "EventStore.append.metadata",
         )
-        encodedMetadata = validated as Record<string, unknown>
+        encodedMetadata = encoded as Record<string, unknown>
       } else if (options?.metadata !== undefined) {
         encodedMetadata = options.metadata as Record<string, unknown>
       }
 
-      // Build transact items — one Put per event, each with attribute_not_exists(pk)
-      const transactItems = events.map((event, i) => {
-        const version = expectedVersion + i + 1
-        // In Effect v4, Schema.Class instances don't have _tag as an own property.
-        // The identifier is on the constructor (class) itself.
-        const evtType =
-          ((event as Record<string, unknown>)._tag as string | undefined) ??
-          (event as { constructor: { identifier?: string } }).constructor.identifier ??
-          (event as { constructor: { name: string } }).constructor.name
+      // Build transact items — one Put per event, each with attribute_not_exists(pk).
+      // Events are encoded to wire form through their schema (codec symmetry
+      // with the read path, which decodes through the same schema).
+      const transactItems = yield* Effect.forEach(events, (event, i) =>
+        Effect.gen(function* () {
+          const version = expectedVersion + i + 1
+          // In Effect v4, Schema.Class instances don't have _tag as an own property.
+          // The identifier is on the constructor (class) itself.
+          const evtType =
+            ((event as Record<string, unknown>)._tag as string | undefined) ??
+            (event as { constructor: { identifier?: string } }).constructor.identifier ??
+            (event as { constructor: { name: string } }).constructor.name
 
-        const eventData = { _tag: evtType, ...(event as Record<string, unknown>) }
+          const wire = yield* encodeToWire(
+            memberSchemaFor(event) as Schema.Codec<any>,
+            event,
+            "EventStore.append",
+          )
 
-        const item: Record<string, unknown> = {
-          pk,
-          sk: composeEventSk(version),
-          __edd_e__: entityType,
-          streamId: streamIdStr,
-          version,
-          eventType: evtType,
-          data: eventData,
-          timestamp: now,
-        }
-        if (encodedMetadata !== undefined) {
-          item.metadata = encodedMetadata
-        }
+          // Inject _tag for plain Schema.Class events; Schema.TaggedClass
+          // events already carry _tag in their encoded form, which wins.
+          const eventData = { _tag: evtType, ...(wire as Record<string, unknown>) }
 
-        return {
-          Put: {
-            TableName: tableName,
-            Item: toAttributeMap(item),
-            ConditionExpression: "attribute_not_exists(pk)",
-          },
-        }
-      })
+          const item: Record<string, unknown> = {
+            pk,
+            sk: composeEventSk(version),
+            __edd_e__: entityType,
+            streamId: streamIdStr,
+            version,
+            eventType: evtType,
+            data: eventData,
+            timestamp: now,
+          }
+          if (encodedMetadata !== undefined) {
+            item.metadata = encodedMetadata
+          }
+
+          return {
+            Put: {
+              TableName: tableName,
+              Item: toAttributeMap(item),
+              ConditionExpression: "attribute_not_exists(pk)",
+            },
+          }
+        }),
+      )
 
       yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
         Effect.mapError((error) => {
@@ -503,19 +597,29 @@ export interface BoundEventStream<
 
   readonly read: (
     streamId: StreamIdInput<TStreamIdFields>,
-  ) => Effect.Effect<ReadonlyArray<StreamEvent<TEvent>>, DynamoClientError | ValidationError, never>
+  ) => Effect.Effect<
+    ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
+    DynamoClientError | ValidationError,
+    never
+  >
 
   readonly readFrom: (
     streamId: StreamIdInput<TStreamIdFields>,
     afterVersion: number,
-  ) => Effect.Effect<ReadonlyArray<StreamEvent<TEvent>>, DynamoClientError | ValidationError, never>
+  ) => Effect.Effect<
+    ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
+    DynamoClientError | ValidationError,
+    never
+  >
 
   readonly currentVersion: (
     streamId: StreamIdInput<TStreamIdFields>,
   ) => Effect.Effect<number, DynamoClientError | ValidationError, never>
 
   readonly query: {
-    readonly events: (streamId: StreamIdInput<TStreamIdFields>) => Query.Query<StreamEvent<TEvent>>
+    readonly events: (
+      streamId: StreamIdInput<TStreamIdFields>,
+    ) => Query.Query<StreamEvent<TEvent, StreamMetadata<TMetadata>>>
   }
 
   /** Escape hatch: provide DynamoClient | TableConfig to an arbitrary effect. */

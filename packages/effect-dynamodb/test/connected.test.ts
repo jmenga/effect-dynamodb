@@ -34,7 +34,9 @@ import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
+import * as EventStore from "../src/EventStore.js"
 import * as Expression from "../src/Expression.js"
+import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
@@ -5959,5 +5961,257 @@ describeConnected("vector search — soft delete round trip (closes #78)", () =>
       expect(after.map((h) => h.item.docId)).toEqual(["d-soft"])
       expect(after[0]!.similarity).toBeCloseTo(before[0]!.similarity, 10)
     }).pipe(provideSoftVec),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// EventStore — codec symmetry + real cancellation mapping (closes #81)
+// ---------------------------------------------------------------------------
+//
+// EventStore previously had ZERO connected coverage: every assertion ran
+// against a stubbed client with a hand-crafted `CancellationReasons` array.
+// These tests exercise the real DynamoDB wire format and the real
+// `TransactionCanceledException` shapes DynamoDB emits.
+
+const EsSchema = DynamoSchema.make({ name: "es-connected", version: 1 })
+
+class EsGoalScored extends Schema.Class<EsGoalScored>("EsGoalScored")({
+  scorer: Schema.String,
+  occurredAt: Schema.DateTimeUtcFromString,
+}) {}
+
+class EsMatchAbandoned extends Schema.TaggedClass<EsMatchAbandoned>()("EsMatchAbandoned", {
+  reason: Schema.String,
+  abandonedAt: Schema.DateTimeUtcFromString,
+}) {}
+
+const EsMetadata = Schema.Struct({
+  correlationId: Schema.String,
+  recordedAt: Schema.DateTimeUtcFromString,
+})
+
+const EsTable = Table.make({ schema: EsSchema })
+const esTableName = `es-events-${Date.now()}`
+const EsStream = EventStore.makeStream({
+  table: EsTable,
+  streamName: "EsMatch",
+  events: [EsGoalScored, EsMatchAbandoned],
+  streamId: { composite: ["matchId"] },
+  metadata: EsMetadata,
+})
+const EsTestLayer = Layer.mergeAll(ClientLayer, EsTable.layer({ name: esTableName }))
+const provideEs = Effect.provide(EsTestLayer)
+
+// A second table whose partition key is declared as a NUMBER. EventStore always
+// writes a string `pk`, so every Put in the transaction is cancelled by real
+// DynamoDB with `Code: "ValidationError"` — a genuine, non-ConditionalCheckFailed
+// cancellation reason produced by the service rather than hand-crafted in a mock.
+const EsBadKeyTable = Table.make({ schema: EsSchema })
+const esBadKeyTableName = `es-badkey-${Date.now()}`
+const EsBadKeyStream = EventStore.makeStream({
+  table: EsBadKeyTable,
+  streamName: "EsBadKey",
+  events: [EsGoalScored],
+  streamId: { composite: ["matchId"] },
+})
+const EsBadKeyLayer = Layer.mergeAll(ClientLayer, EsBadKeyTable.layer({ name: esBadKeyTableName }))
+const provideEsBadKey = Effect.provide(EsBadKeyLayer)
+
+const esStreamPk = (matchId: string) => DynamoSchema.composeKey(EsSchema, "esmatch", [matchId])
+
+describeConnected("EventStore connected tests (closes #81)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: esTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: "sk", AttributeType: "S" },
+          ],
+        })
+        yield* client.createTable({
+          TableName: esBadKeyTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          // Deliberate mismatch: EventStore writes `pk` as a string.
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "N" },
+            { AttributeName: "sk", AttributeType: "S" },
+          ],
+        })
+      }).pipe(provideEs, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: esTableName }).pipe(Effect.catch(() => Effect.void))
+        yield* client
+          .deleteTable({ TableName: esBadKeyTableName })
+          .pipe(Effect.catch(() => Effect.void))
+      }).pipe(provideEs, Effect.scoped),
+    )
+  }, 20000)
+
+  // -------------------------------------------------------------------------
+  // Codec symmetry against real DynamoDB
+  // -------------------------------------------------------------------------
+
+  it.effect("transforming event + metadata schemas round-trip append → read", () =>
+    Effect.gen(function* () {
+      const occurredAt = DateTime.makeUnsafe("2026-05-04T09:30:00.000Z")
+      const recordedAt = DateTime.makeUnsafe("2026-05-04T09:31:00.000Z")
+
+      yield* EsStream.append(
+        { matchId: "rt-1" },
+        [
+          new EsGoalScored({ scorer: "Kane", occurredAt }),
+          new EsMatchAbandoned({ reason: "rain", abandonedAt: occurredAt }),
+        ],
+        0,
+        { metadata: { correlationId: "corr-rt-1", recordedAt } },
+      )
+
+      // 1. The bytes actually stored are the ENCODED (wire) form — ISO strings,
+      //    not a marshalled `DateTime.Utc` instance.
+      const client = yield* DynamoClient
+      const raw = yield* client.query({
+        TableName: esTableName,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: esStreamPk("rt-1") } },
+      })
+      const stored = (raw.Items ?? []).map((i) => fromAttributeMap(i))
+      expect(stored).toHaveLength(2)
+      expect(stored[0]!.data).toEqual({
+        _tag: "EsGoalScored",
+        scorer: "Kane",
+        occurredAt: "2026-05-04T09:30:00.000Z",
+      })
+      expect(stored[0]!.metadata).toEqual({
+        correlationId: "corr-rt-1",
+        recordedAt: "2026-05-04T09:31:00.000Z",
+      })
+      expect(stored[1]!.data).toEqual({
+        _tag: "EsMatchAbandoned",
+        reason: "rain",
+        abandonedAt: "2026-05-04T09:30:00.000Z",
+      })
+
+      // 2. The read path decodes back to the domain types.
+      const events = yield* EsStream.read({ matchId: "rt-1" })
+      expect(events.map((e) => e.version)).toEqual([1, 2])
+      expect(events.map((e) => e.eventType)).toEqual(["EsGoalScored", "EsMatchAbandoned"])
+
+      const goal = events[0]!.data as EsGoalScored
+      expect(goal).toBeInstanceOf(EsGoalScored)
+      expect(DateTime.isDateTime(goal.occurredAt)).toBe(true)
+      expect(DateTime.toEpochMillis(goal.occurredAt)).toBe(DateTime.toEpochMillis(occurredAt))
+
+      const abandoned = events[1]!.data as EsMatchAbandoned
+      expect(abandoned).toBeInstanceOf(EsMatchAbandoned)
+      expect(abandoned._tag).toBe("EsMatchAbandoned")
+      expect(DateTime.toEpochMillis(abandoned.abandonedAt)).toBe(DateTime.toEpochMillis(occurredAt))
+
+      // 3. Metadata is DECODED on read, not returned as a raw attribute map.
+      const metadata = events[0]!.metadata
+      expect(metadata?.correlationId).toBe("corr-rt-1")
+      expect(DateTime.isDateTime(metadata?.recordedAt as DateTime.Utc)).toBe(true)
+      expect(DateTime.toEpochMillis(metadata?.recordedAt as DateTime.Utc)).toBe(
+        DateTime.toEpochMillis(recordedAt),
+      )
+    }).pipe(provideEs),
+  )
+
+  // -------------------------------------------------------------------------
+  // Optimistic concurrency against real DynamoDB
+  // -------------------------------------------------------------------------
+
+  it.effect(
+    "two concurrent appends at the same expectedVersion → 1 success, 1 VersionConflict",
+    () =>
+      Effect.gen(function* () {
+        const occurredAt = DateTime.makeUnsafe("2026-05-04T10:00:00.000Z")
+        const attempt = (scorer: string) =>
+          EsStream.append({ matchId: "cc-1" }, [new EsGoalScored({ scorer, occurredAt })], 0).pipe(
+            Effect.map(() => "ok" as const),
+            Effect.catch((error) => Effect.succeed(error._tag)),
+          )
+
+        const outcomes = yield* Effect.all([attempt("Kane"), attempt("Son")], {
+          concurrency: "unbounded",
+        })
+
+        expect(outcomes.filter((o) => o === "ok")).toHaveLength(1)
+        expect(outcomes.filter((o) => o === "VersionConflict")).toHaveLength(1)
+
+        // Exactly one event landed — the loser wrote nothing.
+        const events = yield* EsStream.read({ matchId: "cc-1" })
+        expect(events).toHaveLength(1)
+        expect(yield* EsStream.currentVersion({ matchId: "cc-1" })).toBe(1)
+      }).pipe(provideEs),
+  )
+
+  it.effect("real mixed-reason cancellation [ConditionalCheckFailed, None] → VersionConflict", () =>
+    Effect.gen(function* () {
+      const occurredAt = DateTime.makeUnsafe("2026-05-04T11:00:00.000Z")
+      yield* EsStream.append(
+        { matchId: "mx-1" },
+        [new EsGoalScored({ scorer: "Kane", occurredAt })],
+        0,
+      )
+
+      // Two events at a stale expectedVersion: the first Put collides with the
+      // existing v1 (ConditionalCheckFailed), the second targets a free v2 and
+      // is reported by DynamoDB as `Code: "None"`. That heterogeneous reasons
+      // array is exactly what a hand-crafted mock never produces.
+      const error = yield* EsStream.append(
+        { matchId: "mx-1" },
+        [
+          new EsGoalScored({ scorer: "Son", occurredAt }),
+          new EsGoalScored({ scorer: "Maddison", occurredAt }),
+        ],
+        0,
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("VersionConflict")
+      expect((error as { expectedVersion: number }).expectedVersion).toBe(0)
+
+      // Nothing was written — the whole transaction rolled back.
+      const events = yield* EsStream.read({ matchId: "mx-1" })
+      expect(events).toHaveLength(1)
+      expect((events[0]!.data as EsGoalScored).scorer).toBe("Kane")
+    }).pipe(provideEs),
+  )
+
+  it.effect("non-conditional cancellation reason → TransactionCancelled", () =>
+    Effect.gen(function* () {
+      const occurredAt = DateTime.makeUnsafe("2026-05-04T12:00:00.000Z")
+      const error = yield* EsBadKeyStream.append(
+        { matchId: "bad-1" },
+        [new EsGoalScored({ scorer: "Kane", occurredAt })],
+        0,
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("TransactionCancelled")
+      const cancelled = error as { operation: string; reasons: ReadonlyArray<{ code?: string }> }
+      expect(cancelled.operation).toBe("TransactWriteItems")
+      // DynamoDB cancels the item with a ValidationError, not a conditional
+      // check failure — so it must NOT be flattened into a VersionConflict.
+      expect(cancelled.reasons.map((r) => r.code)).toContain("ValidationError")
+      expect(cancelled.reasons.map((r) => r.code)).not.toContain("ConditionalCheckFailed")
+    }).pipe(provideEsBadKey),
   )
 })
