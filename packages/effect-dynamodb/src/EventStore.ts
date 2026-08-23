@@ -14,7 +14,9 @@
 
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
+  AppendTooLarge,
   isAwsTransactionCancelled,
+  TRANSACT_WRITE_ITEMS_LIMIT,
   TransactionCancelled,
   ValidationError,
   VersionConflict,
@@ -141,7 +143,7 @@ export interface EventStream<TEvent, TStreamIdFields extends ReadonlyArray<strin
     options?: { readonly metadata?: TMetadata } | undefined,
   ) => Effect.Effect<
     AppendResult<TEvent>,
-    VersionConflict | DynamoClientError | ValidationError | TransactionCancelled,
+    VersionConflict | AppendTooLarge | DynamoClientError | ValidationError | TransactionCancelled,
     DynamoClient | TableConfig
   >
 
@@ -350,17 +352,30 @@ export const makeStream = <
         return { version: expectedVersion, events: [] }
       }
 
+      // Resolve stream ID string for storage (join composites)
+      const streamIdStr = compositeFields
+        .map((f) => (streamId as Record<string, unknown>)[f])
+        .join("#")
+
+      // Guard: one Put per event, plus one ConditionCheck (version-contiguity
+      // guard) when expectedVersion > 0, must fit DynamoDB's TransactWriteItems
+      // limit. Never chunk — chunking would break append atomicity.
+      const requiredItems = events.length + (expectedVersion > 0 ? 1 : 0)
+      if (requiredItems > TRANSACT_WRITE_ITEMS_LIMIT) {
+        return yield* new AppendTooLarge({
+          streamName: config.streamName,
+          streamId: streamIdStr,
+          count: requiredItems,
+          limit: TRANSACT_WRITE_ITEMS_LIMIT,
+        })
+      }
+
       const client = yield* DynamoClient
       const { name: tableName } = yield* config.table.Tag
 
       const pk = composeStreamPk(streamId as Record<string, unknown>)
       // Clock-backed timestamp (deterministic under TestClock; wall-clock in prod).
       const now = DateTime.formatIso(yield* DateTime.now)
-
-      // Resolve stream ID string for storage (join composites)
-      const streamIdStr = compositeFields
-        .map((f) => (streamId as Record<string, unknown>)[f])
-        .join("#")
 
       // Validate and encode metadata to wire form if schema provided
       let encodedMetadata: Record<string, unknown> | undefined
@@ -422,30 +437,53 @@ export const makeStream = <
         }),
       )
 
-      yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
-        Effect.mapError((error) => {
-          if (isAwsTransactionCancelled(error.cause)) {
-            const reasons = (error.cause.CancellationReasons ?? []).map((r) => ({
-              code: r?.Code,
-              message: r?.Message,
-            }))
-            const hasConflict = reasons.some((r) => r.code === "ConditionalCheckFailed")
-            if (hasConflict) {
-              return new VersionConflict({
-                streamName: config.streamName,
-                streamId: streamIdStr,
-                expectedVersion,
+      // Version-contiguity guard: `attribute_not_exists(pk)` on the Puts only
+      // rejects STALE expected versions (the target slot already exists). An
+      // AHEAD expectedVersion (e.g. 10 when the stream is at 3) would silently
+      // write from version 11, leaving a permanent gap. When expectedVersion > 0,
+      // require the event at exactly `expectedVersion` to exist so the appended
+      // range is contiguous with the stream head. Its failure surfaces as a
+      // ConditionalCheckFailed cancellation reason, mapping to VersionConflict
+      // below just like a stale-version Put failure.
+      const contiguityCheck =
+        expectedVersion > 0
+          ? [
+              {
+                ConditionCheck: {
+                  TableName: tableName,
+                  Key: toAttributeMap({ pk, sk: composeEventSk(expectedVersion) }),
+                  ConditionExpression: "attribute_exists(pk)",
+                },
+              },
+            ]
+          : []
+
+      yield* client
+        .transactWriteItems({ TransactItems: [...contiguityCheck, ...transactItems] })
+        .pipe(
+          Effect.mapError((error) => {
+            if (isAwsTransactionCancelled(error.cause)) {
+              const reasons = (error.cause.CancellationReasons ?? []).map((r) => ({
+                code: r?.Code,
+                message: r?.Message,
+              }))
+              const hasConflict = reasons.some((r) => r.code === "ConditionalCheckFailed")
+              if (hasConflict) {
+                return new VersionConflict({
+                  streamName: config.streamName,
+                  streamId: streamIdStr,
+                  expectedVersion,
+                }) as VersionConflict | DynamoClientError | TransactionCancelled
+              }
+              return new TransactionCancelled({
+                operation: "TransactWriteItems",
+                reasons,
+                cause: error.cause,
               }) as VersionConflict | DynamoClientError | TransactionCancelled
             }
-            return new TransactionCancelled({
-              operation: "TransactWriteItems",
-              reasons,
-              cause: error.cause,
-            }) as VersionConflict | DynamoClientError | TransactionCancelled
-          }
-          return error as VersionConflict | DynamoClientError | TransactionCancelled
-        }),
-      )
+            return error as VersionConflict | DynamoClientError | TransactionCancelled
+          }),
+        )
 
       return {
         version: expectedVersion + events.length,
@@ -591,7 +629,7 @@ export interface BoundEventStream<
     options?: { readonly metadata?: TMetadata } | undefined,
   ) => Effect.Effect<
     AppendResult<TEvent>,
-    VersionConflict | DynamoClientError | ValidationError | TransactionCancelled,
+    VersionConflict | AppendTooLarge | DynamoClientError | ValidationError | TransactionCancelled,
     never
   >
 
@@ -690,7 +728,7 @@ type CommandHandler<
   options?: { readonly metadata?: TMetadata } | undefined,
 ) => Effect.Effect<
   CommandHandlerResult<State, TEvent>,
-  E | VersionConflict | DynamoClientError | ValidationError | TransactionCancelled,
+  E | VersionConflict | AppendTooLarge | DynamoClientError | ValidationError | TransactionCancelled,
   DynamoClient | TableConfig
 >
 
@@ -707,7 +745,7 @@ type BoundCommandHandler<
   options?: { readonly metadata?: TMetadata } | undefined,
 ) => Effect.Effect<
   CommandHandlerResult<State, TEvent>,
-  E | VersionConflict | DynamoClientError | ValidationError | TransactionCancelled,
+  E | VersionConflict | AppendTooLarge | DynamoClientError | ValidationError | TransactionCancelled,
   never
 >
 

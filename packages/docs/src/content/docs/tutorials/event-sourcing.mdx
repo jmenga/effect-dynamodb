@@ -188,6 +188,15 @@ Each call to `handleMatch`:
 3. Runs `decide` with the command and current state
 4. Appends the resulting events with an expected version check
 
+### Append limits and version contiguity
+
+`append` writes every event in a single `TransactWriteItems` request, so an append is all-or-nothing — either every event in the batch is persisted or none is. That atomicity is bounded by DynamoDB's transaction limits:
+
+- **100 items per transaction.** Each event is one transact item, and when `expectedVersion > 0` the version-contiguity `ConditionCheck` (below) occupies one more slot. An append that would exceed the limit fails upfront with a typed `AppendTooLarge` error — before any request is issued. The batch is deliberately **never chunked** into multiple transactions, because chunking would break append atomicity. In practice a single append holds at most 100 events when `expectedVersion` is `0`, and at most 99 otherwise. If you hit this, split the work into smaller commands (separate appends at their own expected versions). The limit is exported as the `TRANSACT_WRITE_ITEMS_LIMIT` constant.
+- **4MB total payload per transaction.** This cap is not pre-validated — the marshalled request size is not practical to compute upfront — so exceeding it surfaces as a `DynamoClientError` from AWS. Keep event payloads small; large blobs belong in S3 with a reference in the event.
+
+`append` also enforces that the appended range is **contiguous** with the stream head. Every event Put is conditioned on `attribute_not_exists(pk)`, which rejects *stale* expected versions (the target version slot already exists). In addition, when `expectedVersion > 0` the transaction carries a `ConditionCheck` requiring the event at exactly `expectedVersion` to exist — so an *ahead* expected version (say `expectedVersion: 10` on a stream whose head is at version 3) fails with `VersionConflict` instead of silently writing version 11 and leaving a permanent hole in the sequence. Both failure modes surface as the same `VersionConflict` error.
+
 ---
 
 ## Step 6: Running Commands
