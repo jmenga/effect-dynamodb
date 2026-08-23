@@ -51,6 +51,8 @@ import type {
   RestoreTableToPointInTimeCommandOutput,
   ScanCommandInput,
   ScanCommandOutput,
+  SearchVectorsCommandInput,
+  SearchVectorsCommandOutput,
   TagResourceCommandInput,
   TagResourceCommandOutput,
   TransactGetItemsCommandInput,
@@ -91,6 +93,7 @@ import {
   RestoreTableFromBackupCommand,
   RestoreTableToPointInTimeCommand,
   ScanCommand,
+  SearchVectorsCommand,
   TagResourceCommand,
   TransactGetItemsCommand,
   TransactWriteItemsCommand,
@@ -101,6 +104,8 @@ import {
   UpdateTimeToLiveCommand,
 } from "@aws-sdk/client-dynamodb"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import type { EmbedderService } from "@effect-dynamodb/schema/Embedder.js"
+import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import type { EntityDefinition } from "@effect-dynamodb/schema/Entity.js"
 import {
   DynamoError,
@@ -122,17 +127,26 @@ import type {
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Config, Context, Crypto, Effect, Layer, type Schema } from "effect"
+import type {
+  VectorIndexConfig,
+  VectorIndexDefinition,
+} from "@effect-dynamodb/schema/VectorIndex.js"
+import { Config, Context, Crypto, Duration, Effect, Layer, Option, type Schema } from "effect"
 import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
 import { bind as aggregateBind } from "./Aggregate.js"
 import type { BoundEntity, Entity as EntityType } from "./Entity.js"
 import { bind as entityBind, fromDefinition as entityFromDefinition } from "./Entity.js"
 import { type BoundQueryConfig, BoundQueryImpl } from "./internal/BoundQuery.js"
+import {
+  type BoundVectorQuery,
+  type BoundVectorQueryConfig,
+  makeBoundVectorQuery,
+} from "./internal/BoundVectorQuery.js"
 import { createConditionOps } from "./internal/Expr.js"
 import { createPathBuilder } from "./internal/PathBuilder.js"
 import * as Query from "./Query.js"
 import type { CreateTableOptions, Table, TableConfig } from "./Table.js"
-import { definition as tableDefinition } from "./Table.js"
+import { mergeVectorIndexes, definition as tableDefinition, toVectorIndexSpec } from "./Table.js"
 
 /** Union of all DynamoDB client error types */
 export type DynamoClientError =
@@ -187,6 +201,21 @@ export interface DynamoClientService {
 
   /** Execute a scan against a table or index. */
   readonly scan: (input: ScanCommandInput) => Effect.Effect<ScanCommandOutput, DynamoClientError>
+
+  /**
+   * Approximate-nearest-neighbour search against a vector index.
+   *
+   * Endpoint routing to `search-dynamodb.{region}.amazonaws.com` is handled by
+   * the standard SDK client's endpoint ruleset (an explicit `endpoint` override
+   * wins), so there is no second client to configure. The operation requires the
+   * `dynamodb:SearchVectors` IAM action — existing read policies do NOT cover it.
+   *
+   * DynamoDB Local does not implement this operation; use
+   * `VectorSearchEmulation.layer` for local testing.
+   */
+  readonly searchVectors: (
+    input: SearchVectorsCommandInput,
+  ) => Effect.Effect<SearchVectorsCommandOutput, DynamoClientError>
 
   /** Batch-get up to 100 items in a single request. */
   readonly batchGetItem: (
@@ -394,6 +423,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly aggregates: TAggregates
       readonly tables: TTables
       readonly crypto?: Crypto.Crypto
+      readonly embedder?: EmbedderService
     }): Effect.Effect<
       TypedClient<TEntities, TAggregates, TTables>,
       never,
@@ -407,6 +437,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly entities: TEntities
       readonly aggregates: TAggregates
       readonly crypto?: Crypto.Crypto
+      readonly embedder?: EmbedderService
     }): Effect.Effect<
       TypedClient<TEntities, TAggregates, Record<string, TableLike>>,
       never,
@@ -420,6 +451,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly entities: TEntities
       readonly tables: TTables
       readonly crypto?: Crypto.Crypto
+      readonly embedder?: EmbedderService
     }): Effect.Effect<
       TypedClient<TEntities, Record<string, never>, TTables>,
       never,
@@ -429,6 +461,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
     <TEntities extends Record<string, { readonly _tag: "Entity" }>>(config: {
       readonly entities: TEntities
       readonly crypto?: Crypto.Crypto
+      readonly embedder?: EmbedderService
     }): Effect.Effect<
       TypedClient<TEntities, Record<string, never>, Record<string, TableLike>>,
       never,
@@ -520,17 +553,19 @@ export type TypedClient<
       infer R,
       any,
       infer TS,
-      infer GenId
+      infer GenId,
+      infer VI
     >
       ? Resolve<
-          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId> & {
+          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI> & {
             /** Scan this entity. Returns a BoundQuery for building scan queries. */
             readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
               Schema.Schema.Type<M>,
               never,
               Schema.Schema.Type<M>
             >
-          } & EntityIndexAccessors<M, I, R>
+          } & EntityIndexAccessors<M, I, R> &
+            EntityVectorAccessors<M, VI>
         >
       : TEntities[K] extends EntityDefinition<
             infer M,
@@ -543,17 +578,19 @@ export type TypedClient<
             infer R,
             any,
             infer TS,
-            infer GenId
+            infer GenId,
+            infer VI
           >
         ? Resolve<
-            BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId> & {
+            BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI> & {
               /** Scan this entity. Returns a BoundQuery for building scan queries. */
               readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
                 Schema.Schema.Type<M>,
                 never,
                 Schema.Schema.Type<M>
               >
-            } & EntityIndexAccessors<M, I, R>
+            } & EntityIndexAccessors<M, I, R> &
+              EntityVectorAccessors<M, VI>
           >
         : never
   }
@@ -631,6 +668,69 @@ type EntityIndexAccessors<
 }
 
 /**
+ * Partition composites a vector index accessor requires.
+ *
+ * Resolves to `never` when the index declares no `partition` — which is exactly
+ * what makes `.partition()` disappear (and the terminals appear immediately) in
+ * {@link BoundVectorQuery}. Same shape as the "PK composites required" rule on
+ * index query accessors.
+ */
+type VectorPartitionInput<M extends Schema.Top, C> = C extends {
+  readonly partition: ReadonlyArray<infer K>
+}
+  ? [K] extends [never]
+    ? never
+    : { readonly [P in K & keyof Schema.Schema.Type<M>]: Schema.Schema.Type<M>[P] }
+  : never
+
+/**
+ * The `INLINE_FILTER` attributes a vector index declares, as a string union.
+ *
+ * Resolves to `never` for an index with no `filters`, which makes `.filter()`
+ * accept only `{}` — matching DynamoDB, where an undeclared filter attribute is
+ * a `ValidationException` rather than a slower query.
+ */
+type VectorFilterNames<C> = C extends { readonly filters: ReadonlyArray<infer K extends string> }
+  ? K
+  : never
+
+/**
+ * Vector search accessors injected for each declared vector index, plus the
+ * `reembed` maintenance operation. Empty when the entity declares none — so a
+ * consumer never sees vector API surface on an entity that has no vectors.
+ */
+type EntityVectorAccessors<M extends Schema.Top, VI> =
+  VI extends Record<string, VectorIndexConfig>
+    ? {
+        readonly [K in keyof VI & string]: (
+          query: string | ReadonlyArray<number>,
+        ) => BoundVectorQuery<
+          Schema.Schema.Type<M>,
+          VectorPartitionInput<M, VI[K]>,
+          VectorFilterNames<VI[K]>,
+          Schema.Schema.Type<M>
+        >
+      } & {
+        /**
+         * Re-derive and rewrite every stored embedding for this entity.
+         *
+         * DynamoDB never recomputes a vector — this is the migration path when the
+         * embedding model or the declared `source.fields` change. Returns the
+         * number of items whose vector was rewritten.
+         */
+        readonly reembed: (options?: {
+          readonly concurrency?: number | undefined
+        }) => Effect.Effect<
+          number,
+          | DynamoClientError
+          | import("@effect-dynamodb/schema/Errors.js").ValidationError
+          | import("@effect-dynamodb/schema/Errors.js").EmbeddingError,
+          never
+        >
+      }
+    : {}
+
+/**
  * Pre-bound table operations with resolved table name.
  */
 export interface TableOperations {
@@ -677,11 +777,47 @@ export interface TableOperations {
   readonly untag: (tagKeys: ReadonlyArray<string>) => Effect.Effect<void, DynamoClientError>
   /** List tags on this table. */
   readonly tags: () => Effect.Effect<ListTagsOfResourceCommandOutput, DynamoClientError>
+
+  // --- Vector indexes ---
+
+  /**
+   * Add a declared vector index to an existing table via `UpdateTable`.
+   * `indexName` is the physical index name declared on a registered entity.
+   *
+   * The index backfills asynchronously; `searchVectors` fails until it is
+   * ACTIVE, so follow this with {@link waitForVectorIndex}.
+   */
+  readonly addVectorIndex: (indexName: string) => Effect.Effect<void, DynamoClientError>
+
+  /** Remove a vector index from the table via `UpdateTable`. */
+  readonly removeVectorIndex: (indexName: string) => Effect.Effect<void, DynamoClientError>
+
+  /**
+   * Poll `DescribeTable` until the named vector index reports `ACTIVE` with
+   * `Backfilling: false`.
+   *
+   * Returns once the index is searchable, or fails with `ResourceNotFoundError`
+   * if the index never appears within the timeout. DynamoDB Local never reports
+   * vector indexes at all, so this resolves immediately there.
+   */
+  readonly waitForVectorIndex: (
+    indexName: string,
+    options?: {
+      readonly pollInterval?: Duration.Input | undefined
+      readonly timeout?: Duration.Input | undefined
+    },
+  ) => Effect.Effect<void, DynamoClientError>
 }
 
 // ---------------------------------------------------------------------------
 // makeFromConfig — entity-centric make implementation
 // ---------------------------------------------------------------------------
+
+/**
+ * Accessor names the bound entity owns outright. A vector index logical name
+ * that lands on one of these would take the corresponding feature offline.
+ */
+const RESERVED_ACCESSOR_NAMES: ReadonlySet<string> = new Set(["scan", "reembed"])
 
 /** @internal Structural entity type for runtime access. */
 interface EntityLike {
@@ -689,6 +825,9 @@ interface EntityLike {
   readonly entityType: string
   readonly model: Schema.Top
   readonly indexes: Record<string, IndexDefinition>
+  readonly _vectorIndexes?: Record<string, VectorIndexDefinition> | undefined
+  /** Domain field name → stored DynamoDB attribute name (`storedAs` renames). */
+  readonly _resolveDbName?: ((domainName: string) => string) | undefined
   readonly _schema: DynamoSchema.DynamoSchema
   readonly _tableTag: Context.Service<TableConfig, TableConfig>
   readonly _injectIndex: (name: string, def: IndexDefinition) => void
@@ -703,6 +842,7 @@ const makeFromConfig = (config: {
   readonly aggregates?: Record<string, AggregateType<any, any, any>>
   readonly tables?: Record<string, TableLike>
   readonly crypto?: Crypto.Crypto
+  readonly embedder?: EmbedderService
 }): Effect.Effect<any, never, DynamoClient | TableConfig> =>
   Effect.gen(function* () {
     // 1. Resolve the provide function from context.
@@ -716,10 +856,41 @@ const makeFromConfig = (config: {
     // admit `Crypto.Crypto`. See `DESIGN.md` for the `R = never` rationale.
     const baseCtx = yield* Effect.context<DynamoClient | TableConfig>()
     const cryptoService = config.crypto ?? makeDefaultCrypto()
-    const ctx = Context.add(baseCtx, Crypto.Crypto, cryptoService)
+    const withCrypto = Context.add(baseCtx, Crypto.Crypto, cryptoService)
+    // Bundle the Embedder the same way, so entities with `vectorIndexes` keep
+    // `R = never` on their bound operations. An explicit `embedder` wins; an
+    // ambient one already in context is honoured; otherwise nothing is added
+    // and the write path fails with a pointed `EmbeddingError` naming the index
+    // (rather than forcing the service on every consumer's type).
+    const ambientEmbedder = Context.getOption(baseCtx, Embedder)
+    const embedderService =
+      config.embedder ?? (Option.isSome(ambientEmbedder) ? ambientEmbedder.value : undefined)
+    const ctx =
+      embedderService !== undefined
+        ? Context.add(withCrypto, Embedder, embedderService)
+        : withCrypto
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig | Crypto.Crypto>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
+
+    // Dimension agreement between the Embedder and every bound vector index is
+    // a construction-time invariant — a mismatch would otherwise surface as a
+    // per-write failure long after wiring. See `DESIGN.md §14`.
+    if (embedderService !== undefined) {
+      for (const [entityKey, rawEntity] of Object.entries(config.entities)) {
+        const declared = (rawEntity as unknown as EntityLike)._vectorIndexes
+        if (!declared) continue
+        for (const [logicalName, definition] of Object.entries(declared)) {
+          if (definition.dimensions === embedderService.dimensions) continue
+          throw new Error(
+            `[EDD-9037] Entity "${entityKey}" vector index "${logicalName}" declares ` +
+              `${definition.dimensions} dimensions, but the provided Embedder produces ` +
+              `${embedderService.dimensions}. Dimensions are immutable on a DynamoDB vector index — ` +
+              `align the index declaration with the embedding model.`,
+          )
+        }
+      }
+    }
 
     // Helper: validate query composites at runtime
     const validateQueryComposites = (
@@ -892,6 +1063,33 @@ const makeFromConfig = (config: {
             collectionMembers.get(collName)!.push({ entityKey: key, entityLike, indexDef })
           }
         }
+      }
+
+      // Vector search accessors — one per declared vector index.
+      for (const [logicalName, definition] of Object.entries(entityLike._vectorIndexes ?? {})) {
+        // Accessors share one namespace on the bound entity. A vector index
+        // named after an existing index accessor (or `scan` / `reembed`) would
+        // silently replace it and take the other feature offline, so make the
+        // collision a construction-time failure instead.
+        if (logicalName in accessors || RESERVED_ACCESSOR_NAMES.has(logicalName)) {
+          throw new Error(
+            `[EDD-9038] Entity "${key}": vector index "${logicalName}" collides with an existing ` +
+              `accessor of the same name. Vector index names share a namespace with GSI query ` +
+              `accessors, \`scan\` and \`reembed\` — rename one of them.`,
+          )
+        }
+        const vqConfig: BoundVectorQueryConfig = {
+          entityType: entityLike.entityType,
+          logicalName,
+          definition,
+          schema: entityLike._schema,
+          tableTag: entityLike._tableTag,
+          decode: (raw) => entityLike._decodeRecord(raw),
+          provide,
+          resolveDbName: entityLike._resolveDbName ?? ((domainName: string) => domainName),
+        }
+        accessors[logicalName] = (query: string | ReadonlyArray<number>) =>
+          makeBoundVectorQuery(vqConfig, query)
       }
 
       // Add scan accessor
@@ -1158,6 +1356,9 @@ const buildTableOperationsFromTable = (
   client: DynamoClientService,
 ): TableOperations => {
   const def = tableDefinition(table)
+  const vectorIndexes = mergeVectorIndexes(
+    table.entities as unknown as Record<string, Parameters<typeof mergeVectorIndexes>[0][string]>,
+  )
   return {
     ...buildTableOperations(tableName, client),
     create: (options?: CreateTableOptions) =>
@@ -1170,6 +1371,43 @@ const buildTableOperationsFromTable = (
           })
           .pipe(Effect.asVoid),
       ),
+    addVectorIndex: (indexName) => {
+      const entry = vectorIndexes.get(indexName)
+      if (entry === undefined) {
+        return Effect.fail(
+          new DynamoError({
+            operation: "UpdateTable",
+            cause:
+              `[EDD-9036] No entity registered on table "${tableName}" declares vector index ` +
+              `"${indexName}". Declared: ${[...vectorIndexes.keys()].sort().join(", ") || "(none)"}`,
+          }),
+        )
+      }
+      // UpdateTable, like CreateTable, requires every SearchSchema element to
+      // be declared in AttributeDefinitions (the composed HASH partition is
+      // always a string; filter types were derived at Entity.make).
+      const attributeDefinitions = [
+        { AttributeName: entry.definition.partitionField, AttributeType: "S" as const },
+        ...Object.entries(entry.filterStoredTypes).map(([AttributeName, AttributeType]) => ({
+          AttributeName,
+          AttributeType,
+        })),
+      ]
+      return client
+        .updateTable({
+          TableName: tableName,
+          AttributeDefinitions: attributeDefinitions,
+          VectorIndexUpdates: [
+            {
+              Create: toVectorIndexSpec(entry.definition, {
+                filters: entry.filters,
+                resolveDbName: entry.resolveDbName,
+              }),
+            },
+          ],
+        })
+        .pipe(Effect.asVoid)
+    },
   }
 }
 
@@ -1267,7 +1505,80 @@ const buildTableOperations = (tableName: string, client: DynamoClientService): T
       })
       .pipe(Effect.asVoid),
   tags: () => client.listTagsOfResource({ ResourceArn: tableName }),
+  addVectorIndex: (indexName) =>
+    Effect.fail(
+      new DynamoError({
+        operation: "UpdateTable",
+        cause:
+          `[EDD-9036] Cannot add vector index "${indexName}" — this table handle was built ` +
+          `without entity registrations, so no vector index declarations are available. ` +
+          `Pass \`tables\` to DynamoClient.make().`,
+      }),
+    ),
+  removeVectorIndex: (indexName) =>
+    client
+      .updateTable({
+        TableName: tableName,
+        VectorIndexUpdates: [{ Delete: { IndexName: indexName } }],
+      })
+      .pipe(Effect.asVoid),
+  waitForVectorIndex: (indexName, options) =>
+    waitForVectorIndexReady(tableName, indexName, client, options),
 })
+
+/** Default poll interval while waiting for a vector index to finish backfilling. */
+const VECTOR_INDEX_POLL_INTERVAL = Duration.seconds(2)
+/** Default overall timeout while waiting for a vector index to finish backfilling. */
+const VECTOR_INDEX_TIMEOUT = Duration.minutes(10)
+
+/**
+ * @internal Poll `DescribeTable` until the named vector index is ACTIVE and no
+ * longer backfilling.
+ *
+ * A vector index absent from `DescribeTable` output is treated as "nothing to
+ * wait for" rather than an error: DynamoDB Local silently discards
+ * `VectorIndexes` on `CreateTable`, so every local run would otherwise block
+ * for the full timeout.
+ */
+const waitForVectorIndexReady = (
+  tableName: string,
+  indexName: string,
+  client: DynamoClientService,
+  options?: {
+    readonly pollInterval?: Duration.Input | undefined
+    readonly timeout?: Duration.Input | undefined
+  },
+): Effect.Effect<void, DynamoClientError> => {
+  const pollInterval = options?.pollInterval ?? VECTOR_INDEX_POLL_INTERVAL
+  const timeout = options?.timeout ?? VECTOR_INDEX_TIMEOUT
+  const poll: Effect.Effect<boolean, DynamoClientError> = Effect.gen(function* () {
+    const described = yield* client.describeTable({ TableName: tableName })
+    const indexes = described.Table?.VectorIndexes
+    if (indexes === undefined || indexes.length === 0) return true
+    const found = indexes.find((i) => i.IndexName === indexName)
+    if (found === undefined) return true
+    return found.IndexStatus === "ACTIVE" && found.Backfilling !== true
+  })
+  return Effect.gen(function* () {
+    while (true) {
+      if (yield* poll) return
+      yield* Effect.sleep(pollInterval)
+    }
+  }).pipe(
+    Effect.timeoutOrElse({
+      duration: timeout,
+      orElse: () =>
+        Effect.fail(
+          new DynamoError({
+            operation: "DescribeTable",
+            cause:
+              `Vector index "${indexName}" on table "${tableName}" did not become ACTIVE within ` +
+              `${Duration.format(Duration.fromInputUnsafe(timeout))}.`,
+          }),
+        ),
+    }),
+  )
+}
 
 /** @internal Classify an AWS SDK error into a specific tagged error type. */
 const classifyError =
@@ -1339,6 +1650,11 @@ const buildService = (
         Effect.tryPromise({
           try: () => client.send(new ScanCommand(input)),
           catch: classifyError("Scan"),
+        }),
+      searchVectors: (input) =>
+        Effect.tryPromise({
+          try: () => client.send(new SearchVectorsCommand(input)),
+          catch: classifyError("SearchVectors"),
         }),
       batchGetItem: (input) =>
         Effect.tryPromise({

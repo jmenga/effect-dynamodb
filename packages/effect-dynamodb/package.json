@@ -1,6 +1,6 @@
 {
   "name": "effect-dynamodb",
-  "version": "1.10.0",
+  "version": "1.11.0",
   "description": "Effect TS ORM for DynamoDB — schema-driven entity modeling, single-table design, composite keys, transactions, and Stream-based pagination",
   "type": "module",
   "license": "MIT",
@@ -55,7 +55,7 @@
     "lint:fix": "biome check --write ."
   },
   "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.700.0",
+    "@aws-sdk/client-dynamodb": "^3.1104.0",
     "@aws-sdk/util-dynamodb": "^3.700.0",
     "@effect-dynamodb/schema": "workspace:^"
   },

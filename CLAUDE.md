@@ -6,7 +6,7 @@
 
 Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, composite key composition from entity attributes, type-safe index-aware queries with Stream-based pagination, and DynamoClient as an Effect Service with Layer-based dependency injection.
 
-**Status:** All modules implemented. 940 core tests, 251 schema tests, 56 geo tests, 132 connected tests, 71 language-service tests, 47 doctest tests, 34 examples.
+**Status:** All modules implemented. 983 core tests, 281 schema tests, 56 geo tests, 151 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
 **Design:** `DESIGN.md` — API specification (source of truth for implementation)
 
 ## Architecture
@@ -76,6 +76,7 @@ packages/effect-dynamodb/src/
 ├── Projection.ts       # ProjectionExpression builder for selecting specific attributes
 ├── Aggregate.ts        # Graph-based composite domain model (decompose/assemble/diff)
 ├── EventStore.ts       # Event sourcing with ordered event streams per aggregate
+├── VectorSearchEmulation.ts # Scan + brute-force stand-in for SearchVectors (DDB Local has none)
 ├── DynamoClient.ts     # Context.Service wrapping AWS SDK + DynamoClient.make({ entities, aggregates?, tables? }) typed gateway
 ├── Marshaller.ts       # Thin wrapper around @aws-sdk/util-dynamodb
 ├── Errors.ts           # Tagged errors (DynamoError, ItemNotFound, ConditionalCheckFailed, ValidationError, TransactionCancelled, UniqueConstraintViolation)
@@ -83,6 +84,7 @@ packages/effect-dynamodb/src/
 │   ├── Expr.ts         # Expr ADT — 16 expression node types, ConditionOps, compileExpr, parseShorthand
 │   ├── PathBuilder.ts  # PathBuilder — recursive Proxy for type-safe attribute path access
 │   ├── BoundQuery.ts   # BoundQuery fluent builder — wraps Query<A> with pre-resolved services
+│   ├── BoundVectorQuery.ts # BoundVectorQuery — SearchVectors builder (.collect() is the only terminal)
 │   ├── EntityOps.ts    # Entity operation intermediates + UpdateState (record + path-based)
 │   ├── EntityCombinators.ts # Terminal functions, update combinators (record + path-based)
 │   ├── EntityTypes.ts  # Type-level computations for Entity derived types
@@ -163,6 +165,7 @@ db.collections.assignments({ employee: "dfinlay" }).collect()
 | Aggregates compose entity ops | Never touch DynamoClient. Orchestrate Entity, Collection, Transaction |
 | ElectroDB-style composite indexes | `{ index: { name, pk, sk }, composite: [...], sk: [...] }` — GsiConfig with shared PK composites + entity SK composites |
 | `__edd_e__` entity type attribute | Ugly name convention avoids collisions with user model fields |
+| Vector indexes declared on the entity | `Entity.make({ vectorIndexes })` — the embedding + composed HASH partition are library-managed attributes (`__edd_v_*`, `__edd_vp_*`), so domain models stay pure and entity/tenant scoping is automatic. See `DESIGN.md §14` |
 | @aws-sdk/util-dynamodb for marshalling | Proven, maintained; Effect Schema handles validation layer above |
 
 ## Repository Structure
@@ -314,6 +317,7 @@ Do NOT:
 | `guides/queries.mdx` | `examples/guide-queries.ts` |
 | `guides/expressions.mdx` | `examples/guide-expressions.ts` |
 | `guides/timeseries.mdx` | `examples/guide-timeseries.ts` |
+| `guides/vector-search.mdx` | `examples/guide-vector-search.ts` |
 | ... (all other tutorials/guides follow the same pattern) | |
 
 ### Sync normalization
@@ -436,6 +440,16 @@ Each of the four publishable packages must be configured on npmjs.com with this 
 - **Batch operations auto-chunk.** `batchGet` at 100, `batchWrite` at 25. Both retry unprocessed items.
 - **Table operations via `db.tables.*`.** `create()`, `delete()`, `describe()`, backup/restore, PITR, TTL, tags, export.
 - **`.history(key)` for time-series entities.** Returns a `BoundQuery` auto-scoped to event items via `begins_with("<currentSk>#e#")`. `.where()` restricted to the configured `orderBy` attribute; `.filter()` works on any model attribute.
+
+### Vector Search
+- **Declared on the entity.** `Entity.make({ vectorIndexes: { byDescription: { name, dimensions, distance, source: { fields }, partition?, filters? } } })`. Models stay pure — the embedding lives under `__edd_v_<name>__` and the composed HASH partition under `__edd_vp_<name>__`.
+- **Partition composition scopes for free.** `KeyComposer` composes `$schema#v1#<entityType>[#composites]` into the HASH attribute, so a search on a shared physical vector index only ever sees one entity type (and one tenant, with `partition: ["tenantId"]`). `.partition()` is required by the types iff partition composites are declared.
+- **`Embedder` service** (`@effect-dynamodb/Embedder`) supplies embeddings. Bundled into the captured context like `Crypto`, so bound ops stay `R = never`. `Embedder.layerTest({ dimensions })` for tests/examples; dimension agreement validated at `DynamoClient.make` (EDD-9037).
+- **Write gate.** put/create/upsert always embed; update/patch embed **only** when the write touches a `source.fields` member — by `set()`, `remove()`, a null clear, or a path op (mirrors the §7 GSI `removedSet` discipline) — and read the current item once when the payload is a partial source. Clearing every source field REMOVEs the vector + partition attributes so the item leaves the index. `.withVector(name, vector)` on `BoundPut`/`BoundUpdate` skips the Embedder (name typed + validated). `reembed({ concurrency })` rewrites stale vectors under `attribute_exists(pk)`.
+- **Filters are declared, not free-form.** Only attributes in `filters: [...]` are filterable — enforced by the accessor type, a runtime `ValidationError`, and the emulation layer. Entities sharing a physical index union their filters into one `SearchSchema`.
+- **Lifecycle.** Vector + partition attributes join the GSI strip sets for snapshots, tombstones and time-series event items; the tombstone stashes the embedding under `__edd_vs_<name>__` so `restore()` never re-embeds.
+- **`BoundVectorQuery`.** `.partition().filter().topK().select().collect()`. `.collect()` is the ONLY terminal — `SearchVectors` has no cursor, so pagination combinators are structurally absent. `.filter()` is equality-only (one relaxable alias, `VectorFilterInput`). Hits are `{ item, similarity, rawScore }` with `Similarity` branded and normalized higher-is-more-similar.
+- **DynamoDB Local has no vector search.** `CreateTable` discards `VectorIndexes`, `SearchVectors` throws `UnknownOperationException`. Connected tests and examples run through `VectorSearchEmulation.layer(inner, { tables })`, which emulates `searchVectors` via Scan + brute force. Its ranking is unit-tested against the developer-guide reference table.
 
 ### Lifecycle Operations
 - **Opt-in.** `versioned: { retain: true }` for version snapshots. `softDelete: true` (or `{ ttl, preserveUnique }`) for soft-delete.

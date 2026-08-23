@@ -689,6 +689,62 @@ export const composeGsiKeysForUpdatePolicyAware = (
   return { sets, removes }
 }
 
+// ---------------------------------------------------------------------------
+// Vector index partition composition
+// ---------------------------------------------------------------------------
+
+/**
+ * Compose the HASH partition value for a vector index:
+ * `$schema#v<version>#<entityType>[#<partition composite values>]`.
+ *
+ * Identical prefixing and casing rules to {@link composePk} — a vector index's
+ * partition attribute IS a composed key, it just lives on a different index
+ * type. Because the entity type is always in the value, searches on a shared
+ * physical vector index are automatically scoped to one entity (the vector
+ * analogue of the `__edd_e__` filter on every Query). See `DESIGN.md §14`.
+ *
+ * Returns `undefined` when a declared partition composite is missing from the
+ * record — the item then simply has no partition attribute, and DynamoDB's
+ * sparse index semantics leave it out of the index.
+ */
+export const tryComposeVectorPartition = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  index: {
+    readonly partition: ReadonlyArray<string>
+    readonly casing?: DynamoSchema.Casing | undefined
+  },
+  record: Record<string, unknown>,
+): string | undefined => {
+  const composites = tryExtractComposites(index.partition, record)
+  if (composites === undefined) return undefined
+  return composeKey(schema, entityType, composites, {
+    casing: index.casing,
+    names: [...index.partition],
+  })
+}
+
+/**
+ * Throwing variant of {@link tryComposeVectorPartition}. Used on the search
+ * path, where a missing partition composite is a caller error rather than a
+ * sparse-index outcome.
+ */
+export const composeVectorPartition = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  index: {
+    readonly partition: ReadonlyArray<string>
+    readonly casing?: DynamoSchema.Casing | undefined
+  },
+  record: Record<string, unknown>,
+): string => {
+  const composites = extractComposites(index.partition, record)
+  return composeKey(schema, entityType, composites, {
+    casing: index.casing,
+    names: [...index.partition],
+  })
+}
+
 /** @internal — re-export for documentation cross-reference. */
 export type { CompositeKeyHoleError }
 

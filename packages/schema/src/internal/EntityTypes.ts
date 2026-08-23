@@ -5,7 +5,7 @@
  */
 
 import type { DateTime, Schema } from "effect"
-import type { RefNotFound } from "../Errors.js"
+import type { EmbeddingError, RefNotFound } from "../Errors.js"
 
 // ---------------------------------------------------------------------------
 // Type-level computations for Entity operation types
@@ -360,6 +360,18 @@ export type EntityRefUpdateType<
 
 /** Error type contribution from refs — never when no refs, RefNotFound when refs present */
 export type RefErrors<TRefs> = [TRefs] extends [undefined] ? never : RefNotFound
+
+/**
+ * Error type contribution from vector indexes — `never` when the entity
+ * declares none, {@link EmbeddingError} when it does.
+ *
+ * Mirrors {@link RefErrors}: the embedding path is only reachable for entities
+ * that declare `vectorIndexes`, so entities without them keep an error channel
+ * that is exactly as narrow as it was before vector search existed.
+ */
+export type VectorErrors<TVectorIndexes> = [TVectorIndexes] extends [undefined]
+  ? never
+  : EmbeddingError
 
 /** Extract pk composite names for a specific index */
 export type IndexPkComposites<TIndexes, K extends keyof TIndexes> = TIndexes[K] extends {

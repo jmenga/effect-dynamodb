@@ -1,0 +1,364 @@
+---
+title: "Vector search"
+description: "Declare vector indexes on an entity, plug in an Embedder, and run approximate-nearest-neighbour search with automatic entity and tenant scoping."
+---
+
+DynamoDB shipped native vector search in August 2026: a **vector index** declared on the table, maintained from an ordinary list-of-number attribute, queried with `SearchVectors` for the top-K most similar items.
+
+effect-dynamodb models it the way it models GSIs — declaratively on the entity, with library-managed attributes so the domain model stays free of DynamoDB concepts. You declare the index; the library generates the embedding on write, composes the partition value, keeps snapshots and tombstones out of the index, and hands you back decoded domain records with a normalized similarity score.
+
+## What DynamoDB gives you (and what it doesn't)
+
+| | |
+|---|---|
+| Index management | `CreateTable` / `UpdateTable` only — no standalone create |
+| Query | `SearchVectors`, top-K in one shot, **no pagination** |
+| Filtering | Equality only, on the HASH attribute and up to 18 `INLINE_FILTER` attributes |
+| Embedding generation | **Entirely yours.** DynamoDB never computes or refreshes a vector |
+| Capacity | On-demand only |
+| Quotas | 5 vector indexes/table, 4096 dimensions, TopK ≤ 100 |
+| IAM | New `dynamodb:SearchVectors` action — **not** covered by existing read policies |
+
+The endpoint (`search-dynamodb.{region}.amazonaws.com`) is selected automatically by the SDK's endpoint ruleset on the standard client, so there is no second client to configure.
+
+## The model stays pure
+
+```typescript region="model" example="guide-vector-search.ts"
+class Product extends Schema.Class<Product>("Product")({
+  productId: Schema.String,
+  tenantId: Schema.String,
+  name: Schema.String,
+  description: Schema.String,
+  category: Schema.String,
+  price: Schema.Number,
+}) {}
+```
+
+No embedding field. The stored vector lives under `__edd_v_vec1__` and the composed partition value under `__edd_vp_vec1__` — the same deliberately-ugly convention as `__edd_e__`, and neither ever surfaces in a decoded record.
+
+## Declaring a vector index
+
+```typescript region="define" example="guide-vector-search.ts"
+const Products = Entity.make({
+  model: Product,
+  entityType: "Product",
+  primaryKey: {
+    pk: { field: "pk", composite: ["tenantId", "productId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  vectorIndexes: {
+    byDescription: {
+      name: "vec1", // physical vector index on the table
+      dimensions: 8, // immutable after CreateTable
+      distance: "cosine", // cosine | euclidean | dotProduct — immutable
+      source: { fields: ["name", "description"] },
+      partition: ["tenantId"], // composed into the HASH attribute
+      filters: ["category"], // INLINE_FILTER attributes (equality-only)
+    },
+  },
+})
+```
+
+`source.fields` is a declared field list rather than an opaque function — that is what lets `update` decide whether a write actually touched the embedding source. Add `source.compose` to control how the picked values are joined; the default joins them with a space in declaration order.
+
+`dimensions` and `distance` are immutable at the DynamoDB level. `Entity.make` validates them (1–4096 dimensions, ≤ 18 filters, all named fields exist on the model), and `Table.make` validates that entities *sharing* a physical vector index agree — sharing is the norm in single-table designs, since the quota is only 5 per table.
+
+`filters` are not a shared physical property, though: they are per-entity access patterns, so entities sharing an index may each declare their own and the emitted `SearchSchema` carries the **union**. The 18-filter limit applies to that union.
+
+## Partition composition: entity and tenant scoping for free
+
+The vector index HASH attribute is composed by `KeyComposer` with the same prefixing and casing rules as every other key:
+
+```
+$vector-demo#v1#product#tenantid_acme
+```
+
+Two things fall out of that, both deliberate:
+
+1. **Entity scoping is automatic.** The entity type is in the value, so a search on a shared physical index only ever sees one entity type. It is the vector-search analogue of the `__edd_e__` filter on every query — except it costs nothing at read time, because it is the partition key rather than a filter.
+2. **Tenant scoping composes in.** With `partition: ["tenantId"]`, DynamoDB's per-partition-value throughput ceilings distribute per tenant instead of per table.
+
+`.partition({ ... })` is **required by the types** whenever partition composites are declared — the terminal `.collect()` does not exist on the builder until you supply them.
+
+## Wiring the Embedder
+
+Embedding generation is your job, so the library models the generator as a service:
+
+```typescript
+export interface EmbedderService {
+  readonly embed: (text: string) => Effect.Effect<ReadonlyArray<number>, EmbeddingError>
+  readonly dimensions: number
+}
+```
+
+`Embedder.layerTest({ dimensions })` ships in-library — deterministic, dependency-free, and used by this example and the connected test suite. Dimension agreement between the layer and every bound vector index is validated at `DynamoClient.make`, so a mismatch fails at wiring rather than on the thousandth write.
+
+```typescript region="layers" example="guide-vector-search.ts"
+const endpoint = Config.string("DYNAMODB_ENDPOINT").pipe(
+  Config.withDefault("http://localhost:8000"),
+)
+
+const ClientLayer = DynamoClient.layerConfig({
+  region: Config.succeed("us-east-1"),
+  endpoint,
+  credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
+})
+
+// DynamoDB Local silently discards VectorIndexes on CreateTable and rejects
+// SearchVectors outright, so local runs go through the emulation layer. Against
+// real DynamoDB you would use `ClientLayer` directly.
+const EmulatedClientLayer = VectorSearchEmulation.layer(ClientLayer, {
+  tables: { MainTable },
+})
+
+const AppLayer = Layer.mergeAll(
+  EmulatedClientLayer,
+  MainTable.layer({ name: "vector-demo-table" }),
+  // A deterministic in-library embedder. Swap for a Bedrock/OpenAI-backed
+  // implementation in production — see § "Bringing your own Embedder".
+  Embedder.layerTest({ dimensions: 8 }),
+)
+```
+
+### Bringing your own Embedder
+
+A Bedrock implementation is documented rather than shipped — bundling one would drag another AWS client into every consumer's runtime graph. It is about fifteen lines:
+
+```typescript
+import { BedrockRuntimeClient, InvokeModelCommand } from "@aws-sdk/client-bedrock-runtime"
+import { Effect, Layer } from "effect"
+import { Embedder, EmbeddingError } from "effect-dynamodb"
+
+const bedrock = new BedrockRuntimeClient({ region: "us-east-1" })
+
+export const BedrockEmbedder = Layer.succeed(Embedder, {
+  dimensions: 1024,
+  embed: (text: string) =>
+    Effect.tryPromise({
+      try: async () => {
+        const response = await bedrock.send(
+          new InvokeModelCommand({
+            modelId: "amazon.titan-embed-text-v2:0",
+            body: JSON.stringify({ inputText: text, dimensions: 1024 }),
+          }),
+        )
+        return JSON.parse(new TextDecoder().decode(response.body)).embedding as Array<number>
+      },
+      catch: (cause) =>
+        new EmbeddingError({
+          entityType: "*",
+          index: "*",
+          reason: "Bedrock InvokeModel failed",
+          cause,
+        }),
+    }),
+})
+```
+
+## Writing
+
+Nothing about the write call changes — the embedding is generated as part of it:
+
+```typescript region="write" example="guide-vector-search.ts"
+yield* db.entities.Products.put({
+  productId: "p-1",
+  tenantId: "acme",
+  name: "Summit Trail Boot",
+  description: "Waterproof leather hiking boot with ankle support",
+  category: "footwear",
+  price: 189,
+})
+
+yield* db.entities.Products.put({
+  productId: "p-2",
+  tenantId: "acme",
+  name: "Harbour Deck Shoe",
+  description: "Breathable canvas boat shoe for warm weather",
+  category: "footwear",
+  price: 89,
+})
+
+yield* db.entities.Products.put({
+  productId: "p-3",
+  tenantId: "acme",
+  name: "Camp Kettle",
+  description: "Hard anodised aluminium kettle for camp stoves",
+  category: "cookware",
+  price: 45,
+})
+```
+
+## Searching
+
+```typescript region="search" example="guide-vector-search.ts"
+const hits = yield* db.entities.Products
+  .byDescription("waterproof hiking boots")
+  .partition({ tenantId: "acme" })
+  .topK(5)
+  .collect()
+```
+
+Each hit is `{ item, similarity, rawScore }`:
+
+- `item` is a decoded domain record (or a partial one when `.select()` is used).
+- `similarity` is **branded and normalized higher-is-more-similar**, whichever distance function the index uses.
+- `rawScore` preserves the wire value — which runs the *other* way for cosine and euclidean.
+
+| Distance | Wire score | Direction | `similarity` |
+|---|---|---|---|
+| `cosine` | 0 … 2 | lower is closer | `1 - raw / 2` |
+| `euclidean` | 0 … ∞ | lower is closer | `1 / (1 + raw)` |
+| `dotProduct` | −∞ … ∞ | higher is closer | `raw` |
+
+`.collect()` is the **only** terminal. `SearchVectors` has no cursor and no pagination, so `.fetch()`, `.paginate()`, `.startFrom()`, `.maxPages()` and `.reverse()` are structurally absent from the type rather than present and failing. The builder cannot express an operation the API does not have.
+
+The query argument accepts a `string` (embedded for you) or a `number[]` (used verbatim — useful for reranking, cached queries, or benchmarking).
+
+## Filtering and projection
+
+```typescript region="filter" example="guide-vector-search.ts"
+const cookware = yield* db.entities.Products
+  .byDescription("something to boil water in")
+  .partition({ tenantId: "acme" })
+  .filter({ category: "cookware" })
+  .select(["productId", "name", "price"])
+  .collect()
+```
+
+`.filter()` is **equality-only** — that is an API restriction, not a library one. AWS's own SDK JSDoc already advertises range operators for `INLINE_FILTER`, so the restriction lives in exactly one type alias (`VectorFilterInput`) and widening it will be a one-line change.
+
+Only the attributes declared in `filters: [...]` are filterable, and that is enforced three times over: the accessor types the filter keys as the declared tuple, `.collect()` re-checks at runtime with a `ValidationError`, and the emulation layer rejects an undeclared attribute exactly as real DynamoDB does. The point of the third one is that an undeclared filter cannot quietly pass your local test suite and then throw a `ValidationException` in production.
+
+Everything else must be filtered after `.collect()`.
+
+## Tenant scoping in action
+
+```typescript region="scoping" example="guide-vector-search.ts"
+yield* db.entities.Products.put({
+  productId: "p-9",
+  tenantId: "globex",
+  name: "Summit Trail Boot",
+  description: "Waterproof leather hiking boot with ankle support",
+  category: "footwear",
+  price: 189,
+})
+
+const globex = yield* db.entities.Products
+  .byDescription("waterproof hiking boots")
+  .partition({ tenantId: "globex" })
+  .collect()
+```
+
+Identical product, different tenant, and the two never see each other — no filter expression, no post-processing.
+
+## Updates re-embed only when the source changes
+
+```typescript region="update" example="guide-vector-search.ts"
+// `price` is not a source field — no Embedder call, vector untouched.
+yield* db.entities.Products.update({ tenantId: "acme", productId: "p-1" }).set({ price: 199 })
+
+// `description` IS a source field — the vector is regenerated.
+yield* db.entities.Products
+  .update({ tenantId: "acme", productId: "p-1" })
+  .set({ description: "Insulated waterproof boot for alpine trekking" })
+```
+
+The gate mirrors the per-half evaluation gate of [policy-aware GSI composition](/guides/index-policy/): a writer that does not touch a source field neither pays for an embedding call nor clobbers a vector another writer owns.
+
+"Touches" covers every channel that can change the source, not just `set()`:
+
+- `.remove(["description"])`
+- `.set({ description: undefined })`
+- `.pathSet({ segments: ["description"], … })` and the other path operations
+
+A clear is a change. An embedding that outlives its source is worse than no embedding — the item stays findable by a description it no longer has.
+
+When the payload carries only *part* of the source (here `description` but not `name`), the library reads the current item once so the new embedding reflects the complete post-update source text — not the fragment that happened to be in this payload. Cleared attributes are subtracted from that merged record.
+
+### Clearing the source removes the item from the index
+
+If the write leaves no source text at all, the vector and partition attributes are `REMOVE`d and the item drops out of the index — sparse semantics are the only way to delete a vector index entry:
+
+```typescript
+yield* db.entities.Products.update(key).remove(["name", "description"])
+// The product still exists. It is no longer searchable.
+```
+
+Supplying `.withVector()` on the same write wins, since an explicit vector is not derived from the source at all.
+
+## Pre-computed embeddings
+
+```typescript region="with-vector" example="guide-vector-search.ts"
+yield* db.entities.Products
+  .put({
+    productId: "p-4",
+    tenantId: "acme",
+    name: "Trail Sock",
+    description: "Merino wool hiking sock",
+    category: "apparel",
+    price: 19,
+  })
+  .withVector("byDescription", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
+```
+
+`.withVector(name, vector)` works on `put`, `create`, `upsert` and `update`, and skips the Embedder for that index entirely. `name` is the **logical** index name from `Entity.make` — typed as the declared-name union and re-checked at runtime, so a typo is a compile error rather than a silently ignored call that runs the Embedder anyway.
+
+## Re-embedding after a model change
+
+DynamoDB will never recompute a stored vector. When you change embedding model — or change `source.fields` — every stored vector is stale until something rewrites it:
+
+```typescript region="reembed" example="guide-vector-search.ts"
+const rewritten = yield* db.entities.Products.reembed({ concurrency: 4 })
+```
+
+`reembed` scans the entity's items, re-derives the source text, embeds, and writes the vector back, returning the number of items rewritten. Version snapshots and soft-delete tombstones are skipped automatically.
+
+## Lifecycle
+
+DynamoDB indexes an item only while it carries both the vector attribute and (when declared) the HASH attribute. Removing either removes the index entry — there is no "delete from index" call, and the library leans on that:
+
+| Event | Behaviour |
+|---|---|
+| Version snapshot | Vector + partition attributes stripped — a snapshot is never an ANN hit |
+| Soft delete | Both stripped; the embedding is **stashed** under `__edd_vs_<index>__` |
+| Restore | Stash is un-stashed — restoring never costs an Embedder call |
+| Time-series event item | Both stripped; only the current item is searchable |
+| Hard delete / purge | Nothing to do |
+
+## Table operations
+
+`db.tables.MainTable.create()` emits the merged `VectorIndexes` from every registered entity. To add or drop one on a live table:
+
+```typescript
+yield* db.tables.MainTable.addVectorIndex("vec1")
+yield* db.tables.MainTable.waitForVectorIndex("vec1")
+
+yield* db.tables.MainTable.removeVectorIndex("vec1")
+```
+
+A newly added index backfills asynchronously, and `SearchVectors` **fails while it does**. That failure surfaces as a tagged `VectorIndexBackfilling` error whose message points at `waitForVectorIndex`.
+
+## Testing locally
+
+DynamoDB Local does not support vector search: `CreateTable` silently accepts and discards `VectorIndexes`, and `SearchVectors` fails with `UnknownOperationException`. LocalStack wraps DynamoDB Local and inherits the gap.
+
+`VectorSearchEmulation.layer` wraps a `DynamoClient` layer and replaces `searchVectors` with a Scan + brute-force implementation: all three distance functions with faithful score directions, HASH/`INLINE_FILTER` equality predicates, projection, and TopK. Every other operation — including all your writes — still hits the real engine.
+
+```typescript
+const DdbLocal = DynamoClient.layer({ region: "us-east-1", endpoint: "http://localhost:8000" })
+const Emulated = VectorSearchEmulation.layer(DdbLocal, { tables: { MainTable } })
+```
+
+An emulated search is exhaustive, so it is exact and slow — correct for tests, useless for load. It does not simulate approximate-recall behaviour, backfill states, or consumed capacity.
+
+## IAM
+
+`SearchVectors` needs its own action, and it is **not** implied by `dynamodb:Query` or `dynamodb:GetItem`:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["dynamodb:SearchVectors"],
+  "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/my-table/index/vec1"
+}
+```

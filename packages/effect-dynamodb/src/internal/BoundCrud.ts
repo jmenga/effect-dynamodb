@@ -34,6 +34,7 @@ import {
   returnValues as returnValuesCombinator,
   set as setCombinator,
   subtract as subtractCombinator,
+  withVector as withVectorCombinator,
 } from "./EntityCombinators.js"
 import type {
   CascadeTarget,
@@ -91,9 +92,15 @@ const buildCondition = <Model>(cfg: BoundCrudConfig<Model>, arg: ConditionArg<Mo
  * yield* db.entities.Users.create(input).condition((t, { eq }) => eq(t.status, "active"))
  * ```
  */
-export interface BoundPut<Model, A, E> extends Pipeable.Pipeable {
+export interface BoundPut<Model, A, E, VN extends string = string> extends Pipeable.Pipeable {
   /** Add a condition expression. Callback or shorthand. */
-  readonly condition: (cond: ConditionArg<Model>) => BoundPut<Model, A, E>
+  readonly condition: (cond: ConditionArg<Model>) => BoundPut<Model, A, E, VN>
+  /**
+   * Supply a pre-computed embedding for a named vector index, skipping the
+   * `Embedder` for that index on this write. `name` is the LOGICAL vector index
+   * name declared on `Entity.make({ vectorIndexes })`.
+   */
+  readonly withVector: (name: VN, vector: ReadonlyArray<number>) => BoundPut<Model, A, E, VN>
   /** Convert to an executable Effect for Effect combinator interop. */
   readonly asEffect: () => Effect.Effect<A, E, never>
   /** Yield support for `Effect.gen`. */
@@ -101,16 +108,22 @@ export interface BoundPut<Model, A, E> extends Pipeable.Pipeable {
 }
 
 /** @internal */
-export class BoundPutImpl<Model, A, E> implements BoundPut<Model, A, E> {
+export class BoundPutImpl<Model, A, E, VN extends string = string>
+  implements BoundPut<Model, A, E, VN>
+{
   constructor(
     readonly _op: EntityPut<A, any, E, any>,
     readonly _config: BoundCrudConfig<Model>,
   ) {}
 
-  condition(cond: ConditionArg<Model>): BoundPutImpl<Model, A, E> {
+  condition(cond: ConditionArg<Model>): BoundPutImpl<Model, A, E, VN> {
     const compiled = buildCondition(this._config, cond)
     const next = conditionCombinator(this._op, compiled)
     return new BoundPutImpl(next, this._config)
+  }
+
+  withVector(name: VN, vector: ReadonlyArray<number>): BoundPutImpl<Model, A, E, VN> {
+    return new BoundPutImpl(withVectorCombinator(this._op, name, vector), this._config)
   }
 
   asEffect(): Effect.Effect<A, E, never> {
@@ -201,51 +214,57 @@ export class BoundDeleteImpl<Model, E> implements BoundDelete<Model, E> {
  *   .remove(["temporaryFlag"])
  * ```
  */
-export interface BoundUpdate<Model, A, U, E> extends Pipeable.Pipeable {
+export interface BoundUpdate<Model, A, U, E, VN extends string = string> extends Pipeable.Pipeable {
   /** Set the fields to update (record-based SET). */
-  readonly set: (updates: U) => BoundUpdate<Model, A, U, E>
+  readonly set: (updates: U) => BoundUpdate<Model, A, U, E, VN>
   /** Remove attributes (REMOVE clause). */
-  readonly remove: (fields: ReadonlyArray<string>) => BoundUpdate<Model, A, U, E>
+  readonly remove: (fields: ReadonlyArray<string>) => BoundUpdate<Model, A, U, E, VN>
   /** Atomic numeric ADD. */
-  readonly add: (values: globalThis.Record<string, number>) => BoundUpdate<Model, A, U, E>
+  readonly add: (values: globalThis.Record<string, number>) => BoundUpdate<Model, A, U, E, VN>
   /** Numeric SET subtraction (synthesized as `SET #f = #f - :v`). */
-  readonly subtract: (values: globalThis.Record<string, number>) => BoundUpdate<Model, A, U, E>
+  readonly subtract: (values: globalThis.Record<string, number>) => BoundUpdate<Model, A, U, E, VN>
   /** List append (synthesized as `SET #f = list_append(#f, :v)`). */
   readonly append: (
     values: globalThis.Record<string, ReadonlyArray<unknown>>,
-  ) => BoundUpdate<Model, A, U, E>
+  ) => BoundUpdate<Model, A, U, E, VN>
   /** Delete elements from a set attribute. */
   readonly deleteFromSet: (
     values: globalThis.Record<string, unknown>,
-  ) => BoundUpdate<Model, A, U, E>
+  ) => BoundUpdate<Model, A, U, E, VN>
   /** Optimistic concurrency — expected version. */
-  readonly expectedVersion: (version: number) => BoundUpdate<Model, A, U, E>
+  readonly expectedVersion: (version: number) => BoundUpdate<Model, A, U, E, VN>
   /** Add a condition expression. Callback or shorthand. */
-  readonly condition: (cond: ConditionArg<Model>) => BoundUpdate<Model, A, U, E>
+  readonly condition: (cond: ConditionArg<Model>) => BoundUpdate<Model, A, U, E, VN>
+  /**
+   * Supply a pre-computed embedding for a named vector index, skipping the
+   * `Embedder` for that index on this write. `name` is the LOGICAL vector index
+   * name declared on `Entity.make({ vectorIndexes })`.
+   */
+  readonly withVector: (name: VN, vector: ReadonlyArray<number>) => BoundUpdate<Model, A, U, E, VN>
   /** Set ReturnValues mode. */
-  readonly returnValues: (mode: ReturnValuesMode) => BoundUpdate<Model, A, U, E>
+  readonly returnValues: (mode: ReturnValuesMode) => BoundUpdate<Model, A, U, E, VN>
   /** Configure cascade updates to denormalized target entities. */
   readonly cascade: (config: {
     readonly targets: ReadonlyArray<CascadeTarget>
     readonly filter?: globalThis.Record<string, unknown> | undefined
     readonly mode?: "eventual" | "transactional" | undefined
-  }) => BoundUpdate<Model, A, U, E>
+  }) => BoundUpdate<Model, A, U, E, VN>
   /** Path-based SET. */
-  readonly pathSet: (op: PathSetOp) => BoundUpdate<Model, A, U, E>
+  readonly pathSet: (op: PathSetOp) => BoundUpdate<Model, A, U, E, VN>
   /** Path-based REMOVE. */
-  readonly pathRemove: (segments: ReadonlyArray<string | number>) => BoundUpdate<Model, A, U, E>
+  readonly pathRemove: (segments: ReadonlyArray<string | number>) => BoundUpdate<Model, A, U, E, VN>
   /** Path-based ADD. */
-  readonly pathAdd: (op: PathAddOp) => BoundUpdate<Model, A, U, E>
+  readonly pathAdd: (op: PathAddOp) => BoundUpdate<Model, A, U, E, VN>
   /** Path-based SUBTRACT. */
-  readonly pathSubtract: (op: PathSubtractOp) => BoundUpdate<Model, A, U, E>
+  readonly pathSubtract: (op: PathSubtractOp) => BoundUpdate<Model, A, U, E, VN>
   /** Path-based APPEND. */
-  readonly pathAppend: (op: PathAppendOp) => BoundUpdate<Model, A, U, E>
+  readonly pathAppend: (op: PathAppendOp) => BoundUpdate<Model, A, U, E, VN>
   /** Path-based PREPEND. */
-  readonly pathPrepend: (op: PathPrependOp) => BoundUpdate<Model, A, U, E>
+  readonly pathPrepend: (op: PathPrependOp) => BoundUpdate<Model, A, U, E, VN>
   /** Path-based if_not_exists. */
-  readonly pathIfNotExists: (op: PathIfNotExistsOp) => BoundUpdate<Model, A, U, E>
+  readonly pathIfNotExists: (op: PathIfNotExistsOp) => BoundUpdate<Model, A, U, E, VN>
   /** Path-based DELETE (set removal). */
-  readonly pathDelete: (op: PathDeleteOp) => BoundUpdate<Model, A, U, E>
+  readonly pathDelete: (op: PathDeleteOp) => BoundUpdate<Model, A, U, E, VN>
   /**
    * Remove specific entries from a sparse-map field. Compiles to
    * `REMOVE <prefix>#k1, <prefix>#k2, ...`. Removing an entry that doesn't
@@ -254,14 +273,14 @@ export interface BoundUpdate<Model, A, U, E> extends Pipeable.Pipeable {
   readonly removeEntries: (
     field: string,
     keys: ReadonlyArray<string>,
-  ) => BoundUpdate<Model, A, U, E>
+  ) => BoundUpdate<Model, A, U, E, VN>
   /**
    * Clear all entries of a sparse-map field. Two-op helper: reads the current
    * item, then folds REMOVE clauses for the discovered `<prefix>#*` attrs into
    * the same final UpdateItem. Atomic via the version CAS for `versioned`
    * entities; best-effort for non-versioned.
    */
-  readonly clearMap: (field: string) => BoundUpdate<Model, A, U, E>
+  readonly clearMap: (field: string) => BoundUpdate<Model, A, U, E, VN>
   /** Convert to an executable Effect for Effect combinator interop. */
   readonly asEffect: () => Effect.Effect<A, E, never>
   /** Yield support for `Effect.gen`. */
@@ -269,52 +288,58 @@ export interface BoundUpdate<Model, A, U, E> extends Pipeable.Pipeable {
 }
 
 /** @internal */
-export class BoundUpdateImpl<Model, A, U, E> implements BoundUpdate<Model, A, U, E> {
+export class BoundUpdateImpl<Model, A, U, E, VN extends string = string>
+  implements BoundUpdate<Model, A, U, E, VN>
+{
   constructor(
     readonly _op: EntityUpdate<A, any, U, E, any>,
     readonly _config: BoundCrudConfig<Model>,
   ) {}
 
-  private _with(next: EntityUpdate<A, any, U, E, any>): BoundUpdateImpl<Model, A, U, E> {
+  private _with(next: EntityUpdate<A, any, U, E, any>): BoundUpdateImpl<Model, A, U, E, VN> {
     return new BoundUpdateImpl(next, this._config)
   }
 
-  set(updates: U): BoundUpdateImpl<Model, A, U, E> {
+  set(updates: U): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(setCombinator(this._op, updates))
   }
 
-  remove(fields: ReadonlyArray<string>): BoundUpdateImpl<Model, A, U, E> {
+  remove(fields: ReadonlyArray<string>): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(removeCombinator(this._op, fields))
   }
 
-  add(values: globalThis.Record<string, number>): BoundUpdateImpl<Model, A, U, E> {
+  add(values: globalThis.Record<string, number>): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(addCombinator(this._op, values))
   }
 
-  subtract(values: globalThis.Record<string, number>): BoundUpdateImpl<Model, A, U, E> {
+  subtract(values: globalThis.Record<string, number>): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(subtractCombinator(this._op, values))
   }
 
   append(
     values: globalThis.Record<string, ReadonlyArray<unknown>>,
-  ): BoundUpdateImpl<Model, A, U, E> {
+  ): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(appendCombinator(this._op, values))
   }
 
-  deleteFromSet(values: globalThis.Record<string, unknown>): BoundUpdateImpl<Model, A, U, E> {
+  deleteFromSet(values: globalThis.Record<string, unknown>): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(deleteFromSetCombinator(this._op, values))
   }
 
-  expectedVersion(version: number): BoundUpdateImpl<Model, A, U, E> {
+  expectedVersion(version: number): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(expectedVersionCombinator(this._op, version))
   }
 
-  condition(cond: ConditionArg<Model>): BoundUpdateImpl<Model, A, U, E> {
+  condition(cond: ConditionArg<Model>): BoundUpdateImpl<Model, A, U, E, VN> {
     const compiled = buildCondition(this._config, cond)
     return this._with(conditionCombinator(this._op, compiled))
   }
 
-  returnValues(mode: ReturnValuesMode): BoundUpdateImpl<Model, A, U, E> {
+  withVector(name: VN, vector: ReadonlyArray<number>): BoundUpdateImpl<Model, A, U, E, VN> {
+    return this._with(withVectorCombinator(this._op, name, vector))
+  }
+
+  returnValues(mode: ReturnValuesMode): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(returnValuesCombinator(this._op, mode))
   }
 
@@ -322,47 +347,47 @@ export class BoundUpdateImpl<Model, A, U, E> implements BoundUpdate<Model, A, U,
     readonly targets: ReadonlyArray<CascadeTarget>
     readonly filter?: globalThis.Record<string, unknown> | undefined
     readonly mode?: "eventual" | "transactional" | undefined
-  }): BoundUpdateImpl<Model, A, U, E> {
+  }): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(cascadeCombinator(this._op, config) as EntityUpdate<A, any, U, E, any>)
   }
 
-  pathSet(op: PathSetOp): BoundUpdateImpl<Model, A, U, E> {
+  pathSet(op: PathSetOp): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(pathSetCombinator(this._op, op))
   }
 
-  pathRemove(segments: ReadonlyArray<string | number>): BoundUpdateImpl<Model, A, U, E> {
+  pathRemove(segments: ReadonlyArray<string | number>): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(pathRemoveCombinator(this._op, segments))
   }
 
-  pathAdd(op: PathAddOp): BoundUpdateImpl<Model, A, U, E> {
+  pathAdd(op: PathAddOp): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(pathAddCombinator(this._op, op))
   }
 
-  pathSubtract(op: PathSubtractOp): BoundUpdateImpl<Model, A, U, E> {
+  pathSubtract(op: PathSubtractOp): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(pathSubtractCombinator(this._op, op))
   }
 
-  pathAppend(op: PathAppendOp): BoundUpdateImpl<Model, A, U, E> {
+  pathAppend(op: PathAppendOp): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(pathAppendCombinator(this._op, op))
   }
 
-  pathPrepend(op: PathPrependOp): BoundUpdateImpl<Model, A, U, E> {
+  pathPrepend(op: PathPrependOp): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(pathPrependCombinator(this._op, op))
   }
 
-  pathIfNotExists(op: PathIfNotExistsOp): BoundUpdateImpl<Model, A, U, E> {
+  pathIfNotExists(op: PathIfNotExistsOp): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(pathIfNotExistsCombinator(this._op, op))
   }
 
-  pathDelete(op: PathDeleteOp): BoundUpdateImpl<Model, A, U, E> {
+  pathDelete(op: PathDeleteOp): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(pathDeleteCombinator(this._op, op))
   }
 
-  removeEntries(field: string, keys: ReadonlyArray<string>): BoundUpdateImpl<Model, A, U, E> {
+  removeEntries(field: string, keys: ReadonlyArray<string>): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(removeEntriesCombinator(this._op, field, keys))
   }
 
-  clearMap(field: string): BoundUpdateImpl<Model, A, U, E> {
+  clearMap(field: string): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(clearMapCombinator(this._op, field))
   }
 
@@ -386,10 +411,10 @@ export class BoundUpdateImpl<Model, A, U, E> implements BoundUpdate<Model, A, U,
 // ---------------------------------------------------------------------------
 
 /** @internal */
-export const makeBoundPut = <Model, A, E>(
+export const makeBoundPut = <Model, A, E, VN extends string = string>(
   op: EntityPut<A, any, E, any>,
   config: BoundCrudConfig<Model>,
-): BoundPut<Model, A, E> => new BoundPutImpl(op, config)
+): BoundPut<Model, A, E, VN> => new BoundPutImpl<Model, A, E, VN>(op, config)
 
 /** @internal */
 export const makeBoundDelete = <Model, E>(
@@ -398,10 +423,10 @@ export const makeBoundDelete = <Model, E>(
 ): BoundDelete<Model, E> => new BoundDeleteImpl(op, config)
 
 /** @internal */
-export const makeBoundUpdate = <Model, A, U, E>(
+export const makeBoundUpdate = <Model, A, U, E, VN extends string = string>(
   op: EntityUpdate<A, any, U, E, any>,
   config: BoundCrudConfig<Model>,
-): BoundUpdate<Model, A, U, E> => new BoundUpdateImpl(op, config)
+): BoundUpdate<Model, A, U, E, VN> => new BoundUpdateImpl<Model, A, U, E, VN>(op, config)
 
 // ---------------------------------------------------------------------------
 // BoundAppend — time-series append() builder

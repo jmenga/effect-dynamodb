@@ -17,9 +17,12 @@ import {
   isRefField,
 } from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import type { EmbedderService } from "@effect-dynamodb/schema/Embedder.js"
+import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import {
   CascadePartialFailure,
   ConditionalCheckFailed,
+  EmbeddingError,
   ItemNotFound,
   isAwsConditionalCheckFailed,
   isAwsTransactionCancelled,
@@ -34,6 +37,11 @@ import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypt
 import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { normalizeGsiConfig } from "@effect-dynamodb/schema/KeyComposer.js"
+import type {
+  VectorIndexConfig,
+  VectorIndexDefinition,
+} from "@effect-dynamodb/schema/VectorIndex.js"
+import { deriveSourceText } from "@effect-dynamodb/schema/VectorIndex.js"
 import { Context, Crypto, DateTime, type Duration, Effect, Option, Schema, Stream } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import type { ConditionInput } from "./Expression.js"
@@ -94,6 +102,7 @@ export {
   EntityOpTypeId,
   type EntityPut,
   EntityPutImpl,
+  type EntityPutOpts,
   type EntityUpdate,
   EntityUpdateImpl,
   EntityUpdateTypeId,
@@ -101,6 +110,7 @@ export {
   type ReturnValuesMode,
   returnValuesMap,
   type UpdateState,
+  type WithVectors,
 } from "./internal/EntityOps.js"
 
 import * as Projection from "@effect-dynamodb/schema/Projection.js"
@@ -117,6 +127,7 @@ import {
   EntityOpTypeId,
   type EntityPut,
   EntityPutImpl,
+  type EntityPutOpts,
   type EntityUpdate,
   EntityUpdateImpl,
   emptyUpdateState,
@@ -185,6 +196,7 @@ import type {
   ModelType,
   PrimaryKeyComposites,
   RefErrors,
+  VectorErrors,
   WithGeneratedId,
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import {
@@ -351,6 +363,7 @@ export interface Entity<
   TIdentifier extends string | undefined = undefined,
   TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   TGeneratedId extends GeneratedIdConfig | undefined = undefined,
+  TVectorIndexes extends globalThis.Record<string, VectorIndexConfig> | undefined = undefined,
 > {
   readonly _tag: "Entity"
   readonly model: TModel
@@ -363,6 +376,11 @@ export interface Entity<
   readonly identifier: TIdentifier
   readonly timeSeries: TTimeSeries
   readonly generatedId: TGeneratedId
+  /** Vector index declarations as authored (see `DESIGN.md §14`). */
+  readonly vectorIndexes: TVectorIndexes
+
+  /** @internal Normalized vector index definitions keyed by logical name. */
+  readonly _vectorIndexes: globalThis.Record<string, VectorIndexDefinition>
 
   /** @internal Resolved ref metadata — used by cascade to inspect target entities */
   readonly _resolvedRefs: ReadonlyArray<{
@@ -376,6 +394,12 @@ export interface Entity<
   readonly _decodeRecord: (
     raw: globalThis.Record<string, unknown>,
   ) => Effect.Effect<any, ValidationError>
+
+  /** @internal Domain field name → stored DynamoDB attribute name (`storedAs` renames). */
+  readonly _resolveDbName: (domainName: string) => string
+
+  /** @internal Entity schema version baked into composed keys. */
+  readonly _entityVersion: number
 
   /**
    * @internal Flatten sparse-map fields into per-entry top-level attributes.
@@ -475,7 +499,11 @@ export interface Entity<
   ) => EntityPut<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
-    DynamoClientError | ValidationError | UniqueConstraintViolation | RefErrors<TRefs>,
+    | DynamoClientError
+    | ValidationError
+    | UniqueConstraintViolation
+    | RefErrors<TRefs>
+    | VectorErrors<TVectorIndexes>,
     DynamoClient | TableConfig
   >
 
@@ -494,7 +522,8 @@ export interface Entity<
     | OptimisticLockError
     | UniqueConstraintViolation
     | ValidationError
-    | RefErrors<TRefs>,
+    | RefErrors<TRefs>
+    | VectorErrors<TVectorIndexes>,
     DynamoClient | TableConfig
   >
 
@@ -519,7 +548,8 @@ export interface Entity<
     | ValidationError
     | UniqueConstraintViolation
     | ConditionalCheckFailed
-    | RefErrors<TRefs>,
+    | RefErrors<TRefs>
+    | VectorErrors<TVectorIndexes>,
     DynamoClient | TableConfig
   >
 
@@ -539,7 +569,8 @@ export interface Entity<
     | UniqueConstraintViolation
     | ValidationError
     | ConditionalCheckFailed
-    | RefErrors<TRefs>,
+    | RefErrors<TRefs>
+    | VectorErrors<TVectorIndexes>,
     DynamoClient | TableConfig
   >
 
@@ -570,7 +601,12 @@ export interface Entity<
   ) => EntityPut<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
-    DynamoClientError | ValidationError | ItemNotFound | ConditionalCheckFailed | RefErrors<TRefs>,
+    | DynamoClientError
+    | ValidationError
+    | ItemNotFound
+    | ConditionalCheckFailed
+    | RefErrors<TRefs>
+    | VectorErrors<TVectorIndexes>,
     DynamoClient | TableConfig
   >
 
@@ -839,6 +875,18 @@ export interface Entity<
  * }) {}
  * ```
  */
+/**
+ * The logical vector index names an entity declares, as a string union.
+ *
+ * Resolves to `never` for entities without `vectorIndexes`, which makes
+ * `.withVector()` uncallable on them — an unusable method beats a method that
+ * silently does nothing.
+ */
+export type VectorIndexNames<TVectorIndexes> =
+  TVectorIndexes extends globalThis.Record<string, VectorIndexConfig>
+    ? keyof TVectorIndexes & string
+    : never
+
 export interface BoundEntity<
   TModel extends Schema.Top,
   TIndexes extends globalThis.Record<string, IndexDefinition>,
@@ -848,6 +896,7 @@ export interface BoundEntity<
   TTimestamps extends TimestampsConfig | undefined = undefined,
   TVersioned extends VersionedConfig | undefined = undefined,
   TGeneratedId extends GeneratedIdConfig | undefined = undefined,
+  TVectorIndexes extends globalThis.Record<string, VectorIndexConfig> | undefined = undefined,
 > {
   // --- CRUD Operations ---
 
@@ -873,7 +922,12 @@ export interface BoundEntity<
   ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
     ModelType<TModel>,
-    DynamoClientError | ValidationError | UniqueConstraintViolation | RefErrors<TRefs>
+    | DynamoClientError
+    | ValidationError
+    | UniqueConstraintViolation
+    | RefErrors<TRefs>
+    | VectorErrors<TVectorIndexes>,
+    VectorIndexNames<TVectorIndexes>
   >
 
   /**
@@ -893,6 +947,8 @@ export interface BoundEntity<
     | UniqueConstraintViolation
     | ConditionalCheckFailed
     | RefErrors<TRefs>
+    | VectorErrors<TVectorIndexes>,
+    VectorIndexNames<TVectorIndexes>
   >
 
   /**
@@ -916,6 +972,8 @@ export interface BoundEntity<
     | UniqueConstraintViolation
     | ValidationError
     | RefErrors<TRefs>
+    | VectorErrors<TVectorIndexes>,
+    VectorIndexNames<TVectorIndexes>
   >
 
   /**
@@ -947,7 +1005,13 @@ export interface BoundEntity<
   ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
     ModelType<TModel>,
-    DynamoClientError | ValidationError | ItemNotFound | ConditionalCheckFailed | RefErrors<TRefs>
+    | DynamoClientError
+    | ValidationError
+    | ItemNotFound
+    | ConditionalCheckFailed
+    | RefErrors<TRefs>
+    | VectorErrors<TVectorIndexes>,
+    VectorIndexNames<TVectorIndexes>
   >
 
   /**
@@ -971,6 +1035,8 @@ export interface BoundEntity<
     | ValidationError
     | ConditionalCheckFailed
     | RefErrors<TRefs>
+    | VectorErrors<TVectorIndexes>,
+    VectorIndexNames<TVectorIndexes>
   >
 
   /** Delete an existing item, fails if not found. Returns a fluent {@link BoundDelete}. */
@@ -1297,6 +1363,9 @@ export const make = <
   const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
   const TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   const TGeneratedId extends GeneratedIdConfig | undefined = undefined,
+  const TVectorIndexes extends
+    | globalThis.Record<string, VectorIndexConfig<any>>
+    | undefined = undefined,
   const TAttrs extends {} = {},
 >(config: {
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
@@ -1310,6 +1379,7 @@ export const make = <
   readonly refs?: TRefs
   readonly timeSeries?: TTimeSeries
   readonly generatedId?: TGeneratedId
+  readonly vectorIndexes?: TVectorIndexes
 }): Entity<
   TModel,
   TEntityType,
@@ -1321,7 +1391,8 @@ export const make = <
   TRefs,
   ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
   TTimeSeries,
-  TGeneratedId
+  TGeneratedId,
+  TVectorIndexes
 > => {
   // Normalize GSI configs to internal IndexDefinition format
   const gsiIndexes: globalThis.Record<string, IndexDefinition> = {}
@@ -1443,6 +1514,9 @@ const makeImpl = <
   const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
   const TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   const TGeneratedId extends GeneratedIdConfig | undefined = undefined,
+  const TVectorIndexes extends
+    | globalThis.Record<string, VectorIndexConfig<any>>
+    | undefined = undefined,
   const TAttrs extends {} = {},
 >(
   config: {
@@ -1456,6 +1530,7 @@ const makeImpl = <
     readonly refs?: TRefs
     readonly timeSeries?: TTimeSeries
     readonly generatedId?: TGeneratedId
+    readonly vectorIndexes?: TVectorIndexes
   },
   precomputedData?: EntityDefinitionData,
 ): Entity<
@@ -1469,7 +1544,8 @@ const makeImpl = <
   TRefs,
   ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
   TTimeSeries,
-  TGeneratedId
+  TGeneratedId,
+  TVectorIndexes
 > => {
   // Derivation (validation + schema/ref/sparse/rename resolution) is shared with
   // the pure `@effect-dynamodb/schema` Entity.make via `buildEntityDefinition`,
@@ -1694,6 +1770,334 @@ const makeImpl = <
     return fields
   }
 
+  // ---------------------------------------------------------------------------
+  // Vector search — write-path helpers (see `DESIGN.md §14`)
+  // ---------------------------------------------------------------------------
+
+  const vectorIndexes = data.vectorIndexes
+  const hasVectorIndexes = data.hasVectorIndexes
+  const vectorIndexEntries: ReadonlyArray<readonly [string, VectorIndexDefinition]> =
+    Object.entries(vectorIndexes)
+
+  /**
+   * Vector attributes a write should SET, and those it should REMOVE.
+   *
+   * REMOVE is how an item leaves a vector index — DynamoDB's sparse semantics
+   * mean an item without the embedding (or without the composed HASH value) is
+   * simply not indexed. There is no "delete from index" call.
+   */
+  interface VectorWriteResult {
+    readonly sets: globalThis.Record<string, unknown>
+    readonly removes: ReadonlyArray<string>
+  }
+
+  /**
+   * Library-managed vector attribute names (embedding + composed partition).
+   *
+   * These join `gsiKeyFields()` in every strip set — version snapshots,
+   * soft-delete tombstones, and time-series event items. DynamoDB's sparse
+   * vector index semantics do the rest: an item without the vector attribute
+   * (or without the HASH attribute) is simply not in the index, so stripping IS
+   * the delete. See `DESIGN.md §14 Lifecycle integration`.
+   */
+  const vectorKeyFields = (): ReadonlyArray<string> => {
+    const fields: Array<string> = []
+    for (const [, definition] of vectorIndexEntries) {
+      fields.push(definition.vectorField, definition.partitionField)
+    }
+    return fields
+  }
+
+  /**
+   * Resolve the `Embedder` service from context.
+   *
+   * Deliberately resolved with `Effect.serviceOption` rather than a plain
+   * `yield* Embedder`: only entities that declare `vectorIndexes` need one, and
+   * widening every entity operation's `R` to include `Embedder` would force the
+   * service on consumers who will never call it. A missing embedder surfaces as
+   * a tagged {@link EmbeddingError} naming the index, not a type error at the
+   * far end of the program.
+   */
+  const resolveEmbedder = (
+    indexName: string,
+  ): Effect.Effect<EmbedderService, EmbeddingError, never> =>
+    Effect.flatMap(Effect.serviceOption(Embedder), (maybe) =>
+      Option.isSome(maybe)
+        ? Effect.succeed(maybe.value)
+        : Effect.fail(
+            new EmbeddingError({
+              entityType,
+              index: indexName,
+              reason:
+                `No Embedder service is available. Provide one via ` +
+                `DynamoClient.make({ embedder }) or Effect.provide(Embedder.layerTest(...)), ` +
+                `or supply a pre-computed vector with .withVector("${indexName}", [...]).`,
+            }),
+          ),
+    )
+
+  /**
+   * Reject `.withVector("typo", ...)` before it silently does nothing.
+   *
+   * The combinator takes a plain string at runtime, and an unknown logical name
+   * would otherwise be dropped by the declared-name lookup — the Embedder would
+   * run anyway and the caller's supplied vector would vanish without a trace.
+   * Fails fast with the list of declared names instead.
+   */
+  const checkWithVectorNames = (
+    withVectors: globalThis.Record<string, ReadonlyArray<number>> | undefined,
+    operation: string,
+  ): Effect.Effect<void, ValidationError, never> => {
+    if (withVectors === undefined) return Effect.void
+    for (const name of Object.keys(withVectors)) {
+      if (name in vectorIndexes) continue
+      const declared = Object.keys(vectorIndexes).sort().join(", ")
+      return Effect.fail(
+        new ValidationError({
+          entityType,
+          operation: `${operation}.withVector`,
+          cause:
+            `Unknown vector index "${name}". Declared vector indexes: ` +
+            `${declared.length > 0 ? declared : "(none)"}. ` +
+            `\`.withVector()\` takes the LOGICAL name from Entity.make({ vectorIndexes }).`,
+        }),
+      )
+    }
+    return Effect.void
+  }
+
+  /** @internal Validate an embedding against the index's declared dimensionality. */
+  const checkDimensions = (
+    indexName: string,
+    definition: VectorIndexDefinition,
+    vector: ReadonlyArray<number>,
+  ): Effect.Effect<ReadonlyArray<number>, EmbeddingError, never> =>
+    vector.length === definition.dimensions
+      ? Effect.succeed(vector)
+      : Effect.fail(
+          new EmbeddingError({
+            entityType,
+            index: indexName,
+            reason:
+              `Embedding has ${vector.length} dimensions but vector index "${definition.index}" ` +
+              `declares ${definition.dimensions}. Dimensions are immutable on a DynamoDB vector index.`,
+          }),
+        )
+
+  /**
+   * Compute the vector + partition attributes for a full (put-style) record.
+   *
+   * Each index is independent and sparse: an index whose partition composites
+   * or source fields are absent from the record contributes nothing, and the
+   * item is simply not in that index.
+   *
+   * `embedFor` restricts which indexes are (re-)embedded — `"all"` on the put
+   * path, a gated subset on the update path. The partition value is always
+   * recomposed when it can be: it is idempotent, and writing it is what keeps
+   * an item in the index.
+   */
+  const computeVectorAttributes = (
+    record: globalThis.Record<string, unknown>,
+    withVectors: globalThis.Record<string, ReadonlyArray<number>> | undefined,
+    embedFor: ReadonlySet<string> | "all",
+  ): Effect.Effect<VectorWriteResult, EmbeddingError, never> =>
+    Effect.gen(function* () {
+      const sets: globalThis.Record<string, unknown> = {}
+      const removes: Array<string> = []
+      for (const [logicalName, definition] of vectorIndexEntries) {
+        const shouldEmbed = embedFor === "all" || embedFor.has(logicalName)
+        const partition = KeyComposer.tryComposeVectorPartition(
+          schema,
+          entityType,
+          definition,
+          record,
+        )
+        if (partition === undefined) {
+          // No partition value ⇒ the item cannot be in the index at all. Drop
+          // both attributes so a previously-indexed item leaves the index
+          // rather than lingering under a stale partition.
+          removes.push(definition.partitionField, definition.vectorField)
+          continue
+        }
+        sets[definition.partitionField] = partition
+
+        if (!shouldEmbed) continue
+
+        const explicit = withVectors?.[logicalName]
+        if (explicit !== undefined) {
+          sets[definition.vectorField] = yield* checkDimensions(logicalName, definition, explicit)
+          continue
+        }
+        const text = deriveSourceText(definition, record)
+        if (text === undefined) {
+          // Every source field is gone. Sparse semantics say the item should
+          // leave the index — keeping the previous embedding would make it
+          // findable by a description it no longer has.
+          removes.push(definition.vectorField, definition.partitionField)
+          delete sets[definition.partitionField]
+          continue
+        }
+        const embedder = yield* resolveEmbedder(logicalName)
+        const embedded = yield* embedder.embed(text)
+        sets[definition.vectorField] = yield* checkDimensions(logicalName, definition, embedded)
+      }
+      return { sets, removes }
+    })
+
+  /**
+   * Which vector indexes does this update require work for?
+   *
+   * Re-embedding fires when the write touches a `source.fields` member by ANY
+   * channel — a `set()` payload entry, an `Entity.remove([...])` clearing it, or
+   * a path-based operation whose root segment names it — or when the caller
+   * supplied an explicit vector.
+   *
+   * Enumerating every channel (rather than only the SET payload) is the same
+   * discipline the policy-aware GSI composer applies to `removedSet` (§7): a
+   * clear is a change, and a writer that clears the source must not leave the
+   * old embedding behind. Writers that touch none of it neither pay for an
+   * embedding call nor clobber a vector another writer owns.
+   */
+  const vectorIndexesNeedingUpdate = (
+    touchedFields: ReadonlySet<string>,
+    withVectors: globalThis.Record<string, ReadonlyArray<number>> | undefined,
+  ): ReadonlyArray<readonly [string, VectorIndexDefinition]> =>
+    vectorIndexEntries.filter(
+      ([logicalName, definition]) =>
+        withVectors?.[logicalName] !== undefined ||
+        definition.sourceFields.some((field) => touchedFields.has(field)),
+    )
+
+  /**
+   * Every top-level attribute this update touches, by any channel.
+   *
+   * `touchesSource` alone only sees the SET payload; `remove([...])`, null
+   * clears and path-based operations are just as capable of invalidating an
+   * embedding, so they all feed the same set.
+   */
+  const collectTouchedFields = (
+    updatePayload: globalThis.Record<string, unknown>,
+    uState: UpdateState,
+  ): ReadonlySet<string> => {
+    const touched = new Set<string>(Object.keys(updatePayload))
+    for (const attr of uState.remove ?? []) touched.add(attr)
+    const pathOps: ReadonlyArray<ReadonlyArray<{ segments: ReadonlyArray<string | number> }>> = [
+      uState.pathSets ?? [],
+      uState.pathAdds ?? [],
+      uState.pathSubtracts ?? [],
+      uState.pathAppends ?? [],
+      uState.pathPrepends ?? [],
+      uState.pathIfNotExists ?? [],
+      uState.pathDeletes ?? [],
+    ]
+    for (const ops of pathOps) {
+      for (const op of ops) {
+        const root = op.segments[0]
+        if (typeof root === "string") touched.add(root)
+      }
+    }
+    for (const segments of uState.pathRemoves ?? []) {
+      const root = segments[0]
+      if (typeof root === "string") touched.add(root)
+    }
+    return touched
+  }
+
+  /**
+   * Compute vector-related SET / REMOVE attributes for the standard
+   * (UpdateItem) path.
+   *
+   * When re-embedding is required and the payload does not carry every source
+   * field, the current item is read once so the embedding is derived from the
+   * complete post-update source text rather than the fragment that happened to
+   * be in this payload. Attributes the update clears (via `remove([...])` or a
+   * null payload entry) are subtracted from that merged record, so "clear the
+   * description" produces the embedding of what actually remains — or drops the
+   * item out of the index when nothing does.
+   */
+  const computeVectorUpdateAttributes = (
+    decodedKey: globalThis.Record<string, unknown>,
+    marshalledKey: globalThis.Record<string, AttributeValue>,
+    tableName: string,
+    updatePayload: globalThis.Record<string, unknown>,
+    uState: UpdateState,
+  ): Effect.Effect<VectorWriteResult, EmbeddingError | DynamoClientError, DynamoClient> =>
+    Effect.gen(function* () {
+      if (!hasVectorIndexes) return { sets: {}, removes: [] }
+      const withVectors = uState.withVectors
+      const touchedFields = collectTouchedFields(updatePayload, uState)
+      const needing = vectorIndexesNeedingUpdate(touchedFields, withVectors)
+      const clearedFields = new Set<string>(uState.remove ?? [])
+      for (const [attr, value] of Object.entries(updatePayload)) {
+        if (value === null || value === undefined) clearedFields.add(attr)
+      }
+
+      // Base record: key composites plus whatever the payload supplies. Enough
+      // to compose partition values (their composites are normally primary-key
+      // members) without any extra read.
+      let merged: globalThis.Record<string, unknown> = { ...decodedKey, ...updatePayload }
+
+      const needsFullSource = needing.some(
+        ([logicalName, definition]) =>
+          withVectors?.[logicalName] === undefined &&
+          definition.sourceFields.some((field) => !(field in merged)),
+      )
+      if (needsFullSource) {
+        const client = yield* DynamoClient
+        const current = yield* client.getItem({ TableName: tableName, Key: marshalledKey })
+        if (current.Item) {
+          const currentDomain = fromAttributeMap(current.Item) as globalThis.Record<string, unknown>
+          renameFromDynamo(currentDomain)
+          merged = { ...currentDomain, ...merged }
+        }
+      }
+      // Cleared attributes are absent post-update, whichever channel cleared
+      // them — the same two-way classification the GSI composer uses (§7).
+      for (const attr of clearedFields) delete merged[attr]
+
+      const sets: globalThis.Record<string, unknown> = {}
+      const removes: Array<string> = []
+      for (const [logicalName, definition] of vectorIndexEntries) {
+        const isNeeded = needing.some(([name]) => name === logicalName)
+        // Partition value: idempotent and cheap, so recompose whenever the
+        // merged record can supply it (same reasoning as the PK-composites-only
+        // GSI shape in §7).
+        const partition = KeyComposer.tryComposeVectorPartition(
+          schema,
+          entityType,
+          definition,
+          merged,
+        )
+        if (partition === undefined) {
+          // Only drop the partition when THIS writer invalidated it. Otherwise
+          // the composite simply wasn't in scope for this call and dropping it
+          // would be the multi-writer clobber the §7 gate exists to prevent.
+          if (definition.partition.some((attr) => clearedFields.has(attr))) {
+            removes.push(definition.partitionField, definition.vectorField)
+          }
+          continue
+        }
+        sets[definition.partitionField] = partition
+
+        if (!isNeeded) continue
+        const explicit = withVectors?.[logicalName]
+        if (explicit !== undefined) {
+          sets[definition.vectorField] = yield* checkDimensions(logicalName, definition, explicit)
+          continue
+        }
+        const text = deriveSourceText(definition, merged)
+        if (text === undefined) {
+          removes.push(definition.vectorField, definition.partitionField)
+          delete sets[definition.partitionField]
+          continue
+        }
+        const embedder = yield* resolveEmbedder(logicalName)
+        const embedded = yield* embedder.embed(text)
+        sets[definition.vectorField] = yield* checkDimensions(logicalName, definition, embedded)
+      }
+      return { sets, removes }
+    })
+
   /**
    * Build a version snapshot item: same PK, version SK, stripped GSI keys,
    * keeps __edd_e__ for entity type filtering.
@@ -1714,6 +2118,10 @@ const makeImpl = <
 
     // Strip GSI key fields — snapshots must not appear in index queries
     for (const field of gsiKeyFields()) {
+      delete snapshot[field]
+    }
+    // Same for vector + partition attributes — a snapshot is never an ANN hit.
+    for (const field of vectorKeyFields()) {
       delete snapshot[field]
     }
 
@@ -2050,12 +2458,14 @@ const makeImpl = <
 
   const put = (input: unknown) =>
     new EntityPutImpl(
-      (mode: DecodeMode, opts: { readonly condition: Expr | ConditionInput | undefined }) =>
+      (mode: DecodeMode, opts: EntityPutOpts) =>
         Effect.gen(function* () {
           const client = yield* DynamoClient
           const tc = yield* tableTag
           const tableName = tc.name
           const ttlAttrName = resolveTtlAttributeName(tc)
+
+          yield* checkWithVectorNames(opts.withVectors, "put")
 
           // Auto-generated id: fill the configured primary-key field with a
           // fresh UUID BEFORE the encode, but only when the caller omitted it —
@@ -2124,6 +2534,20 @@ const makeImpl = <
 
           // Apply composed keys
           Object.assign(item, keys)
+
+          // Vector search: embed the source text and compose the partition
+          // value. Sparse — an index whose source or partition composites are
+          // absent contributes nothing. See `DESIGN.md §14`.
+          if (hasVectorIndexes) {
+            const vectorWrite = yield* computeVectorAttributes(
+              encoded as globalThis.Record<string, unknown>,
+              opts.withVectors,
+              "all",
+            )
+            Object.assign(item, vectorWrite.sets)
+            // `put` writes a whole item, so a REMOVE is just an omission.
+            for (const field of vectorWrite.removes) delete item[field]
+          }
 
           // Rename domain fields to DynamoDB attribute names
           renameToDynamo(item)
@@ -2327,9 +2751,13 @@ const makeImpl = <
     const pkField = config.indexes.primary.pk.field
     const skField = config.indexes.primary.sk.field
     const op = put(input)
-    return new EntityPutImpl(op._builder, op._entity, op._input, {
-      attributeNotExists: [pkField, skField],
-    })
+    return new EntityPutImpl(
+      op._builder,
+      op._entity,
+      op._input,
+      { attributeNotExists: [pkField, skField] },
+      op._withVectors,
+    )
   }
 
   // ---------------------------------------------------------------------------
@@ -2430,6 +2858,8 @@ const makeImpl = <
           const ttlAttrName = resolveTtlAttributeName(tc)
           // Clock-backed time source for the updatedAt timestamp + retain snapshot TTL.
           const now = yield* DateTime.now
+
+          yield* checkWithVectorNames(uState.withVectors, "update")
 
           // Decode key
           const decodedKey = yield* Schema.decodeUnknownEffect(
@@ -2742,6 +3172,32 @@ const makeImpl = <
                   newFieldsRecord: newSentinel?.fieldsRecord,
                 })
               }
+            }
+
+            // Vector search: the retain path already holds the full merged
+            // item, so a put-style recompute is exact — no extra read needed.
+            // Re-embedding is still gated on the payload touching a source
+            // field (`DESIGN.md §14`); untouched indexes keep their stored
+            // vector, which the merge above already carried onto `newItem`.
+            if (hasVectorIndexes) {
+              const embedFor = new Set(
+                vectorIndexesNeedingUpdate(
+                  collectTouchedFields(
+                    hydratedUpdates as globalThis.Record<string, unknown>,
+                    uState,
+                  ),
+                  uState.withVectors,
+                ).map(([logicalName]) => logicalName),
+              )
+              // `newItem` is the fully merged post-update item (removals already
+              // applied above), so a put-style recompute is exact.
+              const vectorWrite = yield* computeVectorAttributes(
+                newItem,
+                uState.withVectors,
+                embedFor,
+              )
+              Object.assign(newItem, vectorWrite.sets)
+              for (const field of vectorWrite.removes) delete newItem[field]
             }
 
             // Convert back to DynamoDB attribute names for storage
@@ -3125,6 +3581,35 @@ const makeImpl = <
             removeClauses.push(nameKey)
           }
 
+          // Vector search: partition value is recomposed whenever it can be
+          // (idempotent); the embedding is regenerated only when the payload
+          // touched a `source.fields` member or supplied `.withVector(...)`.
+          // See `DESIGN.md §14 Write path`.
+          if (hasVectorIndexes) {
+            const vectorWrite = yield* computeVectorUpdateAttributes(
+              decodedKey as globalThis.Record<string, unknown>,
+              marshalledKey,
+              tableName,
+              hydratedUpdates as globalThis.Record<string, unknown>,
+              uState,
+            )
+            for (const [field, value] of Object.entries(vectorWrite.sets)) {
+              const nameKey = `#u${counter}`
+              const valKey = `:u${counter}`
+              names[nameKey] = field
+              values[valKey] = toAttributeValue(value)
+              setClauses.push(`${nameKey} = ${valKey}`)
+              counter++
+            }
+            // Clearing every source field takes the item out of the index —
+            // there is no other way to delete a vector index entry.
+            for (const field of new Set(vectorWrite.removes)) {
+              const nameKey = `#r${removeClauses.length}`
+              names[nameKey] = field
+              removeClauses.push(nameKey)
+            }
+          }
+
           // ADD (atomic numeric increment / set addition)
           if (uState.add) {
             for (const [attr, val] of Object.entries(uState.add)) {
@@ -3482,6 +3967,17 @@ const makeImpl = <
               delete deletedItem[field]
             }
 
+            // Vector attributes: stash the embedding under a non-indexed name
+            // before stripping. Sparse semantics drop the tombstone out of the
+            // vector index immediately, and `restore()` un-stashes without
+            // paying for another Embedder call. See `DESIGN.md §14`.
+            for (const [, definition] of vectorIndexEntries) {
+              const stored = deletedItem[definition.vectorField]
+              if (stored !== undefined) deletedItem[definition.stashField] = stored
+              delete deletedItem[definition.vectorField]
+              delete deletedItem[definition.partitionField]
+            }
+
             // Replace SK with deleted sort key
             deletedItem[primary.sk.field] = DynamoSchema.composeDeletedKey(schema, entityType, now)
 
@@ -3670,12 +4166,14 @@ const makeImpl = <
 
   const upsert = (input: unknown) =>
     new EntityPutImpl(
-      (mode: DecodeMode, opts: { readonly condition: Expr | ConditionInput | undefined }) =>
+      (mode: DecodeMode, opts: EntityPutOpts) =>
         Effect.gen(function* () {
           const client = yield* DynamoClient
           const { name: tableName } = yield* tableTag
           // Clock-backed time source for createdAt/updatedAt SET clauses.
           const now = yield* DateTime.now
+
+          yield* checkWithVectorNames(opts.withVectors, "upsert")
 
           // Encode user input → wire form (see `put` for strategy).
           const encodedInput = yield* encodeOrDecodeEncode(
@@ -3698,12 +4196,22 @@ const makeImpl = <
 
           // Build UpdateExpression with if_not_exists for immutable fields + createdAt
           const setClauses: Array<string> = []
+          const upsertRemoveClauses: Array<string> = []
           const names: globalThis.Record<string, string> = {}
           const values: globalThis.Record<string, AttributeValue> = {}
           let counter = 0
 
-          // Determine primary key composite attribute names
-          const pkComposites = new Set(primaryKeyComposites(config.indexes))
+          // The physical key attributes (`pk` / `sk`) live in `Key` and cannot
+          // appear in an UpdateExpression. The COMPOSITE SOURCE fields are
+          // ordinary attributes and must be written like any other model field —
+          // skipping them (as this path used to) left the stored item without
+          // e.g. `productId`, so every read of an upserted item failed to decode
+          // with `Missing key`. Their values are fixed by the key, so a plain
+          // SET is idempotent.
+          const keyAttributeFields = new Set([
+            config.indexes.primary.pk.field,
+            config.indexes.primary.sk.field,
+          ])
 
           // System-colliding fields are written below in the system-field block
           // (so their semantics — if_not_exists / always-set — stay consistent).
@@ -3717,9 +4225,9 @@ const makeImpl = <
 
           // `item` is already in wire-form via `Schema.encode(inputSchema)`.
 
-          // All model fields (excluding PK composites, which are in the Key)
+          // All model fields (excluding the physical key attributes themselves)
           for (const [attr, val] of Object.entries(item)) {
-            if (pkComposites.has(attr)) continue
+            if (keyAttributeFields.has(resolveDbName(attr))) continue
             if (systemColliders.has(attr)) continue
             if (val === undefined) continue
 
@@ -3782,6 +4290,31 @@ const makeImpl = <
             counter++
           }
 
+          // Vector search: upsert writes the full item, so it always re-embeds
+          // (same contract as `put` — see `DESIGN.md §14 Write path`). Emitted
+          // as plain SETs, never `if_not_exists`: an upsert that overwrites the
+          // source fields must overwrite the vector derived from them, or the
+          // item would stay searchable under its previous description forever.
+          if (hasVectorIndexes) {
+            const vectorWrite = yield* computeVectorAttributes(item, opts.withVectors, "all")
+            for (const [field, value] of Object.entries(vectorWrite.sets)) {
+              const nameKey = `#u${counter}`
+              const valKey = `:u${counter}`
+              names[nameKey] = field
+              values[valKey] = toAttributeValue(value)
+              setClauses.push(`${nameKey} = ${valKey}`)
+              counter++
+            }
+            // An upsert whose input carries no source text takes the item out
+            // of the index, exactly as a `put` of the same input would.
+            for (const field of new Set(vectorWrite.removes)) {
+              const nameKey = `#vr${counter}`
+              names[nameKey] = field
+              upsertRemoveClauses.push(nameKey)
+              counter++
+            }
+          }
+
           // Add entity type discriminator
           {
             const nameKey = `#u${counter}`
@@ -3835,7 +4368,10 @@ const makeImpl = <
             counter++
           }
 
-          const updateExpression = `SET ${setClauses.join(", ")}`
+          const updateExpression =
+            upsertRemoveClauses.length > 0
+              ? `SET ${setClauses.join(", ")} REMOVE ${upsertRemoveClauses.join(", ")}`
+              : `SET ${setClauses.join(", ")}`
 
           // Optional user condition
           const condParts: Array<string> = []
@@ -4209,6 +4745,10 @@ const makeImpl = <
       // naive spread above may have carried over. gsiKeys weren't written into
       // eventItem (only decoded fields are), but defensively clear them.
       for (const field of gsiKeyFields()) {
+        delete eventItem[field]
+      }
+      // Only the current item is searchable — event items carry no embedding.
+      for (const field of vectorKeyFields()) {
         delete eventItem[field]
       }
       // Sparse-map fields are aggregate state, not event state. They live on
@@ -4716,6 +5256,24 @@ const makeImpl = <
           const restoredKeys = composeAllKeys(restoredItem)
           Object.assign(restoredItem, restoredKeys)
 
+          // Un-stash the embedding and recompose the vector partition value —
+          // restoring never costs an Embedder call. See `DESIGN.md §14`.
+          for (const [, definition] of vectorIndexEntries) {
+            const stashed = restoredItem[definition.stashField]
+            if (stashed !== undefined) {
+              restoredItem[definition.vectorField] = stashed
+              delete restoredItem[definition.stashField]
+            }
+            if (restoredItem[definition.vectorField] === undefined) continue
+            const partition = KeyComposer.tryComposeVectorPartition(
+              schema,
+              entityType,
+              definition,
+              restoredItem,
+            )
+            if (partition !== undefined) restoredItem[definition.partitionField] = partition
+          }
+
           const marshalledRestoredItem = toAttributeMap(restoredItem)
 
           // Build transaction
@@ -5055,9 +5613,15 @@ const makeImpl = <
     identifier: resolvedIdentifier as ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
     timeSeries: config.timeSeries as TTimeSeries,
     generatedId: config.generatedId as TGeneratedId,
+    vectorIndexes: config.vectorIndexes as TVectorIndexes,
+    _vectorIndexes: vectorIndexes,
     _resolvedRefs: resolvedRefs,
     /** @internal Full decode pipeline: rename + schema decode. Used by Batch/Aggregate. */
     _decodeRecord: decodeRecord,
+    /** @internal Domain field name → stored attribute name (`storedAs` renames). */
+    _resolveDbName: resolveDbName,
+    /** @internal Entity schema version baked into composed keys. */
+    _entityVersion: entityVersion,
     _serializeSparseFields: serializeSparseFields,
     _attachPrototype: attachPrototype,
     _configure: (
@@ -5123,7 +5687,8 @@ const makeImpl = <
     TRefs,
     ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
     TTimeSeries,
-    TGeneratedId
+    TGeneratedId,
+    TVectorIndexes
   >
 
   // Assign self so operation closures can reference the entity
@@ -5156,6 +5721,7 @@ export const bind = <
   TIdentifier extends string | undefined,
   TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   TGeneratedId extends GeneratedIdConfig | undefined = undefined,
+  TVectorIndexes extends globalThis.Record<string, VectorIndexConfig> | undefined = undefined,
 >(
   entity: Entity<
     TModel,
@@ -5168,7 +5734,8 @@ export const bind = <
     TRefs,
     TIdentifier,
     TTimeSeries,
-    TGeneratedId
+    TGeneratedId,
+    TVectorIndexes
   >,
 ): Effect.Effect<
   BoundEntity<
@@ -5179,7 +5746,8 @@ export const bind = <
     TTimeSeries,
     TTimestamps,
     TVersioned,
-    TGeneratedId
+    TGeneratedId,
+    TVectorIndexes
   >,
   never,
   DynamoClient | TableConfig
@@ -5245,8 +5813,159 @@ export const bind = <
       ) as unknown as import("./internal/BoundQuery.js").BoundQuery<A, never, A>
     }
 
+    /**
+     * Out-of-band embedding refresh.
+     *
+     * DynamoDB never recomputes a vector, so changing the embedding model (or
+     * the declared `source.fields`) leaves every stored vector stale until
+     * something rewrites it. `reembed` is that something: scan the entity's
+     * items, re-derive the source text, embed, and write the vector +
+     * partition attributes back.
+     *
+     * Version snapshots and soft-delete tombstones carry the same `__edd_e__`
+     * discriminator as live items, so they are filtered out by recomposing the
+     * primary sort key from the decoded record and comparing it with what is
+     * stored — a snapshot's SK never round-trips.
+     *
+     * See `DESIGN.md §14 Write path`.
+     */
+    const reembed = (options?: {
+      readonly concurrency?: number | undefined
+    }): Effect.Effect<number, DynamoClientError | ValidationError | EmbeddingError, never> => {
+      const vectorDefs = Object.entries(entity._vectorIndexes)
+      const boundSchema = entity._schema
+      const primary = entity.indexes.primary as IndexDefinition
+      const boundEntityVersion = entity._entityVersion
+      const concurrency = options?.concurrency ?? 4
+      return provide(
+        Effect.gen(function* () {
+          if (vectorDefs.length === 0) return 0
+          const client = yield* DynamoClient
+          const { name: tableName } = yield* entity._tableTag as Context.Service<
+            TableConfig,
+            TableConfig
+          >
+
+          const reembedItem = (marshalled: globalThis.Record<string, AttributeValue>) =>
+            Effect.gen(function* () {
+              const raw = fromAttributeMap(marshalled) as globalThis.Record<string, unknown>
+              const storedSk = raw[primary.sk.field]
+              const decoded = (yield* entity._decodeRecord(raw)) as globalThis.Record<
+                string,
+                unknown
+              >
+              // Snapshots / tombstones live in the same partition under a
+              // rewritten SK — their SK cannot be recomposed from the record.
+              const liveSk = KeyComposer.composeSk(
+                boundSchema,
+                entity.entityType,
+                boundEntityVersion,
+                primary,
+                decoded,
+              )
+              if (storedSk !== liveSk) return false
+
+              const attributes: globalThis.Record<string, unknown> = {}
+              for (const [logicalName, definition] of vectorDefs) {
+                const partition = KeyComposer.tryComposeVectorPartition(
+                  boundSchema,
+                  entity.entityType,
+                  definition,
+                  decoded,
+                )
+                if (partition === undefined) continue
+                const text = deriveSourceText(definition, decoded)
+                if (text === undefined) continue
+                const maybeEmbedder = yield* Effect.serviceOption(Embedder)
+                if (Option.isNone(maybeEmbedder)) {
+                  return yield* new EmbeddingError({
+                    entityType: entity.entityType,
+                    index: logicalName,
+                    reason:
+                      "No Embedder service is available. Provide one via " +
+                      "DynamoClient.make({ embedder }) before calling reembed().",
+                  })
+                }
+                const vector = yield* maybeEmbedder.value.embed(text)
+                if (vector.length !== definition.dimensions) {
+                  return yield* new EmbeddingError({
+                    entityType: entity.entityType,
+                    index: logicalName,
+                    reason:
+                      `Embedder produced ${vector.length} dimensions but vector index ` +
+                      `"${definition.index}" declares ${definition.dimensions}.`,
+                  })
+                }
+                attributes[definition.partitionField] = partition
+                attributes[definition.vectorField] = vector
+              }
+              if (Object.keys(attributes).length === 0) return false
+
+              const names: globalThis.Record<string, string> = { "#pk": primary.pk.field }
+              const values: globalThis.Record<string, AttributeValue> = {}
+              const sets: Array<string> = []
+              let i = 0
+              for (const [field, value] of Object.entries(attributes)) {
+                names[`#v${i}`] = field
+                values[`:v${i}`] = toAttributeValue(value)
+                sets.push(`#v${i} = :v${i}`)
+                i++
+              }
+              // Scan → embed → update is not atomic: an item can be hard-deleted
+              // between the scan page and this write, and an unconditional
+              // UpdateItem would resurrect it as a key-plus-vector fragment that
+              // decodes to nothing but still answers searches. Guard on the item
+              // still existing and treat the rejection as "skipped".
+              return yield* client
+                .updateItem({
+                  TableName: tableName,
+                  Key: {
+                    [primary.pk.field]: marshalled[primary.pk.field]!,
+                    [primary.sk.field]: marshalled[primary.sk.field]!,
+                  },
+                  UpdateExpression: `SET ${sets.join(", ")}`,
+                  ConditionExpression: "attribute_exists(#pk)",
+                  ExpressionAttributeNames: names,
+                  ExpressionAttributeValues: values,
+                })
+                .pipe(
+                  Effect.as(true),
+                  Effect.catchIf(
+                    (err: DynamoClientError) => isAwsConditionalCheckFailed(err.cause),
+                    () => Effect.succeed(false),
+                  ),
+                )
+            })
+
+          let updated = 0
+          let exclusiveStartKey: globalThis.Record<string, AttributeValue> | undefined
+          do {
+            const page = yield* client.scan({
+              TableName: tableName,
+              FilterExpression: "#et = :et",
+              ExpressionAttributeNames: { "#et": "__edd_e__" },
+              ExpressionAttributeValues: { ":et": { S: entity.entityType } },
+              ExclusiveStartKey: exclusiveStartKey,
+            })
+            const results = yield* Effect.all(
+              (page.Items ?? []).map((item) =>
+                reembedItem(item as globalThis.Record<string, AttributeValue>),
+              ),
+              { concurrency },
+            )
+            updated += results.filter((applied) => applied).length
+            exclusiveStartKey = page.LastEvaluatedKey as
+              | globalThis.Record<string, AttributeValue>
+              | undefined
+          } while (exclusiveStartKey !== undefined)
+          return updated
+        }),
+      )
+    }
+
     return {
       // CRUD — fluent bound builders (yieldable, no .run() terminal)
+      reembed,
       get: (key: Key) => provide((entity.get(key) as any)._run("record")),
       put: (input: Input) => makeBoundPut(entity.put(input), boundCrudConfig),
       create: (input: Input) => makeBoundPut(entity.create(input), boundCrudConfig),
@@ -5355,7 +6074,8 @@ export const bind = <
       TTimeSeries,
       TTimestamps,
       TVersioned,
-      TGeneratedId
+      TGeneratedId,
+      TVectorIndexes
     >
   })
 

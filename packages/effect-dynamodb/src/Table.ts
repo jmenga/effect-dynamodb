@@ -11,6 +11,12 @@
 import type { DescribeTableCommandOutput } from "@aws-sdk/client-dynamodb"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
+import type { VectorIndexDefinition } from "@effect-dynamodb/schema/VectorIndex.js"
+import {
+  MAX_INLINE_FILTERS,
+  MAX_VECTOR_INDEXES_PER_TABLE,
+  toWireDistanceFunction,
+} from "@effect-dynamodb/schema/VectorIndex.js"
 import { type Config, Context, Effect, Layer } from "effect"
 import type { DynamoClientError } from "./DynamoClient.js"
 
@@ -46,7 +52,12 @@ let tableCounter = 0
 /** Minimal entity shape for Table membership (avoids circular import with Entity.ts) */
 interface EntityLike {
   readonly _tag: "Entity"
+  readonly entityType?: string | undefined
   readonly indexes: Record<string, IndexDefinition>
+  /** Normalized vector index definitions (absent on entities without any). */
+  readonly _vectorIndexes?: Record<string, VectorIndexDefinition> | undefined
+  /** Domain field name → stored DynamoDB attribute name (`storedAs` renames). */
+  readonly _resolveDbName?: ((domainName: string) => string) | undefined
   readonly _configure: (
     schema: DynamoSchema.DynamoSchema,
     tableTag: Context.Service<TableConfig, TableConfig>,
@@ -147,6 +158,12 @@ export const make = <
     }
   }
 
+  // Cross-entity vector index agreement. `Dimensions` and `DistanceFunction` are
+  // immutable at the DynamoDB level, so two entities sharing a physical vector
+  // index cannot disagree — catch it at definition time rather than on the
+  // CreateTable round trip.
+  validateSharedVectorIndexes(entities)
+
   return {
     _tag: "Table" as const,
     schema: config.schema,
@@ -172,6 +189,193 @@ export const make = <
           return result
         }),
       ),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Vector index merging + validation
+// ---------------------------------------------------------------------------
+
+/**
+ * Merge every registered entity's vector index declarations into one map keyed
+ * by physical index name, validating that all sharers agree.
+ *
+ * Sharing a physical vector index across entities is the norm in single-table
+ * designs — the quota is 5 per table — and it is safe precisely because the
+ * composed `__edd_vp_<name>__` partition value carries the entity type, so a
+ * search never crosses entity boundaries (see `DESIGN.md §14`).
+ *
+ * @throws when two entities disagree on `dimensions` or `distance` (EDD-9035),
+ *   or when more than {@link MAX_VECTOR_INDEXES_PER_TABLE} distinct physical
+ *   indexes are declared (EDD-9034).
+ */
+export const mergeVectorIndexes = (
+  entities: Record<string, EntityLike>,
+): Map<string, MergedVectorIndex> => {
+  const merged = new Map<
+    string,
+    {
+      definition: VectorIndexDefinition
+      owner: string
+      filters: Array<string>
+      resolveDbName: (domainName: string) => string
+      filterStoredTypes: Record<string, "S" | "N">
+    }
+  >()
+
+  for (const [entityKey, entity] of Object.entries(entities)) {
+    const declared = entity._vectorIndexes
+    if (!declared) continue
+    const owner = entity.entityType ?? entityKey
+    const resolveDbName = entity._resolveDbName ?? ((domainName: string) => domainName)
+    for (const definition of Object.values(declared)) {
+      const existing = merged.get(definition.index)
+      if (existing === undefined) {
+        merged.set(definition.index, {
+          definition,
+          owner,
+          filters: [...definition.filters],
+          resolveDbName,
+          filterStoredTypes: Object.fromEntries(
+            definition.filters.map((f) => [resolveDbName(f), definition.filterTypes[f] ?? "S"]),
+          ),
+        })
+        continue
+      }
+      if (
+        existing.definition.dimensions !== definition.dimensions ||
+        existing.definition.distance !== definition.distance
+      ) {
+        throw new Error(
+          `[EDD-9035] Vector index "${definition.index}" is shared by entities "${existing.owner}" ` +
+            `and "${owner}" with conflicting settings: ` +
+            `${existing.definition.dimensions}/${existing.definition.distance} vs ` +
+            `${definition.dimensions}/${definition.distance}. Dimensions and distance function are ` +
+            `immutable on a DynamoDB vector index — every entity sharing one must agree.`,
+        )
+      }
+      // Filters, unlike dimensions/distance, are per-entity access patterns
+      // rather than a shared physical property — one index can serve several
+      // entities filtering on different attributes. Union them; keeping only
+      // the first entity's set would silently leave the other sharers' filter
+      // attributes out of the SearchSchema (and un-filterable at runtime).
+      for (const filter of definition.filters) {
+        const stored = resolveDbName(filter)
+        const storedType = definition.filterTypes[filter] ?? "S"
+        const existingType = existing.filterStoredTypes[stored]
+        if (existingType !== undefined && existingType !== storedType) {
+          throw new Error(
+            `[EDD-9040] Vector index "${definition.index}" filter attribute "${stored}" is ` +
+              `declared with AttributeDefinitions type "${existingType}" by entity ` +
+              `"${existing.owner}" and "${storedType}" by entity "${owner}". A shared ` +
+              `SearchSchema attribute must have one scalar type.`,
+          )
+        }
+        existing.filterStoredTypes[stored] = storedType
+        if (existing.filters.some((f) => existing.resolveDbName(f) === stored)) continue
+        existing.filters.push(filter)
+      }
+    }
+  }
+
+  for (const [indexName, entry] of merged) {
+    if (entry.filters.length > MAX_INLINE_FILTERS) {
+      throw new Error(
+        `[EDD-9032] Vector index "${indexName}" resolves to ${entry.filters.length} INLINE_FILTER ` +
+          `attributes once unioned across the entities sharing it ` +
+          `(${[...entry.filters].sort().join(", ")}). DynamoDB allows at most ` +
+          `${MAX_INLINE_FILTERS} per vector index.`,
+      )
+    }
+  }
+
+  if (merged.size > MAX_VECTOR_INDEXES_PER_TABLE) {
+    throw new Error(
+      `[EDD-9034] Table declares ${merged.size} vector indexes ` +
+        `(${[...merged.keys()].sort().join(", ")}). DynamoDB allows at most ` +
+        `${MAX_VECTOR_INDEXES_PER_TABLE} per table.`,
+    )
+  }
+
+  return merged
+}
+
+/** A physical vector index resolved across every entity that declares it. */
+export interface MergedVectorIndex {
+  /** The first declaring entity's definition — authoritative for dimensions/distance. */
+  readonly definition: VectorIndexDefinition
+  /** Entity type of the first declarer, used in conflict messages. */
+  readonly owner: string
+  /** Union of every sharer's declared `filters` (domain names). */
+  readonly filters: ReadonlyArray<string>
+  /** Stored-name resolver for the first declarer's `storedAs` renames. */
+  readonly resolveDbName: (domainName: string) => string
+  /**
+   * `AttributeDefinitions` scalar type per STORED filter attribute name,
+   * merged across sharers (EDD-9040 on conflict). CreateTable/UpdateTable must
+   * declare every SearchSchema element in `AttributeDefinitions`.
+   */
+  readonly filterStoredTypes: Readonly<Record<string, "S" | "N">>
+}
+
+/** @internal Run {@link mergeVectorIndexes} purely for its validation effect. */
+const validateSharedVectorIndexes = (entities: Record<string, EntityLike>): void => {
+  mergeVectorIndexes(entities)
+}
+
+/** Vector index definition for CreateTable / UpdateTable input. */
+export interface VectorIndexSpec {
+  readonly IndexName: string
+  readonly VectorAttribute: { readonly AttributeName: string }
+  readonly Dimensions: number
+  readonly DistanceFunction: "COSINE" | "EUCLIDEAN" | "DOT_PRODUCT"
+  readonly Projection: { readonly ProjectionType: "ALL" }
+  readonly SearchSchema?:
+    | Array<{
+        readonly AttributeName: string
+        readonly SearchSchemaElementType: "HASH" | "INLINE_FILTER"
+      }>
+    | undefined
+}
+
+/**
+ * Map a normalized {@link VectorIndexDefinition} onto the AWS `VectorIndex`
+ * shape. The composed partition attribute is always the single `HASH` element;
+ * declared filters follow as `INLINE_FILTER` elements.
+ *
+ * `filters` may be supplied pre-unioned across every entity that shares the
+ * physical index (see {@link mergeVectorIndexes}) — a shared index must declare
+ * the union, or a sharer's filter attribute would simply not be indexed.
+ *
+ * Filter names are emitted as STORED attribute names: an entity may rename a
+ * field with `storedAs`, and the index has to point at what is actually on disk.
+ */
+export const toVectorIndexSpec = (
+  definition: VectorIndexDefinition,
+  options?: {
+    readonly filters?: ReadonlyArray<string> | undefined
+    readonly resolveDbName?: ((domainName: string) => string) | undefined
+  },
+): VectorIndexSpec => {
+  const resolveDbName = options?.resolveDbName ?? ((domainName: string) => domainName)
+  const filters = options?.filters ?? definition.filters
+  const SearchSchema: Array<{
+    AttributeName: string
+    SearchSchemaElementType: "HASH" | "INLINE_FILTER"
+  }> = [{ AttributeName: definition.partitionField, SearchSchemaElementType: "HASH" }]
+  for (const filter of filters) {
+    SearchSchema.push({
+      AttributeName: resolveDbName(filter),
+      SearchSchemaElementType: "INLINE_FILTER",
+    })
+  }
+  return {
+    IndexName: definition.index,
+    VectorAttribute: { AttributeName: definition.vectorField },
+    Dimensions: definition.dimensions,
+    DistanceFunction: toWireDistanceFunction(definition.distance),
+    Projection: { ProjectionType: "ALL" },
+    SearchSchema,
   }
 }
 
@@ -215,6 +419,15 @@ export interface TableDefinition {
   readonly AttributeDefinitions: Array<AttributeDefinition>
   readonly GlobalSecondaryIndexes?: Array<GlobalSecondaryIndex> | undefined
   readonly LocalSecondaryIndexes?: Array<LocalSecondaryIndex> | undefined
+  /**
+   * Merged vector indexes from every registered entity, deduplicated by physical
+   * name. Every `SearchSchema` element (the composed HASH partition attribute
+   * and each INLINE_FILTER attribute) is also added to `AttributeDefinitions` —
+   * the live service rejects the table otherwise ("One element in SearchSchema
+   * is not defined in attribute definitions"). The vector attribute itself is
+   * NOT declared; DynamoDB derives it from the `VectorIndex` declaration.
+   */
+  readonly VectorIndexes?: Array<VectorIndexSpec> | undefined
 }
 
 /**
@@ -343,6 +556,27 @@ export const definition = (table: Table): TableDefinition => {
     .sort()
     .map((name) => ({ AttributeName: name, AttributeType: "S" as const }))
 
+  // Every SearchSchema element must appear in AttributeDefinitions (verified
+  // against the live service; DynamoDB Local silently accepts their absence).
+  // The composed HASH partition attribute is always a string; filter types are
+  // derived from the model schema at Entity.make (EDD-9039).
+  const vectorAttributeDefs = (
+    merged: Map<string, MergedVectorIndex>,
+  ): Array<AttributeDefinition> => {
+    const defs = new Map<string, "S" | "N">()
+    for (const entry of merged.values()) {
+      if (!attributeNames.has(entry.definition.partitionField)) {
+        defs.set(entry.definition.partitionField, "S")
+      }
+      for (const [stored, type] of Object.entries(entry.filterStoredTypes)) {
+        if (!attributeNames.has(stored)) defs.set(stored, type)
+      }
+    }
+    return Array.from(defs.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([AttributeName, AttributeType]) => ({ AttributeName, AttributeType }))
+  }
+
   const GlobalSecondaryIndexes: Array<GlobalSecondaryIndex> | undefined =
     gsiMap.size > 0
       ? Array.from(gsiMap.entries())
@@ -371,14 +605,30 @@ export const definition = (table: Table): TableDefinition => {
           }))
       : undefined
 
+  const mergedVectorIndexes = mergeVectorIndexes(table.entities)
+  const VectorIndexes: Array<VectorIndexSpec> | undefined =
+    mergedVectorIndexes.size > 0
+      ? Array.from(mergedVectorIndexes.entries())
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([, entry]) =>
+            toVectorIndexSpec(entry.definition, {
+              filters: entry.filters,
+              resolveDbName: entry.resolveDbName,
+            }),
+          )
+      : undefined
+  AttributeDefinitions.push(...vectorAttributeDefs(mergedVectorIndexes))
+
   const result: {
     KeySchema: Array<KeySchemaElement>
     AttributeDefinitions: Array<AttributeDefinition>
     GlobalSecondaryIndexes?: Array<GlobalSecondaryIndex>
     LocalSecondaryIndexes?: Array<LocalSecondaryIndex>
+    VectorIndexes?: Array<VectorIndexSpec>
   } = { KeySchema, AttributeDefinitions }
   if (GlobalSecondaryIndexes) result.GlobalSecondaryIndexes = GlobalSecondaryIndexes
   if (LocalSecondaryIndexes) result.LocalSecondaryIndexes = LocalSecondaryIndexes
+  if (VectorIndexes) result.VectorIndexes = VectorIndexes
   return result
 }
 

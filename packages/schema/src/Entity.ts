@@ -63,6 +63,12 @@ import type {
 } from "./internal/EntityTypes.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "./KeyComposer.js"
 import { normalizeGsiConfig } from "./KeyComposer.js"
+import type { VectorIndexConfig, VectorIndexDefinition } from "./VectorIndex.js"
+import {
+  deriveVectorFilterTypes,
+  normalizeVectorIndexConfig,
+  validateVectorIndexes,
+} from "./VectorIndex.js"
 
 // ---------------------------------------------------------------------------
 // Re-export KeyComposer types for convenience
@@ -209,6 +215,9 @@ export interface EntityDefinitionData {
   readonly resolveDbName: (domainName: string) => string
   readonly generatedIdField: string | undefined
   readonly generatedIdVersion: string | undefined
+  /** Normalized vector index declarations, keyed by logical name. */
+  readonly vectorIndexes: globalThis.Record<string, VectorIndexDefinition>
+  readonly hasVectorIndexes: boolean
 }
 
 /**
@@ -231,6 +240,7 @@ export interface EntityDefinitionConfig {
   readonly refs?: globalThis.Record<string, AnyRefValue> | undefined
   readonly timeSeries?: TimeSeriesConfig<any> | undefined
   readonly generatedId?: GeneratedIdConfig | undefined
+  readonly vectorIndexes?: globalThis.Record<string, VectorIndexConfig> | undefined
 }
 
 /**
@@ -255,6 +265,7 @@ export interface EntityDefinition<
   TIdentifier extends string | undefined = undefined,
   TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   TGeneratedId extends GeneratedIdConfig | undefined = undefined,
+  TVectorIndexes extends globalThis.Record<string, VectorIndexConfig> | undefined = undefined,
 > {
   readonly _tag: "Entity"
   readonly model: TModel
@@ -267,6 +278,15 @@ export interface EntityDefinition<
   readonly identifier: TIdentifier
   readonly timeSeries: TTimeSeries
   readonly generatedId: TGeneratedId
+  /** Vector index declarations as authored (see `DESIGN.md §14`). */
+  readonly vectorIndexes: TVectorIndexes
+
+  /**
+   * @internal Normalized vector index definitions keyed by logical name. The
+   * runtime package reads these to emit `CreateTable.VectorIndexes`, compose
+   * partition attributes on writes, and build search accessors.
+   */
+  readonly _vectorIndexes: globalThis.Record<string, VectorIndexDefinition>
 
   /** @internal Resolved ref metadata — used by cascade to inspect target entities */
   readonly _resolvedRefs: ReadonlyArray<{
@@ -364,6 +384,7 @@ export const buildEntityDefinition = (config: {
   readonly refs?: globalThis.Record<string, AnyRefValue> | undefined
   readonly timeSeries?: TimeSeriesConfig<any> | undefined
   readonly generatedId?: GeneratedIdConfig | undefined
+  readonly vectorIndexes?: globalThis.Record<string, VectorIndexConfig> | undefined
 }): EntityDefinitionData => {
   // Unwrap ConfiguredModel to get the raw model and attribute overrides
   const configured = isConfiguredModel(config.model) ? config.model : undefined
@@ -612,6 +633,55 @@ export const buildEntityDefinition = (config: {
       )
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // Validate + normalize vector indexes (EDD-903x)
+  // ---------------------------------------------------------------------------
+
+  const vectorIndexes: globalThis.Record<string, VectorIndexDefinition> = {}
+  if (config.vectorIndexes) {
+    // Encoded-type tag for a model field, resolving homogeneous literal unions
+    // (e.g. Schema.Literals(["a", "b"]) → "String") so they qualify as filters.
+    const fieldEncodedTag = (field: string): string | undefined => {
+      const fieldSchema = getSchemaFields(rawModel)?.[field] as { ast?: SchemaAST.AST } | undefined
+      if (fieldSchema?.ast === undefined) return undefined
+      const resolveTag = (ast: SchemaAST.AST): string => {
+        const encoded = SchemaAST.toEncoded(ast)
+        if (SchemaAST.isUnion(encoded)) {
+          const memberTags = new Set(encoded.types.map((member) => resolveTag(member)))
+          return (memberTags.size === 1 ? [...memberTags][0] : undefined) ?? "Union"
+        }
+        if (encoded._tag === "Literal") {
+          const literal = (encoded as { literal?: unknown }).literal
+          return typeof literal === "number" ? "Number" : "String"
+        }
+        return encoded._tag
+      }
+      return resolveTag(fieldSchema.ast)
+    }
+    for (const [logicalName, vectorConfig] of Object.entries(config.vectorIndexes)) {
+      vectorIndexes[logicalName] = normalizeVectorIndexConfig(vectorConfig)
+    }
+    // Field-existence validation (EDD-9030..9034) runs before type derivation
+    // so an unknown filter field reports EDD-9031, not a derivation failure.
+    validateVectorIndexes({
+      entityType: config.entityType,
+      definitions: vectorIndexes,
+      validFields: validCompositeFields,
+    })
+    for (const [logicalName, definition] of Object.entries(vectorIndexes)) {
+      vectorIndexes[logicalName] = {
+        ...definition,
+        filterTypes: deriveVectorFilterTypes(
+          config.entityType,
+          logicalName,
+          definition.filters,
+          fieldEncodedTag,
+        ),
+      }
+    }
+  }
+  const hasVectorIndexes = Object.keys(vectorIndexes).length > 0
 
   // ---------------------------------------------------------------------------
   // Resolve refs at make() time
@@ -867,6 +937,8 @@ export const buildEntityDefinition = (config: {
     resolveDbName,
     generatedIdField,
     generatedIdVersion,
+    vectorIndexes,
+    hasVectorIndexes,
   }
 }
 
@@ -922,6 +994,9 @@ export const make = <
   const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
   const TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   const TGeneratedId extends GeneratedIdConfig | undefined = undefined,
+  const TVectorIndexes extends
+    | globalThis.Record<string, VectorIndexConfig<any>>
+    | undefined = undefined,
   const TAttrs extends {} = {},
 >(config: {
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
@@ -935,6 +1010,7 @@ export const make = <
   readonly refs?: TRefs
   readonly timeSeries?: TTimeSeries
   readonly generatedId?: TGeneratedId
+  readonly vectorIndexes?: TVectorIndexes
 }): EntityDefinition<
   TModel,
   TEntityType,
@@ -946,7 +1022,8 @@ export const make = <
   TRefs,
   ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
   TTimeSeries,
-  TGeneratedId
+  TGeneratedId,
+  TVectorIndexes
 > => {
   const gsiIndexes: globalThis.Record<string, IndexDefinition> = {}
   if (config.indexes) {
@@ -975,6 +1052,7 @@ const makeDefinitionImpl = (config: {
   readonly refs?: globalThis.Record<string, AnyRefValue> | undefined
   readonly timeSeries?: TimeSeriesConfig<any> | undefined
   readonly generatedId?: GeneratedIdConfig | undefined
+  readonly vectorIndexes?: globalThis.Record<string, VectorIndexConfig> | undefined
 }): EntityDefinition => {
   const data = buildEntityDefinition(config)
 
@@ -997,6 +1075,8 @@ const makeDefinitionImpl = (config: {
     identifier: data.resolvedIdentifier as any,
     timeSeries: config.timeSeries,
     generatedId: config.generatedId,
+    vectorIndexes: config.vectorIndexes,
+    _vectorIndexes: data.vectorIndexes,
     _resolvedRefs: data.resolvedRefs.map((r) => ({
       fieldName: r.fieldName,
       idFieldName: r.idFieldName,
