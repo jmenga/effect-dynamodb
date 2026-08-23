@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, "release/**"]
 
 jobs:
   ci:
@@ -78,7 +78,14 @@ jobs:
       # the changeset is consumed and package.json versions are bumped in the
       # PR itself — not in a follow-up bot PR. Empty chore changesets (no
       # packages listed) are fine and are allowed through.
+      #
+      # Scoped to PRs targeting `main`. A stacked release train (several PRs
+      # chained onto a `release/**` integration branch, consumed by one
+      # `changeset version` at the tip) must be able to carry unconsumed
+      # changesets on its intermediate PRs. The guarantee that matters is
+      # unchanged: nothing reaches `main` with a changeset left unconsumed.
       - name: Enforce changeset-version consumption
+        if: github.base_ref == 'main'
         run: |
           node <<'EOF'
           const fs = require('fs');
