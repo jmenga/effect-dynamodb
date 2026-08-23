@@ -7,6 +7,7 @@ export * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 export type { EmbedderService } from "@effect-dynamodb/schema/Embedder.js"
 export { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 export {
+  AdditionalItemConditionFailed,
   AggregateAssemblyError,
   AggregateDecompositionError,
   AggregateTransactionOverflow,
@@ -15,6 +16,7 @@ export {
   CompositeKeyHoleError,
   CompositeNullableError,
   ConditionalCheckFailed,
+  DuplicateCommand,
   DynamoError,
   DynamoValidationError,
   EmbeddingError,

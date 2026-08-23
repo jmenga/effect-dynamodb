@@ -7,6 +7,45 @@
 
 ---
 
+## 0. Reconciliation with #82 and #84 (release-train stacking)
+
+This design was written against `main`. It ships stacked on top of
+[#82](https://github.com/jmenga/effect-dynamodb/issues/82) (append guards) and
+[#84](https://github.com/jmenga/effect-dynamodb/issues/84) (snapshots + retry), which
+independently touched the same two surfaces. Three decisions below were superseded when
+the branches were reconciled; the rest of this document stands as written.
+
+1. **Oversize appends raise `AppendTooLarge`, not `TransactionOverflow`.** #82 had already
+   introduced a dedicated `AppendTooLarge` error for exactly this guard, carrying
+   `streamName` / `streamId` / `count` / `limit`. Two errors for one condition is worse
+   than either, so the guard raises `AppendTooLarge` and counts
+   `events + additionalItems + sentinel + contiguityCheck`. §5, §7 and §10 should be read
+   with that substitution.
+
+2. **There is exactly one limit constant: `TRANSACT_WRITE_ITEMS_LIMIT`.** #82 introduced it
+   as a public export of `@effect-dynamodb/schema/Errors.js`, referenced by
+   `AppendTooLarge`'s own docs. The `MAX_TRANSACT_ITEMS` constant this design proposed for
+   `internal/TransactWriteOps.ts` was dropped, and `Transaction.transactWrite` points at
+   the schema-package constant instead.
+
+3. **Item layout gains a leading `ConditionCheck`.** #82 prepends a version-contiguity
+   `ConditionCheck` when `expectedVersion > 0` and events are being written, so the layout
+   is `[contiguityCheck?, events…, additionalItems…, sentinel]`. The positional
+   cancellation mapping in §6 is offset by that check, and a failure at its index maps to
+   `VersionConflict` — the same verdict as a failed event put. The sentinel remains LAST,
+   so caller-visible `additionalItems` indices are unchanged, which is the invariant §6
+   actually depends on. A zero-event append (pure side-write) writes no version and so
+   carries no contiguity check.
+
+Additionally, `commandHandler`'s data-last dual is #84's hand-rolled dispatch on the
+`EventStreamTypeId` brand rather than the `Function.dual` predicate form proposed here.
+Both are correct; the brand dispatch was kept because it is the incumbent and because
+`Function.dual`'s *numeric-arity* form silently drops the trailing options argument that
+both `{ retry }` (#84) and `{ idempotency }` (this design) depend on. `CommandHandlerOptions`
+is a single type carrying both.
+
+---
+
 ## 1. Executive summary
 
 `EventStore.append` builds the whole `TransactWriteItems` call itself. That makes the
@@ -43,7 +82,9 @@ One-screen example:
 yield* matchEvents.append({ matchId: "m-1" }, [new InningsCompleted({ ... })], 3, {
   additionalItems: [
     Watermarks.put({ writerId: "ingest-1", matchId: "m-1", lastSeq: 4021 }),
-    Watermarks.get({ writerId: "ingest-1" }).pipe(Transaction.check({ lt: { lastSeq: 4021 } })),
+    Watermarks.get({ writerId: "ingest-1" }).pipe(
+      Transaction.check(Expression.condition({ lt: { lastSeq: 4021 } })),
+    ),
   ],
 })
 
@@ -257,7 +298,7 @@ command ids are in practice.
 
 ### 4.5 TTL
 
-`idempotency.ttl?: Duration.DurationInput`. When set, the sentinel gets an epoch-seconds
+`idempotency.ttl?: Duration.Duration | string`. When set, the sentinel gets an epoch-seconds
 TTL attribute whose name comes from `Table.resolveTtlAttributeName(tableConfig)` — so it
 honours `TableConfig.ttlAttributeName` (#51) like every other lifecycle feature.
 
@@ -318,7 +359,7 @@ readonly append: (
   options?: {
     readonly metadata?: TMetadata
     readonly additionalItems?: ReadonlyArray<TransactWriteOp>
-    readonly idempotency?: { readonly commandId: string; readonly ttl?: Duration.DurationInput }
+    readonly idempotency?: { readonly commandId: string; readonly ttl?: Duration.Duration | string }
   },
 ) => Effect.Effect<
   AppendResult<TEvent>,
@@ -345,7 +386,7 @@ events *and* no options, the early return is preserved unchanged.
 
 ```ts
 EventStore.commandHandler(decider, stream, {
-  idempotency?: { ttl?: Duration.DurationInput }
+  idempotency?: { ttl?: Duration.Duration | string }
 })
 ```
 
@@ -372,9 +413,10 @@ against here: it would look exactly like success until the day a duplicate matte
 ### 6.3 Pre-existing bug fixed in passing
 
 `commandHandler` is `Function.dual(2, (decider, stream) => …)`. Effect's `dual` passes
-`self` **first**, so the documented data-last form `stream.pipe(commandHandler(decider))`
+`self` **first**, so the documented data-last form `pipe(stream, commandHandler(decider))`
 actually invokes the body as `(stream, decider)` — arguments swapped, i.e. broken. It was
-never exercised by a test, which is why it survived.
+never exercised by a test, which is why it survived. (The JSDoc also showed
+`stream.pipe(…)`, which cannot work either: `EventStream` is not `Pipeable`.)
 
 Per the repo's fix-adjacent-debt rule this is fixed here rather than deferred, since the
 function is being restructured anyway for the options parameter: `dual` moves to its

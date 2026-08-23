@@ -41,7 +41,11 @@ import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
-import type { VersionConflict } from "@effect-dynamodb/schema/Errors.js"
+import type {
+  AdditionalItemConditionFailed,
+  DuplicateCommand,
+  VersionConflict,
+} from "@effect-dynamodb/schema/Errors.js"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -6776,5 +6780,249 @@ describeConnected("EventStore snapshots + retry (closes #84)", () => {
       expect(result.version).toBe(1)
       expect(result.state).toEqual({ balance: 42, txCount: 1 })
     }).pipe(provideEsSnap),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// EventStore — additional transaction items + command idempotency (#85)
+// ---------------------------------------------------------------------------
+
+const esIdemSchema = DynamoSchema.make({ name: "es-idem", version: 1 })
+const esIdemTableName = `es-idem-${Date.now()}`
+
+/** Side record written atomically with events, to exercise `additionalItems`. */
+class EsWatermark extends Schema.Class<EsWatermark>("EsWatermark")({
+  writerId: Schema.String,
+  lastSeq: Schema.Number,
+}) {}
+
+const EsWatermarks = Entity.make({
+  model: EsWatermark,
+  entityType: "EsWatermark",
+  primaryKey: {
+    pk: { field: "pk", composite: ["writerId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const EsIdemTable = Table.make({ schema: esIdemSchema, entities: { EsWatermarks } })
+
+class EsIdemMatchStarted extends Schema.Class<EsIdemMatchStarted>("EsIdemMatchStarted")({
+  venue: Schema.String,
+}) {}
+
+class EsIdemInningsCompleted extends Schema.Class<EsIdemInningsCompleted>("EsIdemInningsCompleted")(
+  {
+    innings: Schema.Number,
+    runs: Schema.Number,
+  },
+) {}
+
+type EsIdemMatchEvent = EsIdemMatchStarted | EsIdemInningsCompleted
+
+const EsIdemMatchEvents = EventStore.makeStream({
+  table: EsIdemTable,
+  streamName: "EsMatch",
+  events: [EsIdemMatchStarted, EsIdemInningsCompleted],
+  streamId: { composite: ["matchId"] },
+})
+
+interface EsIdemMatchState {
+  readonly status: "pending" | "in-progress"
+  readonly innings: number
+}
+
+type EsIdemMatchCommand =
+  | { readonly _tag: "Start"; readonly venue: string }
+  | { readonly _tag: "CompleteInnings"; readonly innings: number; readonly runs: number }
+
+const esIdemDecider: EventStore.Decider<EsIdemMatchState, EsIdemMatchCommand, EsIdemMatchEvent> = {
+  initialState: { status: "pending", innings: 0 },
+  decide: (command) =>
+    Effect.succeed(
+      command._tag === "Start"
+        ? [new EsIdemMatchStarted({ venue: command.venue })]
+        : [new EsIdemInningsCompleted({ innings: command.innings, runs: command.runs })],
+    ),
+  evolve: (state, event) =>
+    event instanceof EsIdemMatchStarted
+      ? { ...state, status: "in-progress" as const }
+      : { ...state, innings: state.innings + 1 },
+}
+
+const EsIdemTestLayer = Layer.mergeAll(ClientLayer, EsIdemTable.layer({ name: esIdemTableName }))
+const provideEsIdem = Effect.provide(EsIdemTestLayer)
+
+describeConnected("EventStore — additionalItems + idempotency (closes #85)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: esIdemTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(EsIdemTable),
+        })
+      }).pipe(provideEsIdem, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: esIdemTableName })
+      }).pipe(
+        provideEsIdem,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("commits events and an additional item atomically", () =>
+    Effect.gen(function* () {
+      yield* EsIdemMatchEvents.append(
+        { matchId: "atomic-1" },
+        [new EsIdemMatchStarted({ venue: "MCG" })],
+        0,
+        { additionalItems: [EsWatermarks.put({ writerId: "w-atomic-1", lastSeq: 1 })] },
+      )
+
+      const events = yield* EsIdemMatchEvents.read({ matchId: "atomic-1" })
+      expect(events).toHaveLength(1)
+      expect(events[0]!.eventType).toBe("EsIdemMatchStarted")
+
+      const watermark = yield* EsWatermarks.get({ writerId: "w-atomic-1" })
+      expect(watermark.lastSeq).toBe(1)
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("a user-item condition failure is NOT reported as VersionConflict", () =>
+    Effect.gen(function* () {
+      yield* EsWatermarks.put({ writerId: "w-cond-1", lastSeq: 100 })
+
+      const error = yield* EsIdemMatchEvents.append(
+        { matchId: "cond-1" },
+        [new EsIdemMatchStarted({ venue: "SCG" })],
+        0,
+        {
+          additionalItems: [
+            // Watermark is at 100 — this condition cannot hold.
+            Transaction.check(
+              EsWatermarks.get({ writerId: "w-cond-1" }),
+              Expression.condition({ lt: { lastSeq: 50 } }),
+            ),
+          ],
+        },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("AdditionalItemConditionFailed")
+      const failure = error as AdditionalItemConditionFailed
+      expect(failure.streamName).toBe("EsMatch")
+      expect(failure.streamId).toBe("cond-1")
+      expect(failure.indices).toEqual([0])
+
+      // All-or-nothing: the event must not have been written
+      const events = yield* EsIdemMatchEvents.read({ matchId: "cond-1" })
+      expect(events).toHaveLength(0)
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("a version conflict is still mapped correctly with additional items present", () =>
+    Effect.gen(function* () {
+      // Establish v1 on the stream
+      yield* EsIdemMatchEvents.append(
+        { matchId: "vc-1" },
+        [new EsIdemMatchStarted({ venue: "WACA" })],
+        0,
+      )
+      yield* EsWatermarks.put({ writerId: "w-vc-1", lastSeq: 0 })
+
+      // Append again at the now-stale expectedVersion 0, with a satisfiable
+      // additional-item condition, so only the event put's guard can fail.
+      const error = yield* EsIdemMatchEvents.append(
+        { matchId: "vc-1" },
+        [new EsIdemInningsCompleted({ innings: 1, runs: 250 })],
+        0,
+        {
+          additionalItems: [
+            Transaction.check(
+              EsWatermarks.get({ writerId: "w-vc-1" }),
+              Expression.condition({ eq: { lastSeq: 0 } }),
+            ),
+          ],
+        },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("VersionConflict")
+      expect((error as VersionConflict).expectedVersion).toBe(0)
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("rejects a replayed commandId with DuplicateCommand", () =>
+    Effect.gen(function* () {
+      const handle = EventStore.commandHandler(esIdemDecider, EsIdemMatchEvents, {
+        idempotency: {},
+      })
+
+      const first = yield* handle(
+        { matchId: "idem-1" },
+        { _tag: "Start", venue: "Lords" },
+        { commandId: "cmd-idem-1" },
+      )
+      expect(first.version).toBe(1)
+
+      const error = yield* handle(
+        { matchId: "idem-1" },
+        { _tag: "Start", venue: "Lords" },
+        { commandId: "cmd-idem-1" },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("DuplicateCommand")
+      expect((error as DuplicateCommand).commandId).toBe("cmd-idem-1")
+
+      // The replay must not have appended a second event
+      const events = yield* EsIdemMatchEvents.read({ matchId: "idem-1" })
+      expect(events).toHaveLength(1)
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("distinct commandIds each append, and sentinels are invisible to read", () =>
+    Effect.gen(function* () {
+      const handle = EventStore.commandHandler(esIdemDecider, EsIdemMatchEvents, {
+        idempotency: { ttl: Duration.days(1) },
+      })
+
+      yield* handle(
+        { matchId: "idem-2" },
+        { _tag: "Start", venue: "Eden" },
+        { commandId: "cmd-idem-2a" },
+      )
+      yield* handle(
+        { matchId: "idem-2" },
+        { _tag: "CompleteInnings", innings: 1, runs: 300 },
+        { commandId: "cmd-idem-2b" },
+      )
+
+      const events = yield* EsIdemMatchEvents.read({ matchId: "idem-2" })
+      expect(events.map((e) => e.eventType)).toEqual([
+        "EsIdemMatchStarted",
+        "EsIdemInningsCompleted",
+      ])
+      expect(yield* EsIdemMatchEvents.currentVersion({ matchId: "idem-2" })).toBe(2)
+
+      // Sentinels live in the same partition but under a different entity type —
+      // a raw partition query sees them, the typed read does not.
+      const raw = yield* (yield* DynamoClient).query({
+        TableName: esIdemTableName,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: "$es-idem#v1#esmatch#idem-2" } },
+      })
+      const entityTypes = (raw.Items ?? []).map((i) => i.__edd_e__?.S)
+      expect(entityTypes.filter((t) => t === "esmatch.command")).toHaveLength(2)
+      expect(entityTypes.filter((t) => t === "esmatch.event")).toHaveLength(2)
+    }).pipe(provideEsIdem),
   )
 })

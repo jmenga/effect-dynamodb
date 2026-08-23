@@ -1183,7 +1183,8 @@ import {
   CompositeKeyHoleError, CompositeNullableError,
   RefNotFound, AggregateAssemblyError,
   AggregateDecompositionError, AggregateTransactionOverflow,
-  CascadePartialFailure, VersionConflict,
+  CascadePartialFailure, VersionConflict, AppendTooLarge,
+  AdditionalItemConditionFailed, DuplicateCommand,
 } from "effect-dynamodb"
 ```
 
@@ -1199,6 +1200,7 @@ import {
 | `ValidationError` | `"ValidationError"` | Schema decode/encode failed |
 | `TransactionCancelled` | `"TransactionCancelled"` | Transaction rejected (includes cancellation `reasons`) |
 | `TransactionOverflow` | `"TransactionOverflow"` | Transaction exceeds 100-item DynamoDB limit |
+| `AppendTooLarge` | `"AppendTooLarge"` | `EventStore.append` exceeds the 100-item transaction limit (`streamName`, `streamId`, `count`, `limit`) |
 | `UniqueConstraintViolation` | `"UniqueConstraintViolation"` | Unique constraint violated on put/create |
 | `OptimisticLockError` | `"OptimisticLockError"` | Version mismatch on `expectedVersion()` |
 | `ItemDeleted` | `"ItemDeleted"` | Item is soft-deleted (get returns this instead of the item) |
@@ -1211,6 +1213,8 @@ import {
 | `AggregateTransactionOverflow` | `"AggregateTransactionOverflow"` | Sub-aggregate exceeds 100-item transaction limit (`aggregate`, `subgraph`, `itemCount`, `limit`) |
 | `CascadePartialFailure` | `"CascadePartialFailure"` | Cascade update partially failed in eventual mode (`sourceEntity`, `sourceId`, `succeeded`, `failed`, `errors`) |
 | `VersionConflict` | `"VersionConflict"` | Event store version mismatch |
+| `AdditionalItemConditionFailed` | `"AdditionalItemConditionFailed"` | A caller-supplied `EventStore.append({ additionalItems })` condition failed — NOT a version conflict (`streamName`, `streamId`, `indices`, `reasons`) |
+| `DuplicateCommand` | `"DuplicateCommand"` | A `commandId` was already applied to this stream (`streamName`, `streamId`, `commandId`) |
 
 ### Usage
 

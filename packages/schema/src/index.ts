@@ -31,6 +31,7 @@ export type {
 } from "./Entity.js"
 export * as Entity from "./Entity.js"
 export {
+  AdditionalItemConditionFailed,
   AggregateAssemblyError,
   AggregateDecompositionError,
   AggregateTransactionOverflow,
@@ -39,6 +40,7 @@ export {
   CompositeKeyHoleError,
   CompositeNullableError,
   ConditionalCheckFailed,
+  DuplicateCommand,
   DynamoError,
   DynamoValidationError,
   EmbeddingError,
