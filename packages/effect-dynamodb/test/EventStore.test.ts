@@ -1,6 +1,11 @@
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { DynamoError, VersionConflict } from "@effect-dynamodb/schema/Errors.js"
+import {
+  AppendTooLarge,
+  DynamoError,
+  TRANSACT_WRITE_ITEMS_LIMIT,
+  VersionConflict,
+} from "@effect-dynamodb/schema/Errors.js"
 import { Data, DateTime, Effect, Layer, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -356,9 +361,175 @@ describe("EventStore", () => {
         )
 
         const call = mockTransactWriteItems.mock.calls[0]![0]
-        const item = fromAttributeMap(call.TransactItems[0].Put.Item)
+        // TransactItems[0] is the version-contiguity ConditionCheck (expectedVersion > 0)
+        const item = fromAttributeMap(call.TransactItems[1].Put.Item)
         // Version 100 → 10-digit padded
         expect(item.sk).toContain("0000000100")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("adds a version-contiguity ConditionCheck when expectedVersion > 0", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* MatchEvents.append(
+          { matchId: "m-1" },
+          [new InningsCompleted({ innings: 2, runs: 180, wickets: 10 })],
+          3,
+        )
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(call.TransactItems).toHaveLength(2)
+
+        const check = call.TransactItems[0].ConditionCheck
+        expect(check.TableName).toBe("events-table")
+        expect(check.ConditionExpression).toBe("attribute_exists(pk)")
+
+        const key = fromAttributeMap(check.Key)
+        expect(key.pk).toBe("$cricket#v1#match#m-1")
+        // Key targets the event at exactly expectedVersion (3)
+        expect(key.sk).toBe(DynamoSchema.composeEventVersionKey(AppSchema, "match.event", 3))
+
+        // The Put still targets expectedVersion + 1
+        const item = fromAttributeMap(call.TransactItems[1].Put.Item)
+        expect(item.version).toBe(4)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("does not add a ConditionCheck when expectedVersion is 0", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* MatchEvents.append(
+          { matchId: "m-1" },
+          [new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" })],
+          0,
+        )
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(call.TransactItems).toHaveLength(1)
+        expect(call.TransactItems[0].ConditionCheck).toBeUndefined()
+        expect(call.TransactItems[0].Put).toBeDefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("ahead expectedVersion ConditionCheck failure maps to VersionConflict", () =>
+      Effect.gen(function* () {
+        // The ConditionCheck item fails (event at expectedVersion doesn't exist);
+        // the Put items are cancelled with None.
+        const txError = {
+          name: "TransactionCanceledException",
+          CancellationReasons: [
+            { Code: "ConditionalCheckFailed", Message: "The conditional request failed" },
+            { Code: "None" },
+          ],
+        }
+        mockTransactWriteItems.mockRejectedValue(txError)
+
+        const result = yield* MatchEvents.append(
+          { matchId: "m-1" },
+          [new MatchEnded({ result: "AUS won" })],
+          10,
+        ).pipe(Effect.flip)
+
+        expect(result._tag).toBe("VersionConflict")
+        const conflict = result as VersionConflict
+        expect(conflict.streamName).toBe("Match")
+        expect(conflict.streamId).toBe("m-1")
+        expect(conflict.expectedVersion).toBe(10)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  // -------------------------------------------------------------------------
+  // append — TransactWriteItems limit guard
+  // -------------------------------------------------------------------------
+
+  describe("append limit guard", () => {
+    const manyEvents = (n: number): ReadonlyArray<MatchEvent> =>
+      Array.from(
+        { length: n },
+        (_, i) => new InningsCompleted({ innings: i + 1, runs: 100, wickets: 5 }),
+      )
+
+    it.effect("fails with AppendTooLarge before any client call at > limit", () =>
+      Effect.gen(function* () {
+        const result = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(101), 0).pipe(
+          Effect.flip,
+        )
+
+        expect(result._tag).toBe("AppendTooLarge")
+        const err = result as AppendTooLarge
+        expect(err.streamName).toBe("Match")
+        expect(err.streamId).toBe("m-1")
+        expect(err.count).toBe(101)
+        expect(err.limit).toBe(TRANSACT_WRITE_ITEMS_LIMIT)
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("exactly 100 events at expectedVersion 0 passes the guard", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        const result = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(100), 0)
+
+        expect(result.version).toBe(100)
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(call.TransactItems).toHaveLength(100)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "ConditionCheck counts toward the limit: 100 events at expectedVersion > 0 fails",
+      () =>
+        Effect.gen(function* () {
+          const result = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(100), 3).pipe(
+            Effect.flip,
+          )
+
+          expect(result._tag).toBe("AppendTooLarge")
+          const err = result as AppendTooLarge
+          expect(err.count).toBe(101)
+          expect(err.limit).toBe(TRANSACT_WRITE_ITEMS_LIMIT)
+          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("99 events at expectedVersion > 0 passes the guard (100 transact items)", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        const result = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(99), 3)
+
+        expect(result.version).toBe(102)
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(call.TransactItems).toHaveLength(100)
+        expect(call.TransactItems[0].ConditionCheck).toBeDefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("joins composite stream ids in the AppendTooLarge error", () =>
+      Effect.gen(function* () {
+        const CompoundStream = EventStore.makeStream({
+          table: EventsTable,
+          streamName: "Team",
+          events: [MatchStarted],
+          streamId: { composite: ["leagueId", "teamId"] },
+        })
+
+        const result = yield* CompoundStream.append(
+          { leagueId: "L-1", teamId: "T-5" },
+          Array.from(
+            { length: 101 },
+            () => new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" }),
+          ),
+          0,
+        ).pipe(Effect.flip)
+
+        expect(result._tag).toBe("AppendTooLarge")
+        expect((result as AppendTooLarge).streamId).toBe("L-1#T-5")
       }).pipe(Effect.provide(TestLayer)),
     )
   })
@@ -639,9 +810,10 @@ describe("EventStore", () => {
         expect(result.state.innings).toHaveLength(1)
         expect(result.version).toBe(2)
 
-        // Verify expectedVersion passed to append
+        // Verify expectedVersion passed to append.
+        // TransactItems[0] is the contiguity ConditionCheck (expectedVersion=1 > 0).
         const twCall = mockTransactWriteItems.mock.calls[0]![0]
-        const item = fromAttributeMap(twCall.TransactItems[0].Put.Item)
+        const item = fromAttributeMap(twCall.TransactItems[1].Put.Item)
         expect(item.version).toBe(2) // expectedVersion=1, so new event is v2
       }).pipe(Effect.provide(TestLayer)),
     )
@@ -1142,6 +1314,26 @@ describe("EventStore", () => {
       expect(error.streamName).toBe("Match")
       expect(error.streamId).toBe("m-1")
       expect(error.expectedVersion).toBe(3)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // AppendTooLarge error
+  // -------------------------------------------------------------------------
+
+  describe("AppendTooLarge", () => {
+    it("is a TaggedError with correct tag", () => {
+      const error = new AppendTooLarge({
+        streamName: "Match",
+        streamId: "m-1",
+        count: 101,
+        limit: TRANSACT_WRITE_ITEMS_LIMIT,
+      })
+      expect(error._tag).toBe("AppendTooLarge")
+      expect(error.streamName).toBe("Match")
+      expect(error.streamId).toBe("m-1")
+      expect(error.count).toBe(101)
+      expect(error.limit).toBe(100)
     })
   })
 })

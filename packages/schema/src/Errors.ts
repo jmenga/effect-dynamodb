@@ -275,6 +275,36 @@ export class VersionConflict extends Data.TaggedError("VersionConflict")<{
 }> {}
 
 /**
+ * DynamoDB's hard cap on the number of items in a single
+ * `TransactWriteItems` request.
+ */
+export const TRANSACT_WRITE_ITEMS_LIMIT = 100
+
+/**
+ * `EventStore.append` would exceed DynamoDB's {@link TRANSACT_WRITE_ITEMS_LIMIT}
+ * (100 items per `TransactWriteItems`). Appends are atomic by design — the
+ * batch is never chunked, because chunking would break append atomicity — so
+ * an oversized batch is rejected before any request is issued.
+ *
+ * `count` is the total number of transact items the append requires: one Put
+ * per event, plus one `ConditionCheck` (the version-contiguity guard) when
+ * `expectedVersion > 0`. In practice a single append therefore holds up to
+ * 100 events at `expectedVersion === 0` and up to 99 events otherwise.
+ *
+ * Note the 4MB aggregate payload cap on `TransactWriteItems` is NOT
+ * pre-validated (marshalled size is not practical to pre-compute) — exceeding
+ * it surfaces as a `DynamoClientError` from AWS.
+ */
+export class AppendTooLarge extends Data.TaggedError("AppendTooLarge")<{
+  readonly streamName: string
+  readonly streamId: string
+  /** Total transact items required (events + contiguity ConditionCheck). */
+  readonly count: number
+  /** The DynamoDB limit ({@link TRANSACT_WRITE_ITEMS_LIMIT}). */
+  readonly limit: number
+}> {}
+
+/**
  * EDD-9024 — DEPRECATED in v1.7.1.
  *
  * @deprecated Since v1.7.1, this error is no longer thrown at runtime. It is

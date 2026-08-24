@@ -30,6 +30,7 @@ import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
+import type { VersionConflict } from "@effect-dynamodb/schema/Errors.js"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -6213,5 +6214,179 @@ describeConnected("EventStore connected tests (closes #81)", () => {
       expect(cancelled.reasons.map((r) => r.code)).toContain("ValidationError")
       expect(cancelled.reasons.map((r) => r.code)).not.toContain("ConditionalCheckFailed")
     }).pipe(provideEsBadKey),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// EventStore append guards (closes #82)
+// ---------------------------------------------------------------------------
+
+class EsMatchStarted extends Schema.Class<EsMatchStarted>("EsMatchStarted")({
+  venue: Schema.String,
+}) {}
+
+class EsInningsCompleted extends Schema.Class<EsInningsCompleted>("EsInningsCompleted")({
+  innings: Schema.Number,
+  runs: Schema.Number,
+}) {}
+
+const esGuardSchema = DynamoSchema.make({ name: "es-test", version: 1 })
+const esGuardTableName = `es-test-${Date.now()}`
+const EsGuardTable = Table.make({ schema: esGuardSchema })
+
+const EsMatchEvents = EventStore.makeStream({
+  table: EsGuardTable,
+  streamName: "EsMatch",
+  events: [EsMatchStarted, EsInningsCompleted],
+  streamId: { composite: ["matchId"] },
+})
+
+const EsGuardTestLayer = Layer.mergeAll(ClientLayer, EsGuardTable.layer({ name: esGuardTableName }))
+const provideEsGuard = Effect.provide(EsGuardTestLayer)
+
+describeConnected("EventStore append guards (closes #82)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: esGuardTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: "sk", AttributeType: "S" },
+          ],
+        })
+      }).pipe(provideEsGuard, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: esGuardTableName })
+      }).pipe(
+        provideEsGuard,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect(
+    "sequential appends at the correct expectedVersion succeed through the contiguity check",
+    () =>
+      Effect.gen(function* () {
+        const r1 = yield* EsMatchEvents.append(
+          { matchId: "es-seq" },
+          [new EsMatchStarted({ venue: "MCG" })],
+          0,
+        )
+        expect(r1.version).toBe(1)
+
+        // expectedVersion > 0 → the ConditionCheck on event v1 must pass
+        const r2 = yield* EsMatchEvents.append(
+          { matchId: "es-seq" },
+          [
+            new EsInningsCompleted({ innings: 1, runs: 250 }),
+            new EsInningsCompleted({ innings: 2, runs: 180 }),
+          ],
+          1,
+        )
+        expect(r2.version).toBe(3)
+
+        const events = yield* EsMatchEvents.read({ matchId: "es-seq" })
+        expect(events.map((e) => e.version)).toEqual([1, 2, 3])
+      }).pipe(provideEsGuard),
+  )
+
+  it.effect("append at an AHEAD expectedVersion fails with VersionConflict and writes no gap", () =>
+    Effect.gen(function* () {
+      yield* EsMatchEvents.append(
+        { matchId: "es-ahead" },
+        [new EsMatchStarted({ venue: "SCG" })],
+        0,
+      )
+
+      // Stream head is at version 1; expectedVersion 10 would silently write
+      // version 11 without the contiguity ConditionCheck.
+      const error = yield* EsMatchEvents.append(
+        { matchId: "es-ahead" },
+        [new EsInningsCompleted({ innings: 1, runs: 300 })],
+        10,
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("VersionConflict")
+      const conflict = error as VersionConflict
+      expect(conflict.streamName).toBe("EsMatch")
+      expect(conflict.streamId).toBe("es-ahead")
+      expect(conflict.expectedVersion).toBe(10)
+
+      // Nothing was written — the stream is still contiguous at version 1.
+      const events = yield* EsMatchEvents.read({ matchId: "es-ahead" })
+      expect(events.map((e) => e.version)).toEqual([1])
+    }).pipe(provideEsGuard),
+  )
+
+  it.effect(
+    "append at a positive expectedVersion on an EMPTY stream fails with VersionConflict",
+    () =>
+      Effect.gen(function* () {
+        const error = yield* EsMatchEvents.append(
+          { matchId: "es-empty" },
+          [new EsMatchStarted({ venue: "Lord's" })],
+          5,
+        ).pipe(Effect.flip)
+
+        expect(error._tag).toBe("VersionConflict")
+        expect((error as VersionConflict).expectedVersion).toBe(5)
+
+        const events = yield* EsMatchEvents.read({ matchId: "es-empty" })
+        expect(events).toEqual([])
+      }).pipe(provideEsGuard),
+  )
+
+  it.effect(
+    "STALE expectedVersion still maps to VersionConflict with the contiguity check present",
+    () =>
+      Effect.gen(function* () {
+        yield* EsMatchEvents.append(
+          { matchId: "es-stale" },
+          [new EsMatchStarted({ venue: "Eden Gardens" })],
+          0,
+        )
+        yield* EsMatchEvents.append(
+          { matchId: "es-stale" },
+          [new EsInningsCompleted({ innings: 1, runs: 200 })],
+          1,
+        )
+
+        // Stream head is at version 2. Appending again at expectedVersion 1:
+        // the ConditionCheck (event v1 exists) passes, but the Put at v2
+        // collides — the cancellation must still surface as VersionConflict.
+        const staleAtOne = yield* EsMatchEvents.append(
+          { matchId: "es-stale" },
+          [new EsInningsCompleted({ innings: 1, runs: 999 })],
+          1,
+        ).pipe(Effect.flip)
+        expect(staleAtOne._tag).toBe("VersionConflict")
+        expect((staleAtOne as VersionConflict).expectedVersion).toBe(1)
+
+        // Stale at expectedVersion 0 (no ConditionCheck item) also conflicts.
+        const staleAtZero = yield* EsMatchEvents.append(
+          { matchId: "es-stale" },
+          [new EsMatchStarted({ venue: "Duplicate" })],
+          0,
+        ).pipe(Effect.flip)
+        expect(staleAtZero._tag).toBe("VersionConflict")
+
+        const events = yield* EsMatchEvents.read({ matchId: "es-stale" })
+        expect(events.map((e) => e.version)).toEqual([1, 2])
+      }).pipe(provideEsGuard),
   )
 })
