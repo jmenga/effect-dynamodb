@@ -415,7 +415,9 @@ Chore: <one-line summary>. No version change.
 
 ### CI enforcement
 
-`ci.yml` runs `pnpm changeset status` on every PR. If it reports any **unconsumed release-declaring changeset** (a file with packages listed in its frontmatter), CI fails with a message telling the author to run `pnpm changeset version` and commit the result. Empty chore changesets pass through.
+`ci.yml` scans `.changeset/` on every PR **targeting `main`**. If any **unconsumed release-declaring changeset** remains (a file with packages listed in its frontmatter), CI fails with a message telling the author to run `pnpm changeset version` and commit the result. Empty chore changesets pass through.
+
+The gate is scoped to `main` so a **stacked release train** can work: several PRs chained onto a `release/**` integration branch, each carrying its own unconsumed changeset, with a single `pnpm changeset version` at the tip producing one version and one CHANGELOG entry for the whole batch. The guarantee is unchanged — nothing reaches `main` with a changeset left unconsumed. CI itself has no `branches` filter and runs on every PR whatever its base, because a stack chains onto `docs/**` / `fix/**` / `feat/**` branches rather than onto `release/**` directly, and a base-branch allowlist would silently leave the intermediate PRs with no CI at all.
 
 ### Trusted Publishing setup
 
