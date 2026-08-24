@@ -17,29 +17,33 @@ An event-sourced cricket match tracker using effect-dynamodb's `EventStore` modu
 
 ## Step 1: Events
 
-Events are pure domain `Schema.Class` definitions. Each event captures something that happened in the domain — no DynamoDB concepts:
+Events are pure domain `Schema.TaggedClass` definitions. Each event captures something that happened in the domain — no DynamoDB concepts:
 
 ```typescript title="events.ts" region="events" example="event-sourcing.ts"
-class MatchStarted extends Schema.Class<MatchStarted>("MatchStarted")({
+class MatchStarted extends Schema.TaggedClass<MatchStarted>()("MatchStarted", {
   venue: Schema.String,
   homeTeam: Schema.String,
   awayTeam: Schema.String,
 }) {}
 
-class InningsCompleted extends Schema.Class<InningsCompleted>("InningsCompleted")({
+class InningsCompleted extends Schema.TaggedClass<InningsCompleted>()("InningsCompleted", {
   innings: Schema.Number,
   runs: Schema.Number,
   wickets: Schema.Number,
 }) {}
 
-class MatchEnded extends Schema.Class<MatchEnded>("MatchEnded")({
+class MatchEnded extends Schema.TaggedClass<MatchEnded>()("MatchEnded", {
   result: Schema.String,
 }) {}
 
 type MatchEvent = MatchStarted | InningsCompleted | MatchEnded
 ```
 
-Each class name doubles as the event type discriminator stored in DynamoDB.
+Each tag doubles as the event type discriminator stored in DynamoDB.
+
+:::caution[Use `Schema.TaggedClass` for event schemas]
+Define events with `Schema.TaggedClass`, not plain `Schema.Class`. The event store decodes stored events through a `Schema.Union` of your event schemas, and a plain `Schema.Class` declares no `_tag` field — the stored `_tag` is treated as an ignored excess property, so the union discriminates **structurally** by field shape. Two event types with identical fields (say, `PaymentAuthorized` and `PaymentCaptured`, both `{ amount: Schema.Number }`) would then mis-decode as each other: the envelope's `eventType` attribute stays correct, but `data` decodes to whichever class matches first. `Schema.TaggedClass` adds the `_tag` literal to the schema itself, so the union discriminates on the tag and every event round-trips to the correct class.
+:::
 
 ---
 
@@ -273,6 +277,10 @@ const state = EventStore.fold(matchDecider, allEvents)
 ```
 
 This is a pure function — no DynamoDB calls. It takes the events you already have and replays them through `evolve`.
+
+:::note[A note on "projections"]
+In event-sourcing jargon, a *projection* is a read model built by consuming events. This library's [`Projection` module](/effect-dynamodb/tutorials/projections/) is something else entirely: it builds DynamoDB `ProjectionExpression`s for selecting specific item attributes on reads. Event-sourcing read models are outside this library's scope — build them in a [DynamoDB Streams](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html) consumer that reacts to appended events.
+:::
 
 ### Query Combinators
 

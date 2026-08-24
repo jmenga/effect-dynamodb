@@ -29,23 +29,23 @@ const EventsTable = Table.make({ schema: AppSchema })
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 2. Events — pure domain Schema.Class definitions
+// 2. Events — pure domain Schema.TaggedClass definitions
 // ---------------------------------------------------------------------------
 
 // #region events
-class MatchStarted extends Schema.Class<MatchStarted>("MatchStarted")({
+class MatchStarted extends Schema.TaggedClass<MatchStarted>()("MatchStarted", {
   venue: Schema.String,
   homeTeam: Schema.String,
   awayTeam: Schema.String,
 }) {}
 
-class InningsCompleted extends Schema.Class<InningsCompleted>("InningsCompleted")({
+class InningsCompleted extends Schema.TaggedClass<InningsCompleted>()("InningsCompleted", {
   innings: Schema.Number,
   runs: Schema.Number,
   wickets: Schema.Number,
 }) {}
 
-class MatchEnded extends Schema.Class<MatchEnded>("MatchEnded")({
+class MatchEnded extends Schema.TaggedClass<MatchEnded>()("MatchEnded", {
   result: Schema.String,
 }) {}
 
