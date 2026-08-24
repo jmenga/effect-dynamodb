@@ -15,8 +15,11 @@
  */
 
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { normalizeTtlSeconds } from "@effect-dynamodb/schema/Entity.js"
 import {
+  AdditionalItemConditionFailed,
   AppendTooLarge,
+  DuplicateCommand,
   isAwsConditionalCheckFailed,
   isAwsTransactionCancelled,
   TRANSACT_WRITE_ITEMS_LIMIT,
@@ -25,11 +28,25 @@ import {
   VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { DateTime, Effect, Function, Option, Pipeable, Schedule, Schema } from "effect"
+import {
+  DateTime,
+  type Duration,
+  Effect,
+  Function,
+  Option,
+  Pipeable,
+  Schedule,
+  Schema,
+} from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
+import {
+  buildTransactWriteItems,
+  type TransactWriteItem,
+  type TransactWriteOp,
+} from "./internal/TransactWriteOps.js"
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
 import * as Query from "./Query.js"
-import type { Table, TableConfig } from "./Table.js"
+import { resolveTtlAttributeName, type Table, type TableConfig } from "./Table.js"
 
 // ---------------------------------------------------------------------------
 // Decider
@@ -147,6 +164,68 @@ export interface SnapshotSettings {
 }
 
 // ---------------------------------------------------------------------------
+// Append options — additional transaction items + command idempotency
+// ---------------------------------------------------------------------------
+
+/**
+ * Command-dedup configuration for a single {@link EventStream.append} call.
+ *
+ * When present, `append` writes a sentinel item guarded by
+ * `attribute_not_exists(pk)` into the same transaction as the events. A replayed
+ * `commandId` therefore cancels the whole transaction and surfaces as
+ * `DuplicateCommand` — the events are never written twice.
+ *
+ * The sentinel is co-located in the stream's own partition, so `commandId`
+ * uniqueness is scoped to the stream (which is what "have I already applied this
+ * command to this aggregate?" asks). It is invisible to `read` / `readFrom` /
+ * `currentVersion`, which filter on the event entity type.
+ *
+ * **Casing:** the sentinel sort key is composed with the schema's casing (default
+ * `"lowercase"`), so command ids that differ only in case collide. Use
+ * case-insensitively-unique ids (UUID / ULID). The raw id is stored as the
+ * `commandId` attribute regardless.
+ */
+export interface AppendIdempotency {
+  /** Caller-supplied identifier for this command delivery. */
+  readonly commandId: string
+  /**
+   * Optional expiry for the sentinel, written to the table's TTL attribute
+   * (honours `TableConfig.ttlAttributeName`). Set it to the longest window over
+   * which your infrastructure can replay a command. Omitted → sentinels are
+   * permanent, which is the safe direction.
+   */
+  readonly ttl?: Duration.Duration | string
+}
+
+/** Options accepted by {@link EventStream.append}. */
+export interface AppendOptions<TMetadata> {
+  /** Per-append metadata, validated against the stream's metadata schema when configured. */
+  readonly metadata?: TMetadata
+  /**
+   * Caller-owned transact items committed atomically with the events — the same
+   * op union `Transaction.transactWrite` accepts (`EntityPut`, `EntityDelete`,
+   * `Transaction.check(...)`).
+   *
+   * Conditional failures on these items are reported as
+   * `AdditionalItemConditionFailed` (carrying the 0-based indices into this
+   * array), never as `VersionConflict`.
+   */
+  readonly additionalItems?: ReadonlyArray<TransactWriteOp>
+  /** Opt in to exactly-once command processing — see {@link AppendIdempotency}. */
+  readonly idempotency?: AppendIdempotency
+}
+
+/** Error channel of {@link EventStream.append}. */
+export type AppendError =
+  | VersionConflict
+  | DuplicateCommand
+  | AdditionalItemConditionFailed
+  | AppendTooLarge
+  | DynamoClientError
+  | ValidationError
+  | TransactionCancelled
+
+// ---------------------------------------------------------------------------
 // StreamIdInput — maps composite field names to a required record
 // ---------------------------------------------------------------------------
 
@@ -220,12 +299,8 @@ export interface EventStream<
     streamId: StreamIdInput<TStreamIdFields>,
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
-    options?: { readonly metadata?: TMetadata } | undefined,
-  ) => Effect.Effect<
-    AppendResult<TEvent>,
-    VersionConflict | AppendTooLarge | DynamoClientError | ValidationError | TransactionCancelled,
-    DynamoClient | TableConfig
-  >
+    options?: AppendOptions<TMetadata> | undefined,
+  ) => Effect.Effect<AppendResult<TEvent>, AppendError, DynamoClient | TableConfig>
 
   readonly read: (
     streamId: StreamIdInput<TStreamIdFields>,
@@ -327,6 +402,13 @@ export const makeStream = <
   const schema = config.table.schema
   const entityType = `${config.streamName.toLowerCase()}.event`
   const snapshotEntityType = `${config.streamName.toLowerCase()}.snapshot`
+  /**
+   * Entity type of the command-dedup sentinel. Distinct from `entityType` so the
+   * sentinel is filtered out of every event query (`read`, `readFrom`,
+   * `currentVersion` all constrain `__edd_e__`), and it sorts before the event
+   * keys (`.command` < `.event`) so it also falls outside `readFrom` ranges.
+   */
+  const commandEntityType = `${config.streamName.toLowerCase()}.command`
   const compositeFields = config.streamId.composite
 
   // -------------------------------------------------------------------------
@@ -481,20 +563,35 @@ export const makeStream = <
     streamId: StreamIdInput<TStreamIdFields>,
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
-    options?: { readonly metadata?: unknown } | undefined,
+    options?: AppendOptions<unknown> | undefined,
   ) =>
     Effect.gen(function* () {
-      if (events.length === 0) {
+      const additionalOps = options?.additionalItems ?? []
+      const idempotency = options?.idempotency
+
+      // Nothing at all to write — preserve the historical no-op fast path.
+      // With additional items or a dedup sentinel the transaction still runs:
+      // a caller who asked for a side write means it, and silently dropping it
+      // would lose data.
+      if (events.length === 0 && additionalOps.length === 0 && idempotency === undefined) {
         return { version: expectedVersion, events: [] }
       }
 
       // Resolve stream ID string for storage (join composites)
       const streamIdStr = composeStreamIdString(streamId as Record<string, unknown>)
 
-      // Guard: one Put per event, plus one ConditionCheck (version-contiguity
-      // guard) when expectedVersion > 0, must fit DynamoDB's TransactWriteItems
-      // limit. Never chunk — chunking would break append atomicity.
-      const requiredItems = events.length + (expectedVersion > 0 ? 1 : 0)
+      // Guard: every item the transaction will carry — one Put per event, one
+      // per caller-supplied additional item, the idempotency sentinel, and the
+      // version-contiguity ConditionCheck when expectedVersion > 0 — must fit
+      // DynamoDB's TransactWriteItems limit. Counted before any work is done so
+      // an oversized append costs nothing. Never chunk: chunking would break
+      // append atomicity.
+      const needsContiguityCheck = expectedVersion > 0 && events.length > 0
+      const requiredItems =
+        events.length +
+        additionalOps.length +
+        (idempotency !== undefined ? 1 : 0) +
+        (needsContiguityCheck ? 1 : 0)
       if (requiredItems > TRANSACT_WRITE_ITEMS_LIMIT) {
         return yield* new AppendTooLarge({
           streamName: config.streamName,
@@ -505,11 +602,13 @@ export const makeStream = <
       }
 
       const client = yield* DynamoClient
-      const { name: tableName } = yield* config.table.Tag
+      const tableConfig = yield* config.table.Tag
+      const tableName = tableConfig.name
 
       const pk = composeStreamPk(streamId as Record<string, unknown>)
       // Clock-backed timestamp (deterministic under TestClock; wall-clock in prod).
-      const now = DateTime.formatIso(yield* DateTime.now)
+      const nowDateTime = yield* DateTime.now
+      const now = DateTime.formatIso(nowDateTime)
 
       // Validate and encode metadata to wire form if schema provided
       let encodedMetadata: Record<string, unknown> | undefined
@@ -524,10 +623,11 @@ export const makeStream = <
         encodedMetadata = options.metadata as Record<string, unknown>
       }
 
-      // Build transact items — one Put per event, each with attribute_not_exists(pk).
+      // Build the event puts — one Put per event, each with attribute_not_exists(pk).
       // Events are encoded to wire form through their schema (codec symmetry
-      // with the read path, which decodes through the same schema).
-      const transactItems = yield* Effect.forEach(events, (event, i) =>
+      // with the read path, which decodes through the same schema), so this is
+      // an effectful build rather than a plain `map`.
+      const eventItems = yield* Effect.forEach(events, (event, i) =>
         Effect.gen(function* () {
           const version = expectedVersion + i + 1
           // In Effect v4, Schema.Class instances don't have _tag as an own property.
@@ -570,54 +670,145 @@ export const makeStream = <
           }
         }),
       )
+      // Caller-owned items, compiled through the same builder
+      // `Transaction.transactWrite` uses, so the two APIs cannot drift.
+      const additionalItems = yield* buildTransactWriteItems(
+        additionalOps,
+        "EventStore.append.additionalItems",
+      )
 
-      // Version-contiguity guard: `attribute_not_exists(pk)` on the Puts only
-      // rejects STALE expected versions (the target slot already exists). An
-      // AHEAD expectedVersion (e.g. 10 when the stream is at 3) would silently
-      // write from version 11, leaving a permanent gap. When expectedVersion > 0,
-      // require the event at exactly `expectedVersion` to exist so the appended
-      // range is contiguous with the stream head. Its failure surfaces as a
-      // ConditionalCheckFailed cancellation reason, mapping to VersionConflict
-      // below just like a stale-version Put failure.
-      const contiguityCheck =
-        expectedVersion > 0
-          ? [
-              {
-                ConditionCheck: {
-                  TableName: tableName,
-                  Key: toAttributeMap({ pk, sk: composeEventSk(expectedVersion) }),
-                  ConditionExpression: "attribute_exists(pk)",
-                },
+      // Version-contiguity guard: `attribute_not_exists(pk)` on the event puts
+      // only rejects STALE expected versions (the target slot already exists).
+      // An AHEAD expectedVersion (e.g. 10 when the stream is at 3) would
+      // silently write from version 11, leaving a permanent gap. When
+      // expectedVersion > 0, require the event at exactly `expectedVersion` to
+      // exist so the appended range is contiguous with the stream head. Its
+      // failure surfaces as a ConditionalCheckFailed cancellation reason,
+      // mapping to VersionConflict below just like a stale-version Put failure.
+      //
+      // Only when events are actually being written: the guard exists to stop an
+      // AHEAD expectedVersion opening a permanent gap, and a zero-event append
+      // (pure `additionalItems` / sentinel side-write) writes no version and so
+      // can open no gap.
+      const contiguityCheck: Array<TransactWriteItem> = needsContiguityCheck
+        ? [
+            {
+              ConditionCheck: {
+                TableName: tableName,
+                Key: toAttributeMap({ pk, sk: composeEventSk(expectedVersion) }),
+                ConditionExpression: "attribute_exists(pk)",
               },
-            ]
-          : []
+            },
+          ]
+        : []
 
-      yield* client
-        .transactWriteItems({ TransactItems: [...contiguityCheck, ...transactItems] })
-        .pipe(
-          Effect.mapError((error) => {
-            if (isAwsTransactionCancelled(error.cause)) {
-              const reasons = (error.cause.CancellationReasons ?? []).map((r) => ({
-                code: r?.Code,
-                message: r?.Message,
-              }))
-              const hasConflict = reasons.some((r) => r.code === "ConditionalCheckFailed")
-              if (hasConflict) {
-                return new VersionConflict({
-                  streamName: config.streamName,
-                  streamId: streamIdStr,
-                  expectedVersion,
-                }) as VersionConflict | DynamoClientError | TransactionCancelled
-              }
-              return new TransactionCancelled({
-                operation: "TransactWriteItems",
-                reasons,
-                cause: error.cause,
-              }) as VersionConflict | DynamoClientError | TransactionCancelled
+      // Item layout is load-bearing — cancellation reasons are positional:
+      //   [0, C)                version-contiguity ConditionCheck (C is 0 or 1)
+      //   [C, C + E)            event puts
+      //   [C + E, C + E + A)    additional items (caller order preserved)
+      //   C + E + A             idempotency sentinel (last, so adding it never
+      //                         shifts the additional-item indices the caller sees)
+      const transactItems: Array<TransactWriteItem> = [
+        ...contiguityCheck,
+        ...eventItems,
+        ...additionalItems,
+      ]
+      const checkCount = contiguityCheck.length
+      const eventCount = eventItems.length
+      const additionalCount = additionalItems.length
+      const sentinelIndex = idempotency !== undefined ? transactItems.length : -1
+
+      if (idempotency !== undefined) {
+        const sentinel: Record<string, unknown> = {
+          pk,
+          sk: DynamoSchema.composeKey(schema, commandEntityType, [idempotency.commandId]),
+          __edd_e__: commandEntityType,
+          streamId: streamIdStr,
+          commandId: idempotency.commandId,
+          version: expectedVersion + events.length,
+          timestamp: now,
+        }
+        if (idempotency.ttl !== undefined) {
+          const ttlSeconds = yield* Effect.try({
+            try: () => normalizeTtlSeconds(idempotency.ttl as Duration.Duration | string),
+            catch: (cause) =>
+              new ValidationError({
+                entityType: commandEntityType,
+                operation: "EventStore.append.idempotency.ttl",
+                cause,
+              }),
+          })
+          sentinel[resolveTtlAttributeName(tableConfig)] =
+            DateTime.toEpochSeconds(nowDateTime) + ttlSeconds
+        }
+        transactItems.push({
+          Put: {
+            TableName: tableName,
+            Item: toAttributeMap(sentinel),
+            ConditionExpression: "attribute_not_exists(pk)",
+          },
+        })
+      }
+
+      yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
+        Effect.mapError((error) => {
+          if (!isAwsTransactionCancelled(error.cause)) {
+            return error as AppendError
+          }
+          const reasons = (error.cause.CancellationReasons ?? []).map((r) => ({
+            code: r?.Code,
+            message: r?.Message,
+          }))
+          const failedAt = (index: number): boolean =>
+            index >= 0 && reasons[index]?.code === "ConditionalCheckFailed"
+
+          // Precedence is ordered by how terminal the caller's response should
+          // be: a duplicate can never succeed on retry, a version conflict
+          // invites a re-read, and only then is the caller's own condition the
+          // most specific explanation left.
+          if (idempotency !== undefined && failedAt(sentinelIndex)) {
+            return new DuplicateCommand({
+              streamName: config.streamName,
+              streamId: streamIdStr,
+              commandId: idempotency.commandId,
+            }) as AppendError
+          }
+
+          // The contiguity ConditionCheck and the event puts both mean "the
+          // stream is not where you said it was", so they share one verdict.
+          for (let i = 0; i < checkCount + eventCount; i++) {
+            if (failedAt(i)) {
+              return new VersionConflict({
+                streamName: config.streamName,
+                streamId: streamIdStr,
+                expectedVersion,
+              }) as AppendError
             }
-            return error as VersionConflict | DynamoClientError | TransactionCancelled
-          }),
-        )
+          }
+
+          const failedAdditional: Array<number> = []
+          for (let i = 0; i < additionalCount; i++) {
+            if (failedAt(checkCount + eventCount + i)) failedAdditional.push(i)
+          }
+          if (failedAdditional.length > 0) {
+            return new AdditionalItemConditionFailed({
+              streamName: config.streamName,
+              streamId: streamIdStr,
+              indices: failedAdditional,
+              reasons,
+            }) as AppendError
+          }
+
+          // No conditional failure we can positionally justify (throttling,
+          // TransactionConflict, or a truncated/absent reason list) — never
+          // guess a VersionConflict.
+          return new TransactionCancelled({
+            operation: "TransactWriteItems",
+            reasons,
+            cause: error.cause,
+          }) as AppendError
+        }),
+      )
 
       return {
         version: expectedVersion + events.length,
@@ -911,12 +1102,8 @@ export interface BoundEventStream<
     streamId: StreamIdInput<TStreamIdFields>,
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
-    options?: { readonly metadata?: TMetadata } | undefined,
-  ) => Effect.Effect<
-    AppendResult<TEvent>,
-    VersionConflict | AppendTooLarge | DynamoClientError | ValidationError | TransactionCancelled,
-    never
-  >
+    options?: AppendOptions<TMetadata> | undefined,
+  ) => Effect.Effect<AppendResult<TEvent>, AppendError, never>
 
   readonly read: (
     streamId: StreamIdInput<TStreamIdFields>,
@@ -1009,7 +1196,11 @@ export const bind = <TEvent, TStreamIdFields extends ReadonlyArray<string>, TMet
 // ---------------------------------------------------------------------------
 
 /**
- * Options accepted by {@link commandHandler}.
+ * Handler-level configuration for {@link commandHandler}.
+ *
+ * `idempotency` carries the policy that is fixed for the handler; the
+ * `commandId` that identifies one delivery can only be per-call and lives in the
+ * handler's own options.
  */
 export interface CommandHandlerOptions {
   /**
@@ -1017,13 +1208,58 @@ export interface CommandHandlerOptions {
    *
    * The retried unit is the entire read–decide–append cycle, so every attempt
    * decides against freshly read state — a blind re-append of stale events is
-   * impossible by construction.
+   * impossible by construction. Snapshot reads participate: a retried attempt
+   * re-reads the snapshot and its delta.
    *
    * A number `n` is shorthand for `Schedule.recurs(n)` (n retries *after* the
    * initial attempt). Omit for the default: no retry.
+   *
+   * `DuplicateCommand` is deliberately NOT retried — it is terminal.
    */
   readonly retry?: number | Schedule.Schedule<unknown, VersionConflict> | undefined
+
+  /** Opt in to exactly-once command processing — see {@link AppendIdempotency}. */
+  readonly idempotency?: { readonly ttl?: Duration.Duration | string }
 }
+
+/** Per-call options accepted by a handler produced by {@link commandHandler}. */
+export interface CommandOptions<TMetadata> {
+  readonly metadata?: TMetadata
+  /**
+   * Identifier for this command delivery. Required when the handler was created
+   * with `idempotency`; a replayed id fails with `DuplicateCommand`.
+   */
+  readonly commandId?: string
+  /** Caller-owned transact items committed atomically with the produced events. */
+  readonly additionalItems?: ReadonlyArray<TransactWriteOp>
+}
+
+/** Per-call options when the handler was created with `idempotency` — `commandId` is required. */
+export interface IdempotentCommandOptions<TMetadata> extends CommandOptions<TMetadata> {
+  readonly commandId: string
+}
+
+/**
+ * Options arity: configuring `idempotency` makes the handler's options parameter
+ * required (and `commandId` within it non-optional), so a missing `commandId`
+ * is a compile error rather than a silent downgrade to at-least-once.
+ */
+type CommandOptionsArgs<
+  TMetadata,
+  TConfig extends CommandHandlerOptions | undefined,
+> = TConfig extends { readonly idempotency: object }
+  ? [options: IdempotentCommandOptions<TMetadata>]
+  : [options?: CommandOptions<TMetadata> | undefined]
+
+type CommandHandlerErrors<E> =
+  | E
+  | VersionConflict
+  | DuplicateCommand
+  | AdditionalItemConditionFailed
+  | AppendTooLarge
+  | DynamoClientError
+  | ValidationError
+  | TransactionCancelled
 
 type CommandHandler<
   State,
@@ -1032,13 +1268,14 @@ type CommandHandler<
   E,
   TStreamIdFields extends ReadonlyArray<string>,
   TMetadata,
+  TConfig extends CommandHandlerOptions | undefined = undefined,
 > = (
   streamId: StreamIdInput<TStreamIdFields>,
   command: Command,
-  options?: { readonly metadata?: TMetadata } | undefined,
+  ...options: CommandOptionsArgs<TMetadata, TConfig>
 ) => Effect.Effect<
   CommandHandlerResult<State, TEvent>,
-  E | VersionConflict | AppendTooLarge | DynamoClientError | ValidationError | TransactionCancelled,
+  CommandHandlerErrors<E>,
   DynamoClient | TableConfig
 >
 
@@ -1049,15 +1286,12 @@ type BoundCommandHandler<
   E,
   TStreamIdFields extends ReadonlyArray<string>,
   TMetadata,
+  TConfig extends CommandHandlerOptions | undefined = undefined,
 > = (
   streamId: StreamIdInput<TStreamIdFields>,
   command: Command,
-  options?: { readonly metadata?: TMetadata } | undefined,
-) => Effect.Effect<
-  CommandHandlerResult<State, TEvent>,
-  E | VersionConflict | AppendTooLarge | DynamoClientError | ValidationError | TransactionCancelled,
-  never
->
+  ...options: CommandOptionsArgs<TMetadata, TConfig>
+) => Effect.Effect<CommandHandlerResult<State, TEvent>, CommandHandlerErrors<E>, never>
 
 /** @internal Both `EventStream` and `BoundEventStream` carry this brand. */
 const hasEventStreamBrand = (u: unknown): boolean =>
@@ -1089,9 +1323,21 @@ const makeCommandHandlerImpl = <
   return (
     streamId: StreamIdInput<TStreamIdFields>,
     command: Command,
-    callOptions?: { readonly metadata?: TMetadata } | undefined,
+    callOptions?: CommandOptions<TMetadata> | undefined,
   ) => {
     const attempt = Effect.gen(function* () {
+      // Backstop for JS callers and `any`-shaped call sites: silently degrading
+      // to at-least-once would look like success right up until the day a
+      // duplicate mattered. Not retryable — `while` below only retries
+      // `VersionConflict`, so this surfaces on the first attempt.
+      if (options?.idempotency !== undefined && callOptions?.commandId === undefined) {
+        return yield* new ValidationError({
+          entityType: stream.streamName,
+          operation: "EventStore.commandHandler",
+          cause: "commandId is required when commandHandler is configured with `idempotency`.",
+        })
+      }
+
       const snapshotSettings = stream.snapshotConfig
 
       // 1. Establish the base state + version — from a snapshot plus its delta
@@ -1133,8 +1379,30 @@ const makeCommandHandlerImpl = <
         return { state, version: baseVersion, events: [] }
       }
 
-      // 4. Append with optimistic concurrency
-      const result = yield* stream.append(streamId, newEvents, baseVersion, callOptions)
+      // 4. Append with optimistic concurrency, plus any caller-owned items and
+      //    the dedup sentinel, all in one transaction.
+      const appendOptions: {
+        metadata?: TMetadata
+        additionalItems?: ReadonlyArray<TransactWriteOp>
+        idempotency?: AppendIdempotency
+      } = {}
+      if (callOptions?.metadata !== undefined) appendOptions.metadata = callOptions.metadata
+      if (callOptions?.additionalItems !== undefined) {
+        appendOptions.additionalItems = callOptions.additionalItems
+      }
+      if (options?.idempotency !== undefined && callOptions?.commandId !== undefined) {
+        appendOptions.idempotency =
+          options.idempotency.ttl !== undefined
+            ? { commandId: callOptions.commandId, ttl: options.idempotency.ttl }
+            : { commandId: callOptions.commandId }
+      }
+
+      const result = yield* stream.append(
+        streamId,
+        newEvents,
+        baseVersion,
+        appendOptions as AppendOptions<TMetadata>,
+      )
 
       // 5. Evolve state through the new events
       for (const event of newEvents) {
@@ -1169,6 +1437,9 @@ const makeCommandHandlerImpl = <
           // because `Retry.Options` demands a schedule whose input accepts the
           // effect's *full* error union, and `Schedule` is contravariant on input.
           schedule: schedule as Schedule.Schedule<unknown, unknown>,
+          // `VersionConflict` only. `DuplicateCommand` is terminal — the same
+          // commandId can never succeed — and `AdditionalItemConditionFailed`
+          // will not resolve itself by re-deciding either.
           while: (error: unknown) => error instanceof VersionConflict,
         })
   }
@@ -1193,6 +1464,12 @@ const makeCommandHandlerImpl = <
  * // Retry the full read-decide-append cycle on VersionConflict
  * const handle = EventStore.commandHandler(decider, stream, { retry: 3 })
  * const handle2 = stream.pipe(EventStore.commandHandler(decider, { retry: 3 }))
+ *
+ * // Exactly-once command processing — `commandId` becomes required per call
+ * const handle = EventStore.commandHandler(decider, stream, {
+ *   idempotency: { ttl: Duration.days(1) },
+ * })
+ * yield* handle({ matchId: "m-1" }, command, { commandId: "cmd-7f3a" })
  * ```
  *
  * When the stream declares a `snapshot` config, each invocation reads the
@@ -1200,23 +1477,27 @@ const makeCommandHandlerImpl = <
  * from the beginning. With `snapshot.every` set, a fresh snapshot is written
  * (best-effort) after a successful append once the cadence threshold is crossed.
  *
+ * Without `idempotency`, command processing is **at-least-once**: a retry after
+ * an acked-but-lost response re-runs `decide` and appends again.
+ *
  * Note: this is a hand-rolled dual rather than `Function.dual` — the data
  * argument (`stream`) is the *second* parameter, which `Function.dual` cannot
- * express, and its numeric-arity form would silently drop `options`. Dispatch
- * is on the `EventStreamTypeId` brand of the second argument.
+ * express, and its numeric-arity form would silently drop the trailing options
+ * (`retry`, `idempotency`) that both forms depend on. Dispatch is on the
+ * `EventStreamTypeId` brand of the second argument.
  */
 export const commandHandler: {
   // Data-last overloads
-  <State, Command, TEvent, E>(
+  <State, Command, TEvent, E, const TConfig extends CommandHandlerOptions | undefined = undefined>(
     decider: Decider<State, Command, TEvent, E>,
-    options?: CommandHandlerOptions,
+    options?: TConfig,
   ): {
     <TStreamIdFields extends ReadonlyArray<string>, TMetadata, TState extends State>(
       stream: BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState>,
-    ): BoundCommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata>
+    ): BoundCommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
     <TStreamIdFields extends ReadonlyArray<string>, TMetadata, TState extends State>(
       stream: EventStream<TEvent, TStreamIdFields, TMetadata, TState>,
-    ): CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata>
+    ): CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
   }
 
   // Data-first: BoundEventStream → BoundCommandHandler
@@ -1228,11 +1509,12 @@ export const commandHandler: {
     TStreamIdFields extends ReadonlyArray<string>,
     TMetadata,
     TState extends State,
+    const TConfig extends CommandHandlerOptions | undefined = undefined,
   >(
     decider: Decider<State, Command, TEvent, E>,
     stream: BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState>,
-    options?: CommandHandlerOptions,
-  ): BoundCommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata>
+    options?: TConfig,
+  ): BoundCommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
 
   // Data-first: EventStream → CommandHandler
   <
@@ -1243,11 +1525,12 @@ export const commandHandler: {
     TStreamIdFields extends ReadonlyArray<string>,
     TMetadata,
     TState extends State,
+    const TConfig extends CommandHandlerOptions | undefined = undefined,
   >(
     decider: Decider<State, Command, TEvent, E>,
     stream: EventStream<TEvent, TStreamIdFields, TMetadata, TState>,
-    options?: CommandHandlerOptions,
-  ): CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata>
+    options?: TConfig,
+  ): CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
 } = ((decider: any, streamOrOptions?: any, maybeOptions?: any) => {
   if (hasEventStreamBrand(streamOrOptions)) {
     return makeCommandHandlerImpl(decider, streamOrOptions, maybeOptions)

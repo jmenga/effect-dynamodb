@@ -11,13 +11,16 @@
  *   npx tsx examples/event-sourcing.ts
  */
 
-import { Console, Data, Effect, Layer, Option, Schema } from "effect"
+import { Console, Data, Duration, Effect, Layer, Option, Schema } from "effect"
 
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
+import * as Expression from "../src/Expression.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
+import * as Transaction from "../src/Transaction.js"
 
 // ---------------------------------------------------------------------------
 // 1. Infrastructure — Schema + Table
@@ -25,7 +28,24 @@ import * as Table from "../src/Table.js"
 
 // #region infrastructure
 const AppSchema = DynamoSchema.make({ name: "cricket", version: 1 })
-const EventsTable = Table.make({ schema: AppSchema })
+
+// A per-writer ingestion watermark — a side record updated atomically with
+// events via `append({ additionalItems })`.
+class Watermark extends Schema.Class<Watermark>("Watermark")({
+  writerId: Schema.String,
+  lastSeq: Schema.Number,
+}) {}
+
+const Watermarks = Entity.make({
+  model: Watermark,
+  entityType: "Watermark",
+  primaryKey: {
+    pk: { field: "pk", composite: ["writerId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const EventsTable = Table.make({ schema: AppSchema, entities: { Watermarks } })
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -354,6 +374,70 @@ const program = Effect.gen(function* () {
   yield* snapshotMatchEvents.writeSnapshot({ matchId: "m-2" }, folded, s4.version)
   // #endregion
   yield* Console.log(`Rewrote snapshot at version ${s4.version}`)
+
+  // --- Atomic side writes: additionalItems ---
+  yield* Console.log("\n=== Atomic side write: append + watermark ===")
+  // #region additional-items
+  yield* matchEvents.append(
+    { matchId: "m-2" },
+    [new MatchStarted({ venue: "SCG", homeTeam: "AUS", awayTeam: "IND" })],
+    0,
+    {
+      additionalItems: [Watermarks.put({ writerId: "ingest-1", lastSeq: 4021 })],
+    },
+  )
+  // #endregion
+  const watermark = yield* Watermarks.get({ writerId: "ingest-1" })
+  yield* Console.log(`Watermark committed with the event: lastSeq=${watermark.lastSeq}`)
+
+  // --- A failing user condition is NOT a version conflict ---
+  yield* Console.log("\n=== Additional-item condition failure ===")
+  // #region additional-item-condition
+  const condError = yield* matchEvents
+    .append({ matchId: "m-2" }, [new InningsCompleted({ innings: 1, runs: 300, wickets: 8 })], 1, {
+      additionalItems: [
+        Transaction.check(
+          Watermarks.get({ writerId: "ingest-1" }),
+          Expression.condition({ lt: { lastSeq: 100 } }),
+        ),
+      ],
+    })
+    .pipe(Effect.flip)
+  // #endregion
+  yield* Console.log(
+    `Error: ${condError._tag} (not VersionConflict — the caller's condition failed)`,
+  )
+
+  // --- Command idempotency ---
+  yield* Console.log("\n=== Command idempotency ===")
+  // #region idempotency
+  const handleIdempotent = EventStore.commandHandler(matchDecider, matchEvents, {
+    idempotency: { ttl: Duration.days(1) },
+  })
+
+  yield* handleIdempotent(
+    { matchId: "m-3" },
+    { _tag: "StartMatch", venue: "Lords", homeTeam: "ENG", awayTeam: "NZ" },
+    { commandId: "cmd-7f3a" },
+  )
+
+  // CompleteInnings is not self-guarding — the decider happily produces a second
+  // event, so only the dedup sentinel can catch the replay.
+  yield* handleIdempotent(
+    { matchId: "m-3" },
+    { _tag: "CompleteInnings", innings: 1, runs: 210, wickets: 6 },
+    { commandId: "cmd-9b12" },
+  )
+
+  const dupError = yield* handleIdempotent(
+    { matchId: "m-3" },
+    { _tag: "CompleteInnings", innings: 1, runs: 210, wickets: 6 },
+    { commandId: "cmd-9b12" },
+  ).pipe(Effect.flip)
+  // #endregion
+  yield* Console.log(`Replay: ${dupError._tag}`)
+  const m3 = yield* matchEvents.read({ matchId: "m-3" })
+  yield* Console.log(`Events on m-3 after the replay: ${m3.length}`)
 
   // --- Cleanup ---
   yield* Console.log("\n=== Cleanup ===")

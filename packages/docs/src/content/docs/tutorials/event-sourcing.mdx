@@ -49,11 +49,28 @@ Define events with `Schema.TaggedClass`, not plain `Schema.Class`. The event sto
 
 ## Step 2: Schema and Table
 
-Define the application schema and a table for the event store. Events live in their own physical table — no entity registration is needed because the stream itself manages the items:
+Define the application schema and a table for the event store. The stream itself manages the event items — no entity registration is needed for them. Entities are only registered here so that ordinary records can be written **atomically alongside events** (see [Step 10](#step-10-atomic-side-writes)):
 
 ```typescript title="infrastructure.ts" region="infrastructure" example="event-sourcing.ts"
 const AppSchema = DynamoSchema.make({ name: "cricket", version: 1 })
-const EventsTable = Table.make({ schema: AppSchema })
+
+// A per-writer ingestion watermark — a side record updated atomically with
+// events via `append({ additionalItems })`.
+class Watermark extends Schema.Class<Watermark>("Watermark")({
+  writerId: Schema.String,
+  lastSeq: Schema.Number,
+}) {}
+
+const Watermarks = Entity.make({
+  model: Watermark,
+  entityType: "Watermark",
+  primaryKey: {
+    pk: { field: "pk", composite: ["writerId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const EventsTable = Table.make({ schema: AppSchema, entities: { Watermarks } })
 ```
 
 ---
@@ -465,6 +482,96 @@ successful no-op rather than a regression of the cache. Auto-snapshot writes are
 best-effort — a failure is logged and never fails the command, because the events it
 summarises are already durable.
 
+## Step 12: Atomic Side Writes
+
+Real event-sourced systems usually need one non-event record kept in step with the events: an ingestion watermark, a stream registry row, a uniqueness guard. `append` accepts `additionalItems` — the same operation builders `Transaction.transactWrite` takes (`Entity.put`, `Entity.delete`, and `Transaction.check`) — and commits them in the **same** `TransactWriteItems` call as the events:
+
+```typescript region="additional-items" example="event-sourcing.ts"
+yield* matchEvents.append(
+  { matchId: "m-2" },
+  [new MatchStarted({ venue: "SCG", homeTeam: "AUS", awayTeam: "IND" })],
+  0,
+  {
+    additionalItems: [Watermarks.put({ writerId: "ingest-1", lastSeq: 4021 })],
+  },
+)
+```
+
+Either everything lands or nothing does. The event puts, your items, and the version guard are one atomic unit.
+
+### Telling the failures apart
+
+Because your items carry their own conditions, "the transaction was cancelled" is no longer a single story. `append` maps cancellation reasons **by position**, so you always know whose condition failed:
+
+```typescript region="additional-item-condition" example="event-sourcing.ts"
+const condError = yield* matchEvents
+  .append({ matchId: "m-2" }, [new InningsCompleted({ innings: 1, runs: 300, wickets: 8 })], 1, {
+    additionalItems: [
+      Transaction.check(
+        Watermarks.get({ writerId: "ingest-1" }),
+        Expression.condition({ lt: { lastSeq: 100 } }),
+      ),
+    ],
+  })
+  .pipe(Effect.flip)
+// Error: AdditionalItemConditionFailed
+```
+
+| Error | What failed | What to do |
+|---|---|---|
+| `VersionConflict` | An event put's guard — the stream advanced under you | Re-read, re-decide, retry |
+| `AdditionalItemConditionFailed` | One of *your* `additionalItems` conditions | Inspect `indices` (0-based into `additionalItems`); retrying blindly will not help |
+| `DuplicateCommand` | The idempotency sentinel — this `commandId` already ran | Nothing; the command already took effect |
+| `TransactionCancelled` | Throttling, a concurrent transaction, or a validation error | Retry with backoff |
+| `AppendTooLarge` | `events + additionalItems + sentinel + contiguity check` exceeded DynamoDB's 100-item cap | Split the append |
+
+Without position-aware mapping, a failed watermark condition would be reported as a `VersionConflict` — and the caller's natural response (re-read, re-decide, retry) would loop forever against a condition that can never pass.
+
+---
+
+## Step 13: Command Idempotency
+
+By default, command processing is **at-least-once**. If a caller's response is lost after the append committed, the retry re-reads the stream, re-runs `decide`, and appends again. Deciders that are self-guarding (`StartMatch` fails once the match is started) absorb this; deciders that aren't (`CompleteInnings` happily emits another event) do not.
+
+To get exactly-once processing, configure `idempotency` on the handler and pass a `commandId` per call. The handler writes a dedup sentinel guarded by `attribute_not_exists` into the same transaction as the events:
+
+```typescript region="idempotency" example="event-sourcing.ts"
+const handleIdempotent = EventStore.commandHandler(matchDecider, matchEvents, {
+  idempotency: { ttl: Duration.days(1) },
+})
+
+yield* handleIdempotent(
+  { matchId: "m-3" },
+  { _tag: "StartMatch", venue: "Lords", homeTeam: "ENG", awayTeam: "NZ" },
+  { commandId: "cmd-7f3a" },
+)
+
+// CompleteInnings is not self-guarding — the decider happily produces a second
+// event, so only the dedup sentinel can catch the replay.
+yield* handleIdempotent(
+  { matchId: "m-3" },
+  { _tag: "CompleteInnings", innings: 1, runs: 210, wickets: 6 },
+  { commandId: "cmd-9b12" },
+)
+
+const dupError = yield* handleIdempotent(
+  { matchId: "m-3" },
+  { _tag: "CompleteInnings", innings: 1, runs: 210, wickets: 6 },
+  { commandId: "cmd-9b12" },
+).pipe(Effect.flip)
+// Error: DuplicateCommand
+```
+
+Configuring `idempotency` makes `commandId` **required** at the type level — you cannot silently fall back to at-least-once.
+
+What to know about the sentinel:
+
+- It lives in the stream's own partition, so `commandId` uniqueness is scoped to the stream. It is invisible to `read`, `readFrom`, and `currentVersion`, which filter on the event entity type.
+- Its sort key is composed with the schema's casing (lowercase by default), so command ids that differ only in case collide. Use UUIDs or ULIDs.
+- `ttl` is optional and written to the table's TTL attribute (honouring `TableConfig.ttlAttributeName`). Set it to the longest window over which your infrastructure can replay a command; omit it and sentinels are permanent.
+- A replay is **rejected**, not replayed — `DuplicateCommand` carries `streamName`, `streamId`, and `commandId`. If you need the original outcome, catch the error and re-read the stream.
+- A command that produces no events writes no sentinel, because there is no transaction to attach it to.
+
 ---
 
 ## Running the Example
@@ -515,6 +622,9 @@ Effect.runPromise(main).then(
 | **Snapshots** | `snapshot: { schema, every }` caches a fold of the stream; the handler replays only the delta |
 | **Snapshot primitives** | `readSnapshot` / `writeSnapshot` for manual cadence; monotonic writes, never a cache regression |
 | **Retry** | `{ retry }` re-runs the full read-decide-append cycle on `VersionConflict` only |
+| **Atomic side writes** | `append(..., { additionalItems })` commits `Entity.put` / `Entity.delete` / `Transaction.check` ops with the events |
+| **Position-aware errors** | `VersionConflict` vs. `AdditionalItemConditionFailed` vs. `DuplicateCommand` — you always know whose condition failed |
+| **Command idempotency** | At-least-once by default; `commandHandler(..., { idempotency })` + a `commandId` makes it exactly-once via a dedup sentinel |
 
 ## What's Next?
 

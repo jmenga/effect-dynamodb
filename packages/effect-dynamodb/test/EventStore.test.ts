@@ -1,7 +1,9 @@
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
+  type AdditionalItemConditionFailed,
   AppendTooLarge,
+  type DuplicateCommand,
   DynamoError,
   TRANSACT_WRITE_ITEMS_LIMIT,
   type ValidationError,
@@ -11,27 +13,49 @@ import {
   Cause,
   Data,
   DateTime,
+  Duration,
   Effect,
   Exit,
   Layer,
   Option,
+  pipe,
   Schedule,
   Schema,
   SchemaGetter,
 } from "effect"
 import { beforeEach, vi } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
+import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
+import * as Expression from "../src/Expression.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
+import * as Transaction from "../src/Transaction.js"
 
 // ---------------------------------------------------------------------------
 // Test setup — Schema, Table, Event classes
 // ---------------------------------------------------------------------------
 
 const AppSchema = DynamoSchema.make({ name: "cricket", version: 1 })
-const EventsTable = Table.make({ schema: AppSchema })
+
+// Side-record entity used to exercise `append({ additionalItems })`. Registered
+// on the same physical table as the event stream.
+class Watermark extends Schema.Class<Watermark>("Watermark")({
+  writerId: Schema.String,
+  lastSeq: Schema.Number,
+}) {}
+
+const Watermarks = Entity.make({
+  model: Watermark,
+  entityType: "Watermark",
+  primaryKey: {
+    pk: { field: "pk", composite: ["writerId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const EventsTable = Table.make({ schema: AppSchema, entities: { Watermarks } })
 
 class MatchStarted extends Schema.Class<MatchStarted>("MatchStarted")({
   venue: Schema.String,
@@ -900,6 +924,393 @@ describe("EventStore", () => {
   })
 
   // -------------------------------------------------------------------------
+  // append — additionalItems (#85)
+  // -------------------------------------------------------------------------
+
+  describe("append — additionalItems", () => {
+    const startMatch = () => new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" })
+
+    const cancelled = (reasons: ReadonlyArray<{ Code: string; Message?: string }>) => ({
+      name: "TransactionCanceledException",
+      CancellationReasons: reasons,
+    })
+
+    it.effect("merges additional items after the event puts, in caller order", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [
+            Watermarks.put({ writerId: "ingest-1", lastSeq: 42 }),
+            Watermarks.delete({ writerId: "ingest-0" }),
+          ],
+        })
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(call.TransactItems).toHaveLength(3)
+
+        // Event put first
+        expect(fromAttributeMap(call.TransactItems[0].Put.Item).__edd_e__).toBe("match.event")
+
+        // Then the caller's items, in the order supplied
+        const wmItem = fromAttributeMap(call.TransactItems[1].Put.Item)
+        expect(call.TransactItems[1].Put.TableName).toBe("events-table")
+        expect(wmItem.__edd_e__).toBe("Watermark")
+        expect(wmItem.lastSeq).toBe(42)
+
+        expect(call.TransactItems[2].Delete.TableName).toBe("events-table")
+        expect(fromAttributeMap(call.TransactItems[2].Delete.Key).pk).toBe(
+          "$cricket#v1#watermark#writerid_ingest-0",
+        )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("supports Transaction.check items", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [
+            Transaction.check(
+              Watermarks.get({ writerId: "ingest-1" }),
+              Expression.condition({ lt: { lastSeq: 42 } }),
+            ),
+          ],
+        })
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        const check = call.TransactItems[1].ConditionCheck
+        expect(check.TableName).toBe("events-table")
+        expect(check.ConditionExpression).toContain("<")
+        expect(fromAttributeMap(check.Key).pk).toBe("$cricket#v1#watermark#writerid_ingest-1")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("maps an additional-item condition failure to AdditionalItemConditionFailed", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValue(
+          cancelled([
+            { Code: "None" },
+            { Code: "None" },
+            { Code: "ConditionalCheckFailed", Message: "watermark moved" },
+          ]),
+        )
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [
+            Watermarks.put({ writerId: "ingest-1", lastSeq: 42 }),
+            Transaction.check(
+              Watermarks.get({ writerId: "ingest-1" }),
+              Expression.condition({ lt: { lastSeq: 42 } }),
+            ),
+          ],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AdditionalItemConditionFailed")
+        const failure = error as AdditionalItemConditionFailed
+        expect(failure.streamName).toBe("Match")
+        expect(failure.streamId).toBe("m-1")
+        // Transaction index 2 → additionalItems index 1
+        expect(failure.indices).toEqual([1])
+        expect(failure.reasons).toHaveLength(3)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("reports every failing additional-item index", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValue(
+          cancelled([
+            { Code: "None" },
+            { Code: "ConditionalCheckFailed" },
+            { Code: "ConditionalCheckFailed" },
+          ]),
+        )
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [
+            Watermarks.put({ writerId: "ingest-1", lastSeq: 42 }),
+            Watermarks.put({ writerId: "ingest-2", lastSeq: 43 }),
+          ],
+        }).pipe(Effect.flip)
+
+        expect((error as AdditionalItemConditionFailed).indices).toEqual([0, 1])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("prefers VersionConflict when an event put also failed", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValue(
+          cancelled([{ Code: "ConditionalCheckFailed" }, { Code: "ConditionalCheckFailed" }]),
+        )
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 3, {
+          additionalItems: [Watermarks.put({ writerId: "ingest-1", lastSeq: 42 })],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("VersionConflict")
+        expect((error as VersionConflict).expectedVersion).toBe(3)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("still maps VersionConflict correctly with additional items present", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValue(
+          cancelled([{ Code: "ConditionalCheckFailed" }, { Code: "None" }]),
+        )
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 7, {
+          additionalItems: [Watermarks.put({ writerId: "ingest-1", lastSeq: 42 })],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("VersionConflict")
+        expect((error as VersionConflict).expectedVersion).toBe(7)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("falls back to TransactionCancelled when reasons are absent", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValue({ name: "TransactionCanceledException" })
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [Watermarks.put({ writerId: "ingest-1", lastSeq: 42 })],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("TransactionCancelled")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("falls back to TransactionCancelled for non-conditional reasons", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValue(
+          cancelled([{ Code: "TransactionConflict" }, { Code: "None" }]),
+        )
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [Watermarks.put({ writerId: "ingest-1", lastSeq: 42 })],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("TransactionCancelled")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("runs the transaction for zero events when additional items are present", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        const result = yield* MatchEvents.append({ matchId: "m-1" }, [], 5, {
+          additionalItems: [Watermarks.put({ writerId: "ingest-1", lastSeq: 42 })],
+        })
+
+        expect(result.version).toBe(5)
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        expect(mockTransactWriteItems.mock.calls[0]![0].TransactItems).toHaveLength(1)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("fails with AppendTooLarge past the 100-item cap, without calling AWS", () =>
+      Effect.gen(function* () {
+        const events = Array.from({ length: 99 }, () => startMatch())
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, events, 0, {
+          additionalItems: [
+            Watermarks.put({ writerId: "ingest-1", lastSeq: 1 }),
+            Watermarks.put({ writerId: "ingest-2", lastSeq: 2 }),
+          ],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AppendTooLarge")
+        const overflow = error as AppendTooLarge
+        expect(overflow.streamName).toBe("Match")
+        expect(overflow.count).toBe(101)
+        expect(overflow.limit).toBe(TRANSACT_WRITE_ITEMS_LIMIT)
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("counts the idempotency sentinel against the cap", () =>
+      Effect.gen(function* () {
+        const events = Array.from({ length: 100 }, () => startMatch())
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, events, 0, {
+          idempotency: { commandId: "cmd-1" },
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AppendTooLarge")
+        expect((error as AppendTooLarge).count).toBe(101)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("counts the version-contiguity ConditionCheck against the cap", () =>
+      Effect.gen(function* () {
+        // 99 events + 1 additional item = 100, which fits at expectedVersion 0.
+        // At expectedVersion > 0 the contiguity ConditionCheck is the 101st item.
+        const events = Array.from({ length: 99 }, () => startMatch())
+        const additionalItems = [Watermarks.put({ writerId: "ingest-1", lastSeq: 1 })]
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, events, 7, {
+          additionalItems,
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AppendTooLarge")
+        expect((error as AppendTooLarge).count).toBe(101)
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  // -------------------------------------------------------------------------
+  // append — command idempotency (#85)
+  // -------------------------------------------------------------------------
+
+  describe("append — idempotency", () => {
+    const startMatch = () => new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" })
+
+    it.effect("appends a dedup sentinel as the last transact item", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 3, {
+          idempotency: { commandId: "cmd-7f3a" },
+        })
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        // [contiguity ConditionCheck (expectedVersion 3 > 0), event put, sentinel].
+        // The sentinel is always LAST — that is what keeps additional-item
+        // indices stable for the caller.
+        expect(call.TransactItems).toHaveLength(3)
+        expect(call.TransactItems[0].ConditionCheck).toBeDefined()
+
+        const sentinel = call.TransactItems[call.TransactItems.length - 1].Put
+        expect(sentinel.TableName).toBe("events-table")
+        expect(sentinel.ConditionExpression).toBe("attribute_not_exists(pk)")
+
+        const item = fromAttributeMap(sentinel.Item)
+        expect(item.pk).toBe("$cricket#v1#match#m-1")
+        expect(item.sk).toBe("$cricket#v1#match.command#cmd-7f3a")
+        expect(item.__edd_e__).toBe("match.command")
+        expect(item.streamId).toBe("m-1")
+        expect(item.commandId).toBe("cmd-7f3a")
+        expect(item.version).toBe(4)
+        expect(item._ttl).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("keeps additional-item indices stable when a sentinel is present", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValue({
+          name: "TransactionCanceledException",
+          CancellationReasons: [
+            { Code: "None" },
+            { Code: "None" },
+            { Code: "ConditionalCheckFailed" },
+            { Code: "None" },
+          ],
+        })
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [
+            Watermarks.put({ writerId: "ingest-1", lastSeq: 1 }),
+            Watermarks.put({ writerId: "ingest-2", lastSeq: 2 }),
+          ],
+          idempotency: { commandId: "cmd-1" },
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AdditionalItemConditionFailed")
+        expect((error as AdditionalItemConditionFailed).indices).toEqual([1])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("writes a TTL to the configured attribute when idempotency.ttl is set", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          idempotency: { commandId: "cmd-1", ttl: Duration.days(1) },
+        })
+
+        const item = fromAttributeMap(
+          mockTransactWriteItems.mock.calls[0]![0].TransactItems[1].Put.Item,
+        )
+        // TestClock is frozen at epoch 0
+        expect(item._ttl).toBe(86_400)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("honours TableConfig.ttlAttributeName for the sentinel", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          idempotency: { commandId: "cmd-1", ttl: "30 minutes" },
+        })
+
+        const item = fromAttributeMap(
+          mockTransactWriteItems.mock.calls[0]![0].TransactItems[1].Put.Item,
+        )
+        expect(item.ttl).toBe(1_800)
+        expect(item._ttl).toBeUndefined()
+      }).pipe(
+        Effect.provide(
+          Layer.merge(
+            TestDynamoClient,
+            EventsTable.layer({ name: "events-table", ttlAttributeName: "ttl" }),
+          ),
+        ),
+      ),
+    )
+
+    it.effect("maps a sentinel condition failure to DuplicateCommand", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValue({
+          name: "TransactionCanceledException",
+          CancellationReasons: [{ Code: "None" }, { Code: "ConditionalCheckFailed" }],
+        })
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          idempotency: { commandId: "cmd-7f3a" },
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("DuplicateCommand")
+        const dup = error as DuplicateCommand
+        expect(dup.streamName).toBe("Match")
+        expect(dup.streamId).toBe("m-1")
+        expect(dup.commandId).toBe("cmd-7f3a")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("prefers DuplicateCommand over VersionConflict", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValue({
+          name: "TransactionCanceledException",
+          CancellationReasons: [
+            { Code: "ConditionalCheckFailed" },
+            { Code: "ConditionalCheckFailed" },
+          ],
+        })
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          idempotency: { commandId: "cmd-7f3a" },
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("DuplicateCommand")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("writes a sentinel with zero events when idempotency is requested", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        const result = yield* MatchEvents.append({ matchId: "m-1" }, [], 2, {
+          idempotency: { commandId: "cmd-1" },
+        })
+
+        expect(result.version).toBe(2)
+        expect(mockTransactWriteItems.mock.calls[0]![0].TransactItems).toHaveLength(1)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  // -------------------------------------------------------------------------
   // commandHandler
   // -------------------------------------------------------------------------
 
@@ -997,6 +1408,107 @@ describe("EventStore", () => {
         expect(result.events).toEqual([])
         expect(result.version).toBe(0)
         expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("works in data-last (pipeable) form", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: [] })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        const handle = pipe(MatchEvents, EventStore.commandHandler(matchDecider))
+
+        const result = yield* handle(
+          { matchId: "m-1" },
+          { _tag: "StartMatch", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
+        )
+
+        expect(result.state.status).toBe("in-progress")
+        expect(result.version).toBe(1)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("threads commandId into the append transaction when idempotency is configured", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: [] })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        const handle = EventStore.commandHandler(matchDecider, MatchEvents, {
+          idempotency: { ttl: Duration.days(1) },
+        })
+
+        yield* handle(
+          { matchId: "m-1" },
+          { _tag: "StartMatch", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
+          { commandId: "cmd-7f3a" },
+        )
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(call.TransactItems).toHaveLength(2)
+        const sentinel = fromAttributeMap(call.TransactItems[1].Put.Item)
+        expect(sentinel.commandId).toBe("cmd-7f3a")
+        expect(sentinel._ttl).toBe(86_400)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("surfaces DuplicateCommand on a replayed commandId", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: [] })
+        mockTransactWriteItems.mockRejectedValueOnce({
+          name: "TransactionCanceledException",
+          CancellationReasons: [{ Code: "None" }, { Code: "ConditionalCheckFailed" }],
+        })
+
+        const handle = EventStore.commandHandler(matchDecider, MatchEvents, {
+          idempotency: {},
+        })
+
+        const error = yield* handle(
+          { matchId: "m-1" },
+          { _tag: "StartMatch", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
+          { commandId: "cmd-7f3a" },
+        ).pipe(Effect.flip)
+
+        expect(error._tag).toBe("DuplicateCommand")
+        expect((error as DuplicateCommand).commandId).toBe("cmd-7f3a")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "fails with ValidationError when idempotency is configured but commandId is absent",
+      () =>
+        Effect.gen(function* () {
+          const handle = EventStore.commandHandler(matchDecider, MatchEvents, {
+            idempotency: {},
+          }) as unknown as (
+            streamId: { matchId: string },
+            command: MatchCommand,
+          ) => Effect.Effect<unknown, { readonly _tag: string }, DynamoClient | Table.TableConfig>
+
+          const error = yield* handle(
+            { matchId: "m-1" },
+            { _tag: "StartMatch", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
+          ).pipe(Effect.flip)
+
+          expect(error._tag).toBe("ValidationError")
+          expect(mockQuery).not.toHaveBeenCalled()
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("forwards additionalItems from the per-call options", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: [] })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* handleMatch(
+          { matchId: "m-1" },
+          { _tag: "StartMatch", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
+          { additionalItems: [Watermarks.put({ writerId: "ingest-1", lastSeq: 42 })] },
+        )
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(call.TransactItems).toHaveLength(2)
+        expect(fromAttributeMap(call.TransactItems[1].Put.Item).__edd_e__).toBe("Watermark")
       }).pipe(Effect.provide(TestLayer)),
     )
   })
@@ -2045,6 +2557,82 @@ describe("EventStore", () => {
         )
 
         expect(result.version).toBe(1)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // Regression guard for the reconciliation of #84 and #85: both layers added a
+    // trailing options argument to `commandHandler`, and the whole reason this is
+    // a hand-rolled dual on the `EventStreamTypeId` brand rather than
+    // `Function.dual`'s numeric-arity form is that the arity form SILENTLY DROPS
+    // that trailing argument in the data-last position. A dropped `{ retry }`
+    // degrades to no retry; a dropped `{ idempotency }` degrades to at-least-once
+    // — both look like success until the day they matter. Assert the option
+    // actually reaches the implementation, for BOTH option kinds and BOTH stream
+    // kinds.
+    it.effect("data-last passes an idempotency option through (EventStream)", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        mockTransactWriteItems.mockResolvedValue({})
+
+        const handle = MatchEvents.pipe(
+          EventStore.commandHandler(matchDecider, { idempotency: { ttl: Duration.days(1) } }),
+        )
+        yield* handle(
+          { matchId: "m-1" },
+          { _tag: "StartMatch", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
+          { commandId: "cmd-datalast" },
+        )
+
+        // The dedup sentinel exists only if `{ idempotency }` survived the pipe.
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        const sentinel = fromAttributeMap(items[items.length - 1].Put.Item)
+        expect(sentinel.__edd_e__).toBe("match.command")
+        expect(sentinel.commandId).toBe("cmd-datalast")
+        expect(sentinel._ttl).toBeDefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("data-last passes an idempotency option through (BoundEventStream)", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        mockTransactWriteItems.mockResolvedValue({})
+
+        const bound = yield* EventStore.bind(MatchEvents)
+        const handle = bound.pipe(EventStore.commandHandler(matchDecider, { idempotency: {} }))
+        yield* handle(
+          { matchId: "m-1" },
+          { _tag: "StartMatch", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
+          { commandId: "cmd-bound-datalast" },
+        )
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        const sentinel = fromAttributeMap(items[items.length - 1].Put.Item)
+        expect(sentinel.__edd_e__).toBe("match.command")
+        expect(sentinel.commandId).toBe("cmd-bound-datalast")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("data-last passes a retry option through (BoundEventStream)", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        mockTransactWriteItems
+          .mockRejectedValueOnce({
+            name: "TransactionCanceledException",
+            CancellationReasons: [{ Code: "ConditionalCheckFailed" }],
+          })
+          .mockResolvedValue({})
+
+        const bound = yield* EventStore.bind(MatchEvents)
+        const handle = bound.pipe(EventStore.commandHandler(matchDecider, { retry: 2 }))
+        const result = yield* handle(
+          { matchId: "m-1" },
+          { _tag: "StartMatch", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
+        )
+
+        expect(result.version).toBe(1)
+        // Without the option surviving the pipe this would be 1 and the effect
+        // would have failed with VersionConflict.
+        expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
       }).pipe(Effect.provide(TestLayer)),
     )
   })

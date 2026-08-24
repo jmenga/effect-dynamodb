@@ -12,41 +12,33 @@
 import {
   DynamoError,
   isAwsTransactionCancelled,
+  TRANSACT_WRITE_ITEMS_LIMIT,
   TransactionCancelled,
   type ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Function as Fn } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
-import type { Entity, EntityDelete, EntityGet, EntityPut } from "./Entity.js"
+import type { EntityGet } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
 import type { ExpressionResult } from "./Expression.js"
+import { composePrimaryKey, resolveTableNames } from "./internal/TransactableOps.js"
 import {
-  composePrimaryKey,
-  resolveTableNames,
-  validateAndBuildPutItem,
-} from "./internal/TransactableOps.js"
+  buildTransactWriteItems,
+  type ConditionCheckOp,
+  ConditionCheckTypeId,
+  type TransactWriteOp,
+} from "./internal/TransactWriteOps.js"
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
 import type { TableConfig } from "./Table.js"
 
 // ---------------------------------------------------------------------------
 // ConditionCheck — composable from EntityGet + condition expression
+//
+// Defined in `internal/TransactWriteOps.ts` (shared with EventStore's
+// `additionalItems`) and re-exported here so the public surface is unchanged.
 // ---------------------------------------------------------------------------
 
-/** @internal */
-export const ConditionCheckTypeId: unique symbol = Symbol.for("effect-dynamodb/ConditionCheck")
-export type ConditionCheckTypeId = typeof ConditionCheckTypeId
-
-/**
- * A condition-check operation for use inside {@link transactWrite}.
- * Created via {@link check} from an EntityGet intermediate + a condition expression.
- * The EntityGet is never executed — used purely as a typed key resolver.
- */
-export interface ConditionCheckOp {
-  readonly [ConditionCheckTypeId]: ConditionCheckTypeId
-  readonly _entity: Entity
-  readonly _key: Record<string, unknown>
-  readonly _condition: ExpressionResult
-}
+export { ConditionCheckTypeId, type ConditionCheckOp, type TransactWriteOp }
 
 /**
  * Create a conditionCheck operation from an EntityGet intermediate and a condition.
@@ -181,9 +173,6 @@ export const transactGet = <const T extends ReadonlyArray<EntityGet<any, any, an
 // TransactWrite — accepts Entity operation intermediates
 // ---------------------------------------------------------------------------
 
-/** Union of operations accepted by transactWrite */
-type TransactWriteOp = EntityPut<any, any, any, any> | EntityDelete<any, any> | ConditionCheckOp
-
 /**
  * Atomically write up to 100 items across entities/tables.
  * Accepts EntityPut, EntityDelete, and ConditionCheckOp (via Transaction.check).
@@ -205,100 +194,19 @@ export const transactWrite = (
 > =>
   Effect.gen(function* () {
     if (operations.length === 0) return
-    if (operations.length > 100) {
+    if (operations.length > TRANSACT_WRITE_ITEMS_LIMIT) {
       return yield* Effect.fail(
         new DynamoError({
           operation: "TransactWriteItems",
-          cause: new Error("TransactWriteItems supports a maximum of 100 items"),
+          cause: new Error(
+            `TransactWriteItems supports a maximum of ${TRANSACT_WRITE_ITEMS_LIMIT} items`,
+          ),
         }),
       )
     }
 
     const client = yield* DynamoClient
-
-    // Build info for each operation
-    const opInfos: Array<{
-      type: "put" | "delete" | "conditionCheck"
-      entity: Entity
-      key?: Record<string, unknown> | undefined
-      input?: Record<string, unknown> | undefined
-      condition?: ExpressionResult | undefined
-    }> = []
-
-    for (const op of operations) {
-      // Check for ConditionCheckOp first (has its own TypeId)
-      if (ConditionCheckTypeId in op) {
-        const checkOp = op as ConditionCheckOp
-        opInfos.push({
-          type: "conditionCheck",
-          entity: checkOp._entity,
-          key: checkOp._key,
-          condition: checkOp._condition,
-        })
-        continue
-      }
-
-      const info = extractTransactable(op)
-      if (!info) {
-        throw new Error("transactWrite: unrecognized operation type")
-      }
-
-      if (info.opType === "put") {
-        opInfos.push({
-          type: "put",
-          entity: info.entity,
-          input: info.input!,
-        })
-      } else if (info.opType === "delete") {
-        opInfos.push({
-          type: "delete",
-          entity: info.entity,
-          key: info.key!,
-        })
-      } else {
-        throw new Error(
-          `transactWrite: unsupported operation type "${info.opType}". Use EntityPut, EntityDelete, or Transaction.check().`,
-        )
-      }
-    }
-
-    const tableNames = yield* resolveTableNames(opInfos)
-
-    const transactItems: Array<Record<string, any>> = []
-
-    for (const op of opInfos) {
-      const tableName = tableNames.get(op.entity)!
-
-      if (op.type === "put") {
-        const marshalledItem = yield* validateAndBuildPutItem(
-          op.entity,
-          op.input!,
-          "transactWrite.put",
-        )
-        transactItems.push({
-          Put: { TableName: tableName, Item: marshalledItem },
-        })
-      } else if (op.type === "delete") {
-        transactItems.push({
-          Delete: {
-            TableName: tableName,
-            Key: toAttributeMap(composePrimaryKey(op.entity, op.key!)),
-          },
-        })
-      } else {
-        // conditionCheck
-        const marshalledKey = toAttributeMap(composePrimaryKey(op.entity, op.key!))
-        transactItems.push({
-          ConditionCheck: {
-            TableName: tableName,
-            Key: marshalledKey,
-            ConditionExpression: op.condition!.expression,
-            ExpressionAttributeNames: op.condition!.names,
-            ExpressionAttributeValues: op.condition!.values,
-          },
-        })
-      }
-    }
+    const transactItems = yield* buildTransactWriteItems(operations, "transactWrite")
 
     yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
       Effect.mapError((error) => {
