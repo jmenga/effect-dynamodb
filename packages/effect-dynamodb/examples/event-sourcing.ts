@@ -11,7 +11,7 @@
  *   npx tsx examples/event-sourcing.ts
  */
 
-import { Console, Data, Effect, Layer, Schema } from "effect"
+import { Console, Data, Effect, Layer, Option, Schema } from "effect"
 
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
@@ -153,7 +153,30 @@ const matchDecider: EventStore.Decider<
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 5. Main program
+// 5. Snapshots — a state schema plus a snapshot-enabled stream
+// ---------------------------------------------------------------------------
+
+// #region snapshot-schema
+const MatchStateSchema = Schema.Struct({
+  status: Schema.Literals(["pending", "in-progress", "completed"]),
+  venue: Schema.optionalKey(Schema.String),
+  innings: Schema.Array(Schema.Struct({ runs: Schema.Number, wickets: Schema.Number })),
+  result: Schema.optionalKey(Schema.String),
+})
+// #endregion
+
+// #region snapshot-stream
+const SnapshotMatchEvents = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "SnapshotMatch",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["matchId"] },
+  snapshot: { schema: MatchStateSchema, every: 3 },
+})
+// #endregion
+
+// ---------------------------------------------------------------------------
+// 6. Main program
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
@@ -278,6 +301,59 @@ const program = Effect.gen(function* () {
   ).pipe(Effect.flip)
   // #endregion
   yield* Console.log(`Error: ${error._tag}`)
+
+  // --- Snapshots: snapshot-aware handler with retry ---
+  yield* Console.log("\n=== Snapshots ===")
+  // #region snapshot-handler
+  const snapshotMatchEvents = yield* EventStore.bind(SnapshotMatchEvents)
+  const handleSnapshotMatch = EventStore.commandHandler(matchDecider, snapshotMatchEvents, {
+    retry: 3,
+  })
+  // #endregion
+
+  // #region snapshot-commands
+  yield* handleSnapshotMatch(
+    { matchId: "m-2" },
+    { _tag: "StartMatch", venue: "SCG", homeTeam: "AUS", awayTeam: "IND" },
+  )
+  yield* handleSnapshotMatch(
+    { matchId: "m-2" },
+    { _tag: "CompleteInnings", innings: 1, runs: 310, wickets: 8 },
+  )
+  // The third event crosses the `every: 3` threshold — a snapshot is written.
+  const s3 = yield* handleSnapshotMatch(
+    { matchId: "m-2" },
+    { _tag: "CompleteInnings", innings: 2, runs: 275, wickets: 10 },
+  )
+  // #endregion
+  yield* Console.log(`State: ${s3.state.status}, Version: ${s3.version}`)
+
+  // #region read-snapshot
+  const snapshot = yield* snapshotMatchEvents.readSnapshot({ matchId: "m-2" })
+  const asOfVersion = Option.match(snapshot, {
+    onNone: () => 0,
+    onSome: (s) => s.asOfVersion,
+  })
+  // #endregion
+  yield* Console.log(`Snapshot asOfVersion: ${asOfVersion}`)
+
+  // Subsequent commands fold from the snapshot plus the delta, not the whole
+  // stream. The result is identical either way.
+  // #region snapshot-fold
+  const s4 = yield* handleSnapshotMatch(
+    { matchId: "m-2" },
+    { _tag: "EndMatch", result: "AUS won by 35 runs" },
+  )
+  // #endregion
+  yield* Console.log(`State: ${s4.state.status}, Version: ${s4.version}`)
+
+  // Snapshots can also be written by hand — e.g. from a backfill job.
+  // #region write-snapshot
+  const events = yield* snapshotMatchEvents.read({ matchId: "m-2" })
+  const folded = EventStore.fold(matchDecider, events)
+  yield* snapshotMatchEvents.writeSnapshot({ matchId: "m-2" }, folded, s4.version)
+  // #endregion
+  yield* Console.log(`Rewrote snapshot at version ${s4.version}`)
 
   // --- Cleanup ---
   yield* Console.log("\n=== Cleanup ===")

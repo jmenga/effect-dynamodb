@@ -5,7 +5,9 @@
  * - `Decider` type for command-event-state modeling
  * - `makeStream` factory for creating event streams bound to a Table
  * - Core operations: `append`, `read`, `readFrom`, `currentVersion`
- * - `commandHandler` combinator for read-decide-append cycle
+ * - Snapshot primitives: `writeSnapshot`, `readSnapshot`
+ * - `commandHandler` combinator for read-decide-append cycle (snapshot-aware,
+ *   with an optional `VersionConflict` retry policy)
  * - `fold` / `foldFrom` helpers for state reconstruction
  *
  * Built on the existing library primitives (DynamoSchema, KeyComposer, Query,
@@ -15,6 +17,7 @@
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   AppendTooLarge,
+  isAwsConditionalCheckFailed,
   isAwsTransactionCancelled,
   TRANSACT_WRITE_ITEMS_LIMIT,
   TransactionCancelled,
@@ -22,9 +25,9 @@ import {
   VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { DateTime, Effect, Function, Schema } from "effect"
+import { DateTime, Effect, Function, Option, Pipeable, Schedule, Schema } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
-import { toAttributeMap } from "./Marshaller.js"
+import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
 import * as Query from "./Query.js"
 import type { Table, TableConfig } from "./Table.js"
 
@@ -107,6 +110,43 @@ export interface CommandHandlerResult<State, Event> extends AppendResult<Event> 
 }
 
 // ---------------------------------------------------------------------------
+// Snapshots
+// ---------------------------------------------------------------------------
+
+/**
+ * A persisted fold of a stream, up to and including `asOfVersion`.
+ *
+ * Snapshots are a cache, never history — there is exactly one per stream and it
+ * is overwritten in place. The event stream remains the source of truth, so a
+ * snapshot can always be discarded and rebuilt.
+ */
+export interface Snapshot<State> {
+  readonly state: State
+  readonly asOfVersion: number
+  readonly timestamp: string
+}
+
+/**
+ * Snapshot configuration accepted by {@link makeStream}.
+ *
+ * - `schema` — the state codec. Snapshot state round-trips through it
+ *   (`Schema.encodeUnknownEffect` on write, `Schema.decodeUnknownEffect` on
+ *   read), so transforming schemas work.
+ * - `every` — optional auto-snapshot cadence for {@link commandHandler}: after a
+ *   successful append, write a fresh snapshot once at least this many events
+ *   have accumulated since the last one. Must be a positive integer.
+ */
+export interface SnapshotConfig<TSchema extends Schema.Top = Schema.Top> {
+  readonly schema: TSchema
+  readonly every?: number | undefined
+}
+
+/** The runtime snapshot settings exposed on a stream. */
+export interface SnapshotSettings {
+  readonly every: number | undefined
+}
+
+// ---------------------------------------------------------------------------
 // StreamIdInput — maps composite field names to a required record
 // ---------------------------------------------------------------------------
 
@@ -131,10 +171,50 @@ export type EventStreamTypeId = typeof EventStreamTypeId
  * Created via {@link makeStream}. Operations are called directly on the stream:
  * `MatchEvents.append(...)`, `MatchEvents.read(...)`, `MatchEvents.query.events(...)`.
  */
-export interface EventStream<TEvent, TStreamIdFields extends ReadonlyArray<string>, TMetadata> {
+export interface EventStream<
+  TEvent,
+  TStreamIdFields extends ReadonlyArray<string>,
+  TMetadata,
+  TState = never,
+> extends Pipeable.Pipeable {
   readonly [EventStreamTypeId]: EventStreamTypeId
   readonly streamName: string
   readonly eventSchema: Schema.Top
+
+  /**
+   * Present iff the stream was created with a `snapshot` config. Its presence
+   * is what switches {@link commandHandler} onto the snapshot-aware read path.
+   */
+  readonly snapshotConfig: SnapshotSettings | undefined
+
+  /**
+   * Write (or overwrite) this stream's snapshot.
+   *
+   * Monotonic: a snapshot at an equal or newer `asOfVersion` already present is
+   * left alone and the write reports success. Dies with `[EDD-9026]` on a
+   * stream declared without a `snapshot` config (unreachable via the types —
+   * `TState` is `never` there, so no value can be supplied).
+   */
+  readonly writeSnapshot: (
+    streamId: StreamIdInput<TStreamIdFields>,
+    state: TState,
+    asOfVersion: number,
+  ) => Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig>
+
+  /**
+   * Read this stream's snapshot, if one has been written.
+   *
+   * A snapshot that fails to decode through the configured state schema fails
+   * with `ValidationError` — it is never silently discarded, because that would
+   * hide state-schema evolution bugs.
+   */
+  readonly readSnapshot: (
+    streamId: StreamIdInput<TStreamIdFields>,
+  ) => Effect.Effect<
+    Option.Option<Snapshot<TState>>,
+    DynamoClientError | ValidationError,
+    DynamoClient | TableConfig
+  >
 
   readonly append: (
     streamId: StreamIdInput<TStreamIdFields>,
@@ -205,6 +285,21 @@ export interface EventStream<TEvent, TStreamIdFields extends ReadonlyArray<strin
  *   streamId: { composite: ["matchId"] },
  * })
  * ```
+ *
+ * Opt into snapshots by declaring a state schema:
+ *
+ * @example
+ * ```typescript
+ * const MatchEvents = EventStore.makeStream({
+ *   table: EventsTable,
+ *   streamName: "Match",
+ *   events: [MatchStarted, InningsCompleted],
+ *   streamId: { composite: ["matchId"] },
+ *   snapshot: { schema: MatchStateSchema, every: 100 },
+ * })
+ * ```
+ *
+ * @throws `[EDD-9027]` when `snapshot.every` is not a positive integer.
  */
 export const makeStream = <
   const TEvents extends ReadonlyArray<Schema.Top>,
@@ -212,23 +307,43 @@ export const makeStream = <
   const TStreamName extends string,
   const TStreamId extends { readonly composite: ReadonlyArray<string> },
   TMetadata extends Schema.Top | undefined = undefined,
+  TSnapshot extends SnapshotConfig | undefined = undefined,
 >(config: {
   readonly table: TTable
   readonly streamName: TStreamName
   readonly events: TEvents
   readonly streamId: TStreamId
   readonly metadata?: TMetadata
+  readonly snapshot?: TSnapshot
 }): EventStream<
   Schema.Schema.Type<TEvents[number]>,
   TStreamId["composite"],
-  TMetadata extends Schema.Top ? Schema.Schema.Type<TMetadata> : undefined
+  TMetadata extends Schema.Top ? Schema.Schema.Type<TMetadata> : undefined,
+  TSnapshot extends SnapshotConfig<infer TStateSchema> ? Schema.Schema.Type<TStateSchema> : never
 > => {
   type TEvent = Schema.Schema.Type<TEvents[number]>
   type TStreamIdFields = TStreamId["composite"]
 
   const schema = config.table.schema
   const entityType = `${config.streamName.toLowerCase()}.event`
+  const snapshotEntityType = `${config.streamName.toLowerCase()}.snapshot`
   const compositeFields = config.streamId.composite
+
+  // -------------------------------------------------------------------------
+  // Snapshot config validation (EDD-9027) — fail fast at definition time.
+  // -------------------------------------------------------------------------
+
+  const snapshot = config.snapshot as SnapshotConfig | undefined
+  if (snapshot !== undefined && snapshot.every !== undefined) {
+    if (!Number.isInteger(snapshot.every) || snapshot.every <= 0) {
+      throw new Error(
+        `[EDD-9027] EventStream "${config.streamName}": snapshot.every must be a positive integer; ` +
+          `received ${String(snapshot.every)}.`,
+      )
+    }
+  }
+  const snapshotSettings: SnapshotSettings | undefined =
+    snapshot === undefined ? undefined : { every: snapshot.every }
 
   // Build union schema from event schemas for decoding
   const eventUnion: Schema.Top =
@@ -250,6 +365,27 @@ export const makeStream = <
 
   const composeEventSk = (version: number): string =>
     DynamoSchema.composeEventVersionKey(schema, entityType, version)
+
+  /**
+   * Every event SK begins with this; nothing else in the stream partition does.
+   * Bounding event reads to it excludes the snapshot item at the key-condition
+   * level, which matters because DynamoDB applies `Limit` *before*
+   * `FilterExpression` — a filtered-out snapshot would still burn a `Limit` slot.
+   */
+  const eventSkPrefix = DynamoSchema.composeEventVersionKeyPrefix(schema, entityType)
+
+  /** Inclusive upper bound of the event SK range (10-digit padding maximum). */
+  const maxEventSk = composeEventSk(DynamoSchema.MAX_EVENT_VERSION)
+
+  /**
+   * The snapshot SK. Distinct entity-type label (`<stream>.snapshot` vs
+   * `<stream>.event_1#…`), so it can never collide with an event SK, and it
+   * sorts after every event in the partition.
+   */
+  const snapshotSk = DynamoSchema.composeKey(schema, snapshotEntityType, [])
+
+  const composeStreamIdString = (streamId: Record<string, unknown>): string =>
+    compositeFields.map((f) => streamId[f]).join("#")
 
   // ---------------------------------------------------------------------------
   // Codec helpers — write encodes, read decodes (symmetry with Entity/Aggregate)
@@ -353,9 +489,7 @@ export const makeStream = <
       }
 
       // Resolve stream ID string for storage (join composites)
-      const streamIdStr = compositeFields
-        .map((f) => (streamId as Record<string, unknown>)[f])
-        .join("#")
+      const streamIdStr = composeStreamIdString(streamId as Record<string, unknown>)
 
       // Guard: one Put per event, plus one ConditionCheck (version-contiguity
       // guard) when expectedVersion > 0, must fit DynamoDB's TransactWriteItems
@@ -520,8 +654,12 @@ export const makeStream = <
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
+      // Versions are integers, so the inclusive lower bound `afterVersion + 1`
+      // is exactly the old exclusive `#sk > eventSk(afterVersion)`. The upper
+      // bound keeps the snapshot item (which sorts after every event) out of the
+      // scanned range.
       const query = buildEventsQuery(streamId).pipe(
-        Query.where({ gt: composeEventSk(afterVersion) }),
+        Query.where({ between: [composeEventSk(afterVersion + 1), maxEventSk] }),
       )
       return yield* Query.collect(query)
     })
@@ -534,11 +672,131 @@ export const makeStream = <
     streamId: StreamIdInput<TStreamIdFields>,
   ): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
+      // Single page, not `collect`: with `Limit: 1` DynamoDB returns a
+      // `LastEvaluatedKey` on every truncated page, so `collect` would walk the
+      // whole partition one request per item. The `begins_with` bound on
+      // `buildEventsQuery` guarantees the single evaluated item is the newest
+      // *event* (never the snapshot, which sorts last).
       const query = buildEventsQuery(streamId).pipe(Query.reverse, Query.limit(1))
-      const results = yield* Query.collect(query)
-      if (results.length === 0) return 0
-      return results[0]!.version
+      const page = yield* Query.execute(query)
+      const newest = page.items[0]
+      if (newest === undefined) return 0
+      return newest.version
     })
+
+  // ---------------------------------------------------------------------------
+  // Snapshot primitives
+  // ---------------------------------------------------------------------------
+
+  const snapshotUnavailable = (operation: string): Effect.Effect<never> =>
+    Effect.die(
+      new Error(
+        `[EDD-9026] EventStream "${config.streamName}": ${operation} requires a snapshot config. ` +
+          `Declare one with makeStream({ ..., snapshot: { schema } }).`,
+      ),
+    )
+
+  const writeSnapshot = (
+    streamId: StreamIdInput<TStreamIdFields>,
+    state: unknown,
+    asOfVersion: number,
+  ): Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      if (snapshot === undefined) return yield* snapshotUnavailable("writeSnapshot")
+
+      const client = yield* DynamoClient
+      const { name: tableName } = yield* config.table.Tag
+      const now = DateTime.formatIso(yield* DateTime.now)
+
+      const encoded = yield* Schema.encodeUnknownEffect(snapshot.schema as Schema.Schema<unknown>)(
+        state,
+      ).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ValidationError({
+              entityType: snapshotEntityType,
+              operation: "EventStore.writeSnapshot",
+              cause,
+            }),
+        ),
+      )
+
+      const item: Record<string, unknown> = {
+        pk: composeStreamPk(streamId as Record<string, unknown>),
+        sk: snapshotSk,
+        __edd_e__: snapshotEntityType,
+        streamId: composeStreamIdString(streamId as Record<string, unknown>),
+        asOfVersion,
+        state: encoded,
+        timestamp: now,
+      }
+
+      yield* client
+        .putItem({
+          TableName: tableName,
+          Item: toAttributeMap(item),
+          // Monotonic: never regress the cache. Losing this race is a no-op,
+          // not an error — the events it summarises are already durable.
+          ConditionExpression: "attribute_not_exists(#pk) OR #asOfVersion < :asOfVersion",
+          ExpressionAttributeNames: { "#pk": "pk", "#asOfVersion": "asOfVersion" },
+          ExpressionAttributeValues: toAttributeMap({ ":asOfVersion": asOfVersion }),
+        })
+        .pipe(
+          Effect.catchIf(
+            (error) => isAwsConditionalCheckFailed(error.cause),
+            () => Effect.void,
+          ),
+        )
+    }) as Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig>
+
+  const readSnapshot = (
+    streamId: StreamIdInput<TStreamIdFields>,
+  ): Effect.Effect<
+    Option.Option<Snapshot<unknown>>,
+    DynamoClientError | ValidationError,
+    DynamoClient | TableConfig
+  > =>
+    Effect.gen(function* () {
+      if (snapshot === undefined) return yield* snapshotUnavailable("readSnapshot")
+
+      const client = yield* DynamoClient
+      const { name: tableName } = yield* config.table.Tag
+
+      const result = yield* client.getItem({
+        TableName: tableName,
+        Key: toAttributeMap({
+          pk: composeStreamPk(streamId as Record<string, unknown>),
+          sk: snapshotSk,
+        }),
+        ConsistentRead: true,
+      })
+
+      if (result.Item === undefined) return Option.none<Snapshot<unknown>>()
+
+      const raw = fromAttributeMap(result.Item)
+      const state = yield* Schema.decodeUnknownEffect(snapshot.schema as Schema.Schema<unknown>)(
+        raw.state,
+      ).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ValidationError({
+              entityType: snapshotEntityType,
+              operation: "EventStore.readSnapshot",
+              cause,
+            }),
+        ),
+      )
+
+      return Option.some<Snapshot<unknown>>({
+        state,
+        asOfVersion: raw.asOfVersion as number,
+        timestamp: raw.timestamp as string,
+      })
+    }) as Effect.Effect<
+      Option.Option<Snapshot<unknown>>,
+      DynamoClientError | ValidationError,
+      DynamoClient | TableConfig
+    >
 
   // ---------------------------------------------------------------------------
   // query.events helper
@@ -557,7 +815,10 @@ export const makeStream = <
       entityTypes: [entityType],
       decoder: (raw) => decodeStreamEvent(raw),
       resolveTableName: config.table.Tag.useSync((tc: TableConfig) => tc.name),
-    })
+      // Bound to the event SK range so non-event items in the stream partition
+      // (the snapshot) are excluded at the key-condition level. A caller-supplied
+      // `Query.where` replaces this — the `__edd_e__` filter still applies.
+    }).pipe(Query.where({ beginsWith: eventSkPrefix }))
   }
 
   const queryNamespace = {
@@ -575,8 +836,15 @@ export const makeStream = <
   // runtime — the user must provide these layers.
   return {
     [EventStreamTypeId]: EventStreamTypeId,
+    pipe() {
+      // eslint-disable-next-line prefer-rest-params
+      return Pipeable.pipeArguments(this, arguments)
+    },
     streamName: config.streamName,
     eventSchema: eventUnion,
+    snapshotConfig: snapshotSettings,
+    writeSnapshot,
+    readSnapshot,
     append,
     read,
     readFrom,
@@ -585,7 +853,8 @@ export const makeStream = <
   } as unknown as EventStream<
     TEvent,
     TStreamIdFields,
-    TMetadata extends Schema.Top ? Schema.Schema.Type<TMetadata> : undefined
+    TMetadata extends Schema.Top ? Schema.Schema.Type<TMetadata> : undefined,
+    TSnapshot extends SnapshotConfig<infer TStateSchema> ? Schema.Schema.Type<TStateSchema> : never
   >
 }
 
@@ -617,10 +886,26 @@ export interface BoundEventStream<
   TEvent,
   TStreamIdFields extends ReadonlyArray<string>,
   TMetadata,
-> {
+  TState = never,
+> extends Pipeable.Pipeable {
   readonly [EventStreamTypeId]: EventStreamTypeId
   readonly streamName: string
   readonly eventSchema: Schema.Top
+
+  /** See {@link EventStream.snapshotConfig}. */
+  readonly snapshotConfig: SnapshotSettings | undefined
+
+  /** See {@link EventStream.writeSnapshot}. */
+  readonly writeSnapshot: (
+    streamId: StreamIdInput<TStreamIdFields>,
+    state: TState,
+    asOfVersion: number,
+  ) => Effect.Effect<void, DynamoClientError | ValidationError, never>
+
+  /** See {@link EventStream.readSnapshot}. */
+  readonly readSnapshot: (
+    streamId: StreamIdInput<TStreamIdFields>,
+  ) => Effect.Effect<Option.Option<Snapshot<TState>>, DynamoClientError | ValidationError, never>
 
   readonly append: (
     streamId: StreamIdInput<TStreamIdFields>,
@@ -684,10 +969,10 @@ export interface BoundEventStream<
  * yield* stream.append({ matchId: "m-1" }, [event], 0)     // R = never
  * ```
  */
-export const bind = <TEvent, TStreamIdFields extends ReadonlyArray<string>, TMetadata>(
-  stream: EventStream<TEvent, TStreamIdFields, TMetadata>,
+export const bind = <TEvent, TStreamIdFields extends ReadonlyArray<string>, TMetadata, TState>(
+  stream: EventStream<TEvent, TStreamIdFields, TMetadata, TState>,
 ): Effect.Effect<
-  BoundEventStream<TEvent, TStreamIdFields, TMetadata>,
+  BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState>,
   never,
   DynamoClient | TableConfig
 > =>
@@ -699,8 +984,16 @@ export const bind = <TEvent, TStreamIdFields extends ReadonlyArray<string>, TMet
 
     return {
       [EventStreamTypeId]: EventStreamTypeId,
+      pipe() {
+        // eslint-disable-next-line prefer-rest-params
+        return Pipeable.pipeArguments(this, arguments)
+      },
       streamName: stream.streamName,
       eventSchema: stream.eventSchema,
+      snapshotConfig: stream.snapshotConfig,
+      writeSnapshot: (streamId, state, asOfVersion) =>
+        provide(stream.writeSnapshot(streamId, state, asOfVersion)),
+      readSnapshot: (streamId) => provide(stream.readSnapshot(streamId)),
       append: (streamId, events, expectedVersion, options) =>
         provide(stream.append(streamId, events, expectedVersion, options)),
       read: (streamId) => provide(stream.read(streamId)),
@@ -708,12 +1001,29 @@ export const bind = <TEvent, TStreamIdFields extends ReadonlyArray<string>, TMet
       currentVersion: (streamId) => provide(stream.currentVersion(streamId)),
       query: stream.query,
       provide,
-    } as BoundEventStream<TEvent, TStreamIdFields, TMetadata>
+    } as BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState>
   })
 
 // ---------------------------------------------------------------------------
 // commandHandler
 // ---------------------------------------------------------------------------
+
+/**
+ * Options accepted by {@link commandHandler}.
+ */
+export interface CommandHandlerOptions {
+  /**
+   * Retry policy applied to `VersionConflict` **only**.
+   *
+   * The retried unit is the entire read–decide–append cycle, so every attempt
+   * decides against freshly read state — a blind re-append of stale events is
+   * impossible by construction.
+   *
+   * A number `n` is shorthand for `Schedule.recurs(n)` (n retries *after* the
+   * initial attempt). Omit for the default: no retry.
+   */
+  readonly retry?: number | Schedule.Schedule<unknown, VersionConflict> | undefined
+}
 
 type CommandHandler<
   State,
@@ -749,6 +1059,121 @@ type BoundCommandHandler<
   never
 >
 
+/** @internal Both `EventStream` and `BoundEventStream` carry this brand. */
+const hasEventStreamBrand = (u: unknown): boolean =>
+  typeof u === "object" && u !== null && EventStreamTypeId in u
+
+/** @internal */
+const makeCommandHandlerImpl = <
+  State,
+  Command,
+  TEvent,
+  E,
+  TStreamIdFields extends ReadonlyArray<string>,
+  TMetadata,
+>(
+  decider: Decider<State, Command, TEvent, E>,
+  stream:
+    | EventStream<TEvent, TStreamIdFields, TMetadata, any>
+    | BoundEventStream<TEvent, TStreamIdFields, TMetadata, any>,
+  options: CommandHandlerOptions | undefined,
+) => {
+  const retryPolicy = options?.retry
+  const schedule =
+    retryPolicy === undefined
+      ? undefined
+      : typeof retryPolicy === "number"
+        ? Schedule.recurs(retryPolicy)
+        : retryPolicy
+
+  return (
+    streamId: StreamIdInput<TStreamIdFields>,
+    command: Command,
+    callOptions?: { readonly metadata?: TMetadata } | undefined,
+  ) => {
+    const attempt = Effect.gen(function* () {
+      const snapshotSettings = stream.snapshotConfig
+
+      // 1. Establish the base state + version — from a snapshot plus its delta
+      //    when the stream has snapshots enabled and one exists, otherwise from
+      //    a full replay.
+      let state = decider.initialState
+      let baseVersion = 0
+      let snapshotAsOfVersion = 0
+
+      const snapshot =
+        snapshotSettings === undefined
+          ? Option.none<Snapshot<State>>()
+          : ((yield* stream.readSnapshot(streamId)) as Option.Option<Snapshot<State>>)
+
+      if (Option.isSome(snapshot)) {
+        snapshotAsOfVersion = snapshot.value.asOfVersion
+        baseVersion = snapshot.value.asOfVersion
+        state = snapshot.value.state
+        const delta = yield* stream.readFrom(streamId, snapshot.value.asOfVersion)
+        for (const event of delta) {
+          state = decider.evolve(state, event.data)
+        }
+        const newest = delta[delta.length - 1]
+        if (newest !== undefined) baseVersion = newest.version
+      } else {
+        const events = yield* stream.read(streamId)
+        for (const event of events) {
+          state = decider.evolve(state, event.data)
+        }
+        const newest = events[events.length - 1]
+        baseVersion = newest === undefined ? 0 : newest.version
+      }
+
+      // 2. Decide
+      const newEvents = yield* decider.decide(command, state)
+
+      // 3. No-op command — return current state
+      if (newEvents.length === 0) {
+        return { state, version: baseVersion, events: [] }
+      }
+
+      // 4. Append with optimistic concurrency
+      const result = yield* stream.append(streamId, newEvents, baseVersion, callOptions)
+
+      // 5. Evolve state through the new events
+      for (const event of newEvents) {
+        state = decider.evolve(state, event)
+      }
+
+      // 6. Auto-snapshot once the cadence threshold is crossed. Best-effort:
+      //    the events are already durable, so a snapshot-write failure must not
+      //    report the command as failed. The next threshold crossing retries it.
+      const every = snapshotSettings?.every
+      if (every !== undefined && result.version - snapshotAsOfVersion >= every) {
+        yield* stream
+          .writeSnapshot(streamId, state, result.version)
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning(
+                `EventStore: snapshot write failed for stream "${stream.streamName}" at version ${result.version}`,
+                cause,
+              ),
+            ),
+          )
+      }
+
+      return { state, version: result.version, events: newEvents }
+    })
+
+    return schedule === undefined
+      ? attempt
+      : Effect.retry(attempt, {
+          // `while` runs before the schedule, so the schedule only ever sees a
+          // `VersionConflict` input — the widening cast is sound. It is needed
+          // because `Retry.Options` demands a schedule whose input accepts the
+          // effect's *full* error union, and `Schedule` is contravariant on input.
+          schedule: schedule as Schedule.Schedule<unknown, unknown>,
+          while: (error: unknown) => error instanceof VersionConflict,
+        })
+  }
+}
+
 /**
  * Create a command handler that reads, decides, and appends atomically.
  *
@@ -764,80 +1189,72 @@ type BoundCommandHandler<
  *
  * // Data-last (pipe)
  * const handle = stream.pipe(EventStore.commandHandler(decider))
+ *
+ * // Retry the full read-decide-append cycle on VersionConflict
+ * const handle = EventStore.commandHandler(decider, stream, { retry: 3 })
+ * const handle2 = stream.pipe(EventStore.commandHandler(decider, { retry: 3 }))
  * ```
+ *
+ * When the stream declares a `snapshot` config, each invocation reads the
+ * snapshot and folds only the events after it, instead of replaying the stream
+ * from the beginning. With `snapshot.every` set, a fresh snapshot is written
+ * (best-effort) after a successful append once the cadence threshold is crossed.
+ *
+ * Note: this is a hand-rolled dual rather than `Function.dual` — the data
+ * argument (`stream`) is the *second* parameter, which `Function.dual` cannot
+ * express, and its numeric-arity form would silently drop `options`. Dispatch
+ * is on the `EventStreamTypeId` brand of the second argument.
  */
 export const commandHandler: {
   // Data-last overloads
   <State, Command, TEvent, E>(
     decider: Decider<State, Command, TEvent, E>,
+    options?: CommandHandlerOptions,
   ): {
-    <TStreamIdFields extends ReadonlyArray<string>, TMetadata>(
-      stream: BoundEventStream<TEvent, TStreamIdFields, TMetadata>,
+    <TStreamIdFields extends ReadonlyArray<string>, TMetadata, TState extends State>(
+      stream: BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState>,
     ): BoundCommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata>
-    <TStreamIdFields extends ReadonlyArray<string>, TMetadata>(
-      stream: EventStream<TEvent, TStreamIdFields, TMetadata>,
+    <TStreamIdFields extends ReadonlyArray<string>, TMetadata, TState extends State>(
+      stream: EventStream<TEvent, TStreamIdFields, TMetadata, TState>,
     ): CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata>
   }
 
   // Data-first: BoundEventStream → BoundCommandHandler
-  <State, Command, TEvent, E, TStreamIdFields extends ReadonlyArray<string>, TMetadata>(
+  <
+    State,
+    Command,
+    TEvent,
+    E,
+    TStreamIdFields extends ReadonlyArray<string>,
+    TMetadata,
+    TState extends State,
+  >(
     decider: Decider<State, Command, TEvent, E>,
-    stream: BoundEventStream<TEvent, TStreamIdFields, TMetadata>,
+    stream: BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState>,
+    options?: CommandHandlerOptions,
   ): BoundCommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata>
 
   // Data-first: EventStream → CommandHandler
-  <State, Command, TEvent, E, TStreamIdFields extends ReadonlyArray<string>, TMetadata>(
+  <
+    State,
+    Command,
+    TEvent,
+    E,
+    TStreamIdFields extends ReadonlyArray<string>,
+    TMetadata,
+    TState extends State,
+  >(
     decider: Decider<State, Command, TEvent, E>,
-    stream: EventStream<TEvent, TStreamIdFields, TMetadata>,
+    stream: EventStream<TEvent, TStreamIdFields, TMetadata, TState>,
+    options?: CommandHandlerOptions,
   ): CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata>
-} = Function.dual(
-  2,
-  <State, Command, TEvent, E, TStreamIdFields extends ReadonlyArray<string>, TMetadata>(
-    decider: Decider<State, Command, TEvent, E>,
-    stream:
-      | EventStream<TEvent, TStreamIdFields, TMetadata>
-      | BoundEventStream<TEvent, TStreamIdFields, TMetadata>,
-  ) =>
-    (
-      streamId: StreamIdInput<TStreamIdFields>,
-      command: Command,
-      options?: { readonly metadata?: TMetadata } | undefined,
-    ) =>
-      Effect.gen(function* () {
-        // 1. Read all events
-        const events = yield* stream.read(streamId)
-
-        // 2. Fold to current state
-        const curVersion = events.length > 0 ? events[events.length - 1]!.version : 0
-        let state = decider.initialState
-        for (const event of events) {
-          state = decider.evolve(state, event.data)
-        }
-
-        // 3. Decide
-        const newEvents = yield* decider.decide(command, state)
-
-        // 4. No-op command — return current state
-        if (newEvents.length === 0) {
-          return { state, version: curVersion, events: [] }
-        }
-
-        // 5. Append with optimistic concurrency
-        const result = yield* stream.append(
-          streamId,
-          newEvents,
-          curVersion,
-          options as { readonly metadata?: TMetadata } | undefined,
-        )
-
-        // 6. Evolve state through new events
-        for (const event of newEvents) {
-          state = decider.evolve(state, event)
-        }
-
-        return { state, version: result.version, events: newEvents }
-      }),
-)
+} = ((decider: any, streamOrOptions?: any, maybeOptions?: any) => {
+  if (hasEventStreamBrand(streamOrOptions)) {
+    return makeCommandHandlerImpl(decider, streamOrOptions, maybeOptions)
+  }
+  const options = streamOrOptions as CommandHandlerOptions | undefined
+  return (stream: any) => makeCommandHandlerImpl(decider, stream, options)
+}) as typeof commandHandler
 
 // ---------------------------------------------------------------------------
 // fold helpers
