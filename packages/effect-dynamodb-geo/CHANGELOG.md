@@ -1,5 +1,104 @@
 # @effect-dynamodb/geo
 
+## 1.12.0
+
+### Minor Changes
+
+- [#89](https://github.com/jmenga/effect-dynamodb/pull/89) [`63eaed6`](https://github.com/jmenga/effect-dynamodb/commit/63eaed62a5cad7d57c87e9fe0de5ca52f3388071) Thanks [@jmenga](https://github.com/jmenga)! - EventStore: additional transaction items in `append` + command idempotency (closes [#85](https://github.com/jmenga/effect-dynamodb/issues/85))
+
+  **`append(streamId, events, expectedVersion, { additionalItems })`** — commit caller-owned
+  transact items atomically with the event puts. `additionalItems` accepts the same op union
+  `Transaction.transactWrite` takes (`Entity.put`, `Entity.delete`, `Transaction.check`),
+  compiled through a new shared builder so the two APIs cannot drift. `EntityUpdate` remains
+  unsupported in both; it will land for both at once.
+
+  **Position-aware cancellation mapping.** Previously _any_ `ConditionalCheckFailed` in
+  `CancellationReasons` became `VersionConflict` — which, with caller-owned items in the
+  transaction, would misreport a failed user condition and send callers into a
+  read-decide-retry loop that could never succeed. Reasons are now matched by transaction
+  index, with precedence `DuplicateCommand` > `VersionConflict` >
+  `AdditionalItemConditionFailed` > `TransactionCancelled`.
+
+  **Command idempotency.** `commandHandler(decider, stream, { idempotency: { ttl? } })` plus a
+  per-call `commandId` writes a dedup sentinel guarded by `attribute_not_exists` into the same
+  transaction, co-located in the stream partition and invisible to `read` / `readFrom` /
+  `currentVersion`. A replayed `commandId` is rejected with `DuplicateCommand`. Without
+  `idempotency`, command processing remains **at-least-once** — now documented in the tutorial.
+  Configuring `idempotency` makes `commandId` required at the type level.
+
+  **Transaction size guard.** `events + additionalItems + sentinel + the version-contiguity
+ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100) before any
+  AWS call, failing with `AppendTooLarge`.
+
+  New tagged errors: `AdditionalItemConditionFailed`, `DuplicateCommand` (both exported from
+  `effect-dynamodb` and `@effect-dynamodb/schema`).
+
+  Also fixes the data-last (pipeable) form of `EventStore.commandHandler`, which passed the
+  stream and decider to the implementation in swapped order and could never have worked.
+
+  **Type-level note:** `append`'s error channel now unconditionally includes
+  `DuplicateCommand | AdditionalItemConditionFailed | AppendTooLarge`, rather than varying
+  with the options passed. `Effect.catchTag` / `catchTags` callers are unaffected; a caller
+  exhaustively matching on `append`'s error union will need three more cases.
+
+- [#87](https://github.com/jmenga/effect-dynamodb/pull/87) [`f846367`](https://github.com/jmenga/effect-dynamodb/commit/f846367a541fefb9c29f40684f87f89c8333745b) Thanks [@jmenga](https://github.com/jmenga)! - EventStore: guard `append` against TransactWriteItems limits and expectedVersion-ahead version gaps ([#82](https://github.com/jmenga/effect-dynamodb/issues/82))
+  - New `AppendTooLarge` tagged error and `TRANSACT_WRITE_ITEMS_LIMIT` constant, exported from both `@effect-dynamodb/schema` and `effect-dynamodb`. `append` now pre-validates the transact-item count and fails with `AppendTooLarge` before issuing any request instead of surfacing a raw AWS validation error. The batch is deliberately never chunked — chunking would break append atomicity.
+  - `append` now enforces version contiguity. When `expectedVersion > 0` the transaction carries a `ConditionCheck` requiring the event at exactly `expectedVersion` to exist, so an _ahead_ expected version fails with `VersionConflict` instead of silently writing past the stream head and leaving a permanent gap in the version sequence. The check occupies one transact item, so a single append holds up to 100 events at `expectedVersion === 0` and up to 99 otherwise.
+
+- [#90](https://github.com/jmenga/effect-dynamodb/pull/90) [`5127a60`](https://github.com/jmenga/effect-dynamodb/commit/5127a606049d89da5de92b44f74dc2182e8b4418) Thanks [@jmenga](https://github.com/jmenga)! - EventStore: snapshot support and a `commandHandler` retry option ([#84](https://github.com/jmenga/effect-dynamodb/issues/84)).
+  - **Snapshots** — opt in with `makeStream({ ..., snapshot: { schema, every? } })`. One
+    snapshot item per stream lives in the stream partition under a distinct sort key
+    (`$<schema>#v<n>#<stream>.snapshot`) that can never collide with an event sort key.
+    State round-trips through the supplied schema (encode on write, decode on read), so
+    transforming schemas work. New primitives: `writeSnapshot` / `readSnapshot` (also on
+    `BoundEventStream`). Snapshot writes are monotonic — losing the race is a no-op, never
+    a cache regression.
+  - **Snapshot-aware `commandHandler`** — when a stream declares `snapshot`, each command
+    runs `readSnapshot → readFrom(asOfVersion) → foldFrom → decide → append` instead of a
+    full replay. With `every: N`, a fresh snapshot is written (best-effort) after a
+    successful append once N events have accumulated since the last one.
+  - **Retry** — `commandHandler(decider, stream, { retry })` accepts a max-attempts number
+    or an Effect `Schedule`. On `VersionConflict` the **full** read-decide-append cycle
+    re-runs, so every attempt decides against fresh state; a blind re-append is impossible
+    by construction. Domain and infrastructure errors are never retried. Default: no retry.
+  - **Event reads are SK-range hardened** — `read` / `readFrom` / `currentVersion` /
+    `query.events` now bound the key condition to the event sort-key range instead of
+    relying on the `__edd_e__` filter alone (DynamoDB applies `Limit` before
+    `FilterExpression`). `currentVersion` also switched from `Query.collect` to the
+    single-page terminal — it previously walked the whole partition one request per item.
+  - **Fixed: `commandHandler`'s data-last form.** It was declared with `Function.dual`,
+    whose data-last path assumes the data is the _first_ parameter — here the stream is the
+    second, so `stream.pipe(commandHandler(decider))` passed the arguments swapped and threw.
+    Replaced with a dispatch on the stream's `EventStreamTypeId` brand. `EventStream` and
+    `BoundEventStream` are now `Pipeable`.
+  - New: `DynamoSchema.composeEventVersionKeyPrefix` and `DynamoSchema.MAX_EVENT_VERSION`.
+
+  Fully backward compatible: streams without `snapshot` and handlers without options behave
+  exactly as before.
+
+### Patch Changes
+
+- [#88](https://github.com/jmenga/effect-dynamodb/pull/88) [`f903422`](https://github.com/jmenga/effect-dynamodb/commit/f90342267928cdc0cb50d0d4ef522dc54689de1a) Thanks [@jmenga](https://github.com/jmenga)! - fix(eventstore): codec symmetry — encode on write, decode on read
+
+  `EventStore.append` previously spread the event instance and marshalled it raw,
+  so any event schema carrying a transformation (`Schema.DateTimeUtc`,
+  `Schema.Date`, branded transforms, fields with defaults) stored its **runtime**
+  representation and then failed or drifted when the read path decoded it.
+  Events are now run through `Schema.encode` before marshalling, mirroring the
+  Entity/Aggregate write path.
+
+  Metadata had the same asymmetry — validated with `Schema.decode` on write and
+  returned via a raw cast on read. It is now encoded on write and decoded on
+  read, so `StreamEvent.metadata` is the decoded schema type.
+
+  The persisted event envelope (`streamId`, `version`, `eventType`, `timestamp`)
+  is decoded through a schema instead of unchecked casts. Encode failures map to
+  `ValidationError` with `operation: "EventStore.append"` (or
+  `"EventStore.append.metadata"`).
+
+  The injected `_tag` on stored event data keeps working for both `Schema.Class`
+  and `Schema.TaggedClass` events.
+
 ## 1.11.0
 
 ### Minor Changes
