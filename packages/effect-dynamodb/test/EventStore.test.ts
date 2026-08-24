@@ -1,7 +1,7 @@
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DynamoError, VersionConflict } from "@effect-dynamodb/schema/Errors.js"
-import { Data, Effect, Layer, Schema } from "effect"
+import { Data, DateTime, Effect, Layer, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as EventStore from "../src/EventStore.js"
@@ -918,6 +918,213 @@ describe("EventStore", () => {
       const key = DynamoSchema.composeEventVersionKey(AppSchema, "match.event", 9999999999)
       expect(key).toBe("$cricket#v1#match.event_1#9999999999")
     })
+  })
+
+  // -------------------------------------------------------------------------
+  // Codec symmetry (issue #81) — encode on write, decode on read
+  // -------------------------------------------------------------------------
+
+  describe("codec symmetry (issue #81)", () => {
+    const epochMs = 1704067200000 // 2024-01-01T00:00:00.000Z
+    const isoString = "2024-01-01T00:00:00.000Z"
+
+    class GoalScored extends Schema.Class<GoalScored>("GoalScored")({
+      scorer: Schema.String,
+      occurredAt: Schema.DateTimeUtcFromString,
+    }) {}
+
+    class MatchAbandoned extends Schema.TaggedClass<MatchAbandoned>()("MatchAbandoned", {
+      reason: Schema.String,
+      abandonedAt: Schema.DateTimeUtcFromString,
+    }) {}
+
+    const GoalStream = EventStore.makeStream({
+      table: EventsTable,
+      streamName: "Goal",
+      events: [GoalScored, MatchAbandoned],
+      streamId: { composite: ["matchId"] },
+      metadata: Schema.Struct({
+        correlationId: Schema.String,
+        recordedAt: Schema.DateTimeUtcFromString,
+      }),
+    })
+
+    it.effect("append encodes transform event fields to wire form", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* GoalStream.append(
+          { matchId: "g-1" },
+          [new GoalScored({ scorer: "Kane", occurredAt: DateTime.makeUnsafe(epochMs) })],
+          0,
+        )
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        const item = fromAttributeMap(call.TransactItems[0].Put.Item)
+        // Wire form is the encoded ISO string, not a marshalled DateTime instance.
+        expect(item.data).toEqual({
+          _tag: "GoalScored",
+          scorer: "Kane",
+          occurredAt: isoString,
+        })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("append encodes transform metadata fields to wire form", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* GoalStream.append(
+          { matchId: "g-1" },
+          [new GoalScored({ scorer: "Kane", occurredAt: DateTime.makeUnsafe(epochMs) })],
+          0,
+          { metadata: { correlationId: "corr-1", recordedAt: DateTime.makeUnsafe(epochMs) } },
+        )
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        const item = fromAttributeMap(call.TransactItems[0].Put.Item)
+        expect(item.metadata).toEqual({ correlationId: "corr-1", recordedAt: isoString })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("transforming event schema round-trips append → read", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* GoalStream.append(
+          { matchId: "g-1" },
+          [new GoalScored({ scorer: "Kane", occurredAt: DateTime.makeUnsafe(epochMs) })],
+          0,
+          { metadata: { correlationId: "corr-1", recordedAt: DateTime.makeUnsafe(epochMs) } },
+        )
+
+        // Feed the exact stored item back through the read path.
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        mockQuery.mockResolvedValue({ Items: [call.TransactItems[0].Put.Item] })
+
+        const events = yield* GoalStream.read({ matchId: "g-1" })
+
+        expect(events).toHaveLength(1)
+        const event = events[0]!
+        expect(event.version).toBe(1)
+        expect(event.eventType).toBe("GoalScored")
+        expect(event.data).toBeInstanceOf(GoalScored)
+        const goal = event.data as GoalScored
+        expect(DateTime.isDateTime(goal.occurredAt)).toBe(true)
+        expect(DateTime.toEpochMillis(goal.occurredAt)).toBe(epochMs)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("metadata round-trips append → read (decoded, not raw)", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* GoalStream.append(
+          { matchId: "g-1" },
+          [new GoalScored({ scorer: "Kane", occurredAt: DateTime.makeUnsafe(epochMs) })],
+          0,
+          { metadata: { correlationId: "corr-1", recordedAt: DateTime.makeUnsafe(epochMs) } },
+        )
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        mockQuery.mockResolvedValue({ Items: [call.TransactItems[0].Put.Item] })
+
+        const events = yield* GoalStream.read({ matchId: "g-1" })
+
+        const metadata = events[0]!.metadata
+        expect(metadata).toBeDefined()
+        expect(metadata!.correlationId).toBe("corr-1")
+        expect(DateTime.isDateTime(metadata!.recordedAt)).toBe(true)
+        expect(DateTime.toEpochMillis(metadata!.recordedAt)).toBe(epochMs)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("Schema.TaggedClass events keep their _tag through append → read", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* GoalStream.append(
+          { matchId: "g-1" },
+          [new MatchAbandoned({ reason: "rain", abandonedAt: DateTime.makeUnsafe(epochMs) })],
+          0,
+        )
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        const item = fromAttributeMap(call.TransactItems[0].Put.Item)
+        expect(item.eventType).toBe("MatchAbandoned")
+        expect(item.data).toEqual({
+          _tag: "MatchAbandoned",
+          reason: "rain",
+          abandonedAt: isoString,
+        })
+
+        mockQuery.mockResolvedValue({ Items: [call.TransactItems[0].Put.Item] })
+        const events = yield* GoalStream.read({ matchId: "g-1" })
+        expect(events[0]!.data).toBeInstanceOf(MatchAbandoned)
+        const abandoned = events[0]!.data as MatchAbandoned
+        expect(abandoned._tag).toBe("MatchAbandoned")
+        expect(DateTime.toEpochMillis(abandoned.abandonedAt)).toBe(epochMs)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("event encode failure maps to ValidationError with EventStore.append", () =>
+      Effect.gen(function* () {
+        const error = yield* GoalStream.append(
+          { matchId: "g-1" },
+          // Invalid in both Type and Encoded shape — encode and fallback fail.
+          [{ scorer: 42, occurredAt: "not-a-date" } as unknown as GoalScored],
+          0,
+        ).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect((error as { operation: string }).operation).toBe("EventStore.append")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("metadata encode failure maps to ValidationError", () =>
+      Effect.gen(function* () {
+        const error = yield* GoalStream.append(
+          { matchId: "g-1" },
+          [new GoalScored({ scorer: "Kane", occurredAt: DateTime.makeUnsafe(epochMs) })],
+          0,
+          {
+            metadata: { correlationId: 42, recordedAt: "bogus" } as unknown as {
+              correlationId: string
+              recordedAt: DateTime.Utc
+            },
+          },
+        ).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect((error as { operation: string }).operation).toBe("EventStore.append.metadata")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("malformed envelope fails read with ValidationError", () =>
+      Effect.gen(function* () {
+        // Item missing the `version` envelope field.
+        mockQuery.mockResolvedValue({
+          Items: [
+            toAttributeMap({
+              pk: "$cricket#v1#match#m-1",
+              sk: DynamoSchema.composeEventVersionKey(AppSchema, "match.event", 1),
+              __edd_e__: "match.event",
+              streamId: "m-1",
+              eventType: "MatchStarted",
+              data: { _tag: "MatchStarted", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
+              timestamp: "2026-03-08T12:00:00.000Z",
+            }),
+          ],
+        })
+
+        const error = yield* MatchEvents.read({ matchId: "m-1" }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect((error as { operation: string }).operation).toBe("EventStore.decode")
+      }).pipe(Effect.provide(TestLayer)),
+    )
   })
 
   // -------------------------------------------------------------------------
