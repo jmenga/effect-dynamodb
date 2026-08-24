@@ -309,3 +309,30 @@ export const composeEventVersionKey = (
   const { pre, label: type } = resolveKeyPrefix(schema, entityType, options)
   return `${pre}#${type}_1#${String(version).padStart(10, "0")}`
 }
+
+/**
+ * The maximum event version representable by {@link composeEventVersionKey}'s
+ * 10-digit zero-padded encoding. Used as the inclusive upper bound of event
+ * sort-key ranges.
+ */
+export const MAX_EVENT_VERSION = 9_999_999_999
+
+/**
+ * Compose the event version key prefix for `begins_with` queries.
+ *
+ * Format: `$<schema>#v<version>#<entityType>_1#`
+ *
+ * Every event sort key produced by {@link composeEventVersionKey} begins with
+ * this prefix, and no other key shape in the partition does — so it bounds an
+ * event query to event items at the key-condition level rather than relying on
+ * the `__edd_e__` FilterExpression alone (which DynamoDB applies *after*
+ * `Limit`).
+ */
+export const composeEventVersionKeyPrefix = (
+  schema: DynamoSchema,
+  entityType: string,
+  options?: { readonly casing?: Casing | undefined } | undefined,
+): string => {
+  const { pre, label: type } = resolveKeyPrefix(schema, entityType, options)
+  return `${pre}#${type}_1#`
+}

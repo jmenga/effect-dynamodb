@@ -31,13 +31,16 @@ export type {
 } from "./Entity.js"
 export * as Entity from "./Entity.js"
 export {
+  AdditionalItemConditionFailed,
   AggregateAssemblyError,
   AggregateDecompositionError,
   AggregateTransactionOverflow,
+  AppendTooLarge,
   CascadePartialFailure,
   CompositeKeyHoleError,
   CompositeNullableError,
   ConditionalCheckFailed,
+  DuplicateCommand,
   DynamoError,
   DynamoValidationError,
   EmbeddingError,
@@ -52,6 +55,7 @@ export {
   ResourceNotFoundError,
   StaleAppend,
   ThrottlingError,
+  TRANSACT_WRITE_ITEMS_LIMIT,
   TransactionCancelled,
   TransactionOverflow,
   UniqueConstraintViolation,

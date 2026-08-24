@@ -13,7 +13,18 @@
  */
 
 import { it } from "@effect/vitest"
-import { Config, DateTime, Duration, Effect, Layer, Option, Schema, Stream } from "effect"
+import {
+  Config,
+  Data,
+  DateTime,
+  Duration,
+  Effect,
+  Layer,
+  Option,
+  Schema,
+  SchemaGetter,
+  Stream,
+} from "effect"
 import { TestClock } from "effect/testing"
 import { afterAll, beforeAll, describe, expect } from "vitest"
 
@@ -30,11 +41,18 @@ import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
+import type {
+  AdditionalItemConditionFailed,
+  DuplicateCommand,
+  VersionConflict,
+} from "@effect-dynamodb/schema/Errors.js"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
+import * as EventStore from "../src/EventStore.js"
 import * as Expression from "../src/Expression.js"
+import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
@@ -5959,5 +5977,1052 @@ describeConnected("vector search — soft delete round trip (closes #78)", () =>
       expect(after.map((h) => h.item.docId)).toEqual(["d-soft"])
       expect(after[0]!.similarity).toBeCloseTo(before[0]!.similarity, 10)
     }).pipe(provideSoftVec),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// EventStore — codec symmetry + real cancellation mapping (closes #81)
+// ---------------------------------------------------------------------------
+//
+// EventStore previously had ZERO connected coverage: every assertion ran
+// against a stubbed client with a hand-crafted `CancellationReasons` array.
+// These tests exercise the real DynamoDB wire format and the real
+// `TransactionCanceledException` shapes DynamoDB emits.
+
+const EsSchema = DynamoSchema.make({ name: "es-connected", version: 1 })
+
+class EsGoalScored extends Schema.Class<EsGoalScored>("EsGoalScored")({
+  scorer: Schema.String,
+  occurredAt: Schema.DateTimeUtcFromString,
+}) {}
+
+class EsMatchAbandoned extends Schema.TaggedClass<EsMatchAbandoned>()("EsMatchAbandoned", {
+  reason: Schema.String,
+  abandonedAt: Schema.DateTimeUtcFromString,
+}) {}
+
+const EsMetadata = Schema.Struct({
+  correlationId: Schema.String,
+  recordedAt: Schema.DateTimeUtcFromString,
+})
+
+const EsTable = Table.make({ schema: EsSchema })
+const esTableName = `es-events-${Date.now()}`
+const EsStream = EventStore.makeStream({
+  table: EsTable,
+  streamName: "EsMatch",
+  events: [EsGoalScored, EsMatchAbandoned],
+  streamId: { composite: ["matchId"] },
+  metadata: EsMetadata,
+})
+const EsTestLayer = Layer.mergeAll(ClientLayer, EsTable.layer({ name: esTableName }))
+const provideEs = Effect.provide(EsTestLayer)
+
+// A second table whose partition key is declared as a NUMBER. EventStore always
+// writes a string `pk`, so every Put in the transaction is cancelled by real
+// DynamoDB with `Code: "ValidationError"` — a genuine, non-ConditionalCheckFailed
+// cancellation reason produced by the service rather than hand-crafted in a mock.
+const EsBadKeyTable = Table.make({ schema: EsSchema })
+const esBadKeyTableName = `es-badkey-${Date.now()}`
+const EsBadKeyStream = EventStore.makeStream({
+  table: EsBadKeyTable,
+  streamName: "EsBadKey",
+  events: [EsGoalScored],
+  streamId: { composite: ["matchId"] },
+})
+const EsBadKeyLayer = Layer.mergeAll(ClientLayer, EsBadKeyTable.layer({ name: esBadKeyTableName }))
+const provideEsBadKey = Effect.provide(EsBadKeyLayer)
+
+const esStreamPk = (matchId: string) => DynamoSchema.composeKey(EsSchema, "esmatch", [matchId])
+
+describeConnected("EventStore connected tests (closes #81)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: esTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: "sk", AttributeType: "S" },
+          ],
+        })
+        yield* client.createTable({
+          TableName: esBadKeyTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          // Deliberate mismatch: EventStore writes `pk` as a string.
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "N" },
+            { AttributeName: "sk", AttributeType: "S" },
+          ],
+        })
+      }).pipe(provideEs, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: esTableName }).pipe(Effect.catch(() => Effect.void))
+        yield* client
+          .deleteTable({ TableName: esBadKeyTableName })
+          .pipe(Effect.catch(() => Effect.void))
+      }).pipe(provideEs, Effect.scoped),
+    )
+  }, 20000)
+
+  // -------------------------------------------------------------------------
+  // Codec symmetry against real DynamoDB
+  // -------------------------------------------------------------------------
+
+  it.effect("transforming event + metadata schemas round-trip append → read", () =>
+    Effect.gen(function* () {
+      const occurredAt = DateTime.makeUnsafe("2026-05-04T09:30:00.000Z")
+      const recordedAt = DateTime.makeUnsafe("2026-05-04T09:31:00.000Z")
+
+      yield* EsStream.append(
+        { matchId: "rt-1" },
+        [
+          new EsGoalScored({ scorer: "Kane", occurredAt }),
+          new EsMatchAbandoned({ reason: "rain", abandonedAt: occurredAt }),
+        ],
+        0,
+        { metadata: { correlationId: "corr-rt-1", recordedAt } },
+      )
+
+      // 1. The bytes actually stored are the ENCODED (wire) form — ISO strings,
+      //    not a marshalled `DateTime.Utc` instance.
+      const client = yield* DynamoClient
+      const raw = yield* client.query({
+        TableName: esTableName,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: esStreamPk("rt-1") } },
+      })
+      const stored = (raw.Items ?? []).map((i) => fromAttributeMap(i))
+      expect(stored).toHaveLength(2)
+      expect(stored[0]!.data).toEqual({
+        _tag: "EsGoalScored",
+        scorer: "Kane",
+        occurredAt: "2026-05-04T09:30:00.000Z",
+      })
+      expect(stored[0]!.metadata).toEqual({
+        correlationId: "corr-rt-1",
+        recordedAt: "2026-05-04T09:31:00.000Z",
+      })
+      expect(stored[1]!.data).toEqual({
+        _tag: "EsMatchAbandoned",
+        reason: "rain",
+        abandonedAt: "2026-05-04T09:30:00.000Z",
+      })
+
+      // 2. The read path decodes back to the domain types.
+      const events = yield* EsStream.read({ matchId: "rt-1" })
+      expect(events.map((e) => e.version)).toEqual([1, 2])
+      expect(events.map((e) => e.eventType)).toEqual(["EsGoalScored", "EsMatchAbandoned"])
+
+      const goal = events[0]!.data as EsGoalScored
+      expect(goal).toBeInstanceOf(EsGoalScored)
+      expect(DateTime.isDateTime(goal.occurredAt)).toBe(true)
+      expect(DateTime.toEpochMillis(goal.occurredAt)).toBe(DateTime.toEpochMillis(occurredAt))
+
+      const abandoned = events[1]!.data as EsMatchAbandoned
+      expect(abandoned).toBeInstanceOf(EsMatchAbandoned)
+      expect(abandoned._tag).toBe("EsMatchAbandoned")
+      expect(DateTime.toEpochMillis(abandoned.abandonedAt)).toBe(DateTime.toEpochMillis(occurredAt))
+
+      // 3. Metadata is DECODED on read, not returned as a raw attribute map.
+      const metadata = events[0]!.metadata
+      expect(metadata?.correlationId).toBe("corr-rt-1")
+      expect(DateTime.isDateTime(metadata?.recordedAt as DateTime.Utc)).toBe(true)
+      expect(DateTime.toEpochMillis(metadata?.recordedAt as DateTime.Utc)).toBe(
+        DateTime.toEpochMillis(recordedAt),
+      )
+    }).pipe(provideEs),
+  )
+
+  // -------------------------------------------------------------------------
+  // Optimistic concurrency against real DynamoDB
+  // -------------------------------------------------------------------------
+
+  it.effect(
+    "two concurrent appends at the same expectedVersion → 1 success, 1 VersionConflict",
+    () =>
+      Effect.gen(function* () {
+        const occurredAt = DateTime.makeUnsafe("2026-05-04T10:00:00.000Z")
+        const attempt = (scorer: string) =>
+          EsStream.append({ matchId: "cc-1" }, [new EsGoalScored({ scorer, occurredAt })], 0).pipe(
+            Effect.map(() => "ok" as const),
+            Effect.catch((error) => Effect.succeed(error._tag)),
+          )
+
+        const outcomes = yield* Effect.all([attempt("Kane"), attempt("Son")], {
+          concurrency: "unbounded",
+        })
+
+        expect(outcomes.filter((o) => o === "ok")).toHaveLength(1)
+        expect(outcomes.filter((o) => o === "VersionConflict")).toHaveLength(1)
+
+        // Exactly one event landed — the loser wrote nothing.
+        const events = yield* EsStream.read({ matchId: "cc-1" })
+        expect(events).toHaveLength(1)
+        expect(yield* EsStream.currentVersion({ matchId: "cc-1" })).toBe(1)
+      }).pipe(provideEs),
+  )
+
+  it.effect("real mixed-reason cancellation [ConditionalCheckFailed, None] → VersionConflict", () =>
+    Effect.gen(function* () {
+      const occurredAt = DateTime.makeUnsafe("2026-05-04T11:00:00.000Z")
+      yield* EsStream.append(
+        { matchId: "mx-1" },
+        [new EsGoalScored({ scorer: "Kane", occurredAt })],
+        0,
+      )
+
+      // Two events at a stale expectedVersion: the first Put collides with the
+      // existing v1 (ConditionalCheckFailed), the second targets a free v2 and
+      // is reported by DynamoDB as `Code: "None"`. That heterogeneous reasons
+      // array is exactly what a hand-crafted mock never produces.
+      const error = yield* EsStream.append(
+        { matchId: "mx-1" },
+        [
+          new EsGoalScored({ scorer: "Son", occurredAt }),
+          new EsGoalScored({ scorer: "Maddison", occurredAt }),
+        ],
+        0,
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("VersionConflict")
+      expect((error as { expectedVersion: number }).expectedVersion).toBe(0)
+
+      // Nothing was written — the whole transaction rolled back.
+      const events = yield* EsStream.read({ matchId: "mx-1" })
+      expect(events).toHaveLength(1)
+      expect((events[0]!.data as EsGoalScored).scorer).toBe("Kane")
+    }).pipe(provideEs),
+  )
+
+  it.effect("non-conditional cancellation reason → TransactionCancelled", () =>
+    Effect.gen(function* () {
+      const occurredAt = DateTime.makeUnsafe("2026-05-04T12:00:00.000Z")
+      const error = yield* EsBadKeyStream.append(
+        { matchId: "bad-1" },
+        [new EsGoalScored({ scorer: "Kane", occurredAt })],
+        0,
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("TransactionCancelled")
+      const cancelled = error as { operation: string; reasons: ReadonlyArray<{ code?: string }> }
+      expect(cancelled.operation).toBe("TransactWriteItems")
+      // DynamoDB cancels the item with a ValidationError, not a conditional
+      // check failure — so it must NOT be flattened into a VersionConflict.
+      expect(cancelled.reasons.map((r) => r.code)).toContain("ValidationError")
+      expect(cancelled.reasons.map((r) => r.code)).not.toContain("ConditionalCheckFailed")
+    }).pipe(provideEsBadKey),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// EventStore append guards (closes #82)
+// ---------------------------------------------------------------------------
+
+class EsMatchStarted extends Schema.Class<EsMatchStarted>("EsMatchStarted")({
+  venue: Schema.String,
+}) {}
+
+class EsInningsCompleted extends Schema.Class<EsInningsCompleted>("EsInningsCompleted")({
+  innings: Schema.Number,
+  runs: Schema.Number,
+}) {}
+
+const esGuardSchema = DynamoSchema.make({ name: "es-test", version: 1 })
+const esGuardTableName = `es-test-${Date.now()}`
+const EsGuardTable = Table.make({ schema: esGuardSchema })
+
+const EsMatchEvents = EventStore.makeStream({
+  table: EsGuardTable,
+  streamName: "EsMatch",
+  events: [EsMatchStarted, EsInningsCompleted],
+  streamId: { composite: ["matchId"] },
+})
+
+const EsGuardTestLayer = Layer.mergeAll(ClientLayer, EsGuardTable.layer({ name: esGuardTableName }))
+const provideEsGuard = Effect.provide(EsGuardTestLayer)
+
+describeConnected("EventStore append guards (closes #82)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: esGuardTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: "sk", AttributeType: "S" },
+          ],
+        })
+      }).pipe(provideEsGuard, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: esGuardTableName })
+      }).pipe(
+        provideEsGuard,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect(
+    "sequential appends at the correct expectedVersion succeed through the contiguity check",
+    () =>
+      Effect.gen(function* () {
+        const r1 = yield* EsMatchEvents.append(
+          { matchId: "es-seq" },
+          [new EsMatchStarted({ venue: "MCG" })],
+          0,
+        )
+        expect(r1.version).toBe(1)
+
+        // expectedVersion > 0 → the ConditionCheck on event v1 must pass
+        const r2 = yield* EsMatchEvents.append(
+          { matchId: "es-seq" },
+          [
+            new EsInningsCompleted({ innings: 1, runs: 250 }),
+            new EsInningsCompleted({ innings: 2, runs: 180 }),
+          ],
+          1,
+        )
+        expect(r2.version).toBe(3)
+
+        const events = yield* EsMatchEvents.read({ matchId: "es-seq" })
+        expect(events.map((e) => e.version)).toEqual([1, 2, 3])
+      }).pipe(provideEsGuard),
+  )
+
+  it.effect("append at an AHEAD expectedVersion fails with VersionConflict and writes no gap", () =>
+    Effect.gen(function* () {
+      yield* EsMatchEvents.append(
+        { matchId: "es-ahead" },
+        [new EsMatchStarted({ venue: "SCG" })],
+        0,
+      )
+
+      // Stream head is at version 1; expectedVersion 10 would silently write
+      // version 11 without the contiguity ConditionCheck.
+      const error = yield* EsMatchEvents.append(
+        { matchId: "es-ahead" },
+        [new EsInningsCompleted({ innings: 1, runs: 300 })],
+        10,
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("VersionConflict")
+      const conflict = error as VersionConflict
+      expect(conflict.streamName).toBe("EsMatch")
+      expect(conflict.streamId).toBe("es-ahead")
+      expect(conflict.expectedVersion).toBe(10)
+
+      // Nothing was written — the stream is still contiguous at version 1.
+      const events = yield* EsMatchEvents.read({ matchId: "es-ahead" })
+      expect(events.map((e) => e.version)).toEqual([1])
+    }).pipe(provideEsGuard),
+  )
+
+  it.effect(
+    "append at a positive expectedVersion on an EMPTY stream fails with VersionConflict",
+    () =>
+      Effect.gen(function* () {
+        const error = yield* EsMatchEvents.append(
+          { matchId: "es-empty" },
+          [new EsMatchStarted({ venue: "Lord's" })],
+          5,
+        ).pipe(Effect.flip)
+
+        expect(error._tag).toBe("VersionConflict")
+        expect((error as VersionConflict).expectedVersion).toBe(5)
+
+        const events = yield* EsMatchEvents.read({ matchId: "es-empty" })
+        expect(events).toEqual([])
+      }).pipe(provideEsGuard),
+  )
+
+  it.effect(
+    "STALE expectedVersion still maps to VersionConflict with the contiguity check present",
+    () =>
+      Effect.gen(function* () {
+        yield* EsMatchEvents.append(
+          { matchId: "es-stale" },
+          [new EsMatchStarted({ venue: "Eden Gardens" })],
+          0,
+        )
+        yield* EsMatchEvents.append(
+          { matchId: "es-stale" },
+          [new EsInningsCompleted({ innings: 1, runs: 200 })],
+          1,
+        )
+
+        // Stream head is at version 2. Appending again at expectedVersion 1:
+        // the ConditionCheck (event v1 exists) passes, but the Put at v2
+        // collides — the cancellation must still surface as VersionConflict.
+        const staleAtOne = yield* EsMatchEvents.append(
+          { matchId: "es-stale" },
+          [new EsInningsCompleted({ innings: 1, runs: 999 })],
+          1,
+        ).pipe(Effect.flip)
+        expect(staleAtOne._tag).toBe("VersionConflict")
+        expect((staleAtOne as VersionConflict).expectedVersion).toBe(1)
+
+        // Stale at expectedVersion 0 (no ConditionCheck item) also conflicts.
+        const staleAtZero = yield* EsMatchEvents.append(
+          { matchId: "es-stale" },
+          [new EsMatchStarted({ venue: "Duplicate" })],
+          0,
+        ).pipe(Effect.flip)
+        expect(staleAtZero._tag).toBe("VersionConflict")
+
+        const events = yield* EsMatchEvents.read({ matchId: "es-stale" })
+        expect(events.map((e) => e.version)).toEqual([1, 2])
+      }).pipe(provideEsGuard),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// EventStore snapshots + commandHandler retry (closes #84)
+// ---------------------------------------------------------------------------
+
+const esSnapSchema = DynamoSchema.make({ name: "es-snap", version: 1 })
+const esSnapTableName = `es-snap-${Date.now()}`
+const EsSnapTable = Table.make({ schema: esSnapSchema })
+
+// TaggedClass, not Class: the two events are structurally identical, so an
+// untagged union would decode every `Withdrew` back as a `Deposited`.
+class Deposited extends Schema.TaggedClass<Deposited>()("Deposited", {
+  amount: Schema.Number,
+}) {}
+
+class Withdrew extends Schema.TaggedClass<Withdrew>()("Withdrew", {
+  amount: Schema.Number,
+}) {}
+
+type LedgerEvent = Deposited | Withdrew
+
+interface LedgerState {
+  readonly balance: number
+  readonly txCount: number
+}
+
+/**
+ * Deliberately *transforming*: the balance is stored as a `"cents:<n>"` string,
+ * so a snapshot that skipped `Schema.encodeUnknownEffect` / `decodeUnknownEffect`
+ * would fail to round-trip against real DynamoDB.
+ */
+const BalanceFromCents = Schema.String.pipe(
+  Schema.decodeTo(Schema.Number, {
+    decode: SchemaGetter.transform((s: string) => Number(s.replace("cents:", ""))),
+    encode: SchemaGetter.transform((n: number) => `cents:${n}`),
+  }),
+)
+
+const LedgerStateSchema = Schema.Struct({
+  balance: BalanceFromCents,
+  txCount: Schema.Number,
+})
+
+class InsufficientFunds extends Data.TaggedError("InsufficientFunds")<{
+  readonly balance: number
+}> {}
+
+type LedgerCommand =
+  | { readonly _tag: "Deposit"; readonly amount: number }
+  | { readonly _tag: "Withdraw"; readonly amount: number }
+
+const ledgerDecider: EventStore.Decider<
+  LedgerState,
+  LedgerCommand,
+  LedgerEvent,
+  InsufficientFunds
+> = {
+  initialState: { balance: 0, txCount: 0 },
+  decide: (command, state) =>
+    Effect.gen(function* () {
+      if (command._tag === "Deposit") return [new Deposited({ amount: command.amount })]
+      if (state.balance < command.amount) {
+        return yield* new InsufficientFunds({ balance: state.balance })
+      }
+      return [new Withdrew({ amount: command.amount })]
+    }),
+  evolve: (state, event) =>
+    event instanceof Deposited
+      ? { balance: state.balance + event.amount, txCount: state.txCount + 1 }
+      : { balance: state.balance - event.amount, txCount: state.txCount + 1 },
+}
+
+/** No snapshots — the pre-#84 baseline. */
+const PlainLedger = EventStore.makeStream({
+  table: EsSnapTable,
+  streamName: "Plain",
+  events: [Deposited, Withdrew],
+  streamId: { composite: ["accountId"] },
+})
+
+/** Snapshots enabled, auto-snapshot every 3 events. */
+const SnapLedger = EventStore.makeStream({
+  table: EsSnapTable,
+  streamName: "Snap",
+  events: [Deposited, Withdrew],
+  streamId: { composite: ["accountId"] },
+  snapshot: { schema: LedgerStateSchema, every: 3 },
+})
+
+const EsSnapTestLayer = Layer.mergeAll(ClientLayer, EsSnapTable.layer({ name: esSnapTableName }))
+const provideEsSnap = Effect.provide(EsSnapTestLayer)
+
+describeConnected("EventStore snapshots + retry (closes #84)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: esSnapTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: "sk", AttributeType: "S" },
+          ],
+        })
+      }).pipe(provideEsSnap, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: esSnapTableName })
+      }).pipe(
+        provideEsSnap,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("snapshot round-trips through a transforming state schema", () =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+
+      yield* SnapLedger.writeSnapshot({ accountId: "rt-1" }, { balance: 4200, txCount: 7 }, 7)
+
+      const read = yield* SnapLedger.readSnapshot({ accountId: "rt-1" })
+      expect(Option.isSome(read)).toBe(true)
+      const snapshot = Option.getOrThrow(read)
+      expect(snapshot.state).toEqual({ balance: 4200, txCount: 7 })
+      expect(snapshot.asOfVersion).toBe(7)
+      expect(typeof snapshot.timestamp).toBe("string")
+
+      // The *stored* form is the encoded one — proves encode-on-write happened.
+      const raw = yield* client.getItem({
+        TableName: esSnapTableName,
+        Key: {
+          pk: { S: "$es-snap#v1#snap#rt-1" },
+          sk: { S: "$es-snap#v1#snap.snapshot" },
+        },
+        ConsistentRead: true,
+      })
+      expect(raw.Item?.state?.M?.balance?.S).toBe("cents:4200")
+      expect(raw.Item?.__edd_e__?.S).toBe("snap.snapshot")
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("readSnapshot returns None when no snapshot has been written", () =>
+    Effect.gen(function* () {
+      const result = yield* SnapLedger.readSnapshot({ accountId: "absent-1" })
+      expect(Option.isNone(result)).toBe(true)
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("snapshot writes are monotonic — an older asOfVersion is a no-op", () =>
+    Effect.gen(function* () {
+      yield* SnapLedger.writeSnapshot({ accountId: "mono-1" }, { balance: 500, txCount: 5 }, 5)
+      // Losing the race must not regress the cache, and must not fail.
+      yield* SnapLedger.writeSnapshot({ accountId: "mono-1" }, { balance: 100, txCount: 1 }, 1)
+
+      const snapshot = Option.getOrThrow(yield* SnapLedger.readSnapshot({ accountId: "mono-1" }))
+      expect(snapshot.asOfVersion).toBe(5)
+      expect(snapshot.state).toEqual({ balance: 500, txCount: 5 })
+
+      // A strictly newer version does overwrite.
+      yield* SnapLedger.writeSnapshot({ accountId: "mono-1" }, { balance: 900, txCount: 9 }, 9)
+      const newer = Option.getOrThrow(yield* SnapLedger.readSnapshot({ accountId: "mono-1" }))
+      expect(newer.asOfVersion).toBe(9)
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("the snapshot item is invisible to read / readFrom / currentVersion", () =>
+    Effect.gen(function* () {
+      yield* SnapLedger.append(
+        { accountId: "iso-1" },
+        [
+          new Deposited({ amount: 10 }),
+          new Deposited({ amount: 20 }),
+          new Deposited({ amount: 30 }),
+        ],
+        0,
+      )
+      // The snapshot SK sorts AFTER every event SK in the same partition, so a
+      // `Limit`-bearing reverse query would hit it first without SK hardening.
+      yield* SnapLedger.writeSnapshot({ accountId: "iso-1" }, { balance: 30, txCount: 2 }, 2)
+
+      const all = yield* SnapLedger.read({ accountId: "iso-1" })
+      expect(all.map((e) => e.version)).toEqual([1, 2, 3])
+
+      const delta = yield* SnapLedger.readFrom({ accountId: "iso-1" }, 2)
+      expect(delta.map((e) => e.version)).toEqual([3])
+
+      // Without the begins_with bound this returns 0 (the snapshot is evaluated
+      // first, then filtered out by __edd_e__, leaving an empty page).
+      expect(yield* SnapLedger.currentVersion({ accountId: "iso-1" })).toBe(3)
+
+      // ...and events are invisible to readSnapshot.
+      const snapshot = Option.getOrThrow(yield* SnapLedger.readSnapshot({ accountId: "iso-1" }))
+      expect(snapshot.asOfVersion).toBe(2)
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("snapshot-aware handler agrees with a full replay and auto-snapshots", () =>
+    Effect.gen(function* () {
+      const handle = EventStore.commandHandler(ledgerDecider, SnapLedger)
+      const key = { accountId: "auto-1" }
+
+      // every: 3 — v1, v2 stay below the threshold.
+      yield* handle(key, { _tag: "Deposit", amount: 100 })
+      yield* handle(key, { _tag: "Deposit", amount: 50 })
+      expect(Option.isNone(yield* SnapLedger.readSnapshot(key))).toBe(true)
+
+      // v3 crosses it.
+      const r3 = yield* handle(key, { _tag: "Withdraw", amount: 30 })
+      expect(r3.version).toBe(3)
+      expect(r3.state).toEqual({ balance: 120, txCount: 3 })
+
+      const snapshot = Option.getOrThrow(yield* SnapLedger.readSnapshot(key))
+      expect(snapshot.asOfVersion).toBe(3)
+      expect(snapshot.state).toEqual({ balance: 120, txCount: 3 })
+
+      // The next command reads the snapshot and folds only the delta — the
+      // result must be identical to a full replay of the same events.
+      const r4 = yield* handle(key, { _tag: "Deposit", amount: 80 })
+      expect(r4.version).toBe(4)
+      expect(r4.state).toEqual({ balance: 200, txCount: 4 })
+
+      const replayed = EventStore.fold(ledgerDecider, yield* SnapLedger.read(key))
+      expect(replayed).toEqual(r4.state)
+
+      // Still at v3 — only 1 event since the last snapshot.
+      expect(Option.getOrThrow(yield* SnapLedger.readSnapshot(key)).asOfVersion).toBe(3)
+
+      // v6 crosses the threshold again.
+      yield* handle(key, { _tag: "Deposit", amount: 1 })
+      const r6 = yield* handle(key, { _tag: "Deposit", amount: 1 })
+      expect(r6.version).toBe(6)
+      expect(Option.getOrThrow(yield* SnapLedger.readSnapshot(key)).asOfVersion).toBe(6)
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("a snapshot-aware handler and a plain handler reach the same state", () =>
+    Effect.gen(function* () {
+      const snapHandle = EventStore.commandHandler(ledgerDecider, SnapLedger)
+      const plainHandle = EventStore.commandHandler(ledgerDecider, PlainLedger)
+      const commands: ReadonlyArray<LedgerCommand> = [
+        { _tag: "Deposit", amount: 10 },
+        { _tag: "Deposit", amount: 20 },
+        { _tag: "Withdraw", amount: 5 },
+        { _tag: "Deposit", amount: 7 },
+        { _tag: "Withdraw", amount: 2 },
+      ]
+
+      let snapState: LedgerState = ledgerDecider.initialState
+      let plainState: LedgerState = ledgerDecider.initialState
+      for (const command of commands) {
+        snapState = (yield* snapHandle({ accountId: "parity-1" }, command)).state
+        plainState = (yield* plainHandle({ accountId: "parity-1" }, command)).state
+      }
+
+      expect(snapState).toEqual(plainState)
+      expect(snapState).toEqual({ balance: 30, txCount: 5 })
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("domain errors from the decider still fail the handler", () =>
+    Effect.gen(function* () {
+      const handle = EventStore.commandHandler(ledgerDecider, SnapLedger, { retry: 3 })
+      const error = yield* handle({ accountId: "domain-1" }, { _tag: "Withdraw", amount: 10 }).pipe(
+        Effect.flip,
+      )
+      expect(error._tag).toBe("InsufficientFunds")
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("without retry, a real concurrent conflict surfaces as VersionConflict", () =>
+    Effect.gen(function* () {
+      const handle = EventStore.commandHandler(ledgerDecider, PlainLedger)
+      const key = { accountId: "conflict-1" }
+
+      const results = yield* Effect.all(
+        [
+          handle(key, { _tag: "Deposit", amount: 10 }).pipe(Effect.result),
+          handle(key, { _tag: "Deposit", amount: 20 }).pipe(Effect.result),
+        ],
+        { concurrency: 2 },
+      )
+
+      const failures = results.filter((r) => r._tag === "Failure")
+      expect(failures).toHaveLength(1)
+      expect((failures[0] as { failure: { _tag: string } }).failure._tag).toBe("VersionConflict")
+
+      // Only the winner's event landed.
+      expect(yield* PlainLedger.currentVersion(key)).toBe(1)
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("retry resolves a real concurrent VersionConflict by re-deciding", () =>
+    Effect.gen(function* () {
+      const handle = EventStore.commandHandler(ledgerDecider, PlainLedger, { retry: 5 })
+      const key = { accountId: "retry-1" }
+
+      yield* Effect.all(
+        [
+          handle(key, { _tag: "Deposit", amount: 10 }),
+          handle(key, { _tag: "Deposit", amount: 20 }),
+          handle(key, { _tag: "Deposit", amount: 30 }),
+        ],
+        { concurrency: 3 },
+      )
+
+      // All three commands landed exactly once, at consecutive versions — a
+      // blind re-append would have produced duplicates or lost an event.
+      const events = yield* PlainLedger.read(key)
+      expect(events.map((e) => e.version)).toEqual([1, 2, 3])
+      expect(EventStore.fold(ledgerDecider, events)).toEqual({ balance: 60, txCount: 3 })
+      expect(yield* PlainLedger.currentVersion(key)).toBe(3)
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("retry composes with the snapshot-aware read path", () =>
+    Effect.gen(function* () {
+      const handle = EventStore.commandHandler(ledgerDecider, SnapLedger, { retry: 5 })
+      const key = { accountId: "retry-snap-1" }
+
+      yield* Effect.all(
+        [
+          handle(key, { _tag: "Deposit", amount: 100 }),
+          handle(key, { _tag: "Deposit", amount: 200 }),
+          handle(key, { _tag: "Deposit", amount: 300 }),
+          handle(key, { _tag: "Deposit", amount: 400 }),
+        ],
+        { concurrency: 4 },
+      )
+
+      const events = yield* SnapLedger.read(key)
+      expect(events.map((e) => e.version)).toEqual([1, 2, 3, 4])
+      expect(EventStore.fold(ledgerDecider, events)).toEqual({ balance: 1000, txCount: 4 })
+
+      // The auto-snapshot (every: 3) fired and is consistent with the stream.
+      const snapshot = Option.getOrThrow(yield* SnapLedger.readSnapshot(key))
+      expect(snapshot.asOfVersion).toBeGreaterThanOrEqual(3)
+      const upTo = events.filter((e) => e.version <= snapshot.asOfVersion)
+      expect(EventStore.fold(ledgerDecider, upTo)).toEqual(snapshot.state)
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("bind carries the snapshot primitives with R = never", () =>
+    Effect.gen(function* () {
+      const bound = yield* EventStore.bind(SnapLedger)
+      expect(bound.snapshotConfig).toEqual({ every: 3 })
+
+      const program: Effect.Effect<number, unknown, never> = Effect.gen(function* () {
+        yield* bound.writeSnapshot({ accountId: "bind-1" }, { balance: 11, txCount: 1 }, 1)
+        const snapshot = yield* bound.readSnapshot({ accountId: "bind-1" })
+        return Option.getOrThrow(snapshot).state.balance
+      })
+
+      expect(yield* program).toBe(11)
+    }).pipe(provideEsSnap),
+  )
+
+  it.effect("data-last commandHandler works against a live stream", () =>
+    Effect.gen(function* () {
+      const handle = PlainLedger.pipe(EventStore.commandHandler(ledgerDecider, { retry: 2 }))
+      const result = yield* handle({ accountId: "datalast-1" }, { _tag: "Deposit", amount: 42 })
+      expect(result.version).toBe(1)
+      expect(result.state).toEqual({ balance: 42, txCount: 1 })
+    }).pipe(provideEsSnap),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// EventStore — additional transaction items + command idempotency (#85)
+// ---------------------------------------------------------------------------
+
+const esIdemSchema = DynamoSchema.make({ name: "es-idem", version: 1 })
+const esIdemTableName = `es-idem-${Date.now()}`
+
+/** Side record written atomically with events, to exercise `additionalItems`. */
+class EsWatermark extends Schema.Class<EsWatermark>("EsWatermark")({
+  writerId: Schema.String,
+  lastSeq: Schema.Number,
+}) {}
+
+const EsWatermarks = Entity.make({
+  model: EsWatermark,
+  entityType: "EsWatermark",
+  primaryKey: {
+    pk: { field: "pk", composite: ["writerId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const EsIdemTable = Table.make({ schema: esIdemSchema, entities: { EsWatermarks } })
+
+class EsIdemMatchStarted extends Schema.Class<EsIdemMatchStarted>("EsIdemMatchStarted")({
+  venue: Schema.String,
+}) {}
+
+class EsIdemInningsCompleted extends Schema.Class<EsIdemInningsCompleted>("EsIdemInningsCompleted")(
+  {
+    innings: Schema.Number,
+    runs: Schema.Number,
+  },
+) {}
+
+type EsIdemMatchEvent = EsIdemMatchStarted | EsIdemInningsCompleted
+
+const EsIdemMatchEvents = EventStore.makeStream({
+  table: EsIdemTable,
+  streamName: "EsMatch",
+  events: [EsIdemMatchStarted, EsIdemInningsCompleted],
+  streamId: { composite: ["matchId"] },
+})
+
+interface EsIdemMatchState {
+  readonly status: "pending" | "in-progress"
+  readonly innings: number
+}
+
+type EsIdemMatchCommand =
+  | { readonly _tag: "Start"; readonly venue: string }
+  | { readonly _tag: "CompleteInnings"; readonly innings: number; readonly runs: number }
+
+const esIdemDecider: EventStore.Decider<EsIdemMatchState, EsIdemMatchCommand, EsIdemMatchEvent> = {
+  initialState: { status: "pending", innings: 0 },
+  decide: (command) =>
+    Effect.succeed(
+      command._tag === "Start"
+        ? [new EsIdemMatchStarted({ venue: command.venue })]
+        : [new EsIdemInningsCompleted({ innings: command.innings, runs: command.runs })],
+    ),
+  evolve: (state, event) =>
+    event instanceof EsIdemMatchStarted
+      ? { ...state, status: "in-progress" as const }
+      : { ...state, innings: state.innings + 1 },
+}
+
+const EsIdemTestLayer = Layer.mergeAll(ClientLayer, EsIdemTable.layer({ name: esIdemTableName }))
+const provideEsIdem = Effect.provide(EsIdemTestLayer)
+
+describeConnected("EventStore — additionalItems + idempotency (closes #85)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: esIdemTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(EsIdemTable),
+        })
+      }).pipe(provideEsIdem, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: esIdemTableName })
+      }).pipe(
+        provideEsIdem,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("commits events and an additional item atomically", () =>
+    Effect.gen(function* () {
+      yield* EsIdemMatchEvents.append(
+        { matchId: "atomic-1" },
+        [new EsIdemMatchStarted({ venue: "MCG" })],
+        0,
+        { additionalItems: [EsWatermarks.put({ writerId: "w-atomic-1", lastSeq: 1 })] },
+      )
+
+      const events = yield* EsIdemMatchEvents.read({ matchId: "atomic-1" })
+      expect(events).toHaveLength(1)
+      expect(events[0]!.eventType).toBe("EsIdemMatchStarted")
+
+      const watermark = yield* EsWatermarks.get({ writerId: "w-atomic-1" })
+      expect(watermark.lastSeq).toBe(1)
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("a user-item condition failure is NOT reported as VersionConflict", () =>
+    Effect.gen(function* () {
+      yield* EsWatermarks.put({ writerId: "w-cond-1", lastSeq: 100 })
+
+      const error = yield* EsIdemMatchEvents.append(
+        { matchId: "cond-1" },
+        [new EsIdemMatchStarted({ venue: "SCG" })],
+        0,
+        {
+          additionalItems: [
+            // Watermark is at 100 — this condition cannot hold.
+            Transaction.check(
+              EsWatermarks.get({ writerId: "w-cond-1" }),
+              Expression.condition({ lt: { lastSeq: 50 } }),
+            ),
+          ],
+        },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("AdditionalItemConditionFailed")
+      const failure = error as AdditionalItemConditionFailed
+      expect(failure.streamName).toBe("EsMatch")
+      expect(failure.streamId).toBe("cond-1")
+      expect(failure.indices).toEqual([0])
+
+      // All-or-nothing: the event must not have been written
+      const events = yield* EsIdemMatchEvents.read({ matchId: "cond-1" })
+      expect(events).toHaveLength(0)
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("a version conflict is still mapped correctly with additional items present", () =>
+    Effect.gen(function* () {
+      // Establish v1 on the stream
+      yield* EsIdemMatchEvents.append(
+        { matchId: "vc-1" },
+        [new EsIdemMatchStarted({ venue: "WACA" })],
+        0,
+      )
+      yield* EsWatermarks.put({ writerId: "w-vc-1", lastSeq: 0 })
+
+      // Append again at the now-stale expectedVersion 0, with a satisfiable
+      // additional-item condition, so only the event put's guard can fail.
+      const error = yield* EsIdemMatchEvents.append(
+        { matchId: "vc-1" },
+        [new EsIdemInningsCompleted({ innings: 1, runs: 250 })],
+        0,
+        {
+          additionalItems: [
+            Transaction.check(
+              EsWatermarks.get({ writerId: "w-vc-1" }),
+              Expression.condition({ eq: { lastSeq: 0 } }),
+            ),
+          ],
+        },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("VersionConflict")
+      expect((error as VersionConflict).expectedVersion).toBe(0)
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("rejects a replayed commandId with DuplicateCommand", () =>
+    Effect.gen(function* () {
+      const handle = EventStore.commandHandler(esIdemDecider, EsIdemMatchEvents, {
+        idempotency: {},
+      })
+
+      const first = yield* handle(
+        { matchId: "idem-1" },
+        { _tag: "Start", venue: "Lords" },
+        { commandId: "cmd-idem-1" },
+      )
+      expect(first.version).toBe(1)
+
+      const error = yield* handle(
+        { matchId: "idem-1" },
+        { _tag: "Start", venue: "Lords" },
+        { commandId: "cmd-idem-1" },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("DuplicateCommand")
+      expect((error as DuplicateCommand).commandId).toBe("cmd-idem-1")
+
+      // The replay must not have appended a second event
+      const events = yield* EsIdemMatchEvents.read({ matchId: "idem-1" })
+      expect(events).toHaveLength(1)
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("distinct commandIds each append, and sentinels are invisible to read", () =>
+    Effect.gen(function* () {
+      const handle = EventStore.commandHandler(esIdemDecider, EsIdemMatchEvents, {
+        idempotency: { ttl: Duration.days(1) },
+      })
+
+      yield* handle(
+        { matchId: "idem-2" },
+        { _tag: "Start", venue: "Eden" },
+        { commandId: "cmd-idem-2a" },
+      )
+      yield* handle(
+        { matchId: "idem-2" },
+        { _tag: "CompleteInnings", innings: 1, runs: 300 },
+        { commandId: "cmd-idem-2b" },
+      )
+
+      const events = yield* EsIdemMatchEvents.read({ matchId: "idem-2" })
+      expect(events.map((e) => e.eventType)).toEqual([
+        "EsIdemMatchStarted",
+        "EsIdemInningsCompleted",
+      ])
+      expect(yield* EsIdemMatchEvents.currentVersion({ matchId: "idem-2" })).toBe(2)
+
+      // Sentinels live in the same partition but under a different entity type —
+      // a raw partition query sees them, the typed read does not.
+      const raw = yield* (yield* DynamoClient).query({
+        TableName: esIdemTableName,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: "$es-idem#v1#esmatch#idem-2" } },
+      })
+      const entityTypes = (raw.Items ?? []).map((i) => i.__edd_e__?.S)
+      expect(entityTypes.filter((t) => t === "esmatch.command")).toHaveLength(2)
+      expect(entityTypes.filter((t) => t === "esmatch.event")).toHaveLength(2)
+    }).pipe(provideEsIdem),
   )
 })

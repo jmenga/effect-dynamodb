@@ -7,13 +7,16 @@ export * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 export type { EmbedderService } from "@effect-dynamodb/schema/Embedder.js"
 export { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 export {
+  AdditionalItemConditionFailed,
   AggregateAssemblyError,
   AggregateDecompositionError,
   AggregateTransactionOverflow,
+  AppendTooLarge,
   CascadePartialFailure,
   CompositeKeyHoleError,
   CompositeNullableError,
   ConditionalCheckFailed,
+  DuplicateCommand,
   DynamoError,
   DynamoValidationError,
   EmbeddingError,
@@ -28,6 +31,7 @@ export {
   ResourceNotFoundError,
   StaleAppend,
   ThrottlingError,
+  TRANSACT_WRITE_ITEMS_LIMIT,
   TransactionCancelled,
   TransactionOverflow,
   UniqueConstraintViolation,

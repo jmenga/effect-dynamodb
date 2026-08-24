@@ -275,6 +275,82 @@ export class VersionConflict extends Data.TaggedError("VersionConflict")<{
 }> {}
 
 /**
+ * DynamoDB's hard cap on the number of items in a single
+ * `TransactWriteItems` request.
+ */
+export const TRANSACT_WRITE_ITEMS_LIMIT = 100
+
+/**
+ * `EventStore.append` would exceed DynamoDB's {@link TRANSACT_WRITE_ITEMS_LIMIT}
+ * (100 items per `TransactWriteItems`). Appends are atomic by design — the
+ * batch is never chunked, because chunking would break append atomicity — so
+ * an oversized batch is rejected before any request is issued.
+ *
+ * `count` is the total number of transact items the append requires: one Put
+ * per event, plus one `ConditionCheck` (the version-contiguity guard) when
+ * `expectedVersion > 0`. In practice a single append therefore holds up to
+ * 100 events at `expectedVersion === 0` and up to 99 events otherwise.
+ *
+ * Note the 4MB aggregate payload cap on `TransactWriteItems` is NOT
+ * pre-validated (marshalled size is not practical to pre-compute) — exceeding
+ * it surfaces as a `DynamoClientError` from AWS.
+ */
+export class AppendTooLarge extends Data.TaggedError("AppendTooLarge")<{
+  readonly streamName: string
+  readonly streamId: string
+  /** Total transact items required (events + contiguity ConditionCheck). */
+  readonly count: number
+  /** The DynamoDB limit ({@link TRANSACT_WRITE_ITEMS_LIMIT}). */
+  readonly limit: number
+}> {}
+
+/**
+ * A caller-supplied `additionalItems` condition failed during `EventStore.append`.
+ *
+ * Distinct from {@link VersionConflict}: the stream version was fine, but one of
+ * the caller's own transact items (a conditional `EntityPut`/`EntityDelete`, or a
+ * `Transaction.check`) had its condition evaluate to false, so the whole
+ * transaction — events included — was cancelled.
+ *
+ * Retrying is only useful if the caller's condition can become true; unlike a
+ * version conflict, a blind read-decide-retry loop will not resolve it.
+ *
+ * Precedence: {@link DuplicateCommand} and {@link VersionConflict} are reported in
+ * preference to this error when a conditional failure occurs at those positions
+ * in the same transaction.
+ */
+export class AdditionalItemConditionFailed extends Data.TaggedError(
+  "AdditionalItemConditionFailed",
+)<{
+  readonly streamName: string
+  readonly streamId: string
+  /** 0-based indices into the caller's `additionalItems` array whose conditions failed. */
+  readonly indices: ReadonlyArray<number>
+  /** Full positional cancellation reasons, for diagnostics. */
+  readonly reasons: ReadonlyArray<{
+    readonly code?: string | undefined
+    readonly message?: string | undefined
+  }>
+}> {}
+
+/**
+ * A command with this `commandId` was already applied to this stream.
+ *
+ * Raised when `EventStore.append` (or a `commandHandler` configured with
+ * `idempotency`) finds an existing command-dedup sentinel for the supplied
+ * `commandId`. Terminal — retrying the same `commandId` can never succeed.
+ *
+ * Precedence: reported ahead of {@link VersionConflict} when both the sentinel
+ * guard and an event-put guard fail in the same transaction, because a duplicate
+ * is terminal whereas a version conflict invites a retry.
+ */
+export class DuplicateCommand extends Data.TaggedError("DuplicateCommand")<{
+  readonly streamName: string
+  readonly streamId: string
+  readonly commandId: string
+}> {}
+
+/**
  * EDD-9024 — DEPRECATED in v1.7.1.
  *
  * @deprecated Since v1.7.1, this error is no longer thrown at runtime. It is

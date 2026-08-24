@@ -6,7 +6,7 @@
 
 Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, composite key composition from entity attributes, type-safe index-aware queries with Stream-based pagination, and DynamoClient as an Effect Service with Layer-based dependency injection.
 
-**Status:** All modules implemented. 983 core tests, 281 schema tests, 56 geo tests, 151 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
+**Status:** All modules implemented. 1069 core tests, 281 schema tests, 56 geo tests, 176 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
 **Design:** `DESIGN.md` — API specification (source of truth for implementation)
 
 ## Architecture
@@ -90,6 +90,7 @@ packages/effect-dynamodb/src/
 │   ├── EntityTypes.ts  # Type-level computations for Entity derived types
 │   ├── EntitySchemas.ts # Schema derivation (7 derived schemas)
 │   ├── TransactableOps.ts # Shared Batch/Transaction helpers (table name resolution, key composition, put-item building)
+│   ├── TransactWriteOps.ts # Shared TransactWriteItems builder + ConditionCheckOp (Transaction.transactWrite AND EventStore.append additionalItems)
 │   └── ...             # AggregateCursor, AggregateEdges, etc.
 └── index.ts            # Public API barrel export
 ```
@@ -103,7 +104,7 @@ Collections → Entity (type-level for member validation), KeyComposer
 Collection → DynamoClient, Entity, Table, Marshaller, Errors
 Transaction → DynamoClient, Entity, TransactableOps, Marshaller, Expression, Errors
 Batch → DynamoClient, Entity, TransactableOps, Marshaller, Errors
-EventStore → DynamoClient, DynamoSchema, Table, KeyComposer, Marshaller, Query, Errors
+EventStore → DynamoClient, DynamoSchema, Table, KeyComposer, Marshaller, Query, TransactWriteOps, Errors
 GeoIndex → Entity, Query (in effect-dynamodb-geo package)
 DynamoClient → effect (Context, Layer), @aws-sdk/client-dynamodb, Entity, Collections, Aggregate (for make() binding + collection auto-discovery)
 Table → DynamoSchema, Entity (type-level for member registration)
@@ -414,7 +415,9 @@ Chore: <one-line summary>. No version change.
 
 ### CI enforcement
 
-`ci.yml` runs `pnpm changeset status` on every PR. If it reports any **unconsumed release-declaring changeset** (a file with packages listed in its frontmatter), CI fails with a message telling the author to run `pnpm changeset version` and commit the result. Empty chore changesets pass through.
+`ci.yml` scans `.changeset/` on every PR **targeting `main`**. If any **unconsumed release-declaring changeset** remains (a file with packages listed in its frontmatter), CI fails with a message telling the author to run `pnpm changeset version` and commit the result. Empty chore changesets pass through.
+
+The gate is scoped to `main` so a **stacked release train** can work: several PRs chained onto a `release/**` integration branch, each carrying its own unconsumed changeset, with a single `pnpm changeset version` at the tip producing one version and one CHANGELOG entry for the whole batch. The guarantee is unchanged — nothing reaches `main` with a changeset left unconsumed. CI itself has no `branches` filter and runs on every PR whatever its base, because a stack chains onto `docs/**` / `fix/**` / `feat/**` branches rather than onto `release/**` directly, and a base-branch allowlist would silently leave the intermediate PRs with no CI at all.
 
 ### Trusted Publishing setup
 
@@ -460,6 +463,13 @@ Each of the four publishable packages must be configured on npmjs.com with this 
 - **Retain-aware operations use transactWriteItems.** put/update/delete with retain create snapshots atomically.
 - **Time-series via `timeSeries: { orderBy, ttl?, appendInput }`.** Current-item SK unchanged; event items SK is `<currentSk>#e#<orderBy-value>`, GSI keys stripped, `_ttl` set. `.append(input)` is a `TransactWriteItems` (UpdateItem current + Put event) with CAS `attribute_not_exists(pk) OR #orderBy < :newOb`. Returns `{ applied: true | false, current }` — stale is a value, not an error. Mutually exclusive with `versioned` (EDD-9012) and `softDelete` (EDD-9015).
 - **Time-series enrichment preservation.** `.append()` SET clause enumerates only fields in `appendInput` (required at `make()` time — EDD-9016). Fields outside `appendInput` are never touched on the current item. `appendInput` must include `orderBy` plus all PK/SK composites (EDD-9013).
+
+### EventStore Operations
+- **`append(streamId, events, expectedVersion, { additionalItems })`.** Caller-owned transact items (`EntityPut`, `EntityDelete`, `Transaction.check`) commit atomically with the event puts — the same op union `Transaction.transactWrite` accepts, compiled by the shared `internal/TransactWriteOps.buildTransactWriteItems`. `EntityUpdate` is not supported (neither is it in `transactWrite`); it lands for both at once when the shared builder gains it.
+- **Cancellation mapping is position-aware.** Item layout is `[contiguityCheck?, events…, additionalItems…, sentinel]` — the version-contiguity `ConditionCheck` (#82) is prepended only when `expectedVersion > 0` AND events are being written (a zero-event side-write opens no version gap), and the sentinel is always LAST so caller-visible `additionalItems` indices never shift. Reasons are matched by index, offset by the check. Precedence: `DuplicateCommand` > `VersionConflict` (contiguity check or any event put) > `AdditionalItemConditionFailed` > `TransactionCancelled` — ordered by how terminal the caller's response should be. NEVER reintroduce an any-reason `VersionConflict` mapping: it misattributes caller-condition failures and sends callers into an unresolvable retry loop.
+- **Command idempotency.** `commandHandler(decider, stream, { idempotency: { ttl? } })` + a per-call `commandId` writes a dedup sentinel (`__edd_e__ = "<stream>.command"`, `attribute_not_exists(pk)`) into the same transaction, co-located in the stream partition and invisible to `read`/`readFrom`/`currentVersion`. Replay → `DuplicateCommand` (rejected, not replayed). Without `idempotency` the default is documented **at-least-once**. Configuring it makes `commandId` required at the type level.
+- **100-item cap** counted across `events + additionalItems + sentinel + contiguityCheck` → `AppendTooLarge`, checked before any AWS call. The limit is the single named constant `TRANSACT_WRITE_ITEMS_LIMIT` (exported from `@effect-dynamodb/schema/Errors.js`, also used by `Transaction.transactWrite`) — there is exactly one, never a second local copy.
+- **`commandHandler` is a hand-rolled dual, dispatching on the `EventStreamTypeId` brand** of its second argument — NOT `Function.dual`'s numeric-arity form, which silently drops the trailing options argument in the data-last position. Dropping it degrades `{ retry }` to no retry and `{ idempotency }` to at-least-once, both of which look like success until they matter. `CommandHandlerOptions` is ONE type carrying `retry` + `idempotency`; per-call `CommandOptions` carries `metadata` + `commandId` + `additionalItems`. Guarded by the `commandHandler dual dispatch` tests, which assert both option kinds survive both data-last forms.
 
 ### Aggregate Operations
 - **Edge entities are first-class.** Own models, keys, indexes, and configuration. Composed via `Aggregate.one()`, `Aggregate.many()`, `BoundSubAggregate`.

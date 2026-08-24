@@ -17,39 +17,60 @@ An event-sourced cricket match tracker using effect-dynamodb's `EventStore` modu
 
 ## Step 1: Events
 
-Events are pure domain `Schema.Class` definitions. Each event captures something that happened in the domain — no DynamoDB concepts:
+Events are pure domain `Schema.TaggedClass` definitions. Each event captures something that happened in the domain — no DynamoDB concepts:
 
 ```typescript title="events.ts" region="events" example="event-sourcing.ts"
-class MatchStarted extends Schema.Class<MatchStarted>("MatchStarted")({
+class MatchStarted extends Schema.TaggedClass<MatchStarted>()("MatchStarted", {
   venue: Schema.String,
   homeTeam: Schema.String,
   awayTeam: Schema.String,
 }) {}
 
-class InningsCompleted extends Schema.Class<InningsCompleted>("InningsCompleted")({
+class InningsCompleted extends Schema.TaggedClass<InningsCompleted>()("InningsCompleted", {
   innings: Schema.Number,
   runs: Schema.Number,
   wickets: Schema.Number,
 }) {}
 
-class MatchEnded extends Schema.Class<MatchEnded>("MatchEnded")({
+class MatchEnded extends Schema.TaggedClass<MatchEnded>()("MatchEnded", {
   result: Schema.String,
 }) {}
 
 type MatchEvent = MatchStarted | InningsCompleted | MatchEnded
 ```
 
-Each class name doubles as the event type discriminator stored in DynamoDB.
+Each tag doubles as the event type discriminator stored in DynamoDB.
+
+:::caution[Use `Schema.TaggedClass` for event schemas]
+Define events with `Schema.TaggedClass`, not plain `Schema.Class`. The event store decodes stored events through a `Schema.Union` of your event schemas, and a plain `Schema.Class` declares no `_tag` field — the stored `_tag` is treated as an ignored excess property, so the union discriminates **structurally** by field shape. Two event types with identical fields (say, `PaymentAuthorized` and `PaymentCaptured`, both `{ amount: Schema.Number }`) would then mis-decode as each other: the envelope's `eventType` attribute stays correct, but `data` decodes to whichever class matches first. `Schema.TaggedClass` adds the `_tag` literal to the schema itself, so the union discriminates on the tag and every event round-trips to the correct class.
+:::
 
 ---
 
 ## Step 2: Schema and Table
 
-Define the application schema and a table for the event store. Events live in their own physical table — no entity registration is needed because the stream itself manages the items:
+Define the application schema and a table for the event store. The stream itself manages the event items — no entity registration is needed for them. Entities are only registered here so that ordinary records can be written **atomically alongside events** (see [Step 10](#step-10-atomic-side-writes)):
 
 ```typescript title="infrastructure.ts" region="infrastructure" example="event-sourcing.ts"
 const AppSchema = DynamoSchema.make({ name: "cricket", version: 1 })
-const EventsTable = Table.make({ schema: AppSchema })
+
+// A per-writer ingestion watermark — a side record updated atomically with
+// events via `append({ additionalItems })`.
+class Watermark extends Schema.Class<Watermark>("Watermark")({
+  writerId: Schema.String,
+  lastSeq: Schema.Number,
+}) {}
+
+const Watermarks = Entity.make({
+  model: Watermark,
+  entityType: "Watermark",
+  primaryKey: {
+    pk: { field: "pk", composite: ["writerId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const EventsTable = Table.make({ schema: AppSchema, entities: { Watermarks } })
 ```
 
 ---
@@ -184,6 +205,15 @@ Each call to `handleMatch`:
 3. Runs `decide` with the command and current state
 4. Appends the resulting events with an expected version check
 
+### Append limits and version contiguity
+
+`append` writes every event in a single `TransactWriteItems` request, so an append is all-or-nothing — either every event in the batch is persisted or none is. That atomicity is bounded by DynamoDB's transaction limits:
+
+- **100 items per transaction.** Each event is one transact item, and when `expectedVersion > 0` the version-contiguity `ConditionCheck` (below) occupies one more slot. An append that would exceed the limit fails upfront with a typed `AppendTooLarge` error — before any request is issued. The batch is deliberately **never chunked** into multiple transactions, because chunking would break append atomicity. In practice a single append holds at most 100 events when `expectedVersion` is `0`, and at most 99 otherwise. If you hit this, split the work into smaller commands (separate appends at their own expected versions). The limit is exported as the `TRANSACT_WRITE_ITEMS_LIMIT` constant.
+- **4MB total payload per transaction.** This cap is not pre-validated — the marshalled request size is not practical to compute upfront — so exceeding it surfaces as a `DynamoClientError` from AWS. Keep event payloads small; large blobs belong in S3 with a reference in the event.
+
+`append` also enforces that the appended range is **contiguous** with the stream head. Every event Put is conditioned on `attribute_not_exists(pk)`, which rejects *stale* expected versions (the target version slot already exists). In addition, when `expectedVersion > 0` the transaction carries a `ConditionCheck` requiring the event at exactly `expectedVersion` to exist — so an *ahead* expected version (say `expectedVersion: 10` on a stream whose head is at version 3) fails with `VersionConflict` instead of silently writing version 11 and leaving a permanent hole in the sequence. Both failure modes surface as the same `VersionConflict` error.
+
 ---
 
 ## Step 6: Running Commands
@@ -274,6 +304,10 @@ const state = EventStore.fold(matchDecider, allEvents)
 
 This is a pure function — no DynamoDB calls. It takes the events you already have and replays them through `evolve`.
 
+:::note[A note on "projections"]
+In event-sourcing jargon, a *projection* is a read model built by consuming events. This library's [`Projection` module](/effect-dynamodb/tutorials/projections/) is something else entirely: it builds DynamoDB `ProjectionExpression`s for selecting specific item attributes on reads. Event-sourcing read models are outside this library's scope — build them in a [DynamoDB Streams](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html) consumer that reacts to appended events.
+:::
+
 ### Query Combinators
 
 Event streams expose a `query` API with the same combinators as entity queries. For example, get the latest event using `reverse` and `limit`:
@@ -310,6 +344,233 @@ yield* handleMatch(streamId, command)
     Effect.catchTag("AlreadyEnded", () => ...),
   )
 ```
+
+---
+
+## Step 10: Snapshots
+
+Every command so far replayed the **entire** stream before deciding. That is fine for
+short-lived streams and a scaling cliff for long-lived ones. A snapshot is a cached fold
+of the stream up to some version: the handler reads it, replays only the events *after*
+it, and decides from there.
+
+Snapshots are opt-in. Declare a schema for your state — the snapshot round-trips through
+it, so branded types, `DateTime` fields, and other transforming schemas all work:
+
+```typescript title="state.ts" region="snapshot-schema" example="event-sourcing.ts"
+const MatchStateSchema = Schema.Struct({
+  status: Schema.Literals(["pending", "in-progress", "completed"]),
+  venue: Schema.optionalKey(Schema.String),
+  innings: Schema.Array(Schema.Struct({ runs: Schema.Number, wickets: Schema.Number })),
+  result: Schema.optionalKey(Schema.String),
+})
+```
+
+Then pass it to `makeStream`. `every: N` asks the command handler to write a fresh
+snapshot after a successful append, once at least `N` events have accumulated since the
+last one:
+
+```typescript title="stream.ts" region="snapshot-stream" example="event-sourcing.ts"
+const SnapshotMatchEvents = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "SnapshotMatch",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["matchId"] },
+  snapshot: { schema: MatchStateSchema, every: 3 },
+})
+```
+
+The snapshot is stored as a single item in the stream's own partition, under a sort key
+that can never collide with an event sort key (`$cricket#v1#snapshotmatch.snapshot`). It
+is invisible to `read`, `readFrom`, `currentVersion`, and `query.events`, and it is
+overwritten in place — snapshots are a cache, never history. The event stream stays the
+source of truth, so a snapshot can always be deleted and rebuilt.
+
+:::caution
+A snapshot that no longer decodes through its state schema fails the command with
+`ValidationError` — it is **not** silently discarded in favour of a full replay, because
+that would hide state-schema evolution bugs. When evolving the state schema, either keep
+it backward-tolerant (optional fields with defaults) or delete the snapshots on deploy.
+:::
+
+---
+
+## Step 11: Retrying Version Conflicts
+
+Two concurrent commands on the same stream will race: one wins the optimistic-concurrency
+check and the other fails with `VersionConflict`. The correct recovery is **not** to
+re-append the events you already decided — those were decided against stale state. It is
+to re-read, re-decide, and re-append.
+
+That is exactly what the `retry` option does. Pass a max-attempts number or an Effect
+`Schedule`; only `VersionConflict` is retried, and the retried unit is the whole
+read-decide-append cycle:
+
+```typescript title="handler.ts" region="snapshot-handler" example="event-sourcing.ts"
+const snapshotMatchEvents = yield* EventStore.bind(SnapshotMatchEvents)
+const handleSnapshotMatch = EventStore.commandHandler(matchDecider, snapshotMatchEvents, {
+  retry: 3,
+})
+```
+
+```typescript
+// A Schedule works too — exponential backoff, capped at 5 retries:
+EventStore.commandHandler(matchDecider, snapshotMatchEvents, {
+  retry: Schedule.exponential("50 millis").pipe(Schedule.compose(Schedule.recurs(5))),
+})
+```
+
+Domain errors from your decider and infrastructure errors are never retried — they fail
+immediately. The default is no retry.
+
+Commands run exactly as before. The third one crosses the `every: 3` threshold, so a
+snapshot is written after the append:
+
+```typescript region="snapshot-commands" example="event-sourcing.ts"
+yield* handleSnapshotMatch(
+  { matchId: "m-2" },
+  { _tag: "StartMatch", venue: "SCG", homeTeam: "AUS", awayTeam: "IND" },
+)
+yield* handleSnapshotMatch(
+  { matchId: "m-2" },
+  { _tag: "CompleteInnings", innings: 1, runs: 310, wickets: 8 },
+)
+// The third event crosses the `every: 3` threshold — a snapshot is written.
+const s3 = yield* handleSnapshotMatch(
+  { matchId: "m-2" },
+  { _tag: "CompleteInnings", innings: 2, runs: 275, wickets: 10 },
+)
+```
+
+### Reading a snapshot
+
+```typescript region="read-snapshot" example="event-sourcing.ts"
+const snapshot = yield* snapshotMatchEvents.readSnapshot({ matchId: "m-2" })
+const asOfVersion = Option.match(snapshot, {
+  onNone: () => 0,
+  onSome: (s) => s.asOfVersion,
+})
+// → asOfVersion: 3
+```
+
+`readSnapshot` returns `Option<Snapshot<State>>`, where `Snapshot` carries the decoded
+`state`, the `asOfVersion` it reflects, and a `timestamp`.
+
+The next command folds from that snapshot plus the single event after it, rather than
+replaying all four — and produces exactly the same state:
+
+```typescript region="snapshot-fold" example="event-sourcing.ts"
+const s4 = yield* handleSnapshotMatch(
+  { matchId: "m-2" },
+  { _tag: "EndMatch", result: "AUS won by 35 runs" },
+)
+```
+
+### Writing a snapshot by hand
+
+Omit `every` to keep the cadence under your own control — for example from a backfill job
+— and call `writeSnapshot` yourself:
+
+```typescript region="write-snapshot" example="event-sourcing.ts"
+const events = yield* snapshotMatchEvents.read({ matchId: "m-2" })
+const folded = EventStore.fold(matchDecider, events)
+yield* snapshotMatchEvents.writeSnapshot({ matchId: "m-2" }, folded, s4.version)
+```
+
+Snapshot writes are **monotonic**: if a newer snapshot already exists, the write is a
+successful no-op rather than a regression of the cache. Auto-snapshot writes are
+best-effort — a failure is logged and never fails the command, because the events it
+summarises are already durable.
+
+## Step 12: Atomic Side Writes
+
+Real event-sourced systems usually need one non-event record kept in step with the events: an ingestion watermark, a stream registry row, a uniqueness guard. `append` accepts `additionalItems` — the same operation builders `Transaction.transactWrite` takes (`Entity.put`, `Entity.delete`, and `Transaction.check`) — and commits them in the **same** `TransactWriteItems` call as the events:
+
+```typescript region="additional-items" example="event-sourcing.ts"
+yield* matchEvents.append(
+  { matchId: "m-2" },
+  [new MatchStarted({ venue: "SCG", homeTeam: "AUS", awayTeam: "IND" })],
+  0,
+  {
+    additionalItems: [Watermarks.put({ writerId: "ingest-1", lastSeq: 4021 })],
+  },
+)
+```
+
+Either everything lands or nothing does. The event puts, your items, and the version guard are one atomic unit.
+
+### Telling the failures apart
+
+Because your items carry their own conditions, "the transaction was cancelled" is no longer a single story. `append` maps cancellation reasons **by position**, so you always know whose condition failed:
+
+```typescript region="additional-item-condition" example="event-sourcing.ts"
+const condError = yield* matchEvents
+  .append({ matchId: "m-2" }, [new InningsCompleted({ innings: 1, runs: 300, wickets: 8 })], 1, {
+    additionalItems: [
+      Transaction.check(
+        Watermarks.get({ writerId: "ingest-1" }),
+        Expression.condition({ lt: { lastSeq: 100 } }),
+      ),
+    ],
+  })
+  .pipe(Effect.flip)
+// Error: AdditionalItemConditionFailed
+```
+
+| Error | What failed | What to do |
+|---|---|---|
+| `VersionConflict` | An event put's guard — the stream advanced under you | Re-read, re-decide, retry |
+| `AdditionalItemConditionFailed` | One of *your* `additionalItems` conditions | Inspect `indices` (0-based into `additionalItems`); retrying blindly will not help |
+| `DuplicateCommand` | The idempotency sentinel — this `commandId` already ran | Nothing; the command already took effect |
+| `TransactionCancelled` | Throttling, a concurrent transaction, or a validation error | Retry with backoff |
+| `AppendTooLarge` | `events + additionalItems + sentinel + contiguity check` exceeded DynamoDB's 100-item cap | Split the append |
+
+Without position-aware mapping, a failed watermark condition would be reported as a `VersionConflict` — and the caller's natural response (re-read, re-decide, retry) would loop forever against a condition that can never pass.
+
+---
+
+## Step 13: Command Idempotency
+
+By default, command processing is **at-least-once**. If a caller's response is lost after the append committed, the retry re-reads the stream, re-runs `decide`, and appends again. Deciders that are self-guarding (`StartMatch` fails once the match is started) absorb this; deciders that aren't (`CompleteInnings` happily emits another event) do not.
+
+To get exactly-once processing, configure `idempotency` on the handler and pass a `commandId` per call. The handler writes a dedup sentinel guarded by `attribute_not_exists` into the same transaction as the events:
+
+```typescript region="idempotency" example="event-sourcing.ts"
+const handleIdempotent = EventStore.commandHandler(matchDecider, matchEvents, {
+  idempotency: { ttl: Duration.days(1) },
+})
+
+yield* handleIdempotent(
+  { matchId: "m-3" },
+  { _tag: "StartMatch", venue: "Lords", homeTeam: "ENG", awayTeam: "NZ" },
+  { commandId: "cmd-7f3a" },
+)
+
+// CompleteInnings is not self-guarding — the decider happily produces a second
+// event, so only the dedup sentinel can catch the replay.
+yield* handleIdempotent(
+  { matchId: "m-3" },
+  { _tag: "CompleteInnings", innings: 1, runs: 210, wickets: 6 },
+  { commandId: "cmd-9b12" },
+)
+
+const dupError = yield* handleIdempotent(
+  { matchId: "m-3" },
+  { _tag: "CompleteInnings", innings: 1, runs: 210, wickets: 6 },
+  { commandId: "cmd-9b12" },
+).pipe(Effect.flip)
+// Error: DuplicateCommand
+```
+
+Configuring `idempotency` makes `commandId` **required** at the type level — you cannot silently fall back to at-least-once.
+
+What to know about the sentinel:
+
+- It lives in the stream's own partition, so `commandId` uniqueness is scoped to the stream. It is invisible to `read`, `readFrom`, and `currentVersion`, which filter on the event entity type.
+- Its sort key is composed with the schema's casing (lowercase by default), so command ids that differ only in case collide. Use UUIDs or ULIDs.
+- `ttl` is optional and written to the table's TTL attribute (honouring `TableConfig.ttlAttributeName`). Set it to the longest window over which your infrastructure can replay a command; omit it and sentinels are permanent.
+- A replay is **rejected**, not replayed — `DuplicateCommand` carries `streamName`, `streamId`, and `commandId`. If you need the original outcome, catch the error and re-read the stream.
+- A command that produces no events writes no sentinel, because there is no transaction to attach it to.
 
 ---
 
@@ -358,6 +619,12 @@ Effect.runPromise(main).then(
 | **Fold** | `EventStore.fold` reconstructs state from events using the decider's `evolve` function |
 | **Query combinators** | `Query.reverse`, `Query.limit`, `Query.collect` work on event stream queries |
 | **Domain errors** | Tagged errors (`AlreadyStarted`, `NotStarted`, `AlreadyEnded`) for precise error handling |
+| **Snapshots** | `snapshot: { schema, every }` caches a fold of the stream; the handler replays only the delta |
+| **Snapshot primitives** | `readSnapshot` / `writeSnapshot` for manual cadence; monotonic writes, never a cache regression |
+| **Retry** | `{ retry }` re-runs the full read-decide-append cycle on `VersionConflict` only |
+| **Atomic side writes** | `append(..., { additionalItems })` commits `Entity.put` / `Entity.delete` / `Transaction.check` ops with the events |
+| **Position-aware errors** | `VersionConflict` vs. `AdditionalItemConditionFailed` vs. `DuplicateCommand` — you always know whose condition failed |
+| **Command idempotency** | At-least-once by default; `commandHandler(..., { idempotency })` + a `commandId` makes it exactly-once via a dedup sentinel |
 
 ## What's Next?
 
