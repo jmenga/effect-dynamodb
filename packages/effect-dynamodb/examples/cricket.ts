@@ -244,11 +244,7 @@ const MatchAggregate = Aggregate.make(Match, {
   table: MainTable,
   schema: CricketSchema,
   pk: { field: "pk", composite: ["id"] },
-  collection: {
-    index: "lsi1",
-    name: "match",
-    sk: { field: "lsi1sk", composite: ["name"] },
-  },
+  collection: { name: "match" },
   root: { entityType: "MatchItem" },
   edges: {
     venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: Venues }),
@@ -306,23 +302,12 @@ const program = Effect.gen(function* () {
     AttributeDefinitions: [
       { AttributeName: "pk", AttributeType: "S" },
       { AttributeName: "sk", AttributeType: "S" },
-      { AttributeName: "lsi1sk", AttributeType: "S" },
       { AttributeName: "gsi1pk", AttributeType: "S" },
       { AttributeName: "gsi1sk", AttributeType: "S" },
       { AttributeName: "gsi2pk", AttributeType: "S" },
       { AttributeName: "gsi2sk", AttributeType: "S" },
       { AttributeName: "gsi3pk", AttributeType: "S" },
       { AttributeName: "gsi3sk", AttributeType: "S" },
-    ],
-    LocalSecondaryIndexes: [
-      {
-        IndexName: "lsi1",
-        KeySchema: [
-          { AttributeName: "pk", KeyType: "HASH" },
-          { AttributeName: "lsi1sk", KeyType: "RANGE" },
-        ],
-        Projection: { ProjectionType: "ALL" },
-      },
     ],
     GlobalSecondaryIndexes: [
       {

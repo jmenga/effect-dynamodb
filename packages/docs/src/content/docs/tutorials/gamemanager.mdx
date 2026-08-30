@@ -2274,11 +2274,7 @@ const MatchAggregate = Aggregate.make(Match, {
   table: MainTable,
   schema: CricketSchema,
   pk: { field: "pk", composite: ["id"] },
-  collection: {
-    index: "lsi1",
-    name: "match",
-    sk: { field: "lsi1sk", composite: ["name"] },
-  },
+  collection: { name: "match" },
   root: { entityType: "MatchItem" },
   edges: {
     venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: Venues }),
@@ -2298,7 +2294,7 @@ Key aggregate concepts:
 
 - **`TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } })`** — Binds a sub-aggregate with a discriminator. Since a match has **two** TeamSheets, the discriminator (`teamNumber: 1` vs `teamNumber: 2`) distinguishes them in the sort key.
 
-- **`collection`** — An index for fetching all items belonging to one match (the aggregate's "get" query). In this example it uses an LSI (`lsi1`).
+- **`collection`** — Names the item collection used to fetch every item belonging to one match (the aggregate's "get" query). The query is a bare partition-key lookup that discriminates items in memory, so no secondary index is needed — `name` alone is enough and the read runs against the base table. You would add `index` + `sk` only if the aggregate were keyed on something other than the table's partition key.
 
 ### 5.4 MatchesApi
 
@@ -2414,7 +2410,7 @@ Key differences from entity services:
 
 `Schema.ts` does **not** change in this phase. The `MatchAggregate` is wired to the table via its `table: MainTable` field inside `Aggregate.make` (section 5.3), and it's registered on the typed client in every service, handler, and script that uses it (`MatchService`, `create-table.ts`) via `DynamoClient.make({ aggregates: { MatchAggregate }, ... })`.
 
-> **Why not register the aggregate on `Table.make(...)`?** — In a multi-file project, `MatchAggregate.ts` already imports `MainTable` from `Schema.ts` (it needs the table for `Aggregate.make({ table: MainTable, ... })`). If `Schema.ts` also imported `MatchAggregate` to register it on `Table.make`, you would create a circular import between `Schema.ts` and `MatchAggregate.ts` and TypeScript would fail with `TS7022: 'MatchAggregate' implicitly has type 'any' because it does not have a type annotation and is referenced directly or indirectly in its own initializer`. Registering aggregates on the typed client via `DynamoClient.make(...)` avoids the cycle and `db.tables.MainTable.create()` still detects and provisions the aggregate's indexes at runtime (LSIs are auto-detected from the aggregate's collection config).
+> **Why not register the aggregate on `Table.make(...)`?** — In a multi-file project, `MatchAggregate.ts` already imports `MainTable` from `Schema.ts` (it needs the table for `Aggregate.make({ table: MainTable, ... })`). If `Schema.ts` also imported `MatchAggregate` to register it on `Table.make`, you would create a circular import between `Schema.ts` and `MatchAggregate.ts` and TypeScript would fail with `TS7022: 'MatchAggregate' implicitly has type 'any' because it does not have a type annotation and is referenced directly or indirectly in its own initializer`. Registering aggregates on the typed client via `DynamoClient.make(...)` avoids the cycle and `db.tables.MainTable.create()` still detects and provisions any indexes the aggregate needs at runtime (this one needs none — it assembles off the base table).
 
 Update `Api.ts`:
 
@@ -2523,7 +2519,7 @@ const ServiceLayers = Layer.mergeAll(
 
 ### 5.7 Recreate the table
 
-Update `create-table.ts` to register `MatchAggregate` alongside the entities. The library merges the runtime-registered aggregates into the supplied table when computing the create-time schema, so `db.tables.MainTable.create()` provisions the aggregate's `lsi1` (the LSI used by its `collection` index) alongside the existing entity GSIs:
+Update `create-table.ts` to register `MatchAggregate` alongside the entities. The library merges the runtime-registered aggregates into the supplied table when computing the create-time schema. `MatchAggregate` assembles off the base table, so it contributes no index of its own and `db.tables.MainTable.create()` provisions just the existing entity GSIs:
 
 ```ts
 // src/create-table.ts
@@ -2675,7 +2671,7 @@ Notice how the create payload maps to the aggregate's edge structure. The flatte
 curl -s http://localhost:3000/matches/$MATCH_ID | jq
 ```
 
-The response contains full `Team`, `Player`, `Coach`, and `Venue` objects — not IDs. This is a single `get` call that queries the aggregate's `lsi1` collection index, fetches all items sharing the partition key, and assembles them into the domain graph.
+The response contains full `Team`, `Player`, `Coach`, and `Venue` objects — not IDs. This is a single `get` call that fetches every item sharing the match's partition key straight from the base table and assembles them into the domain graph.
 
 **Step 4: Update a match.** The current `MatchUpdatePayload` only exposes the `name` field; we'll rename the match in place:
 
