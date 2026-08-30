@@ -37,7 +37,7 @@ import * as Batch from "./Batch.js"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
 import { type EntityGet, fromDefinition as entityFromDefinition } from "./Entity.js"
 import { fromAttributeMap, toAttributeMap, toAttributeValue } from "./Marshaller.js"
-import type { Table, TableConfig } from "./Table.js"
+import { resolvePrimaryKey, type Table, type TableConfig } from "./Table.js"
 
 export type {
   Cursor,
@@ -189,11 +189,17 @@ export interface Aggregate<
   /** Primary key field name (e.g., "pk") */
   readonly pkField: string
 
-  /** Collection GSI config — used for assembling aggregates by partition key */
+  /**
+   * Collection index config — used for assembling aggregates by partition key.
+   * `index` is `undefined` when the aggregate assembles directly off the base table.
+   */
   readonly collection: {
-    readonly index: string
-    readonly sk: { readonly field: string }
+    readonly index: string | undefined
+    readonly sk: { readonly field: string } | undefined
   }
+
+  /** Whether assembly reads use strongly consistent reads. */
+  readonly consistentRead: boolean
 
   /** List GSI config — used for listing/paginating aggregates. Undefined when not configured. */
   readonly listIndex:
@@ -375,15 +381,43 @@ interface SubAggregateConfig<
 // ---------------------------------------------------------------------------
 
 interface CollectionConfig {
-  readonly index: string
+  /**
+   * Physical index backing the collection query.
+   *
+   * **Optional.** Aggregate assembly reads the whole partition with a bare
+   * `pk = :pk` condition and discriminates items by `__edd_e__` in memory — it
+   * issues no sort-key condition and depends on no ordering. When the aggregate's
+   * `pk.field` is the table's primary PK, that query runs against the base table
+   * and no index is needed; omit `index` and none is provisioned.
+   *
+   * Supply an index only when the aggregate's `pk.field` is *not* the table's
+   * primary PK, where a GSI is genuinely load-bearing.
+   *
+   * Declared `?: string` rather than `?: string | undefined` — under
+   * `exactOptionalPropertyTypes` those differ, and "no index" is expressed by
+   * omitting the key, never by passing an explicit `undefined`.
+   */
+  readonly index?: string
   readonly name: string
-  readonly sk: {
+  /**
+   * Sort key for the collection index. Required with `index`, meaningless without
+   * it — the mirror attribute exists only so the index has something to sort by,
+   * so a base-table aggregate omits both. Supplying one without the other throws
+   * at `make()` time.
+   */
+  readonly sk?: {
     readonly field: string
     readonly composite: ReadonlyArray<string>
   }
 }
 
 interface ListCollectionConfig extends CollectionConfig {
+  /** The list index is always a GSI — it has its own partition key. */
+  readonly index: string
+  readonly sk: {
+    readonly field: string
+    readonly composite: ReadonlyArray<string>
+  }
   readonly pk: {
     readonly field: string
     readonly composite: ReadonlyArray<string>
@@ -404,6 +438,22 @@ interface AggregateConfig<
   readonly pk: { readonly field: string; readonly composite: TPK }
   readonly collection: CollectionConfig
   readonly list?: ListCollectionConfig | undefined
+  /**
+   * Use strongly consistent reads when assembling this aggregate. Defaults to `false`,
+   * matching DynamoDB and `Entity`.
+   *
+   * Aggregate writes are transactional, so an eventually consistent read taken shortly
+   * after a write can observe a torn item collection — the root may be missing (raising
+   * `AggregateAssemblyError`), or an edge may be missing while the root is visible, which
+   * for optional or empty-able edges assembles successfully into an aggregate that is
+   * quietly incomplete. Enable this when read-after-write correctness matters; it doubles
+   * the RCU cost of every assembly read.
+   *
+   * Only valid where the assembly query can be strongly consistent: the base table (no
+   * `collection.index`) or an LSI. DynamoDB rejects consistent reads against a GSI, so
+   * combining this with a GSI-shaped collection index throws at `make()` time.
+   */
+  readonly consistentRead?: boolean
   readonly context?: ReadonlyArray<string> | undefined
   readonly root: { readonly entityType: string }
   readonly edges: TEdges
@@ -643,6 +693,47 @@ const makeAggregate = <TSchema extends Schema.Top>(
     resolveRef: (name) => edgeRefModels.get(name),
   }) as unknown as Schema.Codec<any>
 
+  // Validate the collection index / consistency combination against the table's
+  // primary key. Best effort: a table registering only aggregates has no primary key
+  // to resolve, in which case both checks are skipped rather than guessed at.
+  const consistentRead = config.consistentRead ?? false
+  const tablePrimary = resolvePrimaryKey(config.table.entities)
+  const collectionIsGsi =
+    tablePrimary !== undefined &&
+    config.collection.index !== undefined &&
+    config.pk.field !== tablePrimary.pk
+
+  if (tablePrimary !== undefined && config.collection.index === undefined) {
+    if (config.pk.field !== tablePrimary.pk) {
+      throw new Error(
+        `[EDD-9041] Aggregate "${aggregateName}": collection PK field "${config.pk.field}" is ` +
+          `not the table's primary partition key ("${tablePrimary.pk}"), so assembly cannot ` +
+          `query the base table. Either set \`pk.field\` to "${tablePrimary.pk}", or supply ` +
+          `\`collection.index\` naming the GSI partitioned by "${config.pk.field}".`,
+      )
+    }
+  }
+
+  if ((config.collection.index === undefined) !== (config.collection.sk === undefined)) {
+    throw new Error(
+      `[EDD-9043] Aggregate "${aggregateName}": \`collection.index\` and \`collection.sk\` must ` +
+        `be supplied together. The collection SK exists only to give the index something to ` +
+        `sort by — declare both to assemble through an index, or neither to assemble off the ` +
+        `base table.`,
+    )
+  }
+
+  if (consistentRead && collectionIsGsi) {
+    throw new Error(
+      `[EDD-9042] Aggregate "${aggregateName}": \`consistentRead\` is not supported against a ` +
+        `GSI. Collection index "${config.collection.index}" is partitioned by ` +
+        `"${config.pk.field}" rather than the table's primary partition key ` +
+        `("${tablePrimary?.pk}"), which makes it a GSI, and DynamoDB serves GSI reads as ` +
+        `eventually consistent only. Drop \`consistentRead\`, or key the aggregate on the ` +
+        `table's primary partition key so assembly reads the base table.`,
+    )
+  }
+
   // Build optics at construction time (once per aggregate definition)
   const classToPlain = Schema.toIso(schema) as Optic.Iso<
     Schema.Schema.Type<TSchema>,
@@ -663,6 +754,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         config.collection.index,
         config.pk.field,
         pkValue,
+        consistentRead,
       )
       return { client, tableConfig, pkValue, composites, allItems }
     })
@@ -677,8 +769,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
     pkField: config.pk.field,
     collection: {
       index: config.collection.index,
-      sk: { field: config.collection.sk.field },
+      sk: config.collection.sk === undefined ? undefined : { field: config.collection.sk.field },
     },
+    consistentRead,
     listIndex: config.list
       ? {
           index: config.list.index,
@@ -752,7 +845,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
         // 5. Compose collection SK composites for root item
         const collectionSkComposites = KeyComposer.extractComposites(
-          config.collection.sk.composite,
+          config.collection.sk?.composite ?? [],
           assembled,
         )
 
@@ -864,13 +957,13 @@ const makeAggregate = <TSchema extends Schema.Top>(
           newGroups,
           config,
           pkValue,
-          KeyComposer.extractComposites(config.collection.sk.composite, assembledNew),
+          KeyComposer.extractComposites(config.collection.sk?.composite ?? [], assembledNew),
         )
         const oldDynamo = buildDynamoItems(
           oldGroups,
           config,
           pkValue,
-          KeyComposer.extractComposites(config.collection.sk.composite, assembledOld),
+          KeyComposer.extractComposites(config.collection.sk?.composite ?? [], assembledOld),
         )
 
         const skOf = (item: Record<string, AttributeValue>): string =>
@@ -1202,15 +1295,18 @@ const resolveNode = (
 const queryAllItems = (
   client: DynamoClientService,
   tableName: string,
-  indexName: string,
+  indexName: string | undefined,
   pkField: string,
   pkValue: string,
+  consistentRead: boolean,
 ): Effect.Effect<Array<Record<string, unknown>>, DynamoClientError> =>
   Effect.gen(function* () {
     const allItems: Array<Record<string, unknown>> = []
     let exclusiveStartKey: Record<string, AttributeValue> | undefined
 
-    // Paginate through all results
+    // Paginate through all results. Assembly needs every item in the partition and
+    // discriminates them by `__edd_e__`, so there is no sort-key condition and no
+    // ordering requirement — which is why `IndexName` is optional here.
     do {
       const result = yield* client.query({
         TableName: tableName,
@@ -1219,6 +1315,7 @@ const queryAllItems = (
         ExpressionAttributeNames: { "#pk": pkField },
         ExpressionAttributeValues: { ":pk": toAttributeValue(pkValue) },
         ExclusiveStartKey: exclusiveStartKey,
+        ConsistentRead: consistentRead || undefined,
       })
 
       if (result.Items) {
@@ -1983,12 +2080,18 @@ const buildDynamoItems = (
       // SK: entity-type specific
       attrs.sk = composeKey(config.schema, item.entityType, [...item.skComposites])
 
-      // Collection SK (LSI): root uses collection composites, others mirror their SK
+      // Collection SK mirror — only written when an index is actually provisioned.
+      // Root items get the collection key; every other item's value is a verbatim copy
+      // of its own `sk`. With no index there is nothing to sort, so the attribute is
+      // omitted entirely rather than duplicating `sk` on every item.
       const isRootItem =
         item.entityType === config.root.entityType && item.skComposites.length === 0
-      attrs[config.collection.sk.field] = isRootItem
-        ? composeCollectionKey(config.schema, config.collection.name, rootCollectionSkComposites)
-        : composeKey(config.schema, item.entityType, [...item.skComposites])
+      const collectionSk = config.collection.sk
+      if (config.collection.index !== undefined && collectionSk !== undefined) {
+        attrs[collectionSk.field] = isRootItem
+          ? composeCollectionKey(config.schema, config.collection.name, rootCollectionSkComposites)
+          : composeKey(config.schema, item.entityType, [...item.skComposites])
+      }
 
       // List collection GSI keys (root items only)
       if (isRootItem && config.list) {

@@ -1,5 +1,7 @@
 # @effect-dynamodb/language-service
 
+## 1.13.0
+
 ## 1.12.1
 
 ## 1.12.0

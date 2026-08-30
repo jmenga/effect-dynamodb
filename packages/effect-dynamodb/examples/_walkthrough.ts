@@ -158,11 +158,7 @@ const MatchAggregate = Aggregate.make(Match, {
   table: MainTable,
   schema: CricketSchema,
   pk: { field: "pk", composite: ["id"] },
-  collection: {
-    index: "lsi1",
-    name: "match",
-    sk: { field: "lsi1sk", composite: ["name"] },
-  },
+  collection: { name: "match" },
   root: { entityType: "MatchItem" },
   edges: {
     venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: Venues }),
@@ -192,7 +188,7 @@ const scanTable = (label: string) =>
       const sk = item.sk as string
       const d: Record<string, unknown> = {}
       for (const [k, v] of Object.entries(item)) {
-        if (!["pk", "sk", "lsi1sk", "__edd_e__"].includes(k)) d[k] = v
+        if (!["pk", "sk", "__edd_e__"].includes(k)) d[k] = v
       }
       yield* Console.log(`\n  [${et}]  pk=${pk}`)
       yield* Console.log(`               sk=${sk}`)
@@ -223,7 +219,7 @@ const scanPartition = (label: string, pkValue: string) =>
       const sk = item.sk as string
       const d: Record<string, unknown> = {}
       for (const [k, v] of Object.entries(item)) {
-        if (!["pk", "sk", "lsi1sk", "__edd_e__"].includes(k)) d[k] = v
+        if (!["pk", "sk", "__edd_e__"].includes(k)) d[k] = v
       }
       yield* Console.log(`\n  [${et}]  sk=${sk}`)
       yield* Console.log(`    ${JSON.stringify(d)}`)
@@ -255,17 +251,6 @@ const step0 = Effect.gen(function* () {
     AttributeDefinitions: [
       { AttributeName: "pk", AttributeType: "S" },
       { AttributeName: "sk", AttributeType: "S" },
-      { AttributeName: "lsi1sk", AttributeType: "S" },
-    ],
-    LocalSecondaryIndexes: [
-      {
-        IndexName: "lsi1",
-        KeySchema: [
-          { AttributeName: "pk", KeyType: "HASH" },
-          { AttributeName: "lsi1sk", KeyType: "RANGE" },
-        ],
-        Projection: { ProjectionType: "ALL" },
-      },
     ],
   })
   yield* Console.log("Table created.\n")
@@ -391,7 +376,6 @@ const step3 = Effect.gen(function* () {
     Item: toAttributeMap({
       pk: pkValue,
       sk: "$cricket#v1#matchitem",
-      lsi1sk: "$cricket#v1#match#AUS vs IND",
       __edd_e__: "MatchItem",
       id: matchId,
       name: "AUS vs IND, 1st Test",
@@ -405,7 +389,6 @@ const step3 = Effect.gen(function* () {
     Item: toAttributeMap({
       pk: pkValue,
       sk: "$cricket#v1#matchvenue",
-      lsi1sk: "$cricket#v1#matchvenue",
       __edd_e__: "MatchVenue",
       id: "mcg",
       name: "Melbourne Cricket Ground",
@@ -420,7 +403,6 @@ const step3 = Effect.gen(function* () {
     Item: toAttributeMap({
       pk: pkValue,
       sk: "$cricket#v1#matchteam#1",
-      lsi1sk: "$cricket#v1#matchteam#1",
       __edd_e__: "MatchTeam",
       team: { id: "aus", name: "Australia", country: "Australia", ranking: 1 },
       homeTeam: true,
@@ -432,7 +414,6 @@ const step3 = Effect.gen(function* () {
     Item: toAttributeMap({
       pk: pkValue,
       sk: "$cricket#v1#matchcoach#1",
-      lsi1sk: "$cricket#v1#matchcoach#1",
       __edd_e__: "MatchCoach",
       id: "mcdonald",
       name: "Andrew McDonald",
@@ -444,7 +425,6 @@ const step3 = Effect.gen(function* () {
     Item: toAttributeMap({
       pk: pkValue,
       sk: "$cricket#v1#matchplayer#1#cummins-01",
-      lsi1sk: "$cricket#v1#matchplayer#1#cummins-01",
       __edd_e__: "MatchPlayer",
       player: {
         id: "cummins-01",
@@ -462,7 +442,6 @@ const step3 = Effect.gen(function* () {
     Item: toAttributeMap({
       pk: pkValue,
       sk: "$cricket#v1#matchplayer#1#smith-01",
-      lsi1sk: "$cricket#v1#matchplayer#1#smith-01",
       __edd_e__: "MatchPlayer",
       player: {
         id: "smith-01",
@@ -483,7 +462,6 @@ const step3 = Effect.gen(function* () {
     Item: toAttributeMap({
       pk: pkValue,
       sk: "$cricket#v1#matchteam#2",
-      lsi1sk: "$cricket#v1#matchteam#2",
       __edd_e__: "MatchTeam",
       team: { id: "ind", name: "India", country: "India", ranking: 2 },
       homeTeam: false,
@@ -495,7 +473,6 @@ const step3 = Effect.gen(function* () {
     Item: toAttributeMap({
       pk: pkValue,
       sk: "$cricket#v1#matchcoach#2",
-      lsi1sk: "$cricket#v1#matchcoach#2",
       __edd_e__: "MatchCoach",
       id: "gambhir",
       name: "Gautam Gambhir",
@@ -507,7 +484,6 @@ const step3 = Effect.gen(function* () {
     Item: toAttributeMap({
       pk: pkValue,
       sk: "$cricket#v1#matchplayer#2#kohli-01",
-      lsi1sk: "$cricket#v1#matchplayer#2#kohli-01",
       __edd_e__: "MatchPlayer",
       player: {
         id: "kohli-01",
@@ -525,7 +501,6 @@ const step3 = Effect.gen(function* () {
     Item: toAttributeMap({
       pk: pkValue,
       sk: "$cricket#v1#matchplayer#2#bumrah-01",
-      lsi1sk: "$cricket#v1#matchplayer#2#bumrah-01",
       __edd_e__: "MatchPlayer",
       player: {
         id: "bumrah-01",
@@ -545,7 +520,7 @@ const step3 = Effect.gen(function* () {
 
 const step4 = Effect.gen(function* () {
   yield* Console.log('STEP 4: Aggregate.get({ id: "bgt-2025-test-1" })\n')
-  yield* Console.log("  1. Query lsi1 index for all items with this PK")
+  yield* Console.log("  1. Query the base table for all items with this PK")
   yield* Console.log("  2. Discriminate by __edd_e__ + teamNumber discriminator")
   yield* Console.log("  3. Assemble leaves-to-root into Match Schema.Class\n")
 

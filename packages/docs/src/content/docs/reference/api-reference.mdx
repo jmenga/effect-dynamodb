@@ -997,7 +997,7 @@ const MatchAggregate = Aggregate.make(Match, {
   table: MainTable,
   schema: CricketSchema,
   pk: { field: "pk", composite: ["id"] },
-  collection: { index: "lsi1", name: "match", sk: { field: "lsi1sk", composite: ["name"] } },
+  collection: { name: "match" },
   root: { entityType: "MatchItem" },
   refs: { Team: Teams, Player: Players, Coach: Coaches, Venue: Venues },
   edges: {
