@@ -69,8 +69,13 @@ interface AggregateLike {
   readonly _tag: "Aggregate"
   readonly pkField: string
   readonly collection: {
-    readonly index: string
-    readonly sk: { readonly field: string }
+    /**
+     * Physical index backing the collection query. `undefined` means the aggregate
+     * assembles straight off the base table — no secondary index is provisioned and
+     * no collection SK mirror attribute is written.
+     */
+    readonly index: string | undefined
+    readonly sk: { readonly field: string } | undefined
   }
   readonly listIndex:
     | {
@@ -431,6 +436,27 @@ export interface TableDefinition {
 }
 
 /**
+ * Resolve the table's primary PK/SK field names from the first entity carrying a
+ * primary index. Aggregates are skipped — they borrow the table's primary key
+ * rather than declaring one.
+ *
+ * Returns `undefined` when no entity declares a primary index (a table registering
+ * only aggregates). Callers that require the primary key must treat that as an error;
+ * callers performing best-effort validation should skip their check instead.
+ */
+export const resolvePrimaryKey = (
+  entities: Record<string, EntityLike>,
+): { readonly pk: string; readonly sk: string | undefined } | undefined => {
+  for (const entity of Object.values(entities)) {
+    const primary = entity.indexes.primary
+    if (primary) {
+      return { pk: primary.pk.field, sk: primary.sk.field }
+    }
+  }
+  return undefined
+}
+
+/**
  * Derive CreateTable input from a table's registered members.
  *
  * Scans all entity index definitions and aggregate GSI configs to produce:
@@ -462,22 +488,14 @@ export const definition = (table: Table): TableDefinition => {
 
   // Pass 1: determine the table's primary PK/SK from the first entity's primary index.
   // This is needed before we can classify aggregate collection indexes as LSI vs GSI.
-  let primaryPk: string | undefined
-  let primarySk: string | undefined
-  for (const member of members) {
-    if ("_tag" in member && member._tag === "Aggregate") continue
-    const entity = member as EntityLike
-    const primary = entity.indexes.primary
-    if (primary) {
-      primaryPk = primary.pk.field
-      primarySk = primary.sk.field
-      break
-    }
-  }
+  const primary = resolvePrimaryKey(table.entities)
 
-  if (primaryPk === undefined) {
+  if (primary === undefined) {
     throw new Error("No primary index found on any entity")
   }
+
+  const primaryPk = primary.pk
+  const primarySk = primary.sk
 
   // Pass 2: collect attribute names and classify indexes (GSI vs LSI).
   const attributeNames = new Set<string>()
@@ -499,16 +517,24 @@ export const definition = (table: Table): TableDefinition => {
       // If pkField matches the table's primary PK, emit as an LSI (DynamoDB requires
       // LSIs to share the base table's HASH key). Otherwise fall back to GSI — this
       // preserves behaviour for any user whose collection uses a distinct PK attribute.
+      //
+      // An aggregate with no `collection.index` assembles off the base table: it writes
+      // no collection SK mirror attribute, so neither the index nor that attribute's
+      // definition is emitted. Declaring an unused AttributeDefinition would be rejected
+      // by DynamoDB ("attribute definitions include inappropriate attributes").
       const collectionIndex = agg.collection.index
+      const collectionSk = agg.collection.sk
       attributeNames.add(agg.pkField)
-      attributeNames.add(agg.collection.sk.field)
-      if (agg.pkField === primaryPk) {
-        if (!lsiMap.has(collectionIndex) && !gsiMap.has(collectionIndex)) {
-          lsiMap.set(collectionIndex, { pk: agg.pkField, sk: agg.collection.sk.field })
-        }
-      } else {
-        if (!gsiMap.has(collectionIndex) && !lsiMap.has(collectionIndex)) {
-          gsiMap.set(collectionIndex, { pk: agg.pkField, sk: agg.collection.sk.field })
+      if (collectionIndex !== undefined && collectionSk !== undefined) {
+        attributeNames.add(collectionSk.field)
+        if (agg.pkField === primaryPk) {
+          if (!lsiMap.has(collectionIndex) && !gsiMap.has(collectionIndex)) {
+            lsiMap.set(collectionIndex, { pk: agg.pkField, sk: collectionSk.field })
+          }
+        } else {
+          if (!gsiMap.has(collectionIndex) && !lsiMap.has(collectionIndex)) {
+            gsiMap.set(collectionIndex, { pk: agg.pkField, sk: collectionSk.field })
+          }
         }
       }
 

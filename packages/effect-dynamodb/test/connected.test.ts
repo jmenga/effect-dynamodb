@@ -7026,3 +7026,177 @@ describeConnected("EventStore — additionalItems + idempotency (closes #85)", (
     }).pipe(provideEsIdem),
   )
 })
+
+// ===========================================================================
+// Aggregate assembly off the base table (#93)
+// ===========================================================================
+//
+// The collection query is a bare `pk = :pk` over the whole partition, so when the
+// aggregate is keyed on the table's primary partition key it needs no secondary
+// index. These tests prove it end-to-end: the table is provisioned with neither an
+// LSI nor a GSI, no collection SK mirror attribute is written, assembly still
+// round-trips, and the base table serves the strongly consistent read that a GSI
+// could not.
+
+const BtSchema = DynamoSchema.make({ name: "bt-agg", version: 1 })
+const btTableName = `bt-agg-test-${Date.now()}`
+
+class BtLine extends Schema.Class<BtLine>("BtLine")({
+  sku: Schema.String.pipe(DynamoModel.identifier),
+  qty: Schema.Number,
+}) {}
+
+class BtOrderLine extends Schema.Class<BtOrderLine>("BtOrderLine")({
+  id: Schema.String,
+  sku: Schema.String,
+  qty: Schema.Number,
+}) {}
+
+class BtOrder extends Schema.Class<BtOrder>("BtOrder")({
+  id: Schema.String,
+  customer: Schema.String,
+  lines: Schema.Array(BtOrderLine),
+}) {}
+
+const BtLines = Entity.make({
+  model: BtLine,
+  entityType: "BtLine",
+  primaryKey: {
+    pk: { field: "pk", composite: ["sku"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const BtTable = Table.make({ schema: BtSchema, entities: { BtLines } })
+
+/** No `collection.index` — assembly runs against the base table. */
+const BtOrderAggregate = Aggregate.make(BtOrder, {
+  table: BtTable,
+  schema: BtSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "btorder" },
+  root: { entityType: "BtOrderRoot" },
+  edges: {
+    lines: Aggregate.many("lines", { entityType: "BtOrderLine" }),
+  },
+})
+
+/** Same shape, strongly consistent — only legal because it reads the base table. */
+const BtConsistentAggregate = Aggregate.make(BtOrder, {
+  table: BtTable,
+  schema: BtSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "btorder" },
+  consistentRead: true,
+  root: { entityType: "BtOrderRoot" },
+  edges: {
+    lines: Aggregate.many("lines", { entityType: "BtOrderLine" }),
+  },
+})
+
+const BtTestLayer = Layer.mergeAll(ClientLayer, BtTable.layer({ name: btTableName }))
+const provideBt = Effect.provide(BtTestLayer)
+
+describeConnected("Aggregate — base-table assembly (#93)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { BtLines },
+          aggregates: { BtOrderAggregate },
+          tables: { BtTable },
+        })
+        yield* db.tables.BtTable.create()
+      }).pipe(provideBt, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: btTableName })
+      }).pipe(
+        provideBt,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("provisions the table with no secondary index at all", () =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const described = yield* client.describeTable({ TableName: btTableName })
+
+      expect(described.Table?.LocalSecondaryIndexes ?? []).toHaveLength(0)
+      expect(described.Table?.GlobalSecondaryIndexes ?? []).toHaveLength(0)
+      expect(
+        (described.Table?.AttributeDefinitions ?? []).map((a) => a.AttributeName).sort(),
+      ).toEqual(["pk", "sk"])
+    }).pipe(provideBt),
+  )
+
+  it.effect("round-trips create → get without an index", () =>
+    Effect.gen(function* () {
+      yield* BtOrderAggregate.create({
+        id: "bt-1",
+        customer: "acme",
+        lines: [
+          { id: "l-1", sku: "widget", qty: 2 },
+          { id: "l-2", sku: "gadget", qty: 5 },
+        ],
+      })
+
+      const loaded = yield* BtOrderAggregate.get({ id: "bt-1" })
+
+      expect(loaded.customer).toBe("acme")
+      expect(loaded.lines).toHaveLength(2)
+      expect([...loaded.lines].map((l) => l.sku).sort()).toEqual(["gadget", "widget"])
+    }).pipe(provideBt),
+  )
+
+  it.effect("writes no collection SK mirror attribute on any item", () =>
+    Effect.gen(function* () {
+      const raw = yield* (yield* DynamoClient).query({
+        TableName: btTableName,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: "$bt-agg#v1#btorder#bt-1" } },
+      })
+
+      expect((raw.Items ?? []).length).toBeGreaterThan(0)
+      for (const item of raw.Items ?? []) {
+        expect(item.lsi1sk).toBeUndefined()
+      }
+    }).pipe(provideBt),
+  )
+
+  it.effect("round-trips an update without an index", () =>
+    Effect.gen(function* () {
+      yield* BtOrderAggregate.update({ id: "bt-1" }, ({ state }) => ({
+        ...state,
+        customer: "globex",
+      }))
+
+      const loaded = yield* BtOrderAggregate.get({ id: "bt-1" })
+      expect(loaded.customer).toBe("globex")
+      expect(loaded.lines).toHaveLength(2)
+    }).pipe(provideBt),
+  )
+
+  it.effect("serves a strongly consistent read off the base table", () =>
+    Effect.gen(function* () {
+      yield* BtConsistentAggregate.create({
+        id: "bt-2",
+        customer: "initech",
+        lines: [{ id: "l-1", sku: "stapler", qty: 1 }],
+      })
+
+      // Read-after-write with ConsistentRead — the whole point of dropping the GSI.
+      const loaded = yield* BtConsistentAggregate.get({ id: "bt-2" })
+      expect(loaded.customer).toBe("initech")
+      expect(loaded.lines).toHaveLength(1)
+    }).pipe(provideBt),
+  )
+})

@@ -227,18 +227,15 @@ Edge keys (`coach`, `players`) correspond to fields on the schema.
 
 #### Step 3: Top-Level Aggregate
 
-Bind the full domain schema to a table, schema namespace, partition key, and collection index:
+Bind the full domain schema to a table, schema namespace, and partition key:
 
 ```typescript region="top-level-aggregate" example="guide-aggregates.ts"
 const MatchAggregate = Aggregate.make(Match, {
   table: MainTable,
   schema: CricketSchema,
   pk: { field: "pk", composite: ["id"] },
-  collection: {
-    index: "lsi1",
-    name: "match",
-    sk: { field: "lsi1sk", composite: ["name"] },
-  },
+  collection: { name: "match" },
+  consistentRead: true,
   root: { entityType: "MatchItem" },
   edges: {
     venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: Venues }),
@@ -255,10 +252,41 @@ const MatchAggregate = Aggregate.make(Match, {
 | `table` | The DynamoDB table |
 | `schema` | DynamoSchema namespace for key prefixing |
 | `pk` | Partition key definition (field + composite attributes from the schema) |
-| `collection` | Collection index for the read path query (index name, collection name, SK definition) |
+| `collection` | Collection naming for the read path. `name` is required; `index` + `sk` only when assembling through a secondary index (see below) |
+| `consistentRead` | Use strongly consistent reads when assembling. Defaults to `false` |
 | `root` | Entity type for the root item |
 | `context` | Optional array of schema field names to propagate to all member items |
 | `edges` | Map of schema fields to edge descriptors, ref edges, or bound sub-aggregates |
+
+#### Do You Need a Secondary Index?
+
+Usually not. Assembly queries the whole partition with a bare `pk = :pk` condition and
+discriminates items by entity type in memory — it issues no sort-key condition and depends
+on no ordering. When the aggregate is keyed on the table's primary partition key, that
+query runs against the base table, so no index is provisioned and no mirror sort-key
+attribute is written on every item.
+
+Supply `collection.index` and `collection.sk` together only when the aggregate's `pk.field`
+is **not** the table's primary partition key — then a GSI is genuinely load-bearing, because
+you are querying a partition key the base table does not have.
+
+Prefer the base table where you can. An LSI's only capability a GSI cannot match is strongly
+consistent reads, and it costs a 10 GB cap on the item collection plus a permanent commitment
+at `CreateTable` — LSIs cannot be added or removed later. An aggregate is exactly the shape
+that grows (root + N edges), so that cap is a poor trade for an index the read path never uses.
+
+#### Consistent Reads
+
+Aggregate writes are transactional, so root and edges land atomically. Reads are eventually
+consistent by default, which means a read taken shortly after a write can observe a torn
+collection — the root may be missing (raising `AggregateAssemblyError`), or an edge may be
+missing while the root is visible, which for optional or empty-able edges assembles into an
+aggregate that is quietly incomplete.
+
+Set `consistentRead: true` to close that window. It doubles the RCU cost of every assembly
+read, so it is opt-in. It requires a query that can be strongly consistent — the base table
+or an LSI; DynamoDB rejects consistent reads against a GSI, so pairing it with a GSI-shaped
+collection index throws at `make()` time.
 
 #### Sub-Aggregate Binding with Discriminators
 
@@ -275,14 +303,14 @@ Discriminator values are stored on each member item in DynamoDB and used during 
 
 #### get — Read and Assemble
 
-Fetch all items in the partition via a collection query, then assemble them into the domain object:
+Fetch all items in the partition, then assemble them into the domain object:
 
 ```typescript region="aggregate-get" example="guide-aggregates.ts"
 const fetched = yield* MatchAggregate.get({ id: "bgt-2025-test-1" })
 ```
 
 Assembly works by:
-1. Querying the collection index for all items in the partition
+1. Querying all items in the partition
 2. Discriminating items by `__edd_e__` entity type + discriminator values
 3. Traversing the graph leaves-to-root (topological sort)
 4. Building the Schema.Class instance at each node
