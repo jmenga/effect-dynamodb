@@ -60,12 +60,12 @@
     "@effect-dynamodb/schema": "workspace:^"
   },
   "peerDependencies": {
-    "effect": "^4.0.0-rc.109"
+    "effect": "^4.0.0-rc.112"
   },
   "devDependencies": {
-    "@effect/vitest": "4.0.0-rc.109",
+    "@effect/vitest": "4.0.0-rc.112",
     "@types/node": "^25.5.0",
-    "effect": "4.0.0-rc.109",
+    "effect": "4.0.0-rc.112",
     "typescript": "^5.7.0",
     "vitest": "^4.1.0"
   }
