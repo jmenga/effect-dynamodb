@@ -1,6 +1,6 @@
 {
   "name": "@effect-dynamodb/geo",
-  "version": "1.12.0",
+  "version": "1.12.1",
   "description": "Geospatial index and search for effect-dynamodb using H3 hexagonal grid",
   "type": "module",
   "license": "MIT",
@@ -55,14 +55,14 @@
     "h3-js": "^4.2.1"
   },
   "peerDependencies": {
-    "effect": "^4.0.0-rc.109",
+    "effect": "^4.0.0-rc.112",
     "effect-dynamodb": "workspace:^"
   },
   "devDependencies": {
     "@aws-sdk/client-dynamodb": "^3.1104.0",
-    "@effect/vitest": "4.0.0-rc.109",
+    "@effect/vitest": "4.0.0-rc.112",
     "@types/node": "^25.0.0",
-    "effect": "4.0.0-rc.109",
+    "effect": "4.0.0-rc.112",
     "effect-dynamodb": "workspace:*",
     "typescript": "^5.7.0",
     "vitest": "^4.1.0"
