@@ -63,24 +63,24 @@ export type IndexPolicyKey = "sparse" | "preserve"
  * because a half is a single concatenated string.
  */
 export interface IndexPolicy {
-  readonly pk?: IndexPolicyKey | undefined
-  readonly sk?: IndexPolicyKey | undefined
+  readonly pk?: IndexPolicyKey
+  readonly sk?: IndexPolicyKey
 }
 
 /** Index definition for primary or secondary index (internal format) */
 export interface IndexDefinition {
   readonly index?: string | undefined // Physical GSI name (omit for primary)
-  readonly collection?: string | ReadonlyArray<string> | undefined
+  readonly collection?: string | ReadonlyArray<string>
   readonly type?: "isolated" | "clustered" | undefined // Default: "isolated"
   readonly pk: KeyPart
   readonly sk: KeyPart
-  readonly casing?: DynamoSchema.Casing | undefined
+  readonly casing?: DynamoSchema.Casing
   /**
    * Optional per-half policy for `Entity.update` and `.append`. Not consulted
    * on `put()` — put always omits a GSI's keys when any of its composites is
    * missing.
    */
-  readonly indexPolicy?: IndexPolicy | undefined
+  readonly indexPolicy?: IndexPolicy
 }
 
 /** GSI definition as specified on Entity.make() indexes config.
@@ -89,9 +89,9 @@ export interface GsiConfig {
   /** Physical GSI name (e.g., `"gsi1"`). */
   readonly name: string
   /** Optional collection name. String for single, array for sub-collections. */
-  readonly collection?: string | ReadonlyArray<string> | undefined
+  readonly collection?: string | ReadonlyArray<string>
   /** SK ordering mode. `"isolated"` (default) puts entity type before composites; `"clustered"` puts entity type after composites (required for sub-collections). */
-  readonly type?: "isolated" | "clustered" | undefined
+  readonly type?: "isolated" | "clustered"
   /** Partition key: physical field name + composite attributes. */
   readonly pk: KeyPart
   /** Sort key: physical field name + composite attributes. */
@@ -101,7 +101,7 @@ export interface GsiConfig {
    * time-series `.append`. Defaults to `"preserve"` on each half. Not
    * applied on `put()`. See `DESIGN.md §7 Policy-Aware GSI Composition`.
    */
-  readonly indexPolicy?: IndexPolicy | undefined
+  readonly indexPolicy?: IndexPolicy
 }
 
 /** Normalize a GsiConfig (entity input) to an IndexDefinition (internal format). */
@@ -120,11 +120,11 @@ export const normalizeGsiConfig = (config: GsiConfig): IndexDefinition => {
   }
   return {
     index: config.name,
-    collection: config.collection,
+    ...(config.collection !== undefined && { collection: config.collection }),
     type: config.type ?? "isolated",
     pk: { field: config.pk.field, composite: [...config.pk.composite] },
     sk: { field: config.sk.field, composite: [...config.sk.composite] },
-    indexPolicy: config.indexPolicy,
+    ...(config.indexPolicy !== undefined && { indexPolicy: config.indexPolicy }),
   }
 }
 
@@ -580,7 +580,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
   updatePayload: Record<string, unknown>,
   keyRecord: Record<string, unknown>,
   options?: {
-    readonly removedSet?: ReadonlySet<string> | undefined
+    readonly removedSet?: ReadonlySet<string>
   },
 ): GsiUpdateResult => {
   const sets: Record<string, string> = {}
@@ -712,7 +712,7 @@ export const tryComposeVectorPartition = (
   entityType: string,
   index: {
     readonly partition: ReadonlyArray<string>
-    readonly casing?: DynamoSchema.Casing | undefined
+    readonly casing?: DynamoSchema.Casing
   },
   record: Record<string, unknown>,
 ): string | undefined => {
@@ -734,7 +734,7 @@ export const composeVectorPartition = (
   entityType: string,
   index: {
     readonly partition: ReadonlyArray<string>
-    readonly casing?: DynamoSchema.Casing | undefined
+    readonly casing?: DynamoSchema.Casing
   },
   record: Record<string, unknown>,
 ): string => {

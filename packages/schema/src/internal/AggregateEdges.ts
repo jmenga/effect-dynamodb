@@ -57,17 +57,17 @@ export interface OneEdge<E extends RefEntity = RefEntity> {
   readonly _tag: "OneEdge"
   readonly name: string
   readonly entityType: string
-  readonly entity?: E | undefined
-  readonly discriminator?: Record<string, unknown> | undefined
+  readonly entity?: E
+  readonly discriminator?: Record<string, unknown>
 }
 
 /** Configuration for a many edge */
 export interface ManyEdgeConfig<E extends RefEntity = RefEntity> {
   readonly entityType: string
-  readonly entity?: E | undefined
-  readonly inputField?: string | undefined
-  readonly edgeAttributes?: ReadonlyArray<string> | undefined
-  readonly sk?: { readonly composite: ReadonlyArray<string> } | undefined
+  readonly entity?: E
+  readonly inputField?: string
+  readonly edgeAttributes?: ReadonlyArray<string>
+  readonly sk?: { readonly composite: ReadonlyArray<string> }
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
   readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
 }
@@ -82,10 +82,10 @@ export interface ManyEdge<E extends RefEntity = RefEntity> {
   readonly _tag: "ManyEdge"
   readonly name: string
   readonly entityType: string
-  readonly entity?: E | undefined
-  readonly inputField?: string | undefined
-  readonly edgeAttributes?: ReadonlyArray<string> | undefined
-  readonly sk?: { readonly composite: ReadonlyArray<string> } | undefined
+  readonly entity?: E
+  readonly inputField?: string
+  readonly edgeAttributes?: ReadonlyArray<string>
+  readonly sk?: { readonly composite: ReadonlyArray<string> }
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
   readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
 }
@@ -126,8 +126,10 @@ export const one = <const E extends RefEntity = RefEntity>(
   _tag: "OneEdge",
   name,
   entityType: config.entityType,
-  entity: config.entity,
-  discriminator: config.discriminator,
+  // Spread rather than assign: under `exactOptionalPropertyTypes` an absent
+  // optional field must stay absent, not be set to an explicit `undefined`.
+  ...(config.entity !== undefined && { entity: config.entity }),
+  ...(config.discriminator !== undefined && { discriminator: config.discriminator }),
 })
 
 /** Create a one-to-many edge descriptor */
@@ -144,12 +146,12 @@ export function many(name: string, config: ManyEdgeConfig): ManyEdge {
     _tag: "ManyEdge",
     name,
     entityType: config.entityType,
-    entity: config.entity,
-    inputField: config.inputField,
-    edgeAttributes: config.edgeAttributes,
-    sk: config.sk,
-    assemble: config.assemble,
-    decompose: config.decompose,
+    ...(config.entity !== undefined && { entity: config.entity }),
+    ...(config.inputField !== undefined && { inputField: config.inputField }),
+    ...(config.edgeAttributes !== undefined && { edgeAttributes: config.edgeAttributes }),
+    ...(config.sk !== undefined && { sk: config.sk }),
+    ...(config.assemble !== undefined && { assemble: config.assemble }),
+    ...(config.decompose !== undefined && { decompose: config.decompose }),
   }
 }
 
