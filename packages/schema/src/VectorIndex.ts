@@ -152,18 +152,18 @@ export interface VectorIndexConfig<TField extends string = string> {
   /** Embedding dimensionality. Immutable after `CreateTable`. */
   readonly dimensions: number
   /** Distance function. Immutable after `CreateTable`. Defaults to `"cosine"`. */
-  readonly distance?: DistanceFunction | undefined
+  readonly distance?: DistanceFunction
   /** Model fields feeding the embedding. */
   readonly source: VectorSourceConfig<TField>
   /**
    * Extra composites folded into the composed HASH partition attribute. The
    * entity type is always included; these narrow further (e.g. per-tenant).
    */
-  readonly partition?: ReadonlyArray<TField> | undefined
+  readonly partition?: ReadonlyArray<TField>
   /** Model fields exposed as `INLINE_FILTER` attributes (equality-only, ≤ 18). */
-  readonly filters?: ReadonlyArray<TField> | undefined
+  readonly filters?: ReadonlyArray<TField>
   /** Key casing override. Defaults to the table schema's casing. */
-  readonly casing?: DynamoSchema.Casing | undefined
+  readonly casing?: DynamoSchema.Casing
 }
 
 /**
@@ -179,7 +179,7 @@ export interface VectorIndexDefinition {
   readonly compose: ((picked: Record<string, unknown>) => string) | undefined
   readonly partition: ReadonlyArray<string>
   readonly filters: ReadonlyArray<string>
-  readonly casing: DynamoSchema.Casing | undefined
+  readonly casing?: DynamoSchema.Casing
   /** `__edd_v_<index>__` — the stored embedding. */
   readonly vectorField: string
   /** `__edd_vp_<index>__` — the composed HASH partition value. */
@@ -218,7 +218,7 @@ export const normalizeVectorIndexConfig = (
     compose: config.source.compose,
     partition: config.partition ? [...config.partition] : [],
     filters,
-    casing: config.casing,
+    ...(config.casing !== undefined && { casing: config.casing }),
     vectorField: vectorAttributeName(config.name),
     partitionField: vectorPartitionAttributeName(config.name),
     stashField: vectorStashAttributeName(config.name),

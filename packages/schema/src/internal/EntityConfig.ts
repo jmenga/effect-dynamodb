@@ -32,8 +32,8 @@ export type TimestampFieldConfig =
 export type TimestampsConfig =
   | boolean
   | {
-      readonly created?: TimestampFieldConfig | undefined
-      readonly updated?: TimestampFieldConfig | undefined
+      readonly created?: TimestampFieldConfig
+      readonly updated?: TimestampFieldConfig
     }
 
 /**
@@ -46,9 +46,9 @@ export type TimestampsConfig =
 export type VersionedConfig =
   | boolean
   | {
-      readonly field?: string | undefined
-      readonly retain?: boolean | undefined
-      readonly ttl?: Duration.Duration | string | undefined
+      readonly field?: string
+      readonly retain?: boolean
+      readonly ttl?: Duration.Duration | string
     }
 
 /**
@@ -61,8 +61,8 @@ export type VersionedConfig =
 export type SoftDeleteConfig =
   | boolean
   | {
-      readonly ttl?: Duration.Duration | string | undefined
-      readonly preserveUnique?: boolean | undefined
+      readonly ttl?: Duration.Duration | string
+      readonly preserveUnique?: boolean
     }
 
 /**
@@ -83,7 +83,7 @@ export type TimeSeriesConfig<TAppendInput extends Schema.Top = Schema.Top> = {
   /** Model attribute used as the monotonic clock for CAS and event SK decoration. Required. */
   readonly orderBy: string
   /** TTL applied to event items (not current). Omit for retention-forever. */
-  readonly ttl?: Duration.Duration | string | undefined
+  readonly ttl?: Duration.Duration | string
   /**
    * REQUIRED schema restricting which model fields are allowed in `.append()`
    * input AND which fields are written into the current-item SET clause.
@@ -116,7 +116,7 @@ export type TimeSeriesConfig<TAppendInput extends Schema.Top = Schema.Top> = {
  */
 export type GeneratedIdConfig = {
   readonly field: string
-  readonly version?: "v4" | "v7" | undefined
+  readonly version?: "v4" | "v7"
 }
 
 /** An array of model field names that together form a unique constraint. */

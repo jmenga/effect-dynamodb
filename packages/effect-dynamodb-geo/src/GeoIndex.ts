@@ -48,10 +48,10 @@ export interface Coordinates {
 export interface NearbyOptions {
   readonly center: LatLng
   readonly radius: number
-  readonly unit?: H3.GeoUnit | undefined
-  readonly timeWindow?: { readonly start: number; readonly end: number } | undefined
-  readonly sort?: SortOrder | undefined
-  readonly pkFilter?: Record<string, unknown> | undefined
+  readonly unit?: H3.GeoUnit
+  readonly timeWindow?: { readonly start: number; readonly end: number }
+  readonly sort?: SortOrder
+  readonly pkFilter?: Record<string, unknown>
 }
 
 export interface NearbyResult<A> {
