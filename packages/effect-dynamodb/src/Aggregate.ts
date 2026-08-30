@@ -117,8 +117,8 @@ interface ResolvedNode {
   readonly fieldName: string | null // null for root
   readonly entityType: string
   readonly cardinality: "root" | "one" | "many"
-  readonly discriminator?: Record<string, unknown> | undefined
-  readonly ownDiscriminator?: Record<string, unknown> | undefined
+  readonly discriminator?: Record<string, unknown>
+  readonly ownDiscriminator?: Record<string, unknown>
   readonly children: ReadonlyArray<ResolvedNode>
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
   readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
@@ -138,9 +138,9 @@ interface ResolvedNode {
 /** Options for paginated list queries */
 export interface ListOptions {
   /** Maximum number of root items (aggregates) to return */
-  readonly limit?: number | undefined
+  readonly limit?: number
   /** Opaque cursor from a previous list call to resume pagination */
-  readonly cursor?: string | undefined
+  readonly cursor?: string
 }
 
 /** Result of a paginated list query */
@@ -422,7 +422,7 @@ interface ListCollectionConfig extends CollectionConfig {
     readonly field: string
     readonly composite: ReadonlyArray<string>
   }
-  readonly cardinality?: number | undefined
+  readonly cardinality?: number
 }
 
 interface AggregateConfig<
@@ -437,7 +437,7 @@ interface AggregateConfig<
   readonly schema: DynamoSchemaModule.DynamoSchema
   readonly pk: { readonly field: string; readonly composite: TPK }
   readonly collection: CollectionConfig
-  readonly list?: ListCollectionConfig | undefined
+  readonly list?: ListCollectionConfig
   /**
    * Use strongly consistent reads when assembling this aggregate. Defaults to `false`,
    * matching DynamoDB and `Entity`.
@@ -454,7 +454,7 @@ interface AggregateConfig<
    * combining this with a GSI-shaped collection index throws at `make()` time.
    */
   readonly consistentRead?: boolean
-  readonly context?: ReadonlyArray<string> | undefined
+  readonly context?: ReadonlyArray<string>
   readonly root: { readonly entityType: string }
   readonly edges: TEdges
 }
@@ -1279,11 +1279,12 @@ const resolveNode = (
     fieldName,
     entityType,
     cardinality,
-    discriminator,
-    ownDiscriminator,
+    // Absent optionals stay absent under `exactOptionalPropertyTypes`.
+    ...(discriminator !== undefined && { discriminator }),
+    ...(ownDiscriminator !== undefined && { ownDiscriminator }),
     children,
-    assemble,
-    decompose,
+    ...(assemble !== undefined && { assemble }),
+    ...(decompose !== undefined && { decompose }),
     dateEncoders,
   }
 }

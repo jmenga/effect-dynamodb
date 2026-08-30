@@ -103,7 +103,7 @@ interface ListCollectionConfig extends CollectionConfig {
     readonly field: string
     readonly composite: ReadonlyArray<string>
   }
-  readonly cardinality?: number | undefined
+  readonly cardinality?: number
 }
 
 interface AggregateConfig<
@@ -118,8 +118,8 @@ interface AggregateConfig<
   readonly schema: DynamoSchemaModule.DynamoSchema
   readonly pk: { readonly field: string; readonly composite: TPK }
   readonly collection: CollectionConfig
-  readonly list?: ListCollectionConfig | undefined
-  readonly context?: ReadonlyArray<string> | undefined
+  readonly list?: ListCollectionConfig
+  readonly context?: ReadonlyArray<string>
   readonly root: { readonly entityType: string }
   readonly edges: TEdges
 }

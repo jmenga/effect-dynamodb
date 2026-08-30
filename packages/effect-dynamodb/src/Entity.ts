@@ -3085,7 +3085,7 @@ const makeImpl = <
               allIndexes,
               hydratedUpdates as globalThis.Record<string, unknown>,
               newItem,
-              { removedSet: retainRemovedSet },
+              retainRemovedSet === undefined ? {} : { removedSet: retainRemovedSet },
             )
             for (const [field, value] of Object.entries(gsiUpdate.sets)) {
               newItem[field] = value
@@ -3565,7 +3565,7 @@ const makeImpl = <
             allIndexes,
             hydratedUpdates as globalThis.Record<string, unknown>,
             decodedKey as globalThis.Record<string, unknown>,
-            { removedSet },
+            removedSet === undefined ? {} : { removedSet },
           )
           for (const [field, value] of Object.entries(gsiUpdate.sets)) {
             const nameKey = `#u${counter}`
