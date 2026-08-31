@@ -449,9 +449,46 @@ The entity definition still provides type derivation (`Entity.Record<typeof User
 
 | Config | Type | Fields Added |
 |--------|------|-------------|
-| `timestamps: true` | `boolean \| { created: string, updated: string }` | `createdAt`, `updatedAt` (or custom names) |
+| `timestamps: true` | `boolean \| { created?: TimestampFieldConfig, updated?: TimestampFieldConfig }` | `createdAt`, `updatedAt` (or custom names) |
 | `versioned: true` | `boolean \| { field?: string, retain?: boolean, ttl?: Duration \| string }` | `version` (or custom name) |
 | `softDelete: true` | `boolean \| { ttl?: Duration \| string, preserveUnique?: boolean }` | `deletedAt` (when soft-deleted) |
+
+#### Timestamp field configuration (`TimestampFieldConfig`)
+
+```ts
+type TimestampFieldConfig =
+  | string                                              // field name only
+  | Schema.Top                                          // storage only (default field name)
+  | { field?: string; schema?: Schema.Top }             // both
+```
+
+The `schema` half is **a storage descriptor, not a codec**. System timestamps are
+*generated* by the library at write time (`generateTimestampPrimitive` over the
+Clock-backed `DateTime.now`), never decoded from caller input, so the only thing
+the write path can read off the supplied schema is its `DynamoEncoding`
+annotation — which storage form to emit (`string` / `epochMs` / `epochSeconds`).
+
+**Make-time validation (EDD-9044).** A `schema` that carries no `DynamoEncoding`
+annotation is rejected at `Entity.make()` / `Aggregate.make()` time. Before this
+rule such a schema was silently discarded and the field fell back to an ISO
+string — the type accepted `Schema.Number` and `Schema.DateTimeUtcFromMillis`,
+both of which then stored an `S` (#97). Storing the wrong wire type is not merely
+an unused attribute: a GSI declaring `AttributeType: 'N'` over that field makes
+DynamoDB reject the write outright with `ValidationException: Type mismatch for
+Index Key`, so the failure has to surface at definition time, not at the write.
+
+| `schema` | Result |
+|---|---|
+| `DynamoModel.DateString` | ISO 8601 string (`S`) |
+| `DynamoModel.DateEpochMs` | epoch millis (`N`) |
+| `DynamoModel.DateEpochSeconds` / `DynamoModel.TTL` | epoch seconds (`N`) |
+| `X.pipe(DynamoModel.storedAs(Y))` | `Y`'s storage form |
+| `Schema.Number`, `Schema.DateTimeUtcFromMillis`, any un-annotated schema | **EDD-9044** at make() time |
+
+A *model-declared* field of the same name still wins over `timestamps.schema`
+(the existing collision rule): a date-compatible model field supplies the
+encoding, and a non-date model field means the user owns the attribute outright
+and the library skips timestamp management for it.
 
 #### TTL configuration (`versioned.ttl`, `softDelete.ttl`, `timeSeries.ttl`, `unique[].ttl`)
 
@@ -1823,6 +1860,65 @@ db.Matches.update({ matchId: "m-1" }, mutation)
 ```
 
 **Transaction Decomposition:** Each sub-aggregate is a transactional unit, keeping transactions well within DynamoDB's 100-item limit.
+
+### Aggregate System Timestamps
+
+`Aggregate.make(schema, { timestamps })` takes the same `TimestampsConfig` as
+`Entity.make`, and applies it to **every row the aggregate writes** — the root
+item and all edge items, including those inside sub-aggregate transaction groups.
+
+```typescript
+const MatchAggregate = Aggregate.make(Match, {
+  …,
+  timestamps: {
+    created: { field: "created", schema: DynamoModel.DateEpochMs },
+    updated: { field: "updated", schema: DynamoModel.DateEpochMs },
+  },
+})
+```
+
+Aggregates compose their DynamoDB items directly (`buildDynamoItems`) rather than
+routing through `Entity` write ops, so Entity's timestamp machinery never reached
+these rows — in a single-table design where aggregates hold most of the data that
+left the majority of the table with no modification timestamp, and no
+configuration that could add one (#98).
+
+**Four rules govern the implementation:**
+
+1. **Injected after the diff, never during decomposition.** `update` diffs
+   *decomposed* groups (`deepEqualGroups`) to decide which sub-aggregate
+   transactions to rewrite. A timestamp added in `decomposeAggregate` would
+   differ on every comparison and silently collapse the diff into a
+   full-partition rewrite on every update. Timestamps are therefore stamped in
+   `buildDynamoItems`, downstream of the diff.
+2. **`created` is carried forward.** Aggregate writes are `Put`, not
+   `UpdateItem`, so a freshly generated `created` would clobber the original on
+   every update. `update` already fetches the whole partition to assemble current
+   state, so the stored `created` is read back from those raw items, keyed by
+   `sk`, and re-emitted verbatim. A row that is new in this write gets `created`
+   = `updated` = now.
+3. **Per-row semantics.** `updated` records when *that row* last changed. A
+   diff-based update rewrites only the groups whose content changed, so rows the
+   mutation did not touch keep their stored `updated` — which is what a
+   downstream sync guarding writes with
+   `attribute_exists(updated) and updated < :updated` needs. There is
+   deliberately no forced rewrite of the root item to give the aggregate a
+   single "modified" marker: it would cost an extra item in an extra transaction
+   on every update, and the per-row stamp already answers the question the marker
+   was standing in for.
+4. **Generated values win over `context`.** Context fields are merged onto edge
+   items during decomposition; timestamp injection runs later, so a root field
+   propagated via `context` under the same name is overwritten by the generated
+   value rather than racing it.
+
+**Read path.** The configured timestamp attribute names are stripped from
+assembled items alongside the other DynamoDB metadata (`__edd_e__`, keys, index
+mirrors), so they never leak into the decoded domain object. A root model that
+declares the field itself follows the same collision rule as Entity, and in that
+case the value is kept and decoded normally.
+
+The `schema` half of each field config obeys **EDD-9044** exactly as it does on
+`Entity.make` — the aggregate shares the `resolveSystemFields` resolver.
 
 ### Optic-Powered Mutations
 
