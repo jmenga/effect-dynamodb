@@ -25,17 +25,20 @@ import {
   TransactionCancelled,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
+import type { TimestampsConfig } from "@effect-dynamodb/schema/internal/EntityConfig.js"
 import {
   buildDateTransform,
   matchDateRepresentation,
+  resolveSystemFields,
   substituteSchemaDeep,
   validateNoTransformOverride,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { type Context, Effect, type Optic, Schema, SchemaAST } from "effect"
+import { type Context, DateTime, Effect, type Optic, Schema, SchemaAST } from "effect"
 import * as Batch from "./Batch.js"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
 import { type EntityGet, fromDefinition as entityFromDefinition } from "./Entity.js"
+import { generateTimestampPrimitive } from "./internal/TransactableOps.js"
 import { fromAttributeMap, toAttributeMap, toAttributeValue } from "./Marshaller.js"
 import { resolvePrimaryKey, type Table, type TableConfig } from "./Table.js"
 
@@ -455,6 +458,21 @@ interface AggregateConfig<
    */
   readonly consistentRead?: boolean
   readonly context?: ReadonlyArray<string>
+  /**
+   * Auto-managed `created` / `updated` attributes on every row this aggregate
+   * writes — the root item and all edge items, sub-aggregate groups included.
+   *
+   * Takes the same {@link TimestampsConfig} as `Entity.make`, so field names and
+   * `DynamoModel` storage annotations behave identically (a `schema` without a
+   * `DynamoEncoding` annotation throws EDD-9044 at make() time).
+   *
+   * `updated` is per row: it records when *that* row last changed. A diff-based
+   * `update` rewrites only the sub-aggregate groups whose content changed, so
+   * rows the mutation left alone keep their stored value. `created` is carried
+   * forward from the stored item on rewrite, since aggregate writes are `Put`
+   * rather than `UpdateItem`.
+   */
+  readonly timestamps?: TimestampsConfig
   readonly root: { readonly entityType: string }
   readonly edges: TEdges
 }
@@ -734,6 +752,62 @@ const makeAggregate = <TSchema extends Schema.Top>(
     )
   }
 
+  // System timestamps (#98). Aggregates compose their DynamoDB items directly
+  // rather than routing through Entity write ops, so Entity's timestamp
+  // machinery never reached these rows. Resolution goes through the SAME
+  // resolver as Entity, which means field names, `DynamoModel` storage
+  // annotations and the EDD-9044 guard on an un-annotated `schema` all behave
+  // identically here. Passing the root schema's fields also inherits Entity's
+  // collision rule: a date-compatible root field of the same name supplies the
+  // encoding, and a non-date one means the user owns the attribute outright.
+  const timestampFields = resolveSystemFields(
+    config.timestamps,
+    undefined,
+    undefined,
+    schemaFields ?? {},
+    {},
+    `Aggregate "${aggregateName}"`,
+  )
+  const stampFields: StampFields | undefined =
+    timestampFields.createdAt !== null || timestampFields.updatedAt !== null
+      ? {
+          createdAt: timestampFields.createdAt,
+          createdEncoding: timestampFields.createdAtEncoding,
+          updatedAt: timestampFields.updatedAt,
+          updatedEncoding: timestampFields.updatedAtEncoding,
+        }
+      : undefined
+  // Attributes the read path must drop before decoding. A field the root model
+  // declares itself is NOT stripped — it belongs to the domain object.
+  const systemAttrs: ReadonlySet<string> = new Set(
+    [
+      timestampFields.createdAtCollision ? null : timestampFields.createdAt,
+      timestampFields.updatedAtCollision ? null : timestampFields.updatedAt,
+    ].filter((name): name is string => name !== null),
+  )
+
+  /** Read stored `created` values back, keyed by sk, so a rewrite preserves them. */
+  const readExistingCreated = (
+    allItems: ReadonlyArray<Record<string, unknown>>,
+  ): ReadonlyMap<string, unknown> => {
+    const createdField = stampFields?.createdAt
+    if (createdField === undefined || createdField === null) return EMPTY_CREATED
+    const map = new Map<string, unknown>()
+    for (const item of allItems) {
+      const sk = item.sk
+      const prior = item[createdField]
+      if (typeof sk === "string" && prior !== undefined) map.set(sk, prior)
+    }
+    return map
+  }
+
+  /** Bind the per-write stamp: config + the Clock-backed instant + carry-forward. */
+  const stampFor = (
+    now: DateTime.Utc,
+    existingCreated: ReadonlyMap<string, unknown>,
+  ): Stamp | undefined =>
+    stampFields === undefined ? undefined : { fields: stampFields, now, existingCreated }
+
   // Build optics at construction time (once per aggregate definition)
   const classToPlain = Schema.toIso(schema) as Optic.Iso<
     Schema.Schema.Type<TSchema>,
@@ -802,6 +876,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           contextFields,
           key,
           aggregateName,
+          systemAttrs,
         )
         return result as Schema.Schema.Type<TSchema>
       }),
@@ -849,8 +924,16 @@ const makeAggregate = <TSchema extends Schema.Top>(
           assembled,
         )
 
-        // 6. Build DynamoDB items with composed keys (create only ever PUTs)
-        const dynamoGroups = buildDynamoItems(groups, config, pkValue, collectionSkComposites)
+        // 6. Build DynamoDB items with composed keys (create only ever PUTs).
+        //    Every row is new, so `created` has nothing to carry forward.
+        const now = yield* DateTime.now
+        const dynamoGroups = buildDynamoItems(
+          groups,
+          config,
+          pkValue,
+          collectionSkComposites,
+          stampFor(now, EMPTY_CREATED),
+        )
 
         // 7. Write via sub-aggregate transactions
         yield* writeTransactionGroups(
@@ -883,6 +966,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           contextFields,
           key,
           aggregateName,
+          systemAttrs,
         )
 
         // 2. Apply mutation — provide optics context for composable updates
@@ -953,11 +1037,17 @@ const makeAggregate = <TSchema extends Schema.Top>(
         //    collection SK composites only affect the LSI/GSI mirror attributes,
         //    never the (pk, sk) identity used to PUT or DELETE, so the old set's
         //    composites are irrelevant — we read only its (pk, sk) for deletes.
+        //    Rewritten rows are stamped `updated`; their stored `created` is read
+        //    back off the fetched partition and re-emitted verbatim, since these are
+        //    PUTs and would otherwise clobber it. The old set is only mined for
+        //    (pk, sk) delete keys, so it is never stamped.
+        const now = yield* DateTime.now
         const newDynamo = buildDynamoItems(
           newGroups,
           config,
           pkValue,
           KeyComposer.extractComposites(config.collection.sk?.composite ?? [], assembledNew),
+          stampFor(now, readExistingCreated(allItems)),
         )
         const oldDynamo = buildDynamoItems(
           oldGroups,
@@ -1118,6 +1208,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
               contextFields,
               key,
               aggregateName,
+              systemAttrs,
             )
             return result as Schema.Schema.Type<TSchema>
           })
@@ -1342,6 +1433,8 @@ const assembleAggregate = (
   _contextFields: ReadonlyArray<string>,
   key: Record<string, unknown>,
   aggregateName: string,
+  /** Library-managed attribute names (system timestamps) to drop before decode. */
+  systemAttrs: ReadonlySet<string> = EMPTY_ATTRS,
 ): Effect.Effect<unknown, AggregateAssemblyError | ValidationError> =>
   Effect.gen(function* () {
     // Find the root item
@@ -1369,7 +1462,7 @@ const assembleAggregate = (
     const edgeValues: Record<string, unknown> = {}
 
     for (const child of rootNode.children) {
-      const assembled = yield* assembleNode(child, allItems, key, aggregateName)
+      const assembled = yield* assembleNode(child, allItems, key, aggregateName, systemAttrs)
       if (child.fieldName !== null && assembled !== undefined) {
         edgeValues[child.fieldName] = assembled
       }
@@ -1394,6 +1487,7 @@ const assembleAggregate = (
       "gsi5sk",
       "lsi1sk",
       "lsi2sk",
+      ...systemAttrs,
     ])
 
     for (const [fieldKey, value] of Object.entries(rootItem)) {
@@ -1429,6 +1523,7 @@ const assembleNode = (
   allItems: Array<Record<string, unknown>>,
   key: Record<string, unknown>,
   aggregateName: string,
+  systemAttrs: ReadonlySet<string> = EMPTY_ATTRS,
 ): Effect.Effect<unknown, AggregateAssemblyError | ValidationError> =>
   Effect.gen(function* () {
     // Find items matching this node's entity type and discriminator
@@ -1467,7 +1562,13 @@ const assembleNode = (
           const childNode = node.discriminator
             ? { ...child, discriminator: { ...node.discriminator, ...child.discriminator } }
             : child
-          const assembled = yield* assembleNode(childNode, allItems, key, aggregateName)
+          const assembled = yield* assembleNode(
+            childNode,
+            allItems,
+            key,
+            aggregateName,
+            systemAttrs,
+          )
           if (child.fieldName !== null && assembled !== undefined) {
             edgeValues[child.fieldName] = assembled
           }
@@ -1482,6 +1583,7 @@ const assembleNode = (
           if (fieldKey === "__edd_e__") continue
           if (fieldKey.startsWith("pk") || fieldKey.startsWith("sk")) continue
           if (fieldKey.startsWith("gsi") || fieldKey.startsWith("lsi")) continue
+          if (systemAttrs.has(fieldKey)) continue
           if (edgeFieldNames.has(fieldKey)) continue
           // Skip discriminator attributes
           if (node.discriminator && fieldKey in node.discriminator) continue
@@ -1497,11 +1599,11 @@ const assembleNode = (
 
       // Return the item (stripped of DynamoDB metadata)
       const item = matchingItems[0]!
-      return stripMetadata(item)
+      return stripMetadata(item, systemAttrs)
     }
 
     // Many edge: collect all matching items
-    const stripped = matchingItems.map(stripMetadata)
+    const stripped = matchingItems.map((item) => stripMetadata(item, systemAttrs))
 
     if (node.assemble) {
       return node.assemble(stripped)
@@ -1514,12 +1616,18 @@ const assembleNode = (
 // Internal: Strip DynamoDB metadata from items
 // ---------------------------------------------------------------------------
 
-const stripMetadata = (item: Record<string, unknown>): Record<string, unknown> => {
+const EMPTY_ATTRS: ReadonlySet<string> = new Set()
+
+const stripMetadata = (
+  item: Record<string, unknown>,
+  systemAttrs: ReadonlySet<string> = EMPTY_ATTRS,
+): Record<string, unknown> => {
   const result: Record<string, unknown> = {}
   for (const [key, value] of Object.entries(item)) {
     if (key === "__edd_e__") continue
     if (key === "pk" || key === "sk") continue
     if (key.startsWith("gsi") || key.startsWith("lsi")) continue
+    if (systemAttrs.has(key)) continue
     result[key] = value
   }
   return result
@@ -2058,14 +2166,38 @@ const hashToShard = (value: string, cardinality: number): number => {
 // Internal: Compose DynamoDB items from decomposed data
 // ---------------------------------------------------------------------------
 
+/** Resolved timestamp attribute names + storage for one aggregate. */
+interface StampFields {
+  readonly createdAt: string | null
+  readonly createdEncoding: DynamoEncoding | null
+  readonly updatedAt: string | null
+  readonly updatedEncoding: DynamoEncoding | null
+}
+
+/** A single write's stamp: what to write, when, and what `created` to preserve. */
+interface Stamp {
+  readonly fields: StampFields
+  readonly now: DateTime.Utc
+  readonly existingCreated: ReadonlyMap<string, unknown>
+}
+
+const EMPTY_CREATED: ReadonlyMap<string, unknown> = new Map()
+
 /**
  * Convert decomposed items into DynamoDB attribute maps with composed keys.
+ *
+ * `stamp` is applied HERE rather than in `decomposeAggregate` on purpose: update
+ * diffs the decomposed groups (`deepEqualGroups`) to decide which sub-aggregate
+ * transactions to rewrite, so a timestamp mixed into decomposition would differ
+ * on every comparison and silently collapse the diff into a full-partition
+ * rewrite on every update (#98).
  */
 const buildDynamoItems = (
   groups: ReadonlyArray<TransactionGroup>,
   config: AggregateConfig<any>,
   pkValue: string,
   rootCollectionSkComposites: ReadonlyArray<string>,
+  stamp?: Stamp | undefined,
 ): ReadonlyArray<{ group: string; items: ReadonlyArray<Record<string, AttributeValue>> }> =>
   groups.map((group) => ({
     group: group.name,
@@ -2122,6 +2254,20 @@ const buildDynamoItems = (
           config.list.name,
           listSkComposites,
         )
+      }
+
+      // System timestamps — last, so a generated value wins over the same-named
+      // field propagated onto edge items via `context`.
+      if (stamp) {
+        const { existingCreated, fields, now } = stamp
+        const sk = attrs.sk as string
+        if (fields.createdAt !== null) {
+          const prior = existingCreated.get(sk)
+          attrs[fields.createdAt] = prior ?? generateTimestampPrimitive(now, fields.createdEncoding)
+        }
+        if (fields.updatedAt !== null) {
+          attrs[fields.updatedAt] = generateTimestampPrimitive(now, fields.updatedEncoding)
+        }
       }
 
       return toAttributeMap(attrs)

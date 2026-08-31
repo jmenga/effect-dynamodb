@@ -194,6 +194,27 @@ const MatchAggregate = Aggregate.make(Match, {
 })
 // #endregion
 
+// The same aggregate, with library-managed timestamps on every row it writes —
+// root and edges alike. Stored as epoch millis (`N`) rather than an ISO string.
+// #region aggregate-timestamps
+const AuditedMatchAggregate = Aggregate.make(Match, {
+  table: MainTable,
+  schema: CricketSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "audited-match" },
+  root: { entityType: "AuditedMatchItem" },
+  edges: {
+    venue: Aggregate.one("venue", { entityType: "AuditedMatchVenue", entity: Venues }),
+  },
+  timestamps: {
+    created: { field: "created", schema: DynamoModel.DateEpochMs },
+    updated: { field: "updated", schema: DynamoModel.DateEpochMs },
+  },
+})
+// #endregion
+
+void AuditedMatchAggregate
+
 // #region type-extractors
 type MatchDomain = Aggregate.Type<typeof MatchAggregate> // Match
 type MatchKey = Aggregate.Key<typeof MatchAggregate> // { id: string }

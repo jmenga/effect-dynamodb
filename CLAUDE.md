@@ -163,7 +163,7 @@ db.collections.assignments({ employee: "dfinlay" }).collect()
 | Entities define primary key + GSI indexes | `Entity.make({ primaryKey, indexes })` — entity is self-contained. Collections auto-discovered from `collection` property on indexes |
 | Collections auto-discovered from entity indexes | No explicit `Collections.make()` needed. Entities sharing the same `collection` name on the same physical GSI are grouped automatically |
 | BoundQuery fluent builder | `.filter().limit().collect()` — reads naturally, type-safe through method chaining, no `asEffect()` needed |
-| Aggregates compose entity ops | Never touch DynamoClient. Orchestrate Entity, Collection, Transaction |
+| Aggregates own their write path | Read: partition query + assembly. Write: decompose the domain object, compose the rows in `buildDynamoItems`, and issue one `transactWriteItems` per sub-aggregate group — they do NOT route writes through Entity ops, which is why entity-level config (e.g. `timestamps`) has to be re-declared on the aggregate |
 | ElectroDB-style composite indexes | `{ index: { name, pk, sk }, composite: [...], sk: [...] }` — GsiConfig with shared PK composites + entity SK composites |
 | `__edd_e__` entity type attribute | Ugly name convention avoids collisions with user model fields |
 | Vector indexes declared on the entity | `Entity.make({ vectorIndexes })` — the embedding + composed HASH partition are library-managed attributes (`__edd_v_*`, `__edd_vp_*`), so domain models stay pure and entity/tenant scoping is automatic. See `DESIGN.md §14` |
@@ -474,10 +474,11 @@ Each of the four publishable packages must be configured on npmjs.com with this 
 ### Aggregate Operations
 - **Edge entities are first-class.** Own models, keys, indexes, and configuration. Composed via `Aggregate.one()`, `Aggregate.many()`, `BoundSubAggregate`.
 - **Write-time ref hydration.** Framework fetches referenced entity at create/update time, denormalizes into edge entity. Read path is cheap.
-- **Aggregates never touch DynamoClient directly.** Read: Collection query + assembly. Write: decompose into entity ops wrapped in Transaction. Diff-based updates only write changed edges.
+- **Aggregates compose their own rows.** Read: partition query + assembly. Write: `decomposeAggregate` → `buildDynamoItems` (keys, `__edd_e__`, context, system timestamps) → one `transactWriteItems` per sub-aggregate group. Entity write ops are NOT in the path — anything Entity does at write time (timestamps, versioning) must be implemented for aggregates separately. Diff-based updates only write changed groups.
 - **Discriminator SK format is `name#value`.** `{ teamNumber: 1 }` → `#teamNumber#1`.
 - **Domain models are pure.** Entity association declared at edge level in `Aggregate.make()`, not in Schema.Class model.
 - **Aggregate.update mutation context.** Receives `UpdateContext` with: `state` (plain object), `cursor` (pre-bound optic), `optic` (composable optic), `current` (Schema.Class instance).
+- **System timestamps via `Aggregate.make({ timestamps })`.** Same `TimestampsConfig` as `Entity.make`, applied to every row the aggregate writes (root + edges + sub-aggregate groups). Stamped in `buildDynamoItems` — AFTER the update diff, so timestamps never defeat diff narrowing. `created` is carried forward from the stored row (aggregate writes are `Put`); `updated` is per row, so rows a diff leaves alone keep their value. Timestamp attributes are stripped on the read path unless the root model declares the field itself.
 - **Optional sub-aggregates supported.** `Schema.optionalKey` → decomposition skips null/undefined, assembly omits the key entirely.
 
 ## MCP Servers

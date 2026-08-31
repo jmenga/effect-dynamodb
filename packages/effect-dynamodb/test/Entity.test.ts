@@ -5655,6 +5655,71 @@ describe("Entity", () => {
         expect(epochVal).toBe(FROZEN_SECONDS)
       }).pipe(Effect.provide(TestLayer)),
     )
+
+    // -----------------------------------------------------------------------
+    // Bare-schema form + EDD-9044 (#97)
+    // -----------------------------------------------------------------------
+
+    it.effect("bare schema form: default field name, overridden storage", () =>
+      Effect.gen(function* () {
+        const MetricEntity = withConfig(
+          Entity.make({
+            model: Metric,
+            entityType: "Metric",
+            primaryKey: {
+              pk: { field: "pk", composite: ["metricId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            // Schema-only override — the field name stays `updatedAt`.
+            timestamps: { updated: DynamoModel.DateEpochMs },
+          }),
+        )
+
+        yield* TestClock.adjust(Duration.millis(FROZEN_MS))
+        mockPutItem.mockResolvedValue({})
+        yield* MetricEntity.put({ metricId: "m-1", value: 42 }).asEffect()
+
+        const item = mockPutItem.mock.calls[0]![0].Item
+        expect(item.updatedAt.N).toBe(String(FROZEN_MS))
+        // The object form enables both slots; an omitted `created` keeps the
+        // default name and the default ISO-string storage.
+        expect(item.createdAt.S).toBeDefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // A `timestamps.schema` is read ONLY for its DynamoEncoding annotation — the
+    // library generates the value, so an un-annotated schema cannot describe the
+    // storage format. It used to be discarded silently, leaving an ISO string
+    // where the caller asked for a number (#97).
+    it("rejects a timestamps schema with no DynamoEncoding annotation", () => {
+      const make = (timestamps: Parameters<typeof Entity.make>[0]["timestamps"]) => () =>
+        Entity.make({
+          model: Metric,
+          entityType: "Metric",
+          primaryKey: {
+            pk: { field: "pk", composite: ["metricId"] },
+            sk: { field: "sk", composite: [] },
+          },
+          timestamps,
+        })
+
+      // Object form, both slots.
+      expect(make({ created: { field: "created", schema: Schema.Number } })).toThrow(/EDD-9044/)
+      expect(make({ updated: { field: "updated", schema: Schema.Number } })).toThrow(/EDD-9044/)
+      // Bare-schema form.
+      expect(make({ updated: Schema.Number })).toThrow(/EDD-9044/)
+      // An Effect date transform is still not a storage descriptor.
+      expect(make({ updated: Schema.DateTimeUtcFromMillis })).toThrow(/EDD-9044/)
+      // The message names the entity and the offending slot.
+      expect(make({ updated: Schema.Number })).toThrow(/Entity "Metric".*timestamps\.updated/s)
+      // Annotated schemas are accepted.
+      expect(make({ updated: DynamoModel.DateEpochMs })).not.toThrow()
+      expect(
+        make({
+          updated: DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds)),
+        }),
+      ).not.toThrow()
+    })
   })
 
   // ---------------------------------------------------------------------------

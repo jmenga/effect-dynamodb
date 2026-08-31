@@ -256,7 +256,50 @@ const MatchAggregate = Aggregate.make(Match, {
 | `consistentRead` | Use strongly consistent reads when assembling. Defaults to `false` |
 | `root` | Entity type for the root item |
 | `context` | Optional array of schema field names to propagate to all member items |
+| `timestamps` | Optional auto-managed `created` / `updated` attributes on every row the aggregate writes (see below) |
 | `edges` | Map of schema fields to edge descriptors, ref edges, or bound sub-aggregates |
+
+#### System Timestamps
+
+An aggregate composes its DynamoDB rows directly rather than routing them through
+`Entity` write ops, so entity-level `timestamps` never reach them. Configure them on the
+aggregate instead — it takes the same config, so field names and `DynamoModel` storage
+annotations behave exactly as they do on `Entity.make`:
+
+```typescript region="aggregate-timestamps" example="guide-aggregates.ts"
+const AuditedMatchAggregate = Aggregate.make(Match, {
+  table: MainTable,
+  schema: CricketSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "audited-match" },
+  root: { entityType: "AuditedMatchItem" },
+  edges: {
+    venue: Aggregate.one("venue", { entityType: "AuditedMatchVenue", entity: Venues }),
+  },
+  timestamps: {
+    created: { field: "created", schema: DynamoModel.DateEpochMs },
+    updated: { field: "updated", schema: DynamoModel.DateEpochMs },
+  },
+})
+```
+
+Every row the aggregate writes is stamped — the root item, `one` and `many` edges, and
+every row inside a sub-aggregate's transaction group.
+
+**`updated` is per row.** It records when *that row* last changed. `update` diffs the
+decomposition and rewrites only the sub-aggregate groups whose content actually changed,
+so rows a mutation leaves alone keep their stored value. That is what a downstream sync
+guarding its writes with `attribute_exists(updated) and updated < :updated` wants: rows
+that did not change do not need a new stamp.
+
+**`created` survives rewrites.** Aggregate writes are `Put`, not `UpdateItem`, so a
+rewritten row would otherwise lose its original create instant. The stored value is read
+back off the partition the update already fetched and re-emitted unchanged.
+
+Timestamp attributes are stripped on the read path, so they never appear on the assembled
+domain object. If you want them *in* the domain model, declare the field on the root schema
+under the same name — the library then manages it using the model's own encoding and the
+value is decoded normally.
 
 #### Do You Need a Secondary Index?
 
