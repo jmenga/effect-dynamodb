@@ -227,7 +227,7 @@ import { Entity } from "effect-dynamodb"
 | `entityType` | `string` | Yes | Discriminator stored as `__edd_e__` |
 | `primaryKey` | `{ pk: KeyDef, sk: KeyDef }` | Yes | Primary key composition rules |
 | `indexes` | `Record<string, GsiIndexDef>` | No | GSI index definitions with `name`, `pk`, `sk`, optional `collection` |
-| `timestamps` | `boolean \| { created?, updated? }` | No | Auto-managed `createdAt`/`updatedAt` |
+| `timestamps` | `boolean \| { created?, updated? }` | No | Auto-managed `createdAt`/`updatedAt`. Each slot takes a field name, a `DynamoModel` date schema (storage only), or `{ field?, schema? }`. A `schema` without a `DynamoEncoding` annotation throws `EDD-9044` at make() time |
 | `versioned` | `boolean \| { retain?, field?, ttl? }` | No | Auto-increment version with optional snapshot retention |
 | `softDelete` | `boolean \| { ttl?, preserveUnique? }` | No | Soft delete with optional TTL |
 | `unique` | `Record<string, string[]>` | No | Unique constraint definitions |

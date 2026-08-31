@@ -26,6 +26,7 @@ import type {
   BoundSubAggregate,
   SubAggregate,
 } from "./internal/AggregateTypes.js"
+import type { TimestampsConfig } from "./internal/EntityConfig.js"
 
 export type { Cursor, DiscriminatorConfig, UpdateContext } from "./internal/AggregateCursor.js"
 export {
@@ -120,6 +121,12 @@ interface AggregateConfig<
   readonly collection: CollectionConfig
   readonly list?: ListCollectionConfig
   readonly context?: ReadonlyArray<string>
+  /**
+   * Auto-managed `created` / `updated` attributes on every row the aggregate
+   * writes. Accepted here for parity with the operational `Aggregate.make` in
+   * `effect-dynamodb`, which owns the write path that stamps them.
+   */
+  readonly timestamps?: TimestampsConfig
   readonly root: { readonly entityType: string }
   readonly edges: TEdges
 }

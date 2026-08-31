@@ -406,6 +406,7 @@ export const buildEntityDefinition = (config: {
     config.timeSeries,
     modelFields,
     configuredAttributes,
+    `Entity "${config.entityType}"`,
   )
 
   // ---------------------------------------------------------------------------

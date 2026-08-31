@@ -116,8 +116,13 @@ const getSchemaProp = (schema: Schema.Top, prop: "schema" | "value"): Schema.Top
   return undefined
 }
 
-/** A schema is any object or function (class constructor) carrying `.ast`. */
-const isSchemaLike = (value: unknown): value is Schema.Top =>
+/**
+ * A schema is any object or function (class constructor) carrying `.ast`.
+ *
+ * The `function` half is load-bearing: since Effect 4.0.0-rc every schema is
+ * callable, so a `typeof value === "object"` test alone silently rejects them.
+ */
+export const isSchemaLike = (value: unknown): value is Schema.Top =>
   value != null &&
   (typeof value === "object" || typeof value === "function") &&
   "ast" in (value as object)

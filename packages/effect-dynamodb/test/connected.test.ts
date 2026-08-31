@@ -305,6 +305,36 @@ const BlogPostAggregate = Aggregate.make(BlogPost, {
   },
 })
 
+// Aggregate with system timestamps (#98) — ElectroDB-shaped epoch-millis
+// storage, the shape a downstream sync guards with
+// `attribute_exists(updated) and updated < :updated`.
+class TimestampedPost extends Schema.Class<TimestampedPost>("TimestampedPost")({
+  id: Schema.String,
+  title: Schema.String,
+  meta: PostMeta,
+  comments: Schema.Array(Comment),
+}) {}
+
+const TimestampedPostAggregate = Aggregate.make(TimestampedPost, {
+  table: AggTable,
+  schema: AggSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: {
+    index: "gsi2",
+    name: "tspost",
+    sk: { field: "gsi2sk", composite: ["title"] },
+  },
+  root: { entityType: "TsPostRoot" },
+  edges: {
+    meta: Aggregate.one("meta", { entityType: "TsPostMeta" }),
+    comments: Aggregate.many("comments", { entityType: "TsPostComment" }),
+  },
+  timestamps: {
+    created: { field: "created", schema: DynamoModel.DateEpochMs },
+    updated: { field: "updated", schema: DynamoModel.DateEpochMs },
+  },
+})
+
 // ---------------------------------------------------------------------------
 // Shared Layer
 // ---------------------------------------------------------------------------
@@ -2587,7 +2617,7 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
       Effect.gen(function* () {
         const db = yield* DynamoClient.make({
           entities: { Authors, Articles },
-          aggregates: { BlogPostAggregate },
+          aggregates: { BlogPostAggregate, TimestampedPostAggregate },
           tables: { AggTable },
         })
         yield* db.tables.AggTable.create()
@@ -2762,6 +2792,89 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
       Effect.gen(function* () {
         const err = yield* BlogPostAggregate.get({ id: "nonexistent" }).pipe(Effect.flip)
         expect(err._tag).toBe("AggregateAssemblyError")
+      }).pipe(provideAgg),
+    )
+  })
+
+  // -------------------------------------------------------------------------
+  // Aggregate system timestamps (#98)
+  // -------------------------------------------------------------------------
+
+  describe("Aggregate timestamps", () => {
+    /** Raw stored rows for the timestamped aggregate, keyed by sk. */
+    const storedRows = Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const result = yield* client.scan({ TableName: aggTableName })
+      const rows = new Map<string, Record<string, { S?: string; N?: string }>>()
+      for (const item of result.Items ?? []) {
+        const entityType = (item.__edd_e__ as { S?: string } | undefined)?.S ?? ""
+        if (!entityType.startsWith("TsPost")) continue
+        rows.set((item.sk as { S?: string }).S!, item as never)
+      }
+      return rows
+    })
+
+    // `it.effect` runs on a TestClock frozen at epoch 0, so each test advances it
+    // to a known instant — the stored values are then exact, not just "present".
+    const T1 = 1_700_000_000_000
+    const T2 = T1 + 60_000
+
+    it.effect("create stamps every row as a DynamoDB number", () =>
+      Effect.gen(function* () {
+        yield* TestClock.adjust(Duration.millis(T1))
+        yield* TimestampedPostAggregate.create({
+          id: "ts-1",
+          title: "Stamped",
+          meta: { summary: "With timestamps", wordCount: 100 },
+          comments: [
+            { id: "c1", text: "First", commenter: "Charlie" },
+            { id: "c2", text: "Second", commenter: "Dana" },
+          ],
+        })
+
+        const rows = yield* storedRows
+        // root + meta + 2 comments
+        expect(rows.size).toBe(4)
+        for (const row of rows.values()) {
+          // Stored as `N`, not `S` — the whole point of the epoch-millis override.
+          expect(row.created!.N).toBe(String(T1))
+          expect(row.updated!.N).toBe(String(T1))
+          expect(row.created!.S).toBeUndefined()
+        }
+      }).pipe(provideAgg),
+    )
+
+    it.effect("update preserves created and advances updated", () =>
+      Effect.gen(function* () {
+        yield* TestClock.adjust(Duration.millis(T2))
+        const before = yield* storedRows
+
+        yield* TimestampedPostAggregate.update({ id: "ts-1" }, ({ cursor }) =>
+          cursor.key("title").replace("Stamped (Revised)"),
+        )
+
+        const after = yield* storedRows
+        expect(after.size).toBe(before.size)
+        for (const [sk, row] of after) {
+          const prior = before.get(sk)!
+          // PUT-based rewrites must not clobber the original create instant.
+          expect(row.created!.N).toBe(prior.created!.N)
+          expect(row.created!.N).toBe(String(T1))
+          expect(row.updated!.N).toBe(String(T2))
+        }
+      }).pipe(provideAgg),
+    )
+
+    it.effect("get assembles without leaking timestamp attributes", () =>
+      Effect.gen(function* () {
+        const post = yield* TimestampedPostAggregate.get({ id: "ts-1" })
+
+        expect(post.title).toBe("Stamped (Revised)")
+        expect(post.comments).toHaveLength(2)
+        expect(Object.keys(post)).not.toContain("created")
+        expect(Object.keys(post)).not.toContain("updated")
+        expect(Object.keys(post.meta)).not.toContain("updated")
+        expect(Object.keys(post.comments[0]!)).not.toContain("updated")
       }).pipe(provideAgg),
     )
   })
