@@ -676,4 +676,109 @@ describe("Transaction", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
   })
+
+  // -------------------------------------------------------------------------
+  // #100 — bound-CRUD builders as transact ops + conditions carried through
+  // -------------------------------------------------------------------------
+
+  describe("bound-CRUD builders as transact ops (#100)", () => {
+    it.effect("accepts a bound put from db.entities.*", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        const db = yield* DynamoClient.make({
+          entities: { UserEntity, OrderEntity },
+          tables: { MainTable },
+        })
+
+        yield* Transaction.transactWrite([
+          db.entities.UserEntity.put({
+            userId: "u-1",
+            email: "a@x.io",
+            name: "Alice",
+            role: "admin",
+          }),
+        ])
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(call.TransactItems).toHaveLength(1)
+        const item = fromAttributeMap(call.TransactItems[0].Put.Item)
+        expect(item.pk).toBe("$myapp#v1#user#userid_u-1")
+        expect(item.__edd_e__).toBe("User")
+        expect(call.TransactItems[0].Put.ConditionExpression).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("accepts a bound delete from db.entities.*", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        const db = yield* DynamoClient.make({
+          entities: { UserEntity, OrderEntity },
+          tables: { MainTable },
+        })
+
+        yield* Transaction.transactWrite([db.entities.UserEntity.delete({ userId: "u-1" })])
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        const key = fromAttributeMap(call.TransactItems[0].Delete.Key)
+        expect(key.pk).toBe("$myapp#v1#user#userid_u-1")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("carries `.condition()` from a bound put into the transact item", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        const db = yield* DynamoClient.make({
+          entities: { UserEntity, OrderEntity },
+          tables: { MainTable },
+        })
+
+        yield* Transaction.transactWrite([
+          db.entities.UserEntity.put({
+            userId: "u-1",
+            email: "a@x.io",
+            name: "Alice",
+            role: "admin",
+          }).condition({ role: "admin" }),
+        ])
+
+        const put = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Put
+        expect(put.ConditionExpression).toBeDefined()
+        expect(Object.values(put.ExpressionAttributeNames)).toContain("role")
+        expect(Object.values(put.ExpressionAttributeValues)).toEqual([{ S: "admin" }])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("carries create()'s implicit attribute_not_exists guard", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([
+          UserEntity.create({ userId: "u-1", email: "a@x.io", name: "Alice", role: "admin" }),
+        ])
+
+        const put = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Put
+        expect(put.ConditionExpression).toBe(
+          "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+        )
+        expect(put.ExpressionAttributeNames).toEqual({ "#e0": "pk", "#e1": "sk" })
+        // A value-free condition must NOT send an empty ExpressionAttributeValues map.
+        expect(put.ExpressionAttributeValues).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("carries a condition attached to an unbound delete", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([
+          UserEntity.deleteIfExists({ userId: "u-1" }) as Transaction.TransactWriteOp,
+        ])
+
+        const del = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Delete
+        expect(del.ConditionExpression).toBe("attribute_exists(#e0)")
+        expect(del.ExpressionAttributeNames).toEqual({ "#e0": "pk" })
+        expect(del.ExpressionAttributeValues).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
 })

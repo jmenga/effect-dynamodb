@@ -14,6 +14,8 @@
 import { Console, Data, Duration, Effect, Layer, Option, Schema } from "effect"
 
 import { DynamoClient } from "../src/DynamoClient.js"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
+import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
@@ -45,7 +47,24 @@ const Watermarks = Entity.make({
   },
 })
 
-const EventsTable = Table.make({ schema: AppSchema, entities: { Watermarks } })
+// A read model kept in step with the stream. Authored with the pure, AWS-free
+// `@effect-dynamodb/schema` package — it carries no CRUD ops, so its writes are
+// always built from the bound client (`db.entities.MatchStatus.put(...)`).
+const MatchStatusRecord = Schema.Struct({
+  matchId: Schema.String,
+  status: Schema.String,
+})
+
+const MatchStatus = PureEntity.make({
+  model: DynamoModel.configure(MatchStatusRecord, { matchId: { identifier: true } }),
+  entityType: "MatchStatus",
+  primaryKey: {
+    pk: { field: "pk", composite: ["matchId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const EventsTable = Table.make({ schema: AppSchema, entities: { Watermarks, MatchStatus } })
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -389,6 +408,23 @@ const program = Effect.gen(function* () {
   // #endregion
   const watermark = yield* Watermarks.get({ writerId: "ingest-1" })
   yield* Console.log(`Watermark committed with the event: lastSeq=${watermark.lastSeq}`)
+
+  // --- The read-model case: a put built from the bound client ---
+  yield* Console.log("\n=== Atomic side write: append + read model ===")
+  // #region additional-items-read-model
+  const db = yield* DynamoClient.make({ entities: { MatchStatus }, tables: { EventsTable } })
+
+  yield* matchEvents.append(
+    { matchId: "m-4" },
+    [new MatchStarted({ venue: "Basin Reserve", homeTeam: "NZL", awayTeam: "SAF" })],
+    0,
+    {
+      additionalItems: [db.entities.MatchStatus.put({ matchId: "m-4", status: "in-progress" })],
+    },
+  )
+  // #endregion
+  const status = yield* db.entities.MatchStatus.get({ matchId: "m-4" })
+  yield* Console.log(`Read model committed with the event: status=${status.status}`)
 
   // --- A failing user condition is NOT a version conflict ---
   yield* Console.log("\n=== Additional-item condition failure ===")

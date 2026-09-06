@@ -58,6 +58,42 @@ import type { PathBuilder } from "./PathBuilder.js"
 // Shared types
 // ---------------------------------------------------------------------------
 
+/**
+ * @internal Marker carried by every bound-CRUD builder so the transactable
+ * extraction protocol (`Entity.extractTransactable`) can unwrap a builder back
+ * to the `EntityOp` / `EntityDelete` intermediate it wraps.
+ *
+ * Bound builders are the ONLY way to author a write for an entity declared with
+ * the pure `@effect-dynamodb/schema` `Entity.make` (a pure definition carries no
+ * operations), so Batch/Transaction/EventStore must accept them — see #100.
+ */
+export const BoundOpTypeId: unique symbol = Symbol.for("effect-dynamodb/BoundOp")
+export type BoundOpTypeId = typeof BoundOpTypeId
+
+/** @internal Shape every bound-CRUD builder exposes for op extraction. */
+export interface BoundOp {
+  readonly [BoundOpTypeId]: BoundOpTypeId
+  /** @internal The wrapped unbound intermediate. */
+  readonly _op: unknown
+}
+
+/** @internal Narrow an unknown value to a bound-CRUD builder. */
+export const isBoundOp = (op: object): op is BoundOp => BoundOpTypeId in op
+
+/**
+ * A bound-CRUD builder accepted by `Batch.write`,
+ * `Transaction.transactWrite`, and `EventStore.append({ additionalItems })`.
+ *
+ * Type parameters are erased deliberately: `BoundPut<any, any, any, any>` is not
+ * a supertype of a concrete `BoundPut` (the `withVector` name parameter is
+ * contravariant and narrows to `never` for entities with no vector indexes), so
+ * the write unions match on the marker plus the op kind instead.
+ */
+export interface BoundWriteOp {
+  readonly [BoundOpTypeId]: BoundOpTypeId
+  readonly _boundOpType: "put" | "delete"
+}
+
 /** Condition input accepted by `.condition()` — callback or shorthand record. */
 export type ConditionArg<Model> =
   | ((t: PathBuilder<Model, Model, never>, ops: ConditionOps<Model>) => Expr)
@@ -93,6 +129,8 @@ const buildCondition = <Model>(cfg: BoundCrudConfig<Model>, arg: ConditionArg<Mo
  * ```
  */
 export interface BoundPut<Model, A, E, VN extends string = string> extends Pipeable.Pipeable {
+  readonly [BoundOpTypeId]: BoundOpTypeId
+  readonly _boundOpType: "put"
   /** Add a condition expression. Callback or shorthand. */
   readonly condition: (cond: ConditionArg<Model>) => BoundPut<Model, A, E, VN>
   /**
@@ -111,6 +149,8 @@ export interface BoundPut<Model, A, E, VN extends string = string> extends Pipea
 export class BoundPutImpl<Model, A, E, VN extends string = string>
   implements BoundPut<Model, A, E, VN>
 {
+  readonly [BoundOpTypeId]: BoundOpTypeId = BoundOpTypeId as BoundOpTypeId
+  readonly _boundOpType = "put" as const
   constructor(
     readonly _op: EntityPut<A, any, E, any>,
     readonly _config: BoundCrudConfig<Model>,
@@ -155,6 +195,8 @@ export class BoundPutImpl<Model, A, E, VN extends string = string>
  * ```
  */
 export interface BoundDelete<Model, E> extends Pipeable.Pipeable {
+  readonly [BoundOpTypeId]: BoundOpTypeId
+  readonly _boundOpType: "delete"
   /** Add a condition expression. Callback or shorthand. */
   readonly condition: (cond: ConditionArg<Model>) => BoundDelete<Model, E>
   /** Set ReturnValues mode (`"none"` or `"allOld"`). */
@@ -167,6 +209,8 @@ export interface BoundDelete<Model, E> extends Pipeable.Pipeable {
 
 /** @internal */
 export class BoundDeleteImpl<Model, E> implements BoundDelete<Model, E> {
+  readonly [BoundOpTypeId]: BoundOpTypeId = BoundOpTypeId as BoundOpTypeId
+  readonly _boundOpType = "delete" as const
   constructor(
     readonly _op: EntityDelete<E, any>,
     readonly _config: BoundCrudConfig<Model>,
@@ -215,6 +259,8 @@ export class BoundDeleteImpl<Model, E> implements BoundDelete<Model, E> {
  * ```
  */
 export interface BoundUpdate<Model, A, U, E, VN extends string = string> extends Pipeable.Pipeable {
+  readonly [BoundOpTypeId]: BoundOpTypeId
+  readonly _boundOpType: "update"
   /** Set the fields to update (record-based SET). */
   readonly set: (updates: U) => BoundUpdate<Model, A, U, E, VN>
   /** Remove attributes (REMOVE clause). */
@@ -291,6 +337,8 @@ export interface BoundUpdate<Model, A, U, E, VN extends string = string> extends
 export class BoundUpdateImpl<Model, A, U, E, VN extends string = string>
   implements BoundUpdate<Model, A, U, E, VN>
 {
+  readonly [BoundOpTypeId]: BoundOpTypeId = BoundOpTypeId as BoundOpTypeId
+  readonly _boundOpType = "update" as const
   constructor(
     readonly _op: EntityUpdate<A, any, U, E, any>,
     readonly _config: BoundCrudConfig<Model>,
