@@ -9,11 +9,12 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import { DynamoError, type ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import type { Entity, EntityDelete, EntityGet, EntityPut } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
+import type { BoundWriteOp } from "./internal/BoundCrud.js"
 import {
   composePrimaryKey,
   resolveTableNames,
@@ -197,7 +198,14 @@ export const get = <const T extends ReadonlyArray<EntityGet<any, any, any, any>>
 // Batch.write — auto-chunk at 25, retry unprocessed
 // ---------------------------------------------------------------------------
 
-type BatchWriteOp = EntityPut<any, any, any, any> | EntityDelete<any, any>
+/**
+ * Union accepted by `Batch.write`. Bound-CRUD builders
+ * (`db.entities.X.put(...)` / `.delete(...)`) are accepted alongside the unbound
+ * intermediates — they are the only write descriptor available for entities
+ * authored with the pure, AWS-free `@effect-dynamodb/schema` `Entity.make`
+ * (#100).
+ */
+type BatchWriteOp = EntityPut<any, any, any, any> | EntityDelete<any, any> | BoundWriteOp
 
 /**
  * Batch-write any number of items across entities/tables.
@@ -236,6 +244,20 @@ export const write = (
 
       const entity = info.entity
       const { name: tableName } = yield* entity._tableTag
+
+      // BatchWriteItem has no ConditionExpression. Silently dropping a
+      // condition would turn `create()` into a blind overwrite, so reject
+      // instead — the caller wants `Transaction.transactWrite`.
+      if (info.condition !== undefined) {
+        return yield* new ValidationError({
+          entityType: entity.entityType,
+          operation: "batchWrite",
+          cause:
+            "Batch.write cannot apply a condition — BatchWriteItem has no ConditionExpression. " +
+            "Use Transaction.transactWrite for conditional writes (this includes create() and " +
+            "deleteIfExists(), which carry an implicit condition).",
+        })
+      }
 
       if (info.opType === "put") {
         const marshalledItem = yield* validateAndBuildPutItem(entity, info.input!, "batchWrite.put")

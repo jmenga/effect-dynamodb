@@ -1,5 +1,7 @@
 import { describe, expect, it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
 import {
   type AdditionalItemConditionFailed,
   AppendTooLarge,
@@ -55,7 +57,25 @@ const Watermarks = Entity.make({
   },
 })
 
-const EventsTable = Table.make({ schema: AppSchema, entities: { Watermarks } })
+// A read model authored with the PURE, AWS-free `@effect-dynamodb/schema`
+// `Entity.make` — the shape reported in #100. A pure definition carries no CRUD
+// ops, so the only put its author can build is the bound builder returned by
+// `db.entities.StatusProjection.put(...)`.
+const StatusRecord = Schema.Struct({
+  matchId: Schema.String,
+  state: Schema.String,
+})
+
+const StatusProjection = PureEntity.make({
+  model: DynamoModel.configure(StatusRecord, { matchId: { identifier: true } }),
+  entityType: "Status",
+  primaryKey: {
+    pk: { field: "pk", composite: ["matchId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const EventsTable = Table.make({ schema: AppSchema, entities: { Watermarks, StatusProjection } })
 
 class MatchStarted extends Schema.Class<MatchStarted>("MatchStarted")({
   venue: Schema.String,
@@ -1154,6 +1174,81 @@ describe("EventStore", () => {
         expect(error._tag).toBe("AppendTooLarge")
         expect((error as AppendTooLarge).count).toBe(101)
         expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // -----------------------------------------------------------------------
+    // #100 — the read-model use case: a put built from the bound client whose
+    // entity was authored with the pure `@effect-dynamodb/schema` Entity.make.
+    // Before the fix this failed with
+    // ValidationError { entityType: "unknown", operation: "EventStore.append.additionalItems" }.
+    // -----------------------------------------------------------------------
+
+    it.effect("commits a pure-authored read-model put atomically with the events", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        const db = yield* DynamoClient.make({
+          entities: { StatusProjection },
+          tables: { EventsTable },
+        })
+
+        yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [
+            db.entities.StatusProjection.put({ matchId: "m-1", state: "IN_PROGRESS" }),
+          ],
+        })
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(call.TransactItems).toHaveLength(2)
+        expect(fromAttributeMap(call.TransactItems[0].Put.Item).__edd_e__).toBe("match.event")
+
+        const projection = fromAttributeMap(call.TransactItems[1].Put.Item)
+        expect(call.TransactItems[1].Put.TableName).toBe("events-table")
+        expect(projection.__edd_e__).toBe("Status")
+        expect(projection.pk).toBe("$cricket#v1#status#matchid_m-1")
+        expect(projection.state).toBe("IN_PROGRESS")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("supports a bound delete from a pure-authored entity", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        const db = yield* DynamoClient.make({
+          entities: { StatusProjection },
+          tables: { EventsTable },
+        })
+
+        yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [db.entities.StatusProjection.delete({ matchId: "m-1" })],
+        })
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(fromAttributeMap(call.TransactItems[1].Delete.Key).pk).toBe(
+          "$cricket#v1#status#matchid_m-1",
+        )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("keeps cancellation indices aligned for a bound additional item", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValue(
+          cancelled([{ Code: "None" }, { Code: "ConditionalCheckFailed", Message: "stale" }]),
+        )
+        const db = yield* DynamoClient.make({
+          entities: { StatusProjection },
+          tables: { EventsTable },
+        })
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [
+            db.entities.StatusProjection.put({ matchId: "m-1", state: "IN_PROGRESS" }).condition({
+              state: "PRE_MATCH",
+            }),
+          ],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AdditionalItemConditionFailed")
+        expect((error as AdditionalItemConditionFailed).indices).toEqual([0])
       }).pipe(Effect.provide(TestLayer)),
     )
   })

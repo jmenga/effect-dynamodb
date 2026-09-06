@@ -50,6 +50,7 @@ import { Context, Crypto, DateTime, type Duration, Effect, Option, Schema, Strea
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import type { ConditionInput } from "./Expression.js"
 import {
+  isBoundOp,
   makeBoundAppend,
   makeBoundDelete,
   makeBoundPut,
@@ -6244,6 +6245,14 @@ export interface TransactableInfo {
   readonly entity: Entity
   readonly key?: globalThis.Record<string, unknown> | undefined
   readonly input?: globalThis.Record<string, unknown> | undefined
+  /**
+   * The condition attached to the op — via `.condition()` on a bound builder,
+   * `Entity.condition()` on an unbound intermediate, or implicitly by
+   * `Entity.create()` (`attribute_not_exists`) / `Entity.patch()`
+   * (`attribute_exists`). Consumers that cannot express a condition (BatchWrite)
+   * MUST reject the op rather than drop it.
+   */
+  readonly condition?: Expr | ConditionInput | undefined
 }
 
 /** @internal */
@@ -6253,6 +6262,8 @@ interface InternalEntityOp {
   readonly _entity: Entity
   readonly _key?: globalThis.Record<string, unknown>
   readonly _input?: globalThis.Record<string, unknown>
+  readonly _condition?: Expr | ConditionInput | undefined
+  readonly _updateState?: UpdateState
 }
 
 /** @internal */
@@ -6260,6 +6271,7 @@ interface InternalEntityDelete {
   readonly [EntityDeleteTypeId]: EntityDeleteTypeId
   readonly _entity: Entity
   readonly _key: globalThis.Record<string, unknown>
+  readonly _condition?: Expr | ConditionInput | undefined
 }
 
 const isEntityOp = (op: object): op is InternalEntityOp => EntityOpTypeId in op
@@ -6269,26 +6281,55 @@ const isEntityDelete = (op: object): op is InternalEntityDelete => EntityDeleteT
 /**
  * Extract transactable metadata from an Entity operation intermediate.
  * Returns undefined if the value is not a recognized entity operation.
+ *
+ * Bound-CRUD builders (`db.entities.X.put(...)`, `.create(...)`,
+ * `.delete(...)`, …) are unwrapped to the `EntityOp` / `EntityDelete` they wrap.
+ * That unwrapping is what lets entities authored with the pure, AWS-free
+ * `@effect-dynamodb/schema` `Entity.make` take part in `Batch.write`,
+ * `Transaction.transactWrite`, and `EventStore.append({ additionalItems })` — a
+ * pure definition carries no operations, so the bound builder is the only write
+ * descriptor its author can ever hold (#100).
  */
 export const extractTransactable = (op: unknown): TransactableInfo | undefined => {
   if (op == null || typeof op !== "object") return undefined
 
+  // Unwrap a bound-CRUD builder to the intermediate it wraps. Combinators on the
+  // builder (`.condition()`, `.set()`, …) are applied to that inner op, so the
+  // unwrapped value carries the full request.
+  const target = isBoundOp(op) ? (op._op as unknown) : op
+  if (target == null || typeof target !== "object") return undefined
+
   // Check for EntityOp intermediates (get, put, update)
-  if (isEntityOp(op)) {
-    if (op._opType === "get") {
-      return { opType: "get", entity: op._entity, key: op._key }
+  if (isEntityOp(target)) {
+    if (target._opType === "get") {
+      return { opType: "get", entity: target._entity, key: target._key }
     }
-    if (op._opType === "put") {
-      return { opType: "put", entity: op._entity, input: op._input }
+    if (target._opType === "put") {
+      return {
+        opType: "put",
+        entity: target._entity,
+        input: target._input,
+        condition: target._condition,
+      }
     }
-    if (op._opType === "update") {
-      return { opType: "update", entity: op._entity, key: op._key }
+    if (target._opType === "update") {
+      return {
+        opType: "update",
+        entity: target._entity,
+        key: target._key,
+        condition: target._updateState?.condition,
+      }
     }
   }
 
   // Check for EntityDelete intermediate
-  if (isEntityDelete(op)) {
-    return { opType: "delete", entity: op._entity, key: op._key }
+  if (isEntityDelete(target)) {
+    return {
+      opType: "delete",
+      entity: target._entity,
+      key: target._key,
+      condition: target._condition,
+    }
   }
 
   return undefined

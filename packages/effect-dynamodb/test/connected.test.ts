@@ -7430,7 +7430,30 @@ const EsWatermarks = Entity.make({
   },
 })
 
-const EsIdemTable = Table.make({ schema: esIdemSchema, entities: { EsWatermarks } })
+/**
+ * A read model authored with the PURE, AWS-free `@effect-dynamodb/schema`
+ * `Entity.make` — the #100 shape. A pure definition carries no CRUD ops, so the
+ * only write descriptor its author can hold is the bound builder returned by
+ * `db.entities.EsStatusProjection.put(...)`.
+ */
+const EsStatusRecord = Schema.Struct({
+  matchId: Schema.String,
+  state: Schema.String,
+})
+
+const EsStatusProjection = PureEntity.make({
+  model: DynamoModel.configure(EsStatusRecord, { matchId: { identifier: true } }),
+  entityType: "EsStatus",
+  primaryKey: {
+    pk: { field: "pk", composite: ["matchId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const EsIdemTable = Table.make({
+  schema: esIdemSchema,
+  entities: { EsWatermarks, EsStatusProjection },
+})
 
 class EsIdemMatchStarted extends Schema.Class<EsIdemMatchStarted>("EsIdemMatchStarted")({
   venue: Schema.String,
@@ -7648,6 +7671,164 @@ describeConnected("EventStore — additionalItems + idempotency (closes #85)", (
       const entityTypes = (raw.Items ?? []).map((i) => i.__edd_e__?.S)
       expect(entityTypes.filter((t) => t === "esmatch.command")).toHaveLength(2)
       expect(entityTypes.filter((t) => t === "esmatch.event")).toHaveLength(2)
+    }).pipe(provideEsIdem),
+  )
+
+  // -------------------------------------------------------------------------
+  // #100 — bound-CRUD builders as multi-item write ops.
+  //
+  // The headline `additionalItems` use case: commit a read model atomically
+  // with the events that produced it, where the read model was authored with
+  // the pure `@effect-dynamodb/schema` Entity.make. Before the fix this failed
+  // with ValidationError { entityType: "unknown" }.
+  // -------------------------------------------------------------------------
+
+  it.effect("commits a pure-authored read-model row atomically with the events (#100)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      yield* EsIdemMatchEvents.append(
+        { matchId: "proj-1" },
+        [new EsIdemMatchStarted({ venue: "Basin Reserve" })],
+        0,
+        {
+          additionalItems: [
+            db.entities.EsStatusProjection.put({ matchId: "proj-1", state: "IN_PROGRESS" }),
+          ],
+        },
+      )
+
+      const events = yield* EsIdemMatchEvents.read({ matchId: "proj-1" })
+      expect(events.map((e) => e.eventType)).toEqual(["EsIdemMatchStarted"])
+
+      const projection = yield* db.entities.EsStatusProjection.get({ matchId: "proj-1" })
+      expect(projection.state).toBe("IN_PROGRESS")
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("a failing condition on a bound additional item rolls the whole append back", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      yield* db.entities.EsStatusProjection.put({ matchId: "proj-2", state: "IN_PROGRESS" })
+
+      // The projection is already IN_PROGRESS, so this condition cannot hold.
+      // Before the fix the condition was dropped and the write silently applied.
+      const error = yield* EsIdemMatchEvents.append(
+        { matchId: "proj-2" },
+        [new EsIdemMatchStarted({ venue: "Seddon Park" })],
+        0,
+        {
+          additionalItems: [
+            db.entities.EsStatusProjection.put({ matchId: "proj-2", state: "COMPLETE" }).condition({
+              state: "PRE_MATCH",
+            }),
+          ],
+        },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("AdditionalItemConditionFailed")
+      expect((error as AdditionalItemConditionFailed).indices).toEqual([0])
+
+      // All-or-nothing: neither the event nor the projection update landed.
+      expect(yield* EsIdemMatchEvents.read({ matchId: "proj-2" })).toHaveLength(0)
+      const projection = yield* db.entities.EsStatusProjection.get({ matchId: "proj-2" })
+      expect(projection.state).toBe("IN_PROGRESS")
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("Transaction.transactWrite accepts bound builders from a pure entity (#100)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      yield* Transaction.transactWrite([
+        db.entities.EsStatusProjection.put({ matchId: "tx-1", state: "PRE_MATCH" }),
+        db.entities.EsStatusProjection.put({ matchId: "tx-2", state: "PRE_MATCH" }),
+      ])
+
+      expect((yield* db.entities.EsStatusProjection.get({ matchId: "tx-1" })).state).toBe(
+        "PRE_MATCH",
+      )
+      expect((yield* db.entities.EsStatusProjection.get({ matchId: "tx-2" })).state).toBe(
+        "PRE_MATCH",
+      )
+
+      yield* Transaction.transactWrite([db.entities.EsStatusProjection.delete({ matchId: "tx-2" })])
+      const gone = yield* db.entities.EsStatusProjection.get({ matchId: "tx-2" }).pipe(Effect.flip)
+      expect(gone._tag).toBe("ItemNotFound")
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("transactWrite honours create()'s attribute_not_exists guard (#100)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      yield* Transaction.transactWrite([
+        db.entities.EsStatusProjection.create({ matchId: "tx-create", state: "PRE_MATCH" }),
+      ])
+
+      // Second create on the same key must be rejected by real DynamoDB — before
+      // the fix the guard was dropped and this silently overwrote the row.
+      const error = yield* Transaction.transactWrite([
+        db.entities.EsStatusProjection.create({ matchId: "tx-create", state: "COMPLETE" }),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("TransactionCancelled")
+
+      const row = yield* db.entities.EsStatusProjection.get({ matchId: "tx-create" })
+      expect(row.state).toBe("PRE_MATCH")
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("Batch.write accepts bound builders from a pure entity (#100)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      yield* Batch.write([
+        db.entities.EsStatusProjection.put({ matchId: "bw-1", state: "PRE_MATCH" }),
+        db.entities.EsStatusProjection.put({ matchId: "bw-2", state: "PRE_MATCH" }),
+      ])
+
+      expect((yield* db.entities.EsStatusProjection.get({ matchId: "bw-1" })).state).toBe(
+        "PRE_MATCH",
+      )
+
+      yield* Batch.write([db.entities.EsStatusProjection.delete({ matchId: "bw-1" })])
+      const gone = yield* db.entities.EsStatusProjection.get({ matchId: "bw-1" }).pipe(Effect.flip)
+      expect(gone._tag).toBe("ItemNotFound")
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("Batch.write rejects a conditional op rather than dropping the condition", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      const error = yield* Batch.write([
+        db.entities.EsStatusProjection.create({ matchId: "bw-cond", state: "PRE_MATCH" }),
+      ]).pipe(Effect.flip)
+
+      expect(error._tag).toBe("ValidationError")
+      const gone = yield* db.entities.EsStatusProjection.get({ matchId: "bw-cond" }).pipe(
+        Effect.flip,
+      )
+      expect(gone._tag).toBe("ItemNotFound")
     }).pipe(provideEsIdem),
   )
 })

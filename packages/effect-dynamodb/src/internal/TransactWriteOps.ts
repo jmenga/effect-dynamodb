@@ -16,9 +16,11 @@ import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect } from "effect"
 import type { Entity, EntityDelete, EntityPut } from "../Entity.js"
 import { extractTransactable } from "../Entity.js"
-import type { ExpressionResult } from "../Expression.js"
+import type { ConditionInput, ExpressionResult } from "../Expression.js"
 import { toAttributeMap } from "../Marshaller.js"
 import type { TableConfig } from "../Table.js"
+import type { BoundWriteOp } from "./BoundCrud.js"
+import { compileExpr, type Expr, isExpr, parseShorthand } from "./Expr.js"
 import { composePrimaryKey, resolveTableNames, validateAndBuildPutItem } from "./TransactableOps.js"
 
 // ---------------------------------------------------------------------------
@@ -48,11 +50,48 @@ export type { TransactWriteItem }
  * Union of operations accepted by `transactWrite` and by `append`'s
  * `additionalItems`. The `any` positions are deliberate: op intermediates are
  * heterogeneous by design, and each element is narrowed at the call site.
+ *
+ * Bound-CRUD builders (`db.entities.X.put(...)` / `.create(...)` /
+ * `.delete(...)`) are accepted alongside the unbound intermediates. They are the
+ * only write descriptor available for entities authored with the pure,
+ * AWS-free `@effect-dynamodb/schema` `Entity.make` (#100).
  */
 export type TransactWriteOp =
   | EntityPut<any, any, any, any>
   | EntityDelete<any, any>
+  | BoundWriteOp
   | ConditionCheckOp
+
+/**
+ * Compile an op-attached condition (`Entity.create()`'s `attribute_not_exists`,
+ * `.condition(...)`, `Entity.condition(...)`) into a DynamoDB expression.
+ * `resolveDbName` maps domain field names to their stored attribute names.
+ */
+const compileOpCondition = (
+  entity: Entity,
+  cond: Expr | ConditionInput | undefined,
+): ExpressionResult | undefined => {
+  if (cond === undefined) return undefined
+  const expr = isExpr(cond) ? cond : parseShorthand(cond as Record<string, unknown>)
+  return compileExpr(expr, entity._resolveDbName) as ExpressionResult
+}
+
+/**
+ * Spread a compiled condition onto a `Put` / `Delete` / `ConditionCheck` entry.
+ * `ExpressionAttributeValues` is omitted when empty — DynamoDB rejects an empty
+ * map, and value-free conditions (`attribute_not_exists`, `attribute_exists`)
+ * produce one.
+ */
+const conditionFields = (condition: ExpressionResult | undefined) =>
+  condition === undefined
+    ? {}
+    : {
+        ConditionExpression: condition.expression,
+        ExpressionAttributeNames: condition.names,
+        ...(Object.keys(condition.values).length > 0
+          ? { ExpressionAttributeValues: condition.values }
+          : {}),
+      }
 
 // ---------------------------------------------------------------------------
 // buildTransactWriteItems
@@ -104,9 +143,19 @@ export const buildTransactWriteItems = (
       }
 
       if (info.opType === "put") {
-        opInfos.push({ type: "put", entity: info.entity, input: info.input! })
+        opInfos.push({
+          type: "put",
+          entity: info.entity,
+          input: info.input!,
+          condition: compileOpCondition(info.entity, info.condition),
+        })
       } else if (info.opType === "delete") {
-        opInfos.push({ type: "delete", entity: info.entity, key: info.key! })
+        opInfos.push({
+          type: "delete",
+          entity: info.entity,
+          key: info.key!,
+          condition: compileOpCondition(info.entity, info.condition),
+        })
       } else {
         return yield* new ValidationError({
           entityType: info.entity.entityType,
@@ -129,12 +178,19 @@ export const buildTransactWriteItems = (
           op.input!,
           `${operation}.put`,
         )
-        transactItems.push({ Put: { TableName: tableName, Item: marshalledItem } })
+        transactItems.push({
+          Put: {
+            TableName: tableName,
+            Item: marshalledItem,
+            ...conditionFields(op.condition),
+          },
+        })
       } else if (op.type === "delete") {
         transactItems.push({
           Delete: {
             TableName: tableName,
             Key: toAttributeMap(composePrimaryKey(op.entity, op.key!)),
+            ...conditionFields(op.condition),
           },
         })
       } else {
@@ -143,8 +199,7 @@ export const buildTransactWriteItems = (
             TableName: tableName,
             Key: toAttributeMap(composePrimaryKey(op.entity, op.key!)),
             ConditionExpression: op.condition!.expression,
-            ExpressionAttributeNames: op.condition!.names,
-            ExpressionAttributeValues: op.condition!.values,
+            ...conditionFields(op.condition),
           },
         })
       }

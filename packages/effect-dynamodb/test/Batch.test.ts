@@ -685,4 +685,72 @@ describe("Batch", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
   })
+
+  // -------------------------------------------------------------------------
+  // #100 — bound-CRUD builders as batch-write ops
+  // -------------------------------------------------------------------------
+
+  describe("bound-CRUD builders as write ops (#100)", () => {
+    it.effect("accepts a bound put and a bound delete from db.entities.*", () =>
+      Effect.gen(function* () {
+        mockBatchWriteItem.mockResolvedValueOnce({})
+        const db = yield* DynamoClient.make({
+          entities: { UserEntity, OrderEntity },
+          tables: { MainTable },
+        })
+
+        yield* Batch.write([
+          db.entities.UserEntity.put({
+            userId: "u-1",
+            email: "a@x.io",
+            name: "Alice",
+            role: "admin",
+          }),
+          db.entities.OrderEntity.delete({ orderId: "ord-1" }),
+        ])
+
+        const requests = mockBatchWriteItem.mock.calls[0]![0].RequestItems["test-table"]
+        expect(requests).toHaveLength(2)
+        const put = fromAttributeMap(requests[0].PutRequest.Item)
+        expect(put.pk).toBe("$myapp#v1#user#userid_u-1")
+        expect(put.__edd_e__).toBe("User")
+        const del = fromAttributeMap(requests[1].DeleteRequest.Key)
+        expect(del.pk).toBe("$myapp#v1#order#orderid_ord-1")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects a conditional write instead of silently dropping the condition", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { UserEntity, OrderEntity },
+          tables: { MainTable },
+        })
+
+        const error = yield* Batch.write([
+          db.entities.UserEntity.put({
+            userId: "u-1",
+            email: "a@x.io",
+            name: "Alice",
+            role: "admin",
+          }).condition({ role: "admin" }),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).operation).toBe("batchWrite")
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects create() — its attribute_not_exists guard is unexpressible", () =>
+      Effect.gen(function* () {
+        const error = yield* Batch.write([
+          UserEntity.create({ userId: "u-1", email: "a@x.io", name: "Alice", role: "admin" }),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).entityType).toBe("User")
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
 })
