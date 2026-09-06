@@ -85,7 +85,7 @@ const bobs = yield* db.entities.Memberships.primary({
 }).collect()
 ```
 
-Behavior is symmetric with GSI accessors: `.where()`, `.filter()`, `.select()`, `.limit()`, `.reverse()`, `.startFrom()`, `.consistentRead()`, `.collect()`, `.fetch()`, `.paginate()`, and `.count()` all chain off the returned `BoundQuery`.
+Behavior is symmetric with GSI accessors: `.where()`, `.filter()`, `.select()`, `.limit()`, `.pageSize()`, `.maxPages()`, `.reverse()`, `.startFrom()`, `.consistentRead()`, `.collect()`, `.fetch()`, `.paginate()`, and `.count()` all chain off the returned `BoundQuery`.
 
 ### How much of the sort key an accessor pins
 
@@ -224,16 +224,53 @@ const allProjectTasks = yield* db.entities.TaskEntity.byProject({
 }).collect()
 ```
 
+### `limit` vs `pageSize`
+
+These are two different ideas, and they do not share a word:
+
+| Combinator | Contract | Sets DynamoDB `Limit`? |
+|---|---|---|
+| `.limit(n)` | Return **at most `n` items** — a contract on results | No |
+| `.pageSize(n)` | Fetch in **batches of `n` rows** — a contract on round trips | Yes |
+| `.maxPages(n)` | Stop after **`n` requests**, however many items that yielded | No |
+
+```typescript region="limit-vs-pagesize" example="guide-queries.ts"
+// `limit` bounds the RESULT — at most 3 tasks come back
+const firstThree = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+  .limit(3)
+  .collect()
+
+// `pageSize` bounds each ROUND TRIP — every match comes back, fetched in
+// requests of 2
+const inBatches = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+  .pageSize(2)
+  .collect()
+
+// Both compose — requests of 2, accumulating until 5 items
+const batchedAndCapped = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+  .pageSize(2)
+  .limit(5)
+  .collect()
+```
+
+`.limit(n)` works under a `.filter()`, and this is the reason the two are separate. DynamoDB's `Limit` bounds the rows **examined**, and a `FilterExpression` is applied *after* that — so `Limit` can never express "give me 3 matching items". `.limit()` is satisfied by accumulating across requests until `n` items are accepted or the key range is exhausted; `.pageSize()` is what each of those requests asks for. On a large partition with a very selective filter, pair `.limit()` with `.maxPages()` to bound the work.
+
+:::caution[Changed in 1.16]
+`.limit(n)` used to set DynamoDB's per-request `Limit`, which meant `.limit(3).collect()` returned **every** matching item, fetched in pages of 3. It now returns 3. If you were using `.limit()` as a page-size hint, move to `.pageSize()` — `.limit(2).paginate()` streaming everything in pages of 2 becomes `.pageSize(2).paginate()`.
+:::
+
 ### Single Page
 
-`.fetch()` returns a page containing matching items (up to the `limit`) and an optional cursor for pagination:
+`.fetch()` returns one page of items plus an optional cursor. Without a `.limit()`, a page is one DynamoDB request; with `.limit(n)`, a page is `n` items and the request loop fills it:
 
 ```typescript region="single-page" example="guide-queries.ts"
 // Single page with limit — returns page with items and cursor
 const page = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" }).limit(3).fetch()
 // page.items: Task[] (up to 3 items)
-// page.cursor: string | null (pass to startFrom for next page)
+// page.cursor: string | null — resumes after the 3rd item, or null when done
 ```
+
+The cursor always resumes **after the last item you were handed**, even when the underlying request read past it and the surplus was discarded. `cursor: null` means the key range is genuinely exhausted.
 
 ### Cursor-Based Pagination
 
@@ -278,8 +315,13 @@ const activeScan = yield* tasks.scan().filter({ status: "active" }).collect()
 ```
 
 ```typescript region="scan-limit" example="guide-queries.ts"
-// Scan with limit
+// Scan with limit — at most 3 items come back
 const firstPage = yield* tasks.scan().limit(3).collect()
+```
+
+```typescript region="scan-page-size" example="guide-queries.ts"
+// Scan in batches — every item comes back, read 3 rows per request
+const batchedScan = yield* tasks.scan().pageSize(3).collect()
 ```
 
 ```typescript region="scan-consistent" example="guide-queries.ts"
@@ -327,7 +369,7 @@ Consistent reads cost 2x the read capacity of eventually-consistent reads. Use t
 By default, results are in ascending sort key order. Use `.reverse()` for descending:
 
 ```typescript region="reverse" example="guide-queries.ts"
-// Most recent tasks first (descending sort key order)
+// The 3 most recent tasks (descending sort key order)
 const recent = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
   .reverse()
   .limit(3)

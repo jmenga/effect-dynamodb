@@ -1515,8 +1515,9 @@ Query.where({ status: "active", createdAt: { gte: someDate } })
 Query.filter({ email: { contains: "@company.com" } })
 
 // 5. Shape — pagination, ordering
-Query.limit(10)
-Query.reverse    // scanForward = false
+Query.limit(10)    // at most 10 ITEMS (accumulates across requests)
+Query.pageSize(10) // 10 rows examined per REQUEST (DynamoDB `Limit`)
+Query.reverse      // scanForward = false
 
 // 6. Execute — terminal, crosses into Effect
 Query.execute    // Query<A> => Effect<A, DynamoError, DynamoClient>

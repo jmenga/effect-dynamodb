@@ -5286,6 +5286,7 @@ const makeImpl = <
       entityTypes: [entityType],
       decoder: (raw) => decodeHistory(raw),
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
+      keyFields: [primary.pk.field, primary.sk.field],
     }).pipe(Query.where({ beginsWith: prefix }))
   }
 
@@ -5315,6 +5316,12 @@ const makeImpl = <
         entityTypes: [entityType],
         decoder: (raw) => decodeRecord(raw),
         resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
+        keyFields: [
+          indexDef.pk.field,
+          indexDef.sk.field,
+          config.indexes.primary.pk.field,
+          config.indexes.primary.sk.field,
+        ],
       })
       if (hasSkComposites) {
         // `composeSortKeyBeginsWith`, not `composeSortKeyPrefix` — the operand
@@ -5345,6 +5352,7 @@ const makeImpl = <
       entityTypes: [entityType],
       decoder: (raw) => decodeRecord(raw),
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
+      keyFields: [config.indexes.primary.pk.field, config.indexes.primary.sk.field],
     })
 
   // ---------------------------------------------------------------------------
@@ -5407,6 +5415,7 @@ const makeImpl = <
       entityTypes: [entityType],
       decoder: (raw) => decodeRecord(raw),
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
+      keyFields: [primary.pk.field, primary.sk.field],
     }).pipe(Query.where({ beginsWith: versionPrefix }))
   }
 
@@ -5506,6 +5515,7 @@ const makeImpl = <
       entityTypes: [],
       decoder: (raw) => decodeDeleted(raw),
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
+      keyFields: [primary.pk.field, primary.sk.field],
     }).pipe(Query.where({ beginsWith: deletedPrefix }))
   }
 

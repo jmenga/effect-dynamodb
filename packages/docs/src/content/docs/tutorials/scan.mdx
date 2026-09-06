@@ -7,7 +7,7 @@ A product and review catalog that demonstrates **scan operations** -- reading al
 
 **What you'll learn:**
 - `db.entities.Entity.scan()` -- full-table scan returning a BoundQuery
-- BoundQuery combinators: `.filter()`, `.limit()`, `.consistentRead()` on scans
+- BoundQuery combinators: `.filter()`, `.limit()`, `.pageSize()`, `.consistentRead()` on scans
 - Terminals: `.collect()`, `.fetch()`, `.paginate()` for executing scans
 - Entity-type isolation -- scans automatically filter by `__edd_e__` so each entity only sees its own items
 - When to use scan vs query
@@ -156,7 +156,7 @@ Note that filters do **not** reduce read capacity -- DynamoDB still reads every 
 
 ### Scan with Limit
 
-`.limit()` controls how many items DynamoDB evaluates per request. Combined with `.collect()`, it caps the total results:
+`.limit()` bounds the **result**: at most `n` items come back, however many requests that takes. To size the requests themselves — DynamoDB's `Limit` — use `.pageSize()`:
 
 ```typescript region="scan-limit" example="scan.ts"
 const firstTwo = yield* db.entities.Products.scan().limit(2).collect()
@@ -241,7 +241,8 @@ Effect.runPromise(main).then(
 | **`db.entities.Entity.scan()`** | Returns a BoundQuery -- composable with all BoundQuery combinators |
 | **`.collect()` / `.paginate()`** | Terminals on BoundQuery -- execute a scan (or query) |
 | **`.filter()`** | Server-side FilterExpression on scans -- reduces network transfer |
-| **`.limit()`** | Caps items evaluated per DynamoDB request |
+| **`.limit()`** | Caps the number of items returned |
+| **`.pageSize()`** | Caps the rows examined per DynamoDB request (`Limit`) |
 | **`.consistentRead()`** | Strongly consistent reads at 2x RCU cost |
 | **Entity-type isolation** | `__edd_e__` filter ensures scans return only the matching entity type |
 | **Scan vs Query** | Scans read the whole table; queries target a partition -- prefer queries for app patterns |

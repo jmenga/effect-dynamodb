@@ -186,8 +186,18 @@ export interface BoundQueryBase<Model, SkRemaining, A> {
     (attributes: ReadonlyArray<string>): BoundQuery<Model, SkRemaining, Record<string, unknown>>
   }
 
-  /** Set the maximum number of items per DynamoDB page. */
+  /**
+   * Return at most `n` items — a contract on results. The query accumulates
+   * across as many requests as it takes, which is what makes it work under a
+   * `.filter()`. Use `.pageSize()` to size the requests themselves.
+   */
   readonly limit: (n: number) => BoundQuery<Model, SkRemaining, A>
+
+  /**
+   * Fetch in batches of `n` — sets DynamoDB's `Limit` (rows examined per
+   * request). A contract on round trips, not on what comes back.
+   */
+  readonly pageSize: (n: number) => BoundQuery<Model, SkRemaining, A>
 
   /** Set the maximum number of DynamoDB pages to fetch. */
   readonly maxPages: (n: number) => BoundQuery<Model, SkRemaining, A>
@@ -331,6 +341,10 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
   // --- pagination & ordering ---
   limit(n: number): BoundQueryImpl<Model, SkRemaining, A> {
     return new BoundQueryImpl(Query.limit(this._query, n), this._config)
+  }
+
+  pageSize(n: number): BoundQueryImpl<Model, SkRemaining, A> {
+    return new BoundQueryImpl(Query.pageSize(this._query, n), this._config)
   }
 
   maxPages(n: number): BoundQueryImpl<Model, SkRemaining, A> {

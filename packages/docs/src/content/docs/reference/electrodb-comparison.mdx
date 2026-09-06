@@ -69,6 +69,8 @@ ElectroDB is the most feature-rich existing DynamoDB ORM for TypeScript. This co
 | Transact get | `service.transaction.get(cb)` | `Transaction.transactGet(items)` | Parity |
 | Consistent reads | `consistent: true` | `Entity.consistentRead()`, `Query.consistentRead()` | Parity |
 | Projection expression | `attributes: [...]` | `Entity.select(callback | attrs)` | Parity |
+| Result limiting | `limit: N` (items returned) | `Query.limit(n)` / `.limit(n)` | Parity |
+| Page size | `limit` doubles as the per-request size | `Query.pageSize(n)` / `.pageSize(n)` | **Advantage** — result size and round-trip size are separate knobs |
 | Page count limiting | `pages: N` | `Query.maxPages(n)` | Parity |
 | Count mode | Count target | `Query.count` terminal (uses `Select: "COUNT"`) | Parity |
 | Params-only mode | `.params()` returns request without executing | `Query.asParams` | Parity |

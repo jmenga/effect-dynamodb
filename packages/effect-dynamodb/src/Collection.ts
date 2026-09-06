@@ -306,6 +306,12 @@ export const make = <
       entityTypes: targetEntityTypes,
       decoder,
       resolveTableName: firstEntity._tableTag.useSync((tc: TableConfig) => tc.name),
+      keyFields: [
+        sharedPkField,
+        sharedSkField,
+        firstEntity.indexes.primary?.pk.field,
+        firstEntity.indexes.primary?.sk.field,
+      ],
     })
   }
 
@@ -331,6 +337,12 @@ export const make = <
       skField: sharedSkField,
       entityTypes,
       resolveTableName: entityEntries[0]![1]._tableTag.useSync((tc: TableConfig) => tc.name),
+      keyFields: [
+        sharedPkField,
+        sharedSkField,
+        entityEntries[0]![1].indexes.primary?.pk.field,
+        entityEntries[0]![1].indexes.primary?.sk.field,
+      ],
       decoder: (raw) => {
         // This decoder gets called per-item, but Query.collect collects all items
         // We need to tag each item with its entity key so the caller can group
@@ -369,6 +381,12 @@ export const make = <
         entityTypes: [entity.entityType],
         decoder: (raw) => entity._decodeRecord(raw),
         resolveTableName: entity._tableTag.useSync((tc: TableConfig) => tc.name),
+        keyFields: [
+          sharedPkField,
+          sharedSkField,
+          entity.indexes.primary?.pk.field,
+          entity.indexes.primary?.sk.field,
+        ],
       })
 
       // Clustered entity selectors add begins_with on the entity SK prefix.

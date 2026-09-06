@@ -312,6 +312,7 @@ function tryDetectV2ChainRoot(
       }
       if (
         methodName === "limit" ||
+        methodName === "pageSize" ||
         methodName === "reverse" ||
         methodName === "filter" ||
         methodName === "select" ||

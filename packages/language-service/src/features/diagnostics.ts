@@ -567,6 +567,7 @@ function findQueryAccessorRoot(
       const combinator = callee.name.text
       if (
         combinator === "limit" ||
+        combinator === "pageSize" ||
         combinator === "reverse" ||
         combinator === "select" ||
         combinator === "where" ||

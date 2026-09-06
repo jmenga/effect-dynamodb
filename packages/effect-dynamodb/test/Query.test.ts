@@ -972,7 +972,7 @@ describe("Query", () => {
         const params = yield* makeTestQuery().pipe(
           Query.where({ beginsWith: "prefix" }),
           Query.filterExpr(ops.eq(pb.name, "Alice")),
-          Query.limit(10),
+          Query.pageSize(10),
           Query.asParams,
         )
 

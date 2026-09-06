@@ -177,6 +177,12 @@ export const nearby = <A>(
           entityTypes: [entity.entityType],
           decoder: decoder as (raw: Record<string, unknown>) => Effect.Effect<A, ValidationError>,
           resolveTableName,
+          keyFields: [
+            pkField,
+            skField,
+            entity.indexes.primary?.pk.field,
+            entity.indexes.primary?.sk.field,
+          ],
         }).pipe(Query.where({ between: [qc.lower, qc.upper] as const }))
 
         return Query.collect(query)

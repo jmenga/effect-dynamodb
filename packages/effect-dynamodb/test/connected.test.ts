@@ -1000,9 +1000,9 @@ describeConnected("Connected integration tests", () => {
       }).pipe(provide),
     )
 
-    it.effect("query with limit restricts per-page result count", () =>
+    it.effect("query with limit restricts the number of items returned", () =>
       Effect.gen(function* () {
-        // Query.limit sets DynamoDB Limit (per-page), Query.execute returns a single page
+        // Query.limit bounds the RESULT — one item comes back out of two.
         const page = yield* Tasks.query
           .byUser({ userId: "u-query" })
           .pipe(Query.limit(1), Query.execute)
@@ -1538,14 +1538,223 @@ describeConnected("Connected integration tests", () => {
           }).asEffect()
         }
 
-        // paginate with limit 2 per page returns a Stream of pages
+        // pageSize(2) reads 2 rows per request — every item still comes back.
         const stream = yield* Tasks.query
           .byUser({ userId: "u-paginate" })
-          .pipe(Query.limit(2), Query.paginate)
+          .pipe(Query.pageSize(2), Query.paginate)
 
         const pages = yield* Stream.runCollect(stream)
         const allItems = Array.from(pages).flat()
         expect(allItems).toHaveLength(5)
+      }).pipe(provide),
+    )
+
+    it.effect("paginate with limit stops the stream at n items", () =>
+      Effect.gen(function* () {
+        for (let i = 0; i < 5; i++) {
+          yield* Tasks.put({
+            taskId: `t-page-limit-${i}`,
+            userId: "u-paginate-limit",
+            title: `Page Task ${i}`,
+            status: "todo",
+            priority: i,
+          }).asEffect()
+        }
+
+        // limit(2) bounds the RESULT — the stream ends after 2 items even
+        // though 5 match.
+        const stream = yield* Tasks.query
+          .byUser({ userId: "u-paginate-limit" })
+          .pipe(Query.limit(2), Query.paginate)
+
+        const pages = yield* Stream.runCollect(stream)
+        expect(Array.from(pages).flat()).toHaveLength(2)
+      }).pipe(provide),
+    )
+  })
+
+  // -------------------------------------------------------------------------
+  // limit vs pageSize (#105)
+  //
+  // `limit(n)`    — at most n items come back (a contract on RESULTS)
+  // `pageSize(n)` — DynamoDB `Limit`, rows examined per request (ROUND TRIPS)
+  //
+  // Exercised against real DynamoDB because the interesting cases are the ones
+  // mocks cannot reproduce: a filter rejecting whole pages, a request
+  // over-reading past the limit, and DynamoDB accepting a cursor that the
+  // library rebuilt from the last item it handed back.
+  // -------------------------------------------------------------------------
+
+  describe("limit vs pageSize", () => {
+    const LIMIT_USER = "u-limit-pagesize"
+
+    // priority 9 on the last two only — a filter on it is selective and,
+    // unlike `status`, it is not part of the byUser sort key.
+    const seedLimitTasks = Effect.gen(function* () {
+      for (let i = 1; i <= 6; i++) {
+        yield* Tasks.put({
+          taskId: `t-lim-${String(i).padStart(2, "0")}`,
+          userId: LIMIT_USER,
+          title: `Limit task ${i}`,
+          status: "todo",
+          priority: i >= 5 ? 9 : 1,
+        }).asEffect()
+      }
+    })
+
+    const boundTasks = Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Tasks },
+        tables: { MainTable },
+      })
+      return db.entities.Tasks
+    })
+
+    it.effect("collect: limit bounds the result, pageSize does not", () =>
+      Effect.gen(function* () {
+        yield* seedLimitTasks
+        const tasks = yield* boundTasks
+
+        const limited = yield* tasks.byUser({ userId: LIMIT_USER }).limit(4).collect()
+        expect(limited).toHaveLength(4)
+
+        const batched = yield* tasks.byUser({ userId: LIMIT_USER }).pageSize(2).collect()
+        expect(batched).toHaveLength(6)
+
+        const both = yield* tasks.byUser({ userId: LIMIT_USER }).pageSize(2).limit(5).collect()
+        expect(both).toHaveLength(5)
+      }).pipe(provide),
+    )
+
+    it.effect("collect: limit is satisfied across pages that the filter empties", () =>
+      Effect.gen(function* () {
+        yield* seedLimitTasks
+        const tasks = yield* boundTasks
+
+        // pageSize(1) with a filter only the last two items pass: the first
+        // four requests come back empty and pagination must keep going.
+        const highPriority = yield* tasks
+          .byUser({ userId: LIMIT_USER })
+          .filter((t, { gt }) => gt(t.priority, 5))
+          .pageSize(1)
+          .limit(2)
+          .collect()
+
+        expect(highPriority.map((t) => t.taskId)).toEqual(["t-lim-05", "t-lim-06"])
+      }).pipe(provide),
+    )
+
+    it.effect("collect: a limit larger than the partition returns what exists", () =>
+      Effect.gen(function* () {
+        yield* seedLimitTasks
+        const tasks = yield* boundTasks
+
+        const all = yield* tasks.byUser({ userId: LIMIT_USER }).limit(100).collect()
+        expect(all).toHaveLength(6)
+      }).pipe(provide),
+    )
+
+    it.effect("fetch: an over-read page rebuilds a cursor DynamoDB accepts", () =>
+      Effect.gen(function* () {
+        yield* seedLimitTasks
+        const tasks = yield* boundTasks
+
+        // A filtered request cannot be sized, so it examines the whole
+        // partition and accepts all 6 items while only 2 were asked for. The
+        // cursor must resume after the 2nd — not after the 6th, which is where
+        // LastEvaluatedKey would point.
+        const first = yield* tasks
+          .byUser({ userId: LIMIT_USER })
+          .filter({ status: "todo" })
+          .limit(2)
+          .fetch()
+        expect(first.items.map((t) => t.taskId)).toEqual(["t-lim-01", "t-lim-02"])
+        expect(first.cursor).not.toBeNull()
+
+        const second = yield* tasks
+          .byUser({ userId: LIMIT_USER })
+          .filter({ status: "todo" })
+          .limit(2)
+          .startFrom(first.cursor!)
+          .fetch()
+        expect(second.items.map((t) => t.taskId)).toEqual(["t-lim-03", "t-lim-04"])
+
+        const third = yield* tasks
+          .byUser({ userId: LIMIT_USER })
+          .filter({ status: "todo" })
+          .limit(2)
+          .startFrom(second.cursor!)
+          .fetch()
+        expect(third.items.map((t) => t.taskId)).toEqual(["t-lim-05", "t-lim-06"])
+        // Nothing left after the 6th item.
+        expect(third.cursor).toBeNull()
+      }).pipe(provide),
+    )
+
+    it.effect("fetch: limit accumulates across requests to fill the page", () =>
+      Effect.gen(function* () {
+        yield* seedLimitTasks
+        const tasks = yield* boundTasks
+
+        // Each request examines a single row, most of which the filter drops —
+        // the page is still filled.
+        const page = yield* tasks
+          .byUser({ userId: LIMIT_USER })
+          .filter((t, { gt }) => gt(t.priority, 5))
+          .pageSize(1)
+          .limit(2)
+          .fetch()
+
+        expect(page.items.map((t) => t.taskId)).toEqual(["t-lim-05", "t-lim-06"])
+      }).pipe(provide),
+    )
+
+    it.effect("paginate: limit caps the stream, pageSize sizes the requests", () =>
+      Effect.gen(function* () {
+        yield* seedLimitTasks
+        const tasks = yield* boundTasks
+
+        const capped = yield* Stream.runCollect(
+          tasks.byUser({ userId: LIMIT_USER }).limit(3).paginate(),
+        )
+        expect(Array.from(capped)).toHaveLength(3)
+
+        const streamed = yield* Stream.runCollect(
+          tasks.byUser({ userId: LIMIT_USER }).pageSize(2).paginate(),
+        )
+        expect(Array.from(streamed)).toHaveLength(6)
+      }).pipe(provide),
+    )
+
+    it.effect("count: limit caps the count, pageSize does not", () =>
+      Effect.gen(function* () {
+        yield* seedLimitTasks
+        const tasks = yield* boundTasks
+
+        expect(yield* tasks.byUser({ userId: LIMIT_USER }).count()).toBe(6)
+        expect(yield* tasks.byUser({ userId: LIMIT_USER }).pageSize(2).count()).toBe(6)
+        expect(yield* tasks.byUser({ userId: LIMIT_USER }).limit(4).count()).toBe(4)
+        expect(yield* tasks.byUser({ userId: LIMIT_USER }).limit(100).count()).toBe(6)
+        expect(
+          yield* tasks
+            .byUser({ userId: LIMIT_USER })
+            .filter((t, { gt }) => gt(t.priority, 5))
+            .limit(1)
+            .count(),
+        ).toBe(1)
+      }).pipe(provide),
+    )
+
+    it.effect("scan: limit bounds the result across the whole table", () =>
+      Effect.gen(function* () {
+        yield* seedLimitTasks
+        const tasks = yield* boundTasks
+
+        const scanned = yield* tasks.scan().limit(3).collect()
+        expect(scanned).toHaveLength(3)
+
+        const filtered = yield* tasks.scan().filter({ status: "todo" }).limit(2).collect()
+        expect(filtered).toHaveLength(2)
       }).pipe(provide),
     )
   })
