@@ -12,12 +12,13 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
-import type { Entity, EntityDelete, EntityGet, EntityPut } from "./Entity.js"
+import type { Entity, EntityDelete, EntityPut, TransactableInfo } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
-import type { BoundWriteOp } from "./internal/BoundCrud.js"
+import type { AnyGet, BoundWriteOp, GetSuccess } from "./internal/BoundCrud.js"
 import {
   batchRejectReason,
   composePrimaryKey,
+  getRejectReason,
   rejectUnsupportedOp,
   resolveTableNames,
   validateAndBuildPutItem,
@@ -44,10 +45,10 @@ export interface BatchRetryConfig {
 // ---------------------------------------------------------------------------
 
 /**
- * Map a tuple of EntityGet operations to a tuple of (A | undefined) results.
+ * Map a tuple of get descriptors to a tuple of (A | undefined) results.
  */
-type BatchGetResult<T extends ReadonlyArray<EntityGet<any, any, any, any>>> = {
-  -readonly [K in keyof T]: T[K] extends EntityGet<infer A, any, any, any> ? A | undefined : never
+type BatchGetResult<T extends ReadonlyArray<AnyGet>> = {
+  -readonly [K in keyof T]: GetSuccess<T[K]> | undefined
 }
 
 /**
@@ -58,16 +59,21 @@ type BatchGetResult<T extends ReadonlyArray<EntityGet<any, any, any, any>>> = {
  * DynamoDB batchGetItem doesn't preserve order, so results are matched
  * back to input positions by comparing composed primary key fields.
  *
+ * Accepts the unbound `EntityGet` intermediate or the `BoundGet` returned by
+ * `db.entities.X.get(...)` — the latter is the only read descriptor available
+ * for entities authored with the pure `@effect-dynamodb/schema` `Entity.make`
+ * (#108).
+ *
  * ```typescript
  * const [alice, bob, post] = yield* Batch.get([
  *   Users.get({ userId: "u-1" }),
- *   Users.get({ userId: "u-2" }),
+ *   db.entities.Users.get({ userId: "u-2" }),
  *   Posts.get({ postId: "p-1" }),
  * ])
  * // alice: User | undefined, bob: User | undefined, post: Post | undefined
  * ```
  */
-export const get = <const T extends ReadonlyArray<EntityGet<any, any, any, any>>>(
+export const get = <const T extends ReadonlyArray<AnyGet>>(
   items: T,
   config?: BatchRetryConfig,
 ): Effect.Effect<
@@ -84,14 +90,22 @@ export const get = <const T extends ReadonlyArray<EntityGet<any, any, any, any>>
 
     const client = yield* DynamoClient
 
-    // Extract entity info from each EntityGet intermediate
-    const infos = items.map((item) => {
+    // Unwrap each position to its get descriptor. A rejection belongs on the
+    // error channel, not as a defect — a thrown Error is neither catchable nor
+    // discriminable by the caller (the same judgement `Batch.write` made in
+    // #100).
+    const infos: Array<TransactableInfo> = []
+    for (const item of items) {
       const info = extractTransactable(item)
       if (!info || info.opType !== "get") {
-        throw new Error("Batch.get requires EntityGet intermediates")
+        return yield* new ValidationError({
+          entityType: "unknown",
+          operation: "batchGet",
+          cause: getRejectReason("Batch.get"),
+        })
       }
-      return info
-    })
+      infos.push(info)
+    }
 
     const tableNames = yield* resolveTableNames(infos)
 

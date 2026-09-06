@@ -1589,7 +1589,11 @@ yield* db.entities.Products.update({ productId: "p-1" })
   .expectedVersion(5)
 ```
 
-**Yieldable, not Effect.** Builders implement `Pipeable.Pipeable` and `[Symbol.iterator]` (via `Utils.SingleShotGen`) — the same contract as the unbound `EntityOp` and `EntityDelete` intermediates. You execute them by `yield*`ing inside `Effect.gen`. For interop with Effect combinators (`Effect.map`, `Effect.flip`, etc.) use `.asEffect()`.
+**Yieldable, not Effect.** The *write* builders implement `Pipeable.Pipeable` and `[Symbol.iterator]` (via `Utils.SingleShotGen`) — the same contract as the unbound `EntityOp` and `EntityDelete` intermediates. You execute them by `yield*`ing inside `Effect.gen`. For interop with Effect combinators (`Effect.map`, `Effect.flip`, etc.) use `.asEffect()`.
+
+**`BoundGet` is the exception, and must remain one.** `db.entities.X.get(key)` has returned a real `Effect` since the client gateway existed, and call sites depend on that: `db.entities.X.get(k).pipe(Effect.catchTag("ItemNotFound", …))`, `Effect.map`, `Effect.all`. So `BoundGet` is built on `Effectable.Prototype` and **is** an `Effect<A, E, never>` — the same mechanism `effect`'s own `Statement` uses for a builder that is also an Effect. It additionally carries the bound-op marker, which is what lets it be handed to `Batch.get`, `Transaction.transactGet` and `Transaction.check` (#108). Downgrading it to merely-yieldable would be a silent, wide breaking change.
+
+**One unwrap protocol, both directions.** A bound op joins the multi-item paths by carrying `BoundOpTypeId` plus `_op`; `Entity.extractTransactable` unwraps it to the underlying `EntityOp` / `EntityDelete`. That is the whole mechanism, for reads and writes alike — there is no second one to add. Because `BoundGet` wraps the entity's own `EntityGet`, the key it composes is by construction identical to the one `db.entities.X.get(key)` composes (both go through `entity._keyForm`; see §7). A value that is not a get descriptor is rejected with a `ValidationError` carrying **EDD-9051** on the error channel.
 
 **Immutable accumulator.** Every chainable call returns a new builder — same semantics as `BoundQuery`.
 
@@ -1597,6 +1601,7 @@ yield* db.entities.Products.update({ productId: "p-1" })
 
 | Builder | Method | Accepts |
 |---|---|---|
+| `BoundGet` | *(no combinators — it is an `Effect`)* | — |
 | `BoundPut` / `BoundCreate` / `BoundUpsert` | `.condition(cond)` | callback `(t, ops) => Expr` or shorthand record |
 | `BoundDelete` | `.condition(cond)` | same as above |
 | `BoundDelete` | `.returnValues(mode)` | `"none"` or `"allOld"` |

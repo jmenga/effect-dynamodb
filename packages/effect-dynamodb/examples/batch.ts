@@ -7,6 +7,8 @@
  *   - Auto-chunking: DynamoDB limits (100 get, 25 write) handled transparently
  *   - Typed tuple returns: each position matches the input entity type
  *   - Cross-entity batching: mix User and Order in the same batch
+ *   - Bound-client descriptors: db.entities.X.get() in Batch.get,
+ *     Transaction.transactGet and Transaction.check
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -22,7 +24,9 @@ import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
+import * as Expression from "../src/Expression.js"
 import * as Table from "../src/Table.js"
+import * as Transaction from "../src/Transaction.js"
 
 // ---------------------------------------------------------------------------
 // 1. Domain models
@@ -174,6 +178,62 @@ const program = Effect.gen(function* () {
   yield* Console.log(`Existing: ${existing?.name ?? "undefined"}`)
   yield* Console.log(`Missing: ${missing?.name ?? "undefined (as expected)"}`)
   yield* Console.log("")
+
+  // --- Batch.get / transactGet with bound-client descriptors ---
+  yield* Console.log("=== Bound-client get descriptors ===\n")
+
+  // #region batch-get-bound
+  // `db.entities.X.get(key)` IS an Effect — yield it, or pipe it into any
+  // Effect combinator, exactly as before.
+  const aliceDirect = yield* db.entities.Users.get({ userId: "u-1" })
+  const aliceRole = yield* db.entities.Users
+    .get({ userId: "u-1" })
+    .pipe(Effect.map((u) => u.role))
+
+  // It is ALSO a read descriptor, so it goes straight into Batch.get and
+  // Transaction.transactGet — which is what makes batch and transactional
+  // reads reachable for entities authored with the pure, AWS-free
+  // `@effect-dynamodb/schema` package (a pure definition carries no operations,
+  // so the bound client is the only surface its author holds).
+  const [aliceBatched, order1Batched] = yield* Batch.get([
+    db.entities.Users.get({ userId: "u-1" }),
+    db.entities.Orders.get({ orderId: "o-1" }),
+  ])
+
+  const [aliceTx, order1Tx] = yield* Transaction.transactGet([
+    db.entities.Users.get({ userId: "u-1" }),
+    db.entities.Orders.get({ orderId: "o-1" }),
+  ])
+  // #endregion
+
+  yield* Console.log(`Direct: ${aliceDirect.name} (${aliceRole})`)
+  yield* Console.log(`Batched: ${aliceBatched?.name} / ${order1Batched?.product}`)
+  yield* Console.log(`Transact: ${aliceTx?.name} / ${order1Tx?.product}`)
+  yield* Console.log("")
+
+  // --- Transaction.check on a row you are not writing ---
+  yield* Console.log("=== Transaction.check with a bound get ===\n")
+
+  // #region transact-check-bound
+  // A condition check on a row you are NOT writing — the standard way to
+  // assert a cross-entity invariant inside one transaction. `Transaction.check`
+  // takes the same bound descriptor.
+  yield* Transaction.transactWrite([
+    db.entities.Orders.put({
+      orderId: "o-9",
+      userId: "u-1",
+      product: "Sprocket",
+      quantity: 1,
+      status: "pending",
+    }),
+    Transaction.check(
+      db.entities.Users.get({ userId: "u-1" }),
+      Expression.condition({ attributeExists: "pk" }),
+    ),
+  ])
+  // #endregion
+
+  yield* Console.log("Order o-9 written, guarded by 'user u-1 still exists'\n")
 
   // --- Batch.write with deletes ---
   yield* Console.log("=== Batch.write — Mixed Put + Delete ===\n")

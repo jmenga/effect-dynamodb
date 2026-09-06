@@ -6,14 +6,18 @@
  * `R = never`. Each chainable call returns a new builder (immutable, mirroring
  * `BoundQuery`).
  *
- * Builders implement `Pipeable.Pipeable` + `[Symbol.iterator]` (via
+ * Write builders implement `Pipeable.Pipeable` + `[Symbol.iterator]` (via
  * `Utils.SingleShotGen`) — NOT `Effect.Effect`. They are yieldable inside
  * `Effect.gen`; use `.asEffect()` for Effect combinator interop.
+ *
+ * {@link BoundGet} is the deliberate exception: `get` has always returned a real
+ * `Effect`, so it is built on `Effectable.Prototype` and IS one. See the note on
+ * that type.
  */
 
 import type { ConditionalCheckFailed } from "@effect-dynamodb/schema/Errors.js"
 import type { Effect } from "effect"
-import { Pipeable, Utils } from "effect"
+import { Effectable, Pipeable, Utils } from "effect"
 import {
   add as addCombinator,
   append as appendCombinator,
@@ -40,6 +44,7 @@ import {
 import type {
   CascadeTarget,
   EntityDelete,
+  EntityGet,
   EntityPut,
   EntityUpdate,
   PathAddOp,
@@ -64,9 +69,14 @@ import type { PathBuilder } from "./PathBuilder.js"
  * extraction protocol (`Entity.extractTransactable`) can unwrap a builder back
  * to the `EntityOp` / `EntityDelete` intermediate it wraps.
  *
- * Bound builders are the ONLY way to author a write for an entity declared with
- * the pure `@effect-dynamodb/schema` `Entity.make` (a pure definition carries no
- * operations), so Batch/Transaction/EventStore must accept them — see #100.
+ * Bound builders are the ONLY way to author an operation for an entity declared
+ * with the pure `@effect-dynamodb/schema` `Entity.make` (a pure definition
+ * carries no operations), so Batch/Transaction/EventStore must accept them —
+ * see #100 (writes) and #108 (reads).
+ *
+ * There is exactly ONE unwrap protocol: carry this marker plus `_op`, and
+ * `Entity.extractTransactable` unwraps you. {@link BoundGet} joins it on the
+ * read side without a second mechanism.
  */
 export const BoundOpTypeId: unique symbol = Symbol.for("effect-dynamodb/BoundOp")
 export type BoundOpTypeId = typeof BoundOpTypeId
@@ -487,8 +497,116 @@ export class BoundUpdateImpl<Model, A, U, E, VN extends string = string>
 }
 
 // ---------------------------------------------------------------------------
+// BoundGet — the read descriptor, which is ALSO an Effect
+// ---------------------------------------------------------------------------
+
+/**
+ * Effect prototype backing {@link BoundGet}.
+ *
+ * The write builders being yieldable-but-not-Effect was a free choice:
+ * `db.entities.X.put(...)` never returned an `Effect` in the first place. `get`
+ * did. Callers write `db.entities.X.get(k).pipe(Effect.catchTag("ItemNotFound",
+ * …))` and hand the result to `Effect.map` / `Effect.all`, so a wrapper that was
+ * merely yieldable would be a silent, wide breaking change (#108).
+ *
+ * `Effectable.Prototype` is the supported way to make a descriptor evaluate as
+ * an Effect — the same mechanism `effect`'s own `Statement` (a query builder
+ * that is also an Effect) is built on. The result is not "Effect-like": it
+ * carries the Effect type id and prototype, so every combinator, `yield*` and
+ * `pipe` behaves exactly as it did before the wrapper existed.
+ *
+ * A `function` DECLARATION, deliberately: `BoundGetImpl` extends this, so it
+ * must have a [[Construct]] slot. An arrow function does not — rewriting it to
+ * one (as a formatter will happily do) fails at import time with "Class extends
+ * value is not a constructor".
+ */
+function BoundGetCtor(this: unknown) {}
+BoundGetCtor.prototype = Effectable.Prototype<Effect.Effect<unknown, unknown, never>>({
+  label: "BoundGet",
+  evaluate(this: Effect.Effect<unknown, unknown, never>) {
+    return (
+      this as unknown as { asEffect: () => Effect.Effect<unknown, unknown, never> }
+    ).asEffect()
+  },
+})
+
+const BoundGetBase = BoundGetCtor as unknown as new <A, E>() => Effect.Effect<A, E, never>
+
+/**
+ * The value returned by `db.entities.X.get(key)`.
+ *
+ * It IS an `Effect<A, E, never>` — yield it, pipe it, hand it to any Effect
+ * combinator, exactly as before. It additionally carries the bound-op marker, so
+ * `Batch.get`, `Transaction.transactGet` and `Transaction.check` can unwrap it
+ * back to the `EntityGet` descriptor they need, through the SAME protocol that
+ * unwraps the write builders (`Entity.extractTransactable`).
+ *
+ * That is what lets an entity authored with the pure, AWS-free
+ * `@effect-dynamodb/schema` `Entity.make` take part in batch reads,
+ * transactional reads and cross-entity condition checks: a pure definition
+ * carries no operations, so the bound client is the only surface its author ever
+ * holds (#108).
+ *
+ * ```ts
+ * const user = yield* db.entities.Users.get({ userId })          // Effect
+ * yield* db.entities.Users.get({ userId }).pipe(                 // Effect
+ *   Effect.catchTag("ItemNotFound", () => Effect.succeed(null)),
+ * )
+ * yield* Batch.get([db.entities.Users.get({ userId })])          // descriptor
+ * yield* Transaction.transactWrite([
+ *   Transaction.check(db.entities.Users.get({ userId }), cond),  // descriptor
+ * ])
+ * ```
+ */
+export interface BoundGet<A, E> extends Effect.Effect<A, E, never> {
+  readonly [BoundOpTypeId]: BoundOpTypeId
+  readonly _boundOpType: "get"
+  /**
+   * The Effect this value already is. Present so `.asEffect()` reads the same
+   * on every bound op.
+   */
+  readonly asEffect: () => Effect.Effect<A, E, never>
+}
+
+/** @internal */
+export class BoundGetImpl<A, E> extends BoundGetBase<A, E> implements BoundGet<A, E> {
+  readonly [BoundOpTypeId]: BoundOpTypeId = BoundOpTypeId as BoundOpTypeId
+  readonly _boundOpType = "get" as const
+  constructor(
+    readonly _op: EntityGet<A, any, E, any>,
+    readonly _config: BoundCrudConfig<any>,
+  ) {
+    super()
+  }
+
+  asEffect(): Effect.Effect<A, E, never> {
+    // `"record"` — the decode mode bound `get` has always run through.
+    return this._config.provide(
+      (this._op as unknown as { _run: (m: string) => Effect.Effect<A, E, any> })._run("record"),
+    )
+  }
+}
+
+/**
+ * Union of read descriptors accepted by `Batch.get`, `Transaction.transactGet`
+ * and `Transaction.check`: the unbound `EntityGet` intermediate, or the
+ * {@link BoundGet} returned by `db.entities.X.get(...)`.
+ */
+export type AnyGet = EntityGet<any, any, any, any> | BoundGet<any, any>
+
+/** Success type carried by an {@link AnyGet}, whichever half it is. */
+export type GetSuccess<T> =
+  T extends EntityGet<infer A, any, any, any> ? A : T extends BoundGet<infer A, any> ? A : never
+
+// ---------------------------------------------------------------------------
 // Factory helpers
 // ---------------------------------------------------------------------------
+
+/** @internal */
+export const makeBoundGet = <A, E>(
+  op: EntityGet<A, any, E, any>,
+  config: BoundCrudConfig<any>,
+): BoundGet<A, E> => new BoundGetImpl<A, E>(op, config)
 
 /** @internal */
 export const makeBoundPut = <Model, A, E, VN extends string = string>(
