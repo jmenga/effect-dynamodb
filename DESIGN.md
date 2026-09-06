@@ -2540,31 +2540,40 @@ db.Users.update(key, changes, { expectedVersion: 5 })
 
 ---
 
-### Key encoding: entity and aggregate paths differ
+### Key encoding: one rule for every path
 
-The two key paths are mirror images, and for a composite carrying an encoding
-transformation they compose different strings for the same logical value:
+Both paths compose keys through the same rule:
 
-| path | input it accepts | key composed from |
-|------|------------------|-------------------|
-| entity (`get`/`update`/`delete`/query) | Type (`420n`) | Encoded (`"420"`) |
-| aggregate (`create`/`get`) | Encoded (`"420"`) | Type (`420n`) |
+> Compose from the **Encoded** form, EXCEPT when the domain type is numeric
+> (`number`/`bigint`) and the encoded form is a **string** — then compose from the
+> numeric **Type** form so `serializeValue` pads it.
 
-A `Schema.BigIntFromString` composite of `420n` composes
-`…#00000000000000000000000000000000000420` through an aggregate — `serializeValue`
-pads a bigint to 38 digits — and `…#420` through an entity. Composites without a
-transformation, where Type and Encoded are the same value, are identical on both.
+`serializeValue` zero-pads numbers to 16 digits and bigints to 38 so they sort
+correctly; a numeric composite stored via its string wire form would skip that padding
+and sort lexicographically (`100 < 42 < 5`). `DynamoModel.DateEpochMs` composites use
+the encoded epoch, which pads as a number.
 
-Each path is internally consistent, so both work in isolation. Unifying them is a
-**storage-format change**: aggregates work today and callers have data in the Type-side
-format, so routing them through the entity codec would silently orphan those rows rather
-than fail. The entity path could be changed in 1.16 only because neither input spelling
-worked there beforehand, so no data existed in either format.
+Every composition site routes through this one function. `test/KeyFormInvariant.test.ts`
+reads each module as source text and fails if a `KeyComposer` call receives a record
+that did not — the guard exists because eleven modules each deciding independently is
+what produced the divergence it replaced.
 
-Unification belongs in a major, with a migration. Until then the case to watch is an
-aggregate and an entity sharing a partition and expecting byte-identical keys for a
-transformed composite — nothing detects that today. Pinned by
-`test/AggregateKeyEncoding.test.ts`.
+**This changed stored keys in 1.16.0, and rows written before it are orphaned.**
+
+- Entity keys and GSIs with a `Schema.BigIntFromString` or `Schema.NumberFromString`
+  composite: previously written unpadded (`…#seq_420`), now padded
+  (`…#seq_000…0420`). `put` succeeded and wrote those rows on 1.15.0 — only `get` was
+  broken — so **this data exists and must be rewritten** (read by scan, re-`put`).
+- Aggregate partition and collection keys with a `DateEpochMs` / `DateEpochSeconds`
+  composite: ISO form → padded epoch. Same migration.
+
+An earlier draft of this section argued the entity change needed no migration because
+"no data existed in either format". That was wrong: on 1.15.0 `put({seq: 420n})`
+succeeds and writes `seq_420`. Only reads were broken, so callers do have rows in the
+old format.
+
+Composites of every other shape — plain numbers, bigints, strings, `Schema.Date`,
+`DateTimeUtc`, literals — are byte-identical and need no migration.
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 
