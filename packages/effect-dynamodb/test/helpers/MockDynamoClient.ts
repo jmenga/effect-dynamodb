@@ -24,11 +24,8 @@ import { DynamoClient, type DynamoClientService } from "../../src/DynamoClient.j
 const notUsed = (operation: string) => () =>
   Effect.die(`DynamoClient.${operation} is not stubbed by this test`)
 
-/**
- * A complete `DynamoClientService` whose every operation dies when invoked.
- * Exported for tests that need the bare service value rather than a Layer.
- */
-export const unusedDynamoClient: DynamoClientService = {
+/** A complete `DynamoClientService` whose every operation dies when invoked. */
+const unusedDynamoClient: DynamoClientService = {
   createTable: notUsed("createTable"),
   deleteTable: notUsed("deleteTable"),
   describeTable: notUsed("describeTable"),
