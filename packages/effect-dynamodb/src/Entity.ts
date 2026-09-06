@@ -143,6 +143,7 @@ export {
   asModel,
   asNative,
   asRecord,
+  type ConditionPipeable,
   cascade,
   clearMap,
   consistentRead,
@@ -201,6 +202,7 @@ import type {
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import {
   asModel,
+  type ConditionPipeable,
   condition as conditionCombinator,
   expectedVersion,
   set,
@@ -782,6 +784,10 @@ export interface Entity<
    * // Shorthand
    * Teams.condition({ status: "active" })
    * ```
+   *
+   * Applying the returned pipeable widens the operation's error channel with
+   * {@link ConditionalCheckFailed}, so `Effect.catchTag("ConditionalCheckFailed", ...)`
+   * type-checks on the resulting Effect.
    */
   readonly condition: {
     (
@@ -789,24 +795,8 @@ export interface Entity<
         t: import("./internal/PathBuilder.js").PathBuilder<ModelType<TModel>, ModelType<TModel>>,
         ops: import("./internal/Expr.js").ConditionOps<ModelType<TModel>>,
       ) => import("./internal/Expr.js").Expr,
-    ): <
-      T extends
-        | EntityPut<any, any, any, any>
-        | EntityUpdate<any, any, any, any, any>
-        | EntityDelete<any, any>,
-    >(
-      self: T,
-    ) => T
-    (
-      shorthand: globalThis.Record<string, unknown>,
-    ): <
-      T extends
-        | EntityPut<any, any, any, any>
-        | EntityUpdate<any, any, any, any, any>
-        | EntityDelete<any, any>,
-    >(
-      self: T,
-    ) => T
+    ): ConditionPipeable
+    (shorthand: globalThis.Record<string, unknown>): ConditionPipeable
   }
 
   /**
@@ -3334,7 +3324,31 @@ const makeImpl = <
               })
               .pipe(
                 Effect.mapError(
-                  (err): DynamoClientError | OptimisticLockError | UniqueConstraintViolation => {
+                  (
+                    err,
+                  ):
+                    | DynamoClientError
+                    | OptimisticLockError
+                    | ConditionalCheckFailed
+                    | UniqueConstraintViolation => {
+                    // The main item's ConditionExpression carries the version CAS
+                    // (when the entity is versioned) ANDed with any user condition.
+                    // DynamoDB does not say which half rejected, so attribute the
+                    // failure to the version CAS whenever one is present, and to
+                    // the user condition only when it is the sole predicate —
+                    // otherwise an unversioned entity's `.condition()` rejection
+                    // would surface as a nonsensical OptimisticLockError.
+                    const mainItemRejection = (): OptimisticLockError | ConditionalCheckFailed => {
+                      if (!systemFields.version && userCond) {
+                        return new ConditionalCheckFailed({ entityType, key: decodedKey })
+                      }
+                      return new OptimisticLockError({
+                        entityType,
+                        key: decodedKey,
+                        expectedVersion: currentVersion,
+                        actualVersion: -1,
+                      })
+                    }
                     if (isAwsTransactionCancelled(err.cause)) {
                       const reasons = err.cause.CancellationReasons
                       if (reasons) {
@@ -3354,22 +3368,12 @@ const makeImpl = <
                         }
                         // Index 0 is the main item — version conflict or user condition
                         if (reasons[0]?.Code === "ConditionalCheckFailed") {
-                          return new OptimisticLockError({
-                            entityType,
-                            key: decodedKey,
-                            expectedVersion: currentVersion,
-                            actualVersion: -1,
-                          })
+                          return mainItemRejection()
                         }
                       }
                     }
                     if (isAwsConditionalCheckFailed(err.cause)) {
-                      return new OptimisticLockError({
-                        entityType,
-                        key: decodedKey,
-                        expectedVersion: currentVersion,
-                        actualVersion: -1,
-                      })
+                      return mainItemRejection()
                     }
                     return err as
                       | DynamoClientError
@@ -3941,6 +3945,29 @@ const makeImpl = <
             ? compileCondition(opts.condition, resolveDbName)
             : undefined
 
+          /**
+           * Map a rejected user condition on either transaction delete path
+           * (soft-delete, unique-constraint) to `ConditionalCheckFailed`.
+           *
+           * On both paths the current-item Delete sits at index 0 and is the
+           * only item carrying a ConditionExpression — the sentinel Deletes and
+           * the tombstone/snapshot Puts are unconditional — so an index-0
+           * cancellation can only be the user's condition. Every other reason
+           * falls through as the raw `DynamoClientError`.
+           */
+          const mapDeleteConditionFailure = (
+            err: DynamoClientError,
+          ): DynamoClientError | ConditionalCheckFailed => {
+            if (!userCondition) return err
+            const cancelledAtMainItem =
+              isAwsTransactionCancelled(err.cause) &&
+              err.cause.CancellationReasons?.[0]?.Code === "ConditionalCheckFailed"
+            if (cancelledAtMainItem || isAwsConditionalCheckFailed(err.cause)) {
+              return new ConditionalCheckFailed({ entityType, key: decodedKey })
+            }
+            return err
+          }
+
           if (isSoftDeleteEnabled()) {
             // --- Soft delete path ---
             // Read current item
@@ -3993,14 +4020,34 @@ const makeImpl = <
             // Build transaction
             type TransactItem = {
               Put?: { TableName: string; Item: globalThis.Record<string, AttributeValue> }
-              Delete?: { TableName: string; Key: globalThis.Record<string, AttributeValue> }
+              Delete?: {
+                TableName: string
+                Key: globalThis.Record<string, AttributeValue>
+                ConditionExpression?: string
+                ExpressionAttributeNames?: globalThis.Record<string, string>
+                ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
+              }
             }
             const transactItems: Array<TransactItem> = []
 
-            // Delete current entity item
-            transactItems.push({
-              Delete: { TableName: tableName, Key: marshalledKey },
-            })
+            // Delete current entity item — index 0, and the ONLY item in this
+            // transaction carrying a ConditionExpression, so a cancellation
+            // naming index 0 is unambiguously the user's condition. The guard
+            // rides the transaction rather than being pre-checked against the
+            // item read above: a client-side check would leave a race window
+            // between the read and the write.
+            const currentDelete: NonNullable<TransactItem["Delete"]> = {
+              TableName: tableName,
+              Key: marshalledKey,
+            }
+            if (userCondition) {
+              currentDelete.ConditionExpression = userCondition.expression
+              currentDelete.ExpressionAttributeNames = userCondition.names
+              if (Object.keys(userCondition.values).length > 0) {
+                currentDelete.ExpressionAttributeValues = userCondition.values
+              }
+            }
+            transactItems.push({ Delete: currentDelete })
 
             // Put soft-deleted item
             transactItems.push({
@@ -4056,9 +4103,11 @@ const makeImpl = <
             }
 
             yield* checkTransactionLimit(entityType, "delete", transactItems)
-            yield* client.transactWriteItems({
-              TransactItems: transactItems,
-            })
+            yield* client
+              .transactWriteItems({
+                TransactItems: transactItems,
+              })
+              .pipe(Effect.mapError(mapDeleteConditionFailure))
           } else if (hasUniqueConstraints) {
             // --- Hard delete with unique constraints ---
             // First get the item to find sentinel key values
@@ -4077,13 +4126,27 @@ const makeImpl = <
               Delete: {
                 TableName: string
                 Key: globalThis.Record<string, AttributeValue>
+                ConditionExpression?: string
+                ExpressionAttributeNames?: globalThis.Record<string, string>
+                ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
               }
             }> = []
 
-            // Delete entity item
-            transactItems.push({
-              Delete: { TableName: tableName, Key: marshalledKey },
-            })
+            // Delete entity item — index 0, and the only conditioned item (the
+            // sentinel Deletes below are unconditional), so an index-0
+            // cancellation is unambiguously the user's condition.
+            const entityDelete: (typeof transactItems)[number]["Delete"] = {
+              TableName: tableName,
+              Key: marshalledKey,
+            }
+            if (userCondition) {
+              entityDelete.ConditionExpression = userCondition.expression
+              entityDelete.ExpressionAttributeNames = userCondition.names
+              if (Object.keys(userCondition.values).length > 0) {
+                entityDelete.ExpressionAttributeValues = userCondition.values
+              }
+            }
+            transactItems.push({ Delete: entityDelete })
 
             // Delete sentinels (sparse — skip constraints whose fields were unset
             // on the live item; no sentinel was ever written for those)
@@ -4108,9 +4171,11 @@ const makeImpl = <
             }
 
             yield* checkTransactionLimit(entityType, "delete", transactItems)
-            yield* client.transactWriteItems({
-              TransactItems: transactItems.map((t) => ({ Delete: t.Delete })),
-            })
+            yield* client
+              .transactWriteItems({
+                TransactItems: transactItems.map((t) => ({ Delete: t.Delete })),
+              })
+              .pipe(Effect.mapError(mapDeleteConditionFailure))
           } else {
             // Simple delete
             const deleteInput: DeleteItemCommandInput = {
@@ -4127,17 +4192,7 @@ const makeImpl = <
             if (opts.returnValues) {
               deleteInput.ReturnValues = returnValuesMap[opts.returnValues]
             }
-            yield* client.deleteItem(deleteInput).pipe(
-              Effect.mapError((err): DynamoClientError | ConditionalCheckFailed => {
-                if (opts.condition && isAwsConditionalCheckFailed(err.cause)) {
-                  return new ConditionalCheckFailed({
-                    entityType,
-                    key: decodedKey,
-                  })
-                }
-                return err
-              }),
-            )
+            yield* client.deleteItem(deleteInput).pipe(Effect.mapError(mapDeleteConditionFailure))
           }
         }),
       self,
@@ -5400,8 +5455,25 @@ const makeImpl = <
 
   const purge = (key: unknown) =>
     new EntityDeleteImpl(
-      (_opts: { readonly condition: Expr | ConditionInput | undefined }) =>
+      (opts: { readonly condition: Expr | ConditionInput | undefined }) =>
         Effect.gen(function* () {
+          // `purge` is partition-wide — it queries every item under the key and
+          // batch-deletes in chunks, so there is no single item for a
+          // ConditionExpression to guard and no way to make one atomic across
+          // the batches. `.condition()` is structurally available because
+          // `purge` returns an `EntityDelete`; refuse it loudly rather than
+          // accept a guard that would never be sent.
+          if (opts.condition) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "purge.condition",
+              cause:
+                "[EDD-9047] .condition() is not supported on purge() — purge deletes every item " +
+                "in the partition across multiple batched writes, so a per-item ConditionExpression " +
+                "cannot be applied atomically. Guard the individual delete with " +
+                "delete(key).condition(...) instead.",
+            })
+          }
           const client = yield* DynamoClient
           const { name: tableName } = yield* tableTag
 

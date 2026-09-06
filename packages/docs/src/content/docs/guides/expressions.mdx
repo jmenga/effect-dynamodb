@@ -94,6 +94,51 @@ Products.condition({ status: "active", role: "admin" })
   Discrimination is automatic — if the first argument is a function, the callback API is used; if it's an object, the shorthand is used.
 </Aside>
 
+### Handling a Rejected Condition
+
+`.condition()` widens the operation's error channel with `ConditionalCheckFailed`, so a rejection is catchable by tag — the exhaustiveness of `catchTag` / `catchTags` is preserved, and a new failure introduced by an upgrade cannot silently fall into the same branch:
+
+```typescript region="condition-catch" example="guide-expressions.ts"
+  // #region condition-catch
+  // `.condition()` adds ConditionalCheckFailed to the error channel, so the
+  // rejection is catchable by tag — no `catchAll` + `_tag` inspection needed.
+  const outcome = yield* db.entities.Products.put({
+    ...baseProduct,
+    productId: "p-5",
+    name: "Duplicate",
+    category: "electronics",
+    price: 49.99,
+    stock: 10,
+  })
+    .condition((t, { notExists }) => notExists(t.productId))
+    .asEffect()
+    .pipe(
+      Effect.as("written"),
+      Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("already exists")),
+    )
+```
+
+<Aside type="note">
+  `ConditionalCheckFailed` appears **only after** `.condition()` is applied — an
+  unconditional `put` / `update` / `delete` cannot fail that way, and its channel
+  stays narrow.
+
+  One exception on updates: when a version CAS is also in play (`.expectedVersion(...)`,
+  or the automatic CAS on the `versioned` / unique-constraint transaction path), both
+  predicates ride the same `ConditionExpression` and DynamoDB does not say which half
+  failed. The rejection is attributed to the CAS and reported as `OptimisticLockError`.
+  With no version attribute the user condition is the only predicate, so the rejection
+  is reported as `ConditionalCheckFailed`.
+
+  On `delete`, the guard reaches DynamoDB on every path — the simple `DeleteItem`, the
+  soft-delete transaction, and the unique-constraint transaction. On the two transaction
+  paths it rides the current item's own `Delete`, which is the only conditioned item, so
+  a rejection rolls the whole transaction back: no tombstone, no released sentinel.
+  `purge()` is the one operation that refuses a condition (`ValidationError`, `EDD-9047`)
+  — it deletes a whole partition across batched writes, so no single `ConditionExpression`
+  could guard it atomically.
+</Aside>
+
 ### Condition Operators Reference
 
 | Operator | Callback | DynamoDB |

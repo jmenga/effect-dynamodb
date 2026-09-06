@@ -5,7 +5,10 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import type { CascadePartialFailure } from "@effect-dynamodb/schema/Errors.js"
+import type {
+  CascadePartialFailure,
+  ConditionalCheckFailed,
+} from "@effect-dynamodb/schema/Errors.js"
 import { type Effect, Function as Fn } from "effect"
 import type { ConditionInput } from "../Expression.js"
 import {
@@ -217,22 +220,59 @@ export const project: {
 // This preserves the caller's original type while adding condition behavior.
 
 /** @internal Helper type for condition-compatible operations */
-type ConditionTarget =
+export type ConditionTarget =
   | EntityPut<any, any, any, any>
   | EntityUpdate<any, any, any, any, any>
   | EntityDelete<any, any>
 
 /**
+ * Widen a condition-capable operation's error channel with
+ * {@link ConditionalCheckFailed}.
+ *
+ * A rejected condition is precisely the failure `.condition(...)` makes
+ * reachable, so the type declares it — `Effect.catchTag("ConditionalCheckFailed", ...)`
+ * then type-checks. Operations that already carry `ConditionalCheckFailed`
+ * (`create`, `patch`, `upsert`, `deleteIfExists`) are unaffected: the union
+ * collapses.
+ *
+ * `EntityUpdate` is matched first because it is structurally assignable to
+ * `EntityPut` — checking the looser shape first would silently drop an
+ * update's `U` (update payload) parameter.
+ *
+ * A single generic call signature rather than an overload set: `Pipeable.pipe`
+ * infers from the *last* overload of an overloaded argument, which would pin
+ * every piped `.condition(...)` to `EntityDelete`.
+ */
+export type WithConditionalCheckFailed<T> =
+  T extends EntityUpdate<infer A, infer Rec, infer U, infer E, infer R>
+    ? EntityUpdate<A, Rec, U, E | ConditionalCheckFailed, R>
+    : T extends EntityPut<infer A, infer Rec, infer E, infer R>
+      ? EntityPut<A, Rec, E | ConditionalCheckFailed, R>
+      : T extends EntityDelete<infer E, infer R>
+        ? EntityDelete<E | ConditionalCheckFailed, R>
+        : never
+
+/**
+ * The data-last pipeable produced by `condition(cond)` — see
+ * {@link WithConditionalCheckFailed}.
+ */
+export type ConditionPipeable = <T extends ConditionTarget>(
+  self: T,
+) => WithConditionalCheckFailed<T>
+
+/**
  * Add a condition expression to a put, update, or delete operation.
  * The condition is evaluated server-side by DynamoDB. If it fails,
- * the operation returns a `ConditionalCheckFailed` error.
+ * the operation fails with {@link ConditionalCheckFailed} — which this
+ * combinator adds to the operation's error channel, so
+ * `Effect.catchTag("ConditionalCheckFailed", ...)` type-checks.
  *
  * Accepts either a `ConditionInput` shorthand or a compiled `Expr` node.
  * For updates, the user condition is ANDed with any optimistic lock condition.
  */
 export const condition: {
-  (cond: Expr | ConditionInput): <T extends ConditionTarget>(self: T) => T
-  <T extends ConditionTarget>(self: T, cond: Expr | ConditionInput): T
+  (cond: Expr | ConditionInput): ConditionPipeable
+  <T extends ConditionTarget>(self: T, cond: Expr | ConditionInput): WithConditionalCheckFailed<T>
 } = Fn.dual(2, <T extends ConditionTarget>(self: T, cond: Expr | ConditionInput): T => {
   if (EntityDeleteTypeId in self) {
     // EntityDelete

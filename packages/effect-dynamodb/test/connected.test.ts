@@ -1016,6 +1016,340 @@ describeConnected("Connected integration tests", () => {
   })
 
   // -------------------------------------------------------------------------
+  // `.condition()` widens the error channel — GH #102.
+  //
+  // A conditional write raises `ConditionalCheckFailed` at runtime; these tests
+  // assert the standard idempotent-projector idiom
+  // (`Effect.catchTag("ConditionalCheckFailed", ...)`) actually catches it, on
+  // every surface `.condition()` is exposed. The type half — the tag being
+  // present in the declared channel only after `.condition()` — is asserted in
+  // `Entity.types.test.ts`, which `tsconfig.test.json` type-checks.
+  // -------------------------------------------------------------------------
+
+  describe(".condition() error channel (#102)", () => {
+    const makeDb = DynamoClient.make({
+      entities: { Memberships, Tasks, Vehicles },
+      tables: { MainTable },
+    })
+
+    it.effect("put(...).condition(...) rejection is catchable by tag", () =>
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        const key = { orgId: "org-cond-102", userId: "u-put" }
+
+        yield* db.entities.Memberships.put({ ...key, role: "owner", joinedAt: "2025-01-01" })
+
+        const outcome = yield* db.entities.Memberships.put({
+          ...key,
+          role: "member",
+          joinedAt: "2025-02-01",
+        })
+          .condition((t, { notExists }) => notExists(t.orgId))
+          .asEffect()
+          .pipe(
+            Effect.as("written"),
+            Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("redelivery")),
+          )
+
+        expect(outcome).toBe("redelivery")
+
+        // The rejected write left the stored item untouched.
+        const stored = yield* db.entities.Memberships.get(key)
+        expect(stored.role).toBe("owner")
+      }).pipe(provide),
+    )
+
+    it.effect("update(...).condition(...) rejection is catchable by tag", () =>
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.entities.Tasks.put({
+          taskId: "t-cond-102",
+          userId: "u-cond-102",
+          title: "Original",
+          status: "todo",
+          priority: 1,
+        })
+
+        const outcome = yield* db.entities.Tasks.update({ taskId: "t-cond-102" })
+          .set({ title: "Updated" })
+          .condition({ status: "done" })
+          .asEffect()
+          .pipe(
+            Effect.as("written"),
+            Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("skipped")),
+          )
+
+        expect(outcome).toBe("skipped")
+
+        const stored = yield* db.entities.Tasks.get({ taskId: "t-cond-102" })
+        expect(stored.title).toBe("Original")
+      }).pipe(provide),
+    )
+
+    it.effect("delete(...).condition(...) rejection is catchable by tag", () =>
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        const key = { orgId: "org-cond-102", userId: "u-delete" }
+        yield* db.entities.Memberships.put({ ...key, role: "admin", joinedAt: "2025-01-01" })
+
+        const outcome = yield* db.entities.Memberships.delete(key)
+          .condition({ role: "owner" })
+          .asEffect()
+          .pipe(
+            Effect.as("deleted"),
+            Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("kept")),
+          )
+
+        expect(outcome).toBe("kept")
+
+        const stored = yield* db.entities.Memberships.get(key)
+        expect(stored.role).toBe("admin")
+      }).pipe(provide),
+    )
+
+    it.effect("a satisfied condition still succeeds through the widened channel", () =>
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        const key = { orgId: "org-cond-102", userId: "u-ok" }
+
+        const created = yield* db.entities.Memberships.put({
+          ...key,
+          role: "member",
+          joinedAt: "2025-03-01",
+        })
+          .condition((t, { notExists }) => notExists(t.orgId))
+          .asEffect()
+          .pipe(Effect.catchTag("ConditionalCheckFailed", () => Effect.die("unexpected")))
+
+        expect(created.role).toBe("member")
+      }).pipe(provide),
+    )
+
+    it.effect(
+      "unversioned unique-touching update reports the user condition, not a lock error",
+      () =>
+        // The unique-constraint transact path ANDs the version CAS with the user
+        // condition on the main item. With no version attribute the user
+        // condition is the ONLY predicate, so a rejection must surface as
+        // ConditionalCheckFailed — reporting OptimisticLockError there would
+        // name a version conflict that cannot exist.
+        Effect.gen(function* () {
+          const db = yield* makeDb
+          yield* db.entities.Vehicles.put({
+            vehicleId: "veh-cond-102",
+            accountId: "acct-cond-102",
+            name: "Original",
+          })
+
+          const err = yield* db.entities.Vehicles.update({ vehicleId: "veh-cond-102" })
+            .set({ name: "Renamed" })
+            .condition({ accountId: "acct-someone-else" })
+            .asEffect()
+            .pipe(Effect.flip)
+
+          expect(err._tag).toBe("ConditionalCheckFailed")
+
+          const stored = yield* db.entities.Vehicles.get({ vehicleId: "veh-cond-102" })
+          expect(stored.name).toBe("Original")
+        }).pipe(provide),
+    )
+
+    // -----------------------------------------------------------------------
+    // The condition must reach DynamoDB on EVERY delete path, not just the
+    // simple DeleteItem one. It used to be compiled and then dropped on the
+    // soft-delete and unique-constraint transaction paths, so the guard never
+    // shipped and the delete proceeded unconditionally.
+    // -----------------------------------------------------------------------
+
+    it.effect("soft-delete path: false condition keeps the item, raises the tag", () =>
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        const key = { taskId: "t-softcond-102" }
+        yield* db.entities.Tasks.put({
+          ...key,
+          userId: "u-softcond",
+          title: "Live",
+          status: "todo",
+          priority: 1,
+        })
+
+        const err = yield* db.entities.Tasks.delete(key)
+          .condition({ status: "done" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(err._tag).toBe("ConditionalCheckFailed")
+
+        // Nothing moved: the item is still live, and no tombstone was written.
+        const live = yield* db.entities.Tasks.get(key)
+        expect(live.title).toBe("Live")
+        const tombstones = yield* db.entities.Tasks.deleted.list(key).collect()
+        expect(tombstones).toHaveLength(0)
+      }).pipe(provide),
+    )
+
+    it.effect("soft-delete path: true condition tombstones the item", () =>
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        const key = { taskId: "t-softcond-102-ok" }
+        yield* db.entities.Tasks.put({
+          ...key,
+          userId: "u-softcond",
+          title: "Doomed",
+          status: "done",
+          priority: 1,
+        })
+
+        yield* db.entities.Tasks.delete(key).condition({ status: "done" })
+
+        const stillLive = yield* db.entities.Tasks.get(key).pipe(Effect.flip)
+        expect(stillLive._tag).toBe("ItemNotFound")
+        const tombstones = yield* db.entities.Tasks.deleted.list(key).collect()
+        expect(tombstones).toHaveLength(1)
+      }).pipe(provide),
+    )
+
+    it.effect("unique-constraint path: false condition rolls back the whole transaction", () =>
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.entities.Vehicles.put({
+          vehicleId: "veh-delcond-102",
+          accountId: "acct-delcond",
+          name: "Keeper",
+          transponderId: "tp-delcond-102",
+        })
+
+        const err = yield* db.entities.Vehicles.delete({ vehicleId: "veh-delcond-102" })
+          .condition({ name: "SomethingElse" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(err._tag).toBe("ConditionalCheckFailed")
+
+        const stored = yield* db.entities.Vehicles.get({ vehicleId: "veh-delcond-102" })
+        expect(stored.name).toBe("Keeper")
+
+        // The sentinel Deletes rode the same transaction, so they rolled back
+        // too — the constraint must still be held.
+        const violation = yield* db.entities.Vehicles.put({
+          vehicleId: "veh-delcond-102-other",
+          accountId: "acct-delcond",
+          name: "Other",
+          transponderId: "tp-delcond-102",
+        })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(violation._tag).toBe("UniqueConstraintViolation")
+      }).pipe(provide),
+    )
+
+    it.effect("unique-constraint path: true condition deletes and releases sentinels", () =>
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.entities.Vehicles.put({
+          vehicleId: "veh-delcond-102-ok",
+          accountId: "acct-delcond-ok",
+          name: "Doomed",
+          transponderId: "tp-delcond-102-ok",
+        })
+
+        yield* db.entities.Vehicles.delete({ vehicleId: "veh-delcond-102-ok" }).condition({
+          name: "Doomed",
+        })
+
+        const gone = yield* db.entities.Vehicles.get({ vehicleId: "veh-delcond-102-ok" }).pipe(
+          Effect.flip,
+        )
+        expect(gone._tag).toBe("ItemNotFound")
+
+        // Sentinel released — the transponderId is reusable.
+        const reused = yield* db.entities.Vehicles.put({
+          vehicleId: "veh-delcond-102-reuse",
+          accountId: "acct-delcond-ok",
+          name: "Reuse",
+          transponderId: "tp-delcond-102-ok",
+        })
+        expect(reused.vehicleId).toBe("veh-delcond-102-reuse")
+      }).pipe(provide),
+    )
+
+    it.effect("deleteIfExists on a soft-delete entity still tombstones (guard now ships)", () =>
+      // `deleteIfExists` is `delete` carrying an `attribute_exists(pk)`
+      // condition, so it rode the same drop. Now that the guard reaches the
+      // transaction it also closes the read-then-write race that could
+      // resurrect a concurrently-deleted item as a tombstone.
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        const key = { taskId: "t-delifexists-102" }
+        yield* db.entities.Tasks.put({
+          ...key,
+          userId: "u-delifexists",
+          title: "Doomed",
+          status: "todo",
+          priority: 1,
+        })
+
+        yield* db.entities.Tasks.deleteIfExists(key)
+
+        const gone = yield* db.entities.Tasks.get(key).pipe(Effect.flip)
+        expect(gone._tag).toBe("ItemNotFound")
+        const tombstones = yield* db.entities.Tasks.deleted.list(key).collect()
+        expect(tombstones).toHaveLength(1)
+
+        // Second call: nothing live to delete.
+        const err = yield* db.entities.Tasks.deleteIfExists(key).asEffect().pipe(Effect.flip)
+        expect(["ItemNotFound", "ConditionalCheckFailed"]).toContain(err._tag)
+      }).pipe(provide),
+    )
+
+    it.effect("purge() refuses a condition rather than silently dropping it", () =>
+      Effect.gen(function* () {
+        // `purge` is partition-wide and batched, so no per-item
+        // ConditionExpression can guard it atomically. `.condition()` is
+        // structurally reachable on it (purge returns an EntityDelete), so it
+        // must fail loudly instead of ignoring the guard.
+        yield* Vehicles.put({
+          vehicleId: "veh-purgecond-102",
+          accountId: "acct-purgecond",
+          name: "Untouched",
+        }).asEffect()
+
+        const err = yield* Vehicles.purge({ vehicleId: "veh-purgecond-102" })
+          .pipe(Vehicles.condition({ name: "Nope" }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(err._tag).toBe("ValidationError")
+
+        const stored = yield* Vehicles.get({ vehicleId: "veh-purgecond-102" }).asEffect()
+        expect(stored.name).toBe("Untouched")
+      }).pipe(provide),
+    )
+
+    it.effect("unbound Entity.condition() pipeline is catchable by tag", () =>
+      Effect.gen(function* () {
+        yield* Memberships.put({
+          orgId: "org-cond-102",
+          userId: "u-unbound",
+          role: "member",
+          joinedAt: "2025-04-01",
+        }).asEffect()
+
+        const outcome = yield* Memberships.put({
+          orgId: "org-cond-102",
+          userId: "u-unbound",
+          role: "owner",
+          joinedAt: "2025-05-01",
+        }).pipe(
+          Memberships.condition((t, { notExists }) => notExists(t.orgId)),
+          Entity.asModel,
+          Effect.as("written"),
+          Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("redelivery")),
+        )
+
+        expect(outcome).toBe("redelivery")
+      }).pipe(provide),
+    )
+  })
+
+  // -------------------------------------------------------------------------
   // Primary index query accessor (.primary) — GH #2.
   //
   // Symmetric to GSI accessors: required PK composites, optional SK composites
