@@ -9,8 +9,11 @@ import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Layer, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 
+import * as Batch from "../src/Batch.js"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
+import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
+import * as Transaction from "../src/Transaction.js"
 
 // ---------------------------------------------------------------------------
 // Pure definitions (regression fixtures for #69)
@@ -79,6 +82,8 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Users, Teams } })
 
 type AttrMap = Record<string, unknown>
 let store: AttrMap[] = []
+let transactWriteCalls: unknown[] = []
+let batchWriteCalls: unknown[] = []
 
 const keyOf = (item: AttrMap) => `${(item.pk as { S: string })?.S}|${(item.sk as { S: string })?.S}`
 
@@ -113,9 +118,17 @@ const mockClient = Layer.succeed(DynamoClient, {
       return { Attributes: found } as never
     }),
   batchGetItem: () => Effect.die("not used"),
-  batchWriteItem: () => Effect.die("not used"),
+  batchWriteItem: (input: unknown) =>
+    Effect.sync(() => {
+      batchWriteCalls.push(input)
+      return {} as never
+    }),
   transactGetItems: () => Effect.die("not used"),
-  transactWriteItems: () => Effect.die("not used"),
+  transactWriteItems: (input: unknown) =>
+    Effect.sync(() => {
+      transactWriteCalls.push(input)
+      return {} as never
+    }),
   createTable: () => Effect.sync(() => ({}) as never),
   deleteTable: () => Effect.die("not used"),
   describeTable: () => Effect.die("not used"),
@@ -126,6 +139,8 @@ const layers = Layer.merge(mockClient, TableLayer)
 
 beforeEach(() => {
   store = []
+  transactWriteCalls = []
+  batchWriteCalls = []
   vi.clearAllMocks()
 })
 
@@ -247,6 +262,54 @@ const Tasks = PureEntity.make({
 
 const RefsTable = Table.make({ schema: AppSchema, entities: { Projects, Tasks } })
 const refsLayers = Layer.merge(mockClient, RefsTable.layer({ name: "pure-refs-table" }))
+
+// ---------------------------------------------------------------------------
+// #100 — Batch / Transaction participation.
+//
+// A pure `EntityDefinition` carries no CRUD ops, so the ONLY write descriptor
+// its author can build is the bound-CRUD builder returned by `db.entities.*`.
+// Before the fix the shared extraction protocol did not recognise those
+// builders, and every multi-item write path rejected them with
+// `ValidationError { entityType: "unknown" }`.
+// ---------------------------------------------------------------------------
+
+describe("pure-authored entities in Batch / Transaction (#100)", () => {
+  it.effect("Transaction.transactWrite accepts bound put + delete", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { Users, Teams }, tables: { MainTable } })
+
+      yield* Transaction.transactWrite([
+        db.entities.Users.put({ orgId: "o1", userId: "u1", email: "a@x.io", name: "Ann" }),
+        db.entities.Teams.delete({ orgId: "o1", teamId: "t1" }),
+      ])
+
+      expect(transactWriteCalls).toHaveLength(1)
+      const items = (transactWriteCalls[0] as { TransactItems: any[] }).TransactItems
+      expect(items).toHaveLength(2)
+      expect(fromAttributeMap(items[0].Put.Item).__edd_e__).toBe("User")
+      expect(fromAttributeMap(items[1].Delete.Key).pk).toBe("$pure-authoring#v1#team#orgid_o1")
+    }).pipe(Effect.provide(layers)),
+  )
+
+  it.effect("Batch.write accepts bound put + delete", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { Users, Teams }, tables: { MainTable } })
+
+      yield* Batch.write([
+        db.entities.Users.put({ orgId: "o1", userId: "u1", email: "a@x.io", name: "Ann" }),
+        db.entities.Teams.delete({ orgId: "o1", teamId: "t1" }),
+      ])
+
+      expect(batchWriteCalls).toHaveLength(1)
+      const requests = (batchWriteCalls[0] as { RequestItems: Record<string, any[]> }).RequestItems[
+        "pure-authoring-table"
+      ]!
+      expect(requests).toHaveLength(2)
+      expect(fromAttributeMap(requests[0].PutRequest.Item).__edd_e__).toBe("User")
+      expect(requests[1].DeleteRequest).toBeDefined()
+    }).pipe(Effect.provide(layers)),
+  )
+})
 
 describe("pure entity with refs bound via DynamoClient.make (#69 ref-target promotion)", () => {
   it.effect("writing by ref id hydrates the (pure) ref target instead of crashing", () =>

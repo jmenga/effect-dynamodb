@@ -14,6 +14,7 @@ import {
   isAwsTransactionCancelled,
   TRANSACT_WRITE_ITEMS_LIMIT,
   TransactionCancelled,
+  UniqueConstraintViolation,
   type ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Function as Fn } from "effect"
@@ -189,38 +190,64 @@ export const transactWrite = (
   operations: ReadonlyArray<TransactWriteOp>,
 ): Effect.Effect<
   void,
-  DynamoClientError | ValidationError | TransactionCancelled,
+  DynamoClientError | ValidationError | TransactionCancelled | UniqueConstraintViolation,
   DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
     if (operations.length === 0) return
-    if (operations.length > TRANSACT_WRITE_ITEMS_LIMIT) {
+
+    const client = yield* DynamoClient
+    const { items: transactItems, provenance } = yield* buildTransactWriteItems(
+      operations,
+      "transactWrite",
+    )
+
+    // Counted AFTER expansion: one op can emit several items (a `unique` +
+    // `retain` put emits the item, a sentinel per constraint, and the snapshot),
+    // so `operations.length` would understate the request and let DynamoDB
+    // reject it with a far less useful message (#113).
+    if (transactItems.length > TRANSACT_WRITE_ITEMS_LIMIT) {
       return yield* Effect.fail(
         new DynamoError({
           operation: "TransactWriteItems",
           cause: new Error(
-            `TransactWriteItems supports a maximum of ${TRANSACT_WRITE_ITEMS_LIMIT} items`,
+            `TransactWriteItems supports a maximum of ${TRANSACT_WRITE_ITEMS_LIMIT} items; ` +
+              `${operations.length} operation(s) expanded to ${transactItems.length} items ` +
+              "(uniqueness sentinels and version snapshots each occupy one)",
           ),
         }),
       )
     }
 
-    const client = yield* DynamoClient
-    const transactItems = yield* buildTransactWriteItems(operations, "transactWrite")
-
     yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
       Effect.mapError((error) => {
         if (isAwsTransactionCancelled(error.cause)) {
+          const rawReasons = error.cause.CancellationReasons ?? []
+          // A failed sentinel is not a generic cancellation — it is precisely
+          // "this unique value is taken", which is what `Entity.put` reports for
+          // the same item. Attribute it through the provenance map rather than
+          // by position, because one op now spans several items.
+          for (let i = 0; i < rawReasons.length; i++) {
+            const from = provenance[i]
+            if (
+              from?.kind === "sentinel" &&
+              rawReasons[i]?.Code === "ConditionalCheckFailed" &&
+              from.constraintName !== undefined
+            ) {
+              return new UniqueConstraintViolation({
+                entityType: from.entityType,
+                constraint: from.constraintName,
+                fields: from.fields ?? {},
+              }) as DynamoClientError | TransactionCancelled | UniqueConstraintViolation
+            }
+          }
           return new TransactionCancelled({
             operation: "TransactWriteItems",
-            reasons: (error.cause.CancellationReasons ?? []).map((r) => ({
-              code: r?.Code,
-              message: r?.Message,
-            })),
+            reasons: rawReasons.map((r) => ({ code: r?.Code, message: r?.Message })),
             cause: error.cause,
-          }) as DynamoClientError | TransactionCancelled
+          }) as DynamoClientError | TransactionCancelled | UniqueConstraintViolation
         }
-        return error as DynamoClientError | TransactionCancelled
+        return error as DynamoClientError | TransactionCancelled | UniqueConstraintViolation
       }),
     )
   })

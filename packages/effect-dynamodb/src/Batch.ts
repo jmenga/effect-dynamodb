@@ -9,13 +9,16 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import { DynamoError, type ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import type { Entity, EntityDelete, EntityGet, EntityPut } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
+import type { BoundWriteOp } from "./internal/BoundCrud.js"
 import {
+  batchRejectReason,
   composePrimaryKey,
+  rejectUnsupportedOp,
   resolveTableNames,
   validateAndBuildPutItem,
 } from "./internal/TransactableOps.js"
@@ -197,7 +200,14 @@ export const get = <const T extends ReadonlyArray<EntityGet<any, any, any, any>>
 // Batch.write — auto-chunk at 25, retry unprocessed
 // ---------------------------------------------------------------------------
 
-type BatchWriteOp = EntityPut<any, any, any, any> | EntityDelete<any, any>
+/**
+ * Union accepted by `Batch.write`. Bound-CRUD builders
+ * (`db.entities.X.put(...)` / `.delete(...)`) are accepted alongside the unbound
+ * intermediates — they are the only write descriptor available for entities
+ * authored with the pure, AWS-free `@effect-dynamodb/schema` `Entity.make`
+ * (#100).
+ */
+type BatchWriteOp = EntityPut<any, any, any, any> | EntityDelete<any, any> | BoundWriteOp
 
 /**
  * Batch-write any number of items across entities/tables.
@@ -230,29 +240,71 @@ export const write = (
 
     for (const op of operations) {
       const info = extractTransactable(op)
+      // A rejection belongs on the error channel, not as a defect — the caller
+      // can neither catch nor discriminate a thrown Error (#100).
       if (!info) {
-        throw new Error("Batch.write: unrecognized operation type")
+        return yield* new ValidationError({
+          entityType: "unknown",
+          operation: "batchWrite",
+          cause:
+            "Batch.write: unrecognized operation type. Use Entity.put/Entity.delete, or the " +
+            "bound builders db.entities.X.put(...) / .delete(...).",
+        })
       }
 
       const entity = info.entity
       const { name: tableName } = yield* entity._tableTag
 
+      // BatchWriteItem has no ConditionExpression. Silently dropping a
+      // condition would turn `create()` into a blind overwrite, so reject
+      // instead — the caller wants `Transaction.transactWrite`.
+      if (info.condition !== undefined) {
+        return yield* new ValidationError({
+          entityType: entity.entityType,
+          operation: "batchWrite",
+          cause:
+            "Batch.write cannot apply a condition — BatchWriteItem has no ConditionExpression. " +
+            "Use Transaction.transactWrite for conditional writes (this includes create() and " +
+            "deleteIfExists(), which carry an implicit condition).",
+        })
+      }
+
+      // Multi-item lifecycle features are structurally impossible here — no
+      // ConditionExpression, no UpdateRequest, no atomicity across the 25-item
+      // chunk boundary. Checked per direction: `softDelete` changes only the
+      // delete path, so a put of a soft-deletable entity stays allowed. The
+      // transact path expands puts into these items instead (#113).
+      const batchReason = batchRejectReason(entity, info.opType === "delete" ? "delete" : "put")
+      if (batchReason !== undefined) {
+        return yield* new ValidationError({
+          entityType: entity.entityType,
+          operation: "batchWrite",
+          cause: batchReason,
+        })
+      }
+
       if (info.opType === "put") {
-        const marshalledItem = yield* validateAndBuildPutItem(entity, info.input!, "batchWrite.put")
+        yield* rejectUnsupportedOp(entity, "batchWrite", "put", info.putKind)
+        const built = yield* validateAndBuildPutItem(entity, info.input!, "batchWrite.put")
         writeRequests.push({
           tableName,
-          request: { PutRequest: { Item: marshalledItem } },
+          request: { PutRequest: { Item: built.marshalled } },
         })
       } else if (info.opType === "delete") {
+        yield* rejectUnsupportedOp(entity, "batchWrite", "delete", undefined)
         const composed = composePrimaryKey(entity, info.key!)
         writeRequests.push({
           tableName,
           request: { DeleteRequest: { Key: toAttributeMap(composed) } },
         })
       } else {
-        throw new Error(
-          `Batch.write: unsupported operation type "${info.opType}". Use EntityPut or EntityDelete.`,
-        )
+        return yield* new ValidationError({
+          entityType: entity.entityType,
+          operation: "batchWrite",
+          cause:
+            `Batch.write: unsupported operation type "${info.opType}". BatchWriteItem has no ` +
+            "UpdateRequest — use Entity.put or Entity.delete, or Transaction.transactWrite.",
+        })
       }
     }
 

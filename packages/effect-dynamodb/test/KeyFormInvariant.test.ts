@@ -25,15 +25,22 @@ import { describe, expect, it } from "@effect/vitest"
  * Every module that hands a record to `KeyComposer`. Adding a file here is the
  * one-line cost of making it safe; leaving it out is how a bypass survives.
  *
- * The multi-item write helpers, `Aggregate.ts` and geo's `GeoSearch.ts` join
- * this list on the branch that fixes them — a file only belongs here once its
- * bypasses are closed, or the guard fails for reasons unrelated to new code.
+ * The multi-item write helpers, `Aggregate.ts` and geo's `GeoSearch.ts` were
+ * added after #111 found live bypasses across all of them — a transact `put`
+ * composing an unpadded key, `composePrimaryKey` taking the caller's raw key,
+ * and `Aggregate.list` re-deriving a key from a stored row.
  */
 const SOURCES = [
   "../src/Entity.ts",
+  "../src/Aggregate.ts",
+  "../src/Batch.ts",
+  "../src/Transaction.ts",
   "../src/Collection.ts",
   "../src/DynamoClient.ts",
+  "../src/internal/TransactableOps.ts",
+  "../src/internal/TransactWriteOps.ts",
   "../src/internal/BoundVectorQuery.ts",
+  "../../effect-dynamodb-geo/src/GeoSearch.ts",
 ].map((rel) => ({ rel, path: fileURLToPath(new URL(rel, import.meta.url)) }))
 
 const ENTITY_SRC = fileURLToPath(new URL("../src/Entity.ts", import.meta.url))
@@ -58,8 +65,12 @@ const RECORD_TAKING = [
   "tryExtractComposites",
 ] as const
 
-/** Accepted spellings for an already-normalised record. */
-const NORMALISED = /keyForm\(|keyFormFor\(|KeyForm\b|\bkeyRecord\(/
+/**
+ * Accepted spellings for an already-normalised record. `_keyForm(` is the
+ * Entity's exposed normaliser — the handle the modules that compose keys
+ * OUTSIDE `makeImpl` (transact/batch, geo search) must use.
+ */
+const NORMALISED = /keyForm\(|keyFormFor\(|KeyForm\b|\bkeyRecord\(|_keyForm\(/
 
 describe.each(SOURCES)("key-form invariant — $rel", ({ path }) => {
   const src = readFileSync(path, "utf8")
@@ -104,10 +115,6 @@ describe.each(SOURCES)("key-form invariant — $rel", ({ path }) => {
   }
 })
 
-/**
- * Structural checks specific to `Entity.ts` — it is the only module that defines
- * the normalisers, so these cannot run per-source.
- */
 describe("key-form invariant — Entity.ts normaliser shape", () => {
   const src = readFileSync(ENTITY_SRC, "utf8")
 

@@ -70,7 +70,24 @@ const Watermarks = Entity.make({
   },
 })
 
-const EventsTable = Table.make({ schema: AppSchema, entities: { Watermarks } })
+// A read model kept in step with the stream. Authored with the pure, AWS-free
+// `@effect-dynamodb/schema` package — it carries no CRUD ops, so its writes are
+// always built from the bound client (`db.entities.MatchStatus.put(...)`).
+const MatchStatusRecord = Schema.Struct({
+  matchId: Schema.String,
+  status: Schema.String,
+})
+
+const MatchStatus = PureEntity.make({
+  model: DynamoModel.configure(MatchStatusRecord, { matchId: { identifier: true } }),
+  entityType: "MatchStatus",
+  primaryKey: {
+    pk: { field: "pk", composite: ["matchId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const EventsTable = Table.make({ schema: AppSchema, entities: { Watermarks, MatchStatus } })
 ```
 
 ---
@@ -484,7 +501,7 @@ summarises are already durable.
 
 ## Step 12: Atomic Side Writes
 
-Real event-sourced systems usually need one non-event record kept in step with the events: an ingestion watermark, a stream registry row, a uniqueness guard. `append` accepts `additionalItems` — the same operation builders `Transaction.transactWrite` takes (`Entity.put`, `Entity.delete`, and `Transaction.check`) — and commits them in the **same** `TransactWriteItems` call as the events:
+Real event-sourced systems usually need one non-event record kept in step with the events: an ingestion watermark, a read model, a stream registry row, a uniqueness guard. `append` accepts `additionalItems` — the same operation builders `Transaction.transactWrite` takes (`Entity.put`, `Entity.delete`, and `Transaction.check`) — and commits them in the **same** `TransactWriteItems` call as the events:
 
 ```typescript region="additional-items" example="event-sourcing.ts"
 yield* matchEvents.append(
@@ -498,6 +515,39 @@ yield* matchEvents.append(
 ```
 
 Either everything lands or nothing does. The event puts, your items, and the version guard are one atomic unit.
+
+### Bound-client builders work too
+
+The bound builders returned by `db.entities.*` (`put`, `create`, `delete`, `deleteIfExists`) are accepted anywhere an `Entity.put` / `Entity.delete` is. That matters most for entities authored with the pure, AWS-free `@effect-dynamodb/schema` package: a pure `EntityDefinition` carries no operations, so the bound builder is the only write descriptor its author can hold — and it is exactly what you need to commit a **read model** atomically with the events that produced it:
+
+```typescript region="additional-items-read-model" example="event-sourcing.ts"
+const db = yield* DynamoClient.make({ entities: { MatchStatus }, tables: { EventsTable } })
+
+yield* matchEvents.append(
+  { matchId: "m-4" },
+  [new MatchStarted({ venue: "Basin Reserve", homeTeam: "NZL", awayTeam: "SAF" })],
+  0,
+  {
+    additionalItems: [db.entities.MatchStatus.put({ matchId: "m-4", status: "in-progress" })],
+  },
+)
+```
+
+Conditions ride along: `.condition({ ... })` on a bound put or delete, and the implicit `attribute_not_exists` guard `create()` carries, are compiled into the transact item. A failing one surfaces as `AdditionalItemConditionFailed`, not a version conflict.
+
+:::caution[`upsert` is not a transact item]
+`upsert` is deliberately **not** accepted here, and neither is `update` / `patch`. An `upsert` is an `UpdateItem` whose `SET` clause uses `if_not_exists` for `createdAt`, immutable fields and the version counter — compiling it into a `TransactWriteItems` `Put` would reset all three. Rather than do that quietly, `append` fails with a `ValidationError` naming `upsert`. Use `put()` or `create()` in the transaction, or run the upsert as its own operation outside it.
+
+A **delete** of an entity configured with `unique`, `versioned: { retain: true }` or `softDelete` is refused for a related reason (**EDD-9048**): the extra items such a delete must write are derived from the *stored* row, and this path never reads. Use the entity's own `delete`.
+:::
+
+### One additional item can become several
+
+A **put** of an entity with `unique` constraints or `versioned: { retain: true }` expands: the row, one guarded uniqueness sentinel per satisfiable constraint, and the v1 version snapshot — all committed in the same transaction as the events. Two things follow.
+
+`AdditionalItemConditionFailed.indices` still means *indices into the array you passed*. A failing sentinel is reported against the op that produced it, not against the raw transaction position, and one op that fails in several places is reported once.
+
+The 100-item cap counts the **expanded** total, so `events + expanded additional items + sentinel + contiguity check` must fit. `AppendTooLarge.count` reports the expanded number.
 
 ### Telling the failures apart
 
@@ -622,7 +672,7 @@ Effect.runPromise(main).then(
 | **Snapshots** | `snapshot: { schema, every }` caches a fold of the stream; the handler replays only the delta |
 | **Snapshot primitives** | `readSnapshot` / `writeSnapshot` for manual cadence; monotonic writes, never a cache regression |
 | **Retry** | `{ retry }` re-runs the full read-decide-append cycle on `VersionConflict` only |
-| **Atomic side writes** | `append(..., { additionalItems })` commits `Entity.put` / `Entity.delete` / `Transaction.check` ops with the events |
+| **Atomic side writes** | `append(..., { additionalItems })` commits `Entity.put` / `Entity.delete` / bound `db.entities.*` builders / `Transaction.check` ops with the events |
 | **Position-aware errors** | `VersionConflict` vs. `AdditionalItemConditionFailed` vs. `DuplicateCommand` — you always know whose condition failed |
 | **Command idempotency** | At-least-once by default; `commandHandler(..., { idempotency })` + a `commandId` makes it exactly-once via a dedup sentinel |
 

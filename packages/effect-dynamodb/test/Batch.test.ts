@@ -54,7 +54,47 @@ const OrderEntity = Entity.make({
   },
 })
 
-const MainTable = Table.make({ schema: AppSchema, entities: { UserEntity, OrderEntity } })
+// #113 fixtures — entities whose write contract needs more than one item.
+class UniqueMember extends Schema.Class<UniqueMember>("UniqueMember")({
+  memberId: Schema.String,
+  email: Schema.String,
+}) {}
+
+const UniqueMembers = Entity.make({
+  model: UniqueMember,
+  entityType: "UniqueMember",
+  primaryKey: { pk: { field: "pk", composite: ["memberId"] }, sk: { field: "sk", composite: [] } },
+  unique: { email: ["email"] },
+})
+
+class RetainDoc extends Schema.Class<RetainDoc>("RetainDoc")({
+  docId: Schema.String,
+  title: Schema.String,
+}) {}
+
+const RetainDocs = Entity.make({
+  model: RetainDoc,
+  entityType: "RetainDoc",
+  primaryKey: { pk: { field: "pk", composite: ["docId"] }, sk: { field: "sk", composite: [] } },
+  versioned: { retain: true },
+})
+
+class SoftItem extends Schema.Class<SoftItem>("SoftItem")({
+  itemId: Schema.String,
+  label: Schema.String,
+}) {}
+
+const SoftItems = Entity.make({
+  model: SoftItem,
+  entityType: "SoftItem",
+  primaryKey: { pk: { field: "pk", composite: ["itemId"] }, sk: { field: "sk", composite: [] } },
+  softDelete: true,
+})
+
+const MainTable = Table.make({
+  schema: AppSchema,
+  entities: { UserEntity, OrderEntity, UniqueMembers, RetainDocs, SoftItems },
+})
 
 // --- Mock DynamoClient ---
 
@@ -682,6 +722,178 @@ describe("Batch", () => {
         expect(item.__edd_e__).toBe("SparseItem")
         expect(item.gsi1pk).toBeUndefined()
         expect(item.gsi1sk).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  // -------------------------------------------------------------------------
+  // #100 — bound-CRUD builders as batch-write ops
+  // -------------------------------------------------------------------------
+
+  describe("bound-CRUD builders as write ops (#100)", () => {
+    it.effect("accepts a bound put and a bound delete from db.entities.*", () =>
+      Effect.gen(function* () {
+        mockBatchWriteItem.mockResolvedValueOnce({})
+        const db = yield* DynamoClient.make({
+          entities: { UserEntity, OrderEntity },
+          tables: { MainTable },
+        })
+
+        yield* Batch.write([
+          db.entities.UserEntity.put({
+            userId: "u-1",
+            email: "a@x.io",
+            name: "Alice",
+            role: "admin",
+          }),
+          db.entities.OrderEntity.delete({ orderId: "ord-1" }),
+        ])
+
+        const requests = mockBatchWriteItem.mock.calls[0]![0].RequestItems["test-table"]
+        expect(requests).toHaveLength(2)
+        const put = fromAttributeMap(requests[0].PutRequest.Item)
+        expect(put.pk).toBe("$myapp#v1#user#userid_u-1")
+        expect(put.__edd_e__).toBe("User")
+        const del = fromAttributeMap(requests[1].DeleteRequest.Key)
+        expect(del.pk).toBe("$myapp#v1#order#orderid_ord-1")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects a conditional write instead of silently dropping the condition", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { UserEntity, OrderEntity },
+          tables: { MainTable },
+        })
+
+        const error = yield* Batch.write([
+          db.entities.UserEntity.put({
+            userId: "u-1",
+            email: "a@x.io",
+            name: "Alice",
+            role: "admin",
+          }).condition({ role: "admin" }),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).operation).toBe("batchWrite")
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects create() — its attribute_not_exists guard is unexpressible", () =>
+      Effect.gen(function* () {
+        const error = yield* Batch.write([
+          UserEntity.create({ userId: "u-1", email: "a@x.io", name: "Alice", role: "admin" }),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).entityType).toBe("User")
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects upsert — BatchWriteItem has no UpdateRequest", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { UserEntity, OrderEntity },
+          tables: { MainTable },
+        })
+
+        const error = yield* Batch.write([
+          db.entities.UserEntity.upsert({
+            userId: "u-1",
+            email: "a@x.io",
+            name: "Alice",
+            role: "admin",
+          }),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("upsert")
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // A rejection the caller cannot catch is as bad as a silent success. These
+    // two paths used to `throw new Error`, surfacing as an opaque defect.
+    it.effect("an update op fails on the error channel, not as a defect", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { UserEntity, OrderEntity },
+          tables: { MainTable },
+        })
+
+        const error = yield* Batch.write([
+          db.entities.UserEntity.update({ userId: "u-1" }).set({ name: "Bob" }) as never,
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("UpdateRequest")
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // -----------------------------------------------------------------------
+    // #113 — BatchWriteItem cannot host the multi-item lifecycle features.
+    // -----------------------------------------------------------------------
+
+    it.effect("rejects a put of a unique entity — no ConditionExpression for the sentinel", () =>
+      Effect.gen(function* () {
+        const error = yield* Batch.write([
+          UniqueMembers.put({ memberId: "m-1", email: "a@x.io" }),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("EDD-9049")
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects a put of a retain entity — the snapshot would not be atomic", () =>
+      Effect.gen(function* () {
+        const error = yield* Batch.write([RetainDocs.put({ docId: "d-1", title: "T" })]).pipe(
+          Effect.flip,
+        )
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("EDD-9049")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects a DELETE of a softDelete entity — a tombstone is not a DeleteRequest", () =>
+      Effect.gen(function* () {
+        const error = yield* Batch.write([SoftItems.delete({ itemId: "i-1" })]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("EDD-9049")
+        expect(String((error as ValidationError).cause)).toContain("softDelete")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // Direction matters: `softDelete` changes only the delete path, so a put of
+    // a soft-deletable entity is an ordinary single-item write. Gating it would
+    // have broken writes that were always correct — the connected suite caught
+    // exactly this.
+    it.effect("ALLOWS a put of a softDelete entity — softDelete only affects deletes", () =>
+      Effect.gen(function* () {
+        mockBatchWriteItem.mockResolvedValueOnce({})
+
+        yield* Batch.write([SoftItems.put({ itemId: "i-1", label: "L" })])
+
+        const requests = mockBatchWriteItem.mock.calls[0]![0].RequestItems["test-table"]
+        expect(requests).toHaveLength(1)
+        expect(fromAttributeMap(requests[0].PutRequest.Item).__edd_e__).toBe("SoftItem")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an unrecognized op fails on the error channel, not as a defect", () =>
+      Effect.gen(function* () {
+        const error = yield* Batch.write([{ nonsense: true } as never]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).entityType).toBe("unknown")
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )
   })

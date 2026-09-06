@@ -2476,7 +2476,10 @@ describe("Entity", () => {
 
         // Item 2: Put new sentinel with attribute_not_exists
         expect(call.TransactItems[2].Put).toBeDefined()
-        expect(call.TransactItems[2].Put.ConditionExpression).toBe("attribute_not_exists(pk)")
+        expect(call.TransactItems[2].Put.ConditionExpression).toBe(
+          "attribute_not_exists(#sentinel_pk)",
+        )
+        expect(call.TransactItems[2].Put.ExpressionAttributeNames).toEqual({ "#sentinel_pk": "pk" })
         const newSentinelItem = call.TransactItems[2].Put.Item
         expect(newSentinelItem.pk.S).toContain("alice@new.com")
         expect(newSentinelItem.__edd_e__.S).toBe("UniqueUser._unique.email")
@@ -2623,7 +2626,10 @@ describe("Entity", () => {
         expect(call.TransactItems[1].Put).toBeDefined() // snapshot
         expect(call.TransactItems[2].Delete).toBeDefined() // old sentinel
         expect(call.TransactItems[3].Put).toBeDefined() // new sentinel
-        expect(call.TransactItems[3].Put.ConditionExpression).toBe("attribute_not_exists(pk)")
+        expect(call.TransactItems[3].Put.ConditionExpression).toBe(
+          "attribute_not_exists(#sentinel_pk)",
+        )
+        expect(call.TransactItems[3].Put.ExpressionAttributeNames).toEqual({ "#sentinel_pk": "pk" })
       }).pipe(Effect.provide(TestLayer)),
     )
   })

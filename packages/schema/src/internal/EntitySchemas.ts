@@ -600,6 +600,66 @@ const schemaFieldsOf = (schema: Schema.Top): SchemaFields | undefined =>
   (schema as unknown as { readonly fields?: SchemaFields }).fields
 
 /**
+ * A LEAF encoding transformation — one whose Type and Encoded forms differ and
+ * which is not itself a container. Containers (Struct / Class / Array) are
+ * handled by `substituteSchemaDeep`'s own recursion, and dates / Redacted have
+ * their own dedicated substitutes, so those are excluded by the caller's branch
+ * ordering rather than here.
+ */
+const isLeafEncodingTransform = (schema: Schema.Top): boolean =>
+  schemaFieldsOf(schema) === undefined &&
+  !isArraySchema(schema) &&
+  transformWireKindImpl(schema) !== undefined
+
+/**
+ * Build a TOLERANT substitute for an arbitrary leaf transform — the general
+ * form of what `buildDateTransform` does for dates.
+ *
+ * Only reachable under `tolerantTransforms`, i.e. only from the aggregate's
+ * `decodeSchema`. `Aggregate.update` re-decodes the mutated `state`, whose
+ * fields may hold EITHER the domain value the caller set (a `bigint` for a
+ * `Schema.BigIntFromString`) or the wire value that came back from storage (the
+ * string). A strict transform accepts only the latter, so any update on such a
+ * model failed before an item was ever built — regardless of which field the
+ * mutation touched.
+ *
+ * **Tolerant, not lax.** Decode tries the transform first (wire form), then
+ * validates the value against the transform's own TYPE side (domain form). A
+ * value that is neither is still rejected, exactly as before — this widens the
+ * accepted input, it does not skip validation.
+ */
+const buildTolerantTransform = (schema: Schema.Top): Schema.Top => {
+  const typeSide = Schema.make<Schema.Top>(SchemaAST.toType(schema.ast))
+  const codec = schema as unknown as Schema.Codec<any>
+  const decodeWire = Schema.decodeUnknownOption(codec)
+  const validateDomain = Schema.decodeUnknownOption(typeSide as unknown as Schema.Codec<any>)
+  const encodeDomain = Schema.encodeUnknownOption(codec)
+
+  return Schema.Any.pipe(
+    Schema.decodeTo(typeSide, {
+      decode: SchemaGetter.transformOrFail((value: unknown) => {
+        const fromWire = decodeWire(value)
+        if (fromWire._tag === "Some") return Effect.succeed(fromWire.value)
+        const alreadyDomain = validateDomain(value)
+        if (alreadyDomain._tag === "Some") return Effect.succeed(alreadyDomain.value)
+        return Effect.fail(new SchemaIssue.InvalidType(schema.ast, value))
+      }),
+      encode: SchemaGetter.transformOrFail((value: unknown) => {
+        const wire = encodeDomain(value)
+        if (wire._tag === "Some") return Effect.succeed(wire.value)
+        // Already wire-shaped — round-trip it to itself rather than reject.
+        const fromWire = decodeWire(value)
+        if (fromWire._tag === "Some") {
+          const reencoded = encodeDomain(fromWire.value)
+          if (reencoded._tag === "Some") return Effect.succeed(reencoded.value)
+        }
+        return Effect.fail(new SchemaIssue.InvalidType(schema.ast, value))
+      }),
+    } as any),
+  ) as unknown as Schema.Top
+}
+
+/**
  * True when the schema is a Schema.Class (a constructable function carrying
  * fields whose AST is a `Declaration`). The AST check matters: since Effect
  * 4.0.0-rc, `Schema.Struct(...)` is also a function, but its AST is `Objects`.
@@ -718,11 +778,21 @@ export interface DeepSubstitutionOptions {
  */
 const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOptions): boolean => {
   if (schema == null || (schema as { readonly ast?: unknown }).ast == null) return false
-  // `tolerantTransforms` propagates through the recursion; `skipTopLevel` /
-  // `resolveRef` apply only at the immediate level (so they're dropped below).
-  const deeper: DeepSubstitutionOptions | undefined = opts?.tolerantTransforms
-    ? { tolerantTransforms: true }
-    : undefined
+  // `tolerantTransforms` AND `resolveRef` propagate through the recursion;
+  // `skipTopLevel` names top-level fields only, so it is dropped below.
+  //
+  // `resolveRef` has to descend: a `DynamoModel.ref` field nested INSIDE an edge
+  // model is annotated, and `Schema.annotate` drops a `Schema.Class`'s `.fields`,
+  // so the walker cannot see through it and the target's own transformed fields
+  // keep their strict schemas. Only callers that pass `resolveRef` are affected
+  // — the entity derivation passes no options at all (#116).
+  const deeper: DeepSubstitutionOptions | undefined =
+    opts?.tolerantTransforms || opts?.resolveRef
+      ? {
+          ...(opts?.tolerantTransforms ? { tolerantTransforms: true } : {}),
+          ...(opts?.resolveRef ? { resolveRef: opts.resolveRef } : {}),
+        }
+      : undefined
   // Optional wrapper FIRST — unwrap to the REAL inner before the leaf / array /
   // struct checks. `optionalKey(X)` is a bare AST (Declaration/Arrays) with an
   // `isOptional` context, so the leaf detectors (which resolve through to the
@@ -734,6 +804,9 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   if (isSelfDateSchema(schema)) return true
   if (opts?.tolerantTransforms && isDateTransform(schema)) return true
   if (tryGetRedactedInner(schema) !== undefined) return true
+  // Any other leaf transform, tolerant mode only — same reason as the date
+  // case: after a mutation the field may hold either form (#116).
+  if (opts?.tolerantTransforms && isLeafEncodingTransform(schema)) return true
   if (isArraySchema(schema)) {
     const element = arrayElementOf(schema)
     return element !== undefined && needsDeepSubstitution(element, deeper)
@@ -772,11 +845,21 @@ export const substituteSchemaDeep = (
 ): Schema.Top => {
   if (!needsDeepSubstitution(schema, opts)) return schema
 
-  // `tolerantTransforms` propagates through the recursion; `skipTopLevel` /
-  // `resolveRef` apply only at this immediate level.
-  const deeper: DeepSubstitutionOptions | undefined = opts?.tolerantTransforms
-    ? { tolerantTransforms: true }
-    : undefined
+  // `tolerantTransforms` AND `resolveRef` propagate through the recursion;
+  // `skipTopLevel` names top-level fields only, so it is dropped below.
+  //
+  // `resolveRef` has to descend: a `DynamoModel.ref` field nested INSIDE an edge
+  // model is annotated, and `Schema.annotate` drops a `Schema.Class`'s `.fields`,
+  // so the walker cannot see through it and the target's own transformed fields
+  // keep their strict schemas. Only callers that pass `resolveRef` are affected
+  // — the entity derivation passes no options at all (#116).
+  const deeper: DeepSubstitutionOptions | undefined =
+    opts?.tolerantTransforms || opts?.resolveRef
+      ? {
+          ...(opts?.tolerantTransforms ? { tolerantTransforms: true } : {}),
+          ...(opts?.resolveRef ? { resolveRef: opts.resolveRef } : {}),
+        }
+      : undefined
 
   // Optional wrapper FIRST — unwrap to the REAL inner, substitute it, then
   // re-apply the same optionality. Handled BEFORE the leaf / array / struct
@@ -802,6 +885,15 @@ export const substituteSchemaDeep = (
   // Leaf: RedactedFromValue → tolerant Redacted transform.
   const redactedInner = tryGetRedactedInner(schema)
   if (redactedInner !== undefined) return buildRedactedSubstitute(redactedInner)
+
+  // Leaf: any OTHER encoding transform (only under `tolerantTransforms`) →
+  // a substitute whose decode accepts the wire form and the domain form. Placed
+  // after the date and Redacted branches so those keep their dedicated
+  // substitutes, and before the array / struct recursion so containers are
+  // still walked rather than swallowed (#116).
+  if (opts?.tolerantTransforms && isLeafEncodingTransform(schema)) {
+    return buildTolerantTransform(schema)
+  }
 
   // Array: substitute the element schema.
   if (isArraySchema(schema)) {

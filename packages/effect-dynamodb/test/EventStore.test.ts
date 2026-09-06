@@ -1,5 +1,7 @@
 import { describe, expect, it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
 import {
   type AdditionalItemConditionFailed,
   AppendTooLarge,
@@ -55,7 +57,43 @@ const Watermarks = Entity.make({
   },
 })
 
-const EventsTable = Table.make({ schema: AppSchema, entities: { Watermarks } })
+// A read model authored with the PURE, AWS-free `@effect-dynamodb/schema`
+// `Entity.make` — the shape reported in #100. A pure definition carries no CRUD
+// ops, so the only put its author can build is the bound builder returned by
+// `db.entities.StatusProjection.put(...)`.
+const StatusRecord = Schema.Struct({
+  matchId: Schema.String,
+  state: Schema.String,
+})
+
+const StatusProjection = PureEntity.make({
+  model: DynamoModel.configure(StatusRecord, { matchId: { identifier: true } }),
+  entityType: "Status",
+  primaryKey: {
+    pk: { field: "pk", composite: ["matchId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+// #113 — an entity whose put expands into three items (row + sentinel +
+// snapshot). Used to prove `additionalItems` indices survive expansion.
+class Registration extends Schema.Class<Registration>("Registration")({
+  regId: Schema.String,
+  code: Schema.String,
+}) {}
+
+const Registrations = Entity.make({
+  model: Registration,
+  entityType: "Registration",
+  primaryKey: { pk: { field: "pk", composite: ["regId"] }, sk: { field: "sk", composite: [] } },
+  unique: { code: ["code"] },
+  versioned: { retain: true },
+})
+
+const EventsTable = Table.make({
+  schema: AppSchema,
+  entities: { Watermarks, StatusProjection, Registrations },
+})
 
 class MatchStarted extends Schema.Class<MatchStarted>("MatchStarted")({
   venue: Schema.String,
@@ -1154,6 +1192,261 @@ describe("EventStore", () => {
         expect(error._tag).toBe("AppendTooLarge")
         expect((error as AppendTooLarge).count).toBe(101)
         expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // -----------------------------------------------------------------------
+    // #100 — the read-model use case: a put built from the bound client whose
+    // entity was authored with the pure `@effect-dynamodb/schema` Entity.make.
+    // Before the fix this failed with
+    // ValidationError { entityType: "unknown", operation: "EventStore.append.additionalItems" }.
+    // -----------------------------------------------------------------------
+
+    it.effect("commits a pure-authored read-model put atomically with the events", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        const db = yield* DynamoClient.make({
+          entities: { StatusProjection },
+          tables: { EventsTable },
+        })
+
+        yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [
+            db.entities.StatusProjection.put({ matchId: "m-1", state: "IN_PROGRESS" }),
+          ],
+        })
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(call.TransactItems).toHaveLength(2)
+        expect(fromAttributeMap(call.TransactItems[0].Put.Item).__edd_e__).toBe("match.event")
+
+        const projection = fromAttributeMap(call.TransactItems[1].Put.Item)
+        expect(call.TransactItems[1].Put.TableName).toBe("events-table")
+        expect(projection.__edd_e__).toBe("Status")
+        expect(projection.pk).toBe("$cricket#v1#status#matchid_m-1")
+        expect(projection.state).toBe("IN_PROGRESS")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("supports a bound delete from a pure-authored entity", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        const db = yield* DynamoClient.make({
+          entities: { StatusProjection },
+          tables: { EventsTable },
+        })
+
+        yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [db.entities.StatusProjection.delete({ matchId: "m-1" })],
+        })
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(fromAttributeMap(call.TransactItems[1].Delete.Key).pk).toBe(
+          "$cricket#v1#status#matchid_m-1",
+        )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // -----------------------------------------------------------------------
+    // #113 — one additional op can now emit several items. The caller-facing
+    // `indices` must stay indices into the caller's `additionalItems` array.
+    // -----------------------------------------------------------------------
+
+    it.effect("expands a unique + retain additional item into item, sentinel and snapshot", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [Registrations.put({ regId: "r-1", code: "C1" })],
+        })
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        // 1 event + (row + sentinel + snapshot)
+        expect(items).toHaveLength(4)
+        expect(fromAttributeMap(items[0].Put.Item).__edd_e__).toBe("match.event")
+        expect(fromAttributeMap(items[1].Put.Item).__edd_e__).toBe("Registration")
+        expect(fromAttributeMap(items[2].Put.Item).__edd_e__).toBe("Registration._unique.code")
+        expect(items[2].Put.ConditionExpression).toBe("attribute_not_exists(#sentinel_pk)")
+        expect(items[2].Put.ExpressionAttributeNames).toEqual({ "#sentinel_pk": "pk" })
+        expect(fromAttributeMap(items[3].Put.Item).sk).toBe("$cricket#v1#registration#v#0000001")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("attributes a failed SENTINEL back to the caller's additionalItems index", () =>
+      Effect.gen(function* () {
+        // Layout: [event, reg row, reg sentinel, reg snapshot]. The sentinel is
+        // transaction index 2, but it belongs to caller additionalItems index 0.
+        // Before #113's provenance map, index 2 would have been read as caller
+        // index 1 — an index the caller never supplied.
+        mockTransactWriteItems.mockRejectedValue(
+          cancelled([
+            { Code: "None" },
+            { Code: "None" },
+            { Code: "ConditionalCheckFailed", Message: "code taken" },
+            { Code: "None" },
+          ]),
+        )
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [Registrations.put({ regId: "r-1", code: "C1" })],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AdditionalItemConditionFailed")
+        expect((error as AdditionalItemConditionFailed).indices).toEqual([0])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("maps a later op's failure past an earlier op's expansion", () =>
+      Effect.gen(function* () {
+        // Layout: [event, reg row, reg sentinel, reg snapshot, watermark].
+        // The watermark is caller index 1 but transaction index 4.
+        mockTransactWriteItems.mockRejectedValue(
+          cancelled([
+            { Code: "None" },
+            { Code: "None" },
+            { Code: "None" },
+            { Code: "None" },
+            { Code: "ConditionalCheckFailed", Message: "watermark moved" },
+          ]),
+        )
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [
+            Registrations.put({ regId: "r-1", code: "C1" }),
+            Watermarks.put({ writerId: "ingest-1", lastSeq: 42 }),
+          ],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AdditionalItemConditionFailed")
+        expect((error as AdditionalItemConditionFailed).indices).toEqual([1])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("reports one caller index even when several of its items fail", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValue(
+          cancelled([
+            { Code: "None" },
+            { Code: "ConditionalCheckFailed" },
+            { Code: "ConditionalCheckFailed" },
+            { Code: "None" },
+          ]),
+        )
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [Registrations.put({ regId: "r-1", code: "C1" })],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AdditionalItemConditionFailed")
+        // Deduped — the caller passed one op and must be told about one op.
+        expect((error as AdditionalItemConditionFailed).indices).toEqual([0])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an event-put failure still wins over an expanded additional item", () =>
+      Effect.gen(function* () {
+        // Precedence must be unchanged: VersionConflict > AdditionalItemConditionFailed.
+        mockTransactWriteItems.mockRejectedValue(
+          cancelled([
+            { Code: "ConditionalCheckFailed" },
+            { Code: "None" },
+            { Code: "ConditionalCheckFailed" },
+            { Code: "None" },
+          ]),
+        )
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [Registrations.put({ regId: "r-1", code: "C1" })],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("VersionConflict")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("the idempotency sentinel stays LAST after expansion", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [Registrations.put({ regId: "r-1", code: "C1" })],
+          idempotency: { commandId: "cmd-1" },
+        })
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        expect(items).toHaveLength(5)
+        expect(fromAttributeMap(items[4].Put.Item).__edd_e__).toBe("match.command")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("AppendTooLarge counts the EXPANDED item total", () =>
+      Effect.gen(function* () {
+        // 34 registration ops expand to 102 items; unexpanded they would pass.
+        const additionalItems = Array.from({ length: 34 }, (_, i) =>
+          Registrations.put({ regId: `r-${i}`, code: `C${i}` }),
+        )
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [], 0, {
+          additionalItems,
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AppendTooLarge")
+        expect((error as AppendTooLarge).count).toBe(102)
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects a delete of a lifecycle entity as an additional item (EDD-9048)", () =>
+      Effect.gen(function* () {
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [Registrations.delete({ regId: "r-1" })],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("EDD-9048")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects an upsert additional item instead of compiling it as a Put", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { StatusProjection },
+          tables: { EventsTable },
+        })
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [
+            db.entities.StatusProjection.upsert({ matchId: "m-1", state: "IN_PROGRESS" }),
+          ],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("upsert")
+        // Nothing may be written — the whole append is refused up front.
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("keeps cancellation indices aligned for a bound additional item", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValue(
+          cancelled([{ Code: "None" }, { Code: "ConditionalCheckFailed", Message: "stale" }]),
+        )
+        const db = yield* DynamoClient.make({
+          entities: { StatusProjection },
+          tables: { EventsTable },
+        })
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [
+            db.entities.StatusProjection.put({ matchId: "m-1", state: "IN_PROGRESS" }).condition({
+              state: "PRE_MATCH",
+            }),
+          ],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AdditionalItemConditionFailed")
+        expect((error as AdditionalItemConditionFailed).indices).toEqual([0])
       }).pipe(Effect.provide(TestLayer)),
     )
   })

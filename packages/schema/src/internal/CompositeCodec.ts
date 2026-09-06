@@ -32,7 +32,7 @@
  * Not part of the public API.
  */
 
-import { Option, Schema } from "effect"
+import { Option, Schema, SchemaAST } from "effect"
 import {
   getSchemaFields,
   hasEncodingTransformation,
@@ -88,11 +88,26 @@ export const makeCompositeKeyForm = (
 
     const codec = field as unknown as Schema.Codec<any>
 
-    // Case 2 — the numeric exception. Target is the Type side.
+    // Case 2 — the numeric exception. Target is the Type side, and it must be
+    // the DECLARED numeric kind, not merely "some number".
+    //
+    // `KeyComposer.serializeValue` pads by JS type — 16 digits for a number, 38
+    // for a bigint — so a `bigint` composite handed a `number` composes a
+    // 16-wide key where the write composed 38. That is not hypothetical: a
+    // stored `bigint` attribute marshalls to `{ N: "420" }` and unmarshalls
+    // back as a **number**, so any path that re-derives a key from a stored row
+    // (`Aggregate.list`) lands here with the wrong kind and silently finds
+    // nothing. Coercing to the declared kind is the same rule, applied
+    // exactly; a value already of the right kind is unaffected.
     if (numericTypeWithStringEncoding(field)) {
+      const wantsBigInt = SchemaAST.isBigInt(SchemaAST.toType(field.ast))
       const decode = Schema.decodeUnknownOption(codec)
       const fn = (value: unknown): unknown => {
-        if (typeof value === "number" || typeof value === "bigint") return value
+        if (typeof value === "bigint") return wantsBigInt ? value : Number(value)
+        if (typeof value === "number") {
+          if (!wantsBigInt) return value
+          return Number.isInteger(value) ? BigInt(value) : onError(attr, value)
+        }
         const decoded = decode(value)
         if (Option.isSome(decoded)) return decoded.value
         return onError(attr, value)

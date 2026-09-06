@@ -50,6 +50,7 @@ import { Context, Crypto, DateTime, type Duration, Effect, Option, Schema, Strea
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import type { ConditionInput } from "./Expression.js"
 import {
+  isBoundOp,
   makeBoundAppend,
   makeBoundDelete,
   makeBoundPut,
@@ -115,6 +116,7 @@ export {
   EntityUpdateImpl,
   EntityUpdateTypeId,
   emptyUpdateState,
+  type PutKind,
   type ReturnValuesMode,
   returnValuesMap,
   type UpdateState,
@@ -139,6 +141,7 @@ import {
   type EntityUpdate,
   EntityUpdateImpl,
   emptyUpdateState,
+  type PutKind,
   type ReturnValuesMode,
   returnValuesMap,
   type UpdateState,
@@ -444,6 +447,71 @@ export interface Entity<
    * Throws on invalid keys.
    */
   readonly _serializeSparseFields: (item: globalThis.Record<string, unknown>) => void
+
+  /**
+   * @internal Put a record into the composite key form (`internal/CompositeCodec.ts`)
+   * before it reaches `KeyComposer`.
+   *
+   * Exposed because the multi-item write paths (`internal/TransactableOps.ts`,
+   * `internal/TransactWriteOps.ts`, `Batch.ts`) and the aggregate/geo composers
+   * compose keys OUTSIDE `makeImpl`, and a second implementation of the rule is
+   * a second chance to disagree with `Entity.put`. Every such site must call
+   * this rather than hand `KeyComposer` a raw record — `test/KeyFormInvariant.test.ts`
+   * enforces it across all of them.
+   */
+  readonly _keyForm: (
+    record: globalThis.Record<string, unknown>,
+  ) => globalThis.Record<string, unknown>
+
+  /**
+   * @internal Rename domain field names to their stored DynamoDB attribute
+   * names (`storedAs`), in place. `Entity.put` applies this; the transact/batch
+   * put builder must apply the SAME one or a `storedAs` entity gets a
+   * differently-shaped item depending on which API wrote it.
+   */
+  readonly _renameToDynamo: (item: globalThis.Record<string, unknown>) => void
+
+  /**
+   * @internal The extra items a `put` of `item` must write alongside the item
+   * itself: one uniqueness sentinel per satisfiable `unique` constraint, plus a
+   * v1 version snapshot when `versioned: { retain: true }`.
+   *
+   * Every one of these is derived from the payload being written, so the
+   * multi-item write paths (`Transaction.transactWrite`,
+   * `EventStore.append({ additionalItems })`) can emit them without reading
+   * anything back. The DELETE side is deliberately absent: releasing a sentinel,
+   * snapshotting the outgoing row and building a soft-delete tombstone all read
+   * the STORED item, which those paths never do — they reject instead (EDD-9048).
+   *
+   * `item` must be the fully assembled wire-form item (keys composed, system
+   * fields applied) — i.e. the output of `validateAndBuildPutItem`.
+   */
+  readonly _buildPutSideItems: (
+    item: globalThis.Record<string, unknown>,
+    now: DateTime.Utc,
+    ttlAttrName: string,
+  ) => ReadonlyArray<{
+    readonly kind: "sentinel" | "snapshot"
+    /** Set for `kind: "sentinel"` — which `unique` constraint produced it. */
+    readonly constraintName?: string | undefined
+    /** Set for `kind: "sentinel"` — the serialized values it reserves, for `UniqueConstraintViolation`. */
+    readonly fields?: globalThis.Record<string, string> | undefined
+    readonly item: globalThis.Record<string, unknown>
+    /** Sentinels are only correct under this guard; snapshots take none. */
+    readonly guard?:
+      | {
+          readonly ConditionExpression: string
+          readonly ExpressionAttributeNames: globalThis.Record<string, string>
+        }
+      | undefined
+  }>
+
+  /**
+   * @internal Whether this entity's write contract needs items beyond the one
+   * the transact/batch compile path emits, and which config asks for it. Used to
+   * decide between expanding (put) and rejecting (delete, and all of Batch).
+   */
+  readonly _multiItemWriteFeatures: ReadonlyArray<"unique" | "retain" | "softDelete">
 
   /** @internal Attach model class prototype to a decoded plain object (no-op for Schema.Struct models). */
   readonly _attachPrototype: (decoded: any) => any
@@ -1883,6 +1951,22 @@ const makeImpl = <
     return (config.softDelete as { preserveUnique?: boolean }).preserveUnique === true
   }
 
+  /**
+   * The uniqueness sentinel's guard. `attribute_not_exists` must name the
+   * entity's CONFIGURED partition-key attribute — a literal `pk` is simply
+   * absent from an entity declaring `pk: { field: "PK" }`, so the condition is
+   * vacuously true and the constraint is silently unenforced (#111). Routed
+   * through `ExpressionAttributeNames` because the field name is user-supplied
+   * and may be a reserved word.
+   */
+  const sentinelGuard = (): {
+    readonly ConditionExpression: string
+    readonly ExpressionAttributeNames: globalThis.Record<string, string>
+  } => ({
+    ConditionExpression: "attribute_not_exists(#sentinel_pk)",
+    ExpressionAttributeNames: { "#sentinel_pk": config.indexes.primary.pk.field },
+  })
+
   /** Collect all key field names (pk, sk, gsi*pk, gsi*sk) */
   const gsiKeyFields = (): ReadonlyArray<string> => {
     const fields: Array<string> = []
@@ -2258,6 +2342,108 @@ const makeImpl = <
     }
 
     return snapshot
+  }
+
+  // ---------------------------------------------------------------------------
+  // Multi-item write support for the transact compile path (#113)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Which parts of this entity's write contract need more than one item.
+   * Drives both the `put` expansion and the `delete` / `Batch.write` rejections.
+   */
+  const multiItemWriteFeatures = (): ReadonlyArray<"unique" | "retain" | "softDelete"> => {
+    const features: Array<"unique" | "retain" | "softDelete"> = []
+    if (config.unique != null && Object.keys(config.unique).length > 0) features.push("unique")
+    if (isRetainEnabled()) features.push("retain")
+    if (isSoftDeleteEnabled()) features.push("softDelete")
+    return features
+  }
+
+  /**
+   * Side items for a `put`, derived purely from the payload being written —
+   * see the `_buildPutSideItems` doc on the Entity interface for why the delete
+   * side has no counterpart.
+   *
+   * Mirrors the emission in `put`'s own transact path so the two cannot drift:
+   * one sentinel per satisfiable constraint (sparse — a constraint whose fields
+   * are unset produces none), then the v1 snapshot.
+   */
+  const buildPutSideItems = (
+    item: globalThis.Record<string, unknown>,
+    now: DateTime.Utc,
+    ttlAttrName: string,
+  ): ReadonlyArray<{
+    readonly kind: "sentinel" | "snapshot"
+    readonly constraintName?: string | undefined
+    readonly fields?: globalThis.Record<string, string> | undefined
+    readonly item: globalThis.Record<string, unknown>
+    readonly guard?:
+      | {
+          readonly ConditionExpression: string
+          readonly ExpressionAttributeNames: globalThis.Record<string, string>
+        }
+      | undefined
+  }> => {
+    const out: Array<{
+      kind: "sentinel" | "snapshot"
+      constraintName?: string | undefined
+      fields?: globalThis.Record<string, string> | undefined
+      item: globalThis.Record<string, unknown>
+      guard?:
+        | {
+            readonly ConditionExpression: string
+            readonly ExpressionAttributeNames: globalThis.Record<string, string>
+          }
+        | undefined
+    }> = []
+
+    const pkField = config.indexes.primary.pk.field
+    const skField = config.indexes.primary.sk.field
+
+    if (config.unique != null) {
+      for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
+        const sentinel = composeUniqueSentinel(
+          schema,
+          entityType,
+          constraintName,
+          constraintDef,
+          item,
+        )
+        // Sparse: a constraint whose composing fields are unset never had a
+        // sentinel, so writing one would reserve `undefined` for everybody.
+        if (!sentinel) continue
+        const sentinelItem: globalThis.Record<string, unknown> = {
+          [pkField]: sentinel.key.pk,
+          [skField]: sentinel.key.sk,
+          __edd_e__: `${entityType}._unique.${constraintName}`,
+          _entity_pk: item[pkField],
+          _entity_sk: item[skField],
+        }
+        const uniqueTtl = resolveUniqueTtl(constraintDef)
+        if (uniqueTtl !== undefined) {
+          sentinelItem[ttlAttrName] = DateTime.toEpochSeconds(now) + normalizeTtlSeconds(uniqueTtl)
+        }
+        out.push({
+          kind: "sentinel",
+          constraintName,
+          fields: sentinel.fieldsRecord,
+          item: sentinelItem,
+          // The guard IS the constraint — without it the sentinel would happily
+          // overwrite another row's reservation and enforce nothing.
+          guard: sentinelGuard(),
+        })
+      }
+    }
+
+    if (isRetainEnabled()) {
+      out.push({
+        kind: "snapshot",
+        item: buildSnapshotItem(item, 1, pkField, skField, ttlAttrName, now),
+      })
+    }
+
+    return out
   }
 
   // ---------------------------------------------------------------------------
@@ -2755,7 +2941,7 @@ const makeImpl = <
                   Put: {
                     TableName: tableName,
                     Item: toAttributeMap(sentinelItem),
-                    ConditionExpression: "attribute_not_exists(pk)",
+                    ...sentinelGuard(),
                   },
                 })
               }
@@ -2880,6 +3066,7 @@ const makeImpl = <
       op._input,
       { attributeNotExists: [pkField, skField] },
       op._withVectors,
+      "create",
     )
   }
 
@@ -3420,7 +3607,7 @@ const makeImpl = <
                       _entity_pk: primaryKey[config.indexes.primary.pk.field],
                       _entity_sk: primaryKey[config.indexes.primary.sk.field],
                     }),
-                    ConditionExpression: "attribute_not_exists(pk)",
+                    ...sentinelGuard(),
                   },
                 })
               }
@@ -4565,6 +4752,11 @@ const makeImpl = <
         }),
       self,
       input as globalThis.Record<string, unknown>,
+      undefined,
+      undefined,
+      // Tagged so the transact/batch compilers can refuse it: this op is an
+      // UpdateItem with `if_not_exists`, not a Put (#100).
+      "upsert",
     )
 
   /**
@@ -5765,6 +5957,10 @@ const makeImpl = <
     /** @internal Entity schema version baked into composed keys. */
     _entityVersion: entityVersion,
     _serializeSparseFields: serializeSparseFields,
+    _keyForm: keyForm,
+    _renameToDynamo: renameToDynamo,
+    _buildPutSideItems: buildPutSideItems,
+    _multiItemWriteFeatures: multiItemWriteFeatures(),
     _attachPrototype: attachPrototype,
     _configure: (
       injectedSchema: DynamoSchema.DynamoSchema,
@@ -6244,6 +6440,21 @@ export interface TransactableInfo {
   readonly entity: Entity
   readonly key?: globalThis.Record<string, unknown> | undefined
   readonly input?: globalThis.Record<string, unknown> | undefined
+  /**
+   * The condition attached to the op — via `.condition()` on a bound builder,
+   * `Entity.condition()` on an unbound intermediate, or implicitly by
+   * `Entity.create()` (`attribute_not_exists`) / `Entity.patch()`
+   * (`attribute_exists`). Consumers that cannot express a condition (BatchWrite)
+   * MUST reject the op rather than drop it.
+   */
+  readonly condition?: Expr | ConditionInput | undefined
+  /**
+   * For `opType: "put"`, which put-shaped op produced it. `"upsert"` does NOT
+   * have `Put` semantics — it is an `UpdateItem` with `if_not_exists` on
+   * `createdAt`, immutable fields and the version counter. Consumers that emit
+   * a `Put` MUST reject `"upsert"` rather than compile it (#100).
+   */
+  readonly putKind?: PutKind | undefined
 }
 
 /** @internal */
@@ -6253,6 +6464,9 @@ interface InternalEntityOp {
   readonly _entity: Entity
   readonly _key?: globalThis.Record<string, unknown>
   readonly _input?: globalThis.Record<string, unknown>
+  readonly _condition?: Expr | ConditionInput | undefined
+  readonly _updateState?: UpdateState
+  readonly _putKind?: PutKind | undefined
 }
 
 /** @internal */
@@ -6260,6 +6474,7 @@ interface InternalEntityDelete {
   readonly [EntityDeleteTypeId]: EntityDeleteTypeId
   readonly _entity: Entity
   readonly _key: globalThis.Record<string, unknown>
+  readonly _condition?: Expr | ConditionInput | undefined
 }
 
 const isEntityOp = (op: object): op is InternalEntityOp => EntityOpTypeId in op
@@ -6269,26 +6484,56 @@ const isEntityDelete = (op: object): op is InternalEntityDelete => EntityDeleteT
 /**
  * Extract transactable metadata from an Entity operation intermediate.
  * Returns undefined if the value is not a recognized entity operation.
+ *
+ * Bound-CRUD builders (`db.entities.X.put(...)`, `.create(...)`,
+ * `.delete(...)`, …) are unwrapped to the `EntityOp` / `EntityDelete` they wrap.
+ * That unwrapping is what lets entities authored with the pure, AWS-free
+ * `@effect-dynamodb/schema` `Entity.make` take part in `Batch.write`,
+ * `Transaction.transactWrite`, and `EventStore.append({ additionalItems })` — a
+ * pure definition carries no operations, so the bound builder is the only write
+ * descriptor its author can ever hold (#100).
  */
 export const extractTransactable = (op: unknown): TransactableInfo | undefined => {
   if (op == null || typeof op !== "object") return undefined
 
+  // Unwrap a bound-CRUD builder to the intermediate it wraps. Combinators on the
+  // builder (`.condition()`, `.set()`, …) are applied to that inner op, so the
+  // unwrapped value carries the full request.
+  const target = isBoundOp(op) ? (op._op as unknown) : op
+  if (target == null || typeof target !== "object") return undefined
+
   // Check for EntityOp intermediates (get, put, update)
-  if (isEntityOp(op)) {
-    if (op._opType === "get") {
-      return { opType: "get", entity: op._entity, key: op._key }
+  if (isEntityOp(target)) {
+    if (target._opType === "get") {
+      return { opType: "get", entity: target._entity, key: target._key }
     }
-    if (op._opType === "put") {
-      return { opType: "put", entity: op._entity, input: op._input }
+    if (target._opType === "put") {
+      return {
+        opType: "put",
+        entity: target._entity,
+        input: target._input,
+        condition: target._condition,
+        putKind: target._putKind ?? "put",
+      }
     }
-    if (op._opType === "update") {
-      return { opType: "update", entity: op._entity, key: op._key }
+    if (target._opType === "update") {
+      return {
+        opType: "update",
+        entity: target._entity,
+        key: target._key,
+        condition: target._updateState?.condition,
+      }
     }
   }
 
   // Check for EntityDelete intermediate
-  if (isEntityDelete(op)) {
-    return { opType: "delete", entity: op._entity, key: op._key }
+  if (isEntityDelete(target)) {
+    return {
+      opType: "delete",
+      entity: target._entity,
+      key: target._key,
+      condition: target._condition,
+    }
   }
 
   return undefined

@@ -44,6 +44,8 @@ import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
 import type {
   AdditionalItemConditionFailed,
   DuplicateCommand,
+  UniqueConstraintViolation,
+  ValidationError,
   VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
 import * as Aggregate from "../src/Aggregate.js"
@@ -1706,6 +1708,32 @@ describeConnected("Connected integration tests", () => {
         const task = yield* Tasks.get({ taskId: "t-tx" }).asEffect()
         expect(user.displayName).toBe("TxUser")
         expect(task.title).toBe("Tx Task")
+
+        // #113 — `Users` carries `unique: { email }` + `versioned: { retain }`,
+        // so this ONE caller op must have emitted three items: the row, its
+        // uniqueness sentinel, and the v1 snapshot. Before #113 only the row
+        // landed and the constraint was silently unenforced.
+        const client = yield* DynamoClient
+        const sentinel = yield* client.getItem({
+          TableName: tableName,
+          Key: {
+            pk: { S: "$connected-test#v1#user.email#tx@test.com" },
+            sk: { S: "$connected-test#v1#user.email" },
+          },
+        })
+        expect(sentinel.Item?.__edd_e__?.S).toBe("User._unique.email")
+        // The sentinel points back at the row it reserves for.
+        expect(sentinel.Item?._entity_pk?.S).toBe("$connected-test#v1#user#userid_u-tx")
+
+        // ...and the v1 retain snapshot, in the row's own partition.
+        const snapshot = yield* client.getItem({
+          TableName: tableName,
+          Key: {
+            pk: { S: "$connected-test#v1#user#userid_u-tx" },
+            sk: { S: "$connected-test#v1#user#v#0000001" },
+          },
+        })
+        expect(snapshot.Item?.displayName?.S).toBe("TxUser")
       }).pipe(provide),
     )
 
@@ -1740,6 +1768,141 @@ describeConnected("Connected integration tests", () => {
 
         // Verify the put was rolled back
         const result = yield* Users.get({ userId: "u-tx-fail" })
+          .asEffect()
+          .pipe(
+            Effect.map(() => "exists"),
+            Effect.catchTag("ItemNotFound", () => Effect.succeed("not found")),
+          )
+        expect(result).toBe("not found")
+      }).pipe(provide),
+    )
+
+    it.effect("transactWrite enforces the unique constraint it now writes (#113)", () =>
+      Effect.gen(function* () {
+        // The sentinel from the previous test reserves tx@test.com. A second
+        // write of the same email through the SAME path must now be refused —
+        // before #113 it succeeded and left two rows sharing the value.
+        const err = yield* Transaction.transactWrite([
+          Users.put({
+            userId: "u-tx-dup",
+            email: "tx@test.com",
+            displayName: "Duplicate",
+            role: "member",
+            createdBy: "test",
+          }),
+        ]).pipe(Effect.flip)
+
+        expect(err._tag).toBe("UniqueConstraintViolation")
+        const violation = err as UniqueConstraintViolation
+        expect(violation.entityType).toBe("User")
+        expect(violation.constraint).toBe("email")
+        expect(violation.fields).toEqual({ email: "tx@test.com" })
+
+        // All-or-nothing: the row must not exist.
+        const result = yield* Users.get({ userId: "u-tx-dup" })
+          .asEffect()
+          .pipe(
+            Effect.map(() => "exists"),
+            Effect.catchTag("ItemNotFound", () => Effect.succeed("not found")),
+          )
+        expect(result).toBe("not found")
+      }).pipe(provide),
+    )
+
+    it.effect("transactWrite refuses a delete whose side items need a read (#113)", () =>
+      Effect.gen(function* () {
+        const err = yield* Transaction.transactWrite([Users.delete({ userId: "u-tx" })]).pipe(
+          Effect.flip,
+        )
+
+        expect(err._tag).toBe("ValidationError")
+        expect(String((err as ValidationError).cause)).toContain("EDD-9048")
+
+        // Refused up front: the row and its sentinel are both untouched.
+        const still = yield* Users.get({ userId: "u-tx" }).asEffect()
+        expect(still.displayName).toBe("TxUser")
+      }).pipe(provide),
+    )
+
+    it.effect("the entity's own delete releases the sentinel it wrote (#113)", () =>
+      Effect.gen(function* () {
+        yield* Users.delete({ userId: "u-tx" })
+
+        // The released email is reusable through the transact path, which proves
+        // the sentinel really went away rather than being orphaned.
+        yield* Transaction.transactWrite([
+          Users.put({
+            userId: "u-tx-reuse",
+            email: "tx@test.com",
+            displayName: "Reused",
+            role: "member",
+            createdBy: "test",
+          }),
+        ])
+        const reused = yield* Users.get({ userId: "u-tx-reuse" }).asEffect()
+        expect(reused.displayName).toBe("Reused")
+      }).pipe(provide),
+    )
+
+    it.effect("a softDelete entity's transact delete is refused, not hard-deleted (#113)", () =>
+      Effect.gen(function* () {
+        // `Tasks` is softDelete. Before #113 this hard-deleted the row, losing
+        // the tombstone the entity was configured to write.
+        yield* Tasks.put({
+          taskId: "t-sd",
+          userId: "u-sd",
+          title: "Soft",
+          status: "todo",
+          priority: 1,
+        }).asEffect()
+
+        const err = yield* Transaction.transactWrite([Tasks.delete({ taskId: "t-sd" })]).pipe(
+          Effect.flip,
+        )
+        expect(err._tag).toBe("ValidationError")
+        expect(String((err as ValidationError).cause)).toContain("EDD-9048")
+
+        // Still live — nothing was deleted.
+        const still = yield* Tasks.get({ taskId: "t-sd" }).asEffect()
+        expect(still.title).toBe("Soft")
+
+        // The entity's own delete does write the tombstone, with GSI keys stripped.
+        yield* Tasks.delete({ taskId: "t-sd" })
+        const client = yield* DynamoClient
+        const partition = yield* client.query({
+          TableName: tableName,
+          KeyConditionExpression: "#pk = :pk",
+          ExpressionAttributeNames: { "#pk": "pk" },
+          ExpressionAttributeValues: { ":pk": { S: "$connected-test#v1#task#taskid_t-sd" } },
+        })
+        const rows = partition.Items ?? []
+        expect(rows).toHaveLength(1)
+        expect(rows[0]?.sk?.S).toContain("#deleted#")
+        expect(rows[0]?.deletedAt?.S).toBeDefined()
+        expect(rows[0]?.gsi1pk).toBeUndefined()
+      }).pipe(provide),
+    )
+
+    it.effect("Batch.write refuses the lifecycle configs it cannot express (#113)", () =>
+      Effect.gen(function* () {
+        const uniqueErr = yield* Batch.write([
+          Users.put({
+            userId: "u-bw-unique",
+            email: "bwunique@test.com",
+            displayName: "BW",
+            role: "member",
+            createdBy: "test",
+          }),
+        ]).pipe(Effect.flip)
+        expect(uniqueErr._tag).toBe("ValidationError")
+        expect(String((uniqueErr as ValidationError).cause)).toContain("EDD-9049")
+
+        const softErr = yield* Batch.write([Tasks.delete({ taskId: "t-bw-sd" })]).pipe(Effect.flip)
+        expect(softErr._tag).toBe("ValidationError")
+        expect(String((softErr as ValidationError).cause)).toContain("EDD-9049")
+
+        // Nothing was written by the refused unique put.
+        const result = yield* Users.get({ userId: "u-bw-unique" })
           .asEffect()
           .pipe(
             Effect.map(() => "exists"),
@@ -7430,7 +7593,34 @@ const EsWatermarks = Entity.make({
   },
 })
 
-const EsIdemTable = Table.make({ schema: esIdemSchema, entities: { EsWatermarks } })
+/**
+ * A read model authored with the PURE, AWS-free `@effect-dynamodb/schema`
+ * `Entity.make` — the #100 shape. A pure definition carries no CRUD ops, so the
+ * only write descriptor its author can hold is the bound builder returned by
+ * `db.entities.EsStatusProjection.put(...)`.
+ */
+const EsStatusRecord = Schema.Struct({
+  matchId: Schema.String,
+  state: Schema.String,
+})
+
+const EsStatusProjection = PureEntity.make({
+  model: DynamoModel.configure(EsStatusRecord, { matchId: { identifier: true } }),
+  entityType: "EsStatus",
+  primaryKey: {
+    pk: { field: "pk", composite: ["matchId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  // Timestamps + version make the upsert-vs-put divergence observable: a real
+  // upsert preserves `createdAt` and increments `version`; a Put resets both.
+  timestamps: true,
+  versioned: true,
+})
+
+const EsIdemTable = Table.make({
+  schema: esIdemSchema,
+  entities: { EsWatermarks, EsStatusProjection },
+})
 
 class EsIdemMatchStarted extends Schema.Class<EsIdemMatchStarted>("EsIdemMatchStarted")({
   venue: Schema.String,
@@ -7648,6 +7838,253 @@ describeConnected("EventStore — additionalItems + idempotency (closes #85)", (
       const entityTypes = (raw.Items ?? []).map((i) => i.__edd_e__?.S)
       expect(entityTypes.filter((t) => t === "esmatch.command")).toHaveLength(2)
       expect(entityTypes.filter((t) => t === "esmatch.event")).toHaveLength(2)
+    }).pipe(provideEsIdem),
+  )
+
+  // -------------------------------------------------------------------------
+  // #100 — bound-CRUD builders as multi-item write ops.
+  //
+  // The headline `additionalItems` use case: commit a read model atomically
+  // with the events that produced it, where the read model was authored with
+  // the pure `@effect-dynamodb/schema` Entity.make. Before the fix this failed
+  // with ValidationError { entityType: "unknown" }.
+  // -------------------------------------------------------------------------
+
+  it.effect("commits a pure-authored read-model row atomically with the events (#100)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      yield* EsIdemMatchEvents.append(
+        { matchId: "proj-1" },
+        [new EsIdemMatchStarted({ venue: "Basin Reserve" })],
+        0,
+        {
+          additionalItems: [
+            db.entities.EsStatusProjection.put({ matchId: "proj-1", state: "IN_PROGRESS" }),
+          ],
+        },
+      )
+
+      const events = yield* EsIdemMatchEvents.read({ matchId: "proj-1" })
+      expect(events.map((e) => e.eventType)).toEqual(["EsIdemMatchStarted"])
+
+      const projection = yield* db.entities.EsStatusProjection.get({ matchId: "proj-1" })
+      expect(projection.state).toBe("IN_PROGRESS")
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("a failing condition on a bound additional item rolls the whole append back", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      yield* db.entities.EsStatusProjection.put({ matchId: "proj-2", state: "IN_PROGRESS" })
+
+      // The projection is already IN_PROGRESS, so this condition cannot hold.
+      // Before the fix the condition was dropped and the write silently applied.
+      const error = yield* EsIdemMatchEvents.append(
+        { matchId: "proj-2" },
+        [new EsIdemMatchStarted({ venue: "Seddon Park" })],
+        0,
+        {
+          additionalItems: [
+            db.entities.EsStatusProjection.put({ matchId: "proj-2", state: "COMPLETE" }).condition({
+              state: "PRE_MATCH",
+            }),
+          ],
+        },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("AdditionalItemConditionFailed")
+      expect((error as AdditionalItemConditionFailed).indices).toEqual([0])
+
+      // All-or-nothing: neither the event nor the projection update landed.
+      expect(yield* EsIdemMatchEvents.read({ matchId: "proj-2" })).toHaveLength(0)
+      const projection = yield* db.entities.EsStatusProjection.get({ matchId: "proj-2" })
+      expect(projection.state).toBe("IN_PROGRESS")
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("Transaction.transactWrite accepts bound builders from a pure entity (#100)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      yield* Transaction.transactWrite([
+        db.entities.EsStatusProjection.put({ matchId: "tx-1", state: "PRE_MATCH" }),
+        db.entities.EsStatusProjection.put({ matchId: "tx-2", state: "PRE_MATCH" }),
+      ])
+
+      expect((yield* db.entities.EsStatusProjection.get({ matchId: "tx-1" })).state).toBe(
+        "PRE_MATCH",
+      )
+      expect((yield* db.entities.EsStatusProjection.get({ matchId: "tx-2" })).state).toBe(
+        "PRE_MATCH",
+      )
+
+      yield* Transaction.transactWrite([db.entities.EsStatusProjection.delete({ matchId: "tx-2" })])
+      const gone = yield* db.entities.EsStatusProjection.get({ matchId: "tx-2" }).pipe(Effect.flip)
+      expect(gone._tag).toBe("ItemNotFound")
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("transactWrite honours create()'s attribute_not_exists guard (#100)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      yield* Transaction.transactWrite([
+        db.entities.EsStatusProjection.create({ matchId: "tx-create", state: "PRE_MATCH" }),
+      ])
+
+      // Second create on the same key must be rejected by real DynamoDB — before
+      // the fix the guard was dropped and this silently overwrote the row.
+      const error = yield* Transaction.transactWrite([
+        db.entities.EsStatusProjection.create({ matchId: "tx-create", state: "COMPLETE" }),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("TransactionCancelled")
+
+      const row = yield* db.entities.EsStatusProjection.get({ matchId: "tx-create" })
+      expect(row.state).toBe("PRE_MATCH")
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("Batch.write accepts bound builders from a pure entity (#100)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      yield* Batch.write([
+        db.entities.EsStatusProjection.put({ matchId: "bw-1", state: "PRE_MATCH" }),
+        db.entities.EsStatusProjection.put({ matchId: "bw-2", state: "PRE_MATCH" }),
+      ])
+
+      expect((yield* db.entities.EsStatusProjection.get({ matchId: "bw-1" })).state).toBe(
+        "PRE_MATCH",
+      )
+
+      yield* Batch.write([db.entities.EsStatusProjection.delete({ matchId: "bw-1" })])
+      const gone = yield* db.entities.EsStatusProjection.get({ matchId: "bw-1" }).pipe(Effect.flip)
+      expect(gone._tag).toBe("ItemNotFound")
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("Batch.write rejects a conditional op rather than dropping the condition", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      const error = yield* Batch.write([
+        db.entities.EsStatusProjection.create({ matchId: "bw-cond", state: "PRE_MATCH" }),
+      ]).pipe(Effect.flip)
+
+      expect(error._tag).toBe("ValidationError")
+      const gone = yield* db.entities.EsStatusProjection.get({ matchId: "bw-cond" }).pipe(
+        Effect.flip,
+      )
+      expect(gone._tag).toBe("ItemNotFound")
+    }).pipe(provideEsIdem),
+  )
+
+  // -------------------------------------------------------------------------
+  // #100 review — `upsert` does NOT have Put semantics. Its whole contract is
+  // `if_not_exists` on createdAt / immutable fields / the version counter, so
+  // compiling it as a Put silently resets them. Proven end-to-end here: the
+  // direct upsert preserves, the transact paths refuse, and the stored row is
+  // left exactly as it was.
+  // -------------------------------------------------------------------------
+
+  it.effect("a direct upsert preserves createdAt and bumps version (the contract)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      const first = yield* db.entities.EsStatusProjection.upsert({
+        matchId: "ups-1",
+        state: "PRE_MATCH",
+      }).asEffect()
+      const second = yield* db.entities.EsStatusProjection.upsert({
+        matchId: "ups-1",
+        state: "IN_PROGRESS",
+      }).asEffect()
+
+      expect((second as { createdAt: unknown }).createdAt).toEqual(
+        (first as { createdAt: unknown }).createdAt,
+      )
+      expect((second as { version: number }).version).toBe(
+        (first as { version: number }).version + 1,
+      )
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("transactWrite refuses an upsert and leaves the stored row untouched", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      const before = yield* db.entities.EsStatusProjection.upsert({
+        matchId: "ups-tx",
+        state: "PRE_MATCH",
+      }).asEffect()
+
+      const error = yield* Transaction.transactWrite([
+        db.entities.EsStatusProjection.upsert({ matchId: "ups-tx", state: "IN_PROGRESS" }),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+
+      const after = yield* db.entities.EsStatusProjection.get({ matchId: "ups-tx" }).pipe(
+        Effect.map((r) => r as unknown as { state: string; createdAt: unknown; version: number }),
+      )
+      // Refused up front — no partial write, and createdAt/version intact.
+      expect(after.state).toBe("PRE_MATCH")
+      expect(after.createdAt).toEqual((before as { createdAt: unknown }).createdAt)
+      expect(after.version).toBe((before as { version: number }).version)
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("Batch.write and additionalItems refuse an upsert too", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      const batchError = yield* Batch.write([
+        db.entities.EsStatusProjection.upsert({ matchId: "ups-bw", state: "PRE_MATCH" }),
+      ]).pipe(Effect.flip)
+      expect(batchError._tag).toBe("ValidationError")
+
+      const appendError = yield* EsIdemMatchEvents.append(
+        { matchId: "ups-es" },
+        [new EsIdemMatchStarted({ venue: "MCG" })],
+        0,
+        {
+          additionalItems: [
+            db.entities.EsStatusProjection.upsert({ matchId: "ups-es", state: "PRE_MATCH" }),
+          ],
+        },
+      ).pipe(Effect.flip)
+      expect(appendError._tag).toBe("ValidationError")
+
+      // All-or-nothing: the refused append wrote no events either.
+      expect(yield* EsIdemMatchEvents.read({ matchId: "ups-es" })).toHaveLength(0)
     }).pipe(provideEsIdem),
   )
 })
@@ -8838,10 +9275,83 @@ const Metrics = Entity.make({
   },
 })
 
-const KfTable = Table.make({ schema: kfSchema, entities: { Metrics } })
+// #111 additions — the multi-item write paths, the aggregate list path, a
+// renamed field, and a uniqueness sentinel guard.
+class KfReading extends Schema.Class<KfReading>("KfReading")({
+  device: Schema.String,
+  takenAt: DynamoModel.DateEpochMs,
+  value: Schema.Number,
+}) {}
+
+const KfReadings = Entity.make({
+  model: KfReading,
+  entityType: "KfReading",
+  primaryKey: {
+    pk: { field: "pk", composite: ["device"] },
+    sk: { field: "sk", composite: ["takenAt"] },
+  },
+})
+
+class KfRenamed extends Schema.Class<KfRenamed>("KfRenamed")({
+  rid: Schema.String,
+  label: Schema.String,
+}) {}
+
+const KfRenameds = Entity.make({
+  model: DynamoModel.configure(KfRenamed, { label: { field: "lbl" } }),
+  entityType: "KfRenamed",
+  primaryKey: { pk: { field: "pk", composite: ["rid"] }, sk: { field: "sk", composite: [] } },
+})
+
+class KfCustom extends Schema.Class<KfCustom>("KfCustom")({
+  cid: Schema.String,
+  email: Schema.String,
+}) {}
+
+const KfCustomPk = Entity.make({
+  model: KfCustom,
+  entityType: "KfCustomPk",
+  primaryKey: { pk: { field: "pk", composite: ["cid"] }, sk: { field: "sk", composite: [] } },
+  unique: { email: ["email"] },
+})
+
+class KfLedger extends Schema.Class<KfLedger>("KfLedger")({
+  book: Schema.String,
+  // The composite this fixture was written for: numeric Type, string Encoded.
+  // `serializeValue` pads it to 38 on the write side, so `list`'s old
+  // `String(v)` SK prefix looked for `5` where `000...0005` is stored (#111).
+  // It briefly had to be weakened to `Schema.Number` because the aggregate
+  // write path stored Type-side values and assembly could not decode them back;
+  // that is fixed here, so the intended shape is restored.
+  seq: Schema.BigIntFromString,
+  title: Schema.String,
+}) {}
+
+const KfTable = Table.make({
+  schema: kfSchema,
+  entities: { Metrics, KfReadings, KfRenameds, KfCustomPk },
+})
+
+const KfLedgers = Aggregate.make(KfLedger, {
+  table: KfTable,
+  schema: kfSchema,
+  pk: { field: "pk", composite: ["book", "seq"] },
+  // No `collection.index` — assembly runs against the base table (#93), so the
+  // fixture needs only the list GSI, which `Metrics` already provisions.
+  collection: { name: "kfledger" },
+  list: {
+    index: "gsi1",
+    name: "kfledgerlist",
+    pk: { field: "gsi1pk", composite: ["book"] },
+    sk: { field: "gsi1sk", composite: ["seq"] },
+  },
+  root: { entityType: "KfLedgerItem" },
+  edges: {},
+})
+
 const KfLayer = Layer.mergeAll(ClientLayer, KfTable.layer({ name: kfTableName }))
 const provideKf = Effect.provide(KfLayer)
-const kfEntities = { Metrics }
+const kfEntities = { Metrics, KfReadings, KfRenameds, KfCustomPk }
 const kfTables = { KfTable }
 
 describeConnected("composite key form — mixed-width ordering", () => {
@@ -8961,6 +9471,173 @@ describeConnected("composite key form — mixed-width ordering", () => {
       }
     }).pipe(provideKf),
   )
+
+  // -------------------------------------------------------------------------
+  // #111 — the multi-item write paths must spell keys exactly as `Entity.put`.
+  // Each of these composed a DIFFERENT key before the fix, so a row written
+  // through one API was invisible to every accessor of the other.
+  // -------------------------------------------------------------------------
+
+  describe("multi-item write paths spell keys the same way (#111)", () => {
+    it.effect("Batch.get / transactGet / Batch.write(delete) round-trip a DateEpochMs key", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+        const at = DateTime.makeUnsafe(1767225600000)
+
+        yield* db.entities.KfReadings.put({ device: "d1", takenAt: at, value: 1 })
+
+        // Pre-fix both returned [null] — the raw DateTime never reached epoch form.
+        const [viaBatch] = yield* Batch.get([KfReadings.get({ device: "d1", takenAt: at })])
+        expect(viaBatch?.value).toBe(1)
+        const [viaTransact] = yield* Transaction.transactGet([
+          KfReadings.get({ device: "d1", takenAt: at }),
+        ])
+        expect(viaTransact?.value).toBe(1)
+
+        // Pre-fix this reported success while the row remained.
+        yield* Batch.write([KfReadings.delete({ device: "d1", takenAt: at })])
+        const gone = yield* KfReadings.get({ device: "d1", takenAt: at })
+          .asEffect()
+          .pipe(
+            Effect.map(() => "exists"),
+            Effect.catchTag("ItemNotFound", () => Effect.succeed("not found")),
+          )
+        expect(gone).toBe("not found")
+      }).pipe(provideKf),
+    )
+
+    it.effect("Transaction.check evaluates against the row it names", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+        const at = DateTime.makeUnsafe(1767225600001)
+        yield* db.entities.KfReadings.put({ device: "d2", takenAt: at, value: 7 })
+
+        // Pre-fix this COMMITTED: the guard was evaluated against a key that did
+        // not exist, so `attribute_not_exists` was vacuously true.
+        const err = yield* Transaction.transactWrite([
+          Transaction.check(
+            KfReadings.get({ device: "d2", takenAt: at }),
+            Expression.condition({ attributeNotExists: "pk" }),
+          ),
+        ]).pipe(Effect.flip)
+        expect(err._tag).toBe("TransactionCancelled")
+
+        // ...and the positive form commits.
+        yield* Transaction.transactWrite([
+          Transaction.check(
+            KfReadings.get({ device: "d2", takenAt: at }),
+            Expression.condition({ attributeExists: "pk" }),
+          ),
+        ])
+      }).pipe(provideKf),
+    )
+
+    it.effect("a transactWrite([delete, put]) move does not duplicate the row", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+        const from = DateTime.makeUnsafe(1767225600002)
+        const to = DateTime.makeUnsafe(1767225600003)
+        yield* db.entities.KfReadings.put({ device: "d3", takenAt: from, value: 1 })
+
+        yield* Transaction.transactWrite([
+          db.entities.KfReadings.delete({ device: "d3", takenAt: from }),
+          db.entities.KfReadings.put({ device: "d3", takenAt: to, value: 2 }),
+        ])
+
+        // Pre-fix the delete missed its target and the put landed → two rows.
+        const rows = yield* db.entities.KfReadings.primary({ device: "d3" }).collect()
+        expect(rows).toHaveLength(1)
+        expect(rows[0]!.value).toBe(2)
+      }).pipe(provideKf),
+    )
+
+    it.effect("a renamed field is stored identically by put and transactWrite", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+        const client = yield* DynamoClient
+
+        yield* db.entities.KfRenameds.put({ rid: "r1", label: "viaEntity" })
+        yield* Transaction.transactWrite([
+          db.entities.KfRenameds.put({ rid: "r2", label: "viaTransact" }),
+        ])
+
+        const attrsOf = (rid: string) =>
+          client
+            .getItem({
+              TableName: kfTableName,
+              Key: { pk: { S: `$kf#v1#kfrenamed#rid_${rid}` }, sk: { S: "$kf#v1#kfrenamed" } },
+            })
+            .pipe(Effect.map((r) => Object.keys(r.Item ?? {}).sort()))
+
+        // Pre-fix: put wrote `lbl`, transactWrite wrote `label`.
+        const viaEntity = yield* attrsOf("r1")
+        const viaTransact = yield* attrsOf("r2")
+        expect(viaTransact).toEqual(viaEntity)
+        expect(viaTransact).toContain("lbl")
+        expect(viaTransact).not.toContain("label")
+
+        // Both are readable through the decode path.
+        expect((yield* db.entities.KfRenameds.get({ rid: "r2" })).label).toBe("viaTransact")
+      }).pipe(provideKf),
+    )
+
+    it.effect("the uniqueness sentinel guard names the configured pk attribute", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+        yield* db.entities.KfCustomPk.put({ cid: "c1", email: "a@x.io" })
+
+        const err = yield* db.entities.KfCustomPk.put({ cid: "c2", email: "a@x.io" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(err._tag).toBe("UniqueConstraintViolation")
+
+        // ...and through the transact path, which emits the same guarded sentinel.
+        const txErr = yield* Transaction.transactWrite([
+          db.entities.KfCustomPk.put({ cid: "c3", email: "a@x.io" }),
+        ]).pipe(Effect.flip)
+        expect(txErr._tag).toBe("UniqueConstraintViolation")
+      }).pipe(provideKf),
+    )
+
+    it.effect("an aggregate's list() finds the rows its create() wrote", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: kfEntities,
+          aggregates: { KfLedgers },
+          tables: kfTables,
+        })
+
+        for (const n of KF_VALUES) {
+          yield* db.aggregates.KfLedgers.create({
+            book: "b1",
+            seq: String(n),
+            title: `t-${n}`,
+          } as never)
+        }
+
+        // Pre-fix `list` composed its GSI key from the RAW filter and built the
+        // SK prefix with `String(v)`, while `create` composed through the key
+        // form and padded via `serializeValue`. The query matched nothing and
+        // every aggregate was dropped from the result with no error at all.
+        const listed = yield* db.aggregates.KfLedgers.list({ book: "b1" })
+        const seqs = listed.data
+          .map((l) => (l as unknown as { seq: bigint }).seq)
+          .sort((a, b) => (a < b ? -1 : 1))
+        expect(seqs).toEqual(KF_VALUES.map((n) => BigInt(n)).sort((a, b) => (a < b ? -1 : 1)))
+        // Typed correctly — a bigint, not the stored string.
+        expect(typeof seqs[0]).toBe("bigint")
+
+        // A filter that reaches the SK prefix — the `String(v)` path, which
+        // looked for `5` where the padded 38-wide spelling is stored.
+        const one = yield* db.aggregates.KfLedgers.list({
+          book: "b1",
+          seq: BigInt(KF_VALUES[0]!),
+        })
+        expect(one.data).toHaveLength(1)
+        expect((one.data[0] as unknown as { title: string }).title).toBe(`t-${KF_VALUES[0]}`)
+      }).pipe(provideKf),
+    )
+  })
 })
 
 // NOTE: aggregate coverage for the key-form rule is UNIT-level
@@ -9197,6 +9874,52 @@ describeConnected("key form holds across every composition site (S1)", () => {
       expect(left).toEqual([])
     }).pipe(provideS1),
   )
+
+  it.effect("transact and batch puts compose the SAME key as entity put (#111)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: s1Entities, tables: s1Tables })
+      const client = yield* DynamoClient
+
+      const sksOf = (acct: string) =>
+        client
+          .query({
+            TableName: s1TableName,
+            KeyConditionExpression: "#pk = :pk",
+            ExpressionAttributeNames: { "#pk": "pk" },
+            ExpressionAttributeValues: { ":pk": { S: `$s1#v1#s1row#acct_${acct}` } },
+          })
+          .pipe(Effect.map((r) => (r.Items ?? []).map((i) => i.sk?.S)))
+
+      for (const n of S1_VALUES) {
+        yield* db.entities.S1Rows.put({ acct: `kf-e-${n}`, txn: BigInt(n), note: "entity" })
+        yield* Transaction.transactWrite([
+          db.entities.S1Rows.put({ acct: `kf-t-${n}`, txn: BigInt(n), note: "transact" }),
+        ])
+        yield* Batch.write([
+          db.entities.S1Rows.put({ acct: `kf-b-${n}`, txn: BigInt(n), note: "batch" }),
+        ])
+
+        const viaEntity = yield* sksOf(`kf-e-${n}`)
+        const viaTransact = yield* sksOf(`kf-t-${n}`)
+        const viaBatch = yield* sksOf(`kf-b-${n}`)
+
+        // Pre-fix the transact/batch rows carried `txn_5` where the entity row
+        // carried the padded spelling, so each write produced an orphan row no
+        // accessor could read.
+        expect(viaEntity).toHaveLength(1)
+        expect(viaTransact).toEqual(viaEntity)
+        expect(viaBatch).toEqual(viaEntity)
+        expect(viaEntity[0]).toContain(String(n).padStart(38, "0"))
+      }
+
+      // ...and the rows are reachable through the typed accessors.
+      for (const n of S1_VALUES) {
+        expect(
+          (yield* db.entities.S1Rows.byTxn({ txn: BigInt(n) }).collect()).map((r) => r.acct).sort(),
+        ).toEqual(expect.arrayContaining([`kf-b-${n}`, `kf-e-${n}`, `kf-t-${n}`]))
+      }
+    }).pipe(provideS1),
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -9350,4 +10073,560 @@ describeConnected("collections and vector search share the entity key form", () 
       }
     }).pipe(provideCf),
   )
+})
+
+// ===========================================================================
+// Aggregate attribute encoding — every transformed shape round-trips (#116)
+// ===========================================================================
+//
+// Aggregates build their rows from the schema-DECODED domain object and
+// marshalled the Type value straight to DynamoDB, while the read path decodes
+// with the same schema. For any transformed field the two disagreed: a
+// `BigIntFromString` landed as `{N:"5"}` and assembly's decode rejected it, so
+// the aggregate could not round-trip at all. Dates were noticed first (#72) and
+// got a date-only pass; this pins the general rule for every shape, on the root,
+// on a `many` edge element, and on a ref-hydrated edge.
+
+const aeSchema = DynamoSchema.make({ name: "ae", version: 1 })
+const aeTableName = `ae-test-${Date.now()}`
+
+/** The referenced entity — its own schema must encode a hydrated ref. */
+class AeMaker extends Schema.Class<AeMaker>("AeMaker")({
+  makerId: Schema.String,
+  // Transformed field INSIDE the ref target.
+  founded: Schema.BigIntFromString,
+}) {}
+
+const AeMakers = PureEntity.make({
+  model: DynamoModel.configure(AeMaker, { makerId: { identifier: true } }),
+  entityType: "AeMaker",
+  primaryKey: { pk: { field: "pk", composite: ["makerId"] }, sk: { field: "sk", composite: [] } },
+})
+
+/** A `many` edge element carrying the full shape matrix. */
+class AePart extends Schema.Class<AePart>("AePart")({
+  // `id` (not `partId`): `extractRefIdentifiers` uses it as the element's SK
+  // composite, so without it two `many` elements collide on one sort key.
+  id: Schema.String,
+  bigStr: Schema.BigIntFromString,
+  numStr: Schema.NumberFromString,
+  epoch: DynamoModel.DateEpochMs,
+  plainDate: Schema.Date,
+  dtUtc: Schema.DateTimeUtc,
+  plainNum: Schema.Number,
+  plainStr: Schema.String,
+}) {}
+
+const AeParts = PureEntity.make({
+  model: DynamoModel.configure(AePart, { id: { identifier: true } }),
+  entityType: "AePart",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+})
+
+/** A ref-hydrated `one` edge. */
+class AeSupplier extends Schema.Class<AeSupplier>("AeSupplier")({
+  supplierId: Schema.String,
+  since: Schema.NumberFromString,
+  maker: AeMaker.pipe(DynamoModel.ref),
+}) {}
+
+const AeSuppliers = PureEntity.make({
+  model: DynamoModel.configure(AeSupplier, { supplierId: { identifier: true } }),
+  entityType: "AeSupplier",
+  primaryKey: {
+    pk: { field: "pk", composite: ["supplierId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  refs: { maker: { entity: AeMakers } },
+})
+
+/** The aggregate root — same matrix again, at the root level. */
+class AeMachine extends Schema.Class<AeMachine>("AeMachine")({
+  machineId: Schema.String,
+  bigStr: Schema.BigIntFromString,
+  numStr: Schema.NumberFromString,
+  epoch: DynamoModel.DateEpochMs,
+  plainDate: Schema.Date,
+  dtUtc: Schema.DateTimeUtc,
+  plainNum: Schema.Number,
+  plainStr: Schema.String,
+  supplier: Schema.optionalKey(AeSupplier),
+  parts: Schema.optionalKey(Schema.Array(AePart)),
+}) {}
+
+/** An untransformed model — its composed keys must be byte-identical. */
+class AePlain extends Schema.Class<AePlain>("AePlain")({
+  plainId: Schema.String,
+  label: Schema.String,
+  count: Schema.Number,
+}) {}
+
+const AeTable = Table.make({
+  schema: aeSchema,
+  entities: { AeMakers, AeParts, AeSuppliers },
+})
+
+const AeMachineAggregate = Aggregate.make(AeMachine, {
+  table: AeTable,
+  schema: aeSchema,
+  pk: { field: "pk", composite: ["machineId"] },
+  collection: { name: "aemachine" },
+  root: { entityType: "AeMachineItem" },
+  edges: {
+    supplier: Aggregate.one("supplier", { entityType: "AeMachineSupplier", entity: AeSuppliers }),
+    parts: Aggregate.many("parts", { entityType: "AeMachinePart", entity: AeParts }),
+  },
+})
+
+const AePlainAggregate = Aggregate.make(AePlain, {
+  table: AeTable,
+  schema: aeSchema,
+  pk: { field: "pk", composite: ["plainId"] },
+  collection: { name: "aeplain" },
+  root: { entityType: "AePlainItem" },
+  edges: {},
+})
+
+const AeLayer = Layer.mergeAll(ClientLayer, AeTable.layer({ name: aeTableName }))
+const provideAe = Effect.provide(AeLayer)
+const aeAggregates = { AeMachineAggregate, AePlainAggregate }
+const aeTables = { AeTable }
+
+const AE_EPOCH_MS = 1767225600000
+const AE_ISO = "2026-01-01T00:00:00.000Z"
+
+describeConnected("aggregate attribute encoding round-trips every shape (#116)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: aeTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(AeTable),
+        })
+      }).pipe(provideAe, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: aeTableName })
+      }).pipe(
+        provideAe,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  /** The full matrix, as the create input takes it (Encoded side). */
+  const shapeInput = (id: string) => ({
+    bigStr: "420",
+    numStr: "3.5",
+    epoch: AE_ISO,
+    plainDate: AE_ISO,
+    dtUtc: AE_ISO,
+    plainNum: 7,
+    plainStr: `s-${id}`,
+  })
+
+  /** Assert every shape came back with the right value AND the right type. */
+  const expectShapes = (o: Record<string, unknown>) => {
+    expect(o.bigStr).toBe(420n)
+    expect(typeof o.bigStr).toBe("bigint")
+    expect(o.numStr).toBe(3.5)
+    expect(typeof o.numStr).toBe("number")
+    expect(DateTime.toEpochMillis(o.epoch as DateTime.Utc)).toBe(AE_EPOCH_MS)
+    expect((o.plainDate as Date).toISOString()).toBe(AE_ISO)
+    expect(DateTime.toEpochMillis(o.dtUtc as DateTime.Utc)).toBe(AE_EPOCH_MS)
+    expect(o.plainNum).toBe(7)
+    expect(typeof o.plainNum).toBe("number")
+    expect(typeof o.plainStr).toBe("string")
+  }
+
+  it.effect("every shape round-trips on the aggregate ROOT", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+
+      yield* db.aggregates.AeMachineAggregate.create({
+        machineId: "m-root",
+        ...shapeInput("root"),
+      } as never)
+
+      // Pre-fix this threw `aggregate.assemble` with an Encoding issue: the
+      // Type-side bigint was stored as `{N:"420"}` and `BigIntFromString`
+      // rejected a number.
+      const got = yield* db.aggregates.AeMachineAggregate.get({ machineId: "m-root" })
+      expectShapes(got as unknown as Record<string, unknown>)
+    }).pipe(provideAe),
+  )
+
+  it.effect("every shape round-trips on a MANY edge element", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+
+      yield* db.aggregates.AeMachineAggregate.create({
+        machineId: "m-many",
+        ...shapeInput("many"),
+        parts: [
+          { id: "p-1", ...shapeInput("p1") },
+          { id: "p-2", ...shapeInput("p2") },
+        ],
+      } as never)
+
+      const got = (yield* db.aggregates.AeMachineAggregate.get({
+        machineId: "m-many",
+      })) as unknown as { parts: ReadonlyArray<Record<string, unknown>> }
+
+      expect(got.parts).toHaveLength(2)
+      for (const part of got.parts) expectShapes(part)
+      expect(got.parts.map((p) => p.id).sort()).toEqual(["p-1", "p-2"])
+    }).pipe(provideAe),
+  )
+
+  it.effect("a REF-hydrated edge encodes with the referenced entity's own schema", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { AeMakers },
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+
+      yield* db.entities.AeMakers.put({ makerId: "mk-1", founded: 1897n })
+
+      // The aggregate stores what the schema holds — the nested ref object, the
+      // same shape write-time hydration would have produced on the entity path.
+      yield* db.aggregates.AeMachineAggregate.create({
+        machineId: "m-ref",
+        ...shapeInput("ref"),
+        supplier: {
+          supplierId: "sup-1",
+          since: "1999",
+          maker: { makerId: "mk-1", founded: "1897" },
+        },
+      } as never)
+
+      const got = (yield* db.aggregates.AeMachineAggregate.get({
+        machineId: "m-ref",
+      })) as unknown as {
+        supplier: { supplierId: string; since: number; maker: { makerId: string; founded: bigint } }
+      }
+
+      // The edge's own transformed field...
+      expect(got.supplier.since).toBe(1999)
+      expect(typeof got.supplier.since).toBe("number")
+      // ...and the field INSIDE the hydrated ref, which is only correct if the
+      // ref was encoded with `AeMaker`'s schema rather than the aggregate's.
+      expect(got.supplier.maker.makerId).toBe("mk-1")
+      expect(got.supplier.maker.founded).toBe(1897n)
+      expect(typeof got.supplier.maker.founded).toBe("bigint")
+    }).pipe(provideAe),
+  )
+
+  it.effect("context values propagated onto edge rows are encoded once, the same way", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+      const client = yield* DynamoClient
+
+      yield* db.aggregates.AeMachineAggregate.create({
+        machineId: "m-ctx",
+        ...shapeInput("ctx"),
+        parts: [{ id: "p-9", ...shapeInput("p9") }],
+      } as never)
+
+      // Same logical field must be stored the SAME way on every row of the
+      // partition — the divergence class this whole line of work closes.
+      const rows = yield* client.query({
+        TableName: aeTableName,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: "$ae#v1#aemachine#m-ctx" } },
+      })
+      const bigStrs = (rows.Items ?? [])
+        .filter((i) => i.bigStr !== undefined)
+        .map((i) => JSON.stringify(i.bigStr))
+      expect(bigStrs.length).toBeGreaterThan(1)
+      expect(new Set(bigStrs).size).toBe(1)
+      // ...and it is the ENCODED string form, which is what decode expects.
+      expect(bigStrs[0]).toBe(JSON.stringify({ S: "420" }))
+    }).pipe(provideAe),
+  )
+
+  it.effect("composed keys are byte-identical for an untransformed model", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+      const client = yield* DynamoClient
+
+      yield* db.aggregates.AePlainAggregate.create({
+        plainId: "pl-1",
+        label: "L",
+        count: 3,
+      } as never)
+
+      // Encoding ATTRIBUTES must not move a single byte of a composed KEY.
+      // Keys come from the assembled object through the key form, and this is
+      // the value that spelling produces — pinned literally.
+      const rows = yield* client.query({
+        TableName: aeTableName,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: "$ae#v1#aeplain#pl-1" } },
+      })
+      expect(rows.Items ?? []).toHaveLength(1)
+      const row = (rows.Items ?? [])[0]!
+      expect(row.pk?.S).toBe("$ae#v1#aeplain#pl-1")
+      expect(row.sk?.S).toBe("$ae#v1#aeplainitem")
+      // Untransformed attributes are stored exactly as before.
+      expect(row.label?.S).toBe("L")
+      expect(row.count?.N).toBe("3")
+
+      const got = yield* db.aggregates.AePlainAggregate.get({ plainId: "pl-1" })
+      expect((got as unknown as { count: number }).count).toBe(3)
+    }).pipe(provideAe),
+  )
+
+  // -------------------------------------------------------------------------
+  // `aggregate.update` round-trips the same matrix (#116).
+  //
+  // Update re-decodes the MUTATED state, whose fields may hold either the domain
+  // value the caller set or the wire value that came back from storage. That is
+  // not date-specific, so `tolerantTransforms` now substitutes a tolerant
+  // schema for EVERY leaf transform, not just dates.
+  // -------------------------------------------------------------------------
+
+  it.effect("update touching only an UNTRANSFORMED field round-trips every shape", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+      const client = yield* DynamoClient
+
+      yield* db.aggregates.AeMachineAggregate.create({
+        machineId: "m-upd1",
+        ...shapeInput("upd1"),
+        parts: [{ id: "p-u1", ...shapeInput("pu1") }],
+      } as never)
+
+      // This is the case that used to fail: the mutation never touches a
+      // transformed field, but `state` still CARRIES them in domain form, and
+      // the re-decode rejected them before any item was built.
+      yield* db.aggregates.AeMachineAggregate.update({ machineId: "m-upd1" }, ({ state }) => ({
+        ...state,
+        plainStr: "renamed",
+      }))
+
+      const got = (yield* db.aggregates.AeMachineAggregate.get({
+        machineId: "m-upd1",
+      })) as unknown as Record<string, unknown> & {
+        parts: ReadonlyArray<Record<string, unknown>>
+      }
+      expect(got.plainStr).toBe("renamed")
+      expectShapes({ ...got, plainStr: "x" })
+      // The `many` edge survives the update untouched and still decodes.
+      expectShapes(got.parts[0]!)
+
+      // Stored bytes are the ENCODED form on every row, root and edge alike.
+      const rows = yield* client.query({
+        TableName: aeTableName,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: "$ae#v1#aemachine#m-upd1" } },
+      })
+      for (const row of rows.Items ?? []) {
+        if (row.bigStr === undefined) continue
+        expect(row.bigStr).toEqual({ S: "420" })
+        expect(row.numStr).toEqual({ S: "3.5" })
+        expect(row.epoch).toEqual({ N: String(AE_EPOCH_MS) })
+        expect(row.plainDate).toEqual({ S: AE_ISO })
+        expect(row.dtUtc).toEqual({ S: AE_ISO })
+        expect(row.plainNum).toEqual({ N: "7" })
+      }
+    }).pipe(provideAe),
+  )
+
+  it.effect("update touching the TRANSFORMED field itself round-trips", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+      const client = yield* DynamoClient
+
+      yield* db.aggregates.AeMachineAggregate.create({
+        machineId: "m-upd2",
+        ...shapeInput("upd2"),
+      } as never)
+
+      yield* db.aggregates.AeMachineAggregate.update({ machineId: "m-upd2" }, ({ state }) => ({
+        ...state,
+        bigStr: 999n,
+        numStr: 12.5,
+        plainNum: 42,
+      }))
+
+      const got = (yield* db.aggregates.AeMachineAggregate.get({
+        machineId: "m-upd2",
+      })) as unknown as { bigStr: bigint; numStr: number; plainNum: number }
+      expect(got.bigStr).toBe(999n)
+      expect(typeof got.bigStr).toBe("bigint")
+      expect(got.numStr).toBe(12.5)
+      expect(typeof got.numStr).toBe("number")
+      expect(got.plainNum).toBe(42)
+
+      const rows = yield* client.query({
+        TableName: aeTableName,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: "$ae#v1#aemachine#m-upd2" } },
+      })
+      const root = (rows.Items ?? [])[0]!
+      expect(root.bigStr).toEqual({ S: "999" })
+      expect(root.numStr).toEqual({ S: "12.5" })
+      expect(root.plainNum).toEqual({ N: "42" })
+    }).pipe(provideAe),
+  )
+
+  it.effect("update round-trips a MANY edge element and a REF-hydrated edge", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+
+      yield* db.aggregates.AeMachineAggregate.create({
+        machineId: "m-upd3",
+        ...shapeInput("upd3"),
+        supplier: {
+          supplierId: "sup-3",
+          since: "1999",
+          maker: { makerId: "mk-3", founded: "1897" },
+        },
+        parts: [{ id: "p-a", ...shapeInput("pa") }],
+      } as never)
+
+      // Mutate INSIDE the many edge and inside the ref-hydrated edge.
+      yield* db.aggregates.AeMachineAggregate.update({ machineId: "m-upd3" }, ({ state }) => ({
+        ...state,
+        parts: [new AePart({ ...(state as any).parts[0], bigStr: 777n })],
+        supplier: new AeSupplier({
+          ...(state as any).supplier,
+          since: 2001,
+          maker: new AeMaker({ ...(state as any).supplier.maker, founded: 1900n }),
+        }),
+      }))
+
+      const got = (yield* db.aggregates.AeMachineAggregate.get({
+        machineId: "m-upd3",
+      })) as unknown as {
+        parts: ReadonlyArray<Record<string, unknown>>
+        supplier: { since: number; maker: { founded: bigint } }
+      }
+      expect(got.parts[0]!.bigStr).toBe(777n)
+      expect(typeof got.parts[0]!.bigStr).toBe("bigint")
+      expect(got.supplier.since).toBe(2001)
+      expect(got.supplier.maker.founded).toBe(1900n)
+      expect(typeof got.supplier.maker.founded).toBe("bigint")
+    }).pipe(provideAe),
+  )
+
+  it.effect("keys stay byte-identical after an update", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+      const client = yield* DynamoClient
+
+      yield* db.aggregates.AePlainAggregate.create({
+        plainId: "pl-upd",
+        label: "L",
+        count: 3,
+      } as never)
+
+      const keysOf = () =>
+        client
+          .query({
+            TableName: aeTableName,
+            KeyConditionExpression: "#pk = :pk",
+            ExpressionAttributeNames: { "#pk": "pk" },
+            ExpressionAttributeValues: { ":pk": { S: "$ae#v1#aeplain#pl-upd" } },
+          })
+          .pipe(Effect.map((r) => (r.Items ?? []).map((i) => `${i.pk?.S}|${i.sk?.S}`).sort()))
+
+      const before = yield* keysOf()
+      yield* db.aggregates.AePlainAggregate.update({ plainId: "pl-upd" }, ({ state }) => ({
+        ...state,
+        label: "L2",
+      }))
+      expect(yield* keysOf()).toEqual(before)
+      expect(before).toEqual(["$ae#v1#aeplain#pl-upd|$ae#v1#aeplainitem"])
+    }).pipe(provideAe),
+  )
+
+  // A tolerant decode must not become a LAX one. If this ever passes, the
+  // substitution has stopped validating and every guarantee above is hollow.
+  it.effect("a nonsense value is STILL rejected on the update path", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+
+      yield* db.aggregates.AeMachineAggregate.create({
+        machineId: "m-bad",
+        ...shapeInput("bad"),
+      } as never)
+
+      // Neither the wire form (a numeric string) nor the domain form (a bigint).
+      const err = yield* db.aggregates.AeMachineAggregate.update(
+        { machineId: "m-bad" },
+        ({ state }) => ({ ...state, bigStr: "not-a-number" }) as never,
+      ).pipe(Effect.flip)
+      expect(err._tag).toBe("ValidationError")
+
+      // A wrong-typed value for an untransformed field is still rejected too.
+      const err2 = yield* db.aggregates.AeMachineAggregate.update(
+        { machineId: "m-bad" },
+        ({ state }) => ({ ...state, plainNum: "seven" }) as never,
+      ).pipe(Effect.flip)
+      expect(err2._tag).toBe("ValidationError")
+
+      // ...and the stored row is untouched by either attempt.
+      const got = (yield* db.aggregates.AeMachineAggregate.get({
+        machineId: "m-bad",
+      })) as unknown as Record<string, unknown>
+      expectShapes(got)
+    }).pipe(provideAe),
+  )
+
+  // NOTE — diff narrowing on a transformed model is asserted at the UNIT level
+  // (`test/Aggregate.test.ts`, "skips write when nothing changed, on a
+  // transformed model"), where the transactWrite call count is observable. A
+  // connected test can only compare stored bytes, which look identical whether
+  // or not the write was skipped.
 })
