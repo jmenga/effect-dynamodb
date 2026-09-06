@@ -2594,7 +2594,7 @@ for unrelated errors and the collision was caught only at review.
 | 9020–9027 | Sparse maps, composite nullability, EventStore snapshots |
 | 9030–9040 | Vector search |
 | 9041–9044 | Aggregates, timestamps |
-| 9045–9049 | Query sort-key conditions, `purge`, multi-item write paths |
+| 9045–9050 | Query sort-key conditions, `purge`, multi-item write paths, key encoding |
 
 | Code | Raised in | Condition |
 |------|-----------|-----------|
@@ -2641,8 +2641,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9047` | `Entity.ts` | `.condition()` applied to `purge()`, which spans batched writes and cannot be guarded atomically |
 | `EDD-9048` | `internal/TransactableOps.ts` | A multi-item write path cannot compile a **delete** for an entity with `unique`, `versioned: { retain: true }` or `softDelete` — those side items derive from the *stored* row, which these paths never read |
 | `EDD-9049` | `Batch.ts` | `Batch.write` cannot compile a write for those same configs — `BatchWriteItem` has no `ConditionExpression` (the whole basis of a uniqueness sentinel), no `UpdateRequest`, and no atomicity across chunks |
+| `EDD-9050` | `internal/CompositeCodec.ts` | A key composite's value cannot be encoded to its wire form, so it cannot be placed in a key — raised rather than composing a string that silently matches nothing |
 
-Next free code: **`EDD-9050`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+Next free code: **`EDD-9051`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 
