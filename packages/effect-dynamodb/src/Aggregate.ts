@@ -2222,6 +2222,29 @@ const readCompositePath = (attrs: Record<string, unknown>, path: string): unknow
 }
 
 /**
+ * Whether a resolved composite value can be a sort-key segment.
+ *
+ * `KeyComposer.serializeValue` falls through to `String(value)`, so an object
+ * reaches the key as `[object Object]` or, for a Schema.Class instance, its
+ * whole JSON body. Either is silently wrong and unqueryable — and naming the
+ * ref object (`"umpire"`) instead of a scalar path (`"umpire.id"`) is the easy
+ * mistake to make, precisely because the dotted path is the unfamiliar part.
+ */
+const isScalarComposite = (value: unknown): boolean => {
+  switch (typeof value) {
+    case "string":
+    case "number":
+    case "bigint":
+    case "boolean":
+      return true
+    case "object":
+      return value instanceof Date || DateTime.isDateTime(value as DateTime.DateTime)
+    default:
+      return false
+  }
+}
+
+/**
  * Sort-key composites for one element of a `many` edge.
  *
  * A declared `sk.composite` is AUTHORITATIVE — it replaces the ref-identifier
@@ -2256,6 +2279,19 @@ const manyEdgeSkComposites = (
           `(e.g. "contact.contactId", not "contactId").`,
       })
     }
+    const nonScalar = declared.filter((_, i) => !isScalarComposite(values[i]))
+    if (nonScalar.length > 0) {
+      return yield* new AggregateDecompositionError({
+        aggregate: aggregateName,
+        member: node.fieldName ?? node.entityType,
+        reason:
+          `sk.composite names ${nonScalar.map((m) => `"${m}"`).join(", ")}, ` +
+          `${nonScalar.length === 1 ? "which resolves" : "which resolve"} to a non-scalar value. ` +
+          `A sort key segment must be a string, number, bigint, boolean or date — name the ` +
+          `attribute itself by dotted path (e.g. "umpire.id", not "umpire").`,
+      })
+    }
+
     return values.map((value) => KeyComposer.serializeValue(value))
   })
 

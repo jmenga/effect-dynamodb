@@ -2587,6 +2587,83 @@ describe("Aggregate write path", () => {
       }).pipe(Effect.provide(WriteLayer)),
     )
 
+    it.effect("a composite naming the ref object is rejected, not stringified into the key", () =>
+      Effect.gen(function* () {
+        stubHydration()
+        mockTransactWrite.mockResolvedValue({})
+
+        // Naming the hydrated ref itself instead of a scalar path. Without a
+        // scalar check `serializeValue` falls through to `String(value)` and the
+        // whole object lands in a real sort key.
+        const MatchAggregate = makeMatchAggregate({ composite: ["role", "official"] })
+
+        const error = yield* MatchAggregate.create({
+          id: "m-7",
+          name: "NZ vs SL",
+          officials: [{ officialId: "off-1", role: "onfield" }],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AggregateDecompositionError")
+        const decomposition = error as AggregateDecompositionError
+        expect(decomposition.member).toBe("officials")
+        expect(decomposition.reason).toContain('"official"')
+        expect(decomposition.reason).toContain("non-scalar")
+        expect(decomposition.reason).toContain("dotted path")
+        expect(mockTransactWrite).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("scalar composites of every supported kind compose", () =>
+      Effect.gen(function* () {
+        stubHydration()
+        mockTransactWrite.mockResolvedValue({})
+
+        class Slot extends Schema.Class<Slot>("Slot")({
+          official: Official,
+          seq: Schema.Number,
+          confirmed: Schema.Boolean,
+        }) {}
+
+        class Roster extends Schema.Class<Roster>("Roster")({
+          id: Schema.String,
+          slots: Schema.Array(Slot),
+        }) {}
+
+        const RosterAggregate = Aggregate.make(Roster, {
+          table: MainTable,
+          schema: AppSchema,
+          pk: { field: "pk", composite: ["id"] },
+          collection: {
+            index: "lsi1",
+            name: "roster",
+            sk: { field: "lsi1sk", composite: [] },
+          },
+          root: { entityType: "RosterItem" },
+          edges: {
+            slots: Aggregate.many("slots", {
+              entityType: "RosterSlot",
+              entity: OfficialEntity,
+              sk: { composite: ["seq", "confirmed", "official.officialId"] },
+            }),
+          },
+        })
+
+        yield* RosterAggregate.create({
+          id: "r-1",
+          slots: [{ officialId: "off-1", seq: 2, confirmed: true }],
+        })
+
+        const call = mockTransactWrite.mock.calls[0]![0] as {
+          TransactItems: Array<{ Put?: { Item: Record<string, { S?: string }> } }>
+        }
+        const sks = call.TransactItems.filter((i) => i.Put?.Item.__edd_e__?.S === "RosterSlot").map(
+          (i) => i.Put!.Item.sk!.S!,
+        )
+        // Numbers zero-pad for sort order; booleans render as true/false.
+        expect(sks).toEqual(["$myapp#v1#rosterslot#0000000000000002#true#off-1"])
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
     // "Element IS the ref" panel: a multi-occupancy role modelled as its own
     // edge over Array(Official), with single-occupancy roles as `one` edges.
     // Here the element carries no wrapper, so the entity's own identifier field
