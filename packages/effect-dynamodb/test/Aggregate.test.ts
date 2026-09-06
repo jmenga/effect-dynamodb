@@ -1577,6 +1577,22 @@ describe("Aggregate write path", () => {
   // -------------------------------------------------------------------------
 
   describe("update", () => {
+    // A transformed-field model for the #116 diff-narrowing checks.
+    class TxnRow extends Schema.Class<TxnRow>("TxnRow")({
+      txnId: Schema.String,
+      amount: Schema.BigIntFromString,
+      label: Schema.String,
+    }) {}
+
+    const TxnRowAggregate = Aggregate.make(TxnRow, {
+      table: MainTable,
+      schema: AppSchema,
+      pk: { field: "pk", composite: ["txnId"] },
+      collection: { index: "lsi1", name: "txnrow", sk: { field: "lsi1sk", composite: [] } },
+      root: { entityType: "TxnRowItem" },
+      edges: {},
+    })
+
     const ArticleAggregate = Aggregate.make(Article, {
       table: MainTable,
       schema: AppSchema,
@@ -1648,6 +1664,65 @@ describe("Aggregate write path", () => {
         expect(result.title).toBe("Same Title")
         // No writes because nothing changed
         expect(mockTransactWrite).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    // Same claim, on a model with a TRANSFORMED field (#116). `deepEqualGroups`
+    // compares DECOMPOSED groups and decomposition is where attribute encoding
+    // now happens — so both sides must be encoded identically. Encoding only one
+    // side would make every update look dirty and write the whole aggregate.
+    it.effect("skips write when nothing changed, on a transformed model", () =>
+      Effect.gen(function* () {
+        mockWriteQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              pk: "$myapp#v1#txnrow#t-1",
+              sk: "$myapp#v1#txnrowitem",
+              lsi1sk: "$myapp#v1#txnrow",
+              __edd_e__: "TxnRowItem",
+              txnId: "t-1",
+              // Stored ENCODED, as the write path now writes it.
+              amount: "420",
+              label: "L",
+            }),
+          ],
+          LastEvaluatedKey: undefined,
+        })
+
+        const result = yield* TxnRowAggregate.update({ txnId: "t-1" }, ({ state }) => state)
+
+        expect((result as unknown as { amount: bigint }).amount).toBe(420n)
+        expect(mockTransactWrite).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("still writes when a transformed field actually changes", () =>
+      Effect.gen(function* () {
+        mockWriteQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              pk: "$myapp#v1#txnrow#t-2",
+              sk: "$myapp#v1#txnrowitem",
+              lsi1sk: "$myapp#v1#txnrow",
+              __edd_e__: "TxnRowItem",
+              txnId: "t-2",
+              amount: "420",
+              label: "L",
+            }),
+          ],
+          LastEvaluatedKey: undefined,
+        })
+        mockTransactWrite.mockResolvedValueOnce({})
+
+        yield* TxnRowAggregate.update({ txnId: "t-2" }, ({ state }) => ({
+          ...state,
+          amount: 999n,
+        }))
+
+        expect(mockTransactWrite).toHaveBeenCalledTimes(1)
+        const item = mockTransactWrite.mock.calls[0]![0].TransactItems[0].Put.Item
+        // ...and it is written in the ENCODED form.
+        expect(item.amount).toEqual({ S: "999" })
       }).pipe(Effect.provide(WriteLayer)),
     )
 

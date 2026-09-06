@@ -781,16 +781,41 @@ const makeAggregate = <TSchema extends Schema.Top>(
   // `substituteSchemaDeep` introspects directly — re-pointing it at the element
   // model would drop the `Array` and yield "Expected object, got []" on assemble.
   const edgeRefModels = new Map<string, Schema.Top>()
+  const unwrapModel = (model: Schema.Top): Schema.Top =>
+    DynamoModel.isConfiguredModel(model) ? (model.model as Schema.Top) : model
   for (const [edgeName, edge] of Object.entries(config.edges)) {
     if (!("_tag" in edge)) continue
     if (edge._tag !== "RefEdge" && edge._tag !== "OneEdge") continue
-    const entity = (edge as { readonly entity?: { readonly model?: Schema.Top } }).entity
+    const entity = (
+      edge as {
+        readonly entity?: {
+          readonly model?: Schema.Top
+          readonly _data?: {
+            readonly resolvedRefs?: ReadonlyArray<{
+              readonly fieldName: string
+              readonly refEntity?: { readonly model?: Schema.Top }
+            }>
+          }
+        }
+      }
+    ).entity
     const model = entity?.model
     if (!model) continue
-    edgeRefModels.set(
-      edgeName,
-      DynamoModel.isConfiguredModel(model) ? (model.model as Schema.Top) : model,
-    )
+    edgeRefModels.set(edgeName, unwrapModel(model))
+
+    // A ref nested INSIDE an edge's model needs the same treatment. `maker` on
+    // an edge entity is annotated with `DynamoModel.ref`, and `Schema.annotate`
+    // drops a `Schema.Class`'s `.fields`, so the substitution cannot introspect
+    // it and the target's own transformed fields keep their strict schemas —
+    // which is what made `update` reject a `bigint` at
+    // `["supplier"]["maker"]["founded"]` (#116). Registering the target by field
+    // name re-points it exactly as a top-level edge is re-pointed.
+    for (const nested of entity?._data?.resolvedRefs ?? []) {
+      const nestedModel = nested.refEntity?.model
+      if (nestedModel && !edgeRefModels.has(nested.fieldName)) {
+        edgeRefModels.set(nested.fieldName, unwrapModel(nestedModel))
+      }
+    }
   }
   const decodeSchema = substituteSchemaDeep(schema, {
     tolerantTransforms: true,

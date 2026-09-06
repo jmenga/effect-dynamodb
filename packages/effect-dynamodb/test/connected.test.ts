@@ -10404,12 +10404,229 @@ describeConnected("aggregate attribute encoding round-trips every shape (#116)",
     }).pipe(provideAe),
   )
 
-  // NOTE — `aggregate.update` still cannot round-trip a NON-DATE transformed
-  // field, and that is deliberately out of this change. Its failure is upstream
-  // of decomposition: the mutated `state` is re-decoded through `decodeSchema`,
-  // whose `tolerantTransforms` substitution (`internal/EntitySchemas.ts`) only
-  // recognises DATE transforms, so a `BigIntFromString` field holding a domain
-  // `bigint` is rejected before any item is built. Widening that tolerance to
-  // every transform changes the shared entity schema derivation, not the
-  // aggregate write path fixed here.
+  // -------------------------------------------------------------------------
+  // `aggregate.update` round-trips the same matrix (#116).
+  //
+  // Update re-decodes the MUTATED state, whose fields may hold either the domain
+  // value the caller set or the wire value that came back from storage. That is
+  // not date-specific, so `tolerantTransforms` now substitutes a tolerant
+  // schema for EVERY leaf transform, not just dates.
+  // -------------------------------------------------------------------------
+
+  it.effect("update touching only an UNTRANSFORMED field round-trips every shape", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+      const client = yield* DynamoClient
+
+      yield* db.aggregates.AeMachineAggregate.create({
+        machineId: "m-upd1",
+        ...shapeInput("upd1"),
+        parts: [{ id: "p-u1", ...shapeInput("pu1") }],
+      } as never)
+
+      // This is the case that used to fail: the mutation never touches a
+      // transformed field, but `state` still CARRIES them in domain form, and
+      // the re-decode rejected them before any item was built.
+      yield* db.aggregates.AeMachineAggregate.update({ machineId: "m-upd1" }, ({ state }) => ({
+        ...state,
+        plainStr: "renamed",
+      }))
+
+      const got = (yield* db.aggregates.AeMachineAggregate.get({
+        machineId: "m-upd1",
+      })) as unknown as Record<string, unknown> & {
+        parts: ReadonlyArray<Record<string, unknown>>
+      }
+      expect(got.plainStr).toBe("renamed")
+      expectShapes({ ...got, plainStr: "x" })
+      // The `many` edge survives the update untouched and still decodes.
+      expectShapes(got.parts[0]!)
+
+      // Stored bytes are the ENCODED form on every row, root and edge alike.
+      const rows = yield* client.query({
+        TableName: aeTableName,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: "$ae#v1#aemachine#m-upd1" } },
+      })
+      for (const row of rows.Items ?? []) {
+        if (row.bigStr === undefined) continue
+        expect(row.bigStr).toEqual({ S: "420" })
+        expect(row.numStr).toEqual({ S: "3.5" })
+        expect(row.epoch).toEqual({ N: String(AE_EPOCH_MS) })
+        expect(row.plainDate).toEqual({ S: AE_ISO })
+        expect(row.dtUtc).toEqual({ S: AE_ISO })
+        expect(row.plainNum).toEqual({ N: "7" })
+      }
+    }).pipe(provideAe),
+  )
+
+  it.effect("update touching the TRANSFORMED field itself round-trips", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+      const client = yield* DynamoClient
+
+      yield* db.aggregates.AeMachineAggregate.create({
+        machineId: "m-upd2",
+        ...shapeInput("upd2"),
+      } as never)
+
+      yield* db.aggregates.AeMachineAggregate.update({ machineId: "m-upd2" }, ({ state }) => ({
+        ...state,
+        bigStr: 999n,
+        numStr: 12.5,
+        plainNum: 42,
+      }))
+
+      const got = (yield* db.aggregates.AeMachineAggregate.get({
+        machineId: "m-upd2",
+      })) as unknown as { bigStr: bigint; numStr: number; plainNum: number }
+      expect(got.bigStr).toBe(999n)
+      expect(typeof got.bigStr).toBe("bigint")
+      expect(got.numStr).toBe(12.5)
+      expect(typeof got.numStr).toBe("number")
+      expect(got.plainNum).toBe(42)
+
+      const rows = yield* client.query({
+        TableName: aeTableName,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: "$ae#v1#aemachine#m-upd2" } },
+      })
+      const root = (rows.Items ?? [])[0]!
+      expect(root.bigStr).toEqual({ S: "999" })
+      expect(root.numStr).toEqual({ S: "12.5" })
+      expect(root.plainNum).toEqual({ N: "42" })
+    }).pipe(provideAe),
+  )
+
+  it.effect("update round-trips a MANY edge element and a REF-hydrated edge", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+
+      yield* db.aggregates.AeMachineAggregate.create({
+        machineId: "m-upd3",
+        ...shapeInput("upd3"),
+        supplier: {
+          supplierId: "sup-3",
+          since: "1999",
+          maker: { makerId: "mk-3", founded: "1897" },
+        },
+        parts: [{ id: "p-a", ...shapeInput("pa") }],
+      } as never)
+
+      // Mutate INSIDE the many edge and inside the ref-hydrated edge.
+      yield* db.aggregates.AeMachineAggregate.update({ machineId: "m-upd3" }, ({ state }) => ({
+        ...state,
+        parts: [new AePart({ ...(state as any).parts[0], bigStr: 777n })],
+        supplier: new AeSupplier({
+          ...(state as any).supplier,
+          since: 2001,
+          maker: new AeMaker({ ...(state as any).supplier.maker, founded: 1900n }),
+        }),
+      }))
+
+      const got = (yield* db.aggregates.AeMachineAggregate.get({
+        machineId: "m-upd3",
+      })) as unknown as {
+        parts: ReadonlyArray<Record<string, unknown>>
+        supplier: { since: number; maker: { founded: bigint } }
+      }
+      expect(got.parts[0]!.bigStr).toBe(777n)
+      expect(typeof got.parts[0]!.bigStr).toBe("bigint")
+      expect(got.supplier.since).toBe(2001)
+      expect(got.supplier.maker.founded).toBe(1900n)
+      expect(typeof got.supplier.maker.founded).toBe("bigint")
+    }).pipe(provideAe),
+  )
+
+  it.effect("keys stay byte-identical after an update", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+      const client = yield* DynamoClient
+
+      yield* db.aggregates.AePlainAggregate.create({
+        plainId: "pl-upd",
+        label: "L",
+        count: 3,
+      } as never)
+
+      const keysOf = () =>
+        client
+          .query({
+            TableName: aeTableName,
+            KeyConditionExpression: "#pk = :pk",
+            ExpressionAttributeNames: { "#pk": "pk" },
+            ExpressionAttributeValues: { ":pk": { S: "$ae#v1#aeplain#pl-upd" } },
+          })
+          .pipe(Effect.map((r) => (r.Items ?? []).map((i) => `${i.pk?.S}|${i.sk?.S}`).sort()))
+
+      const before = yield* keysOf()
+      yield* db.aggregates.AePlainAggregate.update({ plainId: "pl-upd" }, ({ state }) => ({
+        ...state,
+        label: "L2",
+      }))
+      expect(yield* keysOf()).toEqual(before)
+      expect(before).toEqual(["$ae#v1#aeplain#pl-upd|$ae#v1#aeplainitem"])
+    }).pipe(provideAe),
+  )
+
+  // A tolerant decode must not become a LAX one. If this ever passes, the
+  // substitution has stopped validating and every guarantee above is hollow.
+  it.effect("a nonsense value is STILL rejected on the update path", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+
+      yield* db.aggregates.AeMachineAggregate.create({
+        machineId: "m-bad",
+        ...shapeInput("bad"),
+      } as never)
+
+      // Neither the wire form (a numeric string) nor the domain form (a bigint).
+      const err = yield* db.aggregates.AeMachineAggregate.update(
+        { machineId: "m-bad" },
+        ({ state }) => ({ ...state, bigStr: "not-a-number" }) as never,
+      ).pipe(Effect.flip)
+      expect(err._tag).toBe("ValidationError")
+
+      // A wrong-typed value for an untransformed field is still rejected too.
+      const err2 = yield* db.aggregates.AeMachineAggregate.update(
+        { machineId: "m-bad" },
+        ({ state }) => ({ ...state, plainNum: "seven" }) as never,
+      ).pipe(Effect.flip)
+      expect(err2._tag).toBe("ValidationError")
+
+      // ...and the stored row is untouched by either attempt.
+      const got = (yield* db.aggregates.AeMachineAggregate.get({
+        machineId: "m-bad",
+      })) as unknown as Record<string, unknown>
+      expectShapes(got)
+    }).pipe(provideAe),
+  )
+
+  // NOTE — diff narrowing on a transformed model is asserted at the UNIT level
+  // (`test/Aggregate.test.ts`, "skips write when nothing changed, on a
+  // transformed model"), where the transactWrite call count is observable. A
+  // connected test can only compare stored bytes, which look identical whether
+  // or not the write was skipped.
 })
