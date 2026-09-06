@@ -5468,7 +5468,7 @@ const makeImpl = <
               entityType,
               operation: "purge.condition",
               cause:
-                "[EDD-9046] .condition() is not supported on purge() — purge deletes every item " +
+                "[EDD-9047] .condition() is not supported on purge() — purge deletes every item " +
                 "in the partition across multiple batched writes, so a per-item ConditionExpression " +
                 "cannot be applied atomically. Guard the individual delete with " +
                 "delete(key).condition(...) instead.",

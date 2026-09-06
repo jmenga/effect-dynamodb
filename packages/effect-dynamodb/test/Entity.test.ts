@@ -8144,7 +8144,7 @@ describe("Entity", () => {
           .pipe(Effect.flip)
 
         expect(error._tag).toBe("ValidationError")
-        expect(String((error as any).cause)).toContain("EDD-9046")
+        expect(String((error as any).cause)).toContain("EDD-9047")
         expect(mockQuery).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )

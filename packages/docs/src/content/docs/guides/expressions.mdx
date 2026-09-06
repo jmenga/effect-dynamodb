@@ -134,7 +134,7 @@ Products.condition({ status: "active", role: "admin" })
   soft-delete transaction, and the unique-constraint transaction. On the two transaction
   paths it rides the current item's own `Delete`, which is the only conditioned item, so
   a rejection rolls the whole transaction back: no tombstone, no released sentinel.
-  `purge()` is the one operation that refuses a condition (`ValidationError`, `EDD-9046`)
+  `purge()` is the one operation that refuses a condition (`ValidationError`, `EDD-9047`)
   — it deletes a whole partition across batched writes, so no single `ConditionExpression`
   could guard it atomically.
 </Aside>
