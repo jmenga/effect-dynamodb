@@ -61,6 +61,26 @@ class Venue extends Schema.Class<Venue>("Venue")({
   city: Schema.String,
 }) {}
 
+class Umpire extends Schema.Class<Umpire>("Umpire")({
+  id: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+}) {}
+
+// #region many-edge-sk-models
+// A panel seats two on-field umpires, plus a third umpire and a referee — and
+// the same person routinely holds more than one appointment.
+class MatchOfficial extends Schema.Class<MatchOfficial>("MatchOfficial")({
+  umpire: Umpire.pipe(DynamoModel.ref),
+  role: Schema.Literals(["onfield", "third", "referee"]),
+}) {}
+
+class OfficiatedMatch extends Schema.Class<OfficiatedMatch>("OfficiatedMatch")({
+  matchId: Schema.String,
+  name: Schema.String,
+  officials: Schema.Array(MatchOfficial),
+}) {}
+// #endregion
+
 // #region ref-model
 class SquadSelection extends Schema.Class<SquadSelection>("SquadSelection")({
   squadId: Schema.String,
@@ -137,6 +157,15 @@ const Venues = Entity.make({
   },
 })
 
+const Umpires = Entity.make({
+  model: DynamoModel.configure(Umpire, { id: { field: "umpireId" } }),
+  entityType: "Umpire",
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
 // #region entity-with-refs
 const SquadSelections = Entity.make({
   model: SquadSelection,
@@ -160,7 +189,7 @@ const SquadSelections = Entity.make({
 // #endregion
 const MainTable = Table.make({
   schema: CricketSchema,
-  entities: { Teams, Players, Coaches, Venues, SquadSelections },
+  entities: { Teams, Players, Coaches, Venues, Umpires, SquadSelections },
 })
 
 // ---------------------------------------------------------------------------
@@ -190,6 +219,29 @@ const MatchAggregate = Aggregate.make(Match, {
     venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: Venues }),
     team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
     team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
+  },
+})
+// #endregion
+
+// A `many` edge composes each element's sort key from the referenced entity's
+// identifier, so the same umpire twice would compose one key and collide.
+// `sk.composite` names the element fields that separate them — and, being
+// authoritative, also fixes the order the rows sort in. Here neither half is
+// unique on its own: "onfield" seats two umpires, and one umpire is also the
+// third umpire — so the key is the pair.
+// #region many-edge-sk
+const OfficiatedMatchAggregate = Aggregate.make(OfficiatedMatch, {
+  table: MainTable,
+  schema: CricketSchema,
+  pk: { field: "pk", composite: ["matchId"] },
+  collection: { name: "officiated" },
+  root: { entityType: "OfficiatedMatchItem" },
+  edges: {
+    officials: Aggregate.many("officials", {
+      entityType: "MatchOfficial",
+      entity: Umpires,
+      sk: { composite: ["role", "umpire.id"] },
+    }),
   },
 })
 // #endregion
@@ -229,7 +281,7 @@ void (undefined as MatchKey | undefined)
 
 const program = Effect.gen(function* () {
   const db = yield* DynamoClient.make({
-    entities: { Teams, Players, Coaches, Venues, SquadSelections },
+    entities: { Teams, Players, Coaches, Venues, Umpires, SquadSelections },
   })
   const client = yield* DynamoClient
   const tableConfig = yield* MainTable.Tag
@@ -485,6 +537,38 @@ const program = Effect.gen(function* () {
     .set({ firstName: "Steven" })
     .cascade({ targets: [SquadSelections], mode: "transactional" })
   // #endregion
+
+  // =========================================================================
+  // Part 4: One entity, several roles in the same aggregate
+  // =========================================================================
+
+  yield* Console.log("\n--- Part 4: ManyEdge sort keys ---\n")
+
+  yield* db.entities.Umpires.put({ id: "bowen-01", name: "Ravi Bowen" })
+  yield* db.entities.Umpires.put({ id: "kumar-01", name: "Kumar D." })
+  yield* db.entities.Umpires.put({ id: "erasmus-01", name: "Marais E." })
+
+  // #region many-edge-sk-create
+  const officiated = yield* OfficiatedMatchAggregate.create({
+    matchId: "bgt-2025-test-1",
+    name: "AUS vs IND",
+    officials: [
+      // A role seating two umpires.
+      { umpireId: "bowen-01", role: "onfield" },
+      { umpireId: "kumar-01", role: "onfield" },
+      // ...and an umpire holding two appointments.
+      { umpireId: "bowen-01", role: "third" },
+      { umpireId: "erasmus-01", role: "referee" },
+    ],
+  })
+  // #endregion
+
+  yield* Console.log(`Officials appointed: ${officiated.officials.length}`)
+  for (const official of officiated.officials) {
+    yield* Console.log(`  ${official.role}: ${official.umpire.name}`)
+  }
+
+  yield* OfficiatedMatchAggregate.delete({ matchId: "bgt-2025-test-1" })
 
   // --- Cleanup ---
   yield* Console.log("\nCleaning up...")

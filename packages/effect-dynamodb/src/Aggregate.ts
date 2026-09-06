@@ -18,7 +18,7 @@ import { composeCollectionKey, composeKey } from "@effect-dynamodb/schema/Dynamo
 import type { EntityDefinition } from "@effect-dynamodb/schema/Entity.js"
 import {
   AggregateAssemblyError,
-  type AggregateDecompositionError,
+  AggregateDecompositionError,
   AggregateTransactionOverflow,
   type ItemNotFound,
   RefNotFound,
@@ -132,6 +132,22 @@ interface ResolvedNode {
    * attributes are encoded directly by `decomposeAggregate`.
    */
   readonly dateEncoders?: Record<string, (value: unknown) => unknown> | undefined
+  /**
+   * Declared sort-key composites for a `many` edge (`Aggregate.many(..., { sk })`).
+   * When present these are authoritative: they replace the ref-identifier
+   * heuristic, so the edge's element ordering and uniqueness are the user's to
+   * decide rather than a consequence of property order (#103). Each entry names
+   * an attribute on the decomposed element, and may use a dotted path to reach
+   * into a hydrated ref (`"contact.contactId"`).
+   */
+  readonly skComposite?: ReadonlyArray<string> | undefined
+  /**
+   * Name of the referenced entity's `DynamoModel.identifier` field, when the edge
+   * declares one. Used by {@link extractRefIdentifiers} for the "element IS the
+   * ref" shape (`Schema.Array(Player)`), where hydration leaves the entity's own
+   * fields flat and there is no nested object to walk.
+   */
+  readonly refIdentifierField?: string | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -641,7 +657,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
   config: AggregateConfig<TSchema>,
 ): Aggregate<TSchema, Record<string, unknown>> => {
   // Build resolved graph by walking edges recursively
-  const rootNode = resolveNode(null, config.root.entityType, "root", config.edges)
+  const rootNode = resolveNode({
+    fieldName: null,
+    entityType: config.root.entityType,
+    cardinality: "root",
+    edges: config.edges,
+  })
   const aggregateName = config.root.entityType
   const contextFields = config.context ?? []
 
@@ -916,6 +937,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           contextFields,
           dateEncoders,
           aggregateName,
+          config.schema,
         )
 
         // 5. Compose collection SK composites for root item
@@ -1004,6 +1026,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           contextFields,
           dateEncoders,
           aggregateName,
+          config.schema,
         )
         const newGroups = yield* decomposeAggregate(
           assembledNew,
@@ -1011,6 +1034,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           contextFields,
           dateEncoders,
           aggregateName,
+          config.schema,
         )
 
         // 5. Diff at the ITEM (primary-key) level, not just the group level.
@@ -1298,17 +1322,40 @@ const deepEqualGroups = (a: TransactionGroup, b: TransactionGroup): boolean => {
 // Internal: Resolve the graph
 // ---------------------------------------------------------------------------
 
-const resolveNode = (
-  fieldName: string | null,
-  entityType: string,
-  cardinality: "root" | "one" | "many",
-  edges: Record<string, AggregateEdge | BoundSubAggregate<any>>,
-  discriminator?: Record<string, unknown>,
-  assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined,
-  decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined,
-  ownDiscriminator?: Record<string, unknown>,
-  dateEncoders?: Record<string, (value: unknown) => unknown>,
-): ResolvedNode => {
+/**
+ * Arguments to {@link resolveNode}. An options object rather than positionals:
+ * the node shape has enough optional facets that a call site's trailing
+ * `undefined, undefined, x` told the reader nothing about which facet was being
+ * set.
+ */
+interface ResolveNodeArgs {
+  readonly fieldName: string | null
+  readonly entityType: string
+  readonly cardinality: "root" | "one" | "many"
+  readonly edges: Record<string, AggregateEdge | BoundSubAggregate<any>>
+  readonly discriminator?: Record<string, unknown> | undefined
+  readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
+  readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
+  readonly ownDiscriminator?: Record<string, unknown> | undefined
+  readonly dateEncoders?: Record<string, (value: unknown) => unknown> | undefined
+  readonly skComposite?: ReadonlyArray<string> | undefined
+  readonly refIdentifierField?: string | undefined
+}
+
+const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
+  const {
+    assemble,
+    cardinality,
+    dateEncoders,
+    decompose,
+    discriminator,
+    edges,
+    entityType,
+    fieldName,
+    ownDiscriminator,
+    refIdentifierField,
+    skComposite,
+  } = args
   const children: Array<ResolvedNode> = []
 
   for (const [field, edge] of Object.entries(edges)) {
@@ -1319,48 +1366,48 @@ const resolveNode = (
           ? { ...(discriminator ?? {}), ...edge.discriminator }
           : discriminator
         children.push(
-          resolveNode(
-            field,
-            edge.entityType,
-            "one",
-            {},
-            mergedDisc,
-            undefined,
-            undefined,
-            edge.discriminator,
+          resolveNode({
+            fieldName: field,
+            entityType: edge.entityType,
+            cardinality: "one",
+            edges: {},
+            discriminator: mergedDisc,
+            ownDiscriminator: edge.discriminator,
             // Encode this edge entity's own date fields on write (issue #72).
-            buildDateEncoders(fieldsOf(edge.entity?.model)),
-          ),
+            dateEncoders: buildDateEncoders(fieldsOf(edge.entity?.model)),
+          }),
         )
       } else if (edge._tag === "ManyEdge") {
         children.push(
-          resolveNode(
-            field,
-            edge.entityType,
-            "many",
-            {},
+          resolveNode({
+            fieldName: field,
+            entityType: edge.entityType,
+            cardinality: "many",
+            edges: {},
             discriminator,
-            edge.assemble,
-            edge.decompose,
-            undefined,
-            buildDateEncoders(fieldsOf(edge.entity?.model)),
-          ),
+            assemble: edge.assemble,
+            decompose: edge.decompose,
+            dateEncoders: buildDateEncoders(fieldsOf(edge.entity?.model)),
+            // Declared sort-key composites, authoritative when present (#103).
+            skComposite: edge.sk?.composite,
+            refIdentifierField: edge.entity
+              ? DynamoModel.getIdentifierField(edge.entity.model)?.name
+              : undefined,
+          }),
         )
       } else if (edge._tag === "BoundSubAggregate") {
         const bound = edge as BoundSubAggregate<any>
-        const subChildren = resolveNode(
-          field,
-          bound.aggregate.root.entityType,
-          "one",
-          bound.aggregate.edges,
-          bound.discriminator,
-          undefined,
-          undefined,
-          bound.discriminator,
+        const subChildren = resolveNode({
+          fieldName: field,
+          entityType: bound.aggregate.root.entityType,
+          cardinality: "one",
+          edges: bound.aggregate.edges,
+          discriminator: bound.discriminator,
+          ownDiscriminator: bound.discriminator,
           // The sub-aggregate root item carries the sub-schema's own (non-edge)
           // date fields; its child edges get their own encoders via recursion.
-          buildDateEncoders(fieldsOf(bound.aggregate.schema)),
-        )
+          dateEncoders: buildDateEncoders(fieldsOf(bound.aggregate.schema)),
+        })
         children.push(subChildren)
       }
     }
@@ -1376,6 +1423,8 @@ const resolveNode = (
     children,
     ...(assemble !== undefined && { assemble }),
     ...(decompose !== undefined && { decompose }),
+    ...(skComposite !== undefined && { skComposite }),
+    ...(refIdentifierField !== undefined && { refIdentifierField }),
     dateEncoders,
   }
 }
@@ -1916,6 +1965,8 @@ interface DecomposedItem {
   readonly attributes: Record<string, unknown>
   readonly transactionGroup: string
   readonly skComposites: ReadonlyArray<string>
+  /** Edge field name (entity type for the root) — used to name the culprit in errors. */
+  readonly member: string
 }
 
 /** A group of items to write in a single transaction */
@@ -1934,6 +1985,7 @@ const decomposeAggregate = (
   contextFields: ReadonlyArray<string>,
   dateEncoders: Record<string, (value: unknown) => unknown>,
   aggregateName: string,
+  schema: DynamoSchemaModule.DynamoSchema,
 ): Effect.Effect<ReadonlyArray<TransactionGroup>, AggregateDecompositionError> =>
   Effect.gen(function* () {
     const items: DecomposedItem[] = []
@@ -1964,12 +2016,40 @@ const decomposeAggregate = (
       attributes: rootAttrs,
       transactionGroup: "root",
       skComposites: [],
+      member: rootNode.entityType,
     })
 
     // Decompose each edge
     for (const child of rootNode.children) {
       const fieldValue = assembled[child.fieldName!]
       yield* decomposeNode(items, child, fieldValue, contextValues, "root", [], aggregateName)
+    }
+
+    // Two items composing the same sort key are two writes to one row. DynamoDB
+    // rejects the whole TransactWriteItems with a ValidationException ("Transaction
+    // request cannot include multiple operations on one item") that names no edge,
+    // and carries no CancellationReasons — so `writeTransactionGroups` cannot
+    // decode it and the collision reaches the caller as an opaque client error.
+    // Catch it here, where the edge that produced it is still known (#103).
+    const seen = new Map<string, DecomposedItem>()
+    for (const item of items) {
+      const sk = composeKey(schema, item.entityType, [...item.skComposites])
+      const prior = seen.get(sk)
+      if (prior !== undefined) {
+        const hint =
+          prior.member === item.member
+            ? ` Give the "${item.member}" edge a declared sort key naming attributes that differ` +
+              ` between its elements: Aggregate.many("${item.member}", { …, sk: { composite: [...] } }).`
+            : ""
+        return yield* new AggregateDecompositionError({
+          aggregate: aggregateName,
+          member: item.member,
+          reason:
+            `"${prior.member}" and "${item.member}" both compose the sort key "${sk}", ` +
+            `so one would overwrite the other.${hint}`,
+        })
+      }
+      seen.set(sk, item)
     }
 
     // Group by transaction
@@ -2049,6 +2129,7 @@ const decomposeNode = (
         attributes: subRootAttrs,
         transactionGroup: txGroup,
         skComposites: discValues,
+        member: node.fieldName ?? node.entityType,
       })
 
       // Decompose children within this sub-aggregate
@@ -2088,6 +2169,7 @@ const decomposeNode = (
         attributes: attrs,
         transactionGroup: parentGroup,
         skComposites: [...parentDiscriminatorValues, ...ownDiscValues],
+        member: node.fieldName ?? node.entityType,
       })
     } else {
       // Many edge
@@ -2108,24 +2190,123 @@ const decomposeNode = (
           }
         }
 
-        // Extract ref identifiers for SK composites
-        const itemComposites = extractRefIdentifiers(attrs)
+        const itemComposites = yield* manyEdgeSkComposites(node, attrs, aggregateName)
 
         items.push({
           entityType: node.entityType,
           attributes: attrs,
           transactionGroup: parentGroup,
           skComposites: [...parentDiscriminatorValues, ...itemComposites],
+          member: node.fieldName ?? node.entityType,
         })
       }
     }
   })
 
 /**
+ * Read one declared sk composite off a decomposed element.
+ *
+ * Dotted paths are supported because ref hydration REPLACES the id field with the
+ * hydrated object — an input element `{ contactId, role }` decomposes to
+ * `{ contact: { contactId, … }, role }`, so the referenced entity's identifier is
+ * only reachable as `"contact.contactId"`.
+ */
+const readCompositePath = (attrs: Record<string, unknown>, path: string): unknown => {
+  if (!path.includes(".")) return attrs[path]
+  let current: unknown = attrs
+  for (const segment of path.split(".")) {
+    if (current == null || typeof current !== "object") return undefined
+    current = (current as Record<string, unknown>)[segment]
+  }
+  return current
+}
+
+/**
+ * Whether a resolved composite value can be a sort-key segment.
+ *
+ * `KeyComposer.serializeValue` falls through to `String(value)`, so an object
+ * reaches the key as `[object Object]` or, for a Schema.Class instance, its
+ * whole JSON body. Either is silently wrong and unqueryable — and naming the
+ * ref object (`"umpire"`) instead of a scalar path (`"umpire.id"`) is the easy
+ * mistake to make, precisely because the dotted path is the unfamiliar part.
+ */
+const isScalarComposite = (value: unknown): boolean => {
+  switch (typeof value) {
+    case "string":
+    case "number":
+    case "bigint":
+    case "boolean":
+      return true
+    case "object":
+      return value instanceof Date || DateTime.isDateTime(value as DateTime.DateTime)
+    default:
+      return false
+  }
+}
+
+/**
+ * Sort-key composites for one element of a `many` edge.
+ *
+ * A declared `sk.composite` is AUTHORITATIVE — it replaces the ref-identifier
+ * heuristic rather than extending it, so both the uniqueness and the ordering of
+ * an edge's elements are the user's to state (#103). Without one, uniqueness is
+ * bounded by the referenced entity's identifier and the same entity cannot appear
+ * twice in one aggregate.
+ *
+ * Resolution never throws: a declared attribute that is missing or null is a
+ * modelling error, reported as an {@link AggregateDecompositionError} naming the
+ * edge and the attributes, not a defect escaping the decompose walk.
+ */
+const manyEdgeSkComposites = (
+  node: ResolvedNode,
+  attrs: Record<string, unknown>,
+  aggregateName: string,
+): Effect.Effect<ReadonlyArray<string>, AggregateDecompositionError> =>
+  Effect.gen(function* () {
+    const declared = node.skComposite
+    if (declared === undefined) return extractRefIdentifiers(attrs, node.refIdentifierField)
+
+    const values = declared.map((path) => readCompositePath(attrs, path))
+    const missing = declared.filter((_, i) => values[i] == null)
+    if (missing.length > 0) {
+      return yield* new AggregateDecompositionError({
+        aggregate: aggregateName,
+        member: node.fieldName ?? node.entityType,
+        reason:
+          `sk.composite names ${missing.map((m) => `"${m}"`).join(", ")}, ` +
+          `${missing.length === 1 ? "which is" : "which are"} missing from the element. ` +
+          `A referenced entity's identifier is reachable by dotted path after hydration ` +
+          `(e.g. "contact.contactId", not "contactId").`,
+      })
+    }
+    const nonScalar = declared.filter((_, i) => !isScalarComposite(values[i]))
+    if (nonScalar.length > 0) {
+      return yield* new AggregateDecompositionError({
+        aggregate: aggregateName,
+        member: node.fieldName ?? node.entityType,
+        reason:
+          `sk.composite names ${nonScalar.map((m) => `"${m}"`).join(", ")}, ` +
+          `${nonScalar.length === 1 ? "which resolves" : "which resolve"} to a non-scalar value. ` +
+          `A sort key segment must be a string, number, bigint, boolean or date — name the ` +
+          `attribute itself by dotted path (e.g. "umpire.id", not "umpire").`,
+      })
+    }
+
+    return values.map((value) => KeyComposer.serializeValue(value))
+  })
+
+/**
  * Extract ref identifier values from an item's attributes for use as SK composites.
  * Walks fields looking for embedded objects that have an identifier-annotated field.
+ *
+ * A heuristic, and order-dependent: it takes each nested object's `id` (else its
+ * first `*Id` key) in property order. Declaring `sk.composite` on the edge opts
+ * out of it entirely — see {@link manyEdgeSkComposites}.
  */
-const extractRefIdentifiers = (attrs: Record<string, unknown>): ReadonlyArray<string> => {
+const extractRefIdentifiers = (
+  attrs: Record<string, unknown>,
+  refIdentifierField?: string | undefined,
+): ReadonlyArray<string> => {
   const ids: string[] = []
   // Case 1: Element wraps entity — look for nested objects with id-like fields
   for (const [, value] of Object.entries(attrs)) {
@@ -2143,9 +2324,15 @@ const extractRefIdentifiers = (attrs: Record<string, unknown>): ReadonlyArray<st
       }
     }
   }
-  // Case 2: Element IS entity — top-level id field (e.g., Umpire with { id: "ump-1", ... })
-  if (ids.length === 0 && typeof attrs.id === "string") {
-    ids.push(attrs.id)
+  // Case 2: Element IS entity — the entity's own fields are flat, so there is no
+  // nested object for case 1 to find. Prefer the edge entity's declared
+  // `DynamoModel.identifier` field; fall back to a literal `id` for edges with no
+  // entity. Without this an `Array(Player)` edge composes NO composites and every
+  // element collapses onto one row (#103).
+  if (ids.length === 0) {
+    const declared = refIdentifierField !== undefined ? attrs[refIdentifierField] : undefined
+    if (typeof declared === "string") ids.push(declared)
+    else if (typeof attrs.id === "string") ids.push(attrs.id)
   }
   return ids
 }

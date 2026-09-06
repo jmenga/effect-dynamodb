@@ -3,6 +3,7 @@ import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   type AggregateAssemblyError,
+  type AggregateDecompositionError,
   DynamoError,
   type RefNotFound,
 } from "@effect-dynamodb/schema/Errors.js"
@@ -1333,7 +1334,12 @@ describe("Aggregate write path", () => {
       root: { entityType: "PostItem" },
       edges: {
         author: Aggregate.one("author", { entityType: "PostAuthor" }),
-        comments: Aggregate.many("comments", { entityType: "PostComment" }),
+        // Entity-less many edge: nothing identifies an element, so the sort key
+        // has to be declared or every comment lands on one row (#103).
+        comments: Aggregate.many("comments", {
+          entityType: "PostComment",
+          sk: { composite: ["user"] },
+        }),
       },
     })
 
@@ -2321,6 +2327,402 @@ describe("Aggregate write path", () => {
   // ---------------------------------------------------------------------------
   // ManyEdge inputField — configurable input field name
   // ---------------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // Many-edge declared sort key (#103)
+  // -------------------------------------------------------------------------
+
+  describe("ManyEdge sk.composite (#103)", () => {
+    class Official extends Schema.Class<Official>("Official")({
+      officialId: Schema.String.pipe(DynamoModel.identifier),
+      name: Schema.String,
+    }) {}
+
+    const OfficialEntity = Entity.make({
+      model: Official,
+      entityType: "Official",
+      primaryKey: {
+        pk: { field: "pk", composite: ["officialId"] },
+        sk: { field: "sk", composite: [] },
+      },
+    })
+    OfficialEntity._configure(AppSchema, MainTable.Tag)
+
+    // A real panel has both kinds of role: "onfield" seats TWO umpires, while
+    // "third" and "referee" seat one each — and the same person routinely holds
+    // more than one appointment. So neither the role nor the umpire is unique on
+    // its own; only the pair is.
+    class Appointment extends Schema.Class<Appointment>("Appointment")({
+      official: Official,
+      role: Schema.Literals(["onfield", "third", "referee"]),
+    }) {}
+
+    class OfficiatedMatch extends Schema.Class<OfficiatedMatch>("OfficiatedMatch")({
+      id: Schema.String,
+      name: Schema.String,
+      officials: Schema.Array(Appointment),
+    }) {}
+
+    /** Build the aggregate with a given (or absent) declared sort key. */
+    const makeMatchAggregate = (sk?: { readonly composite: ReadonlyArray<string> }) =>
+      Aggregate.make(OfficiatedMatch, {
+        table: MainTable,
+        schema: AppSchema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: {
+          index: "lsi1",
+          name: "officiated",
+          sk: { field: "lsi1sk", composite: [] },
+        },
+        root: { entityType: "OfficiatedMatchItem" },
+        edges: {
+          officials: Aggregate.many("officials", {
+            entityType: "MatchOfficial",
+            entity: OfficialEntity,
+            ...(sk !== undefined && { sk }),
+          }),
+        },
+      })
+
+    const officialItems: Record<string, Record<string, unknown>> = {
+      "off-1": {
+        pk: "$myapp#v1#official#officialid_off-1",
+        sk: "$myapp#v1#official",
+        __edd_e__: "Official",
+        officialId: "off-1",
+        name: "Ravi Bowen",
+      },
+      "off-2": {
+        pk: "$myapp#v1#official#officialid_off-2",
+        sk: "$myapp#v1#official",
+        __edd_e__: "Official",
+        officialId: "off-2",
+        name: "Kumar D.",
+      },
+      "off-3": {
+        pk: "$myapp#v1#official#officialid_off-3",
+        sk: "$myapp#v1#official",
+        __edd_e__: "Official",
+        officialId: "off-3",
+        name: "Marais E.",
+      },
+    }
+
+    const stubHydration = () => {
+      mockBatchGetItem.mockImplementation((input: Record<string, unknown>) => {
+        const requestItems = input.RequestItems as Record<
+          string,
+          { Keys: Array<Record<string, { S?: string }>> }
+        >
+        const responses: Record<string, Array<Record<string, unknown>>> = {}
+        for (const [tableName, { Keys }] of Object.entries(requestItems)) {
+          responses[tableName] = Keys.map((key) => {
+            const pk = key.pk?.S ?? ""
+            const match = Object.values(officialItems).find((item) => item.pk === pk)
+            return match ? toAttributeMap(match) : undefined
+          }).filter(Boolean) as Array<Record<string, unknown>>
+        }
+        return Promise.resolve({ Responses: responses })
+      })
+    }
+
+    /** Sort keys of the MatchOfficial rows written by the last transaction. */
+    const writtenOfficialSks = (): Array<string> => {
+      const call = mockTransactWrite.mock.calls[0]![0] as {
+        TransactItems: Array<{ Put?: { Item: Record<string, { S?: string }> } }>
+      }
+      return call.TransactItems.filter((i) => i.Put?.Item.__edd_e__?.S === "MatchOfficial").map(
+        (i) => i.Put!.Item.sk!.S!,
+      )
+    }
+
+    /** The full panel: two on-field umpires, one of whom is also the third umpire. */
+    const fullPanel = [
+      { officialId: "off-1", role: "onfield" as const },
+      { officialId: "off-2", role: "onfield" as const },
+      { officialId: "off-1", role: "third" as const },
+      { officialId: "off-3", role: "referee" as const },
+    ]
+
+    it.effect("role + official keys a panel where neither is unique alone", () =>
+      Effect.gen(function* () {
+        stubHydration()
+        mockTransactWrite.mockResolvedValue({})
+
+        // Dotted path: ref hydration replaces `officialId` with the hydrated
+        // `official` object, so the identifier lives one level down.
+        const MatchAggregate = makeMatchAggregate({ composite: ["role", "official.officialId"] })
+
+        const result = yield* MatchAggregate.create({
+          id: "m-1",
+          name: "AUS vs IND",
+          officials: fullPanel,
+        })
+
+        expect(result.officials).toHaveLength(4)
+        expect(writtenOfficialSks()).toEqual([
+          "$myapp#v1#matchofficial#onfield#off-1",
+          "$myapp#v1#matchofficial#onfield#off-2",
+          "$myapp#v1#matchofficial#third#off-1",
+          "$myapp#v1#matchofficial#referee#off-3",
+        ])
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("role alone suffices when every role seats one official", () =>
+      Effect.gen(function* () {
+        stubHydration()
+        mockTransactWrite.mockResolvedValue({})
+
+        const MatchAggregate = makeMatchAggregate({ composite: ["role"] })
+
+        yield* MatchAggregate.create({
+          id: "m-2",
+          name: "ENG vs NZ",
+          officials: [
+            { officialId: "off-1", role: "third" },
+            // Same official, second appointment — one row under the ref-id default.
+            { officialId: "off-1", role: "referee" },
+          ],
+        })
+
+        expect(writtenOfficialSks()).toEqual([
+          "$myapp#v1#matchofficial#third",
+          "$myapp#v1#matchofficial#referee",
+        ])
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("an under-specified key collides on the multi-occupancy role", () =>
+      Effect.gen(function* () {
+        stubHydration()
+        mockTransactWrite.mockResolvedValue({})
+
+        // `role` alone cannot separate the two on-field umpires.
+        const MatchAggregate = makeMatchAggregate({ composite: ["role"] })
+
+        const error = yield* MatchAggregate.create({
+          id: "m-3",
+          name: "SA vs PAK",
+          officials: fullPanel,
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AggregateDecompositionError")
+        const decomposition = error as AggregateDecompositionError
+        expect(decomposition.member).toBe("officials")
+        expect(decomposition.reason).toContain("$myapp#v1#matchofficial#onfield")
+        expect(mockTransactWrite).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("the ref-identifier default collides on the repeated official", () =>
+      Effect.gen(function* () {
+        stubHydration()
+        mockTransactWrite.mockResolvedValue({})
+
+        // No declared sk at all — the key is the official, so off-1's two
+        // appointments compose one row.
+        const MatchAggregate = makeMatchAggregate()
+
+        const error = yield* MatchAggregate.create({
+          id: "m-4",
+          name: "SL vs BAN",
+          officials: fullPanel,
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AggregateDecompositionError")
+        const decomposition = error as AggregateDecompositionError
+        expect(decomposition.member).toBe("officials")
+        expect(decomposition.reason).toContain("$myapp#v1#matchofficial#off-1")
+        expect(decomposition.reason).toContain("sk: { composite: [...] }")
+        expect(mockTransactWrite).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("falls back to the ref-identifier default with no declaration", () =>
+      Effect.gen(function* () {
+        stubHydration()
+        mockTransactWrite.mockResolvedValue({})
+
+        const MatchAggregate = makeMatchAggregate()
+
+        yield* MatchAggregate.create({
+          id: "m-5",
+          name: "WI vs ZIM",
+          officials: [
+            { officialId: "off-1", role: "onfield" },
+            { officialId: "off-2", role: "onfield" },
+          ],
+        })
+
+        expect(writtenOfficialSks()).toEqual([
+          "$myapp#v1#matchofficial#off-1",
+          "$myapp#v1#matchofficial#off-2",
+        ])
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("a declared composite that names a missing attribute fails with a hint", () =>
+      Effect.gen(function* () {
+        stubHydration()
+        mockTransactWrite.mockResolvedValue({})
+
+        // "officialId" is the INPUT field name; after hydration it is
+        // official.officialId.
+        const MatchAggregate = makeMatchAggregate({ composite: ["officialId"] })
+
+        const error = yield* MatchAggregate.create({
+          id: "m-6",
+          name: "IRE vs AFG",
+          officials: [{ officialId: "off-1", role: "onfield" }],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AggregateDecompositionError")
+        const decomposition = error as AggregateDecompositionError
+        expect(decomposition.member).toBe("officials")
+        expect(decomposition.reason).toContain('"officialId"')
+        // The hint points at the dotted path that does resolve after hydration.
+        expect(decomposition.reason).toContain("dotted path")
+        expect(mockTransactWrite).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("a composite naming the ref object is rejected, not stringified into the key", () =>
+      Effect.gen(function* () {
+        stubHydration()
+        mockTransactWrite.mockResolvedValue({})
+
+        // Naming the hydrated ref itself instead of a scalar path. Without a
+        // scalar check `serializeValue` falls through to `String(value)` and the
+        // whole object lands in a real sort key.
+        const MatchAggregate = makeMatchAggregate({ composite: ["role", "official"] })
+
+        const error = yield* MatchAggregate.create({
+          id: "m-7",
+          name: "NZ vs SL",
+          officials: [{ officialId: "off-1", role: "onfield" }],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AggregateDecompositionError")
+        const decomposition = error as AggregateDecompositionError
+        expect(decomposition.member).toBe("officials")
+        expect(decomposition.reason).toContain('"official"')
+        expect(decomposition.reason).toContain("non-scalar")
+        expect(decomposition.reason).toContain("dotted path")
+        expect(mockTransactWrite).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("scalar composites of every supported kind compose", () =>
+      Effect.gen(function* () {
+        stubHydration()
+        mockTransactWrite.mockResolvedValue({})
+
+        class Slot extends Schema.Class<Slot>("Slot")({
+          official: Official,
+          seq: Schema.Number,
+          confirmed: Schema.Boolean,
+        }) {}
+
+        class Roster extends Schema.Class<Roster>("Roster")({
+          id: Schema.String,
+          slots: Schema.Array(Slot),
+        }) {}
+
+        const RosterAggregate = Aggregate.make(Roster, {
+          table: MainTable,
+          schema: AppSchema,
+          pk: { field: "pk", composite: ["id"] },
+          collection: {
+            index: "lsi1",
+            name: "roster",
+            sk: { field: "lsi1sk", composite: [] },
+          },
+          root: { entityType: "RosterItem" },
+          edges: {
+            slots: Aggregate.many("slots", {
+              entityType: "RosterSlot",
+              entity: OfficialEntity,
+              sk: { composite: ["seq", "confirmed", "official.officialId"] },
+            }),
+          },
+        })
+
+        yield* RosterAggregate.create({
+          id: "r-1",
+          slots: [{ officialId: "off-1", seq: 2, confirmed: true }],
+        })
+
+        const call = mockTransactWrite.mock.calls[0]![0] as {
+          TransactItems: Array<{ Put?: { Item: Record<string, { S?: string }> } }>
+        }
+        const sks = call.TransactItems.filter((i) => i.Put?.Item.__edd_e__?.S === "RosterSlot").map(
+          (i) => i.Put!.Item.sk!.S!,
+        )
+        // Numbers zero-pad for sort order; booleans render as true/false.
+        expect(sks).toEqual(["$myapp#v1#rosterslot#0000000000000002#true#off-1"])
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    // "Element IS the ref" panel: a multi-occupancy role modelled as its own
+    // edge over Array(Official), with single-occupancy roles as `one` edges.
+    // Here the element carries no wrapper, so the entity's own identifier field
+    // is what separates the rows.
+    describe("multi-occupancy role as an Array(Official) edge", () => {
+      class Panel extends Schema.Class<Panel>("Panel")({
+        id: Schema.String,
+        name: Schema.String,
+        onfield: Schema.Array(Official),
+        third: Official,
+      }) {}
+
+      const PanelAggregate = Aggregate.make(Panel, {
+        table: MainTable,
+        schema: AppSchema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: {
+          index: "lsi1",
+          name: "panel",
+          sk: { field: "lsi1sk", composite: [] },
+        },
+        root: { entityType: "PanelItem" },
+        edges: {
+          onfield: Aggregate.many("onfield", {
+            entityType: "PanelOnfield",
+            entity: OfficialEntity,
+          }),
+          third: Aggregate.one("third", { entityType: "PanelThird", entity: OfficialEntity }),
+        },
+      })
+
+      it.effect("each umpire in the array gets its own row, keyed by identifier", () =>
+        Effect.gen(function* () {
+          stubHydration()
+          mockTransactWrite.mockResolvedValue({})
+
+          const result = yield* PanelAggregate.create({
+            id: "p-1",
+            name: "AUS vs IND",
+            onfield: ["off-1", "off-2"],
+            // Same official as an on-field umpire AND the third umpire — a
+            // separate edge, so a separate row, no collision.
+            thirdId: "off-1",
+          })
+
+          expect(result.onfield).toHaveLength(2)
+          expect(result.third.officialId).toBe("off-1")
+
+          const call = mockTransactWrite.mock.calls[0]![0] as {
+            TransactItems: Array<{ Put?: { Item: Record<string, { S?: string }> } }>
+          }
+          const sks = call.TransactItems.map((i) => i.Put!.Item.sk!.S!)
+          expect(sks).toContain("$myapp#v1#panelonfield#off-1")
+          expect(sks).toContain("$myapp#v1#panelonfield#off-2")
+          expect(sks).toContain("$myapp#v1#panelthird")
+        }).pipe(Effect.provide(WriteLayer)),
+      )
+    })
+  })
 
   describe("ManyEdge inputField", () => {
     // "Element IS entity" case: Umpire[] → inputField renames to matchUmpireIds: string[]
