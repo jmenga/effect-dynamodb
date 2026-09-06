@@ -115,6 +115,15 @@ class Match extends Schema.Class<Match>("Match")({
 }) {}
 // #endregion
 
+// #region list-model
+class TournamentMatch extends Schema.Class<TournamentMatch>("TournamentMatch")({
+  matchId: Schema.String,
+  tournament: Schema.String,
+  name: Schema.String,
+  status: Schema.Literals(["scheduled", "completed"]),
+}) {}
+// #endregion
+
 // ---------------------------------------------------------------------------
 // 2. Schema + Table + Entities
 // ---------------------------------------------------------------------------
@@ -243,6 +252,26 @@ const OfficiatedMatchAggregate = Aggregate.make(OfficiatedMatch, {
       sk: { composite: ["role", "umpire.id"] },
     }),
   },
+})
+// #endregion
+
+// A `list` index turns the aggregate into something you can page through: the
+// root item of every aggregate is written to it, so `list` reads root items from
+// one partition and assembles each one.
+// #region list-aggregate
+const TournamentMatchAggregate = Aggregate.make(TournamentMatch, {
+  table: MainTable,
+  schema: CricketSchema,
+  pk: { field: "pk", composite: ["matchId"] },
+  collection: { name: "tmatch" },
+  list: {
+    index: "gsi1",
+    name: "tmatchlist",
+    pk: { field: "gsi1pk", composite: ["tournament"] },
+    sk: { field: "gsi1sk", composite: ["matchId"] },
+  },
+  root: { entityType: "TournamentMatchItem" },
+  edges: {},
 })
 // #endregion
 
@@ -569,6 +598,66 @@ const program = Effect.gen(function* () {
   }
 
   yield* OfficiatedMatchAggregate.delete({ matchId: "bgt-2025-test-1" })
+
+  // =========================================================================
+  // Part 5: Listing aggregates
+  // =========================================================================
+
+  yield* Console.log("\n--- Part 5: Listing aggregates ---\n")
+
+  for (const [n, status] of [
+    ["01", "completed"],
+    ["02", "completed"],
+    ["03", "scheduled"],
+    ["04", "completed"],
+    ["05", "scheduled"],
+  ] as const) {
+    yield* TournamentMatchAggregate.create({
+      matchId: `bgt-2025-test-${n}`,
+      tournament: "bgt-2025",
+      name: `Test ${n}`,
+      status,
+    })
+  }
+
+  // The filter runs server-side on the root-item query, so the two scheduled
+  // matches are never assembled — and `limit` still means two COMPLETED
+  // matches, not two rows examined.
+  // #region list-filtered
+  const completed = yield* TournamentMatchAggregate.list(
+    { tournament: "bgt-2025" },
+    { filter: { status: "completed" }, limit: 2 },
+  )
+  // #endregion
+
+  yield* Console.log(
+    `Completed matches: ${completed.data.map((m) => m.matchId).join(", ")}`,
+  )
+
+  // A non-null cursor means there is more; `null` means genuinely exhausted.
+  // #region list-cursor
+  if (completed.cursor !== null) {
+    const nextPage = yield* TournamentMatchAggregate.list(
+      { tournament: "bgt-2025" },
+      { cursor: completed.cursor, filter: { status: "completed" }, limit: 2 },
+    )
+    yield* Console.log(`Next page: ${nextPage.data.map((m) => m.matchId).join(", ")}`)
+  }
+  // #endregion
+
+  // The callback form of `filter`, and newest-first ordering.
+  // #region list-reverse
+  const latest = yield* TournamentMatchAggregate.list(
+    { tournament: "bgt-2025" },
+    { filter: (t, { eq }) => eq(t.status, "completed"), limit: 1, reverse: true },
+  )
+  // #endregion
+
+  yield* Console.log(`Latest completed: ${latest.data[0]?.matchId}`)
+
+  for (const n of ["01", "02", "03", "04", "05"]) {
+    yield* TournamentMatchAggregate.delete({ matchId: `bgt-2025-test-${n}` })
+  }
 
   // --- Cleanup ---
   yield* Console.log("\nCleaning up...")

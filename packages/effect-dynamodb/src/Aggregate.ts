@@ -43,6 +43,16 @@ import { type Context, DateTime, Effect, type Optic, Option, Schema, SchemaAST }
 import * as Batch from "./Batch.js"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
 import { type EntityGet, fromDefinition as entityFromDefinition } from "./Entity.js"
+import {
+  type CompileResult,
+  type ConditionOps,
+  type ConditionShorthand,
+  compileExpr,
+  createConditionOps,
+  type Expr,
+  parseSimpleShorthand,
+} from "./internal/Expr.js"
+import { createPathBuilder, type PathBuilder } from "./internal/PathBuilder.js"
 import { generateTimestampPrimitive } from "./internal/TransactableOps.js"
 import { fromAttributeMap, toAttributeMap, toAttributeValue } from "./Marshaller.js"
 import { resolvePrimaryKey, type Table, type TableConfig } from "./Table.js"
@@ -159,12 +169,48 @@ interface ResolvedNode {
 // List pagination types
 // ---------------------------------------------------------------------------
 
+/**
+ * Server-side predicate for {@link ListOptions.filter} — the same two forms
+ * `BoundQuery.filter()` takes, so there is one filter vocabulary in the library:
+ *
+ * - callback: `(t, { gt }) => gt(t.total, 100)`
+ * - shorthand: `{ status: "shipped" }` (attribute equality, ANDed)
+ */
+export type ListFilter<Model> =
+  | ((t: PathBuilder<Model, Model, never>, ops: ConditionOps<Model>) => Expr)
+  | ConditionShorthand
+
 /** Options for paginated list queries */
-export interface ListOptions {
-  /** Maximum number of root items (aggregates) to return */
+export interface ListOptions<Model = Record<string, unknown>> {
+  /**
+   * Return at most this many aggregates — a contract on results, not on rows
+   * examined. Under {@link ListOptions.filter} the root query accumulates
+   * across as many requests as it takes to fill the page. Use
+   * {@link ListOptions.pageSize} to size the requests themselves.
+   */
   readonly limit?: number
+  /**
+   * Rows examined per DynamoDB request (`Limit`) — a contract on round trips,
+   * not on what comes back. Mostly useful with a selective `filter`, where a
+   * request can return nothing and the loop simply asks again.
+   */
+  readonly pageSize?: number
   /** Opaque cursor from a previous list call to resume pagination */
   readonly cursor?: string
+  /**
+   * `FilterExpression` applied to the **root-item** query, server-side.
+   *
+   * Worth reaching for beyond ergonomics: `list` assembles each surviving root
+   * item with its own partition read, so a predicate applied after the fact
+   * pays a full assembly for every aggregate it then discards. Pushing it into
+   * the query means the discarded rows are never assembled.
+   *
+   * Filters the root item's stored attributes only — edge items are not
+   * examined by this query.
+   */
+  readonly filter?: ListFilter<Model>
+  /** Walk the list index in descending order (`ScanIndexForward: false`). */
+  readonly reverse?: boolean
 }
 
 /** Result of a paginated list query */
@@ -288,10 +334,19 @@ export interface Aggregate<
    * Supports cursor-based pagination via `options.limit` and `options.cursor`.
    * When `limit` is specified, returns at most that many aggregates plus a cursor
    * for the next page. Without `limit`, returns all matching aggregates.
+   *
+   * `options.filter` adds a server-side `FilterExpression` to the root-item
+   * query; `limit` still means "this many aggregates", the loop accumulating
+   * across requests until the page fills or the key range ends. A `null` cursor
+   * means genuinely exhausted.
+   *
+   * On a **sharded** list (`list.cardinality`) `limit` bounds the merged result
+   * but there is no resumable position across shards, so `cursor` is always
+   * `null` and passing one fails with `EDD-9051`.
    */
   readonly list: (
     filter?: Record<string, unknown>,
-    options?: ListOptions,
+    options?: ListOptions<Schema.Schema.Type<TSchema>>,
   ) => Effect.Effect<
     ListResult<Schema.Schema.Type<TSchema>>,
     AggregateAssemblyError | DynamoClientError | ValidationError,
@@ -365,7 +420,7 @@ export interface BoundAggregate<
 
   readonly list: (
     filter?: Record<string, unknown>,
-    options?: ListOptions,
+    options?: ListOptions<Schema.Schema.Type<TSchema>>,
   ) => Effect.Effect<
     ListResult<Schema.Schema.Type<TSchema>>,
     AggregateAssemblyError | DynamoClientError | ValidationError,
@@ -1276,9 +1331,25 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
         const listConfig = config.list
         const limit = options?.limit
-        const startKey = options?.cursor
-          ? (JSON.parse(atob(options.cursor)) as Record<string, AttributeValue>)
-          : undefined
+        const pageSize = options?.pageSize
+
+        // Root-item FilterExpression. Compiled once — the same two forms
+        // `BoundQuery.filter()` takes, through the same `Expr` compiler, so
+        // there is one filter vocabulary rather than a second dialect here.
+        const rootFilter = compileListFilter(options?.filter)
+
+        // Attribute names that make up a resume key on the list index: the index
+        // key plus the table key. A `LastEvaluatedKey` supplies them when there
+        // is one; this is the fallback for the case a filtered request over-reads
+        // on the LAST page, where the surplus still has to be re-read next time.
+        const listKeyFields = Array.from(
+          new Set([
+            tablePrimary?.pk ?? config.pk.field,
+            tablePrimary?.sk ?? "sk",
+            listConfig.pk.field,
+            listConfig.sk.field,
+          ]),
+        )
 
         // Compose PK from filter values matching PK composites. The filter is a
         // DOMAIN record, so it goes through the same key form the write side
@@ -1304,37 +1375,65 @@ const makeAggregate = <TSchema extends Schema.Top>(
         let nextKey: Record<string, AttributeValue> | undefined
 
         if (listConfig.cardinality) {
-          // Fan out: query each shard in parallel, merge results
-          // Pagination not supported for sharded lists — returns all results
+          // A sharded list is a fan-out over N independent partitions, and a
+          // DynamoDB cursor addresses a position in ONE of them. Resuming would
+          // need a per-shard cursor set plus a defined global merge order, which
+          // this fan-out does not have (results are concatenated shard by shard).
+          // Rejecting is the honest answer — the previous behaviour accepted the
+          // cursor and restarted from the beginning, silently.
+          if (options?.cursor !== undefined) {
+            return yield* new ValidationError({
+              entityType: aggregateName,
+              operation: "list",
+              cause:
+                `[EDD-9051] Aggregate "${aggregateName}" has a sharded list ` +
+                `(list.cardinality = ${listConfig.cardinality}), and a sharded fan-out has no ` +
+                "resumable cursor: a DynamoDB cursor names a position in one partition, while " +
+                "this query spans all of them with no defined order across shards. `list` on a " +
+                "sharded aggregate always returns `cursor: null`; use `limit` to bound the " +
+                "result, or drop `list.cardinality` if the partition needs paging more than it " +
+                "needs spreading.",
+            })
+          }
+
+          // Fan out across shards and merge. `limit` bounds each shard too — no
+          // single shard can contribute more than the whole page.
           const shardQueries = Array.from({ length: listConfig.cardinality }, (_, shard) => {
             const shardPkValue = composeCollectionKey(config.schema, listConfig.name, [
               ...listPkComposites,
               String(shard),
             ])
-            return queryListPartition(
-              client,
-              tableConfig,
-              listConfig,
-              config.schema,
-              shardPkValue,
+            return queryListPartition(client, tableConfig, listConfig, config.schema, {
+              pkValue: shardPkValue,
               skValues,
-            )
+              limit,
+              pageSize,
+              filter: rootFilter,
+              reverse: options?.reverse === true,
+              keyFields: listKeyFields,
+            })
           })
           const shardResults = yield* Effect.all(shardQueries)
-          rootItems = shardResults.flatMap((r) => r.items)
+          const merged = shardResults.flatMap((r) => r.items)
+          // Truncate the merged fan-out to `limit`. Previously the option was
+          // accepted and discarded, so a large aggregate set returned everything.
+          rootItems = limit === undefined ? merged : merged.slice(0, limit)
           nextKey = undefined
         } else {
+          const startKey = options?.cursor
+            ? (JSON.parse(atob(options.cursor)) as Record<string, AttributeValue>)
+            : undefined
           const listPkValue = composeCollectionKey(config.schema, listConfig.name, listPkComposites)
-          const result = yield* queryListPartition(
-            client,
-            tableConfig,
-            listConfig,
-            config.schema,
-            listPkValue,
+          const result = yield* queryListPartition(client, tableConfig, listConfig, config.schema, {
+            pkValue: listPkValue,
             skValues,
             limit,
+            pageSize,
             startKey,
-          )
+            filter: rootFilter,
+            reverse: options?.reverse === true,
+            keyFields: listKeyFields,
+          })
           rootItems = result.items
           nextKey = result.lastKey
         }
@@ -1401,8 +1500,10 @@ export const bind = <TSchema extends Schema.Top, TKey extends Record<string, unk
         ) => Schema.Schema.Type<TSchema> | TSchema["Iso"],
       ) => provide(aggregate.update(key, mutationFn)),
       delete: (key: TKey) => provide(aggregate.delete(key)),
-      list: (filter?: Record<string, unknown>, options?: ListOptions) =>
-        provide(aggregate.list(filter, options)),
+      list: (
+        filter?: Record<string, unknown>,
+        options?: ListOptions<Schema.Schema.Type<TSchema>>,
+      ) => provide(aggregate.list(filter, options)),
       inputSchema: aggregate.inputSchema,
       createSchema: aggregate.createSchema,
       updateSchema: aggregate.updateSchema,
@@ -2694,12 +2795,97 @@ const deleteAllItems = (
   })
 
 // ---------------------------------------------------------------------------
+// Internal: list filter compilation
+// ---------------------------------------------------------------------------
+
+/**
+ * @internal Compile a {@link ListFilter} to a `FilterExpression` fragment.
+ *
+ * Both forms route through the same `Expr` compiler `BoundQuery.filter()` uses,
+ * so `{ status: "shipped" }` and `(t, { eq }) => eq(t.status, "shipped")` mean
+ * the same thing here as they do on an entity query. A shorthand with no
+ * entries compiles to the empty string — that is a no-op, not `FilterExpression: ""`,
+ * which DynamoDB rejects.
+ */
+const compileListFilter = <Model>(
+  filter: ListFilter<Model> | undefined,
+): CompileResult | undefined => {
+  if (filter === undefined) return undefined
+  const expr =
+    typeof filter === "function"
+      ? filter(
+          createPathBuilder<Model>() as PathBuilder<Model, Model, never>,
+          createConditionOps<Model>(),
+        )
+      : parseSimpleShorthand(filter)
+  const compiled = compileExpr(expr)
+  return compiled.expression === "" ? undefined : compiled
+}
+
+// ---------------------------------------------------------------------------
 // Internal: Query a single list collection GSI partition (paginated)
 // ---------------------------------------------------------------------------
 
 interface ListPartitionResult {
   readonly items: Array<Record<string, unknown>>
+  /**
+   * Where the next page resumes, or `undefined` when the key range genuinely
+   * ended. NOT always the response's `LastEvaluatedKey`: once a filtered request
+   * over-reads and the surplus is dropped, this is rebuilt from the last item
+   * actually returned, so the caller resumes after what it saw.
+   */
   readonly lastKey: Record<string, AttributeValue> | undefined
+}
+
+interface ListPartitionOptions {
+  /** Composed GSI partition key value. */
+  readonly pkValue: string
+  /** Serialized SK composites forming a `begins_with` prefix (may be empty). */
+  readonly skValues: ReadonlyArray<string>
+  /** At most this many items — accumulated across requests, filter or not. */
+  readonly limit?: number | undefined
+  /** DynamoDB `Limit` per request (rows examined). */
+  readonly pageSize?: number | undefined
+  readonly startKey?: Record<string, AttributeValue> | undefined
+  readonly filter?: CompileResult | undefined
+  readonly reverse?: boolean | undefined
+  /** Attribute names forming a resume key, when there is no LastEvaluatedKey. */
+  readonly keyFields: ReadonlyArray<string>
+}
+
+/**
+ * @internal DynamoDB `Limit` for the next request — the same rule `Query.ts`
+ * applies, and for the same reason: `Limit` bounds rows EXAMINED, and a
+ * `FilterExpression` runs after, so under a filter `limit` cannot be expressed
+ * as `Limit` at all. `pageSize` (or, unset, a natural 1 MB page) is the budget
+ * then, and the loop keeps asking until the page fills.
+ */
+const listRequestLimit = (
+  options: ListPartitionOptions,
+  remaining: number | undefined,
+): number | undefined => {
+  if (remaining === undefined) return options.pageSize
+  if (options.filter !== undefined) return options.pageSize
+  return options.pageSize === undefined ? remaining : Math.min(options.pageSize, remaining)
+}
+
+/**
+ * @internal Rebuild a resume key from an item the query returned. Every item
+ * carries its table key and index key as ordinary attributes, so any item can
+ * address itself. Returns `undefined` if a name is missing.
+ */
+const listKeyFromItem = (
+  item: Record<string, AttributeValue>,
+  names: ReadonlyArray<string>,
+): Record<string, AttributeValue> | undefined => {
+  if (names.length === 0) return undefined
+  const key: Record<string, AttributeValue> = {}
+  for (const name of names) {
+    const value = item[name]
+    if (value === undefined) return undefined
+    key[name] = value
+  }
+  return key
 }
 
 const queryListPartition = (
@@ -2707,12 +2893,11 @@ const queryListPartition = (
   tableConfig: TableConfig,
   listConfig: ListCollectionConfig,
   schema: DynamoSchemaModule.DynamoSchema,
-  pkValue: string,
-  skValues: ReadonlyArray<string>,
-  limit?: number | undefined,
-  startKey?: Record<string, AttributeValue> | undefined,
+  options: ListPartitionOptions,
 ): Effect.Effect<ListPartitionResult, DynamoClientError> =>
   Effect.gen(function* () {
+    const { filter, limit, pkValue, skValues } = options
+
     const exprNames: Record<string, string> = { "#pk": listConfig.pk.field }
     const exprValues: Record<string, AttributeValue> = { ":pk": toAttributeValue(pkValue) }
     let keyCondition = "#pk = :pk"
@@ -2724,31 +2909,61 @@ const queryListPartition = (
       keyCondition += " AND begins_with(#sk, :skPrefix)"
     }
 
-    const items: Array<Record<string, unknown>> = []
-    let lastKey: Record<string, AttributeValue> | undefined = startKey
+    if (filter !== undefined) {
+      Object.assign(exprNames, filter.names)
+      Object.assign(exprValues, filter.values)
+    }
 
-    do {
+    if (limit !== undefined && limit <= 0) return { items: [], lastKey: undefined }
+
+    const items: Array<Record<string, unknown>> = []
+    let startKey = options.startKey
+    let lastKey: Record<string, AttributeValue> | undefined
+
+    for (;;) {
+      const remaining = limit === undefined ? undefined : limit - items.length
+      const requestLimit = listRequestLimit(options, remaining)
       const result = yield* client.query({
         TableName: tableConfig.name,
         IndexName: listConfig.index,
         KeyConditionExpression: keyCondition,
         ExpressionAttributeNames: exprNames,
         ExpressionAttributeValues: exprValues,
-        ExclusiveStartKey: lastKey,
-        ...(limit !== undefined ? { Limit: limit - items.length } : {}),
+        ExclusiveStartKey: startKey,
+        ...(filter !== undefined ? { FilterExpression: filter.expression } : {}),
+        ...(requestLimit !== undefined ? { Limit: requestLimit } : {}),
+        ...(options.reverse === true ? { ScanIndexForward: false } : {}),
       })
 
-      if (result.Items) {
-        for (const item of result.Items) {
-          items.push(fromAttributeMap(item as Record<string, AttributeValue>))
-        }
+      const returned = (result.Items ?? []) as Array<Record<string, AttributeValue>>
+      const lastEvaluatedKey = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined
+      const take = remaining === undefined ? returned.length : Math.min(remaining, returned.length)
+
+      for (let i = 0; i < take; i++) items.push(fromAttributeMap(returned[i]!))
+
+      // Over-read — a filtered request returns whatever survives the filter, not
+      // `Limit` rows. The surplus is dropped, so `LastEvaluatedKey` (the last row
+      // EXAMINED) would skip past items the caller never saw. Resume from the
+      // last item actually handed back instead.
+      if (take < returned.length) {
+        lastKey =
+          listKeyFromItem(
+            returned[take - 1]!,
+            lastEvaluatedKey != null ? Object.keys(lastEvaluatedKey) : options.keyFields,
+          ) ?? lastEvaluatedKey
+        break
       }
 
-      lastKey = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined
+      const exhausted = lastEvaluatedKey == null
+      const limitReached = limit !== undefined && items.length >= limit
 
-      // Stop when we've collected enough items
-      if (limit !== undefined && items.length >= limit) break
-    } while (lastKey !== undefined)
+      if (exhausted || limitReached) {
+        lastKey = lastEvaluatedKey
+        break
+      }
+
+      startKey = lastEvaluatedKey
+    }
 
     return { items, lastKey }
   })

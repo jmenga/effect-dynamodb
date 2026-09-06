@@ -551,6 +551,77 @@ yield* MatchAggregate.delete({ id: "bgt-2025-test-1" })
 
 Queries all items in the partition and batch-deletes them.
 
+#### list — Page Through Aggregates
+
+`list` needs a **list index**: a GSI the root item of every aggregate is written to. `list` reads root items from one partition of it, then assembles each one.
+
+```typescript region="list-model" example="guide-aggregates.ts"
+class TournamentMatch extends Schema.Class<TournamentMatch>("TournamentMatch")({
+  matchId: Schema.String,
+  tournament: Schema.String,
+  name: Schema.String,
+  status: Schema.Literals(["scheduled", "completed"]),
+}) {}
+```
+
+```typescript region="list-aggregate" example="guide-aggregates.ts"
+const TournamentMatchAggregate = Aggregate.make(TournamentMatch, {
+  table: MainTable,
+  schema: CricketSchema,
+  pk: { field: "pk", composite: ["matchId"] },
+  collection: { name: "tmatch" },
+  list: {
+    index: "gsi1",
+    name: "tmatchlist",
+    pk: { field: "gsi1pk", composite: ["tournament"] },
+    sk: { field: "gsi1sk", composite: ["matchId"] },
+  },
+  root: { entityType: "TournamentMatchItem" },
+  edges: {},
+})
+```
+
+The first argument selects the partition (and, with contiguous SK composites, a prefix within it). The second carries the paging options:
+
+| Option | Meaning |
+|--------|---------|
+| `limit` | At most _n_ **aggregates**. Accumulates across as many requests as it takes — not DynamoDB's `Limit`, which bounds rows examined |
+| `pageSize` | DynamoDB's `Limit` — rows examined per request. A contract on round trips, not on what comes back |
+| `filter` | `FilterExpression` on the root-item query. Same callback and shorthand forms as `BoundQuery.filter()` |
+| `reverse` | Walk the list index descending |
+| `cursor` | Resume after the last aggregate the previous call returned |
+
+```typescript region="list-filtered" example="guide-aggregates.ts"
+const completed = yield* TournamentMatchAggregate.list(
+  { tournament: "bgt-2025" },
+  { filter: { status: "completed" }, limit: 2 },
+)
+```
+
+`filter` is worth reaching for beyond ergonomics. `list` assembles each surviving root item with **its own partition read**, so filtering the result afterwards pays a full assembly for every aggregate it then discards. Pushing the predicate into the query means those rows are never assembled.
+
+Because a `FilterExpression` runs _after_ DynamoDB's `Limit`, a request can come back empty. `limit` still means "this many matching aggregates": the query keeps asking until the page fills or the key range ends. `cursor` is `null` only when genuinely exhausted.
+
+```typescript region="list-cursor" example="guide-aggregates.ts"
+if (completed.cursor !== null) {
+  const nextPage = yield* TournamentMatchAggregate.list(
+    { tournament: "bgt-2025" },
+    { cursor: completed.cursor, filter: { status: "completed" }, limit: 2 },
+  )
+}
+```
+
+```typescript region="list-reverse" example="guide-aggregates.ts"
+const latest = yield* TournamentMatchAggregate.list(
+  { tournament: "bgt-2025" },
+  { filter: (t, { eq }) => eq(t.status, "completed"), limit: 1, reverse: true },
+)
+```
+
+:::caution[Sharded lists cannot be resumed]
+With `list.cardinality`, the list index is spread across _n_ partitions and `list` fans out across all of them. `limit` bounds the merged result, but there is no resumable position across shards — `cursor` is always `null`, and passing one fails with a `ValidationError` (`EDD-9051`) rather than being silently ignored.
+:::
+
 ### Type Extractors
 
 | Type | Description |

@@ -3465,5 +3465,317 @@ describe("Aggregate write path", () => {
         expect(gsiInput.Limit).toBeUndefined()
       }).pipe(Effect.provide(ListLayer)),
     )
+
+    // -----------------------------------------------------------------------
+    // list — filter / reverse / sharded limit + cursor (#104)
+    // -----------------------------------------------------------------------
+
+    /** Root item as it appears on the list GSI. */
+    const listRow = (id: string, author: string, title: string) =>
+      toAttributeMap({
+        pk: `$myapp#v1#article#${id}`,
+        sk: "$myapp#v1#articleitem",
+        gsi1pk: "$myapp#v1#articlelist",
+        gsi1sk: `$myapp#v1#articlelist#${author.toLowerCase()}#${title.toLowerCase()}`,
+        __edd_e__: "ArticleItem",
+        articleId: id,
+        title,
+        author,
+        tags: [],
+      })
+
+    /** The partition read `list` issues per surviving root item (the N+1). */
+    const assemblyPage = (id: string, author: string, title: string) => ({
+      Items: [
+        toAttributeMap({
+          pk: `$myapp#v1#article#${id}`,
+          sk: "$myapp#v1#articleitem",
+          __edd_e__: "ArticleItem",
+          articleId: id,
+          title,
+          author,
+          tags: [],
+        }),
+      ],
+    })
+
+    it.effect("filter shorthand compiles to a FilterExpression on the root query", () =>
+      Effect.gen(function* () {
+        // DynamoDB applies the FilterExpression server-side, so only Alice's
+        // row comes back.
+        mockListQuery
+          .mockResolvedValueOnce({ Items: [listRow("a-1", "Alice", "First")] })
+          .mockResolvedValueOnce(assemblyPage("a-1", "Alice", "First"))
+
+        const results = yield* ListAggregate.list(undefined, { filter: { author: "Alice" } })
+
+        expect(results.data).toHaveLength(1)
+        expect(results.data[0]!.author).toBe("Alice")
+
+        const gsiInput = mockListQuery.mock.calls[0]![0]
+        expect(gsiInput.FilterExpression).toBeDefined()
+        // The filter's placeholders live alongside the key-condition ones.
+        const nameEntry = Object.entries(gsiInput.ExpressionAttributeNames).find(
+          ([, v]) => v === "author",
+        )
+        expect(nameEntry).toBeDefined()
+        expect(gsiInput.FilterExpression).toContain(nameEntry![0])
+        expect(Object.values(gsiInput.ExpressionAttributeValues)).toContainEqual({ S: "Alice" })
+      }).pipe(Effect.provide(ListLayer)),
+    )
+
+    it.effect("filter callback form compiles through the same Expr compiler", () =>
+      Effect.gen(function* () {
+        mockListQuery
+          .mockResolvedValueOnce({ Items: [listRow("a-2", "Bob", "Second")] })
+          .mockResolvedValueOnce(assemblyPage("a-2", "Bob", "Second"))
+
+        const results = yield* ListAggregate.list(undefined, {
+          filter: (t, { ne }) => ne(t.author, "Alice"),
+        })
+
+        expect(results.data).toHaveLength(1)
+        const gsiInput = mockListQuery.mock.calls[0]![0]
+        expect(gsiInput.FilterExpression).toContain("<>")
+        expect(Object.values(gsiInput.ExpressionAttributeValues)).toContainEqual({ S: "Alice" })
+      }).pipe(Effect.provide(ListLayer)),
+    )
+
+    it.effect('an empty shorthand filter is a no-op, not FilterExpression: ""', () =>
+      Effect.gen(function* () {
+        mockListQuery
+          .mockResolvedValueOnce({ Items: [listRow("a-1", "Alice", "First")] })
+          .mockResolvedValueOnce(assemblyPage("a-1", "Alice", "First"))
+
+        yield* ListAggregate.list(undefined, { filter: {} })
+
+        expect(mockListQuery.mock.calls[0]![0].FilterExpression).toBeUndefined()
+      }).pipe(Effect.provide(ListLayer)),
+    )
+
+    it.effect("the N+1 assembly does NOT run for rows the filter rejected", () =>
+      Effect.gen(function* () {
+        // Unfiltered: two root items -> two partition assemblies (1 + 2 = 3).
+        mockListQuery
+          .mockResolvedValueOnce({
+            Items: [listRow("a-1", "Alice", "First"), listRow("a-2", "Bob", "Second")],
+          })
+          .mockResolvedValueOnce(assemblyPage("a-1", "Alice", "First"))
+          .mockResolvedValueOnce(assemblyPage("a-2", "Bob", "Second"))
+
+        const unfiltered = yield* ListAggregate.list()
+        expect(unfiltered.data).toHaveLength(2)
+        expect(mockListQuery).toHaveBeenCalledTimes(3)
+
+        mockListQuery.mockReset()
+
+        // Filtered: the same partition, but Bob's row never reaches the client,
+        // so his assembly read is never issued (1 + 1 = 2).
+        mockListQuery
+          .mockResolvedValueOnce({ Items: [listRow("a-1", "Alice", "First")] })
+          .mockResolvedValueOnce(assemblyPage("a-1", "Alice", "First"))
+
+        const filtered = yield* ListAggregate.list(undefined, { filter: { author: "Alice" } })
+        expect(filtered.data).toHaveLength(1)
+        expect(mockListQuery).toHaveBeenCalledTimes(2)
+      }).pipe(Effect.provide(ListLayer)),
+    )
+
+    it.effect("under a filter, limit accumulates across requests that return nothing", () =>
+      Effect.gen(function* () {
+        const lek = (id: string) => ({
+          gsi1pk: { S: "$myapp#v1#articlelist" },
+          gsi1sk: { S: `$myapp#v1#articlelist#${id}` },
+          pk: { S: `$myapp#v1#article#${id}` },
+          sk: { S: "$myapp#v1#articleitem" },
+        })
+
+        mockListQuery
+          // Two requests examine rows that all fail the filter.
+          .mockResolvedValueOnce({ Items: [], LastEvaluatedKey: lek("x-1") })
+          .mockResolvedValueOnce({ Items: [], LastEvaluatedKey: lek("x-2") })
+          .mockResolvedValueOnce({
+            Items: [listRow("a-1", "Alice", "First")],
+            LastEvaluatedKey: lek("a-1"),
+          })
+          .mockResolvedValueOnce({
+            Items: [listRow("a-3", "Alice", "Third")],
+            LastEvaluatedKey: lek("a-3"),
+          })
+          .mockResolvedValueOnce(assemblyPage("a-1", "Alice", "First"))
+          .mockResolvedValueOnce(assemblyPage("a-3", "Alice", "Third"))
+
+        const results = yield* ListAggregate.list(undefined, {
+          limit: 2,
+          pageSize: 5,
+          filter: { author: "Alice" },
+        })
+
+        // A full page of MATCHING aggregates, not a short one.
+        expect(results.data.map((a) => a.articleId)).toEqual(["a-1", "a-3"])
+        // 4 root requests + 2 assemblies.
+        expect(mockListQuery).toHaveBeenCalledTimes(6)
+        // Every root request asked for pageSize rows — `limit` cannot be a
+        // DynamoDB `Limit` under a filter, because `Limit` bounds rows examined.
+        for (const call of mockListQuery.mock.calls.slice(0, 4)) {
+          expect(call[0].Limit).toBe(5)
+        }
+        // More to come, so the cursor is not null.
+        expect(results.cursor).not.toBeNull()
+        expect(JSON.parse(atob(results.cursor!))).toEqual(lek("a-3"))
+      }).pipe(Effect.provide(ListLayer)),
+    )
+
+    it.effect("an over-reading request rebuilds the cursor from the last item RETURNED", () =>
+      Effect.gen(function* () {
+        // Three matches come back in one request with no LastEvaluatedKey; the
+        // caller asked for two, so the third is discarded and must be re-read.
+        mockListQuery
+          .mockResolvedValueOnce({
+            Items: [
+              listRow("a-1", "Alice", "First"),
+              listRow("a-2", "Alice", "Second"),
+              listRow("a-3", "Alice", "Third"),
+            ],
+          })
+          .mockResolvedValueOnce(assemblyPage("a-1", "Alice", "First"))
+          .mockResolvedValueOnce(assemblyPage("a-2", "Alice", "Second"))
+
+        const results = yield* ListAggregate.list(undefined, {
+          limit: 2,
+          filter: { author: "Alice" },
+        })
+
+        expect(results.data.map((a) => a.articleId)).toEqual(["a-1", "a-2"])
+        // Not null — a-3 was read and dropped, so the range is NOT exhausted.
+        expect(results.cursor).not.toBeNull()
+        // Rebuilt from a-2 (the last item handed back), not from a-3.
+        expect(JSON.parse(atob(results.cursor!))).toEqual({
+          pk: { S: "$myapp#v1#article#a-2" },
+          sk: { S: "$myapp#v1#articleitem" },
+          gsi1pk: { S: "$myapp#v1#articlelist" },
+          gsi1sk: { S: "$myapp#v1#articlelist#alice#second" },
+        })
+      }).pipe(Effect.provide(ListLayer)),
+    )
+
+    it.effect("cursor is null when the filtered range is genuinely exhausted", () =>
+      Effect.gen(function* () {
+        mockListQuery
+          .mockResolvedValueOnce({ Items: [listRow("a-1", "Alice", "First")] })
+          .mockResolvedValueOnce(assemblyPage("a-1", "Alice", "First"))
+
+        const results = yield* ListAggregate.list(undefined, {
+          limit: 10,
+          filter: { author: "Alice" },
+        })
+
+        expect(results.data).toHaveLength(1)
+        expect(results.cursor).toBeNull()
+      }).pipe(Effect.provide(ListLayer)),
+    )
+
+    it.effect("reverse walks the list index descending", () =>
+      Effect.gen(function* () {
+        mockListQuery
+          .mockResolvedValueOnce({ Items: [listRow("a-2", "Bob", "Second")] })
+          .mockResolvedValueOnce(assemblyPage("a-2", "Bob", "Second"))
+
+        yield* ListAggregate.list(undefined, { reverse: true })
+
+        expect(mockListQuery.mock.calls[0]![0].ScanIndexForward).toBe(false)
+      }).pipe(Effect.provide(ListLayer)),
+    )
+
+    it.effect("forward order sends no ScanIndexForward", () =>
+      Effect.gen(function* () {
+        mockListQuery
+          .mockResolvedValueOnce({ Items: [listRow("a-1", "Alice", "First")] })
+          .mockResolvedValueOnce(assemblyPage("a-1", "Alice", "First"))
+
+        yield* ListAggregate.list()
+
+        expect(mockListQuery.mock.calls[0]![0].ScanIndexForward).toBeUndefined()
+      }).pipe(Effect.provide(ListLayer)),
+    )
+
+    describe("sharded (cardinality)", () => {
+      const ShardedAggregate = Aggregate.make(Article, {
+        table: MainTable,
+        schema: AppSchema,
+        pk: { field: "pk", composite: ["articleId"] },
+        collection: {
+          index: "lsi1",
+          name: "article",
+          sk: { field: "lsi1sk", composite: [] },
+        },
+        list: {
+          index: "gsi1",
+          name: "articlelist",
+          pk: { field: "gsi1pk", composite: [] },
+          sk: { field: "gsi1sk", composite: ["author"] },
+          cardinality: 3,
+        },
+        root: { entityType: "ArticleItem" },
+        edges: {},
+      })
+
+      it.effect("limit truncates the merged fan-out", () =>
+        Effect.gen(function* () {
+          mockListQuery
+            .mockResolvedValueOnce({ Items: [listRow("a-1", "Alice", "First")] })
+            .mockResolvedValueOnce({ Items: [listRow("a-2", "Bob", "Second")] })
+            .mockResolvedValueOnce({ Items: [listRow("a-3", "Cara", "Third")] })
+            .mockResolvedValueOnce(assemblyPage("a-1", "Alice", "First"))
+            .mockResolvedValueOnce(assemblyPage("a-2", "Bob", "Second"))
+
+          const results = yield* ShardedAggregate.list(undefined, { limit: 2 })
+
+          // Previously the option was accepted and discarded — all three came back.
+          expect(results.data.map((a) => a.articleId)).toEqual(["a-1", "a-2"])
+          // 3 shard queries + 2 assemblies — the truncated row is never assembled.
+          expect(mockListQuery).toHaveBeenCalledTimes(5)
+          // Each shard is bounded by the same limit; no shard can exceed the page.
+          for (const call of mockListQuery.mock.calls.slice(0, 3)) {
+            expect(call[0].Limit).toBe(2)
+          }
+          // No resumable position across shards.
+          expect(results.cursor).toBeNull()
+        }).pipe(Effect.provide(ListLayer)),
+      )
+
+      it.effect("a cursor is rejected with EDD-9051 rather than silently ignored", () =>
+        Effect.gen(function* () {
+          const cursor = btoa(JSON.stringify({ pk: { S: "$myapp#v1#article#a-1" } }))
+
+          const error = yield* Effect.flip(ShardedAggregate.list(undefined, { limit: 2, cursor }))
+
+          expect(error._tag).toBe("ValidationError")
+          expect((error as { cause: string }).cause).toContain("EDD-9051")
+          // No request was issued at all.
+          expect(mockListQuery).not.toHaveBeenCalled()
+        }).pipe(Effect.provide(ListLayer)),
+      )
+
+      it.effect("filter and reverse reach every shard", () =>
+        Effect.gen(function* () {
+          mockListQuery
+            .mockResolvedValueOnce({ Items: [listRow("a-1", "Alice", "First")] })
+            .mockResolvedValueOnce({ Items: [] })
+            .mockResolvedValueOnce({ Items: [] })
+            .mockResolvedValueOnce(assemblyPage("a-1", "Alice", "First"))
+
+          yield* ShardedAggregate.list(undefined, {
+            filter: { author: "Alice" },
+            reverse: true,
+          })
+
+          for (const call of mockListQuery.mock.calls.slice(0, 3)) {
+            expect(call[0].FilterExpression).toBeDefined()
+            expect(call[0].ScanIndexForward).toBe(false)
+          }
+        }).pipe(Effect.provide(ListLayer)),
+      )
+    })
   })
 })
