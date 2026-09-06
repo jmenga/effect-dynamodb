@@ -7936,4 +7936,217 @@ describe("Entity", () => {
         }).pipe(Effect.provide(TestLayer)),
     )
   })
+
+  // -------------------------------------------------------------------------
+  // delete().condition() must reach DynamoDB on EVERY delete path.
+  //
+  // The compiled condition used to be attached only in the simple-DeleteItem
+  // branch: on soft-delete and unique-constraint entities the guard was built
+  // and then dropped, and the delete proceeded unconditionally. These tests
+  // assert the ConditionExpression is present in the emitted command for each
+  // path, so a future branch cannot silently regress.
+  // -------------------------------------------------------------------------
+
+  describe("delete().condition() reaches the emitted command on every path", () => {
+    const primaryKey = {
+      pk: { field: "pk", composite: ["userId"] as const },
+      sk: { field: "sk", composite: [] as const },
+    }
+
+    const storedUser = () =>
+      toAttributeMap({
+        pk: "$myapp#v1#user#u-1",
+        sk: "$myapp#v1#user",
+        userId: "u-1",
+        email: "alice@test.com",
+        displayName: "Alice",
+        role: "admin",
+        __edd_e__: "User",
+      })
+
+    it.effect("simple delete — ConditionExpression on the DeleteItem", () =>
+      Effect.gen(function* () {
+        mockDeleteItem.mockResolvedValueOnce({})
+        const Plain = withConfig(Entity.make({ model: User, entityType: "PlainUser", primaryKey }))
+
+        yield* Plain.delete({ userId: "u-1" })
+          .pipe(Plain.condition({ role: "member" }))
+          .asEffect()
+
+        const call = mockDeleteItem.mock.calls[0]![0]
+        expect(call.ConditionExpression).toBeDefined()
+        expect(Object.values(call.ExpressionAttributeNames)).toContain("role")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("soft delete — ConditionExpression on the current-item Delete", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({ Item: storedUser() })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        const Soft = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "SoftUser",
+            primaryKey,
+            softDelete: true,
+          }),
+        )
+
+        yield* Soft.delete({ userId: "u-1" })
+          .pipe(Soft.condition({ role: "member" }))
+          .asEffect()
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems as Array<any>
+        // Index 0 is the current-item Delete; it carries the guard. The
+        // tombstone Put must stay unconditional so index-0 attribution holds.
+        expect(items[0].Delete.ConditionExpression).toBeDefined()
+        expect(Object.values(items[0].Delete.ExpressionAttributeNames)).toContain("role")
+        expect(items[1].Put.ConditionExpression).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("unique-constraint delete — ConditionExpression on the entity Delete", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({ Item: storedUser() })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        const Unique = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "UniqueDelUser",
+            primaryKey,
+            unique: { email: ["email"] },
+          }),
+        )
+
+        yield* Unique.delete({ userId: "u-1" })
+          .pipe(Unique.condition({ role: "member" }))
+          .asEffect()
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems as Array<any>
+        expect(items[0].Delete.ConditionExpression).toBeDefined()
+        expect(Object.values(items[0].Delete.ExpressionAttributeNames)).toContain("role")
+        // Sentinel deletes stay unconditional — index-0 attribution depends on it.
+        expect(items[1].Delete.ConditionExpression).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("no condition supplied — no ConditionExpression is invented", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({ Item: storedUser() })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        const Soft = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "SoftUserNoCond",
+            primaryKey,
+            softDelete: true,
+          }),
+        )
+
+        yield* Soft.delete({ userId: "u-1" }).asEffect()
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems as Array<any>
+        expect(items[0].Delete.ConditionExpression).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("soft delete — index-0 cancellation maps to ConditionalCheckFailed", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({ Item: storedUser() })
+        const txError = new Error("TransactionCanceledException")
+        ;(txError as any).name = "TransactionCanceledException"
+        ;(txError as any).CancellationReasons = [
+          { Code: "ConditionalCheckFailed" },
+          { Code: "None" },
+        ]
+        mockTransactWriteItems.mockRejectedValueOnce(txError)
+
+        const Soft = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "SoftUserFail",
+            primaryKey,
+            softDelete: true,
+          }),
+        )
+
+        const error = yield* Soft.delete({ userId: "u-1" })
+          .pipe(Soft.condition({ role: "member" }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ConditionalCheckFailed")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("unique delete — index-0 cancellation maps to ConditionalCheckFailed", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({ Item: storedUser() })
+        const txError = new Error("TransactionCanceledException")
+        ;(txError as any).name = "TransactionCanceledException"
+        ;(txError as any).CancellationReasons = [
+          { Code: "ConditionalCheckFailed" },
+          { Code: "None" },
+        ]
+        mockTransactWriteItems.mockRejectedValueOnce(txError)
+
+        const Unique = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "UniqueDelUserFail",
+            primaryKey,
+            unique: { email: ["email"] },
+          }),
+        )
+
+        const error = yield* Unique.delete({ userId: "u-1" })
+          .pipe(Unique.condition({ role: "member" }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ConditionalCheckFailed")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a cancellation NOT at index 0 stays a DynamoError", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({ Item: storedUser() })
+        const txError = new Error("TransactionCanceledException")
+        ;(txError as any).name = "TransactionCanceledException"
+        ;(txError as any).CancellationReasons = [
+          { Code: "None" },
+          { Code: "ConditionalCheckFailed" },
+        ]
+        mockTransactWriteItems.mockRejectedValueOnce(txError)
+
+        const Unique = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "UniqueDelUserOther",
+            primaryKey,
+            unique: { email: ["email"] },
+          }),
+        )
+
+        const error = yield* Unique.delete({ userId: "u-1" })
+          .pipe(Unique.condition({ role: "member" }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("DynamoError")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("purge() refuses a condition instead of dropping it", () =>
+      Effect.gen(function* () {
+        const Plain = withConfig(Entity.make({ model: User, entityType: "PurgeUser", primaryKey }))
+
+        const error = yield* Plain.purge({ userId: "u-1" })
+          .pipe(Plain.condition({ role: "member" }))
+          .asEffect()
+          .pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as any).cause)).toContain("EDD-9046")
+        expect(mockQuery).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
 })

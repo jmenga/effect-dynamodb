@@ -129,6 +129,14 @@ Products.condition({ status: "active", role: "admin" })
   failed. The rejection is attributed to the CAS and reported as `OptimisticLockError`.
   With no version attribute the user condition is the only predicate, so the rejection
   is reported as `ConditionalCheckFailed`.
+
+  On `delete`, the guard reaches DynamoDB on every path — the simple `DeleteItem`, the
+  soft-delete transaction, and the unique-constraint transaction. On the two transaction
+  paths it rides the current item's own `Delete`, which is the only conditioned item, so
+  a rejection rolls the whole transaction back: no tombstone, no released sentinel.
+  `purge()` is the one operation that refuses a condition (`ValidationError`, `EDD-9046`)
+  — it deletes a whole partition across batched writes, so no single `ConditionExpression`
+  could guard it atomically.
 </Aside>
 
 ### Condition Operators Reference

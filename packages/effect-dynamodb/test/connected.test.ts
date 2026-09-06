@@ -1154,6 +1154,146 @@ describeConnected("Connected integration tests", () => {
         }).pipe(provide),
     )
 
+    // -----------------------------------------------------------------------
+    // The condition must reach DynamoDB on EVERY delete path, not just the
+    // simple DeleteItem one. It used to be compiled and then dropped on the
+    // soft-delete and unique-constraint transaction paths, so the guard never
+    // shipped and the delete proceeded unconditionally.
+    // -----------------------------------------------------------------------
+
+    it.effect("soft-delete path: false condition keeps the item, raises the tag", () =>
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        const key = { taskId: "t-softcond-102" }
+        yield* db.entities.Tasks.put({
+          ...key,
+          userId: "u-softcond",
+          title: "Live",
+          status: "todo",
+          priority: 1,
+        })
+
+        const err = yield* db.entities.Tasks.delete(key)
+          .condition({ status: "done" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(err._tag).toBe("ConditionalCheckFailed")
+
+        // Nothing moved: the item is still live, and no tombstone was written.
+        const live = yield* db.entities.Tasks.get(key)
+        expect(live.title).toBe("Live")
+        const tombstones = yield* db.entities.Tasks.deleted.list(key).collect()
+        expect(tombstones).toHaveLength(0)
+      }).pipe(provide),
+    )
+
+    it.effect("soft-delete path: true condition tombstones the item", () =>
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        const key = { taskId: "t-softcond-102-ok" }
+        yield* db.entities.Tasks.put({
+          ...key,
+          userId: "u-softcond",
+          title: "Doomed",
+          status: "done",
+          priority: 1,
+        })
+
+        yield* db.entities.Tasks.delete(key).condition({ status: "done" })
+
+        const stillLive = yield* db.entities.Tasks.get(key).pipe(Effect.flip)
+        expect(stillLive._tag).toBe("ItemNotFound")
+        const tombstones = yield* db.entities.Tasks.deleted.list(key).collect()
+        expect(tombstones).toHaveLength(1)
+      }).pipe(provide),
+    )
+
+    it.effect("unique-constraint path: false condition rolls back the whole transaction", () =>
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.entities.Vehicles.put({
+          vehicleId: "veh-delcond-102",
+          accountId: "acct-delcond",
+          name: "Keeper",
+          transponderId: "tp-delcond-102",
+        })
+
+        const err = yield* db.entities.Vehicles.delete({ vehicleId: "veh-delcond-102" })
+          .condition({ name: "SomethingElse" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(err._tag).toBe("ConditionalCheckFailed")
+
+        const stored = yield* db.entities.Vehicles.get({ vehicleId: "veh-delcond-102" })
+        expect(stored.name).toBe("Keeper")
+
+        // The sentinel Deletes rode the same transaction, so they rolled back
+        // too — the constraint must still be held.
+        const violation = yield* db.entities.Vehicles.put({
+          vehicleId: "veh-delcond-102-other",
+          accountId: "acct-delcond",
+          name: "Other",
+          transponderId: "tp-delcond-102",
+        })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(violation._tag).toBe("UniqueConstraintViolation")
+      }).pipe(provide),
+    )
+
+    it.effect("unique-constraint path: true condition deletes and releases sentinels", () =>
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.entities.Vehicles.put({
+          vehicleId: "veh-delcond-102-ok",
+          accountId: "acct-delcond-ok",
+          name: "Doomed",
+          transponderId: "tp-delcond-102-ok",
+        })
+
+        yield* db.entities.Vehicles.delete({ vehicleId: "veh-delcond-102-ok" }).condition({
+          name: "Doomed",
+        })
+
+        const gone = yield* db.entities.Vehicles.get({ vehicleId: "veh-delcond-102-ok" }).pipe(
+          Effect.flip,
+        )
+        expect(gone._tag).toBe("ItemNotFound")
+
+        // Sentinel released — the transponderId is reusable.
+        const reused = yield* db.entities.Vehicles.put({
+          vehicleId: "veh-delcond-102-reuse",
+          accountId: "acct-delcond-ok",
+          name: "Reuse",
+          transponderId: "tp-delcond-102-ok",
+        })
+        expect(reused.vehicleId).toBe("veh-delcond-102-reuse")
+      }).pipe(provide),
+    )
+
+    it.effect("purge() refuses a condition rather than silently dropping it", () =>
+      Effect.gen(function* () {
+        // `purge` is partition-wide and batched, so no per-item
+        // ConditionExpression can guard it atomically. `.condition()` is
+        // structurally reachable on it (purge returns an EntityDelete), so it
+        // must fail loudly instead of ignoring the guard.
+        yield* Vehicles.put({
+          vehicleId: "veh-purgecond-102",
+          accountId: "acct-purgecond",
+          name: "Untouched",
+        }).asEffect()
+
+        const err = yield* Vehicles.purge({ vehicleId: "veh-purgecond-102" })
+          .pipe(Vehicles.condition({ name: "Nope" }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(err._tag).toBe("ValidationError")
+
+        const stored = yield* Vehicles.get({ vehicleId: "veh-purgecond-102" }).asEffect()
+        expect(stored.name).toBe("Untouched")
+      }).pipe(provide),
+    )
+
     it.effect("unbound Entity.condition() pipeline is catchable by tag", () =>
       Effect.gen(function* () {
         yield* Memberships.put({
