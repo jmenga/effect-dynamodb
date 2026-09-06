@@ -348,6 +348,7 @@ Before committing:
 6. `npx tsx examples/<name>.ts` — examples run against DynamoDB Local (`docker run -p 8000:8000 amazon/dynamodb-local`). Run after changes to Entity, Query, Table, DynamoSchema, KeyComposer, Collection, Transaction, or Errors. **Note: running an example successfully is NOT a substitute for gate 4** — examples exercise one or two scenarios; the connected suite covers the cross-product of behaviors. An agent that runs examples and skips `test:connected` has not satisfied this gate.
 7. New modules must have corresponding test files in `test/`
 8. New errors must use `Data.TaggedError`
+8a. New `EDD-xxxx` diagnostic codes must be **allocated in `DESIGN.md` § Diagnostic Code Registry first**, then used in code — never allocated by grepping the source for the highest number. A grep cannot see branches in flight: two parallel branches both took `EDD-9046` for unrelated errors and the collision surfaced only at review. Codes are permanent once released; retire one rather than reusing it.
 9. New services must follow `Context.Service` pattern
 10. New or updated doc pages must have a backing example file with region markers
 

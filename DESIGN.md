@@ -2575,6 +2575,72 @@ old format.
 
 Composites of every other shape — plain numbers, bigints, strings, `Schema.Date`,
 `DateTimeUtc`, literals — are byte-identical and need no migration.
+### Diagnostic Code Registry (`EDD-xxxx`)
+
+Configuration and usage mistakes carry a stable `EDD-xxxx` code in the message, so an
+error can be searched for without matching on prose that may be reworded. Codes are
+allocated in bands by subject area; **the number is permanent once released** — retire a
+code rather than reusing it for a different condition.
+
+**Before allocating a new code, add the row here first.** The registry is the allocation
+record, not a summary written afterwards. Codes had been allocated by grepping the source,
+which does not see other branches in flight: two parallel branches both took `EDD-9046`
+for unrelated errors and the collision was caught only at review.
+
+| Band | Subject |
+|------|---------|
+| 9001–9008 | Entity definition: keys, indexes, `configure()` |
+| 9010–9016 | Time-series (`timeSeries`) |
+| 9020–9027 | Sparse maps, composite nullability, EventStore snapshots |
+| 9030–9040 | Vector search |
+| 9041–9044 | Aggregates, timestamps |
+| 9045–9047 | Query sort-key conditions, `purge` |
+
+| Code | Raised in | Condition |
+|------|-----------|-----------|
+| `EDD-9001` | `Entity.ts` | Primary key declares no composite attribute in either `pk` or `sk` |
+| `EDD-9002` | `Entity.ts`, `DynamoClient.ts` | A required partition-key composite is missing for an index |
+| `EDD-9003` | `KeyComposer.ts` | Malformed `GsiConfig` — missing `name`/`pk`/`sk`, or the pre-v3 `index` property |
+| `EDD-9004` | `DynamoClient.ts` | Sort-key composite supplied without its prior composites (prefix ordering) |
+| `EDD-9005` | `Entity.ts` | TTL string is not a valid duration, or resolves to a non-finite duration |
+| `EDD-9006` | `DynamoClient.ts` | Unknown composite attribute named for an index |
+| `EDD-9007` | `DynamoModel.ts` | `configure()` field rename collides with an existing model field |
+| `EDD-9008` | `Entity.ts` | `generatedId.field` does not name a model field, or does not participate in the key |
+| `EDD-9010` | `Entity.ts` | `.history()` called on an entity with no `timeSeries` config |
+| `EDD-9011` | `Entity.ts` | `timeSeries.orderBy` also appears as a primary-key composite |
+| `EDD-9012` | `Entity.ts` | `timeSeries` and `versioned` are mutually exclusive |
+| `EDD-9013` | `Entity.ts` | `timeSeries.appendInput` omits `orderBy` |
+| `EDD-9014` | `Entity.ts` | `timeSeries.orderBy` names a ref field |
+| `EDD-9015` | `Entity.ts` | `timeSeries` and `softDelete` are mutually exclusive |
+| `EDD-9016` | `Entity.ts` | `timeSeries.appendInput` is required and was not supplied |
+| `EDD-9020` | `Entity.ts` | Sparse field does not exist on the model, or is not a `Schema.Record` |
+| `EDD-9021` | `Entity.ts` | Sparse field has a Record-typed value schema |
+| `EDD-9022` | `Entity.ts` | Sparse field is also a primary-key or GSI composite |
+| `EDD-9023` | `Entity.ts` | Sparse-field prefixes collide with each other or with a non-sparse field |
+| `EDD-9024` | — | **Retired** in v1.7.1. Do not reuse |
+| `EDD-9025` | `Errors.ts` | Composite attribute schema admits `null` |
+| `EDD-9026` | `EventStore.ts` | Snapshot operation on a stream with no snapshot config |
+| `EDD-9027` | `EventStore.ts` | `snapshot.every` is not a positive integer |
+| `EDD-9030` | `VectorIndex.ts` | Vector index `dimensions` invalid |
+| `EDD-9031` | `VectorIndex.ts` | Vector index declares no `source.fields`, or references an unknown field |
+| `EDD-9032` | `VectorIndex.ts`, `Table.ts` | Vector index resolves to more INLINE_FILTER entries than allowed |
+| `EDD-9033` | `VectorIndex.ts` | Two vector indexes on one entity resolve to the same physical index |
+| `EDD-9034` | `VectorIndex.ts`, `Table.ts` | Too many vector indexes declared on an entity or table |
+| `EDD-9035` | `Table.ts` | Entities sharing a vector index disagree on `dimensions` or `distance` |
+| `EDD-9036` | `DynamoClient.ts` | No registered entity declares the requested vector index |
+| `EDD-9037` | `DynamoClient.ts` | Vector index declaration mismatch at bind time |
+| `EDD-9038` | `DynamoClient.ts` | Vector index name collides with an existing index |
+| `EDD-9039` | `VectorIndex.ts` | Vector filter field's encoded type is not derivable from the model |
+| `EDD-9040` | `Table.ts` | Vector index filter attribute is not a stored attribute |
+| `EDD-9041` | `Aggregate.ts` | Aggregate collection PK field conflicts with the table's |
+| `EDD-9042` | `Aggregate.ts` | `consistentRead` requested against a GSI-backed aggregate collection |
+| `EDD-9043` | `Aggregate.ts` | `collection.index` and `collection.sk` must be supplied together |
+| `EDD-9044` | `internal/EntitySchemas.ts` | Timestamp `schema` carries no `DynamoEncoding` annotation |
+| `EDD-9045` | `DynamoClient.ts` | `.where()` used on an index whose sort key has no composites |
+| `EDD-9046` | `DynamoClient.ts` | Strict `lt` on the last sort-key composite with an earlier composite pinned — inexpressible in one DynamoDB sort-key condition |
+| `EDD-9047` | `Entity.ts` | `.condition()` applied to `purge()`, which spans batched writes and cannot be guarded atomically |
+
+Next free code: **`EDD-9048`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 
