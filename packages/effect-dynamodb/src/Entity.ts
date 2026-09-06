@@ -1627,7 +1627,7 @@ const makeImpl = <
     schemas.inputSchema as unknown as Schema.Top,
     (attr, value) => {
       throw new Error(
-        `[EDD-9048] Composite "${attr}" on entity "${entityType}" could not be encoded to its ` +
+        `[EDD-9050] Composite "${attr}" on entity "${entityType}" could not be encoded to its ` +
           `stored form. The attribute's schema carries an encoding transformation, so the ` +
           `stored key holds the ENCODED value, but ${JSON.stringify(String(value))} encodes ` +
           `under neither encode nor decode->encode. Supply a value of the attribute's own type.`,
@@ -6143,7 +6143,7 @@ export const bind = <
           entityInternals.schemas?.inputSchema ?? entityInternals.model,
           (attr, value) => {
             throw new Error(
-              `[EDD-9048] Time-series orderBy attribute "${attr}" on entity "${entityTypeRef}" ` +
+              `[EDD-9050] Time-series orderBy attribute "${attr}" on entity "${entityTypeRef}" ` +
                 `could not be encoded to its stored form. The attribute's schema carries an ` +
                 `encoding transformation, so the event sort key holds the ENCODED value, but ` +
                 `${JSON.stringify(String(value))} encodes under neither encode nor ` +

@@ -1526,7 +1526,7 @@ describe("DynamoClient", () => {
         }),
       )
 
-      it.effect("refuses an operand that cannot be encoded (EDD-9048)", () =>
+      it.effect("refuses an operand that cannot be encoded (EDD-9050)", () =>
         Effect.gen(function* () {
           const ClientLayer = makeQueryCapturingClient([])
           const TableLayer = SkTable.layer({ name: "sk-table" })
@@ -1539,12 +1539,12 @@ describe("DynamoClient", () => {
               (db.entities.Samples.byBig({ deviceId: "d1" }) as any).where((t: any, ops: any) =>
                 ops.eq(t.big, "not-a-number"),
               ),
-            ).toThrow(/EDD-9048.*big/s)
+            ).toThrow(/EDD-9050.*big/s)
           }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
         }),
       )
 
-      it.effect("refuses an accessor composite that cannot be encoded (EDD-9048)", () =>
+      it.effect("refuses an accessor composite that cannot be encoded (EDD-9050)", () =>
         Effect.gen(function* () {
           const ClientLayer = makeQueryCapturingClient([])
           const TableLayer = SkTable.layer({ name: "sk-table" })
@@ -1555,7 +1555,7 @@ describe("DynamoClient", () => {
             })
             expect(() =>
               (db.entities.Samples.byBig as any)({ deviceId: "d1", big: "not-a-number" }),
-            ).toThrow(/EDD-9048.*big/s)
+            ).toThrow(/EDD-9050.*big/s)
           }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
         }),
       )

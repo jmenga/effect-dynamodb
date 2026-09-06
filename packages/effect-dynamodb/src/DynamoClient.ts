@@ -975,7 +975,7 @@ const makeFromConfig = (config: {
       const encoderSource = entityLike.schemas.inputSchema ?? entityLike.model
       const encodeComposite = makeCompositeEncoder(encoderSource, (attr, value) => {
         throw new Error(
-          `[EDD-9048] Composite "${attr}" on index "${_indexName}" of entity ` +
+          `[EDD-9050] Composite "${attr}" on index "${_indexName}" of entity ` +
             `"${entityLike.entityType}" could not be encoded to its stored form. The ` +
             `attribute's schema carries an encoding transformation, so the stored key holds ` +
             `the ENCODED value, but ${JSON.stringify(String(value))} encodes under neither ` +

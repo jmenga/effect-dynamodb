@@ -8668,7 +8668,7 @@ describeConnected("transformed sort key composites — encoded/decoded gap", () 
     }).pipe(provideEnc),
   )
 
-  it.effect("an operand that cannot be encoded is refused (EDD-9048)", () =>
+  it.effect("an operand that cannot be encoded is refused (EDD-9050)", () =>
     Effect.gen(function* () {
       const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
       expect(() =>
@@ -8682,7 +8682,7 @@ describeConnected("transformed sort key composites — encoded/decoded gap", () 
             "not-a-number",
           ),
         ),
-      ).toThrow(/EDD-9048/)
+      ).toThrow(/EDD-9050/)
     }).pipe(provideEnc),
   )
 })

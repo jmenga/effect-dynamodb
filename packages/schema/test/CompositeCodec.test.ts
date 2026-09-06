@@ -24,7 +24,7 @@ const Model = Schema.Struct({
 })
 
 const refuse = (attr: string, value: unknown): never => {
-  throw new Error(`[EDD-9048] ${attr} ${String(value)}`)
+  throw new Error(`[EDD-9050] ${attr} ${String(value)}`)
 }
 
 describe("CompositeCodec", () => {
@@ -77,11 +77,11 @@ describe("CompositeCodec", () => {
       expect(serializeValue(encode("utc", dt))).toBe(serializeValue(dt))
     })
 
-    it("refuses a value that encodes under neither route (EDD-9048)", () => {
+    it("refuses a value that encodes under neither route (EDD-9050)", () => {
       // A prefix is not a bigint and does not decode as one, so it cannot be
       // placed in a key at all. Refuse loudly rather than compose a string that
       // silently matches nothing.
-      expect(() => encode("txn", "not-a-number")).toThrow(/EDD-9048.*txn/)
+      expect(() => encode("txn", "not-a-number")).toThrow(/EDD-9050.*txn/)
     })
   })
 
