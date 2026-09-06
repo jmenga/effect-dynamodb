@@ -132,12 +132,18 @@ export const isPath = (value: unknown): value is Path =>
  *   prefix configuration. When the proxy walks into a sparse field at the
  *   first level, the next access is expected to be `.entry(key)`, which
  *   produces a literal `<prefix>#<key>` segment.
+ *
+ * `Keys` is the phantom "path so far" marker carried by every produced `Path`.
+ * It defaults to `[]` (a builder rooted at the model). Consumers that store a
+ * builder for callbacks — `BoundQueryConfig` / `BoundCrudConfig` — declare it
+ * as `never` so any concrete path is assignable at the call site, so they
+ * instantiate this as `createPathBuilder<Model, never>()`.
  */
-export const createPathBuilder = <Model>(
+export const createPathBuilder = <Model, Keys extends ReadonlyArray<string | number> = []>(
   segments: ReadonlyArray<string | number> = [],
   resolveDbName?: (name: string) => string,
   sparseFields?: globalThis.Record<string, { readonly prefix: string }>,
-): PathBuilder<Model, Model> => {
+): PathBuilder<Model, Model, Keys> => {
   const handler: ProxyHandler<object> = {
     get(_target, prop) {
       if (prop === PathTag) return PathTag
@@ -196,7 +202,7 @@ export const createPathBuilder = <Model>(
       return prop === PathTag || prop === "_tag" || prop === "segments"
     },
   }
-  return new Proxy({} as any, handler) as PathBuilder<Model, Model>
+  return new Proxy({} as any, handler) as PathBuilder<Model, Model, Keys>
 }
 
 // ---------------------------------------------------------------------------

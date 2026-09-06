@@ -273,12 +273,21 @@ export interface EventStream<
    * left alone and the write reports success. Dies with `[EDD-9026]` on a
    * stream declared without a `snapshot` config (unreachable via the types —
    * `TState` is `never` there, so no value can be supplied).
+   *
+   * Declared as a **method**, not a function-typed property, on purpose. As a
+   * property it is checked contravariantly in `state`, and a snapshot-less
+   * stream (`TState = never`) is then assignable to no other `EventStream` at
+   * all — which breaks every pipeable/data-last consumer, because TypeScript
+   * erases a generic callback's type parameters to their constraints when it
+   * infers the `pipe` subject. Method syntax makes the parameter bivariant, so
+   * `EventStream<E, F, M, never>` unifies with `EventStream<E, F, M, TState>`
+   * again. Callers are unaffected: supplying a `state` still requires `TState`.
    */
-  readonly writeSnapshot: (
+  writeSnapshot(
     streamId: StreamIdInput<TStreamIdFields>,
     state: TState,
     asOfVersion: number,
-  ) => Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig>
+  ): Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig>
 
   /**
    * Read this stream's snapshot, if one has been written.
@@ -287,46 +296,46 @@ export interface EventStream<
    * with `ValidationError` — it is never silently discarded, because that would
    * hide state-schema evolution bugs.
    */
-  readonly readSnapshot: (
+  readSnapshot(
     streamId: StreamIdInput<TStreamIdFields>,
-  ) => Effect.Effect<
+  ): Effect.Effect<
     Option.Option<Snapshot<TState>>,
     DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
 
-  readonly append: (
+  append(
     streamId: StreamIdInput<TStreamIdFields>,
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
     options?: AppendOptions<TMetadata> | undefined,
-  ) => Effect.Effect<AppendResult<TEvent>, AppendError, DynamoClient | TableConfig>
+  ): Effect.Effect<AppendResult<TEvent>, AppendError, DynamoClient | TableConfig>
 
-  readonly read: (
+  read(
     streamId: StreamIdInput<TStreamIdFields>,
-  ) => Effect.Effect<
+  ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
     DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
 
-  readonly readFrom: (
+  readFrom(
     streamId: StreamIdInput<TStreamIdFields>,
     afterVersion: number,
-  ) => Effect.Effect<
+  ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
     DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
 
-  readonly currentVersion: (
+  currentVersion(
     streamId: StreamIdInput<TStreamIdFields>,
-  ) => Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig>
+  ): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig>
 
   readonly query: {
-    readonly events: (
+    events(
       streamId: StreamIdInput<TStreamIdFields>,
-    ) => Query.Query<StreamEvent<TEvent, StreamMetadata<TMetadata>>>
+    ): Query.Query<StreamEvent<TEvent, StreamMetadata<TMetadata>>>
   }
 }
 
@@ -1116,50 +1125,50 @@ export interface BoundEventStream<
   /** See {@link EventStream.snapshotConfig}. */
   readonly snapshotConfig: SnapshotSettings | undefined
 
-  /** See {@link EventStream.writeSnapshot}. */
-  readonly writeSnapshot: (
+  /** See {@link EventStream.writeSnapshot} — a method for the same variance reason. */
+  writeSnapshot(
     streamId: StreamIdInput<TStreamIdFields>,
     state: TState,
     asOfVersion: number,
-  ) => Effect.Effect<void, DynamoClientError | ValidationError, never>
+  ): Effect.Effect<void, DynamoClientError | ValidationError, never>
 
   /** See {@link EventStream.readSnapshot}. */
-  readonly readSnapshot: (
+  readSnapshot(
     streamId: StreamIdInput<TStreamIdFields>,
-  ) => Effect.Effect<Option.Option<Snapshot<TState>>, DynamoClientError | ValidationError, never>
+  ): Effect.Effect<Option.Option<Snapshot<TState>>, DynamoClientError | ValidationError, never>
 
-  readonly append: (
+  append(
     streamId: StreamIdInput<TStreamIdFields>,
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
     options?: AppendOptions<TMetadata> | undefined,
-  ) => Effect.Effect<AppendResult<TEvent>, AppendError, never>
+  ): Effect.Effect<AppendResult<TEvent>, AppendError, never>
 
-  readonly read: (
+  read(
     streamId: StreamIdInput<TStreamIdFields>,
-  ) => Effect.Effect<
+  ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
     DynamoClientError | ValidationError,
     never
   >
 
-  readonly readFrom: (
+  readFrom(
     streamId: StreamIdInput<TStreamIdFields>,
     afterVersion: number,
-  ) => Effect.Effect<
+  ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
     DynamoClientError | ValidationError,
     never
   >
 
-  readonly currentVersion: (
+  currentVersion(
     streamId: StreamIdInput<TStreamIdFields>,
-  ) => Effect.Effect<number, DynamoClientError | ValidationError, never>
+  ): Effect.Effect<number, DynamoClientError | ValidationError, never>
 
   readonly query: {
-    readonly events: (
+    events(
       streamId: StreamIdInput<TStreamIdFields>,
-    ) => Query.Query<StreamEvent<TEvent, StreamMetadata<TMetadata>>>
+    ): Query.Query<StreamEvent<TEvent, StreamMetadata<TMetadata>>>
   }
 
   /** Escape hatch: provide DynamoClient | TableConfig to an arbitrary effect. */
