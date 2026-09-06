@@ -11,6 +11,7 @@ import { beforeEach, vi } from "vitest"
 
 import * as Batch from "../src/Batch.js"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
+import * as Expression from "../src/Expression.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
@@ -84,6 +85,7 @@ type AttrMap = Record<string, unknown>
 let store: AttrMap[] = []
 let transactWriteCalls: unknown[] = []
 let batchWriteCalls: unknown[] = []
+let transactGetCalls: unknown[] = []
 
 const keyOf = (item: AttrMap) => `${(item.pk as { S: string })?.S}|${(item.sk as { S: string })?.S}`
 
@@ -117,13 +119,31 @@ const mockClient = Layer.succeed(DynamoClient, {
       const found = store.find((s) => keyOf(s) === keyOf(input.Key))
       return { Attributes: found } as never
     }),
-  batchGetItem: () => Effect.die("not used"),
+  batchGetItem: (input: { RequestItems: Record<string, { Keys: AttrMap[] }> }) =>
+    Effect.sync(() => {
+      const responses: Record<string, AttrMap[]> = {}
+      for (const [table, { Keys }] of Object.entries(input.RequestItems)) {
+        responses[table] = Keys.map((k) => store.find((s) => keyOf(s) === keyOf(k))).filter(
+          (i): i is AttrMap => i !== undefined,
+        )
+      }
+      return { Responses: responses } as never
+    }),
   batchWriteItem: (input: unknown) =>
     Effect.sync(() => {
       batchWriteCalls.push(input)
       return {} as never
     }),
-  transactGetItems: () => Effect.die("not used"),
+  transactGetItems: (input: { TransactItems: { Get: { Key: AttrMap } }[] }) =>
+    Effect.sync(() => {
+      transactGetCalls.push(input)
+      return {
+        Responses: input.TransactItems.map((t) => {
+          const found = store.find((s) => keyOf(s) === keyOf(t.Get.Key))
+          return found ? { Item: found } : {}
+        }),
+      } as never
+    }),
   transactWriteItems: (input: unknown) =>
     Effect.sync(() => {
       transactWriteCalls.push(input)
@@ -141,6 +161,7 @@ beforeEach(() => {
   store = []
   transactWriteCalls = []
   batchWriteCalls = []
+  transactGetCalls = []
   vi.clearAllMocks()
 })
 
@@ -307,6 +328,115 @@ describe("pure-authored entities in Batch / Transaction (#100)", () => {
       expect(requests).toHaveLength(2)
       expect(fromAttributeMap(requests[0].PutRequest.Item).__edd_e__).toBe("User")
       expect(requests[1].DeleteRequest).toBeDefined()
+    }).pipe(Effect.provide(layers)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// #108 — the read side of the same gap.
+//
+// `Batch.get`, `Transaction.transactGet` and `Transaction.check` all want an
+// `EntityGet` DESCRIPTOR, and a pure `EntityDefinition` carries no ops at all,
+// so before `BoundGet` a pure-authored entity could not read in a batch, read
+// in a transaction, or assert an invariant on a row it was not writing.
+// ---------------------------------------------------------------------------
+
+describe("pure-authored entities in Batch / Transaction reads (#108)", () => {
+  const ann = { orgId: "o1", userId: "u1", email: "a@x.io", name: "Ann" }
+  const eng = { orgId: "o1", teamId: "t1", label: "Eng" }
+
+  it.effect("Batch.get accepts bound gets across two entities", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { Users, Teams }, tables: { MainTable } })
+      yield* db.entities.Users.put(ann)
+      yield* db.entities.Teams.put(eng)
+
+      const [user, team, missing] = yield* Batch.get([
+        db.entities.Users.get({ orgId: "o1", userId: "u1" }),
+        db.entities.Teams.get({ orgId: "o1", teamId: "t1" }),
+        db.entities.Users.get({ orgId: "o1", userId: "nope" }),
+      ])
+
+      // Per-position types survive the union — `user` is a User, not a Team.
+      expect(user?.name).toBe("Ann")
+      expect(team?.label).toBe("Eng")
+      expect(missing).toBeUndefined()
+    }).pipe(Effect.provide(layers)),
+  )
+
+  it.effect("Transaction.transactGet accepts bound gets", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { Users, Teams }, tables: { MainTable } })
+      yield* db.entities.Users.put(ann)
+      yield* db.entities.Teams.put(eng)
+
+      const [user, team] = yield* Transaction.transactGet([
+        db.entities.Users.get({ orgId: "o1", userId: "u1" }),
+        db.entities.Teams.get({ orgId: "o1", teamId: "t1" }),
+      ])
+      expect(user?.email).toBe("a@x.io")
+      expect(team?.label).toBe("Eng")
+      expect(transactGetCalls).toHaveLength(1)
+    }).pipe(Effect.provide(layers)),
+  )
+
+  it.effect("Transaction.check accepts a bound get — data-first and piped", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { Users, Teams }, tables: { MainTable } })
+
+      // The sharp case: guard a row you are NOT writing.
+      yield* Transaction.transactWrite([
+        db.entities.Teams.put(eng),
+        Transaction.check(
+          db.entities.Users.get({ orgId: "o1", userId: "u1" }),
+          Expression.condition({ attributeExists: "pk" }),
+        ),
+        // BoundGet is an Effect, so `.pipe` is the Effect pipe — the data-last
+        // form of `check` still composes through it.
+        db.entities.Users.get({ orgId: "o1", userId: "u1" }).pipe(
+          Transaction.check(Expression.condition({ attributeExists: "pk" })),
+        ),
+      ])
+
+      const items = (transactWriteCalls[0] as { TransactItems: any[] }).TransactItems
+      expect(items).toHaveLength(3)
+      // Both checks name the same composed key the bound `put`/`get` would.
+      const checks = items.filter((i) => i.ConditionCheck !== undefined)
+      expect(checks).toHaveLength(2)
+      expect(fromAttributeMap(checks[0].ConditionCheck.Key).pk).toBe(
+        "$pure-authoring#v1#user#orgid_o1",
+      )
+      expect(fromAttributeMap(checks[0].ConditionCheck.Key).sk).toBe(
+        "$pure-authoring#v1#user#userid_u1",
+      )
+    }).pipe(Effect.provide(layers)),
+  )
+
+  it.effect("a bound get composes the same key the bound put wrote", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { Users, Teams }, tables: { MainTable } })
+      yield* db.entities.Users.put(ann)
+
+      // The stored row and the descriptor's composed key must agree, or a batch
+      // read silently returns undefined against a row that is right there.
+      const written = keyOf(store[0]!)
+      const [viaBatch] = yield* Batch.get([db.entities.Users.get({ orgId: "o1", userId: "u1" })])
+      expect(written).toBe("$pure-authoring#v1#user#orgid_o1|$pure-authoring#v1#user#userid_u1")
+      expect(viaBatch?.name).toBe("Ann")
+    }).pipe(Effect.provide(layers)),
+  )
+
+  it.effect("a value that is not a get descriptor fails on the error channel", () =>
+    Effect.gen(function* () {
+      // Pre-#108 these were thrown Errors — a defect the caller could neither
+      // catch nor discriminate.
+      const batchErr = yield* Batch.get([Effect.succeed(1) as never]).pipe(Effect.flip)
+      expect(batchErr._tag).toBe("ValidationError")
+      expect(String(batchErr.cause)).toContain("EDD-9052")
+
+      const txErr = yield* Transaction.transactGet([Effect.succeed(1) as never]).pipe(Effect.flip)
+      expect(txErr._tag).toBe("ValidationError")
+      expect(String(txErr.cause)).toContain("EDD-9052")
     }).pipe(Effect.provide(layers)),
   )
 })

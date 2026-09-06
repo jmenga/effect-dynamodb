@@ -185,7 +185,7 @@ const aliceWithMeta = yield* db.entities.Users.get({ userId: "alice-1" })
 
 ### Put and Get with System Fields
 
-`yield*` on a `put` or `get` returns the clean model type. To access system fields like `createdAt`, `updatedAt`, and `version`, pipe through `Entity.asRecord`:
+`yield*` on a `put` or `get` returns the clean model type. `Entity.asRecord` — which exposes system fields like `createdAt`, `updatedAt` and `version` — is a combinator on the **unbound** entity descriptor, so pipe the entity's own `get` through it, not the bound client's:
 
 ```typescript
 // yield* returns User — clean model type
@@ -197,8 +197,8 @@ const alice = yield* db.entities.Users.put({
 })
 // alice.displayName → "Alice"
 
-// Entity.asRecord exposes system fields
-const aliceRecord = yield* db.entities.Users.get({ userId: "alice-1" }).pipe(Entity.asRecord)
+// Entity.asRecord exposes system fields — on the unbound descriptor
+const aliceRecord = yield* Users.get({ userId: "alice-1" }).pipe(Entity.asRecord)
 // aliceRecord.version → 1
 // aliceRecord.createdAt → DateTime.Utc
 ```
@@ -282,7 +282,7 @@ The transaction ensures both operations succeed or both fail. If post-4 can't be
 For debugging, `Entity.asNative` returns the raw DynamoDB marshalled item with all internal attributes visible:
 
 ```typescript
-const rawPost = yield* db.entities.Posts.get({ postId: "post-1" }).pipe(Entity.asNative)
+const rawPost = yield* Posts.get({ postId: "post-1" }).pipe(Entity.asNative)
 // rawPost includes pk, sk, gsi1pk, gsi1sk, __edd_e__, createdAt, updatedAt, ...
 ```
 

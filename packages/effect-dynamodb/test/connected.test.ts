@@ -9847,6 +9847,98 @@ describeConnected("composite key form — mixed-width ordering", () => {
       }).pipe(provideKf),
     )
   })
+
+  // -------------------------------------------------------------------------
+  // #108 — the bound-client read descriptors must compose the SAME key.
+  //
+  // `db.entities.X.get(key)` now returns a `BoundGet` the read paths can
+  // unwrap. `txn` is `Schema.BigIntFromString` — Type `bigint`, Encoded
+  // `string` — precisely the shape whose key form used to diverge between
+  // APIs (#111): the stored SK holds the 38-wide padded spelling, so anything
+  // that composes from the raw value looks up a key that does not exist and
+  // reports "not found" against a row that is right there.
+  // -------------------------------------------------------------------------
+
+  describe("bound-client get descriptors reach the read paths (#108)", () => {
+    it.effect("Batch.get and transactGet accept db.entities.X.get on a transformed key", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+
+        const [a, b, missing] = yield* Batch.get([
+          db.entities.Metrics.get({ boxId: "b1", txn: 42n }),
+          db.entities.Metrics.get({ boxId: "b1", txn: 100n }),
+          db.entities.Metrics.get({ boxId: "b1", txn: 7n }),
+        ])
+        expect(a?.num).toBe(42)
+        expect(b?.num).toBe(100)
+        expect(missing).toBeUndefined()
+
+        const [t1, t2] = yield* Transaction.transactGet([
+          db.entities.Metrics.get({ boxId: "b1", txn: 5n }),
+          db.entities.Metrics.get({ boxId: "b1", txn: 42n }),
+        ])
+        expect(t1?.num).toBe(5)
+        expect(t2?.num).toBe(42)
+
+        // Bound and unbound descriptors for the SAME key must agree exactly —
+        // in separate requests, because BatchGetItem rejects duplicate keys.
+        const [viaBound] = yield* Batch.get([db.entities.Metrics.get({ boxId: "b1", txn: 5n })])
+        const [viaUnbound] = yield* Batch.get([Metrics.get({ boxId: "b1", txn: 5n })])
+        expect(viaBound?.num).toBe(5)
+        expect(viaUnbound?.num).toBe(5)
+
+        // And a mixed request over DISTINCT keys resolves both halves.
+        const [mixedBound, mixedUnbound] = yield* Batch.get([
+          db.entities.Metrics.get({ boxId: "b1", txn: 5n }),
+          Metrics.get({ boxId: "b1", txn: 100n }),
+        ])
+        expect(mixedBound?.num).toBe(5)
+        expect(mixedUnbound?.num).toBe(100)
+      }).pipe(provideKf),
+    )
+
+    it.effect("Transaction.check on a bound get guards the row it names", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+
+        // `attribute_not_exists` against a row that DOES exist must cancel. A
+        // mis-composed key makes this vacuously true and the transaction
+        // commits — the silent failure this whole section exists for.
+        const err = yield* Transaction.transactWrite([
+          Transaction.check(
+            db.entities.Metrics.get({ boxId: "b1", txn: 42n }),
+            Expression.condition({ attributeNotExists: "pk" }),
+          ),
+        ]).pipe(Effect.flip)
+        expect(err._tag).toBe("TransactionCancelled")
+
+        // The inverse condition on the same key commits.
+        yield* Transaction.transactWrite([
+          Transaction.check(
+            db.entities.Metrics.get({ boxId: "b1", txn: 42n }),
+            Expression.condition({ attributeExists: "pk" }),
+          ),
+        ])
+      }).pipe(provideKf),
+    )
+
+    it.effect("get() is still an Effect against real DynamoDB", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+
+        const num = yield* db.entities.Metrics.get({ boxId: "b1", txn: 42n }).pipe(
+          Effect.map((m) => m.num),
+        )
+        expect(num).toBe(42)
+
+        const outcome = yield* db.entities.Metrics.get({ boxId: "b1", txn: 7n }).pipe(
+          Effect.map(() => "found" as const),
+          Effect.catchTag("ItemNotFound", () => Effect.succeed("not found" as const)),
+        )
+        expect(outcome).toBe("not found")
+      }).pipe(provideKf),
+    )
+  })
 })
 
 // NOTE: aggregate coverage for the key-form rule is UNIT-level

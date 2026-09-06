@@ -149,7 +149,64 @@ const [existing, missing] = yield* Batch.get([
 
 ---
 
-## Step 5: Mixed Put + Delete in One Batch
+## Step 5: Bound-Client Get Descriptors
+
+`db.entities.X.get(key)` **is** an `Effect` — `yield*` it, `.pipe(Effect.catchTag("ItemNotFound", …))` it, hand it to `Effect.map` or `Effect.all`, exactly as always. It is *also* a read descriptor, so the same value goes straight into `Batch.get` and `Transaction.transactGet`:
+
+```typescript region="batch-get-bound" example="batch.ts"
+// `db.entities.X.get(key)` IS an Effect — yield it, or pipe it into any
+// Effect combinator, exactly as before.
+const aliceDirect = yield* db.entities.Users.get({ userId: "u-1" })
+const aliceRole = yield* db.entities.Users
+  .get({ userId: "u-1" })
+  .pipe(Effect.map((u) => u.role))
+
+// It is ALSO a read descriptor, so it goes straight into Batch.get and
+// Transaction.transactGet — which is what makes batch and transactional
+// reads reachable for entities authored with the pure, AWS-free
+// `@effect-dynamodb/schema` package (a pure definition carries no operations,
+// so the bound client is the only surface its author holds).
+const [aliceBatched, order1Batched] = yield* Batch.get([
+  db.entities.Users.get({ userId: "u-1" }),
+  db.entities.Orders.get({ orderId: "o-1" }),
+])
+
+const [aliceTx, order1Tx] = yield* Transaction.transactGet([
+  db.entities.Users.get({ userId: "u-1" }),
+  db.entities.Orders.get({ orderId: "o-1" }),
+])
+```
+
+`Transaction.check` takes the same descriptor. A condition check on a row you are **not** writing is the standard way to assert a cross-entity invariant inside one transaction:
+
+```typescript region="transact-check-bound" example="batch.ts"
+// A condition check on a row you are NOT writing — the standard way to
+// assert a cross-entity invariant inside one transaction. `Transaction.check`
+// takes the same bound descriptor.
+yield* Transaction.transactWrite([
+  db.entities.Orders.put({
+    orderId: "o-9",
+    userId: "u-1",
+    product: "Sprocket",
+    quantity: 1,
+    status: "pending",
+  }),
+  Transaction.check(
+    db.entities.Users.get({ userId: "u-1" }),
+    Expression.condition({ attributeExists: "pk" }),
+  ),
+])
+```
+
+:::tip[This is what makes pure-authored entities readable in a batch]
+An entity authored with the pure, AWS-free `@effect-dynamodb/schema` `Entity.make` carries **no** operations — `db.entities.*` is the only surface its author ever holds. Accepting the bound descriptor on the read paths is what puts batch reads, transactional reads and condition checks back within reach for those entities, mirroring what the bound `put` / `delete` builders already do for `Batch.write` and `Transaction.transactWrite`.
+
+Both spellings unwrap through the same protocol, so an array can mix them freely. Anything that is *not* a get descriptor — an already-executed `Effect`, a query, a write op — fails with a `ValidationError` carrying **EDD-9052** rather than a defect you cannot catch.
+:::
+
+---
+
+## Step 6: Mixed Put + Delete in One Batch
 
 `Batch.write` accepts both `Entity.put()` and `Entity.delete()` operations in the same array — as well as the bound builders returned by `db.entities.*`, which is the only write descriptor available for entities authored with the pure `@effect-dynamodb/schema` package:
 
@@ -176,7 +233,7 @@ const [deleted, created] = yield* Batch.get([
 
 ---
 
-## Step 6: Cross-Entity Batch Write
+## Step 7: Cross-Entity Batch Write
 
 Puts and deletes can target different entity types in the same batch. This is useful for operations that need to modify users and orders together:
 

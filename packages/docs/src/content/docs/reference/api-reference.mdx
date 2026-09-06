@@ -269,7 +269,7 @@ UserEntity.get({ userId: "u-1" }).pipe(Effect.map(/* … */))
 UserEntity.get({ userId: "u-1" }).asEffect().pipe(Effect.map(/* … */))
 ```
 
-**The recommended path is to access entities through `DynamoClient.make()`** — the resulting `BoundEntity` (`db.entities.UserEntity`) auto-wraps each operation into a real `Effect<A, E, never>`, so you get straightforward `Effect.map`/`Effect.flatMap`/`pipe` ergonomics without ever calling `.asEffect()`. Reach for raw entity descriptors only when (a) you need an alternate decode mode (`asRecord`/`asItem`/`asNative`) or (b) you are composing the descriptor into a `Transaction` or `Batch`, both of which consume descriptors directly.
+**The recommended path is to access entities through `DynamoClient.make()`** — the resulting `BoundEntity` (`db.entities.UserEntity`) auto-wraps each operation into a real `Effect<A, E, never>`, so you get straightforward `Effect.map`/`Effect.flatMap`/`pipe` ergonomics without ever calling `.asEffect()`. Reach for raw entity descriptors only when you need an alternate decode mode (`asRecord`/`asItem`/`asNative`). Composing into a `Transaction` or `Batch` no longer requires them: the bound write builders (`put`/`create`/`delete`/`deleteIfExists`) and the bound `get` are all accepted directly.
 :::
 
 ### Client Gateway Pattern
@@ -647,18 +647,20 @@ import { Transaction } from "effect-dynamodb"
 
 | Export | Type | Description |
 |--------|------|-------------|
-| `transactGet` | `(items) => Effect<Tuple>` | Atomically get up to 100 items — returns a typed tuple |
+| `transactGet` | `(items) => Effect<Tuple>` | Atomically get up to 100 items — returns a typed tuple. Accepts unbound `Entity.get` intermediates AND the `BoundGet` returned by `db.entities.*.get(...)` |
 | `transactWrite` | `(ops) => Effect<void>` | Atomically write up to 100 items (puts, deletes, condition checks). Accepts unbound `Entity.put`/`Entity.delete` intermediates AND the bound builders returned by `db.entities.*`; conditions attached to either (including `create()`'s implicit `attribute_not_exists`) are compiled into the transact item. `upsert`, `update` and `patch` are rejected with a `ValidationError` — see below |
-| `check` | `(get, condition) => ConditionCheckOp` | Create a condition-check operation for `transactWrite` (dual API) |
+| `check` | `(get, condition) => ConditionCheckOp` | Create a condition-check operation for `transactWrite` (dual API). Takes either get spelling |
 
 ### transactGet
 
 ```typescript
-const [user, order] = yield* Transaction.transactGet(
+const [user, order] = yield* Transaction.transactGet([
   UserEntity.get({ userId: "u-1" }),
-  OrderEntity.get({ orderId: "o-1" }),
-)
+  db.entities.Orders.get({ orderId: "o-1" }),
+])
 ```
+
+`db.entities.X.get(key)` returns a `BoundGet`: it **is** an `Effect<Model, …, never>` (yield it, pipe it, `Effect.catchTag` it) and it is *also* a read descriptor, so the same value works in `transactGet`, `Batch.get` and `check`. That matters most for entities authored with the pure, AWS-free `@effect-dynamodb/schema` package — a pure definition carries no operations, so the bound client is the only surface its author holds. Both spellings unwrap through one protocol and can be mixed in a single array; anything else fails with a `ValidationError` carrying **EDD-9052**.
 
 ### transactWrite
 
@@ -714,17 +716,17 @@ import { Batch } from "effect-dynamodb"
 
 | Export | Type | Description |
 |--------|------|-------------|
-| `get` | `(...gets) => Effect<Tuple>` | Batch-get up to 100 items with typed tuple return |
+| `get` | `(...gets) => Effect<Tuple>` | Batch-get up to 100 items with typed tuple return. Accepts unbound `Entity.get` intermediates AND the `BoundGet` returned by `db.entities.*.get(...)` |
 | `write` | `(...ops) => Effect<void>` | Batch-write any number of items (auto-chunks at 25). Accepts unbound `Entity.put`/`Entity.delete` intermediates AND the bound builders returned by `db.entities.*`; conditional ops and `upsert`/`update`/`patch` are rejected with a `ValidationError` — see below |
 
 ### Usage
 
 ```typescript
-// Batch get — typed positional results
-const [user1, user2] = yield* Batch.get(
+// Batch get — typed positional results; unbound and bound gets may be mixed
+const [user1, user2] = yield* Batch.get([
   UserEntity.get({ userId: "u-1" }),
-  UserEntity.get({ userId: "u-2" }),
-)
+  db.entities.Users.get({ userId: "u-2" }),
+])
 
 // Batch write — mixed puts and deletes
 yield* Batch.write(

@@ -5,12 +5,18 @@
 
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import type { ItemNotFound, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import type { IndexPkInput } from "@effect-dynamodb/schema/internal/EntityTypes.js"
-import { type DateTime, Schema } from "effect"
+import { type DateTime, Effect, Schema } from "effect"
 import { describe, expect, expectTypeOf, it } from "vitest"
+import type * as Batch from "../src/Batch.js"
+import type { DynamoClientError } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
+import * as Expression from "../src/Expression.js"
 import type * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
+import type { ConditionCheckOp } from "../src/Transaction.js"
+import * as Transaction from "../src/Transaction.js"
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -1050,5 +1056,112 @@ describe("Entity types — .condition() error channel", () => {
     // An update piped through `condition` stays an EntityUpdate — the `U`
     // parameter must not be flattened away by the EntityPut-shaped overload.
     expect(Entity.EntityUpdateTypeId in conditionedUpdate).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// `get()` returns a BoundGet — an Effect that is ALSO a read descriptor (#108)
+//
+// The wrapper exists so `Batch.get` / `Transaction.transactGet` /
+// `Transaction.check` can unwrap a descriptor out of the bound client. Every
+// assertion below pins the surface `get` had BEFORE the wrapper existed: if one
+// of them stops compiling, the wrapper became a breaking change.
+// ---------------------------------------------------------------------------
+
+describe("Entity types — bound get() is still an Effect", () => {
+  type UserBound = import("../src/Entity.js").BoundEntity<
+    typeof User,
+    typeof UserEntity.indexes,
+    undefined,
+    { readonly userId: string }
+  >
+  type BoundGetOfUser = ReturnType<UserBound["get"]>
+  type UnboundGetOfUser = ReturnType<typeof UserEntity.get>
+  type GetErrors = ItemNotFound | DynamoClientError | ValidationError
+
+  // `users` is a type-level stand-in and the functions below are never called.
+  // The COMPILE is the assertion: these are the exact call shapes callers
+  // already write today.
+  const users = null as unknown as UserBound
+
+  const effectSurface = () =>
+    Effect.gen(function* () {
+      // 1. `yield*` gives the model, unchanged.
+      const direct: User = yield* users.get({ userId: "u-1" })
+
+      // 2. `.pipe(Effect.catchTag(...))` — the shape the issue names
+      //    explicitly. Tag narrowing must still work, and the handled error
+      //    must leave the channel.
+      const orNull: User | null = yield* users
+        .get({ userId: "u-1" })
+        .pipe(Effect.catchTag("ItemNotFound", () => Effect.succeed(null)))
+
+      // 3. Ordinary Effect combinators take it directly.
+      const name: string = yield* users
+        .get({ userId: "u-1" })
+        .pipe(Effect.map((u) => u.displayName))
+
+      // 4. It composes structurally with other Effects.
+      const both: readonly [User, User] = yield* Effect.all([
+        users.get({ userId: "u-1" }),
+        users.get({ userId: "u-2" }),
+      ])
+
+      return { direct, orNull, name, both }
+    })
+
+  const descriptorSurface = (): readonly [ConditionCheckOp, ConditionCheckOp] => [
+    Transaction.check(
+      users.get({ userId: "u-1" }),
+      Expression.condition({ attributeExists: "pk" }),
+    ),
+    users
+      .get({ userId: "u-1" })
+      .pipe(Transaction.check(Expression.condition({ attributeExists: "pk" }))),
+  ]
+
+  it("get() is assignable to the Effect it used to return", () => {
+    expectTypeOf<BoundGetOfUser>().toExtend<Effect.Effect<User, GetErrors, never>>()
+    // R is still `never` — the bound client resolved every service.
+    expectTypeOf<Effect.Services<BoundGetOfUser>>().toEqualTypeOf<never>()
+    expectTypeOf<Effect.Success<BoundGetOfUser>>().toEqualTypeOf<User>()
+    expectTypeOf<Effect.Error<BoundGetOfUser>>().toEqualTypeOf<GetErrors>()
+  })
+
+  it("yield*, catchTag, Effect.map and Effect.all all still type-check", () => {
+    expectTypeOf<ReturnType<typeof effectSurface>>().toExtend<
+      Effect.Effect<
+        {
+          direct: User
+          orNull: User | null
+          name: string
+          both: readonly [User, User]
+        },
+        GetErrors,
+        never
+      >
+    >()
+  })
+
+  it("Batch.get infers per-position types, mixing bound and unbound gets", () => {
+    type Result = ReturnType<
+      typeof Batch.get<readonly [BoundGetOfUser, BoundGetOfUser, UnboundGetOfUser]>
+    >
+    expectTypeOf<Effect.Success<Result>>().toEqualTypeOf<
+      [User | undefined, User | undefined, User | undefined]
+    >()
+  })
+
+  it("Transaction.transactGet infers per-position types, mixing bound and unbound", () => {
+    type Result = ReturnType<
+      typeof Transaction.transactGet<readonly [BoundGetOfUser, UnboundGetOfUser]>
+    >
+    expectTypeOf<Effect.Success<Result>>().toEqualTypeOf<[User | undefined, User | undefined]>()
+  })
+
+  it("Transaction.check takes a bound get data-first and data-last", () => {
+    expectTypeOf<ReturnType<typeof descriptorSurface>>().toEqualTypeOf<
+      readonly [ConditionCheckOp, ConditionCheckOp]
+    >()
   })
 })

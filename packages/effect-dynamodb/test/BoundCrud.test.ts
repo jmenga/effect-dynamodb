@@ -110,8 +110,132 @@ const buildAttributes = (productId: string) => ({
   version: { N: "1" },
 })
 
+/** A valid Product input, for the tests that only need "some write op". */
+const sampleProduct = {
+  productId: "p-1",
+  name: "Widget",
+  price: 9.99,
+  stock: 10,
+  viewCount: 0,
+  status: "active",
+  tags: [],
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
+})
+
+// ---------------------------------------------------------------------------
+// BoundGet — the one bound op that IS an Effect (#108)
+//
+// The wrapper exists so `Batch.get` / `Transaction.transactGet` /
+// `Transaction.check` can unwrap a read descriptor out of the bound client.
+// Everything below the marker test pins the surface `get` had BEFORE the
+// wrapper existed: if any of these break, the wrapper is a breaking change.
+// ---------------------------------------------------------------------------
+
+describe("BoundGet", () => {
+  it.effect("yield* executes getItem and decodes the model", () =>
+    Effect.gen(function* () {
+      mockGetItem.mockResolvedValueOnce({ Item: buildAttributes("p-1") })
+      const db = yield* DynamoClient.make({
+        entities: { Product: ProductEntity },
+        tables: { MainTable },
+      })
+      const result = yield* db.entities.Product.get({ productId: "p-1" })
+      expect(result.productId).toBe("p-1")
+      expect(mockGetItem).toHaveBeenCalledOnce()
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("is an Effect — Effect.map / Effect.flatMap accept it directly", () =>
+    Effect.gen(function* () {
+      mockGetItem.mockResolvedValueOnce({ Item: buildAttributes("p-1") })
+      const db = yield* DynamoClient.make({
+        entities: { Product: ProductEntity },
+        tables: { MainTable },
+      })
+      const name = yield* db.entities.Product.get({ productId: "p-1" }).pipe(
+        Effect.map((p) => p.name),
+      )
+      expect(name).toBe("X")
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect(".pipe(Effect.catchTag('ItemNotFound', …)) still handles a miss", () =>
+    Effect.gen(function* () {
+      mockGetItem.mockResolvedValueOnce({})
+      const db = yield* DynamoClient.make({
+        entities: { Product: ProductEntity },
+        tables: { MainTable },
+      })
+      const result = yield* db.entities.Product.get({ productId: "nope" }).pipe(
+        Effect.map(() => "found" as const),
+        Effect.catchTag("ItemNotFound", () => Effect.succeed("missing" as const)),
+      )
+      expect(result).toBe("missing")
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("composes inside Effect.all like any other Effect", () =>
+    Effect.gen(function* () {
+      mockGetItem
+        .mockResolvedValueOnce({ Item: buildAttributes("p-1") })
+        .mockResolvedValueOnce({ Item: buildAttributes("p-2") })
+      const db = yield* DynamoClient.make({
+        entities: { Product: ProductEntity },
+        tables: { MainTable },
+      })
+      const [a, b] = yield* Effect.all([
+        db.entities.Product.get({ productId: "p-1" }),
+        db.entities.Product.get({ productId: "p-2" }),
+      ])
+      expect([a.productId, b.productId]).toEqual(["p-1", "p-2"])
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("is lazy — building it issues no request", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Product: ProductEntity },
+        tables: { MainTable },
+      })
+      db.entities.Product.get({ productId: "p-1" })
+      expect(mockGetItem).not.toHaveBeenCalled()
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect(".asEffect() runs the same request", () =>
+    Effect.gen(function* () {
+      mockGetItem.mockResolvedValueOnce({ Item: buildAttributes("p-1") })
+      const db = yield* DynamoClient.make({
+        entities: { Product: ProductEntity },
+        tables: { MainTable },
+      })
+      const result = yield* db.entities.Product.get({ productId: "p-1" }).asEffect()
+      expect(result.productId).toBe("p-1")
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("carries the shared bound-op marker, so extractTransactable unwraps it", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Product: ProductEntity },
+        tables: { MainTable },
+      })
+      const info = Entity.extractTransactable(db.entities.Product.get({ productId: "p-1" }))
+      expect(info?.opType).toBe("get")
+      expect(info?.key).toEqual({ productId: "p-1" })
+      // Same protocol as the write builders — one unwrap, not two.
+      expect(Entity.extractTransactable(db.entities.Product.put(sampleProduct))?.opType).toBe("put")
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it("a plain Effect is still not a get descriptor", () => {
+    // BoundGet IS an Effect, so the marker — not effect-ness — is what the
+    // extraction protocol keys on.
+    expect(Entity.extractTransactable(Effect.succeed(1))).toBeUndefined()
+  })
 })
 
 // ---------------------------------------------------------------------------

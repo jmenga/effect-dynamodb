@@ -53,6 +53,7 @@ import {
   isBoundOp,
   makeBoundAppend,
   makeBoundDelete,
+  makeBoundGet,
   makeBoundPut,
   makeBoundUpdate,
 } from "./internal/BoundCrud.js"
@@ -993,10 +994,29 @@ export interface BoundEntity<
 > {
   // --- CRUD Operations ---
 
-  /** Fetch an item by primary key. Returns an Effect that resolves to the model type. */
+  /**
+   * Fetch an item by primary key.
+   *
+   * Returns a {@link BoundGet}, which **is** an `Effect<Model, …, never>` —
+   * `yield*` it, `.pipe(Effect.catchTag("ItemNotFound", …))` it, hand it to any
+   * Effect combinator, exactly as before. It additionally carries the read
+   * descriptor, so it can be passed straight to `Batch.get`,
+   * `Transaction.transactGet` and `Transaction.check` (#108).
+   *
+   * ```ts
+   * const user = yield* db.entities.Users.get({ userId })
+   * const [a, b] = yield* Batch.get([
+   *   db.entities.Users.get({ userId: "u-1" }),
+   *   db.entities.Users.get({ userId: "u-2" }),
+   * ])
+   * ```
+   */
   readonly get: (
     key: TKey,
-  ) => Effect.Effect<ModelType<TModel>, ItemNotFound | DynamoClientError | ValidationError, never>
+  ) => import("./internal/BoundCrud.js").BoundGet<
+    ModelType<TModel>,
+    ItemNotFound | DynamoClientError | ValidationError
+  >
 
   /**
    * Create or replace an item. Returns a fluent {@link BoundPut} — yield to execute,
@@ -6315,7 +6335,7 @@ export const bind = <
     return {
       // CRUD — fluent bound builders (yieldable, no .run() terminal)
       reembed,
-      get: (key: Key) => provide((entity.get(key) as any)._run("record")),
+      get: (key: Key) => makeBoundGet(entity.get(key) as any, boundCrudConfig),
       put: (input: Input) => makeBoundPut(entity.put(input), boundCrudConfig),
       create: (input: Input) => makeBoundPut(entity.create(input), boundCrudConfig),
       update: (key: Key) => makeBoundUpdate(entity.update(key), boundCrudConfig),
@@ -6495,13 +6515,15 @@ const isEntityDelete = (op: object): op is InternalEntityDelete => EntityDeleteT
  * Extract transactable metadata from an Entity operation intermediate.
  * Returns undefined if the value is not a recognized entity operation.
  *
- * Bound-CRUD builders (`db.entities.X.put(...)`, `.create(...)`,
- * `.delete(...)`, …) are unwrapped to the `EntityOp` / `EntityDelete` they wrap.
+ * Bound ops (`db.entities.X.put(...)`, `.create(...)`, `.delete(...)`,
+ * `.get(...)`, …) are unwrapped to the `EntityOp` / `EntityDelete` they wrap.
  * That unwrapping is what lets entities authored with the pure, AWS-free
  * `@effect-dynamodb/schema` `Entity.make` take part in `Batch.write`,
- * `Transaction.transactWrite`, and `EventStore.append({ additionalItems })` — a
- * pure definition carries no operations, so the bound builder is the only write
- * descriptor its author can ever hold (#100).
+ * `Transaction.transactWrite`, `EventStore.append({ additionalItems })` (#100)
+ * and — through the same one protocol, not a second one — `Batch.get`,
+ * `Transaction.transactGet` and `Transaction.check` (#108). A pure definition
+ * carries no operations, so the bound op is the only descriptor its author can
+ * ever hold.
  */
 export const extractTransactable = (op: unknown): TransactableInfo | undefined => {
   if (op == null || typeof op !== "object") return undefined

@@ -40,6 +40,20 @@ export const generateTimestampPrimitive = (
   }
 }
 
+/**
+ * Message for a read path (`Batch.get`, `Transaction.transactGet`,
+ * `Transaction.check`) handed something that is not a get descriptor.
+ *
+ * Both accepted spellings are named, because the bound one is the ONLY
+ * descriptor an entity authored with the pure `@effect-dynamodb/schema`
+ * `Entity.make` can produce (#108) — a caller who reached here with a pure
+ * definition needs to be pointed at the client, not at `Entity.get`.
+ */
+export const getRejectReason = (operation: string): string =>
+  `[EDD-9052] ${operation} requires a get descriptor — pass \`Entity.get(key)\` or the ` +
+  "bound `db.entities.X.get(key)`. An already-executed Effect, a query, or a write op " +
+  "carries no key to read."
+
 /** Render the configured multi-item features for an error message. */
 const describeFeatures = (features: ReadonlyArray<"unique" | "retain" | "softDelete">): string => {
   const labels = features.map((f) =>

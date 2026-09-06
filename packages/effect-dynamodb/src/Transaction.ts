@@ -15,14 +15,19 @@ import {
   TRANSACT_WRITE_ITEMS_LIMIT,
   TransactionCancelled,
   UniqueConstraintViolation,
-  type ValidationError,
+  ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Function as Fn } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
-import type { EntityGet } from "./Entity.js"
+import type { TransactableInfo } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
 import type { ExpressionResult } from "./Expression.js"
-import { composePrimaryKey, resolveTableNames } from "./internal/TransactableOps.js"
+import type { AnyGet, GetSuccess } from "./internal/BoundCrud.js"
+import {
+  composePrimaryKey,
+  getRejectReason,
+  resolveTableNames,
+} from "./internal/TransactableOps.js"
 import {
   buildTransactWriteItems,
   type ConditionCheckOp,
@@ -42,57 +47,65 @@ import type { TableConfig } from "./Table.js"
 export { ConditionCheckTypeId, type ConditionCheckOp, type TransactWriteOp }
 
 /**
- * Create a conditionCheck operation from an EntityGet intermediate and a condition.
- * The EntityGet is never executed — used purely as a typed key resolver.
+ * Create a conditionCheck operation from a get descriptor and a condition.
+ * The descriptor is never executed — it is used purely as a typed key resolver.
+ *
+ * Accepts the unbound `EntityGet` intermediate or the `BoundGet` returned by
+ * `db.entities.X.get(...)`. The bound form is the only read descriptor an
+ * entity authored with the pure `@effect-dynamodb/schema` `Entity.make` can
+ * produce, and a condition check on a row you are not writing is the standard
+ * way to assert a cross-entity invariant inside one transaction (#108).
  *
  * Works in pipe: `Users.get(key).pipe(Transaction.check(expr))`
- * Or data-first: `Transaction.check(Users.get(key), expr)`
+ * Or data-first: `Transaction.check(db.entities.Users.get(key), expr)`
  */
 export const check: {
-  (condition: ExpressionResult): <A, Rec, E, R>(self: EntityGet<A, Rec, E, R>) => ConditionCheckOp
-  <A, Rec, E, R>(self: EntityGet<A, Rec, E, R>, condition: ExpressionResult): ConditionCheckOp
-} = Fn.dual(
-  2,
-  <A, Rec, E, R>(self: EntityGet<A, Rec, E, R>, condition: ExpressionResult): ConditionCheckOp => {
-    const info = extractTransactable(self)
-    if (!info || info.opType !== "get") {
-      throw new Error("Transaction.check requires an EntityGet intermediate")
-    }
-    return {
-      [ConditionCheckTypeId]: ConditionCheckTypeId,
-      _entity: info.entity,
-      _key: info.key!,
-      _condition: condition,
-    }
-  },
-)
+  (condition: ExpressionResult): (self: AnyGet) => ConditionCheckOp
+  (self: AnyGet, condition: ExpressionResult): ConditionCheckOp
+} = Fn.dual(2, (self: AnyGet, condition: ExpressionResult): ConditionCheckOp => {
+  const info = extractTransactable(self)
+  if (!info || info.opType !== "get") {
+    // Sync API — there is no error channel to fail into, so this stays a throw.
+    throw new Error(getRejectReason("Transaction.check"))
+  }
+  return {
+    [ConditionCheckTypeId]: ConditionCheckTypeId,
+    _entity: info.entity,
+    _key: info.key!,
+    _condition: condition,
+  }
+})
 
 // ---------------------------------------------------------------------------
 // TransactGet — typed tuple return
 // ---------------------------------------------------------------------------
 
 /**
- * Map a tuple of EntityGet operations to a tuple of (A | undefined) results.
- * Each position extracts the model type A from EntityGet<A, ...>.
+ * Map a tuple of get descriptors to a tuple of (A | undefined) results.
+ * Each position extracts the model type A from whichever descriptor it holds.
  */
-type TransactGetResult<T extends ReadonlyArray<EntityGet<any, any, any, any>>> = {
-  -readonly [K in keyof T]: T[K] extends EntityGet<infer A, any, any, any> ? A | undefined : never
+type TransactGetResult<T extends ReadonlyArray<AnyGet>> = {
+  -readonly [K in keyof T]: GetSuccess<T[K]> | undefined
 }
 
 /**
  * Atomically get up to 100 items across entities/tables.
- * Accepts EntityGet intermediates directly. Returns a typed tuple
- * where each position is `ModelType | undefined`.
+ * Returns a typed tuple where each position is `ModelType | undefined`.
+ *
+ * Accepts the unbound `EntityGet` intermediate or the `BoundGet` returned by
+ * `db.entities.X.get(...)` — the latter is the only read descriptor available
+ * for entities authored with the pure `@effect-dynamodb/schema` `Entity.make`
+ * (#108).
  *
  * ```typescript
  * const [user, post] = yield* Transaction.transactGet([
  *   Users.get({ userId: "u-1" }),
- *   Posts.get({ postId: "p-1" }),
+ *   db.entities.Posts.get({ postId: "p-1" }),
  * ])
  * // user: User | undefined, post: Post | undefined
  * ```
  */
-export const transactGet = <const T extends ReadonlyArray<EntityGet<any, any, any, any>>>(
+export const transactGet = <const T extends ReadonlyArray<AnyGet>>(
   items: T,
 ): Effect.Effect<
   TransactGetResult<T>,
@@ -113,14 +126,21 @@ export const transactGet = <const T extends ReadonlyArray<EntityGet<any, any, an
 
     const client = yield* DynamoClient
 
-    // Extract entity info from each EntityGet intermediate
-    const infos = items.map((item) => {
+    // Unwrap each position to its get descriptor. A rejection belongs on the
+    // error channel, not as a defect — the caller can neither catch nor
+    // discriminate a thrown Error.
+    const infos: Array<TransactableInfo> = []
+    for (const item of items) {
       const info = extractTransactable(item)
       if (!info || info.opType !== "get") {
-        throw new Error("transactGet requires EntityGet intermediates")
+        return yield* new ValidationError({
+          entityType: "unknown",
+          operation: "transactGet",
+          cause: getRejectReason("Transaction.transactGet"),
+        })
       }
-      return info
-    })
+      infos.push(info)
+    }
 
     const tableNames = yield* resolveTableNames(infos)
 

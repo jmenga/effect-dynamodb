@@ -1589,7 +1589,11 @@ yield* db.entities.Products.update({ productId: "p-1" })
   .expectedVersion(5)
 ```
 
-**Yieldable, not Effect.** Builders implement `Pipeable.Pipeable` and `[Symbol.iterator]` (via `Utils.SingleShotGen`) — the same contract as the unbound `EntityOp` and `EntityDelete` intermediates. You execute them by `yield*`ing inside `Effect.gen`. For interop with Effect combinators (`Effect.map`, `Effect.flip`, etc.) use `.asEffect()`.
+**Yieldable, not Effect.** The *write* builders implement `Pipeable.Pipeable` and `[Symbol.iterator]` (via `Utils.SingleShotGen`) — the same contract as the unbound `EntityOp` and `EntityDelete` intermediates. You execute them by `yield*`ing inside `Effect.gen`. For interop with Effect combinators (`Effect.map`, `Effect.flip`, etc.) use `.asEffect()`.
+
+**`BoundGet` is the exception, and must remain one.** `db.entities.X.get(key)` has returned a real `Effect` since the client gateway existed, and call sites depend on that: `db.entities.X.get(k).pipe(Effect.catchTag("ItemNotFound", …))`, `Effect.map`, `Effect.all`. So `BoundGet` is built on `Effectable.Prototype` and **is** an `Effect<A, E, never>` — the same mechanism `effect`'s own `Statement` uses for a builder that is also an Effect. It additionally carries the bound-op marker, which is what lets it be handed to `Batch.get`, `Transaction.transactGet` and `Transaction.check` (#108). Downgrading it to merely-yieldable would be a silent, wide breaking change.
+
+**One unwrap protocol, both directions.** A bound op joins the multi-item paths by carrying `BoundOpTypeId` plus `_op`; `Entity.extractTransactable` unwraps it to the underlying `EntityOp` / `EntityDelete`. That is the whole mechanism, for reads and writes alike — there is no second one to add. Because `BoundGet` wraps the entity's own `EntityGet`, the key it composes is by construction identical to the one `db.entities.X.get(key)` composes (both go through `entity._keyForm`; see §7). A value that is not a get descriptor is rejected with a `ValidationError` carrying **EDD-9052** on the error channel.
 
 **Immutable accumulator.** Every chainable call returns a new builder — same semantics as `BoundQuery`.
 
@@ -1597,6 +1601,7 @@ yield* db.entities.Products.update({ productId: "p-1" })
 
 | Builder | Method | Accepts |
 |---|---|---|
+| `BoundGet` | *(no combinators — it is an `Effect`)* | — |
 | `BoundPut` / `BoundCreate` / `BoundUpsert` | `.condition(cond)` | callback `(t, ops) => Expr` or shorthand record |
 | `BoundDelete` | `.condition(cond)` | same as above |
 | `BoundDelete` | `.returnValues(mode)` | `"none"` or `"allOld"` |
@@ -2643,8 +2648,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9049` | `Batch.ts` | `Batch.write` cannot compile a write for those same configs — `BatchWriteItem` has no `ConditionExpression` (the whole basis of a uniqueness sentinel), no `UpdateRequest`, and no atomicity across chunks |
 | `EDD-9050` | `internal/CompositeCodec.ts` | A key composite's value cannot be encoded to its wire form, so it cannot be placed in a key — raised rather than composing a string that silently matches nothing |
 | `EDD-9051` | `Aggregate.ts` | `list({ cursor })` on a **sharded** aggregate (`list.cardinality`) — a fan-out over N partitions has no resumable position, so the cursor is rejected rather than silently ignored |
+| `EDD-9052` | `Batch.ts`, `Transaction.ts` | A read path (`Batch.get`, `Transaction.transactGet`, `Transaction.check`) was handed something that is not a get descriptor — pass `Entity.get(key)` or the bound `db.entities.X.get(key)` |
 
-Next free code: **`EDD-9052`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+Next free code: **`EDD-9053`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 
