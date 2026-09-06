@@ -11178,12 +11178,15 @@ describeConnected("Aggregate.list — filtered pagination, reverse, sharding (#1
       let cursor: string | null = null
       let pages = 0
       do {
-        const page = yield* db.aggregates.AlOrderAggregate.list(
-          { customerId: "c1" },
-          cursor === null
-            ? { filter: { status: "shipped" }, limit: 2 }
-            : { cursor, filter: { status: "shipped" }, limit: 2 },
-        )
+        // Annotated: without it `page` infers through the `cursor` it assigns,
+        // which makes the initialiser self-referential (TS7022).
+        const page: { data: ReadonlyArray<AlOrder>; cursor: string | null } =
+          yield* db.aggregates.AlOrderAggregate.list(
+            { customerId: "c1" },
+            cursor === null
+              ? { filter: { status: "shipped" }, limit: 2 }
+              : { cursor, filter: { status: "shipped" }, limit: 2 },
+          )
         collected.push(...ids(page))
         cursor = page.cursor
         pages++
