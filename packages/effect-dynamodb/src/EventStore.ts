@@ -1035,6 +1035,7 @@ export const makeStream = <
       entityTypes: [entityType],
       decoder: (raw) => decodeStreamEvent(raw),
       resolveTableName: config.table.Tag.useSync((tc: TableConfig) => tc.name),
+      keyFields: ["pk", "sk"],
       // Bound to the event SK range so non-event items in the stream partition
       // (the snapshot) are excluded at the key-condition level. A caller-supplied
       // `Query.where` replaces this — the `__edd_e__` filter still applies.

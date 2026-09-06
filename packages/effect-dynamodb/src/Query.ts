@@ -50,7 +50,10 @@ interface QueryState {
   }>
   readonly exprFilters: ReadonlyArray<Expr>
   readonly entityTypes: ReadonlyArray<string>
+  /** Maximum number of items to RETURN (a contract on results). */
   readonly limitValue: number | undefined
+  /** DynamoDB `Limit` — rows examined per request (a contract on round trips). */
+  readonly pageSizeValue: number | undefined
   readonly maxPagesValue: number | undefined
   readonly scanForward: boolean
   readonly consistentRead: boolean
@@ -62,6 +65,21 @@ interface QueryState {
   readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<unknown, ValidationError>
   /** Optional effect to resolve table name at execution time (for deferred resolution) */
   readonly resolveTableName: Effect.Effect<string, never, any> | undefined
+  /**
+   * Attribute names that make up a resume key for this query — the queried
+   * index key plus the table key. Used to rebuild an accurate cursor when a
+   * request over-reads and the surplus is discarded (see {@link limit}).
+   */
+  readonly keyFields: ReadonlyArray<string> | undefined
+}
+
+/** @internal Dedupe + drop absent entries from a caller-supplied key field list. */
+const normalizeKeyFields = (
+  fields: ReadonlyArray<string | undefined> | undefined,
+): ReadonlyArray<string> | undefined => {
+  if (!fields) return undefined
+  const out = [...new Set(fields.filter((f): f is string => typeof f === "string" && f !== ""))]
+  return out.length > 0 ? out : undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +135,8 @@ export const make = <A>(config: {
   readonly entityTypes: ReadonlyArray<string>
   readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<A, ValidationError>
   readonly resolveTableName?: Effect.Effect<string, never, any> | undefined
+  /** Index key + table key attribute names (used to rebuild cursors). */
+  readonly keyFields?: ReadonlyArray<string | undefined> | undefined
 }): Query<A> =>
   new QueryImpl<A>({
     tableName: config.tableName,
@@ -128,6 +148,7 @@ export const make = <A>(config: {
     exprFilters: [],
     entityTypes: config.entityTypes,
     limitValue: undefined,
+    pageSizeValue: undefined,
     maxPagesValue: undefined,
     scanForward: true,
     consistentRead: false,
@@ -140,6 +161,7 @@ export const make = <A>(config: {
       raw: Record<string, unknown>,
     ) => Effect.Effect<unknown, ValidationError>,
     resolveTableName: config.resolveTableName,
+    keyFields: normalizeKeyFields(config.keyFields),
   })
 
 /**
@@ -153,6 +175,8 @@ export const makeScan = <A>(config: {
   readonly entityTypes: ReadonlyArray<string>
   readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<A, ValidationError>
   readonly resolveTableName?: Effect.Effect<string, never, any> | undefined
+  /** Index key + table key attribute names (used to rebuild cursors). */
+  readonly keyFields?: ReadonlyArray<string | undefined> | undefined
 }): Query<A> =>
   new QueryImpl<A>({
     tableName: config.tableName,
@@ -164,6 +188,7 @@ export const makeScan = <A>(config: {
     exprFilters: [],
     entityTypes: config.entityTypes,
     limitValue: undefined,
+    pageSizeValue: undefined,
     maxPagesValue: undefined,
     scanForward: true,
     consistentRead: false,
@@ -176,6 +201,7 @@ export const makeScan = <A>(config: {
       raw: Record<string, unknown>,
     ) => Effect.Effect<unknown, ValidationError>,
     resolveTableName: config.resolveTableName,
+    keyFields: normalizeKeyFields(config.keyFields),
   })
 
 // ---------------------------------------------------------------------------
@@ -207,7 +233,18 @@ export const where: {
 })
 
 /**
- * Set the maximum number of items per DynamoDB page.
+ * Return **at most `n` items** — a contract on results, not on round trips.
+ *
+ * The query accumulates across as many DynamoDB requests as it takes to reach
+ * `n` accepted items (or to exhaust the key range). Under a `FilterExpression`
+ * DynamoDB's own `Limit` bounds rows *examined* before the filter runs, so it
+ * cannot express this — {@link pageSize} is the knob that sets `Limit`, and
+ * {@link maxPages} stays the hard stop on the number of requests.
+ *
+ * ```ts
+ * query.pipe(Query.limit(3), Query.collect)               // 3 items
+ * query.pipe(Query.pageSize(50), Query.limit(120), Query.collect) // 120 items, requests of ≤50
+ * ```
  */
 export const limit: {
   (n: number): <A>(self: Query<A>) => Query<A>
@@ -218,6 +255,24 @@ export const limit: {
     new QueryImpl<A>({
       ...self._state,
       limitValue: n,
+    }),
+)
+
+/**
+ * Fetch in batches of `n` — sets DynamoDB's `Limit` (rows examined per request).
+ * A contract on round trips, not on what comes back: a request under a
+ * `FilterExpression` may return fewer than `n` items, and pagination continues
+ * until the key range is exhausted (or {@link limit} / {@link maxPages} stops it).
+ */
+export const pageSize: {
+  (n: number): <A>(self: Query<A>) => Query<A>
+  <A>(self: Query<A>, n: number): Query<A>
+} = Function.dual(
+  2,
+  <A>(self: Query<A>, n: number): Query<A> =>
+    new QueryImpl<A>({
+      ...self._state,
+      pageSizeValue: n,
     }),
 )
 
@@ -385,17 +440,24 @@ const buildFilterClauses = (state: QueryState) => {
 // Internal: build projection expression from state
 // ---------------------------------------------------------------------------
 
-const buildProjection = (state: QueryState, names: Record<string, string>): string | undefined => {
+const buildProjection = (
+  state: QueryState,
+  names: Record<string, string>,
+  extraFields: ReadonlyArray<string> = [],
+): string | undefined => {
   if (state.projectionPaths && state.projectionPaths.length > 0) {
     const counter = { value: 0 }
     const projParts: Array<string> = []
     for (const segments of state.projectionPaths) {
       projParts.push(compilePath(segments, names, "proj", counter))
     }
+    for (const field of extraFields) {
+      projParts.push(compilePath([field], names, "proj", counter))
+    }
     return projParts.join(", ")
   }
   if (state.projection && state.projection.length > 0) {
-    const proj = Projection.projection(state.projection)
+    const proj = Projection.projection([...state.projection, ...extraFields])
     Object.assign(names, proj.names)
     return proj.expression
   }
@@ -415,7 +477,10 @@ interface DynamoCommandInput {
   readonly ConsistentRead?: boolean | undefined
 }
 
-const buildCommandInput = (state: QueryState): DynamoCommandInput => {
+const buildCommandInput = (
+  state: QueryState,
+  extraProjectionFields: ReadonlyArray<string> = [],
+): DynamoCommandInput => {
   const fc = buildFilterClauses(state)
   const names = { ...fc.names }
   const values = { ...fc.values }
@@ -457,7 +522,7 @@ const buildCommandInput = (state: QueryState): DynamoCommandInput => {
     }
   }
 
-  const projectionExpression = buildProjection(state, names)
+  const projectionExpression = buildProjection(state, names, extraProjectionFields)
 
   return {
     KeyConditionExpression: keyCondition,
@@ -471,13 +536,17 @@ const buildCommandInput = (state: QueryState): DynamoCommandInput => {
 
 /**
  * @internal Build the full DynamoDB command parameters from state and table name.
+ *
+ * `Limit` is NOT derived from state here — it is per-request (it shrinks as a
+ * `limit` budget is consumed) and is always supplied through `overrides`.
  */
 const buildDynamoCommand = (
   state: QueryState,
   tableName: string,
   overrides?: Record<string, unknown>,
+  extraProjectionFields: ReadonlyArray<string> = [],
 ) => {
-  const input = buildCommandInput(state)
+  const input = buildCommandInput(state, extraProjectionFields)
   return {
     TableName: tableName,
     IndexName: state.indexName,
@@ -487,10 +556,81 @@ const buildDynamoCommand = (
     ExpressionAttributeNames: input.ExpressionAttributeNames,
     ExpressionAttributeValues: input.ExpressionAttributeValues,
     ConsistentRead: input.ConsistentRead,
-    Limit: state.limitValue,
+    Limit: computeRequestLimit(state, state.limitValue),
     ScanIndexForward: state.isScan ? undefined : state.scanForward,
     ...overrides,
   }
+}
+
+// ---------------------------------------------------------------------------
+// Internal: limit / pageSize execution helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * @internal DynamoDB `Limit` for the next request.
+ *
+ * - `pageSize` always wins as the round-trip budget when it is set.
+ * - With a `limit` budget and NO user filter, every examined row is an accepted
+ *   row, so the budget can be handed to DynamoDB directly (bounded by pageSize).
+ *   The `__edd_e__` ownership filter is not counted here: it only ever rejects
+ *   foreign items, which the accumulate loop handles by fetching another page.
+ * - With a user filter, `limit` cannot be expressed as `Limit` at all (it bounds
+ *   rows examined, and the filter runs after), so the request asks for
+ *   `pageSize` — or, unset, a natural (1 MB) page.
+ */
+const computeRequestLimit = (
+  state: QueryState,
+  remaining: number | undefined,
+): number | undefined => {
+  const pageSize = state.pageSizeValue
+  if (remaining === undefined) return pageSize
+  if (state.exprFilters.length > 0) return pageSize
+  return pageSize === undefined ? remaining : Math.min(pageSize, remaining)
+}
+
+/**
+ * @internal Attribute names that form a resume key for this response.
+ * The `LastEvaluatedKey`, when present, is authoritative about the key shape.
+ */
+const resumeKeyNames = (
+  state: QueryState,
+  lastEvaluatedKey: Record<string, AttributeValue> | undefined,
+): ReadonlyArray<string> | undefined =>
+  lastEvaluatedKey != null ? Object.keys(lastEvaluatedKey) : state.keyFields
+
+/**
+ * @internal Rebuild a cursor from the last item actually returned, so the next
+ * page resumes after what the caller saw rather than after the last row the
+ * request examined. Returns `undefined` when the item does not carry the whole
+ * key (e.g. a projection dropped it) — the caller then falls back.
+ */
+const cursorFromItem = (
+  item: Record<string, AttributeValue>,
+  names: ReadonlyArray<string> | undefined,
+): string | undefined => {
+  if (!names || names.length === 0) return undefined
+  const key: Record<string, AttributeValue> = {}
+  for (const name of names) {
+    const value = item[name]
+    if (value === undefined) return undefined
+    key[name] = value
+  }
+  return encodeCursor(key)
+}
+
+/**
+ * @internal Key attributes to add to an active ProjectionExpression so an
+ * over-reading request can still rebuild an accurate cursor. They are stripped
+ * from the items handed back, so the caller sees exactly what it selected.
+ */
+const cursorProjectionFields = (state: QueryState): ReadonlyArray<string> => {
+  if (state.limitValue === undefined || !state.keyFields) return []
+  const projected = new Set<string>([
+    ...(state.projection ?? []),
+    ...(state.projectionPaths ?? []).map((segments) => String(segments[0])),
+  ])
+  if (projected.size === 0) return []
+  return state.keyFields.filter((field) => !projected.has(field))
 }
 
 // ---------------------------------------------------------------------------
@@ -511,7 +651,9 @@ export interface Page<A> {
 // ---------------------------------------------------------------------------
 
 /**
- * Execute the query and collect all pages into a single array.
+ * Execute the query and collect the results into a single array.
+ * Stops at {@link limit} items when one is set, otherwise reads to the end of
+ * the key range (or {@link maxPages} requests).
  */
 export const collect = <A>(
   self: Query<A>,
@@ -523,8 +665,15 @@ export const collect = <A>(
   })
 
 /**
- * Execute a single DynamoDB page and return a {@link Page} with an opaque cursor.
- * Combine with {@link startFrom} to iterate through pages:
+ * Execute one page and return a {@link Page} with an opaque cursor.
+ *
+ * Without {@link limit}, a page is one DynamoDB request (of {@link pageSize}
+ * rows, when set). With `limit(n)`, a page is `n` items: the request loop
+ * accumulates until `n` items are accepted, the key range is exhausted, or
+ * {@link maxPages} requests have been made.
+ *
+ * The cursor resumes after the last item actually returned — a `null` cursor
+ * means genuinely exhausted. Combine with {@link startFrom} to iterate:
  *
  * ```ts
  * const first = yield* query.pipe(Query.limit(25), Query.execute)
@@ -540,28 +689,71 @@ export const execute = <A>(
     const client = yield* DynamoClient
     const state = self._state
     const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName
+    const limitValue = state.limitValue
 
-    const cmd = buildDynamoCommand(state, tableName, {
-      ExclusiveStartKey: state.exclusiveStartKey,
-    })
-    const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
+    if (limitValue !== undefined && limitValue <= 0) {
+      return { items: [], cursor: null } as Page<A>
+    }
 
-    const rawItems = (result.Items ?? []).map((item) => fromAttributeMap(item))
-    const items = yield* Effect.forEach(
-      rawItems,
-      (raw) => state.decoder(raw) as Effect.Effect<A, ValidationError>,
-    )
+    // Key attributes borrowed into an active projection so an over-reading
+    // request can still rebuild a cursor. Stripped again before decoding.
+    const borrowedFields = cursorProjectionFields(state)
 
-    const cursor =
-      result.LastEvaluatedKey != null
-        ? encodeCursor(result.LastEvaluatedKey as Record<string, AttributeValue>)
-        : null
+    const items: Array<A> = []
+    let startKey = state.exclusiveStartKey
+    let pageCount = 0
+    let cursor: string | null = null
+
+    while (true) {
+      pageCount++
+      const remaining = limitValue === undefined ? undefined : limitValue - items.length
+      const cmd = buildDynamoCommand(
+        state,
+        tableName,
+        { ExclusiveStartKey: startKey, Limit: computeRequestLimit(state, remaining) },
+        borrowedFields,
+      )
+      const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
+
+      const returned = (result.Items ?? []) as Array<Record<string, AttributeValue>>
+      const lastEvaluatedKey = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined
+      const take = remaining === undefined ? returned.length : Math.min(remaining, returned.length)
+
+      for (let i = 0; i < take; i++) {
+        const raw = fromAttributeMap(returned[i]!)
+        for (const field of borrowedFields) delete raw[field]
+        items.push(yield* state.decoder(raw) as Effect.Effect<A, ValidationError>)
+      }
+
+      // Over-read: the surplus was discarded, so the cursor has to be rebuilt
+      // from the last item handed back rather than from LastEvaluatedKey.
+      if (take < returned.length) {
+        cursor =
+          cursorFromItem(returned[take - 1]!, resumeKeyNames(state, lastEvaluatedKey)) ??
+          (lastEvaluatedKey != null ? encodeCursor(lastEvaluatedKey) : null)
+        break
+      }
+
+      const exhausted = lastEvaluatedKey == null
+      const limitReached = limitValue !== undefined && items.length >= limitValue
+      const maxPagesReached = state.maxPagesValue != null && pageCount >= state.maxPagesValue
+
+      if (limitValue === undefined || exhausted || limitReached || maxPagesReached) {
+        cursor = lastEvaluatedKey != null ? encodeCursor(lastEvaluatedKey) : null
+        break
+      }
+
+      startKey = lastEvaluatedKey
+    }
 
     return { items, cursor } as Page<A>
   })
 
 /**
  * Execute the query and return a Stream of page arrays.
+ * A page is one DynamoDB request (of {@link pageSize} rows, when set); the
+ * stream ends once {@link limit} items have been emitted in total, the key
+ * range is exhausted, or {@link maxPages} requests have been made.
  */
 export const paginate = <A>(
   self: Query<A>,
@@ -583,42 +775,79 @@ const paginateInternal = <A>(
     const state = self._state
     const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName
 
-    let pageCount = 0
+    const limitValue = state.limitValue
+    if (limitValue !== undefined && limitValue <= 0) {
+      return Stream.empty as Stream.Stream<Array<A>, DynamoClientError | ValidationError>
+    }
+
+    // Cursor state travels through Stream.paginate rather than a closure, so
+    // re-running the returned stream restarts from the beginning.
+    interface PageState {
+      readonly key: Record<string, AttributeValue> | undefined
+      readonly pageCount: number
+      readonly emitted: number
+    }
+
     return Stream.paginate(
-      state.exclusiveStartKey as Record<string, AttributeValue> | undefined,
-      (exclusiveStartKey: Record<string, AttributeValue> | undefined) =>
+      {
+        key: state.exclusiveStartKey as Record<string, AttributeValue> | undefined,
+        pageCount: 0,
+        emitted: 0,
+      } as PageState,
+      (pageState: PageState) =>
         Effect.gen(function* () {
-          pageCount++
-          const cmd = buildDynamoCommand(state, tableName, { ExclusiveStartKey: exclusiveStartKey })
+          const pageCount = pageState.pageCount + 1
+          const remaining = limitValue === undefined ? undefined : limitValue - pageState.emitted
+          const cmd = buildDynamoCommand(state, tableName, {
+            ExclusiveStartKey: pageState.key,
+            Limit: computeRequestLimit(state, remaining),
+          })
           const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
 
-          const rawItems = (result.Items ?? []).map((item) => fromAttributeMap(item))
+          const returned = (result.Items ?? []) as Array<Record<string, AttributeValue>>
+          const take =
+            remaining === undefined ? returned.length : Math.min(remaining, returned.length)
           const decoded = yield* Effect.forEach(
-            rawItems,
+            returned.slice(0, take).map((item) => fromAttributeMap(item)),
             (raw) => state.decoder(raw) as Effect.Effect<A, ValidationError>,
           )
 
-          // Stop pagination if maxPages reached or no more pages
+          const emitted = pageState.emitted + decoded.length
           const hasMorePages = result.LastEvaluatedKey != null
           const maxPagesReached = state.maxPagesValue != null && pageCount >= state.maxPagesValue
+          const limitReached = limitValue !== undefined && emitted >= limitValue
 
-          const nextKey =
-            hasMorePages && !maxPagesReached ? Option.some(result.LastEvaluatedKey!) : Option.none()
+          const nextState =
+            hasMorePages && !maxPagesReached && !limitReached
+              ? Option.some({
+                  key: result.LastEvaluatedKey as Record<string, AttributeValue>,
+                  pageCount,
+                  emitted,
+                } as PageState)
+              : Option.none()
 
-          return [[decoded], nextKey] as const
+          return [[decoded], nextState] as const
         }),
     )
   })
 
 /**
  * Execute a count query. Uses `Select: "COUNT"` on DynamoDB — no items are returned.
- * Returns the total count across all pages (respects maxPages).
+ * Returns the total count across all requests (respects {@link maxPages}).
+ *
+ * {@link limit} caps the count, keeping `count()` equal to `collect().length`
+ * for the same query: `.limit(n).count()` returns `min(matching, n)` and stops
+ * counting once `n` is reached — which makes `.limit(1).count()` a cheap
+ * existence check. {@link pageSize} sets the rows examined per request.
  */
 export const count = <A>(self: Query<A>): Effect.Effect<number, DynamoClientError, DynamoClient> =>
   Effect.gen(function* () {
     const client = yield* DynamoClient
     const state = self._state
     const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName
+    const limitValue = state.limitValue
+
+    if (limitValue !== undefined && limitValue <= 0) return 0
 
     let total = 0
     let pageCount = 0
@@ -626,15 +855,18 @@ export const count = <A>(self: Query<A>): Effect.Effect<number, DynamoClientErro
 
     do {
       pageCount++
+      const remaining = limitValue === undefined ? undefined : limitValue - total
       const cmd = buildDynamoCommand(state, tableName, {
         ExclusiveStartKey: exclusiveStartKey,
         Select: "COUNT",
+        Limit: computeRequestLimit(state, remaining),
       })
       const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
 
       total += result.Count ?? 0
       exclusiveStartKey = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined
 
+      if (limitValue !== undefined && total >= limitValue) return limitValue
       if (state.maxPagesValue != null && pageCount >= state.maxPagesValue) break
     } while (exclusiveStartKey != null)
 

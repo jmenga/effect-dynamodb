@@ -6,10 +6,11 @@
 
 Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, composite key composition from entity attributes, type-safe index-aware queries with Stream-based pagination, and DynamoClient as an Effect Service with Layer-based dependency injection.
 
-**Status:** All modules implemented. 1327 core tests, 307 schema tests, 56 geo tests, 272 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
+**Status:** All modules implemented. 1367 core tests, 307 schema tests, 56 geo tests, 281 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
 **Status:** All modules implemented. 1300 core tests, 307 schema tests, 56 geo tests, 247 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
 **Status:** All modules implemented. 1300 core tests, 307 schema tests, 56 geo tests, 252 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
 **Status:** All modules implemented. 1302 core tests, 307 schema tests, 56 geo tests, 257 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
+**Status:** All modules implemented. 1135 core tests, 281 schema tests, 56 geo tests, 193 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
 **Design:** `DESIGN.md` — API specification (source of truth for implementation)
 
 ## Architecture
@@ -347,6 +348,7 @@ Before committing:
 6. `npx tsx examples/<name>.ts` — examples run against DynamoDB Local (`docker run -p 8000:8000 amazon/dynamodb-local`). Run after changes to Entity, Query, Table, DynamoSchema, KeyComposer, Collection, Transaction, or Errors. **Note: running an example successfully is NOT a substitute for gate 4** — examples exercise one or two scenarios; the connected suite covers the cross-product of behaviors. An agent that runs examples and skips `test:connected` has not satisfied this gate.
 7. New modules must have corresponding test files in `test/`
 8. New errors must use `Data.TaggedError`
+8a. New `EDD-xxxx` diagnostic codes must be **allocated in `DESIGN.md` § Diagnostic Code Registry first**, then used in code — never allocated by grepping the source for the highest number. A grep cannot see branches in flight: two parallel branches both took `EDD-9046` for unrelated errors and the collision surfaced only at review. Codes are permanent once released; retire one rather than reusing it.
 9. New services must follow `Context.Service` pattern
 10. New or updated doc pages must have a backing example file with region markers
 
@@ -423,6 +425,20 @@ Chore: <one-line summary>. No version change.
 
 The gate is scoped to `main` so a **stacked release train** can work: several PRs chained onto a `release/**` integration branch, each carrying its own unconsumed changeset, with a single `pnpm changeset version` at the tip producing one version and one CHANGELOG entry for the whole batch. The guarantee is unchanged — nothing reaches `main` with a changeset left unconsumed. CI itself has no `branches` filter and runs on every PR whatever its base, because a stack chains onto `docs/**` / `fix/**` / `feat/**` branches rather than onto `release/**` directly, and a base-branch allowlist would silently leave the intermediate PRs with no CI at all.
 
+### Release ordering
+
+`release.yml` fires on **every** push to `main` and publishes whenever a `package.json`
+version differs from npm. That makes the version-bumping PR order-sensitive: merge it
+while other release work is still open and you publish a release missing those PRs — and
+every later merge then publishes **nothing**, because the version already matches npm.
+The batch sits unpublished until someone hand-cuts the next version.
+
+**The version bump merges last.** `ci.yml`'s "Version bump must merge last" gate enforces
+it: a PR that bumps a publishable package version fails if any other open PR into `main`
+carries a changeset file or touches publishable `src/`. Empty chore changesets count —
+in a batched release they are exactly how the queued PRs are marked. Override with the
+`release-order-override` label when the ordering is deliberate.
+
 ### Trusted Publishing setup
 
 Each of the four publishable packages must be configured on npmjs.com with this repo + `release.yml` as a trusted publisher. No `NPM_TOKEN` is required. The workflow uses `npm publish --provenance --access public` to emit a signed provenance attestation on each publish — verifiable by consumers. **`@effect-dynamodb/schema` is new and must be registered as a Trusted Publisher on npmjs.com before its first release** (this cannot be automated from the repo).
@@ -431,7 +447,7 @@ Each of the four publishable packages must be configured on npmjs.com with this 
 
 ### Entity Operations
 - **BoundEntity CRUD methods return fluent builders.** `db.entities.Users.put(input)` → `BoundPut`; `db.entities.Users.update(key)` → `BoundUpdate`; `db.entities.Users.delete(key)` → `BoundDelete`. All are Yieldable (yield* to execute) and Pipeable (chain methods). Every combinator is a method: `update(key).set({...}).expectedVersion(3).condition({...})`, `put(input).condition({...})`, `delete(key).condition({...}).returnValues("ALL_OLD")`. Use `.asEffect()` to convert to `Effect` when piping to Effect combinators (`Effect.catchTag`, `Effect.map`, etc.). Queries use the same fluent-builder shape via `BoundQuery`.
-- **BoundQuery is a fluent builder.** `db.entities.Tasks.byProject({ project: "alpha" }).filter(...).limit(10).collect()`. Terminals: `.collect()` → `Effect<Array<A>>`, `.fetch()` → `Effect<Page<A>>` (single page + cursor), `.paginate()` → `Stream<A>`, `.count()` → `Effect<number>`. Combinators: `.where()` (SK condition), `.filter()`, `.select()`, `.limit()`, `.maxPages()`, `.reverse()`, `.startFrom()`, `.consistentRead()`, `.ignoreOwnership()`.
+- **BoundQuery is a fluent builder.** `db.entities.Tasks.byProject({ project: "alpha" }).filter(...).limit(10).collect()`. Terminals: `.collect()` → `Effect<Array<A>>`, `.fetch()` → `Effect<Page<A>>` (single page + cursor), `.paginate()` → `Stream<A>`, `.count()` → `Effect<number>`. Combinators: `.where()` (SK condition), `.filter()`, `.select()`, `.limit()`, `.pageSize()`, `.maxPages()`, `.reverse()`, `.startFrom()`, `.consistentRead()`, `.ignoreOwnership()`. `.limit(n)` bounds the RESULT (at most n items, accumulating across requests — it is not DynamoDB's `Limit`, which cannot express this under a `FilterExpression`); `.pageSize(n)` sets DynamoDB's `Limit` (rows examined per request); `.maxPages(n)` is the hard stop on round trips. Once a request over-reads and the surplus is discarded, `.fetch()`'s cursor is rebuilt from the last item returned, so it resumes after what the caller saw.
 - **Query accessors from entity indexes.** Each GSI index on an entity becomes a query accessor: `db.entities.Tasks.byProject({...})` returns a `BoundQuery`. PK composites required, SK composites optional (narrows via auto `begins_with`). `.where()` provides type-safe access to remaining SK composites not already provided.
 - **Collection accessors auto-discovered.** Entities sharing the same `collection` name on the same GSI are grouped: `db.collections.assignments({ employee: "dfinlay" }).collect()` → `Effect<{ Employees: Employee[], Tasks: Task[] }>`. Collection queries support the same BoundQuery combinators (`.filter()`, `.limit()`, etc.) but `.where()` is not available.
 - **put/get/query return model type from BoundEntity.** Entity definitions return intermediates (`EntityOp`, `EntityDelete`) with `asRecord`/`asNative` terminals for advanced decode modes.

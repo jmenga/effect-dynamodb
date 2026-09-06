@@ -589,8 +589,10 @@ export interface CollectionQuery<TResult> {
     ): CollectionQuery<TResult>
     (shorthand: import("./internal/Expr.js").ConditionShorthand): CollectionQuery<TResult>
   }
-  /** Set the maximum number of items per DynamoDB page. */
+  /** Return at most `n` items (a contract on results, not on round trips). */
   readonly limit: (n: number) => CollectionQuery<TResult>
+  /** Fetch in batches of `n` rows — sets DynamoDB's `Limit`. */
+  readonly pageSize: (n: number) => CollectionQuery<TResult>
   /** Reverse sort order. */
   readonly reverse: () => CollectionQuery<TResult>
   /** Resume from cursor. */
@@ -1062,6 +1064,12 @@ const makeFromConfig = (config: {
           entityTypes: [entityLike.entityType],
           decoder: (raw) => entityLike._decodeRecord(raw),
           resolveTableName: entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
+          keyFields: [
+            indexDef.pk.field,
+            indexDef.sk.field,
+            entityLike.indexes.primary?.pk.field,
+            entityLike.indexes.primary?.sk.field,
+          ],
         })
 
         // Apply SK prefix from provided compositesKeyForm.
@@ -1365,6 +1373,7 @@ const makeFromConfig = (config: {
           entityTypes: [entityLike.entityType],
           decoder: (raw) => entityLike._decodeRecord(raw),
           resolveTableName: entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
+          keyFields: [entityLike.indexes.primary?.pk.field, entityLike.indexes.primary?.sk.field],
         })
         const pathBuilder = createPathBuilder()
         const conditionOps = createConditionOps()
@@ -1446,6 +1455,12 @@ const makeFromConfig = (config: {
           entityTypes,
           decoder: collDecoder as any,
           resolveTableName: firstMember.entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
+          keyFields: [
+            indexDef.pk.field,
+            indexDef.sk.field,
+            firstMember.entityLike.indexes.primary?.pk.field,
+            firstMember.entityLike.indexes.primary?.sk.field,
+          ],
         })
 
         // Add begins_with on collection SK prefix for clustered collections.

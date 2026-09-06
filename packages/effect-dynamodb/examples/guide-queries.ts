@@ -293,11 +293,33 @@ const program = Effect.gen(function* () {
   // #endregion
   yield* Console.log(`Collect all: ${allProjectTasks.length} tasks in proj-alpha`)
 
+  // #region limit-vs-pagesize
+  // `limit` bounds the RESULT — at most 3 tasks come back
+  const firstThree = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+    .limit(3)
+    .collect()
+
+  // `pageSize` bounds each ROUND TRIP — every match comes back, fetched in
+  // requests of 2
+  const inBatches = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+    .pageSize(2)
+    .collect()
+
+  // Both compose — requests of 2, accumulating until 5 items
+  const batchedAndCapped = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+    .pageSize(2)
+    .limit(5)
+    .collect()
+  // #endregion
+  yield* Console.log(`limit(3): ${firstThree.length} tasks`)
+  yield* Console.log(`pageSize(2): ${inBatches.length} tasks`)
+  yield* Console.log(`pageSize(2).limit(5): ${batchedAndCapped.length} tasks`)
+
   // #region single-page
   // Single page with limit — returns page with items and cursor
   const page = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" }).limit(3).fetch()
   // page.items: Task[] (up to 3 items)
-  // page.cursor: string | null (pass to startFrom for next page)
+  // page.cursor: string | null — resumes after the 3rd item, or null when done
   // #endregion
   yield* Console.log(
     `Single page (limit 3): ${page.items.length} items, cursor: ${page.cursor != null ? "present" : "null"}`,
@@ -345,10 +367,16 @@ const program = Effect.gen(function* () {
   yield* Console.log(`Scan with filter (active): ${activeScan.length} tasks`)
 
   // #region scan-limit
-  // Scan with limit
+  // Scan with limit — at most 3 items come back
   const firstPage = yield* tasks.scan().limit(3).collect()
   // #endregion
   yield* Console.log(`Scan with limit (3): ${firstPage.length} tasks`)
+
+  // #region scan-page-size
+  // Scan in batches — every item comes back, read 3 rows per request
+  const batchedScan = yield* tasks.scan().pageSize(3).collect()
+  // #endregion
+  yield* Console.log(`Scan with pageSize (3): ${batchedScan.length} tasks`)
 
   // #region scan-consistent
   // Scan with consistent read
@@ -388,7 +416,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Ordering ===\n")
 
   // #region reverse
-  // Most recent tasks first (descending sort key order)
+  // The 3 most recent tasks (descending sort key order)
   const recent = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
     .reverse()
     .limit(3)

@@ -418,7 +418,7 @@ yield* users.delete({ userId: "u-1" })
 
 // Query execution via bound entity
 const allUsers = yield* users.collect(UserEntity.query.byEmail({ email: "a@b.com" }))
-const stream = users.paginate(UserEntity.scan(), Query.limit(100))
+const stream = users.paginate(UserEntity.scan(), Query.pageSize(100))
 
 // Or with v2 entity-centric pattern (BoundQuery fluent API):
 // const db = yield* DynamoClient.make({ entities: { UserEntity } })
@@ -442,7 +442,8 @@ import { Query } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `where(conditions)` | Dual | Add sort key conditions (`KeyConditionExpression`) |
-| `limit(n)` | Dual | Set max items per page |
+| `limit(n)` | Dual | Return at most `n` items (a contract on results — accumulates across requests, works under a filter) |
+| `pageSize(n)` | Dual | Fetch in batches of `n` rows — sets DynamoDB's `Limit` (a contract on round trips) |
 | `maxPages(n)` | Dual | Limit total number of pages fetched |
 | `reverse` | Combinator | Reverse sort order (descending) |
 | `consistentRead` | Combinator | Enable strongly consistent reads |
@@ -527,7 +528,8 @@ Combinators are immutable — each call returns a new `BoundQuery`. Terminals ex
 | `.filter(shorthand)` | Post-read filter via shorthand object (e.g. `{ status: "active" }` or `{ gt: { price: 30 } }`). |
 | `.select((t) => […paths])` | Projection expression via callback. Returns `BoundQuery<…, Record<string, unknown>>`. |
 | `.select(["field", …])` | Projection via attribute name array. |
-| `.limit(n)` | Maximum items per DynamoDB page. |
+| `.limit(n)` | Return at most `n` items. A contract on results: the query accumulates across as many requests as it takes, which is what makes it work under `.filter()`. |
+| `.pageSize(n)` | Fetch in batches of `n` rows — sets DynamoDB's `Limit`. A contract on round trips, not on what comes back. |
 | `.maxPages(n)` | Maximum number of DynamoDB pages to fetch. |
 | `.reverse()` | Reverse sort order (`ScanIndexForward = false`). |
 | `.startFrom(cursor)` | Resume pagination from an opaque cursor returned by `.fetch()`. |

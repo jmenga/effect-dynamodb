@@ -180,7 +180,8 @@ const program = Effect.gen(function* () {
   // --- Scan with limit ---
   yield* Console.log("=== Scan with Limit ===\n")
 
-  // Limit controls the page size (how many items DynamoDB evaluates per request).
+  // `limit` bounds the RESULT — at most 2 products come back. Use `pageSize`
+  // to size the requests instead.
   // #region scan-limit
   const firstTwo = yield* db.entities.Products.scan().limit(2).collect()
   // #endregion

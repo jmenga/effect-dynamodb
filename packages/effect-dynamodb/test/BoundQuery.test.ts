@@ -157,6 +157,57 @@ describe("BoundQuery", () => {
   })
 
   // -----------------------------------------------------------------------
+  // pageSize
+  // -----------------------------------------------------------------------
+
+  describe("pageSize", () => {
+    it("sets the pageSizeValue on the underlying query", () => {
+      const bq = makeBoundQuery().pageSize(25)
+      expect(bq._query._state.pageSizeValue).toBe(25)
+      expect(bq._query._state.limitValue).toBeUndefined()
+    })
+
+    it("composes with limit — batches of pageSize, up to limit items", () => {
+      const bq = makeBoundQuery().pageSize(50).limit(120)
+      expect(bq._query._state.pageSizeValue).toBe(50)
+      expect(bq._query._state.limitValue).toBe(120)
+    })
+
+    it("returns a new instance, original unchanged", () => {
+      const original = makeBoundQuery()
+      const sized = original.pageSize(10)
+      expect(sized).not.toBe(original)
+      expect(original._query._state.pageSizeValue).toBeUndefined()
+    })
+
+    it.effect("limit bounds the items collected; pageSize sizes the request", () =>
+      Effect.gen(function* () {
+        mockQuery
+          .mockResolvedValueOnce({
+            Items: [
+              { pk: { S: "p" }, sk: { S: "s1" }, id: { S: "t-1" } },
+              { pk: { S: "p" }, sk: { S: "s2" }, id: { S: "t-2" } },
+            ],
+            LastEvaluatedKey: { pk: { S: "p" }, sk: { S: "s2" } },
+          })
+          .mockResolvedValueOnce({
+            Items: [
+              { pk: { S: "p" }, sk: { S: "s3" }, id: { S: "t-3" } },
+              { pk: { S: "p" }, sk: { S: "s4" }, id: { S: "t-4" } },
+            ],
+            LastEvaluatedKey: { pk: { S: "p" }, sk: { S: "s4" } },
+          })
+
+        const items = yield* makeBoundQuery().pageSize(2).limit(3).collect()
+
+        expect(items).toHaveLength(3)
+        expect(mockQuery).toHaveBeenCalledTimes(2)
+        expect(mockQuery.mock.calls[0]![0].Limit).toBe(2)
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+  })
+
+  // -----------------------------------------------------------------------
   // maxPages
   // -----------------------------------------------------------------------
 
