@@ -37,8 +37,9 @@ import {
   substituteSchemaDeep,
   validateNoTransformOverride,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import { hasEncodingTransformation } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { type Context, DateTime, Effect, type Optic, Schema, SchemaAST } from "effect"
+import { type Context, DateTime, Effect, type Optic, Option, Schema, SchemaAST } from "effect"
 import * as Batch from "./Batch.js"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
 import { type EntityGet, fromDefinition as entityFromDefinition } from "./Entity.js"
@@ -135,7 +136,7 @@ interface ResolvedNode {
    * wire primitive before marshalling (issue #72). Undefined for the root, whose
    * attributes are encoded directly by `decomposeAggregate`.
    */
-  readonly dateEncoders?: Record<string, (value: unknown) => unknown> | undefined
+  readonly attrEncoders?: Record<string, (value: unknown) => unknown> | undefined
   /**
    * Declared sort-key composites for a `many` edge (`Aggregate.many(..., { sk })`).
    * When present these are authoritative: they replace the ref-identifier
@@ -607,34 +608,94 @@ const inferDateEncoding = (ast: Schema.Top["ast"]): DynamoEncoding | undefined =
 }
 
 /**
- * Build per-field date ENCODERS for a schema's own date fields. Encoders convert
- * a domain date value to its wire primitive on the WRITE path — decompose works
- * from the schema-decoded domain object, so EVERY date field (Pattern A self-date
- * AND Pattern B transform) must serialize for storage. The READ path is handled
- * entirely by the aggregate's tolerant `decodeSchema` (see `makeAggregate`), so
- * no separate decoders are needed.
+ * Build per-field ATTRIBUTE encoders for a schema's own fields — the write-side
+ * equivalent of what `Entity.put` gets for free by encoding its whole input
+ * through `inputSchema`.
+ *
+ * Decomposition works from the schema-DECODED domain object, so every attribute
+ * it produces is a Type-side value. Marshalling those directly stores a shape
+ * the read path cannot decode: a `Schema.BigIntFromString` field lands as
+ * `{N:"5"}` and assembly's decode (which expects the encoded string) rejects it,
+ * so the aggregate cannot round-trip at all. Dates were noticed first (#72) and
+ * got a date-only pass; the same argument applies to every transformed field.
+ *
+ * Exactly ONE encoder per field, so nothing is ever encoded twice:
+ *
+ * 1. **A date encoding** — an explicit `DynamoModel.storedAs` annotation, or the
+ *    inferred default for a standard Effect date schema. This wins over the
+ *    field's own encode because `storedAs` is precisely an override of it
+ *    (a `Schema.DateTimeUtc` field marked `storedAs(DateEpochMs)` must store the
+ *    epoch, not the ISO string its own schema would produce). This branch is the
+ *    former `buildAttrEncoders`, unchanged.
+ * 2. **Any other encoding transformation** — the field's own `encode`. A ref
+ *    field's schema is the referenced entity's, so a hydrated ref is encoded
+ *    with the entity it came from, not with the aggregate's schema.
+ * 3. **No transformation** — no encoder at all, so the stored bytes are
+ *    identical to before this existed.
+ *
+ * The READ path is handled entirely by the aggregate's tolerant `decodeSchema`
+ * (see `makeAggregate`), so no separate decoders are needed.
  */
-const buildDateEncoders = (
+const buildAttrEncoders = (
   fields: Record<string, Schema.Top> | undefined,
 ): Record<string, (value: unknown) => unknown> => {
   const encoders: Record<string, (value: unknown) => unknown> = {}
-  if (fields) {
-    for (const field of Object.keys(fields)) {
-      const fieldSchema = fields[field]!
-      // Precedence: explicit `DynamoModel.storedAs` annotation > inferred default
-      // for standard Effect date schemas (handles `Schema.optional()` wrappers).
-      const encoding = DynamoModel.getEncoding(fieldSchema) ?? inferDateEncoding(fieldSchema.ast)
-      if (!encoding) continue
+  if (!fields) return encoders
+
+  for (const field of Object.keys(fields)) {
+    const fieldSchema = fields[field]!
+
+    // 1. Date encoding — `storedAs` override, else the inferred date default.
+    const encoding = DynamoModel.getEncoding(fieldSchema) ?? inferDateEncoding(fieldSchema.ast)
+    if (encoding) {
       const encode = Schema.encodeUnknownSync(buildDateTransform(encoding) as Schema.Codec<any>)
       encoders[field] = (value) => encode(value)
+      continue
+    }
+
+    // 3. Identity by construction — `SchemaAST` documents `encoding === undefined`
+    //    as "type and encoded forms are identical". Adding an encoder here could
+    //    only change bytes that are already correct.
+    if (!hasEncodingTransformation(fieldSchema)) continue
+
+    // 2. The field's own encode, with `decode -> encode` as the fallback so a
+    //    caller who already supplied wire form round-trips to itself (the same
+    //    strategy `Entity.put` uses). Neither working means the value is neither
+    //    Type nor Encoded for this field; store it unchanged rather than
+    //    introduce a new write-time failure mode mid-release — that shape is
+    //    already unreadable, and the tolerant read path reports it.
+    const codec = fieldSchema as unknown as Schema.Codec<any>
+    const encode = Schema.encodeUnknownOption(codec)
+    const decode = Schema.decodeUnknownOption(codec)
+    encoders[field] = (value) => {
+      const direct = encode(value)
+      if (Option.isSome(direct)) return direct.value
+      const decoded = decode(value)
+      if (Option.isSome(decoded)) {
+        const reencoded = encode(decoded.value)
+        if (Option.isSome(reencoded)) return reencoded.value
+      }
+      return value
     }
   }
   return encoders
 }
 
-/** A schema's declared fields, if it exposes them (Schema.Struct / Schema.Class). */
-const fieldsOf = (schema: unknown): Record<string, Schema.Top> | undefined =>
-  (schema as { readonly fields?: Record<string, Schema.Top> } | undefined)?.fields
+/**
+ * A schema's declared fields, if it exposes them (Schema.Struct / Schema.Class).
+ *
+ * Unwraps `DynamoModel.configure(...)` first: that returns a `{ model, attributes }`
+ * WRAPPER, not a schema, so reading `.fields` off it yields nothing. An edge
+ * entity declared with a configured model therefore got NO encoders at all —
+ * its dates marshalled as `{M:{...}}` and its transformed fields as their Type
+ * values, on every row of that edge. Configured models are the norm (any
+ * `identifier: true` / `field:` rename produces one), so this blind spot covered
+ * most real edges.
+ */
+const fieldsOf = (schema: unknown): Record<string, Schema.Top> | undefined => {
+  const source = DynamoModel.isConfiguredModel(schema) ? schema.model : schema
+  return (source as { readonly fields?: Record<string, Schema.Top> } | undefined)?.fields
+}
 
 /**
  * Apply a node's date encoders in place — converts the node entity's own domain
@@ -642,7 +703,7 @@ const fieldsOf = (schema: unknown): Record<string, Schema.Top> | undefined =>
  * (issue #72: without this, an edge's `DateTime` field marshals to `{M:{}}` and
  * the subsequent `get`/assemble fails decoding it as a string).
  */
-const applyNodeDateEncoders = (
+const applyNodeAttrEncoders = (
   attrs: Record<string, unknown>,
   encoders: Record<string, (value: unknown) => unknown> | undefined,
 ): void => {
@@ -698,7 +759,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
   // Date ENCODERS for the write path: decompose works from the schema-decoded
   // domain object, so every root date field (Pattern A self-date AND Pattern B
   // transform) is serialized to its wire primitive for storage.
-  const dateEncoders = buildDateEncoders(schemaFields)
+  const attrEncoders = buildAttrEncoders(schemaFields)
 
   // Decode schema for read/assemble + input validation. Mirrors the raw `schema`
   // but recursively substitutes EVERY date / Redacted leaf — root and nested,
@@ -708,7 +769,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
   //   - update re-decodes the mutated state, which carries domain `DateTime`
   //     values → accepted as-is (a strict `*FromString` decoder would reject
   //     them). It is decode-only, so making transforms tolerant is safe — the
-  //     stored wire format is still produced by `dateEncoders` / node encoders.
+  //     stored wire format is still produced by `attrEncoders` / node encoders.
   // Nested edge / ref classes round-trip with their class instance identity
   // preserved (Option A). Returns the raw `schema` unchanged when it carries no
   // date / Redacted leaf at all (zero overhead).
@@ -955,7 +1016,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           assembled,
           rootNode,
           contextFields,
-          dateEncoders,
+          attrEncoders,
           aggregateName,
           config.schema,
         )
@@ -1048,7 +1109,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           assembledOld,
           rootNode,
           contextFields,
-          dateEncoders,
+          attrEncoders,
           aggregateName,
           config.schema,
         )
@@ -1056,7 +1117,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           assembledNew,
           rootNode,
           contextFields,
-          dateEncoders,
+          attrEncoders,
           aggregateName,
           config.schema,
         )
@@ -1376,7 +1437,7 @@ interface ResolveNodeArgs {
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
   readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
   readonly ownDiscriminator?: Record<string, unknown> | undefined
-  readonly dateEncoders?: Record<string, (value: unknown) => unknown> | undefined
+  readonly attrEncoders?: Record<string, (value: unknown) => unknown> | undefined
   readonly skComposite?: ReadonlyArray<string> | undefined
   readonly refIdentifierField?: string | undefined
 }
@@ -1385,7 +1446,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
   const {
     assemble,
     cardinality,
-    dateEncoders,
+    attrEncoders,
     decompose,
     discriminator,
     edges,
@@ -1413,7 +1474,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             discriminator: mergedDisc,
             ownDiscriminator: edge.discriminator,
             // Encode this edge entity's own date fields on write (issue #72).
-            dateEncoders: buildDateEncoders(fieldsOf(edge.entity?.model)),
+            attrEncoders: buildAttrEncoders(fieldsOf(edge.entity?.model)),
           }),
         )
       } else if (edge._tag === "ManyEdge") {
@@ -1426,7 +1487,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             discriminator,
             assemble: edge.assemble,
             decompose: edge.decompose,
-            dateEncoders: buildDateEncoders(fieldsOf(edge.entity?.model)),
+            attrEncoders: buildAttrEncoders(fieldsOf(edge.entity?.model)),
             // Declared sort-key composites, authoritative when present (#103).
             skComposite: edge.sk?.composite,
             refIdentifierField: edge.entity
@@ -1445,7 +1506,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
           ownDiscriminator: bound.discriminator,
           // The sub-aggregate root item carries the sub-schema's own (non-edge)
           // date fields; its child edges get their own encoders via recursion.
-          dateEncoders: buildDateEncoders(fieldsOf(bound.aggregate.schema)),
+          attrEncoders: buildAttrEncoders(fieldsOf(bound.aggregate.schema)),
         })
         children.push(subChildren)
       }
@@ -1464,7 +1525,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     ...(decompose !== undefined && { decompose }),
     ...(skComposite !== undefined && { skComposite }),
     ...(refIdentifierField !== undefined && { refIdentifierField }),
-    dateEncoders,
+    attrEncoders,
   }
 }
 
@@ -2022,7 +2083,7 @@ const decomposeAggregate = (
   assembled: Record<string, unknown>,
   rootNode: ResolvedNode,
   contextFields: ReadonlyArray<string>,
-  dateEncoders: Record<string, (value: unknown) => unknown>,
+  attrEncoders: Record<string, (value: unknown) => unknown>,
   aggregateName: string,
   schema: DynamoSchemaModule.DynamoSchema,
 ): Effect.Effect<ReadonlyArray<TransactionGroup>, AggregateDecompositionError> =>
@@ -2036,7 +2097,7 @@ const decomposeAggregate = (
     const contextValues: Record<string, unknown> = {}
     for (const field of contextFields) {
       const value = assembled[field]
-      const encode = dateEncoders[field]
+      const encode = attrEncoders[field]
       contextValues[field] = encode && value != null ? encode(value) : value
     }
 
@@ -2046,7 +2107,7 @@ const decomposeAggregate = (
     for (const [key, value] of Object.entries(assembled)) {
       if (edgeFieldNames.has(key)) continue
       // Serialize date fields in root attributes (same as context values)
-      const encode = dateEncoders[key]
+      const encode = attrEncoders[key]
       rootAttrs[key] = encode && value != null ? encode(value) : value
     }
 
@@ -2153,7 +2214,7 @@ const decomposeNode = (
       }
 
       // Serialize this node's own date fields to their wire primitive (#72).
-      applyNodeDateEncoders(subRootAttrs, node.dateEncoders)
+      applyNodeAttrEncoders(subRootAttrs, node.attrEncoders)
 
       // Inject context and discriminator
       mergeContextValues(subRootAttrs, contextValues)
@@ -2188,7 +2249,7 @@ const decomposeNode = (
       // Simple one-to-one edge (no children)
       const attrs = { ...(value as Record<string, unknown>) }
       // Serialize this edge entity's own date fields to their wire primitive (#72).
-      applyNodeDateEncoders(attrs, node.dateEncoders)
+      applyNodeAttrEncoders(attrs, node.attrEncoders)
       mergeContextValues(attrs, contextValues)
       if (node.discriminator) {
         for (const [k, v] of Object.entries(node.discriminator)) {
@@ -2221,7 +2282,7 @@ const decomposeNode = (
       for (const elem of arrayItems) {
         const attrs = { ...(elem as Record<string, unknown>) }
         // Serialize this edge entity's own date fields to their wire primitive (#72).
-        applyNodeDateEncoders(attrs, node.dateEncoders)
+        applyNodeAttrEncoders(attrs, node.attrEncoders)
         mergeContextValues(attrs, contextValues)
         if (node.discriminator) {
           for (const [k, v] of Object.entries(node.discriminator)) {

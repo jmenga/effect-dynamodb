@@ -8,6 +8,7 @@ Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table
 
 **Status:** All modules implemented. 1211 core tests, 307 schema tests, 56 geo tests, 241 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
 **Status:** All modules implemented. 1300 core tests, 307 schema tests, 56 geo tests, 247 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
+**Status:** All modules implemented. 1300 core tests, 307 schema tests, 56 geo tests, 252 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
 **Design:** `DESIGN.md` — API specification (source of truth for implementation)
 
 ## Architecture
@@ -486,6 +487,10 @@ Each of the four publishable packages must be configured on npmjs.com with this 
 - **Edge entities are first-class.** Own models, keys, indexes, and configuration. Composed via `Aggregate.one()`, `Aggregate.many()`, `BoundSubAggregate`.
 - **Write-time ref hydration.** Framework fetches referenced entity at create/update time, denormalizes into edge entity. Read path is cheap.
 - **Aggregates compose their own rows.** Read: partition query + assembly. Write: `decomposeAggregate` → `buildDynamoItems` (keys, `__edd_e__`, context, system timestamps) → one `transactWriteItems` per sub-aggregate group. Entity write ops are NOT in the path — anything Entity does at write time (timestamps, versioning) must be implemented for aggregates separately. Diff-based updates only write changed groups.
+- **Aggregate attributes are ENCODED before marshalling (#116).** Decomposition works from the schema-DECODED domain object, so `buildAttrEncoders` gives every node (root, sub-aggregate root, `one` edge, `many` element) one encoder per field: a date encoding (`storedAs` override, else the inferred default) wins; otherwise the field's own `encode` with `decode -> encode` as fallback; an untransformed field gets none, so its bytes are unchanged. Exactly one encoder per field — nothing is encoded twice. Without this a `BigIntFromString` stored `{N:"5"}` and assembly's decode rejected it, so the aggregate could not round-trip at all. **Context values go through the same encoders**, or the same logical field is stored two ways on two rows of one partition.
+- **`fieldsOf` unwraps `DynamoModel.configure`.** `configure()` returns a `{ model, attributes }` WRAPPER, not a schema, so reading `.fields` off it yields nothing and the node got NO encoders — dates included. Any `identifier: true` / `field:` rename produces a configured model, so this covered most real edges.
+- **Encoding attributes must never move a composed KEY.** Keys come from the assembled object through the key form, which normalises from either side, so the Type→Encoded shift is absorbed. Pinned literally by a connected test on an untransformed model.
+- **Known gap — `aggregate.update` still cannot round-trip a NON-DATE transform.** It re-decodes the mutated `state` through `decodeSchema`, whose `tolerantTransforms` substitution (`internal/EntitySchemas.ts`) only recognises DATE transforms, so a `BigIntFromString` field holding a domain `bigint` is rejected before any item is built. Upstream of decomposition; widening it changes the shared entity schema derivation.
 - **Discriminator SK format is `name#value`.** `{ teamNumber: 1 }` → `#teamNumber#1`.
 - **Domain models are pure.** Entity association declared at edge level in `Aggregate.make()`, not in Schema.Class model.
 - **Aggregate.update mutation context.** Receives `UpdateContext` with: `state` (plain object), `cursor` (pre-bound optic), `optic` (composable optic), `current` (Schema.Class instance).

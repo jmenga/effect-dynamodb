@@ -9317,13 +9317,13 @@ const KfCustomPk = Entity.make({
 
 class KfLedger extends Schema.Class<KfLedger>("KfLedger")({
   book: Schema.String,
-  // Untransformed numeric: `serializeValue` pads it to 16 on the write side, so
-  // `list`'s old `String(v)` SK prefix looked for `5` where `000...0005` is
-  // stored — the divergence this fixture exists to pin. (A `BigIntFromString`
-  // composite cannot be used here: the aggregate write path stores Type-side
-  // values, so it lands as `{N:"5"}` and assembly's `BigIntFromString` decode
-  // rejects it. That is a separate, pre-existing aggregate storage gap.)
-  seq: Schema.Number,
+  // The composite this fixture was written for: numeric Type, string Encoded.
+  // `serializeValue` pads it to 38 on the write side, so `list`'s old
+  // `String(v)` SK prefix looked for `5` where `000...0005` is stored (#111).
+  // It briefly had to be weakened to `Schema.Number` because the aggregate
+  // write path stored Type-side values and assembly could not decode them back;
+  // that is fixed here, so the intended shape is restored.
+  seq: Schema.BigIntFromString,
   title: Schema.String,
 }) {}
 
@@ -9608,7 +9608,11 @@ describeConnected("composite key form — mixed-width ordering", () => {
         })
 
         for (const n of KF_VALUES) {
-          yield* db.aggregates.KfLedgers.create({ book: "b1", seq: n, title: `t-${n}` } as never)
+          yield* db.aggregates.KfLedgers.create({
+            book: "b1",
+            seq: String(n),
+            title: `t-${n}`,
+          } as never)
         }
 
         // Pre-fix `list` composed its GSI key from the RAW filter and built the
@@ -9617,13 +9621,18 @@ describeConnected("composite key form — mixed-width ordering", () => {
         // every aggregate was dropped from the result with no error at all.
         const listed = yield* db.aggregates.KfLedgers.list({ book: "b1" })
         const seqs = listed.data
-          .map((l) => (l as unknown as { seq: number }).seq)
-          .sort((a, b) => a - b)
-        expect(seqs).toEqual([...KF_VALUES].sort((a, b) => a - b))
+          .map((l) => (l as unknown as { seq: bigint }).seq)
+          .sort((a, b) => (a < b ? -1 : 1))
+        expect(seqs).toEqual(KF_VALUES.map((n) => BigInt(n)).sort((a, b) => (a < b ? -1 : 1)))
+        // Typed correctly — a bigint, not the stored string.
+        expect(typeof seqs[0]).toBe("bigint")
 
         // A filter that reaches the SK prefix — the `String(v)` path, which
-        // looked for `5` where `0000000000000005` is stored.
-        const one = yield* db.aggregates.KfLedgers.list({ book: "b1", seq: KF_VALUES[0]! })
+        // looked for `5` where the padded 38-wide spelling is stored.
+        const one = yield* db.aggregates.KfLedgers.list({
+          book: "b1",
+          seq: BigInt(KF_VALUES[0]!),
+        })
         expect(one.data).toHaveLength(1)
         expect((one.data[0] as unknown as { title: string }).title).toBe(`t-${KF_VALUES[0]}`)
       }).pipe(provideKf),
@@ -10064,4 +10073,343 @@ describeConnected("collections and vector search share the entity key form", () 
       }
     }).pipe(provideCf),
   )
+})
+
+// ===========================================================================
+// Aggregate attribute encoding — every transformed shape round-trips (#116)
+// ===========================================================================
+//
+// Aggregates build their rows from the schema-DECODED domain object and
+// marshalled the Type value straight to DynamoDB, while the read path decodes
+// with the same schema. For any transformed field the two disagreed: a
+// `BigIntFromString` landed as `{N:"5"}` and assembly's decode rejected it, so
+// the aggregate could not round-trip at all. Dates were noticed first (#72) and
+// got a date-only pass; this pins the general rule for every shape, on the root,
+// on a `many` edge element, and on a ref-hydrated edge.
+
+const aeSchema = DynamoSchema.make({ name: "ae", version: 1 })
+const aeTableName = `ae-test-${Date.now()}`
+
+/** The referenced entity — its own schema must encode a hydrated ref. */
+class AeMaker extends Schema.Class<AeMaker>("AeMaker")({
+  makerId: Schema.String,
+  // Transformed field INSIDE the ref target.
+  founded: Schema.BigIntFromString,
+}) {}
+
+const AeMakers = PureEntity.make({
+  model: DynamoModel.configure(AeMaker, { makerId: { identifier: true } }),
+  entityType: "AeMaker",
+  primaryKey: { pk: { field: "pk", composite: ["makerId"] }, sk: { field: "sk", composite: [] } },
+})
+
+/** A `many` edge element carrying the full shape matrix. */
+class AePart extends Schema.Class<AePart>("AePart")({
+  // `id` (not `partId`): `extractRefIdentifiers` uses it as the element's SK
+  // composite, so without it two `many` elements collide on one sort key.
+  id: Schema.String,
+  bigStr: Schema.BigIntFromString,
+  numStr: Schema.NumberFromString,
+  epoch: DynamoModel.DateEpochMs,
+  plainDate: Schema.Date,
+  dtUtc: Schema.DateTimeUtc,
+  plainNum: Schema.Number,
+  plainStr: Schema.String,
+}) {}
+
+const AeParts = PureEntity.make({
+  model: DynamoModel.configure(AePart, { id: { identifier: true } }),
+  entityType: "AePart",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+})
+
+/** A ref-hydrated `one` edge. */
+class AeSupplier extends Schema.Class<AeSupplier>("AeSupplier")({
+  supplierId: Schema.String,
+  since: Schema.NumberFromString,
+  maker: AeMaker.pipe(DynamoModel.ref),
+}) {}
+
+const AeSuppliers = PureEntity.make({
+  model: DynamoModel.configure(AeSupplier, { supplierId: { identifier: true } }),
+  entityType: "AeSupplier",
+  primaryKey: {
+    pk: { field: "pk", composite: ["supplierId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  refs: { maker: { entity: AeMakers } },
+})
+
+/** The aggregate root — same matrix again, at the root level. */
+class AeMachine extends Schema.Class<AeMachine>("AeMachine")({
+  machineId: Schema.String,
+  bigStr: Schema.BigIntFromString,
+  numStr: Schema.NumberFromString,
+  epoch: DynamoModel.DateEpochMs,
+  plainDate: Schema.Date,
+  dtUtc: Schema.DateTimeUtc,
+  plainNum: Schema.Number,
+  plainStr: Schema.String,
+  supplier: Schema.optionalKey(AeSupplier),
+  parts: Schema.optionalKey(Schema.Array(AePart)),
+}) {}
+
+/** An untransformed model — its composed keys must be byte-identical. */
+class AePlain extends Schema.Class<AePlain>("AePlain")({
+  plainId: Schema.String,
+  label: Schema.String,
+  count: Schema.Number,
+}) {}
+
+const AeTable = Table.make({
+  schema: aeSchema,
+  entities: { AeMakers, AeParts, AeSuppliers },
+})
+
+const AeMachineAggregate = Aggregate.make(AeMachine, {
+  table: AeTable,
+  schema: aeSchema,
+  pk: { field: "pk", composite: ["machineId"] },
+  collection: { name: "aemachine" },
+  root: { entityType: "AeMachineItem" },
+  edges: {
+    supplier: Aggregate.one("supplier", { entityType: "AeMachineSupplier", entity: AeSuppliers }),
+    parts: Aggregate.many("parts", { entityType: "AeMachinePart", entity: AeParts }),
+  },
+})
+
+const AePlainAggregate = Aggregate.make(AePlain, {
+  table: AeTable,
+  schema: aeSchema,
+  pk: { field: "pk", composite: ["plainId"] },
+  collection: { name: "aeplain" },
+  root: { entityType: "AePlainItem" },
+  edges: {},
+})
+
+const AeLayer = Layer.mergeAll(ClientLayer, AeTable.layer({ name: aeTableName }))
+const provideAe = Effect.provide(AeLayer)
+const aeAggregates = { AeMachineAggregate, AePlainAggregate }
+const aeTables = { AeTable }
+
+const AE_EPOCH_MS = 1767225600000
+const AE_ISO = "2026-01-01T00:00:00.000Z"
+
+describeConnected("aggregate attribute encoding round-trips every shape (#116)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: aeTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(AeTable),
+        })
+      }).pipe(provideAe, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: aeTableName })
+      }).pipe(
+        provideAe,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  /** The full matrix, as the create input takes it (Encoded side). */
+  const shapeInput = (id: string) => ({
+    bigStr: "420",
+    numStr: "3.5",
+    epoch: AE_ISO,
+    plainDate: AE_ISO,
+    dtUtc: AE_ISO,
+    plainNum: 7,
+    plainStr: `s-${id}`,
+  })
+
+  /** Assert every shape came back with the right value AND the right type. */
+  const expectShapes = (o: Record<string, unknown>) => {
+    expect(o.bigStr).toBe(420n)
+    expect(typeof o.bigStr).toBe("bigint")
+    expect(o.numStr).toBe(3.5)
+    expect(typeof o.numStr).toBe("number")
+    expect(DateTime.toEpochMillis(o.epoch as DateTime.Utc)).toBe(AE_EPOCH_MS)
+    expect((o.plainDate as Date).toISOString()).toBe(AE_ISO)
+    expect(DateTime.toEpochMillis(o.dtUtc as DateTime.Utc)).toBe(AE_EPOCH_MS)
+    expect(o.plainNum).toBe(7)
+    expect(typeof o.plainNum).toBe("number")
+    expect(typeof o.plainStr).toBe("string")
+  }
+
+  it.effect("every shape round-trips on the aggregate ROOT", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+
+      yield* db.aggregates.AeMachineAggregate.create({
+        machineId: "m-root",
+        ...shapeInput("root"),
+      } as never)
+
+      // Pre-fix this threw `aggregate.assemble` with an Encoding issue: the
+      // Type-side bigint was stored as `{N:"420"}` and `BigIntFromString`
+      // rejected a number.
+      const got = yield* db.aggregates.AeMachineAggregate.get({ machineId: "m-root" })
+      expectShapes(got as unknown as Record<string, unknown>)
+    }).pipe(provideAe),
+  )
+
+  it.effect("every shape round-trips on a MANY edge element", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+
+      yield* db.aggregates.AeMachineAggregate.create({
+        machineId: "m-many",
+        ...shapeInput("many"),
+        parts: [
+          { id: "p-1", ...shapeInput("p1") },
+          { id: "p-2", ...shapeInput("p2") },
+        ],
+      } as never)
+
+      const got = (yield* db.aggregates.AeMachineAggregate.get({
+        machineId: "m-many",
+      })) as unknown as { parts: ReadonlyArray<Record<string, unknown>> }
+
+      expect(got.parts).toHaveLength(2)
+      for (const part of got.parts) expectShapes(part)
+      expect(got.parts.map((p) => p.id).sort()).toEqual(["p-1", "p-2"])
+    }).pipe(provideAe),
+  )
+
+  it.effect("a REF-hydrated edge encodes with the referenced entity's own schema", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { AeMakers },
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+
+      yield* db.entities.AeMakers.put({ makerId: "mk-1", founded: 1897n })
+
+      // The aggregate stores what the schema holds — the nested ref object, the
+      // same shape write-time hydration would have produced on the entity path.
+      yield* db.aggregates.AeMachineAggregate.create({
+        machineId: "m-ref",
+        ...shapeInput("ref"),
+        supplier: {
+          supplierId: "sup-1",
+          since: "1999",
+          maker: { makerId: "mk-1", founded: "1897" },
+        },
+      } as never)
+
+      const got = (yield* db.aggregates.AeMachineAggregate.get({
+        machineId: "m-ref",
+      })) as unknown as {
+        supplier: { supplierId: string; since: number; maker: { makerId: string; founded: bigint } }
+      }
+
+      // The edge's own transformed field...
+      expect(got.supplier.since).toBe(1999)
+      expect(typeof got.supplier.since).toBe("number")
+      // ...and the field INSIDE the hydrated ref, which is only correct if the
+      // ref was encoded with `AeMaker`'s schema rather than the aggregate's.
+      expect(got.supplier.maker.makerId).toBe("mk-1")
+      expect(got.supplier.maker.founded).toBe(1897n)
+      expect(typeof got.supplier.maker.founded).toBe("bigint")
+    }).pipe(provideAe),
+  )
+
+  it.effect("context values propagated onto edge rows are encoded once, the same way", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+      const client = yield* DynamoClient
+
+      yield* db.aggregates.AeMachineAggregate.create({
+        machineId: "m-ctx",
+        ...shapeInput("ctx"),
+        parts: [{ id: "p-9", ...shapeInput("p9") }],
+      } as never)
+
+      // Same logical field must be stored the SAME way on every row of the
+      // partition — the divergence class this whole line of work closes.
+      const rows = yield* client.query({
+        TableName: aeTableName,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: "$ae#v1#aemachine#m-ctx" } },
+      })
+      const bigStrs = (rows.Items ?? [])
+        .filter((i) => i.bigStr !== undefined)
+        .map((i) => JSON.stringify(i.bigStr))
+      expect(bigStrs.length).toBeGreaterThan(1)
+      expect(new Set(bigStrs).size).toBe(1)
+      // ...and it is the ENCODED string form, which is what decode expects.
+      expect(bigStrs[0]).toBe(JSON.stringify({ S: "420" }))
+    }).pipe(provideAe),
+  )
+
+  it.effect("composed keys are byte-identical for an untransformed model", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: aeAggregates,
+        tables: aeTables,
+      })
+      const client = yield* DynamoClient
+
+      yield* db.aggregates.AePlainAggregate.create({
+        plainId: "pl-1",
+        label: "L",
+        count: 3,
+      } as never)
+
+      // Encoding ATTRIBUTES must not move a single byte of a composed KEY.
+      // Keys come from the assembled object through the key form, and this is
+      // the value that spelling produces — pinned literally.
+      const rows = yield* client.query({
+        TableName: aeTableName,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: "$ae#v1#aeplain#pl-1" } },
+      })
+      expect(rows.Items ?? []).toHaveLength(1)
+      const row = (rows.Items ?? [])[0]!
+      expect(row.pk?.S).toBe("$ae#v1#aeplain#pl-1")
+      expect(row.sk?.S).toBe("$ae#v1#aeplainitem")
+      // Untransformed attributes are stored exactly as before.
+      expect(row.label?.S).toBe("L")
+      expect(row.count?.N).toBe("3")
+
+      const got = yield* db.aggregates.AePlainAggregate.get({ plainId: "pl-1" })
+      expect((got as unknown as { count: number }).count).toBe(3)
+    }).pipe(provideAe),
+  )
+
+  // NOTE — `aggregate.update` still cannot round-trip a NON-DATE transformed
+  // field, and that is deliberately out of this change. Its failure is upstream
+  // of decomposition: the mutated `state` is re-decoded through `decodeSchema`,
+  // whose `tolerantTransforms` substitution (`internal/EntitySchemas.ts`) only
+  // recognises DATE transforms, so a `BigIntFromString` field holding a domain
+  // `bigint` is rejected before any item is built. Widening that tolerance to
+  // every transform changes the shared entity schema derivation, not the
+  // aggregate write path fixed here.
 })
