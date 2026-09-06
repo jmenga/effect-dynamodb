@@ -2518,24 +2518,6 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `EmbeddingError` | `Embedder.embed` failed, or no `Embedder` was provided for an entity with vector indexes |
 | `VectorIndexBackfilling` | `SearchVectors` called while the vector index is still backfilling |
 
-### Diagnostic Code Registry
-
-`EDD-xxxx` codes name a specific, documented rule so a message can be searched for
-rather than pattern-matched. **Allocate the next free code here BEFORE using it in
-code** — never grep the source for the highest number in use, because a code
-reserved in a branch that has not merged yet will not appear.
-
-Ranges in use: `EDD-9005`–`EDD-9009` (model/key validation), `EDD-9010`–`EDD-9016`
-(timeSeries), `EDD-9020`–`EDD-9025` (sparse maps + key composition),
-`EDD-9037`–`EDD-9044` (vector search, timestamp encodings).
-
-| Code | Rule |
-|------|------|
-| EDD-9048 | A multi-item write path (`Transaction.transactWrite`, `EventStore.append({ additionalItems })`) cannot compile a **delete** for an entity configured with `unique`, `versioned: { retain: true }` or `softDelete` — the side items are derived from the *stored* item, which this path never reads. Use the entity's own `delete`. |
-| EDD-9049 | `Batch.write` cannot compile a write for an entity configured with `unique`, `versioned: { retain: true }` or `softDelete` — `BatchWriteItem` has no `ConditionExpression` (which the uniqueness sentinel depends on), no `UpdateRequest`, and no atomicity across the chunk boundary. Use `Transaction.transactWrite` or the entity's own operation. |
-
-**Next free code: `EDD-9050`.**
-
 ### Error Type Narrowing
 
 Operation signatures narrow error types based on Entity configuration:
