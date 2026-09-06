@@ -3,6 +3,7 @@ import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   type AggregateAssemblyError,
+  type AggregateDecompositionError,
   DynamoError,
   type RefNotFound,
 } from "@effect-dynamodb/schema/Errors.js"
@@ -1333,7 +1334,12 @@ describe("Aggregate write path", () => {
       root: { entityType: "PostItem" },
       edges: {
         author: Aggregate.one("author", { entityType: "PostAuthor" }),
-        comments: Aggregate.many("comments", { entityType: "PostComment" }),
+        // Entity-less many edge: nothing identifies an element, so the sort key
+        // has to be declared or every comment lands on one row (#103).
+        comments: Aggregate.many("comments", {
+          entityType: "PostComment",
+          sk: { composite: ["user"] },
+        }),
       },
     })
 
@@ -2321,6 +2327,229 @@ describe("Aggregate write path", () => {
   // ---------------------------------------------------------------------------
   // ManyEdge inputField — configurable input field name
   // ---------------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // Many-edge declared sort key (#103)
+  // -------------------------------------------------------------------------
+
+  describe("ManyEdge sk.composite (#103)", () => {
+    class Contact extends Schema.Class<Contact>("Contact")({
+      contactId: Schema.String.pipe(DynamoModel.identifier),
+      name: Schema.String,
+    }) {}
+
+    const ContactEntity = Entity.make({
+      model: Contact,
+      entityType: "Contact",
+      primaryKey: {
+        pk: { field: "pk", composite: ["contactId"] },
+        sk: { field: "sk", composite: [] },
+      },
+    })
+    ContactEntity._configure(AppSchema, MainTable.Tag)
+
+    class OrderContact extends Schema.Class<OrderContact>("OrderContact")({
+      contact: Contact,
+      role: Schema.Literals(["billing", "shipping", "technical"]),
+    }) {}
+
+    class Order extends Schema.Class<Order>("Order")({
+      id: Schema.String,
+      reference: Schema.String,
+      contacts: Schema.Array(OrderContact),
+    }) {}
+
+    /** Build an Order aggregate whose `contacts` edge declares `sk` (or not). */
+    const makeOrderAggregate = (sk?: { readonly composite: ReadonlyArray<string> }) =>
+      Aggregate.make(Order, {
+        table: MainTable,
+        schema: AppSchema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: {
+          index: "lsi1",
+          name: "order",
+          sk: { field: "lsi1sk", composite: [] },
+        },
+        root: { entityType: "OrderItem" },
+        edges: {
+          contacts: Aggregate.many("contacts", {
+            entityType: "OrderContact",
+            entity: ContactEntity,
+            ...(sk !== undefined && { sk }),
+          }),
+        },
+      })
+
+    const contactItems: Record<string, Record<string, unknown>> = {
+      "c-1": {
+        pk: "$myapp#v1#contact#contactid_c-1",
+        sk: "$myapp#v1#contact",
+        __edd_e__: "Contact",
+        contactId: "c-1",
+        name: "Dana Finlay",
+      },
+      "c-2": {
+        pk: "$myapp#v1#contact#contactid_c-2",
+        sk: "$myapp#v1#contact",
+        __edd_e__: "Contact",
+        contactId: "c-2",
+        name: "Sam Reyes",
+      },
+    }
+
+    const stubContactHydration = () => {
+      mockBatchGetItem.mockImplementation((input: Record<string, unknown>) => {
+        const requestItems = input.RequestItems as Record<
+          string,
+          { Keys: Array<Record<string, { S?: string }>> }
+        >
+        const responses: Record<string, Array<Record<string, unknown>>> = {}
+        for (const [tableName, { Keys }] of Object.entries(requestItems)) {
+          responses[tableName] = Keys.map((key) => {
+            const pk = key.pk?.S ?? ""
+            const match = Object.values(contactItems).find((item) => item.pk === pk)
+            return match ? toAttributeMap(match) : undefined
+          }).filter(Boolean) as Array<Record<string, unknown>>
+        }
+        return Promise.resolve({ Responses: responses })
+      })
+    }
+
+    /** Sort keys of the OrderContact rows written by the last transaction. */
+    const writtenContactSks = (): Array<string> => {
+      const call = mockTransactWrite.mock.calls[0]![0] as {
+        TransactItems: Array<{ Put?: { Item: Record<string, { S?: string }> } }>
+      }
+      return call.TransactItems.filter((i) => i.Put?.Item.__edd_e__?.S === "OrderContact").map(
+        (i) => i.Put!.Item.sk!.S!,
+      )
+    }
+
+    it.effect("one entity appears twice when the edge declares sk.composite", () =>
+      Effect.gen(function* () {
+        stubContactHydration()
+        mockTransactWrite.mockResolvedValue({})
+
+        const OrderAggregate = makeOrderAggregate({ composite: ["role"] })
+
+        const result = yield* OrderAggregate.create({
+          id: "o-1",
+          reference: "PO-993",
+          contacts: [
+            { contactId: "c-1", role: "billing" },
+            // Same contact, different role — one item under the ref-id heuristic.
+            { contactId: "c-1", role: "shipping" },
+          ],
+        })
+
+        expect(result.contacts).toHaveLength(2)
+        expect(writtenContactSks()).toEqual([
+          "$myapp#v1#ordercontact#billing",
+          "$myapp#v1#ordercontact#shipping",
+        ])
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("declared composites are authoritative — they set order, not just uniqueness", () =>
+      Effect.gen(function* () {
+        stubContactHydration()
+        mockTransactWrite.mockResolvedValue({})
+
+        // Dotted path: ref hydration replaces `contactId` with the hydrated
+        // `contact` object, so the identifier lives one level down.
+        const OrderAggregate = makeOrderAggregate({ composite: ["role", "contact.contactId"] })
+
+        yield* OrderAggregate.create({
+          id: "o-2",
+          reference: "PO-994",
+          contacts: [
+            { contactId: "c-1", role: "billing" },
+            { contactId: "c-2", role: "billing" },
+          ],
+        })
+
+        // Role first, ref id second — the declared order, not the heuristic's.
+        expect(writtenContactSks()).toEqual([
+          "$myapp#v1#ordercontact#billing#c-1",
+          "$myapp#v1#ordercontact#billing#c-2",
+        ])
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("falls back to the ref-identifier heuristic with no declaration", () =>
+      Effect.gen(function* () {
+        stubContactHydration()
+        mockTransactWrite.mockResolvedValue({})
+
+        const OrderAggregate = makeOrderAggregate()
+
+        yield* OrderAggregate.create({
+          id: "o-3",
+          reference: "PO-995",
+          contacts: [
+            { contactId: "c-1", role: "billing" },
+            { contactId: "c-2", role: "shipping" },
+          ],
+        })
+
+        expect(writtenContactSks()).toEqual([
+          "$myapp#v1#ordercontact#c-1",
+          "$myapp#v1#ordercontact#c-2",
+        ])
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("colliding sort keys fail as a decomposition error, naming the edge", () =>
+      Effect.gen(function* () {
+        stubContactHydration()
+        mockTransactWrite.mockResolvedValue({})
+
+        // No declared sk — both elements compose the same key off the ref id.
+        const OrderAggregate = makeOrderAggregate()
+
+        const error = yield* OrderAggregate.create({
+          id: "o-4",
+          reference: "PO-996",
+          contacts: [
+            { contactId: "c-1", role: "billing" },
+            { contactId: "c-1", role: "shipping" },
+          ],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AggregateDecompositionError")
+        const decomposition = error as AggregateDecompositionError
+        expect(decomposition.member).toBe("contacts")
+        expect(decomposition.reason).toContain("$myapp#v1#ordercontact#c-1")
+        expect(decomposition.reason).toContain("sk: { composite: [...] }")
+
+        // The collision is caught before anything is written.
+        expect(mockTransactWrite).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("a declared composite that names a missing attribute fails with a hint", () =>
+      Effect.gen(function* () {
+        stubContactHydration()
+        mockTransactWrite.mockResolvedValue({})
+
+        // "contactId" is the INPUT field name; after hydration it is contact.contactId.
+        const OrderAggregate = makeOrderAggregate({ composite: ["contactId"] })
+
+        const error = yield* OrderAggregate.create({
+          id: "o-5",
+          reference: "PO-997",
+          contacts: [{ contactId: "c-1", role: "billing" }],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AggregateDecompositionError")
+        const decomposition = error as AggregateDecompositionError
+        expect(decomposition.member).toBe("contacts")
+        expect(decomposition.reason).toContain('"contactId"')
+        expect(decomposition.reason).toContain("contact.contactId")
+        expect(mockTransactWrite).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+  })
 
   describe("ManyEdge inputField", () => {
     // "Element IS entity" case: Umpire[] → inputField renames to matchUmpireIds: string[]

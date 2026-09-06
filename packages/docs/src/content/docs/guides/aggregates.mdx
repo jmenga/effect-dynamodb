@@ -225,6 +225,69 @@ const TeamSheetAggregate = Aggregate.make(TeamSheet, {
 
 Edge keys (`coach`, `players`) correspond to fields on the schema.
 
+##### Sort keys for `many` edges
+
+Each element of a `many` edge becomes its own DynamoDB item, and by default its sort key is composed from the **referenced entity's identifier**. That is enough while an entity appears at most once in an aggregate. When the same entity legitimately appears twice — distinguished by a field on the edge element rather than by the ref — both elements compose the same sort key, and DynamoDB rejects the whole write.
+
+Declare `sk.composite` to say what separates them:
+
+```typescript region="many-edge-sk-models" example="guide-aggregates.ts"
+// One umpire may officiate a match in more than one role.
+class MatchOfficial extends Schema.Class<MatchOfficial>("MatchOfficial")({
+  umpire: Umpire.pipe(DynamoModel.ref),
+  role: Schema.Literals(["onfield", "third", "referee"]),
+}) {}
+
+class OfficiatedMatch extends Schema.Class<OfficiatedMatch>("OfficiatedMatch")({
+  matchId: Schema.String,
+  name: Schema.String,
+  officials: Schema.Array(MatchOfficial),
+}) {}
+```
+
+```typescript region="many-edge-sk" example="guide-aggregates.ts"
+const OfficiatedMatchAggregate = Aggregate.make(OfficiatedMatch, {
+  table: MainTable,
+  schema: CricketSchema,
+  pk: { field: "pk", composite: ["matchId"] },
+  collection: { name: "officiated" },
+  root: { entityType: "OfficiatedMatchItem" },
+  edges: {
+    officials: Aggregate.many("officials", {
+      entityType: "MatchOfficial",
+      entity: Umpires,
+      sk: { composite: ["role"] },
+    }),
+  },
+})
+```
+
+```typescript region="many-edge-sk-create" example="guide-aggregates.ts"
+const officiated = yield* OfficiatedMatchAggregate.create({
+  matchId: "bgt-2025-test-1",
+  name: "AUS vs IND",
+  officials: [
+    { umpireId: "bowen-01", role: "onfield" },
+    // Same umpire, second role — a distinct row, because `role` is in the key.
+    { umpireId: "bowen-01", role: "third" },
+    { umpireId: "kumar-01", role: "referee" },
+  ],
+})
+```
+
+A declared `sk.composite` is **authoritative**: it replaces the ref-identifier default rather than extending it, so it decides both uniqueness and the order elements sort in. Include the ref's identifier yourself when you still want it in the key — after hydration it lives under the hydrated object, so name it by dotted path:
+
+```typescript
+sk: { composite: ["role", "umpire.id"] }
+```
+
+Two shapes need a declaration, because nothing about the element identifies it on its own:
+
+- an edge with no `entity`, whose elements are plain structs
+- an edge whose elements share a referenced entity
+
+Without one, decomposition fails with `AggregateDecompositionError` naming the edge and the colliding sort key — rather than the DynamoDB `ValidationException` ("Transaction request cannot include multiple operations on one item") that the collision would otherwise produce.
+
 #### Step 3: Top-Level Aggregate
 
 Bind the full domain schema to a table, schema namespace, and partition key:

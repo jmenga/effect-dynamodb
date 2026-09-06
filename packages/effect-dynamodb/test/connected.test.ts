@@ -278,7 +278,34 @@ const Articles = Entity.make({
   },
 })
 
-const AggTable = Table.make({ schema: AggSchema, entities: { Authors, Articles } })
+// Officials: the #103 shape — one entity appearing twice in one aggregate,
+// distinguished by a field on the edge element rather than by the ref.
+class Official extends Schema.Class<Official>("Official")({
+  officialId: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+}) {}
+
+const Officials = Entity.make({
+  model: Official,
+  entityType: "Official",
+  primaryKey: {
+    pk: { field: "pk", composite: ["officialId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+class MatchOfficial extends Schema.Class<MatchOfficial>("MatchOfficial")({
+  official: Official,
+  role: Schema.Literals(["onfield", "third", "referee"]),
+}) {}
+
+class OfficiatedMatch extends Schema.Class<OfficiatedMatch>("OfficiatedMatch")({
+  id: Schema.String,
+  name: Schema.String,
+  officials: Schema.Array(MatchOfficial),
+}) {}
+
+const AggTable = Table.make({ schema: AggSchema, entities: { Authors, Articles, Officials } })
 
 // Sub-aggregate: reviewer note (bound with discriminator for editorial vs peer)
 const ReviewerNoteAggregate = Aggregate.make(ReviewerNote, {
@@ -302,6 +329,46 @@ const BlogPostAggregate = Aggregate.make(BlogPost, {
     author: Aggregate.ref(Authors),
     meta: Aggregate.one("meta", { entityType: "BlogPostMeta" }),
     comments: Aggregate.many("comments", { entityType: "BlogPostComment" }),
+  },
+})
+
+// The same umpire may officiate in more than one role. `sk.composite` names the
+// element field that separates them; without it both rows compose one key (#103).
+const OfficiatedMatchAggregate = Aggregate.make(OfficiatedMatch, {
+  table: AggTable,
+  schema: AggSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: {
+    index: "gsi2",
+    name: "officiated",
+    sk: { field: "gsi2sk", composite: ["name"] },
+  },
+  root: { entityType: "OfficiatedMatchRoot" },
+  edges: {
+    officials: Aggregate.many("officials", {
+      entityType: "MatchOfficial",
+      entity: Officials,
+      sk: { composite: ["role"] },
+    }),
+  },
+})
+
+// Identical, minus the declared sort key — both elements collapse onto one row.
+const CollidingMatchAggregate = Aggregate.make(OfficiatedMatch, {
+  table: AggTable,
+  schema: AggSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: {
+    index: "gsi2",
+    name: "colliding",
+    sk: { field: "gsi2sk", composite: ["name"] },
+  },
+  root: { entityType: "CollidingMatchRoot" },
+  edges: {
+    officials: Aggregate.many("officials", {
+      entityType: "CollidingMatchOfficial",
+      entity: Officials,
+    }),
   },
 })
 
@@ -2616,8 +2683,13 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
     await Effect.runPromise(
       Effect.gen(function* () {
         const db = yield* DynamoClient.make({
-          entities: { Authors, Articles },
-          aggregates: { BlogPostAggregate, TimestampedPostAggregate },
+          entities: { Authors, Articles, Officials },
+          aggregates: {
+            BlogPostAggregate,
+            TimestampedPostAggregate,
+            OfficiatedMatchAggregate,
+            CollidingMatchAggregate,
+          },
           tables: { AggTable },
         })
         yield* db.tables.AggTable.create()
@@ -2792,6 +2864,96 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
       Effect.gen(function* () {
         const err = yield* BlogPostAggregate.get({ id: "nonexistent" }).pipe(Effect.flip)
         expect(err._tag).toBe("AggregateAssemblyError")
+      }).pipe(provideAgg),
+    )
+  })
+
+  // -------------------------------------------------------------------------
+  // ManyEdge declared sort key (#103)
+  // -------------------------------------------------------------------------
+
+  describe("ManyEdge sk.composite", () => {
+    it.effect("one entity officiates twice in the same match", () =>
+      Effect.gen(function* () {
+        yield* Officials.put({ officialId: "off-1", name: "Ravi Bowen" }).asEffect()
+        yield* Officials.put({ officialId: "off-2", name: "Kumar D." }).asEffect()
+
+        const created = yield* OfficiatedMatchAggregate.create({
+          id: "match-103",
+          name: "AUS vs IND",
+          officials: [
+            { officialId: "off-1", role: "onfield" },
+            // Same official, second role — one row under the ref-id heuristic.
+            { officialId: "off-1", role: "third" },
+            { officialId: "off-2", role: "referee" },
+          ],
+        })
+
+        expect(created.officials).toHaveLength(3)
+
+        // Round-trip: all three rows survive as distinct items.
+        const fetched = yield* OfficiatedMatchAggregate.get({ id: "match-103" })
+        expect(fetched.officials).toHaveLength(3)
+
+        const byRole = new Map(fetched.officials.map((o) => [o.role, o.official.officialId]))
+        expect(byRole.get("onfield")).toBe("off-1")
+        expect(byRole.get("third")).toBe("off-1")
+        expect(byRole.get("referee")).toBe("off-2")
+
+        // The two off-1 rows are the same official under different roles.
+        const offOne = fetched.officials.filter((o) => o.official.officialId === "off-1")
+        expect(offOne).toHaveLength(2)
+        expect(offOne.every((o) => o.official.name === "Ravi Bowen")).toBe(true)
+      }).pipe(provideAgg),
+    )
+
+    it.effect("sort keys carry the declared composite", () =>
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        const result = yield* client.query({
+          TableName: aggTableName,
+          KeyConditionExpression: "#pk = :pk",
+          ExpressionAttributeNames: { "#pk": "pk" },
+          ExpressionAttributeValues: { ":pk": { S: "$agg-test#v1#officiated#match-103" } },
+        })
+
+        const officialSks = (result.Items ?? [])
+          .filter((item) => item.__edd_e__?.S === "MatchOfficial")
+          .map((item) => item.sk?.S)
+          .sort()
+
+        expect(officialSks).toEqual([
+          "$agg-test#v1#matchofficial#onfield",
+          "$agg-test#v1#matchofficial#referee",
+          "$agg-test#v1#matchofficial#third",
+        ])
+      }).pipe(provideAgg),
+    )
+
+    it.effect("without a declared sort key the collision is a typed error, not an AWS one", () =>
+      Effect.gen(function* () {
+        const error = yield* CollidingMatchAggregate.create({
+          id: "match-103-collide",
+          name: "ENG vs NZ",
+          officials: [
+            { officialId: "off-1", role: "onfield" },
+            { officialId: "off-1", role: "third" },
+          ],
+        }).pipe(Effect.flip)
+
+        // Before #103 this reached the caller as DynamoValidationError wrapping
+        // "Transaction request cannot include multiple operations on one item".
+        expect(error._tag).toBe("AggregateDecompositionError")
+
+        // Nothing was written.
+        const client = yield* DynamoClient
+        const result = yield* client.query({
+          TableName: aggTableName,
+          KeyConditionExpression: "#pk = :pk",
+          ExpressionAttributeNames: { "#pk": "pk" },
+          ExpressionAttributeValues: { ":pk": { S: "$agg-test#v1#colliding#match-103-collide" } },
+        })
+        expect(result.Items ?? []).toHaveLength(0)
       }).pipe(provideAgg),
     )
   })
