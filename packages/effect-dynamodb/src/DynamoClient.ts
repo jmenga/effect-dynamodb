@@ -149,12 +149,6 @@ import type { CreateTableOptions, Table, TableConfig } from "./Table.js"
 import { mergeVectorIndexes, definition as tableDefinition, toVectorIndexSpec } from "./Table.js"
 
 /**
- * Delimiter separating composite segments inside a composed sort key
- * (`$schema#v1#entity#a_1#b_2`). Mirrors `DynamoSchema`'s key format.
- */
-const SK_DELIMITER = "#"
-
-/**
  * Upper-bound sentinel used when a `.where()` condition targets a sort key
  * composite that is NOT the last one. The composed operand is then only a
  * prefix of the stored key, so an inclusive upper bound has to be pushed past
@@ -976,13 +970,17 @@ const makeFromConfig = (config: {
           resolveTableName: entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
         })
 
-        // Apply SK prefix from provided composites
+        // Apply SK prefix from provided composites.
+        // `composeSortKeyBeginsWith`, not `composeSortKeyPrefix` — the operand
+        // must terminate on a segment boundary when composites remain, or it
+        // matches sibling values that merely start with the supplied one
+        // (`status_done` also matching `status_done_archived`, issue #115).
         const hasSkComposites = indexDef.sk.composite.some(
           (attr: string) => composites[attr] !== undefined,
         )
         const finalQuery = hasSkComposites
           ? Query.where(query, {
-              beginsWith: KeyComposer.composeSortKeyPrefix(
+              beginsWith: KeyComposer.composeSortKeyBeginsWith(
                 entityLike._schema,
                 entityLike.entityType,
                 1,
@@ -1052,26 +1050,53 @@ const makeFromConfig = (config: {
           for (let i = 0; i < targetIndex; i++) {
             pinnedRecord[skComposites[i]!] = composites[skComposites[i]!]
           }
-          const composeAt = (record: Record<string, unknown>): string =>
+          const compose = (value: string): string =>
             KeyComposer.composeSortKeyPrefix(
               entityLike._schema,
               entityLike.entityType,
               1,
               indexDef,
-              record,
+              {
+                ...pinnedRecord,
+                [targetAttr]: value,
+              },
             )
-          const compose = (value: string): string =>
-            composeAt({ ...pinnedRecord, [targetAttr]: value })
 
           const isLastComposite = targetIndex === skComposites.length - 1
-          // Everything after the target's value in a stored key starts with the
-          // delimiter, so `<composed>#` opens the value's subtree and
-          // `<composed>#￿` closes it.
-          const subtree = (value: string): string => `${compose(value)}${SK_DELIMITER}`
-          const subtreeMax = (value: string): string => `${subtree(value)}${SK_MAX_SENTINEL}`
+
+          /**
+           * `begins_with` operand matching exactly the keys whose target
+           * composite equals `value`. Delegates the delimiter rule (#115) to
+           * `composeSortKeyBeginsWith` — one rule, shared with the accessor's
+           * own prefix — so it stops on a segment boundary rather than leaking
+           * into sibling values (`status_done` vs `status_done_archived`).
+           */
+          const subtreeBeginsWith = (value: string): string =>
+            KeyComposer.composeSortKeyBeginsWith(
+              entityLike._schema,
+              entityLike.entityType,
+              1,
+              indexDef,
+              { ...pinnedRecord, [targetAttr]: value },
+            )
+
+          /**
+           * A bound sorting strictly above every key whose target composite is
+           * `value`, and strictly below the first key of any greater value.
+           *
+           * Unlike `subtreeBeginsWith` the delimiter here is UNCONDITIONAL,
+           * including on the last composite: `compose(v)￿` alone would sort
+           * below `compose(v + "0")`, which is a strictly greater value that
+           * must stay inside a `gt`. `compose(v)#￿` sits above `compose(v)` and
+           * below every longer value because `#` is lower than every character
+           * the composer emits for a value segment.
+           */
+          const aboveSubtree = (value: string): string =>
+            `${compose(value)}${DynamoSchema.KEY_DELIMITER}${SK_MAX_SENTINEL}`
+
           /** Inclusive upper bound covering the whole subtree of `value`. */
           const upper = (value: string): string =>
-            isLastComposite ? compose(value) : subtreeMax(value)
+            isLastComposite ? compose(value) : aboveSubtree(value)
 
           // `beginsWith` / `between` / `eq` already carry the pinned composites
           // in BOTH operands, so they never escape the pinned prefix.
@@ -1079,7 +1104,7 @@ const makeFromConfig = (config: {
           if ("eq" in condition) {
             return isLastComposite
               ? { eq: compose(condition.eq) }
-              : { beginsWith: subtree(condition.eq) }
+              : { beginsWith: subtreeBeginsWith(condition.eq) }
           }
           if ("between" in condition) {
             return { between: [compose(condition.between[0]), upper(condition.between[1])] }
@@ -1098,16 +1123,25 @@ const makeFromConfig = (config: {
             // `>` is already exclusive of the composed value, so only a
             // non-terminal target needs the subtree pushed past.
             if ("gt" in condition) {
-              return { gt: isLastComposite ? compose(condition.gt) : subtreeMax(condition.gt) }
+              return { gt: isLastComposite ? compose(condition.gt) : aboveSubtree(condition.gt) }
             }
             if ("gte" in condition) return { gte: compose(condition.gte) }
             return condition
           }
 
-          const pinnedPrefix = composeAt(pinnedRecord)
-          const pinnedMax = `${pinnedPrefix}${SK_DELIMITER}${SK_MAX_SENTINEL}`
+          // The pinned composites are a strict prefix by construction (the
+          // target composite follows them), so the shared delimiter rule always
+          // terminates this bound on a segment boundary.
+          const pinnedPrefix = KeyComposer.composeSortKeyBeginsWith(
+            entityLike._schema,
+            entityLike.entityType,
+            1,
+            indexDef,
+            pinnedRecord,
+          )
+          const pinnedMax = `${pinnedPrefix}${SK_MAX_SENTINEL}`
           if ("gte" in condition) return { between: [compose(condition.gte), pinnedMax] }
-          if ("gt" in condition) return { between: [subtreeMax(condition.gt), pinnedMax] }
+          if ("gt" in condition) return { between: [aboveSubtree(condition.gt), pinnedMax] }
           if ("lte" in condition) return { between: [pinnedPrefix, upper(condition.lte)] }
           if ("lt" in condition) {
             // On a non-terminal composite no stored key can equal the composed

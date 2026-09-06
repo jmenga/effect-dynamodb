@@ -11,6 +11,7 @@
  */
 
 import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { type Effect, Stream } from "effect"
 import type { DynamoClientError } from "../DynamoClient.js"
 import * as Query from "../Query.js"
@@ -22,16 +23,40 @@ import type { Path, PathBuilder } from "./PathBuilder.js"
 // Sort key condition ops for the `where` callback
 // ---------------------------------------------------------------------------
 
+/**
+ * Operand type accepted by a `.where()` condition on a sort key composite
+ * whose value type is `V`.
+ *
+ * - **String-typed composites** (including literal unions like
+ *   `"todo" | "done"`) widen to `string`, so open bounds and `beginsWith`
+ *   prefixes that are not themselves valid values still typecheck.
+ * - **Every other composite** keeps its own type. That is the point of
+ *   issue #114: `serializeValue` zero-pads numbers to 16 digits and bigints
+ *   to 38 on the write path, so a stringly-typed `"42"` compares against
+ *   `"0000000000000042"` and sorts *after* every stored value — a silent
+ *   mismatch. Requiring the composite's own type means the operand goes
+ *   through the same serialization the stored key did.
+ */
+export type SkOperand<V> = [V] extends [string] ? string : V
+
 /** Sort key condition operators for `.where()` callback.
- * The `field` parameter accepts values from `t` (e.g. `t.status`). */
+ * The `field` parameter accepts values from `t` (e.g. `t.status`); `V` is
+ * inferred from it so the operand type follows the composite. */
 export interface SkConditionOps<SK = Record<string, unknown>> {
-  readonly eq: (field: SK[keyof SK], value: string) => Query.SortKeyCondition
-  readonly lt: (field: SK[keyof SK], value: string) => Query.SortKeyCondition
-  readonly lte: (field: SK[keyof SK], value: string) => Query.SortKeyCondition
-  readonly gt: (field: SK[keyof SK], value: string) => Query.SortKeyCondition
-  readonly gte: (field: SK[keyof SK], value: string) => Query.SortKeyCondition
-  readonly between: (field: SK[keyof SK], low: string, high: string) => Query.SortKeyCondition
-  readonly beginsWith: (field: SK[keyof SK], prefix: string) => Query.SortKeyCondition
+  readonly eq: <V extends SK[keyof SK]>(field: V, value: SkOperand<V>) => Query.SortKeyCondition
+  readonly lt: <V extends SK[keyof SK]>(field: V, value: SkOperand<V>) => Query.SortKeyCondition
+  readonly lte: <V extends SK[keyof SK]>(field: V, value: SkOperand<V>) => Query.SortKeyCondition
+  readonly gt: <V extends SK[keyof SK]>(field: V, value: SkOperand<V>) => Query.SortKeyCondition
+  readonly gte: <V extends SK[keyof SK]>(field: V, value: SkOperand<V>) => Query.SortKeyCondition
+  readonly between: <V extends SK[keyof SK]>(
+    field: V,
+    low: SkOperand<V>,
+    high: SkOperand<V>,
+  ) => Query.SortKeyCondition
+  readonly beginsWith: <V extends SK[keyof SK]>(
+    field: V,
+    prefix: SkOperand<V>,
+  ) => Query.SortKeyCondition
 }
 
 /**
@@ -42,6 +67,14 @@ export interface SkConditionOps<SK = Record<string, unknown>> {
  * needs that name so it can compose the operand into the *same* position of
  * the stored sort key — otherwise the raw operand is compared against a fully
  * composed key and the condition silently matches everything or nothing.
+ *
+ * Operands are run through `KeyComposer.serializeValue` — the SAME function
+ * the write path uses — so a numeric composite is zero-padded, a `Date` /
+ * `DateTime` becomes its ISO form, and the operand compares like-for-like
+ * against the stored key (issue #114). `serializeValue` is idempotent on its
+ * own output, so the downstream `composeSkCondition` hooks (which compose
+ * through `KeyComposer` again) are unaffected. Casing is NOT applied here —
+ * it belongs to key composition, which happens downstream.
  *
  * The callback is invoked synchronously and exactly once, so a closed-over
  * mutable slot is safe here.
@@ -54,34 +87,35 @@ const makeSkConditionOps = (): {
   const capture = (field: unknown): void => {
     if (typeof field === "string") target = field
   }
+  const s = (value: unknown): string => KeyComposer.serializeValue(value)
   const ops: SkConditionOps<any> = {
     eq: (field, value) => {
       capture(field)
-      return { eq: value }
+      return { eq: s(value) }
     },
     lt: (field, value) => {
       capture(field)
-      return { lt: value }
+      return { lt: s(value) }
     },
     lte: (field, value) => {
       capture(field)
-      return { lte: value }
+      return { lte: s(value) }
     },
     gt: (field, value) => {
       capture(field)
-      return { gt: value }
+      return { gt: s(value) }
     },
     gte: (field, value) => {
       capture(field)
-      return { gte: value }
+      return { gte: s(value) }
     },
     between: (field, low, high) => {
       capture(field)
-      return { between: [low, high] }
+      return { between: [s(low), s(high)] }
     },
     beginsWith: (field, prefix) => {
       capture(field)
-      return { beginsWith: prefix }
+      return { beginsWith: s(prefix) }
     },
   }
   return { ops, targetField: () => target }

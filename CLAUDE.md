@@ -6,7 +6,7 @@
 
 Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, composite key composition from entity attributes, type-safe index-aware queries with Stream-based pagination, and DynamoClient as an Effect Service with Layer-based dependency injection.
 
-**Status:** All modules implemented. 1113 core tests, 281 schema tests, 56 geo tests, 195 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
+**Status:** All modules implemented. 1129 core tests, 291 schema tests, 56 geo tests, 205 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
 **Design:** `DESIGN.md` — API specification (source of truth for implementation)
 
 ## Architecture
@@ -108,7 +108,7 @@ EventStore → DynamoClient, DynamoSchema, Table, KeyComposer, Marshaller, Query
 GeoIndex → Entity, Query (in effect-dynamodb-geo package)
 DynamoClient → effect (Context, Layer), @aws-sdk/client-dynamodb, Entity, Collections, Aggregate (for make() binding + collection auto-discovery)
 Table → DynamoSchema, Entity (type-level for member registration)
-BoundQuery → Query, PathBuilder, Expr (thin typed wrapper over Query<A>)
+BoundQuery → Query, PathBuilder, Expr, KeyComposer (thin typed wrapper over Query<A>; KeyComposer.serializeValue normalises `.where()` operands)
 Expression → Marshaller (types only — shorthand compilation routes through Expr)
 TransactableOps → Entity, KeyComposer, Marshaller, Errors (shared Batch/Transaction helpers)
 DynamoModel → effect (Schema)

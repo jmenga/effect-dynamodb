@@ -77,9 +77,8 @@ const allMembers = yield* db.entities.Memberships.primary({
   orgId: "org-acme",
 }).collect()
 
-// Narrow by sort-key prefix — equivalent to `.get()` here because the full SK
-// composite is provided, but returns an array (possibly empty) rather than
-// failing with `ItemNotFound`.
+// Narrow by sort-key prefix — the full SK composite is provided, so this
+// returns an array (possibly empty) rather than failing with `ItemNotFound`.
 const bobs = yield* db.entities.Memberships.primary({
   orgId: "org-acme",
   userId: "u-bob",
@@ -88,11 +87,19 @@ const bobs = yield* db.entities.Memberships.primary({
 
 Behavior is symmetric with GSI accessors: `.where()`, `.filter()`, `.select()`, `.limit()`, `.reverse()`, `.startFrom()`, `.consistentRead()`, `.collect()`, `.fetch()`, `.paginate()`, and `.count()` all chain off the returned `BoundQuery`.
 
+### How much of the sort key an accessor pins
+
+Supplying **some** of the sort key composites narrows to exactly those composite values. The generated `begins_with` stops on a segment boundary, so a value is never confused with a longer sibling — `byTenant({ tenantId, status: "done" })` on `sk: ["status", "taskId"]` matches `done` only, not `done_archived` or `doneish`.
+
+Supplying **all** of them is still a prefix match, not an exact one: the stored key ends there, so there is no boundary left to stop on and a longer sibling value can match. On `sk: ["label"]`, `byBoard({ boardId, label: "ship" })` also returns `shipped` and `ship_it`. Use `.get()` when you want exactly one item, or leave the composite off the accessor and pass it to `.where()` instead — `byBoard({ boardId }).where((t, { eq }) => eq(t.label, "ship"))` compiles to `sk = …#label_ship`, an exact match.
+
 ## Sort Key Conditions
 
 `.where()` adds a `KeyConditionExpression` against a remaining sort key composite — DynamoDB evaluates it on the index server-side, so it **does** reduce read capacity. Use it whenever the condition is on a sort-key composite the accessor hasn't already pinned. Operators: `eq`, `lt`, `lte`, `gt`, `gte`, `between`, `beginsWith`.
 
-The operand you pass is a **composite attribute value**, not a raw sort key. The library composes it into the same `$schema#v1#entity#<name>_<value>` shape the write path stores, applying the schema's casing, so `gte(t.createdAt, "2025-02-10")` compares like-for-like against the stored key.
+The operand you pass is a **composite attribute value**, not a raw sort key. The library composes it into the same `$schema#v1#entity#<name>_<value>` shape the write path stores — same serialization, same casing — so `gte(t.createdAt, "2025-02-10")` compares like-for-like against the stored key.
+
+That includes the composite's **type**. A composite typed `number`, `bigint`, `boolean`, `Date` or `DateTime` takes a value of that type, not a string, because the write path zero-pads numbers (16 digits) and bigints (38 digits) and formats dates as ISO strings. Passing `"42"` for a numeric composite is a compile error rather than a query that silently matches nothing.
 
 ```typescript region="sk-conditions" example="guide-queries.ts"
 // byProject SK composites: ["status", "createdAt"].
@@ -115,6 +122,14 @@ const activeInFeb = yield* db.entities.TaskEntity.byProject({
   status: "active",
 })
   .where((t, { between }) => between(t.createdAt, "2025-02-01", "2025-02-28"))
+  .collect()
+```
+
+```typescript region="sk-typed-operands" example="guide-queries.ts"
+// `estimateHours` is a number, so `.where()` takes a number — not a string.
+// The library zero-pads it exactly as the stored key was padded.
+const bigTasks = yield* db.entities.TaskEntity.byEstimate({ projectId: "proj-alpha" })
+  .where((t, { gte }) => gte(t.estimateHours, 8))
   .collect()
 ```
 

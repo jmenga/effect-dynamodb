@@ -8167,3 +8167,338 @@ describeConnected("sort key conditions via .where() (closes #101)", () => {
       }).pipe(provideSkCond),
   )
 })
+
+// ---------------------------------------------------------------------------
+// #115 — partial sort-key `begins_with` must terminate on a segment boundary
+// #114 — `.where()` operands are serialised like the stored key
+//
+// #115: `byTenant({ status: "done" })` composed `begins_with(sk,
+// "…#status_done")`, which also matched `status_done_archived` and
+// `status_doneish`. The delimiter is now appended iff composites remain.
+// #114: a numeric composite is zero-padded on write, so a stringly-typed
+// `"42"` operand sorted after every stored value. Operands now carry the
+// composite's own type and go through the same `serializeValue`.
+// ---------------------------------------------------------------------------
+
+const skpSchema = DynamoSchema.make({ name: "skp", version: 1 })
+const skpTableName = `skp-test-${Date.now()}`
+
+class PrefixTask extends Schema.Class<PrefixTask>("PrefixTask")({
+  tenantId: Schema.String,
+  status: Schema.String,
+  taskId: Schema.String,
+}) {}
+
+const PrefixTasks = Entity.make({
+  model: PrefixTask,
+  entityType: "PrefixTask",
+  primaryKey: {
+    pk: { field: "pk", composite: ["tenantId"] },
+    sk: { field: "sk", composite: ["status", "taskId"] },
+  },
+  indexes: {
+    byTenant: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["status", "taskId"] },
+    },
+  },
+})
+
+// Single-composite sort key — supplying it is a COMPLETE key.
+class PrefixNote extends Schema.Class<PrefixNote>("PrefixNote")({
+  boardId: Schema.String,
+  label: Schema.String,
+}) {}
+
+const PrefixNotes = Entity.make({
+  model: PrefixNote,
+  entityType: "PrefixNote",
+  primaryKey: {
+    pk: { field: "pk", composite: ["boardId"] },
+    sk: { field: "sk", composite: ["label"] },
+  },
+  indexes: {
+    byBoard: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["boardId"] },
+      sk: { field: "gsi1sk", composite: ["label"] },
+    },
+  },
+})
+
+// Non-string sort key composites.
+class TypedSample extends Schema.Class<TypedSample>("TypedSample")({
+  deviceId: Schema.String,
+  seq: Schema.Number,
+  ok: Schema.Boolean,
+  at: Schema.Date,
+  zoned: Schema.DateTimeUtc,
+}) {}
+
+const TypedSamples = Entity.make({
+  model: TypedSample,
+  entityType: "TypedSample",
+  primaryKey: {
+    pk: { field: "pk", composite: ["deviceId"] },
+    sk: { field: "sk", composite: ["seq"] },
+  },
+  indexes: {
+    byFlag: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["deviceId"] },
+      sk: { field: "gsi2sk", composite: ["ok", "seq"] },
+    },
+    byAt: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["deviceId"] },
+      sk: { field: "gsi3sk", composite: ["at"] },
+    },
+    byZoned: {
+      name: "gsi4",
+      pk: { field: "gsi4pk", composite: ["deviceId"] },
+      sk: { field: "gsi4sk", composite: ["zoned"] },
+    },
+  },
+})
+
+const SkpTable = Table.make({
+  schema: skpSchema,
+  entities: { PrefixTasks, PrefixNotes, TypedSamples },
+})
+const SkpLayer = Layer.mergeAll(ClientLayer, SkpTable.layer({ name: skpTableName }))
+const provideSkp = Effect.provide(SkpLayer)
+
+const skpEntities = { PrefixTasks, PrefixNotes, TypedSamples }
+const skpTables = { SkpTable }
+
+const SAMPLE_SEQS = [5, 42, 100] as const
+const sampleAt = (seq: number) => new Date(Date.UTC(2026, 0, 1 + seq, 0, 0, 0))
+
+describeConnected("sort key prefix + typed operands (closes #114, closes #115)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: skpTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(SkpTable),
+        })
+        const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+
+        for (const [status, taskId] of [
+          ["done", "t1"],
+          ["done", "t2"],
+          ["done_archived", "t3"],
+          ["doneish", "t4"],
+          ["todo", "t5"],
+        ] as const) {
+          yield* db.entities.PrefixTasks.put({ tenantId: "acme", status, taskId })
+        }
+        for (const label of ["ship", "shipped", "ship_it"]) {
+          yield* db.entities.PrefixNotes.put({ boardId: "b1", label })
+        }
+        for (const seq of SAMPLE_SEQS) {
+          yield* db.entities.TypedSamples.put({
+            deviceId: "d1",
+            seq,
+            ok: seq !== 42,
+            at: sampleAt(seq),
+            zoned: DateTime.makeUnsafe(sampleAt(seq).toISOString()),
+          })
+        }
+      }).pipe(provideSkp, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: skpTableName })
+      }).pipe(
+        provideSkp,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  // ----- #115 -----
+
+  it.effect("#115 partial prefix excludes sibling values on a named GSI", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      const rows = yield* db.entities.PrefixTasks.byTenant({
+        tenantId: "acme",
+        status: "done",
+      }).collect()
+      // Pre-fix this returned 4 — `done_archived` and `doneish` also begin with
+      // `status_done`.
+      expect(rows.map((r) => `${r.status}/${r.taskId}`)).toEqual(["done/t1", "done/t2"])
+    }).pipe(provideSkp),
+  )
+
+  it.effect("#115 partial prefix excludes sibling values on the primary accessor", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      const rows = yield* db.entities.PrefixTasks.primary({
+        tenantId: "acme",
+        status: "done",
+      }).collect()
+      expect(rows.map((r) => `${r.status}/${r.taskId}`)).toEqual(["done/t1", "done/t2"])
+    }).pipe(provideSkp),
+  )
+
+  it.effect("#115 a complete SK composite set still matches its row", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      // The regression guard for the rule: a delimiter here would match nothing.
+      const gsi = yield* db.entities.PrefixTasks.byTenant({
+        tenantId: "acme",
+        status: "done",
+        taskId: "t1",
+      }).collect()
+      expect(gsi.map((r) => r.taskId)).toEqual(["t1"])
+
+      const pk = yield* db.entities.PrefixTasks.primary({
+        tenantId: "acme",
+        status: "done",
+        taskId: "t2",
+      }).collect()
+      expect(pk.map((r) => r.taskId)).toEqual(["t2"])
+    }).pipe(provideSkp),
+  )
+
+  it.effect("#115 single-composite sort key is a complete key — still a prefix match", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      // Documented behaviour, unchanged by #115: with every composite supplied
+      // the accessor still issues `begins_with` on the full composed key, so
+      // longer sibling values match. Use `.get()` for a single exact item.
+      const rows = yield* db.entities.PrefixNotes.byBoard({
+        boardId: "b1",
+        label: "ship",
+      }).collect()
+      expect(rows.map((r) => r.label).sort()).toEqual(["ship", "ship_it", "shipped"])
+
+      // The documented escape hatch: leave the composite off the accessor and
+      // let `.where()` compose an exact `sk = …#label_ship`.
+      const exact = yield* db.entities.PrefixNotes.byBoard({ boardId: "b1" })
+        .where((t, ops) => ops.eq(t.label, "ship"))
+        .collect()
+      expect(exact.map((r) => r.label)).toEqual(["ship"])
+    }).pipe(provideSkp),
+  )
+
+  it.effect("#115 pinned-prefix .where() bounds do not leak into sibling values", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      const q = db.entities.PrefixTasks.byTenant({ tenantId: "acme", status: "done" })
+
+      const gte = yield* q.where((t, ops) => ops.gte(t.taskId, "t1")).collect()
+      expect(gte.map((r) => `${r.status}/${r.taskId}`)).toEqual(["done/t1", "done/t2"])
+
+      const gt = yield* q.where((t, ops) => ops.gt(t.taskId, "t1")).collect()
+      expect(gt.map((r) => `${r.status}/${r.taskId}`)).toEqual(["done/t2"])
+
+      const lte = yield* q.where((t, ops) => ops.lte(t.taskId, "t2")).collect()
+      expect(lte.map((r) => `${r.status}/${r.taskId}`)).toEqual(["done/t1", "done/t2"])
+    }).pipe(provideSkp),
+  )
+
+  // ----- #114 -----
+
+  it.effect("#114 numeric composite compares against the zero-padded stored key", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      const q = () => db.entities.TypedSamples.primary({ deviceId: "d1" })
+
+      const all = yield* q().collect()
+      expect(all.map((r) => r.seq)).toEqual([5, 42, 100])
+
+      const gte = yield* q()
+        .where((t, ops) => ops.gte(t.seq, 42))
+        .collect()
+      expect(gte.map((r) => r.seq)).toEqual([42, 100])
+
+      const lt = yield* q()
+        .where((t, ops) => ops.lt(t.seq, 42))
+        .collect()
+      expect(lt.map((r) => r.seq)).toEqual([5])
+
+      const eq = yield* q()
+        .where((t, ops) => ops.eq(t.seq, 42))
+        .collect()
+      expect(eq.map((r) => r.seq)).toEqual([42])
+
+      const between = yield* q()
+        .where((t, ops) => ops.between(t.seq, 5, 42))
+        .collect()
+      expect(between.map((r) => r.seq)).toEqual([5, 42])
+    }).pipe(provideSkp),
+  )
+
+  // NOTE: `bigint` composites are covered in the unit suite only
+  // (`DynamoClient.test.ts` asserts the 38-digit padded operand). A bigint
+  // sort key composite cannot round-trip through DynamoDB today: `Schema.BigInt`
+  // fails to decode (the SDK unmarshalls `N` to a JS number) and
+  // `Schema.BigIntFromString` composes the key from its ENCODED string, which is
+  // not zero-padded. That is a pre-existing modelling gap, unrelated to #114.
+
+  it.effect("#114 boolean composite", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      const truthy = yield* db.entities.TypedSamples.byFlag({ deviceId: "d1" })
+        .where((t, ops) => ops.eq(t.ok, true))
+        .collect()
+      expect(truthy.map((r) => r.seq)).toEqual([5, 100])
+
+      const falsy = yield* db.entities.TypedSamples.byFlag({ deviceId: "d1" })
+        .where((t, ops) => ops.eq(t.ok, false))
+        .collect()
+      expect(falsy.map((r) => r.seq)).toEqual([42])
+    }).pipe(provideSkp),
+  )
+
+  it.effect("#114 Date composite", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      const rows = yield* db.entities.TypedSamples.byAt({ deviceId: "d1" })
+        .where((t, ops) => ops.gte(t.at, sampleAt(42)))
+        .collect()
+      expect(rows.map((r) => r.seq)).toEqual([42, 100])
+
+      const between = yield* db.entities.TypedSamples.byAt({ deviceId: "d1" })
+        .where((t, ops) => ops.between(t.at, sampleAt(5), sampleAt(42)))
+        .collect()
+      expect(between.map((r) => r.seq)).toEqual([5, 42])
+    }).pipe(provideSkp),
+  )
+
+  it.effect("#114 DateTime composite", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      const rows = yield* db.entities.TypedSamples.byZoned({ deviceId: "d1" })
+        .where((t, ops) => ops.gt(t.zoned, DateTime.makeUnsafe(sampleAt(5).toISOString())))
+        .collect()
+      expect(rows.map((r) => r.seq)).toEqual([42, 100])
+    }).pipe(provideSkp),
+  )
+
+  it.effect("#114 string composites are unchanged — serializeValue is identity", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      const rows = yield* db.entities.PrefixTasks.byTenant({ tenantId: "acme" })
+        .where((t, ops) => ops.beginsWith(t.status, "done"))
+        .collect()
+      expect(rows.map((r) => `${r.status}/${r.taskId}`)).toEqual([
+        "done/t1",
+        "done/t2",
+        "done_archived/t3",
+        "doneish/t4",
+      ])
+    }).pipe(provideSkp),
+  )
+})

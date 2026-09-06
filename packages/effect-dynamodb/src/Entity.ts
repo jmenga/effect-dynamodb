@@ -5015,7 +5015,11 @@ const makeImpl = <
         resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
       })
       if (hasSkComposites) {
-        const skPrefix = KeyComposer.composeSortKeyPrefix(
+        // `composeSortKeyBeginsWith`, not `composeSortKeyPrefix` — the operand
+        // must terminate on a segment boundary when composites remain, or it
+        // matches sibling values that merely start with the supplied one
+        // (`status_done` also matching `status_done_archived`, issue #115).
+        const skPrefix = KeyComposer.composeSortKeyBeginsWith(
           schema,
           entityType,
           entityVersion,
