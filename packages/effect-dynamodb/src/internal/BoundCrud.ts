@@ -11,6 +11,7 @@
  * `Effect.gen`; use `.asEffect()` for Effect combinator interop.
  */
 
+import type { ConditionalCheckFailed } from "@effect-dynamodb/schema/Errors.js"
 import type { Effect } from "effect"
 import { Pipeable, Utils } from "effect"
 import {
@@ -93,8 +94,16 @@ const buildCondition = <Model>(cfg: BoundCrudConfig<Model>, arg: ConditionArg<Mo
  * ```
  */
 export interface BoundPut<Model, A, E, VN extends string = string> extends Pipeable.Pipeable {
-  /** Add a condition expression. Callback or shorthand. */
-  readonly condition: (cond: ConditionArg<Model>) => BoundPut<Model, A, E, VN>
+  /**
+   * Add a condition expression. Callback or shorthand.
+   *
+   * Widens the error channel with {@link ConditionalCheckFailed} — DynamoDB
+   * rejecting the condition is the failure this combinator makes reachable, so
+   * `Effect.catchTag("ConditionalCheckFailed", ...)` type-checks downstream.
+   */
+  readonly condition: (
+    cond: ConditionArg<Model>,
+  ) => BoundPut<Model, A, E | ConditionalCheckFailed, VN>
   /**
    * Supply a pre-computed embedding for a named vector index, skipping the
    * `Embedder` for that index on this write. `name` is the LOGICAL vector index
@@ -116,10 +125,10 @@ export class BoundPutImpl<Model, A, E, VN extends string = string>
     readonly _config: BoundCrudConfig<Model>,
   ) {}
 
-  condition(cond: ConditionArg<Model>): BoundPutImpl<Model, A, E, VN> {
+  condition(cond: ConditionArg<Model>): BoundPutImpl<Model, A, E | ConditionalCheckFailed, VN> {
     const compiled = buildCondition(this._config, cond)
     const next = conditionCombinator(this._op, compiled)
-    return new BoundPutImpl(next, this._config)
+    return new BoundPutImpl<Model, A, E | ConditionalCheckFailed, VN>(next, this._config)
   }
 
   withVector(name: VN, vector: ReadonlyArray<number>): BoundPutImpl<Model, A, E, VN> {
@@ -155,8 +164,14 @@ export class BoundPutImpl<Model, A, E, VN extends string = string>
  * ```
  */
 export interface BoundDelete<Model, E> extends Pipeable.Pipeable {
-  /** Add a condition expression. Callback or shorthand. */
-  readonly condition: (cond: ConditionArg<Model>) => BoundDelete<Model, E>
+  /**
+   * Add a condition expression. Callback or shorthand.
+   *
+   * Widens the error channel with {@link ConditionalCheckFailed} — DynamoDB
+   * rejecting the condition is the failure this combinator makes reachable, so
+   * `Effect.catchTag("ConditionalCheckFailed", ...)` type-checks downstream.
+   */
+  readonly condition: (cond: ConditionArg<Model>) => BoundDelete<Model, E | ConditionalCheckFailed>
   /** Set ReturnValues mode (`"none"` or `"allOld"`). */
   readonly returnValues: (mode: ReturnValuesMode) => BoundDelete<Model, E>
   /** Convert to an executable Effect for Effect combinator interop. */
@@ -172,10 +187,10 @@ export class BoundDeleteImpl<Model, E> implements BoundDelete<Model, E> {
     readonly _config: BoundCrudConfig<Model>,
   ) {}
 
-  condition(cond: ConditionArg<Model>): BoundDeleteImpl<Model, E> {
+  condition(cond: ConditionArg<Model>): BoundDeleteImpl<Model, E | ConditionalCheckFailed> {
     const compiled = buildCondition(this._config, cond)
     const next = conditionCombinator(this._op, compiled)
-    return new BoundDeleteImpl(next, this._config)
+    return new BoundDeleteImpl<Model, E | ConditionalCheckFailed>(next, this._config)
   }
 
   returnValues(mode: ReturnValuesMode): BoundDeleteImpl<Model, E> {
@@ -233,8 +248,20 @@ export interface BoundUpdate<Model, A, U, E, VN extends string = string> extends
   ) => BoundUpdate<Model, A, U, E, VN>
   /** Optimistic concurrency — expected version. */
   readonly expectedVersion: (version: number) => BoundUpdate<Model, A, U, E, VN>
-  /** Add a condition expression. Callback or shorthand. */
-  readonly condition: (cond: ConditionArg<Model>) => BoundUpdate<Model, A, U, E, VN>
+  /**
+   * Add a condition expression. Callback or shorthand.
+   *
+   * Widens the error channel with {@link ConditionalCheckFailed} — DynamoDB
+   * rejecting the condition is the failure this combinator makes reachable, so
+   * `Effect.catchTag("ConditionalCheckFailed", ...)` type-checks downstream.
+   *
+   * Note: when `.expectedVersion(...)` is also set, a rejection is reported as
+   * `OptimisticLockError` — the two conditions ride the same
+   * `ConditionExpression` and DynamoDB does not say which half failed.
+   */
+  readonly condition: (
+    cond: ConditionArg<Model>,
+  ) => BoundUpdate<Model, A, U, E | ConditionalCheckFailed, VN>
   /**
    * Supply a pre-computed embedding for a named vector index, skipping the
    * `Embedder` for that index on this write. `name` is the LOGICAL vector index
@@ -330,9 +357,14 @@ export class BoundUpdateImpl<Model, A, U, E, VN extends string = string>
     return this._with(expectedVersionCombinator(this._op, version))
   }
 
-  condition(cond: ConditionArg<Model>): BoundUpdateImpl<Model, A, U, E, VN> {
+  condition(
+    cond: ConditionArg<Model>,
+  ): BoundUpdateImpl<Model, A, U, E | ConditionalCheckFailed, VN> {
     const compiled = buildCondition(this._config, cond)
-    return this._with(conditionCombinator(this._op, compiled))
+    return new BoundUpdateImpl<Model, A, U, E | ConditionalCheckFailed, VN>(
+      conditionCombinator(this._op, compiled),
+      this._config,
+    )
   }
 
   withVector(name: VN, vector: ReadonlyArray<number>): BoundUpdateImpl<Model, A, U, E, VN> {

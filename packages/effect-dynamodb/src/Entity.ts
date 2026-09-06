@@ -143,6 +143,7 @@ export {
   asModel,
   asNative,
   asRecord,
+  type ConditionPipeable,
   cascade,
   clearMap,
   consistentRead,
@@ -201,6 +202,7 @@ import type {
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import {
   asModel,
+  type ConditionPipeable,
   condition as conditionCombinator,
   expectedVersion,
   set,
@@ -782,6 +784,10 @@ export interface Entity<
    * // Shorthand
    * Teams.condition({ status: "active" })
    * ```
+   *
+   * Applying the returned pipeable widens the operation's error channel with
+   * {@link ConditionalCheckFailed}, so `Effect.catchTag("ConditionalCheckFailed", ...)`
+   * type-checks on the resulting Effect.
    */
   readonly condition: {
     (
@@ -789,24 +795,8 @@ export interface Entity<
         t: import("./internal/PathBuilder.js").PathBuilder<ModelType<TModel>, ModelType<TModel>>,
         ops: import("./internal/Expr.js").ConditionOps<ModelType<TModel>>,
       ) => import("./internal/Expr.js").Expr,
-    ): <
-      T extends
-        | EntityPut<any, any, any, any>
-        | EntityUpdate<any, any, any, any, any>
-        | EntityDelete<any, any>,
-    >(
-      self: T,
-    ) => T
-    (
-      shorthand: globalThis.Record<string, unknown>,
-    ): <
-      T extends
-        | EntityPut<any, any, any, any>
-        | EntityUpdate<any, any, any, any, any>
-        | EntityDelete<any, any>,
-    >(
-      self: T,
-    ) => T
+    ): ConditionPipeable
+    (shorthand: globalThis.Record<string, unknown>): ConditionPipeable
   }
 
   /**
@@ -3334,7 +3324,31 @@ const makeImpl = <
               })
               .pipe(
                 Effect.mapError(
-                  (err): DynamoClientError | OptimisticLockError | UniqueConstraintViolation => {
+                  (
+                    err,
+                  ):
+                    | DynamoClientError
+                    | OptimisticLockError
+                    | ConditionalCheckFailed
+                    | UniqueConstraintViolation => {
+                    // The main item's ConditionExpression carries the version CAS
+                    // (when the entity is versioned) ANDed with any user condition.
+                    // DynamoDB does not say which half rejected, so attribute the
+                    // failure to the version CAS whenever one is present, and to
+                    // the user condition only when it is the sole predicate —
+                    // otherwise an unversioned entity's `.condition()` rejection
+                    // would surface as a nonsensical OptimisticLockError.
+                    const mainItemRejection = (): OptimisticLockError | ConditionalCheckFailed => {
+                      if (!systemFields.version && userCond) {
+                        return new ConditionalCheckFailed({ entityType, key: decodedKey })
+                      }
+                      return new OptimisticLockError({
+                        entityType,
+                        key: decodedKey,
+                        expectedVersion: currentVersion,
+                        actualVersion: -1,
+                      })
+                    }
                     if (isAwsTransactionCancelled(err.cause)) {
                       const reasons = err.cause.CancellationReasons
                       if (reasons) {
@@ -3354,22 +3368,12 @@ const makeImpl = <
                         }
                         // Index 0 is the main item — version conflict or user condition
                         if (reasons[0]?.Code === "ConditionalCheckFailed") {
-                          return new OptimisticLockError({
-                            entityType,
-                            key: decodedKey,
-                            expectedVersion: currentVersion,
-                            actualVersion: -1,
-                          })
+                          return mainItemRejection()
                         }
                       }
                     }
                     if (isAwsConditionalCheckFailed(err.cause)) {
-                      return new OptimisticLockError({
-                        entityType,
-                        key: decodedKey,
-                        expectedVersion: currentVersion,
-                        actualVersion: -1,
-                      })
+                      return mainItemRejection()
                     }
                     return err as
                       | DynamoClientError

@@ -1016,6 +1016,171 @@ describeConnected("Connected integration tests", () => {
   })
 
   // -------------------------------------------------------------------------
+  // `.condition()` widens the error channel — GH #102.
+  //
+  // A conditional write raises `ConditionalCheckFailed` at runtime; these tests
+  // assert the standard idempotent-projector idiom
+  // (`Effect.catchTag("ConditionalCheckFailed", ...)`) actually catches it, on
+  // every surface `.condition()` is exposed. The type half — the tag being
+  // present in the declared channel only after `.condition()` — is asserted in
+  // `Entity.types.test.ts`, which `tsconfig.test.json` type-checks.
+  // -------------------------------------------------------------------------
+
+  describe(".condition() error channel (#102)", () => {
+    const makeDb = DynamoClient.make({
+      entities: { Memberships, Tasks, Vehicles },
+      tables: { MainTable },
+    })
+
+    it.effect("put(...).condition(...) rejection is catchable by tag", () =>
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        const key = { orgId: "org-cond-102", userId: "u-put" }
+
+        yield* db.entities.Memberships.put({ ...key, role: "owner", joinedAt: "2025-01-01" })
+
+        const outcome = yield* db.entities.Memberships.put({
+          ...key,
+          role: "member",
+          joinedAt: "2025-02-01",
+        })
+          .condition((t, { notExists }) => notExists(t.orgId))
+          .asEffect()
+          .pipe(
+            Effect.as("written"),
+            Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("redelivery")),
+          )
+
+        expect(outcome).toBe("redelivery")
+
+        // The rejected write left the stored item untouched.
+        const stored = yield* db.entities.Memberships.get(key)
+        expect(stored.role).toBe("owner")
+      }).pipe(provide),
+    )
+
+    it.effect("update(...).condition(...) rejection is catchable by tag", () =>
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.entities.Tasks.put({
+          taskId: "t-cond-102",
+          userId: "u-cond-102",
+          title: "Original",
+          status: "todo",
+          priority: 1,
+        })
+
+        const outcome = yield* db.entities.Tasks.update({ taskId: "t-cond-102" })
+          .set({ title: "Updated" })
+          .condition({ status: "done" })
+          .asEffect()
+          .pipe(
+            Effect.as("written"),
+            Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("skipped")),
+          )
+
+        expect(outcome).toBe("skipped")
+
+        const stored = yield* db.entities.Tasks.get({ taskId: "t-cond-102" })
+        expect(stored.title).toBe("Original")
+      }).pipe(provide),
+    )
+
+    it.effect("delete(...).condition(...) rejection is catchable by tag", () =>
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        const key = { orgId: "org-cond-102", userId: "u-delete" }
+        yield* db.entities.Memberships.put({ ...key, role: "admin", joinedAt: "2025-01-01" })
+
+        const outcome = yield* db.entities.Memberships.delete(key)
+          .condition({ role: "owner" })
+          .asEffect()
+          .pipe(
+            Effect.as("deleted"),
+            Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("kept")),
+          )
+
+        expect(outcome).toBe("kept")
+
+        const stored = yield* db.entities.Memberships.get(key)
+        expect(stored.role).toBe("admin")
+      }).pipe(provide),
+    )
+
+    it.effect("a satisfied condition still succeeds through the widened channel", () =>
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        const key = { orgId: "org-cond-102", userId: "u-ok" }
+
+        const created = yield* db.entities.Memberships.put({
+          ...key,
+          role: "member",
+          joinedAt: "2025-03-01",
+        })
+          .condition((t, { notExists }) => notExists(t.orgId))
+          .asEffect()
+          .pipe(Effect.catchTag("ConditionalCheckFailed", () => Effect.die("unexpected")))
+
+        expect(created.role).toBe("member")
+      }).pipe(provide),
+    )
+
+    it.effect(
+      "unversioned unique-touching update reports the user condition, not a lock error",
+      () =>
+        // The unique-constraint transact path ANDs the version CAS with the user
+        // condition on the main item. With no version attribute the user
+        // condition is the ONLY predicate, so a rejection must surface as
+        // ConditionalCheckFailed — reporting OptimisticLockError there would
+        // name a version conflict that cannot exist.
+        Effect.gen(function* () {
+          const db = yield* makeDb
+          yield* db.entities.Vehicles.put({
+            vehicleId: "veh-cond-102",
+            accountId: "acct-cond-102",
+            name: "Original",
+          })
+
+          const err = yield* db.entities.Vehicles.update({ vehicleId: "veh-cond-102" })
+            .set({ name: "Renamed" })
+            .condition({ accountId: "acct-someone-else" })
+            .asEffect()
+            .pipe(Effect.flip)
+
+          expect(err._tag).toBe("ConditionalCheckFailed")
+
+          const stored = yield* db.entities.Vehicles.get({ vehicleId: "veh-cond-102" })
+          expect(stored.name).toBe("Original")
+        }).pipe(provide),
+    )
+
+    it.effect("unbound Entity.condition() pipeline is catchable by tag", () =>
+      Effect.gen(function* () {
+        yield* Memberships.put({
+          orgId: "org-cond-102",
+          userId: "u-unbound",
+          role: "member",
+          joinedAt: "2025-04-01",
+        }).asEffect()
+
+        const outcome = yield* Memberships.put({
+          orgId: "org-cond-102",
+          userId: "u-unbound",
+          role: "owner",
+          joinedAt: "2025-05-01",
+        }).pipe(
+          Memberships.condition((t, { notExists }) => notExists(t.orgId)),
+          Entity.asModel,
+          Effect.as("written"),
+          Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("redelivery")),
+        )
+
+        expect(outcome).toBe("redelivery")
+      }).pipe(provide),
+    )
+  })
+
+  // -------------------------------------------------------------------------
   // Primary index query accessor (.primary) — GH #2.
   //
   // Symmetric to GSI accessors: required PK composites, optional SK composites

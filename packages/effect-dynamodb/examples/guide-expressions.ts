@@ -227,6 +227,32 @@ const program = Effect.gen(function* () {
   yield* Console.log("Shorthand condition built\n")
 
   // -----------------------------------------------------------------------
+  // Condition Expressions — Handling a rejected condition
+  // -----------------------------------------------------------------------
+  yield* Console.log("=== Handling a rejected condition ===\n")
+
+  // #region condition-catch
+  // `.condition()` adds ConditionalCheckFailed to the error channel, so the
+  // rejection is catchable by tag — no `catchAll` + `_tag` inspection needed.
+  const outcome = yield* db.entities.Products.put({
+    ...baseProduct,
+    productId: "p-5",
+    name: "Duplicate",
+    category: "electronics",
+    price: 49.99,
+    stock: 10,
+  })
+    .condition((t, { notExists }) => notExists(t.productId))
+    .asEffect()
+    .pipe(
+      Effect.as("written"),
+      Effect.catchTag("ConditionalCheckFailed", () => Effect.succeed("already exists")),
+    )
+  // #endregion
+
+  yield* Console.log(`Conditional put outcome: ${outcome}\n`)
+
+  // -----------------------------------------------------------------------
   // Filter Expressions — Callback API
   // -----------------------------------------------------------------------
   yield* Console.log("=== Filter Expressions — Callback API ===\n")

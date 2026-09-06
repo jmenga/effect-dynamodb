@@ -161,7 +161,7 @@ When using `condition()` on an update that also has `Entity.expectedVersion()`, 
 
 ### Handling ConditionalCheckFailed
 
-Use `Entity.create()` for typed `ConditionalCheckFailed` error handling — `create()` includes this error in its typed error channel:
+`ConditionalCheckFailed` is on the typed error channel wherever it is reachable: on `create()`, `patch()`, `upsert()` and `deleteIfExists()` (which carry a built-in condition), and on any operation once `.condition(...)` is applied. Either way, `Effect.catchTag` handles it without widening by hand:
 
 ```typescript region="handle-conditional" example="guide-advanced.ts"
   // #region handle-conditional

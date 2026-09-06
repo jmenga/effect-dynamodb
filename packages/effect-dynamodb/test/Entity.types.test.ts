@@ -940,3 +940,115 @@ describe("Entity types — timeSeries", () => {
     expectTypeOf<PlainBound["history"]>().toEqualTypeOf<never>()
   })
 })
+
+// ---------------------------------------------------------------------------
+// `.condition()` widens the error channel with ConditionalCheckFailed (#102)
+// ---------------------------------------------------------------------------
+
+describe("Entity types — .condition() error channel", () => {
+  type UserBound = import("../src/Entity.js").BoundEntity<
+    typeof User,
+    typeof UserEntity.indexes,
+    undefined,
+    { readonly userId: string }
+  >
+
+  /** Pull the error channel out of anything exposing `asEffect()`. */
+  type ErrorOf<T> = T extends {
+    readonly asEffect: () => import("effect").Effect.Effect<any, infer E, any>
+  }
+    ? E
+    : never
+
+  /** Distribute a union of tagged errors into its `_tag` literals. */
+  type TagsOf<E> = E extends { readonly _tag: infer Tag } ? Tag : never
+
+  type HasCcf<T> = "ConditionalCheckFailed" extends TagsOf<ErrorOf<T>> ? true : false
+
+  type BoundPutOf<K extends "put" | "create" | "upsert"> = ReturnType<UserBound[K]>
+  type BoundUpdateOf<K extends "update" | "patch"> = ReturnType<UserBound[K]>
+  type BoundDeleteOf<K extends "delete" | "deleteIfExists"> = ReturnType<UserBound[K]>
+
+  const input = {
+    userId: "u-1",
+    email: "u@example.com",
+    displayName: "U",
+    role: "admin",
+  } as const
+
+  it("put(): ConditionalCheckFailed absent before .condition(), present after", () => {
+    expectTypeOf<HasCcf<BoundPutOf<"put">>>().toEqualTypeOf<false>()
+    type Conditioned = ReturnType<BoundPutOf<"put">["condition"]>
+    expectTypeOf<HasCcf<Conditioned>>().toEqualTypeOf<true>()
+  })
+
+  it("delete(): ConditionalCheckFailed absent before .condition(), present after", () => {
+    expectTypeOf<HasCcf<BoundDeleteOf<"delete">>>().toEqualTypeOf<false>()
+    type Conditioned = ReturnType<BoundDeleteOf<"delete">["condition"]>
+    expectTypeOf<HasCcf<Conditioned>>().toEqualTypeOf<true>()
+  })
+
+  it("update(): ConditionalCheckFailed absent before .condition(), present after", () => {
+    expectTypeOf<HasCcf<BoundUpdateOf<"update">>>().toEqualTypeOf<false>()
+    type Conditioned = ReturnType<BoundUpdateOf<"update">["condition"]>
+    expectTypeOf<HasCcf<Conditioned>>().toEqualTypeOf<true>()
+  })
+
+  it(".condition() widening survives further combinators", () => {
+    type Conditioned = ReturnType<BoundUpdateOf<"update">["condition"]>
+    type ThenSet = ReturnType<Conditioned["set"]>
+    type ThenVersion = ReturnType<ThenSet["expectedVersion"]>
+    expectTypeOf<HasCcf<ThenSet>>().toEqualTypeOf<true>()
+    expectTypeOf<HasCcf<ThenVersion>>().toEqualTypeOf<true>()
+  })
+
+  it(".condition() on an update preserves the update payload type", () => {
+    type Base = BoundUpdateOf<"update">
+    type Conditioned = ReturnType<Base["condition"]>
+    expectTypeOf<Parameters<Conditioned["set"]>>().toEqualTypeOf<Parameters<Base["set"]>>()
+  })
+
+  it("ops that already declare ConditionalCheckFailed are unchanged by .condition()", () => {
+    expectTypeOf<HasCcf<BoundPutOf<"create">>>().toEqualTypeOf<true>()
+    expectTypeOf<HasCcf<BoundPutOf<"upsert">>>().toEqualTypeOf<true>()
+    expectTypeOf<HasCcf<BoundUpdateOf<"patch">>>().toEqualTypeOf<true>()
+    expectTypeOf<HasCcf<BoundDeleteOf<"deleteIfExists">>>().toEqualTypeOf<true>()
+
+    // The union collapses — the error channel is identical before and after.
+    type CreateConditioned = ReturnType<BoundPutOf<"create">["condition"]>
+    expectTypeOf<ErrorOf<CreateConditioned>>().toEqualTypeOf<ErrorOf<BoundPutOf<"create">>>()
+  })
+
+  it("OptimisticLockError is unconditional on update — .expectedVersion() does not widen", () => {
+    // Unlike `.condition()`, `.expectedVersion()` adds no error: the base
+    // channel already declares `OptimisticLockError` because a retain/unique
+    // update CASes whether or not an expected version was supplied.
+    type Base = BoundUpdateOf<"update">
+    type WithVersion = ReturnType<Base["expectedVersion"]>
+    type HasLock<T> = "OptimisticLockError" extends TagsOf<ErrorOf<T>> ? true : false
+    expectTypeOf<HasLock<Base>>().toEqualTypeOf<true>()
+    expectTypeOf<ErrorOf<WithVersion>>().toEqualTypeOf<ErrorOf<Base>>()
+  })
+
+  it("unbound Entity.condition() pipeable widens put/update/delete", () => {
+    const put = UserEntity.put(input)
+    const update = UserEntity.update({ userId: "u-1" })
+    const del = UserEntity.delete({ userId: "u-1" })
+
+    const conditionedPut = put.pipe(UserEntity.condition({ role: "admin" }))
+    const conditionedUpdate = update.pipe(UserEntity.condition((t, { eq }) => eq(t.role, "admin")))
+    const conditionedDelete = del.pipe(UserEntity.condition({ role: "admin" }))
+
+    expectTypeOf<HasCcf<typeof put>>().toEqualTypeOf<false>()
+    expectTypeOf<HasCcf<typeof update>>().toEqualTypeOf<false>()
+    expectTypeOf<HasCcf<typeof del>>().toEqualTypeOf<false>()
+
+    expectTypeOf<HasCcf<typeof conditionedPut>>().toEqualTypeOf<true>()
+    expectTypeOf<HasCcf<typeof conditionedUpdate>>().toEqualTypeOf<true>()
+    expectTypeOf<HasCcf<typeof conditionedDelete>>().toEqualTypeOf<true>()
+
+    // An update piped through `condition` stays an EntityUpdate — the `U`
+    // parameter must not be flattened away by the EntityPut-shaped overload.
+    expect(Entity.EntityUpdateTypeId in conditionedUpdate).toBe(true)
+  })
+})
