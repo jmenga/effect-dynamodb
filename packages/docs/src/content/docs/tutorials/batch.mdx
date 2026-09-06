@@ -201,7 +201,7 @@ yield* Transaction.transactWrite([
 :::tip[This is what makes pure-authored entities readable in a batch]
 An entity authored with the pure, AWS-free `@effect-dynamodb/schema` `Entity.make` carries **no** operations — `db.entities.*` is the only surface its author ever holds. Accepting the bound descriptor on the read paths is what puts batch reads, transactional reads and condition checks back within reach for those entities, mirroring what the bound `put` / `delete` builders already do for `Batch.write` and `Transaction.transactWrite`.
 
-Both spellings unwrap through the same protocol, so an array can mix them freely. Anything that is *not* a get descriptor — an already-executed `Effect`, a query, a write op — fails with a `ValidationError` carrying **EDD-9051** rather than a defect you cannot catch.
+Both spellings unwrap through the same protocol, so an array can mix them freely. Anything that is *not* a get descriptor — an already-executed `Effect`, a query, a write op — fails with a `ValidationError` carrying **EDD-9052** rather than a defect you cannot catch.
 :::
 
 ---

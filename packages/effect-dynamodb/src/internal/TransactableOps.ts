@@ -50,7 +50,7 @@ export const generateTimestampPrimitive = (
  * definition needs to be pointed at the client, not at `Entity.get`.
  */
 export const getRejectReason = (operation: string): string =>
-  `[EDD-9051] ${operation} requires a get descriptor — pass \`Entity.get(key)\` or the ` +
+  `[EDD-9052] ${operation} requires a get descriptor — pass \`Entity.get(key)\` or the ` +
   "bound `db.entities.X.get(key)`. An already-executed Effect, a query, or a write op " +
   "carries no key to read."
 

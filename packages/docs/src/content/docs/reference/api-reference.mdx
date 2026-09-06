@@ -660,7 +660,7 @@ const [user, order] = yield* Transaction.transactGet([
 ])
 ```
 
-`db.entities.X.get(key)` returns a `BoundGet`: it **is** an `Effect<Model, …, never>` (yield it, pipe it, `Effect.catchTag` it) and it is *also* a read descriptor, so the same value works in `transactGet`, `Batch.get` and `check`. That matters most for entities authored with the pure, AWS-free `@effect-dynamodb/schema` package — a pure definition carries no operations, so the bound client is the only surface its author holds. Both spellings unwrap through one protocol and can be mixed in a single array; anything else fails with a `ValidationError` carrying **EDD-9051**.
+`db.entities.X.get(key)` returns a `BoundGet`: it **is** an `Effect<Model, …, never>` (yield it, pipe it, `Effect.catchTag` it) and it is *also* a read descriptor, so the same value works in `transactGet`, `Batch.get` and `check`. That matters most for entities authored with the pure, AWS-free `@effect-dynamodb/schema` package — a pure definition carries no operations, so the bound client is the only surface its author holds. Both spellings unwrap through one protocol and can be mixed in a single array; anything else fails with a `ValidationError` carrying **EDD-9052**.
 
 ### transactWrite
 

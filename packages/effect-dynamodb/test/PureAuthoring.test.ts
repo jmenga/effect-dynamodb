@@ -432,11 +432,11 @@ describe("pure-authored entities in Batch / Transaction reads (#108)", () => {
       // catch nor discriminate.
       const batchErr = yield* Batch.get([Effect.succeed(1) as never]).pipe(Effect.flip)
       expect(batchErr._tag).toBe("ValidationError")
-      expect(String(batchErr.cause)).toContain("EDD-9051")
+      expect(String(batchErr.cause)).toContain("EDD-9052")
 
       const txErr = yield* Transaction.transactGet([Effect.succeed(1) as never]).pipe(Effect.flip)
       expect(txErr._tag).toBe("ValidationError")
-      expect(String(txErr.cause)).toContain("EDD-9051")
+      expect(String(txErr.cause)).toContain("EDD-9052")
     }).pipe(Effect.provide(layers)),
   )
 })
