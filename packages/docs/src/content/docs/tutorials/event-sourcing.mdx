@@ -518,7 +518,7 @@ Either everything lands or nothing does. The event puts, your items, and the ver
 
 ### Bound-client builders work too
 
-The bound builders returned by `db.entities.*` (`put`, `create`, `upsert`, `delete`, `deleteIfExists`) are accepted anywhere an `Entity.put` / `Entity.delete` is. That matters most for entities authored with the pure, AWS-free `@effect-dynamodb/schema` package: a pure `EntityDefinition` carries no operations, so the bound builder is the only write descriptor its author can hold — and it is exactly what you need to commit a **read model** atomically with the events that produced it:
+The bound builders returned by `db.entities.*` (`put`, `create`, `delete`, `deleteIfExists`) are accepted anywhere an `Entity.put` / `Entity.delete` is. That matters most for entities authored with the pure, AWS-free `@effect-dynamodb/schema` package: a pure `EntityDefinition` carries no operations, so the bound builder is the only write descriptor its author can hold — and it is exactly what you need to commit a **read model** atomically with the events that produced it:
 
 ```typescript region="additional-items-read-model" example="event-sourcing.ts"
 const db = yield* DynamoClient.make({ entities: { MatchStatus }, tables: { EventsTable } })
@@ -534,6 +534,10 @@ yield* matchEvents.append(
 ```
 
 Conditions ride along: `.condition({ ... })` on a bound put or delete, and the implicit `attribute_not_exists` guard `create()` carries, are compiled into the transact item. A failing one surfaces as `AdditionalItemConditionFailed`, not a version conflict.
+
+:::caution[`upsert` is not a transact item]
+`upsert` is deliberately **not** accepted here, and neither is `update` / `patch`. An `upsert` is an `UpdateItem` whose `SET` clause uses `if_not_exists` for `createdAt`, immutable fields and the version counter — compiling it into a `TransactWriteItems` `Put` would reset all three. Rather than do that quietly, `append` fails with a `ValidationError` naming `upsert`. Use `put()` or `create()` in the transaction, or run the upsert as its own operation outside it.
+:::
 
 ### Telling the failures apart
 

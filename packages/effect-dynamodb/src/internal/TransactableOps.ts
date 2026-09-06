@@ -41,6 +41,90 @@ export const generateTimestampPrimitive = (
 }
 
 /**
+ * Reject an op whose semantics the `TransactWriteItems` / `BatchWriteItem`
+ * compile path cannot faithfully reproduce.
+ *
+ * Both paths turn an entity op into a single self-contained `Put` / `Delete`
+ * built from the encoded input. That is exactly right for a plain `put` /
+ * `delete`, and wrong — silently — for anything whose contract needs a
+ * different DynamoDB verb, extra items, or a service the compile step does not
+ * have. Loud beats silent (#100).
+ *
+ * **What this gate covers, and why not more.** It rejects the cases that are
+ * either newly reachable and silently wrong (`upsert` — see `PutKind`) or that
+ * cannot be working for anyone today: a `refs` entity writes an item whose ref
+ * attribute is absent, so every later read fails to decode; a `generatedId`
+ * entity dies outright (no `Crypto` in scope); a vector-indexed entity writes an
+ * item with no embedding, so it silently drops out of the index.
+ *
+ * It deliberately does NOT reject the multi-item lifecycle features — `unique`,
+ * `versioned: { retain }`, `softDelete`. Those share one root cause with each
+ * other (this path emits exactly one item, so it cannot write a sentinel, a
+ * version snapshot, or a tombstone), they are long-shipped, and this repo's own
+ * connected suite exercises them through `transactWrite`. Fixing them means
+ * emitting EXTRA transact items, which collides with EventStore's position-based
+ * cancellation mapping — the caller-visible `additionalItems` indices must not
+ * shift. That is a deliberate design change with its own semver decision, not a
+ * drive-by.
+ *
+ * `capability` names what the caller would have to give up, so the message can
+ * say why rather than just "unsupported".
+ */
+export const rejectUnsupportedOp = (
+  entity: Entity,
+  operation: string,
+  opType: "put" | "delete",
+  putKind: "put" | "create" | "upsert" | undefined,
+): Effect.Effect<void, ValidationError> => {
+  const fail = (capability: string, reason: string) =>
+    new ValidationError({
+      entityType: entity.entityType,
+      operation,
+      cause: `${operation}: ${capability} is not supported here — ${reason}`,
+    })
+
+  // --- op-kind level -------------------------------------------------------
+  if (opType === "put" && putKind === "upsert") {
+    return Effect.fail(
+      fail(
+        "upsert",
+        "upsert is an UpdateItem whose SET clause uses if_not_exists for createdAt, " +
+          "immutable fields and the version counter. Compiling it as a Put would reset " +
+          "them. Use put() or create() here, or run the upsert as its own operation.",
+      ),
+    )
+  }
+
+  // --- entity-configuration level -----------------------------------------
+  // Only the cases that cannot be working for anyone today — see the doc comment
+  // for why `unique` / `versioned.retain` / `softDelete` are deliberately absent.
+  if (opType === "put" && entity._resolvedRefs.length > 0) {
+    return Effect.fail(
+      fail(
+        "a ref",
+        "write-time ref hydration reads the referenced entity, which this compile step " +
+          "cannot do; the ref attribute would be written empty.",
+      ),
+    )
+  }
+  if (opType === "put" && entity.generatedId != null) {
+    return Effect.fail(
+      fail("a generated id", "id generation needs the Crypto service, which is not in scope here."),
+    )
+  }
+  if (opType === "put" && Object.keys(entity._vectorIndexes ?? {}).length > 0) {
+    return Effect.fail(
+      fail(
+        "a vector index",
+        "computing the embedding needs the Embedder service, which is not in scope here; " +
+          "the item would be written without its vector and drop out of the index.",
+      ),
+    )
+  }
+  return Effect.void
+}
+
+/**
  * Resolve table names for a set of entity infos, deduplicating by entity reference.
  */
 export const resolveTableNames = (infos: ReadonlyArray<{ readonly entity: Entity }>) =>

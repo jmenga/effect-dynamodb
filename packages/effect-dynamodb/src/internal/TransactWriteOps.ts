@@ -21,7 +21,12 @@ import { toAttributeMap } from "../Marshaller.js"
 import type { TableConfig } from "../Table.js"
 import type { BoundWriteOp } from "./BoundCrud.js"
 import { compileExpr, type Expr, isExpr, parseShorthand } from "./Expr.js"
-import { composePrimaryKey, resolveTableNames, validateAndBuildPutItem } from "./TransactableOps.js"
+import {
+  composePrimaryKey,
+  rejectUnsupportedOp,
+  resolveTableNames,
+  validateAndBuildPutItem,
+} from "./TransactableOps.js"
 
 // ---------------------------------------------------------------------------
 // ConditionCheck — composable from EntityGet + condition expression
@@ -143,6 +148,7 @@ export const buildTransactWriteItems = (
       }
 
       if (info.opType === "put") {
+        yield* rejectUnsupportedOp(info.entity, operation, "put", info.putKind)
         opInfos.push({
           type: "put",
           entity: info.entity,
@@ -150,6 +156,7 @@ export const buildTransactWriteItems = (
           condition: compileOpCondition(info.entity, info.condition),
         })
       } else if (info.opType === "delete") {
+        yield* rejectUnsupportedOp(info.entity, operation, "delete", undefined)
         opInfos.push({
           type: "delete",
           entity: info.entity,

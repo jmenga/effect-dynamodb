@@ -343,6 +343,18 @@ export interface EntityPutOpts {
   readonly withVectors?: WithVectors | undefined
 }
 
+/**
+ * @internal Which `put`-shaped entity operation produced an `EntityPutImpl`.
+ *
+ * All three share the `EntityPutImpl` carrier and the `_opType: "put"` tag, but
+ * they do NOT share write semantics: `upsert` issues an `UpdateItem` whose SET
+ * clause uses `if_not_exists` for `createdAt`, immutable fields and the version
+ * counter, so a consumer that compiles it as a plain `Put` silently resets
+ * `createdAt` and `version`. Consumers that cannot reproduce a kind's semantics
+ * must reject it — see `internal/TransactWriteOps.ts` (#100).
+ */
+export type PutKind = "put" | "create" | "upsert"
+
 export class EntityPutImpl<A, Rec, E, R> implements Pipeable.Pipeable {
   readonly [EntityOpTypeId]: EntityOpTypeId = EntityOpTypeId as EntityOpTypeId
   readonly _opType = "put" as const
@@ -351,17 +363,21 @@ export class EntityPutImpl<A, Rec, E, R> implements Pipeable.Pipeable {
   readonly _input: globalThis.Record<string, unknown>
   readonly _condition: Expr | ConditionInput | undefined
   readonly _withVectors: WithVectors | undefined
+  /** Which put-shaped op this is. Combinators MUST preserve it. */
+  readonly _putKind: PutKind
   constructor(
     readonly _builder: (mode: DecodeMode, opts: EntityPutOpts) => Effect.Effect<any, E, R>,
     entity: EntityBase,
     input: globalThis.Record<string, unknown>,
     condition?: Expr | ConditionInput | undefined,
     withVectors?: WithVectors | undefined,
+    putKind: PutKind = "put",
   ) {
     this._entity = entity
     this._input = input
     this._condition = condition
     this._withVectors = withVectors
+    this._putKind = putKind
   }
   get _run(): (mode: DecodeMode) => Effect.Effect<any, E, R> {
     return (mode) =>

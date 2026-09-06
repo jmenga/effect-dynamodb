@@ -17,6 +17,7 @@ import { extractTransactable } from "./Entity.js"
 import type { BoundWriteOp } from "./internal/BoundCrud.js"
 import {
   composePrimaryKey,
+  rejectUnsupportedOp,
   resolveTableNames,
   validateAndBuildPutItem,
 } from "./internal/TransactableOps.js"
@@ -238,8 +239,16 @@ export const write = (
 
     for (const op of operations) {
       const info = extractTransactable(op)
+      // A rejection belongs on the error channel, not as a defect — the caller
+      // can neither catch nor discriminate a thrown Error (#100).
       if (!info) {
-        throw new Error("Batch.write: unrecognized operation type")
+        return yield* new ValidationError({
+          entityType: "unknown",
+          operation: "batchWrite",
+          cause:
+            "Batch.write: unrecognized operation type. Use Entity.put/Entity.delete, or the " +
+            "bound builders db.entities.X.put(...) / .delete(...).",
+        })
       }
 
       const entity = info.entity
@@ -260,21 +269,27 @@ export const write = (
       }
 
       if (info.opType === "put") {
+        yield* rejectUnsupportedOp(entity, "batchWrite", "put", info.putKind)
         const marshalledItem = yield* validateAndBuildPutItem(entity, info.input!, "batchWrite.put")
         writeRequests.push({
           tableName,
           request: { PutRequest: { Item: marshalledItem } },
         })
       } else if (info.opType === "delete") {
+        yield* rejectUnsupportedOp(entity, "batchWrite", "delete", undefined)
         const composed = composePrimaryKey(entity, info.key!)
         writeRequests.push({
           tableName,
           request: { DeleteRequest: { Key: toAttributeMap(composed) } },
         })
       } else {
-        throw new Error(
-          `Batch.write: unsupported operation type "${info.opType}". Use EntityPut or EntityDelete.`,
-        )
+        return yield* new ValidationError({
+          entityType: entity.entityType,
+          operation: "batchWrite",
+          cause:
+            `Batch.write: unsupported operation type "${info.opType}". BatchWriteItem has no ` +
+            "UpdateRequest — use Entity.put or Entity.delete, or Transaction.transactWrite.",
+        })
       }
     }
 

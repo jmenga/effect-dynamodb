@@ -646,7 +646,7 @@ import { Transaction } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `transactGet` | `(items) => Effect<Tuple>` | Atomically get up to 100 items — returns a typed tuple |
-| `transactWrite` | `(ops) => Effect<void>` | Atomically write up to 100 items (puts, deletes, condition checks). Accepts unbound `Entity.put`/`Entity.delete` intermediates AND the bound builders returned by `db.entities.*`; conditions attached to either (including `create()`'s implicit `attribute_not_exists`) are compiled into the transact item |
+| `transactWrite` | `(ops) => Effect<void>` | Atomically write up to 100 items (puts, deletes, condition checks). Accepts unbound `Entity.put`/`Entity.delete` intermediates AND the bound builders returned by `db.entities.*`; conditions attached to either (including `create()`'s implicit `attribute_not_exists`) are compiled into the transact item. `upsert`, `update` and `patch` are rejected with a `ValidationError` — see below |
 | `check` | `(get, condition) => ConditionCheckOp` | Create a condition-check operation for `transactWrite` (dual API) |
 
 ### transactGet
@@ -671,6 +671,20 @@ yield* Transaction.transactWrite(
 )
 ```
 
+### Ops `transactWrite` will not compile
+
+`transactWrite` emits exactly one `Put` / `Delete` / `ConditionCheck` per op. Anything whose entity contract needs a different verb, extra items, or a service the compile step does not hold is refused with a `ValidationError` rather than written with different semantics:
+
+| Op / entity feature | Why it is refused |
+|---|---|
+| `upsert()` | An `UpdateItem` using `if_not_exists` for `createdAt`, immutable fields and the version counter. A `Put` would reset all three |
+| `update()` / `patch()` | No `Update` support in the shared transact builder yet |
+| `refs` | Write-time ref hydration reads the referenced entity; the compile step cannot, so the ref attribute would be written empty |
+| `generatedId` | Id generation needs the `Crypto` service |
+| `vectorIndexes` | Computing the embedding needs the `Embedder` service; the item would drop out of the index |
+
+Not currently refused, and a known gap: entities with `unique`, `versioned: { retain: true }` or `softDelete` write **one** item through this path, so their sentinel / snapshot / tombstone item is not written. Prefer the entity's own operation for those.
+
 ### Types
 
 | Type | Description |
@@ -690,7 +704,7 @@ import { Batch } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `get` | `(...gets) => Effect<Tuple>` | Batch-get up to 100 items with typed tuple return |
-| `write` | `(...ops) => Effect<void>` | Batch-write any number of items (auto-chunks at 25). Accepts unbound `Entity.put`/`Entity.delete` intermediates AND the bound builders returned by `db.entities.*` |
+| `write` | `(...ops) => Effect<void>` | Batch-write any number of items (auto-chunks at 25). Accepts unbound `Entity.put`/`Entity.delete` intermediates AND the bound builders returned by `db.entities.*`; conditional ops and `upsert`/`update`/`patch` are rejected with a `ValidationError` — see below |
 
 ### Usage
 

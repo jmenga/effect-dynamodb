@@ -752,5 +752,56 @@ describe("Batch", () => {
         expect(mockBatchWriteItem).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )
+
+    it.effect("rejects upsert — BatchWriteItem has no UpdateRequest", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { UserEntity, OrderEntity },
+          tables: { MainTable },
+        })
+
+        const error = yield* Batch.write([
+          db.entities.UserEntity.upsert({
+            userId: "u-1",
+            email: "a@x.io",
+            name: "Alice",
+            role: "admin",
+          }),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("upsert")
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // A rejection the caller cannot catch is as bad as a silent success. These
+    // two paths used to `throw new Error`, surfacing as an opaque defect.
+    it.effect("an update op fails on the error channel, not as a defect", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { UserEntity, OrderEntity },
+          tables: { MainTable },
+        })
+
+        const error = yield* Batch.write([
+          db.entities.UserEntity.update({ userId: "u-1" }).set({ name: "Bob" }) as never,
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("UpdateRequest")
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an unrecognized op fails on the error channel, not as a defect", () =>
+      Effect.gen(function* () {
+        const error = yield* Batch.write([{ nonsense: true } as never]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).entityType).toBe("unknown")
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
   })
 })
