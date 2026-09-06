@@ -9,7 +9,8 @@
 
 import { DateTime, Schema } from "effect"
 import { describe, expect, it } from "vitest"
-import { encodeCompositeRecord, makeCompositeEncoder } from "../src/internal/CompositeCodec.js"
+import { DateEpochMs } from "../src/DynamoModel.js"
+import { makeCompositeKeyForm, toCompositeKeyRecord } from "../src/internal/CompositeCodec.js"
 import { serializeValue } from "../src/KeyComposer.js"
 
 const Model = Schema.Struct({
@@ -21,6 +22,7 @@ const Model = Schema.Struct({
   utc: Schema.DateTimeUtc,
   // Genuine `decodeTo`: Type is bigint, Encoded is string.
   txn: Schema.BigIntFromString,
+  epoch: DateEpochMs,
 })
 
 const refuse = (attr: string, value: unknown): never => {
@@ -28,7 +30,7 @@ const refuse = (attr: string, value: unknown): never => {
 }
 
 describe("CompositeCodec", () => {
-  const encode = makeCompositeEncoder(Model, refuse)
+  const encode = makeCompositeKeyForm(Model, refuse)
 
   describe("case 1 — attribute is not a model field", () => {
     it("passes the value through untouched", () => {
@@ -55,19 +57,34 @@ describe("CompositeCodec", () => {
   })
 
   describe("case 3 — field has an encoding transformation", () => {
-    it("encodes a bigint composite to the string the write path stores", () => {
-      expect(encode("txn", 420n)).toBe("420")
-      // The stored key is composed from that string, NOT from the 38-digit
-      // padding `serializeValue(420n)` would produce.
-      expect(serializeValue(encode("txn", 420n))).toBe("420")
-      expect(serializeValue(420n)).not.toBe("420")
+    it("keeps a numeric-Type/string-Encoded composite on the TYPE side so it pads", () => {
+      // THE EXCEPTION. `serializeValue` pads a bigint to 38 digits but leaves a
+      // string alone, so composing the encoded "420" stored `txn_420` beside
+      // `txn_100` and `txn_5` — which DynamoDB orders 100 < 42 < 5.
+      expect(encode("txn", 420n)).toBe(420n)
+      expect(serializeValue(encode("txn", 420n))).toBe("420".padStart(38, "0"))
     })
 
-    it("accepts the already-encoded shape via the decode -> encode fallback", () => {
-      // Mirrors `Entity.put`'s `encodeOrDecodeEncode`: callers may hold either
-      // form, and encoding must be idempotent for the retain/restore paths.
-      expect(encode("txn", "420")).toBe("420")
-      expect(encode("txn", encode("txn", 420n))).toBe("420")
+    it("lifts the encoded string back to the Type side, so both inputs agree", () => {
+      // The write path holds the encoded record, the read path the domain
+      // value; both must land on the same key.
+      expect(encode("txn", "420")).toBe(420n)
+      expect(encode("txn", encode("txn", 420n))).toBe(420n)
+    })
+
+    it("padding makes mixed-width values sort numerically", () => {
+      const keys = [5n, 42n, 100n].map((v) => serializeValue(encode("txn", v)))
+      expect([...keys].sort()).toEqual(keys)
+    })
+
+    it("a numeric ENCODED form is used as-is — the exception does not apply", () => {
+      // `DateEpochMs`: Type is DateTime, Encoded is a number, already padded by
+      // `serializeValue`.
+      const dt = DateTime.makeUnsafe("2026-02-11T00:00:00.000Z")
+      expect(encode("epoch", dt)).toBe(DateTime.toEpochMillis(dt))
+      expect(serializeValue(encode("epoch", dt))).toBe(
+        String(DateTime.toEpochMillis(dt)).padStart(16, "0"),
+      )
     })
 
     it("round-trips Date and DateTime to a value that serialises identically", () => {
@@ -77,7 +94,7 @@ describe("CompositeCodec", () => {
       expect(serializeValue(encode("utc", dt))).toBe(serializeValue(dt))
     })
 
-    it("refuses a value that encodes under neither route (EDD-9050)", () => {
+    it("refuses a value that resolves under neither route (EDD-9050)", () => {
       // A prefix is not a bigint and does not decode as one, so it cannot be
       // placed in a key at all. Refuse loudly rather than compose a string that
       // silently matches nothing.
@@ -94,21 +111,21 @@ describe("CompositeCodec", () => {
 
   describe("encodeCompositeRecord", () => {
     it("encodes every entry, leaving untransformed ones alone", () => {
-      expect(encodeCompositeRecord(encode, { id: "a", status: "done", txn: 7n })).toEqual({
+      expect(toCompositeKeyRecord(encode, { id: "a", status: "done", txn: 7n })).toEqual({
         id: "a",
         status: "done",
-        txn: "7",
+        txn: 7n,
       })
     })
 
     it("returns an empty record unchanged", () => {
-      expect(encodeCompositeRecord(encode, {})).toEqual({})
+      expect(toCompositeKeyRecord(encode, {})).toEqual({})
     })
   })
 
   describe("models without a fields record", () => {
     it("passes everything through", () => {
-      const encodeAny = makeCompositeEncoder(Schema.String, refuse)
+      const encodeAny = makeCompositeKeyForm(Schema.String, refuse)
       expect(encodeAny("whatever", 1)).toBe(1)
     })
   })

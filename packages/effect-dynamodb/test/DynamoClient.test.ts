@@ -1468,20 +1468,33 @@ describe("DynamoClient", () => {
         }),
       )
 
-      it.effect("bigint composite encodes to the form the write path stores", () =>
+      it.effect("a numeric-Type/string-Encoded composite is padded, not stored raw", () =>
         Effect.gen(function* () {
-          // `big` is `Schema.BigIntFromString` — a genuine `decodeTo` whose
-          // Encoded form is a string. The write path composes keys from the
-          // ENCODED record, so the stored key holds "42", NOT the 38-digit
-          // padding `serializeValue(42n)` would produce. The operand takes the
-          // same encode step, so both sides agree.
+          // `big` is `Schema.BigIntFromString` — Type bigint, Encoded string, so
+          // the rule's exception applies: compose from the numeric Type value so
+          // `serializeValue` pads it. Composing the encoded "42" sorted
+          // 100 < 42 < 5.
           const input = yield* capture((db) =>
             db.entities.Samples.byBig({ deviceId: "d1" })
               .where((t, { lte }) => lte(t.big, 42n))
               .collect(),
           )
-          expect(skValue(input)).toBe("$skprefix#v1#sample#big_42")
-          expect(skValue(input)).not.toContain("42".padStart(38, "0"))
+          expect(skValue(input)).toBe(`$skprefix#v1#sample#big_${"42".padStart(38, "0")}`)
+        }),
+      )
+
+      it.effect("mixed-width values order numerically on a transformed composite", () =>
+        Effect.gen(function* () {
+          const keys: Array<string> = []
+          for (const v of [5n, 42n, 100n]) {
+            const input = yield* capture((db) =>
+              db.entities.Samples.byBig({ deviceId: "d1" })
+                .where((t, { eq }) => eq(t.big, v))
+                .collect(),
+            )
+            keys.push(skValue(input))
+          }
+          expect([...keys].sort()).toEqual(keys)
         }),
       )
 

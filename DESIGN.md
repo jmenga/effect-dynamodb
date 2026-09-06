@@ -658,31 +658,48 @@ Given `DynamoSchema({ name: "myapp", version: 1, casing: "lowercase" })` and `en
 | `boolean` | `"true"` / `"false"` |
 | Branded string | Underlying string value |
 
-### Composite encoding on the read path
+### Composite key form
 
-Key composition runs on the **encoded** record. `Entity.put` encodes the input
-through `inputSchema` and only then calls `composeAllKeys`, so the stored key
-holds the wire value of every composite — a `Schema.BigIntFromString` composite
-`420n` is stored as `txn_420`, not as the zero-padded form
-`serializeValue(420n)` would produce.
+Every path composes a composite through ONE function
+(`internal/CompositeCodec.ts`) — the write path, `composePrimaryKey`, the query
+accessors, `.where()` operands, and the aggregate composer. An operand and a
+stored key must be produced by the same code; two call sites disagreeing about
+which form to use has been the root cause of every key bug in this area.
 
-The read path therefore has to encode too. Query accessors and `.where()`
-receive **decoded** model values (that is what the Type side declares), so the
-composite is passed through the model field's own codec before
-`KeyComposer` sees it — one pipeline shared with the write path, rather than
-two that merely agree for common types.
+**The rule.** Compose from the **Encoded** form, EXCEPT when the domain type is
+numeric (`number` / `bigint`) and the encoded form is a **string** — then
+compose from the numeric **Type** form so `serializeValue` pads it.
 
-Three cases, per attribute (`internal/CompositeCodec.ts`):
+| composite | Type | Encoded | key uses |
+|---|---|---|---|
+| `Schema.Number` | number | number | encoded (already padded) |
+| `Schema.BigInt` | bigint | bigint | encoded (already padded) |
+| `Schema.BigIntFromString` | bigint | string | **Type** — a string would not pad |
+| `Schema.NumberFromString` | number | string | **Type** — same shape |
+| `DynamoModel.DateEpochMs` | DateTime | number | encoded — epoch, padded |
+| `Schema.Date` / `DateTimeUtc` | Date | ISO string | encoded — ISO sorts correctly |
+| untransformed string | string | string | encoded (identical) |
 
-| Case | Behaviour |
-|------|-----------|
-| Attribute is not a model field (ref-derived `<ref>Id`) | Pass through — already wire-shaped. |
-| Field schema has **no** encoding transformation (`ast.encoding === undefined`, documented as "type and encoded forms are identical") | Pass through, without attempting an encode. This is what keeps an open bound like `gte(t.status, "d")` on a `Schema.Literals` composite working — a bound is deliberately not a valid value. |
-| Field schema **has** an encoding transformation | Encode, mirroring `put`'s `encode` then `decode → encode` fallback. If neither succeeds the value cannot be placed in a key: throw **EDD-9050** naming the attribute, rather than compose a string that silently matches nothing. |
+The exception exists because `serializeValue` pads numbers to 16 digits and
+bigints to 38 so they sort lexicographically in numeric order, and leaves a
+string alone. Composing the encoded `"42"` of a `BigIntFromString` stored
+`txn_42` beside `txn_100` and `txn_5`, which DynamoDB orders 100 < 42 < 5 — so
+`gte(42n)` returned 42 and 5 instead of 42 and 100.
 
-Types follow the same rule: a `.where()` operand takes the composite's own
-Type-side type (`number`, `Date`, `DateTime`, `bigint`), and string-typed
-composites widen to `string` so prefixes and open bounds still typecheck.
+Resolution per attribute:
+
+| case | behaviour |
+|---|---|
+| Not a model field (ref-derived `<ref>Id`) | Pass through — already wire-shaped. |
+| Numeric Type, string Encoded | Keep a `number` / `bigint`; otherwise `decode` to reach it. |
+| No encoding transformation (`ast.encoding === undefined`, documented as "type and encoded forms are identical") | Pass through WITHOUT encoding, so an open bound like `gte(t.status, "d")` on a `Schema.Literals` composite is not rejected by a codec. |
+| Has an encoding transformation | `encode`, with `decode -> encode` as fallback so an already-encoded value round-trips to itself. |
+| Resolves to neither | **EDD-9050**, naming the attribute. |
+
+Public key and composite input is always the **Type** side — the value the
+domain model holds and `.where()` accepts. Internal paths (retain, restore,
+soft-delete) hold wire-shaped records read back from DynamoDB and reach the
+composer directly.
 
 ### Isolated vs Clustered Key Prefixes
 

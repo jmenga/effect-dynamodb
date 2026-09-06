@@ -34,8 +34,8 @@ import {
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import {
-  encodeCompositeRecord,
-  makeCompositeEncoder,
+  makeCompositeKeyForm,
+  toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -1623,7 +1623,7 @@ const makeImpl = <
   // `composeAllKeys`. The raw model is not equivalent — entity derivation
   // substitutes date/Redacted fields with their wire transforms, so reading
   // fields off the model would miss encodings the write path applies.
-  const encodeComposite = makeCompositeEncoder(
+  const compositeKeyForm = makeCompositeKeyForm(
     schemas.inputSchema as unknown as Schema.Top,
     (attr, value) => {
       throw new Error(
@@ -1690,7 +1690,7 @@ const makeImpl = <
    */
   const composePrimaryKey = (record: globalThis.Record<string, unknown>) => {
     const primary = config.indexes.primary
-    const encoded = encodeCompositeRecord(encodeComposite, record)
+    const encoded = toCompositeKeyRecord(compositeKeyForm, record)
     return {
       [primary.pk.field]: KeyComposer.composePk(schema, entityType, primary, encoded),
       [primary.sk.field]: KeyComposer.composeSk(
@@ -1704,7 +1704,13 @@ const makeImpl = <
   }
 
   const composeAllKeys = (record: globalThis.Record<string, unknown>) =>
-    KeyComposer.composeAllKeys(schema, entityType, entityVersion, allIndexes, record)
+    KeyComposer.composeAllKeys(
+      schema,
+      entityType,
+      entityVersion,
+      allIndexes,
+      toCompositeKeyRecord(compositeKeyForm, record),
+    )
 
   /**
    * Fill the auto-generated id field on the raw `put` input when configured and
@@ -5003,7 +5009,7 @@ const makeImpl = <
         `[EDD-9010] Entity "${entityType}": .history() requires timeSeries config on the entity.`,
       )
     }
-    const encodedKey = encodeKeySync(key)
+    const encodedKey = toCompositeKeyRecord(compositeKeyForm, encodeKeySync(key))
     const primary = config.indexes.primary
     const pkValue = KeyComposer.composePk(schema, entityType, primary, encodedKey)
     const currentSk = KeyComposer.composeSk(
@@ -5059,10 +5065,9 @@ const makeImpl = <
     if (indexName === "primary") continue
     const indexDef = config.indexes[indexName]!
     queryNamespace[indexName] = (rawPk: globalThis.Record<string, unknown>) => {
-      // Encode composites before composing — the write path composes from the
-      // ENCODED record, so a transformed composite must be encoded here too or
-      // the two sides produce different key strings (see `CompositeCodec`).
-      const pk = encodeCompositeRecord(encodeComposite, rawPk)
+      // Normalise composites to their key form before composing — same rule
+      // and same function the write path uses (see `CompositeCodec`).
+      const pk = toCompositeKeyRecord(compositeKeyForm, rawPk)
       const pkValue = KeyComposer.composePk(schema, entityType, indexDef, pk)
       const hasSkComposites = indexDef.sk.composite.some((attr) => pk[attr] !== undefined)
       const query = Query.make({
@@ -5152,7 +5157,7 @@ const makeImpl = <
   // ---------------------------------------------------------------------------
 
   const versions = (key: unknown) => {
-    const encodedKey = encodeKeySync(key)
+    const encodedKey = toCompositeKeyRecord(compositeKeyForm, encodeKeySync(key))
     const primary = config.indexes.primary
     const pkValue = KeyComposer.composePk(schema, entityType, primary, encodedKey)
     const versionPrefix = DynamoSchema.composeVersionKeyPrefix(schema, entityType)
@@ -5234,7 +5239,7 @@ const makeImpl = <
     )
 
   const deletedList = (key: unknown) => {
-    const encodedKey = encodeKeySync(key)
+    const encodedKey = toCompositeKeyRecord(compositeKeyForm, encodeKeySync(key))
     const primary = config.indexes.primary
     const pkValue = KeyComposer.composePk(schema, entityType, primary, encodedKey)
     const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
@@ -6111,7 +6116,7 @@ export const bind = <
         const schemaRef = entityInternals._schema
         const entityTypeRef = entityInternals.entityType
         // Same source as the write path — see the `make()`-level encoder.
-        const encodeComposite = makeCompositeEncoder(
+        const compositeKeyForm = makeCompositeKeyForm(
           entityInternals.schemas?.inputSchema ?? entityInternals.model,
           (attr, value) => {
             throw new Error(
@@ -6139,7 +6144,7 @@ export const bind = <
             entityTypeRef,
             1,
             primary,
-            encodeCompositeRecord(encodeComposite, key as globalThis.Record<string, unknown>),
+            toCompositeKeyRecord(compositeKeyForm, key as globalThis.Record<string, unknown>),
           )
           const prefix = KeyComposer.composeEventSkPrefix(currentSk, schemaRef.casing)
           // Encode first: the event SK is composed from the ENCODED orderBy
@@ -6147,7 +6152,7 @@ export const bind = <
           // transformed orderBy composite must take the same route here.
           const rewrite = (v: unknown) =>
             `${prefix}${DynamoSchema.applyCasing(
-              KeyComposer.serializeValue(orderBy === undefined ? v : encodeComposite(orderBy, v)),
+              KeyComposer.serializeValue(orderBy === undefined ? v : compositeKeyForm(orderBy, v)),
               schemaRef.casing,
             )}`
           if ("eq" in cond) return { eq: rewrite(cond.eq) }

@@ -6,7 +6,7 @@
 
 Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, composite key composition from entity attributes, type-safe index-aware queries with Stream-based pagination, and DynamoClient as an Effect Service with Layer-based dependency injection.
 
-**Status:** All modules implemented. 1132 core tests, 305 schema tests, 56 geo tests, 214 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
+**Status:** All modules implemented. 1136 core tests, 307 schema tests, 56 geo tests, 218 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
 **Design:** `DESIGN.md` — API specification (source of truth for implementation)
 
 ## Architecture
@@ -89,7 +89,7 @@ packages/effect-dynamodb/src/
 │   ├── EntityCombinators.ts # Terminal functions, update combinators (record + path-based)
 │   ├── EntityTypes.ts  # Type-level computations for Entity derived types
 │   ├── EntitySchemas.ts # Schema derivation (7 derived schemas)
-│   ├── CompositeCodec.ts # (schema pkg) encodes composites on the read path — see DESIGN §7
+│   ├── CompositeCodec.ts # (schema pkg) THE composite key-form rule — every path uses it; see DESIGN §7
 │   ├── TransactableOps.ts # Shared Batch/Transaction helpers (table name resolution, key composition, put-item building)
 │   ├── TransactWriteOps.ts # Shared TransactWriteItems builder + ConditionCheckOp (Transaction.transactWrite AND EventStore.append additionalItems)
 │   └── ...             # AggregateCursor, AggregateEdges, etc.

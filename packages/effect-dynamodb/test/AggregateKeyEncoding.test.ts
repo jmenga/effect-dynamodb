@@ -1,49 +1,50 @@
 import { describe, expect, it } from "@effect/vitest"
+import { DateEpochMs } from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
-import { Effect, Layer, Schema } from "effect"
+import { DateTime, Effect, Layer, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Table from "../src/Table.js"
 
 /**
- * The entity and aggregate key paths are MIRROR IMAGES of each other, and this
- * test pins that so a change to either is visible in review.
+ * Aggregate and entity key composition now run the SAME rule, from the same
+ * function (`internal/CompositeCodec.ts`):
  *
- * | path      | input it accepts    | key composed from |
- * |-----------|---------------------|-------------------|
- * | entity    | Type (`420n`)       | Encoded (`"420"`) |
- * | aggregate | Encoded (`"420"`)   | Type (`420n`)     |
+ * > Compose from the Encoded form, EXCEPT when the domain type is numeric
+ * > (`number` / `bigint`) and the encoded form is a string — then compose from
+ * > the numeric Type form so `serializeValue` pads it.
  *
- * For a composite carrying an encoding transformation the two therefore produce
- * DIFFERENT key strings for the same logical value: a `BigIntFromString` of
- * `420n` composes `…#00000000000000000000000000000000000420` through an
- * aggregate (serializeValue pads a bigint to 38 digits) and `…#420` through an
- * entity. Untransformed composites, where Type and Encoded are the same value,
- * are identical on both paths.
+ * This file previously argued the two paths should stay divergent, on the
+ * grounds that aggregates were internally consistent and unifying them would
+ * orphan stored rows. That argument is withdrawn: the divergence was a symptom
+ * of a real bug, not a design. The entity path composed a `BigIntFromString`
+ * composite from its ENCODED string, so `serializeValue` never padded it and
+ * `txn_5`, `txn_42`, `txn_100` sorted 100 < 42 < 5 — a range query returned the
+ * wrong rows. Under the rule both paths pad it, and both agree.
  *
- * This is NOT to be "fixed" for consistency without a migration. Aggregates are
- * internally consistent — they decode the input, then compose from the decoded
- * value on both read (`Aggregate.ts` `fetchPartition`) and write — so they work
- * today and callers have stored data in this format. Routing them through the
- * entity codec would silently orphan every existing row with a transformed
- * composite: no error, just a partition that no longer resolves.
+ * What actually changes per path:
  *
- * The entity path could be changed safely because neither input spelling worked
- * there beforehand — the domain value failed validation and the wire value
- * returned `ItemNotFound` for a row that exists — so no data existed in either
- * format. That argument does not transfer here.
+ * | composite shape             | entity path      | aggregate path   |
+ * |-----------------------------|------------------|------------------|
+ * | numeric Type, string Encoded| unpadded → PADDED | unchanged (padded) |
+ * | `DateEpochMs` (Date → number)| unchanged (epoch) | ISO → EPOCH      |
+ * | everything else             | unchanged        | unchanged        |
  *
- * Unifying the two belongs in a major, with a migration note. The dangerous
- * case meanwhile is an aggregate and an entity sharing a partition and expecting
- * byte-identical keys for a transformed composite; nothing detects that yet.
+ * Both are storage-format changes and are called out in the changeset.
  */
-describe("Aggregate key encoding (Type side, deliberately divergent)", () => {
+describe("Aggregate key encoding (shared composite key-form rule)", () => {
   const AppSchema = DynamoSchema.make({ name: "aggkeys", version: 1 })
 
   class Entry extends Schema.Class<Entry>("Entry")({
     txn: Schema.BigIntFromString,
+    note: Schema.String,
+  }) {}
+
+  // Type DateTime, Encoded number — the shape whose aggregate key CHANGES.
+  class Reading extends Schema.Class<Reading>("Reading")({
+    at: DateEpochMs,
     note: Schema.String,
   }) {}
 
@@ -55,6 +56,15 @@ describe("Aggregate key encoding (Type side, deliberately divergent)", () => {
     pk: { field: "pk", composite: ["txn"] },
     collection: { index: "lsi1", name: "ledger", sk: { field: "lsi1sk", composite: [] } },
     root: { entityType: "LedgerEntry" },
+    edges: {},
+  })
+
+  const ReadingAggregate = Aggregate.make(Reading, {
+    table: MainTable,
+    schema: AppSchema,
+    pk: { field: "pk", composite: ["at"] },
+    collection: { index: "lsi1", name: "readings", sk: { field: "lsi1sk", composite: [] } },
+    root: { entityType: "ReadingEntry" },
     edges: {},
   })
 
@@ -86,20 +96,43 @@ describe("Aggregate key encoding (Type side, deliberately divergent)", () => {
     mockTransactWrite.mockReset()
   })
 
-  it.effect("composes a transformed pk composite from the Type side", () =>
+  const pkOf = () => {
+    const call = mockTransactWrite.mock.calls[0]![0] as {
+      TransactItems: Array<{ Put?: { Item: Record<string, { S?: string }> } }>
+    }
+    return call.TransactItems[0]!.Put!.Item.pk!.S
+  }
+
+  it.effect("numeric Type + string Encoded composes PADDED — same as the entity path", () =>
     Effect.gen(function* () {
       mockTransactWrite.mockResolvedValue({})
-
       yield* LedgerAggregate.create({ txn: "420", note: "n" } as never)
+      expect(pkOf()).toBe("$aggkeys#v1#ledger#00000000000000000000000000000000000420")
+    }).pipe(Effect.provide(TestLayer)),
+  )
 
-      const call = mockTransactWrite.mock.calls[0]![0] as {
-        TransactItems: Array<{ Put?: { Item: Record<string, { S?: string }> } }>
+  it.effect("mixed-width values order numerically", () =>
+    Effect.gen(function* () {
+      const keys: Array<string> = []
+      for (const v of ["5", "42", "100"]) {
+        mockTransactWrite.mockReset()
+        mockTransactWrite.mockResolvedValue({})
+        yield* LedgerAggregate.create({ txn: v, note: "n" } as never)
+        keys.push(pkOf()!)
       }
-      const pk = call.TransactItems[0]!.Put!.Item.pk!.S
+      expect([...keys].sort()).toEqual(keys)
+    }).pipe(Effect.provide(TestLayer)),
+  )
 
-      // Type side: serializeValue pads a bigint to 38 digits.
-      // The entity path would compose "…#420" from the encoded string instead.
-      expect(pk).toBe("$aggkeys#v1#ledger#00000000000000000000000000000000000420")
+  it.effect("DateEpochMs composes the EPOCH — changed from the previous ISO form", () =>
+    Effect.gen(function* () {
+      mockTransactWrite.mockResolvedValue({})
+      const at = DateTime.makeUnsafe("2026-02-11T00:00:00.000Z")
+      yield* ReadingAggregate.create({ at, note: "n" } as never)
+      const epoch = String(DateTime.toEpochMillis(at)).padStart(16, "0")
+      expect(pkOf()).toBe(`$aggkeys#v1#readings#${epoch}`)
+      // Previously `…#2026-02-11t00:00:00.000z` — a storage-format change.
+      expect(pkOf()).not.toContain("2026-02-11t")
     }).pipe(Effect.provide(TestLayer)),
   )
 })

@@ -8600,18 +8600,18 @@ describeConnected("transformed sort key composites — encoded/decoded gap", () 
     )
   }, 15000)
 
-  it.effect("the stored key holds the ENCODED composite, not the serialised decoded one", () =>
+  it.effect("the stored key holds the padded key form of the composite", () =>
     Effect.gen(function* () {
       const client = yield* DynamoClient
       const raw = yield* client.scan({ TableName: encTableName })
       const sks = (raw.Items ?? []).map((i) => (i.sk as { S?: string } | undefined)?.S ?? "").sort()
+      // PADDED: `txn` is numeric-Type / string-Encoded, so the key form rule
+      // composes from the bigint and `serializeValue` pads it to 38 digits.
       expect(sks).toEqual([
-        "$enc#v1#ledger#txn_100",
-        "$enc#v1#ledger#txn_420",
-        "$enc#v1#ledger#txn_999",
+        `$enc#v1#ledger#txn_${"100".padStart(38, "0")}`,
+        `$enc#v1#ledger#txn_${"420".padStart(38, "0")}`,
+        `$enc#v1#ledger#txn_${"999".padStart(38, "0")}`,
       ])
-      // Not the 38-digit padded form.
-      expect(sks.every((s) => !s.includes("000000"))).toBe(true)
     }).pipe(provideEnc),
   )
 
@@ -8782,3 +8782,191 @@ describeConnected("transformed sort key composites — encoded/decoded gap", () 
     }).pipe(provideEnc),
   )
 })
+
+// ---------------------------------------------------------------------------
+// Composite key form — mixed-width ordering across every composite shape.
+//
+// The rule: compose from the Encoded form, EXCEPT when the domain type is
+// numeric (number / bigint) and the encoded form is a string — then compose
+// from the numeric Type form so `serializeValue` pads it.
+//
+// Values are 5 / 42 / 100 (and equivalently spaced dates) ON PURPOSE. An
+// earlier fixture used equal-width values (100/420/999), under which
+// lexicographic and numeric order coincide — which is exactly why the suite
+// stayed green while `BigIntFromString` keys were being stored unpadded and
+// `gte(42n)` was returning 42 and 5 instead of 42 and 100.
+// ---------------------------------------------------------------------------
+
+const kfSchema = DynamoSchema.make({ name: "kf", version: 1 })
+const kfTableName = `kf-test-${Date.now()}`
+
+const KF_VALUES = [5, 42, 100] as const
+const kfDate = (n: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, n))
+
+class Metric extends Schema.Class<Metric>("Metric")({
+  boxId: Schema.String,
+  txn: Schema.BigIntFromString, // Type bigint, Encoded string → TYPE side
+  num: Schema.Number, // Type number, Encoded number → encoded
+  epoch: DynamoModel.DateEpochMs, // Type DateTime, Encoded number → encoded
+  iso: Schema.Date, // Type Date, Encoded ISO string → encoded
+}) {}
+
+const Metrics = Entity.make({
+  model: Metric,
+  entityType: "Metric",
+  primaryKey: {
+    pk: { field: "pk", composite: ["boxId"] },
+    sk: { field: "sk", composite: ["txn"] },
+  },
+  indexes: {
+    byNum: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["boxId"] },
+      sk: { field: "gsi1sk", composite: ["num"] },
+    },
+    byEpoch: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["boxId"] },
+      sk: { field: "gsi2sk", composite: ["epoch"] },
+    },
+    byIso: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["boxId"] },
+      sk: { field: "gsi3sk", composite: ["iso"] },
+    },
+  },
+})
+
+const KfTable = Table.make({ schema: kfSchema, entities: { Metrics } })
+const KfLayer = Layer.mergeAll(ClientLayer, KfTable.layer({ name: kfTableName }))
+const provideKf = Effect.provide(KfLayer)
+const kfEntities = { Metrics }
+const kfTables = { KfTable }
+
+describeConnected("composite key form — mixed-width ordering", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: kfTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(KfTable),
+        })
+        const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+        for (const n of KF_VALUES) {
+          yield* db.entities.Metrics.put({
+            boxId: "b1",
+            txn: BigInt(n),
+            num: n,
+            epoch: DateTime.makeUnsafe(kfDate(n).toISOString()),
+            iso: kfDate(n),
+          })
+        }
+      }).pipe(provideKf, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: kfTableName })
+      }).pipe(
+        provideKf,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("a numeric-Type/string-Encoded composite is stored PADDED", () =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const raw = yield* client.scan({ TableName: kfTableName })
+      const sks = (raw.Items ?? []).map((i) => (i.sk as { S?: string } | undefined)?.S ?? "").sort()
+      // Pre-fix: #txn_100, #txn_42, #txn_5 — unpadded, so 100 < 42 < 5.
+      expect(sks).toEqual([
+        `$kf#v1#metric#txn_${"5".padStart(38, "0")}`,
+        `$kf#v1#metric#txn_${"42".padStart(38, "0")}`,
+        `$kf#v1#metric#txn_${"100".padStart(38, "0")}`,
+      ])
+    }).pipe(provideKf),
+  )
+
+  it.effect("ascending values come back ascending on every composite shape", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+
+      // Pre-fix this one returned 100, 42, 5.
+      const byTxn = yield* db.entities.Metrics.primary({ boxId: "b1" }).collect()
+      expect(byTxn.map((r) => r.txn)).toEqual([5n, 42n, 100n])
+
+      const byNum = yield* db.entities.Metrics.byNum({ boxId: "b1" }).collect()
+      expect(byNum.map((r) => r.num)).toEqual([5, 42, 100])
+
+      const byEpoch = yield* db.entities.Metrics.byEpoch({ boxId: "b1" }).collect()
+      expect(byEpoch.map((r) => r.num)).toEqual([5, 42, 100])
+
+      const byIso = yield* db.entities.Metrics.byIso({ boxId: "b1" }).collect()
+      expect(byIso.map((r) => r.num)).toEqual([5, 42, 100])
+    }).pipe(provideKf),
+  )
+
+  it.effect("gte / lte / between return the correct rows on each shape", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+
+      // THE reported case: pre-fix this returned 42 and 5.
+      const txnGte = yield* db.entities.Metrics.primary({ boxId: "b1" })
+        .where((t, ops) => ops.gte(t.txn, 42n))
+        .collect()
+      expect(txnGte.map((r) => r.txn)).toEqual([42n, 100n])
+
+      const txnLte = yield* db.entities.Metrics.primary({ boxId: "b1" })
+        .where((t, ops) => ops.lte(t.txn, 42n))
+        .collect()
+      expect(txnLte.map((r) => r.txn)).toEqual([5n, 42n])
+
+      const txnBetween = yield* db.entities.Metrics.primary({ boxId: "b1" })
+        .where((t, ops) => ops.between(t.txn, 42n, 100n))
+        .collect()
+      expect(txnBetween.map((r) => r.txn)).toEqual([42n, 100n])
+
+      const numGte = yield* db.entities.Metrics.byNum({ boxId: "b1" })
+        .where((t, ops) => ops.gte(t.num, 42))
+        .collect()
+      expect(numGte.map((r) => r.num)).toEqual([42, 100])
+
+      const epochGte = yield* db.entities.Metrics.byEpoch({ boxId: "b1" })
+        .where((t, ops) => ops.gte(t.epoch, DateTime.makeUnsafe(kfDate(42).toISOString())))
+        .collect()
+      expect(epochGte.map((r) => r.num)).toEqual([42, 100])
+
+      const isoBetween = yield* db.entities.Metrics.byIso({ boxId: "b1" })
+        .where((t, ops) => ops.between(t.iso, kfDate(5), kfDate(42)))
+        .collect()
+      expect(isoBetween.map((r) => r.num)).toEqual([5, 42])
+    }).pipe(provideKf),
+  )
+
+  it.effect("get round-trips every value after the format change", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+      for (const n of KF_VALUES) {
+        const got = yield* db.entities.Metrics.get({ boxId: "b1", txn: BigInt(n) })
+        expect(got.txn).toBe(BigInt(n))
+        expect(got.num).toBe(n)
+      }
+    }).pipe(provideKf),
+  )
+})
+
+// NOTE: aggregate coverage for the key-form rule is UNIT-level
+// (`test/AggregateKeyEncoding.test.ts`): padded bigint, mixed-width ordering,
+// and the `DateEpochMs` ISO -> epoch change. A connected aggregate fixture on a
+// `Schema.BigIntFromString` root composite cannot be written today —
+// `Aggregate.create` fails re-encoding the assembled root ("Expected string at
+// [\"txn\"]") on the real write path, before any key is composed. That is a
+// pre-existing aggregate encode defect, independent of this rule, and is
+// reported separately.

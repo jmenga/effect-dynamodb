@@ -25,6 +25,10 @@ import {
   TransactionCancelled,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
+import {
+  makeCompositeKeyForm,
+  toCompositeKeyRecord,
+} from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import type { TimestampsConfig } from "@effect-dynamodb/schema/internal/EntityConfig.js"
 import {
   buildDateTransform,
@@ -836,12 +840,28 @@ const makeAggregate = <TSchema extends Schema.Top>(
   >
   const opticRoot = Schema.toIsoFocus(schema) as Optic.Iso<TSchema["Iso"], TSchema["Iso"]>
 
+  // Composite key form — the SAME rule and the SAME function the entity path
+  // uses (`internal/CompositeCodec.ts`). Aggregates compose from assembled
+  // domain objects, so without this a `DateEpochMs` composite would key on its
+  // ISO form here and its epoch form on the entity path, and a numeric
+  // composite with a string encoding would not be zero-padded on either.
+  const compositeKeyForm = makeCompositeKeyForm(schema, (attr, value) => {
+    throw new Error(
+      `[EDD-9050] Composite "${attr}" on aggregate "${aggregateName}" could not be put into ` +
+        `its key form. The attribute's schema carries an encoding transformation, but ` +
+        `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode. ` +
+        `Supply a value of the attribute's own type.`,
+    )
+  })
+  const keyRecord = (record: Record<string, unknown>): Record<string, unknown> =>
+    toCompositeKeyRecord(compositeKeyForm, record)
+
   /** Shared: compose PK and query all items */
   const fetchPartition = (key: Record<string, unknown>) =>
     Effect.gen(function* () {
       const client = yield* DynamoClient
       const tableConfig: TableConfig = yield* config.table.Tag
-      const composites = KeyComposer.extractComposites(config.pk.composite, key)
+      const composites = KeyComposer.extractComposites(config.pk.composite, keyRecord(key))
       const pkValue = composeCollectionKey(config.schema, config.collection.name, composites)
       const allItems = yield* queryAllItems(
         client,
@@ -927,7 +947,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         const assembled = { ...(decoded as object) } as Record<string, unknown>
 
         // 3. Compose PK
-        const composites = KeyComposer.extractComposites(config.pk.composite, assembled)
+        const composites = KeyComposer.extractComposites(config.pk.composite, keyRecord(assembled))
         const pkValue = composeCollectionKey(config.schema, config.collection.name, composites)
 
         // 4. Decompose into items grouped by sub-aggregate transaction boundaries
@@ -1070,14 +1090,20 @@ const makeAggregate = <TSchema extends Schema.Top>(
           newGroups,
           config,
           pkValue,
-          KeyComposer.extractComposites(config.collection.sk?.composite ?? [], assembledNew),
+          KeyComposer.extractComposites(
+            config.collection.sk?.composite ?? [],
+            keyRecord(assembledNew),
+          ),
           stampFor(now, readExistingCreated(allItems)),
         )
         const oldDynamo = buildDynamoItems(
           oldGroups,
           config,
           pkValue,
-          KeyComposer.extractComposites(config.collection.sk?.composite ?? [], assembledOld),
+          KeyComposer.extractComposites(
+            config.collection.sk?.composite ?? [],
+            keyRecord(assembledOld),
+          ),
         )
 
         const skOf = (item: Record<string, AttributeValue>): string =>

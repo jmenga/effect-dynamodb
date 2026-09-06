@@ -120,8 +120,8 @@ import {
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import {
-  encodeCompositeRecord,
-  makeCompositeEncoder,
+  makeCompositeKeyForm,
+  toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
 import type {
@@ -973,7 +973,7 @@ const makeFromConfig = (config: {
       // composing keys. The raw model is not equivalent — entity derivation
       // substitutes date/Redacted fields with their wire transforms.
       const encoderSource = entityLike.schemas.inputSchema ?? entityLike.model
-      const encodeComposite = makeCompositeEncoder(encoderSource, (attr, value) => {
+      const compositeKeyForm = makeCompositeKeyForm(encoderSource, (attr, value) => {
         throw new Error(
           `[EDD-9050] Composite "${attr}" on index "${_indexName}" of entity ` +
             `"${entityLike.entityType}" could not be encoded to its stored form. The ` +
@@ -985,7 +985,7 @@ const makeFromConfig = (config: {
 
       return (rawComposites: Record<string, unknown>) => {
         validateQueryComposites(_indexName, indexDef, rawComposites)
-        const composites = encodeCompositeRecord(encodeComposite, rawComposites)
+        const composites = toCompositeKeyRecord(compositeKeyForm, rawComposites)
         const pkValue = KeyComposer.composePk(
           entityLike._schema,
           entityLike.entityType,
@@ -1086,7 +1086,7 @@ const makeFromConfig = (config: {
           // Encode the operand exactly as the accessor composites (and the
           // write path) are encoded, so both sides of the comparison come out
           // of one pipeline.
-          const operand = (value: unknown): unknown => encodeComposite(targetAttr, value)
+          const operand = (value: unknown): unknown => compositeKeyForm(targetAttr, value)
           const compose = (value: unknown): string =>
             KeyComposer.composeSortKeyPrefix(
               entityLike._schema,
