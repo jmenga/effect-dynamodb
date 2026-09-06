@@ -8543,7 +8543,27 @@ const Ledgers = Entity.make({
   },
 })
 
-const EncTable = Table.make({ schema: encSchema, entities: { Ledgers } })
+// Same transformed composite, with the lifecycle features whose internal
+// paths compose keys from records read back from DynamoDB (already ENCODED).
+class RetainLedger extends Schema.Class<RetainLedger>("RetainLedger")({
+  acctId: Schema.String,
+  txn: Schema.BigIntFromString,
+  note: Schema.String,
+}) {}
+
+const RetainLedgers = Entity.make({
+  model: RetainLedger,
+  entityType: "RetainLedger",
+  primaryKey: {
+    pk: { field: "pk", composite: ["acctId"] },
+    sk: { field: "sk", composite: ["txn"] },
+  },
+  versioned: { retain: true },
+  softDelete: true,
+  timestamps: true,
+})
+
+const EncTable = Table.make({ schema: encSchema, entities: { Ledgers, RetainLedgers } })
 const EncLayer = Layer.mergeAll(ClientLayer, EncTable.layer({ name: encTableName }))
 const provideEnc = Effect.provide(EncLayer)
 const encEntities = { Ledgers }
@@ -8650,21 +8670,97 @@ describeConnected("transformed sort key composites — encoded/decoded gap", () 
     }).pipe(provideEnc),
   )
 
-  it.effect("primary-key composition on get/delete is encoded as well", () =>
+  // ----- key input is the Type side, one convention across the API -----
+
+  it.effect("get / update / delete take the Type side, like the query path", () =>
     Effect.gen(function* () {
       const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
-      // `get` decodes its key input to the Type side; the stored key came from
-      // the Encoded side. Pre-fix this returned ItemNotFound for a row that
-      // exists.
-      const got = yield* db.entities.Ledgers.get({ bookId: "b1", txn: "999" } as never)
-      expect(got.txn).toBe(999n)
 
-      yield* db.entities.Ledgers.delete({ bookId: "b1", txn: "999" } as never)
+      // `420n` — the value the domain model holds and the value
+      // `.where(eq(t.txn, 420n))` takes. Pre-fix this raised ValidationError.
+      const got = yield* db.entities.Ledgers.get({ bookId: "b1", txn: 420n })
+      expect(got.txn).toBe(420n)
+      expect(got.label).toBe("x")
+
+      const updated = yield* db.entities.Ledgers.update({ bookId: "b1", txn: 420n }).set({
+        label: "y",
+      })
+      expect(updated.label).toBe("y")
+      expect(updated.txn).toBe(420n)
+
+      yield* db.entities.Ledgers.delete({ bookId: "b1", txn: 999n })
       const left = yield* db.entities.Ledgers.primary({ bookId: "b1" }).collect()
       expect(left.map((r) => r.txn)).toEqual([100n, 420n])
 
-      // Restore the fixture for any later test in this block.
+      // Restore the fixture for the rest of this block.
       yield* db.entities.Ledgers.put({ bookId: "b1", txn: 999n, label: "x" })
+      yield* db.entities.Ledgers.update({ bookId: "b1", txn: 420n }).set({ label: "x" })
+    }).pipe(provideEnc),
+  )
+
+  it.effect("the Encoded side is NOT a public key input — it fails, naming the attribute", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
+      // `"420"` is the wire form. It was never a working input on a transformed
+      // composite — pre-fix it silently returned ItemNotFound for a row that
+      // exists. It is now rejected like any other wrong-typed key.
+      const err = yield* db.entities.Ledgers.get({ bookId: "b1", txn: "420" } as never).pipe(
+        Effect.flip,
+      )
+      expect(err._tag).toBe("ValidationError")
+      expect(String((err as { cause?: unknown }).cause)).toMatch(/txn/)
+    }).pipe(provideEnc),
+  )
+
+  it.effect("a nonsense key value still fails, naming the attribute", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
+      const err = yield* db.entities.Ledgers.get({ bookId: "b1", txn: {} } as never).pipe(
+        Effect.flip,
+      )
+      expect(err._tag).toBe("ValidationError")
+      expect(String((err as { cause?: unknown }).cause)).toMatch(/txn/)
+    }).pipe(provideEnc),
+  )
+
+  // ----- internal paths still hold ENCODED records -----
+
+  it.effect("retain / soft-delete / restore compose correctly from encoded records", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { RetainLedgers },
+        tables: { EncTable },
+      })
+
+      yield* db.entities.RetainLedgers.put({ acctId: "a1", txn: 77n, note: "one" })
+
+      // `update` recomposes the primary key from `newItem` — a wire-shaped
+      // record merged from the stored item — and writes a retain snapshot in
+      // the same transaction. Both go through the INTERNAL composePrimaryKey
+      // path, not the public key boundary.
+      yield* db.entities.RetainLedgers.update({ acctId: "a1", txn: 77n }).set({ note: "two" })
+      const afterUpdate = yield* db.entities.RetainLedgers.get({ acctId: "a1", txn: 77n })
+      expect(afterUpdate.note).toBe("two")
+
+      const snapshots = yield* db.entities.RetainLedgers.versions({
+        acctId: "a1",
+        txn: 77n,
+      }).collect()
+      expect(snapshots.length).toBeGreaterThan(0)
+
+      // Soft delete writes the tombstone from the encoded stored item; restore
+      // recomposes every key from that encoded record.
+      yield* db.entities.RetainLedgers.delete({ acctId: "a1", txn: 77n })
+      const tombstone = yield* db.entities.RetainLedgers.deleted.get({ acctId: "a1", txn: 77n })
+      expect(tombstone.txn).toBe(77n)
+
+      const restored = yield* db.entities.RetainLedgers.restore({ acctId: "a1", txn: 77n })
+      expect(restored.txn).toBe(77n)
+      expect(restored.note).toBe("two")
+
+      // The restored row is reachable by its composed key again.
+      const live = yield* db.entities.RetainLedgers.get({ acctId: "a1", txn: 77n })
+      expect(live.note).toBe("two")
     }).pipe(provideEnc),
   )
 
