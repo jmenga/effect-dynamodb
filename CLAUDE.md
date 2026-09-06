@@ -425,6 +425,20 @@ Chore: <one-line summary>. No version change.
 
 The gate is scoped to `main` so a **stacked release train** can work: several PRs chained onto a `release/**` integration branch, each carrying its own unconsumed changeset, with a single `pnpm changeset version` at the tip producing one version and one CHANGELOG entry for the whole batch. The guarantee is unchanged — nothing reaches `main` with a changeset left unconsumed. CI itself has no `branches` filter and runs on every PR whatever its base, because a stack chains onto `docs/**` / `fix/**` / `feat/**` branches rather than onto `release/**` directly, and a base-branch allowlist would silently leave the intermediate PRs with no CI at all.
 
+### Release ordering
+
+`release.yml` fires on **every** push to `main` and publishes whenever a `package.json`
+version differs from npm. That makes the version-bumping PR order-sensitive: merge it
+while other release work is still open and you publish a release missing those PRs — and
+every later merge then publishes **nothing**, because the version already matches npm.
+The batch sits unpublished until someone hand-cuts the next version.
+
+**The version bump merges last.** `ci.yml`'s "Version bump must merge last" gate enforces
+it: a PR that bumps a publishable package version fails if any other open PR into `main`
+carries a changeset file or touches publishable `src/`. Empty chore changesets count —
+in a batched release they are exactly how the queued PRs are marked. Override with the
+`release-order-override` label when the ordering is deliberate.
+
 ### Trusted Publishing setup
 
 Each of the four publishable packages must be configured on npmjs.com with this repo + `release.yml` as a trusted publisher. No `NPM_TOKEN` is required. The workflow uses `npm publish --provenance --access public` to emit a signed provenance attestation on each publish — verifiable by consumers. **`@effect-dynamodb/schema` is new and must be registered as a Trusted Publisher on npmjs.com before its first release** (this cannot be automated from the repo).

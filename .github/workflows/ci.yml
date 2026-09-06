@@ -13,6 +13,11 @@ jobs:
   ci:
     name: Typecheck, Lint, Test, Build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The release-order gate lists other open PRs to check whether release work
+      # is still pending before a version bump merges.
+      pull-requests: read
     services:
       dynamodb-local:
         image: amazon/dynamodb-local:latest
@@ -156,3 +161,67 @@ jobs:
             echo "::error::No changeset found. Run 'pnpm changeset' and commit the generated file."
             exit 1
           fi
+
+      # `release.yml` fires on every push to `main` and publishes whenever a
+      # package.json version differs from npm. That makes the version-bumping PR
+      # order-sensitive in a way nothing else enforces: merge it while other
+      # release work is still open and you publish a tarball missing those PRs —
+      # and every later merge then publishes NOTHING, because the version already
+      # matches npm. The batch sits unpublished until someone hand-cuts the next
+      # version. This gate makes "the version bump merges last" a check rather
+      # than a convention.
+      - name: Version bump must merge last
+        if: github.base_ref == 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Does THIS PR bump a publishable package?
+          BUMPS=false
+          for PKG_FILE in packages/effect-dynamodb/package.json packages/schema/package.json packages/effect-dynamodb-geo/package.json packages/language-service/package.json; do
+            [ -f "$PKG_FILE" ] || continue
+            CURRENT=$(node -p "require('./$PKG_FILE').version")
+            BASE=$(git show origin/${{ github.base_ref }}:$PKG_FILE 2>/dev/null \
+              | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{process.stdout.write(JSON.parse(d).version)}catch{process.stdout.write('')}})")
+            if [ -n "$BASE" ] && [ "$CURRENT" != "$BASE" ]; then BUMPS=true; fi
+          done
+
+          if [ "$BUMPS" != "true" ]; then
+            echo "No version bump in this PR — ordering gate does not apply."
+            exit 0
+          fi
+
+          if gh pr view ${{ github.event.pull_request.number }} --json labels \
+               --jq '.labels[].name' | grep -qx 'release-order-override'; then
+            echo "::warning::'release-order-override' label present — ordering gate skipped."
+            exit 0
+          fi
+
+          echo "This PR bumps a package version. Checking for other open release work..."
+
+          # Any other open PR into main that carries a changeset file, or touches
+          # publishable source, is release work that must merge BEFORE this one.
+          # Empty chore changesets count deliberately: in a batched release they
+          # are exactly how the queued PRs are marked.
+          BLOCKING=""
+          for N in $(gh pr list --base main --state open --json number --jq '.[].number'); do
+            [ "$N" = "${{ github.event.pull_request.number }}" ] && continue
+            FILES=$(gh pr view "$N" --json files --jq '.files[].path')
+            if echo "$FILES" | grep -qE '^\.changeset/.+\.md$|^packages/(effect-dynamodb|schema|effect-dynamodb-geo|language-service)/src/'; then
+              TITLE=$(gh pr view "$N" --json title --jq '.title')
+              BLOCKING="$BLOCKING\n  #$N  $TITLE"
+            fi
+          done
+
+          if [ -n "$BLOCKING" ]; then
+            echo "::error::This PR carries the version bump, but release work is still open:"
+            printf "::error::%b\n" "$BLOCKING"
+            echo "::error::Merge those first, then rebase this PR and re-run 'pnpm changeset version'."
+            echo "::error::release.yml publishes on the FIRST push whose version differs from npm — merging"
+            echo "::error::this now ships a release missing those PRs, and their later merges publish nothing."
+            echo "::error::Override with the 'release-order-override' label if this is deliberate."
+            exit 1
+          fi
+
+          echo "No other open release work — safe to merge the version bump."
