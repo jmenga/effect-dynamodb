@@ -34,7 +34,7 @@
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json"
   },
   "peerDependencies": {
     "typescript": ">=5.7.0"

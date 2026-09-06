@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import type { ResolvedEntity } from "../src/core/EntityResolver"
 import type { DetectedOperation } from "../src/core/OperationDetector"
-import { buildParams } from "../src/core/ParamsBuilder"
+import { buildParamsOrThrow } from "./helpers/params"
 
 const userEntity: ResolvedEntity = {
   variableName: "Users",
@@ -54,7 +54,7 @@ describe("ParamsBuilder", () => {
         arguments: { userId: "u-alice" },
       }
 
-      const params = buildParams(op)
+      const params = buildParamsOrThrow(op)
 
       expect(params.command).toBe("GetItemCommand")
       expect(params.Key).toBeDefined()
@@ -70,7 +70,7 @@ describe("ParamsBuilder", () => {
         arguments: { userId: undefined as any },
       }
 
-      const params = buildParams(op)
+      const params = buildParamsOrThrow(op)
 
       expect(params.Key!.pk).toBe("$crud-demo#v1#user#{userId}")
     })
@@ -84,7 +84,7 @@ describe("ParamsBuilder", () => {
         arguments: { userId: "u-bob", role: "member" },
       }
 
-      const params = buildParams(op)
+      const params = buildParamsOrThrow(op)
 
       expect(params.command).toBe("PutItemCommand")
       expect(params.Item).toBeDefined()
@@ -104,7 +104,7 @@ describe("ParamsBuilder", () => {
         type: "put",
       }
 
-      const params = buildParams(op)
+      const params = buildParamsOrThrow(op)
 
       expect(params.command).toBe("TransactWriteItemsCommand")
     })
@@ -118,7 +118,7 @@ describe("ParamsBuilder", () => {
         arguments: { userId: "u-new" },
       }
 
-      const params = buildParams(op)
+      const params = buildParamsOrThrow(op)
 
       expect(params.command).toBe("PutItemCommand")
       expect(params.ConditionExpression).toContain("attribute_not_exists(#pk)")
@@ -138,7 +138,7 @@ describe("ParamsBuilder", () => {
         },
       }
 
-      const params = buildParams(op)
+      const params = buildParamsOrThrow(op)
 
       expect(params.command).toBe("UpdateItemCommand")
       expect(params.Key!.pk).toBe("$crud-demo#v1#user#u-alice")
@@ -164,7 +164,7 @@ describe("ParamsBuilder", () => {
         },
       }
 
-      const params = buildParams(op)
+      const params = buildParamsOrThrow(op)
 
       expect(params.ConditionExpression).toBe("#__edd_v__ = :expectedVersion")
       expect(params.ExpressionAttributeValues![":expectedVersion"]).toBe("2")
@@ -179,7 +179,7 @@ describe("ParamsBuilder", () => {
         arguments: { userId: "u-alice" },
       }
 
-      const params = buildParams(op)
+      const params = buildParamsOrThrow(op)
 
       expect(params.command).toBe("DeleteItemCommand")
       expect(params.Key!.pk).toBe("$crud-demo#v1#user#u-alice")
@@ -192,7 +192,7 @@ describe("ParamsBuilder", () => {
         arguments: { taskId: "t-1" },
       }
 
-      const params = buildParams(op)
+      const params = buildParamsOrThrow(op)
 
       expect(params.command).toBe("TransactWriteItemsCommand")
     })
@@ -207,7 +207,7 @@ describe("ParamsBuilder", () => {
         arguments: { role: "admin" },
       }
 
-      const params = buildParams(op)
+      const params = buildParamsOrThrow(op)
 
       expect(params.command).toBe("QueryCommand")
       expect(params.IndexName).toBe("gsi1")
@@ -226,7 +226,7 @@ describe("ParamsBuilder", () => {
         arguments: { userId: "u-alice" },
       }
 
-      const params = buildParams(op)
+      const params = buildParamsOrThrow(op)
 
       expect(params.command).toBe("QueryCommand")
       expect(params.KeyConditionExpression).toContain("begins_with(#sk, :skPrefix)")
@@ -241,7 +241,7 @@ describe("ParamsBuilder", () => {
         type: "scan",
       }
 
-      const params = buildParams(op)
+      const params = buildParamsOrThrow(op)
 
       expect(params.command).toBe("ScanCommand")
       expect(params.FilterExpression).toBe("#et IN (:et0)")

@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true
+  },
+  "include": ["src", "test"],
+  // `test/fixtures` holds sample sources the plugin is pointed at by hand; they
+  // import `effect` / `effect-dynamodb`, which this package deliberately does
+  // not depend on (that would invert the dependency direction).
+  "exclude": ["node_modules", "dist", "test/fixtures"]
+}
