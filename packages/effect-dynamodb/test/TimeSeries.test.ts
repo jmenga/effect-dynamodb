@@ -17,9 +17,9 @@ import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import { DateTime, Duration, Effect, Layer, Option, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
-import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -54,35 +54,23 @@ const mockTransactWriteItems = vi.fn()
 const mockGetItem = vi.fn()
 const mockQuery = vi.fn()
 
-const mockService: any = {
-  putItem: () => Effect.die("not used"),
-  getItem: (input: any) =>
+const TestDynamoClient = mockDynamoClientLayer({
+  getItem: (input) =>
     Effect.tryPromise({
       try: () => mockGetItem(input),
       catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
     }),
-  deleteItem: () => Effect.die("not used"),
-  updateItem: () => Effect.die("not used"),
-  query: (input: any) =>
+  query: (input) =>
     Effect.tryPromise({
       try: () => mockQuery(input),
       catch: (e) => new DynamoError({ operation: "Query", cause: e }),
     }),
-  transactWriteItems: (input: any) =>
+  transactWriteItems: (input) =>
     Effect.tryPromise({
       try: () => mockTransactWriteItems(input),
       catch: (e) => new DynamoError({ operation: "TransactWriteItems", cause: e }),
     }),
-  batchGetItem: () => Effect.die("not used"),
-  batchWriteItem: () => Effect.die("not used"),
-  transactGetItems: () => Effect.die("not used"),
-  createTable: () => Effect.die("not used"),
-  deleteTable: () => Effect.die("not used"),
-  describeTable: () => Effect.die("not used"),
-  scan: () => Effect.die("not used"),
-}
-
-const TestDynamoClient = Layer.succeed(DynamoClient, mockService)
+})
 
 /** Build a wired entity with a real Table tag. */
 const makeEntityWithTag = <E extends { _configure: (...args: any) => any }>(

@@ -24,6 +24,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { decodeSparseFields, encodeSparseFields } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
+import { mockDynamoClient } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -85,7 +86,11 @@ describe("SparseMap — DynamoModel.SparseMap() helper", () => {
     }) {}
     expect(() =>
       DynamoModel.configure(P, {
-        metrics: { storedAs: "sparse" as unknown as Schema.Schema<unknown> },
+        // The magic string where a storage schema is expected — the cast is the
+        // point of the test: `"sparse"` must no longer activate the sparse-map path.
+        metrics: {
+          storedAs: "sparse" as unknown as Schema.Schema<{ readonly [x: string]: number }>,
+        },
       }),
     ).toThrow()
     // And the Schema's getSparseFields would NOT report metrics as sparse if
@@ -418,41 +423,33 @@ const mockGetItem = vi.fn()
 const mockDeleteItem = vi.fn()
 const mockTransactWriteItems = vi.fn()
 
-const mockService: any = {
-  putItem: (input: any) =>
+const mockService = mockDynamoClient({
+  putItem: (input) =>
     Effect.tryPromise({
       try: () => mockPutItem(input),
       catch: (e) => new DynamoError({ operation: "PutItem", cause: e }),
     }),
-  getItem: (input: any) =>
+  getItem: (input) =>
     Effect.tryPromise({
       try: () => mockGetItem(input),
       catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
     }),
-  updateItem: (input: any) =>
+  updateItem: (input) =>
     Effect.tryPromise({
       try: () => mockUpdateItem(input),
       catch: (e) => new DynamoError({ operation: "UpdateItem", cause: e }),
     }),
-  deleteItem: (input: any) =>
+  deleteItem: (input) =>
     Effect.tryPromise({
       try: () => mockDeleteItem(input),
       catch: (e) => new DynamoError({ operation: "DeleteItem", cause: e }),
     }),
-  transactWriteItems: (input: any) =>
+  transactWriteItems: (input) =>
     Effect.tryPromise({
       try: () => mockTransactWriteItems(input),
       catch: (e) => new DynamoError({ operation: "TransactWriteItems", cause: e }),
     }),
-  query: () => Effect.die("not used"),
-  batchGetItem: () => Effect.die("not used"),
-  batchWriteItem: () => Effect.die("not used"),
-  transactGetItems: () => Effect.die("not used"),
-  createTable: () => Effect.die("not used"),
-  deleteTable: () => Effect.die("not used"),
-  describeTable: () => Effect.die("not used"),
-  scan: () => Effect.die("not used"),
-}
+})
 
 const TestDynamoClient = Layer.succeed(DynamoClient, mockService)
 
@@ -896,11 +893,11 @@ describe("SparseMap — time-series interaction", () => {
 
     const r = await Effect.runPromise(
       Effect.gen(function* () {
-        return yield* (Telemetries as any).append({
+        return yield* Telemetries.append({
           device: "dev-1",
           timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
           reading: 42,
-        }) as Effect.Effect<any, any, any>
+        })
       }).pipe(Effect.provide(TMLayers, { local: true })),
     )
     // Stale-as-error contract: success returns `{ current }` directly with the

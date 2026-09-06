@@ -18,90 +18,78 @@
  *     bug-3 fix)
  */
 
-import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import type {
+  AttributeValue,
+  GetItemCommandOutput,
+  TransactWriteItemsCommandInput,
+  TransactWriteItemsCommandOutput,
+  UpdateItemCommandInput,
+  UpdateItemCommandOutput,
+} from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { CompositeNullableError } from "@effect-dynamodb/schema/Errors.js"
 import { DateTime, Duration, Effect, Layer, Schema } from "effect"
-import { DynamoClient } from "../src/DynamoClient.js"
+import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
+import { mockDynamoClient, mockOutput } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Mock client capture helpers
 // ---------------------------------------------------------------------------
 
 type Capture = {
-  updateItem?: Record<string, unknown>
-  transactWriteItems?: Record<string, unknown>
+  updateItem?: UpdateItemCommandInput
+  transactWriteItems?: TransactWriteItemsCommandInput
 }
 
-const makeMockClient = (capture: Capture) => ({
-  putItem: () => Effect.die("putItem not used"),
-  getItem: () =>
-    Effect.succeed({
-      Item: {
-        // Pretend the stored item has the full hierarchy populated.
-        pk: { S: "$app#v1#asset#a-1" } as AttributeValue,
-        sk: { S: "$app#v1#asset" } as AttributeValue,
-        assetId: { S: "a-1" } as AttributeValue,
-        region: { S: "americas" } as AttributeValue,
-        country: { S: "us" } as AttributeValue,
-        city: { S: "sf" } as AttributeValue,
-        site: { S: "datacenter-1" } as AttributeValue,
-        gsi1pk: { S: "$app#v1#asset#region_americas" } as AttributeValue,
-        gsi1sk: {
-          S: "$app#v1#asset#country_us#city_sf#site_datacenter-1",
-        } as AttributeValue,
-        version: { N: "1" } as AttributeValue,
-        __edd_e__: { S: "Asset" } as AttributeValue,
-        createdAt: { S: "2026-01-01T00:00:00.000Z" } as AttributeValue,
-        updatedAt: { S: "2026-01-01T00:00:00.000Z" } as AttributeValue,
-      },
-    }),
-  updateItem: (input: Record<string, unknown>) => {
-    capture.updateItem = input
-    return Effect.succeed({
-      Attributes: {
-        pk: { S: "$app#v1#x" } as AttributeValue,
-        sk: { S: "$app#v1#x" } as AttributeValue,
-        pageId: { S: "p-1" } as AttributeValue,
-        assetId: { S: "a-1" } as AttributeValue,
-        __edd_e__: { S: "X" } as AttributeValue,
-      },
-    })
-  },
-  transactWriteItems: (input: Record<string, unknown>) => {
-    capture.transactWriteItems = input
-    return Effect.succeed({})
-  },
-  deleteItem: () => Effect.die("deleteItem not used"),
-  query: () => Effect.die("query not used"),
-  scan: () => Effect.die("scan not used"),
-  batchGetItem: () => Effect.die("batchGetItem not used"),
-  batchWriteItem: () => Effect.die("batchWriteItem not used"),
-  transactGetItems: () => Effect.die("transactGetItems not used"),
-  createTable: () => Effect.die("createTable not used"),
-  deleteTable: () => Effect.die("deleteTable not used"),
-  describeTable: () => Effect.die("describeTable not used"),
-  updateTimeToLive: () => Effect.die("updateTimeToLive not used"),
-  describeTimeToLive: () => Effect.die("describeTimeToLive not used"),
-  updateContinuousBackups: () => Effect.die("updateContinuousBackups not used"),
-  describeContinuousBackups: () => Effect.die("describeContinuousBackups not used"),
-  createBackup: () => Effect.die("createBackup not used"),
-  describeBackup: () => Effect.die("describeBackup not used"),
-  deleteBackup: () => Effect.die("deleteBackup not used"),
-  restoreTableFromBackup: () => Effect.die("restoreTableFromBackup not used"),
-  restoreTableToPointInTime: () => Effect.die("restoreTableToPointInTime not used"),
-  exportTableToPointInTime: () => Effect.die("exportTableToPointInTime not used"),
-  describeExport: () => Effect.die("describeExport not used"),
-  listExports: () => Effect.die("listExports not used"),
-  tagResource: () => Effect.die("tagResource not used"),
-  untagResource: () => Effect.die("untagResource not used"),
-  listTagsOfResource: () => Effect.die("listTagsOfResource not used"),
-})
+const makeMockClient = (capture: Capture): DynamoClientService =>
+  mockDynamoClient({
+    getItem: () =>
+      Effect.succeed(
+        mockOutput<GetItemCommandOutput>({
+          Item: {
+            // Pretend the stored item has the full hierarchy populated.
+            pk: { S: "$app#v1#asset#a-1" } as AttributeValue,
+            sk: { S: "$app#v1#asset" } as AttributeValue,
+            assetId: { S: "a-1" } as AttributeValue,
+            region: { S: "americas" } as AttributeValue,
+            country: { S: "us" } as AttributeValue,
+            city: { S: "sf" } as AttributeValue,
+            site: { S: "datacenter-1" } as AttributeValue,
+            gsi1pk: { S: "$app#v1#asset#region_americas" } as AttributeValue,
+            gsi1sk: {
+              S: "$app#v1#asset#country_us#city_sf#site_datacenter-1",
+            } as AttributeValue,
+            version: { N: "1" } as AttributeValue,
+            __edd_e__: { S: "Asset" } as AttributeValue,
+            createdAt: { S: "2026-01-01T00:00:00.000Z" } as AttributeValue,
+            updatedAt: { S: "2026-01-01T00:00:00.000Z" } as AttributeValue,
+          },
+        }),
+      ),
+    updateItem: (input) => {
+      capture.updateItem = input
+      return Effect.succeed(
+        mockOutput<UpdateItemCommandOutput>({
+          Attributes: {
+            pk: { S: "$app#v1#x" } as AttributeValue,
+            sk: { S: "$app#v1#x" } as AttributeValue,
+            pageId: { S: "p-1" } as AttributeValue,
+            assetId: { S: "a-1" } as AttributeValue,
+            __edd_e__: { S: "X" } as AttributeValue,
+          },
+        }),
+      )
+    },
+    transactWriteItems: (input) => {
+      capture.transactWriteItems = input
+      return Effect.succeed(mockOutput<TransactWriteItemsCommandOutput>({}))
+    },
+  })
 
-const makeLayer = (capture: Capture) => Layer.succeed(DynamoClient, makeMockClient(capture) as any)
+const makeLayer = (capture: Capture) => Layer.succeed(DynamoClient, makeMockClient(capture))
 
 // ---------------------------------------------------------------------------
 // Fixture: geographic asset hierarchy
@@ -313,11 +301,12 @@ const Pages = Entity.make({
 const PagesTable = Table.make({ schema: AppSchema, entities: { Pages } })
 const PagesTableLayer = PagesTable.layer({ name: "pages-table" })
 
-const makePagesMock = (capture: Capture) => ({
-  ...makeMockClient(capture),
-  // No retain on Pages, so getItem isn't called. Only updateItem matters.
-  getItem: () => Effect.die("getItem not expected on standard path"),
-})
+const makePagesMock = (capture: Capture): DynamoClientService =>
+  mockDynamoClient({
+    ...makeMockClient(capture),
+    // No retain on Pages, so getItem isn't called. Only updateItem matters.
+    getItem: () => Effect.die("getItem not expected on standard path"),
+  })
 
 describe("Entity update — standard path migration regression (issue #36 / #41 / #43)", () => {
   it.effect(
@@ -325,7 +314,7 @@ describe("Entity update — standard path migration regression (issue #36 / #41 
     () => {
       const capture: Capture = {}
       const layer = Layer.mergeAll(
-        Layer.succeed(DynamoClient, makePagesMock(capture) as any),
+        Layer.succeed(DynamoClient, makePagesMock(capture)),
         PagesTableLayer,
       )
       return Effect.gen(function* () {
@@ -430,10 +419,11 @@ const SparseHoles = Entity.make({
 const HolesTable = Table.make({ schema: AppSchema, entities: { PreserveHoles, SparseHoles } })
 const HolesTableLayer = HolesTable.layer({ name: "holes-table" })
 
-const makeHolesMock = (capture: Capture) => ({
-  ...makeMockClient(capture),
-  getItem: () => Effect.die("getItem not expected (no retain)"),
-})
+const makeHolesMock = (capture: Capture): DynamoClientService =>
+  mockDynamoClient({
+    ...makeMockClient(capture),
+    getItem: () => Effect.die("getItem not expected (no retain)"),
+  })
 
 // Helper for parsing the captured UpdateExpression's REMOVE clause into a
 // set of physical attribute names.
@@ -462,7 +452,7 @@ describe("Entity update — hole pattern under v1.7.1 (no throw, unified can't-c
       // payload) → SET pk. Critical assertion: no error AND no gsi1sk REMOVE.
       const capture: Capture = {}
       const layer = Layer.mergeAll(
-        Layer.succeed(DynamoClient, makeHolesMock(capture) as any),
+        Layer.succeed(DynamoClient, makeHolesMock(capture)),
         HolesTableLayer,
       )
       return Effect.gen(function* () {
@@ -499,7 +489,7 @@ describe("Entity update — hole pattern under v1.7.1 (no throw, unified can't-c
       // payload, so pk is also touched and SETs.)
       const capture: Capture = {}
       const layer = Layer.mergeAll(
-        Layer.succeed(DynamoClient, makeHolesMock(capture) as any),
+        Layer.succeed(DynamoClient, makeHolesMock(capture)),
         HolesTableLayer,
       )
       return Effect.gen(function* () {
@@ -535,7 +525,7 @@ describe("Entity update — hole pattern under v1.7.1 (no throw, unified can't-c
       // is NOT REMOVE'd (the v1.7.0 GSI-wide cascade is gone).
       const capture: Capture = {}
       const layer = Layer.mergeAll(
-        Layer.succeed(DynamoClient, makeHolesMock(capture) as any),
+        Layer.succeed(DynamoClient, makeHolesMock(capture)),
         HolesTableLayer,
       )
       return Effect.gen(function* () {
@@ -817,32 +807,37 @@ const SensorTableLayer = SensorTable.layer({ name: "sensor-table" })
 // Mock client that pretends a stored Sensor exists with no GSI keys (mirrors
 // items written under v1.7.0 / v1.7.1 — the bug state). Returns
 // Sensor-shaped Attributes from updateItem so the Schema decode succeeds.
-const makeSensorMock = (capture: Capture) => ({
-  ...makeMockClient(capture),
-  getItem: () =>
-    Effect.succeed({
-      Item: {
-        pk: { S: "$sensor-test#v1#sensor#channel_c-1#deviceid_d-1" } as AttributeValue,
-        sk: { S: "$sensor-test#v1#sensor" } as AttributeValue,
-        channel: { S: "c-1" } as AttributeValue,
-        deviceId: { S: "d-1" } as AttributeValue,
-        __edd_e__: { S: "Sensor" } as AttributeValue,
-      },
-    }),
-  updateItem: (input: Record<string, unknown>) => {
-    capture.updateItem = input
-    return Effect.succeed({
-      Attributes: {
-        pk: { S: "$sensor-test#v1#sensor#channel_c-1#deviceid_d-1" } as AttributeValue,
-        sk: { S: "$sensor-test#v1#sensor" } as AttributeValue,
-        channel: { S: "c-1" } as AttributeValue,
-        deviceId: { S: "d-1" } as AttributeValue,
-        otherField: { S: "X" } as AttributeValue,
-        __edd_e__: { S: "Sensor" } as AttributeValue,
-      },
-    })
-  },
-})
+const makeSensorMock = (capture: Capture): DynamoClientService =>
+  mockDynamoClient({
+    ...makeMockClient(capture),
+    getItem: () =>
+      Effect.succeed(
+        mockOutput<GetItemCommandOutput>({
+          Item: {
+            pk: { S: "$sensor-test#v1#sensor#channel_c-1#deviceid_d-1" } as AttributeValue,
+            sk: { S: "$sensor-test#v1#sensor" } as AttributeValue,
+            channel: { S: "c-1" } as AttributeValue,
+            deviceId: { S: "d-1" } as AttributeValue,
+            __edd_e__: { S: "Sensor" } as AttributeValue,
+          },
+        }),
+      ),
+    updateItem: (input) => {
+      capture.updateItem = input
+      return Effect.succeed(
+        mockOutput<UpdateItemCommandOutput>({
+          Attributes: {
+            pk: { S: "$sensor-test#v1#sensor#channel_c-1#deviceid_d-1" } as AttributeValue,
+            sk: { S: "$sensor-test#v1#sensor" } as AttributeValue,
+            channel: { S: "c-1" } as AttributeValue,
+            deviceId: { S: "d-1" } as AttributeValue,
+            otherField: { S: "X" } as AttributeValue,
+            __edd_e__: { S: "Sensor" } as AttributeValue,
+          },
+        }),
+      )
+    },
+  })
 
 describe("Entity update — PK-composites-only GSI shape (closes #43)", () => {
   it.effect(
@@ -854,7 +849,7 @@ describe("Entity update — PK-composites-only GSI shape (closes #43)", () => {
       // UpdateExpression had no SET for gsi1pk / gsi1sk. v1.7.2 fixes this.
       const capture: Capture = {}
       const layer = Layer.mergeAll(
-        Layer.succeed(DynamoClient, makeSensorMock(capture) as any),
+        Layer.succeed(DynamoClient, makeSensorMock(capture)),
         SensorTableLayer,
       )
       return Effect.gen(function* () {
@@ -942,14 +937,15 @@ const TelemetryFixtureTable = Table.make({
 })
 const TelemetryFixtureTableLayer = TelemetryFixtureTable.layer({ name: "telemetry-fixture-table" })
 
-const makeTelemetryFixtureMock = (capture: Capture) => ({
-  ...makeMockClient(capture),
-  getItem: () => Effect.die("getItem not used on append path"),
-  // The append path's follow-up GET (when not skipFollowUp) needs a stored
-  // record. Provide a minimally complete one — the test only inspects the
-  // captured TransactWriteItems.
-  // The follow-up uses getItem too, but we can return the same shape.
-})
+const makeTelemetryFixtureMock = (capture: Capture): DynamoClientService =>
+  mockDynamoClient({
+    ...makeMockClient(capture),
+    getItem: () => Effect.die("getItem not used on append path"),
+    // The append path's follow-up GET (when not skipFollowUp) needs a stored
+    // record. Provide a minimally complete one — the test only inspects the
+    // captured TransactWriteItems.
+    // The follow-up uses getItem too, but we can return the same shape.
+  })
 
 describe("Entity append — PK-composites-only GSI shape (closes #43)", () => {
   it.effect(
@@ -957,7 +953,7 @@ describe("Entity append — PK-composites-only GSI shape (closes #43)", () => {
     () => {
       const capture: Capture = {}
       const layer = Layer.mergeAll(
-        Layer.succeed(DynamoClient, makeTelemetryFixtureMock(capture) as any),
+        Layer.succeed(DynamoClient, makeTelemetryFixtureMock(capture)),
         TelemetryFixtureTableLayer,
       )
       return Effect.gen(function* () {
@@ -1057,30 +1053,35 @@ const Vehicles = Entity.make({
 const VehicleTable = Table.make({ schema: VehicleSchema, entities: { Vehicles } })
 const VehicleTableLayer = VehicleTable.layer({ name: "vehicle-table" })
 
-const makeVehicleMock = (capture: Capture) => ({
-  ...makeMockClient(capture),
-  getItem: () =>
-    Effect.succeed({
-      Item: {
-        pk: { S: "$vehicle-test#v1#vehicle#id_veh-1" } as AttributeValue,
-        sk: { S: "$vehicle-test#v1#vehicle" } as AttributeValue,
-        id: { S: "veh-1" } as AttributeValue,
-        __edd_e__: { S: "Vehicle" } as AttributeValue,
-      },
-    }),
-  updateItem: (input: Record<string, unknown>) => {
-    capture.updateItem = input
-    return Effect.succeed({
-      Attributes: {
-        pk: { S: "$vehicle-test#v1#vehicle#id_veh-1" } as AttributeValue,
-        sk: { S: "$vehicle-test#v1#vehicle" } as AttributeValue,
-        id: { S: "veh-1" } as AttributeValue,
-        deviceBinding: { S: "cloud#dev-1" } as AttributeValue,
-        __edd_e__: { S: "Vehicle" } as AttributeValue,
-      },
-    })
-  },
-})
+const makeVehicleMock = (capture: Capture): DynamoClientService =>
+  mockDynamoClient({
+    ...makeMockClient(capture),
+    getItem: () =>
+      Effect.succeed(
+        mockOutput<GetItemCommandOutput>({
+          Item: {
+            pk: { S: "$vehicle-test#v1#vehicle#id_veh-1" } as AttributeValue,
+            sk: { S: "$vehicle-test#v1#vehicle" } as AttributeValue,
+            id: { S: "veh-1" } as AttributeValue,
+            __edd_e__: { S: "Vehicle" } as AttributeValue,
+          },
+        }),
+      ),
+    updateItem: (input) => {
+      capture.updateItem = input
+      return Effect.succeed(
+        mockOutput<UpdateItemCommandOutput>({
+          Attributes: {
+            pk: { S: "$vehicle-test#v1#vehicle#id_veh-1" } as AttributeValue,
+            sk: { S: "$vehicle-test#v1#vehicle" } as AttributeValue,
+            id: { S: "veh-1" } as AttributeValue,
+            deviceBinding: { S: "cloud#dev-1" } as AttributeValue,
+            __edd_e__: { S: "Vehicle" } as AttributeValue,
+          },
+        }),
+      )
+    },
+  })
 
 describe("Entity update — empty-composite-half GSI shape (closes #46)", () => {
   it.effect(
@@ -1092,7 +1093,7 @@ describe("Entity update — empty-composite-half GSI shape (closes #46)", () => 
       // entity prefix.
       const capture: Capture = {}
       const layer = Layer.mergeAll(
-        Layer.succeed(DynamoClient, makeVehicleMock(capture) as any),
+        Layer.succeed(DynamoClient, makeVehicleMock(capture)),
         VehicleTableLayer,
       )
       return Effect.gen(function* () {
@@ -1154,7 +1155,7 @@ describe("Entity update — empty-composite-half GSI shape (closes #46)", () => 
       // gsi3sk gets re-stamped with the same constant.
       const capture: Capture = {}
       const layer = Layer.mergeAll(
-        Layer.succeed(DynamoClient, makeVehicleMock(capture) as any),
+        Layer.succeed(DynamoClient, makeVehicleMock(capture)),
         VehicleTableLayer,
       )
       return Effect.gen(function* () {

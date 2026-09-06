@@ -15,6 +15,7 @@ import * as Expression from "../src/Expression.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Pure definitions (regression fixtures for #69)
@@ -92,7 +93,7 @@ const keyOf = (item: AttrMap) => `${(item.pk as { S: string })?.S}|${(item.sk as
 // Partial test double — only the methods the bound ops exercise are real; the
 // rest die if reached. Cast because this intentionally omits table-management
 // commands not used by these tests (mirrors the existing DynamoClient.test.ts).
-const mockClient = Layer.succeed(DynamoClient, {
+const mockClient = mockDynamoClientLayer({
   putItem: (input: { Item: AttrMap }) =>
     Effect.sync(() => {
       const item = input.Item
@@ -150,8 +151,6 @@ const mockClient = Layer.succeed(DynamoClient, {
       return {} as never
     }),
   createTable: () => Effect.sync(() => ({}) as never),
-  deleteTable: () => Effect.die("not used"),
-  describeTable: () => Effect.die("not used"),
 } as unknown as DynamoClientService)
 
 const TableLayer = MainTable.layer({ name: "pure-authoring-table" })
@@ -211,7 +210,10 @@ describe("pure @effect-dynamodb/schema authoring bound via DynamoClient.make (#6
       yield* db.entities.Teams.put({ orgId: "o1", teamId: "t1", label: "Eng" })
 
       // Before the fix this threw "member.entityLike._decodeRecord is not a function".
-      const grouped = (yield* db.collections.members({ orgId: "o1" }).collect()) as {
+      // `!` matches every example in the repo: `collections` is an index
+      // signature, so `noUncheckedIndexedAccess` widens each accessor with
+      // `| undefined` even though auto-discovery guarantees it exists.
+      const grouped = (yield* db.collections.members!({ orgId: "o1" }).collect()) as {
         Users: User[]
         Teams: Team[]
       }

@@ -19,6 +19,7 @@ import { beforeEach, vi } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -60,7 +61,7 @@ const mockGetItem = vi.fn()
 const mockDeleteItem = vi.fn()
 const mockUpdateItem = vi.fn()
 
-const TestClient = Layer.succeed(DynamoClient, {
+const TestClient = mockDynamoClientLayer({
   putItem: (input) =>
     Effect.tryPromise({
       try: () => mockPutItem(input),
@@ -81,15 +82,6 @@ const TestClient = Layer.succeed(DynamoClient, {
       try: () => mockUpdateItem(input),
       catch: (e) => new DynamoError({ operation: "UpdateItem", cause: e }),
     }),
-  query: () => Effect.die("not used"),
-  scan: () => Effect.die("not used"),
-  batchGetItem: () => Effect.die("not used"),
-  batchWriteItem: () => Effect.die("not used"),
-  transactGetItems: () => Effect.die("not used"),
-  transactWriteItems: () => Effect.die("not used"),
-  createTable: () => Effect.die("not used"),
-  deleteTable: () => Effect.die("not used"),
-  describeTable: () => Effect.die("not used"),
 })
 
 const TableLayer = MainTable.layer({ name: "bound-crud-test-table" })
@@ -648,28 +640,17 @@ const TelemetryFixtureTable = Table.make({
 const mockTransactWriteItems = vi.fn()
 const mockGetItemTs = vi.fn()
 
-const TestClientTs = Layer.succeed(DynamoClient, {
-  putItem: () => Effect.die("not used"),
+const TestClientTs = mockDynamoClientLayer({
   getItem: (input) =>
     Effect.tryPromise({
       try: () => mockGetItemTs(input),
       catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
     }),
-  deleteItem: () => Effect.die("not used"),
-  updateItem: () => Effect.die("not used"),
-  query: () => Effect.die("not used"),
-  scan: () => Effect.die("not used"),
-  batchGetItem: () => Effect.die("not used"),
-  batchWriteItem: () => Effect.die("not used"),
-  transactGetItems: () => Effect.die("not used"),
   transactWriteItems: (input) =>
     Effect.tryPromise({
       try: () => mockTransactWriteItems(input),
       catch: (e) => new DynamoError({ operation: "TransactWriteItems", cause: e }),
     }),
-  createTable: () => Effect.die("not used"),
-  deleteTable: () => Effect.die("not used"),
-  describeTable: () => Effect.die("not used"),
 })
 
 const TableLayerTs = TelemetryFixtureTable.layer({ name: "bound-append-test-table" })

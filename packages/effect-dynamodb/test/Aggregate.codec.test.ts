@@ -17,9 +17,9 @@ import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import { DateTime, Effect, Layer, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
-import { DynamoClient } from "../src/DynamoClient.js"
 import { fromAttributeValue, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Shared mock client + table
@@ -31,7 +31,7 @@ const MainTable = Table.make({ schema: AppSchema })
 const mockQuery = vi.fn()
 const mockTransactWrite = vi.fn()
 
-const TestDynamoClient = Layer.succeed(DynamoClient, {
+const TestDynamoClient = mockDynamoClientLayer({
   query: (input) =>
     Effect.tryPromise({
       try: () => mockQuery(input),
@@ -42,17 +42,6 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
       try: () => mockTransactWrite(input),
       catch: (e) => new DynamoError({ operation: "TransactWriteItems", cause: e }),
     }),
-  putItem: () => Effect.die("not used"),
-  getItem: () => Effect.die("not used"),
-  deleteItem: () => Effect.die("not used"),
-  updateItem: () => Effect.die("not used"),
-  batchGetItem: () => Effect.die("not used"),
-  batchWriteItem: () => Effect.die("not used"),
-  transactGetItems: () => Effect.die("not used"),
-  createTable: () => Effect.die("not used"),
-  deleteTable: () => Effect.die("not used"),
-  describeTable: () => Effect.die("not used"),
-  scan: () => Effect.die("not used"),
 })
 
 const TestTableConfig = MainTable.layer({ name: "test-table" })

@@ -2463,7 +2463,7 @@ describeConnected("timeSeries integration tests", () => {
 
         // Attempt an append with a NEWER orderBy (CAS would hold) but a
         // condition that does not match the current.
-        const result = yield* (db.entities.Telemetries.append as any)({
+        const result = yield* db.entities.Telemetries.append({
           channel: "c-cond",
           deviceId: "d-1",
           timestamp: DateTime.makeUnsafe("2026-04-22T10:01:00.000Z"),
@@ -2475,7 +2475,9 @@ describeConnected("timeSeries integration tests", () => {
 
         expect(result._tag).toBe("ConditionalCheckFailed")
         if (result._tag === "ConditionalCheckFailed") {
-          expect(Option.isSome(result.current)).toBe(true)
+          // `current` is optional on `ConditionalCheckFailed` — absent when the
+          // follow-up GetItem was skipped. Here it must be a Some.
+          expect(result.current !== undefined && Option.isSome(result.current)).toBe(true)
         }
       }).pipe(provideTs),
   )
@@ -5856,7 +5858,7 @@ describeConnected("#69 — pure schema authoring → DynamoClient.make → real 
       const scanned = yield* db.entities.PureUsers.scan().collect()
       expect(scanned.length).toBeGreaterThanOrEqual(2)
 
-      const grouped = (yield* db.collections.pureMembers({ orgId: "acme" }).collect()) as {
+      const grouped = (yield* db.collections.pureMembers!({ orgId: "acme" }).collect()) as {
         PureUsers: PureUser[]
         PureTeams: PureTeam[]
       }
@@ -8232,12 +8234,15 @@ describeConnected("EventStore — additionalItems + idempotency (closes #85)", (
         state: "IN_PROGRESS",
       }).asEffect()
 
-      expect((second as { createdAt: unknown }).createdAt).toEqual(
-        (first as { createdAt: unknown }).createdAt,
-      )
-      expect((second as { version: number }).version).toBe(
-        (first as { version: number }).version + 1,
-      )
+      // `upsert` resolves to the model type; `createdAt` / `version` are added
+      // by `timestamps` / `versioned` on the stored record, which the bound
+      // builders do not surface — hence the widening view.
+      type Stamped = { readonly createdAt: unknown; readonly version: number }
+      const firstStamped = first as unknown as Stamped
+      const secondStamped = second as unknown as Stamped
+
+      expect(secondStamped.createdAt).toEqual(firstStamped.createdAt)
+      expect(secondStamped.version).toBe(firstStamped.version + 1)
     }).pipe(provideEsIdem),
   )
 
@@ -8263,8 +8268,12 @@ describeConnected("EventStore — additionalItems + idempotency (closes #85)", (
       )
       // Refused up front — no partial write, and createdAt/version intact.
       expect(after.state).toBe("PRE_MATCH")
-      expect(after.createdAt).toEqual((before as { createdAt: unknown }).createdAt)
-      expect(after.version).toBe((before as { version: number }).version)
+      const beforeStamped = before as unknown as {
+        readonly createdAt: unknown
+        readonly version: number
+      }
+      expect(after.createdAt).toEqual(beforeStamped.createdAt)
+      expect(after.version).toBe(beforeStamped.version)
     }).pipe(provideEsIdem),
   )
 

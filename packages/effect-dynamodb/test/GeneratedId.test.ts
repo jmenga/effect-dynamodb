@@ -1,3 +1,9 @@
+import type {
+  GetItemCommandOutput,
+  PutItemCommandOutput,
+  QueryCommandOutput,
+  TransactWriteItemsCommandOutput,
+} from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
@@ -6,6 +12,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
+import { mockDynamoClientLayer, mockOutput } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // In-memory DynamoClient — put stores the item, get reads it back. Lets us
@@ -21,17 +28,17 @@ const keyOf = (key: Record<string, { S?: string }>): string =>
   `${key.pk?.S ?? ""}|${key.sk?.S ?? ""}`
 
 const makeInMemoryClient = (store: Store) =>
-  Layer.succeed(DynamoClient, {
+  mockDynamoClientLayer({
     putItem: (input) =>
       Effect.sync(() => {
-        const item = fromAttributeMap(input.Item as never)
-        store.items.set(keyOf(input.Item as never), item)
-        return {} as never
+        const attrs = input.Item ?? {}
+        store.items.set(keyOf(attrs), fromAttributeMap(attrs))
+        return mockOutput<PutItemCommandOutput>({})
       }),
     getItem: (input) =>
       Effect.sync(() => {
-        const item = store.items.get(keyOf(input.Key as never))
-        return (item ? { Item: toAttributeMap(item) } : {}) as never
+        const item = store.items.get(keyOf(input.Key ?? {}))
+        return mockOutput<GetItemCommandOutput>(item ? { Item: toAttributeMap(item) } : {})
       }),
     query: (input) =>
       Effect.sync(() => {
@@ -47,30 +54,23 @@ const makeInMemoryClient = (store: Store) =>
           }
           return it.pk === pkValue?.S
         })
-        return { Items: items.map((it) => toAttributeMap(it)), Count: items.length } as never
+        return mockOutput<QueryCommandOutput>({
+          Items: items.map((it) => toAttributeMap(it)),
+          Count: items.length,
+        })
       }),
-    deleteItem: () => Effect.die("not used"),
-    updateItem: () => Effect.die("not used"),
-    batchGetItem: () => Effect.die("not used"),
-    batchWriteItem: () => Effect.die("not used"),
-    transactGetItems: () => Effect.die("not used"),
     // Apply each Put to the store — exercises the unique-constraint + retain
     // put paths (which route through transactWriteItems).
     transactWriteItems: (input) =>
       Effect.sync(() => {
         for (const op of input.TransactItems ?? []) {
-          const put = (op as { Put?: { Item: never } }).Put
-          if (put?.Item) {
-            const item = fromAttributeMap(put.Item)
-            store.items.set(keyOf(put.Item), item)
+          const item = op.Put?.Item
+          if (item) {
+            store.items.set(keyOf(item), fromAttributeMap(item))
           }
         }
-        return {} as never
+        return mockOutput<TransactWriteItemsCommandOutput>({})
       }),
-    createTable: () => Effect.die("not used"),
-    deleteTable: () => Effect.die("not used"),
-    describeTable: () => Effect.die("not used"),
-    scan: () => Effect.die("not used"),
   })
 
 const AppSchema = DynamoSchema.make({ name: "genid", version: 1 })
@@ -149,7 +149,8 @@ describe("Entity.make({ generatedId }) — make()-time validation (EDD-9008)", (
           pk: { field: "pk", composite: ["id"] },
           sk: { field: "sk", composite: [] },
         },
-        // @ts-expect-error — "missing" is not a model field
+        // `missing` is not a model field — `GeneratedIdConfig.field` is a plain
+        // string, so this is caught at make() time, not by the type system.
         generatedId: { field: "missing" },
       }),
     ).toThrow(/EDD-9008.*does not name a model field/)

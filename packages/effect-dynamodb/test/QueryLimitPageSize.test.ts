@@ -13,21 +13,27 @@
 
 import { describe, expect, it } from "@effect/vitest"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
-import { Effect, Layer, Stream } from "effect"
+import { Effect, Stream } from "effect"
 import { beforeEach, vi } from "vitest"
-import { DynamoClient } from "../src/DynamoClient.js"
 import { createConditionOps } from "../src/internal/Expr.js"
 import { createPathBuilder } from "../src/internal/PathBuilder.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
-const ops = createConditionOps<any>()
-const pb = createPathBuilder<any>()
+/** Attribute shape the filter expressions in this file are written against. */
+interface TestModel {
+  readonly id: string
+  readonly status: string
+}
+
+const ops = createConditionOps<TestModel>()
+const pb = createPathBuilder<TestModel>()
 
 const mockQuery = vi.fn()
 const mockScan = vi.fn()
 
-const TestDynamoClient = Layer.succeed(DynamoClient, {
+const TestDynamoClient = mockDynamoClientLayer({
   query: (input) =>
     Effect.tryPromise({
       try: () => mockQuery(input),
@@ -38,18 +44,7 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
       try: () => mockScan(input),
       catch: (e) => new DynamoError({ operation: "Scan", cause: e }),
     }),
-  putItem: () => Effect.die("not used"),
-  getItem: () => Effect.die("not used"),
-  deleteItem: () => Effect.die("not used"),
-  updateItem: () => Effect.die("not used"),
-  batchGetItem: () => Effect.die("not used"),
-  batchWriteItem: () => Effect.die("not used"),
-  transactGetItems: () => Effect.die("not used"),
-  transactWriteItems: () => Effect.die("not used"),
-  createTable: () => Effect.die("not used"),
-  deleteTable: () => Effect.die("not used"),
-  describeTable: () => Effect.die("not used"),
-} as any)
+})
 
 const PK = "$myapp#v1#user#u-1"
 

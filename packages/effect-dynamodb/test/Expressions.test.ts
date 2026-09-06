@@ -4,7 +4,6 @@ import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Layer, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
-import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import {
   compileExpr,
@@ -17,6 +16,7 @@ import { createPathBuilder, isPath } from "../src/internal/PathBuilder.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -340,7 +340,7 @@ const mockTransactWriteItems = vi.fn()
 const mockBatchWriteItem = vi.fn()
 const mockBatchGetItem = vi.fn()
 
-const TestDynamoClient = Layer.succeed(DynamoClient, {
+const TestDynamoClient = mockDynamoClientLayer({
   putItem: (input) =>
     Effect.tryPromise({
       try: () => mockPutItem(input),
@@ -376,11 +376,6 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
       try: () => mockTransactWriteItems(input),
       catch: (e) => new DynamoError({ operation: "TransactWriteItems", cause: e }),
     }),
-  transactGetItems: (_input) =>
-    Effect.tryPromise({
-      try: () => ({}),
-      catch: (e) => new DynamoError({ operation: "TransactGetItems", cause: e }),
-    }),
   batchWriteItem: (input) =>
     Effect.tryPromise({
       try: () => mockBatchWriteItem(input),
@@ -391,22 +386,7 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
       try: () => mockBatchGetItem(input),
       catch: (e) => new DynamoError({ operation: "BatchGetItem", cause: e }),
     }),
-  createTable: (_input) =>
-    Effect.tryPromise({
-      try: () => ({}),
-      catch: (e) => new DynamoError({ operation: "CreateTable", cause: e }),
-    }),
-  deleteTable: (_input) =>
-    Effect.tryPromise({
-      try: () => ({}),
-      catch: (e) => new DynamoError({ operation: "DeleteTable", cause: e }),
-    }),
-  describeTable: (_input) =>
-    Effect.tryPromise({
-      try: () => ({}),
-      catch: (e) => new DynamoError({ operation: "DescribeTable", cause: e }),
-    }),
-} as any)
+})
 
 const TestLayer = Layer.merge(
   TestDynamoClient,
@@ -439,7 +419,7 @@ describe("Entity.condition", () => {
       yield* conditioned
 
       expect(mockPutItem).toHaveBeenCalledTimes(1)
-      const input = mockPutItem.mock.calls[0][0]
+      const input = mockPutItem.mock.calls[0]?.[0]
       expect(input.ConditionExpression).toBeDefined()
       expect(input.ConditionExpression).toContain("=")
     }).pipe(Effect.provide(TestLayer)),
@@ -464,7 +444,7 @@ describe("Entity.condition", () => {
       yield* conditioned
 
       expect(mockPutItem).toHaveBeenCalledTimes(1)
-      const input = mockPutItem.mock.calls[0][0]
+      const input = mockPutItem.mock.calls[0]?.[0]
       expect(input.ConditionExpression).toBeDefined()
     }).pipe(Effect.provide(TestLayer)),
   )
@@ -495,7 +475,7 @@ describe("Entity.condition", () => {
       yield* op
 
       expect(mockUpdateItem).toHaveBeenCalledTimes(1)
-      const input = mockUpdateItem.mock.calls[0][0]
+      const input = mockUpdateItem.mock.calls[0]?.[0]
       expect(input.ConditionExpression).toBeDefined()
     }).pipe(Effect.provide(TestLayer)),
   )
