@@ -248,9 +248,7 @@ export const buildTransactWriteItems = (
               Put: {
                 TableName: tableName,
                 Item: toAttributeMap(side.item),
-                ...(side.conditionExpression
-                  ? { ConditionExpression: side.conditionExpression }
-                  : {}),
+                ...(side.guard ?? {}),
               },
             },
             {

@@ -449,6 +449,29 @@ export interface Entity<
   readonly _serializeSparseFields: (item: globalThis.Record<string, unknown>) => void
 
   /**
+   * @internal Put a record into the composite key form (`internal/CompositeCodec.ts`)
+   * before it reaches `KeyComposer`.
+   *
+   * Exposed because the multi-item write paths (`internal/TransactableOps.ts`,
+   * `internal/TransactWriteOps.ts`, `Batch.ts`) and the aggregate/geo composers
+   * compose keys OUTSIDE `makeImpl`, and a second implementation of the rule is
+   * a second chance to disagree with `Entity.put`. Every such site must call
+   * this rather than hand `KeyComposer` a raw record — `test/KeyFormInvariant.test.ts`
+   * enforces it across all of them.
+   */
+  readonly _keyForm: (
+    record: globalThis.Record<string, unknown>,
+  ) => globalThis.Record<string, unknown>
+
+  /**
+   * @internal Rename domain field names to their stored DynamoDB attribute
+   * names (`storedAs`), in place. `Entity.put` applies this; the transact/batch
+   * put builder must apply the SAME one or a `storedAs` entity gets a
+   * differently-shaped item depending on which API wrote it.
+   */
+  readonly _renameToDynamo: (item: globalThis.Record<string, unknown>) => void
+
+  /**
    * @internal The extra items a `put` of `item` must write alongside the item
    * itself: one uniqueness sentinel per satisfiable `unique` constraint, plus a
    * v1 version snapshot when `versioned: { retain: true }`.
@@ -475,7 +498,12 @@ export interface Entity<
     readonly fields?: globalThis.Record<string, string> | undefined
     readonly item: globalThis.Record<string, unknown>
     /** Sentinels are only correct under this guard; snapshots take none. */
-    readonly conditionExpression?: string | undefined
+    readonly guard?:
+      | {
+          readonly ConditionExpression: string
+          readonly ExpressionAttributeNames: globalThis.Record<string, string>
+        }
+      | undefined
   }>
 
   /**
@@ -1923,6 +1951,22 @@ const makeImpl = <
     return (config.softDelete as { preserveUnique?: boolean }).preserveUnique === true
   }
 
+  /**
+   * The uniqueness sentinel's guard. `attribute_not_exists` must name the
+   * entity's CONFIGURED partition-key attribute — a literal `pk` is simply
+   * absent from an entity declaring `pk: { field: "PK" }`, so the condition is
+   * vacuously true and the constraint is silently unenforced (#111). Routed
+   * through `ExpressionAttributeNames` because the field name is user-supplied
+   * and may be a reserved word.
+   */
+  const sentinelGuard = (): {
+    readonly ConditionExpression: string
+    readonly ExpressionAttributeNames: globalThis.Record<string, string>
+  } => ({
+    ConditionExpression: "attribute_not_exists(#sentinel_pk)",
+    ExpressionAttributeNames: { "#sentinel_pk": config.indexes.primary.pk.field },
+  })
+
   /** Collect all key field names (pk, sk, gsi*pk, gsi*sk) */
   const gsiKeyFields = (): ReadonlyArray<string> => {
     const fields: Array<string> = []
@@ -2334,14 +2378,24 @@ const makeImpl = <
     readonly constraintName?: string | undefined
     readonly fields?: globalThis.Record<string, string> | undefined
     readonly item: globalThis.Record<string, unknown>
-    readonly conditionExpression?: string | undefined
+    readonly guard?:
+      | {
+          readonly ConditionExpression: string
+          readonly ExpressionAttributeNames: globalThis.Record<string, string>
+        }
+      | undefined
   }> => {
     const out: Array<{
       kind: "sentinel" | "snapshot"
       constraintName?: string | undefined
       fields?: globalThis.Record<string, string> | undefined
       item: globalThis.Record<string, unknown>
-      conditionExpression?: string | undefined
+      guard?:
+        | {
+            readonly ConditionExpression: string
+            readonly ExpressionAttributeNames: globalThis.Record<string, string>
+          }
+        | undefined
     }> = []
 
     const pkField = config.indexes.primary.pk.field
@@ -2377,7 +2431,7 @@ const makeImpl = <
           item: sentinelItem,
           // The guard IS the constraint — without it the sentinel would happily
           // overwrite another row's reservation and enforce nothing.
-          conditionExpression: "attribute_not_exists(pk)",
+          guard: sentinelGuard(),
         })
       }
     }
@@ -2887,7 +2941,7 @@ const makeImpl = <
                   Put: {
                     TableName: tableName,
                     Item: toAttributeMap(sentinelItem),
-                    ConditionExpression: "attribute_not_exists(pk)",
+                    ...sentinelGuard(),
                   },
                 })
               }
@@ -3553,7 +3607,7 @@ const makeImpl = <
                       _entity_pk: primaryKey[config.indexes.primary.pk.field],
                       _entity_sk: primaryKey[config.indexes.primary.sk.field],
                     }),
-                    ConditionExpression: "attribute_not_exists(pk)",
+                    ...sentinelGuard(),
                   },
                 })
               }
@@ -5903,6 +5957,8 @@ const makeImpl = <
     /** @internal Entity schema version baked into composed keys. */
     _entityVersion: entityVersion,
     _serializeSparseFields: serializeSparseFields,
+    _keyForm: keyForm,
+    _renameToDynamo: renameToDynamo,
     _buildPutSideItems: buildPutSideItems,
     _multiItemWriteFeatures: multiItemWriteFeatures(),
     _attachPrototype: attachPrototype,

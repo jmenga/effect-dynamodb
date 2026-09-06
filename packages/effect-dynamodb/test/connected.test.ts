@@ -9275,10 +9275,83 @@ const Metrics = Entity.make({
   },
 })
 
-const KfTable = Table.make({ schema: kfSchema, entities: { Metrics } })
+// #111 additions — the multi-item write paths, the aggregate list path, a
+// renamed field, and a uniqueness sentinel guard.
+class KfReading extends Schema.Class<KfReading>("KfReading")({
+  device: Schema.String,
+  takenAt: DynamoModel.DateEpochMs,
+  value: Schema.Number,
+}) {}
+
+const KfReadings = Entity.make({
+  model: KfReading,
+  entityType: "KfReading",
+  primaryKey: {
+    pk: { field: "pk", composite: ["device"] },
+    sk: { field: "sk", composite: ["takenAt"] },
+  },
+})
+
+class KfRenamed extends Schema.Class<KfRenamed>("KfRenamed")({
+  rid: Schema.String,
+  label: Schema.String,
+}) {}
+
+const KfRenameds = Entity.make({
+  model: DynamoModel.configure(KfRenamed, { label: { field: "lbl" } }),
+  entityType: "KfRenamed",
+  primaryKey: { pk: { field: "pk", composite: ["rid"] }, sk: { field: "sk", composite: [] } },
+})
+
+class KfCustom extends Schema.Class<KfCustom>("KfCustom")({
+  cid: Schema.String,
+  email: Schema.String,
+}) {}
+
+const KfCustomPk = Entity.make({
+  model: KfCustom,
+  entityType: "KfCustomPk",
+  primaryKey: { pk: { field: "pk", composite: ["cid"] }, sk: { field: "sk", composite: [] } },
+  unique: { email: ["email"] },
+})
+
+class KfLedger extends Schema.Class<KfLedger>("KfLedger")({
+  book: Schema.String,
+  // Untransformed numeric: `serializeValue` pads it to 16 on the write side, so
+  // `list`'s old `String(v)` SK prefix looked for `5` where `000...0005` is
+  // stored — the divergence this fixture exists to pin. (A `BigIntFromString`
+  // composite cannot be used here: the aggregate write path stores Type-side
+  // values, so it lands as `{N:"5"}` and assembly's `BigIntFromString` decode
+  // rejects it. That is a separate, pre-existing aggregate storage gap.)
+  seq: Schema.Number,
+  title: Schema.String,
+}) {}
+
+const KfTable = Table.make({
+  schema: kfSchema,
+  entities: { Metrics, KfReadings, KfRenameds, KfCustomPk },
+})
+
+const KfLedgers = Aggregate.make(KfLedger, {
+  table: KfTable,
+  schema: kfSchema,
+  pk: { field: "pk", composite: ["book", "seq"] },
+  // No `collection.index` — assembly runs against the base table (#93), so the
+  // fixture needs only the list GSI, which `Metrics` already provisions.
+  collection: { name: "kfledger" },
+  list: {
+    index: "gsi1",
+    name: "kfledgerlist",
+    pk: { field: "gsi1pk", composite: ["book"] },
+    sk: { field: "gsi1sk", composite: ["seq"] },
+  },
+  root: { entityType: "KfLedgerItem" },
+  edges: {},
+})
+
 const KfLayer = Layer.mergeAll(ClientLayer, KfTable.layer({ name: kfTableName }))
 const provideKf = Effect.provide(KfLayer)
-const kfEntities = { Metrics }
+const kfEntities = { Metrics, KfReadings, KfRenameds, KfCustomPk }
 const kfTables = { KfTable }
 
 describeConnected("composite key form — mixed-width ordering", () => {
@@ -9398,6 +9471,164 @@ describeConnected("composite key form — mixed-width ordering", () => {
       }
     }).pipe(provideKf),
   )
+
+  // -------------------------------------------------------------------------
+  // #111 — the multi-item write paths must spell keys exactly as `Entity.put`.
+  // Each of these composed a DIFFERENT key before the fix, so a row written
+  // through one API was invisible to every accessor of the other.
+  // -------------------------------------------------------------------------
+
+  describe("multi-item write paths spell keys the same way (#111)", () => {
+    it.effect("Batch.get / transactGet / Batch.write(delete) round-trip a DateEpochMs key", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+        const at = DateTime.makeUnsafe(1767225600000)
+
+        yield* db.entities.KfReadings.put({ device: "d1", takenAt: at, value: 1 })
+
+        // Pre-fix both returned [null] — the raw DateTime never reached epoch form.
+        const [viaBatch] = yield* Batch.get([KfReadings.get({ device: "d1", takenAt: at })])
+        expect(viaBatch?.value).toBe(1)
+        const [viaTransact] = yield* Transaction.transactGet([
+          KfReadings.get({ device: "d1", takenAt: at }),
+        ])
+        expect(viaTransact?.value).toBe(1)
+
+        // Pre-fix this reported success while the row remained.
+        yield* Batch.write([KfReadings.delete({ device: "d1", takenAt: at })])
+        const gone = yield* KfReadings.get({ device: "d1", takenAt: at })
+          .asEffect()
+          .pipe(
+            Effect.map(() => "exists"),
+            Effect.catchTag("ItemNotFound", () => Effect.succeed("not found")),
+          )
+        expect(gone).toBe("not found")
+      }).pipe(provideKf),
+    )
+
+    it.effect("Transaction.check evaluates against the row it names", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+        const at = DateTime.makeUnsafe(1767225600001)
+        yield* db.entities.KfReadings.put({ device: "d2", takenAt: at, value: 7 })
+
+        // Pre-fix this COMMITTED: the guard was evaluated against a key that did
+        // not exist, so `attribute_not_exists` was vacuously true.
+        const err = yield* Transaction.transactWrite([
+          Transaction.check(
+            KfReadings.get({ device: "d2", takenAt: at }),
+            Expression.condition({ attributeNotExists: "pk" }),
+          ),
+        ]).pipe(Effect.flip)
+        expect(err._tag).toBe("TransactionCancelled")
+
+        // ...and the positive form commits.
+        yield* Transaction.transactWrite([
+          Transaction.check(
+            KfReadings.get({ device: "d2", takenAt: at }),
+            Expression.condition({ attributeExists: "pk" }),
+          ),
+        ])
+      }).pipe(provideKf),
+    )
+
+    it.effect("a transactWrite([delete, put]) move does not duplicate the row", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+        const from = DateTime.makeUnsafe(1767225600002)
+        const to = DateTime.makeUnsafe(1767225600003)
+        yield* db.entities.KfReadings.put({ device: "d3", takenAt: from, value: 1 })
+
+        yield* Transaction.transactWrite([
+          db.entities.KfReadings.delete({ device: "d3", takenAt: from }),
+          db.entities.KfReadings.put({ device: "d3", takenAt: to, value: 2 }),
+        ])
+
+        // Pre-fix the delete missed its target and the put landed → two rows.
+        const rows = yield* db.entities.KfReadings.primary({ device: "d3" }).collect()
+        expect(rows).toHaveLength(1)
+        expect(rows[0]!.value).toBe(2)
+      }).pipe(provideKf),
+    )
+
+    it.effect("a renamed field is stored identically by put and transactWrite", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+        const client = yield* DynamoClient
+
+        yield* db.entities.KfRenameds.put({ rid: "r1", label: "viaEntity" })
+        yield* Transaction.transactWrite([
+          db.entities.KfRenameds.put({ rid: "r2", label: "viaTransact" }),
+        ])
+
+        const attrsOf = (rid: string) =>
+          client
+            .getItem({
+              TableName: kfTableName,
+              Key: { pk: { S: `$kf#v1#kfrenamed#rid_${rid}` }, sk: { S: "$kf#v1#kfrenamed" } },
+            })
+            .pipe(Effect.map((r) => Object.keys(r.Item ?? {}).sort()))
+
+        // Pre-fix: put wrote `lbl`, transactWrite wrote `label`.
+        const viaEntity = yield* attrsOf("r1")
+        const viaTransact = yield* attrsOf("r2")
+        expect(viaTransact).toEqual(viaEntity)
+        expect(viaTransact).toContain("lbl")
+        expect(viaTransact).not.toContain("label")
+
+        // Both are readable through the decode path.
+        expect((yield* db.entities.KfRenameds.get({ rid: "r2" })).label).toBe("viaTransact")
+      }).pipe(provideKf),
+    )
+
+    it.effect("the uniqueness sentinel guard names the configured pk attribute", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+        yield* db.entities.KfCustomPk.put({ cid: "c1", email: "a@x.io" })
+
+        const err = yield* db.entities.KfCustomPk.put({ cid: "c2", email: "a@x.io" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(err._tag).toBe("UniqueConstraintViolation")
+
+        // ...and through the transact path, which emits the same guarded sentinel.
+        const txErr = yield* Transaction.transactWrite([
+          db.entities.KfCustomPk.put({ cid: "c3", email: "a@x.io" }),
+        ]).pipe(Effect.flip)
+        expect(txErr._tag).toBe("UniqueConstraintViolation")
+      }).pipe(provideKf),
+    )
+
+    it.effect("an aggregate's list() finds the rows its create() wrote", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: kfEntities,
+          aggregates: { KfLedgers },
+          tables: kfTables,
+        })
+
+        for (const n of KF_VALUES) {
+          yield* db.aggregates.KfLedgers.create({ book: "b1", seq: n, title: `t-${n}` } as never)
+        }
+
+        // Pre-fix `list` composed its GSI key from the RAW filter and built the
+        // SK prefix with `String(v)`, while `create` composed through the key
+        // form and padded via `serializeValue`. The query matched nothing and
+        // every aggregate was dropped from the result with no error at all.
+        const listed = yield* db.aggregates.KfLedgers.list({ book: "b1" })
+        const seqs = listed.data
+          .map((l) => (l as unknown as { seq: number }).seq)
+          .sort((a, b) => a - b)
+        expect(seqs).toEqual([...KF_VALUES].sort((a, b) => a - b))
+
+        // A filter that reaches the SK prefix — the `String(v)` path, which
+        // looked for `5` where `0000000000000005` is stored.
+        const one = yield* db.aggregates.KfLedgers.list({ book: "b1", seq: KF_VALUES[0]! })
+        expect(one.data).toHaveLength(1)
+        expect((one.data[0] as unknown as { title: string }).title).toBe(`t-${KF_VALUES[0]}`)
+      }).pipe(provideKf),
+    )
+  })
 })
 
 // NOTE: aggregate coverage for the key-form rule is UNIT-level
@@ -9632,6 +9863,52 @@ describeConnected("key form holds across every composition site (S1)", () => {
       yield* db.entities.S1Retained.purge({ acct: "r2", txn: 100n })
       const left = yield* db.entities.S1Retained.primary({ acct: "r2", txn: 100n }).collect()
       expect(left).toEqual([])
+    }).pipe(provideS1),
+  )
+
+  it.effect("transact and batch puts compose the SAME key as entity put (#111)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: s1Entities, tables: s1Tables })
+      const client = yield* DynamoClient
+
+      const sksOf = (acct: string) =>
+        client
+          .query({
+            TableName: s1TableName,
+            KeyConditionExpression: "#pk = :pk",
+            ExpressionAttributeNames: { "#pk": "pk" },
+            ExpressionAttributeValues: { ":pk": { S: `$s1#v1#s1row#acct_${acct}` } },
+          })
+          .pipe(Effect.map((r) => (r.Items ?? []).map((i) => i.sk?.S)))
+
+      for (const n of S1_VALUES) {
+        yield* db.entities.S1Rows.put({ acct: `kf-e-${n}`, txn: BigInt(n), note: "entity" })
+        yield* Transaction.transactWrite([
+          db.entities.S1Rows.put({ acct: `kf-t-${n}`, txn: BigInt(n), note: "transact" }),
+        ])
+        yield* Batch.write([
+          db.entities.S1Rows.put({ acct: `kf-b-${n}`, txn: BigInt(n), note: "batch" }),
+        ])
+
+        const viaEntity = yield* sksOf(`kf-e-${n}`)
+        const viaTransact = yield* sksOf(`kf-t-${n}`)
+        const viaBatch = yield* sksOf(`kf-b-${n}`)
+
+        // Pre-fix the transact/batch rows carried `txn_5` where the entity row
+        // carried the padded spelling, so each write produced an orphan row no
+        // accessor could read.
+        expect(viaEntity).toHaveLength(1)
+        expect(viaTransact).toEqual(viaEntity)
+        expect(viaBatch).toEqual(viaEntity)
+        expect(viaEntity[0]).toContain(String(n).padStart(38, "0"))
+      }
+
+      // ...and the rows are reachable through the typed accessors.
+      for (const n of S1_VALUES) {
+        expect(
+          (yield* db.entities.S1Rows.byTxn({ txn: BigInt(n) }).collect()).map((r) => r.acct).sort(),
+        ).toEqual(expect.arrayContaining([`kf-b-${n}`, `kf-e-${n}`, `kf-t-${n}`]))
+      }
     }).pipe(provideS1),
   )
 })

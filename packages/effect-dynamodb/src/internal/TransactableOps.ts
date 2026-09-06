@@ -213,9 +213,15 @@ export const composePrimaryKey = (
 ): Record<string, unknown> => {
   const primary = entity.indexes.primary!
   const schema = entity._schema
+  // The caller's key is a DOMAIN record (`{ takenAt: DateTime }`), and every
+  // `KeyComposer` input must first go through the composite key-form rule or it
+  // composes a different string than `Entity.put` wrote — a `DateEpochMs` PK
+  // composite made `Batch.get` return null and `Batch.write(delete)` report
+  // success against a row it never touched (#111).
+  const recordKeyForm = entity._keyForm(key)
   return {
-    [primary.pk.field]: KeyComposer.composePk(schema, entity.entityType, primary, key),
-    [primary.sk.field]: KeyComposer.composeSk(schema, entity.entityType, 1, primary, key),
+    [primary.pk.field]: KeyComposer.composePk(schema, entity.entityType, primary, recordKeyForm),
+    [primary.sk.field]: KeyComposer.composeSk(schema, entity.entityType, 1, primary, recordKeyForm),
   }
 }
 
@@ -270,12 +276,16 @@ export const validateAndBuildPutItem = (
     const item: Record<string, unknown> = { ...(encoded as Record<string, unknown>) }
     item.__edd_e__ = entity.entityType
 
+    // Same normalisation `Entity.put` applies. Without it a `BigIntFromString`
+    // composite composed `txn_420` here and `txn_000…0420` there, so the two
+    // APIs wrote two different rows for the same logical item and neither
+    // accessor could read the transact-written one (#111).
     const keys = KeyComposer.composeAllKeys(
       entity._schema,
       entity.entityType,
       1,
       entity.indexes,
-      encoded as Record<string, unknown>,
+      entity._keyForm(encoded as Record<string, unknown>),
     )
     Object.assign(item, keys)
 
@@ -295,6 +305,14 @@ export const validateAndBuildPutItem = (
       }
     }
     if (sf.version) item[sf.version] = 1
+
+    // Rename domain fields to their stored attribute names, in the same
+    // position `Entity.put` does (after keys + system fields, before sparse
+    // flattening). Omitting it gave a `field:`-renamed entity a differently
+    // shaped item depending on whether `put` or `transactWrite` wrote it — and
+    // `_buildPutSideItems` derives the v1 retain snapshot from this same item,
+    // so the snapshot inherited the wrong shape too (#111).
+    entity._renameToDynamo(item)
 
     // Flatten sparse-map fields into per-entry top-level attributes. Throws
     // on invalid keys; surface as ValidationError at the entity boundary.

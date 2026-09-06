@@ -23,6 +23,11 @@ export interface SearchConfig<A> {
     readonly entityType: string
     readonly indexes: Record<string, KeyComposer.IndexDefinition>
     readonly schemas: { readonly recordSchema: Schema.Codec<any> }
+    /**
+     * The entity's composite key-form normaliser. Search composes GSI keys for
+     * rows written by `Entity.put`, so both sides must use the same one (#111).
+     */
+    readonly _keyForm: (record: Record<string, unknown>) => Record<string, unknown>
   }
   readonly indexDef: KeyComposer.IndexDefinition
   readonly coordinates: (item: A) => Coordinates | undefined
@@ -118,27 +123,41 @@ export const nearby = <A>(
           const lowerCell = H3.cellToCenterChild(firstCell, H3_RESOLUTION_PRECISE)
           const upperCell = H3.cellToUpperBound(lastCell, H3_RESOLUTION_PRECISE)
 
-          // Build PK composites: geo fields + any extra filter composites
-          const pkComposites: Record<string, unknown> = {
+          // Build PK composites: geo fields + any extra filter composites.
+          // `pkFilter` is a DOMAIN record supplied by the caller, and geo rows
+          // are written through `Entity.put` — so it must go through the same
+          // composite key form the write used. Latent while every composite is
+          // a string on both sides, but a `timePartition: Schema.NumberFromString`
+          // (a natural choice, since `computeTimePartition` returns a decimal
+          // string) would compose an unpadded key the write never wrote (#111).
+          const pkCompositesKeyForm: Record<string, unknown> = entity._keyForm({
             ...pkFilter,
             [fields.parentCell.field]: parentCell,
             [fields.timePartition.field]: partition,
-          }
+          })
 
           const pkValue = KeyComposer.composePk(
             entity._schema,
             entity.entityType,
             indexDef,
-            pkComposites,
+            pkCompositesKeyForm,
           )
 
           // Compose full SK values with schema prefix (must match stored SK format)
-          const lower = KeyComposer.composeSk(entity._schema, entity.entityType, 1, indexDef, {
-            [fields.cell.field]: lowerCell,
-          })
-          const upper = KeyComposer.composeSk(entity._schema, entity.entityType, 1, indexDef, {
-            [fields.cell.field]: upperCell,
-          })
+          const lower = KeyComposer.composeSk(
+            entity._schema,
+            entity.entityType,
+            1,
+            indexDef,
+            entity._keyForm({ [fields.cell.field]: lowerCell }),
+          )
+          const upper = KeyComposer.composeSk(
+            entity._schema,
+            entity.entityType,
+            1,
+            indexDef,
+            entity._keyForm({ [fields.cell.field]: upperCell }),
+          )
 
           return { pkValue, lower, upper }
         })

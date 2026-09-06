@@ -960,10 +960,13 @@ const makeAggregate = <TSchema extends Schema.Top>(
           config.schema,
         )
 
-        // 5. Compose collection SK composites for root item
+        // 5. Compose collection SK composites for root item. Through the key
+        // form — `update` already did (see `newDynamo` / `oldDynamo` below), so
+        // leaving `create` raw made the two write paths mirror the collection SK
+        // differently for a transformed composite.
         const collectionSkComposites = KeyComposer.extractComposites(
           config.collection.sk?.composite ?? [],
-          assembled,
+          keyRecord(assembled),
         )
 
         // 6. Build DynamoDB items with composed keys (create only ever PUTs).
@@ -974,6 +977,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           config,
           pkValue,
           collectionSkComposites,
+          keyRecord,
           stampFor(now, EMPTY_CREATED),
         )
 
@@ -1094,6 +1098,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             config.collection.sk?.composite ?? [],
             keyRecord(assembledNew),
           ),
+          keyRecord,
           stampFor(now, readExistingCreated(allItems)),
         )
         const oldDynamo = buildDynamoItems(
@@ -1104,6 +1109,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             config.collection.sk?.composite ?? [],
             keyRecord(assembledOld),
           ),
+          keyRecord,
         )
 
         const skOf = (item: Record<string, AttributeValue>): string =>
@@ -1188,16 +1194,23 @@ const makeAggregate = <TSchema extends Schema.Top>(
           ? (JSON.parse(atob(options.cursor)) as Record<string, AttributeValue>)
           : undefined
 
-        // Compose PK from filter values matching PK composites
+        // Compose PK from filter values matching PK composites. The filter is a
+        // DOMAIN record, so it goes through the same key form the write side
+        // used — otherwise `list` composes a key `create` never wrote and
+        // silently returns nothing (#111).
         const listPkComposites = KeyComposer.extractComposites(
           listConfig.pk.composite,
-          filter ?? {},
+          keyRecord(filter ?? {}),
         )
 
-        // Build SK prefix from contiguous filter values matching SK composites
+        // Build SK prefix from contiguous filter values matching SK composites.
+        // `serializeValue`, NOT `String(v)` — the write side pads numerics, so
+        // `String(5)` would look for `5` where `0000000000000005` is stored.
         const skValues: string[] = []
+        const listSkFilter = keyRecord(filter ?? {})
         for (const attr of listConfig.sk.composite) {
-          if (filter?.[attr] !== undefined) skValues.push(String(filter[attr]))
+          if (listSkFilter[attr] !== undefined)
+            skValues.push(KeyComposer.serializeValue(listSkFilter[attr]))
           else break // Stop at first gap (prefix matching)
         }
 
@@ -2410,6 +2423,13 @@ const buildDynamoItems = (
   config: AggregateConfig<any>,
   pkValue: string,
   rootCollectionSkComposites: ReadonlyArray<string>,
+  /**
+   * The aggregate's composite key-form normaliser. Required, not optional: the
+   * list-GSI keys composed below have to be spelled exactly as `Aggregate.list`
+   * spells them when it reads, and the only way to guarantee that is for both
+   * to go through the same function (#111).
+   */
+  keyRecord: (record: Record<string, unknown>) => Record<string, unknown>,
   stamp?: Stamp | undefined,
 ): ReadonlyArray<{ group: string; items: ReadonlyArray<Record<string, AttributeValue>> }> =>
   groups.map((group) => ({
@@ -2443,7 +2463,7 @@ const buildDynamoItems = (
       if (isRootItem && config.list) {
         const listPkComposites = KeyComposer.extractComposites(
           config.list.pk.composite,
-          item.attributes,
+          keyRecord(item.attributes),
         )
         if (config.list.cardinality) {
           const shard = hashToShard(pkValue, config.list.cardinality)
@@ -2460,7 +2480,7 @@ const buildDynamoItems = (
         }
         const listSkComposites = KeyComposer.extractComposites(
           config.list.sk.composite,
-          item.attributes,
+          keyRecord(item.attributes),
         )
         attrs[config.list.sk.field] = composeCollectionKey(
           config.schema,

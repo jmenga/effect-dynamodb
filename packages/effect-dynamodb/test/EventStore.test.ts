@@ -1266,7 +1266,8 @@ describe("EventStore", () => {
         expect(fromAttributeMap(items[0].Put.Item).__edd_e__).toBe("match.event")
         expect(fromAttributeMap(items[1].Put.Item).__edd_e__).toBe("Registration")
         expect(fromAttributeMap(items[2].Put.Item).__edd_e__).toBe("Registration._unique.code")
-        expect(items[2].Put.ConditionExpression).toBe("attribute_not_exists(pk)")
+        expect(items[2].Put.ConditionExpression).toBe("attribute_not_exists(#sentinel_pk)")
+        expect(items[2].Put.ExpressionAttributeNames).toEqual({ "#sentinel_pk": "pk" })
         expect(fromAttributeMap(items[3].Put.Item).sk).toBe("$cricket#v1#registration#v#0000001")
       }).pipe(Effect.provide(TestLayer)),
     )

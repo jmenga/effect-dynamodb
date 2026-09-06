@@ -899,7 +899,8 @@ describe("Transaction", () => {
         expect(sentinel.__edd_e__).toBe("LifecycleMember._unique.email")
         expect(sentinel._entity_pk).toBe(main.pk)
         // The guard IS the constraint — without it the sentinel enforces nothing.
-        expect(items[1].Put.ConditionExpression).toBe("attribute_not_exists(pk)")
+        expect(items[1].Put.ConditionExpression).toBe("attribute_not_exists(#sentinel_pk)")
+        expect(items[1].Put.ExpressionAttributeNames).toEqual({ "#sentinel_pk": "pk" })
 
         const snapshot = fromAttributeMap(items[2].Put.Item)
         expect(snapshot.sk).toBe("$myapp#v1#lifecyclemember#v#0000001")
