@@ -16,7 +16,21 @@
  *     end to end.
  */
 
-import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import type {
+  AttributeValue,
+  DeleteItemCommandOutput,
+  GetItemCommandOutput,
+  PutItemCommandInput,
+  PutItemCommandOutput,
+  QueryCommandOutput,
+  ScanCommandOutput,
+  SearchVectorsCommandInput,
+  SearchVectorsCommandOutput,
+  TransactWriteItemsCommandInput,
+  TransactWriteItemsCommandOutput,
+  UpdateItemCommandInput,
+  UpdateItemCommandOutput,
+} from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
@@ -26,6 +40,7 @@ import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
 import * as VectorSearchEmulation from "../src/VectorSearchEmulation.js"
+import { mockDynamoClient, mockDynamoClientLayer, mockOutput } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -91,10 +106,10 @@ const PARTITION_ATTR = "__edd_vp_vec1__"
 // ---------------------------------------------------------------------------
 
 interface Capture {
-  putItem?: Record<string, unknown>
-  updateItem?: Record<string, unknown>
-  transactWriteItems?: Record<string, unknown>
-  searchVectors?: Record<string, unknown>
+  putItem?: PutItemCommandInput
+  updateItem?: UpdateItemCommandInput
+  transactWriteItems?: TransactWriteItemsCommandInput
+  searchVectors?: SearchVectorsCommandInput
   scanItems?: Array<Record<string, AttributeValue>>
 }
 
@@ -113,50 +128,28 @@ const currentItem: Record<string, AttributeValue> = {
 }
 
 const makeMockClient = (capture: Capture): DynamoClientService =>
-  ({
-    putItem: (input: Record<string, unknown>) => {
+  mockDynamoClient({
+    putItem: (input) => {
       capture.putItem = input
-      return Effect.succeed({})
+      return Effect.succeed(mockOutput<PutItemCommandOutput>({}))
     },
-    updateItem: (input: Record<string, unknown>) => {
+    updateItem: (input) => {
       capture.updateItem = input
-      return Effect.succeed({ Attributes: currentItem })
+      return Effect.succeed(mockOutput<UpdateItemCommandOutput>({ Attributes: currentItem }))
     },
-    transactWriteItems: (input: Record<string, unknown>) => {
+    transactWriteItems: (input) => {
       capture.transactWriteItems = input
-      return Effect.succeed({})
+      return Effect.succeed(mockOutput<TransactWriteItemsCommandOutput>({}))
     },
-    getItem: () => Effect.succeed({ Item: currentItem }),
-    deleteItem: () => Effect.succeed({}),
-    query: () => Effect.succeed({ Items: [] }),
-    scan: () => Effect.succeed({ Items: capture.scanItems ?? [] }),
-    searchVectors: (input: Record<string, unknown>) => {
+    getItem: () => Effect.succeed(mockOutput<GetItemCommandOutput>({ Item: currentItem })),
+    deleteItem: () => Effect.succeed(mockOutput<DeleteItemCommandOutput>({})),
+    query: () => Effect.succeed(mockOutput<QueryCommandOutput>({ Items: [] })),
+    scan: () => Effect.succeed(mockOutput<ScanCommandOutput>({ Items: capture.scanItems ?? [] })),
+    searchVectors: (input) => {
       capture.searchVectors = input
-      return Effect.succeed({ SearchResults: [] })
+      return Effect.succeed(mockOutput<SearchVectorsCommandOutput>({ SearchResults: [] }))
     },
-    batchGetItem: () => Effect.die("batchGetItem not used"),
-    batchWriteItem: () => Effect.die("batchWriteItem not used"),
-    transactGetItems: () => Effect.die("transactGetItems not used"),
-    createTable: () => Effect.die("createTable not used"),
-    deleteTable: () => Effect.die("deleteTable not used"),
-    describeTable: () => Effect.die("describeTable not used"),
-    updateTable: () => Effect.die("updateTable not used"),
-    listTables: () => Effect.die("listTables not used"),
-    createBackup: () => Effect.die("createBackup not used"),
-    deleteBackup: () => Effect.die("deleteBackup not used"),
-    listBackups: () => Effect.die("listBackups not used"),
-    restoreTableFromBackup: () => Effect.die("restoreTableFromBackup not used"),
-    describeContinuousBackups: () => Effect.die("describeContinuousBackups not used"),
-    updateContinuousBackups: () => Effect.die("updateContinuousBackups not used"),
-    restoreTableToPointInTime: () => Effect.die("restoreTableToPointInTime not used"),
-    exportTableToPointInTime: () => Effect.die("exportTableToPointInTime not used"),
-    describeExport: () => Effect.die("describeExport not used"),
-    updateTimeToLive: () => Effect.die("updateTimeToLive not used"),
-    describeTimeToLive: () => Effect.die("describeTimeToLive not used"),
-    tagResource: () => Effect.die("tagResource not used"),
-    untagResource: () => Effect.die("untagResource not used"),
-    listTagsOfResource: () => Effect.die("listTagsOfResource not used"),
-  }) as unknown as DynamoClientService
+  })
 
 const makeLayer = (capture: Capture) =>
   Layer.mergeAll(
@@ -1387,7 +1380,7 @@ const lifecycleStoredItem: Record<string, AttributeValue> = {
 
 const makeLifecycleLayer = (capture: Capture, item = lifecycleStoredItem) =>
   Layer.mergeAll(
-    Layer.succeed(DynamoClient, {
+    mockDynamoClientLayer({
       ...makeMockClient(capture),
       getItem: () => Effect.succeed({ Item: item }),
       query: () => Effect.succeed({ Items: [item] }),
@@ -1473,7 +1466,7 @@ describe("vector search lifecycle integration", () => {
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
-          Layer.succeed(DynamoClient, {
+          mockDynamoClientLayer({
             ...makeMockClient(capture),
             getItem: () => Effect.succeed({ Item: undefined }),
             query: () => Effect.succeed({ Items: [tombstone] }),

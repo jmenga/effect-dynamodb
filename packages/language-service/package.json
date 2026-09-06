@@ -1,6 +1,6 @@
 {
   "name": "@effect-dynamodb/language-service",
-  "version": "1.18.0",
+  "version": "1.18.1",
   "description": "TypeScript Language Service Plugin for effect-dynamodb — shows DynamoDB operations on hover",
   "license": "MIT",
   "author": "Justin Menga",
@@ -34,7 +34,7 @@
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json"
   },
   "peerDependencies": {
     "typescript": ">=5.7.0"

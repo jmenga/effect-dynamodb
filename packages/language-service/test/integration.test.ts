@@ -2,8 +2,8 @@ import ts from "typescript"
 import { describe, expect, it } from "vitest"
 import { resolveEntities } from "../src/core/EntityResolver"
 import { detectOperation } from "../src/core/OperationDetector"
-import { buildParams } from "../src/core/ParamsBuilder"
 import { formatTooltip } from "../src/formatters/tooltip"
+import { buildParamsOrThrow } from "./helpers/params"
 
 function parseSource(source: string): ts.SourceFile {
   return ts.createSourceFile("test.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
@@ -65,7 +65,7 @@ describe("Integration: Entity definition → hover tooltip", () => {
     expect(op).toBeDefined()
     expect(op!.type).toBe("get")
 
-    const params = buildParams(op!)
+    const params = buildParamsOrThrow(op!)
 
     expect(params.command).toBe("GetItemCommand")
     expect(params.Key!.pk).toBe("$crud-demo#v1#user#u-alice")
@@ -89,7 +89,7 @@ describe("Integration: Entity definition → hover tooltip", () => {
     expect(op!.type).toBe("query")
     expect(op!.indexName).toBe("byRole")
 
-    const params = buildParams(op!)
+    const params = buildParamsOrThrow(op!)
 
     expect(params.command).toBe("QueryCommand")
     expect(params.IndexName).toBe("gsi1")
@@ -116,7 +116,7 @@ describe("Integration: Entity definition → hover tooltip", () => {
     expect(op).toBeDefined()
     expect(op!.type).toBe("update")
 
-    const params = buildParams(op!)
+    const params = buildParamsOrThrow(op!)
 
     expect(params.command).toBe("UpdateItemCommand")
     expect(params.Key!.pk).toBe("$crud-demo#v1#user#u-alice")
@@ -134,7 +134,7 @@ describe("Integration: Entity definition → hover tooltip", () => {
     expect(op).toBeDefined()
     expect(op!.type).toBe("scan")
 
-    const params = buildParams(op!)
+    const params = buildParamsOrThrow(op!)
 
     expect(params.command).toBe("ScanCommand")
     expect(params.FilterExpression).toContain(":et0")
@@ -152,7 +152,7 @@ describe("Integration: Entity definition → hover tooltip", () => {
     expect(op).toBeDefined()
     expect(op!.type).toBe("delete")
 
-    const params = buildParams(op!)
+    const params = buildParamsOrThrow(op!)
 
     expect(params.command).toBe("TransactWriteItemsCommand")
     expect(params.Key!.pk).toBe("$crud-demo#v1#task#t-1")
@@ -171,7 +171,7 @@ describe("Integration: Entity definition → hover tooltip", () => {
     expect(op).toBeDefined()
     expect(op!.type).toBe("put")
 
-    const params = buildParams(op!)
+    const params = buildParamsOrThrow(op!)
     expect(params.command).toBe("PutItemCommand")
     expect(params.Item).toBeDefined()
     expect(params.Item!.__edd_e__).toBe("User")
@@ -218,7 +218,7 @@ describe("Integration: Entity definition → hover tooltip", () => {
     expect(op).toBeDefined()
     expect(op!.type).toBe("query")
 
-    const params = buildParams(op!)
+    const params = buildParamsOrThrow(op!)
 
     expect(params.ExpressionAttributeValues![":pk"]).toBe("$shop#v1#customerorders#c-123")
   })

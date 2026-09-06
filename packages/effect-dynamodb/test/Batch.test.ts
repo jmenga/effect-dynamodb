@@ -9,6 +9,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // --- Test Models ---
 
@@ -101,12 +102,7 @@ const MainTable = Table.make({
 const mockBatchGetItem = vi.fn()
 const mockBatchWriteItem = vi.fn()
 
-const TestDynamoClient = Layer.succeed(DynamoClient, {
-  putItem: () => Effect.die("not used"),
-  getItem: () => Effect.die("not used"),
-  deleteItem: () => Effect.die("not used"),
-  updateItem: () => Effect.die("not used"),
-  query: () => Effect.die("not used"),
+const TestDynamoClient = mockDynamoClientLayer({
   batchGetItem: (input) =>
     Effect.tryPromise({
       try: () => mockBatchGetItem(input),
@@ -117,12 +113,6 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
       try: () => mockBatchWriteItem(input),
       catch: (e) => new DynamoError({ operation: "BatchWriteItem", cause: e }),
     }),
-  transactGetItems: () => Effect.die("not used"),
-  transactWriteItems: () => Effect.die("not used"),
-  createTable: () => Effect.die("not used"),
-  deleteTable: () => Effect.die("not used"),
-  describeTable: () => Effect.die("not used"),
-  scan: () => Effect.die("not used"),
 })
 
 const TestTableConfig = MainTable.layer({ name: "test-table" })

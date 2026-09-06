@@ -5,11 +5,11 @@ import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, Layer, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 import * as Collection from "../src/Collection.js"
-import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -74,24 +74,12 @@ const MainTable = Table.make({
 
 const mockQuery = vi.fn()
 
-const TestDynamoClient = Layer.succeed(DynamoClient, {
+const TestDynamoClient = mockDynamoClientLayer({
   query: (input) =>
     Effect.tryPromise({
       try: () => mockQuery(input),
       catch: (e) => new DynamoError({ operation: "Query", cause: e }),
     }),
-  putItem: () => Effect.die("not used"),
-  getItem: () => Effect.die("not used"),
-  deleteItem: () => Effect.die("not used"),
-  updateItem: () => Effect.die("not used"),
-  batchGetItem: () => Effect.die("not used"),
-  batchWriteItem: () => Effect.die("not used"),
-  transactGetItems: () => Effect.die("not used"),
-  transactWriteItems: () => Effect.die("not used"),
-  createTable: () => Effect.die("not used"),
-  deleteTable: () => Effect.die("not used"),
-  describeTable: () => Effect.die("not used"),
-  scan: () => Effect.die("not used"),
 })
 
 const TestTableConfig = MainTable.layer({ name: "test-table" })

@@ -1,6 +1,6 @@
 {
   "name": "@effect-dynamodb/geo",
-  "version": "1.18.0",
+  "version": "1.18.1",
   "description": "Geospatial index and search for effect-dynamodb using H3 hexagonal grid",
   "type": "module",
   "license": "MIT",
@@ -47,7 +47,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:connected": "vitest run --config vitest.connected.ts",
-    "check": "tsc --noEmit && tsc --noEmit -p tsconfig.examples.json",
+    "check": "tsc --noEmit && tsc --noEmit -p tsconfig.examples.json && tsc --noEmit -p tsconfig.test.json",
     "lint": "biome check .",
     "lint:fix": "biome check --write ."
   },

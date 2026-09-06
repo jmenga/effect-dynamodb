@@ -59,7 +59,7 @@ describe("OperationDetector", () => {
     const op = detectOperation(ts, sf, 6, entities)
 
     expect(op).toBeDefined()
-    expect(op!.entity.variableName).toBe("Users")
+    expect(op!.entity!.variableName).toBe("Users")
     expect(op!.type).toBe("get")
     expect(op!.arguments).toEqual({ userId: "u-alice" })
   })
@@ -120,7 +120,7 @@ describe("OperationDetector", () => {
     const op = detectOperation(ts, sf, 13, entities)
 
     expect(op).toBeDefined()
-    expect(op!.entity.variableName).toBe("Tasks")
+    expect(op!.entity!.variableName).toBe("Tasks")
     expect(op!.type).toBe("query")
     expect(op!.indexName).toBe("byUser")
   })
@@ -166,7 +166,7 @@ describe("OperationDetector", () => {
     const op = detectOperation(ts, sf, 9, entities)
 
     expect(op).toBeDefined()
-    expect(op!.entity.variableName).toBe("Users")
+    expect(op!.entity!.variableName).toBe("Users")
     expect(op!.type).toBe("get")
     expect(op!.arguments).toEqual({ userId: "u-alice" })
   })
@@ -177,7 +177,7 @@ describe("OperationDetector", () => {
     const op = detectOperation(ts, sf, 9, entities)
 
     expect(op).toBeDefined()
-    expect(op!.entity.variableName).toBe("Tasks")
+    expect(op!.entity!.variableName).toBe("Tasks")
     expect(op!.type).toBe("put")
   })
 

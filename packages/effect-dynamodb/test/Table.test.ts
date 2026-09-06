@@ -57,6 +57,8 @@ describe("Table", () => {
   describe("definition", () => {
     it("derives KeySchema and AttributeDefinitions from entities", () => {
       const entity = {
+        _tag: "Entity" as const,
+        _configure: () => {},
         indexes: {
           primary: {
             pk: { field: "pk", composite: ["userId"] },
@@ -79,6 +81,8 @@ describe("Table", () => {
 
     it("collects GSIs from non-primary indexes", () => {
       const entity = {
+        _tag: "Entity" as const,
+        _configure: () => {},
         indexes: {
           primary: {
             pk: { field: "pk", composite: ["userId"] },
@@ -108,6 +112,8 @@ describe("Table", () => {
 
     it("merges indexes from multiple entities", () => {
       const userEntity = {
+        _tag: "Entity" as const,
+        _configure: () => {},
         indexes: {
           primary: {
             pk: { field: "pk", composite: ["userId"] },
@@ -121,6 +127,8 @@ describe("Table", () => {
         },
       }
       const orderEntity = {
+        _tag: "Entity" as const,
+        _configure: () => {},
         indexes: {
           primary: {
             pk: { field: "pk", composite: ["orderId"] },
@@ -153,6 +161,8 @@ describe("Table", () => {
 
     it("includes aggregate collection as LSI when its PK matches the table primary PK", () => {
       const entity = {
+        _tag: "Entity" as const,
+        _configure: () => {},
         indexes: {
           primary: {
             pk: { field: "pk", composite: ["id"] },
@@ -200,6 +210,8 @@ describe("Table", () => {
       // Preserves legacy behaviour for aggregates whose collection uses a
       // distinct PK attribute — those cannot be LSIs per DynamoDB rules.
       const entity = {
+        _tag: "Entity" as const,
+        _configure: () => {},
         indexes: {
           primary: {
             pk: { field: "pk", composite: ["id"] },
@@ -237,6 +249,8 @@ describe("Table", () => {
 
     it("emits collection as LSI and list index as GSI simultaneously", () => {
       const entity = {
+        _tag: "Entity" as const,
+        _configure: () => {},
         indexes: {
           primary: {
             pk: { field: "pk", composite: ["id"] },
@@ -278,6 +292,8 @@ describe("Table", () => {
 
     it("emits list GSI when no entity defines it", () => {
       const entity = {
+        _tag: "Entity" as const,
+        _configure: () => {},
         indexes: {
           primary: {
             pk: { field: "pk", composite: ["id"] },
@@ -315,6 +331,8 @@ describe("Table", () => {
       // for `db.tables.*.create()` and assert the output is shaped like what
       // DynamoDB CreateTable would accept.
       const rootEntity = {
+        _tag: "Entity" as const,
+        _configure: () => {},
         entityType: "MatchItem",
         indexes: {
           primary: {

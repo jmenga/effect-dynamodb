@@ -1,12 +1,17 @@
 import { describe, expect, it } from "@effect/vitest"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
-import { Effect, Layer, Stream } from "effect"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
+import { Effect, Stream } from "effect"
 import { beforeEach, vi } from "vitest"
-import { DynamoClient } from "../src/DynamoClient.js"
-import { type BoundQueryConfig, BoundQueryImpl } from "../src/internal/BoundQuery.js"
+import {
+  type BoundQueryConfig,
+  BoundQueryImpl,
+  type RawSortKeyCondition,
+} from "../src/internal/BoundQuery.js"
 import { createConditionOps } from "../src/internal/Expr.js"
 import { createPathBuilder } from "../src/internal/PathBuilder.js"
 import * as Query from "../src/Query.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Test model type
@@ -21,7 +26,7 @@ type TestModel = { id: string; name: string; status: string; count: number }
 const mockQuery = vi.fn()
 const mockScan = vi.fn()
 
-const TestDynamoClient = Layer.succeed(DynamoClient, {
+const TestDynamoClient = mockDynamoClientLayer({
   query: (input) =>
     Effect.tryPromise({
       try: () => mockQuery(input),
@@ -32,24 +37,15 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
       try: () => mockScan(input),
       catch: (e) => new DynamoError({ operation: "Scan", cause: e }),
     }),
-  putItem: () => Effect.die("not used"),
-  getItem: () => Effect.die("not used"),
-  deleteItem: () => Effect.die("not used"),
-  updateItem: () => Effect.die("not used"),
-  batchGetItem: () => Effect.die("not used"),
-  batchWriteItem: () => Effect.die("not used"),
-  transactGetItems: () => Effect.die("not used"),
-  transactWriteItems: () => Effect.die("not used"),
-  createTable: () => Effect.die("not used"),
-  deleteTable: () => Effect.die("not used"),
-  describeTable: () => Effect.die("not used"),
 })
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const pathBuilder = createPathBuilder<TestModel>()
+// `never` for the phantom Keys marker — the shape `BoundQueryConfig` declares,
+// so any concrete path produced by a callback is assignable at the call site.
+const pathBuilder = createPathBuilder<TestModel, never>()
 const conditionOps = createConditionOps<TestModel>()
 
 const makeTestQuery = () =>
@@ -75,6 +71,23 @@ const makeConfig = (): BoundQueryConfig<TestModel> => ({
   provide: <X, E>(eff: Effect.Effect<X, E, any>) =>
     Effect.provide(eff, TestDynamoClient) as Effect.Effect<X, E, never>,
 })
+
+/**
+ * Serialise a raw `.where()` condition's operands the way the production
+ * default path does, so a `composeSkCondition` stub can pass one straight
+ * through. `RawSortKeyCondition` carries `unknown` operands;
+ * `Query.SortKeyCondition` carries strings.
+ */
+const serializeRaw = (c: RawSortKeyCondition): Query.SortKeyCondition => {
+  const s = (value: unknown): string => KeyComposer.serializeValue(value)
+  if ("eq" in c) return { eq: s(c.eq) }
+  if ("lt" in c) return { lt: s(c.lt) }
+  if ("lte" in c) return { lte: s(c.lte) }
+  if ("gt" in c) return { gt: s(c.gt) }
+  if ("gte" in c) return { gte: s(c.gte) }
+  if ("between" in c) return { between: [s(c.between[0]), s(c.between[1])] }
+  return { beginsWith: s(c.beginsWith) }
+}
 
 /** SK remaining type for tests — represents available SK composites */
 type TestSkRemaining = { readonly sk: string }
@@ -335,7 +348,7 @@ describe("BoundQuery", () => {
           if ("beginsWith" in cond) {
             return { beginsWith: `composed#${cond.beginsWith}` }
           }
-          return cond
+          return serializeRaw(cond)
         },
       }
       const bq = new BoundQueryImpl<TestModel, TestSkRemaining, TestModel>(makeTestQuery(), config)
@@ -355,7 +368,7 @@ describe("BoundQuery", () => {
         skFields: ["status", "sk"],
         composeSkCondition: (cond, field) => {
           seen.push(field)
-          return cond
+          return serializeRaw(cond)
         },
       }
       const bq = new BoundQueryImpl<TestModel, { status: string; sk: string }, TestModel>(

@@ -10,10 +10,10 @@ import {
 import { Effect, Layer, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
-import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Fixtures: Domain models
@@ -127,24 +127,12 @@ const MainTable = Table.make({
 
 const mockQuery = vi.fn()
 
-const TestDynamoClient = Layer.succeed(DynamoClient, {
+const TestDynamoClient = mockDynamoClientLayer({
   query: (input) =>
     Effect.tryPromise({
       try: () => mockQuery(input),
       catch: (e) => new DynamoError({ operation: "Query", cause: e }),
     }),
-  putItem: () => Effect.die("not used"),
-  getItem: () => Effect.die("not used"),
-  deleteItem: () => Effect.die("not used"),
-  updateItem: () => Effect.die("not used"),
-  batchGetItem: () => Effect.die("not used"),
-  batchWriteItem: () => Effect.die("not used"),
-  transactGetItems: () => Effect.die("not used"),
-  transactWriteItems: () => Effect.die("not used"),
-  createTable: () => Effect.die("not used"),
-  deleteTable: () => Effect.die("not used"),
-  describeTable: () => Effect.die("not used"),
-  scan: () => Effect.die("not used"),
 })
 
 const TestTableConfig = MainTable.layer({ name: "test-table" })
@@ -1111,7 +1099,7 @@ describe("Aggregate write path", () => {
   const mockGetItem = vi.fn()
   const mockBatchGetItem = vi.fn()
 
-  const WriteDynamoClient = Layer.succeed(DynamoClient, {
+  const WriteDynamoClient = mockDynamoClientLayer({
     query: (input) =>
       Effect.tryPromise({
         try: () => mockWriteQuery(input),
@@ -1132,19 +1120,11 @@ describe("Aggregate write path", () => {
         try: () => mockBatchWrite(input),
         catch: (e) => new DynamoError({ operation: "BatchWriteItem", cause: e }),
       }),
-    putItem: () => Effect.die("not used"),
-    deleteItem: () => Effect.die("not used"),
-    updateItem: () => Effect.die("not used"),
     batchGetItem: (input) =>
       Effect.tryPromise({
         try: () => mockBatchGetItem(input),
         catch: (e) => new DynamoError({ operation: "BatchGetItem", cause: e }),
       }),
-    transactGetItems: () => Effect.die("not used"),
-    createTable: () => Effect.die("not used"),
-    deleteTable: () => Effect.die("not used"),
-    describeTable: () => Effect.die("not used"),
-    scan: () => Effect.die("not used"),
   })
 
   const WriteTableConfig = MainTable.layer({ name: "test-table" })
@@ -2988,24 +2968,13 @@ describe("Aggregate write path", () => {
   describe("list", () => {
     const mockListQuery = vi.fn()
 
-    const ListDynamoClient = Layer.succeed(DynamoClient, {
+    const ListDynamoClient = mockDynamoClientLayer({
       scan: () => Effect.die("scan should not be called"),
       query: (input) =>
         Effect.tryPromise({
           try: () => mockListQuery(input),
           catch: (e) => new DynamoError({ operation: "Query", cause: e }),
         }),
-      putItem: () => Effect.die("not used"),
-      getItem: () => Effect.die("not used"),
-      deleteItem: () => Effect.die("not used"),
-      updateItem: () => Effect.die("not used"),
-      batchGetItem: () => Effect.die("not used"),
-      batchWriteItem: () => Effect.die("not used"),
-      transactGetItems: () => Effect.die("not used"),
-      transactWriteItems: () => Effect.die("not used"),
-      createTable: () => Effect.die("not used"),
-      deleteTable: () => Effect.die("not used"),
-      describeTable: () => Effect.die("not used"),
     })
 
     const ListLayer = Layer.merge(ListDynamoClient, MainTable.layer({ name: "test-table" }))

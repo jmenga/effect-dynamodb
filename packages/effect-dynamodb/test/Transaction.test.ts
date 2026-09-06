@@ -15,6 +15,7 @@ import * as Expression from "../src/Expression.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // --- Test Models ---
 
@@ -164,14 +165,7 @@ const MainTable = Table.make({
 const mockTransactGetItems = vi.fn()
 const mockTransactWriteItems = vi.fn()
 
-const TestDynamoClient = Layer.succeed(DynamoClient, {
-  putItem: () => Effect.die("not used"),
-  getItem: () => Effect.die("not used"),
-  deleteItem: () => Effect.die("not used"),
-  updateItem: () => Effect.die("not used"),
-  query: () => Effect.die("not used"),
-  batchGetItem: () => Effect.die("not used"),
-  batchWriteItem: () => Effect.die("not used"),
+const TestDynamoClient = mockDynamoClientLayer({
   transactGetItems: (input) =>
     Effect.tryPromise({
       try: () => mockTransactGetItems(input),
@@ -182,10 +176,6 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
       try: () => mockTransactWriteItems(input),
       catch: (e) => new DynamoError({ operation: "TransactWriteItems", cause: e }),
     }),
-  createTable: () => Effect.die("not used"),
-  deleteTable: () => Effect.die("not used"),
-  describeTable: () => Effect.die("not used"),
-  scan: () => Effect.die("not used"),
 })
 
 const TestTableConfig = MainTable.layer({ name: "test-table" })

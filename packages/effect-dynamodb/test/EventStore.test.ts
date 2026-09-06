@@ -34,6 +34,7 @@ import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Test setup — Schema, Table, Event classes
@@ -263,7 +264,7 @@ const mockTransactWriteItems = vi.fn()
 const mockPutItem = vi.fn()
 const mockGetItem = vi.fn()
 
-const TestDynamoClient = Layer.succeed(DynamoClient, {
+const TestDynamoClient = mockDynamoClientLayer({
   query: (input) =>
     Effect.tryPromise({
       try: () => mockQuery(input),
@@ -284,15 +285,6 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
       try: () => mockGetItem(input),
       catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
     }),
-  deleteItem: () => Effect.die("not used"),
-  updateItem: () => Effect.die("not used"),
-  scan: () => Effect.die("not used"),
-  batchGetItem: () => Effect.die("not used"),
-  batchWriteItem: () => Effect.die("not used"),
-  transactGetItems: () => Effect.die("not used"),
-  createTable: () => Effect.die("not used"),
-  deleteTable: () => Effect.die("not used"),
-  describeTable: () => Effect.die("not used"),
 })
 
 const TestTableConfig = EventsTable.layer({ name: "events-table" })

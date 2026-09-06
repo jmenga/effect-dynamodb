@@ -23,6 +23,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import type { SkConditionOps } from "../src/internal/BoundQuery.js"
 import * as Table from "../src/Table.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // Create a mock DynamoClient layer for testing
 const mockPutItem = vi.fn()
@@ -31,7 +32,7 @@ const mockDeleteItem = vi.fn()
 const mockUpdateItem = vi.fn()
 const mockQuery = vi.fn()
 
-const TestDynamoClient = Layer.succeed(DynamoClient, {
+const TestDynamoClient = mockDynamoClientLayer({
   putItem: (input) =>
     Effect.tryPromise({
       try: () => mockPutItem(input),
@@ -57,14 +58,6 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
       try: () => mockQuery(input),
       catch: (e) => new DynamoError({ operation: "Query", cause: e }),
     }),
-  batchGetItem: () => Effect.die("not used"),
-  batchWriteItem: () => Effect.die("not used"),
-  transactGetItems: () => Effect.die("not used"),
-  transactWriteItems: () => Effect.die("not used"),
-  createTable: () => Effect.die("not used"),
-  deleteTable: () => Effect.die("not used"),
-  describeTable: () => Effect.die("not used"),
-  scan: () => Effect.die("not used"),
 })
 
 beforeEach(() => {
@@ -273,24 +266,12 @@ describe("DynamoClient", () => {
 
     const mockClassifiedPutItem = vi.fn()
 
-    const ClassifiedDynamoClient = Layer.succeed(DynamoClient, {
+    const ClassifiedDynamoClient = mockDynamoClientLayer({
       putItem: (input) =>
         Effect.tryPromise({
           try: () => mockClassifiedPutItem(input),
           catch: classifyError("PutItem"),
         }),
-      getItem: () => Effect.die("not used"),
-      deleteItem: () => Effect.die("not used"),
-      updateItem: () => Effect.die("not used"),
-      query: () => Effect.die("not used"),
-      batchGetItem: () => Effect.die("not used"),
-      batchWriteItem: () => Effect.die("not used"),
-      transactGetItems: () => Effect.die("not used"),
-      transactWriteItems: () => Effect.die("not used"),
-      createTable: () => Effect.die("not used"),
-      deleteTable: () => Effect.die("not used"),
-      describeTable: () => Effect.die("not used"),
-      scan: () => Effect.die("not used"),
     })
 
     it.effect("ThrottlingException produces ThrottlingError", () =>
@@ -421,24 +402,12 @@ describe("DynamoClient", () => {
      * during `db.tables.*.create()`).
      */
     const makeCapturingClient = (captured: Array<unknown>) =>
-      Layer.succeed(DynamoClient, {
-        putItem: () => Effect.die("not used"),
-        getItem: () => Effect.die("not used"),
-        deleteItem: () => Effect.die("not used"),
-        updateItem: () => Effect.die("not used"),
-        query: () => Effect.die("not used"),
-        batchGetItem: () => Effect.die("not used"),
-        batchWriteItem: () => Effect.die("not used"),
-        transactGetItems: () => Effect.die("not used"),
-        transactWriteItems: () => Effect.die("not used"),
+      mockDynamoClientLayer({
         createTable: (input) =>
           Effect.sync(() => {
             captured.push(input)
             return {} as never
           }),
-        deleteTable: () => Effect.die("not used"),
-        describeTable: () => Effect.die("not used"),
-        scan: () => Effect.die("not used"),
       })
 
     it.effect("merges config.aggregates into user-supplied table so LSIs are provisioned", () => {
@@ -619,24 +588,12 @@ describe("DynamoClient", () => {
 
     /** Build a client layer that captures `query` inputs into the provided array. */
     const makeQueryCapturingClient = (captured: Array<unknown>) =>
-      Layer.succeed(DynamoClient, {
-        putItem: () => Effect.die("not used"),
-        getItem: () => Effect.die("not used"),
-        deleteItem: () => Effect.die("not used"),
-        updateItem: () => Effect.die("not used"),
+      mockDynamoClientLayer({
         query: (input) =>
           Effect.sync(() => {
             captured.push(input)
             return { Items: [], Count: 0 } as never
           }),
-        batchGetItem: () => Effect.die("not used"),
-        batchWriteItem: () => Effect.die("not used"),
-        transactGetItems: () => Effect.die("not used"),
-        transactWriteItems: () => Effect.die("not used"),
-        createTable: () => Effect.die("not used"),
-        deleteTable: () => Effect.die("not used"),
-        describeTable: () => Effect.die("not used"),
-        scan: () => Effect.die("not used"),
       })
 
     it.effect("PK-only query on primary targets the base table (no IndexName)", () => {
@@ -800,24 +757,12 @@ describe("DynamoClient", () => {
 
     /** Build a client layer that captures `query` inputs into the provided array. */
     const makeQueryCapturingClient = (captured: Array<unknown>) =>
-      Layer.succeed(DynamoClient, {
-        putItem: () => Effect.die("not used"),
-        getItem: () => Effect.die("not used"),
-        deleteItem: () => Effect.die("not used"),
-        updateItem: () => Effect.die("not used"),
+      mockDynamoClientLayer({
         query: (input) =>
           Effect.sync(() => {
             captured.push(input)
             return { Items: [], Count: 0 } as never
           }),
-        batchGetItem: () => Effect.die("not used"),
-        batchWriteItem: () => Effect.die("not used"),
-        transactGetItems: () => Effect.die("not used"),
-        transactWriteItems: () => Effect.die("not used"),
-        createTable: () => Effect.die("not used"),
-        deleteTable: () => Effect.die("not used"),
-        describeTable: () => Effect.die("not used"),
-        scan: () => Effect.die("not used"),
       })
 
     // Single SK composite — the shape from issue #101.
@@ -892,25 +837,18 @@ describe("DynamoClient", () => {
       entities: { Balls, Readings, Lookups },
     })
 
+    const makeWhereDb = () =>
+      DynamoClient.make({ entities: { Balls, Readings, Lookups }, tables: { WhereTable } })
+    type WhereDb = Effect.Success<ReturnType<typeof makeWhereDb>>
+
     /** Run a `.where()` query and return the captured DynamoDB input. */
-    const capture = (
-      build: (db: {
-        readonly entities: {
-          readonly Balls: any
-          readonly Readings: any
-          readonly Lookups: any
-        }
-      }) => Effect.Effect<unknown, any, never>,
-    ) => {
+    const capture = (build: (db: WhereDb) => Effect.Effect<unknown, any, never>) => {
       const captured: Array<any> = []
       const ClientLayer = makeQueryCapturingClient(captured)
       const TableLayer = WhereTable.layer({ name: "where-table" })
       return Effect.gen(function* () {
-        const db = yield* DynamoClient.make({
-          entities: { Balls, Readings, Lookups },
-          tables: { WhereTable },
-        })
-        yield* build(db as never)
+        const db = yield* makeWhereDb()
+        yield* build(db)
         return captured[0]
       }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
     }
@@ -1219,24 +1157,12 @@ describe("DynamoClient", () => {
     const AppSchema = DynamoSchema.make({ name: "skprefix", version: 1 })
 
     const makeQueryCapturingClient = (captured: Array<unknown>) =>
-      Layer.succeed(DynamoClient, {
-        putItem: () => Effect.die("not used"),
-        getItem: () => Effect.die("not used"),
-        deleteItem: () => Effect.die("not used"),
-        updateItem: () => Effect.die("not used"),
+      mockDynamoClientLayer({
         query: (input) =>
           Effect.sync(() => {
             captured.push(input)
             return { Items: [], Count: 0 } as never
           }),
-        batchGetItem: () => Effect.die("not used"),
-        batchWriteItem: () => Effect.die("not used"),
-        transactGetItems: () => Effect.die("not used"),
-        transactWriteItems: () => Effect.die("not used"),
-        createTable: () => Effect.die("not used"),
-        deleteTable: () => Effect.die("not used"),
-        describeTable: () => Effect.die("not used"),
-        scan: () => Effect.die("not used"),
       })
 
     // Two SK composites — the partial-prefix shape from #115.
@@ -1327,15 +1253,16 @@ describe("DynamoClient", () => {
 
     const SkTable = Table.make({ schema: AppSchema, entities: { Tasks, Notes, Samples } })
 
-    const capture = (build: (db: any) => Effect.Effect<unknown, any, never>) => {
+    const makeSkDb = () =>
+      DynamoClient.make({ entities: { Tasks, Notes, Samples }, tables: { SkTable } })
+    type SkDb = Effect.Success<ReturnType<typeof makeSkDb>>
+
+    const capture = (build: (db: SkDb) => Effect.Effect<unknown, any, never>) => {
       const captured: Array<any> = []
       const ClientLayer = makeQueryCapturingClient(captured)
       const TableLayer = SkTable.layer({ name: "sk-table" })
       return Effect.gen(function* () {
-        const db = yield* DynamoClient.make({
-          entities: { Tasks, Notes, Samples },
-          tables: { SkTable },
-        })
+        const db = yield* makeSkDb()
         yield* build(db)
         return captured[0]
       }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))

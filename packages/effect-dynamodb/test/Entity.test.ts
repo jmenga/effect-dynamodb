@@ -15,11 +15,11 @@ import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DynamoError, type TransactionOverflow } from "@effect-dynamodb/schema/Errors.js"
 import { beforeEach, vi } from "vitest"
-import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -68,7 +68,7 @@ const mockUpdateItem = vi.fn()
 const mockQuery = vi.fn()
 const mockTransactWriteItems = vi.fn()
 
-const TestDynamoClient = Layer.succeed(DynamoClient, {
+const TestDynamoClient = mockDynamoClientLayer({
   putItem: (input) =>
     Effect.tryPromise({
       try: () => mockPutItem(input),
@@ -99,13 +99,6 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
       try: () => mockTransactWriteItems(input),
       catch: (e) => new DynamoError({ operation: "TransactWriteItems", cause: e }),
     }),
-  batchGetItem: () => Effect.die("not used"),
-  batchWriteItem: () => Effect.die("not used"),
-  transactGetItems: () => Effect.die("not used"),
-  createTable: () => Effect.die("not used"),
-  deleteTable: () => Effect.die("not used"),
-  describeTable: () => Effect.die("not used"),
-  scan: () => Effect.die("not used"),
 })
 
 const TestTableConfig = MainTable.layer({ name: "test-table" })
@@ -2902,24 +2895,12 @@ describe("Entity", () => {
   describe("scan", () => {
     const mockScan = vi.fn()
 
-    const ScanTestDynamoClient = Layer.succeed(DynamoClient, {
-      putItem: () => Effect.die("not used"),
-      getItem: () => Effect.die("not used"),
-      deleteItem: () => Effect.die("not used"),
-      updateItem: () => Effect.die("not used"),
-      query: () => Effect.die("not used"),
+    const ScanTestDynamoClient = mockDynamoClientLayer({
       scan: (input) =>
         Effect.tryPromise({
           try: () => mockScan(input),
           catch: (e) => new DynamoError({ operation: "Scan", cause: e }),
         }),
-      transactWriteItems: () => Effect.die("not used"),
-      batchGetItem: () => Effect.die("not used"),
-      batchWriteItem: () => Effect.die("not used"),
-      transactGetItems: () => Effect.die("not used"),
-      createTable: () => Effect.die("not used"),
-      deleteTable: () => Effect.die("not used"),
-      describeTable: () => Effect.die("not used"),
     })
 
     const ScanTestLayer = Layer.merge(ScanTestDynamoClient, TestTableConfig)
@@ -4957,7 +4938,7 @@ describe("Entity", () => {
   describe("purge", () => {
     const mockBatchWriteItem = vi.fn()
 
-    const PurgeTestDynamoClient = Layer.succeed(DynamoClient, {
+    const PurgeTestDynamoClient = mockDynamoClientLayer({
       putItem: (input) =>
         Effect.tryPromise({
           try: () => mockPutItem(input),
@@ -4988,17 +4969,11 @@ describe("Entity", () => {
           try: () => mockTransactWriteItems(input),
           catch: (e) => new DynamoError({ operation: "TransactWriteItems", cause: e }),
         }),
-      batchGetItem: () => Effect.die("not used"),
       batchWriteItem: (input) =>
         Effect.tryPromise({
           try: () => mockBatchWriteItem(input),
           catch: (e) => new DynamoError({ operation: "BatchWriteItem", cause: e }),
         }),
-      transactGetItems: () => Effect.die("not used"),
-      createTable: () => Effect.die("not used"),
-      deleteTable: () => Effect.die("not used"),
-      describeTable: () => Effect.die("not used"),
-      scan: () => Effect.die("not used"),
     })
 
     const PurgeTestLayer = Layer.merge(PurgeTestDynamoClient, TestTableConfig)

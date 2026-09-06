@@ -12,11 +12,11 @@ import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Layer, Schema } from "effect"
 import { beforeEach, describe, expect, vi } from "vitest"
 import * as Batch from "../src/Batch.js"
-import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // --- Models ---
 
@@ -338,7 +338,7 @@ const mockTransactWriteItems = vi.fn().mockImplementation(async (input: any) => 
   return {}
 })
 
-const TestDynamoClient = Layer.succeed(DynamoClient, {
+const TestDynamoClient = mockDynamoClientLayer({
   putItem: (input) =>
     Effect.tryPromise({
       try: () => mockPutItem(input),
@@ -374,15 +374,11 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
       try: () => mockBatchWriteItem(input),
       catch: (e) => new DynamoError({ operation: "BatchWriteItem", cause: e }),
     }),
-  transactGetItems: () => Effect.die("not used in integration tests"),
   transactWriteItems: (input) =>
     Effect.tryPromise({
       try: () => mockTransactWriteItems(input),
       catch: (e) => new DynamoError({ operation: "TransactWriteItems", cause: e }),
     }),
-  createTable: () => Effect.die("not used in integration tests"),
-  deleteTable: () => Effect.die("not used in integration tests"),
-  describeTable: () => Effect.die("not used in integration tests"),
   scan: (input) =>
     Effect.tryPromise({
       try: () => mockScan(input),

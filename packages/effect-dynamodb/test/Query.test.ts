@@ -1,15 +1,33 @@
 import { describe, expect, it } from "@effect/vitest"
 import { DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
-import { Effect, Layer, Stream } from "effect"
+import { Effect, Stream } from "effect"
 import { beforeEach, vi } from "vitest"
-import { DynamoClient } from "../src/DynamoClient.js"
 import { createConditionOps } from "../src/internal/Expr.js"
 import { createPathBuilder } from "../src/internal/PathBuilder.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
-const ops = createConditionOps<any>()
-const pb = createPathBuilder<any>()
+/**
+ * Attribute shape the filter/condition expressions in this file are written
+ * against. `Query` itself is generic over the decoded result type, but the
+ * expression builders are generic over the *model*, so they need a concrete
+ * model to produce typed paths.
+ */
+interface TestModel {
+  readonly id: string
+  readonly name: string
+  readonly email: string
+  readonly status: string
+  readonly role: string
+  readonly age: number
+  readonly score: number
+  readonly tags: ReadonlyArray<string>
+  readonly deletedAt?: string
+}
+
+const ops = createConditionOps<TestModel>()
+const pb = createPathBuilder<TestModel>()
 
 // ---------------------------------------------------------------------------
 // Mock DynamoClient
@@ -18,7 +36,7 @@ const pb = createPathBuilder<any>()
 const mockQuery = vi.fn()
 const mockScan = vi.fn()
 
-const TestDynamoClient = Layer.succeed(DynamoClient, {
+const TestDynamoClient = mockDynamoClientLayer({
   query: (input) =>
     Effect.tryPromise({
       try: () => mockQuery(input),
@@ -29,17 +47,6 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
       try: () => mockScan(input),
       catch: (e) => new DynamoError({ operation: "Scan", cause: e }),
     }),
-  putItem: () => Effect.die("not used"),
-  getItem: () => Effect.die("not used"),
-  deleteItem: () => Effect.die("not used"),
-  updateItem: () => Effect.die("not used"),
-  batchGetItem: () => Effect.die("not used"),
-  batchWriteItem: () => Effect.die("not used"),
-  transactGetItems: () => Effect.die("not used"),
-  transactWriteItems: () => Effect.die("not used"),
-  createTable: () => Effect.die("not used"),
-  deleteTable: () => Effect.die("not used"),
-  describeTable: () => Effect.die("not used"),
 })
 
 // ---------------------------------------------------------------------------
@@ -464,7 +471,7 @@ describe("Query", () => {
     it.effect("builds beginsWith filter", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({ Items: [], LastEvaluatedKey: undefined })
-        const q = makeTestQuery().pipe(Query.filterExpr(ops.beginsWith(pb.name as any, "Al")))
+        const q = makeTestQuery().pipe(Query.filterExpr(ops.beginsWith(pb.name, "Al")))
         yield* Query.collect(q)
         const call = mockQuery.mock.calls[0]![0]
         expect(call.FilterExpression).toContain("begins_with(")

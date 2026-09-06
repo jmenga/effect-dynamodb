@@ -5,8 +5,8 @@ import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import { DateTime, Effect, Layer, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
-import { DynamoClient } from "../src/DynamoClient.js"
 import * as Table from "../src/Table.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 /**
  * Aggregate and entity key composition now run the SAME rule, from the same
@@ -70,25 +70,13 @@ describe("Aggregate key encoding (shared composite key-form rule)", () => {
 
   const mockTransactWrite = vi.fn()
   const TestLayer = Layer.merge(
-    Layer.succeed(DynamoClient, {
+    mockDynamoClientLayer({
       transactWriteItems: (input) =>
         Effect.tryPromise({
           try: () => mockTransactWrite(input),
           catch: (e) => new DynamoError({ operation: "TransactWriteItems", cause: e }),
         }),
-      query: () => Effect.die("not used"),
-      putItem: () => Effect.die("not used"),
-      getItem: () => Effect.die("not used"),
-      deleteItem: () => Effect.die("not used"),
-      updateItem: () => Effect.die("not used"),
-      batchGetItem: () => Effect.die("not used"),
-      batchWriteItem: () => Effect.die("not used"),
-      transactGetItems: () => Effect.die("not used"),
-      createTable: () => Effect.die("not used"),
-      deleteTable: () => Effect.die("not used"),
-      describeTable: () => Effect.die("not used"),
-      scan: () => Effect.die("not used"),
-    } as never),
+    }),
     MainTable.layer({ name: "aggkeys-table" }),
   )
 

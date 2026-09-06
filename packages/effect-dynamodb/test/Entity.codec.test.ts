@@ -19,6 +19,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -35,7 +36,7 @@ const withConfig = <E extends { _configure: Function }>(entity: E): E => {
 const mockPutItem = vi.fn()
 const mockGetItem = vi.fn()
 
-const TestDynamoClient = Layer.succeed(DynamoClient, {
+const TestDynamoClient = mockDynamoClientLayer({
   putItem: (input) =>
     Effect.tryPromise({
       try: () => mockPutItem(input),
@@ -46,23 +47,15 @@ const TestDynamoClient = Layer.succeed(DynamoClient, {
       try: () => mockGetItem(input),
       catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
     }),
-  deleteItem: () => Effect.die("not used"),
-  updateItem: () => Effect.die("not used"),
-  query: () => Effect.die("not used"),
-  transactWriteItems: () => Effect.die("not used"),
-  batchGetItem: () => Effect.die("not used"),
-  batchWriteItem: () => Effect.die("not used"),
-  transactGetItems: () => Effect.die("not used"),
-  createTable: () => Effect.die("not used"),
-  deleteTable: () => Effect.die("not used"),
-  describeTable: () => Effect.die("not used"),
-  scan: () => Effect.die("not used"),
 })
 
 const TestTableConfig = MainTable.layer({ name: "test-table" })
 const TestLayer = Layer.merge(TestDynamoClient, TestTableConfig)
 
-const baseKey = { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } }
+const baseKey = {
+  pk: { field: "pk", composite: ["id"] },
+  sk: { field: "sk", composite: [] },
+} as const
 const epochMs = 1704067200000 // 2024-01-01T00:00:00.000Z
 const epochSec = 1704067200
 const isoString = "2024-01-01T00:00:00.000Z"
@@ -360,7 +353,7 @@ describe("Entity codec direction — non-date transforms (issue #29)", () => {
       })
       // Mock the underlying client.updateItem via a dedicated layer override
       const mockUpdateItem = vi.fn().mockResolvedValue({ Attributes: updatedItem })
-      const Layer2 = Layer.succeed(DynamoClient, {
+      const Layer2 = mockDynamoClientLayer({
         ...((yield* DynamoClient) as any),
         updateItem: (input: any) =>
           Effect.tryPromise({
