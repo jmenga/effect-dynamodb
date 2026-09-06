@@ -372,14 +372,17 @@ export const select: {
 export const filterExpr: {
   (expr: Expr): <A>(self: Query<A>) => Query<A>
   <A>(self: Query<A>, expr: Expr): Query<A>
-} = Function.dual(
-  2,
-  <A>(self: Query<A>, expr: Expr): Query<A> =>
-    new QueryImpl<A>({
-      ...self._state,
-      exprFilters: [...self._state.exprFilters, expr],
-    }),
-)
+} = Function.dual(2, <A>(self: Query<A>, expr: Expr): Query<A> => {
+  // An empty shorthand (`.filter({})`) parses to an empty `and`, which
+  // compiles to the empty string — and `FilterExpression: ""` is rejected by
+  // DynamoDB. A predicate over no attributes is a no-op, so drop it here
+  // rather than emitting an unusable request.
+  if ((expr._tag === "and" || expr._tag === "or") && expr.exprs.length === 0) return self
+  return new QueryImpl<A>({
+    ...self._state,
+    exprFilters: [...self._state.exprFilters, expr],
+  })
+})
 
 /**
  * Apply path-based projections. Compiles path segments to ProjectionExpression.

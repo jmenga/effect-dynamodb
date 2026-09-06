@@ -6,11 +6,7 @@
 
 Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, composite key composition from entity attributes, type-safe index-aware queries with Stream-based pagination, and DynamoClient as an Effect Service with Layer-based dependency injection.
 
-**Status:** All modules implemented. 1367 core tests, 307 schema tests, 56 geo tests, 281 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
-**Status:** All modules implemented. 1300 core tests, 307 schema tests, 56 geo tests, 247 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
-**Status:** All modules implemented. 1300 core tests, 307 schema tests, 56 geo tests, 252 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
-**Status:** All modules implemented. 1302 core tests, 307 schema tests, 56 geo tests, 257 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
-**Status:** All modules implemented. 1135 core tests, 281 schema tests, 56 geo tests, 193 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
+**Status:** All modules implemented. 1379 core tests, 307 schema tests, 56 geo tests, 290 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
 **Design:** `DESIGN.md` — API specification (source of truth for implementation)
 
 ## Architecture
@@ -513,6 +509,8 @@ Each of the four publishable packages must be configured on npmjs.com with this 
 - **Domain models are pure.** Entity association declared at edge level in `Aggregate.make()`, not in Schema.Class model.
 - **Aggregate.update mutation context.** Receives `UpdateContext` with: `state` (plain object), `cursor` (pre-bound optic), `optic` (composable optic), `current` (Schema.Class instance).
 - **System timestamps via `Aggregate.make({ timestamps })`.** Same `TimestampsConfig` as `Entity.make`, applied to every row the aggregate writes (root + edges + sub-aggregate groups). Stamped in `buildDynamoItems` — AFTER the update diff, so timestamps never defeat diff narrowing. `created` is carried forward from the stored row (aggregate writes are `Put`); `updated` is per row, so rows a diff leaves alone keep their value. Timestamp attributes are stripped on the read path unless the root model declares the field itself.
+- **`aggregate.list(key, options)` pages on RESULTS, not rows (#104).** `limit` is at most _n_ aggregates and accumulates across requests; `pageSize` is DynamoDB's `Limit` (rows examined); `filter` compiles a `FilterExpression` onto the ROOT-ITEM query through the same `Expr` compiler `BoundQuery.filter()` uses (callback + shorthand); `reverse` sets `ScanIndexForward: false`. Filtering server-side is a performance fix as much as an ergonomic one — `list` assembles each surviving root item with its own partition read, so an in-memory predicate pays a full assembly per discarded aggregate. Once a filtered request over-reads, the cursor is rebuilt from the last item RETURNED (same rule as `Query.execute`), so `cursor: null` still means genuinely exhausted.
+- **A sharded (`cardinality`) list has no cursor.** The fan-out spans N partitions with no defined order across them, so `limit` truncates the merged result and `cursor` is always `null`; a passed cursor is REJECTED with `EDD-9051` rather than ignored.
 - **Optional sub-aggregates supported.** `Schema.optionalKey` → decomposition skips null/undefined, assembly omits the key entirely.
 
 ## MCP Servers

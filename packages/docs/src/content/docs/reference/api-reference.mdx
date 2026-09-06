@@ -1045,7 +1045,7 @@ const MatchAggregate = Aggregate.make(Match, {
 | `aggregate.create(input)` | `Effect<Domain, AggregateWriteError>` | Create from input (ref IDs hydrated, sub-aggregate transactions) |
 | `aggregate.update(key, fn)` | `Effect<Domain, AggregateWriteError>` | Fetch → mutate → diff → write changed groups. `fn` receives `UpdateContext` with `{ state, cursor, optic, current }` |
 | `aggregate.delete(key)` | `Effect<void, AggregateAssemblyError \| DynamoError>` | Remove all items in the partition |
-| `aggregate.list(key)` | `Query<Domain>` | Query aggregates by collection index |
+| `aggregate.list(key, options?)` | `Effect<ListResult<Domain>, AggregateAssemblyError \| DynamoError \| ValidationError>` | Page aggregates off the list index. `options`: `limit` (at most _n_ aggregates), `pageSize` (rows examined per request), `filter` (server-side `FilterExpression`, callback or shorthand), `reverse`, `cursor`. Returns `{ data, cursor }`; `cursor` is `null` only when exhausted, and is always `null` on a sharded (`cardinality`) list, which rejects a passed cursor with `EDD-9051` |
 
 ### Edge Types
 

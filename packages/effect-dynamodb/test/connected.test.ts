@@ -26,7 +26,7 @@ import {
   Stream,
 } from "effect"
 import { TestClock } from "effect/testing"
-import { afterAll, beforeAll, describe, expect } from "vitest"
+import { afterAll, beforeAll, beforeEach, describe, expect } from "vitest"
 
 /**
  * Fixed instant for TTL/timestamp assertions. `it.effect` runs under a
@@ -51,7 +51,7 @@ import type {
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
 import * as Collection from "../src/Collection.js"
-import { DynamoClient } from "../src/DynamoClient.js"
+import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Expression from "../src/Expression.js"
@@ -10838,4 +10838,401 @@ describeConnected("aggregate attribute encoding round-trips every shape (#116)",
   // transformed model"), where the transactWrite call count is observable. A
   // connected test can only compare stored bytes, which look identical whether
   // or not the write was skipped.
+})
+
+// ---------------------------------------------------------------------------
+// Aggregate.list — server-side filter, reverse, and the sharded branch (#104)
+//
+// `list` reads root items off a list GSI and then assembles each one with its
+// own partition read (the N+1). Filtering in memory therefore paid a full
+// assembly for every aggregate it then discarded, `limit` could not mean "this
+// many MATCHING aggregates", and the sharded branch dropped `limit`/`cursor`
+// on the floor. All three are asserted here against real DynamoDB, because the
+// interesting behaviour — a `Limit` that bounds rows EXAMINED while the filter
+// runs after — is exactly what a mock cannot reproduce.
+// ---------------------------------------------------------------------------
+
+const alSchema = DynamoSchema.make({ name: "agglist", version: 1 })
+const alTableName = `agg-list-test-${Date.now()}`
+
+/** A `many` edge element — `id` is what `extractRefIdentifiers` keys elements by. */
+class AlLine extends Schema.Class<AlLine>("AlLine")({
+  id: Schema.String,
+  sku: Schema.String,
+  qty: Schema.Number,
+}) {}
+
+class AlOrder extends Schema.Class<AlOrder>("AlOrder")({
+  orderId: Schema.String,
+  customerId: Schema.String,
+  status: Schema.Literals(["pending", "shipped"]),
+  total: Schema.Number,
+  lines: Schema.Array(AlLine),
+}) {}
+
+/** Anchors the table's primary key shape; the list GSI comes from the aggregate. */
+class AlAnchor extends Schema.Class<AlAnchor>("AlAnchor")({
+  anchorId: Schema.String,
+}) {}
+
+const AlAnchors = Entity.make({
+  model: AlAnchor,
+  entityType: "AlAnchor",
+  primaryKey: { pk: { field: "pk", composite: ["anchorId"] }, sk: { field: "sk", composite: [] } },
+})
+
+const AlTable = Table.make({ schema: alSchema, entities: { AlAnchors } })
+
+const AlOrderAggregate = Aggregate.make(AlOrder, {
+  table: AlTable,
+  schema: alSchema,
+  pk: { field: "pk", composite: ["orderId"] },
+  // No collection index — assembly runs against the base table.
+  collection: { name: "alorder" },
+  list: {
+    index: "gsi1",
+    name: "alorderlist",
+    pk: { field: "gsi1pk", composite: ["customerId"] },
+    sk: { field: "gsi1sk", composite: ["orderId"] },
+  },
+  root: { entityType: "AlOrderItem" },
+  edges: {
+    lines: Aggregate.many("lines", { entityType: "AlOrderLine" }),
+  },
+})
+
+/** Same shape, sharded — the branch that used to discard `limit` and `cursor`. */
+const AlShardedAggregate = Aggregate.make(AlOrder, {
+  table: AlTable,
+  schema: alSchema,
+  pk: { field: "pk", composite: ["orderId"] },
+  collection: { name: "alsharded" },
+  list: {
+    index: "gsi1",
+    name: "alshardedlist",
+    pk: { field: "gsi1pk", composite: ["customerId"] },
+    sk: { field: "gsi1sk", composite: ["orderId"] },
+    cardinality: 3,
+  },
+  root: { entityType: "AlShardedItem" },
+  edges: {
+    lines: Aggregate.many("lines", { entityType: "AlShardedLine" }),
+  },
+})
+
+/**
+ * Every `query` this suite issues, tagged by index. Requests naming the list
+ * GSI are root-item reads; the rest are the per-aggregate assembly reads whose
+ * count IS the N+1 claim.
+ */
+const alQueryLog: Array<string | undefined> = []
+
+const alCountingClient = (client: DynamoClientService): DynamoClientService => ({
+  ...client,
+  query: (input) => {
+    alQueryLog.push(input.IndexName)
+    return client.query(input)
+  },
+})
+
+const AlClientLayer = Layer.effect(
+  DynamoClient,
+  Effect.map(DynamoClient, (client) => alCountingClient(client)),
+).pipe(Layer.provide(ClientLayer))
+
+const AlLayer = Layer.mergeAll(AlClientLayer, AlTable.layer({ name: alTableName }))
+const provideAl = Effect.provide(AlLayer)
+const alTables = { AlTable }
+const alAggregates = { AlOrderAggregate, AlShardedAggregate }
+
+/** Root reads (list GSI) and assembly reads (base table) since the last reset. */
+const alCounts = () => {
+  const root = alQueryLog.filter((index) => index === "gsi1").length
+  return { assemblies: alQueryLog.length - root, root }
+}
+
+/** 12 orders, every third one shipped: positions 3, 6, 9 and 12. */
+const AL_ORDERS = Array.from({ length: 12 }, (_, i) => {
+  const n = i + 1
+  return {
+    customerId: "c1",
+    lines: [{ id: `l-${n}-a`, qty: n, sku: "sku-a" }],
+    orderId: `o-${String(n).padStart(2, "0")}`,
+    status: n % 3 === 0 ? ("shipped" as const) : ("pending" as const),
+    total: n * 10,
+  }
+})
+
+describeConnected("Aggregate.list — filtered pagination, reverse, sharding (#104)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          aggregates: alAggregates,
+          entities: { AlAnchors },
+          tables: alTables,
+        })
+        yield* db.tables.AlTable.create()
+
+        for (const order of AL_ORDERS) {
+          yield* db.aggregates.AlOrderAggregate.create(order as never)
+          // The sharded twin: same rows, different entity types + list name.
+          yield* db.aggregates.AlShardedAggregate.create({
+            ...order,
+            customerId: "c2",
+            orderId: `s-${order.orderId}`,
+          } as never)
+        }
+      }).pipe(provideAl, Effect.scoped),
+    )
+  }, 60000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: alTableName })
+      }).pipe(
+        provideAl,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  beforeEach(() => {
+    alQueryLog.length = 0
+  })
+
+  const ids = (result: { data: ReadonlyArray<unknown> }) =>
+    result.data.map((o) => (o as { orderId: string }).orderId)
+
+  it.effect("a filtered list returns a FULL page of matches, not a short one", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        aggregates: alAggregates,
+        entities: { AlAnchors },
+        tables: alTables,
+      })
+
+      // `pageSize: 1` makes every request examine exactly one row, so the six
+      // pending rows between the matches each come back EMPTY. Pre-#104 this
+      // shape was inexpressible: `limit` was DynamoDB's `Limit`, which bounds
+      // rows examined, so `limit: 3` under a filter returned whatever survived.
+      const page = yield* db.aggregates.AlOrderAggregate.list(
+        { customerId: "c1" },
+        { filter: { status: "shipped" }, limit: 3, pageSize: 1 },
+      )
+
+      expect(ids(page)).toEqual(["o-03", "o-06", "o-09"])
+      // Nine root requests to fill a three-item page — six returned nothing.
+      expect(alCounts().root).toBe(9)
+      // Assembly ran for the three matches only: rows 1-2, 4-5, 7-8 were
+      // examined and rejected server-side, and never assembled.
+      expect(alCounts().assemblies).toBe(3)
+      // A fourth match (o-12) is still out there, so the page is not the end.
+      expect(page.cursor).not.toBeNull()
+    }).pipe(provideAl),
+  )
+
+  it.effect("the cursor resumes after the last aggregate RETURNED, and nulls only at the end", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        aggregates: alAggregates,
+        entities: { AlAnchors },
+        tables: alTables,
+      })
+
+      const first = yield* db.aggregates.AlOrderAggregate.list(
+        { customerId: "c1" },
+        { filter: { status: "shipped" }, limit: 3, pageSize: 1 },
+      )
+      expect(ids(first)).toEqual(["o-03", "o-06", "o-09"])
+
+      const second = yield* db.aggregates.AlOrderAggregate.list(
+        { customerId: "c1" },
+        { cursor: first.cursor!, filter: { status: "shipped" }, limit: 3, pageSize: 1 },
+      )
+
+      // Resumes after o-09 — no repeats, nothing skipped.
+      expect(ids(second)).toEqual(["o-12"])
+      // Short only because the range genuinely ended, and the cursor says so.
+      expect(second.cursor).toBeNull()
+    }).pipe(provideAl),
+  )
+
+  it.effect("an over-reading page rebuilds its cursor so nothing is skipped", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        aggregates: alAggregates,
+        entities: { AlAnchors },
+        tables: alTables,
+      })
+
+      // No pageSize: one request reads the whole partition and returns all four
+      // matches, of which two are kept. `LastEvaluatedKey` is absent (the range
+      // ended), so a passed-through cursor would have claimed exhaustion and
+      // lost o-09 and o-12 outright.
+      const collected: Array<string> = []
+      let cursor: string | null = null
+      let pages = 0
+      do {
+        const page = yield* db.aggregates.AlOrderAggregate.list(
+          { customerId: "c1" },
+          cursor === null
+            ? { filter: { status: "shipped" }, limit: 2 }
+            : { cursor, filter: { status: "shipped" }, limit: 2 },
+        )
+        collected.push(...ids(page))
+        cursor = page.cursor
+        pages++
+      } while (cursor !== null && pages < 10)
+
+      expect(collected).toEqual(["o-03", "o-06", "o-09", "o-12"])
+      expect(cursor).toBeNull()
+    }).pipe(provideAl),
+  )
+
+  it.effect("the N+1 assembly is what filtering saves — measured", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        aggregates: alAggregates,
+        entities: { AlAnchors },
+        tables: alTables,
+      })
+
+      const all = yield* db.aggregates.AlOrderAggregate.list({ customerId: "c1" })
+      expect(all.data).toHaveLength(12)
+      const unfiltered = alCounts()
+      expect(unfiltered.assemblies).toBe(12)
+
+      alQueryLog.length = 0
+
+      const shipped = yield* db.aggregates.AlOrderAggregate.list(
+        { customerId: "c1" },
+        { filter: { status: "shipped" } },
+      )
+      expect(ids(shipped)).toEqual(["o-03", "o-06", "o-09", "o-12"])
+      const filtered = alCounts()
+
+      // Same rows examined, a third of the partition reads: the eight rejected
+      // aggregates are never assembled.
+      expect(filtered.root).toBe(unfiltered.root)
+      expect(filtered.assemblies).toBe(4)
+    }).pipe(provideAl),
+  )
+
+  it.effect("the filter callback form reaches the same server-side predicate", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        aggregates: alAggregates,
+        entities: { AlAnchors },
+        tables: alTables,
+      })
+
+      const page = yield* db.aggregates.AlOrderAggregate.list(
+        { customerId: "c1" },
+        { filter: (t, { gt }) => gt(t.total, 90) },
+      )
+
+      expect(ids(page)).toEqual(["o-10", "o-11", "o-12"])
+      expect(alCounts().assemblies).toBe(3)
+    }).pipe(provideAl),
+  )
+
+  it.effect("reverse walks the list index descending", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        aggregates: alAggregates,
+        entities: { AlAnchors },
+        tables: alTables,
+      })
+
+      const page = yield* db.aggregates.AlOrderAggregate.list(
+        { customerId: "c1" },
+        { filter: { status: "shipped" }, limit: 2, reverse: true },
+      )
+
+      expect(ids(page)).toEqual(["o-12", "o-09"])
+
+      const forward = yield* db.aggregates.AlOrderAggregate.list(
+        { customerId: "c1" },
+        { filter: { status: "shipped" }, limit: 2 },
+      )
+      expect(ids(forward)).toEqual(["o-03", "o-06"])
+    }).pipe(provideAl),
+  )
+
+  it.effect("sharded: limit bounds the merged fan-out", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        aggregates: alAggregates,
+        entities: { AlAnchors },
+        tables: alTables,
+      })
+
+      const all = yield* db.aggregates.AlShardedAggregate.list({ customerId: "c2" })
+      expect(all.data).toHaveLength(12)
+      expect(all.cursor).toBeNull()
+
+      alQueryLog.length = 0
+
+      // Previously the option was accepted and discarded — this returned all 12.
+      const bounded = yield* db.aggregates.AlShardedAggregate.list(
+        { customerId: "c2" },
+        { limit: 4 },
+      )
+      expect(bounded.data).toHaveLength(4)
+      // Three shard reads, and only the four surviving rows are assembled.
+      expect(alCounts().root).toBe(3)
+      expect(alCounts().assemblies).toBe(4)
+      // No resumable position across shards — never a cursor that lies.
+      expect(bounded.cursor).toBeNull()
+    }).pipe(provideAl),
+  )
+
+  it.effect("sharded: a filter reaches every shard", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        aggregates: alAggregates,
+        entities: { AlAnchors },
+        tables: alTables,
+      })
+
+      const page = yield* db.aggregates.AlShardedAggregate.list(
+        { customerId: "c2" },
+        { filter: { status: "shipped" } },
+      )
+
+      expect(ids(page).sort()).toEqual(["s-o-03", "s-o-06", "s-o-09", "s-o-12"])
+      expect(alCounts().assemblies).toBe(4)
+    }).pipe(provideAl),
+  )
+
+  it.effect("sharded: a cursor is REJECTED (EDD-9051), never silently ignored", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        aggregates: alAggregates,
+        entities: { AlAnchors },
+        tables: alTables,
+      })
+
+      // A cursor minted by the unsharded aggregate — structurally valid, and
+      // meaningless here. The old code accepted it and restarted from the top.
+      const source = yield* db.aggregates.AlOrderAggregate.list({ customerId: "c1" }, { limit: 2 })
+      expect(source.cursor).not.toBeNull()
+
+      alQueryLog.length = 0
+
+      const error = yield* db.aggregates.AlShardedAggregate.list(
+        { customerId: "c2" },
+        { cursor: source.cursor!, limit: 2 },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("ValidationError")
+      expect((error as { cause: string }).cause).toContain("EDD-9051")
+      // Rejected before any request was made.
+      expect(alQueryLog).toHaveLength(0)
+    }).pipe(provideAl),
+  )
 })
