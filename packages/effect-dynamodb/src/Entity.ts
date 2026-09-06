@@ -312,6 +312,33 @@ const composeUniqueSentinel = (
  *
  * @internal
  */
+/**
+ * @internal Build a key-form normaliser for an arbitrary entity-like value.
+ *
+ * `makeImpl` closes over its own `keyForm`; this is the escape hatch for the
+ * two places that compose against a DIFFERENT entity's index (`cascade`) or run
+ * outside `makeImpl` entirely (`bind`'s `reembed` / `history`). Same rule, same
+ * `CompositeCodec` — just resolved per target.
+ */
+const keyFormFor = (
+  target: unknown,
+  record: globalThis.Record<string, unknown>,
+): globalThis.Record<string, unknown> => {
+  const t = target as {
+    readonly model?: Schema.Top | undefined
+    readonly schemas?: { readonly inputSchema?: Schema.Top | undefined } | undefined
+  }
+  const source = t.schemas?.inputSchema ?? t.model
+  if (source === undefined) return record
+  const form = makeCompositeKeyForm(source, (attr, value) => {
+    throw new Error(
+      `[EDD-9050] Composite "${attr}" could not be put into its key form: ` +
+        `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode.`,
+    )
+  })
+  return toCompositeKeyRecord(form, record)
+}
+
 const encodeOrDecodeEncode = (
   schema: Schema.Codec<any>,
   input: unknown,
@@ -1688,29 +1715,39 @@ const makeImpl = <
    * disagree for a composite whose wire transform is added by derivation —
    * `Schema.Date` being the case that matters.
    */
+  /**
+   * THE key-form normaliser. Every record handed to `KeyComposer` in this
+   * module goes through it, so the write path, the update path, the lifecycle
+   * paths and the read path cannot disagree about how a composite is spelled
+   * in a key.
+   *
+   * Skipping it on ONE site is enough to corrupt data: `composeAllKeys` (put)
+   * normalised while `composeGsiKeysForUpdatePolicyAware` (update) did not, so
+   * an `update()` rewrote a padded `gsi1pk` to its unpadded form and evicted
+   * the row from its own GSI. `test/KeyFormInvariant.test.ts` scans this file
+   * and fails if a `KeyComposer.compose*` call takes a record that did not come
+   * through `keyForm(...)`.
+   */
+  const keyForm = (record: globalThis.Record<string, unknown>) =>
+    toCompositeKeyRecord(compositeKeyForm, record)
+
   const composePrimaryKey = (record: globalThis.Record<string, unknown>) => {
     const primary = config.indexes.primary
-    const encoded = toCompositeKeyRecord(compositeKeyForm, record)
+    const recordKeyForm = keyForm(record)
     return {
-      [primary.pk.field]: KeyComposer.composePk(schema, entityType, primary, encoded),
+      [primary.pk.field]: KeyComposer.composePk(schema, entityType, primary, recordKeyForm),
       [primary.sk.field]: KeyComposer.composeSk(
         schema,
         entityType,
         entityVersion,
         primary,
-        encoded,
+        recordKeyForm,
       ),
     }
   }
 
   const composeAllKeys = (record: globalThis.Record<string, unknown>) =>
-    KeyComposer.composeAllKeys(
-      schema,
-      entityType,
-      entityVersion,
-      allIndexes,
-      toCompositeKeyRecord(compositeKeyForm, record),
-    )
+    KeyComposer.composeAllKeys(schema, entityType, entityVersion, allIndexes, keyForm(record))
 
   /**
    * Fill the auto-generated id field on the raw `put` input when configured and
@@ -1996,7 +2033,7 @@ const makeImpl = <
           schema,
           entityType,
           definition,
-          record,
+          keyForm(record),
         )
         if (partition === undefined) {
           // No partition value ⇒ the item cannot be in the index at all. Drop
@@ -2152,7 +2189,7 @@ const makeImpl = <
           schema,
           entityType,
           definition,
-          merged,
+          keyForm(merged),
         )
         if (partition === undefined) {
           // Only drop the partition when THIS writer invalidated it. Otherwise
@@ -2410,7 +2447,7 @@ const makeImpl = <
           targetSchema,
           target.entityType,
           cascadeIdx.indexDef,
-          { [matchingRef.idFieldName]: sourceIdValue },
+          keyFormFor(target, { [matchingRef.idFieldName]: sourceIdValue }),
         )
 
         // Build query parameters
@@ -3147,8 +3184,8 @@ const makeImpl = <
               entityType,
               entityVersion,
               allIndexes,
-              hydratedUpdates as globalThis.Record<string, unknown>,
-              newItem,
+              keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
+              keyForm(newItem),
               retainRemovedSet === undefined ? {} : { removedSet: retainRemovedSet },
             )
             for (const [field, value] of Object.entries(gsiUpdate.sets)) {
@@ -3177,7 +3214,7 @@ const makeImpl = <
                 entityType,
                 entityVersion,
                 indexDef,
-                newItem,
+                keyForm(newItem),
               )
               if (keys) {
                 Object.assign(newItem, keys)
@@ -3641,8 +3678,8 @@ const makeImpl = <
             entityType,
             entityVersion,
             allIndexes,
-            hydratedUpdates as globalThis.Record<string, unknown>,
-            encodedKey as globalThis.Record<string, unknown>,
+            keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
+            keyForm(encodedKey as globalThis.Record<string, unknown>),
             removedSet === undefined ? {} : { removedSet },
           )
           for (const [field, value] of Object.entries(gsiUpdate.sets)) {
@@ -4711,8 +4748,15 @@ const makeImpl = <
 
       // Compose current-item primary key (pk + sk derived from PK/SK composites)
       const primary = config.indexes.primary
-      const pkValue = KeyComposer.composePk(schema, entityType, primary, encoded)
-      const currentSk = KeyComposer.composeSk(schema, entityType, entityVersion, primary, encoded)
+      const appendKeyForm = keyForm(encoded)
+      const pkValue = KeyComposer.composePk(schema, entityType, primary, appendKeyForm)
+      const currentSk = KeyComposer.composeSk(
+        schema,
+        entityType,
+        entityVersion,
+        primary,
+        appendKeyForm,
+      )
       const marshalledKey = toAttributeMap({
         [primary.pk.field]: pkValue,
         [primary.sk.field]: currentSk,
@@ -4765,8 +4809,8 @@ const makeImpl = <
         entityType,
         entityVersion,
         allIndexes,
-        encoded,
-        encoded,
+        keyForm(encoded),
+        keyForm(encoded),
         removedSet !== undefined ? { removedSet } : undefined,
       )
       for (const [field, value] of Object.entries(gsiUpdate.sets)) {
@@ -5009,15 +5053,15 @@ const makeImpl = <
         `[EDD-9010] Entity "${entityType}": .history() requires timeSeries config on the entity.`,
       )
     }
-    const encodedKey = toCompositeKeyRecord(compositeKeyForm, encodeKeySync(key))
+    const encodedKey = keyForm(encodeKeySync(key))
     const primary = config.indexes.primary
-    const pkValue = KeyComposer.composePk(schema, entityType, primary, encodedKey)
+    const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
     const currentSk = KeyComposer.composeSk(
       schema,
       entityType,
       entityVersion,
       primary,
-      encodedKey as globalThis.Record<string, unknown>,
+      keyForm(encodedKey as globalThis.Record<string, unknown>),
     )
     const prefix = KeyComposer.composeEventSkPrefix(currentSk, schema.casing)
 
@@ -5067,9 +5111,9 @@ const makeImpl = <
     queryNamespace[indexName] = (rawPk: globalThis.Record<string, unknown>) => {
       // Normalise composites to their key form before composing — same rule
       // and same function the write path uses (see `CompositeCodec`).
-      const pk = toCompositeKeyRecord(compositeKeyForm, rawPk)
-      const pkValue = KeyComposer.composePk(schema, entityType, indexDef, pk)
-      const hasSkComposites = indexDef.sk.composite.some((attr) => pk[attr] !== undefined)
+      const pkKeyForm = keyForm(rawPk)
+      const pkValue = KeyComposer.composePk(schema, entityType, indexDef, pkKeyForm)
+      const hasSkComposites = indexDef.sk.composite.some((attr) => pkKeyForm[attr] !== undefined)
       const query = Query.make({
         tableName: "",
         indexName: indexDef.index,
@@ -5090,7 +5134,7 @@ const makeImpl = <
           entityType,
           entityVersion,
           indexDef,
-          pk,
+          pkKeyForm,
         )
         return Query.where(query, { beginsWith: skPrefix })
       }
@@ -5127,7 +5171,7 @@ const makeImpl = <
 
           // Compose PK + version SK
           const primary = config.indexes.primary
-          const pkValue = KeyComposer.composePk(schema, entityType, primary, encodedKey)
+          const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
           const versionSk = DynamoSchema.composeVersionKey(schema, entityType, versionNumber)
 
           const marshalledKey = toAttributeMap({
@@ -5157,9 +5201,9 @@ const makeImpl = <
   // ---------------------------------------------------------------------------
 
   const versions = (key: unknown) => {
-    const encodedKey = toCompositeKeyRecord(compositeKeyForm, encodeKeySync(key))
+    const encodedKey = keyForm(encodeKeySync(key))
     const primary = config.indexes.primary
-    const pkValue = KeyComposer.composePk(schema, entityType, primary, encodedKey)
+    const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
     const versionPrefix = DynamoSchema.composeVersionKeyPrefix(schema, entityType)
 
     return Query.make({
@@ -5190,7 +5234,7 @@ const makeImpl = <
 
           // Query for soft-deleted item using begins_with on deleted prefix
           const primary = config.indexes.primary
-          const pkValue = KeyComposer.composePk(schema, entityType, primary, encodedKey)
+          const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
           const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
 
           const result = yield* client.query({
@@ -5239,9 +5283,9 @@ const makeImpl = <
     )
 
   const deletedList = (key: unknown) => {
-    const encodedKey = toCompositeKeyRecord(compositeKeyForm, encodeKeySync(key))
+    const encodedKey = keyForm(encodeKeySync(key))
     const primary = config.indexes.primary
-    const pkValue = KeyComposer.composePk(schema, entityType, primary, encodedKey)
+    const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
     const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
 
     const decodeDeleted = (raw: globalThis.Record<string, unknown>) => {
@@ -5293,7 +5337,7 @@ const makeImpl = <
 
           // Query for the soft-deleted item
           const primary = config.indexes.primary
-          const pkValue = KeyComposer.composePk(schema, entityType, primary, encodedKey)
+          const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
           const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
 
           const queryResult = yield* client.query({
@@ -5361,7 +5405,7 @@ const makeImpl = <
               schema,
               entityType,
               definition,
-              restoredItem,
+              keyForm(restoredItem),
             )
             if (partition !== undefined) restoredItem[definition.partitionField] = partition
           }
@@ -5518,7 +5562,7 @@ const makeImpl = <
           const encodedKey = yield* encodeKey(key, "purge.decode")
 
           const primary = config.indexes.primary
-          const pkValue = KeyComposer.composePk(schema, entityType, primary, encodedKey)
+          const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
 
           // Query ALL items in this partition (current + versions + deleted)
           // Use ProjectionExpression to only get keys
@@ -5553,7 +5597,7 @@ const makeImpl = <
                 entityType,
                 entityVersion,
                 primary,
-                encodedKey,
+                keyForm(encodedKey),
               ),
             })
             const mainResult = yield* client.getItem({
@@ -5954,12 +5998,13 @@ export const bind = <
               >
               // Snapshots / tombstones live in the same partition under a
               // rewritten SK — their SK cannot be recomposed from the record.
+              const decodedKeyForm = keyFormFor(entity, decoded)
               const liveSk = KeyComposer.composeSk(
                 boundSchema,
                 entity.entityType,
                 boundEntityVersion,
                 primary,
-                decoded,
+                decodedKeyForm,
               )
               if (storedSk !== liveSk) return false
 
@@ -5969,7 +6014,7 @@ export const bind = <
                   boundSchema,
                   entity.entityType,
                   definition,
-                  decoded,
+                  decodedKeyForm,
                 )
                 if (partition === undefined) continue
                 const text = deriveSourceText(definition, decoded)
@@ -6115,19 +6160,6 @@ export const bind = <
         }
         const schemaRef = entityInternals._schema
         const entityTypeRef = entityInternals.entityType
-        // Same source as the write path — see the `make()`-level encoder.
-        const compositeKeyForm = makeCompositeKeyForm(
-          entityInternals.schemas?.inputSchema ?? entityInternals.model,
-          (attr, value) => {
-            throw new Error(
-              `[EDD-9050] Time-series orderBy attribute "${attr}" on entity "${entityTypeRef}" ` +
-                `could not be encoded to its stored form. The attribute's schema carries an ` +
-                `encoding transformation, so the event sort key holds the ENCODED value, but ` +
-                `${JSON.stringify(String(value))} encodes under neither encode nor ` +
-                `decode->encode. Supply a value of the attribute's own type.`,
-            )
-          },
-        )
 
         // composeSkCondition: rewrite user's .where() values by prefixing
         // with `<currentSk>#e#` and applying serialisation + casing to the
@@ -6144,15 +6176,17 @@ export const bind = <
             entityTypeRef,
             1,
             primary,
-            toCompositeKeyRecord(compositeKeyForm, key as globalThis.Record<string, unknown>),
+            keyFormFor(entityInternals, key as globalThis.Record<string, unknown>),
           )
           const prefix = KeyComposer.composeEventSkPrefix(currentSk, schemaRef.casing)
-          // Encode first: the event SK is composed from the ENCODED orderBy
-          // value (`Entity.append` composes from `serialisedInput`), so a
-          // transformed orderBy composite must take the same route here.
+          // Key form first: the event SK is composed from the key form of the
+          // orderBy value (`Entity.append` composes from `serialisedInput`), so
+          // a transformed orderBy composite must take the same route here.
           const rewrite = (v: unknown) =>
             `${prefix}${DynamoSchema.applyCasing(
-              KeyComposer.serializeValue(orderBy === undefined ? v : compositeKeyForm(orderBy, v)),
+              KeyComposer.serializeValue(
+                orderBy === undefined ? v : keyFormFor(entityInternals, { [orderBy]: v })[orderBy],
+              ),
               schemaRef.casing,
             )}`
           if ("eq" in cond) return { eq: rewrite(cond.eq) }

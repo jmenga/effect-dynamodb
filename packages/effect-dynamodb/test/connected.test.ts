@@ -8970,3 +8970,230 @@ describeConnected("composite key form — mixed-width ordering", () => {
 // [\"txn\"]") on the real write path, before any key is composed. That is a
 // pre-existing aggregate encode defect, independent of this rule, and is
 // reported separately.
+
+// ---------------------------------------------------------------------------
+// S1 — key-form must hold across EVERY composition site, not just `put`.
+//
+// `composeAllKeys` (put) normalised while `composeGsiKeysForUpdatePolicyAware`
+// (update) did not, so an `update()` rewrote a padded `gsi1pk` back to its
+// unpadded form and evicted the row from its own GSI. Mixed widths (5/42/100)
+// throughout — equal-width values hide exactly this.
+//
+// Covers the canonical GSI-composite shapes from CLAUDE.md against a
+// transformed composite: multi-writer, PK-composites-only, hierarchical, hole
+// pattern, all-mutable, and empty-composite half.
+// ---------------------------------------------------------------------------
+
+const s1Schema = DynamoSchema.make({ name: "s1", version: 1 })
+const s1TableName = `s1-test-${Date.now()}`
+const S1_VALUES = [5, 42, 100] as const
+
+class S1Row extends Schema.Class<S1Row>("S1Row")({
+  acct: Schema.String,
+  txn: Schema.BigIntFromString,
+  region: Schema.optional(Schema.String),
+  site: Schema.optional(Schema.String),
+  status: Schema.optional(Schema.String),
+  binding: Schema.optional(Schema.String),
+  note: Schema.String,
+}) {}
+
+const s1Indexes = {
+  // Shape 5 — all composites mutable, and the S1 reproducer.
+  byTxn: {
+    name: "gsi1",
+    pk: { field: "gsi1pk", composite: ["txn"] },
+    sk: { field: "gsi1sk", composite: ["acct"] },
+  },
+  // Shape 2 — PK-composites-only (both halves are primary key composites).
+  byAcctTxn: {
+    name: "gsi2",
+    pk: { field: "gsi2pk", composite: ["acct"] },
+    sk: { field: "gsi2sk", composite: ["txn"] },
+  },
+  // Shape 3 — hierarchical, with the transformed composite as the leaf.
+  byHier: {
+    name: "gsi3",
+    pk: { field: "gsi3pk", composite: ["acct"] },
+    sk: { field: "gsi3sk", composite: ["region", "site", "txn"] },
+  },
+  // Shape 1 + 4 — multi-writer / hole pattern: an optional leading composite
+  // with the transformed composite trailing it.
+  byStatus: {
+    name: "gsi4",
+    pk: { field: "gsi4pk", composite: ["acct"] },
+    sk: { field: "gsi4sk", composite: ["status", "txn"] },
+  },
+  // Shape 6 — empty-composite half, transformed composite on the PK half.
+  byBinding: {
+    name: "gsi5",
+    pk: { field: "gsi5pk", composite: ["txn"] },
+    sk: { field: "gsi5sk", composite: [] },
+  },
+} as const
+
+const S1Rows = Entity.make({
+  model: S1Row,
+  entityType: "S1Row",
+  primaryKey: {
+    pk: { field: "pk", composite: ["acct"] },
+    sk: { field: "sk", composite: ["txn"] },
+  },
+  indexes: s1Indexes,
+})
+
+// Retain + soft-delete variant, for the lifecycle round-trips.
+const S1Retained = Entity.make({
+  model: S1Row,
+  entityType: "S1Retained",
+  primaryKey: {
+    pk: { field: "pk", composite: ["acct"] },
+    sk: { field: "sk", composite: ["txn"] },
+  },
+  indexes: { byTxn: s1Indexes.byTxn },
+  versioned: { retain: true },
+  softDelete: true,
+})
+
+const S1Table = Table.make({ schema: s1Schema, entities: { S1Rows, S1Retained } })
+const S1Layer = Layer.mergeAll(ClientLayer, S1Table.layer({ name: s1TableName }))
+const provideS1 = Effect.provide(S1Layer)
+const s1Entities = { S1Rows, S1Retained }
+const s1Tables = { S1Table }
+
+describeConnected("key form holds across every composition site (S1)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: s1TableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(S1Table),
+        })
+      }).pipe(provideS1, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: s1TableName })
+      }).pipe(
+        provideS1,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("S1: update() must not evict the row from its own GSI", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: s1Entities, tables: s1Tables })
+      for (const n of S1_VALUES) {
+        yield* db.entities.S1Rows.put({ acct: "a1", txn: BigInt(n), note: "a" })
+
+        const before = yield* db.entities.S1Rows.byTxn({ txn: BigInt(n) }).collect()
+        expect(before.map((r) => r.txn)).toEqual([BigInt(n)])
+
+        yield* db.entities.S1Rows.update({ acct: "a1", txn: BigInt(n) }).set({ note: "b" })
+
+        // Pre-fix: 0 rows — the update rewrote gsi1pk unpadded.
+        const after = yield* db.entities.S1Rows.byTxn({ txn: BigInt(n) }).collect()
+        expect(after.map((r) => r.txn)).toEqual([BigInt(n)])
+        expect(after[0]!.note).toBe("b")
+      }
+    }).pipe(provideS1),
+  )
+
+  it.effect("every canonical GSI shape survives an update", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: s1Entities, tables: s1Tables })
+      yield* db.entities.S1Rows.put({
+        acct: "a2",
+        txn: 42n,
+        region: "apac",
+        site: "syd",
+        status: "active",
+        binding: "b-1",
+        note: "a",
+      })
+      yield* db.entities.S1Rows.update({ acct: "a2", txn: 42n }).set({ note: "b" })
+
+      // Shape 5 / S1, shape 2, shape 3, shapes 1+4, shape 6.
+      expect(
+        (yield* db.entities.S1Rows.byTxn({ txn: 42n }).collect()).some((r) => r.acct === "a2"),
+      ).toBe(true)
+      expect((yield* db.entities.S1Rows.byAcctTxn({ acct: "a2", txn: 42n }).collect()).length).toBe(
+        1,
+      )
+      expect(
+        (yield* db.entities.S1Rows.byHier({ acct: "a2", region: "apac", site: "syd" }).collect())
+          .length,
+      ).toBe(1)
+      expect(
+        (yield* db.entities.S1Rows.byStatus({ acct: "a2", status: "active" }).collect()).length,
+      ).toBe(1)
+      // gsi5 is keyed on `txn` alone, so other accounts share the partition.
+      expect(
+        (yield* db.entities.S1Rows.byBinding({ txn: 42n }).collect()).some((r) => r.acct === "a2"),
+      ).toBe(true)
+    }).pipe(provideS1),
+  )
+
+  it.effect("hole pattern: an absent leading composite does not corrupt the trailing one", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: s1Entities, tables: s1Tables })
+      // `status` absent → byStatus cannot compose; byTxn must still hold.
+      yield* db.entities.S1Rows.put({ acct: "a3", txn: 100n, note: "a" })
+      yield* db.entities.S1Rows.update({ acct: "a3", txn: 100n }).set({ note: "b" })
+      expect(
+        (yield* db.entities.S1Rows.byTxn({ txn: 100n }).collect()).some((r) => r.acct === "a3"),
+      ).toBe(true)
+    }).pipe(provideS1),
+  )
+
+  it.effect("retain-enabled update keeps the GSI key, and versions round-trip", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: s1Entities, tables: s1Tables })
+      yield* db.entities.S1Retained.put({ acct: "r1", txn: 42n, note: "a" })
+      yield* db.entities.S1Retained.update({ acct: "r1", txn: 42n }).set({ note: "b" })
+
+      const found = yield* db.entities.S1Retained.byTxn({ txn: 42n }).collect()
+      expect(found.some((r) => r.acct === "r1")).toBe(true)
+
+      const versions = yield* db.entities.S1Retained.versions({ acct: "r1", txn: 42n }).collect()
+      expect(versions.length).toBeGreaterThan(0)
+
+      // getVersion — pre-fix returned ItemNotFound for a row that exists.
+      const v1 = yield* db.entities.S1Retained.getVersion({ acct: "r1", txn: 42n }, 1)
+      expect(v1.txn).toBe(42n)
+    }).pipe(provideS1),
+  )
+
+  it.effect("soft-delete get / restore / purge round-trip on a transformed composite", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: s1Entities, tables: s1Tables })
+      yield* db.entities.S1Retained.put({ acct: "r2", txn: 100n, note: "a" })
+      yield* db.entities.S1Retained.delete({ acct: "r2", txn: 100n })
+
+      // deleted.get — pre-fix ItemNotFound while deleted.list found the row.
+      const tomb = yield* db.entities.S1Retained.deleted.get({ acct: "r2", txn: 100n })
+      expect(tomb.txn).toBe(100n)
+      const listed = yield* db.entities.S1Retained.deleted.list({ acct: "r2", txn: 100n }).collect()
+      expect(listed.length).toBeGreaterThan(0)
+
+      const restored = yield* db.entities.S1Retained.restore({ acct: "r2", txn: 100n })
+      expect(restored.txn).toBe(100n)
+      expect((yield* db.entities.S1Retained.byTxn({ txn: 100n }).collect()).length).toBeGreaterThan(
+        0,
+      )
+
+      // purge — pre-fix reported success and deleted nothing.
+      yield* db.entities.S1Retained.purge({ acct: "r2", txn: 100n })
+      const left = yield* db.entities.S1Retained.primary({ acct: "r2", txn: 100n }).collect()
+      expect(left).toEqual([])
+    }).pipe(provideS1),
+  )
+})
