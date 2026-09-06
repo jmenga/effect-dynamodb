@@ -97,9 +97,11 @@ Supplying **all** of them is still a prefix match, not an exact one: the stored 
 
 `.where()` adds a `KeyConditionExpression` against a remaining sort key composite — DynamoDB evaluates it on the index server-side, so it **does** reduce read capacity. Use it whenever the condition is on a sort-key composite the accessor hasn't already pinned. Operators: `eq`, `lt`, `lte`, `gt`, `gte`, `between`, `beginsWith`.
 
-The operand you pass is a **composite attribute value**, not a raw sort key. The library composes it into the same `$schema#v1#entity#<name>_<value>` shape the write path stores — same serialization, same casing — so `gte(t.createdAt, "2025-02-10")` compares like-for-like against the stored key.
+The operand you pass is a **composite attribute value**, not a raw sort key. The library runs it through the same pipeline the write path used — the composite's own codec, then serialization, then casing — and drops the result into the same `$schema#v1#entity#<name>_<value>` shape, so `gte(t.createdAt, "2025-02-10")` compares like-for-like against the stored key.
 
 That includes the composite's **type**. A composite typed `number`, `bigint`, `boolean`, `Date` or `DateTime` takes a value of that type, not a string, because the write path zero-pads numbers (16 digits) and bigints (38 digits) and formats dates as ISO strings. Passing `"42"` for a numeric composite is a compile error rather than a query that silently matches nothing.
+
+It also covers composites whose schema **transforms** between its domain type and what DynamoDB stores. `Schema.BigIntFromString` has a `bigint` domain type and a string wire form, so a `420n` composite is stored as `txn_420`; `.where((t, { eq }) => eq(t.txn, 420n))` encodes the operand the same way and finds it. The same encoding applies to composites supplied to the accessor itself and to `.get()` / `.update()` / `.delete()` keys. A value that cannot be encoded at all — a prefix string against a `bigint` composite, say — is refused with `EDD-9048` rather than silently compared against nothing.
 
 ```typescript region="sk-conditions" example="guide-queries.ts"
 // byProject SK composites: ["status", "createdAt"].

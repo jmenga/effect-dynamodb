@@ -187,3 +187,21 @@ export const firstTypeParameterAst = (ast: SchemaAST.AST): SchemaAST.AST | undef
   if (!params || params.length === 0) return undefined
   return params[0]
 }
+
+/**
+ * Whether a schema carries an encoding transformation — i.e. its Type form and
+ * its Encoded (wire) form can differ.
+ *
+ * `SchemaAST.Base.encoding` is a documented public field: "When `undefined`,
+ * the node has no encoding transformation (type and encoded forms are
+ * identical)." That contract is what makes it safe to skip encoding entirely
+ * for plain `String` / `Number` / `Boolean` / `Literals` composites — which
+ * matters because an open sort key bound (`gte(t.status, "d")`) is deliberately
+ * NOT a valid value of the composite and would fail an encode that a
+ * transformed composite must pass.
+ *
+ * Covered by the `SchemaAST.test.ts` canary so a future Effect release that
+ * reshapes `encoding` surfaces here rather than as silent mis-composition.
+ */
+export const hasEncodingTransformation = (schema: Schema.Top): boolean =>
+  schema.ast.encoding !== undefined

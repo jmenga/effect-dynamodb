@@ -33,6 +33,10 @@ import {
   UniqueConstraintViolation,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
+import {
+  encodeCompositeRecord,
+  makeCompositeEncoder,
+} from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
@@ -51,7 +55,11 @@ import {
   makeBoundPut,
   makeBoundUpdate,
 } from "./internal/BoundCrud.js"
-import { type BoundQueryConfig, BoundQueryImpl } from "./internal/BoundQuery.js"
+import {
+  type BoundQueryConfig,
+  BoundQueryImpl,
+  type RawSortKeyCondition,
+} from "./internal/BoundQuery.js"
 import {
   compileExpr,
   createConditionOps,
@@ -1605,11 +1613,44 @@ const makeImpl = <
   // Helpers
   // ---------------------------------------------------------------------------
 
+  // Read-path composite encoder — see `internal/CompositeCodec.ts`. The write
+  // path composes keys from the encoded record (`put` encodes, THEN composes);
+  // key and query inputs arrive as decoded model values, so they are encoded
+  // through the model's own field codecs before composition. Encoding is
+  // idempotent via the `decode -> encode` fallback, so callers that already
+  // hold an encoded record are unaffected.
+  // Source: `inputSchema`, the EXACT schema `put` encodes through before
+  // `composeAllKeys`. The raw model is not equivalent — entity derivation
+  // substitutes date/Redacted fields with their wire transforms, so reading
+  // fields off the model would miss encodings the write path applies.
+  const encodeComposite = makeCompositeEncoder(
+    schemas.inputSchema as unknown as Schema.Top,
+    (attr, value) => {
+      throw new Error(
+        `[EDD-9048] Composite "${attr}" on entity "${entityType}" could not be encoded to its ` +
+          `stored form. The attribute's schema carries an encoding transformation, so the ` +
+          `stored key holds the ENCODED value, but ${JSON.stringify(String(value))} encodes ` +
+          `under neither encode nor decode->encode. Supply a value of the attribute's own type.`,
+      )
+    },
+  )
+
   const composePrimaryKey = (record: globalThis.Record<string, unknown>) => {
     const primary = config.indexes.primary
+    // `get` / `update` / `delete` decode their key input to the model's Type
+    // side, but the stored key was composed from the ENCODED side. Encode here
+    // so a transformed primary-key composite resolves to the key that was
+    // actually written instead of silently missing the item.
+    const encoded = encodeCompositeRecord(encodeComposite, record)
     return {
-      [primary.pk.field]: KeyComposer.composePk(schema, entityType, primary, record),
-      [primary.sk.field]: KeyComposer.composeSk(schema, entityType, entityVersion, primary, record),
+      [primary.pk.field]: KeyComposer.composePk(schema, entityType, primary, encoded),
+      [primary.sk.field]: KeyComposer.composeSk(
+        schema,
+        entityType,
+        entityVersion,
+        primary,
+        encoded,
+      ),
     }
   }
 
@@ -5001,7 +5042,11 @@ const makeImpl = <
   for (const indexName of Object.keys(config.indexes)) {
     if (indexName === "primary") continue
     const indexDef = config.indexes[indexName]!
-    queryNamespace[indexName] = (pk: globalThis.Record<string, unknown>) => {
+    queryNamespace[indexName] = (rawPk: globalThis.Record<string, unknown>) => {
+      // Encode composites before composing — the write path composes from the
+      // ENCODED record, so a transformed composite must be encoded here too or
+      // the two sides produce different key strings (see `CompositeCodec`).
+      const pk = encodeCompositeRecord(encodeComposite, rawPk)
       const pkValue = KeyComposer.composePk(schema, entityType, indexDef, pk)
       const hasSkComposites = indexDef.sk.composite.some((attr) => pk[attr] !== undefined)
       const query = Query.make({
@@ -6088,15 +6133,30 @@ export const bind = <
         const entityInternals = entity as unknown as {
           readonly _schema: DynamoSchema.DynamoSchema
           readonly entityType: string
+          readonly model: Schema.Top
+          readonly schemas?: { readonly inputSchema?: Schema.Top | undefined }
         }
         const schemaRef = entityInternals._schema
         const entityTypeRef = entityInternals.entityType
+        // Same source as the write path — see the `make()`-level encoder.
+        const encodeComposite = makeCompositeEncoder(
+          entityInternals.schemas?.inputSchema ?? entityInternals.model,
+          (attr, value) => {
+            throw new Error(
+              `[EDD-9048] Time-series orderBy attribute "${attr}" on entity "${entityTypeRef}" ` +
+                `could not be encoded to its stored form. The attribute's schema carries an ` +
+                `encoding transformation, so the event sort key holds the ENCODED value, but ` +
+                `${JSON.stringify(String(value))} encodes under neither encode nor ` +
+                `decode->encode. Supply a value of the attribute's own type.`,
+            )
+          },
+        )
 
         // composeSkCondition: rewrite user's .where() values by prefixing
         // with `<currentSk>#e#` and applying serialisation + casing to the
         // user-supplied orderBy value.
         const primary = entity.indexes.primary!
-        const composeSkCondition = (cond: Query.SortKeyCondition): Query.SortKeyCondition => {
+        const composeSkCondition = (cond: RawSortKeyCondition): Query.SortKeyCondition => {
           // We need the `currentSk` + prefix. The user's `key` lets us derive
           // `currentSk` via the same primary SK composer used by `history()`.
           const currentSk = KeyComposer.composeSk(
@@ -6107,8 +6167,14 @@ export const bind = <
             key as globalThis.Record<string, unknown>,
           )
           const prefix = KeyComposer.composeEventSkPrefix(currentSk, schemaRef.casing)
+          // Encode first: the event SK is composed from the ENCODED orderBy
+          // value (`Entity.append` composes from `serialisedInput`), so a
+          // transformed orderBy composite must take the same route here.
           const rewrite = (v: unknown) =>
-            `${prefix}${DynamoSchema.applyCasing(KeyComposer.serializeValue(v), schemaRef.casing)}`
+            `${prefix}${DynamoSchema.applyCasing(
+              KeyComposer.serializeValue(orderBy === undefined ? v : encodeComposite(orderBy, v)),
+              schemaRef.casing,
+            )}`
           if ("eq" in cond) return { eq: rewrite(cond.eq) }
           if ("lt" in cond) return { lt: rewrite(cond.lt) }
           if ("lte" in cond) return { lte: rewrite(cond.lte) }

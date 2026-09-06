@@ -8502,3 +8502,187 @@ describeConnected("sort key prefix + typed operands (closes #114, closes #115)",
     }).pipe(provideSkp),
   )
 })
+
+// ---------------------------------------------------------------------------
+// Transformed composites — the encoded/decoded gap
+//
+// Key composition runs on the ENCODED record (`Entity.put` encodes, THEN calls
+// `composeAllKeys`), while accessors, `.where()` and key inputs carry DECODED
+// model values. For a composite with a `decodeTo` transformation the two forms
+// differ, so composing a decoded value produced a different string from the one
+// that was stored — the query matched nothing, or everything.
+//
+// `Schema.BigIntFromString` is the fixture: Type is `bigint`, Encoded is a
+// string, so the stored sort key holds `txn_420` and NOT the 38-digit padding
+// `serializeValue(420n)` would produce. Values are chosen equal-width so the
+// assertions do not depend on lexicographic-vs-numeric ordering.
+// ---------------------------------------------------------------------------
+
+const encSchema = DynamoSchema.make({ name: "enc", version: 1 })
+const encTableName = `enc-test-${Date.now()}`
+
+class Ledger extends Schema.Class<Ledger>("Ledger")({
+  bookId: Schema.String,
+  txn: Schema.BigIntFromString,
+  label: Schema.String,
+}) {}
+
+const Ledgers = Entity.make({
+  model: Ledger,
+  entityType: "Ledger",
+  primaryKey: {
+    pk: { field: "pk", composite: ["bookId"] },
+    sk: { field: "sk", composite: ["txn"] },
+  },
+  indexes: {
+    byBook: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["bookId"] },
+      sk: { field: "gsi1sk", composite: ["txn", "label"] },
+    },
+  },
+})
+
+const EncTable = Table.make({ schema: encSchema, entities: { Ledgers } })
+const EncLayer = Layer.mergeAll(ClientLayer, EncTable.layer({ name: encTableName }))
+const provideEnc = Effect.provide(EncLayer)
+const encEntities = { Ledgers }
+const encTables = { EncTable }
+
+describeConnected("transformed sort key composites — encoded/decoded gap", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: encTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(EncTable),
+        })
+        const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
+        for (const txn of [100n, 420n, 999n]) {
+          yield* db.entities.Ledgers.put({ bookId: "b1", txn, label: "x" })
+        }
+      }).pipe(provideEnc, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: encTableName })
+      }).pipe(
+        provideEnc,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("the stored key holds the ENCODED composite, not the serialised decoded one", () =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const raw = yield* client.scan({ TableName: encTableName })
+      const sks = (raw.Items ?? []).map((i) => (i.sk as { S?: string } | undefined)?.S ?? "").sort()
+      expect(sks).toEqual([
+        "$enc#v1#ledger#txn_100",
+        "$enc#v1#ledger#txn_420",
+        "$enc#v1#ledger#txn_999",
+      ])
+      // Not the 38-digit padded form.
+      expect(sks.every((s) => !s.includes("000000"))).toBe(true)
+    }).pipe(provideEnc),
+  )
+
+  it.effect(".where() operand matches the stored key on the primary accessor", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
+      const q = () => db.entities.Ledgers.primary({ bookId: "b1" })
+
+      const all = yield* q().collect()
+      expect(all.map((r) => r.txn)).toEqual([100n, 420n, 999n])
+
+      // Pre-fix: 0 rows — the padded operand named a key that does not exist.
+      const eq = yield* q()
+        .where((t, ops) => ops.eq(t.txn, 420n))
+        .collect()
+      expect(eq.map((r) => r.txn)).toEqual([420n])
+
+      // Pre-fix: 3 rows — the padded operand sorted below every stored key.
+      const gte = yield* q()
+        .where((t, ops) => ops.gte(t.txn, 420n))
+        .collect()
+      expect(gte.map((r) => r.txn)).toEqual([420n, 999n])
+
+      const between = yield* q()
+        .where((t, ops) => ops.between(t.txn, 100n, 420n))
+        .collect()
+      expect(between.map((r) => r.txn)).toEqual([100n, 420n])
+    }).pipe(provideEnc),
+  )
+
+  it.effect(".where() operand matches the stored key on a named GSI", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
+      const gte = yield* db.entities.Ledgers.byBook({ bookId: "b1" })
+        .where((t, ops) => ops.gte(t.txn, 420n))
+        .collect()
+      expect(gte.map((r) => r.txn)).toEqual([420n, 999n])
+
+      // Pinned transformed composite + a condition on the composite after it.
+      const pinned = yield* db.entities.Ledgers.byBook({ bookId: "b1", txn: 420n })
+        .where((t, ops) => ops.eq(t.label, "x"))
+        .collect()
+      expect(pinned.map((r) => r.txn)).toEqual([420n])
+    }).pipe(provideEnc),
+  )
+
+  it.effect("accessor composites are encoded too", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
+      // Pre-fix: 0 rows on both.
+      const gsi = yield* db.entities.Ledgers.byBook({ bookId: "b1", txn: 420n }).collect()
+      expect(gsi.map((r) => r.txn)).toEqual([420n])
+
+      const pk = yield* db.entities.Ledgers.primary({ bookId: "b1", txn: 420n }).collect()
+      expect(pk.map((r) => r.txn)).toEqual([420n])
+    }).pipe(provideEnc),
+  )
+
+  it.effect("primary-key composition on get/delete is encoded as well", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
+      // `get` decodes its key input to the Type side; the stored key came from
+      // the Encoded side. Pre-fix this returned ItemNotFound for a row that
+      // exists.
+      const got = yield* db.entities.Ledgers.get({ bookId: "b1", txn: "999" } as never)
+      expect(got.txn).toBe(999n)
+
+      yield* db.entities.Ledgers.delete({ bookId: "b1", txn: "999" } as never)
+      const left = yield* db.entities.Ledgers.primary({ bookId: "b1" }).collect()
+      expect(left.map((r) => r.txn)).toEqual([100n, 420n])
+
+      // Restore the fixture for any later test in this block.
+      yield* db.entities.Ledgers.put({ bookId: "b1", txn: 999n, label: "x" })
+    }).pipe(provideEnc),
+  )
+
+  it.effect("an operand that cannot be encoded is refused (EDD-9048)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
+      expect(() =>
+        (
+          db.entities.Ledgers.primary({ bookId: "b1" }) as never as {
+            where: (fn: (t: never, ops: never) => unknown) => unknown
+          }
+        ).where((t: never, ops: never) =>
+          (ops as { eq: (f: unknown, v: unknown) => unknown }).eq(
+            (t as unknown as { txn: unknown }).txn,
+            "not-a-number",
+          ),
+        ),
+      ).toThrow(/EDD-9048/)
+    }).pipe(provideEnc),
+  )
+})

@@ -1468,14 +1468,95 @@ describe("DynamoClient", () => {
         }),
       )
 
-      it.effect("bigint composite is zero-padded to 38 digits", () =>
+      it.effect("bigint composite encodes to the form the write path stores", () =>
         Effect.gen(function* () {
+          // `big` is `Schema.BigIntFromString` — a genuine `decodeTo` whose
+          // Encoded form is a string. The write path composes keys from the
+          // ENCODED record, so the stored key holds "42", NOT the 38-digit
+          // padding `serializeValue(42n)` would produce. The operand takes the
+          // same encode step, so both sides agree.
           const input = yield* capture((db) =>
             db.entities.Samples.byBig({ deviceId: "d1" })
               .where((t, { lte }) => lte(t.big, 42n))
               .collect(),
           )
-          expect(skValue(input)).toBe(`$skprefix#v1#sample#big_${"42".padStart(38, "0")}`)
+          expect(skValue(input)).toBe("$skprefix#v1#sample#big_42")
+          expect(skValue(input)).not.toContain("42".padStart(38, "0"))
+        }),
+      )
+
+      it.effect("an UNtransformed bigint composite keeps the 38-digit padding", () =>
+        Effect.gen(function* () {
+          // Plain `Schema.BigInt` has no encoding transformation, so both the
+          // write path and the operand fall through to `serializeValue`, which
+          // pads. (Such an entity cannot be read back from DynamoDB — the SDK
+          // unmarshalls `N` to a JS number — but the key composition on both
+          // sides still agrees.)
+          class Counter extends Schema.Class<Counter>("Counter")({
+            counterId: Schema.String,
+            tick: Schema.BigInt,
+          }) {}
+          const Counters = Entity.make({
+            model: Counter,
+            entityType: "Counter",
+            primaryKey: {
+              pk: { field: "pk", composite: ["counterId"] },
+              sk: { field: "sk", composite: ["tick"] },
+            },
+          })
+          const CounterTable = Table.make({ schema: AppSchema, entities: { Counters } })
+          const captured: Array<any> = []
+          yield* Effect.gen(function* () {
+            const db = yield* DynamoClient.make({
+              entities: { Counters },
+              tables: { CounterTable },
+            })
+            yield* db.entities.Counters.primary({ counterId: "c1" })
+              .where((t, { gte }) => gte(t.tick, 42n))
+              .collect()
+          }).pipe(
+            Effect.provide(
+              Layer.merge(
+                makeQueryCapturingClient(captured),
+                CounterTable.layer({ name: "counter-table" }),
+              ),
+            ),
+          )
+          expect(skValue(captured[0])).toBe(`$skprefix#v1#counter#tick_${"42".padStart(38, "0")}`)
+        }),
+      )
+
+      it.effect("refuses an operand that cannot be encoded (EDD-9048)", () =>
+        Effect.gen(function* () {
+          const ClientLayer = makeQueryCapturingClient([])
+          const TableLayer = SkTable.layer({ name: "sk-table" })
+          yield* Effect.gen(function* () {
+            const db = yield* DynamoClient.make({
+              entities: { Tasks, Notes, Samples },
+              tables: { SkTable },
+            })
+            expect(() =>
+              (db.entities.Samples.byBig({ deviceId: "d1" }) as any).where((t: any, ops: any) =>
+                ops.eq(t.big, "not-a-number"),
+              ),
+            ).toThrow(/EDD-9048.*big/s)
+          }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+        }),
+      )
+
+      it.effect("refuses an accessor composite that cannot be encoded (EDD-9048)", () =>
+        Effect.gen(function* () {
+          const ClientLayer = makeQueryCapturingClient([])
+          const TableLayer = SkTable.layer({ name: "sk-table" })
+          yield* Effect.gen(function* () {
+            const db = yield* DynamoClient.make({
+              entities: { Tasks, Notes, Samples },
+              tables: { SkTable },
+            })
+            expect(() =>
+              (db.entities.Samples.byBig as any)({ deviceId: "d1", big: "not-a-number" }),
+            ).toThrow(/EDD-9048.*big/s)
+          }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
         }),
       )
 

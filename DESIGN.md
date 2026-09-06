@@ -658,6 +658,32 @@ Given `DynamoSchema({ name: "myapp", version: 1, casing: "lowercase" })` and `en
 | `boolean` | `"true"` / `"false"` |
 | Branded string | Underlying string value |
 
+### Composite encoding on the read path
+
+Key composition runs on the **encoded** record. `Entity.put` encodes the input
+through `inputSchema` and only then calls `composeAllKeys`, so the stored key
+holds the wire value of every composite — a `Schema.BigIntFromString` composite
+`420n` is stored as `txn_420`, not as the zero-padded form
+`serializeValue(420n)` would produce.
+
+The read path therefore has to encode too. Query accessors and `.where()`
+receive **decoded** model values (that is what the Type side declares), so the
+composite is passed through the model field's own codec before
+`KeyComposer` sees it — one pipeline shared with the write path, rather than
+two that merely agree for common types.
+
+Three cases, per attribute (`internal/CompositeCodec.ts`):
+
+| Case | Behaviour |
+|------|-----------|
+| Attribute is not a model field (ref-derived `<ref>Id`) | Pass through — already wire-shaped. |
+| Field schema has **no** encoding transformation (`ast.encoding === undefined`, documented as "type and encoded forms are identical") | Pass through, without attempting an encode. This is what keeps an open bound like `gte(t.status, "d")` on a `Schema.Literals` composite working — a bound is deliberately not a valid value. |
+| Field schema **has** an encoding transformation | Encode, mirroring `put`'s `encode` then `decode → encode` fallback. If neither succeeds the value cannot be placed in a key: throw **EDD-9048** naming the attribute, rather than compose a string that silently matches nothing. |
+
+Types follow the same rule: a `.where()` operand takes the composite's own
+Type-side type (`number`, `Date`, `DateTime`, `bigint`), and string-typed
+composites widen to `string` so prefixes and open bounds still typecheck.
+
 ### Isolated vs Clustered Key Prefixes
 
 **Isolated:**
@@ -2474,6 +2500,27 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `CascadePartialFailure` | Cascade update partially failed (eventual mode) |
 | `EmbeddingError` | `Embedder.embed` failed, or no `Embedder` was provided for an entity with vector indexes |
 | `VectorIndexBackfilling` | `SearchVectors` called while the vector index is still backfilling |
+
+### Diagnostic Code Registry
+
+`EDD-9xxx` codes are thrown (not `Data.TaggedError`s) for **authoring** mistakes
+— a model, index or query the library cannot serve — so they surface at
+`Entity.make()` / query-build time rather than as a runtime failure channel.
+
+Codes are allocated **from this table**, never by grepping the source for the
+highest number in use: two branches doing that independently collide, and the
+collision only shows up when both merge. Claim the next free row here first,
+then use it.
+
+| Code | Meaning |
+|------|---------|
+| EDD-9045 | `.where()` called on an index whose sort key has no composites — nothing to constrain. |
+| EDD-9046 | Strict `lt` on the last sort key composite while the accessor pinned an earlier one. `begins_with(prefix) AND sk < value` needs two sort key conditions; DynamoDB allows one, `BETWEEN` is inclusive at both ends, and a `FilterExpression` may not reference a key attribute. Use `between` or `lte`. |
+| EDD-9048 | A sort key composite value could not be encoded to its stored form. The composite's schema carries an encoding transformation (the stored key holds the **encoded** value), and the supplied value encodes under neither `encode` nor `decode → encode`. See §7 "Composite encoding on the read path". |
+
+Codes below EDD-9045 are documented inline at their throw sites and in the
+sections they belong to (§5 make-time validation, §7 key composition, §14
+vector indexes).
 
 ### Error Type Narrowing
 

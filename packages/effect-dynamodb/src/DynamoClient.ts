@@ -119,6 +119,10 @@ import {
   ThrottlingError,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
+import {
+  encodeCompositeRecord,
+  makeCompositeEncoder,
+} from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
 import type {
   EntityKeyType,
@@ -136,7 +140,11 @@ import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
 import { bind as aggregateBind } from "./Aggregate.js"
 import type { BoundEntity, Entity as EntityType } from "./Entity.js"
 import { bind as entityBind, fromDefinition as entityFromDefinition } from "./Entity.js"
-import { type BoundQueryConfig, BoundQueryImpl } from "./internal/BoundQuery.js"
+import {
+  type BoundQueryConfig,
+  BoundQueryImpl,
+  type RawSortKeyCondition,
+} from "./internal/BoundQuery.js"
 import {
   type BoundVectorQuery,
   type BoundVectorQueryConfig,
@@ -844,6 +852,10 @@ interface EntityLike {
   readonly _decodeRecord: (raw: Record<string, unknown>) => Effect.Effect<any, any>
   readonly schemas: {
     readonly recordSchema: Schema.Codec<any>
+    /** The schema `put` encodes through — the source of truth for composite
+     * encoding on the read path. Optional so pure schema-package definitions
+     * promoted at bind time still satisfy the shape. */
+    readonly inputSchema?: Schema.Top | undefined
   }
 }
 
@@ -951,8 +963,29 @@ const makeFromConfig = (config: {
       _indexName: string,
       indexDef: IndexDefinition,
     ) => {
-      return (composites: Record<string, unknown>) => {
-        validateQueryComposites(_indexName, indexDef, composites)
+      // Key composition runs on the ENCODED record on the write path
+      // (`Entity.put` encodes, then composes), while accessors and `.where()`
+      // hand us DECODED model values. Put both on one pipeline by encoding the
+      // composites here — otherwise a transformed composite (e.g.
+      // `Schema.BigIntFromString`) composes a different string from the one
+      // that was stored, and the query silently matches nothing.
+      // Source: `inputSchema`, the EXACT schema `put` encodes through before
+      // composing keys. The raw model is not equivalent — entity derivation
+      // substitutes date/Redacted fields with their wire transforms.
+      const encoderSource = entityLike.schemas.inputSchema ?? entityLike.model
+      const encodeComposite = makeCompositeEncoder(encoderSource, (attr, value) => {
+        throw new Error(
+          `[EDD-9048] Composite "${attr}" on index "${_indexName}" of entity ` +
+            `"${entityLike.entityType}" could not be encoded to its stored form. The ` +
+            `attribute's schema carries an encoding transformation, so the stored key holds ` +
+            `the ENCODED value, but ${JSON.stringify(String(value))} encodes under neither ` +
+            `encode nor decode->encode. Supply a value of the attribute's own type.`,
+        )
+      })
+
+      return (rawComposites: Record<string, unknown>) => {
+        validateQueryComposites(_indexName, indexDef, rawComposites)
+        const composites = encodeCompositeRecord(encodeComposite, rawComposites)
         const pkValue = KeyComposer.composePk(
           entityLike._schema,
           entityLike.entityType,
@@ -1005,7 +1038,7 @@ const makeFromConfig = (config: {
         // and the schema casing.
         const skComposites = indexDef.sk.composite
         const composeSkCondition = (
-          condition: Query.SortKeyCondition,
+          condition: RawSortKeyCondition,
           field: string | undefined,
         ): Query.SortKeyCondition => {
           if (skComposites.length === 0) {
@@ -1050,7 +1083,11 @@ const makeFromConfig = (config: {
           for (let i = 0; i < targetIndex; i++) {
             pinnedRecord[skComposites[i]!] = composites[skComposites[i]!]
           }
-          const compose = (value: string): string =>
+          // Encode the operand exactly as the accessor composites (and the
+          // write path) are encoded, so both sides of the comparison come out
+          // of one pipeline.
+          const operand = (value: unknown): unknown => encodeComposite(targetAttr, value)
+          const compose = (value: unknown): string =>
             KeyComposer.composeSortKeyPrefix(
               entityLike._schema,
               entityLike.entityType,
@@ -1058,7 +1095,7 @@ const makeFromConfig = (config: {
               indexDef,
               {
                 ...pinnedRecord,
-                [targetAttr]: value,
+                [targetAttr]: operand(value),
               },
             )
 
@@ -1071,13 +1108,13 @@ const makeFromConfig = (config: {
            * own prefix — so it stops on a segment boundary rather than leaking
            * into sibling values (`status_done` vs `status_done_archived`).
            */
-          const subtreeBeginsWith = (value: string): string =>
+          const subtreeBeginsWith = (value: unknown): string =>
             KeyComposer.composeSortKeyBeginsWith(
               entityLike._schema,
               entityLike.entityType,
               1,
               indexDef,
-              { ...pinnedRecord, [targetAttr]: value },
+              { ...pinnedRecord, [targetAttr]: operand(value) },
             )
 
           /**
@@ -1091,11 +1128,11 @@ const makeFromConfig = (config: {
            * below every longer value because `#` is lower than every character
            * the composer emits for a value segment.
            */
-          const aboveSubtree = (value: string): string =>
+          const aboveSubtree = (value: unknown): string =>
             `${compose(value)}${DynamoSchema.KEY_DELIMITER}${SK_MAX_SENTINEL}`
 
           /** Inclusive upper bound covering the whole subtree of `value`. */
-          const upper = (value: string): string =>
+          const upper = (value: unknown): string =>
             isLastComposite ? compose(value) : aboveSubtree(value)
 
           // `beginsWith` / `between` / `eq` already carry the pinned composites
