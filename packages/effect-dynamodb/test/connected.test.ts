@@ -1271,6 +1271,35 @@ describeConnected("Connected integration tests", () => {
       }).pipe(provide),
     )
 
+    it.effect("deleteIfExists on a soft-delete entity still tombstones (guard now ships)", () =>
+      // `deleteIfExists` is `delete` carrying an `attribute_exists(pk)`
+      // condition, so it rode the same drop. Now that the guard reaches the
+      // transaction it also closes the read-then-write race that could
+      // resurrect a concurrently-deleted item as a tombstone.
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        const key = { taskId: "t-delifexists-102" }
+        yield* db.entities.Tasks.put({
+          ...key,
+          userId: "u-delifexists",
+          title: "Doomed",
+          status: "todo",
+          priority: 1,
+        })
+
+        yield* db.entities.Tasks.deleteIfExists(key)
+
+        const gone = yield* db.entities.Tasks.get(key).pipe(Effect.flip)
+        expect(gone._tag).toBe("ItemNotFound")
+        const tombstones = yield* db.entities.Tasks.deleted.list(key).collect()
+        expect(tombstones).toHaveLength(1)
+
+        // Second call: nothing live to delete.
+        const err = yield* db.entities.Tasks.deleteIfExists(key).asEffect().pipe(Effect.flip)
+        expect(["ItemNotFound", "ConditionalCheckFailed"]).toContain(err._tag)
+      }).pipe(provide),
+    )
+
     it.effect("purge() refuses a condition rather than silently dropping it", () =>
       Effect.gen(function* () {
         // `purge` is partition-wide and batched, so no per-item
