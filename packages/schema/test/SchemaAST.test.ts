@@ -14,6 +14,7 @@ import {
   extractArrayElement,
   firstTypeParameterAst,
   getSchemaFields,
+  hasEncodingTransformation,
   isFieldOptional,
   recordValueAst,
   transformWireKind,
@@ -346,5 +347,34 @@ describe("AST-shape probe (loud canary for Effect beta drift)", () => {
     // Sanity: the isolated read round-trips through Redacted for real schemas.
     const r = Redacted.make("secret")
     expect(Redacted.value(r)).toBe("secret")
+  })
+
+  describe("hasEncodingTransformation — ast.encoding presence", () => {
+    // `SchemaAST.Base.encoding` is documented as: "When `undefined`, the node
+    // has no encoding transformation (type and encoded forms are identical)."
+    // `CompositeCodec` relies on that contract to skip encoding for plain
+    // composites, so that an open sort key bound (`gte(t.status, "d")`) is not
+    // rejected by a codec it was never meant to satisfy.
+    it("is false for schemas whose Type and Encoded forms are identical", () => {
+      expect(hasEncodingTransformation(Schema.String)).toBe(false)
+      expect(hasEncodingTransformation(Schema.Number)).toBe(false)
+      expect(hasEncodingTransformation(Schema.Boolean)).toBe(false)
+      expect(hasEncodingTransformation(Schema.BigInt)).toBe(false)
+      expect(hasEncodingTransformation(Schema.Literals(["todo", "done"]))).toBe(false)
+    })
+
+    it("is true for schemas that transform between Type and Encoded", () => {
+      expect(hasEncodingTransformation(Schema.BigIntFromString)).toBe(true)
+      expect(hasEncodingTransformation(Schema.DateTimeUtcFromString)).toBe(true)
+    })
+
+    it("is false for BARE Schema.Date / Schema.DateTimeUtc", () => {
+      // These are declarations with no encoding link of their own — the entity
+      // derivation substitutes the wire transform. This is precisely why the
+      // composite encoder reads its fields off `inputSchema` (post-substitution)
+      // rather than off the raw model, where these would look untransformed.
+      expect(hasEncodingTransformation(Schema.Date)).toBe(false)
+      expect(hasEncodingTransformation(Schema.DateTimeUtc)).toBe(false)
+    })
   })
 })

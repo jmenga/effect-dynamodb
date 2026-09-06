@@ -44,6 +44,7 @@ class Task extends Schema.Class<Task>("Task")({
   status: TaskStatusSchema,
   priority: PrioritySchema,
   createdAt: Schema.String,
+  estimateHours: Schema.Number,
 }) {}
 // #endregion
 
@@ -71,6 +72,13 @@ const TaskEntity = Entity.make({
       name: "gsi2",
       pk: { field: "gsi2pk", composite: ["assigneeId"] },
       sk: { field: "gsi2sk", composite: ["status", "createdAt"] },
+    },
+    // Numeric sort key composite — zero-padded in the key so it sorts
+    // numerically, and `.where()` takes a `number`.
+    byEstimate: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["projectId"] },
+      sk: { field: "gsi3sk", composite: ["estimateHours"] },
     },
   },
   timestamps: true,
@@ -106,6 +114,7 @@ const program = Effect.gen(function* () {
       status: "done" as const,
       priority: "high" as const,
       createdAt: "2025-01-15",
+      estimateHours: 3,
     },
     {
       taskId: "t-002",
@@ -115,6 +124,7 @@ const program = Effect.gen(function* () {
       status: "active" as const,
       priority: "high" as const,
       createdAt: "2025-02-01",
+      estimateHours: 8,
     },
     {
       taskId: "t-003",
@@ -124,6 +134,7 @@ const program = Effect.gen(function* () {
       status: "active" as const,
       priority: "medium" as const,
       createdAt: "2025-02-10",
+      estimateHours: 13,
     },
     {
       taskId: "t-004",
@@ -133,6 +144,7 @@ const program = Effect.gen(function* () {
       status: "todo" as const,
       priority: "low" as const,
       createdAt: "2025-03-01",
+      estimateHours: 2,
     },
     {
       taskId: "t-005",
@@ -142,6 +154,7 @@ const program = Effect.gen(function* () {
       status: "active" as const,
       priority: "medium" as const,
       createdAt: "2025-02-20",
+      estimateHours: 21,
     },
     {
       taskId: "t-006",
@@ -151,6 +164,7 @@ const program = Effect.gen(function* () {
       status: "done" as const,
       priority: "high" as const,
       createdAt: "2025-01-10",
+      estimateHours: 5,
     },
     {
       taskId: "t-007",
@@ -160,6 +174,7 @@ const program = Effect.gen(function* () {
       status: "todo" as const,
       priority: "medium" as const,
       createdAt: "2025-03-15",
+      estimateHours: 8,
     },
     {
       taskId: "t-008",
@@ -169,6 +184,7 @@ const program = Effect.gen(function* () {
       status: "active" as const,
       priority: "low" as const,
       createdAt: "2025-02-25",
+      estimateHours: 1,
     },
   ]
 
@@ -198,6 +214,47 @@ const program = Effect.gen(function* () {
   yield* Console.log(`Got task: "${task.title}" (${task.status})`)
   yield* Console.log(`Project proj-alpha: ${projectTasks.length} tasks`)
   yield* Console.log(`Assignee emp-alice: ${assigneeTasks.length} tasks\n`)
+
+  // -------------------------------------------------------------------------
+  // Sort Key Conditions
+  // -------------------------------------------------------------------------
+  yield* Console.log("=== Sort Key Conditions ===\n")
+
+  // #region sk-conditions
+  // byProject SK composites: ["status", "createdAt"].
+  // `.where()` constrains the first composite the accessor did not pin.
+  const activeTasks = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+    .where((t, { eq }) => eq(t.status, "active"))
+    .collect()
+
+  // Pin `status` on the accessor, then range over `createdAt`.
+  const activeSinceFeb = yield* db.entities.TaskEntity.byProject({
+    projectId: "proj-alpha",
+    status: "active",
+  })
+    .where((t, { gte }) => gte(t.createdAt, "2025-02-10"))
+    .collect()
+
+  // `between` is inclusive at both ends.
+  const activeInFeb = yield* db.entities.TaskEntity.byProject({
+    projectId: "proj-alpha",
+    status: "active",
+  })
+    .where((t, { between }) => between(t.createdAt, "2025-02-01", "2025-02-28"))
+    .collect()
+  // #endregion
+  yield* Console.log(`Active tasks: ${activeTasks.length}`)
+  yield* Console.log(`Active since 2025-02-10: ${activeSinceFeb.length}`)
+  yield* Console.log(`Active in Feb: ${activeInFeb.length}\n`)
+
+  // #region sk-typed-operands
+  // `estimateHours` is a number, so `.where()` takes a number — not a string.
+  // The library zero-pads it exactly as the stored key was padded.
+  const bigTasks = yield* db.entities.TaskEntity.byEstimate({ projectId: "proj-alpha" })
+    .where((t, { gte }) => gte(t.estimateHours, 8))
+    .collect()
+  // #endregion
+  yield* Console.log(`Tasks estimated at 8h or more: ${bigTasks.length}\n`)
 
   // -------------------------------------------------------------------------
   // Post-Query Filtering

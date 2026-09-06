@@ -33,6 +33,10 @@ import {
   UniqueConstraintViolation,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
+import {
+  makeCompositeKeyForm,
+  toCompositeKeyRecord,
+} from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
@@ -51,7 +55,11 @@ import {
   makeBoundPut,
   makeBoundUpdate,
 } from "./internal/BoundCrud.js"
-import { type BoundQueryConfig, BoundQueryImpl } from "./internal/BoundQuery.js"
+import {
+  type BoundQueryConfig,
+  BoundQueryImpl,
+  type RawSortKeyCondition,
+} from "./internal/BoundQuery.js"
 import {
   compileExpr,
   createConditionOps,
@@ -304,6 +312,33 @@ const composeUniqueSentinel = (
  *
  * @internal
  */
+/**
+ * @internal Build a key-form normaliser for an arbitrary entity-like value.
+ *
+ * `makeImpl` closes over its own `keyForm`; this is the escape hatch for the
+ * two places that compose against a DIFFERENT entity's index (`cascade`) or run
+ * outside `makeImpl` entirely (`bind`'s `reembed` / `history`). Same rule, same
+ * `CompositeCodec` — just resolved per target.
+ */
+const keyFormFor = (
+  target: unknown,
+  record: globalThis.Record<string, unknown>,
+): globalThis.Record<string, unknown> => {
+  const t = target as {
+    readonly model?: Schema.Top | undefined
+    readonly schemas?: { readonly inputSchema?: Schema.Top | undefined } | undefined
+  }
+  const source = t.schemas?.inputSchema ?? t.model
+  if (source === undefined) return record
+  const form = makeCompositeKeyForm(source, (attr, value) => {
+    throw new Error(
+      `[EDD-9050] Composite "${attr}" could not be put into its key form: ` +
+        `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode.`,
+    )
+  })
+  return toCompositeKeyRecord(form, record)
+}
+
 const encodeOrDecodeEncode = (
   schema: Schema.Codec<any>,
   input: unknown,
@@ -1605,16 +1640,114 @@ const makeImpl = <
   // Helpers
   // ---------------------------------------------------------------------------
 
+  // Read-path composite encoder — see `internal/CompositeCodec.ts`. The write
+  // path composes keys from the encoded record (`put` encodes, THEN composes);
+  // key and query inputs arrive as decoded model values, so they are encoded
+  // through the model's own field codecs before composition. Encoding is
+  // idempotent via the `decode -> encode` fallback, so callers that already
+  // hold an encoded record are unaffected.
+  // Source: `inputSchema`, the EXACT schema `put` encodes through before
+  // `composeAllKeys`. The raw model is not equivalent — entity derivation
+  // substitutes date/Redacted fields with their wire transforms, so reading
+  // fields off the model would miss encodings the write path applies.
+  const compositeKeyForm = makeCompositeKeyForm(
+    schemas.inputSchema as unknown as Schema.Top,
+    (attr, value) => {
+      throw new Error(
+        `[EDD-9050] Composite "${attr}" on entity "${entityType}" could not be encoded to its ` +
+          `stored form. The attribute's schema carries an encoding transformation, so the ` +
+          `stored key holds the ENCODED value, but ${JSON.stringify(String(value))} encodes ` +
+          `under neither encode nor decode->encode. Supply a value of the attribute's own type.`,
+      )
+    },
+  )
+
+  /**
+   * PUBLIC key boundary. Converts a caller-supplied key record from the model's
+   * **Type** side — the one convention the whole API takes — into the ENCODED
+   * form key composition expects.
+   *
+   * `put` composes keys from the encoded record, so the stored key holds the
+   * wire value. Key-taking operations used to run a plain `decode`, which reads
+   * the Encoded side and then handed the *decoded* result to the composer. On a
+   * transformed composite neither spelling worked: `get({ txn: 420n })` failed
+   * validation and `get({ txn: "420" })` silently returned `ItemNotFound` for a
+   * row that exists. Encoding the Type side fixes the one spelling that should
+   * have worked all along, and matches what the query path takes.
+   *
+   * Encode-ONLY, deliberately: no `decode -> encode` fallback. The Encoded side
+   * is not a public input, so `{ txn: "420" }` fails here — loudly, with the
+   * attribute named by the schema error — rather than composing a key by a
+   * second convention. Internal callers that legitimately hold encoded records
+   * do not come through here; see `composePrimaryKey`.
+   */
+  const encodeKey = (
+    key: unknown,
+    operation: string,
+  ): Effect.Effect<globalThis.Record<string, unknown>, ValidationError> =>
+    Schema.encodeUnknownEffect(schemas.keySchema as Schema.Codec<any>)(key).pipe(
+      Effect.map((encoded) => encoded as globalThis.Record<string, unknown>),
+      Effect.mapError((cause) => new ValidationError({ entityType, operation, cause })),
+    )
+
+  /**
+   * Synchronous `encodeKey`, for the query builders (`history`, `versions`,
+   * `deleted.list`) that compose a partition key outside an Effect. Same
+   * Type-side-only rule; throws the schema's own error, which names the
+   * offending attribute — these builders have always thrown on a bad key.
+   */
+  const encodeKeySync = (key: unknown): globalThis.Record<string, unknown> =>
+    Schema.encodeUnknownSync(schemas.keySchema as Schema.Codec<any>)(key) as globalThis.Record<
+      string,
+      unknown
+    >
+
+  /**
+   * INTERNAL key composition. Takes an **already-encoded** record — either the
+   * output of `encodeKey` on the public path, or an item read back from
+   * DynamoDB on the retain / restore / soft-delete paths, which are wire-shaped
+   * by construction.
+   *
+   * The `encodeCompositeRecord` pass is a normalisation, not a second input
+   * convention: composite encoding is idempotent, so an already-encoded value
+   * round-trips to itself. It exists so that `keySchema` (built from raw model
+   * fields) and `inputSchema` (built from derivation-substituted fields) cannot
+   * disagree for a composite whose wire transform is added by derivation —
+   * `Schema.Date` being the case that matters.
+   */
+  /**
+   * THE key-form normaliser. Every record handed to `KeyComposer` in this
+   * module goes through it, so the write path, the update path, the lifecycle
+   * paths and the read path cannot disagree about how a composite is spelled
+   * in a key.
+   *
+   * Skipping it on ONE site is enough to corrupt data: `composeAllKeys` (put)
+   * normalised while `composeGsiKeysForUpdatePolicyAware` (update) did not, so
+   * an `update()` rewrote a padded `gsi1pk` to its unpadded form and evicted
+   * the row from its own GSI. `test/KeyFormInvariant.test.ts` scans this file
+   * and fails if a `KeyComposer.compose*` call takes a record that did not come
+   * through `keyForm(...)`.
+   */
+  const keyForm = (record: globalThis.Record<string, unknown>) =>
+    toCompositeKeyRecord(compositeKeyForm, record)
+
   const composePrimaryKey = (record: globalThis.Record<string, unknown>) => {
     const primary = config.indexes.primary
+    const recordKeyForm = keyForm(record)
     return {
-      [primary.pk.field]: KeyComposer.composePk(schema, entityType, primary, record),
-      [primary.sk.field]: KeyComposer.composeSk(schema, entityType, entityVersion, primary, record),
+      [primary.pk.field]: KeyComposer.composePk(schema, entityType, primary, recordKeyForm),
+      [primary.sk.field]: KeyComposer.composeSk(
+        schema,
+        entityType,
+        entityVersion,
+        primary,
+        recordKeyForm,
+      ),
     }
   }
 
   const composeAllKeys = (record: globalThis.Record<string, unknown>) =>
-    KeyComposer.composeAllKeys(schema, entityType, entityVersion, allIndexes, record)
+    KeyComposer.composeAllKeys(schema, entityType, entityVersion, allIndexes, keyForm(record))
 
   /**
    * Fill the auto-generated id field on the raw `put` input when configured and
@@ -1900,7 +2033,7 @@ const makeImpl = <
           schema,
           entityType,
           definition,
-          record,
+          keyForm(record),
         )
         if (partition === undefined) {
           // No partition value ⇒ the item cannot be in the index at all. Drop
@@ -2006,7 +2139,7 @@ const makeImpl = <
    * item out of the index when nothing does.
    */
   const computeVectorUpdateAttributes = (
-    decodedKey: globalThis.Record<string, unknown>,
+    encodedKey: globalThis.Record<string, unknown>,
     marshalledKey: globalThis.Record<string, AttributeValue>,
     tableName: string,
     updatePayload: globalThis.Record<string, unknown>,
@@ -2025,7 +2158,7 @@ const makeImpl = <
       // Base record: key composites plus whatever the payload supplies. Enough
       // to compose partition values (their composites are normally primary-key
       // members) without any extra read.
-      let merged: globalThis.Record<string, unknown> = { ...decodedKey, ...updatePayload }
+      let merged: globalThis.Record<string, unknown> = { ...encodedKey, ...updatePayload }
 
       const needsFullSource = needing.some(
         ([logicalName, definition]) =>
@@ -2056,7 +2189,7 @@ const makeImpl = <
           schema,
           entityType,
           definition,
-          merged,
+          keyForm(merged),
         )
         if (partition === undefined) {
           // Only drop the partition when THIS writer invalidated it. Otherwise
@@ -2314,7 +2447,7 @@ const makeImpl = <
           targetSchema,
           target.entityType,
           cascadeIdx.indexDef,
-          { [matchingRef.idFieldName]: sourceIdValue },
+          keyFormFor(target, { [matchingRef.idFieldName]: sourceIdValue }),
         )
 
         // Build query parameters
@@ -2776,22 +2909,11 @@ const makeImpl = <
           const client = yield* DynamoClient
           const { name: tableName } = yield* tableTag
 
-          // Decode key
-          const decodedKey = yield* Schema.decodeUnknownEffect(
-            schemas.keySchema as Schema.Codec<any>,
-          )(key).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ValidationError({
-                  entityType,
-                  operation: "get.decode",
-                  cause,
-                }),
-            ),
-          )
+          // Caller key: Type side in, ENCODED out (see `encodeKey`).
+          const encodedKey = yield* encodeKey(key, "get.decode")
 
           // Compose primary key
-          const primaryKey = composePrimaryKey(decodedKey)
+          const primaryKey = composePrimaryKey(encodedKey)
           const marshalledKey = toAttributeMap(primaryKey)
 
           // Build ProjectionExpression if projection attributes provided
@@ -2815,7 +2937,7 @@ const makeImpl = <
           })
 
           if (!result.Item) {
-            return yield* new ItemNotFound({ entityType, key: decodedKey })
+            return yield* new ItemNotFound({ entityType, key: encodedKey })
           }
 
           // Raw mode: return unmarshalled record without schema decode
@@ -2851,19 +2973,8 @@ const makeImpl = <
 
           yield* checkWithVectorNames(uState.withVectors, "update")
 
-          // Decode key
-          const decodedKey = yield* Schema.decodeUnknownEffect(
-            schemas.keySchema as Schema.Codec<any>,
-          )(key).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ValidationError({
-                  entityType,
-                  operation: "update.decodeKey",
-                  cause,
-                }),
-            ),
-          )
+          // Caller key: Type side in, ENCODED out (see `encodeKey`).
+          const encodedKey = yield* encodeKey(key, "update.decodeKey")
 
           // Encode update payload → wire form (see `put` for the strategy).
           const encodedUpdates = yield* encodeOrDecodeEncode(
@@ -2888,7 +2999,7 @@ const makeImpl = <
           }
 
           // Compose primary key
-          const primaryKey = composePrimaryKey(decodedKey)
+          const primaryKey = composePrimaryKey(encodedKey)
           const marshalledKey = toAttributeMap(primaryKey)
 
           // Detect whether the update touches any unique constraint fields
@@ -2921,7 +3032,7 @@ const makeImpl = <
             })
 
             if (!currentResult.Item) {
-              return yield* new ItemNotFound({ entityType, key: decodedKey })
+              return yield* new ItemNotFound({ entityType, key: encodedKey })
             }
 
             const currentRaw = fromAttributeMap(currentResult.Item)
@@ -2933,7 +3044,7 @@ const makeImpl = <
             if (evExpected !== undefined && currentVersion !== evExpected) {
               return yield* new OptimisticLockError({
                 entityType,
-                key: decodedKey,
+                key: encodedKey,
                 expectedVersion: evExpected,
                 actualVersion: currentVersion,
               })
@@ -3073,8 +3184,8 @@ const makeImpl = <
               entityType,
               entityVersion,
               allIndexes,
-              hydratedUpdates as globalThis.Record<string, unknown>,
-              newItem,
+              keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
+              keyForm(newItem),
               retainRemovedSet === undefined ? {} : { removedSet: retainRemovedSet },
             )
             for (const [field, value] of Object.entries(gsiUpdate.sets)) {
@@ -3103,7 +3214,7 @@ const makeImpl = <
                 entityType,
                 entityVersion,
                 indexDef,
-                newItem,
+                keyForm(newItem),
               )
               if (keys) {
                 Object.assign(newItem, keys)
@@ -3340,11 +3451,11 @@ const makeImpl = <
                     // would surface as a nonsensical OptimisticLockError.
                     const mainItemRejection = (): OptimisticLockError | ConditionalCheckFailed => {
                       if (!systemFields.version && userCond) {
-                        return new ConditionalCheckFailed({ entityType, key: decodedKey })
+                        return new ConditionalCheckFailed({ entityType, key: encodedKey })
                       }
                       return new OptimisticLockError({
                         entityType,
-                        key: decodedKey,
+                        key: encodedKey,
                         expectedVersion: currentVersion,
                         actualVersion: -1,
                       })
@@ -3390,7 +3501,7 @@ const makeImpl = <
               const domainData = { ...(retainDecoded as object) }
               const sourceId =
                 sourceIdentifierField != null
-                  ? (decodedKey as globalThis.Record<string, unknown>)[sourceIdentifierField]
+                  ? (encodedKey as globalThis.Record<string, unknown>)[sourceIdentifierField]
                   : undefined
               if (sourceId != null) {
                 yield* executeCascade(uState.cascade, domainData, String(sourceId))
@@ -3567,8 +3678,8 @@ const makeImpl = <
             entityType,
             entityVersion,
             allIndexes,
-            hydratedUpdates as globalThis.Record<string, unknown>,
-            decodedKey as globalThis.Record<string, unknown>,
+            keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
+            keyForm(encodedKey as globalThis.Record<string, unknown>),
             removedSet === undefined ? {} : { removedSet },
           )
           for (const [field, value] of Object.entries(gsiUpdate.sets)) {
@@ -3591,7 +3702,7 @@ const makeImpl = <
           // See `DESIGN.md §14 Write path`.
           if (hasVectorIndexes) {
             const vectorWrite = yield* computeVectorUpdateAttributes(
-              decodedKey as globalThis.Record<string, unknown>,
+              encodedKey as globalThis.Record<string, unknown>,
               marshalledKey,
               tableName,
               hydratedUpdates as globalThis.Record<string, unknown>,
@@ -3861,7 +3972,7 @@ const makeImpl = <
                   if (evExpected !== undefined) {
                     return new OptimisticLockError({
                       entityType,
-                      key: decodedKey,
+                      key: encodedKey,
                       expectedVersion: evExpected,
                       actualVersion: -1,
                     }) as DynamoClientError | OptimisticLockError | ConditionalCheckFailed
@@ -3869,7 +3980,7 @@ const makeImpl = <
                   if (userCond) {
                     return new ConditionalCheckFailed({
                       entityType,
-                      key: decodedKey,
+                      key: encodedKey,
                     }) as DynamoClientError | OptimisticLockError | ConditionalCheckFailed
                   }
                 }
@@ -3878,7 +3989,7 @@ const makeImpl = <
             )
 
           if (!result.Attributes) {
-            return yield* new ItemNotFound({ entityType, key: decodedKey })
+            return yield* new ItemNotFound({ entityType, key: encodedKey })
           }
 
           const raw = fromAttributeMap(result.Attributes)
@@ -3889,7 +4000,7 @@ const makeImpl = <
             const domainData = { ...(decoded as object) }
             const sourceId =
               sourceIdentifierField != null
-                ? (decodedKey as globalThis.Record<string, unknown>)[sourceIdentifierField]
+                ? (encodedKey as globalThis.Record<string, unknown>)[sourceIdentifierField]
                 : undefined
             if (sourceId != null) {
               yield* executeCascade(uState.cascade, domainData, String(sourceId))
@@ -3919,22 +4030,11 @@ const makeImpl = <
           const tableName = tc.name
           const ttlAttrName = resolveTtlAttributeName(tc)
 
-          // Decode key
-          const decodedKey = yield* Schema.decodeUnknownEffect(
-            schemas.keySchema as Schema.Codec<any>,
-          )(key).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ValidationError({
-                  entityType,
-                  operation: "delete.decode",
-                  cause,
-                }),
-            ),
-          )
+          // Caller key: Type side in, ENCODED out (see `encodeKey`).
+          const encodedKey = yield* encodeKey(key, "delete.decode")
 
           // Compose primary key
-          const primaryKey = composePrimaryKey(decodedKey)
+          const primaryKey = composePrimaryKey(encodedKey)
           const marshalledKey = toAttributeMap(primaryKey)
           const primary = config.indexes.primary
           const hasUniqueConstraints =
@@ -3963,7 +4063,7 @@ const makeImpl = <
               isAwsTransactionCancelled(err.cause) &&
               err.cause.CancellationReasons?.[0]?.Code === "ConditionalCheckFailed"
             if (cancelledAtMainItem || isAwsConditionalCheckFailed(err.cause)) {
-              return new ConditionalCheckFailed({ entityType, key: decodedKey })
+              return new ConditionalCheckFailed({ entityType, key: encodedKey })
             }
             return err
           }
@@ -3977,7 +4077,7 @@ const makeImpl = <
             })
 
             if (!result.Item) {
-              return yield* Effect.fail(new ItemNotFound({ entityType, key: decodedKey }))
+              return yield* Effect.fail(new ItemNotFound({ entityType, key: encodedKey }))
             }
 
             const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
@@ -4117,7 +4217,7 @@ const makeImpl = <
             })
 
             if (!result.Item) {
-              return yield* Effect.fail(new ItemNotFound({ entityType, key: decodedKey }))
+              return yield* Effect.fail(new ItemNotFound({ entityType, key: encodedKey }))
             }
 
             const raw = fromAttributeMap(result.Item)
@@ -4648,8 +4748,15 @@ const makeImpl = <
 
       // Compose current-item primary key (pk + sk derived from PK/SK composites)
       const primary = config.indexes.primary
-      const pkValue = KeyComposer.composePk(schema, entityType, primary, encoded)
-      const currentSk = KeyComposer.composeSk(schema, entityType, entityVersion, primary, encoded)
+      const appendKeyForm = keyForm(encoded)
+      const pkValue = KeyComposer.composePk(schema, entityType, primary, appendKeyForm)
+      const currentSk = KeyComposer.composeSk(
+        schema,
+        entityType,
+        entityVersion,
+        primary,
+        appendKeyForm,
+      )
       const marshalledKey = toAttributeMap({
         [primary.pk.field]: pkValue,
         [primary.sk.field]: currentSk,
@@ -4702,8 +4809,8 @@ const makeImpl = <
         entityType,
         entityVersion,
         allIndexes,
-        encoded,
-        encoded,
+        keyForm(encoded),
+        keyForm(encoded),
         removedSet !== undefined ? { removedSet } : undefined,
       )
       for (const [field, value] of Object.entries(gsiUpdate.sets)) {
@@ -4946,15 +5053,15 @@ const makeImpl = <
         `[EDD-9010] Entity "${entityType}": .history() requires timeSeries config on the entity.`,
       )
     }
-    const decodedKey = Schema.decodeUnknownSync(schemas.keySchema as Schema.Codec<any>)(key)
+    const encodedKey = keyForm(encodeKeySync(key))
     const primary = config.indexes.primary
-    const pkValue = KeyComposer.composePk(schema, entityType, primary, decodedKey)
+    const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
     const currentSk = KeyComposer.composeSk(
       schema,
       entityType,
       entityVersion,
       primary,
-      decodedKey as globalThis.Record<string, unknown>,
+      keyForm(encodedKey as globalThis.Record<string, unknown>),
     )
     const prefix = KeyComposer.composeEventSkPrefix(currentSk, schema.casing)
 
@@ -5001,9 +5108,12 @@ const makeImpl = <
   for (const indexName of Object.keys(config.indexes)) {
     if (indexName === "primary") continue
     const indexDef = config.indexes[indexName]!
-    queryNamespace[indexName] = (pk: globalThis.Record<string, unknown>) => {
-      const pkValue = KeyComposer.composePk(schema, entityType, indexDef, pk)
-      const hasSkComposites = indexDef.sk.composite.some((attr) => pk[attr] !== undefined)
+    queryNamespace[indexName] = (rawPk: globalThis.Record<string, unknown>) => {
+      // Normalise composites to their key form before composing — same rule
+      // and same function the write path uses (see `CompositeCodec`).
+      const pkKeyForm = keyForm(rawPk)
+      const pkValue = KeyComposer.composePk(schema, entityType, indexDef, pkKeyForm)
+      const hasSkComposites = indexDef.sk.composite.some((attr) => pkKeyForm[attr] !== undefined)
       const query = Query.make({
         tableName: "",
         indexName: indexDef.index,
@@ -5015,12 +5125,16 @@ const makeImpl = <
         resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
       })
       if (hasSkComposites) {
-        const skPrefix = KeyComposer.composeSortKeyPrefix(
+        // `composeSortKeyBeginsWith`, not `composeSortKeyPrefix` — the operand
+        // must terminate on a segment boundary when composites remain, or it
+        // matches sibling values that merely start with the supplied one
+        // (`status_done` also matching `status_done_archived`, issue #115).
+        const skPrefix = KeyComposer.composeSortKeyBeginsWith(
           schema,
           entityType,
           entityVersion,
           indexDef,
-          pk,
+          pkKeyForm,
         )
         return Query.where(query, { beginsWith: skPrefix })
       }
@@ -5052,23 +5166,12 @@ const makeImpl = <
           const client = yield* DynamoClient
           const { name: tableName } = yield* tableTag
 
-          // Decode key
-          const decodedKey = yield* Schema.decodeUnknownEffect(
-            schemas.keySchema as Schema.Codec<any>,
-          )(key).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ValidationError({
-                  entityType,
-                  operation: "getVersion.decode",
-                  cause,
-                }),
-            ),
-          )
+          // Caller key: Type side in, ENCODED out (see `encodeKey`).
+          const encodedKey = yield* encodeKey(key, "getVersion.decode")
 
           // Compose PK + version SK
           const primary = config.indexes.primary
-          const pkValue = KeyComposer.composePk(schema, entityType, primary, decodedKey)
+          const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
           const versionSk = DynamoSchema.composeVersionKey(schema, entityType, versionNumber)
 
           const marshalledKey = toAttributeMap({
@@ -5083,7 +5186,7 @@ const makeImpl = <
           })
 
           if (!result.Item) {
-            return yield* new ItemNotFound({ entityType, key: decodedKey })
+            return yield* new ItemNotFound({ entityType, key: encodedKey })
           }
 
           const raw = fromAttributeMap(result.Item)
@@ -5098,9 +5201,9 @@ const makeImpl = <
   // ---------------------------------------------------------------------------
 
   const versions = (key: unknown) => {
-    const decodedKey = Schema.decodeUnknownSync(schemas.keySchema as Schema.Codec<any>)(key)
+    const encodedKey = keyForm(encodeKeySync(key))
     const primary = config.indexes.primary
-    const pkValue = KeyComposer.composePk(schema, entityType, primary, decodedKey)
+    const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
     const versionPrefix = DynamoSchema.composeVersionKeyPrefix(schema, entityType)
 
     return Query.make({
@@ -5126,23 +5229,12 @@ const makeImpl = <
           const client = yield* DynamoClient
           const { name: tableName } = yield* tableTag
 
-          // Decode key
-          const decodedKey = yield* Schema.decodeUnknownEffect(
-            schemas.keySchema as Schema.Codec<any>,
-          )(key).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ValidationError({
-                  entityType,
-                  operation: "deleted.get.decode",
-                  cause,
-                }),
-            ),
-          )
+          // Caller key: Type side in, ENCODED out (see `encodeKey`).
+          const encodedKey = yield* encodeKey(key, "deleted.get.decode")
 
           // Query for soft-deleted item using begins_with on deleted prefix
           const primary = config.indexes.primary
-          const pkValue = KeyComposer.composePk(schema, entityType, primary, decodedKey)
+          const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
           const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
 
           const result = yield* client.query({
@@ -5161,7 +5253,7 @@ const makeImpl = <
           })
 
           if (!result.Items || result.Items.length === 0) {
-            return yield* new ItemNotFound({ entityType, key: decodedKey })
+            return yield* new ItemNotFound({ entityType, key: encodedKey })
           }
 
           const raw = fromAttributeMap(result.Items[0]!)
@@ -5191,9 +5283,9 @@ const makeImpl = <
     )
 
   const deletedList = (key: unknown) => {
-    const decodedKey = Schema.decodeUnknownSync(schemas.keySchema as Schema.Codec<any>)(key)
+    const encodedKey = keyForm(encodeKeySync(key))
     const primary = config.indexes.primary
-    const pkValue = KeyComposer.composePk(schema, entityType, primary, decodedKey)
+    const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
     const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
 
     const decodeDeleted = (raw: globalThis.Record<string, unknown>) => {
@@ -5240,23 +5332,12 @@ const makeImpl = <
           // Clock-backed time source for the restored updatedAt + retain snapshot.
           const now = yield* DateTime.now
 
-          // Decode key
-          const decodedKey = yield* Schema.decodeUnknownEffect(
-            schemas.keySchema as Schema.Codec<any>,
-          )(key).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ValidationError({
-                  entityType,
-                  operation: "restore.decode",
-                  cause,
-                }),
-            ),
-          )
+          // Caller key: Type side in, ENCODED out (see `encodeKey`).
+          const encodedKey = yield* encodeKey(key, "restore.decode")
 
           // Query for the soft-deleted item
           const primary = config.indexes.primary
-          const pkValue = KeyComposer.composePk(schema, entityType, primary, decodedKey)
+          const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
           const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
 
           const queryResult = yield* client.query({
@@ -5275,7 +5356,7 @@ const makeImpl = <
           })
 
           if (!queryResult.Items || queryResult.Items.length === 0) {
-            return yield* new ItemNotFound({ entityType, key: decodedKey })
+            return yield* new ItemNotFound({ entityType, key: encodedKey })
           }
 
           const deletedRaw = fromAttributeMap(queryResult.Items[0]!)
@@ -5324,7 +5405,7 @@ const makeImpl = <
               schema,
               entityType,
               definition,
-              restoredItem,
+              keyForm(restoredItem),
             )
             if (partition !== undefined) restoredItem[definition.partitionField] = partition
           }
@@ -5477,22 +5558,11 @@ const makeImpl = <
           const client = yield* DynamoClient
           const { name: tableName } = yield* tableTag
 
-          // Decode key
-          const decodedKey = yield* Schema.decodeUnknownEffect(
-            schemas.keySchema as Schema.Codec<any>,
-          )(key).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ValidationError({
-                  entityType,
-                  operation: "purge.decode",
-                  cause,
-                }),
-            ),
-          )
+          // Caller key: Type side in, ENCODED out (see `encodeKey`).
+          const encodedKey = yield* encodeKey(key, "purge.decode")
 
           const primary = config.indexes.primary
-          const pkValue = KeyComposer.composePk(schema, entityType, primary, decodedKey)
+          const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
 
           // Query ALL items in this partition (current + versions + deleted)
           // Use ProjectionExpression to only get keys
@@ -5527,7 +5597,7 @@ const makeImpl = <
                 entityType,
                 entityVersion,
                 primary,
-                decodedKey,
+                keyForm(encodedKey),
               ),
             })
             const mainResult = yield* client.getItem({
@@ -5928,12 +5998,13 @@ export const bind = <
               >
               // Snapshots / tombstones live in the same partition under a
               // rewritten SK — their SK cannot be recomposed from the record.
+              const decodedKeyForm = keyFormFor(entity, decoded)
               const liveSk = KeyComposer.composeSk(
                 boundSchema,
                 entity.entityType,
                 boundEntityVersion,
                 primary,
-                decoded,
+                decodedKeyForm,
               )
               if (storedSk !== liveSk) return false
 
@@ -5943,7 +6014,7 @@ export const bind = <
                   boundSchema,
                   entity.entityType,
                   definition,
-                  decoded,
+                  decodedKeyForm,
                 )
                 if (partition === undefined) continue
                 const text = deriveSourceText(definition, decoded)
@@ -6084,6 +6155,8 @@ export const bind = <
         const entityInternals = entity as unknown as {
           readonly _schema: DynamoSchema.DynamoSchema
           readonly entityType: string
+          readonly model: Schema.Top
+          readonly schemas?: { readonly inputSchema?: Schema.Top | undefined }
         }
         const schemaRef = entityInternals._schema
         const entityTypeRef = entityInternals.entityType
@@ -6092,19 +6165,30 @@ export const bind = <
         // with `<currentSk>#e#` and applying serialisation + casing to the
         // user-supplied orderBy value.
         const primary = entity.indexes.primary!
-        const composeSkCondition = (cond: Query.SortKeyCondition): Query.SortKeyCondition => {
+        const composeSkCondition = (cond: RawSortKeyCondition): Query.SortKeyCondition => {
           // We need the `currentSk` + prefix. The user's `key` lets us derive
           // `currentSk` via the same primary SK composer used by `history()`.
+          // `key` is the caller's Type-side key; the stored SK was composed
+          // from the encoded form, so normalise it the same way
+          // `composePrimaryKey` does before recomposing.
           const currentSk = KeyComposer.composeSk(
             schemaRef,
             entityTypeRef,
             1,
             primary,
-            key as globalThis.Record<string, unknown>,
+            keyFormFor(entityInternals, key as globalThis.Record<string, unknown>),
           )
           const prefix = KeyComposer.composeEventSkPrefix(currentSk, schemaRef.casing)
+          // Key form first: the event SK is composed from the key form of the
+          // orderBy value (`Entity.append` composes from `serialisedInput`), so
+          // a transformed orderBy composite must take the same route here.
           const rewrite = (v: unknown) =>
-            `${prefix}${DynamoSchema.applyCasing(KeyComposer.serializeValue(v), schemaRef.casing)}`
+            `${prefix}${DynamoSchema.applyCasing(
+              KeyComposer.serializeValue(
+                orderBy === undefined ? v : keyFormFor(entityInternals, { [orderBy]: v })[orderBy],
+              ),
+              schemaRef.casing,
+            )}`
           if ("eq" in cond) return { eq: rewrite(cond.eq) }
           if ("lt" in cond) return { lt: rewrite(cond.lt) }
           if ("lte" in cond) return { lte: rewrite(cond.lte) }

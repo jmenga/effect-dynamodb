@@ -6,7 +6,7 @@
 
 Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, composite key composition from entity attributes, type-safe index-aware queries with Stream-based pagination, and DynamoClient as an Effect Service with Layer-based dependency injection.
 
-**Status:** All modules implemented. 1069 core tests, 281 schema tests, 56 geo tests, 176 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
+**Status:** All modules implemented. 1211 core tests, 307 schema tests, 56 geo tests, 241 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
 **Design:** `DESIGN.md` — API specification (source of truth for implementation)
 
 ## Architecture
@@ -89,6 +89,7 @@ packages/effect-dynamodb/src/
 │   ├── EntityCombinators.ts # Terminal functions, update combinators (record + path-based)
 │   ├── EntityTypes.ts  # Type-level computations for Entity derived types
 │   ├── EntitySchemas.ts # Schema derivation (7 derived schemas)
+│   ├── CompositeCodec.ts # (schema pkg) THE composite key-form rule — every path uses it; see DESIGN §7
 │   ├── TransactableOps.ts # Shared Batch/Transaction helpers (table name resolution, key composition, put-item building)
 │   ├── TransactWriteOps.ts # Shared TransactWriteItems builder + ConditionCheckOp (Transaction.transactWrite AND EventStore.append additionalItems)
 │   └── ...             # AggregateCursor, AggregateEdges, etc.
@@ -108,7 +109,7 @@ EventStore → DynamoClient, DynamoSchema, Table, KeyComposer, Marshaller, Query
 GeoIndex → Entity, Query (in effect-dynamodb-geo package)
 DynamoClient → effect (Context, Layer), @aws-sdk/client-dynamodb, Entity, Collections, Aggregate (for make() binding + collection auto-discovery)
 Table → DynamoSchema, Entity (type-level for member registration)
-BoundQuery → Query, PathBuilder, Expr (thin typed wrapper over Query<A>)
+BoundQuery → Query, PathBuilder, Expr, KeyComposer (thin typed wrapper over Query<A>; `.where()` operands stay unserialised until `composeSkCondition` encodes + composes them)
 Expression → Marshaller (types only — shorthand compilation routes through Expr)
 TransactableOps → Entity, KeyComposer, Marshaller, Errors (shared Batch/Transaction helpers)
 DynamoModel → effect (Schema)

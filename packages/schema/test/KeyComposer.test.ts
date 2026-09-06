@@ -1546,4 +1546,142 @@ describe("KeyComposer", () => {
       expect(result).toBe("$myapp#v1#org#engineer_1#department_platform#team_infra")
     })
   })
+
+  // ---------------------------------------------------------------------------
+  // composeSortKeyBeginsWith — the delimiter rule (issue #115)
+  // ---------------------------------------------------------------------------
+
+  describe("composeSortKeyBeginsWith", () => {
+    const twoComposites: KeyComposer.IndexDefinition = {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["status", "taskId"] },
+    }
+
+    const oneComposite: KeyComposer.IndexDefinition = {
+      index: "gsi1",
+      pk: { field: "gsi1pk", composite: ["boardId"] },
+      sk: { field: "gsi1sk", composite: ["label"] },
+    }
+
+    const threeComposites: KeyComposer.IndexDefinition = {
+      index: "gsi2",
+      pk: { field: "gsi2pk", composite: ["orgId"] },
+      sk: { field: "gsi2sk", composite: ["region", "site", "rack"] },
+    }
+
+    it("partial prefix — appends the delimiter because composites remain", () => {
+      expect(
+        KeyComposer.composeSortKeyBeginsWith(schema, "Task", 1, twoComposites, { status: "done" }),
+      ).toBe("$myapp#v1#task#status_done#")
+    })
+
+    it("complete key — no delimiter, the stored key ends there", () => {
+      expect(
+        KeyComposer.composeSortKeyBeginsWith(schema, "Task", 1, twoComposites, {
+          status: "done",
+          taskId: "t1",
+        }),
+      ).toBe("$myapp#v1#task#status_done#taskid_t1")
+    })
+
+    it("single-composite sort key — supplying it is a complete key, so no delimiter", () => {
+      // Regression guard: appending a delimiter here would match nothing, since
+      // no stored key continues past the only composite.
+      expect(
+        KeyComposer.composeSortKeyBeginsWith(schema, "Note", 1, oneComposite, { label: "ship" }),
+      ).toBe("$myapp#v1#note#label_ship")
+    })
+
+    it("three composites — delimiter after one and after two, none after all three", () => {
+      const record = { region: "apac", site: "syd1", rack: "r7" }
+      expect(
+        KeyComposer.composeSortKeyBeginsWith(schema, "Node", 1, threeComposites, {
+          region: record.region,
+        }),
+      ).toBe("$myapp#v1#node#region_apac#")
+      expect(
+        KeyComposer.composeSortKeyBeginsWith(schema, "Node", 1, threeComposites, {
+          region: record.region,
+          site: record.site,
+        }),
+      ).toBe("$myapp#v1#node#region_apac#site_syd1#")
+      expect(KeyComposer.composeSortKeyBeginsWith(schema, "Node", 1, threeComposites, record)).toBe(
+        "$myapp#v1#node#region_apac#site_syd1#rack_r7",
+      )
+    })
+
+    it("excludes a sibling value that the supplied value is a strict prefix of", () => {
+      // The whole point of #115: `done` must not match `done_archived` / `doneish`.
+      const operand = KeyComposer.composeSortKeyBeginsWith(schema, "Task", 1, twoComposites, {
+        status: "done",
+      })
+      const composeStored = (status: string, taskId: string) =>
+        KeyComposer.composeSk(schema, "Task", 1, twoComposites, { status, taskId })
+
+      expect(composeStored("done", "t1").startsWith(operand)).toBe(true)
+      expect(composeStored("done_archived", "t3").startsWith(operand)).toBe(false)
+      expect(composeStored("doneish", "t4").startsWith(operand)).toBe(false)
+    })
+
+    it("no composites supplied — bare entity prefix plus delimiter", () => {
+      expect(KeyComposer.composeSortKeyBeginsWith(schema, "Task", 1, twoComposites, {})).toBe(
+        "$myapp#v1#task#",
+      )
+    })
+
+    it("empty SK composite list — bare entity prefix, no delimiter", () => {
+      const noComposites: KeyComposer.IndexDefinition = {
+        index: "gsi3",
+        pk: { field: "gsi3pk", composite: ["email"] },
+        sk: { field: "gsi3sk", composite: [] },
+      }
+      expect(KeyComposer.composeSortKeyBeginsWith(schema, "User", 1, noComposites, {})).toBe(
+        "$myapp#v1#user",
+      )
+    })
+
+    it("padded composites are fixed-width, so the rule is a no-op for them", () => {
+      // Numbers/bigints cannot be prefixes of one another once padded — the
+      // delimiter protects the string and free-text composites. Recorded here so
+      // nobody concludes from numeric fixtures that the rule is unnecessary.
+      const numericSk: KeyComposer.IndexDefinition = {
+        index: "gsi1",
+        pk: { field: "gsi1pk", composite: ["deviceId"] },
+        sk: { field: "gsi1sk", composite: ["seq", "part"] },
+      }
+      expect(
+        KeyComposer.composeSortKeyBeginsWith(schema, "Reading", 1, numericSk, { seq: 42 }),
+      ).toBe("$myapp#v1#reading#seq_0000000000000042#")
+      expect(KeyComposer.serializeValue(42).length).toBe(KeyComposer.serializeValue(4242).length)
+    })
+
+    it("isolated collection index keeps the entity_version segment", () => {
+      const collectionIndex: KeyComposer.IndexDefinition = {
+        index: "gsi1",
+        collection: "tenantMembers",
+        type: "isolated",
+        pk: { field: "gsi1pk", composite: ["tenantId"] },
+        sk: { field: "gsi1sk", composite: ["status", "taskId"] },
+      }
+      expect(
+        KeyComposer.composeSortKeyBeginsWith(schema, "Task", 1, collectionIndex, {
+          status: "done",
+        }),
+      ).toBe("$myapp#v1#task_1#status_done#")
+    })
+
+    it("clustered collection index keeps the hierarchy", () => {
+      const clustered: KeyComposer.IndexDefinition = {
+        index: "gsi1",
+        collection: ["org", "team"],
+        type: "clustered",
+        pk: { field: "gsi1pk", composite: ["tenantId"] },
+        sk: { field: "gsi1sk", composite: ["status", "taskId"] },
+      }
+      expect(
+        KeyComposer.composeSortKeyBeginsWith(schema, "Task", 1, clustered, { status: "done" }),
+      ).toBe("$myapp#v1#org#team#task_1#status_done#")
+    })
+  })
 })

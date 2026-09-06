@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest"
-import { Config, ConfigProvider, Effect, Layer, Schema } from "effect"
+import { Config, ConfigProvider, DateTime, Effect, Layer, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 
 const configFromMap = (entries: Record<string, string>) =>
@@ -17,9 +17,11 @@ import {
   ResourceNotFoundError,
   ThrottlingError,
 } from "@effect-dynamodb/schema/Errors.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
+import type { SkConditionOps } from "../src/internal/BoundQuery.js"
 import * as Table from "../src/Table.js"
 
 // Create a mock DynamoClient layer for testing
@@ -779,6 +781,877 @@ describe("DynamoClient", () => {
           db.entities.AccountChannel.primary({}),
         ).toThrow(/EDD-9002.*accountId/)
       }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // .where() sort key conditions — issue #101
+  //
+  // A stored sort key is `$schema#v1#entity#<name>_<cased value>`. Before the
+  // fix the `.where()` operand was concatenated raw onto the entity prefix, so
+  // `gte` matched the whole partition (a raw value sorts below every
+  // `<name>_`-prefixed segment) while `begins_with` / `between` matched nothing.
+  // -------------------------------------------------------------------------
+
+  describe(".where() sort key conditions", () => {
+    const AppSchema = DynamoSchema.make({ name: "wheretest", version: 1 })
+
+    /** Build a client layer that captures `query` inputs into the provided array. */
+    const makeQueryCapturingClient = (captured: Array<unknown>) =>
+      Layer.succeed(DynamoClient, {
+        putItem: () => Effect.die("not used"),
+        getItem: () => Effect.die("not used"),
+        deleteItem: () => Effect.die("not used"),
+        updateItem: () => Effect.die("not used"),
+        query: (input) =>
+          Effect.sync(() => {
+            captured.push(input)
+            return { Items: [], Count: 0 } as never
+          }),
+        batchGetItem: () => Effect.die("not used"),
+        batchWriteItem: () => Effect.die("not used"),
+        transactGetItems: () => Effect.die("not used"),
+        transactWriteItems: () => Effect.die("not used"),
+        createTable: () => Effect.die("not used"),
+        deleteTable: () => Effect.die("not used"),
+        describeTable: () => Effect.die("not used"),
+        scan: () => Effect.die("not used"),
+      })
+
+    // Single SK composite — the shape from issue #101.
+    class Ball extends Schema.Class<Ball>("Ball")({
+      matchId: Schema.String,
+      ballKey: Schema.String,
+    }) {}
+
+    const Balls = Entity.make({
+      model: Ball,
+      entityType: "Ball",
+      primaryKey: {
+        pk: { field: "pk", composite: ["matchId"] },
+        sk: { field: "sk", composite: ["ballKey"] },
+      },
+      indexes: {
+        byMatch: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["matchId"] },
+          sk: { field: "gsi1sk", composite: ["ballKey"] },
+        },
+      },
+    })
+
+    // Two SK composites — exercises the non-terminal composite path.
+    class Reading extends Schema.Class<Reading>("Reading")({
+      deviceId: Schema.String,
+      status: Schema.String,
+      seq: Schema.String,
+    }) {}
+
+    const Readings = Entity.make({
+      model: Reading,
+      entityType: "Reading",
+      primaryKey: {
+        pk: { field: "pk", composite: ["deviceId"] },
+        sk: { field: "sk", composite: ["status", "seq"] },
+      },
+      indexes: {
+        byDevice: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["deviceId"] },
+          sk: { field: "gsi1sk", composite: ["status", "seq"] },
+        },
+      },
+    })
+
+    // Empty SK composite — `.where()` has nothing to constrain.
+    class Lookup extends Schema.Class<Lookup>("Lookup")({
+      lookupId: Schema.String,
+      email: Schema.String,
+    }) {}
+
+    const Lookups = Entity.make({
+      model: Lookup,
+      entityType: "Lookup",
+      primaryKey: {
+        pk: { field: "pk", composite: ["lookupId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        byEmail: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["email"] },
+          sk: { field: "gsi1sk", composite: [] },
+        },
+      },
+    })
+
+    const WhereTable = Table.make({
+      schema: AppSchema,
+      entities: { Balls, Readings, Lookups },
+    })
+
+    /** Run a `.where()` query and return the captured DynamoDB input. */
+    const capture = (
+      build: (db: {
+        readonly entities: {
+          readonly Balls: any
+          readonly Readings: any
+          readonly Lookups: any
+        }
+      }) => Effect.Effect<unknown, any, never>,
+    ) => {
+      const captured: Array<any> = []
+      const ClientLayer = makeQueryCapturingClient(captured)
+      const TableLayer = WhereTable.layer({ name: "where-table" })
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { Balls, Readings, Lookups },
+          tables: { WhereTable },
+        })
+        yield* build(db as never)
+        return captured[0]
+      }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+    }
+
+    const skValue = (input: any) => input.ExpressionAttributeValues[":sk"].S as string
+    const skLow = (input: any) => input.ExpressionAttributeValues[":sk1"].S as string
+    const skHigh = (input: any) => input.ExpressionAttributeValues[":sk2"].S as string
+
+    // --- named GSI accessor, single SK composite ---------------------------
+
+    describe("named GSI accessor (single SK composite)", () => {
+      const q = (fn: (t: any, ops: any) => any) => (db: any) =>
+        db.entities.Balls.byMatch({ matchId: "m-1" }).where(fn).collect()
+
+      it.effect("gte composes the operand into a full sort key value", () =>
+        Effect.gen(function* () {
+          const input = yield* capture(q((t, { gte }) => gte(t.ballKey, "1-009")))
+          expect(input.IndexName).toBe("gsi1")
+          expect(input.KeyConditionExpression).toContain("#sk >= :sk")
+          expect(skValue(input)).toBe("$wheretest#v1#ball#ballkey_1-009")
+        }),
+      )
+
+      it.effect("beginsWith composes the operand into a full sort key prefix", () =>
+        Effect.gen(function* () {
+          const input = yield* capture(q((t, { beginsWith }) => beginsWith(t.ballKey, "1-009")))
+          expect(input.KeyConditionExpression).toContain("begins_with(#sk, :sk)")
+          expect(skValue(input)).toBe("$wheretest#v1#ball#ballkey_1-009")
+        }),
+      )
+
+      it.effect("between composes both bounds", () =>
+        Effect.gen(function* () {
+          const input = yield* capture(q((t, { between }) => between(t.ballKey, "1-009", "1-011")))
+          expect(input.KeyConditionExpression).toContain("BETWEEN :sk1 AND :sk2")
+          expect(skLow(input)).toBe("$wheretest#v1#ball#ballkey_1-009")
+          expect(skHigh(input)).toBe("$wheretest#v1#ball#ballkey_1-011")
+        }),
+      )
+
+      it.effect("eq composes an exact sort key value", () =>
+        Effect.gen(function* () {
+          const input = yield* capture(q((t, { eq }) => eq(t.ballKey, "1-009-1-1")))
+          expect(input.KeyConditionExpression).toContain("#sk = :sk")
+          expect(skValue(input)).toBe("$wheretest#v1#ball#ballkey_1-009-1-1")
+        }),
+      )
+
+      it.effect("lt / lte / gt compose the operand", () =>
+        Effect.gen(function* () {
+          const lt = yield* capture(q((t, ops) => ops.lt(t.ballKey, "1-010")))
+          expect(lt.KeyConditionExpression).toContain("#sk < :sk")
+          expect(skValue(lt)).toBe("$wheretest#v1#ball#ballkey_1-010")
+
+          const lte = yield* capture(q((t, ops) => ops.lte(t.ballKey, "1-010")))
+          expect(lte.KeyConditionExpression).toContain("#sk <= :sk")
+          expect(skValue(lte)).toBe("$wheretest#v1#ball#ballkey_1-010")
+
+          const gt = yield* capture(q((t, ops) => ops.gt(t.ballKey, "1-010")))
+          expect(gt.KeyConditionExpression).toContain("#sk > :sk")
+          expect(skValue(gt)).toBe("$wheretest#v1#ball#ballkey_1-010")
+        }),
+      )
+
+      it.effect("applies schema casing to the operand", () =>
+        Effect.gen(function* () {
+          const input = yield* capture(q((t, { beginsWith }) => beginsWith(t.ballKey, "1-XYZ")))
+          expect(skValue(input)).toBe("$wheretest#v1#ball#ballkey_1-xyz")
+        }),
+      )
+    })
+
+    // --- primary-key accessor, single SK composite -------------------------
+
+    describe("primary-key accessor (single SK composite)", () => {
+      const q = (fn: (t: any, ops: any) => any) => (db: any) =>
+        db.entities.Balls.primary({ matchId: "m-1" }).where(fn).collect()
+
+      it.effect("gte / beginsWith / between compose against the base table SK", () =>
+        Effect.gen(function* () {
+          const gte = yield* capture(q((t, ops) => ops.gte(t.ballKey, "1-009")))
+          expect(gte.IndexName).toBeUndefined()
+          expect(skValue(gte)).toBe("$wheretest#v1#ball#ballkey_1-009")
+
+          const bw = yield* capture(q((t, ops) => ops.beginsWith(t.ballKey, "1-009")))
+          expect(skValue(bw)).toBe("$wheretest#v1#ball#ballkey_1-009")
+
+          const btw = yield* capture(q((t, ops) => ops.between(t.ballKey, "1-009", "1-011")))
+          expect(skLow(btw)).toBe("$wheretest#v1#ball#ballkey_1-009")
+          expect(skHigh(btw)).toBe("$wheretest#v1#ball#ballkey_1-011")
+        }),
+      )
+
+      it.effect("eq / lt / lte / gt compose against the base table SK", () =>
+        Effect.gen(function* () {
+          const eq = yield* capture(q((t, ops) => ops.eq(t.ballKey, "1-009-1-1")))
+          expect(skValue(eq)).toBe("$wheretest#v1#ball#ballkey_1-009-1-1")
+
+          const lt = yield* capture(q((t, ops) => ops.lt(t.ballKey, "1-010")))
+          expect(skValue(lt)).toBe("$wheretest#v1#ball#ballkey_1-010")
+
+          const lte = yield* capture(q((t, ops) => ops.lte(t.ballKey, "1-010")))
+          expect(skValue(lte)).toBe("$wheretest#v1#ball#ballkey_1-010")
+
+          const gt = yield* capture(q((t, ops) => ops.gt(t.ballKey, "1-010")))
+          expect(skValue(gt)).toBe("$wheretest#v1#ball#ballkey_1-010")
+        }),
+      )
+    })
+
+    // --- multi-composite sort keys ----------------------------------------
+
+    describe("multi-composite sort key", () => {
+      const MAX = "￿"
+
+      it.effect("targets the leading composite when none are pinned", () =>
+        Effect.gen(function* () {
+          const input = yield* capture((db: any) =>
+            db.entities.Readings.byDevice({ deviceId: "d-1" })
+              .where((t: any, ops: any) => ops.gte(t.status, "done"))
+              .collect(),
+          )
+          expect(skValue(input)).toBe("$wheretest#v1#reading#status_done")
+        }),
+      )
+
+      // With leading composites pinned by the accessor, a one-sided operator
+      // must be clamped to the pinned prefix — `Query.where` REPLACES the
+      // accessor's own `begins_with`, so an unclamped `>=` would leak into the
+      // next composite value's keys.
+      it.effect("clamps a one-sided condition to the accessor's pinned prefix", () =>
+        Effect.gen(function* () {
+          const pinned = "$wheretest#v1#reading#status_done"
+
+          const gte = yield* capture((db: any) =>
+            db.entities.Readings.byDevice({ deviceId: "d-1", status: "done" })
+              .where((t: any, ops: any) => ops.gte(t.seq, "0042"))
+              .collect(),
+          )
+          expect(gte.KeyConditionExpression).toContain("BETWEEN :sk1 AND :sk2")
+          expect(skLow(gte)).toBe(`${pinned}#seq_0042`)
+          expect(skHigh(gte)).toBe(`${pinned}#${MAX}`)
+
+          const gt = yield* capture((db: any) =>
+            db.entities.Readings.byDevice({ deviceId: "d-1", status: "done" })
+              .where((t: any, ops: any) => ops.gt(t.seq, "0042"))
+              .collect(),
+          )
+          expect(skLow(gt)).toBe(`${pinned}#seq_0042#${MAX}`)
+          expect(skHigh(gt)).toBe(`${pinned}#${MAX}`)
+
+          const lte = yield* capture((db: any) =>
+            db.entities.Readings.byDevice({ deviceId: "d-1", status: "done" })
+              .where((t: any, ops: any) => ops.lte(t.seq, "0042"))
+              .collect(),
+          )
+          // Low bound is delimiter-terminated (#115) — the pinned composites
+          // are a strict prefix, so the bound must stop on a segment boundary.
+          expect(skLow(lte)).toBe(`${pinned}#`)
+          expect(skHigh(lte)).toBe(`${pinned}#seq_0042`)
+        }),
+      )
+
+      it.effect("lt on a pinned terminal composite is refused (EDD-9046)", () =>
+        Effect.gen(function* () {
+          // DynamoDB has one sort key condition, BETWEEN is inclusive at both
+          // ends, and a FilterExpression may not reference a key attribute — so
+          // `begins_with(prefix) AND sk < value` is inexpressible. Refuse rather
+          // than silently return the boundary item.
+          const ClientLayer = makeQueryCapturingClient([])
+          const TableLayer = WhereTable.layer({ name: "where-table" })
+          yield* Effect.gen(function* () {
+            const db = yield* DynamoClient.make({
+              entities: { Balls, Readings, Lookups },
+              tables: { WhereTable },
+            })
+            expect(() =>
+              (db.entities.Readings.byDevice({ deviceId: "d-1", status: "done" }) as any).where(
+                (t: any, ops: any) => ops.lt(t.seq, "0042"),
+              ),
+            ).toThrow(/EDD-9046.*seq.*status/s)
+          }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+        }),
+      )
+
+      it.effect("eq / beginsWith / between stay inside the pinned prefix unchanged", () =>
+        Effect.gen(function* () {
+          const pinned = "$wheretest#v1#reading#status_done"
+
+          const eq = yield* capture((db: any) =>
+            db.entities.Readings.byDevice({ deviceId: "d-1", status: "done" })
+              .where((t: any, ops: any) => ops.eq(t.seq, "0042"))
+              .collect(),
+          )
+          expect(eq.KeyConditionExpression).toContain("#sk = :sk")
+          expect(skValue(eq)).toBe(`${pinned}#seq_0042`)
+
+          const btw = yield* capture((db: any) =>
+            db.entities.Readings.byDevice({ deviceId: "d-1", status: "done" })
+              .where((t: any, ops: any) => ops.between(t.seq, "0001", "0042"))
+              .collect(),
+          )
+          expect(skLow(btw)).toBe(`${pinned}#seq_0001`)
+          expect(skHigh(btw)).toBe(`${pinned}#seq_0042`)
+        }),
+      )
+
+      it.effect("eq on a non-terminal composite becomes a subtree begins_with", () =>
+        Effect.gen(function* () {
+          const input = yield* capture((db: any) =>
+            db.entities.Readings.byDevice({ deviceId: "d-1" })
+              .where((t: any, ops: any) => ops.eq(t.status, "done"))
+              .collect(),
+          )
+          expect(input.KeyConditionExpression).toContain("begins_with(#sk, :sk)")
+          expect(skValue(input)).toBe("$wheretest#v1#reading#status_done#")
+        }),
+      )
+
+      it.effect("inclusive upper bounds on a non-terminal composite span its subtree", () =>
+        Effect.gen(function* () {
+          const lte = yield* capture((db: any) =>
+            db.entities.Readings.byDevice({ deviceId: "d-1" })
+              .where((t: any, ops: any) => ops.lte(t.status, "done"))
+              .collect(),
+          )
+          expect(skValue(lte)).toBe(`$wheretest#v1#reading#status_done#${MAX}`)
+
+          const gt = yield* capture((db: any) =>
+            db.entities.Readings.byDevice({ deviceId: "d-1" })
+              .where((t: any, ops: any) => ops.gt(t.status, "done"))
+              .collect(),
+          )
+          expect(skValue(gt)).toBe(`$wheretest#v1#reading#status_done#${MAX}`)
+
+          const btw = yield* capture((db: any) =>
+            db.entities.Readings.byDevice({ deviceId: "d-1" })
+              .where((t: any, ops: any) => ops.between(t.status, "a", "done"))
+              .collect(),
+          )
+          expect(skLow(btw)).toBe("$wheretest#v1#reading#status_a")
+          expect(skHigh(btw)).toBe(`$wheretest#v1#reading#status_done#${MAX}`)
+        }),
+      )
+
+      it.effect("exclusive lower / upper bounds stay at the composite boundary", () =>
+        Effect.gen(function* () {
+          const gte = yield* capture((db: any) =>
+            db.entities.Readings.byDevice({ deviceId: "d-1" })
+              .where((t: any, ops: any) => ops.gte(t.status, "done"))
+              .collect(),
+          )
+          expect(skValue(gte)).toBe("$wheretest#v1#reading#status_done")
+
+          const lt = yield* capture((db: any) =>
+            db.entities.Readings.byDevice({ deviceId: "d-1" })
+              .where((t: any, ops: any) => ops.lt(t.status, "done"))
+              .collect(),
+          )
+          expect(skValue(lt)).toBe("$wheretest#v1#reading#status_done")
+        }),
+      )
+    })
+
+    // --- error cases -------------------------------------------------------
+
+    describe("errors", () => {
+      const ClientLayer = makeQueryCapturingClient([])
+      const TableLayer = WhereTable.layer({ name: "where-table" })
+
+      it.effect("EDD-9004 when the condition skips a leading SK composite", () =>
+        Effect.gen(function* () {
+          const db = yield* DynamoClient.make({
+            entities: { Balls, Readings, Lookups },
+            tables: { WhereTable },
+          })
+          expect(() =>
+            (db.entities.Readings.byDevice({ deviceId: "d-1" }) as any).where((t: any, ops: any) =>
+              ops.gte(t.seq, "0042"),
+            ),
+          ).toThrow(/EDD-9004.*seq.*status/s)
+        }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer))),
+      )
+
+      it.effect("EDD-9045 when the index SK has no composites", () =>
+        Effect.gen(function* () {
+          const db = yield* DynamoClient.make({
+            entities: { Balls, Readings, Lookups },
+            tables: { WhereTable },
+          })
+          expect(() =>
+            (db.entities.Lookups.byEmail({ email: "a@b.com" }) as any).where((t: any, ops: any) =>
+              ops.gte(t.anything, "x"),
+            ),
+          ).toThrow(/EDD-9045/)
+        }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer))),
+      )
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Sort key prefix delimiter (#115) + typed `.where()` operands (#114)
+  // -------------------------------------------------------------------------
+
+  describe("sort key prefix + operand serialization", () => {
+    const AppSchema = DynamoSchema.make({ name: "skprefix", version: 1 })
+
+    const makeQueryCapturingClient = (captured: Array<unknown>) =>
+      Layer.succeed(DynamoClient, {
+        putItem: () => Effect.die("not used"),
+        getItem: () => Effect.die("not used"),
+        deleteItem: () => Effect.die("not used"),
+        updateItem: () => Effect.die("not used"),
+        query: (input) =>
+          Effect.sync(() => {
+            captured.push(input)
+            return { Items: [], Count: 0 } as never
+          }),
+        batchGetItem: () => Effect.die("not used"),
+        batchWriteItem: () => Effect.die("not used"),
+        transactGetItems: () => Effect.die("not used"),
+        transactWriteItems: () => Effect.die("not used"),
+        createTable: () => Effect.die("not used"),
+        deleteTable: () => Effect.die("not used"),
+        describeTable: () => Effect.die("not used"),
+        scan: () => Effect.die("not used"),
+      })
+
+    // Two SK composites — the partial-prefix shape from #115.
+    class Task extends Schema.Class<Task>("Task")({
+      tenantId: Schema.String,
+      status: Schema.String,
+      taskId: Schema.String,
+    }) {}
+
+    const Tasks = Entity.make({
+      model: Task,
+      entityType: "Task",
+      primaryKey: {
+        pk: { field: "pk", composite: ["tenantId"] },
+        sk: { field: "sk", composite: ["status", "taskId"] },
+      },
+      indexes: {
+        byTenant: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["tenantId"] },
+          sk: { field: "gsi1sk", composite: ["status", "taskId"] },
+        },
+      },
+    })
+
+    // Single SK composite — supplying it is a COMPLETE key, so no delimiter.
+    class Note extends Schema.Class<Note>("Note")({
+      boardId: Schema.String,
+      label: Schema.String,
+    }) {}
+
+    const Notes = Entity.make({
+      model: Note,
+      entityType: "Note",
+      primaryKey: {
+        pk: { field: "pk", composite: ["boardId"] },
+        sk: { field: "sk", composite: ["label"] },
+      },
+      indexes: {
+        byBoard: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["boardId"] },
+          sk: { field: "gsi1sk", composite: ["label"] },
+        },
+      },
+    })
+
+    // Non-string SK composites — the #114 shapes.
+    class Sample extends Schema.Class<Sample>("Sample")({
+      deviceId: Schema.String,
+      seq: Schema.Number,
+      big: Schema.BigIntFromString,
+      ok: Schema.Boolean,
+      at: Schema.Date,
+      zoned: Schema.DateTimeUtc,
+    }) {}
+
+    const Samples = Entity.make({
+      model: Sample,
+      entityType: "Sample",
+      primaryKey: {
+        pk: { field: "pk", composite: ["deviceId"] },
+        sk: { field: "sk", composite: ["seq"] },
+      },
+      indexes: {
+        byBig: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["deviceId"] },
+          sk: { field: "gsi1sk", composite: ["big"] },
+        },
+        byFlag: {
+          name: "gsi2",
+          pk: { field: "gsi2pk", composite: ["deviceId"] },
+          sk: { field: "gsi2sk", composite: ["ok"] },
+        },
+        byAt: {
+          name: "gsi3",
+          pk: { field: "gsi3pk", composite: ["deviceId"] },
+          sk: { field: "gsi3sk", composite: ["at"] },
+        },
+        byZoned: {
+          name: "gsi4",
+          pk: { field: "gsi4pk", composite: ["deviceId"] },
+          sk: { field: "gsi4sk", composite: ["zoned"] },
+        },
+      },
+    })
+
+    const SkTable = Table.make({ schema: AppSchema, entities: { Tasks, Notes, Samples } })
+
+    const capture = (build: (db: any) => Effect.Effect<unknown, any, never>) => {
+      const captured: Array<any> = []
+      const ClientLayer = makeQueryCapturingClient(captured)
+      const TableLayer = SkTable.layer({ name: "sk-table" })
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { Tasks, Notes, Samples },
+          tables: { SkTable },
+        })
+        yield* build(db)
+        return captured[0]
+      }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+    }
+
+    const skValue = (input: any) => input.ExpressionAttributeValues[":sk"].S as string
+    const skLow = (input: any) => input.ExpressionAttributeValues[":sk1"].S as string
+    const skHigh = (input: any) => input.ExpressionAttributeValues[":sk2"].S as string
+
+    // --- #115 accessor prefix delimiter --------------------------------
+
+    describe("accessor begins_with delimiter (#115)", () => {
+      it.effect("partial SK composites terminate the prefix on a segment boundary", () =>
+        Effect.gen(function* () {
+          const gsi = yield* capture((db) =>
+            db.entities.Tasks.byTenant({ tenantId: "acme", status: "done" }).collect(),
+          )
+          expect(gsi.KeyConditionExpression).toContain("begins_with(#sk, :sk)")
+          expect(skValue(gsi)).toBe("$skprefix#v1#task#status_done#")
+
+          const pk = yield* capture((db) =>
+            db.entities.Tasks.primary({ tenantId: "acme", status: "done" }).collect(),
+          )
+          expect(skValue(pk)).toBe("$skprefix#v1#task#status_done#")
+        }),
+      )
+
+      it.effect("a complete SK composite set gets NO delimiter", () =>
+        Effect.gen(function* () {
+          const input = yield* capture((db) =>
+            db.entities.Tasks.byTenant({
+              tenantId: "acme",
+              status: "done",
+              taskId: "t1",
+            }).collect(),
+          )
+          // Appending a delimiter here would match nothing — the stored key
+          // ends at taskId.
+          expect(skValue(input)).toBe("$skprefix#v1#task#status_done#taskid_t1")
+        }),
+      )
+
+      it.effect("single-composite sort key is a complete key, so NO delimiter", () =>
+        Effect.gen(function* () {
+          const input = yield* capture((db) =>
+            db.entities.Notes.byBoard({ boardId: "b1", label: "ship" }).collect(),
+          )
+          expect(skValue(input)).toBe("$skprefix#v1#note#label_ship")
+        }),
+      )
+
+      it.effect("the delimiter excludes sibling values the operand is a prefix of", () =>
+        Effect.gen(function* () {
+          const input = yield* capture((db) =>
+            db.entities.Tasks.byTenant({ tenantId: "acme", status: "done" }).collect(),
+          )
+          const operand = skValue(input)
+          // Compose the stored keys the write path would produce.
+          const stored = (status: string, taskId: string) =>
+            KeyComposer.composeSk(
+              AppSchema,
+              "Task",
+              1,
+              {
+                pk: { field: "pk", composite: ["tenantId"] },
+                sk: { field: "sk", composite: ["status", "taskId"] },
+              },
+              { status, taskId },
+            )
+          expect(stored("done", "t1").startsWith(operand)).toBe(true)
+          expect(stored("done_archived", "t3").startsWith(operand)).toBe(false)
+          expect(stored("doneish", "t4").startsWith(operand)).toBe(false)
+        }),
+      )
+    })
+
+    // --- #115 the same rule inside .where() clamping -------------------
+
+    describe("where() clamping uses the same delimiter rule (#115)", () => {
+      const MAX = "￿"
+
+      it.effect("pinned-prefix BETWEEN bounds terminate on a segment boundary", () =>
+        Effect.gen(function* () {
+          const input = yield* capture((db) =>
+            db.entities.Tasks.byTenant({ tenantId: "acme", status: "done" })
+              .where((t, { gte }) => gte(t.taskId, "t2"))
+              .collect(),
+          )
+          expect(skLow(input)).toBe("$skprefix#v1#task#status_done#taskid_t2")
+          expect(skHigh(input)).toBe(`$skprefix#v1#task#status_done#${MAX}`)
+        }),
+      )
+
+      it.effect("eq on a non-terminal composite is a delimiter-terminated subtree", () =>
+        Effect.gen(function* () {
+          const input = yield* capture((db) =>
+            db.entities.Tasks.byTenant({ tenantId: "acme" })
+              .where((t, { eq }) => eq(t.status, "done"))
+              .collect(),
+          )
+          expect(input.KeyConditionExpression).toContain("begins_with(#sk, :sk)")
+          expect(skValue(input)).toBe("$skprefix#v1#task#status_done#")
+        }),
+      )
+
+      it.effect("gt on a terminal composite keeps the unconditional sentinel delimiter", () =>
+        Effect.gen(function* () {
+          // `compose(v)￿` alone would sort below `compose(v + "0")`, which is a
+          // strictly greater value that must stay inside a `gt`.
+          const input = yield* capture((db) =>
+            db.entities.Tasks.byTenant({ tenantId: "acme", status: "done" })
+              .where((t, { gt }) => gt(t.taskId, "t2"))
+              .collect(),
+          )
+          expect(skLow(input)).toBe(`$skprefix#v1#task#status_done#taskid_t2#${MAX}`)
+          expect(skLow(input) < "$skprefix#v1#task#status_done#taskid_t20").toBe(true)
+        }),
+      )
+    })
+
+    // --- #114 operand serialization ------------------------------------
+
+    describe("operand serialization (#114)", () => {
+      it.effect("number composite is zero-padded to 16 digits like the stored key", () =>
+        Effect.gen(function* () {
+          const input = yield* capture((db) =>
+            db.entities.Samples.primary({ deviceId: "d1" })
+              .where((t, { gte }) => gte(t.seq, 42))
+              .collect(),
+          )
+          expect(skValue(input)).toBe("$skprefix#v1#sample#seq_0000000000000042")
+        }),
+      )
+
+      it.effect("a numeric-Type/string-Encoded composite is padded, not stored raw", () =>
+        Effect.gen(function* () {
+          // `big` is `Schema.BigIntFromString` — Type bigint, Encoded string, so
+          // the rule's exception applies: compose from the numeric Type value so
+          // `serializeValue` pads it. Composing the encoded "42" sorted
+          // 100 < 42 < 5.
+          const input = yield* capture((db) =>
+            db.entities.Samples.byBig({ deviceId: "d1" })
+              .where((t, { lte }) => lte(t.big, 42n))
+              .collect(),
+          )
+          expect(skValue(input)).toBe(`$skprefix#v1#sample#big_${"42".padStart(38, "0")}`)
+        }),
+      )
+
+      it.effect("mixed-width values order numerically on a transformed composite", () =>
+        Effect.gen(function* () {
+          const keys: Array<string> = []
+          for (const v of [5n, 42n, 100n]) {
+            const input = yield* capture((db) =>
+              db.entities.Samples.byBig({ deviceId: "d1" })
+                .where((t, { eq }) => eq(t.big, v))
+                .collect(),
+            )
+            keys.push(skValue(input))
+          }
+          expect([...keys].sort()).toEqual(keys)
+        }),
+      )
+
+      it.effect("an UNtransformed bigint composite keeps the 38-digit padding", () =>
+        Effect.gen(function* () {
+          // Plain `Schema.BigInt` has no encoding transformation, so both the
+          // write path and the operand fall through to `serializeValue`, which
+          // pads. (Such an entity cannot be read back from DynamoDB — the SDK
+          // unmarshalls `N` to a JS number — but the key composition on both
+          // sides still agrees.)
+          class Counter extends Schema.Class<Counter>("Counter")({
+            counterId: Schema.String,
+            tick: Schema.BigInt,
+          }) {}
+          const Counters = Entity.make({
+            model: Counter,
+            entityType: "Counter",
+            primaryKey: {
+              pk: { field: "pk", composite: ["counterId"] },
+              sk: { field: "sk", composite: ["tick"] },
+            },
+          })
+          const CounterTable = Table.make({ schema: AppSchema, entities: { Counters } })
+          const captured: Array<any> = []
+          yield* Effect.gen(function* () {
+            const db = yield* DynamoClient.make({
+              entities: { Counters },
+              tables: { CounterTable },
+            })
+            yield* db.entities.Counters.primary({ counterId: "c1" })
+              .where((t, { gte }) => gte(t.tick, 42n))
+              .collect()
+          }).pipe(
+            Effect.provide(
+              Layer.merge(
+                makeQueryCapturingClient(captured),
+                CounterTable.layer({ name: "counter-table" }),
+              ),
+            ),
+          )
+          expect(skValue(captured[0])).toBe(`$skprefix#v1#counter#tick_${"42".padStart(38, "0")}`)
+        }),
+      )
+
+      it.effect("refuses an operand that cannot be encoded (EDD-9050)", () =>
+        Effect.gen(function* () {
+          const ClientLayer = makeQueryCapturingClient([])
+          const TableLayer = SkTable.layer({ name: "sk-table" })
+          yield* Effect.gen(function* () {
+            const db = yield* DynamoClient.make({
+              entities: { Tasks, Notes, Samples },
+              tables: { SkTable },
+            })
+            expect(() =>
+              (db.entities.Samples.byBig({ deviceId: "d1" }) as any).where((t: any, ops: any) =>
+                ops.eq(t.big, "not-a-number"),
+              ),
+            ).toThrow(/EDD-9050.*big/s)
+          }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+        }),
+      )
+
+      it.effect("refuses an accessor composite that cannot be encoded (EDD-9050)", () =>
+        Effect.gen(function* () {
+          const ClientLayer = makeQueryCapturingClient([])
+          const TableLayer = SkTable.layer({ name: "sk-table" })
+          yield* Effect.gen(function* () {
+            const db = yield* DynamoClient.make({
+              entities: { Tasks, Notes, Samples },
+              tables: { SkTable },
+            })
+            expect(() =>
+              (db.entities.Samples.byBig as any)({ deviceId: "d1", big: "not-a-number" }),
+            ).toThrow(/EDD-9050.*big/s)
+          }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+        }),
+      )
+
+      it.effect("boolean composite serializes to true/false", () =>
+        Effect.gen(function* () {
+          const input = yield* capture((db) =>
+            db.entities.Samples.byFlag({ deviceId: "d1" })
+              .where((t, { eq }) => eq(t.ok, true))
+              .collect(),
+          )
+          expect(skValue(input)).toBe("$skprefix#v1#sample#ok_true")
+        }),
+      )
+
+      it.effect("Date composite serializes to its ISO form (lower-cased by key casing)", () =>
+        Effect.gen(function* () {
+          const input = yield* capture((db) =>
+            db.entities.Samples.byAt({ deviceId: "d1" })
+              .where((t, { gt }) => gt(t.at, new Date("2026-02-11T00:00:00.000Z")))
+              .collect(),
+          )
+          expect(skValue(input)).toBe("$skprefix#v1#sample#at_2026-02-11t00:00:00.000z")
+        }),
+      )
+
+      it.effect("DateTime composite serializes to its ISO form", () =>
+        Effect.gen(function* () {
+          const dt = DateTime.makeUnsafe("2026-02-11T00:00:00.000Z")
+          const input = yield* capture((db) =>
+            db.entities.Samples.byZoned({ deviceId: "d1" })
+              .where((t, { gte }) => gte(t.zoned, dt))
+              .collect(),
+          )
+          expect(skValue(input)).toBe("$skprefix#v1#sample#zoned_2026-02-11t00:00:00.000z")
+        }),
+      )
+
+      it.effect("between serializes both bounds", () =>
+        Effect.gen(function* () {
+          const input = yield* capture((db) =>
+            db.entities.Samples.primary({ deviceId: "d1" })
+              .where((t, { between }) => between(t.seq, 5, 100))
+              .collect(),
+          )
+          expect(skLow(input)).toBe("$skprefix#v1#sample#seq_0000000000000005")
+          expect(skHigh(input)).toBe("$skprefix#v1#sample#seq_0000000000000100")
+        }),
+      )
+
+      it.effect("string composites are unchanged — serializeValue is identity", () =>
+        Effect.gen(function* () {
+          const input = yield* capture((db) =>
+            db.entities.Tasks.byTenant({ tenantId: "acme" })
+              .where((t, { beginsWith }) => beginsWith(t.status, "do"))
+              .collect(),
+          )
+          expect(skValue(input)).toBe("$skprefix#v1#task#status_do")
+        }),
+      )
+
+      it("rejects a stringly-typed operand on a non-string composite", () => {
+        // The #114 defect: `"42"` compiled and then sorted after every stored
+        // (padded) value. The type now refuses it.
+        const _typeGuard = (db: any) =>
+          db.entities.Samples.primary({ deviceId: "d1" }).where(
+            (t: { seq: number }, ops: SkConditionOps<{ seq: number }>) =>
+              // @ts-expect-error — string is not assignable to a number composite
+              ops.gte(t.seq, "42"),
+          )
+        expect(typeof _typeGuard).toBe("function")
+      })
+
+      it("still accepts an arbitrary string bound on a string composite", () => {
+        // Literal-union and plain string composites widen to `string` so open
+        // bounds and prefixes that are not themselves values still typecheck.
+        const _typeGuard = (db: any) =>
+          db.entities.Tasks.byTenant({ tenantId: "acme" }).where(
+            (t: { status: string; taskId: string }, ops: SkConditionOps<{ status: string }>) =>
+              ops.beginsWith(t.status, "d"),
+          )
+        expect(typeof _typeGuard).toBe("function")
+      })
     })
   })
 })

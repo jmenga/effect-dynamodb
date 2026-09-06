@@ -14,6 +14,7 @@ import {
   composeCollectionKey,
   composeIsolatedSortKey,
   composeKey,
+  KEY_DELIMITER,
 } from "./DynamoSchema.js"
 import type { CompositeKeyHoleError } from "./Errors.js"
 
@@ -749,11 +750,69 @@ export const composeVectorPartition = (
 export type { CompositeKeyHoleError }
 
 /**
+ * Count the leading SK composites present in `record`, stopping at the first
+ * missing one — the same walk `composeSortKeyPrefix` performs.
+ */
+const availableSkCount = (index: IndexDefinition, record: Record<string, unknown>): number => {
+  let n = 0
+  for (const attr of index.sk.composite) {
+    const value = record[attr]
+    if (value === undefined || value === null) break
+    n++
+  }
+  return n
+}
+
+/**
+ * Compose the operand for a `begins_with` sort key condition from the leading
+ * SK composites present in `record`.
+ *
+ * This is `composeSortKeyPrefix` plus **the delimiter rule**: a trailing
+ * `KEY_DELIMITER` is appended **iff at least one composite remains
+ * unsupplied**.
+ *
+ * Why the rule is conditional:
+ *
+ * - **Partial prefix** — composites remain, so the stored key continues past
+ *   this point with `#<next>`. Without the delimiter the operand stops
+ *   mid-segment and silently matches sibling values that merely *start with*
+ *   the supplied one: `status_done` would also match `status_done_archived`
+ *   and `status_doneish` (issue #115).
+ * - **Complete key** — every composite was supplied, so the stored key ends
+ *   here. Appending a delimiter would match nothing.
+ *
+ * Padded composites (numbers, bigints) are fixed-width by construction, so
+ * they cannot be prefixes of one another and were never affected — do NOT
+ * "simplify" the rule away on the grounds that the numeric fixtures pass
+ * either way. The string and free-text composites are what it protects.
+ *
+ * Every consumer that turns SK composites into a key *prefix* must use this
+ * function (or the same rule) — the entity/GSI query accessors and the
+ * `BETWEEN` bounds that clamp a `.where()` condition to an accessor-pinned
+ * prefix. Two call sites disagreeing about where a segment ends is the bug.
+ */
+export const composeSortKeyBeginsWith = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  entityVersion: number,
+  index: IndexDefinition,
+  record: Record<string, unknown>,
+): string => {
+  const prefix = composeSortKeyPrefix(schema, entityType, entityVersion, index, record)
+  const complete = availableSkCount(index, record) === index.sk.composite.length
+  return complete ? prefix : `${prefix}${KEY_DELIMITER}`
+}
+
+/**
  * Compose a partial sort key prefix for query operations.
  * Used when not all SK composite attributes are provided.
  *
  * For example, if SK composite is ["department", "hireDate"] and only "department"
  * is provided, this generates a begins_with prefix.
+ *
+ * This is the raw composed **value** at a position — it carries no trailing
+ * delimiter. For a `begins_with` operand use `composeSortKeyBeginsWith`, which
+ * adds the delimiter when composites remain.
  */
 export const composeSortKeyPrefix = (
   schema: DynamoSchema.DynamoSchema,

@@ -77,9 +77,8 @@ const allMembers = yield* db.entities.Memberships.primary({
   orgId: "org-acme",
 }).collect()
 
-// Narrow by sort-key prefix — equivalent to `.get()` here because the full SK
-// composite is provided, but returns an array (possibly empty) rather than
-// failing with `ItemNotFound`.
+// Narrow by sort-key prefix — the full SK composite is provided, so this
+// returns an array (possibly empty) rather than failing with `ItemNotFound`.
 const bobs = yield* db.entities.Memberships.primary({
   orgId: "org-acme",
   userId: "u-bob",
@@ -88,22 +87,65 @@ const bobs = yield* db.entities.Memberships.primary({
 
 Behavior is symmetric with GSI accessors: `.where()`, `.filter()`, `.select()`, `.limit()`, `.reverse()`, `.startFrom()`, `.consistentRead()`, `.collect()`, `.fetch()`, `.paginate()`, and `.count()` all chain off the returned `BoundQuery`.
 
+### How much of the sort key an accessor pins
+
+Supplying **some** of the sort key composites narrows to exactly those composite values. The generated `begins_with` stops on a segment boundary, so a value is never confused with a longer sibling — `byTenant({ tenantId, status: "done" })` on `sk: ["status", "taskId"]` matches `done` only, not `done_archived` or `doneish`.
+
+Supplying **all** of them is still a prefix match, not an exact one: the stored key ends there, so there is no boundary left to stop on and a longer sibling value can match. On `sk: ["label"]`, `byBoard({ boardId, label: "ship" })` also returns `shipped` and `ship_it`. Use `.get()` when you want exactly one item, or leave the composite off the accessor and pass it to `.where()` instead — `byBoard({ boardId }).where((t, { eq }) => eq(t.label, "ship"))` compiles to `sk = …#label_ship`, an exact match.
+
 ## Sort Key Conditions
 
 `.where()` adds a `KeyConditionExpression` against a remaining sort key composite — DynamoDB evaluates it on the index server-side, so it **does** reduce read capacity. Use it whenever the condition is on a sort-key composite the accessor hasn't already pinned. Operators: `eq`, `lt`, `lte`, `gt`, `gte`, `between`, `beginsWith`.
 
-```typescript
-// Index: byProject — pk: ["projectId"], sk: ["status", "createdAt"]
-// `.byProject({ projectId })` pins the PK; `status` + `createdAt` remain on the SK.
+The operand you pass is a **composite attribute value**, not a raw sort key. The library runs it through the same pipeline the write path used — the composite's own codec, then serialization, then casing — and drops the result into the same `$schema#v1#entity#<name>_<value>` shape, so `gte(t.createdAt, "2025-02-10")` compares like-for-like against the stored key.
 
-const recentDone = yield* db.entities.TaskEntity
-  .byProject({ projectId: "proj-alpha" })
-  .where((t, { eq }) => eq(t.status, "done"))
-  .where((t, { gt }) => gt(t.createdAt, "2026-01-01"))
+That includes the composite's **type**. A composite typed `number`, `bigint`, `boolean`, `Date` or `DateTime` takes a value of that type, not a string, because the write path zero-pads numbers (16 digits) and bigints (38 digits) and formats dates as ISO strings. Passing `"42"` for a numeric composite is a compile error rather than a query that silently matches nothing.
+
+It also covers composites whose schema **transforms** between its domain type and what DynamoDB stores. `Schema.BigIntFromString` has a `bigint` domain type and a string wire form, so a `420n` composite is stored as `txn_420`; `.where((t, { eq }) => eq(t.txn, 420n))` encodes the operand the same way and finds it. A value that cannot be encoded at all — a prefix string against a `bigint` composite, say — is refused with `EDD-9050` rather than silently compared against nothing.
+
+:::note[Keys and composites always take the domain type]
+`.get()`, `.update()`, `.delete()` and every query accessor take the composite's **domain** value — the same one the model holds and `.where()` accepts — never its stored wire form. On the `Ledger` above that is `get({ bookId, txn: 420n })`, not `get({ bookId, txn: "420" })`; the wire form is rejected with a `ValidationError` naming the attribute. One convention across the whole API.
+:::
+
+```typescript region="sk-conditions" example="guide-queries.ts"
+// byProject SK composites: ["status", "createdAt"].
+// `.where()` constrains the first composite the accessor did not pin.
+const activeTasks = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+  .where((t, { eq }) => eq(t.status, "active"))
+  .collect()
+
+// Pin `status` on the accessor, then range over `createdAt`.
+const activeSinceFeb = yield* db.entities.TaskEntity.byProject({
+  projectId: "proj-alpha",
+  status: "active",
+})
+  .where((t, { gte }) => gte(t.createdAt, "2025-02-10"))
+  .collect()
+
+// `between` is inclusive at both ends.
+const activeInFeb = yield* db.entities.TaskEntity.byProject({
+  projectId: "proj-alpha",
+  status: "active",
+})
+  .where((t, { between }) => between(t.createdAt, "2025-02-01", "2025-02-28"))
   .collect()
 ```
 
-`.where()` is **only available on a `BoundQuery` whose remaining SK composites are non-empty.** Once you have already supplied every SK composite to the accessor (or after a previous `.where()` consumes them), the method is no longer present on the type — calling it is a compile error. This makes it impossible to issue a sort-key condition that DynamoDB would reject at runtime.
+```typescript region="sk-typed-operands" example="guide-queries.ts"
+// `estimateHours` is a number, so `.where()` takes a number — not a string.
+// The library zero-pads it exactly as the stored key was padded.
+const bigTasks = yield* db.entities.TaskEntity.byEstimate({ projectId: "proj-alpha" })
+  .where((t, { gte }) => gte(t.estimateHours, 8))
+  .collect()
+```
+
+`.where()` consumes the remaining SK composites — it can be called **once** per query. Constrain a later composite by pinning the earlier ones on the accessor itself, as `activeSinceFeb` does above. Targeting a composite while an earlier one is still unpinned is rejected with `EDD-9004`, and calling `.where()` on an index whose sort key has no composites is rejected with `EDD-9045`.
+
+A condition on a **non-terminal** composite (`status`, with `createdAt` still to follow) covers that value's whole subtree: `eq(t.status, "active")` matches every `active` task regardless of `createdAt`, and `lte`/`between` include the far edge of the subtree.
+
+:::caution[One case DynamoDB cannot express]
+A strict `lt` on the **last** SK composite when the accessor has pinned an earlier one — `byProject({ projectId, status: "active" }).where((t, { lt }) => lt(t.createdAt, "2025-03-01"))` — needs `begins_with(prefix) AND sk < value`. DynamoDB allows only one sort key condition, `BETWEEN` is inclusive at both ends, and a `FilterExpression` may not reference a key attribute. Rather than silently returning the boundary item, this throws `EDD-9046`; use `between` or `lte` instead.
+:::
 
 ## Post-Query Filtering
 

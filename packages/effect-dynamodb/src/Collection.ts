@@ -10,6 +10,11 @@
 
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import {
+  compositeKeyFormKind,
+  makeCompositeKeyForm,
+  toCompositeKeyRecord,
+} from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, type Schema } from "effect"
@@ -84,6 +89,43 @@ export interface Collection<TEntities extends Record<string, CollectionEntity>> 
  * @param entities - Map of entity names to Entity instances
  * @returns A Collection with a `.query()` method and per-entity selector methods
  */
+/**
+ * The composite key form for one collection member — the same rule
+ * (`internal/CompositeCodec.ts`) its own accessors and its write path apply.
+ *
+ * Without it, `Collections.make()`'s query builder composed the partition key
+ * from the caller's raw Type-side record while the rows were written from the
+ * key form, so a `DateEpochMs` or `BigIntFromString` composite matched nothing.
+ */
+/** The schema a member's key form is derived from — `inputSchema` when the
+ * member is a runtime entity, else its raw model. */
+const keyFormSourceOf = (entity: unknown): Schema.Top => {
+  const e = entity as {
+    readonly model?: unknown
+    readonly schemas?: { readonly inputSchema?: unknown }
+  }
+  return (e.schemas?.inputSchema ?? e.model) as Schema.Top
+}
+
+const collectionKeyForm = (
+  entity: unknown,
+  record: Record<string, unknown>,
+): Record<string, unknown> => {
+  const e = entity as {
+    readonly model?: unknown
+    readonly schemas?: { readonly inputSchema?: unknown }
+  }
+  const source = (e.schemas?.inputSchema ?? e.model) as Schema.Top | undefined
+  if (source === undefined) return record
+  const form = makeCompositeKeyForm(source, (attr, value) => {
+    throw new Error(
+      `[EDD-9050] Composite "${attr}" could not be put into its key form: ` +
+        `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode.`,
+    )
+  })
+  return toCompositeKeyRecord(form, record)
+}
+
 export const make = <
   const TName extends string,
   const TEntities extends Record<string, CollectionEntity>,
@@ -131,6 +173,43 @@ export const make = <
 
   if (!sharedIndexName || !sharedPkField || !sharedSchema) {
     throw new Error(`No entity in collection "${name}" has an index with collection: "${name}"`)
+  }
+
+  // Members share ONE physical index, so they must agree on how each partition
+  // key composite is spelled in a key. Two members disagreeing (`Schema.Date`
+  // vs `DynamoModel.DateEpochMs`, say) write into the same partition under
+  // forms that can never match, and composing with the first member's form
+  // would silently drop the others' rows. A real modelling conflict — fail here
+  // rather than at query time.
+  {
+    const attrs = new Set<string>()
+    for (const [, entity] of entityEntries) {
+      for (const attr of entity.indexes[sharedIndexName]?.pk.composite ?? []) attrs.add(attr)
+    }
+    for (const attr of attrs) {
+      // `absent` and `identity` are the SAME behaviour — both pass the value
+      // through untouched — so a member that simply does not declare the
+      // attribute (a ref-derived id, or an index whose composite list differs)
+      // is not in conflict. Only a genuine difference in how the value is
+      // transformed is. This catches identity-vs-transformed and
+      // numeric-Type-vs-encoded; two DIFFERENT encoded transforms of the same
+      // kind still classify alike and are not detected here.
+      const kinds = entityEntries
+        .filter(([, e]) => (e.indexes[sharedIndexName]?.pk.composite ?? []).includes(attr))
+        .map(([key, entity]) => {
+          const kind = compositeKeyFormKind(keyFormSourceOf(entity), attr)
+          return { key, kind: kind === "absent" ? "identity" : kind }
+        })
+      if (new Set(kinds.map((k) => k.kind)).size > 1) {
+        throw new Error(
+          `[EDD-9050] Collection "${name}" members disagree on how the partition key ` +
+            `composite "${attr}" is composed into a key ` +
+            `(${kinds.map((k) => `${k.key}: ${k.kind}`).join(", ")}). They share one physical ` +
+            `index, so rows written under different forms can never match — align the ` +
+            `attribute's schema across the member models.`,
+        )
+      }
+    }
   }
 
   // Compute the SK prefix for clustered collections.
@@ -208,11 +287,14 @@ export const make = <
     // Use the first entity to compose the PK (they share the same index pattern)
     const firstEntity = entityEntries[0]![1]
     const indexDef = firstEntity.indexes[sharedIndexName!]!
+    // Same key form the member entities' write path uses — see
+    // `internal/CompositeCodec.ts`. Members are checked for agreement at
+    // `Collections.make()` time, so the first member's form speaks for all.
     const pkValue = KeyComposer.composePk(
       sharedSchema!,
       firstEntity.entityType,
       indexDef,
-      pkComposites,
+      collectionKeyForm(firstEntity, pkComposites),
     )
 
     return Query.make({
@@ -275,7 +357,7 @@ export const make = <
         sharedSchema!,
         entity.entityType,
         indexDef,
-        pkComposites,
+        collectionKeyForm(entity, pkComposites),
       )
 
       let q = Query.make({

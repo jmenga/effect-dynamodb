@@ -11,6 +11,7 @@
  */
 
 import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { type Effect, Stream } from "effect"
 import type { DynamoClientError } from "../DynamoClient.js"
 import * as Query from "../Query.js"
@@ -22,26 +23,139 @@ import type { Path, PathBuilder } from "./PathBuilder.js"
 // Sort key condition ops for the `where` callback
 // ---------------------------------------------------------------------------
 
+/**
+ * Operand type accepted by a `.where()` condition on a sort key composite
+ * whose value type is `V`.
+ *
+ * - **String-typed composites** (including literal unions like
+ *   `"todo" | "done"`) widen to `string`, so open bounds and `beginsWith`
+ *   prefixes that are not themselves valid values still typecheck.
+ * - **Every other composite** keeps its own type. That is the point of
+ *   issue #114: `serializeValue` zero-pads numbers to 16 digits and bigints
+ *   to 38 on the write path, so a stringly-typed `"42"` compares against
+ *   `"0000000000000042"` and sorts *after* every stored value — a silent
+ *   mismatch. Requiring the composite's own type also lets the operand run
+ *   through the composite's own codec, which is what makes a transformed
+ *   composite (`Schema.BigIntFromString`) compare against the value that was
+ *   actually stored.
+ */
+export type SkOperand<V> = [V] extends [string] ? string : V
+
+/**
+ * A `.where()` condition before its operands become key strings.
+ *
+ * Mirrors `Query.SortKeyCondition` but keeps the operands `unknown`, because
+ * the composite's own value (a `bigint`, a `Date`, a `DateTime`) must reach
+ * `composeSkCondition` intact: that hook encodes it through the model's field
+ * codec — the step `Entity.put` performs before composing keys — and only then
+ * serialises. Serialising here first would erase the type the codec needs.
+ *
+ * `Query.SortKeyCondition` is assignable to this, so a hand-built `{ eq: "x" }`
+ * still satisfies the `.where()` callback.
+ */
+export type RawSortKeyCondition =
+  | { readonly eq: unknown }
+  | { readonly lt: unknown }
+  | { readonly lte: unknown }
+  | { readonly gt: unknown }
+  | { readonly gte: unknown }
+  | { readonly between: readonly [unknown, unknown] }
+  | { readonly beginsWith: unknown }
+
 /** Sort key condition operators for `.where()` callback.
- * The `field` parameter accepts values from `t` (e.g. `t.status`). */
+ * The `field` parameter accepts values from `t` (e.g. `t.status`); `V` is
+ * inferred from it so the operand type follows the composite. */
 export interface SkConditionOps<SK = Record<string, unknown>> {
-  readonly eq: (field: SK[keyof SK], value: string) => Query.SortKeyCondition
-  readonly lt: (field: SK[keyof SK], value: string) => Query.SortKeyCondition
-  readonly lte: (field: SK[keyof SK], value: string) => Query.SortKeyCondition
-  readonly gt: (field: SK[keyof SK], value: string) => Query.SortKeyCondition
-  readonly gte: (field: SK[keyof SK], value: string) => Query.SortKeyCondition
-  readonly between: (field: SK[keyof SK], low: string, high: string) => Query.SortKeyCondition
-  readonly beginsWith: (field: SK[keyof SK], prefix: string) => Query.SortKeyCondition
+  readonly eq: <V extends SK[keyof SK]>(field: V, value: SkOperand<V>) => RawSortKeyCondition
+  readonly lt: <V extends SK[keyof SK]>(field: V, value: SkOperand<V>) => RawSortKeyCondition
+  readonly lte: <V extends SK[keyof SK]>(field: V, value: SkOperand<V>) => RawSortKeyCondition
+  readonly gt: <V extends SK[keyof SK]>(field: V, value: SkOperand<V>) => RawSortKeyCondition
+  readonly gte: <V extends SK[keyof SK]>(field: V, value: SkOperand<V>) => RawSortKeyCondition
+  readonly between: <V extends SK[keyof SK]>(
+    field: V,
+    low: SkOperand<V>,
+    high: SkOperand<V>,
+  ) => RawSortKeyCondition
+  readonly beginsWith: <V extends SK[keyof SK]>(
+    field: V,
+    prefix: SkOperand<V>,
+  ) => RawSortKeyCondition
 }
 
-const skConditionOps: SkConditionOps<any> = {
-  eq: (_field, value) => ({ eq: value }),
-  lt: (_field, value) => ({ lt: value }),
-  lte: (_field, value) => ({ lte: value }),
-  gt: (_field, value) => ({ gt: value }),
-  gte: (_field, value) => ({ gte: value }),
-  between: (_field, low, high) => ({ between: [low, high] }),
-  beginsWith: (_field, prefix) => ({ beginsWith: prefix }),
+/**
+ * Build the runtime `SkConditionOps` for one `.where()` invocation.
+ *
+ * The ops record which SK composite the caller targeted (`t.status` → the
+ * string `"status"`, courtesy of `buildSkAccessor`). `composeSkCondition`
+ * needs that name so it can compose the operand into the *same* position of
+ * the stored sort key — otherwise the raw operand is compared against a fully
+ * composed key and the condition silently matches everything or nothing.
+ *
+ * Operands are handed on **unserialised**. `composeSkCondition` encodes them
+ * through the model's field codec — the step `Entity.put` performs before
+ * composing keys — and then composes, so both sides of the comparison come out
+ * of one pipeline (issues #114 and the encoded/decoded gap it exposed).
+ * Without a hook there is no model to consult, so `KeyComposer.serializeValue`
+ * is applied directly: the same zero-padding / ISO formatting the write path
+ * uses. Casing is never applied here — it belongs to key composition.
+ *
+ * The callback is invoked synchronously and exactly once, so a closed-over
+ * mutable slot is safe here.
+ */
+const makeSkConditionOps = (): {
+  readonly ops: SkConditionOps<any>
+  readonly targetField: () => string | undefined
+} => {
+  let target: string | undefined
+  const capture = (field: unknown): void => {
+    if (typeof field === "string") target = field
+  }
+  const ops: SkConditionOps<any> = {
+    eq: (field, value) => {
+      capture(field)
+      return { eq: value }
+    },
+    lt: (field, value) => {
+      capture(field)
+      return { lt: value }
+    },
+    lte: (field, value) => {
+      capture(field)
+      return { lte: value }
+    },
+    gt: (field, value) => {
+      capture(field)
+      return { gt: value }
+    },
+    gte: (field, value) => {
+      capture(field)
+      return { gte: value }
+    },
+    between: (field, low, high) => {
+      capture(field)
+      return { between: [low, high] }
+    },
+    beginsWith: (field, prefix) => {
+      capture(field)
+      return { beginsWith: prefix }
+    },
+  }
+  return { ops, targetField: () => target }
+}
+
+/**
+ * Serialise a raw condition's operands. Used only when no `composeSkCondition`
+ * hook is present — with one, encoding + composition happen there instead.
+ */
+const serializeRawCondition = (condition: RawSortKeyCondition): Query.SortKeyCondition => {
+  const s = (value: unknown): string => KeyComposer.serializeValue(value)
+  if ("eq" in condition) return { eq: s(condition.eq) }
+  if ("lt" in condition) return { lt: s(condition.lt) }
+  if ("lte" in condition) return { lte: s(condition.lte) }
+  if ("gt" in condition) return { gt: s(condition.gt) }
+  if ("gte" in condition) return { gte: s(condition.gte) }
+  if ("between" in condition) return { between: [s(condition.between[0]), s(condition.between[1])] }
+  return { beginsWith: s(condition.beginsWith) }
 }
 
 /** Build the runtime sk accessor object — each property returns its field name. */
@@ -118,7 +232,7 @@ export interface BoundQueryWithWhere<Model, SkRemaining, A> {
    * ```
    */
   readonly where: (
-    fn: (t: SkRemaining, ops: SkConditionOps<SkRemaining>) => Query.SortKeyCondition,
+    fn: (t: SkRemaining, ops: SkConditionOps<SkRemaining>) => RawSortKeyCondition,
   ) => BoundQuery<Model, never, A>
 }
 
@@ -140,8 +254,18 @@ export interface BoundQueryConfig<Model> {
   /** SK composite field names for building the SkAccessor in `.where()`. */
   readonly skFields?: ReadonlyArray<string> | undefined
   readonly provide: <X, E>(eff: Effect.Effect<X, E, any>) => Effect.Effect<X, E, never>
-  /** Optional: transform SK condition (e.g., compose prefix for partial composites) */
-  readonly composeSkCondition?: (condition: Query.SortKeyCondition) => Query.SortKeyCondition
+  /**
+   * Optional: transform the raw SK condition produced by `.where()` into one
+   * whose operands are composed the same way stored sort keys are.
+   *
+   * `field` is the SK composite name the caller targeted (`t.status` →
+   * `"status"`), or `undefined` when the callback did not go through the sk
+   * accessor.
+   */
+  readonly composeSkCondition?: (
+    condition: RawSortKeyCondition,
+    field: string | undefined,
+  ) => Query.SortKeyCondition
 }
 
 // ---------------------------------------------------------------------------
@@ -157,15 +281,16 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
 
   // --- where ---
   where(
-    fn: (t: SkRemaining, ops: SkConditionOps<SkRemaining>) => Query.SortKeyCondition,
+    fn: (t: SkRemaining, ops: SkConditionOps<SkRemaining>) => RawSortKeyCondition,
   ): BoundQueryImpl<Model, never, A> {
     const skAccessor = (
       this._config.skFields ? buildSkAccessor(this._config.skFields) : {}
     ) as SkRemaining
-    const condition = fn(skAccessor, skConditionOps as SkConditionOps<SkRemaining>)
+    const { ops, targetField } = makeSkConditionOps()
+    const condition = fn(skAccessor, ops as SkConditionOps<SkRemaining>)
     const finalCondition = this._config.composeSkCondition
-      ? this._config.composeSkCondition(condition)
-      : condition
+      ? this._config.composeSkCondition(condition, targetField())
+      : serializeRawCondition(condition)
     return new BoundQueryImpl<Model, never, A>(
       Query.where(this._query, finalCondition),
       this._config,

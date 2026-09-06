@@ -658,6 +658,49 @@ Given `DynamoSchema({ name: "myapp", version: 1, casing: "lowercase" })` and `en
 | `boolean` | `"true"` / `"false"` |
 | Branded string | Underlying string value |
 
+### Composite key form
+
+Every path composes a composite through ONE function
+(`internal/CompositeCodec.ts`) — the write path, `composePrimaryKey`, the query
+accessors, `.where()` operands, and the aggregate composer. An operand and a
+stored key must be produced by the same code; two call sites disagreeing about
+which form to use has been the root cause of every key bug in this area.
+
+**The rule.** Compose from the **Encoded** form, EXCEPT when the domain type is
+numeric (`number` / `bigint`) and the encoded form is a **string** — then
+compose from the numeric **Type** form so `serializeValue` pads it.
+
+| composite | Type | Encoded | key uses |
+|---|---|---|---|
+| `Schema.Number` | number | number | encoded (already padded) |
+| `Schema.BigInt` | bigint | bigint | encoded (already padded) |
+| `Schema.BigIntFromString` | bigint | string | **Type** — a string would not pad |
+| `Schema.NumberFromString` | number | string | **Type** — same shape |
+| `DynamoModel.DateEpochMs` | DateTime | number | encoded — epoch, padded |
+| `Schema.Date` / `DateTimeUtc` | Date | ISO string | encoded — ISO sorts correctly |
+| untransformed string | string | string | encoded (identical) |
+
+The exception exists because `serializeValue` pads numbers to 16 digits and
+bigints to 38 so they sort lexicographically in numeric order, and leaves a
+string alone. Composing the encoded `"42"` of a `BigIntFromString` stored
+`txn_42` beside `txn_100` and `txn_5`, which DynamoDB orders 100 < 42 < 5 — so
+`gte(42n)` returned 42 and 5 instead of 42 and 100.
+
+Resolution per attribute:
+
+| case | behaviour |
+|---|---|
+| Not a model field (ref-derived `<ref>Id`) | Pass through — already wire-shaped. |
+| Numeric Type, string Encoded | Keep a `number` / `bigint`; otherwise `decode` to reach it. |
+| No encoding transformation (`ast.encoding === undefined`, documented as "type and encoded forms are identical") | Pass through WITHOUT encoding, so an open bound like `gte(t.status, "d")` on a `Schema.Literals` composite is not rejected by a codec. |
+| Has an encoding transformation | `encode`, with `decode -> encode` as fallback so an already-encoded value round-trips to itself. |
+| Resolves to neither | **EDD-9050**, naming the attribute. |
+
+Public key and composite input is always the **Type** side — the value the
+domain model holds and `.where()` accepts. Internal paths (retain, restore,
+soft-delete) hold wire-shaped records read back from DynamoDB and reach the
+composer directly.
+
 ### Isolated vs Clustered Key Prefixes
 
 **Isolated:**
@@ -2496,6 +2539,41 @@ db.Users.update(key, changes, { expectedVersion: 5 })
 ```
 
 ---
+
+### Key encoding: one rule for every path
+
+Both paths compose keys through the same rule:
+
+> Compose from the **Encoded** form, EXCEPT when the domain type is numeric
+> (`number`/`bigint`) and the encoded form is a **string** — then compose from the
+> numeric **Type** form so `serializeValue` pads it.
+
+`serializeValue` zero-pads numbers to 16 digits and bigints to 38 so they sort
+correctly; a numeric composite stored via its string wire form would skip that padding
+and sort lexicographically (`100 < 42 < 5`). `DynamoModel.DateEpochMs` composites use
+the encoded epoch, which pads as a number.
+
+Every composition site routes through this one function. `test/KeyFormInvariant.test.ts`
+reads each module as source text and fails if a `KeyComposer` call receives a record
+that did not — the guard exists because eleven modules each deciding independently is
+what produced the divergence it replaced.
+
+**This changed stored keys in 1.16.0, and rows written before it are orphaned.**
+
+- Entity keys and GSIs with a `Schema.BigIntFromString` or `Schema.NumberFromString`
+  composite: previously written unpadded (`…#seq_420`), now padded
+  (`…#seq_000…0420`). `put` succeeded and wrote those rows on 1.15.0 — only `get` was
+  broken — so **this data exists and must be rewritten** (read by scan, re-`put`).
+- Aggregate partition and collection keys with a `DateEpochMs` / `DateEpochSeconds`
+  composite: ISO form → padded epoch. Same migration.
+
+An earlier draft of this section argued the entity change needed no migration because
+"no data existed in either format". That was wrong: on 1.15.0 `put({seq: 420n})`
+succeeds and writes `seq_420`. Only reads were broken, so callers do have rows in the
+old format.
+
+Composites of every other shape — plain numbers, bigints, strings, `Schema.Date`,
+`DateTimeUtc`, literals — are byte-identical and need no migration.
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 

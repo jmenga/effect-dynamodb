@@ -5,6 +5,17 @@
  * entity-specific parts. The `$` sentinel identifies ORM-managed keys.
  */
 
+/**
+ * Delimiter separating the segments of a composed key
+ * (`$schema#v1#entity#a_1#b_2`).
+ *
+ * Exported so key *consumers* (query prefix bounds, `begins_with` operands)
+ * agree with the composer on where one segment ends and the next begins — a
+ * `begins_with` that stops mid-segment silently matches sibling values
+ * (`status_done` also matching `status_done_archived`).
+ */
+export const KEY_DELIMITER = "#"
+
 export type Casing = "lowercase" | "uppercase" | "preserve"
 
 export interface DynamoSchema {

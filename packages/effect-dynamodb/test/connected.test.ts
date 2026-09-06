@@ -48,6 +48,7 @@ import type {
 } from "@effect-dynamodb/schema/Errors.js"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
+import * as Collection from "../src/Collection.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
@@ -7822,5 +7823,1531 @@ describeConnected("Aggregate — base-table assembly (#93)", () => {
       expect(loaded.customer).toBe("initech")
       expect(loaded.lines).toHaveLength(1)
     }).pipe(provideBt),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// #101 — sort key conditions on named-index and primary-key accessors
+//
+// A stored SK is `$schema#v1#entity#<name>_<cased value>`. Before the fix
+// `.where()` compared the raw operand against that composed key, so `gte`
+// matched the whole partition while `begins_with` / `between` matched nothing.
+// Every operator is verified against real DynamoDB on BOTH a named GSI and the
+// primary-key accessor, plus the multi-composite SK shape.
+// ---------------------------------------------------------------------------
+
+const skCondSchema = DynamoSchema.make({ name: "skcond", version: 1 })
+const skCondTableName = `skcond-test-${Date.now()}`
+
+class BallRecord extends Schema.Class<BallRecord>("BallRecord")({
+  matchId: Schema.String,
+  ballKey: Schema.String,
+}) {}
+
+const SkCondBalls = Entity.make({
+  model: BallRecord,
+  entityType: "Ball",
+  primaryKey: {
+    pk: { field: "pk", composite: ["matchId"] },
+    sk: { field: "sk", composite: ["ballKey"] },
+  },
+  indexes: {
+    byMatch: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["matchId"] },
+      sk: { field: "gsi1sk", composite: ["ballKey"] },
+    },
+  },
+})
+
+// Two SK composites — exercises conditions on a non-terminal composite.
+class ReadingRecord extends Schema.Class<ReadingRecord>("ReadingRecord")({
+  deviceId: Schema.String,
+  status: Schema.String,
+  seq: Schema.String,
+}) {}
+
+const SkCondReadings = Entity.make({
+  model: ReadingRecord,
+  entityType: "Reading",
+  primaryKey: {
+    pk: { field: "pk", composite: ["deviceId"] },
+    sk: { field: "sk", composite: ["status", "seq"] },
+  },
+  indexes: {
+    byDevice: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["deviceId"] },
+      sk: { field: "gsi1sk", composite: ["status", "seq"] },
+    },
+  },
+})
+
+const SkCondTable = Table.make({
+  schema: skCondSchema,
+  entities: { SkCondBalls, SkCondReadings },
+})
+const SkCondLayer = Layer.mergeAll(ClientLayer, SkCondTable.layer({ name: skCondTableName }))
+const provideSkCond = Effect.provide(SkCondLayer)
+
+const BALL_KEYS = ["1-008-6-6", "1-009-1-1", "1-009-2-2", "1-010-1-1", "1-011-1-1"] as const
+
+describeConnected("sort key conditions via .where() (closes #101)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: skCondTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(SkCondTable),
+        })
+        const db = yield* DynamoClient.make({
+          entities: { SkCondBalls, SkCondReadings },
+          tables: { SkCondTable },
+        })
+        for (const ballKey of BALL_KEYS) {
+          yield* db.entities.SkCondBalls.put({ matchId: "m-1", ballKey })
+        }
+        for (const [status, seq] of [
+          ["active", "0001"],
+          ["active", "0002"],
+          ["done", "0001"],
+          ["done", "0002"],
+          ["error", "0001"],
+        ] as const) {
+          yield* db.entities.SkCondReadings.put({ deviceId: "d-1", status, seq })
+        }
+      }).pipe(provideSkCond, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: skCondTableName })
+      }).pipe(
+        provideSkCond,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  // ----- named GSI accessor -----
+
+  it.effect("named GSI: no condition returns the whole partition in sort order", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const all = yield* db.entities.SkCondBalls.byMatch({ matchId: "m-1" }).collect()
+      expect(all.map((b) => b.ballKey)).toEqual([...BALL_KEYS])
+    }).pipe(provideSkCond),
+  )
+
+  it.effect("named GSI: gte narrows to 4 (issue #101 expected)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const rows = yield* db.entities.SkCondBalls.byMatch({ matchId: "m-1" })
+        .where((t, { gte }) => gte(t.ballKey, "1-009"))
+        .collect()
+      expect(rows.map((b) => b.ballKey)).toEqual([
+        "1-009-1-1",
+        "1-009-2-2",
+        "1-010-1-1",
+        "1-011-1-1",
+      ])
+    }).pipe(provideSkCond),
+  )
+
+  it.effect("named GSI: beginsWith narrows to 2 (issue #101 expected)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const rows = yield* db.entities.SkCondBalls.byMatch({ matchId: "m-1" })
+        .where((t, { beginsWith }) => beginsWith(t.ballKey, "1-009"))
+        .collect()
+      expect(rows.map((b) => b.ballKey)).toEqual(["1-009-1-1", "1-009-2-2"])
+    }).pipe(provideSkCond),
+  )
+
+  it.effect("named GSI: between narrows to 3 (issue #101 expected)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const rows = yield* db.entities.SkCondBalls.byMatch({ matchId: "m-1" })
+        .where((t, { between }) => between(t.ballKey, "1-009", "1-011"))
+        .collect()
+      expect(rows.map((b) => b.ballKey)).toEqual(["1-009-1-1", "1-009-2-2", "1-010-1-1"])
+    }).pipe(provideSkCond),
+  )
+
+  it.effect("named GSI: eq / lt / lte / gt narrow correctly", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const q = db.entities.SkCondBalls.byMatch({ matchId: "m-1" })
+
+      const eq = yield* q.where((t, ops) => ops.eq(t.ballKey, "1-009-1-1")).collect()
+      expect(eq.map((b) => b.ballKey)).toEqual(["1-009-1-1"])
+
+      const lt = yield* q.where((t, ops) => ops.lt(t.ballKey, "1-010")).collect()
+      expect(lt.map((b) => b.ballKey)).toEqual(["1-008-6-6", "1-009-1-1", "1-009-2-2"])
+
+      const lte = yield* q.where((t, ops) => ops.lte(t.ballKey, "1-009-2-2")).collect()
+      expect(lte.map((b) => b.ballKey)).toEqual(["1-008-6-6", "1-009-1-1", "1-009-2-2"])
+
+      const gt = yield* q.where((t, ops) => ops.gt(t.ballKey, "1-009-2-2")).collect()
+      expect(gt.map((b) => b.ballKey)).toEqual(["1-010-1-1", "1-011-1-1"])
+    }).pipe(provideSkCond),
+  )
+
+  // ----- primary-key accessor -----
+
+  it.effect("primary: gte / beginsWith / between narrow correctly", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const q = db.entities.SkCondBalls.primary({ matchId: "m-1" })
+
+      const all = yield* q.collect()
+      expect(all.map((b) => b.ballKey)).toEqual([...BALL_KEYS])
+
+      const gte = yield* q.where((t, ops) => ops.gte(t.ballKey, "1-009")).collect()
+      expect(gte.map((b) => b.ballKey)).toEqual([
+        "1-009-1-1",
+        "1-009-2-2",
+        "1-010-1-1",
+        "1-011-1-1",
+      ])
+
+      const bw = yield* q.where((t, ops) => ops.beginsWith(t.ballKey, "1-009")).collect()
+      expect(bw.map((b) => b.ballKey)).toEqual(["1-009-1-1", "1-009-2-2"])
+
+      const btw = yield* q.where((t, ops) => ops.between(t.ballKey, "1-009", "1-011")).collect()
+      expect(btw.map((b) => b.ballKey)).toEqual(["1-009-1-1", "1-009-2-2", "1-010-1-1"])
+    }).pipe(provideSkCond),
+  )
+
+  it.effect("primary: eq / lt / lte / gt narrow correctly", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const q = db.entities.SkCondBalls.primary({ matchId: "m-1" })
+
+      const eq = yield* q.where((t, ops) => ops.eq(t.ballKey, "1-010-1-1")).collect()
+      expect(eq.map((b) => b.ballKey)).toEqual(["1-010-1-1"])
+
+      const lt = yield* q.where((t, ops) => ops.lt(t.ballKey, "1-010")).collect()
+      expect(lt.map((b) => b.ballKey)).toEqual(["1-008-6-6", "1-009-1-1", "1-009-2-2"])
+
+      const lte = yield* q.where((t, ops) => ops.lte(t.ballKey, "1-009-2-2")).collect()
+      expect(lte.map((b) => b.ballKey)).toEqual(["1-008-6-6", "1-009-1-1", "1-009-2-2"])
+
+      const gt = yield* q.where((t, ops) => ops.gt(t.ballKey, "1-009-2-2")).collect()
+      expect(gt.map((b) => b.ballKey)).toEqual(["1-010-1-1", "1-011-1-1"])
+    }).pipe(provideSkCond),
+  )
+
+  // ----- multi-composite sort key -----
+
+  it.effect("multi-composite: condition on the leading composite spans its subtree", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const q = db.entities.SkCondReadings.byDevice({ deviceId: "d-1" })
+      const key = (r: ReadingRecord) => `${r.status}/${r.seq}`
+
+      // eq on a non-terminal composite matches every row with that value.
+      const eq = yield* q.where((t, ops) => ops.eq(t.status, "done")).collect()
+      expect(eq.map(key)).toEqual(["done/0001", "done/0002"])
+
+      // gte includes the whole `done` subtree and everything after it.
+      const gte = yield* q.where((t, ops) => ops.gte(t.status, "done")).collect()
+      expect(gte.map(key)).toEqual(["done/0001", "done/0002", "error/0001"])
+
+      // lte is inclusive of the whole `done` subtree.
+      const lte = yield* q.where((t, ops) => ops.lte(t.status, "done")).collect()
+      expect(lte.map(key)).toEqual(["active/0001", "active/0002", "done/0001", "done/0002"])
+
+      // gt excludes the whole `done` subtree.
+      const gt = yield* q.where((t, ops) => ops.gt(t.status, "done")).collect()
+      expect(gt.map(key)).toEqual(["error/0001"])
+
+      // lt excludes the whole `done` subtree.
+      const lt = yield* q.where((t, ops) => ops.lt(t.status, "done")).collect()
+      expect(lt.map(key)).toEqual(["active/0001", "active/0002"])
+
+      // between is inclusive on both ends.
+      const btw = yield* q.where((t, ops) => ops.between(t.status, "active", "done")).collect()
+      expect(btw.map(key)).toEqual(["active/0001", "active/0002", "done/0001", "done/0002"])
+
+      // beginsWith on a non-terminal composite prefixes the value.
+      const bw = yield* q.where((t, ops) => ops.beginsWith(t.status, "a")).collect()
+      expect(bw.map(key)).toEqual(["active/0001", "active/0002"])
+    }).pipe(provideSkCond),
+  )
+
+  it.effect("multi-composite: condition on the trailing composite after pinning the first", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const key = (r: ReadingRecord) => `${r.status}/${r.seq}`
+      const q = db.entities.SkCondReadings.byDevice({ deviceId: "d-1", status: "done" })
+
+      // Every one-sided operator must stay inside the pinned `status_done`
+      // prefix — `Query.where` replaces the accessor's own begins_with, so an
+      // unclamped bound would leak into `active` / `error` readings.
+      const gte = yield* q.where((t, ops) => ops.gte(t.seq, "0002")).collect()
+      expect(gte.map(key)).toEqual(["done/0002"])
+
+      const gt = yield* q.where((t, ops) => ops.gt(t.seq, "0001")).collect()
+      expect(gt.map(key)).toEqual(["done/0002"])
+
+      const lte = yield* q.where((t, ops) => ops.lte(t.seq, "0002")).collect()
+      expect(lte.map(key)).toEqual(["done/0001", "done/0002"])
+
+      const eq = yield* q.where((t, ops) => ops.eq(t.seq, "0001")).collect()
+      expect(eq.map(key)).toEqual(["done/0001"])
+
+      const btw = yield* q.where((t, ops) => ops.between(t.seq, "0001", "0002")).collect()
+      expect(btw.map(key)).toEqual(["done/0001", "done/0002"])
+
+      const bw = yield* q.where((t, ops) => ops.beginsWith(t.seq, "000")).collect()
+      expect(bw.map(key)).toEqual(["done/0001", "done/0002"])
+    }).pipe(provideSkCond),
+  )
+
+  it.effect("multi-composite: skipping a leading composite is rejected (EDD-9004)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      expect(() =>
+        db.entities.SkCondReadings.byDevice({ deviceId: "d-1" }).where((t, ops) =>
+          ops.gte(t.seq, "0002"),
+        ),
+      ).toThrow(/EDD-9004/)
+    }).pipe(provideSkCond),
+  )
+
+  it.effect(
+    "multi-composite: strict lt on a pinned terminal composite is rejected (EDD-9046)",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { SkCondBalls, SkCondReadings },
+          tables: { SkCondTable },
+        })
+        expect(() =>
+          db.entities.SkCondReadings.byDevice({ deviceId: "d-1", status: "done" }).where((t, ops) =>
+            ops.lt(t.seq, "0002"),
+          ),
+        ).toThrow(/EDD-9046/)
+      }).pipe(provideSkCond),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// #115 — partial sort-key `begins_with` must terminate on a segment boundary
+// #114 — `.where()` operands are serialised like the stored key
+//
+// #115: `byTenant({ status: "done" })` composed `begins_with(sk,
+// "…#status_done")`, which also matched `status_done_archived` and
+// `status_doneish`. The delimiter is now appended iff composites remain.
+// #114: a numeric composite is zero-padded on write, so a stringly-typed
+// `"42"` operand sorted after every stored value. Operands now carry the
+// composite's own type and go through the same `serializeValue`.
+// ---------------------------------------------------------------------------
+
+const skpSchema = DynamoSchema.make({ name: "skp", version: 1 })
+const skpTableName = `skp-test-${Date.now()}`
+
+class PrefixTask extends Schema.Class<PrefixTask>("PrefixTask")({
+  tenantId: Schema.String,
+  status: Schema.String,
+  taskId: Schema.String,
+}) {}
+
+const PrefixTasks = Entity.make({
+  model: PrefixTask,
+  entityType: "PrefixTask",
+  primaryKey: {
+    pk: { field: "pk", composite: ["tenantId"] },
+    sk: { field: "sk", composite: ["status", "taskId"] },
+  },
+  indexes: {
+    byTenant: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["status", "taskId"] },
+    },
+  },
+})
+
+// Single-composite sort key — supplying it is a COMPLETE key.
+class PrefixNote extends Schema.Class<PrefixNote>("PrefixNote")({
+  boardId: Schema.String,
+  label: Schema.String,
+}) {}
+
+const PrefixNotes = Entity.make({
+  model: PrefixNote,
+  entityType: "PrefixNote",
+  primaryKey: {
+    pk: { field: "pk", composite: ["boardId"] },
+    sk: { field: "sk", composite: ["label"] },
+  },
+  indexes: {
+    byBoard: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["boardId"] },
+      sk: { field: "gsi1sk", composite: ["label"] },
+    },
+  },
+})
+
+// Non-string sort key composites.
+class TypedSample extends Schema.Class<TypedSample>("TypedSample")({
+  deviceId: Schema.String,
+  seq: Schema.Number,
+  ok: Schema.Boolean,
+  at: Schema.Date,
+  zoned: Schema.DateTimeUtc,
+}) {}
+
+const TypedSamples = Entity.make({
+  model: TypedSample,
+  entityType: "TypedSample",
+  primaryKey: {
+    pk: { field: "pk", composite: ["deviceId"] },
+    sk: { field: "sk", composite: ["seq"] },
+  },
+  indexes: {
+    byFlag: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["deviceId"] },
+      sk: { field: "gsi2sk", composite: ["ok", "seq"] },
+    },
+    byAt: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["deviceId"] },
+      sk: { field: "gsi3sk", composite: ["at"] },
+    },
+    byZoned: {
+      name: "gsi4",
+      pk: { field: "gsi4pk", composite: ["deviceId"] },
+      sk: { field: "gsi4sk", composite: ["zoned"] },
+    },
+  },
+})
+
+const SkpTable = Table.make({
+  schema: skpSchema,
+  entities: { PrefixTasks, PrefixNotes, TypedSamples },
+})
+const SkpLayer = Layer.mergeAll(ClientLayer, SkpTable.layer({ name: skpTableName }))
+const provideSkp = Effect.provide(SkpLayer)
+
+const skpEntities = { PrefixTasks, PrefixNotes, TypedSamples }
+const skpTables = { SkpTable }
+
+const SAMPLE_SEQS = [5, 42, 100] as const
+const sampleAt = (seq: number) => new Date(Date.UTC(2026, 0, 1 + seq, 0, 0, 0))
+
+describeConnected("sort key prefix + typed operands (closes #114, closes #115)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: skpTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(SkpTable),
+        })
+        const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+
+        for (const [status, taskId] of [
+          ["done", "t1"],
+          ["done", "t2"],
+          ["done_archived", "t3"],
+          ["doneish", "t4"],
+          ["todo", "t5"],
+        ] as const) {
+          yield* db.entities.PrefixTasks.put({ tenantId: "acme", status, taskId })
+        }
+        for (const label of ["ship", "shipped", "ship_it"]) {
+          yield* db.entities.PrefixNotes.put({ boardId: "b1", label })
+        }
+        for (const seq of SAMPLE_SEQS) {
+          yield* db.entities.TypedSamples.put({
+            deviceId: "d1",
+            seq,
+            ok: seq !== 42,
+            at: sampleAt(seq),
+            zoned: DateTime.makeUnsafe(sampleAt(seq).toISOString()),
+          })
+        }
+      }).pipe(provideSkp, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: skpTableName })
+      }).pipe(
+        provideSkp,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  // ----- #115 -----
+
+  it.effect("#115 partial prefix excludes sibling values on a named GSI", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      const rows = yield* db.entities.PrefixTasks.byTenant({
+        tenantId: "acme",
+        status: "done",
+      }).collect()
+      // Pre-fix this returned 4 — `done_archived` and `doneish` also begin with
+      // `status_done`.
+      expect(rows.map((r) => `${r.status}/${r.taskId}`)).toEqual(["done/t1", "done/t2"])
+    }).pipe(provideSkp),
+  )
+
+  it.effect("#115 partial prefix excludes sibling values on the primary accessor", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      const rows = yield* db.entities.PrefixTasks.primary({
+        tenantId: "acme",
+        status: "done",
+      }).collect()
+      expect(rows.map((r) => `${r.status}/${r.taskId}`)).toEqual(["done/t1", "done/t2"])
+    }).pipe(provideSkp),
+  )
+
+  it.effect("#115 a complete SK composite set still matches its row", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      // The regression guard for the rule: a delimiter here would match nothing.
+      const gsi = yield* db.entities.PrefixTasks.byTenant({
+        tenantId: "acme",
+        status: "done",
+        taskId: "t1",
+      }).collect()
+      expect(gsi.map((r) => r.taskId)).toEqual(["t1"])
+
+      const pk = yield* db.entities.PrefixTasks.primary({
+        tenantId: "acme",
+        status: "done",
+        taskId: "t2",
+      }).collect()
+      expect(pk.map((r) => r.taskId)).toEqual(["t2"])
+    }).pipe(provideSkp),
+  )
+
+  it.effect("#115 single-composite sort key is a complete key — still a prefix match", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      // Documented behaviour, unchanged by #115: with every composite supplied
+      // the accessor still issues `begins_with` on the full composed key, so
+      // longer sibling values match. Use `.get()` for a single exact item.
+      const rows = yield* db.entities.PrefixNotes.byBoard({
+        boardId: "b1",
+        label: "ship",
+      }).collect()
+      expect(rows.map((r) => r.label).sort()).toEqual(["ship", "ship_it", "shipped"])
+
+      // The documented escape hatch: leave the composite off the accessor and
+      // let `.where()` compose an exact `sk = …#label_ship`.
+      const exact = yield* db.entities.PrefixNotes.byBoard({ boardId: "b1" })
+        .where((t, ops) => ops.eq(t.label, "ship"))
+        .collect()
+      expect(exact.map((r) => r.label)).toEqual(["ship"])
+    }).pipe(provideSkp),
+  )
+
+  it.effect("#115 pinned-prefix .where() bounds do not leak into sibling values", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      const q = db.entities.PrefixTasks.byTenant({ tenantId: "acme", status: "done" })
+
+      const gte = yield* q.where((t, ops) => ops.gte(t.taskId, "t1")).collect()
+      expect(gte.map((r) => `${r.status}/${r.taskId}`)).toEqual(["done/t1", "done/t2"])
+
+      const gt = yield* q.where((t, ops) => ops.gt(t.taskId, "t1")).collect()
+      expect(gt.map((r) => `${r.status}/${r.taskId}`)).toEqual(["done/t2"])
+
+      const lte = yield* q.where((t, ops) => ops.lte(t.taskId, "t2")).collect()
+      expect(lte.map((r) => `${r.status}/${r.taskId}`)).toEqual(["done/t1", "done/t2"])
+    }).pipe(provideSkp),
+  )
+
+  // ----- #114 -----
+
+  it.effect("#114 numeric composite compares against the zero-padded stored key", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      const q = () => db.entities.TypedSamples.primary({ deviceId: "d1" })
+
+      const all = yield* q().collect()
+      expect(all.map((r) => r.seq)).toEqual([5, 42, 100])
+
+      const gte = yield* q()
+        .where((t, ops) => ops.gte(t.seq, 42))
+        .collect()
+      expect(gte.map((r) => r.seq)).toEqual([42, 100])
+
+      const lt = yield* q()
+        .where((t, ops) => ops.lt(t.seq, 42))
+        .collect()
+      expect(lt.map((r) => r.seq)).toEqual([5])
+
+      const eq = yield* q()
+        .where((t, ops) => ops.eq(t.seq, 42))
+        .collect()
+      expect(eq.map((r) => r.seq)).toEqual([42])
+
+      const between = yield* q()
+        .where((t, ops) => ops.between(t.seq, 5, 42))
+        .collect()
+      expect(between.map((r) => r.seq)).toEqual([5, 42])
+    }).pipe(provideSkp),
+  )
+
+  // NOTE: `bigint` composites are covered in the unit suite only
+  // (`DynamoClient.test.ts` asserts the 38-digit padded operand). A bigint
+  // sort key composite cannot round-trip through DynamoDB today: `Schema.BigInt`
+  // fails to decode (the SDK unmarshalls `N` to a JS number) and
+  // `Schema.BigIntFromString` composes the key from its ENCODED string, which is
+  // not zero-padded. That is a pre-existing modelling gap, unrelated to #114.
+
+  it.effect("#114 boolean composite", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      const truthy = yield* db.entities.TypedSamples.byFlag({ deviceId: "d1" })
+        .where((t, ops) => ops.eq(t.ok, true))
+        .collect()
+      expect(truthy.map((r) => r.seq)).toEqual([5, 100])
+
+      const falsy = yield* db.entities.TypedSamples.byFlag({ deviceId: "d1" })
+        .where((t, ops) => ops.eq(t.ok, false))
+        .collect()
+      expect(falsy.map((r) => r.seq)).toEqual([42])
+    }).pipe(provideSkp),
+  )
+
+  it.effect("#114 Date composite", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      const rows = yield* db.entities.TypedSamples.byAt({ deviceId: "d1" })
+        .where((t, ops) => ops.gte(t.at, sampleAt(42)))
+        .collect()
+      expect(rows.map((r) => r.seq)).toEqual([42, 100])
+
+      const between = yield* db.entities.TypedSamples.byAt({ deviceId: "d1" })
+        .where((t, ops) => ops.between(t.at, sampleAt(5), sampleAt(42)))
+        .collect()
+      expect(between.map((r) => r.seq)).toEqual([5, 42])
+    }).pipe(provideSkp),
+  )
+
+  it.effect("#114 DateTime composite", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      const rows = yield* db.entities.TypedSamples.byZoned({ deviceId: "d1" })
+        .where((t, ops) => ops.gt(t.zoned, DateTime.makeUnsafe(sampleAt(5).toISOString())))
+        .collect()
+      expect(rows.map((r) => r.seq)).toEqual([42, 100])
+    }).pipe(provideSkp),
+  )
+
+  it.effect("#114 string composites are unchanged — serializeValue is identity", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
+      const rows = yield* db.entities.PrefixTasks.byTenant({ tenantId: "acme" })
+        .where((t, ops) => ops.beginsWith(t.status, "done"))
+        .collect()
+      expect(rows.map((r) => `${r.status}/${r.taskId}`)).toEqual([
+        "done/t1",
+        "done/t2",
+        "done_archived/t3",
+        "doneish/t4",
+      ])
+    }).pipe(provideSkp),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Transformed composites — the encoded/decoded gap
+//
+// Key composition runs on the ENCODED record (`Entity.put` encodes, THEN calls
+// `composeAllKeys`), while accessors, `.where()` and key inputs carry DECODED
+// model values. For a composite with a `decodeTo` transformation the two forms
+// differ, so composing a decoded value produced a different string from the one
+// that was stored — the query matched nothing, or everything.
+//
+// `Schema.BigIntFromString` is the fixture: Type is `bigint`, Encoded is a
+// string, so the stored sort key holds `txn_420` and NOT the 38-digit padding
+// `serializeValue(420n)` would produce. Values are chosen equal-width so the
+// assertions do not depend on lexicographic-vs-numeric ordering.
+// ---------------------------------------------------------------------------
+
+const encSchema = DynamoSchema.make({ name: "enc", version: 1 })
+const encTableName = `enc-test-${Date.now()}`
+
+class Ledger extends Schema.Class<Ledger>("Ledger")({
+  bookId: Schema.String,
+  txn: Schema.BigIntFromString,
+  label: Schema.String,
+}) {}
+
+const Ledgers = Entity.make({
+  model: Ledger,
+  entityType: "Ledger",
+  primaryKey: {
+    pk: { field: "pk", composite: ["bookId"] },
+    sk: { field: "sk", composite: ["txn"] },
+  },
+  indexes: {
+    byBook: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["bookId"] },
+      sk: { field: "gsi1sk", composite: ["txn", "label"] },
+    },
+  },
+})
+
+// Same transformed composite, with the lifecycle features whose internal
+// paths compose keys from records read back from DynamoDB (already ENCODED).
+class RetainLedger extends Schema.Class<RetainLedger>("RetainLedger")({
+  acctId: Schema.String,
+  txn: Schema.BigIntFromString,
+  note: Schema.String,
+}) {}
+
+const RetainLedgers = Entity.make({
+  model: RetainLedger,
+  entityType: "RetainLedger",
+  primaryKey: {
+    pk: { field: "pk", composite: ["acctId"] },
+    sk: { field: "sk", composite: ["txn"] },
+  },
+  versioned: { retain: true },
+  softDelete: true,
+  timestamps: true,
+})
+
+const EncTable = Table.make({ schema: encSchema, entities: { Ledgers, RetainLedgers } })
+const EncLayer = Layer.mergeAll(ClientLayer, EncTable.layer({ name: encTableName }))
+const provideEnc = Effect.provide(EncLayer)
+const encEntities = { Ledgers }
+const encTables = { EncTable }
+
+describeConnected("transformed sort key composites — encoded/decoded gap", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: encTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(EncTable),
+        })
+        const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
+        for (const txn of [100n, 420n, 999n]) {
+          yield* db.entities.Ledgers.put({ bookId: "b1", txn, label: "x" })
+        }
+      }).pipe(provideEnc, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: encTableName })
+      }).pipe(
+        provideEnc,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("the stored key holds the padded key form of the composite", () =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const raw = yield* client.scan({ TableName: encTableName })
+      const sks = (raw.Items ?? []).map((i) => (i.sk as { S?: string } | undefined)?.S ?? "").sort()
+      // PADDED: `txn` is numeric-Type / string-Encoded, so the key form rule
+      // composes from the bigint and `serializeValue` pads it to 38 digits.
+      expect(sks).toEqual([
+        `$enc#v1#ledger#txn_${"100".padStart(38, "0")}`,
+        `$enc#v1#ledger#txn_${"420".padStart(38, "0")}`,
+        `$enc#v1#ledger#txn_${"999".padStart(38, "0")}`,
+      ])
+    }).pipe(provideEnc),
+  )
+
+  it.effect(".where() operand matches the stored key on the primary accessor", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
+      const q = () => db.entities.Ledgers.primary({ bookId: "b1" })
+
+      const all = yield* q().collect()
+      expect(all.map((r) => r.txn)).toEqual([100n, 420n, 999n])
+
+      // Pre-fix: 0 rows — the padded operand named a key that does not exist.
+      const eq = yield* q()
+        .where((t, ops) => ops.eq(t.txn, 420n))
+        .collect()
+      expect(eq.map((r) => r.txn)).toEqual([420n])
+
+      // Pre-fix: 3 rows — the padded operand sorted below every stored key.
+      const gte = yield* q()
+        .where((t, ops) => ops.gte(t.txn, 420n))
+        .collect()
+      expect(gte.map((r) => r.txn)).toEqual([420n, 999n])
+
+      const between = yield* q()
+        .where((t, ops) => ops.between(t.txn, 100n, 420n))
+        .collect()
+      expect(between.map((r) => r.txn)).toEqual([100n, 420n])
+    }).pipe(provideEnc),
+  )
+
+  it.effect(".where() operand matches the stored key on a named GSI", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
+      const gte = yield* db.entities.Ledgers.byBook({ bookId: "b1" })
+        .where((t, ops) => ops.gte(t.txn, 420n))
+        .collect()
+      expect(gte.map((r) => r.txn)).toEqual([420n, 999n])
+
+      // Pinned transformed composite + a condition on the composite after it.
+      const pinned = yield* db.entities.Ledgers.byBook({ bookId: "b1", txn: 420n })
+        .where((t, ops) => ops.eq(t.label, "x"))
+        .collect()
+      expect(pinned.map((r) => r.txn)).toEqual([420n])
+    }).pipe(provideEnc),
+  )
+
+  it.effect("accessor composites are encoded too", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
+      // Pre-fix: 0 rows on both.
+      const gsi = yield* db.entities.Ledgers.byBook({ bookId: "b1", txn: 420n }).collect()
+      expect(gsi.map((r) => r.txn)).toEqual([420n])
+
+      const pk = yield* db.entities.Ledgers.primary({ bookId: "b1", txn: 420n }).collect()
+      expect(pk.map((r) => r.txn)).toEqual([420n])
+    }).pipe(provideEnc),
+  )
+
+  // ----- key input is the Type side, one convention across the API -----
+
+  it.effect("get / update / delete take the Type side, like the query path", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
+
+      // `420n` — the value the domain model holds and the value
+      // `.where(eq(t.txn, 420n))` takes. Pre-fix this raised ValidationError.
+      const got = yield* db.entities.Ledgers.get({ bookId: "b1", txn: 420n })
+      expect(got.txn).toBe(420n)
+      expect(got.label).toBe("x")
+
+      const updated = yield* db.entities.Ledgers.update({ bookId: "b1", txn: 420n }).set({
+        label: "y",
+      })
+      expect(updated.label).toBe("y")
+      expect(updated.txn).toBe(420n)
+
+      yield* db.entities.Ledgers.delete({ bookId: "b1", txn: 999n })
+      const left = yield* db.entities.Ledgers.primary({ bookId: "b1" }).collect()
+      expect(left.map((r) => r.txn)).toEqual([100n, 420n])
+
+      // Restore the fixture for the rest of this block.
+      yield* db.entities.Ledgers.put({ bookId: "b1", txn: 999n, label: "x" })
+      yield* db.entities.Ledgers.update({ bookId: "b1", txn: 420n }).set({ label: "x" })
+    }).pipe(provideEnc),
+  )
+
+  it.effect("the Encoded side is NOT a public key input — it fails, naming the attribute", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
+      // `"420"` is the wire form. It was never a working input on a transformed
+      // composite — pre-fix it silently returned ItemNotFound for a row that
+      // exists. It is now rejected like any other wrong-typed key.
+      const err = yield* db.entities.Ledgers.get({ bookId: "b1", txn: "420" } as never).pipe(
+        Effect.flip,
+      )
+      expect(err._tag).toBe("ValidationError")
+      expect(String((err as { cause?: unknown }).cause)).toMatch(/txn/)
+    }).pipe(provideEnc),
+  )
+
+  it.effect("a nonsense key value still fails, naming the attribute", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
+      const err = yield* db.entities.Ledgers.get({ bookId: "b1", txn: {} } as never).pipe(
+        Effect.flip,
+      )
+      expect(err._tag).toBe("ValidationError")
+      expect(String((err as { cause?: unknown }).cause)).toMatch(/txn/)
+    }).pipe(provideEnc),
+  )
+
+  // ----- internal paths still hold ENCODED records -----
+
+  it.effect("retain / soft-delete / restore compose correctly from encoded records", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { RetainLedgers },
+        tables: { EncTable },
+      })
+
+      yield* db.entities.RetainLedgers.put({ acctId: "a1", txn: 77n, note: "one" })
+
+      // `update` recomposes the primary key from `newItem` — a wire-shaped
+      // record merged from the stored item — and writes a retain snapshot in
+      // the same transaction. Both go through the INTERNAL composePrimaryKey
+      // path, not the public key boundary.
+      yield* db.entities.RetainLedgers.update({ acctId: "a1", txn: 77n }).set({ note: "two" })
+      const afterUpdate = yield* db.entities.RetainLedgers.get({ acctId: "a1", txn: 77n })
+      expect(afterUpdate.note).toBe("two")
+
+      const snapshots = yield* db.entities.RetainLedgers.versions({
+        acctId: "a1",
+        txn: 77n,
+      }).collect()
+      expect(snapshots.length).toBeGreaterThan(0)
+
+      // Soft delete writes the tombstone from the encoded stored item; restore
+      // recomposes every key from that encoded record.
+      yield* db.entities.RetainLedgers.delete({ acctId: "a1", txn: 77n })
+      const tombstone = yield* db.entities.RetainLedgers.deleted.get({ acctId: "a1", txn: 77n })
+      expect(tombstone.txn).toBe(77n)
+
+      const restored = yield* db.entities.RetainLedgers.restore({ acctId: "a1", txn: 77n })
+      expect(restored.txn).toBe(77n)
+      expect(restored.note).toBe("two")
+
+      // The restored row is reachable by its composed key again.
+      const live = yield* db.entities.RetainLedgers.get({ acctId: "a1", txn: 77n })
+      expect(live.note).toBe("two")
+    }).pipe(provideEnc),
+  )
+
+  it.effect("an operand that cannot be encoded is refused (EDD-9050)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: encEntities, tables: encTables })
+      expect(() =>
+        (
+          db.entities.Ledgers.primary({ bookId: "b1" }) as never as {
+            where: (fn: (t: never, ops: never) => unknown) => unknown
+          }
+        ).where((t: never, ops: never) =>
+          (ops as { eq: (f: unknown, v: unknown) => unknown }).eq(
+            (t as unknown as { txn: unknown }).txn,
+            "not-a-number",
+          ),
+        ),
+      ).toThrow(/EDD-9050/)
+    }).pipe(provideEnc),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Composite key form — mixed-width ordering across every composite shape.
+//
+// The rule: compose from the Encoded form, EXCEPT when the domain type is
+// numeric (number / bigint) and the encoded form is a string — then compose
+// from the numeric Type form so `serializeValue` pads it.
+//
+// Values are 5 / 42 / 100 (and equivalently spaced dates) ON PURPOSE. An
+// earlier fixture used equal-width values (100/420/999), under which
+// lexicographic and numeric order coincide — which is exactly why the suite
+// stayed green while `BigIntFromString` keys were being stored unpadded and
+// `gte(42n)` was returning 42 and 5 instead of 42 and 100.
+// ---------------------------------------------------------------------------
+
+const kfSchema = DynamoSchema.make({ name: "kf", version: 1 })
+const kfTableName = `kf-test-${Date.now()}`
+
+const KF_VALUES = [5, 42, 100] as const
+const kfDate = (n: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, n))
+
+class Metric extends Schema.Class<Metric>("Metric")({
+  boxId: Schema.String,
+  txn: Schema.BigIntFromString, // Type bigint, Encoded string → TYPE side
+  num: Schema.Number, // Type number, Encoded number → encoded
+  epoch: DynamoModel.DateEpochMs, // Type DateTime, Encoded number → encoded
+  iso: Schema.Date, // Type Date, Encoded ISO string → encoded
+}) {}
+
+const Metrics = Entity.make({
+  model: Metric,
+  entityType: "Metric",
+  primaryKey: {
+    pk: { field: "pk", composite: ["boxId"] },
+    sk: { field: "sk", composite: ["txn"] },
+  },
+  indexes: {
+    byNum: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["boxId"] },
+      sk: { field: "gsi1sk", composite: ["num"] },
+    },
+    byEpoch: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["boxId"] },
+      sk: { field: "gsi2sk", composite: ["epoch"] },
+    },
+    byIso: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["boxId"] },
+      sk: { field: "gsi3sk", composite: ["iso"] },
+    },
+  },
+})
+
+const KfTable = Table.make({ schema: kfSchema, entities: { Metrics } })
+const KfLayer = Layer.mergeAll(ClientLayer, KfTable.layer({ name: kfTableName }))
+const provideKf = Effect.provide(KfLayer)
+const kfEntities = { Metrics }
+const kfTables = { KfTable }
+
+describeConnected("composite key form — mixed-width ordering", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: kfTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(KfTable),
+        })
+        const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+        for (const n of KF_VALUES) {
+          yield* db.entities.Metrics.put({
+            boxId: "b1",
+            txn: BigInt(n),
+            num: n,
+            epoch: DateTime.makeUnsafe(kfDate(n).toISOString()),
+            iso: kfDate(n),
+          })
+        }
+      }).pipe(provideKf, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: kfTableName })
+      }).pipe(
+        provideKf,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("a numeric-Type/string-Encoded composite is stored PADDED", () =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const raw = yield* client.scan({ TableName: kfTableName })
+      const sks = (raw.Items ?? []).map((i) => (i.sk as { S?: string } | undefined)?.S ?? "").sort()
+      // Pre-fix: #txn_100, #txn_42, #txn_5 — unpadded, so 100 < 42 < 5.
+      expect(sks).toEqual([
+        `$kf#v1#metric#txn_${"5".padStart(38, "0")}`,
+        `$kf#v1#metric#txn_${"42".padStart(38, "0")}`,
+        `$kf#v1#metric#txn_${"100".padStart(38, "0")}`,
+      ])
+    }).pipe(provideKf),
+  )
+
+  it.effect("ascending values come back ascending on every composite shape", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+
+      // Pre-fix this one returned 100, 42, 5.
+      const byTxn = yield* db.entities.Metrics.primary({ boxId: "b1" }).collect()
+      expect(byTxn.map((r) => r.txn)).toEqual([5n, 42n, 100n])
+
+      const byNum = yield* db.entities.Metrics.byNum({ boxId: "b1" }).collect()
+      expect(byNum.map((r) => r.num)).toEqual([5, 42, 100])
+
+      const byEpoch = yield* db.entities.Metrics.byEpoch({ boxId: "b1" }).collect()
+      expect(byEpoch.map((r) => r.num)).toEqual([5, 42, 100])
+
+      const byIso = yield* db.entities.Metrics.byIso({ boxId: "b1" }).collect()
+      expect(byIso.map((r) => r.num)).toEqual([5, 42, 100])
+    }).pipe(provideKf),
+  )
+
+  it.effect("gte / lte / between return the correct rows on each shape", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+
+      // THE reported case: pre-fix this returned 42 and 5.
+      const txnGte = yield* db.entities.Metrics.primary({ boxId: "b1" })
+        .where((t, ops) => ops.gte(t.txn, 42n))
+        .collect()
+      expect(txnGte.map((r) => r.txn)).toEqual([42n, 100n])
+
+      const txnLte = yield* db.entities.Metrics.primary({ boxId: "b1" })
+        .where((t, ops) => ops.lte(t.txn, 42n))
+        .collect()
+      expect(txnLte.map((r) => r.txn)).toEqual([5n, 42n])
+
+      const txnBetween = yield* db.entities.Metrics.primary({ boxId: "b1" })
+        .where((t, ops) => ops.between(t.txn, 42n, 100n))
+        .collect()
+      expect(txnBetween.map((r) => r.txn)).toEqual([42n, 100n])
+
+      const numGte = yield* db.entities.Metrics.byNum({ boxId: "b1" })
+        .where((t, ops) => ops.gte(t.num, 42))
+        .collect()
+      expect(numGte.map((r) => r.num)).toEqual([42, 100])
+
+      const epochGte = yield* db.entities.Metrics.byEpoch({ boxId: "b1" })
+        .where((t, ops) => ops.gte(t.epoch, DateTime.makeUnsafe(kfDate(42).toISOString())))
+        .collect()
+      expect(epochGte.map((r) => r.num)).toEqual([42, 100])
+
+      const isoBetween = yield* db.entities.Metrics.byIso({ boxId: "b1" })
+        .where((t, ops) => ops.between(t.iso, kfDate(5), kfDate(42)))
+        .collect()
+      expect(isoBetween.map((r) => r.num)).toEqual([5, 42])
+    }).pipe(provideKf),
+  )
+
+  it.effect("get round-trips every value after the format change", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+      for (const n of KF_VALUES) {
+        const got = yield* db.entities.Metrics.get({ boxId: "b1", txn: BigInt(n) })
+        expect(got.txn).toBe(BigInt(n))
+        expect(got.num).toBe(n)
+      }
+    }).pipe(provideKf),
+  )
+})
+
+// NOTE: aggregate coverage for the key-form rule is UNIT-level
+// (`test/AggregateKeyEncoding.test.ts`): padded bigint, mixed-width ordering,
+// and the `DateEpochMs` ISO -> epoch change. A connected aggregate fixture on a
+// `Schema.BigIntFromString` root composite cannot be written today —
+// `Aggregate.create` fails re-encoding the assembled root ("Expected string at
+// [\"txn\"]") on the real write path, before any key is composed. That is a
+// pre-existing aggregate encode defect, independent of this rule, and is
+// reported separately.
+
+// ---------------------------------------------------------------------------
+// S1 — key-form must hold across EVERY composition site, not just `put`.
+//
+// `composeAllKeys` (put) normalised while `composeGsiKeysForUpdatePolicyAware`
+// (update) did not, so an `update()` rewrote a padded `gsi1pk` back to its
+// unpadded form and evicted the row from its own GSI. Mixed widths (5/42/100)
+// throughout — equal-width values hide exactly this.
+//
+// Covers the canonical GSI-composite shapes from CLAUDE.md against a
+// transformed composite: multi-writer, PK-composites-only, hierarchical, hole
+// pattern, all-mutable, and empty-composite half.
+// ---------------------------------------------------------------------------
+
+const s1Schema = DynamoSchema.make({ name: "s1", version: 1 })
+const s1TableName = `s1-test-${Date.now()}`
+const S1_VALUES = [5, 42, 100] as const
+
+class S1Row extends Schema.Class<S1Row>("S1Row")({
+  acct: Schema.String,
+  txn: Schema.BigIntFromString,
+  region: Schema.optional(Schema.String),
+  site: Schema.optional(Schema.String),
+  status: Schema.optional(Schema.String),
+  binding: Schema.optional(Schema.String),
+  note: Schema.String,
+}) {}
+
+const s1Indexes = {
+  // Shape 5 — all composites mutable, and the S1 reproducer.
+  byTxn: {
+    name: "gsi1",
+    pk: { field: "gsi1pk", composite: ["txn"] },
+    sk: { field: "gsi1sk", composite: ["acct"] },
+  },
+  // Shape 2 — PK-composites-only (both halves are primary key composites).
+  byAcctTxn: {
+    name: "gsi2",
+    pk: { field: "gsi2pk", composite: ["acct"] },
+    sk: { field: "gsi2sk", composite: ["txn"] },
+  },
+  // Shape 3 — hierarchical, with the transformed composite as the leaf.
+  byHier: {
+    name: "gsi3",
+    pk: { field: "gsi3pk", composite: ["acct"] },
+    sk: { field: "gsi3sk", composite: ["region", "site", "txn"] },
+  },
+  // Shape 1 + 4 — multi-writer / hole pattern: an optional leading composite
+  // with the transformed composite trailing it.
+  byStatus: {
+    name: "gsi4",
+    pk: { field: "gsi4pk", composite: ["acct"] },
+    sk: { field: "gsi4sk", composite: ["status", "txn"] },
+  },
+  // Shape 6 — empty-composite half, transformed composite on the PK half.
+  byBinding: {
+    name: "gsi5",
+    pk: { field: "gsi5pk", composite: ["txn"] },
+    sk: { field: "gsi5sk", composite: [] },
+  },
+} as const
+
+const S1Rows = Entity.make({
+  model: S1Row,
+  entityType: "S1Row",
+  primaryKey: {
+    pk: { field: "pk", composite: ["acct"] },
+    sk: { field: "sk", composite: ["txn"] },
+  },
+  indexes: s1Indexes,
+})
+
+// Retain + soft-delete variant, for the lifecycle round-trips.
+const S1Retained = Entity.make({
+  model: S1Row,
+  entityType: "S1Retained",
+  primaryKey: {
+    pk: { field: "pk", composite: ["acct"] },
+    sk: { field: "sk", composite: ["txn"] },
+  },
+  indexes: { byTxn: s1Indexes.byTxn },
+  versioned: { retain: true },
+  softDelete: true,
+})
+
+const S1Table = Table.make({ schema: s1Schema, entities: { S1Rows, S1Retained } })
+const S1Layer = Layer.mergeAll(ClientLayer, S1Table.layer({ name: s1TableName }))
+const provideS1 = Effect.provide(S1Layer)
+const s1Entities = { S1Rows, S1Retained }
+const s1Tables = { S1Table }
+
+describeConnected("key form holds across every composition site (S1)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: s1TableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(S1Table),
+        })
+      }).pipe(provideS1, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: s1TableName })
+      }).pipe(
+        provideS1,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("S1: update() must not evict the row from its own GSI", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: s1Entities, tables: s1Tables })
+      for (const n of S1_VALUES) {
+        yield* db.entities.S1Rows.put({ acct: "a1", txn: BigInt(n), note: "a" })
+
+        const before = yield* db.entities.S1Rows.byTxn({ txn: BigInt(n) }).collect()
+        expect(before.map((r) => r.txn)).toEqual([BigInt(n)])
+
+        yield* db.entities.S1Rows.update({ acct: "a1", txn: BigInt(n) }).set({ note: "b" })
+
+        // Pre-fix: 0 rows — the update rewrote gsi1pk unpadded.
+        const after = yield* db.entities.S1Rows.byTxn({ txn: BigInt(n) }).collect()
+        expect(after.map((r) => r.txn)).toEqual([BigInt(n)])
+        expect(after[0]!.note).toBe("b")
+      }
+    }).pipe(provideS1),
+  )
+
+  it.effect("every canonical GSI shape survives an update", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: s1Entities, tables: s1Tables })
+      yield* db.entities.S1Rows.put({
+        acct: "a2",
+        txn: 42n,
+        region: "apac",
+        site: "syd",
+        status: "active",
+        binding: "b-1",
+        note: "a",
+      })
+      yield* db.entities.S1Rows.update({ acct: "a2", txn: 42n }).set({ note: "b" })
+
+      // Shape 5 / S1, shape 2, shape 3, shapes 1+4, shape 6.
+      expect(
+        (yield* db.entities.S1Rows.byTxn({ txn: 42n }).collect()).some((r) => r.acct === "a2"),
+      ).toBe(true)
+      expect((yield* db.entities.S1Rows.byAcctTxn({ acct: "a2", txn: 42n }).collect()).length).toBe(
+        1,
+      )
+      expect(
+        (yield* db.entities.S1Rows.byHier({ acct: "a2", region: "apac", site: "syd" }).collect())
+          .length,
+      ).toBe(1)
+      expect(
+        (yield* db.entities.S1Rows.byStatus({ acct: "a2", status: "active" }).collect()).length,
+      ).toBe(1)
+      // gsi5 is keyed on `txn` alone, so other accounts share the partition.
+      expect(
+        (yield* db.entities.S1Rows.byBinding({ txn: 42n }).collect()).some((r) => r.acct === "a2"),
+      ).toBe(true)
+    }).pipe(provideS1),
+  )
+
+  it.effect("hole pattern: an absent leading composite does not corrupt the trailing one", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: s1Entities, tables: s1Tables })
+      // `status` absent → byStatus cannot compose; byTxn must still hold.
+      yield* db.entities.S1Rows.put({ acct: "a3", txn: 100n, note: "a" })
+      yield* db.entities.S1Rows.update({ acct: "a3", txn: 100n }).set({ note: "b" })
+      expect(
+        (yield* db.entities.S1Rows.byTxn({ txn: 100n }).collect()).some((r) => r.acct === "a3"),
+      ).toBe(true)
+    }).pipe(provideS1),
+  )
+
+  it.effect("retain-enabled update keeps the GSI key, and versions round-trip", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: s1Entities, tables: s1Tables })
+      yield* db.entities.S1Retained.put({ acct: "r1", txn: 42n, note: "a" })
+      yield* db.entities.S1Retained.update({ acct: "r1", txn: 42n }).set({ note: "b" })
+
+      const found = yield* db.entities.S1Retained.byTxn({ txn: 42n }).collect()
+      expect(found.some((r) => r.acct === "r1")).toBe(true)
+
+      const versions = yield* db.entities.S1Retained.versions({ acct: "r1", txn: 42n }).collect()
+      expect(versions.length).toBeGreaterThan(0)
+
+      // getVersion — pre-fix returned ItemNotFound for a row that exists.
+      const v1 = yield* db.entities.S1Retained.getVersion({ acct: "r1", txn: 42n }, 1)
+      expect(v1.txn).toBe(42n)
+    }).pipe(provideS1),
+  )
+
+  it.effect("soft-delete get / restore / purge round-trip on a transformed composite", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: s1Entities, tables: s1Tables })
+      yield* db.entities.S1Retained.put({ acct: "r2", txn: 100n, note: "a" })
+      yield* db.entities.S1Retained.delete({ acct: "r2", txn: 100n })
+
+      // deleted.get — pre-fix ItemNotFound while deleted.list found the row.
+      const tomb = yield* db.entities.S1Retained.deleted.get({ acct: "r2", txn: 100n })
+      expect(tomb.txn).toBe(100n)
+      const listed = yield* db.entities.S1Retained.deleted.list({ acct: "r2", txn: 100n }).collect()
+      expect(listed.length).toBeGreaterThan(0)
+
+      const restored = yield* db.entities.S1Retained.restore({ acct: "r2", txn: 100n })
+      expect(restored.txn).toBe(100n)
+      expect((yield* db.entities.S1Retained.byTxn({ txn: 100n }).collect()).length).toBeGreaterThan(
+        0,
+      )
+
+      // purge — pre-fix reported success and deleted nothing.
+      yield* db.entities.S1Retained.purge({ acct: "r2", txn: 100n })
+      const left = yield* db.entities.S1Retained.primary({ acct: "r2", txn: 100n }).collect()
+      expect(left).toEqual([])
+    }).pipe(provideS1),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Collections and vector search must compose keys with the SAME key form as
+// the entity accessors and the write path.
+//
+// `db.collections.*` and `Collections.make()` passed the caller's raw record
+// straight to `composePk`, and `BoundVectorQuery` did the same for its
+// partition — so two accessors over one index, with the same values, disagreed.
+// Mixed widths 5/42/100; the composites are a `DateEpochMs` (Type DateTime,
+// Encoded number) and a `BigIntFromString` (Type bigint, Encoded string), the
+// two shapes a plain `Schema.String` fixture cannot distinguish.
+// ---------------------------------------------------------------------------
+
+const cfSchema = DynamoSchema.make({ name: "cf", version: 1 })
+const cfTableName = `cf-test-${Date.now()}`
+const CF_VALUES = [5, 42, 100] as const
+const cfAt = (n: number) =>
+  DateTime.makeUnsafe(new Date(Date.UTC(2026, 0, 1, 0, 0, n)).toISOString())
+
+class CfReading extends Schema.Class<CfReading>("CfReading")({
+  siteId: Schema.String,
+  takenAt: DynamoModel.DateEpochMs,
+  txn: Schema.BigIntFromString,
+  readingId: Schema.String,
+}) {}
+
+const CfReadings = Entity.make({
+  model: CfReading,
+  entityType: "CfReading",
+  primaryKey: {
+    pk: { field: "pk", composite: ["readingId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byWindow: {
+      name: "gsi1",
+      collection: "cfWindow",
+      pk: { field: "gsi1pk", composite: ["siteId", "takenAt"] },
+      sk: { field: "gsi1sk", composite: ["readingId"] },
+    },
+    byTxn: {
+      name: "gsi2",
+      collection: "cfLedger",
+      pk: { field: "gsi2pk", composite: ["txn"] },
+      sk: { field: "gsi2sk", composite: ["readingId"] },
+    },
+  },
+})
+
+const CfTable = Table.make({ schema: cfSchema, entities: { CfReadings } })
+const CfExplicit = Collection.make("cfWindow", { CfReadings })
+const CfLayer = Layer.mergeAll(ClientLayer, CfTable.layer({ name: cfTableName }))
+const provideCf = Effect.provide(CfLayer)
+
+describeConnected("collections and vector search share the entity key form", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: cfTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(CfTable),
+        })
+        const db = yield* DynamoClient.make({
+          entities: { CfReadings },
+          tables: { CfTable },
+        })
+        for (const n of CF_VALUES) {
+          yield* db.entities.CfReadings.put({
+            siteId: "s1",
+            takenAt: cfAt(n),
+            txn: BigInt(n),
+            readingId: `r${n}`,
+          })
+        }
+      }).pipe(provideCf, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: cfTableName })
+      }).pipe(
+        provideCf,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("entity accessor and collection accessor agree — DateEpochMs composite", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { CfReadings }, tables: { CfTable } })
+      for (const n of CF_VALUES) {
+        const viaEntity = yield* db.entities.CfReadings.byWindow({
+          siteId: "s1",
+          takenAt: cfAt(n),
+        }).collect()
+        // Pre-fix: 0 rows — the collection composed the partition from the raw
+        // `DateTime` while the row was written from the epoch key form.
+        const viaCollection = yield* (
+          db.collections as unknown as {
+            cfWindow: (c: Record<string, unknown>) => {
+              collect: () => Effect.Effect<{ CfReadings: ReadonlyArray<CfReading> }, never>
+            }
+          }
+        )
+          .cfWindow({ siteId: "s1", takenAt: cfAt(n) })
+          .collect()
+        expect(viaEntity.map((r) => r.readingId)).toEqual([`r${n}`])
+        expect(viaCollection.CfReadings.map((r) => r.readingId)).toEqual([`r${n}`])
+      }
+    }).pipe(provideCf),
+  )
+
+  it.effect("entity accessor and collection accessor agree — BigIntFromString composite", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { CfReadings }, tables: { CfTable } })
+      for (const n of CF_VALUES) {
+        const viaEntity = yield* db.entities.CfReadings.byTxn({ txn: BigInt(n) }).collect()
+        const viaCollection = yield* (
+          db.collections as unknown as {
+            cfLedger: (c: Record<string, unknown>) => {
+              collect: () => Effect.Effect<{ CfReadings: ReadonlyArray<CfReading> }, never>
+            }
+          }
+        )
+          .cfLedger({ txn: BigInt(n) })
+          .collect()
+        expect(viaEntity.map((r) => r.readingId)).toEqual([`r${n}`])
+        expect(viaCollection.CfReadings.map((r) => r.readingId)).toEqual([`r${n}`])
+      }
+    }).pipe(provideCf),
+  )
+
+  it.effect("explicit Collections.make() composes the same partition", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { CfReadings }, tables: { CfTable } })
+      for (const n of CF_VALUES) {
+        const q = (
+          CfExplicit as unknown as {
+            query: (c: Record<string, unknown>) => Query.Query<unknown>
+          }
+        ).query({ siteId: "s1", takenAt: cfAt(n) })
+        const rows = yield* db.entities.CfReadings.collect(q)
+        expect(rows.length).toBe(1)
+      }
+    }).pipe(provideCf),
   )
 })
