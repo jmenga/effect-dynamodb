@@ -48,6 +48,7 @@ import type {
 } from "@effect-dynamodb/schema/Errors.js"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
+import * as Collection from "../src/Collection.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
@@ -9195,5 +9196,158 @@ describeConnected("key form holds across every composition site (S1)", () => {
       const left = yield* db.entities.S1Retained.primary({ acct: "r2", txn: 100n }).collect()
       expect(left).toEqual([])
     }).pipe(provideS1),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Collections and vector search must compose keys with the SAME key form as
+// the entity accessors and the write path.
+//
+// `db.collections.*` and `Collections.make()` passed the caller's raw record
+// straight to `composePk`, and `BoundVectorQuery` did the same for its
+// partition — so two accessors over one index, with the same values, disagreed.
+// Mixed widths 5/42/100; the composites are a `DateEpochMs` (Type DateTime,
+// Encoded number) and a `BigIntFromString` (Type bigint, Encoded string), the
+// two shapes a plain `Schema.String` fixture cannot distinguish.
+// ---------------------------------------------------------------------------
+
+const cfSchema = DynamoSchema.make({ name: "cf", version: 1 })
+const cfTableName = `cf-test-${Date.now()}`
+const CF_VALUES = [5, 42, 100] as const
+const cfAt = (n: number) =>
+  DateTime.makeUnsafe(new Date(Date.UTC(2026, 0, 1, 0, 0, n)).toISOString())
+
+class CfReading extends Schema.Class<CfReading>("CfReading")({
+  siteId: Schema.String,
+  takenAt: DynamoModel.DateEpochMs,
+  txn: Schema.BigIntFromString,
+  readingId: Schema.String,
+}) {}
+
+const CfReadings = Entity.make({
+  model: CfReading,
+  entityType: "CfReading",
+  primaryKey: {
+    pk: { field: "pk", composite: ["readingId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byWindow: {
+      name: "gsi1",
+      collection: "cfWindow",
+      pk: { field: "gsi1pk", composite: ["siteId", "takenAt"] },
+      sk: { field: "gsi1sk", composite: ["readingId"] },
+    },
+    byTxn: {
+      name: "gsi2",
+      collection: "cfLedger",
+      pk: { field: "gsi2pk", composite: ["txn"] },
+      sk: { field: "gsi2sk", composite: ["readingId"] },
+    },
+  },
+})
+
+const CfTable = Table.make({ schema: cfSchema, entities: { CfReadings } })
+const CfExplicit = Collection.make("cfWindow", { CfReadings })
+const CfLayer = Layer.mergeAll(ClientLayer, CfTable.layer({ name: cfTableName }))
+const provideCf = Effect.provide(CfLayer)
+
+describeConnected("collections and vector search share the entity key form", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: cfTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(CfTable),
+        })
+        const db = yield* DynamoClient.make({
+          entities: { CfReadings },
+          tables: { CfTable },
+        })
+        for (const n of CF_VALUES) {
+          yield* db.entities.CfReadings.put({
+            siteId: "s1",
+            takenAt: cfAt(n),
+            txn: BigInt(n),
+            readingId: `r${n}`,
+          })
+        }
+      }).pipe(provideCf, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: cfTableName })
+      }).pipe(
+        provideCf,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("entity accessor and collection accessor agree — DateEpochMs composite", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { CfReadings }, tables: { CfTable } })
+      for (const n of CF_VALUES) {
+        const viaEntity = yield* db.entities.CfReadings.byWindow({
+          siteId: "s1",
+          takenAt: cfAt(n),
+        }).collect()
+        // Pre-fix: 0 rows — the collection composed the partition from the raw
+        // `DateTime` while the row was written from the epoch key form.
+        const viaCollection = yield* (
+          db.collections as unknown as {
+            cfWindow: (c: Record<string, unknown>) => {
+              collect: () => Effect.Effect<{ CfReadings: ReadonlyArray<CfReading> }, never>
+            }
+          }
+        )
+          .cfWindow({ siteId: "s1", takenAt: cfAt(n) })
+          .collect()
+        expect(viaEntity.map((r) => r.readingId)).toEqual([`r${n}`])
+        expect(viaCollection.CfReadings.map((r) => r.readingId)).toEqual([`r${n}`])
+      }
+    }).pipe(provideCf),
+  )
+
+  it.effect("entity accessor and collection accessor agree — BigIntFromString composite", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { CfReadings }, tables: { CfTable } })
+      for (const n of CF_VALUES) {
+        const viaEntity = yield* db.entities.CfReadings.byTxn({ txn: BigInt(n) }).collect()
+        const viaCollection = yield* (
+          db.collections as unknown as {
+            cfLedger: (c: Record<string, unknown>) => {
+              collect: () => Effect.Effect<{ CfReadings: ReadonlyArray<CfReading> }, never>
+            }
+          }
+        )
+          .cfLedger({ txn: BigInt(n) })
+          .collect()
+        expect(viaEntity.map((r) => r.readingId)).toEqual([`r${n}`])
+        expect(viaCollection.CfReadings.map((r) => r.readingId)).toEqual([`r${n}`])
+      }
+    }).pipe(provideCf),
+  )
+
+  it.effect("explicit Collections.make() composes the same partition", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { CfReadings }, tables: { CfTable } })
+      for (const n of CF_VALUES) {
+        const q = (
+          CfExplicit as unknown as {
+            query: (c: Record<string, unknown>) => Query.Query<unknown>
+          }
+        ).query({ siteId: "s1", takenAt: cfAt(n) })
+        const rows = yield* db.entities.CfReadings.collect(q)
+        expect(rows.length).toBe(1)
+      }
+    }).pipe(provideCf),
   )
 })

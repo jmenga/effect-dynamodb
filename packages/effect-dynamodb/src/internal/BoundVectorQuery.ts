@@ -148,6 +148,15 @@ export interface BoundVectorQueryConfig {
    * would otherwise be filtered/projected under a name that is not on disk.
    */
   readonly resolveDbName: (domainName: string) => string
+  /**
+   * The entity's composite key form (`internal/CompositeCodec.ts`).
+   *
+   * `.partition(composites)` takes Type-side domain values, while the write
+   * path composes `__edd_vp_*` from the key form — so without this, search
+   * composed a different partition from `put` and a `DateEpochMs` partition
+   * composite matched nothing.
+   */
+  readonly keyForm: (record: Record<string, unknown>) => Record<string, unknown>
 }
 
 /** @internal Immutable accumulated builder state. */
@@ -210,8 +219,16 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
     VectorSearchError,
     DynamoClient | TableConfig
   > {
-    const { entityType, logicalName, definition, schema, tableTag, decode, resolveDbName } =
-      this._config
+    const {
+      entityType,
+      logicalName,
+      definition,
+      schema,
+      tableTag,
+      decode,
+      resolveDbName,
+      keyForm,
+    } = this._config
     const state = this._state
     return Effect.gen(function* () {
       const client = yield* DynamoClient
@@ -258,11 +275,12 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
       // 2. Compose the HASH partition value. Always present — the entity type
       //    is baked in, which is what scopes a shared physical index to one
       //    entity (see `DESIGN.md §14`).
+      const partitionKeyForm = keyForm(state.partition ?? {})
       const partitionValue = KeyComposer.composeVectorPartition(
         schema,
         entityType,
         definition,
-        state.partition ?? {},
+        partitionKeyForm,
       )
 
       // 3. Build the equality-only SearchConditionExpression.

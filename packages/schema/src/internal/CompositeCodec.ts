@@ -145,3 +145,25 @@ export const toCompositeKeyRecord = (
   }
   return out
 }
+
+/**
+ * How a composite's key form is derived — the branch `makeCompositeKeyForm`
+ * takes for that attribute.
+ *
+ * Exposed so that a COLLECTION, which spans several entities over one physical
+ * index, can check at bind time that its members agree. Two members whose
+ * models spell the same composite differently (`Schema.Date` vs
+ * `DynamoModel.DateEpochMs`, say) write keys into the same partition that can
+ * never match each other; picking one member's form silently loses the others'
+ * rows. That is a modelling conflict and should fail loudly at `make()` time.
+ */
+export type CompositeKeyFormKind = "absent" | "identity" | "type-numeric" | "encoded"
+
+/** Classify one composite attribute of a model/derived schema. */
+export const compositeKeyFormKind = (source: Schema.Top, attr: string): CompositeKeyFormKind => {
+  const field = getSchemaFields(source)?.[attr]
+  if (field === undefined) return "absent"
+  if (numericTypeWithStringEncoding(field)) return "type-numeric"
+  if (!hasEncodingTransformation(field)) return "identity"
+  return "encoded"
+}

@@ -21,6 +21,21 @@ import { readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { describe, expect, it } from "@effect/vitest"
 
+/**
+ * Every module that hands a record to `KeyComposer`. Adding a file here is the
+ * one-line cost of making it safe; leaving it out is how a bypass survives.
+ *
+ * The multi-item write helpers, `Aggregate.ts` and geo's `GeoSearch.ts` join
+ * this list on the branch that fixes them — a file only belongs here once its
+ * bypasses are closed, or the guard fails for reasons unrelated to new code.
+ */
+const SOURCES = [
+  "../src/Entity.ts",
+  "../src/Collection.ts",
+  "../src/DynamoClient.ts",
+  "../src/internal/BoundVectorQuery.ts",
+].map((rel) => ({ rel, path: fileURLToPath(new URL(rel, import.meta.url)) }))
+
 const ENTITY_SRC = fileURLToPath(new URL("../src/Entity.ts", import.meta.url))
 
 /**
@@ -46,8 +61,8 @@ const RECORD_TAKING = [
 /** Accepted spellings for an already-normalised record. */
 const NORMALISED = /keyForm\(|keyFormFor\(|KeyForm\b|\bkeyRecord\(/
 
-describe("key-form invariant", () => {
-  const src = readFileSync(ENTITY_SRC, "utf8")
+describe.each(SOURCES)("key-form invariant — $rel", ({ path }) => {
+  const src = readFileSync(path, "utf8")
 
   for (const fn of RECORD_TAKING) {
     it(`every KeyComposer.${fn} call takes a normalised record`, () => {
@@ -87,6 +102,14 @@ describe("key-form invariant", () => {
       ).toEqual([])
     })
   }
+})
+
+/**
+ * Structural checks specific to `Entity.ts` — it is the only module that defines
+ * the normalisers, so these cannot run per-source.
+ */
+describe("key-form invariant — Entity.ts normaliser shape", () => {
+  const src = readFileSync(ENTITY_SRC, "utf8")
 
   it("the normaliser itself is defined exactly once per scope", () => {
     // `keyForm` inside `makeImpl`, `keyFormFor` for cross-entity / `bind` use.

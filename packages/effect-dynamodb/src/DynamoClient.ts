@@ -120,6 +120,7 @@ import {
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import {
+  compositeKeyFormKind,
   makeCompositeKeyForm,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
@@ -165,6 +166,66 @@ import { mergeVectorIndexes, definition as tableDefinition, toVectorIndexSpec } 
  * character DynamoDB key composition emits for the following segment.
  */
 const SK_MAX_SENTINEL = "￿"
+
+/**
+ * The composite key form for an arbitrary entity-like value — the same rule
+ * `Entity` applies to its own keys (`internal/CompositeCodec.ts`).
+ */
+const entityKeyForm = (
+  entityLike: { readonly model?: unknown; readonly schemas?: { readonly inputSchema?: unknown } },
+  record: Record<string, unknown>,
+): Record<string, unknown> => {
+  const source = (entityLike.schemas?.inputSchema ?? entityLike.model) as Schema.Top | undefined
+  if (source === undefined) return record
+  const form = makeCompositeKeyForm(source, (attr, value) => {
+    throw new Error(
+      `[EDD-9050] Composite "${attr}" could not be put into its key form: ` +
+        `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode.`,
+    )
+  })
+  return toCompositeKeyRecord(form, record)
+}
+
+/**
+ * Fail at bind time when a collection's members spell a shared PK composite
+ * differently. See the call site for why picking one member is not an option.
+ */
+const assertCollectionKeyFormAgreement = (
+  collName: string,
+  members: ReadonlyArray<{ entityKey: string; entityLike: EntityLike; indexDef: IndexDefinition }>,
+): void => {
+  if (members.length < 2) return
+  const attrs = new Set<string>()
+  for (const m of members) for (const attr of m.indexDef.pk.composite) attrs.add(attr)
+  for (const attr of attrs) {
+    // `absent` and `identity` are the SAME behaviour — both pass the value
+    // through untouched — so a member that simply does not declare the
+    // attribute (a ref-derived id, or an index whose composite list differs)
+    // is not in conflict. Only a genuine difference in how the value is
+    // transformed is. This catches identity-vs-transformed and
+    // numeric-Type-vs-encoded; two DIFFERENT encoded transforms of the same
+    // kind still classify alike and are not detected here.
+    const kinds = members
+      .filter((m) => m.indexDef.pk.composite.includes(attr))
+      .map((m) => {
+        const kind = compositeKeyFormKind(
+          (m.entityLike.schemas.inputSchema ?? m.entityLike.model) as Schema.Top,
+          attr,
+        )
+        return { entityKey: m.entityKey, kind: kind === "absent" ? "identity" : kind }
+      })
+    const distinct = new Set(kinds.map((k) => k.kind))
+    if (distinct.size > 1) {
+      const detail = kinds.map((k) => `${k.entityKey}: ${k.kind}`).join(", ")
+      throw new Error(
+        `[EDD-9050] Collection "${collName}" members disagree on how the partition key ` +
+          `composite "${attr}" is composed into a key (${detail}). They share one physical ` +
+          `index, so rows written under different forms can never match — align the ` +
+          `attribute's schema across the member models.`,
+      )
+    }
+  }
+}
 
 /** Union of all DynamoDB client error types */
 export type DynamoClientError =
@@ -985,12 +1046,12 @@ const makeFromConfig = (config: {
 
       return (rawComposites: Record<string, unknown>) => {
         validateQueryComposites(_indexName, indexDef, rawComposites)
-        const composites = toCompositeKeyRecord(compositeKeyForm, rawComposites)
+        const compositesKeyForm = toCompositeKeyRecord(compositeKeyForm, rawComposites)
         const pkValue = KeyComposer.composePk(
           entityLike._schema,
           entityLike.entityType,
           indexDef,
-          composites,
+          compositesKeyForm,
         )
         const query = Query.make({
           tableName: "",
@@ -1003,13 +1064,13 @@ const makeFromConfig = (config: {
           resolveTableName: entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
         })
 
-        // Apply SK prefix from provided composites.
+        // Apply SK prefix from provided compositesKeyForm.
         // `composeSortKeyBeginsWith`, not `composeSortKeyPrefix` — the operand
-        // must terminate on a segment boundary when composites remain, or it
+        // must terminate on a segment boundary when compositesKeyForm remain, or it
         // matches sibling values that merely start with the supplied one
         // (`status_done` also matching `status_done_archived`, issue #115).
         const hasSkComposites = indexDef.sk.composite.some(
-          (attr: string) => composites[attr] !== undefined,
+          (attr: string) => compositesKeyForm[attr] !== undefined,
         )
         const finalQuery = hasSkComposites
           ? Query.where(query, {
@@ -1018,7 +1079,7 @@ const makeFromConfig = (config: {
                 entityLike.entityType,
                 1,
                 indexDef,
-                composites,
+                compositesKeyForm,
               ),
             })
           : query
@@ -1043,9 +1104,9 @@ const makeFromConfig = (config: {
         ): Query.SortKeyCondition => {
           if (skComposites.length === 0) {
             throw new Error(
-              `[EDD-9045] Index "${_indexName}" has no sort key composites, so there is ` +
+              `[EDD-9045] Index "${_indexName}" has no sort key compositesKeyForm, so there is ` +
                 `nothing for .where() to constrain. Remove the .where() call, or add sort ` +
-                `key composites to the index definition.`,
+                `key compositesKeyForm to the index definition.`,
             )
           }
 
@@ -1053,7 +1114,9 @@ const makeFromConfig = (config: {
           // composite name via the sk accessor; fall back to the first composite
           // the accessor call did not already pin.
           const firstUnpinned = (() => {
-            const i = skComposites.findIndex((attr: string) => composites[attr] === undefined)
+            const i = skComposites.findIndex(
+              (attr: string) => compositesKeyForm[attr] === undefined,
+            )
             return i === -1 ? skComposites.length - 1 : i
           })()
           const targetIndex =
@@ -1067,23 +1130,23 @@ const makeFromConfig = (config: {
           // silently compare against the wrong prefix.
           const missing = skComposites
             .slice(0, targetIndex)
-            .filter((attr: string) => composites[attr] === undefined)
+            .filter((attr: string) => compositesKeyForm[attr] === undefined)
           if (missing.length > 0) {
             throw new Error(
               `[EDD-9004] Sort key condition on "${targetAttr}" for index "${_indexName}" ` +
-                `requires prior composites: ${missing.join(", ")}. Sort key composites must ` +
+                `requires prior compositesKeyForm: ${missing.join(", ")}. Sort key compositesKeyForm must ` +
                 `follow prefix ordering — supply them to the accessor before calling .where().`,
             )
           }
 
-          // Compose a sort key value with the leading pinned composites followed
-          // by `<targetAttr>_<value>`. Trailing composites are excluded — the
+          // Compose a sort key value with the leading pinned compositesKeyForm followed
+          // by `<targetAttr>_<value>`. Trailing compositesKeyForm are excluded — the
           // condition bounds the key at the target's position.
-          const pinnedRecord: Record<string, unknown> = {}
+          const pinnedKeyForm: Record<string, unknown> = {}
           for (let i = 0; i < targetIndex; i++) {
-            pinnedRecord[skComposites[i]!] = composites[skComposites[i]!]
+            pinnedKeyForm[skComposites[i]!] = compositesKeyForm[skComposites[i]!]
           }
-          // Encode the operand exactly as the accessor composites (and the
+          // Encode the operand exactly as the accessor compositesKeyForm (and the
           // write path) are encoded, so both sides of the comparison come out
           // of one pipeline.
           const operand = (value: unknown): unknown => compositeKeyForm(targetAttr, value)
@@ -1094,7 +1157,7 @@ const makeFromConfig = (config: {
               1,
               indexDef,
               {
-                ...pinnedRecord,
+                ...pinnedKeyForm,
                 [targetAttr]: operand(value),
               },
             )
@@ -1114,7 +1177,7 @@ const makeFromConfig = (config: {
               entityLike.entityType,
               1,
               indexDef,
-              { ...pinnedRecord, [targetAttr]: operand(value) },
+              { ...pinnedKeyForm, [targetAttr]: operand(value) },
             )
 
           /**
@@ -1135,7 +1198,7 @@ const makeFromConfig = (config: {
           const upper = (value: unknown): string =>
             isLastComposite ? compose(value) : aboveSubtree(value)
 
-          // `beginsWith` / `between` / `eq` already carry the pinned composites
+          // `beginsWith` / `between` / `eq` already carry the pinned compositesKeyForm
           // in BOTH operands, so they never escape the pinned prefix.
           if ("beginsWith" in condition) return { beginsWith: compose(condition.beginsWith) }
           if ("eq" in condition) {
@@ -1148,8 +1211,8 @@ const makeFromConfig = (config: {
           }
 
           // One-sided operators are open on the other side. With no pinned
-          // composites that is exactly right — the open end runs to the edge of
-          // the partition. But once the accessor has pinned leading composites,
+          // compositesKeyForm that is exactly right — the open end runs to the edge of
+          // the partition. But once the accessor has pinned leading compositesKeyForm,
           // DynamoDB's single sort key condition must ALSO stay inside that
           // prefix, so the open end is clamped and the condition becomes a
           // BETWEEN. (`Query.where` replaces the accessor's own `begins_with`,
@@ -1166,7 +1229,7 @@ const makeFromConfig = (config: {
             return condition
           }
 
-          // The pinned composites are a strict prefix by construction (the
+          // The pinned compositesKeyForm are a strict prefix by construction (the
           // target composite follows them), so the shared delimiter rule always
           // terminates this bound on a segment boundary.
           const pinnedPrefix = KeyComposer.composeSortKeyBeginsWith(
@@ -1174,7 +1237,7 @@ const makeFromConfig = (config: {
             entityLike.entityType,
             1,
             indexDef,
-            pinnedRecord,
+            pinnedKeyForm,
           )
           const pinnedMax = `${pinnedPrefix}${SK_MAX_SENTINEL}`
           if ("gte" in condition) return { between: [compose(condition.gte), pinnedMax] }
@@ -1182,7 +1245,7 @@ const makeFromConfig = (config: {
           if ("lte" in condition) return { between: [pinnedPrefix, upper(condition.lte)] }
           if ("lt" in condition) {
             // On a non-terminal composite no stored key can equal the composed
-            // bound (trailing composites always follow), so BETWEEN's inclusive
+            // bound (trailing compositesKeyForm always follow), so BETWEEN's inclusive
             // high end is harmless. On the LAST composite the bound IS a
             // storable key, and DynamoDB has neither a half-open BETWEEN nor a
             // FilterExpression that may reference a key attribute — so there is
@@ -1191,7 +1254,7 @@ const makeFromConfig = (config: {
             if (!isLastComposite) return { between: [pinnedPrefix, compose(condition.lt)] }
             throw new Error(
               `[EDD-9046] A strict "lt" condition on sort key composite "${targetAttr}" for ` +
-                `index "${_indexName}" cannot be expressed once earlier composites ` +
+                `index "${_indexName}" cannot be expressed once earlier compositesKeyForm ` +
                 `(${skComposites.slice(0, targetIndex).join(", ")}) are pinned by the accessor: ` +
                 `DynamoDB allows one sort key condition, BETWEEN is inclusive at both ends, and ` +
                 `a FilterExpression may not reference a key attribute. Use ` +
@@ -1280,6 +1343,7 @@ const makeFromConfig = (config: {
           )
         }
         const vqConfig: BoundVectorQueryConfig = {
+          keyForm: (record: Record<string, unknown>) => entityKeyForm(entityLike, record),
           entityType: entityLike.entityType,
           logicalName,
           definition,
@@ -1314,8 +1378,17 @@ const makeFromConfig = (config: {
     // 3. Build auto-discovered collection accessors
     const boundCollections: Record<string, unknown> = {}
     for (const [collName, members] of collectionMembers) {
+      // A collection spans several entities over ONE physical index, so its
+      // members must agree on how each PK composite is spelled in a key. Two
+      // members disagreeing (`Schema.Date` vs `DateEpochMs`, say) write keys
+      // into the same partition that can never match each other, and picking
+      // the first member's form would silently lose the others' rows. Fail at
+      // bind time instead.
+      assertCollectionKeyFormAgreement(collName, members)
+
       boundCollections[collName] = (composites: Record<string, unknown>) => {
-        // Use the first member for PK composition
+        // Use the first member for PK composition — verified above to agree
+        // with every other member.
         const firstMember = members[0]!
         const indexDef = firstMember.indexDef
 
@@ -1352,11 +1425,15 @@ const makeFromConfig = (config: {
             .pipe(Effect.map((decoded: unknown) => ({ _memberKey: entityKey, _decoded: decoded })))
         }
 
+        // Same key form the member entities' own accessors and their write
+        // path use — without it `db.collections.window({ takenAt })` composed a
+        // different PK from `db.entities.Readings.byWindow({ takenAt })` and
+        // returned nothing.
         const pkValue = KeyComposer.composePk(
           firstMember.entityLike._schema,
           firstMember.entityLike.entityType,
           indexDef,
-          composites,
+          entityKeyForm(firstMember.entityLike, composites),
         )
 
         // Always isolated — begins_with on collection SK prefix
