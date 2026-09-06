@@ -6936,6 +6936,10 @@ const EsStatusProjection = PureEntity.make({
     pk: { field: "pk", composite: ["matchId"] },
     sk: { field: "sk", composite: [] },
   },
+  // Timestamps + version make the upsert-vs-put divergence observable: a real
+  // upsert preserves `createdAt` and increments `version`; a Put resets both.
+  timestamps: true,
+  versioned: true,
 })
 
 const EsIdemTable = Table.make({
@@ -7317,6 +7321,95 @@ describeConnected("EventStore — additionalItems + idempotency (closes #85)", (
         Effect.flip,
       )
       expect(gone._tag).toBe("ItemNotFound")
+    }).pipe(provideEsIdem),
+  )
+
+  // -------------------------------------------------------------------------
+  // #100 review — `upsert` does NOT have Put semantics. Its whole contract is
+  // `if_not_exists` on createdAt / immutable fields / the version counter, so
+  // compiling it as a Put silently resets them. Proven end-to-end here: the
+  // direct upsert preserves, the transact paths refuse, and the stored row is
+  // left exactly as it was.
+  // -------------------------------------------------------------------------
+
+  it.effect("a direct upsert preserves createdAt and bumps version (the contract)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      const first = yield* db.entities.EsStatusProjection.upsert({
+        matchId: "ups-1",
+        state: "PRE_MATCH",
+      }).asEffect()
+      const second = yield* db.entities.EsStatusProjection.upsert({
+        matchId: "ups-1",
+        state: "IN_PROGRESS",
+      }).asEffect()
+
+      expect((second as { createdAt: unknown }).createdAt).toEqual(
+        (first as { createdAt: unknown }).createdAt,
+      )
+      expect((second as { version: number }).version).toBe(
+        (first as { version: number }).version + 1,
+      )
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("transactWrite refuses an upsert and leaves the stored row untouched", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      const before = yield* db.entities.EsStatusProjection.upsert({
+        matchId: "ups-tx",
+        state: "PRE_MATCH",
+      }).asEffect()
+
+      const error = yield* Transaction.transactWrite([
+        db.entities.EsStatusProjection.upsert({ matchId: "ups-tx", state: "IN_PROGRESS" }),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+
+      const after = yield* db.entities.EsStatusProjection.get({ matchId: "ups-tx" }).pipe(
+        Effect.map((r) => r as unknown as { state: string; createdAt: unknown; version: number }),
+      )
+      // Refused up front — no partial write, and createdAt/version intact.
+      expect(after.state).toBe("PRE_MATCH")
+      expect(after.createdAt).toEqual((before as { createdAt: unknown }).createdAt)
+      expect(after.version).toBe((before as { version: number }).version)
+    }).pipe(provideEsIdem),
+  )
+
+  it.effect("Batch.write and additionalItems refuse an upsert too", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+
+      const batchError = yield* Batch.write([
+        db.entities.EsStatusProjection.upsert({ matchId: "ups-bw", state: "PRE_MATCH" }),
+      ]).pipe(Effect.flip)
+      expect(batchError._tag).toBe("ValidationError")
+
+      const appendError = yield* EsIdemMatchEvents.append(
+        { matchId: "ups-es" },
+        [new EsIdemMatchStarted({ venue: "MCG" })],
+        0,
+        {
+          additionalItems: [
+            db.entities.EsStatusProjection.upsert({ matchId: "ups-es", state: "PRE_MATCH" }),
+          ],
+        },
+      ).pipe(Effect.flip)
+      expect(appendError._tag).toBe("ValidationError")
+
+      // All-or-nothing: the refused append wrote no events either.
+      expect(yield* EsIdemMatchEvents.read({ matchId: "ups-es" })).toHaveLength(0)
     }).pipe(provideEsIdem),
   )
 })

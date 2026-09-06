@@ -1229,6 +1229,26 @@ describe("EventStore", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    it.effect("rejects an upsert additional item instead of compiling it as a Put", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { StatusProjection },
+          tables: { EventsTable },
+        })
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [
+            db.entities.StatusProjection.upsert({ matchId: "m-1", state: "IN_PROGRESS" }),
+          ],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("upsert")
+        // Nothing may be written — the whole append is refused up front.
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("keeps cancellation indices aligned for a bound additional item", () =>
       Effect.gen(function* () {
         mockTransactWriteItems.mockRejectedValue(

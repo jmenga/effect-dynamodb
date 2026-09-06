@@ -108,6 +108,7 @@ export {
   EntityUpdateImpl,
   EntityUpdateTypeId,
   emptyUpdateState,
+  type PutKind,
   type ReturnValuesMode,
   returnValuesMap,
   type UpdateState,
@@ -132,6 +133,7 @@ import {
   type EntityUpdate,
   EntityUpdateImpl,
   emptyUpdateState,
+  type PutKind,
   type ReturnValuesMode,
   returnValuesMap,
   type UpdateState,
@@ -2758,6 +2760,7 @@ const makeImpl = <
       op._input,
       { attributeNotExists: [pkField, skField] },
       op._withVectors,
+      "create",
     )
   }
 
@@ -4411,6 +4414,11 @@ const makeImpl = <
         }),
       self,
       input as globalThis.Record<string, unknown>,
+      undefined,
+      undefined,
+      // Tagged so the transact/batch compilers can refuse it: this op is an
+      // UpdateItem with `if_not_exists`, not a Put (#100).
+      "upsert",
     )
 
   /**
@@ -6097,6 +6105,13 @@ export interface TransactableInfo {
    * MUST reject the op rather than drop it.
    */
   readonly condition?: Expr | ConditionInput | undefined
+  /**
+   * For `opType: "put"`, which put-shaped op produced it. `"upsert"` does NOT
+   * have `Put` semantics — it is an `UpdateItem` with `if_not_exists` on
+   * `createdAt`, immutable fields and the version counter. Consumers that emit
+   * a `Put` MUST reject `"upsert"` rather than compile it (#100).
+   */
+  readonly putKind?: PutKind | undefined
 }
 
 /** @internal */
@@ -6108,6 +6123,7 @@ interface InternalEntityOp {
   readonly _input?: globalThis.Record<string, unknown>
   readonly _condition?: Expr | ConditionInput | undefined
   readonly _updateState?: UpdateState
+  readonly _putKind?: PutKind | undefined
 }
 
 /** @internal */
@@ -6154,6 +6170,7 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
         entity: target._entity,
         input: target._input,
         condition: target._condition,
+        putKind: target._putKind ?? "put",
       }
     }
     if (target._opType === "update") {

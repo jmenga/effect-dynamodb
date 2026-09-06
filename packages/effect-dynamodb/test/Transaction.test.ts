@@ -1,4 +1,5 @@
 import { it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   DynamoError,
@@ -65,9 +66,47 @@ const OrderEntity = Entity.make({
   },
 })
 
+// Fixtures for the #100 capability gate — entities whose write contract the
+// single-item transact compile path cannot reproduce.
+class RefProject extends Schema.Class<RefProject>("RefProject")({
+  projectId: Schema.String,
+  projectName: Schema.String,
+}) {}
+
+const RefProjects = Entity.make({
+  model: DynamoModel.configure(RefProject, { projectId: { identifier: true } }),
+  entityType: "RefProject",
+  primaryKey: { pk: { field: "pk", composite: ["projectId"] }, sk: { field: "sk", composite: [] } },
+})
+
+class RefTask extends Schema.Class<RefTask>("RefTask")({
+  taskId: Schema.String,
+  title: Schema.String,
+  project: DynamoModel.ref(RefProject),
+}) {}
+
+const RefTasks = Entity.make({
+  model: RefTask,
+  entityType: "RefTask",
+  primaryKey: { pk: { field: "pk", composite: ["taskId"] }, sk: { field: "sk", composite: [] } },
+  refs: { project: { entity: RefProjects } },
+})
+
+class GenDoc extends Schema.Class<GenDoc>("GenDoc")({
+  docId: Schema.String,
+  title: Schema.String,
+}) {}
+
+const GenDocs = Entity.make({
+  model: GenDoc,
+  entityType: "GenDoc",
+  primaryKey: { pk: { field: "pk", composite: ["docId"] }, sk: { field: "sk", composite: [] } },
+  generatedId: { field: "docId" },
+})
+
 const MainTable = Table.make({
   schema: AppSchema,
-  entities: { UserEntity, OrderEntity },
+  entities: { UserEntity, OrderEntity, RefProjects, RefTasks, GenDocs },
 })
 
 // --- Mock DynamoClient ---
@@ -778,6 +817,106 @@ describe("Transaction", () => {
         expect(del.ConditionExpression).toBe("attribute_exists(#e0)")
         expect(del.ExpressionAttributeNames).toEqual({ "#e0": "pk" })
         expect(del.ExpressionAttributeValues).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  // -------------------------------------------------------------------------
+  // #100 review — ops the compile path cannot reproduce must be REJECTED, never
+  // silently compiled into something with different semantics.
+  // -------------------------------------------------------------------------
+
+  describe("unsupported ops are rejected, not silently reinterpreted (#100)", () => {
+    const upsertInput = { userId: "u-1", email: "a@x.io", name: "Alice", role: "admin" } as const
+
+    it.effect("rejects upsert — it is an UpdateItem with if_not_exists, not a Put", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([UserEntity.upsert(upsertInput)]).pipe(
+          Effect.flip,
+        )
+
+        expect(error._tag).toBe("ValidationError")
+        const ve = error as ValidationError
+        expect(ve.entityType).toBe("User")
+        expect(String(ve.cause)).toContain("upsert")
+        expect(String(ve.cause)).toContain("if_not_exists")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects a bound upsert from db.entities.*", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { UserEntity, OrderEntity },
+          tables: { MainTable },
+        })
+
+        const error = yield* Transaction.transactWrite([
+          db.entities.UserEntity.upsert(upsertInput),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // The put-kind tag rides on the op intermediate, and every combinator
+    // reconstructs that intermediate. If one forgets to carry `_putKind`, an
+    // upsert silently becomes a plain Put again — exactly the bug this closes.
+    it.effect("`.condition()` on an upsert preserves the upsert rejection", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { UserEntity, OrderEntity },
+          tables: { MainTable },
+        })
+
+        const error = yield* Transaction.transactWrite([
+          db.entities.UserEntity.upsert(upsertInput).condition({ role: "admin" }),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("upsert")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("plain put and create are still accepted (the tag does not over-reject)", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([
+          UserEntity.put(upsertInput),
+          UserEntity.create({ ...upsertInput, userId: "u-2" }),
+        ])
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        expect(items).toHaveLength(2)
+        expect(items[0].Put.ConditionExpression).toBeUndefined()
+        expect(items[1].Put.ConditionExpression).toContain("attribute_not_exists")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects an entity whose ref hydration this path cannot perform", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([
+          RefTasks.put({ taskId: "t-1", title: "Land", projectId: "p-1" } as never),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("ref")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects a generatedId entity — id generation needs Crypto", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([GenDocs.put({ title: "t" } as never)]).pipe(
+          Effect.flip,
+        )
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("generated id")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )
   })

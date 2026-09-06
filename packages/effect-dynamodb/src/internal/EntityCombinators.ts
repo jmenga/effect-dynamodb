@@ -255,7 +255,8 @@ export const condition: {
       impl._key,
     ) as unknown as T
   }
-  // EntityPut
+  // EntityPut — `_putKind` MUST be carried through: it is what tells the
+  // transact/batch compilers that an `upsert` is not a plain `Put` (#100).
   const impl = self as unknown as EntityPutImpl<any, any, any, any>
   return new EntityPutImpl(
     impl._builder,
@@ -263,6 +264,7 @@ export const condition: {
     impl._input,
     cond,
     impl._withVectors,
+    impl._putKind,
   ) as unknown as T
 })
 
@@ -298,10 +300,14 @@ export const withVector: {
       ) as unknown as T
     }
     const impl = self as unknown as EntityPutImpl<any, any, any, any>
-    return new EntityPutImpl(impl._builder, impl._entity, impl._input, impl._condition, {
-      ...(impl._withVectors ?? {}),
-      [name]: vector,
-    }) as unknown as T
+    return new EntityPutImpl(
+      impl._builder,
+      impl._entity,
+      impl._input,
+      impl._condition,
+      { ...(impl._withVectors ?? {}), [name]: vector },
+      impl._putKind,
+    ) as unknown as T
   },
 )
 
