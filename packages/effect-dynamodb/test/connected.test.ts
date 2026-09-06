@@ -44,6 +44,8 @@ import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
 import type {
   AdditionalItemConditionFailed,
   DuplicateCommand,
+  UniqueConstraintViolation,
+  ValidationError,
   VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
 import * as Aggregate from "../src/Aggregate.js"
@@ -1706,6 +1708,32 @@ describeConnected("Connected integration tests", () => {
         const task = yield* Tasks.get({ taskId: "t-tx" }).asEffect()
         expect(user.displayName).toBe("TxUser")
         expect(task.title).toBe("Tx Task")
+
+        // #113 — `Users` carries `unique: { email }` + `versioned: { retain }`,
+        // so this ONE caller op must have emitted three items: the row, its
+        // uniqueness sentinel, and the v1 snapshot. Before #113 only the row
+        // landed and the constraint was silently unenforced.
+        const client = yield* DynamoClient
+        const sentinel = yield* client.getItem({
+          TableName: tableName,
+          Key: {
+            pk: { S: "$connected-test#v1#user.email#tx@test.com" },
+            sk: { S: "$connected-test#v1#user.email" },
+          },
+        })
+        expect(sentinel.Item?.__edd_e__?.S).toBe("User._unique.email")
+        // The sentinel points back at the row it reserves for.
+        expect(sentinel.Item?._entity_pk?.S).toBe("$connected-test#v1#user#userid_u-tx")
+
+        // ...and the v1 retain snapshot, in the row's own partition.
+        const snapshot = yield* client.getItem({
+          TableName: tableName,
+          Key: {
+            pk: { S: "$connected-test#v1#user#userid_u-tx" },
+            sk: { S: "$connected-test#v1#user#v#0000001" },
+          },
+        })
+        expect(snapshot.Item?.displayName?.S).toBe("TxUser")
       }).pipe(provide),
     )
 
@@ -1740,6 +1768,141 @@ describeConnected("Connected integration tests", () => {
 
         // Verify the put was rolled back
         const result = yield* Users.get({ userId: "u-tx-fail" })
+          .asEffect()
+          .pipe(
+            Effect.map(() => "exists"),
+            Effect.catchTag("ItemNotFound", () => Effect.succeed("not found")),
+          )
+        expect(result).toBe("not found")
+      }).pipe(provide),
+    )
+
+    it.effect("transactWrite enforces the unique constraint it now writes (#113)", () =>
+      Effect.gen(function* () {
+        // The sentinel from the previous test reserves tx@test.com. A second
+        // write of the same email through the SAME path must now be refused —
+        // before #113 it succeeded and left two rows sharing the value.
+        const err = yield* Transaction.transactWrite([
+          Users.put({
+            userId: "u-tx-dup",
+            email: "tx@test.com",
+            displayName: "Duplicate",
+            role: "member",
+            createdBy: "test",
+          }),
+        ]).pipe(Effect.flip)
+
+        expect(err._tag).toBe("UniqueConstraintViolation")
+        const violation = err as UniqueConstraintViolation
+        expect(violation.entityType).toBe("User")
+        expect(violation.constraint).toBe("email")
+        expect(violation.fields).toEqual({ email: "tx@test.com" })
+
+        // All-or-nothing: the row must not exist.
+        const result = yield* Users.get({ userId: "u-tx-dup" })
+          .asEffect()
+          .pipe(
+            Effect.map(() => "exists"),
+            Effect.catchTag("ItemNotFound", () => Effect.succeed("not found")),
+          )
+        expect(result).toBe("not found")
+      }).pipe(provide),
+    )
+
+    it.effect("transactWrite refuses a delete whose side items need a read (#113)", () =>
+      Effect.gen(function* () {
+        const err = yield* Transaction.transactWrite([Users.delete({ userId: "u-tx" })]).pipe(
+          Effect.flip,
+        )
+
+        expect(err._tag).toBe("ValidationError")
+        expect(String((err as ValidationError).cause)).toContain("EDD-9048")
+
+        // Refused up front: the row and its sentinel are both untouched.
+        const still = yield* Users.get({ userId: "u-tx" }).asEffect()
+        expect(still.displayName).toBe("TxUser")
+      }).pipe(provide),
+    )
+
+    it.effect("the entity's own delete releases the sentinel it wrote (#113)", () =>
+      Effect.gen(function* () {
+        yield* Users.delete({ userId: "u-tx" })
+
+        // The released email is reusable through the transact path, which proves
+        // the sentinel really went away rather than being orphaned.
+        yield* Transaction.transactWrite([
+          Users.put({
+            userId: "u-tx-reuse",
+            email: "tx@test.com",
+            displayName: "Reused",
+            role: "member",
+            createdBy: "test",
+          }),
+        ])
+        const reused = yield* Users.get({ userId: "u-tx-reuse" }).asEffect()
+        expect(reused.displayName).toBe("Reused")
+      }).pipe(provide),
+    )
+
+    it.effect("a softDelete entity's transact delete is refused, not hard-deleted (#113)", () =>
+      Effect.gen(function* () {
+        // `Tasks` is softDelete. Before #113 this hard-deleted the row, losing
+        // the tombstone the entity was configured to write.
+        yield* Tasks.put({
+          taskId: "t-sd",
+          userId: "u-sd",
+          title: "Soft",
+          status: "todo",
+          priority: 1,
+        }).asEffect()
+
+        const err = yield* Transaction.transactWrite([Tasks.delete({ taskId: "t-sd" })]).pipe(
+          Effect.flip,
+        )
+        expect(err._tag).toBe("ValidationError")
+        expect(String((err as ValidationError).cause)).toContain("EDD-9048")
+
+        // Still live — nothing was deleted.
+        const still = yield* Tasks.get({ taskId: "t-sd" }).asEffect()
+        expect(still.title).toBe("Soft")
+
+        // The entity's own delete does write the tombstone, with GSI keys stripped.
+        yield* Tasks.delete({ taskId: "t-sd" })
+        const client = yield* DynamoClient
+        const partition = yield* client.query({
+          TableName: tableName,
+          KeyConditionExpression: "#pk = :pk",
+          ExpressionAttributeNames: { "#pk": "pk" },
+          ExpressionAttributeValues: { ":pk": { S: "$connected-test#v1#task#taskid_t-sd" } },
+        })
+        const rows = partition.Items ?? []
+        expect(rows).toHaveLength(1)
+        expect(rows[0]?.sk?.S).toContain("#deleted#")
+        expect(rows[0]?.deletedAt?.S).toBeDefined()
+        expect(rows[0]?.gsi1pk).toBeUndefined()
+      }).pipe(provide),
+    )
+
+    it.effect("Batch.write refuses the lifecycle configs it cannot express (#113)", () =>
+      Effect.gen(function* () {
+        const uniqueErr = yield* Batch.write([
+          Users.put({
+            userId: "u-bw-unique",
+            email: "bwunique@test.com",
+            displayName: "BW",
+            role: "member",
+            createdBy: "test",
+          }),
+        ]).pipe(Effect.flip)
+        expect(uniqueErr._tag).toBe("ValidationError")
+        expect(String((uniqueErr as ValidationError).cause)).toContain("EDD-9049")
+
+        const softErr = yield* Batch.write([Tasks.delete({ taskId: "t-bw-sd" })]).pipe(Effect.flip)
+        expect(softErr._tag).toBe("ValidationError")
+        expect(String((softErr as ValidationError).cause)).toContain("EDD-9049")
+
+        // Nothing was written by the refused unique put.
+        const result = yield* Users.get({ userId: "u-bw-unique" })
           .asEffect()
           .pipe(
             Effect.map(() => "exists"),

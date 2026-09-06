@@ -54,7 +54,47 @@ const OrderEntity = Entity.make({
   },
 })
 
-const MainTable = Table.make({ schema: AppSchema, entities: { UserEntity, OrderEntity } })
+// #113 fixtures — entities whose write contract needs more than one item.
+class UniqueMember extends Schema.Class<UniqueMember>("UniqueMember")({
+  memberId: Schema.String,
+  email: Schema.String,
+}) {}
+
+const UniqueMembers = Entity.make({
+  model: UniqueMember,
+  entityType: "UniqueMember",
+  primaryKey: { pk: { field: "pk", composite: ["memberId"] }, sk: { field: "sk", composite: [] } },
+  unique: { email: ["email"] },
+})
+
+class RetainDoc extends Schema.Class<RetainDoc>("RetainDoc")({
+  docId: Schema.String,
+  title: Schema.String,
+}) {}
+
+const RetainDocs = Entity.make({
+  model: RetainDoc,
+  entityType: "RetainDoc",
+  primaryKey: { pk: { field: "pk", composite: ["docId"] }, sk: { field: "sk", composite: [] } },
+  versioned: { retain: true },
+})
+
+class SoftItem extends Schema.Class<SoftItem>("SoftItem")({
+  itemId: Schema.String,
+  label: Schema.String,
+}) {}
+
+const SoftItems = Entity.make({
+  model: SoftItem,
+  entityType: "SoftItem",
+  primaryKey: { pk: { field: "pk", composite: ["itemId"] }, sk: { field: "sk", composite: [] } },
+  softDelete: true,
+})
+
+const MainTable = Table.make({
+  schema: AppSchema,
+  entities: { UserEntity, OrderEntity, UniqueMembers, RetainDocs, SoftItems },
+})
 
 // --- Mock DynamoClient ---
 
@@ -791,6 +831,59 @@ describe("Batch", () => {
         expect(error._tag).toBe("ValidationError")
         expect(String((error as ValidationError).cause)).toContain("UpdateRequest")
         expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // -----------------------------------------------------------------------
+    // #113 — BatchWriteItem cannot host the multi-item lifecycle features.
+    // -----------------------------------------------------------------------
+
+    it.effect("rejects a put of a unique entity — no ConditionExpression for the sentinel", () =>
+      Effect.gen(function* () {
+        const error = yield* Batch.write([
+          UniqueMembers.put({ memberId: "m-1", email: "a@x.io" }),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("EDD-9049")
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects a put of a retain entity — the snapshot would not be atomic", () =>
+      Effect.gen(function* () {
+        const error = yield* Batch.write([RetainDocs.put({ docId: "d-1", title: "T" })]).pipe(
+          Effect.flip,
+        )
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("EDD-9049")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects a DELETE of a softDelete entity — a tombstone is not a DeleteRequest", () =>
+      Effect.gen(function* () {
+        const error = yield* Batch.write([SoftItems.delete({ itemId: "i-1" })]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("EDD-9049")
+        expect(String((error as ValidationError).cause)).toContain("softDelete")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // Direction matters: `softDelete` changes only the delete path, so a put of
+    // a soft-deletable entity is an ordinary single-item write. Gating it would
+    // have broken writes that were always correct — the connected suite caught
+    // exactly this.
+    it.effect("ALLOWS a put of a softDelete entity — softDelete only affects deletes", () =>
+      Effect.gen(function* () {
+        mockBatchWriteItem.mockResolvedValueOnce({})
+
+        yield* Batch.write([SoftItems.put({ itemId: "i-1", label: "L" })])
+
+        const requests = mockBatchWriteItem.mock.calls[0]![0].RequestItems["test-table"]
+        expect(requests).toHaveLength(1)
+        expect(fromAttributeMap(requests[0].PutRequest.Item).__edd_e__).toBe("SoftItem")
       }).pipe(Effect.provide(TestLayer)),
     )
 

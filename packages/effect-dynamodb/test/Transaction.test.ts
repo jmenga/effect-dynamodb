@@ -4,6 +4,7 @@ import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   DynamoError,
   type TransactionCancelled,
+  type UniqueConstraintViolation,
   type ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Layer, Schema } from "effect"
@@ -104,9 +105,58 @@ const GenDocs = Entity.make({
   generatedId: { field: "docId" },
 })
 
+// #113 fixtures — entities whose write contract needs more than one item.
+class LifecycleMember extends Schema.Class<LifecycleMember>("LifecycleMember")({
+  memberId: Schema.String,
+  email: Schema.String,
+  label: Schema.String,
+}) {}
+
+const LifecycleMembers = Entity.make({
+  model: LifecycleMember,
+  entityType: "LifecycleMember",
+  primaryKey: { pk: { field: "pk", composite: ["memberId"] }, sk: { field: "sk", composite: [] } },
+  unique: { email: ["email"] },
+  versioned: { retain: true },
+})
+
+class SparseMember extends Schema.Class<SparseMember>("SparseMember")({
+  memberId: Schema.String,
+  email: Schema.optional(Schema.String),
+  label: Schema.String,
+}) {}
+
+const SparseMembers = Entity.make({
+  model: SparseMember,
+  entityType: "SparseMember",
+  primaryKey: { pk: { field: "pk", composite: ["memberId"] }, sk: { field: "sk", composite: [] } },
+  unique: { email: ["email"] },
+})
+
+class SoftNote extends Schema.Class<SoftNote>("SoftNote")({
+  noteId: Schema.String,
+  body: Schema.String,
+}) {}
+
+const SoftNotes = Entity.make({
+  model: SoftNote,
+  entityType: "SoftNote",
+  primaryKey: { pk: { field: "pk", composite: ["noteId"] }, sk: { field: "sk", composite: [] } },
+  softDelete: true,
+})
+
 const MainTable = Table.make({
   schema: AppSchema,
-  entities: { UserEntity, OrderEntity, RefProjects, RefTasks, GenDocs },
+  entities: {
+    UserEntity,
+    OrderEntity,
+    RefProjects,
+    RefTasks,
+    GenDocs,
+    LifecycleMembers,
+    SparseMembers,
+    SoftNotes,
+  },
 })
 
 // --- Mock DynamoClient ---
@@ -825,6 +875,130 @@ describe("Transaction", () => {
   // #100 review — ops the compile path cannot reproduce must be REJECTED, never
   // silently compiled into something with different semantics.
   // -------------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // #113 — a put of an entity with multi-item lifecycle config expands.
+  // -------------------------------------------------------------------------
+
+  describe("multi-item side writes (#113)", () => {
+    const memberInput = { memberId: "m-1", email: "a@x.io", label: "L" } as const
+
+    it.effect("a unique + retain put emits the item, its sentinel and the v1 snapshot", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([LifecycleMembers.put(memberInput)])
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        expect(items).toHaveLength(3)
+
+        const main = fromAttributeMap(items[0].Put.Item)
+        expect(main.__edd_e__).toBe("LifecycleMember")
+
+        const sentinel = fromAttributeMap(items[1].Put.Item)
+        expect(sentinel.__edd_e__).toBe("LifecycleMember._unique.email")
+        expect(sentinel._entity_pk).toBe(main.pk)
+        // The guard IS the constraint — without it the sentinel enforces nothing.
+        expect(items[1].Put.ConditionExpression).toBe("attribute_not_exists(pk)")
+
+        const snapshot = fromAttributeMap(items[2].Put.Item)
+        expect(snapshot.sk).toBe("$myapp#v1#lifecyclemember#v#0000001")
+        expect(items[2].Put.ConditionExpression).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a constraint whose fields are unset emits no sentinel (sparse)", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([
+          SparseMembers.put({ memberId: "m-2", label: "no-email" } as never),
+        ])
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        // Just the item — reserving `undefined` would collide across records.
+        expect(items).toHaveLength(1)
+        expect(fromAttributeMap(items[0].Put.Item).__edd_e__).toBe("SparseMember")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a failed sentinel is reported as UniqueConstraintViolation, not a bare cancel", () =>
+      Effect.gen(function* () {
+        const txError = new Error("cancelled")
+        ;(txError as any).name = "TransactionCanceledException"
+        // Position 1 is the sentinel emitted for position-0's op.
+        ;(txError as any).CancellationReasons = [
+          { Code: "None" },
+          { Code: "ConditionalCheckFailed" },
+          { Code: "None" },
+        ]
+        mockTransactWriteItems.mockRejectedValueOnce(txError)
+
+        const error = yield* Transaction.transactWrite([LifecycleMembers.put(memberInput)]).pipe(
+          Effect.flip,
+        )
+
+        expect(error._tag).toBe("UniqueConstraintViolation")
+        const violation = error as UniqueConstraintViolation
+        expect(violation.entityType).toBe("LifecycleMember")
+        expect(violation.constraint).toBe("email")
+        expect(violation.fields).toEqual({ email: "a@x.io" })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("the 100-item cap counts EXPANDED items and says so", () =>
+      Effect.gen(function* () {
+        // 34 ops x 3 items each = 102 > 100, while 34 ops alone would pass.
+        const ops = Array.from({ length: 34 }, (_, i) =>
+          LifecycleMembers.put({ memberId: `m-${i}`, email: `e${i}@x.io`, label: "L" }),
+        )
+
+        const error = yield* Transaction.transactWrite(ops).pipe(Effect.flip)
+
+        expect(error._tag).toBe("DynamoError")
+        const message = String((error as DynamoError).cause)
+        expect(message).toContain("34 operation(s) expanded to 102 items")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a delete of a lifecycle entity is rejected with EDD-9048", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([
+          LifecycleMembers.delete({ memberId: "m-1" }),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("EDD-9048")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a delete of a softDelete entity is rejected — a tombstone needs a read", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([SoftNotes.delete({ noteId: "n-1" })]).pipe(
+          Effect.flip,
+        )
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("EDD-9048")
+        expect(String((error as ValidationError).cause)).toContain("softDelete")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "a PUT of a softDelete entity is still allowed — softDelete only affects deletes",
+      () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockResolvedValueOnce({})
+
+          yield* Transaction.transactWrite([SoftNotes.put({ noteId: "n-1", body: "b" })])
+
+          const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+          expect(items).toHaveLength(1)
+        }).pipe(Effect.provide(TestLayer)),
+    )
+  })
 
   describe("unsupported ops are rejected, not silently reinterpreted (#100)", () => {
     const upsertInput = { userId: "u-1", email: "a@x.io", name: "Alice", role: "admin" } as const

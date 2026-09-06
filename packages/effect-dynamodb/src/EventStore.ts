@@ -580,23 +580,25 @@ export const makeStream = <
       // Resolve stream ID string for storage (join composites)
       const streamIdStr = composeStreamIdString(streamId as Record<string, unknown>)
 
-      // Guard: every item the transaction will carry — one Put per event, one
-      // per caller-supplied additional item, the idempotency sentinel, and the
-      // version-contiguity ConditionCheck when expectedVersion > 0 — must fit
-      // DynamoDB's TransactWriteItems limit. Counted before any work is done so
-      // an oversized append costs nothing. Never chunk: chunking would break
-      // append atomicity.
+      // Guard: every item the transaction will carry — one Put per event, the
+      // items each caller-supplied additional op compiles to, the idempotency
+      // sentinel, and the version-contiguity ConditionCheck when
+      // expectedVersion > 0 — must fit DynamoDB's TransactWriteItems limit.
+      // Never chunk: chunking would break append atomicity.
+      //
+      // This first check is a LOWER BOUND, counting one item per additional op.
+      // Expansion (uniqueness sentinels, version snapshots — #113) only ever
+      // adds items, so an append that already fails here can never fit, and
+      // failing now keeps an oversized append free. The authoritative check runs
+      // once the ops are compiled, below.
       const needsContiguityCheck = expectedVersion > 0 && events.length > 0
-      const requiredItems =
-        events.length +
-        additionalOps.length +
-        (idempotency !== undefined ? 1 : 0) +
-        (needsContiguityCheck ? 1 : 0)
-      if (requiredItems > TRANSACT_WRITE_ITEMS_LIMIT) {
+      const fixedItems =
+        events.length + (idempotency !== undefined ? 1 : 0) + (needsContiguityCheck ? 1 : 0)
+      if (fixedItems + additionalOps.length > TRANSACT_WRITE_ITEMS_LIMIT) {
         return yield* new AppendTooLarge({
           streamName: config.streamName,
           streamId: streamIdStr,
-          count: requiredItems,
+          count: fixedItems + additionalOps.length,
           limit: TRANSACT_WRITE_ITEMS_LIMIT,
         })
       }
@@ -672,10 +674,21 @@ export const makeStream = <
       )
       // Caller-owned items, compiled through the same builder
       // `Transaction.transactWrite` uses, so the two APIs cannot drift.
-      const additionalItems = yield* buildTransactWriteItems(
-        additionalOps,
-        "EventStore.append.additionalItems",
-      )
+      const { items: additionalItems, provenance: additionalProvenance } =
+        yield* buildTransactWriteItems(additionalOps, "EventStore.append.additionalItems")
+
+      // Authoritative cap check: one additional op can compile to several items
+      // (#113), so the pre-flight lower bound above is not sufficient. Reporting
+      // the EXPANDED count is the point — "you passed 40 items" when the caller
+      // passed 30 ops is baffling without it.
+      if (fixedItems + additionalItems.length > TRANSACT_WRITE_ITEMS_LIMIT) {
+        return yield* new AppendTooLarge({
+          streamName: config.streamName,
+          streamId: streamIdStr,
+          count: fixedItems + additionalItems.length,
+          limit: TRANSACT_WRITE_ITEMS_LIMIT,
+        })
+      }
 
       // Version-contiguity guard: `attribute_not_exists(pk)` on the event puts
       // only rejects STALE expected versions (the target slot already exists).
@@ -705,9 +718,16 @@ export const makeStream = <
       // Item layout is load-bearing — cancellation reasons are positional:
       //   [0, C)                version-contiguity ConditionCheck (C is 0 or 1)
       //   [C, C + E)            event puts
-      //   [C + E, C + E + A)    additional items (caller order preserved)
+      //   [C + E, C + E + A)    additional ITEMS (caller op order preserved)
       //   C + E + A             idempotency sentinel (last, so adding it never
       //                         shifts the additional-item indices the caller sees)
+      //
+      // `A` is the count of EMITTED items, which is >= the number of caller ops:
+      // a `unique` / `retain` put expands into its item plus sentinels plus a
+      // snapshot (#113). The 1:1 "item index == caller index" assumption is gone,
+      // so the reason mapping below goes through `additionalProvenance` — the
+      // caller-facing `indices` on `AdditionalItemConditionFailed` are still
+      // indices into the caller's `additionalItems` array, unchanged.
       const transactItems: Array<TransactWriteItem> = [
         ...contiguityCheck,
         ...eventItems,
@@ -786,10 +806,19 @@ export const makeStream = <
             }
           }
 
-          const failedAdditional: Array<number> = []
+          // Attribute each failed additional ITEM back to the caller OP that
+          // produced it. Several items can belong to one op (its main item, its
+          // sentinels, its snapshot), so indices are deduped — a caller who
+          // passed one op must never see it reported twice.
+          const failedOps = new Set<number>()
           for (let i = 0; i < additionalCount; i++) {
-            if (failedAt(checkCount + eventCount + i)) failedAdditional.push(i)
+            if (!failedAt(checkCount + eventCount + i)) continue
+            const from = additionalProvenance[i]
+            // A reason with no provenance entry cannot be justified positionally;
+            // fall through to TransactionCancelled rather than guess.
+            if (from !== undefined) failedOps.add(from.opIndex)
           }
+          const failedAdditional = Array.from(failedOps).sort((a, b) => a - b)
           if (failedAdditional.length > 0) {
             return new AdditionalItemConditionFailed({
               streamName: config.streamName,

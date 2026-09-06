@@ -16,6 +16,7 @@ import type { Entity, EntityDelete, EntityGet, EntityPut } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
 import type { BoundWriteOp } from "./internal/BoundCrud.js"
 import {
+  batchRejectReason,
   composePrimaryKey,
   rejectUnsupportedOp,
   resolveTableNames,
@@ -268,12 +269,26 @@ export const write = (
         })
       }
 
+      // Multi-item lifecycle features are structurally impossible here — no
+      // ConditionExpression, no UpdateRequest, no atomicity across the 25-item
+      // chunk boundary. Checked per direction: `softDelete` changes only the
+      // delete path, so a put of a soft-deletable entity stays allowed. The
+      // transact path expands puts into these items instead (#113).
+      const batchReason = batchRejectReason(entity, info.opType === "delete" ? "delete" : "put")
+      if (batchReason !== undefined) {
+        return yield* new ValidationError({
+          entityType: entity.entityType,
+          operation: "batchWrite",
+          cause: batchReason,
+        })
+      }
+
       if (info.opType === "put") {
         yield* rejectUnsupportedOp(entity, "batchWrite", "put", info.putKind)
-        const marshalledItem = yield* validateAndBuildPutItem(entity, info.input!, "batchWrite.put")
+        const built = yield* validateAndBuildPutItem(entity, info.input!, "batchWrite.put")
         writeRequests.push({
           tableName,
-          request: { PutRequest: { Item: marshalledItem } },
+          request: { PutRequest: { Item: built.marshalled } },
         })
       } else if (info.opType === "delete") {
         yield* rejectUnsupportedOp(entity, "batchWrite", "delete", undefined)

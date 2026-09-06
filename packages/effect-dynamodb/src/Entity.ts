@@ -448,6 +448,43 @@ export interface Entity<
    */
   readonly _serializeSparseFields: (item: globalThis.Record<string, unknown>) => void
 
+  /**
+   * @internal The extra items a `put` of `item` must write alongside the item
+   * itself: one uniqueness sentinel per satisfiable `unique` constraint, plus a
+   * v1 version snapshot when `versioned: { retain: true }`.
+   *
+   * Every one of these is derived from the payload being written, so the
+   * multi-item write paths (`Transaction.transactWrite`,
+   * `EventStore.append({ additionalItems })`) can emit them without reading
+   * anything back. The DELETE side is deliberately absent: releasing a sentinel,
+   * snapshotting the outgoing row and building a soft-delete tombstone all read
+   * the STORED item, which those paths never do — they reject instead (EDD-9048).
+   *
+   * `item` must be the fully assembled wire-form item (keys composed, system
+   * fields applied) — i.e. the output of `validateAndBuildPutItem`.
+   */
+  readonly _buildPutSideItems: (
+    item: globalThis.Record<string, unknown>,
+    now: DateTime.Utc,
+    ttlAttrName: string,
+  ) => ReadonlyArray<{
+    readonly kind: "sentinel" | "snapshot"
+    /** Set for `kind: "sentinel"` — which `unique` constraint produced it. */
+    readonly constraintName?: string | undefined
+    /** Set for `kind: "sentinel"` — the serialized values it reserves, for `UniqueConstraintViolation`. */
+    readonly fields?: globalThis.Record<string, string> | undefined
+    readonly item: globalThis.Record<string, unknown>
+    /** Sentinels are only correct under this guard; snapshots take none. */
+    readonly conditionExpression?: string | undefined
+  }>
+
+  /**
+   * @internal Whether this entity's write contract needs items beyond the one
+   * the transact/batch compile path emits, and which config asks for it. Used to
+   * decide between expanding (put) and rejecting (delete, and all of Batch).
+   */
+  readonly _multiItemWriteFeatures: ReadonlyArray<"unique" | "retain" | "softDelete">
+
   /** @internal Attach model class prototype to a decoded plain object (no-op for Schema.Struct models). */
   readonly _attachPrototype: (decoded: any) => any
 
@@ -2261,6 +2298,98 @@ const makeImpl = <
     }
 
     return snapshot
+  }
+
+  // ---------------------------------------------------------------------------
+  // Multi-item write support for the transact compile path (#113)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Which parts of this entity's write contract need more than one item.
+   * Drives both the `put` expansion and the `delete` / `Batch.write` rejections.
+   */
+  const multiItemWriteFeatures = (): ReadonlyArray<"unique" | "retain" | "softDelete"> => {
+    const features: Array<"unique" | "retain" | "softDelete"> = []
+    if (config.unique != null && Object.keys(config.unique).length > 0) features.push("unique")
+    if (isRetainEnabled()) features.push("retain")
+    if (isSoftDeleteEnabled()) features.push("softDelete")
+    return features
+  }
+
+  /**
+   * Side items for a `put`, derived purely from the payload being written —
+   * see the `_buildPutSideItems` doc on the Entity interface for why the delete
+   * side has no counterpart.
+   *
+   * Mirrors the emission in `put`'s own transact path so the two cannot drift:
+   * one sentinel per satisfiable constraint (sparse — a constraint whose fields
+   * are unset produces none), then the v1 snapshot.
+   */
+  const buildPutSideItems = (
+    item: globalThis.Record<string, unknown>,
+    now: DateTime.Utc,
+    ttlAttrName: string,
+  ): ReadonlyArray<{
+    readonly kind: "sentinel" | "snapshot"
+    readonly constraintName?: string | undefined
+    readonly fields?: globalThis.Record<string, string> | undefined
+    readonly item: globalThis.Record<string, unknown>
+    readonly conditionExpression?: string | undefined
+  }> => {
+    const out: Array<{
+      kind: "sentinel" | "snapshot"
+      constraintName?: string | undefined
+      fields?: globalThis.Record<string, string> | undefined
+      item: globalThis.Record<string, unknown>
+      conditionExpression?: string | undefined
+    }> = []
+
+    const pkField = config.indexes.primary.pk.field
+    const skField = config.indexes.primary.sk.field
+
+    if (config.unique != null) {
+      for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
+        const sentinel = composeUniqueSentinel(
+          schema,
+          entityType,
+          constraintName,
+          constraintDef,
+          item,
+        )
+        // Sparse: a constraint whose composing fields are unset never had a
+        // sentinel, so writing one would reserve `undefined` for everybody.
+        if (!sentinel) continue
+        const sentinelItem: globalThis.Record<string, unknown> = {
+          [pkField]: sentinel.key.pk,
+          [skField]: sentinel.key.sk,
+          __edd_e__: `${entityType}._unique.${constraintName}`,
+          _entity_pk: item[pkField],
+          _entity_sk: item[skField],
+        }
+        const uniqueTtl = resolveUniqueTtl(constraintDef)
+        if (uniqueTtl !== undefined) {
+          sentinelItem[ttlAttrName] = DateTime.toEpochSeconds(now) + normalizeTtlSeconds(uniqueTtl)
+        }
+        out.push({
+          kind: "sentinel",
+          constraintName,
+          fields: sentinel.fieldsRecord,
+          item: sentinelItem,
+          // The guard IS the constraint — without it the sentinel would happily
+          // overwrite another row's reservation and enforce nothing.
+          conditionExpression: "attribute_not_exists(pk)",
+        })
+      }
+    }
+
+    if (isRetainEnabled()) {
+      out.push({
+        kind: "snapshot",
+        item: buildSnapshotItem(item, 1, pkField, skField, ttlAttrName, now),
+      })
+    }
+
+    return out
   }
 
   // ---------------------------------------------------------------------------
@@ -5774,6 +5903,8 @@ const makeImpl = <
     /** @internal Entity schema version baked into composed keys. */
     _entityVersion: entityVersion,
     _serializeSparseFields: serializeSparseFields,
+    _buildPutSideItems: buildPutSideItems,
+    _multiItemWriteFeatures: multiItemWriteFeatures(),
     _attachPrototype: attachPrototype,
     _configure: (
       injectedSchema: DynamoSchema.DynamoSchema,

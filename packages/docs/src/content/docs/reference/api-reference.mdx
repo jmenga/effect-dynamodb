@@ -682,8 +682,17 @@ yield* Transaction.transactWrite(
 | `refs` | Write-time ref hydration reads the referenced entity; the compile step cannot, so the ref attribute would be written empty |
 | `generatedId` | Id generation needs the `Crypto` service |
 | `vectorIndexes` | Computing the embedding needs the `Embedder` service; the item would drop out of the index |
+| **`delete()` of an entity with `unique`, `versioned: { retain: true }` or `softDelete`** | **EDD-9048.** The extra items a delete must write come from the *stored* row — the sentinel to release is keyed by its unique values, a retain snapshot copies it, and a soft-delete tombstone is that row relocated to a new sort key. This path never reads. Use the entity's own `delete`, which reads first |
 
-Not currently refused, and a known gap: entities with `unique`, `versioned: { retain: true }` or `softDelete` write **one** item through this path, so their sentinel / snapshot / tombstone item is not written. Prefer the entity's own operation for those.
+### Multi-item puts expand
+
+A `put` through `transactWrite` (or `EventStore.append({ additionalItems })`) of an entity with `unique` constraints or `versioned: { retain: true }` emits **more than one item**: the row, one `attribute_not_exists`-guarded sentinel per satisfiable constraint, and the v1 snapshot. All of it derives from the payload, so it needs no read and stays atomic with the rest of the transaction.
+
+Consequences worth knowing:
+
+- **The uniqueness constraint is enforced.** A duplicate fails with `UniqueConstraintViolation` (naming the constraint and the values), not a bare `TransactionCancelled`.
+- **The 100-item cap counts the expanded total.** Ten `unique` + `retain` puts occupy 30 slots. The error message reports both numbers.
+- **`softDelete` does not affect a put** — only a delete — so puts of soft-deletable entities are unaffected.
 
 ### Types
 
@@ -726,6 +735,8 @@ yield* Batch.write(
 Auto-chunking: `get` chunks at 100 items, `write` chunks at 25 items. Both retry unprocessed items automatically.
 
 `BatchWriteItem` has no `ConditionExpression`, so `Batch.write` **rejects** any op carrying a condition — `.condition(...)`, `create()` (implicit `attribute_not_exists`) and `deleteIfExists()` (implicit `attribute_exists`) all fail with a `ValidationError` rather than silently writing unconditionally. Use `Transaction.transactWrite` for conditional writes.
+
+It also rejects (**EDD-9049**) any write of an entity configured with `unique` or `versioned: { retain: true }`, and any *delete* of a `softDelete` entity. `BatchWriteItem` has no `ConditionExpression` (which is the entirety of a uniqueness sentinel's correctness), no `UpdateRequest`, and no atomicity across its 25-item chunks — a sentinel that lands without its row, or a row without its sentinel, is a corrupt partition. A **put** of a `softDelete` entity is unaffected, because `softDelete` only changes the delete path.
 
 ---
 

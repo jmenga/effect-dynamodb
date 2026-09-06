@@ -18,7 +18,7 @@ import type { Entity, EntityDelete, EntityPut } from "../Entity.js"
 import { extractTransactable } from "../Entity.js"
 import type { ConditionInput, ExpressionResult } from "../Expression.js"
 import { toAttributeMap } from "../Marshaller.js"
-import type { TableConfig } from "../Table.js"
+import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import type { BoundWriteOp } from "./BoundCrud.js"
 import { compileExpr, type Expr, isExpr, parseShorthand } from "./Expr.js"
 import {
@@ -103,35 +103,74 @@ const conditionFields = (condition: ExpressionResult | undefined) =>
 // ---------------------------------------------------------------------------
 
 /**
+ * What an emitted transact item was produced by, so a positional cancellation
+ * reason can be attributed back to the caller op that caused it.
+ *
+ * Before #113 this was implicit: one caller op produced exactly one item, so
+ * `itemIndex === opIndex`. A `put` of an entity with `unique` / `retain` now
+ * expands into several items, and the mapping has to be carried rather than
+ * assumed — that is what this array is for.
+ */
+export interface ItemProvenance {
+  /** Index into the caller's `operations` array. */
+  readonly opIndex: number
+  readonly kind: "main" | "sentinel" | "snapshot"
+  /** Set for `kind: "sentinel"` — which `unique` constraint the item reserves. */
+  readonly constraintName?: string | undefined
+  /** Set for `kind: "sentinel"` — the values reserved, for `UniqueConstraintViolation`. */
+  readonly fields?: Record<string, string> | undefined
+  /** The entity the op targeted, so consumers can name it in an error. */
+  readonly entityType: string
+}
+
+/** Compiled items plus the caller-op attribution for each one. */
+export interface BuiltTransactWriteItems {
+  readonly items: Array<TransactWriteItem>
+  /** Parallel to `items`: `provenance[i]` describes `items[i]`. */
+  readonly provenance: Array<ItemProvenance>
+}
+
+/**
  * Compile a list of Entity write ops into marshalled `TransactWriteItems` entries,
- * preserving caller order (positions are load-bearing: `EventStore.append` maps
- * `CancellationReasons` back to `additionalItems` indices by position).
+ * preserving caller order.
+ *
+ * **One caller op may emit several items.** A `put` of an entity with `unique`
+ * constraints or `versioned: { retain: true }` expands into the main item plus
+ * one guarded sentinel per satisfiable constraint plus the v1 snapshot — all
+ * derived from the payload, so no read is needed (#113). `provenance` records
+ * which caller op each emitted item belongs to; consumers that map cancellation
+ * reasons positionally MUST use it instead of assuming 1:1.
  *
  * Does NOT enforce `TRANSACT_WRITE_ITEMS_LIMIT` — the caller counts, because the
  * total may include items this builder never sees (event puts, dedup sentinels).
+ * Callers must count the EXPANDED `items.length`, not `operations.length`.
  */
 export const buildTransactWriteItems = (
   operations: ReadonlyArray<TransactWriteOp>,
   operation: string,
-): Effect.Effect<Array<TransactWriteItem>, ValidationError, TableConfig> =>
+): Effect.Effect<BuiltTransactWriteItems, ValidationError, TableConfig> =>
   Effect.gen(function* () {
-    if (operations.length === 0) return []
+    if (operations.length === 0) return { items: [], provenance: [] }
 
     const opInfos: Array<{
       type: "put" | "delete" | "conditionCheck"
       entity: Entity
+      /** Index into the caller's `operations` array — preserved for provenance. */
+      opIndex: number
       key?: Record<string, unknown> | undefined
       input?: Record<string, unknown> | undefined
       condition?: ExpressionResult | undefined
     }> = []
 
-    for (const op of operations) {
+    for (let opIndex = 0; opIndex < operations.length; opIndex++) {
+      const op = operations[opIndex]!
       // Check for ConditionCheckOp first (has its own TypeId)
       if (op != null && typeof op === "object" && ConditionCheckTypeId in op) {
         const checkOp = op as ConditionCheckOp
         opInfos.push({
           type: "conditionCheck",
           entity: checkOp._entity,
+          opIndex,
           key: checkOp._key,
           condition: checkOp._condition,
         })
@@ -152,6 +191,7 @@ export const buildTransactWriteItems = (
         opInfos.push({
           type: "put",
           entity: info.entity,
+          opIndex,
           input: info.input!,
           condition: compileOpCondition(info.entity, info.condition),
         })
@@ -160,6 +200,7 @@ export const buildTransactWriteItems = (
         opInfos.push({
           type: "delete",
           entity: info.entity,
+          opIndex,
           key: info.key!,
           condition: compileOpCondition(info.entity, info.condition),
         })
@@ -174,43 +215,78 @@ export const buildTransactWriteItems = (
 
     const tableNames = yield* resolveTableNames(opInfos)
 
-    const transactItems: Array<TransactWriteItem> = []
+    const items: Array<TransactWriteItem> = []
+    const provenance: Array<ItemProvenance> = []
+    const push = (item: TransactWriteItem, from: ItemProvenance) => {
+      items.push(item)
+      provenance.push(from)
+    }
 
     for (const op of opInfos) {
       const tableName = tableNames.get(op.entity)!
 
       if (op.type === "put") {
-        const marshalledItem = yield* validateAndBuildPutItem(
-          op.entity,
-          op.input!,
-          `${operation}.put`,
+        const built = yield* validateAndBuildPutItem(op.entity, op.input!, `${operation}.put`)
+        push(
+          {
+            Put: {
+              TableName: tableName,
+              Item: built.marshalled,
+              ...conditionFields(op.condition),
+            },
+          },
+          { opIndex: op.opIndex, kind: "main", entityType: op.entity.entityType },
         )
-        transactItems.push({
-          Put: {
-            TableName: tableName,
-            Item: marshalledItem,
-            ...conditionFields(op.condition),
-          },
-        })
+
+        // Uniqueness sentinels + the v1 retain snapshot. Emitted immediately
+        // after their item so a reader of the request sees them as one group;
+        // `provenance` is what actually carries the association.
+        const ttlAttrName = resolveTtlAttributeName(yield* op.entity._tableTag)
+        for (const side of op.entity._buildPutSideItems(built.item, built.now, ttlAttrName)) {
+          push(
+            {
+              Put: {
+                TableName: tableName,
+                Item: toAttributeMap(side.item),
+                ...(side.conditionExpression
+                  ? { ConditionExpression: side.conditionExpression }
+                  : {}),
+              },
+            },
+            {
+              opIndex: op.opIndex,
+              kind: side.kind,
+              constraintName: side.constraintName,
+              fields: side.fields,
+              entityType: op.entity.entityType,
+            },
+          )
+        }
       } else if (op.type === "delete") {
-        transactItems.push({
-          Delete: {
-            TableName: tableName,
-            Key: toAttributeMap(composePrimaryKey(op.entity, op.key!)),
-            ...conditionFields(op.condition),
+        push(
+          {
+            Delete: {
+              TableName: tableName,
+              Key: toAttributeMap(composePrimaryKey(op.entity, op.key!)),
+              ...conditionFields(op.condition),
+            },
           },
-        })
+          { opIndex: op.opIndex, kind: "main", entityType: op.entity.entityType },
+        )
       } else {
-        transactItems.push({
-          ConditionCheck: {
-            TableName: tableName,
-            Key: toAttributeMap(composePrimaryKey(op.entity, op.key!)),
-            ConditionExpression: op.condition!.expression,
-            ...conditionFields(op.condition),
+        push(
+          {
+            ConditionCheck: {
+              TableName: tableName,
+              Key: toAttributeMap(composePrimaryKey(op.entity, op.key!)),
+              ConditionExpression: op.condition!.expression,
+              ...conditionFields(op.condition),
+            },
           },
-        })
+          { opIndex: op.opIndex, kind: "main", entityType: op.entity.entityType },
+        )
       }
     }
 
-    return transactItems
+    return { items, provenance }
   })

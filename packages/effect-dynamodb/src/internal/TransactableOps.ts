@@ -40,6 +40,54 @@ export const generateTimestampPrimitive = (
   }
 }
 
+/** Render the configured multi-item features for an error message. */
+const describeFeatures = (features: ReadonlyArray<"unique" | "retain" | "softDelete">): string => {
+  const labels = features.map((f) =>
+    f === "unique" ? "`unique`" : f === "retain" ? "`versioned: { retain: true }`" : "`softDelete`",
+  )
+  return labels.length === 1
+    ? labels[0]!
+    : `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`
+}
+
+/**
+ * `Batch.write` cannot host the multi-item lifecycle features that apply to the
+ * direction being written (EDD-9049). This is a different judgement from the
+ * transact path's: there, a `put`'s side items are derivable and get emitted;
+ * here `BatchWriteItem` structurally cannot express them at all.
+ *
+ *   - **No `ConditionExpression`.** A uniqueness sentinel is only a constraint
+ *     because of `attribute_not_exists(pk)`. Writing one without the guard would
+ *     overwrite another row's reservation and enforce nothing — strictly worse
+ *     than writing none, because the table would then *look* guarded.
+ *   - **No atomicity.** A sentinel or snapshot that lands without its item (or
+ *     an item without them) is a corrupt partition, and `Batch.write` chunks at
+ *     25, so related items can even land in different requests.
+ *   - **No `UpdateRequest`.** A soft-delete tombstone is a relocation
+ *     (delete + put at a new sort key); a batch cannot make that one unit.
+ *
+ * **Direction matters.** `softDelete` changes only the delete path — a `put` of
+ * a soft-deletable entity is an ordinary single-item put and is allowed. Gating
+ * it on the put side would reject writes that have always been correct.
+ *
+ * Returns `undefined` when the entity is safe for `Batch.write` in `opType`.
+ */
+export const batchRejectReason = (entity: Entity, opType: "put" | "delete"): string | undefined => {
+  const features = entity._multiItemWriteFeatures.filter((f) =>
+    // `unique` and `retain` add items to BOTH directions (sentinel write /
+    // release, snapshot on create / on overwrite-and-delete). `softDelete` only
+    // ever changes a delete.
+    f === "softDelete" ? opType === "delete" : true,
+  )
+  if (features.length === 0) return undefined
+  return (
+    `[EDD-9049] Batch.write cannot ${opType} an entity configured with ${describeFeatures(features)} — ` +
+    "BatchWriteItem has no ConditionExpression (which is the whole of a uniqueness " +
+    "sentinel's correctness), no UpdateRequest, and no atomicity across its 25-item " +
+    "chunks. Use Transaction.transactWrite, or the entity's own operation."
+  )
+}
+
 /**
  * Reject an op whose semantics the `TransactWriteItems` / `BatchWriteItem`
  * compile path cannot faithfully reproduce.
@@ -50,22 +98,26 @@ export const generateTimestampPrimitive = (
  * different DynamoDB verb, extra items, or a service the compile step does not
  * have. Loud beats silent (#100).
  *
- * **What this gate covers, and why not more.** It rejects the cases that are
- * either newly reachable and silently wrong (`upsert` — see `PutKind`) or that
- * cannot be working for anyone today: a `refs` entity writes an item whose ref
- * attribute is absent, so every later read fails to decode; a `generatedId`
- * entity dies outright (no `Crypto` in scope); a vector-indexed entity writes an
- * item with no embedding, so it silently drops out of the index.
+ * **What this gate covers.** Cases that are silently wrong (`upsert` — see
+ * `PutKind`) or that cannot be working for anyone today: a `refs` entity writes
+ * an item whose ref attribute is absent, so every later read fails to decode; a
+ * `generatedId` entity dies outright (no `Crypto` in scope); a vector-indexed
+ * entity writes an item with no embedding, so it silently drops out of the index.
  *
- * It deliberately does NOT reject the multi-item lifecycle features — `unique`,
- * `versioned: { retain }`, `softDelete`. Those share one root cause with each
- * other (this path emits exactly one item, so it cannot write a sentinel, a
- * version snapshot, or a tombstone), they are long-shipped, and this repo's own
- * connected suite exercises them through `transactWrite`. Fixing them means
- * emitting EXTRA transact items, which collides with EventStore's position-based
- * cancellation mapping — the caller-visible `additionalItems` indices must not
- * shift. That is a deliberate design change with its own semver decision, not a
- * drive-by.
+ * **The multi-item lifecycle features split by direction (#113).** `unique`,
+ * `versioned: { retain }` and `softDelete` all need MORE than one item per write.
+ * The line between "expand" and "reject" is whether the extra items are
+ * derivable from the caller's payload or only from stored state:
+ *
+ * - **put** — the sentinel and the v1 snapshot come from the payload being
+ *   written. `transactWrite` expands into them (`Entity._buildPutSideItems`).
+ * - **delete** — the sentinel to release is keyed by the *stored* item's unique
+ *   values, a retain snapshot copies the *stored* row, and a soft-delete
+ *   tombstone IS the stored row relocated to a new sort key. All three need a
+ *   read this path does not do (and a read would introduce a TOCTOU window that
+ *   only another ConditionCheck could close). Rejected with **EDD-9048**.
+ *
+ * `Batch.write` rejects BOTH directions (**EDD-9049**) — see `batchRejectReason`.
  *
  * `capability` names what the caller would have to give up, so the message can
  * say why rather than just "unsupported".
@@ -95,9 +147,22 @@ export const rejectUnsupportedOp = (
     )
   }
 
+  // --- multi-item lifecycle, delete direction (EDD-9048) -------------------
+  // The put direction is EXPANDED instead — see the doc comment.
+  if (opType === "delete" && entity._multiItemWriteFeatures.length > 0) {
+    return Effect.fail(
+      fail(
+        `[EDD-9048] deleting an entity configured with ${describeFeatures(entity._multiItemWriteFeatures)}`,
+        "the extra items a delete must write are derived from the STORED item — the sentinel " +
+          "to release is keyed by its unique values, a retain snapshot copies it, and a " +
+          "soft-delete tombstone is that row relocated to a new sort key. This path never " +
+          "reads, so it cannot build them. Run the delete as its own operation " +
+          "(db.entities.X.delete(...)), which reads the item first.",
+      ),
+    )
+  }
+
   // --- entity-configuration level -----------------------------------------
-  // Only the cases that cannot be working for anyone today — see the doc comment
-  // for why `unique` / `versioned.retain` / `softDelete` are deliberately absent.
   if (opType === "put" && entity._resolvedRefs.length > 0) {
     return Effect.fail(
       fail(
@@ -161,13 +226,23 @@ export const composePrimaryKey = (
  * `Schema.encode(inputSchema)`, then assembles the DynamoDB item with system
  * fields and composite keys. Substituted self-date schemas + RedactedFromValue
  * are handled in the encode pass — no per-field serialization needed.
+ *
+ * Returns the unmarshalled `item` alongside the marshalled one, plus the `now`
+ * the timestamps were generated from. `Entity._buildPutSideItems` needs both to
+ * derive uniqueness sentinels and the v1 version snapshot from the same values
+ * that were written (#113), and re-deriving `now` there would risk a skew
+ * between an item's `createdAt` and its snapshot's TTL.
  */
 export const validateAndBuildPutItem = (
   entity: Entity,
   input: Record<string, unknown>,
   operation: string,
 ): Effect.Effect<
-  Record<string, import("@aws-sdk/client-dynamodb").AttributeValue>,
+  {
+    readonly item: Record<string, unknown>
+    readonly marshalled: Record<string, import("@aws-sdk/client-dynamodb").AttributeValue>
+    readonly now: DateTime.Utc
+  },
   ValidationError
 > =>
   Effect.gen(function* () {
@@ -233,5 +308,5 @@ export const validateAndBuildPutItem = (
       })
     }
 
-    return toAttributeMap(item)
+    return { item, marshalled: toAttributeMap(item), now }
   })

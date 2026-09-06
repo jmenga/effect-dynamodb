@@ -200,6 +200,8 @@ Note that batch writes are **not transactional** — DynamoDB applies each item 
 `BatchWriteItem` has no `ConditionExpression`. `Batch.write` therefore **rejects** any operation that carries a condition — `.condition(...)`, `create()` (implicit `attribute_not_exists`) and `deleteIfExists()` (implicit `attribute_exists`) — with a `ValidationError`, rather than quietly writing unconditionally. Route conditional writes through `Transaction.transactWrite`, which compiles the condition into the transact item.
 
 `BatchWriteItem` has no `UpdateRequest` either, so `update()`, `patch()` and `upsert()` are rejected too. `upsert` is the one worth calling out: it is an `UpdateItem` whose `SET` clause uses `if_not_exists` for `createdAt`, immutable fields and the version counter, so writing it as a `PutRequest` would silently reset all three. Run an upsert as its own operation.
+
+The same reasoning rules out the lifecycle configs (**EDD-9049**): entities with `unique` or `versioned: { retain: true }` cannot be written here at all, and `softDelete` entities cannot be *deleted* here. Each needs more than one item per write — a sentinel, a snapshot, a tombstone — and a batch can neither guard them with a condition nor keep them together across its 25-item chunks. Use `Transaction.transactWrite`, which writes the sentinel and snapshot atomically alongside the row, or the entity's own operation. (A **put** of a `softDelete` entity is fine — `softDelete` only affects deletes.)
 :::
 
 ---
