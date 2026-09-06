@@ -295,6 +295,29 @@ describe("BoundQuery", () => {
       })
     })
 
+    it("passes the targeted SK composite name to composeSkCondition", () => {
+      // Issue #101 — composeSkCondition needs the composite the caller targeted
+      // so it can place the operand in the right position of the composed key.
+      const seen: Array<string | undefined> = []
+      const config: BoundQueryConfig<TestModel> = {
+        ...makeConfigWithSk(),
+        skFields: ["status", "sk"],
+        composeSkCondition: (cond, field) => {
+          seen.push(field)
+          return cond
+        },
+      }
+      const bq = new BoundQueryImpl<TestModel, { status: string; sk: string }, TestModel>(
+        makeTestQuery(),
+        config,
+      )
+      bq.where((t, ops) => ops.gte(t.status, "a"))
+      bq.where((t, ops) => ops.beginsWith(t.sk, "b"))
+      // No accessor property read — the field is unknown.
+      bq.where((_t, ops) => ops.eq(undefined as never, "c"))
+      expect(seen).toEqual(["status", "sk", undefined])
+    })
+
     it("supports eq condition", () => {
       const bq = makeBoundQuery().where((t, ops) => ops.eq(t.sk, "exact"))
       expect(bq._query._state.skConditions[0]!.condition).toEqual({ eq: "exact" })

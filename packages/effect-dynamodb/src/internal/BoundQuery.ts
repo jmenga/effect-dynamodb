@@ -34,14 +34,57 @@ export interface SkConditionOps<SK = Record<string, unknown>> {
   readonly beginsWith: (field: SK[keyof SK], prefix: string) => Query.SortKeyCondition
 }
 
-const skConditionOps: SkConditionOps<any> = {
-  eq: (_field, value) => ({ eq: value }),
-  lt: (_field, value) => ({ lt: value }),
-  lte: (_field, value) => ({ lte: value }),
-  gt: (_field, value) => ({ gt: value }),
-  gte: (_field, value) => ({ gte: value }),
-  between: (_field, low, high) => ({ between: [low, high] }),
-  beginsWith: (_field, prefix) => ({ beginsWith: prefix }),
+/**
+ * Build the runtime `SkConditionOps` for one `.where()` invocation.
+ *
+ * The ops record which SK composite the caller targeted (`t.status` → the
+ * string `"status"`, courtesy of `buildSkAccessor`). `composeSkCondition`
+ * needs that name so it can compose the operand into the *same* position of
+ * the stored sort key — otherwise the raw operand is compared against a fully
+ * composed key and the condition silently matches everything or nothing.
+ *
+ * The callback is invoked synchronously and exactly once, so a closed-over
+ * mutable slot is safe here.
+ */
+const makeSkConditionOps = (): {
+  readonly ops: SkConditionOps<any>
+  readonly targetField: () => string | undefined
+} => {
+  let target: string | undefined
+  const capture = (field: unknown): void => {
+    if (typeof field === "string") target = field
+  }
+  const ops: SkConditionOps<any> = {
+    eq: (field, value) => {
+      capture(field)
+      return { eq: value }
+    },
+    lt: (field, value) => {
+      capture(field)
+      return { lt: value }
+    },
+    lte: (field, value) => {
+      capture(field)
+      return { lte: value }
+    },
+    gt: (field, value) => {
+      capture(field)
+      return { gt: value }
+    },
+    gte: (field, value) => {
+      capture(field)
+      return { gte: value }
+    },
+    between: (field, low, high) => {
+      capture(field)
+      return { between: [low, high] }
+    },
+    beginsWith: (field, prefix) => {
+      capture(field)
+      return { beginsWith: prefix }
+    },
+  }
+  return { ops, targetField: () => target }
 }
 
 /** Build the runtime sk accessor object — each property returns its field name. */
@@ -140,8 +183,18 @@ export interface BoundQueryConfig<Model> {
   /** SK composite field names for building the SkAccessor in `.where()`. */
   readonly skFields?: ReadonlyArray<string> | undefined
   readonly provide: <X, E>(eff: Effect.Effect<X, E, any>) => Effect.Effect<X, E, never>
-  /** Optional: transform SK condition (e.g., compose prefix for partial composites) */
-  readonly composeSkCondition?: (condition: Query.SortKeyCondition) => Query.SortKeyCondition
+  /**
+   * Optional: transform the raw SK condition produced by `.where()` into one
+   * whose operands are composed the same way stored sort keys are.
+   *
+   * `field` is the SK composite name the caller targeted (`t.status` →
+   * `"status"`), or `undefined` when the callback did not go through the sk
+   * accessor.
+   */
+  readonly composeSkCondition?: (
+    condition: Query.SortKeyCondition,
+    field: string | undefined,
+  ) => Query.SortKeyCondition
 }
 
 // ---------------------------------------------------------------------------
@@ -162,9 +215,10 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
     const skAccessor = (
       this._config.skFields ? buildSkAccessor(this._config.skFields) : {}
     ) as SkRemaining
-    const condition = fn(skAccessor, skConditionOps as SkConditionOps<SkRemaining>)
+    const { ops, targetField } = makeSkConditionOps()
+    const condition = fn(skAccessor, ops as SkConditionOps<SkRemaining>)
     const finalCondition = this._config.composeSkCondition
-      ? this._config.composeSkCondition(condition)
+      ? this._config.composeSkCondition(condition, targetField())
       : condition
     return new BoundQueryImpl<Model, never, A>(
       Query.where(this._query, finalCondition),

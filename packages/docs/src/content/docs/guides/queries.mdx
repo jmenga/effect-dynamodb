@@ -92,18 +92,39 @@ Behavior is symmetric with GSI accessors: `.where()`, `.filter()`, `.select()`, 
 
 `.where()` adds a `KeyConditionExpression` against a remaining sort key composite — DynamoDB evaluates it on the index server-side, so it **does** reduce read capacity. Use it whenever the condition is on a sort-key composite the accessor hasn't already pinned. Operators: `eq`, `lt`, `lte`, `gt`, `gte`, `between`, `beginsWith`.
 
-```typescript
-// Index: byProject — pk: ["projectId"], sk: ["status", "createdAt"]
-// `.byProject({ projectId })` pins the PK; `status` + `createdAt` remain on the SK.
+The operand you pass is a **composite attribute value**, not a raw sort key. The library composes it into the same `$schema#v1#entity#<name>_<value>` shape the write path stores, applying the schema's casing, so `gte(t.createdAt, "2025-02-10")` compares like-for-like against the stored key.
 
-const recentDone = yield* db.entities.TaskEntity
-  .byProject({ projectId: "proj-alpha" })
-  .where((t, { eq }) => eq(t.status, "done"))
-  .where((t, { gt }) => gt(t.createdAt, "2026-01-01"))
+```typescript region="sk-conditions" example="guide-queries.ts"
+// byProject SK composites: ["status", "createdAt"].
+// `.where()` constrains the first composite the accessor did not pin.
+const activeTasks = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+  .where((t, { eq }) => eq(t.status, "active"))
+  .collect()
+
+// Pin `status` on the accessor, then range over `createdAt`.
+const activeSinceFeb = yield* db.entities.TaskEntity.byProject({
+  projectId: "proj-alpha",
+  status: "active",
+})
+  .where((t, { gte }) => gte(t.createdAt, "2025-02-10"))
+  .collect()
+
+// `between` is inclusive at both ends.
+const activeInFeb = yield* db.entities.TaskEntity.byProject({
+  projectId: "proj-alpha",
+  status: "active",
+})
+  .where((t, { between }) => between(t.createdAt, "2025-02-01", "2025-02-28"))
   .collect()
 ```
 
-`.where()` is **only available on a `BoundQuery` whose remaining SK composites are non-empty.** Once you have already supplied every SK composite to the accessor (or after a previous `.where()` consumes them), the method is no longer present on the type — calling it is a compile error. This makes it impossible to issue a sort-key condition that DynamoDB would reject at runtime.
+`.where()` consumes the remaining SK composites — it can be called **once** per query. Constrain a later composite by pinning the earlier ones on the accessor itself, as `activeSinceFeb` does above. Targeting a composite while an earlier one is still unpinned is rejected with `EDD-9004`, and calling `.where()` on an index whose sort key has no composites is rejected with `EDD-9045`.
+
+A condition on a **non-terminal** composite (`status`, with `createdAt` still to follow) covers that value's whole subtree: `eq(t.status, "active")` matches every `active` task regardless of `createdAt`, and `lte`/`between` include the far edge of the subtree.
+
+:::caution[One case DynamoDB cannot express]
+A strict `lt` on the **last** SK composite when the accessor has pinned an earlier one — `byProject({ projectId, status: "active" }).where((t, { lt }) => lt(t.createdAt, "2025-03-01"))` — needs `begins_with(prefix) AND sk < value`. DynamoDB allows only one sort key condition, `BETWEEN` is inclusive at both ends, and a `FilterExpression` may not reference a key attribute. Rather than silently returning the boundary item, this throws `EDD-9046`; use `between` or `lte` instead.
+:::
 
 ## Post-Query Filtering
 

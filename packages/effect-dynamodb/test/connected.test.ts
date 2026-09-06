@@ -7824,3 +7824,346 @@ describeConnected("Aggregate — base-table assembly (#93)", () => {
     }).pipe(provideBt),
   )
 })
+
+// ---------------------------------------------------------------------------
+// #101 — sort key conditions on named-index and primary-key accessors
+//
+// A stored SK is `$schema#v1#entity#<name>_<cased value>`. Before the fix
+// `.where()` compared the raw operand against that composed key, so `gte`
+// matched the whole partition while `begins_with` / `between` matched nothing.
+// Every operator is verified against real DynamoDB on BOTH a named GSI and the
+// primary-key accessor, plus the multi-composite SK shape.
+// ---------------------------------------------------------------------------
+
+const skCondSchema = DynamoSchema.make({ name: "skcond", version: 1 })
+const skCondTableName = `skcond-test-${Date.now()}`
+
+class BallRecord extends Schema.Class<BallRecord>("BallRecord")({
+  matchId: Schema.String,
+  ballKey: Schema.String,
+}) {}
+
+const SkCondBalls = Entity.make({
+  model: BallRecord,
+  entityType: "Ball",
+  primaryKey: {
+    pk: { field: "pk", composite: ["matchId"] },
+    sk: { field: "sk", composite: ["ballKey"] },
+  },
+  indexes: {
+    byMatch: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["matchId"] },
+      sk: { field: "gsi1sk", composite: ["ballKey"] },
+    },
+  },
+})
+
+// Two SK composites — exercises conditions on a non-terminal composite.
+class ReadingRecord extends Schema.Class<ReadingRecord>("ReadingRecord")({
+  deviceId: Schema.String,
+  status: Schema.String,
+  seq: Schema.String,
+}) {}
+
+const SkCondReadings = Entity.make({
+  model: ReadingRecord,
+  entityType: "Reading",
+  primaryKey: {
+    pk: { field: "pk", composite: ["deviceId"] },
+    sk: { field: "sk", composite: ["status", "seq"] },
+  },
+  indexes: {
+    byDevice: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["deviceId"] },
+      sk: { field: "gsi1sk", composite: ["status", "seq"] },
+    },
+  },
+})
+
+const SkCondTable = Table.make({
+  schema: skCondSchema,
+  entities: { SkCondBalls, SkCondReadings },
+})
+const SkCondLayer = Layer.mergeAll(ClientLayer, SkCondTable.layer({ name: skCondTableName }))
+const provideSkCond = Effect.provide(SkCondLayer)
+
+const BALL_KEYS = ["1-008-6-6", "1-009-1-1", "1-009-2-2", "1-010-1-1", "1-011-1-1"] as const
+
+describeConnected("sort key conditions via .where() (closes #101)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: skCondTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(SkCondTable),
+        })
+        const db = yield* DynamoClient.make({
+          entities: { SkCondBalls, SkCondReadings },
+          tables: { SkCondTable },
+        })
+        for (const ballKey of BALL_KEYS) {
+          yield* db.entities.SkCondBalls.put({ matchId: "m-1", ballKey })
+        }
+        for (const [status, seq] of [
+          ["active", "0001"],
+          ["active", "0002"],
+          ["done", "0001"],
+          ["done", "0002"],
+          ["error", "0001"],
+        ] as const) {
+          yield* db.entities.SkCondReadings.put({ deviceId: "d-1", status, seq })
+        }
+      }).pipe(provideSkCond, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: skCondTableName })
+      }).pipe(
+        provideSkCond,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  // ----- named GSI accessor -----
+
+  it.effect("named GSI: no condition returns the whole partition in sort order", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const all = yield* db.entities.SkCondBalls.byMatch({ matchId: "m-1" }).collect()
+      expect(all.map((b) => b.ballKey)).toEqual([...BALL_KEYS])
+    }).pipe(provideSkCond),
+  )
+
+  it.effect("named GSI: gte narrows to 4 (issue #101 expected)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const rows = yield* db.entities.SkCondBalls.byMatch({ matchId: "m-1" })
+        .where((t, { gte }) => gte(t.ballKey, "1-009"))
+        .collect()
+      expect(rows.map((b) => b.ballKey)).toEqual([
+        "1-009-1-1",
+        "1-009-2-2",
+        "1-010-1-1",
+        "1-011-1-1",
+      ])
+    }).pipe(provideSkCond),
+  )
+
+  it.effect("named GSI: beginsWith narrows to 2 (issue #101 expected)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const rows = yield* db.entities.SkCondBalls.byMatch({ matchId: "m-1" })
+        .where((t, { beginsWith }) => beginsWith(t.ballKey, "1-009"))
+        .collect()
+      expect(rows.map((b) => b.ballKey)).toEqual(["1-009-1-1", "1-009-2-2"])
+    }).pipe(provideSkCond),
+  )
+
+  it.effect("named GSI: between narrows to 3 (issue #101 expected)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const rows = yield* db.entities.SkCondBalls.byMatch({ matchId: "m-1" })
+        .where((t, { between }) => between(t.ballKey, "1-009", "1-011"))
+        .collect()
+      expect(rows.map((b) => b.ballKey)).toEqual(["1-009-1-1", "1-009-2-2", "1-010-1-1"])
+    }).pipe(provideSkCond),
+  )
+
+  it.effect("named GSI: eq / lt / lte / gt narrow correctly", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const q = db.entities.SkCondBalls.byMatch({ matchId: "m-1" })
+
+      const eq = yield* q.where((t, ops) => ops.eq(t.ballKey, "1-009-1-1")).collect()
+      expect(eq.map((b) => b.ballKey)).toEqual(["1-009-1-1"])
+
+      const lt = yield* q.where((t, ops) => ops.lt(t.ballKey, "1-010")).collect()
+      expect(lt.map((b) => b.ballKey)).toEqual(["1-008-6-6", "1-009-1-1", "1-009-2-2"])
+
+      const lte = yield* q.where((t, ops) => ops.lte(t.ballKey, "1-009-2-2")).collect()
+      expect(lte.map((b) => b.ballKey)).toEqual(["1-008-6-6", "1-009-1-1", "1-009-2-2"])
+
+      const gt = yield* q.where((t, ops) => ops.gt(t.ballKey, "1-009-2-2")).collect()
+      expect(gt.map((b) => b.ballKey)).toEqual(["1-010-1-1", "1-011-1-1"])
+    }).pipe(provideSkCond),
+  )
+
+  // ----- primary-key accessor -----
+
+  it.effect("primary: gte / beginsWith / between narrow correctly", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const q = db.entities.SkCondBalls.primary({ matchId: "m-1" })
+
+      const all = yield* q.collect()
+      expect(all.map((b) => b.ballKey)).toEqual([...BALL_KEYS])
+
+      const gte = yield* q.where((t, ops) => ops.gte(t.ballKey, "1-009")).collect()
+      expect(gte.map((b) => b.ballKey)).toEqual([
+        "1-009-1-1",
+        "1-009-2-2",
+        "1-010-1-1",
+        "1-011-1-1",
+      ])
+
+      const bw = yield* q.where((t, ops) => ops.beginsWith(t.ballKey, "1-009")).collect()
+      expect(bw.map((b) => b.ballKey)).toEqual(["1-009-1-1", "1-009-2-2"])
+
+      const btw = yield* q.where((t, ops) => ops.between(t.ballKey, "1-009", "1-011")).collect()
+      expect(btw.map((b) => b.ballKey)).toEqual(["1-009-1-1", "1-009-2-2", "1-010-1-1"])
+    }).pipe(provideSkCond),
+  )
+
+  it.effect("primary: eq / lt / lte / gt narrow correctly", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const q = db.entities.SkCondBalls.primary({ matchId: "m-1" })
+
+      const eq = yield* q.where((t, ops) => ops.eq(t.ballKey, "1-010-1-1")).collect()
+      expect(eq.map((b) => b.ballKey)).toEqual(["1-010-1-1"])
+
+      const lt = yield* q.where((t, ops) => ops.lt(t.ballKey, "1-010")).collect()
+      expect(lt.map((b) => b.ballKey)).toEqual(["1-008-6-6", "1-009-1-1", "1-009-2-2"])
+
+      const lte = yield* q.where((t, ops) => ops.lte(t.ballKey, "1-009-2-2")).collect()
+      expect(lte.map((b) => b.ballKey)).toEqual(["1-008-6-6", "1-009-1-1", "1-009-2-2"])
+
+      const gt = yield* q.where((t, ops) => ops.gt(t.ballKey, "1-009-2-2")).collect()
+      expect(gt.map((b) => b.ballKey)).toEqual(["1-010-1-1", "1-011-1-1"])
+    }).pipe(provideSkCond),
+  )
+
+  // ----- multi-composite sort key -----
+
+  it.effect("multi-composite: condition on the leading composite spans its subtree", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const q = db.entities.SkCondReadings.byDevice({ deviceId: "d-1" })
+      const key = (r: ReadingRecord) => `${r.status}/${r.seq}`
+
+      // eq on a non-terminal composite matches every row with that value.
+      const eq = yield* q.where((t, ops) => ops.eq(t.status, "done")).collect()
+      expect(eq.map(key)).toEqual(["done/0001", "done/0002"])
+
+      // gte includes the whole `done` subtree and everything after it.
+      const gte = yield* q.where((t, ops) => ops.gte(t.status, "done")).collect()
+      expect(gte.map(key)).toEqual(["done/0001", "done/0002", "error/0001"])
+
+      // lte is inclusive of the whole `done` subtree.
+      const lte = yield* q.where((t, ops) => ops.lte(t.status, "done")).collect()
+      expect(lte.map(key)).toEqual(["active/0001", "active/0002", "done/0001", "done/0002"])
+
+      // gt excludes the whole `done` subtree.
+      const gt = yield* q.where((t, ops) => ops.gt(t.status, "done")).collect()
+      expect(gt.map(key)).toEqual(["error/0001"])
+
+      // lt excludes the whole `done` subtree.
+      const lt = yield* q.where((t, ops) => ops.lt(t.status, "done")).collect()
+      expect(lt.map(key)).toEqual(["active/0001", "active/0002"])
+
+      // between is inclusive on both ends.
+      const btw = yield* q.where((t, ops) => ops.between(t.status, "active", "done")).collect()
+      expect(btw.map(key)).toEqual(["active/0001", "active/0002", "done/0001", "done/0002"])
+
+      // beginsWith on a non-terminal composite prefixes the value.
+      const bw = yield* q.where((t, ops) => ops.beginsWith(t.status, "a")).collect()
+      expect(bw.map(key)).toEqual(["active/0001", "active/0002"])
+    }).pipe(provideSkCond),
+  )
+
+  it.effect("multi-composite: condition on the trailing composite after pinning the first", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      const key = (r: ReadingRecord) => `${r.status}/${r.seq}`
+      const q = db.entities.SkCondReadings.byDevice({ deviceId: "d-1", status: "done" })
+
+      // Every one-sided operator must stay inside the pinned `status_done`
+      // prefix — `Query.where` replaces the accessor's own begins_with, so an
+      // unclamped bound would leak into `active` / `error` readings.
+      const gte = yield* q.where((t, ops) => ops.gte(t.seq, "0002")).collect()
+      expect(gte.map(key)).toEqual(["done/0002"])
+
+      const gt = yield* q.where((t, ops) => ops.gt(t.seq, "0001")).collect()
+      expect(gt.map(key)).toEqual(["done/0002"])
+
+      const lte = yield* q.where((t, ops) => ops.lte(t.seq, "0002")).collect()
+      expect(lte.map(key)).toEqual(["done/0001", "done/0002"])
+
+      const eq = yield* q.where((t, ops) => ops.eq(t.seq, "0001")).collect()
+      expect(eq.map(key)).toEqual(["done/0001"])
+
+      const btw = yield* q.where((t, ops) => ops.between(t.seq, "0001", "0002")).collect()
+      expect(btw.map(key)).toEqual(["done/0001", "done/0002"])
+
+      const bw = yield* q.where((t, ops) => ops.beginsWith(t.seq, "000")).collect()
+      expect(bw.map(key)).toEqual(["done/0001", "done/0002"])
+    }).pipe(provideSkCond),
+  )
+
+  it.effect("multi-composite: skipping a leading composite is rejected (EDD-9004)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { SkCondBalls, SkCondReadings },
+        tables: { SkCondTable },
+      })
+      expect(() =>
+        db.entities.SkCondReadings.byDevice({ deviceId: "d-1" }).where((t, ops) =>
+          ops.gte(t.seq, "0002"),
+        ),
+      ).toThrow(/EDD-9004/)
+    }).pipe(provideSkCond),
+  )
+
+  it.effect(
+    "multi-composite: strict lt on a pinned terminal composite is rejected (EDD-9046)",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { SkCondBalls, SkCondReadings },
+          tables: { SkCondTable },
+        })
+        expect(() =>
+          db.entities.SkCondReadings.byDevice({ deviceId: "d-1", status: "done" }).where((t, ops) =>
+            ops.lt(t.seq, "0002"),
+          ),
+        ).toThrow(/EDD-9046/)
+      }).pipe(provideSkCond),
+  )
+})

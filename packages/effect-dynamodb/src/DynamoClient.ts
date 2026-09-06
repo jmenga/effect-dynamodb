@@ -148,6 +148,22 @@ import * as Query from "./Query.js"
 import type { CreateTableOptions, Table, TableConfig } from "./Table.js"
 import { mergeVectorIndexes, definition as tableDefinition, toVectorIndexSpec } from "./Table.js"
 
+/**
+ * Delimiter separating composite segments inside a composed sort key
+ * (`$schema#v1#entity#a_1#b_2`). Mirrors `DynamoSchema`'s key format.
+ */
+const SK_DELIMITER = "#"
+
+/**
+ * Upper-bound sentinel used when a `.where()` condition targets a sort key
+ * composite that is NOT the last one. The composed operand is then only a
+ * prefix of the stored key, so an inclusive upper bound has to be pushed past
+ * every key in that composite value's subtree. `￿` is the highest
+ * code point representable in a 3-byte UTF-8 sequence, which sorts above every
+ * character DynamoDB key composition emits for the following segment.
+ */
+const SK_MAX_SENTINEL = "￿"
+
 /** Union of all DynamoDB client error types */
 export type DynamoClientError =
   | DynamoError
@@ -979,24 +995,138 @@ const makeFromConfig = (config: {
         const pathBuilder = createPathBuilder()
         const conditionOps = createConditionOps()
 
-        // composeSkCondition: prepend the entity SK prefix to user's .where() condition
-        const composeSkCondition = (condition: Query.SortKeyCondition): Query.SortKeyCondition => {
-          const skPrefix = KeyComposer.composeSortKeyPrefix(
-            entityLike._schema,
-            entityLike.entityType,
-            1,
-            indexDef,
-            composites,
-          )
-          const prepend = (value: string) => `${skPrefix}#${value}`
-          if ("eq" in condition) return { eq: prepend(condition.eq) }
-          if ("lt" in condition) return { lt: prepend(condition.lt) }
-          if ("lte" in condition) return { lte: prepend(condition.lte) }
-          if ("gt" in condition) return { gt: prepend(condition.gt) }
-          if ("gte" in condition) return { gte: prepend(condition.gte) }
-          if ("between" in condition)
-            return { between: [prepend(condition.between[0]), prepend(condition.between[1])] }
-          if ("beginsWith" in condition) return { beginsWith: prepend(condition.beginsWith) }
+        // composeSkCondition — compose the user's `.where()` operand into a full
+        // sort key value the same way `put` composes the stored one.
+        //
+        // A stored SK is `$schema#v1#entity#<name>_<cased value>#...`; comparing
+        // a raw operand against that is meaningless (issue #101 — `gte` matched
+        // the whole partition because `"1-009" < "ballkey_…"`, while
+        // `begins_with` / `between` matched nothing). So the operand is placed
+        // in the *position* of the SK composite it targets and run through the
+        // same composer, which applies `serializeValue`, the `<name>_` prefix
+        // and the schema casing.
+        const skComposites = indexDef.sk.composite
+        const composeSkCondition = (
+          condition: Query.SortKeyCondition,
+          field: string | undefined,
+        ): Query.SortKeyCondition => {
+          if (skComposites.length === 0) {
+            throw new Error(
+              `[EDD-9045] Index "${_indexName}" has no sort key composites, so there is ` +
+                `nothing for .where() to constrain. Remove the .where() call, or add sort ` +
+                `key composites to the index definition.`,
+            )
+          }
+
+          // Resolve the targeted composite. `.where((t) => ...)` hands back the
+          // composite name via the sk accessor; fall back to the first composite
+          // the accessor call did not already pin.
+          const firstUnpinned = (() => {
+            const i = skComposites.findIndex((attr: string) => composites[attr] === undefined)
+            return i === -1 ? skComposites.length - 1 : i
+          })()
+          const targetIndex =
+            field !== undefined && skComposites.includes(field)
+              ? skComposites.indexOf(field)
+              : firstUnpinned
+          const targetAttr = skComposites[targetIndex]!
+
+          // Every composite to the left of the target must already be pinned by
+          // the accessor — otherwise the composed operand would have a hole and
+          // silently compare against the wrong prefix.
+          const missing = skComposites
+            .slice(0, targetIndex)
+            .filter((attr: string) => composites[attr] === undefined)
+          if (missing.length > 0) {
+            throw new Error(
+              `[EDD-9004] Sort key condition on "${targetAttr}" for index "${_indexName}" ` +
+                `requires prior composites: ${missing.join(", ")}. Sort key composites must ` +
+                `follow prefix ordering — supply them to the accessor before calling .where().`,
+            )
+          }
+
+          // Compose a sort key value with the leading pinned composites followed
+          // by `<targetAttr>_<value>`. Trailing composites are excluded — the
+          // condition bounds the key at the target's position.
+          const pinnedRecord: Record<string, unknown> = {}
+          for (let i = 0; i < targetIndex; i++) {
+            pinnedRecord[skComposites[i]!] = composites[skComposites[i]!]
+          }
+          const composeAt = (record: Record<string, unknown>): string =>
+            KeyComposer.composeSortKeyPrefix(
+              entityLike._schema,
+              entityLike.entityType,
+              1,
+              indexDef,
+              record,
+            )
+          const compose = (value: string): string =>
+            composeAt({ ...pinnedRecord, [targetAttr]: value })
+
+          const isLastComposite = targetIndex === skComposites.length - 1
+          // Everything after the target's value in a stored key starts with the
+          // delimiter, so `<composed>#` opens the value's subtree and
+          // `<composed>#￿` closes it.
+          const subtree = (value: string): string => `${compose(value)}${SK_DELIMITER}`
+          const subtreeMax = (value: string): string => `${subtree(value)}${SK_MAX_SENTINEL}`
+          /** Inclusive upper bound covering the whole subtree of `value`. */
+          const upper = (value: string): string =>
+            isLastComposite ? compose(value) : subtreeMax(value)
+
+          // `beginsWith` / `between` / `eq` already carry the pinned composites
+          // in BOTH operands, so they never escape the pinned prefix.
+          if ("beginsWith" in condition) return { beginsWith: compose(condition.beginsWith) }
+          if ("eq" in condition) {
+            return isLastComposite
+              ? { eq: compose(condition.eq) }
+              : { beginsWith: subtree(condition.eq) }
+          }
+          if ("between" in condition) {
+            return { between: [compose(condition.between[0]), upper(condition.between[1])] }
+          }
+
+          // One-sided operators are open on the other side. With no pinned
+          // composites that is exactly right — the open end runs to the edge of
+          // the partition. But once the accessor has pinned leading composites,
+          // DynamoDB's single sort key condition must ALSO stay inside that
+          // prefix, so the open end is clamped and the condition becomes a
+          // BETWEEN. (`Query.where` replaces the accessor's own `begins_with`,
+          // so it cannot do the clamping.)
+          if (targetIndex === 0) {
+            if ("lt" in condition) return { lt: compose(condition.lt) }
+            if ("lte" in condition) return { lte: upper(condition.lte) }
+            // `>` is already exclusive of the composed value, so only a
+            // non-terminal target needs the subtree pushed past.
+            if ("gt" in condition) {
+              return { gt: isLastComposite ? compose(condition.gt) : subtreeMax(condition.gt) }
+            }
+            if ("gte" in condition) return { gte: compose(condition.gte) }
+            return condition
+          }
+
+          const pinnedPrefix = composeAt(pinnedRecord)
+          const pinnedMax = `${pinnedPrefix}${SK_DELIMITER}${SK_MAX_SENTINEL}`
+          if ("gte" in condition) return { between: [compose(condition.gte), pinnedMax] }
+          if ("gt" in condition) return { between: [subtreeMax(condition.gt), pinnedMax] }
+          if ("lte" in condition) return { between: [pinnedPrefix, upper(condition.lte)] }
+          if ("lt" in condition) {
+            // On a non-terminal composite no stored key can equal the composed
+            // bound (trailing composites always follow), so BETWEEN's inclusive
+            // high end is harmless. On the LAST composite the bound IS a
+            // storable key, and DynamoDB has neither a half-open BETWEEN nor a
+            // FilterExpression that may reference a key attribute — so there is
+            // no way to say `begins_with(prefix) AND sk < value` in one key
+            // condition. Refuse rather than silently return the boundary item.
+            if (!isLastComposite) return { between: [pinnedPrefix, compose(condition.lt)] }
+            throw new Error(
+              `[EDD-9046] A strict "lt" condition on sort key composite "${targetAttr}" for ` +
+                `index "${_indexName}" cannot be expressed once earlier composites ` +
+                `(${skComposites.slice(0, targetIndex).join(", ")}) are pinned by the accessor: ` +
+                `DynamoDB allows one sort key condition, BETWEEN is inclusive at both ends, and ` +
+                `a FilterExpression may not reference a key attribute. Use ` +
+                `.where((t, { between }) => between(t.${targetAttr}, low, high)) or "lte" instead.`,
+            )
+          }
           return condition
         }
 

@@ -200,6 +200,38 @@ const program = Effect.gen(function* () {
   yield* Console.log(`Assignee emp-alice: ${assigneeTasks.length} tasks\n`)
 
   // -------------------------------------------------------------------------
+  // Sort Key Conditions
+  // -------------------------------------------------------------------------
+  yield* Console.log("=== Sort Key Conditions ===\n")
+
+  // #region sk-conditions
+  // byProject SK composites: ["status", "createdAt"].
+  // `.where()` constrains the first composite the accessor did not pin.
+  const activeTasks = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+    .where((t, { eq }) => eq(t.status, "active"))
+    .collect()
+
+  // Pin `status` on the accessor, then range over `createdAt`.
+  const activeSinceFeb = yield* db.entities.TaskEntity.byProject({
+    projectId: "proj-alpha",
+    status: "active",
+  })
+    .where((t, { gte }) => gte(t.createdAt, "2025-02-10"))
+    .collect()
+
+  // `between` is inclusive at both ends.
+  const activeInFeb = yield* db.entities.TaskEntity.byProject({
+    projectId: "proj-alpha",
+    status: "active",
+  })
+    .where((t, { between }) => between(t.createdAt, "2025-02-01", "2025-02-28"))
+    .collect()
+  // #endregion
+  yield* Console.log(`Active tasks: ${activeTasks.length}`)
+  yield* Console.log(`Active since 2025-02-10: ${activeSinceFeb.length}`)
+  yield* Console.log(`Active in Feb: ${activeInFeb.length}\n`)
+
+  // -------------------------------------------------------------------------
   // Post-Query Filtering
   // -------------------------------------------------------------------------
   yield* Console.log("=== Post-Query Filtering ===\n")
