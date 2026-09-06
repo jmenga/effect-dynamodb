@@ -16,6 +16,8 @@ Two related fixes for the same defect — a `many` edge whose sort key is not de
 - **"Element IS the ref" edges now compose a sort key.** `Schema.Array(Player)` hydrates each element to the entity's own flat fields, and the identifier fallback only recognised a field literally named `id`. An entity whose identifier is `playerId` produced *no* composites, so every element collapsed onto one row. The edge entity's declared `DynamoModel.identifier` field is now used.
 - **Colliding sort keys fail as `AggregateDecompositionError`.** Decomposition detects two items composing the same sort key and fails with the aggregate, the edge and the colliding key — instead of an opaque `DynamoValidationError` naming nothing. This is checked before any write, so nothing is persisted.
 
+A declared composite must resolve to a **scalar** — string, number, bigint, boolean or date. Naming the hydrated ref object itself (`sk: { composite: ["umpire"] }`) rather than a scalar path (`"umpire.id"`) previously serialised the whole object into the sort key; it now fails with `AggregateDecompositionError` pointing at the dotted form.
+
 **Migration.** Sort keys change for two shapes, both of which could not previously hold more than one element:
 
 - edges that already declared `sk.composite` (previously ignored)
