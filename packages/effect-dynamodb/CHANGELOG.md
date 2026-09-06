@@ -1,5 +1,208 @@
 # effect-dynamodb
 
+## 1.16.0
+
+### Minor Changes
+
+- [#112](https://github.com/jmenga/effect-dynamodb/pull/112) [`e1ecfb4`](https://github.com/jmenga/effect-dynamodb/commit/e1ecfb4def8c7d04faa62cf3fc9d3f66002dd7ff) Thanks [@jmenga](https://github.com/jmenga)! - Aggregates round-trip fields with a schema transformation
+
+  An aggregate whose model carried a transformed field could not round-trip: the write path stored Type-side values, so a `bigint` landed as `{"N":"5"}` and assembly's `Schema.BigIntFromString` decode rejected a number. Aggregate attributes are now encoded to their wire form before marshalling, at the root, sub-aggregate roots, `one` edges, `many` elements and propagated context values.
+
+  Two further causes are fixed with it:
+  - **`fieldsOf` did not see through `DynamoModel.configure`**, so any edge whose model is configured — which is most, since `identifier: true` requires it — received **no encoders at all**. Dates on those edges were stored as `{"M":{…}}` or `{"M":{}}`, meaning the date handling added in [#72](https://github.com/jmenga/effect-dynamodb/issues/72) was silently not applying to them.
+  - **`aggregate.update` recognised only date transforms** when re-decoding mutated state, so a non-date transform was rejected before any item was built — even when the mutation touched only an untransformed field. The tolerance now covers every leaf transform, and remains scoped to the aggregate decode path: entities pass no such option.
+
+  Only `BigIntFromString` and `NumberFromString` attributes change on the wire, and both were unreadable before, so **no migration is required**. Composed keys are byte-identical.
+
+- [#112](https://github.com/jmenga/effect-dynamodb/pull/112) [`1e20c24`](https://github.com/jmenga/effect-dynamodb/commit/1e20c240ab44533495451c65b279f185b2c04e7a) Thanks [@jmenga](https://github.com/jmenga)! - Accept bound-client CRUD builders in `Batch.write`, `Transaction.transactWrite` and `EventStore.append({ additionalItems })`, and stop silently reinterpreting ops ([#100](https://github.com/jmenga/effect-dynamodb/issues/100))
+
+  `db.entities.X.put(...)` returns a `BoundPut`, which the shared transactable-extraction protocol did
+  not recognise — every multi-item write path rejected it with `ValidationError { entityType: "unknown" }`.
+  This blocked entities authored with the pure, AWS-free `@effect-dynamodb/schema` `Entity.make`
+  entirely: a pure definition carries no CRUD ops, so the bound builder is the only write descriptor
+  its author can hold, which made "commit a read model atomically with the events that produced it"
+  impossible. `extractTransactable` now unwraps bound builders to the intermediate they wrap.
+
+  **Conditions on transact items are no longer silently dropped.** `.condition(...)`,
+  `Entity.condition(...)`, and the implicit guards carried by `create()` (`attribute_not_exists`) and
+  `deleteIfExists()` (`attribute_exists`) are compiled onto the `Put` / `Delete`. Previously
+  `Transaction.transactWrite([Users.create(x)])` degraded to a blind overwrite.
+  `ExpressionAttributeValues` is omitted when a condition carries no values, which also fixes
+  `Transaction.check` with a value-free condition.
+
+  **Ops the compile path cannot reproduce faithfully are rejected rather than reinterpreted.**
+  `upsert` is an `UpdateItem` using `if_not_exists` for `createdAt`, immutable fields and the version
+  counter — compiling it as a `Put` reset all three, including silently resetting the optimistic-lock
+  counter. It now fails with a `ValidationError` on all three paths, as do entities configured with
+  `refs`, `generatedId` or `vectorIndexes`, whose write contracts need a read, `Crypto` or an
+  `Embedder`. `Batch.write` additionally rejects any conditioned op (`BatchWriteItem` has no
+  `ConditionExpression`) and now reports unsupported ops on the error channel instead of as an
+  untyped defect.
+
+  Known gap, unchanged and now documented: entities with `unique`, `versioned: { retain: true }` or
+  `softDelete` still write a single item through these paths, so their sentinel, snapshot or tombstone
+  is not written. Prefer the entity's own operation for those. Tracked in [#113](https://github.com/jmenga/effect-dynamodb/issues/113).
+
+  `@effect-dynamodb/schema` is unchanged and remains free of any AWS SDK dependency.
+
+- [#112](https://github.com/jmenga/effect-dynamodb/pull/112) [`1e20c24`](https://github.com/jmenga/effect-dynamodb/commit/1e20c240ab44533495451c65b279f185b2c04e7a) Thanks [@jmenga](https://github.com/jmenga)! - `.condition(...)` now declares `ConditionalCheckFailed` on the error channel ([#102](https://github.com/jmenga/effect-dynamodb/issues/102)).
+
+  A conditional write raised `ConditionalCheckFailed` at runtime but did not declare it, so
+  `Effect.catchTag("ConditionalCheckFailed", ...)` — the whole reason to write a conditional put —
+  was a type error. Callers had to `catchAll` and re-inspect `_tag`, losing exactly the
+  exhaustiveness that makes `catchTags` worth using.
+
+  Applying `.condition(...)` now widens the operation's error channel with `ConditionalCheckFailed`,
+  on every surface it is exposed:
+  - `BoundPut.condition()` — `db.entities.Users.put(input).condition(...)`
+  - `BoundUpdate.condition()` — `db.entities.Users.update(key).set(...).condition(...)`
+  - `BoundDelete.condition()` — `db.entities.Users.delete(key).condition(...)`
+  - the entity-scoped pipeable — `Users.put(input).pipe(Users.condition(...))`, on unbound
+    `EntityPut` / `EntityUpdate` / `EntityDelete`
+
+  The widening is precise: an _unconditional_ `put` / `update` / `delete` keeps its narrow channel,
+  and operations that already declare the error (`create`, `patch`, `upsert`, `deleteIfExists`) are
+  unchanged — the union collapses. `.asEffect()` and every combinator chained after `.condition()`
+  carry the widened channel. An update piped through the combinator stays an `EntityUpdate`; its
+  update-payload parameter is not flattened.
+
+  `.expectedVersion(...)` deliberately does **not** widen, and never did: `OptimisticLockError` is
+  unconditional on `update` because the `versioned` and unique-constraint write paths CAS whether or
+  not an expected version was supplied. The two combinators are now consistent in principle — each
+  operation declares exactly the failures reachable on it.
+
+  Also fixed on the unique-constraint transaction path: an update on an **unversioned** entity that
+  touched a unique field and was rejected by a user `.condition(...)` reported `OptimisticLockError`
+  — naming a version conflict that cannot occur on an entity with no version attribute. It now
+  reports `ConditionalCheckFailed`. When a version CAS _is_ present, both predicates ride the same
+  `ConditionExpression` and DynamoDB does not say which half failed, so the rejection is still
+  attributed to the CAS as `OptimisticLockError`.
+
+  **Semver note.** Released as a minor, not a major. Widening an error channel is technically
+  breaking for code that matches the union exhaustively (`Effect.catchTags` over every tag, or a
+  hand-written exhaustive `switch` on `_tag`), and the unversioned-unique fix changes which tag such
+  code sees. Both are narrow, and neither breaks the common `catchTag` / `catchAll` shapes; staying
+  within 1.x is the deliberate call.
+
+  **`.condition()` on `delete` now reaches DynamoDB on every path.** The compiled condition was
+  attached only in the simple `DeleteItem` branch. On entities configured with `softDelete` or a
+  `unique` constraint — both of which delete via `transactWriteItems` — the guard was built and then
+  dropped, and the delete proceeded unconditionally. The condition now rides the current item's own
+  `Delete` in both transactions, so a rejection rolls the whole transaction back: no tombstone is
+  written, no unique sentinel is released. `deleteIfExists` rode the same drop (it is `delete` plus
+  `attribute_exists(pk)`) and is fixed with it, closing a read-then-write window in which a
+  concurrently-deleted item could be resurrected as a tombstone.
+
+  **`purge()` now rejects `.condition()` instead of ignoring it** — `ValidationError`, `EDD-9047`.
+  `purge` deletes a whole partition across batched writes, so no single `ConditionExpression` can
+  guard it atomically. Guard the individual write with `delete(key).condition(...)`.
+
+  Without these, the error-channel widening above would declare a `ConditionalCheckFailed` that those
+  entity shapes could never raise.
+
+- [#112](https://github.com/jmenga/effect-dynamodb/pull/112) [`e1ecfb4`](https://github.com/jmenga/effect-dynamodb/commit/e1ecfb4def8c7d04faa62cf3fc9d3f66002dd7ff) Thanks [@jmenga](https://github.com/jmenga)! - Composite keys are composed by one rule everywhere — **storage-format change, migration required for two shapes** ([#101](https://github.com/jmenga/effect-dynamodb/issues/101), [#113](https://github.com/jmenga/effect-dynamodb/issues/113), [#114](https://github.com/jmenga/effect-dynamodb/issues/114), [#115](https://github.com/jmenga/effect-dynamodb/issues/115))
+
+  Key composition ran on the encoded value, so a composite whose domain type is a `number` or `bigint` but whose encoded form is a **string** — `Schema.BigIntFromString`, `Schema.NumberFromString` — was written to the key as text, skipping the zero-padding that makes numbers sort correctly. Values 5 / 42 / 100 stored as `seq_5` / `seq_42` / `seq_100` and sorted `100 < 42 < 5`, so `gte(42n)` returned 42 and 5 instead of 42 and 100.
+
+  Composition now follows one rule at every site: compose from the Encoded form, except when the domain type is numeric and the encoded form is a string, where the numeric Type form is used so it pads. `DynamoModel.DateEpochMs` composites use the padded epoch.
+
+  **⚠️ Migration.** Rows keyed on either shape below were written under the old key and will not be found after upgrading — no error, the partition simply does not resolve. Read them by scan and re-`put` before or during the upgrade.
+  - **Entity primary keys and GSI keys** with a `Schema.BigIntFromString` or `Schema.NumberFromString` composite. On 1.15.0 `put` **succeeded** and wrote these rows (only `get` was broken), so this data exists.
+  - **Aggregate partition and collection keys** with a `DateEpochMs` / `DateEpochSeconds` composite, which move from their ISO form to the padded epoch.
+
+  Composites of every other shape — plain numbers, bigints, strings, `Schema.Date`, `DateTimeUtc`, literals — are byte-identical and need no migration.
+
+  Eleven modules previously decided independently what to hand the key composer, which is what produced the divergence. `test/KeyFormInvariant.test.ts` now reads each module as source text and fails if a `KeyComposer` call receives a record that did not go through the shared form.
+
+  Fixed by the same change, each previously a silent wrong result:
+  - `update()` rewrote GSI keys in a different format than `put()` wrote them, evicting the row from its own GSI.
+  - `Transaction.transactWrite` / `Batch.write` composed a different primary key than `Entity.put`, producing unreadable orphan rows; `Batch.get`, `transactGet`, `transactWrite(delete)` and `Transaction.check` used the caller's raw key.
+  - `purge()` reported success and deleted nothing.
+  - `reembed()` skipped every live item — its guard compared a Type-side recompose against a stored key.
+  - `getVersion()`, `deleted.get()` and `restore()` raised `ItemNotFound` for rows that exist, while `versions()` and `deleted.list()` worked.
+  - `db.collections.*` and `Collections.make()` returned zero rows for values the equivalent entity accessor found.
+  - Vector search composed a different partition than the write path.
+  - Aggregate `list()` could not find rows `create` had written.
+
+  Key input on `get` / `update` / `delete` and friends now takes the model's **Type** side — the same value the domain model holds and the query path accepts. Passing the wire form fails with a `ValidationError` naming the attribute rather than returning an empty result.
+
+- [#112](https://github.com/jmenga/effect-dynamodb/pull/112) [`0d67a51`](https://github.com/jmenga/effect-dynamodb/commit/0d67a51b1b27907c746c6fe808f929716d12f504) Thanks [@jmenga](https://github.com/jmenga)! - Separate `limit` (results) from `pageSize` (round trips) on queries and scans
+
+  `limit` and page size were two different ideas sharing one word. They are now two combinators:
+  - **`limit(n)`** — return **at most `n` items**. A contract on results. It no longer sets DynamoDB's `Limit`; the query accumulates across as many requests as it takes to reach `n` accepted items or exhaust the key range.
+  - **`pageSize(n)`** — fetch in **batches of `n` rows**. This is what sets DynamoDB's `Limit` (rows _examined_ per request). A contract on round trips, not on what comes back.
+  - **`maxPages(n)`** — unchanged. Still the hard stop on the number of requests, and the escape hatch when a filter is selective enough that `limit` would otherwise walk a large partition.
+
+  Both compose: `.pageSize(50).limit(120)` fetches in requests of at most 50 examined rows, accumulating until 120 items.
+
+  **This is why they had to split.** DynamoDB's `Limit` bounds rows _examined_, and a `FilterExpression` is applied _after_ it — so `Limit` can never express "give me 3 matching items". Under a filter, `limit` is now satisfied by accumulating across requests; `pageSize` (or an unbounded natural page when unset) is what each request asks for. Every entity query and scan therefore gets correct filtered pagination.
+
+  **Cursors.** Once a request can over-read and discard the surplus, `fetch()`'s cursor can no longer be the raw `LastEvaluatedKey` — that points at the last row _examined_, not the last one returned. It is rebuilt from the last item actually handed back (every item carries the table key and the index key), so the next page resumes after what the caller saw. `cursor: null` still means genuinely exhausted. When a `.select()` projection is active alongside a `limit`, the key attributes are added to the request's `ProjectionExpression` and stripped from the items returned, so a truncated page still carries an accurate cursor.
+
+  **`count()`.** `limit(n)` caps the count: `.limit(n).count()` returns `min(matching, n)` and stops counting once `n` is reached, keeping `count()` equal to `collect().length` for the same query — and making `.limit(1).count()` a cheap existence check. `pageSize(n)` sizes each `Select: "COUNT"` request.
+
+  ## Migration — if you used `limit` as a page-size hint, move to `pageSize`
+
+  `limit` changes meaning on `collect()` and `paginate()`. The same call keeps compiling and quietly means something else, so check every call site:
+
+  | Before                                             | After                                         |
+  | -------------------------------------------------- | --------------------------------------------- |
+  | `.limit(3).collect()` → every item, in pages of 3  | `.limit(3).collect()` → **3 items**           |
+  | `.limit(2).paginate()` → everything, in pages of 2 | `.pageSize(2).paginate()`                     |
+  | `.limit(100)` to size a scan's requests            | `.pageSize(100)`                              |
+  | `.limit(25).fetch()`                               | unchanged — still up to 25 items and a cursor |
+
+  Callers who wrote what the documentation showed (`.limit(3).collect()` for "the first 3") were getting every matching item; they are now correct without a change. This ships as a minor within 1.x rather than waiting for a 2.0 because the old behaviour is a trap the docs already described incorrectly.
+
+- [#112](https://github.com/jmenga/effect-dynamodb/pull/112) [`1e20c24`](https://github.com/jmenga/effect-dynamodb/commit/1e20c240ab44533495451c65b279f185b2c04e7a) Thanks [@jmenga](https://github.com/jmenga)! - Aggregate: honour `sk.composite` on `many` edges, so one entity can appear more than once in an aggregate (closes [#103](https://github.com/jmenga/effect-dynamodb/issues/103))
+
+  `ManyEdgeConfig.sk.composite` was declared, type-checked and stored on the edge, but never read — the decompose walk composed each element's sort key from the referenced entity's identifier alone. Two elements sharing a ref composed one sort key, and DynamoDB rejected the entire aggregate write with `ValidationException: Transaction request cannot include multiple operations on one item`.
+
+  A declared `sk.composite` is now **authoritative**: it replaces the ref-identifier heuristic rather than extending it, so it decides both uniqueness and the order elements sort in. Entries name attributes on the decomposed element and may use a dotted path to reach a hydrated ref (`"umpire.id"` — hydration replaces the id field with the referenced object, so the bare name no longer exists at the top level).
+
+  Two related fixes for the same defect — a `many` edge whose sort key is not derived from anything distinguishing:
+  - **"Element IS the ref" edges now compose a sort key.** `Schema.Array(Player)` hydrates each element to the entity's own flat fields, and the identifier fallback only recognised a field literally named `id`. An entity whose identifier is `playerId` produced _no_ composites, so every element collapsed onto one row. The edge entity's declared `DynamoModel.identifier` field is now used.
+  - **Colliding sort keys fail as `AggregateDecompositionError`.** Decomposition detects two items composing the same sort key and fails with the aggregate, the edge and the colliding key — instead of an opaque `DynamoValidationError` naming nothing. This is checked before any write, so nothing is persisted.
+
+  A declared composite must resolve to a **scalar** — string, number, bigint, boolean or date. Naming the hydrated ref object itself (`sk: { composite: ["umpire"] }`) rather than a scalar path (`"umpire.id"`) previously serialised the whole object into the sort key; it now fails with `AggregateDecompositionError` pointing at the dotted form.
+
+  **Migration.** Sort keys change for two shapes, both of which could not previously hold more than one element:
+  - edges that already declared `sk.composite` (previously ignored)
+  - "element IS the ref" edges whose entity identifier is not named `id` — a single-element edge stored as `$app#v1#matchplayer` now stores as `$app#v1#matchplayer#p-1`
+
+  Existing rows in either shape are orphaned on the next update. Entity-less `many` edges over plain structs now require a declared `sk.composite`; without one, a multi-element edge fails with `AggregateDecompositionError` rather than silently writing one row per aggregate.
+
+### Patch Changes
+
+- [#112](https://github.com/jmenga/effect-dynamodb/pull/112) [`1e20c24`](https://github.com/jmenga/effect-dynamodb/commit/1e20c240ab44533495451c65b279f185b2c04e7a) Thanks [@jmenga](https://github.com/jmenga)! - Compose `.where()` sort key conditions into full sort key values (closes [#101](https://github.com/jmenga/effect-dynamodb/issues/101))
+
+  A sort key condition applied through a named-index or primary-key accessor did
+  not narrow the query. Stored sort keys are composed as
+  `$schema#v1#entity#<name>_<cased value>`, but `.where()` concatenated the raw
+  operand onto the entity prefix — so `gte` matched the whole partition (a raw
+  value sorts below every `<name>_`-prefixed segment) while `beginsWith`, `eq`,
+  `between`, `lt` and `lte` matched nothing.
+
+  The operand is now placed in the position of the SK composite it targets and run
+  through the same composer the write path uses, applying value serialization, the
+  `<name>_` prefix and the schema casing. Additional behaviour that follows from
+  composing correctly:
+  - A condition on a **non-terminal** SK composite covers that value's whole
+    subtree — `eq` compiles to a subtree `begins_with`, and inclusive upper bounds
+    span the subtree.
+  - When the accessor has already pinned leading SK composites, one-sided
+    operators are clamped to that prefix (`Query.where` replaces the accessor's
+    own `begins_with`, so an unclamped `>=` would leak into neighbouring
+    composite values).
+  - New `EDD-9045` when `.where()` is used on an index whose sort key has no
+    composites, and `EDD-9046` for a strict `lt` on the last SK composite while an
+    earlier one is pinned — DynamoDB cannot express `begins_with(prefix) AND sk <
+value` in a single key condition, so this is refused rather than silently
+    returning the boundary item.
+
+- Updated dependencies [[`e1ecfb4`](https://github.com/jmenga/effect-dynamodb/commit/e1ecfb4def8c7d04faa62cf3fc9d3f66002dd7ff), [`1e20c24`](https://github.com/jmenga/effect-dynamodb/commit/1e20c240ab44533495451c65b279f185b2c04e7a), [`1e20c24`](https://github.com/jmenga/effect-dynamodb/commit/1e20c240ab44533495451c65b279f185b2c04e7a), [`e1ecfb4`](https://github.com/jmenga/effect-dynamodb/commit/e1ecfb4def8c7d04faa62cf3fc9d3f66002dd7ff), [`0d67a51`](https://github.com/jmenga/effect-dynamodb/commit/0d67a51b1b27907c746c6fe808f929716d12f504), [`1e20c24`](https://github.com/jmenga/effect-dynamodb/commit/1e20c240ab44533495451c65b279f185b2c04e7a), [`1e20c24`](https://github.com/jmenga/effect-dynamodb/commit/1e20c240ab44533495451c65b279f185b2c04e7a)]:
+  - @effect-dynamodb/schema@1.16.0
+
 ## 1.15.0
 
 ### Minor Changes
