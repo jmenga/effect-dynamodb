@@ -8,6 +8,7 @@ Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table
 
 **Status:** All modules implemented. 1397 core tests, 307 schema tests, 56 geo tests, 293 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
 **Status:** All modules implemented. 1385 core tests, 307 schema tests, 56 geo tests, 284 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
+**Status:** All modules implemented. 1367 core tests, 307 schema tests, 56 geo tests, 281 connected tests, 71 language-service tests, 48 doctest tests, 35 examples.
 **Design:** `DESIGN.md` — API specification (source of truth for implementation)
 
 ## Architecture
@@ -244,7 +245,7 @@ If the `Agent` tool's `isolation: "worktree"` parameter is available for the tas
 - **Option over nullable** — `Option<A>` in services and domain logic. Convert at boundaries with `Option.fromNullable`.
 - **No tacit style** — always explicit lambdas: `Effect.map((x) => fn(x))`.
 - **`run*` at the edge only** — never `runPromise`/`runSync` inside an Effect.
-- **Testing** — `@effect/vitest` with `it.effect` / `it.scoped`. Mock `DynamoClient` via `Layer.succeed(DynamoClient, { putItem: mockPutItem, ... })`. Use `Effect.provide(layer, { local: true })` for test isolation.
+- **Testing** — `@effect/vitest` with `it.effect` / `it.scoped`. Mock `DynamoClient` via `mockDynamoClientLayer({ putItem: mockPutItem, ... })` from `test/helpers/MockDynamoClient.ts` — it supplies a dying default for every operation, so a test declares only what it exercises and a new operation on `DynamoClientService` needs a default added in exactly one place. Never hand-roll a full `Layer.succeed(DynamoClient, { ... })` literal. Use `Effect.provide(layer, { local: true })` for test isolation.
 - **Packages** — Unstable APIs live under `effect/unstable/*`.
 
 ### Critical Anti-Patterns
@@ -340,7 +341,7 @@ pnpm --filter @effect-dynamodb/doctest test:connected  # Runtime execution (need
 Before committing:
 1. `pnpm lint` — zero lint/format errors (Biome)
 2. `pnpm check` — zero type errors
-3. `pnpm test` — all unit tests pass (uses `vitest.config.ts`; does NOT run the connected suite)
+3. `pnpm test` — all unit tests pass (uses `vitest.config.ts`; does NOT run the connected suite). Note that Vitest transpiles without type-checking, so a green suite says nothing about types — gate 2 is what compiles `test/` (every package's `tsconfig.test.json` includes the whole `test` directory; issue #106). Never narrow one of those `include` arrays back to a file list.
 4. `pnpm --filter effect-dynamodb test:connected` — **all integration tests pass against DynamoDB Local** (uses `vitest.connected.ts`; requires `docker run -d --rm -p 8000:8000 amazon/dynamodb-local`). **Mandatory** for any PR that touches `KeyComposer`, `Entity`, `Query`, `Collection`, `Transaction`, `Aggregate`, `EventStore`, `Errors`, the `internal/` Entity helpers, or any test fixture. Do NOT skip on the assumption that unit tests cover the same ground — the connected suite catches end-to-end fixture drift, schema-level type widening that only fails on real DDB writes, and policy-aware GSI behavior that mocks can't reproduce.
 5. `pnpm --filter @effect-dynamodb/doctest test` — doc snippet sync verification passes
 6. `npx tsx examples/<name>.ts` — examples run against DynamoDB Local (`docker run -p 8000:8000 amazon/dynamodb-local`). Run after changes to Entity, Query, Table, DynamoSchema, KeyComposer, Collection, Transaction, or Errors. **Note: running an example successfully is NOT a substitute for gate 4** — examples exercise one or two scenarios; the connected suite covers the cross-product of behaviors. An agent that runs examples and skips `test:connected` has not satisfied this gate.
