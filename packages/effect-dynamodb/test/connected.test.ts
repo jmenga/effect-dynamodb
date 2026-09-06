@@ -348,7 +348,9 @@ const OfficiatedMatchAggregate = Aggregate.make(OfficiatedMatch, {
     officials: Aggregate.many("officials", {
       entityType: "MatchOfficial",
       entity: Officials,
-      sk: { composite: ["role"] },
+      // "onfield" seats two umpires and one umpire holds two appointments, so
+      // neither half is unique alone.
+      sk: { composite: ["role", "official.officialId"] },
     }),
   },
 })
@@ -2873,38 +2875,48 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
   // -------------------------------------------------------------------------
 
   describe("ManyEdge sk.composite", () => {
-    it.effect("one entity officiates twice in the same match", () =>
-      Effect.gen(function* () {
-        yield* Officials.put({ officialId: "off-1", name: "Ravi Bowen" }).asEffect()
-        yield* Officials.put({ officialId: "off-2", name: "Kumar D." }).asEffect()
+    it.effect(
+      "a full panel round-trips: a role with two officials, an official with two roles",
+      () =>
+        Effect.gen(function* () {
+          yield* Officials.put({ officialId: "off-1", name: "Ravi Bowen" }).asEffect()
+          yield* Officials.put({ officialId: "off-2", name: "Kumar D." }).asEffect()
+          yield* Officials.put({ officialId: "off-3", name: "Marais E." }).asEffect()
 
-        const created = yield* OfficiatedMatchAggregate.create({
-          id: "match-103",
-          name: "AUS vs IND",
-          officials: [
-            { officialId: "off-1", role: "onfield" },
-            // Same official, second role — one row under the ref-id heuristic.
-            { officialId: "off-1", role: "third" },
-            { officialId: "off-2", role: "referee" },
-          ],
-        })
+          const created = yield* OfficiatedMatchAggregate.create({
+            id: "match-103",
+            name: "AUS vs IND",
+            officials: [
+              // Multi-occupancy role: two on-field umpires.
+              { officialId: "off-1", role: "onfield" },
+              { officialId: "off-2", role: "onfield" },
+              // Repeated official: off-1 is also the third umpire.
+              { officialId: "off-1", role: "third" },
+              { officialId: "off-3", role: "referee" },
+            ],
+          })
 
-        expect(created.officials).toHaveLength(3)
+          expect(created.officials).toHaveLength(4)
 
-        // Round-trip: all three rows survive as distinct items.
-        const fetched = yield* OfficiatedMatchAggregate.get({ id: "match-103" })
-        expect(fetched.officials).toHaveLength(3)
+          // Round-trip: all four rows survive as distinct items.
+          const fetched = yield* OfficiatedMatchAggregate.get({ id: "match-103" })
+          expect(fetched.officials).toHaveLength(4)
 
-        const byRole = new Map(fetched.officials.map((o) => [o.role, o.official.officialId]))
-        expect(byRole.get("onfield")).toBe("off-1")
-        expect(byRole.get("third")).toBe("off-1")
-        expect(byRole.get("referee")).toBe("off-2")
+          const appointments = fetched.officials
+            .map((o) => `${o.role}:${o.official.officialId}`)
+            .sort()
+          expect(appointments).toEqual([
+            "onfield:off-1",
+            "onfield:off-2",
+            "referee:off-3",
+            "third:off-1",
+          ])
 
-        // The two off-1 rows are the same official under different roles.
-        const offOne = fetched.officials.filter((o) => o.official.officialId === "off-1")
-        expect(offOne).toHaveLength(2)
-        expect(offOne.every((o) => o.official.name === "Ravi Bowen")).toBe(true)
-      }).pipe(provideAgg),
+          // Both of off-1's rows hydrate the same official.
+          const offOne = fetched.officials.filter((o) => o.official.officialId === "off-1")
+          expect(offOne).toHaveLength(2)
+          expect(offOne.every((o) => o.official.name === "Ravi Bowen")).toBe(true)
+        }).pipe(provideAgg),
     )
 
     it.effect("sort keys carry the declared composite", () =>
@@ -2923,9 +2935,10 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
           .sort()
 
         expect(officialSks).toEqual([
-          "$agg-test#v1#matchofficial#onfield",
-          "$agg-test#v1#matchofficial#referee",
-          "$agg-test#v1#matchofficial#third",
+          "$agg-test#v1#matchofficial#onfield#off-1",
+          "$agg-test#v1#matchofficial#onfield#off-2",
+          "$agg-test#v1#matchofficial#referee#off-3",
+          "$agg-test#v1#matchofficial#third#off-1",
         ])
       }).pipe(provideAgg),
     )
@@ -2937,6 +2950,8 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
           name: "ENG vs NZ",
           officials: [
             { officialId: "off-1", role: "onfield" },
+            // Same official again — the ref-id default keys on the official
+            // alone, so both appointments compose one row.
             { officialId: "off-1", role: "third" },
           ],
         }).pipe(Effect.flip)

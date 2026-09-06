@@ -67,7 +67,8 @@ class Umpire extends Schema.Class<Umpire>("Umpire")({
 }) {}
 
 // #region many-edge-sk-models
-// One umpire may officiate a match in more than one role.
+// A panel seats two on-field umpires, plus a third umpire and a referee — and
+// the same person routinely holds more than one appointment.
 class MatchOfficial extends Schema.Class<MatchOfficial>("MatchOfficial")({
   umpire: Umpire.pipe(DynamoModel.ref),
   role: Schema.Literals(["onfield", "third", "referee"]),
@@ -225,7 +226,9 @@ const MatchAggregate = Aggregate.make(Match, {
 // A `many` edge composes each element's sort key from the referenced entity's
 // identifier, so the same umpire twice would compose one key and collide.
 // `sk.composite` names the element fields that separate them — and, being
-// authoritative, also fixes the order the rows sort in.
+// authoritative, also fixes the order the rows sort in. Here neither half is
+// unique on its own: "onfield" seats two umpires, and one umpire is also the
+// third umpire — so the key is the pair.
 // #region many-edge-sk
 const OfficiatedMatchAggregate = Aggregate.make(OfficiatedMatch, {
   table: MainTable,
@@ -237,7 +240,7 @@ const OfficiatedMatchAggregate = Aggregate.make(OfficiatedMatch, {
     officials: Aggregate.many("officials", {
       entityType: "MatchOfficial",
       entity: Umpires,
-      sk: { composite: ["role"] },
+      sk: { composite: ["role", "umpire.id"] },
     }),
   },
 })
@@ -543,16 +546,19 @@ const program = Effect.gen(function* () {
 
   yield* db.entities.Umpires.put({ id: "bowen-01", name: "Ravi Bowen" })
   yield* db.entities.Umpires.put({ id: "kumar-01", name: "Kumar D." })
+  yield* db.entities.Umpires.put({ id: "erasmus-01", name: "Marais E." })
 
   // #region many-edge-sk-create
   const officiated = yield* OfficiatedMatchAggregate.create({
     matchId: "bgt-2025-test-1",
     name: "AUS vs IND",
     officials: [
+      // A role seating two umpires.
       { umpireId: "bowen-01", role: "onfield" },
-      // Same umpire, second role — a distinct row, because `role` is in the key.
+      { umpireId: "kumar-01", role: "onfield" },
+      // ...and an umpire holding two appointments.
       { umpireId: "bowen-01", role: "third" },
-      { umpireId: "kumar-01", role: "referee" },
+      { umpireId: "erasmus-01", role: "referee" },
     ],
   })
   // #endregion

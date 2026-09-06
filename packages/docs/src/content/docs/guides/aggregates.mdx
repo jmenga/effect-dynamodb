@@ -232,7 +232,8 @@ Each element of a `many` edge becomes its own DynamoDB item, and by default its 
 Declare `sk.composite` to say what separates them:
 
 ```typescript region="many-edge-sk-models" example="guide-aggregates.ts"
-// One umpire may officiate a match in more than one role.
+// A panel seats two on-field umpires, plus a third umpire and a referee — and
+// the same person routinely holds more than one appointment.
 class MatchOfficial extends Schema.Class<MatchOfficial>("MatchOfficial")({
   umpire: Umpire.pipe(DynamoModel.ref),
   role: Schema.Literals(["onfield", "third", "referee"]),
@@ -256,7 +257,7 @@ const OfficiatedMatchAggregate = Aggregate.make(OfficiatedMatch, {
     officials: Aggregate.many("officials", {
       entityType: "MatchOfficial",
       entity: Umpires,
-      sk: { composite: ["role"] },
+      sk: { composite: ["role", "umpire.id"] },
     }),
   },
 })
@@ -267,19 +268,21 @@ const officiated = yield* OfficiatedMatchAggregate.create({
   matchId: "bgt-2025-test-1",
   name: "AUS vs IND",
   officials: [
+    // A role seating two umpires.
     { umpireId: "bowen-01", role: "onfield" },
-    // Same umpire, second role — a distinct row, because `role` is in the key.
+    { umpireId: "kumar-01", role: "onfield" },
+    // ...and an umpire holding two appointments.
     { umpireId: "bowen-01", role: "third" },
-    { umpireId: "kumar-01", role: "referee" },
+    { umpireId: "erasmus-01", role: "referee" },
   ],
 })
 ```
 
-A declared `sk.composite` is **authoritative**: it replaces the ref-identifier default rather than extending it, so it decides both uniqueness and the order elements sort in. Include the ref's identifier yourself when you still want it in the key — after hydration it lives under the hydrated object, so name it by dotted path:
+Pick the composite that is unique across the whole edge, not just the case in front of you. Here neither half would do alone — `["role"]` collides on the two on-field umpires, and the ref-identifier default collides on the umpire holding two appointments. `["role", "umpire.id"]` separates both. `["role"]` alone is right only when every role seats exactly one official.
 
-```typescript
-sk: { composite: ["role", "umpire.id"] }
-```
+A declared `sk.composite` is **authoritative**: it replaces the ref-identifier default rather than extending it, so it decides both uniqueness and the order elements sort in. Note `umpire.id` is a **dotted path** — hydration replaces the input's `umpireId` with the hydrated `umpire` object, so the bare name no longer exists at the top level.
+
+An alternative modelling, when the roles are fixed and few, is an edge per role — `onfield: Aggregate.many(...)` over `Schema.Array(Umpire)` alongside `third: Aggregate.one(...)`. Elements there are the referenced entity itself, so each row is keyed by that entity's `DynamoModel.identifier` and no declaration is needed. It costs the ability to add a role without changing the schema.
 
 Two shapes need a declaration, because nothing about the element identifies it on its own:
 
