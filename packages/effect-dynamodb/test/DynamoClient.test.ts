@@ -1034,6 +1034,136 @@ describe("DynamoClient", () => {
         }),
       )
 
+      // ---------------------------------------------------------------------
+      // #121 — a condition on an already-pinned composite
+      // ---------------------------------------------------------------------
+      //
+      // `Query.where` REPLACES the accessor's `begins_with`, so a condition on
+      // a composite the accessor already pinned does not narrow within the pin
+      // — it discards it. Before the fix this silently widened the query, and
+      // for `eq` it returned rows with a DIFFERENT value of the pinned
+      // composite. Every operator was affected, not just the one-sided ones,
+      // because `pinnedKeyForm` is built from composites strictly left of the
+      // target and is therefore empty at index 0.
+      describe("a composite the accessor already pinned is refused (EDD-9053)", () => {
+        const expectRejected = (build: (db: any) => unknown, pattern: RegExp) =>
+          Effect.gen(function* () {
+            const ClientLayer = makeQueryCapturingClient([])
+            const TableLayer = WhereTable.layer({ name: "where-table" })
+            yield* Effect.gen(function* () {
+              const db = yield* DynamoClient.make({
+                entities: { Balls, Readings, Lookups },
+                tables: { WhereTable },
+              })
+              expect(() => build(db)).toThrow(pattern)
+            }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+          })
+
+        it.effect("naming the pinned composite explicitly", () =>
+          expectRejected(
+            (db) =>
+              (db.entities.Readings.byDevice({ deviceId: "d-1", status: "done" }) as any).where(
+                (t: any, ops: any) => ops.gte(t.status, "don"),
+              ),
+            /EDD-9053.*status.*already.*pinned/s,
+          ),
+        )
+
+        // The no-cast path: one SK composite, the accessor pins it, and the
+        // callback hands back a raw literal. `field` is undefined, so the
+        // fallback target is the last composite — which is pinned.
+        it.effect("a raw literal when the accessor pinned every composite", () =>
+          expectRejected(
+            (db) =>
+              (db.entities.Balls.primary({ matchId: "m-1", ballKey: "1-009" }) as any).where(
+                () => ({ gte: "1-0" }),
+              ),
+            /EDD-9053.*ballKey.*already.*pinned/s,
+          ),
+        )
+
+        // Every operator, not only the one-sided ones — `eq` was the worst of
+        // them, composing a key for a value the accessor had excluded.
+        it.effect("every operator, not just the one-sided ones", () =>
+          Effect.gen(function* () {
+            const conditions = [
+              { eq: "1-010" },
+              { beginsWith: "1-0" },
+              { between: ["1-0", "1-9"] },
+              { lt: "1-9" },
+              { lte: "1-9" },
+              { gt: "1-0" },
+              { gte: "1-0" },
+            ]
+            for (const condition of conditions) {
+              yield* expectRejected(
+                (db) =>
+                  (db.entities.Balls.primary({ matchId: "m-1", ballKey: "1-009" }) as any).where(
+                    () => condition,
+                  ),
+                /EDD-9053/,
+              )
+            }
+          }),
+        )
+
+        // The pin must survive: an accessor with nothing pinned is unaffected,
+        // and one with a leading composite pinned still clamps (not rejects) a
+        // condition on the composite it left open.
+        it.effect("an open composite is still accepted and clamped", () =>
+          Effect.gen(function* () {
+            const gte = yield* capture((db: any) =>
+              db.entities.Readings.byDevice({ deviceId: "d-1", status: "done" })
+                .where((t: any, ops: any) => ops.gte(t.seq, "0042"))
+                .collect(),
+            )
+            expect(skLow(gte)).toBe("$wheretest#v1#reading#status_done#seq_0042")
+            expect(skHigh(gte)).toBe(`$wheretest#v1#reading#status_done#${MAX}`)
+          }),
+        )
+      })
+
+      // `.where()` should not be REACHABLE in the shapes above. The runtime
+      // guard covers untyped and cast call sites; these assert the type-level
+      // gate that keeps well-typed code away from it. `ResolveSkFields` used to
+      // resolve to `{}` rather than `never` when nothing remained, so
+      // `[SkRemaining] extends [never]` never fired and `.where()` was offered
+      // on every accessor — including ones with no sort key composites at all,
+      // which is the only reason EDD-9045 needed to exist.
+      it.effect("`.where()` is not offered once nothing remains to constrain", () =>
+        Effect.gen(function* () {
+          const ClientLayer = makeQueryCapturingClient([])
+          const TableLayer = WhereTable.layer({ name: "where-table" })
+          yield* Effect.gen(function* () {
+            const db = yield* DynamoClient.make({
+              entities: { Balls, Readings, Lookups },
+              tables: { WhereTable },
+            })
+
+            // Type-level only — never invoked. The calls below would throw
+            // EDD-9053 / EDD-9045 at runtime; what is under test is that they
+            // do not COMPILE, which `tsconfig.test.json` checks (#106).
+            const _neverRun = () => {
+              // Every SK composite pinned by the accessor.
+              // @ts-expect-error `.where()` is gone once SkRemaining is never
+              db.entities.Balls.primary({ matchId: "m-1", ballKey: "1-009" }).where(() => ({
+                gte: "1-0",
+              }))
+
+              // Index whose sort key has no composites at all.
+              // @ts-expect-error `.where()` is gone once SkRemaining is never
+              db.entities.Lookups.byEmail({ email: "a@b.c" }).where(() => ({ gte: "x" }))
+            }
+            void _neverRun
+
+            // Still offered while a composite remains open.
+            expect(
+              typeof db.entities.Readings.byDevice({ deviceId: "d-1", status: "done" }).where,
+            ).toBe("function")
+          }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+        }),
+      )
+
       it.effect("eq / beginsWith / between stay inside the pinned prefix unchanged", () =>
         Effect.gen(function* () {
           const pinned = "$wheretest#v1#reading#status_done"
