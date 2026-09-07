@@ -209,6 +209,29 @@ export interface ListOptions<Model = Record<string, unknown>> {
    * examined by this query.
    */
   readonly filter?: ListFilter<Model>
+  /**
+   * **Client-side** predicate on the root item, evaluated inside the same
+   * accumulate loop `limit` uses — so a page still fills to `limit` and the
+   * cursor still resumes after the last aggregate kept (#122). Filtering the
+   * returned `data` instead breaks both: the page comes back short, and its
+   * cursor points past aggregates the caller never saw.
+   *
+   * It runs **before assembly**, for the same reason {@link ListOptions.filter}
+   * is worth pushing server-side: a rejected root item never pays for its
+   * partition read. That is also why it receives the root item as **stored** —
+   * DynamoDB attribute names, wire-form values — rather than the assembled
+   * aggregate, which does not exist yet at that point.
+   *
+   * Prefer {@link ListOptions.filter} whenever DynamoDB can express the
+   * condition; a `FilterExpression` rejects rows before they cross the wire.
+   * Reach for this when it cannot — case-insensitive matching being the usual
+   * case, since DynamoDB has no `lower()`:
+   *
+   * ```ts
+   * list(key, { filterBy: (root) => String(root.name).toLowerCase().startsWith("mel") })
+   * ```
+   */
+  readonly filterBy?: (rootItem: Record<string, unknown>) => boolean
   /** Walk the list index in descending order (`ScanIndexForward: false`). */
   readonly reverse?: boolean
 }
@@ -1409,6 +1432,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
               limit,
               pageSize,
               filter: rootFilter,
+              accept: options?.filterBy,
               reverse: options?.reverse === true,
               keyFields: listKeyFields,
             })
@@ -1431,6 +1455,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             pageSize,
             startKey,
             filter: rootFilter,
+            accept: options?.filterBy,
             reverse: options?.reverse === true,
             keyFields: listKeyFields,
           })
@@ -2848,6 +2873,8 @@ interface ListPartitionOptions {
   readonly pageSize?: number | undefined
   readonly startKey?: Record<string, AttributeValue> | undefined
   readonly filter?: CompileResult | undefined
+  /** Client-side predicate on the raw root item — see `ListOptions.filterBy`. */
+  readonly accept?: ((rootItem: Record<string, unknown>) => boolean) | undefined
   readonly reverse?: boolean | undefined
   /** Attribute names forming a resume key, when there is no LastEvaluatedKey. */
   readonly keyFields: ReadonlyArray<string>
@@ -2865,7 +2892,9 @@ const listRequestLimit = (
   remaining: number | undefined,
 ): number | undefined => {
   if (remaining === undefined) return options.pageSize
-  if (options.filter !== undefined) return options.pageSize
+  // A client-side predicate rejects rows even later than a FilterExpression
+  // does, so it disqualifies the budget for exactly the same reason.
+  if (options.filter !== undefined || options.accept !== undefined) return options.pageSize
   return options.pageSize === undefined ? remaining : Math.min(options.pageSize, remaining)
 }
 
@@ -2937,18 +2966,37 @@ const queryListPartition = (
 
       const returned = (result.Items ?? []) as Array<Record<string, AttributeValue>>
       const lastEvaluatedKey = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined
-      const take = remaining === undefined ? returned.length : Math.min(remaining, returned.length)
+      // Without a client-side predicate every returned row is kept, so the take
+      // window is known up front. With one, acceptance is only known after the
+      // row is unmarshalled, so every returned row is examined and the loop
+      // stops once the budget fills (#122).
+      const accept = options.accept
+      const take =
+        remaining === undefined || accept !== undefined
+          ? returned.length
+          : Math.min(remaining, returned.length)
 
-      for (let i = 0; i < take; i++) items.push(fromAttributeMap(returned[i]!))
+      /** Index of the last row examined when the limit was reached, else -1. */
+      let stoppedAt = -1
+      for (let i = 0; i < take; i++) {
+        const item = fromAttributeMap(returned[i]!)
+        if (accept !== undefined && !accept(item)) continue
+        items.push(item)
+        if (limit !== undefined && items.length >= limit) {
+          stoppedAt = i
+          break
+        }
+      }
 
       // Over-read — a filtered request returns whatever survives the filter, not
       // `Limit` rows. The surplus is dropped, so `LastEvaluatedKey` (the last row
       // EXAMINED) would skip past items the caller never saw. Resume from the
-      // last item actually handed back instead.
-      if (take < returned.length) {
+      // last item actually handed back instead. `stoppedAt` is the last row
+      // ACCEPTED, which is what keeps this correct under a predicate too.
+      if (stoppedAt >= 0 && stoppedAt < returned.length - 1) {
         lastKey =
           listKeyFromItem(
-            returned[take - 1]!,
+            returned[stoppedAt]!,
             lastEvaluatedKey != null ? Object.keys(lastEvaluatedKey) : options.keyFields,
           ) ?? lastEvaluatedKey
         break

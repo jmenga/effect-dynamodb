@@ -10,6 +10,7 @@ import {
 } from "../src/internal/BoundQuery.js"
 import { createConditionOps } from "../src/internal/Expr.js"
 import { createPathBuilder } from "../src/internal/PathBuilder.js"
+import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
@@ -285,6 +286,57 @@ describe("BoundQuery", () => {
       const bq = makeBoundQuery().filter((t, { eq }) => eq(t.status, "active"))
       expect(bq._query._state.exprFilters).toHaveLength(1)
       expect(bq._query._state.exprFilters[0]!._tag).toBe("eq")
+    })
+  })
+
+  // -----------------------------------------------------------------------
+  // filterBy — client-side predicate (#122)
+  // -----------------------------------------------------------------------
+
+  describe("filterBy", () => {
+    it("registers a predicate on the underlying query", () => {
+      const bq = makeBoundQuery().filterBy((item) => item.status === "active")
+      expect(bq._query._state.predicates).toHaveLength(1)
+    })
+
+    it("returns a new instance, original unchanged", () => {
+      const original = makeBoundQuery()
+      const filtered = original.filterBy((item) => item.count > 1)
+      expect(filtered).not.toBe(original)
+      expect(original._query._state.predicates).toHaveLength(0)
+    })
+
+    it("the predicate sees the DECODED item, and limit counts what it accepts", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({ pk: "p", sk: "s-1", id: "1", name: "Alpha", status: "x", count: 1 }),
+            toAttributeMap({ pk: "p", sk: "s-2", id: "2", name: "BETA", status: "x", count: 2 }),
+            toAttributeMap({ pk: "p", sk: "s-3", id: "3", name: "beta", status: "x", count: 3 }),
+          ],
+          Count: 3,
+        })
+
+        // Case-insensitive matching — no `lower()` in DynamoDB, so a
+        // FilterExpression cannot express this.
+        const items = yield* makeBoundQuery()
+          .filterBy((item) => item.name.toLowerCase().startsWith("beta"))
+          .collect()
+
+        expect(items.map((i) => i.id)).toEqual(["2", "3"])
+      }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+
+    it("cannot be combined with select() (EDD-9054)", () => {
+      expect(() =>
+        makeBoundQuery()
+          .filterBy((i) => i.count > 0)
+          .select(["name"]),
+      ).toThrow(/EDD-9054/)
+      expect(() =>
+        makeBoundQuery()
+          .select(["name"])
+          .filterBy(() => true),
+      ).toThrow(/EDD-9054/)
     })
   })
 

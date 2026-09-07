@@ -167,12 +167,36 @@ const activeShorthand = yield* db.entities.TaskEntity.byProject({ projectId: "pr
   .collect()
 ```
 
-**When to use SK composites vs `filter`:**
+### Predicates DynamoDB cannot express
+
+`.filterBy()` takes an ordinary TypeScript predicate, evaluated on the **decoded item** — for conditions a `FilterExpression` has no operator for. Case-insensitive matching is the standard case: DynamoDB has no `lower()`, so a `FilterExpression` compares the stored attribute byte-for-byte.
+
+```typescript
+// Stored: name = "Melbourne Cricket Ground"
+.filter((t, { beginsWith }) => beginsWith(t.name, "melbourne"))   // no match
+.filterBy((v) => v.name.toLowerCase().startsWith("melbourne"))    // matches
+```
+
+Composite **keys** do not have this problem — casing is folded on both the stored key and the operand — so take as much as the key prefix can carry and match the rest with `.filterBy()`.
+
+The predicate runs **inside the same accumulate loop** `.limit()` uses, which is the whole point of it being a combinator rather than something you do to the result. Filtering `page.items` yourself breaks pagination twice over: the page comes back short, and its cursor resumes after the last item *returned* rather than the last one *kept*, so the next page skips rows.
+
+Two consequences worth knowing:
+
+- **It runs after the read.** Every examined row still crosses the wire and is still paid for. Prefer `.filter()` whenever DynamoDB can express the condition.
+- **`.count()` reads rows.** `Select: "COUNT"` returns no items to test, so under `.filterBy()` the rows are read and the accepted ones counted. Correct, but it costs what a `.collect()` costs.
+
+`.filterBy()` cannot be combined with `.select()` — a projection returns only the attributes it names, and a predicate is a closure whose reads the library cannot see, so it would be handed items missing the fields it tests. That combination raises `EDD-9054`.
+
+`Aggregate.list` takes the same thing as `filterBy` in its options, applied to the root item **before assembly** — so a rejected aggregate never pays for its partition read.
+
+**When to use SK composites vs `filter` vs `filterBy`:**
 
 | Approach | DynamoDB Mapping | Reduces Read Capacity? | Use For |
 |----------|------------------|----------------------|---------|
 | SK composites in accessor | `KeyConditionExpression` | Yes | Narrowing by sort key prefix |
 | `.filter()` | `FilterExpression` | No | Any attribute (post-read) |
+| `.filterBy()` | none — runs in the client | No | Conditions DynamoDB has no operator for |
 
 See the [Expressions Guide](/effect-dynamodb/guides/expressions/) for the complete operator reference and DynamoDB mapping tables.
 
@@ -255,7 +279,7 @@ const batchedAndCapped = yield* db.entities.TaskEntity.byProject({ projectId: "p
   .collect()
 ```
 
-`.limit(n)` works under a `.filter()`, and this is the reason the two are separate. DynamoDB's `Limit` bounds the rows **examined**, and a `FilterExpression` is applied *after* that — so `Limit` can never express "give me 3 matching items". `.limit()` is satisfied by accumulating across requests until `n` items are accepted or the key range is exhausted; `.pageSize()` is what each of those requests asks for. On a large partition with a very selective filter, pair `.limit()` with `.maxPages()` to bound the work.
+`.limit(n)` works under a `.filter()` (and under a `.filterBy()`), and this is the reason the two are separate. DynamoDB's `Limit` bounds the rows **examined**, and a `FilterExpression` is applied *after* that — so `Limit` can never express "give me 3 matching items". `.limit()` is satisfied by accumulating across requests until `n` items are accepted or the key range is exhausted; `.pageSize()` is what each of those requests asks for. On a large partition with a very selective filter, pair `.limit()` with `.maxPages()` to bound the work.
 
 :::caution[Changed in 1.16]
 `.limit(n)` used to set DynamoDB's per-request `Limit`, which meant `.limit(3).collect()` returned **every** matching item, fetched in pages of 3. It now returns 3. If you were using `.limit()` as a page-size hint, move to `.pageSize()` — `.limit(2).paginate()` streaming everything in pages of 2 becomes `.pageSize(2).paginate()`.

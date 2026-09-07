@@ -178,6 +178,28 @@ export interface BoundQueryBase<Model, SkRemaining, A> {
     (shorthand: ConditionShorthand): BoundQuery<Model, SkRemaining, A>
   }
 
+  /**
+   * Add a **client-side** predicate, evaluated on the decoded item inside the
+   * same accumulate loop `.limit()` uses — so a page still fills to `n` and its
+   * cursor still resumes after the last item kept (#122).
+   *
+   * Prefer `.filter()` whenever DynamoDB can express the condition: a
+   * `FilterExpression` is evaluated before the rows cross the wire, while this
+   * runs after, so every examined row is still read and paid for. Reach for it
+   * when the comparison is not expressible server-side — case-insensitive
+   * matching being the standard case, since DynamoDB has no `lower()`:
+   *
+   * ```ts
+   * db.entities.Venues.byCity({ city: "melbourne" })
+   *   .filterBy((v) => v.name.toLowerCase().startsWith("melbourne"))
+   *   .limit(25)
+   *   .fetch()
+   * ```
+   *
+   * Cannot be combined with `.select()` — see EDD-9054.
+   */
+  readonly filterBy: (predicate: (item: A) => boolean) => BoundQuery<Model, SkRemaining, A>
+
   /** Select specific attributes (projection). Callback or string array. */
   readonly select: {
     (
@@ -223,8 +245,15 @@ export interface BoundQueryBase<Model, SkRemaining, A> {
   /** Execute and return a lazy Stream of items. Automatically paginates. */
   readonly paginate: () => Stream.Stream<A, DynamoClientError | ValidationError, never>
 
-  /** Execute a count-only query (no items returned). */
-  readonly count: () => Effect.Effect<number, DynamoClientError, never>
+  /**
+   * Execute a count-only query (no items returned).
+   *
+   * Under `.filterBy()` there is nothing to count server-side — `Select:
+   * "COUNT"` returns no items to run the predicate against — so the rows are
+   * read and the accepted ones counted. Correct, but it pays for the read;
+   * that is why the error channel carries `ValidationError` (decode can fail).
+   */
+  readonly count: () => Effect.Effect<number, DynamoClientError | ValidationError, never>
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +351,11 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
     return new BoundQueryImpl(Query.filterExpr(this._query, expr), this._config)
   }
 
+  // --- filterBy ---
+  filterBy(predicate: (item: A) => boolean): BoundQueryImpl<Model, SkRemaining, A> {
+    return new BoundQueryImpl(Query.filterBy(this._query, predicate), this._config)
+  }
+
   // --- select ---
   select(
     fnOrAttrs:
@@ -383,7 +417,7 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
     )
   }
 
-  count(): Effect.Effect<number, DynamoClientError, never> {
+  count(): Effect.Effect<number, DynamoClientError | ValidationError, never> {
     return this._config.provide(Query.count(this._query))
   }
 }

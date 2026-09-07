@@ -3468,6 +3468,103 @@ describe("Aggregate write path", () => {
       ],
     })
 
+    // -----------------------------------------------------------------------
+    // list — client-side predicate (#122)
+    // -----------------------------------------------------------------------
+    //
+    // `filter` is a FilterExpression, so it cannot express what DynamoDB has no
+    // operator for — case-insensitive matching, since there is no `lower()`.
+    // Filtering `results.data` afterwards breaks `limit` (a short page) AND the
+    // cursor (which resumes after the last aggregate RETURNED, not the last one
+    // KEPT). `filterBy` runs inside the accumulate loop instead.
+
+    it.effect("filterBy fills the page with ACCEPTED aggregates", () =>
+      Effect.gen(function* () {
+        // Three root items examined; the predicate keeps two of them, and only
+        // those two pay for an assembly read.
+        mockListQuery
+          .mockResolvedValueOnce({
+            Items: [
+              listRow("a-1", "Alice", "First"),
+              listRow("a-2", "Bob", "Second"),
+              listRow("a-3", "ALICE", "Third"),
+            ],
+          })
+          .mockResolvedValueOnce(assemblyPage("a-1", "Alice", "First"))
+          .mockResolvedValueOnce(assemblyPage("a-3", "ALICE", "Third"))
+
+        const results = yield* ListAggregate.list(undefined, {
+          // Exactly the case a FilterExpression cannot express.
+          filterBy: (root) => String(root.author).toLowerCase() === "alice",
+        })
+
+        expect(results.data.map((a) => a.articleId)).toEqual(["a-1", "a-3"])
+        // Bob's row was rejected before assembly — 1 list query + 2 assemblies.
+        expect(mockListQuery).toHaveBeenCalledTimes(3)
+      }).pipe(Effect.provide(ListLayer)),
+    )
+
+    it.effect("limit counts accepted aggregates, and the cursor lands after the last one", () =>
+      Effect.gen(function* () {
+        mockListQuery
+          .mockResolvedValueOnce({
+            Items: [
+              listRow("a-1", "Alice", "First"),
+              listRow("a-2", "Bob", "Second"),
+              listRow("a-3", "ALICE", "Third"),
+            ],
+            LastEvaluatedKey: toAttributeMap({
+              pk: "$myapp#v1#article#a-3",
+              sk: "$myapp#v1#articleitem",
+            }),
+          })
+          .mockResolvedValueOnce(assemblyPage("a-1", "Alice", "First"))
+
+        const results = yield* ListAggregate.list(undefined, {
+          limit: 1,
+          filterBy: (root) => String(root.author).toLowerCase() === "alice",
+        })
+
+        expect(results.data.map((a) => a.articleId)).toEqual(["a-1"])
+        // Resumes after a-1 — the last aggregate KEPT. Resuming from
+        // LastEvaluatedKey (a-3) would skip a-3 itself, which the predicate
+        // accepts and the next page still owes the caller.
+        expect(results.cursor).not.toBeNull()
+        const resume = JSON.parse(atob(results.cursor!))
+        expect(resume.pk.S).toBe("$myapp#v1#article#a-1")
+      }).pipe(Effect.provide(ListLayer)),
+    )
+
+    it.effect("filterBy disqualifies the Limit budget, like a FilterExpression does", () =>
+      Effect.gen(function* () {
+        mockListQuery
+          .mockResolvedValueOnce({ Items: [listRow("a-1", "Alice", "First")] })
+          .mockResolvedValueOnce(assemblyPage("a-1", "Alice", "First"))
+
+        yield* ListAggregate.list(undefined, { limit: 2, filterBy: () => true })
+
+        // `Limit` bounds rows EXAMINED; the predicate rejects after that, so
+        // pushing the budget down could return fewer than `limit` aggregates.
+        expect(mockListQuery.mock.calls[0]![0].Limit).toBeUndefined()
+      }).pipe(Effect.provide(ListLayer)),
+    )
+
+    it.effect("filter and filterBy compose — server-side first, then the predicate", () =>
+      Effect.gen(function* () {
+        mockListQuery
+          .mockResolvedValueOnce({ Items: [listRow("a-1", "Alice", "First")] })
+          .mockResolvedValueOnce(assemblyPage("a-1", "Alice", "First"))
+
+        const results = yield* ListAggregate.list(undefined, {
+          filter: { author: "Alice" },
+          filterBy: (root) => String(root.title).startsWith("F"),
+        })
+
+        expect(results.data).toHaveLength(1)
+        expect(mockListQuery.mock.calls[0]![0].FilterExpression).toBeDefined()
+      }).pipe(Effect.provide(ListLayer)),
+    )
+
     it.effect("filter shorthand compiles to a FilterExpression on the root query", () =>
       Effect.gen(function* () {
         // DynamoDB applies the FilterExpression server-side, so only Alice's

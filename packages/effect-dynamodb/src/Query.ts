@@ -49,6 +49,11 @@ interface QueryState {
     readonly condition: SortKeyCondition
   }>
   readonly exprFilters: ReadonlyArray<Expr>
+  /**
+   * Client-side predicates, evaluated on the DECODED item inside the same
+   * accumulate loop the server-side filter uses (see {@link filterBy}).
+   */
+  readonly predicates: ReadonlyArray<(item: never) => boolean>
   readonly entityTypes: ReadonlyArray<string>
   /** Maximum number of items to RETURN (a contract on results). */
   readonly limitValue: number | undefined
@@ -146,6 +151,7 @@ export const make = <A>(config: {
     skField: config.skField,
     skConditions: [],
     exprFilters: [],
+    predicates: [],
     entityTypes: config.entityTypes,
     limitValue: undefined,
     pageSizeValue: undefined,
@@ -186,6 +192,7 @@ export const makeScan = <A>(config: {
     skField: undefined,
     skConditions: [],
     exprFilters: [],
+    predicates: [],
     entityTypes: config.entityTypes,
     limitValue: undefined,
     pageSizeValue: undefined,
@@ -357,12 +364,16 @@ export const select: {
   <A>(self: Query<A>, attributes: ReadonlyArray<string>): Query<Record<string, unknown>>
 } = Function.dual(
   2,
-  <A>(self: Query<A>, attributes: ReadonlyArray<string>): Query<Record<string, unknown>> =>
-    new QueryImpl<Record<string, unknown>>({
+  <A>(self: Query<A>, attributes: ReadonlyArray<string>): Query<Record<string, unknown>> => {
+    if (self._state.predicates.length > 0) {
+      throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
+    }
+    return new QueryImpl<Record<string, unknown>>({
       ...self._state,
       projection: attributes,
       decoder: (raw) => Effect.succeed(raw),
-    }),
+    })
+  },
 )
 
 /**
@@ -385,6 +396,73 @@ export const filterExpr: {
 })
 
 /**
+ * Add a **client-side** predicate, evaluated on the decoded item.
+ *
+ * `limit` is a contract on results, and the request loop fills a page by
+ * accumulating until `n` items are accepted, rebuilding the cursor from the
+ * last accepted item. Until now only `FilterExpression` could take part in
+ * that loop, so a predicate DynamoDB cannot express had to be applied after
+ * `execute` — which breaks pagination two ways: the page comes back short, and
+ * its cursor resumes after the last item RETURNED rather than the last one
+ * KEPT, skipping rows (#122).
+ *
+ * A predicate registered here runs inside the loop instead, so `limit` still
+ * fills the page and the cursor still lands after the last accepted item.
+ *
+ * **Prefer {@link filter} whenever DynamoDB can express the condition.** A
+ * `FilterExpression` is evaluated before the rows cross the wire; this runs
+ * after, so every examined row is still read and paid for. Reach for it when
+ * the comparison is not expressible server-side — case-insensitive matching is
+ * the standard case, since DynamoDB has no `lower()` and a `FilterExpression`
+ * compares the stored attribute byte-for-byte:
+ *
+ * ```ts
+ * query.pipe(
+ *   Query.filterBy((venue) => venue.name.toLowerCase().startsWith("melbourne")),
+ *   Query.limit(25),
+ *   Query.execute,
+ * )
+ * ```
+ *
+ * Composite KEYS do not have this problem — `DynamoSchema.applyCasing` folds
+ * both the stored key and the operand — so take as much as the key prefix can
+ * carry and match the rest here.
+ *
+ * Multiple predicates are ANDed. They cannot be combined with a projection
+ * ({@link select} / {@link selectPaths}), which would hand the predicate an
+ * item missing the attributes it reads — see EDD-9054.
+ */
+export const filterBy: {
+  <A>(predicate: (item: A) => boolean): (self: Query<A>) => Query<A>
+  <A>(self: Query<A>, predicate: (item: A) => boolean): Query<A>
+} = Function.dual(2, <A>(self: Query<A>, predicate: (item: A) => boolean): Query<A> => {
+  if (self._state.projection !== undefined || self._state.projectionPaths !== undefined) {
+    throw new Error(rejectPredicateWithProjection("filterBy() after select()"))
+  }
+  return new QueryImpl<A>({
+    ...self._state,
+    predicates: [...self._state.predicates, predicate as (item: never) => boolean],
+  })
+})
+
+/**
+ * @internal A projection and a client-side predicate cannot both be active.
+ *
+ * The predicate is an opaque closure, so the library cannot know which
+ * attributes it reads and cannot borrow them into the ProjectionExpression the
+ * way {@link cursorProjectionFields} borrows key attributes. Under a projection
+ * the predicate would silently receive an item whose fields are absent and
+ * quietly reject (or accept) every row. Refuse instead — the combination has no
+ * correct reading the library can pick on the caller's behalf.
+ */
+const rejectPredicateWithProjection = (what: string): string =>
+  `[EDD-9054] ${what} is not supported: a client-side predicate runs on the decoded ` +
+  "item, but a projection returns only the attributes it names, and the predicate is a " +
+  "closure whose attribute reads the library cannot see — so it would be handed items " +
+  "missing the fields it tests. Drop the projection, or express the condition as a " +
+  "server-side .filter() which DynamoDB evaluates against the stored item."
+
+/**
  * Apply path-based projections. Compiles path segments to ProjectionExpression.
  * When projection is active, items are returned as raw `Record<string, unknown>`.
  */
@@ -401,12 +479,16 @@ export const selectPaths: {
   <A>(
     self: Query<A>,
     paths: ReadonlyArray<ReadonlyArray<string | number>>,
-  ): Query<Record<string, unknown>> =>
-    new QueryImpl<Record<string, unknown>>({
+  ): Query<Record<string, unknown>> => {
+    if (self._state.predicates.length > 0) {
+      throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
+    }
+    return new QueryImpl<Record<string, unknown>>({
       ...self._state,
       projectionPaths: paths,
       decoder: (raw) => Effect.succeed(raw),
-    }),
+    })
+  },
 )
 
 // ---------------------------------------------------------------------------
@@ -580,6 +662,8 @@ const buildDynamoCommand = (
  * - With a user filter, `limit` cannot be expressed as `Limit` at all (it bounds
  *   rows examined, and the filter runs after), so the request asks for
  *   `pageSize` — or, unset, a natural (1 MB) page.
+ * - A client-side predicate ({@link filterBy}) rejects rows even later, after
+ *   decode, so it disqualifies the budget for exactly the same reason.
  */
 const computeRequestLimit = (
   state: QueryState,
@@ -587,8 +671,16 @@ const computeRequestLimit = (
 ): number | undefined => {
   const pageSize = state.pageSizeValue
   if (remaining === undefined) return pageSize
-  if (state.exprFilters.length > 0) return pageSize
+  if (state.exprFilters.length > 0 || state.predicates.length > 0) return pageSize
   return pageSize === undefined ? remaining : Math.min(pageSize, remaining)
+}
+
+/** @internal Does the decoded item pass every client-side predicate? */
+const accepts = (state: QueryState, item: unknown): boolean => {
+  for (const predicate of state.predicates) {
+    if (!(predicate as (i: unknown) => boolean)(item)) return false
+  }
+  return true
 }
 
 /**
@@ -701,6 +793,7 @@ export const execute = <A>(
     // Key attributes borrowed into an active projection so an over-reading
     // request can still rebuild a cursor. Stripped again before decoding.
     const borrowedFields = cursorProjectionFields(state)
+    const hasPredicate = state.predicates.length > 0
 
     const items: Array<A> = []
     let startKey = state.exclusiveStartKey
@@ -720,19 +813,38 @@ export const execute = <A>(
 
       const returned = (result.Items ?? []) as Array<Record<string, AttributeValue>>
       const lastEvaluatedKey = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined
-      const take = remaining === undefined ? returned.length : Math.min(remaining, returned.length)
+      // Without a client predicate every returned row is accepted, so the take
+      // window is known before decoding and the budget can bound it directly.
+      // With one, acceptance is only known AFTER decode, so every returned row
+      // is examined and the loop stops once the budget fills (#122).
+      const take =
+        remaining === undefined || hasPredicate
+          ? returned.length
+          : Math.min(remaining, returned.length)
 
+      /** Index of the last row examined when the limit was reached, else -1. */
+      let stoppedAt = -1
       for (let i = 0; i < take; i++) {
         const raw = fromAttributeMap(returned[i]!)
         for (const field of borrowedFields) delete raw[field]
-        items.push(yield* state.decoder(raw) as Effect.Effect<A, ValidationError>)
+        const item = yield* state.decoder(raw) as Effect.Effect<A, ValidationError>
+        if (hasPredicate && !accepts(state, item)) continue
+        items.push(item)
+        if (limitValue !== undefined && items.length >= limitValue) {
+          stoppedAt = i
+          break
+        }
       }
 
-      // Over-read: the surplus was discarded, so the cursor has to be rebuilt
-      // from the last item handed back rather than from LastEvaluatedKey.
-      if (take < returned.length) {
+      // Stopped inside the page: the surplus was discarded, so the cursor has
+      // to be rebuilt from the last item handed back rather than from
+      // LastEvaluatedKey. `stoppedAt` is the last row ACCEPTED, which is what
+      // makes this correct under a predicate — resuming from the last row
+      // EXAMINED would skip the rejected rows a later page might still need,
+      // and resuming from LastEvaluatedKey would skip the rest of this page.
+      if (stoppedAt >= 0 && stoppedAt < returned.length - 1) {
         cursor =
-          cursorFromItem(returned[take - 1]!, resumeKeyNames(state, lastEvaluatedKey)) ??
+          cursorFromItem(returned[stoppedAt]!, resumeKeyNames(state, lastEvaluatedKey)) ??
           (lastEvaluatedKey != null ? encodeCursor(lastEvaluatedKey) : null)
         break
       }
@@ -808,12 +920,19 @@ const paginateInternal = <A>(
           const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
 
           const returned = (result.Items ?? []) as Array<Record<string, AttributeValue>>
+          // See `execute` — a client predicate rejects rows after decode, so
+          // the budget cannot bound the examine window, only the accepted one.
+          const hasPredicate = state.predicates.length > 0
           const take =
-            remaining === undefined ? returned.length : Math.min(remaining, returned.length)
-          const decoded = yield* Effect.forEach(
+            remaining === undefined || hasPredicate
+              ? returned.length
+              : Math.min(remaining, returned.length)
+          const examined = yield* Effect.forEach(
             returned.slice(0, take).map((item) => fromAttributeMap(item)),
             (raw) => state.decoder(raw) as Effect.Effect<A, ValidationError>,
           )
+          const kept = hasPredicate ? examined.filter((item) => accepts(state, item)) : examined
+          const decoded = remaining === undefined ? kept : kept.slice(0, remaining)
 
           const emitted = pageState.emitted + decoded.length
           const hasMorePages = result.LastEvaluatedKey != null
@@ -843,7 +962,9 @@ const paginateInternal = <A>(
  * counting once `n` is reached — which makes `.limit(1).count()` a cheap
  * existence check. {@link pageSize} sets the rows examined per request.
  */
-export const count = <A>(self: Query<A>): Effect.Effect<number, DynamoClientError, DynamoClient> =>
+export const count = <A>(
+  self: Query<A>,
+): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient> =>
   Effect.gen(function* () {
     const client = yield* DynamoClient
     const state = self._state
@@ -851,6 +972,18 @@ export const count = <A>(self: Query<A>): Effect.Effect<number, DynamoClientErro
     const limitValue = state.limitValue
 
     if (limitValue !== undefined && limitValue <= 0) return 0
+
+    // A client-side predicate runs on the DECODED item, and `Select: "COUNT"`
+    // returns no items to decode — so counting server-side would report every
+    // row the key condition and FilterExpression matched, silently ignoring the
+    // predicate. Count the accepted items instead. This reads the rows rather
+    // than counting them in DynamoDB, which costs more; it is the price of a
+    // predicate the database cannot evaluate, and the alternative is a wrong
+    // number (#122).
+    if (state.predicates.length > 0) {
+      const items = yield* collect(self)
+      return items.length
+    }
 
     let total = 0
     let pageCount = 0
