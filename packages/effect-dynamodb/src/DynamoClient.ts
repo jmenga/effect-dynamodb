@@ -724,10 +724,23 @@ type Resolve<T> = { [K in keyof T]: T[K] }
 type ResolveKey<M extends Schema.Top, I> =
   EntityKeyType<M, I> extends infer K ? { [P in keyof K]: K[P] } : never
 
-/** Force eager resolution of remaining SK fields for clean hover display. */
+/**
+ * Force eager resolution of remaining SK fields for clean hover display.
+ *
+ * Resolves to `never` — not `{}` — when nothing remains, which is what makes
+ * `.where()` disappear from {@link BoundQuery} (its gate is
+ * `[SkRemaining] extends [never]`). Without the `keyof SK` check the mapped
+ * type produced `{}` for BOTH "the accessor pinned every composite" and "this
+ * index has no sort key composites at all", so the gate never fired and
+ * `.where()` was offered on accessors with nothing left to constrain — the
+ * first silently dropping the accessor's own pin (#121), the second reaching
+ * the EDD-9045 runtime throw that existed only to catch it.
+ */
 type ResolveSkFields<M extends Schema.Top, I, K extends keyof I, Provided, R = undefined> =
   Omit<IndexSkFields<M, I, K, R>, keyof Provided> extends infer SK
-    ? { readonly [P in keyof SK]: SK[P] }
+    ? [keyof SK] extends [never]
+      ? never
+      : { readonly [P in keyof SK]: SK[P] }
     : never
 
 /** Compute entity query accessors for each index — including `primary`.
@@ -1118,19 +1131,60 @@ const makeFromConfig = (config: {
             )
           }
 
-          // Resolve the targeted composite. `.where((t) => ...)` hands back the
-          // composite name via the sk accessor; fall back to the first composite
-          // the accessor call did not already pin.
-          const firstUnpinned = (() => {
+          // How many leading composites the accessor already pinned. Pinning is
+          // a prefix by construction — `validateQueryComposites` rejects a hole
+          // with EDD-9004 before the accessor is built — so this count is also
+          // the index of the first composite still open to a condition.
+          const pinnedCount = (() => {
             const i = skComposites.findIndex(
               (attr: string) => compositesKeyForm[attr] === undefined,
             )
-            return i === -1 ? skComposites.length - 1 : i
+            return i === -1 ? skComposites.length : i
           })()
+
+          /**
+           * `.where()` may only constrain a composite the accessor left open.
+           *
+           * DynamoDB allows exactly ONE sort key condition, and `Query.where`
+           * REPLACES the `begins_with` the accessor installed for its pinned
+           * prefix. So a condition on an already-pinned composite does not
+           * narrow within the pin — it discards the pin, and the query runs
+           * against the whole partition. Under a pinned `label = "ship"`,
+           * `eq("label", "shine")` returned rows whose label was `shine`.
+           *
+           * The two sides cannot be ANDed into one key condition, and
+           * intersecting them (pin ∩ condition) would silently turn some calls
+           * into "matches nothing". Raise instead — the caller pinned the value
+           * once already, so the condition is either redundant or contradictory
+           * and only the caller knows which was meant (#121).
+           */
+          const rejectPinned = (attr: string): never => {
+            throw new Error(
+              `[EDD-9053] Sort key composite "${attr}" for index "${_indexName}" is already ` +
+                `pinned to ${JSON.stringify(String(compositesKeyForm[attr]))} by the accessor, ` +
+                `so .where() cannot also constrain it: DynamoDB allows one sort key condition, ` +
+                `and this one would REPLACE the accessor's own prefix rather than narrow it — ` +
+                `returning rows outside the pinned value. Drop "${attr}" from the accessor call ` +
+                `and express the whole constraint in .where(), or drop the .where() and keep ` +
+                `the pin.`,
+            )
+          }
+
+          // Resolve the targeted composite. `.where((t) => ...)` hands back the
+          // composite name via the sk accessor; fall back to the first composite
+          // the accessor call did not already pin.
+          if (field !== undefined && skComposites.includes(field)) {
+            if (skComposites.indexOf(field) < pinnedCount) rejectPinned(field)
+          } else if (pinnedCount === skComposites.length) {
+            // No field named and nothing left open — the fallback would land on
+            // a pinned composite. (`ResolveSkFields` now hides `.where()` in
+            // this shape, so reaching here means an untyped or cast call site.)
+            rejectPinned(skComposites[skComposites.length - 1]!)
+          }
           const targetIndex =
             field !== undefined && skComposites.includes(field)
               ? skComposites.indexOf(field)
-              : firstUnpinned
+              : pinnedCount
           const targetAttr = skComposites[targetIndex]!
 
           // Every composite to the left of the target must already be pinned by
@@ -1225,7 +1279,14 @@ const makeFromConfig = (config: {
           // prefix, so the open end is clamped and the condition becomes a
           // BETWEEN. (`Query.where` replaces the accessor's own `begins_with`,
           // so it cannot do the clamping.)
-          if (targetIndex === 0) {
+          //
+          // The predicate is "the accessor pinned nothing", NOT `targetIndex === 0`.
+          // Those coincided for every shape the tests covered but are different
+          // claims: an accessor can pin composite[0] itself, and then targeting
+          // index 0 skipped the clamp and dropped the pin (#121). That call now
+          // raises EDD-9053 above, so the two are equivalent again — stating the
+          // real predicate keeps them from drifting apart a second time.
+          if (pinnedCount === 0) {
             if ("lt" in condition) return { lt: compose(condition.lt) }
             if ("lte" in condition) return { lte: upper(condition.lte) }
             // `>` is already exclusive of the composed value, so only a

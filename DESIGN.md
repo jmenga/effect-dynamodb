@@ -2641,7 +2641,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9042` | `Aggregate.ts` | `consistentRead` requested against a GSI-backed aggregate collection |
 | `EDD-9043` | `Aggregate.ts` | `collection.index` and `collection.sk` must be supplied together |
 | `EDD-9044` | `internal/EntitySchemas.ts` | Timestamp `schema` carries no `DynamoEncoding` annotation |
-| `EDD-9045` | `DynamoClient.ts` | `.where()` used on an index whose sort key has no composites |
+| `EDD-9045` | `DynamoClient.ts` | `.where()` used on an index whose sort key has no composites — unreachable from well-typed code since the `ResolveSkFields` repair (#121); retained for untyped and cast call sites |
 | `EDD-9046` | `DynamoClient.ts` | Strict `lt` on the last sort-key composite with an earlier composite pinned — inexpressible in one DynamoDB sort-key condition |
 | `EDD-9047` | `Entity.ts` | `.condition()` applied to `purge()`, which spans batched writes and cannot be guarded atomically |
 | `EDD-9048` | `internal/TransactableOps.ts` | A multi-item write path cannot compile a **delete** for an entity with `unique`, `versioned: { retain: true }` or `softDelete` — those side items derive from the *stored* row, which these paths never read |
@@ -2649,8 +2649,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9050` | `internal/CompositeCodec.ts` | A key composite's value cannot be encoded to its wire form, so it cannot be placed in a key — raised rather than composing a string that silently matches nothing |
 | `EDD-9051` | `Aggregate.ts` | `list({ cursor })` on a **sharded** aggregate (`list.cardinality`) — a fan-out over N partitions has no resumable position, so the cursor is rejected rather than silently ignored |
 | `EDD-9052` | `Batch.ts`, `Transaction.ts` | A read path (`Batch.get`, `Transaction.transactGet`, `Transaction.check`) was handed something that is not a get descriptor — pass `Entity.get(key)` or the bound `db.entities.X.get(key)` |
+| `EDD-9053` | `DynamoClient.ts` | `.where()` targets a sort-key composite the accessor already pinned — `Query.where` REPLACES the accessor's `begins_with`, so the condition would discard the pin and return rows outside it rather than narrowing within it |
 
-Next free code: **`EDD-9053`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+Next free code: **`EDD-9054`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 
