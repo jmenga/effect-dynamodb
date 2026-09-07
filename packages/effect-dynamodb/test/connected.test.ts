@@ -11400,3 +11400,186 @@ describeConnected("Aggregate.list — filtered pagination, reverse, sharding (#1
     }).pipe(provideAl),
   )
 })
+
+// ---------------------------------------------------------------------------
+// Client-side predicates — `.filterBy()` / `ListOptions.filterBy` (#122)
+// ---------------------------------------------------------------------------
+//
+// The motivating case, end to end. DynamoDB has no `lower()`, so a
+// `FilterExpression` compares the stored attribute byte-for-byte and a
+// case-insensitive match is inexpressible server-side. Filtering after the
+// fact breaks pagination two ways — a short page, and a cursor that resumes
+// after the last item RETURNED rather than the last one KEPT.
+
+const cpSchema = DynamoSchema.make({ name: "clientpred", version: 1 })
+const cpTableName = `clientpred-test-${Date.now()}`
+
+class CpVenue extends Schema.Class<CpVenue>("CpVenue")({
+  city: Schema.String,
+  venueId: Schema.String,
+  name: Schema.String,
+}) {}
+
+const CpVenues = Entity.make({
+  model: CpVenue,
+  entityType: "CpVenue",
+  primaryKey: {
+    pk: { field: "pk", composite: ["city"] },
+    sk: { field: "sk", composite: ["venueId"] },
+  },
+})
+
+const CpTable = Table.make({ schema: cpSchema, entities: { CpVenues } })
+const provideCp = Effect.provide(Layer.mergeAll(ClientLayer, CpTable.layer({ name: cpTableName })))
+
+/**
+ * Nine venues, alternating so that a match is never adjacent to a match — a
+ * page can only be filled by reading past the rejects.
+ */
+const CP_VENUES = [
+  { venueId: "v-1", name: "Melbourne Cricket Ground" },
+  { venueId: "v-2", name: "Geelong Oval" },
+  { venueId: "v-3", name: "melbourne Park" },
+  { venueId: "v-4", name: "Ballarat Reserve" },
+  { venueId: "v-5", name: "MELBOURNE Zoo" },
+  { venueId: "v-6", name: "Bendigo Ground" },
+  { venueId: "v-7", name: "MelBourne Docklands" },
+  { venueId: "v-8", name: "Shepparton Park" },
+  { venueId: "v-9", name: "melbournE Olympic Park" },
+]
+
+describeConnected("client-side predicates (closes #122)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: { CpVenues }, tables: { CpTable } })
+        yield* db.tables.CpTable.create()
+        for (const v of CP_VENUES) {
+          yield* db.entities.CpVenues.put({ city: "vic", ...v })
+        }
+      }).pipe(provideCp, Effect.scoped),
+    )
+  }, 60000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: cpTableName })
+      }).pipe(
+        provideCp,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  const isMelbourne = (v: CpVenue) => v.name.toLowerCase().startsWith("melbourne")
+
+  it.effect("a server-side filter cannot do this — that is the whole reason it exists", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { CpVenues }, tables: { CpTable } })
+
+      // `begins_with` on the stored attribute is byte-for-byte. Of the five
+      // venues a reader would call a match, exactly one is spelled so that it
+      // survives: "melbourne Park". Even "melbournE Olympic Park" is excluded,
+      // on the strength of a single capital letter nine characters in.
+      const serverSide = yield* db.entities.CpVenues.primary({ city: "vic" })
+        .filter((t, { beginsWith }) => beginsWith(t.name, "melbourne"))
+        .collect()
+      expect(serverSide.map((v) => v.venueId)).toEqual(["v-3"])
+
+      // The predicate sees the decoded item and folds both sides.
+      const clientSide = yield* db.entities.CpVenues.primary({ city: "vic" })
+        .filterBy(isMelbourne)
+        .collect()
+      expect(clientSide.map((v) => v.venueId)).toEqual(["v-1", "v-3", "v-5", "v-7", "v-9"])
+    }).pipe(provideCp),
+  )
+
+  it.effect("limit fills a FULL page of accepted items, reading past the rejects", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { CpVenues }, tables: { CpTable } })
+
+      // `pageSize: 1` makes every request examine exactly one row, so the four
+      // non-matching rows each come back and are rejected in the loop.
+      const page = yield* db.entities.CpVenues.primary({ city: "vic" })
+        .filterBy(isMelbourne)
+        .pageSize(1)
+        .limit(3)
+        .fetch()
+
+      expect(page.items.map((v) => v.venueId)).toEqual(["v-1", "v-3", "v-5"])
+      expect(page.cursor).not.toBeNull()
+    }).pipe(provideCp),
+  )
+
+  it.effect("the cursor resumes after the last item KEPT — nothing repeated, nothing skipped", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { CpVenues }, tables: { CpTable } })
+
+      const collected: Array<string> = []
+      let cursor: string | null = null
+      let pages = 0
+      do {
+        const query = db.entities.CpVenues.primary({ city: "vic" }).filterBy(isMelbourne).limit(2)
+        const page: { items: Array<CpVenue>; cursor: string | null } = yield* (
+          cursor === null ? query : query.startFrom(cursor)
+        ).fetch()
+        collected.push(...page.items.map((v) => v.venueId))
+        cursor = page.cursor
+        pages++
+      } while (cursor !== null && pages < 10)
+
+      // Every match, exactly once, in order — the property that breaks when a
+      // caller filters `page.items` itself.
+      expect(collected).toEqual(["v-1", "v-3", "v-5", "v-7", "v-9"])
+      expect(cursor).toBeNull()
+    }).pipe(provideCp),
+  )
+
+  it.effect("count reflects the predicate rather than the unfiltered row count", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { CpVenues }, tables: { CpTable } })
+
+      const all = yield* db.entities.CpVenues.primary({ city: "vic" }).count()
+      expect(all).toBe(9)
+
+      // `Select: "COUNT"` returns no items to test, so this reads the rows and
+      // counts the accepted ones — the alternative is reporting 9.
+      const matching = yield* db.entities.CpVenues.primary({ city: "vic" })
+        .filterBy(isMelbourne)
+        .count()
+      expect(matching).toBe(5)
+    }).pipe(provideCp),
+  )
+
+  it.effect("paginate streams only accepted items", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { CpVenues }, tables: { CpTable } })
+
+      const stream = db.entities.CpVenues.primary({ city: "vic" })
+        .filterBy(isMelbourne)
+        .pageSize(2)
+        .paginate()
+      const items = yield* Stream.runCollect(stream)
+
+      expect(items.map((v) => v.venueId)).toEqual(["v-1", "v-3", "v-5", "v-7", "v-9"])
+    }).pipe(provideCp),
+  )
+
+  it.effect("a server-side filter and a client-side predicate compose", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { CpVenues }, tables: { CpTable } })
+
+      // The FilterExpression rejects rows before they cross the wire; the
+      // predicate then folds case on what is left.
+      const items = yield* db.entities.CpVenues.primary({ city: "vic" })
+        .filter((t, { contains }) => contains(t.name, "Park"))
+        .filterBy(isMelbourne)
+        .collect()
+
+      expect(items.map((v) => v.venueId)).toEqual(["v-3", "v-9"])
+    }).pipe(provideCp),
+  )
+})

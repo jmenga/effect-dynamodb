@@ -1087,3 +1087,302 @@ describe("Query", () => {
     )
   })
 })
+
+// ---------------------------------------------------------------------------
+// filterBy — client-side predicate inside the accumulate loop (#122)
+// ---------------------------------------------------------------------------
+//
+// `limit` is a contract on RESULTS: the loop accumulates until `n` items are
+// accepted and rebuilds the cursor from the last accepted item. Only
+// `FilterExpression` could take part in that, so a predicate DynamoDB cannot
+// express (case-insensitive matching being the standard case — there is no
+// `lower()`) had to be applied after `execute`, which returns a short page AND
+// a cursor pointing past items the caller never saw.
+
+describe("filterBy (#122)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  /** Rows named `n-0` … `n-(count-1)`; even indices are "kept" by the predicate. */
+  const rows = (from: number, count: number) =>
+    Array.from({ length: count }, (_, i) =>
+      toAttributeMap({ pk: "p", sk: `s-${from + i}`, id: `${from + i}`, name: `n-${from + i}` }),
+    )
+
+  const isEven = (item: { id: string }) => Number(item.id) % 2 === 0
+
+  describe("combinator", () => {
+    it("registers a predicate without mutating the original", () => {
+      const original = makeTestQuery()
+      const filtered = original.pipe(Query.filterBy(isEven))
+      expect(original._state.predicates).toHaveLength(0)
+      expect(filtered._state.predicates).toHaveLength(1)
+    })
+
+    it("ANDs multiple predicates", () => {
+      const q = makeTestQuery().pipe(
+        Query.filterBy(isEven),
+        Query.filterBy((i: { id: string }) => Number(i.id) > 2),
+      )
+      expect(q._state.predicates).toHaveLength(2)
+    })
+  })
+
+  describe("limit fills the page with ACCEPTED items", () => {
+    it("keeps asking until the budget is met, not until the rows run out", () =>
+      Effect.gen(function* () {
+        // 6 rows examined, 3 accepted — a post-execute filter would return 3
+        // where the caller asked for 3 only by luck; here it is the contract.
+        mockQuery.mockResolvedValueOnce({ Items: rows(0, 6), Count: 6 })
+
+        const page = yield* makeTestQuery().pipe(
+          Query.filterBy(isEven),
+          Query.limit(3),
+          Query.execute,
+        )
+
+        expect(page.items.map((i) => i.id)).toEqual(["0", "2", "4"])
+      }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+
+    it("spans requests when one page cannot fill the budget", () =>
+      Effect.gen(function* () {
+        mockQuery
+          .mockResolvedValueOnce({
+            Items: rows(0, 4),
+            Count: 4,
+            LastEvaluatedKey: toAttributeMap({ pk: "p", sk: "s-3" }),
+          })
+          .mockResolvedValueOnce({ Items: rows(4, 4), Count: 4 })
+
+        const page = yield* makeTestQuery().pipe(
+          Query.filterBy(isEven),
+          Query.limit(3),
+          Query.execute,
+        )
+
+        expect(page.items.map((i) => i.id)).toEqual(["0", "2", "4"])
+        expect(mockQuery).toHaveBeenCalledTimes(2)
+      }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+
+    it("does not push `Limit` — the predicate rejects rows after they are examined", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: rows(0, 6), Count: 6 })
+
+        yield* makeTestQuery().pipe(Query.filterBy(isEven), Query.limit(3), Query.execute)
+
+        // Without this, DynamoDB would examine 3 rows and the predicate could
+        // accept as few as 0 of them.
+        expect(mockQuery.mock.calls[0]![0].Limit).toBeUndefined()
+      }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+
+    it("still honours pageSize as the round-trip budget", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: rows(0, 6), Count: 6 })
+
+        yield* makeTestQuery().pipe(
+          Query.filterBy(isEven),
+          Query.pageSize(50),
+          Query.limit(3),
+          Query.execute,
+        )
+
+        expect(mockQuery.mock.calls[0]![0].Limit).toBe(50)
+      }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+  })
+
+  describe("the cursor resumes after the last item KEPT", () => {
+    it("rebuilds from the last ACCEPTED row, not the last examined one", () =>
+      Effect.gen(function* () {
+        // Rows 0..5, evens accepted, budget 2 → accepted 0 and 2, stopping at
+        // row index 2. Resuming from row 5 (LastEvaluatedKey) or from row 3
+        // (the next examined row) would both skip row 4, which the next page
+        // still owes the caller.
+        mockQuery.mockResolvedValueOnce({
+          Items: rows(0, 6),
+          Count: 6,
+          LastEvaluatedKey: toAttributeMap({ pk: "p", sk: "s-5" }),
+        })
+
+        const page = yield* makeTestQuery().pipe(
+          Query.filterBy(isEven),
+          Query.limit(2),
+          Query.execute,
+        )
+
+        expect(page.items.map((i) => i.id)).toEqual(["0", "2"])
+        expect(page.cursor).not.toBeNull()
+        const resume = JSON.parse(atob(page.cursor!))
+        expect(resume.sk.S).toBe("s-2")
+      }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+
+    it("paging with that cursor returns the next accepted items, none skipped", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({
+          Items: rows(0, 6),
+          Count: 6,
+          LastEvaluatedKey: toAttributeMap({ pk: "p", sk: "s-5" }),
+        })
+
+        const first = yield* makeTestQuery().pipe(
+          Query.filterBy(isEven),
+          Query.limit(2),
+          Query.execute,
+        )
+
+        // The mock replays from the cursor position — rows 3..5.
+        mockQuery.mockResolvedValueOnce({ Items: rows(3, 3), Count: 3 })
+
+        const second = yield* makeTestQuery().pipe(
+          Query.filterBy(isEven),
+          Query.limit(2),
+          Query.startFrom(first.cursor!),
+          Query.execute,
+        )
+
+        expect(second.items.map((i) => i.id)).toEqual(["4"])
+        expect(mockQuery.mock.calls[1]![0].ExclusiveStartKey.sk.S).toBe("s-2")
+      }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+
+    it("a page that ends exactly on the last row keeps LastEvaluatedKey", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({
+          Items: rows(0, 3),
+          Count: 3,
+          LastEvaluatedKey: toAttributeMap({ pk: "p", sk: "s-2" }),
+        })
+
+        const page = yield* makeTestQuery().pipe(
+          Query.filterBy(isEven),
+          Query.limit(2),
+          Query.execute,
+        )
+
+        expect(page.items.map((i) => i.id)).toEqual(["0", "2"])
+        const resume = JSON.parse(atob(page.cursor!))
+        expect(resume.sk.S).toBe("s-2")
+      }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+  })
+
+  describe("the other terminals apply it too", () => {
+    it("collect", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: rows(0, 6), Count: 6 })
+
+        const items = yield* makeTestQuery().pipe(Query.filterBy(isEven), Query.collect)
+
+        expect(items.map((i) => i.id)).toEqual(["0", "2", "4"])
+      }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+
+    it("paginate", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: rows(0, 6), Count: 6 })
+
+        const stream = yield* makeTestQuery().pipe(Query.filterBy(isEven), Query.paginate)
+        const pages = yield* Stream.runCollect(stream)
+
+        expect(pages.flat().map((i) => i.id)).toEqual(["0", "2", "4"])
+      }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+
+    it("paginate respects limit across pages", () =>
+      Effect.gen(function* () {
+        mockQuery
+          .mockResolvedValueOnce({
+            Items: rows(0, 4),
+            Count: 4,
+            LastEvaluatedKey: toAttributeMap({ pk: "p", sk: "s-3" }),
+          })
+          .mockResolvedValueOnce({ Items: rows(4, 4), Count: 4 })
+
+        const stream = yield* makeTestQuery().pipe(
+          Query.filterBy(isEven),
+          Query.limit(3),
+          Query.paginate,
+        )
+        const pages = yield* Stream.runCollect(stream)
+
+        expect(pages.flat().map((i) => i.id)).toEqual(["0", "2", "4"])
+      }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+
+    // `Select: "COUNT"` returns no items, so there is nothing to run the
+    // predicate against — counting server-side would report every row the key
+    // condition matched and silently ignore the predicate. Read and count the
+    // accepted rows instead: it costs more, but the alternative is a wrong number.
+    it("count reads rows rather than reporting an unfiltered COUNT", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: rows(0, 6), Count: 6 })
+
+        const n = yield* makeTestQuery().pipe(Query.filterBy(isEven), Query.count)
+
+        expect(n).toBe(3)
+        expect(mockQuery.mock.calls[0]![0].Select).toBeUndefined()
+      }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+
+    it("count without a predicate still uses Select: COUNT", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Count: 6 })
+
+        const n = yield* makeTestQuery().pipe(Query.count)
+
+        expect(n).toBe(6)
+        expect(mockQuery.mock.calls[0]![0].Select).toBe("COUNT")
+      }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+  })
+
+  // A projection returns only the attributes it names, and the predicate is an
+  // opaque closure whose reads the library cannot see — so it cannot borrow the
+  // fields the way `cursorProjectionFields` borrows key attributes. The
+  // combination has no correct reading to pick on the caller's behalf.
+  describe("a projection and a predicate cannot both be active (EDD-9054)", () => {
+    it("select() after filterBy()", () => {
+      expect(() => makeTestQuery().pipe(Query.filterBy(isEven), Query.select(["name"]))).toThrow(
+        /EDD-9054/,
+      )
+    })
+
+    it("selectPaths() after filterBy()", () => {
+      expect(() =>
+        makeTestQuery().pipe(Query.filterBy(isEven), Query.selectPaths([["name"]])),
+      ).toThrow(/EDD-9054/)
+    })
+
+    it("filterBy() after select()", () => {
+      expect(() =>
+        makeTestQuery().pipe(
+          Query.select(["name"]),
+          Query.filterBy((r: any) => r.name === "x"),
+        ),
+      ).toThrow(/EDD-9054/)
+    })
+
+    it("either alone is fine", () => {
+      expect(() => makeTestQuery().pipe(Query.select(["name"]))).not.toThrow()
+      expect(() => makeTestQuery().pipe(Query.filterBy(isEven))).not.toThrow()
+    })
+  })
+
+  describe("no predicate leaves every existing path byte-identical", () => {
+    it("still pushes `Limit` when nothing filters", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: rows(0, 3), Count: 3 })
+
+        yield* makeTestQuery().pipe(Query.limit(3), Query.execute)
+
+        expect(mockQuery.mock.calls[0]![0].Limit).toBe(3)
+      }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+
+    it("still rebuilds the cursor on an over-read", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({
+          Items: rows(0, 5),
+          Count: 5,
+          LastEvaluatedKey: toAttributeMap({ pk: "p", sk: "s-4" }),
+        })
+
+        const page = yield* makeTestQuery().pipe(Query.limit(2), Query.execute)
+
+        expect(page.items.map((i) => i.id)).toEqual(["0", "1"])
+        expect(JSON.parse(atob(page.cursor!)).sk.S).toBe("s-1")
+      }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+  })
+})
