@@ -298,7 +298,7 @@ export const write = (
       }
 
       if (info.opType === "put") {
-        yield* rejectUnsupportedOp(entity, "batchWrite", "put", info.putKind)
+        yield* rejectUnsupportedOp(entity, "batchWrite", "put", info.putKind, info.input)
         const built = yield* validateAndBuildPutItem(entity, info.input!, "batchWrite.put")
         writeRequests.push({
           tableName,

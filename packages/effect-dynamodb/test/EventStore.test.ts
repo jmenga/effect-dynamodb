@@ -91,9 +91,25 @@ const Registrations = Entity.make({
   versioned: { retain: true },
 })
 
+// #120 — a read model keyed by a framework-generated id. The "commit the read
+// model atomically with the events that produced it" pattern (#100) was barred
+// outright for this shape, even when the caller supplied the id and so needed
+// no `Crypto` at all.
+class AuditRecord extends Schema.Class<AuditRecord>("AuditRecord")({
+  auditId: Schema.String,
+  note: Schema.String,
+}) {}
+
+const AuditRecords = Entity.make({
+  model: AuditRecord,
+  entityType: "Audit",
+  primaryKey: { pk: { field: "pk", composite: ["auditId"] }, sk: { field: "sk", composite: [] } },
+  generatedId: { field: "auditId" },
+})
+
 const EventsTable = Table.make({
   schema: AppSchema,
-  entities: { Watermarks, StatusProjection, Registrations },
+  entities: { Watermarks, StatusProjection, Registrations, AuditRecords },
 })
 
 class MatchStarted extends Schema.Class<MatchStarted>("MatchStarted")({
@@ -1236,6 +1252,38 @@ describe("EventStore", () => {
         expect(fromAttributeMap(call.TransactItems[1].Delete.Key).pk).toBe(
           "$cricket#v1#status#matchid_m-1",
         )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // -----------------------------------------------------------------------
+    // #120 — a generatedId read model, committed with the events that made it.
+    // -----------------------------------------------------------------------
+
+    it.effect("commits a generatedId read model when the caller supplies the id", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [AuditRecords.put({ auditId: "a-1", note: "match started" })],
+        })
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(call.TransactItems).toHaveLength(2)
+        const audit = fromAttributeMap(call.TransactItems[1].Put.Item)
+        expect(audit.auditId).toBe("a-1")
+        expect(audit.pk).toBe("$cricket#v1#audit#auditid_a-1")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("still refuses one whose id would have to be generated here", () =>
+      Effect.gen(function* () {
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [AuditRecords.put({ note: "match started" } as never)],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as { cause: unknown }).cause)).toContain("omitted generated id")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )
 

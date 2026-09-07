@@ -115,8 +115,10 @@ export const batchRejectReason = (entity: Entity, opType: "put" | "delete"): str
  * **What this gate covers.** Cases that are silently wrong (`upsert` — see
  * `PutKind`) or that cannot be working for anyone today: a `refs` entity writes
  * an item whose ref attribute is absent, so every later read fails to decode; a
- * `generatedId` entity dies outright (no `Crypto` in scope); a vector-indexed
- * entity writes an item with no embedding, so it silently drops out of the index.
+ * `generatedId` entity whose id was NOT supplied dies outright (no `Crypto` in
+ * scope) — one supplied on the input is written as given, since that is the case
+ * `Entity.put` also handles without `Crypto` (#120); a vector-indexed entity
+ * writes an item with no embedding, so it silently drops out of the index.
  *
  * **The multi-item lifecycle features split by direction (#113).** `unique`,
  * `versioned: { retain }` and `softDelete` all need MORE than one item per write.
@@ -141,6 +143,12 @@ export const rejectUnsupportedOp = (
   operation: string,
   opType: "put" | "delete",
   putKind: "put" | "create" | "upsert" | undefined,
+  /**
+   * The op's own input, for the one gate whose dependency the caller can
+   * remove. `undefined` for a delete (which carries a key, not an input) and
+   * for any caller with none to offer — both read as "the field is absent".
+   */
+  input?: unknown,
 ): Effect.Effect<void, ValidationError> => {
   const fail = (capability: string, reason: string) =>
     new ValidationError({
@@ -186,10 +194,32 @@ export const rejectUnsupportedOp = (
       ),
     )
   }
+  // Unlike the two gates around it, this one depends on the INPUT rather than
+  // the configuration. `Entity.put` only reaches `Crypto` when the caller
+  // omitted the field — `fillGeneratedId` returns the input untouched when it
+  // is present — so a caller who supplies the id needs nothing this path lacks.
+  // Rejecting them named a dependency that did not apply, and pointed at a
+  // workaround that was already in effect (#120).
+  //
+  // The absent case still has to be refused: this path builds the item straight
+  // from the encoded input and never calls `fillGeneratedId`, so the id would
+  // stay missing and the primary key would compose around an `undefined`.
   if (opType === "put" && entity.generatedId != null) {
-    return Effect.fail(
-      fail("a generated id", "id generation needs the Crypto service, which is not in scope here."),
-    )
+    const idField = (entity.generatedId as { readonly field: string }).field
+    const supplied =
+      typeof input === "object" &&
+      input !== null &&
+      (input as globalThis.Record<string, unknown>)[idField] != null
+    if (!supplied) {
+      return Effect.fail(
+        fail(
+          `an omitted generated id ("${idField}")`,
+          "generating one needs the Crypto service, which is not in scope here. Supply " +
+            `"${idField}" on the input and this path writes it as given — only the ` +
+            "generating case is unsupported.",
+        ),
+      )
+    }
   }
   if (opType === "put" && Object.keys(entity._vectorIndexes ?? {}).length > 0) {
     return Effect.fail(

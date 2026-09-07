@@ -187,7 +187,7 @@ export const buildTransactWriteItems = (
       }
 
       if (info.opType === "put") {
-        yield* rejectUnsupportedOp(info.entity, operation, "put", info.putKind)
+        yield* rejectUnsupportedOp(info.entity, operation, "put", info.putKind, info.input)
         opInfos.push({
           type: "put",
           entity: info.entity,
