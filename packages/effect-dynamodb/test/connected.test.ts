@@ -5683,6 +5683,66 @@ describeConnected("generatedId integration tests (closes #57)", () => {
     }).pipe(provideGenId),
   )
 
+  // #120 — the multi-item write paths gated on the entity's CONFIGURATION, so
+  // a `generatedId` entity was barred from `transactWrite` / `Batch.write`
+  // outright, citing a `Crypto` dependency that a supplied id removes. Proven
+  // end-to-end here: the item lands, decodes, and is queryable by the primary
+  // key and by the GSI its id composes into — same as a plain `put`.
+  it.effect("transactWrite accepts a supplied generated id and writes a well-formed item", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { GenWidgets },
+        tables: { GenIdTable },
+      })
+
+      yield* Transaction.transactWrite([
+        db.entities.GenWidgets.put({
+          widgetId: "txn-widget-1",
+          owner: "carol",
+          label: "Flywheel",
+        }),
+      ])
+
+      const fetched = yield* db.entities.GenWidgets.get({ widgetId: "txn-widget-1" })
+      expect(fetched.label).toBe("Flywheel")
+
+      const byOwner = yield* db.entities.GenWidgets.byOwner({ owner: "carol" }).collect()
+      expect(byOwner.map((w) => w.widgetId)).toContain("txn-widget-1")
+    }).pipe(provideGenId),
+  )
+
+  it.effect("Batch.write accepts a supplied generated id", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { GenWidgets },
+        tables: { GenIdTable },
+      })
+
+      yield* Batch.write([
+        db.entities.GenWidgets.put({ widgetId: "batch-widget-1", owner: "dan", label: "Gear" }),
+      ])
+
+      const fetched = yield* db.entities.GenWidgets.get({ widgetId: "batch-widget-1" })
+      expect(fetched.label).toBe("Gear")
+    }).pipe(provideGenId),
+  )
+
+  it.effect("transactWrite still refuses an OMITTED generated id", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { GenWidgets },
+        tables: { GenIdTable },
+      })
+
+      const error = yield* Transaction.transactWrite([
+        db.entities.GenWidgets.put({ owner: "erin", label: "Ratchet" } as never),
+      ]).pipe(Effect.flip)
+
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as { cause: unknown }).cause)).toContain("omitted generated id")
+    }).pipe(provideGenId),
+  )
+
   it.effect("caller-supplied id is respected over auto-generation", () =>
     Effect.gen(function* () {
       const db = yield* DynamoClient.make({

@@ -92,9 +92,22 @@ const SoftItems = Entity.make({
   softDelete: true,
 })
 
+// #120 fixture — an entity whose id the framework generates when it is absent.
+class GenDoc extends Schema.Class<GenDoc>("GenDoc")({
+  docId: Schema.String,
+  title: Schema.String,
+}) {}
+
+const GenDocs = Entity.make({
+  model: GenDoc,
+  entityType: "GenDoc",
+  primaryKey: { pk: { field: "pk", composite: ["docId"] }, sk: { field: "sk", composite: [] } },
+  generatedId: { field: "docId" },
+})
+
 const MainTable = Table.make({
   schema: AppSchema,
-  entities: { UserEntity, OrderEntity, UniqueMembers, RetainDocs, SoftItems },
+  entities: { UserEntity, OrderEntity, UniqueMembers, RetainDocs, SoftItems, GenDocs },
 })
 
 // --- Mock DynamoClient ---
@@ -821,6 +834,40 @@ describe("Batch", () => {
         expect(error._tag).toBe("ValidationError")
         expect(String((error as ValidationError).cause)).toContain("UpdateRequest")
         expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // -----------------------------------------------------------------------
+    // #120 — the generatedId gate reads the INPUT, not the configuration.
+    // -----------------------------------------------------------------------
+    //
+    // `Entity.put` reaches `Crypto` only when the field is absent, so a caller
+    // who supplies the id needs nothing `BatchWriteItem` lacks. Gating on the
+    // configuration barred the entity from `Batch.write` outright, citing a
+    // dependency that did not apply to the call being rejected.
+
+    it.effect("rejects a put whose generated id was OMITTED — that needs Crypto", () =>
+      Effect.gen(function* () {
+        const error = yield* Batch.write([GenDocs.put({ title: "T" } as never)]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        const cause = String((error as ValidationError).cause)
+        expect(cause).toContain("omitted generated id")
+        expect(cause).toContain("docId")
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("ALLOWS a put whose generated id the caller supplied", () =>
+      Effect.gen(function* () {
+        mockBatchWriteItem.mockResolvedValueOnce({})
+
+        yield* Batch.write([GenDocs.put({ docId: "d-1", title: "T" })])
+
+        const requests = mockBatchWriteItem.mock.calls[0]![0].RequestItems["test-table"]
+        expect(requests).toHaveLength(1)
+        expect(requests[0].PutRequest.Item.docId.S).toBe("d-1")
+        expect(requests[0].PutRequest.Item.pk.S).toContain("docid_d-1")
       }).pipe(Effect.provide(TestLayer)),
     )
 

@@ -1073,15 +1073,64 @@ describe("Transaction", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("rejects a generatedId entity — id generation needs Crypto", () =>
+    // #120 — the gate is on the INPUT, not the entity configuration.
+    //
+    // `Entity.put` reaches `Crypto` only when the caller omitted the field
+    // (`fillGeneratedId` returns the input untouched when it is present), so a
+    // supplied id needs nothing this path lacks. Gating on the configuration
+    // barred the entity outright and named a dependency that did not apply —
+    // while the workaround the message pointed at (supply the id) was already
+    // in effect.
+    it.effect("rejects a generatedId entity when the id is OMITTED — that needs Crypto", () =>
       Effect.gen(function* () {
         const error = yield* Transaction.transactWrite([GenDocs.put({ title: "t" } as never)]).pipe(
           Effect.flip,
         )
 
         expect(error._tag).toBe("ValidationError")
-        expect(String((error as ValidationError).cause)).toContain("generated id")
+        const cause = String((error as ValidationError).cause)
+        expect(cause).toContain("omitted generated id")
+        // The message names the field and the way out, not a blanket ban.
+        expect(cause).toContain("docId")
         expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("accepts a generatedId entity when the caller SUPPLIES the id", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([GenDocs.put({ docId: "d-1", title: "t" })])
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        expect(items).toHaveLength(1)
+        // Written as given — the id composes into the key exactly as `put` does.
+        expect(items[0].Put.Item.docId.S).toBe("d-1")
+        expect(items[0].Put.Item.pk.S).toContain("docid_d-1")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an empty or null id still counts as omitted", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([
+          GenDocs.put({ docId: null, title: "t" } as never),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("omitted generated id")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("delete on a generatedId entity was never gated and still is not", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([GenDocs.delete({ docId: "d-1" })])
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        expect(items).toHaveLength(1)
+        expect(items[0].Delete.Key.pk.S).toContain("docid_d-1")
       }).pipe(Effect.provide(TestLayer)),
     )
   })
