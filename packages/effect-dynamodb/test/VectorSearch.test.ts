@@ -1439,6 +1439,45 @@ describe("vector search lifecycle integration", () => {
     }).pipe(Effect.provide(makeLifecycleLayer(capture)))
   })
 
+  it.effect("the restore snapshot carries neither the vector attributes nor the stash", () => {
+    const capture: Capture = {}
+    const tombstone: Record<string, AttributeValue> = {
+      ...lifecycleStoredItem,
+      sk: { S: "$app#v1#lcproduct#deleted#2026-01-01t00:00:00.000z" },
+      deletedAt: { S: "2026-01-01T00:00:00.000Z" },
+      __edd_vs_vec1__: { L: [{ N: "0" }, { N: "0" }, { N: "1" }, { N: "0" }] },
+    }
+    delete tombstone[VECTOR_ATTR]
+    delete tombstone[PARTITION_ATTR]
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { LifecycleProducts },
+        tables: { LifecycleTable },
+      })
+      yield* db.entities.LifecycleProducts.restore({ tenantId: "t-1", productId: "p-1" })
+      // Puts are [restored item, snapshot] — the snapshot is built from the
+      // TOMBSTONE, which is the one place the stash lives, so it is the only
+      // snapshot that could ever inherit an embedding blob.
+      const snapshot = transactPuts(capture)[1]!
+      expect(snapshot.sk).toEqual({ S: "$app#v1#lcproduct#v#0000003" })
+      expect(snapshot.__edd_vs_vec1__).toBeUndefined()
+      expect(snapshot[VECTOR_ATTR]).toBeUndefined()
+      expect(snapshot[PARTITION_ATTR]).toBeUndefined()
+      expect(snapshot.deletedAt).toBeUndefined()
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          mockDynamoClientLayer({
+            ...makeMockClient(capture),
+            getItem: () => Effect.succeed({ Item: undefined }),
+            query: () => Effect.succeed({ Items: [tombstone] }),
+          } as unknown as DynamoClientService),
+          LifecycleTable.layer({ name: "test-table" }),
+        ),
+      ),
+    )
+  })
+
   it.effect("restore un-stashes the embedding without calling the Embedder", () => {
     const capture: Capture = {}
     const tombstone: Record<string, AttributeValue> = {

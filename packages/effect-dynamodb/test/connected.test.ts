@@ -11583,3 +11583,437 @@ describeConnected("client-side predicates (closes #122)", () => {
     }).pipe(provideCp),
   )
 })
+
+// ---------------------------------------------------------------------------
+// Renamed attributes across the lifecycle (#127)
+// ---------------------------------------------------------------------------
+//
+// A stored row is keyed by ATTRIBUTE name; key composition and unique-sentinel
+// composition read DOMAIN names. Every operation that reads a row back and then
+// composes from it has to bridge that gap, and the soft-delete namespace did
+// not: `deleted.get` / `deleted.list` decoded an attribute-keyed row against a
+// domain-keyed schema, `restore` composed keys from it, and four sentinel sites
+// read a renamed constraint field off it — getting `undefined`, which the sparse
+// rule reads as "constraint unset". No existing fixture paired a rename with
+// either feature, which is exactly why this shipped.
+
+const rnSchema = DynamoSchema.make({ name: "renamed", version: 1 })
+const rnTableName = `renamed-test-${Date.now()}`
+
+class RnWidget extends Schema.Class<RnWidget>("RnWidget")({
+  id: Schema.String,
+  name: Schema.String,
+  channel: Schema.String,
+}) {}
+
+/** The identifier itself is stored as `widgetId` — issue #127 as reported. */
+const RnWidgets = Entity.make({
+  model: DynamoModel.configure(RnWidget, { id: { field: "widgetId", identifier: true } }),
+  entityType: "RnWidget",
+  softDelete: true,
+  versioned: true,
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byChannel: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["channel"] },
+      sk: { field: "gsi1sk", composite: ["id"] },
+    },
+  },
+})
+
+/** The UNIQUE constraint field is stored as `widgetName`, with soft delete. */
+const RnUniques = Entity.make({
+  model: DynamoModel.configure(RnWidget, { name: { field: "widgetName" } }),
+  entityType: "RnUnique",
+  softDelete: true,
+  unique: { name: ["name"] },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+/** Same, hard delete — the sentinel release runs on a different code path. */
+const RnHards = Entity.make({
+  model: DynamoModel.configure(RnWidget, { name: { field: "widgetName" } }),
+  entityType: "RnHard",
+  unique: { name: ["name"] },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const RnTable = Table.make({
+  schema: rnSchema,
+  entities: { RnWidgets, RnUniques, RnHards },
+})
+const provideRn = Effect.provide(Layer.mergeAll(ClientLayer, RnTable.layer({ name: rnTableName })))
+
+describeConnected("renamed attributes across the lifecycle (closes #127)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { RnWidgets, RnUniques, RnHards },
+          tables: { RnTable },
+        })
+        yield* db.tables.RnTable.create()
+      }).pipe(provideRn, Effect.scoped),
+    )
+  }, 60000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: rnTableName })
+      }).pipe(
+        provideRn,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("a renamed identifier round-trips soft delete → deleted.get/list → restore", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { RnWidgets, RnUniques, RnHards },
+        tables: { RnTable },
+      })
+
+      yield* db.entities.RnWidgets.create({ id: "w1", name: "Widget One", channel: "news" })
+      yield* db.entities.RnWidgets.delete({ id: "w1" })
+
+      // All three used to fail: two as ValidationError("Missing key"), restore
+      // as a DEFECT out of `KeyComposer.extractComposites`.
+      const tombstone = yield* db.entities.RnWidgets.deleted.get({ id: "w1" })
+      expect(tombstone.id).toBe("w1")
+      expect(tombstone.name).toBe("Widget One")
+
+      const tombstones = yield* db.entities.RnWidgets.deleted.list({ id: "w1" }).collect()
+      expect(tombstones.map((t) => t.id)).toEqual(["w1"])
+
+      const restored = yield* db.entities.RnWidgets.restore({ id: "w1" })
+      expect(restored.id).toBe("w1")
+
+      // Restored by its primary key AND back in the GSI — the keys were
+      // recomposed from the renamed row, not just copied off the tombstone.
+      const fetched = yield* db.entities.RnWidgets.get({ id: "w1" })
+      expect(fetched.name).toBe("Widget One")
+      const byChannel = yield* db.entities.RnWidgets.byChannel({ channel: "news" }).collect()
+      expect(byChannel.map((w) => w.id)).toEqual(["w1"])
+
+      // The tombstone is gone, and the row is stored under `widgetId`.
+      const gone = yield* db.entities.RnWidgets.deleted.get({ id: "w1" }).pipe(Effect.flip)
+      expect(gone._tag).toBe("ItemNotFound")
+      const client = yield* DynamoClient
+      const raw = yield* client.getItem({
+        TableName: rnTableName,
+        Key: {
+          pk: { S: "$renamed#v1#rnwidget#id_w1" },
+          sk: { S: "$renamed#v1#rnwidget" },
+        },
+      })
+      const stored = fromAttributeMap(raw.Item!)
+      expect(stored.widgetId).toBe("w1")
+      expect(stored.id).toBeUndefined()
+    }).pipe(provideRn),
+  )
+
+  it.effect("soft delete releases the sentinel of a renamed unique field", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { RnWidgets, RnUniques, RnHards },
+        tables: { RnTable },
+      })
+
+      yield* db.entities.RnUniques.create({ id: "u1", name: "Alpha", channel: "news" })
+      yield* db.entities.RnUniques.delete({ id: "u1" })
+
+      // The sentinel was orphaned, so the value could never be used again.
+      const reused = yield* db.entities.RnUniques.create({
+        id: "u2",
+        name: "Alpha",
+        channel: "news",
+      })
+      expect(reused.id).toBe("u2")
+    }).pipe(provideRn),
+  )
+
+  it.effect("hard delete releases the sentinel of a renamed unique field", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { RnWidgets, RnUniques, RnHards },
+        tables: { RnTable },
+      })
+
+      yield* db.entities.RnHards.create({ id: "h1", name: "Beta", channel: "news" })
+      yield* db.entities.RnHards.delete({ id: "h1" })
+
+      const reused = yield* db.entities.RnHards.create({
+        id: "h2",
+        name: "Beta",
+        channel: "news",
+      })
+      expect(reused.id).toBe("h2")
+    }).pipe(provideRn),
+  )
+
+  it.effect("restore re-establishes the sentinel of a renamed unique field", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { RnWidgets, RnUniques, RnHards },
+        tables: { RnTable },
+      })
+
+      yield* db.entities.RnUniques.create({ id: "r1", name: "Gamma", channel: "news" })
+      yield* db.entities.RnUniques.delete({ id: "r1" })
+      yield* db.entities.RnUniques.restore({ id: "r1" })
+
+      // Restoring without a sentinel silently reopened the value to everybody.
+      const err = yield* db.entities.RnUniques.create({
+        id: "r2",
+        name: "Gamma",
+        channel: "news",
+      })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(err._tag).toBe("UniqueConstraintViolation")
+    }).pipe(provideRn),
+  )
+
+  it.effect("restore refuses when the renamed unique value was taken meanwhile", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { RnWidgets, RnUniques, RnHards },
+        tables: { RnTable },
+      })
+
+      // The sharp version of the pair above: the release and the
+      // re-establishment are both observable, and neither can be faked by an
+      // orphan left behind by the delete.
+      yield* db.entities.RnUniques.create({ id: "z1", name: "Zeta", channel: "news" })
+      yield* db.entities.RnUniques.delete({ id: "z1" })
+      yield* db.entities.RnUniques.create({ id: "z2", name: "Zeta", channel: "news" })
+
+      const err = yield* db.entities.RnUniques.restore({ id: "z1" }).pipe(Effect.flip)
+      expect(err._tag).toBe("UniqueConstraintViolation")
+    }).pipe(provideRn),
+  )
+
+  it.effect("purge cleans the sentinel of a renamed unique field", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { RnWidgets, RnUniques, RnHards },
+        tables: { RnTable },
+      })
+
+      yield* db.entities.RnHards.create({ id: "p1", name: "Delta", channel: "news" })
+      yield* db.entities.RnHards.purge({ id: "p1" })
+
+      const reused = yield* db.entities.RnHards.create({
+        id: "p2",
+        name: "Delta",
+        channel: "news",
+      })
+      expect(reused.id).toBe("p2")
+    }).pipe(provideRn),
+  )
+
+  it.effect("a transact put still emits the sentinel of a renamed unique field", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { RnWidgets, RnUniques, RnHards },
+        tables: { RnTable },
+      })
+
+      yield* Transaction.transactWrite([
+        db.entities.RnHards.put({ id: "t1", name: "Epsilon", channel: "news" }),
+      ])
+
+      // Without the sentinel the constraint simply stopped being enforced for
+      // anything written through `transactWrite`.
+      const err = yield* db.entities.RnHards.create({
+        id: "t2",
+        name: "Epsilon",
+        channel: "news",
+      })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(err._tag).toBe("UniqueConstraintViolation")
+    }).pipe(provideRn),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// preserveUnique restore + restore-time snapshots
+// ---------------------------------------------------------------------------
+//
+// Two bugs on the restore path, both independent of any field rename, both
+// found while fixing #127:
+//
+//   1. `softDelete: { preserveUnique: true }` KEEPS the reservation across the
+//      delete, so the restore-time sentinel Put's `attribute_not_exists` guard
+//      could never hold — every restore of a constrained entity was cancelled
+//      and reported as a violation against its own reservation.
+//   2. The restore-time retain snapshot was built from the tombstone, so it
+//      inherited `deletedAt` and the soft-delete TTL — and it lands on the same
+//      `#v#<version>` SK the delete-time snapshot used, replacing a clean
+//      snapshot with one that looks deleted and expires.
+
+const puSchema = DynamoSchema.make({ name: "purestore", version: 1 })
+const puTableName = `purestore-test-${Date.now()}`
+
+class PuItem extends Schema.Class<PuItem>("PuItem")({
+  id: Schema.String,
+  name: Schema.String,
+}) {}
+
+const PuUniques = Entity.make({
+  model: PuItem,
+  entityType: "PuUnique",
+  softDelete: { preserveUnique: true },
+  unique: { name: ["name"] },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const PuSnaps = Entity.make({
+  model: PuItem,
+  entityType: "PuSnap",
+  versioned: { retain: true },
+  softDelete: { ttl: Duration.hours(1) },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const PuTable = Table.make({ schema: puSchema, entities: { PuUniques, PuSnaps } })
+const providePu = Effect.provide(Layer.mergeAll(ClientLayer, PuTable.layer({ name: puTableName })))
+
+describeConnected("preserveUnique restore + restore-time snapshots", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { PuUniques, PuSnaps },
+          tables: { PuTable },
+        })
+        yield* db.tables.PuTable.create()
+      }).pipe(providePu, Effect.scoped),
+    )
+  }, 60000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: puTableName })
+      }).pipe(
+        providePu,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("preserveUnique: a soft-deleted row can be restored and keeps its reservation", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { PuUniques, PuSnaps },
+        tables: { PuTable },
+      })
+
+      yield* db.entities.PuUniques.create({ id: "a1", name: "Alpha" })
+      yield* db.entities.PuUniques.delete({ id: "a1" })
+
+      // The reservation survives the delete — that IS `preserveUnique`.
+      const taken = yield* db.entities.PuUniques.create({ id: "a2", name: "Alpha" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(taken._tag).toBe("UniqueConstraintViolation")
+
+      // And restore re-claims it rather than colliding with it. This used to
+      // fail as a UniqueConstraintViolation against the row's own sentinel,
+      // which made `preserveUnique` and `restore` mutually exclusive.
+      const restored = yield* db.entities.PuUniques.restore({ id: "a1" })
+      expect(restored.name).toBe("Alpha")
+      const fetched = yield* db.entities.PuUniques.get({ id: "a1" })
+      expect(fetched.name).toBe("Alpha")
+
+      // Still enforced afterwards.
+      const stillTaken = yield* db.entities.PuUniques.create({ id: "a3", name: "Alpha" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(stillTaken._tag).toBe("UniqueConstraintViolation")
+    }).pipe(providePu),
+  )
+
+  it.effect("preserveUnique: restore is refused when the reservation belongs to someone else", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { PuUniques, PuSnaps },
+        tables: { PuTable },
+      })
+      const client = yield* DynamoClient
+
+      yield* db.entities.PuUniques.create({ id: "b1", name: "Beta" })
+      yield* db.entities.PuUniques.delete({ id: "b1" })
+
+      // Hand the reservation to another item, exactly as a competing write
+      // would leave it. The relaxed guard must key off the back-pointer, not
+      // merely off the sentinel's existence.
+      const sentinelKey = DynamoSchema.composeUniqueKey(puSchema, "PuUnique", "name", ["Beta"])
+      yield* client.putItem({
+        TableName: puTableName,
+        Item: {
+          pk: { S: sentinelKey.pk },
+          sk: { S: sentinelKey.sk },
+          __edd_e__: { S: "PuUnique._unique.name" },
+          _entity_pk: { S: "$purestore#v1#puunique#id_someone-else" },
+          _entity_sk: { S: "$purestore#v1#puunique" },
+        },
+      })
+
+      const err = yield* db.entities.PuUniques.restore({ id: "b1" }).pipe(Effect.flip)
+      expect(err._tag).toBe("UniqueConstraintViolation")
+    }).pipe(providePu),
+  )
+
+  it.effect("the restore-time snapshot carries neither deletedAt nor the soft-delete TTL", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { PuUniques, PuSnaps },
+        tables: { PuTable },
+      })
+      const client = yield* DynamoClient
+
+      yield* db.entities.PuSnaps.create({ id: "s1", name: "Snap" })
+      yield* db.entities.PuSnaps.delete({ id: "s1" })
+      yield* db.entities.PuSnaps.restore({ id: "s1" })
+
+      const scanned = yield* client.scan({ TableName: puTableName })
+      const snapshots = (scanned.Items ?? [])
+        .map((item) => fromAttributeMap(item))
+        .filter((row) => typeof row.sk === "string" && row.sk.includes("#v#"))
+
+      expect(snapshots).toHaveLength(1)
+      const snapshot = snapshots[0]!
+      expect(snapshot.sk).toBe("$purestore#v1#pusnap#v#0000001")
+      expect(snapshot.name).toBe("Snap")
+      // Both used to ride along from the tombstone, and this row REPLACED the
+      // clean snapshot the delete wrote at the same SK.
+      expect(snapshot.deletedAt).toBeUndefined()
+      expect(snapshot._ttl).toBeUndefined()
+    }).pipe(providePu),
+  )
+})

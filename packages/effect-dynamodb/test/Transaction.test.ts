@@ -134,6 +134,25 @@ const SparseMembers = Entity.make({
   unique: { email: ["email"] },
 })
 
+/**
+ * #127 — a unique constraint names DOMAIN fields, but the item this path hands
+ * to `Entity._buildPutSideItems` has already been renamed to stored attribute
+ * names. Reading the constraint field off it yields `undefined`, and the sparse
+ * rule then emits no sentinel at all: the constraint silently stops being
+ * enforced for anything written through `transactWrite`.
+ */
+class RenamedMember extends Schema.Class<RenamedMember>("RenamedMember")({
+  memberId: Schema.String,
+  email: Schema.String,
+}) {}
+
+const RenamedMembers = Entity.make({
+  model: DynamoModel.configure(RenamedMember, { email: { field: "memberEmail" } }),
+  entityType: "RenamedMember",
+  primaryKey: { pk: { field: "pk", composite: ["memberId"] }, sk: { field: "sk", composite: [] } },
+  unique: { email: ["email"] },
+})
+
 class SoftNote extends Schema.Class<SoftNote>("SoftNote")({
   noteId: Schema.String,
   body: Schema.String,
@@ -156,6 +175,7 @@ const MainTable = Table.make({
     GenDocs,
     LifecycleMembers,
     SparseMembers,
+    RenamedMembers,
     SoftNotes,
   },
 })
@@ -895,6 +915,27 @@ describe("Transaction", () => {
         const snapshot = fromAttributeMap(items[2].Put.Item)
         expect(snapshot.sk).toBe("$myapp#v1#lifecyclemember#v#0000001")
         expect(items[2].Put.ConditionExpression).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a put whose unique field is RENAMED still emits its sentinel (#127)", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([
+          RenamedMembers.put({ memberId: "m-3", email: "renamed@x.io" }),
+        ])
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        // Item + sentinel. Reading `email` off the already-renamed item read
+        // `undefined` and dropped the sentinel entirely.
+        expect(items).toHaveLength(2)
+        const main = fromAttributeMap(items[0].Put.Item)
+        expect(main.memberEmail).toBe("renamed@x.io")
+        const sentinel = fromAttributeMap(items[1].Put.Item)
+        expect(sentinel.__edd_e__).toBe("RenamedMember._unique.email")
+        expect(sentinel.pk).toBe("$myapp#v1#renamedmember.email#renamed@x.io")
+        expect(sentinel._entity_pk).toBe(main.pk)
       }).pipe(Effect.provide(TestLayer)),
     )
 

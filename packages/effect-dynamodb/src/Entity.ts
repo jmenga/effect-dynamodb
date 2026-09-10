@@ -239,9 +239,11 @@ export type { IndexDefinition, KeyPart }
  * records can coexist with the field unset and an entity write doesn't synthesize
  * a literal `"undefined"` collision key.
  *
- * `lookup` overrides the field-value reader. The update path passes a lookup that
- * falls back from the domain field name to the renamed DB column name, since
- * `currentRaw` (read from DynamoDB) carries DB names rather than domain names.
+ * `source` is read by **domain** field name — a constraint declares domain
+ * fields, so a row that came off the wire (keyed by stored attribute name) MUST
+ * be passed through `toDomainView` first. Reading a renamed field off a raw row
+ * yields `undefined`, which the sparse rule then reads as "constraint unset" and
+ * silently skips the sentinel — the delete/purge/restore leak behind #127.
  */
 /**
  * TTL helpers — pure implementations live in `@effect-dynamodb/schema/Entity`,
@@ -266,7 +268,6 @@ const composeUniqueSentinel = (
   constraintName: string,
   constraintDef: UniqueConstraintDef,
   source: globalThis.Record<string, unknown>,
-  lookup?: (source: globalThis.Record<string, unknown>, field: string) => unknown,
 ):
   | {
       readonly key: { readonly pk: string; readonly sk: string }
@@ -274,11 +275,10 @@ const composeUniqueSentinel = (
     }
   | undefined => {
   const fields = resolveUniqueFields(constraintDef)
-  const get = lookup ?? ((s, f) => s[f])
   const serialized: Array<string> = []
   const fieldsRecord: globalThis.Record<string, string> = {}
   for (const f of fields) {
-    const raw = get(source, f)
+    const raw = source[f]
     if (raw === undefined || raw === null) return undefined
     const s = KeyComposer.serializeValue(raw)
     serialized.push(s)
@@ -1724,6 +1724,30 @@ const makeImpl = <
     decodeSparseFields(raw, sparseFields)
   }
 
+  /**
+   * A DOMAIN-keyed VIEW of a row that came off the wire.
+   *
+   * Stored rows are keyed by ATTRIBUTE name, but everything that reads a row by
+   * field name — key composition (`composeAllKeys`, `keyForm`), vector-partition
+   * recomposition, unique-sentinel composition — is written against DOMAIN
+   * names. Under a `DynamoModel.configure(model, { id: { field: "widgetId" } })`
+   * rename the two differ, and reading the wrong one yields `undefined`: key
+   * composition throws (`Missing composite attribute "id" in record`) and
+   * sentinel composition silently treats the constraint as unset (#127).
+   *
+   * Returns a shallow COPY — the caller's row stays attribute-keyed, so the item
+   * actually written back (tombstone, restored item, snapshot) is unaffected and
+   * `decodeAs` can still do its own in-place rename on it. Callers that decode
+   * the row and discard it rename in place instead (see `decodeRecord`).
+   */
+  const toDomainView = (
+    raw: globalThis.Record<string, unknown>,
+  ): globalThis.Record<string, unknown> => {
+    const view = { ...raw }
+    renameFromDynamo(view)
+    return view
+  }
+
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
@@ -1986,6 +2010,51 @@ const makeImpl = <
     ConditionExpression: "attribute_not_exists(#sentinel_pk)",
     ExpressionAttributeNames: { "#sentinel_pk": config.indexes.primary.pk.field },
   })
+
+  /**
+   * The RESTORE-time sentinel guard.
+   *
+   * `restore` re-establishes one sentinel per satisfiable constraint. With
+   * `preserveUnique` off the delete released them, so `attribute_not_exists` is
+   * exactly right: the row is gone and anyone may have taken the value since.
+   *
+   * With `softDelete: { preserveUnique: true }` the delete deliberately KEPT the
+   * reservation, so `attribute_not_exists` can never hold and every restore of a
+   * constrained entity was cancelled and reported as a `UniqueConstraintViolation`
+   * against its own reservation — `preserveUnique` made `restore` impossible.
+   * The guard must instead let the row re-claim the sentinel it still owns while
+   * still refusing one somebody else holds, which is what the stored
+   * `_entity_pk`/`_entity_sk` back-pointer is for: they name the item the
+   * reservation belongs to, and they are the same values this Put writes.
+   */
+  const restoreSentinelGuard = (
+    entityPk: unknown,
+    entitySk: unknown,
+  ): {
+    readonly ConditionExpression: string
+    readonly ExpressionAttributeNames: globalThis.Record<string, string>
+    readonly ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
+  } => {
+    const pkField = config.indexes.primary.pk.field
+    if (!preserveUnique()) {
+      return {
+        ConditionExpression: "attribute_not_exists(#pk)",
+        ExpressionAttributeNames: { "#pk": pkField },
+      }
+    }
+    return {
+      ConditionExpression: "attribute_not_exists(#pk) OR (#epk = :epk AND #esk = :esk)",
+      ExpressionAttributeNames: {
+        "#pk": pkField,
+        "#epk": "_entity_pk",
+        "#esk": "_entity_sk",
+      },
+      ExpressionAttributeValues: {
+        ":epk": toAttributeValue(entityPk),
+        ":esk": toAttributeValue(entitySk),
+      },
+    }
+  }
 
   /** Collect all key field names (pk, sk, gsi*pk, gsi*sk) */
   const gsiKeyFields = (): ReadonlyArray<string> => {
@@ -2351,6 +2420,15 @@ const makeImpl = <
     for (const field of vectorKeyFields()) {
       delete snapshot[field]
     }
+    // And the soft-delete STASH. It is not an indexed attribute, so nothing
+    // above touches it, but `restore` builds its snapshot from the tombstone —
+    // which is exactly where the stash lives — so without this the `#v#N` row
+    // ends up carrying the full embedding blob that the delete-time snapshot at
+    // the same SK never had. A snapshot never re-enters the index, so it has no
+    // use for a stashed embedding either.
+    for (const [, definition] of vectorIndexEntries) {
+      delete snapshot[definition.stashField]
+    }
 
     // Replace SK with version SK
     snapshot[tableSkField] = DynamoSchema.composeVersionKey(schema, entityType, version)
@@ -2388,6 +2466,12 @@ const makeImpl = <
    * Mirrors the emission in `put`'s own transact path so the two cannot drift:
    * one sentinel per satisfiable constraint (sparse — a constraint whose fields
    * are unset produces none), then the v1 snapshot.
+   *
+   * `item` arrives ALREADY renamed to stored attribute names (`_renameToDynamo`
+   * runs inside `validateAndBuildPutItem`, so the snapshot inherits the shape
+   * that was written), hence the `toDomainView` for sentinel composition — the
+   * constraint names domain fields. `put`'s own path composes from `encoded`,
+   * which is domain-keyed before the rename.
    */
   const buildPutSideItems = (
     item: globalThis.Record<string, unknown>,
@@ -2420,6 +2504,7 @@ const makeImpl = <
 
     const pkField = config.indexes.primary.pk.field
     const skField = config.indexes.primary.sk.field
+    const itemDomain = toDomainView(item)
 
     if (config.unique != null) {
       for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
@@ -2428,7 +2513,7 @@ const makeImpl = <
           entityType,
           constraintName,
           constraintDef,
-          item,
+          itemDomain,
         )
         // Sparse: a constraint whose composing fields are unset never had a
         // sentinel, so writing one would reserve `undefined` for everybody.
@@ -3432,8 +3517,8 @@ const makeImpl = <
             }
 
             // Compute sentinel rotation values while newItem is in domain names.
-            // currentRaw uses DynamoDB names, so resolve via resolveDbName for
-            // fields that may have been renamed (e.g. id → teamId).
+            // currentRaw uses DynamoDB names, so read it through `toDomainView`
+            // for fields that may have been renamed (e.g. id → teamId).
             // Sparse-aware rotation: each constraint may transition through one of four
             // states between old and new — both-missing (no-op), missing→present (Put only),
             // present→missing (Delete only), present→present (Delete + Put if changed).
@@ -3445,15 +3530,16 @@ const makeImpl = <
             }
             const sentinelRotations: Array<SentinelRotation> = []
             if (touchesUniqueFields) {
-              const currentRawRecord = currentRaw as globalThis.Record<string, unknown>
+              const currentRawDomain = toDomainView(
+                currentRaw as globalThis.Record<string, unknown>,
+              )
               for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
                 const oldSentinel = composeUniqueSentinel(
                   schema,
                   entityType,
                   constraintName,
                   constraintDef,
-                  currentRawRecord,
-                  (s, f) => s[f] ?? s[resolveDbName(f)],
+                  currentRawDomain,
                 )
                 const newSentinel = composeUniqueSentinel(
                   schema,
@@ -4387,14 +4473,18 @@ const makeImpl = <
 
             // Delete sentinels if not preserving unique. Sparse — fields that were
             // unset on the live item never had a sentinel, so nothing to delete.
+            // The stored row is attribute-keyed; the constraint names domain
+            // fields, so compose from the domain view — otherwise a renamed
+            // field reads `undefined` and the sentinel is orphaned (#127).
             if (hasUniqueConstraints && !preserveUnique()) {
+              const rawDomain = toDomainView(raw)
               for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
                 const sentinel = composeUniqueSentinel(
                   schema,
                   entityType,
                   constraintName,
                   constraintDef,
-                  raw,
+                  rawDomain,
                 )
                 if (!sentinel) continue
                 transactItems.push({
@@ -4456,14 +4546,16 @@ const makeImpl = <
             transactItems.push({ Delete: entityDelete })
 
             // Delete sentinels (sparse — skip constraints whose fields were unset
-            // on the live item; no sentinel was ever written for those)
+            // on the live item; no sentinel was ever written for those). Domain
+            // view: the stored row is attribute-keyed, the constraint is not (#127).
+            const rawDomain = toDomainView(raw)
             for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
               const sentinel = composeUniqueSentinel(
                 schema,
                 entityType,
                 constraintName,
                 constraintDef,
-                raw,
+                rawDomain,
               )
               if (!sentinel) continue
               transactItems.push({
@@ -5486,6 +5578,11 @@ const makeImpl = <
           // verbatim across soft-delete (GSI keys are stripped, sparse data is
           // not).
           deserializeSparseFields(raw)
+          // `deletedRecordSchema` is keyed by DOMAIN field name, exactly like
+          // `recordSchema` — so the same rename `decodeRecord` does applies here
+          // (#127). Without it a `field:`-renamed attribute decodes as a missing
+          // key and every soft-deleted row of such an entity is unreadable.
+          renameFromDynamo(raw)
           const targetSchema = schemas.deletedRecordSchema
           return yield* Schema.decodeUnknownEffect(targetSchema as Schema.Codec<any>)(raw).pipe(
             Effect.map(attachPrototype),
@@ -5513,6 +5610,8 @@ const makeImpl = <
       // Sparse fields are domain data and are preserved across soft-delete.
       // Rebuild Records from flattened attrs before schema decode.
       deserializeSparseFields(raw)
+      // Then attribute → domain names, same order as `decodeRecord` (#127).
+      renameFromDynamo(raw)
       return Schema.decodeUnknownEffect(schemas.deletedRecordSchema as Schema.Codec<any>)(raw).pipe(
         Effect.map(attachPrototype),
         Effect.mapError(
@@ -5610,8 +5709,15 @@ const makeImpl = <
               now,
             )
 
+          // Domain-keyed VIEW of the tombstone, taken once and used for every
+          // read-by-field-name below: key composition, vector-partition
+          // recomposition and unique-sentinel composition. `restoredItem` itself
+          // stays attribute-keyed — it is the row being written back, and
+          // `decodeAs` renames it in place at the end (#127).
+          const restoredDomain = toDomainView(restoredItem)
+
           // Recompose all keys (original SK, GSI keys)
-          const restoredKeys = composeAllKeys(restoredItem)
+          const restoredKeys = composeAllKeys(restoredDomain)
           Object.assign(restoredItem, restoredKeys)
 
           // Un-stash the embedding and recompose the vector partition value —
@@ -5627,7 +5733,7 @@ const makeImpl = <
               schema,
               entityType,
               definition,
-              keyForm(restoredItem),
+              keyForm(restoredDomain),
             )
             if (partition !== undefined) restoredItem[definition.partitionField] = partition
           }
@@ -5641,6 +5747,7 @@ const makeImpl = <
               Item: globalThis.Record<string, AttributeValue>
               ConditionExpression?: string
               ExpressionAttributeNames?: globalThis.Record<string, string>
+              ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
             }
             Delete?: { TableName: string; Key: globalThis.Record<string, AttributeValue> }
           }
@@ -5659,10 +5766,21 @@ const makeImpl = <
             },
           })
 
-          // Version snapshot if retain enabled
+          // Version snapshot if retain enabled. The source is the TOMBSTONE, so
+          // the soft-delete markers have to come off first: `buildSnapshotItem`
+          // only ever overrides the TTL attribute when `versioned.ttl` is set, so
+          // a `softDelete: { ttl }` expiry rode along and the snapshot of a
+          // version that is very much still live expired an hour later — while
+          // `deletedAt` made it look like a tombstone. This Put lands on the same
+          // `#v#<version>` SK the delete-time snapshot used (same version — the
+          // restored item is version + 1), so a dirty item here REPLACED the
+          // clean snapshot the delete wrote.
           if (isRetainEnabled()) {
+            const snapshotSource = { ...(deletedRaw as globalThis.Record<string, unknown>) }
+            delete snapshotSource.deletedAt
+            delete snapshotSource[ttlAttrName]
             const snapshotItem = buildSnapshotItem(
-              deletedRaw as globalThis.Record<string, unknown>,
+              snapshotSource,
               currentVersion,
               primary.pk.field,
               primary.sk.field,
@@ -5687,10 +5805,14 @@ const makeImpl = <
                 entityType,
                 constraintName,
                 constraintDef,
-                restoredItem,
+                restoredDomain,
               )
               if (!sentinel) continue
               sentinelConstraints.push(constraintName)
+              const guard = restoreSentinelGuard(
+                restoredKeys[primary.pk.field],
+                restoredKeys[primary.sk.field],
+              )
               transactItems.push({
                 Put: {
                   TableName: tableName,
@@ -5701,8 +5823,11 @@ const makeImpl = <
                     _entity_pk: restoredKeys[primary.pk.field],
                     _entity_sk: restoredKeys[primary.sk.field],
                   }),
-                  ConditionExpression: "attribute_not_exists(#pk)",
-                  ExpressionAttributeNames: { "#pk": primary.pk.field },
+                  ConditionExpression: guard.ConditionExpression,
+                  ExpressionAttributeNames: guard.ExpressionAttributeNames,
+                  ...(guard.ExpressionAttributeValues
+                    ? { ExpressionAttributeValues: guard.ExpressionAttributeValues }
+                    : {}),
                 },
               })
             }
@@ -5728,7 +5853,7 @@ const makeImpl = <
                         const uniqueFields = constraintDef ? resolveUniqueFields(constraintDef) : []
                         const fieldsRecord: globalThis.Record<string, string> = {}
                         for (const f of uniqueFields) {
-                          const v = restoredItem[f]
+                          const v = restoredDomain[f]
                           if (v !== undefined && v !== null) {
                             fieldsRecord[f] = KeyComposer.serializeValue(v)
                           }
@@ -5857,14 +5982,16 @@ const makeImpl = <
 
             if (entityItem) {
               // Add sentinel keys to delete list (sparse — fields that were unset
-              // never had a sentinel written, so nothing to enqueue)
+              // never had a sentinel written, so nothing to enqueue). The stored
+              // row is attribute-keyed, the constraint is not (#127).
+              const entityItemDomain = toDomainView(entityItem)
               for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
                 const sentinel = composeUniqueSentinel(
                   schema,
                   entityType,
                   constraintName,
                   constraintDef,
-                  entityItem,
+                  entityItemDomain,
                 )
                 if (!sentinel) continue
                 allItems.push(
