@@ -5085,6 +5085,279 @@ describe("Entity", () => {
   })
 
   // ---------------------------------------------------------------------------
+  // Renamed attributes on the soft-delete / restore / sentinel paths (#127)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Rows come off the wire keyed by STORED attribute name; key composition and
+   * unique-sentinel composition read DOMAIN field names. Every fixture below
+   * pairs a `field:` rename with a lifecycle feature that reads a stored row
+   * back — the combination the rest of the suite never exercised, which is why
+   * #127 shipped: soft-delete reads and `restore` skipped `renameFromDynamo`
+   * entirely, and four sentinel call sites read a renamed constraint field off
+   * an attribute-keyed row (getting `undefined`, so the sparse rule silently
+   * skipped the sentinel and orphaned it).
+   */
+  describe("renamed attributes — soft delete, restore, sentinels (#127)", () => {
+    const mockBatchWriteItem = vi.fn()
+
+    const RenamedTestDynamoClient = mockDynamoClientLayer({
+      getItem: (input) =>
+        Effect.tryPromise({
+          try: () => mockGetItem(input),
+          catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
+        }),
+      query: (input) =>
+        Effect.tryPromise({
+          try: () => mockQuery(input),
+          catch: (e) => new DynamoError({ operation: "Query", cause: e }),
+        }),
+      transactWriteItems: (input) =>
+        Effect.tryPromise({
+          try: () => mockTransactWriteItems(input),
+          catch: (e) => new DynamoError({ operation: "TransactWriteItems", cause: e }),
+        }),
+      batchWriteItem: (input) =>
+        Effect.tryPromise({
+          try: () => mockBatchWriteItem(input),
+          catch: (e) => new DynamoError({ operation: "BatchWriteItem", cause: e }),
+        }),
+    })
+
+    const RenamedTestLayer = Layer.merge(RenamedTestDynamoClient, TestTableConfig)
+
+    beforeEach(() => {
+      mockBatchWriteItem.mockReset()
+    })
+
+    class RenamedWidget extends Schema.Class<RenamedWidget>("RenamedWidget")({
+      id: Schema.String,
+      name: Schema.String,
+      channel: Schema.String,
+    }) {}
+
+    // --- Case A: the identifier itself is stored under another name ----------
+    const RenamedIdSoft = withConfig(
+      Entity.make({
+        model: DynamoModel.configure(RenamedWidget, {
+          id: { field: "widgetId", identifier: true },
+        }),
+        entityType: "RenamedIdSoft",
+        softDelete: true,
+        versioned: true,
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          byChannel: {
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["channel"] },
+            sk: { field: "gsi1sk", composite: ["id"] },
+          },
+        },
+      }),
+    )
+
+    /** A tombstone as it is actually stored: `widgetId`, no GSI keys, deleted SK. */
+    const renamedIdTombstone = () =>
+      toAttributeMap({
+        widgetId: "w-1",
+        name: "Widget One",
+        channel: "news",
+        version: 1,
+        deletedAt: "2026-02-01T10:00:00Z",
+        pk: "$myapp#v1#renamedidsoft#id_w-1",
+        sk: "$myapp#v1#renamedidsoft#deleted#2026-02-01T10:00:00Z",
+        __edd_e__: "RenamedIdSoft",
+      })
+
+    it.effect("deleted.get decodes a tombstone whose identifier is renamed", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: [renamedIdTombstone()] })
+
+        const result = yield* RenamedIdSoft.deleted.get({ id: "w-1" }).pipe(Entity.asRecord)
+
+        expect(result.id).toBe("w-1")
+        expect(result.name).toBe("Widget One")
+        expect((result as any).widgetId).toBeUndefined()
+        expect((result as any).deletedAt).toBe("2026-02-01T10:00:00Z")
+      }).pipe(Effect.provide(RenamedTestLayer)),
+    )
+
+    it.effect("deleted.list decodes tombstones whose identifier is renamed", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: [renamedIdTombstone()] })
+
+        const bound = yield* Entity.bind(RenamedIdSoft)
+        const tombstones = yield* bound.deleted.list({ id: "w-1" }).collect()
+
+        expect(tombstones).toHaveLength(1)
+        expect(tombstones[0]!.id).toBe("w-1")
+        expect((tombstones[0] as any).widgetId).toBeUndefined()
+      }).pipe(Effect.provide(RenamedTestLayer)),
+    )
+
+    it.effect("restore recomposes every key from a renamed row and writes it back renamed", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: [renamedIdTombstone()] })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        const restored = yield* RenamedIdSoft.restore({ id: "w-1" }).pipe(Entity.asRecord)
+        expect(restored.id).toBe("w-1")
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        // Delete tombstone + Put restored item (retain is off, so no snapshot)
+        expect(call.TransactItems).toHaveLength(2)
+        const put = call.TransactItems[1].Put
+
+        // The item written stays ATTRIBUTE-keyed — the domain view is a copy.
+        expect(put.Item.widgetId.S).toBe("w-1")
+        expect(put.Item.id).toBeUndefined()
+
+        // Every key recomposed from the renamed row, primary and GSI alike.
+        expect(put.Item.pk.S).toBe("$myapp#v1#renamedidsoft#id_w-1")
+        expect(put.Item.sk.S).toBe("$myapp#v1#renamedidsoft")
+        expect(put.Item.gsi1pk.S).toBe("$myapp#v1#renamedidsoft#channel_news")
+        expect(put.Item.gsi1sk.S).toBe("$myapp#v1#renamedidsoft#id_w-1")
+
+        // Tombstone markers gone, version bumped.
+        expect(put.Item.deletedAt).toBeUndefined()
+        expect(put.Item.version.N).toBe("2")
+      }).pipe(Effect.provide(RenamedTestLayer)),
+    )
+
+    // --- Case B: the UNIQUE constraint field is stored under another name -----
+    const uniqueModel = DynamoModel.configure(RenamedWidget, { name: { field: "widgetName" } })
+
+    const RenamedUniqSoft = withConfig(
+      Entity.make({
+        model: uniqueModel,
+        entityType: "RenamedUniqSoft",
+        softDelete: true,
+        unique: { name: ["name"] },
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+      }),
+    )
+
+    const RenamedUniqHard = withConfig(
+      Entity.make({
+        model: uniqueModel,
+        entityType: "RenamedUniqHard",
+        unique: { name: ["name"] },
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+      }),
+    )
+
+    /** The live row as stored: the constraint field sits under `widgetName`. */
+    const renamedUniqueRow = (entityType: string) =>
+      toAttributeMap({
+        id: "u-1",
+        widgetName: "Alpha",
+        channel: "news",
+        pk: `$myapp#v1#${entityType.toLowerCase()}#id_u-1`,
+        sk: `$myapp#v1#${entityType.toLowerCase()}`,
+        __edd_e__: entityType,
+      })
+
+    const sentinelKeyFor = (entityType: string) =>
+      DynamoSchema.composeUniqueKey(AppSchema, entityType, "name", ["Alpha"])
+
+    it.effect("soft delete releases the sentinel of a renamed unique field", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({ Item: renamedUniqueRow("RenamedUniqSoft") })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* RenamedUniqSoft.delete({ id: "u-1" }).asEffect()
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        // Delete live row + Put tombstone + Delete sentinel
+        expect(call.TransactItems).toHaveLength(3)
+        const expected = sentinelKeyFor("RenamedUniqSoft")
+        expect(call.TransactItems[2].Delete.Key.pk.S).toBe(expected.pk)
+        expect(call.TransactItems[2].Delete.Key.sk.S).toBe(expected.sk)
+      }).pipe(Effect.provide(RenamedTestLayer)),
+    )
+
+    it.effect("hard delete releases the sentinel of a renamed unique field", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({ Item: renamedUniqueRow("RenamedUniqHard") })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* RenamedUniqHard.delete({ id: "u-1" }).asEffect()
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        // Delete live row + Delete sentinel
+        expect(call.TransactItems).toHaveLength(2)
+        const expected = sentinelKeyFor("RenamedUniqHard")
+        expect(call.TransactItems[1].Delete.Key.pk.S).toBe(expected.pk)
+        expect(call.TransactItems[1].Delete.Key.sk.S).toBe(expected.sk)
+      }).pipe(Effect.provide(RenamedTestLayer)),
+    )
+
+    it.effect("purge enqueues the sentinel of a renamed unique field", () =>
+      Effect.gen(function* () {
+        // Partition scan: just the live row
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              pk: "$myapp#v1#renameduniqhard#id_u-1",
+              sk: "$myapp#v1#renameduniqhard",
+            }),
+          ],
+          LastEvaluatedKey: undefined,
+        })
+        mockGetItem.mockResolvedValueOnce({ Item: renamedUniqueRow("RenamedUniqHard") })
+        mockBatchWriteItem.mockResolvedValueOnce({})
+
+        yield* RenamedUniqHard.purge({ id: "u-1" }).asEffect()
+
+        const call = mockBatchWriteItem.mock.calls[0]![0]
+        const keys = (call.RequestItems["test-table"] as Array<any>).map(
+          (r) => r.DeleteRequest.Key.pk.S,
+        )
+        expect(keys).toContain(sentinelKeyFor("RenamedUniqHard").pk)
+      }).pipe(Effect.provide(RenamedTestLayer)),
+    )
+
+    it.effect("restore re-establishes the sentinel of a renamed unique field", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              id: "u-1",
+              widgetName: "Alpha",
+              channel: "news",
+              deletedAt: "2026-02-01T10:00:00Z",
+              pk: "$myapp#v1#renameduniqsoft#id_u-1",
+              sk: "$myapp#v1#renameduniqsoft#deleted#2026-02-01T10:00:00Z",
+              __edd_e__: "RenamedUniqSoft",
+            }),
+          ],
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* RenamedUniqSoft.restore({ id: "u-1" }).asEffect()
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        const sentinelPuts = (call.TransactItems as Array<any>).filter(
+          (t) => t.Put?.Item?.__edd_e__?.S === "RenamedUniqSoft._unique.name",
+        )
+        expect(sentinelPuts).toHaveLength(1)
+        const expected = sentinelKeyFor("RenamedUniqSoft")
+        expect(sentinelPuts[0].Put.Item.pk.S).toBe(expected.pk)
+        expect(sentinelPuts[0].Put.Item.sk.S).toBe(expected.sk)
+      }).pipe(Effect.provide(RenamedTestLayer)),
+    )
+  })
+
+  // ---------------------------------------------------------------------------
   // Date-aware marshalling (DynamoEncoding integration)
   // ---------------------------------------------------------------------------
 
