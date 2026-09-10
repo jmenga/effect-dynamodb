@@ -4922,6 +4922,189 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    it.effect("restore under preserveUnique re-claims the sentinel it still owns", () =>
+      Effect.gen(function* () {
+        // `preserveUnique` deliberately keeps the reservation across the delete,
+        // so `attribute_not_exists` can never hold and EVERY restore of such an
+        // entity was cancelled and reported as a violation against its own
+        // reservation. The back-pointer is what distinguishes "still mine" from
+        // "someone else took it".
+        const PreserveRestoreEntity = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "PreserveRestore",
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            softDelete: { preserveUnique: true },
+            unique: { email: ["email"] },
+          }),
+        )
+
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              userId: "u-1",
+              email: "alice@test.com",
+              displayName: "Alice",
+              role: "admin",
+              deletedAt: "2024-02-01T10:00:00Z",
+              pk: "$myapp#v1#preserverestore#userid_u-1",
+              sk: "$myapp#v1#preserverestore#deleted#2024-02-01T10:00:00Z",
+              __edd_e__: "PreserveRestore",
+            }),
+          ],
+          LastEvaluatedKey: undefined,
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* PreserveRestoreEntity.restore({ userId: "u-1" }).asEffect()
+
+        const sentinelPut = mockTransactWriteItems.mock.calls[0]![0].TransactItems[2].Put
+        expect(sentinelPut.ConditionExpression).toBe(
+          "attribute_not_exists(#pk) OR (#epk = :epk AND #esk = :esk)",
+        )
+        expect(sentinelPut.ExpressionAttributeNames).toEqual({
+          "#pk": "pk",
+          "#epk": "_entity_pk",
+          "#esk": "_entity_sk",
+        })
+        // The values ARE the back-pointer this same Put writes.
+        expect(sentinelPut.ExpressionAttributeValues[":epk"]).toEqual(sentinelPut.Item._entity_pk)
+        expect(sentinelPut.ExpressionAttributeValues[":esk"]).toEqual(sentinelPut.Item._entity_sk)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("restore keeps the plain absence guard when preserveUnique is off", () =>
+      Effect.gen(function* () {
+        const RestoreUniqEntity = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "PlainRestoreUniq",
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            softDelete: true,
+            unique: { email: ["email"] },
+          }),
+        )
+
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              userId: "u-1",
+              email: "alice@test.com",
+              displayName: "Alice",
+              role: "admin",
+              deletedAt: "2024-02-01T10:00:00Z",
+              pk: "$myapp#v1#plainrestoreuniq#userid_u-1",
+              sk: "$myapp#v1#plainrestoreuniq#deleted#2024-02-01T10:00:00Z",
+              __edd_e__: "PlainRestoreUniq",
+            }),
+          ],
+          LastEvaluatedKey: undefined,
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* RestoreUniqEntity.restore({ userId: "u-1" }).asEffect()
+
+        const sentinelPut = mockTransactWriteItems.mock.calls[0]![0].TransactItems[2].Put
+        // The delete released the sentinel, so absence is exactly the right test
+        // and no back-pointer values are sent.
+        expect(sentinelPut.ConditionExpression).toBe("attribute_not_exists(#pk)")
+        expect(sentinelPut.ExpressionAttributeValues).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("the restore snapshot carries neither deletedAt nor the soft-delete TTL", () =>
+      Effect.gen(function* () {
+        // The snapshot source is the TOMBSTONE, and it lands on the same
+        // `#v#<version>` SK the delete-time snapshot used — so a dirty item here
+        // REPLACED a clean snapshot with one that expires and looks deleted.
+        const SnapshotRestoreEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SnapRestore",
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            versioned: { retain: true },
+            softDelete: { ttl: Duration.hours(1) },
+          }),
+        )
+
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              itemId: "i-1",
+              name: "Test",
+              version: 1,
+              deletedAt: "2024-02-01T10:00:00Z",
+              _ttl: 1_706_800_000,
+              pk: "$myapp#v1#snaprestore#itemid_i-1",
+              sk: "$myapp#v1#snaprestore#deleted#2024-02-01T10:00:00Z",
+              __edd_e__: "SnapRestore",
+            }),
+          ],
+          LastEvaluatedKey: undefined,
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* SnapshotRestoreEntity.restore({ itemId: "i-1" }).asEffect()
+
+        const snapshotPut = mockTransactWriteItems.mock.calls[0]![0].TransactItems[2].Put
+        expect(snapshotPut.Item.sk.S).toBe("$myapp#v1#snaprestore#v#0000001")
+        expect(snapshotPut.Item.deletedAt).toBeUndefined()
+        // No `versioned.ttl` is configured, so the snapshot must not expire at all.
+        expect(snapshotPut.Item._ttl).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("the restore snapshot still gets retain's OWN ttl when configured", () =>
+      Effect.gen(function* () {
+        const RetainTtlEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SnapRetainTtl",
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            versioned: { retain: true, ttl: Duration.days(30) },
+            softDelete: { ttl: Duration.hours(1) },
+          }),
+        )
+
+        yield* TestClock.setTime(FROZEN_MS)
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              itemId: "i-1",
+              name: "Test",
+              version: 1,
+              deletedAt: "2024-02-01T10:00:00Z",
+              _ttl: 1_706_800_000,
+              pk: "$myapp#v1#snapretainttl#itemid_i-1",
+              sk: "$myapp#v1#snapretainttl#deleted#2024-02-01T10:00:00Z",
+              __edd_e__: "SnapRetainTtl",
+            }),
+          ],
+          LastEvaluatedKey: undefined,
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* RetainTtlEntity.restore({ itemId: "i-1" }).asEffect()
+
+        const snapshotPut = mockTransactWriteItems.mock.calls[0]![0].TransactItems[2].Put
+        // Retain's own expiry, computed from `now` — not the tombstone's.
+        expect(snapshotPut.Item._ttl.N).toBe(String(FROZEN_SECONDS + 30 * 24 * 60 * 60))
+        expect(snapshotPut.Item.deletedAt).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("restore returns ItemNotFound when not deleted", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({
@@ -5318,11 +5501,85 @@ describe("Entity", () => {
 
         yield* RenamedUniqHard.purge({ id: "u-1" }).asEffect()
 
+        const expected = sentinelKeyFor("RenamedUniqHard")
         const call = mockBatchWriteItem.mock.calls[0]![0]
-        const keys = (call.RequestItems["test-table"] as Array<any>).map(
-          (r) => r.DeleteRequest.Key.pk.S,
+        const keys = (call.RequestItems["test-table"] as Array<any>).map((r) => ({
+          pk: r.DeleteRequest.Key.pk.S,
+          sk: r.DeleteRequest.Key.sk.S,
+        }))
+        expect(keys).toContainEqual({ pk: expected.pk, sk: expected.sk })
+      }).pipe(Effect.provide(RenamedTestLayer)),
+    )
+
+    it.effect("purge reaches the sentinel through the tombstone when the row is soft-deleted", () =>
+      Effect.gen(function* () {
+        // The other branch of the sentinel lookup: no live row, so the values
+        // come off the tombstone — which is attribute-keyed just the same.
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              pk: "$myapp#v1#renameduniqsoft#id_u-9",
+              sk: "$myapp#v1#renameduniqsoft#deleted#2026-02-01T10:00:00Z",
+            }),
+          ],
+          LastEvaluatedKey: undefined,
+        })
+        mockGetItem.mockResolvedValueOnce({ Item: undefined })
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              id: "u-9",
+              widgetName: "Alpha",
+              channel: "news",
+              deletedAt: "2026-02-01T10:00:00Z",
+              pk: "$myapp#v1#renameduniqsoft#id_u-9",
+              sk: "$myapp#v1#renameduniqsoft#deleted#2026-02-01T10:00:00Z",
+              __edd_e__: "RenamedUniqSoft",
+            }),
+          ],
+        })
+        mockBatchWriteItem.mockResolvedValueOnce({})
+
+        yield* RenamedUniqSoft.purge({ id: "u-9" }).asEffect()
+
+        const expected = sentinelKeyFor("RenamedUniqSoft")
+        const call = mockBatchWriteItem.mock.calls[0]![0]
+        const keys = (call.RequestItems["test-table"] as Array<any>).map((r) => ({
+          pk: r.DeleteRequest.Key.pk.S,
+          sk: r.DeleteRequest.Key.sk.S,
+        }))
+        expect(keys).toContainEqual({ pk: expected.pk, sk: expected.sk })
+      }).pipe(Effect.provide(RenamedTestLayer)),
+    )
+
+    it.effect("update rotates the sentinel pair of a renamed unique field", () =>
+      Effect.gen(function* () {
+        // The rotation reads the OLD value off the stored row — attribute-keyed,
+        // so a renamed constraint field used to need a bespoke fallback lookup.
+        mockGetItem.mockResolvedValueOnce({ Item: renamedUniqueRow("RenamedUniqHard") })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* RenamedUniqHard.update({ id: "u-1" }).pipe(
+          Entity.set({ name: "Beta" }),
+          Entity.asModel,
         )
-        expect(keys).toContain(sentinelKeyFor("RenamedUniqHard").pk)
+
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        // Put entity + Delete old sentinel + Put new sentinel
+        expect(call.TransactItems).toHaveLength(3)
+
+        const oldKey = DynamoSchema.composeUniqueKey(AppSchema, "RenamedUniqHard", "name", [
+          "Alpha",
+        ])
+        expect(call.TransactItems[1].Delete.Key.pk.S).toBe(oldKey.pk)
+        expect(call.TransactItems[1].Delete.Key.sk.S).toBe(oldKey.sk)
+
+        const newKey = DynamoSchema.composeUniqueKey(AppSchema, "RenamedUniqHard", "name", ["Beta"])
+        expect(call.TransactItems[2].Put.Item.pk.S).toBe(newKey.pk)
+        expect(call.TransactItems[2].Put.Item.sk.S).toBe(newKey.sk)
+        expect(call.TransactItems[2].Put.Item.__edd_e__.S).toBe("RenamedUniqHard._unique.name")
+        // The row itself keeps the stored attribute name.
+        expect(call.TransactItems[0].Put.Item.widgetName.S).toBe("Beta")
       }).pipe(Effect.provide(RenamedTestLayer)),
     )
 

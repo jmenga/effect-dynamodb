@@ -11850,3 +11850,170 @@ describeConnected("renamed attributes across the lifecycle (closes #127)", () =>
     }).pipe(provideRn),
   )
 })
+
+// ---------------------------------------------------------------------------
+// preserveUnique restore + restore-time snapshots
+// ---------------------------------------------------------------------------
+//
+// Two bugs on the restore path, both independent of any field rename, both
+// found while fixing #127:
+//
+//   1. `softDelete: { preserveUnique: true }` KEEPS the reservation across the
+//      delete, so the restore-time sentinel Put's `attribute_not_exists` guard
+//      could never hold — every restore of a constrained entity was cancelled
+//      and reported as a violation against its own reservation.
+//   2. The restore-time retain snapshot was built from the tombstone, so it
+//      inherited `deletedAt` and the soft-delete TTL — and it lands on the same
+//      `#v#<version>` SK the delete-time snapshot used, replacing a clean
+//      snapshot with one that looks deleted and expires.
+
+const puSchema = DynamoSchema.make({ name: "purestore", version: 1 })
+const puTableName = `purestore-test-${Date.now()}`
+
+class PuItem extends Schema.Class<PuItem>("PuItem")({
+  id: Schema.String,
+  name: Schema.String,
+}) {}
+
+const PuUniques = Entity.make({
+  model: PuItem,
+  entityType: "PuUnique",
+  softDelete: { preserveUnique: true },
+  unique: { name: ["name"] },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const PuSnaps = Entity.make({
+  model: PuItem,
+  entityType: "PuSnap",
+  versioned: { retain: true },
+  softDelete: { ttl: Duration.hours(1) },
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const PuTable = Table.make({ schema: puSchema, entities: { PuUniques, PuSnaps } })
+const providePu = Effect.provide(Layer.mergeAll(ClientLayer, PuTable.layer({ name: puTableName })))
+
+describeConnected("preserveUnique restore + restore-time snapshots", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { PuUniques, PuSnaps },
+          tables: { PuTable },
+        })
+        yield* db.tables.PuTable.create()
+      }).pipe(providePu, Effect.scoped),
+    )
+  }, 60000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: puTableName })
+      }).pipe(
+        providePu,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("preserveUnique: a soft-deleted row can be restored and keeps its reservation", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { PuUniques, PuSnaps },
+        tables: { PuTable },
+      })
+
+      yield* db.entities.PuUniques.create({ id: "a1", name: "Alpha" })
+      yield* db.entities.PuUniques.delete({ id: "a1" })
+
+      // The reservation survives the delete — that IS `preserveUnique`.
+      const taken = yield* db.entities.PuUniques.create({ id: "a2", name: "Alpha" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(taken._tag).toBe("UniqueConstraintViolation")
+
+      // And restore re-claims it rather than colliding with it. This used to
+      // fail as a UniqueConstraintViolation against the row's own sentinel,
+      // which made `preserveUnique` and `restore` mutually exclusive.
+      const restored = yield* db.entities.PuUniques.restore({ id: "a1" })
+      expect(restored.name).toBe("Alpha")
+      const fetched = yield* db.entities.PuUniques.get({ id: "a1" })
+      expect(fetched.name).toBe("Alpha")
+
+      // Still enforced afterwards.
+      const stillTaken = yield* db.entities.PuUniques.create({ id: "a3", name: "Alpha" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(stillTaken._tag).toBe("UniqueConstraintViolation")
+    }).pipe(providePu),
+  )
+
+  it.effect("preserveUnique: restore is refused when the reservation belongs to someone else", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { PuUniques, PuSnaps },
+        tables: { PuTable },
+      })
+      const client = yield* DynamoClient
+
+      yield* db.entities.PuUniques.create({ id: "b1", name: "Beta" })
+      yield* db.entities.PuUniques.delete({ id: "b1" })
+
+      // Hand the reservation to another item, exactly as a competing write
+      // would leave it. The relaxed guard must key off the back-pointer, not
+      // merely off the sentinel's existence.
+      const sentinelKey = DynamoSchema.composeUniqueKey(puSchema, "PuUnique", "name", ["Beta"])
+      yield* client.putItem({
+        TableName: puTableName,
+        Item: {
+          pk: { S: sentinelKey.pk },
+          sk: { S: sentinelKey.sk },
+          __edd_e__: { S: "PuUnique._unique.name" },
+          _entity_pk: { S: "$purestore#v1#puunique#id_someone-else" },
+          _entity_sk: { S: "$purestore#v1#puunique" },
+        },
+      })
+
+      const err = yield* db.entities.PuUniques.restore({ id: "b1" }).pipe(Effect.flip)
+      expect(err._tag).toBe("UniqueConstraintViolation")
+    }).pipe(providePu),
+  )
+
+  it.effect("the restore-time snapshot carries neither deletedAt nor the soft-delete TTL", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { PuUniques, PuSnaps },
+        tables: { PuTable },
+      })
+      const client = yield* DynamoClient
+
+      yield* db.entities.PuSnaps.create({ id: "s1", name: "Snap" })
+      yield* db.entities.PuSnaps.delete({ id: "s1" })
+      yield* db.entities.PuSnaps.restore({ id: "s1" })
+
+      const scanned = yield* client.scan({ TableName: puTableName })
+      const snapshots = (scanned.Items ?? [])
+        .map((item) => fromAttributeMap(item))
+        .filter((row) => typeof row.sk === "string" && row.sk.includes("#v#"))
+
+      expect(snapshots).toHaveLength(1)
+      const snapshot = snapshots[0]!
+      expect(snapshot.sk).toBe("$purestore#v1#pusnap#v#0000001")
+      expect(snapshot.name).toBe("Snap")
+      // Both used to ride along from the tombstone, and this row REPLACED the
+      // clean snapshot the delete wrote at the same SK.
+      expect(snapshot.deletedAt).toBeUndefined()
+      expect(snapshot._ttl).toBeUndefined()
+    }).pipe(providePu),
+  )
+})

@@ -30,6 +30,24 @@
   Every one of those sites now composes from a domain-keyed view of the row; the
   item written back stays attribute-keyed.
 
+  Two further bugs on the `restore` path, both independent of any rename, are
+  fixed alongside:
+
+  - **`softDelete: { preserveUnique: true }` made `restore` impossible.** The
+    delete deliberately keeps the reservation, so the restore-time sentinel Put's
+    `attribute_not_exists` guard could never hold: every restore of a constrained
+    entity was cancelled and reported as a `UniqueConstraintViolation` against its
+    own reservation. Under `preserveUnique` the guard is now
+    `attribute_not_exists(#pk) OR (#epk = :epk AND #esk = :esk)`, so the row
+    re-claims the sentinel it still owns while a value taken by anybody else is
+    still refused. With `preserveUnique` off the plain absence guard is unchanged.
+  - **The restore-time retain snapshot inherited `deletedAt` and the soft-delete
+    TTL.** It was built straight from the tombstone, and it lands on the same
+    `#v#<version>` SK the delete-time snapshot used — so it replaced a clean
+    snapshot with one that looked deleted and expired on the `softDelete.ttl`
+    clock. The snapshot source is now stripped of both markers; `versioned.ttl`,
+    when configured, still applies.
+
 ## 1.20.0
 
 ### Minor Changes

@@ -2011,6 +2011,51 @@ const makeImpl = <
     ExpressionAttributeNames: { "#sentinel_pk": config.indexes.primary.pk.field },
   })
 
+  /**
+   * The RESTORE-time sentinel guard.
+   *
+   * `restore` re-establishes one sentinel per satisfiable constraint. With
+   * `preserveUnique` off the delete released them, so `attribute_not_exists` is
+   * exactly right: the row is gone and anyone may have taken the value since.
+   *
+   * With `softDelete: { preserveUnique: true }` the delete deliberately KEPT the
+   * reservation, so `attribute_not_exists` can never hold and every restore of a
+   * constrained entity was cancelled and reported as a `UniqueConstraintViolation`
+   * against its own reservation — `preserveUnique` made `restore` impossible.
+   * The guard must instead let the row re-claim the sentinel it still owns while
+   * still refusing one somebody else holds, which is what the stored
+   * `_entity_pk`/`_entity_sk` back-pointer is for: they name the item the
+   * reservation belongs to, and they are the same values this Put writes.
+   */
+  const restoreSentinelGuard = (
+    entityPk: unknown,
+    entitySk: unknown,
+  ): {
+    readonly ConditionExpression: string
+    readonly ExpressionAttributeNames: globalThis.Record<string, string>
+    readonly ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
+  } => {
+    const pkField = config.indexes.primary.pk.field
+    if (!preserveUnique()) {
+      return {
+        ConditionExpression: "attribute_not_exists(#pk)",
+        ExpressionAttributeNames: { "#pk": pkField },
+      }
+    }
+    return {
+      ConditionExpression: "attribute_not_exists(#pk) OR (#epk = :epk AND #esk = :esk)",
+      ExpressionAttributeNames: {
+        "#pk": pkField,
+        "#epk": "_entity_pk",
+        "#esk": "_entity_sk",
+      },
+      ExpressionAttributeValues: {
+        ":epk": toAttributeValue(entityPk),
+        ":esk": toAttributeValue(entitySk),
+      },
+    }
+  }
+
   /** Collect all key field names (pk, sk, gsi*pk, gsi*sk) */
   const gsiKeyFields = (): ReadonlyArray<string> => {
     const fields: Array<string> = []
@@ -5693,6 +5738,7 @@ const makeImpl = <
               Item: globalThis.Record<string, AttributeValue>
               ConditionExpression?: string
               ExpressionAttributeNames?: globalThis.Record<string, string>
+              ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
             }
             Delete?: { TableName: string; Key: globalThis.Record<string, AttributeValue> }
           }
@@ -5711,10 +5757,21 @@ const makeImpl = <
             },
           })
 
-          // Version snapshot if retain enabled
+          // Version snapshot if retain enabled. The source is the TOMBSTONE, so
+          // the soft-delete markers have to come off first: `buildSnapshotItem`
+          // only ever overrides the TTL attribute when `versioned.ttl` is set, so
+          // a `softDelete: { ttl }` expiry rode along and the snapshot of a
+          // version that is very much still live expired an hour later — while
+          // `deletedAt` made it look like a tombstone. This Put lands on the same
+          // `#v#<version>` SK the delete-time snapshot used (same version — the
+          // restored item is version + 1), so a dirty item here REPLACED the
+          // clean snapshot the delete wrote.
           if (isRetainEnabled()) {
+            const snapshotSource = { ...(deletedRaw as globalThis.Record<string, unknown>) }
+            delete snapshotSource.deletedAt
+            delete snapshotSource[ttlAttrName]
             const snapshotItem = buildSnapshotItem(
-              deletedRaw as globalThis.Record<string, unknown>,
+              snapshotSource,
               currentVersion,
               primary.pk.field,
               primary.sk.field,
@@ -5743,6 +5800,10 @@ const makeImpl = <
               )
               if (!sentinel) continue
               sentinelConstraints.push(constraintName)
+              const guard = restoreSentinelGuard(
+                restoredKeys[primary.pk.field],
+                restoredKeys[primary.sk.field],
+              )
               transactItems.push({
                 Put: {
                   TableName: tableName,
@@ -5753,8 +5814,11 @@ const makeImpl = <
                     _entity_pk: restoredKeys[primary.pk.field],
                     _entity_sk: restoredKeys[primary.sk.field],
                   }),
-                  ConditionExpression: "attribute_not_exists(#pk)",
-                  ExpressionAttributeNames: { "#pk": primary.pk.field },
+                  ConditionExpression: guard.ConditionExpression,
+                  ExpressionAttributeNames: guard.ExpressionAttributeNames,
+                  ...(guard.ExpressionAttributeValues
+                    ? { ExpressionAttributeValues: guard.ExpressionAttributeValues }
+                    : {}),
                 },
               })
             }
