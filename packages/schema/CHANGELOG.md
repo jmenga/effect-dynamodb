@@ -46,7 +46,9 @@
     `#v#<version>` SK the delete-time snapshot used — so it replaced a clean
     snapshot with one that looked deleted and expired on the `softDelete.ttl`
     clock. The snapshot source is now stripped of both markers; `versioned.ttl`,
-    when configured, still applies.
+    when configured, still applies. `buildSnapshotItem` also strips the
+    soft-delete vector stash (`__edd_vs_<index>__`), so a restore-time snapshot
+    of a vector-indexed entity no longer carries the whole embedding blob.
 
 ## 1.20.0
 

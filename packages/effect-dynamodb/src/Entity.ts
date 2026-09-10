@@ -2420,6 +2420,15 @@ const makeImpl = <
     for (const field of vectorKeyFields()) {
       delete snapshot[field]
     }
+    // And the soft-delete STASH. It is not an indexed attribute, so nothing
+    // above touches it, but `restore` builds its snapshot from the tombstone —
+    // which is exactly where the stash lives — so without this the `#v#N` row
+    // ends up carrying the full embedding blob that the delete-time snapshot at
+    // the same SK never had. A snapshot never re-enters the index, so it has no
+    // use for a stashed embedding either.
+    for (const [, definition] of vectorIndexEntries) {
+      delete snapshot[definition.stashField]
+    }
 
     // Replace SK with version SK
     snapshot[tableSkField] = DynamoSchema.composeVersionKey(schema, entityType, version)
