@@ -130,8 +130,10 @@ export const batchRejectReason = (entity: Entity, opType: "put" | "delete"): str
  * - **delete** — the sentinel to release is keyed by the *stored* item's unique
  *   values, a retain snapshot copies the *stored* row, and a soft-delete
  *   tombstone IS the stored row relocated to a new sort key. All three need a
- *   read this path does not do (and a read would introduce a TOCTOU window that
- *   only another ConditionCheck could close). Rejected with **EDD-9048**.
+ *   read. `Transaction.transactWrite` makes it (`planTransactWriteOps`) and
+ *   closes the TOCTOU window with a read guard on the main item (see
+ *   `readGuard` in `Entity.ts`); a caller that runs no pre-pass
+ *   (`EventStore.append`) reaches this gate and is rejected with **EDD-9048**.
  *
  * `Batch.write` rejects BOTH directions (**EDD-9049**) — see `batchRejectReason`.
  *
@@ -179,7 +181,8 @@ export const rejectUnsupportedOp = (
           "to release is keyed by its unique values, a retain snapshot copies it, and a " +
           "soft-delete tombstone is that row relocated to a new sort key. This path never " +
           "reads, so it cannot build them. Run the delete as its own operation " +
-          "(db.entities.X.delete(...)), which reads the item first.",
+          "(db.entities.X.delete(...)) or through Transaction.transactWrite, both of " +
+          "which read the item first.",
       ),
     )
   }

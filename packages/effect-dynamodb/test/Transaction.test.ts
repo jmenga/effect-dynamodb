@@ -3,6 +3,8 @@ import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   DynamoError,
+  type ItemNotFound,
+  type OptimisticLockError,
   type TransactionCancelled,
   type UniqueConstraintViolation,
   type ValidationError,
@@ -184,8 +186,14 @@ const MainTable = Table.make({
 
 const mockTransactGetItems = vi.fn()
 const mockTransactWriteItems = vi.fn()
+const mockGetItem = vi.fn()
 
 const TestDynamoClient = mockDynamoClientLayer({
+  getItem: (input) =>
+    Effect.tryPromise({
+      try: () => mockGetItem(input),
+      catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
+    }),
   transactGetItems: (input) =>
     Effect.tryPromise({
       try: () => mockTransactGetItems(input),
@@ -994,28 +1002,107 @@ describe("Transaction", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("a delete of a lifecycle entity is rejected with EDD-9048", () =>
+    it.effect("a delete of a unique entity reads the row and releases its sentinel", () =>
       Effect.gen(function* () {
-        const error = yield* Transaction.transactWrite([
-          LifecycleMembers.delete({ memberId: "m-1" }),
-        ]).pipe(Effect.flip)
+        mockGetItem.mockResolvedValueOnce({
+          Item: toAttributeMap({
+            pk: "$myapp#v1#lifecyclemember#memberid_m-1",
+            sk: "$myapp#v1#lifecyclemember",
+            __edd_e__: "LifecycleMember",
+            memberId: "m-1",
+            email: "a@x.io",
+            label: "L",
+            version: 1,
+          }),
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
 
-        expect(error._tag).toBe("ValidationError")
-        expect(String((error as ValidationError).cause)).toContain("EDD-9048")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        yield* Transaction.transactWrite([LifecycleMembers.delete({ memberId: "m-1" })])
+
+        // The read the standalone delete makes — the sentinel key needs the stored email.
+        expect(mockGetItem).toHaveBeenCalledTimes(1)
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        expect(items).toHaveLength(2)
+        expect(fromAttributeMap(items[0].Delete.Key).pk).toBe(
+          "$myapp#v1#lifecyclemember#memberid_m-1",
+        )
+        // Read guard: versioned, so the row must still be at the version read.
+        expect(items[0].Delete.ConditionExpression).toBe("#edd_rg_ver = :edd_rg_ver")
+        expect(fromAttributeMap(items[0].Delete.ExpressionAttributeValues)[":edd_rg_ver"]).toBe(1)
+        // The release is unconditional: it cannot be what rejects the transaction.
+        expect(fromAttributeMap(items[1].Delete.Key).pk).toContain("lifecyclemember.email#a@x.io")
+        expect(items[1].Delete.ConditionExpression).toBeUndefined()
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("a delete of a softDelete entity is rejected — a tombstone needs a read", () =>
+    it.effect("a delete of a softDelete entity writes the tombstone it reads for", () =>
       Effect.gen(function* () {
-        const error = yield* Transaction.transactWrite([SoftNotes.delete({ noteId: "n-1" })]).pipe(
-          Effect.flip,
-        )
+        mockGetItem.mockResolvedValueOnce({
+          Item: toAttributeMap({
+            pk: "$myapp#v1#softnote#noteid_n-1",
+            sk: "$myapp#v1#softnote",
+            __edd_e__: "SoftNote",
+            noteId: "n-1",
+            body: "b",
+          }),
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
 
-        expect(error._tag).toBe("ValidationError")
-        expect(String((error as ValidationError).cause)).toContain("EDD-9048")
-        expect(String((error as ValidationError).cause)).toContain("softDelete")
+        yield* Transaction.transactWrite([SoftNotes.delete({ noteId: "n-1" })])
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        expect(items).toHaveLength(2)
+        expect(items[0].Delete).toBeDefined()
+        const tombstone = fromAttributeMap(items[1].Put.Item)
+        expect(tombstone.body).toBe("b")
+        expect(tombstone.deletedAt).toBeDefined()
+        expect(String(tombstone.sk)).not.toBe("$myapp#v1#softnote")
       }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("the read guard is ANDed with the caller's own condition", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({
+          Item: toAttributeMap({
+            pk: "$myapp#v1#sparsemember#memberid_m-1",
+            sk: "$myapp#v1#sparsemember",
+            __edd_e__: "SparseMember",
+            memberId: "m-1",
+            label: "L",
+          }),
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([
+          SparseMembers.delete({ memberId: "m-1" }).pipe(SparseMembers.condition({ label: "L" })),
+        ])
+
+        const del = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Delete
+        // email was unset when read — the guard asserts it still is.
+        expect(del.ConditionExpression).toMatch(
+          /^\(attribute_not_exists\(#edd_rg_0\)\) AND \(.+\)$/,
+        )
+        expect(Object.values(del.ExpressionAttributeNames)).toEqual(
+          expect.arrayContaining(["email", "label"]),
+        )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "a multi-item delete of a missing row fails with ItemNotFound and writes nothing",
+      () =>
+        Effect.gen(function* () {
+          mockGetItem.mockResolvedValueOnce({})
+
+          const error = yield* Transaction.transactWrite([
+            LifecycleMembers.delete({ memberId: "m-gone" }),
+            UserEntity.put({ userId: "u-1", email: "a@x.io", name: "A", role: "admin" }),
+          ]).pipe(Effect.flip)
+
+          expect(error._tag).toBe("ItemNotFound")
+          expect((error as ItemNotFound).entityType).toBe("LifecycleMember")
+          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        }).pipe(Effect.provide(TestLayer)),
     )
 
     it.effect(
@@ -1029,6 +1116,216 @@ describe("Transaction", () => {
           const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
           expect(items).toHaveLength(1)
         }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  describe("update ops", () => {
+    const storedMember = (email: string, version: number) =>
+      toAttributeMap({
+        pk: "$myapp#v1#sparsemember#memberid_m-1",
+        sk: "$myapp#v1#sparsemember",
+        __edd_e__: "SparseMember",
+        memberId: "m-1",
+        email,
+        label: "L",
+        version,
+      })
+
+    it.effect("an update of a plain entity is one Update item, with no read", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([
+          UserEntity.update({ userId: "u-1" }).pipe(Entity.set({ name: "Renamed" })),
+          OrderEntity.put({
+            orderId: "o-1",
+            userId: "u-1",
+            product: "Widget",
+            quantity: 1,
+            status: "pending",
+          }),
+        ])
+
+        expect(mockGetItem).not.toHaveBeenCalled()
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        expect(items).toHaveLength(2)
+        const update = items[0].Update
+        expect(fromAttributeMap(update.Key).pk).toBe("$myapp#v1#user#userid_u-1")
+        expect(update.UpdateExpression).toMatch(/^SET /)
+        expect(Object.values(update.ExpressionAttributeNames)).toContain("name")
+        expect(fromAttributeMap(items[1].Put.Item).__edd_e__).toBe("Order")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an update's condition rides on the Update item", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([
+          UserEntity.update({ userId: "u-1" }).pipe(
+            Entity.set({ name: "Renamed" }),
+            UserEntity.condition({ role: "admin" }),
+          ),
+        ])
+
+        const update = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Update
+        expect(update.ConditionExpression).toBeDefined()
+        expect(Object.values(update.ExpressionAttributeNames)).toContain("role")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a bound update from db.entities.* is accepted", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { UserEntity, OrderEntity },
+          tables: { MainTable },
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([
+          db.entities.UserEntity.update({ userId: "u-1" }).set({ name: "Bound" }),
+        ])
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        expect(items).toHaveLength(1)
+        expect(items[0].Update).toBeDefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an update that changes a unique field rotates its sentinel", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({ Item: storedMember("old@x.io", 1) })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([
+          SparseMembers.update({ memberId: "m-1" }).pipe(Entity.set({ email: "new@x.io" })),
+        ])
+
+        expect(mockGetItem).toHaveBeenCalledTimes(1)
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        expect(items).toHaveLength(3)
+        expect(fromAttributeMap(items[0].Put.Item).email).toBe("new@x.io")
+        // Read guard: unversioned, so the unique field must still hold what was read.
+        expect(items[0].Put.ConditionExpression).toBe("#edd_rg_0 = :edd_rg_0")
+        expect(items[0].Put.ExpressionAttributeNames).toEqual({ "#edd_rg_0": "email" })
+        expect(fromAttributeMap(items[0].Put.ExpressionAttributeValues)[":edd_rg_0"]).toBe(
+          "old@x.io",
+        )
+        // Release the old value, reserve the new one under its guard.
+        expect(fromAttributeMap(items[1].Delete.Key).pk).toContain("old@x.io")
+        expect(fromAttributeMap(items[2].Put.Item).pk).toContain("new@x.io")
+        expect(items[2].Put.ConditionExpression).toBe("attribute_not_exists(#sentinel_pk)")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a taken unique value is reported as UniqueConstraintViolation", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({ Item: storedMember("old@x.io", 1) })
+        const txError = new Error("cancelled")
+        ;(txError as any).name = "TransactionCanceledException"
+        // Item 2 is the reserve Put for the new email; item 3 the caller's second op.
+        ;(txError as any).CancellationReasons = [
+          { Code: "None" },
+          { Code: "None" },
+          { Code: "ConditionalCheckFailed" },
+          { Code: "None" },
+        ]
+        mockTransactWriteItems.mockRejectedValueOnce(txError)
+
+        const error = yield* Transaction.transactWrite([
+          SparseMembers.update({ memberId: "m-1" }).pipe(Entity.set({ email: "taken@x.io" })),
+          UserEntity.put({ userId: "u-1", email: "a@x.io", name: "A", role: "admin" }),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("UniqueConstraintViolation")
+        const violation = error as UniqueConstraintViolation
+        expect(violation.entityType).toBe("SparseMember")
+        expect(violation.constraint).toBe("email")
+        expect(violation.fields).toEqual({ email: "taken@x.io" })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a retain entity's update carries the version CAS and the snapshot", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({
+          Item: toAttributeMap({
+            pk: "$myapp#v1#lifecyclemember#memberid_m-1",
+            sk: "$myapp#v1#lifecyclemember",
+            __edd_e__: "LifecycleMember",
+            memberId: "m-1",
+            email: "a@x.io",
+            label: "L",
+            version: 3,
+          }),
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([
+          LifecycleMembers.update({ memberId: "m-1" }).pipe(Entity.set({ label: "L2" })),
+        ])
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        // Label is not a unique field: no sentinel rotation, just row + snapshot.
+        expect(items).toHaveLength(2)
+        expect(items[0].Put.ConditionExpression).toContain("#ver = :expectedVer")
+        expect(fromAttributeMap(items[0].Put.ExpressionAttributeValues)[":expectedVer"]).toBe(3)
+        expect(fromAttributeMap(items[1].Put.Item).sk).toBe("$myapp#v1#lifecyclemember#v#0000003")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a stale expectedVersion fails before anything is sent", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({
+          Item: toAttributeMap({
+            pk: "$myapp#v1#lifecyclemember#memberid_m-1",
+            sk: "$myapp#v1#lifecyclemember",
+            __edd_e__: "LifecycleMember",
+            memberId: "m-1",
+            email: "a@x.io",
+            label: "L",
+            version: 4,
+          }),
+        })
+
+        const error = yield* Transaction.transactWrite([
+          LifecycleMembers.update({ memberId: "m-1" }).pipe(
+            Entity.set({ label: "L2" }),
+            Entity.expectedVersion(3),
+          ),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("OptimisticLockError")
+        expect((error as OptimisticLockError).actualVersion).toBe(4)
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an update that reads and finds no row fails with ItemNotFound", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({})
+
+        const error = yield* Transaction.transactWrite([
+          SparseMembers.update({ memberId: "m-1" }).pipe(Entity.set({ email: "new@x.io" })),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ItemNotFound")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects returnValues — a transaction returns no attributes", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([
+          UserEntity.update({ userId: "u-1" }).pipe(
+            Entity.set({ name: "Renamed" }),
+            Entity.returnValues("allOld"),
+          ),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("returnValues")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
     )
   })
 

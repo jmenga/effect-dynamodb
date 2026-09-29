@@ -648,7 +648,7 @@ import { Transaction } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `transactGet` | `(items) => Effect<Tuple>` | Atomically get up to 100 items — returns a typed tuple. Accepts unbound `Entity.get` intermediates AND the `BoundGet` returned by `db.entities.*.get(...)` |
-| `transactWrite` | `(ops) => Effect<void>` | Atomically write up to 100 items (puts, deletes, condition checks). Accepts unbound `Entity.put`/`Entity.delete` intermediates AND the bound builders returned by `db.entities.*`; conditions attached to either (including `create()`'s implicit `attribute_not_exists`) are compiled into the transact item. `upsert`, `update` and `patch` are rejected with a `ValidationError` — see below |
+| `transactWrite` | `(ops) => Effect<void>` | Atomically write up to 100 items (puts, updates, deletes, condition checks). Accepts unbound `Entity.put`/`Entity.update`/`Entity.delete` intermediates AND the bound builders returned by `db.entities.*`; conditions attached to either (including `create()`'s implicit `attribute_not_exists` and `patch()`'s `attribute_exists`) are compiled into the transact item. `upsert` is rejected with a `ValidationError` — see below |
 | `check` | `(get, condition) => ConditionCheckOp` | Create a condition-check operation for `transactWrite` (dual API). Takes either get spelling |
 
 ### transactGet
@@ -677,16 +677,17 @@ yield* Transaction.transactWrite(
 
 ### Ops `transactWrite` will not compile
 
-`transactWrite` emits exactly one `Put` / `Delete` / `ConditionCheck` per op. Anything whose entity contract needs a different verb, extra items, or a service the compile step does not hold is refused with a `ValidationError` rather than written with different semantics:
+Anything whose entity contract needs a different verb or a service the compile step does not hold is refused with a `ValidationError` rather than written with different semantics:
 
 | Op / entity feature | Why it is refused |
 |---|---|
 | `upsert()` | An `UpdateItem` using `if_not_exists` for `createdAt`, immutable fields and the version counter. A `Put` would reset all three |
-| `update()` / `patch()` | No `Update` support in the shared transact builder yet |
 | `refs` | Write-time ref hydration reads the referenced entity; the compile step cannot, so the ref attribute would be written empty |
 | `generatedId` | Id generation needs the `Crypto` service |
 | `vectorIndexes` | Computing the embedding needs the `Embedder` service; the item would drop out of the index |
-| **`delete()` of an entity with `unique`, `versioned: { retain: true }` or `softDelete`** | **EDD-9048.** The extra items a delete must write come from the *stored* row — the sentinel to release is keyed by its unique values, a retain snapshot copies it, and a soft-delete tombstone is that row relocated to a new sort key. This path never reads. Use the entity's own `delete`, which reads first |
+| `update()` with `.cascade(...)` | A cascade is a follow-up write to other entities after the update commits, so it cannot share the transaction |
+| `update()` / `delete()` with `.returnValues(...)` | A transaction returns no item attributes |
+| `update()` of an entity with `vectorIndexes` | Recomputing the embedding needs the `Embedder` service |
 
 ### Multi-item puts expand
 
@@ -697,6 +698,27 @@ Consequences worth knowing:
 - **The uniqueness constraint is enforced.** A duplicate fails with `UniqueConstraintViolation` (naming the constraint and the values), not a bare `TransactionCancelled`.
 - **The 100-item cap counts the expanded total.** Ten `unique` + `retain` puts occupy 30 slots. The error message reports both numbers.
 - **`softDelete` does not affect a put** — only a delete — so puts of soft-deletable entities are unaffected.
+
+### Updates and multi-item deletes read first
+
+An `update`, and a `delete` of an entity with `unique`, `versioned: { retain: true }` or `softDelete`, write what the same op writes on its own — and those extra items derive from the **stored** row: the sentinel to release is keyed by its unique values, a retain snapshot copies it, a soft-delete tombstone is that row relocated to a new sort key, and an update touching a `unique` field (or on a `retain` entity) is a read-merge-`Put`. So `transactWrite` reads each such row first, exactly as the standalone op does, and adds the resulting items to the transaction:
+
+```typescript
+yield* Transaction.transactWrite([
+  // Rotates the email sentinel: releases the old value, reserves the new one.
+  db.entities.Users.update({ userId: "u-1" }).set({ email: "new@example.com" }),
+  // Releases every sentinel the stored row holds.
+  db.entities.Vehicles.delete({ vehicleId: "v-9" }),
+  // Commits or rolls back with both of the above.
+  db.entities.AuditEvents.put({ ... }),
+])
+```
+
+A plain `update` (no `retain`, no `unique` field touched) needs no read and compiles to a single `Update` item.
+
+**The read is guarded.** A row that changes between the read and the transaction would make the planned items describe a row that no longer exists — a delete planned against email A, landing after a concurrent update moved it to B, would release A and orphan B's sentinel for good. So the op's own item carries a condition on what was read: the version, for a versioned entity (which proves the whole row is unchanged), otherwise every `unique` field's value. A concurrent change cancels the transaction (`TransactionCancelled`) instead. On an unversioned entity, non-unique fields have no such guard: a tombstone or a read-merge `Put` copies them as read, exactly as the standalone op does.
+
+**The read's outcomes surface on the error channel,** before anything is sent: `ItemNotFound` when the row is absent, `OptimisticLockError` when an update's `expectedVersion` no longer matches, `RefNotFound` from ref hydration.
 
 ### Types
 

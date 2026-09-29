@@ -11,7 +11,10 @@
 
 import {
   DynamoError,
+  type ItemNotFound,
   isAwsTransactionCancelled,
+  type OptimisticLockError,
+  type RefNotFound,
   TRANSACT_WRITE_ITEMS_LIMIT,
   TransactionCancelled,
   UniqueConstraintViolation,
@@ -32,7 +35,9 @@ import {
   buildTransactWriteItems,
   type ConditionCheckOp,
   ConditionCheckTypeId,
+  planTransactWriteOps,
   type TransactWriteOp,
+  type TransactWriteUpdateOp,
 } from "./internal/TransactWriteOps.js"
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
 import type { TableConfig } from "./Table.js"
@@ -44,7 +49,12 @@ import type { TableConfig } from "./Table.js"
 // `additionalItems`) and re-exported here so the public surface is unchanged.
 // ---------------------------------------------------------------------------
 
-export { ConditionCheckTypeId, type ConditionCheckOp, type TransactWriteOp }
+export {
+  ConditionCheckTypeId,
+  type ConditionCheckOp,
+  type TransactWriteOp,
+  type TransactWriteUpdateOp,
+}
 
 /**
  * Create a conditionCheck operation from a get descriptor and a condition.
@@ -196,30 +206,51 @@ export const transactGet = <const T extends ReadonlyArray<AnyGet>>(
 
 /**
  * Atomically write up to 100 items across entities/tables.
- * Accepts EntityPut, EntityDelete, and ConditionCheckOp (via Transaction.check).
+ * Accepts EntityPut, EntityUpdate, EntityDelete (unbound or bound) and
+ * ConditionCheckOp (via Transaction.check).
  *
  * ```typescript
  * yield* Transaction.transactWrite([
  *   Users.put({ userId: "u-1", ... }),
+ *   Users.update({ userId: "u-2" }).set({ email: "b@example.com" }),
  *   Posts.delete({ postId: "p-3" }),
  *   Users.get({ userId: "u-1" }).pipe(Transaction.check(expr)),
  * ])
  * ```
+ *
+ * Every op writes what it would write on its own — including the uniqueness
+ * sentinels, version snapshots and soft-delete tombstones of multi-item
+ * entities. An `update`, and a `delete` of an entity with `unique`,
+ * `versioned: { retain: true }` or `softDelete`, derive those items from the
+ * stored row, so they are READ before the transaction is sent: exactly the read
+ * the standalone op makes. That read's outcomes surface here — `ItemNotFound`
+ * when the row is absent, `OptimisticLockError` when an update's
+ * `expectedVersion` no longer matches, `RefNotFound` from ref hydration.
+ * A condition failing inside the transaction itself is `TransactionCancelled`
+ * (or `UniqueConstraintViolation` when it was a sentinel).
  */
 export const transactWrite = (
-  operations: ReadonlyArray<TransactWriteOp>,
+  operations: ReadonlyArray<TransactWriteOp | TransactWriteUpdateOp>,
 ): Effect.Effect<
   void,
-  DynamoClientError | ValidationError | TransactionCancelled | UniqueConstraintViolation,
+  | DynamoClientError
+  | ValidationError
+  | TransactionCancelled
+  | UniqueConstraintViolation
+  | ItemNotFound
+  | OptimisticLockError
+  | RefNotFound,
   DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
     if (operations.length === 0) return
 
     const client = yield* DynamoClient
+    const plans = yield* planTransactWriteOps(operations)
     const { items: transactItems, provenance } = yield* buildTransactWriteItems(
       operations,
       "transactWrite",
+      plans,
     )
 
     // Counted AFTER expansion: one op can emit several items (a `unique` +

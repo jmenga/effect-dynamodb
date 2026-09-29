@@ -73,6 +73,12 @@ import {
 import { compilePath, createPathBuilder } from "./internal/PathBuilder.js"
 import { generateTimestampPrimitive } from "./internal/TransactableOps.js"
 import {
+  isTransactPlan,
+  makeTransactPlan,
+  type PlannedTransactItem,
+  type TransactPlan,
+} from "./internal/TransactPlan.js"
+import {
   decodeSparseFields,
   encodeSparseFields,
   fromAttributeMap,
@@ -482,7 +488,8 @@ export interface Entity<
    * `EventStore.append({ additionalItems })`) can emit them without reading
    * anything back. The DELETE side is deliberately absent: releasing a sentinel,
    * snapshotting the outgoing row and building a soft-delete tombstone all read
-   * the STORED item, which those paths never do — they reject instead (EDD-9048).
+   * the STORED item. `transactWrite` gets those through `_planDelete`, which
+   * reads; `EventStore.append` does not read and rejects instead (EDD-9048).
    *
    * `item` must be the fully assembled wire-form item (keys composed, system
    * fields applied) — i.e. the output of `validateAndBuildPutItem`.
@@ -513,6 +520,35 @@ export interface Entity<
    * decide between expanding (put) and rejecting (delete, and all of Batch).
    */
   readonly _multiItemWriteFeatures: ReadonlyArray<"unique" | "retain" | "softDelete">
+
+  /**
+   * @internal Compile an `update` into the transact items it would issue,
+   * without issuing them — for `Transaction.transactWrite`.
+   *
+   * Runs the standalone update's own code path in plan mode, so the result is
+   * exactly the write `update` would make: a single `Update` on the standard
+   * path, or — when the entity retains versions or the update touches a
+   * `unique` field — the read-then-transact items (main `Put`, snapshot,
+   * sentinel release + reserve). That path READS the stored row, which is why
+   * this is effectful and why the read's outcomes (`ItemNotFound`,
+   * `OptimisticLockError`) can surface here.
+   */
+  readonly _planUpdate: (
+    key: unknown,
+    state: UpdateState,
+  ) => Effect.Effect<TransactPlan, PlanUpdateError, DynamoClient | TableConfig>
+
+  /**
+   * @internal Compile a `delete` into the transact items it would issue — the
+   * `delete` counterpart of `_planUpdate`. For an entity with `unique`,
+   * `versioned: { retain: true }` or `softDelete` this reads the stored row to
+   * build the sentinel releases, snapshot and tombstone — the read whose
+   * absence is why the plain compile path rejects these deletes (EDD-9048).
+   */
+  readonly _planDelete: (
+    key: unknown,
+    condition: Expr | ConditionInput | undefined,
+  ) => Effect.Effect<TransactPlan, PlanDeleteError, DynamoClient | TableConfig>
 
   /** @internal Attach model class prototype to a decoded plain object (no-op for Schema.Struct models). */
   readonly _attachPrototype: (decoded: any) => any
@@ -2447,6 +2483,143 @@ const makeImpl = <
   // ---------------------------------------------------------------------------
 
   /**
+   * Update features a transaction item cannot carry. Checked before the plan
+   * is built so a rejection names the feature rather than surfacing later as
+   * a missing dependency or a silently dropped step.
+   */
+  const rejectUnplannableUpdate = (uState: UpdateState): Effect.Effect<void, ValidationError> => {
+    const fail = (capability: string, reason: string) =>
+      new ValidationError({
+        entityType,
+        operation: "transactWrite.update",
+        cause: `transactWrite.update: ${capability} is not supported here — ${reason}`,
+      })
+    if (uState.cascade !== undefined) {
+      return Effect.fail(
+        fail(
+          "cascade",
+          "a cascade is a follow-up write to other entities after the update commits, so it " +
+            "cannot share the transaction. Run the update as its own operation.",
+        ),
+      )
+    }
+    if (uState.returnValues !== undefined) {
+      return Effect.fail(
+        fail(
+          "returnValues",
+          "a transaction returns no item attributes. Run the update as its own operation to read them.",
+        ),
+      )
+    }
+    if (hasVectorIndexes) {
+      return Effect.fail(
+        fail(
+          "updating an entity with vector indexes",
+          "recomputing the embedding calls the Embedder service, which this path does not " +
+            "provide. Run the update as its own operation.",
+        ),
+      )
+    }
+    return Effect.void
+  }
+
+  /**
+   * The condition that closes the window between a plan's read and its write.
+   *
+   * A plan derives side items from the row it read — the sentinel to release,
+   * the snapshot, the tombstone, the merged `Put`. If the row changes before
+   * the transaction lands, those items describe a row that no longer exists
+   * (the classic case: a concurrent update moves `email` from A to B, and a
+   * delete planned against A releases A's sentinel and orphans B's). Guarding
+   * the main item on what was read turns that race into a cancelled
+   * transaction instead of a silently wrong write.
+   *
+   * - **Versioned** — every write bumps the version, so equality on it proves
+   *   the whole row is unchanged, which covers snapshots and tombstones too.
+   * - **Unversioned** — each `unique` field must still hold the value read,
+   *   which is what the sentinel items depend on. Other fields have no cheap
+   *   guard: a tombstone or merged `Put` copies them as read, exactly as the
+   *   standalone op does.
+   *
+   * Returns `undefined` when there is nothing to guard.
+   */
+  const readGuard = (
+    raw: globalThis.Record<string, unknown>,
+  ):
+    | {
+        readonly expression: string
+        readonly names: globalThis.Record<string, string>
+        readonly values: globalThis.Record<string, AttributeValue>
+      }
+    | undefined => {
+    if (systemFields.version) {
+      const names = { "#edd_rg_ver": systemFields.version }
+      const stored = raw[systemFields.version]
+      return stored === undefined
+        ? { expression: "attribute_not_exists(#edd_rg_ver)", names, values: {} }
+        : {
+            expression: "#edd_rg_ver = :edd_rg_ver",
+            names,
+            values: { ":edd_rg_ver": toAttributeValue(stored) },
+          }
+    }
+    if (config.unique == null) return undefined
+    const fields = [
+      ...new Set(Object.values(config.unique).flatMap((def) => [...resolveUniqueFields(def)])),
+    ]
+    if (fields.length === 0) return undefined
+    const parts: Array<string> = []
+    const names: globalThis.Record<string, string> = {}
+    const values: globalThis.Record<string, AttributeValue> = {}
+    fields.forEach((field, i) => {
+      const storedName = resolveDbName(field)
+      names[`#edd_rg_${i}`] = storedName
+      const stored = raw[storedName]
+      if (stored === undefined) {
+        parts.push(`attribute_not_exists(#edd_rg_${i})`)
+      } else {
+        values[`:edd_rg_${i}`] = toAttributeValue(stored)
+        parts.push(`#edd_rg_${i} = :edd_rg_${i}`)
+      }
+    })
+    return { expression: parts.join(" AND "), names, values }
+  }
+
+  /** AND {@link readGuard} into a planned main item's own condition. */
+  const withReadGuard = <
+    T extends {
+      readonly ConditionExpression?: string | undefined
+      readonly ExpressionAttributeNames?: globalThis.Record<string, string> | undefined
+      readonly ExpressionAttributeValues?: globalThis.Record<string, AttributeValue> | undefined
+    },
+  >(
+    target: T,
+    raw: globalThis.Record<string, unknown>,
+  ): T => {
+    const guard = readGuard(raw)
+    if (guard === undefined) return target
+    const values = { ...target.ExpressionAttributeValues, ...guard.values }
+    return {
+      ...target,
+      ConditionExpression:
+        target.ConditionExpression !== undefined
+          ? `(${guard.expression}) AND (${target.ConditionExpression})`
+          : guard.expression,
+      ExpressionAttributeNames: { ...target.ExpressionAttributeNames, ...guard.names },
+      ...(Object.keys(values).length > 0 ? { ExpressionAttributeValues: values } : {}),
+    }
+  }
+
+  /**
+   * Narrow a plan-mode builder result. Plan mode returns a `TransactPlan` on
+   * every path that does not fail, so anything else is a defect in this file.
+   */
+  const expectPlan = (out: unknown, op: "update" | "delete"): Effect.Effect<TransactPlan> =>
+    isTransactPlan(out)
+      ? Effect.succeed(out)
+      : Effect.die(new Error(`${entityType}.${op}: plan mode returned no TransactPlan`))
+
+  /**
    * Which parts of this entity's write contract need more than one item.
    * Drives both the `put` expansion and the `delete` / `Batch.write` rejections.
    */
@@ -3249,10 +3422,20 @@ const makeImpl = <
   // update operation
   // ---------------------------------------------------------------------------
 
-  const update = (key: unknown) =>
+  /**
+   * `planOnly` runs the op up to the point it would call DynamoDB and returns a
+   * `TransactPlan` instead — see `planUpdate` and `internal/TransactPlan.ts`.
+   * Every read the standalone op makes (the retain / unique-rotation read, ref
+   * hydration, the `clearMap` read) still happens, so the plan is the write the
+   * standalone op would have issued — plus, on the read-merge path, a read guard
+   * on the main item (`withReadGuard`), since a transaction's read and write
+   * are further apart.
+   */
+  const buildUpdate = (key: unknown, planOnly: boolean) =>
     new EntityUpdateImpl(
       (mode: DecodeMode, uState: UpdateState) =>
         Effect.gen(function* () {
+          if (planOnly) yield* rejectUnplannableUpdate(uState)
           const updates = uState.updates
           const evExpected = uState.expectedVersion
           const userCond = uState.condition
@@ -3717,6 +3900,39 @@ const makeImpl = <
                   },
                 })
               }
+            }
+
+            if (planOnly) {
+              // Same order as the standalone transaction: main Put, snapshot,
+              // then each rotation's release Delete and guarded reserve Put.
+              const reserveByIndex = new Map(sentinelPutIndices.map((s) => [s.index, s]))
+              return makeTransactPlan(
+                transactItems.map((t, index): PlannedTransactItem => {
+                  if ("Delete" in t) return { item: { Delete: t.Delete }, kind: "sentinel" }
+                  if (index === 0) {
+                    // A versioned entity's Put already CASes on the version it
+                    // read (`#ver = :expectedVer`); only the unversioned case
+                    // needs the read guard added.
+                    return {
+                      item: {
+                        Put: systemFields.version
+                          ? t.Put
+                          : withReadGuard(t.Put, currentRaw as globalThis.Record<string, unknown>),
+                      },
+                      kind: "main",
+                    }
+                  }
+                  const reserve = reserveByIndex.get(index)
+                  return reserve
+                    ? {
+                        item: { Put: t.Put },
+                        kind: "sentinel",
+                        constraintName: reserve.constraintName,
+                        fields: reserve.newFieldsRecord,
+                      }
+                    : { item: { Put: t.Put }, kind: "snapshot" }
+                }),
+              )
             }
 
             yield* checkTransactionLimit(entityType, "update", transactItems)
@@ -4219,6 +4435,8 @@ const makeImpl = <
             deleteClauses.length > 0
 
           if (!hasAnyUpdate) {
+            // Nothing to write. In a transaction the op contributes no item.
+            if (planOnly) return makeTransactPlan([])
             // Nothing to update — just get the current item
             return yield* get(key)._run(mode)
           }
@@ -4245,6 +4463,28 @@ const makeImpl = <
             Object.assign(values, uc.values)
           }
           const conditionExpression = condParts.length > 0 ? condParts.join(" AND ") : undefined
+
+          if (planOnly) {
+            return makeTransactPlan([
+              {
+                item: {
+                  Update: {
+                    TableName: tableName,
+                    Key: marshalledKey,
+                    UpdateExpression: updateExpression,
+                    ExpressionAttributeNames: names,
+                    ...(Object.keys(values).length > 0
+                      ? { ExpressionAttributeValues: values }
+                      : {}),
+                    ...(conditionExpression !== undefined
+                      ? { ConditionExpression: conditionExpression }
+                      : {}),
+                  },
+                },
+                kind: "main",
+              },
+            ])
+          }
 
           // DynamoDB rejects an empty `ExpressionAttributeValues` map. When
           // the UpdateExpression is REMOVE-only (e.g. clearMap with no other
@@ -4307,17 +4547,56 @@ const makeImpl = <
       key as globalThis.Record<string, unknown>,
     )
 
+  const update = (key: unknown) => buildUpdate(key, false)
+
+  /**
+   * Compile an update for `Transaction.transactWrite` — see `_planUpdate` on
+   * the Entity interface.
+   */
+  const planUpdate = (
+    key: unknown,
+    uState: UpdateState,
+  ): Effect.Effect<TransactPlan, PlanUpdateError, DynamoClient | TableConfig> =>
+    buildUpdate(key, true)
+      ._builder("model", uState)
+      .pipe(
+        Effect.flatMap((out: unknown) => expectPlan(out, "update")),
+        // Raised only by sending the write, running a cascade or embedding —
+        // plan mode stops before the first and rejects the other two up front.
+        Effect.catchTags({
+          ConditionalCheckFailed: (e) => Effect.die(e),
+          CascadePartialFailure: (e) => Effect.die(e),
+          UniqueConstraintViolation: (e) => Effect.die(e),
+          TransactionOverflow: (e) => Effect.die(e),
+          EmbeddingError: (e) => Effect.die(e),
+        }),
+      )
+
   // ---------------------------------------------------------------------------
   // delete operation
   // ---------------------------------------------------------------------------
 
-  const del = (key: unknown) =>
+  /**
+   * `planOnly` mirrors `buildUpdate`: the stored-row read that the soft-delete
+   * and unique-constraint paths make still happens, and the items they would
+   * send are returned as a `TransactPlan` instead of being sent.
+   */
+  const buildDelete = (key: unknown, planOnly: boolean) =>
     new EntityDeleteImpl(
       (opts: {
         readonly condition: Expr | ConditionInput | undefined
         readonly returnValues: ReturnValuesMode | undefined
       }) =>
         Effect.gen(function* () {
+          if (planOnly && opts.returnValues !== undefined) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "transactWrite.delete",
+              cause:
+                "transactWrite.delete: returnValues is not supported here — a transaction " +
+                "returns no item attributes. Run the delete as its own operation to read them.",
+            })
+          }
           const client = yield* DynamoClient
           const tc = yield* tableTag
           const tableName = tc.name
@@ -4499,6 +4778,22 @@ const makeImpl = <
               }
             }
 
+            if (planOnly) {
+              // Index 0 is the current-item Delete and index 1 the tombstone;
+              // any further Put is the retain snapshot, any further Delete a
+              // sentinel release.
+              return makeTransactPlan(
+                transactItems.map((t, index): PlannedTransactItem => {
+                  if (t.Delete) {
+                    return index === 0
+                      ? { item: { Delete: withReadGuard(t.Delete, raw) }, kind: "main" }
+                      : { item: { Delete: t.Delete }, kind: "sentinel" }
+                  }
+                  return { item: { Put: t.Put }, kind: index === 1 ? "tombstone" : "snapshot" }
+                }),
+              )
+            }
+
             yield* checkTransactionLimit(entityType, "delete", transactItems)
             yield* client
               .transactWriteItems({
@@ -4569,6 +4864,17 @@ const makeImpl = <
               })
             }
 
+            if (planOnly) {
+              return makeTransactPlan(
+                transactItems.map(
+                  (t, index): PlannedTransactItem =>
+                    index === 0
+                      ? { item: { Delete: withReadGuard(t.Delete, raw) }, kind: "main" }
+                      : { item: { Delete: t.Delete }, kind: "sentinel" },
+                ),
+              )
+            }
+
             yield* checkTransactionLimit(entityType, "delete", transactItems)
             yield* client
               .transactWriteItems({
@@ -4588,6 +4894,28 @@ const makeImpl = <
                 deleteInput.ExpressionAttributeValues = userCondition.values
               }
             }
+            if (planOnly) {
+              return makeTransactPlan([
+                {
+                  item: {
+                    Delete: {
+                      TableName: deleteInput.TableName,
+                      Key: deleteInput.Key,
+                      ...(deleteInput.ConditionExpression !== undefined
+                        ? { ConditionExpression: deleteInput.ConditionExpression }
+                        : {}),
+                      ...(deleteInput.ExpressionAttributeNames !== undefined
+                        ? { ExpressionAttributeNames: deleteInput.ExpressionAttributeNames }
+                        : {}),
+                      ...(deleteInput.ExpressionAttributeValues !== undefined
+                        ? { ExpressionAttributeValues: deleteInput.ExpressionAttributeValues }
+                        : {}),
+                    },
+                  },
+                  kind: "main",
+                },
+              ])
+            }
             if (opts.returnValues) {
               deleteInput.ReturnValues = returnValuesMap[opts.returnValues]
             }
@@ -4597,6 +4925,27 @@ const makeImpl = <
       self,
       key as globalThis.Record<string, unknown>,
     )
+
+  const del = (key: unknown) => buildDelete(key, false)
+
+  /**
+   * Compile a delete for `Transaction.transactWrite` — see `_planDelete` on
+   * the Entity interface.
+   */
+  const planDelete = (
+    key: unknown,
+    condition: Expr | ConditionInput | undefined,
+  ): Effect.Effect<TransactPlan, PlanDeleteError, DynamoClient | TableConfig> =>
+    buildDelete(key, true)
+      ._builder({ condition, returnValues: undefined })
+      .pipe(
+        Effect.flatMap((out: unknown) => expectPlan(out, "delete")),
+        // Raised only by sending the write, which plan mode never does.
+        Effect.catchTags({
+          ConditionalCheckFailed: (e) => Effect.die(e),
+          TransactionOverflow: (e) => Effect.die(e),
+        }),
+      )
 
   // ---------------------------------------------------------------------------
   // deleteIfExists operation — delete + attribute_exists condition
@@ -6118,6 +6467,8 @@ const makeImpl = <
     _renameToDynamo: renameToDynamo,
     _buildPutSideItems: buildPutSideItems,
     _multiItemWriteFeatures: multiItemWriteFeatures(),
+    _planUpdate: planUpdate,
+    _planDelete: planDelete,
     _attachPrototype: attachPrototype,
     _configure: (
       injectedSchema: DynamoSchema.DynamoSchema,
@@ -6592,6 +6943,22 @@ export const bind = <
 // Extraction protocol — used by Transaction and Batch modules
 // ---------------------------------------------------------------------------
 
+/**
+ * What planning an update for a transaction can fail with: the reads it makes
+ * (`DynamoClientError`, `ItemNotFound` when the retain / unique-rotation read
+ * finds no row, `RefNotFound` from ref hydration), an `expectedVersion` the
+ * stored row no longer has, and an op the transaction cannot carry.
+ */
+export type PlanUpdateError =
+  | DynamoClientError
+  | ValidationError
+  | ItemNotFound
+  | OptimisticLockError
+  | RefNotFound
+
+/** What planning a delete for a transaction can fail with — see {@link PlanUpdateError}. */
+export type PlanDeleteError = DynamoClientError | ValidationError | ItemNotFound
+
 export interface TransactableInfo {
   readonly opType: "get" | "put" | "update" | "delete"
   readonly entity: Entity
@@ -6612,6 +6979,8 @@ export interface TransactableInfo {
    * a `Put` MUST reject `"upsert"` rather than compile it (#100).
    */
   readonly putKind?: PutKind | undefined
+  /** For `opType: "update"` — the accumulated update (`.set()`, `.remove()`, …). */
+  readonly updateState?: UpdateState | undefined
 }
 
 /** @internal */
@@ -6681,6 +7050,7 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
         entity: target._entity,
         key: target._key,
         condition: target._updateState?.condition,
+        updateState: target._updateState,
       }
     }
   }
