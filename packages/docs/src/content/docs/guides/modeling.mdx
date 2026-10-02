@@ -182,6 +182,8 @@ Under the default `"lowercase"`, `"Dev-A"` and `"dev-a"` compose the **same key*
 Choose `casing` before a table holds data. Changing it later moves every composed key, so existing items are no longer found. Switching on a populated table needs a table rewrite.
 :::
 
+An index can override the schema's casing with its own `casing`, and an event stream with `makeStream({ casing })` — see [Casing Resolution](/effect-dynamodb/guides/indexes/#casing-resolution).
+
 A few fixed markers inside keys are **not** cased, under any setting: the `v` in the version prefix (`$APP#v1`), the version-snapshot `#v#` and soft-delete `#deleted#` infixes, and the `_1` in event and isolated sort keys. Under `"uppercase"` a version snapshot key is `$APP#v1#EMPLOYEE#v#0000003`. The time-series `#e#` infix is the exception — it follows the casing (`#E#` under `"uppercase"`). These are fixed because they are already stored; they will not change.
 
 ## Declaring the Physical Table

@@ -110,25 +110,25 @@ Under the hood, each event is stored as a DynamoDB item with:
 - **SK** containing a zero-padded version number for ordered retrieval
 - **eventType** discriminator for decoding back to the correct Schema.Class
 
-### Stream name casing
+### Stream key casing
 
-By default the stream name is **lower-cased** in every key the stream writes, whatever the schema's `casing`. Entity types follow the schema's `casing` instead, so under `casing: "preserve"` a stream and an entity on the same table disagree:
+By default a stream **lower-cases its name** in every key it writes, whatever the schema's `casing`, and the rest of the key (stream ids, command ids) follows the schema. Entity types follow the schema's casing, so under `casing: "preserve"` a stream and an entity on the same table disagree:
 
 ```
 $cricket#v1#Watermark#writerId_Ingest-1      ← entity: label follows the schema
-$cricket#v1#match#M-1                        ← stream: label always lower-case
+$cricket#v1#match#M-1                        ← stream: name always lower-case
 ```
 
-Set `labelCasing: "schema"` on `makeStream` to make the stream name follow the schema's casing like entities do:
+Set `casing` on `makeStream` to choose the stream's key casing, the same way an index's `casing` works. It applies to the stream name, stream ids and command ids in the partition key and the event, snapshot and idempotency-sentinel sort keys; the `$<schema>#v<n>` prefix keeps the schema's casing:
 
 ```
-$cricket#v1#Match#M-1                        ← stream with labelCasing: "schema"
+$cricket#v1#Match#M-1                        ← stream with casing: "preserve"
 ```
 
-`"schema"` only changes keys under `casing: "preserve"`, and only when `streamName` has upper-case letters — under `"lowercase"` and `"uppercase"` both settings write the same keys. It applies to the partition key and the event, snapshot and idempotency-sentinel sort keys. The `__edd_e__` discriminator (`match.event`, …) stays lower-case either way.
+On a `"lowercase"` or `"uppercase"` schema, setting `casing` to the schema's value writes the same keys as leaving it out. The `__edd_e__` discriminator (`match.event`, …) stays lower-case either way. In the next major version, leaving `casing` out will mean the schema's casing, as it does for indexes.
 
-:::caution[Switching an existing stream]
-On a `"preserve"` table, turning on `labelCasing: "schema"` for a stream that already holds data moves its keys. Existing events, snapshots and idempotency sentinels stay under the old keys and are no longer read, so the stream appears to start from version 0. Use it for new streams, or migrate the items first. The default becomes `"schema"` in the next major version.
+:::caution[Setting `casing` on an existing stream]
+If the keys it produces differ from the ones the stream was written with — for example `casing: "preserve"` on a `"preserve"` schema with a `streamName` containing capitals — existing events, snapshots and idempotency sentinels stay under the old keys and are no longer read, so the stream appears to start from version 0. Use it for new streams, or migrate the items first.
 :::
 
 ---

@@ -1685,3 +1685,56 @@ describe("KeyComposer", () => {
     })
   })
 })
+
+describe("index-level casing", () => {
+  const schema = DynamoSchema.make({ name: "App", version: 1 })
+  const base = {
+    name: "gsi1",
+    pk: { field: "gsi1pk", composite: ["ownerId"] },
+    sk: { field: "gsi1sk", composite: [] },
+  }
+
+  it("normalizeGsiConfig carries casing through", () => {
+    expect(KeyComposer.normalizeGsiConfig({ ...base, casing: "preserve" }).casing).toBe("preserve")
+    expect("casing" in KeyComposer.normalizeGsiConfig(base)).toBe(false)
+  })
+
+  it("the normalized index composes with its own casing, keeping the schema's prefix", () => {
+    const index = KeyComposer.normalizeGsiConfig({ ...base, casing: "uppercase" })
+    expect(KeyComposer.composePk(schema, "Device", index, { ownerId: "Own-a" })).toBe(
+      "$app#v1#DEVICE#OWNERID_OWN-A",
+    )
+  })
+
+  it("effectiveCasing falls back to the schema's", () => {
+    expect(KeyComposer.effectiveCasing(schema, KeyComposer.normalizeGsiConfig(base))).toBe(
+      "lowercase",
+    )
+    expect(
+      KeyComposer.effectiveCasing(
+        schema,
+        KeyComposer.normalizeGsiConfig({ ...base, casing: "preserve" }),
+      ),
+    ).toBe("preserve")
+  })
+
+  it("assertCollectionCasingAgreement compares effective casings", () => {
+    const lower = KeyComposer.normalizeGsiConfig(base)
+    const explicitLower = KeyComposer.normalizeGsiConfig({ ...base, casing: "lowercase" })
+    const preserve = KeyComposer.normalizeGsiConfig({ ...base, casing: "preserve" })
+    expect(() =>
+      KeyComposer.assertCollectionCasingAgreement("Fleet", [
+        { key: "A", schema, index: lower },
+        { key: "B", schema, index: explicitLower },
+      ]),
+    ).not.toThrow()
+    expect(() =>
+      KeyComposer.assertCollectionCasingAgreement("Fleet", [
+        { key: "A", schema, index: lower },
+        { key: "B", schema, index: preserve },
+      ]),
+    ).toThrow(
+      '[EDD-9055] Collection "Fleet" members compose its keys with different casings (A: lowercase, B: preserve)',
+    )
+  })
+})

@@ -3158,41 +3158,42 @@ describe("EventStore", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Stream label casing — `labelCasing` decides whether the stream name in keys
-// follows the schema's casing. The default keeps the always-lower-case layout
-// that existing streams were written with.
+// Stream key casing — `casing` overrides the casing of the stream's keys, as an
+// index's `casing` does. Omitted, the stream keeps the layout it has always
+// been written with: name lower-cased, the rest following the schema.
 // ---------------------------------------------------------------------------
 
-describe("EventStore stream label casing", () => {
-  const casings = ["lowercase", "uppercase", "preserve"] as const
-
-  const streamsFor = (casing: DynamoSchema.Casing) => {
+describe("EventStore stream casing", () => {
+  const streamFor = (
+    schemaCasing: DynamoSchema.Casing,
+    casing: DynamoSchema.Casing | undefined,
+  ) => {
     const table = Table.make({
-      schema: DynamoSchema.make({ name: "app", version: 1, casing }),
+      schema: DynamoSchema.make({ name: "App", version: 1, casing: schemaCasing }),
       entities: {},
     })
-    const make = (labelCasing: EventStore.StreamLabelCasing | undefined) =>
-      EventStore.makeStream({
-        table,
-        streamName: "OrderBook",
-        events: [MatchStarted],
-        streamId: { composite: ["orderId"] },
-        snapshot: { schema: MatchStateSchema },
-        ...(labelCasing !== undefined ? { labelCasing } : {}),
-      })
+    const stream = EventStore.makeStream({
+      table,
+      streamName: "OrderBook",
+      events: [MatchStarted],
+      streamId: { composite: ["orderId"] },
+      snapshot: { schema: MatchStateSchema },
+      ...(casing !== undefined ? { casing } : {}),
+    })
     return {
-      defaulted: make(undefined),
-      lowercase: make("lowercase"),
-      schema: make("schema"),
+      stream,
       layer: Layer.merge(TestDynamoClient, table.layer({ name: "events-table" })),
     }
   }
 
-  type Stream = ReturnType<typeof streamsFor>["schema"]
-
   // Every key the stream writes or reads, captured from the mock client.
-  const captureKeys = (stream: Stream) =>
-    Effect.gen(function* () {
+  const captureKeys = (
+    schemaCasing: DynamoSchema.Casing,
+    casing: DynamoSchema.Casing | undefined,
+  ) => {
+    const { stream, layer } = streamFor(schemaCasing, casing)
+    return Effect.gen(function* () {
+      vi.resetAllMocks()
       mockTransactWriteItems.mockResolvedValue({})
       mockPutItem.mockResolvedValue({})
       mockQuery.mockResolvedValue({ Items: [] })
@@ -3211,26 +3212,30 @@ describe("EventStore stream label casing", () => {
       const sentinel = fromAttributeMap(transact[transact.length - 1].Put.Item)
       const snapshot = fromAttributeMap(mockPutItem.mock.calls[0]![0].Item)
       const read = mockQuery.mock.calls[0]![0]
+      expect(read.ExpressionAttributeValues[":pk"].S).toBe(event.pk)
+      // The discriminators never vary — reads match them exactly.
+      expect([event.__edd_e__, sentinel.__edd_e__, snapshot.__edd_e__]).toEqual([
+        "orderbook.event",
+        "orderbook.command",
+        "orderbook.snapshot",
+      ])
       return {
         pk: event.pk,
         eventSk: event.sk,
-        eventType: event.__edd_e__,
         sentinelSk: sentinel.sk,
-        sentinelType: sentinel.__edd_e__,
         snapshotSk: snapshot.sk,
-        snapshotType: snapshot.__edd_e__,
-        readPk: read.ExpressionAttributeValues[":pk"].S,
         readSkPrefix: read.ExpressionAttributeValues[":sk"].S,
       }
-    })
+    }).pipe(Effect.provide(layer))
+  }
 
+  // The layout streams were written with before `casing` existed.
   const legacyKeys = {
     lowercase: {
       pk: "$app#v1#orderbook#ord-1",
       eventSk: "$app#v1#orderbook.event_1#0000000001",
       sentinelSk: "$app#v1#orderbook.command#cmd-1",
       snapshotSk: "$app#v1#orderbook.snapshot",
-      readPk: "$app#v1#orderbook#ord-1",
       readSkPrefix: "$app#v1#orderbook.event_1#",
     },
     uppercase: {
@@ -3238,64 +3243,66 @@ describe("EventStore stream label casing", () => {
       eventSk: "$APP#v1#ORDERBOOK.EVENT_1#0000000001",
       sentinelSk: "$APP#v1#ORDERBOOK.COMMAND#CMD-1",
       snapshotSk: "$APP#v1#ORDERBOOK.SNAPSHOT",
-      readPk: "$APP#v1#ORDERBOOK#ORD-1",
       readSkPrefix: "$APP#v1#ORDERBOOK.EVENT_1#",
     },
     preserve: {
-      pk: "$app#v1#orderbook#Ord-1",
-      eventSk: "$app#v1#orderbook.event_1#0000000001",
-      sentinelSk: "$app#v1#orderbook.command#Cmd-1",
-      snapshotSk: "$app#v1#orderbook.snapshot",
-      readPk: "$app#v1#orderbook#Ord-1",
-      readSkPrefix: "$app#v1#orderbook.event_1#",
+      pk: "$App#v1#orderbook#Ord-1",
+      eventSk: "$App#v1#orderbook.event_1#0000000001",
+      sentinelSk: "$App#v1#orderbook.command#Cmd-1",
+      snapshotSk: "$App#v1#orderbook.snapshot",
+      readSkPrefix: "$App#v1#orderbook.event_1#",
     },
   } as const
 
-  // The discriminator never varies — reads match it exactly.
-  const discriminators = {
-    eventType: "orderbook.event",
-    sentinelType: "orderbook.command",
-    snapshotType: "orderbook.snapshot",
+  for (const schemaCasing of ["lowercase", "uppercase", "preserve"] as const) {
+    it.effect(`omitted keeps the existing layout (schema casing: "${schemaCasing}")`, () =>
+      Effect.gen(function* () {
+        expect(yield* captureKeys(schemaCasing, undefined)).toEqual(legacyKeys[schemaCasing])
+      }),
+    )
   }
 
-  for (const casing of casings) {
-    it.effect(`default keeps the lower-cased stream label (casing: "${casing}")`, () => {
-      const { defaulted, lowercase, layer } = streamsFor(casing)
-      return Effect.gen(function* () {
-        const keys = yield* captureKeys(defaulted)
-        expect(keys).toEqual({ ...legacyKeys[casing], ...discriminators })
-
-        vi.resetAllMocks()
-        expect(yield* captureKeys(lowercase)).toEqual(keys)
-      }).pipe(Effect.provide(layer))
-    })
+  for (const schemaCasing of ["lowercase", "uppercase"] as const) {
+    it.effect(`set to the schema's casing matches the existing layout ("${schemaCasing}")`, () =>
+      Effect.gen(function* () {
+        expect(yield* captureKeys(schemaCasing, schemaCasing)).toEqual(legacyKeys[schemaCasing])
+      }),
+    )
   }
 
-  for (const casing of ["lowercase", "uppercase"] as const) {
-    it.effect(`"schema" matches the default layout (casing: "${casing}")`, () => {
-      const { schema, layer } = streamsFor(casing)
-      return Effect.gen(function* () {
-        expect(yield* captureKeys(schema)).toEqual({ ...legacyKeys[casing], ...discriminators })
-      }).pipe(Effect.provide(layer))
-    })
-  }
+  it.effect(`"preserve" on a "preserve" schema keeps the stream name as written`, () =>
+    Effect.gen(function* () {
+      expect(yield* captureKeys("preserve", "preserve")).toEqual({
+        pk: "$App#v1#OrderBook#Ord-1",
+        eventSk: "$App#v1#OrderBook.event_1#0000000001",
+        sentinelSk: "$App#v1#OrderBook.command#Cmd-1",
+        snapshotSk: "$App#v1#OrderBook.snapshot",
+        readSkPrefix: "$App#v1#OrderBook.event_1#",
+      })
+    }),
+  )
 
-  it.effect(`"schema" keeps the stream name as written under casing: "preserve"`, () => {
-    const { schema, layer } = streamsFor("preserve")
-    return Effect.gen(function* () {
-      expect(yield* captureKeys(schema)).toEqual({
+  it.effect("overrides the schema's casing for the whole key except the schema prefix", () =>
+    Effect.gen(function* () {
+      // Stream ids and command ids stay distinct by case on a lower-casing schema.
+      expect(yield* captureKeys("lowercase", "preserve")).toEqual({
         pk: "$app#v1#OrderBook#Ord-1",
         eventSk: "$app#v1#OrderBook.event_1#0000000001",
         sentinelSk: "$app#v1#OrderBook.command#Cmd-1",
         snapshotSk: "$app#v1#OrderBook.snapshot",
-        readPk: "$app#v1#OrderBook#Ord-1",
         readSkPrefix: "$app#v1#OrderBook.event_1#",
-        ...discriminators,
       })
-    }).pipe(Effect.provide(layer))
-  })
+      expect(yield* captureKeys("uppercase", "lowercase")).toEqual({
+        pk: "$APP#v1#orderbook#ord-1",
+        eventSk: "$APP#v1#orderbook.event_1#0000000001",
+        sentinelSk: "$APP#v1#orderbook.command#cmd-1",
+        snapshotSk: "$APP#v1#orderbook.snapshot",
+        readSkPrefix: "$APP#v1#orderbook.event_1#",
+      })
+    }),
+  )
 
-  it(`"schema" under "preserve" still sorts the snapshot after every event`, () => {
+  it(`a preserved stream name still sorts the snapshot after every event`, () => {
     const schema = DynamoSchema.make({ name: "app", version: 1, casing: "preserve" })
     const snapshotSk = DynamoSchema.composeKey(schema, "OrderBook.snapshot", [])
     const lastEvent = DynamoSchema.composeEventVersionKey(

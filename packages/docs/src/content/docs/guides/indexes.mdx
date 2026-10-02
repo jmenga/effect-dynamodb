@@ -135,18 +135,63 @@ Both `pk.composite` and `sk.composite` can be empty arrays. The entity type pref
 
 ### Casing Resolution
 
-Casing is applied uniformly across the **entire generated key** — schema name, version prefix, entity type, collection name, **and composite attribute values**. Resolution order:
+Casing is applied across the generated key — schema name, entity type, collection name, composite attribute names, **and composite attribute values**. Resolution order:
 
-1. Index-level `casing` (highest priority)
+1. Index-level `casing` (highest priority) — on `primaryKey` or on any entry in `indexes`
 2. Schema-level `casing` (default: `"lowercase"`)
 
-This means `"Emp-Alice"` and `"emp-alice"` produce identical keys under the default `"lowercase"` setting. The original attribute value casing is preserved on the stored attribute itself — only the composed key string is cased.
+Under the default `"lowercase"`, `"Emp-Alice"` and `"emp-alice"` produce identical keys. The original attribute value is preserved on the stored attribute itself — only the composed key string is cased.
 
-```typescript
+```
 // With casing: "lowercase", entityType: "Employee", employeeId: "Emp-Alice"
-// Composed PK:      $myapp#v1#employee#emp-alice
+// Composed PK:      $myapp#v1#employee#employeeid_emp-alice
 // Stored attribute: employeeId = "Emp-Alice"  (original casing preserved)
 ```
+
+An index's own `casing` overrides the schema's for that index's keys — entity type or collection name and composites, in both halves. The `$<schema>#v<n>` prefix keeps the schema's casing. Use it when one access pattern needs case-sensitive values on a schema that folds case:
+
+```typescript region="index-casing" example="guide-indexes.ts"
+// External references are case-sensitive: "AbC-1" and "abc-1" are different
+// accounts. The schema folds case, so this index keeps it with its own `casing`.
+class Integration extends Schema.Class<Integration>("Integration")({
+  integrationId: Schema.String,
+  externalRef: Schema.String,
+}) {}
+
+const Integrations = Entity.make({
+  model: Integration,
+  entityType: "Integration",
+  primaryKey: {
+    pk: { field: "pk", composite: ["integrationId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byExternalRef: {
+      name: "gsi1",
+      casing: "preserve",
+      pk: { field: "gsi1pk", composite: ["externalRef"] },
+      sk: { field: "gsi1sk", composite: [] },
+    },
+  },
+})
+
+const CasingTable = Table.make({ schema: AppSchema, entities: { Integrations } })
+```
+
+```typescript region="index-casing-queries" example="guide-indexes.ts"
+yield* casing.entities.Integrations.put({ integrationId: "int-1", externalRef: "AbC-1" })
+yield* casing.entities.Integrations.put({ integrationId: "int-2", externalRef: "abc-1" })
+
+// gsi1pk: $myapp#v1#Integration#externalRef_AbC-1 — the case survives
+const exact = yield* casing.entities.Integrations.byExternalRef({ externalRef: "AbC-1" }).collect()
+// → [int-1] only. With the schema's "lowercase", both items share one gsi1pk and both return.
+```
+
+Entities sharing a collection compose its keys together, so they must agree on the collection index's casing — a mismatch fails at `DynamoClient.make()` / `Collection.make()` with `EDD-9055`. An index `casing` equal to the schema's agrees with an index that sets none.
+
+:::caution[Setting `casing` on an index that holds data]
+Changing an index's casing changes the keys it composes. Items written before keep their old index keys until they are written again, so queries through that index won't find them in the meantime. Before 1.22, `casing` on an `indexes` entry was accepted but ignored — if you had set it, items written by earlier versions carry schema-cased keys for that index.
+:::
 
 ## Collections
 

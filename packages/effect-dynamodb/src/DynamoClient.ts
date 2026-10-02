@@ -1455,6 +1455,10 @@ const makeFromConfig = (config: {
       // the first member's form would silently lose the others' rows. Fail at
       // bind time instead.
       assertCollectionKeyFormAgreement(collName, members)
+      KeyComposer.assertCollectionCasingAgreement(
+        collName,
+        members.map((m) => ({ key: m.entityKey, schema: m.entityLike._schema, index: m.indexDef })),
+      )
 
       boundCollections[collName] = (composites: Record<string, unknown>) => {
         // Use the first member for PK composition — verified above to agree
@@ -1536,7 +1540,7 @@ const makeFromConfig = (config: {
           const hierarchy = Array.isArray(coll)
             ? coll.slice(0, coll.indexOf(collName) + 1)
             : [collName]
-          const casing = indexDef.casing ?? firstMember.entityLike._schema.casing
+          const casing = KeyComposer.effectiveCasing(firstMember.entityLike._schema, indexDef)
           const pre = DynamoSchema.prefix(firstMember.entityLike._schema)
           const casedNames = hierarchy.map((n) => DynamoSchema.applyCasing(n, casing))
           const skPrefix = `${pre}#${casedNames.join("#")}`

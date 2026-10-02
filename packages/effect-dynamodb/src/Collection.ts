@@ -211,6 +211,13 @@ export const make = <
       }
     }
   }
+  KeyComposer.assertCollectionCasingAgreement(
+    name,
+    entityEntries.flatMap(([key, entity]) => {
+      const index = entity.indexes[sharedIndexName]
+      return index === undefined ? [] : [{ key, schema: entity._schema, index }]
+    }),
+  )
 
   // Compute the SK prefix for clustered collections.
   // For sub-collections (collection: ["parent", "child"]), the prefix includes
@@ -220,7 +227,7 @@ export const make = <
     // Find the collection hierarchy from the first entity's index definition
     const firstIndex = entityEntries[0]![1].indexes[sharedIndexName!]!
     const coll = firstIndex.collection
-    const casing = firstIndex.casing ?? sharedSchema.casing
+    const casing = KeyComposer.effectiveCasing(sharedSchema, firstIndex)
 
     if (Array.isArray(coll)) {
       // Sub-collection: include hierarchy up to and including the target name

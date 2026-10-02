@@ -75,6 +75,7 @@ export interface IndexDefinition {
   readonly type?: "isolated" | "clustered" | undefined // Default: "isolated"
   readonly pk: KeyPart
   readonly sk: KeyPart
+  /** Key casing override; see {@link GsiConfig.casing}. Defaults to the schema's. */
   readonly casing?: DynamoSchema.Casing
   /**
    * Optional per-half policy for `Entity.update` and `.append`. Not consulted
@@ -98,11 +99,48 @@ export interface GsiConfig {
   /** Sort key: physical field name + composite attributes. */
   readonly sk: KeyPart
   /**
+   * Key casing for this index, overriding the schema's `casing`. Applies to the
+   * entity type / collection name and the composite names and values in both
+   * halves; the `$<schema>#v<n>` prefix keeps the schema's casing. Members of a
+   * collection must agree on it (EDD-9055).
+   */
+  readonly casing?: DynamoSchema.Casing
+  /**
    * Per-half sparse/preserve policy. Applied by `Entity.update` and
    * time-series `.append`. Defaults to `"preserve"` on each half. Not
    * applied on `put()`. See `DESIGN.md §7 Policy-Aware GSI Composition`.
    */
   readonly indexPolicy?: IndexPolicy
+}
+
+/** The casing an index's keys are composed with: its own, else the schema's. */
+export const effectiveCasing = (
+  schema: DynamoSchema.DynamoSchema,
+  index: IndexDefinition,
+): DynamoSchema.Casing => index.casing ?? schema.casing
+
+/**
+ * Fail when a collection's members would compose its keys with different
+ * casings. They share one physical index, so a member whose keys are cased
+ * differently writes into partitions the collection query never reads.
+ */
+export const assertCollectionCasingAgreement = (
+  collectionName: string,
+  members: ReadonlyArray<{
+    readonly key: string
+    readonly schema: DynamoSchema.DynamoSchema
+    readonly index: IndexDefinition
+  }>,
+): void => {
+  const casings = members.map((m) => ({ key: m.key, casing: effectiveCasing(m.schema, m.index) }))
+  if (new Set(casings.map((c) => c.casing)).size > 1) {
+    throw new Error(
+      `[EDD-9055] Collection "${collectionName}" members compose its keys with different ` +
+        `casings (${casings.map((c) => `${c.key}: ${c.casing}`).join(", ")}). They share one ` +
+        `physical index, so their keys would never meet — give the collection's index the same ` +
+        `\`casing\` on every member.`,
+    )
+  }
 }
 
 /** Normalize a GsiConfig (entity input) to an IndexDefinition (internal format). */
@@ -125,6 +163,7 @@ export const normalizeGsiConfig = (config: GsiConfig): IndexDefinition => {
     type: config.type ?? "isolated",
     pk: { field: config.pk.field, composite: [...config.pk.composite] },
     sk: { field: config.sk.field, composite: [...config.sk.composite] },
+    ...(config.casing !== undefined && { casing: config.casing }),
     ...(config.indexPolicy !== undefined && { indexPolicy: config.indexPolicy }),
   }
 }

@@ -1,6 +1,12 @@
 import { DynamoSchema, KeyComposer } from "@effect-dynamodb/schema"
+import ts from "typescript"
 import { describe, expect, it } from "vitest"
-import type { Casing, IndexDefinition, ResolvedEntity } from "../src/core/EntityResolver"
+import {
+  type Casing,
+  type IndexDefinition,
+  type ResolvedEntity,
+  resolveEntities,
+} from "../src/core/EntityResolver"
 import { buildParamsOrThrow } from "./helpers/params"
 
 // The plugin mirrors the library's key composition (it is CommonJS and cannot
@@ -109,4 +115,63 @@ describe("key composition parity with @effect-dynamodb/schema", () => {
       }
     })
   }
+})
+
+// Index-level `casing` read from source must reach the keys the same way
+// `Entity.make` carries it: as-is on `primaryKey`, via `normalizeGsiConfig` on
+// each GSI.
+describe("index-level casing from source matches Entity.make", () => {
+  const primaryKey = {
+    pk: { field: "pk", composite: ["orgId"] },
+    sk: { field: "sk", composite: [] },
+    casing: "uppercase",
+  } as const
+  const gsis = {
+    byTeam: {
+      name: "gsi1",
+      casing: "preserve",
+      pk: { field: "gsi1pk", composite: ["teamId"] },
+      sk: { field: "gsi1sk", composite: ["status"] },
+    },
+  } as const
+
+  // Same configuration as above, as the plugin sees it in source.
+  const source = `
+    const AppSchema = DynamoSchema.make({ name: "Help-Desk", version: 3 })
+    const Tickets = Entity.make({
+      model: Ticket,
+      entityType: "Ticket",
+      primaryKey: {
+        pk: { field: "pk", composite: ["orgId"] },
+        sk: { field: "sk", composite: [] },
+        casing: "uppercase",
+      },
+      indexes: {
+        byTeam: {
+          name: "gsi1",
+          casing: "preserve",
+          pk: { field: "gsi1pk", composite: ["teamId"] },
+          sk: { field: "gsi1sk", composite: ["status"] },
+        },
+      },
+    })
+    const MainTable = Table.make({ schema: AppSchema, entities: { Tickets } })
+  `
+
+  it("put writes the same keys", () => {
+    const sf = ts.createSourceFile("t.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+    const entity = resolveEntities(ts, sf)[0]!
+    const params = buildParamsOrThrow({ entity, type: "put", arguments: record })
+
+    const schema = DynamoSchema.make({ name: "Help-Desk", version: 3 })
+    const indexes = {
+      primary: primaryKey,
+      byTeam: KeyComposer.normalizeGsiConfig(gsis.byTeam),
+    }
+    const expected = KeyComposer.composeAllKeys(schema, "Ticket", 1, indexes, record)
+    expect(expected.gsi1pk).toBe("$help-desk#v3#Ticket#teamId_Team-B")
+    for (const [field, value] of Object.entries(expected)) {
+      expect(params.Item![field], field).toBe(value)
+    }
+  })
 })
