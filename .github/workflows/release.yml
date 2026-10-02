@@ -29,11 +29,8 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      # pnpm version comes from `packageManager` in the root package.json.
       - uses: pnpm/action-setup@v5
-        with:
-          # Pin to pnpm 10 — matches ci.yml. See the rationale comment
-          # there for the pnpm 11 ERR_PNPM_IGNORED_BUILDS issue.
-          version: 10
 
       - uses: actions/setup-node@v6
         with:

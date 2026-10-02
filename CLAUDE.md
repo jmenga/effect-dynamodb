@@ -1,6 +1,6 @@
 # CLAUDE.md — Effect DynamoDB ORM
 
-> **Version:** This project targets **Effect v4** (4.0.0-rc as of 2026-08 — release candidate, published from the main [Effect-TS/effect](https://github.com/Effect-TS/effect) repo). Some v4 APIs still live under `effect/unstable/*` and may change before stable. The v3 codebase is preserved at git tag `effect-dynamodb-v3`.
+> **Version:** This project targets **Effect v4** (`effect@^4.0.0`, stable since 2026-10-01, published from the main [Effect-TS/effect](https://github.com/Effect-TS/effect) repo). The former `effect/unstable/*` modules now live at top-level paths (`effect/http`, `effect/http-api`, …); modules still tagged `@stability unstable` may change in minor releases. Toolchain: TypeScript 6, pnpm 12 (pinned via `packageManager`), vitest 5. The v3 codebase is preserved at git tag `effect-dynamodb-v3`.
 
 ## Project Overview
 
@@ -246,7 +246,7 @@ If the `Agent` tool's `isolation: "worktree"` parameter is available for the tas
 - **No tacit style** — always explicit lambdas: `Effect.map((x) => fn(x))`.
 - **`run*` at the edge only** — never `runPromise`/`runSync` inside an Effect.
 - **Testing** — `@effect/vitest` with `it.effect` / `it.scoped`. Mock `DynamoClient` via `mockDynamoClientLayer({ putItem: mockPutItem, ... })` from `test/helpers/MockDynamoClient.ts` — it supplies a dying default for every operation, so a test declares only what it exercises and a new operation on `DynamoClientService` needs a default added in exactly one place. Never hand-roll a full `Layer.succeed(DynamoClient, { ... })` literal. Use `Effect.provide(layer, { local: true })` for test isolation.
-- **Packages** — Unstable APIs live under `effect/unstable/*`.
+- **Packages** — There is no `effect/unstable/*` namespace in 4.0.0; import former unstable modules from their top-level paths (`effect/http`, `effect/http-api`). `Config` constructors are PascalCase (`Config.String`, `Config.Int`).
 
 ### Critical Anti-Patterns
 
@@ -260,6 +260,7 @@ Do NOT:
 - Use `yield* ref` / `yield* deferred` / `yield* fiber` — use `Ref.get`/`Deferred.await`/`Fiber.join` (not Yieldable)
 - Use v3 service APIs (`Context.Tag`, `Effect.Service`) — use `Context.Service`
 - Use v3 Schema APIs (`Schema.filter`, `Schema.fromKey`, `Schema.Literal`) — use `.check()`, `.withKey()`, `Schema.Literals`
+- Use pre-GA names (`SchemaGetter.transformOrFail`, `Config.string`, `effect/unstable/*`) — use `SchemaGetter.transformEffect`, `Config.String`, top-level module paths
 - Put DynamoDB concepts in domain models — keep models pure, Entity handles DynamoDB binding
 - Extract `A`/`E`/`R` from entity ops via `Effect.Effect<infer A>` — match against `EntityOp<infer A, ...>` instead
 
@@ -522,5 +523,5 @@ Each of the four publishable packages must be configured on npmjs.com with this 
 ## MCP Servers
 
 - **effect-docs** — Effect TS documentation search. Use `effect_docs_search` to search and `get_effect_doc` to retrieve specific docs. **Note:** May serve v3 documentation until v4 is stable — cross-reference with migration guides.
-- v4 source: https://github.com/Effect-TS/effect — ground truth for v4 APIs (the RC is published from the main repo; effect-smol was the beta-era home)
+- v4 source: https://github.com/Effect-TS/effect — ground truth for v4 APIs (effect-smol was the beta-era home)
 - v4 migration: https://github.com/Effect-TS/effect/blob/main/MIGRATION.md

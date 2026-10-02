@@ -3,6 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@12.8.1",
   "scripts": {
     "build": "pnpm -r build",
     "test": "pnpm -r test",
@@ -20,12 +21,5 @@
     "@changesets/changelog-github": "^0.6.0",
     "@changesets/cli": "^2.31.0",
     "tsx": "^4.21.0"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild",
-      "msgpackr-extract",
-      "sharp"
-    ]
   }
 }
