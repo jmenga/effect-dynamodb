@@ -11,6 +11,7 @@ import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Effect, Schema } from "effect"
 import type { Entity } from "../Entity.js"
 import { toAttributeMap } from "../Marshaller.js"
+import type { ReturnValuesMode, UpdateState } from "./EntityOps.js"
 
 /**
  * Generate a wire-form timestamp value for the configured encoding from a
@@ -137,13 +138,19 @@ export const batchRejectReason = (entity: Entity, opType: "put" | "delete"): str
  *
  * `Batch.write` rejects BOTH directions (**EDD-9049**) — see `batchRejectReason`.
  *
+ * **What a transaction cannot carry at all**, whoever compiles it: a cascade
+ * (**EDD-9056** — a follow-up write after the update commits), `returnValues`
+ * on an update or delete (**EDD-9057** — a transaction returns no item
+ * attributes), and an update of a vector-indexed entity (**EDD-9058** — the
+ * embedding needs the `Embedder` service).
+ *
  * `capability` names what the caller would have to give up, so the message can
  * say why rather than just "unsupported".
  */
 export const rejectUnsupportedOp = (
   entity: Entity,
   operation: string,
-  opType: "put" | "delete",
+  opType: "put" | "update" | "delete",
   putKind: "put" | "create" | "upsert" | undefined,
   /**
    * The op's own input, for the one gate whose dependency the caller can
@@ -151,6 +158,17 @@ export const rejectUnsupportedOp = (
    * for any caller with none to offer — both read as "the field is absent".
    */
   input?: unknown,
+  details?: {
+    /** An update's accumulated state (`.cascade()`, `.returnValues()`, …). */
+    readonly updateState?: UpdateState | undefined
+    /** A delete's `.returnValues()`. */
+    readonly returnValues?: ReturnValuesMode | undefined
+    /**
+     * The caller reads the stored row before compiling (`transactWrite`'s
+     * pre-pass), so a multi-item delete is buildable and EDD-9048 does not apply.
+     */
+    readonly readsStoredRow?: boolean | undefined
+  },
 ): Effect.Effect<void, ValidationError> => {
   const fail = (capability: string, reason: string) =>
     new ValidationError({
@@ -171,9 +189,44 @@ export const rejectUnsupportedOp = (
     )
   }
 
+  // --- what no transaction item can carry (EDD-9056 – EDD-9058) -----------
+  if (opType === "update" && details?.updateState?.cascade !== undefined) {
+    return Effect.fail(
+      fail(
+        "[EDD-9056] cascade",
+        "a cascade is a follow-up write to other entities after the update commits, so it " +
+          "cannot share the transaction. Run the update as its own operation.",
+      ),
+    )
+  }
+  const returnValues =
+    opType === "update" ? details?.updateState?.returnValues : details?.returnValues
+  if (opType !== "put" && returnValues !== undefined) {
+    return Effect.fail(
+      fail(
+        "[EDD-9057] returnValues",
+        `a transaction returns no item attributes. Run the ${opType} as its own operation ` +
+          "to read them.",
+      ),
+    )
+  }
+  if (opType === "update" && Object.keys(entity._vectorIndexes ?? {}).length > 0) {
+    return Effect.fail(
+      fail(
+        "[EDD-9058] updating an entity with vector indexes",
+        "recomputing the embedding calls the Embedder service, which this path does not " +
+          "provide. Run the update as its own operation.",
+      ),
+    )
+  }
+
   // --- multi-item lifecycle, delete direction (EDD-9048) -------------------
   // The put direction is EXPANDED instead — see the doc comment.
-  if (opType === "delete" && entity._multiItemWriteFeatures.length > 0) {
+  if (
+    opType === "delete" &&
+    details?.readsStoredRow !== true &&
+    entity._multiItemWriteFeatures.length > 0
+  ) {
     return Effect.fail(
       fail(
         `[EDD-9048] deleting an entity configured with ${describeFeatures(entity._multiItemWriteFeatures)}`,

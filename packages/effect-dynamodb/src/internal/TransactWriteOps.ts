@@ -168,9 +168,17 @@ export const planTransactWriteOps = (
       if (op != null && typeof op === "object" && ConditionCheckTypeId in op) continue
       const info = extractTransactable(op)
       if (!info) continue
+      // Refused before the read, so an op no transaction can carry costs nothing.
       if (info.opType === "update" && info.updateState !== undefined) {
+        yield* rejectUnsupportedOp(info.entity, "transactWrite", "update", undefined, undefined, {
+          updateState: info.updateState,
+        })
         plans.set(opIndex, yield* info.entity._planUpdate(info.key, info.updateState))
       } else if (info.opType === "delete" && info.entity._multiItemWriteFeatures.length > 0) {
+        yield* rejectUnsupportedOp(info.entity, "transactWrite", "delete", undefined, undefined, {
+          returnValues: info.returnValues,
+          readsStoredRow: true,
+        })
         plans.set(opIndex, yield* info.entity._planDelete(info.key, info.condition))
       }
     }
@@ -255,7 +263,9 @@ export const buildTransactWriteItems = (
           condition: compileOpCondition(info.entity, info.condition),
         })
       } else if (info.opType === "delete") {
-        yield* rejectUnsupportedOp(info.entity, operation, "delete", undefined)
+        yield* rejectUnsupportedOp(info.entity, operation, "delete", undefined, undefined, {
+          returnValues: info.returnValues,
+        })
         opInfos.push({
           type: "delete",
           entity: info.entity,

@@ -14,19 +14,23 @@ multi-item delete needs (sentinel releases, the retain snapshot, the soft-delete
 tombstone), and the read-merge-`Put` plus sentinel rotation an update touching a
 `unique` field needs, derive from the **stored** row, so `transactWrite` reads
 each such row first — the same read the standalone op makes — by running the
-entity's own prepare step. A plain update needs no read and compiles to a
-single `Update` item.
+entity's own prepare step. A plain update compiles to a single `Update` item and
+reads only where the standalone update does (`clearMap`, ref hydration).
 
-The read is guarded: the op's main item carries a condition on what was read
-(the version on a versioned entity, otherwise every `unique` field), so a row
-changed between the read and the write cancels the transaction instead of
-orphaning a sentinel.
+The read is guarded: the op's main item carries a condition on what was read —
+that the row still exists, plus the version on a versioned entity, otherwise
+every `unique` field — so a row changed or deleted between the read and the
+write cancels the transaction instead of orphaning a sentinel, writing a second
+tombstone or re-creating the row. A transaction whose updates all resolve to no
+write sends nothing, as the standalone no-op update does.
 
 `transactWrite`'s error channel gains the read's outcomes — `ItemNotFound`,
 `OptimisticLockError` (a stale `expectedVersion`) and `RefNotFound` — surfaced
-before anything is sent. Updates with `.cascade(...)` or `.returnValues(...)`, and
-updates of entities with `vectorIndexes`, are refused with a `ValidationError`
-naming the feature.
+before anything is sent. A transaction refuses, with a `ValidationError`, an
+update `.cascade(...)` (**EDD-9056**), `.returnValues(...)` on an update or a
+delete (**EDD-9057**), and an update of an entity with `vectorIndexes`
+(**EDD-9058**). A delete's `.returnValues(...)` used to be dropped silently by
+`transactWrite` and `EventStore.append({ additionalItems })`; both now refuse it.
 
 `EventStore.append({ additionalItems })` and `Batch.write` are unchanged: they run
 no read, so they keep rejecting these deletes, and neither accepts `update` at the

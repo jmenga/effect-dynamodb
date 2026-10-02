@@ -212,7 +212,7 @@ export const transactGet = <const T extends ReadonlyArray<AnyGet>>(
  * ```typescript
  * yield* Transaction.transactWrite([
  *   Users.put({ userId: "u-1", ... }),
- *   Users.update({ userId: "u-2" }).set({ email: "b@example.com" }),
+ *   Users.update({ userId: "u-2" }).pipe(Entity.set({ email: "b@example.com" })),
  *   Posts.delete({ postId: "p-3" }),
  *   Users.get({ userId: "u-1" }).pipe(Transaction.check(expr)),
  * ])
@@ -252,6 +252,10 @@ export const transactWrite = (
       "transactWrite",
       plans,
     )
+
+    // Every op resolved to no write (an update with nothing to set — which is a
+    // no-op standalone too). DynamoDB rejects an empty TransactItems list.
+    if (transactItems.length === 0) return
 
     // Counted AFTER expansion: one op can emit several items (a `unique` +
     // `retain` put emits the item, a sentinel per constraint, and the snapshot),

@@ -2665,7 +2665,11 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9054` | `Query.ts` | A client-side predicate (`.filterBy()`) and a projection (`.select()`) are both active — the predicate is an opaque closure, so its attribute reads cannot be borrowed into the `ProjectionExpression` the way key attributes are, and it would be handed items missing the fields it tests |
 | `EDD-9055` | `KeyComposer.ts` (via `DynamoClient.ts`, `Collection.ts`) | A collection's members compose its keys with different casings (index `casing` vs schema `casing`) — they share one physical index, so their keys would never meet |
 
-Next free code: **`EDD-9056`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+| `EDD-9056` | `internal/TransactableOps.ts` | An `update` with `.cascade(...)` in a transaction — a cascade is a follow-up write to other entities after the update commits, so it cannot share the transaction |
+| `EDD-9057` | `internal/TransactableOps.ts` | `.returnValues(...)` on an `update` or `delete` in a transaction — a transaction returns no item attributes, so the setting would be dropped |
+| `EDD-9058` | `internal/TransactableOps.ts` | An `update` of an entity with `vectorIndexes` in a transaction — recomputing the embedding needs the `Embedder` service, which the transact compile step does not provide |
+
+Next free code: **`EDD-9059`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 

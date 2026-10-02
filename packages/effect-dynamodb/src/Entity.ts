@@ -539,10 +539,11 @@ export interface Entity<
 
   /**
    * @internal Compile a `delete` into the transact items it would issue — the
-   * `delete` counterpart of `_planUpdate`. For an entity with `unique`,
-   * `versioned: { retain: true }` or `softDelete` this reads the stored row to
-   * build the sentinel releases, snapshot and tombstone — the read whose
-   * absence is why the plain compile path rejects these deletes (EDD-9048).
+   * `delete` counterpart of `_planUpdate`. For an entity with `unique` or
+   * `softDelete` this reads the stored row to build the sentinel releases, the
+   * tombstone and (with `retain` too) the snapshot — the read whose absence is
+   * why the plain compile path rejects these deletes (EDD-9048). A `retain`-only
+   * delete is one `Delete` with no read and no snapshot, as it is standalone.
    */
   readonly _planDelete: (
     key: unknown,
@@ -2482,47 +2483,6 @@ const makeImpl = <
   // ---------------------------------------------------------------------------
 
   /**
-   * Update features a transaction item cannot carry. Checked before the plan
-   * is built so a rejection names the feature rather than surfacing later as
-   * a missing dependency or a silently dropped step.
-   */
-  const rejectUnplannableUpdate = (uState: UpdateState): Effect.Effect<void, ValidationError> => {
-    const fail = (capability: string, reason: string) =>
-      new ValidationError({
-        entityType,
-        operation: "transactWrite.update",
-        cause: `transactWrite.update: ${capability} is not supported here — ${reason}`,
-      })
-    if (uState.cascade !== undefined) {
-      return Effect.fail(
-        fail(
-          "cascade",
-          "a cascade is a follow-up write to other entities after the update commits, so it " +
-            "cannot share the transaction. Run the update as its own operation.",
-        ),
-      )
-    }
-    if (uState.returnValues !== undefined) {
-      return Effect.fail(
-        fail(
-          "returnValues",
-          "a transaction returns no item attributes. Run the update as its own operation to read them.",
-        ),
-      )
-    }
-    if (hasVectorIndexes) {
-      return Effect.fail(
-        fail(
-          "updating an entity with vector indexes",
-          "recomputing the embedding calls the Embedder service, which this path does not " +
-            "provide. Run the update as its own operation.",
-        ),
-      )
-    }
-    return Effect.void
-  }
-
-  /**
    * The condition that closes the window between a plan's read and its write.
    *
    * A plan derives side items from the row it read — the sentinel to release,
@@ -2533,43 +2493,44 @@ const makeImpl = <
    * the main item on what was read turns that race into a cancelled
    * transaction instead of a silently wrong write.
    *
+   * Always, the row must still exist (`attribute_exists` on the partition
+   * key). Without it a concurrent delete slips through every other predicate
+   * here that a missing attribute satisfies (`attribute_not_exists` on an
+   * unset unique field), and the plan then writes a second tombstone or a
+   * read-merge `Put` that re-creates the deleted row. On top of that:
+   *
    * - **Versioned** — every write bumps the version, so equality on it proves
    *   the whole row is unchanged, which covers snapshots and tombstones too.
    * - **Unversioned** — each `unique` field must still hold the value read,
    *   which is what the sentinel items depend on. Other fields have no cheap
    *   guard: a tombstone or merged `Put` copies them as read, exactly as the
-   *   standalone op does.
-   *
-   * Returns `undefined` when there is nothing to guard.
+   *   standalone op does. `versioned` is the way to get whole-row protection.
    */
   const readGuard = (
     raw: globalThis.Record<string, unknown>,
-  ):
-    | {
-        readonly expression: string
-        readonly names: globalThis.Record<string, string>
-        readonly values: globalThis.Record<string, AttributeValue>
-      }
-    | undefined => {
-    if (systemFields.version) {
-      const names = { "#edd_rg_ver": systemFields.version }
-      const stored = raw[systemFields.version]
-      return stored === undefined
-        ? { expression: "attribute_not_exists(#edd_rg_ver)", names, values: {} }
-        : {
-            expression: "#edd_rg_ver = :edd_rg_ver",
-            names,
-            values: { ":edd_rg_ver": toAttributeValue(stored) },
-          }
+  ): {
+    readonly expression: string
+    readonly names: globalThis.Record<string, string>
+    readonly values: globalThis.Record<string, AttributeValue>
+  } => {
+    const parts: Array<string> = ["attribute_exists(#edd_rg_pk)"]
+    const names: globalThis.Record<string, string> = {
+      "#edd_rg_pk": config.indexes.primary.pk.field,
     }
-    if (config.unique == null) return undefined
-    const fields = [
-      ...new Set(Object.values(config.unique).flatMap((def) => [...resolveUniqueFields(def)])),
-    ]
-    if (fields.length === 0) return undefined
-    const parts: Array<string> = []
-    const names: globalThis.Record<string, string> = {}
     const values: globalThis.Record<string, AttributeValue> = {}
+    if (systemFields.version) {
+      names["#edd_rg_ver"] = systemFields.version
+      const stored = raw[systemFields.version]
+      if (stored === undefined) {
+        parts.push("attribute_not_exists(#edd_rg_ver)")
+      } else {
+        values[":edd_rg_ver"] = toAttributeValue(stored)
+        parts.push("#edd_rg_ver = :edd_rg_ver")
+      }
+      return { expression: parts.join(" AND "), names, values }
+    }
+    const constraints = config.unique == null ? [] : Object.values(config.unique)
+    const fields = [...new Set(constraints.flatMap((def) => [...resolveUniqueFields(def)]))]
     fields.forEach((field, i) => {
       const storedName = resolveDbName(field)
       names[`#edd_rg_${i}`] = storedName
@@ -2596,7 +2557,6 @@ const makeImpl = <
     raw: globalThis.Record<string, unknown>,
   ): T => {
     const guard = readGuard(raw)
-    if (guard === undefined) return target
     const values = { ...target.ExpressionAttributeValues, ...guard.values }
     return {
       ...target,
@@ -4548,11 +4508,10 @@ const makeImpl = <
     key: unknown,
     uState: UpdateState,
   ): Effect.Effect<TransactPlan, PlanUpdateError, DynamoClient | TableConfig> =>
-    rejectUnplannableUpdate(uState).pipe(
-      Effect.flatMap(() => prepareUpdate(key, uState)),
+    prepareUpdate(key, uState).pipe(
       Effect.map((plan) => ({ items: updatePlanItems(plan) })),
-      // Embedding runs only for an entity with vector indexes, which
-      // `rejectUnplannableUpdate` has already refused.
+      // Embedding runs only for an entity with vector indexes, whose updates
+      // `transactWrite` refuses before planning (`rejectUnsupportedOp`, EDD-9058).
       Effect.catchTag("EmbeddingError", (e) => Effect.die(e)),
     )
 
@@ -6939,6 +6898,11 @@ export interface TransactableInfo {
   readonly putKind?: PutKind | undefined
   /** For `opType: "update"` — the accumulated update (`.set()`, `.remove()`, …). */
   readonly updateState?: UpdateState | undefined
+  /**
+   * For `opType: "delete"` — the op's `.returnValues()`. Forwarded so a
+   * transact path can refuse it (EDD-9057) rather than drop it.
+   */
+  readonly returnValues?: ReturnValuesMode | undefined
 }
 
 /** @internal */
@@ -6959,6 +6923,7 @@ interface InternalEntityDelete {
   readonly _entity: Entity
   readonly _key: globalThis.Record<string, unknown>
   readonly _condition?: Expr | ConditionInput | undefined
+  readonly _returnValues?: ReturnValuesMode | undefined
 }
 
 const isEntityOp = (op: object): op is InternalEntityOp => EntityOpTypeId in op
@@ -7020,6 +6985,7 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
       entity: target._entity,
       key: target._key,
       condition: target._condition,
+      returnValues: target._returnValues,
     }
   }
 

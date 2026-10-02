@@ -682,12 +682,12 @@ Anything whose entity contract needs a different verb or a service the compile s
 | Op / entity feature | Why it is refused |
 |---|---|
 | `upsert()` | An `UpdateItem` using `if_not_exists` for `createdAt`, immutable fields and the version counter. A `Put` would reset all three |
-| `refs` | Write-time ref hydration reads the referenced entity; the compile step cannot, so the ref attribute would be written empty |
+| `put()` / `create()` of an entity with `refs` | Write-time ref hydration reads the referenced entity; the put compile step does not read, so the ref attribute would be written empty. (An `update()` of such an entity is fine — its plan hydrates refs as the standalone update does.) |
 | `generatedId` | Id generation needs the `Crypto` service |
 | `vectorIndexes` | Computing the embedding needs the `Embedder` service; the item would drop out of the index |
-| `update()` with `.cascade(...)` | A cascade is a follow-up write to other entities after the update commits, so it cannot share the transaction |
-| `update()` / `delete()` with `.returnValues(...)` | A transaction returns no item attributes |
-| `update()` of an entity with `vectorIndexes` | Recomputing the embedding needs the `Embedder` service |
+| `update()` with `.cascade(...)` | **EDD-9056.** A cascade is a follow-up write to other entities after the update commits, so it cannot share the transaction |
+| `update()` / `delete()` with `.returnValues(...)` | **EDD-9057.** A transaction returns no item attributes |
+| `update()` of an entity with `vectorIndexes` | **EDD-9058.** Recomputing the embedding needs the `Embedder` service |
 
 ### Multi-item puts expand
 
@@ -714,9 +714,11 @@ yield* Transaction.transactWrite([
 ])
 ```
 
-A plain `update` (no `retain`, no `unique` field touched) needs no read and compiles to a single `Update` item.
+A plain `update` (no `retain`, no `unique` field touched) compiles to a single `Update` item. It reads only where the standalone update does — to resolve a `clearMap`, or to hydrate a ref.
 
-**The read is guarded.** A row that changes between the read and the transaction would make the planned items describe a row that no longer exists — a delete planned against email A, landing after a concurrent update moved it to B, would release A and orphan B's sentinel for good. So the op's own item carries a condition on what was read: the version, for a versioned entity (which proves the whole row is unchanged), otherwise every `unique` field's value. A concurrent change cancels the transaction (`TransactionCancelled`) instead. On an unversioned entity, non-unique fields have no such guard: a tombstone or a read-merge `Put` copies them as read, exactly as the standalone op does.
+**The read is guarded.** A row that changes between the read and the transaction would make the planned items describe a row that no longer exists — a delete planned against email A, landing after a concurrent update moved it to B, would release A and orphan B's sentinel for good. So the op's own item carries a condition on what was read: that the row still exists, plus the version for a versioned entity (which proves the whole row is unchanged), otherwise every `unique` field's value. A concurrent change — or a concurrent delete — cancels the transaction (`TransactionCancelled`) instead.
+
+On an unversioned entity, non-unique fields have no such guard: a tombstone or a read-merge `Put` copies them as read, exactly as the standalone op does. Use `versioned` when you need whole-row protection.
 
 **The read's outcomes surface on the error channel,** before anything is sent: `ItemNotFound` when the row is absent, `OptimisticLockError` when an update's `expectedVersion` no longer matches, `RefNotFound` from ref hydration.
 

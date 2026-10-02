@@ -167,6 +167,36 @@ const SoftNotes = Entity.make({
   softDelete: true,
 })
 
+class FullNote extends Schema.Class<FullNote>("FullNote")({
+  noteId: Schema.String,
+  slug: Schema.String,
+  body: Schema.String,
+}) {}
+
+/** Every multi-item delete feature at once: tombstone, snapshot and sentinel. */
+const FullNotes = Entity.make({
+  model: FullNote,
+  entityType: "FullNote",
+  primaryKey: { pk: { field: "pk", composite: ["noteId"] }, sk: { field: "sk", composite: [] } },
+  unique: { slug: ["slug"] },
+  versioned: { retain: true },
+  softDelete: true,
+})
+
+class VectorDoc extends Schema.Class<VectorDoc>("VectorDoc")({
+  docId: Schema.String,
+  body: Schema.String,
+}) {}
+
+const VectorDocs = Entity.make({
+  model: VectorDoc,
+  entityType: "VectorDoc",
+  primaryKey: { pk: { field: "pk", composite: ["docId"] }, sk: { field: "sk", composite: [] } },
+  vectorIndexes: {
+    byBody: { name: "vec1", dimensions: 4, distance: "cosine", source: { fields: ["body"] } },
+  },
+})
+
 const MainTable = Table.make({
   schema: AppSchema,
   entities: {
@@ -179,6 +209,8 @@ const MainTable = Table.make({
     SparseMembers,
     RenamedMembers,
     SoftNotes,
+    FullNotes,
+    VectorDocs,
   },
 })
 
@@ -1026,8 +1058,10 @@ describe("Transaction", () => {
         expect(fromAttributeMap(items[0].Delete.Key).pk).toBe(
           "$myapp#v1#lifecyclemember#memberid_m-1",
         )
-        // Read guard: versioned, so the row must still be at the version read.
-        expect(items[0].Delete.ConditionExpression).toBe("#edd_rg_ver = :edd_rg_ver")
+        // Read guard: the row still exists, at the version read (versioned).
+        expect(items[0].Delete.ConditionExpression).toBe(
+          "attribute_exists(#edd_rg_pk) AND #edd_rg_ver = :edd_rg_ver",
+        )
         expect(fromAttributeMap(items[0].Delete.ExpressionAttributeValues)[":edd_rg_ver"]).toBe(1)
         // The release is unconditional: it cannot be what rejects the transaction.
         expect(fromAttributeMap(items[1].Delete.Key).pk).toContain("lifecyclemember.email#a@x.io")
@@ -1078,13 +1112,76 @@ describe("Transaction", () => {
         ])
 
         const del = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Delete
-        // email was unset when read — the guard asserts it still is.
+        // email was unset when read — the guard asserts it still is, and that
+        // the row itself still exists (`attribute_not_exists` alone would also
+        // pass on a row deleted in between).
         expect(del.ConditionExpression).toMatch(
-          /^\(attribute_not_exists\(#edd_rg_0\)\) AND \(.+\)$/,
+          /^\(attribute_exists\(#edd_rg_pk\) AND attribute_not_exists\(#edd_rg_0\)\) AND \(.+\)$/,
         )
         expect(Object.values(del.ExpressionAttributeNames)).toEqual(
           expect.arrayContaining(["email", "label"]),
         )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a softDelete + retain + unique delete emits all four item kinds", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({
+          Item: toAttributeMap({
+            pk: "$myapp#v1#fullnote#noteid_n-1",
+            sk: "$myapp#v1#fullnote",
+            __edd_e__: "FullNote",
+            noteId: "n-1",
+            slug: "hello",
+            body: "b",
+            version: 2,
+          }),
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([FullNotes.delete({ noteId: "n-1" })])
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        expect(items).toHaveLength(4)
+        // main: the live row, guarded on existence + the version read.
+        expect(fromAttributeMap(items[0].Delete.Key).sk).toBe("$myapp#v1#fullnote")
+        expect(items[0].Delete.ConditionExpression).toBe(
+          "attribute_exists(#edd_rg_pk) AND #edd_rg_ver = :edd_rg_ver",
+        )
+        // tombstone: the row relocated to its deleted sort key.
+        const tombstone = fromAttributeMap(items[1].Put.Item)
+        expect(String(tombstone.sk)).toContain("#deleted#")
+        expect(tombstone.deletedAt).toBeDefined()
+        // snapshot: the outgoing version.
+        expect(fromAttributeMap(items[2].Put.Item).sk).toBe("$myapp#v1#fullnote#v#0000002")
+        // sentinel release: unconditional.
+        expect(fromAttributeMap(items[3].Delete.Key).pk).toContain("fullnote.slug#hello")
+        expect(items[3].Delete.ConditionExpression).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects delete returnValues on a plain entity — EDD-9057", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([
+          UserEntity.delete({ userId: "u-1" }).pipe(Entity.returnValues("allOld")),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("EDD-9057")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects delete returnValues on a unique entity — before reading", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([
+          LifecycleMembers.delete({ memberId: "m-1" }).pipe(Entity.returnValues("allOld")),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("EDD-9057")
+        expect(mockGetItem).not.toHaveBeenCalled()
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -1205,9 +1302,15 @@ describe("Transaction", () => {
         const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
         expect(items).toHaveLength(3)
         expect(fromAttributeMap(items[0].Put.Item).email).toBe("new@x.io")
-        // Read guard: unversioned, so the unique field must still hold what was read.
-        expect(items[0].Put.ConditionExpression).toBe("#edd_rg_0 = :edd_rg_0")
-        expect(items[0].Put.ExpressionAttributeNames).toEqual({ "#edd_rg_0": "email" })
+        // Read guard: the row still exists and, unversioned, its unique field
+        // still holds what was read.
+        expect(items[0].Put.ConditionExpression).toBe(
+          "attribute_exists(#edd_rg_pk) AND #edd_rg_0 = :edd_rg_0",
+        )
+        expect(items[0].Put.ExpressionAttributeNames).toEqual({
+          "#edd_rg_pk": "pk",
+          "#edd_rg_0": "email",
+        })
         expect(fromAttributeMap(items[0].Put.ExpressionAttributeValues)[":edd_rg_0"]).toBe(
           "old@x.io",
         )
@@ -1323,7 +1426,60 @@ describe("Transaction", () => {
         ]).pipe(Effect.flip)
 
         expect(error._tag).toBe("ValidationError")
-        expect(String((error as ValidationError).cause)).toContain("returnValues")
+        expect(String((error as ValidationError).cause)).toContain("[EDD-9057] returnValues")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects cascade — EDD-9056", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([
+          RefProjects.update({ projectId: "p-1" }).pipe(
+            Entity.set({ projectName: "Renamed" }),
+            Entity.cascade({ targets: [RefTasks] }),
+          ),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("[EDD-9056] cascade")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects an update of a vector-indexed entity — EDD-9058", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([
+          VectorDocs.update({ docId: "d-1" }).pipe(Entity.set({ body: "new" })),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("EDD-9058")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("patch() keeps its attribute_exists guard on the Update item", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([
+          UserEntity.patch({ userId: "u-1" }).pipe(Entity.set({ name: "Patched" })),
+        ])
+
+        const update = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Update
+        expect(update.ConditionExpression).toContain("attribute_exists")
+        expect(Object.values(update.ExpressionAttributeNames)).toContain("pk")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a transaction of only no-op updates sends nothing", () =>
+      Effect.gen(function* () {
+        // SparseMembers has no GSIs and no timestamps, so an empty set writes
+        // nothing (UserEntity would still re-compose its GSI key).
+        yield* Transaction.transactWrite([
+          SparseMembers.update({ memberId: "m-1" }).pipe(Entity.set({})),
+        ])
+
         expect(mockTransactWriteItems).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )

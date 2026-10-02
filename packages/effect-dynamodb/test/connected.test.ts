@@ -2076,6 +2076,43 @@ describeConnected("Connected integration tests", () => {
       }).pipe(provide),
     )
 
+    it.effect("a retain entity's transactional update bumps the version and snapshots it", () =>
+      Effect.gen(function* () {
+        yield* Users.put({
+          userId: "u-txr",
+          email: "txr@test.com",
+          displayName: "v1",
+          role: "member",
+          createdBy: "test",
+        }).asEffect()
+        const before = yield* Users.get({ userId: "u-txr" }).pipe(Entity.asRecord)
+
+        // displayName is not unique: the retain path alone forces the read-merge Put.
+        yield* Transaction.transactWrite([
+          Users.update({ userId: "u-txr" }).pipe(Entity.set({ displayName: "v2" })),
+          txTask("t-txr"),
+        ])
+
+        const after = yield* Users.get({ userId: "u-txr" }).pipe(Entity.asRecord)
+        expect(after.displayName).toBe("v2")
+        expect(after.version).toBe(before.version + 1)
+        expect(yield* taskExists("t-txr")).toBe(true)
+
+        // The outgoing version was retained, exactly as a standalone update does.
+        const client = yield* DynamoClient
+        const snapshot = yield* client.getItem({
+          TableName: tableName,
+          Key: {
+            pk: { S: "$connected-test#v1#user#userid_u-txr" },
+            sk: {
+              S: `$connected-test#v1#user#v#${String(before.version).padStart(7, "0")}`,
+            },
+          },
+        })
+        expect(snapshot.Item?.displayName?.S).toBe("v1")
+      }).pipe(provide),
+    )
+
     it.effect("a taken unique value on update rolls the whole transaction back", () =>
       Effect.gen(function* () {
         // tx@test.com is held by u-tx (first test in this block).
