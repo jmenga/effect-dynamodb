@@ -3397,6 +3397,12 @@ const makeImpl = <
         readonly names: globalThis.Record<string, string>
         readonly values: globalThis.Record<string, AttributeValue>
         readonly conditionExpression: string | undefined
+        /**
+         * The version the write is conditioned on — the caller's
+         * `expectedVersion`, or the version a `clearMap` read found. A rejected
+         * condition is reported as an `OptimisticLockError` against it.
+         */
+        readonly casVersion: number | undefined
       }
     | {
         readonly _tag: "Transact"
@@ -3792,13 +3798,17 @@ const makeImpl = <
               Put: {
                 TableName: tableName,
                 Item: marshalledNewItem,
-                ...(retainCondParts.length > 0
-                  ? {
-                      ConditionExpression: retainCondParts.join(" AND "),
-                      ExpressionAttributeNames: retainNames,
-                      ExpressionAttributeValues: retainValues,
-                    }
-                  : {}),
+                // `conditionFields` omits an empty values map, which DynamoDB
+                // rejects — e.g. an unversioned `.condition({ attributeExists })`.
+                ...conditionFields(
+                  retainCondParts.length > 0
+                    ? {
+                        expression: retainCondParts.join(" AND "),
+                        names: retainNames,
+                        values: retainValues,
+                      }
+                    : undefined,
+                ),
               },
             },
             kind: "main",
@@ -4225,9 +4235,11 @@ const makeImpl = <
       // Sparse-map .clearMap — Get-then-Update helper. Reads the current
       // item with a consistent read to discover which `<prefix>#*` attrs
       // exist, then folds the resulting REMOVEs into this same UpdateItem.
-      // The version CAS (when configured) provides atomicity; non-versioned
-      // entities are best-effort (a concurrent writer can add a new bucket
-      // between the read and the update — that bucket survives).
+      // On a versioned entity the update is conditioned on the version that
+      // read found (unless the caller pinned `expectedVersion`), so a writer
+      // that adds a bucket in between makes it fail instead of surviving the
+      // clear. Non-versioned entities are best-effort: that bucket survives.
+      let readVersion: number | undefined
       if (uState.sparseClearFields && uState.sparseClearFields.length > 0) {
         for (const field of uState.sparseClearFields) {
           if (!hasSparseFields || !(field in sparseFields)) {
@@ -4245,6 +4257,10 @@ const makeImpl = <
           ConsistentRead: true,
         })
         if (clearGetResult.Item) {
+          if (systemFields.version) {
+            const stored = fromAttributeMap(clearGetResult.Item)[systemFields.version]
+            if (typeof stored === "number") readVersion = stored
+          }
           const clearItemKeys = Object.keys(clearGetResult.Item)
           for (const field of uState.sparseClearFields) {
             const sparse = sparseFields[field]!
@@ -4281,9 +4297,10 @@ const makeImpl = <
 
       // Build condition expression — combine optimistic lock + user condition
       const condParts: Array<string> = []
-      if (evExpected !== undefined && systemFields.version) {
+      const casVersion = systemFields.version ? (evExpected ?? readVersion) : undefined
+      if (casVersion !== undefined && systemFields.version) {
         names["#condVer"] = systemFields.version
-        values[":expectedVer"] = toAttributeValue(evExpected)
+        values[":expectedVer"] = toAttributeValue(casVersion)
         condParts.push("#condVer = :expectedVer")
       }
       if (userCond) {
@@ -4303,6 +4320,7 @@ const makeImpl = <
         names,
         values,
         conditionExpression,
+        casVersion,
       } satisfies UpdatePlan
     })
 
@@ -4317,7 +4335,6 @@ const makeImpl = <
 
       const client = yield* DynamoClient
       const userCond = uState.condition
-      const evExpected = uState.expectedVersion
       const { encodedKey } = plan
 
       const decoded =
@@ -4373,10 +4390,11 @@ const makeImpl = <
                             }
                           }
                           // The main item — version conflict or user condition
-                          const mainIndex = plan.items.findIndex((p) => p.kind === "main")
-                          if (reasons[mainIndex]?.Code === "ConditionalCheckFailed") {
-                            return mainItemRejection()
-                          }
+                          const mainRejected = plan.items.some(
+                            (p, i) =>
+                              p.kind === "main" && reasons[i]?.Code === "ConditionalCheckFailed",
+                          )
+                          if (mainRejected) return mainItemRejection()
                         }
                       }
                       if (isAwsConditionalCheckFailed(err.cause)) {
@@ -4409,11 +4427,11 @@ const makeImpl = <
                 .pipe(
                   Effect.mapError((err) => {
                     if (isAwsConditionalCheckFailed(err.cause)) {
-                      if (evExpected !== undefined) {
+                      if (plan.casVersion !== undefined) {
                         return new OptimisticLockError({
                           entityType,
                           key: encodedKey,
-                          expectedVersion: evExpected,
+                          expectedVersion: plan.casVersion,
                           actualVersion: -1,
                         }) as DynamoClientError | OptimisticLockError | ConditionalCheckFailed
                       }
@@ -4787,11 +4805,16 @@ const makeImpl = <
         err: DynamoClientError,
       ): DynamoClientError | ConditionalCheckFailed => {
         if (!plan.userCondition) return err
-        const mainIndex =
-          plan._tag === "Transact" ? plan.items.findIndex((p) => p.kind === "main") : -1
+        // A DeleteItem plan never transacts, so only a Transact plan can be
+        // cancelled — and then only its main item carries a condition.
+        const reasons = isAwsTransactionCancelled(err.cause)
+          ? (err.cause.CancellationReasons ?? [])
+          : []
         const cancelledAtMainItem =
-          isAwsTransactionCancelled(err.cause) &&
-          err.cause.CancellationReasons?.[mainIndex]?.Code === "ConditionalCheckFailed"
+          plan._tag === "Transact" &&
+          plan.items.some(
+            (p, i) => p.kind === "main" && reasons[i]?.Code === "ConditionalCheckFailed",
+          )
         if (cancelledAtMainItem || isAwsConditionalCheckFailed(err.cause)) {
           return new ConditionalCheckFailed({ entityType, key: plan.encodedKey })
         }

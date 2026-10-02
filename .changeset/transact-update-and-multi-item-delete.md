@@ -2,6 +2,8 @@
 "effect-dynamodb": minor
 ---
 
+pr: 129
+
 `Transaction.transactWrite` accepts `update` / `patch`, and deletes of entities with `unique`, `versioned: { retain: true }` or `softDelete`
 
 Both used to be refused with a `ValidationError` (a delete of those entities with
@@ -35,3 +37,14 @@ delete (**EDD-9057**), and an update of an entity with `vectorIndexes`
 `EventStore.append({ additionalItems })` and `Batch.write` are unchanged: they run
 no read, so they keep rejecting these deletes, and neither accepts `update` at the
 type level (the new `TransactWriteUpdateOp` is `transactWrite`-only).
+
+Two fixes reach the standalone `update` too, since it shares the same prepare step:
+
+- **`clearMap` on a versioned entity now conditions the write on the version it
+  read** (unless `expectedVersion` was given). Before, a bucket added between the
+  read and the write survived the clear, despite the documented version CAS. A
+  concurrent write is now an `OptimisticLockError` against the version read.
+- **An update that rotates a `unique` sentinel no longer sends an empty
+  `ExpressionAttributeValues` map**, which DynamoDB rejects. That happened
+  whenever the condition carried no values: for example `patch()` (or
+  `.condition({ attributeExists })`) on an unversioned entity.

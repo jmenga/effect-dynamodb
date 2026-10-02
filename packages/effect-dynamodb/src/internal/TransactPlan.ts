@@ -12,7 +12,8 @@
  * `TransactWriteOps.ts` can consume it without a runtime import cycle.
  */
 
-import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
+import type { TransactWriteItem } from "@aws-sdk/client-dynamodb"
+import type { ExpressionResult } from "../Expression.js"
 
 /**
  * One planned item and what it is for. The role is set where the item is
@@ -43,15 +44,7 @@ export interface TransactPlan {
  * map, and value-free conditions (`attribute_not_exists`, `attribute_exists`)
  * produce one. Shared by `Entity.ts` and `TransactWriteOps.ts`.
  */
-export const conditionFields = (
-  condition:
-    | {
-        readonly expression: string
-        readonly names: Record<string, string>
-        readonly values: Record<string, AttributeValue>
-      }
-    | undefined,
-) =>
+export const conditionFields = (condition: ExpressionResult | undefined) =>
   condition === undefined
     ? {}
     : {

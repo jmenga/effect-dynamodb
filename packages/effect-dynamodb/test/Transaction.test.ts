@@ -1472,6 +1472,24 @@ describe("Transaction", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    it.effect("a standalone patch rotating a sentinel sends no empty values map", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({ Item: storedMember("old@x.io", 1) })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        // patch() conditions on attribute_exists — a value-free predicate. The
+        // entity is unversioned, so the read-merge Put carries no other value.
+        yield* SparseMembers.patch({ memberId: "m-1" })
+          .pipe(Entity.set({ email: "new@x.io" }))
+          .asEffect()
+
+        const put = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Put
+        expect(put.ConditionExpression).toContain("attribute_exists")
+        // DynamoDB rejects an empty ExpressionAttributeValues map.
+        expect(put).not.toHaveProperty("ExpressionAttributeValues")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("a transaction of only no-op updates sends nothing", () =>
       Effect.gen(function* () {
         // SparseMembers has no GSIs and no timestamps, so an empty set writes

@@ -1184,7 +1184,7 @@ class Page extends Schema.Class<Page>('Page')({
   }),
 }) {}
 const PageModel = DynamoModel.configure(Page, { metrics: { storedAs: DynamoModel.SparseMap() } })
-// versioned: { retain: true } makes clearMap atomic.
+// Any `versioned` config makes clearMap atomic: the write CASes on the version its read found.
 const Pages = Entity.make({
   model: PageModel,
   entityType: 'Page',
