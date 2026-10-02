@@ -1,5 +1,11 @@
 # @effect-dynamodb/geo
 
+## 1.21.0
+
+### Minor Changes
+
+- [`e1b5f0d`](https://github.com/jmenga/effect-dynamodb/commit/e1b5f0d311195c200215e2f7d366bd167ac65f5b) Thanks [@mixja](https://github.com/mixja)! - Require Effect 4.0.0 (stable). The `effect` peer dependency moves from `^4.0.0-rc.112` to `^4.0.0`, so pre-release builds of Effect no longer satisfy it. Consumers on an Effect 4 release candidate should upgrade to `effect@4.0.0` and apply the GA renames that affect application code: `Config.string`/`Config.int` → `Config.String`/`Config.Int`, `SchemaGetter.transformOrFail` → `SchemaGetter.transformEffect`, and `effect/unstable/http` / `effect/unstable/httpapi` → `effect/http` / `effect/http-api`. Tests built on `@effect/vitest@4.0.0` need vitest 5. The language-service plugin now compiles with TypeScript 6 and its emitted output is unchanged.
+
 ## 1.20.1
 
 ### Patch Changes
@@ -32,7 +38,6 @@
 
   Two further bugs on the `restore` path, both independent of any rename, are
   fixed alongside:
-
   - **`softDelete: { preserveUnique: true }` made `restore` impossible.** The
     delete deliberately keeps the reservation, so the restore-time sentinel Put's
     `attribute_not_exists` guard could never hold: every restore of a constrained

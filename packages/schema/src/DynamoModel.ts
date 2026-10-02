@@ -291,7 +291,7 @@ export const DateEpoch = (options: {
 
   return Schema.Number.pipe(
     Schema.decodeTo(Schema.DateTimeUtc, {
-      decode: SchemaGetter.transformOrFail((n: number) => {
+      decode: SchemaGetter.transformEffect((n: number) => {
         // Try milliseconds first
         try {
           const asMs = DateTime.makeUnsafe(n)
@@ -339,7 +339,7 @@ export const DateEpoch = (options: {
  */
 export const DateTimeZoned = Schema.String.pipe(
   Schema.decodeTo(Schema.DateTimeZoned, {
-    decode: SchemaGetter.transformOrFail((s: string) => {
+    decode: SchemaGetter.transformEffect((s: string) => {
       // Parse extended ISO format: "2024-01-01T15:00:00+09:00[Asia/Tokyo]"
       const match = s.match(/^(.+)\[(.+)\]$/)
       if (match) {

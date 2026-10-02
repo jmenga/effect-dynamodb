@@ -578,7 +578,7 @@ const step5 = Effect.gen(function* () {
 
 const steps = [step0, step1, step2, step3, step4, step5]
 const program = Effect.gen(function* () {
-  const step = yield* Config.int("STEP").pipe(Config.withDefault(0))
+  const step = yield* Config.Int("STEP").pipe(Config.withDefault(0))
   for (let i = 0; i <= step; i++) {
     yield* steps[i]!
   }

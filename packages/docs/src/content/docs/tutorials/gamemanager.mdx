@@ -33,8 +33,8 @@ pnpm init
 ### 1.2 Install dependencies
 
 ```bash
-pnpm add effect@4.0.0-rc.112 @effect/platform-node@4.0.0-rc.112 effect-dynamodb ulid
-pnpm add -D typescript@^5.9.0 tsx vitest@^4.1.0 @effect/vitest@4.0.0-rc.112 @biomejs/biome@^2.4.4
+pnpm add effect@4.0.0 @effect/platform-node@4.0.0 effect-dynamodb ulid
+pnpm add -D typescript@^6.0.3 tsx vitest@^5.0.3 @effect/vitest@4.0.0 @biomejs/biome@^2.4.4
 ```
 
 ### 1.3 Language Service Plugin
@@ -401,7 +401,7 @@ export class ApiUnprocessableEntity extends Schema.Error<ApiUnprocessableEntity>
 ```ts
 // src/api/TeamsApi.ts
 import { Schema } from "effect"
-import { HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi"
+import { HttpApiEndpoint, HttpApiGroup } from "effect/http-api"
 import { Teams } from "../entities/Teams.js"
 import { TeamListFilter } from "../models/Filters.js"
 import { TeamId } from "../models/Ids.js"
@@ -450,7 +450,7 @@ export const TeamsApi = HttpApiGroup.make("teams").add(
 ```ts
 // src/api/Api.ts
 import type { Schema } from "effect"
-import { HttpApi, OpenApi } from "effect/unstable/httpapi"
+import { HttpApi, OpenApi } from "effect/http-api"
 import { TeamsApi } from "./TeamsApi.js"
 
 export type { Schema }
@@ -465,8 +465,8 @@ export const GameManagerApi = HttpApi.make("gamemanager")
 // src/api/App.ts
 import type { ItemNotFound, UniqueConstraintViolation, Table } from "effect-dynamodb"
 import { type DateTime, Effect, Layer } from "effect"
-import { HttpServer } from "effect/unstable/http"
-import { HttpApiBuilder } from "effect/unstable/httpapi"
+import { HttpServer } from "effect/http"
+import { HttpApiBuilder } from "effect/http-api"
 import { Team } from "../models/Team.js"
 import { TeamService } from "../services/TeamService.js"
 import { GameManagerApi } from "./Api.js"
@@ -625,7 +625,7 @@ import { createServer } from "node:http"
 import { NodeHttpServer, NodeRuntime } from "@effect/platform-node"
 import { DynamoClient } from "effect-dynamodb"
 import { Effect, Layer } from "effect"
-import { HttpMiddleware, HttpRouter, HttpServerRequest } from "effect/unstable/http"
+import { HttpMiddleware, HttpRouter, HttpServerRequest } from "effect/http"
 import { ApiLayer } from "./api/App.js"
 import { MainTable } from "./entities/Schema.js"
 
@@ -895,7 +895,7 @@ export class PlayerService extends Context.Service<PlayerService>()(
 ```ts
 // src/api/PlayersApi.ts
 import { Schema } from "effect"
-import { HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi"
+import { HttpApiEndpoint, HttpApiGroup } from "effect/http-api"
 import { Players } from "../entities/Players.js"
 import { PlayerListFilter } from "../models/Filters.js"
 import { PlayerId } from "../models/Ids.js"
@@ -1050,7 +1050,7 @@ export class CoachService extends Context.Service<CoachService>()("@gamemanager/
 ```ts
 // src/api/CoachesApi.ts
 import { Schema } from "effect"
-import { HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi"
+import { HttpApiEndpoint, HttpApiGroup } from "effect/http-api"
 import { Coaches } from "../entities/Coaches.js"
 import { CoachListFilter } from "../models/Filters.js"
 import { CoachId } from "../models/Ids.js"
@@ -1208,7 +1208,7 @@ export class UmpireService extends Context.Service<UmpireService>()(
 ```ts
 // src/api/UmpiresApi.ts
 import { Schema } from "effect"
-import { HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi"
+import { HttpApiEndpoint, HttpApiGroup } from "effect/http-api"
 import { Umpires } from "../entities/Umpires.js"
 import { UmpireListFilter } from "../models/Filters.js"
 import { UmpireId } from "../models/Ids.js"
@@ -1365,7 +1365,7 @@ export class VenueService extends Context.Service<VenueService>()("@gamemanager/
 ```ts
 // src/api/VenuesApi.ts
 import { Schema } from "effect"
-import { HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi"
+import { HttpApiEndpoint, HttpApiGroup } from "effect/http-api"
 import { Venues } from "../entities/Venues.js"
 import { VenueListFilter } from "../models/Filters.js"
 import { VenueId } from "../models/Ids.js"
@@ -1429,7 +1429,7 @@ Update `Api.ts` to add all groups:
 ```ts
 // src/api/Api.ts
 import type { Schema } from "effect"
-import { HttpApi, OpenApi } from "effect/unstable/httpapi"
+import { HttpApi, OpenApi } from "effect/http-api"
 import { TeamsApi } from "./TeamsApi.js"
 import { PlayersApi } from "./PlayersApi.js"
 import { CoachesApi } from "./CoachesApi.js"
@@ -1454,8 +1454,8 @@ Update `App.ts` — add handler and service layers for each new entity. Each han
 // src/api/App.ts
 import type { ItemNotFound, UniqueConstraintViolation, Table } from "effect-dynamodb"
 import { type DateTime, Effect, Layer } from "effect"
-import { HttpServer } from "effect/unstable/http"
-import { HttpApiBuilder } from "effect/unstable/httpapi"
+import { HttpServer } from "effect/http"
+import { HttpApiBuilder } from "effect/http-api"
 import { Coach } from "../models/Coach.js"
 import { Player } from "../models/Player.js"
 import { Team } from "../models/Team.js"
@@ -1961,7 +1961,7 @@ export class SquadSelectionService extends Context.Service<SquadSelectionService
 ```ts
 // src/api/SquadSelectionsApi.ts
 import { Schema } from "effect"
-import { HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi"
+import { HttpApiEndpoint, HttpApiGroup } from "effect/http-api"
 import { SquadSelections } from "../entities/SquadSelections.js"
 import { SquadListFilter } from "../models/Filters.js"
 import { SquadSelectionId } from "../models/Ids.js"
@@ -2023,7 +2023,7 @@ Update `Api.ts` to add the SquadSelectionsApi group:
 ```ts
 // src/api/Api.ts
 import type { Schema } from "effect"
-import { HttpApi, OpenApi } from "effect/unstable/httpapi"
+import { HttpApi, OpenApi } from "effect/http-api"
 import { CoachesApi } from "./CoachesApi.js"
 import { PlayersApi } from "./PlayersApi.js"
 import { SquadSelectionsApi } from "./SquadSelectionsApi.js"
@@ -2303,7 +2303,7 @@ The MatchesApi follows the same pattern as entity APIs but uses the aggregate's 
 ```ts
 // src/api/MatchesApi.ts
 import { Schema } from "effect"
-import { HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi"
+import { HttpApiEndpoint, HttpApiGroup } from "effect/http-api"
 import { MatchAggregate } from "../entities/MatchAggregate.js"
 import { Match, MatchUpdatePayload } from "../models/Match.js"
 import { ApiNotFound, ApiUnprocessableEntity } from "./ApiErrors.js"
@@ -2417,7 +2417,7 @@ Update `Api.ts`:
 ```ts
 // src/api/Api.ts
 import type { Schema } from "effect"
-import { HttpApi, OpenApi } from "effect/unstable/httpapi"
+import { HttpApi, OpenApi } from "effect/http-api"
 import { CoachesApi } from "./CoachesApi.js"
 import { MatchesApi } from "./MatchesApi.js"
 import { PlayersApi } from "./PlayersApi.js"

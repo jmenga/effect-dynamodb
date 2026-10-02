@@ -119,8 +119,8 @@ describe("DynamoClient", () => {
       }).pipe(
         Effect.provide(
           DynamoClient.layerConfig({
-            region: Config.string("AWS_REGION"),
-            endpoint: Config.string("DYNAMODB_ENDPOINT"),
+            region: Config.String("AWS_REGION"),
+            endpoint: Config.String("DYNAMODB_ENDPOINT"),
           }),
         ),
         Effect.provide(
@@ -134,7 +134,7 @@ describe("DynamoClient", () => {
         const client = yield* DynamoClient
         expect(client).toBeUndefined() // Should not reach here
       }).pipe(
-        Effect.provide(DynamoClient.layerConfig({ region: Config.string("MISSING_REGION") })),
+        Effect.provide(DynamoClient.layerConfig({ region: Config.String("MISSING_REGION") })),
         Effect.provide(configFromMap({})),
         Effect.flip,
         Effect.tap((error) => Effect.sync(() => expect(error._tag).toBe("ConfigError"))),
@@ -147,7 +147,7 @@ describe("DynamoClient", () => {
         expect(client.putItem).toBeDefined()
         expect(client.getItem).toBeDefined()
       }).pipe(
-        Effect.provide(DynamoClient.layerConfig({ region: Config.string("AWS_REGION") })),
+        Effect.provide(DynamoClient.layerConfig({ region: Config.String("AWS_REGION") })),
         Effect.provide(configFromMap({ AWS_REGION: "eu-west-1" })),
       ),
     )

@@ -1,6 +1,6 @@
 {
   "name": "effect-dynamodb",
-  "version": "1.20.1",
+  "version": "1.21.0",
   "description": "Effect TS ORM for DynamoDB — schema-driven entity modeling, single-table design, composite keys, transactions, and Stream-based pagination",
   "type": "module",
   "license": "MIT",
@@ -60,13 +60,13 @@
     "@effect-dynamodb/schema": "workspace:^"
   },
   "peerDependencies": {
-    "effect": "^4.0.0-rc.112"
+    "effect": "^4.0.0"
   },
   "devDependencies": {
-    "@effect/vitest": "4.0.0-rc.112",
+    "@effect/vitest": "4.0.0",
     "@types/node": "^25.5.0",
-    "effect": "4.0.0-rc.112",
-    "typescript": "^5.7.0",
-    "vitest": "^4.1.0"
+    "effect": "4.0.0",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.3"
   }
 }

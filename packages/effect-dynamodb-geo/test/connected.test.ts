@@ -9,7 +9,7 @@ import * as H3 from "../src/H3.js"
 // ---------------------------------------------------------------------------
 
 const ENDPOINT = Effect.runSync(
-  Config.string("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+  Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
 )
 
 let dynamoAvailable = false

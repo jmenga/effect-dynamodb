@@ -79,7 +79,7 @@ const MainTable = Table.make({
 // =============================================================================
 
 // #region layers
-const endpoint = Config.string("DYNAMODB_ENDPOINT").pipe(
+const endpoint = Config.String("DYNAMODB_ENDPOINT").pipe(
   Config.withDefault("http://localhost:8000"),
 )
 

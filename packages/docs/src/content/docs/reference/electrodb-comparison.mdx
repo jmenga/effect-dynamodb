@@ -28,13 +28,13 @@ ElectroDB is the most feature-rich existing DynamoDB ORM for TypeScript. This co
 | Date/time handling | Manual (string/number attributes) | 9 built-in date schemas (`DateString`, `DateEpochMs`, `DateEpochSeconds`, `DateTimeZoned`, etc.) with `storedAs` modifier | **Advantage** — type-safe date handling with configurable storage |
 | Attribute labels for keys | `label: "customPrefix"` | Not supported (attribute name used) | ElectroDB only |
 | Attribute padding in keys | `padding: { length, char }` | Automatic zero-padding for numeric composites (16 digits for numbers, 38 for bigints) | Parity |
-| Getter/setter hooks | `get`/`set` callbacks per attribute | Use `Schema.transform` / `Schema.transformOrFail` | Different approach — see note 1 |
+| Getter/setter hooks | `get`/`set` callbacks per attribute | Use `Schema.decodeTo` with `SchemaGetter.transform` / `SchemaGetter.transformEffect` | Different approach — see note 1 |
 | Watch attribute changes | `watch: ["attr1"] \| "*"` | Not applicable | Different approach — see note 1 |
 | Calculated attributes | Via watch + set | Not applicable | Different approach — see note 1 |
 | Virtual attributes | Via watch + get (never persisted) | Not applicable | Different approach — see note 1 |
 | DynamoDB native Set type | `type: "set"`, items: "string"/"number" | `Schema.ReadonlySet(Schema.String)` / `Schema.ReadonlySet(Schema.Number)` — marshalls to native `SS`/`NS`; `Entity.add()` (atomic addition), `Entity.deleteFromSet()` (atomic removal) | Parity |
 
-> **Note 1:** ElectroDB's getter/setter/watch/calculated/virtual attributes follow an imperative callback paradigm. Effect Schema provides equivalent power through composable, declarative transformations (`Schema.transform`, `Schema.transformOrFail`, custom annotations). These represent a different design philosophy rather than a missing capability.
+> **Note 1:** ElectroDB's getter/setter/watch/calculated/virtual attributes follow an imperative callback paradigm. Effect Schema provides equivalent power through composable, declarative transformations (`Schema.decodeTo` with `SchemaGetter.transform` / `SchemaGetter.transformEffect`, custom annotations). These represent a different design philosophy rather than a missing capability.
 
 ### 2. Indexes
 
@@ -242,8 +242,8 @@ Features in ElectroDB that are not available in effect-dynamodb, with workaround
 |---------|------------|
 | Find/Match (auto index selection) | Use explicit `entity.query.<indexName>()` — more predictable than auto-selection |
 | Custom key templates | Attribute-list composition covers standard patterns |
-| Getter/setter hooks | `Schema.transform` / `Schema.transformOrFail` provide equivalent power |
-| Watch/calculated/virtual attributes | Compute at application layer or use `Schema.transform` |
+| Getter/setter hooks | `Schema.decodeTo` with `SchemaGetter.transform` / `SchemaGetter.transformEffect` provide equivalent power |
+| Watch/calculated/virtual attributes | Compute at application layer or use `Schema.decodeTo` |
 | Attribute padding | Automatic zero-padding for numeric composites in sort keys |
 | Composite index type | DynamoDB feature from Nov 2025 — can be added in a future release |
 | Key casting (numeric keys) | All keys are strings by design |

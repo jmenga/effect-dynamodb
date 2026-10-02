@@ -139,7 +139,7 @@ export interface Table<
  * MainTable.layer({ name: "my-prod-table" })
  *
  * // Or from environment variables via Effect Config
- * MainTable.layerConfig({ name: Config.string("TABLE_NAME") })
+ * MainTable.layerConfig({ name: Config.String("TABLE_NAME") })
  * ```
  */
 export const make = <

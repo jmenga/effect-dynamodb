@@ -301,8 +301,8 @@ MainTable.layer({
 
 // Or from Effect Config (env-driven, optional):
 MainTable.layerConfig({
-  name: Config.string("TABLE_NAME"),
-  ttlAttributeName: Config.string("TTL_ATTRIBUTE").pipe(Config.withDefault("_ttl")),
+  name: Config.String("TABLE_NAME"),
+  ttlAttributeName: Config.String("TTL_ATTRIBUTE").pipe(Config.withDefault("_ttl")),
 })
 ```
 
