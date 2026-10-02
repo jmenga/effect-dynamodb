@@ -461,8 +461,19 @@ const Pages = Entity.make({
     sk: { field: "sk", composite: [] },
   },
 })
-const PagesTable = Table.make({ schema: AppSchema, entities: { Pages } })
+/** Same model, versioned — the clearMap read must CAS on the version it found. */
+const VersionedPages = Entity.make({
+  model: PageModel,
+  entityType: "VersionedPage",
+  primaryKey: {
+    pk: { field: "pk", composite: ["pageId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  versioned: true,
+})
+const PagesTable = Table.make({ schema: AppSchema, entities: { Pages, VersionedPages } })
 ;(Pages as any)._configure(AppSchema, PagesTable.Tag)
+;(VersionedPages as any)._configure(AppSchema, PagesTable.Tag)
 const PagesTableLayer = PagesTable.layer({ name: "test-pages" })
 const TestLayers = Layer.mergeAll(TestDynamoClient, PagesTableLayer)
 
@@ -694,6 +705,65 @@ describe("SparseMap — clearMap", () => {
       call.ExpressionAttributeNames as Record<string, string>,
     ).filter((n) => n.startsWith("metrics#"))
     expect(removedNames.sort()).toEqual(["metrics#2026-01", "metrics#2026-02"])
+  })
+
+  it("on a versioned entity, conditions the Update on the version the read found", async () => {
+    mockGetItem.mockReset()
+    mockUpdateItem.mockReset()
+    mockGetItem.mockImplementation(() =>
+      Promise.resolve({
+        Item: {
+          pk: { S: "x" },
+          sk: { S: "x" },
+          pageId: { S: "p1" },
+          version: { N: "3" },
+          "metrics#2026-01": { M: { views: { N: "5" }, clicks: { N: "2" } } },
+        },
+      }),
+    )
+    mockUpdateItem.mockImplementation(() =>
+      Promise.resolve({
+        Attributes: { pk: { S: "x" }, sk: { S: "x" }, pageId: { S: "p1" }, version: { N: "4" } },
+      }),
+    )
+    await Effect.runPromise(
+      VersionedPages.update({ pageId: "p1" })
+        .pipe(Entity.clearMap("metrics"))
+        .pipe(Entity.asRecord)
+        .pipe(Effect.provide(TestLayers, { local: true })),
+    )
+    const call = mockUpdateItem.mock.calls[0]![0]
+    // Without it, a bucket added between the Get and the Update survives the clear.
+    expect(call.ConditionExpression).toBe("#condVer = :expectedVer")
+    expect(call.ExpressionAttributeNames["#condVer"]).toBe("version")
+    expect(call.ExpressionAttributeValues[":expectedVer"]).toEqual({ N: "3" })
+  })
+
+  it("on a versioned entity, a concurrent write is an OptimisticLockError", async () => {
+    mockGetItem.mockReset()
+    mockUpdateItem.mockReset()
+    mockGetItem.mockImplementation(() =>
+      Promise.resolve({
+        Item: {
+          pk: { S: "x" },
+          sk: { S: "x" },
+          pageId: { S: "p1" },
+          version: { N: "3" },
+          "metrics#2026-01": { M: { views: { N: "5" }, clicks: { N: "2" } } },
+        },
+      }),
+    )
+    const casError = new Error("conditional")
+    ;(casError as any).name = "ConditionalCheckFailedException"
+    mockUpdateItem.mockImplementation(() => Promise.reject(casError))
+    const error = await Effect.runPromise(
+      VersionedPages.update({ pageId: "p1" })
+        .pipe(Entity.clearMap("metrics"))
+        .pipe(Entity.asRecord)
+        .pipe(Effect.flip, Effect.provide(TestLayers, { local: true })),
+    )
+    expect(error._tag).toBe("OptimisticLockError")
+    expect((error as { expectedVersion: number }).expectedVersion).toBe(3)
   })
 
   it("clearMap on missing item is a no-op (the subsequent Update may still create the row)", async () => {

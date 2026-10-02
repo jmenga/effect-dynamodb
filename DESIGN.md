@@ -1184,7 +1184,7 @@ class Page extends Schema.Class<Page>('Page')({
   }),
 }) {}
 const PageModel = DynamoModel.configure(Page, { metrics: { storedAs: DynamoModel.SparseMap() } })
-// versioned: { retain: true } makes clearMap atomic.
+// Any `versioned` config makes clearMap atomic: the write CASes on the version its read found.
 const Pages = Entity.make({
   model: PageModel,
   entityType: 'Page',
@@ -2656,7 +2656,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9045` | `DynamoClient.ts` | `.where()` used on an index whose sort key has no composites — unreachable from well-typed code since the `ResolveSkFields` repair (#121); retained for untyped and cast call sites |
 | `EDD-9046` | `DynamoClient.ts` | Strict `lt` on the last sort-key composite with an earlier composite pinned — inexpressible in one DynamoDB sort-key condition |
 | `EDD-9047` | `Entity.ts` | `.condition()` applied to `purge()`, which spans batched writes and cannot be guarded atomically |
-| `EDD-9048` | `internal/TransactableOps.ts` | A multi-item write path cannot compile a **delete** for an entity with `unique`, `versioned: { retain: true }` or `softDelete` — those side items derive from the *stored* row, which these paths never read |
+| `EDD-9048` | `internal/TransactableOps.ts` | `EventStore.append({ additionalItems })` cannot compile a **delete** for an entity with `unique`, `versioned: { retain: true }` or `softDelete` — those side items derive from the *stored* row, which that path never reads. `Transaction.transactWrite` reads it first and accepts these deletes |
 | `EDD-9049` | `Batch.ts` | `Batch.write` cannot compile a write for those same configs — `BatchWriteItem` has no `ConditionExpression` (the whole basis of a uniqueness sentinel), no `UpdateRequest`, and no atomicity across chunks |
 | `EDD-9050` | `internal/CompositeCodec.ts` | A key composite's value cannot be encoded to its wire form, so it cannot be placed in a key — raised rather than composing a string that silently matches nothing |
 | `EDD-9051` | `Aggregate.ts` | `list({ cursor })` on a **sharded** aggregate (`list.cardinality`) — a fan-out over N partitions has no resumable position, so the cursor is rejected rather than silently ignored |
@@ -2665,7 +2665,11 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9054` | `Query.ts` | A client-side predicate (`.filterBy()`) and a projection (`.select()`) are both active — the predicate is an opaque closure, so its attribute reads cannot be borrowed into the `ProjectionExpression` the way key attributes are, and it would be handed items missing the fields it tests |
 | `EDD-9055` | `KeyComposer.ts` (via `DynamoClient.ts`, `Collection.ts`) | A collection's members compose its keys with different casings (index `casing` vs schema `casing`) — they share one physical index, so their keys would never meet |
 
-Next free code: **`EDD-9056`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+| `EDD-9056` | `internal/TransactableOps.ts` | An `update` with `.cascade(...)` in a transaction — a cascade is a follow-up write to other entities after the update commits, so it cannot share the transaction |
+| `EDD-9057` | `internal/TransactableOps.ts` | `.returnValues(...)` on an `update` or `delete` in a transaction — a transaction returns no item attributes, so the setting would be dropped |
+| `EDD-9058` | `internal/TransactableOps.ts` | An `update` of an entity with `vectorIndexes` in a transaction — recomputing the embedding needs the `Embedder` service, which the transact compile step does not provide |
+
+Next free code: **`EDD-9059`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 
