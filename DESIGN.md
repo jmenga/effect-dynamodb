@@ -225,17 +225,27 @@ const AppSchema = DynamoSchema.make({
 |----------|------|---------|-------------|
 | `name` | `string` | *required* | Application name, used as key prefix |
 | `version` | `number` | *required* | Schema version number |
-| `casing` | `"lowercase" \| "uppercase" \| "preserve"` | `"lowercase"` | Casing for structural key parts |
+| `casing` | `"lowercase" \| "uppercase" \| "preserve"` | `"lowercase"` | Casing for the whole composed key, composite values included |
 
 ### Casing Rules
 
-Casing applies to **structural parts** of keys:
+Casing applies to the **entire composed key** (ElectroDB parity):
 - Schema name
-- Version prefix
-- Entity type
-- Collection name
+- Entity type / collection name
+- Composite attribute names
+- **Composite attribute values** — under the default `"lowercase"`, `"Dev-A"` and `"dev-a"` compose the same key. Ids that must stay distinct by case need `"preserve"`.
 
-**Attribute values are always preserved as-is.** If a user's `email` is `"Alice@Example.com"`, the email value in the key retains its original casing.
+The stored attribute keeps its original value; only the key string is cased.
+
+**Index-level override.** `primaryKey.casing` and `indexes.<name>.casing` override the schema's casing for that index's keys: entity type / collection name and composites, both halves. The `$<schema>#v<n>` prefix always uses the schema's casing (`KeyComposer.effectiveCasing` = index's, else schema's). Every composition path goes through `KeyComposer` with the index definition, so put, query accessors (PK, `begins_with`, `.where()` operands), policy-aware updates and collection queries all honour it. Collection members must agree on the collection index's effective casing — `EDD-9055` at `DynamoClient.make()` / `Collection.make()`, since keys composed under different casings never meet in the shared partition. (Before 1.22 `normalizeGsiConfig` dropped `casing` from `indexes` entries, so it was accepted but ignored on GSIs; `primaryKey.casing` always worked.)
+
+**Time-series exception.** The `#e#` infix and the serialized `orderBy` value in an event-item SK follow the **schema's** casing even when `primaryKey.casing` overrides it. Event SKs are already stored under that rule, so it is pinned (`TimeSeries.test.ts`) rather than aligned.
+
+**Fixed markers are never cased:** the `v` in `#v<n>`, the `#v#` (version snapshot) and `#deleted#` (soft delete) infixes, and the `_<n>` entity/event version suffix. The time-series `#e#` infix is the exception and follows the casing. These are storage format — pinned by `packages/schema/test/DynamoSchema.test.ts` — and must not change.
+
+**Casing is storage format.** Changing it on a populated table moves every composed key.
+
+**EventStore streams** lower-case `streamName` in their keys by default, regardless of `casing`. `makeStream({ casing })` sets the stream's key casing like an index's `casing` does. See §12.
 
 ### Key Prefix Format
 
@@ -249,9 +259,9 @@ Examples with `name: "myapp"`, `version: 1`, `casing: "lowercase"`:
 
 | Context | Generated key |
 |---------|---------------|
-| User entity, pk `["userId"]`, value `"abc-123"` | `$myapp#v1#user#abc-123` |
+| User entity, pk `["userId"]`, value `"abc-123"` | `$myapp#v1#user#userid_abc-123` |
 | User entity, sk `[]` (empty) | `$myapp#v1#user` |
-| Clustered collection "TenantItems", pk | `$myapp#v1#tenantitems#t-1` |
+| Clustered collection "TenantItems", pk `["tenantId"]` | `$myapp#v1#tenantitems#tenantid_t-1` |
 | Unique constraint sentinel (email) | `$myapp#v1#user.email#foo@bar.com` |
 | Version snapshot (v7) | `$myapp#v1#user#v#0000007` |
 | Soft-deleted item | `$myapp#v1#user#deleted#2024-01-15T10:30:00Z` |
@@ -2034,51 +2044,53 @@ yield* Players.provide(
 
 `EventStore` provides typed, Effect-native event sourcing on DynamoDB. It implements the Decider pattern (command → events → state) with stream-based event persistence.
 
-### Client Gateway Pattern
+### Stream Definition and Binding
 
-EventStore definitions are registered on a table and accessed through the typed client, just like entities and aggregates:
+A stream is bound to a table at definition time. Its operations require
+`DynamoClient | TableConfig`; `EventStore.bind` resolves both and returns a
+`BoundEventStream` with `R = never` for use inside `Context.Service` make effects:
 
 ```typescript
-// Definition — no executable operations
 const MatchEvents = EventStore.makeStream({
+  table: EventsTable,
   streamName: "Match",
   events: [MatchStarted, InningsCompleted, MatchEnded],
   streamId: { composite: ["matchId"] },
 })
 
-// Register on table
-const EventsTable = Table.make({
-  schema: EventSchema,
-  eventStores: { MatchEvents },
-})
-
-// Access through typed client
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(EventsTable)
-  yield* db.MatchEvents.append({ matchId: "m-1" }, [new MatchStarted({ venue: "MCG" })], 0)
-  const events = yield* db.MatchEvents.read({ matchId: "m-1" })
-  const version = yield* db.MatchEvents.currentVersion({ matchId: "m-1" })
+  const stream = yield* EventStore.bind(MatchEvents)
+  yield* stream.append({ matchId: "m-1" }, [new MatchStarted({ venue: "MCG" })], 0)
+  const events = yield* stream.read({ matchId: "m-1" })
+  const version = yield* stream.currentVersion({ matchId: "m-1" })
 })
 ```
 
-As a service:
+### Key Layout
 
-```typescript
-class MatchEventStream extends Context.Service<MatchEventStream>()("@gamemanager/MatchEventStream", {
-  make: Effect.gen(function* () {
-    const { MatchEvents } = yield* DynamoClient.make(EventsTable)
-    return MatchEvents
-  }),
-}) {}
 ```
+pk           $<schema>#v<n>#<stream>#<streamId composites>
+sk (event)   $<schema>#v<n>#<stream>.event_1#<10-digit version>
+sk (command) $<schema>#v<n>#<stream>.command#<commandId>     (idempotency sentinel)
+sk (snapshot)$<schema>#v<n>#<stream>.snapshot
+__edd_e__    "<stream>.event" | "<stream>.command" | "<stream>.snapshot"
+```
+
+Stream-id composites carry no `name_` prefix (unlike entity keys). Without
+`makeStream({ casing })`, `<stream>` is `streamName` lower-cased and the rest of
+the key follows the schema's casing — the layout streams have always had. With
+`casing`, the stream name is taken as written and that casing applies to the
+whole key except the schema prefix, as an index's `casing` does. On a
+`"lowercase"`/`"uppercase"` schema, `casing` equal to the schema's reproduces the
+default layout. The `__edd_e__` values are always lower-cased. In the next major,
+omitting `casing` will mean the schema's casing.
 
 ### Command Handler
 
 The `commandHandler` combinator implements the read-decide-append cycle:
 
 ```typescript
-const { MatchEvents } = yield* DynamoClient.make(EventsTable)
-const handler = MatchEvents.commandHandler(MatchDecider)
+const handler = EventStore.commandHandler(MatchDecider, MatchEvents)
 const result = yield* handler({ matchId: "m-1" }, new StartMatch({ venue: "MCG" }))
 // result: { state, version, events }
 ```
@@ -2651,8 +2663,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9052` | `Batch.ts`, `Transaction.ts` | A read path (`Batch.get`, `Transaction.transactGet`, `Transaction.check`) was handed something that is not a get descriptor — pass `Entity.get(key)` or the bound `db.entities.X.get(key)` |
 | `EDD-9053` | `DynamoClient.ts` | `.where()` targets a sort-key composite the accessor already pinned — `Query.where` REPLACES the accessor's `begins_with`, so the condition would discard the pin and return rows outside it rather than narrowing within it |
 | `EDD-9054` | `Query.ts` | A client-side predicate (`.filterBy()`) and a projection (`.select()`) are both active — the predicate is an opaque closure, so its attribute reads cannot be borrowed into the `ProjectionExpression` the way key attributes are, and it would be handed items missing the fields it tests |
+| `EDD-9055` | `KeyComposer.ts` (via `DynamoClient.ts`, `Collection.ts`) | A collection's members compose its keys with different casings (index `casing` vs schema `casing`) — they share one physical index, so their keys would never meet |
 
-Next free code: **`EDD-9055`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+Next free code: **`EDD-9056`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 

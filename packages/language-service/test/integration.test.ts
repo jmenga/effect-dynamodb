@@ -68,13 +68,13 @@ describe("Integration: Entity definition → hover tooltip", () => {
     const params = buildParamsOrThrow(op!)
 
     expect(params.command).toBe("GetItemCommand")
-    expect(params.Key!.pk).toBe("$crud-demo#v1#user#u-alice")
+    expect(params.Key!.pk).toBe("$crud-demo#v1#user#userid_u-alice")
     expect(params.Key!.sk).toBe("$crud-demo#v1#user")
 
     const tooltip = formatTooltip(params)
 
     expect(tooltip).toContain("GetItemCommand({")
-    expect(tooltip).toContain("$crud-demo#v1#user#u-alice")
+    expect(tooltip).toContain("$crud-demo#v1#user#userid_u-alice")
   })
 
   it("should produce tooltip for query with GSI", () => {
@@ -93,7 +93,7 @@ describe("Integration: Entity definition → hover tooltip", () => {
 
     expect(params.command).toBe("QueryCommand")
     expect(params.IndexName).toBe("gsi1")
-    expect(params.ExpressionAttributeValues![":pk"]).toBe("$crud-demo#v1#user#admin")
+    expect(params.ExpressionAttributeValues![":pk"]).toBe("$crud-demo#v1#user#role_admin")
 
     const tooltip = formatTooltip(params)
     expect(tooltip).toContain("QueryCommand({")
@@ -119,7 +119,7 @@ describe("Integration: Entity definition → hover tooltip", () => {
     const params = buildParamsOrThrow(op!)
 
     expect(params.command).toBe("UpdateItemCommand")
-    expect(params.Key!.pk).toBe("$crud-demo#v1#user#u-alice")
+    expect(params.Key!.pk).toBe("$crud-demo#v1#user#userid_u-alice")
     expect(params.UpdateExpression).toContain("SET")
   })
 
@@ -155,7 +155,7 @@ describe("Integration: Entity definition → hover tooltip", () => {
     const params = buildParamsOrThrow(op!)
 
     expect(params.command).toBe("TransactWriteItemsCommand")
-    expect(params.Key!.pk).toBe("$crud-demo#v1#task#t-1")
+    expect(params.Key!.pk).toBe("$crud-demo#v1#task#taskid_t-1")
   })
 
   it("should produce tooltip for put", () => {
@@ -220,6 +220,8 @@ describe("Integration: Entity definition → hover tooltip", () => {
 
     const params = buildParamsOrThrow(op!)
 
-    expect(params.ExpressionAttributeValues![":pk"]).toBe("$shop#v1#customerorders#c-123")
+    expect(params.ExpressionAttributeValues![":pk"]).toBe(
+      "$shop#v1#customerorders#customerid_c-123",
+    )
   })
 })

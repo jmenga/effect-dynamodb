@@ -278,6 +278,34 @@ const SubProjectMembers = Entity.make({
 // 5. Tables — one per demo section
 // =============================================================================
 
+// #region index-casing
+// External references are case-sensitive: "AbC-1" and "abc-1" are different
+// accounts. The schema folds case, so this index keeps it with its own `casing`.
+class Integration extends Schema.Class<Integration>("Integration")({
+  integrationId: Schema.String,
+  externalRef: Schema.String,
+}) {}
+
+const Integrations = Entity.make({
+  model: Integration,
+  entityType: "Integration",
+  primaryKey: {
+    pk: { field: "pk", composite: ["integrationId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byExternalRef: {
+      name: "gsi1",
+      casing: "preserve",
+      pk: { field: "gsi1pk", composite: ["externalRef"] },
+      sk: { field: "gsi1sk", composite: [] },
+    },
+  },
+})
+
+const CasingTable = Table.make({ schema: AppSchema, entities: { Integrations } })
+// #endregion
+
 // #region tables
 const BasicTable = Table.make({
   schema: AppSchema,
@@ -586,6 +614,34 @@ const program = Effect.gen(function* () {
   yield* sub.tables["guide-indexes-subcollection"]!.delete()
   yield* Console.log("  Sub-collection demo — OK\n")
 
+
+  // -------------------------------------------------------------------------
+  // Part E: Index-level casing
+  // -------------------------------------------------------------------------
+
+  yield* Console.log("=== Part E: Index-Level Casing ===\n")
+
+  const casing = yield* DynamoClient.make({
+    entities: { Integrations },
+    tables: { CasingTable },
+  })
+  yield* casing.tables.CasingTable.create()
+
+  // #region index-casing-queries
+  yield* casing.entities.Integrations.put({ integrationId: "int-1", externalRef: "AbC-1" })
+  yield* casing.entities.Integrations.put({ integrationId: "int-2", externalRef: "abc-1" })
+
+  // gsi1pk: $myapp#v1#Integration#externalRef_AbC-1 — the case survives
+  const exact = yield* casing.entities.Integrations.byExternalRef({ externalRef: "AbC-1" }).collect()
+  // → [int-1] only. With the schema's "lowercase", both items share one gsi1pk and both return.
+  // #endregion
+
+  assertEq(exact.map((i) => i.integrationId).join(","), "int-1", "byExternalRef keeps case")
+  yield* Console.log(`  byExternalRef (AbC-1): ${exact.map((i) => i.integrationId).join(", ")}`)
+
+  yield* casing.tables.CasingTable.delete()
+  yield* Console.log("  Index-level casing demo — OK\n")
+
   yield* Console.log("All index & collection patterns passed.")
 })
 
@@ -604,6 +660,7 @@ const AppLayer = Layer.mergeAll(
   IsolatedTable.layer({ name: "guide-indexes-isolated" }),
   ClusteredTable.layer({ name: "guide-indexes-clustered" }),
   SubCollectionTable.layer({ name: "guide-indexes-subcollection" }),
+  CasingTable.layer({ name: "guide-indexes-casing" }),
 )
 
 const main = program.pipe(Effect.provide(AppLayer))

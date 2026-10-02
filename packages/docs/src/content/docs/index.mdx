@@ -122,3 +122,7 @@ Effect.runPromise(program.pipe(
   )
 ))
 ```
+
+:::caution[Ids that differ only by case]
+Composed keys are **lower-cased by default — composite values included** — so `"Dev-A"` and `"dev-a"` address the same item, and a put for one overwrites the other. If an id must stay distinct by case (device ids, tenant ids, external references), set `casing: "preserve"` on the schema, or on just the `primaryKey` or index that holds it. Choose before the table holds data: changing casing later moves every key. See [Casing](/effect-dynamodb/guides/modeling/#casing).
+:::

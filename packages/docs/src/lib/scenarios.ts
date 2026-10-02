@@ -128,6 +128,7 @@ export const scenarios: ReadonlyArray<Scenario> = [
       byTournament: {
         index: "gsi1",
         collection: "tournamentMatches",
+        type: "clustered",
         pk: { field: "gsi1pk", composite: ["tournamentId"] },
         sk: { field: "gsi1sk", composite: ["matchDate"] },
       },

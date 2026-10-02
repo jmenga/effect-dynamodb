@@ -434,6 +434,7 @@ function resolveGsiConfig(
   let sk: KeyPart | undefined
   let collection: string | ReadonlyArray<string> | undefined
   let type: "isolated" | "clustered" | undefined
+  let casing: Casing | undefined
 
   for (const prop of expr.properties) {
     if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
@@ -453,6 +454,9 @@ function resolveGsiConfig(
       case "type":
         type = extractStringLiteral(ts, prop.initializer) as "isolated" | "clustered" | undefined
         break
+      case "casing":
+        casing = extractStringLiteral(ts, prop.initializer) as Casing | undefined
+        break
     }
   }
 
@@ -464,6 +468,7 @@ function resolveGsiConfig(
     type: type ?? "isolated",
     pk,
     sk,
+    casing,
   }
 }
 

@@ -3156,3 +3156,163 @@ describe("EventStore", () => {
     )
   })
 })
+
+// ---------------------------------------------------------------------------
+// Stream key casing — `casing` overrides the casing of the stream's keys, as an
+// index's `casing` does. Omitted, the stream keeps the layout it has always
+// been written with: name lower-cased, the rest following the schema.
+// ---------------------------------------------------------------------------
+
+describe("EventStore stream casing", () => {
+  const streamFor = (
+    schemaCasing: DynamoSchema.Casing,
+    casing: DynamoSchema.Casing | undefined,
+  ) => {
+    const table = Table.make({
+      schema: DynamoSchema.make({ name: "App", version: 1, casing: schemaCasing }),
+      entities: {},
+    })
+    const stream = EventStore.makeStream({
+      table,
+      streamName: "OrderBook",
+      events: [MatchStarted],
+      streamId: { composite: ["orderId"] },
+      snapshot: { schema: MatchStateSchema },
+      ...(casing !== undefined ? { casing } : {}),
+    })
+    return {
+      stream,
+      layer: Layer.merge(TestDynamoClient, table.layer({ name: "events-table" })),
+    }
+  }
+
+  // Every key the stream writes or reads, captured from the mock client.
+  const captureKeys = (
+    schemaCasing: DynamoSchema.Casing,
+    casing: DynamoSchema.Casing | undefined,
+  ) => {
+    const { stream, layer } = streamFor(schemaCasing, casing)
+    return Effect.gen(function* () {
+      vi.resetAllMocks()
+      mockTransactWriteItems.mockResolvedValue({})
+      mockPutItem.mockResolvedValue({})
+      mockQuery.mockResolvedValue({ Items: [] })
+
+      yield* stream.append(
+        { orderId: "Ord-1" },
+        [new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" })],
+        0,
+        { idempotency: { commandId: "Cmd-1" } },
+      )
+      yield* stream.writeSnapshot({ orderId: "Ord-1" }, { status: "in-progress", innings: [] }, 1)
+      yield* stream.read({ orderId: "Ord-1" })
+
+      const transact = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+      const event = fromAttributeMap(transact[0].Put.Item)
+      const sentinel = fromAttributeMap(transact[transact.length - 1].Put.Item)
+      const snapshot = fromAttributeMap(mockPutItem.mock.calls[0]![0].Item)
+      const read = mockQuery.mock.calls[0]![0]
+      expect(read.ExpressionAttributeValues[":pk"].S).toBe(event.pk)
+      // The discriminators never vary — reads match them exactly.
+      expect([event.__edd_e__, sentinel.__edd_e__, snapshot.__edd_e__]).toEqual([
+        "orderbook.event",
+        "orderbook.command",
+        "orderbook.snapshot",
+      ])
+      return {
+        pk: event.pk,
+        eventSk: event.sk,
+        sentinelSk: sentinel.sk,
+        snapshotSk: snapshot.sk,
+        readSkPrefix: read.ExpressionAttributeValues[":sk"].S,
+      }
+    }).pipe(Effect.provide(layer))
+  }
+
+  // The layout streams were written with before `casing` existed.
+  const legacyKeys = {
+    lowercase: {
+      pk: "$app#v1#orderbook#ord-1",
+      eventSk: "$app#v1#orderbook.event_1#0000000001",
+      sentinelSk: "$app#v1#orderbook.command#cmd-1",
+      snapshotSk: "$app#v1#orderbook.snapshot",
+      readSkPrefix: "$app#v1#orderbook.event_1#",
+    },
+    uppercase: {
+      pk: "$APP#v1#ORDERBOOK#ORD-1",
+      eventSk: "$APP#v1#ORDERBOOK.EVENT_1#0000000001",
+      sentinelSk: "$APP#v1#ORDERBOOK.COMMAND#CMD-1",
+      snapshotSk: "$APP#v1#ORDERBOOK.SNAPSHOT",
+      readSkPrefix: "$APP#v1#ORDERBOOK.EVENT_1#",
+    },
+    preserve: {
+      pk: "$App#v1#orderbook#Ord-1",
+      eventSk: "$App#v1#orderbook.event_1#0000000001",
+      sentinelSk: "$App#v1#orderbook.command#Cmd-1",
+      snapshotSk: "$App#v1#orderbook.snapshot",
+      readSkPrefix: "$App#v1#orderbook.event_1#",
+    },
+  } as const
+
+  for (const schemaCasing of ["lowercase", "uppercase", "preserve"] as const) {
+    it.effect(`omitted keeps the existing layout (schema casing: "${schemaCasing}")`, () =>
+      Effect.gen(function* () {
+        expect(yield* captureKeys(schemaCasing, undefined)).toEqual(legacyKeys[schemaCasing])
+      }),
+    )
+  }
+
+  for (const schemaCasing of ["lowercase", "uppercase"] as const) {
+    it.effect(`set to the schema's casing matches the existing layout ("${schemaCasing}")`, () =>
+      Effect.gen(function* () {
+        expect(yield* captureKeys(schemaCasing, schemaCasing)).toEqual(legacyKeys[schemaCasing])
+      }),
+    )
+  }
+
+  it.effect(`"preserve" on a "preserve" schema keeps the stream name as written`, () =>
+    Effect.gen(function* () {
+      expect(yield* captureKeys("preserve", "preserve")).toEqual({
+        pk: "$App#v1#OrderBook#Ord-1",
+        eventSk: "$App#v1#OrderBook.event_1#0000000001",
+        sentinelSk: "$App#v1#OrderBook.command#Cmd-1",
+        snapshotSk: "$App#v1#OrderBook.snapshot",
+        readSkPrefix: "$App#v1#OrderBook.event_1#",
+      })
+    }),
+  )
+
+  it.effect("overrides the schema's casing for the whole key except the schema prefix", () =>
+    Effect.gen(function* () {
+      // Stream ids and command ids stay distinct by case on a lower-casing schema.
+      expect(yield* captureKeys("lowercase", "preserve")).toEqual({
+        pk: "$app#v1#OrderBook#Ord-1",
+        eventSk: "$app#v1#OrderBook.event_1#0000000001",
+        sentinelSk: "$app#v1#OrderBook.command#Cmd-1",
+        snapshotSk: "$app#v1#OrderBook.snapshot",
+        readSkPrefix: "$app#v1#OrderBook.event_1#",
+      })
+      expect(yield* captureKeys("uppercase", "lowercase")).toEqual({
+        pk: "$APP#v1#orderbook#ord-1",
+        eventSk: "$APP#v1#orderbook.event_1#0000000001",
+        sentinelSk: "$APP#v1#orderbook.command#cmd-1",
+        snapshotSk: "$APP#v1#orderbook.snapshot",
+        readSkPrefix: "$APP#v1#orderbook.event_1#",
+      })
+    }),
+  )
+
+  it(`a preserved stream name still sorts the snapshot after every event`, () => {
+    const schema = DynamoSchema.make({ name: "app", version: 1, casing: "preserve" })
+    const snapshotSk = DynamoSchema.composeKey(schema, "OrderBook.snapshot", [])
+    const lastEvent = DynamoSchema.composeEventVersionKey(
+      schema,
+      "OrderBook.event",
+      DynamoSchema.MAX_EVENT_VERSION,
+    )
+    const sentinel = DynamoSchema.composeKey(schema, "OrderBook.command", ["zzz"])
+    const firstEvent = DynamoSchema.composeEventVersionKey(schema, "OrderBook.event", 1)
+    expect(snapshotSk > lastEvent).toBe(true)
+    expect(sentinel < firstEvent).toBe(true)
+  })
+})

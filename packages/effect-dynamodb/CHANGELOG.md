@@ -1,5 +1,22 @@
 # effect-dynamodb
 
+## 1.22.0
+
+### Minor Changes
+
+- [`573d567`](https://github.com/jmenga/effect-dynamodb/commit/573d5674c766c279c482db15e55d057470a4d98d) Thanks [@mixja](https://github.com/mixja)! - `EventStore.makeStream` accepts `casing`, the stream's key casing — the same option, with the same values, that indexes and vector indexes already take. Set, the stream name, stream ids and command ids in the stream's keys all take that casing (the `$<schema>#v<n>` prefix keeps the schema's). Omitted, the stream keeps the layout it has always had: name lower-cased, the rest following the schema. Setting `casing` on a stream that already holds data moves its keys whenever they come out different (e.g. `"preserve"` with a capitalised `streamName`), so its history is no longer read. The `__edd_e__` discriminators stay lower-cased. In the next major, omitting `casing` will mean the schema's casing.
+
+  Index-level `casing` now works on GSIs. `indexes.<name>.casing` was accepted by the types but dropped during normalization, so GSI keys silently used the schema's casing (`primaryKey.casing` always worked). It now overrides the schema's casing for that index on every path — put, query accessors, `.where()` operands, policy-aware updates and collection queries. Collection members must agree on the collection index's casing; a mismatch fails at `DynamoClient.make()` / `Collection.make()` with `EDD-9055`. **If you had set `casing` on an `indexes` entry**, items written by earlier versions carry schema-cased keys for that index and won't be found through it until rewritten. Time-series event SKs keep using the schema's casing for the `#e#` suffix even under a `primaryKey.casing` override, so existing event items stay readable.
+
+  The language-service hover tooltips now show the keys the library actually writes — attribute-name prefixes, cased composite values, padded numbers, GSI `casing`, the `"isolated"` collection default and the `begins_with` delimiter rule — and a parity test pins them to `@effect-dynamodb/schema`. The docs playground now composes keys with `@effect-dynamodb/schema` directly.
+
+  Docs: the `casing` option is described as casing composite values too (it always has), with a warning — now also on the home page, getting-started guide, starter tutorial and both READMEs — that ids differing only by case share a key, that `casing` is part of the storage format, and which fixed key markers (`v1`, `#v#`, `#deleted#`, `_1`) are never cased. Tests pin those markers.
+
+### Patch Changes
+
+- Updated dependencies [[`573d567`](https://github.com/jmenga/effect-dynamodb/commit/573d5674c766c279c482db15e55d057470a4d98d)]:
+  - @effect-dynamodb/schema@1.22.0
+
 ## 1.21.0
 
 ### Minor Changes

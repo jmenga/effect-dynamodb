@@ -135,7 +135,7 @@ import { DynamoSchema } from "effect-dynamodb"
 |--------|------|-------------|
 | `make` | `(config) => DynamoSchema` | Create a schema with name, version, and optional casing |
 | `prefix` | `(schema) => string` | Build schema prefix: `$name#vN` |
-| `applyCasing` | `(schema, value) => string` | Apply casing rules to a structural key part |
+| `applyCasing` | `(value, casing) => string` | Apply a casing to a key part — labels and composite values alike |
 | `composeKey` | `(schema, entityType, composites) => string` | Compose entity key: `$schema#vN#entity_type#composites` |
 | `composeCollectionKey` | `(schema, collection, composites) => string` | Compose collection PK |
 | `composeClusteredSortKey` | `(schema, collection, entity, composites) => string` | Compose clustered SK |
@@ -225,8 +225,8 @@ import { Entity } from "effect-dynamodb"
 |----------|------|----------|-------------|
 | `model` | `Schema.Class \| Schema.Struct \| ConfiguredModel` | Yes | Domain model schema (or configured model with field overrides) |
 | `entityType` | `string` | Yes | Discriminator stored as `__edd_e__` |
-| `primaryKey` | `{ pk: KeyDef, sk: KeyDef }` | Yes | Primary key composition rules |
-| `indexes` | `Record<string, GsiIndexDef>` | No | GSI index definitions with `name`, `pk`, `sk`, optional `collection` |
+| `primaryKey` | `{ pk: KeyDef, sk: KeyDef, casing? }` | Yes | Primary key composition rules. Optional `casing` overrides the schema's for the primary key |
+| `indexes` | `Record<string, GsiIndexDef>` | No | GSI index definitions with `name`, `pk`, `sk`, optional `collection`, `type`, `casing` (overrides the schema's for that index — collection members must agree, `EDD-9055`) and `indexPolicy` |
 | `timestamps` | `boolean \| { created?, updated? }` | No | Auto-managed `createdAt`/`updatedAt`. Each slot takes a field name, a `DynamoModel` date schema (storage only), or `{ field?, schema? }`. A `schema` without a `DynamoEncoding` annotation throws `EDD-9044` at make() time |
 | `versioned` | `boolean \| { retain?, field?, ttl? }` | No | Auto-increment version with optional snapshot retention |
 | `softDelete` | `boolean \| { ttl?, preserveUnique? }` | No | Soft delete with optional TTL |
@@ -903,6 +903,8 @@ import { KeyComposer } from "effect-dynamodb"
 | `extractComposites` | `(keyPart, record) => string[]` | Extract composite attribute values from a record |
 | `tryExtractComposites` | `(keyPart, record) => string[] \| undefined` | Non-throwing variant |
 | `serializeValue` | `(value) => string` | Serialize a value for key composition |
+| `effectiveCasing` | `(schema, index) => Casing` | The casing an index composes with: its own `casing`, else the schema's |
+| `assertCollectionCasingAgreement` | `(collectionName, members) => void` | Throw `EDD-9055` when a collection's members would compose its keys with different casings |
 
 ### Types
 
@@ -1097,7 +1099,7 @@ import { EventStore } from "effect-dynamodb"
 
 | Export | Description |
 |--------|-------------|
-| `EventStore.makeStream({ table, streamName, events, streamId, metadata? })` | Create an `EventStream<TEvent, TStreamIdFields, TMetadata>` bound to a `Table`. `events` is an array of `Schema.Class` event types, `streamId.composite` lists the stream-id composite fields, optional `metadata` is a Schema. |
+| `EventStore.makeStream({ table, streamName, events, streamId, metadata?, snapshot?, casing? })` | Create an `EventStream<TEvent, TStreamIdFields, TMetadata>` bound to a `Table`. `events` is an array of `Schema.Class` event types, `streamId.composite` lists the stream-id composite fields, optional `metadata` is a Schema. Optional `casing` sets the key casing for the stream (stream name, stream ids, command ids); omitted, the stream name is lower-cased and the rest follows the schema — see [Stream key casing](/effect-dynamodb/tutorials/event-sourcing/#stream-key-casing). |
 | `EventStore.bind(stream)` | Resolve `DynamoClient` and `TableConfig` from context and return a `BoundEventStream` whose operations have `R = never`. Use inside `Context.Service` make effects. |
 
 ### Decider

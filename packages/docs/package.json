@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@astrojs/react": "^5.0.0",
+    "@effect-dynamodb/schema": "workspace:^",
     "@astrojs/starlight": "^0.38.1",
     "@expressive-code/plugin-line-numbers": "^0.41.7",
     "@tailwindcss/vite": "^4.2.1",

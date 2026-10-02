@@ -12017,3 +12017,294 @@ describeConnected("preserveUnique restore + restore-time snapshots", () => {
     }).pipe(providePu),
   )
 })
+
+// ---------------------------------------------------------------------------
+// EventStore stream casing under `casing: "preserve"`
+// ---------------------------------------------------------------------------
+//
+// Without `casing` a stream lower-cases its name in keys whatever the schema's
+// casing; with `casing: "preserve"` it keeps the name as written, like an entity
+// type on this schema. The two write different keys, so two streams that differ
+// only in this option are separate stores — the hazard the docs warn about when
+// setting `casing` on an existing stream.
+
+const lcSchema = DynamoSchema.make({ name: "LcStore", version: 1, casing: "preserve" })
+
+class LcCursor extends Schema.Class<LcCursor>("LcCursor")({
+  deviceId: Schema.String,
+  mark: Schema.Number,
+}) {}
+
+const LcCursors = Entity.make({
+  model: LcCursor,
+  entityType: "Cursor",
+  primaryKey: {
+    pk: { field: "pk", composite: ["deviceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+class LcPlaced extends Schema.TaggedClass<LcPlaced>()("LcPlaced", { qty: Schema.Number }) {}
+
+const LcState = Schema.Struct({ total: Schema.Number })
+
+const LcTable = Table.make({ schema: lcSchema, entities: { LcCursors } })
+const lcTableName = `lc-casing-${Date.now()}`
+
+const lcStream = (casing: DynamoSchema.Casing | undefined) =>
+  EventStore.makeStream({
+    table: LcTable,
+    streamName: "OrderBook",
+    events: [LcPlaced],
+    streamId: { composite: ["orderId"] },
+    snapshot: { schema: LcState },
+    ...(casing !== undefined ? { casing } : {}),
+  })
+
+const LcDefaultStream = lcStream(undefined)
+const LcPreserveStream = lcStream("preserve")
+
+const provideLc = Effect.provide(Layer.mergeAll(ClientLayer, LcTable.layer({ name: lcTableName })))
+
+const lcPartition = (pk: string) =>
+  Effect.gen(function* () {
+    const client = yield* DynamoClient
+    const raw = yield* client.query({
+      TableName: lcTableName,
+      KeyConditionExpression: "#pk = :pk",
+      ExpressionAttributeNames: { "#pk": "pk" },
+      ExpressionAttributeValues: { ":pk": { S: pk } },
+    })
+    return (raw.Items ?? []).map((i) => fromAttributeMap(i))
+  })
+
+describeConnected("EventStore stream casing (schema casing: preserve)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: lcTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: "sk", AttributeType: "S" },
+          ],
+        })
+      }).pipe(provideLc, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: lcTableName }).pipe(Effect.catch(() => Effect.void))
+      }).pipe(provideLc, Effect.scoped),
+    )
+  }, 15000)
+
+  it.effect("omitted keeps the lower-cased stream name; entity keys follow the schema", () =>
+    Effect.gen(function* () {
+      yield* LcDefaultStream.append({ orderId: "Ord-1" }, [new LcPlaced({ qty: 2 })], 0, {
+        additionalItems: [LcCursors.put({ deviceId: "Dev-A", mark: 1 })],
+        idempotency: { commandId: "Cmd-1" },
+      })
+      yield* LcDefaultStream.writeSnapshot({ orderId: "Ord-1" }, { total: 2 }, 1)
+
+      const items = yield* lcPartition("$LcStore#v1#orderbook#Ord-1")
+      expect(items.map((i) => [i.sk, i.__edd_e__])).toEqual([
+        ["$LcStore#v1#orderbook.command#Cmd-1", "orderbook.command"],
+        ["$LcStore#v1#orderbook.event_1#0000000001", "orderbook.event"],
+        ["$LcStore#v1#orderbook.snapshot", "orderbook.snapshot"],
+      ])
+
+      const cursor = yield* lcPartition("$LcStore#v1#Cursor#deviceId_Dev-A")
+      expect(cursor).toHaveLength(1)
+    }).pipe(provideLc),
+  )
+
+  it.effect(`casing: "preserve" writes and reads the stream name as written, end to end`, () =>
+    Effect.gen(function* () {
+      const key = { orderId: "Ord-2" }
+      yield* LcPreserveStream.append(key, [new LcPlaced({ qty: 3 })], 0, {
+        idempotency: { commandId: "Cmd-2" },
+      })
+      yield* LcPreserveStream.writeSnapshot(key, { total: 3 }, 1)
+      yield* LcPreserveStream.append(key, [new LcPlaced({ qty: 4 })], 1)
+
+      const items = yield* lcPartition("$LcStore#v1#OrderBook#Ord-2")
+      expect(items.map((i) => [i.sk, i.__edd_e__])).toEqual([
+        ["$LcStore#v1#OrderBook.command#Cmd-2", "orderbook.command"],
+        ["$LcStore#v1#OrderBook.event_1#0000000001", "orderbook.event"],
+        ["$LcStore#v1#OrderBook.event_1#0000000002", "orderbook.event"],
+        ["$LcStore#v1#OrderBook.snapshot", "orderbook.snapshot"],
+      ])
+
+      // Every read path finds what the write paths wrote.
+      expect((yield* LcPreserveStream.read(key)).map((e) => e.version)).toEqual([1, 2])
+      expect((yield* LcPreserveStream.readFrom(key, 1)).map((e) => e.version)).toEqual([2])
+      expect(yield* LcPreserveStream.currentVersion(key)).toBe(2)
+      const snapshot = yield* LcPreserveStream.readSnapshot(key)
+      expect(Option.map(snapshot, (s) => s.asOfVersion)).toEqual(Option.some(1))
+
+      // The idempotency sentinel is found too: a replay is rejected.
+      const replay = yield* LcPreserveStream.append(key, [new LcPlaced({ qty: 3 })], 2, {
+        idempotency: { commandId: "Cmd-2" },
+      }).pipe(Effect.flip)
+      expect(replay._tag).toBe("DuplicateCommand")
+    }).pipe(provideLc),
+  )
+
+  it.effect("the two settings are separate stores under preserve", () =>
+    Effect.gen(function* () {
+      const key = { orderId: "Ord-3" }
+      yield* LcDefaultStream.append(key, [new LcPlaced({ qty: 1 })], 0)
+
+      // Setting `casing` on an existing stream no longer sees its history.
+      expect(yield* LcPreserveStream.currentVersion(key)).toBe(0)
+      expect(yield* LcPreserveStream.read(key)).toEqual([])
+      expect(yield* LcDefaultStream.currentVersion(key)).toBe(1)
+    }).pipe(provideLc),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Index-level `casing` (was silently dropped for GSIs before 1.22)
+// ---------------------------------------------------------------------------
+//
+// The schema folds case; one GSI keeps it. Ids that differ only by case must
+// stay distinct through that index — on put, query, update and the collection —
+// while the primary key still folds them together.
+
+const icSchema = DynamoSchema.make({ name: "icstore", version: 1 })
+
+class IcDevice extends Schema.Class<IcDevice>("IcDevice")({
+  deviceId: Schema.String,
+  ownerId: Schema.String,
+  site: Schema.String,
+}) {}
+
+const IcDevices = Entity.make({
+  model: IcDevice,
+  entityType: "Device",
+  primaryKey: {
+    pk: { field: "pk", composite: ["deviceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byOwner: {
+      name: "gsi1",
+      casing: "preserve",
+      pk: { field: "gsi1pk", composite: ["ownerId"] },
+      sk: { field: "gsi1sk", composite: ["deviceId"] },
+    },
+    bySite: {
+      name: "gsi2",
+      collection: "Fleet",
+      casing: "preserve",
+      pk: { field: "gsi2pk", composite: ["site"] },
+      sk: { field: "gsi2sk", composite: ["deviceId"] },
+    },
+  },
+})
+
+class IcGateway extends Schema.Class<IcGateway>("IcGateway")({
+  gatewayId: Schema.String,
+  site: Schema.String,
+}) {}
+
+const IcGateways = Entity.make({
+  model: IcGateway,
+  entityType: "Gateway",
+  primaryKey: {
+    pk: { field: "pk", composite: ["gatewayId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    bySite: {
+      name: "gsi2",
+      collection: "Fleet",
+      casing: "preserve",
+      pk: { field: "gsi2pk", composite: ["site"] },
+      sk: { field: "gsi2sk", composite: ["gatewayId"] },
+    },
+  },
+})
+
+const icTableName = `index-casing-${Date.now()}`
+const IcTable = Table.make({ schema: icSchema, entities: { IcDevices, IcGateways } })
+const provideIc = Effect.provide(Layer.mergeAll(ClientLayer, IcTable.layer({ name: icTableName })))
+const icClient = DynamoClient.make({
+  entities: { IcDevices, IcGateways },
+  tables: { IcTable },
+})
+
+describeConnected("index-level casing", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* icClient
+        yield* db.tables.IcTable.create()
+      }).pipe(provideIc, Effect.scoped),
+    )
+  }, 60000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: icTableName })
+      }).pipe(
+        provideIc,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("keeps ids that differ only by case apart through the preserving index", () =>
+    Effect.gen(function* () {
+      const db = yield* icClient
+      yield* db.entities.IcDevices.put({ deviceId: "d-1", ownerId: "Own-A", site: "Site-X" })
+      yield* db.entities.IcDevices.put({ deviceId: "d-2", ownerId: "own-a", site: "site-x" })
+      yield* db.entities.IcGateways.put({ gatewayId: "g-1", site: "Site-X" })
+
+      const upper = yield* db.entities.IcDevices.byOwner({ ownerId: "Own-A" }).collect()
+      expect(upper.map((d) => d.deviceId)).toEqual(["d-1"])
+      const lower = yield* db.entities.IcDevices.byOwner({ ownerId: "own-a" }).collect()
+      expect(lower.map((d) => d.deviceId)).toEqual(["d-2"])
+
+      const narrowed = yield* db.entities.IcDevices.byOwner({
+        ownerId: "Own-A",
+        deviceId: "d-1",
+      }).collect()
+      expect(narrowed).toHaveLength(1)
+
+      const fleet = yield* db.collections.Fleet!({ site: "Site-X" }).collect()
+      expect(fleet.IcDevices!.map((d: IcDevice) => d.deviceId)).toEqual(["d-1"])
+      expect(fleet.IcGateways!.map((g: IcGateway) => g.gatewayId)).toEqual(["g-1"])
+
+      // The primary key still folds case under the schema's casing.
+      const folded = yield* db.entities.IcDevices.get({ deviceId: "D-1" })
+      expect(folded.ownerId).toBe("Own-A")
+    }).pipe(provideIc),
+  )
+
+  it.effect("update recomposes the preserving index's keys", () =>
+    Effect.gen(function* () {
+      const db = yield* icClient
+      yield* db.entities.IcDevices.put({ deviceId: "d-3", ownerId: "Own-B", site: "Site-Y" })
+      yield* db.entities.IcDevices.update({ deviceId: "d-3" }).set({ ownerId: "Own-C" })
+
+      expect(yield* db.entities.IcDevices.byOwner({ ownerId: "Own-B" }).collect()).toEqual([])
+      const moved = yield* db.entities.IcDevices.byOwner({ ownerId: "Own-C" }).collect()
+      expect(moved.map((d) => d.deviceId)).toEqual(["d-3"])
+      expect(yield* db.entities.IcDevices.byOwner({ ownerId: "own-c" }).collect()).toEqual([])
+    }).pipe(provideIc),
+  )
+})

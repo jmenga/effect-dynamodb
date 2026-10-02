@@ -358,6 +358,41 @@ describe("TimeSeries — append payload shape", () => {
     }).pipe(Effect.provide(layer))
   })
 
+  // Storage format. The `#e#` infix and the orderBy value follow the SCHEMA's
+  // casing even when the primary key overrides it — event SKs already stored
+  // under that rule must stay readable, so this is pinned rather than aligned.
+  it.effect("event SK suffix follows the schema's casing, not a primary-key override", () => {
+    const entity = Entity.make({
+      model: Telemetry,
+      entityType: "Telemetry",
+      primaryKey: {
+        pk: { field: "pk", composite: ["channel", "deviceId"] },
+        sk: { field: "sk", composite: [] },
+        casing: "uppercase",
+      },
+      timeSeries: { orderBy: "timestamp", appendInput: TelemetryAppendInput },
+    })
+    const { tableLayer } = makeEntityWithTag(entity)
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      mockTransactWriteItems.mockResolvedValueOnce({})
+      mockGetItem.mockResolvedValueOnce({ Item: undefined })
+
+      yield* entity
+        .append({
+          channel: "C-1",
+          deviceId: "D-7",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+        })
+        .pipe(Effect.ignore)
+
+      const put = mockTransactWriteItems.mock.calls[0]![0].TransactItems[1].Put
+      expect(put.Item.pk.S).toBe("$tsapp#v1#TELEMETRY#CHANNEL_C-1#DEVICEID_D-7")
+      expect(put.Item.sk.S).toBe("$tsapp#v1#TELEMETRY#e#2026-04-22t10:00:00.000z")
+    }).pipe(Effect.provide(layer))
+  })
+
   it.effect("omits _ttl on event when config has no ttl", () => {
     const { entity, tableLayer } = buildEntity() // no ttl
     const layer = Layer.merge(TestDynamoClient, tableLayer)
