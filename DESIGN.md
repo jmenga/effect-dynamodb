@@ -352,7 +352,7 @@ The physical table name is injected at runtime via Effect Layers, keeping defini
 MainTable.layer({ name: "my-prod-table" })
 
 // Or from environment variables via Effect Config
-MainTable.layerConfig({ name: Config.string("TABLE_NAME") })
+MainTable.layerConfig({ name: Config.String("TABLE_NAME") })
 ```
 
 ### DynamoClient.make(table) — Typed Execution Gateway
@@ -1701,8 +1701,8 @@ DynamoClient.layer({ region: "us-east-1" })
 MainTable.layer({ name: "my-prod-table" })
 
 // Config-based (reads from environment variables)
-DynamoClient.layerConfig({ region: Config.string("AWS_REGION") })
-MainTable.layerConfig({ name: Config.string("TABLE_NAME") })
+DynamoClient.layerConfig({ region: Config.String("AWS_REGION") })
+MainTable.layerConfig({ name: Config.String("TABLE_NAME") })
 ```
 
 ---

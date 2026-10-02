@@ -94,7 +94,7 @@ export interface EmbedderService {
 `Embedder.layerTest({ dimensions })` ships in-library — deterministic, dependency-free, and used by this example and the connected test suite. Dimension agreement between the layer and every bound vector index is validated at `DynamoClient.make`, so a mismatch fails at wiring rather than on the thousandth write.
 
 ```typescript region="layers" example="guide-vector-search.ts"
-const endpoint = Config.string("DYNAMODB_ENDPOINT").pipe(
+const endpoint = Config.String("DYNAMODB_ENDPOINT").pipe(
   Config.withDefault("http://localhost:8000"),
 )
 

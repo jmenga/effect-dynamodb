@@ -136,7 +136,7 @@ const program = Effect.gen(function* () {
 const AppLayer = Layer.mergeAll(
   DynamoClient.layerConfig({
     region: Config.succeed("us-east-1"),
-    endpoint: Config.string("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+    endpoint: Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
     credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
   }),
   MainTable.layer({ name: "vehicle-tracking" }),

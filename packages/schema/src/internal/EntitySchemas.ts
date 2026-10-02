@@ -522,14 +522,14 @@ export const buildDateTransform = (encoding: DynamoEncoding): Schema.Top => {
   }
   return Schema.Any.pipe(
     Schema.decodeTo(targetSchema, {
-      decode: SchemaGetter.transformOrFail((value: unknown) => {
+      decode: SchemaGetter.transformEffect((value: unknown) => {
         try {
           return Effect.succeed(liftToDomain(value))
         } catch {
           return Effect.fail(new SchemaIssue.InvalidType(Schema.Any.ast, value))
         }
       }),
-      encode: SchemaGetter.transformOrFail((value: unknown) => {
+      encode: SchemaGetter.transformEffect((value: unknown) => {
         try {
           return Effect.succeed(toWirePrimitive(value, encoding))
         } catch {
@@ -637,14 +637,14 @@ const buildTolerantTransform = (schema: Schema.Top): Schema.Top => {
 
   return Schema.Any.pipe(
     Schema.decodeTo(typeSide, {
-      decode: SchemaGetter.transformOrFail((value: unknown) => {
+      decode: SchemaGetter.transformEffect((value: unknown) => {
         const fromWire = decodeWire(value)
         if (fromWire._tag === "Some") return Effect.succeed(fromWire.value)
         const alreadyDomain = validateDomain(value)
         if (alreadyDomain._tag === "Some") return Effect.succeed(alreadyDomain.value)
         return Effect.fail(new SchemaIssue.InvalidType(schema.ast, value))
       }),
-      encode: SchemaGetter.transformOrFail((value: unknown) => {
+      encode: SchemaGetter.transformEffect((value: unknown) => {
         const wire = encodeDomain(value)
         if (wire._tag === "Some") return Effect.succeed(wire.value)
         // Already wire-shaped — round-trip it to itself rather than reject.

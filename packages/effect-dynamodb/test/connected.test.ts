@@ -66,7 +66,7 @@ import * as VectorSearchEmulation from "../src/VectorSearchEmulation.js"
 // ---------------------------------------------------------------------------
 
 const ENDPOINT = Effect.runSync(
-  Config.string("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+  Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
 )
 
 let dynamoAvailable = false

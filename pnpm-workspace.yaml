@@ -6,6 +6,11 @@ packages:
 # accepted by pnpm 10 but ignored by pnpm 11. CI uses `pnpm/action-setup@v5`
 # with `version: latest`, which jumped to pnpm 11 after PR #48 landed; without
 # this list the install fails with ERR_PNPM_IGNORED_BUILDS.
+allowBuilds:
+  esbuild: true
+  msgpackr-extract: true
+  sharp: true
+
 onlyBuiltDependencies:
   - esbuild
   - msgpackr-extract

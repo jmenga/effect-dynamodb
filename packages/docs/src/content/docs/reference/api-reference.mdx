@@ -981,8 +981,8 @@ DynamoClient.layer({
 
 // Config-based (reads from Effect Config — e.g., env vars)
 DynamoClient.layerConfig({
-  region: Config.string("AWS_REGION"),
-  endpoint: Config.option(Config.string("DYNAMO_ENDPOINT")),
+  region: Config.String("AWS_REGION"),
+  endpoint: Config.option(Config.String("DYNAMO_ENDPOINT")),
 })
 ```
 
