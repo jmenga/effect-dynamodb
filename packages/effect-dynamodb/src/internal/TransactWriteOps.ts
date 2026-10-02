@@ -35,7 +35,7 @@ import {
   resolveTableNames,
   validateAndBuildPutItem,
 } from "./TransactableOps.js"
-import type { TransactPlan } from "./TransactPlan.js"
+import { conditionFields, type TransactPlan } from "./TransactPlan.js"
 
 // ---------------------------------------------------------------------------
 // ConditionCheck — composable from EntityGet + condition expression
@@ -99,23 +99,6 @@ const compileOpCondition = (
   const expr = isExpr(cond) ? cond : parseShorthand(cond as Record<string, unknown>)
   return compileExpr(expr, entity._resolveDbName) as ExpressionResult
 }
-
-/**
- * Spread a compiled condition onto a `Put` / `Delete` / `ConditionCheck` entry.
- * `ExpressionAttributeValues` is omitted when empty — DynamoDB rejects an empty
- * map, and value-free conditions (`attribute_not_exists`, `attribute_exists`)
- * produce one.
- */
-const conditionFields = (condition: ExpressionResult | undefined) =>
-  condition === undefined
-    ? {}
-    : {
-        ConditionExpression: condition.expression,
-        ExpressionAttributeNames: condition.names,
-        ...(Object.keys(condition.values).length > 0
-          ? { ExpressionAttributeValues: condition.values }
-          : {}),
-      }
 
 // ---------------------------------------------------------------------------
 // buildTransactWriteItems

@@ -14,7 +14,7 @@ multi-item delete needs (sentinel releases, the retain snapshot, the soft-delete
 tombstone), and the read-merge-`Put` plus sentinel rotation an update touching a
 `unique` field needs, derive from the **stored** row, so `transactWrite` reads
 each such row first — the same read the standalone op makes — by running the
-entity's own op in plan mode. A plain update needs no read and compiles to a
+entity's own prepare step. A plain update needs no read and compiles to a
 single `Update` item.
 
 The read is guarded: the op's main item carries a condition on what was read
