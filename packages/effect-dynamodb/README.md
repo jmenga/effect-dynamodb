@@ -62,6 +62,8 @@ const program = Effect.gen(function* () {
 })
 ```
 
+> **Key casing.** Composed keys are lower-cased by default — composite values included — so `"Dev-A"` and `"dev-a"` address the same item, and a put for one overwrites the other. If an id must stay distinct by case (device ids, tenant ids, external references), set `casing: "preserve"` on the schema (`DynamoSchema.make({ name, version, casing: "preserve" })`), or on just the `primaryKey` or index that holds it. Choose before the table holds data: changing casing later moves every key. See [Casing](https://jmenga.github.io/effect-dynamodb/guides/modeling/#casing).
+
 See the [full documentation](https://jmenga.github.io/effect-dynamodb) for guides, tutorials, and API reference.
 
 ## License
