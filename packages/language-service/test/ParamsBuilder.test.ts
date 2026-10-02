@@ -58,7 +58,7 @@ describe("ParamsBuilder", () => {
 
       expect(params.command).toBe("GetItemCommand")
       expect(params.Key).toBeDefined()
-      expect(params.Key!.pk).toBe("$crud-demo#v1#user#u-alice")
+      expect(params.Key!.pk).toBe("$crud-demo#v1#user#userid_u-alice")
       expect(params.Key!.sk).toBe("$crud-demo#v1#user")
       expect(params.entityType).toBe("User")
     })
@@ -72,7 +72,7 @@ describe("ParamsBuilder", () => {
 
       const params = buildParamsOrThrow(op)
 
-      expect(params.Key!.pk).toBe("$crud-demo#v1#user#{userId}")
+      expect(params.Key!.pk).toBe("$crud-demo#v1#user#userid_{userId}")
     })
   })
 
@@ -88,7 +88,7 @@ describe("ParamsBuilder", () => {
 
       expect(params.command).toBe("PutItemCommand")
       expect(params.Item).toBeDefined()
-      expect(params.Item!.pk).toBe("$crud-demo#v1#user#u-bob")
+      expect(params.Item!.pk).toBe("$crud-demo#v1#user#userid_u-bob")
       expect(params.Item!.__edd_e__).toBe("User")
       expect(params.Item!.createdAt).toBe("{now}")
       expect(params.entityType).toBe("User")
@@ -141,7 +141,7 @@ describe("ParamsBuilder", () => {
       const params = buildParamsOrThrow(op)
 
       expect(params.command).toBe("UpdateItemCommand")
-      expect(params.Key!.pk).toBe("$crud-demo#v1#user#u-alice")
+      expect(params.Key!.pk).toBe("$crud-demo#v1#user#userid_u-alice")
       expect(params.UpdateExpression).toContain("SET")
       expect(params.UpdateExpression).toContain("#role")
       expect(params.UpdateExpression).toContain("#displayName")
@@ -182,7 +182,7 @@ describe("ParamsBuilder", () => {
       const params = buildParamsOrThrow(op)
 
       expect(params.command).toBe("DeleteItemCommand")
-      expect(params.Key!.pk).toBe("$crud-demo#v1#user#u-alice")
+      expect(params.Key!.pk).toBe("$crud-demo#v1#user#userid_u-alice")
     })
 
     it("should build TransactWriteItemsCommand for soft-delete entity", () => {
@@ -214,7 +214,7 @@ describe("ParamsBuilder", () => {
       expect(params.KeyConditionExpression).toContain("#pk = :pk")
       expect(params.FilterExpression).toBe("#et IN (:et0)")
       expect(params.ExpressionAttributeNames!["#pk"]).toBe("gsi1pk")
-      expect(params.ExpressionAttributeValues![":pk"]).toBe("$crud-demo#v1#user#admin")
+      expect(params.ExpressionAttributeValues![":pk"]).toBe("$crud-demo#v1#user#role_admin")
       expect(params.ExpressionAttributeValues![":et0"]).toBe("User")
     })
 
@@ -230,7 +230,7 @@ describe("ParamsBuilder", () => {
 
       expect(params.command).toBe("QueryCommand")
       expect(params.KeyConditionExpression).toContain("begins_with(#sk, :skPrefix)")
-      expect(params.ExpressionAttributeValues![":pk"]).toBe("$crud-demo#v1#task#u-alice")
+      expect(params.ExpressionAttributeValues![":pk"]).toBe("$crud-demo#v1#task#userid_u-alice")
     })
   })
 

@@ -142,7 +142,7 @@ const AppSchema = DynamoSchema.make({
 |----------|------|---------|-------------|
 | `name` | `string` | *required* | Application name, used as key prefix |
 | `version` | `number` | *required* | Schema version for migration support |
-| `casing` | `"lowercase" \| "uppercase" \| "preserve"` | `"lowercase"` | Casing for structural key parts |
+| `casing` | `"lowercase" \| "uppercase" \| "preserve"` | `"lowercase"` | Casing for the whole composed key — labels **and composite values** (see [Casing](#casing)) |
 
 ### Why Schema Versioning?
 
@@ -173,6 +173,16 @@ Casing applies uniformly across the **entire generated key**: schema name, versi
 // Key:             $projmgmt#v1#employee#employeeid_emp-alice
 // Stored attribute: employeeId = "Emp-Alice"  (original casing preserved)
 ```
+
+:::caution[Ids that differ only by case share a key]
+Under the default `"lowercase"`, `"Dev-A"` and `"dev-a"` compose the **same key**: a put for one overwrites the other and a get for one returns the other, with no error. If a composite holds an id that must stay distinct by case — device ids, tenant ids, external references — use `casing: "preserve"`.
+:::
+
+:::danger[Casing is part of the storage format]
+Choose `casing` before a table holds data. Changing it later moves every composed key, so existing items are no longer found. Switching on a populated table needs a table rewrite.
+:::
+
+A few fixed markers inside keys are **not** cased, under any setting: the `v` in the version prefix (`$APP#v1`), the version-snapshot `#v#` and soft-delete `#deleted#` infixes, and the `_1` in event and isolated sort keys. Under `"uppercase"` a version snapshot key is `$APP#v1#EMPLOYEE#v#0000003`. The time-series `#e#` infix is the exception — it follows the casing (`#E#` under `"uppercase"`). These are fixed because they are already stored; they will not change.
 
 ## Declaring the Physical Table
 

@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'packages/docs/**'
+      - 'packages/schema/src/**'
       - 'packages/effect-dynamodb/src/**'
       - 'packages/effect-dynamodb/examples/**'
       - 'packages/effect-dynamodb-geo/src/**'
@@ -34,6 +35,11 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # The playground imports key composition from @effect-dynamodb/schema,
+      # which resolves through its built dist.
+      - name: Build schema package
+        run: pnpm --filter @effect-dynamodb/schema build
 
       - name: Build docs site
         run: pnpm --filter @effect-dynamodb/docs build

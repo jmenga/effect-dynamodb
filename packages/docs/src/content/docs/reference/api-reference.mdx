@@ -135,7 +135,7 @@ import { DynamoSchema } from "effect-dynamodb"
 |--------|------|-------------|
 | `make` | `(config) => DynamoSchema` | Create a schema with name, version, and optional casing |
 | `prefix` | `(schema) => string` | Build schema prefix: `$name#vN` |
-| `applyCasing` | `(schema, value) => string` | Apply casing rules to a structural key part |
+| `applyCasing` | `(value, casing) => string` | Apply a casing to a key part — labels and composite values alike |
 | `composeKey` | `(schema, entityType, composites) => string` | Compose entity key: `$schema#vN#entity_type#composites` |
 | `composeCollectionKey` | `(schema, collection, composites) => string` | Compose collection PK |
 | `composeClusteredSortKey` | `(schema, collection, entity, composites) => string` | Compose clustered SK |
@@ -1097,7 +1097,7 @@ import { EventStore } from "effect-dynamodb"
 
 | Export | Description |
 |--------|-------------|
-| `EventStore.makeStream({ table, streamName, events, streamId, metadata? })` | Create an `EventStream<TEvent, TStreamIdFields, TMetadata>` bound to a `Table`. `events` is an array of `Schema.Class` event types, `streamId.composite` lists the stream-id composite fields, optional `metadata` is a Schema. |
+| `EventStore.makeStream({ table, streamName, events, streamId, metadata?, snapshot?, labelCasing? })` | Create an `EventStream<TEvent, TStreamIdFields, TMetadata>` bound to a `Table`. `events` is an array of `Schema.Class` event types, `streamId.composite` lists the stream-id composite fields, optional `metadata` is a Schema. `labelCasing` (`"lowercase"` default \| `"schema"`) decides whether the stream name in keys follows the schema's `casing` — see [Stream name casing](/effect-dynamodb/tutorials/event-sourcing/#stream-name-casing). |
 | `EventStore.bind(stream)` | Resolve `DynamoClient` and `TableConfig` from context and return a `BoundEventStream` whose operations have `R = never`. Use inside `Context.Service` make effects. |
 
 ### Decider

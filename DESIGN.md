@@ -225,17 +225,23 @@ const AppSchema = DynamoSchema.make({
 |----------|------|---------|-------------|
 | `name` | `string` | *required* | Application name, used as key prefix |
 | `version` | `number` | *required* | Schema version number |
-| `casing` | `"lowercase" \| "uppercase" \| "preserve"` | `"lowercase"` | Casing for structural key parts |
+| `casing` | `"lowercase" \| "uppercase" \| "preserve"` | `"lowercase"` | Casing for the whole composed key, composite values included |
 
 ### Casing Rules
 
-Casing applies to **structural parts** of keys:
+Casing applies to the **entire composed key** (ElectroDB parity):
 - Schema name
-- Version prefix
-- Entity type
-- Collection name
+- Entity type / collection name
+- Composite attribute names
+- **Composite attribute values** — under the default `"lowercase"`, `"Dev-A"` and `"dev-a"` compose the same key. Ids that must stay distinct by case need `"preserve"`.
 
-**Attribute values are always preserved as-is.** If a user's `email` is `"Alice@Example.com"`, the email value in the key retains its original casing.
+The stored attribute keeps its original value; only the key string is cased. An index may override the schema's casing with its own `casing`.
+
+**Fixed markers are never cased:** the `v` in `#v<n>`, the `#v#` (version snapshot) and `#deleted#` (soft delete) infixes, and the `_<n>` entity/event version suffix. The time-series `#e#` infix is the exception and follows the casing. These are storage format — pinned by `packages/schema/test/DynamoSchema.test.ts` — and must not change.
+
+**Casing is storage format.** Changing it on a populated table moves every composed key.
+
+**EventStore streams** lower-case `streamName` in their keys by default, regardless of `casing`. `makeStream({ labelCasing: "schema" })` makes it follow the schema's casing like an entity type (only observable under `"preserve"`). See §12.
 
 ### Key Prefix Format
 
@@ -249,9 +255,9 @@ Examples with `name: "myapp"`, `version: 1`, `casing: "lowercase"`:
 
 | Context | Generated key |
 |---------|---------------|
-| User entity, pk `["userId"]`, value `"abc-123"` | `$myapp#v1#user#abc-123` |
+| User entity, pk `["userId"]`, value `"abc-123"` | `$myapp#v1#user#userid_abc-123` |
 | User entity, sk `[]` (empty) | `$myapp#v1#user` |
-| Clustered collection "TenantItems", pk | `$myapp#v1#tenantitems#t-1` |
+| Clustered collection "TenantItems", pk `["tenantId"]` | `$myapp#v1#tenantitems#tenantid_t-1` |
 | Unique constraint sentinel (email) | `$myapp#v1#user.email#foo@bar.com` |
 | Version snapshot (v7) | `$myapp#v1#user#v#0000007` |
 | Soft-deleted item | `$myapp#v1#user#deleted#2024-01-15T10:30:00Z` |
@@ -2034,51 +2040,51 @@ yield* Players.provide(
 
 `EventStore` provides typed, Effect-native event sourcing on DynamoDB. It implements the Decider pattern (command → events → state) with stream-based event persistence.
 
-### Client Gateway Pattern
+### Stream Definition and Binding
 
-EventStore definitions are registered on a table and accessed through the typed client, just like entities and aggregates:
+A stream is bound to a table at definition time. Its operations require
+`DynamoClient | TableConfig`; `EventStore.bind` resolves both and returns a
+`BoundEventStream` with `R = never` for use inside `Context.Service` make effects:
 
 ```typescript
-// Definition — no executable operations
 const MatchEvents = EventStore.makeStream({
+  table: EventsTable,
   streamName: "Match",
   events: [MatchStarted, InningsCompleted, MatchEnded],
   streamId: { composite: ["matchId"] },
 })
 
-// Register on table
-const EventsTable = Table.make({
-  schema: EventSchema,
-  eventStores: { MatchEvents },
-})
-
-// Access through typed client
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(EventsTable)
-  yield* db.MatchEvents.append({ matchId: "m-1" }, [new MatchStarted({ venue: "MCG" })], 0)
-  const events = yield* db.MatchEvents.read({ matchId: "m-1" })
-  const version = yield* db.MatchEvents.currentVersion({ matchId: "m-1" })
+  const stream = yield* EventStore.bind(MatchEvents)
+  yield* stream.append({ matchId: "m-1" }, [new MatchStarted({ venue: "MCG" })], 0)
+  const events = yield* stream.read({ matchId: "m-1" })
+  const version = yield* stream.currentVersion({ matchId: "m-1" })
 })
 ```
 
-As a service:
+### Key Layout
 
-```typescript
-class MatchEventStream extends Context.Service<MatchEventStream>()("@gamemanager/MatchEventStream", {
-  make: Effect.gen(function* () {
-    const { MatchEvents } = yield* DynamoClient.make(EventsTable)
-    return MatchEvents
-  }),
-}) {}
 ```
+pk           $<schema>#v<n>#<stream>#<streamId composites>
+sk (event)   $<schema>#v<n>#<stream>.event_1#<10-digit version>
+sk (command) $<schema>#v<n>#<stream>.command#<commandId>     (idempotency sentinel)
+sk (snapshot)$<schema>#v<n>#<stream>.snapshot
+__edd_e__    "<stream>.event" | "<stream>.command" | "<stream>.snapshot"
+```
+
+Stream-id composites carry no `name_` prefix (unlike entity keys). `<stream>` is
+`streamName` lower-cased by default (`labelCasing: "lowercase"`), whatever the
+schema's casing; with `labelCasing: "schema"` it is `streamName` cased by the
+schema like an entity type. The two only differ under `casing: "preserve"`.
+The `__edd_e__` values are always lower-cased. The default becomes `"schema"` in
+the next major.
 
 ### Command Handler
 
 The `commandHandler` combinator implements the read-decide-append cycle:
 
 ```typescript
-const { MatchEvents } = yield* DynamoClient.make(EventsTable)
-const handler = MatchEvents.commandHandler(MatchDecider)
+const handler = EventStore.commandHandler(MatchDecider, MatchEvents)
 const result = yield* handler({ matchId: "m-1" }, new StartMatch({ venue: "MCG" }))
 // result: { state, version, events }
 ```

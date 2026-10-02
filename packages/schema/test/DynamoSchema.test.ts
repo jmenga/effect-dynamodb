@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import * as DynamoSchema from "../src/DynamoSchema.js"
+import * as KeyComposer from "../src/KeyComposer.js"
 
 describe("DynamoSchema", () => {
   const schema = DynamoSchema.make({ name: "myapp", version: 1 })
@@ -166,6 +167,55 @@ describe("DynamoSchema", () => {
 
     it("preserve", () => {
       expect(DynamoSchema.applyCasing("MyApp", "preserve")).toBe("MyApp")
+    })
+  })
+
+  // Storage format. These markers are written into keys that already exist in
+  // tables, so changing how they are cased would orphan stored items. Most are
+  // fixed literals that ignore casing; the time-series `e` infix is the
+  // exception and has always followed it.
+  describe("fixed key markers", () => {
+    const at = (casing: DynamoSchema.Casing) =>
+      DynamoSchema.make({ name: "App", version: 2, casing })
+
+    it("version prefix `v` ignores casing", () => {
+      expect(DynamoSchema.prefix(at("uppercase"))).toBe("$APP#v2")
+      expect(DynamoSchema.prefix(at("preserve"))).toBe("$App#v2")
+    })
+
+    it("version snapshot `#v#` ignores casing", () => {
+      expect(DynamoSchema.composeVersionKey(at("uppercase"), "User", 3)).toBe(
+        "$APP#v2#USER#v#0000003",
+      )
+      expect(DynamoSchema.composeVersionKeyPrefix(at("preserve"), "User")).toBe("$App#v2#User#v#")
+    })
+
+    it("soft-delete `#deleted#` ignores casing", () => {
+      expect(DynamoSchema.composeDeletedKey(at("uppercase"), "User", "2024-01-15T10:30:00Z")).toBe(
+        "$APP#v2#USER#deleted#2024-01-15T10:30:00Z",
+      )
+      expect(DynamoSchema.composeDeletedKeyPrefix(at("preserve"), "User")).toBe(
+        "$App#v2#User#deleted#",
+      )
+    })
+
+    it("event-version `_1` marker ignores casing", () => {
+      expect(DynamoSchema.composeEventVersionKey(at("uppercase"), "orders.event", 7)).toBe(
+        "$APP#v2#ORDERS.EVENT_1#0000000007",
+      )
+      expect(DynamoSchema.composeEventVersionKeyPrefix(at("preserve"), "Orders.event")).toBe(
+        "$App#v2#Orders.event_1#",
+      )
+    })
+
+    it("time-series `#e#` infix follows casing", () => {
+      expect(KeyComposer.composeEventSk("$APP#v2#METER", "Ab", "uppercase")).toBe(
+        "$APP#v2#METER#E#AB",
+      )
+      expect(KeyComposer.composeEventSk("$app#v2#meter", "Ab", "lowercase")).toBe(
+        "$app#v2#meter#e#ab",
+      )
+      expect(KeyComposer.composeEventSkPrefix("$App#v2#Meter", "preserve")).toBe("$App#v2#Meter#e#")
     })
   })
 })

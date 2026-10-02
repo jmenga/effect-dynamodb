@@ -12017,3 +12017,158 @@ describeConnected("preserveUnique restore + restore-time snapshots", () => {
     }).pipe(providePu),
   )
 })
+
+// ---------------------------------------------------------------------------
+// EventStore stream label casing under `casing: "preserve"`
+// ---------------------------------------------------------------------------
+//
+// The default stream lower-cases its name in keys whatever the schema's casing;
+// `labelCasing: "schema"` makes it follow the schema like an entity type. Under
+// "preserve" the two write different keys, so two streams that differ only in
+// this option are separate stores — the hazard the docs warn about when
+// switching an existing stream.
+
+const lcSchema = DynamoSchema.make({ name: "LcStore", version: 1, casing: "preserve" })
+
+class LcCursor extends Schema.Class<LcCursor>("LcCursor")({
+  deviceId: Schema.String,
+  mark: Schema.Number,
+}) {}
+
+const LcCursors = Entity.make({
+  model: LcCursor,
+  entityType: "Cursor",
+  primaryKey: {
+    pk: { field: "pk", composite: ["deviceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+class LcPlaced extends Schema.TaggedClass<LcPlaced>()("LcPlaced", { qty: Schema.Number }) {}
+
+const LcState = Schema.Struct({ total: Schema.Number })
+
+const LcTable = Table.make({ schema: lcSchema, entities: { LcCursors } })
+const lcTableName = `lc-casing-${Date.now()}`
+
+const lcStream = (labelCasing: EventStore.StreamLabelCasing | undefined) =>
+  EventStore.makeStream({
+    table: LcTable,
+    streamName: "OrderBook",
+    events: [LcPlaced],
+    streamId: { composite: ["orderId"] },
+    snapshot: { schema: LcState },
+    ...(labelCasing !== undefined ? { labelCasing } : {}),
+  })
+
+const LcDefaultStream = lcStream(undefined)
+const LcSchemaStream = lcStream("schema")
+
+const provideLc = Effect.provide(Layer.mergeAll(ClientLayer, LcTable.layer({ name: lcTableName })))
+
+const lcPartition = (pk: string) =>
+  Effect.gen(function* () {
+    const client = yield* DynamoClient
+    const raw = yield* client.query({
+      TableName: lcTableName,
+      KeyConditionExpression: "#pk = :pk",
+      ExpressionAttributeNames: { "#pk": "pk" },
+      ExpressionAttributeValues: { ":pk": { S: pk } },
+    })
+    return (raw.Items ?? []).map((i) => fromAttributeMap(i))
+  })
+
+describeConnected("EventStore stream label casing (casing: preserve)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: lcTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: "sk", AttributeType: "S" },
+          ],
+        })
+      }).pipe(provideLc, Effect.scoped),
+    )
+  }, 20000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: lcTableName }).pipe(Effect.catch(() => Effect.void))
+      }).pipe(provideLc, Effect.scoped),
+    )
+  }, 15000)
+
+  it.effect("default keeps the lower-cased label; entity keys follow the schema", () =>
+    Effect.gen(function* () {
+      yield* LcDefaultStream.append({ orderId: "Ord-1" }, [new LcPlaced({ qty: 2 })], 0, {
+        additionalItems: [LcCursors.put({ deviceId: "Dev-A", mark: 1 })],
+        idempotency: { commandId: "Cmd-1" },
+      })
+      yield* LcDefaultStream.writeSnapshot({ orderId: "Ord-1" }, { total: 2 }, 1)
+
+      const items = yield* lcPartition("$LcStore#v1#orderbook#Ord-1")
+      expect(items.map((i) => [i.sk, i.__edd_e__])).toEqual([
+        ["$LcStore#v1#orderbook.command#Cmd-1", "orderbook.command"],
+        ["$LcStore#v1#orderbook.event_1#0000000001", "orderbook.event"],
+        ["$LcStore#v1#orderbook.snapshot", "orderbook.snapshot"],
+      ])
+
+      const cursor = yield* lcPartition("$LcStore#v1#Cursor#deviceId_Dev-A")
+      expect(cursor).toHaveLength(1)
+    }).pipe(provideLc),
+  )
+
+  it.effect(`"schema" writes and reads the label as written, end to end`, () =>
+    Effect.gen(function* () {
+      const key = { orderId: "Ord-2" }
+      yield* LcSchemaStream.append(key, [new LcPlaced({ qty: 3 })], 0, {
+        idempotency: { commandId: "Cmd-2" },
+      })
+      yield* LcSchemaStream.writeSnapshot(key, { total: 3 }, 1)
+      yield* LcSchemaStream.append(key, [new LcPlaced({ qty: 4 })], 1)
+
+      const items = yield* lcPartition("$LcStore#v1#OrderBook#Ord-2")
+      expect(items.map((i) => [i.sk, i.__edd_e__])).toEqual([
+        ["$LcStore#v1#OrderBook.command#Cmd-2", "orderbook.command"],
+        ["$LcStore#v1#OrderBook.event_1#0000000001", "orderbook.event"],
+        ["$LcStore#v1#OrderBook.event_1#0000000002", "orderbook.event"],
+        ["$LcStore#v1#OrderBook.snapshot", "orderbook.snapshot"],
+      ])
+
+      // Every read path finds what the write paths wrote.
+      expect((yield* LcSchemaStream.read(key)).map((e) => e.version)).toEqual([1, 2])
+      expect((yield* LcSchemaStream.readFrom(key, 1)).map((e) => e.version)).toEqual([2])
+      expect(yield* LcSchemaStream.currentVersion(key)).toBe(2)
+      const snapshot = yield* LcSchemaStream.readSnapshot(key)
+      expect(Option.map(snapshot, (s) => s.asOfVersion)).toEqual(Option.some(1))
+
+      // The idempotency sentinel is found too: a replay is rejected.
+      const replay = yield* LcSchemaStream.append(key, [new LcPlaced({ qty: 3 })], 2, {
+        idempotency: { commandId: "Cmd-2" },
+      }).pipe(Effect.flip)
+      expect(replay._tag).toBe("DuplicateCommand")
+    }).pipe(provideLc),
+  )
+
+  it.effect("the two settings are separate stores under preserve", () =>
+    Effect.gen(function* () {
+      const key = { orderId: "Ord-3" }
+      yield* LcDefaultStream.append(key, [new LcPlaced({ qty: 1 })], 0)
+
+      // Switching an existing stream to "schema" no longer sees its history.
+      expect(yield* LcSchemaStream.currentVersion(key)).toBe(0)
+      expect(yield* LcSchemaStream.read(key)).toEqual([])
+      expect(yield* LcDefaultStream.currentVersion(key)).toBe(1)
+    }).pipe(provideLc),
+  )
+})

@@ -110,6 +110,27 @@ Under the hood, each event is stored as a DynamoDB item with:
 - **SK** containing a zero-padded version number for ordered retrieval
 - **eventType** discriminator for decoding back to the correct Schema.Class
 
+### Stream name casing
+
+By default the stream name is **lower-cased** in every key the stream writes, whatever the schema's `casing`. Entity types follow the schema's `casing` instead, so under `casing: "preserve"` a stream and an entity on the same table disagree:
+
+```
+$cricket#v1#Watermark#writerId_Ingest-1      ← entity: label follows the schema
+$cricket#v1#match#M-1                        ← stream: label always lower-case
+```
+
+Set `labelCasing: "schema"` on `makeStream` to make the stream name follow the schema's casing like entities do:
+
+```
+$cricket#v1#Match#M-1                        ← stream with labelCasing: "schema"
+```
+
+`"schema"` only changes keys under `casing: "preserve"`, and only when `streamName` has upper-case letters — under `"lowercase"` and `"uppercase"` both settings write the same keys. It applies to the partition key and the event, snapshot and idempotency-sentinel sort keys. The `__edd_e__` discriminator (`match.event`, …) stays lower-case either way.
+
+:::caution[Switching an existing stream]
+On a `"preserve"` table, turning on `labelCasing: "schema"` for a stream that already holds data moves its keys. Existing events, snapshots and idempotency sentinels stay under the old keys and are no longer read, so the stream appears to start from version 0. Use it for new streams, or migrate the items first. The default becomes `"schema"` in the next major version.
+:::
+
 ---
 
 ## Step 4: Decider

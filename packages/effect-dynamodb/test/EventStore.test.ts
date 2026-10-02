@@ -3156,3 +3156,156 @@ describe("EventStore", () => {
     )
   })
 })
+
+// ---------------------------------------------------------------------------
+// Stream label casing — `labelCasing` decides whether the stream name in keys
+// follows the schema's casing. The default keeps the always-lower-case layout
+// that existing streams were written with.
+// ---------------------------------------------------------------------------
+
+describe("EventStore stream label casing", () => {
+  const casings = ["lowercase", "uppercase", "preserve"] as const
+
+  const streamsFor = (casing: DynamoSchema.Casing) => {
+    const table = Table.make({
+      schema: DynamoSchema.make({ name: "app", version: 1, casing }),
+      entities: {},
+    })
+    const make = (labelCasing: EventStore.StreamLabelCasing | undefined) =>
+      EventStore.makeStream({
+        table,
+        streamName: "OrderBook",
+        events: [MatchStarted],
+        streamId: { composite: ["orderId"] },
+        snapshot: { schema: MatchStateSchema },
+        ...(labelCasing !== undefined ? { labelCasing } : {}),
+      })
+    return {
+      defaulted: make(undefined),
+      lowercase: make("lowercase"),
+      schema: make("schema"),
+      layer: Layer.merge(TestDynamoClient, table.layer({ name: "events-table" })),
+    }
+  }
+
+  type Stream = ReturnType<typeof streamsFor>["schema"]
+
+  // Every key the stream writes or reads, captured from the mock client.
+  const captureKeys = (stream: Stream) =>
+    Effect.gen(function* () {
+      mockTransactWriteItems.mockResolvedValue({})
+      mockPutItem.mockResolvedValue({})
+      mockQuery.mockResolvedValue({ Items: [] })
+
+      yield* stream.append(
+        { orderId: "Ord-1" },
+        [new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" })],
+        0,
+        { idempotency: { commandId: "Cmd-1" } },
+      )
+      yield* stream.writeSnapshot({ orderId: "Ord-1" }, { status: "in-progress", innings: [] }, 1)
+      yield* stream.read({ orderId: "Ord-1" })
+
+      const transact = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+      const event = fromAttributeMap(transact[0].Put.Item)
+      const sentinel = fromAttributeMap(transact[transact.length - 1].Put.Item)
+      const snapshot = fromAttributeMap(mockPutItem.mock.calls[0]![0].Item)
+      const read = mockQuery.mock.calls[0]![0]
+      return {
+        pk: event.pk,
+        eventSk: event.sk,
+        eventType: event.__edd_e__,
+        sentinelSk: sentinel.sk,
+        sentinelType: sentinel.__edd_e__,
+        snapshotSk: snapshot.sk,
+        snapshotType: snapshot.__edd_e__,
+        readPk: read.ExpressionAttributeValues[":pk"].S,
+        readSkPrefix: read.ExpressionAttributeValues[":sk"].S,
+      }
+    })
+
+  const legacyKeys = {
+    lowercase: {
+      pk: "$app#v1#orderbook#ord-1",
+      eventSk: "$app#v1#orderbook.event_1#0000000001",
+      sentinelSk: "$app#v1#orderbook.command#cmd-1",
+      snapshotSk: "$app#v1#orderbook.snapshot",
+      readPk: "$app#v1#orderbook#ord-1",
+      readSkPrefix: "$app#v1#orderbook.event_1#",
+    },
+    uppercase: {
+      pk: "$APP#v1#ORDERBOOK#ORD-1",
+      eventSk: "$APP#v1#ORDERBOOK.EVENT_1#0000000001",
+      sentinelSk: "$APP#v1#ORDERBOOK.COMMAND#CMD-1",
+      snapshotSk: "$APP#v1#ORDERBOOK.SNAPSHOT",
+      readPk: "$APP#v1#ORDERBOOK#ORD-1",
+      readSkPrefix: "$APP#v1#ORDERBOOK.EVENT_1#",
+    },
+    preserve: {
+      pk: "$app#v1#orderbook#Ord-1",
+      eventSk: "$app#v1#orderbook.event_1#0000000001",
+      sentinelSk: "$app#v1#orderbook.command#Cmd-1",
+      snapshotSk: "$app#v1#orderbook.snapshot",
+      readPk: "$app#v1#orderbook#Ord-1",
+      readSkPrefix: "$app#v1#orderbook.event_1#",
+    },
+  } as const
+
+  // The discriminator never varies — reads match it exactly.
+  const discriminators = {
+    eventType: "orderbook.event",
+    sentinelType: "orderbook.command",
+    snapshotType: "orderbook.snapshot",
+  }
+
+  for (const casing of casings) {
+    it.effect(`default keeps the lower-cased stream label (casing: "${casing}")`, () => {
+      const { defaulted, lowercase, layer } = streamsFor(casing)
+      return Effect.gen(function* () {
+        const keys = yield* captureKeys(defaulted)
+        expect(keys).toEqual({ ...legacyKeys[casing], ...discriminators })
+
+        vi.resetAllMocks()
+        expect(yield* captureKeys(lowercase)).toEqual(keys)
+      }).pipe(Effect.provide(layer))
+    })
+  }
+
+  for (const casing of ["lowercase", "uppercase"] as const) {
+    it.effect(`"schema" matches the default layout (casing: "${casing}")`, () => {
+      const { schema, layer } = streamsFor(casing)
+      return Effect.gen(function* () {
+        expect(yield* captureKeys(schema)).toEqual({ ...legacyKeys[casing], ...discriminators })
+      }).pipe(Effect.provide(layer))
+    })
+  }
+
+  it.effect(`"schema" keeps the stream name as written under casing: "preserve"`, () => {
+    const { schema, layer } = streamsFor("preserve")
+    return Effect.gen(function* () {
+      expect(yield* captureKeys(schema)).toEqual({
+        pk: "$app#v1#OrderBook#Ord-1",
+        eventSk: "$app#v1#OrderBook.event_1#0000000001",
+        sentinelSk: "$app#v1#OrderBook.command#Cmd-1",
+        snapshotSk: "$app#v1#OrderBook.snapshot",
+        readPk: "$app#v1#OrderBook#Ord-1",
+        readSkPrefix: "$app#v1#OrderBook.event_1#",
+        ...discriminators,
+      })
+    }).pipe(Effect.provide(layer))
+  })
+
+  it(`"schema" under "preserve" still sorts the snapshot after every event`, () => {
+    const schema = DynamoSchema.make({ name: "app", version: 1, casing: "preserve" })
+    const snapshotSk = DynamoSchema.composeKey(schema, "OrderBook.snapshot", [])
+    const lastEvent = DynamoSchema.composeEventVersionKey(
+      schema,
+      "OrderBook.event",
+      DynamoSchema.MAX_EVENT_VERSION,
+    )
+    const sentinel = DynamoSchema.composeKey(schema, "OrderBook.command", ["zzz"])
+    const firstEvent = DynamoSchema.composeEventVersionKey(schema, "OrderBook.event", 1)
+    expect(snapshotSk > lastEvent).toBe(true)
+    expect(sentinel < firstEvent).toBe(true)
+  })
+})

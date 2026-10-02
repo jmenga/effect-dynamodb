@@ -159,6 +159,28 @@ export interface SnapshotConfig<TSchema extends Schema.Top = Schema.Top> {
 }
 
 /** The runtime snapshot settings exposed on a stream. */
+/**
+ * How a stream's name is cased in its keys (partition key, event / snapshot /
+ * command-sentinel sort keys).
+ *
+ * - `"lowercase"` (default) — the stream name is lower-cased before key
+ *   composition, whatever the schema's `casing`. This is the layout every stream
+ *   has used so far; keep it for streams that already hold data.
+ * - `"schema"` — the stream name follows the schema's `casing`, as entity types
+ *   do. Under `"lowercase"` and `"uppercase"` schemas this produces the same keys
+ *   as the default; it differs only under `casing: "preserve"` when the stream
+ *   name contains upper-case letters (`$app#v1#Orders#…` instead of
+ *   `$app#v1#orders#…`).
+ *
+ * Switching an existing `"preserve"` stream to `"schema"` is a storage-format
+ * change: its existing events, snapshot and idempotency sentinels stay under the
+ * old keys and are no longer read. The `__edd_e__` discriminator
+ * (`<stream>.event` etc.) is always lower-cased and is unaffected by this option.
+ *
+ * The default becomes `"schema"` in the next major version.
+ */
+export type StreamLabelCasing = "lowercase" | "schema"
+
 export interface SnapshotSettings {
   readonly every: number | undefined
 }
@@ -383,6 +405,10 @@ export interface EventStream<
  * })
  * ```
  *
+ * Set `labelCasing: "schema"` to case the stream name in keys with the schema's
+ * `casing`, as entities do — see {@link StreamLabelCasing}. Only matters for
+ * `casing: "preserve"` schemas.
+ *
  * @throws `[EDD-9027]` when `snapshot.every` is not a positive integer.
  */
 export const makeStream = <
@@ -399,6 +425,7 @@ export const makeStream = <
   readonly streamId: TStreamId
   readonly metadata?: TMetadata
   readonly snapshot?: TSnapshot
+  readonly labelCasing?: StreamLabelCasing | undefined
 }): EventStream<
   Schema.Schema.Type<TEvents[number]>,
   TStreamId["composite"],
@@ -409,15 +436,31 @@ export const makeStream = <
   type TStreamIdFields = TStreamId["composite"]
 
   const schema = config.table.schema
-  const entityType = `${config.streamName.toLowerCase()}.event`
-  const snapshotEntityType = `${config.streamName.toLowerCase()}.snapshot`
+  /**
+   * `__edd_e__` discriminator values. Always lower-cased, whatever the casing:
+   * they are matched exactly by every stream read, so they never vary with
+   * `labelCasing` or the schema's casing.
+   */
+  const typeLabel = config.streamName.toLowerCase()
+  const entityType = `${typeLabel}.event`
+  const snapshotEntityType = `${typeLabel}.snapshot`
   /**
    * Entity type of the command-dedup sentinel. Distinct from `entityType` so the
    * sentinel is filtered out of every event query (`read`, `readFrom`,
    * `currentVersion` all constrain `__edd_e__`), and it sorts before the event
    * keys (`.command` < `.event`) so it also falls outside `readFrom` ranges.
    */
-  const commandEntityType = `${config.streamName.toLowerCase()}.command`
+  const commandEntityType = `${typeLabel}.command`
+
+  /**
+   * Label used in the stream's keys (see {@link StreamLabelCasing}). `"schema"`
+   * hands the stream name to the key composer as written, so the schema's casing
+   * applies to it exactly as it does to entity types.
+   */
+  const keyLabel = (config.labelCasing ?? "lowercase") === "schema" ? config.streamName : typeLabel
+  const eventKeyLabel = `${keyLabel}.event`
+  const snapshotKeyLabel = `${keyLabel}.snapshot`
+  const commandKeyLabel = `${keyLabel}.command`
   const compositeFields = config.streamId.composite
 
   // -------------------------------------------------------------------------
@@ -451,11 +494,11 @@ export const makeStream = <
 
   const composeStreamPk = (streamId: Record<string, unknown>): string => {
     const composites = KeyComposer.extractComposites(compositeFields, streamId)
-    return DynamoSchema.composeKey(schema, config.streamName.toLowerCase(), composites)
+    return DynamoSchema.composeKey(schema, keyLabel, composites)
   }
 
   const composeEventSk = (version: number): string =>
-    DynamoSchema.composeEventVersionKey(schema, entityType, version)
+    DynamoSchema.composeEventVersionKey(schema, eventKeyLabel, version)
 
   /**
    * Every event SK begins with this; nothing else in the stream partition does.
@@ -463,7 +506,7 @@ export const makeStream = <
    * level, which matters because DynamoDB applies `Limit` *before*
    * `FilterExpression` — a filtered-out snapshot would still burn a `Limit` slot.
    */
-  const eventSkPrefix = DynamoSchema.composeEventVersionKeyPrefix(schema, entityType)
+  const eventSkPrefix = DynamoSchema.composeEventVersionKeyPrefix(schema, eventKeyLabel)
 
   /** Inclusive upper bound of the event SK range (10-digit padding maximum). */
   const maxEventSk = composeEventSk(DynamoSchema.MAX_EVENT_VERSION)
@@ -473,7 +516,7 @@ export const makeStream = <
    * `<stream>.event_1#…`), so it can never collide with an event SK, and it
    * sorts after every event in the partition.
    */
-  const snapshotSk = DynamoSchema.composeKey(schema, snapshotEntityType, [])
+  const snapshotSk = DynamoSchema.composeKey(schema, snapshotKeyLabel, [])
 
   const composeStreamIdString = (streamId: Record<string, unknown>): string =>
     compositeFields.map((f) => streamId[f]).join("#")
@@ -750,7 +793,7 @@ export const makeStream = <
       if (idempotency !== undefined) {
         const sentinel: Record<string, unknown> = {
           pk,
-          sk: DynamoSchema.composeKey(schema, commandEntityType, [idempotency.commandId]),
+          sk: DynamoSchema.composeKey(schema, commandKeyLabel, [idempotency.commandId]),
           __edd_e__: commandEntityType,
           streamId: streamIdStr,
           commandId: idempotency.commandId,

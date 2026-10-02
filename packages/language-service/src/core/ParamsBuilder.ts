@@ -160,7 +160,7 @@ function buildQueryParams(
   const values: Record<string, string> = {}
 
   const pkValue = composePkValue(entity.schema, entity.entityType, index, args)
-  const skPrefix = composeSkPrefixValue(entity.schema, entity.entityType, index, args)
+  const skPrefix = composeSkBeginsWithValue(entity.schema, entity.entityType, index, args)
 
   names["#pk"] = index.pk.field
   values[":pk"] = pkValue
@@ -308,6 +308,20 @@ function buildUpdateExpression(
 }
 
 // --- Key composition (mirrors DynamoSchema + KeyComposer) ---
+//
+// This package is CommonJS and cannot load the ESM-only `@effect-dynamodb/schema`,
+// so key composition is mirrored here. `test/KeyParity.test.ts` checks it against
+// the library on every run — change both together.
+
+/**
+ * One composite slot. `placeholder` marks a value only known at runtime, shown
+ * as `{attr}` and left uncased so it still names the attribute.
+ */
+interface CompositeSlot {
+  readonly name: string
+  readonly value: string
+  readonly placeholder: boolean
+}
 
 function applyCasing(value: string, casing: Casing): string {
   switch (casing) {
@@ -324,62 +338,95 @@ function schemaPrefix(schema: SchemaConfig): string {
   return `$${applyCasing(schema.name, schema.casing)}#v${schema.version}`
 }
 
-function composeKey(
-  schema: SchemaConfig,
-  entityType: string,
-  composites: ReadonlyArray<string>,
-  casing?: Casing,
-): string {
-  const effectiveCasing = casing ?? schema.casing
-  const pre = schemaPrefix(schema)
-  const type = applyCasing(entityType, effectiveCasing)
-  if (composites.length === 0) return `${pre}#${type}`
-  return `${pre}#${type}#${composites.join("#")}`
+/** Mirrors `KeyComposer.serializeValue` for the values a source literal can hold. */
+function serializeValue(value: unknown): string {
+  if (typeof value === "string") return value
+  if (typeof value === "number") return String(value).padStart(16, "0")
+  if (typeof value === "bigint") return String(value).padStart(38, "0")
+  if (typeof value === "boolean") return value ? "true" : "false"
+  return String(value)
 }
 
-function composeCollectionKey(
+function formatComposites(
+  slots: ReadonlyArray<CompositeSlot>,
+  casing: Casing,
+): ReadonlyArray<string> {
+  return slots.map(
+    (slot) =>
+      `${applyCasing(slot.name, casing)}_${slot.placeholder ? slot.value : applyCasing(slot.value, casing)}`,
+  )
+}
+
+function composeKey(
   schema: SchemaConfig,
-  collectionName: string,
-  composites: ReadonlyArray<string>,
+  label: string,
+  slots: ReadonlyArray<CompositeSlot>,
   casing?: Casing,
 ): string {
   const effectiveCasing = casing ?? schema.casing
-  const pre = schemaPrefix(schema)
-  const collection = applyCasing(collectionName, effectiveCasing)
-  if (composites.length === 0) return `${pre}#${collection}`
-  return `${pre}#${collection}#${composites.join("#")}`
+  return [
+    schemaPrefix(schema),
+    applyCasing(label, effectiveCasing),
+    ...formatComposites(slots, effectiveCasing),
+  ].join("#")
 }
 
 function composeClusteredSortKey(
   schema: SchemaConfig,
-  collectionName: string,
+  collection: string | ReadonlyArray<string>,
   entityType: string,
   entityVersion: number,
-  composites: ReadonlyArray<string>,
+  slots: ReadonlyArray<CompositeSlot>,
   casing?: Casing,
 ): string {
   const effectiveCasing = casing ?? schema.casing
-  const pre = schemaPrefix(schema)
-  const collection = applyCasing(collectionName, effectiveCasing)
-  const type = applyCasing(entityType, effectiveCasing)
-  const entityPrefix = `${type}_${entityVersion}`
-  const parts = [pre, collection, entityPrefix, ...composites].filter((p) => p.length > 0)
-  return parts.join("#")
+  const hierarchy = typeof collection === "string" ? [collection] : collection
+  return [
+    schemaPrefix(schema),
+    ...hierarchy.map((name) => applyCasing(name, effectiveCasing)),
+    `${applyCasing(entityType, effectiveCasing)}_${entityVersion}`,
+    ...formatComposites(slots, effectiveCasing),
+  ]
+    .filter((part) => part.length > 0)
+    .join("#")
 }
 
 function composeIsolatedSortKey(
   schema: SchemaConfig,
   entityType: string,
   entityVersion: number,
-  composites: ReadonlyArray<string>,
+  slots: ReadonlyArray<CompositeSlot>,
   casing?: Casing,
 ): string {
   const effectiveCasing = casing ?? schema.casing
-  const pre = schemaPrefix(schema)
-  const type = applyCasing(entityType, effectiveCasing)
-  const entityPrefix = `${type}_${entityVersion}`
-  const parts = [pre, entityPrefix, ...composites].filter((p) => p.length > 0)
-  return parts.join("#")
+  return [
+    schemaPrefix(schema),
+    `${applyCasing(entityType, effectiveCasing)}_${entityVersion}`,
+    ...formatComposites(slots, effectiveCasing),
+  ].join("#")
+}
+
+function composeSkFromSlots(
+  schema: SchemaConfig,
+  entityType: string,
+  index: IndexDefinition,
+  slots: ReadonlyArray<CompositeSlot>,
+): string {
+  const entityVersion = 1
+  if (index.collection !== undefined) {
+    if ((index.type ?? "isolated") === "clustered") {
+      return composeClusteredSortKey(
+        schema,
+        index.collection,
+        entityType,
+        entityVersion,
+        slots,
+        index.casing,
+      )
+    }
+    return composeIsolatedSortKey(schema, entityType, entityVersion, slots, index.casing)
+  }
+  return composeKey(schema, entityType, slots, index.casing)
 }
 
 function composePkValue(
@@ -388,13 +435,13 @@ function composePkValue(
   index: IndexDefinition,
   record: Record<string, unknown> | undefined,
 ): string {
-  const composites = extractCompositeValues(index.pk.composite, record)
+  const slots = extractCompositeSlots(index.pk.composite, record)
   const collection = index.collection
   if (collection !== undefined) {
-    const collectionName = Array.isArray(collection) ? collection[0]! : collection
-    return composeCollectionKey(schema, collectionName, composites, index.casing)
+    const collectionName = typeof collection === "string" ? collection : collection[0]!
+    return composeKey(schema, collectionName, slots, index.casing)
   }
-  return composeKey(schema, entityType, composites, index.casing)
+  return composeKey(schema, entityType, slots, index.casing)
 }
 
 function composeSkValue(
@@ -403,60 +450,52 @@ function composeSkValue(
   index: IndexDefinition,
   record: Record<string, unknown> | undefined,
 ): string {
-  const composites = extractCompositeValues(index.sk.composite, record)
-  const collection = index.collection
-  const collectionType = index.type ?? "clustered"
-  const entityVersion = 1
-
-  if (collection !== undefined) {
-    if (collectionType === "clustered") {
-      const collectionName = Array.isArray(collection) ? collection[0]! : collection
-      return composeClusteredSortKey(
-        schema,
-        collectionName,
-        entityType,
-        entityVersion,
-        composites,
-        index.casing,
-      )
-    }
-    return composeIsolatedSortKey(schema, entityType, entityVersion, composites, index.casing)
-  }
-  return composeKey(schema, entityType, composites, index.casing)
+  return composeSkFromSlots(
+    schema,
+    entityType,
+    index,
+    extractCompositeSlots(index.sk.composite, record),
+  )
 }
 
+/** Leading SK composites present in `record`, stopping at the first missing one. */
+function availableSkSlots(
+  index: IndexDefinition,
+  record: Record<string, unknown> | undefined,
+): ReadonlyArray<CompositeSlot> {
+  const slots: Array<CompositeSlot> = []
+  for (const attr of index.sk.composite) {
+    const value = record?.[attr]
+    if (value === undefined || value === null) break
+    slots.push({ name: attr, value: serializeValue(value), placeholder: false })
+  }
+  return slots
+}
+
+/** Mirrors `KeyComposer.composeSortKeyPrefix` — the raw value, no trailing delimiter. */
 function composeSkPrefixValue(
   schema: SchemaConfig,
   entityType: string,
   index: IndexDefinition,
   record: Record<string, unknown> | undefined,
-): string | undefined {
-  const available: Array<string> = []
-  for (const attr of index.sk.composite) {
-    const value = record?.[attr]
-    if (value === undefined || value === null) break
-    available.push(String(value))
-  }
+): string {
+  return composeSkFromSlots(schema, entityType, index, availableSkSlots(index, record))
+}
 
-  const collection = index.collection
-  const collectionType = index.type ?? "clustered"
-  const entityVersion = 1
-
-  if (collection !== undefined) {
-    if (collectionType === "clustered") {
-      const collectionName = Array.isArray(collection) ? collection[0]! : collection
-      return composeClusteredSortKey(
-        schema,
-        collectionName,
-        entityType,
-        entityVersion,
-        available,
-        index.casing,
-      )
-    }
-    return composeIsolatedSortKey(schema, entityType, entityVersion, available, index.casing)
-  }
-  return composeKey(schema, entityType, available, index.casing)
+/**
+ * Mirrors `KeyComposer.composeSortKeyBeginsWith` — the prefix plus a trailing
+ * delimiter iff SK composites remain, so `status_done` cannot match
+ * `status_done_archived`.
+ */
+function composeSkBeginsWithValue(
+  schema: SchemaConfig,
+  entityType: string,
+  index: IndexDefinition,
+  record: Record<string, unknown> | undefined,
+): string {
+  const slots = availableSkSlots(index, record)
+  const prefix = composeSkFromSlots(schema, entityType, index, slots)
+  return slots.length === index.sk.composite.length ? prefix : `${prefix}#`
 }
 
 function composePrimaryKey(
@@ -470,14 +509,16 @@ function composePrimaryKey(
   }
 }
 
-function extractCompositeValues(
+function extractCompositeSlots(
   composite: ReadonlyArray<string>,
   record: Record<string, unknown> | undefined,
-): ReadonlyArray<string> {
+): ReadonlyArray<CompositeSlot> {
   return composite.map((attr) => {
     const value = record?.[attr]
-    if (value === undefined || value === null) return `{${attr}}`
-    return String(value)
+    if (value === undefined || value === null) {
+      return { name: attr, value: `{${attr}}`, placeholder: true }
+    }
+    return { name: attr, value: serializeValue(value), placeholder: false }
   })
 }
 
@@ -631,7 +672,12 @@ function buildEntityIndexAccessorParams(
             // Use the .where() operator on the composed prefix
             switch (whereCondition.op) {
               case "beginsWith":
-                values[":skPrefix"] = skPrefix
+                values[":skPrefix"] = composeSkBeginsWithValue(
+                  entity.schema,
+                  entity.entityType,
+                  indexDef,
+                  mergedArgs,
+                )
                 keyCondition += " AND begins_with(#sk, :skPrefix)"
                 break
               case "eq":
@@ -668,7 +714,12 @@ function buildEntityIndexAccessorParams(
               }
             }
           } else {
-            values[":skPrefix"] = skPrefix
+            values[":skPrefix"] = composeSkBeginsWithValue(
+              entity.schema,
+              entity.entityType,
+              indexDef,
+              mergedArgs,
+            )
             keyCondition += " AND begins_with(#sk, :skPrefix)"
           }
         }
