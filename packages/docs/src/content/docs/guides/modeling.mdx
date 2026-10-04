@@ -138,6 +138,8 @@ const EmployeeModel = DynamoModel.configure(Employee, {
 
 Primary key composite attributes are inherently immutable — you don't need to mark them.
 
+An update may restate an immutable field with its current value, so spreading a whole record into `.set()` works. A `.set()` with a different value fails with a `ValidationError`, as does a `.set()` that changes a primary-key composite. Earlier versions silently ignored the latter.
+
 ### Identifier and Ref
 
 `identifier` and `ref` support aggregate and reference resolution. See [Aggregates](/effect-dynamodb/guides/aggregates/) for details.

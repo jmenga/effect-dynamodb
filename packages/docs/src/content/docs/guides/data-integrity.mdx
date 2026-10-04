@@ -299,7 +299,30 @@ ExpressionAttributeNames: { "#version": "version" }
 ExpressionAttributeValues: { ":expected": { N: "5" } }
 ```
 
-If the condition fails, DynamoDB returns `ConditionalCheckFailedException`, which the entity maps to `OptimisticLockError`.
+If the condition fails, DynamoDB returns `ConditionalCheckFailedException` together with the stored item, and the entity tells the two causes apart by the stored version:
+
+- **A lost version race** is an `OptimisticLockError` carrying the real `actualVersion`.
+- **A failed `.condition()`** is a `ConditionalCheckFailed`.
+- **An update of a missing item** is an `ItemNotFound`.
+
+That holds on every update path, including retain entities. Earlier versions mixed these up in three cases:
+
+- A versioned update with `expectedVersion` and a `.condition()` reported a failed condition as `OptimisticLockError(-1)`.
+- A retain update with a `.condition()` did the same.
+- A retain path update with a `.condition()` reported a lost version race as `ConditionalCheckFailed`.
+
+A versioned update of a missing item with `expectedVersion` also used to give `OptimisticLockError(-1)`.
+
+### Read-then-write updates
+
+Some updates read the item before writing: a unique-field change, a computed change (`.add()`, `.append()`, …) to an index composite, and any update on a retain entity. They write a guarded update of only what changed, so a concurrent change to an unrelated attribute is preserved. If another writer changed something the update read, it fails without writing: with `OptimisticLockError` on a versioned entity, and with `ConcurrentModification` on an unversioned one. Retrying re-reads the item.
+
+Versioned entities carry a hidden `__edd_i__` attribute, a token set when the item is created and added to existing items on their next guarded write. It never appears in decoded models, only in `asNative` output and raw items. Version-checked writes require it to match, so an item deleted and recreated at the same version is never mistaken for the original.
+
+Known limitations:
+
+- On an unversioned entity, the item returned by a unique-field update may show a stale value for an attribute the update neither reads nor writes, if another writer changed it in between. Use `versioned` when you need exact images.
+- A plain `.expectedVersion(n)` can't detect a delete-and-recreate that has climbed back to version `n`. Versions restart at 1, so this takes `n − 1` updates after the recreate.
 
 ## Idempotency
 

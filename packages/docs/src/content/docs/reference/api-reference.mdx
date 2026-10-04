@@ -243,7 +243,7 @@ These are methods on the entity definition returned by `Entity.make()`. They ret
 | `entity.create(input)` | `EntityPut` | Insert only — fails with `ConditionalCheckFailed` if exists (descriptor) |
 | `entity.upsert(input)` | `EntityPut` | Create or update — uses `if_not_exists()` for immutable fields, createdAt, version (descriptor) |
 | `entity.get(key)` | `EntityGet` | Get a single item by primary key (descriptor) |
-| `entity.update(key)` | `EntityUpdate` | Start an update operation (compose with `set`, `add`, etc.) (descriptor) |
+| `entity.update(key)` | `EntityUpdate` | Start an update operation (compose with `set`, `add`, etc.) (descriptor). On a missing item it fails with `ItemNotFound` and writes nothing, unless it is a plain update whose `.set()` supplies every required field and key composite, in which case it creates a complete item |
 | `entity.patch(key)` | `EntityUpdate` | Update with `attribute_exists` — fails with `ConditionalCheckFailed` if not exists (descriptor) |
 | `entity.delete(key)` | `EntityDelete` | Delete an item (descriptor) |
 | `entity.deleteIfExists(key)` | `EntityDelete` | Delete with `attribute_exists` — fails with `ConditionalCheckFailed` if not exists (descriptor) |
@@ -335,7 +335,7 @@ These functions transform entity operations via pipe:
 | `subtract(values)` | `EntityUpdate` | Subtract from numeric attributes (SET `#f = #f - :v`) |
 | `append(values)` | `EntityUpdate` | Append to list attributes (`list_append`) |
 | `deleteFromSet(values)` | `EntityUpdate` | DELETE elements from Set attributes |
-| `returnValues(mode)` | `EntityUpdate`, `EntityDelete` | Control DynamoDB `ReturnValues`: `"none" \| "allOld" \| "allNew" \| "updatedOld" \| "updatedNew"` |
+| `returnValues(mode)` | `EntityUpdate`, `EntityDelete` | Control DynamoDB `ReturnValues`: `"none" \| "allOld" \| "allNew" \| "updatedOld" \| "updatedNew"`. On an update the result type follows the mode (`UpdateReturn<A, M>`): `"none"` → `undefined`, `"updatedOld"` / `"updatedNew"` → a `Partial` of the top-level attributes the update wrote, `"allOld"` / `"allNew"` → the whole item. Honoured on every update path; with repeated calls the last one wins |
 | `cascade(config)` | `EntityUpdate` | Propagate source entity changes to target entities that embed it via `DynamoModel.ref`. Config: `{ targets, filter?, mode? }` (dual API) |
 
 ### Decode Mode Selectors
@@ -1213,6 +1213,7 @@ import {
   ValidationError, TransactionCancelled, TransactionOverflow,
   UniqueConstraintViolation, OptimisticLockError,
   ItemDeleted, ItemNotDeleted,
+  ConcurrentModification, UpdateAppliedButUnreadable,
   CompositeKeyHoleError, CompositeNullableError,
   RefNotFound, AggregateAssemblyError,
   AggregateDecompositionError, AggregateTransactionOverflow,
@@ -1228,16 +1229,18 @@ import {
 | `DynamoValidationError` | `"DynamoValidationError"` | Malformed DynamoDB request |
 | `InternalServerError` | `"InternalServerError"` | Transient DynamoDB failure |
 | `ResourceNotFoundError` | `"ResourceNotFoundError"` | Table or index does not exist |
-| `ItemNotFound` | `"ItemNotFound"` | `getItem` returned no item |
-| `ConditionalCheckFailed` | `"ConditionalCheckFailed"` | Condition expression not met (put, update, delete, create) |
+| `ItemNotFound` | `"ItemNotFound"` | No item under the key: `get`, an `update` of a missing item (unless a plain update supplies a complete item), `restore` with no soft-deleted item or after a concurrent restore won |
+| `ConditionalCheckFailed` | `"ConditionalCheckFailed"` | A `.condition()` was not met (put, update, delete, create), or `patch()` of a missing item. A lost version race is an `OptimisticLockError` instead |
 | `ValidationError` | `"ValidationError"` | Schema decode/encode failed |
 | `TransactionCancelled` | `"TransactionCancelled"` | Transaction rejected (includes cancellation `reasons`) |
 | `TransactionOverflow` | `"TransactionOverflow"` | Transaction exceeds 100-item DynamoDB limit |
 | `AppendTooLarge` | `"AppendTooLarge"` | `EventStore.append` exceeds the 100-item transaction limit (`streamName`, `streamId`, `count`, `limit`) |
 | `UniqueConstraintViolation` | `"UniqueConstraintViolation"` | Unique constraint violated on put/create |
-| `OptimisticLockError` | `"OptimisticLockError"` | Version mismatch on `expectedVersion()` |
+| `OptimisticLockError` | `"OptimisticLockError"` | A versioned write lost a version race: `expectedVersion()` did not match, or another writer changed the item between a read-then-write update's read and its write. `actualVersion` is the stored version (`entityType`, `key`, `expectedVersion`, `actualVersion`) |
+| `ConcurrentModification` | `"ConcurrentModification"` | An unversioned update that reads first (a unique-field change, a computed change to an index composite) found that another writer changed one of the attributes it read before its write landed. Nothing was written; retrying recomputes from the new values (`entityType`, `key`, `attributes`, `current`) |
+| `UpdateAppliedButUnreadable` | `"UpdateAppliedButUnreadable"` | A retain update WAS applied at `version`, but another write replaced the item before it could be read back, and no snapshot proves what this update wrote. Don't retry a non-idempotent update on this error; read the item instead (`entityType`, `key`, `version`, `reason`) |
 | `ItemDeleted` | `"ItemDeleted"` | Item is soft-deleted (get returns this instead of the item) |
-| `ItemNotDeleted` | `"ItemNotDeleted"` | Restore called on an item that isn't soft-deleted |
+| `ItemNotDeleted` | `"ItemNotDeleted"` | `restore` found a live item under the key as well as the soft-deleted one (for example, the item was recreated after it was deleted) |
 | `CompositeKeyHoleError` | `"CompositeKeyHoleError"` | EDD-9024 — **deprecated in v1.7.1**, no longer thrown at runtime. Class export retained for back-compat with consumers who type-imported it for `Effect.catchTag` handlers. Hole patterns now collapse into the unified per-half can't-compose rule (drop under sparse, noop-or-cascade-override under preserve). |
 | `CompositeNullableError` | `"CompositeNullableError"` | EDD-9025 — composite attribute Schema includes `null`. Raised at `Entity.make()` time. Carries `entityType`, `surface` (e.g. `"primaryKey"`, `"index:..."`, `"unique:..."`), `compositeAttribute`, `schemaPath`. |
 | `RefNotFound` | `"RefNotFound"` | Referenced entity not found during ref hydration (`entity`, `field`, `refEntity`, `refId`) |

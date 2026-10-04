@@ -1769,9 +1769,10 @@ bump, timestamps, GSI recomposition, `expectedVersion`, user condition) as the
 `Update` in one `TransactWriteItems` with the snapshot `Put`, conditioned on
 the version read. DynamoDB therefore applies the path semantics itself — parity
 by construction, never emulated — and a rejected expression writes no snapshot.
-Path operations combined with a unique-constraint change are rejected with a
-`ValidationError`, since sentinel rotation is a read-then-put that cannot carry
-path expressions. Record-only retain updates are unchanged.
+Path operations combined with a unique-constraint change, or with a computed
+change to an index composite, are rejected with a `ValidationError`: both are
+read-then-write updates that cannot carry path expressions. Record retain
+updates are guarded read-then-write updates (below).
 
 Each encoded path value is then **validated** against the write schema at its
 path (`validate` / `validateElements`), as `.set()` validates its payload: a
@@ -1781,6 +1782,90 @@ entries are dropped first (`asStored`), since the marshaller drops them too.
 List `append` / `prepend` validate each element, but cannot enforce list-level
 checks such as `maxLength`: DynamoDB builds the list server-side. `ADD`,
 `DELETE` and `SUBTRACT` are unchanged.
+
+**Path operations on key and unique fields (#133).** DynamoDB evaluates a path
+operation, so compiling one on an index composite or unique field would change
+the attribute while its keys and sentinel stayed put. `normalizeDerivedPathOps`
+rewrites the ones whose result is known client-side into record operations: a
+top-level `pathSet` of a value / `pathRemove` into `.set()` / `.remove()`, a
+numeric `pathAdd` / `pathSubtract` into `.add()` / `.subtract()`. Those then go
+through the key composer and the sentinel rotation. It refuses, with a
+`ValidationError` naming the field: copies, `pathIfNotExists`, list and set
+operations on such a field (DynamoDB computes their result at write time); a
+path below such a field; any path operation on a primary-key composite or an
+immutable field; and a second operation on the same field. `.add()` /
+`.subtract()` / `.append()` / `.deleteFromSet()` on a GSI composite recompose
+the index key on every entity.
+
+**Guarded read-then-write (#133).** Updates that read first (a unique-field
+change, a computed change to an index composite, every retain update) write a
+guarded `Update` of only the attributes that changed, conditioned on what they
+read. A concurrent change to an unrelated attribute is preserved. A race on an
+input fails without writing: `OptimisticLockError` (with the real
+`actualVersion`) on a versioned entity, `ConcurrentModification` (naming the
+changed `attributes`, with `current`) on an unversioned one. Soft delete and a
+unique-constraint hard delete are guarded the same way: by version, or for an
+unversioned entity by a condition over every attribute read. If that condition
+exceeds `GUARD_EXPRESSION_BUDGET` (3,500 characters, under DynamoDB's 4 KB
+expression limit), the delete is refused with a `ValidationError` asking for
+`versioned`. `restore` fails with `ItemNotFound` when the tombstone is gone (a
+concurrent restore won) and `ItemNotDeleted` when a live item already exists.
+
+**Error mapping.** Failed conditions ask DynamoDB for `ALL_OLD` and classify by
+the stored item. A newer stored version is `OptimisticLockError` with the real
+`actualVersion`; the same version is the user's `.condition()`, so
+`ConditionalCheckFailed`; no item is `ItemNotFound`. That holds on every update
+path. Before, three paths had it the other way round:
+
+- a plain versioned update with `expectedVersion` + `.condition()` reported a
+  failed condition as `OptimisticLockError(-1)`;
+- a retain record update with `.condition()` did the same;
+- a retain path update with `.condition()` reported a lost version race as
+  `ConditionalCheckFailed`.
+
+A versioned update of a missing item with `expectedVersion` also gave
+`OptimisticLockError(-1)`. `patch()` keeps its contract: a missing item is
+`ConditionalCheckFailed`.
+
+**Incarnation token.** A version alone cannot tell an item from one deleted and
+recreated at the same version. Versioned entities carry `__edd_i__`
+(`INCARNATION_TOKEN`), a random UUID stamped on create (put, create, upsert,
+batch / transaction put) and backfilled on the next guarded write. Every
+version-checked write also checks the token (`incarnationGuard`;
+`attribute_not_exists` for an item that has none yet). It is stripped from
+decoded models and appears only in `asNative` / raw items.
+
+**Return values.** `returnValues` is honoured on every update path: `"none"` →
+`undefined`; `"updatedOld"` / `"updatedNew"` → only the top-level attributes
+the update wrote, decoded as a partial; `"allOld"` / `"allNew"` → the whole
+item. The type follows the mode (`UpdateReturn<A, M>`); repeated
+`Entity.returnValues` calls are typed by the last one (`UpdateBase`). A retain
+update returns exactly the item it wrote even if another writer replaced it
+since. When that cannot be proven from a snapshot it fails with
+`UpdateAppliedButUnreadable` (the write was applied; do not retry). `allOld`
+returns the replaced item; the record retain / unique branch used to return the
+new one. A cascade with `allOld` / `updatedOld` cascades exactly what the update
+wrote, which needs both images; with path operations on an unversioned entity
+that combination is refused.
+
+**Missing items and refusals.** `update()` of a missing item no longer leaves an
+undecodable partial row. A plain (unread) update creates the item only when its
+`.set()` supplies every required field and primary-key composite
+(`completeUpsertPayload`). Anything else fails with `ItemNotFound` and writes
+nothing. `.set()` of a changed primary-key composite is refused (it was silently
+ignored). An immutable field may be restated with its stored value (spread
+records), while a different value is refused.
+
+**Known limitations.**
+
+- On an unversioned entity, the item returned by a unique-field update may show
+  a stale value for an attribute it neither reads nor writes, if another writer
+  changed it in between.
+- An unversioned soft delete cannot detect a sparse map entry added concurrently
+  under a key it never saw.
+- A plain `.expectedVersion(n)` cannot detect a delete-and-recreate that has
+  climbed back to version `n` (versions restart at 1, so this needs `n − 1`
+  updates after the recreate).
 
 **Why hard-break over dual.** Carrying both the variadic overload and the fluent builder would double the surface area of `BoundEntity`, degrade hover tooltips, and force contributors to remember two shapes. The read side settled on builders for the same reasons. The change is batched into the next major alongside other breaking changes.
 
@@ -2765,12 +2850,15 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | Error | Cause |
 |-------|-------|
 | `DynamoError` | AWS SDK error wrapper |
-| `ItemNotFound` | GetItem returned no item |
-| `ConditionalCheckFailed` | ConditionExpression failed |
+| `ItemNotFound` | No item: `get`, `update` of a missing item (unless a complete plain update), `restore` without a tombstone |
+| `ConditionalCheckFailed` | A user `.condition()` failed, or `patch()` of a missing item |
 | `ValidationError` | Schema decode/encode failure |
 | `TransactionCancelled` | Transaction failed with cancellation reasons |
 | `UniqueConstraintViolation` | Sentinel item already exists for unique field |
-| `OptimisticLockError` | Version mismatch on update |
+| `OptimisticLockError` | A versioned write lost a version race (`expectedVersion` mismatch, or a concurrent write between a read-then-write update's read and write); carries the real `actualVersion` |
+| `ConcurrentModification` | An unversioned read-then-write update found an attribute it read changed before its write landed; nothing written (`attributes`, `current`) |
+| `UpdateAppliedButUnreadable` | A retain update was applied at `version` but its result could not be read back provably; do not retry (`version`, `reason`) |
+| `ItemNotDeleted` | `restore` found a live item under the key alongside the tombstone |
 | `RefNotFound` | Referenced entity does not exist during hydration |
 | `AggregateAssemblyError` | Collection query returned unexpected/incomplete data |
 | `AggregateDecompositionError` | Decomposition produced items that fail schema validation |

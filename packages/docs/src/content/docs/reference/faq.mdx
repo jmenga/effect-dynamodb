@@ -482,9 +482,9 @@ yield* users.purge({ userId: "u-1" })
 
 **Symptom:** `ItemNotDeleted` error when calling `entity.restore()`.
 
-**Cause:** The item is not soft-deleted — `restore` can only be called on items that have been soft-deleted.
+**Cause:** A soft-deleted copy exists, but so does a live item under the same key, usually because the item was recreated after it was deleted. `restore` won't overwrite the live item. (`restore` of a key that has no soft-deleted item fails with `ItemNotFound`.)
 
-**Solution:** Check the item's state before restoring. If the item is active, no action is needed.
+**Solution:** Decide which copy to keep. Delete the live item first if the soft-deleted one should come back.
 
 ---
 

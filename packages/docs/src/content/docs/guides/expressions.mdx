@@ -334,7 +334,20 @@ Paths into and under a top-level `DynamoModel.ref` field are encoded through the
 
 A value set by path into a class that has lost its fields is written as given, in the same form `put` stores it, so the item stays readable. A class loses its fields when it is built with `.check()` or `.annotate()`, or when it is a `DynamoModel.ref` nested inside a ref target. Known limitation: plain dates inside such a class are still stored as maps, as on 1.22.0, and read back as plain objects. That applies to whole-value `put`, `.set()` and `pathSet` of the class too.
 
-On entities with `versioned: { retain: true }`, path operations were silently ignored before this release: they returned success and wrote nothing. They are now sent to DynamoDB as the same update expression other entities use, in one transaction with the version snapshot, so they follow DynamoDB's own semantics: list indexes refer to the item before the update, overlapping paths and appends to a missing list are rejected, and a rejected update writes no snapshot. `expectedVersion` and `.condition()` apply. An update cannot combine path operations with a change to a unique-constraint field; split it into two updates.
+On entities with `versioned: { retain: true }`, path operations were silently ignored before this release: they returned success and wrote nothing. They are now sent to DynamoDB as the same update expression other entities use, in one transaction with the version snapshot, so they follow DynamoDB's own semantics: list indexes refer to the item before the update, overlapping paths and appends to a missing list are rejected, and a rejected update writes no snapshot. `expectedVersion` and `.condition()` apply.
+
+#### Path operations on index composites and unique fields
+
+A path operation on a field that feeds an index key or a unique constraint is handled like the matching record operation. A top-level `pathSet` of a value or `pathRemove` works like `.set()` or `.remove()`, and a numeric `pathAdd` or `pathSubtract` works like `.add()` or `.subtract()`. The index keys are recomposed and the unique sentinels rotated, exactly as those operations do. `.add()`, `.subtract()`, `.append()` and `.deleteFromSet()` on an index composite also recompose the index key, on every entity.
+
+These are rejected with a `ValidationError` that names the field:
+
+- operations whose result DynamoDB computes at write time on such a field: a copy from another attribute, `pathIfNotExists`, and list or set operations;
+- a path below such a field;
+- any path operation on a primary-key composite or an immutable field;
+- more than one operation on the same such field.
+
+An update can't combine path operations with a change to a unique-constraint field, or with a computed change (`.add()`, `.append()`, …) to an index composite. Split it into two updates.
 
 Path values are also validated the way `.set()` validates its payload. A value the schema rejects, such as a literal outside its set, a string under its `minLength`, or a container that breaks its `.check()`, fails with a `ValidationError` instead of being stored. A key whose value is `undefined` is dropped before validation, as it is when the item is stored. List `append` and `prepend` validate each element, but can't enforce list-level checks such as `maxLength`, because DynamoDB builds the list server-side.
 
