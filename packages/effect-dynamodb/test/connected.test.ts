@@ -13694,3 +13694,131 @@ describeConnected("#133 — container checks on writes, path values under a ref"
     }).pipe(provideZ133),
   )
 })
+
+// ===========================================================================
+// #133 — path operations on a versioned (retain) entity
+// ===========================================================================
+
+class R133Doc extends Schema.Class<R133Doc>("R133Doc")({
+  id: Schema.String,
+  n: Schema.Number,
+  tags: Schema.Array(Schema.String),
+  days: Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(3)),
+  labels: Schema.ReadonlySet(Schema.String),
+  nested: Schema.Struct({ at: Schema.DateTimeUtc, count: Schema.Number }),
+  opt: Schema.optionalKey(Schema.String),
+  gone: Schema.optionalKey(Schema.String),
+}) {}
+const R133Schema = DynamoSchema.make({ name: "edd133r", version: 1 })
+const R133Docs = Entity.make({
+  model: R133Doc,
+  entityType: "R133Doc",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  versioned: { retain: true },
+})
+const R133Table = Table.make({ schema: R133Schema, entities: { R133Docs } })
+const r133TableName = `edd133r-${Date.now()}`
+const provideR133 = Effect.provide(
+  Layer.mergeAll(ClientLayer, R133Table.layer({ name: r133TableName })),
+)
+const r133Client = DynamoClient.make({ entities: { R133Docs }, tables: { R133Table } })
+
+describeConnected("#133 — path operations on a retain entity", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* r133Client
+        yield* db.tables.R133Table.create()
+      }).pipe(provideR133, Effect.scoped),
+    )
+  }, 30000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: r133TableName })
+      }).pipe(
+        provideR133,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 30000)
+
+  it.effect("applies, validates and snapshots every path operation", () =>
+    Effect.gen(function* () {
+      const db = yield* r133Client
+      const client = yield* DynamoClient
+      const dt = DateTime.makeUnsafe(I133_DOB_MS)
+      const later = DateTime.makeUnsafe(I133_DOB_MS + 1000)
+      yield* db.entities.R133Docs.put({
+        id: "d1",
+        n: 1,
+        tags: ["a", "b"],
+        days: [dt],
+        labels: new Set(["x", "y"]),
+        nested: { at: dt, count: 5 },
+        gone: "bye",
+      } as any)
+      const updated = (yield* db.entities.R133Docs.update({ id: "d1" })
+        .expectedVersion(1)
+        .pathSet({ segments: ["nested", "at"], value: later, isPath: false })
+        .pathSet({ segments: ["opt"], value: "set", isPath: false })
+        .pathAdd({ segments: ["n"], value: 2 })
+        .pathAdd({ segments: ["labels"], value: new Set(["z"]) })
+        .pathSubtract({ segments: ["nested", "count"], value: 1, isPath: false })
+        .pathAppend({ segments: ["days"], value: [later] })
+        .pathPrepend({ segments: ["tags"], value: ["first"] })
+        .pathIfNotExists({ segments: ["n"], value: 99 })
+        .pathDelete({ segments: ["labels"], value: new Set(["x"]) })
+        .pathRemove(["gone"])) as any
+      expect(updated.n).toBe(3)
+      expect([...updated.labels].sort()).toEqual(["y", "z"])
+      expect(updated.tags).toEqual(["first", "a", "b"])
+      expect(updated.nested.count).toBe(4)
+      expect(i133IsRealUtc(updated.nested.at, I133_DOB_MS + 1000)).toBe(true)
+      expect(updated.days).toHaveLength(2)
+      expect(updated.opt).toBe("set")
+      expect(updated.gone).toBeUndefined()
+      expect(updated.version).toBe(2)
+
+      const raw = (sk: string) =>
+        client
+          .getItem({
+            TableName: r133TableName,
+            Key: { pk: { S: "$edd133r#v1#r133doc#id_d1" }, sk: { S: sk } },
+            ConsistentRead: true,
+          })
+          .pipe(Effect.map(({ Item }) => Item as Record<string, any>))
+      const current = yield* raw("$edd133r#v1#r133doc")
+      expect(current.nested).toEqual({
+        M: { at: { S: "2000-01-01T00:00:01.000Z" }, count: { N: "4" } },
+      })
+      const snapshot = yield* raw("$edd133r#v1#r133doc#v#0000001")
+      expect([snapshot.n, snapshot.nested, snapshot.gone]).toEqual([
+        { N: "1" },
+        { M: { at: { S: I133_DOB }, count: { N: "5" } } },
+        { S: "bye" },
+      ])
+
+      const docs = db.entities.R133Docs as any
+      const stale = yield* Effect.flip(
+        docs
+          .update({ id: "d1" })
+          .expectedVersion(1)
+          .pathSet({ segments: ["n"], value: 7, isPath: false })
+          .asEffect() as Effect.Effect<unknown, { readonly _tag: string }>,
+      )
+      expect(stale._tag).toBe("OptimisticLockError")
+      const tooMany = yield* Effect.flip(
+        docs
+          .update({ id: "d1" })
+          .pathSet({ segments: ["days"], value: [dt, dt, dt, dt], isPath: false })
+          .asEffect() as Effect.Effect<unknown, { readonly _tag: string }>,
+      )
+      expect(tooMany._tag).toBe("ValidationError")
+      expect((yield* raw("$edd133r#v1#r133doc")).version).toEqual({ N: "2" })
+    }).pipe(provideR133),
+  )
+})
