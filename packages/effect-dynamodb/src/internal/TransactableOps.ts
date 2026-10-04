@@ -21,6 +21,15 @@ import { toAttributeMap } from "../Marshaller.js"
  */
 export const INCARNATION_TOKEN = "__edd_i__"
 
+/**
+ * @internal Hidden string set naming the unique-constraint fields an item
+ * holds a DEFAULT for (#133): a decoding-default field that is also an index
+ * composite is stored when omitted, but a default never creates a unique
+ * sentinel — so no sentinel is composed, rotated or deleted for a field
+ * listed here until a write supplies a value for it.
+ */
+export const UNSENTINELED_DEFAULTS = "__edd_d__"
+
 const incarnationCrypto = makeDefaultCrypto()
 
 /** @internal A fresh incarnation token. */
@@ -319,6 +328,7 @@ export const validateAndBuildPutItem = (
     // Encode → fall back to decode-then-encode (mirrors Entity.put).
     // Omitted decoding defaults are stored, exactly as `Entity.put` does.
     const filled = yield* entity._fillDecodingDefaults(input)
+    const unsentineled = entity._unsentineledDefaults(input)
     const encoded = yield* Schema.encodeUnknownEffect(inputSchema)(filled).pipe(
       Effect.catch(() =>
         Schema.decodeUnknownEffect(inputSchema)(filled).pipe(
@@ -337,6 +347,7 @@ export const validateAndBuildPutItem = (
 
     const item: Record<string, unknown> = { ...(encoded as Record<string, unknown>) }
     item.__edd_e__ = entity.entityType
+    if (unsentineled.length > 0) item[UNSENTINELED_DEFAULTS] = new Set(unsentineled)
 
     // Same normalisation `Entity.put` applies. Without it a `BigIntFromString`
     // composite composed `txn_420` here and `txn_000…0420` there, so the two

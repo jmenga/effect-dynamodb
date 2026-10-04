@@ -91,6 +91,7 @@ import {
   freshIncarnationToken,
   generateTimestampPrimitive,
   INCARNATION_TOKEN,
+  UNSENTINELED_DEFAULTS,
 } from "./internal/TransactableOps.js"
 import {
   decodeSparseFields,
@@ -297,6 +298,13 @@ const composeUniqueSentinel = (
     }
   | undefined => {
   const fields = resolveUniqueFields(constraintDef)
+  // A field holding only a default has no sentinel (#133).
+  const defaulted = source[UNSENTINELED_DEFAULTS]
+  const defaultedFields =
+    defaulted instanceof Set
+      ? (defaulted as ReadonlySet<unknown>)
+      : new Set(Array.isArray(defaulted) ? defaulted : [])
+  if (fields.some((f) => defaultedFields.has(f))) return undefined
   const serialized: Array<string> = []
   const fieldsRecord: globalThis.Record<string, string> = {}
   for (const f of fields) {
@@ -376,17 +384,57 @@ class MissingForCreate extends Data.TaggedError("MissingForCreate")<{
 /** DynamoDB's limits on one expression: its length, and its operators + functions. */
 const EXPRESSION_LIMIT = 4096
 const OPERATOR_LIMIT = 300
-const OPERATOR_PATTERN =
-  /<>|<=|>=|=|<|>|\bAND\b|\bOR\b|\bNOT\b|\bBETWEEN\b|\bIN\b|\b(?:attribute_exists|attribute_not_exists|attribute_type|begins_with|contains|size)\s*\(/gi
-/** What DynamoDB counts against an expression's limits (placeholders keep names out of it). */
+
+/**
+ * The tokens of a compiled expression. Names and values are placeholders
+ * (`#…`, `:…`), so no operator can hide inside one.
+ */
+const EXPRESSION_TOKEN = /#\w+|:\w+|<>|<=|>=|[=<>()+\-,.[\]]|[A-Za-z_]\w*|\d+/g
+
+/**
+ * The operators DynamoDB counts against an expression's 300 (#133), measured
+ * against DynamoDB: in a condition, each comparison (`=`, `<>`, `<`, `<=`,
+ * `>`, `>=`), `AND` / `OR` / `NOT`, `BETWEEN` (whose own `AND` is part of it,
+ * not another operator), `IN`, and each function; in an update, each `+` /
+ * `-` and each function (`if_not_exists`, `list_append`) — a `SET` clause's
+ * `=` is not an operator.
+ */
+/** @internal */
+export const countOperators = (expression: string, kind: "condition" | "update"): number => {
+  const tokens = expression.match(EXPRESSION_TOKEN) ?? []
+  let count = 0
+  let betweens = 0
+  for (const [i, token] of tokens.entries()) {
+    const word = token.toUpperCase()
+    const isFunction = /^[A-Za-z_]\w*$/.test(token) && tokens[i + 1] === "("
+    if (kind === "update") {
+      if (token === "+" || token === "-" || isFunction) count++
+      continue
+    }
+    if (isFunction) count++
+    else if (["=", "<>", "<", "<=", ">", ">="].includes(token)) count++
+    else if (word === "BETWEEN") {
+      count++
+      betweens++
+    } else if (word === "AND" && betweens > 0) betweens--
+    else if (word === "AND" || word === "OR" || word === "NOT" || word === "IN") count++
+  }
+  return count
+}
+
+/** What DynamoDB counts against an expression's limits. */
 const expressionCost = (
   expression: string | undefined,
+  kind: "condition" | "update" = "condition",
 ): { readonly length: number; readonly operators: number } =>
   expression === undefined
     ? { length: 0, operators: 0 }
-    : { length: expression.length, operators: (expression.match(OPERATOR_PATTERN) ?? []).length }
-const expressionFits = (expression: string): boolean => {
-  const cost = expressionCost(expression)
+    : { length: expression.length, operators: countOperators(expression, kind) }
+const expressionFits = (
+  expression: string,
+  kind: "condition" | "update" = "condition",
+): boolean => {
+  const cost = expressionCost(expression, kind)
   return cost.length <= EXPRESSION_LIMIT && cost.operators <= OPERATOR_LIMIT
 }
 
@@ -607,8 +655,17 @@ export interface Entity<
    */
   readonly _incarnationToken: boolean
 
+  /** @internal An item with an incarnation token but no version (see `versionCorruption`). */
+  readonly _versionCorruption: (
+    item: Readonly<globalThis.Record<string, unknown>> | undefined,
+    operation: string,
+  ) => ValidationError | undefined
+
   /** @internal Fill omitted decoding-default fields of a put's input (see `put`). */
   readonly _fillDecodingDefaults: (input: unknown) => Effect.Effect<unknown, ValidationError>
+
+  /** @internal Unique fields a put's input leaves to an index-stored default. */
+  readonly _unsentineledDefaults: (input: unknown) => ReadonlyArray<string>
 
   /**
    * @internal The extra items a `put` of `item` must write alongside the item
@@ -2429,25 +2486,45 @@ const makeImpl = <
   })
 
   /**
-   * Fill each omitted decoding-default field that a KEY derives from — a
-   * primary-key, index or unique-constraint composite — with its default
-   * (#133), so the item stores it, its keys and sentinels compose from it, and
-   * the item, its keys and its decoded read all agree. Left out, the item had
-   * no index keys while its decoded record named a value the index is keyed
-   * by. Other defaulted fields keep their contract: not stored, defaulted on
-   * read.
+   * Fill each omitted decoding-default field that an INDEX key derives from —
+   * a primary-key, GSI or LSI composite — with its default (#133), so the item
+   * stores it, its keys compose from it, and the item, its keys and its decoded
+   * read all agree. Left out, the item had no index keys while its decoded
+   * record named a value the index is keyed by. A default never creates a
+   * unique sentinel (`unsentineledDefaults`); other defaulted fields keep
+   * their contract: not stored, defaulted on read.
    */
+  /** The defaulted fields an index key derives from — materialised when omitted. */
+  const indexedDefaultFields = (): ReadonlySet<string> => {
+    const composites = new Set(
+      Object.values(allIndexes).flatMap((def) => [...def.pk.composite, ...def.sk.composite]),
+    )
+    return new Set(defaultedFields.map(([name]) => name).filter((name) => composites.has(name)))
+  }
+  /**
+   * The unique-constraint fields a write's input omits but stores a default
+   * for (an index composite): the item lists them in `__edd_d__`, and no
+   * sentinel is composed from them — a default never creates a sentinel.
+   */
+  const unsentineledDefaults = (input: unknown): ReadonlyArray<string> => {
+    if (config.unique == null || typeof input !== "object" || input === null) return []
+    const record = input as globalThis.Record<string, unknown>
+    const unique = new Set(
+      Object.values(config.unique as globalThis.Record<string, UniqueConstraintDef>).flatMap(
+        (def) => [...resolveUniqueFields(def)],
+      ),
+    )
+    return [...indexedDefaultFields()].filter(
+      (name) => unique.has(name) && record[name] === undefined,
+    )
+  }
+
   const fillDecodingDefaults = (input: unknown): Effect.Effect<unknown, ValidationError> => {
     if (defaultedFields.length === 0 || typeof input !== "object" || input === null) {
       return Effect.succeed(input)
     }
     const record = input as globalThis.Record<string, unknown>
-    const keyed = new Set<string>([
-      ...Object.values(allIndexes).flatMap((def) => [...def.pk.composite, ...def.sk.composite]),
-      ...Object.values(
-        (config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>,
-      ).flatMap((def) => [...resolveUniqueFields(def)]),
-    ])
+    const keyed = indexedDefaultFields()
     const missing = defaultedFields.filter(
       ([name]) => keyed.has(name) && record[name] === undefined,
     )
@@ -2466,7 +2543,43 @@ const makeImpl = <
   const attachPrototype = (decoded: any) =>
     isSchemaClass ? Object.assign(Object.create((rawModel as any).prototype), decoded) : decoded
 
+  /**
+   * An item of a versioned entity with an incarnation token but no version
+   * (#133). A versioned entity stamps the token when it creates an item, so
+   * only an item written before the entity was `versioned` may lack a version
+   * — and it lacks the token too. Token without version: the version was
+   * removed outside the library. Reading it as version 0 would let the next
+   * update rewrite the item's history, so every read and write refuses it.
+   */
+  const versionCorruption = (
+    item: Readonly<globalThis.Record<string, unknown>> | undefined,
+    operation: string,
+  ): ValidationError | undefined =>
+    systemFields.version &&
+    item !== undefined &&
+    item[systemFields.version] === undefined &&
+    item[INCARNATION_TOKEN] !== undefined
+      ? new ValidationError({
+          entityType,
+          operation,
+          cause:
+            `The ${entityType} item has an incarnation token (${INCARNATION_TOKEN}) but no ` +
+            `"${systemFields.version}" attribute: its version was removed outside the library. ` +
+            "It is refused rather than read as version 0, which would let an update overwrite " +
+            "its version history. Restore the version attribute.",
+        })
+      : undefined
+  const checkVersion = (
+    item: Readonly<globalThis.Record<string, unknown>> | undefined,
+    operation: string,
+  ): Effect.Effect<void, ValidationError> => {
+    const corruption = versionCorruption(item, operation)
+    return corruption === undefined ? Effect.void : Effect.fail(corruption)
+  }
+
   const decodeRecord = (raw: globalThis.Record<string, unknown>) => {
+    const corruption = versionCorruption(raw, "decode")
+    if (corruption !== undefined) return Effect.fail(corruption)
     deserializeSparseFields(raw)
     renameFromDynamo(raw)
     return Schema.decodeUnknownEffect(schemas.recordSchema as Schema.Codec<any>)(raw).pipe(
@@ -2488,6 +2601,8 @@ const makeImpl = <
     marshalled: globalThis.Record<string, AttributeValue>,
     mode: DecodeMode,
   ) => {
+    const corruption = versionCorruption(raw, "decode")
+    if (corruption !== undefined) return Effect.fail(corruption)
     if (mode === "native") return Effect.succeed(marshalled)
     // Collect flattened sparse-map attributes back into the domain Record.
     // Must happen before rename so the rebuilt Record sits at the domain field
@@ -3013,6 +3128,55 @@ const makeImpl = <
   }
 
   /**
+   * A version-snapshot Put that never overwrites history (#133). The
+   * `v#<version>` row may already exist only as a snapshot of the SAME state —
+   * a retain `put` writes `v#0000001` and the first update snapshots that same
+   * version 1 state again; a restore re-writes the delete-time snapshot — so
+   * the row is replaced only when it holds the same version, the same
+   * incarnation and (with timestamps) the same `updatedAt`. Any other row is a
+   * different history, and the write is refused.
+   */
+  const snapshotPut = (tableName: string, snapshotItem: globalThis.Record<string, unknown>) => {
+    const names: globalThis.Record<string, string> = { "#snap": config.indexes.primary.pk.field }
+    const values: globalThis.Record<string, AttributeValue> = {}
+    const same: Array<string> = []
+    if (systemFields.version) {
+      const version = snapshotItem[systemFields.version]
+      same.push(
+        versionIs(typeof version === "number" ? version : 0, names, values, "#snapVer", ":snapVer"),
+      )
+    }
+    const sameAs = (attr: string, tag: string) => {
+      names[`#${tag}`] = attr
+      const value = snapshotItem[attr]
+      if (value === undefined) {
+        same.push(`attribute_not_exists(#${tag})`)
+      } else {
+        values[`:${tag}`] = toAttributeValue(value)
+        same.push(`#${tag} = :${tag}`)
+      }
+    }
+    sameAs(INCARNATION_TOKEN, "snapInc")
+    if (systemFields.updatedAt) sameAs(systemFields.updatedAt, "snapUpd")
+    return {
+      TableName: tableName,
+      Item: toAttributeMap(snapshotItem),
+      ConditionExpression: `attribute_not_exists(#snap) OR (${same.join(" AND ")})`,
+      ExpressionAttributeNames: names,
+      ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
+    }
+  }
+  /** A version snapshot Put refused: that version's history row already exists. */
+  const historyConflict = (version: number, operation: string): ValidationError =>
+    new ValidationError({
+      entityType,
+      operation,
+      cause:
+        `The ${entityType} version ${version} snapshot already exists: the item's version is ` +
+        "inconsistent with its history, and history is never overwritten. Nothing was written.",
+    })
+
+  /**
    * The condition that the stored version is `version` — for version 0 (an
    * item written before the entity was `versioned`), that it has none (#133).
    */
@@ -3356,6 +3520,8 @@ const makeImpl = <
     attributes: ReadonlySet<string>,
     mode: DecodeMode,
   ) => {
+    const corruption = versionCorruption(image, "decode")
+    if (corruption !== undefined) return Effect.fail(corruption)
     const projected: globalThis.Record<string, AttributeValue> = {}
     for (const [attr, value] of Object.entries(image ?? {})) {
       if (attributes.has(attr)) projected[attr] = value
@@ -3902,7 +4068,9 @@ const makeImpl = <
           // so this keeps the bound `put` at `R = never`. The filled id then
           // flows through input validation → key composition → stored item →
           // returned record in this same pass.
-          const inputWithGeneratedId = yield* fillDecodingDefaults(yield* fillGeneratedId(input))
+          const withGeneratedId = yield* fillGeneratedId(input)
+          const unsentineled = unsentineledDefaults(withGeneratedId)
+          const inputWithGeneratedId = yield* fillDecodingDefaults(withGeneratedId)
 
           // Encode user input → wire form. Users typically construct domain
           // values for transforms (DateTime, Redacted, Number) and plain
@@ -3960,6 +4128,8 @@ const makeImpl = <
 
           // Add entity type discriminator
           item.__edd_e__ = entityType
+          // Unique fields holding only a default: no sentinel for them (#133).
+          if (unsentineled.length > 0) item[UNSENTINELED_DEFAULTS] = new Set(unsentineled)
 
           // Apply composed keys
           Object.assign(item, keys)
@@ -4038,7 +4208,11 @@ const makeImpl = <
                   entityType,
                   constraintName,
                   constraintDef,
-                  encoded as globalThis.Record<string, unknown>,
+                  // Domain-keyed, plus the unique fields holding only a default.
+                  {
+                    ...(encoded as globalThis.Record<string, unknown>),
+                    [UNSENTINELED_DEFAULTS]: item[UNSENTINELED_DEFAULTS],
+                  },
                 )
                 if (!sentinel) continue
                 sentinelConstraints.push(constraintName)
@@ -4543,6 +4717,23 @@ const makeImpl = <
           }
         }
 
+        // A unique field that held only a default gets its sentinel once a
+        // write supplies (or removes) its value (#133).
+        const defaultedMarker = newItem[UNSENTINELED_DEFAULTS]
+        if (defaultedMarker instanceof Set) {
+          const supplied = new Set<string>([
+            ...Object.keys(hydratedUpdates as globalThis.Record<string, unknown>),
+            ...(uState.remove ?? []),
+            ...Object.keys(uState.add ?? {}),
+            ...Object.keys(uState.subtract ?? {}),
+          ])
+          const still = [...(defaultedMarker as ReadonlySet<string>)].filter(
+            (f) => !supplied.has(f),
+          )
+          if (still.length === 0) delete newItem[UNSENTINELED_DEFAULTS]
+          else newItem[UNSENTINELED_DEFAULTS] = new Set(still)
+        }
+
         // Increment version and update timestamp. If the caller supplied a
         // value for `updatedAt` (allowed when the field collides with a
         // model-declared field), respect it (already wire-form via encode);
@@ -4703,6 +4894,7 @@ const makeImpl = <
         }
 
         const currentItem = currentResult.Item
+        yield* checkVersion(currentItem, "update")
         const immutableChange = immutableMismatch(immutables, currentItem)
         if (immutableChange !== undefined) {
           return yield* new ValidationError({
@@ -4853,7 +5045,7 @@ const makeImpl = <
         // item instead, as before #133: under the version condition when
         // versioned (exact), otherwise under the strongest guard that fits —
         // the same fallback a wide soft delete uses.
-        const wide = !expressionFits(updateExpression)
+        const wide = !expressionFits(updateExpression, "update")
         const wideGuardOrRefusal =
           wide && !systemFields.version
             ? deleteGuard(currentItem, "item", condParts.slice(1).join(" AND "))
@@ -5010,12 +5202,7 @@ const makeImpl = <
 
           // Snapshot of pre-update state (only when retain is enabled)
           if (snapshotItem) {
-            transactItems.push({
-              Put: {
-                TableName: tableName,
-                Item: toAttributeMap(snapshotItem),
-              },
-            })
+            transactItems.push({ Put: snapshotPut(tableName, snapshotItem) })
           }
 
           // Apply sentinel rotations computed earlier. Delete and Put are emitted
@@ -5073,6 +5260,7 @@ const makeImpl = <
                   | ConditionalCheckFailed
                   | ConcurrentModification
                   | ItemNotFound
+                  | ValidationError
                   | UniqueConstraintViolation => {
                   if (isAwsTransactionCancelled(err.cause)) {
                     const reasons = err.cause.CancellationReasons
@@ -5081,6 +5269,9 @@ const makeImpl = <
                       // the main write was cancelled reports nothing useful.
                       if (reasons[0]?.Code === "ConditionalCheckFailed") {
                         return recordRejected(reasons[0].Item)
+                      }
+                      if (snapshotItem && reasons[1]?.Code === "ConditionalCheckFailed") {
+                        return historyConflict(currentVersion, "update")
                       }
                       for (const { index, constraintName, newFieldsRecord } of sentinelPutIndices) {
                         if (reasons[index]?.Code === "ConditionalCheckFailed") {
@@ -5162,6 +5353,7 @@ const makeImpl = <
         if (!current.Item) {
           return yield* new ItemNotFound({ entityType, key: encodedKey })
         }
+        yield* checkVersion(current.Item, "update")
         const immutableChange = immutableMismatch(immutables, current.Item)
         if (immutableChange !== undefined) {
           return yield* new ValidationError({
@@ -5711,6 +5903,13 @@ const makeImpl = <
       if (evExpected !== undefined && systemFields.version) {
         condParts.push(versionIs(evExpected, names, values, "#condVer", ":expectedVer"))
       }
+      if (plainWrite && systemFields.version) {
+        // Never version an item whose version was removed outside the library
+        // (incarnation token, no version) as if it predated versioning.
+        names["#intVer"] = systemFields.version
+        names["#intInc"] = INCARNATION_TOKEN
+        condParts.push("(attribute_exists(#intVer) OR attribute_not_exists(#intInc))")
+      }
       if (userCond) {
         const uc = compileCondition(userCond, resolveDbName)!
         condParts.push(`(${uc.expression})`)
@@ -5797,12 +5996,18 @@ const makeImpl = <
               }),
             },
           },
-          { Put: { TableName: tableName, Item: toAttributeMap(snapshot.item) } },
+          { Put: snapshotPut(tableName, snapshot.item) },
         ]
         yield* checkTransactionLimit(entityType, "update", transactItems)
         yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
           Effect.mapError(
-            (err): DynamoClientError | OptimisticLockError | ConditionalCheckFailed => {
+            (
+              err,
+            ):
+              | DynamoClientError
+              | OptimisticLockError
+              | ConditionalCheckFailed
+              | ValidationError => {
               // The update is guarded by the snapshot version AND any user
               // condition; the stored item (ALL_OLD) says which rejected it.
               const rejection = (
@@ -5819,6 +6024,9 @@ const makeImpl = <
               if (isAwsTransactionCancelled(err.cause)) {
                 const main = err.cause.CancellationReasons?.[0]
                 if (main?.Code === "ConditionalCheckFailed") return rejection(main.Item)
+                if (err.cause.CancellationReasons?.[1]?.Code === "ConditionalCheckFailed") {
+                  return historyConflict(snapshot.version, "update")
+                }
               }
               if (isAwsConditionalCheckFailed(err.cause)) return rejection(err.cause.Item)
               return err
@@ -5898,6 +6106,8 @@ const makeImpl = <
                     ? new MissingForCreate({ input: uState.updates })
                     : new ItemNotFound({ entityType, key: encodedKey })
                 }
+                const corrupt = versionCorruption(stored, "update")
+                if (corrupt !== undefined) return corrupt
                 const immutableChange =
                   stored !== undefined ? immutableMismatch(immutables, stored) : undefined
                 if (immutableChange !== undefined) {
@@ -6073,6 +6283,7 @@ const makeImpl = <
             write: Effect.Effect<A, DynamoClientError>,
             read: globalThis.Record<string, AttributeValue>,
             inputs: ReadonlyArray<string>,
+            snapshotAt?: { readonly index: number; readonly version: number },
           ) => {
             let rejected: globalThis.Record<string, AttributeValue> | undefined
             const reject = (stored: Readonly<globalThis.Record<string, unknown>> | undefined) => {
@@ -6091,6 +6302,13 @@ const makeImpl = <
                   if (isAwsTransactionCancelled(err.cause)) {
                     const main = err.cause.CancellationReasons?.[0]
                     if (main?.Code === "ConditionalCheckFailed") return reject(main.Item)
+                    if (
+                      snapshotAt !== undefined &&
+                      err.cause.CancellationReasons?.[snapshotAt.index]?.Code ===
+                        "ConditionalCheckFailed"
+                    ) {
+                      return historyConflict(snapshotAt.version, "delete")
+                    }
                   }
                   if (isAwsConditionalCheckFailed(err.cause)) return reject(err.cause.Item)
                   return err
@@ -6115,6 +6333,7 @@ const makeImpl = <
             // The tombstone (and snapshot) copy the item read: the delete is
             // conditioned on it being unchanged, so no concurrent update is lost
             // into them (#133).
+            yield* checkVersion(result.Item, "delete")
             const softGuard = deleteGuard(result.Item, "item", userCondition?.expression)
             if (softGuard instanceof ValidationError) return yield* softGuard
 
@@ -6189,7 +6408,8 @@ const makeImpl = <
               },
             })
 
-            // Version snapshot if retain is enabled
+            // Version snapshot if retain is enabled — never over existing history.
+            let snapshotAt: { readonly index: number; readonly version: number } | undefined
             if (isRetainEnabled()) {
               const currentVersion = systemFields.version
                 ? ((raw[systemFields.version] as number | undefined) ?? 0)
@@ -6202,12 +6422,8 @@ const makeImpl = <
                 ttlAttrName,
                 dtNow,
               )
-              transactItems.push({
-                Put: {
-                  TableName: tableName,
-                  Item: toAttributeMap(snapshotItem),
-                },
-              })
+              snapshotAt = { index: transactItems.length, version: currentVersion }
+              transactItems.push({ Put: snapshotPut(tableName, snapshotItem) })
             }
 
             // Delete sentinels if not preserving unique. Sparse — fields that were
@@ -6243,6 +6459,7 @@ const makeImpl = <
               client.transactWriteItems({ TransactItems: transactItems }),
               result.Item,
               softGuard.inputs,
+              snapshotAt,
             )
           } else if (hasUniqueConstraints) {
             // --- Hard delete with unique constraints ---
@@ -6258,6 +6475,7 @@ const makeImpl = <
             }
             // The sentinel deletes are keyed by the unique values read: the
             // delete is conditioned on them, so no sentinel is orphaned (#133).
+            yield* checkVersion(result.Item, "delete")
             const uniqueGuard = deleteGuard(
               result.Item,
               [
@@ -7326,6 +7544,7 @@ const makeImpl = <
           }
 
           const raw = fromAttributeMap(result.Items[0]!)
+          yield* checkVersion(raw, "deleted.get.decode")
           // Soft-deleted items have GSI keys stripped — always use deletedRecordSchema
           // (itemSchema would fail because it expects GSI key fields that aren't present)
           if (mode === "native") return result.Items[0]!
@@ -7363,6 +7582,8 @@ const makeImpl = <
     const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
 
     const decodeDeleted = (raw: globalThis.Record<string, unknown>) => {
+      const corruption = versionCorruption(raw, "deleted.list.decode")
+      if (corruption !== undefined) return Effect.fail(corruption)
       // Sparse fields are domain data and are preserved across soft-delete.
       // Rebuild Records from flattened attrs before schema decode.
       deserializeSparseFields(raw)
@@ -7436,6 +7657,7 @@ const makeImpl = <
             return yield* new ItemNotFound({ entityType, key: encodedKey })
           }
 
+          yield* checkVersion(queryResult.Items[0], "restore")
           const deletedRaw = fromAttributeMap(queryResult.Items[0]!)
           const deletedMarshalledKey = toAttributeMap({
             [primary.pk.field]: (deletedRaw as globalThis.Record<string, unknown>)[
@@ -7558,11 +7780,10 @@ const makeImpl = <
               ttlAttrName,
               now,
             )
+            // Replaces only the delete-time snapshot of this same state —
+            // never another version's history.
             transactItems.push({
-              Put: {
-                TableName: tableName,
-                Item: toAttributeMap(snapshotItem),
-              },
+              Put: snapshotPut(tableName, snapshotItem),
             })
           }
 
@@ -7617,7 +7838,8 @@ const makeImpl = <
                   | DynamoClientError
                   | UniqueConstraintViolation
                   | ItemNotFound
-                  | ItemNotDeleted => {
+                  | ItemNotDeleted
+                  | ValidationError => {
                   if (isAwsTransactionCancelled(err.cause)) {
                     const reasons = err.cause.CancellationReasons
                     // The tombstone is gone (restored concurrently), or a live
@@ -7627,6 +7849,9 @@ const makeImpl = <
                     }
                     if (reasons?.[1]?.Code === "ConditionalCheckFailed") {
                       return new ItemNotDeleted({ entityType, key: encodedKey })
+                    }
+                    if (isRetainEnabled() && reasons?.[2]?.Code === "ConditionalCheckFailed") {
+                      return historyConflict(currentVersion, "restore")
                     }
                     if (reasons && config.unique) {
                       // Sentinel Puts come after Delete + Put + optional snapshot, in the
@@ -7906,7 +8131,9 @@ const makeImpl = <
     _keyForm: keyForm,
     _renameToDynamo: renameToDynamo,
     _incarnationToken: stampsIncarnation,
+    _versionCorruption: versionCorruption,
     _fillDecodingDefaults: fillDecodingDefaults,
+    _unsentineledDefaults: unsentineledDefaults,
     _buildPutSideItems: buildPutSideItems,
     _multiItemWriteFeatures: multiItemWriteFeatures(),
     _attachPrototype: attachPrototype,
@@ -8635,6 +8862,11 @@ export const compositeAttributes = (entity: EntityLike): ReadonlyArray<string> =
 interface EntityWithSchemas {
   readonly schemas: DerivedSchemas
   readonly _attachPrototype?: (decoded: any) => any
+  /** See `versionCorruption` (#133): an item with a token but no version. */
+  readonly _versionCorruption?: (
+    item: Readonly<globalThis.Record<string, unknown>>,
+    operation: string,
+  ) => ValidationError | undefined
 }
 
 /**
@@ -8659,8 +8891,12 @@ export const itemSchema = (entity: EntityWithSchemas): Schema.Codec<any> =>
 export const decodeMarshalledItem = (
   entity: EntityWithSchemas & { readonly entityType: string },
   marshalledItem: globalThis.Record<string, AttributeValue>,
-): Effect.Effect<unknown, ValidationError> =>
-  Schema.decodeUnknownEffect(entity.schemas.itemSchema)(fromAttributeMap(marshalledItem)).pipe(
+): Effect.Effect<unknown, ValidationError> => {
+  const corruption = entity._versionCorruption?.(marshalledItem, "decodeMarshalledItem")
+  if (corruption !== undefined) return Effect.fail(corruption)
+  return Schema.decodeUnknownEffect(entity.schemas.itemSchema)(
+    fromAttributeMap(marshalledItem),
+  ).pipe(
     Effect.map((decoded) => (entity._attachPrototype ? entity._attachPrototype(decoded) : decoded)),
     Effect.mapError(
       (cause) =>
@@ -8671,3 +8907,4 @@ export const decodeMarshalledItem = (
         }),
     ),
   )
+}

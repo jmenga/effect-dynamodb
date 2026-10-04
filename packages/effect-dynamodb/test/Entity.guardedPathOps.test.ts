@@ -1157,3 +1157,30 @@ describe("#133 an item written before the entity was versioned", () => {
     }).pipe(Effect.provide(TestLayer), closed),
   )
 })
+
+// ---------------------------------------------------------------------------
+// Operator counting, as DynamoDB counts (measured against DynamoDB Local)
+// ---------------------------------------------------------------------------
+
+describe("#133 countOperators", () => {
+  it("conditions: comparisons, logic, BETWEEN (its AND included), IN, functions", () => {
+    expect(Entity.countOperators("#a = :v", "condition")).toBe(1)
+    expect(Entity.countOperators("#a = :v AND #b <> :w", "condition")).toBe(3)
+    expect(Entity.countOperators("#a BETWEEN :v AND :w", "condition")).toBe(1)
+    expect(Entity.countOperators("(#a BETWEEN :v AND :w) AND #b = :x", "condition")).toBe(3)
+    expect(Entity.countOperators("#a IN (:v, :w, :x)", "condition")).toBe(1)
+    expect(Entity.countOperators("attribute_exists(#a)", "condition")).toBe(1)
+    expect(Entity.countOperators("size(#l) < :w", "condition")).toBe(2)
+    expect(Entity.countOperators("NOT #a = :w", "condition")).toBe(2)
+    expect(Entity.countOperators("#a.#b[3] >= :v OR begins_with(#c, :p)", "condition")).toBe(3)
+  })
+
+  it("updates: + / - and functions; a SET clause's = is not an operator", () => {
+    expect(Entity.countOperators("SET #a = :v, #b = :w", "update")).toBe(0)
+    expect(Entity.countOperators("SET #a = #a + :v, #b = #b - :w", "update")).toBe(2)
+    expect(Entity.countOperators("SET #v = if_not_exists(#v, :z) + :one", "update")).toBe(2)
+    expect(
+      Entity.countOperators("SET #l = list_append(#l, :v) REMOVE #x ADD #n :one", "update"),
+    ).toBe(1)
+  })
+})

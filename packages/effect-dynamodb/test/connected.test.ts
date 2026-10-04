@@ -14160,6 +14160,14 @@ class G133Wide extends Schema.Class<G133Wide>("G133Wide")({
   email: Schema.optional(Schema.String),
   totals: Schema.Record(Schema.String, Schema.Number),
 }) {}
+class G133Coded extends Schema.Class<G133Coded>("G133Coded")({
+  id: Schema.String,
+  name: Schema.String,
+  // A unique field that is also an index composite, with a default.
+  code: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed("none"))),
+  // A unique field with a default that no index uses.
+  handle: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed("anon"))),
+}) {}
 class G133Sparse extends Schema.Class<G133Sparse>("G133Sparse")({
   id: Schema.String,
   name: Schema.String,
@@ -14245,6 +14253,20 @@ const g133Entities = {
     versioned: { retain: true },
   }),
   Authors: G133Authors,
+  Coded: Entity.make({
+    model: G133Coded,
+    entityType: "G133Coded",
+    primaryKey: g133IdKey as any,
+    indexes: {
+      byCode: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["code"] },
+        sk: { field: "gsi1sk", composite: [] },
+      },
+    },
+    unique: { code: ["code"], handle: ["handle"] },
+    timestamps: true,
+  }),
   SoftVersioned: Entity.make({
     model: G133Account,
     entityType: "G133SoftVersioned",
@@ -15203,6 +15225,20 @@ describeConnected("#133 — path operations on index composites and unique field
       return false
     }).pipe(Effect.provide(ClientLayer), Effect.scoped)
 
+  const sentinelExistsFor = (entityType: string, constraint: string, value: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { Item } = yield* client.getItem({
+        TableName: g133Tables.record,
+        Key: {
+          pk: { S: `$edd133g#v1#${entityType.toLowerCase()}.${constraint}#${value}` },
+          sk: { S: `$edd133g#v1#${entityType.toLowerCase()}.${constraint}` },
+        },
+        ConsistentRead: true,
+      })
+      return Item !== undefined
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+
   it.effect("a versioned soft delete loses no concurrent update into its tombstone", () =>
     Effect.gen(function* () {
       const db = yield* g133Client
@@ -15847,6 +15883,218 @@ describeConnected("#133 — path operations on index composites and unique field
         or(...Array.from({ length: 60 }, (_, i) => eq(t.email, i === 0 ? "wcond@x.io" : `x${i}`)))
       yield* wide.delete({ id: "wcond" }).condition(sized)
       expect(yield* rawItem("G133WideBare", "wcond")).toBeUndefined()
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- a removed version is corruption, never "pre-versioning" ----
+
+  const removeAttr = (entityType: string, id: string, attr: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      yield* client.updateItem({
+        TableName: g133Tables.record,
+        Key: mainKey(entityType, id),
+        UpdateExpression: "REMOVE #a",
+        ExpressionAttributeNames: { "#a": attr },
+      })
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+  const snapshotLabel = (entityType: string, id: string, version: number) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { Item } = yield* client.getItem({
+        TableName: g133Tables.record,
+        Key: {
+          pk: mainKey(entityType, id).pk,
+          sk: {
+            S: `$edd133g#v1#${entityType.toLowerCase()}#v#${String(version).padStart(7, "0")}`,
+          },
+        },
+        ConsistentRead: true,
+      })
+      return Item?.label
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+
+  it.effect("an item whose version was removed outside the library is refused everywhere", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const docs = db.entities.DevicesRetained as any
+      // The reviewer's repro: v1 → v2 → v3, then the version is removed.
+      yield* docs.put({ id: "corrupt", owner: "o", label: "v1" })
+      yield* docs.update({ id: "corrupt" }).set({ label: "v2" })
+      yield* docs.update({ id: "corrupt" }).set({ label: "v3" })
+      yield* removeAttr("G133DeviceRetained", "corrupt", "version")
+      const refused = (effect: Effect.Effect<unknown, any>) =>
+        Effect.gen(function* () {
+          const error = yield* effect.pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          expect(String(error.cause)).toContain("incarnation token")
+        })
+      yield* refused(docs.get({ id: "corrupt" }).asEffect())
+      yield* refused(docs.update({ id: "corrupt" }).set({ label: "x1" }).asEffect())
+      yield* refused(
+        docs
+          .update({ id: "corrupt" })
+          .pathSet({ segments: ["label"], value: "x1", isPath: false })
+          .asEffect(),
+      )
+      yield* refused(docs.scan().collect())
+      // History untouched: no v#0000000, v#0000001 still "v1".
+      expect(yield* snapshotLabel("G133DeviceRetained", "corrupt", 1)).toEqual({ S: "v1" })
+      expect(yield* snapshotLabel("G133DeviceRetained", "corrupt", 0)).toBeUndefined()
+
+      // A plain (unread) update refuses it too, through its condition.
+      const plain = db.entities.DevicesPlain as any
+      yield* plain.put({ id: "corrupt2", owner: "o", label: "l" })
+      yield* removeAttr("G133DevicePlain", "corrupt2", "version")
+      yield* refused(plain.update({ id: "corrupt2" }).set({ label: "m" }).asEffect())
+      expect((yield* rawItem("G133DevicePlain", "corrupt2")).version).toBeUndefined()
+      // …and so do soft delete and restore.
+      const soft = db.entities.SoftDevices as any
+      yield* soft.put({ id: "corrupt3", owner: "o", label: "l" })
+      yield* removeAttr("G133SoftDevice", "corrupt3", "version")
+      yield* refused(soft.delete({ id: "corrupt3" }).asEffect())
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a version snapshot is never overwritten", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const docs = db.entities.DevicesRetained as any
+      // Distinct clock readings: each version's updatedAt differs.
+      yield* docs.put({ id: "hist", owner: "o", label: "v1" })
+      yield* TestClock.adjust("1 second")
+      yield* docs.update({ id: "hist" }).set({ label: "v2" })
+      yield* TestClock.adjust("1 second")
+      yield* docs.update({ id: "hist" }).set({ label: "v3" })
+      // An outside write rewinds the version: the next snapshot would be v#0000001.
+      yield* rawSetAttrs("G133DeviceRetained", "hist", { version: { N: "1" } }).pipe(Effect.orDie)
+      for (const build of [
+        (u: any) => u.set({ label: "x" }),
+        (u: any) => u.pathSet({ segments: ["label"], value: "x", isPath: false }),
+      ]) {
+        const error = yield* build(docs.update({ id: "hist" }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String(error.cause)).toContain("version 1 snapshot already exists")
+      }
+      expect(yield* snapshotLabel("G133DeviceRetained", "hist", 1)).toEqual({ S: "v1" })
+      expect((yield* rawItem("G133DeviceRetained", "hist")).label).toEqual({ S: "v3" })
+
+      const soft = db.entities.SoftDevices as any
+      yield* soft.put({ id: "hist2", owner: "o", label: "v1" })
+      yield* TestClock.adjust("1 second")
+      yield* soft.update({ id: "hist2" }).set({ label: "v2" })
+      yield* rawSetAttrs("G133SoftDevice", "hist2", { version: { N: "1" } }).pipe(Effect.orDie)
+      const del = yield* soft.delete({ id: "hist2" }).asEffect().pipe(Effect.flip)
+      expect(del._tag).toBe("ValidationError")
+      expect(yield* rawItem("G133SoftDevice", "hist2")).toBeDefined()
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("an item written by a versioned entity before #133 (version, no token) works", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const client = yield* DynamoClient
+      yield* client.putItem({
+        TableName: g133Tables.record,
+        Item: {
+          ...mainKey("G133DeviceRetained", "pre133"),
+          __edd_e__: { S: "G133DeviceRetained" },
+          id: { S: "pre133" },
+          owner: { S: "o" },
+          label: { S: "l" },
+          version: { N: "4" },
+          createdAt: { S: "1970-01-01T00:00:00.000Z" },
+          updatedAt: { S: "1970-01-01T00:00:00.000Z" },
+        },
+      })
+      const docs = db.entities.DevicesRetained as any
+      expect((yield* docs.get({ id: "pre133" })).version).toBe(4)
+      const updated = yield* docs.update({ id: "pre133" }).set({ label: "m" })
+      expect(updated.version).toBe(5)
+      expect((yield* rawItem("G133DeviceRetained", "pre133")).__edd_i__?.S).toMatch(
+        /^[0-9a-f-]{36}$/,
+      )
+      expect(yield* snapshotLabel("G133DeviceRetained", "pre133", 4)).toEqual({ S: "l" })
+      yield* docs.delete({ id: "pre133" })
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- a default never creates a unique sentinel ----
+
+  it.effect("defaulted unique fields: indexed and stored, but no sentinel until supplied", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const coded = db.entities.Coded as any
+      // Two items leave both unique fields to their defaults: both succeed.
+      yield* coded.put({ id: "cd1", name: "a" })
+      yield* coded.put({ id: "cd2", name: "b" })
+      const raw1 = yield* rawItem("G133Coded", "cd1")
+      expect([raw1.code, raw1.handle, raw1.__edd_d__]).toEqual([
+        { S: "none" },
+        undefined,
+        { SS: ["code"] },
+      ])
+      expect(
+        (yield* coded.byCode({ code: "none" }).collect()).map((c: any) => c.id).sort(),
+      ).toEqual(["cd1", "cd2"])
+      expect(yield* sentinelExistsFor("G133Coded", "code", "none")).toBe(false)
+      expect(yield* sentinelExistsFor("G133Coded", "handle", "anon")).toBe(false)
+      // A third item SUPPLIES "none": its sentinel is created, and it is its own.
+      yield* coded.put({ id: "cd3", name: "c", code: "none" })
+      expect(yield* sentinelExistsFor("G133Coded", "code", "none")).toBe(true)
+      // cd1 moves to a real value: its sentinel is created, cd3's survives.
+      const moved = yield* coded.update({ id: "cd1" }).set({ code: "c1" })
+      expect(moved.code).toBe("c1")
+      expect((yield* rawItem("G133Coded", "cd1")).__edd_d__).toBeUndefined()
+      expect(yield* sentinelExistsFor("G133Coded", "code", "c1")).toBe(true)
+      expect(yield* sentinelExistsFor("G133Coded", "code", "none")).toBe(true)
+      // Deleting cd2 (still on the default) leaves cd3's sentinel alone too.
+      yield* coded.delete({ id: "cd2" })
+      expect(yield* sentinelExistsFor("G133Coded", "code", "none")).toBe(true)
+      // And the supplied value is enforced.
+      const taken = yield* coded
+        .put({ id: "cd4", name: "d", code: "c1" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(taken._tag).toBe("UniqueConstraintViolation")
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- operator counting against DynamoDB's own ----
+
+  it.effect("a condition at DynamoDB's operator limit is sent; one over is refused first", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const counters = db.entities.Counters as any
+      yield* counters.put({ id: "ops", owner: "o", label: "l0" })
+      // The plain update adds `AND attribute_exists(#exists)`: 2 operators.
+      const equals =
+        (k: number) =>
+        (t: any, { or, eq }: any) =>
+          or(...Array.from({ length: k }, (_, i) => eq(t.label, i === 0 ? "l0" : `x${i}`)))
+      const betweens =
+        (k: number) =>
+        (t: any, { or, between }: any) =>
+          or(...Array.from({ length: k }, (_, i) => between(t.label, i === 0 ? "a" : `x${i}`, "z")))
+      // 149 comparisons → 149 + 148 OR + 2 = 299: within the limit.
+      yield* counters.update({ id: "ops" }).set({ label: "l0" }).condition(equals(149))
+      // BETWEEN's own AND is part of it: 101 BETWEEN → 101 + 100 OR + 2 = 203,
+      // sent and accepted (counting that AND would make it 304, refused).
+      yield* counters.update({ id: "ops" }).set({ label: "l0" }).condition(betweens(101))
+      // 150 comparisons → 301: refused before anything is sent.
+      for (const cond of [equals(150)]) {
+        const error = yield* counters
+          .update({ id: "ops" })
+          .set({ label: "changed" })
+          .condition(cond)
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String(error.cause)).toContain("301 operators")
+      }
+      expect((yield* rawItem("G133Counter", "ops")).label).toEqual({ S: "l0" })
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 })
