@@ -156,7 +156,7 @@ const Orders = Entity.make({
 | Operation | Behavior | On Duplicate Key | DynamoDB API |
 |-----------|----------|------------------|--------------|
 | **`put`** | Creates or overwrites | Replaces the existing item; on a versioned or unique-constrained entity it continues the item's version and rotates its sentinels | PutItem (TransactWriteItems with sentinels or retain) |
-| **`create`** | Insert-only — `put` + automatic `attribute_not_exists` condition; never reads the item (a `retain` entity runs one `Limit 1` query of its version history) | Fails with `ConditionalCheckFailed` | PutItem (with condition) |
+| **`create`** | Insert-only — `put` + automatic `attribute_not_exists` condition; never reads the item (a `retain` entity queries its version history: one `Limit 1` query, plus a keys-only `Limit 1` query for older history when the primary sort key has composites) | Fails with `ConditionalCheckFailed` | PutItem (with condition) |
 | **`upsert`** | Create-or-update | Creates if missing, updates the supplied fields if it exists | UpdateItem (with `if_not_exists`); reads first on a `unique` or `retain` entity, or when the input omits a defaulted index composite |
 
 ```typescript

@@ -785,7 +785,10 @@ row, and a single-item entity's keys stay unchanged. `purge` of such an item
 removes its live row, rows nested under it, its own history, and history an
 earlier release wrote without a segment whose stored composites compose its
 live key; siblings are untouched. An entity without sort key composites purges
-the whole partition, as before.
+every row of its own in the partition. Either way, only rows of its own entity
+type (`__edd_e__`): another entity sharing the partition through a collection on
+the primary key keeps its rows (purge used to delete every row in the
+partition).
 
 **History written before the segment stays readable.** Rows an earlier release
 wrote for such an entity sit under the partition-wide keys (`#v#0000003`,
@@ -793,7 +796,10 @@ wrote for such an entity sit under the partition-wide keys (`#v#0000003`,
 whose live key its stored composites compose (`isItemsRow`), and every reader
 of one item's history reads them too (`legacyHistory`: a `BETWEEN` on
 `<prefix>0`…`<prefix>:` — a version or timestamp starts with a digit, a
-segment with a composite name, so the range holds only unsegmented rows):
+segment with a composite name; a segment can still start with a digit if a
+composite's NAME does, so rows with a `#` past the prefix are dropped. A
+keys-only `Limit 1` probe of the range runs first, and only a hit reads it in
+full, so a partition with no such history costs one small read):
 `getVersion` falls back to the unsegmented key when the item's own is missing;
 `deleted.get` / `restore` take the later of the item's own latest tombstone and
 its latest unsegmented one (`latestTombstone`); `highestRetainedVersion` takes
@@ -807,17 +813,19 @@ segmented one on a tie).
 
 **History rows are not items.** Snapshots, tombstones and time-series event
 items keep their entity's `__edd_e__` (the history readers filter on it), so the
-ownership filter alone admits them to a primary-key query or a scan.
-`Entity._historyRows` (the type-wide `#v#` / `#deleted#` prefixes, for `retain` /
-`softDelete`; for `timeSeries`, rows nested under a live item: beginning with the
-live key less its composites, with `#e#` after it) drives `Query`'s
-`excludeSkPrefixes`: a scan adds `NOT begins_with(sk, …)` and
-`NOT contains(sk, "#e#")` to its `FilterExpression` (judging client-side instead
-if the marker could occur in a live key — an entity or collection named `e`); a query can't (DynamoDB refuses a key attribute in a query's
-filter), so it drops those rows as they arrive, before decoding or counting —
-like a client-side predicate, which also means `limit` isn't sent as `Limit` and
-`count()` reads the rows (projecting the sort key if a `select` omits it). GSI
-queries never meet history rows, which carry no index keys.
+ownership filter alone admits them to a primary-key query, a scan, or a
+collection on the primary key. They're judged exactly: a row is an item iff the
+sort key composed from its own stored composites (`liveSkOf(toDomainView(row))`)
+is its stored sort key — history and event rows never are, and no live row
+fails it, whatever its values or collection names hold (`#e#`, `deleted`, `v`).
+`Entity._liveRows` (for `retain` / `softDelete` / `timeSeries`; otherwise
+`undefined`, and the query is unchanged) drives `Query`'s `liveRows`, applied to
+rows as they arrive, before decoding or counting, for queries and scans alike (a
+query can't name a key attribute in its filter, and a scan's filter saves no
+read capacity). Like a client-side predicate, that means `limit` isn't sent as
+`Limit` and `count()` reads the rows; a `select` also reads the sort key and its
+composites. A collection on the primary key judges each row by the member its
+`__edd_e__` names. GSI queries never meet history rows, which carry no index keys.
 
 ### Policy-Aware GSI Composition (update & append)
 
@@ -2040,7 +2048,13 @@ therefore costs a `GetItem` and a two-item `TransactWriteItems`, not one
 `DeleteItem`; deleting a missing retain item writes nothing (with a
 `.condition()`, a `DeleteItem` conditioned on `attribute_not_exists(pk)` and the
 condition, so the condition is judged against no item and an item created since
-the read is never removed unsnapshotted). A put, `create`, `upsert` or transaction put of a
+the read is never removed unsnapshotted). A delete that reads first — retain,
+unique or soft — with no `.condition()` is retried from a fresh read when it
+loses a race (the item changed, or a sentinel it releases changed hands), up to
+`GUARDED_PUT_ATTEMPTS`, as a put is: the caller asserted nothing the race could
+break, and the guard still keeps a concurrent write out of the snapshot or
+tombstone. With a `.condition()`, the read is what the condition was judged
+against, and the race fails. A put, `create`, `upsert` or transaction put of a
 missing retain item reads the highest version retained for its key (a `Query` on
 the `v#` prefix, reversed, `Limit: 1`) and continues after it: the new item takes
 that version + 1, a new incarnation token, and its snapshot at that version.
@@ -2063,7 +2077,8 @@ conditioned on `_entity_pk` / `_entity_sk` still naming it (`sentinelRelease`). 
 release cancelled because the reservation changed hands in between is planned
 again from a fresh read by a put, an `upsert` and a transaction put (bounded by
 the same attempts), and is a `ConcurrentModification` on the unique fields from
-an update or delete. (`releaseRaced` marks those errors, `releaseRaces`, so
+an update or a delete with a `.condition()` (an unconditioned delete is retried
+too). (`releaseRaced` marks those errors, `releaseRaces`, so
 `guardedUpsert` can tell them from a change of the item itself, which fails an
 upsert as it fails an update.) Each sentinel a write would release costs one consistent
 `GetItem` (projecting only `_entity_pk` / `_entity_sk`). `purge` releases them
@@ -2119,9 +2134,11 @@ guarded put adds, so two puts that swap unique values (releasing and reserving
 the same sentinels) are caught too; `append` adds targets for its contiguity
 check, event puts and idempotency sentinel. A repeat is a `ValidationError`
 naming the entity and both sources. **Size** (`refuseOversizedTransaction`):
-the items' sizes, counted as DynamoDB counts them (`internal/ItemSize.ts`,
-shared with `Batch.write`: a `Put`'s item, a `Delete`'s or `ConditionCheck`'s
-key, an `Update`'s key and values — a lower bound there), must not pass 4 MB =
+a LOWER bound on the items' sizes by DynamoDB's item-size rules
+(`internal/ItemSize.ts`, `"lower"`: numbers a byte per two significant digits
+plus one, no list or map overhead; a `Put`'s item, a `Delete`'s or
+`ConditionCheck`'s key, an `Update`'s key and values), so a transaction DynamoDB
+would accept is never refused, must not pass 4 MB =
 4,194,304 bytes, DynamoDB's documented aggregate limit for one transaction (in
 the binary megabytes of all its size limits). A retain put counts twice: its
 item and its snapshot. An oversized transaction is a `ValidationError` naming
@@ -2133,7 +2150,7 @@ key alone.
 existing item to version 1 under a new incarnation. So `Batch.write` sends these
 puts first, before any other request, as create-only `TransactWriteItems` Puts
 (`attribute_not_exists(pk)`) in chunks of up to 100 items, each closed before
-its item size, counted as DynamoDB counts it, passes 3.5 MB (the cap is 4 MB). There
+its item size, by an upper bound of DynamoDB's item-size rules (`"upper"`), passes 3.5 MB (the cap is 4 MB). There
 is no read, and so no window between a check and the write. A batch that
 touches a versioned put's item more than once — a delete and a put, or two
 puts — is refused before anything is sent: the put runs in its own

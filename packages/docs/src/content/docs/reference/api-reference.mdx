@@ -240,12 +240,12 @@ These are methods on the entity definition returned by `Entity.make()`. They ret
 | Operation | Signature | Description |
 |-----------|-----------|-------------|
 | `entity.put(input)` | `EntityPut` | Insert or overwrite an item (descriptor). On a versioned or unique-constrained entity it reads the item first: a put over an existing item continues its version, incarnation and `createdAt`, snapshots it (retain) and rotates changed sentinels, releasing only those it owns. A concurrent write in between is retried (last writer wins); a race lost on every attempt fails with `OptimisticLockError` / `ConcurrentModification`. A deleted retain item created again continues after its retained version history |
-| `entity.create(input)` | `EntityPut` | Insert only — fails with `ConditionalCheckFailed` if exists (descriptor). Never reads the item; a `retain` entity runs one `Limit 1` query to continue after any version history retained at the key |
+| `entity.create(input)` | `EntityPut` | Insert only — fails with `ConditionalCheckFailed` if exists (descriptor). Never reads the item; a `retain` entity runs one `Limit 1` query to continue after any version history retained at the key (with primary sort key composites, plus a keys-only `Limit 1` query for history an earlier release wrote) |
 | `entity.upsert(input)` | `EntityPut` | Create or update the supplied fields — uses `if_not_exists()` for immutable fields, createdAt, version (descriptor). On an entity with unique constraints or `retain` (or an input omitting a defaulted index composite) it reads the item once: creates a missing item with its sentinels and snapshot, or updates an existing one, rotating changed sentinels and snapshotting it. Validates the whole input either way |
 | `entity.get(key)` | `EntityGet` | Get a single item by primary key (descriptor) |
 | `entity.update(key)` | `EntityUpdate` | Start an update operation (compose with `set`, `add`, etc.) (descriptor). On a missing item it fails with `ItemNotFound` and writes nothing. The exception is a plain `.set()` of a complete item (every required field and primary-key composite, with no other operations, `expectedVersion`, `.condition()`, cascade, `withVector` or old-image `returnValues`), which the library creates through `create`, exactly as `put` would write it |
 | `entity.patch(key)` | `EntityUpdate` | Update with `attribute_exists` — fails with `ConditionalCheckFailed` if not exists (descriptor) |
-| `entity.delete(key)` | `EntityDelete` | Delete an item (descriptor). Releases only the unique sentinels the item owns. On a `retain` entity it reads the item and deletes it in one transaction with a snapshot of its final state, so an item created again continues past it |
+| `entity.delete(key)` | `EntityDelete` | Delete an item (descriptor). Releases only the unique sentinels the item owns. On a `retain` entity it reads the item and deletes it in one transaction with a snapshot of its final state, so an item created again continues past it. A delete that reads first and has no `.condition()` is retried from a fresh read after a concurrent write |
 | `entity.deleteIfExists(key)` | `EntityDelete` | Delete with `attribute_exists` — fails with `ConditionalCheckFailed` if not exists (descriptor) |
 | `entity.query.<indexName>(pk)` | `Query<Record>` | Query a specific index by partition key (descriptor) |
 | `entity.scan()` | `Query<Record>` | Full table scan filtered by entity type (descriptor) |
@@ -307,7 +307,7 @@ const users = db.entities.UserEntity
 | `bound.getVersion(key, version)` | `versioned: { retain: true }` | `Effect` | Get a specific version snapshot |
 | `bound.versions(key)` | `versioned: { retain: true }` | `BoundQuery` | List all version snapshots as a fluent BoundQuery — supports `.collect()`, `.fetch()`, `.paginate()`, `.count()`, `.limit()`, `.reverse()`, `.startFrom()`, `.filter()`, `.select()` |
 | `bound.restore(key)` | `softDelete` | `Effect` | Restore a soft-deleted item |
-| `bound.purge(key)` | Any | `Effect` | Permanently remove item + all versions and soft-deleted copies, and release the unique sentinels they own. With sort key composites, only the named item's rows; without, the whole partition |
+| `bound.purge(key)` | Any | `Effect` | Permanently remove item + all versions and soft-deleted copies, and release the unique sentinels they own. With sort key composites, only the named item's rows; without, every row of this entity in the partition. Never another entity's rows |
 | `bound.deleted.get(key)` | `softDelete` | `Effect` | Get a specific soft-deleted item |
 | `bound.deleted.list(key)` | `softDelete` | `BoundQuery` | List all soft-deleted tombstones in the partition as a fluent BoundQuery |
 
@@ -318,7 +318,7 @@ const users = db.entities.UserEntity
 | `entity.getVersion(key, version)` | `versioned: { retain: true }` | Get a specific version snapshot (descriptor) |
 | `entity.deleted.get(key)` | `softDelete` | Get a soft-deleted item (descriptor) |
 | `entity.restore(key)` | `softDelete` | Restore a soft-deleted item (descriptor) |
-| `entity.purge(key)` | Any | Delete the item, its versions and its soft-deleted copies (descriptor): the whole partition without sort key composites, the named item's rows with them |
+| `entity.purge(key)` | Any | Delete the item, its versions and its soft-deleted copies (descriptor): every row of this entity in the partition without sort key composites, the named item's rows with them; never another entity's rows |
 
 ### Operation Combinators
 
@@ -698,8 +698,8 @@ Consequences worth knowing:
 - **A race is retried.** If another writer changes, creates or deletes the item between the read and the transaction, or a sentinel it releases changes hands, the transaction is cancelled and built again from a fresh read. A race lost on every attempt fails with `OptimisticLockError` / `ConcurrentModification`.
 - **Errors name what happened.** A duplicate fails with `UniqueConstraintViolation` (naming the constraint and the values). Only an op's own condition (`.condition()`, `create()`) is reported as a condition: `TransactionCancelled` from `transactWrite`, `AdditionalItemConditionFailed` from `append`.
 - **One op per item.** DynamoDB allows one operation per item in a transaction, so a transaction that touches one item twice fails with a `ValidationError` naming the entity and both ops, before anything is sent. That includes two puts of one item, and two puts that swap unique values: each releases the sentinel the other reserves. In `append`, an additional item that repeats an event or the idempotency sentinel is refused the same way.
-- **4 MB, counted before sending.** A transaction whose items pass DynamoDB's 4 MB (4,194,304 bytes, item sizes counted as DynamoDB counts them) fails with a `ValidationError` naming its largest item, before anything is sent. A `retain` put counts twice: its item and its snapshot.
-- **The reads cost capacity.** Each guarded put makes one consistent `GetItem` of its item, one more per sentinel it would release, and, for a missing `retain` item, one `Limit 1` query of its version history.
+- **4 MB, counted before sending.** A transaction whose items pass DynamoDB's 4 MB (4,194,304 bytes) fails with a `ValidationError` naming its largest item, before anything is sent. The size is a lower bound by DynamoDB's item-size rules (numbers a byte per two significant digits, plus one; no list or map overhead), so a transaction DynamoDB would accept is never refused. A `retain` put counts twice: its item and its snapshot.
+- **The reads cost capacity.** Each guarded put makes one consistent `GetItem` of its item, one more per sentinel it would release, and, for a missing `retain` item, one `Limit 1` query of its version history (plus, with primary sort key composites, a keys-only `Limit 1` query for older history).
 - **The 100-item cap counts the expanded total.** Ten `unique` + `retain` puts occupy 30 slots or more. The error message reports both numbers.
 - **`softDelete` does not affect a put** — only a delete — so puts of soft-deletable entities are unaffected.
 
