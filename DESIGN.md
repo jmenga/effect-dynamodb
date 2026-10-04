@@ -1986,7 +1986,7 @@ keeps its own condition and error.
 existing item to version 1 under a new incarnation. So `Batch.write` sends these
 puts first, before any other request, as create-only `TransactWriteItems` Puts
 (`attribute_not_exists(pk)`) in chunks of up to 100 items, each closed before
-its marshalled size passes 3.5 MB (DynamoDB caps a transaction at 4 MB). There
+its item size, counted as DynamoDB counts it, passes 3.5 MB (the cap is 4 MB). There
 is no read, and so no window between a check and the write. A batch that
 touches a versioned put's item more than once — a delete and a put, or two
 puts — is refused before anything is sent: the put runs in its own
