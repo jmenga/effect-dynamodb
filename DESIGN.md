@@ -1477,6 +1477,23 @@ and `Redacted` leaves are substituted, so a transform (Pattern B) inside a
 container keeps owning its wire form. A `TupleWithRest` is now derived as a
 tuple; it was previously treated as an array.
 
+**Container checks on writes (#133).** Rebuilding an `Array`, a `Struct` or a
+class around substituted children with a plain constructor dropped the original
+node's `.check()` refinements, so a write that broke one
+(`Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(1))` given two
+dates) was accepted. WRITE schemas are now built with `enforceChecks`, which
+restores those checks (`withMetadataOf`; for a class over a checked Struct, on
+the Struct its encoding leads to, `classStructAst`). That covers the entity
+input / create / update / key schemas (so `put`, `create`, `update`, Batch and
+Transaction), `appendInput`, the path-value schemas (`writeModelSchema`) and the
+aggregate's `writeSchema`, used by `create` and `update`. READ schemas leave it
+off, so a row written while the check was not enforced still reads. An aggregate
+`update` can repair such a row: it converts the current state through the read
+schema when `toIso` rejects it (`toPlainState`), and `keyRecord` normalises only
+key composites. `Union` / `Record` / `Tuple` rebuilds (`walkedContainer`) keep
+their metadata in every mode. A container that holds no substituted value is
+never rebuilt and keeps its own checks on reads and writes, as before.
+
 Date leaves inside a `Union` follow the union rules below, and also rebuild
 legacy maps, so rows written before #133 read back as real `DateTime`s.
 
@@ -1728,8 +1745,19 @@ domain parts), or that holds an ambiguous wire leaf, is encoded part by part
 transform with a primitive wire form, given a value that genuinely decodes as
 wire AND validates as the domain type (`StringFromBase64` given `"aGk="`,
 `fromJsonString`), whose encode would double-encode it (`makeAmbiguityCheck`);
-`"hi"` on `StringFromBase64` is not valid wire and is encoded. A path the schema
-cannot follow (an opaque `DynamoModel.ref`) is passed through as before. `ADD`,
+`"hi"` on `StringFromBase64` is not valid wire and is encoded. Paths into and
+under a `DynamoModel.ref` field follow the ref target's model (`refTargets`;
+`childAtSegment` also recovers an opaque class's fields from the Struct its
+encoding leads to), so they are encoded like any other path. Only a path no
+schema describes (under a dynamic key of an untyped value) is passed through.
+
+Each encoded path value is then **validated** against the write schema at its
+path (`validate` / `validateElements`), as `.set()` validates its payload: a
+literal outside its set, a string under `minLength` or a broken container check
+fails with a `ValidationError` instead of being stored. `undefined` object
+entries are dropped first (`asStored`), since the marshaller drops them too.
+List `append` / `prepend` validate each element, but cannot enforce list-level
+checks such as `maxLength`: DynamoDB builds the list server-side. `ADD`,
 `DELETE` and `SUBTRACT` are unchanged.
 
 **Why hard-break over dual.** Carrying both the variadic overload and the fluent builder would double the surface area of `BoundEntity`, degrade hover tooltips, and force contributors to remember two shapes. The read side settled on builders for the same reasons. The change is batched into the next major alongside other breaking changes.

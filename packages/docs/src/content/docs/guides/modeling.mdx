@@ -113,6 +113,10 @@ A zoned field, either `DynamoModel.DateTimeZoned` or a self `Schema.DateTimeZone
 
 Offsets that aren't whole minutes, such as historical local-mean-time offsets or a sub-minute `DateTime.zoneMakeOffset`, are rounded to the minute by Effect's ISO format, and the instant read back moves by the same amount. Earlier versions behaved the same way.
 
+#### Container checks
+
+A `.check()` refinement on an array, a struct or a class built over a checked struct is enforced on every write when the container holds a date or another value the library substitutes, for example `Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(1))`. That covers `put`, `create`, `update` and `.set()`, path operations, `.append()`, Batch and Transaction. A violating value fails with a `ValidationError`. Earlier versions silently dropped these checks, so rows that break them may already exist. Reads don't enforce them, so those rows still read, and the next write that sets the field to a valid value repairs them.
+
 :::caution[Upgrading from 1.22.0 or earlier]
 Earlier versions stopped at unions, records and tuples, so a self date inside one was stored as a marshalled `DateTime` map (`{ epochMilliseconds, "~effect/DateTime", _tag: "Utc" }`). Those rows still read back, as real `DateTime` values, and are rewritten in wire form when the attribute is next written. Keys are not affected.
 

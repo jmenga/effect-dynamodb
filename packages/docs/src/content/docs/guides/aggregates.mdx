@@ -455,6 +455,8 @@ Refs are matched by the field's schema, not its name. A nested field that happen
 
 Composed keys (`pk`, `sk`, collection and list-index keys) are not affected by this encoding. They are built exactly as before, so existing rows stay addressable.
 
+Container `.check()` refinements are enforced on `create` and `update`, as they are on entities (see [Container checks](/effect-dynamodb/guides/modeling/#container-checks)). An array, struct or checked-struct class holding a date or another substituted value that breaks its check fails with a `ValidationError`. Earlier versions silently dropped those checks. Reads don't enforce them, so a stored row that breaks one still assembles, and an `update` that makes the value valid repairs it.
+
 :::caution[Custom `decompose` that renames fields]
 A `many` edge with a custom `decompose` that **renames** element fields (`{ noteId, at }` → `{ nid, when }`) is the one exception. Encoders are matched to the element's own field names, so a renamed field is stored as its domain value, and a `DateTime` there is still written as a map. It reads back as a real `DateTime`. To store it in wire form, keep the element's field names in `decompose`, or encode the value yourself before returning it.
 :::
