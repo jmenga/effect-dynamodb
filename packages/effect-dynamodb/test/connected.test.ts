@@ -13226,3 +13226,192 @@ describeConnected("#133 — nested sub-aggregates", () => {
     }).pipe(provideN133),
   )
 })
+
+// ===========================================================================
+// #133 — unions with a colliding member, wire-form path values, configured
+// union storage, legacy raw values and plain bigints
+// ===========================================================================
+
+class X133Row extends Schema.Class<X133Row>("X133Row")({
+  id: Schema.String,
+  dateOrText: Schema.Union([Schema.DateTimeUtc, Schema.String]),
+  textOrDate: Schema.Union([Schema.String, Schema.DateTimeUtc]),
+  epochOrNumber: Schema.Union([
+    Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
+    Schema.Number,
+  ]),
+  configured: Schema.NullOr(Schema.DateTimeUtc),
+  b64: Schema.StringFromBase64,
+  nfs: Schema.NumberFromString,
+  big: Schema.BigInt,
+}) {}
+const X133Schema = DynamoSchema.make({ name: "edd133x", version: 1 })
+const X133Rows = Entity.make({
+  model: DynamoModel.configure(X133Row, { configured: { storedAs: DynamoModel.DateEpochMs } }),
+  entityType: "X133Row",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+})
+class X133Agg extends Schema.Class<X133Agg>("X133Agg")({
+  id: Schema.String,
+  dateOrText: Schema.Union([Schema.DateTimeUtc, Schema.String]),
+  big: Schema.BigInt,
+}) {}
+const X133Table = Table.make({ schema: X133Schema, entities: { X133Rows } })
+const X133Aggregate = Aggregate.make(X133Agg, {
+  table: X133Table,
+  schema: X133Schema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "xagg" },
+  root: { entityType: "X133AggItem" },
+  edges: {},
+})
+const x133TableName = `edd133x-${Date.now()}`
+const provideX133 = Effect.provide(
+  Layer.mergeAll(ClientLayer, X133Table.layer({ name: x133TableName })),
+)
+const x133Client = DynamoClient.make({
+  entities: { X133Rows },
+  aggregates: { X133Aggregate },
+  tables: { X133Table },
+})
+const x133Key = (id: string) => ({
+  pk: { S: `$edd133x#v1#x133row#id_${id}` },
+  sk: { S: "$edd133x#v1#x133row" },
+})
+
+describeConnected("#133 — colliding unions, wire path values, legacy raw values", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* x133Client
+        yield* db.tables.X133Table.create()
+      }).pipe(provideX133, Effect.scoped),
+    )
+  }, 30000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: x133TableName })
+      }).pipe(
+        provideX133,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 30000)
+
+  it.effect("entity: each union member reads back as itself; storage as configured", () =>
+    Effect.gen(function* () {
+      const db = yield* x133Client
+      const client = yield* DynamoClient
+      const dt = DateTime.makeUnsafe(I133_DOB_MS)
+      const base = { b64: "hi", nfs: 1, big: 12345678901234567890n }
+      yield* db.entities.X133Rows.put({
+        id: "a",
+        dateOrText: "2020",
+        textOrDate: "5",
+        epochOrNumber: 5,
+        configured: dt,
+        ...base,
+      } as any)
+      yield* db.entities.X133Rows.put({
+        id: "b",
+        dateOrText: dt,
+        textOrDate: dt,
+        epochOrNumber: dt,
+        configured: null,
+        ...base,
+      } as any)
+      const raw = (id: string) =>
+        client
+          .getItem({ TableName: x133TableName, Key: x133Key(id), ConsistentRead: true })
+          .pipe(Effect.map(({ Item }) => Item as Record<string, any>))
+      const a = yield* raw("a")
+      const b = yield* raw("b")
+      expect([a.dateOrText, a.textOrDate, a.epochOrNumber, a.configured]).toEqual([
+        { S: "2020" },
+        { S: "5" },
+        { N: "5" },
+        { N: String(I133_DOB_MS) },
+      ])
+      expect([b.dateOrText, b.textOrDate, b.epochOrNumber, b.big]).toEqual([
+        { S: I133_DOB },
+        { S: I133_DOB },
+        { S: I133_DOB },
+        { N: "12345678901234567890" },
+      ])
+
+      const gotA = (yield* db.entities.X133Rows.get({ id: "a" })) as any
+      expect([gotA.dateOrText, gotA.textOrDate, gotA.epochOrNumber]).toEqual(["2020", "5", 5])
+      expect(i133IsRealUtc(gotA.configured, I133_DOB_MS)).toBe(true)
+      expect(gotA.big).toBe(12345678901234567890n)
+      const gotB = (yield* db.entities.X133Rows.get({ id: "b" })) as any
+      expect(i133IsRealUtc(gotB.dateOrText, I133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(gotB.textOrDate, I133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(gotB.epochOrNumber, I133_DOB_MS)).toBe(true)
+
+      // Path values: ambiguous wire values pass through, domain values encode.
+      yield* db.entities.X133Rows.update({ id: "a" })
+        .pathSet({ segments: ["b64"], value: "aGk=", isPath: false })
+        .pathSet({ segments: ["nfs"], value: 7, isPath: false })
+        .pathSet({ segments: ["configured"], value: dt, isPath: false })
+      const a2 = yield* raw("a")
+      expect([a2.b64, a2.nfs, a2.configured]).toEqual([
+        { S: "aGk=" },
+        { S: "7" },
+        { N: String(I133_DOB_MS) },
+      ])
+    }).pipe(provideX133),
+  )
+
+  it.effect("entity: rows left by older releases read back", () =>
+    Effect.gen(function* () {
+      const db = yield* x133Client
+      const client = yield* DynamoClient
+      yield* client.putItem({
+        TableName: x133TableName,
+        Item: {
+          ...x133Key("legacy"),
+          __edd_e__: { S: "X133Row" },
+          id: { S: "legacy" },
+          dateOrText: { S: "2020" },
+          textOrDate: i133LegacyMap("~effect/time/DateTime")(I133_DOB_MS) as any,
+          epochOrNumber: { N: "5" },
+          configured: i133LegacyMap("~effect/DateTime")(I133_DOB_MS) as any,
+          b64: { S: "aGk=" },
+          nfs: { N: "3" },
+          big: { N: "9" },
+        },
+      })
+      const got = (yield* db.entities.X133Rows.get({ id: "legacy" })) as any
+      expect(got.dateOrText).toBe("2020")
+      expect(i133IsRealUtc(got.textOrDate, I133_DOB_MS)).toBe(true)
+      expect(got.epochOrNumber).toBe(5)
+      expect(i133IsRealUtc(got.configured, I133_DOB_MS)).toBe(true)
+      expect(got.nfs).toBe(3)
+      expect(got.big).toBe(9n)
+    }).pipe(provideX133),
+  )
+
+  it.effect("aggregate: a root union and a plain bigint round-trip", () =>
+    Effect.gen(function* () {
+      const db = yield* x133Client
+      const aggs = db.aggregates.X133Aggregate
+      yield* aggs.create({ id: "g1", dateOrText: "2020", big: 5n } as any)
+      yield* aggs.create({
+        id: "g2",
+        dateOrText: DateTime.makeUnsafe(I133_DOB_MS),
+        big: 12345678901234567890n,
+      } as any)
+      const g1 = (yield* aggs.get({ id: "g1" } as any)) as any
+      const g2 = (yield* aggs.get({ id: "g2" } as any)) as any
+      expect(g1.dateOrText).toBe("2020")
+      expect(g1.big).toBe(5n)
+      expect(i133IsRealUtc(g2.dateOrText, I133_DOB_MS)).toBe(true)
+      expect(g2.big).toBe(12345678901234567890n)
+      yield* aggs.update({ id: "g1" } as any, (c: any) => c.state)
+    }).pipe(provideX133),
+  )
+})
