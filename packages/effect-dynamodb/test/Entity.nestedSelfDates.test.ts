@@ -1054,6 +1054,16 @@ describe("#133 entity nested self dates — class values set by path are encoded
           u.pathSet({ segments: ["plain"], value: { at: dt, n: 2 }, isPath: false }),
         ),
       ).toContainEqual({ M: { at: S(DOB), n: S("2") } })
+      // A plain object given for a class-typed field is encoded as that class.
+      expect(
+        yield* update((u) =>
+          u.pathSet({
+            segments: ["f"],
+            value: { user: "u", token: Redacted.make("secret"), issued: new Date(DOB_MS), at: dt },
+            isPath: false,
+          }),
+        ),
+      ).toContainEqual(storedCred)
       expect(
         yield* update((u) =>
           u.pathSet({

@@ -2296,11 +2296,21 @@ export const makePathValueEncoder = (
       return (value) => (Array.isArray(value) ? value.map((entry) => element(entry)) : value)
     }
     const encode = Schema.encodeUnknownOption(stored as Schema.Codec<any>)
+    const decode = Schema.decodeUnknownOption(stored as Schema.Codec<any>)
     const ambiguous = makeAmbiguityCheck(original)
     return (value: unknown) => {
       if (ambiguous(value)) return value
       const encoded = encode(value)
-      return encoded._tag === "Some" ? encoded.value : value
+      if (encoded._tag === "Some") return encoded.value
+      // `decode -> encode`, as `.set()` / `put` do: a plain object given for a
+      // class-typed field, or a value already in wire form, round-trips to its
+      // wire form instead of being marshalled as given.
+      const decoded = decode(value)
+      if (decoded._tag === "Some") {
+        const reencoded = encode(decoded.value)
+        if (reencoded._tag === "Some") return reencoded.value
+      }
+      return value
     }
   }
   /** The model's own schema at a path, before any substitution. */
