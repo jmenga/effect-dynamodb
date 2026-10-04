@@ -15387,22 +15387,30 @@ describeConnected("#133 — path operations on index composites and unique field
       const db = yield* g133Client
       const docs = db.entities.SoftDevices as any
       yield* docs.put({ id: "sdv", owner: "o", label: "l" })
+      // With a `.condition()`, the read it was judged against has changed: refused.
       g133Inject.before = rawSetAttrs("G133SoftDevice", "sdv", { label: { S: "theirs" } }, true)
-      const error = yield* docs.delete({ id: "sdv" }).asEffect().pipe(Effect.flip)
+      const error = yield* docs
+        .delete({ id: "sdv" })
+        .condition({ attributeExists: "id" })
+        .asEffect()
+        .pipe(Effect.flip)
       expect(error._tag).toBe("OptimisticLockError")
       expect((yield* rawItem("G133SoftDevice", "sdv")).label).toEqual({ S: "theirs" })
       expect(yield* partition("G133SoftDevice", "sdv")).toEqual([
         "$edd133g#v1#g133softdevice",
         "$edd133g#v1#g133softdevice#v#0000001",
       ])
-      // No race: the tombstone and snapshot keys are the ones they always were.
+      // Without one, it reads the item again: the tombstone holds the update.
+      g133Inject.before = rawSetAttrs("G133SoftDevice", "sdv", { label: { S: "later" } }, true)
       yield* docs.delete({ id: "sdv" })
+      expect((yield* docs.deleted.get({ id: "sdv" })).label).toBe("later")
       const keys = yield* partition("G133SoftDevice", "sdv")
       expect(keys).toHaveLength(3)
       expect(keys[0]).toMatch(/^\$edd133g#v1#g133softdevice#deleted#/)
+      // The snapshot is of the state deleted: version 3, after both bumps.
       expect(keys.slice(1)).toEqual([
         "$edd133g#v1#g133softdevice#v#0000001",
-        "$edd133g#v1#g133softdevice#v#0000002",
+        "$edd133g#v1#g133softdevice#v#0000003",
       ])
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
@@ -15413,13 +15421,19 @@ describeConnected("#133 — path operations on index composites and unique field
       const accounts = db.entities.SoftAccounts as any
       yield* accounts.put({ id: "sda", email: "sda@x.io", name: "n" })
       g133Inject.before = rawSetAttrs("G133SoftAccount", "sda", { name: { S: "theirs" } })
-      const error = yield* accounts.delete({ id: "sda" }).asEffect().pipe(Effect.flip)
+      const error = yield* accounts
+        .delete({ id: "sda" })
+        .condition({ attributeExists: "id" })
+        .asEffect()
+        .pipe(Effect.flip)
       expect(error._tag).toBe("ConcurrentModification")
       expect(error.attributes).toEqual(["name"])
       expect((yield* rawItem("G133SoftAccount", "sda")).name).toEqual({ S: "theirs" })
       expect(yield* sentinelExists("G133SoftAccount", "sda@x.io")).toBe(true)
-      // A delete that sees the current item succeeds.
+      // Without a condition it reads the item again, and the tombstone holds the update.
+      g133Inject.before = rawSetAttrs("G133SoftAccount", "sda", { name: { S: "later" } })
       yield* accounts.delete({ id: "sda" })
+      expect((yield* accounts.deleted.get({ id: "sda" })).name).toBe("later")
       expect(yield* rawItem("G133SoftAccount", "sda")).toBeUndefined()
       expect(yield* sentinelExists("G133SoftAccount", "sda@x.io")).toBe(false)
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
@@ -15439,19 +15453,39 @@ describeConnected("#133 — path operations on index composites and unique field
             .set({ email: "hd2@x.io" })
         }).pipe(Effect.provide(g133Layer(g133Tables.record))),
       )
-      const error = yield* bare.delete({ id: "hd" }).asEffect().pipe(Effect.flip)
+      const error = yield* bare
+        .delete({ id: "hd" })
+        .condition({ attributeExists: "id" })
+        .asEffect()
+        .pipe(Effect.flip)
       expect(error._tag).toBe("ConcurrentModification")
       expect(error.attributes).toEqual(["email"])
       expect(yield* sentinelExists("G133AccountBare", "hd2@x.io")).toBe(true)
+      // Without a condition the delete reads the item again: the rotated
+      // sentinel is the one released.
+      g133Inject.before = g133Hook(
+        Effect.gen(function* () {
+          const other = yield* g133Client
+          yield* (other.entities.AccountsBare as any)
+            .update({ id: "hd" })
+            .set({ email: "hd3@x.io" })
+        }).pipe(Effect.provide(g133Layer(g133Tables.record))),
+      )
       yield* bare.delete({ id: "hd" })
-      expect(yield* sentinelExists("G133AccountBare", "hd2@x.io")).toBe(false)
-      expect(yield* sentinelExists("G133AccountBare", "hd@x.io")).toBe(false)
+      expect(yield* rawItem("G133AccountBare", "hd")).toBeUndefined()
+      for (const email of ["hd@x.io", "hd2@x.io", "hd3@x.io"]) {
+        expect(yield* sentinelExists("G133AccountBare", email)).toBe(false)
+      }
 
       // Versioned: the version + incarnation condition.
       const plain = db.entities.AccountsPlain as any
       yield* plain.put({ id: "hdv", email: "hdv@x.io", name: "n" })
       g133Inject.before = rawSetAttrs("G133AccountPlain", "hdv", { name: { S: "x" } }, true)
-      const versioned = yield* plain.delete({ id: "hdv" }).asEffect().pipe(Effect.flip)
+      const versioned = yield* plain
+        .delete({ id: "hdv" })
+        .condition({ attributeExists: "id" })
+        .asEffect()
+        .pipe(Effect.flip)
       expect(versioned._tag).toBe("OptimisticLockError")
       expect(yield* sentinelExists("G133AccountPlain", "hdv@x.io")).toBe(true)
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
@@ -15637,7 +15671,11 @@ describeConnected("#133 — path operations on index composites and unique field
               }).pipe(Effect.provide(g133Layer(g133Tables.record))),
             )
           : rawSetAttrs(entityType, id, { email: { S: `${entity}race2@x.io` } })
-        const error = yield* wide.delete({ id }).asEffect().pipe(Effect.flip)
+        const error = yield* wide
+          .delete({ id })
+          .condition({ attributeExists: "id" })
+          .asEffect()
+          .pipe(Effect.flip)
         expect(error._tag).toBe("ConcurrentModification")
         expect(error.attributes).toEqual([stamped ? "updatedAt" : "email"])
         expect(yield* rawItem(entityType, id)).toBeDefined()
@@ -16770,6 +16808,46 @@ describeConnected("#133 — path operations on index composites and unique field
         expect((yield* docs.primary({ id }).collect()).map((r: any) => r.label)).toEqual(["more"])
       }
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect(
+    "a retain hard delete with no condition is written again after a concurrent update",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        for (const [entity, entityType] of [
+          ["DevicesRetained", "G133DeviceRetained"],
+          ["AccountsRetained", "G133AccountRetained"],
+        ] as const) {
+          const docs = db.entities[entity] as any
+          const id = `hdr-${entity.toLowerCase()}`
+          const field = entity === "AccountsRetained" ? "name" : "label"
+          yield* docs.put(
+            entity === "AccountsRetained"
+              ? { id, email: `${id}@x.io`, name: "first" }
+              : { id, owner: "o", label: "first" },
+          )
+          // Another writer updates it between the delete's read and its write.
+          g133Inject.before = rawSetAttrs(entityType, id, { [field]: { S: "theirs" } }, true)
+          yield* docs.delete({ id })
+          expect(yield* rawItem(entityType, id)).toBeUndefined()
+          // The final state snapshotted is the one the concurrent write left.
+          expect((yield* snapshotOf(entityType, id, 2))?.[field]).toEqual({ S: "theirs" })
+          // With a `.condition()`, the race still fails.
+          yield* docs.put(
+            entity === "AccountsRetained"
+              ? { id, email: `${id}@x.io`, name: "again" }
+              : { id, owner: "o", label: "again" },
+          )
+          g133Inject.before = rawSetAttrs(entityType, id, { [field]: { S: "x" } }, true)
+          const refused = yield* docs
+            .delete({ id })
+            .condition({ attributeExists: "id" })
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(refused._tag).toBe("OptimisticLockError")
+        }
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
   it.effect("a stale writer cannot overwrite a hard-deleted and re-created retain item", () =>

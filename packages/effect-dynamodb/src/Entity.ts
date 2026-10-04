@@ -7091,250 +7091,273 @@ const makeImpl = <
               return releases
             })
 
-          if (isSoftDeleteEnabled()) {
-            // --- Soft delete path ---
-            // Read current item
-            const result = yield* client.getItem({
-              TableName: tableName,
-              Key: marshalledKey,
-              ConsistentRead: true,
-            })
-
-            if (!result.Item) {
-              return yield* Effect.fail(new ItemNotFound({ entityType, key: encodedKey }))
-            }
-            // The tombstone (and snapshot) copy the item read: the delete is
-            // conditioned on it being unchanged, so no concurrent update is lost
-            // into them (#133).
-            yield* checkVersion(result.Item, "delete")
-            const softGuard = deleteGuard(result.Item, "item", userCondition?.expression)
-            if (softGuard instanceof ValidationError) return yield* softGuard
-
-            const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
-            // Clock-backed time source; `now` is the ISO timestamp used for the
-            // deleted SK + deletedAt, `dtNow` drives the optional TTL + snapshot.
-            const dtNow = yield* DateTime.now
-            const now = nowIso(dtNow)
-
-            // Build soft-deleted item: same PK, replace SK with deleted key, strip GSI keys
-            const deletedItem: globalThis.Record<string, unknown> = { ...raw }
-
-            // Strip GSI key fields — soft-deleted items must not appear in index queries
-            for (const field of gsiKeyFields()) {
-              delete deletedItem[field]
-            }
-
-            // Vector attributes: stash the embedding under a non-indexed name
-            // before stripping. Sparse semantics drop the tombstone out of the
-            // vector index immediately, and `restore()` un-stashes without
-            // paying for another Embedder call. See `DESIGN.md §14`.
-            for (const [, definition] of vectorIndexEntries) {
-              const stored = deletedItem[definition.vectorField]
-              if (stored !== undefined) deletedItem[definition.stashField] = stored
-              delete deletedItem[definition.vectorField]
-              delete deletedItem[definition.partitionField]
-            }
-
-            // Replace SK with deleted sort key
-            deletedItem[primary.sk.field] = DynamoSchema.composeDeletedKey(
-              schema,
-              entityType,
-              now,
-              historyKeyOptions(primaryKey[primary.sk.field]),
-            )
-
-            // Add deletedAt
-            deletedItem.deletedAt = now
-
-            // Add optional TTL
-            const sdTtl = softDeleteTtl()
-            if (sdTtl) {
-              deletedItem[ttlAttrName] = DateTime.toEpochSeconds(dtNow) + normalizeTtlSeconds(sdTtl)
-            }
-
-            // Build transaction
-            type TransactItem = {
-              Put?: { TableName: string; Item: globalThis.Record<string, AttributeValue> }
-              Delete?: {
-                TableName: string
-                Key: globalThis.Record<string, AttributeValue>
-                ConditionExpression?: string
-                ExpressionAttributeNames?: globalThis.Record<string, string>
-                ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
-              }
-            }
-            const transactItems: Array<TransactItem> = []
-
-            // Delete current entity item — index 0, and the ONLY item in this
-            // transaction carrying a ConditionExpression, so a cancellation
-            // naming index 0 is unambiguously the user's condition. The guard
-            // rides the transaction rather than being pre-checked against the
-            // item read above: a client-side check would leave a race window
-            // between the read and the write.
-            const currentDelete: NonNullable<TransactItem["Delete"]> = {
-              TableName: tableName,
-              Key: marshalledKey,
-              ...guardedDeleteCondition(softGuard),
-            }
-            transactItems.push({ Delete: currentDelete })
-
-            // Put soft-deleted item
-            transactItems.push({
-              Put: {
-                TableName: tableName,
-                Item: toAttributeMap(deletedItem),
-              },
-            })
-
-            // Version snapshot if retain is enabled — never over existing history.
-            let snapshotAt: { readonly index: number; readonly version: number } | undefined
-            if (isRetainEnabled()) {
-              const currentVersion = systemFields.version
-                ? ((raw[systemFields.version] as number | undefined) ?? 0)
-                : 0
-              const snapshotItem = buildSnapshotItem(
-                raw,
-                currentVersion,
-                primary.pk.field,
-                primary.sk.field,
-                ttlAttrName,
-                dtNow,
-              )
-              snapshotAt = { index: transactItems.length, version: currentVersion }
-              transactItems.push({ Put: snapshotPut(tableName, snapshotItem) })
-            }
-
-            // Release sentinels if not preserving unique — only those this item
-            // owns (#133). Sparse — fields that were unset on the live item
-            // never had a sentinel, so nothing to release.
-            const releases =
-              hasUniqueConstraints && !preserveUnique()
-                ? yield* ownedReleases(tableName, raw, transactItems)
-                : []
-
-            yield* checkTransactionLimit(entityType, "delete", transactItems)
-            yield* guardedDelete(
-              client.transactWriteItems({ TransactItems: transactItems }),
-              result.Item,
-              softGuard.inputs,
-              snapshotAt,
-              releases,
-            )
-          } else if (hasUniqueConstraints || isRetainEnabled()) {
-            // --- Hard delete with unique constraints and/or retained history ---
-            // The item is read first: the sentinels to release are keyed by its
-            // unique values, and a retain entity snapshots its final state.
-            const result = yield* client.getItem({
-              TableName: tableName,
-              Key: marshalledKey,
-              ConsistentRead: true,
-            })
-
-            if (!result.Item) {
-              if (hasUniqueConstraints) {
-                return yield* Effect.fail(new ItemNotFound({ entityType, key: encodedKey }))
-              }
-              // Retain only: deleting a missing item writes nothing, as a plain
-              // `DeleteItem` would. The caller's condition is still judged
-              // against no item — and the delete never removes an item created
-              // since the read, which would leave its final state unsnapshotted.
-              if (!userCondition) return
-              const values = userCondition.values
-              yield* client
-                .deleteItem({
+          if (isSoftDeleteEnabled() || hasUniqueConstraints || isRetainEnabled()) {
+            const readFirst = Effect.gen(function* () {
+              if (isSoftDeleteEnabled()) {
+                // --- Soft delete path ---
+                // Read current item
+                const result = yield* client.getItem({
                   TableName: tableName,
                   Key: marshalledKey,
-                  ConditionExpression: `attribute_not_exists(#dpk) AND (${userCondition.expression})`,
-                  ExpressionAttributeNames: { ...userCondition.names, "#dpk": primary.pk.field },
-                  ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
-                  ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+                  ConsistentRead: true,
                 })
-                .pipe(
-                  Effect.mapError((err) =>
-                    isAwsConditionalCheckFailed(err.cause)
-                      ? conditionRejection(
-                          encodedKey as globalThis.Record<string, unknown>,
-                          err.cause.Item,
-                          err.cause.Item === undefined ? undefined : { version: 0 },
-                          true,
-                        )
-                      : err,
-                  ),
+
+                if (!result.Item) {
+                  return yield* Effect.fail(new ItemNotFound({ entityType, key: encodedKey }))
+                }
+                // The tombstone (and snapshot) copy the item read: the delete is
+                // conditioned on it being unchanged, so no concurrent update is lost
+                // into them (#133).
+                yield* checkVersion(result.Item, "delete")
+                const softGuard = deleteGuard(result.Item, "item", userCondition?.expression)
+                if (softGuard instanceof ValidationError) return yield* softGuard
+
+                const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
+                // Clock-backed time source; `now` is the ISO timestamp used for the
+                // deleted SK + deletedAt, `dtNow` drives the optional TTL + snapshot.
+                const dtNow = yield* DateTime.now
+                const now = nowIso(dtNow)
+
+                // Build soft-deleted item: same PK, replace SK with deleted key, strip GSI keys
+                const deletedItem: globalThis.Record<string, unknown> = { ...raw }
+
+                // Strip GSI key fields — soft-deleted items must not appear in index queries
+                for (const field of gsiKeyFields()) {
+                  delete deletedItem[field]
+                }
+
+                // Vector attributes: stash the embedding under a non-indexed name
+                // before stripping. Sparse semantics drop the tombstone out of the
+                // vector index immediately, and `restore()` un-stashes without
+                // paying for another Embedder call. See `DESIGN.md §14`.
+                for (const [, definition] of vectorIndexEntries) {
+                  const stored = deletedItem[definition.vectorField]
+                  if (stored !== undefined) deletedItem[definition.stashField] = stored
+                  delete deletedItem[definition.vectorField]
+                  delete deletedItem[definition.partitionField]
+                }
+
+                // Replace SK with deleted sort key
+                deletedItem[primary.sk.field] = DynamoSchema.composeDeletedKey(
+                  schema,
+                  entityType,
+                  now,
+                  historyKeyOptions(primaryKey[primary.sk.field]),
                 )
-              return
-            }
-            // The sentinel deletes are keyed by the unique values read, and the
-            // snapshot copies the item read: the delete is conditioned on it —
-            // its version and incarnation — so no sentinel is orphaned and no
-            // concurrent write is lost from the history (#133).
-            yield* checkVersion(result.Item, "delete")
-            const hardGuard = deleteGuard(
-              result.Item,
-              hasUniqueConstraints
-                ? [
-                    ...new Set(
-                      Object.values(config.unique!).flatMap((def) =>
-                        resolveUniqueFields(def).map(resolveDbName),
-                      ),
-                    ),
-                  ]
-                : [],
-              userCondition?.expression,
-            )
-            if (hardGuard instanceof ValidationError) return yield* hardGuard
 
-            const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
+                // Add deletedAt
+                deletedItem.deletedAt = now
 
-            const transactItems: Array<TransactWriteItem> = []
+                // Add optional TTL
+                const sdTtl = softDeleteTtl()
+                if (sdTtl) {
+                  deletedItem[ttlAttrName] =
+                    DateTime.toEpochSeconds(dtNow) + normalizeTtlSeconds(sdTtl)
+                }
 
-            // Delete entity item — index 0, and the only item conditioned on the
-            // item read (the sentinel Deletes are conditioned on ownership, the
-            // snapshot on history), so an index-0 cancellation is read from it.
-            transactItems.push({
-              Delete: {
-                TableName: tableName,
-                Key: marshalledKey,
-                ...guardedDeleteCondition(hardGuard),
-              },
-            })
+                // Build transaction
+                type TransactItem = {
+                  Put?: { TableName: string; Item: globalThis.Record<string, AttributeValue> }
+                  Delete?: {
+                    TableName: string
+                    Key: globalThis.Record<string, AttributeValue>
+                    ConditionExpression?: string
+                    ExpressionAttributeNames?: globalThis.Record<string, string>
+                    ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
+                  }
+                }
+                const transactItems: Array<TransactItem> = []
 
-            // Retain: the final state is history too. Snapshotted at its own
-            // version — under the same never-overwrite guard as every snapshot —
-            // so an item created again at this key continues PAST it, and a
-            // writer holding this version can never match the new incarnation.
-            let snapshotAt: { readonly index: number; readonly version: number } | undefined
-            if (isRetainEnabled()) {
-              const currentVersion = storedVersionOf(result.Item) ?? 0
-              snapshotAt = { index: transactItems.length, version: currentVersion }
-              transactItems.push({
-                Put: snapshotPut(
-                  tableName,
-                  buildSnapshotItem(
+                // Delete current entity item — index 0, and the ONLY item in this
+                // transaction carrying a ConditionExpression, so a cancellation
+                // naming index 0 is unambiguously the user's condition. The guard
+                // rides the transaction rather than being pre-checked against the
+                // item read above: a client-side check would leave a race window
+                // between the read and the write.
+                const currentDelete: NonNullable<TransactItem["Delete"]> = {
+                  TableName: tableName,
+                  Key: marshalledKey,
+                  ...guardedDeleteCondition(softGuard),
+                }
+                transactItems.push({ Delete: currentDelete })
+
+                // Put soft-deleted item
+                transactItems.push({
+                  Put: {
+                    TableName: tableName,
+                    Item: toAttributeMap(deletedItem),
+                  },
+                })
+
+                // Version snapshot if retain is enabled — never over existing history.
+                let snapshotAt: { readonly index: number; readonly version: number } | undefined
+                if (isRetainEnabled()) {
+                  const currentVersion = systemFields.version
+                    ? ((raw[systemFields.version] as number | undefined) ?? 0)
+                    : 0
+                  const snapshotItem = buildSnapshotItem(
                     raw,
                     currentVersion,
                     primary.pk.field,
                     primary.sk.field,
                     ttlAttrName,
-                    yield* DateTime.now,
-                  ),
-                ),
-              })
-            }
+                    dtNow,
+                  )
+                  snapshotAt = { index: transactItems.length, version: currentVersion }
+                  transactItems.push({ Put: snapshotPut(tableName, snapshotItem) })
+                }
 
-            // Release sentinels — only those this item owns (#133). Sparse: no
-            // sentinel was ever written for a constraint whose fields are unset.
-            const releases = hasUniqueConstraints
-              ? yield* ownedReleases(tableName, raw, transactItems)
-              : []
+                // Release sentinels if not preserving unique — only those this item
+                // owns (#133). Sparse — fields that were unset on the live item
+                // never had a sentinel, so nothing to release.
+                const releases =
+                  hasUniqueConstraints && !preserveUnique()
+                    ? yield* ownedReleases(tableName, raw, transactItems)
+                    : []
 
-            yield* checkTransactionLimit(entityType, "delete", transactItems)
-            yield* guardedDelete(
-              client.transactWriteItems({ TransactItems: transactItems }),
-              result.Item,
-              hardGuard.inputs,
-              snapshotAt,
-              releases,
-            )
+                yield* checkTransactionLimit(entityType, "delete", transactItems)
+                yield* guardedDelete(
+                  client.transactWriteItems({ TransactItems: transactItems }),
+                  result.Item,
+                  softGuard.inputs,
+                  snapshotAt,
+                  releases,
+                )
+              } else {
+                // --- Hard delete with unique constraints and/or retained history ---
+                // The item is read first: the sentinels to release are keyed by its
+                // unique values, and a retain entity snapshots its final state.
+                const result = yield* client.getItem({
+                  TableName: tableName,
+                  Key: marshalledKey,
+                  ConsistentRead: true,
+                })
+
+                if (!result.Item) {
+                  if (hasUniqueConstraints) {
+                    return yield* Effect.fail(new ItemNotFound({ entityType, key: encodedKey }))
+                  }
+                  // Retain only: deleting a missing item writes nothing, as a plain
+                  // `DeleteItem` would. The caller's condition is still judged
+                  // against no item — and the delete never removes an item created
+                  // since the read, which would leave its final state unsnapshotted.
+                  if (!userCondition) return
+                  const values = userCondition.values
+                  yield* client
+                    .deleteItem({
+                      TableName: tableName,
+                      Key: marshalledKey,
+                      ConditionExpression: `attribute_not_exists(#dpk) AND (${userCondition.expression})`,
+                      ExpressionAttributeNames: {
+                        ...userCondition.names,
+                        "#dpk": primary.pk.field,
+                      },
+                      ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
+                      ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+                    })
+                    .pipe(
+                      Effect.mapError((err) =>
+                        isAwsConditionalCheckFailed(err.cause)
+                          ? conditionRejection(
+                              encodedKey as globalThis.Record<string, unknown>,
+                              err.cause.Item,
+                              err.cause.Item === undefined ? undefined : { version: 0 },
+                              true,
+                            )
+                          : err,
+                      ),
+                    )
+                  return
+                }
+                // The sentinel deletes are keyed by the unique values read, and the
+                // snapshot copies the item read: the delete is conditioned on it —
+                // its version and incarnation — so no sentinel is orphaned and no
+                // concurrent write is lost from the history (#133).
+                yield* checkVersion(result.Item, "delete")
+                const hardGuard = deleteGuard(
+                  result.Item,
+                  hasUniqueConstraints
+                    ? [
+                        ...new Set(
+                          Object.values(config.unique!).flatMap((def) =>
+                            resolveUniqueFields(def).map(resolveDbName),
+                          ),
+                        ),
+                      ]
+                    : [],
+                  userCondition?.expression,
+                )
+                if (hardGuard instanceof ValidationError) return yield* hardGuard
+
+                const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
+
+                const transactItems: Array<TransactWriteItem> = []
+
+                // Delete entity item — index 0, and the only item conditioned on the
+                // item read (the sentinel Deletes are conditioned on ownership, the
+                // snapshot on history), so an index-0 cancellation is read from it.
+                transactItems.push({
+                  Delete: {
+                    TableName: tableName,
+                    Key: marshalledKey,
+                    ...guardedDeleteCondition(hardGuard),
+                  },
+                })
+
+                // Retain: the final state is history too. Snapshotted at its own
+                // version — under the same never-overwrite guard as every snapshot —
+                // so an item created again at this key continues PAST it, and a
+                // writer holding this version can never match the new incarnation.
+                let snapshotAt: { readonly index: number; readonly version: number } | undefined
+                if (isRetainEnabled()) {
+                  const currentVersion = storedVersionOf(result.Item) ?? 0
+                  snapshotAt = { index: transactItems.length, version: currentVersion }
+                  transactItems.push({
+                    Put: snapshotPut(
+                      tableName,
+                      buildSnapshotItem(
+                        raw,
+                        currentVersion,
+                        primary.pk.field,
+                        primary.sk.field,
+                        ttlAttrName,
+                        yield* DateTime.now,
+                      ),
+                    ),
+                  })
+                }
+
+                // Release sentinels — only those this item owns (#133). Sparse: no
+                // sentinel was ever written for a constraint whose fields are unset.
+                const releases = hasUniqueConstraints
+                  ? yield* ownedReleases(tableName, raw, transactItems)
+                  : []
+
+                yield* checkTransactionLimit(entityType, "delete", transactItems)
+                yield* guardedDelete(
+                  client.transactWriteItems({ TransactItems: transactItems }),
+                  result.Item,
+                  hardGuard.inputs,
+                  snapshotAt,
+                  releases,
+                )
+              }
+            })
+            // The caller asserted nothing about the item, so a concurrent write
+            // between the read and the transaction — a changed item, or a
+            // sentinel release that changed hands — is not a refusal: the
+            // delete reads the item again and is written again, as a put is.
+            // With a `.condition()` the read is what the condition was judged
+            // against, and a race fails.
+            yield* userCondition === undefined
+              ? readFirst.pipe(
+                  Effect.retry({
+                    times: GUARDED_PUT_ATTEMPTS - 1,
+                    while: (e) =>
+                      e instanceof OptimisticLockError || e instanceof ConcurrentModification,
+                  }),
+                )
+              : readFirst
           } else {
             // Simple delete
             const deleteInput: DeleteItemCommandInput = {
