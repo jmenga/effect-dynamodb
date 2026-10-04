@@ -526,3 +526,36 @@ describe("substituteSchemaDeep — zoned zones and nested unions (#133)", () => 
     }),
   )
 })
+
+describe("substituteSchemaDeep — enforceChecks keeps rebuilt container checks (#133)", () => {
+  const MS = 946684800000
+  const a = DateTime.makeUnsafe(MS)
+  const b = DateTime.makeUnsafe(MS + 1000)
+  const ordered = Schema.makeFilter(
+    (v: { readonly from: DateTime.Utc; readonly to: DateTime.Utc }) =>
+      DateTime.toEpochMillis(v.from) <= DateTime.toEpochMillis(v.to) || "ordered",
+  )
+  class Span extends Schema.Class<Span>("EnforcedSpan")(
+    Schema.Struct({ from: Schema.DateTimeUtc, to: Schema.DateTimeUtc }).check(ordered),
+  ) {}
+  const cases: ReadonlyArray<readonly [string, Schema.Top, unknown]> = [
+    ["Array", Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(1)), [a, b]],
+    [
+      "Struct",
+      Schema.Struct({ from: Schema.DateTimeUtc, to: Schema.DateTimeUtc }).check(ordered),
+      { from: b, to: a },
+    ],
+    ["Class over a checked Struct", Span, { from: b, to: a }],
+  ]
+  for (const [label, schema, invalid] of cases) {
+    it.effect(`${label}: enforced for writes, not for reads`, () =>
+      Effect.gen(function* () {
+        const write = substituteSchemaDeep(schema, { enforceChecks: true }) as Schema.Codec<any>
+        const rejected = yield* Effect.flip(Schema.decodeUnknownEffect(write)(invalid))
+        expect(rejected._tag).toBe("SchemaError")
+        const read = substituteSchemaDeep(schema) as Schema.Codec<any>
+        yield* Schema.decodeUnknownEffect(read)(invalid)
+      }),
+    )
+  }
+})

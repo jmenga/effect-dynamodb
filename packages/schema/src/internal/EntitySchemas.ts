@@ -1024,6 +1024,13 @@ const isClassSchema = (schema: Schema.Top): boolean =>
   schemaFieldsOf(schema) !== undefined &&
   (schema.ast as { readonly _tag?: string })._tag === "Declaration"
 
+/** The Struct AST a class decodes from — the last link of its encoding chain. */
+const classStructAst = (schema: Schema.Top): SchemaAST.AST | undefined => {
+  const encoding = schema.ast.encoding
+  const last = encoding === undefined ? undefined : encoding[encoding.length - 1]
+  return last !== undefined && SchemaAST.isObjects(last.to) ? last.to : undefined
+}
+
 /** True when the schema is `Schema.Array(...)` (AST tag `Arrays`). */
 const isArraySchema = (schema: Schema.Top): boolean =>
   (schema.ast as { readonly _tag?: string })._tag === "Arrays"
@@ -1153,6 +1160,14 @@ export interface DeepSubstitutionOptions {
   readonly dateEncodingOverride?: DynamoEncoding | undefined
   /** The field path being substituted, for error messages. */
   readonly path?: ReadonlyArray<string> | undefined
+  /**
+   * WRITE schemas only (#133): keep the `.check()` refinements of the Arrays,
+   * Structs and class Structs the substitution rebuilds. Rebuilding them with a
+   * plain constructor dropped those checks, so a write breaking them was
+   * accepted. Read schemas leave this off: a row written while the check was
+   * not enforced must stay readable. Propagated through the recursion.
+   */
+  readonly enforceChecks?: boolean | undefined
 }
 
 /** The options a nested schema inherits: everything but the per-position ones. */
@@ -1161,13 +1176,15 @@ const descend = (opts: DeepSubstitutionOptions | undefined): DeepSubstitutionOpt
   opts?.resolveRef ||
   opts?.strictWireKind ||
   opts?.legacyReads ||
-  opts?.path
+  opts?.path ||
+  opts?.enforceChecks
     ? {
         ...(opts?.tolerantTransforms ? { tolerantTransforms: true } : {}),
         ...(opts?.resolveRef ? { resolveRef: opts.resolveRef } : {}),
         ...(opts?.strictWireKind ? { strictWireKind: true } : {}),
         ...(opts?.legacyReads ? { legacyReads: true } : {}),
         ...(opts?.path ? { path: opts.path } : {}),
+        ...(opts?.enforceChecks ? { enforceChecks: true } : {}),
       }
     : undefined
 
@@ -1214,8 +1231,12 @@ const walkedContainer = (schema: Schema.Top): WalkedContainer | undefined => {
  * fresh node without them, so a `.check(Schema.isMaxProperties(1))` on the
  * original was silently dropped and an invalid value accepted (#133).
  */
-const withMetadataOf = (original: Schema.Top, rebuilt: Schema.Top): Schema.Top => {
-  const from = original.ast as SchemaAST.AST & { readonly encodingChecks?: unknown }
+const withMetadataOf = (original: Schema.Top, rebuilt: Schema.Top): Schema.Top =>
+  withAstMetadataOf(original.ast, rebuilt)
+
+/** `withMetadataOf`, taking the metadata from an AST node. */
+const withAstMetadataOf = (source: SchemaAST.AST, rebuilt: Schema.Top): Schema.Top => {
+  const from = source as SchemaAST.AST & { readonly encodingChecks?: unknown }
   const to = rebuilt.ast as SchemaAST.AST & { readonly encodingChecks?: unknown }
   if (
     to.annotations === from.annotations &&
@@ -1592,9 +1613,10 @@ export const substituteSchemaDeep = (
   if (isArraySchema(schema)) {
     const element = arrayElementOf(schema)
     if (element === undefined) return schema
-    return Schema.Array(
+    const rebuilt = Schema.Array(
       substituteSchemaDeep(element, deeper) as Schema.Codec<any>,
     ) as unknown as Schema.Top
+    return opts?.enforceChecks ? withMetadataOf(schema, rebuilt) : rebuilt
   }
 
   // Struct / Class: substitute each field, recursing into nested structures.
@@ -1619,8 +1641,16 @@ export const substituteSchemaDeep = (
         subFields[name] = substituteSchemaDeep(field, atField(deeper, opts, name))
       }
     }
-    const subStruct = Schema.Struct(subFields as Schema.Struct.Fields)
-    if (!isClassSchema(schema)) return subStruct as unknown as Schema.Top
+    const plainStruct = Schema.Struct(subFields as Schema.Struct.Fields) as unknown as Schema.Top
+    if (!isClassSchema(schema)) {
+      return opts?.enforceChecks ? withMetadataOf(schema, plainStruct) : plainStruct
+    }
+    // A class built over a checked Struct (`Schema.Class("C")(Struct(…).check(f))`)
+    // keeps that check on the Struct its encoding leads to.
+    const classStruct = classStructAst(schema)
+    const subStruct = (opts?.enforceChecks && classStruct !== undefined
+      ? withAstMetadataOf(classStruct, plainStruct)
+      : plainStruct) as unknown as Schema.Struct<Schema.Struct.Fields>
     // Preserve the class instance: decode the substituted struct to the original
     // class via prototype attach (no constructor re-validation, no field re-decode).
     const ctor = schema as unknown as new (input: unknown) => unknown
@@ -1671,12 +1701,15 @@ export const substituteSchemas = (
   options?: {
     /** Build READ schemas: see `DeepSubstitutionOptions.legacyReads`. */
     readonly legacyReads?: boolean | undefined
+    /** Build WRITE schemas: see `DeepSubstitutionOptions.enforceChecks`. */
+    readonly enforceChecks?: boolean | undefined
   },
 ): SchemaFields => {
   const out: SchemaFields = {}
-  const deep: DeepSubstitutionOptions | undefined = options?.legacyReads
-    ? { legacyReads: true }
-    : undefined
+  const deep: DeepSubstitutionOptions = {
+    ...(options?.legacyReads ? { legacyReads: true } : {}),
+    ...(options?.enforceChecks ? { enforceChecks: true } : {}),
+  }
   for (const [name, schema] of Object.entries(modelFields)) {
     // 1. Self-date substitution. Pattern A: user declared `Schema.DateTimeUtc`
     //    and chose a wire format via annotation. We substitute with the
@@ -1827,6 +1860,12 @@ const transformWireKind = (schema: Schema.Top): "string" | "number" | undefined 
 export interface DerivedSchemas {
   /** Pure model fields schema (substituted — used for both validation and decode) */
   readonly modelSchema: Schema.Codec<any>
+  /**
+   * The model fields as WRITES encode them: container checks enforced, no
+   * read leniency (#133). Path-based update values are encoded and validated
+   * through it.
+   */
+  readonly writeModelSchema: Schema.Codec<any>
   /** Model + system fields schema */
   readonly recordSchema: Schema.Codec<any>
   /**
@@ -1882,7 +1921,9 @@ export const buildDerivedSchemas = (
   // fields are replaced with a custom bidirectional transform so encoding
   // round-trips. All other transform schemas are passed through — the user's
   // transform IS the wire format and we never override it.
-  const fields = substituteSchemas(modelFields, fieldEncodings)
+  // WRITE schemas (input / create / update / key) enforce the container checks
+  // the substitution rebuilds; the READ schemas below do not (#133).
+  const fields = substituteSchemas(modelFields, fieldEncodings, { enforceChecks: true })
   // READ schemas (model / record / item / deleted / history decode) also take
   // the domain-form values earlier releases left on transform fields (#133).
   // Their encode is the strict one, and keys are composed from `inputSchema`,
@@ -1901,7 +1942,7 @@ export const buildDerivedSchemas = (
     const resolved = isConfiguredModel(targetModel)
       ? ((targetModel as ConfiguredModel<Schema.Top, any>).model as Schema.Top)
       : targetModel
-    fields[ref.fieldName] = substituteSchemaDeep(resolved)
+    fields[ref.fieldName] = substituteSchemaDeep(resolved, { enforceChecks: true })
     readFields[ref.fieldName] = substituteSchemaDeep(resolved, { legacyReads: true })
   }
 
@@ -2111,7 +2152,7 @@ export const buildDerivedSchemas = (
         // Compute encodings for the appendInput fields (annotation +
         // inferred from typeConstructor for self schemas).
         const appendEncodings = buildFieldEncodings(userFields, {})
-        const subbedFields = substituteSchemas(userFields, appendEncodings)
+        const subbedFields = substituteSchemas(userFields, appendEncodings, { enforceChecks: true })
         return Schema.Struct(subbedFields as Schema.Struct.Fields) as unknown as Schema.Top
       })()
     : null
@@ -2131,6 +2172,7 @@ export const buildDerivedSchemas = (
   type S = Schema.Codec<any>
   return {
     modelSchema: modelVisibleSchema as unknown as S,
+    writeModelSchema: Schema.Struct(fields) as unknown as S,
     recordSchema: recordVisibleSchema as unknown as S,
     inputSchema: inputSchema as unknown as S,
     createSchema: createSchema as unknown as S,
@@ -2160,6 +2202,17 @@ const childAtSegment = (schema: Schema.Top, segment: string | number): Schema.To
   const s = inner as unknown as globalThis.Record<string, unknown>
   const fields = schemaFieldsOf(inner)
   if (fields !== undefined) return typeof segment === "string" ? fields[segment] : undefined
+  // An OPAQUE class — `Author.pipe(DynamoModel.ref)` or `Author.check(…)`, whose
+  // `.fields` the annotation dropped — still decodes from a Struct: recover the
+  // field from that Struct's property signatures (#133).
+  if (SchemaAST.isDeclaration(inner.ast)) {
+    const struct = classStructAst(inner)
+    if (struct === undefined || !SchemaAST.isObjects(struct) || typeof segment !== "string") {
+      return undefined
+    }
+    const property = struct.propertySignatures.find((ps) => ps.name === segment)
+    return property === undefined ? undefined : Schema.make<Schema.Top>(property.type)
+  }
   if (SchemaAST.isUnion(inner.ast)) {
     // `NullOr(Stamp)` and friends: the first member the segment resolves in.
     const members = Array.isArray(s.members) ? (s.members as ReadonlyArray<Schema.Top>) : []
@@ -2198,7 +2251,10 @@ const listElementOf = (schema: Schema.Top): Schema.Top | undefined => {
   const inner = optionalField(schema)?.inner ?? schema
   if (!SchemaAST.isArrays(inner.ast)) return undefined
   const value = (inner as unknown as { readonly value?: unknown }).value
-  return isSchemaLike(value) ? value : undefined
+  if (isSchemaLike(value)) return value
+  // A rebuilt array with its checks restored has no runtime `.value`; a plain
+  // list (no fixed elements) still has its element in the AST's rest.
+  return inner.ast.elements.length === 0 ? arrayElementOf(inner) : undefined
 }
 
 /** Structural equality over plain values (primitives, arrays, plain objects). */
@@ -2275,11 +2331,26 @@ const isWalkableObject = (value: unknown): value is object =>
  */
 export const makePathValueEncoder = (
   modelFields: SchemaFields,
-  recordFields: SchemaFields,
+  writeFields: SchemaFields,
+  /**
+   * The model each `DynamoModel.ref` field is denormalised from, keyed by
+   * field name. A ref field's own schema is opaque (the annotation drops its
+   * `.fields`), so a path under it is followed through the target model.
+   */
+  refTargets: globalThis.Record<string, Schema.Top> = {},
 ): {
   readonly value: (segments: ReadonlyArray<string | number>, value: unknown) => unknown
   readonly elements: (segments: ReadonlyArray<string | number>, value: unknown) => unknown
+  /**
+   * The issue an ENCODED path value raises under the write schema at its path
+   * — a broken container check, or a value no form of which is valid — or
+   * `undefined` when it is valid, or when the path has no schema to check.
+   */
+  readonly validate: (segments: ReadonlyArray<string | number>, encoded: unknown) => unknown
+  /** `validate` for each element of a list value (append / prepend). */
+  readonly validateElements: (segments: ReadonlyArray<string | number>, encoded: unknown) => unknown
 } => {
+  const recordFields = writeFields
   const cache = new Map<string, ((value: unknown) => unknown) | null>()
   const encoderFor = (
     key: string,
@@ -2368,7 +2439,7 @@ export const makePathValueEncoder = (
   const partEncoder = (schema: Schema.Top): ((value: unknown) => unknown) => {
     const cached = partEncoders.get(schema)
     if (cached !== undefined) return cached
-    const fn = leafAwareEncoder(schema, substituteSchemaDeep(schema))
+    const fn = leafAwareEncoder(schema, substituteSchemaDeep(schema, { enforceChecks: true }))
     partEncoders.set(schema, fn)
     return fn
   }
@@ -2403,7 +2474,7 @@ export const makePathValueEncoder = (
   const originalAt = (segments: ReadonlyArray<string | number>): Schema.Top | undefined => {
     const [head, ...rest] = segments
     if (typeof head !== "string") return undefined
-    let current: Schema.Top | undefined = modelFields[head]
+    let current: Schema.Top | undefined = refTargets[head] ?? modelFields[head]
     for (const segment of rest) {
       if (current === undefined) return undefined
       current = childAtSegment(current, segment)
@@ -2414,10 +2485,51 @@ export const makePathValueEncoder = (
     const original = originalAt(segments)
     if (original === undefined) return undefined
     const head = segments[0] as string
-    const stored = segments.length === 1 ? recordFields[head] : substituteSchemaDeep(original)
+    const stored =
+      segments.length === 1
+        ? recordFields[head]
+        : substituteSchemaDeep(original, { enforceChecks: true })
     return stored === undefined ? undefined : { original, stored }
   }
+  const validators = new Map<string, ((encoded: unknown) => unknown) | null>()
+  const validatorFor = (
+    key: string,
+    resolve: () => Schema.Top | undefined,
+  ): ((encoded: unknown) => unknown) | null => {
+    const cached = validators.get(key)
+    if (cached !== undefined) return cached
+    const schema = resolve()
+    const fn =
+      schema === undefined
+        ? null
+        : (() => {
+            const decode = Schema.decodeUnknownExit(schema as Schema.Codec<any>)
+            return (encoded: unknown): unknown => {
+              const exit = decode(encoded)
+              return exit._tag === "Success" ? undefined : exit.cause
+            }
+          })()
+    validators.set(key, fn)
+    return fn
+  }
   return {
+    validate: (segments, encoded) => {
+      const fn = validatorFor(`v:${JSON.stringify(segments)}`, () => schemaAt(segments)?.stored)
+      return fn === null ? undefined : fn(encoded)
+    },
+    validateElements: (segments, encoded) => {
+      if (!Array.isArray(encoded)) return undefined
+      const fn = validatorFor(`e:${JSON.stringify(segments)}`, () => {
+        const list = schemaAt(segments)
+        return list === undefined ? undefined : listElementOf(list.stored)
+      })
+      if (fn === null) return undefined
+      for (const entry of encoded) {
+        const issue = fn(entry)
+        if (issue !== undefined) return issue
+      }
+      return undefined
+    },
     value: (segments, value) => {
       const fn = encoderFor(`v:${JSON.stringify(segments)}`, () => schemaAt(segments))
       return fn === null ? value : fn(value)
