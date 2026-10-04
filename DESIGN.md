@@ -1396,6 +1396,10 @@ class Order extends Schema.Class<Order>("Order")({
 | `DateEpochSeconds` | Epoch seconds number | Epoch seconds number |
 | `DateTimeZoned` | UTC ISO string (normalized) | Extended ISO with zone |
 
+The extended ISO form round-trips the zone: a named zone as `…+09:00[Asia/Tokyo]`,
+an offset zone as `…+05:00` (rebuilt with that offset since #133; earlier
+versions read it back as UTC).
+
 ### Domain Model Purity
 
 The library supports two patterns for where storage configuration lives:
@@ -1472,9 +1476,50 @@ and `Redacted` leaves are substituted, so a transform (Pattern B) inside a
 container keeps owning its wire form. A `TupleWithRest` is now derived as a
 tuple; it was previously treated as an array.
 
-Date leaves inside a `Union` use the `strictWireKind` date transform (see §11
-Attribute Encoding), which also rebuilds legacy maps, so rows written before
-#133 read back as real `DateTime`s. Key composition is unchanged for every
+Date leaves inside a `Union` follow the union rules below, and also rebuild
+legacy maps, so rows written before #133 read back as real `DateTime`s.
+
+**Union rules (#133).** Every member of a union learns which primitive kinds
+the *other* members are stored as (`memberWireKinds`), including, for a union
+nested in another (`Union([NullOr(DateTimeUtc), String])`), the outer union's
+other members. A self-date member then:
+
+- accepts only its own wire kind, its own domain, or a legacy map
+  (`strictWireKind`), so it never claims a value of another kind;
+- when its storage kind **collides** with another member's (ISO storage next to
+  a `String`), accepts only the exact canonical string `toWirePrimitive` writes
+  (`canonicalOnly`), and is decoded **first** whatever the declared order. So
+  `"2000-01-01T00:00:00.000Z"` in `Union([DateTimeUtc, String])` reads back as a
+  `DateTime`, while `"2020"`, `"5"` and `"hello"` stay strings. A string field
+  that may legitimately hold canonical ISO instants needs a tagged or
+  discriminated shape;
+- when it is stored as an epoch number next to a member also stored as a number
+  (`Number`, a number literal, `BigInt`, another epoch date), cannot be told
+  apart from it at all: rejected at `make()` with **EDD-9058**. There is no
+  fallback to ISO storage. `NumberFromString` is stored as a string and does not
+  collide.
+
+A transform date member (`DateTimeUtcFromString`) keeps the transform's own
+decode inside a union, since the generic date transform accepts more than the
+user's transform. A `DynamoModel.configure(..., { f: { storedAs } })` override
+on a top-level union field applies to the union's single self-date member; with
+several date members it is rejected with **EDD-9057**.
+
+**Legacy reads on entities.** Entity READ schemas (model, record, item,
+deleted, history) are built with `legacyReads`: a transform field also accepts
+the domain-form value older path updates wrote (a `number` on a
+`NumberFromString`, a safe-integer `number` or `bigint` on a `BigIntFromString`,
+a marshalled map on a date transform), and a plain `Schema.BigInt` lifts the
+unmarshalled `number` back to `bigint`. Never inside a union, where a lenient
+member could claim another member's value. Write schemas and keys use the
+strict schemas, so nothing written changes.
+
+**Zoned offsets.** A `DateTimeZoned` stored as `…+05:00` (an offset zone, no
+bracket) is rebuilt with that offset; before #133 it was rebuilt as UTC. Named
+zones (`…[Europe/London]`) and UTC round-trip as before, and the stored form is
+unchanged.
+
+Key composition is unchanged for every
 existing shape (primary, GSI, unique, version, soft-delete, time-series keys);
 `Entity.nestedSelfDates.test.ts` snapshots the key attributes written.
 
@@ -1660,9 +1705,18 @@ value as given: a `DateTime` became a map even on a plain date field, and a
 the schema the path addresses (`childAtSegment` through struct fields, union
 members, array / tuple elements and record values; a top-level field uses the
 record schema's own, so `storedAs` applies) and encodes the value through it;
-list operations encode element by element. A value that does not encode, or a
-path the schema cannot follow (an opaque `DynamoModel.ref`), is passed through
-as before. `ADD`, `DELETE` and `SUBTRACT` are unchanged.
+list operations encode element by element. Values go through `encode`, then
+`decode → encode` as `.set()` does, so a plain object on a class-typed field is
+encoded as that class and a `Schema.Trim` field stores its trimmed form. A
+class, struct, record, tuple or union value is always encoded, so `Redacted`,
+`Date` and `DateTime` leaves inside it keep their wire form. The one
+pass-through for a value already in wire form is a LEAF transform with a
+primitive wire form whose wire value is also a valid domain value
+(`StringFromBase64` given `"aGk="`, `fromJsonString`), and arrays of such leaves
+element by element (`makeAmbiguityCheck`): encoding those would double-encode.
+A value that does not encode at all, or a path the schema cannot follow (an
+opaque `DynamoModel.ref`), is passed through as before. `ADD`, `DELETE` and
+`SUBTRACT` are unchanged.
 
 **Why hard-break over dual.** Carrying both the variadic overload and the fluent builder would double the surface area of `BoundEntity`, degrade hover tooltips, and force contributors to remember two shapes. The read side settled on builders for the same reasons. The change is batched into the next major alongside other breaking changes.
 
@@ -1969,7 +2023,7 @@ becomes `{M:{}}`, and a `bigint` becomes `{N:"5"}`.
 | **One encoder per field** | A `storedAs` annotation or inferred date default wins, except for a union mixing a date with a non-date member (`Union([DateTimeUtcFromString, Number])`, `isMixedDateUnion`), whose non-date values a date encoder would throw on. Otherwise the field is encoded through the same substituted, tolerant schema the read path decodes it with (`substituteSchemaDeep` + the aggregate's ref resolver), falling back to the field's own `encode`, then `decode → encode`. |
 | **Which schema** | The schema the decomposed value actually has: the root model's fields for the root, a `one` edge's entity model (or the model field's own class when the edge has no entity), the array **element** for a `many` edge (`PlayerSheet`, not `Player`), a sub-aggregate's own schema for its root item. Encoders are keyed by the element's field names, so a custom `decompose` that **renames** fields escapes them: the renamed values are stored in domain form (a `DateTime` as a map). This is a known limitation; the read path still lifts those maps. |
 | **Per attribute, not per aggregate** | The aggregate is never encoded as a whole before decomposition: key composition needs Type-side values (`numericTypeWithStringEncoding`). |
-| **Union members** | Under `tolerantTransforms`, `substituteSchemaDeep` walks `Union`, `Record`, `Tuple`, `TupleWithRest` and `StructWithRest` (`tolerantContainer`), rebuilding each container kind around substituted children. Date leaves inside a union get a `strictWireKind` transform that accepts only its own wire kind, its own domain or a legacy map of it, so a date member cannot claim a value that belongs to a later member (a stored `5` stays a number). The same walk runs for entity derivation (no options), where only self-date and `Redacted` leaves are substituted. Rebuilt containers keep the original node's annotations and `.check()` refinements (`withMetadataOf`). |
+| **Union members** | `substituteSchemaDeep` walks `Union`, `Record`, `Tuple`, `TupleWithRest` and `StructWithRest` in every mode (`walkedContainer`), rebuilding each container kind around substituted children with the original node's annotations and `.check()` refinements (`withMetadataOf`). Under `tolerantTransforms` (aggregates) every transformed leaf is substituted; for entity derivation only self-date and `Redacted` leaves are. Union members follow the union rules in §8 (Self dates nested in containers): a self date accepts only its own wire kind, its domain or a legacy map; on a storage-kind collision only its exact canonical form, decoded first; an epoch date next to a numeric member is rejected (**EDD-9058**). The collision set propagates into nested unions. A transform date member keeps its own decode, so a stored `5` in `Union([DateTimeUtcFromString, Number])` stays a number. |
 | **Keys unchanged** | A `many` edge's `sk.composite` and the root's list-index composites are read from a second encoder set (`buildKeyAttrEncoders`) that keeps the pre-#133 top-level-only behaviour. Composed keys are therefore byte-identical to earlier versions; only stored attribute values gained the deeper encoding. |
 
 **Ref resolution.** `DynamoModel.ref` annotates with `Schema.annotate`, which
@@ -2792,7 +2846,10 @@ for unrelated errors and the collision was caught only at review.
 
 | `EDD-9056` | `Aggregate.ts` | A nested sub-aggregate binding declares a discriminator attribute it already inherits from an enclosing binding — the inner value would overwrite the outer one on the inner rows, so the parent's bindings could no longer be told apart. Use a distinct attribute name (e.g. `{ squadNo: 1 }` inside `{ clubNo: 1 }`) |
 
-Next free code: **`EDD-9057`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+| `EDD-9057` | `internal/EntitySchemas.ts` | A `DynamoModel.configure` `storedAs` override on a union field with more than one self-date member — the override cannot say which member it applies to. Annotate the intended member with `.pipe(DynamoModel.storedAs(...))` instead |
+| `EDD-9058` | `internal/EntitySchemas.ts` | A union's self-date member is stored as an epoch number next to a member also stored as a number (`Number`, a number literal, `BigInt`, another epoch date) — a stored number could belong to either, so it cannot be read back reliably. Store the date as a string, or remove the numeric member |
+
+Next free code: **`EDD-9059`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 

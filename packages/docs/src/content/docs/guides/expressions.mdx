@@ -317,12 +317,21 @@ For nested attributes, array elements, and attribute-to-attribute operations, us
 
 #### Values are encoded through the schema at the path
 
-`pathSet`, `pathAppend`, `pathPrepend`, `pathIfNotExists` and the record-based `append` encode their value through the model schema at the path they address, the same way `set` does. A `DateTime` set at `["days", 0]` is stored as its ISO string (or as a number under `storedAs`), and a `Schema.NumberFromString` value is stored as a string. Appended and prepended lists are encoded element by element. A value that is already in its wire form is stored as given.
+`pathSet`, `pathAppend`, `pathPrepend`, `pathIfNotExists` and the record-based `append` encode their value through the model schema at the path they address, the same way `set` does:
+
+- A `DateTime` set at `["days", 0]` is stored as its ISO string, or as a number under `storedAs`.
+- A `Schema.NumberFromString` value is stored as a string.
+- A `Schema.Trim` field stores its trimmed form.
+- A plain object set on a class-typed field is encoded as that class.
+- A class, struct, record, tuple or union value is always encoded as a whole, so the `DateTime`, `Date` and `Redacted` values inside it keep their wire form.
+- Appended and prepended lists are encoded element by element.
+
+One kind of value is stored as given: a value already in the wire form of a leaf transform whose wire form is a primitive, such as a base64 string on a `Schema.StringFromBase64` field or a JSON string on a `Schema.fromJsonString` field. Such a value is also a valid domain value, so encoding it again would double-encode it. Arrays of these leaves are checked element by element.
 
 `ADD`, `DELETE` and `SUBTRACT` are unchanged. A path the model schema cannot follow, such as one into a `DynamoModel.ref` field, still writes the value as given.
 
 :::note[Upgrading from 1.22.0 or earlier]
-Earlier versions wrote path and `append` values unencoded: a `DateTime` became a marshalled map even on a plain date field, and a `NumberFromString` value was stored as a number. A map on a self date field (`Schema.DateTimeUtc`) reads back as a real `DateTime`. A value on a transform field (`Schema.NumberFromString`, `Schema.DateTimeUtcFromString`) never decoded and still fails with a `ValidationError`, so rewrite those attributes with `set`. Until old values are rewritten, a filter on the attribute can match old and new items differently, and DynamoDB Streams consumers see the type change.
+Earlier versions wrote path and `append` values unencoded: a `DateTime` became a marshalled map even on a plain date field, and a `NumberFromString` value was stored as a number. Those values now read back. A map is rebuilt into a real `DateTime`, a number on a `NumberFromString` field reads as that number, and a safe-integer number on a `BigIntFromString` field reads as a `bigint`. Until old values are rewritten, a filter on the attribute can match old and new items differently, and DynamoDB Streams consumers see the type change.
 :::
 
 ---

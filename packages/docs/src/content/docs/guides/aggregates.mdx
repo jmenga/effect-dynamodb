@@ -441,7 +441,9 @@ Aggregate items store their values in their schema's **wire form**, the same for
 - a field of a ref hydrated into a `one` or `many` item (`player.dateOfBirth` on a `MatchPlayer` item), at the root or inside a sub-aggregate
 - a field of a `one` or `many` edge declared without an `entity`
 
-Other transforms follow the same rule. A `Schema.BigIntFromString` or `Schema.NumberFromString` is stored as a string, and self date schemas such as `Schema.DateTimeUtc` and `Schema.Date` default to an ISO string. In a union that mixes a date with another type (`Schema.Union([Schema.DateTimeUtcFromString, Schema.Number])`), each value is stored by the member it belongs to, so a `5` stays a number. On read, each value is decoded back to its domain type, so the assembled aggregate holds real `DateTime` instances.
+Other transforms follow the same rule. A `Schema.BigIntFromString` or `Schema.NumberFromString` is stored as a string, and self date schemas such as `Schema.DateTimeUtc` and `Schema.Date` default to an ISO string. In a union that mixes a date with another type (`Schema.Union([Schema.DateTimeUtcFromString, Schema.Number])`), each value is stored by the member it belongs to, so a `5` stays a number. A plain `Schema.BigInt` is stored as a number and reads back as a `bigint`. On read, each value is decoded back to its domain type, so the assembled aggregate holds real `DateTime` instances, and a zoned date keeps its named or offset zone.
+
+Self dates in unions follow the entity rules in [Dates in unions](/effect-dynamodb/guides/modeling/#dates-in-unions). A date next to a string member claims only its canonical ISO string, so a string member holding exactly such an instant reads back as a `DateTime`. An epoch-stored date next to a numeric member is rejected by `Aggregate.make` with `EDD-9058`.
 
 A ref in a `many` edge can be declared in any of these ways, and all of them round-trip through `create`, `get` and `update`:
 
@@ -459,11 +461,17 @@ A `many` edge with a custom `decompose` that **renames** element fields (`{ note
 
 #### Upgrading from 1.22.0 or earlier
 
+:::caution[Upgrade readers first]
+1.22.0 can't read every row this version writes. A **self** date schema (`Schema.DateTimeUtc`, `Schema.Date`, or one with `storedAs`) inside a `NullOr` or other union, a `Record` or a `Tuple` is now stored as a string or number. A 1.22.0 reader fails on it with `Expected DateTime.Utc`, or, in a union with a string member, reads it back as a plain string. **Upgrade every reader before any writer, and don't roll back past this version** once new rows are written.
+
+1.22.0 does read the other shapes this version writes differently. These include dates in root arrays and arrays of classes, transform dates such as `Schema.DateTimeUtcFromString` in any container, plain-class refs in `many` elements, and optional `NumberFromString` fields. Nested sub-aggregates and refs annotated with `DynamoModel.ref` in a `many` element never read back on 1.22.0 anyway.
+:::
+
 Versions up to and including 1.22.0 encoded only top-level fields, and only when the field's own schema was a transform. A transformed value nested inside an array, a union, a class or a hydrated ref was marshalled as the domain object itself, so a `DateTime` was stored as a map such as `{ epochMilliseconds, "~effect/DateTime", _tag: "Utc" }`. On Effect 4.0.0, rows written under an Effect release candidate (whose maps carry `~effect/time/DateTime`) failed assembly with `Expected DateTime.Utc`. Rows written under 4.0.0 decoded as plain objects that only looked like `DateTime`s.
 
 Existing rows need no migration step:
 
-- **Reads** rebuild a stored `DateTime` map into a real `DateTime`, whichever type-id key it carries. `Zoned` values keep their named or offset zone.
+- **Reads** rebuild a stored `DateTime` map into a real `DateTime`, whichever type-id key it carries. `Zoned` values keep their named or offset zone. A plain `Schema.BigInt`, stored as a number, now reads back; earlier versions could not read it.
 - **Writes** rewrite a row in wire form the next time an `update` changes its group (the root item, or the sub-aggregate it belongs to). An update that changes nothing writes nothing, and there is no automatic backfill, so rows that are never updated keep the map form and keep reading correctly.
 - **Lost values.** Some domain objects have no enumerable state, so the map they were stored as holds no value: a `Schema.Date` was stored as an empty map, and a `URL`, `Duration` or `BigDecimal` lost its value the same way. These cannot be recovered, and reading them fails with a `ValidationError`.
 

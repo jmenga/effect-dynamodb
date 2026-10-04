@@ -98,10 +98,27 @@ A self date schema is stored in its wire form wherever it sits in the model: at 
 - a `Schema.Record` value, such as `Schema.Record(Schema.String, Schema.DateTimeUtc)`
 - a `Schema.Tuple`, `Schema.TupleWithRest` or `Schema.StructWithRest`
 
-A `storedAs` annotation applies there too, so `Schema.NullOr(Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)))` stores a number. Transform schemas such as `Schema.DateTimeUtcFromString` already owned their wire form in every container and are unchanged.
+A `storedAs` annotation applies there too, so `Schema.NullOr(Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)))` stores a number. A `DynamoModel.configure` `storedAs` override on a union field applies to the union's date member. If the union has more than one date member, the override can't say which one it means, and `Entity.make()` rejects it with `EDD-9057`; annotate the intended member with `.pipe(DynamoModel.storedAs(...))` instead. Transform schemas such as `Schema.DateTimeUtcFromString` already owned their wire form in every container and are unchanged.
 
-:::note[Upgrading from 1.22.0 or earlier]
-Earlier versions stopped at unions, records and tuples, so a self date inside one was stored as a marshalled `DateTime` map (`{ epochMilliseconds, "~effect/DateTime", _tag: "Utc" }`). Those rows still read back, as real `DateTime` values, and are rewritten in wire form when the attribute is next written. Until then the attribute is a map (`M`) on old rows and a string or number on new ones, so a filter on it can match the two differently, and DynamoDB Streams consumers see the type change. Keys are not affected.
+#### Dates in unions
+
+A union is read back by trying its members, so a stored value must not be claimable by two of them.
+
+- **A date stored as a string next to a string member.** In `Schema.Union([Schema.DateTimeUtc, Schema.String])`, the date member claims only the exact ISO string the library writes for a date, and it is tried first. A string such as `"2020"`, `"5"` or `"hello"` reads back as a string. A string that happens to be a canonical ISO instant, such as `"2000-01-01T00:00:00.000Z"`, reads back as a `DateTime`. If a string field may legitimately hold ISO instants, use a tagged or discriminated shape instead of a bare union. The same rule applies through nested unions, such as `Schema.Union([Schema.NullOr(Schema.DateTimeUtc), Schema.String])`.
+- **A date stored as a number next to a numeric member.** A date stored as epoch milliseconds or seconds next to `Schema.Number`, a number literal, `Schema.BigInt` or another epoch date can't be told apart from that member at all, so `Entity.make()` rejects it with `EDD-9058`. Store the date as a string (the default for a self date), or remove the numeric member. `Schema.NumberFromString` is stored as a string, so it doesn't collide.
+
+#### Zoned dates
+
+A self `Schema.DateTimeZoned` field is stored as an ISO string with its zone, and read back with the same zone: a named zone as `2025-01-01T19:00:00.000+09:00[Asia/Tokyo]`, an offset zone as `2025-01-01T15:00:00.000+05:00`. That holds wherever the field sits, including inside a container, and for any zoned field on an aggregate. Versions up to 1.22.0 read an offset zone back as UTC. The stored form is unchanged.
+
+An entity field declared as `DynamoModel.DateTimeZoned` still reads an offset zone back as UTC; named zones round-trip. Use `Schema.DateTimeZoned` if you need offsets kept.
+
+:::caution[Upgrading from 1.22.0 or earlier]
+Earlier versions stopped at unions, records and tuples, so a self date inside one was stored as a marshalled `DateTime` map (`{ epochMilliseconds, "~effect/DateTime", _tag: "Utc" }`). Those rows still read back, as real `DateTime` values, and are rewritten in wire form when the attribute is next written. Keys are not affected.
+
+The new stored form can't be read by 1.22.0. A 1.22.0 reader fails with `Expected DateTime.Utc` on a self date written as a string inside a `NullOr`, `Record` or `Tuple`. Inside a union with a string member, it reads the date back as a plain string. **Upgrade every reader before any writer, and don't roll back past this version** once new rows are written.
+
+Until old rows are rewritten, the attribute is a map (`M`) on old rows and a string or number on new ones. A filter on it can therefore match the two differently, and DynamoDB Streams consumers see the type change.
 :::
 
 ### Immutable Fields
