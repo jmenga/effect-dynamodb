@@ -1581,7 +1581,7 @@ describe("#133 entity nested self dates — path operations on a retain entity",
   const docRow = (sk = "$edd133#v1#retaindoc") =>
     store.get(`$edd133#v1#retaindoc#id_d1|${sk}`) as Record<string, any>
 
-  it.effect("every path operation is applied, validated and snapshotted", () =>
+  it.effect("path operations are sent to DynamoDB, transacted with the version snapshot", () =>
     Effect.gen(function* () {
       const db = yield* docClient
       yield* db.entities.Docs.put({
@@ -1593,39 +1593,24 @@ describe("#133 entity nested self dates — path operations on a retain entity",
         nested: { at: dt, count: 5 },
         gone: "bye",
       } as any)
+      writes.length = 0
       yield* db.entities.Docs.update({ id: "d1" })
         .pathSet({ segments: ["nested", "at"], value: later, isPath: false })
-        .pathSet({ segments: ["opt"], value: "set", isPath: false })
         .pathAdd({ segments: ["n"], value: 2 })
-        .pathAdd({ segments: ["labels"], value: new Set(["z"]) })
-        .pathSubtract({ segments: ["nested", "count"], value: 1, isPath: false })
         .pathAppend({ segments: ["days"], value: [later] })
-        .pathPrepend({ segments: ["tags"], value: ["first"] })
-        .pathIfNotExists({ segments: ["n"], value: 99 })
         .pathDelete({ segments: ["labels"], value: new Set(["x"]) })
         .pathRemove(["gone"])
 
-      const row = docRow()
-      expect({
-        n: row.n,
-        tags: row.tags,
-        days: row.days,
-        labels: row.labels,
-        nested: row.nested,
-        opt: row.opt,
-        gone: row.gone,
-        version: row.version,
-      }).toEqual({
-        n: { N: "3" },
-        tags: { L: [S("first"), S("a"), S("b")] },
-        days: { L: [S(DOB), S(LATER)] },
-        labels: { SS: ["y", "z"] },
-        nested: { M: { at: S(LATER), count: { N: "4" } } },
-        opt: S("set"),
-        gone: undefined,
-        version: { N: "2" },
-      })
-      // The snapshot is the item BEFORE the update.
+      // One transaction: the Update DynamoDB applies, and the snapshot Put.
+      const update = writes.find((w) => w.op === "Update")!.input
+      expect(update.UpdateExpression).toMatch(/^SET .*list_append.* REMOVE .* ADD .* DELETE /)
+      expect(update.ConditionExpression).toBe("#retainVer = :retainVer")
+      expect(update.ExpressionAttributeValues[":retainVer"]).toEqual({ N: "1" })
+      const values = Object.values(update.ExpressionAttributeValues as Record<string, any>)
+      expect(values).toContainEqual(S(LATER))
+      expect(values).toContainEqual({ L: [S(LATER)] })
+      expect(values.some(holdsMarshalledDate)).toBe(false)
+      // The snapshot is the item BEFORE the update, keyed as before.
       const snapshot = docRow("$edd133#v1#retaindoc#v#0000001")
       expect([snapshot.n, snapshot.nested, snapshot.gone]).toEqual([
         { N: "1" },

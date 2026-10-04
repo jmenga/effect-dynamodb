@@ -14,12 +14,14 @@
 
 import { it } from "@effect/vitest"
 import {
+  Cause,
   Config,
   Data,
   DateTime,
   Duration,
   Effect,
   Equal,
+  Exit,
   Layer,
   Option,
   Redacted,
@@ -13764,17 +13766,15 @@ describeConnected("#133 — path operations on a retain entity", () => {
       const updated = (yield* db.entities.R133Docs.update({ id: "d1" })
         .expectedVersion(1)
         .pathSet({ segments: ["nested", "at"], value: later, isPath: false })
-        .pathSet({ segments: ["opt"], value: "set", isPath: false })
+        .pathIfNotExists({ segments: ["opt"], value: "set" })
         .pathAdd({ segments: ["n"], value: 2 })
-        .pathAdd({ segments: ["labels"], value: new Set(["z"]) })
         .pathSubtract({ segments: ["nested", "count"], value: 1, isPath: false })
         .pathAppend({ segments: ["days"], value: [later] })
         .pathPrepend({ segments: ["tags"], value: ["first"] })
-        .pathIfNotExists({ segments: ["n"], value: 99 })
         .pathDelete({ segments: ["labels"], value: new Set(["x"]) })
         .pathRemove(["gone"])) as any
       expect(updated.n).toBe(3)
-      expect([...updated.labels].sort()).toEqual(["y", "z"])
+      expect([...updated.labels].sort()).toEqual(["y"])
       expect(updated.tags).toEqual(["first", "a", "b"])
       expect(updated.nested.count).toBe(4)
       expect(i133IsRealUtc(updated.nested.at, I133_DOB_MS + 1000)).toBe(true)
@@ -13820,5 +13820,177 @@ describeConnected("#133 — path operations on a retain entity", () => {
       expect(tooMany._tag).toBe("ValidationError")
       expect((yield* raw("$edd133r#v1#r133doc")).version).toEqual({ N: "2" })
     }).pipe(provideR133),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Retain vs non-retain parity: DynamoDB applies the path operations of both
+// ---------------------------------------------------------------------------
+
+class P133Doc extends Schema.Class<P133Doc>("P133Doc")({
+  id: Schema.String,
+  name: Schema.String,
+  tag: Schema.String,
+  list: Schema.Array(Schema.String),
+  n: Schema.Number,
+  labels: Schema.ReadonlySet(Schema.String),
+  opt: Schema.optional(Schema.Array(Schema.String)),
+}) {}
+const P133Schema = DynamoSchema.make({ name: "edd133p", version: 1 })
+const p133Key = {
+  pk: { field: "pk", composite: ["id"] },
+  sk: { field: "sk", composite: [] },
+} as const
+const P133Retained = Entity.make({
+  model: P133Doc,
+  entityType: "P133Retained",
+  primaryKey: p133Key,
+  versioned: { retain: true },
+})
+const P133Plain = Entity.make({
+  model: P133Doc,
+  entityType: "P133Plain",
+  primaryKey: p133Key,
+  versioned: true,
+})
+const P133Table = Table.make({ schema: P133Schema, entities: { P133Retained, P133Plain } })
+const p133TableName = `edd133p-${Date.now()}`
+const provideP133 = Effect.provide(
+  Layer.mergeAll(ClientLayer, P133Table.layer({ name: p133TableName })),
+)
+const p133Client = DynamoClient.make({
+  entities: { P133Retained, P133Plain },
+  tables: { P133Table },
+})
+
+describeConnected("#133 — retain path operations match DynamoDB's own", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* p133Client
+        yield* db.tables.P133Table.create()
+      }).pipe(provideP133, Effect.scoped),
+    )
+  }, 30000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: p133TableName })
+      }).pipe(
+        provideP133,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 30000)
+
+  const sequences: ReadonlyArray<readonly [string, (u: any) => any]> = [
+    ["remove list[0] and list[2]", (u) => u.pathRemove(["list", 0]).pathRemove(["list", 2])],
+    [
+      "set tag, copy tag into name",
+      (u) =>
+        u
+          .pathSet({ segments: ["tag"], value: "t2", isPath: false })
+          .pathSet({ segments: ["name"], value: undefined, isPath: true, valueSegments: ["tag"] }),
+    ],
+    [
+      "set and remove the same path",
+      (u) =>
+        u.pathSet({ segments: ["list", 1], value: "z", isPath: false }).pathRemove(["list", 1]),
+    ],
+    [
+      "if_not_exists on an absent attribute",
+      (u) => u.pathIfNotExists({ segments: ["opt"], value: ["w"] }),
+    ],
+    [
+      "if_not_exists on a present attribute",
+      (u) => u.pathIfNotExists({ segments: ["n"], value: 99 }),
+    ],
+    ["append to a missing list", (u) => u.pathAppend({ segments: ["opt"], value: ["q"] })],
+    ["delete from a non-set", (u) => u.pathDelete({ segments: ["list"], value: new Set(["a"]) })],
+    [
+      "set past the end, add, prepend",
+      (u) =>
+        u
+          .pathSet({ segments: ["list", 10], value: "z", isPath: false })
+          .pathAdd({ segments: ["n"], value: 5 })
+          .pathAdd({ segments: ["labels"], value: new Set(["c"]) }),
+    ],
+  ]
+
+  it.effect("each sequence stores the same item, or fails the same way", () =>
+    Effect.gen(function* () {
+      const db = yield* p133Client
+      const client = yield* DynamoClient
+      const read = (entityType: string, id: string, sk: string) =>
+        client
+          .getItem({
+            TableName: p133TableName,
+            Key: {
+              pk: { S: `$edd133p#v1#${entityType.toLowerCase()}#id_${id}` },
+              sk: { S: sk },
+            },
+            ConsistentRead: true,
+          })
+          .pipe(Effect.map(({ Item }) => Item as Record<string, any> | undefined))
+      const fields = (item: Record<string, any> | undefined) => {
+        if (item === undefined) return undefined
+        const { pk, sk, __edd_e__, updatedAt, createdAt, ...rest } = item
+        return rest
+      }
+      const base = {
+        name: "n",
+        tag: "t",
+        list: ["a", "b", "c", "d"],
+        n: 1,
+        labels: new Set(["a", "b"]),
+      }
+      for (const [index, [label, apply]] of sequences.entries()) {
+        const id = `s${index}`
+        yield* db.entities.P133Retained.put({ id, ...base } as any)
+        yield* db.entities.P133Plain.put({ id, ...base } as any)
+        // A record update first, so the path update below snapshots version 2
+        // (`put` on a retain entity already writes the version 1 snapshot).
+        yield* db.entities.P133Retained.update({ id }).set({ name: "pre" } as any)
+        yield* db.entities.P133Plain.update({ id }).set({ name: "pre" } as any)
+        const retained = yield* Effect.exit(
+          Effect.suspend(
+            () =>
+              apply(db.entities.P133Retained.update({ id })).asEffect() as Effect.Effect<
+                unknown,
+                unknown
+              >,
+          ),
+        )
+        const plain = yield* Effect.exit(
+          Effect.suspend(
+            () =>
+              apply(db.entities.P133Plain.update({ id })).asEffect() as Effect.Effect<
+                unknown,
+                unknown
+              >,
+          ),
+        )
+        const outcome = (exit: Exit.Exit<unknown, unknown>) =>
+          Exit.isSuccess(exit) ? "ok" : String((Cause.squash(exit.cause) as any)?._tag ?? "error")
+        expect([label, outcome(retained)]).toEqual([label, outcome(plain)])
+        const retainedItem = yield* read("P133Retained", id, "$edd133p#v1#p133retained")
+        const plainItem = yield* read("P133Plain", id, "$edd133p#v1#p133plain")
+        expect([label, fields(retainedItem)]).toEqual([label, fields(plainItem)])
+        // A snapshot of the pre-update item exactly when the update applied.
+        const snapshot = yield* read("P133Retained", id, "$edd133p#v1#p133retained#v#0000002")
+        if (Exit.isSuccess(retained)) {
+          expect([label, snapshot?.name, snapshot?.list]).toEqual([
+            label,
+            { S: "pre" },
+            { L: base.list.map((value) => ({ S: value })) },
+          ])
+        } else {
+          expect([label, snapshot]).toEqual([label, undefined])
+        }
+      }
+    }).pipe(provideP133),
   )
 })
