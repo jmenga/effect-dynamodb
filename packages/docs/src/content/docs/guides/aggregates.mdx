@@ -412,34 +412,48 @@ Discriminator values are stored on each member item in DynamoDB and used during 
 
 ### How Values Are Stored
 
-Every item an aggregate writes stores its values in their schema's **wire form**, the same form `Entity.put` writes, however deeply they are nested. A `Schema.DateTimeUtcFromString` is an ISO string (`S`) in each of these places:
+Aggregate items store their values in their schema's **wire form**, the same form `Entity.put` writes, however deeply they are nested. A `Schema.DateTimeUtcFromString` is an ISO string (`S`) in each of these places:
 
 - a root field (`startDate`)
 - an element of a root array (`matchDays: Schema.Array(Schema.DateTimeUtcFromString)`)
 - a field of a class inside an array (`sessions[].startTime`)
+- a member of a `Schema.NullOr` or other union, including inside an array (`Schema.Array(Schema.NullOr(...))`) and a union of a class and a scalar (`Schema.Union([Slot, Schema.String])`)
+- a `Schema.Record` value or a `Schema.Tuple` element
 - a field of a ref hydrated into a `one` or `many` item (`player.dateOfBirth` on a `MatchPlayer` item), at the root or inside a sub-aggregate
 - a field of a `one` or `many` edge declared without an `entity`
 
-Other transforms follow the same rule. A `Schema.BigIntFromString` is stored as a string, and self date schemas such as `Schema.DateTimeUtc` and `Schema.Date` default to an ISO string. On read, each value is decoded back to its domain type, so the assembled aggregate holds real `DateTime` instances.
+Other transforms follow the same rule. A `Schema.BigIntFromString` or `Schema.NumberFromString` is stored as a string, and self date schemas such as `Schema.DateTimeUtc` and `Schema.Date` default to an ISO string. In a union that mixes a date with another type (`Schema.Union([Schema.DateTimeUtcFromString, Schema.Number])`), each value is stored by the member it belongs to, so a `5` stays a number. On read, each value is decoded back to its domain type, so the assembled aggregate holds real `DateTime` instances.
 
-The ref inside a `many` element can be declared either way, and both round-trip:
+A ref in a `many` edge can be declared in any of these ways, and all of them round-trip through `create`, `get` and `update`:
 
-- `player: Player.pipe(DynamoModel.ref)`
-- the plain class `player: Player`, matched by name to the edge's `entity`
+- inside an element class, annotated: `player: Player.pipe(DynamoModel.ref)`
+- inside an element class, as the plain class `player: Player`, matched by name to the edge's `entity`
+- as the element itself: `players: Schema.Array(Player.pipe(DynamoModel.ref))`
 
 Refs are matched by the field's schema, not its name. A nested field that happens to share a ref edge's name (a `coach: Schema.String` inside an array, next to a root `coach` edge) is stored and read as its own schema.
 
 Composed keys (`pk`, `sk`, collection and list-index keys) are not affected by this encoding. They are built exactly as before, so existing rows stay addressable.
 
+:::caution[Custom `decompose` that renames fields]
+A `many` edge with a custom `decompose` that **renames** element fields (`{ noteId, at }` → `{ nid, when }`) is the one exception. Encoders are matched to the element's own field names, so a renamed field is stored as its domain value, and a `DateTime` there is still written as a map. It reads back as a real `DateTime`. To store it in wire form, keep the element's field names in `decompose`, or encode the value yourself before returning it.
+:::
+
 #### Upgrading from 1.22.0 or earlier
 
-Versions up to and including 1.22.0 encoded only top-level fields. A transformed value nested inside an array, a class or a hydrated ref was marshalled as the domain object itself, so a `DateTime` was stored as a map such as `{ epochMilliseconds, "~effect/DateTime", _tag: "Utc" }`. On Effect 4.0.0, rows written under an Effect release candidate (whose maps carry `~effect/time/DateTime`) failed assembly with `Expected DateTime.Utc`. Rows written under 4.0.0 decoded as plain objects that only looked like `DateTime`s.
+Versions up to and including 1.22.0 encoded only top-level fields, and only when the field's own schema was a transform. A transformed value nested inside an array, a union, a class or a hydrated ref was marshalled as the domain object itself, so a `DateTime` was stored as a map such as `{ epochMilliseconds, "~effect/DateTime", _tag: "Utc" }`. On Effect 4.0.0, rows written under an Effect release candidate (whose maps carry `~effect/time/DateTime`) failed assembly with `Expected DateTime.Utc`. Rows written under 4.0.0 decoded as plain objects that only looked like `DateTime`s.
 
 Existing rows need no migration step:
 
 - **Reads** rebuild a stored `DateTime` map into a real `DateTime`, whichever type-id key it carries. `Zoned` values keep their named or offset zone.
 - **Writes** rewrite a row in wire form the next time an `update` changes its group (the root item, or the sub-aggregate it belongs to). An update that changes nothing writes nothing, and there is no automatic backfill, so rows that are never updated keep the map form and keep reading correctly.
 - **Lost values.** A `Schema.Date` stored by those versions is an empty map with no instant in it. It cannot be recovered, and reading it fails with a `ValidationError`.
+
+**Some attributes change stored type.** A few values that 1.22.0 stored in their domain form are now encoded, which changes their DynamoDB type. Keys are not affected. The affected attributes are:
+
+- a top-level field wrapped in `Schema.optional(...)` or `Schema.NullOr(...)` around a non-date transform such as `Schema.NumberFromString`, on the root item, an edge item or a `many` element's own fields
+- a `Schema.NumberFromString` nested inside a hydrated ref
+
+For example, an optional `NumberFromString` holding `5` was stored as `{ "N": "5" }` and is now `{ "S": "5" }`. Rows of both kinds read back correctly. However, a `list` filter on such an attribute can match old and new rows differently until the old rows are rewritten: a `filter` expression compares against one DynamoDB type, and a `filterBy` predicate receives the stored value, a number on old rows and a string on new ones. DynamoDB Streams consumers also see the attribute change type. A `Schema.optional(Schema.BigIntFromString)` field was also stored as a number by 1.22.0, but those rows could never be read back. They still cannot; only rows written from this version on round-trip.
 
 ### Aggregate Operations
 

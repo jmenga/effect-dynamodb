@@ -1931,10 +1931,11 @@ becomes `{M:{}}`, and a `bigint` becomes `{N:"5"}`.
 
 | Rule | Behaviour |
 |------|-----------|
-| **Which attributes** | Any field holding a wire transform **at any depth** (`containsWireTransform`): a leaf transform, a `Schema.Class`, a self date or `Redacted`, or an `Array` / `Struct` / `Union` containing one. Gating on the top-level AST (pre-#133) skipped every container, since an `Arrays` / `Objects` node carries no encoding of its own. Fields with nothing to encode get no encoder and their bytes are unchanged. |
-| **One encoder per field** | A `storedAs` annotation or inferred date default wins. Otherwise the field is encoded through the same substituted, tolerant schema the read path decodes it with (`substituteSchemaDeep` + the aggregate's ref resolver), falling back to the field's own `encode`, then `decode → encode`. |
-| **Which schema** | The schema the decomposed value actually has: the root model's fields for the root, a `one` edge's entity model (or the model field's own class when the edge has no entity), the array **element** for a `many` edge (`PlayerSheet`, not `Player`), a sub-aggregate's own schema for its root item. |
+| **Which attributes** | Any field holding a wire transform **at any depth** (`containsWireTransform`): a leaf transform, a `Schema.Class`, a self date or `Redacted`, or an `Array` / `Struct` / `Union` / `Record` / `Tuple` containing one. Gating on the top-level AST (pre-#133) skipped every container, since an `Arrays` / `Objects` / `Union` node carries no encoding of its own; that included `Schema.optional(X)` and `NullOr(X)` around a transform. Fields with nothing to encode get no encoder and their bytes are unchanged. |
+| **One encoder per field** | A `storedAs` annotation or inferred date default wins, except for a union mixing a date with a non-date member (`Union([DateTimeUtcFromString, Number])`, `isMixedDateUnion`), whose non-date values a date encoder would throw on. Otherwise the field is encoded through the same substituted, tolerant schema the read path decodes it with (`substituteSchemaDeep` + the aggregate's ref resolver), falling back to the field's own `encode`, then `decode → encode`. |
+| **Which schema** | The schema the decomposed value actually has: the root model's fields for the root, a `one` edge's entity model (or the model field's own class when the edge has no entity), the array **element** for a `many` edge (`PlayerSheet`, not `Player`), a sub-aggregate's own schema for its root item. Encoders are keyed by the element's field names, so a custom `decompose` that **renames** fields escapes them: the renamed values are stored in domain form (a `DateTime` as a map). This is a known limitation; the read path still lifts those maps. |
 | **Per attribute, not per aggregate** | The aggregate is never encoded as a whole before decomposition: key composition needs Type-side values (`numericTypeWithStringEncoding`). |
+| **Union members** | Under `tolerantTransforms`, `substituteSchemaDeep` walks `Union`, `Record`, `Tuple`, `TupleWithRest` and `StructWithRest` (`tolerantContainer`), rebuilding each container kind around substituted children. Date leaves inside a union get a `strictWireKind` transform that accepts only its own wire kind, its own domain or a legacy map of it, so a date member cannot claim a value that belongs to a later member (a stored `5` stays a number). Entity derivation (no options) does not walk these containers. |
 | **Keys unchanged** | A `many` edge's `sk.composite` and the root's list-index composites are read from a second encoder set (`buildKeyAttrEncoders`) that keeps the pre-#133 top-level-only behaviour. Composed keys are therefore byte-identical to earlier versions; only stored attribute values gained the deeper encoding. |
 
 **Ref resolution.** `DynamoModel.ref` annotates with `Schema.annotate`, which
@@ -1942,7 +1943,10 @@ drops a `Schema.Class`'s `.fields`, so the schema walker cannot recurse into an
 annotated ref. `collectRefTargets` registers each such field with the model it
 should be read (and encoded) as: root `one`/`ref` edge fields, opaque ref fields
 inside sub-aggregate edges and `many` elements (found by
-`deriveEntityFieldName`), and refs nested in an edge entity's own model (#116). A
+`deriveEntityFieldName`), a `many` field whose element *is* an opaque ref
+(`Schema.Array(X.pipe(DynamoModel.ref))`, re-pointed as a whole at
+`Schema.Array(<entity model>)` because the walker re-points fields, not
+elements), and refs nested in an edge entity's own model (#116). A
 plain-class element field is walked directly and needs no registration. Targets
 are keyed by **field schema identity**, not field name: the resolver is
 consulted at every depth, and a name-keyed table re-pointed any same-named field
@@ -1958,6 +1962,23 @@ instant is rejected rather than passed to the domain. There is no backfill: a
 legacy row is rewritten in wire form only when an `update` changes its
 decomposed group, because the diff compares decomposed (re-encoded) groups and a
 no-op update writes nothing.
+
+**Stored-type change.** Because the gate now looks through `optional` /
+`NullOr` and into refs, some attributes that ≤1.22.0 stored in domain form are
+now encoded: a top-level `optional` / `NullOr` around a non-date transform, and
+a `NumberFromString` inside a hydrated ref (`{N:"5"}` → `{S:"5"}`). Keys are
+unaffected (they use `buildKeyAttrEncoders`), and both forms decode, but a
+`list` `filter` / `filterBy` on such an attribute can match old and new rows
+differently, and Streams consumers see the type change. An `optional` /
+`NullOr` `BigIntFromString` stored as `{N}` by ≤1.22.0 was never readable
+(unmarshalling yields a `number`, which the bigint decode rejects) and still is
+not.
+
+**Create input cloning.** `replaceRefIds` deep-copies the create input with
+`cloneInput` rather than `structuredClone`, which reduced a `DateTime` to a bare
+`{ epochMilliseconds }` and emptied a `Redacted`. `DateTime` and `Redacted`
+values are kept by reference; other values are copied as `structuredClone`
+copied them.
 
 ### Aggregate System Timestamps
 
