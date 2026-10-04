@@ -92,6 +92,19 @@ const SoftItems = Entity.make({
   softDelete: true,
 })
 
+// #133 fixture — a versioned entity: a batch put must never replace an item.
+class VersionedNote extends Schema.Class<VersionedNote>("VersionedNote")({
+  noteId: Schema.String,
+  body: Schema.String,
+}) {}
+
+const VersionedNotes = Entity.make({
+  model: VersionedNote,
+  entityType: "VersionedNote",
+  primaryKey: { pk: { field: "pk", composite: ["noteId"] }, sk: { field: "sk", composite: [] } },
+  versioned: true,
+})
+
 // #120 fixture — an entity whose id the framework generates when it is absent.
 class GenDoc extends Schema.Class<GenDoc>("GenDoc")({
   docId: Schema.String,
@@ -107,13 +120,23 @@ const GenDocs = Entity.make({
 
 const MainTable = Table.make({
   schema: AppSchema,
-  entities: { UserEntity, OrderEntity, UniqueMembers, RetainDocs, SoftItems, GenDocs },
+  entities: {
+    UserEntity,
+    OrderEntity,
+    UniqueMembers,
+    RetainDocs,
+    SoftItems,
+    GenDocs,
+    VersionedNotes,
+  },
 })
 
 // --- Mock DynamoClient ---
 
 const mockBatchGetItem = vi.fn()
 const mockBatchWriteItem = vi.fn()
+const mockTransactWriteItems = vi.fn()
+const mockGetItem = vi.fn()
 
 const TestDynamoClient = mockDynamoClientLayer({
   batchGetItem: (input) =>
@@ -126,7 +149,24 @@ const TestDynamoClient = mockDynamoClientLayer({
       try: () => mockBatchWriteItem(input),
       catch: (e) => new DynamoError({ operation: "BatchWriteItem", cause: e }),
     }),
+  transactWriteItems: (input) =>
+    Effect.tryPromise({
+      try: () => mockTransactWriteItems(input),
+      catch: (e) => new DynamoError({ operation: "TransactWriteItems", cause: e }),
+    }),
+  getItem: (input) =>
+    Effect.tryPromise({
+      try: () => mockGetItem(input),
+      catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
+    }),
 })
+
+/** A TransactionCanceledException as the AWS SDK raises it. */
+const cancelled = (codes: ReadonlyArray<string>) =>
+  Object.assign(new Error("Transaction cancelled"), {
+    name: "TransactionCanceledException",
+    CancellationReasons: codes.map((Code) => ({ Code })),
+  })
 
 const TestTableConfig = MainTable.layer({ name: "test-table" })
 const TestLayer = Layer.merge(TestDynamoClient, TestTableConfig)
@@ -921,6 +961,93 @@ describe("Batch", () => {
         const requests = mockBatchWriteItem.mock.calls[0]![0].RequestItems["test-table"]
         expect(requests).toHaveLength(1)
         expect(fromAttributeMap(requests[0].PutRequest.Item).__edd_e__).toBe("SoftItem")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("sends versioned puts as create-only transactions, with no read", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        mockBatchWriteItem.mockResolvedValueOnce({ UnprocessedItems: {} })
+        yield* Batch.write([
+          VersionedNotes.put({ noteId: "n-1", body: "a" }),
+          OrderEntity.put({
+            orderId: "o-1",
+            userId: "u-1",
+            product: "x",
+            quantity: 1,
+            status: "pending",
+          }),
+        ])
+
+        expect(mockGetItem).not.toHaveBeenCalled()
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        const [put] = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        expect(put.Put.ConditionExpression).toBe("attribute_not_exists(#pk)")
+        expect(put.Put.ExpressionAttributeNames).toEqual({ "#pk": "pk" })
+        expect(put.Put.Item.version).toEqual({ N: "1" })
+        expect(put.Put.Item.__edd_i__).toBeDefined()
+        // The non-versioned put is still a plain BatchWriteItem request.
+        const requests = mockBatchWriteItem.mock.calls[0]![0].RequestItems["test-table"]
+        expect(requests).toHaveLength(1)
+        expect(requests[0].PutRequest.Item.orderId).toEqual({ S: "o-1" })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("refuses a versioned put that would replace an item, before any plain write", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce(cancelled(["None", "ConditionalCheckFailed"]))
+        const error = yield* Batch.write([
+          VersionedNotes.put({ noteId: "n-1", body: "a" }),
+          VersionedNotes.put({ noteId: "n-2", body: "b" }),
+          OrderEntity.put({
+            orderId: "o-1",
+            userId: "u-1",
+            product: "x",
+            quantity: 1,
+            status: "pending",
+          }),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("would replace an existing")
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("retries a versioned-put chunk cancelled by contention only", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems
+          .mockRejectedValueOnce(cancelled(["TransactionConflict"]))
+          .mockResolvedValueOnce({})
+        const fiber = yield* Batch.write([VersionedNotes.put({ noteId: "n-1", body: "a" })], {
+          baseDelayMs: 1,
+        }).pipe(Effect.forkChild)
+        yield* TestClock.adjust("1 second")
+        yield* Fiber.join(fiber)
+        expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
+
+        mockTransactWriteItems.mockReset()
+        mockTransactWriteItems.mockRejectedValueOnce(cancelled(["ValidationError"]))
+        const error = yield* Batch.write([VersionedNotes.put({ noteId: "n-2", body: "b" })], {
+          baseDelayMs: 1,
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("DynamoError")
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("chunks versioned puts at 100 per transaction", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        yield* Batch.write(
+          Array.from({ length: 101 }, (_, i) =>
+            VersionedNotes.put({ noteId: `n-${i}`, body: "a" }),
+          ),
+        )
+        expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
+        expect(mockTransactWriteItems.mock.calls[0]![0].TransactItems).toHaveLength(100)
+        expect(mockTransactWriteItems.mock.calls[1]![0].TransactItems).toHaveLength(1)
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )
 

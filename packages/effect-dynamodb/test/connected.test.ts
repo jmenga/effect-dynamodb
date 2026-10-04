@@ -16246,7 +16246,8 @@ describeConnected("#133 — path operations on index composites and unique field
         g133Entities.DevicesPlain.put({ id: "tx2", owner: "o", label: "b" } as any),
       ])
       expect((yield* rawItem("G133DevicePlain", "tx2")).version).toEqual({ N: "1" })
-      // Batch.write: new items are written; an existing one is refused first.
+      // Batch.write: new versioned items are created through create-only
+      // transactions; one that exists cancels its whole chunk.
       yield* Batch.write([
         g133Entities.DevicesPlain.put({ id: "tx3", owner: "o", label: "b" } as any),
       ])
