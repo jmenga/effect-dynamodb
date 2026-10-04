@@ -16989,7 +16989,7 @@ describeConnected("#133 — path operations on index composites and unique field
       expect((yield* lines.getVersion(a, 1)).label).toBe("a1")
       expect((yield* lines.getVersion(b, 2)).label).toBe("b2")
       // v#0000001 is a's, not b's.
-      expect((yield* Effect.flip(lines.getVersion(b, 1)))._tag).toBe("ItemNotFound")
+      expect(((yield* Effect.flip(lines.getVersion(b, 1))) as any)._tag).toBe("ItemNotFound")
 
       // An update snapshots v3 again, under the item's own key: that one wins.
       expect((yield* lines.update(a).set({ label: "a4" })).version).toBe(4)
@@ -17043,7 +17043,7 @@ describeConnected("#133 — path operations on index composites and unique field
       // Restored from the legacy tombstone, which is consumed.
       const restored = yield* lines.restore(a)
       expect([restored.line, restored.label, restored.version]).toEqual(["a", "a1", 2])
-      expect((yield* Effect.flip(lines.deleted.get(a)))._tag).toBe("ItemNotFound")
+      expect(((yield* Effect.flip(lines.deleted.get(a))) as any)._tag).toBe("ItemNotFound")
       expect((yield* lines.deleted.get(b)).label).toBe("b2")
       const restoredB = yield* lines.restore(b)
       expect([restoredB.line, restoredB.label, restoredB.version]).toEqual(["b", "b2", 3])
