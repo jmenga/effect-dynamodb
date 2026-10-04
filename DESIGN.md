@@ -1487,8 +1487,11 @@ the Struct its encoding leads to, `classStructAst`). That covers the entity
 input / create / update / key schemas (so `put`, `create`, `update`, Batch and
 Transaction), `appendInput`, the path-value schemas (`writeModelSchema`) and the
 aggregate's `writeSchema`, used by `create` and `update`. READ schemas leave it
-off, so a row written while the check was not enforced still reads. An aggregate
-`update` can repair such a row: it converts the current state through the read
+off, so a row written while the check was not enforced still reads. On an
+aggregate every `update` of such a row fails until the same update makes the
+value valid, because the whole mutated state is decoded through `writeSchema`;
+an entity `.set()` of other fields still succeeds. The repairing `update` works
+because it converts the current state through the read
 schema when `toIso` rejects it (`toPlainState`), and `keyRecord` normalises only
 key composites. `Union` / `Record` / `Tuple` rebuilds (`walkedContainer`) keep
 their metadata in every mode. A container that holds no substituted value is
@@ -1746,10 +1749,24 @@ transform with a primitive wire form, given a value that genuinely decodes as
 wire AND validates as the domain type (`StringFromBase64` given `"aGk="`,
 `fromJsonString`), whose encode would double-encode it (`makeAmbiguityCheck`);
 `"hi"` on `StringFromBase64` is not valid wire and is encoded. Paths into and
-under a `DynamoModel.ref` field follow the ref target's model (`refTargets`;
-`childAtSegment` also recovers an opaque class's fields from the Struct its
-encoding leads to), so they are encoded like any other path. Only a path no
-schema describes (under a dynamic key of an untyped value) is passed through.
+under a TOP-LEVEL `DynamoModel.ref` field follow the ref target's model
+(`refTargets`), whose read schema is substituted, so they are encoded like any
+other path. An opaque class (built with `.check()` or `.annotate()`, or a
+`DynamoModel.ref` nested inside a ref target) is deliberately not followed by
+`childAtSegment`: its `.fields` are gone, so the read schema keeps it
+unsubstituted and decodes its leaves exactly as `put` stores them, and a path
+value under it is passed through as given so the item stays readable. Known
+limitation: plain dates inside such a class are still stored as maps (also by
+`put` / `.set()`), as on 1.22.0. Only those and paths no schema describes (under
+a dynamic key of an untyped value) are passed through.
+
+**Retain entities.** The `versioned: { retain: true }` update branch builds the
+new item in memory and writes it in a transaction with the snapshot; it used to
+ignore path operations entirely (success, nothing written). It now applies them
+in memory (`applyPathOpsInMemory`) with the same encoding and validation, after
+deep-copying the stored values so the snapshot keeps the pre-update item.
+`expectedVersion` still applies, and a path whose parent does not exist fails
+with a `ValidationError`, as DynamoDB's own path update would.
 
 Each encoded path value is then **validated** against the write schema at its
 path (`validate` / `validateElements`), as `.set()` validates its payload: a
