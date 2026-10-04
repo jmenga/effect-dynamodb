@@ -16645,7 +16645,7 @@ describeConnected("#133 — path operations on index composites and unique field
       ]).pipe(Effect.flip)
       // Refused before anything is sent, naming the entity.
       expect(swapped._tag).toBe("ValidationError")
-      expect(swapped.entityType).toBe("G133AccountBare")
+      expect((swapped as ValidationError).entityType).toBe("G133AccountBare")
       expect(String(swapped.cause)).toContain("touches one item more than once")
 
       // Two puts of one item.
@@ -16665,7 +16665,7 @@ describeConnected("#133 — path operations on index composites and unique field
         g133Entities.DevicesRetained.put({ id: "sw3", owner: "o", label: "b" } as any),
       ]).pipe(Effect.flip)
       expect(retainedTwice._tag).toBe("ValidationError")
-      expect(retainedTwice.entityType).toBe("G133DeviceRetained")
+      expect((retainedTwice as ValidationError).entityType).toBe("G133DeviceRetained")
       const sw3 = yield* rawItem("G133DeviceRetained", "sw3")
       expect([sw3.label, sw3.version]).toEqual([{ S: "v1" }, { N: "1" }])
       expect(yield* snapshotLabel("G133DeviceRetained", "sw3", 2)).toBeUndefined()
@@ -16692,7 +16692,7 @@ describeConnected("#133 — path operations on index composites and unique field
         ids.map((id) => g133Entities.DevicesRetained.put({ id, owner: "o", label: big } as any)),
       ).pipe(Effect.flip)
       expect(error._tag).toBe("ValidationError")
-      expect(error.entityType).toBe("G133DeviceRetained")
+      expect((error as ValidationError).entityType).toBe("G133DeviceRetained")
       expect(String(error.cause)).toContain("4194304 bytes (4 MB)")
       for (const id of ids) expect(yield* rawItem("G133DeviceRetained", id)).toBeUndefined()
       // The same items fit as two transactions.
