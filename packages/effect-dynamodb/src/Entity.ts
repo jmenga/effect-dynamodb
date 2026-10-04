@@ -1754,6 +1754,211 @@ const makeImpl = <
   const resolvedRefs = data.resolvedRefs as unknown as ReadonlyArray<ResolvedRef>
   // allIndexes is mutable: _injectIndex adds collection-owned GSIs after make().
   let allIndexes: globalThis.Record<string, IndexDefinition> = { ...data.initialIndexes }
+
+  /** Composites of the secondary indexes (`allIndexes` grows after make()). */
+  const indexCompositeFields = (): ReadonlySet<string> =>
+    new Set(
+      Object.entries(allIndexes)
+        .filter(([name]) => name !== "primary")
+        .flatMap(([, def]) => [...def.pk.composite, ...def.sk.composite]),
+    )
+
+  /**
+   * Why `field` feeds a key or a unique sentinel — values the library derives
+   * from the field at write time — or `undefined` when it feeds neither.
+   */
+  const derivedFrom = (field: string): string | undefined => {
+    const primary = allIndexes.primary
+    if (primary && [...primary.pk.composite, ...primary.sk.composite].includes(field)) {
+      return "a primary-key composite"
+    }
+    for (const [name, def] of Object.entries(allIndexes)) {
+      if (name === "primary") continue
+      if (def.pk.composite.includes(field) || def.sk.composite.includes(field)) {
+        return `a composite of index "${name}"`
+      }
+    }
+    for (const [name, def] of Object.entries(
+      (config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>,
+    )) {
+      if (resolveUniqueFields(def).includes(field)) return `a field of unique constraint "${name}"`
+    }
+    return undefined
+  }
+
+  /**
+   * Path operations on a field that feeds a key or a unique sentinel (#133).
+   *
+   * DynamoDB evaluates a path operation, so compiling one on such a field would
+   * change the attribute while its index keys and sentinel stay as they were.
+   * A top-level `pathSet` of a value / `pathRemove` IS `.set()` / `.remove()`
+   * of that field, and `pathAdd` / `pathSubtract` of a number IS `.add()` /
+   * `.subtract()`: they are rewritten into those record operations, which go
+   * through the key composer and the sentinel rotation. Anything whose result
+   * only DynamoDB knows (a copy from another attribute, `if_not_exists`, list
+   * and set operations) is refused, as is a path below such a field, a
+   * primary-key composite (it identifies the item), an immutable field, and a
+   * field targeted twice. Returns the rewritten state or the refusal.
+   */
+  const normalizeDerivedPathOps = (uState: UpdateState): UpdateState | string => {
+    if (!hasPathOps(uState)) return uState
+    const updates: globalThis.Record<string, unknown> = {
+      ...((uState.updates as globalThis.Record<string, unknown> | undefined) ?? {}),
+    }
+    const remove = [...(uState.remove ?? [])]
+    const add: globalThis.Record<string, number> = { ...uState.add }
+    const subtract: globalThis.Record<string, number> = { ...uState.subtract }
+    const targeted = new Set<string>([
+      ...Object.keys(updates),
+      ...remove,
+      ...Object.keys(add),
+      ...Object.keys(subtract),
+      ...Object.keys(uState.append ?? {}),
+      ...Object.keys(uState.deleteFromSet ?? {}),
+    ])
+    let refusal: string | undefined
+    let rewritten = false
+    const shown = (segments: ReadonlyArray<string | number>) =>
+      JSON.stringify(
+        segments.map((s, i) => (typeof s === "number" ? `[${s}]` : i === 0 ? s : `.${s}`)).join(""),
+      )
+    // The field a path operation addresses when it feeds a key or sentinel,
+    // "free" when it feeds neither, or "refused" (recorded) for the shapes
+    // that can never be rewritten.
+    const claim = (
+      op: string,
+      segments: ReadonlyArray<string | number>,
+    ): { readonly field: string; readonly reason: string } | "free" | "refused" => {
+      const first = segments[0]
+      if (typeof first !== "string") return "free"
+      const head: string = first
+      const reason = derivedFrom(head)
+      if (reason === undefined) return "free"
+      if (segments.length > 1) {
+        refusal ??=
+          `${op} on ${shown(segments)}: "${head}" is ${reason}, so a path below it cannot be ` +
+          `updated. Write the whole value with .set({ ${head} }).`
+      } else if (reason === "a primary-key composite") {
+        refusal ??=
+          `${op} on "${head}": "${head}" is a primary-key composite — it identifies the item ` +
+          "and cannot be changed by an update."
+      } else if (immutableFields.has(head)) {
+        refusal ??= `${op} on "${head}": "${head}" is immutable and cannot be changed by an update.`
+      } else if (targeted.has(head)) {
+        refusal ??=
+          `${op} on "${head}": "${head}" is ${reason} and is already targeted by another ` +
+          "operation in this update. Give it one operation."
+      } else {
+        targeted.add(head)
+        return { field: head, reason }
+      }
+      return "refused"
+    }
+    const serverSide = (op: string, field: string, reason: string) => {
+      refusal ??=
+        `${op} on "${field}": "${field}" is ${reason}. DynamoDB computes this operation's ` +
+        `result at write time, so the key or sentinel derived from "${field}" could not be ` +
+        `recomposed to match. Read the item and write the new value with .set({ ${field} }).`
+    }
+    const keep = <Op>(
+      ops: ReadonlyArray<Op> | undefined,
+      segmentsOf: (op: Op) => ReadonlyArray<string | number>,
+      name: string,
+      rewrite: (op: Op, field: string, reason: string) => void,
+    ): ReadonlyArray<Op> | undefined => {
+      if (ops === undefined) return undefined
+      const kept: Array<Op> = []
+      for (const op of ops) {
+        const claimed = claim(name, segmentsOf(op))
+        if (claimed === "free") kept.push(op)
+        if (typeof claimed === "string") continue
+        rewritten = true
+        rewrite(op, claimed.field, claimed.reason)
+      }
+      return kept
+    }
+    const pathSets = keep(
+      uState.pathSets,
+      (op) => op.segments,
+      "pathSet",
+      (op, field, reason) => {
+        if (op.isPath) serverSide("pathSet (a copy of another attribute)", field, reason)
+        else updates[field] = op.value
+      },
+    )
+    const pathRemoves = keep(
+      uState.pathRemoves,
+      (segments) => segments,
+      "pathRemove",
+      (_, field) => {
+        remove.push(field)
+      },
+    )
+    const pathAdds = keep(
+      uState.pathAdds,
+      (op) => op.segments,
+      "pathAdd",
+      (op, field, reason) => {
+        if (typeof op.value === "number") add[field] = op.value
+        else serverSide("pathAdd (to a set)", field, reason)
+      },
+    )
+    const pathSubtracts = keep(
+      uState.pathSubtracts,
+      (op) => op.segments,
+      "pathSubtract",
+      (op, field, reason) => {
+        if (!op.isPath && typeof op.value === "number") subtract[field] = op.value
+        else serverSide("pathSubtract (of another attribute)", field, reason)
+      },
+    )
+    const refuseAll =
+      (name: string) =>
+      (_: unknown, field: string, reason: string): void =>
+        serverSide(name, field, reason)
+    const pathAppends = keep(
+      uState.pathAppends,
+      (op) => op.segments,
+      "pathAppend",
+      refuseAll("pathAppend"),
+    )
+    const pathPrepends = keep(
+      uState.pathPrepends,
+      (op) => op.segments,
+      "pathPrepend",
+      refuseAll("pathPrepend"),
+    )
+    const pathIfNotExists = keep(
+      uState.pathIfNotExists,
+      (op) => op.segments,
+      "pathIfNotExists",
+      refuseAll("pathIfNotExists"),
+    )
+    const pathDeletes = keep(
+      uState.pathDeletes,
+      (op) => op.segments,
+      "pathDelete",
+      refuseAll("pathDelete"),
+    )
+    if (refusal !== undefined) return refusal
+    if (!rewritten) return uState
+    return {
+      ...uState,
+      updates: Object.keys(updates).length > 0 ? updates : uState.updates,
+      remove: remove.length > 0 ? remove : uState.remove,
+      add: Object.keys(add).length > 0 ? add : uState.add,
+      subtract: Object.keys(subtract).length > 0 ? subtract : uState.subtract,
+      pathSets,
+      pathRemoves,
+      pathAdds,
+      pathSubtracts,
+      pathAppends,
+      pathPrepends,
+      pathIfNotExists,
+      pathDeletes,
+    }
+  }
+
   // schema + tableTag are injected via _configure() when the entity is registered
   // on a Table and bound through DynamoClient.make(); captured by operation closures.
   let schema!: DynamoSchema.DynamoSchema
@@ -3309,8 +3514,20 @@ const makeImpl = <
 
   const update = (key: unknown) =>
     new EntityUpdateImpl(
-      (mode: DecodeMode, uState: UpdateState) =>
+      (mode: DecodeMode, requested: UpdateState) =>
         Effect.gen(function* () {
+          // Path operations on a field that feeds a key or a unique sentinel
+          // become the record operations they are equivalent to, or are
+          // refused (#133) — before anything reads the state.
+          const normalized = normalizeDerivedPathOps(requested)
+          if (typeof normalized === "string") {
+            return yield* new ValidationError({
+              entityType,
+              operation: "update",
+              cause: normalized,
+            })
+          }
+          const uState = normalized
           const updates = uState.updates
           const evExpected = uState.expectedVersion
           const userCond = uState.condition
@@ -3373,23 +3590,44 @@ const makeImpl = <
             touchesUniqueFields = [...uniqueFieldSet].some((f) => allUpdatedFields.has(f))
           }
 
+          // `.add()` / `.subtract()` / `.append()` / `.deleteFromSet()` on an
+          // index composite: DynamoDB would compute the new value, but the
+          // index key is composed from it here — so the item is read, the
+          // value computed and the keys recomposed by the read-then-write
+          // branch below, exactly as for a retain entity (#133).
+          const indexComposites = indexCompositeFields()
+          const computedComposites = [
+            ...Object.keys(uState.add ?? {}),
+            ...Object.keys(uState.subtract ?? {}),
+            ...Object.keys(uState.append ?? {}),
+            ...Object.keys(uState.deleteFromSet ?? {}),
+          ].filter((field) => indexComposites.has(field))
+
           // Path operations are never emulated in memory: DynamoDB applies them
           // (#133). A retain update carrying them takes the standard branch
           // below, transacted with its version snapshot. An update that also
-          // rotates a unique sentinel needs this branch's read-then-put, which
-          // cannot carry them — refused rather than silently dropping them.
+          // rotates a unique sentinel or computes an index composite needs this
+          // branch's read-then-put, which cannot carry them — refused rather
+          // than silently dropping them.
           const pathOpsPresent = hasPathOps(uState)
-          if (pathOpsPresent && touchesUniqueFields) {
+          if (pathOpsPresent && (touchesUniqueFields || computedComposites.length > 0)) {
             return yield* new ValidationError({
               entityType,
               operation: "update",
-              cause:
-                "Path operations (pathSet, pathAppend, …) cannot be combined with a change to a " +
-                "unique-constraint field in one update: the unique sentinels are rotated by a " +
-                "read-then-put that DynamoDB path expressions cannot join. Split the update in two.",
+              cause: touchesUniqueFields
+                ? "Path operations (pathSet, pathAppend, …) cannot be combined with a change to a " +
+                  "unique-constraint field in one update: the unique sentinels are rotated by a " +
+                  "read-then-put that DynamoDB path expressions cannot join. Split the update in two."
+                : `Path operations (pathSet, pathAppend, …) cannot be combined with a computed ` +
+                  `change to index composite "${computedComposites[0]}" in one update: its new ` +
+                  "value is computed by a read-then-put that DynamoDB path expressions cannot " +
+                  "join. Split the update in two.",
             })
           }
-          if ((isRetainEnabled() || touchesUniqueFields) && !pathOpsPresent) {
+          if (
+            (isRetainEnabled() || touchesUniqueFields || computedComposites.length > 0) &&
+            !pathOpsPresent
+          ) {
             // --- Retain path: read-then-transact ---
             // Read current item (needed to create snapshot of pre-update state)
             const currentResult = yield* client.getItem({

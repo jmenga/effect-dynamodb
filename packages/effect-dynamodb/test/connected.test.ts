@@ -13994,3 +13994,394 @@ describeConnected("#133 — retain path operations match DynamoDB's own", () => 
     }).pipe(provideP133),
   )
 })
+
+// ---------------------------------------------------------------------------
+// #133 — path operations on index composites and unique fields; condition
+// failures; the exact retain post-image
+//
+// A top-level `pathSet` / `pathRemove` on a field that feeds an index key or a
+// unique sentinel goes through the same logic as `.set()` / `.remove()`. Each
+// case runs the record form against one table and the path form against a
+// second table with the same definition: every item in the two tables — main
+// items, index keys, version snapshots, unique sentinels — must be identical.
+// Covers the six canonical GSI-composite shapes on a plain and a retain entity.
+// ---------------------------------------------------------------------------
+
+const G133Schema = DynamoSchema.make({ name: "edd133g", version: 1 })
+const g133Variants = <M extends Schema.Top>(
+  name: string,
+  model: M,
+  config: {
+    readonly primaryKey: Record<string, any>
+    readonly indexes?: Record<string, any>
+    readonly unique?: Record<string, any>
+  },
+) =>
+  ({
+    plain: Entity.make({
+      model,
+      entityType: `G133${name}Plain`,
+      ...config,
+      timestamps: true,
+      versioned: true,
+    } as any),
+    retained: Entity.make({
+      model,
+      entityType: `G133${name}Retained`,
+      ...config,
+      timestamps: true,
+      versioned: { retain: true },
+    } as any),
+  }) as const
+const g133IdKey = { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } }
+
+class G133Device extends Schema.Class<G133Device>("G133Device")({
+  id: Schema.String,
+  owner: Schema.optional(Schema.String),
+  reading: Schema.optional(Schema.String),
+  seq: Schema.optional(Schema.Number),
+  label: Schema.optional(Schema.String),
+}) {}
+const g133DeviceIndexes = {
+  byOwner: {
+    name: "gsi1",
+    pk: { field: "gsi1pk", composite: ["owner"] },
+    sk: { field: "gsi1sk", composite: ["reading", "seq"] },
+  },
+}
+const G133Devices = g133Variants("Device", G133Device, {
+  primaryKey: g133IdKey,
+  indexes: g133DeviceIndexes,
+})
+class G133Port extends Schema.Class<G133Port>("G133Port")({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  label: Schema.optional(Schema.String),
+}) {}
+const G133Ports = g133Variants("Port", G133Port, {
+  primaryKey: {
+    pk: { field: "pk", composite: ["channel"] },
+    sk: { field: "sk", composite: ["deviceId"] },
+  },
+  indexes: {
+    byChannel: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["channel"] },
+      sk: { field: "gsi2sk", composite: ["deviceId"] },
+    },
+  },
+})
+class G133Site extends Schema.Class<G133Site>("G133Site")({
+  id: Schema.String,
+  region: Schema.optional(Schema.String),
+  country: Schema.optional(Schema.String),
+  city: Schema.optional(Schema.String),
+  site: Schema.optional(Schema.String),
+}) {}
+const G133Sites = g133Variants("Site", G133Site, {
+  primaryKey: g133IdKey,
+  indexes: {
+    byLocation: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["region"] },
+      sk: { field: "gsi1sk", composite: ["country", "city", "site"] },
+    },
+  },
+})
+class G133Slot extends Schema.Class<G133Slot>("G133Slot")({
+  id: Schema.String,
+  tenant: Schema.optional(Schema.String),
+  lead: Schema.optional(Schema.String),
+  trail: Schema.optional(Schema.String),
+}) {}
+const G133Slots = g133Variants("Slot", G133Slot, {
+  primaryKey: g133IdKey,
+  indexes: {
+    byTenant: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenant"] },
+      sk: { field: "gsi1sk", composite: ["lead", "trail"] },
+      indexPolicy: { sk: "sparse" },
+    },
+  },
+})
+class G133Task extends Schema.Class<G133Task>("G133Task")({
+  id: Schema.String,
+  category: Schema.optional(Schema.String),
+  priority: Schema.optional(Schema.String),
+}) {}
+const G133Tasks = g133Variants("Task", G133Task, {
+  primaryKey: g133IdKey,
+  indexes: {
+    byCategory: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["category"] },
+      sk: { field: "gsi1sk", composite: ["priority"] },
+    },
+  },
+})
+class G133Binding extends Schema.Class<G133Binding>("G133Binding")({
+  id: Schema.String,
+  deviceBinding: Schema.optional(Schema.String),
+}) {}
+const G133Bindings = g133Variants("Binding", G133Binding, {
+  primaryKey: g133IdKey,
+  indexes: {
+    byDeviceBinding: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["deviceBinding"] },
+      sk: { field: "gsi1sk", composite: [] },
+    },
+  },
+})
+class G133Account extends Schema.Class<G133Account>("G133Account")({
+  id: Schema.String,
+  email: Schema.optional(Schema.String),
+  name: Schema.optional(Schema.String),
+}) {}
+const G133Accounts = g133Variants("Account", G133Account, {
+  primaryKey: g133IdKey,
+  unique: { email: ["email"] },
+})
+const G133Counters = Entity.make({
+  model: G133Device,
+  entityType: "G133Counter",
+  primaryKey: g133IdKey as any,
+  indexes: g133DeviceIndexes,
+})
+
+const g133Entities = {
+  DevicesPlain: G133Devices.plain,
+  DevicesRetained: G133Devices.retained,
+  PortsPlain: G133Ports.plain,
+  PortsRetained: G133Ports.retained,
+  SitesPlain: G133Sites.plain,
+  SitesRetained: G133Sites.retained,
+  SlotsPlain: G133Slots.plain,
+  SlotsRetained: G133Slots.retained,
+  TasksPlain: G133Tasks.plain,
+  TasksRetained: G133Tasks.retained,
+  BindingsPlain: G133Bindings.plain,
+  BindingsRetained: G133Bindings.retained,
+  AccountsPlain: G133Accounts.plain,
+  AccountsRetained: G133Accounts.retained,
+  Counters: G133Counters,
+}
+const G133Table = Table.make({ schema: G133Schema, entities: g133Entities })
+const g133Tables = {
+  record: `edd133g-record-${Date.now()}`,
+  path: `edd133g-path-${Date.now()}`,
+} as const
+const g133Layer = (name: string) => Layer.mergeAll(ClientLayer, G133Table.layer({ name }))
+const g133Client = DynamoClient.make({ entities: g133Entities, tables: { G133Table } })
+
+/**
+ * The bound accessors are driven through `any` (one table serves every shape),
+ * which leaves the requirements `unknown`; the layers provide them.
+ */
+const g133Closed = <A, E>(effect: Effect.Effect<A, E, unknown>): Effect.Effect<A, E> =>
+  effect as Effect.Effect<A, E>
+
+describeConnected("#133 — path operations on index composites and unique fields", () => {
+  beforeAll(async () => {
+    for (const name of Object.values(g133Tables)) {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const db = yield* g133Client
+          yield* db.tables.G133Table.create()
+        }).pipe(Effect.provide(g133Layer(name)), Effect.scoped),
+      )
+    }
+  }, 30000)
+
+  afterAll(async () => {
+    for (const name of Object.values(g133Tables)) {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const client = yield* DynamoClient
+          yield* client.deleteTable({ TableName: name })
+        }).pipe(
+          Effect.provide(g133Layer(name)),
+          Effect.scoped,
+          Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+        ),
+      )
+    }
+  }, 30000)
+
+  type Build = (u: any) => any
+  const pathSet =
+    (field: string, value: unknown): Build =>
+    (u) =>
+      u.pathSet({ segments: [field], value, isPath: false })
+  const shapes: ReadonlyArray<readonly [string, string, Record<string, unknown>, Build, Build]> = [
+    [
+      "1. multi-writer: PK-half composite",
+      "Devices",
+      { id: "mw", owner: "alice", reading: "r1", seq: 1, label: "l" },
+      (u) => u.set({ owner: "bob" }),
+      pathSet("owner", "bob"),
+    ],
+    [
+      "1. multi-writer: numeric SK-half composite",
+      "Devices",
+      { id: "mwn", owner: "alice", reading: "r1", seq: 1 },
+      (u) => u.add({ seq: 2 }),
+      (u) => u.pathAdd({ segments: ["seq"], value: 2 }),
+    ],
+    [
+      "2. PK-composites-only: a non-composite write",
+      "Ports",
+      { channel: "c1", deviceId: "x1", label: "l" },
+      (u) => u.set({ label: "m" }),
+      (u) => u.set({ label: "m" }),
+    ],
+    [
+      "3. hierarchical: parents set, leaf removed",
+      "Sites",
+      { id: "h", region: "emea", country: "uk", city: "ldn", site: "dc1" },
+      (u) => u.set({ region: "emea", country: "uk", city: "mcr" }).remove(["site"]),
+      (u) =>
+        u
+          .pathSet({ segments: ["region"], value: "emea", isPath: false })
+          .pathSet({ segments: ["country"], value: "uk", isPath: false })
+          .pathSet({ segments: ["city"], value: "mcr", isPath: false })
+          .pathRemove(["site"]),
+    ],
+    [
+      "3. hierarchical: a lone leaf",
+      "Sites",
+      { id: "hl", region: "emea", country: "uk", city: "ldn", site: "dc1" },
+      (u) => u.set({ city: "mcr" }),
+      pathSet("city", "mcr"),
+    ],
+    [
+      "4. hole pattern",
+      "Slots",
+      { id: "hp", tenant: "t1", trail: "z1" },
+      (u) => u.set({ trail: "z2" }),
+      pathSet("trail", "z2"),
+    ],
+    [
+      "5. all composites mutable",
+      "Tasks",
+      { id: "am", category: "a", priority: "low" },
+      (u) => u.set({ category: "b", priority: "high" }),
+      (u) =>
+        u
+          .pathSet({ segments: ["category"], value: "b", isPath: false })
+          .pathSet({ segments: ["priority"], value: "high", isPath: false }),
+    ],
+    [
+      "6. empty-composite half: set",
+      "Bindings",
+      { id: "eh", deviceBinding: "db1" },
+      (u) => u.set({ deviceBinding: "db2" }),
+      pathSet("deviceBinding", "db2"),
+    ],
+    [
+      "6. empty-composite half: remove",
+      "Bindings",
+      { id: "ehr", deviceBinding: "db1" },
+      (u) => u.remove(["deviceBinding"]),
+      (u) => u.pathRemove(["deviceBinding"]),
+    ],
+    [
+      "unique constraint: set",
+      "Accounts",
+      { id: "us", email: "us@x.io", name: "n" },
+      (u) => u.set({ email: "us2@x.io" }),
+      pathSet("email", "us2@x.io"),
+    ],
+    [
+      "unique constraint: remove",
+      "Accounts",
+      { id: "ur", email: "ur@x.io", name: "n" },
+      (u) => u.remove(["email"]),
+      (u) => u.pathRemove(["email"]),
+    ],
+  ]
+
+  const scanAll = (name: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { Items } = yield* client.scan({ TableName: name, ConsistentRead: true })
+      return (Items ?? [])
+        .map((item) => item as Record<string, any>)
+        .sort((a, b) => `${a.pk.S}|${a.sk.S}`.localeCompare(`${b.pk.S}|${b.sk.S}`))
+    }).pipe(Effect.provide(g133Layer(name)))
+
+  it.effect("pathSet / pathRemove store exactly what .set() / .remove() store", () =>
+    Effect.gen(function* () {
+      for (const variant of ["Plain", "Retained"] as const) {
+        for (const [label, entity, seed, viaRecord, viaPath] of shapes) {
+          for (const [form, build] of [
+            ["record", viaRecord],
+            ["path", viaPath],
+          ] as const) {
+            yield* Effect.gen(function* () {
+              const db = yield* g133Client
+              const bound = (db.entities as Record<string, any>)[`${entity}${variant}`]
+              yield* bound.put(seed)
+              const key = Object.fromEntries(
+                Object.entries(seed).filter(([k]) => ["id", "channel", "deviceId"].includes(k)),
+              )
+              const out = yield* Effect.exit(
+                Effect.suspend(() => build(bound.update(key)).asEffect() as Effect.Effect<unknown>),
+              )
+              expect([variant, label, form, out._tag]).toEqual([variant, label, form, "Success"])
+            }).pipe(Effect.provide(g133Layer(g133Tables[form])))
+          }
+        }
+      }
+      const record = yield* scanAll(g133Tables.record)
+      const path = yield* scanAll(g133Tables.path)
+      expect(path).toEqual(record)
+      // The keys moved: spot-check one per shape in the stored rows.
+      const keysOf = (pk: string) =>
+        record.filter((i) => i.pk.S === pk).map((i) => [i.sk.S, i.gsi1pk?.S, i.gsi1sk?.S])
+      expect(keysOf("$edd133g#v1#g133deviceplain#id_mw")[0]![1]).toBe(
+        "$edd133g#v1#g133deviceplain#owner_bob",
+      )
+      expect(keysOf("$edd133g#v1#g133deviceplain#id_mwn")[0]![2]).toMatch(/#seq_0+3$/)
+      expect(keysOf("$edd133g#v1#g133siteplain#id_h")[0]![2]).toMatch(/#city_mcr$/)
+      expect(keysOf("$edd133g#v1#g133bindingplain#id_eh")[0]![1]).toMatch(/#devicebinding_db2$/)
+      expect(keysOf("$edd133g#v1#g133bindingplain#id_ehr")[0]![1]).toBeUndefined()
+      const sentinels = record.filter((i) => String(i.__edd_e__?.S).includes("_unique"))
+      expect(sentinels.map((i) => i.pk.S).filter((pk) => pk.includes("us"))).toEqual(
+        expect.arrayContaining([expect.stringContaining("us2@x.io")]),
+      )
+      expect(sentinels.some((i) => String(i.pk.S).includes("us@x.io"))).toBe(false)
+      expect(sentinels.some((i) => String(i.pk.S).includes("ur@x.io"))).toBe(false)
+    }).pipe(g133Closed),
+  )
+
+  it.effect("refuses path operations DynamoDB would compute on a composite", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      yield* db.entities.DevicesRetained.put({ id: "rf", owner: "alice", reading: "r1" } as any)
+      const error = yield* (db.entities.DevicesRetained as any)
+        .update({ id: "rf" })
+        .pathIfNotExists({ segments: ["owner"], value: "bob" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String(error.cause)).toContain('"owner"')
+    }).pipe(Effect.provide(g133Layer(g133Tables.record)), g133Closed),
+  )
+
+  it.effect(".add() on a composite of an unversioned entity recomposes the index key", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      yield* db.entities.Counters.put({ id: "cn", owner: "alice", reading: "r1", seq: 1 } as any)
+      const updated = (yield* (db.entities.Counters as any)
+        .update({ id: "cn" })
+        .add({ seq: 2 })) as any
+      expect(updated.seq).toBe(3)
+      const hits = yield* (db.entities.Counters as any)
+        .byOwner({ owner: "alice", reading: "r1", seq: 3 })
+        .collect()
+      expect(hits.map((h: any) => h.id)).toEqual(["cn"])
+    }).pipe(Effect.provide(g133Layer(g133Tables.record)), g133Closed),
+  )
+})
