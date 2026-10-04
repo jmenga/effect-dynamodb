@@ -1737,3 +1737,65 @@ describe("#133 nested transforms — DynamoModel.DateTimeZoned keeps offset zone
     }).pipe(Effect.provide(TestLayer)),
   )
 })
+
+// ---------------------------------------------------------------------------
+// Batch 6 — container refinements are enforced on writes, not on reads
+// ---------------------------------------------------------------------------
+
+describe("#133 nested transforms — container checks on writes", () => {
+  const ordered = Schema.makeFilter(
+    (v: { readonly from: DateTime.Utc; readonly to: DateTime.Utc }) =>
+      DateTime.toEpochMillis(v.from) <= DateTime.toEpochMillis(v.to) || "from must not be after to",
+  )
+  class CheckedWindow extends Schema.Class<CheckedWindow>("AggCheckedWindow")(
+    Schema.Struct({ from: Schema.DateTimeUtc, to: Schema.DateTimeUtc }).check(ordered),
+  ) {}
+  const dt = DateTime.makeUnsafe(DOB_MS)
+  const later = DateTime.makeUnsafe(DAY2_MS)
+
+  for (const [label, schema, valid, invalid, violatingRow] of [
+    [
+      "Array.check(isMaxLength(2))",
+      Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(2)),
+      [dt],
+      [dt, dt, dt],
+      { L: [S(DOB), S(DOB), S(DOB)] },
+    ],
+    [
+      "Struct.check(...)",
+      Schema.Struct({ from: Schema.DateTimeUtc, to: Schema.DateTimeUtc }).check(ordered),
+      { from: dt, to: later },
+      { from: later, to: dt },
+      { M: { from: S(DAY2), to: S(DOB) } },
+    ],
+    [
+      "Class over a checked Struct",
+      CheckedWindow,
+      { from: dt, to: later },
+      { from: later, to: dt },
+      { M: { from: S(DAY2), to: S(DOB) } },
+    ],
+  ] as const) {
+    it.effect(`${label}: create and update reject, a stored violating row still reads`, () =>
+      Effect.gen(function* () {
+        const Holder = makeHolder(`checked-write-${label}`, schema as Schema.Top)
+        yield* Holder.create({ id: "h1", f: valid } as any)
+        const badCreate = yield* Effect.flip(Holder.create({ id: "h2", f: invalid } as any))
+        expect(badCreate._tag).toBe("ValidationError")
+        const badUpdate = yield* Effect.flip(
+          Holder.update({ id: "h1" } as any, (ctx: any) => ({ ...ctx.state, f: invalid })),
+        )
+        expect(badUpdate._tag).toBe("ValidationError")
+
+        // A row written before the check was enforced is still readable, and an
+        // update that leaves it alone still works.
+        holderItem().f = violatingRow as unknown as AttributeValue
+        const got = (yield* Holder.get({ id: "h1" } as any)) as any
+        expect(got.f).toBeDefined()
+        transactCalls.length = 0
+        yield* Holder.update({ id: "h1" } as any, (ctx: any) => ({ ...ctx.state, f: valid }))
+        expect(transactCalls).toHaveLength(1)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  }
+})

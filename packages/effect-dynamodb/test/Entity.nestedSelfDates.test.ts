@@ -18,9 +18,11 @@ import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DateTime, Effect, Equal, Layer, Redacted, Schema } from "effect"
 import { beforeEach } from "vitest"
+import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
+import * as Transaction from "../src/Transaction.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
@@ -1243,4 +1245,244 @@ describe("#133 entity nested self dates — epoch date next to NumberFromString"
       expect(isRealUtc(((yield* db.entities.Holders.get({ id: "b" })) as any).f, DOB_MS)).toBe(true)
     }).pipe(Effect.provide(layer))
   })
+})
+
+// ---------------------------------------------------------------------------
+// Batch 6 — container refinements are enforced on writes, not on reads; path
+// values under an opaque DynamoModel.ref field
+// ---------------------------------------------------------------------------
+
+const ordered = Schema.makeFilter(
+  (v: { readonly from: DateTime.Utc; readonly to: DateTime.Utc }) =>
+    DateTime.toEpochMillis(v.from) <= DateTime.toEpochMillis(v.to) || "from must not be after to",
+)
+const Window = Schema.Struct({ from: Schema.DateTimeUtc, to: Schema.DateTimeUtc }).check(ordered)
+class Slot extends Schema.Class<Slot>("CheckedSlot")(
+  Schema.Struct({ from: Schema.DateTimeUtc, to: Schema.DateTimeUtc }).check(ordered),
+) {}
+
+describe("#133 entity nested self dates — container checks on writes", () => {
+  const { client, layer } = makeEntityHolder(
+    "checked",
+    Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(2)),
+    undefined,
+    { window: Window, slot: Slot },
+  )
+  const valid = {
+    id: "v",
+    f: [dt],
+    window: { from: dt, to: later },
+    slot: new Slot({ from: dt, to: later }),
+  }
+  const failsValidation = (effect: Effect.Effect<unknown, unknown, any>) =>
+    Effect.gen(function* () {
+      const error = yield* Effect.flip(effect)
+      expect((error as { _tag?: string })._tag).toBe("ValidationError")
+    })
+
+  it.effect(
+    "put, set, path ops, Batch and Transaction reject a value breaking a container check",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* client
+        yield* db.entities.Holders.put(valid as any)
+        const holders = db.entities.Holders as any
+        yield* failsValidation(holders.put({ ...valid, id: "a", f: [dt, dt, dt] }).asEffect())
+        yield* failsValidation(
+          holders.put({ ...valid, id: "b", window: { from: later, to: dt } }).asEffect(),
+        )
+        yield* failsValidation(
+          holders.put({ ...valid, id: "c", slot: { from: later, to: dt } }).asEffect(),
+        )
+        yield* failsValidation(
+          holders
+            .update({ id: "v" })
+            .set({ f: [dt, dt, dt] })
+            .asEffect(),
+        )
+        yield* failsValidation(
+          holders
+            .update({ id: "v" })
+            .set({ window: { from: later, to: dt } })
+            .asEffect(),
+        )
+        yield* failsValidation(
+          holders
+            .update({ id: "v" })
+            .pathSet({ segments: ["f"], value: [dt, dt, dt], isPath: false })
+            .asEffect(),
+        )
+        yield* failsValidation(
+          holders
+            .update({ id: "v" })
+            .pathSet({ segments: ["window"], value: { from: later, to: dt }, isPath: false })
+            .asEffect(),
+        )
+        yield* failsValidation(
+          holders
+            .update({ id: "v" })
+            .pathSet({ segments: ["slot"], value: { from: later, to: dt }, isPath: false })
+            .asEffect(),
+        )
+        yield* failsValidation(Batch.write([holders.put({ ...valid, id: "d", f: [dt, dt, dt] })]))
+        yield* failsValidation(
+          Transaction.transactWrite([holders.put({ ...valid, id: "e", f: [dt, dt, dt] })]),
+        )
+        // Nothing was written by the rejected operations.
+        expect(holderRow("a")).toBeUndefined()
+        expect(holderRow("v").f).toEqual({ L: [S(DOB)] })
+      }).pipe(Effect.provide(layer)),
+  )
+
+  it.effect("valid writes are unaffected", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Holders.put(valid as any)
+      expect(holderRow("v").f).toEqual({ L: [S(DOB)] })
+      writes.length = 0
+      yield* db.entities.Holders.update({ id: "v" }).set({ f: [dt, later] } as any)
+      expect(lastUpdateValues()).toContainEqual({ L: [S(DOB), S(LATER)] })
+      writes.length = 0
+      yield* db.entities.Holders.update({ id: "v" }).pathSet({
+        segments: ["window"],
+        value: { from: dt, to: dt },
+        isPath: false,
+      })
+      expect(lastUpdateValues()).toContainEqual({ M: { from: S(DOB), to: S(DOB) } })
+    }).pipe(Effect.provide(layer)),
+  )
+
+  it.effect("a stored row that breaks a container check still reads", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      plant("old", {
+        f: { L: [S(DOB), S(DOB), S(DOB)] },
+        window: { M: { from: S(LATER), to: S(DOB) } },
+        slot: { M: { from: S(LATER), to: S(DOB) } },
+      })
+      const got = (yield* db.entities.Holders.get({ id: "old" })) as any
+      expect(got.f).toHaveLength(3)
+      expect(isRealUtc(got.window.from, LATER_MS)).toBe(true)
+      expect(got.slot).toBeInstanceOf(Slot)
+    }).pipe(Effect.provide(layer)),
+  )
+})
+
+describe("#133 entity nested self dates — path values under a DynamoModel.ref field", () => {
+  class Author extends Schema.Class<Author>("RefAuthor")({
+    authorId: Schema.String.pipe(DynamoModel.identifier),
+    name: Schema.String,
+    born: Schema.DateTimeUtc,
+    secret: Schema.Redacted(Schema.String),
+    rank: Schema.NumberFromString,
+    awards: Schema.Array(Schema.DateTimeUtc),
+  }) {}
+  class Note extends Schema.Class<Note>("RefNote")({
+    id: Schema.String,
+    author: Author.pipe(DynamoModel.ref),
+  }) {}
+  const pk = {
+    pk: { field: "pk", composite: [] as Array<string> },
+    sk: { field: "sk", composite: [] },
+  }
+  const Authors = Entity.make({
+    model: Author,
+    entityType: "RefAuthor",
+    primaryKey: { ...pk, pk: { field: "pk", composite: ["authorId"] } },
+  })
+  const Notes = Entity.make({
+    model: Note,
+    entityType: "RefNote",
+    primaryKey: { ...pk, pk: { field: "pk", composite: ["id"] } },
+    refs: { author: { entity: Authors } },
+  })
+  const RefTable = Table.make({ schema: AppSchema, entities: { Authors, Notes } })
+  const refLayer = Layer.merge(InMemoryClient, RefTable.layer({ name: "edd133" }))
+  const refClient = DynamoClient.make({ entities: { Authors, Notes }, tables: { RefTable } })
+  const author = new Author({
+    authorId: "a1",
+    name: "Ann",
+    born: dt,
+    secret: Redacted.make("s"),
+    rank: 1,
+    awards: [dt],
+  })
+  const storedAuthor = (rank: string) => ({
+    M: {
+      authorId: S("a1"),
+      name: S("Ann"),
+      born: S(DOB),
+      secret: S("s"),
+      rank: S(rank),
+      awards: { L: [S(DOB)] },
+    },
+  })
+  const update = (f: (u: any) => any) =>
+    Effect.gen(function* () {
+      const db = yield* refClient
+      writes.length = 0
+      yield* f(db.entities.Notes.update({ id: "n1" })) as Effect.Effect<unknown>
+      return lastUpdateValues()
+    })
+
+  it.effect("encodes values set into and under the ref field", () =>
+    Effect.gen(function* () {
+      const db = yield* refClient
+      yield* db.entities.Authors.put(author as any)
+      yield* db.entities.Notes.put({ id: "n1", authorId: "a1" } as any)
+      const note = [...store.values()].find((i) => i.__edd_e__?.S === "RefNote")!
+      expect(note.author).toEqual(storedAuthor("1"))
+
+      expect(
+        yield* update((u) =>
+          u.pathSet({ segments: ["author", "born"], value: later, isPath: false }),
+        ),
+      ).toContainEqual(S(LATER))
+      expect(
+        yield* update((u) =>
+          u.pathSet({ segments: ["author", "secret"], value: Redacted.make("t"), isPath: false }),
+        ),
+      ).toContainEqual(S("t"))
+      expect(
+        yield* update((u) => u.pathSet({ segments: ["author", "rank"], value: 7, isPath: false })),
+      ).toContainEqual(S("7"))
+      expect(
+        yield* update((u) => u.pathAppend({ segments: ["author", "awards"], value: [later] })),
+      ).toContainEqual({ L: [S(LATER)] })
+      expect(
+        yield* update((u) => u.pathIfNotExists({ segments: ["author", "born"], value: later })),
+      ).toContainEqual(S(LATER))
+      const whole = yield* update((u) =>
+        u.pathSet({ segments: ["author"], value: author, isPath: false }),
+      )
+      expect(whole).toContainEqual(storedAuthor("1"))
+      expect(whole.some(holdsMarshalledDate)).toBe(false)
+    }).pipe(Effect.provide(refLayer)),
+  )
+
+  it.effect("legacy raw values under the ref field still read", () =>
+    Effect.gen(function* () {
+      const db = yield* refClient
+      store.set("$edd133#v1#refnote#id_n2|$edd133#v1#refnote", {
+        pk: S("$edd133#v1#refnote#id_n2"),
+        sk: S("$edd133#v1#refnote"),
+        __edd_e__: S("RefNote"),
+        id: S("n2"),
+        author: {
+          M: {
+            authorId: S("a1"),
+            name: S("Ann"),
+            born: rcMap(DOB_MS),
+            secret: S("s"),
+            rank: { N: "5" },
+            awards: { L: [rcMap(DOB_MS)] },
+          },
+        },
+      })
+      const got = (yield* db.entities.Notes.get({ id: "n2" })) as any
+      expect(isRealUtc(got.author.born, DOB_MS)).toBe(true)
+      expect(got.author.rank).toBe(5)
+      expect(isRealUtc(got.author.awards[0], DOB_MS)).toBe(true)
+    }).pipe(Effect.provide(refLayer)),
+  )
 })
