@@ -55,7 +55,9 @@ real `DateTime`s.
   (entities and aggregates; details below). Entity path updates are now
   validated like `.set()`, so a literal outside its set or a string under its
   `minLength` is rejected instead of stored. Reads don't enforce the container
-  checks, so existing rows that break them still read.
+  checks, so existing rows that break them still read. On an aggregate, though,
+  such a row refuses every `update` until that same update makes the value
+  valid; an entity `.set()` on other fields still succeeds on it.
 - **A canonical ISO string in a string member reads as a date.** In
   `Schema.Union([Schema.DateTimeUtc, Schema.String])`, the exact ISO form the
   library writes for a date (`"2000-01-01T00:00:00.000Z"`) reads back as a
@@ -118,8 +120,8 @@ a hydrated ref, and a self date inside a union, record or tuple.
 arrays, structs and checked-struct classes that hold a date or another
 substituted value; earlier versions silently dropped them. A violating value
 fails with a `ValidationError`. Reads don't enforce them, so a stored row that
-breaks one still assembles, and an `update` that makes the value valid repairs
-it.
+breaks one still assembles. Every `update` of that aggregate fails until the
+same update makes the value valid, which repairs the row.
 
 **Known limitation.** A `many` edge with a custom `decompose` that renames
 element fields still stores the renamed values in their domain form, so a
@@ -166,9 +168,14 @@ plain date field, and a `NumberFromString` value was stored as a number. Now:
   value, such as `"aGk="` on a `StringFromBase64` field; encoding it would
   double-encode it. A plain string that isn't valid wire (`"hi"`) is a domain
   value and is encoded.
-- Path values into and under a `DynamoModel.ref` field are encoded through the
-  ref target's model, like any other path. Only a path no schema describes
-  (such as one under a dynamic key of an untyped value) is written as given.
+- Path values into and under a top-level `DynamoModel.ref` field are encoded
+  through the ref target's model, like any other path. Only a path no schema
+  describes (such as one under a dynamic key of an untyped value) is written as
+  given.
+- A value set by path into a class that has lost its fields (one built with
+  `.check()` or `.annotate()`, or a `DynamoModel.ref` nested inside a ref
+  target) is written as given, in the same form `put` stores it, so the item
+  stays readable.
 - Path values are validated like `.set()`, so an invalid value (a literal not
   in the set, a string under `minLength`, a broken container check) fails with a
   `ValidationError` instead of being stored. A key whose value is `undefined`
@@ -184,11 +191,24 @@ plain date field, and a `NumberFromString` value was stored as a number. Now:
 
 `ADD`, `DELETE` and `SUBTRACT` are unchanged.
 
+**Path updates on retain entities.** Path operations (`pathSet`,
+`pathAppend`, `pathPrepend`, `pathIfNotExists`, `pathAdd`, `pathSubtract`,
+`pathDelete`, `pathRemove`) on entities with `versioned: { retain: true }` were
+silently ignored: they returned success and wrote nothing. They are now
+applied, with the same encoding and validation as on other entities. The
+version snapshot holds the item as it was before the update, and
+`expectedVersion` still applies. A path whose parent does not exist fails with
+a `ValidationError`.
+
 **Legacy values read back.** The raw values earlier path updates left on
 transform fields now read: a number on a `NumberFromString` field, a
 safe-integer number on a `BigIntFromString` field, a `DateTime` map on a date
 transform. A plain `Schema.BigInt`, stored as a number, now reads back as a
 `bigint`.
+
+**Known limitation.** Plain dates inside a class that has lost its fields (see
+above), including whole-value `put`, `.set()` and `pathSet` of that class, are
+still stored as maps, as on 1.22.0, and read back as plain objects.
 
 **Zoned dates.** A zoned date with an offset zone (`+05:00`) now reads back
 with that offset, for both `DynamoModel.DateTimeZoned` and a self
