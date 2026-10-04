@@ -355,7 +355,7 @@ export const write = (
             entityType: entity.entityType,
             item: built.marshalled,
             pkField: entity.indexes.primary!.pk.field,
-            bytes: itemBytes(built.marshalled),
+            bytes: itemBytes(built.marshalled, "upper"),
           })
         } else {
           writeRequests.push({

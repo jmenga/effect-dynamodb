@@ -116,8 +116,9 @@ const conditionFields = (condition: ExpressionResult | undefined) =>
 /**
  * Refuse a transaction whose items exceed DynamoDB's 4 MB aggregate limit —
  * BEFORE it is sent, with the entity that contributes most named, rather
- * than DynamoDB's bare `ValidationException`. Sizes are counted as DynamoDB
- * counts them ({@link transactItemBytes}); a retain put counts twice — its
+ * than DynamoDB's bare `ValidationException`. Sizes are a LOWER bound by
+ * DynamoDB's item-size rules ({@link transactItemBytes}), so a transaction
+ * DynamoDB would accept is never refused; a retain put counts twice — its
  * item and its snapshot carry the same attributes.
  */
 export const refuseOversizedTransaction = (
@@ -139,8 +140,8 @@ export const refuseOversizedTransaction = (
       entityType: target?.entityType ?? "unknown",
       operation,
       cause:
-        `${operation}: the transaction's ${items.length} items total ${total} bytes as DynamoDB ` +
-        `counts them, over its limit of ${TRANSACT_WRITE_MAX_BYTES} bytes (4 MB) for one ` +
+        `${operation}: the transaction's ${items.length} items total at least ${total} bytes ` +
+        `by DynamoDB's item-size rules, over its limit of ${TRANSACT_WRITE_MAX_BYTES} bytes (4 MB) for one ` +
         "transaction. The largest is " +
         (target === undefined ? "" : `${target.source}'s, at ${target.key}, `) +
         `${largest.bytes} bytes. A put of a retain entity counts twice: its item and its ` +

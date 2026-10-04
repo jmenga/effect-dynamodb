@@ -1180,7 +1180,7 @@ describe("Transaction", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("the limit is exactly 4 MB as DynamoDB counts it", () =>
+    it.effect("the limit is exactly 4 MB by DynamoDB's item-size rules", () =>
       Effect.gen(function* () {
         // An item of one attribute `a`: 1 byte of name plus its value.
         const put = (bytes: number) => ({
@@ -1194,9 +1194,39 @@ describe("Transaction", () => {
           "transactWrite",
         ).pipe(Effect.flip)
         expect(over._tag).toBe("ValidationError")
-        expect(String(over.cause)).toContain("total 4194305 bytes")
+        expect(String(over.cause)).toContain("total at least 4194305 bytes")
       }),
     )
+
+    it.effect("numbers count as DynamoDB stores them: 25 lists of 12,000 floats fit", () =>
+      Effect.gen(function* () {
+        // ~2.9 MB as DynamoDB counts it (a byte per two significant digits,
+        // plus one); counted by digits it read as 5.5 MB and was refused.
+        const vec = Array.from({ length: 12_000 }, (_, i) => ({
+          N: String(0.1234567890123 + i * 1e-13),
+        }))
+        const items = Array.from({ length: 25 }, (_, i) => ({
+          Put: { TableName: "t", Item: { pk: { S: `p${i}` }, vec: { L: vec } } },
+        }))
+        const targets = items.map((item, i) =>
+          transactItemTarget(item, "t", ["pk"], "Vec", `operation ${i} (Vec)`),
+        )
+        yield* refuseOversizedTransaction(items, targets, "transactWrite")
+      }),
+    )
+
+    it("number sizes trim leading and trailing zeros and count digit pairs", () => {
+      const n = (value: string) => itemBytes({ a: { N: value } }) - 1
+      expect(n("5")).toBe(2)
+      expect(n("12")).toBe(2)
+      expect(n("123")).toBe(3)
+      expect(n("-0.00012300")).toBe(3)
+      expect(n("1000000")).toBe(2)
+      expect(n("0.1234567890123")).toBe(8)
+      expect(n("1e+21")).toBe(2)
+      // The batch budget keeps its higher count.
+      expect(itemBytes({ a: { N: "0.1234567890123" } }, "upper")).toBeGreaterThan(9)
+    })
 
     it("item sizes count attribute names, UTF-8 strings and raw binary", () => {
       expect(itemBytes({ ab: { S: "é" } })).toBe(4)

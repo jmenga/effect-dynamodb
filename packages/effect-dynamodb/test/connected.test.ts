@@ -14260,6 +14260,11 @@ const G133Counters = Entity.make({
   indexes: g133DeviceIndexes,
 })
 
+class G133Vec extends Schema.Class<G133Vec>("G133Vec")({
+  id: Schema.String,
+  vec: Schema.Array(Schema.Number),
+}) {}
+
 // Several items per partition (#133): a primary sort key with a composite.
 class G133Line extends Schema.Class<G133Line>("G133Line")({
   order: Schema.String,
@@ -14388,6 +14393,7 @@ const g133Entities = {
     timestamps: true,
     versioned: true,
   }),
+  Vecs: Entity.make({ model: G133Vec, entityType: "G133Vec", primaryKey: g133IdKey as any }),
   Lines: Entity.make({
     model: G133Line,
     entityType: "G133Line",
@@ -16713,6 +16719,20 @@ describeConnected("#133 — path operations on index composites and unique field
           .map((id) => g133Entities.DevicesRetained.put({ id, owner: "o", label: big } as any)),
       )
       expect((yield* rawItem("G133DeviceRetained", "big-0")).label.S).toHaveLength(380_000)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a transaction of number-heavy items DynamoDB accepts is not refused", () =>
+    Effect.gen(function* () {
+      // 25 lists of 12,000 floats: ~2.9 MB as DynamoDB stores numbers.
+      const vec = Array.from({ length: 12_000 }, (_, i) => 0.1234567890123 + i * 1e-13)
+      yield* Transaction.transactWrite(
+        Array.from({ length: 25 }, (_, i) => g133Entities.Vecs.put({ id: `vec-${i}`, vec } as any)),
+      )
+      const db = yield* g133Client
+      expect(
+        ((yield* (db.entities.Vecs as any).get({ id: "vec-24" })).vec as Array<number>).length,
+      ).toBe(12_000)
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
