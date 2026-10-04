@@ -14256,6 +14256,13 @@ const g133Entities = {
     model: G133Defaults,
     entityType: "G133Defaults",
     primaryKey: g133IdKey as any,
+    indexes: {
+      byTier: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["tier"] },
+        sk: { field: "gsi1sk", composite: ["born"] },
+      },
+    },
     timestamps: true,
   }),
   WideStamped: Entity.make({
@@ -14352,6 +14359,56 @@ const g133RaceLayer = Layer.mergeAll(
   G133InjectingClient,
   G133Table.layer({ name: g133Tables.record }),
 )
+
+// Items written before an entity was `versioned` (#133): the same entity type
+// defined without and with versioning, against the same physical table.
+class G133LegacyDoc extends Schema.Class<G133LegacyDoc>("G133LegacyDoc")({
+  id: Schema.String,
+  name: Schema.String,
+  email: Schema.optional(Schema.String),
+  tags: Schema.optional(Schema.Array(Schema.String)),
+}) {}
+const g133Legacy = (
+  entityType: string,
+  extra: Record<string, unknown>,
+  versioned: boolean | { readonly retain: true },
+) =>
+  Entity.make({
+    model: G133LegacyDoc,
+    entityType,
+    primaryKey: g133IdKey as any,
+    indexes: {
+      byName: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["name"] },
+        sk: { field: "gsi1sk", composite: [] },
+      },
+    },
+    ...extra,
+    ...(versioned === false ? {} : { versioned }),
+  } as any)
+const g133LegacyPairs = {
+  Plain: [g133Legacy("G133LegacyPlain", {}, false), g133Legacy("G133LegacyPlain", {}, true)],
+  Ret: [g133Legacy("G133LegacyRet", {}, false), g133Legacy("G133LegacyRet", {}, { retain: true })],
+  Uniq: [
+    g133Legacy("G133LegacyUniq", { unique: { email: ["email"] } }, false),
+    g133Legacy("G133LegacyUniq", { unique: { email: ["email"] } }, true),
+  ],
+  Soft: [
+    g133Legacy("G133LegacySoft", { softDelete: true }, false),
+    g133Legacy("G133LegacySoft", { softDelete: true }, { retain: true }),
+  ],
+} as const
+/** A client for one side (0: before `versioned`, 1: after) of one pair. */
+const g133LegacyClient = (pair: keyof typeof g133LegacyPairs, side: 0 | 1) => {
+  const entity = g133LegacyPairs[pair][side]
+  const table = Table.make({ schema: G133Schema, entities: { Doc: entity } as any })
+  return {
+    entity,
+    layer: table.layer({ name: g133Tables.record }),
+    client: DynamoClient.make({ entities: { Doc: entity }, tables: { T: table } } as any),
+  }
+}
 
 describeConnected("#133 — path operations on index composites and unique fields", () => {
   beforeAll(async () => {
@@ -15451,17 +15508,39 @@ describeConnected("#133 — path operations on index composites and unique field
         expect(DateTime.formatIso(value.when)).toBe("1970-01-02T00:00:00.000Z")
         expect(value.tier).toBe("basic")
       }
+      // The defaults are stored — so the index they compose is written too.
+      const expectStored = (id: string) =>
+        Effect.gen(function* () {
+          const raw = yield* rawItem("G133Defaults", id)
+          // `tier` and `born` compose the byTier index: stored. `when` is
+          // not part of any key: not stored, defaulted on read.
+          expect([id, raw.born, raw.when, raw.tier]).toEqual([
+            id,
+            { S: "1800-01-01T00:00:00.000Z" },
+            undefined,
+            { S: "basic" },
+          ])
+          expect(raw.gsi1pk).toEqual({ S: "$edd133g#v1#g133defaults#tier_basic" })
+        })
       const put = yield* defaults.put({ id: "df1", name: "n" })
       expectDefaults(put)
       expectDefaults(yield* defaults.get({ id: "df1" }))
+      yield* expectStored("df1")
       expectDefaults(yield* defaults.create({ id: "df2", name: "n" }))
       expectDefaults(yield* defaults.get({ id: "df2" }))
+      yield* expectStored("df2")
       expectDefaults(yield* defaults.upsert({ id: "df3", name: "n" }))
       expectDefaults(yield* defaults.get({ id: "df3" }))
+      yield* expectStored("df3")
       yield* Batch.write([g133Entities.Defaults.put({ id: "df4", name: "n" } as any)])
       expectDefaults(yield* defaults.get({ id: "df4" }))
+      yield* expectStored("df4")
       yield* Transaction.transactWrite([g133Entities.Defaults.put({ id: "df5", name: "n" } as any)])
       expectDefaults(yield* defaults.get({ id: "df5" }))
+      yield* expectStored("df5")
+      // Every one of them is in the index its decoded record names.
+      const inIndex = (yield* defaults.byTier({ tier: "basic" }).collect()).map((d: any) => d.id)
+      expect(inIndex).toEqual(expect.arrayContaining(["df1", "df2", "df3", "df4", "df5"]))
       // A value supplied is stored and returned as given.
       const given = (yield* defaults.put({
         id: "df6",
@@ -15510,6 +15589,9 @@ describeConnected("#133 — path operations on index composites and unique field
       yield* defaults.put({ id: "dp", name: "n" })
       const created = (yield* defaults.update({ id: "du" }).set({ id: "du", name: "n" })) as any
       expect(created.tier).toBe("basic")
+      expect((yield* defaults.byTier({ tier: "basic" }).collect()).map((d: any) => d.id)).toContain(
+        "du",
+      )
       const strip = (item: Record<string, any>, id: string) =>
         JSON.parse(
           JSON.stringify(item).replaceAll(`id_${id}`, "id_ID").replaceAll(`"${id}"`, '"ID"'),
@@ -15517,6 +15599,254 @@ describeConnected("#133 — path operations on index composites and unique field
       expect(strip(yield* rawItem("G133Defaults", "du"), "du")).toEqual(
         strip(yield* rawItem("G133Defaults", "dp"), "dp"),
       )
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- items written before the entity was `versioned` ----
+
+  /** Write `id` through the unversioned definition, then run `use` through the versioned one. */
+  const legacy = <A>(
+    pair: keyof typeof g133LegacyPairs,
+    seeds: ReadonlyArray<Record<string, unknown>>,
+    use: (db: any, entity: any) => Effect.Effect<A, any, any>,
+  ) =>
+    Effect.gen(function* () {
+      const before = g133LegacyClient(pair, 0)
+      yield* Effect.gen(function* () {
+        const db: any = yield* before.client
+        for (const seed of seeds) yield* db.entities.Doc.put(seed)
+      }).pipe(Effect.provide(before.layer))
+      const after = g133LegacyClient(pair, 1)
+      return yield* Effect.gen(function* () {
+        const db: any = yield* after.client
+        return yield* use(db, after.entity)
+      }).pipe(Effect.provide(after.layer))
+    })
+  const legacyRaw = (entityType: string, id: string) => rawItem(entityType, id)
+
+  it.effect("a pre-versioning item reads as version 0 on every read path", () =>
+    Effect.gen(function* () {
+      yield* legacy(
+        "Ret",
+        [
+          { id: "lr1", name: "legacy-read" },
+          { id: "lr2", name: "legacy-read" },
+        ],
+        (db, entity) =>
+          Effect.gen(function* () {
+            const docs = db.entities.Doc
+            expect((yield* docs.get({ id: "lr1" })).version).toBe(0)
+            const byName = yield* docs.byName({ name: "legacy-read" }).collect()
+            expect(byName.map((d: any) => d.version)).toEqual([0, 0])
+            const scanned = (yield* docs.scan().collect()).filter((d: any) =>
+              ["lr1", "lr2"].includes(d.id),
+            )
+            expect(scanned.map((d: any) => d.version)).toEqual([0, 0])
+            const [batch] = yield* Batch.get([entity.get({ id: "lr1" })])
+            expect((batch as any).version).toBe(0)
+            const [tx] = yield* Transaction.transactGet([entity.get({ id: "lr2" })])
+            expect((tx as any).version).toBe(0)
+            const item = (yield* Entity.asItem(entity.get({ id: "lr1" }))) as any
+            expect(item.version).toBe(0)
+          }),
+      )
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("the first versioned plain update writes version 1", () =>
+    Effect.gen(function* () {
+      yield* legacy(
+        "Plain",
+        [
+          { id: "lp1", name: "a" },
+          { id: "lp2", name: "a" },
+          { id: "lp3", name: "a" },
+        ],
+        (db) =>
+          Effect.gen(function* () {
+            const docs = db.entities.Doc
+            const updated = yield* docs.update({ id: "lp1" }).set({ tags: ["x"] })
+            expect(updated.version).toBe(1)
+            expect((yield* legacyRaw("G133LegacyPlain", "lp1")).version).toEqual({ N: "1" })
+            const pinned = yield* docs
+              .update({ id: "lp2" })
+              .set({ tags: ["y"] })
+              .expectedVersion(0)
+            expect(pinned.version).toBe(1)
+            const stale = yield* docs
+              .update({ id: "lp3" })
+              .set({ tags: ["z"] })
+              .expectedVersion(1)
+              .asEffect()
+              .pipe(Effect.flip)
+            expect([stale._tag, stale.expectedVersion, stale.actualVersion]).toEqual([
+              "OptimisticLockError",
+              1,
+              0,
+            ])
+            // A path update is a plain update too.
+            const path = yield* docs
+              .update({ id: "lp3" })
+              .pathSet({ segments: ["name"], value: "p", isPath: false })
+            expect([path.name, path.version]).toEqual(["p", 1])
+          }),
+      )
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("the first versioned read-then-write update writes version 1", () =>
+    Effect.gen(function* () {
+      yield* legacy("Uniq", [{ id: "lu1", name: "a", email: "lu1@x.io" }], (db) =>
+        Effect.gen(function* () {
+          const updated = yield* db.entities.Doc.update({ id: "lu1" }).set({ email: "lu1b@x.io" })
+          expect([updated.version, updated.email]).toEqual([1, "lu1b@x.io"])
+          const raw = yield* legacyRaw("G133LegacyUniq", "lu1")
+          expect(raw.version).toEqual({ N: "1" })
+          expect(raw.__edd_i__?.S).toMatch(/^[0-9a-f-]{36}$/)
+        }),
+      )
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  for (const [label, build] of [
+    ["record", (u: any) => u.set({ name: "b" })],
+    ["path", (u: any) => u.pathSet({ segments: ["name"], value: "b", isPath: false })],
+  ] as const) {
+    it.effect(`the first versioned retain ${label} update snapshots it as v#0000000`, () =>
+      Effect.gen(function* () {
+        const id = `lret-${label}`
+        yield* legacy("Ret", [{ id, name: "a" }], (db) =>
+          Effect.gen(function* () {
+            const docs = db.entities.Doc
+            const updated = yield* build(docs.update({ id }))
+            expect([updated.name, updated.version]).toEqual(["b", 1])
+            const v0 = yield* docs.getVersion({ id }, 0)
+            expect([v0.name, v0.version]).toEqual(["a", 0])
+            const all = yield* docs.versions({ id }).collect()
+            expect(all.map((v: any) => v.version)).toEqual([0])
+            expect(yield* partition("G133LegacyRet", id)).toEqual([
+              "$edd133g#v1#g133legacyret",
+              "$edd133g#v1#g133legacyret#v#0000000",
+            ])
+            // …and from there on, ordinary versioning.
+            const next = yield* build(docs.update({ id }))
+            expect(next.version).toBe(2)
+          }),
+        )
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+
+    it.effect(
+      `a race on the first versioned retain ${label} update is an OptimisticLockError`,
+      () =>
+        Effect.gen(function* () {
+          const id = `lrace-${label}`
+          yield* legacy("Ret", [{ id, name: "a" }], (db) =>
+            Effect.gen(function* () {
+              // Another writer versions the item between our read and write.
+              g133Inject.before = rawSetAttrs("G133LegacyRet", id, {
+                version: { N: "1" },
+                name: { S: "theirs" },
+              })
+              const error = yield* build(db.entities.Doc.update({ id }))
+                .asEffect()
+                .pipe(Effect.flip)
+              expect([error._tag, error.expectedVersion, error.actualVersion]).toEqual([
+                "OptimisticLockError",
+                0,
+                1,
+              ])
+              expect((yield* legacyRaw("G133LegacyRet", id)).name).toEqual({ S: "theirs" })
+            }),
+          )
+        }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+  }
+
+  it.effect("a race on the first versioned plain update with expectedVersion(0)", () =>
+    Effect.gen(function* () {
+      yield* legacy("Plain", [{ id: "lpr", name: "a" }], (db) =>
+        Effect.gen(function* () {
+          g133Inject.before = rawSetAttrs("G133LegacyPlain", "lpr", { version: { N: "1" } })
+          const error = yield* db.entities.Doc.update({ id: "lpr" })
+            .set({ name: "b" })
+            .expectedVersion(0)
+            .asEffect()
+            .pipe(Effect.flip)
+          expect([error._tag, error.actualVersion]).toEqual(["OptimisticLockError", 1])
+        }),
+      )
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a pre-versioning item soft-deletes and restores through the versioned entity", () =>
+    Effect.gen(function* () {
+      yield* legacy("Soft", [{ id: "lsd", name: "a" }], (db) =>
+        Effect.gen(function* () {
+          const docs = db.entities.Doc
+          yield* docs.delete({ id: "lsd" })
+          const tombstone = yield* docs.deleted.get({ id: "lsd" })
+          expect(tombstone.version).toBe(0)
+          const restored = yield* docs.restore({ id: "lsd" })
+          expect([restored.name, restored.version]).toEqual(["a", 1])
+          const keys = yield* partition("G133LegacySoft", "lsd")
+          expect(keys).toEqual([
+            "$edd133g#v1#g133legacysoft",
+            "$edd133g#v1#g133legacysoft#v#0000000",
+          ])
+        }),
+      )
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- a condition too large to share with the library's guard ----
+
+  it.effect("a pathological .condition() is refused before writing, naming its size", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const huge = (t: any, { or, eq }: any) =>
+        or(...Array.from({ length: 160 }, (_, i) => eq(t.name, `value-${i}`)))
+      const accounts = db.entities.SoftAccounts as any
+      yield* accounts.put({ id: "huge", email: "huge@x.io", name: "n" })
+      const del = yield* accounts
+        .delete({ id: "huge" })
+        .condition(huge)
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(del._tag).toBe("ValidationError")
+      expect(String(del.cause)).toMatch(/\.condition\(\) alone is \d+ characters \/ \d+ operators/)
+      expect(yield* rawItem("G133SoftAccount", "huge")).toBeDefined()
+
+      const retained = db.entities.DevicesRetained as any
+      yield* retained.put({ id: "huge", owner: "o", label: "l" })
+      for (const build of [
+        (u: any) => u.set({ label: "m" }),
+        (u: any) => u.pathSet({ segments: ["label"], value: "m", isPath: false }),
+      ]) {
+        const error = yield* build(retained.update({ id: "huge" }))
+          .condition(huge)
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+      }
+      const plain = yield* (db.entities.DevicesPlain as any)
+        .update({ id: "huge" })
+        .set({ label: "m" })
+        .condition(huge)
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(plain._tag).toBe("ValidationError")
+      expect((yield* rawItem("G133DeviceRetained", "huge")).label).toEqual({ S: "l" })
+
+      // A large condition that fits beside the guard still runs, and a wide
+      // item's fallback guard shrinks to leave it room.
+      const wide = db.entities.WideBare as any
+      const totals = Object.fromEntries(Array.from({ length: 300 }, (_, i) => [`k${i}`, i]))
+      yield* wide.put({ id: "wcond", email: "wcond@x.io", totals })
+      const sized = (t: any, { or, eq }: any) =>
+        or(...Array.from({ length: 60 }, (_, i) => eq(t.email, i === 0 ? "wcond@x.io" : `x${i}`)))
+      yield* wide.delete({ id: "wcond" }).condition(sized)
+      expect(yield* rawItem("G133WideBare", "wcond")).toBeUndefined()
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 })

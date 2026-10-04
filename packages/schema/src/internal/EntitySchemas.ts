@@ -2035,7 +2035,11 @@ export const buildDerivedSchemas = (
       : Schema.DateTimeUtcFromString
   }
   if (systemFields.version && !systemFields.versionCollision) {
-    systemSchemaFields[systemFields.version] = Schema.Number
+    // An item written before the entity was `versioned` has no version: it
+    // reads as version 0 — real versions start at 1 (#133).
+    systemSchemaFields[systemFields.version] = Schema.Number.pipe(
+      Schema.withDecodingDefaultKey(Effect.succeed(0)),
+    )
   }
   const recordSchema = Schema.Struct({
     ...readFields,

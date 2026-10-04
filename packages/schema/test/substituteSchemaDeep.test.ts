@@ -600,3 +600,21 @@ describe("substituteSchemaDeep — decoding defaults", () => {
     }),
   )
 })
+
+describe("record schema — an item written before the entity was versioned", () => {
+  it.effect("decodes with version 0; a stored version decodes as itself", () =>
+    Effect.gen(function* () {
+      const { make } = yield* Effect.promise(() => import("../src/Entity.js"))
+      class Doc extends Schema.Class<Doc>("Doc")({ id: Schema.String }) {}
+      const entity = make({
+        model: Doc,
+        entityType: "Doc",
+        primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+        versioned: true,
+      } as any) as any
+      const decode = Schema.decodeUnknownEffect(entity.schemas.recordSchema)
+      expect(((yield* decode({ id: "a" })) as any).version).toBe(0)
+      expect(((yield* decode({ id: "a", version: 3 })) as any).version).toBe(3)
+    }),
+  )
+})

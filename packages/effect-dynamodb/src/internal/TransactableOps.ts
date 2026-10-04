@@ -317,9 +317,11 @@ export const validateAndBuildPutItem = (
     const now = yield* DateTime.now
     const inputSchema = entity.schemas.inputSchema as Schema.Codec<any>
     // Encode → fall back to decode-then-encode (mirrors Entity.put).
-    const encoded = yield* Schema.encodeUnknownEffect(inputSchema)(input).pipe(
+    // Omitted decoding defaults are stored, exactly as `Entity.put` does.
+    const filled = yield* entity._fillDecodingDefaults(input)
+    const encoded = yield* Schema.encodeUnknownEffect(inputSchema)(filled).pipe(
       Effect.catch(() =>
-        Schema.decodeUnknownEffect(inputSchema)(input).pipe(
+        Schema.decodeUnknownEffect(inputSchema)(filled).pipe(
           Effect.flatMap((decoded) => Schema.encodeUnknownEffect(inputSchema)(decoded)),
         ),
       ),

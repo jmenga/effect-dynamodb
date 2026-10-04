@@ -373,6 +373,23 @@ class MissingForCreate extends Data.TaggedError("MissingForCreate")<{
   readonly input: unknown
 }> {}
 
+/** DynamoDB's limits on one expression: its length, and its operators + functions. */
+const EXPRESSION_LIMIT = 4096
+const OPERATOR_LIMIT = 300
+const OPERATOR_PATTERN =
+  /<>|<=|>=|=|<|>|\bAND\b|\bOR\b|\bNOT\b|\bBETWEEN\b|\bIN\b|\b(?:attribute_exists|attribute_not_exists|attribute_type|begins_with|contains|size)\s*\(/gi
+/** What DynamoDB counts against an expression's limits (placeholders keep names out of it). */
+const expressionCost = (
+  expression: string | undefined,
+): { readonly length: number; readonly operators: number } =>
+  expression === undefined
+    ? { length: 0, operators: 0 }
+    : { length: expression.length, operators: (expression.match(OPERATOR_PATTERN) ?? []).length }
+const expressionFits = (expression: string): boolean => {
+  const cost = expressionCost(expression)
+  return cost.length <= EXPRESSION_LIMIT && cost.operators <= OPERATOR_LIMIT
+}
+
 const bytesKey = (bytes: Uint8Array): string => Array.from(bytes).join(",")
 
 /** Structural equality of two marshalled values (sets compare as sets). */
@@ -589,6 +606,9 @@ export interface Entity<
    * (`__edd_i__`) — every versioned entity.
    */
   readonly _incarnationToken: boolean
+
+  /** @internal Fill omitted decoding-default fields of a put's input (see `put`). */
+  readonly _fillDecodingDefaults: (input: unknown) => Effect.Effect<unknown, ValidationError>
 
   /**
    * @internal The extra items a `put` of `item` must write alongside the item
@@ -2389,6 +2409,59 @@ const makeImpl = <
     )
   }
 
+  /**
+   * The model fields with a decoding default (`Schema.withDecodingDefault` and
+   * kin: optional on the stored side, required on the domain side).
+   */
+  const defaultedFields: ReadonlyArray<readonly [string, Schema.Top]> = Object.entries(
+    data.modelFields as globalThis.Record<string, Schema.Top>,
+  ).filter(([, field]) => {
+    const ast = field.ast as {
+      readonly context?: { readonly isOptional?: boolean }
+      readonly encoding?: ReadonlyArray<{
+        readonly to: { readonly context?: { readonly isOptional?: boolean } }
+      }>
+    }
+    return (
+      ast.context?.isOptional !== true &&
+      ast.encoding?.[ast.encoding.length - 1]?.to.context?.isOptional === true
+    )
+  })
+
+  /**
+   * Fill each omitted decoding-default field that a KEY derives from — a
+   * primary-key, index or unique-constraint composite — with its default
+   * (#133), so the item stores it, its keys and sentinels compose from it, and
+   * the item, its keys and its decoded read all agree. Left out, the item had
+   * no index keys while its decoded record named a value the index is keyed
+   * by. Other defaulted fields keep their contract: not stored, defaulted on
+   * read.
+   */
+  const fillDecodingDefaults = (input: unknown): Effect.Effect<unknown, ValidationError> => {
+    if (defaultedFields.length === 0 || typeof input !== "object" || input === null) {
+      return Effect.succeed(input)
+    }
+    const record = input as globalThis.Record<string, unknown>
+    const keyed = new Set<string>([
+      ...Object.values(allIndexes).flatMap((def) => [...def.pk.composite, ...def.sk.composite]),
+      ...Object.values(
+        (config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>,
+      ).flatMap((def) => [...resolveUniqueFields(def)]),
+    ])
+    const missing = defaultedFields.filter(
+      ([name]) => keyed.has(name) && record[name] === undefined,
+    )
+    if (missing.length === 0) return Effect.succeed(input)
+    return Schema.decodeUnknownEffect(
+      Schema.Struct(Object.fromEntries(missing)) as unknown as Schema.Codec<any>,
+    )({}).pipe(
+      Effect.map((defaults) => ({ ...record, ...(defaults as object) })),
+      Effect.mapError(
+        (cause) => new ValidationError({ entityType, operation: "put.default", cause }),
+      ),
+    ) as Effect.Effect<unknown, ValidationError>
+  }
+
   /** Attach the model class prototype to a decoded plain object (when model is Schema.Class). */
   const attachPrototype = (decoded: any) =>
     isSchemaClass ? Object.assign(Object.create((rawModel as any).prototype), decoded) : decoded
@@ -2926,11 +2999,34 @@ const makeImpl = <
     return "#inc = :inc"
   }
 
+  /**
+   * The version an item is stored at: `undefined` for no item, 0 for an item
+   * written before the entity was `versioned` (it has no version attribute;
+   * real versions start at 1).
+   */
   const storedVersionOf = (
     item: Readonly<globalThis.Record<string, unknown>> | undefined,
   ): number | undefined => {
-    const attr = item !== undefined && systemFields.version ? item[systemFields.version] : undefined
-    return attr !== undefined ? Number((attr as { readonly N?: string }).N) : undefined
+    if (item === undefined || !systemFields.version) return undefined
+    const attr = item[systemFields.version]
+    return attr !== undefined ? Number((attr as { readonly N?: string }).N) : 0
+  }
+
+  /**
+   * The condition that the stored version is `version` — for version 0 (an
+   * item written before the entity was `versioned`), that it has none (#133).
+   */
+  const versionIs = (
+    version: number,
+    names: globalThis.Record<string, string>,
+    values: globalThis.Record<string, AttributeValue>,
+    name: string,
+    value: string,
+  ): string => {
+    names[name] = systemFields.version!
+    if (version === 0) return `attribute_not_exists(${name})`
+    values[value] = toAttributeValue(version)
+    return `${name} = ${value}`
   }
 
   /**
@@ -2977,14 +3073,28 @@ const makeImpl = <
   }
 
   /**
-   * DynamoDB's limits on one condition — 4 KB of expression and 300 operators
-   * (each comparison, function and AND counts) — less headroom for the user's
-   * own condition.
+   * A condition the library sends — its own guard plus the user's
+   * `.condition()` — that exceeds DynamoDB's limits on one expression (4 KB,
+   * 300 operators and functions): refused BEFORE writing (#133).
    */
-  const GUARD_EXPRESSION_BUDGET = 3500
-  const GUARD_OPERATOR_BUDGET = 250
-  /** Operators in a guard of `clauses` comparisons / functions joined by AND. */
-  const guardOperators = (clauses: number): number => clauses * 2 - 1
+  const oversizedCondition = (
+    operation: string,
+    condition: string | undefined,
+    user: string | undefined,
+  ): ValidationError | undefined => {
+    if (condition === undefined || expressionFits(condition)) return undefined
+    const own = expressionCost(user)
+    return new ValidationError({
+      entityType,
+      operation,
+      cause:
+        `The ${operation}'s condition is ${expressionCost(condition).length} characters / ` +
+        `${expressionCost(condition).operators} operators — beyond DynamoDB's limits on one ` +
+        `expression (${EXPRESSION_LIMIT} characters, ${OPERATOR_LIMIT} operators). The ` +
+        `.condition() alone is ${own.length} characters / ${own.operators} operators, and ` +
+        "the library's own guard needs room beside it: simplify the condition.",
+    })
+  }
 
   /** The domain field a stored attribute holds (`storedAs` renames reversed). */
   const domainNameOf = (attr: string): string =>
@@ -3003,12 +3113,19 @@ const makeImpl = <
   const deleteGuard = (
     read: globalThis.Record<string, AttributeValue>,
     dependsOn: "item" | ReadonlyArray<string>,
-  ): {
-    readonly expression: string
-    readonly names: globalThis.Record<string, string>
-    readonly values: globalThis.Record<string, AttributeValue>
-    readonly inputs: ReadonlyArray<string>
-  } => {
+    /** The rest of the condition, ANDed with the guard (the user's, …). */
+    others: string | undefined,
+  ):
+    | {
+        readonly expression: string
+        readonly names: globalThis.Record<string, string>
+        readonly values: globalThis.Record<string, AttributeValue>
+        readonly inputs: ReadonlyArray<string>
+      }
+    | ValidationError => {
+    // Whether a guard fits beside `others` within DynamoDB's real limits.
+    const fits = (guard: string) =>
+      expressionFits(others === undefined || others === "" ? guard : `${guard} AND (${others})`)
     const names: globalThis.Record<string, string> = {}
     const values: globalThis.Record<string, AttributeValue> = {}
     const parts: Array<string> = []
@@ -3026,10 +3143,13 @@ const makeImpl = <
       }
       const incarnation = incarnationGuard(read, names, values)
       if (incarnation !== undefined) parts.push(incarnation)
-      return { expression: parts.join(" AND "), names, values, inputs: [] }
+      const expression = parts.join(" AND ")
+      if (!fits(expression)) return tooLargeBeside(expression)
+      return { expression, names, values, inputs: [] }
     }
     names["#dpk"] = pkField
     parts.push("attribute_exists(#dpk)")
+    if (!fits(parts.join(" AND "))) return tooLargeBeside(parts.join(" AND "))
     const attrs =
       dependsOn === "item"
         ? [
@@ -3051,12 +3171,7 @@ const makeImpl = <
       return `#dg${i} = :dg${i}`
     }
     const full = [...parts, ...attrs.map(guardOf)].join(" AND ")
-    if (
-      full.length <= GUARD_EXPRESSION_BUDGET &&
-      guardOperators(parts.length + attrs.length) <= GUARD_OPERATOR_BUDGET
-    ) {
-      return { expression: full, names, values, inputs: attrs }
-    }
+    if (fits(full)) return { expression: full, names, values, inputs: attrs }
     // Too wide to guard attribute by attribute (a sparse map with hundreds of
     // entries): the strongest guard that fits. Every library write sets
     // `updatedAt`, so with timestamps it alone detects any library update;
@@ -3080,10 +3195,7 @@ const makeImpl = <
     let expression = parts.join(" AND ")
     for (const attr of ordered) {
       const clause = guardOf(attr, inputs.length)
-      if (
-        expression.length + 5 + clause.length > GUARD_EXPRESSION_BUDGET ||
-        guardOperators(parts.length + inputs.length + 1) > GUARD_OPERATOR_BUDGET
-      ) {
+      if (!fits(`${expression} AND ${clause}`)) {
         delete names[`#dg${inputs.length}`]
         delete values[`:dg${inputs.length}`]
         continue
@@ -3092,6 +3204,16 @@ const makeImpl = <
       inputs.push(attr)
     }
     return { expression, names, values, inputs }
+
+    function tooLargeBeside(guard: string): ValidationError {
+      return (
+        oversizedCondition(
+          "write",
+          others === undefined || others === "" ? guard : `${guard} AND (${others})`,
+          others,
+        ) ?? new ValidationError({ entityType, operation: "write", cause: "condition too large" })
+      )
+    }
   }
 
   /** Which predicate rejected a guarded delete — from the stored item (ALL_OLD). */
@@ -3780,7 +3902,7 @@ const makeImpl = <
           // so this keeps the bound `put` at `R = never`. The filled id then
           // flows through input validation → key composition → stored item →
           // returned record in this same pass.
-          const inputWithGeneratedId = yield* fillGeneratedId(input)
+          const inputWithGeneratedId = yield* fillDecodingDefaults(yield* fillGeneratedId(input))
 
           // Encode user input → wire form. Users typically construct domain
           // values for transforms (DateTime, Redacted, Number) and plain
@@ -4302,8 +4424,11 @@ const makeImpl = <
         }
 
         const currentRaw = fromAttributeMap(currentResult.Item)
+        // 0: written before the entity was `versioned` (#133).
         const currentVersion = systemFields.version
-          ? ((currentRaw as globalThis.Record<string, unknown>)[systemFields.version] as number)
+          ? (((currentRaw as globalThis.Record<string, unknown>)[systemFields.version] as
+              | number
+              | undefined) ?? 0)
           : 0
 
         // Validate optimistic lock if requested
@@ -4654,9 +4779,7 @@ const makeImpl = <
         const condParts: Array<string> = []
         const inputs: Array<string> = []
         if (systemFields.version) {
-          writeNames["#ver"] = systemFields.version
-          writeValues[":expectedVer"] = toAttributeValue(currentVersion)
-          condParts.push("#ver = :expectedVer")
+          condParts.push(versionIs(currentVersion, writeNames, writeValues, "#ver", ":expectedVer"))
           const incarnation = incarnationGuard(currentItem, writeNames, writeValues)
           if (incarnation !== undefined) condParts.push(incarnation)
         } else {
@@ -4730,11 +4853,13 @@ const makeImpl = <
         // item instead, as before #133: under the version condition when
         // versioned (exact), otherwise under the strongest guard that fits —
         // the same fallback a wide soft delete uses.
-        const wide =
-          updateExpression.length > GUARD_EXPRESSION_BUDGET ||
-          setClauses.length + removeClauses.length > GUARD_OPERATOR_BUDGET
-        const wideGuard =
-          wide && !systemFields.version ? deleteGuard(currentItem, "item") : undefined
+        const wide = !expressionFits(updateExpression)
+        const wideGuardOrRefusal =
+          wide && !systemFields.version
+            ? deleteGuard(currentItem, "item", condParts.slice(1).join(" AND "))
+            : undefined
+        if (wideGuardOrRefusal instanceof ValidationError) return yield* wideGuardOrRefusal
+        const wideGuard = wideGuardOrRefusal
         const putCondition =
           wideGuard === undefined
             ? condParts.join(" AND ")
@@ -4752,6 +4877,14 @@ const makeImpl = <
           ...(Object.keys(putValues).length > 0 && { ExpressionAttributeValues: putValues }),
           ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
         }
+        const tooLarge = oversizedCondition(
+          "update",
+          wide ? putCondition : mainUpdate.ConditionExpression,
+          userCond !== undefined
+            ? compileCondition(userCond, resolveDbName)?.expression
+            : undefined,
+        )
+        if (tooLarge !== undefined) return yield* tooLarge
         // The stored attributes the rejection compares: the guarded inputs,
         // and on the wide fallback whatever else its guard covered.
         const guardedAttrs = [
@@ -5038,7 +5171,9 @@ const makeImpl = <
           })
         }
         const currentRaw = fromAttributeMap(current.Item) as globalThis.Record<string, unknown>
-        const version = systemFields.version ? (currentRaw[systemFields.version] as number) : 0
+        const version = systemFields.version
+          ? ((currentRaw[systemFields.version] as number | undefined) ?? 0)
+          : 0
         if (evExpected !== undefined && version !== evExpected) {
           return yield* new OptimisticLockError({
             entityType,
@@ -5185,7 +5320,10 @@ const makeImpl = <
       if (systemFields.version) {
         const nameKey = `#u${counter}`
         names[nameKey] = systemFields.version
-        setClauses.push(`${nameKey} = ${nameKey} + :vinc`)
+        // An item written before the entity was `versioned` has none: its
+        // first versioned write makes it version 1 (#133).
+        values[":vzero"] = toAttributeValue(0)
+        setClauses.push(`${nameKey} = if_not_exists(${nameKey}, :vzero) + :vinc`)
         values[":vinc"] = toAttributeValue(1)
         counter++
       }
@@ -5571,9 +5709,7 @@ const makeImpl = <
       // Build condition expression — combine optimistic lock + user condition
       const condParts: Array<string> = []
       if (evExpected !== undefined && systemFields.version) {
-        names["#condVer"] = systemFields.version
-        values[":expectedVer"] = toAttributeValue(evExpected)
-        condParts.push("#condVer = :expectedVer")
+        condParts.push(versionIs(evExpected, names, values, "#condVer", ":expectedVer"))
       }
       if (userCond) {
         const uc = compileCondition(userCond, resolveDbName)!
@@ -5592,13 +5728,21 @@ const makeImpl = <
         condParts.push("attribute_exists(#exists)")
       }
       if (casRead !== undefined && systemFields.version) {
-        names["#casVer"] = systemFields.version
-        values[":casVer"] = toAttributeValue(casRead.version)
-        condParts.push("#casVer = :casVer")
+        condParts.push(versionIs(casRead.version, names, values, "#casVer", ":casVer"))
         const incarnation = incarnationGuard(casRead.raw, names, values)
         if (incarnation !== undefined) condParts.push(incarnation)
       }
       const conditionExpression = condParts.length > 0 ? condParts.join(" AND ") : undefined
+      {
+        const tooLarge = oversizedCondition(
+          "update",
+          conditionExpression,
+          userCond !== undefined
+            ? compileCondition(userCond, resolveDbName)?.expression
+            : undefined,
+        )
+        if (tooLarge !== undefined) return yield* tooLarge
+      }
 
       // The top-level attributes this update writes — what `updatedOld` /
       // `updatedNew` return.
@@ -5627,12 +5771,18 @@ const makeImpl = <
         const snapshot = retainSnapshot
         const guardParts = [...condParts]
         if (systemFields.version) {
-          names["#retainVer"] = systemFields.version
-          values[":retainVer"] = toAttributeValue(snapshot.version)
-          guardParts.push("#retainVer = :retainVer")
+          guardParts.push(versionIs(snapshot.version, names, values, "#retainVer", ":retainVer"))
           const incarnation = incarnationGuard(snapshot.raw, names, values)
           if (incarnation !== undefined) guardParts.push(incarnation)
         }
+        const tooLarge = oversizedCondition(
+          "update",
+          guardParts.join(" AND "),
+          userCond !== undefined
+            ? compileCondition(userCond, resolveDbName)?.expression
+            : undefined,
+        )
+        if (tooLarge !== undefined) return yield* tooLarge
         const transactItems = [
           {
             Update: {
@@ -5965,7 +6115,8 @@ const makeImpl = <
             // The tombstone (and snapshot) copy the item read: the delete is
             // conditioned on it being unchanged, so no concurrent update is lost
             // into them (#133).
-            const softGuard = deleteGuard(result.Item, "item")
+            const softGuard = deleteGuard(result.Item, "item", userCondition?.expression)
+            if (softGuard instanceof ValidationError) return yield* softGuard
 
             const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
             // Clock-backed time source; `now` is the ISO timestamp used for the
@@ -6041,7 +6192,7 @@ const makeImpl = <
             // Version snapshot if retain is enabled
             if (isRetainEnabled()) {
               const currentVersion = systemFields.version
-                ? (raw[systemFields.version] as number)
+                ? ((raw[systemFields.version] as number | undefined) ?? 0)
                 : 0
               const snapshotItem = buildSnapshotItem(
                 raw,
@@ -6107,13 +6258,18 @@ const makeImpl = <
             }
             // The sentinel deletes are keyed by the unique values read: the
             // delete is conditioned on them, so no sentinel is orphaned (#133).
-            const uniqueGuard = deleteGuard(result.Item, [
-              ...new Set(
-                Object.values(config.unique!).flatMap((def) =>
-                  resolveUniqueFields(def).map(resolveDbName),
+            const uniqueGuard = deleteGuard(
+              result.Item,
+              [
+                ...new Set(
+                  Object.values(config.unique!).flatMap((def) =>
+                    resolveUniqueFields(def).map(resolveDbName),
+                  ),
                 ),
-              ),
-            ])
+              ],
+              userCondition?.expression,
+            )
+            if (uniqueGuard instanceof ValidationError) return yield* uniqueGuard
 
             const raw = fromAttributeMap(result.Item)
 
@@ -6226,7 +6382,7 @@ const makeImpl = <
           // Encode user input → wire form (see `put` for strategy).
           const encodedInput = yield* encodeOrDecodeEncode(
             schemas.inputSchema as Schema.Codec<any>,
-            input,
+            yield* fillDecodingDefaults(input),
             entityType,
             "upsert",
           )
@@ -7298,8 +7454,9 @@ const makeImpl = <
           delete restoredItem[ttlAttrName]
 
           // Increment version
+          // 0: a tombstone of an item written before the entity was `versioned`.
           const currentVersion = systemFields.version
-            ? (restoredItem[systemFields.version] as number)
+            ? ((restoredItem[systemFields.version] as number | undefined) ?? 0)
             : 0
           const newVersion = currentVersion + 1
           if (systemFields.version) restoredItem[systemFields.version] = newVersion
@@ -7749,6 +7906,7 @@ const makeImpl = <
     _keyForm: keyForm,
     _renameToDynamo: renameToDynamo,
     _incarnationToken: stampsIncarnation,
+    _fillDecodingDefaults: fillDecodingDefaults,
     _buildPutSideItems: buildPutSideItems,
     _multiItemWriteFeatures: multiItemWriteFeatures(),
     _attachPrototype: attachPrototype,

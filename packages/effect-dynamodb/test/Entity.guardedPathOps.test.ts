@@ -1099,3 +1099,61 @@ describe("#133 read-then-write update writes a guarded Update", () => {
     }).pipe(Effect.provide(TestLayer), closed),
   )
 })
+
+// ---------------------------------------------------------------------------
+// Items written before the entity was `versioned`
+// ---------------------------------------------------------------------------
+
+describe("#133 an item written before the entity was versioned", () => {
+  /** Put through the versioned entity, then strip what versioning added. */
+  const plantLegacy = (name: Name, seed: Record<string, unknown>) =>
+    Effect.gen(function* () {
+      const client = yield* db
+      yield* (client.entities as Record<string, any>)[name].put(seed)
+      for (const [key, item] of store.entries()) {
+        if (key.includes("#v#")) {
+          store.delete(key)
+          continue
+        }
+        const { version, __edd_i__, ...rest } = item
+        void version
+        void __edd_i__
+        store.set(key, rest)
+      }
+      writes.length = 0
+      return client.entities as Record<string, any>
+    })
+
+  it.effect("reads as version 0", () =>
+    Effect.gen(function* () {
+      const entities = yield* plantLegacy("DevicesPlain", { id: "lg1", label: "l" })
+      expect((yield* entities.DevicesPlain.get({ id: "lg1" })).version).toBe(0)
+    }).pipe(Effect.provide(TestLayer), closed),
+  )
+
+  it.effect("a plain update makes it version 1; expectedVersion(0) means no version yet", () =>
+    Effect.gen(function* () {
+      const entities = yield* plantLegacy("DevicesPlain", { id: "lg2", label: "l" })
+      yield* entities.DevicesPlain.update({ id: "lg2" }).set({ label: "m" }).expectedVersion(0)
+      const update = writes.find((w) => w.op === "Update")!.input
+      expect(update.UpdateExpression).toMatch(/= if_not_exists\(#u\d+, :vzero\) \+ :vinc/)
+      expect(update.ConditionExpression).toContain("attribute_not_exists(#condVer)")
+      expect(update.ExpressionAttributeValues[":expectedVer"]).toBeUndefined()
+    }).pipe(Effect.provide(TestLayer), closed),
+  )
+
+  it.effect("a retain update conditions on no version and snapshots it as v#0000000", () =>
+    Effect.gen(function* () {
+      const entities = yield* plantLegacy("DevicesRetained", { id: "lg3", label: "l" })
+      const updated = yield* entities.DevicesRetained.update({ id: "lg3" }).set({ label: "m" })
+      expect(updated.version).toBe(1)
+      const main = writes.find((w) => w.op === "Update")!.input
+      expect(main.ConditionExpression).toBe(
+        "attribute_not_exists(#ver) AND attribute_not_exists(#inc)",
+      )
+      const snapshot = writes.find((w) => w.op === "Put")!.input.Item
+      expect(snapshot.sk.S).toBe("$gpo#v1#deviceretained#v#0000000")
+      expect(snapshot.version).toBeUndefined()
+    }).pipe(Effect.provide(TestLayer), closed),
+  )
+})
