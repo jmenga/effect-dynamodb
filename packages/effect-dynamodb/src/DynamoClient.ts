@@ -926,19 +926,34 @@ interface EntityLike {
   readonly _tableTag: Context.Service<TableConfig, TableConfig>
   readonly _injectIndex: (name: string, def: IndexDefinition) => void
   readonly _decodeRecord: (raw: Record<string, unknown>) => Effect.Effect<any, any>
-  /** Rows that aren't items (snapshots, tombstones, events): a primary-key query or scan leaves them out (#133). */
-  readonly _historyRows?:
-    | (() => {
-        readonly prefixes: ReadonlyArray<string>
-        readonly nested?: { readonly under: string; readonly marker: string } | undefined
-      })
-    | undefined
+  /** Which rows are items: a primary-key query or scan leaves the rest out (#133). */
+  readonly _liveRows?: (() => Query.LiveRows | undefined) | undefined
   readonly schemas: {
     readonly recordSchema: Schema.Codec<any>
     /** The schema `put` encodes through — the source of truth for composite
      * encoding on the read path. Optional so pure schema-package definitions
      * promoted at bind time still satisfy the shape. */
     readonly inputSchema?: Schema.Top | undefined
+  }
+}
+
+/**
+ * Which rows of a collection over the table's primary key are items (#133):
+ * each row judged by the member its `__edd_e__` names. `undefined` when no
+ * member keeps history.
+ */
+const collectionLiveRows = (
+  members: ReadonlyArray<{ readonly entityLike: EntityLike }>,
+): Query.LiveRows | undefined => {
+  const byType = new Map<string, Query.LiveRows>()
+  for (const { entityLike } of members) {
+    const live = entityLike._liveRows?.()
+    if (live !== undefined) byType.set(entityLike.entityType, live)
+  }
+  if (byType.size === 0) return undefined
+  return {
+    isLive: (row) => byType.get(row.__edd_e__?.S ?? "")?.isLive(row) ?? true,
+    reads: [...new Set([...byType.values()].flatMap((live) => live.reads))],
   }
 }
 
@@ -1092,13 +1107,7 @@ const makeFromConfig = (config: {
           ],
           // The primary key also holds the entity's history rows; an index
           // never does (they carry no index keys).
-          excludeSkPrefixes:
-            indexDef.index === undefined
-              ? {
-                  field: indexDef.sk.field,
-                  ...(entityLike._historyRows?.() ?? { prefixes: [] }),
-                }
-              : undefined,
+          liveRows: indexDef.index === undefined ? entityLike._liveRows?.() : undefined,
         })
 
         // Apply SK prefix from provided compositesKeyForm.
@@ -1451,13 +1460,7 @@ const makeFromConfig = (config: {
           decoder: (raw) => entityLike._decodeRecord(raw),
           resolveTableName: entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
           keyFields: [entityLike.indexes.primary?.pk.field, entityLike.indexes.primary?.sk.field],
-          excludeSkPrefixes:
-            entityLike.indexes.primary === undefined
-              ? undefined
-              : {
-                  field: entityLike.indexes.primary.sk.field,
-                  ...(entityLike._historyRows?.() ?? { prefixes: [] }),
-                },
+          liveRows: entityLike._liveRows?.(),
         })
         const pathBuilder = createPathBuilder()
         const conditionOps = createConditionOps()
@@ -1549,6 +1552,8 @@ const makeFromConfig = (config: {
             firstMember.entityLike.indexes.primary?.pk.field,
             firstMember.entityLike.indexes.primary?.sk.field,
           ],
+          // A collection on the primary key also meets its members' history.
+          liveRows: indexDef.index === undefined ? collectionLiveRows(members) : undefined,
         })
 
         // Add begins_with on collection SK prefix for clustered collections.

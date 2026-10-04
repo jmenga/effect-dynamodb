@@ -319,7 +319,35 @@ export const make = <
         firstEntity.indexes.primary?.pk.field,
         firstEntity.indexes.primary?.sk.field,
       ],
+      liveRows: liveRowsOf(
+        entityEntries.flatMap(([, entity]) =>
+          targetEntityTypes.includes(entity.entityType) ? [entity] : [],
+        ),
+      ),
     })
+  }
+
+  /**
+   * A collection over the table's primary key also meets its members'
+   * history (snapshots, tombstones, events), which keeps their `__edd_e__`:
+   * each row is judged by the member it names (#133). An index never holds it.
+   */
+  const liveRowsOf = (
+    members: ReadonlyArray<(typeof entityEntries)[number][1]>,
+  ): Query.LiveRows | undefined => {
+    if (sharedDynamoIndexName !== undefined) return undefined
+    const byType = new Map<string, Query.LiveRows>()
+    for (const member of members) {
+      const live = (
+        member as { readonly _liveRows?: () => Query.LiveRows | undefined }
+      )._liveRows?.()
+      if (live !== undefined) byType.set(member.entityType, live)
+    }
+    if (byType.size === 0) return undefined
+    return {
+      isLive: (row) => byType.get(row.__edd_e__?.S ?? "")?.isLive(row) ?? true,
+      reads: [...new Set([...byType.values()].flatMap((live) => live.reads))],
+    }
   }
 
   // Main query: returns grouped results
@@ -350,6 +378,7 @@ export const make = <
         entityEntries[0]![1].indexes.primary?.pk.field,
         entityEntries[0]![1].indexes.primary?.sk.field,
       ],
+      liveRows: liveRowsOf(entityEntries.map(([, entity]) => entity)),
       decoder: (raw) => {
         // This decoder gets called per-item, but Query.collect collects all items
         // We need to tag each item with its entity key so the caller can group
@@ -394,6 +423,7 @@ export const make = <
           entity.indexes.primary?.pk.field,
           entity.indexes.primary?.sk.field,
         ],
+        liveRows: liveRowsOf([entity]),
       })
 
       // Clustered entity selectors add begins_with on the entity SK prefix.

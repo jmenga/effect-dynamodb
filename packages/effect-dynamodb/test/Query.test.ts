@@ -637,14 +637,19 @@ describe("Query", () => {
   // -------------------------------------------------------------------------
 
   describe("history rows are not items (#133)", () => {
-    const excluded = { field: "sk", prefixes: ["$myapp#v1#user#v#", "$myapp#v1#user#deleted#"] }
+    // A row is live when the key composed from its own `id` is its sort key.
+    const liveRows: Query.LiveRows = {
+      isLive: (row) => row.sk?.S === `$myapp#v1#user#id_${row.id?.S}`,
+      reads: ["sk", "id"],
+    }
     const row = (id: string, sk: string) => toAttributeMap({ id, name: id, pk: "p", sk })
     const page = () => ({
       Items: [
-        row("live-a", "$myapp#v1#user#id_a"),
-        row("snap", "$myapp#v1#user#v#id_a#0000001"),
-        row("tomb", "$myapp#v1#user#deleted#id_b#2024-01-01T00:00:00.000Z"),
-        row("live-c", "$myapp#v1#user#id_c"),
+        row("a", "$myapp#v1#user#id_a"),
+        row("a", "$myapp#v1#user#v#id_a#0000001"),
+        row("b", "$myapp#v1#user#deleted#id_b#2024-01-01T00:00:00.000Z"),
+        row("c", "$myapp#v1#user#id_c"),
+        row("c", "$myapp#v1#user#id_c#e#2026"),
       ],
     })
     const historyQuery = () =>
@@ -656,16 +661,27 @@ describe("Query", () => {
         skField: "sk",
         entityTypes: ["User"],
         decoder: (raw) => Effect.succeed({ id: raw.id as string }),
-        excludeSkPrefixes: excluded,
+        liveRows,
+      })
+    const historyScan = () =>
+      Query.makeScan<{ id: string }>({
+        tableName: "TestTable",
+        indexName: undefined,
+        entityTypes: ["User"],
+        decoder: (raw) => Effect.succeed({ id: raw.id as string }),
+        liveRows,
       })
 
-    it.effect("a query drops them as they arrive — never in its key filter", () =>
+    it.effect("a query and a scan drop them as they arrive — never in a filter", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValue(page())
-        const items = yield* Query.collect(historyQuery())
-        expect(items.map((i) => i.id)).toEqual(["live-a", "live-c"])
-        // DynamoDB refuses a key attribute in a query's FilterExpression.
-        expect(mockQuery.mock.calls[0]![0].FilterExpression).not.toContain("begins_with")
+        mockScan.mockResolvedValue(page())
+        expect((yield* Query.collect(historyQuery())).map((i) => i.id)).toEqual(["a", "c"])
+        expect((yield* Query.collect(historyScan())).map((i) => i.id)).toEqual(["a", "c"])
+        // DynamoDB refuses a key attribute in a query's FilterExpression, and
+        // a scan's would save no read capacity.
+        expect(mockQuery.mock.calls[0]![0].FilterExpression).not.toContain("sk")
+        expect(mockScan.mock.calls[0]![0].FilterExpression).not.toContain("sk")
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
@@ -673,67 +689,48 @@ describe("Query", () => {
       Effect.gen(function* () {
         mockQuery.mockResolvedValue(page())
         const first = yield* Query.execute(historyQuery().pipe(Query.limit(2)))
-        expect(first.items.map((i) => i.id)).toEqual(["live-a", "live-c"])
+        expect(first.items.map((i) => i.id)).toEqual(["a", "c"])
         // The budget is not handed to DynamoDB: rows past it may be history.
         expect(mockQuery.mock.calls[0]![0].Limit).toBeUndefined()
         const pages = yield* Query.paginate(historyQuery()).pipe(
           Effect.flatMap((stream) => Stream.runCollect(stream)),
         )
-        expect([...pages].flat().map((i) => i.id)).toEqual(["live-a", "live-c"])
+        expect([...pages].flat().map((i) => i.id)).toEqual(["a", "c"])
         expect(yield* Query.count(historyQuery())).toBe(2)
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
-    it.effect("a projected query still reads the sort key it judges them by", () =>
+    it.effect("a projected query still reads what it judges rows by", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValue(page())
-        const items = yield* Query.collect(historyQuery().pipe(Query.select(["id"])))
-        expect(items.map((i) => i.id)).toEqual(["live-a", "live-c"])
+        const items = yield* Query.collect(historyQuery().pipe(Query.select(["name"])))
+        expect(items).toHaveLength(2)
         const input = mockQuery.mock.calls[0]![0]
-        expect(Object.values(input.ExpressionAttributeNames)).toContain("sk")
+        expect(Object.values(input.ExpressionAttributeNames)).toEqual(
+          expect.arrayContaining(["sk", "id"]),
+        )
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
-    it.effect("rows nested under an item (time-series events) are dropped too", () =>
+    it.effect("paginate with select and limit projects no key attributes it doesn't need", () =>
       Effect.gen(function* () {
-        const nested = { under: "$myapp#v1#user", marker: "#e#" }
-        mockQuery.mockResolvedValue({
-          Items: [
-            row("live", "$myapp#v1#user#id_a"),
-            row("event", "$myapp#v1#user#id_a#e#2026-01-01"),
-          ],
-        })
-        const q = Query.make<{ id: string }>({
+        mockQuery.mockResolvedValue({ Items: [toAttributeMap({ name: "n" })] })
+        const keyed = Query.make<{ name: string }>({
           tableName: "TestTable",
           indexName: undefined,
           pkField: "pk",
           pkValue: "p",
           skField: "sk",
           entityTypes: ["User"],
-          decoder: (raw) => Effect.succeed({ id: raw.id as string }),
-          excludeSkPrefixes: { field: "sk", prefixes: [], nested },
+          decoder: (raw) => Effect.succeed({ name: raw.name as string }),
+          keyFields: ["pk", "sk"],
         })
-        expect((yield* Query.collect(q)).map((i) => i.id)).toEqual(["live"])
-        mockScan.mockResolvedValue({ Items: [] })
-        const scan = (under: string) =>
-          Query.makeScan<{ id: string }>({
-            tableName: "TestTable",
-            indexName: undefined,
-            entityTypes: ["User"],
-            decoder: (raw) => Effect.succeed({ id: raw.id as string }),
-            excludeSkPrefixes: { field: "sk", prefixes: [], nested: { under, marker: "#e#" } },
-          })
-        yield* Query.collect(scan("$myapp#v1#user"))
-        expect(mockScan.mock.calls[0]![0].FilterExpression).toContain(
-          "NOT contains(#eddSk, :eddNest)",
+        yield* Query.paginate(keyed.pipe(Query.select(["name"]), Query.limit(5))).pipe(
+          Effect.flatMap((stream) => Stream.runCollect(stream)),
         )
-        // A marker the live keys can hold (an entity named "e") is judged client-side.
-        mockScan.mockResolvedValue({
-          Items: [row("live", "$myapp#v1#e#id_a"), row("event", "$myapp#v1#e#id_a#e#1")],
-        })
-        const items = yield* Query.collect(scan("$myapp#v1#e"))
-        expect(items.map((i) => i.id)).toEqual(["live"])
-        expect(mockScan.mock.calls[1]![0].FilterExpression ?? "").not.toContain("contains")
+        expect(Object.values(mockQuery.mock.calls[0]![0].ExpressionAttributeNames)).not.toContain(
+          "sk",
+        )
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
@@ -751,37 +748,15 @@ describe("Query", () => {
           prepare: (tableName) =>
             Effect.succeed({
               replaceBeginsWith: { from: "own#", to: `${tableName}#all#` },
-              keep: (r) => r.id?.S !== "snap",
+              keep: (r) => !String(r.sk?.S).includes("#v#"),
             }),
         }).pipe(Query.where({ beginsWith: "own#" }))
         const items = yield* Query.collect(q)
-        expect(items.map((i) => i.id)).toEqual(["live-a", "tomb", "live-c"])
+        expect(items.map((i) => i.id)).toEqual(["a", "b", "c", "c"])
         expect(mockQuery.mock.calls[0]![0].ExpressionAttributeValues[":sk"]).toEqual({
           S: "TestTable#all#",
         })
-        expect(yield* Query.count(q)).toBe(3)
-      }).pipe(Effect.provide(TestDynamoClient)),
-    )
-
-    it.effect("a scan filters them out in its FilterExpression", () =>
-      Effect.gen(function* () {
-        mockScan.mockResolvedValue({ Items: [] })
-        yield* Query.collect(
-          Query.makeScan<{ id: string }>({
-            tableName: "TestTable",
-            indexName: undefined,
-            entityTypes: ["User"],
-            decoder: (raw) => Effect.succeed({ id: raw.id as string }),
-            excludeSkPrefixes: excluded,
-          }),
-        )
-        const input = mockScan.mock.calls[0]![0]
-        expect(input.FilterExpression).toContain(
-          "NOT begins_with(#eddSk, :eddSk0) AND NOT begins_with(#eddSk, :eddSk1)",
-        )
-        expect(input.ExpressionAttributeValues[":eddSk1"]).toEqual({
-          S: "$myapp#v1#user#deleted#",
-        })
+        expect(yield* Query.count(q)).toBe(4)
       }).pipe(Effect.provide(TestDynamoClient)),
     )
   })

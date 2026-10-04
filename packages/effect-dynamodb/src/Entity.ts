@@ -705,16 +705,14 @@ export interface Entity<
   readonly _multiItemWriteFeatures: ReadonlyArray<"unique" | "retain" | "softDelete">
 
   /**
-   * @internal This entity's rows that are not items, by sort key: version
-   * snapshots (`retain`) and soft-delete tombstones by prefix, time-series
-   * event items as rows nested under a live item. They keep the entity's
-   * `__edd_e__`, so a query of the primary key or a scan leaves them out
-   * (#133). Empty without `retain`, `softDelete` or `timeSeries`.
+   * @internal Which of this entity's rows are items: a row is live iff the
+   * sort key composed from its own stored composites is its stored sort key.
+   * Version snapshots, soft-delete tombstones and time-series events keep the
+   * entity's `__edd_e__` but never satisfy it, so a query of the primary key
+   * or a scan leaves them out (#133). `undefined` without `retain`,
+   * `softDelete` or `timeSeries` — every row is then an item.
    */
-  readonly _historyRows: () => {
-    readonly prefixes: ReadonlyArray<string>
-    readonly nested?: { readonly under: string; readonly marker: string } | undefined
-  }
+  readonly _liveRows: () => Query.LiveRows | undefined
 
   /** @internal Attach model class prototype to a decoded plain object (no-op for Schema.Struct models). */
   readonly _attachPrototype: (decoded: any) => any
@@ -3769,31 +3767,25 @@ const makeImpl = <
     )
     return item === undefined ? undefined : { item }
   }
-  /** See {@link Entity._historyRows}: partition-wide, so every item's. */
-  const historyRows = () => ({
-    prefixes: [
-      ...(isRetainEnabled() ? [DynamoSchema.composeVersionKeyPrefix(schema, entityType)] : []),
-      ...(isSoftDeleteEnabled() ? [DynamoSchema.composeDeletedKeyPrefix(schema, entityType)] : []),
-    ],
-    // Time-series events: `<liveSk>#e#<orderBy>`, the infix in the schema's casing.
-    nested:
-      config.timeSeries === undefined
-        ? undefined
-        : {
-            under: bareLiveSk(),
-            marker: KeyComposer.composeEventSkPrefix("", schema.casing),
-          },
-  })
-  /** The live sort key less its composites: what every item's begins with. */
-  const bareLiveSk = (): string =>
-    KeyComposer.composeSk(
-      schema,
-      entityType,
-      entityVersion,
-      { ...config.indexes.primary, sk: { ...config.indexes.primary.sk, composite: [] } },
-      keyForm({}),
-    )
-
+  /** See {@link Entity._liveRows}. */
+  const liveRows = (): Query.LiveRows | undefined => {
+    if (!isRetainEnabled() && !isSoftDeleteEnabled() && config.timeSeries === undefined) {
+      return undefined
+    }
+    const skField = config.indexes.primary.sk.field
+    return {
+      isLive: (row) => {
+        const sk = row[skField]?.S
+        if (sk === undefined) return false
+        try {
+          return liveSkOf(toDomainView(fromAttributeMap(row))) === sk
+        } catch {
+          return false
+        }
+      },
+      reads: [skField, ...config.indexes.primary.sk.composite.map(resolveDbName)],
+    }
+  }
   // ---------------------------------------------------------------------------
   // History an earlier release wrote without an item segment (#133)
   // ---------------------------------------------------------------------------
@@ -8408,7 +8400,7 @@ const makeImpl = <
       decoder: (raw) => decodeRecord(raw),
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
       keyFields: [config.indexes.primary.pk.field, config.indexes.primary.sk.field],
-      excludeSkPrefixes: { field: config.indexes.primary.sk.field, ...historyRows() },
+      liveRows: liveRows(),
     })
 
   // ---------------------------------------------------------------------------
@@ -8946,12 +8938,15 @@ const makeImpl = <
           const history = historyKeyOptions(liveSk)
 
           /**
-           * Whether a row of the partition is this item's (#133). Without sort
-           * key composites the partition IS the item: every row. With them, the
-           * partition holds siblings, and the item's rows are its live row, the
-           * rows nested under it (time-series events), and its own history.
-           * History an earlier release wrote without an item segment is the
-           * item's when the composites it carries compose the item's live key.
+           * Whether a row of the partition is this item's (#133). Only this
+           * entity's rows (`__edd_e__`): in a single-table design another
+           * entity can share the partition — a collection on the primary key —
+           * and purge never removes its rows. Without sort key composites that
+           * is every row of this entity. With them, the partition holds
+           * siblings, and the item's rows are its live row, the rows nested
+           * under it (time-series events), and its own history. History an
+           * earlier release wrote without an item segment is the item's when
+           * the composites it carries compose the item's live key.
            */
           const ownVersions = DynamoSchema.composeVersionKeyPrefix(schema, entityType, history)
           const ownTombstones = DynamoSchema.composeDeletedKeyPrefix(schema, entityType, history)
@@ -8960,6 +8955,7 @@ const makeImpl = <
             DynamoSchema.composeDeletedKeyPrefix(schema, entityType),
           ]
           const belongsToItem = (row: globalThis.Record<string, AttributeValue>): boolean => {
+            if (row.__edd_e__?.S !== entityType) return false
             if (history === undefined) return true
             const sk = row[primary.sk.field]?.S
             if (sk === undefined) return false
@@ -8978,9 +8974,9 @@ const makeImpl = <
           }
 
           // Query ALL items in this partition (current + versions + deleted).
-          // Keys only — plus, with sort key composites, the composites that
-          // attribute an unsegmented history row to its item.
-          const projected: globalThis.Record<string, string> = {}
+          // Keys and entity type only — plus, with sort key composites, the
+          // composites that attribute an unsegmented history row to its item.
+          const projected: globalThis.Record<string, string> = { "#ent": "__edd_e__" }
           if (history !== undefined) {
             primary.sk.composite.forEach((attr, i) => {
               projected[`#c${i}`] = resolveDbName(attr)
@@ -8995,13 +8991,11 @@ const makeImpl = <
               KeyConditionExpression: "#pk = :pk",
               ExpressionAttributeNames: {
                 "#pk": primary.pk.field,
-                ...(history !== undefined && { "#sk": primary.sk.field, ...projected }),
+                "#sk": primary.sk.field,
+                ...projected,
               },
               ExpressionAttributeValues: { ":pk": toAttributeValue(pkValue) },
-              ProjectionExpression:
-                history === undefined
-                  ? `${primary.pk.field}, ${primary.sk.field}`
-                  : ["#pk", "#sk", ...Object.keys(projected)].join(", "),
+              ProjectionExpression: ["#pk", "#sk", ...Object.keys(projected)].join(", "),
               ExclusiveStartKey: exclusiveStartKey,
             })
 
@@ -9204,7 +9198,7 @@ const makeImpl = <
     _unsentineledDefaults: unsentineledDefaults,
     _planPut: planPut,
     _multiItemWriteFeatures: multiItemWriteFeatures(),
-    _historyRows: historyRows,
+    _liveRows: liveRows,
     _attachPrototype: attachPrototype,
     _configure: (
       injectedSchema: DynamoSchema.DynamoSchema,

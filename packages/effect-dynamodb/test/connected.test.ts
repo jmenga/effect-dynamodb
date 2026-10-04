@@ -14265,6 +14265,40 @@ class G133Vec extends Schema.Class<G133Vec>("G133Vec")({
   vec: Schema.Array(Schema.Number),
 }) {}
 
+// Live rows whose keys look like history (#133).
+class G133Reading extends Schema.Class<G133Reading>("G133Reading")({
+  ch: Schema.String,
+  dev: Schema.String,
+  ts: Schema.DateTimeUtc,
+  v: Schema.optional(Schema.Number),
+}) {}
+const G133ReadingInput = Schema.Struct({
+  ch: Schema.String,
+  dev: Schema.String,
+  ts: Schema.DateTimeUtc,
+  v: Schema.optional(Schema.Number),
+})
+class G133Sub extends Schema.Class<G133Sub>("G133Sub")({
+  id: Schema.String,
+  label: Schema.String,
+}) {}
+// A collection on the primary key: an order and its lines share a partition.
+class G133POrder extends Schema.Class<G133POrder>("G133POrder")({
+  orderId: Schema.String,
+  label: Schema.String,
+}) {}
+class G133PLine extends Schema.Class<G133PLine>("G133PLine")({
+  orderId: Schema.String,
+  lineId: Schema.String,
+  qty: Schema.Number,
+}) {}
+const g133OrderKey = (sk: ReadonlyArray<string>) => ({
+  collection: "g133OrderAll",
+  type: "isolated",
+  pk: { field: "pk", composite: ["orderId"] },
+  sk: { field: "sk", composite: sk },
+})
+
 // Several items per partition (#133): a primary sort key with a composite.
 class G133Line extends Schema.Class<G133Line>("G133Line")({
   order: Schema.String,
@@ -14394,6 +14428,51 @@ const g133Entities = {
     versioned: true,
   }),
   Vecs: Entity.make({ model: G133Vec, entityType: "G133Vec", primaryKey: g133IdKey as any }),
+  Readings: Entity.make({
+    model: G133Reading,
+    entityType: "G133Reading",
+    primaryKey: {
+      pk: { field: "pk", composite: ["ch"] },
+      sk: { field: "sk", composite: ["dev"] },
+    } as any,
+    timeSeries: { orderBy: "ts", appendInput: G133ReadingInput },
+  }),
+  SubDeleted: Entity.make({
+    model: G133Sub,
+    entityType: "G133SubDel",
+    primaryKey: {
+      collection: ["G133SubDel", "deleted"],
+      type: "clustered",
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
+    } as any,
+    softDelete: true,
+  }),
+  SubVersioned: Entity.make({
+    model: G133Sub,
+    entityType: "G133SubV",
+    primaryKey: {
+      collection: ["G133SubV", "v"],
+      type: "clustered",
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
+    } as any,
+    versioned: { retain: true },
+  }),
+  POrders: Entity.make({
+    model: G133POrder,
+    entityType: "G133POrder",
+    primaryKey: g133OrderKey([]) as any,
+    timestamps: true,
+    versioned: { retain: true },
+    softDelete: true,
+  }),
+  PLines: Entity.make({
+    model: G133PLine,
+    entityType: "G133PLine",
+    primaryKey: g133OrderKey(["lineId"]) as any,
+  }),
+
   Lines: Entity.make({
     model: G133Line,
     entityType: "G133Line",
@@ -17151,6 +17230,69 @@ describeConnected("#133 — path operations on index composites and unique field
       yield* lines.delete(a)
       expect((yield* lines.deleted.get(a)).label).toBe("a3")
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- live rows are never mistaken for history (#133) ----
+
+  it.effect("a time-series item whose key holds the event marker is still an item", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const readings = db.entities.Readings as any
+      for (const dev of ["d1", "x#e#y"]) {
+        for (let day = 1; day <= 3; day++) {
+          yield* readings.append({
+            ch: "lr",
+            dev,
+            ts: DateTime.makeUnsafe(Date.UTC(2024, 0, day)),
+            v: day,
+          })
+        }
+      }
+      const devs = (rows: ReadonlyArray<any>) => rows.map((r) => r.dev).sort()
+      expect(devs(yield* readings.primary({ ch: "lr" }).collect())).toEqual(["d1", "x#e#y"])
+      expect(yield* readings.primary({ ch: "lr" }).count()).toBe(2)
+      expect(devs(yield* readings.scan().filter({ ch: "lr" }).collect())).toEqual(["d1", "x#e#y"])
+      expect(yield* readings.history({ ch: "lr", dev: "x#e#y" }).collect()).toHaveLength(3)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("an item in a sub-collection named like a history marker is still an item", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      for (const entity of ["SubDeleted", "SubVersioned"] as const) {
+        const subs = db.entities[entity] as any
+        yield* subs.put({ id: "sc1", label: "one" })
+        expect((yield* subs.primary({ id: "sc1" }).collect()).map((r: any) => r.label)).toEqual([
+          "one",
+        ])
+        expect((yield* subs.scan().collect()).map((r: any) => r.label)).toEqual(["one"])
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect(
+    "a collection on the primary key returns items, and purge keeps other types' rows",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const orders = db.entities.POrders as any
+        const lines = db.entities.PLines as any
+        yield* orders.put({ orderId: "po1", label: "v1" })
+        yield* orders.update({ orderId: "po1" }).set({ label: "v2" })
+        yield* orders.update({ orderId: "po1" }).set({ label: "v3" })
+        yield* lines.put({ orderId: "po1", lineId: "a", qty: 1 })
+        yield* lines.put({ orderId: "po1", lineId: "b", qty: 2 })
+        const all = yield* (db.collections as any).g133OrderAll({ orderId: "po1" }).collect()
+        expect(all.POrders.map((o: any) => o.label)).toEqual(["v3"])
+        expect(all.PLines).toHaveLength(2)
+        // purge removes the order, its history and its tombstones — not the lines.
+        yield* orders.delete({ orderId: "po1" })
+        yield* orders.purge({ orderId: "po1" })
+        expect(yield* orders.versions({ orderId: "po1" }).collect()).toEqual([])
+        expect(
+          (yield* lines.primary({ orderId: "po1" }).collect()).map((l: any) => l.lineId),
+        ).toEqual(["a", "b"])
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
   // ---- upsert validates the whole input, and stores defaults only on create ----

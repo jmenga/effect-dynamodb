@@ -5562,7 +5562,7 @@ describe("Entity", () => {
         )
         const pk = "$myapp#v1#line#order_o1"
         const row = (sk: string, extra: Record<string, unknown> = {}) =>
-          toAttributeMap({ pk, sk, ...extra })
+          toAttributeMap({ pk, sk, __edd_e__: "Line", ...extra })
         mockQuery.mockResolvedValueOnce({
           Items: [
             row("$myapp#v1#line#line_a"),
@@ -5581,7 +5581,7 @@ describe("Entity", () => {
         yield* Lines.purge({ order: "o1", line: "a" }).asEffect()
 
         const query = mockQuery.mock.calls[0]![0]
-        expect(query.ProjectionExpression).toBe("#pk, #sk, #c0")
+        expect(query.ProjectionExpression).toBe("#pk, #sk, #ent, #c0")
         expect(query.ExpressionAttributeNames["#c0"]).toBe("line")
         const deleted = mockBatchWriteItem.mock.calls.flatMap((call) =>
           call[0].RequestItems["test-table"].map((r: any) => r.DeleteRequest.Key.sk.S),
@@ -5603,14 +5603,17 @@ describe("Entity", () => {
             toAttributeMap({
               pk: "$myapp#v1#purgeitem#i-1",
               sk: "$myapp#v1#purgeitem",
+              __edd_e__: "PurgeItem",
             }),
             toAttributeMap({
               pk: "$myapp#v1#purgeitem#i-1",
               sk: "$myapp#v1#purgeitem#v#0000001",
+              __edd_e__: "PurgeItem",
             }),
             toAttributeMap({
               pk: "$myapp#v1#purgeitem#i-1",
               sk: "$myapp#v1#purgeitem#v#0000002",
+              __edd_e__: "PurgeItem",
             }),
           ],
           LastEvaluatedKey: undefined,
@@ -5645,6 +5648,7 @@ describe("Entity", () => {
             toAttributeMap({
               pk: "$myapp#v1#purgesoft#i-1",
               sk: "$myapp#v1#purgesoft#deleted#2024-02-01T10:00:00Z",
+              __edd_e__: "PurgeSoft",
             }),
           ],
           LastEvaluatedKey: undefined,
@@ -5664,6 +5668,31 @@ describe("Entity", () => {
       }).pipe(Effect.provide(PurgeTestLayer)),
     )
 
+    it.effect("purge never deletes another entity's rows in the partition", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              pk: "$myapp#v1#purgeitem#i-1",
+              sk: "$myapp#v1#purgeitem",
+              __edd_e__: "PurgeItem",
+            }),
+            toAttributeMap({
+              pk: "$myapp#v1#purgeitem#i-1",
+              sk: "$myapp#v1#other_1#lineid_a",
+              __edd_e__: "Other",
+            }),
+          ],
+        })
+        mockBatchWriteItem.mockResolvedValueOnce({})
+        yield* PurgeEntity.purge({ itemId: "i-1" }).asEffect()
+        const keys = mockBatchWriteItem.mock.calls[0]![0].RequestItems["test-table"].map(
+          (r: any) => r.DeleteRequest.Key.sk.S,
+        )
+        expect(keys).toEqual(["$myapp#v1#purgeitem"])
+      }).pipe(Effect.provide(PurgeTestLayer)),
+    )
+
     it.effect("purge simple case (no versions or sentinels)", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({
@@ -5671,6 +5700,7 @@ describe("Entity", () => {
             toAttributeMap({
               pk: "$myapp#v1#purgeitem#i-1",
               sk: "$myapp#v1#purgeitem",
+              __edd_e__: "PurgeItem",
             }),
           ],
           LastEvaluatedKey: undefined,

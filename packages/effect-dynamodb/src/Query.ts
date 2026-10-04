@@ -77,19 +77,19 @@ interface QueryState {
    */
   readonly keyFields: ReadonlyArray<string> | undefined
   /**
-   * Sort key prefixes of rows that are an entity's HISTORY, not its items —
-   * version snapshots and soft-delete tombstones (#133). They keep the
-   * entity's `__edd_e__`, so the ownership filter alone admits them to a
-   * query of the table's primary key (or a scan). A scan filters them out in
-   * its `FilterExpression`; a query cannot (DynamoDB refuses a key attribute
-   * there), so its rows are dropped as they arrive, before they are decoded
-   * or counted — see {@link isExcludedRow}.
+   * Which rows are items (#133). An entity's version snapshots, soft-delete
+   * tombstones and time-series events keep its `__edd_e__`, so the ownership
+   * filter alone admits them to a query of the table's primary key, or a
+   * scan. Rows that fail it are dropped as they arrive, before they are
+   * decoded or counted — see {@link isExcludedRow}. (Client-side for scans
+   * too: a `FilterExpression` saves no read capacity, and no expression
+   * tells a live row from history as exactly.)
    */
-  readonly excludeSkPrefixes: ExcludedSkPrefixes | undefined
+  readonly liveRows: LiveRows | undefined
   /**
    * Run once at the start of each terminal, against the resolved table: may
    * swap the sort key `begins_with` operand and add a row filter (`keep`)
-   * applied, like {@link excludeSkPrefixes}, to rows before they are decoded.
+   * applied, like {@link liveRows}, to rows before they are decoded.
    * An entity's `versions` uses it to read history written by an earlier
    * release alongside its own (#133).
    */
@@ -109,25 +109,13 @@ export type QueryPrepare = (tableName: string) => Effect.Effect<
   DynamoClient
 >
 
-/** @internal Rows a query must not return: `field` beginning with any of `prefixes`. */
-export interface ExcludedSkPrefixes {
-  readonly field: string
-  readonly prefixes: ReadonlyArray<string>
-  /**
-   * Rows nested under a live item — time-series events, `<liveSk>#e#…`: a
-   * sort key beginning with `under` (the live sort key less its composites)
-   * whose remainder contains `marker`.
-   */
-  readonly nested?: { readonly under: string; readonly marker: string } | undefined
+/** @internal See {@link QueryState.liveRows}. */
+export interface LiveRows {
+  /** Whether a raw row is an item, rather than an entity's history. */
+  readonly isLive: (row: Record<string, AttributeValue>) => boolean
+  /** The attributes `isLive` reads — kept in a request that projects. */
+  readonly reads: ReadonlyArray<string>
 }
-
-/** @internal Absent when there is nothing to exclude. */
-const normalizeExcluded = (
-  excluded: ExcludedSkPrefixes | undefined,
-): ExcludedSkPrefixes | undefined =>
-  excluded === undefined || (excluded.prefixes.length === 0 && excluded.nested === undefined)
-    ? undefined
-    : excluded
 
 /** @internal Dedupe + drop absent entries from a caller-supplied key field list. */
 const normalizeKeyFields = (
@@ -193,13 +181,13 @@ export const make = <A>(config: {
   readonly resolveTableName?: Effect.Effect<string, never, any> | undefined
   /** Index key + table key attribute names (used to rebuild cursors). */
   readonly keyFields?: ReadonlyArray<string | undefined> | undefined
-  /** History rows to leave out (see {@link QueryState.excludeSkPrefixes}). */
-  readonly excludeSkPrefixes?: ExcludedSkPrefixes | undefined
+  /** Which rows are items (see {@link QueryState.liveRows}). */
+  readonly liveRows?: LiveRows | undefined
   /** See {@link QueryState.prepare}. */
   readonly prepare?: QueryPrepare | undefined
 }): Query<A> =>
   new QueryImpl<A>({
-    excludeSkPrefixes: normalizeExcluded(config.excludeSkPrefixes),
+    liveRows: config.liveRows,
     prepare: config.prepare,
     keepRow: undefined,
     tableName: config.tableName,
@@ -241,13 +229,13 @@ export const makeScan = <A>(config: {
   readonly resolveTableName?: Effect.Effect<string, never, any> | undefined
   /** Index key + table key attribute names (used to rebuild cursors). */
   readonly keyFields?: ReadonlyArray<string | undefined> | undefined
-  /** History rows to leave out (see {@link QueryState.excludeSkPrefixes}). */
-  readonly excludeSkPrefixes?: ExcludedSkPrefixes | undefined
+  /** Which rows are items (see {@link QueryState.liveRows}). */
+  readonly liveRows?: LiveRows | undefined
   /** See {@link QueryState.prepare}. */
   readonly prepare?: QueryPrepare | undefined
 }): Query<A> =>
   new QueryImpl<A>({
-    excludeSkPrefixes: normalizeExcluded(config.excludeSkPrefixes),
+    liveRows: config.liveRows,
     prepare: config.prepare,
     keepRow: undefined,
     tableName: config.tableName,
@@ -575,21 +563,6 @@ const buildFilterClauses = (state: QueryState) => {
     })
   }
 
-  // History rows (snapshots, tombstones) are not items (#133). A query's are
-  // dropped client-side instead: its filter may not name a key attribute.
-  if (state.isScan && state.excludeSkPrefixes !== undefined && !excludedClientSide(state)) {
-    names["#eddSk"] = state.excludeSkPrefixes.field
-    state.excludeSkPrefixes.prefixes.forEach((prefix, i) => {
-      filterClauses.push(`NOT begins_with(#eddSk, :eddSk${i})`)
-      values[`:eddSk${i}`] = toAttributeValue(prefix)
-    })
-    const nested = state.excludeSkPrefixes.nested
-    if (nested !== undefined) {
-      filterClauses.push("NOT contains(#eddSk, :eddNest)")
-      values[":eddNest"] = toAttributeValue(nested.marker)
-    }
-  }
-
   // Expr-based filters (compiled from Entity.filter() callback/shorthand API)
   for (const expr of state.exprFilters) {
     const compiled = compileExpr(expr)
@@ -758,39 +731,17 @@ const computeRequestLimit = (
 }
 
 /**
- * @internal Whether a query drops history rows client-side (#133): like a
- * predicate, it rejects rows after they are read, so the `limit` budget cannot
- * be handed to DynamoDB, and a count has to read the rows.
+ * @internal Whether the query drops rows client-side (#133): like a predicate,
+ * it rejects rows after they are read, so the `limit` budget cannot be handed
+ * to DynamoDB, and a count has to read the rows.
  */
 const dropsRows = (state: QueryState): boolean =>
-  state.keepRow !== undefined ||
-  (state.excludeSkPrefixes !== undefined && (!state.isScan || excludedClientSide(state)))
+  state.keepRow !== undefined || state.liveRows !== undefined
 
 /** @internal Is this raw row one the query leaves out (#133)? */
-const isExcludedRow = (state: QueryState, row: Record<string, AttributeValue>): boolean => {
-  if (state.keepRow !== undefined && !state.keepRow(row)) return true
-  const excluded = state.excludeSkPrefixes
-  if (excluded === undefined || (state.isScan && !excludedClientSide(state))) return false
-  const sk = row[excluded.field]?.S
-  if (sk === undefined) return false
-  if (excluded.prefixes.some((p) => sk.startsWith(p))) return true
-  const nested = excluded.nested
-  return (
-    nested !== undefined &&
-    sk.startsWith(nested.under) &&
-    sk.slice(nested.under.length).includes(nested.marker)
-  )
-}
-
-/**
- * @internal Whether a scan must drop excluded rows client-side too: a nested
- * marker its `FilterExpression` can only test with `contains`, which would
- * also match live rows if the marker can occur in their keys.
- */
-const excludedClientSide = (state: QueryState): boolean => {
-  const nested = state.excludeSkPrefixes?.nested
-  return nested !== undefined && `${nested.under}#`.includes(nested.marker)
-}
+const isExcludedRow = (state: QueryState, row: Record<string, AttributeValue>): boolean =>
+  (state.keepRow !== undefined && !state.keepRow(row)) ||
+  (state.liveRows !== undefined && !state.liveRows.isLive(row))
 
 /**
  * @internal The state a terminal runs: {@link QueryState.prepare} applied
@@ -862,21 +813,23 @@ const cursorFromItem = (
  * over-reading request can still rebuild an accurate cursor. They are stripped
  * from the items handed back, so the caller sees exactly what it selected.
  */
-const cursorProjectionFields = (state: QueryState): ReadonlyArray<string> => {
+const cursorProjectionFields = (
+  state: QueryState,
+  /** Whether the terminal rebuilds a cursor (`execute`); `paginate` doesn't. */
+  forCursor: boolean,
+): ReadonlyArray<string> => {
   const projected = new Set<string>([
     ...(state.projection ?? []),
     ...(state.projectionPaths ?? []).map((segments) => String(segments[0])),
   ])
   if (projected.size === 0) return []
   const borrowed = new Set<string>(
-    state.limitValue === undefined || !state.keyFields
-      ? []
-      : state.keyFields.filter((field) => !projected.has(field)),
+    !forCursor || state.limitValue === undefined || !state.keyFields ? [] : state.keyFields,
   )
-  // A query that drops history rows reads their sort key (#133).
-  const judged = state.keepRow !== undefined ? state.skField : state.excludeSkPrefixes?.field
-  if (dropsRows(state) && judged !== undefined && !projected.has(judged)) borrowed.add(judged)
-  return [...borrowed]
+  // A query that drops rows reads what it judges them by (#133).
+  if (state.keepRow !== undefined && state.skField !== undefined) borrowed.add(state.skField)
+  for (const attr of state.liveRows?.reads ?? []) borrowed.add(attr)
+  return [...borrowed].filter((field) => !projected.has(field))
 }
 
 // ---------------------------------------------------------------------------
@@ -945,7 +898,7 @@ export const execute = <A>(
 
     // Key attributes borrowed into an active projection so an over-reading
     // request can still rebuild a cursor. Stripped again before decoding.
-    const borrowedFields = cursorProjectionFields(state)
+    const borrowedFields = cursorProjectionFields(state, true)
     const hasPredicate = state.predicates.length > 0 || dropsRows(state)
 
     const items: Array<A> = []
@@ -1081,7 +1034,7 @@ const pageStream = <A>(
       Effect.gen(function* () {
         const pageCount = pageState.pageCount + 1
         const remaining = limitValue === undefined ? undefined : limitValue - pageState.emitted
-        const borrowedFields = cursorProjectionFields(state)
+        const borrowedFields = cursorProjectionFields(state, false)
         const cmd = buildDynamoCommand(
           state,
           tableName,
