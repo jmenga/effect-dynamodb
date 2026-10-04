@@ -680,12 +680,22 @@ export const buildDateTransform = (
         case "DateTime.Utc":
           return DateTime.makeUnsafe(value)
         case "DateTime.Zoned": {
-          const match = value.match(/^(.+)\[(.+)\]$/)
-          if (match) {
-            const utc = DateTime.makeUnsafe(match[1]!)
-            return DateTime.makeZonedUnsafe(utc, { timeZone: match[2]! })
+          // `formatIsoZoned` writes a NAMED zone as `…+00:00[Europe/London]`
+          // and an OFFSET zone as `…+05:00` (no bracket). Both are rebuilt with
+          // the zone they were written with, so either round-trips exactly
+          // (#133); before, an offset zone was dropped and rebuilt as UTC.
+          const named = value.match(/^(.+)\[(.+)\]$/)
+          if (named) {
+            const utc = DateTime.makeUnsafe(named[1]!)
+            return DateTime.makeZonedUnsafe(utc, { timeZone: named[2]! })
           }
           const utc = DateTime.makeUnsafe(value)
+          const offset = value.match(/([+-])(\d{2}):(\d{2})$/)
+          if (offset) {
+            const sign = offset[1] === "-" ? -1 : 1
+            const ms = sign * (Number(offset[2]) * 3_600_000 + Number(offset[3]) * 60_000)
+            return DateTime.makeZonedUnsafe(utc, { timeZone: DateTime.zoneMakeOffset(ms) })
+          }
           return DateTime.makeZonedUnsafe(utc, { timeZone: "UTC" })
         }
         case "Date":
@@ -977,7 +987,15 @@ const memberWireKinds = (member: Schema.Top): ReadonlySet<WireKind> => {
   const visit = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST>) => {
     if (seen.has(ast)) return
     seen.add(ast)
-    if (SchemaAST.isAny(ast) || SchemaAST.isUnknown(ast)) {
+    if (SchemaAST.isDeclaration(ast)) {
+      // A self date nested in this member — `NullOr(DateTimeUtc)` inside an
+      // outer union — is stored as its storage kind too.
+      const nested = Schema.make<Schema.Top>(ast)
+      if (isSelfDateSchema(nested)) {
+        const encoding = getEncoding(nested) ?? inferDefaultEncoding(nested)
+        kinds.add(encoding === undefined || encoding.storage === "string" ? "string" : "number")
+      }
+    } else if (SchemaAST.isAny(ast) || SchemaAST.isUnknown(ast)) {
       kinds.add("string")
       kinds.add("number")
     } else if (SchemaAST.isString(ast) || SchemaAST.isTemplateLiteral(ast)) {
@@ -1134,18 +1152,32 @@ export interface DeepSubstitutionOptions {
   readonly unionDateOverride?: DynamoEncoding | undefined
   /** Set internally from `unionDateOverride` on the union's members. */
   readonly dateEncodingOverride?: DynamoEncoding | undefined
+  /** The field path being substituted, for error messages. */
+  readonly path?: ReadonlyArray<string> | undefined
 }
 
 /** The options a nested schema inherits: everything but the per-position ones. */
 const descend = (opts: DeepSubstitutionOptions | undefined): DeepSubstitutionOptions | undefined =>
-  opts?.tolerantTransforms || opts?.resolveRef || opts?.strictWireKind || opts?.legacyReads
+  opts?.tolerantTransforms ||
+  opts?.resolveRef ||
+  opts?.strictWireKind ||
+  opts?.legacyReads ||
+  opts?.path
     ? {
         ...(opts?.tolerantTransforms ? { tolerantTransforms: true } : {}),
         ...(opts?.resolveRef ? { resolveRef: opts.resolveRef } : {}),
         ...(opts?.strictWireKind ? { strictWireKind: true } : {}),
         ...(opts?.legacyReads ? { legacyReads: true } : {}),
+        ...(opts?.path ? { path: opts.path } : {}),
       }
     : undefined
+
+/** Options for a struct / class field: the inherited ones, with the field on the path. */
+const atField = (
+  deeper: DeepSubstitutionOptions | undefined,
+  opts: DeepSubstitutionOptions | undefined,
+  name: string,
+): DeepSubstitutionOptions => ({ ...deeper, path: [...(opts?.path ?? []), name] })
 
 /**
  * A container the substitution walks only under `tolerantTransforms` (#133):
@@ -1284,7 +1316,10 @@ const childOptions = (
   opts: DeepSubstitutionOptions | undefined,
 ): DeepSubstitutionOptions | undefined => {
   if (!container.isUnion) return deeper
-  const collidingKinds = new Set<WireKind>()
+  // What the other members are stored as — plus, for a union nested inside
+  // another (`Union([NullOr(DateTimeUtc), String])`), what the OUTER union's
+  // other members are stored as: they compete for the same stored value.
+  const collidingKinds = new Set<WireKind>(opts?.collidingKinds ?? [])
   container.children.forEach((member, i) => {
     if (i !== index) for (const kind of memberWireKinds(member)) collidingKinds.add(kind)
   })
@@ -1321,16 +1356,24 @@ const selfDatePlan = (
 ): { readonly encoding: DynamoEncoding; readonly canonicalOnly: boolean } | undefined => {
   const own = getEncoding(schema) ?? inferDefaultEncoding(schema)
   if (!own) return undefined
-  let encoding: DynamoEncoding = opts?.dateEncodingOverride
+  const encoding: DynamoEncoding = opts?.dateEncodingOverride
     ? { storage: opts.dateEncodingOverride.storage, domain: own.domain }
     : own
   const colliding = opts?.collidingKinds
   let canonicalOnly = false
   if (colliding !== undefined) {
     // An epoch number is indistinguishable from a number member's value — any
-    // integer is a canonical epoch — so store the date as its ISO string.
+    // integer is a canonical epoch — so no stored number could be read back
+    // reliably. Refused at make() time (EDD-9058) rather than guessed.
     if (encoding.storage !== "string" && colliding.has("number")) {
-      encoding = { ...encoding, storage: "string" }
+      const field = opts?.path?.length ? opts.path.join(".") : "(unnamed)"
+      throw new Error(
+        `[EDD-9058] Field "${field}" is a union whose date member is stored as an epoch ` +
+          `number (${encoding.storage}), next to a member that is also stored as a number. ` +
+          `A stored number could belong to either member, so it cannot be read back ` +
+          `reliably. Store the date as a string (DynamoModel.DateString — the default for a ` +
+          `self date), or remove the numeric member from the union.`,
+      )
     }
     canonicalOnly = colliding.has(encoding.storage === "string" ? "string" : "number")
   }
@@ -1362,7 +1405,14 @@ const isCanonicalDateMember = (
   opts: DeepSubstitutionOptions | undefined,
 ): boolean => {
   const inner = optionalField(member)?.inner ?? member
-  return isSelfDateSchema(inner) && selfDatePlan(inner, opts)?.canonicalOnly === true
+  if (isSelfDateSchema(inner)) return selfDatePlan(inner, opts)?.canonicalOnly === true
+  // A nested union holding such a member (`NullOr(DateTimeUtc)` next to a
+  // `String`) is decoded first for the same reason.
+  const container = walkedContainer(inner)
+  if (container === undefined || !container.isUnion) return false
+  return container.children.some((child, index) =>
+    isCanonicalDateMember(child, childOptions(container, descend(opts), index, opts)),
+  )
 }
 
 /** Whether a leaf gets a read-leniency substitute (see `legacyReads`). */
@@ -1556,10 +1606,10 @@ export const substituteSchemaDeep = (
       const refTarget = opts?.resolveRef?.(name, field)
       if (refTarget !== undefined) {
         const fieldOpt = optionalField(field)
-        const sub = substituteSchemaDeep(refTarget, deeper)
+        const sub = substituteSchemaDeep(refTarget, atField(deeper, opts, name))
         subFields[name] = fieldOpt ? fieldOpt.rewrap(sub) : sub
       } else {
-        subFields[name] = substituteSchemaDeep(field, deeper)
+        subFields[name] = substituteSchemaDeep(field, atField(deeper, opts, name))
       }
     }
     const subStruct = Schema.Struct(subFields as Schema.Struct.Fields)
@@ -1650,10 +1700,11 @@ export const substituteSchemas = (
     //    A configured storage override on a UNION field (`NullOr(DateTimeUtc)`)
     //    is applied to the union's self-date member (#133).
     const unionOverride = unionDateOverride(name, schema, fieldEncodings[name])
-    out[name] = substituteSchemaDeep(
-      schema,
-      unionOverride === undefined ? deep : { ...deep, unionDateOverride: unionOverride },
-    )
+    out[name] = substituteSchemaDeep(schema, {
+      ...deep,
+      path: [name],
+      ...(unionOverride === undefined ? {} : { unionDateOverride: unionOverride }),
+    })
   }
   return out
 }
@@ -2165,12 +2216,16 @@ const sameValue = (a: unknown, b: unknown): boolean => {
  * Before path values were encoded, a wire value was the only way to round-trip
  * such a field, so it is passed through as given (#133).
  *
- * Schemas without an encoding transformation never qualify — a self date's
- * domain `DateTime` is "its own encoded form" to Effect, but the library stores
- * it as a primitive, so it is always encoded.
+ * Only a LEAF transform with a primitive wire form qualifies. A container — a
+ * class, struct, array, record, tuple or union — is always encoded: encoding a
+ * `Schema.Class` yields a plain object, so it would always look "changed", and
+ * passing it through whole would marshal its `Redacted` / `Date` / `DateTime`
+ * leaves as maps and lose them. A self date never qualifies either: its domain
+ * `DateTime` is "its own encoded form" to Effect, but the library stores it as
+ * a primitive.
  */
 const makeAmbiguityCheck = (original: Schema.Top): ((value: unknown) => boolean) => {
-  if (!containsWireTransform(original)) return () => false
+  if (!isLeafEncodingTransform(original)) return () => false
   const isEncoded = Schema.is(Schema.make<Schema.Top>(SchemaAST.toEncoded(original.ast)))
   const isType = Schema.is(Schema.make<Schema.Top>(SchemaAST.toType(original.ast)))
   const encode = Schema.encodeUnknownOption(original as unknown as Schema.Codec<any>)
@@ -2215,22 +2270,38 @@ export const makePathValueEncoder = (
     const cached = cache.get(key)
     if (cached !== undefined) return cached
     const resolved = resolve()
-    const fn =
-      resolved === undefined
-        ? null
-        : (() => {
-            const encode = Schema.encodeUnknownOption(resolved.stored as Schema.Codec<any>)
-            const ambiguous = makeAmbiguityCheck(
-              optionalField(resolved.original)?.inner ?? resolved.original,
-            )
-            return (value: unknown) => {
-              if (ambiguous(value)) return value
-              const encoded = encode(value)
-              return encoded._tag === "Some" ? encoded.value : value
-            }
-          })()
+    const fn = resolved === undefined ? null : leafAwareEncoder(resolved.original, resolved.stored)
     cache.set(key, fn)
     return fn
+  }
+  /**
+   * Encode through `stored`, passing an ambiguous wire value of a LEAF transform
+   * through. An array of such leaves (`Array(StringFromBase64)`) is the one
+   * container handled element by element, so a list of wire strings is not
+   * double-encoded either; every other container is encoded whole.
+   */
+  const leafAwareEncoder = (
+    originalSchema: Schema.Top,
+    stored: Schema.Top,
+  ): ((value: unknown) => unknown) => {
+    const original = optionalField(originalSchema)?.inner ?? originalSchema
+    const originalElement = listElementOf(original)
+    const storedElement = listElementOf(stored)
+    if (
+      originalElement !== undefined &&
+      storedElement !== undefined &&
+      isLeafEncodingTransform(optionalField(originalElement)?.inner ?? originalElement)
+    ) {
+      const element = leafAwareEncoder(originalElement, storedElement)
+      return (value) => (Array.isArray(value) ? value.map((entry) => element(entry)) : value)
+    }
+    const encode = Schema.encodeUnknownOption(stored as Schema.Codec<any>)
+    const ambiguous = makeAmbiguityCheck(original)
+    return (value: unknown) => {
+      if (ambiguous(value)) return value
+      const encoded = encode(value)
+      return encoded._tag === "Some" ? encoded.value : value
+    }
   }
   /** The model's own schema at a path, before any substitution. */
   const originalAt = (segments: ReadonlyArray<string | number>): Schema.Top | undefined => {

@@ -386,18 +386,27 @@ describe("substituteSchemaDeep — unions with a colliding member (#133)", () =>
     }),
   )
 
-  it.effect("an epoch date next to a Number member is stored as its ISO string", () =>
-    Effect.gen(function* () {
-      const schema = Schema.Union([
-        Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
-        Schema.Number,
-      ])
-      expect(yield* encode(schema, DateTime.makeUnsafe(MS))).toBe(ISO)
-      expect(yield* encode(schema, 5)).toBe(5)
-      expect(yield* decode(schema, MS)).toBe(MS)
-      expect(DateTime.isDateTime(yield* decode(schema, ISO))).toBe(true)
-    }),
-  )
+  it("rejects an epoch-stored date next to a member stored as a number (EDD-9058)", () => {
+    for (const other of [Schema.Number, Schema.Literal(0), Schema.BigInt]) {
+      expect(() =>
+        substituteSchemaDeep(
+          Schema.Union([
+            Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
+            other as Schema.Top,
+          ]),
+        ),
+      ).toThrow(/EDD-9058/)
+    }
+    // A member stored as a string does not collide with an epoch number.
+    expect(() =>
+      substituteSchemaDeep(
+        Schema.Union([
+          Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
+          Schema.NumberFromString,
+        ]),
+      ),
+    ).not.toThrow()
+  })
 
   it.effect("a date with no colliding member keeps its storage", () =>
     Effect.gen(function* () {
@@ -469,4 +478,51 @@ describe("substituteSchemas — read leniency and configured union storage (#133
       ),
     ).toThrow(/EDD-9057/)
   })
+})
+
+describe("substituteSchemaDeep — zoned zones and nested unions (#133)", () => {
+  const MS = 946684800000
+  const roundTrip = (schema: Schema.Top, value: unknown) =>
+    Effect.gen(function* () {
+      const sub = substituteSchemaDeep(schema) as Schema.Codec<any>
+      const wire = yield* Schema.encodeUnknownEffect(sub)(value)
+      return { wire, back: yield* Schema.decodeUnknownEffect(sub)(wire) }
+    })
+
+  it.effect("named, offset and UTC zones are rebuilt exactly", () =>
+    Effect.gen(function* () {
+      for (const zone of [
+        "Europe/London",
+        "UTC",
+        DateTime.zoneMakeOffset(5 * 3_600_000),
+        DateTime.zoneMakeOffset(-(3 * 3_600_000 + 30 * 60_000)),
+      ]) {
+        const zoned = DateTime.makeZonedUnsafe(MS, { timeZone: zone })
+        for (const schema of [
+          Schema.DateTimeZoned,
+          Schema.Union([Schema.DateTimeZoned, Schema.String]),
+        ]) {
+          const { wire, back } = yield* roundTrip(schema, zoned)
+          expect(wire).toBe(DateTime.formatIsoZoned(zoned))
+          expect(DateTime.formatIsoZoned(back as DateTime.Zoned)).toBe(wire)
+        }
+      }
+    }),
+  )
+
+  it.effect("a self date in a nested union yields to the outer union's string member", () =>
+    Effect.gen(function* () {
+      for (const schema of [
+        Schema.Union([Schema.NullOr(Schema.DateTimeUtc), Schema.String]),
+        Schema.Union([Schema.String, Schema.NullOr(Schema.DateTimeUtc)]),
+        Schema.NullOr(Schema.Union([Schema.DateTimeUtc, Schema.String])),
+      ]) {
+        const sub = substituteSchemaDeep(schema) as Schema.Codec<any>
+        expect(yield* Schema.decodeUnknownEffect(sub)("2020")).toBe("2020")
+        expect(yield* Schema.decodeUnknownEffect(sub)("5")).toBe("5")
+        const date = yield* Schema.decodeUnknownEffect(sub)("2000-01-01T00:00:00.000Z")
+        expect(DateTime.isDateTime(date)).toBe(true)
+      }
+    }),
+  )
 })
