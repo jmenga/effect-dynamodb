@@ -14299,6 +14299,14 @@ const g133OrderKey = (sk: ReadonlyArray<string>) => ({
   sk: { field: "sk", composite: sk },
 })
 
+// A number composite stored as a string (#133): rows written by 1.15 have an
+// unpadded key (`#seq_5`) the current composer doesn't reproduce.
+class G133Seq extends Schema.Class<G133Seq>("G133Seq")({
+  tenant: Schema.String,
+  seq: Schema.NumberFromString,
+  label: Schema.String,
+}) {}
+
 // Several items per partition (#133): a primary sort key with a composite.
 class G133Line extends Schema.Class<G133Line>("G133Line")({
   order: Schema.String,
@@ -14428,6 +14436,15 @@ const g133Entities = {
     versioned: true,
   }),
   Vecs: Entity.make({ model: G133Vec, entityType: "G133Vec", primaryKey: g133IdKey as any }),
+  Seqs: Entity.make({
+    model: G133Seq,
+    entityType: "G133Seq",
+    primaryKey: {
+      pk: { field: "pk", composite: ["tenant"] },
+      sk: { field: "sk", composite: ["seq"] },
+    } as any,
+    versioned: { retain: true },
+  }),
   Readings: Entity.make({
     model: G133Reading,
     entityType: "G133Reading",
@@ -17253,6 +17270,93 @@ describeConnected("#133 — path operations on index composites and unique field
       expect(yield* readings.primary({ ch: "lr" }).count()).toBe(2)
       expect(devs(yield* readings.scan().filter({ ch: "lr" }).collect())).toEqual(["d1", "x#e#y"])
       expect(yield* readings.history({ ch: "lr", dev: "x#e#y" }).collect()).toHaveLength(3)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a row the composer can't reproduce is kept unless it is shaped like history", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const seqs = db.entities.Seqs as any
+      // As 1.15 wrote it: the key from the encoded string, unpadded.
+      yield* putRaw({
+        pk: "$edd133g#v1#g133seq#tenant_t1",
+        sk: "$edd133g#v1#g133seq#seq_5",
+        __edd_e__: "G133Seq",
+        tenant: "t1",
+        seq: "5",
+        label: "from-1.15",
+        version: 1,
+      })
+      yield* seqs.put({ tenant: "t1", seq: 42, label: "new" })
+      yield* seqs.update({ tenant: "t1", seq: 42 }).set({ label: "newer" })
+      const labels = (rows: ReadonlyArray<any>) => rows.map((r) => r.label).sort()
+      expect(labels(yield* seqs.primary({ tenant: "t1" }).collect())).toEqual([
+        "from-1.15",
+        "newer",
+      ])
+      expect(yield* seqs.primary({ tenant: "t1" }).count()).toBe(2)
+      expect(labels(yield* seqs.scan().filter({ tenant: "t1" }).collect())).toEqual([
+        "from-1.15",
+        "newer",
+      ])
+      // A malformed live row (its composite is missing) is read as before:
+      // the query fails to decode it rather than hiding it.
+      yield* putRaw({
+        pk: "$edd133g#v1#g133seq#tenant_t2",
+        sk: "$edd133g#v1#g133seq#seq_0000000000000007",
+        __edd_e__: "G133Seq",
+        tenant: "t2",
+        label: "malformed",
+        version: 1,
+      })
+      const failed = yield* Effect.flip(seqs.primary({ tenant: "t2" }).collect())
+      expect((failed as any)._tag).toBe("ValidationError")
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("select on items sharing a partition reads the composites it judges rows by", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const lines = db.entities.Lines as any
+      for (const line of ["a", "b"]) {
+        yield* lines.put({ order: "o5", line, label: `${line}1` })
+        yield* lines.update({ order: "o5", line }).set({ label: `${line}2` })
+      }
+      const labels = (rows: ReadonlyArray<any>) => rows.map((r) => r.label).sort()
+      expect(labels(yield* lines.primary({ order: "o5" }).select(["label"]).collect())).toEqual([
+        "a2",
+        "b2",
+      ])
+      expect(
+        labels(yield* lines.scan().filter({ order: "o5" }).select(["label"]).collect()),
+      ).toEqual(["a2", "b2"])
+      const streamed = yield* Stream.runCollect(
+        lines.primary({ order: "o5" }).select(["label"]).limit(5).paginate(),
+      )
+      expect(labels([...(streamed as any)])).toEqual(["a2", "b2"])
+
+      // A live time-series item whose composite holds the event marker is told
+      // from an event only by composing its key — which needs its composites.
+      const readings = db.entities.Readings as any
+      for (const dev of ["s1", "x#e#z"]) {
+        for (let day = 1; day <= 2; day++) {
+          yield* readings.append({
+            ch: "sel",
+            dev,
+            ts: DateTime.makeUnsafe(Date.UTC(2024, 0, day)),
+            v: day,
+          })
+        }
+      }
+      const values = (rows: ReadonlyArray<any>) => rows.map((r) => r.v)
+      expect(values(yield* readings.primary({ ch: "sel" }).select(["v"]).collect())).toEqual([2, 2])
+      expect(values(yield* readings.scan().filter({ ch: "sel" }).select(["v"]).collect())).toEqual([
+        2, 2,
+      ])
+      const paged = yield* Stream.runCollect(
+        readings.primary({ ch: "sel" }).select(["v"]).limit(5).paginate(),
+      )
+      expect(values([...(paged as any)])).toEqual([2, 2])
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 

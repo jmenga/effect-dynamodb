@@ -717,6 +717,9 @@ const buildDynamoCommand = (
  *   `pageSize` — or, unset, a natural (1 MB) page.
  * - A client-side predicate ({@link filterBy}) rejects rows even later, after
  *   decode, so it disqualifies the budget for exactly the same reason.
+ * - Rows dropped as history ({@link QueryState.liveRows}, a prepared `keep`)
+ *   are not: the budget still bounds the request, and the accumulate loop
+ *   fetches another page for any it drops (#133).
  */
 const computeRequestLimit = (
   state: QueryState,
@@ -724,9 +727,7 @@ const computeRequestLimit = (
 ): number | undefined => {
   const pageSize = state.pageSizeValue
   if (remaining === undefined) return pageSize
-  if (state.exprFilters.length > 0 || state.predicates.length > 0 || dropsRows(state)) {
-    return pageSize
-  }
+  if (state.exprFilters.length > 0 || state.predicates.length > 0) return pageSize
   return pageSize === undefined ? remaining : Math.min(pageSize, remaining)
 }
 
@@ -1116,9 +1117,39 @@ export const count = <A>(
     // than counting them in DynamoDB, which costs more; it is the price of a
     // predicate the database cannot evaluate, and the alternative is a wrong
     // number (#122).
-    if (state.predicates.length > 0 || dropsRows(state)) {
+    if (state.predicates.length > 0) {
       const items = yield* collect(self)
       return items.length
+    }
+
+    // Rows that may be history are judged by a few attributes, so only those
+    // are read — never whole items (#133).
+    if (dropsRows(state)) {
+      const judged = [
+        ...new Set([
+          ...(state.liveRows?.reads ?? []),
+          ...(state.keepRow !== undefined && state.skField !== undefined ? [state.skField] : []),
+        ]),
+      ]
+      const judging: QueryState = { ...state, projection: judged, projectionPaths: undefined }
+      let counted = 0
+      let pages = 0
+      let start: Record<string, AttributeValue> | undefined
+      do {
+        pages++
+        const remaining = limitValue === undefined ? undefined : limitValue - counted
+        const cmd = buildDynamoCommand(judging, tableName, {
+          ExclusiveStartKey: start,
+          Limit: computeRequestLimit(state, remaining),
+        })
+        const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
+        const rows = (result.Items ?? []) as Array<Record<string, AttributeValue>>
+        counted += rows.filter((row) => !isExcludedRow(state, row)).length
+        start = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined
+        if (limitValue !== undefined && counted >= limitValue) return limitValue
+        if (state.maxPagesValue != null && pages >= state.maxPagesValue) break
+      } while (start != null)
+      return counted
     }
 
     let total = 0

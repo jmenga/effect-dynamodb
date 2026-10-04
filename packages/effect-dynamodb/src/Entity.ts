@@ -3767,23 +3767,60 @@ const makeImpl = <
     )
     return item === undefined ? undefined : { item }
   }
-  /** See {@link Entity._liveRows}. */
+  /**
+   * See {@link Entity._liveRows}. A row is dropped only when it is positively
+   * history: its sort key is not the one its own composites compose (or they
+   * don't compose) AND it has the layout of a snapshot (`#v#…<version>`), a
+   * tombstone (`#deleted#…<timestamp>`) or a time-series event (`#e#` under
+   * the live key). Any other row is kept and decoded as before — including
+   * rows an earlier release keyed differently (an unpadded number composite),
+   * which the current composer can't reproduce.
+   */
   const liveRows = (): Query.LiveRows | undefined => {
     if (!isRetainEnabled() && !isSoftDeleteEnabled() && config.timeSeries === undefined) {
       return undefined
     }
-    const skField = config.indexes.primary.sk.field
+    const primary = config.indexes.primary
+    const skField = primary.sk.field
+    const compositeAttrs = primary.sk.composite.map(resolveDbName)
+    const versions = DynamoSchema.composeVersionKeyPrefix(schema, entityType)
+    const tombstones = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
+    const bare = KeyComposer.composeSk(
+      schema,
+      entityType,
+      entityVersion,
+      { ...primary, sk: { ...primary.sk, composite: [] } },
+      keyForm({}),
+    )
+    const eventMarker = KeyComposer.composeEventSkPrefix("", schema.casing)
+    const historyShaped = (sk: string): boolean =>
+      (isRetainEnabled() &&
+        sk.startsWith(versions) &&
+        /^(?:.*#)?\d{7,}$/.test(sk.slice(versions.length))) ||
+      (isSoftDeleteEnabled() &&
+        sk.startsWith(tombstones) &&
+        /^(?:.*#)?\d{4}-\d\d-\d\dT[^#]*$/.test(sk.slice(tombstones.length))) ||
+      (config.timeSeries !== undefined &&
+        sk.startsWith(bare) &&
+        sk.slice(bare.length).includes(eventMarker))
     return {
       isLive: (row) => {
         const sk = row[skField]?.S
-        if (sk === undefined) return false
-        try {
-          return liveSkOf(toDomainView(fromAttributeMap(row))) === sk
-        } catch {
-          return false
+        if (sk === undefined) return true
+        // Only the composites are unmarshalled: the row may be large.
+        const composites: globalThis.Record<string, AttributeValue> = {}
+        for (const attr of compositeAttrs) {
+          const value = row[attr]
+          if (value !== undefined) composites[attr] = value
         }
+        try {
+          if (liveSkOf(toDomainView(fromAttributeMap(composites))) === sk) return true
+        } catch {
+          // Not composable now: judged by its layout alone.
+        }
+        return !historyShaped(sk)
       },
-      reads: [skField, ...config.indexes.primary.sk.composite.map(resolveDbName)],
+      reads: [skField, ...compositeAttrs],
     }
   }
   // ---------------------------------------------------------------------------

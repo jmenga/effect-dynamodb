@@ -690,13 +690,49 @@ describe("Query", () => {
         mockQuery.mockResolvedValue(page())
         const first = yield* Query.execute(historyQuery().pipe(Query.limit(2)))
         expect(first.items.map((i) => i.id)).toEqual(["a", "c"])
-        // The budget is not handed to DynamoDB: rows past it may be history.
-        expect(mockQuery.mock.calls[0]![0].Limit).toBeUndefined()
+        // The budget still bounds the request; dropped rows are made up by paging.
+        expect(mockQuery.mock.calls[0]![0].Limit).toBe(2)
         const pages = yield* Query.paginate(historyQuery()).pipe(
           Effect.flatMap((stream) => Stream.runCollect(stream)),
         )
         expect([...pages].flat().map((i) => i.id)).toEqual(["a", "c"])
         expect(yield* Query.count(historyQuery())).toBe(2)
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect("limit is sent as Limit, and paging makes up rows dropped as history", () =>
+      Effect.gen(function* () {
+        for (const [mock, make] of [
+          [mockQuery, historyQuery],
+          [mockScan, historyScan],
+        ] as const) {
+          mock.mockReset()
+          mock
+            .mockResolvedValueOnce({
+              Items: [row("a", "$myapp#v1#user#id_a"), row("a", "$myapp#v1#user#v#id_a#0000001")],
+              LastEvaluatedKey: { pk: { S: "p" }, sk: { S: "$myapp#v1#user#v#id_a#0000001" } },
+            })
+            .mockResolvedValueOnce({ Items: [row("c", "$myapp#v1#user#id_c")] })
+          const items = yield* Query.collect(make().pipe(Query.limit(2)))
+          expect(items.map((i) => i.id)).toEqual(["a", "c"])
+          expect(mock.mock.calls.map((call) => call[0].Limit)).toEqual([2, 1])
+        }
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect("count reads only what it judges rows by, and honours limit", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue(page())
+        expect(yield* Query.count(historyQuery())).toBe(2)
+        const input = mockQuery.mock.calls[0]![0]
+        expect(input.Select).toBeUndefined()
+        expect(Object.values(input.ExpressionAttributeNames).sort()).toEqual(
+          expect.arrayContaining(["sk", "id"]),
+        )
+        expect(input.ProjectionExpression.split(",").length).toBe(2)
+        mockQuery.mockClear()
+        expect(yield* Query.count(historyQuery().pipe(Query.limit(1)))).toBe(1)
+        expect(mockQuery.mock.calls[0]![0].Limit).toBe(1)
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 

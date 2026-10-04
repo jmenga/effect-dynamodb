@@ -953,7 +953,7 @@ const collectionLiveRows = (
   if (byType.size === 0) return undefined
   return {
     isLive: (row) => byType.get(row.__edd_e__?.S ?? "")?.isLive(row) ?? true,
-    reads: [...new Set([...byType.values()].flatMap((live) => live.reads))],
+    reads: [...new Set(["__edd_e__", ...[...byType.values()].flatMap((live) => live.reads)])],
   }
 }
 
