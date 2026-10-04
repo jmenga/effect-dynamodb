@@ -7174,7 +7174,8 @@ const makeImpl = <
               ExpressionAttributeNames: names,
               ExpressionAttributeValues: values,
               ConditionExpression: condParts.length > 0 ? condParts.join(" AND ") : undefined,
-              ...(condParts.length > 0 && {
+              // Only the corruption guard needs the stored item.
+              ...(systemFields.version && {
                 ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
               }),
               ReturnValues: "ALL_NEW",

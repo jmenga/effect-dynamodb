@@ -16267,6 +16267,21 @@ describeConnected("#133 — path operations on index composites and unique field
       expect(String((batch as any).cause)).toContain("would replace an existing")
       expect(yield* rawItem("G133DevicePlain", "tx4")).toBeUndefined()
       expect((yield* rawItem("G133DevicePlain", "tx3")).label).toEqual({ S: "b" })
+      // More than 4 MB of versioned puts is split under DynamoDB's transaction cap.
+      const big = "x".repeat(380_000)
+      yield* Batch.write(
+        Array.from({ length: 12 }, (_, i) =>
+          g133Entities.DevicesPlain.put({ id: `big${i}`, owner: "o", label: big } as any),
+        ),
+      )
+      expect((yield* rawItem("G133DevicePlain", "big11")).version).toEqual({ N: "1" })
+      // A delete and a versioned put of one item can't keep their order: refused.
+      const reordered = yield* Batch.write([
+        g133Entities.DevicesPlain.delete({ id: "tx2" } as any),
+        g133Entities.DevicesPlain.put({ id: "tx2", owner: "o", label: "z" } as any),
+      ]).pipe(Effect.flip)
+      expect(reordered._tag).toBe("ValidationError")
+      expect((yield* rawItem("G133DevicePlain", "tx2")).label).toEqual({ S: "b" })
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 

@@ -1051,6 +1051,60 @@ describe("Batch", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    it.effect("refuses a batch touching a versioned put's item twice, before writing", () =>
+      Effect.gen(function* () {
+        const reordered = yield* Batch.write([
+          VersionedNotes.delete({ noteId: "n-1" }),
+          VersionedNotes.put({ noteId: "n-1", body: "a" }),
+        ]).pipe(Effect.flip)
+        expect(reordered._tag).toBe("ValidationError")
+        expect(String((reordered as ValidationError).cause)).toContain("more than once")
+
+        const duplicated = yield* Batch.write([
+          VersionedNotes.put({ noteId: "n-2", body: "a" }),
+          VersionedNotes.put({ noteId: "n-2", body: "b" }),
+        ]).pipe(Effect.flip)
+        expect(duplicated._tag).toBe("ValidationError")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("bounds a versioned-put transaction by DynamoDB's 4 MB payload", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        // ~380 KB each: 12 of them exceed 4 MB in one transaction.
+        const body = "x".repeat(380_000)
+        yield* Batch.write(
+          Array.from({ length: 12 }, (_, i) => VersionedNotes.put({ noteId: `big-${i}`, body })),
+        )
+        const sizes = mockTransactWriteItems.mock.calls.map(
+          (call) => call[0].TransactItems.length as number,
+        )
+        expect(sizes.length).toBeGreaterThan(1)
+        expect(sizes.reduce((a, b) => a + b, 0)).toBe(12)
+        for (const call of mockTransactWriteItems.mock.calls) {
+          expect(JSON.stringify(call[0].TransactItems).length).toBeLessThan(4_000_000)
+        }
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("keeps the cancellation reasons and cause on a non-retryable failure", () =>
+      Effect.gen(function* () {
+        const exception = Object.assign(cancelled(["ValidationError"]), {
+          CancellationReasons: [{ Code: "ValidationError", Message: "Item size has exceeded" }],
+        })
+        mockTransactWriteItems.mockRejectedValueOnce(exception)
+        const error = yield* Batch.write([VersionedNotes.put({ noteId: "n-1", body: "a" })]).pipe(
+          Effect.flip,
+        )
+        expect(error._tag).toBe("DynamoError")
+        const cause = (error as DynamoError).cause as Error
+        expect(cause.message).toContain("Item size has exceeded")
+        expect(cause.cause).toBe(exception)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("an unrecognized op fails on the error channel, not as a defect", () =>
       Effect.gen(function* () {
         const error = yield* Batch.write([{ nonsense: true } as never]).pipe(Effect.flip)

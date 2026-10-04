@@ -13,7 +13,11 @@ const FROZEN_SECONDS = 1_717_200_000
 
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { DynamoError, type TransactionOverflow } from "@effect-dynamodb/schema/Errors.js"
+import {
+  DynamoError,
+  type TransactionOverflow,
+  type ValidationError,
+} from "@effect-dynamodb/schema/Errors.js"
 import { beforeEach, vi } from "vitest"
 import * as Entity from "../src/Entity.js"
 import { toAttributeMap } from "../src/Marshaller.js"
@@ -6549,6 +6553,72 @@ describe("Entity", () => {
         const updateExpr = call.UpdateExpression as string
         // Should have if_not_exists for version with + :vinc
         expect(updateExpr).toMatch(/if_not_exists\(.+, .+\) \+ :vinc/)
+        // Never versions an item whose version was removed (token, no version).
+        expect(call.ConditionExpression).toBe(
+          "(attribute_exists(#intVer) OR attribute_not_exists(#intInc))",
+        )
+        expect(call.ExpressionAttributeNames["#intInc"]).toBe("__edd_i__")
+        expect(call.ReturnValuesOnConditionCheckFailure).toBe("ALL_OLD")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an unversioned upsert sends no condition and no ALL_OLD", () =>
+      Effect.gen(function* () {
+        const ItemEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SimpleItem",
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
+            },
+          }),
+        )
+
+        mockUpdateItem.mockResolvedValue({
+          Attributes: toAttributeMap({
+            pk: "$myapp#v1#simpleitem#i-1",
+            sk: "$myapp#v1#simpleitem",
+            itemId: "i-1",
+            name: "Test",
+            __edd_e__: "SimpleItem",
+          }),
+        })
+
+        yield* ItemEntity.upsert({ itemId: "i-1", name: "Test" }).asEffect()
+
+        const call = mockUpdateItem.mock.calls[0]![0]
+        expect(call.ConditionExpression).toBeUndefined()
+        expect(call.ReturnValuesOnConditionCheckFailure).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a versioned upsert of an item whose version was removed is refused", () =>
+      Effect.gen(function* () {
+        const ItemEntity = withConfig(
+          Entity.make({
+            model: SimpleItem,
+            entityType: "SimpleItem",
+            primaryKey: {
+              pk: { field: "pk", composite: ["itemId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            versioned: true,
+          }),
+        )
+
+        mockUpdateItem.mockRejectedValue(
+          Object.assign(new Error("The conditional request failed"), {
+            name: "ConditionalCheckFailedException",
+            Item: toAttributeMap({ itemId: "i-1", name: "Old", __edd_i__: "token" }),
+          }),
+        )
+
+        const error = yield* ItemEntity.upsert({ itemId: "i-1", name: "Test" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("incarnation token")
       }).pipe(Effect.provide(TestLayer)),
     )
   })

@@ -33,6 +33,8 @@ import type { TableConfig } from "./Table.js"
 const MAX_BATCH_GET = 100
 const MAX_BATCH_WRITE = 25
 const MAX_TRANSACT_WRITE = 100
+/** DynamoDB caps a transaction's payload at 4 MB; leave headroom for the request envelope. */
+const MAX_TRANSACT_BYTES = 3_500_000
 const MAX_RETRIES = 5
 const BASE_DELAY_MS = 100
 
@@ -215,6 +217,15 @@ export const get = <const T extends ReadonlyArray<AnyGet>>(
     return results as unknown as BatchGetResult<T>
   })
 
+/**
+ * An upper bound on an item's share of a transaction payload: the marshalled
+ * JSON, type wrappers included, measured in UTF-8 bytes.
+ */
+const itemBytes = (item: Record<string, AttributeValue>): number =>
+  new TextEncoder().encode(
+    JSON.stringify(item, (_, value) => (typeof value === "bigint" ? value.toString() : value)),
+  ).length
+
 // ---------------------------------------------------------------------------
 // Batch.write — auto-chunk at 25, retry unprocessed
 // ---------------------------------------------------------------------------
@@ -263,7 +274,27 @@ export const write = (
       readonly entityType: string
       readonly item: Record<string, AttributeValue>
       readonly pkField: string
+      readonly bytes: number
     }> = []
+    // Every key the batch touches, to refuse one touched twice when a versioned
+    // put is involved: its put runs in an earlier transaction than the batch's
+    // other requests, so a repeated key would be reordered or misreported.
+    const touched = new Map<string, number>()
+    const versionedKeys = new Set<string>()
+    const keyOf = (
+      tableName: string,
+      entity: {
+        readonly indexes: {
+          readonly primary?:
+            | { readonly pk: { readonly field: string }; readonly sk: { readonly field: string } }
+            | undefined
+        }
+      },
+      item: Record<string, AttributeValue>,
+    ) => {
+      const primary = entity.indexes.primary!
+      return JSON.stringify([tableName, item[primary.pk.field], item[primary.sk.field]])
+    }
     const writeRequests: Array<{
       tableName: string
       request: Record<string, any>
@@ -322,12 +353,16 @@ export const write = (
         // to version 1 under a new incarnation. Such puts go out as create-only
         // TransactWriteItems Puts (`attribute_not_exists`) instead: no read, no
         // window between a check and the write.
+        const key = keyOf(tableName, entity, built.marshalled)
+        touched.set(key, (touched.get(key) ?? 0) + 1)
         if (entity._incarnationToken) {
+          versionedKeys.add(key)
           versionedPuts.push({
             tableName,
             entityType: entity.entityType,
             item: built.marshalled,
             pkField: entity.indexes.primary!.pk.field,
+            bytes: itemBytes(built.marshalled),
           })
         } else {
           writeRequests.push({
@@ -337,10 +372,12 @@ export const write = (
         }
       } else if (info.opType === "delete") {
         yield* rejectUnsupportedOp(entity, "batchWrite", "delete", undefined)
-        const composed = composePrimaryKey(entity, info.key!)
+        const composed = toAttributeMap(composePrimaryKey(entity, info.key!))
+        const key = keyOf(tableName, entity, composed)
+        touched.set(key, (touched.get(key) ?? 0) + 1)
         writeRequests.push({
           tableName,
-          request: { DeleteRequest: { Key: toAttributeMap(composed) } },
+          request: { DeleteRequest: { Key: composed } },
         })
       } else {
         return yield* new ValidationError({
@@ -353,11 +390,39 @@ export const write = (
       }
     }
 
-    // Versioned puts first, as create-only transactions of up to 100 items. Each
-    // chunk is atomic; a chunk that would replace an existing item writes nothing
-    // and stops the batch before any later chunk or the plain requests below.
-    for (let chunkStart = 0; chunkStart < versionedPuts.length; chunkStart += MAX_TRANSACT_WRITE) {
-      const chunk = versionedPuts.slice(chunkStart, chunkStart + MAX_TRANSACT_WRITE)
+    for (const key of versionedKeys) {
+      if ((touched.get(key) ?? 0) > 1) {
+        const [table] = JSON.parse(key) as [string]
+        return yield* new ValidationError({
+          entityType: versionedPuts.find((put) => put.tableName === table)?.entityType ?? "unknown",
+          operation: "batchWrite",
+          cause:
+            "Batch.write touches the same item more than once alongside a versioned put. " +
+            "Versioned puts are written as separate create-only transactions, so the batch's " +
+            "operations on that item could not keep their order. Nothing was written.",
+        })
+      }
+    }
+
+    // Versioned puts first, as create-only transactions of up to 100 items and
+    // under DynamoDB's 4 MB transaction payload. Each chunk is atomic; a chunk
+    // that would replace an existing item writes nothing and stops the batch
+    // before any later chunk or the plain requests below.
+    const versionedChunks: Array<typeof versionedPuts> = []
+    for (const put of versionedPuts) {
+      const last = versionedChunks[versionedChunks.length - 1]
+      const lastBytes = last?.reduce((sum, p) => sum + p.bytes, 0) ?? 0
+      if (
+        last === undefined ||
+        last.length >= MAX_TRANSACT_WRITE ||
+        lastBytes + put.bytes > MAX_TRANSACT_BYTES
+      ) {
+        versionedChunks.push([put])
+      } else {
+        last.push(put)
+      }
+    }
+    for (const chunk of versionedChunks) {
       const transactItems = chunk.map((put) => ({
         Put: {
           TableName: put.tableName,
@@ -369,15 +434,19 @@ export const write = (
 
       let retries = 0
       while (true) {
-        const outcome = yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
+        const cancelled = yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
           Effect.as(undefined),
           Effect.catchTag("DynamoError", (error) =>
             isAwsTransactionCancelled(error.cause)
-              ? Effect.succeed(error.cause.CancellationReasons ?? [])
+              ? Effect.succeed({
+                  reasons: error.cause.CancellationReasons ?? [],
+                  cause: error.cause,
+                })
               : Effect.fail(error),
           ),
         )
-        if (outcome === undefined) break
+        if (cancelled === undefined) break
+        const outcome = cancelled.reasons
 
         const replacedAt = outcome.findIndex((reason) => reason?.Code === "ConditionalCheckFailed")
         if (replacedAt !== -1) {
@@ -389,28 +458,35 @@ export const write = (
               `Batch.write would replace an existing ${replaced.entityType} item. A versioned ` +
               "entity's replacing put continues the item's version (and snapshots / rotates it), " +
               "which needs the stored item — a batch write could only reset it to version 1. " +
-              "Use the entity's put() for it. Nothing in this batch was written from this item " +
-              "onwards; earlier chunks of up to 100 versioned puts may have been.",
+              "Use the entity's put() for it. Nothing in its chunk of versioned puts, nor any " +
+              "non-versioned request, was written; earlier chunks of versioned puts may have been.",
           })
         }
 
         // Only contention is retried; any other cancellation is a real failure.
-        const retryable = outcome.every(
-          (reason) =>
-            reason?.Code === undefined ||
-            reason.Code === "None" ||
-            reason.Code === "TransactionConflict" ||
-            reason.Code === "ThrottlingError" ||
-            reason.Code === "ProvisionedThroughputExceeded",
-        )
+        const retryable =
+          outcome.length > 0 &&
+          outcome.every(
+            (reason) =>
+              reason?.Code === undefined ||
+              reason.Code === "None" ||
+              reason.Code === "TransactionConflict" ||
+              reason.Code === "ThrottlingError" ||
+              reason.Code === "ProvisionedThroughputExceeded",
+          )
         retries++
         if (!retryable || retries > maxRetries) {
           return yield* new DynamoError({
             operation: "TransactWriteItems",
             cause: new Error(
               `Batch.write versioned puts were cancelled: ${outcome
-                .map((reason) => reason?.Code ?? "None")
+                .map((reason) =>
+                  reason?.Message
+                    ? `${reason.Code ?? "None"} (${reason.Message})`
+                    : (reason?.Code ?? "None"),
+                )
                 .join(", ")}`,
+              { cause: cancelled.cause },
             ),
           })
         }
