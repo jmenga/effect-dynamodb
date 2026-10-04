@@ -15973,6 +15973,13 @@ describeConnected("#133 — path operations on index composites and unique field
       yield* removeAttr("G133DevicePlain", "corrupt2", "version")
       yield* refused(plain.update({ id: "corrupt2" }).set({ label: "m" }).asEffect())
       expect((yield* rawItem("G133DevicePlain", "corrupt2")).version).toBeUndefined()
+      // A plain upsert (no read) would version it as 1 — refused by its condition.
+      yield* refused(plain.upsert({ id: "corrupt2", owner: "o", label: "u" }).asEffect())
+      const afterUpsert = yield* rawItem("G133DevicePlain", "corrupt2")
+      expect([afterUpsert.version, afterUpsert.label]).toEqual([undefined, { S: "l" }])
+      // A plain hard delete reads and writes no history: it removes the item.
+      yield* plain.delete({ id: "corrupt2" })
+      expect(yield* rawItem("G133DevicePlain", "corrupt2")).toBeUndefined()
       // …and so do soft delete and restore.
       const soft = db.entities.SoftDevices as any
       yield* soft.put({ id: "corrupt3", owner: "o", label: "l" })

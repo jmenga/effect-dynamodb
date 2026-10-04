@@ -7152,6 +7152,13 @@ const makeImpl = <
 
           // Optional user condition
           const condParts: Array<string> = []
+          if (systemFields.version) {
+            // Never version an item whose version was removed outside the library
+            // (incarnation token, no version) as if it predated versioning (#133).
+            names["#intVer"] = systemFields.version
+            names["#intInc"] = INCARNATION_TOKEN
+            condParts.push("(attribute_exists(#intVer) OR attribute_not_exists(#intInc))")
+          }
           if (opts.condition) {
             const uc = compileCondition(opts.condition, resolveDbName)!
             condParts.push(`(${uc.expression})`)
@@ -7167,15 +7174,22 @@ const makeImpl = <
               ExpressionAttributeNames: names,
               ExpressionAttributeValues: values,
               ConditionExpression: condParts.length > 0 ? condParts.join(" AND ") : undefined,
+              ...(condParts.length > 0 && {
+                ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
+              }),
               ReturnValues: "ALL_NEW",
             })
             .pipe(
-              Effect.mapError((err): DynamoClientError | ConditionalCheckFailed => {
-                if (opts.condition && isAwsConditionalCheckFailed(err.cause)) {
-                  return new ConditionalCheckFailed({ entityType, key: item })
-                }
-                return err
-              }),
+              Effect.mapError(
+                (err): DynamoClientError | ConditionalCheckFailed | ValidationError => {
+                  if (isAwsConditionalCheckFailed(err.cause)) {
+                    const corrupt = versionCorruption(err.cause.Item, "upsert")
+                    if (corrupt !== undefined) return corrupt
+                    if (opts.condition) return new ConditionalCheckFailed({ entityType, key: item })
+                  }
+                  return err
+                },
+              ),
             )
 
           if (!result.Attributes) {
