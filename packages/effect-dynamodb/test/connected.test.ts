@@ -13433,6 +13433,12 @@ class Y133Row extends Schema.Class<Y133Row>("Y133Row")({
   zonedOrText: Schema.Union([Schema.DateTimeZoned, Schema.String]),
   cred: Y133Cred,
   creds: Schema.Array(Y133Cred),
+  dmZoned: DynamoModel.DateTimeZoned,
+  mixed: Schema.Struct({
+    b64: Schema.StringFromBase64,
+    at: Schema.DateTimeUtc,
+    n: Schema.NumberFromString,
+  }),
 }) {}
 const Y133Schema = DynamoSchema.make({ name: "edd133y", version: 1 })
 const Y133Rows = Entity.make({
@@ -13499,10 +13505,18 @@ describeConnected("#133 — nested unions, zoned offsets, class path values", ()
         zonedOrText: named,
         cred,
         creds: [],
+        dmZoned: offset,
+        mixed: { b64: "hi", at: DateTime.makeUnsafe(I133_DOB_MS), n: 1 },
       } as any)
       yield* db.entities.Y133Rows.update({ id: "y" })
         .pathSet({ segments: ["cred"], value: cred, isPath: false })
         .pathAppend({ segments: ["creds"], value: [cred] })
+        // `n` already wire, `at` domain, `b64` a plain string: encoded leaf by leaf.
+        .pathSet({
+          segments: ["mixed"],
+          value: { b64: "hi", at: DateTime.makeUnsafe(I133_DOB_MS), n: "5" },
+          isPath: false,
+        })
       const { Item } = yield* client.getItem({
         TableName: y133TableName,
         Key: { pk: { S: "$edd133y#v1#y133row#id_y" }, sk: { S: "$edd133y#v1#y133row" } },
@@ -13522,6 +13536,14 @@ describeConnected("#133 — nested unions, zoned offsets, class path values", ()
       expect(DateTime.formatIsoZoned(got.zonedOrText)).toBe(DateTime.formatIsoZoned(named))
       expect(Redacted.value(got.cred.token)).toBe("secret")
       expect(got.creds[0].issued.getTime()).toBe(I133_DOB_MS)
+      expect(item.dmZoned).toEqual({ S: "2000-01-01T05:00:00.000+05:00" })
+      expect(DateTime.formatIsoZoned(got.dmZoned)).toBe("2000-01-01T05:00:00.000+05:00")
+      expect(item.mixed).toEqual({
+        M: { b64: { S: "aGk=" }, at: { S: I133_DOB }, n: { S: "5" } },
+      })
+      expect(got.mixed.b64).toBe("hi")
+      expect(i133IsRealUtc(got.mixed.at, I133_DOB_MS)).toBe(true)
+      expect(got.mixed.n).toBe(5)
     }).pipe(provideY133),
   )
 })
