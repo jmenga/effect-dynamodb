@@ -5,7 +5,8 @@
  */
 import { describe, expect, it } from "@effect/vitest"
 import { DateTime, Effect, Schema } from "effect"
-import { substituteSchemaDeep } from "../src/internal/EntitySchemas.js"
+import * as DynamoModel from "../src/DynamoModel.js"
+import { substituteSchemaDeep, substituteSchemas } from "../src/internal/EntitySchemas.js"
 
 class Coach extends Schema.Class<Coach>("Coach")({
   id: Schema.String,
@@ -360,4 +361,112 @@ describe("substituteSchemaDeep — rebuilt containers keep their metadata (#133)
       expect(rejected._tag).toBe("SchemaError")
     }),
   )
+})
+
+describe("substituteSchemaDeep — unions with a colliding member (#133)", () => {
+  const ISO = "2000-01-01T00:00:00.000Z"
+  const MS = 946684800000
+  const decode = (schema: Schema.Top, value: unknown) =>
+    Schema.decodeUnknownEffect(substituteSchemaDeep(schema) as Schema.Codec<any>)(value)
+  const encode = (schema: Schema.Top, value: unknown) =>
+    Schema.encodeUnknownEffect(substituteSchemaDeep(schema) as Schema.Codec<any>)(value)
+
+  it.effect("a self date next to a String member claims only its canonical form", () =>
+    Effect.gen(function* () {
+      for (const schema of [
+        Schema.Union([Schema.DateTimeUtc, Schema.String]),
+        Schema.Union([Schema.String, Schema.DateTimeUtc]),
+      ]) {
+        expect(yield* decode(schema, "2020")).toBe("2020")
+        expect(yield* decode(schema, "5")).toBe("5")
+        expect(DateTime.isDateTime(yield* decode(schema, ISO))).toBe(true)
+        expect(yield* encode(schema, DateTime.makeUnsafe(MS))).toBe(ISO)
+        expect(yield* encode(schema, "hello")).toBe("hello")
+      }
+    }),
+  )
+
+  it.effect("an epoch date next to a Number member is stored as its ISO string", () =>
+    Effect.gen(function* () {
+      const schema = Schema.Union([
+        Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
+        Schema.Number,
+      ])
+      expect(yield* encode(schema, DateTime.makeUnsafe(MS))).toBe(ISO)
+      expect(yield* encode(schema, 5)).toBe(5)
+      expect(yield* decode(schema, MS)).toBe(MS)
+      expect(DateTime.isDateTime(yield* decode(schema, ISO))).toBe(true)
+    }),
+  )
+
+  it.effect("a date with no colliding member keeps its storage", () =>
+    Effect.gen(function* () {
+      const schema = Schema.NullOr(
+        Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
+      )
+      expect(yield* encode(schema, DateTime.makeUnsafe(MS))).toBe(MS)
+      expect(DateTime.isDateTime(yield* decode(schema, MS))).toBe(true)
+      expect(yield* decode(schema, null)).toBe(null)
+    }),
+  )
+
+  it.effect("a Pattern B date member keeps its own decode inside an aggregate union", () =>
+    Effect.gen(function* () {
+      const sub = substituteSchemaDeep(
+        Schema.Union([Schema.DateTimeUtcFromString, Schema.Number]),
+        { tolerantTransforms: true },
+      ) as Schema.Codec<any>
+      expect(yield* Schema.decodeUnknownEffect(sub)(5)).toBe(5)
+      const dt = DateTime.makeUnsafe(MS)
+      expect(yield* Schema.decodeUnknownEffect(sub)(dt)).toBe(dt)
+    }),
+  )
+})
+
+describe("substituteSchemas — read leniency and configured union storage (#133)", () => {
+  it.effect("legacy domain-form values decode only in read schemas", () =>
+    Effect.gen(function* () {
+      const fields = {
+        n: Schema.NumberFromString,
+        big: Schema.BigIntFromString,
+        plain: Schema.BigInt,
+        at: Schema.DateTimeUtcFromString,
+        either: Schema.Union([Schema.BigIntFromString, Schema.Number]),
+      }
+      const read = Schema.Struct(substituteSchemas(fields, {}, { legacyReads: true }) as any)
+      const decoded: any = yield* Schema.decodeUnknownEffect(read)({
+        n: 5,
+        big: 7,
+        plain: 9,
+        at: {
+          epochMilliseconds: 946684800000,
+          "~effect/time/DateTime": "~effect/time/DateTime",
+          _tag: "Utc",
+        },
+        either: 4,
+      })
+      expect(decoded).toMatchObject({ n: 5, big: 7n, plain: 9n, either: 4 })
+      expect(DateTime.isDateTime(decoded.at)).toBe(true)
+      // The encode is the transform's own.
+      expect(yield* Schema.encodeUnknownEffect(read)(decoded)).toMatchObject({
+        n: "5",
+        big: "7",
+        plain: 9n,
+        at: "2000-01-01T00:00:00.000Z",
+      })
+      // Write schemas stay strict.
+      const write = Schema.Struct(substituteSchemas(fields, {}) as any)
+      const rejected = yield* Effect.flip(Schema.decodeUnknownEffect(write)({ n: 5 }))
+      expect(rejected._tag).toBe("SchemaError")
+    }),
+  )
+
+  it("rejects a configured override on a union with two date members (EDD-9057)", () => {
+    expect(() =>
+      substituteSchemas(
+        { f: Schema.Union([Schema.DateTimeUtc, Schema.Date]) },
+        { f: { storage: "epochMs", domain: "DateTime.Utc" } },
+      ),
+    ).toThrow(/EDD-9057/)
+  })
 })
