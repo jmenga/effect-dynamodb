@@ -805,6 +805,7 @@ const buildTolerantTransform = (schema: Schema.Top): Schema.Top => {
   const decodeWire = Schema.decodeUnknownOption(codec)
   const validateDomain = Schema.decodeUnknownOption(typeSide as unknown as Schema.Codec<any>)
   const encodeDomain = Schema.encodeUnknownOption(codec)
+  const bigintDomain = SchemaAST.isBigInt(SchemaAST.toType(schema.ast))
 
   return Schema.Any.pipe(
     Schema.decodeTo(typeSide, {
@@ -813,6 +814,17 @@ const buildTolerantTransform = (schema: Schema.Top): Schema.Top => {
         if (fromWire._tag === "Some") return Effect.succeed(fromWire.value)
         const alreadyDomain = validateDomain(value)
         if (alreadyDomain._tag === "Some") return Effect.succeed(alreadyDomain.value)
+        // A value stored in its DOMAIN form, as a transform nested in a container
+        // (or under `optional`) was before #133, comes back changed by the
+        // unmarshaller: a `bigint` is written as `N` and read back as a JS
+        // `number` (or a `bigint` only beyond the safe-integer range). Lift an
+        // integer back to the `bigint` it was. Every other primitive domain form
+        // (`number`, `string`, `boolean`, `Uint8Array`) reads back as itself and
+        // is already accepted above.
+        if (bigintDomain && typeof value === "number" && Number.isSafeInteger(value)) {
+          const lifted = validateDomain(BigInt(value))
+          if (lifted._tag === "Some") return Effect.succeed(lifted.value)
+        }
         return Effect.fail(new SchemaIssue.InvalidType(schema.ast, value))
       }),
       encode: SchemaGetter.transformEffect((value: unknown) => {
@@ -965,8 +977,47 @@ interface TolerantContainer {
  * these, and changing what an entity stores is out of this function's remit.
  */
 const tolerantContainer = (schema: Schema.Top): TolerantContainer | undefined => {
+  const shape = containerShape(schema)
+  if (shape === undefined) return undefined
+  return { ...shape, rebuild: (children) => withMetadataOf(schema, shape.rebuild(children)) }
+}
+
+/**
+ * Give a rebuilt container the original's node-level metadata — its
+ * annotations, `.check()` refinements and context. Rebuilding through a
+ * constructor (`Schema.Record(k, v)`, `Schema.TupleWithRest(…)`) produces a
+ * fresh node without them, so a `.check(Schema.isMaxProperties(1))` on the
+ * original was silently dropped and an invalid value accepted (#133).
+ */
+const withMetadataOf = (original: Schema.Top, rebuilt: Schema.Top): Schema.Top => {
+  const from = original.ast as SchemaAST.AST & { readonly encodingChecks?: unknown }
+  const to = rebuilt.ast as SchemaAST.AST & { readonly encodingChecks?: unknown }
+  if (
+    to.annotations === from.annotations &&
+    to.checks === from.checks &&
+    to.context === from.context &&
+    to.encodingChecks === from.encodingChecks
+  ) {
+    return rebuilt
+  }
+  // AST nodes are immutable value objects: a shallow copy with the metadata
+  // fields replaced is the same node shape the constructors produce.
+  const ast = Object.assign(Object.create(Object.getPrototypeOf(to)), to, {
+    annotations: from.annotations,
+    checks: from.checks,
+    context: from.context,
+    encodingChecks: from.encodingChecks,
+  }) as SchemaAST.AST
+  return Schema.make<Schema.Top>(ast)
+}
+
+const containerShape = (schema: Schema.Top): TolerantContainer | undefined => {
   const s = schema as unknown as globalThis.Record<string, unknown>
   const ast = schema.ast
+  // A container piped through its own transformation (`Record(…).pipe(decodeTo(…))`)
+  // has an encoding chain tied to its ORIGINAL children; rebuilding it would
+  // detach that chain, so it is left exactly as declared.
+  if (ast.encoding !== undefined) return undefined
   const schemas = (value: unknown): ReadonlyArray<Schema.Top> | undefined =>
     Array.isArray(value) && value.every(isSchemaLike)
       ? (value as ReadonlyArray<Schema.Top>)

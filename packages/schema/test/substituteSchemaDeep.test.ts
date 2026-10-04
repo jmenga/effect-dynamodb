@@ -304,3 +304,40 @@ describe("substituteSchemaDeep — Union / Record / Tuple containers (#133)", ()
     }),
   )
 })
+
+describe("substituteSchemaDeep — rebuilt containers keep their metadata (#133)", () => {
+  it("keeps annotations and checks on Record / TupleWithRest / StructWithRest", () => {
+    const tolerant = { tolerantTransforms: true } as const
+    const shapes: ReadonlyArray<Schema.Top> = [
+      Schema.Record(Schema.String, Schema.DateTimeUtcFromString)
+        .check(Schema.isMaxProperties(1))
+        .annotate({ description: "rec" }),
+      Schema.TupleWithRest(Schema.Tuple([Schema.String]), [Schema.DateTimeUtcFromString])
+        .check(Schema.isMaxLength(2))
+        .annotate({ description: "twr" }),
+      Schema.StructWithRest(Schema.Struct({ at: Schema.DateTimeUtcFromString }), [
+        Schema.Record(Schema.String, Schema.Unknown),
+      ])
+        .check(Schema.isMaxProperties(2))
+        .annotate({ description: "swr" }),
+    ]
+    for (const shape of shapes) {
+      const sub = substituteSchemaDeep(shape, tolerant)
+      expect(sub).not.toBe(shape)
+      expect(sub.ast._tag).toBe(shape.ast._tag)
+      expect(sub.ast.checks).toBe(shape.ast.checks)
+      expect(sub.ast.annotations?.description).toBe(shape.ast.annotations?.description)
+    }
+  })
+
+  it.effect("lifts a legacy numeric bigint stored in its domain form", () =>
+    Effect.gen(function* () {
+      const sub = substituteSchemaDeep(Schema.Array(Schema.BigIntFromString), {
+        tolerantTransforms: true,
+      }) as Schema.Codec<any>
+      expect(yield* Schema.decodeUnknownEffect(sub)([5, "6", 7n])).toEqual([5n, 6n, 7n])
+      const rejected = yield* Effect.flip(Schema.decodeUnknownEffect(sub)([1.5]))
+      expect(rejected._tag).toBe("SchemaError")
+    }),
+  )
+})
