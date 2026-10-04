@@ -240,7 +240,7 @@ Version history is never overwritten. An update, soft delete, restore or `put` t
 
 A `put` of a versioned entity reads the item first, so a put over an existing item continues it instead of resetting it to version 1. It takes the next version, keeps the item's incarnation token and `createdAt` (unless the input supplies one), and with `retain` writes a snapshot of the item it replaces. A race with another writer fails with `OptimisticLockError`. A soft-deleted item counts as missing.
 
-With `retain`, re-creating an item that was deleted while its version history still exists is refused with a `ValidationError`: the history belongs to the earlier item, and it is never overwritten. `purge` the item first. `create` is unchanged; it fails with `ConditionalCheckFailed` on an existing item.
+With `retain`, re-creating an item that was deleted while its version history still exists is refused with a `ValidationError`: the history belongs to the earlier item, and it is never overwritten. `purge` the item first. This applies to `create` as well as `put`. Otherwise `create` is unchanged; it fails with `ConditionalCheckFailed` on an existing item.
 
 In `Transaction.transactWrite`, a `put` of a versioned or unique-constrained entity may only create the item. One that would replace an existing item is refused with a `ValidationError`, and the transaction writes nothing. `Batch.write` sends puts of a `versioned` entity as create-only transactions (see [Batch Operations](/effect-dynamodb/tutorials/batch/)).
 
@@ -341,7 +341,7 @@ Versioned entities carry a hidden `__edd_i__` attribute, a token set when the it
 
 An update too wide for one DynamoDB expression (4 KB, 300 operators) writes the whole item instead. A versioned entity writes it under its version condition. An unversioned one writes it under the fallback guard soft delete uses (see [Lifecycle](/effect-dynamodb/guides/lifecycle/)). A concurrent write from outside the library to an attribute that guard doesn't cover is lost, which 1.22.0 also did for every such update. A `.condition()` too large to fit beside the guard fails before writing with a `ValidationError` stating its size. Operators are counted as DynamoDB counts them: `BETWEEN` counts once, and in an update expression each `+`, `-` and function counts, but a `SET` clause's `=` doesn't.
 
-Items written before an entity was `versioned` read as version 0, and `expectedVersion(0)` addresses them; their first versioned write produces version 1. An item that has the `__edd_i__` token but no version is different: its version was removed outside the library. Reads and the writes that check the version refuse it with a `ValidationError` instead of reading it as version 0, and a query over a partition holding one fails as a whole. Restore the version attribute to read it again.
+Items written before an entity was `versioned` read as version 0, and `expectedVersion(0)` addresses them; their first versioned write produces version 1. An item that has the `__edd_i__` token but no version is different: its version was removed outside the library. Reads and the writes that check the version refuse it with a `ValidationError` instead of reading it as version 0, and a query over a partition holding one fails as a whole. Restore the version attribute to read it again, or remove the item with a plain hard delete, which reads nothing and writes no history.
 
 Known limitations, both inherent:
 

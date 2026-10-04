@@ -271,7 +271,7 @@ A write from outside the library that changes an item without bumping its versio
 
 Items written before the entity was `versioned` read as version 0 on every path, and `expectedVersion(0)` addresses them. Their first versioned write conditions on no version existing, adds the incarnation token and writes version 1. Their retain snapshot is `v#0000000`, and a race on that first write is an `OptimisticLockError`. Soft delete and restore work on them.
 
-An item that has the hidden `__edd_i__` token but no version is not one of these. A versioned entity sets the token when it creates an item, so a token without a version means the version was removed outside the library. Reading it as version 0 would let the next update rewrite its history, so reads and the writes that check the version refuse it with a `ValidationError`. A query over a partition that holds one fails as a whole. Restore the version attribute to read it again.
+An item that has the hidden `__edd_i__` token but no version is not one of these. A versioned entity sets the token when it creates an item, so a token without a version means the version was removed outside the library. Reading it as version 0 would let the next update rewrite its history, so reads and the writes that check the version refuse it with a `ValidationError`. A query over a partition that holds one fails as a whole. Restore the version attribute to read it again, or remove the item with a plain hard delete, which reads nothing and writes no history.
 
 ### Updates on Retained Entities
 

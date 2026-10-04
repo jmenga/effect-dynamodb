@@ -341,8 +341,8 @@ library. It is refused with a `ValidationError` rather than read as version 0,
 which would let the next update rewrite its history: by every read (`get`,
 queries, the `deleted` views, `decodeMarshalledItem`), and by every update,
 soft delete, unique-constraint hard delete, `restore`, versioned `put` and
-unique-constraint `upsert`. A query over a partition holding one fails as a
-whole.
+`upsert`. A query over a partition holding one fails as a whole. A plain hard
+delete still removes it, since it reads nothing and writes no history.
 
 **Version history is never overwritten.** An update, soft delete, restore or
 replacing `put` that would write a `v#N` snapshot holding a different state
@@ -420,7 +420,8 @@ with `OptimisticLockError` (versioned) or `ConcurrentModification`
 (unversioned) and writes nothing. A soft-deleted item counts as missing.
 Re-creating a deleted retain item whose version history still exists is
 refused with a `ValidationError`, because its `v#0000001` snapshot belongs to
-the earlier item; `purge` it first. `create` is unchanged: it still fails with
+the earlier item; `purge` it first. The same applies to `create` of a retain
+entity. Otherwise `create` is unchanged: it still fails with
 `ConditionalCheckFailed` on an existing item.
 
 **`upsert` with unique constraints.** One `UpdateItem` can't write, rotate or

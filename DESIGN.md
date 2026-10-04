@@ -1865,11 +1865,11 @@ update rewrite its history, so `versionCorruption` refuses it with a
 `decodeMarshalledItem`), so a query over a partition holding one fails as a
 whole; on the read of every read-then-write path (updates, soft delete,
 unique-constraint hard delete, `restore`, versioned `put`, unique-constraint
-`upsert`); and on a plain update, through a
-`attribute_exists(version) OR attribute_not_exists(__edd_i__)` condition.
-Two writes don't check: a plain `upsert` (no unique constraints), whose
-`if_not_exists(version, 0) + 1` gives the item version 1, and a plain hard
-delete.
+`upsert`); and on a plain update and a plain `upsert` (no unique
+constraints), through a
+`attribute_exists(version) OR attribute_not_exists(__edd_i__)` condition with
+`ALL_OLD` on failure. A plain hard delete deliberately doesn't check: it reads
+nothing and writes no history, so it is the safe way to remove such an item.
 
 **Version history is never overwritten.** Every `v#N` snapshot `Put`
 (`snapshotPut`) is conditioned on `attribute_not_exists(pk)` OR the existing
@@ -1956,8 +1956,9 @@ incarnation when versioned, the unique attributes otherwise), with
 `.condition()` failure is `ConditionalCheckFailed`. A soft-deleted item counts as
 missing, since its tombstone has a different sort key. Re-creating a deleted
 retain item whose `v#0000001` still exists fails on the snapshot guard with a
-`ValidationError`: `purge` it first. `create` is unchanged (an existing item is
-`ConditionalCheckFailed`). Entities with neither feature keep the single
+`ValidationError`: `purge` it first. The same snapshot guard applies to
+`create` of a retain entity; otherwise `create` is unchanged (an existing item
+is `ConditionalCheckFailed`). Entities with neither feature keep the single
 `PutItem`, with no read.
 
 **`upsert` with unique constraints.** One `UpdateItem` cannot write, rotate or
