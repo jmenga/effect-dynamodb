@@ -4407,20 +4407,79 @@ describe("Entity", () => {
 
       it.effect("a re-created item continues past its unsegmented history too", () =>
         Effect.gen(function* () {
-          mockQuery.mockResolvedValueOnce({ Items: [] }).mockResolvedValueOnce({
-            Items: [
-              legacyRow("$myapp#v1#line#v#0000006", "b", 6),
-              legacyRow("$myapp#v1#line#v#0000004", "a", 4),
-            ],
-          })
+          mockQuery
+            .mockResolvedValueOnce({ Items: [] })
+            .mockResolvedValueOnce({ Items: [legacyRow("$myapp#v1#line#v#0000006", "b", 6)] })
+            .mockResolvedValueOnce({
+              Items: [
+                legacyRow("$myapp#v1#line#v#0000006", "b", 6),
+                legacyRow("$myapp#v1#line#v#0000004", "a", 4),
+              ],
+            })
           mockTransactWriteItems.mockResolvedValueOnce({})
           yield* Lines.create({ ...key, name: "n" }).asEffect()
-          const legacy = mockQuery.mock.calls[1]![0]
+          const legacy = mockQuery.mock.calls[2]![0]
           expect(legacy.KeyConditionExpression).toBe("#pk = :pk AND #sk BETWEEN :lo AND :hi")
           expect(legacy.ScanIndexForward).toBe(false)
           const [main, snapshot] = mockTransactWriteItems.mock.calls[0]![0].TransactItems
           expect(main.Put.Item.version.N).toBe("5")
           expect(snapshot.Put.Item.sk.S).toBe("$myapp#v1#line#v#line_a#0000005")
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect(
+        "without unsegmented history, a create reads it with one Limit 1 keys-only query",
+        () =>
+          Effect.gen(function* () {
+            mockTransactWriteItems.mockResolvedValueOnce({})
+            yield* Lines.create({ ...key, name: "n" }).asEffect()
+            expect(mockQuery).toHaveBeenCalledTimes(2)
+            const probe = mockQuery.mock.calls[1]![0]
+            expect(probe.KeyConditionExpression).toBe("#pk = :pk AND #sk BETWEEN :lo AND :hi")
+            expect([probe.Limit, probe.ProjectionExpression]).toEqual([1, "#sk"])
+          }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("a segment starting with a digit is never read as unsegmented history", () =>
+        Effect.gen(function* () {
+          class Digit extends Schema.Class<Digit>("Digit")({
+            order: Schema.String,
+            "1st": Schema.String,
+            name: Schema.String,
+          }) {}
+          const Digits = withConfig(
+            Entity.make({
+              model: Digit,
+              entityType: "Digit",
+              primaryKey: {
+                pk: { field: "pk", composite: ["order"] },
+                sk: { field: "sk", composite: ["1st"] },
+              },
+              timestamps: true,
+              versioned: { retain: true },
+            }),
+          )
+          // Another item's segmented snapshot sits inside the unsegmented range.
+          const sibling = toAttributeMap({
+            order: "o1",
+            "1st": "b",
+            name: "n",
+            version: 4,
+            createdAt: "2024-01-15T00:00:00Z",
+            updatedAt: "2024-01-15T00:00:00Z",
+            pk: "$myapp#v1#digit#order_o1",
+            sk: "$myapp#v1#digit#v#1st_b#0000004",
+            __edd_e__: "Digit",
+          })
+          mockQuery
+            .mockResolvedValueOnce({ Items: [] })
+            .mockResolvedValueOnce({ Items: [sibling] })
+            .mockResolvedValueOnce({ Items: [sibling] })
+          mockTransactWriteItems.mockResolvedValueOnce({})
+          yield* Digits.create({ order: "o1", "1st": "b", name: "n" }).asEffect()
+          const [main] = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+          // Not v5: the row is segmented, so not this item's unsegmented history.
+          expect(main.Put.Item.version.N).toBe("1")
         }).pipe(Effect.provide(TestLayer)),
       )
 

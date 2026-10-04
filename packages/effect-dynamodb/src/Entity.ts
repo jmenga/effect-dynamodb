@@ -3836,20 +3836,28 @@ const makeImpl = <
         args.kind === "version"
           ? DynamoSchema.composeVersionKeyPrefix(schema, entityType)
           : DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
+      const range = {
+        TableName: args.tableName,
+        KeyConditionExpression: "#pk = :pk AND #sk BETWEEN :lo AND :hi",
+        ExpressionAttributeNames: { "#pk": primary.pk.field, "#sk": primary.sk.field },
+        ExpressionAttributeValues: {
+          ":pk": toAttributeValue(args.pk),
+          ":lo": toAttributeValue(`${prefix}0`),
+          ":hi": toAttributeValue(`${prefix}:`),
+        },
+        ConsistentRead: true,
+      }
+      // The common case — a partition no earlier release wrote history into —
+      // costs one `Limit 1` keys-only read. (A row it finds may still be
+      // segmented, if a segment starts with a digit; the read below filters.)
+      const probe = yield* client.query({ ...range, ProjectionExpression: "#sk", Limit: 1 })
+      if ((probe.Items ?? []).length === 0) return []
       const rows: Array<globalThis.Record<string, AttributeValue>> = []
       let start: globalThis.Record<string, AttributeValue> | undefined
       do {
         const result = yield* client.query({
-          TableName: args.tableName,
-          KeyConditionExpression: "#pk = :pk AND #sk BETWEEN :lo AND :hi",
-          ExpressionAttributeNames: { "#pk": primary.pk.field, "#sk": primary.sk.field },
-          ExpressionAttributeValues: {
-            ":pk": toAttributeValue(args.pk),
-            ":lo": toAttributeValue(`${prefix}0`),
-            ":hi": toAttributeValue(`${prefix}:`),
-          },
+          ...range,
           ScanIndexForward: !args.descending,
-          ConsistentRead: true,
           ExclusiveStartKey: start,
         })
         for (const row of result.Items ?? []) {
