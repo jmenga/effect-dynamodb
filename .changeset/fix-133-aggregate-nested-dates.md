@@ -48,6 +48,14 @@ real `DateTime`s.
   date) or remove the numeric member. A `DynamoModel.configure` `storedAs`
   override on a union field with more than one date member fails with
   `EDD-9057`; annotate the intended member instead.
+- **Writes are validated more strictly**, so some calls that used to succeed
+  now fail with a `ValidationError`. Container `.check()` refinements on an
+  array, a struct or a checked-struct class that holds a date or another
+  substituted value were silently dropped, and are now enforced on every write
+  (entities and aggregates; details below). Entity path updates are now
+  validated like `.set()`, so a literal outside its set or a string under its
+  `minLength` is rejected instead of stored. Reads don't enforce the container
+  checks, so existing rows that break them still read.
 - **A canonical ISO string in a string member reads as a date.** In
   `Schema.Union([Schema.DateTimeUtc, Schema.String])`, the exact ISO form the
   library writes for a date (`"2000-01-01T00:00:00.000Z"`) reads back as a
@@ -106,6 +114,13 @@ a hydrated ref, and a self date inside a union, record or tuple.
   inside an array, next to a root `coach` edge). Refs are now resolved by field
   schema, so it is no longer decoded as that edge's entity.
 
+**Container checks.** `create` and `update` enforce `.check()` refinements on
+arrays, structs and checked-struct classes that hold a date or another
+substituted value; earlier versions silently dropped them. A violating value
+fails with a `ValidationError`. Reads don't enforce them, so a stored row that
+breaks one still assembles, and an `update` that makes the value valid repairs
+it.
+
 **Known limitation.** A `many` edge with a custom `decompose` that renames
 element fields still stores the renamed values in their domain form, so a
 `DateTime` there is written as a map. Those values do read back as real
@@ -122,6 +137,13 @@ says so), and existing map rows read back as real `DateTime`s. A
 date member. Transform schemas such as `DateTimeUtcFromString` already stored
 their wire form and are unchanged. A `TupleWithRest` field is also no longer
 mis-derived as an array.
+
+**Container checks.** `.check()` refinements on arrays, structs and
+checked-struct classes that hold a date or another substituted value were
+silently dropped. They are now enforced on every write: `put`, `create`,
+`update` and `.set()`, path operations, `.append()`, Batch and Transaction. A
+violating value fails with a `ValidationError`. Reads don't enforce them, so
+existing rows that break one still read.
 
 **Path updates.** `pathSet`, `pathAppend`, `pathPrepend`, `pathIfNotExists` and
 the record-based `.append()` (including on versioned entities that retain
@@ -144,10 +166,17 @@ plain date field, and a `NumberFromString` value was stored as a number. Now:
   value, such as `"aGk="` on a `StringFromBase64` field; encoding it would
   double-encode it. A plain string that isn't valid wire (`"hi"`) is a domain
   value and is encoded.
+- Path values into and under a `DynamoModel.ref` field are encoded through the
+  ref target's model, like any other path. Only a path no schema describes
+  (such as one under a dynamic key of an untyped value) is written as given.
+- Path values are validated like `.set()`, so an invalid value (a literal not
+  in the set, a string under `minLength`, a broken container check) fails with a
+  `ValidationError` instead of being stored. A key whose value is `undefined`
+  is dropped before validation, as it is when stored. List `append` and
+  `prepend` validate each element, but can't enforce list-level checks such as
+  `maxLength`, because DynamoDB builds the list server-side.
 
-`ADD`, `DELETE` and `SUBTRACT` are unchanged. A path the model schema cannot
-follow, such as one into a `DynamoModel.ref` field, still writes the value as
-given.
+`ADD`, `DELETE` and `SUBTRACT` are unchanged.
 
 **Legacy values read back.** The raw values earlier path updates left on
 transform fields now read: a number on a `NumberFromString` field, a
