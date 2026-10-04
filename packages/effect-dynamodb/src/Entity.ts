@@ -1736,6 +1736,147 @@ const makeImpl = <
     const encoded = pathValues.elements(segments, value)
     return { encoded, issue: pathValues.validateElements(segments, encoded) }
   }
+  const hasPathOps = (uState: UpdateState): boolean =>
+    [
+      uState.pathSets,
+      uState.pathRemoves,
+      uState.pathAdds,
+      uState.pathSubtracts,
+      uState.pathAppends,
+      uState.pathPrepends,
+      uState.pathIfNotExists,
+      uState.pathDeletes,
+    ].some((ops) => ops !== undefined && ops.length > 0)
+
+  /**
+   * Apply the update's PATH operations to an in-memory item — domain-named,
+   * wire-form, as the retain (read-then-transact) branch builds it — with the
+   * same encoding and validation the UpdateItem branch gives them, and the
+   * semantics DynamoDB gives the expressions that branch compiles (#133). The
+   * retain branch used to ignore path operations entirely: they returned
+   * success and wrote nothing.
+   *
+   * Mutates `item`; the caller passes a deep copy so the version snapshot,
+   * built from the stored item, keeps the pre-update values. Returns the
+   * error to fail with, or `undefined`.
+   */
+  const applyPathOpsInMemory = (
+    item: globalThis.Record<string, unknown>,
+    uState: UpdateState,
+  ): ValidationError | undefined => {
+    type Path = ReadonlyArray<string | number>
+    const fail = (operation: string, cause: unknown) =>
+      new ValidationError({ entityType, operation: `update.${operation}`, cause })
+    const getAt = (path: Path): unknown => {
+      let current: unknown = item
+      for (const segment of path) {
+        if (current === null || typeof current !== "object") return undefined
+        current = (current as globalThis.Record<string | number, unknown>)[segment]
+      }
+      return current
+    }
+    /** The container holding the last segment, or `undefined` if the path is broken. */
+    const parentOf = (path: Path) => {
+      const parent = getAt(path.slice(0, -1))
+      return parent !== null && typeof parent === "object"
+        ? { parent: parent as globalThis.Record<string | number, unknown>, key: path.at(-1)! }
+        : undefined
+    }
+    const setAt = (operation: string, path: Path, value: unknown): ValidationError | undefined => {
+      const at = parentOf(path)
+      if (at === undefined) {
+        return fail(operation, `The document path ${JSON.stringify(path)} does not exist`)
+      }
+      if (Array.isArray(at.parent) && typeof at.key === "number" && at.key >= at.parent.length) {
+        at.parent.push(value) // DynamoDB appends past the end of a list
+      } else {
+        at.parent[at.key] = value
+      }
+      return undefined
+    }
+    const encoded = (operation: string, path: Path, value: unknown, kind: "value" | "elements") => {
+      const result = encodePathValue(path, value, kind)
+      return result.issue === undefined
+        ? { value: result.encoded, error: undefined }
+        : { value: undefined, error: fail(operation, result.issue) }
+    }
+
+    for (const op of uState.pathSets ?? []) {
+      let value: unknown
+      if (op.isPath && op.valueSegments) {
+        value = getAt(op.valueSegments)
+      } else {
+        const result = encoded("pathSet", op.segments, op.value, "value")
+        if (result.error) return result.error
+        value = result.value
+      }
+      const error = setAt("pathSet", op.segments, value)
+      if (error) return error
+    }
+    for (const op of uState.pathIfNotExists ?? []) {
+      if (getAt(op.segments) !== undefined) continue
+      const result = encoded("pathIfNotExists", op.segments, op.value, "value")
+      if (result.error) return result.error
+      const error = setAt("pathIfNotExists", op.segments, result.value)
+      if (error) return error
+    }
+    for (const [ops, prepend] of [
+      [uState.pathAppends ?? [], false],
+      [uState.pathPrepends ?? [], true],
+    ] as const) {
+      for (const op of ops) {
+        const operation = prepend ? "pathPrepend" : "pathAppend"
+        const result = encoded(operation, op.segments, op.value, "elements")
+        if (result.error) return result.error
+        const existing = (getAt(op.segments) as ReadonlyArray<unknown> | undefined) ?? []
+        const added = result.value as ReadonlyArray<unknown>
+        const error = setAt(
+          operation,
+          op.segments,
+          prepend ? [...added, ...existing] : [...existing, ...added],
+        )
+        if (error) return error
+      }
+    }
+    for (const op of uState.pathSubtracts ?? []) {
+      const current = getAt(op.segments)
+      const operand = op.isPath && op.valueSegments ? getAt(op.valueSegments) : op.value
+      if (typeof current !== "number" || typeof operand !== "number") {
+        return fail("pathSubtract", `Cannot subtract at ${JSON.stringify(op.segments)}`)
+      }
+      const error = setAt("pathSubtract", op.segments, current - operand)
+      if (error) return error
+    }
+    for (const op of uState.pathAdds ?? []) {
+      const current = getAt(op.segments)
+      let next: unknown
+      if (current === undefined) next = op.value
+      else if (typeof current === "number" && typeof op.value === "number")
+        next = current + op.value
+      else if (current instanceof Set && op.value instanceof Set)
+        next = new Set([...current, ...op.value])
+      else return fail("pathAdd", `Cannot ADD to ${JSON.stringify(op.segments)}`)
+      const error = setAt("pathAdd", op.segments, next)
+      if (error) return error
+    }
+    for (const op of uState.pathDeletes ?? []) {
+      const current = getAt(op.segments)
+      if (current instanceof Set && op.value instanceof Set) {
+        const next = new Set(current)
+        for (const element of op.value) next.delete(element)
+        const error = setAt("pathDelete", op.segments, next)
+        if (error) return error
+      }
+    }
+    for (const path of uState.pathRemoves ?? []) {
+      const at = parentOf(path)
+      if (at === undefined) continue // removing an absent path is a no-op
+      if (Array.isArray(at.parent) && typeof at.key === "number") at.parent.splice(at.key, 1)
+      else delete at.parent[at.key]
+    }
+    return undefined
+  }
+
   // resolvedRefs carries the actual ref-target entity objects; at runtime they
   // are operational Entities (for runtime-authored refs) so write-time hydration
   // can call their CRUD ops. The pure bundle widens refEntity to EntityDefinition.
@@ -3488,6 +3629,18 @@ const makeImpl = <
                   }
                 }
               }
+            }
+            // Path operations (#133). `newItem` shares its nested values with the
+            // stored item the version snapshot is built from, so they are copied
+            // before a path operation can mutate them.
+            if (hasPathOps(uState)) {
+              for (const [attr, value] of Object.entries(newItem)) {
+                if (value !== null && typeof value === "object") {
+                  newItem[attr] = structuredClone(value)
+                }
+              }
+              const pathError = applyPathOpsInMemory(newItem, uState)
+              if (pathError !== undefined) return yield* pathError
             }
 
             // Increment version and update timestamp. If the caller supplied a
