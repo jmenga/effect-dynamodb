@@ -28,6 +28,7 @@ import {
   numericTypeWithStringEncoding,
   transformWireKind as transformWireKindImpl,
 } from "./SchemaAccessors.js"
+import { parseZonedIso } from "./ZonedIso.js"
 
 // ---------------------------------------------------------------------------
 // Resolved system field names (internal)
@@ -679,25 +680,9 @@ export const buildDateTransform = (
       switch (encoding.domain) {
         case "DateTime.Utc":
           return DateTime.makeUnsafe(value)
-        case "DateTime.Zoned": {
-          // `formatIsoZoned` writes a NAMED zone as `…+00:00[Europe/London]`
-          // and an OFFSET zone as `…+05:00` (no bracket). Both are rebuilt with
-          // the zone they were written with, so either round-trips exactly
-          // (#133); before, an offset zone was dropped and rebuilt as UTC.
-          const named = value.match(/^(.+)\[(.+)\]$/)
-          if (named) {
-            const utc = DateTime.makeUnsafe(named[1]!)
-            return DateTime.makeZonedUnsafe(utc, { timeZone: named[2]! })
-          }
-          const utc = DateTime.makeUnsafe(value)
-          const offset = value.match(/([+-])(\d{2}):(\d{2})$/)
-          if (offset) {
-            const sign = offset[1] === "-" ? -1 : 1
-            const ms = sign * (Number(offset[2]) * 3_600_000 + Number(offset[3]) * 60_000)
-            return DateTime.makeZonedUnsafe(utc, { timeZone: DateTime.zoneMakeOffset(ms) })
-          }
-          return DateTime.makeZonedUnsafe(utc, { timeZone: "UTC" })
-        }
+        case "DateTime.Zoned":
+          // Named and offset zones are both rebuilt as written (#133).
+          return parseZonedIso(value)
         case "Date":
           return new Date(value)
       }
@@ -976,7 +961,18 @@ type WireKind = "string" | "number"
  * else as its encoded side's string / number forms. Objects, arrays, booleans
  * and null never collide with a date's primitive and contribute nothing.
  */
-const memberWireKinds = (member: Schema.Top): ReadonlySet<WireKind> => {
+const memberWireKinds = (
+  member: Schema.Top,
+  options?: {
+    /**
+     * Also count the member's DOMAIN-side kinds. Aggregates (`tolerantTransforms`)
+     * re-decode domain values on every `update`, so a `NumberFromString` member's
+     * domain `5` competes with an epoch date for the same decode, just as a
+     * `Number` member's stored `5` does on a read.
+     */
+    readonly domainSide?: boolean | undefined
+  },
+): ReadonlySet<WireKind> => {
   const kinds = new Set<WireKind>()
   const inner = optionalField(member)?.inner ?? member
   if (isSelfDateSchema(inner)) {
@@ -1014,6 +1010,7 @@ const memberWireKinds = (member: Schema.Top): ReadonlySet<WireKind> => {
     }
   }
   visit(SchemaAST.toEncoded(inner.ast), new Set())
+  if (options?.domainSide) visit(SchemaAST.toType(inner.ast), new Set())
   return kinds
 }
 
@@ -1138,10 +1135,12 @@ export interface DeepSubstitutionOptions {
   readonly legacyReads?: boolean | undefined
   /**
    * Set internally on a union's members: the primitive kinds the OTHER members
-   * are stored as. A self-date member whose storage collides with one of them
-   * decodes only its canonical wire form; an epoch storage that collides with a
-   * number member is stored as its ISO string instead (#133). Applies to the
-   * immediate member only.
+   * are stored as — and, under `tolerantTransforms`, their domain kinds too,
+   * since an aggregate re-decodes domain values on update. A self-date member
+   * whose storage collides with one of them decodes only its canonical wire
+   * form; an epoch storage that collides with a number kind is rejected at
+   * `make()` with EDD-9058, since any integer is a canonical epoch (#133).
+   * Applies to the immediate member, and to members of a union nested in it.
    */
   readonly collidingKinds?: ReadonlySet<WireKind> | undefined
   /**
@@ -1321,7 +1320,10 @@ const childOptions = (
   // other members are stored as: they compete for the same stored value.
   const collidingKinds = new Set<WireKind>(opts?.collidingKinds ?? [])
   container.children.forEach((member, i) => {
-    if (i !== index) for (const kind of memberWireKinds(member)) collidingKinds.add(kind)
+    if (i !== index) {
+      const kinds = memberWireKinds(member, { domainSide: opts?.tolerantTransforms === true })
+      for (const kind of kinds) collidingKinds.add(kind)
+    }
   })
   return {
     ...deeper,
@@ -2209,8 +2211,8 @@ const sameValue = (a: unknown, b: unknown): boolean => {
 
 /**
  * Whether a path value is ALREADY in the wire form of `original`, in a way
- * encoding cannot tell apart from a domain value: it validates as both the
- * Encoded and the Type side, and encoding it would change it. `StringFromBase64`
+ * encoding cannot tell apart from a domain value: it decodes as wire, it
+ * validates as the Type side, and encoding it would change it. `StringFromBase64`
  * given `"aGk="`, or `fromJsonString(Unknown)` given `'{"a":2}'`, are both
  * valid domain strings and valid wire strings; encoding would double-encode.
  * Before path values were encoded, a wire value was the only way to round-trip
@@ -2226,15 +2228,26 @@ const sameValue = (a: unknown, b: unknown): boolean => {
  */
 const makeAmbiguityCheck = (original: Schema.Top): ((value: unknown) => boolean) => {
   if (!isLeafEncodingTransform(original)) return () => false
-  const isEncoded = Schema.is(Schema.make<Schema.Top>(SchemaAST.toEncoded(original.ast)))
+  // "Already wire" means the value DECODES as wire — a plain string that is not
+  // valid base64 is a domain value for `StringFromBase64`, and is encoded.
+  const decodesAsWire = Schema.decodeUnknownOption(original as unknown as Schema.Codec<any>)
   const isType = Schema.is(Schema.make<Schema.Top>(SchemaAST.toType(original.ast)))
   const encode = Schema.encodeUnknownOption(original as unknown as Schema.Codec<any>)
   return (value) => {
-    if (!isEncoded(value) || !isType(value)) return false
+    if (decodesAsWire(value)._tag === "None" || !isType(value)) return false
     const encoded = encode(value)
     return encoded._tag === "Some" && !sameValue(encoded.value, value)
   }
 }
+
+/** A plain object or class instance whose fields a path value can be walked by. */
+const isWalkableObject = (value: unknown): value is object =>
+  value !== null &&
+  typeof value === "object" &&
+  !Array.isArray(value) &&
+  !(value instanceof Date) &&
+  !DateTime.isDateTime(value) &&
+  !Redacted.isRedacted(value)
 
 /**
  * Encoders for the VALUES of path-based updates (`pathSet`, `pathAppend`,
@@ -2300,6 +2313,10 @@ export const makePathValueEncoder = (
     const ambiguous = makeAmbiguityCheck(original)
     return (value: unknown) => {
       if (ambiguous(value)) return value
+      // A container holding an ambiguous wire leaf (`{ b64: "aGk=", at }`) is
+      // encoded part by part, so that leaf follows the leaf rule instead of
+      // being encoded a second time by the whole-value encode.
+      if (holdsAmbiguousLeaf(original, value)) return encodeByParts(original, value)
       const encoded = encode(value)
       if (encoded._tag === "Some") return encoded.value
       // `decode -> encode`, as `.set()` / `put` do: a plain object given for a
@@ -2310,8 +2327,72 @@ export const makePathValueEncoder = (
         const reencoded = encode(decoded.value)
         if (reencoded._tag === "Some") return reencoded.value
       }
-      return value
+      return encodeByParts(original, value)
     }
+  }
+  const ambiguityChecks = new WeakMap<Schema.Top, (value: unknown) => boolean>()
+  const isAmbiguousAt = (schema: Schema.Top, value: unknown): boolean => {
+    let check = ambiguityChecks.get(schema)
+    if (check === undefined) {
+      check = makeAmbiguityCheck(optionalField(schema)?.inner ?? schema)
+      ambiguityChecks.set(schema, check)
+    }
+    return check(value)
+  }
+  /**
+   * Whether a container value holds, at any depth, a leaf in ambiguous wire
+   * form. Only arrays and PLAIN objects are looked into: a class instance was
+   * built from domain values by its constructor, so its leaves are domain and
+   * the whole instance is encoded.
+   */
+  const holdsAmbiguousLeaf = (schema: Schema.Top, value: unknown): boolean => {
+    const parts: ReadonlyArray<readonly [string | number, unknown]> = Array.isArray(value)
+      ? value.map((entry, index) => [index, entry] as const)
+      : isPlainObject(value)
+        ? Object.entries(value)
+        : []
+    return parts.some(([segment, entry]) => {
+      const child = childAtSegment(schema, segment)
+      return (
+        child !== undefined && (isAmbiguousAt(child, entry) || holdsAmbiguousLeaf(child, entry))
+      )
+    })
+  }
+  /** `leafAwareEncoder` for a schema nested in a path value, memoised per schema. */
+  const partEncoders = new WeakMap<Schema.Top, (value: unknown) => unknown>()
+  const partEncoder = (schema: Schema.Top): ((value: unknown) => unknown) => {
+    const cached = partEncoders.get(schema)
+    if (cached !== undefined) return cached
+    const fn = leafAwareEncoder(schema, substituteSchemaDeep(schema))
+    partEncoders.set(schema, fn)
+    return fn
+  }
+  /**
+   * The last resort for a container value that neither encodes nor
+   * decode→encodes as a whole — one that MIXES wire and domain leaves, such as
+   * `{ b64: "hi", at: DateTime, n: "5" }` (`n` is already wire, `b64` is not
+   * valid base64). Each part is put into its stored form on its own, by the
+   * schema at its position, with the same leaf rules; storing the value raw
+   * would marshal its `DateTime` / `Date` / `Redacted` leaves as maps (#133).
+   *
+   * Arrays and tuples go element by element, structs, classes and records key
+   * by key. A part the schema has no position for, and a value that is neither
+   * an array nor a plain object or class instance, are kept as given.
+   */
+  const encodeByParts = (schema: Schema.Top, value: unknown): unknown => {
+    if (Array.isArray(value)) {
+      return value.map((entry, index) => {
+        const child = childAtSegment(schema, index)
+        return child === undefined ? entry : partEncoder(child)(entry)
+      })
+    }
+    if (!isWalkableObject(value)) return value
+    const out: globalThis.Record<string, unknown> = {}
+    for (const [key, entry] of Object.entries(value)) {
+      const child = childAtSegment(schema, key)
+      out[key] = child === undefined ? entry : partEncoder(child)(entry)
+    }
+    return out
   }
   /** The model's own schema at a path, before any substitution. */
   const originalAt = (segments: ReadonlyArray<string | number>): Schema.Top | undefined => {

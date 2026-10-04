@@ -19,6 +19,7 @@ import {
   recordValueAst,
   recordValueAstFromAst,
 } from "./internal/SchemaAccessors.js"
+import { parseZonedIso } from "./internal/ZonedIso.js"
 
 // ---------------------------------------------------------------------------
 // Identifier annotation
@@ -340,22 +341,10 @@ export const DateEpoch = (options: {
 export const DateTimeZoned = Schema.String.pipe(
   Schema.decodeTo(Schema.DateTimeZoned, {
     decode: SchemaGetter.transformEffect((s: string) => {
-      // Parse extended ISO format: "2024-01-01T15:00:00+09:00[Asia/Tokyo]"
-      const match = s.match(/^(.+)\[(.+)\]$/)
-      if (match) {
-        const dateStr = match[1]!
-        const tzName = match[2]!
-        try {
-          const utc = DateTime.makeUnsafe(dateStr)
-          return Effect.succeed(DateTime.makeZonedUnsafe(utc, { timeZone: tzName }))
-        } catch {
-          return Effect.fail(new SchemaIssue.InvalidType(Schema.String.ast, s))
-        }
-      }
-      // Try parsing as offset-only: "2024-01-01T15:00:00+09:00"
+      // `…+09:00[Asia/Tokyo]` (named zone) or `…+05:00` (offset zone), each
+      // rebuilt in the zone it was written with (#133).
       try {
-        const utc = DateTime.makeUnsafe(s)
-        return Effect.succeed(DateTime.makeZonedUnsafe(utc, { timeZone: "UTC" }))
+        return Effect.succeed(parseZonedIso(s))
       } catch {
         return Effect.fail(new SchemaIssue.InvalidType(Schema.String.ast, s))
       }
