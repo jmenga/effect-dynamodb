@@ -8973,6 +8973,61 @@ describe("Entity", () => {
       )
     }
 
+    /** Cancel the first transaction at its sentinel release: the reservation changed hands. */
+    const releaseRacesOnce = () =>
+      mockTransactWriteItems
+        .mockImplementationOnce(async (input: any) => {
+          const error = new Error("TransactionCanceledException")
+          ;(error as any).name = "TransactionCanceledException"
+          ;(error as any).CancellationReasons = input.TransactItems.map((t: any) =>
+            t.Delete !== undefined && String(t.Delete.Key.pk.S).includes(".email#")
+              ? { Code: "ConditionalCheckFailed" }
+              : { Code: "None" },
+          )
+          throw error
+        })
+        .mockResolvedValueOnce({})
+
+    it.effect("an upsert whose sentinel release races is planned again, as a put is", () =>
+      Effect.gen(function* () {
+        const Upserted = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "UpsertOwnedUser",
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            unique: { email: ["email"] },
+            versioned: true,
+          }),
+        )
+        withSentinelOwnedBy("UpsertOwnedUser", "u-1")
+        releaseRacesOnce()
+        const upserted = yield* Upserted.upsert({
+          userId: "u-1",
+          email: "y@x.io",
+          displayName: "Alice",
+          role: "admin",
+        }).asEffect()
+        expect(upserted.email).toBe("y@x.io")
+        expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an update whose sentinel release races still fails, as before", () =>
+      Effect.gen(function* () {
+        withSentinelOwnedBy("OwnedUser", "u-1")
+        releaseRacesOnce()
+        const error = yield* Owned.update({ userId: "u-1" })
+          .pipe(Entity.set({ email: "y@x.io" }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ConcurrentModification")
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("an update's new sentinel carries its constraint's TTL, as a put's does", () =>
       Effect.gen(function* () {
         const Held = withConfig(

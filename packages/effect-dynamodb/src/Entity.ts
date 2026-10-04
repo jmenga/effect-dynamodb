@@ -1662,6 +1662,23 @@ const checkTransactionLimit = (
 /** Attempts a guarded put makes before it reports a lost race (#133). */
 const GUARDED_PUT_ATTEMPTS = 3
 
+/**
+ * The `ConcurrentModification`s that report a sentinel release whose
+ * reservation changed hands between the ownership read and the write (#133),
+ * as opposed to a change of the item itself. Nothing was written, and the
+ * write is still valid against a fresh read — so an `upsert` plans it again,
+ * as a put does. Carried across the copies that fill in `current`.
+ */
+const releaseRaces = new WeakSet<ConcurrentModification>()
+/** `next`, a copy of `previous`, marked as a release race if `previous` was. */
+const keepReleaseRace = (
+  previous: ConcurrentModification,
+  next: ConcurrentModification,
+): ConcurrentModification => {
+  if (releaseRaces.has(previous)) releaseRaces.add(next)
+  return next
+}
+
 /** @internal One positional reason of a cancelled (or conditional) write. */
 export interface WriteCancellationReason {
   readonly Code?: string | undefined
@@ -3572,7 +3589,7 @@ const makeImpl = <
                       "model",
                     ),
                   )
-            return yield* new ConcurrentModification({ ...e, current })
+            return yield* keepReleaseRace(e, new ConcurrentModification({ ...e, current }))
           }),
       ),
     )
@@ -3890,13 +3907,16 @@ const makeImpl = <
   const releaseRaced = (
     key: globalThis.Record<string, unknown>,
     constraintName: string,
-  ): ConcurrentModification =>
-    new ConcurrentModification({
+  ): ConcurrentModification => {
+    const error = new ConcurrentModification({
       entityType,
       key,
       attributes: [...resolveUniqueFields(config.unique![constraintName]!)],
       current: Option.none(),
     })
+    releaseRaces.add(error)
+    return error
+  }
 
   // ---------------------------------------------------------------------------
   // Guarded puts (#133)
@@ -5610,7 +5630,7 @@ const makeImpl = <
                             "model",
                           ),
                         )
-                  return yield* new ConcurrentModification({ ...e, current })
+                  return yield* keepReleaseRace(e, new ConcurrentModification({ ...e, current }))
                 }),
             ),
           )
@@ -7155,7 +7175,10 @@ const makeImpl = <
    * replaced item — under the update's version / incarnation or attribute
    * guards, from that one read. The whole input is validated either way. A
    * concurrent create or delete between the read and the write is retried the
-   * other way; a race lost on every attempt fails with the concurrency error.
+   * other way, and a sentinel release whose reservation changed hands is
+   * planned again from a fresh read (as a put's is); a race lost on every
+   * attempt fails with the concurrency error. A concurrent change of the item
+   * itself fails the upsert, as it fails an update.
    */
   const guardedUpsert = (input: unknown, mode: DecodeMode, opts: EntityPutOpts) =>
     Effect.gen(function* () {
@@ -7190,6 +7213,7 @@ const makeImpl = <
           .pipe(Effect.map((result) => result.Item))
       let current = yield* read()
       let expected = 0
+      let lost: ConcurrentModification | undefined
       for (let attempt = 0; attempt < GUARDED_PUT_ATTEMPTS; attempt++) {
         yield* checkVersion(current, "upsert")
         expected = storedVersionOf(current) ?? 0
@@ -7239,12 +7263,19 @@ const makeImpl = <
         )
         if (updated._tag === "Success") return updated.value
         const error = Cause.findErrorOption(updated.cause)
-        // Deleted concurrently: upsert it as the missing item it now is.
-        if (Option.isNone(error) || !(error.value instanceof ItemNotFound)) {
+        if (Option.isNone(error)) return yield* updated
+        // A sentinel it would release changed hands since its ownership read:
+        // nothing was written, and the upsert is planned again from a fresh
+        // read, as a put is.
+        if (error.value instanceof ConcurrentModification && releaseRaces.has(error.value)) {
+          lost = error.value
+        } else if (!(error.value instanceof ItemNotFound)) {
           return yield* updated
         }
+        // Deleted concurrently: upserted as the missing item it now is.
         current = yield* read()
       }
+      if (lost !== undefined) return yield* lost
       // Every attempt raced a concurrent create or delete.
       return yield* systemFields.version
         ? new OptimisticLockError({

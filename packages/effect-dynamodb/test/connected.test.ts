@@ -16462,6 +16462,60 @@ describeConnected("#133 — path operations on index composites and unique field
     }
   }
 
+  // ---- a release whose reservation changes hands is planned again (#133) ----
+
+  /** Another item takes over a sentinel — between a write's ownership read and its write. */
+  const handOver = (entityType: string, constraint: string, value: string, to: string) =>
+    g133Hook(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.updateItem({
+          TableName: g133Tables.record,
+          Key: sentinelKey(entityType, constraint, value),
+          UpdateExpression: "SET #epk = :epk",
+          ExpressionAttributeNames: { "#epk": "_entity_pk" },
+          ExpressionAttributeValues: { ":epk": mainKey(entityType, to).pk },
+        })
+      }).pipe(Effect.provide(ClientLayer)),
+    )
+
+  for (const [entity, entityType] of [
+    ["AccountsBare", "G133AccountBare"],
+    ["AccountsPlain", "G133AccountPlain"],
+    ["AccountsRetained", "G133AccountRetained"],
+  ] as const) {
+    for (const [label, write] of [
+      ["put", (acc: any, id: string, to: string) => acc.put({ id, email: to, name: "m" })],
+      ["upsert", (acc: any, id: string, to: string) => acc.upsert({ id, email: to, name: "m" })],
+      [
+        "transactWrite put",
+        (_: any, id: string, to: string) =>
+          Transaction.transactWrite([
+            (g133Entities as any)[entity].put({ id, email: to, name: "m" }),
+          ]),
+      ],
+    ] as const) {
+      it.effect(`${entity}: ${label} is written again when a release races`, () =>
+        Effect.gen(function* () {
+          const db = yield* g133Client
+          const accounts = db.entities[entity] as any
+          const tag = `${entity}-hand-${label.replace(" ", "-")}`.toLowerCase()
+          const [a, b] = [`${tag}-a`, `${tag}-b`]
+          const held = `${tag}@x.io`
+          const moved = `${tag}-moved@x.io`
+          yield* accounts.put({ id: a, email: held, name: "a" })
+          // The reservation passes to `b` after `a`'s write read it as `a`'s.
+          g133Inject.before = handOver(entityType, "email", held, b)
+          yield* write(accounts, a, moved)
+          // Planned again from a fresh read: `b`'s sentinel is left alone.
+          expect(yield* sentinelOwner(entityType, "email", held)).toBe(mainKey(entityType, b).pk.S)
+          expect(yield* sentinelOwner(entityType, "email", moved)).toBe(mainKey(entityType, a).pk.S)
+          expect((yield* rawItem(entityType, a)).email).toEqual({ S: moved })
+        }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+      )
+    }
+  }
+
   // ---- transactions write existing versioned and unique items (#133) ----
 
   it.effect("transactWrite replaces an existing item exactly as its own put does", () =>
