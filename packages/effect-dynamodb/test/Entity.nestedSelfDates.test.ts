@@ -1486,3 +1486,23 @@ describe("#133 entity nested self dates — path values under a DynamoModel.ref 
     }).pipe(Effect.provide(refLayer)),
   )
 })
+
+describe("#133 entity nested self dates — path values are validated as stored", () => {
+  it.effect("an undefined optional key is dropped, not rejected", () => {
+    const { client, layer } = makeEntityHolder(
+      "optional-key",
+      Schema.Struct({ at: Schema.DateTimeUtc, opt: Schema.optionalKey(Schema.DateTimeUtc) }),
+    )
+    return Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Holders.put({ id: "o", f: { at: dt } } as any)
+      writes.length = 0
+      yield* db.entities.Holders.update({ id: "o" }).pathSet({
+        segments: ["f"],
+        value: { at: later, opt: undefined },
+        isPath: false,
+      })
+      expect(lastUpdateValues()).toContainEqual({ M: { at: S(LATER) } })
+    }).pipe(Effect.provide(layer))
+  })
+})

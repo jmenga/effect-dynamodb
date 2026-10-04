@@ -2301,6 +2301,22 @@ const makeAmbiguityCheck = (original: Schema.Top): ((value: unknown) => boolean)
   }
 }
 
+/**
+ * A path value as DynamoDB will store it: the marshaller drops `undefined`
+ * object entries (`removeUndefinedValues`), so `{ opt: undefined }` is stored as
+ * `{}` and must be validated as such — an `optionalKey` rejects a present
+ * `undefined` that never reaches the table.
+ */
+const asStored = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(asStored)
+  if (!isPlainObject(value)) return value
+  const out: globalThis.Record<string, unknown> = {}
+  for (const [key, entry] of Object.entries(value)) {
+    if (entry !== undefined) out[key] = asStored(entry)
+  }
+  return out
+}
+
 /** A plain object or class instance whose fields a path value can be walked by. */
 const isWalkableObject = (value: unknown): value is object =>
   value !== null &&
@@ -2505,7 +2521,7 @@ export const makePathValueEncoder = (
         : (() => {
             const decode = Schema.decodeUnknownExit(schema as Schema.Codec<any>)
             return (encoded: unknown): unknown => {
-              const exit = decode(encoded)
+              const exit = decode(asStored(encoded))
               return exit._tag === "Success" ? undefined : exit.cause
             }
           })()
