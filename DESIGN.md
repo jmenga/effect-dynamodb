@@ -1920,6 +1920,45 @@ db.Matches.update({ matchId: "m-1" }, mutation)
 
 **Transaction Decomposition:** Each sub-aggregate is a transactional unit, keeping transactions well within DynamoDB's 100-item limit.
 
+### Attribute Encoding (#72, #133)
+
+Decomposition works from the schema-decoded domain object, so every attribute it
+produces is a Type-side value. Each attribute is put into its schema's **wire
+form** before marshalling, through per-attribute encoders built at `make()` time.
+Marshalling a domain value directly stores a shape the read path cannot decode:
+a `DateTime` becomes a `{ epochMilliseconds, <type-id>, _tag }` map, a `Date`
+becomes `{M:{}}`, and a `bigint` becomes `{N:"5"}`.
+
+| Rule | Behaviour |
+|------|-----------|
+| **Which attributes** | Any field holding a wire transform **at any depth** (`containsWireTransform`): a leaf transform, a `Schema.Class`, a self date or `Redacted`, or an `Array` / `Struct` / `Union` containing one. Gating on the top-level AST (pre-#133) skipped every container, since an `Arrays` / `Objects` node carries no encoding of its own. Fields with nothing to encode get no encoder and their bytes are unchanged. |
+| **One encoder per field** | A `storedAs` annotation or inferred date default wins. Otherwise the field is encoded through the same substituted, tolerant schema the read path decodes it with (`substituteSchemaDeep` + the aggregate's ref resolver), falling back to the field's own `encode`, then `decode → encode`. |
+| **Which schema** | The schema the decomposed value actually has: the root model's fields for the root, a `one` edge's entity model (or the model field's own class when the edge has no entity), the array **element** for a `many` edge (`PlayerSheet`, not `Player`), a sub-aggregate's own schema for its root item. |
+| **Per attribute, not per aggregate** | The aggregate is never encoded as a whole before decomposition: key composition needs Type-side values (`numericTypeWithStringEncoding`). |
+| **Keys unchanged** | A `many` edge's `sk.composite` and the root's list-index composites are read from a second encoder set (`buildKeyAttrEncoders`) that keeps the pre-#133 top-level-only behaviour. Composed keys are therefore byte-identical to earlier versions; only stored attribute values gained the deeper encoding. |
+
+**Ref resolution.** `DynamoModel.ref` annotates with `Schema.annotate`, which
+drops a `Schema.Class`'s `.fields`, so the schema walker cannot recurse into an
+annotated ref. `collectRefTargets` registers each such field with the model it
+should be read (and encoded) as: root `one`/`ref` edge fields, opaque ref fields
+inside sub-aggregate edges and `many` elements (found by
+`deriveEntityFieldName`), and refs nested in an edge entity's own model (#116). A
+plain-class element field is walked directly and needs no registration. Targets
+are keyed by **field schema identity**, not field name: the resolver is
+consulted at every depth, and a name-keyed table re-pointed any same-named field
+anywhere in the model.
+
+**Legacy maps on read.** Versions ≤1.22.0 stored nested `DateTime`s as marshalled
+maps. The tolerant date decoder (`liftToDomain`) rebuilds any plain object with a
+finite numeric `epochMilliseconds` and `_tag: "Utc"`, or `_tag: "Zoned"` with a
+recoverable named or offset `zone`, into a real `DateTime`. The type-id key is
+deliberately not inspected (`~effect/time/DateTime` on the rc, `~effect/DateTime`
+on 4.0.0). An object that duck-types as a `DateTime` but carries no recoverable
+instant is rejected rather than passed to the domain. There is no backfill: a
+legacy row is rewritten in wire form only when an `update` changes its
+decomposed group, because the diff compares decomposed (re-encoded) groups and a
+no-op update writes nothing.
+
 ### Aggregate System Timestamps
 
 `Aggregate.make(schema, { timestamps })` takes the same `TimestampsConfig` as

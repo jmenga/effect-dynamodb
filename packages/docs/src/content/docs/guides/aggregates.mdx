@@ -410,6 +410,37 @@ team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
 
 Discriminator values are stored on each member item in DynamoDB and used during assembly to route items to the correct sub-aggregate instance.
 
+### How Values Are Stored
+
+Every item an aggregate writes stores its values in their schema's **wire form**, the same form `Entity.put` writes, however deeply they are nested. A `Schema.DateTimeUtcFromString` is an ISO string (`S`) in each of these places:
+
+- a root field (`startDate`)
+- an element of a root array (`matchDays: Schema.Array(Schema.DateTimeUtcFromString)`)
+- a field of a class inside an array (`sessions[].startTime`)
+- a field of a ref hydrated into a `one` or `many` item (`player.dateOfBirth` on a `MatchPlayer` item), at the root or inside a sub-aggregate
+- a field of a `one` or `many` edge declared without an `entity`
+
+Other transforms follow the same rule. A `Schema.BigIntFromString` is stored as a string, and self date schemas such as `Schema.DateTimeUtc` and `Schema.Date` default to an ISO string. On read, each value is decoded back to its domain type, so the assembled aggregate holds real `DateTime` instances.
+
+The ref inside a `many` element can be declared either way, and both round-trip:
+
+- `player: Player.pipe(DynamoModel.ref)`
+- the plain class `player: Player`, matched by name to the edge's `entity`
+
+Refs are matched by the field's schema, not its name. A nested field that happens to share a ref edge's name (a `coach: Schema.String` inside an array, next to a root `coach` edge) is stored and read as its own schema.
+
+Composed keys (`pk`, `sk`, collection and list-index keys) are not affected by this encoding. They are built exactly as before, so existing rows stay addressable.
+
+#### Upgrading from 1.22.0 or earlier
+
+Versions up to and including 1.22.0 encoded only top-level fields. A transformed value nested inside an array, a class or a hydrated ref was marshalled as the domain object itself, so a `DateTime` was stored as a map such as `{ epochMilliseconds, "~effect/DateTime", _tag: "Utc" }`. On Effect 4.0.0, rows written under an Effect release candidate (whose maps carry `~effect/time/DateTime`) failed assembly with `Expected DateTime.Utc`. Rows written under 4.0.0 decoded as plain objects that only looked like `DateTime`s.
+
+Existing rows need no migration step:
+
+- **Reads** rebuild a stored `DateTime` map into a real `DateTime`, whichever type-id key it carries. `Zoned` values keep their named or offset zone.
+- **Writes** rewrite a row in wire form the next time an `update` changes its group (the root item, or the sub-aggregate it belongs to). An update that changes nothing writes nothing, and there is no automatic backfill, so rows that are never updated keep the map form and keep reading correctly.
+- **Lost values.** A `Schema.Date` stored by those versions is an empty map with no instant in it. It cannot be recovered, and reading it fails with a `ValidationError`.
+
 ### Aggregate Operations
 
 #### get — Read and Assemble
@@ -458,7 +489,7 @@ const match = yield* MatchAggregate.create({
 The create operation:
 1. Validates the input against the schema
 2. Hydrates all ref fields (fetches entities by ID, embeds domain data)
-3. Decomposes the domain object into individual DynamoDB items following the graph structure
+3. Decomposes the domain object into individual DynamoDB items following the graph structure, with every value in its wire form (see [How Values Are Stored](#how-values-are-stored))
 4. Adds partition keys, sort keys, entity type discriminators, and context fields
 5. Writes items in sub-aggregate transaction groups (each sub-aggregate = one `transactWriteItems`)
 
@@ -638,7 +669,8 @@ type MatchKey = Aggregate.Key<typeof MatchAggregate> // { id: string }
 
 | Error | When | Properties |
 |-------|------|------------|
-| `AggregateAssemblyError` | Read path: missing items, structural violations, or decode errors | `aggregate`, `reason`, `key` |
+| `AggregateAssemblyError` | Read path: no items for the key, a missing root item, or duplicate root / sub-aggregate items | `aggregate`, `reason`, `key` |
+| `ValidationError` | Read path: the assembled items fail schema decode (`operation: "aggregate.assemble"`) | `entityType`, `operation`, `cause` |
 | `AggregateDecompositionError` | Write path: schema validation or structural error during decomposition | `aggregate`, `member`, `reason` |
 | `AggregateTransactionOverflow` | Write path: sub-aggregate exceeds 100-item transaction limit | `aggregate`, `subgraph`, `itemCount`, `limit` |
 | `RefNotFound` | Ref hydration: referenced entity not found | `entity`, `field`, `refEntity`, `refId` |

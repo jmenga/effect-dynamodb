@@ -431,7 +431,8 @@ yield* users.update({ userId: "u-1" })
 **Cause:** The aggregate could not be assembled from the items in DynamoDB. Common reasons:
 - **Missing items** — A required sub-entity or edge target does not exist in the partition
 - **Structural violations** — Items do not match the expected aggregate shape (e.g., wrong entity type, unexpected discriminator)
-- **Decode errors** — An item failed Schema validation during assembly
+
+A stored value that fails schema decode during assembly is reported as a `ValidationError` with `operation: "aggregate.assemble"`, not as an `AggregateAssemblyError`.
 
 **Solution:**
 
