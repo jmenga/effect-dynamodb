@@ -786,7 +786,17 @@ export interface Entity<
     DynamoClient | TableConfig
   >
 
-  /** Create or replace an item. Returns a lazy {@link EntityPut} intermediate. */
+  /**
+   * Create or replace an item. Returns a lazy {@link EntityPut} intermediate.
+   *
+   * On a versioned or unique-constrained entity the put reads the item first:
+   * a replacing put continues its version, incarnation and `createdAt`,
+   * snapshots it (`retain`) and rotates its unique sentinels — releasing only
+   * those the item owns; a created one continues after any history retained
+   * for its key. A concurrent write between the read and the put is retried,
+   * so the last writer wins; a race lost on every attempt is an
+   * `OptimisticLockError` (versioned) or `ConcurrentModification`.
+   */
   readonly put: (
     input: WithGeneratedId<
       EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
@@ -796,6 +806,7 @@ export interface Entity<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
     | DynamoClientError
+    | TransactionOverflow
     | ValidationError
     | UniqueConstraintViolation
     | OptimisticLockError
@@ -816,6 +827,7 @@ export interface Entity<
     EntityRecordType<TModel, TTimestamps, TVersioned>,
     EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
     | DynamoClientError
+    | TransactionOverflow
     | ItemNotFound
     | OptimisticLockError
     | ConcurrentModification
@@ -827,11 +839,15 @@ export interface Entity<
     DynamoClient | TableConfig
   >
 
-  /** Delete an item by primary key. Returns a lazy {@link EntityDelete} intermediate. */
+  /**
+   * Delete an item by primary key. Returns a lazy {@link EntityDelete} intermediate.
+   * A unique-constrained entity releases only the sentinels the item owns.
+   */
   readonly delete: (
     key: EntityKeyType<TModel, TIndexes>,
   ) => EntityDelete<
     | DynamoClientError
+    | TransactionOverflow
     | ItemNotFound
     | OptimisticLockError
     | ConcurrentModification
@@ -841,7 +857,9 @@ export interface Entity<
 
   /**
    * Create a new item. Fails with `ConditionalCheckFailed` if an item with the same
-   * primary key already exists. Equivalent to `put(input)` with an `attribute_not_exists` condition.
+   * primary key already exists. Equivalent to `put(input)` with an `attribute_not_exists`
+   * condition — it never reads the item (a `retain` entity reads only the highest
+   * version retained for the key, to continue after it).
    */
   readonly create: (
     input: WithGeneratedId<
@@ -852,6 +870,7 @@ export interface Entity<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
     | DynamoClientError
+    | TransactionOverflow
     | ValidationError
     | UniqueConstraintViolation
     | OptimisticLockError
@@ -873,6 +892,7 @@ export interface Entity<
     EntityRecordType<TModel, TTimestamps, TVersioned>,
     EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
     | DynamoClientError
+    | TransactionOverflow
     | ItemNotFound
     | OptimisticLockError
     | ConcurrentModification
@@ -893,6 +913,7 @@ export interface Entity<
     key: EntityKeyType<TModel, TIndexes>,
   ) => EntityDelete<
     | DynamoClientError
+    | TransactionOverflow
     | ItemNotFound
     | OptimisticLockError
     | ConcurrentModification
@@ -902,12 +923,19 @@ export interface Entity<
   >
 
   /**
-   * Create or update an item atomically. Uses DynamoDB UpdateItem with `if_not_exists()`
-   * for immutable fields and createdAt so they're only set on first creation.
-   * Version is incremented atomically: `if_not_exists(version, 0) + 1`.
-   * Returns the full record (ReturnValues: ALL_NEW).
+   * Create an item, or update the fields the input supplies on an existing one —
+   * immutable fields, `createdAt` and fields the input omits keep their stored
+   * values; the version is incremented. The whole input is validated either way.
+   * Returns the full record.
    *
-   * Does NOT support unique constraints or retain (cannot determine if item existed).
+   * Plain entities: one UpdateItem, `if_not_exists()` for immutable fields,
+   * `createdAt` and the version (`if_not_exists(version, 0) + 1`). An entity with
+   * `unique` constraints or `versioned: { retain: true }` — or an input omitting a
+   * defaulted index composite — reads the item once first: missing, it is
+   * `create`d (sentinels reserved, snapshot written, defaults stored); present, it
+   * is updated (sentinels rotated, the replaced item snapshotted). A concurrent
+   * create or delete in between is retried the other way; a race lost on every
+   * attempt is an `OptimisticLockError` (versioned) or `ConcurrentModification`.
    */
   readonly upsert: (
     input: WithGeneratedId<
@@ -918,6 +946,7 @@ export interface Entity<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
     | DynamoClientError
+    | TransactionOverflow
     | ValidationError
     | ItemNotFound
     | UniqueConstraintViolation
@@ -953,7 +982,12 @@ export interface Entity<
   ) => EntityGet<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
-    ItemNotFound | ItemNotDeleted | DynamoClientError | ValidationError | UniqueConstraintViolation,
+    | ItemNotFound
+    | ItemNotDeleted
+    | DynamoClientError
+    | TransactionOverflow
+    | ValidationError
+    | UniqueConstraintViolation,
     DynamoClient | TableConfig
   >
 
@@ -1249,6 +1283,7 @@ export interface BoundEntity<
     ModelType<TModel>,
     ModelType<TModel>,
     | DynamoClientError
+    | TransactionOverflow
     | ValidationError
     | UniqueConstraintViolation
     | OptimisticLockError
@@ -1271,6 +1306,7 @@ export interface BoundEntity<
     ModelType<TModel>,
     ModelType<TModel>,
     | DynamoClientError
+    | TransactionOverflow
     | ValidationError
     | UniqueConstraintViolation
     | OptimisticLockError
@@ -1297,6 +1333,7 @@ export interface BoundEntity<
     ModelType<TModel>,
     EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
     | DynamoClientError
+    | TransactionOverflow
     | ItemNotFound
     | OptimisticLockError
     | ConcurrentModification
@@ -1322,6 +1359,7 @@ export interface BoundEntity<
   ) => import("./internal/BoundCrud.js").BoundDelete<
     ModelType<TModel>,
     | DynamoClientError
+    | TransactionOverflow
     | ItemNotFound
     | OptimisticLockError
     | ConcurrentModification
@@ -1329,9 +1367,11 @@ export interface BoundEntity<
   >
 
   /**
-   * Create or update an item atomically. Returns a fluent {@link BoundPut}.
-   * Uses DynamoDB UpdateItem with `if_not_exists()` for immutable fields and
-   * createdAt so they're only set on first creation.
+   * Create an item, or update the fields the input supplies on an existing one.
+   * Returns a fluent {@link BoundPut}. See `Entity.upsert`: a plain entity is one
+   * UpdateItem with `if_not_exists()` for immutable fields, `createdAt` and the
+   * version; a `unique` or `retain` entity (or an input omitting a defaulted index
+   * composite) reads the item once and creates or updates it.
    */
   readonly upsert: (
     input: WithGeneratedId<
@@ -1342,6 +1382,7 @@ export interface BoundEntity<
     ModelType<TModel>,
     ModelType<TModel>,
     | DynamoClientError
+    | TransactionOverflow
     | ValidationError
     | ItemNotFound
     | UniqueConstraintViolation
@@ -1368,6 +1409,7 @@ export interface BoundEntity<
     ModelType<TModel>,
     EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
     | DynamoClientError
+    | TransactionOverflow
     | ItemNotFound
     | OptimisticLockError
     | ConcurrentModification
@@ -1386,6 +1428,7 @@ export interface BoundEntity<
   ) => import("./internal/BoundCrud.js").BoundDelete<
     ModelType<TModel>,
     | DynamoClientError
+    | TransactionOverflow
     | ItemNotFound
     | OptimisticLockError
     | ConcurrentModification
@@ -1423,7 +1466,12 @@ export interface BoundEntity<
     key: TKey,
   ) => Effect.Effect<
     ModelType<TModel>,
-    ItemNotFound | ItemNotDeleted | DynamoClientError | ValidationError | UniqueConstraintViolation,
+    | ItemNotFound
+    | ItemNotDeleted
+    | DynamoClientError
+    | TransactionOverflow
+    | ValidationError
+    | UniqueConstraintViolation,
     never
   >
 

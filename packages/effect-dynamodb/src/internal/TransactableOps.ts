@@ -146,17 +146,16 @@ export const batchRejectReason = (entity: Entity, opType: "put" | "delete"): str
  * writes an item with no embedding, so it silently drops out of the index.
  *
  * **The multi-item lifecycle features split by direction (#113).** `unique`,
- * `versioned: { retain }` and `softDelete` all need MORE than one item per write.
- * The line between "expand" and "reject" is whether the extra items are
- * derivable from the caller's payload or only from stored state:
+ * `versioned: { retain }` and `softDelete` all need MORE than one item per write:
  *
- * - **put** — the sentinel and the v1 snapshot come from the payload being
- *   written. `transactWrite` expands into them (`Entity._buildPutSideItems`).
- * - **delete** — the sentinel to release is keyed by the *stored* item's unique
- *   values, a retain snapshot copies the *stored* row, and a soft-delete
- *   tombstone IS the stored row relocated to a new sort key. All three need a
- *   read this path does not do (and a read would introduce a TOCTOU window that
- *   only another ConditionCheck could close). Rejected with **EDD-9048**.
+ * - **put** — expanded. A put of a versioned or unique-constrained entity is
+ *   planned exactly as `Entity.put` plans it (#133): the item is read, and the
+ *   Put is guarded on what was read, beside its sentinel reservations and
+ *   (owned) releases and its retain snapshot (`Entity._planPut`).
+ * - **delete** — rejected with **EDD-9048**. The sentinel to release is keyed by
+ *   the *stored* item's unique values, a retain snapshot copies the *stored* row,
+ *   and a soft-delete tombstone IS the stored row relocated to a new sort key;
+ *   the transaction path builds a delete from its key alone.
  *
  * `Batch.write` rejects BOTH directions (**EDD-9049**) — see `batchRejectReason`.
  *
@@ -202,8 +201,8 @@ export const rejectUnsupportedOp = (
         `[EDD-9048] deleting an entity configured with ${describeFeatures(entity._multiItemWriteFeatures)}`,
         "the extra items a delete must write are derived from the STORED item — the sentinel " +
           "to release is keyed by its unique values, a retain snapshot copies it, and a " +
-          "soft-delete tombstone is that row relocated to a new sort key. This path never " +
-          "reads, so it cannot build them. Run the delete as its own operation " +
+          "soft-delete tombstone is that row relocated to a new sort key. This path builds a " +
+          "delete from its key alone, so it cannot build them. Run the delete as its own operation " +
           "(db.entities.X.delete(...)), which reads the item first.",
       ),
     )
@@ -303,10 +302,11 @@ export const composePrimaryKey = (
  * are handled in the encode pass — no per-field serialization needed.
  *
  * Returns the unmarshalled `item` alongside the marshalled one, plus the `now`
- * the timestamps were generated from. `Entity._buildPutSideItems` needs both to
- * derive uniqueness sentinels and the v1 version snapshot from the same values
- * that were written (#113), and re-deriving `now` there would risk a skew
- * between an item's `createdAt` and its snapshot's TTL.
+ * the timestamps were generated from, and whether the input supplied
+ * `createdAt`. `Entity._planPut` needs them to derive uniqueness sentinels and
+ * the retain snapshot from the same values that were written (#113), and to
+ * keep a replaced item's `createdAt` (#133); re-deriving `now` there would risk
+ * a skew between an item's `createdAt` and its snapshot's TTL.
  */
 export const validateAndBuildPutItem = (
   entity: Entity,
@@ -387,7 +387,7 @@ export const validateAndBuildPutItem = (
     // position `Entity.put` does (after keys + system fields, before sparse
     // flattening). Omitting it gave a `field:`-renamed entity a differently
     // shaped item depending on whether `put` or `transactWrite` wrote it — and
-    // `_buildPutSideItems` derives the v1 retain snapshot from this same item,
+    // `_planPut` derives the retain snapshot from this same item,
     // so the snapshot inherited the wrong shape too (#111).
     entity._renameToDynamo(item)
 

@@ -212,9 +212,18 @@ export interface AppendOptions<TMetadata> {
    * op union `Transaction.transactWrite` accepts (`EntityPut`, `EntityDelete`,
    * `Transaction.check(...)`).
    *
-   * Conditional failures on these items are reported as
-   * `AdditionalItemConditionFailed` (carrying the 0-based indices into this
-   * array), never as `VersionConflict`.
+   * A put of a versioned or unique-constrained entity is written exactly as
+   * the entity's own `put` writes it (#133) — reading the item, continuing a
+   * replaced item's version and history, rotating its sentinels — and an
+   * append whose read raced a concurrent write is written again.
+   *
+   * A failure of an item's OWN condition (`.condition()`, `create()`,
+   * `Transaction.check`) is reported as `AdditionalItemConditionFailed`
+   * (carrying the 0-based indices into this array), never as
+   * `VersionConflict`. A guarded put the caller set no condition on fails as
+   * the entity's put would: `UniqueConstraintViolation`, a history
+   * `ValidationError`, or — a race lost on every attempt —
+   * `OptimisticLockError` / `ConcurrentModification`.
    */
   readonly additionalItems?: ReadonlyArray<TransactWriteOp>
   /** Opt in to exactly-once command processing — see {@link AppendIdempotency}. */

@@ -264,8 +264,9 @@ type BatchWriteOp = EntityPut<any, any, any, any> | EntityDelete<any, any> | Bou
  * Puts of a `versioned` entity are sent first, as create-only
  * `TransactWriteItems` of up to 100 items (`attribute_not_exists`): a batch
  * put cannot continue an existing item's version, so one that would replace an
- * item fails with a `ValidationError` and its chunk writes nothing. Each chunk
- * costs twice the write capacity of a batch write.
+ * item fails with a `ValidationError` and its chunk writes nothing (the entity's
+ * `put` and `Transaction.transactWrite` replace it). Each chunk costs twice the
+ * write capacity of a batch write.
  *
  * ```typescript
  * yield* Batch.write([
@@ -474,7 +475,8 @@ export const write = (
               `Batch.write would replace an existing ${replaced.entityType} item. A versioned ` +
               "entity's replacing put continues the item's version (and snapshots / rotates it), " +
               "which needs the stored item — a batch write could only reset it to version 1. " +
-              "Use the entity's put() for it. Nothing in its chunk of versioned puts, nor any " +
+              "Use the entity's put() or Transaction.transactWrite for it. Nothing in its chunk " +
+              "of versioned puts, nor any " +
               "non-versioned request, was written; earlier chunks of versioned puts may have been.",
           })
         }
