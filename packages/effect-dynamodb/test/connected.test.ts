@@ -13547,3 +13547,150 @@ describeConnected("#133 — nested unions, zoned offsets, class path values", ()
     }).pipe(provideY133),
   )
 })
+
+// ===========================================================================
+// #133 — container checks enforced on writes, path values under a ref field
+// ===========================================================================
+
+class Z133Author extends Schema.Class<Z133Author>("Z133Author")({
+  authorId: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+  born: Schema.DateTimeUtc,
+  rank: Schema.NumberFromString,
+}) {}
+class Z133Note extends Schema.Class<Z133Note>("Z133Note")({
+  id: Schema.String,
+  days: Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(2)),
+  author: Z133Author.pipe(DynamoModel.ref),
+}) {}
+class Z133Agg extends Schema.Class<Z133Agg>("Z133Agg")({
+  id: Schema.String,
+  days: Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(2)),
+}) {}
+const Z133Schema = DynamoSchema.make({ name: "edd133z", version: 1 })
+const Z133Authors = Entity.make({
+  model: Z133Author,
+  entityType: "Z133Author",
+  primaryKey: { pk: { field: "pk", composite: ["authorId"] }, sk: { field: "sk", composite: [] } },
+})
+const Z133Notes = Entity.make({
+  model: Z133Note,
+  entityType: "Z133Note",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  refs: { author: { entity: Z133Authors } },
+})
+const Z133Table = Table.make({ schema: Z133Schema, entities: { Z133Authors, Z133Notes } })
+const Z133Aggregate = Aggregate.make(Z133Agg, {
+  table: Z133Table,
+  schema: Z133Schema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "zagg" },
+  root: { entityType: "Z133AggItem" },
+  edges: {},
+})
+const z133TableName = `edd133z-${Date.now()}`
+const provideZ133 = Effect.provide(
+  Layer.mergeAll(ClientLayer, Z133Table.layer({ name: z133TableName })),
+)
+const z133Client = DynamoClient.make({
+  entities: { Z133Authors, Z133Notes },
+  aggregates: { Z133Aggregate },
+  tables: { Z133Table },
+})
+
+describeConnected("#133 — container checks on writes, path values under a ref", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* z133Client
+        yield* db.tables.Z133Table.create()
+        yield* db.entities.Z133Authors.put({
+          authorId: "a1",
+          name: "Ann",
+          born: DateTime.makeUnsafe(I133_DOB_MS),
+          rank: 1,
+        })
+      }).pipe(provideZ133, Effect.scoped),
+    )
+  }, 30000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: z133TableName })
+      }).pipe(
+        provideZ133,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 30000)
+
+  it.effect("writes breaking a check are rejected; a stored violating row still reads", () =>
+    Effect.gen(function* () {
+      const db = yield* z133Client
+      const client = yield* DynamoClient
+      const dt = DateTime.makeUnsafe(I133_DOB_MS)
+      const three = [dt, dt, dt]
+      yield* db.entities.Z133Notes.put({ id: "n1", days: [dt], authorId: "a1" } as any)
+      const notes = db.entities.Z133Notes as any
+      for (const write of [
+        notes.put({ id: "n2", days: three, authorId: "a1" }).asEffect(),
+        notes.update({ id: "n1" }).set({ days: three }).asEffect(),
+        notes
+          .update({ id: "n1" })
+          .pathSet({ segments: ["days"], value: three, isPath: false })
+          .asEffect(),
+        db.aggregates.Z133Aggregate.create({ id: "g1", days: three } as any),
+      ] as ReadonlyArray<Effect.Effect<unknown, unknown>>) {
+        expect(((yield* Effect.flip(write)) as { _tag?: string })._tag).toBe("ValidationError")
+      }
+
+      yield* db.aggregates.Z133Aggregate.create({ id: "g2", days: [dt] } as any)
+      yield* client.updateItem({
+        TableName: z133TableName,
+        Key: { pk: { S: "$edd133z#v1#zagg#g2" }, sk: { S: "$edd133z#v1#z133aggitem" } },
+        UpdateExpression: "SET #d = :v",
+        ExpressionAttributeNames: { "#d": "days" },
+        ExpressionAttributeValues: {
+          ":v": { L: [{ S: I133_DOB }, { S: I133_DOB }, { S: I133_DOB }] },
+        },
+      })
+      const got = (yield* db.aggregates.Z133Aggregate.get({ id: "g2" } as any)) as any
+      expect(got.days).toHaveLength(3)
+      yield* db.aggregates.Z133Aggregate.update({ id: "g2" } as any, (c: any) => ({
+        ...c.state,
+        days: [dt],
+      }))
+      expect(
+        ((yield* db.aggregates.Z133Aggregate.get({ id: "g2" } as any)) as any).days,
+      ).toHaveLength(1)
+    }).pipe(provideZ133),
+  )
+
+  it.effect("path values under a DynamoModel.ref field are stored in wire form", () =>
+    Effect.gen(function* () {
+      const db = yield* z133Client
+      const client = yield* DynamoClient
+      yield* db.entities.Z133Notes.put({ id: "n3", days: [], authorId: "a1" } as any)
+      yield* db.entities.Z133Notes.update({ id: "n3" })
+        .pathSet({
+          segments: ["author", "born"],
+          value: DateTime.makeUnsafe(I133_DOB_MS + 1000),
+          isPath: false,
+        })
+        .pathSet({ segments: ["author", "rank"], value: 7, isPath: false })
+      const { Item } = yield* client.getItem({
+        TableName: z133TableName,
+        Key: { pk: { S: "$edd133z#v1#z133note#id_n3" }, sk: { S: "$edd133z#v1#z133note" } },
+        ConsistentRead: true,
+      })
+      const author = (Item as any).author.M
+      expect([author.born, author.rank]).toEqual([{ S: "2000-01-01T00:00:01.000Z" }, { S: "7" }])
+      const got = (yield* db.entities.Z133Notes.get({ id: "n3" })) as any
+      expect(i133IsRealUtc(got.author.born, I133_DOB_MS + 1000)).toBe(true)
+      expect(got.author.rank).toBe(7)
+    }).pipe(provideZ133),
+  )
+})
