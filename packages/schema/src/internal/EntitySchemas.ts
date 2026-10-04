@@ -410,7 +410,10 @@ export const isSelfDateSchema = (schema: Schema.Top): boolean => {
  *
  * Walks through containers (`Arrays`, `Objects`, `Union` — which covers
  * `Schema.optional` and `NullOr` — and `Suspend`); an `optionalKey` wrapper is
- * the inner AST with an optional context, so it needs no case of its own.
+ * the inner AST with an optional context, so it needs no case of its own. The
+ * tolerant `substituteSchemaDeep` walks the same containers (see
+ * `tolerantContainer`), except `Suspend`: a recursive schema keeps its own
+ * codec, so the aggregate encodes it through its own `encode`.
  *
  * `hasEncodingTransformation` asks the same question of the TOP-LEVEL node
  * only, and an `Arrays` / `Objects` node never carries an encoding itself — so a
@@ -575,7 +578,22 @@ const toWirePrimitive = (input: unknown, encoding: DynamoEncoding): string | num
  *
  * @internal
  */
-export const buildDateTransform = (encoding: DynamoEncoding): Schema.Top => {
+export const buildDateTransform = (
+  encoding: DynamoEncoding,
+  options?: {
+    /**
+     * Accept only this encoding's OWN wire kind (a string for `string` storage, a
+     * number for epoch storage), a domain value of this encoding's domain, or a
+     * legacy marshalled map of it — never a cross-kind input. Used for date leaves
+     * reached through a `Union`: there the tolerant decode is tried member by
+     * member, and accepting any date-ish input would let a date member claim a
+     * value that belongs to a later member (a stored `5` in
+     * `Union([DateTimeUtcFromString, Number])` would read back as a `DateTime`).
+     */
+    readonly strictWireKind?: boolean | undefined
+  },
+): Schema.Top => {
+  const strict = options?.strictWireKind === true
   const targetSchema = (() => {
     switch (encoding.domain) {
       case "DateTime.Utc":
@@ -597,6 +615,30 @@ export const buildDateTransform = (encoding: DynamoEncoding): Schema.Top => {
       case "Date":
         return DateTime.toDateUtc(value)
     }
+  }
+  /** Under `strictWireKind`: whether a DateTime is of this encoding's own domain. */
+  const ownDomain = (value: DateTime.DateTime): boolean =>
+    encoding.domain === "DateTime.Utc"
+      ? DateTime.isUtc(value)
+      : encoding.domain === "DateTime.Zoned" && DateTime.isZoned(value)
+  const liftStrict = (value: unknown): unknown => {
+    const revived = reviveMarshalledDateTime(value)
+    if (revived !== undefined) {
+      if (ownDomain(revived)) return revived
+      throw new Error("[effect-dynamodb] marshalled DateTime of another domain")
+    }
+    if (isGenuineDateTime(value) && ownDomain(value)) return value
+    if (value instanceof Date && encoding.domain === "Date" && !Number.isNaN(value.getTime())) {
+      return value
+    }
+    if (typeof value === (encoding.storage === "string" ? "string" : "number")) {
+      const lifted = liftToDomain(value)
+      if (lifted instanceof Date && Number.isNaN(lifted.getTime())) {
+        throw new Error("[effect-dynamodb] invalid date")
+      }
+      return lifted
+    }
+    throw new Error("[effect-dynamodb] not this date member's wire or domain form")
   }
   const liftToDomain = (value: unknown): unknown => {
     // A marshalled `DateTime` instance (#133) — rebuilt, whatever type-id key
@@ -653,7 +695,7 @@ export const buildDateTransform = (encoding: DynamoEncoding): Schema.Top => {
     Schema.decodeTo(targetSchema, {
       decode: SchemaGetter.transformEffect((value: unknown) => {
         try {
-          return Effect.succeed(liftToDomain(value))
+          return Effect.succeed(strict ? liftStrict(value) : liftToDomain(value))
         } catch {
           return Effect.fail(new SchemaIssue.InvalidType(Schema.Any.ast, value))
         }
@@ -819,7 +861,7 @@ const arrayElementOf = (schema: Schema.Top): Schema.Top | undefined => {
   return elementAst ? Schema.make<Schema.Top>(elementAst) : undefined
 }
 
-interface OptionalField {
+export interface OptionalField {
   /** The REAL inner schema X (class/struct/array/leaf) — `.fields` / `.value` /
    *  constructor intact, so the normal recursion can substitute and preserve it. */
   readonly inner: Schema.Top
@@ -834,8 +876,10 @@ interface OptionalField {
  * accessors (which return real schemas with `.fields` / `.value` / constructor
  * intact), NOT AST reconstruction (which loses those). Returns `undefined` for
  * non-optional fields.
+ *
+ * @internal Also used by the aggregate runtime to see through a field's optionality.
  */
-const optionalField = (field: Schema.Top): OptionalField | undefined => {
+export const optionalField = (field: Schema.Top): OptionalField | undefined => {
   const ast = field.ast as {
     readonly _tag?: string
     readonly context?: { readonly isOptional?: boolean }
@@ -891,7 +935,108 @@ export interface DeepSubstitutionOptions {
    * its wire format and must not be overridden there.
    */
   readonly tolerantTransforms?: boolean | undefined
+  /**
+   * Set internally while substituting inside a `Union` member: date leaves get
+   * a `strictWireKind` transform (see {@link buildDateTransform}). Propagated
+   * through the rest of the recursion.
+   */
+  readonly strictWireKind?: boolean | undefined
 }
+
+/**
+ * A container the substitution walks only under `tolerantTransforms` (#133):
+ * its child schemas, and how to rebuild it around substituted children.
+ */
+interface TolerantContainer {
+  readonly children: ReadonlyArray<Schema.Top>
+  readonly rebuild: (children: ReadonlyArray<Schema.Top>) => Schema.Top
+  /** Children are alternatives (a `Union`), decoded member by member. */
+  readonly isUnion: boolean
+}
+
+/**
+ * The containers besides Struct / Class / Array that a value can nest a
+ * transformed leaf in: `Union` (incl. `NullOr` and a non-field `UndefinedOr`),
+ * `Record`, `Tuple`, `TupleWithRest` and `StructWithRest`. Each is rebuilt
+ * through its own runtime accessors so its kind, union options and checks are
+ * kept. `containsWireTransform` walks the same shapes.
+ *
+ * Tolerant mode only: the entity derivation (no options) has never walked
+ * these, and changing what an entity stores is out of this function's remit.
+ */
+const tolerantContainer = (schema: Schema.Top): TolerantContainer | undefined => {
+  const s = schema as unknown as globalThis.Record<string, unknown>
+  const ast = schema.ast
+  const schemas = (value: unknown): ReadonlyArray<Schema.Top> | undefined =>
+    Array.isArray(value) && value.every(isSchemaLike)
+      ? (value as ReadonlyArray<Schema.Top>)
+      : undefined
+  if (SchemaAST.isUnion(ast)) {
+    const members = schemas(s.members)
+    if (members === undefined || typeof s.mapMembers !== "function") return undefined
+    const union = schema as unknown as {
+      mapMembers: (f: (m: unknown) => unknown, o: { unsafePreserveChecks: boolean }) => Schema.Top
+    }
+    return {
+      children: members,
+      rebuild: (subs) => union.mapMembers(() => subs, { unsafePreserveChecks: true }),
+      isUnion: true,
+    }
+  }
+  if (SchemaAST.isArrays(ast)) {
+    const elements = schemas(s.elements)
+    if (elements !== undefined && typeof s.mapElements === "function") {
+      const tuple = schema as unknown as {
+        mapElements: (
+          f: (e: unknown) => unknown,
+          o: { unsafePreserveChecks: boolean },
+        ) => Schema.Top
+      }
+      return {
+        children: elements,
+        rebuild: (subs) => tuple.mapElements(() => subs, { unsafePreserveChecks: true }),
+        isUnion: false,
+      }
+    }
+    const rest = schemas(s.rest)
+    if (isSchemaLike(s.schema) && rest !== undefined) {
+      return {
+        children: [s.schema, ...rest],
+        rebuild: ([head, ...tail]) =>
+          Schema.TupleWithRest(head as any, tail as any) as unknown as Schema.Top,
+        isUnion: false,
+      }
+    }
+    return undefined
+  }
+  if (SchemaAST.isObjects(ast)) {
+    if (isSchemaLike(s.key) && isSchemaLike(s.value)) {
+      const key = s.key
+      return {
+        children: [s.value],
+        rebuild: ([value]) => Schema.Record(key as any, value as any) as unknown as Schema.Top,
+        isUnion: false,
+      }
+    }
+    const records = schemas(s.records)
+    if (isSchemaLike(s.schema) && records !== undefined) {
+      return {
+        children: [s.schema, ...records],
+        rebuild: ([head, ...tail]) =>
+          Schema.StructWithRest(head as any, tail as any) as unknown as Schema.Top,
+        isUnion: false,
+      }
+    }
+  }
+  return undefined
+}
+
+/** Options for a tolerant container's children: a Union's members decode strictly by kind. */
+const childOptions = (
+  container: TolerantContainer,
+  deeper: DeepSubstitutionOptions | undefined,
+): DeepSubstitutionOptions | undefined =>
+  container.isUnion ? { ...deeper, strictWireKind: true } : deeper
 
 /**
  * Recursively determine whether a schema contains — at any depth reachable
@@ -900,10 +1045,10 @@ export interface DeepSubstitutionOptions {
  * `RedactedFromValue`). Returns false for schemas that don't, so
  * {@link substituteSchemaDeep} can return them unchanged (zero structural churn).
  *
- * Optional / union members are intentionally NOT traversed — reconstructing a
- * `Schema.optional(Class)` while preserving the nested class is not reliably
- * supported, so such fields are left exactly as the caller declared them (same
- * as the pre-existing behavior).
+ * Optional wrappers are unwrapped to their real inner schema. Under
+ * `tolerantTransforms` the walk also enters `Union` members, `Record` values and
+ * `Tuple` elements (see `tolerantContainer`); without it those are left exactly
+ * as declared, as they always have been for entity schemas.
  */
 const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOptions): boolean => {
   if (schema == null || (schema as { readonly ast?: unknown }).ast == null) return false
@@ -920,6 +1065,7 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
       ? {
           ...(opts?.tolerantTransforms ? { tolerantTransforms: true } : {}),
           ...(opts?.resolveRef ? { resolveRef: opts.resolveRef } : {}),
+          ...(opts?.strictWireKind ? { strictWireKind: true } : {}),
         }
       : undefined
   // Optional wrapper FIRST — unwrap to the REAL inner before the leaf / array /
@@ -936,6 +1082,13 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   // Any other leaf transform, tolerant mode only — same reason as the date
   // case: after a mutation the field may hold either form (#116).
   if (opts?.tolerantTransforms && isLeafEncodingTransform(schema)) return true
+  if (opts?.tolerantTransforms) {
+    const container = tolerantContainer(schema)
+    if (container !== undefined) {
+      const childOpts = childOptions(container, deeper)
+      return container.children.some((child) => needsDeepSubstitution(child, childOpts))
+    }
+  }
   if (isArraySchema(schema)) {
     const element = arrayElementOf(schema)
     return element !== undefined && needsDeepSubstitution(element, deeper)
@@ -987,6 +1140,7 @@ export const substituteSchemaDeep = (
       ? {
           ...(opts?.tolerantTransforms ? { tolerantTransforms: true } : {}),
           ...(opts?.resolveRef ? { resolveRef: opts.resolveRef } : {}),
+          ...(opts?.strictWireKind ? { strictWireKind: true } : {}),
         }
       : undefined
 
@@ -1001,15 +1155,16 @@ export const substituteSchemaDeep = (
   }
 
   // Leaf: self-date schema → tolerant bidirectional date transform.
+  const dateOptions = { strictWireKind: opts?.strictWireKind }
   if (isSelfDateSchema(schema)) {
     const encoding = getEncoding(schema) ?? inferDefaultEncoding(schema)
-    return encoding ? buildDateTransform(encoding) : schema
+    return encoding ? buildDateTransform(encoding, dateOptions) : schema
   }
   // Leaf: Pattern B transform date schema (only under `tolerantTransforms`) →
   // tolerant date transform whose decode also accepts the already-domain value.
   if (opts?.tolerantTransforms && isDateTransform(schema)) {
     const encoding = getEncoding(schema) ?? inferDefaultEncoding(schema)
-    if (encoding) return buildDateTransform(encoding)
+    if (encoding) return buildDateTransform(encoding, dateOptions)
   }
   // Leaf: RedactedFromValue → tolerant Redacted transform.
   const redactedInner = tryGetRedactedInner(schema)
@@ -1022,6 +1177,18 @@ export const substituteSchemaDeep = (
   // still walked rather than swallowed (#116).
   if (opts?.tolerantTransforms && isLeafEncodingTransform(schema)) {
     return buildTolerantTransform(schema)
+  }
+
+  // Union / Record / Tuple / *WithRest (only under `tolerantTransforms`):
+  // substitute every child, rebuild the same container kind (#133).
+  if (opts?.tolerantTransforms) {
+    const container = tolerantContainer(schema)
+    if (container !== undefined) {
+      const childOpts = childOptions(container, deeper)
+      return container.rebuild(
+        container.children.map((child) => substituteSchemaDeep(child, childOpts)),
+      )
+    }
   }
 
   // Array: substitute the element schema.

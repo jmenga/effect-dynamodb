@@ -211,3 +211,96 @@ describe("substituteSchemaDeep", () => {
     )
   })
 })
+
+describe("substituteSchemaDeep — Union / Record / Tuple containers (#133)", () => {
+  const tolerant = { tolerantTransforms: true } as const
+  const ISO = "2000-01-01T00:00:00.000Z"
+  const MS = 946684800000
+  const dt = DateTime.makeUnsafe(MS)
+  const roundTrip = (schema: Schema.Top, wire: unknown) =>
+    Effect.gen(function* () {
+      const sub = substituteSchemaDeep(schema, tolerant) as Schema.Codec<any>
+      const fromWire = yield* Schema.decodeUnknownEffect(sub)(wire)
+      // A tolerant decode accepts its own output (the update path) …
+      const again = yield* Schema.decodeUnknownEffect(sub)(fromWire)
+      // … and encodes it back to the same wire form.
+      const back = yield* Schema.encodeUnknownEffect(sub)(again)
+      return { fromWire, back }
+    })
+
+  it("leaves these containers untouched without tolerantTransforms (entity derivation)", () => {
+    for (const schema of [
+      Schema.NullOr(Schema.DateTimeUtc),
+      Schema.Record(Schema.String, Schema.DateTimeUtc),
+      Schema.Tuple([Schema.String, Schema.DateTimeUtc]),
+      Schema.Union([Coach, Schema.String]),
+    ]) {
+      expect(substituteSchemaDeep(schema as Schema.Top)).toBe(schema)
+    }
+  })
+
+  it("returns a container with nothing to substitute unchanged", () => {
+    const plain = Schema.NullOr(Schema.String)
+    expect(substituteSchemaDeep(plain, tolerant)).toBe(plain)
+    const literals = Schema.Literals(["a", "b"])
+    expect(substituteSchemaDeep(literals, tolerant)).toBe(literals)
+  })
+
+  it.effect("NullOr(self date) decodes the wire string and re-encodes it", () =>
+    Effect.gen(function* () {
+      const { fromWire, back } = yield* roundTrip(Schema.NullOr(Schema.DateTimeUtc), ISO)
+      expect(DateTime.isDateTime(fromWire)).toBe(true)
+      expect(back).toBe(ISO)
+      expect((yield* roundTrip(Schema.NullOr(Schema.DateTimeUtc), null)).back).toBe(null)
+    }),
+  )
+
+  it.effect("Record and Tuple values are substituted in place", () =>
+    Effect.gen(function* () {
+      const rec = yield* roundTrip(Schema.Record(Schema.String, Schema.DateTimeUtcFromString), {
+        a: ISO,
+      })
+      expect(DateTime.isDateTime((rec.fromWire as any).a)).toBe(true)
+      expect(rec.back).toEqual({ a: ISO })
+      const tup = yield* roundTrip(Schema.Tuple([Schema.String, Schema.DateTimeUtcFromString]), [
+        "x",
+        ISO,
+      ])
+      expect(DateTime.isDateTime((tup.fromWire as any)[1])).toBe(true)
+      expect(tup.back).toEqual(["x", ISO])
+    }),
+  )
+
+  it.effect("a union member keeps its class and decodes its nested date", () =>
+    Effect.gen(function* () {
+      const wire = { id: "c1", joinedAt: ISO, dob: ISO }
+      const { fromWire, back } = yield* roundTrip(Schema.Union([Coach, Schema.String]), wire)
+      expect(fromWire).toBeInstanceOf(Coach)
+      expect(back).toEqual(wire)
+      expect((yield* roundTrip(Schema.Union([Coach, Schema.String]), "none")).back).toBe("none")
+    }),
+  )
+
+  it.effect("keeps union checks", () =>
+    Effect.gen(function* () {
+      const checked = Schema.NullOr(Schema.DateTimeUtcFromString).check(
+        Schema.makeFilter((v) => v !== null || "no nulls"),
+      )
+      const sub = substituteSchemaDeep(checked, tolerant) as Schema.Codec<any>
+      const result = yield* Effect.flip(Schema.decodeUnknownEffect(sub)(null))
+      expect(result._tag).toBe("SchemaError")
+    }),
+  )
+
+  it.effect("a date member under a union only claims its own wire kind", () =>
+    Effect.gen(function* () {
+      const sub = substituteSchemaDeep(
+        Schema.Union([Schema.DateTimeUtcFromString, Schema.Number]),
+        tolerant,
+      ) as Schema.Codec<any>
+      expect(yield* Schema.decodeUnknownEffect(sub)(5)).toBe(5)
+      expect(DateTime.isDateTime(yield* Schema.decodeUnknownEffect(sub)(ISO))).toBe(true)
+      expect(yield* Schema.decodeUnknownEffect(sub)(dt)).toBe(dt)
+    }),
+  )
+})
