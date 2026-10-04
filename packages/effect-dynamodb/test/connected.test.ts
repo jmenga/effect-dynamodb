@@ -14494,4 +14494,89 @@ describeConnected("#133 — path operations on index composites and unique field
       }).pipe(Effect.provide(g133RaceLayer), g133Closed),
     )
   }
+
+  // ---- the retain path update returns its own post-image ----
+
+  it.effect("returns our post-image although a later retain write replaced it", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const id = "post"
+      yield* db.entities.DevicesRetained.put({
+        id,
+        owner: "alice",
+        reading: "r1",
+        seq: 1,
+        label: "l",
+      } as any)
+      const client = yield* DynamoClient
+      let ours: Record<string, any> | undefined
+      g133Inject.after = g133Hook(
+        Effect.gen(function* () {
+          // The item exactly as our update left it, then another retain write.
+          ours = (yield* client.getItem({
+            TableName: g133Tables.record,
+            Key: mainKey("G133DeviceRetained", id),
+            ConsistentRead: true,
+          })).Item
+          const other = yield* g133Client
+          yield* (other.entities.DevicesRetained as any).update({ id }).set({ label: "theirs" })
+        }).pipe(Effect.provide(g133Layer(g133Tables.record))),
+      )
+      const native = yield* Entity.asNative(
+        Entity.pathSet((G133Devices.retained as any).update({ id }), {
+          segments: ["label"],
+          value: "m",
+          isPath: false,
+        }),
+      )
+      expect(ours?.label).toEqual({ S: "m" })
+      expect(native).toEqual(ours)
+      const live = yield* db.entities.DevicesRetained.get({ id } as any)
+      expect((live as any).label).toBe("theirs")
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("returns the model of our post-image, and fails clearly once it is gone", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const id = "post2"
+      yield* db.entities.DevicesRetained.put({ id, owner: "alice", label: "l" } as any)
+      g133Inject.after = g133Hook(
+        Effect.gen(function* () {
+          const other = yield* g133Client
+          yield* (other.entities.DevicesRetained as any).update({ id }).set({ label: "theirs" })
+        }).pipe(Effect.provide(g133Layer(g133Tables.record))),
+      )
+      const mine = (yield* (db.entities.DevicesRetained as any)
+        .update({ id })
+        .pathSet({ segments: ["label"], value: "m", isPath: false })) as any
+      expect(mine.label).toBe("m")
+
+      // A writer that leaves no snapshot (a raw write) — nothing exact to return.
+      g133Inject.after = g133Hook(bumpVersion("G133DeviceRetained", id, "raw"))
+      const error = yield* (db.entities.DevicesRetained as any)
+        .update({ id })
+        .pathSet({ segments: ["label"], value: "n", isPath: false })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("DynamoError")
+      expect(String(error.cause)).toContain("no version 4 snapshot")
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("returnValues('allOld') returns the item the update replaced", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      for (const [id, build] of [
+        ["old-path", (u: any) => u.pathSet({ segments: ["label"], value: "m", isPath: false })],
+        ["old-record", (u: any) => u.set({ label: "m" })],
+      ] as const) {
+        yield* db.entities.DevicesRetained.put({ id, owner: "alice", label: "l" } as any)
+        const old = (yield* build((db.entities.DevicesRetained as any).update({ id })).returnValues(
+          "allOld",
+        )) as any
+        expect([id, old.label, old.version]).toEqual([id, "l", 1])
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
 })

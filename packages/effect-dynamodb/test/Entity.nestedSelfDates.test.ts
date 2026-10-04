@@ -67,7 +67,18 @@ const InMemoryClient = mockDynamoClientLayer({
           writes.push({ op: "Delete", input: op.Delete })
           store.delete(keyOf(op.Delete.Key))
         }
-        if (op.Update) writes.push({ op: "Update", input: op.Update })
+        if (op.Update) {
+          writes.push({ op: "Update", input: op.Update })
+          // Only the version increment is emulated: a retain update reads its
+          // item back and recognises it by version.
+          const prior = store.get(keyOf(op.Update.Key))
+          if (prior?.version?.N !== undefined) {
+            store.set(keyOf(op.Update.Key), {
+              ...prior,
+              version: { N: String(Number(prior.version.N) + 1) },
+            })
+          }
+        }
         if (op.ConditionCheck) writes.push({ op: "Check", input: op.ConditionCheck })
       }
       return {} as any

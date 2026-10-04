@@ -815,3 +815,106 @@ describe("#133 condition failures distinguish a version race from the user condi
     )
   }
 })
+
+// ---------------------------------------------------------------------------
+// Exact retain post-image
+// ---------------------------------------------------------------------------
+
+describe("#133 retain path update returns its own post-image", () => {
+  const seed = { id: "d1", owner: "alice", reading: "r1", seq: 1, label: "l" }
+  const mainKey = "$gpo#v1#deviceretained#id_d1|$gpo#v1#deviceretained"
+  const ours = (label: string): Item => {
+    const main = store.get(mainKey)!
+    return { ...main, label: { S: label }, version: { N: "2" } }
+  }
+
+  it.effect("the current item when no one wrote after us", () =>
+    Effect.gen(function* () {
+      const result = yield* runUpdate("DevicesRetained", seed, (u) => {
+        afterTransact = () => store.set(mainKey, ours("m"))
+        return u.pathSet({ segments: ["label"], value: "m", isPath: false })
+      })
+      expect(failureOf(result.exit)).toBeUndefined()
+      expect((result.exit as any).value.label).toBe("m")
+    }).pipe(Effect.provide(TestLayer), closed),
+  )
+
+  it.effect("the snapshot a later writer took of our post-image", () =>
+    Effect.gen(function* () {
+      const result = yield* runUpdate("DevicesRetained", seed, (u) => {
+        afterTransact = () => {
+          const post = ours("m")
+          const { gsi1pk, gsi1sk, ...snapshot } = post
+          void gsi1pk
+          void gsi1sk
+          store.set(`${post.pk!.S}|$gpo#v1#deviceretained#v#0000002`, {
+            ...snapshot,
+            sk: { S: "$gpo#v1#deviceretained#v#0000002" },
+          })
+          store.set(mainKey, { ...post, label: { S: "theirs" }, version: { N: "3" } })
+        }
+        return u.pathSet({ segments: ["label"], value: "m", isPath: false })
+      })
+      expect(failureOf(result.exit)).toBeUndefined()
+      expect((result.exit as any).value.label).toBe("m")
+    }).pipe(Effect.provide(TestLayer), closed),
+  )
+
+  it.effect("native mode restores the keys of the post-image", () =>
+    Effect.gen(function* () {
+      const client = yield* db
+      yield* client.entities.DevicesRetained.put(seed as any)
+      const before = store.get(mainKey)!
+      afterTransact = () => {
+        const post = ours("m")
+        const { gsi1pk, gsi1sk, ...snapshot } = post
+        void gsi1pk
+        void gsi1sk
+        store.set(`${post.pk!.S}|$gpo#v1#deviceretained#v#0000002`, {
+          ...snapshot,
+          sk: { S: "$gpo#v1#deviceretained#v#0000002" },
+        })
+        store.set(mainKey, { ...post, label: { S: "theirs" }, version: { N: "3" } })
+      }
+      const native = (yield* Entity.asNative(
+        Entity.pathSet((Devices.retained as any).update({ id: "d1" }), {
+          segments: ["label"],
+          value: "m",
+          isPath: false,
+        }),
+      )) as Record<string, AttributeValue>
+      expect(native.label).toEqual({ S: "m" })
+      expect(native.sk).toEqual(before.sk)
+      expect(native.gsi1pk).toEqual(before.gsi1pk)
+      expect(native.gsi1sk).toEqual(before.gsi1sk)
+    }).pipe(Effect.provide(TestLayer), closed),
+  )
+
+  it.effect("a clear error when the post-image is gone", () =>
+    Effect.gen(function* () {
+      const result = yield* runUpdate("DevicesRetained", seed, (u) => {
+        afterTransact = () =>
+          store.set(mainKey, { ...ours("m"), label: { S: "theirs" }, version: { N: "3" } })
+        return u.pathSet({ segments: ["label"], value: "m", isPath: false })
+      })
+      const error = failureOf(result.exit)
+      expect(error?._tag).toBe("DynamoError")
+      expect(String(error?.cause)).toContain("version 2")
+    }).pipe(Effect.provide(TestLayer), closed),
+  )
+
+  it.effect("returnValues('allOld') returns the item the update replaced", () =>
+    Effect.gen(function* () {
+      for (const build of [
+        (u: Builder) => u.pathSet({ segments: ["label"], value: "m", isPath: false }),
+        (u: Builder) => u.set({ label: "m" }),
+      ]) {
+        const result = yield* runUpdate("DevicesRetained", seed, (u) => {
+          afterTransact = () => store.set(mainKey, ours("m"))
+          return build(u).returnValues("allOld")
+        })
+        expect((result.exit as any).value.label).toBe("l")
+      }
+    }).pipe(Effect.provide(TestLayer), closed),
+  )
+})

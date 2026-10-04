@@ -23,6 +23,7 @@ import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import {
   CascadePartialFailure,
   ConditionalCheckFailed,
+  DynamoError,
   EmbeddingError,
   ItemNotFound,
   isAwsConditionalCheckFailed,
@@ -2687,6 +2688,74 @@ const makeImpl = <
   }
 
   /**
+   * The item a retain path update wrote, read back after its transaction
+   * (#133). The live item is it while its version is `ourVersion`. A later
+   * retain write snapshots the item it replaces, so once the live item has
+   * moved on, our post-image is the `v#<ourVersion>` snapshot — minus what a
+   * snapshot strips (index and vector attributes) or adds (its sort key and
+   * TTL): those are restored from the item we replaced plus this update's own
+   * writes to them. Without that snapshot there is nothing exact to return.
+   */
+  const readRetainPostImage = (
+    tableName: string,
+    marshalledKey: globalThis.Record<string, AttributeValue>,
+    replaced: globalThis.Record<string, AttributeValue>,
+    ourVersion: number,
+    derivedSets: globalThis.Record<string, AttributeValue>,
+    derivedRemoves: ReadonlySet<string>,
+    ttlAttrName: string,
+  ) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const versionField = systemFields.version
+      const current = (yield* client.getItem({
+        TableName: tableName,
+        Key: marshalledKey,
+        ConsistentRead: true,
+      })).Item
+      const currentVersion =
+        current !== undefined && versionField
+          ? Number((current[versionField] as { readonly N?: string } | undefined)?.N)
+          : undefined
+      if (!versionField || currentVersion === ourVersion) return current
+      const skField = config.indexes.primary.sk.field
+      const snapshotKey = {
+        ...marshalledKey,
+        [skField]: toAttributeValue(DynamoSchema.composeVersionKey(schema, entityType, ourVersion)),
+      }
+      const snapshot = (yield* client.getItem({
+        TableName: tableName,
+        Key: snapshotKey,
+        ConsistentRead: true,
+      })).Item
+      if (snapshot === undefined) {
+        return yield* new DynamoError({
+          operation: "update",
+          cause: new Error(
+            `${entityType} update applied as version ${ourVersion}, but another write replaced ` +
+              `the item before it could be read back and left no version ${ourVersion} ` +
+              "snapshot to read it from.",
+          ),
+        })
+      }
+      const post: globalThis.Record<string, AttributeValue> = { ...snapshot }
+      post[skField] = marshalledKey[skField]!
+      const restored = [
+        ...gsiKeyFields(),
+        ...vectorKeyFields(),
+        ...vectorIndexEntries.map(([, definition]) => definition.stashField),
+        ...(retainTtl() ? [ttlAttrName] : []),
+      ]
+      for (const field of restored) {
+        delete post[field]
+        if (replaced[field] !== undefined) post[field] = replaced[field]
+      }
+      Object.assign(post, derivedSets)
+      for (const field of derivedRemoves) delete post[field]
+      return post
+    })
+
+  /**
    * Build a version snapshot item: same PK, version SK, stripped GSI keys,
    * keeps __edd_e__ for entity type filtering.
    *
@@ -4152,6 +4221,14 @@ const makeImpl = <
               }
             }
 
+            // `allOld`: the item this write replaced — the one read above.
+            if (uState.returnValues === "allOld") {
+              return yield* decodeAs(
+                fromAttributeMap(currentResult.Item) as globalThis.Record<string, unknown>,
+                currentResult.Item,
+                mode,
+              )
+            }
             return retainDecoded
           }
 
@@ -4377,17 +4454,23 @@ const makeImpl = <
             keyForm(encodedKey as globalThis.Record<string, unknown>),
             removedSet === undefined ? {} : { removedSet },
           )
+          // The key and vector attributes this update writes — a retain
+          // snapshot strips them, so the post-image is rebuilt from these.
+          const derivedSets: globalThis.Record<string, AttributeValue> = {}
+          const derivedRemoves = new Set<string>()
           for (const [field, value] of Object.entries(gsiUpdate.sets)) {
             const nameKey = `#u${counter}`
             const valKey = `:u${counter}`
             names[nameKey] = field
             values[valKey] = toAttributeValue(value)
+            derivedSets[field] = values[valKey]
             setClauses.push(`${nameKey} = ${valKey}`)
             counter++
           }
           for (const keyField of gsiUpdate.removes) {
             const nameKey = `#r${removeClauses.length}`
             names[nameKey] = keyField
+            derivedRemoves.add(keyField)
             removeClauses.push(nameKey)
           }
 
@@ -4408,6 +4491,7 @@ const makeImpl = <
               const valKey = `:u${counter}`
               names[nameKey] = field
               values[valKey] = toAttributeValue(value)
+              derivedSets[field] = values[valKey]
               setClauses.push(`${nameKey} = ${valKey}`)
               counter++
             }
@@ -4416,6 +4500,7 @@ const makeImpl = <
             for (const field of new Set(vectorWrite.removes)) {
               const nameKey = `#r${removeClauses.length}`
               names[nameKey] = field
+              derivedRemoves.add(field)
               removeClauses.push(nameKey)
             }
           }
@@ -4731,16 +4816,23 @@ const makeImpl = <
                 },
               ),
             )
-            // A transacted Update returns no attributes: read the new item, as
-            // the record-based retain branch returns the full new item.
+            // A transacted Update returns no attributes. `allOld` is exact: the
+            // version condition proves `snapshot.raw` is what it replaced. The
+            // new item is read back — and since another writer may have
+            // replaced it since, it is ours only at our version; otherwise the
+            // later writer's own snapshot of the item it replaced is ours.
             const after =
               uState.returnValues === "allOld"
                 ? snapshot.raw
-                : (yield* client.getItem({
-                    TableName: tableName,
-                    Key: marshalledKey,
-                    ConsistentRead: true,
-                  })).Item
+                : yield* readRetainPostImage(
+                    tableName,
+                    marshalledKey,
+                    snapshot.raw,
+                    snapshot.version + 1,
+                    derivedSets,
+                    derivedRemoves,
+                    ttlAttrName,
+                  )
             if (!after) return yield* new ItemNotFound({ entityType, key: encodedKey })
             const retained = yield* decodeAs(fromAttributeMap(after), after, mode)
             if (uState.cascade) {
