@@ -932,6 +932,43 @@ const manyElementFields = (
   return element === undefined ? undefined : getSchemaFields(element)
 }
 
+/**
+ * A sub-aggregate nested in another inherits its parent's discriminator, and
+ * its rows carry both (#133). Re-using an inherited attribute name would
+ * overwrite the parent's value on the inner rows: the two bindings of the
+ * parent would then key and assemble the inner sub-aggregate identically.
+ * Refused at `make()` time, naming the edge, rather than surfacing as a
+ * key collision or a mis-assembly at runtime.
+ */
+const validateNestedDiscriminators = (
+  aggregateName: string,
+  edges: Record<string, AggregateEdge | BoundSubAggregate<any>>,
+  inherited: ReadonlyMap<string, string> = new Map(),
+  path: ReadonlyArray<string> = [],
+): void => {
+  for (const [edgeName, edge] of Object.entries(edges)) {
+    if (!("_tag" in edge) || edge._tag !== "BoundSubAggregate") continue
+    const bound = edge as BoundSubAggregate<any>
+    const here = [...path, edgeName]
+    const own = Object.keys(bound.discriminator ?? {})
+    for (const attr of own) {
+      const owner = inherited.get(attr)
+      if (owner !== undefined) {
+        throw new Error(
+          `[EDD-9056] Aggregate "${aggregateName}": the sub-aggregate at "${here.join(".")}" ` +
+            `declares discriminator "${attr}", which it already inherits from "${owner}". ` +
+            `A nested sub-aggregate's rows carry every enclosing discriminator, so the inner ` +
+            `value would overwrite the outer one. Give the nested binding a distinct attribute ` +
+            `name (e.g. { squadNo: 1 } inside { clubNo: 1 }).`,
+        )
+      }
+    }
+    const next = new Map(inherited)
+    for (const attr of own) next.set(attr, here.join("."))
+    validateNestedDiscriminators(aggregateName, bound.aggregate.edges, next, here)
+  }
+}
+
 /** The structural slice of an edge's target entity that ref resolution reads. */
 interface RefTargetEntity {
   readonly model?: Schema.Top
@@ -1082,6 +1119,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
     // annotation conflict is checked.
     validateNoTransformOverride(schemaFields, {})
   }
+
+  validateNestedDiscriminators(aggregateName, config.edges)
 
   // Ref fields whose target the schema walker must be told about (see
   // `collectRefTargets`). Keyed by the field SCHEMA, not its name: the resolver
@@ -1906,6 +1945,16 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
       } else if (edge._tag === "BoundSubAggregate") {
         const bound = edge as BoundSubAggregate<any>
         const subFields = fieldsOf(bound.aggregate.schema)
+        // A sub-aggregate nested in another inherits its parent's discriminator,
+        // exactly as a `one` edge does: its rows carry the parent's attributes
+        // (`clubNo`) as well as their own (`squadNo`), so assembly — which
+        // matches on the merged set — can tell the two bindings of the parent
+        // apart. At the top level there is no parent discriminator and this is
+        // `bound.discriminator`, as before.
+        const inherited =
+          discriminator === undefined
+            ? bound.discriminator
+            : { ...discriminator, ...bound.discriminator }
         const subChildren = resolveNode({
           fieldName: field,
           entityType: bound.aggregate.root.entityType,
@@ -1913,7 +1962,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
           edges: bound.aggregate.edges,
           parentFields: subFields,
           resolveRef,
-          discriminator: bound.discriminator,
+          discriminator: inherited,
           ownDiscriminator: bound.discriminator,
           // The sub-aggregate root item carries the sub-schema's own (non-edge)
           // fields; its child edges get their own encoders via recursion.
@@ -2680,14 +2729,22 @@ const decomposeNode = (
     if (node.cardinality === "one" && node.children.length > 0) {
       // Sub-aggregate — becomes its own transaction group
       const subValue = value as Record<string, unknown>
-      const txGroup = node.fieldName ?? node.entityType
+      // A nested sub-aggregate is its own transaction group, named by its path
+      // (`club2.squad`) so the two bindings of its parent stay distinct groups.
+      const ownName = node.fieldName ?? node.entityType
+      const txGroup = parentGroup === "root" ? ownName : `${parentGroup}.${ownName}`
 
-      // Discriminator values for SK composition (name#value pairs from own discriminator)
-      const discValues = node.ownDiscriminator
-        ? Object.entries(node.ownDiscriminator)
-            .filter(([, v]) => typeof v !== "function")
-            .flatMap(([k, v]) => [k, KeyComposer.serializeValue(v)])
-        : []
+      // Discriminator values for SK composition: the parent sub-aggregate's
+      // (name#value pairs, empty at the top level) then this node's own, so a
+      // nested sub-aggregate's rows are keyed apart per binding of its parent.
+      const discValues = [
+        ...parentDiscriminatorValues,
+        ...(node.ownDiscriminator
+          ? Object.entries(node.ownDiscriminator)
+              .filter(([, v]) => typeof v !== "function")
+              .flatMap(([k, v]) => [k, KeyComposer.serializeValue(v)])
+          : []),
+      ]
 
       // Sub-aggregate root item: fields not claimed by child edges
       const childEdgeNames = new Set(node.children.map((c) => c.fieldName).filter(Boolean))

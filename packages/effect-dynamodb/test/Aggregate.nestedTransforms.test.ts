@@ -81,6 +81,18 @@ const InMemoryClient = mockDynamoClientLayer({
       const pk = (input.ExpressionAttributeValues?.[":pk"] as { S?: string } | undefined)?.S
       return { Items: [...store.values()].filter((item) => item.pk?.S === pk) } as any
     }),
+  batchWriteItem: (input) =>
+    Effect.sync(() => {
+      for (const requests of Object.values(input.RequestItems ?? {})) {
+        for (const request of requests) {
+          if (request.DeleteRequest?.Key) store.delete(keyOf(request.DeleteRequest.Key))
+          if (request.PutRequest?.Item) {
+            store.set(keyOf(request.PutRequest.Item), request.PutRequest.Item as Item)
+          }
+        }
+      }
+      return {} as any
+    }),
 })
 
 beforeEach(() => {
@@ -1260,5 +1272,203 @@ describe("#133 nested transforms — legacy domain-form numbers", () => {
       expect(after.big).toEqual(S("6"))
       expect(after.bigs).toEqual({ L: [S("7"), S("12345678901234567890")] })
     }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// A sub-aggregate nested inside a sub-aggregate
+// ---------------------------------------------------------------------------
+
+class SquadSession extends Schema.Class<SquadSession>("SquadSession")({
+  at: Schema.DateTimeUtcFromString,
+}) {}
+class SquadPlayer extends Schema.Class<SquadPlayer>("SquadPlayer")({
+  player: Player,
+  sessions: Schema.Array(SquadSession),
+}) {}
+class Squad extends Schema.Class<Squad>("Squad")({
+  name: Schema.String,
+  days: Schema.Array(Schema.DateTimeUtcFromString),
+  players: Schema.Array(SquadPlayer),
+}) {}
+class Club extends Schema.Class<Club>("Club")({
+  name: Schema.String,
+  coach: Coach.pipe(DynamoModel.ref),
+  squad: Squad,
+}) {}
+class League extends Schema.Class<League>("League")({
+  id: Schema.String,
+  club1: Club,
+  club2: Club,
+}) {}
+
+const SquadAggregate = Aggregate.make(Squad, {
+  root: { entityType: "LeagueSquad" },
+  edges: {
+    players: Aggregate.many("players", { entityType: "LeagueSquadPlayer", entity: Players }),
+  },
+})
+const ClubAggregate = Aggregate.make(Club, {
+  root: { entityType: "LeagueClub" },
+  edges: {
+    coach: Aggregate.one("coach", { entityType: "LeagueCoach", entity: Coaches }),
+    squad: SquadAggregate.with({ discriminator: { squadNo: 1 } }),
+  },
+})
+const LeagueAggregate = Aggregate.make(League, {
+  table: ReproTable,
+  schema: ReproSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "league" },
+  root: { entityType: "LeagueItem" },
+  edges: {
+    club1: ClubAggregate.with({ discriminator: { clubNo: 1 } }),
+    club2: ClubAggregate.with({ discriminator: { clubNo: 2 } }),
+  },
+})
+
+const leagueInput = {
+  id: "l1",
+  club1: {
+    name: "One",
+    coachId: "coach-1",
+    squad: {
+      name: "A",
+      days: [DOB],
+      players: [{ playerId: "player-1", sessions: [{ at: DOB }] }],
+    },
+  },
+  club2: {
+    name: "Two",
+    coachId: "coach-2",
+    squad: {
+      name: "B",
+      days: [DAY2],
+      players: [{ playerId: "player-2", sessions: [{ at: DAY2 }] }],
+    },
+  },
+}
+
+const leagueKeys = () =>
+  [...store.values()]
+    .filter((i) => i.pk?.S === "$issue133#v1#league#l1")
+    .map((i) => `${i.__edd_e__?.S} ${i.sk?.S}`)
+    .sort()
+
+describe("#133 nested sub-aggregates", () => {
+  it.effect("create writes each binding's inner sub-aggregate under its own keys", () =>
+    Effect.gen(function* () {
+      yield* seed
+      yield* LeagueAggregate.create(leagueInput as any)
+      expect(leagueKeys()).toEqual([
+        "LeagueClub $issue133#v1#leagueclub#clubno#0000000000000001",
+        "LeagueClub $issue133#v1#leagueclub#clubno#0000000000000002",
+        "LeagueCoach $issue133#v1#leaguecoach#clubno#0000000000000001",
+        "LeagueCoach $issue133#v1#leaguecoach#clubno#0000000000000002",
+        "LeagueItem $issue133#v1#leagueitem",
+        "LeagueSquad $issue133#v1#leaguesquad#clubno#0000000000000001#squadno#0000000000000001",
+        "LeagueSquad $issue133#v1#leaguesquad#clubno#0000000000000002#squadno#0000000000000001",
+        "LeagueSquadPlayer $issue133#v1#leaguesquadplayer#clubno#0000000000000001#squadno#0000000000000001#player-1",
+        "LeagueSquadPlayer $issue133#v1#leaguesquadplayer#clubno#0000000000000002#squadno#0000000000000001#player-2",
+      ])
+      const squad = [...store.values()].find(
+        (i) => i.__edd_e__?.S === "LeagueSquad" && i.clubNo?.N === "2",
+      )!
+      expect(squad.squadNo).toEqual({ N: "1" })
+      expect(squad.days).toEqual({ L: [S(DAY2)] })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("get assembles both levels with real DateTimes", () =>
+    Effect.gen(function* () {
+      yield* seed
+      yield* LeagueAggregate.create(leagueInput as any)
+      const got = (yield* LeagueAggregate.get({ id: "l1" } as any)) as League
+      expect(got.club1.name).toBe("One")
+      expect(got.club2.squad.name).toBe("B")
+      expect(got.club2.squad).toBeInstanceOf(Squad)
+      expect(isRealUtc(got.club1.coach.dateOfBirth, DOB_MS)).toBe(true)
+      expect(isRealUtc(got.club2.squad.days[0], DAY2_MS)).toBe(true)
+      expect(got.club2.squad.players[0]!.player.id).toBe("player-2")
+      expect(isRealUtc(got.club2.squad.players[0]!.sessions[0]!.at, DAY2_MS)).toBe(true)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("update rewrites only the inner group that changed", () =>
+    Effect.gen(function* () {
+      yield* seed
+      yield* LeagueAggregate.create(leagueInput as any)
+      transactCalls.length = 0
+      yield* LeagueAggregate.update({ id: "l1" } as any, (c: any) => c.state)
+      expect(transactCalls).toHaveLength(0)
+
+      yield* LeagueAggregate.update({ id: "l1" } as any, (c: any) => ({
+        ...c.state,
+        club2: { ...c.state.club2, squad: { ...c.state.club2.squad, name: "B2" } },
+      }))
+      expect(transactCalls).toHaveLength(1)
+      const written = transactCalls[0]!.map((op) => op.Put?.Item?.__edd_e__?.S).sort()
+      expect(written).toEqual(["LeagueSquad", "LeagueSquadPlayer"])
+      const got = (yield* LeagueAggregate.get({ id: "l1" } as any)) as League
+      expect(got.club2.squad.name).toBe("B2")
+      expect(got.club1.squad.name).toBe("A")
+
+      // Removing an inner element deletes its row.
+      yield* LeagueAggregate.update({ id: "l1" } as any, (c: any) => ({
+        ...c.state,
+        club1: { ...c.state.club1, squad: { ...c.state.club1.squad, players: [] } },
+      }))
+      expect(leagueKeys()).toHaveLength(8)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("delete removes every level", () =>
+    Effect.gen(function* () {
+      yield* seed
+      yield* LeagueAggregate.create(leagueInput as any)
+      yield* LeagueAggregate.delete({ id: "l1" } as any)
+      expect(leagueKeys()).toEqual([])
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it("rejects a nested binding that reuses an inherited discriminator attribute", () => {
+    const Inner = Aggregate.make(Squad, {
+      root: { entityType: "ClashSquad" },
+      edges: {
+        players: Aggregate.many("players", { entityType: "ClashPlayer", entity: Players }),
+      },
+    })
+    const Outer = Aggregate.make(Club, {
+      root: { entityType: "ClashClub" },
+      edges: {
+        coach: Aggregate.one("coach", { entityType: "ClashCoach", entity: Coaches }),
+        squad: Inner.with({ discriminator: { clubNo: 9 } }),
+      },
+    })
+    expect(() =>
+      Aggregate.make(League, {
+        table: ReproTable,
+        schema: ReproSchema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: { name: "clash" },
+        root: { entityType: "ClashLeague" },
+        edges: {
+          club1: Outer.with({ discriminator: { clubNo: 1 } }),
+          club2: Outer.with({ discriminator: { clubNo: 2 } }),
+        },
+      }),
+    ).toThrow(/EDD-9056/)
+  })
+})
+
+describe("#133 nested sub-aggregates — derived input schema", () => {
+  it.effect("accepts the nested create payload, with ref ids at both levels", () =>
+    Effect.gen(function* () {
+      const decoded = (yield* Schema.decodeUnknownEffect(LeagueAggregate.inputSchema as any)(
+        leagueInput,
+      )) as any
+      expect(decoded.club2.coachId).toBe("coach-2")
+      expect(decoded.club2.squad.players[0].playerId).toBe("player-2")
+    }),
   )
 })
