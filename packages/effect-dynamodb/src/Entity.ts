@@ -705,12 +705,16 @@ export interface Entity<
   readonly _multiItemWriteFeatures: ReadonlyArray<"unique" | "retain" | "softDelete">
 
   /**
-   * @internal The sort key prefixes of this entity's history rows — version
-   * snapshots (`retain`) and soft-delete tombstones — in any partition. They
-   * keep the entity's `__edd_e__`, so a query of the primary key or a scan
-   * filters them out (#133). Empty without `retain` or `softDelete`.
+   * @internal This entity's rows that are not items, by sort key: version
+   * snapshots (`retain`) and soft-delete tombstones by prefix, time-series
+   * event items as rows nested under a live item. They keep the entity's
+   * `__edd_e__`, so a query of the primary key or a scan leaves them out
+   * (#133). Empty without `retain`, `softDelete` or `timeSeries`.
    */
-  readonly _historySkPrefixes: () => ReadonlyArray<string>
+  readonly _historyRows: () => {
+    readonly prefixes: ReadonlyArray<string>
+    readonly nested?: { readonly under: string; readonly marker: string } | undefined
+  }
 
   /** @internal Attach model class prototype to a decoded plain object (no-op for Schema.Struct models). */
   readonly _attachPrototype: (decoded: any) => any
@@ -3765,11 +3769,143 @@ const makeImpl = <
     )
     return item === undefined ? undefined : { item }
   }
-  /** See {@link Entity._historySkPrefixes}: partition-wide, so every item's. */
-  const historySkPrefixes = (): ReadonlyArray<string> => [
-    ...(isRetainEnabled() ? [DynamoSchema.composeVersionKeyPrefix(schema, entityType)] : []),
-    ...(isSoftDeleteEnabled() ? [DynamoSchema.composeDeletedKeyPrefix(schema, entityType)] : []),
-  ]
+  /** See {@link Entity._historyRows}: partition-wide, so every item's. */
+  const historyRows = () => ({
+    prefixes: [
+      ...(isRetainEnabled() ? [DynamoSchema.composeVersionKeyPrefix(schema, entityType)] : []),
+      ...(isSoftDeleteEnabled() ? [DynamoSchema.composeDeletedKeyPrefix(schema, entityType)] : []),
+    ],
+    // Time-series events: `<liveSk>#e#<orderBy>`, the infix in the schema's casing.
+    nested:
+      config.timeSeries === undefined
+        ? undefined
+        : {
+            under: bareLiveSk(),
+            marker: KeyComposer.composeEventSkPrefix("", schema.casing),
+          },
+  })
+  /** The live sort key less its composites: what every item's begins with. */
+  const bareLiveSk = (): string =>
+    KeyComposer.composeSk(
+      schema,
+      entityType,
+      entityVersion,
+      { ...config.indexes.primary, sk: { ...config.indexes.primary.sk, composite: [] } },
+      keyForm({}),
+    )
+
+  // ---------------------------------------------------------------------------
+  // History an earlier release wrote without an item segment (#133)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Whether the entity's history keys carry an item segment — its primary sort
+   * key has composites. Only then can history an earlier release wrote, under
+   * the partition-wide keys (`#v#0000003`, `#deleted#<ts>`), be in the
+   * partition: every reader of one item's history also reads those rows, and
+   * takes the ones whose stored composites compose the item's live key. A
+   * version held both ways is read from the segmented row.
+   */
+  const hasItemHistory = config.indexes.primary.sk.composite.length > 0
+  /** Whether a stored (attribute-keyed) row is the history of the item at `liveSk`. */
+  const isItemsRow = (row: globalThis.Record<string, AttributeValue>, liveSk: string): boolean => {
+    try {
+      return liveSkOf(toDomainView(fromAttributeMap(row))) === liveSk
+    } catch {
+      return false
+    }
+  }
+  /**
+   * The item's unsegmented history rows of one kind, in sort key order (latest
+   * first with `descending`), stopping at the first with `first`. Unsegmented
+   * rows sort before every segmented one — a version or timestamp starts with
+   * a digit, a segment with a composite name — so a key range bounds them.
+   */
+  const legacyHistory = (args: {
+    readonly tableName: string
+    readonly pk: unknown
+    readonly liveSk: string
+    readonly kind: "version" | "deleted"
+    readonly descending?: boolean
+    readonly first?: boolean
+  }) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const primary = config.indexes.primary
+      const prefix =
+        args.kind === "version"
+          ? DynamoSchema.composeVersionKeyPrefix(schema, entityType)
+          : DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
+      const rows: Array<globalThis.Record<string, AttributeValue>> = []
+      let start: globalThis.Record<string, AttributeValue> | undefined
+      do {
+        const result = yield* client.query({
+          TableName: args.tableName,
+          KeyConditionExpression: "#pk = :pk AND #sk BETWEEN :lo AND :hi",
+          ExpressionAttributeNames: { "#pk": primary.pk.field, "#sk": primary.sk.field },
+          ExpressionAttributeValues: {
+            ":pk": toAttributeValue(args.pk),
+            ":lo": toAttributeValue(`${prefix}0`),
+            ":hi": toAttributeValue(`${prefix}:`),
+          },
+          ScanIndexForward: !args.descending,
+          ConsistentRead: true,
+          ExclusiveStartKey: start,
+        })
+        for (const row of result.Items ?? []) {
+          const sk = row[primary.sk.field]?.S ?? ""
+          if (sk.slice(prefix.length).includes("#") || !isItemsRow(row, args.liveSk)) continue
+          rows.push(row)
+          if (args.first) return rows
+        }
+        start = result.LastEvaluatedKey as globalThis.Record<string, AttributeValue> | undefined
+      } while (start !== undefined)
+      return rows
+    })
+  /** The version a history sort key ends with. */
+  const versionOfSk = (sk: string | undefined): number => {
+    if (sk === undefined) return 0
+    const version = Number(sk.slice(sk.lastIndexOf("#") + 1))
+    return Number.isInteger(version) ? version : 0
+  }
+  /**
+   * The item's latest tombstone — its own, or one an earlier release wrote
+   * without a segment, whichever is later (its own on a tie).
+   */
+  const latestTombstone = (tableName: string, pk: unknown, liveSk: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const primary = config.indexes.primary
+      const own = (yield* client.query({
+        TableName: tableName,
+        KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
+        ExpressionAttributeNames: { "#pk": primary.pk.field, "#sk": primary.sk.field },
+        ExpressionAttributeValues: {
+          ":pk": toAttributeValue(pk),
+          ":skPrefix": toAttributeValue(
+            DynamoSchema.composeDeletedKeyPrefix(schema, entityType, historyKeyOptions(liveSk)),
+          ),
+        },
+        Limit: 1,
+        ScanIndexForward: false,
+      })).Items?.[0]
+      if (!hasItemHistory) return own
+      const [legacy] = yield* legacyHistory({
+        tableName,
+        pk,
+        liveSk,
+        kind: "deleted",
+        descending: true,
+        first: true,
+      })
+      if (legacy === undefined) return own
+      if (own === undefined) return legacy
+      const stamp = (row: globalThis.Record<string, AttributeValue>) => {
+        const sk = row[primary.sk.field]?.S ?? ""
+        return sk.slice(sk.lastIndexOf("#") + 1)
+      }
+      return stamp(legacy) > stamp(own) ? legacy : own
+    })
   /** The live sort key of the item at `encodedKey` (the caller's key, encoded). */
   const liveSkOf = (encodedKey: unknown): string =>
     KeyComposer.composeSk(
@@ -4001,10 +4137,19 @@ const makeImpl = <
         Limit: 1,
         ConsistentRead: true,
       })
-      const sk = Items?.[0]?.[primary.sk.field]?.S
-      if (sk === undefined) return 0
-      const version = Number(sk.slice(sk.lastIndexOf("#") + 1))
-      return Number.isInteger(version) ? version : 0
+      const own = versionOfSk(Items?.[0]?.[primary.sk.field]?.S)
+      if (!hasItemHistory || typeof liveSk !== "string") return own
+      // History an earlier release wrote for this item counts too: a version it
+      // holds is never written again.
+      const [legacy] = yield* legacyHistory({
+        tableName,
+        pk,
+        liveSk,
+        kind: "version",
+        descending: true,
+        first: true,
+      })
+      return Math.max(own, versionOfSk(legacy?.[primary.sk.field]?.S))
     })
 
   /**
@@ -8232,10 +8377,7 @@ const makeImpl = <
       decoder: (raw) => decodeRecord(raw),
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
       keyFields: [config.indexes.primary.pk.field, config.indexes.primary.sk.field],
-      excludeSkPrefixes: {
-        field: config.indexes.primary.sk.field,
-        prefixes: historySkPrefixes(),
-      },
+      excludeSkPrefixes: { field: config.indexes.primary.sk.field, ...historyRows() },
     })
 
   // ---------------------------------------------------------------------------
@@ -8255,30 +8397,42 @@ const makeImpl = <
           // Compose PK + version SK
           const primary = config.indexes.primary
           const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
-          const versionSk = DynamoSchema.composeVersionKey(
-            schema,
-            entityType,
-            versionNumber,
-            historyKeyOptions(liveSkOf(encodedKey)),
+          const liveSk = liveSkOf(encodedKey)
+          const read = (versionSk: string) =>
+            client
+              .getItem({
+                TableName: tableName,
+                Key: toAttributeMap({
+                  [primary.pk.field]: pkValue,
+                  [primary.sk.field]: versionSk,
+                }),
+                ConsistentRead: opts.consistentRead || undefined,
+              })
+              .pipe(Effect.map((result) => result.Item))
+
+          let item = yield* read(
+            DynamoSchema.composeVersionKey(
+              schema,
+              entityType,
+              versionNumber,
+              historyKeyOptions(liveSk),
+            ),
           )
+          // Not under the item's own key: written by an earlier release, under
+          // the partition-wide one — if it is this item's (#133).
+          if (item === undefined && hasItemHistory) {
+            const legacy = yield* read(
+              DynamoSchema.composeVersionKey(schema, entityType, versionNumber),
+            )
+            if (legacy !== undefined && isItemsRow(legacy, liveSk)) item = legacy
+          }
 
-          const marshalledKey = toAttributeMap({
-            [primary.pk.field]: pkValue,
-            [primary.sk.field]: versionSk,
-          })
-
-          const result = yield* client.getItem({
-            TableName: tableName,
-            Key: marshalledKey,
-            ConsistentRead: opts.consistentRead || undefined,
-          })
-
-          if (!result.Item) {
+          if (!item) {
             return yield* new ItemNotFound({ entityType, key: encodedKey })
           }
 
-          const raw = fromAttributeMap(result.Item)
-          return yield* decodeAs(raw, result.Item, mode)
+          const raw = fromAttributeMap(item)
+          return yield* decodeAs(raw, item, mode)
         }),
       self,
       key as globalThis.Record<string, unknown>,
@@ -8292,11 +8446,62 @@ const makeImpl = <
     const encodedKey = keyForm(encodeKeySync(key))
     const primary = config.indexes.primary
     const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
+    const liveSk = liveSkOf(encodedKey)
     const versionPrefix = DynamoSchema.composeVersionKeyPrefix(
       schema,
       entityType,
-      historyKeyOptions(liveSkOf(encodedKey)),
+      historyKeyOptions(liveSk),
     )
+
+    /**
+     * History an earlier release wrote for this item, under the partition-wide
+     * keys (#133): when there is any, the query reads the partition's history
+     * and keeps the item's own rows plus those — a version held both ways is
+     * read from its own row. Without any, it reads only the item's own.
+     */
+    const withLegacy: Query.QueryPrepare | undefined = hasItemHistory
+      ? (tableName) =>
+          Effect.gen(function* () {
+            const legacy = yield* legacyHistory({ tableName, pk: pkValue, liveSk, kind: "version" })
+            if (legacy.length === 0) return {}
+            const client = yield* DynamoClient
+            const own = new Set<number>()
+            let start: globalThis.Record<string, AttributeValue> | undefined
+            do {
+              const result = yield* client.query({
+                TableName: tableName,
+                KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :prefix)",
+                ExpressionAttributeNames: { "#pk": primary.pk.field, "#sk": primary.sk.field },
+                ExpressionAttributeValues: {
+                  ":pk": toAttributeValue(pkValue),
+                  ":prefix": toAttributeValue(versionPrefix),
+                },
+                ProjectionExpression: "#sk",
+                ConsistentRead: true,
+                ExclusiveStartKey: start,
+              })
+              for (const row of result.Items ?? []) own.add(versionOfSk(row[primary.sk.field]?.S))
+              start = result.LastEvaluatedKey as
+                | globalThis.Record<string, AttributeValue>
+                | undefined
+            } while (start !== undefined)
+            const legacySks = new Set(
+              legacy
+                .map((row) => row[primary.sk.field]?.S ?? "")
+                .filter((sk) => !own.has(versionOfSk(sk))),
+            )
+            return {
+              replaceBeginsWith: {
+                from: versionPrefix,
+                to: DynamoSchema.composeVersionKeyPrefix(schema, entityType),
+              },
+              keep: (row: globalThis.Record<string, AttributeValue>) => {
+                const sk = row[primary.sk.field]?.S ?? ""
+                return sk.startsWith(versionPrefix) || legacySks.has(sk)
+              },
+            }
+          })
+      : undefined
 
     return Query.make({
       tableName: "",
@@ -8308,6 +8513,7 @@ const makeImpl = <
       decoder: (raw) => decodeRecord(raw),
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
       keyFields: [primary.pk.field, primary.sk.field],
+      prepare: withLegacy,
     }).pipe(Query.where({ beginsWith: versionPrefix }))
   }
 
@@ -8319,46 +8525,26 @@ const makeImpl = <
     new EntityGetImpl(
       (mode: DecodeMode, _opts: EntityGetOpts) =>
         Effect.gen(function* () {
-          const client = yield* DynamoClient
           const { name: tableName } = yield* tableTag
 
           // Caller key: Type side in, ENCODED out (see `encodeKey`).
           const encodedKey = yield* encodeKey(key, "deleted.get.decode")
 
-          // Query for soft-deleted item using begins_with on deleted prefix
+          // The item's latest tombstone — not a sibling's in the same partition,
+          // and one an earlier release wrote counts (#133).
           const primary = config.indexes.primary
           const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
-          // This item's tombstones — not a sibling's in the same partition (#133).
-          const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(
-            schema,
-            entityType,
-            historyKeyOptions(liveSkOf(encodedKey)),
-          )
+          const tombstone = yield* latestTombstone(tableName, pkValue, liveSkOf(encodedKey))
 
-          const result = yield* client.query({
-            TableName: tableName,
-            KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
-            ExpressionAttributeNames: {
-              "#pk": primary.pk.field,
-              "#sk": primary.sk.field,
-            },
-            ExpressionAttributeValues: {
-              ":pk": toAttributeValue(pkValue),
-              ":skPrefix": toAttributeValue(deletedPrefix),
-            },
-            Limit: 1,
-            ScanIndexForward: false,
-          })
-
-          if (!result.Items || result.Items.length === 0) {
+          if (tombstone === undefined) {
             return yield* new ItemNotFound({ entityType, key: encodedKey })
           }
 
-          const raw = fromAttributeMap(result.Items[0]!)
+          const raw = fromAttributeMap(tombstone)
           yield* checkVersion(raw, "deleted.get.decode")
           // Soft-deleted items have GSI keys stripped — always use deletedRecordSchema
           // (itemSchema would fail because it expects GSI key fields that aren't present)
-          if (mode === "native") return result.Items[0]!
+          if (mode === "native") return tombstone
           // Sparse Map fields: rebuild domain Records from flattened attrs so
           // soft-deleted items decode correctly. Sparse data is preserved
           // verbatim across soft-delete (GSI keys are stripped, sparse data is
@@ -8446,37 +8632,18 @@ const makeImpl = <
           // Caller key: Type side in, ENCODED out (see `encodeKey`).
           const encodedKey = yield* encodeKey(key, "restore.decode")
 
-          // Query for the soft-deleted item
+          // The item's latest tombstone — not a sibling's in the same partition,
+          // and one an earlier release wrote counts (#133).
           const primary = config.indexes.primary
           const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
-          // This item's tombstones — not a sibling's in the same partition (#133).
-          const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(
-            schema,
-            entityType,
-            historyKeyOptions(liveSkOf(encodedKey)),
-          )
+          const tombstone = yield* latestTombstone(tableName, pkValue, liveSkOf(encodedKey))
 
-          const queryResult = yield* client.query({
-            TableName: tableName,
-            KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
-            ExpressionAttributeNames: {
-              "#pk": primary.pk.field,
-              "#sk": primary.sk.field,
-            },
-            ExpressionAttributeValues: {
-              ":pk": toAttributeValue(pkValue),
-              ":skPrefix": toAttributeValue(deletedPrefix),
-            },
-            Limit: 1,
-            ScanIndexForward: false,
-          })
-
-          if (!queryResult.Items || queryResult.Items.length === 0) {
+          if (tombstone === undefined) {
             return yield* new ItemNotFound({ entityType, key: encodedKey })
           }
 
-          yield* checkVersion(queryResult.Items[0], "restore")
-          const deletedRaw = fromAttributeMap(queryResult.Items[0]!)
+          yield* checkVersion(tombstone, "restore")
+          const deletedRaw = fromAttributeMap(tombstone)
           const deletedMarshalledKey = toAttributeMap({
             [primary.pk.field]: (deletedRaw as globalThis.Record<string, unknown>)[
               primary.pk.field
@@ -8776,12 +8943,7 @@ const makeImpl = <
             const unsegmented = sharedHistory.some(
               (prefix) => sk.startsWith(prefix) && !sk.slice(prefix.length).includes("#"),
             )
-            if (!unsegmented) return false
-            try {
-              return liveSkOf(toDomainView(fromAttributeMap(row))) === liveSk
-            } catch {
-              return false
-            }
+            return unsegmented && isItemsRow(row, liveSk)
           }
 
           // Query ALL items in this partition (current + versions + deleted).
@@ -9011,7 +9173,7 @@ const makeImpl = <
     _unsentineledDefaults: unsentineledDefaults,
     _planPut: planPut,
     _multiItemWriteFeatures: multiItemWriteFeatures(),
-    _historySkPrefixes: historySkPrefixes,
+    _historyRows: historyRows,
     _attachPrototype: attachPrototype,
     _configure: (
       injectedSchema: DynamoSchema.DynamoSchema,

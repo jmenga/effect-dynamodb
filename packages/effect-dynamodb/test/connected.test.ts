@@ -59,7 +59,7 @@ import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Expression from "../src/Expression.js"
-import { fromAttributeMap } from "../src/Marshaller.js"
+import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
@@ -2376,6 +2376,17 @@ describeConnected("timeSeries integration tests", () => {
         deviceId: "d-1",
       }).collect()
       expect(history).toHaveLength(3)
+
+      // Event items keep the entity's type, but they are not items: a query of
+      // the partition and a scan return the current item only.
+      const key = { channel: "c-seq", deviceId: "d-1" }
+      const current = yield* db.entities.Telemetries.primary(key).collect()
+      expect(current.map((t) => DateTime.formatIso(t.timestamp))).toEqual([
+        "2026-04-22T10:10:00.000Z",
+      ])
+      expect(yield* db.entities.Telemetries.primary(key).count()).toBe(1)
+      const scanned = yield* db.entities.Telemetries.scan().filter({ channel: "c-seq" }).collect()
+      expect(scanned).toHaveLength(1)
     }).pipe(provideTs),
   )
 
@@ -16923,6 +16934,124 @@ describeConnected("#133 — path operations on index composites and unique field
       expect(left.filter((sk) => sk.includes("line_a"))).toEqual([])
       expect(left).toContain("$edd133g#v1#g133softline#line_b")
       expect((yield* lines.versions(b).collect()).map((r: any) => r.version)).toEqual([1, 2])
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- history written before items got their own keeps working (#133) ----
+
+  /** A row as an earlier release stored it, written raw. */
+  const putRaw = (item: Record<string, unknown>) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      yield* client.putItem({ TableName: g133Tables.record, Item: toAttributeMap(item) })
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+  const lineRow = (
+    entityType: string,
+    order: string,
+    line: string,
+    sk: string,
+    fields: Record<string, unknown>,
+  ) => ({
+    pk: `$edd133g#v1#${entityType.toLowerCase()}#order_${order}`,
+    sk,
+    __edd_e__: entityType,
+    order,
+    line,
+    createdAt: "2024-01-01T00:00:00.000Z",
+    updatedAt: "2024-01-01T00:00:00.000Z",
+    ...fields,
+  })
+
+  it.effect("sibling items read their legacy version history, segmented first", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const lines = db.entities.Lines as any
+      const at = (sk: string) => `$edd133g#v1#g133line#${sk}`
+      const row = (line: string, sk: string, version: number, label: string) =>
+        lineRow("G133Line", "o3", line, at(sk), { version, label })
+      // The shared sequence earlier releases wrote: a v1, b v2, a v3.
+      yield* putRaw(row("a", "v#0000001", 1, "a1"))
+      yield* putRaw(row("b", "v#0000002", 2, "b2"))
+      yield* putRaw(row("a", "v#0000003", 3, "a3-legacy"))
+      yield* putRaw(row("a", "line_a", 3, "a3"))
+      yield* putRaw(row("b", "line_b", 2, "b2"))
+      const a = { order: "o3", line: "a" }
+      const b = { order: "o3", line: "b" }
+      const history = (key: any) =>
+        Effect.map(lines.versions(key).collect(), (rows: any) =>
+          rows.map((r: any) => [r.version, r.label]),
+        )
+      expect(yield* history(a)).toEqual([
+        [1, "a1"],
+        [3, "a3-legacy"],
+      ])
+      expect(yield* history(b)).toEqual([[2, "b2"]])
+      expect((yield* lines.getVersion(a, 1)).label).toBe("a1")
+      expect((yield* lines.getVersion(b, 2)).label).toBe("b2")
+      // v#0000001 is a's, not b's.
+      expect((yield* Effect.flip(lines.getVersion(b, 1)))._tag).toBe("ItemNotFound")
+
+      // An update snapshots v3 again, under the item's own key: that one wins.
+      expect((yield* lines.update(a).set({ label: "a4" })).version).toBe(4)
+      expect(yield* history(a)).toEqual([
+        [1, "a1"],
+        [3, "a3"],
+      ])
+      expect((yield* lines.getVersion(a, 3)).label).toBe("a3")
+      expect((yield* lines.versions(a).reverse().collect()).map((r: any) => r.version)).toEqual([
+        3, 1,
+      ])
+
+      // b was hard-deleted by an earlier release (no final snapshot): created
+      // again, it continues past its legacy history, not at version 1.
+      yield* Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteItem({
+          TableName: g133Tables.record,
+          Key: toAttributeMap({ pk: "$edd133g#v1#g133line#order_o3", sk: at("line_b") }),
+        })
+      }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+      expect((yield* lines.create({ ...b, label: "b3" })).version).toBe(3)
+      expect(yield* history(b)).toEqual([
+        [2, "b2"],
+        [3, "b3"],
+      ])
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("sibling items find and restore their legacy tombstones", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const lines = db.entities.SoftLines as any
+      const tomb = (line: string, ts: string, label: string, version: number) =>
+        lineRow("G133SoftLine", "o4", line, `$edd133g#v1#g133softline#deleted#${ts}`, {
+          version,
+          label,
+          deletedAt: ts,
+        })
+      yield* putRaw(tomb("a", "2024-01-02T00:00:00.000Z", "a1", 1))
+      yield* putRaw(tomb("b", "2024-01-03T00:00:00.000Z", "b2", 2))
+      const a = { order: "o4", line: "a" }
+      const b = { order: "o4", line: "b" }
+      // Each item finds its own — not the partition's latest.
+      expect((yield* lines.deleted.get(a)).label).toBe("a1")
+      expect((yield* lines.deleted.get(b)).label).toBe("b2")
+      expect((yield* lines.deleted.list(a).collect()).map((r: any) => r.label).sort()).toEqual([
+        "a1",
+        "b2",
+      ])
+      // Restored from the legacy tombstone, which is consumed.
+      const restored = yield* lines.restore(a)
+      expect([restored.line, restored.label, restored.version]).toEqual(["a", "a1", 2])
+      expect((yield* Effect.flip(lines.deleted.get(a)))._tag).toBe("ItemNotFound")
+      expect((yield* lines.deleted.get(b)).label).toBe("b2")
+      const restoredB = yield* lines.restore(b)
+      expect([restoredB.line, restoredB.label, restoredB.version]).toEqual(["b", "b2", 3])
+      // Deleted again: the newer, segmented tombstone is the one found.
+      yield* TestClock.adjust("1 second")
+      yield* lines.update(a).set({ label: "a3" })
+      yield* lines.delete(a)
+      expect((yield* lines.deleted.get(a)).label).toBe("a3")
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 

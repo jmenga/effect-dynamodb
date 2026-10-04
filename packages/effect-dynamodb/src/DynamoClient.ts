@@ -926,8 +926,13 @@ interface EntityLike {
   readonly _tableTag: Context.Service<TableConfig, TableConfig>
   readonly _injectIndex: (name: string, def: IndexDefinition) => void
   readonly _decodeRecord: (raw: Record<string, unknown>) => Effect.Effect<any, any>
-  /** History rows (snapshots, tombstones) a primary-key query or scan leaves out (#133). */
-  readonly _historySkPrefixes?: (() => ReadonlyArray<string>) | undefined
+  /** Rows that aren't items (snapshots, tombstones, events): a primary-key query or scan leaves them out (#133). */
+  readonly _historyRows?:
+    | (() => {
+        readonly prefixes: ReadonlyArray<string>
+        readonly nested?: { readonly under: string; readonly marker: string } | undefined
+      })
+    | undefined
   readonly schemas: {
     readonly recordSchema: Schema.Codec<any>
     /** The schema `put` encodes through — the source of truth for composite
@@ -1089,7 +1094,10 @@ const makeFromConfig = (config: {
           // never does (they carry no index keys).
           excludeSkPrefixes:
             indexDef.index === undefined
-              ? { field: indexDef.sk.field, prefixes: entityLike._historySkPrefixes?.() ?? [] }
+              ? {
+                  field: indexDef.sk.field,
+                  ...(entityLike._historyRows?.() ?? { prefixes: [] }),
+                }
               : undefined,
         })
 
@@ -1448,7 +1456,7 @@ const makeFromConfig = (config: {
               ? undefined
               : {
                   field: entityLike.indexes.primary.sk.field,
-                  prefixes: entityLike._historySkPrefixes?.() ?? [],
+                  ...(entityLike._historyRows?.() ?? { prefixes: [] }),
                 },
         })
         const pathBuilder = createPathBuilder()

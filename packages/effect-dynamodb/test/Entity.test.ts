@@ -4373,6 +4373,57 @@ describe("Entity", () => {
         }).pipe(Effect.provide(TestLayer)),
       )
 
+      const legacyRow = (sk: string, line: string, version: number) =>
+        toAttributeMap({
+          order: "o1",
+          line,
+          name: "n",
+          version,
+          createdAt: "2024-01-15T00:00:00Z",
+          updatedAt: "2024-01-15T00:00:00Z",
+          pk: "$myapp#v1#line#order_o1",
+          sk,
+          __edd_e__: "Line",
+        })
+
+      it.effect("getVersion falls back to the item's own unsegmented snapshot", () =>
+        Effect.gen(function* () {
+          // Not under the item's key; the unsegmented v#0000003 is a sibling's.
+          mockGetItem
+            .mockResolvedValueOnce({})
+            .mockResolvedValueOnce({ Item: legacyRow("$myapp#v1#line#v#0000003", "b", 3) })
+          expect((yield* Effect.flip(Lines.getVersion(key, 3).asEffect()))._tag).toBe(
+            "ItemNotFound",
+          )
+          expect(mockGetItem.mock.calls[1]![0].Key.sk.S).toBe("$myapp#v1#line#v#0000003")
+          // …and this one is the item's.
+          mockGetItem
+            .mockResolvedValueOnce({})
+            .mockResolvedValueOnce({ Item: legacyRow("$myapp#v1#line#v#0000003", "a", 3) })
+          const v3 = yield* Lines.getVersion(key, 3).pipe(Entity.asRecord)
+          expect(v3.version).toBe(3)
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("a re-created item continues past its unsegmented history too", () =>
+        Effect.gen(function* () {
+          mockQuery.mockResolvedValueOnce({ Items: [] }).mockResolvedValueOnce({
+            Items: [
+              legacyRow("$myapp#v1#line#v#0000006", "b", 6),
+              legacyRow("$myapp#v1#line#v#0000004", "a", 4),
+            ],
+          })
+          mockTransactWriteItems.mockResolvedValueOnce({})
+          yield* Lines.create({ ...key, name: "n" }).asEffect()
+          const legacy = mockQuery.mock.calls[1]![0]
+          expect(legacy.KeyConditionExpression).toBe("#pk = :pk AND #sk BETWEEN :lo AND :hi")
+          expect(legacy.ScanIndexForward).toBe(false)
+          const [main, snapshot] = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+          expect(main.Put.Item.version.N).toBe("5")
+          expect(snapshot.Put.Item.sk.S).toBe("$myapp#v1#line#v#line_a#0000005")
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
       it.effect("getVersion, versions, deleted.get and soft delete key by the item", () =>
         Effect.gen(function* () {
           mockGetItem.mockResolvedValueOnce({})

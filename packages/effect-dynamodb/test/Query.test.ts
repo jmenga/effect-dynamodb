@@ -694,6 +694,75 @@ describe("Query", () => {
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
+    it.effect("rows nested under an item (time-series events) are dropped too", () =>
+      Effect.gen(function* () {
+        const nested = { under: "$myapp#v1#user", marker: "#e#" }
+        mockQuery.mockResolvedValue({
+          Items: [
+            row("live", "$myapp#v1#user#id_a"),
+            row("event", "$myapp#v1#user#id_a#e#2026-01-01"),
+          ],
+        })
+        const q = Query.make<{ id: string }>({
+          tableName: "TestTable",
+          indexName: undefined,
+          pkField: "pk",
+          pkValue: "p",
+          skField: "sk",
+          entityTypes: ["User"],
+          decoder: (raw) => Effect.succeed({ id: raw.id as string }),
+          excludeSkPrefixes: { field: "sk", prefixes: [], nested },
+        })
+        expect((yield* Query.collect(q)).map((i) => i.id)).toEqual(["live"])
+        mockScan.mockResolvedValue({ Items: [] })
+        const scan = (under: string) =>
+          Query.makeScan<{ id: string }>({
+            tableName: "TestTable",
+            indexName: undefined,
+            entityTypes: ["User"],
+            decoder: (raw) => Effect.succeed({ id: raw.id as string }),
+            excludeSkPrefixes: { field: "sk", prefixes: [], nested: { under, marker: "#e#" } },
+          })
+        yield* Query.collect(scan("$myapp#v1#user"))
+        expect(mockScan.mock.calls[0]![0].FilterExpression).toContain(
+          "NOT contains(#eddSk, :eddNest)",
+        )
+        // A marker the live keys can hold (an entity named "e") is judged client-side.
+        mockScan.mockResolvedValue({
+          Items: [row("live", "$myapp#v1#e#id_a"), row("event", "$myapp#v1#e#id_a#e#1")],
+        })
+        const items = yield* Query.collect(scan("$myapp#v1#e"))
+        expect(items.map((i) => i.id)).toEqual(["live"])
+        expect(mockScan.mock.calls[1]![0].FilterExpression ?? "").not.toContain("contains")
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect("prepare swaps the sort key operand and keeps only its rows", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue(page())
+        const q = Query.make<{ id: string }>({
+          tableName: "TestTable",
+          indexName: undefined,
+          pkField: "pk",
+          pkValue: "p",
+          skField: "sk",
+          entityTypes: ["User"],
+          decoder: (raw) => Effect.succeed({ id: raw.id as string }),
+          prepare: (tableName) =>
+            Effect.succeed({
+              replaceBeginsWith: { from: "own#", to: `${tableName}#all#` },
+              keep: (r) => r.id?.S !== "snap",
+            }),
+        }).pipe(Query.where({ beginsWith: "own#" }))
+        const items = yield* Query.collect(q)
+        expect(items.map((i) => i.id)).toEqual(["live-a", "tomb", "live-c"])
+        expect(mockQuery.mock.calls[0]![0].ExpressionAttributeValues[":sk"]).toEqual({
+          S: "TestTable#all#",
+        })
+        expect(yield* Query.count(q)).toBe(3)
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
     it.effect("a scan filters them out in its FilterExpression", () =>
       Effect.gen(function* () {
         mockScan.mockResolvedValue({ Items: [] })

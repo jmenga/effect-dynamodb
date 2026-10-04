@@ -12,7 +12,7 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import { Effect, Function, Option, Pipeable, Stream } from "effect"
-import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
+import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
 import { compileExpr, type Expr } from "./internal/Expr.js"
 import { compilePath } from "./internal/PathBuilder.js"
 import { fromAttributeMap, toAttributeValue } from "./Marshaller.js"
@@ -86,19 +86,48 @@ interface QueryState {
    * or counted — see {@link isExcludedRow}.
    */
   readonly excludeSkPrefixes: ExcludedSkPrefixes | undefined
+  /**
+   * Run once at the start of each terminal, against the resolved table: may
+   * swap the sort key `begins_with` operand and add a row filter (`keep`)
+   * applied, like {@link excludeSkPrefixes}, to rows before they are decoded.
+   * An entity's `versions` uses it to read history written by an earlier
+   * release alongside its own (#133).
+   */
+  readonly prepare: QueryPrepare | undefined
+  /** @internal Set by {@link prepare}: rows outside it are dropped before decode. */
+  readonly keepRow: ((row: Record<string, AttributeValue>) => boolean) | undefined
 }
+
+/** @internal See {@link QueryState.prepare}. */
+export type QueryPrepare = (tableName: string) => Effect.Effect<
+  {
+    /** Replace a `begins_with` sort key condition on `from` with one on `to`. */
+    readonly replaceBeginsWith?: { readonly from: string; readonly to: string } | undefined
+    readonly keep?: ((row: Record<string, AttributeValue>) => boolean) | undefined
+  },
+  DynamoClientError,
+  DynamoClient
+>
 
 /** @internal Rows a query must not return: `field` beginning with any of `prefixes`. */
 export interface ExcludedSkPrefixes {
   readonly field: string
   readonly prefixes: ReadonlyArray<string>
+  /**
+   * Rows nested under a live item — time-series events, `<liveSk>#e#…`: a
+   * sort key beginning with `under` (the live sort key less its composites)
+   * whose remainder contains `marker`.
+   */
+  readonly nested?: { readonly under: string; readonly marker: string } | undefined
 }
 
 /** @internal Absent when there is nothing to exclude. */
 const normalizeExcluded = (
   excluded: ExcludedSkPrefixes | undefined,
 ): ExcludedSkPrefixes | undefined =>
-  excluded === undefined || excluded.prefixes.length === 0 ? undefined : excluded
+  excluded === undefined || (excluded.prefixes.length === 0 && excluded.nested === undefined)
+    ? undefined
+    : excluded
 
 /** @internal Dedupe + drop absent entries from a caller-supplied key field list. */
 const normalizeKeyFields = (
@@ -166,9 +195,13 @@ export const make = <A>(config: {
   readonly keyFields?: ReadonlyArray<string | undefined> | undefined
   /** History rows to leave out (see {@link QueryState.excludeSkPrefixes}). */
   readonly excludeSkPrefixes?: ExcludedSkPrefixes | undefined
+  /** See {@link QueryState.prepare}. */
+  readonly prepare?: QueryPrepare | undefined
 }): Query<A> =>
   new QueryImpl<A>({
     excludeSkPrefixes: normalizeExcluded(config.excludeSkPrefixes),
+    prepare: config.prepare,
+    keepRow: undefined,
     tableName: config.tableName,
     indexName: config.indexName,
     pkField: config.pkField,
@@ -210,9 +243,13 @@ export const makeScan = <A>(config: {
   readonly keyFields?: ReadonlyArray<string | undefined> | undefined
   /** History rows to leave out (see {@link QueryState.excludeSkPrefixes}). */
   readonly excludeSkPrefixes?: ExcludedSkPrefixes | undefined
+  /** See {@link QueryState.prepare}. */
+  readonly prepare?: QueryPrepare | undefined
 }): Query<A> =>
   new QueryImpl<A>({
     excludeSkPrefixes: normalizeExcluded(config.excludeSkPrefixes),
+    prepare: config.prepare,
+    keepRow: undefined,
     tableName: config.tableName,
     indexName: config.indexName,
     pkField: "",
@@ -540,12 +577,17 @@ const buildFilterClauses = (state: QueryState) => {
 
   // History rows (snapshots, tombstones) are not items (#133). A query's are
   // dropped client-side instead: its filter may not name a key attribute.
-  if (state.isScan && state.excludeSkPrefixes !== undefined) {
+  if (state.isScan && state.excludeSkPrefixes !== undefined && !excludedClientSide(state)) {
     names["#eddSk"] = state.excludeSkPrefixes.field
     state.excludeSkPrefixes.prefixes.forEach((prefix, i) => {
       filterClauses.push(`NOT begins_with(#eddSk, :eddSk${i})`)
       values[`:eddSk${i}`] = toAttributeValue(prefix)
     })
+    const nested = state.excludeSkPrefixes.nested
+    if (nested !== undefined) {
+      filterClauses.push("NOT contains(#eddSk, :eddNest)")
+      values[":eddNest"] = toAttributeValue(nested.marker)
+    }
   }
 
   // Expr-based filters (compiled from Entity.filter() callback/shorthand API)
@@ -721,14 +763,61 @@ const computeRequestLimit = (
  * be handed to DynamoDB, and a count has to read the rows.
  */
 const dropsRows = (state: QueryState): boolean =>
-  !state.isScan && state.excludeSkPrefixes !== undefined
+  state.keepRow !== undefined ||
+  (state.excludeSkPrefixes !== undefined && (!state.isScan || excludedClientSide(state)))
 
-/** @internal Is this raw row a history row the query leaves out (#133)? */
+/** @internal Is this raw row one the query leaves out (#133)? */
 const isExcludedRow = (state: QueryState, row: Record<string, AttributeValue>): boolean => {
-  if (!dropsRows(state)) return false
-  const sk = row[state.excludeSkPrefixes!.field]?.S
-  return sk !== undefined && state.excludeSkPrefixes!.prefixes.some((p) => sk.startsWith(p))
+  if (state.keepRow !== undefined && !state.keepRow(row)) return true
+  const excluded = state.excludeSkPrefixes
+  if (excluded === undefined || (state.isScan && !excludedClientSide(state))) return false
+  const sk = row[excluded.field]?.S
+  if (sk === undefined) return false
+  if (excluded.prefixes.some((p) => sk.startsWith(p))) return true
+  const nested = excluded.nested
+  return (
+    nested !== undefined &&
+    sk.startsWith(nested.under) &&
+    sk.slice(nested.under.length).includes(nested.marker)
+  )
 }
+
+/**
+ * @internal Whether a scan must drop excluded rows client-side too: a nested
+ * marker its `FilterExpression` can only test with `contains`, which would
+ * also match live rows if the marker can occur in their keys.
+ */
+const excludedClientSide = (state: QueryState): boolean => {
+  const nested = state.excludeSkPrefixes?.nested
+  return nested !== undefined && `${nested.under}#`.includes(nested.marker)
+}
+
+/**
+ * @internal The state a terminal runs: {@link QueryState.prepare} applied
+ * against the resolved table.
+ */
+const prepared = (
+  state: QueryState,
+  tableName: string,
+): Effect.Effect<QueryState, DynamoClientError, DynamoClient> =>
+  state.prepare === undefined
+    ? Effect.succeed(state)
+    : Effect.map(state.prepare(tableName), (prep) => {
+        const swap = prep.replaceBeginsWith
+        return {
+          ...state,
+          prepare: undefined,
+          keepRow: prep.keep,
+          skConditions:
+            swap === undefined
+              ? state.skConditions
+              : state.skConditions.map((c) =>
+                  "beginsWith" in c.condition && c.condition.beginsWith === swap.from
+                    ? { ...c, condition: { beginsWith: swap.to } }
+                    : c,
+                ),
+        }
+      })
 
 /** @internal Does the decoded item pass every client-side predicate? */
 const accepts = (state: QueryState, item: unknown): boolean => {
@@ -785,9 +874,8 @@ const cursorProjectionFields = (state: QueryState): ReadonlyArray<string> => {
       : state.keyFields.filter((field) => !projected.has(field)),
   )
   // A query that drops history rows reads their sort key (#133).
-  if (dropsRows(state) && !projected.has(state.excludeSkPrefixes!.field)) {
-    borrowed.add(state.excludeSkPrefixes!.field)
-  }
+  const judged = state.keepRow !== undefined ? state.skField : state.excludeSkPrefixes?.field
+  if (dropsRows(state) && judged !== undefined && !projected.has(judged)) borrowed.add(judged)
   return [...borrowed]
 }
 
@@ -845,8 +933,10 @@ export const execute = <A>(
 ): Effect.Effect<Page<A>, DynamoClientError | ValidationError, DynamoClient> =>
   Effect.gen(function* () {
     const client = yield* DynamoClient
-    const state = self._state
-    const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName
+    const tableName = self._state.resolveTableName
+      ? yield* self._state.resolveTableName
+      : self._state.tableName
+    const state = yield* prepared(self._state, tableName)
     const limitValue = state.limitValue
 
     if (limitValue !== undefined && limitValue <= 0) {
@@ -951,84 +1041,98 @@ const paginateInternal = <A>(
 > =>
   Effect.gen(function* () {
     const client = yield* DynamoClient
-    const state = self._state
-    const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName
-
-    const limitValue = state.limitValue
-    if (limitValue !== undefined && limitValue <= 0) {
-      return Stream.empty as Stream.Stream<Array<A>, DynamoClientError | ValidationError>
-    }
-
-    // Cursor state travels through Stream.paginate rather than a closure, so
-    // re-running the returned stream restarts from the beginning.
-    interface PageState {
-      readonly key: Record<string, AttributeValue> | undefined
-      readonly pageCount: number
-      readonly emitted: number
-    }
-
-    return Stream.paginate(
-      {
-        key: state.exclusiveStartKey as Record<string, AttributeValue> | undefined,
-        pageCount: 0,
-        emitted: 0,
-      } as PageState,
-      (pageState: PageState) =>
-        Effect.gen(function* () {
-          const pageCount = pageState.pageCount + 1
-          const remaining = limitValue === undefined ? undefined : limitValue - pageState.emitted
-          const borrowedFields = cursorProjectionFields(state)
-          const cmd = buildDynamoCommand(
-            state,
-            tableName,
-            {
-              ExclusiveStartKey: pageState.key,
-              Limit: computeRequestLimit(state, remaining),
-            },
-            borrowedFields,
-          )
-          const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
-
-          const returned = (result.Items ?? []) as Array<Record<string, AttributeValue>>
-          // See `execute` — a client predicate rejects rows after decode, so
-          // the budget cannot bound the examine window, only the accepted one.
-          const hasPredicate = state.predicates.length > 0 || dropsRows(state)
-          const take =
-            remaining === undefined || hasPredicate
-              ? returned.length
-              : Math.min(remaining, returned.length)
-          const examined = yield* Effect.forEach(
-            returned
-              .slice(0, take)
-              .filter((item) => !isExcludedRow(state, item))
-              .map((item) => {
-                const raw = fromAttributeMap(item)
-                for (const field of borrowedFields) delete raw[field]
-                return raw
-              }),
-            (raw) => state.decoder(raw) as Effect.Effect<A, ValidationError>,
-          )
-          const kept = hasPredicate ? examined.filter((item) => accepts(state, item)) : examined
-          const decoded = remaining === undefined ? kept : kept.slice(0, remaining)
-
-          const emitted = pageState.emitted + decoded.length
-          const hasMorePages = result.LastEvaluatedKey != null
-          const maxPagesReached = state.maxPagesValue != null && pageCount >= state.maxPagesValue
-          const limitReached = limitValue !== undefined && emitted >= limitValue
-
-          const nextState =
-            hasMorePages && !maxPagesReached && !limitReached
-              ? Option.some({
-                  key: result.LastEvaluatedKey as Record<string, AttributeValue>,
-                  pageCount,
-                  emitted,
-                } as PageState)
-              : Option.none()
-
-          return [[decoded], nextState] as const
-        }),
+    const tableName = self._state.resolveTableName
+      ? yield* self._state.resolveTableName
+      : self._state.tableName
+    // Prepared when the stream runs, so a failure is the stream's.
+    return Stream.unwrap(
+      prepared(self._state, tableName).pipe(
+        Effect.provideService(DynamoClient, client),
+        Effect.map((state) => pageStream<A>(client, tableName, state)),
+      ),
     )
   })
+
+const pageStream = <A>(
+  client: DynamoClientService,
+  tableName: string,
+  state: QueryState,
+): Stream.Stream<Array<A>, DynamoClientError | ValidationError> => {
+  const limitValue = state.limitValue
+  if (limitValue !== undefined && limitValue <= 0) {
+    return Stream.empty as Stream.Stream<Array<A>, DynamoClientError | ValidationError>
+  }
+
+  // Cursor state travels through Stream.paginate rather than a closure, so
+  // re-running the returned stream restarts from the beginning.
+  interface PageState {
+    readonly key: Record<string, AttributeValue> | undefined
+    readonly pageCount: number
+    readonly emitted: number
+  }
+
+  return Stream.paginate(
+    {
+      key: state.exclusiveStartKey as Record<string, AttributeValue> | undefined,
+      pageCount: 0,
+      emitted: 0,
+    } as PageState,
+    (pageState: PageState) =>
+      Effect.gen(function* () {
+        const pageCount = pageState.pageCount + 1
+        const remaining = limitValue === undefined ? undefined : limitValue - pageState.emitted
+        const borrowedFields = cursorProjectionFields(state)
+        const cmd = buildDynamoCommand(
+          state,
+          tableName,
+          {
+            ExclusiveStartKey: pageState.key,
+            Limit: computeRequestLimit(state, remaining),
+          },
+          borrowedFields,
+        )
+        const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
+
+        const returned = (result.Items ?? []) as Array<Record<string, AttributeValue>>
+        // See `execute` — a client predicate rejects rows after decode, so
+        // the budget cannot bound the examine window, only the accepted one.
+        const hasPredicate = state.predicates.length > 0 || dropsRows(state)
+        const take =
+          remaining === undefined || hasPredicate
+            ? returned.length
+            : Math.min(remaining, returned.length)
+        const examined = yield* Effect.forEach(
+          returned
+            .slice(0, take)
+            .filter((item) => !isExcludedRow(state, item))
+            .map((item) => {
+              const raw = fromAttributeMap(item)
+              for (const field of borrowedFields) delete raw[field]
+              return raw
+            }),
+          (raw) => state.decoder(raw) as Effect.Effect<A, ValidationError>,
+        )
+        const kept = hasPredicate ? examined.filter((item) => accepts(state, item)) : examined
+        const decoded = remaining === undefined ? kept : kept.slice(0, remaining)
+
+        const emitted = pageState.emitted + decoded.length
+        const hasMorePages = result.LastEvaluatedKey != null
+        const maxPagesReached = state.maxPagesValue != null && pageCount >= state.maxPagesValue
+        const limitReached = limitValue !== undefined && emitted >= limitValue
+
+        const nextState =
+          hasMorePages && !maxPagesReached && !limitReached
+            ? Option.some({
+                key: result.LastEvaluatedKey as Record<string, AttributeValue>,
+                pageCount,
+                emitted,
+              } as PageState)
+            : Option.none()
+
+        return [[decoded], nextState] as const
+      }),
+  )
+}
 
 /**
  * Execute a count query. Uses `Select: "COUNT"` on DynamoDB — no items are returned.
@@ -1044,8 +1148,10 @@ export const count = <A>(
 ): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient> =>
   Effect.gen(function* () {
     const client = yield* DynamoClient
-    const state = self._state
-    const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName
+    const tableName = self._state.resolveTableName
+      ? yield* self._state.resolveTableName
+      : self._state.tableName
+    const state = yield* prepared(self._state, tableName)
     const limitValue = state.limitValue
 
     if (limitValue !== undefined && limitValue <= 0) return 0
