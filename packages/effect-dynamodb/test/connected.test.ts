@@ -19,6 +19,7 @@ import {
   DateTime,
   Duration,
   Effect,
+  Equal,
   Layer,
   Option,
   Schema,
@@ -12307,4 +12308,393 @@ describeConnected("index-level casing", () => {
       expect(yield* db.entities.IcDevices.byOwner({ ownerId: "own-c" }).collect()).toEqual([])
     }).pipe(provideIc),
   )
+})
+
+// ===========================================================================
+// #133 — aggregate DateTimes nested in containers are stored in wire form
+// ===========================================================================
+//
+// The downstream `Match` shape from #133, trimmed to its date-bearing paths:
+// a root array of a date transform, a root array of a class with dates, a ref
+// in a root `many` element (declared `sk.composite`), and a ref in a `many`
+// element of a sub-aggregate bound twice. Entity models are configured wrappers
+// with an identifier rename, and `dateOfBirth` carries a decoding default.
+//
+// Before #133 every one of those nested dates was stored as a marshalled
+// `{ epochMilliseconds, "~effect/DateTime", _tag }` map, which effect 4.0.0
+// either rejects (rc-era maps) or reads back as a plain object (4.0.0-era
+// maps). The ref element field is exercised both as the plain entity class
+// (matched by field name) and `DynamoModel.ref`-annotated — the latter could not
+// read back even a fresh write.
+
+const I133PersonFields = {
+  id: Schema.String,
+  name: Schema.String,
+  dateOfBirth: Schema.DateTimeUtcFromString.pipe(
+    Schema.withDecodingDefault(Effect.succeed("1800-01-01")),
+  ),
+}
+class I133Team extends Schema.Class<I133Team>("I133Team")({
+  id: Schema.String,
+  name: Schema.String,
+}) {}
+class I133Coach extends Schema.Class<I133Coach>("I133Coach")({ ...I133PersonFields }) {}
+class I133Player extends Schema.Class<I133Player>("I133Player")({ ...I133PersonFields }) {}
+class I133Umpire extends Schema.Class<I133Umpire>("I133Umpire")({ ...I133PersonFields }) {}
+
+const i133PkSk = {
+  pk: { field: "pk", composite: ["id"] },
+  sk: { field: "sk", composite: [] },
+} as const
+const I133Teams = Entity.make({
+  model: DynamoModel.configure(I133Team, { id: { field: "teamId", identifier: true } }),
+  entityType: "Team",
+  primaryKey: i133PkSk,
+})
+const I133Coaches = Entity.make({
+  model: DynamoModel.configure(I133Coach, { id: { field: "coachId", identifier: true } }),
+  entityType: "Coach",
+  primaryKey: i133PkSk,
+})
+const I133Players = Entity.make({
+  model: DynamoModel.configure(I133Player, { id: { field: "playerId", identifier: true } }),
+  entityType: "Player",
+  primaryKey: i133PkSk,
+})
+const I133Umpires = Entity.make({
+  model: DynamoModel.configure(I133Umpire, { id: { field: "umpireId", identifier: true } }),
+  entityType: "Umpire",
+  primaryKey: i133PkSk,
+})
+
+class I133Session extends Schema.Class<I133Session>("I133Session")({
+  number: Schema.Number,
+  startTime: Schema.DateTimeUtcFromString,
+  finishTime: Schema.optionalKey(Schema.DateTimeUtcFromString),
+}) {}
+
+const I133Schema = DynamoSchema.make({ name: "issue133", version: 1 })
+const I133Table = Table.make({
+  schema: I133Schema,
+  entities: { I133Teams, I133Coaches, I133Players, I133Umpires },
+})
+
+const makeI133Match = (kind: "plain" | "ref") => {
+  const playerField = kind === "plain" ? I133Player : I133Player.pipe(DynamoModel.ref)
+  const umpireField = kind === "plain" ? I133Umpire : I133Umpire.pipe(DynamoModel.ref)
+  class PlayerSheet extends Schema.Class<PlayerSheet>(`I133PlayerSheet-${kind}`)({
+    player: playerField as typeof I133Player,
+    isCaptain: Schema.optionalKey(Schema.Boolean),
+  }) {}
+  class TeamSheet extends Schema.Class<TeamSheet>(`I133TeamSheet-${kind}`)({
+    team: I133Team,
+    coach: I133Coach,
+    homeTeam: Schema.Boolean,
+    players: Schema.Array(PlayerSheet),
+  }) {}
+  class UmpireSheet extends Schema.Class<UmpireSheet>(`I133UmpireSheet-${kind}`)({
+    umpire: umpireField as typeof I133Umpire,
+    role: Schema.Literals(["onfield", "third"]),
+  }) {}
+  class Match extends Schema.Class<Match>(`I133Match-${kind}`)({
+    id: Schema.String,
+    name: Schema.String,
+    startDate: Schema.DateTimeUtcFromString,
+    matchDays: Schema.optionalKey(Schema.Array(Schema.DateTimeUtcFromString)),
+    sessions: Schema.optionalKey(Schema.Array(I133Session)),
+    team1: TeamSheet,
+    team2: TeamSheet,
+    umpires: Schema.optionalKey(Schema.Array(UmpireSheet)),
+  }) {}
+  const TeamSheetAggregate = Aggregate.make(TeamSheet, {
+    root: { entityType: "MatchTeam" },
+    edges: {
+      team: Aggregate.ref(I133Teams),
+      coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: I133Coaches }),
+      players: Aggregate.many("players", { entityType: "MatchPlayer", entity: I133Players }),
+    },
+  })
+  return Aggregate.make(Match, {
+    table: I133Table,
+    schema: I133Schema,
+    pk: { field: "pk", composite: ["id"] },
+    collection: { name: `match${kind}` }, // no index: whole-partition read on the base table
+    root: { entityType: "MatchItem" },
+    edges: {
+      team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
+      team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
+      umpires: Aggregate.many("umpires", {
+        entityType: "MatchUmpire",
+        entity: I133Umpires,
+        sk: { composite: ["role", "umpire.id"] },
+      }),
+    },
+  })
+}
+
+const i133TableName = `issue133-${Date.now()}`
+const I133TestLayer = Layer.mergeAll(ClientLayer, I133Table.layer({ name: i133TableName }))
+const provideI133 = Effect.provide(I133TestLayer)
+
+const I133_DOB = "2000-01-01T00:00:00.000Z"
+const I133_DOB_MS = 946684800000
+const I133_DAY2 = "2000-01-02T00:00:00.000Z"
+
+const i133LegacyMap = (typeIdKey: string) => (ms: number) => ({
+  M: {
+    epochMilliseconds: { N: String(ms) },
+    [typeIdKey]: { S: typeIdKey },
+    _tag: { S: "Utc" },
+  },
+})
+const i133LegacyForms = [
+  ["rc-era map", i133LegacyMap("~effect/time/DateTime")],
+  ["4.0.0-era map", i133LegacyMap("~effect/DateTime")],
+] as const
+
+/** A real `DateTime.Utc` for `ms`, not a plain object that duck-types as one. */
+const i133IsRealUtc = (value: unknown, ms: number) =>
+  DateTime.isDateTime(value) &&
+  Object.getPrototypeOf(value) !== Object.prototype &&
+  Equal.equals(value, DateTime.makeUnsafe(ms))
+
+describeConnected("#133 — aggregate DateTimes nested in containers", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { I133Teams, I133Coaches, I133Players, I133Umpires },
+          tables: { I133Table },
+        })
+        yield* db.tables.I133Table.create()
+        const dob = DateTime.makeUnsafe(I133_DOB)
+        yield* db.entities.I133Teams.put({ id: "team-1", name: "Team One" })
+        yield* db.entities.I133Teams.put({ id: "team-2", name: "Team Two" })
+        yield* db.entities.I133Coaches.put({ id: "coach-1", name: "Coach One", dateOfBirth: dob })
+        yield* db.entities.I133Coaches.put({ id: "coach-2", name: "Coach Two", dateOfBirth: dob })
+        yield* db.entities.I133Players.put({ id: "player-1", name: "Player One", dateOfBirth: dob })
+        yield* db.entities.I133Players.put({ id: "player-2", name: "Player Two", dateOfBirth: dob })
+        yield* db.entities.I133Umpires.put({ id: "umpire-1", name: "Umpire One", dateOfBirth: dob })
+      }).pipe(provideI133, Effect.scoped),
+    )
+  }, 30000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: i133TableName })
+      }).pipe(
+        provideI133,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 30000)
+
+  for (const kind of ["plain", "ref"] as const) {
+    const MatchAggregate = makeI133Match(kind)
+    const createMatch = (id: string) =>
+      MatchAggregate.create({
+        id,
+        name: "Match",
+        startDate: I133_DOB,
+        matchDays: [I133_DOB, I133_DAY2],
+        sessions: [{ number: 1, startTime: I133_DOB }],
+        team1: {
+          teamId: "team-1",
+          coachId: "coach-1",
+          homeTeam: true,
+          players: [{ playerId: "player-1" }],
+        },
+        team2: {
+          teamId: "team-2",
+          coachId: "coach-2",
+          homeTeam: false,
+          players: [{ playerId: "player-2" }],
+        },
+        umpires: [{ umpireId: "umpire-1", role: "onfield" }],
+      })
+    const getMatch = (id: string) =>
+      MatchAggregate.get({ id } as any) as Effect.Effect<any, unknown, any>
+
+    /** Raw items of one match partition. */
+    const rawItems = (id: string) =>
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        const { Items = [] } = yield* client.query({
+          TableName: i133TableName,
+          KeyConditionExpression: "#pk = :pk",
+          ExpressionAttributeNames: { "#pk": "pk" },
+          ExpressionAttributeValues: { ":pk": { S: `$issue133#v1#match${kind}#${id}` } },
+          ConsistentRead: true,
+        })
+        return Items as ReadonlyArray<Record<string, any>>
+      })
+    const first = (items: ReadonlyArray<Record<string, any>>, entityType: string) =>
+      items.find((item) => item.__edd_e__?.S === entityType)!
+
+    /** Overwrite one nested attribute of a stored item with a legacy map. */
+    const overwrite = (
+      item: Record<string, any>,
+      path: string,
+      names: Record<string, string>,
+      value: unknown,
+    ) =>
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.updateItem({
+          TableName: i133TableName,
+          Key: { pk: item.pk, sk: item.sk },
+          UpdateExpression: `SET ${path} = :v`,
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: { ":v": value as any },
+        })
+      })
+
+    const label = kind === "plain" ? "plain class element" : "DynamoModel.ref element"
+
+    it.effect(`${label}: stores every date leaf in wire form (S)`, () =>
+      Effect.gen(function* () {
+        yield* createMatch("w1")
+        const items = yield* rawItems("w1")
+        const root = first(items, "MatchItem")
+        const stored = {
+          "MatchItem.startDate": root.startDate,
+          "MatchItem.matchDays": root.matchDays,
+          "MatchItem.sessions[0].startTime": root.sessions?.L?.[0]?.M?.startTime,
+          "MatchPlayer.player.dateOfBirth": first(items, "MatchPlayer").player?.M?.dateOfBirth,
+          "MatchUmpire.umpire.dateOfBirth": first(items, "MatchUmpire").umpire?.M?.dateOfBirth,
+          "MatchCoach.dateOfBirth": first(items, "MatchCoach").dateOfBirth,
+        }
+        expect(stored).toEqual({
+          "MatchItem.startDate": { S: I133_DOB },
+          "MatchItem.matchDays": { L: [{ S: I133_DOB }, { S: I133_DAY2 }] },
+          "MatchItem.sessions[0].startTime": { S: I133_DOB },
+          "MatchPlayer.player.dateOfBirth": { S: I133_DOB },
+          "MatchUmpire.umpire.dateOfBirth": { S: I133_DOB },
+          "MatchCoach.dateOfBirth": { S: I133_DOB },
+        })
+        // The declared sk composite still keys the umpire row on its id.
+        expect(first(items, "MatchUmpire").sk.S).toBe("$issue133#v1#matchumpire#onfield#umpire-1")
+      }).pipe(provideI133),
+    )
+
+    it.effect(`${label}: reads a fresh write back as real DateTime.Utc instances`, () =>
+      Effect.gen(function* () {
+        yield* createMatch("w2")
+        const got = yield* getMatch("w2")
+        expect({
+          startDate: i133IsRealUtc(got.startDate, I133_DOB_MS),
+          "matchDays[0]": i133IsRealUtc(got.matchDays?.[0], I133_DOB_MS),
+          "sessions[0].startTime": i133IsRealUtc(got.sessions?.[0]?.startTime, I133_DOB_MS),
+          "team1.players[0].player.dateOfBirth": i133IsRealUtc(
+            got.team1.players[0]?.player.dateOfBirth,
+            I133_DOB_MS,
+          ),
+          "team2.players[0].player.dateOfBirth": i133IsRealUtc(
+            got.team2.players[0]?.player.dateOfBirth,
+            I133_DOB_MS,
+          ),
+          "umpires[0].umpire.dateOfBirth": i133IsRealUtc(
+            got.umpires?.[0]?.umpire.dateOfBirth,
+            I133_DOB_MS,
+          ),
+          "team1.coach.dateOfBirth": i133IsRealUtc(got.team1.coach.dateOfBirth, I133_DOB_MS),
+        }).toEqual({
+          startDate: true,
+          "matchDays[0]": true,
+          "sessions[0].startTime": true,
+          "team1.players[0].player.dateOfBirth": true,
+          "team2.players[0].player.dateOfBirth": true,
+          "umpires[0].umpire.dateOfBirth": true,
+          "team1.coach.dateOfBirth": true,
+        })
+      }).pipe(provideI133),
+    )
+
+    for (const [formName, form] of i133LegacyForms) {
+      const id = (n: number) => `${formName.startsWith("rc") ? "rc" : "v4"}${n}`
+
+      it.effect(`${label}: reads a stored ${formName} in MatchItem.matchDays[]`, () =>
+        Effect.gen(function* () {
+          yield* createMatch(id(3))
+          const root = first(yield* rawItems(id(3)), "MatchItem")
+          yield* overwrite(root, "#a[0]", { "#a": "matchDays" }, form(I133_DOB_MS))
+          const got = yield* getMatch(id(3))
+          expect(i133IsRealUtc(got.matchDays?.[0], I133_DOB_MS)).toBe(true)
+        }).pipe(provideI133),
+      )
+
+      it.effect(`${label}: reads a stored ${formName} in MatchItem.sessions[].startTime`, () =>
+        Effect.gen(function* () {
+          yield* createMatch(id(4))
+          const root = first(yield* rawItems(id(4)), "MatchItem")
+          yield* overwrite(
+            root,
+            "#a[0].#b",
+            { "#a": "sessions", "#b": "startTime" },
+            form(I133_DOB_MS),
+          )
+          const got = yield* getMatch(id(4))
+          expect(i133IsRealUtc(got.sessions?.[0]?.startTime, I133_DOB_MS)).toBe(true)
+        }).pipe(provideI133),
+      )
+
+      it.effect(`${label}: reads a stored ${formName} in MatchPlayer.player.dateOfBirth`, () =>
+        Effect.gen(function* () {
+          yield* createMatch(id(5))
+          const player = first(yield* rawItems(id(5)), "MatchPlayer")
+          yield* overwrite(
+            player,
+            "#a.#b",
+            { "#a": "player", "#b": "dateOfBirth" },
+            form(I133_DOB_MS),
+          )
+          const got = yield* getMatch(id(5))
+          for (const sheet of [...got.team1.players, ...got.team2.players]) {
+            expect(i133IsRealUtc(sheet.player.dateOfBirth, I133_DOB_MS)).toBe(true)
+          }
+        }).pipe(provideI133),
+      )
+
+      it.effect(`${label}: reads a stored ${formName} in MatchUmpire.umpire.dateOfBirth`, () =>
+        Effect.gen(function* () {
+          yield* createMatch(id(6))
+          const umpire = first(yield* rawItems(id(6)), "MatchUmpire")
+          yield* overwrite(
+            umpire,
+            "#a.#b",
+            { "#a": "umpire", "#b": "dateOfBirth" },
+            form(I133_DOB_MS),
+          )
+          const got = yield* getMatch(id(6))
+          expect(i133IsRealUtc(got.umpires?.[0]?.umpire.dateOfBirth, I133_DOB_MS)).toBe(true)
+        }).pipe(provideI133),
+      )
+    }
+
+    it.effect(`${label}: update over a legacy root row rewrites it in wire form`, () =>
+      Effect.gen(function* () {
+        yield* createMatch("u1")
+        const root = first(yield* rawItems("u1"), "MatchItem")
+        yield* overwrite(
+          root,
+          "#a[0]",
+          { "#a": "matchDays" },
+          i133LegacyMap("~effect/time/DateTime")(I133_DOB_MS),
+        )
+        const updated = yield* MatchAggregate.update({ id: "u1" } as any, (c: any) => ({
+          ...c.state,
+          name: "Renamed",
+        }))
+        expect((updated as any).name).toBe("Renamed")
+        const after = first(yield* rawItems("u1"), "MatchItem")
+        expect(after.matchDays).toEqual({ L: [{ S: I133_DOB }, { S: I133_DAY2 }] })
+        const got = yield* getMatch("u1")
+        expect(i133IsRealUtc(got.matchDays?.[0], I133_DOB_MS)).toBe(true)
+        expect(i133IsRealUtc(got.team1.players[0]?.player.dateOfBirth, I133_DOB_MS)).toBe(true)
+      }).pipe(provideI133),
+    )
+  }
 })
