@@ -2202,17 +2202,14 @@ const childAtSegment = (schema: Schema.Top, segment: string | number): Schema.To
   const s = inner as unknown as globalThis.Record<string, unknown>
   const fields = schemaFieldsOf(inner)
   if (fields !== undefined) return typeof segment === "string" ? fields[segment] : undefined
-  // An OPAQUE class — `Author.pipe(DynamoModel.ref)` or `Author.check(…)`, whose
-  // `.fields` the annotation dropped — still decodes from a Struct: recover the
-  // field from that Struct's property signatures (#133).
-  if (SchemaAST.isDeclaration(inner.ast)) {
-    const struct = classStructAst(inner)
-    if (struct === undefined || !SchemaAST.isObjects(struct) || typeof segment !== "string") {
-      return undefined
-    }
-    const property = struct.propertySignatures.find((ps) => ps.name === segment)
-    return property === undefined ? undefined : Schema.make<Schema.Top>(property.type)
-  }
+  // An OPAQUE class — `X.check(…)`, `X.annotate(…)`, a `DynamoModel.ref` nested
+  // in a ref target — is deliberately NOT followed. Its `.fields` are gone, so
+  // the derived read schema keeps it unsubstituted and decodes its leaves
+  // exactly as `put` stores them; encoding a value under it into wire form
+  // would leave the item unreadable (#133). A path into it is passed through
+  // as given. A top-level `DynamoModel.ref` field is followed through its
+  // target model instead (`makePathValueEncoder`'s `refTargets`), whose read
+  // schema IS substituted.
   if (SchemaAST.isUnion(inner.ast)) {
     // `NullOr(Stamp)` and friends: the first member the segment resolves in.
     const members = Array.isArray(s.members) ? (s.members as ReadonlyArray<Schema.Top>) : []
