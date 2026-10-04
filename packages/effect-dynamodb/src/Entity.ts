@@ -1748,135 +1748,6 @@ const makeImpl = <
       uState.pathDeletes,
     ].some((ops) => ops !== undefined && ops.length > 0)
 
-  /**
-   * Apply the update's PATH operations to an in-memory item — domain-named,
-   * wire-form, as the retain (read-then-transact) branch builds it — with the
-   * same encoding and validation the UpdateItem branch gives them, and the
-   * semantics DynamoDB gives the expressions that branch compiles (#133). The
-   * retain branch used to ignore path operations entirely: they returned
-   * success and wrote nothing.
-   *
-   * Mutates `item`; the caller passes a deep copy so the version snapshot,
-   * built from the stored item, keeps the pre-update values. Returns the
-   * error to fail with, or `undefined`.
-   */
-  const applyPathOpsInMemory = (
-    item: globalThis.Record<string, unknown>,
-    uState: UpdateState,
-  ): ValidationError | undefined => {
-    type Path = ReadonlyArray<string | number>
-    const fail = (operation: string, cause: unknown) =>
-      new ValidationError({ entityType, operation: `update.${operation}`, cause })
-    const getAt = (path: Path): unknown => {
-      let current: unknown = item
-      for (const segment of path) {
-        if (current === null || typeof current !== "object") return undefined
-        current = (current as globalThis.Record<string | number, unknown>)[segment]
-      }
-      return current
-    }
-    /** The container holding the last segment, or `undefined` if the path is broken. */
-    const parentOf = (path: Path) => {
-      const parent = getAt(path.slice(0, -1))
-      return parent !== null && typeof parent === "object"
-        ? { parent: parent as globalThis.Record<string | number, unknown>, key: path.at(-1)! }
-        : undefined
-    }
-    const setAt = (operation: string, path: Path, value: unknown): ValidationError | undefined => {
-      const at = parentOf(path)
-      if (at === undefined) {
-        return fail(operation, `The document path ${JSON.stringify(path)} does not exist`)
-      }
-      if (Array.isArray(at.parent) && typeof at.key === "number" && at.key >= at.parent.length) {
-        at.parent.push(value) // DynamoDB appends past the end of a list
-      } else {
-        at.parent[at.key] = value
-      }
-      return undefined
-    }
-    const encoded = (operation: string, path: Path, value: unknown, kind: "value" | "elements") => {
-      const result = encodePathValue(path, value, kind)
-      return result.issue === undefined
-        ? { value: result.encoded, error: undefined }
-        : { value: undefined, error: fail(operation, result.issue) }
-    }
-
-    for (const op of uState.pathSets ?? []) {
-      let value: unknown
-      if (op.isPath && op.valueSegments) {
-        value = getAt(op.valueSegments)
-      } else {
-        const result = encoded("pathSet", op.segments, op.value, "value")
-        if (result.error) return result.error
-        value = result.value
-      }
-      const error = setAt("pathSet", op.segments, value)
-      if (error) return error
-    }
-    for (const op of uState.pathIfNotExists ?? []) {
-      if (getAt(op.segments) !== undefined) continue
-      const result = encoded("pathIfNotExists", op.segments, op.value, "value")
-      if (result.error) return result.error
-      const error = setAt("pathIfNotExists", op.segments, result.value)
-      if (error) return error
-    }
-    for (const [ops, prepend] of [
-      [uState.pathAppends ?? [], false],
-      [uState.pathPrepends ?? [], true],
-    ] as const) {
-      for (const op of ops) {
-        const operation = prepend ? "pathPrepend" : "pathAppend"
-        const result = encoded(operation, op.segments, op.value, "elements")
-        if (result.error) return result.error
-        const existing = (getAt(op.segments) as ReadonlyArray<unknown> | undefined) ?? []
-        const added = result.value as ReadonlyArray<unknown>
-        const error = setAt(
-          operation,
-          op.segments,
-          prepend ? [...added, ...existing] : [...existing, ...added],
-        )
-        if (error) return error
-      }
-    }
-    for (const op of uState.pathSubtracts ?? []) {
-      const current = getAt(op.segments)
-      const operand = op.isPath && op.valueSegments ? getAt(op.valueSegments) : op.value
-      if (typeof current !== "number" || typeof operand !== "number") {
-        return fail("pathSubtract", `Cannot subtract at ${JSON.stringify(op.segments)}`)
-      }
-      const error = setAt("pathSubtract", op.segments, current - operand)
-      if (error) return error
-    }
-    for (const op of uState.pathAdds ?? []) {
-      const current = getAt(op.segments)
-      let next: unknown
-      if (current === undefined) next = op.value
-      else if (typeof current === "number" && typeof op.value === "number")
-        next = current + op.value
-      else if (current instanceof Set && op.value instanceof Set)
-        next = new Set([...current, ...op.value])
-      else return fail("pathAdd", `Cannot ADD to ${JSON.stringify(op.segments)}`)
-      const error = setAt("pathAdd", op.segments, next)
-      if (error) return error
-    }
-    for (const op of uState.pathDeletes ?? []) {
-      const current = getAt(op.segments)
-      if (current instanceof Set && op.value instanceof Set) {
-        const next = new Set(current)
-        for (const element of op.value) next.delete(element)
-        const error = setAt("pathDelete", op.segments, next)
-        if (error) return error
-      }
-    }
-    for (const path of uState.pathRemoves ?? []) {
-      const at = parentOf(path)
-      if (at === undefined) continue // removing an absent path is a no-op
-      if (Array.isArray(at.parent) && typeof at.key === "number") at.parent.splice(at.key, 1)
-      else delete at.parent[at.key]
-    }
-    return undefined
-  }
-
   // resolvedRefs carries the actual ref-target entity objects; at runtime they
   // are operational Entities (for runtime-authored refs) so write-time hydration
   // can call their CRUD ops. The pure bundle widens refEntity to EntityDefinition.
@@ -3502,7 +3373,23 @@ const makeImpl = <
             touchesUniqueFields = [...uniqueFieldSet].some((f) => allUpdatedFields.has(f))
           }
 
-          if (isRetainEnabled() || touchesUniqueFields) {
+          // Path operations are never emulated in memory: DynamoDB applies them
+          // (#133). A retain update carrying them takes the standard branch
+          // below, transacted with its version snapshot. An update that also
+          // rotates a unique sentinel needs this branch's read-then-put, which
+          // cannot carry them — refused rather than silently dropping them.
+          const pathOpsPresent = hasPathOps(uState)
+          if (pathOpsPresent && touchesUniqueFields) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "update",
+              cause:
+                "Path operations (pathSet, pathAppend, …) cannot be combined with a change to a " +
+                "unique-constraint field in one update: the unique sentinels are rotated by a " +
+                "read-then-put that DynamoDB path expressions cannot join. Split the update in two.",
+            })
+          }
+          if ((isRetainEnabled() || touchesUniqueFields) && !pathOpsPresent) {
             // --- Retain path: read-then-transact ---
             // Read current item (needed to create snapshot of pre-update state)
             const currentResult = yield* client.getItem({
@@ -3629,18 +3516,6 @@ const makeImpl = <
                   }
                 }
               }
-            }
-            // Path operations (#133). `newItem` shares its nested values with the
-            // stored item the version snapshot is built from, so they are copied
-            // before a path operation can mutate them.
-            if (hasPathOps(uState)) {
-              for (const [attr, value] of Object.entries(newItem)) {
-                if (value !== null && typeof value === "object") {
-                  newItem[attr] = structuredClone(value)
-                }
-              }
-              const pathError = applyPathOpsInMemory(newItem, uState)
-              if (pathError !== undefined) return yield* pathError
             }
 
             // Increment version and update timestamp. If the caller supplied a
@@ -4012,6 +3887,49 @@ const makeImpl = <
           }
 
           // --- Standard path: updateItem ---
+          // A retain entity reaching this branch carries path operations. Read
+          // the item first: its version snapshot is built from it, and the
+          // update below is conditioned on that version, so the snapshot is
+          // exactly the item the update replaces (#133).
+          let retainSnapshot:
+            | {
+                readonly item: globalThis.Record<string, unknown>
+                readonly raw: globalThis.Record<string, AttributeValue>
+                readonly version: number
+              }
+            | undefined
+          if (isRetainEnabled()) {
+            const current = yield* client.getItem({
+              TableName: tableName,
+              Key: marshalledKey,
+              ConsistentRead: true,
+            })
+            if (!current.Item) {
+              return yield* new ItemNotFound({ entityType, key: encodedKey })
+            }
+            const currentRaw = fromAttributeMap(current.Item) as globalThis.Record<string, unknown>
+            const version = systemFields.version ? (currentRaw[systemFields.version] as number) : 0
+            if (evExpected !== undefined && version !== evExpected) {
+              return yield* new OptimisticLockError({
+                entityType,
+                key: encodedKey,
+                expectedVersion: evExpected,
+                actualVersion: version,
+              })
+            }
+            retainSnapshot = {
+              item: buildSnapshotItem(
+                currentRaw,
+                version,
+                config.indexes.primary.pk.field,
+                config.indexes.primary.sk.field,
+                ttlAttrName,
+                now,
+              ),
+              raw: current.Item,
+              version,
+            }
+          }
           // Build UpdateExpression
           const setClauses: Array<string> = []
           const names: globalThis.Record<string, string> = {}
@@ -4492,6 +4410,80 @@ const makeImpl = <
             Object.assign(values, uc.values)
           }
           const conditionExpression = condParts.length > 0 ? condParts.join(" AND ") : undefined
+
+          if (retainSnapshot !== undefined) {
+            // The SAME UpdateExpression, transacted with the version snapshot of
+            // the item it replaces — DynamoDB applies the path operations, so
+            // their semantics are DynamoDB's own (#133).
+            const snapshot = retainSnapshot
+            const guardParts = [...condParts]
+            if (systemFields.version) {
+              names["#retainVer"] = systemFields.version
+              values[":retainVer"] = toAttributeValue(snapshot.version)
+              guardParts.push("#retainVer = :retainVer")
+            }
+            const transactItems = [
+              {
+                Update: {
+                  TableName: tableName,
+                  Key: marshalledKey,
+                  UpdateExpression: updateExpression,
+                  ExpressionAttributeNames: names,
+                  ExpressionAttributeValues: Object.keys(values).length > 0 ? values : undefined,
+                  ...(guardParts.length > 0 && { ConditionExpression: guardParts.join(" AND ") }),
+                },
+              },
+              { Put: { TableName: tableName, Item: toAttributeMap(snapshot.item) } },
+            ]
+            yield* checkTransactionLimit(entityType, "update", transactItems)
+            yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
+              Effect.mapError((err) => {
+                const mainRejected =
+                  (isAwsTransactionCancelled(err.cause) &&
+                    err.cause.CancellationReasons?.[0]?.Code === "ConditionalCheckFailed") ||
+                  isAwsConditionalCheckFailed(err.cause)
+                if (!mainRejected) {
+                  return err as DynamoClientError | OptimisticLockError | ConditionalCheckFailed
+                }
+                // The update is guarded by the snapshot version AND any user
+                // condition; DynamoDB does not say which rejected it.
+                if (userCond && evExpected === undefined) {
+                  return new ConditionalCheckFailed({ entityType, key: encodedKey }) as
+                    | DynamoClientError
+                    | OptimisticLockError
+                    | ConditionalCheckFailed
+                }
+                return new OptimisticLockError({
+                  entityType,
+                  key: encodedKey,
+                  expectedVersion: snapshot.version,
+                  actualVersion: -1,
+                }) as DynamoClientError | OptimisticLockError | ConditionalCheckFailed
+              }),
+            )
+            // A transacted Update returns no attributes: read the new item, as
+            // the record-based retain branch returns the full new item.
+            const after =
+              uState.returnValues === "allOld"
+                ? snapshot.raw
+                : (yield* client.getItem({
+                    TableName: tableName,
+                    Key: marshalledKey,
+                    ConsistentRead: true,
+                  })).Item
+            if (!after) return yield* new ItemNotFound({ entityType, key: encodedKey })
+            const retained = yield* decodeAs(fromAttributeMap(after), after, mode)
+            if (uState.cascade) {
+              const sourceId =
+                sourceIdentifierField != null
+                  ? (encodedKey as globalThis.Record<string, unknown>)[sourceIdentifierField]
+                  : undefined
+              if (sourceId != null) {
+                yield* executeCascade(uState.cascade, { ...(retained as object) }, String(sourceId))
+              }
+            }
+            return retained
+          }
 
           // DynamoDB rejects an empty `ExpressionAttributeValues` map. When
           // the UpdateExpression is REMOVE-only (e.g. clearMap with no other
