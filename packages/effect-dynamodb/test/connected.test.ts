@@ -12795,3 +12795,254 @@ describeConnected("#133 — aggregate DateTimes nested in containers", () => {
     )
   }
 })
+
+// ===========================================================================
+// #133 — entity self dates nested in Union / Record / Tuple containers
+// ===========================================================================
+//
+// An entity substitutes self dates (`Schema.DateTimeUtc`, `storedAs(...)`) with
+// a transform to their wire primitive, but the substitution stopped at a Union,
+// a Record or a Tuple, so those fields stored the marshalled `DateTime` itself.
+// Path-based update values were never encoded at all.
+
+class E133Stamp extends Schema.Class<E133Stamp>("E133Stamp")({ at: Schema.DateTimeUtc }) {}
+class E133Event extends Schema.Class<E133Event>("E133Event")({
+  eventId: Schema.String.pipe(DynamoModel.identifier),
+  venue: Schema.String,
+  nullAt: Schema.NullOr(Schema.DateTimeUtc),
+  nullMs: Schema.NullOr(Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs))),
+  stamp: Schema.NullOr(E133Stamp),
+  rec: Schema.Record(Schema.String, Schema.DateTimeUtc),
+  tup: Schema.Tuple([Schema.String, Schema.DateTimeUtc]),
+  arrNull: Schema.Array(Schema.NullOr(Schema.DateTimeUtc)),
+  days: Schema.Array(Schema.DateTimeUtc),
+}) {}
+class E133Note extends Schema.Class<E133Note>("E133Note")({
+  noteId: Schema.String,
+  venue: Schema.String,
+  event: E133Event.pipe(DynamoModel.ref),
+}) {}
+
+const E133Schema = DynamoSchema.make({ name: "edd133e", version: 1 })
+const E133Events = Entity.make({
+  model: E133Event,
+  entityType: "E133Event",
+  primaryKey: {
+    pk: { field: "pk", composite: ["eventId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byVenue: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["venue"] },
+      sk: { field: "gsi1sk", composite: ["eventId"] },
+      collection: "e133venue",
+    },
+  },
+})
+const E133Notes = Entity.make({
+  model: E133Note,
+  entityType: "E133Note",
+  primaryKey: {
+    pk: { field: "pk", composite: ["noteId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byVenue: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["venue"] },
+      sk: { field: "gsi1sk", composite: ["noteId"] },
+      collection: "e133venue",
+    },
+  },
+  refs: { event: { entity: E133Events } },
+})
+const E133Table = Table.make({ schema: E133Schema, entities: { E133Events, E133Notes } })
+const e133TableName = `edd133e-${Date.now()}`
+const provideE133 = Effect.provide(
+  Layer.mergeAll(ClientLayer, E133Table.layer({ name: e133TableName })),
+)
+const e133Client = DynamoClient.make({
+  entities: { E133Events, E133Notes },
+  tables: { E133Table },
+})
+
+const E133_DOB = "2000-01-01T00:00:00.000Z"
+const E133_DOB_MS = 946684800000
+const E133_LATER = "2000-01-01T00:00:01.000Z"
+const E133_LATER_MS = E133_DOB_MS + 1000
+const e133Dt = DateTime.makeUnsafe(E133_DOB_MS)
+const e133Later = DateTime.makeUnsafe(E133_LATER_MS)
+
+const e133Raw = (pk: string) =>
+  Effect.gen(function* () {
+    const client = yield* DynamoClient
+    const { Item } = yield* client.getItem({
+      TableName: e133TableName,
+      Key: { pk: { S: pk }, sk: { S: "$edd133e#v1#e133event" } },
+      ConsistentRead: true,
+    })
+    return Item as Record<string, any>
+  })
+
+const e133Event = (eventId: string) => ({
+  eventId,
+  venue: "mcg",
+  nullAt: e133Dt,
+  nullMs: e133Dt,
+  stamp: new E133Stamp({ at: e133Dt }),
+  rec: { a: e133Dt },
+  tup: ["x", e133Dt] as const,
+  arrNull: [e133Dt, null],
+  days: [e133Dt],
+})
+
+describeConnected("#133 — entity self dates nested in containers", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* e133Client
+        yield* db.tables.E133Table.create()
+      }).pipe(provideE133, Effect.scoped),
+    )
+  }, 30000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: e133TableName })
+      }).pipe(
+        provideE133,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 30000)
+
+  it.effect("stores wire form, reads real instances, and keeps keys", () =>
+    Effect.gen(function* () {
+      const db = yield* e133Client
+      yield* db.entities.E133Events.put(e133Event("ev1") as any)
+      const item = yield* e133Raw("$edd133e#v1#e133event#eventid_ev1")
+      expect({
+        nullAt: item.nullAt,
+        nullMs: item.nullMs,
+        stamp: item.stamp,
+        rec: item.rec,
+        tup: item.tup,
+        arrNull: item.arrNull,
+        gsi1pk: item.gsi1pk,
+        gsi1sk: item.gsi1sk,
+      }).toEqual({
+        nullAt: { S: E133_DOB },
+        nullMs: { N: String(E133_DOB_MS) },
+        stamp: { M: { at: { S: E133_DOB } } },
+        rec: { M: { a: { S: E133_DOB } } },
+        tup: { L: [{ S: "x" }, { S: E133_DOB }] },
+        arrNull: { L: [{ S: E133_DOB }, { NULL: true }] },
+        gsi1pk: { S: "$edd133e#v1#e133venue#venue_mcg" },
+        gsi1sk: { S: "$edd133e#v1#e133event_1#eventid_ev1" },
+      })
+
+      const got = (yield* db.entities.E133Events.get({ eventId: "ev1" })) as any
+      expect(i133IsRealUtc(got.nullAt, E133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.nullMs, E133_DOB_MS)).toBe(true)
+      expect(got.stamp).toBeInstanceOf(E133Stamp)
+      expect(i133IsRealUtc(got.stamp.at, E133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.rec.a, E133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.tup[1], E133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.arrNull[0], E133_DOB_MS)).toBe(true)
+    }).pipe(provideE133),
+  )
+
+  it.effect(".set() and path operations store wire form", () =>
+    Effect.gen(function* () {
+      const db = yield* e133Client
+      yield* db.entities.E133Events.put(e133Event("ev2") as any)
+      yield* db.entities.E133Events.update({ eventId: "ev2" }).set({
+        nullAt: e133Later,
+        rec: { b: e133Later },
+      } as any)
+      yield* db.entities.E133Events.update({ eventId: "ev2" })
+        .pathSet({ segments: ["stamp", "at"], value: e133Later, isPath: false })
+        .pathSet({ segments: ["days", 0], value: e133Later, isPath: false })
+        .pathAppend({ segments: ["arrNull"], value: [e133Later] })
+      const item = yield* e133Raw("$edd133e#v1#e133event#eventid_ev2")
+      expect({
+        nullAt: item.nullAt,
+        rec: item.rec,
+        stamp: item.stamp,
+        days: item.days,
+        arrNull: item.arrNull,
+      }).toEqual({
+        nullAt: { S: E133_LATER },
+        rec: { M: { b: { S: E133_LATER } } },
+        stamp: { M: { at: { S: E133_LATER } } },
+        days: { L: [{ S: E133_LATER }] },
+        arrNull: { L: [{ S: E133_DOB }, { NULL: true }, { S: E133_LATER }] },
+      })
+      const got = (yield* db.entities.E133Events.get({ eventId: "ev2" })) as any
+      expect(i133IsRealUtc(got.stamp.at, E133_LATER_MS)).toBe(true)
+      expect(i133IsRealUtc(got.arrNull[2], E133_LATER_MS)).toBe(true)
+    }).pipe(provideE133),
+  )
+
+  it.effect("reads a legacy marshalled map back as a real DateTime", () =>
+    Effect.gen(function* () {
+      const db = yield* e133Client
+      yield* db.entities.E133Events.put(e133Event("ev3") as any)
+      const client = yield* DynamoClient
+      yield* client.updateItem({
+        TableName: e133TableName,
+        Key: { pk: { S: "$edd133e#v1#e133event#eventid_ev3" }, sk: { S: "$edd133e#v1#e133event" } },
+        UpdateExpression: "SET #n = :v, #r.#a = :v",
+        ExpressionAttributeNames: { "#n": "nullAt", "#r": "rec", "#a": "a" },
+        ExpressionAttributeValues: {
+          ":v": i133LegacyMap("~effect/time/DateTime")(E133_DOB_MS) as any,
+        },
+      })
+      const got = (yield* db.entities.E133Events.get({ eventId: "ev3" })) as any
+      expect(i133IsRealUtc(got.nullAt, E133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.rec.a, E133_DOB_MS)).toBe(true)
+    }).pipe(provideE133),
+  )
+
+  it.effect("Batch, Transaction, collection and ref hydration decode real instances", () =>
+    Effect.gen(function* () {
+      const db = yield* e133Client
+      yield* Transaction.transactWrite([
+        E133Events.put(e133Event("ev4") as any),
+        E133Events.put(e133Event("ev5") as any),
+      ])
+      const [a, b] = yield* Batch.get([
+        E133Events.get({ eventId: "ev4" }),
+        E133Events.get({ eventId: "ev5" }),
+      ])
+      expect(i133IsRealUtc((a as any)?.nullAt, E133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc((b as any)?.tup[1], E133_DOB_MS)).toBe(true)
+      const [c] = yield* Transaction.transactGet([E133Events.get({ eventId: "ev4" })])
+      expect(i133IsRealUtc((c as any)?.rec.a, E133_DOB_MS)).toBe(true)
+
+      // A plain entity's ref is hydrated from the target and denormalised.
+      yield* db.entities.E133Notes.put({ noteId: "n1", venue: "mcg", eventId: "ev4" } as any)
+      const client = yield* DynamoClient
+      const { Item } = yield* client.getItem({
+        TableName: e133TableName,
+        Key: { pk: { S: "$edd133e#v1#e133note#noteid_n1" }, sk: { S: "$edd133e#v1#e133note" } },
+        ConsistentRead: true,
+      })
+      expect((Item as any).event.M.nullAt).toEqual({ S: E133_DOB })
+      expect((Item as any).event.M.rec).toEqual({ M: { a: { S: E133_DOB } } })
+      const note = (yield* db.entities.E133Notes.get({ noteId: "n1" })) as any
+      expect(i133IsRealUtc(note.event.nullAt, E133_DOB_MS)).toBe(true)
+
+      const venue = yield* db.collections.e133venue!({ venue: "mcg" }).collect()
+      const fromCollection = (venue.E133Events as Array<any>).find((e) => e.eventId === "ev4")
+      expect(i133IsRealUtc(fromCollection?.nullAt, E133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc((venue.E133Notes as Array<any>)[0]?.event.tup[1], E133_DOB_MS)).toBe(
+        true,
+      )
+    }).pipe(provideE133),
+  )
+})
