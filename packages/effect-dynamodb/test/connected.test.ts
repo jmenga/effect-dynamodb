@@ -14388,6 +14388,14 @@ const g133Tables = {
   record: `edd133g-record-${Date.now()}`,
   path: `edd133g-path-${Date.now()}`,
 } as const
+/** A stream on the same table, to write guarded puts as `additionalItems`. */
+class G133Noted extends Schema.Class<G133Noted>("G133Noted")({ note: Schema.String }) {}
+const G133Feed = EventStore.makeStream({
+  table: G133Table,
+  streamName: "G133Feed",
+  events: [G133Noted],
+  streamId: { composite: ["feedId"] },
+})
 const g133Layer = (name: string) => Layer.mergeAll(ClientLayer, G133Table.layer({ name }))
 const g133Client = DynamoClient.make({ entities: g133Entities, tables: { G133Table } })
 
@@ -16512,6 +16520,34 @@ describeConnected("#133 — path operations on index composites and unique field
       ]).pipe(Effect.flip)
       expect(refused._tag).toBe("TransactionCancelled")
       expect((yield* rawItem("G133DeviceRetained", "txr1")).label).toEqual({ S: "v4" })
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("EventStore.append writes a guarded additional put again after a lost race", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const docs = db.entities.DevicesRetained as any
+      yield* docs.put({ id: "esr1", owner: "o", label: "v1" })
+      // Another writer changes the item between the append's read and its
+      // transaction: the transaction is cancelled, built again and written.
+      g133Inject.before = rawSetAttrs("G133DeviceRetained", "esr1", { label: { S: "x" } }, true)
+      const appended = yield* G133Feed.append(
+        { feedId: "esr-feed" },
+        [new G133Noted({ note: "n" })],
+        0,
+        {
+          additionalItems: [
+            g133Entities.DevicesRetained.put({ id: "esr1", owner: "o", label: "mine" } as any),
+          ],
+        },
+      )
+      expect(appended.version).toBe(1)
+      // Last writer wins, past the concurrent write — which is kept as history.
+      const raw = yield* rawItem("G133DeviceRetained", "esr1")
+      expect([raw.label, raw.version]).toEqual([{ S: "mine" }, { N: "3" }])
+      expect(yield* snapshotLabel("G133DeviceRetained", "esr1", 2)).toEqual({ S: "x" })
+      // The event was written exactly once.
+      expect(yield* G133Feed.read({ feedId: "esr-feed" })).toHaveLength(1)
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
