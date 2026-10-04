@@ -1472,3 +1472,117 @@ describe("#133 nested sub-aggregates — derived input schema", () => {
     }),
   )
 })
+
+// ---------------------------------------------------------------------------
+// Batch 3 — root unions mixing a date with a string / number member
+// ---------------------------------------------------------------------------
+
+const describeValue = (v: unknown): string =>
+  DateTime.isDateTime(v)
+    ? Object.getPrototypeOf(v) === Object.prototype
+      ? "PLAIN"
+      : `DT ${DateTime.formatIso(v)}`
+    : typeof v === "bigint"
+      ? `${v}n`
+      : JSON.stringify(v)
+
+interface AggUnionCase {
+  readonly name: string
+  readonly schema: Schema.Top
+  /** Stored attributes, as an earlier version left them, and their read-back. */
+  readonly stored: ReadonlyArray<readonly [AttributeValue, string]>
+  readonly fresh: ReadonlyArray<readonly [unknown, AttributeValue, string]>
+}
+
+const aggUnionCases: ReadonlyArray<AggUnionCase> = [
+  {
+    name: "Union([DateTimeUtc, String])",
+    schema: Schema.Union([Schema.DateTimeUtc, Schema.String]),
+    stored: [
+      [S("2020"), '"2020"'],
+      [S("5"), '"5"'],
+      // <= 1.22.0 aggregates stored this field's dates as canonical ISO.
+      [S(DOB), `DT ${DOB}`],
+      [rcMap(DOB_MS), `DT ${DOB}`],
+    ],
+    fresh: [
+      ["2020", S("2020"), '"2020"'],
+      [DateTime.makeUnsafe(DOB_MS), S(DOB), `DT ${DOB}`],
+    ],
+  },
+  {
+    name: "Union([String, DateTimeUtc])",
+    schema: Schema.Union([Schema.String, Schema.DateTimeUtc]),
+    stored: [
+      [S("2020"), '"2020"'],
+      [S(DOB), `DT ${DOB}`],
+    ],
+    fresh: [
+      ["hello", S("hello"), '"hello"'],
+      [DateTime.makeUnsafe(DOB_MS), S(DOB), `DT ${DOB}`],
+    ],
+  },
+  {
+    name: "Union([DateTimeUtc storedAs epochMs, Number])",
+    schema: Schema.Union([
+      Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
+      Schema.Number,
+    ]),
+    stored: [
+      [{ N: "5" }, "5"],
+      [rcMap(DOB_MS), `DT ${DOB}`],
+    ],
+    fresh: [
+      [5, { N: "5" }, "5"],
+      [DateTime.makeUnsafe(DOB_MS), S(DOB), `DT ${DOB}`],
+    ],
+  },
+  {
+    name: "NullOr(DateTimeUtc)",
+    schema: Schema.NullOr(Schema.DateTimeUtc),
+    stored: [[rcMap(DOB_MS), `DT ${DOB}`]],
+    fresh: [
+      [DateTime.makeUnsafe(DOB_MS), S(DOB), `DT ${DOB}`],
+      [null, { NULL: true }, "null"],
+    ],
+  },
+  {
+    name: "Schema.BigInt",
+    schema: Schema.BigInt,
+    stored: [
+      [{ N: "5" }, "5n"],
+      [{ N: "12345678901234567890" }, "12345678901234567890n"],
+    ],
+    fresh: [[5n, { N: "5" }, "5n"]],
+  },
+]
+
+describe("#133 nested transforms — root unions with a colliding member", () => {
+  for (const c of aggUnionCases) {
+    it.effect(`${c.name}: stored rows and fresh writes read back as their own member`, () =>
+      Effect.gen(function* () {
+        const Holder = makeHolder(`collide-${c.name}`, c.schema)
+        const reads: Array<string> = []
+        for (const [stored] of c.stored) {
+          store.clear()
+          yield* Holder.create({ id: "h1", f: c.fresh[0]![0] } as any)
+          holderItem().f = stored
+          reads.push(describeValue(((yield* Holder.get({ id: "h1" } as any)) as any).f))
+        }
+        expect(reads).toEqual(c.stored.map(([, read]) => read))
+
+        const fresh: Array<string> = []
+        for (const [value, stored] of c.fresh) {
+          store.clear()
+          yield* Holder.create({ id: "h1", f: value } as any)
+          expect(holderItem().f).toEqual(stored)
+          fresh.push(describeValue(((yield* Holder.get({ id: "h1" } as any)) as any).f))
+          transactCalls.length = 0
+          yield* Holder.update({ id: "h1" } as any, (ctx: any) => ctx.state)
+          expect(transactCalls).toHaveLength(0)
+        }
+        expect(fresh).toEqual(c.fresh.map(([, , read]) => read))
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  }
+})

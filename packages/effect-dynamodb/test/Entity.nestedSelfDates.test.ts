@@ -16,7 +16,7 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { DateTime, Effect, Equal, Layer, Schema } from "effect"
+import { DateTime, Effect, Equal, Layer, Redacted, Schema } from "effect"
 import { beforeEach } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -588,5 +588,304 @@ describe("#133 entity nested self dates — update values", () => {
       const values = Object.values(update.input.ExpressionAttributeValues as Record<string, any>)
       expect(values.some(holdsMarshalledDate)).toBe(false)
     }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Batch 3 — unions that mix a self date with a string / number member, path
+// values already in wire form, configured storage on a union, legacy raw values
+// ---------------------------------------------------------------------------
+
+const makeEntityHolder = (
+  name: string,
+  field: Schema.Top,
+  configured?: Record<string, unknown>,
+  extra: Record<string, Schema.Top> = {},
+) => {
+  class Holder extends Schema.Class<Holder>(`EntityHolder-${name}`)({
+    id: Schema.String,
+    f: field as Schema.Codec<unknown>,
+    ...(extra as Record<string, Schema.Codec<unknown>>),
+  }) {}
+  const model = configured === undefined ? Holder : DynamoModel.configure(Holder, configured as any)
+  const Holders = Entity.make({
+    model: model as any,
+    entityType: "EntityHolder",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  })
+  const HolderTable = Table.make({ schema: AppSchema, entities: { Holders } })
+  return {
+    client: DynamoClient.make({ entities: { Holders }, tables: { HolderTable } }),
+    layer: Layer.merge(InMemoryClient, HolderTable.layer({ name: "edd133" })),
+  }
+}
+const holderRow = (id: string) =>
+  [...store.values()].find((i) => i.__edd_e__?.S === "EntityHolder" && i.id?.S === id)!
+const plant = (id: string, attrs: Record<string, AttributeValue>) =>
+  store.set(`$edd133#v1#entityholder#id_${id}|$edd133#v1#entityholder`, {
+    pk: S(`$edd133#v1#entityholder#id_${id}`),
+    sk: S("$edd133#v1#entityholder"),
+    __edd_e__: S("EntityHolder"),
+    id: S(id),
+    ...attrs,
+  })
+const describeValue = (v: unknown): string =>
+  DateTime.isDateTime(v)
+    ? Object.getPrototypeOf(v) === Object.prototype
+      ? "PLAIN"
+      : `DT ${DateTime.formatIso(v)}`
+    : JSON.stringify(v)
+
+interface UnionCase {
+  readonly name: string
+  readonly schema: Schema.Top
+  /** Rows as <= 1.22.0 stored them, and what each must read back as. */
+  readonly legacy: ReadonlyArray<readonly [AttributeValue, string]>
+  /** Fresh writes: value, stored attribute, read-back. */
+  readonly fresh: ReadonlyArray<readonly [unknown, AttributeValue, string]>
+}
+
+const unionCases: ReadonlyArray<UnionCase> = [
+  {
+    name: "Union([DateTimeUtc, String])",
+    schema: Schema.Union([Schema.DateTimeUtc, Schema.String]),
+    legacy: [
+      [S("2020"), '"2020"'],
+      [S("5"), '"5"'],
+      [S("hello"), '"hello"'],
+      [rcMap(DOB_MS), `DT ${DOB}`],
+    ],
+    fresh: [
+      ["2020", S("2020"), '"2020"'],
+      ["5", S("5"), '"5"'],
+      [dt, S(DOB), `DT ${DOB}`],
+    ],
+  },
+  {
+    name: "Union([String, DateTimeUtc])",
+    schema: Schema.Union([Schema.String, Schema.DateTimeUtc]),
+    legacy: [
+      [S("2020"), '"2020"'],
+      [rcMap(DOB_MS), `DT ${DOB}`],
+    ],
+    fresh: [
+      ["2020", S("2020"), '"2020"'],
+      [dt, S(DOB), `DT ${DOB}`],
+    ],
+  },
+  {
+    name: "Union([DateTimeUtc storedAs epochMs, Number])",
+    schema: Schema.Union([
+      Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
+      Schema.Number,
+    ]),
+    legacy: [
+      [{ N: "5" }, "5"],
+      [{ N: String(DOB_MS) }, String(DOB_MS)],
+      [rcMap(DOB_MS), `DT ${DOB}`],
+    ],
+    fresh: [
+      [5, { N: "5" }, "5"],
+      // An epoch number would be indistinguishable from the Number member, so
+      // the date is stored as its canonical ISO string instead.
+      [dt, S(DOB), `DT ${DOB}`],
+    ],
+  },
+  {
+    name: "NullOr(DateTimeUtc)",
+    schema: Schema.NullOr(Schema.DateTimeUtc),
+    legacy: [
+      [rcMap(DOB_MS), `DT ${DOB}`],
+      [{ NULL: true }, "null"],
+    ],
+    fresh: [
+      [dt, S(DOB), `DT ${DOB}`],
+      [null, { NULL: true }, "null"],
+    ],
+  },
+]
+
+describe("#133 entity nested self dates — unions with a colliding member", () => {
+  for (const c of unionCases) {
+    it.effect(`${c.name}: legacy rows and fresh writes read back as their own member`, () => {
+      const { client, layer } = makeEntityHolder(c.name, c.schema)
+      return Effect.gen(function* () {
+        const db = yield* client
+        const reads: Array<string> = []
+        for (const [index, [stored]] of c.legacy.entries()) plant(`l${index}`, { f: stored })
+        for (const [index] of c.legacy.entries()) {
+          const got = (yield* db.entities.Holders.get({ id: `l${index}` })) as any
+          reads.push(describeValue(got.f))
+        }
+        expect(reads).toEqual(c.legacy.map(([, read]) => read))
+
+        const fresh: Array<string> = []
+        for (const [index, [value, stored]] of c.fresh.entries()) {
+          yield* db.entities.Holders.put({ id: `f${index}`, f: value } as any)
+          expect(holderRow(`f${index}`).f).toEqual(stored)
+          const got = (yield* db.entities.Holders.get({ id: `f${index}` })) as any
+          fresh.push(describeValue(got.f))
+        }
+        expect(fresh).toEqual(c.fresh.map(([, , read]) => read))
+      }).pipe(Effect.provide(layer))
+    })
+  }
+
+  it.effect("a String value spelled exactly as a canonical ISO instant reads as the date", () => {
+    // The one value the two members cannot be told apart by: documented decision.
+    const { client, layer } = makeEntityHolder(
+      "canonical",
+      Schema.Union([Schema.DateTimeUtc, Schema.String]),
+    )
+    return Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Holders.put({ id: "c1", f: DOB } as any)
+      const got = (yield* db.entities.Holders.get({ id: "c1" })) as any
+      expect(describeValue(got.f)).toBe(`DT ${DOB}`)
+    }).pipe(Effect.provide(layer))
+  })
+})
+
+describe("#133 entity nested self dates — path values already in wire form", () => {
+  class Address extends Schema.Class<Address>("PathAddress")({
+    since: Schema.DateTimeUtc,
+    n: Schema.NumberFromString,
+  }) {}
+  const { client, layer } = makeEntityHolder("wire", Schema.StringFromBase64, undefined, {
+    json: Schema.fromJsonString(Schema.Unknown),
+    b64s: Schema.Array(Schema.StringFromBase64),
+    nfs: Schema.NumberFromString,
+    xdate: Schema.DateTimeUtcFromString,
+    secret: Schema.RedactedFromValue(Schema.String),
+    addr: Address,
+  })
+  const input = {
+    id: "w1",
+    f: "hi",
+    json: { a: 1 },
+    b64s: ["hi"],
+    nfs: 1,
+    xdate: dt,
+    secret: Redacted.make("s"),
+    addr: new Address({ since: dt, n: 1 }),
+  }
+  const setValue = (segments: ReadonlyArray<string | number>, value: unknown) =>
+    Effect.gen(function* () {
+      const db = yield* client
+      writes.length = 0
+      yield* db.entities.Holders.update({ id: "w1" }).pathSet({ segments, value, isPath: false })
+      return lastUpdateValues()
+    })
+
+  it.effect("passes ambiguous wire values through unchanged", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Holders.put(input as any)
+      expect(yield* setValue(["f"], "aGk=")).toContainEqual(S("aGk="))
+      expect(yield* setValue(["json"], '{"a":2}')).toContainEqual(S('{"a":2}'))
+      expect(yield* setValue(["b64s"], ["aGk="])).toContainEqual({ L: [S("aGk=")] })
+    }).pipe(Effect.provide(layer)),
+  )
+
+  it.effect("still encodes values that are unambiguously domain", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Holders.put(input as any)
+      expect(yield* setValue(["nfs"], 5)).toContainEqual(S("5"))
+      expect(yield* setValue(["nfs"], "6")).toContainEqual(S("6"))
+      expect(yield* setValue(["xdate"], dt)).toContainEqual(S(DOB))
+      expect(yield* setValue(["secret"], Redacted.make("z"))).toContainEqual(S("z"))
+      expect(yield* setValue(["json"], { a: 3 })).toContainEqual(S('{"a":3}'))
+      expect(yield* setValue(["addr"], new Address({ since: dt, n: 2 }))).toContainEqual({
+        M: { since: S(DOB), n: S("2") },
+      })
+      expect(yield* setValue(["addr", "n"], 7)).toContainEqual(S("7"))
+    }).pipe(Effect.provide(layer)),
+  )
+})
+
+describe("#133 entity nested self dates — configured storage on a union field", () => {
+  it.effect("DynamoModel.configure storedAs reaches the union's date member", () => {
+    const { client, layer } = makeEntityHolder("configured", Schema.NullOr(Schema.DateTimeUtc), {
+      f: { storedAs: DynamoModel.DateEpochMs },
+    })
+    return Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Holders.put({ id: "c1", f: dt } as any)
+      expect(holderRow("c1").f).toEqual({ N: String(DOB_MS) })
+      const got = (yield* db.entities.Holders.get({ id: "c1" })) as any
+      expect(isRealUtc(got.f, DOB_MS)).toBe(true)
+      writes.length = 0
+      yield* db.entities.Holders.update({ id: "c1" }).pathSet({
+        segments: ["f"],
+        value: later,
+        isPath: false,
+      })
+      expect(lastUpdateValues()).toContainEqual({ N: String(LATER_MS) })
+    }).pipe(Effect.provide(layer))
+  })
+
+  it("rejects a configured storage override on a union with several date members", () => {
+    expect(() =>
+      makeEntityHolder("ambiguous", Schema.Union([Schema.DateTimeUtc, Schema.Date]), {
+        f: { storedAs: DynamoModel.DateEpochMs },
+      }),
+    ).toThrow(/EDD-9057/)
+  })
+})
+
+describe("#133 entity nested self dates — legacy raw values on transform fields", () => {
+  class Box extends Schema.Class<Box>("LegacyBox")({ n: Schema.NumberFromString }) {}
+  const { client, layer } = makeEntityHolder("legacy", Schema.NumberFromString, undefined, {
+    big: Schema.BigIntFromString,
+    xdate: Schema.DateTimeUtcFromString,
+    box: Box,
+    plainBig: Schema.BigInt,
+    either: Schema.Union([Schema.BigIntFromString, Schema.Number]),
+  })
+
+  it.effect("reads values old path operations stored in their domain form", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      plant("r1", {
+        f: { N: "5" },
+        big: { N: "7" },
+        xdate: rcMap(DOB_MS),
+        box: { M: { n: { N: "3" } } },
+        plainBig: { N: "9" },
+        either: { N: "4" },
+      })
+      const got = (yield* db.entities.Holders.get({ id: "r1" })) as any
+      expect(got.f).toBe(5)
+      expect(got.big).toBe(7n)
+      expect(isRealUtc(got.xdate, DOB_MS)).toBe(true)
+      expect(got.box.n).toBe(3)
+      expect(got.plainBig).toBe(9n)
+      // A union member never claims another member's value.
+      expect(got.either).toBe(4)
+    }).pipe(Effect.provide(layer)),
+  )
+
+  it.effect("keeps writing each transform's own wire form", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Holders.put({
+        id: "r2",
+        f: 5,
+        big: 7n,
+        xdate: dt,
+        box: new Box({ n: 3 }),
+        plainBig: 12345678901234567890n,
+        either: 4,
+      } as any)
+      const row = holderRow("r2")
+      expect(row.f).toEqual(S("5"))
+      expect(row.big).toEqual(S("7"))
+      expect(row.xdate).toEqual(S(DOB))
+      expect(row.box).toEqual({ M: { n: S("3") } })
+      expect(row.plainBig).toEqual({ N: "12345678901234567890" })
+      const got = (yield* db.entities.Holders.get({ id: "r2" })) as any
+      expect(got.plainBig).toBe(12345678901234567890n)
+    }).pipe(Effect.provide(layer)),
   )
 })
