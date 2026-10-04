@@ -31,7 +31,7 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { DateTime, Effect, Equal, Layer, Schema } from "effect"
+import { DateTime, Duration, Effect, Equal, Layer, Option, Schema } from "effect"
 import { beforeEach } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Entity from "../src/Entity.js"
@@ -1065,6 +1065,200 @@ describe("#133 nested transforms — many edge of annotated refs", () => {
         const legacy = (yield* RefRosterAggregate.get({ id: "rr1" } as any)) as RefRoster
         expect(isRealUtc(legacy.players[0]!.dateOfBirth, DOB_MS)).toBe(true)
       }
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Container refinements survive substitution
+// ---------------------------------------------------------------------------
+
+interface CheckedCase {
+  readonly name: string
+  readonly schema: Schema.Top
+  readonly valid: unknown
+  readonly stored: AttributeValue
+  readonly read: (value: any) => boolean
+  readonly invalid: unknown
+}
+
+const checkedCases: ReadonlyArray<CheckedCase> = [
+  {
+    name: "Record.check(isMaxProperties(1))",
+    schema: Schema.Record(Schema.String, Schema.DateTimeUtcFromString).check(
+      Schema.isMaxProperties(1),
+    ),
+    valid: { a: DOB },
+    stored: { M: { a: S(DOB) } },
+    read: (v) => isRealUtc(v.a, DOB_MS),
+    invalid: { a: DOB, b: DOB },
+  },
+  {
+    name: "TupleWithRest.check(isMaxLength(2))",
+    schema: Schema.TupleWithRest(Schema.Tuple([Schema.String]), [
+      Schema.DateTimeUtcFromString,
+    ]).check(Schema.isMaxLength(2)),
+    valid: ["x", DOB],
+    stored: { L: [S("x"), S(DOB)] },
+    read: (v) => v[0] === "x" && isRealUtc(v[1], DOB_MS),
+    invalid: ["x", DOB, DOB],
+  },
+  {
+    name: "StructWithRest.check(isMaxProperties(2))",
+    schema: Schema.StructWithRest(Schema.Struct({ at: Schema.DateTimeUtcFromString }), [
+      Schema.Record(Schema.String, Schema.Unknown),
+    ]).check(Schema.isMaxProperties(2)),
+    valid: { at: DOB, note: "n" },
+    stored: { M: { at: S(DOB), note: S("n") } },
+    read: (v) => isRealUtc(v.at, DOB_MS) && v.note === "n",
+    invalid: { at: DOB, note: "n", extra: "e" },
+  },
+  {
+    name: "Tuple.check(...)",
+    schema: Schema.Tuple([Schema.String, Schema.DateTimeUtcFromString]).check(
+      Schema.makeFilter((t: readonly [string, unknown]) => t[0] !== "bad" || "no bad"),
+    ),
+    valid: ["x", DOB],
+    stored: { L: [S("x"), S(DOB)] },
+    read: (v) => isRealUtc(v[1], DOB_MS),
+    invalid: ["bad", DOB],
+  },
+  {
+    name: "NullOr.check(...)",
+    schema: Schema.NullOr(Schema.DateTimeUtcFromString).check(
+      Schema.makeFilter((v: unknown) => v !== null || "no nulls"),
+    ),
+    valid: DOB,
+    stored: S(DOB),
+    read: (v) => isRealUtc(v, DOB_MS),
+    invalid: null,
+  },
+]
+
+describe("#133 nested transforms — container refinements are kept", () => {
+  for (const c of checkedCases) {
+    it.effect(c.name, () =>
+      Effect.gen(function* () {
+        const Holder = makeHolder(`checked-${c.name}`, c.schema)
+        yield* Holder.create({ id: "h1", f: c.valid } as any)
+        expect(holderItem().f).toEqual(c.stored)
+        const got = (yield* Holder.get({ id: "h1" } as any)) as any
+        expect(c.read(got.f)).toBe(true)
+
+        const badCreate = yield* Effect.flip(Holder.create({ id: "h2", f: c.invalid } as any))
+        expect(badCreate._tag).toBe("ValidationError")
+        const badUpdate = yield* Effect.flip(
+          Holder.update({ id: "h1" } as any, (ctx: any) => ({ ...ctx.state, f: c.invalid })),
+        )
+        expect(badUpdate._tag).toBe("ValidationError")
+        expect(holderItem().f).toEqual(c.stored)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Create input with a ref edge: Effect values and cycles
+// ---------------------------------------------------------------------------
+
+class Kit extends Schema.Class<Kit>("Kit")({
+  id: Schema.String,
+  coach: Coach.pipe(DynamoModel.ref),
+  nickname: Schema.Option(Schema.String),
+  warmup: Schema.Duration,
+  inner: Schema.Struct({ n: Schema.Number }),
+}) {}
+
+const KitAggregate = Aggregate.make(Kit, {
+  table: ReproTable,
+  schema: ReproSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "kit" },
+  root: { entityType: "KitItem" },
+  edges: { coach: Aggregate.one("coach", { entityType: "KitCoach", entity: Coaches }) },
+})
+
+describe("#133 nested transforms — create input values survive ref replacement", () => {
+  for (const [label, nickname] of [
+    ["Option.some", Option.some("Coachy")],
+    ["Option.none", Option.none()],
+  ] as const) {
+    it.effect(`keeps an ${label} and a Duration`, () =>
+      Effect.gen(function* () {
+        yield* seed
+        const input = {
+          id: "k1",
+          coachId: "coach-1",
+          nickname,
+          warmup: Duration.minutes(5),
+          inner: { n: 1 },
+        }
+        const created = (yield* KitAggregate.create(input as any)) as Kit
+        expect(Equal.equals(created.nickname, nickname)).toBe(true)
+        expect(Equal.equals(created.warmup, Duration.minutes(5))).toBe(true)
+        // The caller's input is not mutated by ref replacement.
+        expect("coachId" in input).toBe(true)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  }
+
+  it.effect("copies a cyclic input instead of overflowing the stack", () =>
+    Effect.gen(function* () {
+      yield* seed
+      const input: any = {
+        id: "k2",
+        coachId: "coach-1",
+        nickname: Option.none(),
+        warmup: Duration.seconds(1),
+        inner: { n: 1 },
+      }
+      input.inner.self = input
+      const created = (yield* KitAggregate.create(input)) as Kit
+      expect(created.inner.n).toBe(1)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Legacy domain-form numbers
+// ---------------------------------------------------------------------------
+
+class Tally extends Schema.Class<Tally>("Tally")({
+  id: Schema.String,
+  big: Schema.optional(Schema.BigIntFromString),
+  bigs: Schema.Array(Schema.BigIntFromString),
+  num: Schema.optional(Schema.NumberFromString),
+}) {}
+
+const TallyAggregate = Aggregate.make(Tally, {
+  table: ReproTable,
+  schema: ReproSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "tally" },
+  root: { entityType: "TallyItem" },
+  edges: {},
+})
+
+describe("#133 nested transforms — legacy domain-form numbers", () => {
+  it.effect("reads bigint and NumberFromString values stored as N before #133", () =>
+    Effect.gen(function* () {
+      yield* TallyAggregate.create({ id: "t1", big: "5", bigs: ["7"], num: "3" } as any)
+      const item = [...store.values()].find((i) => i.__edd_e__?.S === "TallyItem")!
+      expect(item.big).toEqual(S("5"))
+      // How <= 1.22.0 stored them: the domain value, marshalled as a number.
+      item.big = { N: "5" }
+      item.bigs = { L: [{ N: "7" }, { N: "12345678901234567890" }] }
+      item.num = { N: "3" }
+
+      const got = (yield* TallyAggregate.get({ id: "t1" } as any)) as Tally
+      expect(got.big).toBe(5n)
+      expect(got.bigs).toEqual([7n, 12345678901234567890n])
+      expect(got.num).toBe(3)
+
+      yield* TallyAggregate.update({ id: "t1" } as any, (c: any) => ({ ...c.state, big: 6n }))
+      const after = [...store.values()].find((i) => i.__edd_e__?.S === "TallyItem")!
+      expect(after.big).toEqual(S("6"))
+      expect(after.bigs).toEqual({ L: [S("7"), S("12345678901234567890")] })
     }).pipe(Effect.provide(TestLayer)),
   )
 })

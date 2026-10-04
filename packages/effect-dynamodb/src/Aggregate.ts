@@ -49,9 +49,9 @@ import {
   type Context,
   DateTime,
   Effect,
+  Equal,
   type Optic,
   Option,
-  Redacted,
   Schema,
   SchemaAST,
 } from "effect"
@@ -2432,19 +2432,33 @@ const collectRefIdsFromEdges = (
 /**
  * Deep-copy a create input so ref replacement can mutate it — like
  * `structuredClone`, which this replaces, except that DOMAIN VALUES survive.
- * `structuredClone` copies only own enumerable properties, so a `DateTime` came
- * out as a bare `{ epochMilliseconds }` object with no prototype and no tag,
- * which no date schema accepts, and a `Redacted` came out empty: any aggregate
- * with a ref edge rejected a `DateTime` in its create input (#133). Those
- * immutable domain values are now kept by reference; built-ins
- * `structuredClone` knows (`Date`, `Map`, `Set`, binary data) still go through
- * it; plain objects, arrays and class instances are walked and copied to plain
- * objects, as `structuredClone` copied them.
+ *
+ * `structuredClone` copies only own enumerable properties, so it reduced every
+ * Effect data type to a bare object: a `DateTime` became `{ epochMilliseconds }`
+ * with no prototype or tag, a `Redacted` became `{}`, an `Option` lost its
+ * variant. No schema accepts those, so any aggregate with a ref edge rejected
+ * such a value in its create input (#133).
+ *
+ * - Values implementing `Equal` — `DateTime`, `Redacted`, `Option`, `Duration`,
+ *   `Chunk`, `HashMap`, … — are immutable, so they are kept by reference.
+ * - Built-ins `structuredClone` knows (`Date`, `Map`, `Set`, `RegExp`, binary
+ *   data) still go through it.
+ * - Plain objects, arrays and other class instances (a `Schema.Class` value
+ *   among them) are walked and copied to plain objects, as `structuredClone`
+ *   copied them — so ref replacement never mutates the caller's objects.
+ * - Cycles are preserved, as `structuredClone` preserved them.
  */
-const cloneInput = (value: unknown): unknown => {
+const cloneInput = (value: unknown, seen: WeakMap<object, unknown> = new WeakMap()): unknown => {
   if (value === null || typeof value !== "object") return value
-  if (Array.isArray(value)) return value.map(cloneInput)
-  if (DateTime.isDateTime(value) || Redacted.isRedacted(value)) return value
+  if (Equal.isEqual(value)) return value
+  const prior = seen.get(value)
+  if (prior !== undefined) return prior
+  if (Array.isArray(value)) {
+    const copy: Array<unknown> = []
+    seen.set(value, copy)
+    for (const entry of value) copy.push(cloneInput(entry, seen))
+    return copy
+  }
   if (
     value instanceof Date ||
     value instanceof Map ||
@@ -2453,12 +2467,13 @@ const cloneInput = (value: unknown): unknown => {
     ArrayBuffer.isView(value) ||
     value instanceof ArrayBuffer
   ) {
-    return structuredClone(value)
+    const copy = structuredClone(value)
+    seen.set(value, copy)
+    return copy
   }
-  // A plain object, or a class instance — which `structuredClone` also reduced
-  // to a plain object of its own enumerable properties.
   const copy: Record<string, unknown> = {}
-  for (const [key, entry] of Object.entries(value)) copy[key] = cloneInput(entry)
+  seen.set(value, copy)
+  for (const [key, entry] of Object.entries(value)) copy[key] = cloneInput(entry, seen)
   return copy
 }
 
