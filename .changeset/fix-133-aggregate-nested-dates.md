@@ -48,6 +48,32 @@ real `DateTime`s.
   date) or remove the numeric member. A `DynamoModel.configure` `storedAs`
   override on a union field with more than one date member fails with
   `EDD-9057`; annotate the intended member instead.
+- **Update and delete errors changed.** A lost version race is now always an
+  `OptimisticLockError` carrying the real `actualVersion`, a failed
+  `.condition()` is always a `ConditionalCheckFailed`, and an update of a
+  missing item is always an `ItemNotFound` (it used to be
+  `OptimisticLockError(-1)` for a versioned update with `expectedVersion`).
+  Two new errors exist: `ConcurrentModification` and `UpdateAppliedButUnreadable`.
+  Don't retry the second one, because the write was applied. Review your
+  `catchTag` handlers; the cases that changed are listed under "Updates and
+  deletes".
+- **`update()` of a missing item fails instead of writing a partial row.** It
+  now fails with `ItemNotFound` and writes nothing, unless it is a plain update
+  whose `.set()` supplies every required field and key composite, which
+  creates a complete item. `patch()` is unchanged.
+- **More updates are refused with a `ValidationError`**: a `.set()` that changes
+  a primary-key composite (silently ignored before), a `.set()` that changes an
+  immutable field (restating its current value is fine), and the path
+  operations on index composites and unique fields listed under "Updates and
+  deletes".
+- **`returnValues` is honoured, and typed by its mode.** `"none"` now returns
+  `undefined` and `"updatedOld"` / `"updatedNew"` return a partial of the
+  attributes written, on every update path. A retain update with `"allOld"`
+  now returns the replaced item rather than the new one.
+- **Versioned entities get a hidden attribute.** `__edd_i__` is set on create
+  and added to existing items on their next guarded write. Decoded models never
+  include it, but raw readers, `asNative` and DynamoDB Streams consumers will
+  see it.
 - **Writes are validated more strictly**, so some calls that used to succeed
   now fail with a `ValidationError`. Container `.check()` refinements on an
   array, a struct or a checked-struct class that holds a date or another
@@ -201,8 +227,8 @@ exactly as DynamoDB defines: list indexes refer to the item before the update,
 a copy reads the old value, overlapping paths and appends to a missing list are
 rejected, and a rejected update writes no snapshot. `expectedVersion` and
 `.condition()` apply. One update cannot combine path operations with a change
-to a unique-constraint field; it fails with a `ValidationError`, so split it
-into two updates.
+to a unique-constraint field or a computed change to an index composite; it
+fails with a `ValidationError`, so split it into two updates.
 
 **Legacy values read back.** The raw values earlier path updates left on
 transform fields now read: a number on a `NumberFromString` field, a
@@ -222,6 +248,85 @@ unchanged. Known limitation, as in earlier versions: an offset that isn't a
 whole minute (a historical local-mean-time offset, a sub-minute
 `zoneMakeOffset`) is rounded to the minute by Effect's ISO format, and the
 instant read back moves by the same amount.
+
+### Updates and deletes
+
+**Path operations on index composites and unique fields.** A top-level
+`pathSet` of a value or `pathRemove`, and a numeric `pathAdd` or
+`pathSubtract`, on an index composite or unique field now recompose the keys
+and rotate the unique sentinels exactly as `.set()`, `.remove()`, `.add()` and
+`.subtract()` do. Operations whose result DynamoDB computes at write time
+(copies, `pathIfNotExists`, list and set operations) on such a field, paths
+below such a field, any path operation on a primary-key composite or an
+immutable field, and two operations on the same such field are rejected with a
+`ValidationError` naming the field. An update can't combine path operations
+with a change to a unique field or a computed change to an index composite;
+split it into two updates. `.add()`, `.subtract()`, `.append()` and
+`.deleteFromSet()` on an index composite now recompose the index key on every
+entity.
+
+**Error mapping.** On every update path a lost version race is an
+`OptimisticLockError` with the real `actualVersion`, a failed `.condition()` is
+a `ConditionalCheckFailed`, and a missing item is an `ItemNotFound`. Three cases
+used to be the other way round:
+
+- A versioned update with `expectedVersion` and a `.condition()` reported a
+  failed condition as `OptimisticLockError(-1)`.
+- A retain update with a `.condition()` did the same.
+- A retain path update with a `.condition()` reported a lost version race as
+  `ConditionalCheckFailed`.
+
+**Guarded read-then-write.** Updates that read the item first (a unique-field
+change, a computed change to an index composite, any retain update) write a
+guarded update of only what changed. A concurrent change to an unrelated
+attribute is preserved. A race on something the update read fails without
+writing: with the new `ConcurrentModification` on an unversioned entity, and
+with `OptimisticLockError` on a versioned one. Soft delete and a hard delete
+with unique constraints are guarded the same way. `restore` fails with
+`ItemNotFound` if a concurrent restore won, and with `ItemNotDeleted` if a live
+item exists under the key. An unversioned soft delete of an item so wide that
+its guard would exceed DynamoDB's 4 KB expression limit is refused with a
+`ValidationError` asking you to make the entity `versioned`.
+
+**Incarnation token.** Versioned entities carry a hidden `__edd_i__` attribute,
+set on create and backfilled on the next guarded write. It is never in decoded
+models (only in `asNative`). Version-checked writes require it, so an item
+deleted and recreated at the same version is never mistaken for the original.
+
+**Retain return values.** A retain update returns exactly the item it wrote,
+even if another writer has replaced it since. If that can't be proven, it fails
+with the new `UpdateAppliedButUnreadable`: the write WAS applied, so don't
+retry. `allOld` returns the replaced item; on record and unique-field retain
+updates it used to return the new one.
+
+**`returnValues` on every update path.** `"none"` returns `undefined`,
+`"updatedOld"` / `"updatedNew"` return only the top-level attributes written as
+a partial, and `"allOld"` / `"allNew"` return the whole item. The result type
+follows the mode (`UpdateReturn` is exported), and repeated
+`Entity.returnValues` calls are typed by the last one. A cascade with `allOld`
+or `updatedOld` cascades exactly what this update wrote; combined with path
+operations on an unversioned entity it is refused.
+
+**`update()` of a missing item** no longer leaves an undecodable partial row.
+Unless it is a plain update whose `.set()` supplies every required field and key
+composite, it fails with `ItemNotFound` and writes nothing. A complete payload
+creates a full item. An update that reads first (unique-field change, retain)
+always requires the item. `patch()` is unchanged.
+
+**`.set()` refusals.** A `.set()` of a changed primary-key composite is refused;
+it was silently ignored before. An immutable field can be restated with its
+current value, so spread records work; a different value is refused.
+
+**Known limitations.**
+
+- On an unversioned entity, the item returned by a unique-field update may show
+  a stale value for an attribute the update neither reads nor writes, if
+  another writer changed it in between. Use `versioned` for exact images.
+- An unversioned soft delete can't detect a sparse map entry added concurrently
+  under a key it has never seen.
+- A plain `.expectedVersion(n)` can't detect a delete-and-recreate that has
+  climbed back to version `n`: versions restart at 1, so this needs `n − 1`
+  updates after the recreate.
 
 ### Nested sub-aggregates
 
