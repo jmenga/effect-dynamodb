@@ -9924,6 +9924,29 @@ describeConnected("composite key form — mixed-width ordering", () => {
       }).pipe(provideKf),
     )
 
+    it.effect("select and filter on a renamed field use its stored name (#133)", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+        yield* db.entities.KfRenameds.put({ rid: "rs1", label: "renamed" })
+        const q = () => db.entities.KfRenameds.primary({ rid: "rs1" })
+        expect(yield* q().select(["label"]).collect()).toEqual([{ label: "renamed" }])
+        expect(
+          yield* q()
+            .select((t) => [t.label])
+            .collect(),
+        ).toEqual([{ label: "renamed" }])
+        expect((yield* q().filter({ label: "renamed" }).collect()).map((r) => r.rid)).toEqual([
+          "rs1",
+        ])
+        expect(
+          (yield* q()
+            .filter((t, { eq }) => eq(t.label, "renamed"))
+            .collect()).map((r) => r.rid),
+        ).toEqual(["rs1"])
+        expect(yield* q().filter({ label: "other" }).collect()).toEqual([])
+      }).pipe(provideKf),
+    )
+
     it.effect("the uniqueness sentinel guard names the configured pk attribute", () =>
       Effect.gen(function* () {
         const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })

@@ -430,6 +430,39 @@ export const select: {
 )
 
 /**
+ * @internal `select` / `selectPaths` of DOMAIN field names on an entity that
+ * stores some under other names (`DynamoModel.configure(..., { field })`): the
+ * projection names the stored attributes, and each item is handed back keyed
+ * by the domain names asked for (#133).
+ */
+export const selectRenamed = <A>(
+  self: Query<A>,
+  paths: ReadonlyArray<ReadonlyArray<string | number>>,
+  resolveDbName: (domainName: string) => string,
+): Query<Record<string, unknown>> => {
+  if (self._state.predicates.length > 0) {
+    throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
+  }
+  const heads = [...new Set(paths.map((path) => String(path[0])))]
+  const stored = paths.map((path) => [resolveDbName(String(path[0])), ...path.slice(1)])
+  const flat = stored.every((path) => path.length === 1)
+  return new QueryImpl<Record<string, unknown>>({
+    ...self._state,
+    ...(flat
+      ? { projection: stored.map((path) => String(path[0])), projectionPaths: undefined }
+      : { projectionPaths: stored }),
+    decoder: (raw) => {
+      const item: Record<string, unknown> = {}
+      for (const head of heads) {
+        const value = raw[resolveDbName(head)]
+        if (value !== undefined) item[head] = value
+      }
+      return Effect.succeed(item)
+    },
+  })
+}
+
+/**
  * Add an Expr-based filter expression to the query.
  * Multiple filterExpr calls are ANDed together.
  */

@@ -1364,6 +1364,7 @@ const makeFromConfig = (config: {
           provide,
           composeSkCondition,
           skFields: indexDef.sk.composite,
+          resolveDbName: entityLike._resolveDbName,
         }
         return new BoundQueryImpl(finalQuery, bqConfig)
       }
@@ -1464,7 +1465,12 @@ const makeFromConfig = (config: {
         })
         const pathBuilder = createPathBuilder()
         const conditionOps = createConditionOps()
-        const bqConfig: BoundQueryConfig<unknown> = { pathBuilder, conditionOps, provide }
+        const bqConfig: BoundQueryConfig<unknown> = {
+          pathBuilder,
+          conditionOps,
+          provide,
+          resolveDbName: entityLike._resolveDbName,
+        }
         return new BoundQueryImpl(scanQuery, bqConfig)
       }
 

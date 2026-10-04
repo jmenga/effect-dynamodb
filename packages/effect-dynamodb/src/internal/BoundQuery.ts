@@ -19,6 +19,25 @@ import type { ConditionOps, ConditionShorthand, Expr } from "./Expr.js"
 import { parseSimpleShorthand } from "./Expr.js"
 import type { Path, PathBuilder } from "./PathBuilder.js"
 
+/**
+ * An expression with every attribute path's top-level field renamed to its
+ * stored attribute (#133). Values are left alone.
+ */
+const renamePaths = (node: unknown, resolve: (name: string) => string): unknown => {
+  if (Array.isArray(node)) return node.map((item) => renamePaths(item, resolve))
+  if (node === null || typeof node !== "object") return node
+  const record = node as { readonly _tag?: unknown; readonly segments?: unknown }
+  if (record._tag === "value") return node
+  if ((record._tag === "path" || record._tag === "size") && Array.isArray(record.segments)) {
+    const [head, ...rest] = record.segments as ReadonlyArray<string | number>
+    return { ...record, segments: [typeof head === "string" ? resolve(head) : head, ...rest] }
+  }
+  // Spread keeps the symbol-keyed Expr brand; string keys are walked.
+  const copy: globalThis.Record<string | symbol, unknown> = { ...record }
+  for (const [key, value] of Object.entries(record)) copy[key] = renamePaths(value, resolve)
+  return copy
+}
+
 // ---------------------------------------------------------------------------
 // Sort key condition ops for the `where` callback
 // ---------------------------------------------------------------------------
@@ -305,6 +324,12 @@ export interface BoundQueryConfig<Model> {
     condition: RawSortKeyCondition,
     field: string | undefined,
   ) => Query.SortKeyCondition
+  /**
+   * Optional: a domain field's stored attribute name, for an entity that
+   * renames fields. `.filter()` and `.select()` name the stored attribute;
+   * `.select()` hands each item back under the domain names (#133).
+   */
+  readonly resolveDbName?: ((domainName: string) => string) | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -342,13 +367,15 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
       | ((t: PathBuilder<Model, Model, never>, ops: ConditionOps<Model>) => Expr)
       | ConditionShorthand,
   ): BoundQueryImpl<Model, SkRemaining, A> {
-    if (typeof fnOrShorthand === "function") {
-      const expr = fnOrShorthand(this._config.pathBuilder, this._config.conditionOps)
-      return new BoundQueryImpl(Query.filterExpr(this._query, expr), this._config)
-    }
-    // Shorthand object — parse to equality Expr then apply
-    const expr = parseSimpleShorthand(fnOrShorthand as Record<string, unknown>)
-    return new BoundQueryImpl(Query.filterExpr(this._query, expr), this._config)
+    const expr =
+      typeof fnOrShorthand === "function"
+        ? fnOrShorthand(this._config.pathBuilder, this._config.conditionOps)
+        : // Shorthand object — parse to equality Expr
+          parseSimpleShorthand(fnOrShorthand as Record<string, unknown>)
+    const resolve = this._config.resolveDbName
+    // Paths name the stored attributes of renamed fields.
+    const stored = resolve === undefined ? expr : (renamePaths(expr, resolve) as Expr)
+    return new BoundQueryImpl(Query.filterExpr(this._query, stored), this._config)
   }
 
   // --- filterBy ---
@@ -362,14 +389,29 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
       | ((t: PathBuilder<Model, Model, never>) => ReadonlyArray<Path<Model, any, any>>)
       | ReadonlyArray<string>,
   ): BoundQueryImpl<Model, SkRemaining, Record<string, unknown>> {
+    const resolve = this._config.resolveDbName
     if (typeof fnOrAttrs === "function") {
       const paths = fnOrAttrs(this._config.pathBuilder)
       const segments = paths.map(
         (p) => (p as unknown as { segments: ReadonlyArray<string | number> }).segments,
       )
-      return new BoundQueryImpl(Query.selectPaths(this._query, segments), this._config)
+      return new BoundQueryImpl(
+        resolve === undefined
+          ? Query.selectPaths(this._query, segments)
+          : Query.selectRenamed(this._query, segments, resolve),
+        this._config,
+      )
     }
-    return new BoundQueryImpl(Query.select(this._query, fnOrAttrs), this._config)
+    return new BoundQueryImpl(
+      resolve === undefined
+        ? Query.select(this._query, fnOrAttrs)
+        : Query.selectRenamed(
+            this._query,
+            fnOrAttrs.map((attr) => [attr]),
+            resolve,
+          ),
+      this._config,
+    )
   }
 
   // --- pagination & ordering ---
