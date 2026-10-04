@@ -245,11 +245,11 @@ These are methods on the entity definition returned by `Entity.make()`. They ret
 | `entity.get(key)` | `EntityGet` | Get a single item by primary key (descriptor) |
 | `entity.update(key)` | `EntityUpdate` | Start an update operation (compose with `set`, `add`, etc.) (descriptor). On a missing item it fails with `ItemNotFound` and writes nothing. The exception is a plain `.set()` of a complete item (every required field and primary-key composite, with no other operations, `expectedVersion`, `.condition()`, cascade, `withVector` or old-image `returnValues`), which the library creates through `create`, exactly as `put` would write it |
 | `entity.patch(key)` | `EntityUpdate` | Update with `attribute_exists` — fails with `ConditionalCheckFailed` if not exists (descriptor) |
-| `entity.delete(key)` | `EntityDelete` | Delete an item (descriptor). Releases only the unique sentinels the item owns |
+| `entity.delete(key)` | `EntityDelete` | Delete an item (descriptor). Releases only the unique sentinels the item owns. On a `retain` entity it reads the item and deletes it in one transaction with a snapshot of its final state, so an item created again continues past it |
 | `entity.deleteIfExists(key)` | `EntityDelete` | Delete with `attribute_exists` — fails with `ConditionalCheckFailed` if not exists (descriptor) |
 | `entity.query.<indexName>(pk)` | `Query<Record>` | Query a specific index by partition key (descriptor) |
 | `entity.scan()` | `Query<Record>` | Full table scan filtered by entity type (descriptor) |
-| `entity.versions(key)` | `Query<Record>` | Query version history for an item (requires `versioned: { retain: true }`) (descriptor) |
+| `entity.versions(key)` | `Query<Record>` | Query version history for an item (requires `versioned: { retain: true }`) (descriptor). With sort key composites, only the named item's history |
 | `entity.deleted.list(key)` | `Query<Record>` | List soft-deleted items for a key (requires `softDelete`) (descriptor) |
 | `entity.batchGet(keys)` | See Batch module | Batch get items |
 | `entity.batchPut(items)` | See Batch module | Batch put items |
@@ -307,7 +307,7 @@ const users = db.entities.UserEntity
 | `bound.getVersion(key, version)` | `versioned: { retain: true }` | `Effect` | Get a specific version snapshot |
 | `bound.versions(key)` | `versioned: { retain: true }` | `BoundQuery` | List all version snapshots as a fluent BoundQuery — supports `.collect()`, `.fetch()`, `.paginate()`, `.count()`, `.limit()`, `.reverse()`, `.startFrom()`, `.filter()`, `.select()` |
 | `bound.restore(key)` | `softDelete` | `Effect` | Restore a soft-deleted item |
-| `bound.purge(key)` | Any | `Effect` | Permanently remove item + all versions and soft-deleted copies, and release the unique sentinels they own |
+| `bound.purge(key)` | Any | `Effect` | Permanently remove item + all versions and soft-deleted copies, and release the unique sentinels they own. With sort key composites, only the named item's rows; without, the whole partition |
 | `bound.deleted.get(key)` | `softDelete` | `Effect` | Get a specific soft-deleted item |
 | `bound.deleted.list(key)` | `softDelete` | `BoundQuery` | List all soft-deleted tombstones in the partition as a fluent BoundQuery |
 
@@ -318,7 +318,7 @@ const users = db.entities.UserEntity
 | `entity.getVersion(key, version)` | `versioned: { retain: true }` | Get a specific version snapshot (descriptor) |
 | `entity.deleted.get(key)` | `softDelete` | Get a soft-deleted item (descriptor) |
 | `entity.restore(key)` | `softDelete` | Restore a soft-deleted item (descriptor) |
-| `entity.purge(key)` | Any | Delete all items in the partition (main + versions + deleted) (descriptor) |
+| `entity.purge(key)` | Any | Delete the item, its versions and its soft-deleted copies (descriptor): the whole partition without sort key composites, the named item's rows with them |
 
 ### Operation Combinators
 
@@ -695,9 +695,10 @@ A `put` through `transactWrite` (or `EventStore.append({ additionalItems })`) of
 Consequences worth knowing:
 
 - **An existing item is replaced, not refused.** It continues its version, incarnation and `createdAt`, its replaced state is snapshotted (`retain`), and changed unique values rotate their sentinels. A deleted retain item created again continues after its retained version history. This is what keeps a versioned read model in step with `EventStore.append`.
-- **A race is retried.** If another writer changes, creates or deletes the item between the read and the transaction, the transaction is cancelled and built again from a fresh read. A race lost on every attempt fails with `OptimisticLockError` / `ConcurrentModification`.
+- **A race is retried.** If another writer changes, creates or deletes the item between the read and the transaction, or a sentinel it releases changes hands, the transaction is cancelled and built again from a fresh read. A race lost on every attempt fails with `OptimisticLockError` / `ConcurrentModification`.
 - **Errors name what happened.** A duplicate fails with `UniqueConstraintViolation` (naming the constraint and the values). Only an op's own condition (`.condition()`, `create()`) is reported as a condition: `TransactionCancelled` from `transactWrite`, `AdditionalItemConditionFailed` from `append`.
-- **One op per item.** DynamoDB rejects a transaction that touches one item twice, with a `DynamoValidationError`. That includes two puts of one item, and two puts that swap unique values: each releases the sentinel the other reserves.
+- **One op per item.** DynamoDB allows one operation per item in a transaction, so a transaction that touches one item twice fails with a `ValidationError` naming the entity and both ops, before anything is sent. That includes two puts of one item, and two puts that swap unique values: each releases the sentinel the other reserves. In `append`, an additional item that repeats an event or the idempotency sentinel is refused the same way.
+- **4 MB, counted before sending.** A transaction whose items pass DynamoDB's 4 MB (4,194,304 bytes, item sizes counted as DynamoDB counts them) fails with a `ValidationError` naming its largest item, before anything is sent. A `retain` put counts twice: its item and its snapshot.
 - **The reads cost capacity.** Each guarded put makes one consistent `GetItem` of its item, one more per sentinel it would release, and, for a missing `retain` item, one `Limit 1` query of its version history.
 - **The 100-item cap counts the expanded total.** Ten `unique` + `retain` puts occupy 30 slots or more. The error message reports both numbers.
 - **`softDelete` does not affect a put** — only a delete — so puts of soft-deletable entities are unaffected.
@@ -1237,12 +1238,12 @@ import {
 |-------|-----|-------------|
 | `DynamoError` | `"DynamoError"` | AWS SDK error wrapper (includes `operation` and `cause`) |
 | `ThrottlingError` | `"ThrottlingError"` | AWS SDK throttling — request rate exceeded |
-| `DynamoValidationError` | `"DynamoValidationError"` | DynamoDB rejected the request as malformed, for example a transaction that touches one item twice |
+| `DynamoValidationError` | `"DynamoValidationError"` | DynamoDB rejected the request as malformed |
 | `InternalServerError` | `"InternalServerError"` | Transient DynamoDB failure |
 | `ResourceNotFoundError` | `"ResourceNotFoundError"` | Table or index does not exist |
 | `ItemNotFound` | `"ItemNotFound"` | No item under the key: `get`, an `update` of a missing item (unless it is a plain `.set()` of a complete item), `restore` with no soft-deleted item or after a concurrent restore won |
 | `ConditionalCheckFailed` | `"ConditionalCheckFailed"` | A `.condition()` was not met (put, update, delete, create), or `patch()` of a missing item. A lost version race is an `OptimisticLockError` instead |
-| `ValidationError` | `"ValidationError"` | Schema decode/encode failed, or the operation was refused: an item of a versioned entity with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, or a replacing put in `Batch.write` |
+| `ValidationError` | `"ValidationError"` | Schema decode/encode failed, or the operation was refused: an item of a versioned entity with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, or a transaction that touches one item twice or passes 4 MB |
 | `TransactionCancelled` | `"TransactionCancelled"` | Transaction rejected (includes cancellation `reasons`) |
 | `TransactionOverflow` | `"TransactionOverflow"` | A write's own transaction (the item, its sentinels and snapshot) would exceed DynamoDB's 100-item limit |
 | `AppendTooLarge` | `"AppendTooLarge"` | `EventStore.append` exceeds the 100-item transaction limit (`streamName`, `streamId`, `count`, `limit`) |

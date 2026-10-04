@@ -572,7 +572,7 @@ A **put** of a `versioned` or `unique`-constrained entity is written exactly as 
 
 The 100-item cap counts the **expanded** total, so `events + expanded additional items + sentinel + contiguity check` must fit. `AppendTooLarge.count` reports the expanded number.
 
-DynamoDB allows one operation per item in a transaction. Two `additionalItems` that touch the same item, such as two puts that swap unique values (each releases the sentinel the other reserves), fail with a `DynamoValidationError`.
+DynamoDB allows one operation per item in a transaction. Two `additionalItems` that touch the same item, such as two puts that swap unique values (each releases the sentinel the other reserves), or one that repeats an event or the idempotency sentinel, fail with a `ValidationError` naming the entity, before anything is sent. So does an append whose items pass DynamoDB's 4 MB limit; a `retain` put counts twice (its item and its snapshot).
 
 ### Telling the failures apart
 

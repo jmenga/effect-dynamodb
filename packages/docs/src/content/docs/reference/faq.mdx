@@ -201,8 +201,8 @@ const Users = Entity.make({
 ```
 
 **How it works:**
-- Snapshots share the same partition key (PK) as the main item but use a version sort key: `$schema#v1#entity#v#0000001`
-- GSI key fields are **stripped** from snapshots so they do not appear in index queries
+- Snapshots share the same partition key (PK) as the main item but use a version sort key: `$schema#v1#entity#v#0000001` (with sort key composites, the item's own: `$schema#v1#entity#v#line_a#0000001`)
+- GSI key fields are **stripped** from snapshots so they do not appear in index queries, and primary-key queries and scans leave them out
 - The `__edd_e__` entity type is preserved for filtering
 - Retain-aware writes use `transactWriteItems` to atomically write both the main item and the snapshot
 

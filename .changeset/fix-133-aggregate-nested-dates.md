@@ -30,7 +30,12 @@ real `DateTime`s.
   `NumberFromString` fields.
 - **Keys are unchanged** for every existing entity and aggregate shape: `pk`,
   `sk`, GSI, unique, version, soft-delete, time-series, collection and
-  list-index keys are composed byte-for-byte as before.
+  list-index keys are composed byte-for-byte as before, with one exception:
+  the version-snapshot and soft-delete keys of an entity whose primary sort
+  key has composites (several items per partition) now carry the item's
+  identity, so each item has its own history. Entities without sort key
+  composites keep exactly the keys they had. Details under "History of items
+  that share a partition".
 - **Some attributes change stored type** on their next write, listed under each
   section below. For example, an optional `NumberFromString` holding `5` was
   stored as `{ "N": "5" }` and is now `{ "S": "5" }`, and a nested self date was
@@ -100,6 +105,23 @@ real `DateTime`s.
   first and releases it only if it names this item, so it can no longer delete
   another item's reservation and let the value be taken twice. That costs one
   consistent read per sentinel released.
+- **A hard delete of a retain entity snapshots the item it deletes.** The
+  delete and the snapshot of the final state (`v#N`) are one transaction,
+  guarded on the version read, so an item created again at the key continues
+  at `N + 1` and a writer still holding version `N` can't overwrite it. That
+  makes a retain hard delete a `GetItem` plus a two-item `TransactWriteItems`
+  (twice the write capacity of a `DeleteItem`) instead of one `DeleteItem`.
+- **A transaction that touches one item twice, or passes DynamoDB's 4 MB, is
+  refused before it is sent**, with a `ValidationError` naming the entity, in
+  `Transaction.transactWrite` and `EventStore.append`. The items an op adds
+  count: two puts that swap unique values touch the same sentinels, and a
+  retain put counts twice (its item and its snapshot).
+- **Primary-key queries and scans no longer return history rows.** Version
+  snapshots and soft-delete tombstones carry their entity's type, so a
+  primary-key query with no (or a partial) sort key condition, and a scan,
+  returned them as if they were items. They're now left out. A primary-key
+  `count()` of a retain or soft-delete entity reads the rows to count them
+  (the same read capacity as a server-side count).
 - **`Batch.write` sends puts of a `versioned` entity as transactions.** They go
   first, as create-only `TransactWriteItems` of up to 100 items (and under
   DynamoDB's 4 MB transaction payload), and each chunk costs twice the write
@@ -331,8 +353,8 @@ change, a computed change to an index composite, any retain update) write a
 guarded update of only what changed. A concurrent change to an unrelated
 attribute is preserved. A race on something the update read fails without
 writing: with the new `ConcurrentModification` on an unversioned entity, and
-with `OptimisticLockError` on a versioned one. Soft delete and a hard delete
-with unique constraints are guarded the same way. `restore` fails with
+with `OptimisticLockError` on a versioned one. Soft delete, and a hard delete
+of an entity with unique constraints or `retain`, are guarded the same way. `restore` fails with
 `ItemNotFound` if a concurrent restore won, and with `ItemNotDeleted` if a live
 item exists under the key.
 
@@ -366,12 +388,14 @@ An item that has the token but no version had its version removed outside the
 library. It is refused with a `ValidationError` rather than read as version 0,
 which would let the next update rewrite its history: by every read (`get`,
 queries, the `deleted` views, `decodeMarshalledItem`), and by every update,
-soft delete, unique-constraint hard delete, `restore`, versioned `put` and
-`upsert`. A query over a partition holding one fails as a whole. A plain hard
-delete still removes it, since it reads nothing and writes no history.
+soft delete, hard delete of an entity with unique constraints or `retain`,
+`restore`, versioned `put` and `upsert`. A query over a partition holding one
+fails as a whole. A plain hard delete (no unique constraints, no `retain`) still
+removes it, since it reads nothing and writes no history; `purge` removes it on
+any entity.
 
-**Version history is never overwritten.** An update, soft delete, restore or
-replacing `put` that would write a `v#N` snapshot holding a different state
+**Version history is never overwritten.** An update, soft or hard delete,
+restore or replacing `put` that would write a `v#N` snapshot holding a different state
 from the row already there fails with a `ValidationError` and writes nothing.
 Rewriting the same state (the same version, incarnation and, with timestamps,
 `updatedAt`) is allowed, which is what the first update after a retain `put`,
@@ -451,18 +475,24 @@ the item first (a retain `create` runs one `Limit 1` query of its version
 history); it still fails with `ConditionalCheckFailed` on an existing item.
 
 **Re-creating a deleted retain item.** Its version history outlives it, and
-the key can be used again without `purge`. A `put`, `create`, `upsert` or
-transaction put of the missing item reads the highest version retained for its
-key and continues after it, with a new incarnation token: an item deleted at
-version 3 comes back at version 4 with its own `v#0000004` snapshot, and the
-earlier history is never overwritten. `restore` of the old tombstone while the
-new item is live fails with `ItemNotDeleted`.
+the key can be used again without `purge`. Deleting it, hard or soft, snapshots
+its final state at its own version in the same transaction (1.22.0 wrote no
+snapshot on a hard delete). A `put`, `create`, `upsert` or transaction put of
+the missing item reads the highest version retained for its key and continues
+after it, with a new incarnation token: an item deleted at version 3 comes back
+at version 4 with its own `v#0000004` snapshot, and the earlier history is never
+overwritten. A writer still holding version 3 fails with `OptimisticLockError`.
+`restore` of the old tombstone while the new item is live fails with
+`ItemNotDeleted`. A hard delete of a missing retain item writes nothing, as
+before; with a `.condition()` the condition is judged against no item, and the
+delete never removes an item created since its read.
 
 **Sentinel ownership.** A sentinel is released only by the item that owns it
 (`_entity_pk` / `_entity_sk`): the write reads it first and conditions the
 release on that ownership. A release whose reservation changed hands in
-between fails an update, upsert or delete with `ConcurrentModification` on the
-unique fields; a put retries. `purge` releases the sentinels of the live item and of
+between fails an update or delete with `ConcurrentModification` on the unique
+fields; a put, an `upsert` and a transaction put plan the write again from a
+fresh read (up to three attempts, then `ConcurrentModification`). `purge` releases the sentinels of the live item and of
 every tombstone, each only if owned. Each sentinel a write would release costs
 one consistent `GetItem`. An update that changes the value of a unique
 constraint with a `ttl` now gives the new sentinel that expiry, as a put does
@@ -478,7 +508,10 @@ unchanged ones, the replaced item is snapshotted, under the update's version
 and incarnation guards (versioned) or attribute guards (unversioned). The whole
 input is validated either way, so an `upsert` missing a required field fails
 with a `ValidationError` even when the item exists. A concurrent create or
-delete in between is retried the other way; a race lost on every attempt fails
+delete in between is retried the other way, and a sentinel release whose
+reservation changed hands is planned again from a fresh read, as a put's is; a
+concurrent change of the item itself fails the upsert, as it fails an update.
+A race lost on every attempt fails
 with `OptimisticLockError` or `ConcurrentModification` (never a
 `ConditionalCheckFailed` you didn't ask for), and a value another item holds
 with `UniqueConstraintViolation`. Its errors name the `upsert`. An `upsert`
@@ -496,10 +529,20 @@ re-created retain item continues after its history — all in the one
 transaction. A race between the read and the transaction cancels it, and it is
 built and written again. A taken unique value is a `UniqueConstraintViolation`
 from both; only an op's own condition is `TransactionCancelled` from
-`transactWrite` and `AdditionalItemConditionFailed` from `append`. DynamoDB
-allows one operation per item in a transaction, so two ops on one item, such as
-two puts that swap unique values (and so touch the same sentinels), fail with a
-`DynamoValidationError`. Deletes of `unique`, retain and `softDelete` entities
+`transactWrite` and `AdditionalItemConditionFailed` from `append`.
+
+Both are checked before anything is sent. DynamoDB allows one operation per
+item in a transaction, and the reasons it gives for a repeated item can read as
+a lost race, so the transaction was retried and misreported (as
+`OptimisticLockError`, or a `DynamoValidationError`, depending on the backend).
+Now any item touched twice, counting the sentinels and snapshots an op adds
+(two puts that swap unique values touch the same sentinels), fails with a
+`ValidationError` naming the entity and both ops, and nothing is sent. So does
+an `additionalItems` op that repeats an event or the idempotency sentinel of the
+append. A transaction whose items pass DynamoDB's 4 MB (4,194,304 bytes,
+counted as DynamoDB counts item sizes, a retain put twice) fails with a
+`ValidationError` naming its largest item, instead of DynamoDB's bare
+`ValidationException`. Deletes of `unique`, retain and `softDelete` entities
 are still refused (`EDD-9048`), and `Batch.write` still sends versioned puts as
 create-only transactions (below).
 
@@ -535,6 +578,28 @@ throttling) are retried with the batch's backoff settings; any other
 cancellation is a `DynamoError` that keeps each reason's message and the SDK
 exception. Puts of other
 entities, and deletes, are still plain `BatchWriteItem` requests.
+
+### History of items that share a partition
+
+An entity whose primary sort key has composites keeps several items in one
+partition. Their version snapshots and soft-delete tombstones used to share one
+key space (`$app#v1#line#v#0000001`, `$app#v1#line#deleted#<timestamp>`), so
+siblings shared one version sequence, a second item's history collided with
+the first's, `deleted.get` and `restore` found the partition's latest
+tombstone rather than the item's, and `purge` removed every sibling. Each item
+now has its own: its history keys carry the composite part of its sort key
+after the marker (`$app#v1#line#v#line_a#0000001`,
+`$app#v1#line#deleted#line_a#<timestamp>`), and `versions`, `getVersion`,
+`deleted.get`, `restore`, the version a re-created item continues from, and
+`purge` all key by the item. `deleted.list` still lists the partition's
+tombstones, every item's. An entity without sort key composites writes and
+reads exactly the keys it did.
+
+History rows an earlier release wrote for such an entity keep their old keys.
+`purge` removes them with their item (it reads the composites they carry). The
+readers above don't list them, and an item created again continues past its
+own history only — which, for such an entity, earlier releases kept no
+reliable copy of anyway.
 
 ### Nested sub-aggregates
 
