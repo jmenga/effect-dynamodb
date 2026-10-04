@@ -170,7 +170,6 @@ import {
   emptyUpdateState,
   type PutKind,
   type ReturnValuesMode,
-  returnValuesMap,
   type UpdateState,
 } from "./internal/EntityOps.js"
 
@@ -862,7 +861,9 @@ export interface Entity<
     | OptimisticLockError
     | ConcurrentModification
     | ValidationError,
-    DynamoClient | TableConfig
+    DynamoClient | TableConfig,
+    void,
+    ModelType<TModel>
   >
 
   /**
@@ -929,7 +930,9 @@ export interface Entity<
     | ConcurrentModification
     | ValidationError
     | ConditionalCheckFailed,
-    DynamoClient | TableConfig
+    DynamoClient | TableConfig,
+    void,
+    ModelType<TModel>
   >
 
   /**
@@ -1671,6 +1674,30 @@ const checkTransactionLimit = (
 
 /** Attempts a guarded put makes before it reports a lost race (#133). */
 const GUARDED_PUT_ATTEMPTS = 3
+
+/**
+ * @internal A delete's item was deleted between its read and its write, with
+ * nothing asserted about it: read again, never reported (#133).
+ */
+class DeletedConcurrently extends Data.TaggedError("DeletedConcurrently")<{}> {}
+
+/**
+ * @internal Whether a delete's condition asserts only that the item exists —
+ * `deleteIfExists`'s `attribute_exists` on the partition key.
+ */
+const assertsExistenceOnly = (
+  condition: Expr | ConditionInput | undefined,
+  pkField: string,
+): boolean => {
+  if (condition === undefined || isExpr(condition)) return false
+  const entries = Object.entries(condition as globalThis.Record<string, unknown>)
+  if (entries.length !== 1) return false
+  const [op, value] = entries[0]!
+  return (
+    op === "attributeExists" &&
+    (value === pkField || (Array.isArray(value) && value.length === 1 && value[0] === pkField))
+  )
+}
 
 /**
  * The `ConcurrentModification`s that report a sentinel release whose
@@ -6984,10 +7011,37 @@ const makeImpl = <
           const hasUniqueConstraints =
             config.unique != null && Object.keys(config.unique).length > 0
 
+          // A delete that reads the item first already requires it to exist,
+          // so a condition asserting only that (`deleteIfExists`) adds nothing
+          // to its guard: it is judged against the read instead — a missing
+          // item is `ConditionalCheckFailed` — and the delete is retried after
+          // a race like an unconditioned one.
+          const readsFirst = isSoftDeleteEnabled() || hasUniqueConstraints || isRetainEnabled()
+          const existenceOnly =
+            readsFirst && assertsExistenceOnly(opts.condition, config.indexes.primary.pk.field)
           // Build user condition expression if provided
-          const userCondition = opts.condition
-            ? compileCondition(opts.condition, resolveDbName)
-            : undefined
+          const userCondition =
+            opts.condition && !existenceOnly
+              ? compileCondition(opts.condition, resolveDbName)
+              : undefined
+          /**
+           * What the delete returns: with `returnValues("allOld")`, the item it
+           * removed — the one read (every read-first delete is guarded on it) or
+           * DynamoDB's `ALL_OLD` — as a model, `undefined` when there was none.
+           */
+          const deletedResult = (old: globalThis.Record<string, AttributeValue> | undefined) =>
+            opts.returnValues === "allOld" && old !== undefined
+              ? decodeAs(fromAttributeMap(old) as globalThis.Record<string, unknown>, old, "model")
+              : Effect.succeed(undefined)
+          /** The item is missing: what a delete that read it reports. */
+          const missing = (
+            otherwise: ItemNotFound | undefined,
+          ): Effect.Effect<undefined, ItemNotFound | ConditionalCheckFailed> =>
+            existenceOnly
+              ? Effect.fail(new ConditionalCheckFailed({ entityType, key: encodedKey }))
+              : otherwise === undefined
+                ? Effect.succeed(undefined)
+                : Effect.fail(otherwise)
 
           /**
            * Map a rejected user condition on either transaction delete path
@@ -7043,6 +7097,11 @@ const makeImpl = <
             let rejected: globalThis.Record<string, AttributeValue> | undefined
             const reject = (stored: Readonly<globalThis.Record<string, unknown>> | undefined) => {
               rejected = stored as globalThis.Record<string, AttributeValue> | undefined
+              // Deleted since the read: with nothing asserted, read it again —
+              // a delete of a missing item reports what such a delete does.
+              if (stored === undefined && userCondition === undefined) {
+                return new DeletedConcurrently()
+              }
               return deleteRejection(
                 encodedKey as globalThis.Record<string, unknown>,
                 read,
@@ -7132,7 +7191,7 @@ const makeImpl = <
                 })
 
                 if (!result.Item) {
-                  return yield* Effect.fail(new ItemNotFound({ entityType, key: encodedKey }))
+                  return yield* missing(new ItemNotFound({ entityType, key: encodedKey }))
                 }
                 // The tombstone (and snapshot) copy the item read: the delete is
                 // conditioned on it being unchanged, so no concurrent update is lost
@@ -7252,6 +7311,7 @@ const makeImpl = <
                   snapshotAt,
                   releases,
                 )
+                return result.Item
               } else {
                 // --- Hard delete with unique constraints and/or retained history ---
                 // The item is read first: the sentinels to release are keyed by its
@@ -7263,14 +7323,14 @@ const makeImpl = <
                 })
 
                 if (!result.Item) {
-                  if (hasUniqueConstraints) {
-                    return yield* Effect.fail(new ItemNotFound({ entityType, key: encodedKey }))
+                  if (hasUniqueConstraints || existenceOnly) {
+                    return yield* missing(new ItemNotFound({ entityType, key: encodedKey }))
                   }
                   // Retain only: deleting a missing item writes nothing, as a plain
                   // `DeleteItem` would. The caller's condition is still judged
                   // against no item — and the delete never removes an item created
                   // since the read, which would leave its final state unsnapshotted.
-                  if (!userCondition) return
+                  if (!userCondition) return undefined
                   const values = userCondition.values
                   yield* client
                     .deleteItem({
@@ -7296,7 +7356,7 @@ const makeImpl = <
                           : err,
                       ),
                     )
-                  return
+                  return undefined
                 }
                 // The sentinel deletes are keyed by the unique values read, and the
                 // snapshot copies the item read: the delete is conditioned on it —
@@ -7370,6 +7430,7 @@ const makeImpl = <
                   snapshotAt,
                   releases,
                 )
+                return result.Item
               }
             })
             // The caller asserted nothing about the item, so a concurrent write
@@ -7378,15 +7439,29 @@ const makeImpl = <
             // delete reads the item again and is written again, as a put is.
             // With a `.condition()` the read is what the condition was judged
             // against, and a race fails.
-            yield* userCondition === undefined
+            // Deleted concurrently on every attempt: what a delete that read
+            // it missing reports.
+            const deleted = (yield* userCondition === undefined
               ? readFirst.pipe(
                   Effect.retry({
                     times: GUARDED_PUT_ATTEMPTS - 1,
                     while: (e) =>
-                      e instanceof OptimisticLockError || e instanceof ConcurrentModification,
+                      e instanceof OptimisticLockError ||
+                      e instanceof ConcurrentModification ||
+                      e instanceof DeletedConcurrently,
                   }),
+                  Effect.catchIf(
+                    (e): e is DeletedConcurrently => e instanceof DeletedConcurrently,
+                    () =>
+                      missing(
+                        hasUniqueConstraints || isSoftDeleteEnabled()
+                          ? new ItemNotFound({ entityType, key: encodedKey })
+                          : undefined,
+                      ),
+                  ),
                 )
-              : readFirst
+              : readFirst) as globalThis.Record<string, AttributeValue> | undefined
+            return yield* deletedResult(deleted)
           } else {
             // Simple delete
             const deleteInput: DeleteItemCommandInput = {
@@ -7400,10 +7475,13 @@ const makeImpl = <
                 deleteInput.ExpressionAttributeValues = userCondition.values
               }
             }
-            if (opts.returnValues) {
-              deleteInput.ReturnValues = returnValuesMap[opts.returnValues]
-            }
-            yield* client.deleteItem(deleteInput).pipe(Effect.mapError(mapDeleteConditionFailure))
+            if (opts.returnValues === "allOld") deleteInput.ReturnValues = "ALL_OLD"
+            const output = yield* client
+              .deleteItem(deleteInput)
+              .pipe(Effect.mapError(mapDeleteConditionFailure))
+            return yield* deletedResult(
+              output.Attributes as globalThis.Record<string, AttributeValue> | undefined,
+            )
           }
         }),
       self,

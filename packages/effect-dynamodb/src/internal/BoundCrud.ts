@@ -214,7 +214,7 @@ export class BoundPutImpl<Model, A, E, VN extends string = string>
  * yield* db.entities.Tasks.delete({ taskId }).returnValues("allOld")
  * ```
  */
-export interface BoundDelete<Model, E> extends Pipeable.Pipeable {
+export interface BoundDelete<Model, E, A = void> extends Pipeable.Pipeable {
   readonly [BoundOpTypeId]: BoundOpTypeId
   readonly _boundOpType: "delete"
   /**
@@ -224,37 +224,47 @@ export interface BoundDelete<Model, E> extends Pipeable.Pipeable {
    * rejecting the condition is the failure this combinator makes reachable, so
    * `Effect.catchTag("ConditionalCheckFailed", ...)` type-checks downstream.
    */
-  readonly condition: (cond: ConditionArg<Model>) => BoundDelete<Model, E | ConditionalCheckFailed>
-  /** Set ReturnValues mode (`"none"` or `"allOld"`). */
-  readonly returnValues: (mode: ReturnValuesMode) => BoundDelete<Model, E>
+  readonly condition: (
+    cond: ConditionArg<Model>,
+  ) => BoundDelete<Model, E | ConditionalCheckFailed, A>
+  /**
+   * Set ReturnValues mode: `"allOld"` returns the item the delete removed
+   * (`undefined` when there was none); `"none"` returns nothing. (DynamoDB has
+   * no other mode for a delete.)
+   */
+  readonly returnValues: <M extends "none" | "allOld">(
+    mode: M,
+  ) => BoundDelete<Model, E, M extends "allOld" ? Model | undefined : void>
   /** Convert to an executable Effect for Effect combinator interop. */
-  readonly asEffect: () => Effect.Effect<void, E, never>
+  readonly asEffect: () => Effect.Effect<A, E, never>
   /** Yield support for `Effect.gen`. */
-  readonly [Symbol.iterator]: () => Iterator<Effect.Effect<void, E, never>, void>
+  readonly [Symbol.iterator]: () => Iterator<Effect.Effect<A, E, never>, A>
 }
 
 /** @internal */
-export class BoundDeleteImpl<Model, E> implements BoundDelete<Model, E> {
+export class BoundDeleteImpl<Model, E, A = void> implements BoundDelete<Model, E, A> {
   readonly [BoundOpTypeId]: BoundOpTypeId = BoundOpTypeId as BoundOpTypeId
   readonly _boundOpType = "delete" as const
   constructor(
-    readonly _op: EntityDelete<E, any>,
+    readonly _op: EntityDelete<E, any, any, any>,
     readonly _config: BoundCrudConfig<Model>,
   ) {}
 
-  condition(cond: ConditionArg<Model>): BoundDeleteImpl<Model, E | ConditionalCheckFailed> {
+  condition(cond: ConditionArg<Model>): BoundDeleteImpl<Model, E | ConditionalCheckFailed, A> {
     const compiled = buildCondition(this._config, cond)
     const next = conditionCombinator(this._op, compiled)
-    return new BoundDeleteImpl<Model, E | ConditionalCheckFailed>(next, this._config)
+    return new BoundDeleteImpl<Model, E | ConditionalCheckFailed, A>(next as any, this._config)
   }
 
-  returnValues(mode: ReturnValuesMode): BoundDeleteImpl<Model, E> {
-    const next = returnValuesCombinator(this._op, mode)
-    return new BoundDeleteImpl(next, this._config)
+  returnValues<M extends "none" | "allOld">(
+    mode: M,
+  ): BoundDeleteImpl<Model, E, M extends "allOld" ? Model | undefined : void> {
+    const next = returnValuesCombinator(this._op, mode as ReturnValuesMode)
+    return new BoundDeleteImpl(next as any, this._config)
   }
 
-  asEffect(): Effect.Effect<void, E, never> {
-    return this._config.provide(this._op.asEffect())
+  asEffect(): Effect.Effect<A, E, never> {
+    return this._config.provide(this._op.asEffect()) as Effect.Effect<A, E, never>
   }
 
   [Symbol.iterator]() {
@@ -636,7 +646,7 @@ export const makeBoundPut = <Model, A, E, VN extends string = string>(
 
 /** @internal */
 export const makeBoundDelete = <Model, E>(
-  op: EntityDelete<E, any>,
+  op: EntityDelete<E, any, any, any>,
   config: BoundCrudConfig<Model>,
 ): BoundDelete<Model, E> => new BoundDeleteImpl(op, config)
 

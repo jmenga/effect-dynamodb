@@ -16946,6 +16946,79 @@ describeConnected("#133 — path operations on index composites and unique field
       }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
+  it.effect(
+    "a delete racing a concurrent delete reports what a delete of a missing item does",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        // Retain only: a delete of a missing item succeeds — so does the race.
+        const retained = db.entities.DevicesRetained as any
+        yield* retained.put({ id: "rdd1", owner: "o", label: "l" })
+        g133Inject.before = rawDelete("G133DeviceRetained", "rdd1")
+        yield* retained.delete({ id: "rdd1" })
+        yield* retained.delete({ id: "rdd1" })
+        // Soft delete: a missing item is ItemNotFound, raced or not.
+        const soft = db.entities.SoftDevices as any
+        yield* soft.put({ id: "rdd2", owner: "o", label: "l" })
+        g133Inject.before = rawDelete("G133SoftDevice", "rdd2")
+        expect((yield* soft.delete({ id: "rdd2" }).asEffect().pipe(Effect.flip))._tag).toBe(
+          "ItemNotFound",
+        )
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect(
+    "deleteIfExists racing an update reads the item again; a missing one fails its condition",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        for (const [entity, entityType, doc] of [
+          ["DevicesRetained", "G133DeviceRetained", { owner: "o", label: "l" }],
+          ["AccountsBare", "G133AccountBare", { email: "die@x.io", name: "l" }],
+          ["SoftDevices", "G133SoftDevice", { owner: "o", label: "l" }],
+        ] as const) {
+          const docs = db.entities[entity] as any
+          const id = `die-${entity.toLowerCase()}`
+          yield* docs.put({ id, ...doc })
+          g133Inject.before = rawSetAttrs(
+            entityType,
+            id,
+            entity === "AccountsBare" ? { name: { S: "x" } } : { label: { S: "x" } },
+            entity !== "AccountsBare",
+          )
+          yield* docs.deleteIfExists({ id })
+          expect(yield* rawItem(entityType, id)).toBeUndefined()
+          const gone = yield* docs.deleteIfExists({ id }).asEffect().pipe(Effect.flip)
+          expect(gone._tag).toBe("ConditionalCheckFailed")
+        }
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("delete().returnValues('allOld') returns the deleted item on every path", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      for (const [entity, doc] of [
+        ["Authors", { name: "plain" }],
+        ["DevicesPlain", { owner: "o", label: "versioned" }],
+        ["AccountsBare", { email: "rv@x.io", name: "unique" }],
+        ["DevicesRetained", { owner: "o", label: "retained" }],
+        ["SoftDevices", { owner: "o", label: "soft" }],
+      ] as const) {
+        const docs = db.entities[entity] as any
+        const id = `rv-${entity.toLowerCase()}`
+        yield* docs.put({ id, ...doc })
+        const old = yield* docs.delete({ id }).returnValues("allOld")
+        expect(old).toMatchObject({ id, ...doc })
+        // Nothing to delete: nothing returned. "none" returns nothing either.
+        if (entity === "Authors" || entity === "DevicesRetained") {
+          expect(yield* docs.delete({ id }).returnValues("allOld")).toBeUndefined()
+        }
+        yield* docs.put({ id, ...doc })
+        expect(yield* docs.delete({ id }).returnValues("none")).toBeUndefined()
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
   it.effect("a stale writer cannot overwrite a hard-deleted and re-created retain item", () =>
     Effect.gen(function* () {
       const db = yield* g133Client

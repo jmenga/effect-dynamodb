@@ -279,12 +279,19 @@ export interface EntityUpdate<A, Rec, U, E, R> extends EntityOp<A, Rec, E, R> {
  * Does NOT extend EntityOp (no decode mode — delete returns void).
  * Yieldable in `Effect.gen`.
  */
-export interface EntityDelete<E, R> extends Pipeable.Pipeable {
+/**
+ * A delete descriptor. `A` is what it returns: nothing, or with
+ * `returnValues("allOld")` the item it deleted (`Model`, `undefined` when there
+ * was none).
+ */
+export interface EntityDelete<E, R, A = void, Model = unknown> extends Pipeable.Pipeable {
   readonly [EntityDeleteTypeId]: EntityDeleteTypeId
   /** Convert this descriptor to an executable Effect. */
-  readonly asEffect: () => Effect.Effect<void, E, R>
+  readonly asEffect: () => Effect.Effect<A, E, R>
   /** Yield support for `Effect.gen`. */
-  readonly [Symbol.iterator]: () => Iterator<Effect.Effect<void, E, R>, void>
+  readonly [Symbol.iterator]: () => Iterator<Effect.Effect<A, E, R>, A>
+  /** @internal Phantom: the model an `"allOld"` delete returns. */
+  readonly _deleteModel?: Model | undefined
   /** @internal */ readonly _opType: "delete"
   /** @internal */ readonly _entity: EntityBase
   /** @internal */ readonly _key: globalThis.Record<string, unknown>
@@ -451,7 +458,7 @@ export class EntityUpdateImpl<A, Rec, U, E, R> implements Pipeable.Pipeable {
   }
 }
 
-export class EntityDeleteImpl<E, R> implements Pipeable.Pipeable {
+export class EntityDeleteImpl<E, R, A = void> implements Pipeable.Pipeable {
   readonly [EntityDeleteTypeId]: EntityDeleteTypeId = EntityDeleteTypeId as EntityDeleteTypeId
   readonly _opType = "delete" as const
   readonly _entity: EntityBase
@@ -462,7 +469,7 @@ export class EntityDeleteImpl<E, R> implements Pipeable.Pipeable {
     readonly _builder: (opts: {
       readonly condition: Expr | ConditionInput | undefined
       readonly returnValues: ReturnValuesMode | undefined
-    }) => Effect.Effect<void, E, R>,
+    }) => Effect.Effect<A, E, R>,
     entity: EntityBase,
     key: globalThis.Record<string, unknown>,
     condition?: Expr | ConditionInput | undefined,
@@ -473,7 +480,7 @@ export class EntityDeleteImpl<E, R> implements Pipeable.Pipeable {
     this._condition = condition
     this._returnValues = returnValues
   }
-  asEffect(): Effect.Effect<void, E, R> {
+  asEffect(): Effect.Effect<A, E, R> {
     return this._builder({ condition: this._condition, returnValues: this._returnValues })
   }
   [Symbol.iterator]() {

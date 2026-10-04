@@ -4320,20 +4320,14 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("deleteIfExists of a missing retain item never deletes one created since", () =>
+    it.effect("deleteIfExists of a missing retain item fails its condition, writing nothing", () =>
       Effect.gen(function* () {
         mockGetItem.mockResolvedValueOnce({})
-        mockDeleteItem.mockRejectedValueOnce(
-          Object.assign(new Error("failed"), { name: "ConditionalCheckFailedException" }),
-        )
         const error = yield* RetainEntity.deleteIfExists({ itemId: "i-1" })
           .asEffect()
           .pipe(Effect.flip)
         expect(error._tag).toBe("ConditionalCheckFailed")
-        const call = mockDeleteItem.mock.calls[0]![0]
-        expect(call.ConditionExpression).toBe(
-          "attribute_not_exists(#dpk) AND (attribute_exists(#e0))",
-        )
+        expect(mockDeleteItem).not.toHaveBeenCalled()
         expect(mockTransactWriteItems).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )

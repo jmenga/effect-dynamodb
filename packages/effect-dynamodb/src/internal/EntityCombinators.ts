@@ -262,8 +262,8 @@ export type WithConditionalCheckFailed<T> =
     ? EntityUpdate<A, Rec, U, E | ConditionalCheckFailed, R>
     : T extends EntityPut<infer A, infer Rec, infer E, infer R>
       ? EntityPut<A, Rec, E | ConditionalCheckFailed, R>
-      : T extends EntityDelete<infer E, infer R>
-        ? EntityDelete<E | ConditionalCheckFailed, R>
+      : T extends EntityDelete<infer E, infer R, infer A, infer Mo>
+        ? EntityDelete<E | ConditionalCheckFailed, R, A, Mo>
         : never
 
 /**
@@ -370,7 +370,8 @@ type ReturnValuesTarget = EntityUpdate<any, any, any, any, any> | EntityDelete<a
 
 /**
  * An update's result type under a `returnValues` mode — see {@link UpdateReturn}.
- * A delete is unchanged.
+ * A delete returns the item it deleted under `"allOld"` (`undefined` when
+ * there was none), and nothing otherwise.
  */
 export type ReturnValuesResult<T, M extends ReturnValuesMode> =
   T extends EntityUpdate<infer A, infer Rec, infer U, infer E, infer R>
@@ -379,7 +380,9 @@ export type ReturnValuesResult<T, M extends ReturnValuesMode> =
         ? EntityUpdate<UpdateReturn<BA, M>, UpdateReturn<BR, M>, U, E, R>
         : never
       : EntityUpdate<UpdateReturn<A, M>, UpdateReturn<Rec, M>, U & UpdateBase<A, Rec>, E, R>
-    : T
+    : T extends EntityDelete<infer E, infer R, any, infer Mo>
+      ? EntityDelete<E, R, M extends "allOld" ? Mo | undefined : void, Mo>
+      : T
 
 /**
  * @internal The model / record types an update returned before its first

@@ -1167,6 +1167,42 @@ describe("Entity types — bound get() is still an Effect", () => {
 })
 
 // ---------------------------------------------------------------------------
+// `delete().returnValues("allOld")` types the deleted item (#133)
+// ---------------------------------------------------------------------------
+
+describe("Entity types — delete returnValues", () => {
+  type UserBound = import("../src/Entity.js").BoundEntity<
+    typeof User,
+    typeof UserEntity.indexes,
+    undefined,
+    { readonly userId: string }
+  >
+  type Delete = ReturnType<UserBound["delete"]>
+  type ValueOf<T> = T extends {
+    readonly asEffect: () => import("effect").Effect.Effect<infer A, any, any>
+  }
+    ? A
+    : never
+  // Never executed — the descriptors only feed `typeof`.
+  const del = null as unknown as Delete
+
+  it('a delete returns nothing; "allOld" returns the model or undefined', () => {
+    if (del === null) return
+    expectTypeOf<ValueOf<Delete>>().toEqualTypeOf<void>()
+    const allOld = del.returnValues("allOld")
+    expectTypeOf<ValueOf<typeof allOld>>().toEqualTypeOf<User | undefined>()
+    const conditioned = del.returnValues("allOld").condition({ role: "admin" })
+    expectTypeOf<ValueOf<typeof conditioned>>().toEqualTypeOf<User | undefined>()
+    expectTypeOf<ValueOf<ReturnType<typeof del.returnValues<"none">>>>().toEqualTypeOf<void>()
+  })
+
+  it("unbound Entity.returnValues types a delete too", () => {
+    const allOld = Entity.returnValues(UserEntity.delete({ userId: "u-1" }), "allOld")
+    expectTypeOf<ValueOf<typeof allOld>>().toEqualTypeOf<User | undefined>()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // `returnValues(mode)` types what the update returns (#133)
 // ---------------------------------------------------------------------------
 
