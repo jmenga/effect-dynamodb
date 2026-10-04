@@ -24,7 +24,7 @@ import { beforeEach } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
-import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+import { applyUpdate, mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // In-memory raw client: stores puts, records every write
@@ -59,7 +59,12 @@ const InMemoryClient = mockDynamoClientLayer({
     takeFailure("UpdateItem") ??
     Effect.sync(() => {
       writes.push({ op: "Update", input })
-      return { Attributes: store.get(keyOf(input.Key!)) } as any
+      const prior = store.get(keyOf(input.Key!))
+      const next = applyUpdate(prior, input)
+      if (next !== undefined) store.set(keyOf(input.Key!), next)
+      const returned =
+        input.ReturnValues === "ALL_OLD" ? prior : input.ReturnValues === "NONE" ? undefined : next
+      return { Attributes: returned } as any
     }),
   transactWriteItems: (input) =>
     takeFailure("TransactWriteItems") ??
@@ -73,7 +78,11 @@ const InMemoryClient = mockDynamoClientLayer({
           writes.push({ op: "Delete", input: op.Delete })
           store.delete(keyOf(op.Delete.Key))
         }
-        if (op.Update) writes.push({ op: "Update", input: op.Update })
+        if (op.Update) {
+          writes.push({ op: "Update", input: op.Update })
+          const next = applyUpdate(store.get(keyOf(op.Update.Key)), op.Update)
+          if (next !== undefined) store.set(keyOf(op.Update.Key), next)
+        }
         if (op.ConditionCheck) writes.push({ op: "Check", input: op.ConditionCheck })
       }
       const hook = afterTransact
@@ -343,6 +352,15 @@ const keyWrites = (write: { readonly op: string; readonly input: Record<string, 
   return out.sort()
 }
 
+/** A deep copy with every incarnation token (a random UUID) masked, so two runs compare. */
+const masked = <T>(value: T): T =>
+  JSON.parse(
+    JSON.stringify(value).replace(
+      /[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/g,
+      "<incarnation>",
+    ),
+  )
+
 /** Seed `seed`, run one update built by `build`, and return what it wrote. */
 const runUpdate = (name: Name, seed: Record<string, unknown>, build: (u: Builder) => Builder) =>
   Effect.gen(function* () {
@@ -360,8 +378,8 @@ const runUpdate = (name: Name, seed: Record<string, unknown>, build: (u: Builder
     )
     return {
       exit,
-      writes: structuredClone(writes),
-      store: structuredClone([...store.entries()].sort(([a], [b]) => a.localeCompare(b))),
+      writes: masked(writes),
+      store: masked([...store.entries()].sort(([a], [b]) => a.localeCompare(b))),
     }
   })
 
@@ -425,15 +443,21 @@ describe("#133 path operations on index composites — six canonical shapes", ()
           const seed = { channel: "c1", deviceId: "x1", label: "l" }
           const record = yield* runUpdate(`Ports${variant}`, seed, (u) => u.set({ label: "m" }))
           const path = yield* runUpdate(`Ports${variant}`, seed, set(["label"], "m"))
-          // A retain path update is a transacted Update, the record one a Put:
-          // compare the index keys each writes.
-          const gsiKeys = (run: typeof record) =>
-            run.writes
-              .flatMap(keyWrites)
+          // The index keys after each form: the record form writes only keys
+          // that changed (none here), the path form re-SETs the PK-composite
+          // GSI keys idempotently — both leave the same stored keys.
+          const storedGsi = (run: typeof record) => {
+            const main = run.store.find(([k]) => !k.includes("#v#"))![1]
+            return Object.keys(main)
               .filter((k) => k.startsWith("gsi"))
               .sort()
-          expect(gsiKeys(path)).toEqual(gsiKeys(record))
-          expect(gsiKeys(path).some((k) => k.startsWith("gsi2pk="))).toBe(true)
+              .map((k) => `${k}=${main[k]!.S}`)
+          }
+          expect(storedGsi(record)).toEqual(storedGsi(path))
+          expect(storedGsi(record).some((k) => k.startsWith("gsi2pk="))).toBe(true)
+          for (const k of path.writes.flatMap(keyWrites).filter((k) => k.startsWith("gsi"))) {
+            expect(storedGsi(record)).toContain(k)
+          }
         }).pipe(Effect.provide(TestLayer), closed),
       )
 
@@ -521,7 +545,11 @@ describe("#133 path operations on index composites — six canonical shapes", ()
             set(["deviceBinding"], "db2"),
           )
           expect(keys.some((k) => k.startsWith("gsi1pk=") && k.includes("db2"))).toBe(true)
-          expect(keys.some((k) => k.startsWith("gsi1sk="))).toBe(true)
+          // The constant-prefix SK half is written when it changes — here it
+          // does not, so the stored one stands.
+          const after = yield* runUpdate(`Bindings${variant}`, seed, set(["deviceBinding"], "db2"))
+          const main = after.store.find(([k]) => !k.includes("#v#"))![1]
+          expect(main.gsi1sk?.S).toBe(`$gpo#v1#binding${variant.toLowerCase()}`)
           yield* expectParity(
             `Bindings${variant}`,
             seed,
@@ -767,7 +795,7 @@ describe("#133 condition failures distinguish a version race from the user condi
       "DevicesRetained",
       (u) => u.set({ label: "m" }).condition({ eq: { label: "l" } }),
       cancelled,
-      "Put",
+      "Update",
     ],
     [
       "retain path update with a condition",
@@ -898,8 +926,9 @@ describe("#133 retain path update returns its own post-image", () => {
         return u.pathSet({ segments: ["label"], value: "m", isPath: false })
       })
       const error = failureOf(result.exit)
-      expect(error?._tag).toBe("DynamoError")
-      expect(String(error?.cause)).toContain("version 2")
+      // The write WAS applied: a distinct error, never a retryable failure.
+      expect(error?._tag).toBe("UpdateAppliedButUnreadable")
+      expect(error?.version).toBe(2)
     }).pipe(Effect.provide(TestLayer), closed),
   )
 
@@ -915,6 +944,129 @@ describe("#133 retain path update returns its own post-image", () => {
         })
         expect((result.exit as any).value.label).toBe("l")
       }
+    }).pipe(Effect.provide(TestLayer), closed),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Fields an update cannot change
+// ---------------------------------------------------------------------------
+
+describe("#133 .set() of a field an update cannot change", () => {
+  it.effect("a primary-key composite with another value is refused, naming it", () =>
+    Effect.gen(function* () {
+      const result = yield* runUpdate("PortsPlain", { channel: "c1", deviceId: "x1" }, (u) =>
+        u.set({ channel: "c2", label: "m" }),
+      )
+      expect(failureOf(result.exit)?._tag).toBe("ValidationError")
+      expect(String(failureOf(result.exit)?.cause)).toContain('"channel"')
+      expect(result.writes).toEqual([])
+    }).pipe(Effect.provide(TestLayer), closed),
+  )
+
+  it.effect("the key's own value is a no-op", () =>
+    Effect.gen(function* () {
+      const result = yield* runUpdate("PortsPlain", { channel: "c1", deviceId: "x1" }, (u) =>
+        u.set({ channel: "c1", label: "m" }),
+      )
+      expect(failureOf(result.exit)).toBeUndefined()
+    }).pipe(Effect.provide(TestLayer), closed),
+  )
+
+  it.effect("an immutable field is refused, naming it", () =>
+    Effect.gen(function* () {
+      const result = yield* runUpdate("Ledgers", { id: "l1", book: "b1" }, (u) =>
+        u.set({ book: "b2" }),
+      )
+      expect(failureOf(result.exit)?._tag).toBe("ValidationError")
+      expect(String(failureOf(result.exit)?.cause)).toContain('"book"')
+    }).pipe(Effect.provide(TestLayer), closed),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Incarnation token
+// ---------------------------------------------------------------------------
+
+describe("#133 incarnation token", () => {
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+  it.effect("a versioned create stamps one; it never reaches a decoded result", () =>
+    Effect.gen(function* () {
+      const client = yield* db
+      const record = (yield* client.entities.DevicesPlain.put({
+        id: "t1",
+        label: "l",
+      } as any)) as any
+      const stored = store.get("$gpo#v1#deviceplain#id_t1|$gpo#v1#deviceplain")!
+      expect(stored.__edd_i__?.S).toMatch(uuid)
+      expect("__edd_i__" in record).toBe(false)
+      const item = yield* Entity.asItem((Devices.plain as any).get({ id: "t1" }))
+      expect("__edd_i__" in (item as object)).toBe(false)
+      yield* client.entities.Counters.put({ id: "t2" } as any)
+      expect(store.get("$gpo#v1#counter#id_t2|$gpo#v1#counter")!.__edd_i__).toBeUndefined()
+    }).pipe(Effect.provide(TestLayer), closed),
+  )
+
+  it.effect("a version-checked update also proves the incarnation it read", () =>
+    Effect.gen(function* () {
+      for (const build of [
+        (u: Builder) => u.set({ label: "m" }),
+        (u: Builder) => u.pathSet({ segments: ["label"], value: "m", isPath: false }),
+      ]) {
+        const result = yield* runUpdate("DevicesRetained", { id: "d1", label: "l" }, build)
+        const main = result.writes.find((w) => w.op === "Update")!
+        expect(main.input.ConditionExpression).toContain("#inc = :inc")
+        expect(main.input.ExpressionAttributeNames["#inc"]).toBe("__edd_i__")
+      }
+    }).pipe(Effect.provide(TestLayer), closed),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Read-then-write updates: a guarded Update of what changed
+// ---------------------------------------------------------------------------
+
+describe("#133 read-then-write update writes a guarded Update", () => {
+  it.effect("unversioned: guards exactly the read values it computed from", () =>
+    Effect.gen(function* () {
+      const result = yield* runUpdate(
+        "Counters",
+        { id: "c1", owner: "alice", reading: "r1", seq: 1, label: "l" },
+        (u) => u.add({ seq: 2 }),
+      )
+      expect(result.writes.map((w) => w.op)).toEqual(["Update"])
+      const update = result.writes[0]!.input
+      const names = update.ExpressionAttributeNames as Record<string, string>
+      const guarded = [...String(update.ConditionExpression).matchAll(/(#g\d+) = /g)].map(
+        ([, key]) => names[key!],
+      )
+      // seq: the ADD operand's base; reading: composes the rewritten gsi1sk.
+      // owner and label fed nothing written — a concurrent change survives.
+      expect(guarded.sort()).toEqual(["reading", "seq"])
+      expect(update.ConditionExpression).toContain("attribute_exists(#pk)")
+      // Only what changed is written: seq and its index key.
+      const written = Object.values(names).filter((n) => !["pk", "seq", "reading"].includes(n))
+      expect(written).toEqual(["gsi1sk"])
+    }).pipe(Effect.provide(TestLayer), closed),
+  )
+
+  it.effect("a rejected input surfaces as ConcurrentModification with the stored item", () =>
+    Effect.gen(function* () {
+      const result = yield* runUpdate(
+        "Counters",
+        { id: "c1", owner: "alice", reading: "r1", seq: 1 },
+        (u) => {
+          const stored = [...store.values()].find((i) => i.__edd_e__?.S === "Counter")!
+          failNext = ccf({ ...stored, seq: { N: "7" } })
+          return u.add({ seq: 2 })
+        },
+      )
+      const error = failureOf(result.exit)
+      expect(error?._tag).toBe("ConcurrentModification")
+      expect(error?.attributes).toEqual(["seq"])
+      expect(error?.current?._tag).toBe("Some")
+      expect(error?.current?.value?.seq).toBe(7)
     }).pipe(Effect.provide(TestLayer), closed),
   )
 })

@@ -19,7 +19,13 @@ import * as Entity from "../src/Entity.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
-import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+import { applyUpdate, mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+
+/**
+ * The attributes a guarded Update SETs, by name — the read-then-write update
+ * branch writes an Update of what changed, not a Put of the whole item (#133).
+ */
+const updateSets = (update: Parameters<typeof applyUpdate>[1]) => applyUpdate({}, update)!
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -2454,12 +2460,16 @@ describe("Entity", () => {
         expect(mockUpdateItem).not.toHaveBeenCalled()
 
         const call = mockTransactWriteItems.mock.calls[0]![0]
-        // Items: [0] Put entity, [1] Delete old sentinel, [2] Put new sentinel
+        // Items: [0] Update entity, [1] Delete old sentinel, [2] Put new sentinel
         expect(call.TransactItems).toHaveLength(3)
 
-        // Item 0: Put entity item with version condition
-        expect(call.TransactItems[0].Put).toBeDefined()
-        expect(call.TransactItems[0].Put.ConditionExpression).toContain("#ver = :expectedVer")
+        // Item 0: a guarded Update of what changed, with the version condition
+        // (never a Put of the whole item read — #133)
+        expect(call.TransactItems[0].Update).toBeDefined()
+        expect(call.TransactItems[0].Update.ConditionExpression).toContain("#ver = :expectedVer")
+        expect(Object.values(call.TransactItems[0].Update.ExpressionAttributeNames)).not.toContain(
+          "displayName",
+        )
 
         // Item 1: Delete old sentinel
         expect(call.TransactItems[1].Delete).toBeDefined()
@@ -2559,21 +2569,31 @@ describe("Entity", () => {
             __edd_e__: "UniqueUser",
           }),
         })
-        mockTransactWriteItems.mockResolvedValueOnce({})
+        mockUpdateItem.mockImplementationOnce(async () => ({
+          Attributes: toAttributeMap({
+            userId: "u-1",
+            email: "alice@test.com",
+            displayName: "Alice",
+            role: "admin",
+            version: 1,
+            pk: "$myapp#v1#uniqueuser#u-1",
+            sk: "$myapp#v1#uniqueuser",
+            __edd_e__: "UniqueUser",
+          }),
+        }))
 
-        // Update email to the same value — still enters transact path
-        // (because the field is in the update payload) but should NOT
-        // include sentinel Delete/Put since the value didn't change
+        // Update email to the same value — still reads the item (the field is
+        // in the update payload) but writes no sentinel Delete/Put since the
+        // value didn't change: one guarded UpdateItem, no transaction.
         yield* UniqueEntity.update({ userId: "u-1" }).pipe(
           Entity.set({ email: "alice@test.com" }),
           Entity.asModel,
         )
 
-        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
-        const call = mockTransactWriteItems.mock.calls[0]![0]
-        // Only the entity Put — no sentinel operations
-        expect(call.TransactItems).toHaveLength(1)
-        expect(call.TransactItems[0].Put).toBeDefined()
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expect(mockUpdateItem).toHaveBeenCalledOnce()
+        const call = mockUpdateItem.mock.calls[0]![0]
+        expect(call.ConditionExpression).toContain("#ver = :expectedVer")
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -2613,9 +2633,9 @@ describe("Entity", () => {
 
         expect(mockTransactWriteItems).toHaveBeenCalledOnce()
         const call = mockTransactWriteItems.mock.calls[0]![0]
-        // Items: [0] Put entity, [1] Put snapshot, [2] Delete old sentinel, [3] Put new sentinel
+        // Items: [0] Update entity, [1] Put snapshot, [2] Delete old sentinel, [3] Put new sentinel
         expect(call.TransactItems).toHaveLength(4)
-        expect(call.TransactItems[0].Put).toBeDefined() // entity
+        expect(call.TransactItems[0].Update).toBeDefined() // entity
         expect(call.TransactItems[1].Put).toBeDefined() // snapshot
         expect(call.TransactItems[2].Delete).toBeDefined() // old sentinel
         expect(call.TransactItems[3].Put).toBeDefined() // new sentinel
@@ -4142,9 +4162,10 @@ describe("Entity", () => {
         expect(call.TransactItems).toHaveLength(2)
 
         // New item should have version 2
-        const newPut = call.TransactItems[0].Put
-        expect(newPut.Item.version.N).toBe("2")
-        expect(newPut.Item.name.S).toBe("Updated")
+        // The live item: a guarded Update of what changed (#133)
+        const newItem = updateSets(call.TransactItems[0].Update)
+        expect(newItem.version!.N).toBe("2")
+        expect(newItem.name!.S).toBe("Updated")
 
         // Snapshot should capture pre-update state (version 1, name "Original")
         const snapshotPut = call.TransactItems[1].Put
@@ -4176,10 +4197,10 @@ describe("Entity", () => {
           Entity.asModel,
         )
 
-        // The transaction Put should have a version condition
+        // The transaction's Update should have a version condition
         const call = mockTransactWriteItems.mock.calls[0]![0]
-        const mainPut = call.TransactItems[0].Put
-        expect(mainPut.ConditionExpression).toContain("#ver = :expectedVer")
+        const mainUpdate = call.TransactItems[0].Update
+        expect(mainUpdate.ConditionExpression).toContain("#ver = :expectedVer")
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -5579,7 +5600,7 @@ describe("Entity", () => {
         expect(call.TransactItems[2].Put.Item.sk.S).toBe(newKey.sk)
         expect(call.TransactItems[2].Put.Item.__edd_e__.S).toBe("RenamedUniqHard._unique.name")
         // The row itself keeps the stored attribute name.
-        expect(call.TransactItems[0].Put.Item.widgetName.S).toBe("Beta")
+        expect(updateSets(call.TransactItems[0].Update).widgetName!.S).toBe("Beta")
       }).pipe(Effect.provide(RenamedTestLayer)),
     )
 
@@ -6588,14 +6609,17 @@ describe("Entity", () => {
           }),
         })
 
-        yield* ItemEntity.update({ itemId: "i-1" }).pipe(
+        const old = yield* ItemEntity.update({ itemId: "i-1" }).pipe(
           Entity.set({ name: "Updated" }),
           Entity.returnValues("updatedOld"),
           Entity.asModel,
         )
 
+        // The whole old item is asked for and projected onto the attributes
+        // the update writes, so each decodes in full (#133).
         const call = mockUpdateItem.mock.calls[0]![0]
-        expect(call.ReturnValues).toBe("UPDATED_OLD")
+        expect(call.ReturnValues).toBe("ALL_OLD")
+        expect(old).toEqual({ name: "Old" })
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -8409,7 +8433,9 @@ describe("Entity", () => {
           .pipe(Entity.set({ occurredAt: newOccurred, updatedAt: pinnedUpdatedAt }))
           .asEffect()
 
-        const putItem = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Put.Item
+        const putItem = updateSets(
+          mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Update,
+        ) as any
         // Neither field should be serialized as a DynamoDB Map (`M`).
         expect(putItem.occurredAt).toEqual({ S: "2024-06-15T00:00:00.000Z" })
         expect(putItem.updatedAt).toEqual({ S: "2024-06-15T12:00:00.000Z" })
@@ -8441,7 +8467,9 @@ describe("Entity", () => {
           yield* RetainDocEntity.update({ id: "r-2" })
             .pipe(Entity.set({ title: "after" }))
             .asEffect()
-          const putItem = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Put.Item
+          const putItem = updateSets(
+            mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Update,
+          ) as any
           expect(typeof putItem.updatedAt.S).toBe("string")
           expect(putItem.updatedAt.M).toBeUndefined()
         }).pipe(Effect.provide(TestLayer)),

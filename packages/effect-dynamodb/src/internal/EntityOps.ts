@@ -38,6 +38,17 @@ export type DecodeMode = "model" | "record" | "item" | "native" | "raw"
 /** DynamoDB ReturnValues modes */
 export type ReturnValuesMode = "none" | "allOld" | "allNew" | "updatedOld" | "updatedNew"
 
+/**
+ * What an update returns for a `returnValues` mode (#133): `"none"` →
+ * `undefined`; `"updatedOld"` / `"updatedNew"` → only the attributes the
+ * update wrote, as a `Partial`; `"allOld"` / `"allNew"` → the whole item.
+ */
+export type UpdateReturn<A, M extends ReturnValuesMode> = M extends "none"
+  ? undefined
+  : M extends "updatedOld" | "updatedNew"
+    ? Partial<A>
+    : A
+
 /** @internal Map from our mode names to DynamoDB ReturnValues strings */
 export const returnValuesMap: globalThis.Record<ReturnValuesMode, ReturnValue> = {
   none: "NONE",

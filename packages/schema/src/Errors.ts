@@ -57,6 +57,39 @@ export class ConditionalCheckFailed extends Data.TaggedError("ConditionalCheckFa
 }> {}
 
 /**
+ * An update computed part of what it writes from the item it read — a value
+ * an `.add()` / `.subtract()` / `.append()` / `.deleteFromSet()` derives from,
+ * an index key composed from stored composites, a unique sentinel keyed by the
+ * stored value — and another writer changed one of those inputs before the
+ * write landed. Nothing was written. Raised for entities without a version
+ * attribute (a versioned entity reports the race as {@link OptimisticLockError}).
+ *
+ * `attributes` names the inputs that changed; `current` carries the item as
+ * stored when the write was rejected (decoded, when it decodes). Retrying the
+ * update re-reads the item and recomputes from its new values.
+ */
+export class ConcurrentModification extends Data.TaggedError("ConcurrentModification")<{
+  readonly entityType: string
+  readonly key: Record<string, unknown>
+  readonly attributes: ReadonlyArray<string>
+  readonly current: Option.Option<unknown>
+}> {}
+
+/**
+ * The update WAS applied — committed at `version` — but the item it wrote could
+ * not be read back: another write replaced it before the read, and left no
+ * snapshot that provably holds this write's result. Do not retry a
+ * non-idempotent update (`pathAdd`, `pathAppend`, …) on this error: it would
+ * apply twice. Read the item to see its current state.
+ */
+export class UpdateAppliedButUnreadable extends Data.TaggedError("UpdateAppliedButUnreadable")<{
+  readonly entityType: string
+  readonly key: Record<string, unknown>
+  readonly version: number
+  readonly reason: string
+}> {}
+
+/**
  * `Entity.append()` was rejected because the CAS predicate
  * (`attribute_not_exists(pk) OR <orderBy> < :newOrderBy`) did not hold —
  * i.e. another writer has already advanced the current item past

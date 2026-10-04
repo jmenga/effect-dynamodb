@@ -13,6 +13,7 @@
  * only requires adding a default here.
  */
 
+import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { Effect, Layer } from "effect"
 import { DynamoClient, type DynamoClientService } from "../../src/DynamoClient.js"
 
@@ -86,3 +87,52 @@ export const mockDynamoClientLayer = (
 export const mockOutput = <T extends { readonly $metadata: unknown }>(
   fields: Omit<T, "$metadata">,
 ): T => fields as T
+
+/**
+ * Apply an UpdateItem request to an in-memory item, for mocks that keep a
+ * store. Understands the shapes the library emits for whole attributes —
+ * `SET #a = :v`, `SET #v = #v + :n`, `REMOVE #a` — which is every write of the
+ * read-then-write update branch. Anything else (path expressions, ADD,
+ * list_append, …) only bumps the `version` attribute, so a retain update can
+ * still recognise its own write by version.
+ */
+export const applyUpdate = (
+  item: Record<string, AttributeValue> | undefined,
+  input: {
+    readonly UpdateExpression?: string | undefined
+    readonly ExpressionAttributeNames?: Record<string, string> | undefined
+    readonly ExpressionAttributeValues?: Record<string, AttributeValue> | undefined
+  },
+): Record<string, AttributeValue> | undefined => {
+  if (item === undefined) return undefined
+  const names = input.ExpressionAttributeNames ?? {}
+  const values = input.ExpressionAttributeValues ?? {}
+  const expression = input.UpdateExpression ?? ""
+  const set = /^SET (.*?)(?: REMOVE (.*))?$/.exec(expression)
+  const remove = /^REMOVE (.*)$/.exec(expression)
+  const sets = set?.[1]?.split(", ") ?? []
+  const removes = (set?.[2] ?? remove?.[1])?.split(", ") ?? []
+  const simple =
+    (set !== null || remove !== null) &&
+    sets.every((clause) => /^#\w+ = (:\w+|#\w+ \+ :\w+)$/.test(clause)) &&
+    removes.every((clause) => /^#\w+$/.test(clause))
+  const next: Record<string, AttributeValue> = { ...item }
+  if (!simple) {
+    if (next.version?.N !== undefined) {
+      next.version = { N: String(Number(next.version.N) + 1) }
+    }
+    return next
+  }
+  for (const clause of sets) {
+    const [target, source] = clause.split(" = ") as [string, string]
+    const name = names[target]!
+    const increment = /^(#\w+) \+ (:\w+)$/.exec(source)
+    next[name] = increment
+      ? {
+          N: String(Number(next[names[increment[1]!]!]?.N ?? 0) + Number(values[increment[2]!]!.N)),
+        }
+      : values[source]!
+  }
+  for (const clause of removes) delete next[names[clause]!]
+  return next
+}

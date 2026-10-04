@@ -13937,7 +13937,8 @@ describeConnected("#133 — retain path operations match DynamoDB's own", () => 
           .pipe(Effect.map(({ Item }) => Item as Record<string, any> | undefined))
       const fields = (item: Record<string, any> | undefined) => {
         if (item === undefined) return undefined
-        const { pk, sk, __edd_e__, updatedAt, createdAt, ...rest } = item
+        // Each create draws its own random incarnation token (`__edd_i__`).
+        const { pk, sk, __edd_e__, __edd_i__, updatedAt, createdAt, ...rest } = item
         return rest
       }
       const base = {
@@ -14166,6 +14167,13 @@ const g133Entities = {
   AccountsPlain: G133Accounts.plain,
   AccountsRetained: G133Accounts.retained,
   Counters: G133Counters,
+  AccountsBare: Entity.make({
+    model: G133Account,
+    entityType: "G133AccountBare",
+    primaryKey: g133IdKey as any,
+    unique: { email: ["email"] },
+    timestamps: true,
+  }),
 }
 const G133Table = Table.make({ schema: G133Schema, entities: g133Entities })
 const g133Tables = {
@@ -14340,9 +14348,15 @@ describeConnected("#133 — path operations on index composites and unique field
     Effect.gen(function* () {
       const client = yield* DynamoClient
       const { Items } = yield* client.scan({ TableName: name, ConsistentRead: true })
-      return (Items ?? [])
-        .map((item) => item as Record<string, any>)
-        .sort((a, b) => `${a.pk.S}|${a.sk.S}`.localeCompare(`${b.pk.S}|${b.sk.S}`))
+      return (
+        (Items ?? [])
+          .map((item) => item as Record<string, any>)
+          // Each create draws its own random incarnation token.
+          .map((item) =>
+            item.__edd_i__ === undefined ? item : { ...item, __edd_i__: { S: "<incarnation>" } },
+          )
+          .sort((a, b) => `${a.pk.S}|${a.sk.S}`.localeCompare(`${b.pk.S}|${b.sk.S}`))
+      )
     }).pipe(Effect.provide(g133Layer(name)))
 
   it.effect("pathSet / pathRemove store exactly what .set() / .remove() store", () =>
@@ -14559,8 +14573,9 @@ describeConnected("#133 — path operations on index composites and unique field
         .pathSet({ segments: ["label"], value: "n", isPath: false })
         .asEffect()
         .pipe(Effect.flip)
-      expect(error._tag).toBe("DynamoError")
-      expect(String(error.cause)).toContain("no version 4 snapshot")
+      // The write WAS applied — a distinct error that says so, never a retry.
+      expect(error._tag).toBe("UpdateAppliedButUnreadable")
+      expect(error.version).toBe(4)
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
@@ -14577,6 +14592,363 @@ describeConnected("#133 — path operations on index composites and unique field
         )) as any
         expect([id, old.label, old.version]).toEqual([id, "l", 1])
       }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- read-then-write updates: guarded Update, never a whole-item Put ----
+
+  const rawItem = (entityType: string, id: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      return (yield* client.getItem({
+        TableName: g133Tables.record,
+        Key: mainKey(entityType, id),
+        ConsistentRead: true,
+      })).Item as Record<string, any>
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+  /** A concurrent raw write of one attribute behind the update's back. */
+  const rawSet = (entityType: string, id: string, attr: string, value: Record<string, unknown>) =>
+    g133Hook(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.updateItem({
+          TableName: g133Tables.record,
+          Key: mainKey(entityType, id),
+          UpdateExpression: "SET #a = :v",
+          ExpressionAttributeNames: { "#a": attr },
+          ExpressionAttributeValues: { ":v": value as any },
+        })
+      }).pipe(Effect.provide(ClientLayer)),
+    )
+
+  it.effect("stores exactly the read item plus the update's changes", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      yield* db.entities.AccountsBare.put({ id: "ex1", email: "ex1@x.io", name: "n" } as any)
+      const before = yield* rawItem("G133AccountBare", "ex1")
+      yield* (db.entities.AccountsBare as any).update({ id: "ex1" }).set({ email: "ex1b@x.io" })
+      expect(yield* rawItem("G133AccountBare", "ex1")).toEqual({
+        ...before,
+        email: { S: "ex1b@x.io" },
+      })
+
+      yield* db.entities.Counters.put({ id: "ex2", owner: "o", reading: "r", seq: 1 } as any)
+      const counter = yield* rawItem("G133Counter", "ex2")
+      yield* (db.entities.Counters as any).update({ id: "ex2" }).add({ seq: 2 })
+      expect(yield* rawItem("G133Counter", "ex2")).toEqual({
+        ...counter,
+        seq: { N: "3" },
+        gsi1sk: { S: counter.gsi1sk.S.replace(/seq_0+1$/, "seq_0000000000000003") },
+      })
+
+      yield* db.entities.DevicesRetained.put({ id: "ex3", owner: "o", label: "l" } as any)
+      const retained = yield* rawItem("G133DeviceRetained", "ex3")
+      yield* (db.entities.DevicesRetained as any).update({ id: "ex3" }).set({ label: "m" })
+      expect(yield* rawItem("G133DeviceRetained", "ex3")).toEqual({
+        ...retained,
+        label: { S: "m" },
+        version: { N: "2" },
+        // The owner composite composes the PK half of byOwner on update (the
+        // put left both halves out: its SK composites are missing).
+        gsi1pk: { S: "$edd133g#v1#g133deviceretained#owner_o" },
+      })
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  const readThenWrite: ReadonlyArray<
+    readonly [
+      string,
+      "AccountsBare" | "Counters",
+      string,
+      Record<string, unknown>,
+      Build,
+      string,
+      string,
+    ]
+  > = [
+    [
+      "unique-field change (transacted)",
+      "AccountsBare",
+      "G133AccountBare",
+      { email: "rw@x.io", name: "n" },
+      (u) => u.set({ email: "rw2@x.io" }),
+      "name",
+      "email",
+    ],
+    [
+      "computed GSI composite (single UpdateItem)",
+      "Counters",
+      "G133Counter",
+      { owner: "o", reading: "r", seq: 1, label: "l" },
+      (u) => u.add({ seq: 2 }),
+      "label",
+      "reading",
+    ],
+  ]
+  for (const [label, entity, entityType, seed, build, unrelated, input] of readThenWrite) {
+    it.effect(`${label}: a concurrent change to an unrelated attribute is preserved`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const id = `un-${entity.toLowerCase()}`
+        yield* (db.entities[entity] as any).put({ id, ...seed, email: `${id}@x.io` })
+        g133Inject.before = rawSet(entityType, id, unrelated, { S: "theirs" })
+        yield* build((db.entities[entity] as any).update({ id })).asEffect()
+        const stored = yield* rawItem(entityType, id)
+        expect(stored[unrelated]).toEqual({ S: "theirs" })
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+
+    it.effect(`${label}: a concurrent change to an input is rejected`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const id = `in-${entity.toLowerCase()}`
+        yield* (db.entities[entity] as any).put({ id, ...seed, email: `${id}@x.io` })
+        g133Inject.before = rawSet(entityType, id, input, { S: "theirs" })
+        const error = yield* build((db.entities[entity] as any).update({ id }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ConcurrentModification")
+        expect(error.attributes).toEqual([input])
+        expect(Option.isSome(error.current)).toBe(true)
+        const stored = yield* rawItem(entityType, id)
+        expect(stored[input]).toEqual({ S: "theirs" })
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+  }
+
+  // ---- returnValues: every mode on every update branch ----
+
+  const branches: ReadonlyArray<
+    readonly [
+      string,
+      keyof typeof g133Entities,
+      Record<string, unknown>,
+      Build,
+      Record<string, unknown>,
+      Record<string, unknown>,
+    ]
+  > = [
+    [
+      "plain UpdateItem",
+      "DevicesPlain",
+      { owner: "o", label: "l" },
+      (u) => u.set({ label: "m" }),
+      { label: "l" },
+      { label: "m" },
+    ],
+    [
+      "read-then-write UpdateItem",
+      "Counters",
+      { owner: "o", reading: "r", seq: 1, label: "l" },
+      (u) => u.add({ seq: 2 }),
+      { seq: 1 },
+      { seq: 3 },
+    ],
+    [
+      "read-then-write transaction",
+      "AccountsBare",
+      { email: "rv@x.io", name: "n" },
+      (u) => u.set({ email: "rv2@x.io" }),
+      { email: "rv@x.io" },
+      { email: "rv2@x.io" },
+    ],
+    [
+      "retain record update",
+      "DevicesRetained",
+      { owner: "o", label: "l" },
+      (u) => u.set({ label: "m" }),
+      { label: "l" },
+      { label: "m" },
+    ],
+    [
+      "retain path update",
+      "DevicesRetained",
+      { owner: "o", label: "l" },
+      (u) => u.pathSet({ segments: ["label"], value: "m", isPath: false }),
+      { label: "l" },
+      { label: "m" },
+    ],
+  ]
+  const modes = ["none", "allNew", "allOld", "updatedNew", "updatedOld"] as const
+  for (const [index, [label, entity, seed, build, , newPart]] of branches.entries()) {
+    it.effect(`returnValues on a ${label}`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const bound = db.entities[entity] as any
+        for (const mode of modes) {
+          const id = `rv-${index}-${mode.toLowerCase()}`
+          const email =
+            typeof seed.email === "string" ? `${mode.toLowerCase()}-${seed.email}` : undefined
+          const nextEmail =
+            typeof newPart.email === "string" ? `${mode.toLowerCase()}-${newPart.email}` : undefined
+          yield* bound.put({ id, ...seed, ...(email !== undefined && { email }) })
+          const before = yield* bound.get({ id })
+          const update = build(bound.update({ id }))
+          const result = yield* (
+            nextEmail !== undefined ? update.set({ email: nextEmail }) : update
+          )
+            .returnValues(mode)
+            .asEffect()
+          const after = yield* bound.get({ id })
+          // The written attributes: the update's own, plus the system fields
+          // every update writes (the bound client decodes in record mode).
+          const writtenFields = [
+            ...Object.keys(nextEmail !== undefined ? { email: nextEmail } : newPart),
+            ...["updatedAt", "version"].filter((field) => field in after),
+          ]
+          const pick = (item: Record<string, unknown>) =>
+            Object.fromEntries(writtenFields.map((field) => [field, item[field]]))
+          const expected = {
+            none: undefined,
+            allNew: after,
+            allOld: before,
+            updatedNew: pick(after),
+            updatedOld: pick(before),
+          }[mode]
+          expect([label, mode, result]).toEqual([label, mode, expected])
+        }
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+  }
+
+  it.effect("returnValues partials in record and native modes", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      yield* db.entities.DevicesPlain.put({ id: "rvn", owner: "o", label: "l" } as any)
+      const record = (yield* Entity.asRecord(
+        Entity.returnValues(
+          (G133Devices.plain as any).update({ id: "rvn" }).pipe(Entity.set({ label: "m" } as any)),
+          "updatedNew",
+        ),
+      )) as any
+      expect(Object.keys(record).sort()).toEqual(["label", "updatedAt", "version"])
+      expect([record.label, record.version]).toEqual(["m", 2])
+      const native = yield* Entity.asNative(
+        Entity.returnValues(
+          (G133Devices.plain as any).update({ id: "rvn" }).pipe(Entity.set({ label: "n" } as any)),
+          "updatedOld",
+        ),
+      )
+      expect(Object.keys(native).sort()).toEqual(["label", "updatedAt", "version"])
+      expect(native.label).toEqual({ S: "m" })
+      const none = yield* Entity.asNative(
+        Entity.returnValues(
+          (G133Devices.plain as any).update({ id: "rvn" }).pipe(Entity.set({ label: "o" } as any)),
+          "none",
+        ),
+      )
+      expect(none).toBeUndefined()
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- incarnations: a deleted-and-recreated item is never mistaken for ours ----
+
+  const rawDelete = (entityType: string, id: string) =>
+    g133Hook(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteItem({
+          TableName: g133Tables.record,
+          Key: mainKey(entityType, id),
+        })
+      }).pipe(Effect.provide(ClientLayer)),
+    )
+  const recreate = (id: string, label: string) =>
+    g133Hook(
+      Effect.gen(function* () {
+        const other = yield* g133Client
+        yield* (other.entities.DevicesRetained as any).put({ id, owner: "o", label })
+      }).pipe(Effect.provide(g133Layer(g133Tables.record))),
+    )
+  const snapshotRow = (id: string, version: number) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      return (yield* client.getItem({
+        TableName: g133Tables.record,
+        Key: {
+          pk: { S: `$edd133g#v1#g133deviceretained#id_${id}` },
+          sk: { S: `$edd133g#v1#g133deviceretained#v#${String(version).padStart(7, "0")}` },
+        },
+        ConsistentRead: true,
+      })).Item as Record<string, any> | undefined
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+
+  for (const [label, after] of [
+    ["a hard delete", (id: string) => rawDelete("G133DeviceRetained", id)],
+    [
+      "a delete and re-create",
+      (id: string) => Effect.andThen(rawDelete("G133DeviceRetained", id), recreate(id, "LATER")),
+    ],
+  ] as const) {
+    it.effect(
+      `a retain path update never returns an earlier incarnation's snapshot (${label})`,
+      () =>
+        Effect.gen(function* () {
+          const db = yield* g133Client
+          const id = `stale-${label.length}`
+          const docs = db.entities.DevicesRetained as any
+          // Incarnation 1: versions 1..3 — its v#2 snapshot survives the delete.
+          yield* docs.put({ id, owner: "o", label: "OLD1" })
+          yield* docs.update({ id }).set({ label: "OLD2" })
+          yield* docs.update({ id }).set({ label: "OLD3" })
+          yield* docs.delete({ id })
+          // Incarnation 2, updated to version 2 — then replaced before readback.
+          yield* docs.put({ id, owner: "o", label: "NEW" })
+          g133Inject.after = after(id)
+          const error = yield* docs
+            .update({ id })
+            .pathSet({ segments: ["label"], value: "mine", isPath: false })
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(error._tag).toBe("UpdateAppliedButUnreadable")
+          expect(error.version).toBe(2)
+          expect((yield* snapshotRow(id, 2))?.label).toEqual({ S: "OLD2" })
+        }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+  }
+
+  for (const [label, build] of [
+    ["record", (u: any) => u.set({ label: "mine" })],
+    ["path", (u: any) => u.pathSet({ segments: ["label"], value: "mine", isPath: false })],
+  ] as const) {
+    it.effect(`a ${label} retain update rejects a re-created item at the same version`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const id = `aba-${label}`
+        const docs = db.entities.DevicesRetained as any
+        yield* docs.put({ id, owner: "o", label: "first" })
+        // Between our read and our write: delete, and re-create at version 1.
+        g133Inject.before = Effect.andThen(
+          rawDelete("G133DeviceRetained", id),
+          recreate(id, "second"),
+        )
+        const error = yield* build(docs.update({ id })).asEffect().pipe(Effect.flip)
+        expect(error._tag).toBe("OptimisticLockError")
+        const live = yield* rawItem("G133DeviceRetained", id)
+        expect([live.label, live.version]).toEqual([{ S: "second" }, { N: "1" }])
+        // The re-created item's own v#1 snapshot is untouched.
+        expect((yield* snapshotRow(id, 1))?.label).toEqual({ S: "second" })
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+  }
+
+  it.effect(".set() of a primary-key composite or an immutable field is refused", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      yield* db.entities.DevicesPlain.put({ id: "pkset", owner: "o", label: "l" } as any)
+      const error = yield* (db.entities.DevicesPlain as any)
+        .update({ id: "pkset" })
+        .set({ id: "other", label: "m" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String(error.cause)).toContain('"id"')
+      // The same value is the key itself — a no-op, not a refusal.
+      const same = (yield* (db.entities.DevicesPlain as any)
+        .update({ id: "pkset" })
+        .set({ id: "pkset", label: "m" })) as any
+      expect(same.label).toBe("m")
+      expect((yield* rawItem("G133DevicePlain", "pkset")).label).toEqual({ S: "m" })
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 })

@@ -23,7 +23,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
-import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+import { applyUpdate, mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // In-memory raw client that records every write
@@ -54,7 +54,12 @@ const InMemoryClient = mockDynamoClientLayer({
   updateItem: (input) =>
     Effect.sync(() => {
       writes.push({ op: "Update", input })
-      return { Attributes: store.get(keyOf(input.Key!)) } as any
+      const prior = store.get(keyOf(input.Key!))
+      const next = applyUpdate(prior, input)
+      if (next !== undefined) store.set(keyOf(input.Key!), next)
+      const returned =
+        input.ReturnValues === "ALL_OLD" ? prior : input.ReturnValues === "NONE" ? undefined : next
+      return { Attributes: returned } as any
     }),
   transactWriteItems: (input) =>
     Effect.sync(() => {
@@ -69,15 +74,8 @@ const InMemoryClient = mockDynamoClientLayer({
         }
         if (op.Update) {
           writes.push({ op: "Update", input: op.Update })
-          // Only the version increment is emulated: a retain update reads its
-          // item back and recognises it by version.
-          const prior = store.get(keyOf(op.Update.Key))
-          if (prior?.version?.N !== undefined) {
-            store.set(keyOf(op.Update.Key), {
-              ...prior,
-              version: { N: String(Number(prior.version.N) + 1) },
-            })
-          }
+          const next = applyUpdate(store.get(keyOf(op.Update.Key)), op.Update)
+          if (next !== undefined) store.set(keyOf(op.Update.Key), next)
         }
         if (op.ConditionCheck) writes.push({ op: "Check", input: op.ConditionCheck })
       }
@@ -287,6 +285,24 @@ describe("#133 entity nested self dates — keys are unchanged", () => {
         kind: "final",
         nullAt: later,
       } as any)
+      // The update writes only what changed (#133); the stored keys are the
+      // ones the whole-item write produced before.
+      const stored = mainItem()
+      expect(
+        Object.keys(stored)
+          .filter(isKeyAttr)
+          .sort()
+          .map((k) => `${k}=${stored[k]!.S}`),
+      ).toEqual([
+        "gsi1pk=$edd133#v1#fixture#kind_final",
+        "gsi1sk=$edd133#v1#fixture#when_2000-01-01t00:00:00.000z",
+        "gsi2pk=$edd133#v1#fixture#id_f1",
+        "gsi2sk=$edd133#v1#fixture#when_2000-01-01t00:00:00.000z",
+        "gsi3pk=$edd133#v1#fixture#team_t1",
+        "gsi3sk=$edd133#v1#fixture",
+        "pk=$edd133#v1#fixture#id_f1",
+        "sk=$edd133#v1#fixture#when_2000-01-01t00:00:00.000z",
+      ])
       yield* client.entities.Fixtures.delete({ id: "f1", when: dt } as any)
       expect(keyLog()).toMatchInlineSnapshot(`
         [
@@ -302,14 +318,9 @@ describe("#133 entity nested self dates — keys are unchanged", () => {
           "Put item sk=$edd133#v1#fixture.kindwhen",
           "Put item pk=$edd133#v1#fixture#id_f1",
           "Put item sk=$edd133#v1#fixture#v#0000001",
-          "Put item gsi1pk=$edd133#v1#fixture#kind_final",
-          "Put item gsi1sk=$edd133#v1#fixture#when_2000-01-01t00:00:00.000z",
-          "Put item gsi2pk=$edd133#v1#fixture#id_f1",
-          "Put item gsi2sk=$edd133#v1#fixture#when_2000-01-01t00:00:00.000z",
-          "Put item gsi3pk=$edd133#v1#fixture#team_t1",
-          "Put item gsi3sk=$edd133#v1#fixture",
-          "Put item pk=$edd133#v1#fixture#id_f1",
-          "Put item sk=$edd133#v1#fixture#when_2000-01-01t00:00:00.000z",
+          "Update key pk=$edd133#v1#fixture#id_f1",
+          "Update key sk=$edd133#v1#fixture#when_2000-01-01t00:00:00.000z",
+          "Update set gsi1pk=$edd133#v1#fixture#kind_final",
           "Put item pk=$edd133#v1#fixture#id_f1",
           "Put item sk=$edd133#v1#fixture#v#0000001",
           "Delete key pk=$edd133#v1#fixture.kindwhen#match#2000-01-01t00:00:00.000z",
@@ -1615,7 +1626,8 @@ describe("#133 entity nested self dates — path operations on a retain entity",
       // One transaction: the Update DynamoDB applies, and the snapshot Put.
       const update = writes.find((w) => w.op === "Update")!.input
       expect(update.UpdateExpression).toMatch(/^SET .*list_append.* REMOVE .* ADD .* DELETE /)
-      expect(update.ConditionExpression).toBe("#retainVer = :retainVer")
+      // The version AND the incarnation read (#133).
+      expect(update.ConditionExpression).toBe("#retainVer = :retainVer AND #inc = :inc")
       expect(update.ExpressionAttributeValues[":retainVer"]).toEqual({ N: "1" })
       const values = Object.values(update.ExpressionAttributeValues as Record<string, any>)
       expect(values).toContainEqual(S(LATER))

@@ -7,10 +7,26 @@
 
 import type { DynamoEncoding } from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Effect, Schema } from "effect"
 import type { Entity } from "../Entity.js"
 import { toAttributeMap } from "../Marshaller.js"
+
+/**
+ * @internal Hidden per-incarnation token of a versioned entity (#133): set
+ * when an item is created, it tells an item apart from a deleted-and-recreated
+ * one at the same version. Named like
+ * `__edd_e__` so it cannot collide with a model field; never decoded.
+ */
+export const INCARNATION_TOKEN = "__edd_i__"
+
+const incarnationCrypto = makeDefaultCrypto()
+
+/** @internal A fresh incarnation token. */
+export const freshIncarnationToken: Effect.Effect<string> = Effect.orDie(
+  incarnationCrypto.randomUUIDv4,
+)
 
 /**
  * Generate a wire-form timestamp value for the configured encoding from a
@@ -349,6 +365,7 @@ export const validateAndBuildPutItem = (
       }
     }
     if (sf.version) item[sf.version] = 1
+    if (entity._incarnationToken) item[INCARNATION_TOKEN] = yield* freshIncarnationToken
 
     // Rename domain fields to their stored attribute names, in the same
     // position `Entity.put` does (after keys + system fields, before sparse

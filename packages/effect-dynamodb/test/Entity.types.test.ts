@@ -1165,3 +1165,84 @@ describe("Entity types — bound get() is still an Effect", () => {
     >()
   })
 })
+
+// ---------------------------------------------------------------------------
+// `returnValues(mode)` types what the update returns (#133)
+// ---------------------------------------------------------------------------
+
+describe("Entity types — update returnValues", () => {
+  type UserBound = import("../src/Entity.js").BoundEntity<
+    typeof User,
+    typeof UserEntity.indexes,
+    undefined,
+    { readonly userId: string }
+  >
+  type Update = ReturnType<UserBound["update"]>
+  type ValueOf<T> = T extends {
+    readonly asEffect: () => import("effect").Effect.Effect<infer A, any, any>
+  }
+    ? A
+    : never
+  type ErrorOf<T> = T extends {
+    readonly asEffect: () => import("effect").Effect.Effect<any, infer E, any>
+  }
+    ? E
+    : never
+  type TagsOf<E> = E extends { readonly _tag: infer Tag } ? Tag : never
+  // Never executed — the update descriptors only feed `typeof`.
+  const update = null as unknown as Update
+
+  it("the default and the whole-item modes return the model", () => {
+    if (update === null) return
+    expectTypeOf<ValueOf<Update>>().toEqualTypeOf<User>()
+    expectTypeOf<ValueOf<ReturnType<typeof update.returnValues<"allNew">>>>().toEqualTypeOf<User>()
+    const allOld = update.returnValues("allOld")
+    expectTypeOf<ValueOf<typeof allOld>>().toEqualTypeOf<User>()
+  })
+
+  it('"none" returns undefined', () => {
+    if (update === null) return
+    const none = update.returnValues("none")
+    expectTypeOf<ValueOf<typeof none>>().toEqualTypeOf<undefined>()
+  })
+
+  it('"updatedOld" / "updatedNew" return a partial model', () => {
+    if (update === null) return
+    const updatedOld = update.returnValues("updatedOld")
+    const updatedNew = update.returnValues("updatedNew")
+    expectTypeOf<ValueOf<typeof updatedOld>>().toEqualTypeOf<Partial<User>>()
+    expectTypeOf<ValueOf<typeof updatedNew>>().toEqualTypeOf<Partial<User>>()
+  })
+
+  it("the mode survives later combinators and can be changed again", () => {
+    if (update === null) return
+    const thenSet = update.returnValues("none").set({ displayName: "x" })
+    expectTypeOf<ValueOf<typeof thenSet>>().toEqualTypeOf<undefined>()
+    const back = update.returnValues("none").returnValues("allNew")
+    expectTypeOf<ValueOf<typeof back>>().toEqualTypeOf<User>()
+  })
+
+  it("the error channel declares the update concurrency errors", () => {
+    expectTypeOf<
+      "ConcurrentModification" extends TagsOf<ErrorOf<Update>> ? true : false
+    >().toEqualTypeOf<true>()
+    expectTypeOf<
+      "UpdateAppliedButUnreadable" extends TagsOf<ErrorOf<Update>> ? true : false
+    >().toEqualTypeOf<true>()
+  })
+
+  it("unbound Entity.returnValues types the terminals", () => {
+    const none = Entity.returnValues(UserEntity.update({ userId: "u-1" }), "none")
+    expectTypeOf<ValueOf<typeof none>>().toEqualTypeOf<undefined>()
+    type Native<T> = T extends import("effect").Effect.Effect<infer A, any, any> ? A : never
+    expectTypeOf<
+      Native<ReturnType<typeof Entity.asNative<typeof none>>>
+    >().toEqualTypeOf<undefined>()
+    const partial = UserEntity.update({ userId: "u-1" }).pipe(Entity.returnValues("updatedNew"))
+    expectTypeOf<ValueOf<typeof partial>>().toEqualTypeOf<Partial<User>>()
+    const full = UserEntity.update({ userId: "u-1" })
+    expectTypeOf<Native<ReturnType<typeof Entity.asNative<typeof full>>>>().toEqualTypeOf<
+      Record<string, import("@aws-sdk/client-dynamodb").AttributeValue>
+    >()
+  })
+})

@@ -16,7 +16,7 @@ import * as Entity from "../src/Entity.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
-import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+import { applyUpdate, mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // --- Models ---
 
@@ -313,6 +313,17 @@ const mockTransactWriteItems = vi.fn().mockImplementation(async (input: any) => 
         }
       }
     }
+    // A guarded Update (read-then-write update) carries the same version CAS.
+    if (item.Update?.ConditionExpression?.includes("#ver = :expectedVer")) {
+      const existing = store.get(storeKey(item.Update.Key.pk?.S ?? "", item.Update.Key.sk?.S ?? ""))
+      const verField = item.Update.ExpressionAttributeNames?.["#ver"]
+      const expectedVer = item.Update.ExpressionAttributeValues?.[":expectedVer"]
+      if (!existing || existing[verField]?.N !== expectedVer?.N) {
+        cancellationReasons.push({ Code: "ConditionalCheckFailed", Message: "Version mismatch" })
+        hasFailed = true
+        continue
+      }
+    }
     cancellationReasons.push({ Code: "None" })
   }
 
@@ -333,6 +344,10 @@ const mockTransactWriteItems = vi.fn().mockImplementation(async (input: any) => 
       const pk = item.Delete.Key.pk?.S ?? ""
       const sk = item.Delete.Key.sk?.S ?? ""
       store.delete(storeKey(pk, sk))
+    } else if (item.Update) {
+      const key = storeKey(item.Update.Key.pk?.S ?? "", item.Update.Key.sk?.S ?? "")
+      const next = applyUpdate(store.get(key), item.Update)
+      if (next !== undefined) store.set(key, next)
     }
   }
   return {}
