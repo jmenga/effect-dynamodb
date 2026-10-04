@@ -4338,6 +4338,82 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    describe("several items per partition: each has its own history (#133)", () => {
+      class Line extends Schema.Class<Line>("Line")({
+        order: Schema.String,
+        line: Schema.String,
+        name: Schema.String,
+      }) {}
+      const Lines = withConfig(
+        Entity.make({
+          model: Line,
+          entityType: "Line",
+          primaryKey: {
+            pk: { field: "pk", composite: ["order"] },
+            sk: { field: "sk", composite: ["line"] },
+          },
+          timestamps: true,
+          versioned: { retain: true },
+          softDelete: true,
+        }),
+      )
+      const key = { order: "o1", line: "a" }
+
+      it.effect("a created item's history continues from its own snapshots only", () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockResolvedValueOnce({})
+          yield* Lines.put({ ...key, name: "n" }).asEffect()
+          const history = mockQuery.mock.calls[0]![0]
+          expect(history.ExpressionAttributeValues[":prefix"]).toEqual({
+            S: "$myapp#v1#line#v#line_a#",
+          })
+          const [main, snapshot] = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+          expect(main.Put.Item.sk.S).toBe("$myapp#v1#line#line_a")
+          expect(snapshot.Put.Item.sk.S).toBe("$myapp#v1#line#v#line_a#0000001")
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("getVersion, versions, deleted.get and soft delete key by the item", () =>
+        Effect.gen(function* () {
+          mockGetItem.mockResolvedValueOnce({})
+          yield* Effect.flip(Lines.getVersion(key, 3).asEffect())
+          expect(mockGetItem.mock.calls[0]![0].Key.sk.S).toBe("$myapp#v1#line#v#line_a#0000003")
+          const versions = Lines.versions(key)
+          expect(versions._state.skConditions[0]!.condition).toEqual({
+            beginsWith: "$myapp#v1#line#v#line_a#",
+          })
+          // The partition's tombstones are listed together, every item's.
+          expect(Lines.deleted.list(key)._state.skConditions[0]!.condition).toEqual({
+            beginsWith: "$myapp#v1#line#deleted#",
+          })
+          mockQuery.mockResolvedValueOnce({ Items: [] })
+          yield* Effect.flip(Lines.deleted.get(key).asEffect())
+          expect(mockQuery.mock.calls[0]![0].ExpressionAttributeValues[":skPrefix"]).toEqual({
+            S: "$myapp#v1#line#deleted#line_a#",
+          })
+
+          mockGetItem.mockResolvedValueOnce({
+            Item: toAttributeMap({
+              ...key,
+              name: "n",
+              version: 2,
+              __edd_i__: "inc",
+              createdAt: "2024-01-15T00:00:00Z",
+              updatedAt: "2024-01-15T00:00:00Z",
+              pk: "$myapp#v1#line#order_o1",
+              sk: "$myapp#v1#line#line_a",
+              __edd_e__: "Line",
+            }),
+          })
+          mockTransactWriteItems.mockResolvedValueOnce({})
+          yield* Lines.delete(key).asEffect()
+          const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+          expect(items[1].Put.Item.sk.S).toMatch(/^\$myapp#v1#line#deleted#line_a#1970-/)
+          expect(items[2].Put.Item.sk.S).toBe("$myapp#v1#line#v#line_a#0000002")
+        }).pipe(Effect.provide(TestLayer)),
+      )
+    })
+
     it.effect("getVersion fetches specific version snapshot", () =>
       Effect.gen(function* () {
         mockGetItem.mockResolvedValueOnce({
@@ -5302,6 +5378,60 @@ describe("Entity", () => {
     beforeEach(() => {
       mockBatchWriteItem.mockReset()
     })
+
+    it.effect("purge of an item sharing its partition removes only that item's rows (#133)", () =>
+      Effect.gen(function* () {
+        class Line extends Schema.Class<Line>("Line")({
+          order: Schema.String,
+          line: Schema.String,
+          name: Schema.String,
+        }) {}
+        const Lines = withConfig(
+          Entity.make({
+            model: Line,
+            entityType: "Line",
+            primaryKey: {
+              pk: { field: "pk", composite: ["order"] },
+              sk: { field: "sk", composite: ["line"] },
+            },
+            versioned: { retain: true },
+            softDelete: true,
+          }),
+        )
+        const pk = "$myapp#v1#line#order_o1"
+        const row = (sk: string, extra: Record<string, unknown> = {}) =>
+          toAttributeMap({ pk, sk, ...extra })
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            row("$myapp#v1#line#line_a"),
+            row("$myapp#v1#line#line_b"),
+            row("$myapp#v1#line#v#line_a#0000001"),
+            row("$myapp#v1#line#v#line_b#0000001"),
+            row("$myapp#v1#line#deleted#line_a#2024-01-01T00:00:00.000Z"),
+            // Written by an earlier release, without an item segment: the
+            // composite it carries says whose it is.
+            row("$myapp#v1#line#v#0000001", { line: "a" }),
+            row("$myapp#v1#line#v#0000002", { line: "b" }),
+          ],
+        })
+        mockBatchWriteItem.mockResolvedValue({})
+
+        yield* Lines.purge({ order: "o1", line: "a" }).asEffect()
+
+        const query = mockQuery.mock.calls[0]![0]
+        expect(query.ProjectionExpression).toBe("#pk, #sk, #c0")
+        expect(query.ExpressionAttributeNames["#c0"]).toBe("line")
+        const deleted = mockBatchWriteItem.mock.calls.flatMap((call) =>
+          call[0].RequestItems["test-table"].map((r: any) => r.DeleteRequest.Key.sk.S),
+        )
+        expect(deleted).toEqual([
+          "$myapp#v1#line#line_a",
+          "$myapp#v1#line#v#line_a#0000001",
+          "$myapp#v1#line#deleted#line_a#2024-01-01T00:00:00.000Z",
+          "$myapp#v1#line#v#0000001",
+        ])
+      }).pipe(Effect.provide(PurgeTestLayer)),
+    )
 
     it.effect("purge deletes all items in partition via batchWriteItem", () =>
       Effect.gen(function* () {

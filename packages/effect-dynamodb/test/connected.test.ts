@@ -14249,6 +14249,17 @@ const G133Counters = Entity.make({
   indexes: g133DeviceIndexes,
 })
 
+// Several items per partition (#133): a primary sort key with a composite.
+class G133Line extends Schema.Class<G133Line>("G133Line")({
+  order: Schema.String,
+  line: Schema.String,
+  label: Schema.String,
+}) {}
+const g133LineKey = {
+  pk: { field: "pk", composite: ["order"] },
+  sk: { field: "sk", composite: ["line"] },
+}
+
 const g133Entities = {
   DevicesPlain: G133Devices.plain,
   DevicesRetained: G133Devices.retained,
@@ -14365,6 +14376,21 @@ const g133Entities = {
     },
     timestamps: true,
     versioned: true,
+  }),
+  Lines: Entity.make({
+    model: G133Line,
+    entityType: "G133Line",
+    primaryKey: g133LineKey as any,
+    timestamps: true,
+    versioned: { retain: true },
+  }),
+  SoftLines: Entity.make({
+    model: G133Line,
+    entityType: "G133SoftLine",
+    primaryKey: g133LineKey as any,
+    timestamps: true,
+    versioned: { retain: true },
+    softDelete: true,
   }),
   Articles: Entity.make({
     model: G133Article,
@@ -16709,6 +16735,8 @@ describeConnected("#133 — path operations on index composites and unique field
         // …and it goes on from there.
         const next = yield* docs.update({ id }).set({ label: "more" })
         expect(next.version).toBe(4)
+        // A query of its partition returns the item, never its snapshots.
+        expect((yield* docs.primary({ id }).collect()).map((r: any) => r.label)).toEqual(["more"])
       }
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
@@ -16779,6 +16807,122 @@ describeConnected("#133 — path operations on index composites and unique field
       const restored = yield* docs.restore({ id: "rs1" })
       expect([restored.label, restored.version]).toEqual(["again", 4])
       expect(yield* snapshotLabel("G133SoftDevice", "rs1", 3)).toEqual({ S: "again" })
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- several items per partition: each has its own history (#133) ----
+
+  /** Every row of an order's partition, by sort key. */
+  const linePartition = (order: string, entityType = "g133line") =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { Items } = yield* client.query({
+        TableName: g133Tables.record,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: `$edd133g#v1#${entityType}#order_${order}` } },
+        ConsistentRead: true,
+      })
+      return (Items ?? []).map((item) => item.sk!.S!)
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+
+  it.effect("sibling retain items keep independent version histories", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const lines = db.entities.Lines as any
+      const [a, b] = [
+        { order: "o1", line: "a" },
+        { order: "o1", line: "b" },
+      ]
+      yield* lines.put({ ...a, label: "a1" })
+      // A sibling is created at version 1 — not after the other's history.
+      expect((yield* lines.put({ ...b, label: "b1" })).version).toBe(1)
+      yield* lines.update(a).set({ label: "a2" })
+      expect((yield* lines.update(a).set({ label: "a3" })).version).toBe(3)
+      expect((yield* lines.update(b).set({ label: "b2" })).version).toBe(2)
+      // Each item's snapshots are its own, under its own key.
+      expect(yield* linePartition("o1")).toEqual([
+        "$edd133g#v1#g133line#line_a",
+        "$edd133g#v1#g133line#line_b",
+        "$edd133g#v1#g133line#v#line_a#0000001",
+        "$edd133g#v1#g133line#v#line_a#0000002",
+        "$edd133g#v1#g133line#v#line_b#0000001",
+      ])
+      const labels = (rows: ReadonlyArray<any>) => rows.map((r) => [r.version, r.label])
+      expect(labels(yield* lines.versions(a).collect())).toEqual([
+        [1, "a1"],
+        [2, "a2"],
+      ])
+      expect(labels(yield* lines.versions(b).collect())).toEqual([[1, "b1"]])
+      expect((yield* lines.getVersion(b, 1)).label).toBe("b1")
+      expect(yield* lines.getVersion(b, 2).pipe(Effect.flip)).toMatchObject({
+        _tag: "ItemNotFound",
+      })
+
+      // Delete and re-create one: it continues past its own history only.
+      yield* lines.delete(a)
+      expect((yield* lines.create({ ...a, label: "a4" })).version).toBe(4)
+      expect((yield* lines.update(b).set({ label: "b3" })).version).toBe(3)
+
+      // A query of the partition by sort key composite never meets history.
+      expect(
+        (yield* lines.primary({ order: "o1", line: "a" }).collect()).map((r: any) => r.label),
+      ).toEqual(["a4"])
+
+      // Nor does a query of the whole partition, or a scan: history rows keep
+      // the entity's type, but they are not its items.
+      const live = (rows: ReadonlyArray<any>) => rows.map((r) => r.label).sort()
+      expect(live(yield* lines.primary({ order: "o1" }).collect())).toEqual(["a4", "b3"])
+      expect(live(yield* lines.scan().collect())).toEqual(["a4", "b3"])
+      expect(yield* lines.primary({ order: "o1" }).count()).toBe(2)
+      // Purging one leaves its sibling and the sibling's history.
+      yield* lines.purge(a)
+      expect(yield* linePartition("o1")).toEqual([
+        "$edd133g#v1#g133line#line_b",
+        "$edd133g#v1#g133line#v#line_b#0000001",
+        "$edd133g#v1#g133line#v#line_b#0000002",
+      ])
+      expect((yield* lines.get(b)).label).toBe("b3")
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("sibling soft-deleted items are read, restored and purged one by one", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const lines = db.entities.SoftLines as any
+      const [a, b] = [
+        { order: "o2", line: "a" },
+        { order: "o2", line: "b" },
+      ]
+      yield* lines.put({ ...a, label: "a1" })
+      yield* lines.put({ ...b, label: "b1" })
+      yield* lines.update(b).set({ label: "b2" })
+      yield* lines.delete(a)
+      yield* TestClock.adjust("1 second")
+      yield* lines.delete(b)
+      // Tombstones are not items: a query of the partition finds none.
+      expect(yield* lines.primary({ order: "o2" }).collect()).toEqual([])
+      // Each tombstone is found by its own key — not the partition's latest.
+      expect((yield* lines.deleted.get(a)).label).toBe("a1")
+      expect((yield* lines.deleted.get(b)).label).toBe("b2")
+      // The partition's tombstones are still listed together.
+      expect((yield* lines.deleted.list(a).collect()).map((r: any) => r.label).sort()).toEqual([
+        "a1",
+        "b2",
+      ])
+      // Restoring one restores that one, at its own next version.
+      const restored = yield* lines.restore(a)
+      expect([restored.line, restored.label, restored.version]).toEqual(["a", "a1", 2])
+      expect(yield* lines.deleted.get(b).pipe(Effect.map((r: any) => r.label))).toBe("b2")
+      const restoredB = yield* lines.restore(b)
+      expect([restoredB.line, restoredB.label, restoredB.version]).toEqual(["b", "b2", 3])
+      // Purge removes one item, its tombstones and history only.
+      yield* lines.delete(a)
+      yield* lines.purge(a)
+      const left = yield* linePartition("o2", "g133softline")
+      expect(left.filter((sk) => sk.includes("line_a"))).toEqual([])
+      expect(left).toContain("$edd133g#v1#g133softline#line_b")
+      expect((yield* lines.versions(b).collect()).map((r: any) => r.version)).toEqual([1, 2])
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 

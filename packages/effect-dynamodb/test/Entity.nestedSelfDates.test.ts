@@ -273,7 +273,10 @@ const db = DynamoClient.make({
 })
 
 // ---------------------------------------------------------------------------
-// Key bytes — captured before the #133 entity change, and pinned
+// Key bytes — captured before the #133 entity change, and pinned. The one
+// deliberate change: `Fixtures` has a sort key composite (`when`), so its
+// snapshots and tombstones carry the item's segment (`#v#when_…#0000001`) —
+// several items share a partition, and each has its own history.
 // ---------------------------------------------------------------------------
 
 describe("#133 entity nested self dates — keys are unchanged", () => {
@@ -317,12 +320,12 @@ describe("#133 entity nested self dates — keys are unchanged", () => {
           "Put item pk=$edd133#v1#fixture.kindwhen#match#2000-01-01t00:00:00.000z",
           "Put item sk=$edd133#v1#fixture.kindwhen",
           "Put item pk=$edd133#v1#fixture#id_f1",
-          "Put item sk=$edd133#v1#fixture#v#0000001",
+          "Put item sk=$edd133#v1#fixture#v#when_2000-01-01t00:00:00.000z#0000001",
           "Update key pk=$edd133#v1#fixture#id_f1",
           "Update key sk=$edd133#v1#fixture#when_2000-01-01t00:00:00.000z",
           "Update set gsi1pk=$edd133#v1#fixture#kind_final",
           "Put item pk=$edd133#v1#fixture#id_f1",
-          "Put item sk=$edd133#v1#fixture#v#0000001",
+          "Put item sk=$edd133#v1#fixture#v#when_2000-01-01t00:00:00.000z#0000001",
           "Delete key pk=$edd133#v1#fixture.kindwhen#match#2000-01-01t00:00:00.000z",
           "Delete key sk=$edd133#v1#fixture.kindwhen",
           "Put item pk=$edd133#v1#fixture.kindwhen#final#2000-01-01t00:00:00.000z",
@@ -330,9 +333,9 @@ describe("#133 entity nested self dates — keys are unchanged", () => {
           "Delete key pk=$edd133#v1#fixture#id_f1",
           "Delete key sk=$edd133#v1#fixture#when_2000-01-01t00:00:00.000z",
           "Put item pk=$edd133#v1#fixture#id_f1",
-          "Put item sk=$edd133#v1#fixture#deleted#1970-01-01T00:00:00.000Z",
+          "Put item sk=$edd133#v1#fixture#deleted#when_2000-01-01t00:00:00.000z#1970-01-01T00:00:00.000Z",
           "Put item pk=$edd133#v1#fixture#id_f1",
-          "Put item sk=$edd133#v1#fixture#v#0000002",
+          "Put item sk=$edd133#v1#fixture#v#when_2000-01-01t00:00:00.000z#0000002",
           "Delete key pk=$edd133#v1#fixture.kindwhen#final#2000-01-01t00:00:00.000z",
           "Delete key sk=$edd133#v1#fixture.kindwhen",
         ]
@@ -357,7 +360,7 @@ describe("#133 entity nested self dates — keys are unchanged", () => {
           "Put item pk=$edd133#v1#fixture.kindwhen#match#tbd",
           "Put item sk=$edd133#v1#fixture.kindwhen",
           "Put item pk=$edd133#v1#fixture#id_f2",
-          "Put item sk=$edd133#v1#fixture#v#0000001",
+          "Put item sk=$edd133#v1#fixture#v#when_tbd#0000001",
         ]
       `)
     }).pipe(Effect.provide(TestLayer)),

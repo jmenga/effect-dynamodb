@@ -156,6 +156,35 @@ describe("DynamoSchema", () => {
     })
   })
 
+  describe("history keys of one item in a shared partition (#133)", () => {
+    const item = { item: "kind_a#seq_0000000002" }
+    it("insert the item segment after the history marker", () => {
+      expect(DynamoSchema.composeVersionKey(schema, "User", 3, item)).toBe(
+        "$myapp#v1#user#v#kind_a#seq_0000000002#0000003",
+      )
+      expect(DynamoSchema.composeVersionKeyPrefix(schema, "User", item)).toBe(
+        "$myapp#v1#user#v#kind_a#seq_0000000002#",
+      )
+      expect(DynamoSchema.composeDeletedKey(schema, "User", "2024-01-15T10:30:00Z", item)).toBe(
+        "$myapp#v1#user#deleted#kind_a#seq_0000000002#2024-01-15T10:30:00Z",
+      )
+      expect(DynamoSchema.composeDeletedKeyPrefix(schema, "User", item)).toBe(
+        "$myapp#v1#user#deleted#kind_a#seq_0000000002#",
+      )
+    })
+
+    it("are byte-identical to the partition-wide keys without one", () => {
+      for (const options of [undefined, {}, { item: undefined }, { item: "" }]) {
+        expect(DynamoSchema.composeVersionKey(schema, "User", 1, options)).toBe(
+          "$myapp#v1#user#v#0000001",
+        )
+        expect(DynamoSchema.composeDeletedKey(schema, "User", "t", options)).toBe(
+          "$myapp#v1#user#deleted#t",
+        )
+      }
+    })
+  })
+
   describe("applyCasing", () => {
     it("lowercase", () => {
       expect(DynamoSchema.applyCasing("MyApp", "lowercase")).toBe("myapp")

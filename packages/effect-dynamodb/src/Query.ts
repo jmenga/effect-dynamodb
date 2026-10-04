@@ -76,7 +76,29 @@ interface QueryState {
    * request over-reads and the surplus is discarded (see {@link limit}).
    */
   readonly keyFields: ReadonlyArray<string> | undefined
+  /**
+   * Sort key prefixes of rows that are an entity's HISTORY, not its items —
+   * version snapshots and soft-delete tombstones (#133). They keep the
+   * entity's `__edd_e__`, so the ownership filter alone admits them to a
+   * query of the table's primary key (or a scan). A scan filters them out in
+   * its `FilterExpression`; a query cannot (DynamoDB refuses a key attribute
+   * there), so its rows are dropped as they arrive, before they are decoded
+   * or counted — see {@link isExcludedRow}.
+   */
+  readonly excludeSkPrefixes: ExcludedSkPrefixes | undefined
 }
+
+/** @internal Rows a query must not return: `field` beginning with any of `prefixes`. */
+export interface ExcludedSkPrefixes {
+  readonly field: string
+  readonly prefixes: ReadonlyArray<string>
+}
+
+/** @internal Absent when there is nothing to exclude. */
+const normalizeExcluded = (
+  excluded: ExcludedSkPrefixes | undefined,
+): ExcludedSkPrefixes | undefined =>
+  excluded === undefined || excluded.prefixes.length === 0 ? undefined : excluded
 
 /** @internal Dedupe + drop absent entries from a caller-supplied key field list. */
 const normalizeKeyFields = (
@@ -142,8 +164,11 @@ export const make = <A>(config: {
   readonly resolveTableName?: Effect.Effect<string, never, any> | undefined
   /** Index key + table key attribute names (used to rebuild cursors). */
   readonly keyFields?: ReadonlyArray<string | undefined> | undefined
+  /** History rows to leave out (see {@link QueryState.excludeSkPrefixes}). */
+  readonly excludeSkPrefixes?: ExcludedSkPrefixes | undefined
 }): Query<A> =>
   new QueryImpl<A>({
+    excludeSkPrefixes: normalizeExcluded(config.excludeSkPrefixes),
     tableName: config.tableName,
     indexName: config.indexName,
     pkField: config.pkField,
@@ -183,8 +208,11 @@ export const makeScan = <A>(config: {
   readonly resolveTableName?: Effect.Effect<string, never, any> | undefined
   /** Index key + table key attribute names (used to rebuild cursors). */
   readonly keyFields?: ReadonlyArray<string | undefined> | undefined
+  /** History rows to leave out (see {@link QueryState.excludeSkPrefixes}). */
+  readonly excludeSkPrefixes?: ExcludedSkPrefixes | undefined
 }): Query<A> =>
   new QueryImpl<A>({
+    excludeSkPrefixes: normalizeExcluded(config.excludeSkPrefixes),
     tableName: config.tableName,
     indexName: config.indexName,
     pkField: "",
@@ -510,6 +538,16 @@ const buildFilterClauses = (state: QueryState) => {
     })
   }
 
+  // History rows (snapshots, tombstones) are not items (#133). A query's are
+  // dropped client-side instead: its filter may not name a key attribute.
+  if (state.isScan && state.excludeSkPrefixes !== undefined) {
+    names["#eddSk"] = state.excludeSkPrefixes.field
+    state.excludeSkPrefixes.prefixes.forEach((prefix, i) => {
+      filterClauses.push(`NOT begins_with(#eddSk, :eddSk${i})`)
+      values[`:eddSk${i}`] = toAttributeValue(prefix)
+    })
+  }
+
   // Expr-based filters (compiled from Entity.filter() callback/shorthand API)
   for (const expr of state.exprFilters) {
     const compiled = compileExpr(expr)
@@ -671,8 +709,25 @@ const computeRequestLimit = (
 ): number | undefined => {
   const pageSize = state.pageSizeValue
   if (remaining === undefined) return pageSize
-  if (state.exprFilters.length > 0 || state.predicates.length > 0) return pageSize
+  if (state.exprFilters.length > 0 || state.predicates.length > 0 || dropsRows(state)) {
+    return pageSize
+  }
   return pageSize === undefined ? remaining : Math.min(pageSize, remaining)
+}
+
+/**
+ * @internal Whether a query drops history rows client-side (#133): like a
+ * predicate, it rejects rows after they are read, so the `limit` budget cannot
+ * be handed to DynamoDB, and a count has to read the rows.
+ */
+const dropsRows = (state: QueryState): boolean =>
+  !state.isScan && state.excludeSkPrefixes !== undefined
+
+/** @internal Is this raw row a history row the query leaves out (#133)? */
+const isExcludedRow = (state: QueryState, row: Record<string, AttributeValue>): boolean => {
+  if (!dropsRows(state)) return false
+  const sk = row[state.excludeSkPrefixes!.field]?.S
+  return sk !== undefined && state.excludeSkPrefixes!.prefixes.some((p) => sk.startsWith(p))
 }
 
 /** @internal Does the decoded item pass every client-side predicate? */
@@ -719,13 +774,21 @@ const cursorFromItem = (
  * from the items handed back, so the caller sees exactly what it selected.
  */
 const cursorProjectionFields = (state: QueryState): ReadonlyArray<string> => {
-  if (state.limitValue === undefined || !state.keyFields) return []
   const projected = new Set<string>([
     ...(state.projection ?? []),
     ...(state.projectionPaths ?? []).map((segments) => String(segments[0])),
   ])
   if (projected.size === 0) return []
-  return state.keyFields.filter((field) => !projected.has(field))
+  const borrowed = new Set<string>(
+    state.limitValue === undefined || !state.keyFields
+      ? []
+      : state.keyFields.filter((field) => !projected.has(field)),
+  )
+  // A query that drops history rows reads their sort key (#133).
+  if (dropsRows(state) && !projected.has(state.excludeSkPrefixes!.field)) {
+    borrowed.add(state.excludeSkPrefixes!.field)
+  }
+  return [...borrowed]
 }
 
 // ---------------------------------------------------------------------------
@@ -793,7 +856,7 @@ export const execute = <A>(
     // Key attributes borrowed into an active projection so an over-reading
     // request can still rebuild a cursor. Stripped again before decoding.
     const borrowedFields = cursorProjectionFields(state)
-    const hasPredicate = state.predicates.length > 0
+    const hasPredicate = state.predicates.length > 0 || dropsRows(state)
 
     const items: Array<A> = []
     let startKey = state.exclusiveStartKey
@@ -825,6 +888,7 @@ export const execute = <A>(
       /** Index of the last row examined when the limit was reached, else -1. */
       let stoppedAt = -1
       for (let i = 0; i < take; i++) {
+        if (isExcludedRow(state, returned[i]!)) continue
         const raw = fromAttributeMap(returned[i]!)
         for (const field of borrowedFields) delete raw[field]
         const item = yield* state.decoder(raw) as Effect.Effect<A, ValidationError>
@@ -913,22 +977,35 @@ const paginateInternal = <A>(
         Effect.gen(function* () {
           const pageCount = pageState.pageCount + 1
           const remaining = limitValue === undefined ? undefined : limitValue - pageState.emitted
-          const cmd = buildDynamoCommand(state, tableName, {
-            ExclusiveStartKey: pageState.key,
-            Limit: computeRequestLimit(state, remaining),
-          })
+          const borrowedFields = cursorProjectionFields(state)
+          const cmd = buildDynamoCommand(
+            state,
+            tableName,
+            {
+              ExclusiveStartKey: pageState.key,
+              Limit: computeRequestLimit(state, remaining),
+            },
+            borrowedFields,
+          )
           const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
 
           const returned = (result.Items ?? []) as Array<Record<string, AttributeValue>>
           // See `execute` — a client predicate rejects rows after decode, so
           // the budget cannot bound the examine window, only the accepted one.
-          const hasPredicate = state.predicates.length > 0
+          const hasPredicate = state.predicates.length > 0 || dropsRows(state)
           const take =
             remaining === undefined || hasPredicate
               ? returned.length
               : Math.min(remaining, returned.length)
           const examined = yield* Effect.forEach(
-            returned.slice(0, take).map((item) => fromAttributeMap(item)),
+            returned
+              .slice(0, take)
+              .filter((item) => !isExcludedRow(state, item))
+              .map((item) => {
+                const raw = fromAttributeMap(item)
+                for (const field of borrowedFields) delete raw[field]
+                return raw
+              }),
             (raw) => state.decoder(raw) as Effect.Effect<A, ValidationError>,
           )
           const kept = hasPredicate ? examined.filter((item) => accepts(state, item)) : examined
@@ -980,7 +1057,7 @@ export const count = <A>(
     // than counting them in DynamoDB, which costs more; it is the price of a
     // predicate the database cannot evaluate, and the alternative is a wrong
     // number (#122).
-    if (state.predicates.length > 0) {
+    if (state.predicates.length > 0 || dropsRows(state)) {
       const items = yield* collect(self)
       return items.length
     }

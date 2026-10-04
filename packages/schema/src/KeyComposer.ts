@@ -296,6 +296,32 @@ export const composeSk = (
 }
 
 /**
+ * The item segment of an entity's history keys (version snapshots and
+ * soft-delete tombstones): the composite part of the item's primary sort key,
+ * exactly as `liveSk` — its live sort key — carries it (`kind_a#seq_0000000001`).
+ * `undefined` for a primary index without sort key composites: one item per
+ * partition, whose history keys carry no segment (see
+ * `DynamoSchema.HistoryKeyOptions`).
+ */
+export const composeHistoryItemSegment = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  entityVersion: number,
+  primary: IndexDefinition,
+  liveSk: string,
+): string | undefined => {
+  if (primary.sk.composite.length === 0) return undefined
+  const bare = composeSk(
+    schema,
+    entityType,
+    entityVersion,
+    { ...primary, sk: { ...primary.sk, composite: [] } },
+    {},
+  )
+  return liveSk.startsWith(`${bare}#`) ? liveSk.slice(bare.length + 1) : undefined
+}
+
+/**
  * Compose all key attributes for a single index.
  * Returns a record mapping field names to composed key values.
  */

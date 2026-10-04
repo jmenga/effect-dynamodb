@@ -704,6 +704,14 @@ export interface Entity<
    */
   readonly _multiItemWriteFeatures: ReadonlyArray<"unique" | "retain" | "softDelete">
 
+  /**
+   * @internal The sort key prefixes of this entity's history rows — version
+   * snapshots (`retain`) and soft-delete tombstones — in any partition. They
+   * keep the entity's `__edd_e__`, so a query of the primary key or a scan
+   * filters them out (#133). Empty without `retain` or `softDelete`.
+   */
+  readonly _historySkPrefixes: () => ReadonlyArray<string>
+
   /** @internal Attach model class prototype to a decoded plain object (no-op for Schema.Struct models). */
   readonly _attachPrototype: (decoded: any) => any
 
@@ -3635,7 +3643,12 @@ const makeImpl = <
         Key: {
           ...marshalledKey,
           [skField]: toAttributeValue(
-            DynamoSchema.composeVersionKey(schema, entityType, ourVersion),
+            DynamoSchema.composeVersionKey(
+              schema,
+              entityType,
+              ourVersion,
+              historyKeyOptions(marshalledKey[skField]?.S),
+            ),
           ),
         },
         ConsistentRead: true,
@@ -3733,6 +3746,41 @@ const makeImpl = <
   }
 
   /**
+   * The history keys (version snapshots, soft-delete tombstones) of the item
+   * whose live sort key is `liveSk` (#133). An entity whose primary sort key
+   * has composites holds several items per partition, so each item's history
+   * keys carry its segment — the composite part of `liveSk` — and items never
+   * share a version sequence, a snapshot or a tombstone. Without sort key
+   * composites there is one item per partition and no segment: the keys are
+   * byte-identical to the partition-wide ones every earlier release wrote.
+   */
+  const historyKeyOptions = (liveSk: unknown): DynamoSchema.HistoryKeyOptions | undefined => {
+    if (typeof liveSk !== "string") return undefined
+    const item = KeyComposer.composeHistoryItemSegment(
+      schema,
+      entityType,
+      entityVersion,
+      config.indexes.primary,
+      liveSk,
+    )
+    return item === undefined ? undefined : { item }
+  }
+  /** See {@link Entity._historySkPrefixes}: partition-wide, so every item's. */
+  const historySkPrefixes = (): ReadonlyArray<string> => [
+    ...(isRetainEnabled() ? [DynamoSchema.composeVersionKeyPrefix(schema, entityType)] : []),
+    ...(isSoftDeleteEnabled() ? [DynamoSchema.composeDeletedKeyPrefix(schema, entityType)] : []),
+  ]
+  /** The live sort key of the item at `encodedKey` (the caller's key, encoded). */
+  const liveSkOf = (encodedKey: unknown): string =>
+    KeyComposer.composeSk(
+      schema,
+      entityType,
+      entityVersion,
+      config.indexes.primary,
+      keyForm(encodedKey as globalThis.Record<string, unknown>),
+    )
+
+  /**
    * Build a version snapshot item: same PK, version SK, stripped GSI keys,
    * keeps __edd_e__ for entity type filtering.
    *
@@ -3747,6 +3795,8 @@ const makeImpl = <
     tableSkField: string,
     ttlAttrName: string,
     now: DateTime.Utc,
+    /** The item's live sort key, when `item` is not the live item (a tombstone). */
+    liveSk: unknown = item[tableSkField],
   ): globalThis.Record<string, unknown> => {
     const snapshot: globalThis.Record<string, unknown> = { ...item }
 
@@ -3769,7 +3819,12 @@ const makeImpl = <
     }
 
     // Replace SK with version SK
-    snapshot[tableSkField] = DynamoSchema.composeVersionKey(schema, entityType, version)
+    snapshot[tableSkField] = DynamoSchema.composeVersionKey(
+      schema,
+      entityType,
+      version,
+      historyKeyOptions(liveSk),
+    )
 
     // Add optional TTL
     const ttl = retainTtl()
@@ -3928,7 +3983,7 @@ const makeImpl = <
    * again at its key continues the sequence after them rather than
    * overwriting its earlier incarnation's history.
    */
-  const highestRetainedVersion = (tableName: string, pk: unknown) =>
+  const highestRetainedVersion = (tableName: string, pk: unknown, liveSk: unknown) =>
     Effect.gen(function* () {
       const client = yield* DynamoClient
       const primary = config.indexes.primary
@@ -3938,7 +3993,9 @@ const makeImpl = <
         ExpressionAttributeNames: { "#pk": primary.pk.field, "#sk": primary.sk.field },
         ExpressionAttributeValues: {
           ":pk": toAttributeValue(pk),
-          ":prefix": toAttributeValue(DynamoSchema.composeVersionKeyPrefix(schema, entityType)),
+          ":prefix": toAttributeValue(
+            DynamoSchema.composeVersionKeyPrefix(schema, entityType, historyKeyOptions(liveSk)),
+          ),
         },
         ScanIndexForward: false,
         Limit: 1,
@@ -4026,7 +4083,8 @@ const makeImpl = <
           if (currentRaw[createdAttr] !== undefined) item[createdAttr] = currentRaw[createdAttr]
         }
       } else if (systemFields.version && isRetainEnabled()) {
-        item[systemFields.version] = (yield* highestRetainedVersion(args.tableName, owner.pk)) + 1
+        item[systemFields.version] =
+          (yield* highestRetainedVersion(args.tableName, owner.pk, owner.sk)) + 1
       }
       const marshalled = toAttributeMap(item)
 
@@ -6925,7 +6983,12 @@ const makeImpl = <
             }
 
             // Replace SK with deleted sort key
-            deletedItem[primary.sk.field] = DynamoSchema.composeDeletedKey(schema, entityType, now)
+            deletedItem[primary.sk.field] = DynamoSchema.composeDeletedKey(
+              schema,
+              entityType,
+              now,
+              historyKeyOptions(primaryKey[primary.sk.field]),
+            )
 
             // Add deletedAt
             deletedItem.deletedAt = now
@@ -8169,6 +8232,10 @@ const makeImpl = <
       decoder: (raw) => decodeRecord(raw),
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
       keyFields: [config.indexes.primary.pk.field, config.indexes.primary.sk.field],
+      excludeSkPrefixes: {
+        field: config.indexes.primary.sk.field,
+        prefixes: historySkPrefixes(),
+      },
     })
 
   // ---------------------------------------------------------------------------
@@ -8188,7 +8255,12 @@ const makeImpl = <
           // Compose PK + version SK
           const primary = config.indexes.primary
           const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
-          const versionSk = DynamoSchema.composeVersionKey(schema, entityType, versionNumber)
+          const versionSk = DynamoSchema.composeVersionKey(
+            schema,
+            entityType,
+            versionNumber,
+            historyKeyOptions(liveSkOf(encodedKey)),
+          )
 
           const marshalledKey = toAttributeMap({
             [primary.pk.field]: pkValue,
@@ -8220,7 +8292,11 @@ const makeImpl = <
     const encodedKey = keyForm(encodeKeySync(key))
     const primary = config.indexes.primary
     const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
-    const versionPrefix = DynamoSchema.composeVersionKeyPrefix(schema, entityType)
+    const versionPrefix = DynamoSchema.composeVersionKeyPrefix(
+      schema,
+      entityType,
+      historyKeyOptions(liveSkOf(encodedKey)),
+    )
 
     return Query.make({
       tableName: "",
@@ -8252,7 +8328,12 @@ const makeImpl = <
           // Query for soft-deleted item using begins_with on deleted prefix
           const primary = config.indexes.primary
           const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
-          const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
+          // This item's tombstones — not a sibling's in the same partition (#133).
+          const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(
+            schema,
+            entityType,
+            historyKeyOptions(liveSkOf(encodedKey)),
+          )
 
           const result = yield* client.query({
             TableName: tableName,
@@ -8309,6 +8390,8 @@ const makeImpl = <
     const encodedKey = keyForm(encodeKeySync(key))
     const primary = config.indexes.primary
     const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
+    // The whole partition's tombstones — every item's, with sort key
+    // composites (#133): no item segment.
     const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
 
     const decodeDeleted = (raw: globalThis.Record<string, unknown>) => {
@@ -8366,7 +8449,12 @@ const makeImpl = <
           // Query for the soft-deleted item
           const primary = config.indexes.primary
           const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
-          const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
+          // This item's tombstones — not a sibling's in the same partition (#133).
+          const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(
+            schema,
+            entityType,
+            historyKeyOptions(liveSkOf(encodedKey)),
+          )
 
           const queryResult = yield* client.query({
             TableName: tableName,
@@ -8509,6 +8597,7 @@ const makeImpl = <
               primary.sk.field,
               ttlAttrName,
               now,
+              restoredKeys[primary.sk.field],
             )
             // Replaces only the delete-time snapshot of this same state —
             // never another version's history.
@@ -8629,8 +8718,9 @@ const makeImpl = <
     new EntityDeleteImpl(
       (opts: { readonly condition: Expr | ConditionInput | undefined }) =>
         Effect.gen(function* () {
-          // `purge` is partition-wide — it queries every item under the key and
-          // batch-deletes in chunks, so there is no single item for a
+          // `purge` queries the partition — every row of it, or with sort key
+          // composites this item's rows in it (#133) — and batch-deletes them
+          // in chunks, so there is no single item for a
           // ConditionExpression to guard and no way to make one atomic across
           // the batches. `.condition()` is structurally available because
           // `purge` returns an `EntityDelete`; refuse it loudly rather than
@@ -8654,9 +8744,55 @@ const makeImpl = <
 
           const primary = config.indexes.primary
           const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
+          const liveSk = liveSkOf(encodedKey)
+          const history = historyKeyOptions(liveSk)
 
-          // Query ALL items in this partition (current + versions + deleted)
-          // Use ProjectionExpression to only get keys
+          /**
+           * Whether a row of the partition is this item's (#133). Without sort
+           * key composites the partition IS the item: every row. With them, the
+           * partition holds siblings, and the item's rows are its live row, the
+           * rows nested under it (time-series events), and its own history.
+           * History an earlier release wrote without an item segment is the
+           * item's when the composites it carries compose the item's live key.
+           */
+          const ownVersions = DynamoSchema.composeVersionKeyPrefix(schema, entityType, history)
+          const ownTombstones = DynamoSchema.composeDeletedKeyPrefix(schema, entityType, history)
+          const sharedHistory = [
+            DynamoSchema.composeVersionKeyPrefix(schema, entityType),
+            DynamoSchema.composeDeletedKeyPrefix(schema, entityType),
+          ]
+          const belongsToItem = (row: globalThis.Record<string, AttributeValue>): boolean => {
+            if (history === undefined) return true
+            const sk = row[primary.sk.field]?.S
+            if (sk === undefined) return false
+            if (
+              sk === liveSk ||
+              sk.startsWith(`${liveSk}#`) ||
+              sk.startsWith(ownVersions) ||
+              sk.startsWith(ownTombstones)
+            ) {
+              return true
+            }
+            const unsegmented = sharedHistory.some(
+              (prefix) => sk.startsWith(prefix) && !sk.slice(prefix.length).includes("#"),
+            )
+            if (!unsegmented) return false
+            try {
+              return liveSkOf(toDomainView(fromAttributeMap(row))) === liveSk
+            } catch {
+              return false
+            }
+          }
+
+          // Query ALL items in this partition (current + versions + deleted).
+          // Keys only — plus, with sort key composites, the composites that
+          // attribute an unsegmented history row to its item.
+          const projected: globalThis.Record<string, string> = {}
+          if (history !== undefined) {
+            primary.sk.composite.forEach((attr, i) => {
+              projected[`#c${i}`] = resolveDbName(attr)
+            })
+          }
           const allItems: Array<globalThis.Record<string, AttributeValue>> = []
           let exclusiveStartKey: globalThis.Record<string, AttributeValue> | undefined
 
@@ -8664,14 +8800,20 @@ const makeImpl = <
             const result = yield* client.query({
               TableName: tableName,
               KeyConditionExpression: "#pk = :pk",
-              ExpressionAttributeNames: { "#pk": primary.pk.field },
+              ExpressionAttributeNames: {
+                "#pk": primary.pk.field,
+                ...(history !== undefined && { "#sk": primary.sk.field, ...projected }),
+              },
               ExpressionAttributeValues: { ":pk": toAttributeValue(pkValue) },
-              ProjectionExpression: `${primary.pk.field}, ${primary.sk.field}`,
+              ProjectionExpression:
+                history === undefined
+                  ? `${primary.pk.field}, ${primary.sk.field}`
+                  : ["#pk", "#sk", ...Object.keys(projected)].join(", "),
               ExclusiveStartKey: exclusiveStartKey,
             })
 
             if (result.Items) {
-              allItems.push(...result.Items)
+              allItems.push(...result.Items.filter(belongsToItem))
             }
             exclusiveStartKey = result.LastEvaluatedKey as
               | globalThis.Record<string, AttributeValue>
@@ -8717,7 +8859,7 @@ const makeImpl = <
                 ConsistentRead: true,
                 ExclusiveStartKey: deletedStart,
               })
-              holders.push(...(deletedResult.Items ?? []))
+              holders.push(...(deletedResult.Items ?? []).filter(belongsToItem))
               deletedStart = deletedResult.LastEvaluatedKey as
                 | globalThis.Record<string, AttributeValue>
                 | undefined
@@ -8869,6 +9011,7 @@ const makeImpl = <
     _unsentineledDefaults: unsentineledDefaults,
     _planPut: planPut,
     _multiItemWriteFeatures: multiItemWriteFeatures(),
+    _historySkPrefixes: historySkPrefixes,
     _attachPrototype: attachPrototype,
     _configure: (
       injectedSchema: DynamoSchema.DynamoSchema,
