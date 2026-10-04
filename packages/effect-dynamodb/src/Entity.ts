@@ -6984,9 +6984,10 @@ const makeImpl = <
               snapshotAt,
               releases,
             )
-          } else if (hasUniqueConstraints) {
-            // --- Hard delete with unique constraints ---
-            // First get the item to find sentinel key values
+          } else if (hasUniqueConstraints || isRetainEnabled()) {
+            // --- Hard delete with unique constraints and/or retained history ---
+            // The item is read first: the sentinels to release are keyed by its
+            // unique values, and a retain entity snapshots its final state.
             const result = yield* client.getItem({
               TableName: tableName,
               Key: marshalledKey,
@@ -6994,56 +6995,108 @@ const makeImpl = <
             })
 
             if (!result.Item) {
-              return yield* Effect.fail(new ItemNotFound({ entityType, key: encodedKey }))
-            }
-            // The sentinel deletes are keyed by the unique values read: the
-            // delete is conditioned on them, so no sentinel is orphaned (#133).
-            yield* checkVersion(result.Item, "delete")
-            const uniqueGuard = deleteGuard(
-              result.Item,
-              [
-                ...new Set(
-                  Object.values(config.unique!).flatMap((def) =>
-                    resolveUniqueFields(def).map(resolveDbName),
+              if (hasUniqueConstraints) {
+                return yield* Effect.fail(new ItemNotFound({ entityType, key: encodedKey }))
+              }
+              // Retain only: deleting a missing item writes nothing, as a plain
+              // `DeleteItem` would. The caller's condition is still judged
+              // against no item — and the delete never removes an item created
+              // since the read, which would leave its final state unsnapshotted.
+              if (!userCondition) return
+              const values = userCondition.values
+              yield* client
+                .deleteItem({
+                  TableName: tableName,
+                  Key: marshalledKey,
+                  ConditionExpression: `attribute_not_exists(#dpk) AND (${userCondition.expression})`,
+                  ExpressionAttributeNames: { ...userCondition.names, "#dpk": primary.pk.field },
+                  ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
+                  ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+                })
+                .pipe(
+                  Effect.mapError((err) =>
+                    isAwsConditionalCheckFailed(err.cause)
+                      ? conditionRejection(
+                          encodedKey as globalThis.Record<string, unknown>,
+                          err.cause.Item,
+                          err.cause.Item === undefined ? undefined : { version: 0 },
+                          true,
+                        )
+                      : err,
                   ),
-                ),
-              ],
+                )
+              return
+            }
+            // The sentinel deletes are keyed by the unique values read, and the
+            // snapshot copies the item read: the delete is conditioned on it —
+            // its version and incarnation — so no sentinel is orphaned and no
+            // concurrent write is lost from the history (#133).
+            yield* checkVersion(result.Item, "delete")
+            const hardGuard = deleteGuard(
+              result.Item,
+              hasUniqueConstraints
+                ? [
+                    ...new Set(
+                      Object.values(config.unique!).flatMap((def) =>
+                        resolveUniqueFields(def).map(resolveDbName),
+                      ),
+                    ),
+                  ]
+                : [],
               userCondition?.expression,
             )
-            if (uniqueGuard instanceof ValidationError) return yield* uniqueGuard
+            if (hardGuard instanceof ValidationError) return yield* hardGuard
 
-            const raw = fromAttributeMap(result.Item)
+            const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
 
-            const transactItems: Array<{
+            const transactItems: Array<TransactWriteItem> = []
+
+            // Delete entity item — index 0, and the only item conditioned on the
+            // item read (the sentinel Deletes are conditioned on ownership, the
+            // snapshot on history), so an index-0 cancellation is read from it.
+            transactItems.push({
               Delete: {
-                TableName: string
-                Key: globalThis.Record<string, AttributeValue>
-                ConditionExpression?: string
-                ExpressionAttributeNames?: globalThis.Record<string, string>
-                ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
-              }
-            }> = []
+                TableName: tableName,
+                Key: marshalledKey,
+                ...guardedDeleteCondition(hardGuard),
+              },
+            })
 
-            // Delete entity item — index 0, and the only conditioned item (the
-            // sentinel Deletes below are unconditional), so an index-0
-            // cancellation is unambiguously the user's condition.
-            const entityDelete: (typeof transactItems)[number]["Delete"] = {
-              TableName: tableName,
-              Key: marshalledKey,
-              ...guardedDeleteCondition(uniqueGuard),
+            // Retain: the final state is history too. Snapshotted at its own
+            // version — under the same never-overwrite guard as every snapshot —
+            // so an item created again at this key continues PAST it, and a
+            // writer holding this version can never match the new incarnation.
+            let snapshotAt: { readonly index: number; readonly version: number } | undefined
+            if (isRetainEnabled()) {
+              const currentVersion = storedVersionOf(result.Item) ?? 0
+              snapshotAt = { index: transactItems.length, version: currentVersion }
+              transactItems.push({
+                Put: snapshotPut(
+                  tableName,
+                  buildSnapshotItem(
+                    raw,
+                    currentVersion,
+                    primary.pk.field,
+                    primary.sk.field,
+                    ttlAttrName,
+                    yield* DateTime.now,
+                  ),
+                ),
+              })
             }
-            transactItems.push({ Delete: entityDelete })
 
             // Release sentinels — only those this item owns (#133). Sparse: no
             // sentinel was ever written for a constraint whose fields are unset.
-            const releases = yield* ownedReleases(tableName, raw, transactItems)
+            const releases = hasUniqueConstraints
+              ? yield* ownedReleases(tableName, raw, transactItems)
+              : []
 
             yield* checkTransactionLimit(entityType, "delete", transactItems)
             yield* guardedDelete(
               client.transactWriteItems({ TransactItems: transactItems }),
               result.Item,
-              uniqueGuard.inputs,
-              undefined,
+              hardGuard.inputs,
+              snapshotAt,
               releases,
             )
           } else {

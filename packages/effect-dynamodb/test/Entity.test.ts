@@ -4260,6 +4260,84 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    const storedV2 = () =>
+      toAttributeMap({
+        itemId: "i-1",
+        name: "Second",
+        version: 2,
+        __edd_i__: "inc-1",
+        createdAt: "2024-01-15T00:00:00Z",
+        updatedAt: "2024-01-16T00:00:00Z",
+        pk: "$myapp#v1#retainitem#itemid_i-1",
+        sk: "$myapp#v1#retainitem",
+        __edd_e__: "RetainItem",
+      })
+
+    it.effect("a hard delete snapshots the final state at its version, atomically", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({ Item: storedV2() })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* RetainEntity.delete({ itemId: "i-1" }).asEffect()
+
+        expect(mockDeleteItem).not.toHaveBeenCalled()
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        expect(items).toHaveLength(2)
+        // The delete, guarded on the version and incarnation read.
+        expect(items[0].Delete.Key.sk.S).toBe("$myapp#v1#retainitem")
+        expect(items[0].Delete.ConditionExpression).toContain("#dver = :dver")
+        expect(items[0].Delete.ExpressionAttributeValues[":dver"]).toEqual({ N: "2" })
+        // The final state, at v#2 — under the never-overwrite snapshot guard.
+        const snapshot = items[1].Put
+        expect(snapshot.Item.sk.S).toBe("$myapp#v1#retainitem#v#0000002")
+        expect(snapshot.Item.name.S).toBe("Second")
+        expect(snapshot.ConditionExpression).toMatch(/^attribute_not_exists\(#snap\) OR \(/)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a hard delete whose snapshot meets other history fails with nothing written", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({ Item: storedV2() })
+        mockTransactWriteItems.mockRejectedValueOnce(
+          Object.assign(new Error("cancelled"), {
+            name: "TransactionCanceledException",
+            CancellationReasons: [{ Code: "None" }, { Code: "ConditionalCheckFailed" }],
+          }),
+        )
+        const error = yield* RetainEntity.delete({ itemId: "i-1" }).asEffect().pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("version 2 snapshot")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a hard delete of a missing retain item writes nothing", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({})
+        yield* RetainEntity.delete({ itemId: "i-1" }).asEffect()
+        expect(mockDeleteItem).not.toHaveBeenCalled()
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("deleteIfExists of a missing retain item never deletes one created since", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({})
+        mockDeleteItem.mockRejectedValueOnce(
+          Object.assign(new Error("failed"), { name: "ConditionalCheckFailedException" }),
+        )
+        const error = yield* RetainEntity.deleteIfExists({ itemId: "i-1" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ConditionalCheckFailed")
+        const call = mockDeleteItem.mock.calls[0]![0]
+        expect(call.ConditionExpression).toBe(
+          "attribute_not_exists(#dpk) AND (attribute_exists(#e0))",
+        )
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("getVersion fetches specific version snapshot", () =>
       Effect.gen(function* () {
         mockGetItem.mockResolvedValueOnce({

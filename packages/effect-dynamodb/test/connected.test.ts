@@ -15990,7 +15990,7 @@ describeConnected("#133 — path operations on index composites and unique field
         ExpressionAttributeNames: { "#a": attr },
       })
     }).pipe(Effect.provide(ClientLayer), Effect.scoped)
-  const snapshotLabel = (entityType: string, id: string, version: number) =>
+  const snapshotOf = (entityType: string, id: string, version: number) =>
     Effect.gen(function* () {
       const client = yield* DynamoClient
       const { Item } = yield* client.getItem({
@@ -16003,8 +16003,10 @@ describeConnected("#133 — path operations on index composites and unique field
         },
         ConsistentRead: true,
       })
-      return Item?.label
+      return Item as Record<string, any> | undefined
     }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+  const snapshotLabel = (entityType: string, id: string, version: number) =>
+    Effect.map(snapshotOf(entityType, id, version), (item) => item?.label)
 
   it.effect("an item whose version was removed outside the library is refused everywhere", () =>
     Effect.gen(function* () {
@@ -16563,18 +16565,64 @@ describeConnected("#133 — path operations on index composites and unique field
         yield* docs.update({ id }).set({ label: "second" })
         const firstRaw = yield* rawItem("G133DeviceRetained", id)
         yield* docs.delete({ id })
-        // v#1 survives the delete (retain keeps history).
+        // The delete snapshots the final state (v#2) beside the history (v#1).
         expect(yield* snapshotLabel("G133DeviceRetained", id, 1)).toEqual({ S: "first" })
+        expect(yield* snapshotLabel("G133DeviceRetained", id, 2)).toEqual({ S: "second" })
+        expect(yield* rawItem("G133DeviceRetained", id)).toBeUndefined()
         yield* recreate({ id, owner: "o", label: "again" })
         const raw = yield* rawItem("G133DeviceRetained", id)
-        // Past the highest version retained (1), with a new incarnation.
-        expect([raw.label, raw.version]).toEqual([{ S: "again" }, { N: "2" }])
+        // Past the highest version retained (2), with a new incarnation.
+        expect([raw.label, raw.version]).toEqual([{ S: "again" }, { N: "3" }])
         expect(raw.__edd_i__).not.toEqual(firstRaw.__edd_i__)
-        expect(yield* snapshotLabel("G133DeviceRetained", id, 1)).toEqual({ S: "first" })
-        expect(yield* snapshotLabel("G133DeviceRetained", id, 2)).toEqual({ S: "again" })
+        expect(yield* snapshotLabel("G133DeviceRetained", id, 2)).toEqual({ S: "second" })
+        expect(yield* snapshotLabel("G133DeviceRetained", id, 3)).toEqual({ S: "again" })
         // …and it goes on from there.
         const next = yield* docs.update({ id }).set({ label: "more" })
-        expect(next.version).toBe(3)
+        expect(next.version).toBe(4)
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a stale writer cannot overwrite a hard-deleted and re-created retain item", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      for (const [entity, entityType, extra] of [
+        ["DevicesRetained", "G133DeviceRetained", { owner: "o" }],
+        ["AccountsRetained", "G133AccountRetained", {}],
+      ] as const) {
+        const docs = db.entities[entity] as any
+        const id = `stale-${entity.toLowerCase()}`
+        const doc = (label: string) =>
+          entity === "AccountsRetained"
+            ? { id, email: `${id}-${label}@x.io`, name: label }
+            : { id, ...extra, label }
+        const field = entity === "AccountsRetained" ? "name" : "label"
+        yield* docs.put(doc("first"))
+        yield* docs.update({ id }).set({ [field]: "second" })
+        // A writer reads the item at version 2…
+        const seen = yield* docs.get({ id })
+        expect(seen.version).toBe(2)
+        // …it is hard-deleted (one transaction: the delete and the v#2 snapshot)…
+        yield* docs.delete({ id })
+        expect((yield* snapshotOf(entityType, id, 2))?.[field]).toEqual({ S: "second" })
+        // …and created again, past its history, under a new incarnation.
+        const again = yield* docs.create(doc("again"))
+        expect(again.version).toBe(3)
+        // The stale writer's expectedVersion(2) no longer matches anything live.
+        const stale = yield* docs
+          .update({ id })
+          .set({ [field]: "stale" })
+          .expectedVersion(2)
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(stale._tag).toBe("OptimisticLockError")
+        expect((yield* rawItem(entityType, id))[field]).toEqual({ S: "again" })
+        // `purge` still removes all of it — the delete-time snapshot included.
+        yield* docs.purge({ id })
+        expect(yield* rawItem(entityType, id)).toBeUndefined()
+        for (const version of [1, 2, 3]) {
+          expect(yield* snapshotOf(entityType, id, version)).toBeUndefined()
+        }
       }
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
