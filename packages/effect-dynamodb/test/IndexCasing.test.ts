@@ -83,6 +83,8 @@ const mockQuery = vi.fn()
 const mockUpdateItem = vi.fn()
 
 const ClientLayer = mockDynamoClientLayer({
+  // No stored item: a versioned / unique put reads first (#133).
+  getItem: () => Effect.succeed({} as any),
   putItem: (input) => Effect.sync(() => mockPutItem(input) ?? {}),
   query: (input) => Effect.sync(() => mockQuery(input) ?? { Items: [] }),
   updateItem: (input) => Effect.sync(() => mockUpdateItem(input)),

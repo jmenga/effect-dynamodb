@@ -914,7 +914,11 @@ describe("Transaction", () => {
 
         const snapshot = fromAttributeMap(items[2].Put.Item)
         expect(snapshot.sk).toBe("$myapp#v1#lifecyclemember#v#0000001")
-        expect(items[2].Put.ConditionExpression).toBeUndefined()
+        // Never over another incarnation's history (#133).
+        expect(items[2].Put.ConditionExpression).toBe("attribute_not_exists(#snap)")
+        // The item itself may only be created here: a replacing put needs the
+        // stored item (version, snapshot, sentinel rotation).
+        expect(items[0].Put.ConditionExpression).toBe("attribute_not_exists(#createOnly)")
       }).pipe(Effect.provide(TestLayer)),
     )
 

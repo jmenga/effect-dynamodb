@@ -82,7 +82,7 @@ const TestDynamoClient = mockDynamoClientLayer({
     }),
   getItem: (input) =>
     Effect.tryPromise({
-      try: () => mockGetItem(input),
+      try: async () => (await mockGetItem(input)) ?? {},
       catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
     }),
   deleteItem: (input) =>
@@ -5152,7 +5152,7 @@ describe("Entity", () => {
         }),
       getItem: (input) =>
         Effect.tryPromise({
-          try: () => mockGetItem(input),
+          try: async () => (await mockGetItem(input)) ?? {},
           catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
         }),
       deleteItem: (input) =>
@@ -5310,7 +5310,7 @@ describe("Entity", () => {
     const RenamedTestDynamoClient = mockDynamoClientLayer({
       getItem: (input) =>
         Effect.tryPromise({
-          try: () => mockGetItem(input),
+          try: async () => (await mockGetItem(input)) ?? {},
           catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
         }),
       query: (input) =>

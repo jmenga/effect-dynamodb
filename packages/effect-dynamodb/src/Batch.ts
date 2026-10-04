@@ -247,6 +247,11 @@ export const write = (
     const client = yield* DynamoClient
 
     // Build write requests
+    const versionedPuts: Array<{
+      readonly tableName: string
+      readonly entityType: string
+      readonly key: Record<string, import("@aws-sdk/client-dynamodb").AttributeValue>
+    }> = []
     const writeRequests: Array<{
       tableName: string
       request: Record<string, any>
@@ -304,6 +309,18 @@ export const write = (
           tableName,
           request: { PutRequest: { Item: built.marshalled } },
         })
+        // A versioned entity's put over an existing item continues its version
+        // (#133), which a blind BatchWriteItem cannot: such puts are checked
+        // for an existing item first, and refused if there is one.
+        if (entity._incarnationToken) {
+          const pk = entity.indexes.primary!.pk.field
+          const sk = entity.indexes.primary!.sk.field
+          versionedPuts.push({
+            tableName,
+            entityType: entity.entityType,
+            key: { [pk]: built.marshalled[pk]!, [sk]: built.marshalled[sk]! },
+          })
+        }
       } else if (info.opType === "delete") {
         yield* rejectUnsupportedOp(entity, "batchWrite", "delete", undefined)
         const composed = composePrimaryKey(entity, info.key!)
@@ -318,6 +335,29 @@ export const write = (
           cause:
             `Batch.write: unsupported operation type "${info.opType}". BatchWriteItem has no ` +
             "UpdateRequest — use Entity.put or Entity.delete, or Transaction.transactWrite.",
+        })
+      }
+    }
+
+    if (versionedPuts.length > 0) {
+      const existing = yield* Effect.forEach(
+        versionedPuts,
+        (put) =>
+          client
+            .getItem({ TableName: put.tableName, Key: put.key, ConsistentRead: true })
+            .pipe(Effect.map((result) => (result.Item !== undefined ? put : undefined))),
+        { concurrency: 10 },
+      )
+      const replaced = existing.find((put) => put !== undefined)
+      if (replaced !== undefined) {
+        return yield* new ValidationError({
+          entityType: replaced.entityType,
+          operation: "batchWrite",
+          cause:
+            `Batch.write would replace an existing ${replaced.entityType} item. A versioned ` +
+            "entity's replacing put continues the item's version (and snapshots / rotates it), " +
+            "which needs the stored item — BatchWriteItem can only overwrite it back to " +
+            "version 1. Use the entity's put() for it. Nothing was written.",
         })
       }
     }

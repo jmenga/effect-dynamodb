@@ -249,6 +249,44 @@ export const transactWrite = (
           // by position, because one op now spans several items.
           for (let i = 0; i < rawReasons.length; i++) {
             const from = provenance[i]
+            const reason = rawReasons[i] as { readonly Code?: string; readonly Item?: unknown }
+            // A put of a versioned / unique entity may only create here: the
+            // item exists, and replacing it needs the stored item (#133).
+            if (
+              from?.kind === "main" &&
+              from.createOnly === true &&
+              reason?.Code === "ConditionalCheckFailed" &&
+              reason.Item !== undefined
+            ) {
+              return new ValidationError({
+                entityType: from.entityType,
+                operation: "transactWrite",
+                cause:
+                  `transactWrite: the ${from.entityType} put at operation ${from.opIndex} would ` +
+                  "replace an existing item. A versioned or unique-constrained entity's " +
+                  "replacing put continues the item's version, snapshots it and rotates its " +
+                  "sentinels, which needs the stored item — use the entity's own put() (or an " +
+                  "update) for it. Nothing was written.",
+              }) as
+                | DynamoClientError
+                | TransactionCancelled
+                | UniqueConstraintViolation
+                | ValidationError
+            }
+            if (from?.kind === "snapshot" && reason?.Code === "ConditionalCheckFailed") {
+              return new ValidationError({
+                entityType: from.entityType,
+                operation: "transactWrite",
+                cause:
+                  `transactWrite: the ${from.entityType} put at operation ${from.opIndex} would ` +
+                  "overwrite the version 1 snapshot of an earlier incarnation of the item — " +
+                  "history is never overwritten. Nothing was written.",
+              }) as
+                | DynamoClientError
+                | TransactionCancelled
+                | UniqueConstraintViolation
+                | ValidationError
+            }
             if (
               from?.kind === "sentinel" &&
               rawReasons[i]?.Code === "ConditionalCheckFailed" &&
@@ -258,7 +296,11 @@ export const transactWrite = (
                 entityType: from.entityType,
                 constraint: from.constraintName,
                 fields: from.fields ?? {},
-              }) as DynamoClientError | TransactionCancelled | UniqueConstraintViolation
+              }) as
+                | DynamoClientError
+                | TransactionCancelled
+                | UniqueConstraintViolation
+                | ValidationError
             }
           }
           return new TransactionCancelled({

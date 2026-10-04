@@ -357,6 +357,8 @@ export type WithVectors = globalThis.Record<string, ReadonlyArray<number>>
 export interface EntityPutOpts {
   readonly condition: Expr | ConditionInput | undefined
   readonly withVectors?: WithVectors | undefined
+  /** Which put-shaped op is running (`create` fails on an existing item). */
+  readonly putKind?: PutKind | undefined
 }
 
 /**
@@ -397,7 +399,11 @@ export class EntityPutImpl<A, Rec, E, R> implements Pipeable.Pipeable {
   }
   get _run(): (mode: DecodeMode) => Effect.Effect<any, E, R> {
     return (mode) =>
-      this._builder(mode, { condition: this._condition, withVectors: this._withVectors })
+      this._builder(mode, {
+        condition: this._condition,
+        withVectors: this._withVectors,
+        putKind: this._putKind,
+      })
   }
   asEffect(): Effect.Effect<A, E, R> {
     return this._run("model") as Effect.Effect<A, E, R>

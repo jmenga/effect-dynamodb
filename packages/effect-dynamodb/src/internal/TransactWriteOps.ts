@@ -115,6 +115,13 @@ export interface ItemProvenance {
   /** Index into the caller's `operations` array. */
   readonly opIndex: number
   readonly kind: "main" | "sentinel" | "snapshot"
+  /**
+   * Set on the main Put of a versioned or unique-constrained entity: it may
+   * only create (#133). Replacing an existing item needs the stored item —
+   * to continue its version, snapshot it, rotate its sentinels — which a
+   * transaction compiled from the payload alone does not have.
+   */
+  readonly createOnly?: boolean | undefined
   /** Set for `kind: "sentinel"` — which `unique` constraint the item reserves. */
   readonly constraintName?: string | undefined
   /** Set for `kind: "sentinel"` — the values reserved, for `UniqueConstraintViolation`. */
@@ -154,6 +161,7 @@ export const buildTransactWriteItems = (
 
     const opInfos: Array<{
       type: "put" | "delete" | "conditionCheck"
+      putKind?: "put" | "create" | "upsert" | undefined
       entity: Entity
       /** Index into the caller's `operations` array — preserved for provenance. */
       opIndex: number
@@ -190,6 +198,7 @@ export const buildTransactWriteItems = (
         yield* rejectUnsupportedOp(info.entity, operation, "put", info.putKind, info.input)
         opInfos.push({
           type: "put",
+          putKind: info.putKind,
           entity: info.entity,
           opIndex,
           input: info.input!,
@@ -227,15 +236,36 @@ export const buildTransactWriteItems = (
 
       if (op.type === "put") {
         const built = yield* validateAndBuildPutItem(op.entity, op.input!, `${operation}.put`)
+        // `create` already may only create (its own condition, own error).
+        const createOnly =
+          op.putKind !== "create" &&
+          (op.entity._incarnationToken || op.entity._multiItemWriteFeatures.includes("unique"))
+        const pkField = op.entity.indexes.primary!.pk.field
+        const createCondition: ExpressionResult | undefined = createOnly
+          ? {
+              expression:
+                op.condition !== undefined
+                  ? `attribute_not_exists(#createOnly) AND (${op.condition.expression})`
+                  : "attribute_not_exists(#createOnly)",
+              names: { "#createOnly": pkField, ...op.condition?.names },
+              values: { ...op.condition?.values },
+            }
+          : op.condition
         push(
           {
             Put: {
               TableName: tableName,
               Item: built.marshalled,
-              ...conditionFields(op.condition),
+              ...conditionFields(createCondition),
+              ...(createOnly && { ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const }),
             },
           },
-          { opIndex: op.opIndex, kind: "main", entityType: op.entity.entityType },
+          {
+            opIndex: op.opIndex,
+            kind: "main",
+            entityType: op.entity.entityType,
+            ...(createOnly && { createOnly: true }),
+          },
         )
 
         // Uniqueness sentinels + the v1 retain snapshot. Emitted immediately

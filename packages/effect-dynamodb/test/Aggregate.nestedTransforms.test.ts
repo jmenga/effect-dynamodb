@@ -51,6 +51,7 @@ const transactCalls: Array<ReadonlyArray<Record<string, any>>> = []
 const keyOf = (item: Record<string, any>): string => `${item.pk?.S}|${item.sk?.S}`
 
 const InMemoryClient = mockDynamoClientLayer({
+  getItem: (input) => Effect.sync(() => ({ Item: store.get(keyOf(input.Key!)) }) as any),
   putItem: (input) =>
     Effect.sync(() => {
       store.set(keyOf(input.Item!), input.Item as Item)
