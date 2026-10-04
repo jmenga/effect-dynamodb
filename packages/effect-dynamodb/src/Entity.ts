@@ -25,6 +25,7 @@ import {
   ConcurrentModification,
   ConditionalCheckFailed,
   EmbeddingError,
+  ItemNotDeleted,
   ItemNotFound,
   isAwsConditionalCheckFailed,
   isAwsTransactionCancelled,
@@ -745,7 +746,14 @@ export interface Entity<
   /** Delete an item by primary key. Returns a lazy {@link EntityDelete} intermediate. */
   readonly delete: (
     key: EntityKeyType<TModel, TIndexes>,
-  ) => EntityDelete<DynamoClientError | ItemNotFound, DynamoClient | TableConfig>
+  ) => EntityDelete<
+    | DynamoClientError
+    | ItemNotFound
+    | OptimisticLockError
+    | ConcurrentModification
+    | ValidationError,
+    DynamoClient | TableConfig
+  >
 
   /**
    * Create a new item. Fails with `ConditionalCheckFailed` if an item with the same
@@ -798,7 +806,12 @@ export interface Entity<
   readonly deleteIfExists: (
     key: EntityKeyType<TModel, TIndexes>,
   ) => EntityDelete<
-    DynamoClientError | ItemNotFound | ConditionalCheckFailed,
+    | DynamoClientError
+    | ItemNotFound
+    | OptimisticLockError
+    | ConcurrentModification
+    | ValidationError
+    | ConditionalCheckFailed,
     DynamoClient | TableConfig
   >
 
@@ -851,7 +864,7 @@ export interface Entity<
   ) => EntityGet<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
-    ItemNotFound | DynamoClientError | ValidationError | UniqueConstraintViolation,
+    ItemNotFound | ItemNotDeleted | DynamoClientError | ValidationError | UniqueConstraintViolation,
     DynamoClient | TableConfig
   >
 
@@ -1215,7 +1228,11 @@ export interface BoundEntity<
     key: TKey,
   ) => import("./internal/BoundCrud.js").BoundDelete<
     ModelType<TModel>,
-    DynamoClientError | ItemNotFound
+    | DynamoClientError
+    | ItemNotFound
+    | OptimisticLockError
+    | ConcurrentModification
+    | ValidationError
   >
 
   /**
@@ -1272,7 +1289,12 @@ export interface BoundEntity<
     key: TKey,
   ) => import("./internal/BoundCrud.js").BoundDelete<
     ModelType<TModel>,
-    DynamoClientError | ItemNotFound | ConditionalCheckFailed
+    | DynamoClientError
+    | ItemNotFound
+    | OptimisticLockError
+    | ConcurrentModification
+    | ValidationError
+    | ConditionalCheckFailed
   >
 
   // --- Lifecycle Operations ---
@@ -1305,7 +1327,7 @@ export interface BoundEntity<
     key: TKey,
   ) => Effect.Effect<
     ModelType<TModel>,
-    ItemNotFound | DynamoClientError | ValidationError | UniqueConstraintViolation,
+    ItemNotFound | ItemNotDeleted | DynamoClientError | ValidationError | UniqueConstraintViolation,
     never
   >
 
@@ -2073,10 +2095,10 @@ const makeImpl = <
   }
 
   /**
-   * A `.set()` of a field an update cannot change (#133): a primary-key
-   * composite whose value differs from the key (it identifies the item — the
-   * same value is a no-op), or an immutable field. Both were silently dropped;
-   * the update types already exclude them.
+   * A `.set()` of a primary-key composite with a value other than the key's
+   * (#133): it identifies the item and cannot change. It was silently dropped;
+   * the update types already exclude it. The key's own value is a no-op, so a
+   * spread record keeps working.
    */
   const refusedRecordSet = (updates: unknown, key: unknown): string | undefined => {
     if (typeof updates !== "object" || updates === null) return undefined
@@ -2090,11 +2112,70 @@ const makeImpl = <
         "and cannot be changed by an update."
       )
     }
+    return undefined
+  }
+
+  type AssertedImmutable = {
+    readonly field: string
+    readonly attr: string
+    readonly value: AttributeValue
+  }
+
+  /**
+   * The immutable fields a `.set()` names, in stored form (#133). An update may
+   * restate an immutable field's value — a spread record does — but never
+   * change it: each one is checked against the item (read, or a condition on
+   * the write) and a different value is refused.
+   */
+  const assertedImmutables = (updates: unknown): ReadonlyArray<AssertedImmutable> | string => {
+    if (typeof updates !== "object" || updates === null) return []
+    const record = updates as globalThis.Record<string, unknown>
+    const out: Array<AssertedImmutable> = []
     for (const field of immutableFields) {
       if (record[field] === undefined) continue
-      return `.set() of "${field}": "${field}" is immutable and cannot be changed by an update.`
+      const encoded = encodePathValue([field], record[field], "value")
+      if (encoded.issue !== undefined) {
+        return `.set() of immutable "${field}": ${String(encoded.issue)}`
+      }
+      out.push({ field, attr: resolveDbName(field), value: toAttributeValue(encoded.encoded) })
     }
-    return undefined
+    return out
+  }
+  const immutableMismatch = (
+    asserted: ReadonlyArray<AssertedImmutable>,
+    stored: Readonly<globalThis.Record<string, unknown>>,
+  ): string | undefined => {
+    const changed = asserted.find(
+      ({ attr, value }) => !attributeValueEquals(stored[attr] as AttributeValue | undefined, value),
+    )
+    return changed === undefined
+      ? undefined
+      : `.set() of "${changed.field}": "${changed.field}" is immutable and the update's value ` +
+          "differs from the stored one."
+  }
+
+  /**
+   * Whether an update can safely create the item it names (#133): its payload
+   * supplies every required model field and every primary-key composite, so
+   * the item it writes decodes. Anything less on a missing item would leave a
+   * partial row behind — those updates require the item to exist.
+   */
+  const completeUpsertPayload = (updates: unknown): boolean => {
+    if (typeof updates !== "object" || updates === null) return false
+    const record = updates as globalThis.Record<string, unknown>
+    const present = (field: string) => record[field] !== undefined && record[field] !== null
+    const primary = allIndexes.primary
+    if (primary && ![...primary.pk.composite, ...primary.sk.composite].every(present)) return false
+    for (const [field, fieldSchema] of Object.entries(
+      data.modelFields as globalThis.Record<string, Schema.Top>,
+    )) {
+      const ast = fieldSchema.ast as { readonly context?: { readonly isOptional?: boolean } }
+      if (ast.context?.isOptional === true) continue
+      const ref = resolvedRefs.find((r) => r.fieldName === field)
+      if (present(field) || (ref !== undefined && present(ref.idFieldName))) continue
+      return false
+    }
+    return true
   }
 
   // schema + tableTag are injected via _configure() when the entity is registered
@@ -2876,6 +2957,138 @@ const makeImpl = <
     }
     return new ConditionalCheckFailed({ entityType, key })
   }
+
+  /** DynamoDB's limit on one expression string, with headroom for the user's condition. */
+  const GUARD_EXPRESSION_BUDGET = 3500
+
+  /** The domain field a stored attribute holds (`storedAs` renames reversed). */
+  const domainNameOf = (attr: string): string =>
+    Object.keys(data.modelFields as object).find((field) => resolveDbName(field) === attr) ?? attr
+
+  /**
+   * The condition a read-then-write DELETE carries (#133): the item is still
+   * what the tombstone, snapshot and sentinel deletes were derived from.
+   * Versioned: its version and incarnation. Otherwise: it exists and every
+   * attribute in `dependsOn` still holds the value read (absent ones still
+   * absent). `"item"` means the whole item — a tombstone copies all of it —
+   * so every stored attribute is guarded, plus every attribute the entity
+   * knows of that was absent.
+   */
+  const deleteGuard = (
+    read: globalThis.Record<string, AttributeValue>,
+    dependsOn: "item" | ReadonlyArray<string>,
+  ):
+    | {
+        readonly expression: string
+        readonly names: globalThis.Record<string, string>
+        readonly values: globalThis.Record<string, AttributeValue>
+        readonly inputs: ReadonlyArray<string>
+      }
+    | string => {
+    const names: globalThis.Record<string, string> = {}
+    const values: globalThis.Record<string, AttributeValue> = {}
+    const parts: Array<string> = []
+    const pkField = config.indexes.primary.pk.field
+    const skField = config.indexes.primary.sk.field
+    if (systemFields.version) {
+      names["#dver"] = systemFields.version
+      values[":dver"] = read[systemFields.version] ?? toAttributeValue(0)
+      parts.push("#dver = :dver")
+      const incarnation = incarnationGuard(read, names, values)
+      if (incarnation !== undefined) parts.push(incarnation)
+      return { expression: parts.join(" AND "), names, values, inputs: [] }
+    }
+    names["#dpk"] = pkField
+    parts.push("attribute_exists(#dpk)")
+    const attrs =
+      dependsOn === "item"
+        ? [
+            ...new Set([
+              ...Object.keys(read),
+              ...Object.keys(data.modelFields as object).map(resolveDbName),
+              ...[systemFields.createdAt, systemFields.updatedAt].filter(
+                (f): f is string => typeof f === "string",
+              ),
+              ...gsiKeyFields(),
+              ...vectorKeyFields(),
+            ]),
+          ].filter((attr) => attr !== pkField && attr !== skField)
+        : dependsOn
+    for (const [i, attr] of attrs.entries()) {
+      names[`#dg${i}`] = attr
+      if (read[attr] === undefined) {
+        parts.push(`attribute_not_exists(#dg${i})`)
+      } else {
+        values[`:dg${i}`] = read[attr]!
+        parts.push(`#dg${i} = :dg${i}`)
+      }
+    }
+    const expression = parts.join(" AND ")
+    if (expression.length > GUARD_EXPRESSION_BUDGET) {
+      return (
+        `Deleting this ${entityType} needs a condition over its ${attrs.length} attributes to ` +
+        "be safe against a concurrent update, beyond DynamoDB's 4 KB expression limit. Make the " +
+        "entity `versioned` — its version condition is one comparison."
+      )
+    }
+    return { expression, names, values, inputs: attrs }
+  }
+
+  /** Which predicate rejected a guarded delete — from the stored item (ALL_OLD). */
+  const deleteRejection = (
+    key: globalThis.Record<string, unknown>,
+    read: globalThis.Record<string, AttributeValue>,
+    inputs: ReadonlyArray<string>,
+    stored: Readonly<globalThis.Record<string, unknown>> | undefined,
+    userCondition: boolean,
+  ): ItemNotFound | OptimisticLockError | ConcurrentModification | ConditionalCheckFailed => {
+    if (stored === undefined) return new ItemNotFound({ entityType, key })
+    if (systemFields.version) {
+      return conditionRejection(
+        key,
+        stored,
+        { version: storedVersionOf(read) ?? 0, read },
+        userCondition,
+      )
+    }
+    const changed = inputs.filter(
+      (attr) => !attributeValueEquals(stored[attr] as AttributeValue | undefined, read[attr]),
+    )
+    if (changed.length === 0 && userCondition)
+      return new ConditionalCheckFailed({ entityType, key })
+    return new ConcurrentModification({
+      entityType,
+      key,
+      attributes: changed.map(domainNameOf),
+      current: Option.none(),
+    })
+  }
+
+  /** Fill a `ConcurrentModification`'s `current` with the stored item, decoded. */
+  const withCurrentItem = <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+    stored: () => globalThis.Record<string, AttributeValue> | undefined,
+  ) =>
+    effect.pipe(
+      Effect.catchIf(
+        (e): e is E & ConcurrentModification => e instanceof ConcurrentModification,
+        (e) =>
+          Effect.gen(function* () {
+            const item = stored()
+            const current =
+              item === undefined
+                ? Option.none()
+                : yield* Effect.option(
+                    decodeAs(
+                      fromAttributeMap(item) as globalThis.Record<string, unknown>,
+                      item,
+                      "model",
+                    ),
+                  )
+            return yield* new ConcurrentModification({ ...e, current })
+          }),
+      ),
+    )
 
   /**
    * The item a retain path update wrote, read back after its transaction. The
@@ -3804,7 +4017,7 @@ const makeImpl = <
     const op = update(key)
     return new EntityUpdateImpl(
       op._builder,
-      { ...op._updateState, condition: { attributeExists: [pkField] } },
+      { ...op._updateState, condition: { attributeExists: [pkField] }, patch: true },
       op._entity,
       op._key,
     )
@@ -3893,6 +4106,21 @@ const makeImpl = <
               cause: refusedSet,
             })
           }
+          const immutables = assertedImmutables(uState.updates)
+          if (typeof immutables === "string") {
+            return yield* new ValidationError({
+              entityType,
+              operation: "update",
+              cause: immutables,
+            })
+          }
+          const upsertable = completeUpsertPayload(uState.updates)
+          const requestedRv = uState.returnValues ?? "allNew"
+          // A cascade propagates the NEW item; a mode returning the OLD one then
+          // needs both images exactly — the read-then-write branch has both.
+          const needsBothImages =
+            uState.cascade !== undefined &&
+            (requestedRv === "allOld" || requestedRv === "updatedOld")
           const updates = uState.updates
           const evExpected = uState.expectedVersion
           const userCond = uState.condition
@@ -3989,8 +4217,21 @@ const makeImpl = <
                   "join. Split the update in two.",
             })
           }
+          if (needsBothImages && pathOpsPresent && !isRetainEnabled() && !systemFields.version) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "update",
+              cause:
+                'A cascade with returnValues("allOld" | "updatedOld") and path operations ' +
+                "needs the item before AND after the update exactly, which an entity without " +
+                "`versioned` cannot prove. Drop the path operations, the cascade, or the mode.",
+            })
+          }
           if (
-            (isRetainEnabled() || touchesUniqueFields || computedComposites.length > 0) &&
+            (isRetainEnabled() ||
+              touchesUniqueFields ||
+              computedComposites.length > 0 ||
+              needsBothImages) &&
             !pathOpsPresent
           ) {
             // --- Retain path: read-then-transact ---
@@ -4294,6 +4535,14 @@ const makeImpl = <
             }
 
             const currentItem = currentResult.Item
+            const immutableChange = immutableMismatch(immutables, currentItem)
+            if (immutableChange !== undefined) {
+              return yield* new ValidationError({
+                entityType,
+                operation: "update",
+                cause: immutableChange,
+              })
+            }
             const pkField = config.indexes.primary.pk.field
             const skField = config.indexes.primary.sk.field
             // A legacy item of an entity whose incarnation is proven by a
@@ -4703,7 +4952,13 @@ const makeImpl = <
                 readonly stamp: string | undefined
               }
             | undefined
-          if (isRetainEnabled()) {
+          // A cascade that also returns the OLD item, with path operations on a
+          // versioned entity: read first, condition the write on that version
+          // and incarnation, so the read IS the old item and ALL_NEW the new.
+          let casRead:
+            | { readonly raw: globalThis.Record<string, AttributeValue>; readonly version: number }
+            | undefined
+          if (isRetainEnabled() || needsBothImages) {
             const current = yield* client.getItem({
               TableName: tableName,
               Key: marshalledKey,
@@ -4711,6 +4966,14 @@ const makeImpl = <
             })
             if (!current.Item) {
               return yield* new ItemNotFound({ entityType, key: encodedKey })
+            }
+            const immutableChange = immutableMismatch(immutables, current.Item)
+            if (immutableChange !== undefined) {
+              return yield* new ValidationError({
+                entityType,
+                operation: "update",
+                cause: immutableChange,
+              })
             }
             const currentRaw = fromAttributeMap(current.Item) as globalThis.Record<string, unknown>
             const version = systemFields.version ? (currentRaw[systemFields.version] as number) : 0
@@ -4722,28 +4985,37 @@ const makeImpl = <
                 actualVersion: version,
               })
             }
-            retainSnapshot = {
-              item: buildSnapshotItem(
-                currentRaw,
+            if (!isRetainEnabled()) {
+              casRead = { raw: current.Item, version }
+            } else {
+              retainSnapshot = {
+                item: buildSnapshotItem(
+                  currentRaw,
+                  version,
+                  config.indexes.primary.pk.field,
+                  config.indexes.primary.sk.field,
+                  ttlAttrName,
+                  now,
+                ),
+                raw: current.Item,
                 version,
-                config.indexes.primary.pk.field,
-                config.indexes.primary.sk.field,
-                ttlAttrName,
-                now,
-              ),
-              raw: current.Item,
-              version,
-              ...(stampsIncarnation && current.Item[INCARNATION_TOKEN] === undefined
-                ? yield* freshIncarnation.pipe(
-                    Effect.map((stamp) => ({ stamp, incarnation: toAttributeValue(stamp) })),
-                  )
-                : {
-                    stamp: undefined,
-                    incarnation:
-                      incarnationAttr !== undefined ? current.Item[incarnationAttr] : undefined,
-                  }),
+                ...(stampsIncarnation && current.Item[INCARNATION_TOKEN] === undefined
+                  ? yield* freshIncarnation.pipe(
+                      Effect.map((stamp) => ({ stamp, incarnation: toAttributeValue(stamp) })),
+                    )
+                  : {
+                      stamp: undefined,
+                      incarnation:
+                        incarnationAttr !== undefined ? current.Item[incarnationAttr] : undefined,
+                    }),
+              }
             }
           }
+          // Plain (unread) updates: one that cannot create a decodable item
+          // requires the item to exist; one that can — every required field and
+          // key composite supplied — creates a complete item (#133).
+          const plainWrite = retainSnapshot === undefined && casRead === undefined
+          const creates = plainWrite && upsertable
           // Build UpdateExpression
           const setClauses: Array<string> = []
           const names: globalThis.Record<string, string> = {}
@@ -4835,9 +5107,43 @@ const makeImpl = <
           if (systemFields.version) {
             const nameKey = `#u${counter}`
             names[nameKey] = systemFields.version
-            setClauses.push(`${nameKey} = ${nameKey} + :vinc`)
+            if (creates) {
+              values[":vzero"] = toAttributeValue(0)
+              setClauses.push(`${nameKey} = if_not_exists(${nameKey}, :vzero) + :vinc`)
+            } else {
+              setClauses.push(`${nameKey} = ${nameKey} + :vinc`)
+            }
             values[":vinc"] = toAttributeValue(1)
             counter++
+          }
+
+          // An update that may create the item writes what a put would and an
+          // update otherwise never does — the key composites, the entity type,
+          // createdAt, the incarnation token — each only if absent.
+          if (creates) {
+            const ifAbsent = (attr: string, value: unknown) => {
+              const nameKey = `#u${counter}`
+              const valKey = `:u${counter}`
+              names[nameKey] = attr
+              values[valKey] = toAttributeValue(value)
+              setClauses.push(`${nameKey} = if_not_exists(${nameKey}, ${valKey})`)
+              counter++
+            }
+            const primary = config.indexes.primary
+            for (const field of [...primary.pk.composite, ...primary.sk.composite]) {
+              ifAbsent(
+                resolveDbName(field),
+                (encodedKey as globalThis.Record<string, unknown>)[field],
+              )
+            }
+            ifAbsent("__edd_e__", entityType)
+            if (systemFields.createdAt && !systemFields.createdAtCollision) {
+              ifAbsent(
+                systemFields.createdAt,
+                generateTimestamp(systemFields.createdAtEncoding, now),
+              )
+            }
+            if (stampsIncarnation) ifAbsent(INCARNATION_TOKEN, yield* freshIncarnation)
           }
 
           // Rich update operations from state
@@ -5194,9 +5500,8 @@ const makeImpl = <
                 }
               }
             }
-            // If the item doesn't exist, clearMap is a no-op — the subsequent
-            // UpdateItem will create the row (with whatever other clauses the
-            // builder accumulated) per DynamoDB UpdateItem semantics.
+            // If the item doesn't exist, clearMap is a no-op — and the
+            // subsequent UpdateItem's existence condition reports it.
           }
 
           // A legacy retain item gets its incarnation token with this write.
@@ -5243,6 +5548,25 @@ const makeImpl = <
             condParts.push(`(${uc.expression})`)
             Object.assign(names, uc.names)
             Object.assign(values, uc.values)
+          }
+          if (plainWrite) {
+            // Restated immutable values must match the item's.
+            for (const [i, { attr, value }] of immutables.entries()) {
+              names[`#imm${i}`] = attr
+              values[`:imm${i}`] = value
+              condParts.push(`#imm${i} = :imm${i}`)
+            }
+            if (!creates) {
+              names["#exists"] = config.indexes.primary.pk.field
+              condParts.push("attribute_exists(#exists)")
+            }
+          }
+          if (casRead !== undefined && systemFields.version) {
+            names["#casVer"] = systemFields.version
+            values[":casVer"] = toAttributeValue(casRead.version)
+            condParts.push("#casVer = :casVer")
+            const incarnation = incarnationGuard(casRead.raw, names, values)
+            if (incarnation !== undefined) condParts.push(incarnation)
           }
           const conditionExpression = condParts.length > 0 ? condParts.join(" AND ") : undefined
 
@@ -5351,10 +5675,10 @@ const makeImpl = <
 
           // The image the mode returns; `none` asks for nothing unless a
           // cascade needs the new item.
-          const wantsOld = rv === "allOld" || rv === "updatedOld"
+          const wantsOld = casRead === undefined && (rv === "allOld" || rv === "updatedOld")
           const returned = wantsOld
             ? "ALL_OLD"
-            : rv === "none" && !uState.cascade
+            : rv === "none" && !uState.cascade && casRead === undefined
               ? "NONE"
               : "ALL_NEW"
           // DynamoDB rejects an empty `ExpressionAttributeValues` map. When
@@ -5375,16 +5699,39 @@ const makeImpl = <
             })
             .pipe(
               Effect.mapError(
-                (err): DynamoClientError | OptimisticLockError | ConditionalCheckFailed => {
-                  // The stored item (ALL_OLD) says whether the version CAS or
-                  // the user's condition rejected the update.
+                (
+                  err,
+                ):
+                  | DynamoClientError
+                  | OptimisticLockError
+                  | ConditionalCheckFailed
+                  | ItemNotFound
+                  | ValidationError => {
+                  // The stored item (ALL_OLD) says what rejected the update: no
+                  // item (it must exist), a restated immutable value, the
+                  // version CAS, or the user's condition.
                   if (isAwsConditionalCheckFailed(err.cause)) {
+                    const stored = err.cause.Item
+                    if (stored === undefined && !uState.patch && !creates) {
+                      return new ItemNotFound({ entityType, key: encodedKey })
+                    }
+                    const immutableChange =
+                      stored !== undefined ? immutableMismatch(immutables, stored) : undefined
+                    if (immutableChange !== undefined) {
+                      return new ValidationError({
+                        entityType,
+                        operation: "update",
+                        cause: immutableChange,
+                      })
+                    }
                     return conditionRejection(
                       encodedKey as globalThis.Record<string, unknown>,
-                      err.cause.Item,
-                      systemFields.version && evExpected !== undefined
-                        ? { version: evExpected }
-                        : undefined,
+                      stored,
+                      casRead !== undefined
+                        ? { version: casRead.version, read: casRead.raw }
+                        : systemFields.version && evExpected !== undefined
+                          ? { version: evExpected }
+                          : undefined,
                       userCond !== undefined,
                     )
                   }
@@ -5393,23 +5740,15 @@ const makeImpl = <
               ),
             )
 
-          if (uState.cascade) {
-            // The new item: returned, or — when the mode asked for the old one —
-            // read back (a cascade propagates the item's current state).
-            const next = wantsOld
-              ? (yield* client.getItem({
-                  TableName: tableName,
-                  Key: marshalledKey,
-                  ConsistentRead: true,
-                })).Item
-              : result.Attributes
-            if (next !== undefined) yield* cascadeFrom(next)
-          }
+          // A cascade never meets an old-image mode here: that combination is
+          // routed to the read-then-write branch, or read first (`casRead`).
+          const newImage = wantsOld ? undefined : result.Attributes
+          if (uState.cascade && newImage !== undefined) yield* cascadeFrom(newImage)
 
           return yield* updateResult(
             rv,
-            wantsOld ? result.Attributes : undefined,
-            wantsOld ? undefined : result.Attributes,
+            casRead !== undefined ? casRead.raw : wantsOld ? result.Attributes : undefined,
+            newImage,
             written,
             mode,
             encodedKey as globalThis.Record<string, unknown>,
@@ -5474,16 +5813,80 @@ const makeImpl = <
             return err
           }
 
+          /** The guard ANDed with the user's condition, for the main Delete. */
+          const guardedDeleteCondition = (guard: {
+            readonly expression: string
+            readonly names: globalThis.Record<string, string>
+            readonly values: globalThis.Record<string, AttributeValue>
+          }) => {
+            const values = { ...guard.values, ...userCondition?.values }
+            return {
+              ConditionExpression: userCondition
+                ? `${guard.expression} AND (${userCondition.expression})`
+                : guard.expression,
+              ExpressionAttributeNames: { ...guard.names, ...userCondition?.names },
+              ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
+              ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
+            }
+          }
+          /**
+           * Run a guarded delete transaction: index 0 is the main Delete, the
+           * only conditioned item, so its rejection is read from the stored
+           * item (ALL_OLD) — gone, raced, or the user's condition.
+           */
+          const guardedDelete = <A>(
+            write: Effect.Effect<A, DynamoClientError>,
+            read: globalThis.Record<string, AttributeValue>,
+            inputs: ReadonlyArray<string>,
+          ) => {
+            let rejected: globalThis.Record<string, AttributeValue> | undefined
+            const reject = (stored: Readonly<globalThis.Record<string, unknown>> | undefined) => {
+              rejected = stored as globalThis.Record<string, AttributeValue> | undefined
+              return deleteRejection(
+                encodedKey as globalThis.Record<string, unknown>,
+                read,
+                inputs,
+                stored,
+                userCondition !== undefined,
+              )
+            }
+            return withCurrentItem(
+              write.pipe(
+                Effect.mapError((err) => {
+                  if (isAwsTransactionCancelled(err.cause)) {
+                    const main = err.cause.CancellationReasons?.[0]
+                    if (main?.Code === "ConditionalCheckFailed") return reject(main.Item)
+                  }
+                  if (isAwsConditionalCheckFailed(err.cause)) return reject(err.cause.Item)
+                  return err
+                }),
+              ),
+              () => rejected,
+            )
+          }
+
           if (isSoftDeleteEnabled()) {
             // --- Soft delete path ---
             // Read current item
             const result = yield* client.getItem({
               TableName: tableName,
               Key: marshalledKey,
+              ConsistentRead: true,
             })
 
             if (!result.Item) {
               return yield* Effect.fail(new ItemNotFound({ entityType, key: encodedKey }))
+            }
+            // The tombstone (and snapshot) copy the item read: the delete is
+            // conditioned on it being unchanged, so no concurrent update is lost
+            // into them (#133).
+            const softGuard = deleteGuard(result.Item, "item")
+            if (typeof softGuard === "string") {
+              return yield* new ValidationError({
+                entityType,
+                operation: "delete",
+                cause: softGuard,
+              })
             }
 
             const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
@@ -5545,13 +5948,7 @@ const makeImpl = <
             const currentDelete: NonNullable<TransactItem["Delete"]> = {
               TableName: tableName,
               Key: marshalledKey,
-            }
-            if (userCondition) {
-              currentDelete.ConditionExpression = userCondition.expression
-              currentDelete.ExpressionAttributeNames = userCondition.names
-              if (Object.keys(userCondition.values).length > 0) {
-                currentDelete.ExpressionAttributeValues = userCondition.values
-              }
+              ...guardedDeleteCondition(softGuard),
             }
             transactItems.push({ Delete: currentDelete })
 
@@ -5613,21 +6010,38 @@ const makeImpl = <
             }
 
             yield* checkTransactionLimit(entityType, "delete", transactItems)
-            yield* client
-              .transactWriteItems({
-                TransactItems: transactItems,
-              })
-              .pipe(Effect.mapError(mapDeleteConditionFailure))
+            yield* guardedDelete(
+              client.transactWriteItems({ TransactItems: transactItems }),
+              result.Item,
+              softGuard.inputs,
+            )
           } else if (hasUniqueConstraints) {
             // --- Hard delete with unique constraints ---
             // First get the item to find sentinel key values
             const result = yield* client.getItem({
               TableName: tableName,
               Key: marshalledKey,
+              ConsistentRead: true,
             })
 
             if (!result.Item) {
               return yield* Effect.fail(new ItemNotFound({ entityType, key: encodedKey }))
+            }
+            // The sentinel deletes are keyed by the unique values read: the
+            // delete is conditioned on them, so no sentinel is orphaned (#133).
+            const uniqueGuard = deleteGuard(result.Item, [
+              ...new Set(
+                Object.values(config.unique!).flatMap((def) =>
+                  resolveUniqueFields(def).map(resolveDbName),
+                ),
+              ),
+            ])
+            if (typeof uniqueGuard === "string") {
+              return yield* new ValidationError({
+                entityType,
+                operation: "delete",
+                cause: uniqueGuard,
+              })
             }
 
             const raw = fromAttributeMap(result.Item)
@@ -5648,13 +6062,7 @@ const makeImpl = <
             const entityDelete: (typeof transactItems)[number]["Delete"] = {
               TableName: tableName,
               Key: marshalledKey,
-            }
-            if (userCondition) {
-              entityDelete.ConditionExpression = userCondition.expression
-              entityDelete.ExpressionAttributeNames = userCondition.names
-              if (Object.keys(userCondition.values).length > 0) {
-                entityDelete.ExpressionAttributeValues = userCondition.values
-              }
+              ...guardedDeleteCondition(uniqueGuard),
             }
             transactItems.push({ Delete: entityDelete })
 
@@ -5683,11 +6091,13 @@ const makeImpl = <
             }
 
             yield* checkTransactionLimit(entityType, "delete", transactItems)
-            yield* client
-              .transactWriteItems({
+            yield* guardedDelete(
+              client.transactWriteItems({
                 TransactItems: transactItems.map((t) => ({ Delete: t.Delete })),
-              })
-              .pipe(Effect.mapError(mapDeleteConditionFailure))
+              }),
+              result.Item,
+              uniqueGuard.inputs,
+            )
           } else {
             // Simple delete
             const deleteInput: DeleteItemCommandInput = {
@@ -6868,20 +7278,34 @@ const makeImpl = <
               ExpressionAttributeNames?: globalThis.Record<string, string>
               ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
             }
-            Delete?: { TableName: string; Key: globalThis.Record<string, AttributeValue> }
+            Delete?: {
+              TableName: string
+              Key: globalThis.Record<string, AttributeValue>
+              ConditionExpression?: string
+              ExpressionAttributeNames?: globalThis.Record<string, string>
+            }
           }
           const transactItems: Array<TransactItem> = []
 
-          // Delete the soft-deleted item
+          // Delete the soft-deleted item — only while it is still there: a
+          // concurrent restore that already consumed it must not restore twice.
           transactItems.push({
-            Delete: { TableName: tableName, Key: deletedMarshalledKey },
+            Delete: {
+              TableName: tableName,
+              Key: deletedMarshalledKey,
+              ConditionExpression: "attribute_exists(#pk)",
+              ExpressionAttributeNames: { "#pk": primary.pk.field },
+            },
           })
 
-          // Put restored item
+          // Put restored item — never over a live item (a re-created one, or
+          // another restore's): that would lose it and orphan its sentinels.
           transactItems.push({
             Put: {
               TableName: tableName,
               Item: marshalledRestoredItem,
+              ConditionExpression: "attribute_not_exists(#pk)",
+              ExpressionAttributeNames: { "#pk": primary.pk.field },
             },
           })
 
@@ -6958,36 +7382,54 @@ const makeImpl = <
               TransactItems: transactItems,
             })
             .pipe(
-              Effect.mapError((err): DynamoClientError | UniqueConstraintViolation => {
-                if (isAwsTransactionCancelled(err.cause)) {
-                  const reasons = err.cause.CancellationReasons
-                  if (reasons && config.unique) {
-                    // Sentinel Puts come after Delete + Put + optional snapshot, in the
-                    // order recorded in `sentinelConstraints` (sparse-skipped entries absent)
-                    const sentinelStart = isRetainEnabled() ? 3 : 2
-                    for (let i = sentinelStart; i < reasons.length; i++) {
-                      if (reasons[i]?.Code === "ConditionalCheckFailed") {
-                        const constraintName = sentinelConstraints[i - sentinelStart] ?? "unknown"
-                        const constraintDef = config.unique[constraintName]
-                        const uniqueFields = constraintDef ? resolveUniqueFields(constraintDef) : []
-                        const fieldsRecord: globalThis.Record<string, string> = {}
-                        for (const f of uniqueFields) {
-                          const v = restoredDomain[f]
-                          if (v !== undefined && v !== null) {
-                            fieldsRecord[f] = KeyComposer.serializeValue(v)
+              Effect.mapError(
+                (
+                  err,
+                ):
+                  | DynamoClientError
+                  | UniqueConstraintViolation
+                  | ItemNotFound
+                  | ItemNotDeleted => {
+                  if (isAwsTransactionCancelled(err.cause)) {
+                    const reasons = err.cause.CancellationReasons
+                    // The tombstone is gone (restored concurrently), or a live
+                    // item already exists under the key.
+                    if (reasons?.[0]?.Code === "ConditionalCheckFailed") {
+                      return new ItemNotFound({ entityType, key: encodedKey })
+                    }
+                    if (reasons?.[1]?.Code === "ConditionalCheckFailed") {
+                      return new ItemNotDeleted({ entityType, key: encodedKey })
+                    }
+                    if (reasons && config.unique) {
+                      // Sentinel Puts come after Delete + Put + optional snapshot, in the
+                      // order recorded in `sentinelConstraints` (sparse-skipped entries absent)
+                      const sentinelStart = isRetainEnabled() ? 3 : 2
+                      for (let i = sentinelStart; i < reasons.length; i++) {
+                        if (reasons[i]?.Code === "ConditionalCheckFailed") {
+                          const constraintName = sentinelConstraints[i - sentinelStart] ?? "unknown"
+                          const constraintDef = config.unique[constraintName]
+                          const uniqueFields = constraintDef
+                            ? resolveUniqueFields(constraintDef)
+                            : []
+                          const fieldsRecord: globalThis.Record<string, string> = {}
+                          for (const f of uniqueFields) {
+                            const v = restoredDomain[f]
+                            if (v !== undefined && v !== null) {
+                              fieldsRecord[f] = KeyComposer.serializeValue(v)
+                            }
                           }
+                          return new UniqueConstraintViolation({
+                            entityType,
+                            constraint: constraintName,
+                            fields: fieldsRecord,
+                          })
                         }
-                        return new UniqueConstraintViolation({
-                          entityType,
-                          constraint: constraintName,
-                          fields: fieldsRecord,
-                        })
                       }
                     }
                   }
-                }
-                return err
-              }),
+                  return err
+                },
+              ),
             )
 
           return yield* decodeAs(restoredItem, marshalledRestoredItem, mode)

@@ -14144,6 +14144,24 @@ const G133Accounts = g133Variants("Account", G133Account, {
   primaryKey: g133IdKey,
   unique: { email: ["email"] },
 })
+class G133Ledger extends Schema.Class<G133Ledger>("G133Ledger")({
+  id: Schema.String,
+  book: Schema.String,
+  note: Schema.optional(Schema.String),
+}) {}
+class G133Author extends Schema.Class<G133Author>("G133Author")({
+  id: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+}) {}
+class G133Article extends Schema.Class<G133Article>("G133Article")({
+  articleId: Schema.String,
+  author: G133Author.pipe(DynamoModel.ref),
+}) {}
+const G133Authors = Entity.make({
+  model: G133Author,
+  entityType: "G133Author",
+  primaryKey: g133IdKey as any,
+})
 const G133Counters = Entity.make({
   model: G133Device,
   entityType: "G133Counter",
@@ -14173,6 +14191,53 @@ const g133Entities = {
     primaryKey: g133IdKey as any,
     unique: { email: ["email"] },
     timestamps: true,
+  }),
+  SoftDevices: Entity.make({
+    model: G133Device,
+    entityType: "G133SoftDevice",
+    primaryKey: g133IdKey as any,
+    timestamps: true,
+    versioned: { retain: true },
+    softDelete: true,
+  }),
+  SoftAccounts: Entity.make({
+    model: G133Account,
+    entityType: "G133SoftAccount",
+    primaryKey: g133IdKey as any,
+    unique: { email: ["email"] },
+    timestamps: true,
+    softDelete: true,
+  }),
+  Ledgers: Entity.make({
+    model: DynamoModel.configure(G133Ledger, { book: { immutable: true } }),
+    entityType: "G133Ledger",
+    primaryKey: g133IdKey as any,
+    timestamps: true,
+    versioned: true,
+  }),
+  LedgersRetained: Entity.make({
+    model: DynamoModel.configure(G133Ledger, { book: { immutable: true } }),
+    entityType: "G133LedgerRetained",
+    primaryKey: g133IdKey as any,
+    timestamps: true,
+    versioned: { retain: true },
+  }),
+  Authors: G133Authors,
+  Articles: Entity.make({
+    model: G133Article,
+    entityType: "G133Article",
+    primaryKey: {
+      pk: { field: "pk", composite: ["articleId"] },
+      sk: { field: "sk", composite: [] },
+    } as any,
+    indexes: {
+      byAuthor: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["authorId"] },
+        sk: { field: "gsi1sk", composite: ["articleId"] },
+      },
+    },
+    refs: { author: { entity: G133Authors } },
   }),
 }
 const G133Table = Table.make({ schema: G133Schema, entities: g133Entities })
@@ -14951,4 +15016,253 @@ describeConnected("#133 — path operations on index composites and unique field
       expect((yield* rawItem("G133DevicePlain", "pkset")).label).toEqual({ S: "m" })
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
+
+  // ---- deletes and restore: guarded on what the tombstone / sentinels derive from ----
+
+  const rawSetAttrs = (entityType: string, id: string, attrs: Record<string, any>, bump = false) =>
+    g133Hook(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        const names: Record<string, string> = {}
+        const values: Record<string, any> = {}
+        const sets = Object.entries(attrs).map(([attr, value], i) => {
+          names[`#a${i}`] = attr
+          values[`:a${i}`] = value
+          return `#a${i} = :a${i}`
+        })
+        if (bump) {
+          names["#v"] = "version"
+          values[":one"] = { N: "1" }
+          sets.push("#v = #v + :one")
+        }
+        yield* client.updateItem({
+          TableName: g133Tables.record,
+          Key: mainKey(entityType, id),
+          UpdateExpression: `SET ${sets.join(", ")}`,
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: values,
+        })
+      }).pipe(Effect.provide(ClientLayer)),
+    )
+  const partition = (entityType: string, id: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { Items } = yield* client.query({
+        TableName: g133Tables.record,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: {
+          ":pk": { S: `$edd133g#v1#${entityType.toLowerCase()}#id_${id}` },
+        },
+        ConsistentRead: true,
+      })
+      return (Items ?? []).map((item) => String(item.sk?.S)).sort()
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+  const sentinelExists = (entityType: string, email: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { Items } = yield* client.scan({
+        TableName: g133Tables.record,
+        ConsistentRead: true,
+        FilterExpression: "#e = :e",
+        ExpressionAttributeNames: { "#e": "__edd_e__" },
+        ExpressionAttributeValues: { ":e": { S: `${entityType}._unique.email` } },
+      })
+      return (Items ?? []).some((item) => String(item.pk?.S).includes(email))
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+
+  it.effect("a versioned soft delete loses no concurrent update into its tombstone", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const docs = db.entities.SoftDevices as any
+      yield* docs.put({ id: "sdv", owner: "o", label: "l" })
+      g133Inject.before = rawSetAttrs("G133SoftDevice", "sdv", { label: { S: "theirs" } }, true)
+      const error = yield* docs.delete({ id: "sdv" }).asEffect().pipe(Effect.flip)
+      expect(error._tag).toBe("OptimisticLockError")
+      expect((yield* rawItem("G133SoftDevice", "sdv")).label).toEqual({ S: "theirs" })
+      expect(yield* partition("G133SoftDevice", "sdv")).toEqual([
+        "$edd133g#v1#g133softdevice",
+        "$edd133g#v1#g133softdevice#v#0000001",
+      ])
+      // No race: the tombstone and snapshot keys are the ones they always were.
+      yield* docs.delete({ id: "sdv" })
+      const keys = yield* partition("G133SoftDevice", "sdv")
+      expect(keys).toHaveLength(3)
+      expect(keys[0]).toMatch(/^\$edd133g#v1#g133softdevice#deleted#/)
+      expect(keys.slice(1)).toEqual([
+        "$edd133g#v1#g133softdevice#v#0000001",
+        "$edd133g#v1#g133softdevice#v#0000002",
+      ])
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("an unversioned soft delete refuses a concurrent update to any attribute", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const accounts = db.entities.SoftAccounts as any
+      yield* accounts.put({ id: "sda", email: "sda@x.io", name: "n" })
+      g133Inject.before = rawSetAttrs("G133SoftAccount", "sda", { name: { S: "theirs" } })
+      const error = yield* accounts.delete({ id: "sda" }).asEffect().pipe(Effect.flip)
+      expect(error._tag).toBe("ConcurrentModification")
+      expect(error.attributes).toEqual(["name"])
+      expect((yield* rawItem("G133SoftAccount", "sda")).name).toEqual({ S: "theirs" })
+      expect(yield* sentinelExists("G133SoftAccount", "sda@x.io")).toBe(true)
+      // A delete that sees the current item succeeds.
+      yield* accounts.delete({ id: "sda" })
+      expect(yield* rawItem("G133SoftAccount", "sda")).toBeUndefined()
+      expect(yield* sentinelExists("G133SoftAccount", "sda@x.io")).toBe(false)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a unique hard delete orphans no sentinel under a concurrent rotation", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const bare = db.entities.AccountsBare as any
+      yield* bare.put({ id: "hd", email: "hd@x.io", name: "n" })
+      // Another writer rotates the email (item + sentinels) between our read and write.
+      g133Inject.before = g133Hook(
+        Effect.gen(function* () {
+          const other = yield* g133Client
+          yield* (other.entities.AccountsBare as any)
+            .update({ id: "hd" })
+            .set({ email: "hd2@x.io" })
+        }).pipe(Effect.provide(g133Layer(g133Tables.record))),
+      )
+      const error = yield* bare.delete({ id: "hd" }).asEffect().pipe(Effect.flip)
+      expect(error._tag).toBe("ConcurrentModification")
+      expect(error.attributes).toEqual(["email"])
+      expect(yield* sentinelExists("G133AccountBare", "hd2@x.io")).toBe(true)
+      yield* bare.delete({ id: "hd" })
+      expect(yield* sentinelExists("G133AccountBare", "hd2@x.io")).toBe(false)
+      expect(yield* sentinelExists("G133AccountBare", "hd@x.io")).toBe(false)
+
+      // Versioned: the version + incarnation condition.
+      const plain = db.entities.AccountsPlain as any
+      yield* plain.put({ id: "hdv", email: "hdv@x.io", name: "n" })
+      g133Inject.before = rawSetAttrs("G133AccountPlain", "hdv", { name: { S: "x" } }, true)
+      const versioned = yield* plain.delete({ id: "hdv" }).asEffect().pipe(Effect.flip)
+      expect(versioned._tag).toBe("OptimisticLockError")
+      expect(yield* sentinelExists("G133AccountPlain", "hdv@x.io")).toBe(true)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("restore never restores twice, nor over a live item", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const accounts = db.entities.SoftAccounts as any
+      yield* accounts.put({ id: "rs", email: "rs@x.io", name: "n" })
+      yield* accounts.delete({ id: "rs" })
+      g133Inject.before = g133Hook(
+        Effect.gen(function* () {
+          const other = yield* g133Client
+          yield* (other.entities.SoftAccounts as any).restore({ id: "rs" })
+        }).pipe(Effect.provide(g133Layer(g133Tables.record))),
+      )
+      const twice = yield* accounts.restore({ id: "rs" }).pipe(Effect.flip)
+      expect(twice._tag).toBe("ItemNotFound")
+      expect(yield* partition("G133SoftAccount", "rs")).toEqual(["$edd133g#v1#g133softaccount"])
+
+      yield* accounts.delete({ id: "rs" })
+      g133Inject.before = g133Hook(
+        Effect.gen(function* () {
+          const other = yield* g133Client
+          yield* (other.entities.SoftAccounts as any).put({
+            id: "rs",
+            email: "rs-new@x.io",
+            name: "live",
+          })
+        }).pipe(Effect.provide(g133Layer(g133Tables.record))),
+      )
+      const overLive = yield* accounts.restore({ id: "rs" }).pipe(Effect.flip)
+      expect(overLive._tag).toBe("ItemNotDeleted")
+      expect((yield* rawItem("G133SoftAccount", "rs")).name).toEqual({ S: "live" })
+      expect(yield* sentinelExists("G133SoftAccount", "rs-new@x.io")).toBe(true)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- update() of a missing item ----
+
+  it.effect("update() of a missing item creates it only from a complete payload", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const devices = db.entities.DevicesPlain as any
+      const partial = yield* devices
+        .update({ id: "nx1" })
+        .set({ label: "m" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(partial._tag).toBe("ItemNotFound")
+      expect(yield* rawItem("G133DevicePlain", "nx1")).toBeUndefined()
+
+      // Every required field (and the key composite) supplied: a real upsert.
+      const created = (yield* devices.update({ id: "nx2" }).set({ id: "nx2", label: "m" })) as any
+      expect([created.id, created.label, created.version]).toEqual(["nx2", "m", 1])
+      const got = (yield* devices.get({ id: "nx2" })) as any
+      expect([got.id, got.label, got.version]).toEqual(["nx2", "m", 1])
+      expect((yield* rawItem("G133DevicePlain", "nx2")).__edd_e__).toEqual({ S: "G133DevicePlain" })
+      // …and on an existing item the same update is an ordinary update.
+      const again = (yield* devices.update({ id: "nx2" }).set({ id: "nx2", label: "n" })) as any
+      expect([again.label, again.version]).toEqual(["n", 2])
+
+      // patch keeps its contract: a missing item is ConditionalCheckFailed.
+      const patched = yield* devices
+        .patch({ id: "nx3" })
+        .set({ label: "m" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(patched._tag).toBe("ConditionalCheckFailed")
+      expect(yield* rawItem("G133DevicePlain", "nx3")).toBeUndefined()
+      // The read-then-write paths report a missing item as before.
+      const retained = yield* (db.entities.DevicesRetained as any)
+        .update({ id: "nx4" })
+        .set({ label: "m" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(retained._tag).toBe("ItemNotFound")
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- cascade with an old-image return mode ----
+
+  it.effect("a cascade returning the old item cascades this write's new item exactly", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      yield* (db.entities.Authors as any).put({ id: "au", name: "Old" })
+      yield* (db.entities.Articles as any).put({ articleId: "ar", authorId: "au" })
+      // A later write lands before the cascade runs.
+      g133Inject.after = rawSetAttrs("G133Author", "au", { name: { S: "Later" } })
+      const old = (yield* (db.entities.Authors as any)
+        .update({ id: "au" })
+        .set({ name: "New" })
+        .cascade({ targets: [g133Entities.Articles] })
+        .returnValues("allOld")) as any
+      expect(old.name).toBe("Old")
+      const article = (yield* (db.entities.Articles as any).get({ articleId: "ar" })) as any
+      expect(article.author.name).toBe("New")
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- immutable fields: restating is fine, changing is refused ----
+
+  for (const entity of ["Ledgers", "LedgersRetained"] as const) {
+    it.effect(`${entity}: a spread record updates; a changed immutable value is refused`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const ledgers = db.entities[entity] as any
+        const id = `lg-${entity.toLowerCase()}`
+        const record = (yield* ledgers.put({ id, book: "b1", note: "n" })) as any
+        const updated = (yield* ledgers.update({ id }).set({ ...record, note: "m" })) as any
+        expect([updated.book, updated.note, updated.version]).toEqual(["b1", "m", 2])
+        const error = yield* ledgers
+          .update({ id })
+          .set({ book: "b2", note: "x" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String(error.cause)).toContain('"book"')
+        const stored = (yield* ledgers.get({ id })) as any
+        expect([stored.book, stored.note, stored.version]).toEqual(["b1", "m", 2])
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+  }
 })

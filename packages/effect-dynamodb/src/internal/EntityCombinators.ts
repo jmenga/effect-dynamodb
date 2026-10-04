@@ -374,8 +374,23 @@ type ReturnValuesTarget = EntityUpdate<any, any, any, any, any> | EntityDelete<a
  */
 export type ReturnValuesResult<T, M extends ReturnValuesMode> =
   T extends EntityUpdate<infer A, infer Rec, infer U, infer E, infer R>
-    ? EntityUpdate<UpdateReturn<A, M>, UpdateReturn<Rec, M>, U, E, R>
+    ? typeof UpdateBaseTypeId extends keyof U
+      ? U extends UpdateBase<infer BA, infer BR>
+        ? EntityUpdate<UpdateReturn<BA, M>, UpdateReturn<BR, M>, U, E, R>
+        : never
+      : EntityUpdate<UpdateReturn<A, M>, UpdateReturn<Rec, M>, U & UpdateBase<A, Rec>, E, R>
     : T
+
+/**
+ * @internal The model / record types an update returned before its first
+ * `returnValues`, carried on the (phantom) payload type so a later
+ * `returnValues` derives from them, not from the previous mode's result.
+ */
+declare const UpdateBaseTypeId: unique symbol
+/** @internal */
+export interface UpdateBase<A, Rec> {
+  readonly [UpdateBaseTypeId]?: (_: never) => readonly [A, Rec]
+}
 
 /**
  * Set the DynamoDB `ReturnValues` mode on an update or delete operation.

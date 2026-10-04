@@ -1240,6 +1240,20 @@ describe("Entity types — update returnValues", () => {
     >().toEqualTypeOf<undefined>()
     const partial = UserEntity.update({ userId: "u-1" }).pipe(Entity.returnValues("updatedNew"))
     expectTypeOf<ValueOf<typeof partial>>().toEqualTypeOf<Partial<User>>()
+    // A later mode overrides an earlier one — as at runtime — through other
+    // combinators in between, data-first or data-last.
+    const again = Entity.returnValues(Entity.set(none, { displayName: "x" }), "allNew")
+    expectTypeOf<ValueOf<typeof again>>().toEqualTypeOf<User>()
+    const piped = UserEntity.update({ userId: "u-1" }).pipe(
+      Entity.returnValues("none"),
+      Entity.set({ displayName: "x" }),
+      Entity.returnValues("updatedOld"),
+    )
+    expectTypeOf<ValueOf<typeof piped>>().toEqualTypeOf<Partial<User>>()
+    type Rec<T> = T extends import("../src/Entity.js").EntityUpdate<any, infer R, any, any, any>
+      ? R
+      : never
+    expectTypeOf<Rec<typeof again>>().toEqualTypeOf<Rec<ReturnType<typeof UserEntity.update>>>()
     const full = UserEntity.update({ userId: "u-1" })
     expectTypeOf<Native<ReturnType<typeof Entity.asNative<typeof full>>>>().toEqualTypeOf<
       Record<string, import("@aws-sdk/client-dynamodb").AttributeValue>

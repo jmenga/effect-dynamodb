@@ -2333,6 +2333,8 @@ describe("Entity", () => {
 
         const condError = new Error("ConditionalCheckFailedException")
         ;(condError as any).name = "ConditionalCheckFailedException"
+        // ALL_OLD on the failed condition: the item, at another version.
+        ;(condError as any).Item = toAttributeMap({ itemId: "i-1", version: 5 })
         mockUpdateItem.mockRejectedValueOnce(condError)
 
         const error = yield* VerEntity.update({ itemId: "i-1" })
@@ -8584,8 +8586,12 @@ describe("Entity", () => {
 
         yield* Soft.delete({ userId: "u-1" }).asEffect()
 
+        // Only the library's own guard (#133): the tombstone copies the item
+        // read, so the delete requires it unchanged — no user condition.
         const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems as Array<any>
-        expect(items[0].Delete.ConditionExpression).toBeUndefined()
+        expect(items[0].Delete.ConditionExpression).toMatch(
+          /^attribute_exists\(#dpk\)( AND #dg\d+ = :dg\d+| AND attribute_not_exists\(#dg\d+\))+$/,
+        )
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -8595,7 +8601,8 @@ describe("Entity", () => {
         const txError = new Error("TransactionCanceledException")
         ;(txError as any).name = "TransactionCanceledException"
         ;(txError as any).CancellationReasons = [
-          { Code: "ConditionalCheckFailed" },
+          // ALL_OLD: the item, unchanged — so the user's condition rejected it.
+          { Code: "ConditionalCheckFailed", Item: storedUser() },
           { Code: "None" },
         ]
         mockTransactWriteItems.mockRejectedValueOnce(txError)
@@ -8623,7 +8630,8 @@ describe("Entity", () => {
         const txError = new Error("TransactionCanceledException")
         ;(txError as any).name = "TransactionCanceledException"
         ;(txError as any).CancellationReasons = [
-          { Code: "ConditionalCheckFailed" },
+          // ALL_OLD: the item, unchanged — so the user's condition rejected it.
+          { Code: "ConditionalCheckFailed", Item: storedUser() },
           { Code: "None" },
         ]
         mockTransactWriteItems.mockRejectedValueOnce(txError)

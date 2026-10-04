@@ -973,13 +973,42 @@ describe("#133 .set() of a field an update cannot change", () => {
     }).pipe(Effect.provide(TestLayer), closed),
   )
 
-  it.effect("an immutable field is refused, naming it", () =>
+  it.effect("a changed immutable value is refused by the write's condition, naming it", () =>
     Effect.gen(function* () {
-      const result = yield* runUpdate("Ledgers", { id: "l1", book: "b1" }, (u) =>
-        u.set({ book: "b2" }),
-      )
+      const result = yield* runUpdate("Ledgers", { id: "l1", book: "b1" }, (u) => {
+        const stored = [...store.values()].find((i) => i.__edd_e__?.S === "Ledger")!
+        failNext = ccf(stored)
+        return u.set({ book: "b2" })
+      })
       expect(failureOf(result.exit)?._tag).toBe("ValidationError")
       expect(String(failureOf(result.exit)?.cause)).toContain('"book"')
+    }).pipe(Effect.provide(TestLayer), closed),
+  )
+
+  it.effect("a restated immutable value is a condition, not a refusal", () =>
+    Effect.gen(function* () {
+      const result = yield* runUpdate("Ledgers", { id: "l1", book: "b1" }, (u) =>
+        u.set({ book: "b1" }),
+      )
+      expect(failureOf(result.exit)).toBeUndefined()
+      const update = result.writes.find((w) => w.op === "Update")!.input
+      expect(update.ConditionExpression).toContain("#imm0 = :imm0")
+      expect(update.ExpressionAttributeValues[":imm0"]).toEqual({ S: "b1" })
+    }).pipe(Effect.provide(TestLayer), closed),
+  )
+
+  it.effect("a spread record — key, immutable and system fields included — updates", () =>
+    Effect.gen(function* () {
+      const client = yield* db
+      const record = (yield* client.entities.DevicesRetained.put({
+        id: "sp1",
+        owner: "o",
+        label: "l",
+      } as any)) as any
+      const updated = (yield* (client.entities.DevicesRetained as any)
+        .update({ id: "sp1" })
+        .set({ ...record, label: "m" })) as any
+      expect([updated.label, updated.version]).toEqual(["m", 2])
     }).pipe(Effect.provide(TestLayer), closed),
   )
 })

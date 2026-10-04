@@ -125,6 +125,11 @@ export interface UpdateState {
    * escape hatch that skips the Embedder for the named vector index.
    */
   readonly withVectors: WithVectors | undefined
+  /**
+   * `patch()`: the update requires the item to exist and reports a missing
+   * one as `ConditionalCheckFailed` (its documented contract).
+   */
+  readonly patch?: boolean | undefined
 }
 
 /** @internal Path-based SET operation */
