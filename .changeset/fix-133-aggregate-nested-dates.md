@@ -79,7 +79,7 @@ real `DateTime`s.
   A concurrent write between the read and the put is retried, so the last
   writer wins as before; only a race lost on every attempt fails, with
   `OptimisticLockError` or `ConcurrentModification`, which the error channel
-  gains. `create` doesn't read: the item must be missing anyway. **A deleted
+  gains. `create` doesn't read the item: it must be missing anyway. **A deleted
   retain item can be created again without `purge`**: it continues after the
   version history its key still holds. Details under "Puts, upserts and
   batches".
@@ -447,8 +447,8 @@ writer creates, changes or deletes it in between, the put reads it again and
 retries, and the last writer wins. A race lost on every attempt fails with
 `OptimisticLockError` (versioned) or `ConcurrentModification` (unversioned) and
 writes nothing. A soft-deleted item counts as missing. `create` no longer reads
-the item first; it still fails with `ConditionalCheckFailed` on an existing
-item.
+the item first (a retain `create` runs one `Limit 1` query of its version
+history); it still fails with `ConditionalCheckFailed` on an existing item.
 
 **Re-creating a deleted retain item.** Its version history outlives it, and
 the key can be used again without `purge`. A `put`, `create`, `upsert` or
@@ -461,10 +461,11 @@ new item is live fails with `ItemNotDeleted`.
 **Sentinel ownership.** A sentinel is released only by the item that owns it
 (`_entity_pk` / `_entity_sk`): the write reads it first and conditions the
 release on that ownership. A release whose reservation changed hands in
-between fails an update or delete with `ConcurrentModification` on the unique
-fields; a put retries. `purge` releases the sentinels of the live item and of
-every tombstone, each only if owned. An update that moves a unique value to a
-constraint with a `ttl` now gives the new sentinel its expiry, as a put does
+between fails an update, upsert or delete with `ConcurrentModification` on the
+unique fields; a put retries. `purge` releases the sentinels of the live item and of
+every tombstone, each only if owned. Each sentinel a write would release costs
+one consistent `GetItem`. An update that changes the value of a unique
+constraint with a `ttl` now gives the new sentinel that expiry, as a put does
 (it was written without one).
 
 **`upsert` that reads first.** One `UpdateItem` can't write, rotate or check a
@@ -495,12 +496,29 @@ re-created retain item continues after its history — all in the one
 transaction. A race between the read and the transaction cancels it, and it is
 built and written again. A taken unique value is a `UniqueConstraintViolation`
 from both; only an op's own condition is `TransactionCancelled` from
-`transactWrite` and `AdditionalItemConditionFailed` from `append`.
+`transactWrite` and `AdditionalItemConditionFailed` from `append`. DynamoDB
+allows one operation per item in a transaction, so two ops on one item, such as
+two puts that swap unique values (and so touch the same sentinels), fail with a
+`DynamoValidationError`. Deletes of `unique`, retain and `softDelete` entities
+are still refused (`EDD-9048`), and `Batch.write` still sends versioned puts as
+create-only transactions (below).
 
-**Error channels.** `put`, `create`, `upsert`, `update`, `patch`, `delete`,
-`deleteIfExists` and `restore` now declare `TransactionOverflow`, which they
-could already raise when an item's own transaction would pass 100 items, and
-`GeoIndex.bind`'s `put` declares the errors the entity's `put` raises.
+**Error channels.** Compared with 1.22.0, these operations declare new errors.
+Review `catchTag` handlers and exhaustive matches on them:
+
+| Operation | New in its error channel |
+|-----------|--------------------------|
+| `put`, `create` | `OptimisticLockError`, `ConcurrentModification`, `TransactionOverflow` |
+| `upsert` | `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `TransactionOverflow` |
+| `update`, `patch` | `ConcurrentModification`, `UpdateAppliedButUnreadable`, `TransactionOverflow` |
+| `delete`, `deleteIfExists` | `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow` |
+| `restore` | `ItemNotDeleted`, `TransactionOverflow` |
+| `Transaction.transactWrite` | `OptimisticLockError`, `ConcurrentModification` |
+| `EventStore` `append`, `commandHandler` | `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+
+`TransactionOverflow` could already be raised when an item's own transaction
+would pass 100 items; it is now declared. `GeoIndex.bind`'s `put` declares the
+errors the entity's `put` raises.
 
 **`Batch.write` of a `versioned` entity.** Its puts are sent first, as
 create-only `TransactWriteItems` of up to 100 items, each conditioned on

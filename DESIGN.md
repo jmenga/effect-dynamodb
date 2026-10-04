@@ -561,7 +561,11 @@ unique: {
 
 When a unique constraint declares a `ttl`, the **sentinel item** carries the TTL
 attribute and auto-expires, releasing the uniqueness reservation (e.g. a
-time-bounded hold). Without a `ttl`, sentinels are permanent.
+time-bounded hold), whether a put or an update wrote it. Without a `ttl`,
+sentinels are permanent. A sentinel names the item that reserved it
+(`_entity_pk` / `_entity_sk`), and a write releases only sentinels its item
+owns, since an expired reservation may have been claimed by another item (see
+"Sentinel ownership" in §10).
 
 Constraints are **sparse**: a sentinel is only written when every composing
 field is present on the record. Mirrors GSI sparse semantics — a record with a
@@ -1878,9 +1882,11 @@ row holding the same version, incarnation token and (with timestamps)
 `v#0000001` and the first update snapshots that same version-1 state again, and
 a restore rewrites the delete-time snapshot. Any other row is a different
 history, so the update, soft delete, restore or replacing `put` fails with a
-`ValidationError` (`historyConflict`) and writes nothing. A new item's `v#0000001`
-(a `put` with no current item, or a `transactWrite` put) requires
-`attribute_not_exists` outright. Caveat: a write from outside the library that
+`ValidationError` (`historyConflict`) and writes nothing. A new item's snapshot
+(`v#0000001`, or the version after the history retained at its key) carries a
+fresh incarnation token, so in effect it requires the row to be missing; one
+already there means the read missed retained history, and the put is planned
+again. Caveat: a write from outside the library that
 changes an item without bumping its version can be captured into the next
 `v#N` snapshot, because the snapshot copies the item read.
 
@@ -1965,7 +1971,8 @@ A `.condition()` failure is `ConditionalCheckFailed`, a taken unique value
 `UniqueConstraintViolation`, a replaced item whose `v#N` snapshot holds other
 history a `ValidationError`. `create` does not read: the item must be missing,
 so its `Put` is guarded by `attribute_not_exists(pk)` and carries a fresh
-incarnation; an existing item is `ConditionalCheckFailed`.
+incarnation; an existing item is `ConditionalCheckFailed`. A retain `create`
+runs only the one `Limit: 1` history query below.
 
 **Re-creating a deleted retain item.** A deleted (or soft-deleted) retain item's
 `v#N` snapshots outlive it. A put, `create`, `upsert` or transaction put of a
@@ -1989,10 +1996,13 @@ soft delete, `purge`, a transaction put — first reads it consistently
 (`ownedSentinels`) and releases only those this item owns, each with a `Delete`
 conditioned on `_entity_pk` / `_entity_sk` still naming it (`sentinelRelease`). A
 release cancelled because the reservation changed hands in between is retried by
-a put, and is a `ConcurrentModification` on the unique fields from an update or
-delete. `purge` releases them one by one with `DeleteItem`, since a batch
-delete cannot carry the condition, and collects them from the live item and
-every tombstone.
+a put, and is a `ConcurrentModification` on the unique fields from an update,
+upsert or delete. Each sentinel a write would release costs one consistent
+`GetItem` (projecting only `_entity_pk` / `_entity_sk`). `purge` releases them
+one by one with a conditional `DeleteItem`, since a batch delete cannot carry
+the condition, collects them from the live item and every tombstone, and skips
+a release whose reservation changed hands in between. A sentinel an update
+writes for a changed value carries its constraint's `ttl`, as a put's does.
 
 **`upsert` that reads first.** One `UpdateItem` cannot write, rotate or check a
 sentinel, snapshot the replaced item, or tell whether to store a default or keep
@@ -2026,8 +2036,12 @@ final; the caller's own condition is `TransactionCancelled` from
 reported for an op the caller set no condition on; a race with the read cancels
 the transaction, which is built and written again
 (`GUARDED_TRANSACTION_ATTEMPTS` = 3, then `OptimisticLockError` /
-`ConcurrentModification`). Deletes of `unique` / retain / `softDelete` entities
-are still refused (EDD-9048): a transaction builds a delete from its key alone.
+`ConcurrentModification`). DynamoDB allows one operation per item in a
+transaction, so two ops that touch the same item — two puts of it, or two puts
+that swap unique values and so release and reserve the same sentinels — fail
+with a `DynamoValidationError`. Deletes of `unique` / retain / `softDelete`
+entities are still refused (EDD-9048): a transaction builds a delete from its
+key alone.
 
 **`Batch.write` of a `versioned` entity.** A `PutRequest` would reset an
 existing item to version 1 under a new incarnation. So `Batch.write` sends these
@@ -2086,12 +2100,16 @@ semantics):
 | Operation | Transaction Items |
 |-----------|-------------------|
 | Put — new item | Entity item + sentinel per unique field whose composites are all set (`condition: attribute_not_exists(pk)`) |
-| Put — over an existing item | Entity item (guarded by what was read) + for each changed value, delete old sentinel + put new sentinel |
+| Put — over an existing item | Entity item (guarded by what was read) + for each changed value, release old sentinel + put new sentinel |
 | Update — composites unchanged | Entity item only (no sentinel ops) |
 | Update — undefined → defined | Entity item + put new sentinel |
-| Update — defined → undefined | Entity item + delete old sentinel |
-| Update — defined → defined (changed) | Entity item + delete old sentinel + put new sentinel |
-| Delete | Entity item + delete sentinel per unique field whose composites were set |
+| Update — defined → undefined | Entity item + release old sentinel |
+| Update — defined → defined (changed) | Entity item + release old sentinel + put new sentinel |
+| Delete | Entity item + release sentinel per unique field whose composites were set |
+
+A release is a `Delete` conditioned on the sentinel still naming this item
+(`_entity_pk` / `_entity_sk`), emitted only for a sentinel this item owns — see
+"Sentinel ownership" under §10 Fluent bound-CRUD builders.
 
 #### Optimistic Concurrency
 
@@ -3062,25 +3080,28 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `EmbeddingError` | `Embedder.embed` failed, or no `Embedder` was provided for an entity with vector indexes |
 | `VectorIndexBackfilling` | `SearchVectors` called while the vector index is still backfilling |
 
-### Error Type Narrowing
+### Declared Errors per Operation
 
-Operation signatures narrow error types based on Entity configuration:
+Each operation declares a fixed error union, whatever the entity's
+configuration: a `put` declares `UniqueConstraintViolation` even on an entity
+without unique constraints. Every union also includes `DynamoClientError`,
+plus `RefErrors` / `VectorErrors` where the entity has refs or vector indexes.
 
-```typescript
-const db = yield* DynamoClient.make(MainTable)
+| Operation | Declared errors (besides `DynamoClientError`) |
+|-----------|-----------------------------------------------|
+| `put` | `ValidationError`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `TransactionOverflow` |
+| `create` | as `put`, plus `ConditionalCheckFailed` |
+| `upsert` | as `put`, plus `ItemNotFound`, `ConditionalCheckFailed` |
+| `update` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `UpdateAppliedButUnreadable`, `UniqueConstraintViolation`, `ValidationError`, `TransactionOverflow` |
+| `patch` | as `update`, plus `ConditionalCheckFailed` |
+| `delete` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow` |
+| `deleteIfExists` | as `delete`, plus `ConditionalCheckFailed` |
+| `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow` |
+| `purge` | `ValidationError` |
+| `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| `EventStore` `append` / `commandHandler` (plus the decider's errors) | `AppendError`: `VersionConflict`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 
-// Entity without unique constraints or versioning
-db.Users.put(input)
-// Effect<Entity.Record<E>, DynamoError, never>
-
-// Entity with unique constraints
-db.Users.put(input)
-// Effect<Entity.Record<E>, DynamoError | UniqueConstraintViolation, never>
-
-// Update with optimistic locking
-db.Users.update(key, changes, { expectedVersion: 5 })
-// Effect<Entity.Record<E>, DynamoError | ItemNotFound | OptimisticLockError, never>
-```
+`.condition()` adds `ConditionalCheckFailed` to an operation that lacks it.
 
 ---
 

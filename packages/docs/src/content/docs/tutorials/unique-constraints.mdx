@@ -76,7 +76,7 @@ const Users = Entity.make({
 })
 ```
 
-Under the hood, every `put` becomes a DynamoDB `TransactWriteItems` that atomically writes the main item **and** a sentinel item for each unique constraint. If any sentinel already exists, the transaction fails with `UniqueConstraintViolation`.
+Under the hood, a `put` reads the item first, then writes a DynamoDB `TransactWriteItems` that atomically writes the main item **and** a sentinel item for each unique value it claims. Over an existing item, only changed values get a new sentinel, and the old one is released. If any sentinel already exists, the transaction fails with `UniqueConstraintViolation`.
 
 ### ApiRequests Entity — TTL-Based Idempotency Key
 
@@ -103,7 +103,7 @@ const ApiRequests = Entity.make({
 })
 ```
 
-The sentinel item gets a `_ttl` attribute set to 30 minutes in the future. DynamoDB's TTL mechanism automatically deletes it after expiry, freeing the idempotency key for reuse.
+The sentinel item gets a `_ttl` attribute set to 30 minutes in the future, whether a put or an update wrote it. DynamoDB's TTL mechanism automatically deletes it after expiry, freeing the idempotency key for reuse.
 
 ---
 

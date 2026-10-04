@@ -379,6 +379,8 @@ A field declared with `Schema.withDecodingDefault` can be left out of a `put`. T
 - **A primary-key or index composite** is stored with its default, and its keys are composed from it, so the item is indexed under the value it reads back with. A `.remove()` of such a field stores the default again and keeps the item indexed under it.
 - **Any other field** is not stored. The default is applied on read.
 
+An `upsert` that omits a defaulted index composite reads the item first: it stores the default only when it creates the item, and otherwise keeps the stored value.
+
 A default never creates a unique-constraint sentinel. A defaulted unique field that is also an index composite is listed in a hidden string-set attribute, `__edd_d__`, until a write supplies its value. See [Defaults and Unique Constraints](/effect-dynamodb/guides/data-integrity/#defaults-and-unique-constraints).
 
 ## Derived Types

@@ -196,7 +196,7 @@ const testPutOperation = Effect.gen(function* () {
 ```
 
 <Aside type="note">
-  Entities with `unique` constraints use `transactWriteItems` to atomically write both the item and the uniqueness sentinel. Entities without `unique` use `putItem` directly.
+  A `put` of an entity with `unique` constraints first reads the item with `getItem` (the mock's empty response means it doesn't exist yet), then uses `transactWriteItems` to atomically write both the item and the uniqueness sentinel. Entities with neither `unique` nor `versioned` use `putItem` directly, with no read.
 </Aside>
 
 ---

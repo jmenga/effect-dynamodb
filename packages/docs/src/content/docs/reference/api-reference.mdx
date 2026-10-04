@@ -240,7 +240,7 @@ These are methods on the entity definition returned by `Entity.make()`. They ret
 | Operation | Signature | Description |
 |-----------|-----------|-------------|
 | `entity.put(input)` | `EntityPut` | Insert or overwrite an item (descriptor). On a versioned or unique-constrained entity it reads the item first: a put over an existing item continues its version, incarnation and `createdAt`, snapshots it (retain) and rotates changed sentinels, releasing only those it owns. A concurrent write in between is retried (last writer wins); a race lost on every attempt fails with `OptimisticLockError` / `ConcurrentModification`. A deleted retain item created again continues after its retained version history |
-| `entity.create(input)` | `EntityPut` | Insert only — fails with `ConditionalCheckFailed` if exists (descriptor). Never reads the item |
+| `entity.create(input)` | `EntityPut` | Insert only — fails with `ConditionalCheckFailed` if exists (descriptor). Never reads the item; a `retain` entity runs one `Limit 1` query to continue after any version history retained at the key |
 | `entity.upsert(input)` | `EntityPut` | Create or update the supplied fields — uses `if_not_exists()` for immutable fields, createdAt, version (descriptor). On an entity with unique constraints or `retain` (or an input omitting a defaulted index composite) it reads the item once: creates a missing item with its sentinels and snapshot, or updates an existing one, rotating changed sentinels and snapshotting it. Validates the whole input either way |
 | `entity.get(key)` | `EntityGet` | Get a single item by primary key (descriptor) |
 | `entity.update(key)` | `EntityUpdate` | Start an update operation (compose with `set`, `add`, etc.) (descriptor). On a missing item it fails with `ItemNotFound` and writes nothing. The exception is a plain `.set()` of a complete item (every required field and primary-key composite, with no other operations, `expectedVersion`, `.condition()`, cascade, `withVector` or old-image `returnValues`), which the library creates through `create`, exactly as `put` would write it |
@@ -307,7 +307,7 @@ const users = db.entities.UserEntity
 | `bound.getVersion(key, version)` | `versioned: { retain: true }` | `Effect` | Get a specific version snapshot |
 | `bound.versions(key)` | `versioned: { retain: true }` | `BoundQuery` | List all version snapshots as a fluent BoundQuery — supports `.collect()`, `.fetch()`, `.paginate()`, `.count()`, `.limit()`, `.reverse()`, `.startFrom()`, `.filter()`, `.select()` |
 | `bound.restore(key)` | `softDelete` | `Effect` | Restore a soft-deleted item |
-| `bound.purge(key)` | Any | `Effect` | Permanently remove item + all versions and sentinels |
+| `bound.purge(key)` | Any | `Effect` | Permanently remove item + all versions and soft-deleted copies, and release the unique sentinels they own |
 | `bound.deleted.get(key)` | `softDelete` | `Effect` | Get a specific soft-deleted item |
 | `bound.deleted.list(key)` | `softDelete` | `BoundQuery` | List all soft-deleted tombstones in the partition as a fluent BoundQuery |
 
@@ -648,7 +648,7 @@ import { Transaction } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `transactGet` | `(items) => Effect<Tuple>` | Atomically get up to 100 items — returns a typed tuple. Accepts unbound `Entity.get` intermediates AND the `BoundGet` returned by `db.entities.*.get(...)` |
-| `transactWrite` | `(ops) => Effect<void>` | Atomically write up to 100 items (puts, deletes, condition checks). Accepts unbound `Entity.put`/`Entity.delete` intermediates AND the bound builders returned by `db.entities.*`; conditions attached to either (including `create()`'s implicit `attribute_not_exists`) are compiled into the transact item. `upsert`, `update` and `patch` are rejected with a `ValidationError` — see below |
+| `transactWrite` | `(ops) => Effect<void>` | Atomically write up to 100 items (puts, deletes, condition checks). A put of a versioned or unique-constrained entity reads the item first and creates or replaces it as the entity's own `put` does (see below). Accepts unbound `Entity.put`/`Entity.delete` intermediates AND the bound builders returned by `db.entities.*`; conditions attached to either (including `create()`'s implicit `attribute_not_exists`) are compiled into the transact item. `upsert`, `update` and `patch` are rejected with a `ValidationError` — see below |
 | `check` | `(get, condition) => ConditionCheckOp` | Create a condition-check operation for `transactWrite` (dual API). Takes either get spelling |
 
 ### transactGet
@@ -677,7 +677,7 @@ yield* Transaction.transactWrite(
 
 ### Ops `transactWrite` will not compile
 
-`transactWrite` emits exactly one `Put` / `Delete` / `ConditionCheck` per op. Anything whose entity contract needs a different verb, extra items, or a service the compile step does not hold is refused with a `ValidationError` rather than written with different semantics:
+`transactWrite` compiles each op to a `Put`, `Delete` or `ConditionCheck`, plus the extra items of a guarded put (see below). An op whose entity contract needs a different verb, extra items it can't build from the op, or a service the compile step does not hold is refused with a `ValidationError` rather than written with different semantics:
 
 | Op / entity feature | Why it is refused |
 |---|---|
@@ -697,6 +697,8 @@ Consequences worth knowing:
 - **An existing item is replaced, not refused.** It continues its version, incarnation and `createdAt`, its replaced state is snapshotted (`retain`), and changed unique values rotate their sentinels. A deleted retain item created again continues after its retained version history. This is what keeps a versioned read model in step with `EventStore.append`.
 - **A race is retried.** If another writer changes, creates or deletes the item between the read and the transaction, the transaction is cancelled and built again from a fresh read. A race lost on every attempt fails with `OptimisticLockError` / `ConcurrentModification`.
 - **Errors name what happened.** A duplicate fails with `UniqueConstraintViolation` (naming the constraint and the values). Only an op's own condition (`.condition()`, `create()`) is reported as a condition: `TransactionCancelled` from `transactWrite`, `AdditionalItemConditionFailed` from `append`.
+- **One op per item.** DynamoDB rejects a transaction that touches one item twice, with a `DynamoValidationError`. That includes two puts of one item, and two puts that swap unique values: each releases the sentinel the other reserves.
+- **The reads cost capacity.** Each guarded put makes one consistent `GetItem` of its item, one more per sentinel it would release, and, for a missing `retain` item, one `Limit 1` query of its version history.
 - **The 100-item cap counts the expanded total.** Ten `unique` + `retain` puts occupy 30 slots or more. The error message reports both numbers.
 - **`softDelete` does not affect a put** — only a delete — so puts of soft-deletable entities are unaffected.
 
@@ -746,7 +748,7 @@ It also rejects (**EDD-9049**) any write of an entity configured with `unique` o
 
 Puts of a plain `versioned` entity are accepted, but not as `PutRequest`s, which would reset an existing item to version 1 under a new incarnation. `Batch.write` sends them first, as create-only `TransactWriteItems` of up to 100 items (kept under DynamoDB's 4 MB transaction payload), each conditioned on `attribute_not_exists`. There is no read, so there is no window between a check and the write. A batch that touches such an item more than once is refused with a `ValidationError` before anything is written.
 
-- A put that would replace an existing item cancels its whole chunk, so nothing in that chunk is written, and fails with a `ValidationError`. Earlier chunks may already have been written, since `Batch.write` was never atomic across chunks, and the batch's other requests aren't sent. Use the entity's own `put()` to replace an item.
+- A put that would replace an existing item cancels its whole chunk, so nothing in that chunk is written, and fails with a `ValidationError`. Earlier chunks may already have been written, since `Batch.write` was never atomic across chunks, and the batch's other requests aren't sent. Use the entity's own `put()` or `Transaction.transactWrite` to replace an item.
 - Each chunk costs twice the write capacity of a batch write.
 - Contention cancellations (`TransactionConflict`, throttling) are retried with the batch's `maxRetries` / `baseDelayMs` backoff.
 - Puts of other entities, and deletes, are still plain `BatchWriteItem` requests.
@@ -1127,7 +1129,7 @@ A `Decider<State, Command, Event, E = never>` encodes one aggregate's command-ev
 
 | Method | Returns |
 |--------|---------|
-| `append(streamId, events, expectedVersion, options?)` | `Effect<AppendResult<TEvent>, VersionConflict \| DynamoClientError \| ValidationError \| TransactionCancelled, R>` — atomically append events with optimistic concurrency. Each event becomes a `Put` with `attribute_not_exists(pk)` inside a single `TransactWriteItems`. Optional `options.metadata` is validated against the stream's metadata schema. |
+| `append(streamId, events, expectedVersion, options?)` | `Effect<AppendResult<TEvent>, AppendError, R>` — atomically append events with optimistic concurrency. `AppendError` is `VersionConflict \| DuplicateCommand \| AdditionalItemConditionFailed \| AppendTooLarge \| DynamoClientError \| ValidationError \| TransactionCancelled \| UniqueConstraintViolation \| OptimisticLockError \| ConcurrentModification`; the last three come from guarded puts in `additionalItems`. Each event becomes a `Put` with `attribute_not_exists(pk)` inside a single `TransactWriteItems`. Optional `options.metadata` is validated against the stream's metadata schema. |
 | `read(streamId)` | `Effect<ReadonlyArray<StreamEvent<TEvent>>, DynamoClientError \| ValidationError, R>` — read all events for a stream in version order. |
 | `readFrom(streamId, afterVersion)` | `Effect<ReadonlyArray<StreamEvent<TEvent>>, DynamoClientError \| ValidationError, R>` — read events strictly after a given version. |
 | `currentVersion(streamId)` | `Effect<number, DynamoClientError \| ValidationError, R>` — current head version (0 if the stream is empty). |
@@ -1235,7 +1237,7 @@ import {
 |-------|-----|-------------|
 | `DynamoError` | `"DynamoError"` | AWS SDK error wrapper (includes `operation` and `cause`) |
 | `ThrottlingError` | `"ThrottlingError"` | AWS SDK throttling — request rate exceeded |
-| `DynamoValidationError` | `"DynamoValidationError"` | Malformed DynamoDB request |
+| `DynamoValidationError` | `"DynamoValidationError"` | DynamoDB rejected the request as malformed, for example a transaction that touches one item twice |
 | `InternalServerError` | `"InternalServerError"` | Transient DynamoDB failure |
 | `ResourceNotFoundError` | `"ResourceNotFoundError"` | Table or index does not exist |
 | `ItemNotFound` | `"ItemNotFound"` | No item under the key: `get`, an `update` of a missing item (unless it is a plain `.set()` of a complete item), `restore` with no soft-deleted item or after a concurrent restore won |
@@ -1260,6 +1262,24 @@ import {
 | `VersionConflict` | `"VersionConflict"` | Event store version mismatch |
 | `AdditionalItemConditionFailed` | `"AdditionalItemConditionFailed"` | A condition the caller set on an `EventStore.append({ additionalItems })` op (`.condition()`, `create()`, `Transaction.check`) failed — NOT a version conflict, and never an op the caller set no condition on (`streamName`, `streamId`, `indices`, `reasons`) |
 | `DuplicateCommand` | `"DuplicateCommand"` | A `commandId` was already applied to this stream (`streamName`, `streamId`, `commandId`) |
+
+### Errors by operation
+
+Each operation declares a fixed error union, whatever the entity's configuration. Every union also includes `DynamoClientError`, plus ref and vector errors where the entity has refs or vector indexes. `.condition()` adds `ConditionalCheckFailed` to an operation that lacks it.
+
+| Operation | Declared errors (besides `DynamoClientError`) |
+|-----------|-----------------------------------------------|
+| `put` | `ValidationError`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `TransactionOverflow` |
+| `create` | as `put`, plus `ConditionalCheckFailed` |
+| `upsert` | as `put`, plus `ItemNotFound`, `ConditionalCheckFailed` |
+| `update` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `UpdateAppliedButUnreadable`, `UniqueConstraintViolation`, `ValidationError`, `TransactionOverflow` |
+| `patch` | as `update`, plus `ConditionalCheckFailed` |
+| `delete` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow` |
+| `deleteIfExists` | as `delete`, plus `ConditionalCheckFailed` |
+| `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow` |
+| `purge` | `ValidationError` |
+| `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| `EventStore` `append` / `commandHandler` (plus the decider's errors) | `VersionConflict`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 
 ### Usage
 

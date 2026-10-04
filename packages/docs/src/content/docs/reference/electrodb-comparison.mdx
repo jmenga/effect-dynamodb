@@ -127,7 +127,7 @@ ElectroDB is the most feature-rich existing DynamoDB ORM for TypeScript. This co
 | Version retrieval | Not built-in | `Entity.getVersion(key, version)`, `Entity.versions(key)` | **Advantage** |
 | Soft delete | Not built-in | Built-in `softDelete` config with optional TTL | **Advantage** |
 | Restore soft-deleted | Not built-in | `Entity.restore(key)` — recomposes all keys and unique sentinels | **Advantage** |
-| Purge (full partition) | Not built-in | `Entity.purge(key)` — deletes item + versions + sentinels | **Advantage** |
+| Purge (full partition) | Not built-in | `Entity.purge(key)` — deletes item + versions + the sentinels it owns | **Advantage** |
 | Soft-deleted item access | Not built-in | `Entity.deleted.get(key)`, `Entity.deleted.list(key)` | **Advantage** |
 | Unique constraints | Manual via transactions | Built-in `unique` config — sentinel-based with atomic transactions | **Advantage** |
 | Optimistic locking | Not built-in | Built-in `.expectedVersion(n)` on `BoundUpdate` | **Advantage** |
