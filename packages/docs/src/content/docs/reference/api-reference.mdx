@@ -239,13 +239,13 @@ These are methods on the entity definition returned by `Entity.make()`. They ret
 
 | Operation | Signature | Description |
 |-----------|-----------|-------------|
-| `entity.put(input)` | `EntityPut` | Insert or overwrite an item (descriptor). On a versioned or unique-constrained entity it reads the item first: a put over an existing item continues its version, incarnation and `createdAt`, snapshots it (retain) and rotates changed sentinels. A race fails with `OptimisticLockError` / `ConcurrentModification`. Re-creating a deleted retain item whose version history exists fails with `ValidationError` (`purge` it first) |
-| `entity.create(input)` | `EntityPut` | Insert only — fails with `ConditionalCheckFailed` if exists (descriptor) |
-| `entity.upsert(input)` | `EntityPut` | Create or update — uses `if_not_exists()` for immutable fields, createdAt, version (descriptor). On an entity with unique constraints it reads the item first: creates a missing item with its sentinels, or updates an existing one and rotates changed sentinels |
+| `entity.put(input)` | `EntityPut` | Insert or overwrite an item (descriptor). On a versioned or unique-constrained entity it reads the item first: a put over an existing item continues its version, incarnation and `createdAt`, snapshots it (retain) and rotates changed sentinels, releasing only those it owns. A concurrent write in between is retried (last writer wins); a race lost on every attempt fails with `OptimisticLockError` / `ConcurrentModification`. A deleted retain item created again continues after its retained version history |
+| `entity.create(input)` | `EntityPut` | Insert only — fails with `ConditionalCheckFailed` if exists (descriptor). Never reads the item |
+| `entity.upsert(input)` | `EntityPut` | Create or update the supplied fields — uses `if_not_exists()` for immutable fields, createdAt, version (descriptor). On an entity with unique constraints or `retain` (or an input omitting a defaulted index composite) it reads the item once: creates a missing item with its sentinels and snapshot, or updates an existing one, rotating changed sentinels and snapshotting it. Validates the whole input either way |
 | `entity.get(key)` | `EntityGet` | Get a single item by primary key (descriptor) |
 | `entity.update(key)` | `EntityUpdate` | Start an update operation (compose with `set`, `add`, etc.) (descriptor). On a missing item it fails with `ItemNotFound` and writes nothing. The exception is a plain `.set()` of a complete item (every required field and primary-key composite, with no other operations, `expectedVersion`, `.condition()`, cascade, `withVector` or old-image `returnValues`), which the library creates through `create`, exactly as `put` would write it |
 | `entity.patch(key)` | `EntityUpdate` | Update with `attribute_exists` — fails with `ConditionalCheckFailed` if not exists (descriptor) |
-| `entity.delete(key)` | `EntityDelete` | Delete an item (descriptor) |
+| `entity.delete(key)` | `EntityDelete` | Delete an item (descriptor). Releases only the unique sentinels the item owns |
 | `entity.deleteIfExists(key)` | `EntityDelete` | Delete with `attribute_exists` — fails with `ConditionalCheckFailed` if not exists (descriptor) |
 | `entity.query.<indexName>(pk)` | `Query<Record>` | Query a specific index by partition key (descriptor) |
 | `entity.scan()` | `Query<Record>` | Full table scan filtered by entity type (descriptor) |
@@ -292,7 +292,7 @@ const users = db.entities.UserEntity
 | `bound.get(key)` | Get a single item |
 | `bound.put(input, ...combinators)` | Insert or overwrite. Optional combinators (e.g. `condition(...)`). A put over an existing item of a versioned or unique-constrained entity continues it (see `entity.put`) |
 | `bound.create(input, ...combinators)` | Insert only — fails with `ConditionalCheckFailed` if exists |
-| `bound.upsert(input, ...combinators)` | Create or update — `if_not_exists()` for immutable fields, createdAt, version. Reads first on an entity with unique constraints (see `entity.upsert`) |
+| `bound.upsert(input, ...combinators)` | Create or update — `if_not_exists()` for immutable fields, createdAt, version. Reads first on an entity with unique constraints or `retain` (see `entity.upsert`) |
 | `bound.update(key, ...combinators)` | Update an item — compose with `Entity.set(...)`, `Entity.expectedVersion(...)`, etc. |
 | `bound.patch(key, ...combinators)` | Update with `attribute_exists` — fails if item does not exist |
 | `bound.delete(key, ...combinators)` | Delete an item. Optional combinators (e.g. `condition(...)`) |
@@ -686,18 +686,19 @@ yield* Transaction.transactWrite(
 | `refs` | Write-time ref hydration reads the referenced entity; the compile step cannot, so the ref attribute would be written empty |
 | `generatedId` | Id generation needs the `Crypto` service |
 | `vectorIndexes` | Computing the embedding needs the `Embedder` service; the item would drop out of the index |
-| **`delete()` of an entity with `unique`, `versioned: { retain: true }` or `softDelete`** | **EDD-9048.** The extra items a delete must write come from the *stored* row — the sentinel to release is keyed by its unique values, a retain snapshot copies it, and a soft-delete tombstone is that row relocated to a new sort key. This path never reads. Use the entity's own `delete`, which reads first |
+| **`delete()` of an entity with `unique`, `versioned: { retain: true }` or `softDelete`** | **EDD-9048.** The extra items a delete must write come from the *stored* row — the sentinel to release is keyed by its unique values, a retain snapshot copies it, and a soft-delete tombstone is that row relocated to a new sort key. This path builds a delete from its key alone. Use the entity's own `delete`, which reads first |
 
-### Multi-item puts expand
+### Guarded puts expand
 
-A `put` through `transactWrite` (or `EventStore.append({ additionalItems })`) of an entity with `unique` constraints or `versioned: { retain: true }` emits **more than one item**: the row, one `attribute_not_exists`-guarded sentinel per satisfiable constraint, and the v1 snapshot. All of it derives from the payload, so it needs no read and stays atomic with the rest of the transaction.
+A `put` through `transactWrite` (or `EventStore.append({ additionalItems })`) of a versioned or unique-constrained entity is written exactly as the entity's own `put` writes it. It reads the item first, then emits **more than one item**, all atomic with the rest of the transaction: the row, guarded on what was read (missing: `attribute_not_exists`; present: its version and incarnation, or its unique values), one `attribute_not_exists`-guarded sentinel per new unique value, a release of each old sentinel the item owns, and with `retain` the snapshot.
 
 Consequences worth knowing:
 
-- **The uniqueness constraint is enforced.** A duplicate fails with `UniqueConstraintViolation` (naming the constraint and the values), not a bare `TransactionCancelled`.
-- **The 100-item cap counts the expanded total.** Ten `unique` + `retain` puts occupy 30 slots. The error message reports both numbers.
+- **An existing item is replaced, not refused.** It continues its version, incarnation and `createdAt`, its replaced state is snapshotted (`retain`), and changed unique values rotate their sentinels. A deleted retain item created again continues after its retained version history. This is what keeps a versioned read model in step with `EventStore.append`.
+- **A race is retried.** If another writer changes, creates or deletes the item between the read and the transaction, the transaction is cancelled and built again from a fresh read. A race lost on every attempt fails with `OptimisticLockError` / `ConcurrentModification`.
+- **Errors name what happened.** A duplicate fails with `UniqueConstraintViolation` (naming the constraint and the values). Only an op's own condition (`.condition()`, `create()`) is reported as a condition: `TransactionCancelled` from `transactWrite`, `AdditionalItemConditionFailed` from `append`.
+- **The 100-item cap counts the expanded total.** Ten `unique` + `retain` puts occupy 30 slots or more. The error message reports both numbers.
 - **`softDelete` does not affect a put** — only a delete — so puts of soft-deletable entities are unaffected.
-- **A put of a versioned or unique-constrained entity may only create.** Replacing an item needs the stored item, to continue its version, snapshot it and rotate its sentinels, and this path never reads. The `Put` carries `attribute_not_exists` (ANDed with any `.condition()`), and one that would replace an existing item fails with a `ValidationError`; nothing in the transaction is written. Use the entity's own `put()` to replace an item. A retain put whose `v#0000001` snapshot already exists from a deleted earlier item fails the same way.
 
 ### Types
 
@@ -1239,13 +1240,13 @@ import {
 | `ResourceNotFoundError` | `"ResourceNotFoundError"` | Table or index does not exist |
 | `ItemNotFound` | `"ItemNotFound"` | No item under the key: `get`, an `update` of a missing item (unless it is a plain `.set()` of a complete item), `restore` with no soft-deleted item or after a concurrent restore won |
 | `ConditionalCheckFailed` | `"ConditionalCheckFailed"` | A `.condition()` was not met (put, update, delete, create), or `patch()` of a missing item. A lost version race is an `OptimisticLockError` instead |
-| `ValidationError` | `"ValidationError"` | Schema decode/encode failed, or the operation was refused: an item of a versioned entity with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, re-creating a deleted retain item whose history exists, or a replacing put in `transactWrite` / `Batch.write` |
+| `ValidationError` | `"ValidationError"` | Schema decode/encode failed, or the operation was refused: an item of a versioned entity with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, or a replacing put in `Batch.write` |
 | `TransactionCancelled` | `"TransactionCancelled"` | Transaction rejected (includes cancellation `reasons`) |
-| `TransactionOverflow` | `"TransactionOverflow"` | Transaction exceeds 100-item DynamoDB limit |
+| `TransactionOverflow` | `"TransactionOverflow"` | A write's own transaction (the item, its sentinels and snapshot) would exceed DynamoDB's 100-item limit |
 | `AppendTooLarge` | `"AppendTooLarge"` | `EventStore.append` exceeds the 100-item transaction limit (`streamName`, `streamId`, `count`, `limit`) |
-| `UniqueConstraintViolation` | `"UniqueConstraintViolation"` | Unique constraint violated on put/create/upsert/update |
-| `OptimisticLockError` | `"OptimisticLockError"` | A versioned write lost a version race: `expectedVersion()` did not match, or another writer changed the item between the read and the write of a read-then-write update, `put` or `upsert`. `actualVersion` is the stored version (`entityType`, `key`, `expectedVersion`, `actualVersion`) |
-| `ConcurrentModification` | `"ConcurrentModification"` | An unversioned write that reads first (a unique-field change, a computed change to an index composite, a `put` or `upsert` of a unique-constrained entity) found that another writer changed one of the attributes it read before its write landed. Nothing was written; retrying recomputes from the new values (`entityType`, `key`, `attributes`, `current`) |
+| `UniqueConstraintViolation` | `"UniqueConstraintViolation"` | Unique constraint violated on put/create/upsert/update, or by a put in `transactWrite` / `append`'s `additionalItems` |
+| `OptimisticLockError` | `"OptimisticLockError"` | A versioned write lost a version race: `expectedVersion()` did not match, or another writer changed the item between the read and the write of a read-then-write update, or a `put`, `upsert` or transaction put lost that race on every attempt. `actualVersion` is the stored version (`entityType`, `key`, `expectedVersion`, `actualVersion`) |
+| `ConcurrentModification` | `"ConcurrentModification"` | An unversioned write that reads first (a unique-field change, a computed change to an index composite, a `put` or `upsert` of a unique-constrained entity — the last two after every attempt) found that another writer changed one of the attributes it read before its write landed, or a unique sentinel it was releasing changed hands. Nothing was written; retrying recomputes from the new values (`entityType`, `key`, `attributes`, `current`) |
 | `UpdateAppliedButUnreadable` | `"UpdateAppliedButUnreadable"` | A retain update WAS applied at `version`, but another write replaced the item before it could be read back, and no snapshot proves what this update wrote. Don't retry a non-idempotent update on this error; read the item instead (`entityType`, `key`, `version`, `reason`) |
 | `ItemDeleted` | `"ItemDeleted"` | Item is soft-deleted (get returns this instead of the item) |
 | `ItemNotDeleted` | `"ItemNotDeleted"` | `restore` found a live item under the key as well as the soft-deleted one (for example, the item was recreated after it was deleted) |
@@ -1257,7 +1258,7 @@ import {
 | `AggregateTransactionOverflow` | `"AggregateTransactionOverflow"` | Sub-aggregate exceeds 100-item transaction limit (`aggregate`, `subgraph`, `itemCount`, `limit`) |
 | `CascadePartialFailure` | `"CascadePartialFailure"` | Cascade update partially failed in eventual mode (`sourceEntity`, `sourceId`, `succeeded`, `failed`, `errors`) |
 | `VersionConflict` | `"VersionConflict"` | Event store version mismatch |
-| `AdditionalItemConditionFailed` | `"AdditionalItemConditionFailed"` | A caller-supplied `EventStore.append({ additionalItems })` condition failed — NOT a version conflict (`streamName`, `streamId`, `indices`, `reasons`) |
+| `AdditionalItemConditionFailed` | `"AdditionalItemConditionFailed"` | A condition the caller set on an `EventStore.append({ additionalItems })` op (`.condition()`, `create()`, `Transaction.check`) failed — NOT a version conflict, and never an op the caller set no condition on (`streamName`, `streamId`, `indices`, `reasons`) |
 | `DuplicateCommand` | `"DuplicateCommand"` | A `commandId` was already applied to this stream (`streamName`, `streamId`, `commandId`) |
 
 ### Usage

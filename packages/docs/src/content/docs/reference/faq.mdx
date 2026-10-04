@@ -156,8 +156,8 @@ const Orders = Entity.make({
 | Operation | Behavior | On Duplicate Key | DynamoDB API |
 |-----------|----------|------------------|--------------|
 | **`put`** | Creates or overwrites | Replaces the existing item; on a versioned or unique-constrained entity it continues the item's version and rotates its sentinels | PutItem (TransactWriteItems with sentinels or retain) |
-| **`create`** | Insert-only — `put` + automatic `attribute_not_exists` condition | Fails with `ConditionalCheckFailed` | PutItem (with condition) |
-| **`upsert`** | Create-or-update atomically | Creates if missing, updates if exists | UpdateItem (with `if_not_exists`) |
+| **`create`** | Insert-only — `put` + automatic `attribute_not_exists` condition; never reads the item | Fails with `ConditionalCheckFailed` | PutItem (with condition) |
+| **`upsert`** | Create-or-update | Creates if missing, updates the supplied fields if it exists | UpdateItem (with `if_not_exists`); reads first on a `unique` or `retain` entity |
 
 ```typescript
 const db = yield* DynamoClient.make({
@@ -183,9 +183,9 @@ yield* users.create({ userId: "u-1", name: "Alice" }).pipe(
 yield* users.upsert({ userId: "u-1", name: "Alice" })
 ```
 
-**Note:** On an entity with unique constraints, `upsert` reads the item first, because one `UpdateItem` can't write, rotate or check a sentinel. A missing item is created with its sentinels; an existing one is updated, with sentinels rotated for changed unique values. On other entities `upsert` is a single `UpdateItem`, so it writes no `retain` snapshot.
+**Note:** On an entity with unique constraints or `versioned: { retain: true }`, `upsert` reads the item once first, because one `UpdateItem` can't write, rotate or check a sentinel, or snapshot the item it replaces. A missing item is created with its sentinels and snapshot; an existing one is updated, with sentinels rotated for changed unique values and the replaced item snapshotted. Either way the whole input is validated. On other entities `upsert` is a single `UpdateItem`, unless the input omits a defaulted index composite: then it reads first too, so it stores the default only when it creates the item.
 
-A `put` of a versioned or unique-constrained entity also reads first. Over an existing item it takes the next version, keeps the incarnation and `createdAt`, snapshots the replaced item (`retain`) and rotates changed sentinels, so it never resets the item to version 1.
+A `put` of a versioned or unique-constrained entity also reads first. Over an existing item it takes the next version, keeps the incarnation and `createdAt`, snapshots the replaced item (`retain`) and rotates changed sentinels, so it never resets the item to version 1. A concurrent write in between is retried: the last writer wins. `Transaction.transactWrite` and `EventStore` `additionalItems` write these puts the same way.
 
 ---
 
@@ -386,7 +386,7 @@ yield* users.put({ userId: "u-1", email: "alice@example.com" }).pipe(
 )
 ```
 
-To update a unique field, provide the new value in `set()`. The library automatically deletes the old sentinel and creates a new one in a transaction. If the new value is already taken, you get `UniqueConstraintViolation`.
+To update a unique field, provide the new value in `set()`. The library creates the new sentinel and releases the old one in a transaction — the old one only if this item owns it, since another item may have claimed the value after this item's reservation expired. If the new value is already taken, you get `UniqueConstraintViolation`.
 
 ---
 

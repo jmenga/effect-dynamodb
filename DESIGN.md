@@ -1864,9 +1864,9 @@ update rewrite its history, so `versionCorruption` refuses it with a
 `ValidationError`: on every decode (`get`, queries, the `deleted` views,
 `decodeMarshalledItem`), so a query over a partition holding one fails as a
 whole; on the read of every read-then-write path (updates, soft delete,
-unique-constraint hard delete, `restore`, versioned `put`, unique-constraint
-`upsert`); and on a plain update and a plain `upsert` (no unique
-constraints), through a
+unique-constraint hard delete, `restore`, versioned `put` other than `create`,
+read-first `upsert`, transaction puts); and on a plain update and a plain
+`upsert`, through a
 `attribute_exists(version) OR attribute_not_exists(__edd_i__)` condition with
 `ALL_OLD` on failure. A plain hard delete deliberately doesn't check: it reads
 nothing and writes no history, so it is the safe way to remove such an item.
@@ -1942,45 +1942,92 @@ writes nothing, as do retain entities and updates that read first. `.set()` of a
 ignored). An immutable field may be restated with its stored value (spread
 records), while a different value is refused.
 
-**Replacing puts.** A `put` of a versioned or unique-constrained entity reads
-the item first (consistent read). Over an existing item it continues that item:
-the next version, the same incarnation token, the stored `createdAt` (unless the
-input supplies one), a retain snapshot of the replaced item at its version, and
-sentinel rotation (a changed value deletes the old sentinel and puts the new
-one; an unchanged value is left alone). It never resets to version 1 or orphans
-a sentinel. The main `Put` is guarded by `attribute_not_exists(pk)` when the
-item was missing, and otherwise by `deleteGuard` over what was read (version and
-incarnation when versioned, the unique attributes otherwise), with
-`ReturnValuesOnConditionCheckFailure: ALL_OLD`. A race is an
-`OptimisticLockError` (versioned) or `ConcurrentModification` (unversioned); a
-`.condition()` failure is `ConditionalCheckFailed`. A soft-deleted item counts as
-missing, since its tombstone has a different sort key. Re-creating a deleted
-retain item whose `v#0000001` still exists fails on the snapshot guard with a
-`ValidationError`: `purge` it first. The same snapshot guard applies to
-`create` of a retain entity; otherwise `create` is unchanged (an existing item
-is `ConditionalCheckFailed`). Entities with neither feature keep the single
-`PutItem`, with no read.
+**Guarded puts.** A `put` of a versioned or unique-constrained entity is planned
+from a consistent read of the item (`planPut`), and written by `runGuardedPut`.
+Over an existing item it continues that item: the next version, the same
+incarnation token, the stored `createdAt` (unless the input supplies one — on
+unique-only entities too), a retain snapshot of the replaced item at its version,
+and sentinel rotation (a changed value takes the new sentinel and releases the
+old one; an unchanged value is left alone). It never resets to version 1 or
+orphans a sentinel. The main `Put` is guarded by `attribute_not_exists(pk)` when
+the item was missing, and otherwise by `deleteGuard` over what was read (version
+and incarnation when versioned, the unique attributes otherwise), with
+`ReturnValuesOnConditionCheckFailure: ALL_OLD`. A soft-deleted item counts as
+missing, since its tombstone has a different sort key. Entities with neither
+feature keep the single `PutItem`, with no read.
 
-**`upsert` with unique constraints.** One `UpdateItem` cannot write, rotate or
-check a sentinel, so `guardedUpsert` reads the item first. Missing: `create`,
-sentinels guarded by `attribute_not_exists`. Present: an update of the upserted
-fields (primary-key composites, immutable fields, `createdAt` and the version
-dropped, so they keep their stored values), with sentinels rotated for changed
-values only, under the update's version / incarnation guard (versioned) or
-attribute guard (unversioned). A concurrent create or delete between the read
-and the write is retried once the other way; any other race fails as the update
-or create reports it (`OptimisticLockError`, `ConcurrentModification`,
-`UniqueConstraintViolation` for a taken value). Entities without unique
-constraints keep the single `if_not_exists` `UpdateItem`.
+A put replaces the whole item, so a lost race is retried rather than reported:
+a concurrent create, replace or delete of the item between the read and the
+write cancels it, and it is planned again from a fresh read — the last writer
+wins, as with a plain `PutItem` (`GUARDED_PUT_ATTEMPTS` = 3; a race lost on every
+attempt is an `OptimisticLockError` when versioned, else `ConcurrentModification`).
+A `.condition()` failure is `ConditionalCheckFailed`, a taken unique value
+`UniqueConstraintViolation`, a replaced item whose `v#N` snapshot holds other
+history a `ValidationError`. `create` does not read: the item must be missing,
+so its `Put` is guarded by `attribute_not_exists(pk)` and carries a fresh
+incarnation; an existing item is `ConditionalCheckFailed`.
 
-**Transaction puts are create-only.** `transactWrite` compiles a put from the
-payload alone, so it cannot continue an existing item. A `put` of a versioned or
-unique-constrained entity is emitted with `attribute_not_exists(pk)` (ANDed with
-any `.condition()`) and `ALL_OLD` on failure (`createOnly` provenance). A
-cancellation whose stored item exists becomes a `ValidationError` telling the
-caller to use the entity's own `put()`. A failed v1 snapshot guard (the
-`v#0000001` of a deleted earlier item) is a `ValidationError` as well. `create`
-keeps its own condition and error.
+**Re-creating a deleted retain item.** A deleted (or soft-deleted) retain item's
+`v#N` snapshots outlive it. A put, `create`, `upsert` or transaction put of a
+missing retain item reads the highest version retained for its key (a `Query` on
+the `v#` prefix, reversed, `Limit: 1`) and continues after it: the new item takes
+that version + 1, a new incarnation token, and its snapshot at that version.
+History is never overwritten, and the key is reusable without `purge`. If
+snapshots appear between the read and the write, the snapshot guard cancels the
+write and it is planned again. `restore` of a tombstone while a live item exists
+at the key is refused with `ItemNotDeleted`; once that item is deleted too,
+`restore` brings back the latest tombstone.
+
+**Sentinel ownership.** A sentinel names the item that reserved it
+(`_entity_pk` / `_entity_sk`). An item can hold a unique value without owning its
+sentinel: the constraint was added after the item was written, the item was
+written outside the library, or a `ttl`'d reservation expired and another item
+claimed the value. Releasing that sentinel by key would delete the other item's
+reservation and let the value be taken twice. So every path that releases a
+sentinel — a replacing put, an update or upsert that changes the value, a hard or
+soft delete, `purge`, a transaction put — first reads it consistently
+(`ownedSentinels`) and releases only those this item owns, each with a `Delete`
+conditioned on `_entity_pk` / `_entity_sk` still naming it (`sentinelRelease`). A
+release cancelled because the reservation changed hands in between is retried by
+a put, and is a `ConcurrentModification` on the unique fields from an update or
+delete. `purge` releases them one by one with `DeleteItem`, since a batch
+delete cannot carry the condition, and collects them from the live item and
+every tombstone.
+
+**`upsert` that reads first.** One `UpdateItem` cannot write, rotate or check a
+sentinel, snapshot the replaced item, or tell whether to store a default or keep
+the stored value. So an entity with `unique` constraints or `versioned: { retain:
+true }`, or an input that omits a defaulted index composite, takes
+`guardedUpsert`: it validates the whole input (required fields included) and
+reads the item once. Missing: `create`, sentinels guarded by
+`attribute_not_exists`, the retain snapshot written, omitted defaults stored.
+Present: an update of the upserted fields (primary-key composites, immutable
+fields, `createdAt` and the version dropped, so they keep their stored values,
+as do fields the input omits) from that same read, with sentinels rotated for
+changed values only and the replaced item snapshotted, under the update's
+version / incarnation guard (versioned) or attribute guard (unversioned). A
+concurrent create or delete between the read and the write is retried the other
+way (`GUARDED_PUT_ATTEMPTS`); a race lost on every attempt is an
+`OptimisticLockError` / `ConcurrentModification`, never a
+`ConditionalCheckFailed` the caller didn't ask for, and every error names the
+`upsert`. Other entities keep the single `if_not_exists` `UpdateItem`.
+
+**Transaction puts.** `transactWrite` and `EventStore.append`'s
+`additionalItems` plan a put of a versioned or unique-constrained entity with
+the same `planPut` (`Entity._planPut`), so it creates or replaces exactly as the
+entity's own `put`: it reads the item, guards the `Put` on what it read,
+continues a replaced item's version, incarnation and `createdAt`, snapshots it,
+rotates its sentinels (releasing only owned ones) and continues a re-created
+retain item past its history. Each guarded put's items carry `"guarded"`
+provenance and are judged by `judgeCancellation`: a taken unique value
+(`UniqueConstraintViolation`) or a history conflict (`ValidationError`) is
+final; the caller's own condition is `TransactionCancelled` from
+`transactWrite` and `AdditionalItemConditionFailed` from `append` — never
+reported for an op the caller set no condition on; a race with the read cancels
+the transaction, which is built and written again
+(`GUARDED_TRANSACTION_ATTEMPTS` = 3, then `OptimisticLockError` /
+`ConcurrentModification`). Deletes of `unique` / retain / `softDelete` entities
+are still refused (EDD-9048): a transaction builds a delete from its key alone.
 
 **`Batch.write` of a `versioned` entity.** A `PutRequest` would reset an
 existing item to version 1 under a new incarnation. So `Batch.write` sends these
@@ -2009,8 +2056,9 @@ entities are still refused by EDD-9049.)
   attributes it neither reads nor writes, wide items use the fallback guard,
   and the wide-update whole-item write can overwrite outside writers.
 - A plain `.expectedVersion(n)` cannot detect a delete-and-recreate that has
-  climbed back to version `n` (versions restart at 1, so it takes `n − 1`
-  updates).
+  climbed back to version `n` on an entity without `retain` (its versions
+  restart at 1, so it takes `n − 1` updates; a retain item continues after its
+  retained history).
 
 **Why hard-break over dual.** Carrying both the variadic overload and the fluent builder would double the surface area of `BoundEntity`, degrade hover tooltips, and force contributors to remember two shapes. The read side settled on builders for the same reasons. The change is batched into the next major alongside other breaking changes.
 
@@ -2998,11 +3046,12 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `DynamoError` | AWS SDK error wrapper |
 | `ItemNotFound` | No item: `get`, `update` of a missing item (unless a plain `.set()` of a complete item, which is created), `restore` without a tombstone |
 | `ConditionalCheckFailed` | A user `.condition()` failed, or `patch()` of a missing item |
-| `ValidationError` | Schema decode/encode failure, or a refused operation: an item with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `transactWrite` or `Batch.write` |
+| `ValidationError` | Schema decode/encode failure, or a refused operation: an item with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write` |
 | `TransactionCancelled` | Transaction failed with cancellation reasons |
-| `UniqueConstraintViolation` | Sentinel item already exists for unique field |
-| `OptimisticLockError` | A versioned write lost a version race (`expectedVersion` mismatch, or a concurrent write between a read-then-write update's read and write); carries the real `actualVersion` |
-| `ConcurrentModification` | An unversioned read-then-write update found an attribute it read changed before its write landed; nothing written (`attributes`, `current`) |
+| `UniqueConstraintViolation` | Sentinel item already exists for unique field (from the entity's write, `transactWrite`, or an `append`'s `additionalItems`) |
+| `OptimisticLockError` | A versioned write lost a version race (`expectedVersion` mismatch, a concurrent write between a read-then-write update's read and write, or a guarded put / upsert / transaction put that lost the race on every attempt); carries the real `actualVersion` |
+| `ConcurrentModification` | An unversioned read-then-write write found an attribute it read changed before its write landed (or lost a guarded put's race on every attempt), or a unique sentinel it was releasing changed hands; nothing written (`attributes`, `current`) |
+| `TransactionOverflow` | A write's own transaction (item, sentinels, snapshot) would exceed 100 items |
 | `UpdateAppliedButUnreadable` | A retain update was applied at `version` but its result could not be read back provably; do not retry (`version`, `reason`) |
 | `ItemNotDeleted` | `restore` found a live item under the key alongside the tombstone |
 | `RefNotFound` | Referenced entity does not exist during hydration |
