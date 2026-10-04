@@ -55,6 +55,18 @@ const InMemoryClient = mockDynamoClientLayer({
       return {} as any
     }),
   getItem: (input) => Effect.sync(() => ({ Item: store.get(keyOf(input.Key!)) }) as any),
+  // A partition's items under a sort-key prefix (a put of a missing retain item
+  // looks for its retained history this way).
+  query: (input) =>
+    Effect.sync(() => {
+      const pk = input.ExpressionAttributeValues?.[":pk"]?.S
+      const prefix = input.ExpressionAttributeValues?.[":prefix"]?.S ?? ""
+      const items = [...store.values()]
+        .filter((item) => item.pk?.S === pk && String(item.sk?.S).startsWith(prefix))
+        .sort((a, b) => String(a.sk?.S).localeCompare(String(b.sk?.S)))
+      if (input.ScanIndexForward === false) items.reverse()
+      return { Items: items.slice(0, input.Limit ?? items.length) } as any
+    }),
   updateItem: (input) =>
     takeFailure("UpdateItem") ??
     Effect.sync(() => {

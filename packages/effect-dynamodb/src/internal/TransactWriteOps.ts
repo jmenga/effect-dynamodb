@@ -2,9 +2,10 @@
  * @internal Shared `TransactWriteItems` item-building for `Transaction.transactWrite`
  * and `EventStore.append`'s `additionalItems`.
  *
- * The builder is a pure compile step — its `R` is `TableConfig` only (no
- * `DynamoClient`) — so both call sites can assemble items before deciding what
- * to do with them (execute directly, or merge into a larger transaction).
+ * Both call sites assemble items before deciding what to do with them
+ * (execute directly, or merge into a larger transaction). A put of a versioned
+ * or unique-constrained entity reads the item it replaces (#133), so the
+ * builder needs `DynamoClient` as well as `TableConfig`.
  *
  * Keeping one builder is what lets `EventStore.append({ additionalItems })` and
  * `Transaction.transactWrite` accept exactly the same op union: they cannot
@@ -12,9 +13,22 @@
  */
 
 import type { TransactWriteItem } from "@aws-sdk/client-dynamodb"
+import type {
+  ConcurrentModification,
+  OptimisticLockError,
+  UniqueConstraintViolation,
+} from "@effect-dynamodb/schema/Errors.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect } from "effect"
-import type { Entity, EntityDelete, EntityPut } from "../Entity.js"
+import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
+import type {
+  Entity,
+  EntityDelete,
+  EntityPut,
+  PutPlan,
+  PutVerdict,
+  WriteCancellationReason,
+} from "../Entity.js"
 import { extractTransactable } from "../Entity.js"
 import type { ConditionInput, ExpressionResult } from "../Expression.js"
 import { toAttributeMap } from "../Marshaller.js"
@@ -107,27 +121,34 @@ const conditionFields = (condition: ExpressionResult | undefined) =>
  * reason can be attributed back to the caller op that caused it.
  *
  * Before #113 this was implicit: one caller op produced exactly one item, so
- * `itemIndex === opIndex`. A `put` of an entity with `unique` / `retain` now
- * expands into several items, and the mapping has to be carried rather than
- * assumed — that is what this array is for.
+ * `itemIndex === opIndex`. A guarded put (#133) expands into several items,
+ * and the mapping has to be carried rather than assumed — that is what this
+ * array is for.
  */
 export interface ItemProvenance {
   /** Index into the caller's `operations` array. */
   readonly opIndex: number
-  readonly kind: "main" | "sentinel" | "snapshot"
   /**
-   * Set on the main Put of a versioned or unique-constrained entity: it may
-   * only create (#133). Replacing an existing item needs the stored item —
-   * to continue its version, snapshot it, rotate its sentinels — which a
-   * transaction compiled from the payload alone does not have.
+   * `"main"`: the op's own item. `"guarded"`: one of the items of a guarded put
+   * — see {@link GuardedPut}, which reads their cancellation reasons.
    */
-  readonly createOnly?: boolean | undefined
-  /** Set for `kind: "sentinel"` — which `unique` constraint the item reserves. */
-  readonly constraintName?: string | undefined
-  /** Set for `kind: "sentinel"` — the values reserved, for `UniqueConstraintViolation`. */
-  readonly fields?: Record<string, string> | undefined
+  readonly kind: "main" | "guarded"
   /** The entity the op targeted, so consumers can name it in an error. */
   readonly entityType: string
+}
+
+/**
+ * A put of a versioned or unique-constrained entity, planned from a fresh read
+ * of its item (#133) exactly as the entity's own `put` plans it: the item
+ * continued (or created past any retained history), its sentinels rotated —
+ * releasing only those it owns — and its retain snapshot.
+ */
+export interface GuardedPut {
+  /** Index into the caller's `operations` array. */
+  readonly opIndex: number
+  /** Where the plan's items start in `items`. */
+  readonly start: number
+  readonly plan: PutPlan
 }
 
 /** Compiled items plus the caller-op attribution for each one. */
@@ -135,18 +156,20 @@ export interface BuiltTransactWriteItems {
   readonly items: Array<TransactWriteItem>
   /** Parallel to `items`: `provenance[i]` describes `items[i]`. */
   readonly provenance: Array<ItemProvenance>
+  readonly guarded: ReadonlyArray<GuardedPut>
 }
 
 /**
  * Compile a list of Entity write ops into marshalled `TransactWriteItems` entries,
  * preserving caller order.
  *
- * **One caller op may emit several items.** A `put` of an entity with `unique`
- * constraints or `versioned: { retain: true }` expands into the main item plus
- * one guarded sentinel per satisfiable constraint plus the v1 snapshot — all
- * derived from the payload, so no read is needed (#113). `provenance` records
- * which caller op each emitted item belongs to; consumers that map cancellation
- * reasons positionally MUST use it instead of assuming 1:1.
+ * **One caller op may emit several items.** A put of a versioned or
+ * unique-constrained entity is a guarded put (#133): it reads the item, and
+ * emits the item guarded on what was read, plus its sentinel reservations and
+ * releases and its retain snapshot (see {@link GuardedPut}). `provenance`
+ * records which caller op each emitted item belongs to; consumers that map
+ * cancellation reasons positionally MUST use it instead of assuming 1:1, and
+ * read a guarded put's reasons through {@link judgeCancellation}.
  *
  * Does NOT enforce `TRANSACT_WRITE_ITEMS_LIMIT` — the caller counts, because the
  * total may include items this builder never sees (event puts, dedup sentinels).
@@ -155,9 +178,13 @@ export interface BuiltTransactWriteItems {
 export const buildTransactWriteItems = (
   operations: ReadonlyArray<TransactWriteOp>,
   operation: string,
-): Effect.Effect<BuiltTransactWriteItems, ValidationError, TableConfig> =>
+): Effect.Effect<
+  BuiltTransactWriteItems,
+  ValidationError | DynamoClientError,
+  TableConfig | DynamoClient
+> =>
   Effect.gen(function* () {
-    if (operations.length === 0) return { items: [], provenance: [] }
+    if (operations.length === 0) return { items: [], provenance: [], guarded: [] }
 
     const opInfos: Array<{
       type: "put" | "delete" | "conditionCheck"
@@ -226,6 +253,7 @@ export const buildTransactWriteItems = (
 
     const items: Array<TransactWriteItem> = []
     const provenance: Array<ItemProvenance> = []
+    const guarded: Array<GuardedPut> = []
     const push = (item: TransactWriteItem, from: ItemProvenance) => {
       items.push(item)
       provenance.push(from)
@@ -236,60 +264,34 @@ export const buildTransactWriteItems = (
 
       if (op.type === "put") {
         const built = yield* validateAndBuildPutItem(op.entity, op.input!, `${operation}.put`)
-        // `create` already may only create (its own condition, own error).
-        const createOnly =
-          op.putKind !== "create" &&
-          (op.entity._incarnationToken || op.entity._multiItemWriteFeatures.includes("unique"))
-        const pkField = op.entity.indexes.primary!.pk.field
-        const createCondition: ExpressionResult | undefined = createOnly
-          ? {
-              expression:
-                op.condition !== undefined
-                  ? `attribute_not_exists(#createOnly) AND (${op.condition.expression})`
-                  : "attribute_not_exists(#createOnly)",
-              names: { "#createOnly": pkField, ...op.condition?.names },
-              values: { ...op.condition?.values },
-            }
-          : op.condition
+        if (op.entity._incarnationToken || op.entity._multiItemWriteFeatures.includes("unique")) {
+          const plan = yield* op.entity._planPut({
+            tableName,
+            ttlAttrName: resolveTtlAttributeName(yield* op.entity._tableTag),
+            now: built.now,
+            item: built.item,
+            createdAtSupplied: built.createdAtSupplied,
+            userCondition: op.condition,
+            create: op.putKind === "create",
+            operation,
+            key: op.input!,
+          })
+          guarded.push({ opIndex: op.opIndex, start: items.length, plan })
+          for (const item of plan.items) {
+            push(item, { opIndex: op.opIndex, kind: "guarded", entityType: op.entity.entityType })
+          }
+          continue
+        }
         push(
           {
             Put: {
               TableName: tableName,
               Item: built.marshalled,
-              ...conditionFields(createCondition),
-              ...(createOnly && { ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const }),
+              ...conditionFields(op.condition),
             },
           },
-          {
-            opIndex: op.opIndex,
-            kind: "main",
-            entityType: op.entity.entityType,
-            ...(createOnly && { createOnly: true }),
-          },
+          { opIndex: op.opIndex, kind: "main", entityType: op.entity.entityType },
         )
-
-        // Uniqueness sentinels + the v1 retain snapshot. Emitted immediately
-        // after their item so a reader of the request sees them as one group;
-        // `provenance` is what actually carries the association.
-        const ttlAttrName = resolveTtlAttributeName(yield* op.entity._tableTag)
-        for (const side of op.entity._buildPutSideItems(built.item, built.now, ttlAttrName)) {
-          push(
-            {
-              Put: {
-                TableName: tableName,
-                Item: toAttributeMap(side.item),
-                ...(side.guard ?? {}),
-              },
-            },
-            {
-              opIndex: op.opIndex,
-              kind: side.kind,
-              constraintName: side.constraintName,
-              fields: side.fields,
-              entityType: op.entity.entityType,
-            },
-          )
-        }
       } else if (op.type === "delete") {
         push(
           {
@@ -316,5 +318,69 @@ export const buildTransactWriteItems = (
       }
     }
 
-    return { items, provenance }
+    return { items, provenance, guarded }
   })
+
+// ---------------------------------------------------------------------------
+// judgeCancellation
+// ---------------------------------------------------------------------------
+
+/** Attempts a transaction with guarded puts makes before it reports a lost race. */
+export const GUARDED_TRANSACTION_ATTEMPTS = 3
+
+/**
+ * What a cancelled transaction of {@link buildTransactWriteItems} items means,
+ * from its positional reasons (`offset`: where those items start in the
+ * request). In order of precedence:
+ *
+ * - `fail` — a guarded put's final verdict: a unique value is taken
+ *   (`UniqueConstraintViolation`) or its history conflicts (`ValidationError`).
+ *   Never a caller-condition error: the caller set none.
+ * - `conditions` — the caller ops whose OWN condition (`.condition()`,
+ *   `create()`'s, `Transaction.check`'s) rejected the write.
+ * - `retry` — a guarded put lost a race to a concurrent write (or met retained
+ *   history its read did not see): build and write the transaction again. Its
+ *   `error` is what to report when every attempt loses.
+ *
+ * `undefined`: no conditional failure among these items explains it.
+ */
+export const judgeCancellation = (
+  built: BuiltTransactWriteItems,
+  reasons: ReadonlyArray<WriteCancellationReason | undefined>,
+  offset = 0,
+):
+  | {
+      readonly _tag: "fail"
+      readonly opIndex: number
+      readonly error: UniqueConstraintViolation | ValidationError
+    }
+  | { readonly _tag: "conditions"; readonly opIndices: ReadonlyArray<number> }
+  | {
+      readonly _tag: "retry"
+      readonly error: OptimisticLockError | ConcurrentModification
+      readonly stored: Extract<PutVerdict, { readonly _tag: "Retry" }>["stored"]
+    }
+  | undefined => {
+  const conditions = new Set<number>()
+  let retry: Extract<PutVerdict, { readonly _tag: "Retry" }> | undefined
+  const inGuarded = new Set<number>()
+  for (const { opIndex, start, plan } of built.guarded) {
+    for (let i = 0; i < plan.items.length; i++) inGuarded.add(start + i)
+    const verdict = plan.verdict(reasons.slice(offset + start, offset + start + plan.items.length))
+    if (verdict === undefined) continue
+    if (verdict._tag === "Fail") return { _tag: "fail", opIndex, error: verdict.error }
+    if (verdict._tag === "Condition") conditions.add(opIndex)
+    else retry ??= verdict
+  }
+  for (let i = 0; i < built.items.length; i++) {
+    if (inGuarded.has(i)) continue
+    if (reasons[offset + i]?.Code !== "ConditionalCheckFailed") continue
+    const from = built.provenance[i]
+    if (from !== undefined) conditions.add(from.opIndex)
+  }
+  if (conditions.size > 0) {
+    return { _tag: "conditions", opIndices: [...conditions].sort((a, b) => a - b) }
+  }
+  if (retry !== undefined) return { _tag: "retry", error: retry.error, stored: retry.stored }
+  return undefined
+}

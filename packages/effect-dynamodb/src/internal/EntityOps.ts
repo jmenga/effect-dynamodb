@@ -359,6 +359,8 @@ export interface EntityPutOpts {
   readonly withVectors?: WithVectors | undefined
   /** Which put-shaped op is running (`create` fails on an existing item). */
   readonly putKind?: PutKind | undefined
+  /** The operation errors name — `upsert` runs its create through `put`. */
+  readonly operation?: string | undefined
 }
 
 /**

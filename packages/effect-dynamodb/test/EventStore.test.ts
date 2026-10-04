@@ -8,6 +8,7 @@ import {
   type DuplicateCommand,
   DynamoError,
   TRANSACT_WRITE_ITEMS_LIMIT,
+  type UniqueConstraintViolation,
   type ValidationError,
   VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
@@ -281,9 +282,11 @@ const mockPutItem = vi.fn()
 const mockGetItem = vi.fn()
 
 const TestDynamoClient = mockDynamoClientLayer({
+  // Unanswered, a query finds nothing — a guarded additional put of a missing
+  // retain item looks for its retained history (#133).
   query: (input) =>
     Effect.tryPromise({
-      try: () => mockQuery(input),
+      try: async () => (await mockQuery(input)) ?? { Items: [] },
       catch: (e) => new DynamoError({ operation: "Query", cause: e }),
     }),
   transactWriteItems: (input) =>
@@ -296,9 +299,10 @@ const TestDynamoClient = mockDynamoClientLayer({
       try: () => mockPutItem(input),
       catch: (e) => new DynamoError({ operation: "PutItem", cause: e }),
     }),
+  // Unanswered, a read finds no item (a guarded additional put reads its item).
   getItem: (input) =>
     Effect.tryPromise({
-      try: () => mockGetItem(input),
+      try: async () => (await mockGetItem(input)) ?? {},
       catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
     }),
 })
@@ -1312,28 +1316,31 @@ describe("EventStore", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("attributes a failed SENTINEL back to the caller's additionalItems index", () =>
-      Effect.gen(function* () {
-        // Layout: [event, reg row, reg sentinel, reg snapshot]. The sentinel is
-        // transaction index 2, but it belongs to caller additionalItems index 0.
-        // Before #113's provenance map, index 2 would have been read as caller
-        // index 1 — an index the caller never supplied.
-        mockTransactWriteItems.mockRejectedValue(
-          cancelled([
-            { Code: "None" },
-            { Code: "None" },
-            { Code: "ConditionalCheckFailed", Message: "code taken" },
-            { Code: "None" },
-          ]),
-        )
+    it.effect(
+      "a taken unique value is a UniqueConstraintViolation, not the caller's condition",
+      () =>
+        Effect.gen(function* () {
+          // Layout: [event, reg row, reg sentinel, reg snapshot]. The sentinel is
+          // transaction index 2, but it belongs to caller additionalItems index 0
+          // — whose caller set no condition, so it is not
+          // AdditionalItemConditionFailed: it is what `Registrations.put` reports
+          // for the same item (#133).
+          mockTransactWriteItems.mockRejectedValue(
+            cancelled([
+              { Code: "None" },
+              { Code: "None" },
+              { Code: "ConditionalCheckFailed", Message: "code taken" },
+              { Code: "None" },
+            ]),
+          )
 
-        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
-          additionalItems: [Registrations.put({ regId: "r-1", code: "C1" })],
-        }).pipe(Effect.flip)
+          const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+            additionalItems: [Registrations.put({ regId: "r-1", code: "C1" })],
+          }).pipe(Effect.flip)
 
-        expect(error._tag).toBe("AdditionalItemConditionFailed")
-        expect((error as AdditionalItemConditionFailed).indices).toEqual([0])
-      }).pipe(Effect.provide(TestLayer)),
+          expect(error._tag).toBe("UniqueConstraintViolation")
+          expect((error as UniqueConstraintViolation).fields).toEqual({ code: "C1" })
+        }).pipe(Effect.provide(TestLayer)),
     )
 
     it.effect("maps a later op's failure past an earlier op's expansion", () =>
@@ -1364,17 +1371,22 @@ describe("EventStore", () => {
 
     it.effect("reports one caller index even when several of its items fail", () =>
       Effect.gen(function* () {
+        // The row (its caller's condition) and its snapshot both fail.
         mockTransactWriteItems.mockRejectedValue(
           cancelled([
             { Code: "None" },
             { Code: "ConditionalCheckFailed" },
-            { Code: "ConditionalCheckFailed" },
             { Code: "None" },
+            { Code: "ConditionalCheckFailed" },
           ]),
         )
 
         const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
-          additionalItems: [Registrations.put({ regId: "r-1", code: "C1" })],
+          additionalItems: [
+            Registrations.put({ regId: "r-1", code: "C1" }).pipe(
+              Registrations.condition({ code: "C0" }),
+            ),
+          ],
         }).pipe(Effect.flip)
 
         expect(error._tag).toBe("AdditionalItemConditionFailed")

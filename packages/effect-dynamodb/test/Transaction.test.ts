@@ -184,8 +184,17 @@ const MainTable = Table.make({
 
 const mockTransactGetItems = vi.fn()
 const mockTransactWriteItems = vi.fn()
+const mockGetItem = vi.fn()
 
 const TestDynamoClient = mockDynamoClientLayer({
+  // A guarded put (versioned / unique) reads its item; unanswered, it is missing.
+  getItem: (input) =>
+    Effect.tryPromise({
+      try: async () => (await mockGetItem(input)) ?? {},
+      catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
+    }),
+  // …and a missing retain item looks for its retained history: none.
+  query: () => Effect.succeed({ Items: [] } as any),
   transactGetItems: (input) =>
     Effect.tryPromise({
       try: () => mockTransactGetItems(input),
@@ -915,10 +924,9 @@ describe("Transaction", () => {
         const snapshot = fromAttributeMap(items[2].Put.Item)
         expect(snapshot.sk).toBe("$myapp#v1#lifecyclemember#v#0000001")
         // Never over another incarnation's history (#133).
-        expect(items[2].Put.ConditionExpression).toBe("attribute_not_exists(#snap)")
-        // The item itself may only be created here: a replacing put needs the
-        // stored item (version, snapshot, sentinel rotation).
-        expect(items[0].Put.ConditionExpression).toBe("attribute_not_exists(#createOnly)")
+        expect(items[2].Put.ConditionExpression).toMatch(/^attribute_not_exists\(#snap\) OR /)
+        // The item was read missing: it must still be missing (#133).
+        expect(items[0].Put.ConditionExpression).toBe("attribute_not_exists(#pk)")
       }).pipe(Effect.provide(TestLayer)),
     )
 

@@ -19,6 +19,7 @@ import {
   type ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import { beforeEach, vi } from "vitest"
+import type { DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
@@ -78,17 +79,41 @@ const mockUpdateItem = vi.fn()
 const mockQuery = vi.fn()
 const mockTransactWriteItems = vi.fn()
 
+/**
+ * A write releases a unique sentinel only if the item owns it (#133), which it
+ * reads first (`ProjectionExpression: "#epk, #esk"`). Unless a test answers
+ * that read itself, the sentinel is owned by the item the write last read.
+ */
+let lastItemKey: Record<string, unknown> | undefined
+const isOwnershipRead = (input: { readonly ProjectionExpression?: string | undefined }) =>
+  input.ProjectionExpression === "#epk, #esk"
+
+const getItemThroughMock: DynamoClientService["getItem"] = (input) =>
+  Effect.tryPromise({
+    try: async () => {
+      if (!isOwnershipRead(input)) lastItemKey = input.Key
+      const answered = await mockGetItem(input)
+      if (answered !== undefined || !isOwnershipRead(input) || lastItemKey === undefined) {
+        return answered ?? {}
+      }
+      return { Item: { _entity_pk: lastItemKey.pk, _entity_sk: lastItemKey.sk } }
+    },
+    catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
+  }) as any
+/** An unanswered query finds nothing (a put of a missing retain item looks for its history). */
+const queryThroughMock: DynamoClientService["query"] = (input) =>
+  Effect.tryPromise({
+    try: async () => (await mockQuery(input)) ?? { Items: [] },
+    catch: (e) => new DynamoError({ operation: "Query", cause: e }),
+  })
+
 const TestDynamoClient = mockDynamoClientLayer({
   putItem: (input) =>
     Effect.tryPromise({
       try: () => mockPutItem(input),
       catch: (e) => new DynamoError({ operation: "PutItem", cause: e }),
     }),
-  getItem: (input) =>
-    Effect.tryPromise({
-      try: async () => (await mockGetItem(input)) ?? {},
-      catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
-    }),
+  getItem: getItemThroughMock,
   deleteItem: (input) =>
     Effect.tryPromise({
       try: () => mockDeleteItem(input),
@@ -99,11 +124,7 @@ const TestDynamoClient = mockDynamoClientLayer({
       try: () => mockUpdateItem(input),
       catch: (e) => new DynamoError({ operation: "UpdateItem", cause: e }),
     }),
-  query: (input) =>
-    Effect.tryPromise({
-      try: () => mockQuery(input),
-      catch: (e) => new DynamoError({ operation: "Query", cause: e }),
-    }),
+  query: queryThroughMock,
   transactWriteItems: (input) =>
     Effect.tryPromise({
       try: () => mockTransactWriteItems(input),
@@ -129,6 +150,7 @@ const TestLayerCustomTtl = Layer.merge(TestDynamoClient, TestTableConfigCustomTt
 describe("Entity", () => {
   beforeEach(() => {
     vi.resetAllMocks()
+    lastItemKey = undefined
   })
 
   describe("make", () => {
@@ -5312,15 +5334,12 @@ describe("Entity", () => {
     const mockBatchWriteItem = vi.fn()
 
     const RenamedTestDynamoClient = mockDynamoClientLayer({
-      getItem: (input) =>
+      getItem: getItemThroughMock,
+      query: queryThroughMock,
+      deleteItem: (input) =>
         Effect.tryPromise({
-          try: async () => (await mockGetItem(input)) ?? {},
-          catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
-        }),
-      query: (input) =>
-        Effect.tryPromise({
-          try: () => mockQuery(input),
-          catch: (e) => new DynamoError({ operation: "Query", cause: e }),
+          try: async () => (await mockDeleteItem(input)) ?? {},
+          catch: (e) => new DynamoError({ operation: "DeleteItem", cause: e }),
         }),
       transactWriteItems: (input) =>
         Effect.tryPromise({
@@ -5528,13 +5547,13 @@ describe("Entity", () => {
 
         yield* RenamedUniqHard.purge({ id: "u-1" }).asEffect()
 
+        // Released on its own, under the ownership condition (#133).
         const expected = sentinelKeyFor("RenamedUniqHard")
-        const call = mockBatchWriteItem.mock.calls[0]![0]
-        const keys = (call.RequestItems["test-table"] as Array<any>).map((r) => ({
-          pk: r.DeleteRequest.Key.pk.S,
-          sk: r.DeleteRequest.Key.sk.S,
-        }))
-        expect(keys).toContainEqual({ pk: expected.pk, sk: expected.sk })
+        const released = mockDeleteItem.mock.calls.map(([input]) => input)
+        expect(released.map((d: any) => ({ pk: d.Key.pk.S, sk: d.Key.sk.S }))).toEqual([
+          { pk: expected.pk, sk: expected.sk },
+        ])
+        expect(released[0].ConditionExpression).toBe("#epk = :epk AND #esk = :esk")
       }).pipe(Effect.provide(RenamedTestLayer)),
     )
 
@@ -5570,12 +5589,10 @@ describe("Entity", () => {
         yield* RenamedUniqSoft.purge({ id: "u-9" }).asEffect()
 
         const expected = sentinelKeyFor("RenamedUniqSoft")
-        const call = mockBatchWriteItem.mock.calls[0]![0]
-        const keys = (call.RequestItems["test-table"] as Array<any>).map((r) => ({
-          pk: r.DeleteRequest.Key.pk.S,
-          sk: r.DeleteRequest.Key.sk.S,
-        }))
-        expect(keys).toContainEqual({ pk: expected.pk, sk: expected.sk })
+        const released = mockDeleteItem.mock.calls.map(([input]) => input)
+        expect(released.map((d: any) => ({ pk: d.Key.pk.S, sk: d.Key.sk.S }))).toEqual([
+          { pk: expected.pk, sk: expected.sk },
+        ])
       }).pipe(Effect.provide(RenamedTestLayer)),
     )
 
@@ -8636,8 +8653,10 @@ describe("Entity", () => {
         const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems as Array<any>
         expect(items[0].Delete.ConditionExpression).toBeDefined()
         expect(Object.values(items[0].Delete.ExpressionAttributeNames)).toContain("role")
-        // Sentinel deletes stay unconditional — index-0 attribution depends on it.
-        expect(items[1].Delete.ConditionExpression).toBeUndefined()
+        // The sentinel release is conditioned only on the item still owning it
+        // (#133) — the user's condition stays on index 0 alone.
+        expect(items[1].Delete.ConditionExpression).toBe("#epk = :epk AND #esk = :esk")
+        expect(Object.values(items[1].Delete.ExpressionAttributeNames)).not.toContain("role")
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -8723,7 +8742,7 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("a cancellation NOT at index 0 stays a DynamoError", () =>
+    it.effect("a cancellation NOT at index 0 is never the user's condition", () =>
       Effect.gen(function* () {
         mockGetItem.mockResolvedValueOnce({ Item: storedUser() })
         const txError = new Error("TransactionCanceledException")
@@ -8747,7 +8766,9 @@ describe("Entity", () => {
           .pipe(Unique.condition({ role: "member" }))
           .asEffect()
           .pipe(Effect.flip)
-        expect(error._tag).toBe("DynamoError")
+        // Index 1 is the sentinel release: its reservation changed hands (#133).
+        expect(error._tag).toBe("ConcurrentModification")
+        expect((error as any).attributes).toEqual(["email"])
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -8763,6 +8784,243 @@ describe("Entity", () => {
         expect(error._tag).toBe("ValidationError")
         expect(String((error as any).cause)).toContain("EDD-9047")
         expect(mockQuery).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  // ---------------------------------------------------------------------------
+  // Sentinel ownership (#133): a write never releases a sentinel it doesn't own
+  // ---------------------------------------------------------------------------
+
+  describe("sentinel ownership", () => {
+    const Owned = withConfig(
+      Entity.make({
+        model: User,
+        entityType: "OwnedUser",
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        unique: { email: ["email"] },
+        versioned: true,
+      }),
+    )
+    const SoftOwned = withConfig(
+      Entity.make({
+        model: User,
+        entityType: "SoftOwnedUser",
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        unique: { email: ["email"] },
+        softDelete: true,
+      }),
+    )
+    const stored = (entityType: string) =>
+      toAttributeMap({
+        userId: "u-1",
+        email: "x@x.io",
+        displayName: "Alice",
+        role: "admin",
+        version: 1,
+        __edd_i__: "inc-1",
+        pk: `$myapp#v1#${entityType.toLowerCase()}#u-1`,
+        sk: `$myapp#v1#${entityType.toLowerCase()}`,
+        __edd_e__: entityType,
+      })
+    /** The x@x.io sentinel belongs to `owner` (u-1 is the item written). */
+    const withSentinelOwnedBy = (entityType: string, owner: string) =>
+      mockGetItem.mockImplementation(async (input: any) => {
+        if (String(input.Key.pk.S).includes(".email#")) {
+          return {
+            Item: toAttributeMap({
+              pk: input.Key.pk.S,
+              sk: input.Key.sk.S,
+              _entity_pk: `$myapp#v1#${entityType.toLowerCase()}#userid_${owner}`,
+              _entity_sk: `$myapp#v1#${entityType.toLowerCase()}`,
+            }),
+          }
+        }
+        return { Item: stored(entityType) }
+      })
+    const sentinelDeletes = () =>
+      (mockTransactWriteItems.mock.calls[0]?.[0]?.TransactItems ?? []).filter(
+        (t: any) => t.Delete !== undefined && String(t.Delete.Key.pk.S).includes(".email#"),
+      )
+
+    for (const [label, write] of [
+      [
+        "update",
+        () =>
+          Owned.update({ userId: "u-1" })
+            .pipe(Entity.set({ email: "y@x.io" }))
+            .asEffect(),
+      ],
+      [
+        "put",
+        () =>
+          Owned.put({
+            userId: "u-1",
+            email: "y@x.io",
+            displayName: "Alice",
+            role: "admin",
+          }).asEffect(),
+      ],
+      ["delete", () => Owned.delete({ userId: "u-1" }).asEffect()],
+    ] as const) {
+      it.effect(`${label} leaves a sentinel another item owns`, () =>
+        Effect.gen(function* () {
+          withSentinelOwnedBy("OwnedUser", "u-2")
+          mockTransactWriteItems.mockResolvedValueOnce({})
+          yield* write()
+          expect(
+            sentinelDeletes().filter((t: any) => t.Delete.Key.pk.S.includes("x@x.io")),
+          ).toEqual([])
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect(`${label} releases its own sentinel only while it still owns it`, () =>
+        Effect.gen(function* () {
+          withSentinelOwnedBy("OwnedUser", "u-1")
+          mockTransactWriteItems.mockResolvedValueOnce({})
+          yield* write()
+          const [release] = sentinelDeletes()
+          expect(release.Delete.Key.pk.S).toContain("x@x.io")
+          expect(release.Delete.ConditionExpression).toBe("#epk = :epk AND #esk = :esk")
+          expect(release.Delete.ExpressionAttributeValues[":epk"]).toEqual({
+            S: "$myapp#v1#owneduser#userid_u-1",
+          })
+        }).pipe(Effect.provide(TestLayer)),
+      )
+    }
+
+    it.effect("a soft delete leaves a sentinel another item owns", () =>
+      Effect.gen(function* () {
+        withSentinelOwnedBy("SoftOwnedUser", "u-2")
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        yield* SoftOwned.delete({ userId: "u-1" }).asEffect()
+        expect(sentinelDeletes()).toEqual([])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  // ---------------------------------------------------------------------------
+  // What a guarded put / upsert reads (#133)
+  // ---------------------------------------------------------------------------
+
+  describe("guarded put and upsert reads", () => {
+    const Guarded = withConfig(
+      Entity.make({
+        model: User,
+        entityType: "GuardedUser",
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        unique: { email: ["email"] },
+        versioned: true,
+        timestamps: true,
+      }),
+    )
+    const Bare = withConfig(
+      Entity.make({
+        model: User,
+        entityType: "BareUser",
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        unique: { email: ["email"] },
+      }),
+    )
+    const user = {
+      userId: "u-1",
+      email: "a@x.io",
+      displayName: "Alice",
+      role: "admin",
+    } as const
+    const stored = (entityType: string, extra: Record<string, unknown> = {}) =>
+      toAttributeMap({
+        ...user,
+        pk: `$myapp#v1#${entityType.toLowerCase()}#userid_u-1`,
+        sk: `$myapp#v1#${entityType.toLowerCase()}`,
+        __edd_e__: entityType,
+        ...extra,
+      })
+    const cancelled = (reasons: ReadonlyArray<Record<string, unknown>>) =>
+      Object.assign(new Error("cancelled"), {
+        name: "TransactionCanceledException",
+        CancellationReasons: reasons,
+      })
+
+    it.effect("create reads nothing: the item must be missing anyway", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        const created = yield* Guarded.create(user).pipe(Entity.asRecord)
+        expect(mockGetItem).not.toHaveBeenCalled()
+        expect(created.version).toBe(1)
+        const [main] = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        expect(main.Put.ConditionExpression).toContain("attribute_not_exists(#pk)")
+        expect(main.Put.Item.__edd_i__.S).toMatch(/^[0-9a-f-]{36}$/)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an upsert of an existing unique item reads it once", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce({
+          Item: stored("GuardedUser", { version: 1, __edd_i__: "inc-1" }),
+        })
+        mockUpdateItem.mockImplementationOnce(async (input: any) => ({
+          Attributes: applyUpdate(stored("GuardedUser", { version: 1, __edd_i__: "inc-1" }), {
+            ...input,
+            ReturnValues: "ALL_NEW",
+          }),
+        }))
+        const upserted = yield* Guarded.upsert({ ...user, displayName: "Alicia" }).asEffect()
+        expect(upserted.displayName).toBe("Alicia")
+        expect(mockGetItem).toHaveBeenCalledTimes(1)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an upsert that races every attempt fails with the concurrency error", () =>
+      Effect.gen(function* () {
+        // Each attempt: read missing → create collides with an item created
+        // since; read present → its update finds it deleted since.
+        let present = false
+        mockGetItem.mockImplementation(async () => {
+          present = !present
+          return present ? {} : { Item: stored("BareUser") }
+        })
+        mockTransactWriteItems.mockRejectedValue(
+          cancelled([
+            { Code: "ConditionalCheckFailed", Item: stored("BareUser") },
+            { Code: "None" },
+          ]),
+        )
+        mockUpdateItem.mockRejectedValue(
+          Object.assign(new Error("ccf"), { name: "ConditionalCheckFailedException" }),
+        )
+        const error = yield* Bare.upsert({ ...user, displayName: "Alicia" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ConcurrentModification")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("errors from an upsert's create name the upsert", () =>
+      Effect.gen(function* () {
+        // Missing: the upsert creates — under a condition DynamoDB can't take.
+        const error = yield* Guarded.upsert(user)
+          .pipe(
+            Guarded.condition((t: any, { or, eq }: any) =>
+              or(...Array.from({ length: 160 }, (_, i) => eq(t.displayName, `n${i}`))),
+            ),
+          )
+          .asEffect()
+          .pipe(Effect.flip)
+        expect([error._tag, (error as any).operation]).toEqual(["ValidationError", "upsert"])
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )
   })

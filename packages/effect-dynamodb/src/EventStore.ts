@@ -19,11 +19,14 @@ import { normalizeTtlSeconds } from "@effect-dynamodb/schema/Entity.js"
 import {
   AdditionalItemConditionFailed,
   AppendTooLarge,
+  type ConcurrentModification,
   DuplicateCommand,
   isAwsConditionalCheckFailed,
   isAwsTransactionCancelled,
+  type OptimisticLockError,
   TRANSACT_WRITE_ITEMS_LIMIT,
   TransactionCancelled,
+  type UniqueConstraintViolation,
   ValidationError,
   VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
@@ -41,6 +44,8 @@ import {
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import {
   buildTransactWriteItems,
+  GUARDED_TRANSACTION_ATTEMPTS,
+  judgeCancellation,
   type TransactWriteItem,
   type TransactWriteOp,
 } from "./internal/TransactWriteOps.js"
@@ -225,6 +230,9 @@ export type AppendError =
   | DynamoClientError
   | ValidationError
   | TransactionCancelled
+  | UniqueConstraintViolation
+  | OptimisticLockError
+  | ConcurrentModification
 
 // ---------------------------------------------------------------------------
 // StreamIdInput — maps composite field names to a required record
@@ -711,177 +719,202 @@ export const makeStream = <
           }
         }),
       )
-      // Caller-owned items, compiled through the same builder
-      // `Transaction.transactWrite` uses, so the two APIs cannot drift.
-      const { items: additionalItems, provenance: additionalProvenance } =
-        yield* buildTransactWriteItems(additionalOps, "EventStore.append.additionalItems")
+      // A guarded put among the additional items reads its item; a race with
+      // that read cancels the append, which is then built and written again.
+      let lost: OptimisticLockError | ConcurrentModification | undefined
+      for (let attempt = 0; attempt < GUARDED_TRANSACTION_ATTEMPTS; attempt++) {
+        // Caller-owned items, compiled through the same builder
+        // `Transaction.transactWrite` uses, so the two APIs cannot drift.
+        const additional = yield* buildTransactWriteItems(
+          additionalOps,
+          "EventStore.append.additionalItems",
+        )
+        const additionalItems = additional.items
 
-      // Authoritative cap check: one additional op can compile to several items
-      // (#113), so the pre-flight lower bound above is not sufficient. Reporting
-      // the EXPANDED count is the point — "you passed 40 items" when the caller
-      // passed 30 ops is baffling without it.
-      if (fixedItems + additionalItems.length > TRANSACT_WRITE_ITEMS_LIMIT) {
-        return yield* new AppendTooLarge({
-          streamName: config.streamName,
-          streamId: streamIdStr,
-          count: fixedItems + additionalItems.length,
-          limit: TRANSACT_WRITE_ITEMS_LIMIT,
-        })
-      }
-
-      // Version-contiguity guard: `attribute_not_exists(pk)` on the event puts
-      // only rejects STALE expected versions (the target slot already exists).
-      // An AHEAD expectedVersion (e.g. 10 when the stream is at 3) would
-      // silently write from version 11, leaving a permanent gap. When
-      // expectedVersion > 0, require the event at exactly `expectedVersion` to
-      // exist so the appended range is contiguous with the stream head. Its
-      // failure surfaces as a ConditionalCheckFailed cancellation reason,
-      // mapping to VersionConflict below just like a stale-version Put failure.
-      //
-      // Only when events are actually being written: the guard exists to stop an
-      // AHEAD expectedVersion opening a permanent gap, and a zero-event append
-      // (pure `additionalItems` / sentinel side-write) writes no version and so
-      // can open no gap.
-      const contiguityCheck: Array<TransactWriteItem> = needsContiguityCheck
-        ? [
-            {
-              ConditionCheck: {
-                TableName: tableName,
-                Key: toAttributeMap({ pk, sk: composeEventSk(expectedVersion) }),
-                ConditionExpression: "attribute_exists(pk)",
-              },
-            },
-          ]
-        : []
-
-      // Item layout is load-bearing — cancellation reasons are positional:
-      //   [0, C)                version-contiguity ConditionCheck (C is 0 or 1)
-      //   [C, C + E)            event puts
-      //   [C + E, C + E + A)    additional ITEMS (caller op order preserved)
-      //   C + E + A             idempotency sentinel (last, so adding it never
-      //                         shifts the additional-item indices the caller sees)
-      //
-      // `A` is the count of EMITTED items, which is >= the number of caller ops:
-      // a `unique` / `retain` put expands into its item plus sentinels plus a
-      // snapshot (#113). The 1:1 "item index == caller index" assumption is gone,
-      // so the reason mapping below goes through `additionalProvenance` — the
-      // caller-facing `indices` on `AdditionalItemConditionFailed` are still
-      // indices into the caller's `additionalItems` array, unchanged.
-      const transactItems: Array<TransactWriteItem> = [
-        ...contiguityCheck,
-        ...eventItems,
-        ...additionalItems,
-      ]
-      const checkCount = contiguityCheck.length
-      const eventCount = eventItems.length
-      const additionalCount = additionalItems.length
-      const sentinelIndex = idempotency !== undefined ? transactItems.length : -1
-
-      if (idempotency !== undefined) {
-        const sentinel: Record<string, unknown> = {
-          pk,
-          sk: DynamoSchema.composeKey(schema, commandKeyLabel, [idempotency.commandId], keyOptions),
-          __edd_e__: commandEntityType,
-          streamId: streamIdStr,
-          commandId: idempotency.commandId,
-          version: expectedVersion + events.length,
-          timestamp: now,
-        }
-        if (idempotency.ttl !== undefined) {
-          const ttlSeconds = yield* Effect.try({
-            try: () => normalizeTtlSeconds(idempotency.ttl as Duration.Duration | string),
-            catch: (cause) =>
-              new ValidationError({
-                entityType: commandEntityType,
-                operation: "EventStore.append.idempotency.ttl",
-                cause,
-              }),
+        // Authoritative cap check: one additional op can compile to several items
+        // (#113), so the pre-flight lower bound above is not sufficient. Reporting
+        // the EXPANDED count is the point — "you passed 40 items" when the caller
+        // passed 30 ops is baffling without it.
+        if (fixedItems + additionalItems.length > TRANSACT_WRITE_ITEMS_LIMIT) {
+          return yield* new AppendTooLarge({
+            streamName: config.streamName,
+            streamId: streamIdStr,
+            count: fixedItems + additionalItems.length,
+            limit: TRANSACT_WRITE_ITEMS_LIMIT,
           })
-          sentinel[resolveTtlAttributeName(tableConfig)] =
-            DateTime.toEpochSeconds(nowDateTime) + ttlSeconds
         }
-        transactItems.push({
-          Put: {
-            TableName: tableName,
-            Item: toAttributeMap(sentinel),
-            ConditionExpression: "attribute_not_exists(pk)",
-          },
-        })
+
+        // Version-contiguity guard: `attribute_not_exists(pk)` on the event puts
+        // only rejects STALE expected versions (the target slot already exists).
+        // An AHEAD expectedVersion (e.g. 10 when the stream is at 3) would
+        // silently write from version 11, leaving a permanent gap. When
+        // expectedVersion > 0, require the event at exactly `expectedVersion` to
+        // exist so the appended range is contiguous with the stream head. Its
+        // failure surfaces as a ConditionalCheckFailed cancellation reason,
+        // mapping to VersionConflict below just like a stale-version Put failure.
+        //
+        // Only when events are actually being written: the guard exists to stop an
+        // AHEAD expectedVersion opening a permanent gap, and a zero-event append
+        // (pure `additionalItems` / sentinel side-write) writes no version and so
+        // can open no gap.
+        const contiguityCheck: Array<TransactWriteItem> = needsContiguityCheck
+          ? [
+              {
+                ConditionCheck: {
+                  TableName: tableName,
+                  Key: toAttributeMap({ pk, sk: composeEventSk(expectedVersion) }),
+                  ConditionExpression: "attribute_exists(pk)",
+                },
+              },
+            ]
+          : []
+
+        // Item layout is load-bearing — cancellation reasons are positional:
+        //   [0, C)                version-contiguity ConditionCheck (C is 0 or 1)
+        //   [C, C + E)            event puts
+        //   [C + E, C + E + A)    additional ITEMS (caller op order preserved)
+        //   C + E + A             idempotency sentinel (last, so adding it never
+        //                         shifts the additional-item indices the caller sees)
+        //
+        // `A` is the count of EMITTED items, which is >= the number of caller ops:
+        // a guarded put (#133) expands into its item plus its sentinel
+        // reservations and releases plus a snapshot. The 1:1 "item index == caller
+        // index" assumption is gone, so the reason mapping below goes through
+        // `judgeCancellation` — the caller-facing `indices` on
+        // `AdditionalItemConditionFailed` are still indices into the caller's
+        // `additionalItems` array, unchanged.
+        const transactItems: Array<TransactWriteItem> = [
+          ...contiguityCheck,
+          ...eventItems,
+          ...additionalItems,
+        ]
+        const checkCount = contiguityCheck.length
+        const eventCount = eventItems.length
+        const sentinelIndex = idempotency !== undefined ? transactItems.length : -1
+
+        if (idempotency !== undefined) {
+          const sentinel: Record<string, unknown> = {
+            pk,
+            sk: DynamoSchema.composeKey(
+              schema,
+              commandKeyLabel,
+              [idempotency.commandId],
+              keyOptions,
+            ),
+            __edd_e__: commandEntityType,
+            streamId: streamIdStr,
+            commandId: idempotency.commandId,
+            version: expectedVersion + events.length,
+            timestamp: now,
+          }
+          if (idempotency.ttl !== undefined) {
+            const ttlSeconds = yield* Effect.try({
+              try: () => normalizeTtlSeconds(idempotency.ttl as Duration.Duration | string),
+              catch: (cause) =>
+                new ValidationError({
+                  entityType: commandEntityType,
+                  operation: "EventStore.append.idempotency.ttl",
+                  cause,
+                }),
+            })
+            sentinel[resolveTtlAttributeName(tableConfig)] =
+              DateTime.toEpochSeconds(nowDateTime) + ttlSeconds
+          }
+          transactItems.push({
+            Put: {
+              TableName: tableName,
+              Item: toAttributeMap(sentinel),
+              ConditionExpression: "attribute_not_exists(pk)",
+            },
+          })
+        }
+
+        const outcome = yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
+          Effect.as(undefined),
+          Effect.catch(
+            (
+              error: DynamoClientError,
+            ): Effect.Effect<OptimisticLockError | ConcurrentModification, AppendError> => {
+              if (!isAwsTransactionCancelled(error.cause)) {
+                return Effect.fail(error)
+              }
+              const rawReasons = error.cause.CancellationReasons ?? []
+              const reasons = rawReasons.map((r) => ({
+                code: r?.Code,
+                message: r?.Message,
+              }))
+              const failedAt = (index: number): boolean =>
+                index >= 0 && reasons[index]?.code === "ConditionalCheckFailed"
+
+              // Precedence is ordered by how terminal the caller's response should
+              // be: a duplicate can never succeed on retry, a version conflict
+              // invites a re-read, and only then are the additional items judged.
+              if (idempotency !== undefined && failedAt(sentinelIndex)) {
+                return Effect.fail(
+                  new DuplicateCommand({
+                    streamName: config.streamName,
+                    streamId: streamIdStr,
+                    commandId: idempotency.commandId,
+                  }),
+                )
+              }
+
+              // The contiguity ConditionCheck and the event puts both mean "the
+              // stream is not where you said it was", so they share one verdict.
+              for (let i = 0; i < checkCount + eventCount; i++) {
+                if (failedAt(i)) {
+                  return Effect.fail(
+                    new VersionConflict({
+                      streamName: config.streamName,
+                      streamId: streamIdStr,
+                      expectedVersion,
+                    }),
+                  )
+                }
+              }
+
+              // The additional items, attributed back to the caller OPS that
+              // produced them (several items can belong to one op). Only an op's
+              // own condition is `AdditionalItemConditionFailed`: a guarded put
+              // the caller set no condition on reports what the entity's own put
+              // would — a taken unique value, a history conflict — or, having
+              // lost a race to a concurrent write, is written again (#133).
+              const judged = judgeCancellation(additional, rawReasons, checkCount + eventCount)
+              if (judged?._tag === "fail") return Effect.fail(judged.error)
+              if (judged?._tag === "conditions") {
+                return Effect.fail(
+                  new AdditionalItemConditionFailed({
+                    streamName: config.streamName,
+                    streamId: streamIdStr,
+                    indices: judged.opIndices,
+                    reasons,
+                  }),
+                )
+              }
+              if (judged?._tag === "retry") return Effect.succeed(judged.error)
+
+              // No conditional failure we can positionally justify (throttling,
+              // TransactionConflict, or a truncated/absent reason list) — never
+              // guess a VersionConflict.
+              return Effect.fail(
+                new TransactionCancelled({
+                  operation: "TransactWriteItems",
+                  reasons,
+                  cause: error.cause,
+                }),
+              )
+            },
+          ),
+        )
+        if (outcome === undefined) {
+          return {
+            version: expectedVersion + events.length,
+            events,
+          }
+        }
+        lost = outcome
       }
-
-      yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
-        Effect.mapError((error) => {
-          if (!isAwsTransactionCancelled(error.cause)) {
-            return error as AppendError
-          }
-          const reasons = (error.cause.CancellationReasons ?? []).map((r) => ({
-            code: r?.Code,
-            message: r?.Message,
-          }))
-          const failedAt = (index: number): boolean =>
-            index >= 0 && reasons[index]?.code === "ConditionalCheckFailed"
-
-          // Precedence is ordered by how terminal the caller's response should
-          // be: a duplicate can never succeed on retry, a version conflict
-          // invites a re-read, and only then is the caller's own condition the
-          // most specific explanation left.
-          if (idempotency !== undefined && failedAt(sentinelIndex)) {
-            return new DuplicateCommand({
-              streamName: config.streamName,
-              streamId: streamIdStr,
-              commandId: idempotency.commandId,
-            }) as AppendError
-          }
-
-          // The contiguity ConditionCheck and the event puts both mean "the
-          // stream is not where you said it was", so they share one verdict.
-          for (let i = 0; i < checkCount + eventCount; i++) {
-            if (failedAt(i)) {
-              return new VersionConflict({
-                streamName: config.streamName,
-                streamId: streamIdStr,
-                expectedVersion,
-              }) as AppendError
-            }
-          }
-
-          // Attribute each failed additional ITEM back to the caller OP that
-          // produced it. Several items can belong to one op (its main item, its
-          // sentinels, its snapshot), so indices are deduped — a caller who
-          // passed one op must never see it reported twice.
-          const failedOps = new Set<number>()
-          for (let i = 0; i < additionalCount; i++) {
-            if (!failedAt(checkCount + eventCount + i)) continue
-            const from = additionalProvenance[i]
-            // A reason with no provenance entry cannot be justified positionally;
-            // fall through to TransactionCancelled rather than guess.
-            if (from !== undefined) failedOps.add(from.opIndex)
-          }
-          const failedAdditional = Array.from(failedOps).sort((a, b) => a - b)
-          if (failedAdditional.length > 0) {
-            return new AdditionalItemConditionFailed({
-              streamName: config.streamName,
-              streamId: streamIdStr,
-              indices: failedAdditional,
-              reasons,
-            }) as AppendError
-          }
-
-          // No conditional failure we can positionally justify (throttling,
-          // TransactionConflict, or a truncated/absent reason list) — never
-          // guess a VersionConflict.
-          return new TransactionCancelled({
-            operation: "TransactWriteItems",
-            reasons,
-            cause: error.cause,
-          }) as AppendError
-        }),
-      )
-
-      return {
-        version: expectedVersion + events.length,
-        events,
-      }
+      return yield* Effect.fail(lost!)
     })
 
   // ---------------------------------------------------------------------------
@@ -1329,6 +1362,9 @@ type CommandHandlerErrors<E> =
   | DynamoClientError
   | ValidationError
   | TransactionCancelled
+  | UniqueConstraintViolation
+  | OptimisticLockError
+  | ConcurrentModification
 
 type CommandHandler<
   State,

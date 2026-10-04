@@ -317,6 +317,8 @@ export const validateAndBuildPutItem = (
     readonly item: Record<string, unknown>
     readonly marshalled: Record<string, import("@aws-sdk/client-dynamodb").AttributeValue>
     readonly now: DateTime.Utc
+    /** Whether the input supplied `createdAt` (a replacing put keeps the stored one otherwise). */
+    readonly createdAtSupplied: boolean
   },
   ValidationError
 > =>
@@ -367,6 +369,7 @@ export const validateAndBuildPutItem = (
     // (already encoded to wire by `Schema.encode`); else generate a wire
     // primitive directly.
     const sf = entity.systemFields
+    const createdAtSupplied = sf.createdAt !== null && item[sf.createdAt] !== undefined
     if (sf.createdAt) {
       if (item[sf.createdAt] === undefined) {
         item[sf.createdAt] = generateTimestampPrimitive(now, sf.createdAtEncoding)
@@ -400,5 +403,5 @@ export const validateAndBuildPutItem = (
       })
     }
 
-    return { item, marshalled: toAttributeMap(item), now }
+    return { item, marshalled: toAttributeMap(item), now, createdAtSupplied }
   })

@@ -8185,6 +8185,56 @@ describeConnected("EventStore — additionalItems + idempotency (closes #85)", (
     }).pipe(provideEsIdem),
   )
 
+  it.effect("keeps a versioned read model in step across appends (#133)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+      const client = yield* DynamoClient
+      const stored = () =>
+        client
+          .getItem({
+            TableName: esIdemTableName,
+            Key: {
+              pk: { S: "$es-idem#v1#esstatus#matchid_proj-3" },
+              sk: { S: "$es-idem#v1#esstatus" },
+            },
+            ConsistentRead: true,
+          })
+          .pipe(Effect.map((r) => fromAttributeMap(r.Item!) as Record<string, any>))
+
+      yield* EsIdemMatchEvents.append(
+        { matchId: "proj-3" },
+        [new EsIdemMatchStarted({ venue: "Eden Park" })],
+        0,
+        {
+          additionalItems: [
+            db.entities.EsStatusProjection.put({ matchId: "proj-3", state: "IN_PROGRESS" }),
+          ],
+        },
+      )
+      const first = yield* stored()
+      // The second append replaces the existing versioned row — no condition
+      // was set, so nothing may fail as one.
+      yield* EsIdemMatchEvents.append(
+        { matchId: "proj-3" },
+        [new EsIdemInningsCompleted({ innings: 1, runs: 250 })],
+        1,
+        {
+          additionalItems: [
+            db.entities.EsStatusProjection.put({ matchId: "proj-3", state: "INNINGS_BREAK" }),
+          ],
+        },
+      )
+      const second = yield* stored()
+      expect([second.state, second.version]).toEqual(["INNINGS_BREAK", 2])
+      expect(second.createdAt).toBe(first.createdAt)
+      expect(second.__edd_i__).toBe(first.__edd_i__)
+      expect(yield* EsIdemMatchEvents.read({ matchId: "proj-3" })).toHaveLength(2)
+    }).pipe(provideEsIdem),
+  )
+
   it.effect("Transaction.transactWrite accepts bound builders from a pure entity (#100)", () =>
     Effect.gen(function* () {
       const db = yield* DynamoClient.make({
@@ -14350,7 +14400,7 @@ const g133Closed = <A, E>(effect: Effect.Effect<A, E, unknown>): Effect.Effect<A
 /** A hook's effect with its layers' scope closed, so it can run anywhere. */
 const g133Hook = (effect: Effect.Effect<void, unknown, any>): Effect.Effect<void, unknown> =>
   Effect.scoped(effect) as Effect.Effect<void, unknown>
-/** One-shot hooks run around the next UpdateItem / TransactWriteItems. */
+/** One-shot hooks run around the next PutItem / UpdateItem / TransactWriteItems. */
 const g133Inject: {
   before?: Effect.Effect<void, unknown> | undefined
   after?: Effect.Effect<void, unknown> | undefined
@@ -14372,6 +14422,7 @@ const G133InjectingClient = Layer.effect(
       })
     return {
       ...real,
+      putItem: (input) => around(real.putItem(input)),
       updateItem: (input) => around(real.updateItem(input)),
       transactWriteItems: (input) => around(real.transactWriteItems(input)),
     } satisfies DynamoClientService
@@ -15062,41 +15113,53 @@ describeConnected("#133 — path operations on index composites and unique field
       }).pipe(Effect.provide(ClientLayer)),
     )
   /**
-   * A new incarnation of the item at version 1 — written raw: the library's own
-   * put refuses to re-create a retain item over an earlier incarnation's
-   * `v#0000001` (history is never overwritten), so this is the outside writer
-   * (or a pre-#133 library) the incarnation proof defends against.
+   * A new incarnation of the item at version 1 — written raw, as an outside
+   * writer (or a pre-#133 library) would: the library's own re-create continues
+   * the version sequence past the earlier incarnation's history. `withHistory`
+   * also writes this incarnation's own `v#0000001` snapshot.
    */
-  const recreateRaw = (id: string, label: string) =>
+  const recreateRaw = (id: string, label: string, withHistory = false) =>
     Effect.gen(function* () {
       const client = yield* DynamoClient
-      yield* client.putItem({
-        TableName: g133Tables.record,
-        Item: {
-          ...mainKey("G133DeviceRetained", id),
-          __edd_e__: { S: "G133DeviceRetained" },
-          __edd_i__: { S: crypto.randomUUID() },
-          id: { S: id },
-          owner: { S: "o" },
-          label: { S: label },
-          version: { N: "1" },
-          createdAt: { S: "1970-01-01T00:00:00.000Z" },
-          updatedAt: { S: "1970-01-01T00:00:00.000Z" },
-        },
-      })
+      const item = {
+        ...mainKey("G133DeviceRetained", id),
+        __edd_e__: { S: "G133DeviceRetained" },
+        __edd_i__: { S: crypto.randomUUID() },
+        id: { S: id },
+        owner: { S: "o" },
+        label: { S: label },
+        version: { N: "1" },
+        createdAt: { S: "1970-01-01T00:00:00.000Z" },
+        updatedAt: { S: "1970-01-01T00:00:00.000Z" },
+      }
+      yield* client.putItem({ TableName: g133Tables.record, Item: item })
+      if (withHistory) {
+        yield* client.putItem({
+          TableName: g133Tables.record,
+          Item: { ...item, sk: { S: "$edd133g#v1#g133deviceretained#v#0000001" } },
+        })
+      }
     }).pipe(Effect.provide(ClientLayer))
-  const recreate = (id: string, label: string) => g133Hook(recreateRaw(id, label))
+  const recreate = (id: string, label: string, withHistory = false) =>
+    g133Hook(recreateRaw(id, label, withHistory))
+  const snapshotKey = (id: string, version: number) => ({
+    pk: { S: `$edd133g#v1#g133deviceretained#id_${id}` },
+    sk: { S: `$edd133g#v1#g133deviceretained#v#${String(version).padStart(7, "0")}` },
+  })
   const snapshotRow = (id: string, version: number) =>
     Effect.gen(function* () {
       const client = yield* DynamoClient
       return (yield* client.getItem({
         TableName: g133Tables.record,
-        Key: {
-          pk: { S: `$edd133g#v1#g133deviceretained#id_${id}` },
-          sk: { S: `$edd133g#v1#g133deviceretained#v#${String(version).padStart(7, "0")}` },
-        },
+        Key: snapshotKey(id, version),
         ConsistentRead: true,
       })).Item as Record<string, any> | undefined
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+  /** A snapshot gone — as a `versioned.ttl` expiry removes the oldest first. */
+  const dropSnapshot = (id: string, version: number) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      yield* client.deleteItem({ TableName: g133Tables.record, Key: snapshotKey(id, version) })
     }).pipe(Effect.provide(ClientLayer), Effect.scoped)
 
   for (const [label, after] of [
@@ -15113,17 +15176,20 @@ describeConnected("#133 — path operations on index composites and unique field
           const db = yield* g133Client
           const id = `stale-${label.length}`
           const docs = db.entities.DevicesRetained as any
-          // Incarnation 1: versions 1..3 — its v#2 snapshot survives the delete.
+          // Incarnation 1: versions 1..3 — its v#1 and v#2 snapshots outlive
+          // the delete.
           yield* docs.put({ id, owner: "o", label: "OLD1" })
           yield* docs.update({ id }).set({ label: "OLD2" })
           yield* docs.update({ id }).set({ label: "OLD3" })
           yield* docs.delete({ id })
-          // Incarnation 2 at version 1 (written raw — the library's put
-          // refuses to re-create over incarnation 1's history). Its update would
-          // snapshot v#0000001, which holds incarnation 1's history: refused
-          // before anything is written, so no stale snapshot can ever be read
-          // back as this write's result.
+          // Incarnation 2 at version 1, written raw, with incarnation 1's v#1
+          // expired: its update to version 2 snapshots v#1 and commits — while
+          // v#2 still holds incarnation 1's history.
           yield* recreateRaw(id, "NEW").pipe(Effect.scoped)
+          yield* dropSnapshot(id, 1)
+          // Once the update commits, the item is deleted (and re-created), so
+          // its post-image can only come from a v#2 snapshot of ITS incarnation
+          // — and the v#2 there is incarnation 1's.
           g133Inject.after = after(id)
           const error = yield* docs
             .update({ id })
@@ -15131,11 +15197,10 @@ describeConnected("#133 — path operations on index composites and unique field
             .asEffect()
             .pipe(Effect.flip)
           g133Inject.after = undefined
-          expect(error._tag).toBe("ValidationError")
-          expect(String(error.cause)).toContain("version 1 snapshot already exists")
-          expect((yield* snapshotRow(id, 1))?.label).toEqual({ S: "OLD1" })
+          expect([error._tag, error.version]).toEqual(["UpdateAppliedButUnreadable", 2])
+          // The update was applied: its own snapshot of the item it replaced.
+          expect((yield* snapshotRow(id, 1))?.label).toEqual({ S: "NEW" })
           expect((yield* snapshotRow(id, 2))?.label).toEqual({ S: "OLD2" })
-          expect((yield* rawItem("G133DeviceRetained", id)).label).toEqual({ S: "NEW" })
         }).pipe(Effect.provide(g133RaceLayer), g133Closed),
     )
   }
@@ -15150,17 +15215,19 @@ describeConnected("#133 — path operations on index composites and unique field
         const id = `aba-${label}`
         const docs = db.entities.DevicesRetained as any
         yield* docs.put({ id, owner: "o", label: "first" })
-        // Between our read and our write: delete, and re-create at version 1.
+        // Between our read and our write: delete, and re-create at version 1 —
+        // with the new incarnation's own v#1 snapshot.
         g133Inject.before = Effect.andThen(
           rawDelete("G133DeviceRetained", id),
-          recreate(id, "second"),
+          recreate(id, "second", true),
         )
         const error = yield* build(docs.update({ id })).asEffect().pipe(Effect.flip)
         expect(error._tag).toBe("OptimisticLockError")
         const live = yield* rawItem("G133DeviceRetained", id)
         expect([live.label, live.version]).toEqual([{ S: "second" }, { N: "1" }])
-        // The original v#1 snapshot is untouched.
-        expect((yield* snapshotRow(id, 1))?.label).toEqual({ S: "first" })
+        // The new incarnation's v#1 is untouched: our snapshot of "first" was
+        // never written over it.
+        expect((yield* snapshotRow(id, 1))?.label).toEqual({ S: "second" })
       }).pipe(Effect.provide(g133RaceLayer), g133Closed),
     )
   }
@@ -16208,18 +16275,12 @@ describeConnected("#133 — path operations on index composites and unique field
       expect(yield* snapshotLabel("G133DeviceRetained", "rp2", 2)).toEqual({ S: "v2" })
       expect(yield* snapshotLabel("G133DeviceRetained", "rp2", 3)).toBeUndefined()
 
-      // A race on the replace: an OptimisticLockError, nothing written.
+      // A race on the replace: the put is planned again from the item as the
+      // other writer left it, and the last writer wins — as a plain PutItem.
       g133Inject.before = rawSetAttrs("G133DeviceRetained", "rp2", { label: { S: "x" } }, true)
-      const race = yield* retained
-        .put({ id: "rp2", owner: "o", label: "v4" })
-        .asEffect()
-        .pipe(Effect.flip)
-      expect([race._tag, race.expectedVersion, race.actualVersion]).toEqual([
-        "OptimisticLockError",
-        3,
-        4,
-      ])
-      expect((yield* rawItem("G133DeviceRetained", "rp2")).label).toEqual({ S: "x" })
+      const raced = yield* retained.put({ id: "rp2", owner: "o", label: "v4" })
+      expect([raced.label, raced.version]).toEqual(["v4", 5])
+      expect(yield* snapshotLabel("G133DeviceRetained", "rp2", 4)).toEqual({ S: "x" })
 
       // create still fails on an existing item.
       const dup = yield* retained
@@ -16228,26 +16289,31 @@ describeConnected("#133 — path operations on index composites and unique field
         .pipe(Effect.flip)
       expect(dup._tag).toBe("ConditionalCheckFailed")
 
-      // A put over a unique entity's item with the same value replaces it.
+      // A put over a unique entity's item with the same value replaces it,
+      // keeping its createdAt as a versioned item's does.
       const bare = db.entities.AccountsBare as any
       yield* bare.put({ id: "rp3", email: "rp3@x.io", name: "a" })
+      const bareFirst = yield* rawItem("G133AccountBare", "rp3")
+      yield* TestClock.adjust("1 second")
       yield* bare.put({ id: "rp3", email: "rp3@x.io", name: "b" })
+      const bareAgain = yield* rawItem("G133AccountBare", "rp3")
+      expect(bareAgain.createdAt).toEqual(bareFirst.createdAt)
+      expect(bareAgain.updatedAt).not.toEqual(bareFirst.updatedAt)
       yield* bare.put({ id: "rp3", email: "rp3b@x.io", name: "c" })
       expect(yield* sentinelExistsFor("G133AccountBare", "email", "rp3@x.io")).toBe(false)
       expect(yield* sentinelExistsFor("G133AccountBare", "email", "rp3b@x.io")).toBe(true)
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
-  it.effect("transactions and batches may only create a versioned item", () =>
+  it.effect("transactions replace a versioned item; batches may only create one", () =>
     Effect.gen(function* () {
       const db = yield* g133Client
       yield* (db.entities.DevicesPlain as any).put({ id: "tx1", owner: "o", label: "a" })
-      const tx = yield* Transaction.transactWrite([
+      yield* Transaction.transactWrite([
         g133Entities.DevicesPlain.put({ id: "tx1", owner: "o", label: "b" } as any),
-      ]).pipe(Effect.flip)
-      expect(tx._tag).toBe("ValidationError")
-      expect(String((tx as any).cause)).toContain("replace an existing item")
-      expect((yield* rawItem("G133DevicePlain", "tx1")).version).toEqual({ N: "1" })
+      ])
+      const replaced = yield* rawItem("G133DevicePlain", "tx1")
+      expect([replaced.label, replaced.version]).toEqual([{ S: "b" }, { N: "2" }])
       // A new item is still created through a transaction.
       yield* Transaction.transactWrite([
         g133Entities.DevicesPlain.put({ id: "tx2", owner: "o", label: "b" } as any),
@@ -16306,20 +16372,265 @@ describeConnected("#133 — path operations on index composites and unique field
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
-  it.effect("put refuses to re-create a retain item over an earlier incarnation's history", () =>
+  // ---- a sentinel another item owns is never released (#133) ----
+
+  const sentinelKey = (entityType: string, constraint: string, value: string) => ({
+    pk: { S: `$edd133g#v1#${entityType.toLowerCase()}.${constraint}#${value}` },
+    sk: { S: `$edd133g#v1#${entityType.toLowerCase()}.${constraint}` },
+  })
+  const sentinelOwner = (entityType: string, constraint: string, value: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { Item } = yield* client.getItem({
+        TableName: g133Tables.record,
+        Key: sentinelKey(entityType, constraint, value),
+        ConsistentRead: true,
+      })
+      return Item?._entity_pk?.S
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+  const dropSentinel = (entityType: string, constraint: string, value: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      yield* client.deleteItem({
+        TableName: g133Tables.record,
+        Key: sentinelKey(entityType, constraint, value),
+      })
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+
+  for (const [entity, entityType] of [
+    ["AccountsBare", "G133AccountBare"],
+    ["AccountsPlain", "G133AccountPlain"],
+    ["AccountsRetained", "G133AccountRetained"],
+    ["SoftAccounts", "G133SoftAccount"],
+  ] as const) {
+    for (const [label, release] of [
+      ["put", (acc: any, id: string, to: string) => acc.put({ id, email: to, name: "moved" })],
+      ["update", (acc: any, id: string, to: string) => acc.update({ id }).set({ email: to })],
+      ["upsert", (acc: any, id: string, to: string) => acc.upsert({ id, email: to, name: "m" })],
+      ["delete", (acc: any, id: string) => acc.delete({ id })],
+      ["purge", (acc: any, id: string) => acc.purge({ id })],
+      [
+        "transactWrite put",
+        (_: any, id: string, to: string) =>
+          Transaction.transactWrite([
+            (g133Entities as any)[entity].put({ id, email: to, name: "moved" }),
+          ]),
+      ],
+    ] as const) {
+      it.effect(`${entity}: ${label} never releases a sentinel another item owns`, () =>
+        Effect.gen(function* () {
+          const db = yield* g133Client
+          const accounts = db.entities[entity] as any
+          const tag = `${entity}-${label.replace(" ", "-")}`.toLowerCase()
+          const [a, b, c] = [`${tag}-a`, `${tag}-b`, `${tag}-c`]
+          const held = `${tag}@x.io`
+          const moved = `${tag}-moved@x.io`
+          // `a` holds the value without its sentinel (an expired or later-added
+          // constraint); `b` then claimed the value and owns its sentinel.
+          yield* accounts.put({ id: a, email: held, name: "a" })
+          yield* dropSentinel(entityType, "email", held)
+          yield* accounts.put({ id: b, email: held, name: "b" })
+          const owner = mainKey(entityType, b).pk.S
+          expect(yield* sentinelOwner(entityType, "email", held)).toBe(owner)
+
+          yield* release(accounts, a, moved)
+
+          // `b` still owns its sentinel, and the value stays taken.
+          expect(yield* sentinelOwner(entityType, "email", held)).toBe(owner)
+          const dup = yield* accounts
+            .create({ id: c, email: held, name: "c" })
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(dup._tag).toBe("UniqueConstraintViolation")
+          if (label !== "delete" && label !== "purge") {
+            expect(yield* sentinelOwner(entityType, "email", moved)).toBe(
+              mainKey(entityType, a).pk.S,
+            )
+          }
+        }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+      )
+    }
+  }
+
+  // ---- transactions write existing versioned and unique items (#133) ----
+
+  it.effect("transactWrite replaces an existing item exactly as its own put does", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const retained = db.entities.DevicesRetained as any
+      yield* retained.put({ id: "txr1", owner: "o", label: "v1" })
+      const firstRaw = yield* rawItem("G133DeviceRetained", "txr1")
+      yield* TestClock.adjust("1 second")
+      yield* Transaction.transactWrite([
+        g133Entities.DevicesRetained.put({ id: "txr1", owner: "o", label: "v2" } as any),
+      ])
+      const raw = yield* rawItem("G133DeviceRetained", "txr1")
+      expect([raw.label, raw.version]).toEqual([{ S: "v2" }, { N: "2" }])
+      expect(raw.__edd_i__).toEqual(firstRaw.__edd_i__)
+      expect(raw.createdAt).toEqual(firstRaw.createdAt)
+      expect(raw.updatedAt).not.toEqual(firstRaw.updatedAt)
+      expect(yield* snapshotLabel("G133DeviceRetained", "txr1", 1)).toEqual({ S: "v1" })
+
+      // A race between the read and the transaction: written again, last writer wins.
+      g133Inject.before = rawSetAttrs("G133DeviceRetained", "txr1", { label: { S: "x" } }, true)
+      yield* Transaction.transactWrite([
+        g133Entities.DevicesRetained.put({ id: "txr1", owner: "o", label: "v4" } as any),
+      ])
+      const after = yield* rawItem("G133DeviceRetained", "txr1")
+      expect([after.label, after.version]).toEqual([{ S: "v4" }, { N: "4" }])
+      expect(yield* snapshotLabel("G133DeviceRetained", "txr1", 3)).toEqual({ S: "x" })
+
+      // A unique entity: the changed value's sentinel rotates; createdAt is kept.
+      const bare = db.entities.AccountsBare as any
+      yield* bare.put({ id: "txr2", email: "txr2@x.io", name: "a" })
+      const bareFirst = yield* rawItem("G133AccountBare", "txr2")
+      yield* TestClock.adjust("1 second")
+      yield* Transaction.transactWrite([
+        g133Entities.AccountsBare.put({ id: "txr2", email: "txr2b@x.io", name: "b" } as any),
+      ])
+      expect(yield* sentinelExistsFor("G133AccountBare", "email", "txr2@x.io")).toBe(false)
+      expect(yield* sentinelOwner("G133AccountBare", "email", "txr2b@x.io")).toBe(
+        mainKey("G133AccountBare", "txr2").pk.S,
+      )
+      expect((yield* rawItem("G133AccountBare", "txr2")).createdAt).toEqual(bareFirst.createdAt)
+
+      // A value another item holds: UniqueConstraintViolation, nothing written.
+      yield* bare.put({ id: "txr3", email: "txr3@x.io", name: "c" })
+      const taken = yield* Transaction.transactWrite([
+        g133Entities.AccountsBare.put({ id: "txr3", email: "txr2b@x.io", name: "c" } as any),
+      ]).pipe(Effect.flip)
+      expect(taken._tag).toBe("UniqueConstraintViolation")
+      expect((yield* rawItem("G133AccountBare", "txr3")).email).toEqual({ S: "txr3@x.io" })
+
+      // The caller's own condition: TransactionCancelled, as for any op.
+      const refused = yield* Transaction.transactWrite([
+        g133Entities.DevicesRetained.put({ id: "txr1", owner: "o", label: "v5" } as any).pipe(
+          g133Entities.DevicesRetained.condition({ label: "nope" }),
+        ),
+      ]).pipe(Effect.flip)
+      expect(refused._tag).toBe("TransactionCancelled")
+      expect((yield* rawItem("G133DeviceRetained", "txr1")).label).toEqual({ S: "v4" })
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- a deleted retain item's key is reused: its history continues (#133) ----
+
+  it.effect("a hard-deleted retain item is created again past its retained history", () =>
     Effect.gen(function* () {
       const db = yield* g133Client
       const docs = db.entities.DevicesRetained as any
-      yield* docs.put({ id: "rc1", owner: "o", label: "first" })
-      yield* docs.delete({ id: "rc1" })
-      const error = yield* docs
-        .put({ id: "rc1", owner: "o", label: "second" })
-        .asEffect()
-        .pipe(Effect.flip)
-      expect(error._tag).toBe("ValidationError")
-      expect(String(error.cause)).toContain("version 1 snapshot already exists")
-      expect(yield* snapshotLabel("G133DeviceRetained", "rc1", 1)).toEqual({ S: "first" })
-      expect(yield* rawItem("G133DeviceRetained", "rc1")).toBeUndefined()
+      for (const [id, recreate] of [
+        ["rc-put", (doc: any) => docs.put(doc)],
+        ["rc-create", (doc: any) => docs.create(doc)],
+        ["rc-upsert", (doc: any) => docs.upsert(doc)],
+        ["rc-tx", (doc: any) => Transaction.transactWrite([g133Entities.DevicesRetained.put(doc)])],
+      ] as const) {
+        yield* docs.put({ id, owner: "o", label: "first" })
+        yield* docs.update({ id }).set({ label: "second" })
+        const firstRaw = yield* rawItem("G133DeviceRetained", id)
+        yield* docs.delete({ id })
+        // v#1 survives the delete (retain keeps history).
+        expect(yield* snapshotLabel("G133DeviceRetained", id, 1)).toEqual({ S: "first" })
+        yield* recreate({ id, owner: "o", label: "again" })
+        const raw = yield* rawItem("G133DeviceRetained", id)
+        // Past the highest version retained (1), with a new incarnation.
+        expect([raw.label, raw.version]).toEqual([{ S: "again" }, { N: "2" }])
+        expect(raw.__edd_i__).not.toEqual(firstRaw.__edd_i__)
+        expect(yield* snapshotLabel("G133DeviceRetained", id, 1)).toEqual({ S: "first" })
+        expect(yield* snapshotLabel("G133DeviceRetained", id, 2)).toEqual({ S: "again" })
+        // …and it goes on from there.
+        const next = yield* docs.update({ id }).set({ label: "more" })
+        expect(next.version).toBe(3)
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a soft-deleted retain item is created again; restore then refuses the live one", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const docs = db.entities.SoftDevices as any
+      yield* docs.put({ id: "rs1", owner: "o", label: "first" })
+      yield* docs.update({ id: "rs1" }).set({ label: "second" })
+      yield* docs.delete({ id: "rs1" })
+      // A soft-deleted item is missing: created again, past its history (v#2).
+      const again = yield* docs.create({ id: "rs1", owner: "o", label: "again" })
+      expect(again.version).toBe(3)
+      expect(yield* snapshotLabel("G133SoftDevice", "rs1", 2)).toEqual({ S: "second" })
+      expect(yield* snapshotLabel("G133SoftDevice", "rs1", 3)).toEqual({ S: "again" })
+      // Restoring the tombstone over the live item is refused, clearly.
+      const refused = yield* docs.restore({ id: "rs1" }).pipe(Effect.flip)
+      expect(refused._tag).toBe("ItemNotDeleted")
+      expect((yield* rawItem("G133SoftDevice", "rs1")).label).toEqual({ S: "again" })
+      // Once the live item is deleted too, restore brings back the latest one.
+      yield* TestClock.adjust("1 second")
+      yield* docs.delete({ id: "rs1" })
+      const restored = yield* docs.restore({ id: "rs1" })
+      expect([restored.label, restored.version]).toEqual(["again", 4])
+      expect(yield* snapshotLabel("G133SoftDevice", "rs1", 3)).toEqual({ S: "again" })
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- upsert validates the whole input, and stores defaults only on create ----
+
+  it.effect("upsert of an existing unique item still requires every required field", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const coded = db.entities.Coded as any
+      yield* coded.put({ id: "uv1", name: "a", code: "uv1" })
+      const missing = yield* coded.upsert({ id: "uv1", code: "uv1b" }).asEffect().pipe(Effect.flip)
+      expect(missing._tag).toBe("ValidationError")
+      expect(missing.operation).toMatch(/^upsert/)
+      const raw = yield* rawItem("G133Coded", "uv1")
+      expect([raw.name, raw.code]).toEqual([{ S: "a" }, { S: "uv1" }])
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("upsert stores an omitted default on create and keeps the stored value on update", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const defaults = db.entities.Defaults as any
+      const coded = db.entities.Coded as any
+      // Created: the default is stored and indexed.
+      expect((yield* defaults.upsert({ id: "ud1", name: "n" })).tier).toBe("basic")
+      expect((yield* rawItem("G133Defaults", "ud1")).tier).toEqual({ S: "basic" })
+      // Existing: an upsert that omits it keeps what is stored — unique or not.
+      yield* defaults.put({ id: "ud2", name: "n", tier: "gold" })
+      const kept = yield* defaults.upsert({ id: "ud2", name: "m" })
+      expect([kept.tier, kept.name]).toEqual(["gold", "m"])
+      expect((yield* defaults.byTier({ tier: "gold" }).collect()).map((d: any) => d.id)).toContain(
+        "ud2",
+      )
+      yield* coded.put({ id: "ud3", name: "n", code: "ud3" })
+      const codedKept = yield* coded.upsert({ id: "ud3", name: "m" })
+      expect([codedKept.code, codedKept.name]).toEqual(["ud3", "m"])
+      expect(yield* sentinelExistsFor("G133Coded", "code", "ud3")).toBe(true)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- concurrent puts of a missing versioned item: the last writer wins ----
+
+  it.effect("a put that loses the race to create an item replaces it", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      for (const [entity, entityType] of [
+        ["DevicesPlain", "G133DevicePlain"],
+        ["DevicesRetained", "G133DeviceRetained"],
+      ] as const) {
+        const docs = db.entities[entity] as any
+        const id = `lww-${entity.toLowerCase()}`
+        // Another writer creates the item between our read and our write.
+        g133Inject.before = g133Hook(
+          Effect.asVoid(
+            (g133Entities[entity] as any)
+              .put({ id, owner: "o", label: "theirs" })
+              .asEffect()
+              .pipe(Effect.provide(g133Layer(g133Tables.record))),
+          ),
+        )
+        const mine = yield* docs.put({ id, owner: "o", label: "mine" })
+        expect([mine.label, mine.version]).toEqual(["mine", 2])
+        expect((yield* rawItem(entityType, id)).label).toEqual({ S: "mine" })
+      }
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 })
