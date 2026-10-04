@@ -105,6 +105,18 @@ const VersionedNotes = Entity.make({
   versioned: true,
 })
 
+class VersionedBlob extends Schema.Class<VersionedBlob>("VersionedBlob")({
+  blobId: Schema.String,
+  data: Schema.Uint8Array,
+}) {}
+
+const VersionedBlobs = Entity.make({
+  model: VersionedBlob,
+  entityType: "VersionedBlob",
+  primaryKey: { pk: { field: "pk", composite: ["blobId"] }, sk: { field: "sk", composite: [] } },
+  versioned: true,
+})
+
 // #120 fixture — an entity whose id the framework generates when it is absent.
 class GenDoc extends Schema.Class<GenDoc>("GenDoc")({
   docId: Schema.String,
@@ -128,6 +140,7 @@ const MainTable = Table.make({
     SoftItems,
     GenDocs,
     VersionedNotes,
+    VersionedBlobs,
   },
 })
 
@@ -1086,6 +1099,31 @@ describe("Batch", () => {
         for (const call of mockTransactWriteItems.mock.calls) {
           expect(JSON.stringify(call[0].TransactItems).length).toBeLessThan(4_000_000)
         }
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("sizes binary attributes by their bytes, not their JSON", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        // 11 × 300 KB = 3.3 MB fits one transaction; as JSON it would not.
+        const data = new Uint8Array(300_000)
+        yield* Batch.write(
+          Array.from({ length: 11 }, (_, i) => VersionedBlobs.put({ blobId: `b-${i}`, data })),
+        )
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        expect(mockTransactWriteItems.mock.calls[0]![0].TransactItems).toHaveLength(11)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("names the entity whose item a batch touches twice", () =>
+      Effect.gen(function* () {
+        const error = yield* Batch.write([
+          VersionedNotes.put({ noteId: "x", body: "a" }),
+          VersionedBlobs.put({ blobId: "dup", data: new Uint8Array(1) }),
+          VersionedBlobs.delete({ blobId: "dup" }),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).entityType).toBe("VersionedBlob")
       }).pipe(Effect.provide(TestLayer)),
     )
 

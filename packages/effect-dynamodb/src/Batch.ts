@@ -33,7 +33,7 @@ import type { TableConfig } from "./Table.js"
 const MAX_BATCH_GET = 100
 const MAX_BATCH_WRITE = 25
 const MAX_TRANSACT_WRITE = 100
-/** DynamoDB caps a transaction's payload at 4 MB; leave headroom for the request envelope. */
+/** DynamoDB caps a transaction's payload at 4 MB of item data; leave headroom. */
 const MAX_TRANSACT_BYTES = 3_500_000
 const MAX_RETRIES = 5
 const BASE_DELAY_MS = 100
@@ -217,14 +217,31 @@ export const get = <const T extends ReadonlyArray<AnyGet>>(
     return results as unknown as BatchGetResult<T>
   })
 
+const utf8Bytes = (text: string): number => new TextEncoder().encode(text).length
+
 /**
- * An upper bound on an item's share of a transaction payload: the marshalled
- * JSON, type wrappers included, measured in UTF-8 bytes.
+ * An item's size as DynamoDB counts it toward a transaction's 4 MB payload:
+ * attribute names plus values, binary as raw bytes. Numbers are counted by
+ * their digits and list / map entries carry a few bytes of overhead, so this
+ * errs high.
  */
+const attributeBytes = (value: AttributeValue): number => {
+  if (value.S !== undefined) return utf8Bytes(value.S)
+  if (value.N !== undefined) return value.N.length + 1
+  if (value.B !== undefined) return value.B.byteLength
+  if (value.SS !== undefined) return value.SS.reduce((sum, v) => sum + utf8Bytes(v), 0)
+  if (value.NS !== undefined) return value.NS.reduce((sum, v) => sum + v.length + 1, 0)
+  if (value.BS !== undefined) return value.BS.reduce((sum, v) => sum + v.byteLength, 0)
+  if (value.L !== undefined) return value.L.reduce((sum, v) => sum + attributeBytes(v) + 1, 3)
+  if (value.M !== undefined) return itemBytes(value.M) + 3
+  return 1
+}
+
 const itemBytes = (item: Record<string, AttributeValue>): number =>
-  new TextEncoder().encode(
-    JSON.stringify(item, (_, value) => (typeof value === "bigint" ? value.toString() : value)),
-  ).length
+  Object.entries(item).reduce(
+    (sum, [name, value]) => sum + utf8Bytes(name) + attributeBytes(value),
+    0,
+  )
 
 // ---------------------------------------------------------------------------
 // Batch.write — auto-chunk at 25, retry unprocessed
@@ -280,7 +297,7 @@ export const write = (
     // put is involved: its put runs in an earlier transaction than the batch's
     // other requests, so a repeated key would be reordered or misreported.
     const touched = new Map<string, number>()
-    const versionedKeys = new Set<string>()
+    const versionedKeys = new Map<string, string>()
     const keyOf = (
       tableName: string,
       entity: {
@@ -356,7 +373,7 @@ export const write = (
         const key = keyOf(tableName, entity, built.marshalled)
         touched.set(key, (touched.get(key) ?? 0) + 1)
         if (entity._incarnationToken) {
-          versionedKeys.add(key)
+          versionedKeys.set(key, entity.entityType)
           versionedPuts.push({
             tableName,
             entityType: entity.entityType,
@@ -390,11 +407,10 @@ export const write = (
       }
     }
 
-    for (const key of versionedKeys) {
+    for (const [key, entityType] of versionedKeys) {
       if ((touched.get(key) ?? 0) > 1) {
-        const [table] = JSON.parse(key) as [string]
         return yield* new ValidationError({
-          entityType: versionedPuts.find((put) => put.tableName === table)?.entityType ?? "unknown",
+          entityType,
           operation: "batchWrite",
           cause:
             "Batch.write touches the same item more than once alongside a versioned put. " +
