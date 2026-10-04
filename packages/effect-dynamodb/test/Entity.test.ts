@@ -4483,6 +4483,58 @@ describe("Entity", () => {
         }).pipe(Effect.provide(TestLayer)),
       )
 
+      describe("which tombstone is found: the later, the item's own on a tie", () => {
+        const tomb = (sk: string, name: string, at: string) =>
+          toAttributeMap({
+            order: "o1",
+            line: "a",
+            name,
+            version: 1,
+            createdAt: "2024-01-15T00:00:00Z",
+            updatedAt: "2024-01-15T00:00:00Z",
+            deletedAt: at,
+            pk: "$myapp#v1#line#order_o1",
+            sk,
+            __edd_e__: "Line",
+          })
+        const own = (at: string) => tomb(`$myapp#v1#line#deleted#line_a#${at}`, "own", at)
+        const legacy = (at: string) => tomb(`$myapp#v1#line#deleted#${at}`, "legacy", at)
+        const answer = (ownRow: unknown, legacyRow: unknown) =>
+          mockQuery
+            .mockResolvedValueOnce({ Items: [ownRow] })
+            .mockResolvedValueOnce({ Items: [legacyRow] })
+            .mockResolvedValueOnce({ Items: [legacyRow] })
+        const t1 = "2024-01-01T00:00:00.000Z"
+        const t2 = "2024-02-01T00:00:00.000Z"
+        for (const [label, ownAt, legacyAt, found] of [
+          ["the item's own is later", t2, t1, "own"],
+          ["the unsegmented one is later", t1, t2, "legacy"],
+          ["a tie", t1, t1, "own"],
+        ] as const) {
+          it.effect(`deleted.get: ${label}`, () =>
+            Effect.gen(function* () {
+              answer(own(ownAt), legacy(legacyAt))
+              const row = yield* Lines.deleted.get(key).pipe(Entity.asRecord)
+              expect(row.name).toBe(found)
+            }).pipe(Effect.provide(TestLayer)),
+          )
+          it.effect(`restore: ${label}`, () =>
+            Effect.gen(function* () {
+              answer(own(ownAt), legacy(legacyAt))
+              mockTransactWriteItems.mockResolvedValueOnce({})
+              const restored = yield* Lines.restore(key).pipe(Entity.asRecord)
+              expect(restored.name).toBe(found)
+              const [consumed] = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+              expect(consumed.Delete.Key.sk.S).toBe(
+                found === "own"
+                  ? `$myapp#v1#line#deleted#line_a#${ownAt}`
+                  : `$myapp#v1#line#deleted#${legacyAt}`,
+              )
+            }).pipe(Effect.provide(TestLayer)),
+          )
+        }
+      })
+
       it.effect("getVersion, versions, deleted.get and soft delete key by the item", () =>
         Effect.gen(function* () {
           mockGetItem.mockResolvedValueOnce({})
