@@ -41,10 +41,13 @@ real `DateTime`s.
 - **Two model shapes are now rejected at `make()`.** A union whose date member
   is stored as an epoch number next to a member also stored as a number
   (`Number`, a number literal, `BigInt`, another epoch date) fails with
-  `EDD-9058`, because a stored number could belong to either member. Store the
-  date as a string (the default for a self date) or remove the numeric member.
-  A `DynamoModel.configure` `storedAs` override on a union field with more than
-  one date member fails with `EDD-9057`; annotate the intended member instead.
+  `EDD-9058`, because a stored number could belong to either member. On an
+  aggregate this also covers a `NumberFromString` or `BigIntFromString` member:
+  `update` re-decodes the aggregate's domain values, where those are numbers.
+  Entities accept those two. Store the date as a string (the default for a self
+  date) or remove the numeric member. A `DynamoModel.configure` `storedAs`
+  override on a union field with more than one date member fails with
+  `EDD-9057`; annotate the intended member instead.
 - **A canonical ISO string in a string member reads as a date.** In
   `Schema.Union([Schema.DateTimeUtc, Schema.String])`, the exact ISO form the
   library writes for a date (`"2000-01-01T00:00:00.000Z"`) reads back as a
@@ -124,16 +127,27 @@ mis-derived as an array.
 the record-based `.append()` (including on versioned entities that retain
 snapshots) now encode their value through the schema at the path, as `.set()`
 does. Before, they wrote the raw value: a `DateTime` became a map even on a
-plain date field, and a `NumberFromString` value was stored as a number. Values
-are decoded and re-encoded, so a plain object on a class-typed field is encoded
-as that class and a `Schema.Trim` field stores its trimmed form. Class, struct,
-record, tuple and union values are always encoded, so their `DateTime`, `Date`
-and `Redacted` contents keep their wire form. A value already in the wire form
-of a leaf transform with a primitive wire form (`StringFromBase64`,
-`fromJsonString`), or an array of them, is stored as given rather than
-double-encoded. `ADD`, `DELETE` and `SUBTRACT` are unchanged. A path the model
-schema cannot follow, such as one into a `DynamoModel.ref` field, still writes
-the value as given.
+plain date field, and a `NumberFromString` value was stored as a number. Now:
+
+- A plain object on a class-typed field is encoded as that class, and a class
+  instance is always encoded whole.
+- A plain object or array that mixes wire and domain parts, or holds an
+  ambiguous wire part, is encoded part by part, so every `DateTime`, `Date` and
+  `Redacted` inside it is stored in wire form.
+- A value already in wire form is normalised the way `.set()` normalises it:
+  `NumberFromString` `"05"` is stored as `"5"`, `DateTimeUtcFromString`
+  `"2000-01-01"` as `"2000-01-01T00:00:00.000Z"`, and a `Schema.Trim` field
+  stores its trimmed form. Read-back values are identical; only the stored
+  bytes differ, which filters and Streams consumers will see.
+- A value passes through as given only if it genuinely decodes as the wire form
+  of a leaf transform with a primitive wire form AND is also a valid domain
+  value, such as `"aGk="` on a `StringFromBase64` field; encoding it would
+  double-encode it. A plain string that isn't valid wire (`"hi"`) is a domain
+  value and is encoded.
+
+`ADD`, `DELETE` and `SUBTRACT` are unchanged. A path the model schema cannot
+follow, such as one into a `DynamoModel.ref` field, still writes the value as
+given.
 
 **Legacy values read back.** The raw values earlier path updates left on
 transform fields now read: a number on a `NumberFromString` field, a
@@ -141,10 +155,14 @@ safe-integer number on a `BigIntFromString` field, a `DateTime` map on a date
 transform. A plain `Schema.BigInt`, stored as a number, now reads back as a
 `bigint`.
 
-**Zoned dates.** A self `Schema.DateTimeZoned` with an offset zone (`+05:00`)
-now reads back with that offset, wherever it sits in the model; earlier versions
-read it back as UTC. Named zones and UTC round-trip as before, and the stored
-form is unchanged.
+**Zoned dates.** A zoned date with an offset zone (`+05:00`) now reads back
+with that offset, for both `DynamoModel.DateTimeZoned` and a self
+`Schema.DateTimeZoned`, on entities and aggregates; earlier versions read it
+back as UTC. Named zones and UTC round-trip as before, and the stored form is
+unchanged. Known limitation, as in earlier versions: an offset that isn't a
+whole minute (a historical local-mean-time offset, a sub-minute
+`zoneMakeOffset`) is rounded to the minute by Effect's ISO format, and the
+instant read back moves by the same amount.
 
 ### Nested sub-aggregates
 
