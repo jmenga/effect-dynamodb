@@ -8895,6 +8895,33 @@ describe("Entity", () => {
       )
     }
 
+    it.effect("an update's new sentinel carries its constraint's TTL, as a put's does", () =>
+      Effect.gen(function* () {
+        const Held = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "HeldUser",
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            unique: { email: { fields: ["email"], ttl: "1 hour" } },
+            versioned: true,
+          }),
+        )
+        mockGetItem.mockResolvedValueOnce({ Item: stored("HeldUser") })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        yield* Held.update({ userId: "u-1" })
+          .pipe(Entity.set({ email: "y@x.io" }))
+          .asEffect()
+        const reservation = mockTransactWriteItems.mock.calls[0]![0].TransactItems.find(
+          (t: any) => t.Put !== undefined,
+        )
+        expect(reservation.Put.Item.pk.S).toContain("y@x.io")
+        expect(Number(reservation.Put.Item._ttl.N)).toBeGreaterThan(0)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("a soft delete leaves a sentinel another item owns", () =>
       Effect.gen(function* () {
         withSentinelOwnedBy("SoftOwnedUser", "u-2")

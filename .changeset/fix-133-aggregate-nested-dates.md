@@ -463,7 +463,9 @@ new item is live fails with `ItemNotDeleted`.
 release on that ownership. A release whose reservation changed hands in
 between fails an update or delete with `ConcurrentModification` on the unique
 fields; a put retries. `purge` releases the sentinels of the live item and of
-every tombstone, each only if owned.
+every tombstone, each only if owned. An update that moves a unique value to a
+constraint with a `ttl` now gives the new sentinel its expiry, as a put does
+(it was written without one).
 
 **`upsert` that reads first.** One `UpdateItem` can't write, rotate or check a
 sentinel, or snapshot the item it replaces, so `upsert` of an entity with
