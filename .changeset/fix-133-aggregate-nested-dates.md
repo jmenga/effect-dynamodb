@@ -81,11 +81,14 @@ real `DateTime`s.
   exists is refused with a `ValidationError`**, so `purge` it first. Details
   under "Puts, upserts and batches".
 - **`Batch.write` sends puts of a `versioned` entity as transactions.** They go
-  first, as create-only `TransactWriteItems` of up to 100 items, and each
-  chunk costs twice the write capacity of a batch write. A put that would
-  replace an existing item fails with a `ValidationError` and writes nothing
-  from its chunk. Earlier chunks may already have been written, because
-  `Batch.write` was never atomic across chunks.
+  first, as create-only `TransactWriteItems` of up to 100 items (and under
+  DynamoDB's 4 MB transaction payload), and each chunk costs twice the write
+  capacity of a batch write. A put that would replace an existing item fails
+  with a `ValidationError` and writes nothing from its chunk. Earlier chunks
+  may already have been written, because `Batch.write` was never atomic across
+  chunks. A batch that touches a versioned put's item more than once (a
+  delete and a put of it, or two puts) is refused before anything is written,
+  since the put runs in its own transaction and the order couldn't be kept.
 - **More updates are refused with a `ValidationError`**: a `.set()` that changes
   a primary-key composite (silently ignored before), a `.set()` that changes an
   immutable field (restating its current value is fine), and the path
@@ -441,13 +444,18 @@ retain `v#0000001` snapshot already exists from a deleted earlier item.
 
 **`Batch.write` of a `versioned` entity.** Its puts are sent first, as
 create-only `TransactWriteItems` of up to 100 items, each conditioned on
-`attribute_not_exists`. There is no read, so there is no race window. A put
+`attribute_not_exists`; a chunk also closes before it would pass DynamoDB's
+4 MB transaction payload. There is no read, so there is no race window. A batch
+that touches a versioned put's item more than once is refused with a
+`ValidationError` before anything is written. A put
 that would replace an existing item cancels its whole chunk, so nothing in that
 chunk is written, and fails with a `ValidationError`. Earlier chunks may
 already have been written, since `Batch.write` was never atomic across chunks,
 and the batch's other requests aren't sent. Each chunk costs twice the write
 capacity of a batch write. Contention cancellations (`TransactionConflict`,
-throttling) are retried with the batch's backoff settings. Puts of other
+throttling) are retried with the batch's backoff settings; any other
+cancellation is a `DynamoError` that keeps each reason's message and the SDK
+exception. Puts of other
 entities, and deletes, are still plain `BatchWriteItem` requests.
 
 ### Nested sub-aggregates

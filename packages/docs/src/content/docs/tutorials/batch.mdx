@@ -262,7 +262,7 @@ The same reasoning rules out the lifecycle configs (**EDD-9049**): entities with
 :::
 
 :::note[Puts of a `versioned` entity are sent as transactions]
-A `PutRequest` can't continue an existing item's version; it would reset the item to version 1. So `Batch.write` sends puts of a `versioned` entity first, as create-only `TransactWriteItems` of up to 100 items, each conditioned on `attribute_not_exists`. Puts of other entities, and deletes, are still plain `BatchWriteItem` requests.
+A `PutRequest` can't continue an existing item's version; it would reset the item to version 1. So `Batch.write` sends puts of a `versioned` entity first, as create-only `TransactWriteItems` of up to 100 items (kept under DynamoDB's 4 MB transaction payload), each conditioned on `attribute_not_exists`. A batch that touches such an item more than once, for example a delete and a put of it, is refused before anything is written, because the put runs in its own transaction. Puts of other entities, and deletes, are still plain `BatchWriteItem` requests.
 
 - A put that would replace an existing item cancels its whole chunk, so nothing in that chunk is written, and `Batch.write` fails with a `ValidationError`. Earlier chunks may already have been written, as with any batch, and the remaining requests aren't sent. Replace an existing item with the entity's own `put()`.
 - Each chunk costs twice the write capacity of a batch write.

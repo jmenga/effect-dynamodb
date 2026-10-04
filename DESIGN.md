@@ -1985,8 +1985,13 @@ keeps its own condition and error.
 **`Batch.write` of a `versioned` entity.** A `PutRequest` would reset an
 existing item to version 1 under a new incarnation. So `Batch.write` sends these
 puts first, before any other request, as create-only `TransactWriteItems` Puts
-(`attribute_not_exists(pk)`) in chunks of up to 100. There is no read, and so
-no window between a check and the write. Each chunk is atomic: a put that would
+(`attribute_not_exists(pk)`) in chunks of up to 100 items, each closed before
+its marshalled size passes 3.5 MB (DynamoDB caps a transaction at 4 MB). There
+is no read, and so no window between a check and the write. A batch that
+touches a versioned put's item more than once — a delete and a put, or two
+puts — is refused before anything is sent: the put runs in its own
+transaction, so the order couldn't be kept (and two puts of one item in one
+transaction would be misreported as a replace). Each chunk is atomic: a put that would
 replace an existing item cancels it, nothing in the chunk is written, and the
 batch fails with a `ValidationError` without sending later chunks or the plain
 requests. Earlier chunks may already have been written; `Batch.write` was never
