@@ -194,11 +194,15 @@ plain date field, and a `NumberFromString` value was stored as a number. Now:
 **Path updates on retain entities.** Path operations (`pathSet`,
 `pathAppend`, `pathPrepend`, `pathIfNotExists`, `pathAdd`, `pathSubtract`,
 `pathDelete`, `pathRemove`) on entities with `versioned: { retain: true }` were
-silently ignored: they returned success and wrote nothing. They are now
-applied, with the same encoding and validation as on other entities. The
-version snapshot holds the item as it was before the update, and
-`expectedVersion` still applies. A path whose parent does not exist fails with
-a `ValidationError`.
+silently ignored: they returned success and wrote nothing. They are now sent to
+DynamoDB as the same update expression used for other entities, in one
+transaction with the version snapshot of the item they replace, so they behave
+exactly as DynamoDB defines: list indexes refer to the item before the update,
+a copy reads the old value, overlapping paths and appends to a missing list are
+rejected, and a rejected update writes no snapshot. `expectedVersion` and
+`.condition()` apply. One update cannot combine path operations with a change
+to a unique-constraint field; it fails with a `ValidationError`, so split it
+into two updates.
 
 **Legacy values read back.** The raw values earlier path updates left on
 transform fields now read: a number on a `NumberFromString` field, a

@@ -1762,11 +1762,16 @@ a dynamic key of an untyped value) are passed through.
 
 **Retain entities.** The `versioned: { retain: true }` update branch builds the
 new item in memory and writes it in a transaction with the snapshot; it used to
-ignore path operations entirely (success, nothing written). It now applies them
-in memory (`applyPathOpsInMemory`) with the same encoding and validation, after
-deep-copying the stored values so the snapshot keeps the pre-update item.
-`expectedVersion` still applies, and a path whose parent does not exist fails
-with a `ValidationError`, as DynamoDB's own path update would.
+ignore path operations entirely (success, nothing written). An update that
+carries path operations now reads the current item (consistent read) for the
+snapshot, then sends the non-retain branch's own `UpdateExpression` (version
+bump, timestamps, GSI recomposition, `expectedVersion`, user condition) as the
+`Update` in one `TransactWriteItems` with the snapshot `Put`, conditioned on
+the version read. DynamoDB therefore applies the path semantics itself — parity
+by construction, never emulated — and a rejected expression writes no snapshot.
+Path operations combined with a unique-constraint change are rejected with a
+`ValidationError`, since sentinel rotation is a read-then-put that cannot carry
+path expressions. Record-only retain updates are unchanged.
 
 Each encoded path value is then **validated** against the write schema at its
 path (`validate` / `validateElements`), as `.set()` validates its payload: a
