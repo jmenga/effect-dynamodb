@@ -46,8 +46,10 @@ import {
   buildTransactWriteItems,
   GUARDED_TRANSACTION_ATTEMPTS,
   judgeCancellation,
+  refuseRepeatedItems,
   type TransactWriteItem,
   type TransactWriteOp,
+  transactItemTarget,
 } from "./internal/TransactWriteOps.js"
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
 import * as Query from "./Query.js"
@@ -837,6 +839,29 @@ export const makeStream = <
             },
           })
         }
+
+        // One op per item: an additional item that repeats an event, the
+        // contiguity check or the idempotency sentinel is refused before
+        // anything is sent, as additional items repeating each other are (#133).
+        const streamItemSource = (i: number) =>
+          i < checkCount
+            ? "the version-contiguity check"
+            : i < checkCount + eventCount
+              ? `the event at version ${expectedVersion + i - checkCount + 1}`
+              : "the idempotency sentinel"
+        yield* refuseRepeatedItems(
+          [
+            ...transactItems
+              .flatMap((item, i) =>
+                i < checkCount + eventCount || i === sentinelIndex ? [{ item, i }] : [],
+              )
+              .map(({ item, i }) =>
+                transactItemTarget(item, tableName, ["pk", "sk"], entityType, streamItemSource(i)),
+              ),
+            ...additional.targets,
+          ],
+          "EventStore.append",
+        )
 
         const outcome = yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
           Effect.as(undefined),

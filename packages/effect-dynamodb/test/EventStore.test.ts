@@ -31,6 +31,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Expression from "../src/Expression.js"
+import { refuseRepeatedItems, transactItemTarget } from "../src/internal/TransactWriteOps.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
@@ -1015,6 +1016,86 @@ describe("EventStore", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    it.effect("refuses additional items that repeat one item, before writing (#133)", () =>
+      Effect.gen(function* () {
+        const twice = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [
+            Watermarks.put({ writerId: "ingest-1", lastSeq: 1 }),
+            Watermarks.put({ writerId: "ingest-1", lastSeq: 2 }),
+          ],
+        }).pipe(Effect.flip)
+        expect(twice._tag).toBe("ValidationError")
+        expect((twice as ValidationError).entityType).toBe("Watermark")
+        expect(String((twice as ValidationError).cause)).toContain(
+          "touches one item more than once",
+        )
+
+        // A versioned retain put repeated: refused too, never judged a lost race.
+        const retained = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [
+            Registrations.put({ regId: "r-1", code: "a" }),
+            Registrations.put({ regId: "r-1", code: "a" }),
+          ],
+        }).pipe(Effect.flip)
+        expect(retained._tag).toBe("ValidationError")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an additional item repeating a stream item is refused by the same check", () =>
+      Effect.gen(function* () {
+        // No entity key composes to a stream key (names prefix every composite),
+        // so the stream-side targets are proven against the check directly.
+        const key = {
+          pk: { S: "$cricket#v1#match#m-1" },
+          sk: { S: "$cricket#v1#match.event_1#0000000001" },
+        }
+        const error = yield* refuseRepeatedItems(
+          [
+            transactItemTarget(
+              { Put: { TableName: "events-table", Item: { ...key, data: { S: "x" } } } },
+              "events-table",
+              ["pk", "sk"],
+              "match.event",
+              "the event at version 1",
+            ),
+            transactItemTarget(
+              { Delete: { TableName: "events-table", Key: key } },
+              "events-table",
+              ["pk", "sk"],
+              "Watermark",
+              "operation 0 (Watermark)",
+            ),
+          ],
+          "EventStore.append",
+        ).pipe(Effect.flip)
+        expect(error.entityType).toBe("match.event")
+        expect(String(error.cause)).toContain(
+          "the event at version 1 and operation 0 (Watermark) both target the item",
+        )
+        // A different table is a different item.
+        yield* refuseRepeatedItems(
+          [
+            transactItemTarget(
+              { Delete: { TableName: "a", Key: key } },
+              "a",
+              ["pk", "sk"],
+              "X",
+              "x",
+            ),
+            transactItemTarget(
+              { Delete: { TableName: "b", Key: key } },
+              "b",
+              ["pk", "sk"],
+              "X",
+              "y",
+            ),
+          ],
+          "EventStore.append",
+        )
+      }),
+    )
+
     it.effect("supports Transaction.check items", () =>
       Effect.gen(function* () {
         mockTransactWriteItems.mockResolvedValue({})
@@ -1050,7 +1131,7 @@ describe("EventStore", () => {
           additionalItems: [
             Watermarks.put({ writerId: "ingest-1", lastSeq: 42 }),
             Transaction.check(
-              Watermarks.get({ writerId: "ingest-1" }),
+              Watermarks.get({ writerId: "ingest-2" }),
               Expression.condition({ lt: { lastSeq: 42 } }),
             ),
           ],

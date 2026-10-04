@@ -394,8 +394,9 @@ describe("pure-authored entities in Batch / Transaction reads (#108)", () => {
           Expression.condition({ attributeExists: "pk" }),
         ),
         // BoundGet is an Effect, so `.pipe` is the Effect pipe — the data-last
-        // form of `check` still composes through it.
-        db.entities.Users.get({ orgId: "o1", userId: "u1" }).pipe(
+        // form of `check` still composes through it. (Another item: a
+        // transaction touches each item once.)
+        db.entities.Users.get({ orgId: "o1", userId: "u2" }).pipe(
           Transaction.check(Expression.condition({ attributeExists: "pk" })),
         ),
       ])
@@ -410,6 +411,9 @@ describe("pure-authored entities in Batch / Transaction reads (#108)", () => {
       )
       expect(fromAttributeMap(checks[0].ConditionCheck.Key).sk).toBe(
         "$pure-authoring#v1#user#userid_u1",
+      )
+      expect(fromAttributeMap(checks[1].ConditionCheck.Key).sk).toBe(
+        "$pure-authoring#v1#user#userid_u2",
       )
     }).pipe(Effect.provide(layers)),
   )

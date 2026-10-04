@@ -12,7 +12,7 @@
  * drift, and support added here (e.g. `EntityUpdate`) lands for both at once.
  */
 
-import type { TransactWriteItem } from "@aws-sdk/client-dynamodb"
+import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import type {
   ConcurrentModification,
   OptimisticLockError,
@@ -156,7 +156,91 @@ export interface BuiltTransactWriteItems {
   readonly items: Array<TransactWriteItem>
   /** Parallel to `items`: `provenance[i]` describes `items[i]`. */
   readonly provenance: Array<ItemProvenance>
+  /** Parallel to `items`: the item each one writes, for {@link refuseRepeatedItems}. */
+  readonly targets: Array<TransactItemTarget>
   readonly guarded: ReadonlyArray<GuardedPut>
+}
+
+// ---------------------------------------------------------------------------
+// One op per item (#133)
+// ---------------------------------------------------------------------------
+
+/** The item a transact entry writes or checks, and how to name it in an error. */
+export interface TransactItemTarget {
+  /** Its table and primary key, as one comparable string. */
+  readonly identity: string
+  /** The entity (or stream) it belongs to. */
+  readonly entityType: string
+  /** What put it in the transaction: `operation 2 (User)`, `the event at version 4`. */
+  readonly source: string
+  /** The key, readable: `pk=…, sk=…`. */
+  readonly key: string
+}
+
+/**
+ * The target of a transact entry in `tableName`, keyed by `keyFields` (the
+ * table's primary key attributes): read from a Put's item, or any other
+ * entry's `Key`.
+ */
+export const transactItemTarget = (
+  item: TransactWriteItem,
+  tableName: string,
+  keyFields: ReadonlyArray<string>,
+  entityType: string,
+  source: string,
+): TransactItemTarget => {
+  const attributes: Record<string, AttributeValue> | undefined =
+    item.Put?.Item ?? item.Delete?.Key ?? item.Update?.Key ?? item.ConditionCheck?.Key
+  const parts = keyFields.map((field) => {
+    const value = attributes?.[field]
+    return { field, value, text: value?.S ?? value?.N ?? JSON.stringify(value ?? null) }
+  })
+  return {
+    identity: [
+      tableName,
+      ...parts.map((p) => `${p.field}=${JSON.stringify(p.value ?? null)}`),
+    ].join("\u0000"),
+    entityType,
+    source,
+    key: parts.map((p) => `${p.field}=${p.text}`).join(", "),
+  }
+}
+
+/**
+ * Refuse a transaction that writes (or checks) one item more than once —
+ * BEFORE it is sent. DynamoDB allows one operation per item in a transaction
+ * and rejects the whole request otherwise; worse, the reasons it reports for
+ * a guarded put can read as a lost race (`[None, ConditionalCheckFailed]`), so
+ * the put would be retried and finally misreported as `OptimisticLockError`
+ * on one backend, and as a raw validation error on another. The targets
+ * include the items an op derives — uniqueness sentinels (reserved or
+ * released) and version snapshots — so two items swapping unique values, which
+ * release and claim the same sentinels, are refused too.
+ */
+export const refuseRepeatedItems = (
+  targets: ReadonlyArray<TransactItemTarget>,
+  operation: string,
+): Effect.Effect<void, ValidationError> => {
+  const seen = new Map<string, TransactItemTarget>()
+  for (const target of targets) {
+    const first = seen.get(target.identity)
+    if (first === undefined) {
+      seen.set(target.identity, target)
+      continue
+    }
+    return Effect.fail(
+      new ValidationError({
+        entityType: first.entityType,
+        operation,
+        cause:
+          `${operation}: the transaction touches one item more than once — ${first.source} and ` +
+          `${target.source} both target the item at ${target.key}. DynamoDB allows one ` +
+          "operation per item in a transaction, counting the uniqueness sentinels and version " +
+          "snapshots a put writes. Split the operations into separate writes. Nothing was written.",
+      }),
+    )
+  }
+  return Effect.void
 }
 
 /**
@@ -171,6 +255,9 @@ export interface BuiltTransactWriteItems {
  * cancellation reasons positionally MUST use it instead of assuming 1:1, and
  * read a guarded put's reasons through {@link judgeCancellation}.
  *
+ * Refuses items that repeat one item ({@link refuseRepeatedItems}) among those
+ * it builds; a caller adding items of its own checks them against `targets`.
+ *
  * Does NOT enforce `TRANSACT_WRITE_ITEMS_LIMIT` — the caller counts, because the
  * total may include items this builder never sees (event puts, dedup sentinels).
  * Callers must count the EXPANDED `items.length`, not `operations.length`.
@@ -184,7 +271,7 @@ export const buildTransactWriteItems = (
   TableConfig | DynamoClient
 > =>
   Effect.gen(function* () {
-    if (operations.length === 0) return { items: [], provenance: [], guarded: [] }
+    if (operations.length === 0) return { items: [], provenance: [], targets: [], guarded: [] }
 
     const opInfos: Array<{
       type: "put" | "delete" | "conditionCheck"
@@ -253,14 +340,30 @@ export const buildTransactWriteItems = (
 
     const items: Array<TransactWriteItem> = []
     const provenance: Array<ItemProvenance> = []
+    const targets: Array<TransactItemTarget> = []
     const guarded: Array<GuardedPut> = []
-    const push = (item: TransactWriteItem, from: ItemProvenance) => {
+    let tableName = ""
+    let keyFields: ReadonlyArray<string> = []
+    const push = (item: TransactWriteItem, from: ItemProvenance, derived = false) => {
       items.push(item)
       provenance.push(from)
+      targets.push(
+        transactItemTarget(
+          item,
+          tableName,
+          keyFields,
+          from.entityType,
+          `operation ${from.opIndex} (${from.entityType}${
+            derived ? ", through a uniqueness sentinel or version snapshot it writes" : ""
+          })`,
+        ),
+      )
     }
 
     for (const op of opInfos) {
-      const tableName = tableNames.get(op.entity)!
+      tableName = tableNames.get(op.entity)!
+      const primary = op.entity.indexes.primary!
+      keyFields = [primary.pk.field, primary.sk.field]
 
       if (op.type === "put") {
         const built = yield* validateAndBuildPutItem(op.entity, op.input!, `${operation}.put`)
@@ -277,8 +380,12 @@ export const buildTransactWriteItems = (
             key: op.input!,
           })
           guarded.push({ opIndex: op.opIndex, start: items.length, plan })
-          for (const item of plan.items) {
-            push(item, { opIndex: op.opIndex, kind: "guarded", entityType: op.entity.entityType })
+          for (const [i, item] of plan.items.entries()) {
+            push(
+              item,
+              { opIndex: op.opIndex, kind: "guarded", entityType: op.entity.entityType },
+              i > 0,
+            )
           }
           continue
         }
@@ -318,7 +425,8 @@ export const buildTransactWriteItems = (
       }
     }
 
-    return { items, provenance, guarded }
+    yield* refuseRepeatedItems(targets, operation)
+    return { items, provenance, targets, guarded }
   })
 
 // ---------------------------------------------------------------------------

@@ -1044,6 +1044,101 @@ describe("Transaction", () => {
     )
   })
 
+  describe("one op per item: a repeated item is refused before writing (#133)", () => {
+    const user = (userId: string, name: string) =>
+      ({ userId, email: `${userId}@x.io`, name, role: "member" }) as const
+
+    it.effect("two ops on one plain item are refused, and nothing is written", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([
+          UserEntity.put(user("u-1", "A")),
+          UserEntity.delete({ userId: "u-1" }),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.entityType).toBe("User")
+        expect(String(failure.cause)).toContain("touches one item more than once")
+        expect(String(failure.cause)).toMatch(/operation 0 \(User\) and operation 1 \(User\)/)
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("two puts of one versioned retain item are refused, not judged a lost race", () =>
+      Effect.gen(function* () {
+        const member = (label: string) => ({ memberId: "m-9", email: "m9@x.io", label })
+        const error = yield* Transaction.transactWrite([
+          LifecycleMembers.put(member("a")),
+          LifecycleMembers.put(member("b")),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).entityType).toBe("LifecycleMember")
+        expect(String((error as ValidationError).cause)).toContain(
+          "touches one item more than once",
+        )
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("swapping unique values between two items repeats a sentinel and is refused", () =>
+      Effect.gen(function* () {
+        // Both items exist, each holding (and owning) its own value's sentinel.
+        const stored: Record<string, Record<string, unknown>> = {
+          "$myapp#v1#sparsemember#memberid_s-1": { memberId: "s-1", email: "s1@x.io" },
+          "$myapp#v1#sparsemember#memberid_s-2": { memberId: "s-2", email: "s2@x.io" },
+        }
+        const owners: Record<string, string> = {
+          "$myapp#v1#sparsemember.email#s1@x.io": "$myapp#v1#sparsemember#memberid_s-1",
+          "$myapp#v1#sparsemember.email#s2@x.io": "$myapp#v1#sparsemember#memberid_s-2",
+        }
+        mockGetItem.mockImplementation(async (input: any) => {
+          const pk = input.Key.pk.S as string
+          if (input.ProjectionExpression === "#epk, #esk") {
+            const owner = owners[pk]
+            return owner === undefined
+              ? {}
+              : {
+                  Item: toAttributeMap({ _entity_pk: owner, _entity_sk: "$myapp#v1#sparsemember" }),
+                }
+          }
+          const item = stored[pk]
+          return item === undefined
+            ? {}
+            : {
+                Item: toAttributeMap({
+                  ...item,
+                  label: "L",
+                  pk,
+                  sk: "$myapp#v1#sparsemember",
+                  __edd_e__: "SparseMember",
+                }),
+              }
+        })
+        const error = yield* Transaction.transactWrite([
+          SparseMembers.put({ memberId: "s-1", email: "s2@x.io", label: "L" }),
+          SparseMembers.put({ memberId: "s-2", email: "s1@x.io", label: "L" }),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).entityType).toBe("SparseMember")
+        expect(String((error as ValidationError).cause)).toContain(
+          "touches one item more than once",
+        )
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("distinct items in one transaction are written as before", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        yield* Transaction.transactWrite([
+          UserEntity.put(user("u-1", "A")),
+          UserEntity.delete({ userId: "u-2" }),
+          OrderEntity.delete({ orderId: "u-1" }),
+        ])
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
   describe("unsupported ops are rejected, not silently reinterpreted (#100)", () => {
     const upsertInput = { userId: "u-1", email: "a@x.io", name: "Alice", role: "admin" } as const
 

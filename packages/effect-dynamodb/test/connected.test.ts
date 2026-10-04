@@ -16527,14 +16527,32 @@ describeConnected("#133 — path operations on index composites and unique field
         g133Entities.AccountsBare.put({ id: "sw1", email: "sw2@x.io", name: "a" } as any),
         g133Entities.AccountsBare.put({ id: "sw2", email: "sw1@x.io", name: "b" } as any),
       ]).pipe(Effect.flip)
-      expect(swapped._tag).toBe("DynamoValidationError")
+      // Refused before anything is sent, naming the entity.
+      expect(swapped._tag).toBe("ValidationError")
+      expect(swapped.entityType).toBe("G133AccountBare")
+      expect(String(swapped.cause)).toContain("touches one item more than once")
 
       // Two puts of one item.
       const twice = yield* Transaction.transactWrite([
         g133Entities.AccountsBare.put({ id: "sw1", email: "sw1@x.io", name: "c" } as any),
         g133Entities.AccountsBare.put({ id: "sw1", email: "sw1@x.io", name: "d" } as any),
       ]).pipe(Effect.flip)
-      expect(twice._tag).toBe("DynamoValidationError")
+      expect(twice._tag).toBe("ValidationError")
+      expect(String(twice.cause)).toContain("touches one item more than once")
+
+      // Two puts of one versioned retain item: refused too — not judged a lost
+      // race, retried and reported as `OptimisticLockError`.
+      const retained = db.entities.DevicesRetained as any
+      yield* retained.put({ id: "sw3", owner: "o", label: "v1" })
+      const retainedTwice = yield* Transaction.transactWrite([
+        g133Entities.DevicesRetained.put({ id: "sw3", owner: "o", label: "a" } as any),
+        g133Entities.DevicesRetained.put({ id: "sw3", owner: "o", label: "b" } as any),
+      ]).pipe(Effect.flip)
+      expect(retainedTwice._tag).toBe("ValidationError")
+      expect(retainedTwice.entityType).toBe("G133DeviceRetained")
+      const sw3 = yield* rawItem("G133DeviceRetained", "sw3")
+      expect([sw3.label, sw3.version]).toEqual([{ S: "v1" }, { N: "1" }])
+      expect(yield* snapshotLabel("G133DeviceRetained", "sw3", 2)).toBeUndefined()
 
       // Nothing was written: both items and their sentinels are as they were.
       expect((yield* rawItem("G133AccountBare", "sw1")).email).toEqual({ S: "sw1@x.io" })
