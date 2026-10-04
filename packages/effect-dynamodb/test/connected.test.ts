@@ -16513,6 +16513,40 @@ describeConnected("#133 — path operations on index composites and unique field
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
+  it.effect("transactWrite refuses two ops on one item, including swapped unique values", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const bare = db.entities.AccountsBare as any
+      yield* bare.put({ id: "sw1", email: "sw1@x.io", name: "a" })
+      yield* bare.put({ id: "sw2", email: "sw2@x.io", name: "b" })
+
+      // Swapping values releases and claims each sentinel in the same transaction.
+      const swapped = yield* Transaction.transactWrite([
+        g133Entities.AccountsBare.put({ id: "sw1", email: "sw2@x.io", name: "a" } as any),
+        g133Entities.AccountsBare.put({ id: "sw2", email: "sw1@x.io", name: "b" } as any),
+      ]).pipe(Effect.flip)
+      expect(swapped._tag).toBe("DynamoValidationError")
+
+      // Two puts of one item.
+      const twice = yield* Transaction.transactWrite([
+        g133Entities.AccountsBare.put({ id: "sw1", email: "sw1@x.io", name: "c" } as any),
+        g133Entities.AccountsBare.put({ id: "sw1", email: "sw1@x.io", name: "d" } as any),
+      ]).pipe(Effect.flip)
+      expect(twice._tag).toBe("DynamoValidationError")
+
+      // Nothing was written: both items and their sentinels are as they were.
+      expect((yield* rawItem("G133AccountBare", "sw1")).email).toEqual({ S: "sw1@x.io" })
+      expect((yield* rawItem("G133AccountBare", "sw1")).name).toEqual({ S: "a" })
+      expect((yield* rawItem("G133AccountBare", "sw2")).email).toEqual({ S: "sw2@x.io" })
+      expect(yield* sentinelOwner("G133AccountBare", "email", "sw1@x.io")).toBe(
+        mainKey("G133AccountBare", "sw1").pk.S,
+      )
+      expect(yield* sentinelOwner("G133AccountBare", "email", "sw2@x.io")).toBe(
+        mainKey("G133AccountBare", "sw2").pk.S,
+      )
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
   // ---- a deleted retain item's key is reused: its history continues (#133) ----
 
   it.effect("a hard-deleted retain item is created again past its retained history", () =>
