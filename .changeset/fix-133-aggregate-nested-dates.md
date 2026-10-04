@@ -1,8 +1,8 @@
 ---
-"effect-dynamodb": patch
-"@effect-dynamodb/schema": patch
-"@effect-dynamodb/geo": patch
-"@effect-dynamodb/language-service": patch
+"effect-dynamodb": minor
+"@effect-dynamodb/schema": minor
+"@effect-dynamodb/geo": minor
+"@effect-dynamodb/language-service": minor
 ---
 
 Store nested dates and other transformed values in wire form, read the maps earlier versions wrote, and support nested sub-aggregates (#133)
@@ -18,10 +18,19 @@ real `DateTime`s.
 
 ### Before you upgrade
 
+- **Upgrade every reader before any writer, and don't roll back past this
+  version once new rows are written.** A self date (`Schema.DateTimeUtc`,
+  `Schema.Date`, or one with `storedAs`) inside a `NullOr` or other union, a
+  `Record` or a `Tuple` is now stored as a string or number, on entities and
+  aggregates alike. 1.22.0 fails to read it (`Expected DateTime.Utc`), or, in a
+  union with a string member, reads it back as a plain string. The other shapes
+  this release writes differently stay readable by 1.22.0: dates in arrays and
+  arrays of classes, transform dates such as `DateTimeUtcFromString` in any
+  container, refs in `many` elements declared as plain classes, and optional
+  `NumberFromString` fields.
 - **Keys are unchanged** for every existing entity and aggregate shape: `pk`,
   `sk`, GSI, unique, version, soft-delete, time-series, collection and
-  list-index keys are composed byte-for-byte as before. Existing rows stay
-  addressable.
+  list-index keys are composed byte-for-byte as before.
 - **Some attributes change stored type** on their next write, listed under each
   section below. For example, an optional `NumberFromString` holding `5` was
   stored as `{ "N": "5" }` and is now `{ "S": "5" }`, and a nested self date was
@@ -29,17 +38,27 @@ real `DateTime`s.
   filter on such an attribute (a `filter` expression, or a `filterBy` predicate,
   which sees the stored value) can match old and new rows differently, and
   DynamoDB Streams consumers see the attribute change type.
-- **No backfill is performed.** Old rows read correctly as they are (with the
-  exceptions in the next point), and are rewritten in wire form when they are
-  next written. For an aggregate that means the next `update` that changes the
-  row's group (the root item or its sub-aggregate); an update that changes
-  nothing writes nothing.
+- **Two model shapes are now rejected at `make()`.** A union whose date member
+  is stored as an epoch number next to a member also stored as a number
+  (`Number`, a number literal, `BigInt`, another epoch date) fails with
+  `EDD-9058`, because a stored number could belong to either member. Store the
+  date as a string (the default for a self date) or remove the numeric member.
+  A `DynamoModel.configure` `storedAs` override on a union field with more than
+  one date member fails with `EDD-9057`; annotate the intended member instead.
+- **A canonical ISO string in a string member reads as a date.** In
+  `Schema.Union([Schema.DateTimeUtc, Schema.String])`, the exact ISO form the
+  library writes for a date (`"2000-01-01T00:00:00.000Z"`) reads back as a
+  `DateTime`, even if it was written as a string. Other strings (`"2020"`, `"5"`,
+  `"hello"`) stay strings. If a string field may hold ISO instants, use a tagged
+  or discriminated shape.
+- **No backfill is performed.** Old rows read correctly as they are, and are
+  rewritten in wire form when they are next written. For an aggregate that
+  means the next `update` that changes the row's group (the root item or its
+  sub-aggregate); an update that changes nothing writes nothing.
 - **Values that were lost stay lost.** A domain object with no enumerable state
   was stored as a map holding no value: a `Schema.Date` (`{M:{}}`), a `URL`, a
   `Duration`, a `BigDecimal`. These cannot be recovered, and reading them fails
-  with a `ValidationError`. So does a raw value an entity path update wrote to a
-  transform field (a number on a `NumberFromString` field, a map on a
-  `DateTimeUtcFromString` field), which never read back; rewrite it with `set`.
+  with a `ValidationError`.
 - **Nested sub-aggregates written by earlier versions are not read.** Rows below
   the first sub-aggregate level used different keys, and never read back
   before. Recreate those aggregates.
@@ -55,14 +74,14 @@ arrays), records, tuples, refs hydrated into `one` / `many` items
 
 **Reads.** Date maps written by earlier versions are rebuilt into real
 `DateTime` values, whichever type-id key they carry; `Zoned` values keep their
-named or offset zone. An optional `BigIntFromString` stored as a number by
-earlier versions, which could not be read back at all, now reads as a `bigint`.
+named or offset zone. An optional `BigIntFromString` and a plain `Schema.BigInt`
+stored as a number, which could not be read back at all, now read as a `bigint`.
 
 **Stored-type changes.** A top-level `Schema.optional(...)` or `Schema.NullOr(...)`
 around a non-date transform (such as `NumberFromString` or `BigIntFromString`),
 on the root item, an edge item or a `many` element's own fields, is now stored
 encoded rather than in its domain form. So is a `NumberFromString` nested inside
-a hydrated ref.
+a hydrated ref, and a self date inside a union, record or tuple.
 
 **Now working.** None of these worked on 1.22.0:
 
@@ -91,23 +110,41 @@ element fields still stores the renamed values in their domain form, so a
 
 ### Entities
 
-**Self dates in containers.** A self date (`Schema.DateTimeUtc`, `Schema.Date`,
-or one with `storedAs`) inside a `NullOr` or other union, a nullable class
-(`NullOr(Stamp)`), an array of a union (`Array(NullOr(date))`), a `Record`
-value, or a `Tuple` / `TupleWithRest` / `StructWithRest` was stored as a
-`DateTime` map. It is now stored in its wire form (a number where `storedAs`
-says so), and existing map rows read back as real `DateTime`s. Transform
-schemas such as `DateTimeUtcFromString` already stored their wire form and are
-unchanged. A `TupleWithRest` field is also no longer mis-derived as an array.
+**Self dates in containers.** A self date inside a `NullOr` or other union, a
+nullable class (`NullOr(Stamp)`), an array of a union (`Array(NullOr(date))`), a
+`Record` value, or a `Tuple` / `TupleWithRest` / `StructWithRest` was stored as
+a `DateTime` map. It is now stored in its wire form (a number where `storedAs`
+says so), and existing map rows read back as real `DateTime`s. A
+`DynamoModel.configure` `storedAs` override on a union field now applies to its
+date member. Transform schemas such as `DateTimeUtcFromString` already stored
+their wire form and are unchanged. A `TupleWithRest` field is also no longer
+mis-derived as an array.
 
 **Path updates.** `pathSet`, `pathAppend`, `pathPrepend`, `pathIfNotExists` and
 the record-based `.append()` (including on versioned entities that retain
-snapshots) now encode their value through the schema at the path. Before, they
-wrote the raw value: a `DateTime` became a map even on a plain date field, and a
-`NumberFromString` value was stored as a number. A map written that way on a
-self date field reads back as a real `DateTime`. `ADD`, `DELETE` and `SUBTRACT`
-are unchanged. A path the model schema cannot follow, such as one into a
-`DynamoModel.ref` field, still writes the value as given.
+snapshots) now encode their value through the schema at the path, as `.set()`
+does. Before, they wrote the raw value: a `DateTime` became a map even on a
+plain date field, and a `NumberFromString` value was stored as a number. Values
+are decoded and re-encoded, so a plain object on a class-typed field is encoded
+as that class and a `Schema.Trim` field stores its trimmed form. Class, struct,
+record, tuple and union values are always encoded, so their `DateTime`, `Date`
+and `Redacted` contents keep their wire form. A value already in the wire form
+of a leaf transform with a primitive wire form (`StringFromBase64`,
+`fromJsonString`), or an array of them, is stored as given rather than
+double-encoded. `ADD`, `DELETE` and `SUBTRACT` are unchanged. A path the model
+schema cannot follow, such as one into a `DynamoModel.ref` field, still writes
+the value as given.
+
+**Legacy values read back.** The raw values earlier path updates left on
+transform fields now read: a number on a `NumberFromString` field, a
+safe-integer number on a `BigIntFromString` field, a `DateTime` map on a date
+transform. A plain `Schema.BigInt`, stored as a number, now reads back as a
+`bigint`.
+
+**Zoned dates.** A self `Schema.DateTimeZoned` with an offset zone (`+05:00`)
+now reads back with that offset, wherever it sits in the model; earlier versions
+read it back as UTC. Named zones and UTC round-trip as before, and the stored
+form is unchanged.
 
 ### Nested sub-aggregates
 
