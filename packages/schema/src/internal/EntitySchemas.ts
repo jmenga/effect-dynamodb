@@ -398,6 +398,51 @@ export const isSelfDateSchema = (schema: Schema.Top): boolean => {
 }
 
 /**
+ * Whether a value of this schema can hold something, AT ANY DEPTH, whose stored
+ * form differs from its domain form (#133):
+ *
+ * - any node carrying an encoding transformation — a leaf transform
+ *   (`DateTimeUtcFromString`, `BigIntFromString`, …), a `Schema.Class`, a
+ *   `withDecodingDefault` chain;
+ * - a self date (`Schema.DateTimeUtc` / `DateTimeZoned` / `Date`), whose domain
+ *   value marshals to a map rather than its wire primitive;
+ * - a `Redacted` declaration.
+ *
+ * Walks through containers (`Arrays`, `Objects`, `Union` — which covers
+ * `Schema.optional` and `NullOr` — and `Suspend`); an `optionalKey` wrapper is
+ * the inner AST with an optional context, so it needs no case of its own.
+ *
+ * `hasEncodingTransformation` asks the same question of the TOP-LEVEL node
+ * only, and an `Arrays` / `Objects` node never carries an encoding itself — so a
+ * `Schema.Array(DateTimeUtcFromString)` attribute was treated as identity and
+ * its `DateTime`s were marshalled as maps.
+ */
+export const containsWireTransform = (schema: Schema.Top): boolean =>
+  astContainsWireTransform(schema.ast, new Set())
+
+const astContainsWireTransform = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST>): boolean => {
+  if (seen.has(ast)) return false
+  seen.add(ast)
+  if (ast.encoding !== undefined) return true
+  if (SchemaAST.isDeclaration(ast)) {
+    const resolved = SchemaAST.resolve(ast) as globalThis.Record<string, unknown> | undefined
+    const rep = resolved?.representation as { readonly id?: string } | undefined
+    return matchDateRepresentation(resolved) !== undefined || rep?.id === "effect/schema/Redacted"
+  }
+  const walk = (child: SchemaAST.AST) => astContainsWireTransform(child, seen)
+  if (SchemaAST.isArrays(ast)) return ast.elements.some(walk) || ast.rest.some(walk)
+  if (SchemaAST.isObjects(ast)) {
+    return (
+      ast.propertySignatures.some((ps) => walk(ps.type)) ||
+      ast.indexSignatures.some((is) => walk(is.type))
+    )
+  }
+  if (SchemaAST.isUnion(ast)) return ast.types.some(walk)
+  if (SchemaAST.isSuspend(ast)) return walk(ast.thunk())
+  return false
+}
+
+/**
  * Returns true when the schema is a transform schema with a date typeConstructor
  * (e.g. `Schema.DateTimeUtcFromString`, `DynamoModel.DateEpochSeconds`).
  * Used to enforce the "transform owns the wire format" policy at Entity.make().
@@ -411,6 +456,68 @@ export const isDateTransform = (schema: Schema.Top): boolean => {
 // Self-date schema substitution
 // ---------------------------------------------------------------------------
 
+/** A plain record — what unmarshalling produces, as opposed to a class instance. */
+const isPlainObject = (value: unknown): value is globalThis.Record<string, unknown> => {
+  if (value === null || typeof value !== "object") return false
+  const proto = Object.getPrototypeOf(value)
+  return proto === Object.prototype || proto === null
+}
+
+/**
+ * A real `DateTime` instance. `DateTime.isDateTime` checks for the type-id
+ * property only, so a plain object read back from a marshalled instance passes
+ * it too (#133) — and is then neither `Equal` to the instant nor usable with the
+ * `DateTime` API that relies on the prototype.
+ */
+const isGenuineDateTime = (value: unknown): value is DateTime.DateTime =>
+  DateTime.isDateTime(value) && !isPlainObject(value)
+
+const reviveTimeZone = (zone: unknown): DateTime.TimeZone | undefined => {
+  if (!isPlainObject(zone)) return undefined
+  try {
+    if (zone._tag === "Named" && typeof zone.id === "string") {
+      return DateTime.zoneMakeNamedUnsafe(zone.id)
+    }
+    if (zone._tag === "Offset" && typeof zone.offset === "number") {
+      return DateTime.zoneMakeOffset(zone.offset)
+    }
+  } catch {
+    return undefined
+  }
+  return undefined
+}
+
+/**
+ * Rebuild a `DateTime` from a MARSHALLED instance (#133).
+ *
+ * Before #133 an aggregate stored some `DateTime`s by marshalling the instance
+ * itself, which keeps its own enumerable properties:
+ *
+ * - `Utc`: `{ epochMilliseconds, <type-id>, _tag: "Utc" }`
+ * - `Zoned`: the same plus `zone`, itself `{ id, _tag: "Named" }` or
+ *   `{ offset, _tag: "Offset" }` (a named zone's `Intl` formatter marshals to
+ *   an empty map and is not needed).
+ *
+ * The type-id key is `~effect/time/DateTime` on effect 4.0.0-rc and
+ * `~effect/DateTime` on 4.0.0, so it is deliberately NOT inspected: the instant
+ * and the tag are what identify the value, and they are all a `DateTime` holds.
+ * A zoned value is rebuilt only when its zone is recoverable.
+ *
+ * Returns `undefined` for anything else — including a genuine `DateTime`, which
+ * needs no rebuilding.
+ */
+export const reviveMarshalledDateTime = (value: unknown): DateTime.DateTime | undefined => {
+  if (!isPlainObject(value)) return undefined
+  const epochMs = value.epochMilliseconds
+  if (typeof epochMs !== "number" || !Number.isFinite(epochMs)) return undefined
+  if (value._tag === "Utc") return DateTime.makeUnsafe(epochMs)
+  if (value._tag === "Zoned") {
+    const timeZone = reviveTimeZone(value.zone)
+    return timeZone === undefined ? undefined : DateTime.makeZonedUnsafe(epochMs, { timeZone })
+  }
+  return undefined
+}
+
 /**
  * Convert any input value (string / number / DateTime / Date) to the wire
  * primitive for a given encoding. Used by date substitutes' `encode` path.
@@ -421,7 +528,8 @@ export const isDateTransform = (schema: Schema.Top): boolean => {
  * - `epochMs` storage → integer milliseconds since the Unix epoch
  * - `epochSeconds` storage → integer seconds since the Unix epoch (TTL format)
  */
-const toWirePrimitive = (value: unknown, encoding: DynamoEncoding): string | number => {
+const toWirePrimitive = (input: unknown, encoding: DynamoEncoding): string | number => {
+  const value = reviveMarshalledDateTime(input) ?? input
   let epochMs: number
   let zoned: DateTime.Zoned | undefined
   if (DateTime.isDateTime(value)) {
@@ -478,8 +586,29 @@ export const buildDateTransform = (encoding: DynamoEncoding): Schema.Top => {
         return Schema.Date as unknown as Schema.Top
     }
   })()
+  const fromDateTime = (value: DateTime.DateTime): unknown => {
+    switch (encoding.domain) {
+      case "DateTime.Utc":
+        return DateTime.toUtc(value)
+      case "DateTime.Zoned":
+        return DateTime.isZoned(value)
+          ? value
+          : DateTime.makeZonedUnsafe(DateTime.toEpochMillis(value), { timeZone: "UTC" })
+      case "Date":
+        return DateTime.toDateUtc(value)
+    }
+  }
   const liftToDomain = (value: unknown): unknown => {
-    if (DateTime.isDateTime(value)) return value
+    // A marshalled `DateTime` instance (#133) — rebuilt, whatever type-id key
+    // the Effect version that wrote it used.
+    const revived = reviveMarshalledDateTime(value)
+    if (revived !== undefined) return fromDateTime(revived)
+    if (DateTime.isDateTime(value)) {
+      if (isGenuineDateTime(value)) return value
+      // Duck-types as a DateTime but carries no recoverable instant: refuse it
+      // rather than hand a plain object to the domain.
+      throw new Error("[effect-dynamodb] unrecoverable marshalled DateTime")
+    }
     if (value instanceof Date) {
       switch (encoding.domain) {
         case "DateTime.Utc":
