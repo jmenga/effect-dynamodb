@@ -32,12 +32,17 @@ import {
 import type { TimestampsConfig } from "@effect-dynamodb/schema/internal/EntityConfig.js"
 import {
   buildDateTransform,
+  containsWireTransform,
   matchDateRepresentation,
   resolveSystemFields,
   substituteSchemaDeep,
   validateNoTransformOverride,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
-import { hasEncodingTransformation } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
+import {
+  extractArrayElement,
+  getSchemaFields,
+  hasEncodingTransformation,
+} from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { type Context, DateTime, Effect, type Optic, Option, Schema, SchemaAST } from "effect"
 import * as Batch from "./Batch.js"
@@ -141,12 +146,22 @@ interface ResolvedNode {
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
   readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
   /**
-   * Per-field encoders for this node entity's own date fields, applied on the
-   * WRITE path (decompose) so transform/self-date values are serialized to their
-   * wire primitive before marshalling (issue #72). Undefined for the root, whose
-   * attributes are encoded directly by `decomposeAggregate`.
+   * Per-attribute encoders for this node's items, applied on the WRITE path
+   * (decompose) so every value with a wire form — a date, a transformed scalar,
+   * or a container or hydrated ref holding one — is put into it before
+   * marshalling (#72, #133). Built from the schema the decomposed values
+   * actually have: a `many` edge's array ELEMENT, a `one` edge's entity model, a
+   * sub-aggregate's own schema. Undefined for the root, whose attributes are
+   * encoded directly by `decomposeAggregate`.
    */
   readonly attrEncoders?: Record<string, (value: unknown) => unknown> | undefined
+  /**
+   * `many` edges only: the encoders whose output the edge's sort-key composites
+   * are read from. These are the pre-#133 encoders, kept separate from
+   * {@link attrEncoders} so that putting a nested value into its wire form can
+   * never change a composed key (see {@link buildKeyAttrEncoders}).
+   */
+  readonly keyAttrEncoders?: Record<string, (value: unknown) => unknown> | undefined
   /**
    * Declared sort-key composites for a `many` edge (`Aggregate.many(..., { sk })`).
    * When present these are authoritative: they replace the ref-identifier
@@ -685,6 +700,50 @@ const inferDateEncoding = (ast: Schema.Top["ast"]): DynamoEncoding | undefined =
   return undefined
 }
 
+/** Resolves a ref field (by schema identity) to the model it should be read as. */
+type RefResolver = (name: string, field: Schema.Top) => Schema.Top | undefined
+
+type AttrEncoders = Record<string, (value: unknown) => unknown>
+
+/**
+ * The date branch shared by both encoder builders: an explicit
+ * `DynamoModel.storedAs` annotation, or the inferred default for a standard
+ * Effect date schema. It wins over the field's own encode because `storedAs` is
+ * precisely an override of it (a `Schema.DateTimeUtc` field marked
+ * `storedAs(DateEpochMs)` must store the epoch, not the ISO string its own schema
+ * would produce).
+ */
+const dateAttrEncoder = (fieldSchema: Schema.Top): ((value: unknown) => unknown) | undefined => {
+  const encoding = DynamoModel.getEncoding(fieldSchema) ?? inferDateEncoding(fieldSchema.ast)
+  if (!encoding) return undefined
+  const encode = Schema.encodeUnknownSync(buildDateTransform(encoding) as Schema.Codec<any>)
+  return (value) => encode(value)
+}
+
+/**
+ * The field's own encode, with `decode -> encode` as the fallback so a caller
+ * who already supplied wire form round-trips to itself (the same strategy
+ * `Entity.put` uses). Neither working means the value is neither Type nor
+ * Encoded for this field; it is stored unchanged rather than introducing a
+ * write-time failure mode — that shape is already unreadable, and the tolerant
+ * read path reports it.
+ */
+const ownAttrEncoder = (fieldSchema: Schema.Top): ((value: unknown) => unknown) => {
+  const codec = fieldSchema as unknown as Schema.Codec<any>
+  const encode = Schema.encodeUnknownOption(codec)
+  const decode = Schema.decodeUnknownOption(codec)
+  return (value) => {
+    const direct = encode(value)
+    if (Option.isSome(direct)) return direct.value
+    const decoded = decode(value)
+    if (Option.isSome(decoded)) {
+      const reencoded = encode(decoded.value)
+      if (Option.isSome(reencoded)) return reencoded.value
+    }
+    return value
+  }
+}
+
 /**
  * Build per-field ATTRIBUTE encoders for a schema's own fields — the write-side
  * equivalent of what `Entity.put` gets for free by encoding its whole input
@@ -692,69 +751,94 @@ const inferDateEncoding = (ast: Schema.Top["ast"]): DynamoEncoding | undefined =
  *
  * Decomposition works from the schema-DECODED domain object, so every attribute
  * it produces is a Type-side value. Marshalling those directly stores a shape
- * the read path cannot decode: a `Schema.BigIntFromString` field lands as
- * `{N:"5"}` and assembly's decode (which expects the encoded string) rejects it,
- * so the aggregate cannot round-trip at all. Dates were noticed first (#72) and
- * got a date-only pass; the same argument applies to every transformed field.
+ * the read path cannot decode: a `DateTime` lands as a marshalled
+ * `{ epochMilliseconds, "~effect/DateTime", _tag }` map, a `Date` as `{M:{}}`,
+ * a `bigint` as `{N:"5"}`.
  *
  * Exactly ONE encoder per field, so nothing is ever encoded twice:
  *
- * 1. **A date encoding** — an explicit `DynamoModel.storedAs` annotation, or the
- *    inferred default for a standard Effect date schema. This wins over the
- *    field's own encode because `storedAs` is precisely an override of it
- *    (a `Schema.DateTimeUtc` field marked `storedAs(DateEpochMs)` must store the
- *    epoch, not the ISO string its own schema would produce). This branch is the
- *    former `buildAttrEncoders`, unchanged.
- * 2. **Any other encoding transformation** — the field's own `encode`. A ref
- *    field's schema is the referenced entity's, so a hydrated ref is encoded
- *    with the entity it came from, not with the aggregate's schema.
- * 3. **No transformation** — no encoder at all, so the stored bytes are
+ * 1. **A date encoding** — see {@link dateAttrEncoder}.
+ * 2. **Anything that holds a wire transform AT ANY DEPTH** — a leaf transform, a
+ *    `Schema.Class`, and also an `Array` / `Struct` / `Union` containing one, or
+ *    a self date or `Redacted` nested anywhere ({@link containsWireTransform}).
+ *    The attribute is encoded through the SAME substituted, tolerant schema the
+ *    read path decodes it with (`substituteSchemaDeep` under
+ *    `tolerantTransforms`, with the aggregate's ref resolver), so the stored
+ *    form is exactly what assembly reads back — nested date leaves included —
+ *    and a `DynamoModel.ref`-annotated field is encoded through the ref
+ *    target's model. The field's own encode is the fallback.
+ *
+ *    Gating on the TOP-LEVEL node instead (as before #133) skipped every
+ *    container, because an `Arrays` / `Objects` node carries no encoding of its
+ *    own: `Schema.Array(DateTimeUtcFromString)` and `Schema.Array(SomeClass)`
+ *    attributes stored their `DateTime`s as maps.
+ * 3. **Nothing to encode** — no encoder at all, so the stored bytes are
  *    identical to before this existed.
  *
- * The READ path is handled entirely by the aggregate's tolerant `decodeSchema`
- * (see `makeAggregate`), so no separate decoders are needed.
+ * Encoding stays PER ATTRIBUTE: decomposition and key composition need the
+ * Type-side values (`numericTypeWithStringEncoding`), so the aggregate is never
+ * encoded as a whole before it is decomposed.
  */
 const buildAttrEncoders = (
   fields: Record<string, Schema.Top> | undefined,
-): Record<string, (value: unknown) => unknown> => {
-  const encoders: Record<string, (value: unknown) => unknown> = {}
+  resolveRef?: RefResolver | undefined,
+): AttrEncoders => {
+  const encoders: AttrEncoders = {}
   if (!fields) return encoders
 
   for (const field of Object.keys(fields)) {
     const fieldSchema = fields[field]!
 
-    // 1. Date encoding — `storedAs` override, else the inferred date default.
-    const encoding = DynamoModel.getEncoding(fieldSchema) ?? inferDateEncoding(fieldSchema.ast)
-    if (encoding) {
-      const encode = Schema.encodeUnknownSync(buildDateTransform(encoding) as Schema.Codec<any>)
-      encoders[field] = (value) => encode(value)
+    // 1. Date encoding.
+    const date = dateAttrEncoder(fieldSchema)
+    if (date) {
+      encoders[field] = date
       continue
     }
 
-    // 3. Identity by construction — `SchemaAST` documents `encoding === undefined`
-    //    as "type and encoded forms are identical". Adding an encoder here could
-    //    only change bytes that are already correct.
-    if (!hasEncodingTransformation(fieldSchema)) continue
+    // 3. Nothing anywhere in the value has a wire form distinct from its domain form.
+    if (!containsWireTransform(fieldSchema)) continue
 
-    // 2. The field's own encode, with `decode -> encode` as the fallback so a
-    //    caller who already supplied wire form round-trips to itself (the same
-    //    strategy `Entity.put` uses). Neither working means the value is neither
-    //    Type nor Encoded for this field; store it unchanged rather than
-    //    introduce a new write-time failure mode mid-release — that shape is
-    //    already unreadable, and the tolerant read path reports it.
-    const codec = fieldSchema as unknown as Schema.Codec<any>
-    const encode = Schema.encodeUnknownOption(codec)
-    const decode = Schema.decodeUnknownOption(codec)
+    // 2. Encode through the read path's own (substituted, tolerant) schema. A
+    //    one-field struct carries the field's optionality and lets `resolveRef`
+    //    re-point the field itself, exactly as it does inside `decodeSchema`.
+    const substituted = substituteSchemaDeep(Schema.Struct({ [field]: fieldSchema }), {
+      tolerantTransforms: true,
+      resolveRef,
+    }) as unknown as Schema.Codec<any>
+    const encodeSubstituted = Schema.encodeUnknownOption(substituted)
+    const own = ownAttrEncoder(fieldSchema)
     encoders[field] = (value) => {
-      const direct = encode(value)
-      if (Option.isSome(direct)) return direct.value
-      const decoded = decode(value)
-      if (Option.isSome(decoded)) {
-        const reencoded = encode(decoded.value)
-        if (Option.isSome(reencoded)) return reencoded.value
-      }
-      return value
+      const encoded = encodeSubstituted({ [field]: value })
+      if (Option.isSome(encoded)) return (encoded.value as Record<string, unknown>)[field]
+      return own(value)
     }
+  }
+  return encoders
+}
+
+/**
+ * The encoders sort-key composites are READ from — the encoders as they stood
+ * before #133, gated on the field's TOP-LEVEL encoding.
+ *
+ * A `many` edge's declared `sk.composite` (and a root list index's composites)
+ * are read off the item's attributes. Those attributes used to be encoded by
+ * these encoders only, so the stored keys were composed from their output: a
+ * top-level transformed field from its encoded form, anything nested (a
+ * `DateTime` or `NumberFromString` reached through `"umpire.dateOfBirth"`) from
+ * its domain form. Composing keys from the new, deeper encoders instead would
+ * re-spell those keys — orphaning every stored row and making `update` diff
+ * against keys that do not exist. Keys therefore keep this exact behaviour,
+ * and only the STORED attribute values gain the deeper encoding.
+ */
+const buildKeyAttrEncoders = (fields: Record<string, Schema.Top> | undefined): AttrEncoders => {
+  const encoders: AttrEncoders = {}
+  if (!fields) return encoders
+  for (const field of Object.keys(fields)) {
+    const fieldSchema = fields[field]!
+    const date = dateAttrEncoder(fieldSchema)
+    if (date) encoders[field] = date
+    else if (hasEncodingTransformation(fieldSchema)) encoders[field] = ownAttrEncoder(fieldSchema)
   }
   return encoders
 }
@@ -775,11 +859,140 @@ const fieldsOf = (schema: unknown): Record<string, Schema.Top> | undefined => {
   return (source as { readonly fields?: Record<string, Schema.Top> } | undefined)?.fields
 }
 
+/** The value schema of a struct field, with any `optionalKey` / `optional` wrapper removed. */
+const unwrapOptionalField = (field: Schema.Top): Schema.Top => {
+  if (!SchemaAST.isOptional(field.ast)) return field
+  const inner = (field as { readonly schema?: Schema.Top }).schema
+  if (inner === undefined) return field
+  // `Schema.optional(X)`: the value is `UndefinedOr(X)`; X is the non-`Undefined` member.
+  const members = (inner as { readonly members?: ReadonlyArray<Schema.Top> }).members
+  if (members !== undefined && SchemaAST.isUnion(inner.ast)) {
+    return members.find((m) => !SchemaAST.isUndefined(m.ast)) ?? field
+  }
+  return inner
+}
+
 /**
- * Apply a node's date encoders in place — converts the node entity's own domain
- * date fields to their wire primitives before the decomposed item is marshalled
- * (issue #72: without this, an edge's `DateTime` field marshals to `{M:{}}` and
- * the subsequent `get`/assemble fails decoding it as a string).
+ * Whether a field is a class-like value whose fields the schema walker cannot
+ * see. `DynamoModel.ref` annotates with `Schema.annotate`, which drops a
+ * `Schema.Class`'s `.fields`, so `substituteSchemaDeep` cannot recurse into it
+ * and the target's transformed fields keep their strict decoders. A plain class
+ * is introspectable and is left to the walker.
+ */
+const isOpaqueRefField = (field: Schema.Top): boolean => {
+  const inner = unwrapOptionalField(field)
+  return getSchemaFields(inner) === undefined && SchemaAST.isDeclaration(inner.ast)
+}
+
+/**
+ * The fields of a `many` edge's ELEMENT, read off the parent model's array
+ * field (`players: Schema.Array(PlayerSheet)` → `PlayerSheet`'s fields).
+ * `undefined` when the field is not array-shaped (a custom `decompose`) or its
+ * element exposes no fields (a scalar, or an opaque ref).
+ */
+const manyElementFields = (
+  parentFields: Record<string, Schema.Top> | undefined,
+  edgeName: string,
+): Record<string, Schema.Top> | undefined => {
+  const field = parentFields?.[edgeName]
+  const element = field === undefined ? undefined : extractArrayElement(field)
+  return element === undefined ? undefined : getSchemaFields(element)
+}
+
+/** The structural slice of an edge's target entity that ref resolution reads. */
+interface RefTargetEntity {
+  readonly model?: Schema.Top
+  readonly _data?: {
+    readonly resolvedRefs?: ReadonlyArray<{
+      readonly fieldName: string
+      readonly refEntity?: { readonly model?: Schema.Top }
+    }>
+  }
+}
+
+const unwrapEntityModel = (model: Schema.Top): Schema.Top =>
+  DynamoModel.isConfiguredModel(model) ? (model.model as Schema.Top) : model
+
+/**
+ * Map each ref FIELD SCHEMA the aggregate's schema walker cannot see into to the
+ * model it should be decoded (and encoded) as.
+ *
+ * `substituteSchemaDeep` recurses into plain classes / structs / arrays on its
+ * own. It cannot recurse into a `DynamoModel.ref`-annotated class (the
+ * annotation drops `.fields`), so that field's transformed leaves keep their
+ * strict decoders: a re-decoded domain `DateTime` is rejected as "Expected
+ * string", and a legacy marshalled one is never lifted. Registered here:
+ *
+ * - **root `one` / `ref` edge fields** — unconditionally, re-pointed at the
+ *   edge entity's model (the behaviour since #72);
+ * - **sub-aggregate `one` / `ref` edge fields** and **the ref field inside a
+ *   `many` element** (`PlayerSheet.player`, found by
+ *   `deriveEntityFieldName(entity)` as hydration finds it), at root or in a
+ *   sub-aggregate — only when OPAQUE. A plain class there is already walked,
+ *   and swapping it for the entity's model could only make its decode stricter
+ *   or change its class (#133);
+ * - **refs nested inside an edge entity's own model** (`maker` on a `supplier`
+ *   edge entity, #116).
+ *
+ * Keyed by schema IDENTITY. The resolver is consulted at every depth of the
+ * walk, so the former name-keyed table re-pointed every same-named field
+ * anywhere in the model — a `coach` field three levels down was decoded as the
+ * root `coach` edge's entity.
+ */
+const collectRefTargets = (
+  rootFields: Record<string, Schema.Top> | undefined,
+  rootEdges: Record<string, AggregateEdge | BoundSubAggregate<any>>,
+): ReadonlyMap<Schema.Top, Schema.Top> => {
+  const targets = new Map<Schema.Top, Schema.Top>()
+  const register = (field: Schema.Top | undefined, model: Schema.Top | undefined) => {
+    if (field !== undefined && model !== undefined && !targets.has(field)) {
+      targets.set(field, unwrapEntityModel(model))
+    }
+  }
+  const registerNested = (entity: RefTargetEntity | undefined) => {
+    if (entity?.model === undefined) return
+    const entityFields = getSchemaFields(unwrapEntityModel(entity.model))
+    for (const nested of entity._data?.resolvedRefs ?? []) {
+      register(entityFields?.[nested.fieldName], nested.refEntity?.model)
+    }
+  }
+  const walk = (
+    fields: Record<string, Schema.Top> | undefined,
+    edges: Record<string, AggregateEdge | BoundSubAggregate<any>>,
+    isRoot: boolean,
+  ) => {
+    for (const [edgeName, edge] of Object.entries(edges)) {
+      if (!("_tag" in edge)) continue
+      if (edge._tag === "RefEdge" || edge._tag === "OneEdge") {
+        const entity = (edge as { readonly entity?: RefTargetEntity }).entity
+        const field = fields?.[edgeName]
+        if (field !== undefined && (isRoot || isOpaqueRefField(field))) {
+          register(field, entity?.model)
+        }
+        registerNested(entity)
+      } else if (edge._tag === "ManyEdge") {
+        const entity = edge.entity as RefTargetEntity | undefined
+        if (edge.entity !== undefined) {
+          const refField = manyElementFields(fields, edgeName)?.[deriveEntityFieldName(edge.entity)]
+          if (refField !== undefined && isOpaqueRefField(refField))
+            register(refField, entity?.model)
+        }
+        registerNested(entity)
+      } else if (edge._tag === "BoundSubAggregate") {
+        const bound = edge as BoundSubAggregate<any>
+        walk(fieldsOf(bound.aggregate.schema), bound.aggregate.edges, false)
+      }
+    }
+  }
+  walk(rootFields, rootEdges, true)
+  return targets
+}
+
+/**
+ * Apply a node's attribute encoders in place — puts each attribute into its
+ * stored form before the decomposed item is marshalled (#72, #133: without
+ * this, a `DateTime` marshals to a `{ epochMilliseconds, … }` map that the
+ * read path cannot decode as the wire form).
  */
 const applyNodeAttrEncoders = (
   attrs: Record<string, unknown>,
@@ -799,27 +1012,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
   schema: TSchema,
   config: AggregateConfig<TSchema>,
 ): Aggregate<TSchema, Record<string, unknown>> => {
-  // Build resolved graph by walking edges recursively
-  const rootNode = resolveNode({
-    fieldName: null,
-    entityType: config.root.entityType,
-    cardinality: "root",
-    edges: config.edges,
-  })
   const aggregateName = config.root.entityType
   const contextFields = config.context ?? []
 
-  // Detect date encodings for all root schema fields (once, at make() time)
-  // and build a per-field bidirectional substitute schema.
-  //
-  // Aggregates decompose/assemble at the root-attribute level — each date
-  // field is converted in isolation (write: domain → wire primitive; read:
-  // wire primitive → domain). To stay schema-driven (issue #29), we route
-  // the conversion through the same `buildDateTransform` substitute used by
-  // Entity. `Schema.encodeUnknownSync` produces the wire form on writes and
-  // `Schema.decodeUnknownSync` lifts the wire form back on reads — wire
-  // format is byte-identical to the legacy per-field helpers.
-  //
   // Policy: aggregate fields that already carry a date transform schema
   // (e.g. `Schema.DateTimeUtcFromString`) cannot be combined with a
   // `DynamoModel.storedAs(...)` annotation that conflicts with the
@@ -834,70 +1029,51 @@ const makeAggregate = <TSchema extends Schema.Top>(
     // annotation conflict is checked.
     validateNoTransformOverride(schemaFields, {})
   }
-  // Date ENCODERS for the write path: decompose works from the schema-decoded
-  // domain object, so every root date field (Pattern A self-date AND Pattern B
-  // transform) is serialized to its wire primitive for storage.
-  const attrEncoders = buildAttrEncoders(schemaFields)
+
+  // Ref fields whose target the schema walker must be told about (see
+  // `collectRefTargets`). Keyed by the field SCHEMA, not its name: the resolver
+  // is consulted at every depth, so a name-keyed table re-pointed any
+  // same-named field anywhere in the model.
+  const refTargets = collectRefTargets(schemaFields, config.edges)
+  const resolveRef: RefResolver = (_name, field) => refTargets.get(field)
+
+  // Build resolved graph by walking edges recursively. Each node's attribute
+  // encoders come from the schema its decomposed values actually have — for a
+  // `many` edge that is the aggregate model's array ELEMENT (#133).
+  const rootNode = resolveNode({
+    fieldName: null,
+    entityType: config.root.entityType,
+    cardinality: "root",
+    edges: config.edges,
+    parentFields: schemaFields,
+    resolveRef,
+  })
+
+  // Attribute ENCODERS for the root item: decompose works from the
+  // schema-decoded domain object, so every root attribute holding a wire
+  // transform — a date, a transformed scalar, or a container of either — is
+  // put into its stored form. The key encoders are the pre-#133 ones, which the
+  // root's list-index composites are still read from (see `buildKeyAttrEncoders`).
+  const attrEncoders = buildAttrEncoders(schemaFields, resolveRef)
+  const keyAttrEncoders = buildKeyAttrEncoders(schemaFields)
+  const rootEncoders: NodeEncoders = { stored: attrEncoders, key: keyAttrEncoders }
 
   // Decode schema for read/assemble + input validation. Mirrors the raw `schema`
-  // but recursively substitutes EVERY date / Redacted leaf — root and nested,
-  // Pattern A and Pattern B — with a TOLERANT transform. This is the single
-  // decode path for get / create / update:
+  // but recursively substitutes EVERY date / Redacted / transformed leaf — root
+  // and nested — with a TOLERANT transform. This is the single decode path for
+  // get / create / update:
   //   - reads supply the stored wire form (string/number) → lifted to domain;
+  //     a legacy marshalled `DateTime` map is rebuilt into a real one (#133);
   //   - update re-decodes the mutated state, which carries domain `DateTime`
   //     values → accepted as-is (a strict `*FromString` decoder would reject
   //     them). It is decode-only, so making transforms tolerant is safe — the
-  //     stored wire format is still produced by `attrEncoders` / node encoders.
+  //     stored wire format is still produced by the attribute encoders.
   // Nested edge / ref classes round-trip with their class instance identity
   // preserved (Option A). Returns the raw `schema` unchanged when it carries no
-  // date / Redacted leaf at all (zero overhead).
-  //
-  // SINGLE ref/one edge fields carry the opaque `DynamoModel.ref` annotation, so
-  // the substitution can't introspect them — `resolveRef` re-points each to its
-  // edge target model (unwrapping `DynamoModel.configure`). MANY edges are
-  // excluded: their model field is a `Schema.Array(...)` (or a wrapper class) that
-  // `substituteSchemaDeep` introspects directly — re-pointing it at the element
-  // model would drop the `Array` and yield "Expected object, got []" on assemble.
-  const edgeRefModels = new Map<string, Schema.Top>()
-  const unwrapModel = (model: Schema.Top): Schema.Top =>
-    DynamoModel.isConfiguredModel(model) ? (model.model as Schema.Top) : model
-  for (const [edgeName, edge] of Object.entries(config.edges)) {
-    if (!("_tag" in edge)) continue
-    if (edge._tag !== "RefEdge" && edge._tag !== "OneEdge") continue
-    const entity = (
-      edge as {
-        readonly entity?: {
-          readonly model?: Schema.Top
-          readonly _data?: {
-            readonly resolvedRefs?: ReadonlyArray<{
-              readonly fieldName: string
-              readonly refEntity?: { readonly model?: Schema.Top }
-            }>
-          }
-        }
-      }
-    ).entity
-    const model = entity?.model
-    if (!model) continue
-    edgeRefModels.set(edgeName, unwrapModel(model))
-
-    // A ref nested INSIDE an edge's model needs the same treatment. `maker` on
-    // an edge entity is annotated with `DynamoModel.ref`, and `Schema.annotate`
-    // drops a `Schema.Class`'s `.fields`, so the substitution cannot introspect
-    // it and the target's own transformed fields keep their strict schemas —
-    // which is what made `update` reject a `bigint` at
-    // `["supplier"]["maker"]["founded"]` (#116). Registering the target by field
-    // name re-points it exactly as a top-level edge is re-pointed.
-    for (const nested of entity?._data?.resolvedRefs ?? []) {
-      const nestedModel = nested.refEntity?.model
-      if (nestedModel && !edgeRefModels.has(nested.fieldName)) {
-        edgeRefModels.set(nested.fieldName, unwrapModel(nestedModel))
-      }
-    }
-  }
+  // such leaf at all (zero overhead).
   const decodeSchema = substituteSchemaDeep(schema, {
     tolerantTransforms: true,
-    resolveRef: (name) => edgeRefModels.get(name),
+    resolveRef,
   }) as unknown as Schema.Codec<any>
 
   // Validate the collection index / consistency combination against the table's
@@ -1119,7 +1295,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           assembled,
           rootNode,
           contextFields,
-          attrEncoders,
+          rootEncoders,
           aggregateName,
           config.schema,
         )
@@ -1212,7 +1388,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           assembledOld,
           rootNode,
           contextFields,
-          attrEncoders,
+          rootEncoders,
           aggregateName,
           config.schema,
         )
@@ -1220,7 +1396,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           assembledNew,
           rootNode,
           contextFields,
-          attrEncoders,
+          rootEncoders,
           aggregateName,
           config.schema,
         )
@@ -1584,11 +1760,16 @@ interface ResolveNodeArgs {
   readonly entityType: string
   readonly cardinality: "root" | "one" | "many"
   readonly edges: Record<string, AggregateEdge | BoundSubAggregate<any>>
+  /** Fields of the model `edges` belong to — the root schema, or a sub-aggregate's. */
+  readonly parentFields?: Record<string, Schema.Top> | undefined
+  /** The aggregate's ref resolver, shared with its `decodeSchema`. */
+  readonly resolveRef?: RefResolver | undefined
   readonly discriminator?: Record<string, unknown> | undefined
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
   readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
   readonly ownDiscriminator?: Record<string, unknown> | undefined
-  readonly attrEncoders?: Record<string, (value: unknown) => unknown> | undefined
+  readonly attrEncoders?: AttrEncoders | undefined
+  readonly keyAttrEncoders?: AttrEncoders | undefined
   readonly skComposite?: ReadonlyArray<string> | undefined
   readonly refIdentifierField?: string | undefined
 }
@@ -1603,8 +1784,11 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     edges,
     entityType,
     fieldName,
+    keyAttrEncoders,
     ownDiscriminator,
+    parentFields,
     refIdentifierField,
+    resolveRef,
     skComposite,
   } = args
   const children: Array<ResolvedNode> = []
@@ -1616,6 +1800,15 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
         const mergedDisc = edge.discriminator
           ? { ...(discriminator ?? {}), ...edge.discriminator }
           : discriminator
+        // The item is the edge value flattened: encode it field by field with
+        // the edge entity's model (#72), or — for an edge without an entity —
+        // with the model field's own class.
+        const parentField = parentFields?.[field]
+        const valueFields =
+          fieldsOf(edge.entity?.model) ??
+          (parentField === undefined
+            ? undefined
+            : getSchemaFields(unwrapOptionalField(parentField)))
         children.push(
           resolveNode({
             fieldName: field,
@@ -1624,11 +1817,19 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             edges: {},
             discriminator: mergedDisc,
             ownDiscriminator: edge.discriminator,
-            // Encode this edge entity's own date fields on write (issue #72).
-            attrEncoders: buildAttrEncoders(fieldsOf(edge.entity?.model)),
+            attrEncoders: buildAttrEncoders(valueFields, resolveRef),
           }),
         )
       } else if (edge._tag === "ManyEdge") {
+        // The item is one decomposed ELEMENT. Its encoders must come from the
+        // element's schema — `PlayerSheet { player, isCaptain }` — not from the
+        // edge entity's model (`Player { id, name, dateOfBirth }`), whose field
+        // names never match a wrapper element's, so a hydrated ref inside the
+        // element was never encoded (#133). An element that exposes no fields
+        // (a custom `decompose`, an opaque ref element) falls back to the
+        // entity's model, which is what such an element IS.
+        const entityFields = fieldsOf(edge.entity?.model)
+        const elementFields = manyElementFields(parentFields, field) ?? entityFields
         children.push(
           resolveNode({
             fieldName: field,
@@ -1638,7 +1839,10 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             discriminator,
             assemble: edge.assemble,
             decompose: edge.decompose,
-            attrEncoders: buildAttrEncoders(fieldsOf(edge.entity?.model)),
+            attrEncoders: buildAttrEncoders(elementFields, resolveRef),
+            // Sort-key composites keep reading the pre-#133 encoding (the entity
+            // model's top-level transforms), so no stored key is re-spelled.
+            keyAttrEncoders: buildKeyAttrEncoders(entityFields),
             // Declared sort-key composites, authoritative when present (#103).
             skComposite: edge.sk?.composite,
             refIdentifierField: edge.entity
@@ -1648,16 +1852,19 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
         )
       } else if (edge._tag === "BoundSubAggregate") {
         const bound = edge as BoundSubAggregate<any>
+        const subFields = fieldsOf(bound.aggregate.schema)
         const subChildren = resolveNode({
           fieldName: field,
           entityType: bound.aggregate.root.entityType,
           cardinality: "one",
           edges: bound.aggregate.edges,
+          parentFields: subFields,
+          resolveRef,
           discriminator: bound.discriminator,
           ownDiscriminator: bound.discriminator,
           // The sub-aggregate root item carries the sub-schema's own (non-edge)
-          // date fields; its child edges get their own encoders via recursion.
-          attrEncoders: buildAttrEncoders(fieldsOf(bound.aggregate.schema)),
+          // fields; its child edges get their own encoders via recursion.
+          attrEncoders: buildAttrEncoders(subFields, resolveRef),
         })
         children.push(subChildren)
       }
@@ -1677,6 +1884,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     ...(skComposite !== undefined && { skComposite }),
     ...(refIdentifierField !== undefined && { refIdentifierField }),
     attrEncoders,
+    ...(keyAttrEncoders !== undefined && { keyAttrEncoders }),
   }
 }
 
@@ -2214,6 +2422,11 @@ const replaceRefIds = (
 interface DecomposedItem {
   readonly entityType: string
   readonly attributes: Record<string, unknown>
+  /**
+   * Root item only: its attributes under the pre-#133 key encoders, which its
+   * list-index composites are read from (see `buildKeyAttrEncoders`).
+   */
+  readonly keyAttributes?: Record<string, unknown>
   readonly transactionGroup: string
   readonly skComposites: ReadonlyArray<string>
   /** Edge field name (entity type for the root) — used to name the culprit in errors. */
@@ -2227,6 +2440,21 @@ interface TransactionGroup {
 }
 
 /**
+ * A node's two encoder sets: `stored` puts every attribute into its stored
+ * form; `key` is what composed keys are read from (see `buildKeyAttrEncoders`).
+ */
+interface NodeEncoders {
+  readonly stored: AttrEncoders
+  readonly key: AttrEncoders
+}
+
+/** Context values, as stored on member items and as their keys read them. */
+interface ContextValues {
+  readonly stored: Record<string, unknown>
+  readonly key: Record<string, unknown>
+}
+
+/**
  * Decompose an assembled domain object into DynamoDB items grouped by
  * sub-aggregate transaction boundaries.
  */
@@ -2234,37 +2462,41 @@ const decomposeAggregate = (
   assembled: Record<string, unknown>,
   rootNode: ResolvedNode,
   contextFields: ReadonlyArray<string>,
-  attrEncoders: Record<string, (value: unknown) => unknown>,
+  encoders: NodeEncoders,
   aggregateName: string,
   schema: DynamoSchemaModule.DynamoSchema,
 ): Effect.Effect<ReadonlyArray<TransactionGroup>, AggregateDecompositionError> =>
   Effect.gen(function* () {
     const items: DecomposedItem[] = []
+    const encodeWith = (set: AttrEncoders, field: string, value: unknown): unknown => {
+      const encode = set[field]
+      return encode && value != null ? encode(value) : value
+    }
 
-    // Extract context values from the root, serializing date fields for DynamoDB storage.
+    // Extract context values from the root, encoded for DynamoDB storage.
     // Domain Date/DateTime objects must be encoded before toAttributeMap() marshalling,
     // otherwise Date objects become { M: {} } (no enumerable properties).
-    // The encoder is the substituted bidirectional date schema built at make() time.
-    const contextValues: Record<string, unknown> = {}
+    const contextValues: ContextValues = { stored: {}, key: {} }
     for (const field of contextFields) {
       const value = assembled[field]
-      const encode = attrEncoders[field]
-      contextValues[field] = encode && value != null ? encode(value) : value
+      contextValues.stored[field] = encodeWith(encoders.stored, field, value)
+      contextValues.key[field] = encodeWith(encoders.key, field, value)
     }
 
     // Root item: fields not claimed by edges
     const edgeFieldNames = new Set(rootNode.children.map((c) => c.fieldName).filter(Boolean))
     const rootAttrs: Record<string, unknown> = {}
+    const rootKeyAttrs: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(assembled)) {
       if (edgeFieldNames.has(key)) continue
-      // Serialize date fields in root attributes (same as context values)
-      const encode = attrEncoders[key]
-      rootAttrs[key] = encode && value != null ? encode(value) : value
+      rootAttrs[key] = encodeWith(encoders.stored, key, value)
+      rootKeyAttrs[key] = encodeWith(encoders.key, key, value)
     }
 
     items.push({
       entityType: rootNode.entityType,
       attributes: rootAttrs,
+      keyAttributes: rootKeyAttrs,
       transactionGroup: "root",
       skComposites: [],
       member: rootNode.entityType,
@@ -2335,7 +2567,7 @@ const decomposeNode = (
   items: DecomposedItem[],
   node: ResolvedNode,
   value: unknown,
-  contextValues: Record<string, unknown>,
+  contextValues: ContextValues,
   parentGroup: string,
   parentDiscriminatorValues: ReadonlyArray<string>,
   aggregateName: string,
@@ -2368,7 +2600,7 @@ const decomposeNode = (
       applyNodeAttrEncoders(subRootAttrs, node.attrEncoders)
 
       // Inject context and discriminator
-      mergeContextValues(subRootAttrs, contextValues)
+      mergeContextValues(subRootAttrs, contextValues.stored)
       if (node.discriminator) {
         for (const [k, v] of Object.entries(node.discriminator)) {
           if (typeof v !== "function") subRootAttrs[k] = v
@@ -2401,7 +2633,7 @@ const decomposeNode = (
       const attrs = { ...(value as Record<string, unknown>) }
       // Serialize this edge entity's own date fields to their wire primitive (#72).
       applyNodeAttrEncoders(attrs, node.attrEncoders)
-      mergeContextValues(attrs, contextValues)
+      mergeContextValues(attrs, contextValues.stored)
       if (node.discriminator) {
         for (const [k, v] of Object.entries(node.discriminator)) {
           if (typeof v !== "function") attrs[k] = v
@@ -2430,18 +2662,32 @@ const decomposeNode = (
           ? (value as ReadonlyArray<unknown>)
           : []
 
-      for (const elem of arrayItems) {
-        const attrs = { ...(elem as Record<string, unknown>) }
-        // Serialize this edge entity's own date fields to their wire primitive (#72).
-        applyNodeAttrEncoders(attrs, node.attrEncoders)
-        mergeContextValues(attrs, contextValues)
+      const withContext = (attrs: Record<string, unknown>, context: Record<string, unknown>) => {
+        mergeContextValues(attrs, context)
         if (node.discriminator) {
           for (const [k, v] of Object.entries(node.discriminator)) {
             if (typeof v !== "function") attrs[k] = v
           }
         }
+        return attrs
+      }
 
-        const itemComposites = yield* manyEdgeSkComposites(node, attrs, aggregateName)
+      for (const elem of arrayItems) {
+        // The element's attributes in their STORED form — every nested date,
+        // transformed scalar and hydrated ref encoded (#72, #133).
+        const attrs = { ...(elem as Record<string, unknown>) }
+        applyNodeAttrEncoders(attrs, node.attrEncoders)
+        withContext(attrs, contextValues.stored)
+
+        // The sort key is read from the element as the pre-#133 encoders left
+        // it, NOT from `attrs`: encoding a ref's nested `NumberFromString` turns
+        // a padded `0000000000000005` key segment into `5`, so composing from
+        // the stored form would re-spell (and orphan) existing rows.
+        const keyAttrs = { ...(elem as Record<string, unknown>) }
+        applyNodeAttrEncoders(keyAttrs, node.keyAttrEncoders)
+        withContext(keyAttrs, contextValues.key)
+
+        const itemComposites = yield* manyEdgeSkComposites(node, keyAttrs, aggregateName)
 
         items.push({
           entityType: node.entityType,
@@ -2675,7 +2921,7 @@ const buildDynamoItems = (
       if (isRootItem && config.list) {
         const listPkComposites = KeyComposer.extractComposites(
           config.list.pk.composite,
-          keyRecord(item.attributes),
+          keyRecord(item.keyAttributes ?? item.attributes),
         )
         if (config.list.cardinality) {
           const shard = hashToShard(pkValue, config.list.cardinality)
@@ -2692,7 +2938,7 @@ const buildDynamoItems = (
         }
         const listSkComposites = KeyComposer.extractComposites(
           config.list.sk.composite,
-          keyRecord(item.attributes),
+          keyRecord(item.keyAttributes ?? item.attributes),
         )
         attrs[config.list.sk.field] = composeCollectionKey(
           config.schema,

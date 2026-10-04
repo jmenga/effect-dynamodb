@@ -1,0 +1,810 @@
+/**
+ * Aggregate write + read of transformed values NESTED in containers (#133).
+ *
+ * An aggregate decomposes its decoded domain object into one item per node and
+ * marshals each item. Every value that has a wire form (a date, a bigint, a
+ * `Date`, …) must be put into that wire form first, through the same encoders as
+ * a root scalar date. Before #133 only TOP-LEVEL transformed attributes were
+ * encoded, and `many`-edge encoders were built from the wrong schema, so:
+ *
+ * - `Schema.Array(DateTimeUtcFromString)` and `Schema.Array(SomeClass)` root
+ *   attributes stored each `DateTime` as a marshalled `{ epochMilliseconds, … }`
+ *   map;
+ * - a ref inside a `many` element (root or sub-aggregate) did the same;
+ * - a `DynamoModel.ref`-annotated element field was decoded strictly, so a fresh
+ *   write could not even be read back;
+ * - the legacy maps read back (when they read back at all) as PLAIN OBJECTS that
+ *   only duck-type as `DateTime`.
+ *
+ * These tests run the aggregate against an in-memory mock of the raw client so
+ * they can assert the STORED attribute types (`S` / `N`), not merely that `get`
+ * succeeds, and so they can plant the legacy map forms in stored rows.
+ *
+ * Matrix: shape {root array of a date transform; root array of a class with
+ * dates; ref in a root `many` element with a declared `sk.composite`; ref in a
+ * sub-aggregate `many` element bound twice} × element field kind {plain class
+ * matched by name; `DynamoModel.ref`-annotated} × stored form {wire; rc-era map;
+ * 4.0.0-era map}.
+ */
+
+import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import { describe, expect, it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { DateTime, Effect, Equal, Layer, Schema } from "effect"
+import { beforeEach } from "vitest"
+import * as Aggregate from "../src/Aggregate.js"
+import * as Entity from "../src/Entity.js"
+import * as Table from "../src/Table.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+
+// ---------------------------------------------------------------------------
+// In-memory raw client
+// ---------------------------------------------------------------------------
+
+type Item = Record<string, AttributeValue>
+
+const store = new Map<string, Item>()
+/** Every TransactWriteItems call, in order — sub-aggregates write separately. */
+const transactCalls: Array<ReadonlyArray<Record<string, any>>> = []
+
+const keyOf = (item: Record<string, any>): string => `${item.pk?.S}|${item.sk?.S}`
+
+const InMemoryClient = mockDynamoClientLayer({
+  putItem: (input) =>
+    Effect.sync(() => {
+      store.set(keyOf(input.Item!), input.Item as Item)
+      return {} as any
+    }),
+  batchGetItem: (input) =>
+    Effect.sync(() => {
+      const Responses: Record<string, Array<Item>> = {}
+      for (const [table, request] of Object.entries(input.RequestItems ?? {})) {
+        Responses[table] = (request.Keys ?? [])
+          .map((key) => store.get(keyOf(key)))
+          .filter((item): item is Item => item !== undefined)
+      }
+      return { Responses } as any
+    }),
+  transactWriteItems: (input) =>
+    Effect.sync(() => {
+      const items = (input.TransactItems ?? []) as ReadonlyArray<Record<string, any>>
+      transactCalls.push(items)
+      for (const op of items) {
+        if (op.Put) store.set(keyOf(op.Put.Item), op.Put.Item)
+        if (op.Delete) store.delete(keyOf(op.Delete.Key))
+      }
+      return {} as any
+    }),
+  query: (input) =>
+    Effect.sync(() => {
+      const pk = (input.ExpressionAttributeValues?.[":pk"] as { S?: string } | undefined)?.S
+      return { Items: [...store.values()].filter((item) => item.pk?.S === pk) } as any
+    }),
+})
+
+beforeEach(() => {
+  store.clear()
+  transactCalls.length = 0
+})
+
+// ---------------------------------------------------------------------------
+// Values + legacy forms
+// ---------------------------------------------------------------------------
+
+const DOB = "2000-01-01T00:00:00.000Z"
+const DOB_MS = 946684800000
+const DAY2 = "2000-01-02T00:00:00.000Z"
+const DAY2_MS = 946771200000
+const FINISH = "2000-01-01T06:00:00.000Z"
+const FINISH_MS = DOB_MS + 6 * 3600 * 1000
+
+/** The map effect-dynamodb <= 1.20.1 stored on effect 4.0.0-rc.x. */
+const rcMap = (ms: number): AttributeValue => ({
+  M: {
+    epochMilliseconds: { N: String(ms) },
+    "~effect/time/DateTime": { S: "~effect/time/DateTime" },
+    _tag: { S: "Utc" },
+  },
+})
+
+/** The map 1.22.0 stored on effect 4.0.0 — only the type-id key differs. */
+const v4Map = (ms: number): AttributeValue => ({
+  M: {
+    epochMilliseconds: { N: String(ms) },
+    "~effect/DateTime": { S: "~effect/DateTime" },
+    _tag: { S: "Utc" },
+  },
+})
+
+const legacyForms = [
+  ["rc-era map", rcMap],
+  ["4.0.0-era map", v4Map],
+] as const
+
+/** A REAL `DateTime.Utc` for `ms` — not a plain object that duck-types as one. */
+const isRealUtc = (value: unknown, ms: number): boolean =>
+  DateTime.isDateTime(value) &&
+  Object.getPrototypeOf(value) !== Object.prototype &&
+  Equal.equals(value, DateTime.makeUnsafe(ms))
+
+// ---------------------------------------------------------------------------
+// Entities — configured models with an identifier rename, as reported in #133
+// ---------------------------------------------------------------------------
+
+const PersonFields = {
+  id: Schema.String,
+  name: Schema.String,
+  dateOfBirth: Schema.DateTimeUtcFromString.pipe(
+    Schema.withDecodingDefault(Effect.succeed("1800-01-01")),
+  ),
+}
+
+class Team extends Schema.Class<Team>("Team")({ id: Schema.String, name: Schema.String }) {}
+class Coach extends Schema.Class<Coach>("Coach")({ ...PersonFields }) {}
+class Player extends Schema.Class<Player>("Player")({ ...PersonFields }) {}
+class Umpire extends Schema.Class<Umpire>("Umpire")({
+  ...PersonFields,
+  rank: Schema.NumberFromString,
+}) {}
+
+const pkSk = {
+  pk: { field: "pk", composite: ["id"] },
+  sk: { field: "sk", composite: [] },
+} as const
+
+const Teams = Entity.make({
+  model: DynamoModel.configure(Team, { id: { field: "teamId", identifier: true } }),
+  entityType: "Team",
+  primaryKey: pkSk,
+})
+const Coaches = Entity.make({
+  model: DynamoModel.configure(Coach, { id: { field: "coachId", identifier: true } }),
+  entityType: "Coach",
+  primaryKey: pkSk,
+})
+const Players = Entity.make({
+  model: DynamoModel.configure(Player, { id: { field: "playerId", identifier: true } }),
+  entityType: "Player",
+  primaryKey: pkSk,
+})
+const Umpires = Entity.make({
+  model: DynamoModel.configure(Umpire, { id: { field: "umpireId", identifier: true } }),
+  entityType: "Umpire",
+  primaryKey: pkSk,
+})
+
+const ReproSchema = DynamoSchema.make({ name: "issue133", version: 1 })
+const ReproTable = Table.make({
+  schema: ReproSchema,
+  entities: { Teams, Coaches, Players, Umpires },
+})
+const TestLayer = Layer.merge(InMemoryClient, ReproTable.layer({ name: "issue133" }))
+
+/** Seed the referenced entities through the real entity write path. */
+const seed = Effect.gen(function* () {
+  const dob = DateTime.makeUnsafe(DOB)
+  yield* Teams.put({ id: "team-1", name: "Team One" }).asEffect()
+  yield* Teams.put({ id: "team-2", name: "Team Two" }).asEffect()
+  yield* Coaches.put({ id: "coach-1", name: "Coach One", dateOfBirth: dob }).asEffect()
+  yield* Coaches.put({ id: "coach-2", name: "Coach Two", dateOfBirth: dob }).asEffect()
+  yield* Players.put({ id: "player-1", name: "Player One", dateOfBirth: dob }).asEffect()
+  yield* Players.put({ id: "player-2", name: "Player Two", dateOfBirth: dob }).asEffect()
+  yield* Umpires.put({ id: "umpire-1", name: "Umpire One", dateOfBirth: dob, rank: 5 }).asEffect()
+  yield* Umpires.put({ id: "umpire-2", name: "Umpire Two", dateOfBirth: dob, rank: 12 }).asEffect()
+})
+
+// ---------------------------------------------------------------------------
+// Aggregate fixtures — one per element field kind
+// ---------------------------------------------------------------------------
+
+/** Element of a root-level `Schema.Array` of classes (no edge). */
+class Session extends Schema.Class<Session>("Session")({
+  number: Schema.Number,
+  startTime: Schema.DateTimeUtcFromString,
+  finishTime: Schema.optionalKey(Schema.DateTimeUtcFromString),
+}) {}
+
+type Kind = "plain" | "ref"
+
+const makeMatch = (kind: Kind) => {
+  // The element's ref field: the PLAIN entity class (matched by field name, as
+  // in the downstream report) or the `DynamoModel.ref`-annotated class (whose
+  // `.fields` `Schema.annotate` drops).
+  const playerField = kind === "plain" ? Player : Player.pipe(DynamoModel.ref)
+  const umpireField = kind === "plain" ? Umpire : Umpire.pipe(DynamoModel.ref)
+
+  class PlayerSheet extends Schema.Class<PlayerSheet>(`PlayerSheet-${kind}`)({
+    player: playerField as typeof Player,
+    isCaptain: Schema.optionalKey(Schema.Boolean),
+  }) {}
+  class TeamSheet extends Schema.Class<TeamSheet>(`TeamSheet-${kind}`)({
+    team: Team,
+    coach: Coach,
+    homeTeam: Schema.Boolean,
+    players: Schema.Array(PlayerSheet),
+  }) {}
+  class UmpireSheet extends Schema.Class<UmpireSheet>(`UmpireSheet-${kind}`)({
+    umpire: umpireField as typeof Umpire,
+    role: Schema.Literals(["onfield", "third"]),
+  }) {}
+  class Match extends Schema.Class<Match>(`Match-${kind}`)({
+    id: Schema.String,
+    name: Schema.String,
+    startDate: Schema.DateTimeUtcFromString,
+    matchDays: Schema.optionalKey(Schema.Array(Schema.DateTimeUtcFromString)),
+    sessions: Schema.optionalKey(Schema.Array(Session)),
+    team1: TeamSheet,
+    team2: TeamSheet,
+    umpires: Schema.optionalKey(Schema.Array(UmpireSheet)),
+  }) {}
+
+  const TeamSheetAggregate = Aggregate.make(TeamSheet, {
+    root: { entityType: "MatchTeam" },
+    edges: {
+      team: Aggregate.ref(Teams),
+      coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: Coaches }),
+      players: Aggregate.many("players", { entityType: "MatchPlayer", entity: Players }),
+    },
+  })
+
+  return Aggregate.make(Match, {
+    table: ReproTable,
+    schema: ReproSchema,
+    pk: { field: "pk", composite: ["id"] },
+    collection: { name: "match" },
+    root: { entityType: "MatchItem" },
+    edges: {
+      team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
+      team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
+      umpires: Aggregate.many("umpires", {
+        entityType: "MatchUmpire",
+        entity: Umpires,
+        sk: { composite: ["role", "umpire.id"] },
+      }),
+    },
+  })
+}
+
+const matchInput = (id: string) => ({
+  id,
+  name: "Match",
+  startDate: DOB,
+  matchDays: [DOB, DAY2],
+  sessions: [
+    { number: 1, startTime: DOB, finishTime: FINISH },
+    { number: 2, startTime: DAY2 },
+  ],
+  team1: {
+    teamId: "team-1",
+    coachId: "coach-1",
+    homeTeam: true,
+    players: [{ playerId: "player-1", isCaptain: true }],
+  },
+  team2: {
+    teamId: "team-2",
+    coachId: "coach-2",
+    homeTeam: false,
+    players: [{ playerId: "player-2" }],
+  },
+  umpires: [
+    { umpireId: "umpire-1", role: "onfield" },
+    { umpireId: "umpire-2", role: "third" },
+  ],
+})
+
+// ---------------------------------------------------------------------------
+// Stored-item helpers
+// ---------------------------------------------------------------------------
+
+const partition = (id: string): Array<Item> =>
+  [...store.values()].filter((item) => item.pk?.S === `$issue133#v1#match#${id}`)
+
+const itemsOf = (id: string, entityType: string): Array<Item> =>
+  partition(id).filter((item) => item.__edd_e__?.S === entityType)
+
+const itemOf = (id: string, entityType: string, predicate: (item: Item) => boolean = () => true) =>
+  itemsOf(id, entityType).find(predicate)!
+
+/** Every key attribute of every stored item in the partition, sorted. */
+const keysOf = (id: string): Array<string> =>
+  partition(id)
+    .map((item) => `${item.__edd_e__?.S} ${item.pk?.S} ${item.sk?.S}`)
+    .sort()
+
+const S = (value: string): AttributeValue => ({ S: value })
+
+// ---------------------------------------------------------------------------
+// The matrix
+// ---------------------------------------------------------------------------
+
+for (const kind of ["plain", "ref"] as const) {
+  describe(`#133 nested transforms — ${kind === "plain" ? "plain class" : "DynamoModel.ref"} element field`, () => {
+    const MatchAggregate = makeMatch(kind)
+    const create = (id: string) => MatchAggregate.create(matchInput(id) as any)
+    const get = (id: string) => MatchAggregate.get({ id } as any) as Effect.Effect<any, any, any>
+
+    it.effect("stores every date leaf in wire form (S)", () =>
+      Effect.gen(function* () {
+        yield* seed
+        yield* create("m1")
+
+        const root = itemOf("m1", "MatchItem")
+        // Controls: root scalar date and the `one` edge's flattened date.
+        expect(root.startDate).toEqual(S(DOB))
+        expect(itemOf("m1", "MatchCoach").dateOfBirth).toEqual(S(DOB))
+        // Root array of a date transform.
+        expect(root.matchDays).toEqual({ L: [S(DOB), S(DAY2)] })
+        // Root array of a class with dates, including an optionalKey date.
+        expect(root.sessions).toEqual({
+          L: [
+            { M: { number: { N: "1" }, startTime: S(DOB), finishTime: S(FINISH) } },
+            { M: { number: { N: "2" }, startTime: S(DAY2) } },
+          ],
+        })
+        // Ref in a sub-aggregate `many` element — both bindings.
+        const players = itemsOf("m1", "MatchPlayer")
+        expect(players).toHaveLength(2)
+        for (const player of players) {
+          expect(player.player?.M?.dateOfBirth).toEqual(S(DOB))
+        }
+        // Ref in a root `many` element with a declared sk.composite — including a
+        // non-date transform (`rank: NumberFromString`) inside the ref.
+        const umpires = itemsOf("m1", "MatchUmpire")
+        expect(umpires).toHaveLength(2)
+        for (const umpire of umpires) {
+          expect(umpire.umpire?.M?.dateOfBirth).toEqual(S(DOB))
+          expect(umpire.umpire?.M?.rank?.S).toMatch(/^\d+$/)
+        }
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("composes byte-identical keys", () =>
+      Effect.gen(function* () {
+        yield* seed
+        yield* create("m1")
+        expect(keysOf("m1")).toEqual([
+          "MatchCoach $issue133#v1#match#m1 $issue133#v1#matchcoach#teamnumber#0000000000000001",
+          "MatchCoach $issue133#v1#match#m1 $issue133#v1#matchcoach#teamnumber#0000000000000002",
+          "MatchItem $issue133#v1#match#m1 $issue133#v1#matchitem",
+          "MatchPlayer $issue133#v1#match#m1 $issue133#v1#matchplayer#teamnumber#0000000000000001#player-1",
+          "MatchPlayer $issue133#v1#match#m1 $issue133#v1#matchplayer#teamnumber#0000000000000002#player-2",
+          "MatchTeam $issue133#v1#match#m1 $issue133#v1#matchteam#teamnumber#0000000000000001",
+          "MatchTeam $issue133#v1#match#m1 $issue133#v1#matchteam#teamnumber#0000000000000002",
+          "MatchUmpire $issue133#v1#match#m1 $issue133#v1#matchumpire#onfield#umpire-1",
+          "MatchUmpire $issue133#v1#match#m1 $issue133#v1#matchumpire#third#umpire-2",
+        ])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("reads a fresh write back as real DateTime.Utc instances", () =>
+      Effect.gen(function* () {
+        yield* seed
+        yield* create("m1")
+        const got = yield* get("m1")
+
+        expect(isRealUtc(got.startDate, DOB_MS)).toBe(true)
+        expect(isRealUtc(got.matchDays[0], DOB_MS)).toBe(true)
+        expect(isRealUtc(got.matchDays[1], DAY2_MS)).toBe(true)
+        expect(isRealUtc(got.sessions[0].startTime, DOB_MS)).toBe(true)
+        expect(isRealUtc(got.sessions[0].finishTime, FINISH_MS)).toBe(true)
+        expect(got.sessions[1].finishTime).toBeUndefined()
+        expect(isRealUtc(got.team1.coach.dateOfBirth, DOB_MS)).toBe(true)
+        expect(isRealUtc(got.team1.players[0].player.dateOfBirth, DOB_MS)).toBe(true)
+        expect(isRealUtc(got.team2.players[0].player.dateOfBirth, DOB_MS)).toBe(true)
+        expect(got.team1.players[0].player).toBeInstanceOf(Player)
+        expect(isRealUtc(got.umpires[0].umpire.dateOfBirth, DOB_MS)).toBe(true)
+        expect(got.umpires[0].umpire).toBeInstanceOf(Umpire)
+        expect(got.umpires.map((u: any) => u.umpire.rank).sort()).toEqual([12, 5].sort())
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    for (const [formName, form] of legacyForms) {
+      describe(`reads a stored ${formName}`, () => {
+        it.effect("in MatchItem.matchDays[]", () =>
+          Effect.gen(function* () {
+            yield* seed
+            yield* create("m1")
+            const root = itemOf("m1", "MatchItem")
+            root.matchDays = { L: [form(DOB_MS), form(DAY2_MS)] }
+            const got = yield* get("m1")
+            expect(isRealUtc(got.matchDays[0], DOB_MS)).toBe(true)
+            expect(isRealUtc(got.matchDays[1], DAY2_MS)).toBe(true)
+          }).pipe(Effect.provide(TestLayer)),
+        )
+
+        it.effect("in MatchItem.sessions[].startTime / finishTime", () =>
+          Effect.gen(function* () {
+            yield* seed
+            yield* create("m1")
+            const root = itemOf("m1", "MatchItem")
+            const first = (root.sessions as any).L[0].M
+            first.startTime = form(DOB_MS)
+            first.finishTime = form(FINISH_MS)
+            const got = yield* get("m1")
+            expect(isRealUtc(got.sessions[0].startTime, DOB_MS)).toBe(true)
+            expect(isRealUtc(got.sessions[0].finishTime, FINISH_MS)).toBe(true)
+          }).pipe(Effect.provide(TestLayer)),
+        )
+
+        it.effect("in MatchPlayer.player.dateOfBirth (sub-aggregate many element)", () =>
+          Effect.gen(function* () {
+            yield* seed
+            yield* create("m1")
+            for (const player of itemsOf("m1", "MatchPlayer")) {
+              ;(player.player as any).M.dateOfBirth = form(DOB_MS)
+            }
+            const got = yield* get("m1")
+            expect(isRealUtc(got.team1.players[0].player.dateOfBirth, DOB_MS)).toBe(true)
+            expect(isRealUtc(got.team2.players[0].player.dateOfBirth, DOB_MS)).toBe(true)
+          }).pipe(Effect.provide(TestLayer)),
+        )
+
+        it.effect("in MatchUmpire.umpire.dateOfBirth (root many element)", () =>
+          Effect.gen(function* () {
+            yield* seed
+            yield* create("m1")
+            for (const umpire of itemsOf("m1", "MatchUmpire")) {
+              ;(umpire.umpire as any).M.dateOfBirth = form(DOB_MS)
+            }
+            const got = yield* get("m1")
+            expect(isRealUtc(got.umpires[0].umpire.dateOfBirth, DOB_MS)).toBe(true)
+            expect(isRealUtc(got.umpires[1].umpire.dateOfBirth, DOB_MS)).toBe(true)
+          }).pipe(Effect.provide(TestLayer)),
+        )
+
+        it.effect("update over a legacy row rewrites only what changed, in wire form", () =>
+          Effect.gen(function* () {
+            yield* seed
+            yield* create("m1")
+            const root = itemOf("m1", "MatchItem")
+            root.matchDays = { L: [form(DOB_MS), form(DAY2_MS)] }
+            for (const umpire of itemsOf("m1", "MatchUmpire")) {
+              ;(umpire.umpire as any).M.dateOfBirth = form(DOB_MS)
+            }
+            transactCalls.length = 0
+
+            const updated = yield* MatchAggregate.update({ id: "m1" } as any, (c: any) => ({
+              ...c.state,
+              name: "Renamed",
+            }))
+            expect((updated as any).name).toBe("Renamed")
+            expect(isRealUtc((updated as any).matchDays[0], DOB_MS)).toBe(true)
+
+            // The root group changed (name); the legacy root row is rewritten in
+            // wire form along with it. Its umpire edge items sit in the same
+            // (root) group, so they are rewritten too.
+            const after = itemOf("m1", "MatchItem")
+            expect(after.matchDays).toEqual({ L: [S(DOB), S(DAY2)] })
+            for (const umpire of itemsOf("m1", "MatchUmpire")) {
+              expect(umpire.umpire?.M?.dateOfBirth).toEqual(S(DOB))
+            }
+            // The two sub-aggregate groups did not change, so they were not written.
+            expect(transactCalls).toHaveLength(1)
+            expect(keysOf("m1")).toHaveLength(9)
+          }).pipe(Effect.provide(TestLayer)),
+        )
+      })
+    }
+
+    it.effect("a no-op update writes nothing (decomposed groups compare equal)", () =>
+      Effect.gen(function* () {
+        yield* seed
+        yield* create("m1")
+        transactCalls.length = 0
+        yield* MatchAggregate.update({ id: "m1" } as any, (c: any) => c.state)
+        expect(transactCalls).toHaveLength(0)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an update touching one sub-aggregate rewrites only that group, in wire form", () =>
+      Effect.gen(function* () {
+        yield* seed
+        yield* create("m1")
+        transactCalls.length = 0
+        yield* MatchAggregate.update({ id: "m1" } as any, (c: any) => ({
+          ...c.state,
+          team2: { ...c.state.team2, homeTeam: true },
+        }))
+        expect(transactCalls).toHaveLength(1)
+        const written = transactCalls[0]!.map((op) => op.Put?.Item?.__edd_e__?.S).sort()
+        expect(written).toEqual(["MatchCoach", "MatchPlayer", "MatchTeam"])
+        const player = itemOf("m1", "MatchPlayer", (item) => item.teamNumber?.N === "2")
+        expect(player.player?.M?.dateOfBirth).toEqual(S(DOB))
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Non-date nested transforms and self schemas
+// ---------------------------------------------------------------------------
+
+class Ledger extends Schema.Class<Ledger>("Ledger")({
+  id: Schema.String,
+  amounts: Schema.Array(Schema.BigIntFromString),
+  seen: Schema.Array(Schema.Date),
+  stamps: Schema.Array(Schema.DateTimeUtc),
+  maybeDays: Schema.optional(Schema.Array(Schema.DateTimeUtcFromString)),
+  tags: Schema.Array(Schema.String),
+}) {}
+
+const LedgerAggregate = Aggregate.make(Ledger, {
+  table: ReproTable,
+  schema: ReproSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "ledger" },
+  root: { entityType: "LedgerItem" },
+  edges: {},
+})
+
+describe("#133 nested transforms — non-date and self-schema leaves", () => {
+  it.effect("stores each element in wire form and reads real domain values back", () =>
+    Effect.gen(function* () {
+      yield* LedgerAggregate.create({
+        id: "l1",
+        amounts: ["5", "12345678901234567890"],
+        seen: [new Date(DOB_MS)],
+        stamps: [DateTime.makeUnsafe(DOB_MS)],
+        maybeDays: [DOB],
+        tags: ["a"],
+      } as any)
+
+      const item = [...store.values()].find((i) => i.__edd_e__?.S === "LedgerItem")!
+      expect(item.amounts).toEqual({ L: [S("5"), S("12345678901234567890")] })
+      expect(item.seen).toEqual({ L: [S(DOB)] })
+      expect(item.stamps).toEqual({ L: [S(DOB)] })
+      expect(item.maybeDays).toEqual({ L: [S(DOB)] })
+      // Untransformed containers are stored exactly as before.
+      expect(item.tags).toEqual({ L: [S("a")] })
+
+      const got = (yield* LedgerAggregate.get({ id: "l1" } as any)) as Ledger
+      expect(got.amounts).toEqual([5n, 12345678901234567890n])
+      expect(got.seen[0]).toBeInstanceOf(Date)
+      expect(got.seen[0]!.getTime()).toBe(DOB_MS)
+      expect(isRealUtc(got.stamps[0], DOB_MS)).toBe(true)
+      expect(isRealUtc(got.maybeDays?.[0], DOB_MS)).toBe(true)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("an update round-trips domain values without re-encoding twice", () =>
+    Effect.gen(function* () {
+      yield* LedgerAggregate.create({
+        id: "l1",
+        amounts: ["5"],
+        seen: [new Date(DOB_MS)],
+        stamps: [DateTime.makeUnsafe(DOB_MS)],
+        tags: [],
+      } as any)
+      yield* LedgerAggregate.update({ id: "l1" } as any, (c: any) => ({
+        ...c.state,
+        amounts: [...c.state.amounts, 7n],
+      }))
+      const item = [...store.values()].find((i) => i.__edd_e__?.S === "LedgerItem")!
+      expect(item.amounts).toEqual({ L: [S("5"), S("7")] })
+      expect(item.seen).toEqual({ L: [S(DOB)] })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Key composition: transformed composites read off a ref must keep their bytes
+// ---------------------------------------------------------------------------
+
+class RankSheet extends Schema.Class<RankSheet>("RankSheet")({
+  umpire: Umpire.pipe(DynamoModel.ref),
+  seq: Schema.NumberFromString,
+}) {}
+class Roster extends Schema.Class<Roster>("Roster")({
+  id: Schema.String,
+  byDob: Schema.Array(RankSheet),
+  byRank: Schema.Array(RankSheet),
+  bySeq: Schema.Array(RankSheet),
+  flat: Schema.Array(Umpire),
+}) {}
+
+const RosterAggregate = Aggregate.make(Roster, {
+  table: ReproTable,
+  schema: ReproSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "roster" },
+  root: { entityType: "RosterItem" },
+  edges: {
+    byDob: Aggregate.many("byDob", {
+      entityType: "RosterDob",
+      entity: Umpires,
+      sk: { composite: ["umpire.dateOfBirth", "umpire.id"] },
+    }),
+    byRank: Aggregate.many("byRank", {
+      entityType: "RosterRank",
+      entity: Umpires,
+      sk: { composite: ["umpire.rank"] },
+    }),
+    bySeq: Aggregate.many("bySeq", {
+      entityType: "RosterSeq",
+      entity: Umpires,
+      sk: { composite: ["seq"] },
+    }),
+    // Element IS the entity: its own `rank` (NumberFromString) is the composite.
+    flat: Aggregate.many("flat", {
+      entityType: "RosterFlat",
+      entity: Umpires,
+      sk: { composite: ["rank"] },
+    }),
+  },
+})
+
+describe("#133 nested transforms — key composition is unchanged", () => {
+  it.effect("date and numeric transform composites inside a ref keep their key bytes", () =>
+    Effect.gen(function* () {
+      yield* seed
+      yield* RosterAggregate.create({
+        id: "r1",
+        byDob: [{ umpireId: "umpire-1", seq: "1" }],
+        byRank: [
+          { umpireId: "umpire-1", seq: "1" },
+          { umpireId: "umpire-2", seq: "2" },
+        ],
+        bySeq: [{ umpireId: "umpire-2", seq: "3" }],
+        flat: ["umpire-2"],
+      } as any)
+
+      const sks = [...store.values()]
+        .filter((i) => i.pk?.S === "$issue133#v1#roster#r1")
+        .map((i) => i.sk?.S)
+        .sort()
+      expect(sks).toEqual([
+        "$issue133#v1#rosterdob#2000-01-01t00:00:00.000z#umpire-1",
+        "$issue133#v1#rosterflat#12",
+        "$issue133#v1#rosteritem",
+        "$issue133#v1#rosterrank#0000000000000005",
+        "$issue133#v1#rosterrank#0000000000000012",
+        "$issue133#v1#rosterseq#0000000000000003",
+      ])
+
+      const dobItem = [...store.values()].find((i) => i.__edd_e__?.S === "RosterDob")!
+      expect(dobItem.umpire?.M?.dateOfBirth).toEqual(S(DOB))
+      expect(dobItem.umpire?.M?.rank).toEqual(S("5"))
+      expect(dobItem.seq).toEqual(S("1"))
+
+      const got = (yield* RosterAggregate.get({ id: "r1" } as any)) as Roster
+      expect(isRealUtc(got.byDob[0]!.umpire.dateOfBirth, DOB_MS)).toBe(true)
+      expect(got.byRank.map((s) => s.umpire.rank)).toEqual([5, 12])
+      expect(got.bySeq[0]!.seq).toBe(3)
+      expect(got.flat[0]!.rank).toBe(12)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Ref resolution is by field identity, not field name
+// ---------------------------------------------------------------------------
+
+/** A nested field that shares its NAME with a root `one` edge, but not its schema. */
+class Shift extends Schema.Class<Shift>("Shift")({
+  coach: Schema.String,
+  at: Schema.DateTimeUtcFromString,
+}) {}
+class Training extends Schema.Class<Training>("Training")({
+  id: Schema.String,
+  coach: Coach.pipe(DynamoModel.ref),
+  shifts: Schema.Array(Shift),
+}) {}
+
+const TrainingAggregate = Aggregate.make(Training, {
+  table: ReproTable,
+  schema: ReproSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "training" },
+  root: { entityType: "TrainingItem" },
+  edges: { coach: Aggregate.one("coach", { entityType: "TrainingCoach", entity: Coaches }) },
+})
+
+describe("#133 nested transforms — ref resolution", () => {
+  it.effect("does not re-point a nested field that merely shares a ref edge's name", () =>
+    Effect.gen(function* () {
+      yield* seed
+      yield* TrainingAggregate.create({
+        id: "t1",
+        coachId: "coach-1",
+        shifts: [{ coach: "assistant", at: DOB }],
+      } as any)
+      const item = [...store.values()].find((i) => i.__edd_e__?.S === "TrainingItem")!
+      expect(item.shifts).toEqual({ L: [{ M: { coach: S("assistant"), at: S(DOB) } }] })
+
+      const got = (yield* TrainingAggregate.get({ id: "t1" } as any)) as Training
+      expect(got.shifts[0]!.coach).toBe("assistant")
+      expect(isRealUtc(got.shifts[0]!.at, DOB_MS)).toBe(true)
+      expect(isRealUtc(got.coach.dateOfBirth, DOB_MS)).toBe(true)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Edges without an entity encode from the aggregate model's own schema
+// ---------------------------------------------------------------------------
+
+class Note extends Schema.Class<Note>("Note")({
+  noteId: Schema.String,
+  at: Schema.DateTimeUtcFromString,
+}) {}
+class Summary extends Schema.Class<Summary>("Summary")({
+  days: Schema.Array(Schema.DateTimeUtcFromString),
+}) {}
+class Journal extends Schema.Class<Journal>("Journal")({
+  id: Schema.String,
+  notes: Schema.Array(Note),
+  summary: Summary,
+}) {}
+
+const JournalAggregate = Aggregate.make(Journal, {
+  table: ReproTable,
+  schema: ReproSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "journal" },
+  root: { entityType: "JournalItem" },
+  edges: {
+    notes: Aggregate.many("notes", { entityType: "JournalNote", sk: { composite: ["noteId"] } }),
+    summary: Aggregate.one("summary", { entityType: "JournalSummary" }),
+  },
+})
+
+describe("#133 nested transforms — edges without an entity", () => {
+  it.effect("stores many-element and one-edge dates in wire form and reads them back", () =>
+    Effect.gen(function* () {
+      yield* JournalAggregate.create({
+        id: "j1",
+        notes: [{ noteId: "n1", at: DOB }],
+        summary: { days: [DOB, DAY2] },
+      } as any)
+      const note = [...store.values()].find((i) => i.__edd_e__?.S === "JournalNote")!
+      expect(note.at).toEqual(S(DOB))
+      expect(note.sk).toEqual(S("$issue133#v1#journalnote#n1"))
+      const summary = [...store.values()].find((i) => i.__edd_e__?.S === "JournalSummary")!
+      expect(summary.days).toEqual({ L: [S(DOB), S(DAY2)] })
+
+      const got = (yield* JournalAggregate.get({ id: "j1" } as any)) as Journal
+      expect(isRealUtc(got.notes[0]!.at, DOB_MS)).toBe(true)
+      expect(isRealUtc(got.summary.days[1], DAY2_MS)).toBe(true)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Root list-index composites keep their key bytes
+// ---------------------------------------------------------------------------
+
+class Invoice extends Schema.Class<Invoice>("Invoice")({
+  id: Schema.String,
+  // A transform under a Union: no top-level encoding, so it was stored as a
+  // number and its list key was composed (padded) from the bigint.
+  amount: Schema.optional(Schema.BigIntFromString),
+}) {}
+
+const InvoiceAggregate = Aggregate.make(Invoice, {
+  table: ReproTable,
+  schema: ReproSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "invoice" },
+  list: {
+    index: "gsi1",
+    name: "invoices",
+    pk: { field: "gsi1pk", composite: [] },
+    sk: { field: "gsi1sk", composite: ["amount"] },
+  },
+  root: { entityType: "InvoiceItem" },
+  edges: {},
+})
+
+describe("#133 nested transforms — list-index key composition is unchanged", () => {
+  it.effect("stores the encoded value but keys on the same bytes as before", () =>
+    Effect.gen(function* () {
+      yield* InvoiceAggregate.create({ id: "i1", amount: "5" } as any)
+      const item = [...store.values()].find((i) => i.__edd_e__?.S === "InvoiceItem")!
+      expect(item.amount).toEqual(S("5"))
+      expect(item.gsi1sk).toEqual(S(`$issue133#v1#invoices#${"5".padStart(38, "0")}`))
+      const got = (yield* InvoiceAggregate.get({ id: "i1" } as any)) as Invoice
+      expect(got.amount).toBe(5n)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
