@@ -1369,12 +1369,17 @@ const selfDatePlan = (
     // reliably. Refused at make() time (EDD-9058) rather than guessed.
     if (encoding.storage !== "string" && colliding.has("number")) {
       const field = opts?.path?.length ? opts.path.join(".") : "(unnamed)"
+      const reason = opts?.tolerantTransforms
+        ? `next to a member that is stored as a number or decodes to one (aggregates ` +
+          `re-decode domain values on update, so a NumberFromString / BigIntFromString ` +
+          `member collides too). A number could belong to either member`
+        : `next to a member that is also stored as a number. A stored number could ` +
+          `belong to either member`
       throw new Error(
         `[EDD-9058] Field "${field}" is a union whose date member is stored as an epoch ` +
-          `number (${encoding.storage}), next to a member that is also stored as a number. ` +
-          `A stored number could belong to either member, so it cannot be read back ` +
-          `reliably. Store the date as a string (DynamoModel.DateString — the default for a ` +
-          `self date), or remove the numeric member from the union.`,
+          `number (${encoding.storage}), ${reason}, so it cannot be read back reliably. ` +
+          `Store the date as a string (DynamoModel.DateString — the default for a self ` +
+          `date), or remove the numeric member from the union.`,
       )
     }
     canonicalOnly = colliding.has(encoding.storage === "string" ? "string" : "number")
