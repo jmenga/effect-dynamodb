@@ -720,6 +720,23 @@ describe("#133 nested transforms — ref resolution", () => {
   )
 })
 
+describe("#133 nested transforms — create input with refs", () => {
+  it.effect("keeps domain DateTime values intact while ref ids are replaced", () =>
+    Effect.gen(function* () {
+      yield* seed
+      yield* TrainingAggregate.create({
+        id: "t2",
+        coachId: "coach-1",
+        shifts: [{ coach: "assistant", at: DateTime.makeUnsafe(DOB_MS) }],
+      } as any)
+      const item = [...store.values()].find(
+        (i) => i.__edd_e__?.S === "TrainingItem" && i.id?.S === "t2",
+      )!
+      expect(item.shifts).toEqual({ L: [{ M: { coach: S("assistant"), at: S(DOB) } }] })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
 // ---------------------------------------------------------------------------
 // Edges without an entity encode from the aggregate model's own schema
 // ---------------------------------------------------------------------------

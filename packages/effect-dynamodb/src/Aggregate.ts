@@ -51,6 +51,7 @@ import {
   Effect,
   type Optic,
   Option,
+  Redacted,
   Schema,
   SchemaAST,
 } from "effect"
@@ -2429,6 +2430,39 @@ const collectRefIdsFromEdges = (
 }
 
 /**
+ * Deep-copy a create input so ref replacement can mutate it — like
+ * `structuredClone`, which this replaces, except that DOMAIN VALUES survive.
+ * `structuredClone` copies only own enumerable properties, so a `DateTime` came
+ * out as a bare `{ epochMilliseconds }` object with no prototype and no tag,
+ * which no date schema accepts, and a `Redacted` came out empty: any aggregate
+ * with a ref edge rejected a `DateTime` in its create input (#133). Those
+ * immutable domain values are now kept by reference; built-ins
+ * `structuredClone` knows (`Date`, `Map`, `Set`, binary data) still go through
+ * it; plain objects, arrays and class instances are walked and copied to plain
+ * objects, as `structuredClone` copied them.
+ */
+const cloneInput = (value: unknown): unknown => {
+  if (value === null || typeof value !== "object") return value
+  if (Array.isArray(value)) return value.map(cloneInput)
+  if (DateTime.isDateTime(value) || Redacted.isRedacted(value)) return value
+  if (
+    value instanceof Date ||
+    value instanceof Map ||
+    value instanceof Set ||
+    value instanceof RegExp ||
+    ArrayBuffer.isView(value) ||
+    value instanceof ArrayBuffer
+  ) {
+    return structuredClone(value)
+  }
+  // A plain object, or a class instance — which `structuredClone` also reduced
+  // to a plain object of its own enumerable properties.
+  const copy: Record<string, unknown> = {}
+  for (const [key, entry] of Object.entries(value)) copy[key] = cloneInput(entry)
+  return copy
+}
+
+/**
  * Replace ref ID fields in the input with hydrated domain data.
  */
 const replaceRefIds = (
@@ -2437,7 +2471,7 @@ const replaceRefIds = (
   lookup: Map<string, Record<string, unknown>>,
 ): Record<string, unknown> => {
   // Deep clone the input for mutation
-  const result = structuredClone(input) as Record<string, unknown>
+  const result = cloneInput(input) as Record<string, unknown>
 
   for (const req of refRequests) {
     const lookupKey = `${req.entity.entityType}:${req.id}`
