@@ -246,7 +246,7 @@ These are methods on the entity definition returned by `Entity.make()`. They ret
 | `entity.update(key)` | `EntityUpdate` | Start an update operation (compose with `set`, `add`, etc.) (descriptor). On a missing item it fails with `ItemNotFound` and writes nothing. The exception is a plain `.set()` of a complete item (every required field and primary-key composite, with no other operations, `expectedVersion`, `.condition()`, cascade, `withVector` or old-image `returnValues`), which the library creates through `create`, exactly as `put` would write it |
 | `entity.patch(key)` | `EntityUpdate` | Update with `attribute_exists` — fails with `ConditionalCheckFailed` if not exists (descriptor) |
 | `entity.delete(key)` | `EntityDelete` | Delete an item (descriptor). Releases only the unique sentinels the item owns. On a `retain` entity it reads the item and deletes it in one transaction with a snapshot of its final state, so an item created again continues past it. A delete that reads first and has no `.condition()` is retried from a fresh read after a concurrent write |
-| `entity.deleteIfExists(key)` | `EntityDelete` | Delete with `attribute_exists` — fails with `ConditionalCheckFailed` if not exists (descriptor) |
+| `entity.deleteIfExists(key)` | `EntityDelete` | Delete with `attribute_exists` — fails with `ConditionalCheckFailed` if not exists (descriptor). On an entity whose delete reads first, retried after a concurrent write like an unconditioned delete |
 | `entity.query.<indexName>(pk)` | `Query<Record>` | Query a specific index by partition key (descriptor) |
 | `entity.scan()` | `Query<Record>` | Full table scan filtered by entity type (descriptor) |
 | `entity.versions(key)` | `Query<Record>` | Query version history for an item (requires `versioned: { retain: true }`) (descriptor). With sort key composites, only the named item's history |
@@ -335,7 +335,7 @@ These functions transform entity operations via pipe:
 | `subtract(values)` | `EntityUpdate` | Subtract from numeric attributes (SET `#f = #f - :v`) |
 | `append(values)` | `EntityUpdate` | Append to list attributes (`list_append`) |
 | `deleteFromSet(values)` | `EntityUpdate` | DELETE elements from Set attributes |
-| `returnValues(mode)` | `EntityUpdate`, `EntityDelete` | Control DynamoDB `ReturnValues`: `"none" \| "allOld" \| "allNew" \| "updatedOld" \| "updatedNew"`. On an update the result type follows the mode (`UpdateReturn<A, M>`): `"none"` → `undefined`, `"updatedOld"` / `"updatedNew"` → a `Partial` of the top-level attributes the update wrote, `"allOld"` / `"allNew"` → the whole item. Honoured on every update path; with repeated calls the last one wins |
+| `returnValues(mode)` | `EntityUpdate`, `EntityDelete` | Control DynamoDB `ReturnValues`: `"none" \| "allOld" \| "allNew" \| "updatedOld" \| "updatedNew"`. On an update the result type follows the mode (`UpdateReturn<A, M>`): `"none"` → `undefined`, `"updatedOld"` / `"updatedNew"` → a `Partial` of the top-level attributes the update wrote, `"allOld"` / `"allNew"` → the whole item. Honoured on every update path; with repeated calls the last one wins. On a delete, `"allOld"` returns the deleted item (`undefined` when there was none) on every delete path, and `"none"` nothing |
 | `cascade(config)` | `EntityUpdate` | Propagate source entity changes to target entities that embed it via `DynamoModel.ref`. Config: `{ targets, filter?, mode? }` (dual API) |
 
 ### Decode Mode Selectors

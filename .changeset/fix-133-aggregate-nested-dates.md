@@ -39,8 +39,10 @@ real `DateTime`s.
   key has composites (several items per partition) now carry the item's
   identity, so each item has its own history. History written by earlier
   releases stays readable and restorable. Entities without sort key
-  composites keep exactly the keys they had. Details under "History of items
-  that share a partition".
+  composites keep exactly the keys they had. Rows an earlier release keyed
+  differently from today's composer (an unpadded number composite written by
+  1.15) are still read by queries and scans as they were. Details under
+  "History of items that share a partition".
 - **Some attributes change stored type** on their next write, listed under each
   section below. For example, an optional `NumberFromString` holding `5` was
   stored as `{ "N": "5" }` and is now `{ "S": "5" }`, and a nested self date was
@@ -117,9 +119,23 @@ real `DateTime`s.
   makes a retain hard delete a `GetItem` plus a two-item `TransactWriteItems`
   (twice the write capacity of a `DeleteItem`) instead of one `DeleteItem`.
   A delete you set no `.condition()` on is read and written again (up to three
-  attempts) when another writer changes the item in between, as a put is; this
-  holds for every delete that reads first (retain, unique and soft delete).
-  With a `.condition()`, such a race fails, as before.
+  attempts) when another writer changes or deletes the item in between, as a
+  put is; this holds for every delete that reads first (retain, unique and
+  soft delete), and a delete that loses the item to a concurrent delete
+  reports what a delete of a missing item does (success for retain only,
+  `ItemNotFound` with unique constraints or soft delete). `deleteIfExists`
+  asserts only that the item exists, which these deletes already check: it
+  is retried the same way, and on a missing item it fails with
+  `ConditionalCheckFailed` (it used to fail with `ItemNotFound` on these
+  entities). With any other `.condition()`, such a race fails, as before.
+- **`delete().returnValues("allOld")` returns the item it deleted** (the
+  model, `undefined` when there was none), on every delete path — it returned
+  nothing. The result is typed by the mode.
+- **Bound queries filter and select renamed fields by their stored names.** A
+  field renamed with `DynamoModel.configure(..., { field })` was projected and
+  filtered under its domain name, so `select(["name"])` returned `{}` and
+  `filter({ name })` matched nothing; they now use the stored attribute and
+  hand items back under the domain names.
 - **A transaction that touches one item twice, or passes DynamoDB's 4 MB, is
   refused before it is sent**, with a `ValidationError` naming the entity, in
   `Transaction.transactWrite` and `EventStore.append`. The items an op adds
@@ -130,12 +146,18 @@ real `DateTime`s.
   entity's type, so a primary-key query with no (or a partial) sort key
   condition, a scan, and a collection on the primary key returned them as if
   they were items (a time-series partition query failed to decode its events).
-  They're now left out, judged exactly: a row is an item when the sort key
-  composed from its own stored composites is its sort key. That runs on the
-  rows as they arrive, for queries and scans alike, so a projection also reads
-  the sort key and its composites. `.history()` still reads events. A
-  primary-key `count()` of a retain, soft-delete or time-series entity reads
-  the rows to count them (the same read capacity as a server-side count).
+  They're now left out. A row is left out only when it is positively history:
+  its sort key is not the one its own stored composites compose AND it has the
+  layout of a snapshot (`#v#…<version>`), a tombstone (`#deleted#…<timestamp>`)
+  or an event (`#e#` under the live key). Every other row is read as before —
+  including rows an earlier release keyed in a way the current composer
+  doesn't reproduce (an unpadded number composite written by 1.15). This runs
+  on the rows as they arrive, for queries and scans alike, so a projection
+  also reads the sort key and its composites. `limit` is still sent as
+  `Limit`, paging on to make up any rows left out. `.history()` still reads
+  events. A primary-key `count()` of a retain, soft-delete or time-series
+  entity reads the sort key and composites of each row to count them (the
+  same read capacity as a server-side count), not whole items.
 - **`purge` removes only its own entity's rows.** It deleted every row in the
   partition, so with a collection on the primary key, purging an order also
   deleted its lines. It now deletes only rows of its own entity type.
@@ -564,9 +586,9 @@ an `additionalItems` op that repeats an event or the idempotency sentinel of the
 append. A transaction whose items pass DynamoDB's 4 MB (4,194,304 bytes) fails
 with a `ValidationError` naming its largest item, instead of DynamoDB's bare
 `ValidationException`. The size is a lower bound by DynamoDB's item-size rules
-(numbers count a byte per two significant digits, plus one; list and map
-overheads aren't counted; a retain put counts twice), so a transaction DynamoDB
-would accept is never refused. Deletes of `unique`, retain and `softDelete` entities
+(numbers count a byte per two significant digits, plus one, and zero one byte;
+list and map overheads aren't counted; an update counts only its key; a retain
+put counts twice), so a transaction DynamoDB would accept is never refused. Deletes of `unique`, retain and `softDelete` entities
 are still refused (`EDD-9048`), and `Batch.write` still sends versioned puts as
 create-only transactions (below).
 

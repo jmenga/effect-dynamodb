@@ -814,17 +814,23 @@ segmented one on a tie).
 **History rows are not items.** Snapshots, tombstones and time-series event
 items keep their entity's `__edd_e__` (the history readers filter on it), so the
 ownership filter alone admits them to a primary-key query, a scan, or a
-collection on the primary key. They're judged exactly: a row is an item iff the
-sort key composed from its own stored composites (`liveSkOf(toDomainView(row))`)
-is its stored sort key — history and event rows never are, and no live row
-fails it, whatever its values or collection names hold (`#e#`, `deleted`, `v`).
-`Entity._liveRows` (for `retain` / `softDelete` / `timeSeries`; otherwise
-`undefined`, and the query is unchanged) drives `Query`'s `liveRows`, applied to
-rows as they arrive, before decoding or counting, for queries and scans alike (a
-query can't name a key attribute in its filter, and a scan's filter saves no
-read capacity). Like a client-side predicate, that means `limit` isn't sent as
-`Limit` and `count()` reads the rows; a `select` also reads the sort key and its
-composites. A collection on the primary key judges each row by the member its
+collection on the primary key. A row is dropped only when it is positively
+history: the sort key composed from its own stored composites
+(`liveSkOf(toDomainView(composites))`, only those attributes unmarshalled) is not
+its stored sort key, or they don't compose, AND the sort key has a history
+layout — `#v#[…#]<7+ digits>` (retain), `#deleted#[…#]<ISO timestamp>`
+(softDelete), or `#e#` after the live key less its composites (timeSeries). A
+live row composes its own key, whatever its values or collection names hold
+(`#e#`, `deleted`, `v`); a row the current composer can't reproduce (an unpadded
+number composite written by 1.15, a row missing a composite) isn't history-shaped
+and is read as on main. `Entity._liveRows` (for `retain` / `softDelete` /
+`timeSeries`; otherwise `undefined`, and the query is unchanged) drives
+`Query`'s `liveRows`, applied to rows as they arrive, before decoding or
+counting, for queries and scans alike (a query can't name a key attribute in its
+filter, and a scan's filter saves no read capacity). `limit` is still sent as
+`Limit` (bounded by `pageSize`); the accumulate loop pages on to make up dropped
+rows. `count()` reads only the sort key and composites (`reads`) of each row; a
+`select` also reads them. A collection on the primary key judges each row by the member its
 `__edd_e__` names. GSI queries never meet history rows, which carry no index keys.
 
 ### Policy-Aware GSI Composition (update & append)
@@ -2050,11 +2056,19 @@ therefore costs a `GetItem` and a two-item `TransactWriteItems`, not one
 condition, so the condition is judged against no item and an item created since
 the read is never removed unsnapshotted). A delete that reads first — retain,
 unique or soft — with no `.condition()` is retried from a fresh read when it
-loses a race (the item changed, or a sentinel it releases changed hands), up to
-`GUARDED_PUT_ATTEMPTS`, as a put is: the caller asserted nothing the race could
-break, and the guard still keeps a concurrent write out of the snapshot or
-tombstone. With a `.condition()`, the read is what the condition was judged
-against, and the race fails. A put, `create`, `upsert` or transaction put of a
+loses a race (the item changed, was deleted — `DeletedConcurrently` — or a
+sentinel it releases changed hands), up to `GUARDED_PUT_ATTEMPTS`, as a put is:
+the caller asserted nothing the race could break, and the guard still keeps a
+concurrent write out of the snapshot or tombstone. A retry that finds the item
+gone reports what a delete of a missing item does: nothing for retain only,
+`ItemNotFound` with unique constraints or soft delete. `deleteIfExists`'s
+`attribute_exists(pk)` (`assertsExistenceOnly`) is already implied by these
+guards, so it is judged against the read — a missing item is
+`ConditionalCheckFailed` — and retried like an unconditioned delete. With any
+other `.condition()`, the read is what the condition was judged against, and the
+race fails. Every delete path returns, under `returnValues("allOld")`, the item
+it removed: the one read (the delete is guarded on it), or `ALL_OLD` from a
+plain `DeleteItem`. A put, `create`, `upsert` or transaction put of a
 missing retain item reads the highest version retained for its key (a `Query` on
 the `v#` prefix, reversed, `Limit: 1`) and continues after it: the new item takes
 that version + 1, a new incarnation token, and its snapshot at that version.
@@ -2137,7 +2151,8 @@ naming the entity and both sources. **Size** (`refuseOversizedTransaction`):
 a LOWER bound on the items' sizes by DynamoDB's item-size rules
 (`internal/ItemSize.ts`, `"lower"`: numbers a byte per two significant digits
 plus one, no list or map overhead; a `Put`'s item, a `Delete`'s or
-`ConditionCheck`'s key, an `Update`'s key and values), so a transaction DynamoDB
+`ConditionCheck`'s or `Update`'s key — an Update's values may be its
+condition's; zero is one byte), so a transaction DynamoDB
 would accept is never refused, must not pass 4 MB =
 4,194,304 bytes, DynamoDB's documented aggregate limit for one transaction (in
 the binary megabytes of all its size limits). A retain put counts twice: its
