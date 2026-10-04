@@ -1167,6 +1167,15 @@ const makeAggregate = <TSchema extends Schema.Top>(
     tolerantTransforms: true,
     resolveRef,
   }) as unknown as Schema.Codec<any>
+  // The same schema for WRITES — `create` input and `update`'s mutated state —
+  // with the container `.check()` refinements the substitution rebuilds kept, so
+  // a write that breaks one is rejected (#133). Assembly keeps `decodeSchema`:
+  // a row written while those checks were not enforced must stay readable.
+  const writeSchema = substituteSchemaDeep(schema, {
+    tolerantTransforms: true,
+    resolveRef,
+    enforceChecks: true,
+  }) as unknown as Schema.Codec<any>
 
   // Validate the collection index / consistency combination against the table's
   // primary key. Best effort: a table registering only aggregates has no primary key
@@ -1271,6 +1280,21 @@ const makeAggregate = <TSchema extends Schema.Top>(
     TSchema["Iso"]
   >
   const opticRoot = Schema.toIsoFocus(schema) as Optic.Iso<TSchema["Iso"], TSchema["Iso"]>
+  // The same conversion through the READ schema. `toIso(schema)` re-checks the
+  // model's `.check()` refinements, so a stored row written while a container
+  // check was not enforced (#133) would make every `update` throw before the
+  // mutation could repair it. Reads accept such a row; so does this.
+  const readToPlain = Schema.toIso(decodeSchema as unknown as TSchema) as Optic.Iso<
+    Schema.Schema.Type<TSchema>,
+    TSchema["Iso"]
+  >
+  const toPlainState = (value: Schema.Schema.Type<TSchema>): TSchema["Iso"] => {
+    try {
+      return classToPlain.get(value)
+    } catch {
+      return readToPlain.get(value)
+    }
+  }
 
   // Composite key form — the SAME rule and the SAME function the entity path
   // uses (`internal/CompositeCodec.ts`). Aggregates compose from assembled
@@ -1285,8 +1309,23 @@ const makeAggregate = <TSchema extends Schema.Top>(
         `Supply a value of the attribute's own type.`,
     )
   })
-  const keyRecord = (record: Record<string, unknown>): Record<string, unknown> =>
-    toCompositeKeyRecord(compositeKeyForm, record)
+  // Only the attributes a key is ever composed from are put into key form. The
+  // rest of the record is never read off the result, and normalising it could
+  // only fail: a stored value that breaks a field's `.check()` (#133) made
+  // every `update` throw EDD-9050 over an attribute no key uses.
+  const compositeAttrs: ReadonlySet<string> = new Set([
+    ...config.pk.composite,
+    ...(config.collection.sk?.composite ?? []),
+    ...(config.list?.pk.composite ?? []),
+    ...(config.list?.sk.composite ?? []),
+  ])
+  const keyRecord = (record: Record<string, unknown>): Record<string, unknown> => {
+    const composites: Record<string, unknown> = {}
+    for (const attr of compositeAttrs) {
+      if (attr in record) composites[attr] = record[attr]
+    }
+    return toCompositeKeyRecord(compositeKeyForm, composites)
+  }
 
   /** Shared: compose PK and query all items */
   const fetchPartition = (key: Record<string, unknown>) =>
@@ -1365,7 +1404,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         // 2. Validate via schema decode (decodeSchema substitutes nested edge
         //    self-date/Redacted leaves — Option A — and is identical to `schema`
         //    when no edge needs it).
-        const decoded = yield* Schema.decodeUnknownEffect(decodeSchema)(hydrated).pipe(
+        const decoded = yield* Schema.decodeUnknownEffect(writeSchema)(hydrated).pipe(
           Effect.mapError(
             (cause) =>
               new ValidationError({
@@ -1448,7 +1487,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         )
 
         // 2. Apply mutation — provide optics context for composable updates
-        const state = classToPlain.get(current as Schema.Schema.Type<TSchema>)
+        const state = toPlainState(current as Schema.Schema.Type<TSchema>)
         const updated = mutationFn({
           state,
           cursor: makeCursor(state, opticRoot),
@@ -1461,7 +1500,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         //    for every date field (root + nested edges, Pattern A and Pattern B),
         //    so update no longer trips the "Expected string, got DateTime" decode
         //    that a strict `*FromString` schema would raise (#72 update path).
-        const decoded = yield* Schema.decodeUnknownEffect(decodeSchema)(updated).pipe(
+        const decoded = yield* Schema.decodeUnknownEffect(writeSchema)(updated).pipe(
           Effect.mapError(
             (cause) =>
               new ValidationError({

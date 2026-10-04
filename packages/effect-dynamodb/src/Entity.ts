@@ -14,6 +14,7 @@ import {
   type ExtractIdentifier,
   getIdentifierField,
   getSparseFields,
+  isConfiguredModel,
   isRefField,
 } from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
@@ -1695,9 +1696,46 @@ const makeImpl = <
   // record-based `append`, which bypass the update schema (#133).
   const pathValues = makePathValueEncoder(
     data.modelFields,
-    (schemas.recordSchema as unknown as { readonly fields: globalThis.Record<string, Schema.Top> })
-      .fields,
+    (
+      schemas.writeModelSchema as unknown as {
+        readonly fields: globalThis.Record<string, Schema.Top>
+      }
+    ).fields,
+    // A `DynamoModel.ref` field's own schema is opaque; paths under it follow
+    // the model it is denormalised from.
+    Object.fromEntries(
+      (
+        data.resolvedRefs as ReadonlyArray<{
+          readonly fieldName: string
+          readonly refEntity?: { readonly model?: unknown }
+        }>
+      )
+        .filter((ref) => ref.refEntity?.model !== undefined)
+        .map((ref) => {
+          const model = ref.refEntity!.model as Schema.Top
+          return [
+            ref.fieldName,
+            isConfiguredModel(model) ? (model.model as Schema.Top) : model,
+          ] as const
+        }),
+    ),
   )
+  /**
+   * Encode a path-addressed update value and check it against the write schema
+   * at its path — container checks included (#133). `undefined` issue = valid.
+   */
+  const encodePathValue = (
+    segments: ReadonlyArray<string | number>,
+    value: unknown,
+    kind: "value" | "elements",
+  ): { readonly encoded: unknown; readonly issue: unknown } => {
+    if (kind === "value") {
+      const encoded = pathValues.value(segments, value)
+      return { encoded, issue: pathValues.validate(segments, encoded) }
+    }
+    const encoded = pathValues.elements(segments, value)
+    return { encoded, issue: pathValues.validateElements(segments, encoded) }
+  }
   // resolvedRefs carries the actual ref-target entity objects; at runtime they
   // are operational Entities (for runtime-authored refs) so write-time hydration
   // can call their CRUD ops. The pure bundle widens refEntity to EntityDefinition.
@@ -3430,10 +3468,15 @@ const makeImpl = <
             if (uState.append) {
               for (const [attr, val] of Object.entries(uState.append)) {
                 const existing = (newItem[attr] as Array<unknown>) ?? []
-                newItem[attr] = [
-                  ...existing,
-                  ...(pathValues.elements([attr], val) as ReadonlyArray<unknown>),
-                ]
+                const appended = encodePathValue([attr], val, "elements")
+                if (appended.issue !== undefined) {
+                  return yield* new ValidationError({
+                    entityType,
+                    operation: "update.append",
+                    cause: appended.issue,
+                  })
+                }
+                newItem[attr] = [...existing, ...(appended.encoded as ReadonlyArray<unknown>)]
               }
             }
             if (uState.deleteFromSet) {
@@ -3935,7 +3978,15 @@ const makeImpl = <
               const nameKey = `#u${counter}`
               const valKey = `:u${counter}`
               names[nameKey] = resolveDbName(attr)
-              values[valKey] = toAttributeValue(pathValues.elements([attr], val))
+              const appended = encodePathValue([attr], val, "elements")
+              if (appended.issue !== undefined) {
+                return yield* new ValidationError({
+                  entityType,
+                  operation: "update.append",
+                  cause: appended.issue,
+                })
+              }
+              values[valKey] = toAttributeValue(appended.encoded)
               setClauses.push(`${nameKey} = list_append(${nameKey}, ${valKey})`)
               counter++
             }
@@ -4069,7 +4120,15 @@ const makeImpl = <
                 setClauses.push(`${pathExpr} = ${srcExpr}`)
               } else {
                 const valKey = `:ps${pathCounter.value++}`
-                values[valKey] = toAttributeValue(pathValues.value(op.segments, op.value))
+                const set = encodePathValue(op.segments, op.value, "value")
+                if (set.issue !== undefined) {
+                  return yield* new ValidationError({
+                    entityType,
+                    operation: "update.pathSet",
+                    cause: set.issue,
+                  })
+                }
+                values[valKey] = toAttributeValue(set.encoded)
                 setClauses.push(`${pathExpr} = ${valKey}`)
               }
             }
@@ -4101,7 +4160,15 @@ const makeImpl = <
             for (const op of uState.pathAppends) {
               const pathExpr = compilePath(op.segments, names, "pa", pathCounter, resolveDbName)
               const valKey = `:pa${pathCounter.value++}`
-              values[valKey] = toAttributeValue(pathValues.elements(op.segments, op.value))
+              const appended = encodePathValue(op.segments, op.value, "elements")
+              if (appended.issue !== undefined) {
+                return yield* new ValidationError({
+                  entityType,
+                  operation: "update.pathAppend",
+                  cause: appended.issue,
+                })
+              }
+              values[valKey] = toAttributeValue(appended.encoded)
               setClauses.push(`${pathExpr} = list_append(${pathExpr}, ${valKey})`)
             }
           }
@@ -4111,7 +4178,15 @@ const makeImpl = <
             for (const op of uState.pathPrepends) {
               const pathExpr = compilePath(op.segments, names, "pp", pathCounter, resolveDbName)
               const valKey = `:pp${pathCounter.value++}`
-              values[valKey] = toAttributeValue(pathValues.elements(op.segments, op.value))
+              const prepended = encodePathValue(op.segments, op.value, "elements")
+              if (prepended.issue !== undefined) {
+                return yield* new ValidationError({
+                  entityType,
+                  operation: "update.pathPrepend",
+                  cause: prepended.issue,
+                })
+              }
+              values[valKey] = toAttributeValue(prepended.encoded)
               setClauses.push(`${pathExpr} = list_append(${valKey}, ${pathExpr})`)
             }
           }
@@ -4121,7 +4196,15 @@ const makeImpl = <
             for (const op of uState.pathIfNotExists) {
               const pathExpr = compilePath(op.segments, names, "pi", pathCounter, resolveDbName)
               const valKey = `:pi${pathCounter.value++}`
-              values[valKey] = toAttributeValue(pathValues.value(op.segments, op.value))
+              const ifAbsent = encodePathValue(op.segments, op.value, "value")
+              if (ifAbsent.issue !== undefined) {
+                return yield* new ValidationError({
+                  entityType,
+                  operation: "update.pathIfNotExists",
+                  cause: ifAbsent.issue,
+                })
+              }
+              values[valKey] = toAttributeValue(ifAbsent.encoded)
               setClauses.push(`${pathExpr} = if_not_exists(${pathExpr}, ${valKey})`)
             }
           }
