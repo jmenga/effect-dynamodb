@@ -321,12 +321,14 @@ For nested attributes, array elements, and attribute-to-attribute operations, us
 
 - A `DateTime` set at `["days", 0]` is stored as its ISO string, or as a number under `storedAs`.
 - A `Schema.NumberFromString` value is stored as a string.
-- A `Schema.Trim` field stores its trimmed form.
 - A plain object set on a class-typed field is encoded as that class.
-- A class, struct, record, tuple or union value is always encoded as a whole, so the `DateTime`, `Date` and `Redacted` values inside it keep their wire form.
+- A class instance is always encoded as a whole, since its constructor took domain values.
+- A plain object or array that mixes wire and domain parts, such as `{ b64: "hi", at: DateTime, n: "5" }`, is encoded part by part, by the schema at each position. Every `DateTime`, `Date` and `Redacted` inside it is stored in its wire form.
 - Appended and prepended lists are encoded element by element.
 
-One kind of value is stored as given: a value already in the wire form of a leaf transform whose wire form is a primitive, such as a base64 string on a `Schema.StringFromBase64` field or a JSON string on a `Schema.fromJsonString` field. Such a value is also a valid domain value, so encoding it again would double-encode it. Arrays of these leaves are checked element by element.
+A value already in wire form is normalised the way `.set()` normalises it. A `NumberFromString` value of `"05"` is stored as `"5"`, a `DateTimeUtcFromString` value of `"2000-01-01"` as `"2000-01-01T00:00:00.000Z"`, and a `Schema.Trim` field stores its trimmed form. The value read back is the same either way; only the stored bytes differ, which matters to filters and DynamoDB Streams consumers.
+
+One kind of value is stored exactly as given: a value that is genuinely valid wire for a leaf transform with a primitive wire form, and also a valid domain value. Examples are `"aGk="` on a `Schema.StringFromBase64` field, or a JSON string on a `Schema.fromJsonString` field. Encoding such a value again would double-encode it. A plain string that isn't valid wire, such as `"hi"` on a `StringFromBase64` field, is a domain value and is encoded (`"aGk="`). The same rule applies to such leaves inside arrays and plain objects.
 
 `ADD`, `DELETE` and `SUBTRACT` are unchanged. A path the model schema cannot follow, such as one into a `DynamoModel.ref` field, still writes the value as given.
 

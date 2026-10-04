@@ -1397,8 +1397,9 @@ class Order extends Schema.Class<Order>("Order")({
 | `DateTimeZoned` | UTC ISO string (normalized) | Extended ISO with zone |
 
 The extended ISO form round-trips the zone: a named zone as `…+09:00[Asia/Tokyo]`,
-an offset zone as `…+05:00` (rebuilt with that offset since #133; earlier
-versions read it back as UTC).
+an offset zone as `…+05:00` (rebuilt with that offset since #133, for both
+`DynamoModel.DateTimeZoned` and a self `Schema.DateTimeZoned`; earlier versions
+read it back as UTC).
 
 ### Domain Model Purity
 
@@ -1496,8 +1497,12 @@ other members. A self-date member then:
 - when it is stored as an epoch number next to a member also stored as a number
   (`Number`, a number literal, `BigInt`, another epoch date), cannot be told
   apart from it at all: rejected at `make()` with **EDD-9058**. There is no
-  fallback to ISO storage. `NumberFromString` is stored as a string and does not
-  collide.
+  fallback to ISO storage. On an entity, `NumberFromString` and
+  `BigIntFromString` are stored as strings and do not collide. Under
+  `tolerantTransforms` (aggregates) a member's **domain** kinds count too
+  (`memberWireKinds(..., { domainSide })`), because `update` re-decodes domain
+  values: their domain `5` competes with an epoch date, so aggregates reject
+  them with EDD-9058 as well.
 
 A transform date member (`DateTimeUtcFromString`) keeps the transform's own
 decode inside a union, since the generic date transform accepts more than the
@@ -1514,10 +1519,15 @@ unmarshalled `number` back to `bigint`. Never inside a union, where a lenient
 member could claim another member's value. Write schemas and keys use the
 strict schemas, so nothing written changes.
 
-**Zoned offsets.** A `DateTimeZoned` stored as `…+05:00` (an offset zone, no
-bracket) is rebuilt with that offset; before #133 it was rebuilt as UTC. Named
-zones (`…[Europe/London]`) and UTC round-trip as before, and the stored form is
-unchanged.
+**Zoned offsets.** A zoned date stored as `…+05:00` (an offset zone, no
+bracket) is rebuilt with that offset; before #133 it was rebuilt as UTC. One
+parser (`internal/ZonedIso.ts`, `parseZonedIso`) serves both the
+`DynamoModel.DateTimeZoned` transform and the substituted date transform, so the
+two cannot drift. Named zones (`…[Europe/London]`) and UTC round-trip as before,
+and the stored form is unchanged. Offsets that are not whole minutes (historical
+LMT offsets, a sub-minute `zoneMakeOffset`) are rounded to the minute by
+`formatIsoZoned`, so the instant read back moves by the rounding difference, as
+in earlier versions.
 
 Key composition is unchanged for every
 existing shape (primary, GSI, unique, version, soft-delete, time-series keys);
@@ -1707,16 +1717,20 @@ members, array / tuple elements and record values; a top-level field uses the
 record schema's own, so `storedAs` applies) and encodes the value through it;
 list operations encode element by element. Values go through `encode`, then
 `decode → encode` as `.set()` does, so a plain object on a class-typed field is
-encoded as that class and a `Schema.Trim` field stores its trimmed form. A
-class, struct, record, tuple or union value is always encoded, so `Redacted`,
-`Date` and `DateTime` leaves inside it keep their wire form. The one
-pass-through for a value already in wire form is a LEAF transform with a
-primitive wire form whose wire value is also a valid domain value
-(`StringFromBase64` given `"aGk="`, `fromJsonString`), and arrays of such leaves
-element by element (`makeAmbiguityCheck`): encoding those would double-encode.
-A value that does not encode at all, or a path the schema cannot follow (an
-opaque `DynamoModel.ref`), is passed through as before. `ADD`, `DELETE` and
-`SUBTRACT` are unchanged.
+encoded as that class, and a value already in wire form is normalised
+(`NumberFromString` `"05"` → `"5"`, `DateTimeUtcFromString` `"2000-01-01"` →
+`"2000-01-01T00:00:00.000Z"`, `Schema.Trim`): read-back values are identical,
+only stored bytes differ. A class instance is always encoded whole. A plain
+object or array that neither encodes nor decode→encodes whole (it mixes wire and
+domain parts), or that holds an ambiguous wire leaf, is encoded part by part
+(`encodeByParts`, `holdsAmbiguousLeaf`), so every `DateTime` / `Date` /
+`Redacted` inside is stored in wire form. The one pass-through is a LEAF
+transform with a primitive wire form, given a value that genuinely decodes as
+wire AND validates as the domain type (`StringFromBase64` given `"aGk="`,
+`fromJsonString`), whose encode would double-encode it (`makeAmbiguityCheck`);
+`"hi"` on `StringFromBase64` is not valid wire and is encoded. A path the schema
+cannot follow (an opaque `DynamoModel.ref`) is passed through as before. `ADD`,
+`DELETE` and `SUBTRACT` are unchanged.
 
 **Why hard-break over dual.** Carrying both the variadic overload and the fluent builder would double the surface area of `BoundEntity`, degrade hover tooltips, and force contributors to remember two shapes. The read side settled on builders for the same reasons. The change is batched into the next major alongside other breaking changes.
 
@@ -2847,7 +2861,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9056` | `Aggregate.ts` | A nested sub-aggregate binding declares a discriminator attribute it already inherits from an enclosing binding — the inner value would overwrite the outer one on the inner rows, so the parent's bindings could no longer be told apart. Use a distinct attribute name (e.g. `{ squadNo: 1 }` inside `{ clubNo: 1 }`) |
 
 | `EDD-9057` | `internal/EntitySchemas.ts` | A `DynamoModel.configure` `storedAs` override on a union field with more than one self-date member — the override cannot say which member it applies to. Annotate the intended member with `.pipe(DynamoModel.storedAs(...))` instead |
-| `EDD-9058` | `internal/EntitySchemas.ts` | A union's self-date member is stored as an epoch number next to a member also stored as a number (`Number`, a number literal, `BigInt`, another epoch date) — a stored number could belong to either, so it cannot be read back reliably. Store the date as a string, or remove the numeric member |
+| `EDD-9058` | `internal/EntitySchemas.ts` | A union's self-date member is stored as an epoch number next to a member also stored as a number (`Number`, a number literal, `BigInt`, another epoch date) — a stored number could belong to either, so it cannot be read back reliably. On aggregates a member whose DOMAIN is numeric (`NumberFromString`, `BigIntFromString`) is rejected too, since `update` re-decodes domain values. Store the date as a string, or remove the numeric member |
 
 Next free code: **`EDD-9059`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
