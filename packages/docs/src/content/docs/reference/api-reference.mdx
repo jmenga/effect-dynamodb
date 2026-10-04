@@ -243,7 +243,7 @@ These are methods on the entity definition returned by `Entity.make()`. They ret
 | `entity.create(input)` | `EntityPut` | Insert only — fails with `ConditionalCheckFailed` if exists (descriptor) |
 | `entity.upsert(input)` | `EntityPut` | Create or update — uses `if_not_exists()` for immutable fields, createdAt, version (descriptor) |
 | `entity.get(key)` | `EntityGet` | Get a single item by primary key (descriptor) |
-| `entity.update(key)` | `EntityUpdate` | Start an update operation (compose with `set`, `add`, etc.) (descriptor). On a missing item it fails with `ItemNotFound` and writes nothing, unless it is a plain update whose `.set()` supplies every required field and key composite, in which case it creates a complete item |
+| `entity.update(key)` | `EntityUpdate` | Start an update operation (compose with `set`, `add`, etc.) (descriptor). On a missing item it fails with `ItemNotFound` and writes nothing. The exception is a plain `.set()` of a complete item (every required field and primary-key composite, with no other operations, `expectedVersion`, `.condition()`, cascade, `withVector` or old-image `returnValues`), which the library creates through `create`, exactly as `put` would write it |
 | `entity.patch(key)` | `EntityUpdate` | Update with `attribute_exists` — fails with `ConditionalCheckFailed` if not exists (descriptor) |
 | `entity.delete(key)` | `EntityDelete` | Delete an item (descriptor) |
 | `entity.deleteIfExists(key)` | `EntityDelete` | Delete with `attribute_exists` — fails with `ConditionalCheckFailed` if not exists (descriptor) |
@@ -1229,7 +1229,7 @@ import {
 | `DynamoValidationError` | `"DynamoValidationError"` | Malformed DynamoDB request |
 | `InternalServerError` | `"InternalServerError"` | Transient DynamoDB failure |
 | `ResourceNotFoundError` | `"ResourceNotFoundError"` | Table or index does not exist |
-| `ItemNotFound` | `"ItemNotFound"` | No item under the key: `get`, an `update` of a missing item (unless a plain update supplies a complete item), `restore` with no soft-deleted item or after a concurrent restore won |
+| `ItemNotFound` | `"ItemNotFound"` | No item under the key: `get`, an `update` of a missing item (unless it is a plain `.set()` of a complete item), `restore` with no soft-deleted item or after a concurrent restore won |
 | `ConditionalCheckFailed` | `"ConditionalCheckFailed"` | A `.condition()` was not met (put, update, delete, create), or `patch()` of a missing item. A lost version race is an `OptimisticLockError` instead |
 | `ValidationError` | `"ValidationError"` | Schema decode/encode failed |
 | `TransactionCancelled` | `"TransactionCancelled"` | Transaction rejected (includes cancellation `reasons`) |

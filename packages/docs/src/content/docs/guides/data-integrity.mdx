@@ -319,10 +319,14 @@ Some updates read the item before writing: a unique-field change, a computed cha
 
 Versioned entities carry a hidden `__edd_i__` attribute, a token set when the item is created and added to existing items on their next guarded write. It never appears in decoded models, only in `asNative` output and raw items. Version-checked writes require it to match, so an item deleted and recreated at the same version is never mistaken for the original.
 
-Known limitations:
+An update too wide for one DynamoDB expression (4 KB, 300 operators) writes the whole item instead. A versioned entity writes it under its version condition. An unversioned one writes it under the fallback guard soft delete uses (see [Lifecycle](/effect-dynamodb/guides/lifecycle/)). A concurrent write from outside the library to an attribute that guard doesn't cover is lost, which 1.22.0 also did for every such update. A `.condition()` too large to fit beside the guard fails before writing with a `ValidationError` stating its size.
 
-- On an unversioned entity, the item returned by a unique-field update may show a stale value for an attribute the update neither reads nor writes, if another writer changed it in between. Use `versioned` when you need exact images.
-- A plain `.expectedVersion(n)` can't detect a delete-and-recreate that has climbed back to version `n`. Versions restart at 1, so this takes `n − 1` updates after the recreate.
+Items written before an entity was `versioned` read as version 0, and `expectedVersion(0)` addresses them; their first versioned write produces version 1.
+
+Known limitations, both inherent:
+
+- On unversioned entities, nothing can prove an unguarded attribute unchanged. So the item a unique-field update returns may show stale values for attributes it neither reads nor writes, wide items use the fallback guard, and the whole-item write of a wide update can overwrite writers outside the library. Use `versioned` where that matters.
+- A plain `.expectedVersion(n)` can't detect a delete-and-recreate that has climbed back to version `n`. Versions restart at 1, so it takes `n − 1` updates after the recreate.
 
 ## Idempotency
 

@@ -1805,11 +1805,41 @@ input fails without writing: `OptimisticLockError` (with the real
 `actualVersion`) on a versioned entity, `ConcurrentModification` (naming the
 changed `attributes`, with `current`) on an unversioned one. Soft delete and a
 unique-constraint hard delete are guarded the same way: by version, or for an
-unversioned entity by a condition over every attribute read. If that condition
-exceeds `GUARD_EXPRESSION_BUDGET` (3,500 characters, under DynamoDB's 4 KB
-expression limit), the delete is refused with a `ValidationError` asking for
-`versioned`. `restore` fails with `ItemNotFound` when the tombstone is gone (a
+unversioned entity by a condition over every attribute read. `restore` fails with `ItemNotFound` when the tombstone is gone (a
 concurrent restore won) and `ItemNotDeleted` when a live item already exists.
+
+**Wide items.** Guards are sized against DynamoDB's real limits on one
+expression (`EXPRESSION_LIMIT` 4,096 characters, `OPERATOR_LIMIT` 300 operators
+and functions), computed on the actual condition, including the caller's
+`.condition()` (`expressionFits`). An unversioned delete is never refused for
+width: when the full guard does not fit, `deleteGuard` falls back to the
+strongest guard that fits. That is `attribute_exists(pk)`, then `updatedAt`
+unchanged (with timestamps), then as many attributes as fit, unique-constraint
+fields first, then the model's fields, then the rest. With timestamps, every
+library write changes `updatedAt`, so any concurrent library update is detected
+except one in the same millisecond with an identical `updatedAt`. A writer
+outside the library that leaves `updatedAt` alone can change unguarded
+attributes undetected. Without timestamps only the guarded attributes are
+protected. An update too wide for one expression writes the whole item, under
+the version condition (versioned) or the same fallback guard (unversioned). A
+concurrent write from outside the library to an attribute the guard does not
+cover is lost, as 1.22.0 lost it for every such update. A caller's
+`.condition()` too large to fit beside the guard fails before writing
+(`oversizedCondition`), with a `ValidationError` stating both sizes.
+
+**Pre-versioning items.** An item written before the entity was `versioned` has
+no version attribute. It reads as version 0 on every path, and
+`expectedVersion(0)` addresses it. The first versioned write conditions on
+`attribute_not_exists(version)` (plus the incarnation token, which it adds) and
+writes version 1; the retain snapshot is `v#0000000`. A race on that first
+write is an `OptimisticLockError`. Soft delete and restore handle it too.
+
+**Decoding defaults.** Read schemas keep `withDecodingDefault`, so a `put` that
+omits a defaulted field returns and reads back the default (it used to write the
+item and then fail with a `ValidationError`). A defaulted self date is stored as
+an ISO string. A defaulted key composite (primary, index or unique field) that a
+write omits is stored with its default, and keys are composed from it; other
+defaulted fields are not stored.
 
 **Error mapping.** Failed conditions ask DynamoDB for `ALL_OLD` and classify by
 the stored item. A newer stored version is `OptimisticLockError` with the real
@@ -1849,23 +1879,27 @@ wrote, which needs both images; with path operations on an unversioned entity
 that combination is refused.
 
 **Missing items and refusals.** `update()` of a missing item no longer leaves an
-undecodable partial row. A plain (unread) update creates the item only when its
-`.set()` supplies every required field and primary-key composite
-(`completeUpsertPayload`). Anything else fails with `ItemNotFound` and writes
-nothing. `.set()` of a changed primary-key composite is refused (it was silently
+undecodable partial row. A plain update always requires the item to exist. When
+it is missing and the update is a plain `.set()` of a complete item (every
+required field and primary-key composite, where a field with a decoding default
+is not required) with no other operation, `expectedVersion`, `.condition()`,
+cascade, `withVector` or old-image return mode, the library creates it through
+`create` with the same payload (`MissingForCreate` → `updateOrCreate`), so the
+item is exactly what `put` writes. If another writer creates it in between, the
+update re-runs once on that item. Anything else fails with `ItemNotFound` and
+writes nothing, as do retain entities and updates that read first. `.set()` of a changed primary-key composite is refused (it was silently
 ignored). An immutable field may be restated with its stored value (spread
 records), while a different value is refused.
 
-**Known limitations.**
+**Known limitations** (inherent):
 
-- On an unversioned entity, the item returned by a unique-field update may show
-  a stale value for an attribute it neither reads nor writes, if another writer
-  changed it in between.
-- An unversioned soft delete cannot detect a sparse map entry added concurrently
-  under a key it never saw.
+- On unversioned entities, nothing can prove an unguarded attribute unchanged.
+  So the item a unique-field update returns may show stale values for
+  attributes it neither reads nor writes, wide items use the fallback guard,
+  and the wide-update whole-item write can overwrite outside writers.
 - A plain `.expectedVersion(n)` cannot detect a delete-and-recreate that has
-  climbed back to version `n` (versions restart at 1, so this needs `n − 1`
-  updates after the recreate).
+  climbed back to version `n` (versions restart at 1, so it takes `n − 1`
+  updates).
 
 **Why hard-break over dual.** Carrying both the variadic overload and the fluent builder would double the surface area of `BoundEntity`, degrade hover tooltips, and force contributors to remember two shapes. The read side settled on builders for the same reasons. The change is batched into the next major alongside other breaking changes.
 
@@ -2850,7 +2884,7 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | Error | Cause |
 |-------|-------|
 | `DynamoError` | AWS SDK error wrapper |
-| `ItemNotFound` | No item: `get`, `update` of a missing item (unless a complete plain update), `restore` without a tombstone |
+| `ItemNotFound` | No item: `get`, `update` of a missing item (unless a plain `.set()` of a complete item, which is created), `restore` without a tombstone |
 | `ConditionalCheckFailed` | A user `.condition()` failed, or `patch()` of a missing item |
 | `ValidationError` | Schema decode/encode failure |
 | `TransactionCancelled` | Transaction failed with cancellation reasons |

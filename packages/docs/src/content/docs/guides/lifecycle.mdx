@@ -74,7 +74,9 @@ yield* Console.log("Soft-deleted alice")
 4. **Optional TTL is set** for automatic purge by DynamoDB
 5. **Item stays in the same partition** (same pk) — co-located with version history
 
-The soft delete, and a hard delete of an entity with unique constraints, are guarded against a concurrent update: if the item changed after it was read, the delete fails instead of removing the newer item. A versioned entity checks its version. An unversioned one checks every attribute it read, and if that condition would exceed DynamoDB's 4 KB expression limit (a very wide item), the delete is refused with a `ValidationError` asking you to make the entity `versioned`. An unversioned soft delete can't detect a sparse map entry added concurrently under a key it has never seen.
+The soft delete, and a hard delete of an entity with unique constraints, are guarded against a concurrent update: if the item changed after it was read, the delete fails instead of removing the newer item. A versioned entity checks its version. An unversioned one checks every attribute it read.
+
+**Wide items.** An unversioned delete is never refused for width. When the full guard can't fit DynamoDB's condition limits (4 KB and 300 operators, counted on the actual condition including your `.condition()`), it falls back to the strongest guard that fits: the item exists, `updatedAt` is unchanged (with timestamps), then as many attributes as fit, unique-constraint fields first. With timestamps, that detects any concurrent library update except one in the same millisecond with an identical `updatedAt`. A writer outside the library that leaves `updatedAt` alone can change unguarded attributes undetected. Without timestamps, only the guarded attributes are protected. A `.condition()` too large to fit beside the guard fails before writing with a `ValidationError` stating its size.
 
 ### Visibility After Deletion
 
@@ -255,6 +257,10 @@ versioned: { retain: true, ttl: Duration.days(90) }
 - Version numbers are integers, starting at 1
 - Updates use DynamoDB atomic counters (`SET version = version + 1`)
 - In sort keys, versions are zero-padded (`#v#0000001`) for correct lexicographic ordering
+
+### Enabling Versioning on an Existing Table
+
+Items written before the entity was `versioned` read as version 0 on every path, and `expectedVersion(0)` addresses them. Their first versioned write conditions on no version existing, adds the incarnation token and writes version 1. Their retain snapshot is `v#0000000`, and a race on that first write is an `OptimisticLockError`. Soft delete and restore work on them.
 
 ### Updates on Retained Entities
 
