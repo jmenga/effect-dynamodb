@@ -674,24 +674,6 @@ const unionCases: ReadonlyArray<UnionCase> = [
     ],
   },
   {
-    name: "Union([DateTimeUtc storedAs epochMs, Number])",
-    schema: Schema.Union([
-      Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
-      Schema.Number,
-    ]),
-    legacy: [
-      [{ N: "5" }, "5"],
-      [{ N: String(DOB_MS) }, String(DOB_MS)],
-      [rcMap(DOB_MS), `DT ${DOB}`],
-    ],
-    fresh: [
-      [5, { N: "5" }, "5"],
-      // An epoch number would be indistinguishable from the Number member, so
-      // the date is stored as its canonical ISO string instead.
-      [dt, S(DOB), `DT ${DOB}`],
-    ],
-  },
-  {
     name: "NullOr(DateTimeUtc)",
     schema: Schema.NullOr(Schema.DateTimeUtc),
     legacy: [
@@ -888,4 +870,238 @@ describe("#133 entity nested self dates — legacy raw values on transform field
       expect(got.plainBig).toBe(12345678901234567890n)
     }).pipe(Effect.provide(layer)),
   )
+})
+
+// ---------------------------------------------------------------------------
+// Batch 4 — nested unions, zoned offsets, class path values, EDD-9058
+// ---------------------------------------------------------------------------
+
+const describeZoned = (v: unknown): string =>
+  DateTime.isDateTime(v) && DateTime.isZoned(v)
+    ? `ZONED ${DateTime.formatIsoZoned(v)}`
+    : describeValue(v)
+
+const nestedUnionCases: ReadonlyArray<UnionCase> = [
+  {
+    name: "Union([NullOr(DateTimeUtc), String])",
+    schema: Schema.Union([Schema.NullOr(Schema.DateTimeUtc), Schema.String]),
+    legacy: [
+      [S("2020"), '"2020"'],
+      [S("5"), '"5"'],
+      [rcMap(DOB_MS), `DT ${DOB}`],
+      [{ NULL: true }, "null"],
+    ],
+    fresh: [
+      ["2020", S("2020"), '"2020"'],
+      [dt, S(DOB), `DT ${DOB}`],
+      [null, { NULL: true }, "null"],
+    ],
+  },
+  {
+    name: "Union([String, NullOr(DateTimeUtc)])",
+    schema: Schema.Union([Schema.String, Schema.NullOr(Schema.DateTimeUtc)]),
+    legacy: [
+      [S("2020"), '"2020"'],
+      [rcMap(DOB_MS), `DT ${DOB}`],
+    ],
+    fresh: [
+      ["5", S("5"), '"5"'],
+      [dt, S(DOB), `DT ${DOB}`],
+    ],
+  },
+  {
+    name: "Union([Union([DateTimeUtc, Literal(TBD)]), String])",
+    schema: Schema.Union([
+      Schema.Union([Schema.DateTimeUtc, Schema.Literal("TBD")]),
+      Schema.String,
+    ]),
+    legacy: [
+      [S("2020"), '"2020"'],
+      [S("TBD"), '"TBD"'],
+      [rcMap(DOB_MS), `DT ${DOB}`],
+    ],
+    fresh: [
+      ["2020", S("2020"), '"2020"'],
+      ["TBD", S("TBD"), '"TBD"'],
+      [dt, S(DOB), `DT ${DOB}`],
+    ],
+  },
+  {
+    name: "NullOr(Union([DateTimeUtc, String]))",
+    schema: Schema.NullOr(Schema.Union([Schema.DateTimeUtc, Schema.String])),
+    legacy: [
+      [S("2020"), '"2020"'],
+      [rcMap(DOB_MS), `DT ${DOB}`],
+      [{ NULL: true }, "null"],
+    ],
+    fresh: [
+      ["2020", S("2020"), '"2020"'],
+      [dt, S(DOB), `DT ${DOB}`],
+      [null, { NULL: true }, "null"],
+    ],
+  },
+]
+
+describe("#133 entity nested self dates — nested unions with a colliding member", () => {
+  for (const c of nestedUnionCases) {
+    it.effect(`${c.name}: legacy rows and fresh writes read back as their own member`, () => {
+      const { client, layer } = makeEntityHolder(c.name, c.schema)
+      return Effect.gen(function* () {
+        const db = yield* client
+        const reads: Array<string> = []
+        for (const [index, [stored]] of c.legacy.entries()) plant(`l${index}`, { f: stored })
+        for (const [index] of c.legacy.entries()) {
+          reads.push(
+            describeValue(((yield* db.entities.Holders.get({ id: `l${index}` })) as any).f),
+          )
+        }
+        expect(reads).toEqual(c.legacy.map(([, read]) => read))
+        const fresh: Array<string> = []
+        for (const [index, [value, stored]] of c.fresh.entries()) {
+          yield* db.entities.Holders.put({ id: `f${index}`, f: value } as any)
+          expect(holderRow(`f${index}`).f).toEqual(stored)
+          fresh.push(
+            describeValue(((yield* db.entities.Holders.get({ id: `f${index}` })) as any).f),
+          )
+        }
+        expect(fresh).toEqual(c.fresh.map(([, , read]) => read))
+      }).pipe(Effect.provide(layer))
+    })
+  }
+})
+
+describe("#133 entity nested self dates — zoned dates keep their zone", () => {
+  const named = DateTime.makeZonedUnsafe(DOB_MS, { timeZone: "Europe/London" })
+  const offset = DateTime.makeZonedUnsafe(DOB_MS, { timeZone: DateTime.zoneMakeOffset(5 * 3600e3) })
+  const negative = DateTime.makeZonedUnsafe(DOB_MS, {
+    timeZone: DateTime.zoneMakeOffset(-(3 * 3600e3 + 30 * 60e3)),
+  })
+  const utcZone = DateTime.makeZonedUnsafe(DOB_MS, { timeZone: "UTC" })
+
+  for (const [label, schema] of [
+    ["DateTimeZoned", Schema.DateTimeZoned],
+    ["Union([DateTimeZoned, String])", Schema.Union([Schema.DateTimeZoned, Schema.String])],
+  ] as const) {
+    it.effect(`${label}: named, offset and UTC zones round-trip exactly`, () => {
+      const { client, layer } = makeEntityHolder(`zoned-${label}`, schema)
+      return Effect.gen(function* () {
+        const db = yield* client
+        for (const [index, value] of [named, offset, negative, utcZone].entries()) {
+          yield* db.entities.Holders.put({ id: `z${index}`, f: value } as any)
+          expect(holderRow(`z${index}`).f).toEqual(S(DateTime.formatIsoZoned(value)))
+          const got = (yield* db.entities.Holders.get({ id: `z${index}` })) as any
+          expect(describeZoned(got.f)).toBe(`ZONED ${DateTime.formatIsoZoned(value)}`)
+        }
+        if (label !== "DateTimeZoned") {
+          yield* db.entities.Holders.put({ id: "s", f: "2020" } as any)
+          expect(((yield* db.entities.Holders.get({ id: "s" })) as any).f).toBe("2020")
+        }
+      }).pipe(Effect.provide(layer))
+    })
+  }
+})
+
+describe("#133 entity nested self dates — class values set by path are encoded", () => {
+  class Cred extends Schema.Class<Cred>("PathCred")({
+    user: Schema.String,
+    token: Schema.Redacted(Schema.String),
+    issued: Schema.Date,
+    at: Schema.DateTimeUtc,
+  }) {}
+  class Coded extends Schema.Class<Coded>("PathCoded")({
+    code: Schema.StringFromBase64,
+    at: Schema.DateTimeUtc,
+  }) {}
+  const { client, layer } = makeEntityHolder("cred", Cred, undefined, {
+    creds: Schema.Array(Cred),
+    plain: Schema.Struct({ at: Schema.DateTimeUtc, n: Schema.NumberFromString }),
+    coded: Coded,
+  })
+  const cred = new Cred({
+    user: "u",
+    token: Redacted.make("secret"),
+    issued: new Date(DOB_MS),
+    at: dt,
+  })
+  const storedCred = { M: { user: S("u"), token: S("secret"), issued: S(DOB), at: S(DOB) } }
+  const update = (f: (u: any) => any) =>
+    Effect.gen(function* () {
+      const db = yield* client
+      writes.length = 0
+      yield* f(db.entities.Holders.update({ id: "c" })) as Effect.Effect<unknown>
+      return lastUpdateValues()
+    })
+
+  it.effect("pathSet / pathAppend of class instances and plain structs store wire form", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Holders.put({
+        id: "c",
+        f: cred,
+        creds: [],
+        plain: { at: dt, n: 1 },
+        coded: new Coded({ code: "hi", at: dt }),
+      } as any)
+      expect(holderRow("c").f).toEqual(storedCred)
+      expect(
+        yield* update((u) => u.pathSet({ segments: ["f"], value: cred, isPath: false })),
+      ).toContainEqual(storedCred)
+      expect(
+        yield* update((u) => u.pathAppend({ segments: ["creds"], value: [cred] })),
+      ).toContainEqual({ L: [storedCred] })
+      expect(
+        yield* update((u) =>
+          u.pathSet({ segments: ["plain"], value: { at: dt, n: 2 }, isPath: false }),
+        ),
+      ).toContainEqual({ M: { at: S(DOB), n: S("2") } })
+      expect(
+        yield* update((u) =>
+          u.pathSet({
+            segments: ["coded"],
+            value: new Coded({ code: "hi", at: dt }),
+            isPath: false,
+          }),
+        ),
+      ).toContainEqual({ M: { code: S("aGk="), at: S(DOB) } })
+    }).pipe(Effect.provide(layer)),
+  )
+})
+
+describe("#133 entity nested self dates — epoch storage next to a number member", () => {
+  for (const [label, other] of [
+    ["Number", Schema.Number],
+    ["Literal(0)", Schema.Literal(0)],
+  ] as const) {
+    it(`rejects Union([epoch date, ${label}]) at make() with EDD-9058`, () => {
+      expect(() =>
+        makeEntityHolder(
+          `epoch-${label}`,
+          Schema.Union([
+            Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
+            other as Schema.Top,
+          ]),
+        ),
+      ).toThrow(/EDD-9058[\s\S]*"f"/)
+    })
+  }
+
+  it("rejects a configured epoch override on Union([date, Number]) with EDD-9058", () => {
+    expect(() =>
+      makeEntityHolder("epoch-configured", Schema.Union([Schema.DateTimeUtc, Schema.Number]), {
+        f: { storedAs: DynamoModel.DateEpochSeconds },
+      }),
+    ).toThrow(/EDD-9058/)
+  })
+
+  it("accepts epoch storage next to a member stored as a string", () => {
+    expect(() =>
+      makeEntityHolder(
+        "epoch-nfs",
+        Schema.Union([
+          Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
+          Schema.NumberFromString,
+        ]),
+      ),
+    ).not.toThrow()
+  })
 })

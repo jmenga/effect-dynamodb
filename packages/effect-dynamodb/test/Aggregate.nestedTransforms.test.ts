@@ -1523,21 +1523,6 @@ const aggUnionCases: ReadonlyArray<AggUnionCase> = [
     ],
   },
   {
-    name: "Union([DateTimeUtc storedAs epochMs, Number])",
-    schema: Schema.Union([
-      Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
-      Schema.Number,
-    ]),
-    stored: [
-      [{ N: "5" }, "5"],
-      [rcMap(DOB_MS), `DT ${DOB}`],
-    ],
-    fresh: [
-      [5, { N: "5" }, "5"],
-      [DateTime.makeUnsafe(DOB_MS), S(DOB), `DT ${DOB}`],
-    ],
-  },
-  {
     name: "NullOr(DateTimeUtc)",
     schema: Schema.NullOr(Schema.DateTimeUtc),
     stored: [[rcMap(DOB_MS), `DT ${DOB}`]],
@@ -1585,4 +1570,111 @@ describe("#133 nested transforms — root unions with a colliding member", () =>
       }).pipe(Effect.provide(TestLayer)),
     )
   }
+})
+
+// ---------------------------------------------------------------------------
+// Batch 4 — nested unions, zoned offsets, EDD-9058
+// ---------------------------------------------------------------------------
+
+describe("#133 nested transforms — nested unions with a colliding member", () => {
+  const cases: ReadonlyArray<AggUnionCase> = [
+    {
+      name: "Union([NullOr(DateTimeUtc), String])",
+      schema: Schema.Union([Schema.NullOr(Schema.DateTimeUtc), Schema.String]),
+      stored: [
+        [S("2020"), '"2020"'],
+        [S("5"), '"5"'],
+        [S(DOB), `DT ${DOB}`],
+        [rcMap(DOB_MS), `DT ${DOB}`],
+      ],
+      fresh: [
+        ["2020", S("2020"), '"2020"'],
+        ["5", S("5"), '"5"'],
+        [DateTime.makeUnsafe(DOB_MS), S(DOB), `DT ${DOB}`],
+        [null, { NULL: true }, "null"],
+      ],
+    },
+    {
+      name: "Union([Union([DateTimeUtc, Literal(TBD)]), String])",
+      schema: Schema.Union([
+        Schema.Union([Schema.DateTimeUtc, Schema.Literal("TBD")]),
+        Schema.String,
+      ]),
+      stored: [
+        [S("2020"), '"2020"'],
+        [S("TBD"), '"TBD"'],
+      ],
+      fresh: [
+        ["2020", S("2020"), '"2020"'],
+        [DateTime.makeUnsafe(DOB_MS), S(DOB), `DT ${DOB}`],
+      ],
+    },
+    {
+      name: "NullOr(Union([DateTimeUtc, String]))",
+      schema: Schema.NullOr(Schema.Union([Schema.DateTimeUtc, Schema.String])),
+      stored: [
+        [S("2020"), '"2020"'],
+        [rcMap(DOB_MS), `DT ${DOB}`],
+      ],
+      fresh: [
+        ["2020", S("2020"), '"2020"'],
+        [null, { NULL: true }, "null"],
+      ],
+    },
+    {
+      name: "Union([DateTimeZoned, String]) with an offset zone",
+      schema: Schema.Union([Schema.DateTimeZoned, Schema.String]),
+      stored: [[S("2020"), '"2020"']],
+      fresh: [
+        [
+          DateTime.makeZonedUnsafe(DOB_MS, { timeZone: DateTime.zoneMakeOffset(5 * 3600e3) }),
+          S("2000-01-01T05:00:00.000+05:00"),
+          "ZONED 2000-01-01T05:00:00.000+05:00",
+        ],
+        ["2020", S("2020"), '"2020"'],
+      ],
+    },
+  ]
+  const show = (v: unknown) =>
+    DateTime.isDateTime(v) && DateTime.isZoned(v)
+      ? `ZONED ${DateTime.formatIsoZoned(v)}`
+      : describeValue(v)
+  for (const c of cases) {
+    it.effect(`${c.name}: stored rows and fresh writes read back as their own member`, () =>
+      Effect.gen(function* () {
+        const Holder = makeHolder(`nested-${c.name}`, c.schema)
+        const reads: Array<string> = []
+        for (const [stored] of c.stored) {
+          store.clear()
+          yield* Holder.create({ id: "h1", f: c.fresh[0]![0] } as any)
+          holderItem().f = stored
+          reads.push(show(((yield* Holder.get({ id: "h1" } as any)) as any).f))
+        }
+        expect(reads).toEqual(c.stored.map(([, read]) => read))
+        const fresh: Array<string> = []
+        for (const [value, stored] of c.fresh) {
+          store.clear()
+          yield* Holder.create({ id: "h1", f: value } as any)
+          expect(holderItem().f).toEqual(stored)
+          fresh.push(show(((yield* Holder.get({ id: "h1" } as any)) as any).f))
+          transactCalls.length = 0
+          yield* Holder.update({ id: "h1" } as any, (ctx: any) => ctx.state)
+          expect(transactCalls).toHaveLength(0)
+        }
+        expect(fresh).toEqual(c.fresh.map(([, , read]) => read))
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  }
+
+  it("rejects an epoch-stored date next to a Number member at make() with EDD-9058", () => {
+    expect(() =>
+      makeHolder(
+        "epoch-number",
+        Schema.Union([
+          Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
+          Schema.Number,
+        ]),
+      ),
+    ).toThrow(/EDD-9058[\s\S]*"f"/)
+  })
 })
