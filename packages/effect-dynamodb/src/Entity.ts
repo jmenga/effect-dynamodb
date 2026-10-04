@@ -191,6 +191,7 @@ import {
   allKeyFieldNames,
   type DerivedSchemas,
   getSchemaFields,
+  makePathValueEncoder,
   primaryKeyComposites,
   type ResolvedSystemFields,
   resolveUniqueFields,
@@ -1690,6 +1691,13 @@ const makeImpl = <
     isSchemaClass,
     hasHiddenFields,
   } = data
+  // Encoders for path-addressed update values (`pathSet`, `pathAppend`, …) and
+  // record-based `append`, which bypass the update schema (#133).
+  const pathValues = makePathValueEncoder(
+    data.modelFields,
+    (schemas.recordSchema as unknown as { readonly fields: globalThis.Record<string, Schema.Top> })
+      .fields,
+  )
   // resolvedRefs carries the actual ref-target entity objects; at runtime they
   // are operational Entities (for runtime-authored refs) so write-time hydration
   // can call their CRUD ops. The pure bundle widens refEntity to EntityDefinition.
@@ -3422,7 +3430,10 @@ const makeImpl = <
             if (uState.append) {
               for (const [attr, val] of Object.entries(uState.append)) {
                 const existing = (newItem[attr] as Array<unknown>) ?? []
-                newItem[attr] = [...existing, ...val]
+                newItem[attr] = [
+                  ...existing,
+                  ...(pathValues.elements([attr], val) as ReadonlyArray<unknown>),
+                ]
               }
             }
             if (uState.deleteFromSet) {
@@ -3924,7 +3935,7 @@ const makeImpl = <
               const nameKey = `#u${counter}`
               const valKey = `:u${counter}`
               names[nameKey] = resolveDbName(attr)
-              values[valKey] = toAttributeValue(val)
+              values[valKey] = toAttributeValue(pathValues.elements([attr], val))
               setClauses.push(`${nameKey} = list_append(${nameKey}, ${valKey})`)
               counter++
             }
@@ -4058,7 +4069,7 @@ const makeImpl = <
                 setClauses.push(`${pathExpr} = ${srcExpr}`)
               } else {
                 const valKey = `:ps${pathCounter.value++}`
-                values[valKey] = toAttributeValue(op.value)
+                values[valKey] = toAttributeValue(pathValues.value(op.segments, op.value))
                 setClauses.push(`${pathExpr} = ${valKey}`)
               }
             }
@@ -4090,7 +4101,7 @@ const makeImpl = <
             for (const op of uState.pathAppends) {
               const pathExpr = compilePath(op.segments, names, "pa", pathCounter, resolveDbName)
               const valKey = `:pa${pathCounter.value++}`
-              values[valKey] = toAttributeValue(op.value)
+              values[valKey] = toAttributeValue(pathValues.elements(op.segments, op.value))
               setClauses.push(`${pathExpr} = list_append(${pathExpr}, ${valKey})`)
             }
           }
@@ -4100,7 +4111,7 @@ const makeImpl = <
             for (const op of uState.pathPrepends) {
               const pathExpr = compilePath(op.segments, names, "pp", pathCounter, resolveDbName)
               const valKey = `:pp${pathCounter.value++}`
-              values[valKey] = toAttributeValue(op.value)
+              values[valKey] = toAttributeValue(pathValues.elements(op.segments, op.value))
               setClauses.push(`${pathExpr} = list_append(${valKey}, ${pathExpr})`)
             }
           }
@@ -4110,7 +4121,7 @@ const makeImpl = <
             for (const op of uState.pathIfNotExists) {
               const pathExpr = compilePath(op.segments, names, "pi", pathCounter, resolveDbName)
               const valKey = `:pi${pathCounter.value++}`
-              values[valKey] = toAttributeValue(op.value)
+              values[valKey] = toAttributeValue(pathValues.value(op.segments, op.value))
               setClauses.push(`${pathExpr} = if_not_exists(${pathExpr}, ${valKey})`)
             }
           }

@@ -387,3 +387,206 @@ describe("#133 entity nested self dates — keys are unchanged", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 })
+
+// ---------------------------------------------------------------------------
+// Stored form, reads, legacy rows and update values
+// ---------------------------------------------------------------------------
+
+/** Whether an attribute value holds a marshalled DateTime map anywhere. */
+const holdsMarshalledDate = (value: unknown): boolean => {
+  if (value === null || typeof value !== "object") return false
+  const record = value as Record<string, unknown>
+  if ("epochMilliseconds" in record) return true
+  return Object.values(record).some(holdsMarshalledDate)
+}
+
+const lastUpdateValues = (): ReadonlyArray<AttributeValue> => {
+  const update = [...writes].reverse().find((w) => w.op === "Update")
+  return Object.values((update?.input.ExpressionAttributeValues ?? {}) as Record<string, any>)
+}
+
+class Span extends Schema.Class<Span>("Span")({
+  id: Schema.String,
+  twr: Schema.TupleWithRest(Schema.Tuple([Schema.String]), [Schema.DateTimeUtc]),
+}) {}
+const Spans = Entity.make({
+  model: Span,
+  entityType: "Span",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+})
+const SpanTable = Table.make({ schema: AppSchema, entities: { Spans } })
+const SpanLayer = Layer.merge(InMemoryClient, SpanTable.layer({ name: "edd133" }))
+
+describe("#133 entity nested self dates — stored form and reads", () => {
+  it.effect("put stores every nested self date in wire form", () =>
+    Effect.gen(function* () {
+      const client = yield* db
+      yield* client.entities.Fixtures.put(fixtureInput as any)
+      const item = mainItem()
+      expect({
+        when: item.when,
+        nullAt: item.nullAt,
+        nullMs: item.nullMs,
+        nullStamp: item.nullStamp,
+        arrNull: item.arrNull,
+        rec: item.rec,
+        tup: item.tup,
+        swr: item.swr,
+        xform: item.xform,
+        days: item.days,
+      }).toEqual({
+        when: S(DOB),
+        nullAt: S(DOB),
+        nullMs: { N: String(DOB_MS) },
+        nullStamp: { M: { at: S(DOB) } },
+        arrNull: { L: [S(DOB), { NULL: true }] },
+        rec: { M: { a: S(DOB) } },
+        tup: { L: [S("x"), S(DOB)] },
+        swr: { M: { at: S(DOB), note: S("n") } },
+        xform: S(DOB),
+        days: { L: [S(DOB)] },
+      })
+      // The version snapshot carries the same stored form.
+      const snapshot = [...store.values()].find((i) => i.sk?.S?.includes("#v#"))!
+      expect(holdsMarshalledDate(snapshot)).toBe(false)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("get reads real DateTime instances back", () =>
+    Effect.gen(function* () {
+      const client = yield* db
+      yield* client.entities.Fixtures.put(fixtureInput as any)
+      const got = (yield* client.entities.Fixtures.get({ id: "f1", when: dt } as any)) as any
+      expect({
+        when: isRealUtc(got.when, DOB_MS),
+        nullAt: isRealUtc(got.nullAt, DOB_MS),
+        nullMs: isRealUtc(got.nullMs, DOB_MS),
+        nullStamp: got.nullStamp instanceof Stamp && isRealUtc(got.nullStamp.at, DOB_MS),
+        arrNull: isRealUtc(got.arrNull[0], DOB_MS) && got.arrNull[1] === null,
+        rec: isRealUtc(got.rec.a, DOB_MS),
+        tup: isRealUtc(got.tup[1], DOB_MS),
+        swr: isRealUtc(got.swr.at, DOB_MS) && got.swr.note === "n",
+        xform: isRealUtc(got.xform, DOB_MS),
+      }).toEqual({
+        when: true,
+        nullAt: true,
+        nullMs: true,
+        nullStamp: true,
+        arrNull: true,
+        rec: true,
+        tup: true,
+        swr: true,
+        xform: true,
+      })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("legacy marshalled maps on those paths read back as real DateTimes", () =>
+    Effect.gen(function* () {
+      const client = yield* db
+      yield* client.entities.Fixtures.put(fixtureInput as any)
+      const item = mainItem()
+      item.nullAt = rcMap(DOB_MS)
+      item.nullStamp = { M: { at: rcMap(DOB_MS) } }
+      item.arrNull = { L: [rcMap(DOB_MS), { NULL: true }] }
+      item.rec = { M: { a: rcMap(DOB_MS) } }
+      item.tup = { L: [S("x"), rcMap(DOB_MS)] }
+      item.swr = { M: { at: rcMap(DOB_MS), note: S("n") } }
+      const got = (yield* client.entities.Fixtures.get({ id: "f1", when: dt } as any)) as any
+      expect(isRealUtc(got.nullAt, DOB_MS)).toBe(true)
+      expect(isRealUtc(got.nullStamp.at, DOB_MS)).toBe(true)
+      expect(isRealUtc(got.arrNull[0], DOB_MS)).toBe(true)
+      expect(isRealUtc(got.rec.a, DOB_MS)).toBe(true)
+      expect(isRealUtc(got.tup[1], DOB_MS)).toBe(true)
+      expect(isRealUtc(got.swr.at, DOB_MS)).toBe(true)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("a TupleWithRest keeps its head element and encodes its rest", () =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient.make({ entities: { Spans }, tables: { SpanTable } })
+      yield* client.entities.Spans.put({ id: "s1", twr: ["x", dt, later] } as any)
+      const item = [...store.values()].find((i) => i.__edd_e__?.S === "Span")!
+      expect(item.twr).toEqual({ L: [S("x"), S(DOB), S(LATER)] })
+      const got = (yield* client.entities.Spans.get({ id: "s1" })) as any
+      expect(got.twr[0]).toBe("x")
+      expect(isRealUtc(got.twr[2], LATER_MS)).toBe(true)
+    }).pipe(Effect.provide(SpanLayer)),
+  )
+})
+
+describe("#133 entity nested self dates — update values", () => {
+  it.effect(".set() encodes nested self dates", () =>
+    Effect.gen(function* () {
+      const client = yield* db
+      yield* client.entities.PlainFixtures.put({ ...fixtureInput, id: "p1" } as any)
+      yield* client.entities.PlainFixtures.update({ id: "p1", when: dt } as any).set({
+        nullAt: later,
+        rec: { b: later },
+        tup: ["y", later],
+        arrNull: [null, later],
+      } as any)
+      const values = lastUpdateValues()
+      expect(values.some(holdsMarshalledDate)).toBe(false)
+      expect(values).toContainEqual(S(LATER))
+      expect(values).toContainEqual({ M: { b: S(LATER) } })
+      expect(values).toContainEqual({ L: [S("y"), S(LATER)] })
+      expect(values).toContainEqual({ L: [{ NULL: true }, S(LATER)] })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("path operations encode their value through the schema at the path", () =>
+    Effect.gen(function* () {
+      const client = yield* db
+      yield* client.entities.PlainFixtures.put({ ...fixtureInput, id: "p1" } as any)
+      yield* client.entities.PlainFixtures.update({ id: "p1", when: dt } as any)
+        .pathSet({ segments: ["nullAt"], value: later, isPath: false })
+        .pathSet({ segments: ["rec", "b"], value: later, isPath: false })
+        .pathSet({ segments: ["nullStamp", "at"], value: later, isPath: false })
+        .pathSet({ segments: ["days", 0], value: later, isPath: false })
+        .pathAppend({ segments: ["arrNull"], value: [later, null] })
+        .pathPrepend({ segments: ["days"], value: [later] })
+        .pathIfNotExists({ segments: ["xform"], value: later })
+      const values = lastUpdateValues()
+      expect(values.some(holdsMarshalledDate)).toBe(false)
+      expect(values).toContainEqual(S(LATER))
+      expect(values).toContainEqual({ L: [S(LATER), { NULL: true }] })
+      expect(values).toContainEqual({ L: [S(LATER)] })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("record-based append encodes its elements", () =>
+    Effect.gen(function* () {
+      const client = yield* db
+      yield* client.entities.PlainFixtures.put({ ...fixtureInput, id: "p1" } as any)
+      yield* client.entities.PlainFixtures.update({ id: "p1", when: dt } as any).append({
+        days: [later],
+        arrNull: [null, later],
+      } as any)
+      const values = lastUpdateValues()
+      expect(values.some(holdsMarshalledDate)).toBe(false)
+      expect(values).toContainEqual({ L: [S(LATER)] })
+      expect(values).toContainEqual({ L: [{ NULL: true }, S(LATER)] })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("time-series append stores a nested self date in wire form", () =>
+    Effect.gen(function* () {
+      const client = yield* db
+      yield* Effect.exit(
+        Effect.gen(function* () {
+          yield* client.entities.Readings.append({
+            deviceId: "d1",
+            at: dt,
+            calibratedAt: dt,
+          } as any)
+        }),
+      )
+      const event = [...store.values()].find((i) => i.sk?.S?.includes("#e#"))!
+      expect(event.calibratedAt).toEqual(S(DOB))
+      const update = writes.find((w) => w.op === "Update")!
+      const values = Object.values(update.input.ExpressionAttributeValues as Record<string, any>)
+      expect(values.some(holdsMarshalledDate)).toBe(false)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
