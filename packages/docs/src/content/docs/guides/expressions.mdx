@@ -315,6 +315,16 @@ For nested attributes, array elements, and attribute-to-attribute operations, us
 | Delete from set | `Entity.deleteFromSet({ f: set })` | `Entity.pathDelete(...)` | `DELETE #f :v` |
 | Copy attribute | — | `Entity.pathSet({ isPath: true })` | `SET #a = #b` |
 
+#### Values are encoded through the schema at the path
+
+`pathSet`, `pathAppend`, `pathPrepend`, `pathIfNotExists` and the record-based `append` encode their value through the model schema at the path they address, the same way `set` does. A `DateTime` set at `["days", 0]` is stored as its ISO string (or as a number under `storedAs`), and a `Schema.NumberFromString` value is stored as a string. Appended and prepended lists are encoded element by element. A value that is already in its wire form is stored as given.
+
+`ADD`, `DELETE` and `SUBTRACT` are unchanged. A path the model schema cannot follow, such as one into a `DynamoModel.ref` field, still writes the value as given.
+
+:::note[Upgrading from 1.22.0 or earlier]
+Earlier versions wrote path and `append` values unencoded: a `DateTime` became a marshalled map even on a plain date field, and a `NumberFromString` value was stored as a number. A map on a self date field (`Schema.DateTimeUtc`) reads back as a real `DateTime`. A value on a transform field (`Schema.NumberFromString`, `Schema.DateTimeUtcFromString`) never decoded and still fails with a `ValidationError`, so rewrite those attributes with `set`. Until old values are rewritten, a filter on the attribute can match old and new items differently, and DynamoDB Streams consumers see the type change.
+:::
+
 ---
 
 ## Key Condition Expressions

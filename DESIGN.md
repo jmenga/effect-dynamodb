@@ -1456,6 +1456,28 @@ const OrderEntity = Entity.make({
 | `DynamoModel.configure(model, attributes)` | Create a configured model with per-field storage overrides and field renaming (Pattern B) |
 | `DynamoModel.configure({ immutable: true })` | Mark field as read-only after creation |
 
+#### Self dates nested in containers (#133)
+
+Entity derivation substitutes every **self** date (`Schema.DateTimeUtc`,
+`Schema.Date`, `storedAs(...)`) with a transform to its wire primitive. Before
+#133 the walk entered Struct / Class / Array but stopped at `Union`, `Record`,
+`Tuple`, `TupleWithRest` and `StructWithRest`, so `NullOr(Schema.DateTimeUtc)`,
+`NullOr(ClassWithDate)`, `Array(NullOr(date))` and `Record(_, date)` stored the
+`DateTime` instance itself, a marshalled `{ epochMilliseconds, … }` map.
+`substituteSchemaDeep` now walks those containers in every mode
+(`walkedContainer`), rebuilding each container kind with the original node's
+annotations, checks and context (`withMetadataOf`). A container with its own
+encoding chain is left as declared. Without `tolerantTransforms` only self-date
+and `Redacted` leaves are substituted, so a transform (Pattern B) inside a
+container keeps owning its wire form. A `TupleWithRest` is now derived as a
+tuple; it was previously treated as an array.
+
+Date leaves inside a `Union` use the `strictWireKind` date transform (see §11
+Attribute Encoding), which also rebuilds legacy maps, so rows written before
+#133 read back as real `DateTime`s. Key composition is unchanged for every
+existing shape (primary, GSI, unique, version, soft-delete, time-series keys);
+`Entity.nestedSelfDates.test.ts` snapshots the key attributes written.
+
 ---
 
 ## 9. Collections
@@ -1629,6 +1651,18 @@ yield* db.entities.Products.update({ productId: "p-1" })
 | all builders | `.asEffect()` | — |
 
 **Implementation strategy.** The builders are thin wrappers. Internally each holds an `EntityOp` (or `EntityDelete`) from the unbound entity plus a pre-resolved `provide` for `DynamoClient + TableConfig`. Every chainable method forwards into the existing `Entity.set/remove/add/condition/…` combinators. On `yield*` (or `.asEffect()`) the builder calls `op._run("record")` (or `op.asEffect()` for deletes) and pipes through `provide` so the final `Effect` has `R = never`.
+
+**Path-addressed values are encoded (#133).** `pathSet`, `pathAppend`,
+`pathPrepend`, `pathIfNotExists` and record-based `append` (including the
+versioned-retain path) bypass the update schema, and used to marshal their
+value as given: a `DateTime` became a map even on a plain date field, and a
+`NumberFromString` value was stored as a number. `makePathValueEncoder` resolves
+the schema the path addresses (`childAtSegment` through struct fields, union
+members, array / tuple elements and record values; a top-level field uses the
+record schema's own, so `storedAs` applies) and encodes the value through it;
+list operations encode element by element. A value that does not encode, or a
+path the schema cannot follow (an opaque `DynamoModel.ref`), is passed through
+as before. `ADD`, `DELETE` and `SUBTRACT` are unchanged.
 
 **Why hard-break over dual.** Carrying both the variadic overload and the fluent builder would double the surface area of `BoundEntity`, degrade hover tooltips, and force contributors to remember two shapes. The read side settled on builders for the same reasons. The change is batched into the next major alongside other breaking changes.
 
@@ -1935,7 +1969,7 @@ becomes `{M:{}}`, and a `bigint` becomes `{N:"5"}`.
 | **One encoder per field** | A `storedAs` annotation or inferred date default wins, except for a union mixing a date with a non-date member (`Union([DateTimeUtcFromString, Number])`, `isMixedDateUnion`), whose non-date values a date encoder would throw on. Otherwise the field is encoded through the same substituted, tolerant schema the read path decodes it with (`substituteSchemaDeep` + the aggregate's ref resolver), falling back to the field's own `encode`, then `decode → encode`. |
 | **Which schema** | The schema the decomposed value actually has: the root model's fields for the root, a `one` edge's entity model (or the model field's own class when the edge has no entity), the array **element** for a `many` edge (`PlayerSheet`, not `Player`), a sub-aggregate's own schema for its root item. Encoders are keyed by the element's field names, so a custom `decompose` that **renames** fields escapes them: the renamed values are stored in domain form (a `DateTime` as a map). This is a known limitation; the read path still lifts those maps. |
 | **Per attribute, not per aggregate** | The aggregate is never encoded as a whole before decomposition: key composition needs Type-side values (`numericTypeWithStringEncoding`). |
-| **Union members** | Under `tolerantTransforms`, `substituteSchemaDeep` walks `Union`, `Record`, `Tuple`, `TupleWithRest` and `StructWithRest` (`tolerantContainer`), rebuilding each container kind around substituted children. Date leaves inside a union get a `strictWireKind` transform that accepts only its own wire kind, its own domain or a legacy map of it, so a date member cannot claim a value that belongs to a later member (a stored `5` stays a number). Entity derivation (no options) does not walk these containers. |
+| **Union members** | Under `tolerantTransforms`, `substituteSchemaDeep` walks `Union`, `Record`, `Tuple`, `TupleWithRest` and `StructWithRest` (`tolerantContainer`), rebuilding each container kind around substituted children. Date leaves inside a union get a `strictWireKind` transform that accepts only its own wire kind, its own domain or a legacy map of it, so a date member cannot claim a value that belongs to a later member (a stored `5` stays a number). The same walk runs for entity derivation (no options), where only self-date and `Redacted` leaves are substituted. Rebuilt containers keep the original node's annotations and `.check()` refinements (`withMetadataOf`). |
 | **Keys unchanged** | A `many` edge's `sk.composite` and the root's list-index composites are read from a second encoder set (`buildKeyAttrEncoders`) that keeps the pre-#133 top-level-only behaviour. Composed keys are therefore byte-identical to earlier versions; only stored attribute values gained the deeper encoding. |
 
 **Ref resolution.** `DynamoModel.ref` annotates with `Schema.annotate`, which
@@ -1970,15 +2004,46 @@ a `NumberFromString` inside a hydrated ref (`{N:"5"}` → `{S:"5"}`). Keys are
 unaffected (they use `buildKeyAttrEncoders`), and both forms decode, but a
 `list` `filter` / `filterBy` on such an attribute can match old and new rows
 differently, and Streams consumers see the type change. An `optional` /
-`NullOr` `BigIntFromString` stored as `{N}` by ≤1.22.0 was never readable
-(unmarshalling yields a `number`, which the bigint decode rejects) and still is
-not.
+`NullOr` `BigIntFromString` stored as `{N}` by ≤1.22.0 was never readable,
+because unmarshalling yields a `number`. The tolerant transform
+(`buildTolerantTransform`) now lifts a safe-integer `number` to `bigint` for a
+bigint domain, so those rows read. Domain objects with no enumerable state
+(`Schema.Date`, `URL`, `Duration`, `BigDecimal`) were stored as maps holding no
+value and cannot be recovered.
 
 **Create input cloning.** `replaceRefIds` deep-copies the create input with
-`cloneInput` rather than `structuredClone`, which reduced a `DateTime` to a bare
-`{ epochMilliseconds }` and emptied a `Redacted`. `DateTime` and `Redacted`
-values are kept by reference; other values are copied as `structuredClone`
-copied them.
+`cloneInput` rather than `structuredClone`, which reduced every Effect data type
+to a bare object (a `DateTime` to `{ epochMilliseconds }`, a `Redacted` to `{}`,
+an `Option` lost its variant). Values implementing `Equal` are immutable and are
+kept by reference; built-ins `structuredClone` knows still go through it; plain
+objects, arrays and other class instances are copied to plain objects; cycles
+are preserved.
+
+### Nested Sub-Aggregates (#133)
+
+A `BoundSubAggregate` inside another sub-aggregate inherits the parent's
+discriminator, as a `one` edge does: `resolveNode` merges
+`{ ...parentDiscriminator, ...bound.discriminator }`, so the inner rows carry
+both attributes and assembly, which matches on the merged set, can tell the
+parent's bindings apart. On the write side the inner sort keys are prefixed with
+the parent's `name#value` pairs, and each nested sub-aggregate is its own
+transaction group, named by its path (`club2.squad`):
+
+```
+SK = $app#v1#leagueclub#clubno#1                        → club1 root
+SK = $app#v1#leaguesquad#clubno#1#squadno#1             → club1.squad root
+SK = $app#v1#leaguesquadplayer#clubno#1#squadno#1#p-1   → club1.squad.players[*]
+```
+
+(numeric values zero-padded in real keys). A sub-aggregate bound on the root has
+no parent discriminator, so depth-1 keys are unchanged. Before #133 depth-2 rows
+were written without the parent's values and could not be assembled
+(`Missing key at ["club"]["squad"]`); they are not read under the new keys.
+
+**EDD-9056.** `validateNestedDiscriminators` runs at `make()` and rejects a
+nested binding that declares a discriminator attribute it already inherits: the
+inner value would overwrite the outer one on the inner rows, so both bindings of
+the parent would key and assemble the inner sub-aggregate identically.
 
 ### Aggregate System Timestamps
 
@@ -2725,7 +2790,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9054` | `Query.ts` | A client-side predicate (`.filterBy()`) and a projection (`.select()`) are both active — the predicate is an opaque closure, so its attribute reads cannot be borrowed into the `ProjectionExpression` the way key attributes are, and it would be handed items missing the fields it tests |
 | `EDD-9055` | `KeyComposer.ts` (via `DynamoClient.ts`, `Collection.ts`) | A collection's members compose its keys with different casings (index `casing` vs schema `casing`) — they share one physical index, so their keys would never meet |
 
-Next free code: **`EDD-9056`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+| `EDD-9056` | `Aggregate.ts` | A nested sub-aggregate binding declares a discriminator attribute it already inherits from an enclosing binding — the inner value would overwrite the outer one on the inner rows, so the parent's bindings could no longer be told apart. Use a distinct attribute name (e.g. `{ squadNo: 1 }` inside `{ clubNo: 1 }`) |
+
+Next free code: **`EDD-9057`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 

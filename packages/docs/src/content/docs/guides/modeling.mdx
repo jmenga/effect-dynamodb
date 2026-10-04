@@ -88,6 +88,22 @@ Available date schemas: `DynamoModel.DateString` (ISO), `DynamoModel.DateEpochMs
 
 Applying `storedAs(DynamoModel.DateEpochSeconds)` on top of `Schema.DateTimeUtcFromString` (which already encodes to a string) used to silently override the transform's wire format. After the codec direction fix in v1.4, this combination raises a clear error at `Entity.make()` time. Migrate to a self schema (`Schema.DateTimeUtc.pipe(DynamoModel.storedAs(...))`) or drop the override.
 
+#### Dates nested in containers
+
+A self date schema is stored in its wire form wherever it sits in the model: at the top level, in a `Schema.Struct` or `Schema.Class`, in an array, and also in a container such as these:
+
+- a `Schema.NullOr` or other union, such as `Schema.NullOr(Schema.DateTimeUtc)`
+- a nullable class, such as `Schema.NullOr(Stamp)`, where `Stamp` has a date field
+- an array of a union, such as `Schema.Array(Schema.NullOr(Schema.DateTimeUtc))`
+- a `Schema.Record` value, such as `Schema.Record(Schema.String, Schema.DateTimeUtc)`
+- a `Schema.Tuple`, `Schema.TupleWithRest` or `Schema.StructWithRest`
+
+A `storedAs` annotation applies there too, so `Schema.NullOr(Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)))` stores a number. Transform schemas such as `Schema.DateTimeUtcFromString` already owned their wire form in every container and are unchanged.
+
+:::note[Upgrading from 1.22.0 or earlier]
+Earlier versions stopped at unions, records and tuples, so a self date inside one was stored as a marshalled `DateTime` map (`{ epochMilliseconds, "~effect/DateTime", _tag: "Utc" }`). Those rows still read back, as real `DateTime` values, and are rewritten in wire form when the attribute is next written. Until then the attribute is a map (`M`) on old rows and a string or number on new ones, so a filter on it can match the two differently, and DynamoDB Streams consumers see the type change. Keys are not affected.
+:::
+
 ### Immutable Fields
 
 Mark fields as read-only after creation. Immutable fields are present in `Entity.Input` (you provide them on creation) and `Entity.Record` (you can read them), but excluded from `Entity.Update`:

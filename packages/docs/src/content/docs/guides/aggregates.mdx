@@ -410,6 +410,25 @@ team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
 
 Discriminator values are stored on each member item in DynamoDB and used during assembly to route items to the correct sub-aggregate instance.
 
+##### Nested sub-aggregates
+
+A sub-aggregate can itself bind another sub-aggregate, for example a `Club` sub-aggregate whose `squad` field is a bound `Squad` sub-aggregate, used twice on a `League` as `club1` and `club2`. `create`, `get`, `list`, `update` and `delete` all work at every depth.
+
+The nested level inherits its parent's discriminator. Its rows carry both attributes, and their sort keys are prefixed with the parent's discriminator values, so each binding of the parent keeps its own copy of the inner sub-aggregate:
+
+```text
+SK = $app#v1#leagueclub#clubno#1                         → LeagueClub (club1)
+SK = $app#v1#leaguesquad#clubno#1#squadno#1              → LeagueSquad (club1.squad)
+SK = $app#v1#leaguesquadplayer#clubno#1#squadno#1#p-1    → LeagueSquadPlayer (club1.squad.players)
+SK = $app#v1#leaguesquad#clubno#2#squadno#1              → LeagueSquad (club2.squad)
+```
+
+(Numeric discriminator values are zero-padded in real keys; they are shortened here.) Each nested sub-aggregate is its own transaction group, so `update` rewrites only the inner group that changed.
+
+Give a nested binding its own discriminator attribute. Reusing one it inherits (`{ clubNo: 9 }` inside a parent bound with `{ clubNo: 1 }`) would overwrite the parent's value on the inner rows, so `Aggregate.make` throws `EDD-9056`, naming the sub-aggregate's path.
+
+Sub-aggregates bound directly on the root keep exactly the keys they had before. Nested sub-aggregates did not work in 1.22.0 and earlier: they were written, but reading them failed (`Missing key at ["club"]["squad"]`). Rows those versions wrote below the first level used different keys and are not read, so recreate those aggregates.
+
 ### How Values Are Stored
 
 Aggregate items store their values in their schema's **wire form**, the same form `Entity.put` writes, however deeply they are nested. A `Schema.DateTimeUtcFromString` is an ISO string (`S`) in each of these places:
@@ -446,14 +465,14 @@ Existing rows need no migration step:
 
 - **Reads** rebuild a stored `DateTime` map into a real `DateTime`, whichever type-id key it carries. `Zoned` values keep their named or offset zone.
 - **Writes** rewrite a row in wire form the next time an `update` changes its group (the root item, or the sub-aggregate it belongs to). An update that changes nothing writes nothing, and there is no automatic backfill, so rows that are never updated keep the map form and keep reading correctly.
-- **Lost values.** A `Schema.Date` stored by those versions is an empty map with no instant in it. It cannot be recovered, and reading it fails with a `ValidationError`.
+- **Lost values.** Some domain objects have no enumerable state, so the map they were stored as holds no value: a `Schema.Date` was stored as an empty map, and a `URL`, `Duration` or `BigDecimal` lost its value the same way. These cannot be recovered, and reading them fails with a `ValidationError`.
 
 **Some attributes change stored type.** A few values that 1.22.0 stored in their domain form are now encoded, which changes their DynamoDB type. Keys are not affected. The affected attributes are:
 
 - a top-level field wrapped in `Schema.optional(...)` or `Schema.NullOr(...)` around a non-date transform such as `Schema.NumberFromString`, on the root item, an edge item or a `many` element's own fields
 - a `Schema.NumberFromString` nested inside a hydrated ref
 
-For example, an optional `NumberFromString` holding `5` was stored as `{ "N": "5" }` and is now `{ "S": "5" }`. Rows of both kinds read back correctly. However, a `list` filter on such an attribute can match old and new rows differently until the old rows are rewritten: a `filter` expression compares against one DynamoDB type, and a `filterBy` predicate receives the stored value, a number on old rows and a string on new ones. DynamoDB Streams consumers also see the attribute change type. A `Schema.optional(Schema.BigIntFromString)` field was also stored as a number by 1.22.0, but those rows could never be read back. They still cannot; only rows written from this version on round-trip.
+For example, an optional `NumberFromString` holding `5` was stored as `{ "N": "5" }` and is now `{ "S": "5" }`. Rows of both kinds read back correctly. However, a `list` filter on such an attribute can match old and new rows differently until the old rows are rewritten: a `filter` expression compares against one DynamoDB type, and a `filterBy` predicate receives the stored value, a number on old rows and a string on new ones. DynamoDB Streams consumers also see the attribute change type. The same applies to an optional `Schema.BigIntFromString`. Rows 1.22.0 stored as `{ "N": "5" }` could not be read back at all; they now read back as `5n`.
 
 ### Aggregate Operations
 
@@ -506,6 +525,8 @@ The create operation:
 3. Decomposes the domain object into individual DynamoDB items following the graph structure, with every value in its wire form (see [How Values Are Stored](#how-values-are-stored))
 4. Adds partition keys, sort keys, entity type discriminators, and context fields
 5. Writes items in sub-aggregate transaction groups (each sub-aggregate = one `transactWriteItems`)
+
+Fields other than refs can be given in their domain form as well as their wire form, so the input may carry a `DateTime`, an `Option` or a `Redacted`. These are kept intact while ref IDs are replaced with hydrated data.
 
 Returns `RefNotFound` if a ref ID doesn't resolve. Returns `AggregateTransactionOverflow` if a sub-aggregate group exceeds 100 items (DynamoDB transaction limit).
 
