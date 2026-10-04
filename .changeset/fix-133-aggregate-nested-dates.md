@@ -33,7 +33,8 @@ real `DateTime`s.
   list-index keys are composed byte-for-byte as before, with one exception:
   the version-snapshot and soft-delete keys of an entity whose primary sort
   key has composites (several items per partition) now carry the item's
-  identity, so each item has its own history. Entities without sort key
+  identity, so each item has its own history. History written by earlier
+  releases stays readable and restorable. Entities without sort key
   composites keep exactly the keys they had. Details under "History of items
   that share a partition".
 - **Some attributes change stored type** on their next write, listed under each
@@ -117,11 +118,13 @@ real `DateTime`s.
   count: two puts that swap unique values touch the same sentinels, and a
   retain put counts twice (its item and its snapshot).
 - **Primary-key queries and scans no longer return history rows.** Version
-  snapshots and soft-delete tombstones carry their entity's type, so a
-  primary-key query with no (or a partial) sort key condition, and a scan,
-  returned them as if they were items. They're now left out. A primary-key
-  `count()` of a retain or soft-delete entity reads the rows to count them
-  (the same read capacity as a server-side count).
+  snapshots, soft-delete tombstones and time-series event items carry their
+  entity's type, so a primary-key query with no (or a partial) sort key
+  condition, and a scan, returned them as if they were items (a time-series
+  partition query failed to decode its events). They're now left out;
+  `.history()` still reads events. A primary-key `count()` of a retain,
+  soft-delete or time-series entity reads the rows to count them (the same
+  read capacity as a server-side count).
 - **`Batch.write` sends puts of a `versioned` entity as transactions.** They go
   first, as create-only `TransactWriteItems` of up to 100 items (and under
   DynamoDB's 4 MB transaction payload), and each chunk costs twice the write
@@ -595,11 +598,15 @@ after the marker (`$app#v1#line#v#line_a#0000001`,
 tombstones, every item's. An entity without sort key composites writes and
 reads exactly the keys it did.
 
-History rows an earlier release wrote for such an entity keep their old keys.
-`purge` removes them with their item (it reads the composites they carry). The
-readers above don't list them, and an item created again continues past its
-own history only — which, for such an entity, earlier releases kept no
-reliable copy of anyway.
+History an earlier release wrote for such an entity keeps its old keys and
+stays readable. A row under the partition-wide keys belongs to the item whose
+key its stored composites compose, and every reader of one item's history
+reads those rows too: `versions` and `getVersion`, `deleted.get` and `restore`
+(which restores from such a tombstone and consumes it), `deleted.list`, the
+version an item created again continues from, and `purge`. A version held both
+ways is read from the item's own row; of two tombstones, the later one wins.
+`versions` reads the partition's history (and filters it) only while such rows
+exist for the item; otherwise it reads the item's own range.
 
 ### Nested sub-aggregates
 

@@ -238,9 +238,11 @@ PK: $app#v1#line#order_o1  SK: $app#v1#line#v#line_a#0000001       ← a, snapsh
 PK: $app#v1#line#order_o1  SK: $app#v1#line#v#line_b#0000001       ← b, snapshot v1
 ```
 
-Each item's versions start at 1, and `versions`, `getVersion`, `deleted.get`, `restore` and `purge` act on the item you name. `deleted.list` lists the partition's tombstones, every item's. An entity without sort key composites keeps the keys shown above. History an earlier release wrote for such an entity, without the item segment, is removed by `purge` with its item but isn't listed by `versions`.
+Each item's versions start at 1, and `versions`, `getVersion`, `deleted.get`, `restore` and `purge` act on the item you name. `deleted.list` lists the partition's tombstones, every item's. An entity without sort key composites keeps the keys shown above.
 
-Snapshots and tombstones keep their entity's type, but they aren't items: a primary-key query (with or without sort key composites) and a scan leave them out. A primary-key `count()` of a `retain` or soft-delete entity reads the rows to count them, at the same read capacity.
+History an earlier release wrote for such an entity, without the item segment, stays readable. A row there belongs to the item whose key its stored composites compose, and `versions`, `getVersion`, `deleted.get`, `restore` (which consumes such a tombstone), `deleted.list`, `purge` and the version a re-created item continues from all read it. A version held both ways is read from the item's own row, and of two tombstones the later one is found.
+
+Snapshots and tombstones keep their entity's type, but they aren't items: a primary-key query (with or without sort key composites) and a scan leave them out, as they leave out time-series event items. A primary-key `count()` of a `retain` or soft-delete entity reads the rows to count them, at the same read capacity.
 
 ### Querying Version History
 

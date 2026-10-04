@@ -787,12 +787,33 @@ earlier release wrote without a segment whose stored composites compose its
 live key; siblings are untouched. An entity without sort key composites purges
 the whole partition, as before.
 
-**History rows are not items.** Snapshots and tombstones keep their entity's
-`__edd_e__` (the history readers filter on it), so the ownership filter alone
-admits them to a primary-key query or a scan. `Entity._historySkPrefixes` (the
-type-wide `#v#` / `#deleted#` prefixes, for `retain` / `softDelete`) drives
-`Query`'s `excludeSkPrefixes`: a scan adds `NOT begins_with(sk, …)` to its
-`FilterExpression`; a query can't (DynamoDB refuses a key attribute in a query's
+**History written before the segment stays readable.** Rows an earlier release
+wrote for such an entity sit under the partition-wide keys (`#v#0000003`,
+`#deleted#<ts>`), all items' in one sequence. A row there belongs to the item
+whose live key its stored composites compose (`isItemsRow`), and every reader
+of one item's history reads them too (`legacyHistory`: a `BETWEEN` on
+`<prefix>0`…`<prefix>:` — a version or timestamp starts with a digit, a
+segment with a composite name, so the range holds only unsegmented rows):
+`getVersion` falls back to the unsegmented key when the item's own is missing;
+`deleted.get` / `restore` take the later of the item's own latest tombstone and
+its latest unsegmented one (`latestTombstone`); `highestRetainedVersion` takes
+the higher of both; `deleted.list` is partition-wide and lists them anyway.
+`versions` stays a lazy `Query`: its `prepare` hook (run once per terminal)
+looks for the item's unsegmented snapshots and, if there are any, widens the
+`begins_with` to the partition's history and keeps the item's own rows plus
+those not already held under its own key. **Precedence:** a version held both
+ways is read from the segmented row; of two tombstones, the later wins (the
+segmented one on a tie).
+
+**History rows are not items.** Snapshots, tombstones and time-series event
+items keep their entity's `__edd_e__` (the history readers filter on it), so the
+ownership filter alone admits them to a primary-key query or a scan.
+`Entity._historyRows` (the type-wide `#v#` / `#deleted#` prefixes, for `retain` /
+`softDelete`; for `timeSeries`, rows nested under a live item: beginning with the
+live key less its composites, with `#e#` after it) drives `Query`'s
+`excludeSkPrefixes`: a scan adds `NOT begins_with(sk, …)` and
+`NOT contains(sk, "#e#")` to its `FilterExpression` (judging client-side instead
+if the marker could occur in a live key — an entity or collection named `e`); a query can't (DynamoDB refuses a key attribute in a query's
 filter), so it drops those rows as they arrive, before decoding or counting —
 like a client-side predicate, which also means `limit` isn't sent as `Limit` and
 `count()` reads the rows (projecting the sort key if a `select` omits it). GSI
