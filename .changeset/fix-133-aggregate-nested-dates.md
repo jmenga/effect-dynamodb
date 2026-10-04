@@ -57,10 +57,16 @@ real `DateTime`s.
   Don't retry the second one, because the write was applied. Review your
   `catchTag` handlers; the cases that changed are listed under "Updates and
   deletes".
-- **`update()` of a missing item fails instead of writing a partial row.** It
-  now fails with `ItemNotFound` and writes nothing, unless it is a plain update
-  whose `.set()` supplies every required field and key composite, which
-  creates a complete item. `patch()` is unchanged.
+- **`update()` of a missing item no longer writes a partial row.** It fails
+  with `ItemNotFound` and writes nothing, unless it is a plain `.set()` of a
+  complete item, which the library creates through `create`. `patch()` is
+  unchanged.
+- **Good news if you enabled `versioned` on an existing table.** Items written
+  before the entity was versioned read as version 0 on every path, and
+  `expectedVersion(0)` addresses them. Their first versioned write conditions
+  on no version existing, adds the incarnation token and writes version 1, and
+  their retain snapshot is `v#0000000`. A race on that first write is an
+  `OptimisticLockError`. Soft delete and restore work on them.
 - **More updates are refused with a `ValidationError`**: a `.set()` that changes
   a primary-key composite (silently ignored before), a `.set()` that changes an
   immutable field (restating its current value is fine), and the path
@@ -284,9 +290,23 @@ writing: with the new `ConcurrentModification` on an unversioned entity, and
 with `OptimisticLockError` on a versioned one. Soft delete and a hard delete
 with unique constraints are guarded the same way. `restore` fails with
 `ItemNotFound` if a concurrent restore won, and with `ItemNotDeleted` if a live
-item exists under the key. An unversioned soft delete of an item so wide that
-its guard would exceed DynamoDB's 4 KB expression limit is refused with a
-`ValidationError` asking you to make the entity `versioned`.
+item exists under the key.
+
+**Wide items.** An unversioned soft delete is never refused for width. When
+the full guard can't fit DynamoDB's condition limits (4 KB and 300 operators,
+counted on the actual condition including your `.condition()`), it falls back
+to the strongest guard that fits: the item exists, `updatedAt` is unchanged
+(with timestamps), then as many attributes as fit, unique-constraint fields
+first. With timestamps, that detects any concurrent library update except one
+in the same millisecond with an identical `updatedAt`. A writer outside the
+library that leaves `updatedAt` alone can change unguarded attributes
+undetected. Without timestamps, only the guarded attributes are protected. An
+update too wide for one expression writes the whole item, under the version
+condition (versioned) or the same fallback guard (unversioned). A concurrent
+write from outside the library to an attribute the guard doesn't cover is lost,
+which is also what 1.22.0 did for every such update. A `.condition()` too large
+to fit beside the guard fails before writing with a `ValidationError` stating
+its size.
 
 **Incarnation token.** Versioned entities carry a hidden `__edd_i__` attribute,
 set on create and backfilled on the next guarded write. It is never in decoded
@@ -308,24 +328,36 @@ or `updatedOld` cascades exactly what this update wrote; combined with path
 operations on an unversioned entity it is refused.
 
 **`update()` of a missing item** no longer leaves an undecodable partial row.
-Unless it is a plain update whose `.set()` supplies every required field and key
-composite, it fails with `ItemNotFound` and writes nothing. A complete payload
-creates a full item. An update that reads first (unique-field change, retain)
-always requires the item. `patch()` is unchanged.
+A plain update requires the item to exist. If it's missing and the update is a
+plain `.set()` of a complete item (every required field and primary-key
+composite; a field with a decoding default doesn't count as required) with no
+other operations, `expectedVersion`, `.condition()`, cascade, `withVector` or
+old-image `returnValues`, the library creates it through `create` with the same
+payload, so the item is exactly what `put` writes. If another writer creates it
+in between, the update re-runs once on that item. Anything else fails with
+`ItemNotFound` and writes nothing, as do retain entities and updates that read
+first (a unique-field change and the like). `patch()` is unchanged.
+
+**Decoding defaults.** Fields with `Schema.withDecodingDefault` now survive on
+read: a `put` that omitted one used to write the item and then fail with a
+`ValidationError`. A defaulted `DateTimeUtc` is stored as an ISO string. A
+defaulted key composite (primary, index or unique field) that a write omits is
+stored with its default, and keys are composed from it. Other defaulted fields
+are still not stored, and the default is applied on read.
 
 **`.set()` refusals.** A `.set()` of a changed primary-key composite is refused;
 it was silently ignored before. An immutable field can be restated with its
 current value, so spread records work; a different value is refused.
 
-**Known limitations.**
+**Known limitations.** Both are inherent:
 
-- On an unversioned entity, the item returned by a unique-field update may show
-  a stale value for an attribute the update neither reads nor writes, if
-  another writer changed it in between. Use `versioned` for exact images.
-- An unversioned soft delete can't detect a sparse map entry added concurrently
-  under a key it has never seen.
+- On unversioned entities, nothing can prove an unguarded attribute unchanged.
+  So the item a unique-field update returns may show stale values for
+  attributes it neither reads nor writes, wide items use the fallback guard
+  above, and the whole-item write of a wide update can overwrite writers
+  outside the library. Use `versioned` where that matters.
 - A plain `.expectedVersion(n)` can't detect a delete-and-recreate that has
-  climbed back to version `n`: versions restart at 1, so this needs `n − 1`
+  climbed back to version `n`: versions restart at 1, so it takes `n − 1`
   updates after the recreate.
 
 ### Nested sub-aggregates
