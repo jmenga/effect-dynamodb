@@ -1355,6 +1355,58 @@ const childOptions = (
 }
 
 /** The options an optional wrapper hands its inner schema: it is transparent. */
+/**
+ * A field whose LAST encoding step makes the encoded key optional while the
+ * type side stays required — `Schema.withDecodingDefault(…)` /
+ * `withDecodingDefaultKey(…)`, or any `optional(…).pipe(decodeTo(…))`. Its
+ * inner schema (the field without that step) is what substitution works on;
+ * `rewrap` re-applies the same step on top of the substitute, so the default
+ * survives (#133). Without it a self-date / transform leaf was replaced
+ * wholesale and the read schema lost the default — a stored item without the
+ * key failed to decode.
+ */
+const decodingDefaultField = (
+  field: Schema.Top,
+): { readonly inner: Schema.Top; readonly rewrap: (s: Schema.Top) => Schema.Top } | undefined => {
+  const ast = field.ast
+  const encoding = ast.encoding
+  if (encoding === undefined || encoding.length === 0) return undefined
+  if ((ast.context as { readonly isOptional?: boolean } | undefined)?.isOptional === true) {
+    return undefined
+  }
+  const last = encoding[encoding.length - 1]!
+  const lastTo = last.to as SchemaAST.AST & {
+    readonly context?: { readonly isOptional?: boolean }
+  }
+  if (lastTo.context?.isOptional !== true) return undefined
+  const transformation = last.transformation as unknown as {
+    readonly _tag?: string
+    readonly decode: unknown
+    readonly encode: unknown
+  }
+  if (transformation._tag !== "Transformation") return undefined
+  // The same node without its last encoding step (what Effect's internal
+  // `replaceEncoding` does: a shallow copy carrying the shorter chain).
+  const innerAst = Object.assign(Object.create(Object.getPrototypeOf(ast)), ast, {
+    encoding: encoding.length === 1 ? undefined : encoding.slice(0, -1),
+  }) as SchemaAST.AST
+  const inner = Schema.make<Schema.Top>(innerAst)
+  const withUndefined =
+    SchemaAST.isUnion(lastTo) && lastTo.types.some((t) => SchemaAST.isUndefined(t))
+  return {
+    inner,
+    rewrap: (substitute) => {
+      const encodedSide = Schema.toEncoded(substitute as Schema.Codec<any>)
+      const optionalEncoded = withUndefined
+        ? Schema.optional(encodedSide)
+        : Schema.optionalKey(encodedSide)
+      return optionalEncoded.pipe(
+        Schema.decodeTo(substitute as Schema.Codec<any>, transformation as any),
+      ) as unknown as Schema.Top
+    },
+  }
+}
+
 const throughOptional = (
   opts: DeepSubstitutionOptions | undefined,
 ): DeepSubstitutionOptions | undefined => {
@@ -1487,6 +1539,8 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   // has the `Arrays` AST but no runtime `.value`.
   const opt = optionalField(schema)
   if (opt !== undefined) return needsDeepSubstitution(opt.inner, throughOptional(opts))
+  const defaulted = decodingDefaultField(schema)
+  if (defaulted !== undefined) return needsDeepSubstitution(defaulted.inner, opts)
   if (isSelfDateSchema(schema)) return true
   if (opts?.tolerantTransforms && isDateTransform(schema)) return true
   if (tryGetRedactedInner(schema) !== undefined) return true
@@ -1557,6 +1611,12 @@ export const substituteSchemaDeep = (
   const opt = optionalField(schema)
   if (opt !== undefined) {
     return opt.rewrap(substituteSchemaDeep(opt.inner, throughOptional(opts)))
+  }
+  // A decoding default (or any optional-encoded step) on top: substitute the
+  // field beneath it and keep the step, so a missing key still defaults (#133).
+  const defaulted = decodingDefaultField(schema)
+  if (defaulted !== undefined) {
+    return defaulted.rewrap(substituteSchemaDeep(defaulted.inner, opts))
   }
 
   // Leaf: self-date schema → tolerant bidirectional date transform.
@@ -1719,6 +1779,15 @@ export const substituteSchemas = (
       const enc = fieldEncodings[name]
       if (enc) {
         out[name] = buildDateTransform(enc)
+        continue
+      }
+    }
+    // …also beneath a decoding default, which is kept on top (#133).
+    const defaulted = decodingDefaultField(schema)
+    if (defaulted !== undefined && isSelfDateSchema(defaulted.inner)) {
+      const enc = fieldEncodings[name]
+      if (enc) {
+        out[name] = defaulted.rewrap(buildDateTransform(enc))
         continue
       }
     }

@@ -559,3 +559,44 @@ describe("substituteSchemaDeep — enforceChecks keeps rebuilt container checks 
     )
   }
 })
+
+// ---------------------------------------------------------------------------
+// Decoding defaults survive substitution (#133)
+// ---------------------------------------------------------------------------
+
+describe("substituteSchemaDeep — decoding defaults", () => {
+  const born = Schema.DateTimeUtcFromString.pipe(
+    Schema.withDecodingDefault(Effect.succeed("1800-01-01T00:00:00.000Z")),
+  )
+  const when = Schema.DateTimeUtc.pipe(
+    Schema.withDecodingDefaultKey(Effect.succeed(DateTime.makeUnsafe(86_400_000))),
+  )
+  const read = (schema: Schema.Top) =>
+    Schema.Struct({ f: substituteSchemaDeep(schema, { legacyReads: true }) as Schema.Codec<any> })
+
+  it.effect("a missing key still decodes to the default — transform and self date", () =>
+    Effect.gen(function* () {
+      const a = yield* Schema.decodeUnknownEffect(read(born))({})
+      expect(DateTime.formatIso((a as any).f)).toBe("1800-01-01T00:00:00.000Z")
+      const b = yield* Schema.decodeUnknownEffect(read(when))({})
+      expect(DateTime.formatIso((b as any).f)).toBe("1970-01-02T00:00:00.000Z")
+    }),
+  )
+
+  it.effect("a present value still decodes through the substitute", () =>
+    Effect.gen(function* () {
+      const a = yield* Schema.decodeUnknownEffect(read(born))({ f: "2000-01-01T00:00:00.000Z" })
+      expect(DateTime.formatIso((a as any).f)).toBe("2000-01-01T00:00:00.000Z")
+      const b = yield* Schema.decodeUnknownEffect(read(when))({ f: "2000-01-01T00:00:00.000Z" })
+      expect(DateTime.formatIso((b as any).f)).toBe("2000-01-01T00:00:00.000Z")
+    }),
+  )
+
+  it.effect("the self date beneath the default is stored in wire form", () =>
+    Effect.gen(function* () {
+      const write = Schema.Struct({ f: substituteSchemaDeep(when) as Schema.Codec<any> })
+      const encoded = yield* Schema.encodeUnknownEffect(write)({ f: DateTime.makeUnsafe(0) })
+      expect(encoded).toEqual({ f: "1970-01-01T00:00:00.000Z" })
+    }),
+  )
+})
