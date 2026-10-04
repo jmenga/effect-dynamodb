@@ -22,6 +22,7 @@ import {
   Equal,
   Layer,
   Option,
+  Redacted,
   Schema,
   SchemaGetter,
   Stream,
@@ -13236,10 +13237,9 @@ class X133Row extends Schema.Class<X133Row>("X133Row")({
   id: Schema.String,
   dateOrText: Schema.Union([Schema.DateTimeUtc, Schema.String]),
   textOrDate: Schema.Union([Schema.String, Schema.DateTimeUtc]),
-  epochOrNumber: Schema.Union([
+  epochOrNull: Schema.NullOr(
     Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
-    Schema.Number,
-  ]),
+  ),
   configured: Schema.NullOr(Schema.DateTimeUtc),
   b64: Schema.StringFromBase64,
   nfs: Schema.NumberFromString,
@@ -13312,7 +13312,7 @@ describeConnected("#133 — colliding unions, wire path values, legacy raw value
         id: "a",
         dateOrText: "2020",
         textOrDate: "5",
-        epochOrNumber: 5,
+        epochOrNull: null,
         configured: dt,
         ...base,
       } as any)
@@ -13320,7 +13320,7 @@ describeConnected("#133 — colliding unions, wire path values, legacy raw value
         id: "b",
         dateOrText: dt,
         textOrDate: dt,
-        epochOrNumber: dt,
+        epochOrNull: dt,
         configured: null,
         ...base,
       } as any)
@@ -13330,27 +13330,27 @@ describeConnected("#133 — colliding unions, wire path values, legacy raw value
           .pipe(Effect.map(({ Item }) => Item as Record<string, any>))
       const a = yield* raw("a")
       const b = yield* raw("b")
-      expect([a.dateOrText, a.textOrDate, a.epochOrNumber, a.configured]).toEqual([
+      expect([a.dateOrText, a.textOrDate, a.epochOrNull, a.configured]).toEqual([
         { S: "2020" },
         { S: "5" },
-        { N: "5" },
+        { NULL: true },
         { N: String(I133_DOB_MS) },
       ])
-      expect([b.dateOrText, b.textOrDate, b.epochOrNumber, b.big]).toEqual([
+      expect([b.dateOrText, b.textOrDate, b.epochOrNull, b.big]).toEqual([
         { S: I133_DOB },
         { S: I133_DOB },
-        { S: I133_DOB },
+        { N: String(I133_DOB_MS) },
         { N: "12345678901234567890" },
       ])
 
       const gotA = (yield* db.entities.X133Rows.get({ id: "a" })) as any
-      expect([gotA.dateOrText, gotA.textOrDate, gotA.epochOrNumber]).toEqual(["2020", "5", 5])
+      expect([gotA.dateOrText, gotA.textOrDate, gotA.epochOrNull]).toEqual(["2020", "5", null])
       expect(i133IsRealUtc(gotA.configured, I133_DOB_MS)).toBe(true)
       expect(gotA.big).toBe(12345678901234567890n)
       const gotB = (yield* db.entities.X133Rows.get({ id: "b" })) as any
       expect(i133IsRealUtc(gotB.dateOrText, I133_DOB_MS)).toBe(true)
       expect(i133IsRealUtc(gotB.textOrDate, I133_DOB_MS)).toBe(true)
-      expect(i133IsRealUtc(gotB.epochOrNumber, I133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(gotB.epochOrNull, I133_DOB_MS)).toBe(true)
 
       // Path values: ambiguous wire values pass through, domain values encode.
       yield* db.entities.X133Rows.update({ id: "a" })
@@ -13378,7 +13378,7 @@ describeConnected("#133 — colliding unions, wire path values, legacy raw value
           id: { S: "legacy" },
           dateOrText: { S: "2020" },
           textOrDate: i133LegacyMap("~effect/time/DateTime")(I133_DOB_MS) as any,
-          epochOrNumber: { N: "5" },
+          epochOrNull: { N: String(I133_DOB_MS) },
           configured: i133LegacyMap("~effect/DateTime")(I133_DOB_MS) as any,
           b64: { S: "aGk=" },
           nfs: { N: "3" },
@@ -13388,7 +13388,7 @@ describeConnected("#133 — colliding unions, wire path values, legacy raw value
       const got = (yield* db.entities.X133Rows.get({ id: "legacy" })) as any
       expect(got.dateOrText).toBe("2020")
       expect(i133IsRealUtc(got.textOrDate, I133_DOB_MS)).toBe(true)
-      expect(got.epochOrNumber).toBe(5)
+      expect(i133IsRealUtc(got.epochOrNull, I133_DOB_MS)).toBe(true)
       expect(i133IsRealUtc(got.configured, I133_DOB_MS)).toBe(true)
       expect(got.nfs).toBe(3)
       expect(got.big).toBe(9n)
@@ -13413,5 +13413,115 @@ describeConnected("#133 — colliding unions, wire path values, legacy raw value
       expect(g2.big).toBe(12345678901234567890n)
       yield* aggs.update({ id: "g1" } as any, (c: any) => c.state)
     }).pipe(provideX133),
+  )
+})
+
+// ===========================================================================
+// #133 — nested unions, zoned offsets and class values set by path
+// ===========================================================================
+
+class Y133Cred extends Schema.Class<Y133Cred>("Y133Cred")({
+  user: Schema.String,
+  token: Schema.Redacted(Schema.String),
+  issued: Schema.Date,
+  at: Schema.DateTimeUtc,
+}) {}
+class Y133Row extends Schema.Class<Y133Row>("Y133Row")({
+  id: Schema.String,
+  nested: Schema.Union([Schema.NullOr(Schema.DateTimeUtc), Schema.String]),
+  zoned: Schema.DateTimeZoned,
+  zonedOrText: Schema.Union([Schema.DateTimeZoned, Schema.String]),
+  cred: Y133Cred,
+  creds: Schema.Array(Y133Cred),
+}) {}
+const Y133Schema = DynamoSchema.make({ name: "edd133y", version: 1 })
+const Y133Rows = Entity.make({
+  model: Y133Row,
+  entityType: "Y133Row",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+})
+const Y133Table = Table.make({ schema: Y133Schema, entities: { Y133Rows } })
+const y133TableName = `edd133y-${Date.now()}`
+const provideY133 = Effect.provide(
+  Layer.mergeAll(ClientLayer, Y133Table.layer({ name: y133TableName })),
+)
+const y133Client = DynamoClient.make({ entities: { Y133Rows }, tables: { Y133Table } })
+
+describeConnected("#133 — nested unions, zoned offsets, class path values", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* y133Client
+        yield* db.tables.Y133Table.create()
+      }).pipe(provideY133, Effect.scoped),
+    )
+  }, 30000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: y133TableName })
+      }).pipe(
+        provideY133,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 30000)
+
+  it.effect("stores and reads each member, zone and class value faithfully", () =>
+    Effect.gen(function* () {
+      const db = yield* y133Client
+      const client = yield* DynamoClient
+      const offset = DateTime.makeZonedUnsafe(I133_DOB_MS, {
+        timeZone: DateTime.zoneMakeOffset(5 * 3_600_000),
+      })
+      const named = DateTime.makeZonedUnsafe(I133_DOB_MS, { timeZone: "Europe/London" })
+      const cred = new Y133Cred({
+        user: "u",
+        token: Redacted.make("secret"),
+        issued: new Date(I133_DOB_MS),
+        at: DateTime.makeUnsafe(I133_DOB_MS),
+      })
+      const storedCred = {
+        M: {
+          user: { S: "u" },
+          token: { S: "secret" },
+          issued: { S: I133_DOB },
+          at: { S: I133_DOB },
+        },
+      }
+      yield* db.entities.Y133Rows.put({
+        id: "y",
+        nested: "2020",
+        zoned: offset,
+        zonedOrText: named,
+        cred,
+        creds: [],
+      } as any)
+      yield* db.entities.Y133Rows.update({ id: "y" })
+        .pathSet({ segments: ["cred"], value: cred, isPath: false })
+        .pathAppend({ segments: ["creds"], value: [cred] })
+      const { Item } = yield* client.getItem({
+        TableName: y133TableName,
+        Key: { pk: { S: "$edd133y#v1#y133row#id_y" }, sk: { S: "$edd133y#v1#y133row" } },
+        ConsistentRead: true,
+      })
+      const item = Item as Record<string, any>
+      expect([item.nested, item.zoned, item.zonedOrText, item.cred, item.creds]).toEqual([
+        { S: "2020" },
+        { S: "2000-01-01T05:00:00.000+05:00" },
+        { S: DateTime.formatIsoZoned(named) },
+        storedCred,
+        { L: [storedCred] },
+      ])
+      const got = (yield* db.entities.Y133Rows.get({ id: "y" })) as any
+      expect(got.nested).toBe("2020")
+      expect(DateTime.formatIsoZoned(got.zoned)).toBe("2000-01-01T05:00:00.000+05:00")
+      expect(DateTime.formatIsoZoned(got.zonedOrText)).toBe(DateTime.formatIsoZoned(named))
+      expect(Redacted.value(got.cred.token)).toBe("secret")
+      expect(got.creds[0].issued.getTime()).toBe(I133_DOB_MS)
+    }).pipe(provideY133),
   )
 })
