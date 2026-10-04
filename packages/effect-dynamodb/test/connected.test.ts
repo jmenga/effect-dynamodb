@@ -13046,3 +13046,183 @@ describeConnected("#133 — entity self dates nested in containers", () => {
     }).pipe(provideE133),
   )
 })
+
+// ===========================================================================
+// #133 — a sub-aggregate nested inside a sub-aggregate
+// ===========================================================================
+//
+// The nested sub-aggregate's rows were written with only their own
+// discriminator, so assembly (which matches on the parent's too) found none —
+// `Missing key at ["club"]["squad"]` — and two bindings of the parent keyed
+// their inner rows identically.
+
+class N133Player extends Schema.Class<N133Player>("N133Player")({ ...I133PersonFields }) {}
+class N133Coach extends Schema.Class<N133Coach>("N133Coach")({ ...I133PersonFields }) {}
+const N133Players = Entity.make({
+  model: DynamoModel.configure(N133Player, { id: { field: "playerId", identifier: true } }),
+  entityType: "Player",
+  primaryKey: i133PkSk,
+})
+const N133Coaches = Entity.make({
+  model: DynamoModel.configure(N133Coach, { id: { field: "coachId", identifier: true } }),
+  entityType: "Coach",
+  primaryKey: i133PkSk,
+})
+class N133SquadPlayer extends Schema.Class<N133SquadPlayer>("N133SquadPlayer")({
+  player: N133Player,
+  joined: Schema.DateTimeUtcFromString,
+}) {}
+class N133Squad extends Schema.Class<N133Squad>("N133Squad")({
+  name: Schema.String,
+  players: Schema.Array(N133SquadPlayer),
+}) {}
+class N133Club extends Schema.Class<N133Club>("N133Club")({
+  name: Schema.String,
+  coach: N133Coach.pipe(DynamoModel.ref),
+  squad: N133Squad,
+}) {}
+class N133League extends Schema.Class<N133League>("N133League")({
+  id: Schema.String,
+  season: Schema.String,
+  club1: N133Club,
+  club2: N133Club,
+}) {}
+
+const N133Schema = DynamoSchema.make({ name: "edd133n", version: 1 })
+const N133Table = Table.make({ schema: N133Schema, entities: { N133Players, N133Coaches } })
+const N133SquadAggregate = Aggregate.make(N133Squad, {
+  root: { entityType: "NSquad" },
+  edges: {
+    players: Aggregate.many("players", { entityType: "NSquadPlayer", entity: N133Players }),
+  },
+})
+const N133ClubAggregate = Aggregate.make(N133Club, {
+  root: { entityType: "NClub" },
+  edges: {
+    coach: Aggregate.one("coach", { entityType: "NCoach", entity: N133Coaches }),
+    squad: N133SquadAggregate.with({ discriminator: { squadNo: 1 } }),
+  },
+})
+const N133LeagueAggregate = Aggregate.make(N133League, {
+  table: N133Table,
+  schema: N133Schema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "league" },
+  list: {
+    index: "gsi1",
+    name: "leagues",
+    pk: { field: "gsi1pk", composite: ["season"] },
+    sk: { field: "gsi1sk", composite: ["id"] },
+  },
+  root: { entityType: "NLeague" },
+  edges: {
+    club1: N133ClubAggregate.with({ discriminator: { clubNo: 1 } }),
+    club2: N133ClubAggregate.with({ discriminator: { clubNo: 2 } }),
+  },
+})
+const n133TableName = `edd133n-${Date.now()}`
+const provideN133 = Effect.provide(
+  Layer.mergeAll(ClientLayer, N133Table.layer({ name: n133TableName })),
+)
+const n133Client = DynamoClient.make({
+  entities: { N133Players, N133Coaches },
+  aggregates: { N133LeagueAggregate },
+  tables: { N133Table },
+})
+const n133League = (id: string) => ({
+  id,
+  season: "2026",
+  club1: {
+    name: "One",
+    coachId: "c1",
+    squad: { name: "A", players: [{ playerId: "p1", joined: I133_DOB }] },
+  },
+  club2: {
+    name: "Two",
+    coachId: "c2",
+    squad: { name: "B", players: [{ playerId: "p2", joined: I133_DAY2 }] },
+  },
+})
+
+describeConnected("#133 — nested sub-aggregates", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* n133Client
+        yield* db.tables.N133Table.create()
+        const dob = DateTime.makeUnsafe(I133_DOB)
+        yield* db.entities.N133Players.put({ id: "p1", name: "P1", dateOfBirth: dob })
+        yield* db.entities.N133Players.put({ id: "p2", name: "P2", dateOfBirth: dob })
+        yield* db.entities.N133Coaches.put({ id: "c1", name: "C1", dateOfBirth: dob })
+        yield* db.entities.N133Coaches.put({ id: "c2", name: "C2", dateOfBirth: dob })
+      }).pipe(provideN133, Effect.scoped),
+    )
+  }, 30000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: n133TableName })
+      }).pipe(
+        provideN133,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 30000)
+
+  it.effect("create, get, list, update and delete across both levels", () =>
+    Effect.gen(function* () {
+      const db = yield* n133Client
+      const leagues = db.aggregates.N133LeagueAggregate
+      yield* leagues.create(n133League("l1") as any)
+      yield* leagues.create(n133League("l2") as any)
+
+      const client = yield* DynamoClient
+      const raw = (id: string) =>
+        client
+          .query({
+            TableName: n133TableName,
+            KeyConditionExpression: "#pk = :pk",
+            ExpressionAttributeNames: { "#pk": "pk" },
+            ExpressionAttributeValues: { ":pk": { S: `$edd133n#v1#league#${id}` } },
+            ConsistentRead: true,
+          })
+          .pipe(Effect.map(({ Items = [] }) => Items as ReadonlyArray<Record<string, any>>))
+      const sks = (yield* raw("l1")).map((i) => i.sk.S as string).sort()
+      expect(sks).toEqual([
+        "$edd133n#v1#nclub#clubno#0000000000000001",
+        "$edd133n#v1#nclub#clubno#0000000000000002",
+        "$edd133n#v1#ncoach#clubno#0000000000000001",
+        "$edd133n#v1#ncoach#clubno#0000000000000002",
+        "$edd133n#v1#nleague",
+        "$edd133n#v1#nsquad#clubno#0000000000000001#squadno#0000000000000001",
+        "$edd133n#v1#nsquad#clubno#0000000000000002#squadno#0000000000000001",
+        "$edd133n#v1#nsquadplayer#clubno#0000000000000001#squadno#0000000000000001#p1",
+        "$edd133n#v1#nsquadplayer#clubno#0000000000000002#squadno#0000000000000001#p2",
+      ])
+
+      const got = (yield* leagues.get({ id: "l1" } as any)) as N133League
+      expect(got.club2.squad.name).toBe("B")
+      expect(i133IsRealUtc(got.club2.squad.players[0]!.joined, I133_DOB_MS + 86_400_000)).toBe(true)
+      expect(i133IsRealUtc(got.club1.coach.dateOfBirth, I133_DOB_MS)).toBe(true)
+
+      const listed = yield* leagues.list({ season: "2026" })
+      expect(listed.data.map((l: any) => l.id).sort()).toEqual(["l1", "l2"])
+      expect(listed.data.every((l: any) => l.club1.squad.name === "A")).toBe(true)
+
+      yield* leagues.update({ id: "l1" } as any, (c: any) => ({
+        ...c.state,
+        club2: { ...c.state.club2, squad: { ...c.state.club2.squad, name: "B2" } },
+      }))
+      const updated = (yield* leagues.get({ id: "l1" } as any)) as N133League
+      expect(updated.club2.squad.name).toBe("B2")
+      expect(updated.club1.squad.name).toBe("A")
+
+      yield* leagues.delete({ id: "l1" } as any)
+      expect(yield* raw("l1")).toEqual([])
+      expect((yield* raw("l2")).length).toBe(9)
+    }).pipe(provideN133),
+  )
+})
