@@ -32,11 +32,15 @@ export type SizeBound = "lower" | "upper"
 const significantDigits = (n: string): number => {
   const mantissa = n.split(/[eE]/)[0] ?? ""
   const digits = mantissa.replace(/[-+.]/g, "").replace(/^0+/, "").replace(/0+$/, "")
-  return Math.max(digits.length, 1)
+  return digits.length
 }
 
-const numberBytes = (n: string, bound: SizeBound): number =>
-  bound === "lower" ? Math.ceil(significantDigits(n) / 2) + 1 : n.length + 1
+const numberBytes = (n: string, bound: SizeBound): number => {
+  if (bound === "upper") return n.length + 1
+  // Zero has no significant digits, and is stored in one byte.
+  const digits = significantDigits(n)
+  return digits === 0 ? 1 : Math.ceil(digits / 2) + 1
+}
 
 /** An attribute value's size toward its item's, erring the way `bound` says. */
 export const attributeBytes = (value: AttributeValue, bound: SizeBound = "lower"): number => {
@@ -69,15 +73,12 @@ export const itemBytes = (
 
 /**
  * A lower bound on what one transact entry contributes to its transaction's
- * size, as far as the request shows it: a Put's whole item; a Delete's or
- * ConditionCheck's key; an Update's key and the values it writes (DynamoDB also
- * counts an updated item's stored attributes, which the request does not
- * carry).
+ * size, as far as the request shows it: a Put's whole item; a Delete's,
+ * ConditionCheck's or Update's key. (An Update's values aren't counted: some
+ * may be its condition's, and the item it writes is the stored one updated,
+ * which the request does not carry.)
  */
 export const transactItemBytes = (item: TransactWriteItem): number => {
   if (item.Put !== undefined) return itemBytes(item.Put.Item ?? {})
-  if (item.Update !== undefined) {
-    return itemBytes(item.Update.Key ?? {}) + itemBytes(item.Update.ExpressionAttributeValues ?? {})
-  }
-  return itemBytes(item.Delete?.Key ?? item.ConditionCheck?.Key ?? {})
+  return itemBytes(item.Delete?.Key ?? item.Update?.Key ?? item.ConditionCheck?.Key ?? {})
 }

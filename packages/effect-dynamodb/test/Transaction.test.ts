@@ -1224,8 +1224,26 @@ describe("Transaction", () => {
       expect(n("1000000")).toBe(2)
       expect(n("0.1234567890123")).toBe(8)
       expect(n("1e+21")).toBe(2)
+      // Zero has no significant digits: one byte.
+      expect(n("0")).toBe(1)
+      expect(n("-0.000")).toBe(1)
       // The batch budget keeps its higher count.
       expect(itemBytes({ a: { N: "0.1234567890123" } }, "upper")).toBeGreaterThan(9)
+    })
+
+    it("an Update counts only its key: its values may be the condition's", () => {
+      expect(
+        transactItemBytes({
+          Update: {
+            TableName: "t",
+            Key: { pk: { S: "abc" } },
+            UpdateExpression: "SET #a = :a",
+            ConditionExpression: "#b = :b",
+            ExpressionAttributeNames: { "#a": "a", "#b": "b" },
+            ExpressionAttributeValues: { ":a": { S: "x" }, ":b": { S: "y".repeat(1000) } },
+          },
+        }),
+      ).toBe(5)
     })
 
     it("item sizes count attribute names, UTF-8 strings and raw binary", () => {
