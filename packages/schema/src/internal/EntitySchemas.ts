@@ -412,7 +412,7 @@ export const isSelfDateSchema = (schema: Schema.Top): boolean => {
  * `Schema.optional` and `NullOr` — and `Suspend`); an `optionalKey` wrapper is
  * the inner AST with an optional context, so it needs no case of its own. The
  * tolerant `substituteSchemaDeep` walks the same containers (see
- * `tolerantContainer`), except `Suspend`: a recursive schema keeps its own
+ * `walkedContainer`), except `Suspend`: a recursive schema keeps its own
  * codec, so the aggregate encodes it through its own `encode`.
  *
  * `hasEncodingTransformation` asks the same question of the TOP-LEVEL node
@@ -959,7 +959,7 @@ export interface DeepSubstitutionOptions {
  * A container the substitution walks only under `tolerantTransforms` (#133):
  * its child schemas, and how to rebuild it around substituted children.
  */
-interface TolerantContainer {
+interface WalkedContainer {
   readonly children: ReadonlyArray<Schema.Top>
   readonly rebuild: (children: ReadonlyArray<Schema.Top>) => Schema.Top
   /** Children are alternatives (a `Union`), decoded member by member. */
@@ -973,10 +973,12 @@ interface TolerantContainer {
  * through its own runtime accessors so its kind, union options and checks are
  * kept. `containsWireTransform` walks the same shapes.
  *
- * Tolerant mode only: the entity derivation (no options) has never walked
- * these, and changing what an entity stores is out of this function's remit.
+ * Walked in every mode. Without `tolerantTransforms` (entity derivation) the
+ * walk substitutes only self-date and `Redacted` leaves, so an entity's
+ * `NullOr(Schema.DateTimeUtc)` stores its wire form instead of a marshalled
+ * `DateTime` (#133), while a Pattern B transform inside keeps owning its wire.
  */
-const tolerantContainer = (schema: Schema.Top): TolerantContainer | undefined => {
+const walkedContainer = (schema: Schema.Top): WalkedContainer | undefined => {
   const shape = containerShape(schema)
   if (shape === undefined) return undefined
   return { ...shape, rebuild: (children) => withMetadataOf(schema, shape.rebuild(children)) }
@@ -1011,7 +1013,7 @@ const withMetadataOf = (original: Schema.Top, rebuilt: Schema.Top): Schema.Top =
   return Schema.make<Schema.Top>(ast)
 }
 
-const containerShape = (schema: Schema.Top): TolerantContainer | undefined => {
+const containerShape = (schema: Schema.Top): WalkedContainer | undefined => {
   const s = schema as unknown as globalThis.Record<string, unknown>
   const ast = schema.ast
   // A container piped through its own transformation (`Record(…).pipe(decodeTo(…))`)
@@ -1084,7 +1086,7 @@ const containerShape = (schema: Schema.Top): TolerantContainer | undefined => {
 
 /** Options for a tolerant container's children: a Union's members decode strictly by kind. */
 const childOptions = (
-  container: TolerantContainer,
+  container: WalkedContainer,
   deeper: DeepSubstitutionOptions | undefined,
 ): DeepSubstitutionOptions | undefined =>
   container.isUnion ? { ...deeper, strictWireKind: true } : deeper
@@ -1096,10 +1098,9 @@ const childOptions = (
  * `RedactedFromValue`). Returns false for schemas that don't, so
  * {@link substituteSchemaDeep} can return them unchanged (zero structural churn).
  *
- * Optional wrappers are unwrapped to their real inner schema. Under
- * `tolerantTransforms` the walk also enters `Union` members, `Record` values and
- * `Tuple` elements (see `tolerantContainer`); without it those are left exactly
- * as declared, as they always have been for entity schemas.
+ * Optional wrappers are unwrapped to their real inner schema, and the walk
+ * enters `Union` members, `Record` values and `Tuple` elements too (see
+ * `walkedContainer`).
  */
 const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOptions): boolean => {
   if (schema == null || (schema as { readonly ast?: unknown }).ast == null) return false
@@ -1112,7 +1113,7 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   // keep their strict schemas. Only callers that pass `resolveRef` are affected
   // — the entity derivation passes no options at all (#116).
   const deeper: DeepSubstitutionOptions | undefined =
-    opts?.tolerantTransforms || opts?.resolveRef
+    opts?.tolerantTransforms || opts?.resolveRef || opts?.strictWireKind
       ? {
           ...(opts?.tolerantTransforms ? { tolerantTransforms: true } : {}),
           ...(opts?.resolveRef ? { resolveRef: opts.resolveRef } : {}),
@@ -1133,12 +1134,10 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   // Any other leaf transform, tolerant mode only — same reason as the date
   // case: after a mutation the field may hold either form (#116).
   if (opts?.tolerantTransforms && isLeafEncodingTransform(schema)) return true
-  if (opts?.tolerantTransforms) {
-    const container = tolerantContainer(schema)
-    if (container !== undefined) {
-      const childOpts = childOptions(container, deeper)
-      return container.children.some((child) => needsDeepSubstitution(child, childOpts))
-    }
+  const container = walkedContainer(schema)
+  if (container !== undefined) {
+    const childOpts = childOptions(container, deeper)
+    return container.children.some((child) => needsDeepSubstitution(child, childOpts))
   }
   if (isArraySchema(schema)) {
     const element = arrayElementOf(schema)
@@ -1187,7 +1186,7 @@ export const substituteSchemaDeep = (
   // keep their strict schemas. Only callers that pass `resolveRef` are affected
   // — the entity derivation passes no options at all (#116).
   const deeper: DeepSubstitutionOptions | undefined =
-    opts?.tolerantTransforms || opts?.resolveRef
+    opts?.tolerantTransforms || opts?.resolveRef || opts?.strictWireKind
       ? {
           ...(opts?.tolerantTransforms ? { tolerantTransforms: true } : {}),
           ...(opts?.resolveRef ? { resolveRef: opts.resolveRef } : {}),
@@ -1230,16 +1229,16 @@ export const substituteSchemaDeep = (
     return buildTolerantTransform(schema)
   }
 
-  // Union / Record / Tuple / *WithRest (only under `tolerantTransforms`):
-  // substitute every child, rebuild the same container kind (#133).
-  if (opts?.tolerantTransforms) {
-    const container = tolerantContainer(schema)
-    if (container !== undefined) {
-      const childOpts = childOptions(container, deeper)
-      return container.rebuild(
-        container.children.map((child) => substituteSchemaDeep(child, childOpts)),
-      )
-    }
+  // Union / Record / Tuple / *WithRest: substitute every child and rebuild the
+  // same container kind, metadata included (#133). Without `tolerantTransforms`
+  // (entity derivation) only self-date / Redacted leaves inside are
+  // substituted, exactly as for a Struct or an Array.
+  const container = walkedContainer(schema)
+  if (container !== undefined) {
+    const childOpts = childOptions(container, deeper)
+    return container.rebuild(
+      container.children.map((child) => substituteSchemaDeep(child, childOpts)),
+    )
   }
 
   // Array: substitute the element schema.
@@ -1750,3 +1749,128 @@ export const buildDerivedSchemas = (
 
 export const resolveUniqueFields = (def: UniqueConstraintDef): ReadonlyArray<string> =>
   Array.isArray(def) ? def : (def as { readonly fields: UniqueFieldsDef }).fields
+
+// ---------------------------------------------------------------------------
+// Path-addressed values (#133)
+// ---------------------------------------------------------------------------
+
+/** The schema one path segment addresses inside `schema`, or `undefined`. */
+const childAtSegment = (schema: Schema.Top, segment: string | number): Schema.Top | undefined => {
+  const inner = optionalField(schema)?.inner ?? schema
+  const s = inner as unknown as globalThis.Record<string, unknown>
+  const fields = schemaFieldsOf(inner)
+  if (fields !== undefined) return typeof segment === "string" ? fields[segment] : undefined
+  if (SchemaAST.isUnion(inner.ast)) {
+    // `NullOr(Stamp)` and friends: the first member the segment resolves in.
+    const members = Array.isArray(s.members) ? (s.members as ReadonlyArray<Schema.Top>) : []
+    for (const member of members) {
+      const child = childAtSegment(member, segment)
+      if (child !== undefined) return child
+    }
+    return undefined
+  }
+  if (SchemaAST.isArrays(inner.ast)) {
+    if (typeof segment !== "number") return undefined
+    if (isSchemaLike(s.value)) return s.value
+    if (Array.isArray(s.elements)) return s.elements[segment] as Schema.Top | undefined
+    if (isSchemaLike(s.schema) && Array.isArray(s.rest)) {
+      const head = (s.schema as unknown as { readonly elements?: ReadonlyArray<Schema.Top> })
+        .elements
+      if (head !== undefined && segment < head.length) return head[segment]
+      return s.rest[0] as Schema.Top | undefined
+    }
+    return undefined
+  }
+  if (SchemaAST.isObjects(inner.ast) && typeof segment === "string") {
+    if (isSchemaLike(s.value) && isSchemaLike(s.key)) return s.value
+    if (isSchemaLike(s.schema) && Array.isArray(s.records)) {
+      const declared = schemaFieldsOf(s.schema)?.[segment]
+      if (declared !== undefined) return declared
+      const record = s.records[0] as unknown as { readonly value?: Schema.Top } | undefined
+      return record?.value
+    }
+  }
+  return undefined
+}
+
+/** The element schema of the list a path addresses (for append / prepend). */
+const listElementOf = (schema: Schema.Top): Schema.Top | undefined => {
+  const inner = optionalField(schema)?.inner ?? schema
+  if (!SchemaAST.isArrays(inner.ast)) return undefined
+  const value = (inner as unknown as { readonly value?: unknown }).value
+  return isSchemaLike(value) ? value : undefined
+}
+
+/**
+ * Encoders for the VALUES of path-based updates (`pathSet`, `pathAppend`,
+ * `pathPrepend`, `pathIfNotExists`) and record-based `append` (#133).
+ *
+ * Those values were marshalled as given, never encoded, so a `DateTime` set at
+ * `["days", 0]` — or appended to a list of dates — was stored as a marshalled
+ * `{ epochMilliseconds, … }` map, and a `NumberFromString` as a number. The
+ * schema the path addresses is resolved from the model and substituted exactly
+ * as the record schema substitutes it (a top-level field uses the record
+ * schema's own, so a configured `storedAs` applies), and the value is encoded
+ * through it.
+ *
+ * A value that does not encode — already wire-shaped, or a path the schema
+ * cannot follow (an opaque `DynamoModel.ref`, a dynamic key) — is passed
+ * through unchanged, as before.
+ *
+ * @internal
+ */
+export const makePathValueEncoder = (
+  modelFields: SchemaFields,
+  recordFields: SchemaFields,
+): {
+  readonly value: (segments: ReadonlyArray<string | number>, value: unknown) => unknown
+  readonly elements: (segments: ReadonlyArray<string | number>, value: unknown) => unknown
+} => {
+  const cache = new Map<string, ((value: unknown) => unknown) | null>()
+  const encoderFor = (
+    key: string,
+    resolve: () => Schema.Top | undefined,
+  ): ((value: unknown) => unknown) | null => {
+    const cached = cache.get(key)
+    if (cached !== undefined) return cached
+    const schema = resolve()
+    const fn =
+      schema === undefined
+        ? null
+        : (() => {
+            const encode = Schema.encodeUnknownOption(schema as Schema.Codec<any>)
+            return (value: unknown) => {
+              const encoded = encode(value)
+              return encoded._tag === "Some" ? encoded.value : value
+            }
+          })()
+    cache.set(key, fn)
+    return fn
+  }
+  const schemaAt = (segments: ReadonlyArray<string | number>): Schema.Top | undefined => {
+    const [head, ...rest] = segments
+    if (typeof head !== "string") return undefined
+    if (rest.length === 0) return recordFields[head]
+    let current: Schema.Top | undefined = modelFields[head]
+    for (const segment of rest) {
+      if (current === undefined) return undefined
+      current = childAtSegment(current, segment)
+    }
+    return current === undefined ? undefined : substituteSchemaDeep(current)
+  }
+  return {
+    value: (segments, value) => {
+      const fn = encoderFor(`v:${JSON.stringify(segments)}`, () => schemaAt(segments))
+      return fn === null ? value : fn(value)
+    },
+    elements: (segments, value) => {
+      if (!Array.isArray(value)) return value
+      const fn = encoderFor(`e:${JSON.stringify(segments)}`, () => {
+        const list = schemaAt(segments)
+        const element = list === undefined ? undefined : listElementOf(list)
+        return element === undefined ? undefined : substituteSchemaDeep(element)
+      })
+      return fn === null ? value : value.map((entry) => fn(entry))
+    },
+  }
+}

@@ -228,16 +228,36 @@ describe("substituteSchemaDeep — Union / Record / Tuple containers (#133)", ()
       return { fromWire, back }
     })
 
-  it("leaves these containers untouched without tolerantTransforms (entity derivation)", () => {
+  it("without tolerantTransforms (entity derivation), leaves Pattern B transforms alone", () => {
     for (const schema of [
-      Schema.NullOr(Schema.DateTimeUtc),
-      Schema.Record(Schema.String, Schema.DateTimeUtc),
-      Schema.Tuple([Schema.String, Schema.DateTimeUtc]),
-      Schema.Union([Coach, Schema.String]),
+      Schema.NullOr(Schema.DateTimeUtcFromString),
+      Schema.Record(Schema.String, Schema.BigIntFromString),
+      Schema.Tuple([Schema.String, Schema.DateTimeUtcFromString]),
+      Schema.Union([Schema.String, Schema.NumberFromString]),
     ]) {
       expect(substituteSchemaDeep(schema as Schema.Top)).toBe(schema)
     }
   })
+
+  it.effect("without tolerantTransforms, substitutes self dates inside those containers", () =>
+    Effect.gen(function* () {
+      const cases: ReadonlyArray<readonly [Schema.Top, unknown, unknown]> = [
+        [Schema.NullOr(Schema.DateTimeUtc), dt, ISO],
+        [Schema.Record(Schema.String, Schema.DateTimeUtc), { a: dt }, { a: ISO }],
+        [Schema.Tuple([Schema.String, Schema.DateTimeUtc]), ["x", dt], ["x", ISO]],
+        [
+          Schema.TupleWithRest(Schema.Tuple([Schema.String]), [Schema.DateTimeUtc]),
+          ["x", dt, dt],
+          ["x", ISO, ISO],
+        ],
+      ]
+      for (const [schema, domain, wire] of cases) {
+        const sub = substituteSchemaDeep(schema) as Schema.Codec<any>
+        expect(sub).not.toBe(schema)
+        expect(yield* Schema.encodeUnknownEffect(sub)(domain)).toEqual(wire)
+      }
+    }),
+  )
 
   it("returns a container with nothing to substitute unchanged", () => {
     const plain = Schema.NullOr(Schema.String)
