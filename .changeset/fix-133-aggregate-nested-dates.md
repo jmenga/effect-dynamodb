@@ -174,7 +174,13 @@ plain date field, and a `NumberFromString` value was stored as a number. Now:
   `ValidationError` instead of being stored. A key whose value is `undefined`
   is dropped before validation, as it is when stored. List `append` and
   `prepend` validate each element, but can't enforce list-level checks such as
-  `maxLength`, because DynamoDB builds the list server-side.
+  `maxLength`, because DynamoDB builds the list server-side. An append can
+  therefore take a list past such a check. For a list whose check is enforced
+  on read (any array holding no date or other substituted value), the item then
+  fails to decode on the update's returned item and on every later read. Guard
+  such lists with a condition on their size, e.g.
+  `.condition((t, { lt }) => lt(t.tags.size(), 2))`, or use `.set()` with the
+  full list. This is not new in this release.
 
 `ADD`, `DELETE` and `SUBTRACT` are unchanged.
 

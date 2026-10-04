@@ -334,6 +334,18 @@ Paths into and under a `DynamoModel.ref` field are encoded through the ref targe
 
 Path values are also validated the way `.set()` validates its payload. A value the schema rejects, such as a literal outside its set, a string under its `minLength`, or a container that breaks its `.check()`, fails with a `ValidationError` instead of being stored. A key whose value is `undefined` is dropped before validation, as it is when the item is stored. List `append` and `prepend` validate each element, but can't enforce list-level checks such as `maxLength`, because DynamoDB builds the list server-side.
 
+:::caution[Appends can break a list-level check]
+An append or prepend can take a list past a list-level check such as `maxLength`, and DynamoDB stores the result. For a list whose check is also enforced on read (any array that holds no date or other substituted value), the item then fails to decode with a `ValidationError`, both on the update's returned item and on every later read. Guard such a list with a condition on its size. For example, when appending one element to a list capped at 2:
+
+```typescript
+db.entities.Items.update({ id: "1" })
+  .pathAppend({ segments: ["tags"], value: ["new"] })
+  .condition((t, { lt }) => lt(t.tags.size(), 2))
+```
+
+The update then fails with `ConditionalCheckFailed` instead of writing. Alternatively, use `.set()` with the full list, which is validated before it is written. This is not new in this release.
+:::
+
 `ADD`, `DELETE` and `SUBTRACT` are unchanged.
 
 :::note[Upgrading from 1.22.0 or earlier]
