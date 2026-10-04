@@ -1115,3 +1115,132 @@ describe("#133 entity nested self dates — epoch storage next to a number membe
     ).not.toThrow()
   })
 })
+
+// ---------------------------------------------------------------------------
+// Batch 5 — DynamoModel.DateTimeZoned offsets, mixed path values, epoch next
+// to NumberFromString on an entity
+// ---------------------------------------------------------------------------
+
+describe("#133 entity nested self dates — DynamoModel.DateTimeZoned keeps offset zones", () => {
+  it.effect("named and offset zones round-trip exactly", () => {
+    const { client, layer } = makeEntityHolder("dm-zoned", DynamoModel.DateTimeZoned)
+    return Effect.gen(function* () {
+      const db = yield* client
+      for (const [index, zone] of [
+        "Europe/London",
+        DateTime.zoneMakeOffset(5 * 3600e3),
+        DateTime.zoneMakeOffset(-(3 * 3600e3 + 30 * 60e3)),
+      ].entries()) {
+        const value = DateTime.makeZonedUnsafe(DOB_MS, { timeZone: zone })
+        yield* db.entities.Holders.put({ id: `z${index}`, f: value } as any)
+        expect(holderRow(`z${index}`).f).toEqual(S(DateTime.formatIsoZoned(value)))
+        const got = (yield* db.entities.Holders.get({ id: `z${index}` })) as any
+        expect(DateTime.formatIsoZoned(got.f)).toBe(DateTime.formatIsoZoned(value))
+      }
+    }).pipe(Effect.provide(layer))
+  })
+})
+
+describe("#133 entity nested self dates — path values mixing wire and domain leaves", () => {
+  class Mixed extends Schema.Class<Mixed>("PathMixed")({
+    b64: Schema.StringFromBase64,
+    at: Schema.DateTimeUtc,
+    n: Schema.NumberFromString,
+    secret: Schema.Redacted(Schema.String),
+    issued: Schema.Date,
+  }) {}
+  const MixedStruct = Schema.Struct({
+    b64: Schema.StringFromBase64,
+    at: Schema.DateTimeUtc,
+    n: Schema.NumberFromString,
+    secret: Schema.Redacted(Schema.String),
+    issued: Schema.Date,
+  })
+  const { client, layer } = makeEntityHolder("mixed", MixedStruct, undefined, {
+    cls: Mixed,
+    list: Schema.Array(MixedStruct),
+    byKey: Schema.Record(Schema.String, MixedStruct),
+  })
+  // `n` is already wire ("5") while `at` / `secret` / `issued` are domain, and
+  // `b64` is a plain string — no whole-value encode or decode accepts this.
+  const mixed = {
+    b64: "hi",
+    at: dt,
+    n: "5",
+    secret: Redacted.make("pw"),
+    issued: new Date(DOB_MS),
+  }
+  const storedMixed = {
+    // `"hi"` is not valid base64, so it is a domain value and is encoded.
+    M: { b64: S("aGk="), at: S(DOB), n: S("5"), secret: S("pw"), issued: S(DOB) },
+  }
+  const update = (f: (u: any) => any) =>
+    Effect.gen(function* () {
+      const db = yield* client
+      writes.length = 0
+      yield* f(db.entities.Holders.update({ id: "m" })) as Effect.Effect<unknown>
+      return lastUpdateValues()
+    })
+
+  it.effect("each leaf is put into its stored form", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      const domain = { ...mixed, b64: "hi", n: 5 }
+      yield* db.entities.Holders.put({
+        id: "m",
+        f: domain,
+        cls: new Mixed(domain),
+        list: [],
+        byKey: {},
+      } as any)
+      for (const values of [
+        yield* update((u) => u.pathSet({ segments: ["f"], value: mixed, isPath: false })),
+        yield* update((u) => u.pathSet({ segments: ["cls"], value: mixed, isPath: false })),
+      ]) {
+        expect(values).toContainEqual(storedMixed)
+        expect(values.some(holdsMarshalledDate)).toBe(false)
+      }
+      expect(
+        yield* update((u) => u.pathAppend({ segments: ["list"], value: [mixed] })),
+      ).toContainEqual({ L: [storedMixed] })
+      expect(
+        yield* update((u) =>
+          u.pathSet({ segments: ["list"], value: [mixed, mixed], isPath: false }),
+        ),
+      ).toContainEqual({ L: [storedMixed, storedMixed] })
+      expect(
+        yield* update((u) =>
+          u.pathSet({ segments: ["byKey"], value: { k: mixed }, isPath: false }),
+        ),
+      ).toContainEqual({ M: { k: storedMixed } })
+      // A container that WOULD encode as a whole still leaves its ambiguous wire
+      // leaf alone: `"aGk="` (valid base64 and a valid string) is passed through,
+      // not base64-encoded again.
+      const wholeEncodable = { ...mixed, b64: "aGk=", n: 5 }
+      expect(
+        yield* update((u) => u.pathSet({ segments: ["f"], value: wholeEncodable, isPath: false })),
+      ).toContainEqual({ M: { ...storedMixed.M, b64: S("aGk=") } })
+    }).pipe(Effect.provide(layer)),
+  )
+})
+
+describe("#133 entity nested self dates — epoch date next to NumberFromString", () => {
+  it.effect("is accepted on an entity and keeps each member", () => {
+    const { client, layer } = makeEntityHolder(
+      "epoch-nfs-roundtrip",
+      Schema.Union([
+        Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds)),
+        Schema.NumberFromString,
+      ]),
+    )
+    return Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Holders.put({ id: "a", f: 5 } as any)
+      yield* db.entities.Holders.put({ id: "b", f: dt } as any)
+      expect(holderRow("a").f).toEqual(S("5"))
+      expect(holderRow("b").f).toEqual({ N: String(DOB_MS / 1000) })
+      expect(((yield* db.entities.Holders.get({ id: "a" })) as any).f).toBe(5)
+      expect(isRealUtc(((yield* db.entities.Holders.get({ id: "b" })) as any).f, DOB_MS)).toBe(true)
+    }).pipe(Effect.provide(layer))
+  })
+})

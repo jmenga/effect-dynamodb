@@ -1678,3 +1678,62 @@ describe("#133 nested transforms — nested unions with a colliding member", () 
     ).toThrow(/EDD-9058[\s\S]*"f"/)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Batch 5 — domain-side collisions, DynamoModel.DateTimeZoned offsets
+// ---------------------------------------------------------------------------
+
+describe("#133 nested transforms — domain-side collisions in aggregate unions", () => {
+  const epochSeconds = Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))
+
+  for (const [label, other] of [
+    ["NumberFromString", Schema.NumberFromString],
+    ["BigIntFromString", Schema.BigIntFromString],
+  ] as const) {
+    it(`rejects Union([epoch date, ${label}]) at make() with EDD-9058`, () => {
+      // `update` re-decodes the DOMAIN value (5), which an epoch date would claim.
+      expect(() =>
+        makeHolder(`domain-${label}`, Schema.Union([epochSeconds, other as Schema.Top])),
+      ).toThrow(/EDD-9058[\s\S]*"f"/)
+    })
+  }
+
+  for (const [label, schema, value, stored] of [
+    [
+      "ISO date + NumberFromString",
+      Schema.Union([Schema.DateTimeUtc, Schema.NumberFromString]),
+      "5",
+      S("5"),
+    ],
+    ["epoch date + Boolean", Schema.Union([epochSeconds, Schema.Boolean]), true, { BOOL: true }],
+  ] as const) {
+    it.effect(`accepts ${label}; an update keeps the member`, () =>
+      Effect.gen(function* () {
+        const Holder = makeHolder(`domain-ok-${label}`, schema)
+        yield* Holder.create({ id: "h1", f: value } as any)
+        expect(holderItem().f).toEqual(stored)
+        const before = ((yield* Holder.get({ id: "h1" } as any)) as any).f
+        yield* Holder.update({ id: "h1" } as any, (ctx: any) => ({ ...ctx.state, f: ctx.state.f }))
+        expect(holderItem().f).toEqual(stored)
+        expect(((yield* Holder.get({ id: "h1" } as any)) as any).f).toEqual(before)
+        expect(DateTime.isDateTime(before)).toBe(false)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  }
+})
+
+describe("#133 nested transforms — DynamoModel.DateTimeZoned keeps offset zones", () => {
+  it.effect("named and offset zones round-trip exactly", () =>
+    Effect.gen(function* () {
+      const Holder = makeHolder("dm-zoned", DynamoModel.DateTimeZoned)
+      for (const zone of ["Europe/London", DateTime.zoneMakeOffset(5 * 3600e3)]) {
+        store.clear()
+        const value = DateTime.makeZonedUnsafe(DOB_MS, { timeZone: zone })
+        yield* Holder.create({ id: "h1", f: value } as any)
+        expect(holderItem().f).toEqual(S(DateTime.formatIsoZoned(value)))
+        const got = ((yield* Holder.get({ id: "h1" } as any)) as any).f
+        expect(DateTime.formatIsoZoned(got)).toBe(DateTime.formatIsoZoned(value))
+      }
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
