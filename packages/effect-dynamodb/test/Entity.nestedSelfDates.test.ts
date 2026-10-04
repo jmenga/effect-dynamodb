@@ -1506,3 +1506,163 @@ describe("#133 entity nested self dates — path values are validated as stored"
     }).pipe(Effect.provide(layer))
   })
 })
+
+// ---------------------------------------------------------------------------
+// Batch 7 — opaque class fields stay readable; path ops on retain entities
+// ---------------------------------------------------------------------------
+
+describe("#133 entity nested self dates — opaque class fields keep their stored form", () => {
+  class Checked extends Schema.Class<Checked>("OpaqueChecked")({
+    at: Schema.DateTimeUtc,
+    n: Schema.Number,
+  }) {}
+  class Annotated extends Schema.Class<Annotated>("OpaqueAnnotated")({ at: Schema.DateTimeUtc }) {}
+  const { client, layer } = makeEntityHolder(
+    "opaque",
+    Checked.check(Schema.makeFilter((c: { readonly n: number }) => c.n >= 0 || "n >= 0")),
+    undefined,
+    { annotated: Annotated.annotate({ description: "annotated" }) },
+  )
+
+  it.effect("pathSet under, and of, an .annotate() / .check() class leaves the item readable", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Holders.put({
+        id: "o",
+        f: new Checked({ at: dt, n: 1 }),
+        annotated: new Annotated({ at: dt }),
+      } as any)
+      const before = holderRow("o")
+      for (const [segments, value] of [
+        [["f", "at"], later],
+        [["annotated", "at"], later],
+        [["f"], new Checked({ at: later, n: 2 })],
+        [["annotated"], new Annotated({ at: later })],
+      ] as const) {
+        writes.length = 0
+        yield* db.entities.Holders.update({ id: "o" }).pathSet({
+          segments,
+          value,
+          isPath: false,
+        })
+        // The value is stored in the same form `put` stores this field in, so
+        // the field keeps decoding through its (unsubstituted) schema.
+        const stored = lastUpdateValues()[0]
+        const field = before[segments[0] as string]!
+        const sameKind = segments.length === 1 ? Object.keys(field)[0] : "M"
+        expect(Object.keys(stored ?? {})[0]).toBe(sameKind)
+      }
+      // The row still reads.
+      yield* db.entities.Holders.get({ id: "o" })
+    }).pipe(Effect.provide(layer)),
+  )
+})
+
+describe("#133 entity nested self dates — path operations on a retain entity", () => {
+  class Doc extends Schema.Class<Doc>("RetainDoc")({
+    id: Schema.String,
+    n: Schema.Number,
+    tags: Schema.Array(Schema.String),
+    days: Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(3)),
+    labels: Schema.ReadonlySet(Schema.String),
+    nested: Schema.Struct({ at: Schema.DateTimeUtc, count: Schema.Number }),
+    opt: Schema.optionalKey(Schema.String),
+    gone: Schema.optionalKey(Schema.String),
+  }) {}
+  const Docs = Entity.make({
+    model: Doc,
+    entityType: "RetainDoc",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+    versioned: { retain: true },
+  })
+  const DocTable = Table.make({ schema: AppSchema, entities: { Docs } })
+  const docLayer = Layer.merge(InMemoryClient, DocTable.layer({ name: "edd133" }))
+  const docClient = DynamoClient.make({ entities: { Docs }, tables: { DocTable } })
+  const docRow = (sk = "$edd133#v1#retaindoc") =>
+    store.get(`$edd133#v1#retaindoc#id_d1|${sk}`) as Record<string, any>
+
+  it.effect("every path operation is applied, validated and snapshotted", () =>
+    Effect.gen(function* () {
+      const db = yield* docClient
+      yield* db.entities.Docs.put({
+        id: "d1",
+        n: 1,
+        tags: ["a", "b"],
+        days: [dt],
+        labels: new Set(["x", "y"]),
+        nested: { at: dt, count: 5 },
+        gone: "bye",
+      } as any)
+      yield* db.entities.Docs.update({ id: "d1" })
+        .pathSet({ segments: ["nested", "at"], value: later, isPath: false })
+        .pathSet({ segments: ["opt"], value: "set", isPath: false })
+        .pathAdd({ segments: ["n"], value: 2 })
+        .pathAdd({ segments: ["labels"], value: new Set(["z"]) })
+        .pathSubtract({ segments: ["nested", "count"], value: 1, isPath: false })
+        .pathAppend({ segments: ["days"], value: [later] })
+        .pathPrepend({ segments: ["tags"], value: ["first"] })
+        .pathIfNotExists({ segments: ["n"], value: 99 })
+        .pathDelete({ segments: ["labels"], value: new Set(["x"]) })
+        .pathRemove(["gone"])
+
+      const row = docRow()
+      expect({
+        n: row.n,
+        tags: row.tags,
+        days: row.days,
+        labels: row.labels,
+        nested: row.nested,
+        opt: row.opt,
+        gone: row.gone,
+        version: row.version,
+      }).toEqual({
+        n: { N: "3" },
+        tags: { L: [S("first"), S("a"), S("b")] },
+        days: { L: [S(DOB), S(LATER)] },
+        labels: { SS: ["y", "z"] },
+        nested: { M: { at: S(LATER), count: { N: "4" } } },
+        opt: S("set"),
+        gone: undefined,
+        version: { N: "2" },
+      })
+      // The snapshot is the item BEFORE the update.
+      const snapshot = docRow("$edd133#v1#retaindoc#v#0000001")
+      expect([snapshot.n, snapshot.nested, snapshot.gone]).toEqual([
+        { N: "1" },
+        { M: { at: S(DOB), count: { N: "5" } } },
+        S("bye"),
+      ])
+    }).pipe(Effect.provide(docLayer)),
+  )
+
+  it.effect("path values are validated and the optimistic lock still applies", () =>
+    Effect.gen(function* () {
+      const db = yield* docClient
+      yield* db.entities.Docs.put({
+        id: "d1",
+        n: 1,
+        tags: [],
+        days: [dt],
+        labels: new Set(["x"]),
+        nested: { at: dt, count: 0 },
+      } as any)
+      const docs = db.entities.Docs as any
+      const tooMany = yield* Effect.flip(
+        docs
+          .update({ id: "d1" })
+          .pathSet({ segments: ["days"], value: [dt, dt, dt, dt], isPath: false })
+          .asEffect() as Effect.Effect<unknown, { readonly _tag: string }>,
+      )
+      expect(tooMany._tag).toBe("ValidationError")
+      const stale = yield* Effect.flip(
+        docs
+          .update({ id: "d1" })
+          .expectedVersion(7)
+          .pathSet({ segments: ["n"], value: 2, isPath: false })
+          .asEffect() as Effect.Effect<unknown, { readonly _tag: string }>,
+      )
+      expect(stale._tag).toBe("OptimisticLockError")
+      expect(docRow().n).toEqual({ N: "1" })
+    }).pipe(Effect.provide(docLayer)),
+  )
+})
