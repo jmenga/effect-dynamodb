@@ -2658,6 +2658,35 @@ const makeImpl = <
     })
 
   /**
+   * Which predicate rejected a conditioned write (#133). The write asked for
+   * `ReturnValuesOnConditionCheckFailure: "ALL_OLD"`, so DynamoDB hands back
+   * the item as stored: a version other than the one the write was
+   * conditioned on (`casVersion`) is a lost version race; otherwise the user's
+   * `.condition()` rejected it. No item back means the item is gone — a
+   * version race when the write was version-conditioned.
+   */
+  const conditionRejection = (
+    key: globalThis.Record<string, unknown>,
+    stored: Readonly<globalThis.Record<string, unknown>> | undefined,
+    casVersion: number | undefined,
+    userCondition: boolean,
+  ): OptimisticLockError | ConditionalCheckFailed => {
+    const storedAttr =
+      stored !== undefined && systemFields.version ? stored[systemFields.version] : undefined
+    const storedVersion =
+      storedAttr !== undefined ? Number((storedAttr as { readonly N?: string }).N) : undefined
+    if ((casVersion !== undefined && storedVersion !== casVersion) || !userCondition) {
+      return new OptimisticLockError({
+        entityType,
+        key,
+        expectedVersion: casVersion ?? -1,
+        actualVersion: storedVersion ?? -1,
+      })
+    }
+    return new ConditionalCheckFailed({ entityType, key })
+  }
+
+  /**
    * Build a version snapshot item: same PK, version SK, stripped GSI keys,
    * keeps __edd_e__ for entity type filtering.
    *
@@ -3948,6 +3977,7 @@ const makeImpl = <
                 ConditionExpression?: string
                 ExpressionAttributeNames?: globalThis.Record<string, string>
                 ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
+                ReturnValuesOnConditionCheckFailure?: "ALL_OLD"
               }
             }
             type TransactDelete = {
@@ -3982,6 +4012,7 @@ const makeImpl = <
                 mainPut.ConditionExpression = retainCondParts.join(" AND ")
                 mainPut.ExpressionAttributeNames = retainNames
                 mainPut.ExpressionAttributeValues = retainValues
+                mainPut.ReturnValuesOnConditionCheckFailure = "ALL_OLD"
               }
               transactItems.push({ Put: mainPut })
             }
@@ -4062,17 +4093,17 @@ const makeImpl = <
                     // the user condition only when it is the sole predicate —
                     // otherwise an unversioned entity's `.condition()` rejection
                     // would surface as a nonsensical OptimisticLockError.
-                    const mainItemRejection = (): OptimisticLockError | ConditionalCheckFailed => {
-                      if (!systemFields.version && userCond) {
-                        return new ConditionalCheckFailed({ entityType, key: encodedKey })
-                      }
-                      return new OptimisticLockError({
-                        entityType,
-                        key: encodedKey,
-                        expectedVersion: currentVersion,
-                        actualVersion: -1,
-                      })
-                    }
+                    // The Put asked for ALL_OLD, so the stored item says which:
+                    // a version other than the one read is a lost race.
+                    const mainItemRejection = (
+                      stored: Readonly<globalThis.Record<string, unknown>> | undefined,
+                    ): OptimisticLockError | ConditionalCheckFailed =>
+                      conditionRejection(
+                        encodedKey as globalThis.Record<string, unknown>,
+                        stored,
+                        systemFields.version ? currentVersion : undefined,
+                        userCond !== undefined,
+                      )
                     if (isAwsTransactionCancelled(err.cause)) {
                       const reasons = err.cause.CancellationReasons
                       if (reasons) {
@@ -4092,12 +4123,12 @@ const makeImpl = <
                         }
                         // Index 0 is the main item — version conflict or user condition
                         if (reasons[0]?.Code === "ConditionalCheckFailed") {
-                          return mainItemRejection()
+                          return mainItemRejection(reasons[0].Item)
                         }
                       }
                     }
                     if (isAwsConditionalCheckFailed(err.cause)) {
-                      return mainItemRejection()
+                      return mainItemRejection(err.cause.Item)
                     }
                     return err as
                       | DynamoClientError
@@ -4668,36 +4699,37 @@ const makeImpl = <
                   UpdateExpression: updateExpression,
                   ExpressionAttributeNames: names,
                   ExpressionAttributeValues: Object.keys(values).length > 0 ? values : undefined,
-                  ...(guardParts.length > 0 && { ConditionExpression: guardParts.join(" AND ") }),
+                  ...(guardParts.length > 0 && {
+                    ConditionExpression: guardParts.join(" AND "),
+                    ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
+                  }),
                 },
               },
               { Put: { TableName: tableName, Item: toAttributeMap(snapshot.item) } },
             ]
             yield* checkTransactionLimit(entityType, "update", transactItems)
             yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
-              Effect.mapError((err) => {
-                const mainRejected =
-                  (isAwsTransactionCancelled(err.cause) &&
-                    err.cause.CancellationReasons?.[0]?.Code === "ConditionalCheckFailed") ||
-                  isAwsConditionalCheckFailed(err.cause)
-                if (!mainRejected) {
-                  return err as DynamoClientError | OptimisticLockError | ConditionalCheckFailed
-                }
-                // The update is guarded by the snapshot version AND any user
-                // condition; DynamoDB does not say which rejected it.
-                if (userCond && evExpected === undefined) {
-                  return new ConditionalCheckFailed({ entityType, key: encodedKey }) as
-                    | DynamoClientError
-                    | OptimisticLockError
-                    | ConditionalCheckFailed
-                }
-                return new OptimisticLockError({
-                  entityType,
-                  key: encodedKey,
-                  expectedVersion: snapshot.version,
-                  actualVersion: -1,
-                }) as DynamoClientError | OptimisticLockError | ConditionalCheckFailed
-              }),
+              Effect.mapError(
+                (err): DynamoClientError | OptimisticLockError | ConditionalCheckFailed => {
+                  // The update is guarded by the snapshot version AND any user
+                  // condition; the stored item (ALL_OLD) says which rejected it.
+                  const rejection = (
+                    stored: Readonly<globalThis.Record<string, unknown>> | undefined,
+                  ) =>
+                    conditionRejection(
+                      encodedKey as globalThis.Record<string, unknown>,
+                      stored,
+                      systemFields.version ? snapshot.version : undefined,
+                      userCond !== undefined,
+                    )
+                  if (isAwsTransactionCancelled(err.cause)) {
+                    const main = err.cause.CancellationReasons?.[0]
+                    if (main?.Code === "ConditionalCheckFailed") return rejection(main.Item)
+                  }
+                  if (isAwsConditionalCheckFailed(err.cause)) return rejection(err.cause.Item)
+                  return err
+                },
+              ),
             )
             // A transacted Update returns no attributes: read the new item, as
             // the record-based retain branch returns the full new item.
@@ -4734,28 +4766,27 @@ const makeImpl = <
               ExpressionAttributeNames: names,
               ExpressionAttributeValues: Object.keys(values).length > 0 ? values : undefined,
               ConditionExpression: conditionExpression,
+              ...(conditionExpression !== undefined && {
+                ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
+              }),
               ReturnValues: returnValuesMap[uState.returnValues ?? "allNew"],
             })
             .pipe(
-              Effect.mapError((err) => {
-                if (isAwsConditionalCheckFailed(err.cause)) {
-                  if (evExpected !== undefined) {
-                    return new OptimisticLockError({
-                      entityType,
-                      key: encodedKey,
-                      expectedVersion: evExpected,
-                      actualVersion: -1,
-                    }) as DynamoClientError | OptimisticLockError | ConditionalCheckFailed
+              Effect.mapError(
+                (err): DynamoClientError | OptimisticLockError | ConditionalCheckFailed => {
+                  // The stored item (ALL_OLD) says whether the version CAS or
+                  // the user's condition rejected the update.
+                  if (isAwsConditionalCheckFailed(err.cause)) {
+                    return conditionRejection(
+                      encodedKey as globalThis.Record<string, unknown>,
+                      err.cause.Item,
+                      systemFields.version ? evExpected : undefined,
+                      userCond !== undefined,
+                    )
                   }
-                  if (userCond) {
-                    return new ConditionalCheckFailed({
-                      entityType,
-                      key: encodedKey,
-                    }) as DynamoClientError | OptimisticLockError | ConditionalCheckFailed
-                  }
-                }
-                return err as DynamoClientError | OptimisticLockError | ConditionalCheckFailed
-              }),
+                  return err
+                },
+              ),
             )
 
           if (!result.Attributes) {

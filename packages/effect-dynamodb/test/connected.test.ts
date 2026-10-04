@@ -14181,6 +14181,40 @@ const g133Client = DynamoClient.make({ entities: g133Entities, tables: { G133Tab
  */
 const g133Closed = <A, E>(effect: Effect.Effect<A, E, unknown>): Effect.Effect<A, E> =>
   effect as Effect.Effect<A, E>
+/** A hook's effect with its layers' scope closed, so it can run anywhere. */
+const g133Hook = (effect: Effect.Effect<void, unknown, any>): Effect.Effect<void, unknown> =>
+  Effect.scoped(effect) as Effect.Effect<void, unknown>
+/** One-shot hooks run around the next UpdateItem / TransactWriteItems. */
+const g133Inject: {
+  before?: Effect.Effect<void, unknown> | undefined
+  after?: Effect.Effect<void, unknown> | undefined
+} = {}
+const G133InjectingClient = Layer.effect(
+  DynamoClient,
+  Effect.gen(function* () {
+    const real = yield* DynamoClient
+    const around = <A, E>(call: Effect.Effect<A, E>) =>
+      Effect.gen(function* () {
+        const before = g133Inject.before
+        g133Inject.before = undefined
+        if (before) yield* Effect.orDie(before)
+        const out = yield* call
+        const after = g133Inject.after
+        g133Inject.after = undefined
+        if (after) yield* Effect.orDie(after)
+        return out
+      })
+    return {
+      ...real,
+      updateItem: (input) => around(real.updateItem(input)),
+      transactWriteItems: (input) => around(real.transactWriteItems(input)),
+    } satisfies DynamoClientService
+  }),
+).pipe(Layer.provide(ClientLayer))
+const g133RaceLayer = Layer.mergeAll(
+  G133InjectingClient,
+  G133Table.layer({ name: g133Tables.record }),
+)
 
 describeConnected("#133 — path operations on index composites and unique fields", () => {
   beforeAll(async () => {
@@ -14384,4 +14418,80 @@ describeConnected("#133 — path operations on index composites and unique field
       expect(hits.map((h: any) => h.id)).toEqual(["cn"])
     }).pipe(Effect.provide(g133Layer(g133Tables.record)), g133Closed),
   )
+
+  // ---- condition failures: a lost version race vs the user's condition ----
+
+  const mainKey = (entityType: string, id: string) => ({
+    pk: { S: `$edd133g#v1#${entityType.toLowerCase()}#id_${id}` },
+    sk: { S: `$edd133g#v1#${entityType.toLowerCase()}` },
+  })
+  /** A concurrent writer: bumps the version (and label) behind our back. */
+  const bumpVersion = (entityType: string, id: string, label = "l") =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      yield* client.updateItem({
+        TableName: g133Tables.record,
+        Key: mainKey(entityType, id),
+        UpdateExpression: "SET #v = #v + :one, #l = :l",
+        ExpressionAttributeNames: { "#v": "version", "#l": "label" },
+        ExpressionAttributeValues: { ":one": { N: "1" }, ":l": { S: label } },
+      })
+    }).pipe(Effect.provide(ClientLayer))
+
+  const raceCases: ReadonlyArray<
+    readonly [string, "DevicesPlain" | "DevicesRetained", string, Build]
+  > = [
+    [
+      "plain update with expectedVersion and a condition",
+      "DevicesPlain",
+      "G133DevicePlain",
+      (u) =>
+        u
+          .set({ label: "m" })
+          .expectedVersion(1)
+          .condition({ eq: { label: "l" } }),
+    ],
+    [
+      "retain record update with a condition",
+      "DevicesRetained",
+      "G133DeviceRetained",
+      (u) => u.set({ label: "m" }).condition({ eq: { label: "l" } }),
+    ],
+    [
+      "retain path update with a condition",
+      "DevicesRetained",
+      "G133DeviceRetained",
+      (u) =>
+        u
+          .pathSet({ segments: ["label"], value: "m", isPath: false })
+          .condition({ eq: { label: "l" } }),
+    ],
+  ]
+  for (const [label, entity, entityType, build] of raceCases) {
+    it.effect(`${label}: a concurrent version bump is an OptimisticLockError`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const id = `race-${entity.toLowerCase()}-${label.length}`
+        yield* (db.entities[entity] as any).put({ id, owner: "o", reading: "r", label: "l" })
+        g133Inject.before = g133Hook(bumpVersion(entityType, id))
+        const error = yield* build((db.entities[entity] as any).update({ id }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("OptimisticLockError")
+        expect([error.expectedVersion, error.actualVersion]).toEqual([1, 2])
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+
+    it.effect(`${label}: a false condition without a race is a ConditionalCheckFailed`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const id = `cond-${entity.toLowerCase()}-${label.length}`
+        yield* (db.entities[entity] as any).put({ id, owner: "o", reading: "r", label: "other" })
+        const error = yield* build((db.entities[entity] as any).update({ id }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ConditionalCheckFailed")
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+  }
 })

@@ -710,3 +710,108 @@ describe("#133 record rich operations on an index composite", () => {
     }).pipe(Effect.provide(TestLayer), closed),
   )
 })
+
+// ---------------------------------------------------------------------------
+// Condition failures: version race vs user condition (ALL_OLD)
+// ---------------------------------------------------------------------------
+
+const ccf = (item: Record<string, unknown> | undefined) =>
+  Object.assign(new Error("The conditional request failed"), {
+    name: "ConditionalCheckFailedException",
+    ...(item !== undefined && { Item: item }),
+  })
+const cancelled = (item: Record<string, unknown> | undefined) =>
+  Object.assign(new Error("Transaction cancelled"), {
+    name: "TransactionCanceledException",
+    CancellationReasons: [
+      { Code: "ConditionalCheckFailed", ...(item !== undefined && { Item: item }) },
+      { Code: "None" },
+    ],
+  })
+
+/** The stored main item with its version replaced — what ALL_OLD hands back. */
+const storedWithVersion = (id: string, version: number) => {
+  const item = [...store.values()].find(
+    (i) =>
+      i.pk?.S?.includes(`#id_${id}`) &&
+      !i.sk?.S?.includes("#v#") &&
+      !i.__edd_e__?.S?.includes("_unique"),
+  )
+  return { ...item!, version: { N: String(version) } }
+}
+
+describe("#133 condition failures distinguish a version race from the user condition", () => {
+  const seed = { id: "d1", owner: "alice", reading: "r1", seq: 1, label: "l" }
+  const cases: ReadonlyArray<
+    readonly [
+      string,
+      Name,
+      (u: Builder) => Builder,
+      (item: Record<string, unknown>) => unknown,
+      string,
+    ]
+  > = [
+    [
+      "plain UpdateItem with expectedVersion and a condition",
+      "DevicesPlain",
+      (u) =>
+        u
+          .set({ label: "m" })
+          .expectedVersion(1)
+          .condition({ eq: { label: "l" } }),
+      ccf,
+      "Update",
+    ],
+    [
+      "retain record update with a condition",
+      "DevicesRetained",
+      (u) => u.set({ label: "m" }).condition({ eq: { label: "l" } }),
+      cancelled,
+      "Put",
+    ],
+    [
+      "retain path update with a condition",
+      "DevicesRetained",
+      (u) =>
+        u
+          .pathSet({ segments: ["label"], value: "m", isPath: false })
+          .condition({ eq: { label: "l" } }),
+      cancelled,
+      "Update",
+    ],
+  ]
+  for (const [label, name, build, failure, mainOp] of cases) {
+    it.effect(`${label}: a newer stored version is an OptimisticLockError`, () =>
+      Effect.gen(function* () {
+        const result = yield* runUpdate(name, seed, (u) => {
+          failNext = failure(storedWithVersion("d1", 2))
+          return build(u)
+        })
+        const error = failureOf(result.exit)
+        expect(error?._tag).toBe("OptimisticLockError")
+        expect(error?.expectedVersion).toBe(1)
+        expect(error?.actualVersion).toBe(2)
+      }).pipe(Effect.provide(TestLayer), closed),
+    )
+
+    it.effect(`${label}: the same stored version is a ConditionalCheckFailed`, () =>
+      Effect.gen(function* () {
+        const result = yield* runUpdate(name, seed, (u) => {
+          failNext = failure(storedWithVersion("d1", 1))
+          return build(u)
+        })
+        expect(failureOf(result.exit)?._tag).toBe("ConditionalCheckFailed")
+      }).pipe(Effect.provide(TestLayer), closed),
+    )
+
+    it.effect(`${label}: asks DynamoDB for the item on a failed condition`, () =>
+      Effect.gen(function* () {
+        const result = yield* runUpdate(name, seed, build)
+        const main = result.writes.find(
+          (w) => w.op === mainOp && !String(w.input.Item?.sk?.S ?? "").includes("#v#"),
+        )!
+        expect(main.input.ReturnValuesOnConditionCheckFailure).toBe("ALL_OLD")
+      }).pipe(Effect.provide(TestLayer), closed),
+    )
+  }
+})

@@ -127,12 +127,16 @@ export interface AwsTransactionCancelled {
   readonly CancellationReasons?: ReadonlyArray<{
     readonly Code?: string
     readonly Message?: string
+    /** The item as stored, when the request asked for `ALL_OLD` on a failed condition. */
+    readonly Item?: Readonly<Record<string, unknown>>
   }>
 }
 
 /** @internal Shape of AWS SDK ConditionalCheckFailedException */
 export interface AwsConditionalCheckFailed {
   readonly name: "ConditionalCheckFailedException"
+  /** The item as stored, when the request asked for `ALL_OLD` on a failed condition. */
+  readonly Item?: Readonly<Record<string, unknown>>
 }
 
 /** @internal */
