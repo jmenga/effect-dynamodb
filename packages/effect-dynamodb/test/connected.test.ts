@@ -12458,6 +12458,29 @@ const i133IsRealUtc = (value: unknown, ms: number) =>
   Object.getPrototypeOf(value) !== Object.prototype &&
   Equal.equals(value, DateTime.makeUnsafe(ms))
 
+class I133Slot extends Schema.Class<I133Slot>("I133Slot")({ at: Schema.DateTimeUtcFromString }) {}
+class I133Holder extends Schema.Class<I133Holder>("I133Holder")({
+  id: Schema.String,
+  nullSelf: Schema.NullOr(Schema.DateTimeUtc),
+  arrNullSelf: Schema.Array(Schema.NullOr(Schema.DateTimeUtc)),
+  rec: Schema.Record(Schema.String, Schema.DateTimeUtcFromString),
+  tup: Schema.Tuple([Schema.String, Schema.DateTimeUtcFromString]),
+  either: Schema.Union([I133Slot, Schema.String]),
+  mixed: Schema.Union([Schema.DateTimeUtcFromString, Schema.Number]),
+  // A many edge whose element IS a DynamoModel.ref-annotated entity class.
+  players: Schema.Array(I133Player.pipe(DynamoModel.ref)),
+}) {}
+const I133HolderAggregate = Aggregate.make(I133Holder, {
+  table: I133Table,
+  schema: I133Schema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "holder" },
+  root: { entityType: "HolderItem" },
+  edges: {
+    players: Aggregate.many("players", { entityType: "HolderPlayer", entity: I133Players }),
+  },
+})
+
 describeConnected("#133 — aggregate DateTimes nested in containers", () => {
   beforeAll(async () => {
     await Effect.runPromise(
@@ -12491,6 +12514,80 @@ describeConnected("#133 — aggregate DateTimes nested in containers", () => {
       ),
     )
   }, 30000)
+
+  it.effect("Union / Record / Tuple containers and an annotated-ref many edge round-trip", () =>
+    Effect.gen(function* () {
+      const dt = DateTime.makeUnsafe(I133_DOB_MS)
+      yield* I133HolderAggregate.create({
+        id: "h1",
+        nullSelf: dt,
+        arrNullSelf: [dt, null],
+        rec: { a: I133_DOB },
+        tup: ["x", I133_DOB],
+        either: { at: I133_DOB },
+        mixed: 5,
+        players: ["player-1"],
+      } as any)
+
+      const client = yield* DynamoClient
+      const { Items = [] } = yield* client.query({
+        TableName: i133TableName,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: "$issue133#v1#holder#h1" } },
+        ConsistentRead: true,
+      })
+      const root = Items.find((i) => i.__edd_e__?.S === "HolderItem")!
+      const player = Items.find((i) => i.__edd_e__?.S === "HolderPlayer")!
+      expect({
+        nullSelf: root.nullSelf,
+        arrNullSelf: root.arrNullSelf,
+        rec: root.rec,
+        tup: root.tup,
+        either: root.either,
+        mixed: root.mixed,
+        dob: player.dateOfBirth,
+      }).toEqual({
+        nullSelf: { S: I133_DOB },
+        arrNullSelf: { L: [{ S: I133_DOB }, { NULL: true }] },
+        rec: { M: { a: { S: I133_DOB } } },
+        tup: { L: [{ S: "x" }, { S: I133_DOB }] },
+        either: { M: { at: { S: I133_DOB } } },
+        mixed: { N: "5" },
+        dob: { S: I133_DOB },
+      })
+
+      // A legacy map in the annotated-ref element reads back as a real DateTime.
+      yield* client.updateItem({
+        TableName: i133TableName,
+        Key: { pk: player.pk!, sk: player.sk! },
+        UpdateExpression: "SET #d = :v",
+        ExpressionAttributeNames: { "#d": "dateOfBirth" },
+        ExpressionAttributeValues: { ":v": i133LegacyMap("~effect/DateTime")(I133_DOB_MS) as any },
+      })
+
+      const got = (yield* I133HolderAggregate.get({ id: "h1" } as any)) as any
+      expect(i133IsRealUtc(got.nullSelf, I133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.arrNullSelf[0], I133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.rec.a, I133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.tup[1], I133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.either.at, I133_DOB_MS)).toBe(true)
+      expect(got.mixed).toBe(5)
+      expect(i133IsRealUtc(got.players[0].dateOfBirth, I133_DOB_MS)).toBe(true)
+
+      // A no-op update and a mutating one both succeed.
+      yield* I133HolderAggregate.update({ id: "h1" } as any, (c: any) => c.state)
+      const updated = (yield* I133HolderAggregate.update({ id: "h1" } as any, (c: any) => ({
+        ...c.state,
+        nullSelf: null,
+        mixed: DateTime.makeUnsafe(I133_DOB_MS),
+      }))) as any
+      expect(updated.nullSelf).toBe(null)
+      const after = (yield* I133HolderAggregate.get({ id: "h1" } as any)) as any
+      expect(i133IsRealUtc(after.mixed, I133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(after.players[0].dateOfBirth, I133_DOB_MS)).toBe(true)
+    }).pipe(provideI133),
+  )
 
   for (const kind of ["plain", "ref"] as const) {
     const MatchAggregate = makeI133Match(kind)
