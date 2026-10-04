@@ -34,6 +34,7 @@ import {
   buildDateTransform,
   containsWireTransform,
   matchDateRepresentation,
+  optionalField,
   resolveSystemFields,
   substituteSchemaDeep,
   validateNoTransformOverride,
@@ -44,7 +45,15 @@ import {
   hasEncodingTransformation,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { type Context, DateTime, Effect, type Optic, Option, Schema, SchemaAST } from "effect"
+import {
+  type Context,
+  DateTime,
+  Effect,
+  type Optic,
+  Option,
+  Schema,
+  SchemaAST,
+} from "effect"
 import * as Batch from "./Batch.js"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
 import { type EntityGet, fromDefinition as entityFromDefinition } from "./Entity.js"
@@ -700,6 +709,25 @@ const inferDateEncoding = (ast: Schema.Top["ast"]): DynamoEncoding | undefined =
   return undefined
 }
 
+/**
+ * A union that holds a date member alongside a member that is neither a date
+ * nor `Undefined` / `Null` — `Union([DateTimeUtcFromString, Number])`.
+ * `inferDateEncoding` looks through unions to find the date in `optional(date)`,
+ * so it reports such a field as a date, and encoding a `5` through a date
+ * transform throws. Its stored form is the union's own business: it is encoded
+ * member by member through the substituted union instead.
+ */
+const isMixedDateUnion = (ast: Schema.Top["ast"]): boolean => {
+  if (!SchemaAST.isUnion(ast)) return false
+  const isDate = (member: SchemaAST.AST): boolean =>
+    matchDateRepresentation(SchemaAST.resolve(member) as Record<string, unknown> | undefined) !==
+      undefined ||
+    matchDateRepresentation(member.annotations as Record<string, unknown> | undefined) !== undefined
+  return ast.types.some(
+    (member) => !SchemaAST.isUndefined(member) && !SchemaAST.isNull(member) && !isDate(member),
+  )
+}
+
 /** Resolves a ref field (by schema identity) to the model it should be read as. */
 type RefResolver = (name: string, field: Schema.Top) => Schema.Top | undefined
 
@@ -713,7 +741,11 @@ type AttrEncoders = Record<string, (value: unknown) => unknown>
  * `storedAs(DateEpochMs)` must store the epoch, not the ISO string its own schema
  * would produce).
  */
-const dateAttrEncoder = (fieldSchema: Schema.Top): ((value: unknown) => unknown) | undefined => {
+const dateAttrEncoder = (
+  fieldSchema: Schema.Top,
+  options?: { readonly mixedUnions?: boolean },
+): ((value: unknown) => unknown) | undefined => {
+  if (options?.mixedUnions !== true && isMixedDateUnion(fieldSchema.ast)) return undefined
   const encoding = DynamoModel.getEncoding(fieldSchema) ?? inferDateEncoding(fieldSchema.ast)
   if (!encoding) return undefined
   const encode = Schema.encodeUnknownSync(buildDateTransform(encoding) as Schema.Codec<any>)
@@ -836,9 +868,19 @@ const buildKeyAttrEncoders = (fields: Record<string, Schema.Top> | undefined): A
   if (!fields) return encoders
   for (const field of Object.keys(fields)) {
     const fieldSchema = fields[field]!
-    const date = dateAttrEncoder(fieldSchema)
-    if (date) encoders[field] = date
-    else if (hasEncodingTransformation(fieldSchema)) encoders[field] = ownAttrEncoder(fieldSchema)
+    const date = dateAttrEncoder(fieldSchema, { mixedUnions: true })
+    if (date) {
+      // Before, a value this encoder rejects (the `5` of a mixed date union)
+      // threw and failed the write, so there is no stored key to stay
+      // byte-identical with: compose from the value as it is.
+      encoders[field] = (value) => {
+        try {
+          return date(value)
+        } catch {
+          return value
+        }
+      }
+    } else if (hasEncodingTransformation(fieldSchema)) encoders[field] = ownAttrEncoder(fieldSchema)
   }
   return encoders
 }
@@ -860,17 +902,7 @@ const fieldsOf = (schema: unknown): Record<string, Schema.Top> | undefined => {
 }
 
 /** The value schema of a struct field, with any `optionalKey` / `optional` wrapper removed. */
-const unwrapOptionalField = (field: Schema.Top): Schema.Top => {
-  if (!SchemaAST.isOptional(field.ast)) return field
-  const inner = (field as { readonly schema?: Schema.Top }).schema
-  if (inner === undefined) return field
-  // `Schema.optional(X)`: the value is `UndefinedOr(X)`; X is the non-`Undefined` member.
-  const members = (inner as { readonly members?: ReadonlyArray<Schema.Top> }).members
-  if (members !== undefined && SchemaAST.isUnion(inner.ast)) {
-    return members.find((m) => !SchemaAST.isUndefined(m.ast)) ?? field
-  }
-  return inner
-}
+const unwrapOptionalField = (field: Schema.Top): Schema.Top => optionalField(field)?.inner ?? field
 
 /**
  * Whether a field is a class-like value whose fields the schema walker cannot
@@ -931,6 +963,10 @@ const unwrapEntityModel = (model: Schema.Top): Schema.Top =>
  *   sub-aggregate — only when OPAQUE. A plain class there is already walked,
  *   and swapping it for the entity's model could only make its decode stricter
  *   or change its class (#133);
+ * - **a `many` edge field whose ELEMENT is an opaque ref**
+ *   (`Schema.Array(Player.pipe(DynamoModel.ref))`) — the array field itself,
+ *   re-pointed at `Schema.Array(<entity model>)`, since the walker can only
+ *   re-point fields, not array elements;
  * - **refs nested inside an edge entity's own model** (`maker` on a `supplier`
  *   edge entity, #116).
  *
@@ -972,10 +1008,26 @@ const collectRefTargets = (
         registerNested(entity)
       } else if (edge._tag === "ManyEdge") {
         const entity = edge.entity as RefTargetEntity | undefined
-        if (edge.entity !== undefined) {
+        const arrayField = fields?.[edgeName]
+        const element = arrayField === undefined ? undefined : extractArrayElement(arrayField)
+        if (arrayField !== undefined && element !== undefined && isOpaqueRefField(element)) {
+          // The element IS an opaque ref (`Schema.Array(Player.pipe(DynamoModel.ref))`):
+          // re-point the whole array field at an array of the entity's model. The
+          // walker re-applies the field's optionality around the target.
+          const model = entity?.model
+          if (model !== undefined && !targets.has(arrayField)) {
+            targets.set(
+              arrayField,
+              Schema.Array(unwrapEntityModel(model) as Schema.Codec<any>) as unknown as Schema.Top,
+            )
+          }
+        } else if (edge.entity !== undefined) {
+          // The element WRAPS the ref (`PlayerSheet { player }`), found by name as
+          // hydration finds it.
           const refField = manyElementFields(fields, edgeName)?.[deriveEntityFieldName(edge.entity)]
-          if (refField !== undefined && isOpaqueRefField(refField))
+          if (refField !== undefined && isOpaqueRefField(refField)) {
             register(refField, entity?.model)
+          }
         }
         registerNested(entity)
       } else if (edge._tag === "BoundSubAggregate") {

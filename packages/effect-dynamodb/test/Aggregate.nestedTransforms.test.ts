@@ -808,3 +808,246 @@ describe("#133 nested transforms — list-index key composition is unchanged", (
     }).pipe(Effect.provide(TestLayer)),
   )
 })
+
+// ---------------------------------------------------------------------------
+// Union / Record / Tuple containers
+// ---------------------------------------------------------------------------
+//
+// The read path's schema walk (`substituteSchemaDeep`) used to stop at a Union,
+// a Record or a Tuple, so the date leaves inside kept their strict decoders: a
+// self date in a `NullOr` was written as a string but read back as
+// "Expected DateTime.Utc", and every update — even a no-op — re-decoded the
+// domain values with an encoded-only decoder and failed.
+
+const LATER = "2000-01-01T00:00:01.000Z"
+const LATER_MS = DOB_MS + 1000
+
+class Slot extends Schema.Class<Slot>("Slot")({ at: Schema.DateTimeUtcFromString }) {}
+
+interface ContainerCase {
+  readonly name: string
+  readonly schema: Schema.Top
+  /** Create input (wire-shaped, as an HTTP payload would be). */
+  readonly input: unknown
+  readonly stored: AttributeValue
+  readonly read: (value: any) => boolean
+  /** A mutation on the decoded domain value. */
+  readonly mutate: (value: any) => unknown
+  readonly storedAfter: AttributeValue
+}
+
+const later = () => DateTime.makeUnsafe(LATER_MS)
+const containerCases: ReadonlyArray<ContainerCase> = [
+  {
+    name: "NullOr(DateTimeUtc)",
+    schema: Schema.NullOr(Schema.DateTimeUtc),
+    input: DateTime.makeUnsafe(DOB_MS),
+    stored: S(DOB),
+    read: (v) => isRealUtc(v, DOB_MS),
+    mutate: later,
+    storedAfter: S(LATER),
+  },
+  {
+    name: "NullOr(DateTimeUtcFromString)",
+    schema: Schema.NullOr(Schema.DateTimeUtcFromString),
+    input: DOB,
+    stored: S(DOB),
+    read: (v) => isRealUtc(v, DOB_MS),
+    mutate: () => null,
+    storedAfter: { NULL: true },
+  },
+  {
+    name: "NullOr(Class)",
+    schema: Schema.NullOr(Slot),
+    input: { at: DOB },
+    stored: { M: { at: S(DOB) } },
+    read: (v) => v instanceof Slot && isRealUtc(v.at, DOB_MS),
+    mutate: () => new Slot({ at: later() }),
+    storedAfter: { M: { at: S(LATER) } },
+  },
+  {
+    name: "Array(NullOr(DateTimeUtc))",
+    schema: Schema.Array(Schema.NullOr(Schema.DateTimeUtc)),
+    input: [DateTime.makeUnsafe(DOB_MS), null],
+    stored: { L: [S(DOB), { NULL: true }] },
+    read: (v) => isRealUtc(v[0], DOB_MS) && v[1] === null,
+    mutate: (v) => [...v, later()],
+    storedAfter: { L: [S(DOB), { NULL: true }, S(LATER)] },
+  },
+  {
+    name: "Array(NullOr(DateTimeUtcFromString))",
+    schema: Schema.Array(Schema.NullOr(Schema.DateTimeUtcFromString)),
+    input: [DOB, null],
+    stored: { L: [S(DOB), { NULL: true }] },
+    read: (v) => isRealUtc(v[0], DOB_MS) && v[1] === null,
+    mutate: (v) => [v[0], later()],
+    storedAfter: { L: [S(DOB), S(LATER)] },
+  },
+  {
+    name: "Record(String, DateTimeUtcFromString)",
+    schema: Schema.Record(Schema.String, Schema.DateTimeUtcFromString),
+    input: { a: DOB },
+    stored: { M: { a: S(DOB) } },
+    read: (v) => isRealUtc(v.a, DOB_MS),
+    mutate: (v) => ({ ...v, b: later() }),
+    storedAfter: { M: { a: S(DOB), b: S(LATER) } },
+  },
+  {
+    name: "Tuple([String, DateTimeUtcFromString])",
+    schema: Schema.Tuple([Schema.String, Schema.DateTimeUtcFromString]),
+    input: ["x", DOB],
+    stored: { L: [S("x"), S(DOB)] },
+    read: (v) => v[0] === "x" && isRealUtc(v[1], DOB_MS),
+    mutate: (v) => [v[0], later()],
+    storedAfter: { L: [S("x"), S(LATER)] },
+  },
+  {
+    name: "Union([Class, String])",
+    schema: Schema.Union([Slot, Schema.String]),
+    input: { at: DOB },
+    stored: { M: { at: S(DOB) } },
+    read: (v) => v instanceof Slot && isRealUtc(v.at, DOB_MS),
+    mutate: () => "none",
+    storedAfter: S("none"),
+  },
+]
+
+const makeHolder = (name: string, schema: Schema.Top) => {
+  class Holder extends Schema.Class<Holder>(`Holder-${name}`)({
+    id: Schema.String,
+    f: schema as Schema.Codec<unknown>,
+  }) {}
+  return Aggregate.make(Holder, {
+    table: ReproTable,
+    schema: ReproSchema,
+    pk: { field: "pk", composite: ["id"] },
+    collection: { name: "holder" },
+    root: { entityType: "HolderItem" },
+    edges: {},
+  })
+}
+const holderItem = () => [...store.values()].find((i) => i.__edd_e__?.S === "HolderItem")!
+
+describe("#133 nested transforms — Union / Record / Tuple containers", () => {
+  for (const c of containerCases) {
+    describe(c.name, () => {
+      const Holder = makeHolder(c.name, c.schema)
+
+      it.effect("stores wire form, reads real instances, and updates", () =>
+        Effect.gen(function* () {
+          yield* Holder.create({ id: "h1", f: c.input } as any)
+          expect(holderItem().f).toEqual(c.stored)
+
+          const got = (yield* Holder.get({ id: "h1" } as any)) as any
+          expect(c.read(got.f)).toBe(true)
+
+          transactCalls.length = 0
+          yield* Holder.update({ id: "h1" } as any, (ctx: any) => ctx.state)
+          expect(transactCalls).toHaveLength(0)
+
+          yield* Holder.update({ id: "h1" } as any, (ctx: any) => ({
+            ...ctx.state,
+            f: c.mutate(ctx.state.f),
+          }))
+          expect(holderItem().f).toEqual(c.storedAfter)
+          // The key is untouched by any of it.
+          expect(holderItem().sk).toEqual(S("$issue133#v1#holderitem"))
+        }).pipe(Effect.provide(TestLayer)),
+      )
+    })
+  }
+
+  for (const [formName, form] of legacyForms) {
+    it.effect(`reads a stored ${formName} inside a NullOr and a Record`, () =>
+      Effect.gen(function* () {
+        const NullHolder = makeHolder("legacy-null", Schema.NullOr(Schema.DateTimeUtcFromString))
+        yield* NullHolder.create({ id: "h1", f: DOB } as any)
+        holderItem().f = form(DOB_MS)
+        const got = (yield* NullHolder.get({ id: "h1" } as any)) as any
+        expect(isRealUtc(got.f, DOB_MS)).toBe(true)
+
+        store.clear()
+        const RecHolder = makeHolder(
+          "legacy-rec",
+          Schema.Record(Schema.String, Schema.DateTimeUtcFromString),
+        )
+        yield* RecHolder.create({ id: "h1", f: { a: DOB } } as any)
+        holderItem().f = { M: { a: form(DOB_MS) } }
+        const rec = (yield* RecHolder.get({ id: "h1" } as any)) as any
+        expect(isRealUtc(rec.f.a, DOB_MS)).toBe(true)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  }
+
+  it.effect("a date member does not claim a value that belongs to a later member", () =>
+    Effect.gen(function* () {
+      const Holder = makeHolder(
+        "mixed",
+        Schema.Union([Schema.DateTimeUtcFromString, Schema.Number]),
+      )
+      yield* Holder.create({ id: "h1", f: 5 } as any)
+      expect(holderItem().f).toEqual({ N: "5" })
+      const asNumber = (yield* Holder.get({ id: "h1" } as any)) as any
+      expect(asNumber.f).toBe(5)
+
+      yield* Holder.update({ id: "h1" } as any, (ctx: any) => ({ ...ctx.state, f: later() }))
+      expect(holderItem().f).toEqual(S(LATER))
+      const asDate = (yield* Holder.get({ id: "h1" } as any)) as any
+      expect(isRealUtc(asDate.f, LATER_MS)).toBe(true)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// A many edge whose ELEMENT is a DynamoModel.ref-annotated entity class
+// ---------------------------------------------------------------------------
+
+class RefRoster extends Schema.Class<RefRoster>("RefRoster")({
+  id: Schema.String,
+  players: Schema.Array(Player.pipe(DynamoModel.ref)),
+}) {}
+
+const RefRosterAggregate = Aggregate.make(RefRoster, {
+  table: ReproTable,
+  schema: ReproSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "refroster" },
+  root: { entityType: "RefRosterItem" },
+  edges: { players: Aggregate.many("players", { entityType: "RefRosterPlayer", entity: Players }) },
+})
+
+describe("#133 nested transforms — many edge of annotated refs", () => {
+  const playerItems = () => [...store.values()].filter((i) => i.__edd_e__?.S === "RefRosterPlayer")
+
+  it.effect("stores, reads, updates and reads legacy maps", () =>
+    Effect.gen(function* () {
+      yield* seed
+      yield* RefRosterAggregate.create({ id: "rr1", players: ["player-1", "player-2"] } as any)
+      expect(playerItems().map((i) => i.dateOfBirth)).toEqual([S(DOB), S(DOB)])
+      expect(playerItems().map((i) => i.sk?.S)).toEqual([
+        "$issue133#v1#refrosterplayer#player-1",
+        "$issue133#v1#refrosterplayer#player-2",
+      ])
+
+      const got = (yield* RefRosterAggregate.get({ id: "rr1" } as any)) as RefRoster
+      expect(got.players[0]).toBeInstanceOf(Player)
+      expect(isRealUtc(got.players[0]!.dateOfBirth, DOB_MS)).toBe(true)
+
+      transactCalls.length = 0
+      yield* RefRosterAggregate.update({ id: "rr1" } as any, (c: any) => c.state)
+      expect(transactCalls).toHaveLength(0)
+
+      yield* RefRosterAggregate.update({ id: "rr1" } as any, (c: any) => ({
+        ...c.state,
+        players: [c.state.players[0]],
+      }))
+      expect(playerItems()).toHaveLength(1)
+
+      for (const [, form] of legacyForms) {
+        playerItems()[0]!.dateOfBirth = form(DOB_MS)
+        const legacy = (yield* RefRosterAggregate.get({ id: "rr1" } as any)) as RefRoster
+        expect(isRealUtc(legacy.players[0]!.dateOfBirth, DOB_MS)).toBe(true)
+      }
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
