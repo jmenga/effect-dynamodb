@@ -372,6 +372,15 @@ unique: {
 
 See [Data Integrity](/effect-dynamodb/guides/data-integrity/) for details.
 
+### Decoding Defaults
+
+A field declared with `Schema.withDecodingDefault` can be left out of a `put`. The returned record and every later read carry the default. Whether the default is stored depends on the field:
+
+- **A primary-key or index composite** is stored with its default, and its keys are composed from it, so the item is indexed under the value it reads back with. A `.remove()` of such a field stores the default again and keeps the item indexed under it.
+- **Any other field** is not stored. The default is applied on read.
+
+A default never creates a unique-constraint sentinel. A defaulted unique field that is also an index composite is listed in a hidden string-set attribute, `__edd_d__`, until a write supplies its value. See [Defaults and Unique Constraints](/effect-dynamodb/guides/data-integrity/#defaults-and-unique-constraints).
+
 ## Derived Types
 
 Seven types are automatically derived from your Model + Table + Entity declarations. No manual type maintenance required.

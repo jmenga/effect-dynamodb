@@ -21,6 +21,8 @@ DynamoDB Stream records contain items in DynamoDB's native `AttributeValue` form
 
 Manually decoding this into your domain types is error-prone. effect-dynamodb provides `Entity.decodeMarshalledItem` for AttributeValue input and `Entity.itemSchema` for already-unmarshalled input.
 
+Images can also carry two other hidden attributes: `__edd_i__`, the incarnation token on items of a versioned entity, and `__edd_d__`, a string set naming unique fields that hold only a decoding default. Decoded models never include them. `Entity.decodeMarshalledItem` refuses, with a `ValidationError`, an image of a versioned entity that has `__edd_i__` but no version, because its version was removed outside the library.
+
 ## Setup
 
 The examples on this page use these models and entities:

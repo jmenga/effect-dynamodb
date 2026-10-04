@@ -261,6 +261,14 @@ Note that batch writes are **not transactional** — DynamoDB applies each item 
 The same reasoning rules out the lifecycle configs (**EDD-9049**): entities with `unique` or `versioned: { retain: true }` cannot be written here at all, and `softDelete` entities cannot be *deleted* here. Each needs more than one item per write — a sentinel, a snapshot, a tombstone — and a batch can neither guard them with a condition nor keep them together across its 25-item chunks. Use `Transaction.transactWrite`, which writes the sentinel and snapshot atomically alongside the row, or the entity's own operation. (A **put** of a `softDelete` entity is fine — `softDelete` only affects deletes.)
 :::
 
+:::note[Puts of a `versioned` entity are sent as transactions]
+A `PutRequest` can't continue an existing item's version; it would reset the item to version 1. So `Batch.write` sends puts of a `versioned` entity first, as create-only `TransactWriteItems` of up to 100 items, each conditioned on `attribute_not_exists`. Puts of other entities, and deletes, are still plain `BatchWriteItem` requests.
+
+- A put that would replace an existing item cancels its whole chunk, so nothing in that chunk is written, and `Batch.write` fails with a `ValidationError`. Earlier chunks may already have been written, as with any batch, and the remaining requests aren't sent. Replace an existing item with the entity's own `put()`.
+- Each chunk costs twice the write capacity of a batch write.
+- Cancellations caused by contention (`TransactionConflict`, throttling) are retried with the batch's backoff settings.
+:::
+
 ---
 
 ## Running the Example

@@ -340,6 +340,8 @@ On entities with `versioned: { retain: true }`, path operations were silently ig
 
 A path operation on a field that feeds an index key or a unique constraint is handled like the matching record operation. A top-level `pathSet` of a value or `pathRemove` works like `.set()` or `.remove()`, and a numeric `pathAdd` or `pathSubtract` works like `.add()` or `.subtract()`. The index keys are recomposed and the unique sentinels rotated, exactly as those operations do. `.add()`, `.subtract()`, `.append()` and `.deleteFromSet()` on an index composite also recompose the index key, on every entity.
 
+A `.remove()` (or top-level `pathRemove`) of an index composite that has a `Schema.withDecodingDefault` doesn't drop the item from the index. It stores the default instead and keeps the item indexed under it, so the keys agree with the value the item reads back with. On a unique field, the old value's sentinel is released and none is created for the default (see [Defaults and Unique Constraints](/effect-dynamodb/guides/data-integrity/#defaults-and-unique-constraints)).
+
 These are rejected with a `ValidationError` that names the field:
 
 - operations whose result DynamoDB computes at write time on such a field: a copy from another attribute, `pathIfNotExists`, and list or set operations;

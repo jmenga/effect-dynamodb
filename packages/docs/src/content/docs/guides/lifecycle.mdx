@@ -76,7 +76,7 @@ yield* Console.log("Soft-deleted alice")
 
 The soft delete, and a hard delete of an entity with unique constraints, are guarded against a concurrent update: if the item changed after it was read, the delete fails instead of removing the newer item. A versioned entity checks its version. An unversioned one checks every attribute it read.
 
-**Wide items.** An unversioned delete is never refused for width. When the full guard can't fit DynamoDB's condition limits (4 KB and 300 operators, counted on the actual condition including your `.condition()`), it falls back to the strongest guard that fits: the item exists, `updatedAt` is unchanged (with timestamps), then as many attributes as fit, unique-constraint fields first. With timestamps, that detects any concurrent library update except one in the same millisecond with an identical `updatedAt`. A writer outside the library that leaves `updatedAt` alone can change unguarded attributes undetected. Without timestamps, only the guarded attributes are protected. A `.condition()` too large to fit beside the guard fails before writing with a `ValidationError` stating its size.
+**Wide items.** An unversioned delete is never refused for width. When the full guard can't fit DynamoDB's condition limits (4 KB and 300 operators, counted on the actual condition including your `.condition()`, the way DynamoDB counts them), it falls back to the strongest guard that fits: the item exists, `updatedAt` is unchanged (with timestamps), then as many attributes as fit, unique-constraint fields first. With timestamps, that detects any concurrent library update except one in the same millisecond with an identical `updatedAt`. A writer outside the library that leaves `updatedAt` alone can change unguarded attributes undetected. Without timestamps, only the guarded attributes are protected. A `.condition()` too large to fit beside the guard fails before writing with a `ValidationError` stating its size.
 
 ### Visibility After Deletion
 
@@ -193,6 +193,8 @@ What gets deleted:
 - All version history snapshots
 - All unique constraint sentinel items
 
+On a `retain` entity, purge is also what lets you re-create a deleted item under the same key. While its version history exists, a `put` of a new item there is refused with a `ValidationError`, because it would overwrite that history.
+
 ### Auto-Purge with TTL
 
 When `ttl` is configured on `softDelete`, DynamoDB automatically deletes the item after the specified duration. No manual purge required.
@@ -257,10 +259,19 @@ versioned: { retain: true, ttl: Duration.days(90) }
 - Version numbers are integers, starting at 1
 - Updates use DynamoDB atomic counters (`SET version = version + 1`)
 - In sort keys, versions are zero-padded (`#v#0000001`) for correct lexicographic ordering
+- A `put` over an existing item continues its version, incarnation token and `createdAt`, and snapshots the item it replaces. It never restarts at 1
+
+### History Is Never Overwritten
+
+Every snapshot write checks the `v#N` row it would write. If a row is already there with a different state (another version, another incarnation, or with timestamps another `updatedAt`), the update, soft delete, restore or `put` fails with a `ValidationError` and writes nothing. Rewriting the same state is allowed: the first update after a `put` snapshots the same version 1 state the `put` already stored, and a restore rewrites the delete-time snapshot.
+
+A write from outside the library that changes an item without bumping its version can still be captured into the next `v#N` snapshot, because the snapshot copies the item as read.
 
 ### Enabling Versioning on an Existing Table
 
 Items written before the entity was `versioned` read as version 0 on every path, and `expectedVersion(0)` addresses them. Their first versioned write conditions on no version existing, adds the incarnation token and writes version 1. Their retain snapshot is `v#0000000`, and a race on that first write is an `OptimisticLockError`. Soft delete and restore work on them.
+
+An item that has the hidden `__edd_i__` token but no version is not one of these. A versioned entity sets the token when it creates an item, so a token without a version means the version was removed outside the library. Reading it as version 0 would let the next update rewrite its history, so reads and the writes that check the version refuse it with a `ValidationError`. A query over a partition that holds one fails as a whole. Restore the version attribute to read it again.
 
 ### Updates on Retained Entities
 
@@ -285,7 +296,8 @@ When multiple features are enabled, entity operations compose into DynamoDB tran
 
 | Mutation | Transaction Items |
 |----------|-------------------|
-| **Put** | Entity + version snapshot + sentinel per unique field |
+| **Put** (new item) | Entity + v1 snapshot + sentinel per unique field |
+| **Put** (over an existing item) | Entity + snapshot of the replaced item + delete old / put new sentinel per changed unique field |
 | **Update** (unique field changed) | Entity + version snapshot + delete old sentinel + put new sentinel |
 | **Update** (no unique field change) | Entity + version snapshot |
 | **Delete** (soft, free policy) | Delete current + put deleted item + version snapshot + delete sentinels |

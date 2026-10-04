@@ -124,7 +124,7 @@ yield* users.update({ userId: "u-1" }).set({ tenantId: "t-new", region: "us-east
 
 Multiple entity types share one physical DynamoDB table. Three mechanisms make this work:
 
-1. **Entity type discriminator (`__edd_e__`)** — Every item carries a hidden `__edd_e__` attribute containing the entity type string (e.g., `"User"`, `"Order"`). All queries automatically include a `FilterExpression` on this field to isolate entity types.
+1. **Entity type discriminator (`__edd_e__`)** — Every item carries a hidden `__edd_e__` attribute containing the entity type string (e.g., `"User"`, `"Order"`). All queries automatically include a `FilterExpression` on this field to isolate entity types. Two other hidden attributes may appear on raw items: `__edd_i__`, the incarnation token of a versioned entity's item, and `__edd_d__`, the unique fields holding only a decoding default. Decoded models never include them.
 
 2. **Structured key format** — Keys follow the pattern `$schema#v1#entity_type#attr_value#attr_value`. The schema name, version, and entity type prefix ensure that different entity types produce non-overlapping key spaces even when they share the same physical index.
 
@@ -155,7 +155,7 @@ const Orders = Entity.make({
 
 | Operation | Behavior | On Duplicate Key | DynamoDB API |
 |-----------|----------|------------------|--------------|
-| **`put`** | Unconditional write — creates or overwrites | Silently replaces the existing item | PutItem |
+| **`put`** | Creates or overwrites | Replaces the existing item; on a versioned or unique-constrained entity it continues the item's version and rotates its sentinels | PutItem (TransactWriteItems with sentinels or retain) |
 | **`create`** | Insert-only — `put` + automatic `attribute_not_exists` condition | Fails with `ConditionalCheckFailed` | PutItem (with condition) |
 | **`upsert`** | Create-or-update atomically | Creates if missing, updates if exists | UpdateItem (with `if_not_exists`) |
 
@@ -183,7 +183,9 @@ yield* users.create({ userId: "u-1", name: "Alice" }).pipe(
 yield* users.upsert({ userId: "u-1", name: "Alice" })
 ```
 
-**Note:** `upsert` does not support unique constraints or version retention (`retain`) because it cannot determine whether the item previously existed.
+**Note:** On an entity with unique constraints, `upsert` reads the item first, because one `UpdateItem` can't write, rotate or check a sentinel. A missing item is created with its sentinels; an existing one is updated, with sentinels rotated for changed unique values. On other entities `upsert` is a single `UpdateItem`, so it writes no `retain` snapshot.
+
+A `put` of a versioned or unique-constrained entity also reads first. Over an existing item it takes the next version, keeps the incarnation and `createdAt`, snapshots the replaced item (`retain`) and rotates changed sentinels, so it never resets the item to version 1.
 
 ---
 

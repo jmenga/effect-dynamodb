@@ -47,12 +47,17 @@ All mutations involving unique constraints are automatically wrapped in DynamoDB
 
 | Operation | Transaction Items |
 |-----------|-------------------|
-| **Put** | Entity item + sentinel per unique field whose composites are all set (`condition: attribute_not_exists(pk)`) |
+| **Put** (new item) | Entity item + sentinel per unique field whose composites are all set (`condition: attribute_not_exists(pk)`) |
+| **Put** (over an existing item) | Entity item + for each changed unique value, delete old sentinel + put new sentinel |
 | **Update** (unique field unchanged) | Entity item only (no sentinel operations) |
 | **Update** (`undefined` → defined) | Entity item + put new sentinel |
 | **Update** (defined → `undefined`) | Entity item + delete old sentinel |
 | **Update** (defined → defined, changed) | Entity item + delete old sentinel + put new sentinel |
 | **Delete** | Entity item + delete sentinel per unique field whose composites were set |
+
+A `put` of an entity with unique constraints reads the item first. Over an existing item it rotates the sentinels of changed values and leaves unchanged ones alone, so it never orphans a sentinel. If another writer changes the item between the read and the write, the put fails without writing: with `OptimisticLockError` on a versioned entity, and with `ConcurrentModification` on an unversioned one.
+
+`upsert` works the same way on these entities. A missing item is created with its sentinels. An existing item is updated, with sentinels rotated for changed unique values only, under the same guards as an update. A race fails with `OptimisticLockError` or `ConcurrentModification`, and a value another item holds fails with `UniqueConstraintViolation`. On entities without unique constraints, `upsert` stays a single `UpdateItem`.
 
 ### Error Handling
 
@@ -159,6 +164,10 @@ yield* db.entities.Vehicles.update({ vehicleId: "v-2" }).set({ deviceBinding: "d
 
 Sparse semantics mean you can declare a unique constraint on any optional field without worrying that records leaving that field unset will collide on a synthesized "missing value" key.
 
+### Defaults and Unique Constraints
+
+A decoding default never creates a sentinel. When a write omits a unique field that has a `Schema.withDecodingDefault`, the field holds only its default, and no value is reserved for it. If that field is also an index composite, the default is stored so the item stays indexed, and the field is listed in a hidden string-set attribute, `__edd_d__`. Decoded models never include it. The field gets its sentinel once a write supplies its value. A `.remove()` of the field stores the default again, keeps the item indexed under it, and releases the old value's sentinel without creating one for the default.
+
 ## Versioning
 
 When `versioned` is enabled on an Entity, every item carries a `version` field that auto-increments on each write.
@@ -207,7 +216,8 @@ const CustomEntity = Entity.make({
 
 ### How It Works
 
-- **Put** sets `version = 1`
+- **Put** of a new item sets `version = 1`
+- **Put** over an existing item continues it: the next version, the same incarnation token and `createdAt`, and a retain snapshot of the item it replaces (see below)
 - **Update** uses `SET version = version + 1` (DynamoDB atomic counter)
 - The version field appears in `Entity.Record<E>` (readable) but not in `Entity.Input<E>` or `Entity.Update<E>` (system-managed)
 
@@ -223,6 +233,16 @@ PK: $myapp#v1#user#u-1  SK: $myapp#v1#user#v#0000003  ← snapshot v3
 ```
 
 All versions are co-located (same partition key) for efficient access. Version numbers are zero-padded for correct lexicographic sort order.
+
+Version history is never overwritten. An update, soft delete, restore or `put` that would write a `v#N` snapshot holding a different state from the row already there fails with a `ValidationError` and writes nothing. A write from outside the library that changes an item without bumping its version can still end up in the next `v#N` snapshot.
+
+### Puts on Versioned Entities
+
+A `put` of a versioned entity reads the item first, so a put over an existing item continues it instead of resetting it to version 1. It takes the next version, keeps the item's incarnation token and `createdAt` (unless the input supplies one), and with `retain` writes a snapshot of the item it replaces. A race with another writer fails with `OptimisticLockError`. A soft-deleted item counts as missing.
+
+With `retain`, re-creating an item that was deleted while its version history still exists is refused with a `ValidationError`: the history belongs to the earlier item, and it is never overwritten. `purge` the item first. `create` is unchanged; it fails with `ConditionalCheckFailed` on an existing item.
+
+In `Transaction.transactWrite`, a `put` of a versioned or unique-constrained entity may only create the item. One that would replace an existing item is refused with a `ValidationError`, and the transaction writes nothing. `Batch.write` sends puts of a `versioned` entity as create-only transactions (see [Batch Operations](/effect-dynamodb/tutorials/batch/)).
 
 ### Querying Versions
 
@@ -319,9 +339,9 @@ Some updates read the item before writing: a unique-field change, a computed cha
 
 Versioned entities carry a hidden `__edd_i__` attribute, a token set when the item is created and added to existing items on their next guarded write. It never appears in decoded models, only in `asNative` output and raw items. Version-checked writes require it to match, so an item deleted and recreated at the same version is never mistaken for the original.
 
-An update too wide for one DynamoDB expression (4 KB, 300 operators) writes the whole item instead. A versioned entity writes it under its version condition. An unversioned one writes it under the fallback guard soft delete uses (see [Lifecycle](/effect-dynamodb/guides/lifecycle/)). A concurrent write from outside the library to an attribute that guard doesn't cover is lost, which 1.22.0 also did for every such update. A `.condition()` too large to fit beside the guard fails before writing with a `ValidationError` stating its size.
+An update too wide for one DynamoDB expression (4 KB, 300 operators) writes the whole item instead. A versioned entity writes it under its version condition. An unversioned one writes it under the fallback guard soft delete uses (see [Lifecycle](/effect-dynamodb/guides/lifecycle/)). A concurrent write from outside the library to an attribute that guard doesn't cover is lost, which 1.22.0 also did for every such update. A `.condition()` too large to fit beside the guard fails before writing with a `ValidationError` stating its size. Operators are counted as DynamoDB counts them: `BETWEEN` counts once, and in an update expression each `+`, `-` and function counts, but a `SET` clause's `=` doesn't.
 
-Items written before an entity was `versioned` read as version 0, and `expectedVersion(0)` addresses them; their first versioned write produces version 1.
+Items written before an entity was `versioned` read as version 0, and `expectedVersion(0)` addresses them; their first versioned write produces version 1. An item that has the `__edd_i__` token but no version is different: its version was removed outside the library. Reads and the writes that check the version refuse it with a `ValidationError` instead of reading it as version 0, and a query over a partition holding one fails as a whole. Restore the version attribute to read it again.
 
 Known limitations, both inherent:
 
@@ -408,6 +428,7 @@ DynamoDB limits transactions to 100 items. When multiple features are enabled, e
 | Put + 1 unique constraint | 2 |
 | Put + 2 unique constraints + version snapshot | 4 |
 | Update (unique field changed) + version snapshot | 4 |
+| Put over an existing item (unique field changed) + version snapshot | 4 |
 | Soft delete + 2 sentinels + version snapshot | 5 |
 
 Plan your entity design accordingly. For entities with many unique constraints, ensure the total transaction items stay well under 100.
