@@ -19,6 +19,7 @@ import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import type { Entity, EntityDelete, EntityPut, TransactableInfo } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
 import type { AnyGet, BoundWriteOp, GetSuccess } from "./internal/BoundCrud.js"
+import { itemBytes } from "./internal/ItemSize.js"
 import {
   batchRejectReason,
   composePrimaryKey,
@@ -216,32 +217,6 @@ export const get = <const T extends ReadonlyArray<AnyGet>>(
     // array construction can't express this statically.
     return results as unknown as BatchGetResult<T>
   })
-
-const utf8Bytes = (text: string): number => new TextEncoder().encode(text).length
-
-/**
- * An item's size as DynamoDB counts it toward a transaction's 4 MB payload:
- * attribute names plus values, binary as raw bytes. Numbers are counted by
- * their digits and list / map entries carry a few bytes of overhead, so this
- * errs high.
- */
-const attributeBytes = (value: AttributeValue): number => {
-  if (value.S !== undefined) return utf8Bytes(value.S)
-  if (value.N !== undefined) return value.N.length + 1
-  if (value.B !== undefined) return value.B.byteLength
-  if (value.SS !== undefined) return value.SS.reduce((sum, v) => sum + utf8Bytes(v), 0)
-  if (value.NS !== undefined) return value.NS.reduce((sum, v) => sum + v.length + 1, 0)
-  if (value.BS !== undefined) return value.BS.reduce((sum, v) => sum + v.byteLength, 0)
-  if (value.L !== undefined) return value.L.reduce((sum, v) => sum + attributeBytes(v) + 1, 3)
-  if (value.M !== undefined) return itemBytes(value.M) + 3
-  return 1
-}
-
-const itemBytes = (item: Record<string, AttributeValue>): number =>
-  Object.entries(item).reduce(
-    (sum, [name, value]) => sum + utf8Bytes(name) + attributeBytes(value),
-    0,
-  )
 
 // ---------------------------------------------------------------------------
 // Batch.write — auto-chunk at 25, retry unprocessed

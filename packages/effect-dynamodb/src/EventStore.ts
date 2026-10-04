@@ -46,6 +46,7 @@ import {
   buildTransactWriteItems,
   GUARDED_TRANSACTION_ATTEMPTS,
   judgeCancellation,
+  refuseOversizedTransaction,
   refuseRepeatedItems,
   type TransactWriteItem,
   type TransactWriteOp,
@@ -840,28 +841,24 @@ export const makeStream = <
           })
         }
 
-        // One op per item: an additional item that repeats an event, the
-        // contiguity check or the idempotency sentinel is refused before
-        // anything is sent, as additional items repeating each other are (#133).
+        // Checked before anything is sent: one op per item — an additional item
+        // repeating an event, the contiguity check or the idempotency sentinel
+        // is refused, as additional items repeating each other are — and the
+        // whole transaction within DynamoDB's 4 MB (#133).
+        const additionalStart = checkCount + eventCount
         const streamItemSource = (i: number) =>
           i < checkCount
             ? "the version-contiguity check"
-            : i < checkCount + eventCount
+            : i < additionalStart
               ? `the event at version ${expectedVersion + i - checkCount + 1}`
               : "the idempotency sentinel"
-        yield* refuseRepeatedItems(
-          [
-            ...transactItems
-              .flatMap((item, i) =>
-                i < checkCount + eventCount || i === sentinelIndex ? [{ item, i }] : [],
-              )
-              .map(({ item, i }) =>
-                transactItemTarget(item, tableName, ["pk", "sk"], entityType, streamItemSource(i)),
-              ),
-            ...additional.targets,
-          ],
-          "EventStore.append",
+        const targets = transactItems.map((item, i) =>
+          i >= additionalStart && i < additionalStart + additionalItems.length
+            ? additional.targets[i - additionalStart]!
+            : transactItemTarget(item, tableName, ["pk", "sk"], entityType, streamItemSource(i)),
         )
+        yield* refuseRepeatedItems(targets, "EventStore.append")
+        yield* refuseOversizedTransaction(transactItems, targets, "EventStore.append")
 
         const outcome = yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
           Effect.as(undefined),

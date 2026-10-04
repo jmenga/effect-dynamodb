@@ -1042,6 +1042,21 @@ describe("EventStore", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    it.effect("refuses an append whose items exceed DynamoDB's 4 MB, before writing (#133)", () =>
+      Effect.gen(function* () {
+        const big = "x".repeat(380_000)
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: Array.from({ length: 6 }, (_, i) =>
+            Registrations.put({ regId: `r-${i}`, code: `${i}${big}` }),
+          ),
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).entityType).toBe("Registration")
+        expect(String((error as ValidationError).cause)).toContain("4194304 bytes (4 MB)")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("an additional item repeating a stream item is refused by the same check", () =>
       Effect.gen(function* () {
         // No entity key composes to a stream key (names prefix every composite),

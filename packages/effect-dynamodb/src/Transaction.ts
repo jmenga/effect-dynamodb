@@ -36,6 +36,7 @@ import {
   ConditionCheckTypeId,
   GUARDED_TRANSACTION_ATTEMPTS,
   judgeCancellation,
+  refuseOversizedTransaction,
   type TransactWriteOp,
 } from "./internal/TransactWriteOps.js"
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
@@ -258,6 +259,8 @@ export const transactWrite = (
           }),
         )
       }
+
+      yield* refuseOversizedTransaction(transactItems, built.targets, "transactWrite")
 
       const outcome = yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
         Effect.as(undefined),

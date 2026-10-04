@@ -35,6 +35,7 @@ import { toAttributeMap } from "../Marshaller.js"
 import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import type { BoundWriteOp } from "./BoundCrud.js"
 import { compileExpr, type Expr, isExpr, parseShorthand } from "./Expr.js"
+import { TRANSACT_WRITE_MAX_BYTES, transactItemBytes } from "./ItemSize.js"
 import {
   composePrimaryKey,
   rejectUnsupportedOp,
@@ -111,6 +112,42 @@ const conditionFields = (condition: ExpressionResult | undefined) =>
           ? { ExpressionAttributeValues: condition.values }
           : {}),
       }
+
+/**
+ * Refuse a transaction whose items exceed DynamoDB's 4 MB aggregate limit —
+ * BEFORE it is sent, with the entity that contributes most named, rather
+ * than DynamoDB's bare `ValidationException`. Sizes are counted as DynamoDB
+ * counts them ({@link transactItemBytes}); a retain put counts twice — its
+ * item and its snapshot carry the same attributes.
+ */
+export const refuseOversizedTransaction = (
+  items: ReadonlyArray<TransactWriteItem>,
+  targets: ReadonlyArray<TransactItemTarget>,
+  operation: string,
+): Effect.Effect<void, ValidationError> => {
+  let total = 0
+  let largest = { index: 0, bytes: -1 }
+  for (const [index, item] of items.entries()) {
+    const bytes = transactItemBytes(item)
+    total += bytes
+    if (bytes > largest.bytes) largest = { index, bytes }
+  }
+  if (total <= TRANSACT_WRITE_MAX_BYTES) return Effect.void
+  const target = targets[largest.index]
+  return Effect.fail(
+    new ValidationError({
+      entityType: target?.entityType ?? "unknown",
+      operation,
+      cause:
+        `${operation}: the transaction's ${items.length} items total ${total} bytes as DynamoDB ` +
+        `counts them, over its limit of ${TRANSACT_WRITE_MAX_BYTES} bytes (4 MB) for one ` +
+        "transaction. The largest is " +
+        (target === undefined ? "" : `${target.source}'s, at ${target.key}, `) +
+        `${largest.bytes} bytes. A put of a retain entity counts twice: its item and its ` +
+        "version snapshot. Split the operations into smaller transactions. Nothing was written.",
+    }),
+  )
+}
 
 // ---------------------------------------------------------------------------
 // buildTransactWriteItems

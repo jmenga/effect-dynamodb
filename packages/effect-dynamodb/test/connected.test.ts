@@ -16657,6 +16657,28 @@ describeConnected("#133 — path operations on index composites and unique field
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
+  it.effect("a transaction over 4 MB is refused before it is sent", () =>
+    Effect.gen(function* () {
+      // Six 380 KB retain puts: 2.3 MB of items, 4.6 MB with their snapshots.
+      const big = "x".repeat(380_000)
+      const ids = Array.from({ length: 6 }, (_, i) => `big-${i}`)
+      const error = yield* Transaction.transactWrite(
+        ids.map((id) => g133Entities.DevicesRetained.put({ id, owner: "o", label: big } as any)),
+      ).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(error.entityType).toBe("G133DeviceRetained")
+      expect(String(error.cause)).toContain("4194304 bytes (4 MB)")
+      for (const id of ids) expect(yield* rawItem("G133DeviceRetained", id)).toBeUndefined()
+      // The same items fit as two transactions.
+      yield* Transaction.transactWrite(
+        ids
+          .slice(0, 3)
+          .map((id) => g133Entities.DevicesRetained.put({ id, owner: "o", label: big } as any)),
+      )
+      expect((yield* rawItem("G133DeviceRetained", "big-0")).label.S).toHaveLength(380_000)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
   // ---- a deleted retain item's key is reused: its history continues (#133) ----
 
   it.effect("a hard-deleted retain item is created again past its retained history", () =>

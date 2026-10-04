@@ -12,6 +12,8 @@ import { beforeEach, describe, expect, vi } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Expression from "../src/Expression.js"
+import { itemBytes, transactItemBytes } from "../src/internal/ItemSize.js"
+import { refuseOversizedTransaction, transactItemTarget } from "../src/internal/TransactWriteOps.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
@@ -1137,6 +1139,70 @@ describe("Transaction", () => {
         expect(mockTransactWriteItems).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
+  })
+
+  describe("a transaction over DynamoDB's 4 MB is refused before writing (#133)", () => {
+    const big = "x".repeat(380_000)
+    const user = (i: number) =>
+      ({ userId: `u-${i}`, email: `u${i}@x.io`, name: big, role: "member" }) as const
+    const member = (i: number) => ({ memberId: `m-${i}`, email: `m${i}@x.io`, label: big })
+
+    it.effect("items totalling more than 4 MB are refused, naming the largest", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite(
+          Array.from({ length: 12 }, (_, i) => UserEntity.put(user(i))),
+        ).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.entityType).toBe("User")
+        expect(String(failure.cause)).toContain("over its limit of 4194304 bytes (4 MB)")
+        expect(String(failure.cause)).toMatch(/The largest is operation \d+ \(User\)'s/)
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a retain put counts twice: its item and its snapshot", () =>
+      Effect.gen(function* () {
+        // Six 380 KB items: 2.3 MB as plain puts — written…
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        yield* Transaction.transactWrite(
+          Array.from({ length: 6 }, (_, i) => UserEntity.put(user(i))),
+        )
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        // …but 4.6 MB as retain puts, each snapshotted in the same transaction.
+        const error = yield* Transaction.transactWrite(
+          Array.from({ length: 6 }, (_, i) => LifecycleMembers.put(member(i))),
+        ).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).entityType).toBe("LifecycleMember")
+        expect(String((error as ValidationError).cause)).toContain("counts twice")
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("the limit is exactly 4 MB as DynamoDB counts it", () =>
+      Effect.gen(function* () {
+        // An item of one attribute `a`: 1 byte of name plus its value.
+        const put = (bytes: number) => ({
+          Put: { TableName: "t", Item: { a: { S: "x".repeat(bytes - 1) } } },
+        })
+        const target = transactItemTarget(put(2), "t", ["a"], "Doc", "operation 0 (Doc)")
+        yield* refuseOversizedTransaction([put(4 * 1024 * 1024)], [target], "transactWrite")
+        const over = yield* refuseOversizedTransaction(
+          [put(4 * 1024 * 1024 + 1)],
+          [target],
+          "transactWrite",
+        ).pipe(Effect.flip)
+        expect(over._tag).toBe("ValidationError")
+        expect(String(over.cause)).toContain("total 4194305 bytes")
+      }),
+    )
+
+    it("item sizes count attribute names, UTF-8 strings and raw binary", () => {
+      expect(itemBytes({ ab: { S: "é" } })).toBe(4)
+      expect(itemBytes({ b: { B: new Uint8Array(10) } })).toBe(11)
+      expect(transactItemBytes({ Delete: { TableName: "t", Key: { pk: { S: "abc" } } } })).toBe(5)
+    })
   })
 
   describe("unsupported ops are rejected, not silently reinterpreted (#100)", () => {
