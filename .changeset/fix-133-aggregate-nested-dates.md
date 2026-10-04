@@ -67,6 +67,25 @@ real `DateTime`s.
   on no version existing, adds the incarnation token and writes version 1, and
   their retain snapshot is `v#0000000`. A race on that first write is an
   `OptimisticLockError`. Soft delete and restore work on them.
+- **Items whose version was removed are refused.** An item of a versioned
+  entity that has the incarnation token (`__edd_i__`) but no version, because
+  its version was removed outside the library, fails with a `ValidationError`
+  on reads and on the writes that read or check the version, instead of
+  reading as version 0. A query over a partition that holds one such item fails
+  as a whole. Restore the version attribute to read it again. Items with
+  neither (written before the entity was versioned) still read as version 0.
+- **A `put` over an existing item of a versioned or unique-constrained entity
+  now reads it first and continues it** instead of resetting it to version 1.
+  Its error channel gains `OptimisticLockError` and `ConcurrentModification`
+  for a race. **Re-creating a deleted retain item whose version history still
+  exists is refused with a `ValidationError`**, so `purge` it first. Details
+  under "Puts, upserts and batches".
+- **`Batch.write` sends puts of a `versioned` entity as transactions.** They go
+  first, as create-only `TransactWriteItems` of up to 100 items, and each
+  chunk costs twice the write capacity of a batch write. A put that would
+  replace an existing item fails with a `ValidationError` and writes nothing
+  from its chunk. Earlier chunks may already have been written, because
+  `Batch.write` was never atomic across chunks.
 - **More updates are refused with a `ValidationError`**: a `.set()` that changes
   a primary-key composite (silently ignored before), a `.set()` that changes an
   immutable field (restating its current value is fine), and the path
@@ -76,10 +95,12 @@ real `DateTime`s.
   `undefined` and `"updatedOld"` / `"updatedNew"` return a partial of the
   attributes written, on every update path. A retain update with `"allOld"`
   now returns the replaced item rather than the new one.
-- **Versioned entities get a hidden attribute.** `__edd_i__` is set on create
-  and added to existing items on their next guarded write. Decoded models never
-  include it, but raw readers, `asNative` and DynamoDB Streams consumers will
-  see it.
+- **Two new hidden attributes.** Versioned entities get `__edd_i__`, set on
+  create and added to existing items on their next guarded write. An item whose
+  unique field holds only a decoding default that is also an index composite
+  gets `__edd_d__`, a string set naming those fields. Decoded models never
+  include either, but raw readers, `asNative` and DynamoDB Streams consumers
+  will see them.
 - **Writes are validated more strictly**, so some calls that used to succeed
   now fail with a `ValidationError`. Container `.check()` refinements on an
   array, a struct or a checked-struct class that holds a date or another
@@ -306,12 +327,31 @@ condition (versioned) or the same fallback guard (unversioned). A concurrent
 write from outside the library to an attribute the guard doesn't cover is lost,
 which is also what 1.22.0 did for every such update. A `.condition()` too large
 to fit beside the guard fails before writing with a `ValidationError` stating
-its size.
+its size. Operators are counted as DynamoDB counts them: in a condition, each
+comparison, `AND` / `OR` / `NOT`, `IN` and each function, with `BETWEEN`
+counted once (its own `AND` is part of it); in an update expression, each `+`,
+`-` and function, but not a `SET` clause's `=`.
 
 **Incarnation token.** Versioned entities carry a hidden `__edd_i__` attribute,
 set on create and backfilled on the next guarded write. It is never in decoded
 models (only in `asNative`). Version-checked writes require it, so an item
 deleted and recreated at the same version is never mistaken for the original.
+An item that has the token but no version had its version removed outside the
+library. It is refused with a `ValidationError` rather than read as version 0,
+which would let the next update rewrite its history: by every read (`get`,
+queries, the `deleted` views, `decodeMarshalledItem`), and by every update,
+soft delete, unique-constraint hard delete, `restore`, versioned `put` and
+unique-constraint `upsert`. A query over a partition holding one fails as a
+whole.
+
+**Version history is never overwritten.** An update, soft delete, restore or
+replacing `put` that would write a `v#N` snapshot holding a different state
+from the row already there fails with a `ValidationError` and writes nothing.
+Rewriting the same state (the same version, incarnation and, with timestamps,
+`updatedAt`) is allowed, which is what the first update after a retain `put`,
+and a restore, do. A write from outside the library that changes an item
+without bumping its version can still be captured into the next `v#N`
+snapshot.
 
 **Retain return values.** A retain update returns exactly the item it wrote,
 even if another writer has replaced it since. If that can't be proven, it fails
@@ -341,9 +381,17 @@ first (a unique-field change and the like). `patch()` is unchanged.
 **Decoding defaults.** Fields with `Schema.withDecodingDefault` now survive on
 read: a `put` that omitted one used to write the item and then fail with a
 `ValidationError`. A defaulted `DateTimeUtc` is stored as an ISO string. A
-defaulted key composite (primary, index or unique field) that a write omits is
-stored with its default, and keys are composed from it. Other defaulted fields
-are still not stored, and the default is applied on read.
+defaulted primary-key or index composite that a write omits is stored with its
+default, and keys are composed from it. Other defaulted fields are still not
+stored, and the default is applied on read.
+
+A default never creates a unique-constraint sentinel. A defaulted unique field
+that is also an index composite is stored and indexed, and is listed in a hidden
+string-set attribute, `__edd_d__`, which never appears in decoded models. It
+gets its sentinel only when a write supplies its value. A `.remove()` of a
+defaulted index composite stores the default again and keeps the item indexed
+under it; on a unique field it releases the old value's sentinel and creates
+none for the default.
 
 **`.set()` refusals.** A `.set()` of a changed primary-key composite is refused;
 it was silently ignored before. An immutable field can be restated with its
@@ -359,6 +407,47 @@ current value, so spread records work; a different value is refused.
 - A plain `.expectedVersion(n)` can't detect a delete-and-recreate that has
   climbed back to version `n`: versions restart at 1, so it takes `n − 1`
   updates after the recreate.
+
+### Puts, upserts and batches
+
+**Replacing puts.** A `put` of a versioned or unique-constrained entity reads
+the item first. Over an existing item it continues that item: it takes the
+next version, keeps the same incarnation and `createdAt` (unless the input
+supplies one), writes a retain snapshot of the item it replaces, and rotates
+the unique sentinels of changed values. It never resets the item to version 1
+or orphans a sentinel. The write is guarded by what it read, so a race fails
+with `OptimisticLockError` (versioned) or `ConcurrentModification`
+(unversioned) and writes nothing. A soft-deleted item counts as missing.
+Re-creating a deleted retain item whose version history still exists is
+refused with a `ValidationError`, because its `v#0000001` snapshot belongs to
+the earlier item; `purge` it first. `create` is unchanged: it still fails with
+`ConditionalCheckFailed` on an existing item.
+
+**`upsert` with unique constraints.** One `UpdateItem` can't write, rotate or
+check a sentinel, so `upsert` of an entity with unique constraints reads the
+item first. A missing item is created with its sentinels. An existing item is
+updated: sentinels rotate for changed unique values and are left alone for
+unchanged ones, under the update's version and incarnation guards (versioned)
+or attribute guards (unversioned). A race fails with `OptimisticLockError` or
+`ConcurrentModification`, and a value another item holds with
+`UniqueConstraintViolation`. Entities without unique constraints are unchanged.
+
+**Transactions.** In `Transaction.transactWrite`, a `put` of a versioned or
+unique-constrained entity may only create the item, because replacing one
+needs the stored item. A put that would replace an existing item is refused
+with a `ValidationError`, and the transaction writes nothing. So is one whose
+retain `v#0000001` snapshot already exists from a deleted earlier item.
+
+**`Batch.write` of a `versioned` entity.** Its puts are sent first, as
+create-only `TransactWriteItems` of up to 100 items, each conditioned on
+`attribute_not_exists`. There is no read, so there is no race window. A put
+that would replace an existing item cancels its whole chunk, so nothing in that
+chunk is written, and fails with a `ValidationError`. Earlier chunks may
+already have been written, since `Batch.write` was never atomic across chunks,
+and the batch's other requests aren't sent. Each chunk costs twice the write
+capacity of a batch write. Contention cancellations (`TransactionConflict`,
+throttling) are retried with the batch's backoff settings. Puts of other
+entities, and deletes, are still plain `BatchWriteItem` requests.
 
 ### Nested sub-aggregates
 
