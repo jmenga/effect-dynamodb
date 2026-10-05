@@ -7,7 +7,8 @@ import {
   DynamoError,
   type RefNotFound,
 } from "@effect-dynamodb/schema/Errors.js"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Fiber, Layer, Schema } from "effect"
+import { TestClock } from "effect/testing"
 import { beforeEach, vi } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Entity from "../src/Entity.js"
@@ -1601,6 +1602,57 @@ describe("Aggregate write path", () => {
         const call = mockBatchWrite.mock.calls[0]![0]
         expect(call.RequestItems["test-table"]).toHaveLength(1)
         expect(call.RequestItems["test-table"][0].DeleteRequest).toBeDefined()
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    const articleRow = toAttributeMap({
+      pk: "$myapp#v1#article#a-1",
+      sk: "$myapp#v1#articleitem",
+      lsi1sk: "$myapp#v1#article",
+      __edd_e__: "ArticleItem",
+      articleId: "a-1",
+      title: "Test",
+      author: "Alice",
+      tags: [],
+    })
+    const stillUnprocessed = {
+      UnprocessedItems: {
+        "test-table": [{ DeleteRequest: { Key: { pk: articleRow.pk, sk: articleRow.sk } } }],
+      },
+    }
+
+    it.effect("retries unprocessed deletes with backoff until they are written (#134)", () =>
+      Effect.gen(function* () {
+        mockWriteQuery.mockResolvedValueOnce({ Items: [articleRow] })
+        mockBatchWrite
+          .mockResolvedValueOnce(stillUnprocessed)
+          .mockResolvedValueOnce(stillUnprocessed)
+          .mockResolvedValueOnce({})
+        const fiber = yield* SimpleAggregate.delete({ articleId: "a-1" }).pipe(Effect.forkChild)
+        yield* TestClock.adjust("10 seconds")
+        yield* Fiber.join(fiber)
+        expect(mockBatchWrite).toHaveBeenCalledTimes(3)
+        expect(mockBatchWrite.mock.calls[2]![0].RequestItems["test-table"]).toEqual(
+          stillUnprocessed.UnprocessedItems["test-table"],
+        )
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("fails clearly when deletes stay unprocessed (#134)", () =>
+      Effect.gen(function* () {
+        mockWriteQuery.mockResolvedValueOnce({ Items: [articleRow] })
+        mockBatchWrite.mockResolvedValue(stillUnprocessed)
+        const fiber = yield* SimpleAggregate.delete({ articleId: "a-1" }).pipe(
+          Effect.flip,
+          Effect.forkChild,
+        )
+        yield* TestClock.adjust("60 seconds")
+        const error = yield* Fiber.join(fiber)
+        expect(error._tag).toBe("DynamoError")
+        expect(String((error as { readonly cause?: unknown }).cause)).toContain("unprocessed")
+        // The first attempt and a bounded number of retries.
+        expect(mockBatchWrite.mock.calls.length).toBeGreaterThan(1)
+        expect(mockBatchWrite).toHaveBeenCalledTimes(6)
       }).pipe(Effect.provide(WriteLayer)),
     )
 

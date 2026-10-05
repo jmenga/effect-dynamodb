@@ -21,6 +21,7 @@ import {
   AggregateDecompositionError,
   AggregateTransactionOverflow,
   ConditionalCheckFailed,
+  DynamoError,
   type ItemNotFound,
   RefNotFound,
   TransactionCancelled,
@@ -277,7 +278,7 @@ export interface ListResult<T> {
 // ---------------------------------------------------------------------------
 
 /** Error union for aggregate write operations */
-type AggregateWriteError =
+export type AggregateWriteError =
   | AggregateAssemblyError
   | AggregateDecompositionError
   | AggregateTransactionOverflow
@@ -291,7 +292,7 @@ type AggregateWriteError =
  * `create`'s errors: a write's, plus `ConditionalCheckFailed` when the
  * aggregate's root item already exists (#134).
  */
-type AggregateCreateError = AggregateWriteError | ConditionalCheckFailed
+export type AggregateCreateError = AggregateWriteError | ConditionalCheckFailed
 
 /**
  * An operational aggregate — returned by `Aggregate.make` with full config.
@@ -3331,14 +3332,37 @@ const deleteAllItems = (
       },
     }))
 
-    // Chunk into batches of 25 (DynamoDB batchWriteItem limit)
+    // Chunk into batches of 25 (DynamoDB batchWriteItem limit). Items DynamoDB
+    // leaves unprocessed (throttling) are retried with exponential backoff, as
+    // `Batch.write` retries them; a bounded number of retries, then a clear
+    // failure — never a silent partial delete (#134).
     for (let i = 0; i < deleteRequests.length; i += 25) {
-      const chunk = deleteRequests.slice(i, i + 25)
-      yield* client.batchWriteItem({
-        RequestItems: { [tableName]: chunk },
-      })
+      let pending: ReadonlyArray<unknown> = deleteRequests.slice(i, i + 25)
+      let retries = 0
+      while (pending.length > 0) {
+        const response = yield* client.batchWriteItem({
+          RequestItems: { [tableName]: pending as Array<never> },
+        })
+        pending = (response.UnprocessedItems?.[tableName] ?? []) as ReadonlyArray<unknown>
+        if (pending.length === 0) break
+        retries++
+        if (retries > DELETE_MAX_RETRIES) {
+          return yield* new DynamoError({
+            operation: "BatchWriteItem",
+            cause: new Error(
+              `Aggregate delete: ${pending.length} unprocessed item(s) remain after ` +
+                `${DELETE_MAX_RETRIES} retries; the partition is partly deleted.`,
+            ),
+          })
+        }
+        yield* Effect.sleep(`${DELETE_BASE_DELAY_MS * 2 ** (retries - 1)} millis`)
+      }
     }
   })
+
+/** `Batch.write`'s bound and backoff, for `deleteAllItems`' unprocessed items. */
+const DELETE_MAX_RETRIES = 5
+const DELETE_BASE_DELAY_MS = 100
 
 // ---------------------------------------------------------------------------
 // Internal: list filter compilation

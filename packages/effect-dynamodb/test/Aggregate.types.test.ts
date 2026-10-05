@@ -18,6 +18,7 @@ import { Schema } from "effect"
 import { describe, expectTypeOf, it } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Entity from "../src/Entity.js"
+import type { AggregateCreateError, AggregateWriteError } from "../src/index.js"
 import * as Table from "../src/Table.js"
 
 // ---------------------------------------------------------------------------
@@ -288,5 +289,19 @@ describe("Aggregate derived schemas preserve branded identifier types (#61)", ()
     expectTypeOf<Team1["teamId"]>().toEqualTypeOf<TeamId>()
     expectTypeOf<Team1["coachId"]>().toEqualTypeOf<CoachId>()
     expectTypeOf<Team1["players"][number]["playerId"]>().toEqualTypeOf<PlayerId>()
+  })
+})
+
+describe("aggregate write error unions are exported (#134)", () => {
+  it("names create's and update's error unions from the package entry point", () => {
+    expectTypeOf<
+      Extract<AggregateCreateError, { readonly _tag: "ConditionalCheckFailed" }>
+    >().not.toBeNever()
+    expectTypeOf<
+      Extract<AggregateWriteError, { readonly _tag: "ConditionalCheckFailed" }>
+    >().toBeNever()
+    expectTypeOf<
+      Extract<AggregateWriteError, { readonly _tag: "TransactionCancelled" }>
+    >().not.toBeNever()
   })
 })
