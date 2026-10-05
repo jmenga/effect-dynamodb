@@ -1715,7 +1715,7 @@ Query.filter({ email: { contains: "@company.com" } })
 Query.limit(10)    // at most 10 ITEMS (accumulates across requests)
 Query.pageSize(10) // 10 rows examined per REQUEST (DynamoDB `Limit`)
 Query.reverse      // scanForward = false
-Query.consistentRead // the table or an LSI; refused on a GSI (#133)
+Query.consistentRead // the table; refused on a GSI (#133) — entity indexes are always GSIs
 
 // 6. Execute — terminal, crosses into Effect
 Query.execute    // Query<A> => Effect<A, DynamoError, DynamoClient>
@@ -1812,8 +1812,23 @@ left out when compiled. Anywhere else — under `or` (which it would make match
 everything) or `not` (nothing), or an `or()` with no parts (nothing) — it has
 no reading that keeps what the caller wrote, so `emptyPartProblem` refuses it
 with a `ValidationError` before anything is sent: in `EntityPut` / `Update` /
-`Delete` when they run, per op in `transactWrite`, in `append`, and for filters
-when a query runs.
+`Delete` when they run, per op in `transactWrite`, in `append`, for filters
+when a query runs, and for aggregate `list` filters. An `isIn` with no values
+(`IN ()`, which DynamoDB rejects) is refused the same way, and a
+`Transaction.check()` with an empty condition is refused before sending.
+`compileExpr` itself throws on anything `emptyPartProblem` refuses, so no
+caller can compile one by skipping the check — reaching it is a library bug.
+
+**`patch` and missing items (#134).** `patch()` of a missing item fails with
+`ConditionalCheckFailed` on every path — including those that read first
+(retain, a unique-field change), which used to report `ItemNotFound`. A plain
+(unread) patch sends one exists clause: the plain write's own
+`attribute_exists(#exists)` already covers patch's guard.
+
+**`expectedVersion` needs a version (#134).** On an entity without
+`versioned`, `.expectedVersion(n)` is refused with a `ValidationError` before
+anything is read or sent — a silently skipped concurrency check is worse than
+none.
 
 **Yieldable, not Effect.** The *write* builders implement `Pipeable.Pipeable` and `[Symbol.iterator]` (via `Utils.SingleShotGen`) — the same contract as the unbound `EntityOp` and `EntityDelete` intermediates. You execute them by `yield*`ing inside `Effect.gen`. For interop with Effect combinators (`Effect.map`, `Effect.flip`, etc.) use `.asEffect()`.
 
@@ -3227,7 +3242,7 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `DynamoError` | AWS SDK error wrapper |
 | `ItemNotFound` | No item: `get`, `update` of a missing item (unless a plain `.set()` of a complete item, which is created), `restore` without a tombstone |
 | `ConditionalCheckFailed` | A user `.condition()` failed, or an op's own guard did: `create()` of an existing item (or aggregate), `patch()` or `deleteIfExists()` of a missing item |
-| `ValidationError` | Schema decode/encode failure, or a refused operation: an item with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, a condition or filter with an empty part under `or` / `not` (or an `or()` with no parts), `consistentRead` on a GSI |
+| `ValidationError` | Schema decode/encode failure, or a refused operation: an item with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, a condition or filter with an empty part under `or` / `not` (or an `or()` with no parts, or an `isIn` with no values), `consistentRead` on a GSI, `expectedVersion` on an unversioned entity |
 | `TransactionCancelled` | Transaction failed with cancellation reasons |
 | `UniqueConstraintViolation` | Sentinel item already exists for unique field (from the entity's write, `transactWrite`, or an `append`'s `additionalItems`) |
 | `OptimisticLockError` | A versioned write lost a version race (`expectedVersion` mismatch, a concurrent write between a read-then-write update's read and write, or a guarded put / upsert / transaction put that lost the race on every attempt); carries the real `actualVersion` |

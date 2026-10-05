@@ -327,9 +327,9 @@ These functions transform entity operations via pipe:
 | Export | Works On | Description |
 |--------|----------|-------------|
 | `set(updates)` | `EntityUpdate` | Set fields to new values (dual API) |
-| `expectedVersion(n)` | `EntityUpdate` | Optimistic lock — fail if version doesn't match |
+| `expectedVersion(n)` | `EntityUpdate` | Optimistic lock — fail if version doesn't match. Requires a `versioned` entity: on any other it fails with a `ValidationError` before anything is sent |
 | `consistentRead` | `EntityGet` | Enable strongly consistent reads |
-| `condition(input)` | `EntityPut`, `EntityUpdate`, `EntityDelete` | Add a `ConditionExpression`. A later one replaces an earlier one. It is ANDed with the op's own guard (`create`'s not-exists, `patch`'s and `deleteIfExists`'s exists), never in its place. An empty condition (`{}`, `and()`) is no condition. An empty part under `or()` or `not()`, or an `or()` with no parts, fails with a `ValidationError` before anything is sent |
+| `condition(input)` | `EntityPut`, `EntityUpdate`, `EntityDelete` | Add a `ConditionExpression`. A later one replaces an earlier one. It is ANDed with the op's own guard (`create`'s not-exists, `patch`'s and `deleteIfExists`'s exists), never in its place. An empty condition (`{}`, `and()`) is no condition. An empty part under `or()` or `not()`, an `or()` with no parts, or an `isIn` with no values, fails with a `ValidationError` before anything is sent |
 | `remove(fields)` | `EntityUpdate` | REMOVE attributes from the item |
 | `add(values)` | `EntityUpdate` | Atomically ADD to numeric attributes |
 | `subtract(values)` | `EntityUpdate` | Subtract from numeric attributes (SET `#f = #f - :v`) |
@@ -446,7 +446,7 @@ import { Query } from "effect-dynamodb"
 | `pageSize(n)` | Dual | Fetch in batches of `n` rows — sets DynamoDB's `Limit` (a contract on round trips) |
 | `maxPages(n)` | Dual | Limit total number of pages fetched |
 | `reverse` | Combinator | Reverse sort order (descending) |
-| `consistentRead` | Combinator | Enable strongly consistent reads (the table or an LSI; on a GSI the query fails with a `ValidationError` before sending) |
+| `consistentRead` | Combinator | Enable strongly consistent reads (the table; on a GSI the query fails with a `ValidationError` before sending — an entity's indexes are always treated as GSIs, so one pointed at an LSI of a table created outside the library is refused too) |
 | `ignoreOwnership` | Combinator | Skip `__edd_e__` entity type filter — for mixed-table scenarios |
 | `startFrom(cursor)` | Dual | Resume pagination from a previous cursor |
 | `select(attrs)` | Dual | Project specific attributes (returns `Query<Record<string, unknown>>`) |
@@ -524,7 +524,7 @@ Combinators are immutable — each call returns a new `BoundQuery`. Terminals ex
 | Method | Description |
 |--------|-------------|
 | `.where((t, ops) => …)` | Type-safe sort key condition on remaining SK composites. Only available when SK composites have not all been consumed. Consumes `SkRemaining` (cannot be called twice). Operators: `eq`, `lt`, `lte`, `gt`, `gte`, `between`, `beginsWith`. |
-| `.filter((t, ops) => …)` | Post-read filter expression via callback. Type-safe attribute paths via `t`, condition operators via `ops`. An empty filter (`and()`) is no filter. An empty part under `or()` or `not()`, or an `or()` with no parts, fails with a `ValidationError` before sending. |
+| `.filter((t, ops) => …)` | Post-read filter expression via callback. Type-safe attribute paths via `t`, condition operators via `ops`. An empty filter (`and()`) is no filter. An empty part under `or()` or `not()`, an `or()` with no parts, or an `isIn` with no values, fails with a `ValidationError` before sending. |
 | `.filter(shorthand)` | Post-read filter via an equality shorthand object: `{ status: "active" }` ANDs `status = "active"` for each key. For other comparisons use the callback form. |
 | `.select((t) => […paths])` | Projection expression via callback. Returns `BoundQuery<…, Record<string, unknown>>`. |
 | `.select(["field", …])` | Projection via attribute name array. |
@@ -533,7 +533,7 @@ Combinators are immutable — each call returns a new `BoundQuery`. Terminals ex
 | `.maxPages(n)` | Maximum number of DynamoDB pages to fetch. |
 | `.reverse()` | Reverse sort order (`ScanIndexForward = false`). |
 | `.startFrom(cursor)` | Resume pagination from an opaque cursor returned by `.fetch()`. |
-| `.consistentRead()` | Enable strongly consistent reads. On a GSI, which DynamoDB reads only eventually consistently, the query fails with a `ValidationError` before sending. |
+| `.consistentRead()` | Enable strongly consistent reads. On a GSI, which DynamoDB reads only eventually consistently, the query fails with a `ValidationError` before sending. An entity's indexes are always treated as GSIs (`db.tables.*.create()` creates them as GSIs). |
 | `.ignoreOwnership()` | Skip the `__edd_e__` entity-type filter. Use only when querying a polymorphic GSI shared across entity types and you want every item back. |
 
 ### Terminals
@@ -1072,7 +1072,7 @@ const MatchAggregate = Aggregate.make(Match, {
 | `aggregate.create(input)` | `Effect<Domain, AggregateWriteError \| ConditionalCheckFailed>` | Create from input (ref IDs hydrated, sub-aggregate transactions). Fails with `ConditionalCheckFailed`, writing nothing, when the aggregate's root item already exists |
 | `aggregate.update(key, fn)` | `Effect<Domain, AggregateWriteError>` | Fetch → mutate → diff → write changed groups. `fn` receives `UpdateContext` with `{ state, cursor, optic, current }` |
 | `aggregate.delete(key)` | `Effect<void, AggregateAssemblyError \| DynamoError>` | Remove all items in the partition |
-| `aggregate.list(key, options?)` | `Effect<ListResult<Domain>, AggregateAssemblyError \| DynamoError \| ValidationError>` | Page aggregates off the list index. `options`: `limit` (at most _n_ aggregates), `pageSize` (rows examined per request), `filter` (server-side `FilterExpression`, callback or shorthand), `reverse`, `cursor`. Returns `{ data, cursor }`; `cursor` is `null` only when exhausted, and is always `null` on a sharded (`cardinality`) list, which rejects a passed cursor with `EDD-9051` |
+| `aggregate.list(key, options?)` | `Effect<ListResult<Domain>, AggregateAssemblyError \| DynamoError \| ValidationError>` | Page aggregates off the list index. `options`: `limit` (at most _n_ aggregates), `pageSize` (rows examined per request), `filter` (server-side `FilterExpression`, callback or shorthand; an empty part under `or()` / `not()`, an `or()` with no parts or an `isIn` with no values fails with a `ValidationError` before sending), `reverse`, `cursor`. Returns `{ data, cursor }`; `cursor` is `null` only when exhausted, and is always `null` on a sharded (`cardinality`) list, which rejects a passed cursor with `EDD-9051` |
 
 ### Edge Types
 
@@ -1254,7 +1254,7 @@ import {
 | `ResourceNotFoundError` | `"ResourceNotFoundError"` | Table or index does not exist |
 | `ItemNotFound` | `"ItemNotFound"` | No item under the key: `get`, an `update` of a missing item (unless it is a plain `.set()` of a complete item), `restore` with no soft-deleted item or after a concurrent restore won |
 | `ConditionalCheckFailed` | `"ConditionalCheckFailed"` | A `.condition()` was not met (put, update, delete, create), or an op's own guard was: `create()` of an existing item or aggregate, `patch()` or `deleteIfExists()` of a missing item, whatever `.condition()` was added. A lost version race is an `OptimisticLockError` instead |
-| `ValidationError` | `"ValidationError"` | Schema decode/encode failed, or the operation was refused: an item of a versioned entity with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, a transaction that touches one item twice or passes 4 MB, a condition or filter with an empty part under `or()` / `not()` (or an `or()` with no parts), or `.consistentRead()` on a GSI |
+| `ValidationError` | `"ValidationError"` | Schema decode/encode failed, or the operation was refused: an item of a versioned entity with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, a transaction that touches one item twice or passes 4 MB, a condition or filter with an empty part under `or()` / `not()` (or an `or()` with no parts, or an `isIn` with no values), `.consistentRead()` on a GSI, or `.expectedVersion()` on an entity that isn't `versioned` |
 | `DeleteAppliedButUnreadable` | `"DeleteAppliedButUnreadable"` | A delete with `returnValues("allOld")` was applied, but the item it removed (`item`, as stored) could not be decoded. Don't retry it |
 | `TransactionCancelled` | `"TransactionCancelled"` | Transaction rejected (includes cancellation `reasons`) |
 | `TransactionOverflow` | `"TransactionOverflow"` | A write's own transaction (the item, its sentinels and snapshot) would exceed DynamoDB's 100-item limit |

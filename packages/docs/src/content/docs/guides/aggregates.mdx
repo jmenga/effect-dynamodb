@@ -665,7 +665,7 @@ The first argument selects the partition (and, with contiguous SK composites, a 
 |--------|---------|
 | `limit` | At most _n_ **aggregates**. Accumulates across as many requests as it takes — not DynamoDB's `Limit`, which bounds rows examined |
 | `pageSize` | DynamoDB's `Limit` — rows examined per request. A contract on round trips, not on what comes back |
-| `filter` | `FilterExpression` on the root-item query. Same callback and shorthand forms as `BoundQuery.filter()` |
+| `filter` | `FilterExpression` on the root-item query. Same callback and shorthand forms as `BoundQuery.filter()`, and the same empty-part rules: an empty filter is none, and an empty part under `or()` / `not()`, an `or()` with no parts or an `isIn` with no values fails with a `ValidationError` before sending |
 | `reverse` | Walk the list index descending |
 | `cursor` | Resume after the last aggregate the previous call returned |
 

@@ -388,7 +388,7 @@ const consistentTask = yield* TaskEntity.get({ taskId: "t-001" }).pipe(Entity.co
 const consistentScan = yield* tasks.scan().consistentRead().collect()
 ```
 
-Consistent reads cost 2x the read capacity of eventually-consistent reads. Use them when you need read-after-write consistency (e.g., immediately after a put or update). **GSIs cannot serve consistent reads** — `consistentRead()` is only valid against the primary table or a local secondary index. On an entity's GSI accessor or a collection over a GSI, the query fails with a `ValidationError` before anything is sent.
+Consistent reads cost 2x the read capacity of eventually-consistent reads. Use them when you need read-after-write consistency (e.g., immediately after a put or update). **GSIs cannot serve consistent reads** — `consistentRead()` is only valid against the primary table or a local secondary index. On an entity's GSI accessor or a collection over a GSI, the query fails with a `ValidationError` before anything is sent. An entity's indexes are always treated as GSIs (`db.tables.*.create()` creates them as GSIs), so an entity index pointed at an LSI of a table you created yourself is refused too.
 
 ## Ordering
 

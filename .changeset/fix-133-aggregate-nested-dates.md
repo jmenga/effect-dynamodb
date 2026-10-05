@@ -71,8 +71,8 @@ real `DateTime`s.
   deletes".
 - **`update()` of a missing item no longer writes a partial row.** It fails
   with `ItemNotFound` and writes nothing, unless it is a plain `.set()` of a
-  complete item, which the library creates through `create`. `patch()` is
-  unchanged.
+  complete item, which the library creates through `create`. `patch()` still
+  fails with `ConditionalCheckFailed` (see below).
 - **Good news if you enabled `versioned` on an existing table.** Items written
   before the entity was versioned read as version 0 on every path, and
   `expectedVersion(0)` addresses them. Their first versioned write conditions
@@ -148,10 +148,11 @@ real `DateTime`s.
   built the placeholder `#proj_first-name`, which DynamoDB rejects; a name
   that isn't letters, digits and underscores now gets a numbered placeholder.
 - **Collection queries keep their grouping through every combinator.**
-  `db.collections.x(...).filter(...).collect()` returned a flat list (it lost
-  the grouping by member); it is grouped like `collect()`, and so is
-  `.fetch()`'s page (it returned internal wrappers, though typed as grouped).
-  `.paginate()` streams each item tagged with its member
+  `db.collections.x(...).filter(...).collect()` returned a flat list of
+  internal `{ _memberKey, _decoded }` wrappers (it lost the grouping by
+  member); it is grouped like `collect()`, and so is `.fetch()`'s page (it
+  returned the same wrappers, though typed as grouped). `.paginate()`, which
+  streamed the wrappers too, streams each item tagged with its member
   (`{ member, item }`, typed `CollectionStreamItem`), and `CollectionQuery`
   now declares `.select()` (partial records grouped per member), `.count()`,
   `.paginate()`, `.maxPages()`, `.consistentRead()` and `.ignoreOwnership()`;
@@ -166,32 +167,50 @@ real `DateTime`s.
   parentheses (`#eddE IN (:et0) AND a OR b`), so another entity's rows in the
   same partition matched `b` — returned by `collect` (or failing to decode),
   counted, selected. The filter is now parenthesised.
-- **A `.condition()` can no longer remove an op's own guard.** `create`'s
-  not-exists check and `patch`'s and `deleteIfExists`'s exists check were
-  held as the op's condition, so a `.condition()` replaced them:
-  `create(item).condition(c)` overwrote an existing item whenever `c` held
-  (with `.condition({})`, always), and `Batch.write` accepted such a create
-  or `deleteIfExists` as a blind put or delete. They are now the op's own
-  guards, ANDed with the caller's condition — bound, unbound, in a
-  transaction and in `EventStore` additional items — and `Batch.write`
-  refuses them whatever condition is added. As on every op, a later
-  `.condition()` replaces an earlier one; the guard stays.
-  `patch(missing).condition({})` on an unversioned entity now fails with
-  `ConditionalCheckFailed`, not `OptimisticLockError`.
-- **Empty conditions and filters.** `.condition({})` (or `and()`) compiled
-  to `()`, which DynamoDB rejects — alone, or beside the library's guard as
-  `… AND ()`. A condition that asserts nothing is now no condition — the op's
-  own guard alone — on put, create, upsert, update, patch, delete,
-  `deleteIfExists`, append and transaction ops, and `.filter({})` is no
-  filter. An empty part directly under `and()` is left out. Anywhere else it
-  is refused with a `ValidationError` before anything is sent: under `or()`
-  it would match everything (`or(x, {})`), under `not()` nothing, and an
-  `or()` with no parts matches nothing.
+- **A `.condition()` no longer replaces an op's own guard.** On 1.22.0
+  `create`'s not-exists check and `patch`'s and `deleteIfExists`'s exists
+  check were held as the op's condition, so a `.condition()` replaced them:
+  `create(item).condition(c)` overwrote an existing item whenever `c` held on
+  it (`exists(n)`, say); `patch(key).condition(c)` with a `c` that holds on a
+  missing item (`notExists(n)`) wrote a partial item and then failed to decode
+  it; and `deleteIfExists(key).condition(c)` of a missing item succeeded,
+  deleting nothing, whenever `c` held. They are now the op's own guards, ANDed
+  with the caller's condition — bound, unbound, in a transaction and in
+  `EventStore` additional items — so each of these fails with
+  `ConditionalCheckFailed` (`TransactionCancelled` in a transaction) and writes
+  nothing. As on every op, a later `.condition()` replaces an earlier one; the
+  guard stays. `patch()` of a missing item now fails with
+  `ConditionalCheckFailed` on every entity: one whose update reads first,
+  such as a retain entity, failed with `ItemNotFound`.
+- **Empty conditions and filters.** On 1.22.0 `.condition({})` (or `and()`)
+  sent an empty `ConditionExpression`, or `()` beside the library's guard
+  (`… AND ()`), and an empty part under `or()` or `not()` was sent as
+  `… OR ()` / `NOT ()`; DynamoDB rejected each with a `DynamoValidationError`,
+  as it did an `isIn` with no values (`IN ()`). A condition that asserts
+  nothing is now no condition — the op's own guard alone — on put, create,
+  upsert, update, patch, delete, `deleteIfExists`, append and transaction ops,
+  and an empty part directly under `and()` is left out. Anywhere else — under
+  `or()` (it would match everything) or `not()` (nothing), an `or()` with no
+  parts, or an `isIn` with no values — it is refused with a `ValidationError`
+  before anything is sent, in conditions, entity and collection filters and
+  aggregate `list` filters. Two of these are behaviour changes: a filter of
+  `or()` with no parts was dropped, so the query matched everything, and an
+  aggregate `list` filter of `or()` returned every aggregate; both now fail
+  with a `ValidationError`. `.filter({})` is still no filter, and a
+  `Transaction.check()` with an empty condition is refused before sending.
 - **`.consistentRead()` on a GSI is refused before sending.** DynamoDB reads
   a global secondary index only eventually consistently, and rejected the
-  request with a `DynamoError`; an entity index query or a collection with
-  `.consistentRead()` now fails with a `ValidationError` without sending it.
-  The table and LSIs are read consistently, as before.
+  request with a `DynamoValidationError`; an entity index query or a
+  collection with `.consistentRead()` now fails with a `ValidationError`
+  without sending it. The table is read consistently, as before. An entity's
+  indexes are always treated as GSIs (`db.tables.*.create()` creates them as
+  GSIs), so one pointed at an LSI of a table created outside the library is
+  refused too.
+- **`expectedVersion` on an entity that isn't `versioned` is refused
+  (behaviour change).** On 1.22.0 it was silently ignored, so the update ran
+  with no concurrency check at all. It now fails with a `ValidationError`
+  before anything is read or sent. Add `versioned: true`, or use a
+  `.condition()`.
 - **Bound queries filter and select renamed fields by their stored names.** A
   field renamed with `DynamoModel.configure(..., { field })` was projected and
   filtered under its domain name, so `select(["name"])` returned `{}` and
@@ -544,7 +563,8 @@ old-image `returnValues`, the library creates it through `create` with the same
 payload, so the item is exactly what `put` writes. If another writer creates it
 in between, the update re-runs once on that item. Anything else fails with
 `ItemNotFound` and writes nothing, as do retain entities and updates that read
-first (a unique-field change and the like). `patch()` is unchanged.
+first (a unique-field change and the like). `patch()` of a missing item fails
+with `ConditionalCheckFailed` on every path.
 
 **Decoding defaults.** Fields with `Schema.withDecodingDefault` now survive on
 read: a `put` that omitted one used to write the item and then fail with a
