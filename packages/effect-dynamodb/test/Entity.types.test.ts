@@ -1196,6 +1196,14 @@ describe("Entity types — delete returnValues", () => {
     expectTypeOf<ValueOf<ReturnType<typeof del.returnValues<"none">>>>().toEqualTypeOf<void>()
   })
 
+  it("a ReturnValuesMode variable is still accepted", () => {
+    if (del === null) return
+    const mode = "allOld" as import("../src/Entity.js").ReturnValuesMode
+    const any = del.returnValues(mode)
+    // Any mode compiles; the result is the model when it may be "allOld".
+    expectTypeOf<User | undefined>().toMatchTypeOf<ValueOf<typeof any>>()
+  })
+
   it("unbound Entity.returnValues types a delete too", () => {
     const allOld = Entity.returnValues(UserEntity.delete({ userId: "u-1" }), "allOld")
     expectTypeOf<ValueOf<typeof allOld>>().toEqualTypeOf<User | undefined>()

@@ -17091,6 +17091,29 @@ describeConnected("#133 — path operations on index composites and unique field
         }
         yield* docs.put({ id, ...doc })
         expect(yield* docs.delete({ id }).returnValues("none")).toBeUndefined()
+        // A mode DeleteItem doesn't support is refused, and nothing is deleted.
+        yield* docs.put({ id, ...doc })
+        const refused = yield* docs
+          .delete({ id })
+          .returnValues("allNew")
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(refused._tag).toBe("ValidationError")
+        expect(yield* docs.get({ id })).toMatchObject({ id })
+        // deleteIfExists with a condition asserts both.
+        const unmet = yield* docs
+          .deleteIfExists({ id })
+          .condition({ id: "someone-else" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(unmet._tag).toBe("ConditionalCheckFailed")
+        yield* docs.deleteIfExists({ id }).condition({ id })
+        const missing = yield* docs
+          .deleteIfExists({ id })
+          .condition({ id })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(missing._tag).toBe("ConditionalCheckFailed")
       }
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )

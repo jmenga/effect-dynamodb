@@ -90,6 +90,18 @@ export class UpdateAppliedButUnreadable extends Data.TaggedError("UpdateAppliedB
 }> {}
 
 /**
+ * The delete WAS applied, but the item it removed — asked for with
+ * `returnValues("allOld")` — could not be decoded. `item` is the removed item
+ * as stored. Do not retry the delete expecting the item back: it is gone.
+ */
+export class DeleteAppliedButUnreadable extends Data.TaggedError("DeleteAppliedButUnreadable")<{
+  readonly entityType: string
+  readonly key: Record<string, unknown>
+  readonly item: Record<string, unknown>
+  readonly cause: unknown
+}> {}
+
+/**
  * `Entity.append()` was rejected because the CAS predicate
  * (`attribute_not_exists(pk) OR <orderBy> < :newOrderBy`) did not hold —
  * i.e. another writer has already advanced the current item past

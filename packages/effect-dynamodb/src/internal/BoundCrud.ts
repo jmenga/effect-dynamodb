@@ -229,10 +229,11 @@ export interface BoundDelete<Model, E, A = void> extends Pipeable.Pipeable {
   ) => BoundDelete<Model, E | ConditionalCheckFailed, A>
   /**
    * Set ReturnValues mode: `"allOld"` returns the item the delete removed
-   * (`undefined` when there was none); `"none"` returns nothing. (DynamoDB has
-   * no other mode for a delete.)
+   * (`undefined` when there was none); `"none"` returns nothing. DynamoDB has no
+   * other mode for a delete: any other fails with a `ValidationError` before
+   * anything is sent.
    */
-  readonly returnValues: <M extends "none" | "allOld">(
+  readonly returnValues: <M extends ReturnValuesMode>(
     mode: M,
   ) => BoundDelete<Model, E, M extends "allOld" ? Model | undefined : void>
   /** Convert to an executable Effect for Effect combinator interop. */
@@ -256,10 +257,10 @@ export class BoundDeleteImpl<Model, E, A = void> implements BoundDelete<Model, E
     return new BoundDeleteImpl<Model, E | ConditionalCheckFailed, A>(next as any, this._config)
   }
 
-  returnValues<M extends "none" | "allOld">(
+  returnValues<M extends ReturnValuesMode>(
     mode: M,
   ): BoundDeleteImpl<Model, E, M extends "allOld" ? Model | undefined : void> {
-    const next = returnValuesCombinator(this._op, mode as ReturnValuesMode)
+    const next = returnValuesCombinator(this._op, mode)
     return new BoundDeleteImpl(next as any, this._config)
   }
 

@@ -28,6 +28,7 @@ import {
   CascadePartialFailure,
   ConcurrentModification,
   ConditionalCheckFailed,
+  DeleteAppliedButUnreadable,
   EmbeddingError,
   ItemNotDeleted,
   ItemNotFound,
@@ -169,6 +170,7 @@ import {
   type EntityUpdate,
   EntityUpdateImpl,
   emptyUpdateState,
+  existenceConditions,
   type PutKind,
   type ReturnValuesMode,
   type UpdateState,
@@ -861,7 +863,8 @@ export interface Entity<
     | ItemNotFound
     | OptimisticLockError
     | ConcurrentModification
-    | ValidationError,
+    | ValidationError
+    | DeleteAppliedButUnreadable,
     DynamoClient | TableConfig,
     void,
     ModelType<TModel>
@@ -930,6 +933,7 @@ export interface Entity<
     | OptimisticLockError
     | ConcurrentModification
     | ValidationError
+    | DeleteAppliedButUnreadable
     | ConditionalCheckFailed,
     DynamoClient | TableConfig,
     void,
@@ -1378,6 +1382,7 @@ export interface BoundEntity<
     | OptimisticLockError
     | ConcurrentModification
     | ValidationError
+    | DeleteAppliedButUnreadable
   >
 
   /**
@@ -1447,6 +1452,7 @@ export interface BoundEntity<
     | OptimisticLockError
     | ConcurrentModification
     | ValidationError
+    | DeleteAppliedButUnreadable
     | ConditionalCheckFailed
   >
 
@@ -1681,24 +1687,6 @@ const GUARDED_PUT_ATTEMPTS = 3
  * nothing asserted about it: read again, never reported (#133).
  */
 class DeletedConcurrently extends Data.TaggedError("DeletedConcurrently")<{}> {}
-
-/**
- * @internal Whether a delete's condition asserts only that the item exists —
- * `deleteIfExists`'s `attribute_exists` on the partition key.
- */
-const assertsExistenceOnly = (
-  condition: Expr | ConditionInput | undefined,
-  pkField: string,
-): boolean => {
-  if (condition === undefined || isExpr(condition)) return false
-  const entries = Object.entries(condition as globalThis.Record<string, unknown>)
-  if (entries.length !== 1) return false
-  const [op, value] = entries[0]!
-  return (
-    op === "attributeExists" &&
-    (value === pkField || (Array.isArray(value) && value.length === 1 && value[0] === pkField))
-  )
-}
 
 /**
  * The `ConcurrentModification`s that report a sentinel release whose
@@ -7018,8 +7006,27 @@ const makeImpl = <
           // item is `ConditionalCheckFailed` — and the delete is retried after
           // a race like an unconditioned one.
           const readsFirst = isSoftDeleteEnabled() || hasUniqueConstraints || isRetainEnabled()
-          const existenceOnly =
-            readsFirst && assertsExistenceOnly(opts.condition, config.indexes.primary.pk.field)
+          // `deleteIfExists` (alone, or ANDed with a `.condition()`): a missing
+          // item fails its condition.
+          const existence =
+            opts.condition === undefined
+              ? undefined
+              : existenceConditions.get(opts.condition as object)
+          const existenceOnly = readsFirst && existence === "existenceOnly"
+          const mustExist = existence !== undefined
+          if (
+            opts.returnValues !== undefined &&
+            opts.returnValues !== "none" &&
+            opts.returnValues !== "allOld"
+          ) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "delete",
+              cause:
+                `delete: returnValues("${opts.returnValues}") is not a mode DeleteItem ` +
+                'supports — only "none" and "allOld". Nothing was sent.',
+            })
+          }
           // Build user condition expression if provided
           const userCondition =
             opts.condition && !existenceOnly
@@ -7030,15 +7037,28 @@ const makeImpl = <
            * removed — the one read (every read-first delete is guarded on it) or
            * DynamoDB's `ALL_OLD` — as a model, `undefined` when there was none.
            */
-          const deletedResult = (old: globalThis.Record<string, AttributeValue> | undefined) =>
-            opts.returnValues === "allOld" && old !== undefined
-              ? decodeAs(fromAttributeMap(old) as globalThis.Record<string, unknown>, old, "model")
-              : Effect.succeed(undefined)
+          const deletedResult = (old: globalThis.Record<string, AttributeValue> | undefined) => {
+            if (opts.returnValues !== "allOld" || old === undefined)
+              return Effect.succeed(undefined)
+            const raw = fromAttributeMap(old) as globalThis.Record<string, unknown>
+            // The delete is applied: a decode failure must not read as a refusal.
+            return decodeAs({ ...raw }, old, "model").pipe(
+              Effect.mapError(
+                (cause) =>
+                  new DeleteAppliedButUnreadable({
+                    entityType,
+                    key: encodedKey as globalThis.Record<string, unknown>,
+                    item: raw,
+                    cause,
+                  }),
+              ),
+            )
+          }
           /** The item is missing: what a delete that read it reports. */
           const missing = (
             otherwise: ItemNotFound | undefined,
           ): Effect.Effect<undefined, ItemNotFound | ConditionalCheckFailed> =>
-            existenceOnly
+            mustExist
               ? Effect.fail(new ConditionalCheckFailed({ entityType, key: encodedKey }))
               : otherwise === undefined
                 ? Effect.succeed(undefined)
@@ -7324,7 +7344,7 @@ const makeImpl = <
                 })
 
                 if (!result.Item) {
-                  if (hasUniqueConstraints || existenceOnly) {
+                  if (hasUniqueConstraints || mustExist) {
                     return yield* missing(new ItemNotFound({ entityType, key: encodedKey }))
                   }
                   // Retain only: deleting a missing item writes nothing, as a plain
@@ -7476,7 +7496,9 @@ const makeImpl = <
                 deleteInput.ExpressionAttributeValues = userCondition.values
               }
             }
-            if (opts.returnValues === "allOld") deleteInput.ReturnValues = "ALL_OLD"
+            if (opts.returnValues !== undefined) {
+              deleteInput.ReturnValues = opts.returnValues === "allOld" ? "ALL_OLD" : "NONE"
+            }
             const output = yield* client
               .deleteItem(deleteInput)
               .pipe(Effect.mapError(mapDeleteConditionFailure))
@@ -7496,13 +7518,9 @@ const makeImpl = <
   const deleteIfExists = (key: unknown) => {
     const pkField = config.indexes.primary.pk.field
     const op = del(key)
-    return new EntityDeleteImpl(
-      op._builder,
-      op._entity,
-      op._key,
-      { attributeExists: [pkField] },
-      op._returnValues,
-    )
+    const exists: ConditionInput = { attributeExists: [pkField] }
+    existenceConditions.set(exists, "existenceOnly")
+    return new EntityDeleteImpl(op._builder, op._entity, op._key, exists, op._returnValues)
   }
 
   // ---------------------------------------------------------------------------

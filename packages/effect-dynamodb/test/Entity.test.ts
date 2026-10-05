@@ -6807,6 +6807,66 @@ describe("Entity", () => {
     )
   })
 
+  describe("delete return values and conditions (#133)", () => {
+    const Plain = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "SimpleItem",
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
+        },
+      }),
+    )
+
+    it.effect('returnValues("none") sends ReturnValues: "NONE", as it always did', () =>
+      Effect.gen(function* () {
+        mockDeleteItem.mockResolvedValue({})
+        yield* Entity.returnValues(Plain.delete({ itemId: "i-1" }), "none").asEffect()
+        expect(mockDeleteItem.mock.calls[0]![0].ReturnValues).toBe("NONE")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a mode DeleteItem doesn't support is refused before sending", () =>
+      Effect.gen(function* () {
+        const error = yield* Entity.returnValues(Plain.delete({ itemId: "i-1" }), "allNew")
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain('"none" and "allOld"')
+        expect(mockDeleteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "an old image that won't decode is DeleteAppliedButUnreadable, with the raw item",
+      () =>
+        Effect.gen(function* () {
+          mockDeleteItem.mockResolvedValue({
+            Attributes: toAttributeMap({ pk: "p", sk: "s", itemId: "i-1", name: 42 }),
+          })
+          const error = yield* Entity.returnValues(Plain.delete({ itemId: "i-1" }), "allOld")
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(error._tag).toBe("DeleteAppliedButUnreadable")
+          expect((error as any).item).toMatchObject({ itemId: "i-1", name: 42 })
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("deleteIfExists(k).condition(x) asserts both", () =>
+      Effect.gen(function* () {
+        mockDeleteItem.mockResolvedValue({})
+        yield* Plain.deleteIfExists({ itemId: "i-1" })
+          .pipe(Plain.condition({ name: "n" }))
+          .asEffect()
+        const call = mockDeleteItem.mock.calls[0]![0]
+        expect(call.ConditionExpression).toContain("attribute_exists")
+        expect(call.ConditionExpression).toMatch(/ = /)
+        expect(call.ConditionExpression).toContain(" AND ")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
   describe("deleteIfExists", () => {
     it.effect("succeeds when item exists", () =>
       Effect.gen(function* () {

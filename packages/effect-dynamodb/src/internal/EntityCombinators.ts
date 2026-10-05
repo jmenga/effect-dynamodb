@@ -26,6 +26,7 @@ import {
   type EntityUpdate,
   EntityUpdateImpl,
   EntityUpdateTypeId,
+  existenceConditions,
   type PathAddOp,
   type PathAppendOp,
   type PathDeleteOp,
@@ -36,7 +37,7 @@ import {
   type ReturnValuesMode,
   type UpdateReturn,
 } from "./EntityOps.js"
-import type { Expr } from "./Expr.js"
+import { type Expr, ExprTag, isExpr, parseShorthand } from "./Expr.js"
 
 // ---------------------------------------------------------------------------
 // Terminal functions — select decode mode for EntityOp intermediates
@@ -289,13 +290,22 @@ export const condition: {
   <T extends ConditionTarget>(self: T, cond: Expr | ConditionInput): WithConditionalCheckFailed<T>
 } = Fn.dual(2, <T extends ConditionTarget>(self: T, cond: Expr | ConditionInput): T => {
   if (EntityDeleteTypeId in self) {
-    // EntityDelete
+    // EntityDelete. `deleteIfExists`'s existence check is kept: a condition
+    // added to it is ANDed with it, never in its place (#133).
     const impl = self as unknown as EntityDeleteImpl<any, any>
+    const existing = impl._condition
+    let next: Expr | ConditionInput = cond
+    if (existing !== undefined && existenceConditions.has(existing as object)) {
+      const asExpr = (c: Expr | ConditionInput): Expr =>
+        isExpr(c) ? c : parseShorthand(c as ConditionInput)
+      next = { [ExprTag]: ExprTag, _tag: "and", exprs: [asExpr(existing), asExpr(cond)] } as Expr
+      existenceConditions.set(next as object, "mustExist")
+    }
     return new EntityDeleteImpl(
       impl._builder,
       impl._entity,
       impl._key,
-      cond,
+      next,
       impl._returnValues,
     ) as unknown as T
   }

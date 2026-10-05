@@ -41,6 +41,7 @@ export {
   CompositeNullableError,
   ConcurrentModification,
   ConditionalCheckFailed,
+  DeleteAppliedButUnreadable,
   DuplicateCommand,
   DynamoError,
   DynamoValidationError,

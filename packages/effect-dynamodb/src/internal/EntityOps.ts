@@ -50,6 +50,13 @@ export type UpdateReturn<A, M extends ReturnValuesMode> = M extends "none"
     : A
 
 /** @internal Map from our mode names to DynamoDB ReturnValues strings */
+/**
+ * @internal The conditions a delete must exist under (#133): `deleteIfExists`'s
+ * own `attribute_exists` on the partition key (`"existenceOnly"`), and that
+ * check ANDed with a `.condition()` added after it (`"mustExist"`).
+ */
+export const existenceConditions = new WeakMap<object, "existenceOnly" | "mustExist">()
+
 export const returnValuesMap: globalThis.Record<ReturnValuesMode, ReturnValue> = {
   none: "NONE",
   allOld: "ALL_OLD",
