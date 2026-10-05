@@ -4355,6 +4355,23 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    it.effect(
+      "a retain patch with path operations on a missing item fails its condition (#134)",
+      () =>
+        Effect.gen(function* () {
+          mockGetItem.mockResolvedValueOnce({})
+          const op = Entity.pathSet(RetainEntity.patch({ itemId: "i-1" }), {
+            segments: ["name"],
+            value: "n",
+            isPath: false,
+          })
+          const error = yield* op.asEffect().pipe(Effect.flip)
+          expect(error._tag).toBe("ConditionalCheckFailed")
+          expect(mockUpdateItem).not.toHaveBeenCalled()
+          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("deleteIfExists of a missing retain item fails its condition, writing nothing", () =>
       Effect.gen(function* () {
         mockGetItem.mockResolvedValueOnce({})

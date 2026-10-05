@@ -13362,6 +13362,19 @@ describeConnected("#133 — nested sub-aggregates", () => {
         const refused = yield* leagues.list({ season: "2026" }, { filter } as any).pipe(Effect.flip)
         expect(refused._tag).toBe("ValidationError")
       }
+      // Orphan edge rows (the root gone, its edges left) don't stop create;
+      // `delete` clears the whole partition, orphans included, as documented.
+      yield* client.deleteItem({
+        TableName: n133TableName,
+        Key: { pk: { S: "$edd133n#v1#league#dup" }, sk: { S: "$edd133n#v1#nleague" } },
+      })
+      expect((yield* raw("dup")).length).toBe(8)
+      yield* leagues.delete({ id: "dup" } as any)
+      expect(yield* raw("dup")).toEqual([])
+      yield* leagues.create(again as any)
+      const fresh = (yield* leagues.get({ id: "dup" } as any)) as N133League
+      expect(fresh.club1.name).toBe("Uno")
+      expect((yield* raw("dup")).length).toBe(9)
     }).pipe(provideN133),
   )
 })
@@ -17667,6 +17680,35 @@ describeConnected("#133 — path operations on index composites and unique field
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
+  it.effect(
+    "a read-first patch that loses its item to a delete fails, writing nothing (#134)",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const accounts = db.entities.AccountsBare as any
+        yield* accounts.put({ id: "pr-race", email: "pr-race@x.io", name: "a" })
+        // Deleted between the patch's read and its write.
+        g133Inject.before = g133Hook(
+          Effect.gen(function* () {
+            const client = yield* DynamoClient
+            yield* client.deleteItem({
+              TableName: g133Tables.record,
+              Key: mainKey("G133AccountBare", "pr-race"),
+            })
+          }).pipe(Effect.provide(ClientLayer)),
+        )
+        const error = yield* accounts
+          .patch({ id: "pr-race" })
+          .set({ email: "pr-race-2@x.io" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ConditionalCheckFailed")
+        expect(yield* rawItem("G133AccountBare", "pr-race")).toBeUndefined()
+        // The new value's sentinel was not written: another item can take it.
+        yield* accounts.put({ id: "pr-race-other", email: "pr-race-2@x.io" })
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
   it.effect("deleteIfExists of a missing item fails whatever condition is added", () =>
     Effect.gen(function* () {
       const db = yield* g133Client
@@ -17710,6 +17752,7 @@ describeConnected("#133 — path operations on index composites and unique field
         (t: any, { or, eq, and }: any) => or(eq(t.label, "first"), and()),
         (_: any, { not, and }: any) => not(and()),
         (_: any, { or }: any) => or(),
+        (t: any, { isIn }: any) => isIn(t.label, []),
       ]
       yield* devices.put({ id: "ep-1", owner: "ep", label: "first" })
       for (const cond of refused) {
