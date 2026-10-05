@@ -219,9 +219,10 @@ real `DateTime`s.
   change).** `asParams` now declares `ValidationError` (it declared `never`):
   it fails, as the query would, for a filter with an empty part under `or()` /
   `not()`, an `or()` with no parts or an `isIn` with no values — on 1.22.0 it
-  returned params DynamoDB then rejected. The exported `compileExpr` throws on
-  those same expressions instead of compiling them to `… OR ()`, `NOT ()`,
-  `IN ()` or an empty string.
+  returned params DynamoDB then rejected or, for an `or()` with no parts,
+  silently dropped the filter, so the query matched every row. The exported
+  `compileExpr` throws on those same expressions instead of compiling them to
+  `… OR ()`, `NOT ()`, `IN ()` or an empty string.
 - **Bound queries filter and select renamed fields by their stored names.** A
   field renamed with `DynamoModel.configure(..., { field })` was projected and
   filtered under its domain name, so `select(["name"])` returned `{}` and

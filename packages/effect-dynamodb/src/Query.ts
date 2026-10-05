@@ -832,10 +832,6 @@ const isExcludedRow = (state: QueryState, row: Record<string, AttributeValue>): 
   (state.liveRows !== undefined && !state.liveRows.isLive(row))
 
 /**
- * @internal The state a terminal runs: {@link QueryState.prepare} applied
- * against the resolved table.
- */
-/**
  * @internal A filter with an empty part where none may be (`emptyPartProblem`):
  * the `ValidationError` every path that builds a request fails with, before
  * `compileExpr` — which throws on one — ever sees it (#133).
@@ -854,6 +850,10 @@ const refuseEmptyFilterParts = (state: QueryState): ValidationError | undefined 
   return undefined
 }
 
+/**
+ * @internal The state a terminal runs: {@link QueryState.prepare} applied
+ * against the resolved table.
+ */
 const prepared = (
   state: QueryState,
   tableName: string,

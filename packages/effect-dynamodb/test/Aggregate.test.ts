@@ -1623,18 +1623,26 @@ describe("Aggregate write path", () => {
 
     it.effect("retries unprocessed deletes with backoff until they are written (#134)", () =>
       Effect.gen(function* () {
-        mockWriteQuery.mockResolvedValueOnce({ Items: [articleRow] })
+        const secondRow = { ...articleRow, sk: { S: "$myapp#v1#articleitem#2" } }
+        mockWriteQuery.mockResolvedValueOnce({ Items: [articleRow, secondRow] })
         mockBatchWrite
           .mockResolvedValueOnce(stillUnprocessed)
           .mockResolvedValueOnce(stillUnprocessed)
           .mockResolvedValueOnce({})
         const fiber = yield* SimpleAggregate.delete({ articleId: "a-1" }).pipe(Effect.forkChild)
+        yield* TestClock.adjust("50 millis")
+        // The retry waits for its backoff.
+        expect(mockBatchWrite).toHaveBeenCalledTimes(1)
+        expect(mockBatchWrite.mock.calls[0]![0].RequestItems["test-table"]).toHaveLength(2)
         yield* TestClock.adjust("10 seconds")
         yield* Fiber.join(fiber)
         expect(mockBatchWrite).toHaveBeenCalledTimes(3)
-        expect(mockBatchWrite.mock.calls[2]![0].RequestItems["test-table"]).toEqual(
-          stillUnprocessed.UnprocessedItems["test-table"],
-        )
+        // Each retry resends only what was left unprocessed.
+        for (const call of mockBatchWrite.mock.calls.slice(1)) {
+          expect(call[0].RequestItems["test-table"]).toEqual(
+            stillUnprocessed.UnprocessedItems["test-table"],
+          )
+        }
       }).pipe(Effect.provide(WriteLayer)),
     )
 
