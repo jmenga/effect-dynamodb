@@ -14337,7 +14337,7 @@ const G133Named = Schema.Struct({
   hid: Schema.String,
   "first-name": Schema.String,
   label: Schema.String,
-  addr: Schema.Struct({ city: Schema.String }),
+  addr: Schema.Struct({ city: Schema.String, zip: Schema.String }),
   tags: Schema.Array(Schema.String),
 })
 const G133NamedOther = Schema.Struct({
@@ -17411,7 +17411,7 @@ describeConnected("#133 — path operations on index composites and unique field
           hid: "1",
           "first-name": "Ann",
           label: "L1",
-          addr: { city: "C1" },
+          addr: { city: "C1", zip: "Z1" },
           tags: ["a", "b"],
         })
         yield* docs.put({
@@ -17419,7 +17419,7 @@ describeConnected("#133 — path operations on index composites and unique field
           hid: "2",
           "first-name": "Bob",
           label: "L2",
-          addr: { city: "C2" },
+          addr: { city: "C2", zip: "Z2" },
           tags: ["a"],
         })
         const queries = [
@@ -17488,7 +17488,7 @@ describeConnected("#133 — path operations on index composites and unique field
         hid: "1",
         "first-name": "Ann",
         label: "L1",
-        addr: { city: "C1" },
+        addr: { city: "C1", zip: "Z1" },
         tags: [],
       })
       yield* hyphens.put({
@@ -17496,7 +17496,7 @@ describeConnected("#133 — path operations on index composites and unique field
         hid: "2",
         "first-name": "Bob",
         label: "L2",
-        addr: { city: "C2" },
+        addr: { city: "C2", zip: "Z2" },
         tags: [],
       })
       yield* others.put({ grp: "col", nid: "n1", label: "L1" })
