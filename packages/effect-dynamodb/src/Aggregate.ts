@@ -66,6 +66,8 @@ import {
   compileExpr,
   createConditionOps,
   type Expr,
+  emptyPartProblem,
+  isEmptyExpr,
   parseSimpleShorthand,
 } from "./internal/Expr.js"
 import { createPathBuilder, type PathBuilder } from "./internal/PathBuilder.js"
@@ -1685,7 +1687,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         // Root-item FilterExpression. Compiled once — the same two forms
         // `BoundQuery.filter()` takes, through the same `Expr` compiler, so
         // there is one filter vocabulary rather than a second dialect here.
-        const rootFilter = compileListFilter(options?.filter)
+        const rootFilter = yield* compileListFilter(options?.filter, aggregateName)
 
         // Attribute names that make up a resume key on the list index: the index
         // key plus the table key. A `LastEvaluatedKey` supplies them when there
@@ -3347,14 +3349,17 @@ const deleteAllItems = (
  *
  * Both forms route through the same `Expr` compiler `BoundQuery.filter()` uses,
  * so `{ status: "shipped" }` and `(t, { eq }) => eq(t.status, "shipped")` mean
- * the same thing here as they do on an entity query. A shorthand with no
- * entries compiles to the empty string — that is a no-op, not `FilterExpression: ""`,
- * which DynamoDB rejects.
+ * the same thing here as they do on an entity query, under the same empty-part
+ * rules (#134): a filter that asserts nothing (`{}`, `and()`) is no filter, an
+ * empty part directly under `and` is left out, and one anywhere else — or an
+ * `or()` with no parts, or an `isIn` with no values — is refused with a
+ * `ValidationError` before anything is sent.
  */
 const compileListFilter = <Model>(
   filter: ListFilter<Model> | undefined,
-): CompileResult | undefined => {
-  if (filter === undefined) return undefined
+  aggregateName: string,
+): Effect.Effect<CompileResult | undefined, ValidationError> => {
+  if (filter === undefined) return Effect.succeed(undefined)
   const expr =
     typeof filter === "function"
       ? filter(
@@ -3362,8 +3367,17 @@ const compileListFilter = <Model>(
           createConditionOps<Model>(),
         )
       : parseSimpleShorthand(filter)
-  const compiled = compileExpr(expr)
-  return compiled.expression === "" ? undefined : compiled
+  const problem = emptyPartProblem(expr)
+  if (problem !== undefined) {
+    return Effect.fail(
+      new ValidationError({
+        entityType: aggregateName,
+        operation: "list.filter",
+        cause: `list filter: ${problem} Nothing was sent.`,
+      }),
+    )
+  }
+  return Effect.succeed(isEmptyExpr(expr) ? undefined : compileExpr(expr))
 }
 
 // ---------------------------------------------------------------------------

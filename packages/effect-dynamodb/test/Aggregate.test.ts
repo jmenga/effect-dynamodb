@@ -3543,6 +3543,29 @@ describe("Aggregate write path", () => {
     // cursor (which resumes after the last aggregate RETURNED, not the last one
     // KEPT). `filterBy` runs inside the accumulate loop instead.
 
+    it.effect("a list filter follows the empty-part rules (#134)", () =>
+      Effect.gen(function* () {
+        for (const refused of [
+          (_: any, o: any) => o.or(),
+          (t: any, o: any) => o.or(o.eq(t.author, "Alice"), o.and()),
+          (_: any, o: any) => o.not(o.and()),
+          (t: any, o: any) => o.isIn(t.author, []),
+        ]) {
+          const error = yield* ListAggregate.list(undefined, { filter: refused }).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+        }
+        expect(mockListQuery).not.toHaveBeenCalled()
+        // An empty part directly under and is left out; a whole empty filter is none.
+        mockListQuery.mockResolvedValue({ Items: [] })
+        yield* ListAggregate.list(undefined, {
+          filter: (t: any, o: any) => o.and(o.eq(t.author, "Alice"), o.and()),
+        })
+        expect(mockListQuery.mock.calls[0]![0].FilterExpression).toBe("#e0 = :e1")
+        yield* ListAggregate.list(undefined, { filter: (_: any, o: any) => o.and() })
+        expect(mockListQuery.mock.calls[1]![0].FilterExpression).toBeUndefined()
+      }).pipe(Effect.provide(ListLayer)),
+    )
+
     it.effect("filterBy fills the page with ACCEPTED aggregates", () =>
       Effect.gen(function* () {
         // Three root items examined; the predicate keeps two of them, and only

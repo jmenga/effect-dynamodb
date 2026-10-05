@@ -309,6 +309,13 @@ export const compileExpr = (
   expr: Expr,
   resolveDbName?: (name: string) => string,
 ): CompileResult => {
+  // Every user-facing entry point refuses these with a `ValidationError`
+  // before compiling (#133); reaching here with one is a library bug, and
+  // compiling it would silently send a widened or invalid expression.
+  const problem = emptyPartProblem(expr)
+  if (problem !== undefined) {
+    throw new Error(`compileExpr: ${problem} (refuse it with emptyPartProblem before compiling)`)
+  }
   const names: globalThis.Record<string, string> = {}
   const values: globalThis.Record<string, AttributeValue> = {}
   const counter = { value: 0 }
@@ -361,8 +368,7 @@ export const compileExpr = (
       // An empty part (`and()`, a `{}` shorthand) directly under `and` is no
       // condition: it is left out, never compiled to `()`, which DynamoDB
       // rejects (#133). Under `or` or `not` it has no meaning that would not
-      // widen the expression — `emptyPartProblem` refuses it before sending,
-      // and it is compiled as written here, never silently dropped.
+      // widen the expression — `emptyPartProblem` refuses it, above.
       case "and": {
         const parts = node.exprs.map((e) => compile(e)).filter((part) => part !== "")
         if (parts.length === 0) return ""
@@ -427,6 +433,10 @@ export const emptyPartProblem = (expr: Expr): string | undefined => {
       }
       return undefined
     }
+    case "in":
+      return expr.values.length === 0
+        ? "isIn() with no values matches nothing, and DynamoDB rejects `IN ()`. Give it at least one value."
+        : undefined
     case "not":
       if (isEmptyExpr(expr.expr)) {
         return (

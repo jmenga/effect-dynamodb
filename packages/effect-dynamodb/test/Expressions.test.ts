@@ -179,6 +179,28 @@ describe("Expr", () => {
       expect(emptyPartProblem(ops.or(x, ops.eq(pb.b, "2")))).toBeUndefined()
       expect(emptyPartProblem(ops.not(x))).toBeUndefined()
     })
+
+    it("isIn with no values is a problem (#134)", () => {
+      expect(emptyPartProblem(ops.isIn(pb.a, []))).toBeDefined()
+      expect(emptyPartProblem(ops.and(x, ops.not(ops.isIn(pb.a, []))))).toBeDefined()
+      expect(emptyPartProblem(ops.isIn(pb.a, ["1"]))).toBeUndefined()
+    })
+
+    it("compileExpr refuses what emptyPartProblem refuses, so no caller can bypass it (#134)", () => {
+      for (const expr of [
+        ops.or(),
+        ops.or(x, ops.and()),
+        ops.or(x, ops.and(ops.and())),
+        ops.not(ops.and()),
+        ops.and(x, ops.or(x, ops.and())),
+        ops.isIn(pb.a, []),
+      ]) {
+        expect(() => compileExpr(expr)).toThrow(/compileExpr/)
+      }
+      expect(compileExpr(ops.or(x, ops.eq(pb.b, "2"))).expression).toBe(
+        "(#e0 = :e1) OR (#e2 = :e3)",
+      )
+    })
   })
 
   describe("compileExpr", () => {

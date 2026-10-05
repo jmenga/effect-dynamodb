@@ -1078,6 +1078,16 @@ describe("Transaction", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
+  it.effect("a Transaction.check with an empty condition is refused (#134)", () =>
+    Effect.gen(function* () {
+      const error = yield* Transaction.transactWrite([
+        Transaction.check(UserEntity.get({ userId: "u-1" }), Expression.condition({})),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(mockTransactWriteItems).not.toHaveBeenCalled()
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
   it.effect("an empty part under or or not in a transacted condition is refused (#133)", () =>
     Effect.gen(function* () {
       const input = { userId: "u-r", email: "r@x.io", name: "R", role: "member" } as const

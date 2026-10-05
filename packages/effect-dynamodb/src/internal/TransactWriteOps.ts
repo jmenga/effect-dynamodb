@@ -352,6 +352,15 @@ export const buildTransactWriteItems = (
       // Check for ConditionCheckOp first (has its own TypeId)
       if (op != null && typeof op === "object" && ConditionCheckTypeId in op) {
         const checkOp = op as ConditionCheckOp
+        // A check that asserts nothing (`Expression.condition({})`) would be
+        // sent as an empty ConditionExpression, which DynamoDB rejects (#134).
+        if (checkOp._condition.expression.trim() === "") {
+          return yield* new ValidationError({
+            entityType: checkOp._entity.entityType,
+            operation: `${operation}.check`,
+            cause: `${operation}: Transaction.check() was given an empty condition. Nothing was sent.`,
+          })
+        }
         opInfos.push({
           type: "conditionCheck",
           entity: checkOp._entity,

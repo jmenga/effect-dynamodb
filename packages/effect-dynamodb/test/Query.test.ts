@@ -665,6 +665,7 @@ describe("Query", () => {
           ops.or(),
           ops.and(ops.eq(pb.name, "b"), ops.or(ops.eq(pb.id, "a"), ops.and(ops.and()))),
           ops.not(ops.or(ops.eq(pb.id, "a"), ops.not(ops.and()))),
+          ops.isIn(pb.id, []),
         ]
         for (const filter of refused) {
           const query = makeTestQuery().pipe(Query.filterExpr(filter))
