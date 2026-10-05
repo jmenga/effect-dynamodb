@@ -14354,6 +14354,23 @@ const g133NamedIndex = (sk: string) => ({
   },
 })
 
+// Two entities sharing a GSI partition: one's filter must never reach the other.
+const G133OrA = Schema.Struct({ owner: Schema.String, aid: Schema.String, n: Schema.Number })
+const G133OrB = Schema.Struct({
+  owner: Schema.String,
+  bid: Schema.String,
+  n: Schema.Number,
+  secret: Schema.String,
+})
+const g133OrIndex = (sk: string) => ({
+  byOwner: {
+    name: "gsi2",
+    collection: "g133Or",
+    pk: { field: "gsi2pk", composite: ["owner"] },
+    sk: { field: "gsi2sk", composite: [sk] },
+  },
+})
+
 // Several items per partition (#133): a primary sort key with a composite.
 class G133Line extends Schema.Class<G133Line>("G133Line")({
   order: Schema.String,
@@ -14520,6 +14537,24 @@ const g133Entities = {
       sk: { field: "sk", composite: ["nid"] },
     } as any,
     indexes: g133NamedIndex("nid") as any,
+  }),
+  OrAs: Entity.make({
+    model: G133OrA,
+    entityType: "G133OrA",
+    primaryKey: {
+      pk: { field: "pk", composite: ["owner"] },
+      sk: { field: "sk", composite: ["aid"] },
+    } as any,
+    indexes: g133OrIndex("aid") as any,
+  }),
+  OrBs: Entity.make({
+    model: G133OrB,
+    entityType: "G133OrB",
+    primaryKey: {
+      pk: { field: "pk", composite: ["owner"] },
+      sk: { field: "sk", composite: ["bid"] },
+    } as any,
+    indexes: g133OrIndex("bid") as any,
   }),
   Readings: Entity.make({
     model: G133Reading,
@@ -17418,6 +17453,28 @@ describeConnected("#133 — path operations on index composites and unique field
       yield* lines.update(a).set({ label: "a3" })
       yield* lines.delete(a)
       expect((yield* lines.deleted.get(a)).label).toBe("a3")
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- a filter never widens the ownership check (#133) ----
+
+  it.effect("a top-level OR filter returns only the entity's own rows", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const as = db.entities.OrAs as any
+      const bs = db.entities.OrBs as any
+      yield* as.put({ owner: "or1", aid: "a1", n: 1 })
+      yield* bs.put({ owner: "or1", bid: "b1", n: 5, secret: "s" })
+      const either = (t: any, { or, eq }: any) => or(eq(t.n, 1), eq(t.n, 5))
+      const q = () => as.byOwner({ owner: "or1" }).filter(either)
+      expect((yield* q().collect()).map((a: any) => a.aid)).toEqual(["a1"])
+      expect(yield* q().count()).toBe(1)
+      expect(yield* q().select(["n"]).collect()).toEqual([{ n: 1 }])
+      const scanned = yield* as.scan().filter({ owner: "or1" }).filter(either).collect()
+      expect(scanned.map((a: any) => a.aid)).toEqual(["a1"])
+      expect(yield* as.scan().filter(either).count()).toBeGreaterThanOrEqual(1)
+      const leaked = yield* as.scan().filter(either).collect()
+      expect(leaked.every((a: any) => a.aid !== undefined)).toBe(true)
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 

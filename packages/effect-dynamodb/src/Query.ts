@@ -621,7 +621,12 @@ const buildFilterClauses = (state: QueryState) => {
         ? state.exprFilters[0]!
         : ({ [ExprTag]: ExprTag, _tag: "and", exprs: state.exprFilters } as Expr),
     )
-    filterClauses.push(compiled.expression)
+    // Parenthesised beside the ownership clause: a top-level `OR` would
+    // otherwise bind looser than the `AND` and admit other entities' rows
+    // (`#eddE IN (:et0) AND a OR b`).
+    filterClauses.push(
+      filterClauses.length > 0 ? `(${compiled.expression})` : compiled.expression,
+    )
     Object.assign(names, compiled.names)
     Object.assign(values, compiled.values)
   }

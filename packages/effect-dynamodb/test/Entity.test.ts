@@ -9064,6 +9064,75 @@ describe("Entity", () => {
         __edd_e__: "User",
       })
 
+    // A top-level OR in the caller's condition never escapes the library's own
+    // guard: it is parenthesised beside it (#133).
+    const either = (t: any, { or, eq }: any) => or(eq(t.role, "admin"), eq(t.role, "member"))
+
+    it.effect("a guarded delete keeps an OR condition inside its parentheses", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValue({ Item: storedUser() })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        const Unique = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "OrDelUser",
+            primaryKey,
+            unique: { email: ["email"] },
+          }),
+        )
+        yield* Unique.delete({ userId: "u-1" }).pipe(Unique.condition(either)).asEffect()
+        const main = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Delete
+        expect(main.ConditionExpression).toMatch(/^.+ AND \(.+ OR .+\)$/)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a versioned update keeps an OR condition inside its parentheses", () =>
+      Effect.gen(function* () {
+        mockUpdateItem.mockResolvedValueOnce({
+          Attributes: { ...storedUser(), version: { N: "2" } },
+        })
+        const Versioned = withConfig(
+          Entity.make({ model: User, entityType: "OrUpdUser", primaryKey, versioned: true }),
+        )
+        yield* Versioned.update({ userId: "u-1" })
+          .pipe(
+            Entity.set({ displayName: "B" }),
+            Entity.expectedVersion(1),
+            Versioned.condition(either),
+          )
+          .asEffect()
+          .pipe(Effect.ignore)
+        const expression = mockUpdateItem.mock.calls[0]![0].ConditionExpression as string
+        // The caller's condition, whole, as one parenthesised conjunct.
+        expect(expression).toContain("AND ((#")
+        expect(expression).toMatch(/AND \(\(#[^)]+\) OR \(#[^)]+\)\)/)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a guarded put keeps an OR condition inside its parentheses", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        const Unique = withConfig(
+          Entity.make({
+            model: User,
+            entityType: "OrPutUser",
+            primaryKey,
+            unique: { email: ["email"] },
+          }),
+        )
+        yield* Unique.put({
+          userId: "u-1",
+          email: "alice@test.com",
+          displayName: "Alice",
+          role: "admin",
+        })
+          .pipe(Unique.condition(either))
+          .asEffect()
+        const main = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Put
+        expect(main.ConditionExpression).toMatch(/^.+ AND \(.+ OR .+\)$/)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("simple delete — ConditionExpression on the DeleteItem", () =>
       Effect.gen(function* () {
         mockDeleteItem.mockResolvedValueOnce({})

@@ -636,6 +636,22 @@ describe("Query", () => {
   // paginate terminal
   // -------------------------------------------------------------------------
 
+  describe("a filter beside the ownership clause (#133)", () => {
+    it.effect("a top-level OR is parenthesised, so it can't admit other entities", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        const ops = createConditionOps<{ id: string; name: string }>()
+        const pb = createPathBuilder<{ id: string; name: string }>()
+        yield* Query.collect(
+          makeTestQuery().pipe(Query.filterExpr(ops.or(ops.eq(pb.id, "a"), ops.eq(pb.name, "b")))),
+        )
+        expect(mockQuery.mock.calls[0]![0].FilterExpression).toBe(
+          "#eddE IN (:et0) AND ((#e0 = :e1) OR (#e2 = :e3))",
+        )
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+  })
+
   describe("history rows are not items (#133)", () => {
     // A row is live when the key composed from its own `id` is its sort key.
     const liveRows: Query.LiveRows = {
