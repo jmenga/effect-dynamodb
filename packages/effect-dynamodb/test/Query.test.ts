@@ -662,6 +662,7 @@ describe("Query", () => {
         entityTypes: ["User"],
         decoder: (raw) => Effect.succeed({ id: raw.id as string }),
         liveRows,
+        keyFields: ["pk", "sk"],
       })
     const historyScan = () =>
       Query.makeScan<{ id: string }>({
@@ -715,8 +716,75 @@ describe("Query", () => {
             .mockResolvedValueOnce({ Items: [row("c", "$myapp#v1#user#id_c")] })
           const items = yield* Query.collect(make().pipe(Query.limit(2)))
           expect(items.map((i) => i.id)).toEqual(["a", "c"])
-          expect(mock.mock.calls.map((call) => call[0].Limit)).toEqual([2, 1])
+          // `limit` first, then twice the last: never the remainder.
+          expect(mock.mock.calls.map((call) => call[0].Limit)).toEqual([2, 4])
         }
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    /** A partition, served in sort key order a page at a time, as DynamoDB does. */
+    const servePartition = (rows: ReadonlyArray<Record<string, any>>) => (input: any) => {
+      const ordered = input.ScanIndexForward === false ? [...rows].reverse() : [...rows]
+      const from =
+        input.ExclusiveStartKey === undefined
+          ? 0
+          : ordered.findIndex((r) => r.sk.S === input.ExclusiveStartKey.sk.S) + 1
+      const page = ordered.slice(from, from + (input.Limit ?? ordered.length))
+      const last = page[page.length - 1]
+      return Promise.resolve({
+        Items: page,
+        ...(from + page.length < ordered.length && last !== undefined
+          ? { LastEvaluatedKey: { pk: last.pk, sk: last.sk } }
+          : {}),
+      })
+    }
+    const sorted = (rows: Array<Record<string, any>>) =>
+      rows.sort((a, b) => (a.sk.S < b.sk.S ? -1 : a.sk.S > b.sk.S ? 1 : 0))
+
+    it.effect("a run of history rows costs requests logarithmic in its length", () =>
+      Effect.gen(function* () {
+        // Three items with 300 snapshots each: in reverse, the snapshots come first.
+        const retained = sorted(
+          ["a", "b", "c"].flatMap((id) => [
+            row(id, `$myapp#v1#user#id_${id}`),
+            ...Array.from({ length: 300 }, (_, v) =>
+              row(id, `$myapp#v1#user#v#id_${id}#${String(v + 1).padStart(7, "0")}`),
+            ),
+          ]),
+        )
+        mockQuery.mockReset()
+        mockQuery.mockImplementation(servePartition(retained))
+        const last = yield* Query.collect(historyQuery().pipe(Query.reverse, Query.limit(1)))
+        expect(last.map((i) => i.id)).toEqual(["c"])
+        expect(mockQuery.mock.calls.length).toBeLessThanOrEqual(11)
+
+        // Three items, 300 tombstones each: forward, the tombstones come first.
+        const deleted = sorted(
+          ["a", "b", "c"].flatMap((id) => [
+            row(id, `$myapp#v1#user#id_${id}`),
+            ...Array.from({ length: 300 }, (_, n) =>
+              row(
+                id,
+                `$myapp#v1#user#deleted#id_${id}#2024-01-01T00:00:${String(n).padStart(3, "0")}Z`,
+              ),
+            ),
+          ]),
+        )
+        mockQuery.mockReset()
+        mockQuery.mockImplementation(servePartition(deleted))
+        const items = yield* Query.collect(historyQuery().pipe(Query.limit(5)))
+        expect(items.map((i) => i.id)).toEqual(["a", "b", "c"])
+        expect(mockQuery.mock.calls.length).toBeLessThanOrEqual(10)
+        // Paging through them a page of two at a time stays logarithmic too.
+        mockQuery.mockClear()
+        const page = yield* Query.execute(historyQuery().pipe(Query.limit(2)))
+        expect(page.items.map((i) => i.id)).toEqual(["a", "b"])
+        expect(mockQuery.mock.calls.length).toBeLessThanOrEqual(10)
+        mockQuery.mockClear()
+        const rest = yield* Query.execute(
+          historyQuery().pipe(Query.limit(2), Query.startFrom(page.cursor!)),
+        )
+        expect(rest.items.map((i) => i.id)).toEqual(["c"])
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 

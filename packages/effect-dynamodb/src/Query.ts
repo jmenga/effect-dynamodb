@@ -773,16 +773,31 @@ const buildDynamoCommand = (
  * - A client-side predicate ({@link filterBy}) rejects rows even later, after
  *   decode, so it disqualifies the budget for exactly the same reason.
  * - Rows dropped as history ({@link QueryState.liveRows}, a prepared `keep`)
- *   are not: the budget still bounds the request, and the accumulate loop
- *   fetches another page for any it drops (#133).
+ *   are not: they can't be skipped server-side, and a run of them (an item's
+ *   versions, its tombstones) can far outnumber the items. The first request
+ *   asks for `limit`, and each later one twice the last — so a run of `n`
+ *   history rows costs about `log2(n / limit)` requests, not `n / limit` — and
+ *   the surplus past `limit` is discarded, the cursor rebuilt from the last
+ *   item returned (#133). `pageSize`, when set, is used as is.
+ *
+ * `page` is the request's 1-based number within the terminal.
  */
+/** The largest `Limit` a growing request asks for: DynamoDB stops at 1 MB anyway. */
+const MAX_GROWN_LIMIT = 100_000
+
 const computeRequestLimit = (
   state: QueryState,
   remaining: number | undefined,
+  page = 1,
 ): number | undefined => {
   const pageSize = state.pageSizeValue
   if (remaining === undefined) return pageSize
   if (state.exprFilters.length > 0 || state.predicates.length > 0) return pageSize
+  if (dropsRows(state)) {
+    if (pageSize !== undefined) return pageSize
+    const limit = state.limitValue ?? remaining
+    return Math.min(limit * 2 ** (page - 1), MAX_GROWN_LIMIT)
+  }
   return pageSize === undefined ? remaining : Math.min(pageSize, remaining)
 }
 
@@ -968,7 +983,7 @@ export const execute = <A>(
       const cmd = buildDynamoCommand(
         state,
         tableName,
-        { ExclusiveStartKey: startKey, Limit: computeRequestLimit(state, remaining) },
+        { ExclusiveStartKey: startKey, Limit: computeRequestLimit(state, remaining, pageCount) },
         borrowedFields,
       )
       const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
@@ -1096,7 +1111,7 @@ const pageStream = <A>(
           tableName,
           {
             ExclusiveStartKey: pageState.key,
-            Limit: computeRequestLimit(state, remaining),
+            Limit: computeRequestLimit(state, remaining, pageCount),
           },
           borrowedFields,
         )
@@ -1195,7 +1210,7 @@ export const count = <A>(
         const remaining = limitValue === undefined ? undefined : limitValue - counted
         const cmd = buildDynamoCommand(judging, tableName, {
           ExclusiveStartKey: start,
-          Limit: computeRequestLimit(state, remaining),
+          Limit: computeRequestLimit(state, remaining, pages),
         })
         const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
         const rows = (result.Items ?? []) as Array<Record<string, AttributeValue>>
