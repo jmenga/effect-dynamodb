@@ -21,6 +21,8 @@ import {
 import { beforeEach, vi } from "vitest"
 import type { DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
+import { createConditionOps, type Expr } from "../src/internal/Expr.js"
+import { createPathBuilder } from "../src/internal/PathBuilder.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
@@ -6926,6 +6928,155 @@ describe("Entity", () => {
         expect(call.ConditionExpression).toContain("attribute_exists")
         expect(call.ConditionExpression).toMatch(/ = /)
         expect(call.ConditionExpression).toContain(" AND ")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  describe("an op's own guard is structural (#133)", () => {
+    const Plain = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "SimpleItem",
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
+        },
+      }),
+    )
+    const ccf = () =>
+      Object.assign(new Error("conditional"), { name: "ConditionalCheckFailedException" })
+    const notExists = "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))"
+
+    it.effect("create keeps its not-exists guard whatever .condition() is added", () =>
+      Effect.gen(function* () {
+        mockPutItem.mockResolvedValue({})
+        const sent = () => mockPutItem.mock.calls.at(-1)![0]
+        yield* Plain.create({ itemId: "i-1", name: "n" }).asEffect()
+        expect(sent().ConditionExpression).toBe(notExists)
+        yield* Plain.create({ itemId: "i-1", name: "n" }).pipe(Plain.condition({})).asEffect()
+        expect(sent().ConditionExpression).toBe(notExists)
+        expect(sent().ExpressionAttributeNames).toEqual({ "#e0": "pk", "#e1": "sk" })
+        yield* Plain.create({ itemId: "i-1", name: "n" })
+          .pipe(Plain.condition({ name: "a" }), Plain.condition({}))
+          .asEffect()
+        expect(sent().ConditionExpression).toBe(notExists)
+        yield* Plain.create({ itemId: "i-1", name: "n" })
+          .pipe(Plain.condition({ name: "b" }))
+          .asEffect()
+        expect(sent().ConditionExpression).toBe(`(${notExists}) AND (#e2 = :e3)`)
+        expect(sent().ExpressionAttributeNames).toEqual({ "#e0": "pk", "#e1": "sk", "#e2": "name" })
+        // An existing item: the guard fails it, whatever was added.
+        mockPutItem.mockRejectedValueOnce(ccf())
+        const error = yield* Plain.create({ itemId: "i-1", name: "n" })
+          .pipe(Plain.condition({}))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ConditionalCheckFailed")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("patch keeps its exists guard; a missing item is ConditionalCheckFailed", () =>
+      Effect.gen(function* () {
+        mockUpdateItem.mockResolvedValue({
+          Attributes: toAttributeMap({ itemId: "i-1", name: "m" }),
+        })
+        const sent = () => mockUpdateItem.mock.calls.at(-1)![0]
+        for (const added of [{}, { name: "b" }]) {
+          yield* Plain.patch({ itemId: "i-1" })
+            .pipe(Entity.set({ name: "m" }), Plain.condition({ name: "a" }), Plain.condition(added))
+            .asEffect()
+          const names = sent().ExpressionAttributeNames as Record<string, string>
+          const pk = Object.keys(names).find((k) => names[k] === "pk" && k.startsWith("#e"))
+          expect(pk).toBeDefined()
+          expect(sent().ConditionExpression).toContain(`attribute_exists(${pk})`)
+          expect(Object.values(sent().ExpressionAttributeValues ?? {})).not.toContainEqual({
+            S: "a",
+          })
+        }
+        // S1: no item → ConditionalCheckFailed, not OptimisticLockError(-1, -1).
+        for (const added of [{}, { name: "b" }]) {
+          mockUpdateItem.mockRejectedValueOnce(ccf())
+          const error = yield* Plain.patch({ itemId: "i-1" })
+            .pipe(Entity.set({ name: "m" }), Plain.condition(added))
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(error._tag).toBe("ConditionalCheckFailed")
+        }
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("deleteIfExists(k).condition(x).condition({}) asserts existence only", () =>
+      Effect.gen(function* () {
+        mockDeleteItem.mockResolvedValue({})
+        yield* Plain.deleteIfExists({ itemId: "i-1" })
+          .pipe(Plain.condition({ name: "x" }), Plain.condition({}))
+          .asEffect()
+        const call = mockDeleteItem.mock.calls[0]![0]
+        expect(call.ConditionExpression).toBe("attribute_exists(#e0)")
+        expect(call.ExpressionAttributeNames).toEqual({ "#e0": "pk" })
+        expect(call.ExpressionAttributeValues).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it("the combinator is the one place an empty condition becomes none", () => {
+      const ops = createConditionOps<{ name: string }>()
+      const pb = createPathBuilder<{ name: string }>()
+      const op = Plain.put({ itemId: "i-1", name: "n" })
+      const conditionOf = (cond: Record<string, unknown> | (() => Expr)) =>
+        (
+          op.pipe(
+            Plain.condition({ name: "a" }),
+            typeof cond === "function" ? Plain.condition(cond) : Plain.condition(cond),
+          ) as unknown as { readonly _condition: unknown }
+        )._condition
+      expect(conditionOf({})).toBeUndefined()
+      expect(conditionOf(() => ops.and())).toBeUndefined()
+      expect(conditionOf(() => ops.and(ops.and(), ops.and()))).toBeUndefined()
+      // Kept — and refused when it runs.
+      expect(conditionOf(() => ops.or())).toMatchObject({ _tag: "or", exprs: [] })
+      expect(conditionOf(() => ops.not(ops.and()))).toMatchObject({ _tag: "not" })
+      const kept = ops.and(ops.eq(pb.name, "b"), ops.and())
+      expect(conditionOf(() => kept)).toBe(kept)
+      const del = Plain.deleteIfExists({ itemId: "i-1" }).pipe(Plain.condition({})) as any
+      expect(del._condition).toBeUndefined()
+      expect(del._mustExist).toBe(true)
+    })
+
+    it.effect("an empty part under or or not in a condition is refused unsent, on every op", () =>
+      Effect.gen(function* () {
+        const ops = createConditionOps<{ name: string }>()
+        const pb = createPathBuilder<{ name: string }>()
+        const refused = [
+          ops.or(ops.eq(pb.name, "a"), ops.and()),
+          ops.not(ops.and()),
+          ops.or(),
+          ops.and(ops.eq(pb.name, "a"), ops.or(ops.and(ops.and()))),
+        ]
+        for (const expr of refused) {
+          const cond = () => expr
+          const runs = [
+            Plain.put({ itemId: "i-1", name: "n" }).pipe(Plain.condition(cond)).asEffect(),
+            Plain.create({ itemId: "i-1", name: "n" }).pipe(Plain.condition(cond)).asEffect(),
+            Plain.update({ itemId: "i-1" })
+              .pipe(Entity.set({ name: "m" }), Plain.condition(cond))
+              .asEffect(),
+            Plain.patch({ itemId: "i-1" })
+              .pipe(Entity.set({ name: "m" }), Plain.condition(cond))
+              .asEffect(),
+            Plain.delete({ itemId: "i-1" }).pipe(Plain.condition(cond)).asEffect(),
+            Plain.deleteIfExists({ itemId: "i-1" }).pipe(Plain.condition(cond)).asEffect(),
+          ]
+          for (const run of runs) {
+            const error = yield* Effect.flip(
+              run as unknown as Effect.Effect<unknown, { readonly _tag: string }>,
+            )
+            expect(error._tag).toBe("ValidationError")
+          }
+        }
+        expect(mockPutItem).not.toHaveBeenCalled()
+        expect(mockUpdateItem).not.toHaveBeenCalled()
+        expect(mockDeleteItem).not.toHaveBeenCalled()
+        expect(mockGetItem).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )
   })

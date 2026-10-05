@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest"
 import { DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Stream } from "effect"
 import { beforeEach, vi } from "vitest"
+import type { DynamoClient } from "../src/DynamoClient.js"
 import { createConditionOps } from "../src/internal/Expr.js"
 import { createPathBuilder } from "../src/internal/PathBuilder.js"
 import { toAttributeMap } from "../src/Marshaller.js"
@@ -637,7 +638,7 @@ describe("Query", () => {
   // -------------------------------------------------------------------------
 
   describe("a filter beside the ownership clause (#133)", () => {
-    it.effect("an empty part of a filter compiles to nothing, never `()`", () =>
+    it.effect("an empty part directly under and, or a whole empty filter, is left out", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValue({ Items: [] })
         const ops = createConditionOps<{ id: string; name: string }>()
@@ -647,8 +648,37 @@ describe("Query", () => {
         )
         expect(mockQuery.mock.calls[0]![0].FilterExpression).toBe("#eddE IN (:et0) AND (#e0 = :e1)")
         mockQuery.mockClear()
-        yield* Query.collect(makeTestQuery().pipe(Query.filterExpr(ops.not(ops.and()))))
+        yield* Query.collect(makeTestQuery().pipe(Query.filterExpr(ops.and(ops.and()))))
         expect(mockQuery.mock.calls[0]![0].FilterExpression).toBe("#eddE IN (:et0)")
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect("an empty part under or or not, or an or() with no parts, is refused unsent", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        const ops = createConditionOps<{ id: string; name: string }>()
+        const pb = createPathBuilder<{ id: string; name: string }>()
+        const refused = [
+          ops.not(ops.and()),
+          ops.or(ops.eq(pb.id, "a"), ops.and()),
+          ops.or(ops.and()),
+          ops.or(),
+          ops.and(ops.eq(pb.name, "b"), ops.or(ops.eq(pb.id, "a"), ops.and(ops.and()))),
+          ops.not(ops.or(ops.eq(pb.id, "a"), ops.not(ops.and()))),
+        ]
+        for (const filter of refused) {
+          const query = makeTestQuery().pipe(Query.filterExpr(filter))
+          for (const run of [
+            Query.collect(query),
+            Query.execute(query),
+            Query.count(query),
+            Query.paginate(query).pipe(Effect.flatMap((pages) => Stream.runCollect(pages))),
+          ]) {
+            const error = yield* Effect.flip(run as Effect.Effect<unknown, unknown, DynamoClient>)
+            expect(error).toBeInstanceOf(ValidationError)
+          }
+        }
+        expect(mockQuery).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 

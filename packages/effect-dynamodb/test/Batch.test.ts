@@ -849,6 +849,26 @@ describe("Batch", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    it.effect("rejects create() and deleteIfExists() whatever .condition() is added (#133)", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { UserEntity, OrderEntity },
+          tables: { MainTable },
+        })
+        const input = { userId: "u-1", email: "a@x.io", name: "Alice", role: "admin" } as const
+        for (const op of [
+          UserEntity.create(input).pipe(UserEntity.condition({})),
+          db.entities.UserEntity.create(input).condition({ name: "a" }).condition({}),
+          UserEntity.deleteIfExists({ userId: "u-1" }).pipe(UserEntity.condition({})),
+          db.entities.UserEntity.deleteIfExists({ userId: "u-1" }).condition({}),
+        ]) {
+          const error = yield* Batch.write([op]).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+        }
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("rejects upsert — BatchWriteItem has no UpdateRequest", () =>
       Effect.gen(function* () {
         const db = yield* DynamoClient.make({

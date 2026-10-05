@@ -1046,6 +1046,55 @@ describe("Transaction", () => {
     )
   })
 
+  it.effect("a transacted op keeps its own guard whatever .condition() is added (#133)", () =>
+    Effect.gen(function* () {
+      mockTransactWriteItems.mockResolvedValue({})
+      const db = yield* DynamoClient.make({
+        entities: { UserEntity, OrderEntity },
+        tables: { MainTable },
+      })
+      const input = { userId: "u-g", email: "g@x.io", name: "G", role: "member" } as const
+      const notExists = "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))"
+      yield* Transaction.transactWrite([
+        UserEntity.create(input).pipe(
+          UserEntity.condition({ name: "a" }),
+          UserEntity.condition({}),
+        ),
+        db.entities.OrderEntity.deleteIfExists({ orderId: "o-g" })
+          .condition({ status: "shipped" })
+          .condition({}),
+      ])
+      const [put, del] = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+      expect(put.Put.ConditionExpression).toBe(notExists)
+      expect(put.Put.ExpressionAttributeNames).toEqual({ "#e0": "pk", "#e1": "sk" })
+      expect(del.Delete.ConditionExpression).toBe("attribute_exists(#e0)")
+      expect(del.Delete.ExpressionAttributeNames).toEqual({ "#e0": "pk" })
+      yield* Transaction.transactWrite([
+        db.entities.UserEntity.create(input).condition({ name: "G" }),
+      ])
+      const guarded = mockTransactWriteItems.mock.calls[1]![0].TransactItems[0].Put
+      expect(guarded.ConditionExpression).toBe(`(${notExists}) AND (#e2 = :e3)`)
+      expect(guarded.ExpressionAttributeNames).toEqual({ "#e0": "pk", "#e1": "sk", "#e2": "name" })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("an empty part under or or not in a transacted condition is refused (#133)", () =>
+    Effect.gen(function* () {
+      const input = { userId: "u-r", email: "r@x.io", name: "R", role: "member" } as const
+      for (const cond of [
+        UserEntity.condition((t, { or, eq, and }) => or(eq(t.name, "a"), and())),
+        UserEntity.condition((_, { not, and }) => not(and())),
+        UserEntity.condition((_, { or }) => or()),
+      ]) {
+        const error = yield* Transaction.transactWrite([UserEntity.put(input).pipe(cond)]).pipe(
+          Effect.flip,
+        )
+        expect(error._tag).toBe("ValidationError")
+      }
+      expect(mockTransactWriteItems).not.toHaveBeenCalled()
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
   it.effect("an empty condition on a transaction op is no condition (#133)", () =>
     Effect.gen(function* () {
       mockTransactWriteItems.mockResolvedValueOnce({})

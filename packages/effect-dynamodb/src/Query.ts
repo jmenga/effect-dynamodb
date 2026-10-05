@@ -9,11 +9,11 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import { Effect, Function, Option, Pipeable, Stream } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
-import { compileExpr, type Expr, ExprTag } from "./internal/Expr.js"
+import { compileExpr, type Expr, ExprTag, emptyPartProblem, isEmptyExpr } from "./internal/Expr.js"
 import { compilePath } from "./internal/PathBuilder.js"
 import { fromAttributeMap, toAttributeValue } from "./Marshaller.js"
 
@@ -485,11 +485,12 @@ export const filterExpr: {
   (expr: Expr): <A>(self: Query<A>) => Query<A>
   <A>(self: Query<A>, expr: Expr): Query<A>
 } = Function.dual(2, <A>(self: Query<A>, expr: Expr): Query<A> => {
-  // An empty shorthand (`.filter({})`) parses to an empty `and`, which
-  // compiles to the empty string — and `FilterExpression: ""` is rejected by
-  // DynamoDB. A predicate over no attributes is a no-op, so drop it here
-  // rather than emitting an unusable request.
-  if ((expr._tag === "and" || expr._tag === "or") && expr.exprs.length === 0) return self
+  // A filter that asserts nothing (`.filter({})`, `and()`) is no filter: it is
+  // dropped here, never sent as `FilterExpression: ""`, which DynamoDB
+  // rejects (#133). An empty part anywhere else — under `or` or `not`, or an
+  // `or()` with no parts — is kept, and refused when the query runs
+  // (`emptyPartProblem`).
+  if (isEmptyExpr(expr)) return self
   return new QueryImpl<A>({
     ...self._state,
     exprFilters: [...self._state.exprFilters, expr],
@@ -624,11 +625,7 @@ const buildFilterClauses = (state: QueryState) => {
     // Parenthesised beside the ownership clause: a top-level `OR` would
     // otherwise bind looser than the `AND` and admit other entities' rows
     // (`#eddE IN (:et0) AND a OR b`).
-    if (compiled.expression !== "") {
-      filterClauses.push(
-        filterClauses.length > 0 ? `(${compiled.expression})` : compiled.expression,
-      )
-    }
+    filterClauses.push(filterClauses.length > 0 ? `(${compiled.expression})` : compiled.expression)
     Object.assign(names, compiled.names)
     Object.assign(values, compiled.values)
   }
@@ -828,8 +825,22 @@ const isExcludedRow = (state: QueryState, row: Record<string, AttributeValue>): 
 const prepared = (
   state: QueryState,
   tableName: string,
-): Effect.Effect<QueryState, DynamoClientError, DynamoClient> =>
-  state.prepare === undefined
+): Effect.Effect<QueryState, DynamoClientError | ValidationError, DynamoClient> => {
+  // A filter with an empty part where none may be is refused before
+  // anything is sent (#133).
+  for (const filter of state.exprFilters) {
+    const problem = emptyPartProblem(filter)
+    if (problem !== undefined) {
+      return Effect.fail(
+        new ValidationError({
+          entityType: state.entityTypes.join(", ") || "unknown",
+          operation: "query.filter",
+          cause: `filter: ${problem} Nothing was sent.`,
+        }),
+      )
+    }
+  }
+  return state.prepare === undefined
     ? Effect.succeed(state)
     : Effect.map(state.prepare(tableName), (prep) => {
         const swap = prep.replaceBeginsWith
@@ -847,6 +858,7 @@ const prepared = (
                 ),
         }
       })
+}
 
 /** @internal Does the decoded item pass every client-side predicate? */
 const accepts = (state: QueryState, item: unknown): boolean => {

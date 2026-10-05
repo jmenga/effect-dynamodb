@@ -8,7 +8,10 @@ import * as Entity from "../src/Entity.js"
 import {
   compileExpr,
   createConditionOps,
+  emptyPartProblem,
+  isEmptyExpr,
   isExpr,
+  nonEmptyCondition,
   parseShorthand,
   parseSimpleShorthand,
 } from "../src/internal/Expr.js"
@@ -131,6 +134,50 @@ describe("Expr", () => {
       expect(isExpr(null)).toBe(false)
       expect(isExpr({})).toBe(false)
       expect(isExpr("hello")).toBe(false)
+    })
+  })
+
+  describe("empty parts (#133)", () => {
+    const ops = createConditionOps<{ a: string; b: string }>()
+    const pb = createPathBuilder<{ a: string; b: string }>()
+    const x = ops.eq(pb.a, "1")
+
+    it("only an and of nothing is empty; a whole empty condition is none", () => {
+      expect(isEmptyExpr(ops.and())).toBe(true)
+      expect(isEmptyExpr(ops.and(ops.and(), ops.and(ops.and())))).toBe(true)
+      expect(isEmptyExpr(parseShorthand({}))).toBe(true)
+      expect(isEmptyExpr(ops.or())).toBe(false)
+      expect(isEmptyExpr(ops.not(ops.and()))).toBe(false)
+      expect(isEmptyExpr(ops.and(x, ops.and()))).toBe(false)
+      expect(nonEmptyCondition({})).toBeUndefined()
+      expect(nonEmptyCondition(ops.and(ops.and()))).toBeUndefined()
+      expect(nonEmptyCondition(undefined)).toBeUndefined()
+      expect(nonEmptyCondition(ops.or())).toEqual(ops.or())
+      expect(nonEmptyCondition({ eq: { a: "1" } })).toEqual({ eq: { a: "1" } })
+    })
+
+    it("an empty part directly under and is left out", () => {
+      expect(emptyPartProblem(ops.and(x, ops.and(), ops.and(ops.and())))).toBeUndefined()
+      expect(emptyPartProblem(ops.not(ops.and(x, ops.and())))).toBeUndefined()
+      expect(compileExpr(ops.and(x, ops.and())).expression).toBe("#e0 = :e1")
+      expect(compileExpr(ops.not(ops.and(x, ops.and()))).expression).toBe("NOT (#e0 = :e1)")
+    })
+
+    it("an empty part under or or not, or an or() with no parts, is a problem", () => {
+      for (const expr of [
+        ops.or(),
+        ops.or(ops.and()),
+        ops.or(x, ops.and()),
+        ops.or(x, ops.and(ops.and())),
+        ops.not(ops.and()),
+        ops.and(x, ops.or(x, ops.and())),
+        ops.and(x, ops.not(ops.and(ops.and()))),
+        ops.not(ops.or(x, ops.or())),
+      ]) {
+        expect(emptyPartProblem(expr)).toBeDefined()
+      }
+      expect(emptyPartProblem(ops.or(x, ops.eq(pb.b, "2")))).toBeUndefined()
+      expect(emptyPartProblem(ops.not(x))).toBeUndefined()
     })
   })
 

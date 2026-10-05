@@ -26,8 +26,6 @@ import {
   type EntityUpdate,
   EntityUpdateImpl,
   EntityUpdateTypeId,
-  existenceBase,
-  existenceConditions,
   type PathAddOp,
   type PathAppendOp,
   type PathDeleteOp,
@@ -38,7 +36,7 @@ import {
   type ReturnValuesMode,
   type UpdateReturn,
 } from "./EntityOps.js"
-import { compileExpr, type Expr, ExprTag, isExpr, parseShorthand } from "./Expr.js"
+import { type Expr, nonEmptyCondition } from "./Expr.js"
 
 // ---------------------------------------------------------------------------
 // Terminal functions — select decode mode for EntityOp intermediates
@@ -277,8 +275,6 @@ export type ConditionPipeable = <T extends ConditionTarget>(
 ) => WithConditionalCheckFailed<T>
 
 /** @internal Whether a condition compiles to nothing (`{}`, `and()`). */
-const isEmptyCondition = (cond: Expr | ConditionInput): boolean =>
-  compileExpr(isExpr(cond) ? cond : parseShorthand(cond as ConditionInput)).expression === ""
 
 /**
  * Add a condition expression to a put, update, or delete operation.
@@ -296,34 +292,18 @@ export const condition: {
 } = Fn.dual(2, <T extends ConditionTarget>(self: T, given: Expr | ConditionInput): T => {
   // An empty condition (`{}`, `and()`) is no condition (#133): like any later
   // `.condition()`, it replaces an earlier one — with none.
-  const cond = isEmptyCondition(given) ? undefined : given
+  const cond = nonEmptyCondition(given)
   if (EntityDeleteTypeId in self) {
-    // EntityDelete. `deleteIfExists`'s existence check is kept: a condition
-    // added to it is ANDed with it, never in its place (#133).
+    // EntityDelete. `deleteIfExists`'s existence check is the op's own guard
+    // (`_mustExist`), never its condition: it stays, ANDed with this one.
     const impl = self as unknown as EntityDeleteImpl<any, any>
-    const existing = impl._condition
-    let next: Expr | ConditionInput | undefined = cond
-    const kind = existing === undefined ? undefined : existenceConditions.get(existing as object)
-    if (kind !== undefined) {
-      // Like every op's `.condition()`, a later one replaces an earlier one —
-      // the existence check is the op's own guard, and stays.
-      const base = kind === "existenceOnly" ? existing! : existenceBase.get(existing as object)!
-      const asExpr = (c: Expr | ConditionInput): Expr =>
-        isExpr(c) ? c : parseShorthand(c as ConditionInput)
-      if (cond === undefined) {
-        next = base
-      } else {
-        next = { [ExprTag]: ExprTag, _tag: "and", exprs: [asExpr(base), asExpr(cond)] } as Expr
-        existenceConditions.set(next as object, "mustExist")
-        existenceBase.set(next as object, base as object)
-      }
-    }
     return new EntityDeleteImpl(
       impl._builder,
       impl._entity,
       impl._key,
-      next,
+      cond,
       impl._returnValues,
+      impl._mustExist,
     ) as unknown as T
   }
   if (EntityUpdateTypeId in self) {
@@ -454,6 +434,7 @@ export const returnValues: {
       impl._key,
       impl._condition,
       mode,
+      impl._mustExist,
     ) as unknown as T
   }
   // EntityUpdate

@@ -34,7 +34,7 @@ import type { ConditionInput, ExpressionResult } from "../Expression.js"
 import { toAttributeMap } from "../Marshaller.js"
 import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import type { BoundWriteOp } from "./BoundCrud.js"
-import { compileExpr, type Expr, isExpr, parseShorthand } from "./Expr.js"
+import { compileExpr, type Expr, emptyPartProblem, isExpr, parseShorthand } from "./Expr.js"
 import { TRANSACT_WRITE_MAX_BYTES, transactItemBytes } from "./ItemSize.js"
 import {
   composePrimaryKey,
@@ -93,9 +93,32 @@ const compileOpCondition = (
 ): ExpressionResult | undefined => {
   if (cond === undefined) return undefined
   const expr = isExpr(cond) ? cond : parseShorthand(cond as Record<string, unknown>)
-  const compiled = compileExpr(expr, entity._resolveDbName) as ExpressionResult
-  // An empty condition (`{}`) is no condition (#133).
-  return compiled.expression === "" ? undefined : compiled
+  return compileExpr(expr, entity._resolveDbName) as ExpressionResult
+}
+
+/**
+ * An op's condition with an empty part where none may be (#133) is refused
+ * before anything is sent — see `emptyPartProblem`.
+ */
+const refuseEmptyParts = (
+  entity: Entity,
+  operation: string,
+  opType: string,
+  cond: Expr | ConditionInput | undefined,
+): Effect.Effect<void, ValidationError> => {
+  const problem =
+    cond === undefined
+      ? undefined
+      : emptyPartProblem(isExpr(cond) ? cond : parseShorthand(cond as Record<string, unknown>))
+  return problem === undefined
+    ? Effect.void
+    : Effect.fail(
+        new ValidationError({
+          entityType: entity.entityType,
+          operation: `${operation}.condition`,
+          cause: `${operation} (${opType}): ${problem} Nothing was sent.`,
+        }),
+      )
 }
 
 /**
@@ -350,6 +373,7 @@ export const buildTransactWriteItems = (
 
       if (info.opType === "put") {
         yield* rejectUnsupportedOp(info.entity, operation, "put", info.putKind, info.input)
+        yield* refuseEmptyParts(info.entity, operation, "put", info.condition)
         opInfos.push({
           type: "put",
           putKind: info.putKind,
@@ -360,6 +384,7 @@ export const buildTransactWriteItems = (
         })
       } else if (info.opType === "delete") {
         yield* rejectUnsupportedOp(info.entity, operation, "delete", undefined)
+        yield* refuseEmptyParts(info.entity, operation, "delete", info.condition)
         opInfos.push({
           type: "delete",
           entity: info.entity,

@@ -88,9 +88,11 @@ import {
   compileExpr,
   createConditionOps,
   type Expr,
+  emptyPartProblem,
   isExpr,
   parseShorthand,
   parseSimpleShorthand,
+  toExpr,
 } from "./internal/Expr.js"
 import { compilePath, createPathBuilder } from "./internal/PathBuilder.js"
 import {
@@ -170,10 +172,10 @@ import {
   type EntityUpdate,
   EntityUpdateImpl,
   emptyUpdateState,
-  existenceConditions,
   type PutKind,
   type ReturnValuesMode,
   type UpdateState,
+  withGuard,
 } from "./internal/EntityOps.js"
 
 export {
@@ -1658,9 +1660,7 @@ const compileCondition = (
   | undefined => {
   if (cond === undefined) return undefined
   const expr = isExpr(cond) ? cond : parseShorthand(cond)
-  const compiled = compileExpr(expr, resolveDbNameFn)
-  // An empty condition (`{}`) is no condition (#133).
-  return compiled.expression === "" ? undefined : compiled
+  return compileExpr(expr, resolveDbNameFn)
 }
 
 const TRANSACTION_LIMIT = 100
@@ -5012,10 +5012,21 @@ const makeImpl = <
             })
           }
 
-          // Build user condition expression if provided
-          const userCondition = opts.condition
-            ? compileCondition(opts.condition, resolveDbName)
-            : undefined
+          // The caller's condition, ANDed onto `create`'s not-exists guard —
+          // a guard no `.condition()` can replace (#133). `upsert`'s create
+          // attempt brings its own (`runGuardedPut` requires the item missing).
+          const condition = withGuard(
+            opts.putKind === "create" && operation !== "upsert"
+              ? {
+                  attributeNotExists: [
+                    config.indexes.primary.pk.field,
+                    config.indexes.primary.sk.field,
+                  ],
+                }
+              : undefined,
+            opts.condition,
+          )
+          const userCondition = condition ? compileCondition(condition, resolveDbName) : undefined
 
           if (guarded) {
             const plan = yield* runGuardedPut({
@@ -5054,7 +5065,7 @@ const makeImpl = <
             }
             yield* client.putItem(putInput).pipe(
               Effect.mapError((err): DynamoClientError | ConditionalCheckFailed => {
-                if (opts.condition && isAwsConditionalCheckFailed(err.cause)) {
+                if (condition && isAwsConditionalCheckFailed(err.cause)) {
                   return new ConditionalCheckFailed({
                     entityType,
                     key: encoded as globalThis.Record<string, unknown>,
@@ -5076,15 +5087,15 @@ const makeImpl = <
   // create operation — put + attribute_not_exists condition
   // ---------------------------------------------------------------------------
 
+  // The not-exists guard is the put builder's, from `putKind: "create"` —
+  // never the op's condition, which `.condition()` replaces (#133).
   const create = (input: unknown) => {
-    const pkField = config.indexes.primary.pk.field
-    const skField = config.indexes.primary.sk.field
     const op = put(input)
     return new EntityPutImpl(
       op._builder,
       op._entity,
       op._input,
-      { attributeNotExists: [pkField, skField] },
+      op._condition,
       op._withVectors,
       "create",
     )
@@ -5094,12 +5105,13 @@ const makeImpl = <
   // patch operation — update + attribute_exists condition
   // ---------------------------------------------------------------------------
 
+  // The exists guard is `runUpdate`'s, from `patch: true` — never the op's
+  // condition, which `.condition()` replaces (#133).
   const patch = (key: unknown) => {
-    const pkField = config.indexes.primary.pk.field
     const op = update(key)
     return new EntityUpdateImpl(
       op._builder,
-      { ...op._updateState, condition: { attributeExists: [pkField] }, patch: true },
+      { ...op._updateState, patch: true },
       op._entity,
       op._key,
     )
@@ -5214,7 +5226,12 @@ const makeImpl = <
         uState.cascade !== undefined && (requestedRv === "allOld" || requestedRv === "updatedOld")
       const updates = uState.updates
       const evExpected = uState.expectedVersion
-      const userCond = uState.condition
+      // The caller's condition, ANDed onto `patch`'s exists guard — a guard
+      // no `.condition()` can replace (#133).
+      const userCond = withGuard(
+        uState.patch ? { attributeExists: [config.indexes.primary.pk.field] } : undefined,
+        uState.condition,
+      )
       const client = yield* DynamoClient
       const tc = yield* tableTag
       const tableName = tc.name
@@ -6985,6 +7002,7 @@ const makeImpl = <
       (opts: {
         readonly condition: Expr | ConditionInput | undefined
         readonly returnValues: ReturnValuesMode | undefined
+        readonly mustExist: boolean
       }) =>
         Effect.gen(function* () {
           const client = yield* DynamoClient
@@ -7009,13 +7027,9 @@ const makeImpl = <
           // a race like an unconditioned one.
           const readsFirst = isSoftDeleteEnabled() || hasUniqueConstraints || isRetainEnabled()
           // `deleteIfExists` (alone, or ANDed with a `.condition()`): a missing
-          // item fails its condition.
-          const existence =
-            opts.condition === undefined
-              ? undefined
-              : existenceConditions.get(opts.condition as object)
-          const existenceOnly = readsFirst && existence === "existenceOnly"
-          const mustExist = existence !== undefined
+          // item fails its condition — a guard no `.condition()` replaces.
+          const mustExist = opts.mustExist
+          const existenceOnly = readsFirst && mustExist && opts.condition === undefined
           if (
             opts.returnValues !== undefined &&
             opts.returnValues !== "none" &&
@@ -7029,11 +7043,13 @@ const makeImpl = <
                 'supports — only "none" and "allOld". Nothing was sent.',
             })
           }
-          // Build user condition expression if provided
+          // The caller's condition, ANDed onto `deleteIfExists`'s exists guard.
+          const condition = withGuard(
+            mustExist ? { attributeExists: [primary.pk.field] } : undefined,
+            opts.condition,
+          )
           const userCondition =
-            opts.condition && !existenceOnly
-              ? compileCondition(opts.condition, resolveDbName)
-              : undefined
+            condition && !existenceOnly ? compileCondition(condition, resolveDbName) : undefined
           /**
            * What the delete returns: with `returnValues("allOld")`, the item it
            * removed — the one read (every read-first delete is guarded on it) or
@@ -7518,11 +7534,15 @@ const makeImpl = <
   // ---------------------------------------------------------------------------
 
   const deleteIfExists = (key: unknown) => {
-    const pkField = config.indexes.primary.pk.field
     const op = del(key)
-    const exists: ConditionInput = { attributeExists: [pkField] }
-    existenceConditions.set(exists, "existenceOnly")
-    return new EntityDeleteImpl(op._builder, op._entity, op._key, exists, op._returnValues)
+    return new EntityDeleteImpl(
+      op._builder,
+      op._entity,
+      op._key,
+      op._condition,
+      op._returnValues,
+      true,
+    )
   }
 
   // ---------------------------------------------------------------------------
@@ -8025,6 +8045,15 @@ const makeImpl = <
           entityType,
           operation: "append",
           cause: "Entity is not configured with timeSeries. .append() requires timeSeries config.",
+        })
+      }
+      const emptyPart =
+        userCondition === undefined ? undefined : emptyPartProblem(toExpr(userCondition))
+      if (emptyPart !== undefined) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "append.condition",
+          cause: `append: ${emptyPart} Nothing was sent.`,
         })
       }
       const client = yield* DynamoClient
@@ -9852,6 +9881,7 @@ interface InternalEntityDelete {
   readonly _entity: Entity
   readonly _key: globalThis.Record<string, unknown>
   readonly _condition?: Expr | ConditionInput | undefined
+  readonly _mustExist?: boolean
 }
 
 const isEntityOp = (op: object): op is InternalEntityOp => EntityOpTypeId in op
@@ -9886,13 +9916,22 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
     if (target._opType === "get") {
       return { opType: "get", entity: target._entity, key: target._key }
     }
+    // An op's own guard — `create`'s not-exists, `patch`'s exists — is
+    // ANDed with the caller's condition: no `.condition()` replaces it (#133).
+    const primary = target._entity.indexes.primary!
     if (target._opType === "put") {
+      const putKind = target._putKind ?? "put"
       return {
         opType: "put",
         entity: target._entity,
         input: target._input,
-        condition: target._condition,
-        putKind: target._putKind ?? "put",
+        condition: withGuard(
+          putKind === "create"
+            ? { attributeNotExists: [primary.pk.field, primary.sk.field] }
+            : undefined,
+          target._condition,
+        ),
+        putKind,
       }
     }
     if (target._opType === "update") {
@@ -9900,18 +9939,27 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
         opType: "update",
         entity: target._entity,
         key: target._key,
-        condition: target._updateState?.condition,
+        condition: withGuard(
+          target._updateState?.patch ? { attributeExists: [primary.pk.field] } : undefined,
+          target._updateState?.condition,
+        ),
       }
     }
   }
 
-  // Check for EntityDelete intermediate
+  // Check for EntityDelete intermediate — `deleteIfExists`'s exists guard
+  // ANDed with the caller's condition.
   if (isEntityDelete(target)) {
     return {
       opType: "delete",
       entity: target._entity,
       key: target._key,
-      condition: target._condition,
+      condition: withGuard(
+        target._mustExist
+          ? { attributeExists: [target._entity.indexes.primary!.pk.field] }
+          : undefined,
+        target._condition,
+      ),
     }
   }
 

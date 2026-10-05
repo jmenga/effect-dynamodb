@@ -17547,6 +17547,127 @@ describeConnected("#133 — path operations on index composites and unique field
       }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
+  // ---- an op's own guard is never replaced by .condition() (#133) ----
+
+  it.effect("create of an existing item fails whatever condition is added", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      for (const [entity, entityType, doc] of [
+        ["Authors", "G133Author", { name: "first" }],
+        ["DevicesPlain", "G133DevicePlain", { owner: "o", label: "first" }],
+      ] as const) {
+        const docs = db.entities[entity] as any
+        const id = `cg-${entity.toLowerCase()}`
+        yield* docs.put({ id, ...doc })
+        const field = entity === "Authors" ? "name" : "label"
+        const again = { id, ...doc, [field]: "second" }
+        for (const condition of [{}, { [field]: "first" }]) {
+          const bound = yield* docs.create(again).condition(condition).asEffect().pipe(Effect.flip)
+          expect(bound._tag).toBe("ConditionalCheckFailed")
+          const unbound = yield* (g133Entities[entity] as any)
+            .create(again)
+            .pipe((g133Entities[entity] as any).condition(condition))
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(unbound._tag).toBe("ConditionalCheckFailed")
+          const inTransaction = yield* Transaction.transactWrite([
+            (g133Entities[entity] as any)
+              .create(again)
+              .pipe((g133Entities[entity] as any).condition(condition)),
+          ]).pipe(Effect.flip)
+          expect(inTransaction._tag).toBe("TransactionCancelled")
+          expect((yield* rawItem(entityType, id))[field]).toEqual({ S: "first" })
+        }
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("patch of a missing item fails its existence check whatever condition is added", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const authors = db.entities.Authors as any
+      for (const condition of [{}, { name: "x" }]) {
+        const missing = yield* authors
+          .patch({ id: "pg-missing" })
+          .set({ name: "n" })
+          .condition(condition)
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(missing._tag).toBe("ConditionalCheckFailed")
+        expect(yield* rawItem("G133Author", "pg-missing")).toBeUndefined()
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("deleteIfExists of a missing item fails whatever condition is added", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const devices = db.entities.DevicesPlain as any
+      const Devices = g133Entities.DevicesPlain as any
+      for (const condition of [{}, { label: "first" }]) {
+        const key = { id: "dg-missing" }
+        const bound = yield* devices
+          .deleteIfExists(key)
+          .condition(condition)
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(bound._tag).toBe("ConditionalCheckFailed")
+        const unbound = yield* Devices.deleteIfExists(key)
+          .pipe(Devices.condition(condition))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(unbound._tag).toBe("ConditionalCheckFailed")
+        const inTransaction = yield* Transaction.transactWrite([
+          Devices.deleteIfExists(key).pipe(Devices.condition(condition)),
+        ]).pipe(Effect.flip)
+        expect(inTransaction._tag).toBe("TransactionCancelled")
+      }
+      // A later `.condition({})` replaces an earlier one; existence stays.
+      yield* devices.put({ id: "dg-present", owner: "o", label: "first" })
+      yield* devices
+        .deleteIfExists({ id: "dg-present" })
+        .condition({ label: "other" })
+        .condition({})
+      expect(yield* rawItem("G133DevicePlain", "dg-present")).toBeUndefined()
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- an empty part under or / not is refused, never dropped (#133) ----
+
+  it.effect("an empty part under or or not is refused before anything is sent", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const devices = db.entities.DevicesPlain as any
+      const refused = [
+        (t: any, { or, eq, and }: any) => or(eq(t.label, "first"), and()),
+        (_: any, { not, and }: any) => not(and()),
+        (_: any, { or }: any) => or(),
+      ]
+      yield* devices.put({ id: "ep-1", owner: "ep", label: "first" })
+      for (const cond of refused) {
+        const put = yield* devices
+          .put({ id: "ep-2", owner: "ep", label: "x" })
+          .condition(cond)
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(put._tag).toBe("ValidationError")
+        expect(yield* rawItem("G133DevicePlain", "ep-2")).toBeUndefined()
+        const del = yield* devices
+          .delete({ id: "ep-1" })
+          .condition(cond)
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(del._tag).toBe("ValidationError")
+        expect(yield* rawItem("G133DevicePlain", "ep-1")).toBeDefined()
+        const filtered = yield* devices.scan().filter(cond).collect().pipe(Effect.flip)
+        expect(filtered._tag).toBe("ValidationError")
+      }
+      // Directly under and, or as the whole filter, an empty part is none.
+      const kept = (t: any, { and, eq }: any) => and(eq(t.owner, "ep"), and())
+      expect((yield* devices.scan().filter(kept).collect()).map((d: any) => d.id)).toEqual(["ep-1"])
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
   // ---- a filter never widens the ownership check (#133) ----
 
   it.effect("a top-level OR filter returns only the entity's own rows", () =>

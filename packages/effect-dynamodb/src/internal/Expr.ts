@@ -358,24 +358,100 @@ export const compileExpr = (
         return `begins_with(${compileOperand(node.operand)}, ${compileOperand(node.prefix)})`
       case "contains":
         return `contains(${compileOperand(node.operand)}, ${compileOperand(node.value)})`
-      // An empty part (`and()`, a `{}` shorthand) is no condition: it is left
-      // out, never compiled to `()`, which DynamoDB rejects (#133).
-      case "and":
-      case "or": {
+      // An empty part (`and()`, a `{}` shorthand) directly under `and` is no
+      // condition: it is left out, never compiled to `()`, which DynamoDB
+      // rejects (#133). Under `or` or `not` it has no meaning that would not
+      // widen the expression — `emptyPartProblem` refuses it before sending,
+      // and it is compiled as written here, never silently dropped.
+      case "and": {
         const parts = node.exprs.map((e) => compile(e)).filter((part) => part !== "")
         if (parts.length === 0) return ""
         if (parts.length === 1) return parts[0]!
-        return parts.map((part) => `(${part})`).join(node._tag === "and" ? " AND " : " OR ")
+        return parts.map((part) => `(${part})`).join(" AND ")
       }
-      case "not": {
-        const inner = compile(node.expr)
-        return inner === "" ? "" : `NOT (${inner})`
+      case "or": {
+        const parts = node.exprs.map((e) => compile(e))
+        if (parts.length === 1) return parts[0]!
+        return parts.map((part) => `(${part})`).join(" OR ")
       }
+      case "not":
+        return `NOT (${compile(node.expr)})`
     }
   }
 
   return { expression: compile(expr), names, values }
 }
+
+// ---------------------------------------------------------------------------
+// Empty parts (#133)
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether an expression asserts nothing: `and()` — a `{}` shorthand — or an
+ * `and` of only such parts. A whole condition or filter that is empty is no
+ * condition, and an empty part directly under `and` is left out.
+ */
+export const isEmptyExpr = (expr: Expr): boolean =>
+  expr._tag === "and" && expr.exprs.every((part) => isEmptyExpr(part))
+
+/**
+ * Why an expression cannot be sent, or `undefined`: an empty part anywhere but
+ * directly under `and` or as the whole expression (#133). `or(x, {})` and
+ * `not({})` have no reading that does not widen what the caller wrote — `{}`
+ * asserts nothing, so `or(x, {})` would match everything and `not({})`
+ * nothing — and `or()` with no parts matches nothing at all. Each is refused
+ * with a `ValidationError` before anything is sent, never dropped.
+ */
+export const emptyPartProblem = (expr: Expr): string | undefined => {
+  switch (expr._tag) {
+    case "and": {
+      for (const part of expr.exprs) {
+        const problem = emptyPartProblem(part)
+        if (problem !== undefined) return problem
+      }
+      return undefined
+    }
+    case "or": {
+      if (expr.exprs.length === 0) {
+        return "or() has no parts — it would match nothing. Give it at least one condition."
+      }
+      for (const part of expr.exprs) {
+        if (isEmptyExpr(part)) {
+          return (
+            "an empty part ({} or and()) under or() would match everything. " +
+            "Remove it, or give it a condition."
+          )
+        }
+        const problem = emptyPartProblem(part)
+        if (problem !== undefined) return problem
+      }
+      return undefined
+    }
+    case "not":
+      if (isEmptyExpr(expr.expr)) {
+        return (
+          "not() of an empty part ({} or and()) would match nothing. " +
+          "Remove it, or give it a condition."
+        )
+      }
+      return emptyPartProblem(expr.expr)
+    default:
+      return undefined
+  }
+}
+
+/** A condition or filter as an `Expr`: shorthand records are parsed. */
+export const toExpr = (cond: Expr | ConditionInput): Expr =>
+  isExpr(cond) ? cond : parseShorthand(cond)
+
+/**
+ * The one place an empty condition becomes no condition (#133): a whole
+ * condition that asserts nothing (`{}`, `and()`) is `undefined`; anything
+ * else — including one `emptyPartProblem` will refuse — is kept as given.
+ */
+export const nonEmptyCondition = <C extends Expr | ConditionInput>(
+  cond: C | undefined,
+): C | undefined => (cond === undefined || isEmptyExpr(toExpr(cond)) ? undefined : cond)
 
 // ---------------------------------------------------------------------------
 // Shorthand parser — convert ConditionInput-like objects to Expr
