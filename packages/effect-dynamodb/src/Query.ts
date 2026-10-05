@@ -13,7 +13,7 @@ import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import { Effect, Function, Option, Pipeable, Stream } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
-import { compileExpr, type Expr } from "./internal/Expr.js"
+import { compileExpr, type Expr, ExprTag } from "./internal/Expr.js"
 import { compilePath } from "./internal/PathBuilder.js"
 import { fromAttributeMap, toAttributeValue } from "./Marshaller.js"
 
@@ -430,6 +430,28 @@ export const select: {
 )
 
 /**
+ * @internal A projection of stored attribute paths, decoded by `decode`: what
+ * `select` becomes when the names a caller asks for are not the names stored
+ * (#133). Always numbered placeholders (`#proj0`), whatever characters the
+ * stored names hold.
+ */
+export const selectProjected = <A>(
+  self: Query<A>,
+  storedPaths: ReadonlyArray<ReadonlyArray<string | number>>,
+  decode: (raw: Record<string, unknown>) => unknown,
+): Query<Record<string, unknown>> => {
+  if (self._state.predicates.length > 0) {
+    throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
+  }
+  return new QueryImpl<Record<string, unknown>>({
+    ...self._state,
+    projection: undefined,
+    projectionPaths: storedPaths,
+    decoder: (raw) => Effect.succeed(decode(raw) as Record<string, unknown>),
+  })
+}
+
+/**
  * @internal `select` / `selectPaths` of DOMAIN field names on an entity that
  * stores some under other names (`DynamoModel.configure(..., { field })`): the
  * projection names the stored attributes, and each item is handed back keyed
@@ -440,26 +462,19 @@ export const selectRenamed = <A>(
   paths: ReadonlyArray<ReadonlyArray<string | number>>,
   resolveDbName: (domainName: string) => string,
 ): Query<Record<string, unknown>> => {
-  if (self._state.predicates.length > 0) {
-    throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
-  }
   const heads = [...new Set(paths.map((path) => String(path[0])))]
-  const stored = paths.map((path) => [resolveDbName(String(path[0])), ...path.slice(1)])
-  const flat = stored.every((path) => path.length === 1)
-  return new QueryImpl<Record<string, unknown>>({
-    ...self._state,
-    ...(flat
-      ? { projection: stored.map((path) => String(path[0])), projectionPaths: undefined }
-      : { projectionPaths: stored }),
-    decoder: (raw) => {
+  return selectProjected(
+    self,
+    paths.map((path) => [resolveDbName(String(path[0])), ...path.slice(1)]),
+    (raw) => {
       const item: Record<string, unknown> = {}
       for (const head of heads) {
         const value = raw[resolveDbName(head)]
         if (value !== undefined) item[head] = value
       }
-      return Effect.succeed(item)
+      return item
     },
-  })
+  )
 }
 
 /**
@@ -596,9 +611,16 @@ const buildFilterClauses = (state: QueryState) => {
     })
   }
 
-  // Expr-based filters (compiled from Entity.filter() callback/shorthand API)
-  for (const expr of state.exprFilters) {
-    const compiled = compileExpr(expr)
+  // Expr-based filters (compiled from Entity.filter() callback/shorthand API).
+  // Compiled as ONE expression: each compile numbers its placeholders from
+  // zero, so two compiled apart both wrote `#e0` and the second overwrote the
+  // first's name (#133).
+  if (state.exprFilters.length > 0) {
+    const compiled = compileExpr(
+      state.exprFilters.length === 1
+        ? state.exprFilters[0]!
+        : ({ [ExprTag]: ExprTag, _tag: "and", exprs: state.exprFilters } as Expr),
+    )
     filterClauses.push(compiled.expression)
     Object.assign(names, compiled.names)
     Object.assign(values, compiled.values)

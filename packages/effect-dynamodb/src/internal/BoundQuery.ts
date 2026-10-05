@@ -12,11 +12,11 @@
 
 import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { type Effect, Stream } from "effect"
+import { Effect, Stream } from "effect"
 import type { DynamoClientError } from "../DynamoClient.js"
 import * as Query from "../Query.js"
 import type { ConditionOps, ConditionShorthand, Expr } from "./Expr.js"
-import { parseSimpleShorthand } from "./Expr.js"
+import { ExprTag, parseSimpleShorthand } from "./Expr.js"
 import type { Path, PathBuilder } from "./PathBuilder.js"
 
 /**
@@ -325,12 +325,145 @@ export interface BoundQueryConfig<Model> {
     field: string | undefined,
   ) => Query.SortKeyCondition
   /**
-   * Optional: a domain field's stored attribute name, for an entity that
-   * renames fields. `.filter()` and `.select()` name the stored attribute;
-   * `.select()` hands each item back under the domain names (#133).
+   * Optional: how `collect()` shapes the items — a collection groups them by
+   * member. Carried through every combinator, so `.filter().collect()` groups
+   * as `collect()` does (#133).
    */
-  readonly resolveDbName?: ((domainName: string) => string) | undefined
+  readonly groupCollected?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
+  /**
+   * Optional: how `.filter()` names the stored attributes of renamed fields
+   * (#133) — see {@link entityNaming} / {@link collectionNaming}.
+   */
+  readonly renameExpr?: ((expr: Expr) => Expr) | undefined
+  /**
+   * Optional: what `.select()` becomes when stored names differ from the
+   * domain names asked for (#133). Without it, a plain projection.
+   */
+  readonly selectAs?:
+    | ((
+        query: Query.Query<any>,
+        paths: ReadonlyArray<ReadonlyArray<string | number>>,
+        form: "attributes" | "paths",
+      ) => Query.Query<Record<string, unknown>>)
+    | undefined
 }
+
+/** The plain projection: the domain names are the stored names. */
+const plainSelect = (
+  query: Query.Query<any>,
+  paths: ReadonlyArray<ReadonlyArray<string | number>>,
+  form: "attributes" | "paths",
+): Query.Query<Record<string, unknown>> =>
+  form === "attributes"
+    ? Query.select(
+        query,
+        paths.map((path) => String(path[0])),
+      )
+    : Query.selectPaths(query, paths)
+
+/** The top-level field names an expression's paths name. */
+const pathHeads = (node: unknown, into: Set<string> = new Set()): Set<string> => {
+  if (Array.isArray(node)) {
+    for (const item of node) pathHeads(item, into)
+    return into
+  }
+  if (node === null || typeof node !== "object") return into
+  const record = node as { readonly _tag?: unknown; readonly segments?: unknown }
+  if (record._tag === "value") return into
+  if ((record._tag === "path" || record._tag === "size") && Array.isArray(record.segments)) {
+    const head = record.segments[0]
+    if (typeof head === "string") into.add(head)
+    return into
+  }
+  for (const value of Object.values(record)) pathHeads(value, into)
+  return into
+}
+
+/**
+ * @internal An entity's naming (#133): filters and selects name the stored
+ * attribute of each renamed field. A select of no renamed field stays the
+ * plain projection, so an entity without renames sends what it always sent.
+ */
+export const entityNaming = (
+  resolve: ((domainName: string) => string) | undefined,
+): Pick<BoundQueryConfig<unknown>, "renameExpr" | "selectAs"> =>
+  resolve === undefined
+    ? {}
+    : {
+        renameExpr: (expr) => renamePaths(expr, resolve) as Expr,
+        selectAs: (query, paths, form) =>
+          paths.some((path) => typeof path[0] === "string" && resolve(path[0]) !== path[0])
+            ? Query.selectRenamed(query, paths, resolve)
+            : plainSelect(query, paths, form),
+      }
+
+/**
+ * @internal A collection's naming (#133). Its members may store one domain
+ * field under different names, so a filter is judged per member — an OR over
+ * the members, each naming its own attributes, when they disagree — and a
+ * select projects every member's stored names (and `__edd_e__`), handing each
+ * item back under the domain names of the member it belongs to, grouped as
+ * the collection's `collect` expects.
+ */
+export const collectionNaming = (
+  members: ReadonlyArray<{
+    readonly entityType: string
+    readonly entityKey: string
+    readonly resolve: (domainName: string) => string
+  }>,
+): Pick<BoundQueryConfig<unknown>, "renameExpr" | "selectAs"> => ({
+  renameExpr: (expr) => {
+    const heads = [...pathHeads(expr)]
+    const first = members[0]
+    if (
+      first === undefined ||
+      members.every((m) => heads.every((head) => m.resolve(head) === first.resolve(head)))
+    ) {
+      return first === undefined ? expr : (renamePaths(expr, first.resolve) as Expr)
+    }
+    return {
+      [ExprTag]: ExprTag,
+      _tag: "or",
+      exprs: members.map(
+        (m): Expr => ({
+          [ExprTag]: ExprTag,
+          _tag: "and",
+          exprs: [
+            {
+              [ExprTag]: ExprTag,
+              _tag: "eq",
+              left: { _tag: "path", segments: ["__edd_e__"] },
+              right: { _tag: "value", value: m.entityType },
+            } as Expr,
+            renamePaths(expr, m.resolve) as Expr,
+          ],
+        }),
+      ),
+    } as Expr
+  },
+  selectAs: (query, paths) => {
+    const heads = [...new Set(paths.map((path) => String(path[0])))]
+    const stored = new Map<string, ReadonlyArray<string | number>>()
+    for (const m of members) {
+      for (const path of paths) {
+        const renamed = [m.resolve(String(path[0])), ...path.slice(1)]
+        stored.set(JSON.stringify(renamed), renamed)
+      }
+    }
+    stored.set(JSON.stringify(["__edd_e__"]), ["__edd_e__"])
+    const byType = new Map(members.map((m) => [m.entityType, m]))
+    return Query.selectProjected(query, [...stored.values()], (raw) => {
+      const m = byType.get(raw.__edd_e__ as string)
+      if (m === undefined) return { _memberKey: "__unknown__", _decoded: raw }
+      const item: Record<string, unknown> = {}
+      for (const head of heads) {
+        const value = raw[m.resolve(head)]
+        if (value !== undefined) item[head] = value
+      }
+      return { _memberKey: m.entityKey, _decoded: item }
+    })
+  },
+})
 
 // ---------------------------------------------------------------------------
 // BoundQuery implementation
@@ -372,9 +505,8 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
         ? fnOrShorthand(this._config.pathBuilder, this._config.conditionOps)
         : // Shorthand object — parse to equality Expr
           parseSimpleShorthand(fnOrShorthand as Record<string, unknown>)
-    const resolve = this._config.resolveDbName
     // Paths name the stored attributes of renamed fields.
-    const stored = resolve === undefined ? expr : (renamePaths(expr, resolve) as Expr)
+    const stored = this._config.renameExpr === undefined ? expr : this._config.renameExpr(expr)
     return new BoundQueryImpl(Query.filterExpr(this._query, stored), this._config)
   }
 
@@ -389,29 +521,17 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
       | ((t: PathBuilder<Model, Model, never>) => ReadonlyArray<Path<Model, any, any>>)
       | ReadonlyArray<string>,
   ): BoundQueryImpl<Model, SkRemaining, Record<string, unknown>> {
-    const resolve = this._config.resolveDbName
-    if (typeof fnOrAttrs === "function") {
-      const paths = fnOrAttrs(this._config.pathBuilder)
-      const segments = paths.map(
-        (p) => (p as unknown as { segments: ReadonlyArray<string | number> }).segments,
-      )
-      return new BoundQueryImpl(
-        resolve === undefined
-          ? Query.selectPaths(this._query, segments)
-          : Query.selectRenamed(this._query, segments, resolve),
-        this._config,
-      )
-    }
-    return new BoundQueryImpl(
-      resolve === undefined
-        ? Query.select(this._query, fnOrAttrs)
-        : Query.selectRenamed(
-            this._query,
-            fnOrAttrs.map((attr) => [attr]),
-            resolve,
-          ),
-      this._config,
-    )
+    const [paths, form] =
+      typeof fnOrAttrs === "function"
+        ? [
+            fnOrAttrs(this._config.pathBuilder).map(
+              (p) => (p as unknown as { segments: ReadonlyArray<string | number> }).segments,
+            ),
+            "paths" as const,
+          ]
+        : [fnOrAttrs.map((attr) => [attr]), "attributes" as const]
+    const select = this._config.selectAs ?? plainSelect
+    return new BoundQueryImpl(select(this._query, paths, form), this._config)
   }
 
   // --- pagination & ordering ---
@@ -450,7 +570,15 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
   }
 
   collect(): Effect.Effect<Array<A>, DynamoClientError | ValidationError, never> {
-    return this._config.provide(Query.collect(this._query))
+    const collected = this._config.provide(Query.collect(this._query))
+    const group = this._config.groupCollected
+    return group === undefined
+      ? collected
+      : (collected.pipe(Effect.map((items) => group(items))) as unknown as Effect.Effect<
+          Array<A>,
+          DynamoClientError | ValidationError,
+          never
+        >)
   }
 
   paginate(): Stream.Stream<A, DynamoClientError | ValidationError, never> {

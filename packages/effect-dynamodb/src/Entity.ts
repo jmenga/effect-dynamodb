@@ -80,6 +80,7 @@ import {
 import {
   type BoundQueryConfig,
   BoundQueryImpl,
+  entityNaming,
   type RawSortKeyCondition,
 } from "./internal/BoundQuery.js"
 import {
@@ -9497,7 +9498,7 @@ export const bind = <
         pathBuilder: createPathBuilder(),
         conditionOps: createConditionOps(),
         provide,
-        resolveDbName: entity._resolveDbName,
+        ...entityNaming(entity._resolveDbName),
       }
       return new BoundQueryImpl(
         q,
@@ -9756,7 +9757,7 @@ export const bind = <
           provide,
           skFields: orderBy ? [orderBy] : [],
           composeSkCondition,
-          resolveDbName: entity._resolveDbName,
+          ...entityNaming(entity._resolveDbName),
         }
         return new BoundQueryImpl(q, bqConfig)
       },

@@ -14330,6 +14330,30 @@ class G133Seq extends Schema.Class<G133Seq>("G133Seq")({
   label: Schema.String,
 }) {}
 
+// Names a placeholder may not hold, and renamed fields — on an entity, its GSI
+// collection, and a second member storing the same field under another name.
+const G133Named = Schema.Struct({
+  grp: Schema.String,
+  hid: Schema.String,
+  "first-name": Schema.String,
+  label: Schema.String,
+  addr: Schema.Struct({ city: Schema.String }),
+  tags: Schema.Array(Schema.String),
+})
+const G133NamedOther = Schema.Struct({
+  grp: Schema.String,
+  nid: Schema.String,
+  label: Schema.String,
+})
+const g133NamedIndex = (sk: string) => ({
+  byGrp: {
+    name: "gsi2",
+    collection: "g133Named",
+    pk: { field: "gsi2pk", composite: ["grp"] },
+    sk: { field: "gsi2sk", composite: [sk] },
+  },
+})
+
 // Several items per partition (#133): a primary sort key with a composite.
 class G133Line extends Schema.Class<G133Line>("G133Line")({
   order: Schema.String,
@@ -14467,6 +14491,35 @@ const g133Entities = {
       sk: { field: "sk", composite: ["seq"] },
     } as any,
     versioned: { retain: true },
+  }),
+  Hyphens: Entity.make({
+    model: DynamoModel.configure(G133Named, {
+      label: { field: "the-label" },
+      addr: { field: "ad" },
+    } as any),
+    entityType: "G133Hyphen",
+    primaryKey: {
+      pk: { field: "pk", composite: ["grp"] },
+      sk: { field: "sk", composite: ["hid"] },
+    } as any,
+    indexes: g133NamedIndex("hid") as any,
+  }),
+  PlainHyphens: Entity.make({
+    model: G133Named,
+    entityType: "G133PlainHyphen",
+    primaryKey: {
+      pk: { field: "pk", composite: ["grp"] },
+      sk: { field: "sk", composite: ["hid"] },
+    } as any,
+  }),
+  NamedOthers: Entity.make({
+    model: DynamoModel.configure(G133NamedOther, { label: { field: "nlabel" } } as any),
+    entityType: "G133NamedOther",
+    primaryKey: {
+      pk: { field: "pk", composite: ["grp"] },
+      sk: { field: "sk", composite: ["nid"] },
+    } as any,
+    indexes: g133NamedIndex("nid") as any,
   }),
   Readings: Entity.make({
     model: G133Reading,
@@ -17342,6 +17395,118 @@ describeConnected("#133 — path operations on index composites and unique field
       yield* lines.update(a).set({ label: "a3" })
       yield* lines.delete(a)
       expect((yield* lines.deleted.get(a)).label).toBe("a3")
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- names a placeholder may not hold, and renamed fields (#133) ----
+
+  it.effect("select and filter field names that need placeholders, plain or renamed", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      for (const entity of ["Hyphens", "PlainHyphens"] as const) {
+        const docs = db.entities[entity] as any
+        const grp = `pl-${entity.toLowerCase()}`
+        yield* docs.put({
+          grp,
+          hid: "1",
+          "first-name": "Ann",
+          label: "L1",
+          addr: { city: "C1" },
+          tags: ["a", "b"],
+        })
+        yield* docs.put({
+          grp,
+          hid: "2",
+          "first-name": "Bob",
+          label: "L2",
+          addr: { city: "C2" },
+          tags: ["a"],
+        })
+        const queries = [
+          () => docs.primary({ grp }),
+          () => docs.scan().filter({ grp }),
+          ...(entity === "Hyphens" ? [() => docs.byGrp({ grp })] : []),
+        ]
+        for (const q of queries) {
+          expect(yield* q().select(["first-name"]).collect()).toEqual([
+            { "first-name": "Ann" },
+            { "first-name": "Bob" },
+          ])
+          expect(
+            yield* q()
+              .select((x: any) => [x["first-name"], x.label])
+              .collect(),
+          ).toEqual([
+            { "first-name": "Ann", label: "L1" },
+            { "first-name": "Bob", label: "L2" },
+          ])
+          expect(yield* q().select(["label"]).collect()).toEqual([{ label: "L1" }, { label: "L2" }])
+          // A nested path under a renamed field.
+          expect(
+            yield* q()
+              .select((x: any) => [x.addr.city])
+              .collect(),
+          ).toEqual([{ addr: { city: "C1" } }, { addr: { city: "C2" } }])
+          const page = yield* q().select(["label"]).limit(1).fetch()
+          expect(page.items).toEqual([{ label: "L1" }])
+          const ids = (rows: ReadonlyArray<any>) => rows.map((r) => r.hid)
+          expect(ids(yield* q().filter({ label: "L2" }).collect())).toEqual(["2"])
+          expect(ids(yield* q().filter({ "first-name": "Ann" }).collect())).toEqual(["1"])
+          expect(
+            ids(
+              yield* q()
+                .filter((x: any, { eq }: any) => eq(x.addr.city, "C2"))
+                .collect(),
+            ),
+          ).toEqual(["2"])
+          expect(
+            ids(
+              yield* q()
+                .filter((x: any, { gt }: any) => gt(x.label.size(), 1))
+                .collect(),
+            ),
+          ).toEqual(["1", "2"])
+          expect(
+            ids(
+              yield* q()
+                .filter((x: any, { gt }: any) => gt(x.tags.size(), 1))
+                .collect(),
+            ),
+          ).toEqual(["1"])
+        }
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a collection filters and selects each member's renamed fields", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const hyphens = db.entities.Hyphens as any
+      const others = db.entities.NamedOthers as any
+      yield* hyphens.put({
+        grp: "col",
+        hid: "1",
+        "first-name": "Ann",
+        label: "L1",
+        addr: { city: "C1" },
+        tags: [],
+      })
+      yield* hyphens.put({
+        grp: "col",
+        hid: "2",
+        "first-name": "Bob",
+        label: "L2",
+        addr: { city: "C2" },
+        tags: [],
+      })
+      yield* others.put({ grp: "col", nid: "n1", label: "L1" })
+      const named = (db.collections as any).g133Named
+      const filtered = yield* named({ grp: "col" }).filter({ label: "L1" }).collect()
+      expect(filtered.Hyphens.map((h: any) => h.hid)).toEqual(["1"])
+      expect(filtered.NamedOthers.map((o: any) => o.nid)).toEqual(["n1"])
+      const selected = yield* named({ grp: "col" }).select(["label"]).collect()
+      expect(selected.Hyphens).toEqual([{ label: "L1" }, { label: "L2" }])
+      expect(selected.NamedOthers).toEqual([{ label: "L1" }])
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 

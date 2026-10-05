@@ -144,6 +144,8 @@ import { bind as entityBind, fromDefinition as entityFromDefinition } from "./En
 import {
   type BoundQueryConfig,
   BoundQueryImpl,
+  collectionNaming,
+  entityNaming,
   type RawSortKeyCondition,
 } from "./internal/BoundQuery.js"
 import {
@@ -1364,7 +1366,7 @@ const makeFromConfig = (config: {
           provide,
           composeSkCondition,
           skFields: indexDef.sk.composite,
-          resolveDbName: entityLike._resolveDbName,
+          ...entityNaming(entityLike._resolveDbName),
         }
         return new BoundQueryImpl(finalQuery, bqConfig)
       }
@@ -1469,7 +1471,7 @@ const makeFromConfig = (config: {
           pathBuilder,
           conditionOps,
           provide,
-          resolveDbName: entityLike._resolveDbName,
+          ...entityNaming(entityLike._resolveDbName),
         }
         return new BoundQueryImpl(scanQuery, bqConfig)
       }
@@ -1590,13 +1592,8 @@ const makeFromConfig = (config: {
           pathBuilder,
           conditionOps,
           provide: collectionProvide,
-        }
-        const bq = new BoundQueryImpl(query, bqConfig)
-
-        // Override collect to group results
-        const originalCollect = bq.collect.bind(bq)
-        ;(bq as any).collect = () =>
-          Effect.map(originalCollect(), (items: any[]) => {
+          // Group results by member — through every combinator.
+          groupCollected: (items) => {
             const result: Record<string, unknown[]> = {}
             for (const member of members) {
               result[member.entityKey] = []
@@ -1608,9 +1605,16 @@ const makeFromConfig = (config: {
               }
             }
             return result
-          })
-
-        return bq
+          },
+          ...collectionNaming(
+            members.map((m) => ({
+              entityType: m.entityLike.entityType,
+              entityKey: m.entityKey,
+              resolve: m.entityLike._resolveDbName ?? ((name: string) => name),
+            })),
+          ),
+        }
+        return new BoundQueryImpl(query, bqConfig)
       }
     }
 
