@@ -4320,6 +4320,24 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    it.effect("a retain delete losing every attempt to a concurrent delete succeeds", () =>
+      Effect.gen(function* () {
+        // Read present each time; deleted before each write (no ALL_OLD item).
+        mockGetItem.mockResolvedValue({ Item: storedV2() })
+        mockTransactWriteItems.mockImplementation(async () => {
+          const error = new Error("TransactionCanceledException")
+          ;(error as any).name = "TransactionCanceledException"
+          ;(error as any).CancellationReasons = [
+            { Code: "ConditionalCheckFailed" },
+            { Code: "None" },
+          ]
+          throw error
+        })
+        yield* RetainEntity.delete({ itemId: "i-1" }).asEffect()
+        expect(mockTransactWriteItems).toHaveBeenCalledTimes(3)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("deleteIfExists of a missing retain item fails its condition, writing nothing", () =>
       Effect.gen(function* () {
         mockGetItem.mockResolvedValueOnce({})

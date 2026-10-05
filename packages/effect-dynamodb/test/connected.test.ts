@@ -17572,6 +17572,31 @@ describeConnected("#133 — path operations on index composites and unique field
       })
       const failed = yield* Effect.flip(seqs.primary({ tenant: "t2" }).collect())
       expect((failed as any)._tag).toBe("ValidationError")
+      // Rows under the snapshot or tombstone prefix that aren't shaped like a
+      // snapshot (`…#<7+ digits>`) or a tombstone (`…#<ISO timestamp>`) are kept.
+      yield* putRaw({
+        pk: "$edd133g#v1#g133seq#tenant_t3",
+        sk: "$edd133g#v1#g133seq#v#seq_5",
+        __edd_e__: "G133Seq",
+        tenant: "t3",
+        seq: "5",
+        label: "under-v",
+        version: 1,
+      })
+      expect(labels(yield* seqs.primary({ tenant: "t3" }).collect())).toEqual(["under-v"])
+      const soft = db.entities.SoftLines as any
+      yield* putRaw({
+        pk: "$edd133g#v1#g133softline#order_o9",
+        sk: "$edd133g#v1#g133softline#deleted#not-a-time",
+        __edd_e__: "G133SoftLine",
+        order: "o9",
+        line: "zz",
+        label: "under-deleted",
+        version: 1,
+        createdAt: "2024-01-01T00:00:00.000Z",
+        updatedAt: "2024-01-01T00:00:00.000Z",
+      })
+      expect(labels(yield* soft.primary({ order: "o9" }).collect())).toEqual(["under-deleted"])
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
@@ -17650,6 +17675,8 @@ describeConnected("#133 — path operations on index composites and unique field
         const all = yield* (db.collections as any).g133OrderAll({ orderId: "po1" }).collect()
         expect(all.POrders.map((o: any) => o.label)).toEqual(["v3"])
         expect(all.PLines).toHaveLength(2)
+        // Counting judges each row by its member — which reads its entity type.
+        expect(yield* (db.collections as any).g133OrderAll({ orderId: "po1" }).count()).toBe(3)
         // purge removes the order, its history and its tombstones — not the lines.
         yield* orders.delete({ orderId: "po1" })
         yield* orders.purge({ orderId: "po1" })
