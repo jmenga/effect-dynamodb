@@ -13312,6 +13312,50 @@ describeConnected("#133 — nested sub-aggregates", () => {
       expect((yield* raw("l2")).length).toBe(9)
     }).pipe(provideN133),
   )
+  it.effect("create of an existing aggregate fails and writes nothing (#134)", () =>
+    Effect.gen(function* () {
+      const db = yield* n133Client
+      const leagues = db.aggregates.N133LeagueAggregate
+      const client = yield* DynamoClient
+      const raw = (id: string) =>
+        client
+          .query({
+            TableName: n133TableName,
+            KeyConditionExpression: "#pk = :pk",
+            ExpressionAttributeNames: { "#pk": "pk" },
+            ExpressionAttributeValues: { ":pk": { S: `$edd133n#v1#league#${id}` } },
+            ConsistentRead: true,
+          })
+          .pipe(Effect.map(({ Items = [] }) => Items as ReadonlyArray<Record<string, any>>))
+      yield* leagues.create(n133League("dup") as any)
+      const before = yield* raw("dup")
+      expect(before.length).toBe(9)
+      // Different root fields, edges and sub-aggregate rows — new sort keys
+      // (p2 in club1, p1 in club2) that must not appear.
+      const again = {
+        ...n133League("dup"),
+        season: "2027",
+        club1: {
+          name: "Uno",
+          coachId: "c2",
+          squad: { name: "X", players: [{ playerId: "p2", joined: I133_DAY2 }] },
+        },
+        club2: {
+          name: "Dos",
+          coachId: "c1",
+          squad: { name: "Y", players: [{ playerId: "p1", joined: I133_DOB }] },
+        },
+      }
+      const error = yield* leagues.create(again as any).pipe(Effect.flip)
+      expect(error._tag).toBe("ConditionalCheckFailed")
+      const after = yield* raw("dup")
+      const bySk = (items: ReadonlyArray<Record<string, any>>) =>
+        [...items].sort((a, b) => (a.sk.S < b.sk.S ? -1 : 1))
+      expect(bySk(after)).toEqual(bySk(before))
+      const listed = yield* leagues.list({ season: "2027" })
+      expect(listed.data).toEqual([])
+    }).pipe(provideN133),
+  )
 })
 
 // ===========================================================================

@@ -20,6 +20,7 @@ import {
   AggregateAssemblyError,
   AggregateDecompositionError,
   AggregateTransactionOverflow,
+  ConditionalCheckFailed,
   type ItemNotFound,
   RefNotFound,
   TransactionCancelled,
@@ -285,6 +286,12 @@ type AggregateWriteError =
   | TransactionCancelled
 
 /**
+ * `create`'s errors: a write's, plus `ConditionalCheckFailed` when the
+ * aggregate's root item already exists (#134).
+ */
+type AggregateCreateError = AggregateWriteError | ConditionalCheckFailed
+
+/**
  * An operational aggregate — returned by `Aggregate.make` with full config.
  * Provides `get`, `create`, `update`, and `delete` for full CRUD lifecycle.
  */
@@ -345,7 +352,7 @@ export interface Aggregate<
    */
   readonly create: (
     input: Record<string, unknown>,
-  ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateWriteError, DynamoClient | TableConfig>
+  ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateCreateError, DynamoClient | TableConfig>
 
   /**
    * Update an aggregate: fetch current state, apply mutation, diff, write changes.
@@ -453,7 +460,7 @@ export interface BoundAggregate<
 
   readonly create: (
     input: Record<string, unknown>,
-  ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateWriteError, never>
+  ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateCreateError, never>
 
   readonly update: (
     key: TKey,
@@ -1452,13 +1459,25 @@ const makeAggregate = <TSchema extends Schema.Top>(
           stampFor(now, EMPTY_CREATED),
         )
 
-        // 7. Write via sub-aggregate transactions
-        yield* writeTransactionGroups(
-          client,
-          tableConfig.name,
-          dynamoGroups.map((g) => ({ group: g.group, puts: g.items, deletes: [] })),
-          aggregateName,
-        )
+        // 7. Write via sub-aggregate transactions. The root item goes first in
+        //    the first transaction, guarded by `attribute_not_exists` (#134):
+        //    an existing aggregate cancels it before any edge or sub-aggregate
+        //    row is written. Rows below the root need no guard of their own —
+        //    they are only ever written after the root's transaction commits.
+        const rootSk = composeKey(config.schema, config.root.entityType, [])
+        const isRoot = (item: Record<string, AttributeValue>) => item.sk?.S === rootSk
+        const ordered = [...dynamoGroups]
+          .sort((a, b) => Number(b.items.some(isRoot)) - Number(a.items.some(isRoot)))
+          .map((g) => ({
+            group: g.group,
+            puts: [...g.items].sort((a, b) => Number(isRoot(b)) - Number(isRoot(a))),
+            deletes: [],
+          }))
+        yield* writeTransactionGroups(client, tableConfig.name, ordered, aggregateName, {
+          pkField: config.pk.field,
+          entityType: config.root.entityType,
+          key: { [config.pk.field]: pkValue, sk: rootSk },
+        })
 
         return decoded as Schema.Schema.Type<TSchema>
       }),
@@ -3166,17 +3185,47 @@ const buildDynamoItems = (
 // Internal: Write transaction groups to DynamoDB
 // ---------------------------------------------------------------------------
 
-const writeTransactionGroups = (
+type WriteGroups = ReadonlyArray<{
+  group: string
+  puts: ReadonlyArray<Record<string, AttributeValue>>
+  deletes: ReadonlyArray<Record<string, AttributeValue>>
+}>
+
+/**
+ * `create`: the first group's first Put is the root item, written only when it
+ * doesn't exist (`attribute_not_exists`); its cancellation for that reason is
+ * `ConditionalCheckFailed` (#134). A later group still commits on its own, as
+ * every multi-group write always has.
+ */
+interface RootGuard {
+  readonly pkField: string
+  readonly entityType: string
+  readonly key: Record<string, unknown>
+}
+
+type WriteGroupsError = AggregateTransactionOverflow | DynamoClientError | TransactionCancelled
+
+function writeTransactionGroups(
   client: DynamoClientService,
   tableName: string,
-  groups: ReadonlyArray<{
-    group: string
-    puts: ReadonlyArray<Record<string, AttributeValue>>
-    deletes: ReadonlyArray<Record<string, AttributeValue>>
-  }>,
+  groups: WriteGroups,
   aggregateName: string,
-): Effect.Effect<void, AggregateTransactionOverflow | DynamoClientError | TransactionCancelled> =>
-  Effect.gen(function* () {
+): Effect.Effect<void, WriteGroupsError>
+function writeTransactionGroups(
+  client: DynamoClientService,
+  tableName: string,
+  groups: WriteGroups,
+  aggregateName: string,
+  rootGuard: RootGuard,
+): Effect.Effect<void, WriteGroupsError | ConditionalCheckFailed>
+function writeTransactionGroups(
+  client: DynamoClientService,
+  tableName: string,
+  groups: WriteGroups,
+  aggregateName: string,
+  rootGuard?: RootGuard,
+): Effect.Effect<void, WriteGroupsError | ConditionalCheckFailed> {
+  return Effect.gen(function* () {
     // Validate ALL group sizes BEFORE writing any group. Each group is its own
     // transaction (DynamoDB: 100 items per TransactWriteItems), and the per-group
     // count now spans Puts AND Deletes together — so an `update` that both adds and
@@ -3194,15 +3243,31 @@ const writeTransactionGroups = (
       }
     }
 
-    for (const group of groups) {
+    for (const [groupIndex, group] of groups.entries()) {
       // Each group is one transaction — Puts AND Deletes applied atomically, so an
       // edge add and a sibling edge removal in the same sub-aggregate commit together.
       const itemCount = group.puts.length + group.deletes.length
       if (itemCount === 0) continue
+      // The root item, in the first transaction only.
+      const rootIndex =
+        rootGuard !== undefined && groupIndex === 0
+          ? group.puts.findIndex((item) => item.sk?.S === rootGuard.key.sk)
+          : -1
 
       // Build TransactWriteItems request — Puts first, then Deletes for orphans.
       const transactItems = [
-        ...group.puts.map((item) => ({ Put: { TableName: tableName, Item: item } })),
+        ...group.puts.map((item, i) => ({
+          Put: {
+            TableName: tableName,
+            Item: item,
+            ...(rootGuard !== undefined && i === rootIndex
+              ? {
+                  ConditionExpression: "attribute_not_exists(#pk)",
+                  ExpressionAttributeNames: { "#pk": rootGuard.pkField },
+                }
+              : {}),
+          },
+        })),
         ...group.deletes.map((key) => ({ Delete: { TableName: tableName, Key: key } })),
       ]
 
@@ -3217,6 +3282,16 @@ const writeTransactionGroups = (
             const cancelled = error.cause as {
               CancellationReasons?: ReadonlyArray<{ Code?: string; Message?: string }>
             }
+            if (
+              rootGuard !== undefined &&
+              rootIndex >= 0 &&
+              cancelled.CancellationReasons?.[rootIndex]?.Code === "ConditionalCheckFailed"
+            ) {
+              return new ConditionalCheckFailed({
+                entityType: rootGuard.entityType,
+                key: rootGuard.key,
+              })
+            }
             return new TransactionCancelled({
               operation: "TransactWriteItems",
               reasons: (cancelled.CancellationReasons ?? []).map((r) => ({
@@ -3224,13 +3299,14 @@ const writeTransactionGroups = (
                 message: r?.Message,
               })),
               cause: error.cause,
-            }) as DynamoClientError | TransactionCancelled
+            })
           }
-          return error as DynamoClientError | TransactionCancelled
+          return error
         }),
       )
     }
   })
+}
 
 // ---------------------------------------------------------------------------
 // Internal: Delete all items in an aggregate partition

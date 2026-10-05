@@ -11,7 +11,7 @@ import { Effect, Layer, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Entity from "../src/Entity.js"
-import { toAttributeMap } from "../src/Marshaller.js"
+import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
@@ -1381,100 +1381,105 @@ describe("Aggregate write path", () => {
       },
     })
 
+    // Mock ref hydration via batchGetItem — Batch.get groups by table
+    const mockRefs = () => {
+      const refItems: Record<string, Record<string, unknown>> = {
+        venue: {
+          pk: "$myapp#v1#venue#venueid_v-1",
+          sk: "$myapp#v1#venue",
+          __edd_e__: "Venue",
+          venueId: "v-1",
+          name: "MCG",
+          city: "Melbourne",
+        },
+        "team-aus": {
+          pk: "$myapp#v1#team#teamid_t-aus",
+          sk: "$myapp#v1#team",
+          __edd_e__: "Team",
+          teamId: "t-aus",
+          name: "Australia",
+          country: "Australia",
+        },
+        "team-ind": {
+          pk: "$myapp#v1#team#teamid_t-ind",
+          sk: "$myapp#v1#team",
+          __edd_e__: "Team",
+          teamId: "t-ind",
+          name: "India",
+          country: "India",
+        },
+        "coach-1": {
+          pk: "$myapp#v1#coach#coachid_c-1",
+          sk: "$myapp#v1#coach",
+          __edd_e__: "Coach",
+          coachId: "c-1",
+          name: "Andrew McDonald",
+        },
+        "coach-2": {
+          pk: "$myapp#v1#coach#coachid_c-2",
+          sk: "$myapp#v1#coach",
+          __edd_e__: "Coach",
+          coachId: "c-2",
+          name: "Gautam Gambhir",
+        },
+        "player-smith": {
+          pk: "$myapp#v1#player#playerid_p-smith",
+          sk: "$myapp#v1#player",
+          __edd_e__: "Player",
+          playerId: "p-smith",
+          displayName: "Steve Smith",
+          role: "batter",
+        },
+        "player-kohli": {
+          pk: "$myapp#v1#player#playerid_p-kohli",
+          sk: "$myapp#v1#player",
+          __edd_e__: "Player",
+          playerId: "p-kohli",
+          displayName: "Virat Kohli",
+          role: "batter",
+        },
+      }
+      mockBatchGetItem.mockImplementation((input: Record<string, unknown>) => {
+        const requestItems = input.RequestItems as Record<
+          string,
+          { Keys: Array<Record<string, { S?: string }>> }
+        >
+        const responses: Record<string, Array<Record<string, unknown>>> = {}
+        for (const [tableName, { Keys }] of Object.entries(requestItems)) {
+          responses[tableName] = Keys.map((key) => {
+            const pk = key.pk?.S ?? ""
+            const match = Object.values(refItems).find((item) => item.pk === pk)
+            return match ? toAttributeMap(match) : undefined
+          }).filter(Boolean) as Array<Record<string, unknown>>
+        }
+        return Promise.resolve({ Responses: responses })
+      })
+    }
+
+    const matchInput = {
+      id: "match-1",
+      name: "AUS vs IND",
+      venueId: "v-1",
+      team1: {
+        teamId: "t-aus",
+        coachId: "c-1",
+        homeTeam: true,
+        players: [{ playerId: "p-smith", battingPosition: 1, isCaptain: true }],
+      },
+      team2: {
+        teamId: "t-ind",
+        coachId: "c-2",
+        homeTeam: false,
+        players: [{ playerId: "p-kohli", battingPosition: 1, isCaptain: true }],
+      },
+    }
+
     it.effect("writes sub-aggregates as separate transaction groups", () =>
       Effect.gen(function* () {
-        // Mock ref hydration via batchGetItem — Batch.get groups by table
-        const refItems: Record<string, Record<string, unknown>> = {
-          venue: {
-            pk: "$myapp#v1#venue#venueid_v-1",
-            sk: "$myapp#v1#venue",
-            __edd_e__: "Venue",
-            venueId: "v-1",
-            name: "MCG",
-            city: "Melbourne",
-          },
-          "team-aus": {
-            pk: "$myapp#v1#team#teamid_t-aus",
-            sk: "$myapp#v1#team",
-            __edd_e__: "Team",
-            teamId: "t-aus",
-            name: "Australia",
-            country: "Australia",
-          },
-          "team-ind": {
-            pk: "$myapp#v1#team#teamid_t-ind",
-            sk: "$myapp#v1#team",
-            __edd_e__: "Team",
-            teamId: "t-ind",
-            name: "India",
-            country: "India",
-          },
-          "coach-1": {
-            pk: "$myapp#v1#coach#coachid_c-1",
-            sk: "$myapp#v1#coach",
-            __edd_e__: "Coach",
-            coachId: "c-1",
-            name: "Andrew McDonald",
-          },
-          "coach-2": {
-            pk: "$myapp#v1#coach#coachid_c-2",
-            sk: "$myapp#v1#coach",
-            __edd_e__: "Coach",
-            coachId: "c-2",
-            name: "Gautam Gambhir",
-          },
-          "player-smith": {
-            pk: "$myapp#v1#player#playerid_p-smith",
-            sk: "$myapp#v1#player",
-            __edd_e__: "Player",
-            playerId: "p-smith",
-            displayName: "Steve Smith",
-            role: "batter",
-          },
-          "player-kohli": {
-            pk: "$myapp#v1#player#playerid_p-kohli",
-            sk: "$myapp#v1#player",
-            __edd_e__: "Player",
-            playerId: "p-kohli",
-            displayName: "Virat Kohli",
-            role: "batter",
-          },
-        }
-        mockBatchGetItem.mockImplementation((input: Record<string, unknown>) => {
-          const requestItems = input.RequestItems as Record<
-            string,
-            { Keys: Array<Record<string, { S?: string }>> }
-          >
-          const responses: Record<string, Array<Record<string, unknown>>> = {}
-          for (const [tableName, { Keys }] of Object.entries(requestItems)) {
-            responses[tableName] = Keys.map((key) => {
-              const pk = key.pk?.S ?? ""
-              const match = Object.values(refItems).find((item) => item.pk === pk)
-              return match ? toAttributeMap(match) : undefined
-            }).filter(Boolean) as Array<Record<string, unknown>>
-          }
-          return Promise.resolve({ Responses: responses })
-        })
-
+        mockRefs()
         mockTransactWrite.mockResolvedValue({})
 
-        const result = yield* MatchAggregate.create({
-          id: "match-1",
-          name: "AUS vs IND",
-          venueId: "v-1",
-          team1: {
-            teamId: "t-aus",
-            coachId: "c-1",
-            homeTeam: true,
-            players: [{ playerId: "p-smith", battingPosition: 1, isCaptain: true }],
-          },
-          team2: {
-            teamId: "t-ind",
-            coachId: "c-2",
-            homeTeam: false,
-            players: [{ playerId: "p-kohli", battingPosition: 1, isCaptain: true }],
-          },
-        })
+        const result = yield* MatchAggregate.create(matchInput)
 
         // Verify the assembled domain object
         expect(result.id).toBe("match-1")
@@ -1487,6 +1492,66 @@ describe("Aggregate write path", () => {
 
         // Should produce 3 transaction groups: root, team1, team2
         expect(mockTransactWrite).toHaveBeenCalledTimes(3)
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("guards the root item alone, in the first transaction (#134)", () =>
+      Effect.gen(function* () {
+        mockRefs()
+        mockTransactWrite.mockResolvedValue({})
+        yield* MatchAggregate.create(matchInput)
+        const calls = mockTransactWrite.mock.calls.map(
+          (call) => call[0].TransactItems as Array<{ Put: Record<string, any> }>,
+        )
+        const [root, ...rest] = calls[0]!
+        expect(fromAttributeMap(root!.Put.Item)).toMatchObject({
+          __edd_e__: "MatchItem",
+          sk: "$myapp#v1#matchitem",
+        })
+        expect(root!.Put.ConditionExpression).toBe("attribute_not_exists(#pk)")
+        expect(root!.Put.ExpressionAttributeNames).toEqual({ "#pk": "pk" })
+        expect(root!.Put.ExpressionAttributeValues).toBeUndefined()
+        // Edges and sub-aggregate rows carry no guard of their own.
+        for (const item of [...rest, ...calls.slice(1).flat()]) {
+          expect(item.Put.ConditionExpression).toBeUndefined()
+        }
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect(
+      "an existing root fails create with ConditionalCheckFailed, before any other write (#134)",
+      () =>
+        Effect.gen(function* () {
+          mockRefs()
+          mockTransactWrite.mockRejectedValueOnce(
+            Object.assign(new Error("cancelled"), {
+              name: "TransactionCanceledException",
+              CancellationReasons: [{ Code: "ConditionalCheckFailed" }, { Code: "None" }],
+            }),
+          )
+          mockTransactWrite.mockResolvedValue({})
+          const error = yield* MatchAggregate.create(matchInput).pipe(Effect.flip)
+          expect(error._tag).toBe("ConditionalCheckFailed")
+          expect(error).toMatchObject({
+            entityType: "MatchItem",
+            key: { pk: "$myapp#v1#match#match-1", sk: "$myapp#v1#matchitem" },
+          })
+          expect(mockTransactWrite).toHaveBeenCalledTimes(1)
+        }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("a later group's cancellation stays TransactionCancelled (#134)", () =>
+      Effect.gen(function* () {
+        mockRefs()
+        mockTransactWrite.mockResolvedValueOnce({})
+        mockTransactWrite.mockRejectedValueOnce(
+          Object.assign(new Error("cancelled"), {
+            name: "TransactionCanceledException",
+            CancellationReasons: [{ Code: "ConditionalCheckFailed" }],
+          }),
+        )
+        const error = yield* MatchAggregate.create(matchInput).pipe(Effect.flip)
+        expect(error._tag).toBe("TransactionCancelled")
       }).pipe(Effect.provide(WriteLayer)),
     )
   })
