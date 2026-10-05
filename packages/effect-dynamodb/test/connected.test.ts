@@ -17825,9 +17825,23 @@ describeConnected("#133 — path operations on index composites and unique field
           addr: { city: "C2", zip: "Z2" },
           tags: ["a"],
         })
+        // A scan reads the whole shared table, so it gets the names that need
+        // placeholders and a nested renamed path, not every query below.
+        const scan = () => docs.scan().filter({ grp })
+        expect(yield* scan().select(["first-name"]).collect()).toEqual([
+          { "first-name": "Ann" },
+          { "first-name": "Bob" },
+        ])
+        expect(
+          yield* scan()
+            .select((x: any) => [x.addr.city])
+            .collect(),
+        ).toEqual([{ addr: { city: "C1" } }, { addr: { city: "C2" } }])
+        expect(
+          (yield* scan().filter({ "first-name": "Ann" }).collect()).map((r: any) => r.hid),
+        ).toEqual(["1"])
         const queries = [
           () => docs.primary({ grp }),
-          () => docs.scan().filter({ grp }),
           ...(entity === "Hyphens" ? [() => docs.byGrp({ grp })] : []),
         ]
         for (const q of queries) {
