@@ -177,6 +177,8 @@ describe("error channels match 1.25.0 whether or not a field is packed (#147)", 
       >()
       const tw = Transaction.transactWrite([Packed.put({ orderId: "o", lines: [] })])
       expectTypeOf<Leaked<Effect.Error<typeof tw>>>().toBeNever()
+      // Plus what planning an update or multi-item delete can raise before
+      // anything is sent (#129): its reads' outcomes.
       expectTypeOf<Effect.Error<typeof tw>>().toEqualTypeOf<
         | DynamoClientError
         | ValidationError
@@ -184,6 +186,10 @@ describe("error channels match 1.25.0 whether or not a field is packed (#147)", 
         | UniqueConstraintViolation
         | OptimisticLockError
         | ConcurrentModification
+        | ConditionalCheckFailed
+        | ItemNotFound
+        | TransactionOverflow
+        | RefNotFound
       >()
     })
     expect(true).toBe(true)
