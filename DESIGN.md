@@ -2495,7 +2495,7 @@ db.Matches.create({ matchId: "m-2", venueId: "v-1", teams: [...], players: [...]
   → Denormalize: MatchVenue = { matchId, venueId, name: "MCG", city: "Melbourne", capacity: 100000 }
   → Decompose all edges into entity inputs
   → Transaction.transactWrite(
-      MatchEntity.put(rootItem),
+      MatchEntity.create(rootItem),          // attribute_not_exists — first item of the first transaction
       MatchVenueEntity.put({ matchId, venueId, name: "MCG", city: "Melbourne", capacity: 100000 }),
       MatchTeamEntity.put(team1),
       MatchTeamEntity.put(team2),
@@ -2503,6 +2503,17 @@ db.Matches.create({ matchId: "m-2", venueId: "v-1", teams: [...], players: [...]
       ...
     )
 ```
+
+**`create` is guarded on the root (#134).** The root item is the first Put of
+the first transaction, conditioned on `attribute_not_exists(pk)`. An existing
+aggregate cancels that transaction — nothing is written — and its cancellation
+reason maps to `ConditionalCheckFailed` (the root's `entityType`, `key`
+`{ pk, sk }`), never a raw `TransactionCancelled`. Edge, `many` and nested
+sub-aggregate rows carry no guard: they are written only after the root's
+transaction commits. Each sub-aggregate group remains its own transaction, so a
+later group that fails leaves the earlier groups written — exactly as before;
+the guard only makes the first transaction refuse. `update` and `delete` are
+unchanged.
 
 **Update with diff:**
 
@@ -3215,7 +3226,7 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 |-------|-------|
 | `DynamoError` | AWS SDK error wrapper |
 | `ItemNotFound` | No item: `get`, `update` of a missing item (unless a plain `.set()` of a complete item, which is created), `restore` without a tombstone |
-| `ConditionalCheckFailed` | A user `.condition()` failed, or an op's own guard did: `create()` of an existing item, `patch()` or `deleteIfExists()` of a missing item |
+| `ConditionalCheckFailed` | A user `.condition()` failed, or an op's own guard did: `create()` of an existing item (or aggregate), `patch()` or `deleteIfExists()` of a missing item |
 | `ValidationError` | Schema decode/encode failure, or a refused operation: an item with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, a condition or filter with an empty part under `or` / `not` (or an `or()` with no parts), `consistentRead` on a GSI |
 | `TransactionCancelled` | Transaction failed with cancellation reasons |
 | `UniqueConstraintViolation` | Sentinel item already exists for unique field (from the entity's write, `transactWrite`, or an `append`'s `additionalItems`) |
@@ -3251,6 +3262,7 @@ plus `RefErrors` / `VectorErrors` where the entity has refs or vector indexes.
 | `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow` |
 | `purge` | `ValidationError` |
 | `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
 | `EventStore` `append` / `commandHandler` (plus the decider's errors) | `AppendError`: `VersionConflict`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 
 `.condition()` adds `ConditionalCheckFailed` to an operation that lacks it.

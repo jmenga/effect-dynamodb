@@ -534,11 +534,13 @@ The create operation:
 2. Hydrates all ref fields (fetches entities by ID, embeds domain data)
 3. Decomposes the domain object into individual DynamoDB items following the graph structure, with every value in its wire form (see [How Values Are Stored](#how-values-are-stored))
 4. Adds partition keys, sort keys, entity type discriminators, and context fields
-5. Writes items in sub-aggregate transaction groups (each sub-aggregate = one `transactWriteItems`)
+5. Writes items in sub-aggregate transaction groups (each sub-aggregate = one `transactWriteItems`). The root item goes first, in the first transaction, conditioned on `attribute_not_exists`
 
 Fields other than refs can be given in their domain form as well as their wire form, so the input may carry a `DateTime`, an `Option` or a `Redacted`. These are kept intact while ref IDs are replaced with hydrated data.
 
 Returns `RefNotFound` if a ref ID doesn't resolve. Returns `AggregateTransactionOverflow` if a sub-aggregate group exceeds 100 items (DynamoDB transaction limit).
+
+Returns `ConditionalCheckFailed` if the aggregate already exists. Its root item's guard cancels the first transaction, so nothing is written: not the root, not an edge, not a sub-aggregate row. Earlier versions overwrote the root and left behind any old rows the new aggregate didn't rewrite. To replace an aggregate, `update` it, or `delete` it first. Each sub-aggregate is still its own transaction, so if a later one fails, the ones before it stay written.
 
 #### update — Diff and Write
 

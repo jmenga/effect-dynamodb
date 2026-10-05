@@ -1069,7 +1069,7 @@ const MatchAggregate = Aggregate.make(Match, {
 | Operation | Signature | Description |
 |-----------|-----------|-------------|
 | `aggregate.get(key)` | `Effect<Domain, AggregateAssemblyError \| DynamoError \| ValidationError>` | Fetch and assemble by partition key |
-| `aggregate.create(input)` | `Effect<Domain, AggregateWriteError>` | Create from input (ref IDs hydrated, sub-aggregate transactions) |
+| `aggregate.create(input)` | `Effect<Domain, AggregateWriteError \| ConditionalCheckFailed>` | Create from input (ref IDs hydrated, sub-aggregate transactions). Fails with `ConditionalCheckFailed`, writing nothing, when the aggregate's root item already exists |
 | `aggregate.update(key, fn)` | `Effect<Domain, AggregateWriteError>` | Fetch → mutate → diff → write changed groups. `fn` receives `UpdateContext` with `{ state, cursor, optic, current }` |
 | `aggregate.delete(key)` | `Effect<void, AggregateAssemblyError \| DynamoError>` | Remove all items in the partition |
 | `aggregate.list(key, options?)` | `Effect<ListResult<Domain>, AggregateAssemblyError \| DynamoError \| ValidationError>` | Page aggregates off the list index. `options`: `limit` (at most _n_ aggregates), `pageSize` (rows examined per request), `filter` (server-side `FilterExpression`, callback or shorthand), `reverse`, `cursor`. Returns `{ data, cursor }`; `cursor` is `null` only when exhausted, and is always `null` on a sharded (`cardinality`) list, which rejects a passed cursor with `EDD-9051` |
@@ -1253,7 +1253,7 @@ import {
 | `InternalServerError` | `"InternalServerError"` | Transient DynamoDB failure |
 | `ResourceNotFoundError` | `"ResourceNotFoundError"` | Table or index does not exist |
 | `ItemNotFound` | `"ItemNotFound"` | No item under the key: `get`, an `update` of a missing item (unless it is a plain `.set()` of a complete item), `restore` with no soft-deleted item or after a concurrent restore won |
-| `ConditionalCheckFailed` | `"ConditionalCheckFailed"` | A `.condition()` was not met (put, update, delete, create), or an op's own guard was: `create()` of an existing item, `patch()` or `deleteIfExists()` of a missing item, whatever `.condition()` was added. A lost version race is an `OptimisticLockError` instead |
+| `ConditionalCheckFailed` | `"ConditionalCheckFailed"` | A `.condition()` was not met (put, update, delete, create), or an op's own guard was: `create()` of an existing item or aggregate, `patch()` or `deleteIfExists()` of a missing item, whatever `.condition()` was added. A lost version race is an `OptimisticLockError` instead |
 | `ValidationError` | `"ValidationError"` | Schema decode/encode failed, or the operation was refused: an item of a versioned entity with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, a transaction that touches one item twice or passes 4 MB, a condition or filter with an empty part under `or()` / `not()` (or an `or()` with no parts), or `.consistentRead()` on a GSI |
 | `DeleteAppliedButUnreadable` | `"DeleteAppliedButUnreadable"` | A delete with `returnValues("allOld")` was applied, but the item it removed (`item`, as stored) could not be decoded. Don't retry it |
 | `TransactionCancelled` | `"TransactionCancelled"` | Transaction rejected (includes cancellation `reasons`) |
@@ -1292,6 +1292,7 @@ Each operation declares a fixed error union, whatever the entity's configuration
 | `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow` |
 | `purge` | `ValidationError` |
 | `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
 | `EventStore` `append` / `commandHandler` (plus the decider's errors) | `VersionConflict`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 
 ### Usage

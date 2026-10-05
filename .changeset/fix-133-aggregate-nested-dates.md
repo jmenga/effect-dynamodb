@@ -281,6 +281,18 @@ real `DateTime`s.
 
 ### Aggregates
 
+**`create` of an existing aggregate fails (behaviour change).** `create`
+wrote plain `Put`s, so creating an aggregate whose root item already existed
+silently overwrote it — and left the old aggregate's edge and sub-aggregate
+rows that the new one didn't rewrite. The root item is now written first, in
+the first transaction, conditioned on `attribute_not_exists`. An existing
+aggregate cancels that transaction, so nothing is written, and `create` fails
+with `ConditionalCheckFailed` (`entityType` is the root's, `key` its `pk` and
+`sk`). Edge and sub-aggregate rows carry no guard of their own; they are only
+written after the root's transaction commits. As before, each sub-aggregate is
+its own transaction: if a later one fails, the earlier ones stay written.
+Replace an existing aggregate with `update`, or `delete` it first.
+
 **Writes.** Aggregates now store every value in its wire form wherever it is
 nested: in root arrays (`Schema.Array(Schema.DateTimeUtcFromString)`), arrays of
 classes (`sessions[].startTime`), `NullOr` and other unions (also inside
@@ -670,6 +682,7 @@ Review `catchTag` handlers and exhaustive matches on them:
 | `restore` | `ItemNotDeleted`, `TransactionOverflow` |
 | `Transaction.transactWrite` | `OptimisticLockError`, `ConcurrentModification` |
 | `EventStore` `append`, `commandHandler` | `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| Aggregate `create` | `ConditionalCheckFailed` |
 
 `TransactionOverflow` could already be raised when an item's own transaction
 would pass 100 items; it is now declared. `GeoIndex.bind`'s `put` declares the
