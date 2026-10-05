@@ -6,7 +6,7 @@
 
 Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, composite key composition from entity attributes, type-safe index-aware queries with Stream-based pagination, and DynamoClient as an Effect Service with Layer-based dependency injection.
 
-**Status:** All modules implemented. 1737 core tests, 368 schema tests, 56 geo tests, 90 language-service tests, 48 doctest tests, 35 examples, 480 connected tests against DynamoDB Local.
+**Status:** All modules implemented. 1747 core tests, 368 schema tests, 56 geo tests, 90 language-service tests, 48 doctest tests, 35 examples, 483 connected tests against DynamoDB Local.
 **Design:** `DESIGN.md` — API specification (source of truth for implementation)
 
 ## Architecture
