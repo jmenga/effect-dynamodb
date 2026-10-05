@@ -827,9 +827,14 @@ and is read as on main. `Entity._liveRows` (for `retain` / `softDelete` /
 `timeSeries`; otherwise `undefined`, and the query is unchanged) drives
 `Query`'s `liveRows`, applied to rows as they arrive, before decoding or
 counting, for queries and scans alike (a query can't name a key attribute in its
-filter, and a scan's filter saves no read capacity). `limit` is still sent as
-`Limit` (bounded by `pageSize`); the accumulate loop pages on to make up dropped
-rows. `count()` reads only the sort key and composites (`reads`) of each row; a
+filter, and a scan's filter saves no read capacity). `limit` is sent as `Limit`
+on the first request and each later request asks for twice the last
+(`computeRequestLimit`, capped at 100,000; `pageSize`, when set, is used as is):
+a run of `n` history rows costs about `log2(n / limit)` requests, where sending
+the remainder cost one per row for `limit(1)`. The surplus past `limit` is
+discarded and the cursor rebuilt from the last item returned. `maxPages` still
+bounds requests, so a capped query can return fewer items than `limit` when rows
+are dropped — as with a filter. `count()` reads only the sort key and composites (`reads`) of each row; a
 `select` also reads them. A collection on the primary key judges each row by the member its
 `__edd_e__` names. GSI queries never meet history rows, which carry no index keys.
 
@@ -3212,7 +3217,7 @@ plus `RefErrors` / `VectorErrors` where the entity has refs or vector indexes.
 | `upsert` | as `put`, plus `ItemNotFound`, `ConditionalCheckFailed` |
 | `update` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `UpdateAppliedButUnreadable`, `UniqueConstraintViolation`, `ValidationError`, `TransactionOverflow` |
 | `patch` | as `update`, plus `ConditionalCheckFailed` |
-| `delete` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow` |
+| `delete` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow`, `DeleteAppliedButUnreadable` |
 | `deleteIfExists` | as `delete`, plus `ConditionalCheckFailed` |
 | `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow` |
 | `purge` | `ValidationError` |

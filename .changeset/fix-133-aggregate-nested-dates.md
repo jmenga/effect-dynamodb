@@ -126,16 +126,38 @@ real `DateTime`s.
   `ItemNotFound` with unique constraints or soft delete). `deleteIfExists`
   asserts only that the item exists, which these deletes already check: it
   is retried the same way, and on a missing item it fails with
-  `ConditionalCheckFailed` (it used to fail with `ItemNotFound` on these
-  entities). With any other `.condition()`, such a race fails, as before.
+  `ConditionalCheckFailed` (on unique-constraint and soft-delete entities it
+  used to fail with `ItemNotFound`; retain-only entities already gave
+  `ConditionalCheckFailed`). A `.condition()` added to `deleteIfExists` is now
+  ANDed with its existence check instead of replacing it. With any other
+  `.condition()`, such a race fails, as before.
 - **`delete().returnValues("allOld")` returns the item it deleted** (the
   model, `undefined` when there was none), on every delete path — it returned
-  nothing. The result is typed by the mode.
+  nothing. The result is typed by the mode (any `ReturnValuesMode` still
+  compiles). A mode DeleteItem doesn't support (`"allNew"`, `"updatedOld"`,
+  `"updatedNew"`) fails with a `ValidationError` before anything is sent; it
+  used to reach DynamoDB, which rejected it (or, through `Entity.returnValues`,
+  was dropped). If the deleted item can't be decoded, the new
+  `DeleteAppliedButUnreadable` reports it, with the item as stored: the delete
+  WAS applied.
+- **Chained `.filter()`s no longer collide.** Each filter was compiled on its
+  own, numbering its attribute placeholders from zero, so the second
+  overwrote the first's name and the query matched the wrong attribute; they
+  are now compiled as one expression.
+- **Projected names need no particular characters.** `select(["first-name"])`
+  built the placeholder `#proj_first-name`, which DynamoDB rejects; a name
+  that isn't letters, digits and underscores now gets a numbered placeholder.
+- **Collection queries keep their grouping through every combinator.**
+  `db.collections.x(...).filter(...).collect()` returned a flat list (it lost
+  the grouping by member); it is grouped like `collect()`, and `select`
+  returns each member's items grouped too.
 - **Bound queries filter and select renamed fields by their stored names.** A
   field renamed with `DynamoModel.configure(..., { field })` was projected and
   filtered under its domain name, so `select(["name"])` returned `{}` and
   `filter({ name })` matched nothing; they now use the stored attribute and
-  hand items back under the domain names.
+  hand items back under the domain names. On a collection whose members store
+  one field under different names, a filter is judged per member and a select
+  reads each member's own attribute.
 - **A transaction that touches one item twice, or passes DynamoDB's 4 MB, is
   refused before it is sent**, with a `ValidationError` naming the entity, in
   `Transaction.transactWrite` and `EventStore.append`. The items an op adds
@@ -154,7 +176,10 @@ real `DateTime`s.
   doesn't reproduce (an unpadded number composite written by 1.15). This runs
   on the rows as they arrive, for queries and scans alike, so a projection
   also reads the sort key and its composites. `limit` is still sent as
-  `Limit`, paging on to make up any rows left out. `.history()` still reads
+  `Limit` on the first request, and each later request asks for twice the
+  last, so a run of history rows costs requests logarithmic in its length;
+  `maxPages` still bounds requests, so a capped query can return fewer items
+  than `limit` when rows are left out. `.history()` still reads
   events. A primary-key `count()` of a retain, soft-delete or time-series
   entity reads the sort key and composites of each row to count them (the
   same read capacity as a server-side count), not whole items.
@@ -600,7 +625,7 @@ Review `catchTag` handlers and exhaustive matches on them:
 | `put`, `create` | `OptimisticLockError`, `ConcurrentModification`, `TransactionOverflow` |
 | `upsert` | `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `TransactionOverflow` |
 | `update`, `patch` | `ConcurrentModification`, `UpdateAppliedButUnreadable`, `TransactionOverflow` |
-| `delete`, `deleteIfExists` | `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow` |
+| `delete`, `deleteIfExists` | `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow`, `DeleteAppliedButUnreadable` |
 | `restore` | `ItemNotDeleted`, `TransactionOverflow` |
 | `Transaction.transactWrite` | `OptimisticLockError`, `ConcurrentModification` |
 | `EventStore` `append`, `commandHandler` | `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |

@@ -335,7 +335,7 @@ These functions transform entity operations via pipe:
 | `subtract(values)` | `EntityUpdate` | Subtract from numeric attributes (SET `#f = #f - :v`) |
 | `append(values)` | `EntityUpdate` | Append to list attributes (`list_append`) |
 | `deleteFromSet(values)` | `EntityUpdate` | DELETE elements from Set attributes |
-| `returnValues(mode)` | `EntityUpdate`, `EntityDelete` | Control DynamoDB `ReturnValues`: `"none" \| "allOld" \| "allNew" \| "updatedOld" \| "updatedNew"`. On an update the result type follows the mode (`UpdateReturn<A, M>`): `"none"` → `undefined`, `"updatedOld"` / `"updatedNew"` → a `Partial` of the top-level attributes the update wrote, `"allOld"` / `"allNew"` → the whole item. Honoured on every update path; with repeated calls the last one wins. On a delete, `"allOld"` returns the deleted item (`undefined` when there was none) on every delete path, and `"none"` nothing |
+| `returnValues(mode)` | `EntityUpdate`, `EntityDelete` | Control DynamoDB `ReturnValues`. An update takes `"none" \| "allOld" \| "allNew" \| "updatedOld" \| "updatedNew"`; a delete takes `"none" \| "allOld"` (any other mode fails with a `ValidationError` before sending). On an update the result type follows the mode (`UpdateReturn<A, M>`): `"none"` → `undefined`, `"updatedOld"` / `"updatedNew"` → a `Partial` of the top-level attributes the update wrote, `"allOld"` / `"allNew"` → the whole item. Honoured on every update path; with repeated calls the last one wins. On a delete, `"allOld"` returns the deleted item (`undefined` when there was none) on every delete path, and `"none"` nothing; a deleted item that won't decode is `DeleteAppliedButUnreadable` (the delete was applied) |
 | `cascade(config)` | `EntityUpdate` | Propagate source entity changes to target entities that embed it via `DynamoModel.ref`. Config: `{ targets, filter?, mode? }` (dual API) |
 
 ### Decode Mode Selectors
@@ -1244,6 +1244,7 @@ import {
 | `ItemNotFound` | `"ItemNotFound"` | No item under the key: `get`, an `update` of a missing item (unless it is a plain `.set()` of a complete item), `restore` with no soft-deleted item or after a concurrent restore won |
 | `ConditionalCheckFailed` | `"ConditionalCheckFailed"` | A `.condition()` was not met (put, update, delete, create), or `patch()` of a missing item. A lost version race is an `OptimisticLockError` instead |
 | `ValidationError` | `"ValidationError"` | Schema decode/encode failed, or the operation was refused: an item of a versioned entity with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, or a transaction that touches one item twice or passes 4 MB |
+| `DeleteAppliedButUnreadable` | `"DeleteAppliedButUnreadable"` | A delete with `returnValues("allOld")` was applied, but the item it removed (`item`, as stored) could not be decoded. Don't retry it |
 | `TransactionCancelled` | `"TransactionCancelled"` | Transaction rejected (includes cancellation `reasons`) |
 | `TransactionOverflow` | `"TransactionOverflow"` | A write's own transaction (the item, its sentinels and snapshot) would exceed DynamoDB's 100-item limit |
 | `AppendTooLarge` | `"AppendTooLarge"` | `EventStore.append` exceeds the 100-item transaction limit (`streamName`, `streamId`, `count`, `limit`) |
@@ -1275,7 +1276,7 @@ Each operation declares a fixed error union, whatever the entity's configuration
 | `upsert` | as `put`, plus `ItemNotFound`, `ConditionalCheckFailed` |
 | `update` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `UpdateAppliedButUnreadable`, `UniqueConstraintViolation`, `ValidationError`, `TransactionOverflow` |
 | `patch` | as `update`, plus `ConditionalCheckFailed` |
-| `delete` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow` |
+| `delete` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow`, `DeleteAppliedButUnreadable` |
 | `deleteIfExists` | as `delete`, plus `ConditionalCheckFailed` |
 | `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow` |
 | `purge` | `ValidationError` |
