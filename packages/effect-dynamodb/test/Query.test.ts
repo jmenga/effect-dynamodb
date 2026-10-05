@@ -653,6 +653,33 @@ describe("Query", () => {
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
+    it.effect("asParams fails with ValidationError on an empty part, never dies (#134)", () =>
+      Effect.gen(function* () {
+        const ops = createConditionOps<{ id: string; name: string }>()
+        const pb = createPathBuilder<{ id: string; name: string }>()
+        for (const filter of [
+          ops.isIn(pb.id, []),
+          ops.or(ops.eq(pb.id, "a"), ops.and()),
+          ops.not(ops.and()),
+          ops.or(),
+        ]) {
+          const exit = yield* Effect.exit(
+            makeTestQuery().pipe(Query.filterExpr(filter), Query.asParams),
+          )
+          expect(exit._tag).toBe("Failure")
+          const error = yield* Effect.flip(
+            makeTestQuery().pipe(Query.filterExpr(filter), Query.asParams),
+          )
+          expect(error._tag).toBe("ValidationError")
+        }
+        const params = yield* makeTestQuery().pipe(
+          Query.filterExpr(ops.and(ops.eq(pb.id, "a"), ops.and())),
+          Query.asParams,
+        )
+        expect(params.FilterExpression).toBe("#eddE IN (:et0) AND (#e0 = :e1)")
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
     it.effect("an empty part under or or not, or an or() with no parts, is refused unsent", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValue({ Items: [] })

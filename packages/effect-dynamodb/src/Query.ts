@@ -835,6 +835,25 @@ const isExcludedRow = (state: QueryState, row: Record<string, AttributeValue>): 
  * @internal The state a terminal runs: {@link QueryState.prepare} applied
  * against the resolved table.
  */
+/**
+ * @internal A filter with an empty part where none may be (`emptyPartProblem`):
+ * the `ValidationError` every path that builds a request fails with, before
+ * `compileExpr` — which throws on one — ever sees it (#133).
+ */
+const refuseEmptyFilterParts = (state: QueryState): ValidationError | undefined => {
+  for (const filter of state.exprFilters) {
+    const problem = emptyPartProblem(filter)
+    if (problem !== undefined) {
+      return new ValidationError({
+        entityType: state.entityTypes.join(", ") || "unknown",
+        operation: "query.filter",
+        cause: `filter: ${problem} Nothing was sent.`,
+      })
+    }
+  }
+  return undefined
+}
+
 const prepared = (
   state: QueryState,
   tableName: string,
@@ -854,18 +873,8 @@ const prepared = (
   }
   // A filter with an empty part where none may be is refused before
   // anything is sent (#133).
-  for (const filter of state.exprFilters) {
-    const problem = emptyPartProblem(filter)
-    if (problem !== undefined) {
-      return Effect.fail(
-        new ValidationError({
-          entityType: state.entityTypes.join(", ") || "unknown",
-          operation: "query.filter",
-          cause: `filter: ${problem} Nothing was sent.`,
-        }),
-      )
-    }
-  }
+  const filterRefusal = refuseEmptyFilterParts(state)
+  if (filterRefusal !== undefined) return Effect.fail(filterRefusal)
   return state.prepare === undefined
     ? Effect.succeed(state)
     : Effect.map(state.prepare(tableName), (prep) => {
@@ -1294,10 +1303,17 @@ export const count = <A>(
 /**
  * Return the built DynamoDB command input without executing.
  * Useful for debugging, logging, or passing to DynamoClient directly.
+ * Fails with a `ValidationError` for a filter the query would refuse to send
+ * (an empty part under `or` / `not`, an `or()` with no parts, an `isIn` with
+ * no values).
  */
-export const asParams = <A>(self: Query<A>): Effect.Effect<Record<string, unknown>, never, any> =>
+export const asParams = <A>(
+  self: Query<A>,
+): Effect.Effect<Record<string, unknown>, ValidationError, any> =>
   Effect.gen(function* () {
     const state = self._state
+    const refusal = refuseEmptyFilterParts(state)
+    if (refusal !== undefined) return yield* refusal
     const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName
     return buildDynamoCommand(state, tableName)
   })
