@@ -395,9 +395,10 @@ missing while the root is visible, which for optional or empty-able edges assemb
 aggregate that is quietly incomplete.
 
 Set `consistentRead: true` to close that window. It doubles the RCU cost of every assembly
-read, so it is opt-in. It requires a query that can be strongly consistent — the base table
-or an LSI; DynamoDB rejects consistent reads against a GSI, so pairing it with a GSI-shaped
-collection index throws at `make()` time.
+read, so it is opt-in. It requires an aggregate collection that can be read strongly
+consistently — on the base table, or on an LSI (an aggregate's collection index whose
+partition key is the table's is created as one). DynamoDB reads a GSI only eventually
+consistently, so pairing it with a GSI-shaped collection index throws at `make()` time.
 
 #### Sub-Aggregate Binding with Discriminators
 
@@ -541,6 +542,8 @@ Fields other than refs can be given in their domain form as well as their wire f
 Returns `RefNotFound` if a ref ID doesn't resolve. Returns `AggregateTransactionOverflow` if a sub-aggregate group exceeds 100 items (DynamoDB transaction limit).
 
 Returns `ConditionalCheckFailed` if the aggregate already exists. Its root item's guard cancels the first transaction, so nothing is written: not the root, not an edge, not a sub-aggregate row. Earlier versions overwrote the root and left behind any old rows the new aggregate didn't rewrite. To replace an aggregate, `update` it, or `delete` it first. Each sub-aggregate is still its own transaction, so if a later one fails, the ones before it stay written.
+
+The guard is on the root item only. Edge and sub-aggregate rows left without a root, for example by an earlier write that failed partway, don't stop `create`. `get` then reads them back together with the new aggregate's rows, merging stale edges into it. Before creating an aggregate where an earlier write may have failed partway, `delete` its key: `delete` removes every row in the partition, orphans included. The library doesn't check for orphan rows on `create`, because that would add a partition read to every create.
 
 #### update — Diff and Write
 

@@ -2528,7 +2528,12 @@ sub-aggregate rows carry no guard: they are written only after the root's
 transaction commits. Each sub-aggregate group remains its own transaction, so a
 later group that fails leaves the earlier groups written — exactly as before;
 the guard only makes the first transaction refuse. `update` and `delete` are
-unchanged.
+unchanged. The guard sees the root only: orphan edge rows (a root-less
+partition left by a partial earlier write) don't stop `create`, and `get`
+merges them in; detecting them would cost a partition read on every create, so
+it is documented instead (`delete` the key first). `delete` retries the
+`UnprocessedItems` of its `BatchWriteItem`s with `Batch.write`'s backoff and
+bound (5 retries), then fails with a `DynamoError`.
 
 **Update with diff:**
 

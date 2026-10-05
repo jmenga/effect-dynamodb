@@ -461,7 +461,7 @@ import { Query } from "effect-dynamodb"
 | `collect` | `Effect<Array<A>>` | Execute, fetch all pages, and flatten into a single array |
 | `paginate` | `Effect<Stream<Array<A>>>` | Execute and return a Stream of pages for lazy pagination |
 | `count` | `Effect<number>` | Execute with `SELECT COUNT` — returns total matching items (respects `maxPages`) |
-| `asParams` | `Effect<Record<string, unknown>>` | Return built DynamoDB command input without executing — useful for debugging |
+| `asParams` | `Effect<Record<string, unknown>, ValidationError>` | Return built DynamoDB command input without executing — useful for debugging. Fails with a `ValidationError` for a filter the query would refuse to send |
 
 ### Filter Operators
 
@@ -838,7 +838,7 @@ import {
 |--------|------|-------------|
 | `createPathBuilder<M>()` | `() => PathBuilder<M, M>` | Create a path proxy for type-safe attribute access |
 | `createConditionOps<M>()` | `() => ConditionOps<M>` | Create comparison and logical operators |
-| `compileExpr(expr, resolveDbName?)` | `(Expr) => CompileResult` | Compile `Expr` to DynamoDB expression string |
+| `compileExpr(expr, resolveDbName?)` | `(Expr) => CompileResult` | Compile `Expr` to DynamoDB expression string. Throws on an expression DynamoDB can't take or that would widen what was written — an empty part under `or()` / `not()`, an `or()` with no parts, an `isIn` with no values; an empty part directly under `and()` is left out |
 | `isExpr(u)` | `(unknown) => u is Expr` | Type guard for `Expr` nodes |
 | `parseShorthand(input)` | `(ConditionInput) => Expr` | Convert `ConditionInput` to `Expr` |
 | `parseSimpleShorthand(input)` | `(Record) => Expr` | Convert `{ key: value }` to `Expr` |

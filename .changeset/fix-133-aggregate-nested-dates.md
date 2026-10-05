@@ -181,7 +181,9 @@ real `DateTime`s.
   nothing. As on every op, a later `.condition()` replaces an earlier one; the
   guard stays. `patch()` of a missing item now fails with
   `ConditionalCheckFailed` on every entity: one whose update reads first,
-  such as a retain entity, failed with `ItemNotFound`.
+  such as a retain entity, failed with `ItemNotFound`. The exception is a
+  lost race on a versioned entity — the item is deleted between the read and
+  the write — which is an `OptimisticLockError`, like every lost version race.
 - **Empty conditions and filters.** On 1.22.0 `.condition({})` (or `and()`)
   sent an empty `ConditionExpression`, or `()` beside the library's guard
   (`… AND ()`), and an empty part under `or()` or `not()` was sent as
@@ -207,10 +209,19 @@ real `DateTime`s.
   GSIs), so one pointed at an LSI of a table created outside the library is
   refused too.
 - **`expectedVersion` on an entity that isn't `versioned` is refused
-  (behaviour change).** On 1.22.0 it was silently ignored, so the update ran
-  with no concurrency check at all. It now fails with a `ValidationError`
-  before anything is read or sent. Add `versioned: true`, or use a
-  `.condition()`.
+  (behaviour change).** On 1.22.0 a plain `update`, a `patch` and the unbound
+  `Entity.expectedVersion` silently ignored it, so the update ran with no
+  concurrency check at all; an update that read first (a unique-field change)
+  compared it against the missing version and failed with
+  `OptimisticLockError`. It now fails with a `ValidationError` before anything
+  is read or sent. Add `versioned: true`, or use a `.condition()`.
+- **`Query.asParams` can fail, and `compileExpr` can throw (type-level
+  change).** `asParams` now declares `ValidationError` (it declared `never`):
+  it fails, as the query would, for a filter with an empty part under `or()` /
+  `not()`, an `or()` with no parts or an `isIn` with no values — on 1.22.0 it
+  returned params DynamoDB then rejected. The exported `compileExpr` throws on
+  those same expressions instead of compiling them to `… OR ()`, `NOT ()`,
+  `IN ()` or an empty string.
 - **Bound queries filter and select renamed fields by their stored names.** A
   field renamed with `DynamoModel.configure(..., { field })` was projected and
   filtered under its domain name, so `select(["name"])` returned `{}` and
@@ -310,7 +321,16 @@ with `ConditionalCheckFailed` (`entityType` is the root's, `key` its `pk` and
 `sk`). Edge and sub-aggregate rows carry no guard of their own; they are only
 written after the root's transaction commits. As before, each sub-aggregate is
 its own transaction: if a later one fails, the earlier ones stay written.
-Replace an existing aggregate with `update`, or `delete` it first.
+Replace an existing aggregate with `update`, or `delete` it first. The guard
+sees the root only: edge rows left without a root (an earlier write that
+failed partway) don't stop `create`, and `get` reads them back merged with the
+new rows — `delete` the key first, which removes every row in the partition.
+
+**`delete` no longer leaves rows behind under throttling.** It ignored the
+`UnprocessedItems` DynamoDB returns from `BatchWriteItem`, so a throttled
+delete succeeded with rows still stored. They are retried with exponential
+backoff, as `Batch.write` retries them (up to 5 retries), and a `delete` that
+still can't remove them fails with a `DynamoError` saying how many remain.
 
 **Writes.** Aggregates now store every value in its wire form wherever it is
 nested: in root arrays (`Schema.Array(Schema.DateTimeUtcFromString)`), arrays of
@@ -564,7 +584,9 @@ payload, so the item is exactly what `put` writes. If another writer creates it
 in between, the update re-runs once on that item. Anything else fails with
 `ItemNotFound` and writes nothing, as do retain entities and updates that read
 first (a unique-field change and the like). `patch()` of a missing item fails
-with `ConditionalCheckFailed` on every path.
+with `ConditionalCheckFailed` on every path, except a lost race on a versioned
+entity (the item deleted between the read and the write), which is an
+`OptimisticLockError`.
 
 **Decoding defaults.** Fields with `Schema.withDecodingDefault` now survive on
 read: a `put` that omitted one used to write the item and then fail with a
