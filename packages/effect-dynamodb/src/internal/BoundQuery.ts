@@ -415,77 +415,91 @@ export const collectionNaming = (
     readonly entityType: string
     readonly entityKey: string
     readonly resolve: (domainName: string) => string
-    /** The member's domain field names, when known: a filter names only these. */
+    /** The member's domain field names, when known: filters and selects name only these. */
     readonly fields?: ReadonlySet<string> | undefined
   }>,
-): Pick<BoundQueryConfig<unknown>, "renameExpr" | "selectAs"> => ({
-  renameExpr: (expr) => {
-    const heads = [...pathHeads(expr)]
-    // A filter names DOMAIN fields: a member without one of them has no rows
-    // it can match — never one whose stored attribute merely bears the name.
-    const knows = (m: (typeof members)[number]) =>
-      m.fields === undefined || heads.every((head) => m.fields!.has(head))
-    const first = members[0]
-    if (
-      first === undefined ||
-      members.every(
-        (m) => knows(m) && heads.every((head) => m.resolve(head) === first.resolve(head)),
-      )
-    ) {
-      return first === undefined ? expr : (renamePaths(expr, first.resolve) as Expr)
+): Pick<BoundQueryConfig<unknown>, "renameExpr" | "selectAs"> => {
+  /**
+   * The attribute a member reads for a domain field: its stored name when it
+   * has the field; the field's own name when it hasn't and nothing of its is
+   * stored under that name (DynamoDB then evaluates an absent attribute, as
+   * it always did); and when another of its fields IS stored under that name,
+   * an attribute that never exists — so a stored name never stands in for a
+   * domain field.
+   */
+  const attributeOf = (m: (typeof members)[number], field: string): string => {
+    if (m.fields === undefined || m.fields.has(field)) return m.resolve(field)
+    for (const own of m.fields) {
+      if (m.resolve(own) === field) return ABSENT_ATTRIBUTE
     }
-    const matching = members.filter(knows)
-    if (matching.length === 0) {
-      // No member has the field: nothing matches.
+    return field
+  }
+  return {
+    renameExpr: (expr) => {
+      const heads = [...pathHeads(expr)]
+      const first = members[0]
+      if (first === undefined) return expr
+      // Every member reads the same attributes: one expression, as before.
+      if (
+        members.every((m) =>
+          heads.every((head) => attributeOf(m, head) === attributeOf(first, head)),
+        )
+      ) {
+        return renamePaths(expr, (head) => attributeOf(first, head)) as Expr
+      }
+      // They differ: each member's rows judged by its own attributes.
       return {
         [ExprTag]: ExprTag,
-        _tag: "notExists",
-        operand: { _tag: "path", segments: ["__edd_e__"] },
-      } as unknown as Expr
-    }
-    return {
-      [ExprTag]: ExprTag,
-      _tag: "or",
-      exprs: matching.map(
-        (m): Expr => ({
-          [ExprTag]: ExprTag,
-          _tag: "and",
-          exprs: [
-            {
-              [ExprTag]: ExprTag,
-              _tag: "eq",
-              left: { _tag: "path", segments: ["__edd_e__"] },
-              right: { _tag: "value", value: m.entityType },
-            } as Expr,
-            renamePaths(expr, m.resolve) as Expr,
-          ],
-        }),
-      ),
-    } as Expr
-  },
-  selectAs: (query, paths) => {
-    const heads = [...new Set(paths.map((path) => String(path[0])))]
-    const stored = new Map<string, ReadonlyArray<string | number>>()
-    for (const m of members) {
-      for (const path of paths) {
-        const renamed = [m.resolve(String(path[0])), ...path.slice(1)]
-        stored.set(JSON.stringify(renamed), renamed)
+        _tag: "or",
+        exprs: members.map(
+          (m): Expr => ({
+            [ExprTag]: ExprTag,
+            _tag: "and",
+            exprs: [
+              {
+                [ExprTag]: ExprTag,
+                _tag: "eq",
+                left: { _tag: "path", segments: ["__edd_e__"] },
+                right: { _tag: "value", value: m.entityType },
+              } as Expr,
+              renamePaths(expr, (head) => attributeOf(m, head)) as Expr,
+            ],
+          }),
+        ),
+      } as Expr
+    },
+    selectAs: (query, paths) => {
+      const heads = [...new Set(paths.map((path) => String(path[0])))]
+      // Only a member's own domain fields are read for it.
+      const has = (m: (typeof members)[number], head: string) =>
+        m.fields === undefined || m.fields.has(head)
+      const stored = new Map<string, ReadonlyArray<string | number>>()
+      for (const m of members) {
+        for (const path of paths) {
+          if (!has(m, String(path[0]))) continue
+          const renamed = [m.resolve(String(path[0])), ...path.slice(1)]
+          stored.set(JSON.stringify(renamed), renamed)
+        }
       }
-    }
-    stored.set(JSON.stringify(["__edd_e__"]), ["__edd_e__"])
-    const byType = new Map(members.map((m) => [m.entityType, m]))
-    return Query.selectProjected(query, [...stored.values()], (raw) => {
-      const m = byType.get(raw.__edd_e__ as string)
-      if (m === undefined) return { _memberKey: "__unknown__", _decoded: raw }
-      const item: Record<string, unknown> = {}
-      for (const head of heads) {
-        const value = raw[m.resolve(head)]
-        if (value !== undefined) item[head] = value
-      }
-      return { _memberKey: m.entityKey, _decoded: item }
-    })
-  },
-})
+      stored.set(JSON.stringify(["__edd_e__"]), ["__edd_e__"])
+      const byType = new Map(members.map((m) => [m.entityType, m]))
+      return Query.selectProjected(query, [...stored.values()], (raw) => {
+        const m = byType.get(raw.__edd_e__ as string)
+        if (m === undefined) return { _memberKey: "__unknown__", _decoded: raw }
+        const item: Record<string, unknown> = {}
+        for (const head of heads) {
+          if (!has(m, head)) continue
+          const value = raw[m.resolve(head)]
+          if (value !== undefined) item[head] = value
+        }
+        return { _memberKey: m.entityKey, _decoded: item }
+      })
+    },
+  }
+}
+
+/** An attribute no item ever has (#133): see {@link collectionNaming}. */
+const ABSENT_ATTRIBUTE = "__edd_absent__"
 
 // ---------------------------------------------------------------------------
 // BoundQuery implementation

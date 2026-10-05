@@ -14362,7 +14362,12 @@ const g133NamedIndex = (sk: string) => ({
 })
 
 // Two entities sharing a GSI partition: one's filter must never reach the other.
-const G133OrA = Schema.Struct({ owner: Schema.String, aid: Schema.String, n: Schema.Number })
+const G133OrA = Schema.Struct({
+  owner: Schema.String,
+  aid: Schema.String,
+  n: Schema.Number,
+  code: Schema.optional(Schema.String),
+})
 const G133OrB = Schema.Struct({
   owner: Schema.String,
   bid: Schema.String,
@@ -17494,6 +17499,54 @@ describeConnected("#133 — path operations on index composites and unique field
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
+  it.effect(
+    "a collection filter on a field only some members have reads it as absent on the rest",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const as = db.entities.OrAs as any
+        const bs = db.entities.OrBs as any
+        yield* as.put({ owner: "part", aid: "a1", n: 1, code: "c1" })
+        yield* as.put({ owner: "part", aid: "a2", n: 2, code: "c2" })
+        yield* bs.put({ owner: "part", bid: "b1", n: 3, secret: "s" })
+        yield* bs.put({ owner: "part", bid: "b2", n: 4, secret: "t" })
+        const q = () => (db.collections as any).g133Or({ owner: "part" })
+        const ids = (r: any) => [r.OrAs.map((a: any) => a.aid), r.OrBs.map((b: any) => b.bid)]
+        // What main returns: DynamoDB evaluates an absent attribute.
+        const either = (t: any, { or, eq }: any) => or(eq(t.secret, "s"), eq(t.code, "c1"))
+        expect(ids(yield* q().filter(either).collect())).toEqual([["a1"], ["b1"]])
+        expect(yield* q().filter(either).count()).toBe(2)
+        const notS = (t: any, { not, eq }: any) => not(eq(t.secret, "s"))
+        expect(ids(yield* q().filter(notS).collect())).toEqual([["a1", "a2"], ["b2"]])
+        const noSecret = (t: any, { notExists }: any) => notExists(t.secret)
+        expect(ids(yield* q().filter(noSecret).collect())).toEqual([["a1", "a2"], []])
+        // A field no member has matches nothing.
+        expect(ids(yield* q().filter({ nope: "x" }).collect())).toEqual([[], []])
+        // A row of no member's in the partition (seen once ownership is
+        // ignored) is never streamed as a member's item.
+        const a1 = yield* Effect.gen(function* () {
+          const client = yield* DynamoClient
+          return (yield* client.getItem({
+            TableName: g133Tables.record,
+            Key: toAttributeMap({
+              pk: "$edd133g#v1#g133ora#owner_part",
+              sk: "$edd133g#v1#g133ora#aid_a1",
+            }),
+          })).Item!
+        }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+        yield* putRaw({
+          ...fromAttributeMap(a1),
+          pk: "$edd133g#v1#foreign#x",
+          sk: "$edd133g#v1#foreign",
+          __edd_e__: "Foreign",
+        })
+        const streamed = [
+          ...(yield* Stream.runCollect(q().ignoreOwnership().paginate())),
+        ] as Array<any>
+        expect(streamed.map((s) => s.member).sort()).toEqual(["OrAs", "OrAs", "OrBs", "OrBs"])
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
   // ---- a filter never widens the ownership check (#133) ----
 
   it.effect("a top-level OR filter returns only the entity's own rows", () =>
@@ -17621,6 +17674,13 @@ describeConnected("#133 — path operations on index composites and unique field
       const byStoredName = yield* named({ grp: "dom" }).filter({ "the-label": "L1" }).collect()
       expect(byStoredName.Hyphens).toEqual([])
       expect(byStoredName.NamedThirds.map((t: any) => t.tid)).toEqual(["t1"])
+      // A field only one member stores, under a name that is no member's
+      // domain field: nothing.
+      expect(yield* named({ grp: "dom" }).filter({ nlabel: "L1" }).count()).toBe(0)
+      // select reads each member's own domain fields — never a stored name.
+      const selected = yield* named({ grp: "dom" }).select(["label", "the-label"]).collect()
+      expect(selected.Hyphens).toEqual([{ label: "L1" }])
+      expect(selected.NamedThirds).toEqual([{ label: "X", "the-label": "L1" }])
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 

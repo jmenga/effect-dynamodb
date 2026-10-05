@@ -6,9 +6,10 @@ import { beforeEach, vi } from "vitest"
 import {
   type BoundQueryConfig,
   BoundQueryImpl,
+  collectionNaming,
   type RawSortKeyCondition,
 } from "../src/internal/BoundQuery.js"
-import { createConditionOps } from "../src/internal/Expr.js"
+import { compileExpr, createConditionOps } from "../src/internal/Expr.js"
 import { createPathBuilder } from "../src/internal/PathBuilder.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
@@ -606,5 +607,45 @@ describe("BoundQuery", () => {
       expect(bq._query._state.limitValue).toBe(5)
       expect(bq._query._state.consistentRead).toBe(true)
     })
+  })
+})
+
+describe("collectionNaming (#133)", () => {
+  type Row = { n: number; secret: string; code: string; label: string }
+  const ops = createConditionOps<Row>()
+  const pb = createPathBuilder<Row>()
+  const identity = (name: string) => name
+  const plain = [
+    { entityType: "A", entityKey: "As", resolve: identity, fields: new Set(["n", "code"]) },
+    { entityType: "B", entityKey: "Bs", resolve: identity, fields: new Set(["n", "secret"]) },
+  ]
+
+  it("a collection without renames compiles a filter exactly as written", () => {
+    const naming = collectionNaming(plain)
+    for (const expr of [
+      ops.eq(pb.n, 1),
+      ops.or(ops.eq(pb.secret, "s"), ops.eq(pb.code, "c1")),
+      ops.not(ops.eq(pb.secret, "s")),
+      ops.notExists(pb.secret),
+    ]) {
+      expect(compileExpr(naming.renameExpr!(expr))).toEqual(compileExpr(expr))
+    }
+  })
+
+  it("a stored name another member's domain field bears reads as absent there", () => {
+    const naming = collectionNaming([
+      ...plain,
+      {
+        entityType: "C",
+        entityKey: "Cs",
+        resolve: (name) => (name === "label" ? "secret" : name),
+        fields: new Set(["n", "label"]),
+      },
+    ])
+    const compiled = compileExpr(naming.renameExpr!(ops.eq(pb.secret, "s")))
+    expect(compiled.expression).toContain(" OR ")
+    expect(Object.values(compiled.names)).toEqual(
+      expect.arrayContaining(["__edd_e__", "secret", "__edd_absent__"]),
+    )
   })
 })
