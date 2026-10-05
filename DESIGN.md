@@ -1803,9 +1803,9 @@ for byte as before. As on every op, a later `.condition()` replaces an earlier
 one; the guard always stays. (The version, unique-sentinel and retain guards
 were already separate from the caller's condition.)
 
-**Empty conditions and filters (#133).** The `condition` combinator — and the
-bound `append(...).condition()` — is the one place an empty condition becomes
-none: a condition that asserts nothing (`{}`, `and()`, an `and` of only such
+**Empty conditions and filters (#133).** The `condition` combinator is the one
+place an empty condition becomes none (`nonEmptyCondition`; `append`, which
+takes its condition as an argument, applies it on entry): a condition that asserts nothing (`{}`, `and()`, an `and` of only such
 parts — `isEmptyExpr`) is dropped, leaving the op's own guard alone; likewise
 `Query.filterExpr` drops an empty filter. An empty part directly under `and` is
 left out when compiled. Anywhere else — under `or` (which it would make match

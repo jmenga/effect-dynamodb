@@ -18,6 +18,8 @@ import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import { DateTime, Duration, Effect, Layer, Option, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 import * as Entity from "../src/Entity.js"
+import { createConditionOps } from "../src/internal/Expr.js"
+import { createPathBuilder } from "../src/internal/PathBuilder.js"
 import * as Table from "../src/Table.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
@@ -1152,6 +1154,38 @@ describe("TimeSeries — .append().remove() basic emission", () => {
       )
     }).pipe(Effect.provide(layer))
   })
+
+  it.effect(
+    "an empty condition is no condition; an empty part under or / not is refused (#133)",
+    () => {
+      const { entity, tableLayer } = buildEntity()
+      const layer = Layer.merge(TestDynamoClient, tableLayer)
+      const input = {
+        channel: "c-1",
+        deviceId: "d-7",
+        timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+      }
+      const ops = createConditionOps<{ location: string }>()
+      const pb = createPathBuilder<{ location: string }>()
+
+      return Effect.gen(function* () {
+        mockHappyPathReadback()
+        yield* (entity as any).append(input, {})
+        const cond = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Update
+          .ConditionExpression as string
+        expect(cond).toBe("attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb")
+        for (const refused of [
+          ops.or(ops.eq(pb.location, "rack-1"), ops.and()),
+          ops.not(ops.and()),
+          ops.or(),
+        ]) {
+          const error = yield* (entity as any).append(input, refused).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+        }
+        expect(mockTransactWriteItems).toHaveBeenCalledTimes(1)
+      }).pipe(Effect.provide(layer))
+    },
+  )
 
   it.effect("removeAttrs composes with user condition (ANDed onto CAS)", () => {
     const { entity, tableLayer } = buildEntity()

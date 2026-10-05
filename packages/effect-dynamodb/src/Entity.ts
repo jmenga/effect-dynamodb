@@ -90,6 +90,7 @@ import {
   type Expr,
   emptyPartProblem,
   isExpr,
+  nonEmptyCondition,
   parseShorthand,
   parseSimpleShorthand,
   toExpr,
@@ -8035,7 +8036,7 @@ const makeImpl = <
 
   const append = (
     input: unknown,
-    userCondition?: Expr | ConditionInput,
+    givenCondition?: Expr | ConditionInput,
     skipFollowUp = false,
     removeAttrs?: ReadonlyArray<string>,
   ) =>
@@ -8047,6 +8048,9 @@ const makeImpl = <
           cause: "Entity is not configured with timeSeries. .append() requires timeSeries config.",
         })
       }
+      // `append` takes its condition as an argument — no `condition`
+      // combinator — so an empty one becomes none here (#133).
+      const userCondition = nonEmptyCondition(givenCondition)
       const emptyPart =
         userCondition === undefined ? undefined : emptyPartProblem(toExpr(userCondition))
       if (emptyPart !== undefined) {

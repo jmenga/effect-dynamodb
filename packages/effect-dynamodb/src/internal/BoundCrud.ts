@@ -58,7 +58,7 @@ import type {
   UpdateReturn,
 } from "./EntityOps.js"
 import type { ConditionOps, Expr } from "./Expr.js"
-import { nonEmptyCondition, parseSimpleShorthand } from "./Expr.js"
+import { parseSimpleShorthand } from "./Expr.js"
 import type { PathBuilder } from "./PathBuilder.js"
 
 // ---------------------------------------------------------------------------
@@ -737,9 +737,7 @@ export class BoundAppendImpl<Model, A, E, ESkip> implements BoundAppend<Model, A
   ) {}
 
   condition(cond: ConditionArg<Model>): BoundAppendImpl<Model, A, E, ESkip> {
-    // An empty condition is no condition (#133) — `nonEmptyCondition`, as on
-    // every other op's `.condition()`.
-    const compiled = nonEmptyCondition(buildCondition(this._config, cond))
+    const compiled = buildCondition(this._config, cond)
     return new BoundAppendImpl(this._input, this._config, compiled, this._skip, this._removeAttrs)
   }
 
