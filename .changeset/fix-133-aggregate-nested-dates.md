@@ -153,18 +153,27 @@ real `DateTime`s.
   `.fetch()`'s page (it returned internal wrappers, though typed as grouped).
   `.paginate()` streams each item tagged with its member
   (`{ member, item }`, typed `CollectionStreamItem`), and `CollectionQuery`
-  now declares `.select()` (partial records grouped per member), `.count()`
-  and `.paginate()`. A collection filter names each member's domain fields: a
-  member that doesn't have one matches nothing, rather than matching an
-  attribute another member stores under that name.
+  now declares `.select()` (partial records grouped per member), `.count()`,
+  `.paginate()`, `.maxPages()` and `.consistentRead()`; `CollectionQuery`,
+  `CollectionStreamItem` and `CollectionSelected` are exported. A collection
+  filter or select names each member's domain fields. A member without the
+  field reads it as absent, exactly as before (so `not(...)` and
+  `notExists(...)` still match its rows), and an attribute that member
+  stores under that name never stands in for it.
 - **A filter can no longer widen an entity's ownership check.** A filter
   whose top level was an `OR` was ANDed with the `__edd_e__` check without
   parentheses (`#eddE IN (:et0) AND a OR b`), so another entity's rows in the
   same partition matched `b` — returned by `collect` (or failing to decode),
   counted, selected. The filter is now parenthesised.
-- **A later `.condition()` replaces an earlier one on every op**, as on puts
-  and updates before; `deleteIfExists`'s existence check is the op's own
-  guard and stays, ANDed with the latest condition.
+- **`deleteIfExists` keeps its existence check under chained conditions.**
+  As on every other op, a later `.condition()` replaces an earlier one; on
+  `deleteIfExists` the existence check is the op's own guard and stays,
+  ANDed with the latest condition (it used to be replaced by it).
+- **An empty condition is no condition.** `.condition({})` (or an empty
+  `and()`) compiled to `()`, which DynamoDB rejects — alone, or beside the
+  library's guard as `… AND ()`. It is now no condition on put, create,
+  upsert, update, delete, `deleteIfExists` and transaction ops, and an empty
+  filter or empty part of one is left out.
 - **Bound queries filter and select renamed fields by their stored names.** A
   field renamed with `DynamoModel.configure(..., { field })` was projected and
   filtered under its domain name, so `select(["name"])` returned `{}` and

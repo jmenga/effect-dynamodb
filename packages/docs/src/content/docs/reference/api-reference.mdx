@@ -630,7 +630,7 @@ A collection query takes `.filter()`, `.select()`, `.limit()`, `.pageSize()`, `.
 | `.paginate()` | A `Stream` of every item, each tagged with its member: `{ member: "Employees", item: Employee }` (`CollectionStreamItem`) |
 | `.count()` | The number of items, every member's together |
 
-A filter names each member's **domain** fields: on a member that stores a field under another name (`DynamoModel.configure(..., { field })`) it reads that attribute, and a member without the field matches nothing. `.select()` returns partial records grouped per member.
+A filter or select names each member's **domain** fields: on a member that stores a field under another name (`DynamoModel.configure(..., { field })`) it reads that attribute. A member without the field reads it as absent — `eq` doesn't match, `not(eq(...))` and `notExists(...)` do — and an attribute it stores under that name never stands in for the field. `.select()` returns partial records grouped per member. The query also takes `.maxPages()` and `.consistentRead()`, and its types (`CollectionQuery`, `CollectionStreamItem`, `CollectionSelected`) are exported.
 
 ### Explicit Collections
 
