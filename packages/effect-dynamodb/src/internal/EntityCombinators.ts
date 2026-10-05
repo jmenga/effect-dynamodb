@@ -26,6 +26,7 @@ import {
   type EntityUpdate,
   EntityUpdateImpl,
   EntityUpdateTypeId,
+  existenceBase,
   existenceConditions,
   type PathAddOp,
   type PathAppendOp,
@@ -295,11 +296,16 @@ export const condition: {
     const impl = self as unknown as EntityDeleteImpl<any, any>
     const existing = impl._condition
     let next: Expr | ConditionInput = cond
-    if (existing !== undefined && existenceConditions.has(existing as object)) {
+    const kind = existing === undefined ? undefined : existenceConditions.get(existing as object)
+    if (kind !== undefined) {
+      // Like every op's `.condition()`, a later one replaces an earlier one —
+      // the existence check is the op's own guard, and stays.
+      const base = kind === "existenceOnly" ? existing! : existenceBase.get(existing as object)!
       const asExpr = (c: Expr | ConditionInput): Expr =>
         isExpr(c) ? c : parseShorthand(c as ConditionInput)
-      next = { [ExprTag]: ExprTag, _tag: "and", exprs: [asExpr(existing), asExpr(cond)] } as Expr
+      next = { [ExprTag]: ExprTag, _tag: "and", exprs: [asExpr(base), asExpr(cond)] } as Expr
       existenceConditions.set(next as object, "mustExist")
+      existenceBase.set(next as object, base as object)
     }
     return new EntityDeleteImpl(
       impl._builder,

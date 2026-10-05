@@ -6853,6 +6853,42 @@ describe("Entity", () => {
         }).pipe(Effect.provide(TestLayer)),
     )
 
+    it.effect("a later .condition() replaces an earlier one; the op's own guard stays", () =>
+      Effect.gen(function* () {
+        mockDeleteItem.mockResolvedValue({})
+        mockPutItem.mockResolvedValue({})
+        mockUpdateItem.mockResolvedValue({
+          Attributes: toAttributeMap({ itemId: "i-1", name: "n" }),
+        })
+        const names = (input: any) => Object.values(input.ExpressionAttributeNames ?? {})
+        yield* Plain.delete({ itemId: "i-1" })
+          .pipe(Plain.condition({ itemId: "a" }), Plain.condition({ name: "b" }))
+          .asEffect()
+        expect(names(mockDeleteItem.mock.calls[0]![0])).toEqual(["name"])
+        yield* Plain.deleteIfExists({ itemId: "i-1" })
+          .pipe(Plain.condition({ itemId: "a" }), Plain.condition({ name: "b" }))
+          .asEffect()
+        const ifExists = mockDeleteItem.mock.calls[1]![0]
+        expect(ifExists.ConditionExpression).toContain("attribute_exists")
+        expect(names(ifExists)).not.toContain("itemId")
+        expect(names(ifExists)).toContain("name")
+        yield* Plain.put({ itemId: "i-1", name: "n" })
+          .pipe(Plain.condition({ itemId: "a" }), Plain.condition({ name: "b" }))
+          .asEffect()
+        expect(names(mockPutItem.mock.calls[0]![0])).toEqual(["name"])
+        yield* Plain.update({ itemId: "i-1" })
+          .pipe(
+            Entity.set({ name: "m" }),
+            Plain.condition({ itemId: "a" }),
+            Plain.condition({ name: "b" }),
+          )
+          .asEffect()
+        const update = mockUpdateItem.mock.calls[0]![0]
+        expect(update.ConditionExpression).not.toMatch(/#c\d+ = :c\d+ AND .*itemId/)
+        expect(Object.values(update.ExpressionAttributeValues)).not.toContainEqual({ S: "a" })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("deleteIfExists(k).condition(x) asserts both", () =>
       Effect.gen(function* () {
         mockDeleteItem.mockResolvedValue({})

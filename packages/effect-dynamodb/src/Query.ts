@@ -762,6 +762,9 @@ const buildDynamoCommand = (
 // Internal: limit / pageSize execution helpers
 // ---------------------------------------------------------------------------
 
+/** The largest `Limit` a growing request asks for: DynamoDB stops at 1 MB anyway. */
+const MAX_GROWN_LIMIT = 100_000
+
 /**
  * @internal DynamoDB `Limit` for the next request.
  *
@@ -785,9 +788,6 @@ const buildDynamoCommand = (
  *
  * `page` is the request's 1-based number within the terminal.
  */
-/** The largest `Limit` a growing request asks for: DynamoDB stops at 1 MB anyway. */
-const MAX_GROWN_LIMIT = 100_000
-
 const computeRequestLimit = (
   state: QueryState,
   remaining: number | undefined,

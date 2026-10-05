@@ -525,7 +525,7 @@ Combinators are immutable — each call returns a new `BoundQuery`. Terminals ex
 |--------|-------------|
 | `.where((t, ops) => …)` | Type-safe sort key condition on remaining SK composites. Only available when SK composites have not all been consumed. Consumes `SkRemaining` (cannot be called twice). Operators: `eq`, `lt`, `lte`, `gt`, `gte`, `between`, `beginsWith`. |
 | `.filter((t, ops) => …)` | Post-read filter expression via callback. Type-safe attribute paths via `t`, condition operators via `ops`. |
-| `.filter(shorthand)` | Post-read filter via shorthand object (e.g. `{ status: "active" }` or `{ gt: { price: 30 } }`). |
+| `.filter(shorthand)` | Post-read filter via an equality shorthand object: `{ status: "active" }` ANDs `status = "active"` for each key. For other comparisons use the callback form. |
 | `.select((t) => […paths])` | Projection expression via callback. Returns `BoundQuery<…, Record<string, unknown>>`. |
 | `.select(["field", …])` | Projection via attribute name array. |
 | `.limit(n)` | Return at most `n` items. A contract on results: the query accumulates across as many requests as it takes, which is what makes it work under `.filter()`. |
@@ -620,6 +620,17 @@ const db = yield* DynamoClient.make({ entities: { Employees, Tasks } })
 const result = yield* db.collections.tenantMembers({ tenantId: "t-1" }).collect()
 // result: { Employees: Employee[], Tasks: Task[] }
 ```
+
+A collection query takes `.filter()`, `.select()`, `.limit()`, `.pageSize()`, `.reverse()` and `.startFrom()`, and keeps its grouping through them. Its terminals:
+
+| Terminal | Returns |
+|----------|---------|
+| `.collect()` | The grouped result, `{ Employees: Employee[], Tasks: Task[] }` |
+| `.fetch()` | One page, grouped the same way, with its `cursor` |
+| `.paginate()` | A `Stream` of every item, each tagged with its member: `{ member: "Employees", item: Employee }` (`CollectionStreamItem`) |
+| `.count()` | The number of items, every member's together |
+
+A filter names each member's **domain** fields: on a member that stores a field under another name (`DynamoModel.configure(..., { field })`) it reads that attribute, and a member without the field matches nothing. `.select()` returns partial records grouped per member.
 
 ### Explicit Collections
 
@@ -1225,7 +1236,7 @@ import {
   ValidationError, TransactionCancelled, TransactionOverflow,
   UniqueConstraintViolation, OptimisticLockError,
   ItemDeleted, ItemNotDeleted,
-  ConcurrentModification, UpdateAppliedButUnreadable,
+  ConcurrentModification, UpdateAppliedButUnreadable, DeleteAppliedButUnreadable,
   CompositeKeyHoleError, CompositeNullableError,
   RefNotFound, AggregateAssemblyError,
   AggregateDecompositionError, AggregateTransactionOverflow,

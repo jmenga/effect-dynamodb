@@ -1204,6 +1204,22 @@ describe("Entity types — delete returnValues", () => {
     expectTypeOf<User | undefined>().toMatchTypeOf<ValueOf<typeof any>>()
   })
 
+  it("delete and deleteIfExists declare DeleteAppliedButUnreadable", () => {
+    type ErrorOf<T> = T extends {
+      readonly asEffect: () => import("effect").Effect.Effect<any, infer E, any>
+    }
+      ? E
+      : never
+    type TagsOf<E> = E extends { readonly _tag: infer Tag } ? Tag : never
+    type IfExists = ReturnType<UserBound["deleteIfExists"]>
+    expectTypeOf<
+      "DeleteAppliedButUnreadable" extends TagsOf<ErrorOf<Delete>> ? true : false
+    >().toEqualTypeOf<true>()
+    expectTypeOf<
+      "DeleteAppliedButUnreadable" extends TagsOf<ErrorOf<IfExists>> ? true : false
+    >().toEqualTypeOf<true>()
+  })
+
   it("unbound Entity.returnValues types a delete too", () => {
     const allOld = Entity.returnValues(UserEntity.delete({ userId: "u-1" }), "allOld")
     expectTypeOf<ValueOf<typeof allOld>>().toEqualTypeOf<User | undefined>()
