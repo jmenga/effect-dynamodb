@@ -1715,6 +1715,7 @@ Query.filter({ email: { contains: "@company.com" } })
 Query.limit(10)    // at most 10 ITEMS (accumulates across requests)
 Query.pageSize(10) // 10 rows examined per REQUEST (DynamoDB `Limit`)
 Query.reverse      // scanForward = false
+Query.consistentRead // the table or an LSI; refused on a GSI (#133)
 
 // 6. Execute — terminal, crosses into Effect
 Query.execute    // Query<A> => Effect<A, DynamoError, DynamoClient>
@@ -1776,6 +1777,9 @@ yield* db.entities.Counters.upsert({ counterId: "c-1", total: 0 })
 yield* db.entities.Tasks.patch({ taskId: "t-1" })
   .set({ status: "blocked" })
 
+// deleteIfExists — delete with attribute_exists guard
+yield* db.entities.Tasks.deleteIfExists({ taskId: "t-1" })
+
 // Composed update
 yield* db.entities.Products.update({ productId: "p-1" })
   .set({ name: "Updated", price: 24.99 })
@@ -1785,6 +1789,31 @@ yield* db.entities.Products.update({ productId: "p-1" })
   .remove(["temporaryFlag"])
   .expectedVersion(5)
 ```
+
+**An op's own guard is structural (#133).** `create`'s
+`attribute_not_exists(pk) AND attribute_not_exists(sk)`, and `patch`'s and
+`deleteIfExists`'s `attribute_exists(pk)`, are not held as the op's condition:
+they come from the op's kind (`putKind: "create"`, `patch: true`,
+`_mustExist`) and are ANDed with the caller's condition where the request is
+built — the entity's own write, `Entity.extractTransactable` (transactions,
+`EventStore` additional items) and so `Batch.write`, which refuses any op with
+a condition. Guard and condition compile as one `and` expression, so their
+placeholders never collide; with no condition the guard is sent alone, byte
+for byte as before. As on every op, a later `.condition()` replaces an earlier
+one; the guard always stays. (The version, unique-sentinel and retain guards
+were already separate from the caller's condition.)
+
+**Empty conditions and filters (#133).** The `condition` combinator — and the
+bound `append(...).condition()` — is the one place an empty condition becomes
+none: a condition that asserts nothing (`{}`, `and()`, an `and` of only such
+parts — `isEmptyExpr`) is dropped, leaving the op's own guard alone; likewise
+`Query.filterExpr` drops an empty filter. An empty part directly under `and` is
+left out when compiled. Anywhere else — under `or` (which it would make match
+everything) or `not` (nothing), or an `or()` with no parts (nothing) — it has
+no reading that keeps what the caller wrote, so `emptyPartProblem` refuses it
+with a `ValidationError` before anything is sent: in `EntityPut` / `Update` /
+`Delete` when they run, per op in `transactWrite`, in `append`, and for filters
+when a query runs.
 
 **Yieldable, not Effect.** The *write* builders implement `Pipeable.Pipeable` and `[Symbol.iterator]` (via `Utils.SingleShotGen`) — the same contract as the unbound `EntityOp` and `EntityDelete` intermediates. You execute them by `yield*`ing inside `Effect.gen`. For interop with Effect combinators (`Effect.map`, `Effect.flip`, etc.) use `.asEffect()`.
 
@@ -3186,8 +3215,8 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 |-------|-------|
 | `DynamoError` | AWS SDK error wrapper |
 | `ItemNotFound` | No item: `get`, `update` of a missing item (unless a plain `.set()` of a complete item, which is created), `restore` without a tombstone |
-| `ConditionalCheckFailed` | A user `.condition()` failed, or `patch()` of a missing item |
-| `ValidationError` | Schema decode/encode failure, or a refused operation: an item with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write` |
+| `ConditionalCheckFailed` | A user `.condition()` failed, or an op's own guard did: `create()` of an existing item, `patch()` or `deleteIfExists()` of a missing item |
+| `ValidationError` | Schema decode/encode failure, or a refused operation: an item with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, a condition or filter with an empty part under `or` / `not` (or an `or()` with no parts), `consistentRead` on a GSI |
 | `TransactionCancelled` | Transaction failed with cancellation reasons |
 | `UniqueConstraintViolation` | Sentinel item already exists for unique field (from the entity's write, `transactWrite`, or an `append`'s `additionalItems`) |
 | `OptimisticLockError` | A versioned write lost a version race (`expectedVersion` mismatch, a concurrent write between a read-then-write update's read and write, or a guarded put / upsert / transaction put that lost the race on every attempt); carries the real `actualVersion` |

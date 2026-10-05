@@ -329,7 +329,7 @@ These functions transform entity operations via pipe:
 | `set(updates)` | `EntityUpdate` | Set fields to new values (dual API) |
 | `expectedVersion(n)` | `EntityUpdate` | Optimistic lock — fail if version doesn't match |
 | `consistentRead` | `EntityGet` | Enable strongly consistent reads |
-| `condition(input)` | `EntityPut`, `EntityUpdate`, `EntityDelete` | Add a `ConditionExpression` |
+| `condition(input)` | `EntityPut`, `EntityUpdate`, `EntityDelete` | Add a `ConditionExpression`. A later one replaces an earlier one. It is ANDed with the op's own guard (`create`'s not-exists, `patch`'s and `deleteIfExists`'s exists), never in its place. An empty condition (`{}`, `and()`) is no condition. An empty part under `or()` or `not()`, or an `or()` with no parts, fails with a `ValidationError` before anything is sent |
 | `remove(fields)` | `EntityUpdate` | REMOVE attributes from the item |
 | `add(values)` | `EntityUpdate` | Atomically ADD to numeric attributes |
 | `subtract(values)` | `EntityUpdate` | Subtract from numeric attributes (SET `#f = #f - :v`) |
@@ -446,7 +446,7 @@ import { Query } from "effect-dynamodb"
 | `pageSize(n)` | Dual | Fetch in batches of `n` rows — sets DynamoDB's `Limit` (a contract on round trips) |
 | `maxPages(n)` | Dual | Limit total number of pages fetched |
 | `reverse` | Combinator | Reverse sort order (descending) |
-| `consistentRead` | Combinator | Enable strongly consistent reads |
+| `consistentRead` | Combinator | Enable strongly consistent reads (the table or an LSI; on a GSI the query fails with a `ValidationError` before sending) |
 | `ignoreOwnership` | Combinator | Skip `__edd_e__` entity type filter — for mixed-table scenarios |
 | `startFrom(cursor)` | Dual | Resume pagination from a previous cursor |
 | `select(attrs)` | Dual | Project specific attributes (returns `Query<Record<string, unknown>>`) |
@@ -524,7 +524,7 @@ Combinators are immutable — each call returns a new `BoundQuery`. Terminals ex
 | Method | Description |
 |--------|-------------|
 | `.where((t, ops) => …)` | Type-safe sort key condition on remaining SK composites. Only available when SK composites have not all been consumed. Consumes `SkRemaining` (cannot be called twice). Operators: `eq`, `lt`, `lte`, `gt`, `gte`, `between`, `beginsWith`. |
-| `.filter((t, ops) => …)` | Post-read filter expression via callback. Type-safe attribute paths via `t`, condition operators via `ops`. |
+| `.filter((t, ops) => …)` | Post-read filter expression via callback. Type-safe attribute paths via `t`, condition operators via `ops`. An empty filter (`and()`) is no filter. An empty part under `or()` or `not()`, or an `or()` with no parts, fails with a `ValidationError` before sending. |
 | `.filter(shorthand)` | Post-read filter via an equality shorthand object: `{ status: "active" }` ANDs `status = "active"` for each key. For other comparisons use the callback form. |
 | `.select((t) => […paths])` | Projection expression via callback. Returns `BoundQuery<…, Record<string, unknown>>`. |
 | `.select(["field", …])` | Projection via attribute name array. |
@@ -533,7 +533,7 @@ Combinators are immutable — each call returns a new `BoundQuery`. Terminals ex
 | `.maxPages(n)` | Maximum number of DynamoDB pages to fetch. |
 | `.reverse()` | Reverse sort order (`ScanIndexForward = false`). |
 | `.startFrom(cursor)` | Resume pagination from an opaque cursor returned by `.fetch()`. |
-| `.consistentRead()` | Enable strongly consistent reads. |
+| `.consistentRead()` | Enable strongly consistent reads. On a GSI, which DynamoDB reads only eventually consistently, the query fails with a `ValidationError` before sending. |
 | `.ignoreOwnership()` | Skip the `__edd_e__` entity-type filter. Use only when querying a polymorphic GSI shared across entity types and you want every item back. |
 
 ### Terminals
@@ -630,7 +630,7 @@ A collection query takes `.filter()`, `.select()`, `.limit()`, `.pageSize()`, `.
 | `.paginate()` | A `Stream` of every item, each tagged with its member: `{ member: "Employees", item: Employee }` (`CollectionStreamItem`) |
 | `.count()` | The number of items, every member's together |
 
-A filter or select names each member's **domain** fields: on a member that stores a field under another name (`DynamoModel.configure(..., { field })`) it reads that attribute. A member without the field reads it as absent — `eq` doesn't match, `not(eq(...))` and `notExists(...)` do — and an attribute it stores under that name never stands in for the field. `.select()` returns partial records grouped per member. The query also takes `.maxPages()` and `.consistentRead()`, and its types (`CollectionQuery`, `CollectionStreamItem`, `CollectionSelected`) are exported.
+A filter or select names each member's **domain** fields: on a member that stores a field under another name (`DynamoModel.configure(..., { field })`) it reads that attribute. A member without the field reads it as absent — `eq` doesn't match, `not(eq(...))` and `notExists(...)` do — and an attribute it stores under that name never stands in for the field. `.select()` returns partial records grouped per member. The query also takes `.maxPages()`, `.ignoreOwnership()` and `.consistentRead()`. A collection over a GSI, which DynamoDB reads only eventually consistently, refuses `.consistentRead()` with a `ValidationError` before sending. Its types (`CollectionQuery`, `CollectionStreamItem`, `CollectionSelected`, `CollectionAccessors`) are exported.
 
 ### Explicit Collections
 
@@ -754,7 +754,7 @@ yield* Batch.write(
 
 Auto-chunking: `get` chunks at 100 items, `write` chunks at 25 items. Both retry unprocessed items automatically.
 
-`BatchWriteItem` has no `ConditionExpression`, so `Batch.write` **rejects** any op carrying a condition — `.condition(...)`, `create()` (implicit `attribute_not_exists`) and `deleteIfExists()` (implicit `attribute_exists`) all fail with a `ValidationError` rather than silently writing unconditionally. Use `Transaction.transactWrite` for conditional writes.
+`BatchWriteItem` has no `ConditionExpression`, so `Batch.write` **rejects** any op carrying a condition — `.condition(...)`, `create()` (implicit `attribute_not_exists`) and `deleteIfExists()` (implicit `attribute_exists`) all fail with a `ValidationError` rather than silently writing unconditionally, whatever `.condition()` is added to them (even `.condition({})`). Use `Transaction.transactWrite` for conditional writes.
 
 It also rejects (**EDD-9049**) any write of an entity configured with `unique` or `versioned: { retain: true }`, and any *delete* of a `softDelete` entity. `BatchWriteItem` has no `ConditionExpression` (which is the entirety of a uniqueness sentinel's correctness), no `UpdateRequest`, and no atomicity across its 25-item chunks — a sentinel that lands without its row, or a row without its sentinel, is a corrupt partition. A **put** of a `softDelete` entity is unaffected, because `softDelete` only changes the delete path.
 
@@ -1253,8 +1253,8 @@ import {
 | `InternalServerError` | `"InternalServerError"` | Transient DynamoDB failure |
 | `ResourceNotFoundError` | `"ResourceNotFoundError"` | Table or index does not exist |
 | `ItemNotFound` | `"ItemNotFound"` | No item under the key: `get`, an `update` of a missing item (unless it is a plain `.set()` of a complete item), `restore` with no soft-deleted item or after a concurrent restore won |
-| `ConditionalCheckFailed` | `"ConditionalCheckFailed"` | A `.condition()` was not met (put, update, delete, create), or `patch()` of a missing item. A lost version race is an `OptimisticLockError` instead |
-| `ValidationError` | `"ValidationError"` | Schema decode/encode failed, or the operation was refused: an item of a versioned entity with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, or a transaction that touches one item twice or passes 4 MB |
+| `ConditionalCheckFailed` | `"ConditionalCheckFailed"` | A `.condition()` was not met (put, update, delete, create), or an op's own guard was: `create()` of an existing item, `patch()` or `deleteIfExists()` of a missing item, whatever `.condition()` was added. A lost version race is an `OptimisticLockError` instead |
+| `ValidationError` | `"ValidationError"` | Schema decode/encode failed, or the operation was refused: an item of a versioned entity with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, a transaction that touches one item twice or passes 4 MB, a condition or filter with an empty part under `or()` / `not()` (or an `or()` with no parts), or `.consistentRead()` on a GSI |
 | `DeleteAppliedButUnreadable` | `"DeleteAppliedButUnreadable"` | A delete with `returnValues("allOld")` was applied, but the item it removed (`item`, as stored) could not be decoded. Don't retry it |
 | `TransactionCancelled` | `"TransactionCancelled"` | Transaction rejected (includes cancellation `reasons`) |
 | `TransactionOverflow` | `"TransactionOverflow"` | A write's own transaction (the item, its sentinels and snapshot) would exceed DynamoDB's 100-item limit |

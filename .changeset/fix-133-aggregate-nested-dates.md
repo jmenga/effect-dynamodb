@@ -154,8 +154,9 @@ real `DateTime`s.
   `.paginate()` streams each item tagged with its member
   (`{ member, item }`, typed `CollectionStreamItem`), and `CollectionQuery`
   now declares `.select()` (partial records grouped per member), `.count()`,
-  `.paginate()`, `.maxPages()` and `.consistentRead()`; `CollectionQuery`,
-  `CollectionStreamItem` and `CollectionSelected` are exported. A collection
+  `.paginate()`, `.maxPages()`, `.consistentRead()` and `.ignoreOwnership()`;
+  `CollectionQuery`, `CollectionStreamItem`, `CollectionSelected` and
+  `CollectionAccessors` are exported. A collection
   filter or select names each member's domain fields. A member without the
   field reads it as absent, exactly as before (so `not(...)` and
   `notExists(...)` still match its rows), and an attribute that member
@@ -165,15 +166,32 @@ real `DateTime`s.
   parentheses (`#eddE IN (:et0) AND a OR b`), so another entity's rows in the
   same partition matched `b` — returned by `collect` (or failing to decode),
   counted, selected. The filter is now parenthesised.
-- **`deleteIfExists` keeps its existence check under chained conditions.**
-  As on every other op, a later `.condition()` replaces an earlier one; on
-  `deleteIfExists` the existence check is the op's own guard and stays,
-  ANDed with the latest condition (it used to be replaced by it).
-- **An empty condition is no condition.** `.condition({})` (or an empty
-  `and()`) compiled to `()`, which DynamoDB rejects — alone, or beside the
-  library's guard as `… AND ()`. It is now no condition on put, create,
-  upsert, update, delete, `deleteIfExists` and transaction ops, and an empty
-  filter or empty part of one is left out.
+- **A `.condition()` can no longer remove an op's own guard.** `create`'s
+  not-exists check and `patch`'s and `deleteIfExists`'s exists check were
+  held as the op's condition, so a `.condition()` replaced them:
+  `create(item).condition(c)` overwrote an existing item whenever `c` held
+  (with `.condition({})`, always), and `Batch.write` accepted such a create
+  or `deleteIfExists` as a blind put or delete. They are now the op's own
+  guards, ANDed with the caller's condition — bound, unbound, in a
+  transaction and in `EventStore` additional items — and `Batch.write`
+  refuses them whatever condition is added. As on every op, a later
+  `.condition()` replaces an earlier one; the guard stays.
+  `patch(missing).condition({})` on an unversioned entity now fails with
+  `ConditionalCheckFailed`, not `OptimisticLockError`.
+- **Empty conditions and filters.** `.condition({})` (or `and()`) compiled
+  to `()`, which DynamoDB rejects — alone, or beside the library's guard as
+  `… AND ()`. A condition that asserts nothing is now no condition — the op's
+  own guard alone — on put, create, upsert, update, patch, delete,
+  `deleteIfExists`, append and transaction ops, and `.filter({})` is no
+  filter. An empty part directly under `and()` is left out. Anywhere else it
+  is refused with a `ValidationError` before anything is sent: under `or()`
+  it would match everything (`or(x, {})`), under `not()` nothing, and an
+  `or()` with no parts matches nothing.
+- **`.consistentRead()` on a GSI is refused before sending.** DynamoDB reads
+  a global secondary index only eventually consistently, and rejected the
+  request with a `DynamoError`; an entity index query or a collection with
+  `.consistentRead()` now fails with a `ValidationError` without sending it.
+  The table and LSIs are read consistently, as before.
 - **Bound queries filter and select renamed fields by their stored names.** A
   field renamed with `DynamoModel.configure(..., { field })` was projected and
   filtered under its domain name, so `select(["name"])` returned `{}` and
