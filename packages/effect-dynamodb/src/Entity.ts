@@ -5227,6 +5227,18 @@ const makeImpl = <
         uState.cascade !== undefined && (requestedRv === "allOld" || requestedRv === "updatedOld")
       const updates = uState.updates
       const evExpected = uState.expectedVersion
+      // An entity without `versioned` has no version to check: an expected
+      // version would be silently skipped — a concurrency check that never
+      // runs — so it is refused before anything is read or sent (#134).
+      if (evExpected !== undefined && !systemFields.version) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "update.expectedVersion",
+          cause:
+            `expectedVersion(${evExpected}): entity "${entityType}" is not versioned, so there ` +
+            "is no version to check. Add `versioned: true`, or use a `.condition()`. Nothing was sent.",
+        })
+      }
       // The caller's condition, ANDed onto `patch`'s exists guard — a guard
       // no `.condition()` can replace (#133).
       const userCond = withGuard(
@@ -5244,6 +5256,16 @@ const makeImpl = <
 
       // Caller key: Type side in, ENCODED out (see `encodeKey`).
       const encodedKey = yield* encodeKey(key, "update.decodeKey")
+      // A missing item: `patch`'s exists guard failed — `ConditionalCheckFailed`,
+      // on every path, including those that read first (#134); for `update`,
+      // `ItemNotFound`.
+      const missingItem = () =>
+        uState.patch
+          ? new ConditionalCheckFailed({
+              entityType,
+              key: encodedKey as globalThis.Record<string, unknown>,
+            })
+          : new ItemNotFound({ entityType, key: encodedKey })
 
       // Encode update payload → wire form (see `put` for the strategy).
       const encodedUpdates = yield* encodeOrDecodeEncode(
@@ -5353,7 +5375,7 @@ const makeImpl = <
               })
 
         if (!currentResult.Item) {
-          return yield* new ItemNotFound({ entityType, key: encodedKey })
+          return yield* missingItem()
         }
 
         const currentRaw = fromAttributeMap(currentResult.Item)
@@ -5867,7 +5889,7 @@ const makeImpl = <
               userCond !== undefined,
             )
           }
-          if (stored === undefined) return new ItemNotFound({ entityType, key: encodedKey })
+          if (stored === undefined) return missingItem()
           const changed = guardedAttrs.filter(
             (attr) =>
               !attributeValueEquals(stored[attr] as AttributeValue | undefined, currentItem[attr]),
@@ -6141,7 +6163,7 @@ const makeImpl = <
                 ConsistentRead: true,
               })
         if (!current.Item) {
-          return yield* new ItemNotFound({ entityType, key: encodedKey })
+          return yield* missingItem()
         }
         yield* checkVersion(current.Item, "update")
         const immutableChange = immutableMismatch(immutables, current.Item)
@@ -6700,7 +6722,10 @@ const makeImpl = <
         names["#intInc"] = INCARNATION_TOKEN
         condParts.push("(attribute_exists(#intVer) OR attribute_not_exists(#intInc))")
       }
-      const uc = userCond ? compileCondition(userCond, resolveDbName) : undefined
+      // A plain write already requires the item (`attribute_exists(#exists)`
+      // below), so `patch`'s own exists guard would only repeat it.
+      const sentCond = plainWrite ? uState.condition : userCond
+      const uc = sentCond ? compileCondition(sentCond, resolveDbName) : undefined
       if (uc) {
         condParts.push(`(${uc.expression})`)
         Object.assign(names, uc.names)
@@ -6726,8 +6751,8 @@ const makeImpl = <
         const tooLarge = oversizedCondition(
           "update",
           conditionExpression,
-          userCond !== undefined
-            ? compileCondition(userCond, resolveDbName)?.expression
+          sentCond !== undefined
+            ? compileCondition(sentCond, resolveDbName)?.expression
             : undefined,
         )
         if (tooLarge !== undefined) return yield* tooLarge
@@ -6767,8 +6792,8 @@ const makeImpl = <
         const tooLarge = oversizedCondition(
           "update",
           guardParts.join(" AND "),
-          userCond !== undefined
-            ? compileCondition(userCond, resolveDbName)?.expression
+          sentCond !== undefined
+            ? compileCondition(sentCond, resolveDbName)?.expression
             : undefined,
         )
         if (tooLarge !== undefined) return yield* tooLarge
@@ -9921,8 +9946,8 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
     if (target._opType === "get") {
       return { opType: "get", entity: target._entity, key: target._key }
     }
-    // An op's own guard — `create`'s not-exists, `patch`'s exists — is
-    // ANDed with the caller's condition: no `.condition()` replaces it (#133).
+    // `create`'s own not-exists guard is ANDed with the caller's condition:
+    // no `.condition()` replaces it (#133).
     const primary = target._entity.indexes.primary!
     if (target._opType === "put") {
       const putKind = target._putKind ?? "put"
@@ -9940,14 +9965,13 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
       }
     }
     if (target._opType === "update") {
+      // Every multi-item path (transactions, `Batch.write`, `EventStore`
+      // additional items) refuses an update, so no guard is carried here.
       return {
         opType: "update",
         entity: target._entity,
         key: target._key,
-        condition: withGuard(
-          target._updateState?.patch ? { attributeExists: [primary.pk.field] } : undefined,
-          target._updateState?.condition,
-        ),
+        condition: target._updateState?.condition,
       }
     }
   }

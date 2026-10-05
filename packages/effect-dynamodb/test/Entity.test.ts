@@ -4340,6 +4340,21 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    it.effect("patch of a missing retain item fails its condition, writing nothing (#134)", () =>
+      Effect.gen(function* () {
+        for (const added of [undefined, {}, { name: "x" }]) {
+          mockGetItem.mockResolvedValueOnce({})
+          const op = RetainEntity.patch({ itemId: "i-1" }).pipe(Entity.set({ name: "n" }))
+          const error = yield* (added === undefined ? op : op.pipe(RetainEntity.condition(added)))
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(error._tag).toBe("ConditionalCheckFailed")
+        }
+        expect(mockUpdateItem).not.toHaveBeenCalled()
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("deleteIfExists of a missing retain item fails its condition, writing nothing", () =>
       Effect.gen(function* () {
         mockGetItem.mockResolvedValueOnce({})
@@ -7005,6 +7020,61 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    it.effect("expectedVersion on an unversioned entity is refused, not ignored (#134)", () =>
+      Effect.gen(function* () {
+        for (const op of [
+          Plain.update({ itemId: "i-1" }).pipe(
+            Entity.set({ name: "m" }),
+            Entity.expectedVersion(3),
+          ),
+          Plain.patch({ itemId: "i-1" }).pipe(Entity.set({ name: "m" }), Entity.expectedVersion(0)),
+        ]) {
+          const error = yield* op.asEffect().pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+        }
+        expect(mockUpdateItem).not.toHaveBeenCalled()
+        expect(mockGetItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an unversioned patch sends one exists clause (#134)", () =>
+      Effect.gen(function* () {
+        mockUpdateItem.mockResolvedValue({
+          Attributes: toAttributeMap({ itemId: "i-1", name: "m" }),
+        })
+        yield* Plain.patch({ itemId: "i-1" })
+          .pipe(Entity.set({ name: "m" }))
+          .asEffect()
+        const plain = mockUpdateItem.mock.calls[0]![0]
+        expect(plain.ConditionExpression).toBe("attribute_exists(#exists)")
+        expect(plain.ExpressionAttributeNames["#exists"]).toBe("pk")
+        yield* Plain.patch({ itemId: "i-1" })
+          .pipe(Entity.set({ name: "m" }), Plain.condition({ name: "b" }))
+          .asEffect()
+        const conditioned = mockUpdateItem.mock.calls[1]![0]
+        expect(conditioned.ConditionExpression).toBe("(#e0 = :e1) AND attribute_exists(#exists)")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("deleteIfExists keeps its guard through returnValues (#134)", () =>
+      Effect.gen(function* () {
+        mockDeleteItem.mockRejectedValue(ccf())
+        const unbound = Entity.returnValues(Plain.deleteIfExists({ itemId: "i-1" }), "allOld")
+        expect((unbound as unknown as { readonly _mustExist: boolean })._mustExist).toBe(true)
+        const error = yield* unbound.asEffect().pipe(Effect.flip)
+        expect(error._tag).toBe("ConditionalCheckFailed")
+        const piped = yield* Plain.deleteIfExists({ itemId: "i-1" })
+          .pipe(Plain.condition({ name: "n" }), Entity.returnValues("allOld"))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(piped._tag).toBe("ConditionalCheckFailed")
+        for (const call of mockDeleteItem.mock.calls) {
+          expect(call[0].ConditionExpression).toContain("attribute_exists(#e0)")
+          expect(call[0].ReturnValues).toBe("ALL_OLD")
+        }
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("deleteIfExists(k).condition(x).condition({}) asserts existence only", () =>
       Effect.gen(function* () {
         mockDeleteItem.mockResolvedValue({})
@@ -7051,6 +7121,7 @@ describe("Entity", () => {
           ops.not(ops.and()),
           ops.or(),
           ops.and(ops.eq(pb.name, "a"), ops.or(ops.and(ops.and()))),
+          ops.isIn(pb.name, []),
         ]
         for (const expr of refused) {
           const cond = () => expr

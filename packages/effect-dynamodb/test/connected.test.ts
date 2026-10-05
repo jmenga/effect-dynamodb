@@ -13354,6 +13354,14 @@ describeConnected("#133 — nested sub-aggregates", () => {
       expect(bySk(after)).toEqual(bySk(before))
       const listed = yield* leagues.list({ season: "2027" })
       expect(listed.data).toEqual([])
+      // A list filter follows the empty-part rules: refused, never widened.
+      for (const filter of [
+        (_: any, o: any) => o.or(),
+        (t: any, o: any) => o.or(o.eq(t.id, "dup"), o.and()),
+      ]) {
+        const refused = yield* leagues.list({ season: "2026" }, { filter } as any).pipe(Effect.flip)
+        expect(refused._tag).toBe("ValidationError")
+      }
     }).pipe(provideN133),
   )
 })
@@ -17643,6 +17651,18 @@ describeConnected("#133 — path operations on index composites and unique field
           .pipe(Effect.flip)
         expect(missing._tag).toBe("ConditionalCheckFailed")
         expect(yield* rawItem("G133Author", "pg-missing")).toBeUndefined()
+      }
+      // A patch that reads first (retain) reports the same, writing nothing (#134).
+      const retained = db.entities.DevicesRetained as any
+      for (const condition of [{}, { label: "x" }]) {
+        const missing = yield* retained
+          .patch({ id: "pg-missing-r" })
+          .set({ label: "n" })
+          .condition(condition)
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(missing._tag).toBe("ConditionalCheckFailed")
+        expect(yield* rawItem("G133DeviceRetained", "pg-missing-r")).toBeUndefined()
       }
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
