@@ -6889,6 +6889,33 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    it.effect("an empty condition is no condition, on every op", () =>
+      Effect.gen(function* () {
+        mockDeleteItem.mockResolvedValue({})
+        mockPutItem.mockResolvedValue({})
+        mockGetItem.mockResolvedValue({
+          Item: toAttributeMap({ pk: "p", sk: "s", itemId: "i-1", name: "n" }),
+        })
+        mockUpdateItem.mockResolvedValue({
+          Attributes: toAttributeMap({ itemId: "i-1", name: "n" }),
+        })
+        const noEmpty = (input: any) => expect(input.ConditionExpression ?? "").not.toContain("()")
+        yield* Plain.delete({ itemId: "i-1" }).pipe(Plain.condition({})).asEffect()
+        expect(mockDeleteItem.mock.calls[0]![0].ConditionExpression).toBeUndefined()
+        yield* Plain.deleteIfExists({ itemId: "i-1" }).pipe(Plain.condition({})).asEffect()
+        noEmpty(mockDeleteItem.mock.calls[1]![0])
+        expect(mockDeleteItem.mock.calls[1]![0].ConditionExpression).toContain("attribute_exists")
+        yield* Plain.put({ itemId: "i-1", name: "n" }).pipe(Plain.condition({})).asEffect()
+        expect(mockPutItem.mock.calls[0]![0].ConditionExpression).toBeUndefined()
+        yield* Plain.create({ itemId: "i-1", name: "n" }).pipe(Plain.condition({})).asEffect()
+        noEmpty(mockPutItem.mock.calls[1]![0])
+        yield* Plain.update({ itemId: "i-1" })
+          .pipe(Entity.set({ name: "m" }), Plain.condition({}))
+          .asEffect()
+        noEmpty(mockUpdateItem.mock.calls[0]![0])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("deleteIfExists(k).condition(x) asserts both", () =>
       Effect.gen(function* () {
         mockDeleteItem.mockResolvedValue({})

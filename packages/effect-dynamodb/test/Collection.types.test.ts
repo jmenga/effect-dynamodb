@@ -3,7 +3,7 @@
  */
 import type { Effect, Stream } from "effect"
 import { describe, expectTypeOf, it } from "vitest"
-import type { CollectionQuery, CollectionStreamItem } from "../src/DynamoClient.js"
+import type { CollectionQuery, CollectionSelected, CollectionStreamItem } from "../src/index.js"
 
 interface Employee {
   readonly employee: string
@@ -39,6 +39,16 @@ describe("CollectionQuery types", () => {
     expectTypeOf<Effect.Success<ReturnType<typeof query.count>>>().toEqualTypeOf<number>()
     const selected = query.select(["name"])
     expectTypeOf<Effect.Success<ReturnType<typeof selected.collect>>>().toEqualTypeOf<{
+      readonly Employees: Array<Record<string, unknown>>
+      readonly Tasks: Array<Record<string, unknown>>
+    }>()
+  })
+
+  it("maxPages and consistentRead keep the query's grouping", () => {
+    if (query === null) return
+    expectTypeOf(query.maxPages(1)).toEqualTypeOf<CollectionQuery<Grouped>>()
+    expectTypeOf(query.consistentRead()).toEqualTypeOf<CollectionQuery<Grouped>>()
+    expectTypeOf<CollectionSelected<Grouped>>().toEqualTypeOf<{
       readonly Employees: Array<Record<string, unknown>>
       readonly Tasks: Array<Record<string, unknown>>
     }>()

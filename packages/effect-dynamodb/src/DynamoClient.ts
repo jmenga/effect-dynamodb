@@ -649,6 +649,10 @@ export interface CollectionQuery<TResult> {
   readonly reverse: () => CollectionQuery<TResult>
   /** Resume from cursor. */
   readonly startFrom: (cursor: string) => CollectionQuery<TResult>
+  /** Stop after `n` DynamoDB requests. */
+  readonly maxPages: (n: number) => CollectionQuery<TResult>
+  /** Strongly consistent reads (not on a GSI). */
+  readonly consistentRead: () => CollectionQuery<TResult>
 }
 
 /**

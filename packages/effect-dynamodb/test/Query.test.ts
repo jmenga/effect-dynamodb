@@ -637,6 +637,21 @@ describe("Query", () => {
   // -------------------------------------------------------------------------
 
   describe("a filter beside the ownership clause (#133)", () => {
+    it.effect("an empty part of a filter compiles to nothing, never `()`", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        const ops = createConditionOps<{ id: string; name: string }>()
+        const pb = createPathBuilder<{ id: string; name: string }>()
+        yield* Query.collect(
+          makeTestQuery().pipe(Query.filterExpr(ops.and(ops.eq(pb.id, "a"), ops.and()))),
+        )
+        expect(mockQuery.mock.calls[0]![0].FilterExpression).toBe("#eddE IN (:et0) AND (#e0 = :e1)")
+        mockQuery.mockClear()
+        yield* Query.collect(makeTestQuery().pipe(Query.filterExpr(ops.not(ops.and()))))
+        expect(mockQuery.mock.calls[0]![0].FilterExpression).toBe("#eddE IN (:et0)")
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
     it.effect("a top-level OR is parenthesised, so it can't admit other entities", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValue({ Items: [] })

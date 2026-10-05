@@ -1046,6 +1046,21 @@ describe("Transaction", () => {
     )
   })
 
+  it.effect("an empty condition on a transaction op is no condition (#133)", () =>
+    Effect.gen(function* () {
+      mockTransactWriteItems.mockResolvedValueOnce({})
+      yield* Transaction.transactWrite([
+        UserEntity.put({ userId: "u-e", email: "e@x.io", name: "E", role: "member" }).pipe(
+          UserEntity.condition({}),
+        ),
+        OrderEntity.delete({ orderId: "o-e" }).pipe(OrderEntity.condition({})),
+      ])
+      const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+      expect(items[0].Put.ConditionExpression).toBeUndefined()
+      expect(items[1].Delete.ConditionExpression).toBeUndefined()
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
   describe("one op per item: a repeated item is refused before writing (#133)", () => {
     const user = (userId: string, name: string) =>
       ({ userId, email: `${userId}@x.io`, name, role: "member" }) as const

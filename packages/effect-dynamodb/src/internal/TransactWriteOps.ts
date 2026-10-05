@@ -93,7 +93,9 @@ const compileOpCondition = (
 ): ExpressionResult | undefined => {
   if (cond === undefined) return undefined
   const expr = isExpr(cond) ? cond : parseShorthand(cond as Record<string, unknown>)
-  return compileExpr(expr, entity._resolveDbName) as ExpressionResult
+  const compiled = compileExpr(expr, entity._resolveDbName) as ExpressionResult
+  // An empty condition (`{}`) is no condition (#133).
+  return compiled.expression === "" ? undefined : compiled
 }
 
 /**

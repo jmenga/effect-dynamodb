@@ -358,18 +358,19 @@ export const compileExpr = (
         return `begins_with(${compileOperand(node.operand)}, ${compileOperand(node.prefix)})`
       case "contains":
         return `contains(${compileOperand(node.operand)}, ${compileOperand(node.value)})`
-      case "and": {
-        if (node.exprs.length === 0) return ""
-        if (node.exprs.length === 1) return compile(node.exprs[0]!)
-        return node.exprs.map((e) => `(${compile(e)})`).join(" AND ")
-      }
+      // An empty part (`and()`, a `{}` shorthand) is no condition: it is left
+      // out, never compiled to `()`, which DynamoDB rejects (#133).
+      case "and":
       case "or": {
-        if (node.exprs.length === 0) return ""
-        if (node.exprs.length === 1) return compile(node.exprs[0]!)
-        return node.exprs.map((e) => `(${compile(e)})`).join(" OR ")
+        const parts = node.exprs.map((e) => compile(e)).filter((part) => part !== "")
+        if (parts.length === 0) return ""
+        if (parts.length === 1) return parts[0]!
+        return parts.map((part) => `(${part})`).join(node._tag === "and" ? " AND " : " OR ")
       }
-      case "not":
-        return `NOT (${compile(node.expr)})`
+      case "not": {
+        const inner = compile(node.expr)
+        return inner === "" ? "" : `NOT (${inner})`
+      }
     }
   }
 

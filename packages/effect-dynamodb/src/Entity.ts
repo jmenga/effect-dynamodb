@@ -1658,7 +1658,9 @@ const compileCondition = (
   | undefined => {
   if (cond === undefined) return undefined
   const expr = isExpr(cond) ? cond : parseShorthand(cond)
-  return compileExpr(expr, resolveDbNameFn)
+  const compiled = compileExpr(expr, resolveDbNameFn)
+  // An empty condition (`{}`) is no condition (#133).
+  return compiled.expression === "" ? undefined : compiled
 }
 
 const TRANSACTION_LIMIT = 100
@@ -5774,8 +5776,8 @@ const makeImpl = <
             }
           }
         }
-        if (userCond) {
-          const uc = compileCondition(userCond, resolveDbName)!
+        const uc = userCond ? compileCondition(userCond, resolveDbName) : undefined
+        if (uc) {
           condParts.push(`(${uc.expression})`)
           Object.assign(writeNames, uc.names)
           Object.assign(writeValues, uc.values)
@@ -6680,8 +6682,8 @@ const makeImpl = <
         names["#intInc"] = INCARNATION_TOKEN
         condParts.push("(attribute_exists(#intVer) OR attribute_not_exists(#intInc))")
       }
-      if (userCond) {
-        const uc = compileCondition(userCond, resolveDbName)!
+      const uc = userCond ? compileCondition(userCond, resolveDbName) : undefined
+      if (uc) {
         condParts.push(`(${uc.expression})`)
         Object.assign(names, uc.names)
         Object.assign(values, uc.values)
@@ -7890,8 +7892,8 @@ const makeImpl = <
             names["#intInc"] = INCARNATION_TOKEN
             condParts.push("(attribute_exists(#intVer) OR attribute_not_exists(#intInc))")
           }
-          if (opts.condition) {
-            const uc = compileCondition(opts.condition, resolveDbName)!
+          const uc = opts.condition ? compileCondition(opts.condition, resolveDbName) : undefined
+          if (uc) {
             condParts.push(`(${uc.expression})`)
             Object.assign(names, uc.names)
             Object.assign(values, uc.values)
@@ -8248,8 +8250,9 @@ const makeImpl = <
 
       const casCondition = "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb"
       let finalCondition = casCondition
-      if (userCondition !== undefined) {
-        const uc = compileCondition(userCondition, resolveDbName)!
+      const uc =
+        userCondition !== undefined ? compileCondition(userCondition, resolveDbName) : undefined
+      if (uc) {
         finalCondition = `(${casCondition}) AND (${uc.expression})`
         Object.assign(names, uc.names)
         Object.assign(values, uc.values)

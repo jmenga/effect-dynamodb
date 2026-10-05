@@ -81,6 +81,10 @@ export * as Batch from "./Batch.js"
 export type { Collection as CollectionType } from "./Collection.js"
 export * as Collection from "./Collection.js"
 export type {
+  CollectionAccessors,
+  CollectionQuery,
+  CollectionSelected,
+  CollectionStreamItem,
   DynamoClientError,
   DynamoClientService,
   TableLike,
