@@ -149,8 +149,22 @@ real `DateTime`s.
   that isn't letters, digits and underscores now gets a numbered placeholder.
 - **Collection queries keep their grouping through every combinator.**
   `db.collections.x(...).filter(...).collect()` returned a flat list (it lost
-  the grouping by member); it is grouped like `collect()`, and `select`
-  returns each member's items grouped too.
+  the grouping by member); it is grouped like `collect()`, and so is
+  `.fetch()`'s page (it returned internal wrappers, though typed as grouped).
+  `.paginate()` streams each item tagged with its member
+  (`{ member, item }`, typed `CollectionStreamItem`), and `CollectionQuery`
+  now declares `.select()` (partial records grouped per member), `.count()`
+  and `.paginate()`. A collection filter names each member's domain fields: a
+  member that doesn't have one matches nothing, rather than matching an
+  attribute another member stores under that name.
+- **A filter can no longer widen an entity's ownership check.** A filter
+  whose top level was an `OR` was ANDed with the `__edd_e__` check without
+  parentheses (`#eddE IN (:et0) AND a OR b`), so another entity's rows in the
+  same partition matched `b` — returned by `collect` (or failing to decode),
+  counted, selected. The filter is now parenthesised.
+- **A later `.condition()` replaces an earlier one on every op**, as on puts
+  and updates before; `deleteIfExists`'s existence check is the op's own
+  guard and stays, ANDed with the latest condition.
 - **Bound queries filter and select renamed fields by their stored names.** A
   field renamed with `DynamoModel.configure(..., { field })` was projected and
   filtered under its domain name, so `select(["name"])` returned `{}` and

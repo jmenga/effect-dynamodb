@@ -1799,7 +1799,7 @@ yield* db.entities.Products.update({ productId: "p-1" })
 | Builder | Method | Accepts |
 |---|---|---|
 | `BoundGet` | *(no combinators — it is an `Effect`)* | — |
-| `BoundPut` / `BoundCreate` / `BoundUpsert` | `.condition(cond)` | callback `(t, ops) => Expr` or shorthand record |
+| `BoundPut` / `BoundCreate` / `BoundUpsert` | `.condition(cond)` | callback `(t, ops) => Expr` or equality shorthand record (`{ status: "active" }`) |
 | `BoundDelete` | `.condition(cond)` | same as above |
 | `BoundDelete` | `.returnValues(mode)` | `"none"` or `"allOld"` |
 | `BoundUpdate` / `BoundPatch` | `.set(updates)` | partial record |
@@ -1809,7 +1809,7 @@ yield* db.entities.Products.update({ productId: "p-1" })
 | `BoundUpdate` / `BoundPatch` | `.append(values)` | `Record<string, ReadonlyArray<unknown>>` |
 | `BoundUpdate` / `BoundPatch` | `.deleteFromSet(values)` | `Record<string, unknown>` |
 | `BoundUpdate` / `BoundPatch` | `.expectedVersion(n)` | `number` |
-| `BoundUpdate` / `BoundPatch` | `.condition(cond)` | callback or shorthand |
+| `BoundUpdate` / `BoundPatch` | `.condition(cond)` | callback or equality shorthand record |
 | `BoundUpdate` / `BoundPatch` | `.returnValues(mode)` | any `ReturnValuesMode` |
 | `BoundUpdate` / `BoundPatch` | `.cascade(config)` | cascade targets |
 | `BoundUpdate` / `BoundPatch` | `.pathSet(op)` / `.pathRemove(segs)` / `.pathAdd(op)` / `.pathSubtract(op)` / `.pathAppend(op)` / `.pathPrepend(op)` / `.pathIfNotExists(op)` / `.pathDelete(op)` | same payloads as the unbound `Entity.path*` combinators |
