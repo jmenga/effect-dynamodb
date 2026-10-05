@@ -29,7 +29,7 @@ Use `versioned: { retain: true }` instead when you need server-order (monotonic 
 For a partition `{ channel: "c-1", deviceId: "d-7" }` the table contains:
 
 - **One current item** — SK `$app#v1#telemetry`, all GSI keys present, latest `orderBy` value
-- **N event items** — SK `$app#v1#telemetry#e#<serialised-orderBy>`, GSI keys stripped, `_ttl` set
+- **N event items** — SK `$app#v1#telemetry#e#<serialised-orderBy>`, GSI keys stripped, `_ttl` set. They are read with `.history(key)`: a primary-key query and a scan return current items only (an item is a row whose sort key is the one its own composites compose, whatever they hold)
 
 The `#e#` infix on the event SK means a `begins_with(<currentSk>#e#)` query isolates events from the current without visiting any other partition.
 

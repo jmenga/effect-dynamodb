@@ -124,7 +124,7 @@ yield* users.update({ userId: "u-1" }).set({ tenantId: "t-new", region: "us-east
 
 Multiple entity types share one physical DynamoDB table. Three mechanisms make this work:
 
-1. **Entity type discriminator (`__edd_e__`)** — Every item carries a hidden `__edd_e__` attribute containing the entity type string (e.g., `"User"`, `"Order"`). All queries automatically include a `FilterExpression` on this field to isolate entity types.
+1. **Entity type discriminator (`__edd_e__`)** — Every item carries a hidden `__edd_e__` attribute containing the entity type string (e.g., `"User"`, `"Order"`). All queries automatically include a `FilterExpression` on this field to isolate entity types. Two other hidden attributes may appear on raw items: `__edd_i__`, the incarnation token of a versioned entity's item, and `__edd_d__`, the unique fields holding only a decoding default. Decoded models never include them.
 
 2. **Structured key format** — Keys follow the pattern `$schema#v1#entity_type#attr_value#attr_value`. The schema name, version, and entity type prefix ensure that different entity types produce non-overlapping key spaces even when they share the same physical index.
 
@@ -155,9 +155,9 @@ const Orders = Entity.make({
 
 | Operation | Behavior | On Duplicate Key | DynamoDB API |
 |-----------|----------|------------------|--------------|
-| **`put`** | Unconditional write — creates or overwrites | Silently replaces the existing item | PutItem |
-| **`create`** | Insert-only — `put` + automatic `attribute_not_exists` condition | Fails with `ConditionalCheckFailed` | PutItem (with condition) |
-| **`upsert`** | Create-or-update atomically | Creates if missing, updates if exists | UpdateItem (with `if_not_exists`) |
+| **`put`** | Creates or overwrites | Replaces the existing item; on a versioned or unique-constrained entity it continues the item's version and rotates its sentinels | PutItem (TransactWriteItems with sentinels or retain) |
+| **`create`** | Insert-only — `put` + automatic `attribute_not_exists` condition; never reads the item (a `retain` entity queries its version history: one `Limit 1` query, plus a keys-only `Limit 1` query for older history when the primary sort key has composites) | Fails with `ConditionalCheckFailed` | PutItem (with condition) |
+| **`upsert`** | Create-or-update | Creates if missing, updates the supplied fields if it exists | UpdateItem (with `if_not_exists`); reads first on a `unique` or `retain` entity, or when the input omits a defaulted index composite |
 
 ```typescript
 const db = yield* DynamoClient.make({
@@ -183,7 +183,9 @@ yield* users.create({ userId: "u-1", name: "Alice" }).pipe(
 yield* users.upsert({ userId: "u-1", name: "Alice" })
 ```
 
-**Note:** `upsert` does not support unique constraints or version retention (`retain`) because it cannot determine whether the item previously existed.
+**Note:** On an entity with unique constraints or `versioned: { retain: true }`, `upsert` reads the item once first, because one `UpdateItem` can't write, rotate or check a sentinel, or snapshot the item it replaces. A missing item is created with its sentinels and snapshot; an existing one is updated, with sentinels rotated for changed unique values and the replaced item snapshotted. Either way the whole input is validated. On other entities `upsert` is a single `UpdateItem`, unless the input omits a defaulted index composite: then it reads first too, so it stores the default only when it creates the item.
+
+A `put` of a versioned or unique-constrained entity also reads first. Over an existing item it takes the next version, keeps the incarnation and `createdAt`, snapshots the replaced item (`retain`) and rotates changed sentinels, so it never resets the item to version 1. A concurrent write in between is retried: the last writer wins. `Transaction.transactWrite` and `EventStore` `additionalItems` write these puts the same way.
 
 ---
 
@@ -199,8 +201,8 @@ const Users = Entity.make({
 ```
 
 **How it works:**
-- Snapshots share the same partition key (PK) as the main item but use a version sort key: `$schema#v1#entity#v#0000001`
-- GSI key fields are **stripped** from snapshots so they do not appear in index queries
+- Snapshots share the same partition key (PK) as the main item but use a version sort key: `$schema#v1#entity#v#0000001` (with sort key composites, the item's own: `$schema#v1#entity#v#line_a#0000001`)
+- GSI key fields are **stripped** from snapshots so they do not appear in index queries, and primary-key queries and scans leave them out
 - The `__edd_e__` entity type is preserved for filtering
 - Retain-aware writes use `transactWriteItems` to atomically write both the main item and the snapshot
 
@@ -271,7 +273,7 @@ const deleted = yield* users.deleted.get({ userId: "u-1" })
 // Restore — recomposes all keys and re-establishes unique sentinels
 yield* users.restore({ userId: "u-1" })
 
-// Purge — permanently removes item + all versions + unique sentinels
+// Purge — permanently removes item + all versions + the unique sentinels it owns
 yield* users.purge({ userId: "u-1" })
 ```
 
@@ -384,7 +386,7 @@ yield* users.put({ userId: "u-1", email: "alice@example.com" }).pipe(
 )
 ```
 
-To update a unique field, provide the new value in `set()`. The library automatically deletes the old sentinel and creates a new one in a transaction. If the new value is already taken, you get `UniqueConstraintViolation`.
+To update a unique field, provide the new value in `set()`. The library creates the new sentinel and releases the old one in a transaction — the old one only if this item owns it, since another item may have claimed the value after this item's reservation expired. If the new value is already taken, you get `UniqueConstraintViolation`.
 
 ---
 
@@ -431,7 +433,8 @@ yield* users.update({ userId: "u-1" })
 **Cause:** The aggregate could not be assembled from the items in DynamoDB. Common reasons:
 - **Missing items** — A required sub-entity or edge target does not exist in the partition
 - **Structural violations** — Items do not match the expected aggregate shape (e.g., wrong entity type, unexpected discriminator)
-- **Decode errors** — An item failed Schema validation during assembly
+
+A stored value that fails schema decode during assembly is reported as a `ValidationError` with `operation: "aggregate.assemble"`, not as an `AggregateAssemblyError`.
 
 **Solution:**
 
@@ -471,7 +474,7 @@ const item = yield* users.deleted.get({ userId: "u-1" })
 // Restore it to make it active again
 yield* users.restore({ userId: "u-1" })
 
-// Or purge it permanently (removes item + versions + sentinels)
+// Or purge it permanently (removes item + versions + owned sentinels)
 yield* users.purge({ userId: "u-1" })
 ```
 
@@ -481,9 +484,9 @@ yield* users.purge({ userId: "u-1" })
 
 **Symptom:** `ItemNotDeleted` error when calling `entity.restore()`.
 
-**Cause:** The item is not soft-deleted — `restore` can only be called on items that have been soft-deleted.
+**Cause:** A soft-deleted copy exists, but so does a live item under the same key, usually because the item was recreated after it was deleted. `restore` won't overwrite the live item. (`restore` of a key that has no soft-deleted item fails with `ItemNotFound`.)
 
-**Solution:** Check the item's state before restoring. If the item is active, no action is needed.
+**Solution:** Decide which copy to keep. `restore` always brings back the most recent soft-deleted copy, so soft-deleting the live item and then restoring brings back the live item, not the older copy. To revive the older copy, read it with `deleted.list(key)` and `put` its fields over the live item.
 
 ---
 

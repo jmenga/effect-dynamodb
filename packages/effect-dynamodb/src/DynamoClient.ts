@@ -136,7 +136,17 @@ import type {
   VectorIndexConfig,
   VectorIndexDefinition,
 } from "@effect-dynamodb/schema/VectorIndex.js"
-import { Config, Context, Crypto, Duration, Effect, Layer, Option, type Schema } from "effect"
+import {
+  Config,
+  Context,
+  Crypto,
+  Duration,
+  Effect,
+  Layer,
+  Option,
+  type Schema,
+  type Stream,
+} from "effect"
 import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
 import { bind as aggregateBind } from "./Aggregate.js"
 import type { BoundEntity, Entity as EntityType } from "./Entity.js"
@@ -144,6 +154,8 @@ import { bind as entityBind, fromDefinition as entityFromDefinition } from "./En
 import {
   type BoundQueryConfig,
   BoundQueryImpl,
+  collectionNaming,
+  entityNaming,
   type RawSortKeyCondition,
 } from "./internal/BoundQuery.js"
 import {
@@ -563,8 +575,25 @@ export interface TableLike {
 }
 
 /**
+ * One item a collection's `paginate()` streams: the member it belongs to (the
+ * key `collect()` groups it under) and the item.
+ */
+export type CollectionStreamItem<TResult> = {
+  readonly [K in keyof TResult]: {
+    readonly member: K
+    readonly item: TResult[K] extends ReadonlyArray<infer A> ? A : unknown
+  }
+}[keyof TResult]
+
+/** A collection's grouped result after `select`: partial records per member. */
+export type CollectionSelected<TResult> = {
+  readonly [K in keyof TResult]: Array<Record<string, unknown>>
+}
+
+/**
  * Collection query — returned by `db.collections.Name(composites)`.
- * `.collect()` returns the grouped result directly (not an array).
+ * `.collect()` and `.fetch()` return the grouped result (not an array);
+ * `.paginate()` streams each item tagged with its member.
  */
 export interface CollectionQuery<TResult> {
   /** Execute and collect all pages into a grouped result. */
@@ -573,12 +602,35 @@ export interface CollectionQuery<TResult> {
     DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
     never
   >
-  /** Execute a single page. */
+  /** Execute a single page, grouped like `collect()`. */
   readonly fetch: () => Effect.Effect<
     { items: TResult; cursor: string | null },
     DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
     never
   >
+  /** Stream every item, page by page, each tagged with its member. */
+  readonly paginate: () => Stream.Stream<
+    CollectionStreamItem<TResult>,
+    DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
+    never
+  >
+  /** Count the members' items (every member's, together). */
+  readonly count: () => Effect.Effect<
+    number,
+    DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
+    never
+  >
+  /**
+   * Project attributes — by domain name, per member: each member's items come
+   * back as partial records under its key.
+   */
+  readonly select: (
+    attributes:
+      | ReadonlyArray<string>
+      | ((
+          t: import("./internal/PathBuilder.js").PathBuilder<unknown, unknown, never>,
+        ) => ReadonlyArray<import("./internal/PathBuilder.js").Path<unknown, any, any>>),
+  ) => CollectionQuery<CollectionSelected<TResult>>
   /** Add a filter expression (post-read). */
   readonly filter: {
     (
@@ -597,6 +649,19 @@ export interface CollectionQuery<TResult> {
   readonly reverse: () => CollectionQuery<TResult>
   /** Resume from cursor. */
   readonly startFrom: (cursor: string) => CollectionQuery<TResult>
+  /** Stop after `n` DynamoDB requests. */
+  readonly maxPages: (n: number) => CollectionQuery<TResult>
+  /**
+   * Strongly consistent reads. A collection over a GSI — every auto-discovered
+   * one — is refused with a `ValidationError` when it runs: DynamoDB reads a
+   * GSI only eventually consistently.
+   */
+  readonly consistentRead: () => CollectionQuery<TResult>
+  /**
+   * Skip the `__edd_e__` ownership filter. Rows of no member are still never
+   * returned as a member's items.
+   */
+  readonly ignoreOwnership: () => CollectionQuery<TResult>
 }
 
 /**
@@ -926,12 +991,40 @@ interface EntityLike {
   readonly _tableTag: Context.Service<TableConfig, TableConfig>
   readonly _injectIndex: (name: string, def: IndexDefinition) => void
   readonly _decodeRecord: (raw: Record<string, unknown>) => Effect.Effect<any, any>
+  /** Which rows are items: a primary-key query or scan leaves the rest out (#133). */
+  readonly _liveRows?: (() => Query.LiveRows | undefined) | undefined
   readonly schemas: {
     readonly recordSchema: Schema.Codec<any>
     /** The schema `put` encodes through — the source of truth for composite
      * encoding on the read path. Optional so pure schema-package definitions
      * promoted at bind time still satisfy the shape. */
     readonly inputSchema?: Schema.Top | undefined
+  }
+}
+
+/** An entity's domain field names (its record's), when its schema exposes them. */
+const domainFieldsOf = (entityLike: EntityLike): ReadonlySet<string> | undefined => {
+  const fields = (entityLike.schemas.recordSchema as unknown as { readonly fields?: object }).fields
+  return fields === undefined ? undefined : new Set(Object.keys(fields))
+}
+
+/**
+ * Which rows of a collection over the table's primary key are items (#133):
+ * each row judged by the member its `__edd_e__` names. `undefined` when no
+ * member keeps history.
+ */
+const collectionLiveRows = (
+  members: ReadonlyArray<{ readonly entityLike: EntityLike }>,
+): Query.LiveRows | undefined => {
+  const byType = new Map<string, Query.LiveRows>()
+  for (const { entityLike } of members) {
+    const live = entityLike._liveRows?.()
+    if (live !== undefined) byType.set(entityLike.entityType, live)
+  }
+  if (byType.size === 0) return undefined
+  return {
+    isLive: (row) => byType.get(row.__edd_e__?.S ?? "")?.isLive(row) ?? true,
+    reads: [...new Set(["__edd_e__", ...[...byType.values()].flatMap((live) => live.reads)])],
   }
 }
 
@@ -1071,6 +1164,8 @@ const makeFromConfig = (config: {
         const query = Query.make({
           tableName: "",
           indexName: indexDef.index,
+          // An entity's indexes are GSIs (`Table.definition`).
+          globalIndex: indexDef.index !== undefined,
           pkField: indexDef.pk.field,
           pkValue,
           skField: indexDef.sk.field,
@@ -1083,6 +1178,9 @@ const makeFromConfig = (config: {
             entityLike.indexes.primary?.pk.field,
             entityLike.indexes.primary?.sk.field,
           ],
+          // The primary key also holds the entity's history rows; an index
+          // never does (they carry no index keys).
+          liveRows: indexDef.index === undefined ? entityLike._liveRows?.() : undefined,
         })
 
         // Apply SK prefix from provided compositesKeyForm.
@@ -1339,6 +1437,7 @@ const makeFromConfig = (config: {
           provide,
           composeSkCondition,
           skFields: indexDef.sk.composite,
+          ...entityNaming(entityLike._resolveDbName),
         }
         return new BoundQueryImpl(finalQuery, bqConfig)
       }
@@ -1435,10 +1534,16 @@ const makeFromConfig = (config: {
           decoder: (raw) => entityLike._decodeRecord(raw),
           resolveTableName: entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
           keyFields: [entityLike.indexes.primary?.pk.field, entityLike.indexes.primary?.sk.field],
+          liveRows: entityLike._liveRows?.(),
         })
         const pathBuilder = createPathBuilder()
         const conditionOps = createConditionOps()
-        const bqConfig: BoundQueryConfig<unknown> = { pathBuilder, conditionOps, provide }
+        const bqConfig: BoundQueryConfig<unknown> = {
+          pathBuilder,
+          conditionOps,
+          provide,
+          ...entityNaming(entityLike._resolveDbName),
+        }
         return new BoundQueryImpl(scanQuery, bqConfig)
       }
 
@@ -1514,6 +1619,8 @@ const makeFromConfig = (config: {
         let query = Query.make({
           tableName: "",
           indexName: indexDef.index,
+          // An entity's indexes are GSIs (`Table.definition`).
+          globalIndex: indexDef.index !== undefined,
           pkField: indexDef.pk.field,
           pkValue,
           skField: indexDef.sk.field,
@@ -1526,6 +1633,8 @@ const makeFromConfig = (config: {
             firstMember.entityLike.indexes.primary?.pk.field,
             firstMember.entityLike.indexes.primary?.sk.field,
           ],
+          // A collection on the primary key also meets its members' history.
+          liveRows: indexDef.index === undefined ? collectionLiveRows(members) : undefined,
         })
 
         // Add begins_with on collection SK prefix for clustered collections.
@@ -1556,13 +1665,15 @@ const makeFromConfig = (config: {
           pathBuilder,
           conditionOps,
           provide: collectionProvide,
-        }
-        const bq = new BoundQueryImpl(query, bqConfig)
-
-        // Override collect to group results
-        const originalCollect = bq.collect.bind(bq)
-        ;(bq as any).collect = () =>
-          Effect.map(originalCollect(), (items: any[]) => {
+          // Each streamed item tagged with its member; foreign rows dropped.
+          tagStreamed: (item) => {
+            const memberKey = (item as any)._memberKey
+            return memberKey !== undefined && memberKey !== "__unknown__"
+              ? { member: memberKey, item: (item as any)._decoded }
+              : undefined
+          },
+          // Group results by member — through every combinator.
+          groupCollected: (items) => {
             const result: Record<string, unknown[]> = {}
             for (const member of members) {
               result[member.entityKey] = []
@@ -1574,9 +1685,17 @@ const makeFromConfig = (config: {
               }
             }
             return result
-          })
-
-        return bq
+          },
+          ...collectionNaming(
+            members.map((m) => ({
+              entityType: m.entityLike.entityType,
+              entityKey: m.entityKey,
+              resolve: m.entityLike._resolveDbName ?? ((name: string) => name),
+              fields: domainFieldsOf(m.entityLike),
+            })),
+          ),
+        }
+        return new BoundQueryImpl(query, bqConfig)
       }
     }
 

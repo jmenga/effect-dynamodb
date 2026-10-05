@@ -3,12 +3,14 @@ import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, Stream } from "effect"
 import { beforeEach, vi } from "vitest"
+import type { DynamoClient } from "../src/DynamoClient.js"
 import {
   type BoundQueryConfig,
   BoundQueryImpl,
+  collectionNaming,
   type RawSortKeyCondition,
 } from "../src/internal/BoundQuery.js"
-import { createConditionOps } from "../src/internal/Expr.js"
+import { compileExpr, createConditionOps } from "../src/internal/Expr.js"
 import { createPathBuilder } from "../src/internal/PathBuilder.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
@@ -607,4 +609,133 @@ describe("BoundQuery", () => {
       expect(bq._query._state.consistentRead).toBe(true)
     })
   })
+})
+
+describe("collectionNaming (#133)", () => {
+  type Row = { n: number; secret: string; code: string; label: string }
+  const ops = createConditionOps<Row>()
+  const pb = createPathBuilder<Row>()
+  const identity = (name: string) => name
+  const plain = [
+    { entityType: "A", entityKey: "As", resolve: identity, fields: new Set(["n", "code"]) },
+    { entityType: "B", entityKey: "Bs", resolve: identity, fields: new Set(["n", "secret"]) },
+  ]
+
+  it("a collection without renames compiles a filter exactly as written", () => {
+    const naming = collectionNaming(plain)
+    for (const expr of [
+      ops.eq(pb.n, 1),
+      ops.or(ops.eq(pb.secret, "s"), ops.eq(pb.code, "c1")),
+      ops.not(ops.eq(pb.secret, "s")),
+      ops.notExists(pb.secret),
+    ]) {
+      expect(compileExpr(naming.renameExpr!(expr))).toEqual(compileExpr(expr))
+    }
+  })
+
+  it("a stored name another member's domain field bears reads as absent there", () => {
+    const naming = collectionNaming([
+      ...plain,
+      {
+        entityType: "C",
+        entityKey: "Cs",
+        resolve: (name) => (name === "label" ? "secret" : name),
+        fields: new Set(["n", "label"]),
+      },
+    ])
+    const compiled = compileExpr(naming.renameExpr!(ops.eq(pb.secret, "s")))
+    expect(compiled.expression).toContain(" OR ")
+    expect(Object.values(compiled.names)).toEqual(
+      expect.arrayContaining(["__edd_e__", "secret", "__edd_absent__"]),
+    )
+  })
+  it.effect("select reads, per member, only that member's own domain fields", () =>
+    Effect.gen(function* () {
+      const naming = collectionNaming([
+        ...plain,
+        {
+          entityType: "C",
+          entityKey: "Cs",
+          resolve: (name) => (name === "label" ? "secret" : name),
+          fields: new Set(["n", "label"]),
+        },
+      ])
+      const base = Query.make({
+        tableName: "t",
+        indexName: "gsi1",
+        pkField: "gsi1pk",
+        pkValue: "p",
+        skField: "gsi1sk",
+        entityTypes: ["A", "B", "C"],
+        decoder: (raw) => Effect.succeed(raw),
+      })
+      const selected = naming.selectAs!(base, [["secret"], ["n"]], "attributes")
+      // B's `secret`, everyone's `n`, the discriminator — C's `label` is
+      // stored as `secret`, but `secret` is not one of C's domain fields.
+      expect(selected._state.projectionPaths).toEqual([["n"], ["secret"], ["__edd_e__"]])
+      const decode = (raw: Record<string, unknown>) => selected._state.decoder(raw)
+      expect(yield* decode({ __edd_e__: "A", n: 1, secret: "leak" })).toEqual({
+        _memberKey: "As",
+        _decoded: { n: 1 },
+      })
+      expect(yield* decode({ __edd_e__: "B", n: 2, secret: "s" })).toEqual({
+        _memberKey: "Bs",
+        _decoded: { n: 2, secret: "s" },
+      })
+      expect(yield* decode({ __edd_e__: "C", n: 3, secret: "a label" })).toEqual({
+        _memberKey: "Cs",
+        _decoded: { n: 3 },
+      })
+      const labels = naming.selectAs!(base, [["label"]], "attributes")
+      expect(labels._state.projectionPaths).toEqual([["secret"], ["__edd_e__"]])
+      expect(yield* labels._state.decoder({ __edd_e__: "C", secret: "L" })).toEqual({
+        _memberKey: "Cs",
+        _decoded: { label: "L" },
+      })
+      expect(yield* labels._state.decoder({ __edd_e__: "B", secret: "s" })).toEqual({
+        _memberKey: "Bs",
+        _decoded: {},
+      })
+    }),
+  )
+})
+
+describe("a consistent read of a GSI is refused before sending (#133)", () => {
+  const make = (indexName: string | undefined, globalIndex: boolean) =>
+    Query.make({
+      tableName: "t",
+      indexName,
+      globalIndex,
+      pkField: "pk",
+      pkValue: "p",
+      skField: "sk",
+      entityTypes: ["A"],
+      decoder: (raw) => Effect.succeed(raw),
+    })
+
+  it.effect("refused on a GSI, sent on the table or an LSI", () =>
+    Effect.gen(function* () {
+      mockQuery.mockReset()
+      mockQuery.mockResolvedValue({ Items: [] })
+      const gsi = Query.consistentRead(make("gsi1", true))
+      for (const run of [
+        Query.collect(gsi),
+        Query.execute(gsi),
+        Query.count(gsi),
+        Query.paginate(gsi).pipe(Effect.flatMap((pages) => Stream.runCollect(pages))),
+      ]) {
+        const error = yield* Effect.flip(
+          run as Effect.Effect<unknown, { readonly _tag: string }, DynamoClient>,
+        )
+        expect(error._tag).toBe("ValidationError")
+      }
+      expect(mockQuery).not.toHaveBeenCalled()
+      yield* Query.collect(Query.consistentRead(make(undefined, false)))
+      yield* Query.collect(Query.consistentRead(make("lsi1", false)))
+      expect(mockQuery.mock.calls.map((call) => call[0].ConsistentRead)).toEqual([true, true])
+      // Without consistentRead a GSI is read as always.
+      yield* Query.collect(make("gsi1", true))
+      expect(mockQuery.mock.calls[2]![0].ConsistentRead).toBeUndefined()
+    }).pipe(Effect.provide(TestDynamoClient)),
+  )
 })

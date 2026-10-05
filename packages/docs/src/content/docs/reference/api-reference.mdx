@@ -239,17 +239,17 @@ These are methods on the entity definition returned by `Entity.make()`. They ret
 
 | Operation | Signature | Description |
 |-----------|-----------|-------------|
-| `entity.put(input)` | `EntityPut` | Insert or overwrite an item (descriptor) |
-| `entity.create(input)` | `EntityPut` | Insert only — fails with `ConditionalCheckFailed` if exists (descriptor) |
-| `entity.upsert(input)` | `EntityPut` | Create or update — uses `if_not_exists()` for immutable fields, createdAt, version (descriptor) |
+| `entity.put(input)` | `EntityPut` | Insert or overwrite an item (descriptor). On a versioned or unique-constrained entity it reads the item first: a put over an existing item continues its version, incarnation and `createdAt`, snapshots it (retain) and rotates changed sentinels, releasing only those it owns. A concurrent write in between is retried (last writer wins); a race lost on every attempt fails with `OptimisticLockError` / `ConcurrentModification`. A deleted retain item created again continues after its retained version history |
+| `entity.create(input)` | `EntityPut` | Insert only — fails with `ConditionalCheckFailed` if exists (descriptor). Never reads the item; a `retain` entity runs one `Limit 1` query to continue after any version history retained at the key (with primary sort key composites, plus a keys-only `Limit 1` query for history an earlier release wrote) |
+| `entity.upsert(input)` | `EntityPut` | Create or update the supplied fields — uses `if_not_exists()` for immutable fields, createdAt, version (descriptor). On an entity with unique constraints or `retain` (or an input omitting a defaulted index composite) it reads the item once: creates a missing item with its sentinels and snapshot, or updates an existing one, rotating changed sentinels and snapshotting it. Validates the whole input either way |
 | `entity.get(key)` | `EntityGet` | Get a single item by primary key (descriptor) |
-| `entity.update(key)` | `EntityUpdate` | Start an update operation (compose with `set`, `add`, etc.) (descriptor) |
+| `entity.update(key)` | `EntityUpdate` | Start an update operation (compose with `set`, `add`, etc.) (descriptor). On a missing item it fails with `ItemNotFound` and writes nothing. The exception is a plain `.set()` of a complete item (every required field and primary-key composite, with no other operations, `expectedVersion`, `.condition()`, cascade, `withVector` or old-image `returnValues`), which the library creates through `create`, exactly as `put` would write it |
 | `entity.patch(key)` | `EntityUpdate` | Update with `attribute_exists` — fails with `ConditionalCheckFailed` if not exists (descriptor) |
-| `entity.delete(key)` | `EntityDelete` | Delete an item (descriptor) |
-| `entity.deleteIfExists(key)` | `EntityDelete` | Delete with `attribute_exists` — fails with `ConditionalCheckFailed` if not exists (descriptor) |
+| `entity.delete(key)` | `EntityDelete` | Delete an item (descriptor). Releases only the unique sentinels the item owns. On a `retain` entity it reads the item and deletes it in one transaction with a snapshot of its final state, so an item created again continues past it. A delete that reads first and has no `.condition()` is retried from a fresh read after a concurrent write |
+| `entity.deleteIfExists(key)` | `EntityDelete` | Delete with `attribute_exists` — fails with `ConditionalCheckFailed` if not exists (descriptor). On an entity whose delete reads first, retried after a concurrent write like an unconditioned delete |
 | `entity.query.<indexName>(pk)` | `Query<Record>` | Query a specific index by partition key (descriptor) |
 | `entity.scan()` | `Query<Record>` | Full table scan filtered by entity type (descriptor) |
-| `entity.versions(key)` | `Query<Record>` | Query version history for an item (requires `versioned: { retain: true }`) (descriptor) |
+| `entity.versions(key)` | `Query<Record>` | Query version history for an item (requires `versioned: { retain: true }`) (descriptor). With sort key composites, only the named item's history |
 | `entity.deleted.list(key)` | `Query<Record>` | List soft-deleted items for a key (requires `softDelete`) (descriptor) |
 | `entity.batchGet(keys)` | See Batch module | Batch get items |
 | `entity.batchPut(items)` | See Batch module | Batch put items |
@@ -290,9 +290,9 @@ const users = db.entities.UserEntity
 | Method | Description |
 |--------|-------------|
 | `bound.get(key)` | Get a single item |
-| `bound.put(input, ...combinators)` | Insert or overwrite. Optional combinators (e.g. `condition(...)`) |
+| `bound.put(input, ...combinators)` | Insert or overwrite. Optional combinators (e.g. `condition(...)`). A put over an existing item of a versioned or unique-constrained entity continues it (see `entity.put`) |
 | `bound.create(input, ...combinators)` | Insert only — fails with `ConditionalCheckFailed` if exists |
-| `bound.upsert(input, ...combinators)` | Create or update — `if_not_exists()` for immutable fields, createdAt, version |
+| `bound.upsert(input, ...combinators)` | Create or update — `if_not_exists()` for immutable fields, createdAt, version. Reads first on an entity with unique constraints or `retain` (see `entity.upsert`) |
 | `bound.update(key, ...combinators)` | Update an item — compose with `Entity.set(...)`, `Entity.expectedVersion(...)`, etc. |
 | `bound.patch(key, ...combinators)` | Update with `attribute_exists` — fails if item does not exist |
 | `bound.delete(key, ...combinators)` | Delete an item. Optional combinators (e.g. `condition(...)`) |
@@ -307,7 +307,7 @@ const users = db.entities.UserEntity
 | `bound.getVersion(key, version)` | `versioned: { retain: true }` | `Effect` | Get a specific version snapshot |
 | `bound.versions(key)` | `versioned: { retain: true }` | `BoundQuery` | List all version snapshots as a fluent BoundQuery — supports `.collect()`, `.fetch()`, `.paginate()`, `.count()`, `.limit()`, `.reverse()`, `.startFrom()`, `.filter()`, `.select()` |
 | `bound.restore(key)` | `softDelete` | `Effect` | Restore a soft-deleted item |
-| `bound.purge(key)` | Any | `Effect` | Permanently remove item + all versions and sentinels |
+| `bound.purge(key)` | Any | `Effect` | Permanently remove item + all versions and soft-deleted copies, and release the unique sentinels they own. With sort key composites, only the named item's rows; without, every row of this entity in the partition. Never another entity's rows |
 | `bound.deleted.get(key)` | `softDelete` | `Effect` | Get a specific soft-deleted item |
 | `bound.deleted.list(key)` | `softDelete` | `BoundQuery` | List all soft-deleted tombstones in the partition as a fluent BoundQuery |
 
@@ -318,7 +318,7 @@ const users = db.entities.UserEntity
 | `entity.getVersion(key, version)` | `versioned: { retain: true }` | Get a specific version snapshot (descriptor) |
 | `entity.deleted.get(key)` | `softDelete` | Get a soft-deleted item (descriptor) |
 | `entity.restore(key)` | `softDelete` | Restore a soft-deleted item (descriptor) |
-| `entity.purge(key)` | Any | Delete all items in the partition (main + versions + deleted) (descriptor) |
+| `entity.purge(key)` | Any | Delete the item, its versions and its soft-deleted copies (descriptor): every row of this entity in the partition without sort key composites, the named item's rows with them; never another entity's rows |
 
 ### Operation Combinators
 
@@ -327,15 +327,15 @@ These functions transform entity operations via pipe:
 | Export | Works On | Description |
 |--------|----------|-------------|
 | `set(updates)` | `EntityUpdate` | Set fields to new values (dual API) |
-| `expectedVersion(n)` | `EntityUpdate` | Optimistic lock — fail if version doesn't match |
+| `expectedVersion(n)` | `EntityUpdate` | Optimistic lock — fail if version doesn't match. Requires a `versioned` entity: on any other it fails with a `ValidationError` before anything is sent |
 | `consistentRead` | `EntityGet` | Enable strongly consistent reads |
-| `condition(input)` | `EntityPut`, `EntityUpdate`, `EntityDelete` | Add a `ConditionExpression` |
+| `condition(input)` | `EntityPut`, `EntityUpdate`, `EntityDelete` | Add a `ConditionExpression`. A later one replaces an earlier one. It is ANDed with the op's own guard (`create`'s not-exists, `patch`'s and `deleteIfExists`'s exists), never in its place. An empty condition (`{}`, `and()`) is no condition. An empty part under `or()` or `not()`, an `or()` with no parts, or an `isIn` with no values, fails with a `ValidationError` before anything is sent |
 | `remove(fields)` | `EntityUpdate` | REMOVE attributes from the item |
 | `add(values)` | `EntityUpdate` | Atomically ADD to numeric attributes |
 | `subtract(values)` | `EntityUpdate` | Subtract from numeric attributes (SET `#f = #f - :v`) |
 | `append(values)` | `EntityUpdate` | Append to list attributes (`list_append`) |
 | `deleteFromSet(values)` | `EntityUpdate` | DELETE elements from Set attributes |
-| `returnValues(mode)` | `EntityUpdate`, `EntityDelete` | Control DynamoDB `ReturnValues`: `"none" \| "allOld" \| "allNew" \| "updatedOld" \| "updatedNew"` |
+| `returnValues(mode)` | `EntityUpdate`, `EntityDelete` | Control DynamoDB `ReturnValues`. An update takes `"none" \| "allOld" \| "allNew" \| "updatedOld" \| "updatedNew"`; a delete takes `"none" \| "allOld"` (any other mode fails with a `ValidationError` before sending). On an update the result type follows the mode (`UpdateReturn<A, M>`): `"none"` → `undefined`, `"updatedOld"` / `"updatedNew"` → a `Partial` of the top-level attributes the update wrote, `"allOld"` / `"allNew"` → the whole item. Honoured on every update path; with repeated calls the last one wins. On a delete, `"allOld"` returns the deleted item (`undefined` when there was none) on every delete path, and `"none"` nothing; a deleted item that won't decode is `DeleteAppliedButUnreadable` (the delete was applied) |
 | `cascade(config)` | `EntityUpdate` | Propagate source entity changes to target entities that embed it via `DynamoModel.ref`. Config: `{ targets, filter?, mode? }` (dual API) |
 
 ### Decode Mode Selectors
@@ -446,7 +446,7 @@ import { Query } from "effect-dynamodb"
 | `pageSize(n)` | Dual | Fetch in batches of `n` rows — sets DynamoDB's `Limit` (a contract on round trips) |
 | `maxPages(n)` | Dual | Limit total number of pages fetched |
 | `reverse` | Combinator | Reverse sort order (descending) |
-| `consistentRead` | Combinator | Enable strongly consistent reads |
+| `consistentRead` | Combinator | Enable strongly consistent reads (the table; on a GSI the query fails with a `ValidationError` before sending — an entity's indexes are always treated as GSIs, so one pointed at an LSI of a table created outside the library is refused too) |
 | `ignoreOwnership` | Combinator | Skip `__edd_e__` entity type filter — for mixed-table scenarios |
 | `startFrom(cursor)` | Dual | Resume pagination from a previous cursor |
 | `select(attrs)` | Dual | Project specific attributes (returns `Query<Record<string, unknown>>`) |
@@ -461,7 +461,7 @@ import { Query } from "effect-dynamodb"
 | `collect` | `Effect<Array<A>>` | Execute, fetch all pages, and flatten into a single array |
 | `paginate` | `Effect<Stream<Array<A>>>` | Execute and return a Stream of pages for lazy pagination |
 | `count` | `Effect<number>` | Execute with `SELECT COUNT` — returns total matching items (respects `maxPages`) |
-| `asParams` | `Effect<Record<string, unknown>>` | Return built DynamoDB command input without executing — useful for debugging |
+| `asParams` | `Effect<Record<string, unknown>, ValidationError>` | Return built DynamoDB command input without executing — useful for debugging. Fails with a `ValidationError` for a filter the query would refuse to send |
 
 ### Filter Operators
 
@@ -524,8 +524,8 @@ Combinators are immutable — each call returns a new `BoundQuery`. Terminals ex
 | Method | Description |
 |--------|-------------|
 | `.where((t, ops) => …)` | Type-safe sort key condition on remaining SK composites. Only available when SK composites have not all been consumed. Consumes `SkRemaining` (cannot be called twice). Operators: `eq`, `lt`, `lte`, `gt`, `gte`, `between`, `beginsWith`. |
-| `.filter((t, ops) => …)` | Post-read filter expression via callback. Type-safe attribute paths via `t`, condition operators via `ops`. |
-| `.filter(shorthand)` | Post-read filter via shorthand object (e.g. `{ status: "active" }` or `{ gt: { price: 30 } }`). |
+| `.filter((t, ops) => …)` | Post-read filter expression via callback. Type-safe attribute paths via `t`, condition operators via `ops`. An empty filter (`and()`) is no filter. An empty part under `or()` or `not()`, an `or()` with no parts, or an `isIn` with no values, fails with a `ValidationError` before sending. |
+| `.filter(shorthand)` | Post-read filter via an equality shorthand object: `{ status: "active" }` ANDs `status = "active"` for each key. For other comparisons use the callback form. |
 | `.select((t) => […paths])` | Projection expression via callback. Returns `BoundQuery<…, Record<string, unknown>>`. |
 | `.select(["field", …])` | Projection via attribute name array. |
 | `.limit(n)` | Return at most `n` items. A contract on results: the query accumulates across as many requests as it takes, which is what makes it work under `.filter()`. |
@@ -533,7 +533,7 @@ Combinators are immutable — each call returns a new `BoundQuery`. Terminals ex
 | `.maxPages(n)` | Maximum number of DynamoDB pages to fetch. |
 | `.reverse()` | Reverse sort order (`ScanIndexForward = false`). |
 | `.startFrom(cursor)` | Resume pagination from an opaque cursor returned by `.fetch()`. |
-| `.consistentRead()` | Enable strongly consistent reads. |
+| `.consistentRead()` | Enable strongly consistent reads. On a GSI, which DynamoDB reads only eventually consistently, the query fails with a `ValidationError` before sending. An entity's indexes are always treated as GSIs (`db.tables.*.create()` creates them as GSIs). |
 | `.ignoreOwnership()` | Skip the `__edd_e__` entity-type filter. Use only when querying a polymorphic GSI shared across entity types and you want every item back. |
 
 ### Terminals
@@ -621,6 +621,17 @@ const result = yield* db.collections.tenantMembers({ tenantId: "t-1" }).collect(
 // result: { Employees: Employee[], Tasks: Task[] }
 ```
 
+A collection query takes `.filter()`, `.select()`, `.limit()`, `.pageSize()`, `.reverse()` and `.startFrom()`, and keeps its grouping through them. Its terminals:
+
+| Terminal | Returns |
+|----------|---------|
+| `.collect()` | The grouped result, `{ Employees: Employee[], Tasks: Task[] }` |
+| `.fetch()` | One page, grouped the same way, with its `cursor` |
+| `.paginate()` | A `Stream` of every item, each tagged with its member: `{ member: "Employees", item: Employee }` (`CollectionStreamItem`) |
+| `.count()` | The number of items, every member's together |
+
+A filter or select names each member's **domain** fields: on a member that stores a field under another name (`DynamoModel.configure(..., { field })`) it reads that attribute. A member without the field reads it as absent — `eq` doesn't match, `not(eq(...))` and `notExists(...)` do — and an attribute it stores under that name never stands in for the field. `.select()` returns partial records grouped per member. The query also takes `.maxPages()`, `.ignoreOwnership()` and `.consistentRead()`. A collection over a GSI, which DynamoDB reads only eventually consistently, refuses `.consistentRead()` with a `ValidationError` before sending. Its types (`CollectionQuery`, `CollectionStreamItem`, `CollectionSelected`, `CollectionAccessors`) are exported.
+
 ### Explicit Collections
 
 For advanced use, `Collection.make()` creates collections explicitly:
@@ -648,7 +659,7 @@ import { Transaction } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `transactGet` | `(items) => Effect<Tuple>` | Atomically get up to 100 items — returns a typed tuple. Accepts unbound `Entity.get` intermediates AND the `BoundGet` returned by `db.entities.*.get(...)` |
-| `transactWrite` | `(ops) => Effect<void>` | Atomically write up to 100 items (puts, deletes, condition checks). Accepts unbound `Entity.put`/`Entity.delete` intermediates AND the bound builders returned by `db.entities.*`; conditions attached to either (including `create()`'s implicit `attribute_not_exists`) are compiled into the transact item. `upsert`, `update` and `patch` are rejected with a `ValidationError` — see below |
+| `transactWrite` | `(ops) => Effect<void>` | Atomically write up to 100 items (puts, deletes, condition checks). A put of a versioned or unique-constrained entity reads the item first and creates or replaces it as the entity's own `put` does (see below). Accepts unbound `Entity.put`/`Entity.delete` intermediates AND the bound builders returned by `db.entities.*`; conditions attached to either (including `create()`'s implicit `attribute_not_exists`) are compiled into the transact item. `upsert`, `update` and `patch` are rejected with a `ValidationError` — see below |
 | `check` | `(get, condition) => ConditionCheckOp` | Create a condition-check operation for `transactWrite` (dual API). Takes either get spelling |
 
 ### transactGet
@@ -677,7 +688,7 @@ yield* Transaction.transactWrite(
 
 ### Ops `transactWrite` will not compile
 
-`transactWrite` emits exactly one `Put` / `Delete` / `ConditionCheck` per op. Anything whose entity contract needs a different verb, extra items, or a service the compile step does not hold is refused with a `ValidationError` rather than written with different semantics:
+`transactWrite` compiles each op to a `Put`, `Delete` or `ConditionCheck`, plus the extra items of a guarded put (see below). An op whose entity contract needs a different verb, extra items it can't build from the op, or a service the compile step does not hold is refused with a `ValidationError` rather than written with different semantics:
 
 | Op / entity feature | Why it is refused |
 |---|---|
@@ -686,16 +697,21 @@ yield* Transaction.transactWrite(
 | `refs` | Write-time ref hydration reads the referenced entity; the compile step cannot, so the ref attribute would be written empty |
 | `generatedId` | Id generation needs the `Crypto` service |
 | `vectorIndexes` | Computing the embedding needs the `Embedder` service; the item would drop out of the index |
-| **`delete()` of an entity with `unique`, `versioned: { retain: true }` or `softDelete`** | **EDD-9048.** The extra items a delete must write come from the *stored* row — the sentinel to release is keyed by its unique values, a retain snapshot copies it, and a soft-delete tombstone is that row relocated to a new sort key. This path never reads. Use the entity's own `delete`, which reads first |
+| **`delete()` of an entity with `unique`, `versioned: { retain: true }` or `softDelete`** | **EDD-9048.** The extra items a delete must write come from the *stored* row — the sentinel to release is keyed by its unique values, a retain snapshot copies it, and a soft-delete tombstone is that row relocated to a new sort key. This path builds a delete from its key alone. Use the entity's own `delete`, which reads first |
 
-### Multi-item puts expand
+### Guarded puts expand
 
-A `put` through `transactWrite` (or `EventStore.append({ additionalItems })`) of an entity with `unique` constraints or `versioned: { retain: true }` emits **more than one item**: the row, one `attribute_not_exists`-guarded sentinel per satisfiable constraint, and the v1 snapshot. All of it derives from the payload, so it needs no read and stays atomic with the rest of the transaction.
+A `put` through `transactWrite` (or `EventStore.append({ additionalItems })`) of a versioned or unique-constrained entity is written exactly as the entity's own `put` writes it. It reads the item first, then emits **more than one item**, all atomic with the rest of the transaction: the row, guarded on what was read (missing: `attribute_not_exists`; present: its version and incarnation, or its unique values), one `attribute_not_exists`-guarded sentinel per new unique value, a release of each old sentinel the item owns, and with `retain` the snapshot.
 
 Consequences worth knowing:
 
-- **The uniqueness constraint is enforced.** A duplicate fails with `UniqueConstraintViolation` (naming the constraint and the values), not a bare `TransactionCancelled`.
-- **The 100-item cap counts the expanded total.** Ten `unique` + `retain` puts occupy 30 slots. The error message reports both numbers.
+- **An existing item is replaced, not refused.** It continues its version, incarnation and `createdAt`, its replaced state is snapshotted (`retain`), and changed unique values rotate their sentinels. A deleted retain item created again continues after its retained version history. This is what keeps a versioned read model in step with `EventStore.append`.
+- **A race is retried.** If another writer changes, creates or deletes the item between the read and the transaction, or a sentinel it releases changes hands, the transaction is cancelled and built again from a fresh read. A race lost on every attempt fails with `OptimisticLockError` / `ConcurrentModification`.
+- **Errors name what happened.** A duplicate fails with `UniqueConstraintViolation` (naming the constraint and the values). Only an op's own condition (`.condition()`, `create()`) is reported as a condition: `TransactionCancelled` from `transactWrite`, `AdditionalItemConditionFailed` from `append`.
+- **One op per item.** DynamoDB allows one operation per item in a transaction, so a transaction that touches one item twice fails with a `ValidationError` naming the entity and both ops, before anything is sent. That includes two puts of one item, and two puts that swap unique values: each releases the sentinel the other reserves. In `append`, an additional item that repeats an event or the idempotency sentinel is refused the same way.
+- **4 MB, counted before sending.** A transaction whose items pass DynamoDB's 4 MB (4,194,304 bytes) fails with a `ValidationError` naming its largest item, before anything is sent. The size is a lower bound by DynamoDB's item-size rules (numbers a byte per two significant digits, plus one; no list or map overhead), so a transaction DynamoDB would accept is never refused. A `retain` put counts twice: its item and its snapshot.
+- **The reads cost capacity.** Each guarded put makes one consistent `GetItem` of its item, one more per sentinel it would release, and, for a missing `retain` item, one `Limit 1` query of its version history (plus, with primary sort key composites, a keys-only `Limit 1` query for older history).
+- **The 100-item cap counts the expanded total.** Ten `unique` + `retain` puts occupy 30 slots or more. The error message reports both numbers.
 - **`softDelete` does not affect a put** — only a delete — so puts of soft-deletable entities are unaffected.
 
 ### Types
@@ -717,7 +733,7 @@ import { Batch } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `get` | `(...gets) => Effect<Tuple>` | Batch-get up to 100 items with typed tuple return. Accepts unbound `Entity.get` intermediates AND the `BoundGet` returned by `db.entities.*.get(...)` |
-| `write` | `(...ops) => Effect<void>` | Batch-write any number of items (auto-chunks at 25). Accepts unbound `Entity.put`/`Entity.delete` intermediates AND the bound builders returned by `db.entities.*`; conditional ops and `upsert`/`update`/`patch` are rejected with a `ValidationError` — see below |
+| `write` | `(...ops) => Effect<void>` | Batch-write any number of items (auto-chunks at 25). Accepts unbound `Entity.put`/`Entity.delete` intermediates AND the bound builders returned by `db.entities.*`; conditional ops and `upsert`/`update`/`patch` are rejected with a `ValidationError` — see below. Puts of a `versioned` entity go first, as create-only transactions of up to 100 items |
 
 ### Usage
 
@@ -738,9 +754,16 @@ yield* Batch.write(
 
 Auto-chunking: `get` chunks at 100 items, `write` chunks at 25 items. Both retry unprocessed items automatically.
 
-`BatchWriteItem` has no `ConditionExpression`, so `Batch.write` **rejects** any op carrying a condition — `.condition(...)`, `create()` (implicit `attribute_not_exists`) and `deleteIfExists()` (implicit `attribute_exists`) all fail with a `ValidationError` rather than silently writing unconditionally. Use `Transaction.transactWrite` for conditional writes.
+`BatchWriteItem` has no `ConditionExpression`, so `Batch.write` **rejects** any op carrying a condition — `.condition(...)`, `create()` (implicit `attribute_not_exists`) and `deleteIfExists()` (implicit `attribute_exists`) all fail with a `ValidationError` rather than silently writing unconditionally, whatever `.condition()` is added to them (even `.condition({})`). Use `Transaction.transactWrite` for conditional writes.
 
 It also rejects (**EDD-9049**) any write of an entity configured with `unique` or `versioned: { retain: true }`, and any *delete* of a `softDelete` entity. `BatchWriteItem` has no `ConditionExpression` (which is the entirety of a uniqueness sentinel's correctness), no `UpdateRequest`, and no atomicity across its 25-item chunks — a sentinel that lands without its row, or a row without its sentinel, is a corrupt partition. A **put** of a `softDelete` entity is unaffected, because `softDelete` only changes the delete path.
+
+Puts of a plain `versioned` entity are accepted, but not as `PutRequest`s, which would reset an existing item to version 1 under a new incarnation. `Batch.write` sends them first, as create-only `TransactWriteItems` of up to 100 items (kept under DynamoDB's 4 MB transaction payload), each conditioned on `attribute_not_exists`. There is no read, so there is no window between a check and the write. A batch that touches such an item more than once is refused with a `ValidationError` before anything is written.
+
+- A put that would replace an existing item cancels its whole chunk, so nothing in that chunk is written, and fails with a `ValidationError`. Earlier chunks may already have been written, since `Batch.write` was never atomic across chunks, and the batch's other requests aren't sent. Use the entity's own `put()` or `Transaction.transactWrite` to replace an item.
+- Each chunk costs twice the write capacity of a batch write.
+- Contention cancellations (`TransactionConflict`, throttling) are retried with the batch's `maxRetries` / `baseDelayMs` backoff.
+- Puts of other entities, and deletes, are still plain `BatchWriteItem` requests.
 
 ---
 
@@ -815,7 +838,7 @@ import {
 |--------|------|-------------|
 | `createPathBuilder<M>()` | `() => PathBuilder<M, M>` | Create a path proxy for type-safe attribute access |
 | `createConditionOps<M>()` | `() => ConditionOps<M>` | Create comparison and logical operators |
-| `compileExpr(expr, resolveDbName?)` | `(Expr) => CompileResult` | Compile `Expr` to DynamoDB expression string |
+| `compileExpr(expr, resolveDbName?)` | `(Expr) => CompileResult` | Compile `Expr` to DynamoDB expression string. Throws on an expression DynamoDB can't take or that would widen what was written — an empty part under `or()` / `not()`, an `or()` with no parts, an `isIn` with no values; an empty part directly under `and()` is left out |
 | `isExpr(u)` | `(unknown) => u is Expr` | Type guard for `Expr` nodes |
 | `parseShorthand(input)` | `(ConditionInput) => Expr` | Convert `ConditionInput` to `Expr` |
 | `parseSimpleShorthand(input)` | `(Record) => Expr` | Convert `{ key: value }` to `Expr` |
@@ -1046,10 +1069,10 @@ const MatchAggregate = Aggregate.make(Match, {
 | Operation | Signature | Description |
 |-----------|-----------|-------------|
 | `aggregate.get(key)` | `Effect<Domain, AggregateAssemblyError \| DynamoError \| ValidationError>` | Fetch and assemble by partition key |
-| `aggregate.create(input)` | `Effect<Domain, AggregateWriteError>` | Create from input (ref IDs hydrated, sub-aggregate transactions) |
+| `aggregate.create(input)` | `Effect<Domain, AggregateWriteError \| ConditionalCheckFailed>` | Create from input (ref IDs hydrated, sub-aggregate transactions). Fails with `ConditionalCheckFailed`, writing nothing, when the aggregate's root item already exists |
 | `aggregate.update(key, fn)` | `Effect<Domain, AggregateWriteError>` | Fetch → mutate → diff → write changed groups. `fn` receives `UpdateContext` with `{ state, cursor, optic, current }` |
 | `aggregate.delete(key)` | `Effect<void, AggregateAssemblyError \| DynamoError>` | Remove all items in the partition |
-| `aggregate.list(key, options?)` | `Effect<ListResult<Domain>, AggregateAssemblyError \| DynamoError \| ValidationError>` | Page aggregates off the list index. `options`: `limit` (at most _n_ aggregates), `pageSize` (rows examined per request), `filter` (server-side `FilterExpression`, callback or shorthand), `reverse`, `cursor`. Returns `{ data, cursor }`; `cursor` is `null` only when exhausted, and is always `null` on a sharded (`cardinality`) list, which rejects a passed cursor with `EDD-9051` |
+| `aggregate.list(key, options?)` | `Effect<ListResult<Domain>, AggregateAssemblyError \| DynamoError \| ValidationError>` | Page aggregates off the list index. `options`: `limit` (at most _n_ aggregates), `pageSize` (rows examined per request), `filter` (server-side `FilterExpression`, callback or shorthand; an empty part under `or()` / `not()`, an `or()` with no parts or an `isIn` with no values fails with a `ValidationError` before sending), `reverse`, `cursor`. Returns `{ data, cursor }`; `cursor` is `null` only when exhausted, and is always `null` on a sharded (`cardinality`) list, which rejects a passed cursor with `EDD-9051` |
 
 ### Edge Types
 
@@ -1118,7 +1141,7 @@ A `Decider<State, Command, Event, E = never>` encodes one aggregate's command-ev
 
 | Method | Returns |
 |--------|---------|
-| `append(streamId, events, expectedVersion, options?)` | `Effect<AppendResult<TEvent>, VersionConflict \| DynamoClientError \| ValidationError \| TransactionCancelled, R>` — atomically append events with optimistic concurrency. Each event becomes a `Put` with `attribute_not_exists(pk)` inside a single `TransactWriteItems`. Optional `options.metadata` is validated against the stream's metadata schema. |
+| `append(streamId, events, expectedVersion, options?)` | `Effect<AppendResult<TEvent>, AppendError, R>` — atomically append events with optimistic concurrency. `AppendError` is `VersionConflict \| DuplicateCommand \| AdditionalItemConditionFailed \| AppendTooLarge \| DynamoClientError \| ValidationError \| TransactionCancelled \| UniqueConstraintViolation \| OptimisticLockError \| ConcurrentModification`; the last three come from guarded puts in `additionalItems`. Each event becomes a `Put` with `attribute_not_exists(pk)` inside a single `TransactWriteItems`. Optional `options.metadata` is validated against the stream's metadata schema. |
 | `read(streamId)` | `Effect<ReadonlyArray<StreamEvent<TEvent>>, DynamoClientError \| ValidationError, R>` — read all events for a stream in version order. |
 | `readFrom(streamId, afterVersion)` | `Effect<ReadonlyArray<StreamEvent<TEvent>>, DynamoClientError \| ValidationError, R>` — read events strictly after a given version. |
 | `currentVersion(streamId)` | `Effect<number, DynamoClientError \| ValidationError, R>` — current head version (0 if the stream is empty). |
@@ -1213,6 +1236,7 @@ import {
   ValidationError, TransactionCancelled, TransactionOverflow,
   UniqueConstraintViolation, OptimisticLockError,
   ItemDeleted, ItemNotDeleted,
+  ConcurrentModification, UpdateAppliedButUnreadable, DeleteAppliedButUnreadable,
   CompositeKeyHoleError, CompositeNullableError,
   RefNotFound, AggregateAssemblyError,
   AggregateDecompositionError, AggregateTransactionOverflow,
@@ -1225,19 +1249,22 @@ import {
 |-------|-----|-------------|
 | `DynamoError` | `"DynamoError"` | AWS SDK error wrapper (includes `operation` and `cause`) |
 | `ThrottlingError` | `"ThrottlingError"` | AWS SDK throttling — request rate exceeded |
-| `DynamoValidationError` | `"DynamoValidationError"` | Malformed DynamoDB request |
+| `DynamoValidationError` | `"DynamoValidationError"` | DynamoDB rejected the request as malformed |
 | `InternalServerError` | `"InternalServerError"` | Transient DynamoDB failure |
 | `ResourceNotFoundError` | `"ResourceNotFoundError"` | Table or index does not exist |
-| `ItemNotFound` | `"ItemNotFound"` | `getItem` returned no item |
-| `ConditionalCheckFailed` | `"ConditionalCheckFailed"` | Condition expression not met (put, update, delete, create) |
-| `ValidationError` | `"ValidationError"` | Schema decode/encode failed |
+| `ItemNotFound` | `"ItemNotFound"` | No item under the key: `get`, an `update` of a missing item (unless it is a plain `.set()` of a complete item), `restore` with no soft-deleted item or after a concurrent restore won |
+| `ConditionalCheckFailed` | `"ConditionalCheckFailed"` | A `.condition()` was not met (put, update, delete, create), or an op's own guard was: `create()` of an existing item or aggregate, `patch()` or `deleteIfExists()` of a missing item, whatever `.condition()` was added. A lost version race is an `OptimisticLockError` instead |
+| `ValidationError` | `"ValidationError"` | Schema decode/encode failed, or the operation was refused: an item of a versioned entity with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, a transaction that touches one item twice or passes 4 MB, a condition or filter with an empty part under `or()` / `not()` (or an `or()` with no parts, or an `isIn` with no values), `.consistentRead()` on a GSI, or `.expectedVersion()` on an entity that isn't `versioned` |
+| `DeleteAppliedButUnreadable` | `"DeleteAppliedButUnreadable"` | A delete with `returnValues("allOld")` was applied, but the item it removed (`item`, as stored) could not be decoded. Don't retry it |
 | `TransactionCancelled` | `"TransactionCancelled"` | Transaction rejected (includes cancellation `reasons`) |
-| `TransactionOverflow` | `"TransactionOverflow"` | Transaction exceeds 100-item DynamoDB limit |
+| `TransactionOverflow` | `"TransactionOverflow"` | A write's own transaction (the item, its sentinels and snapshot) would exceed DynamoDB's 100-item limit |
 | `AppendTooLarge` | `"AppendTooLarge"` | `EventStore.append` exceeds the 100-item transaction limit (`streamName`, `streamId`, `count`, `limit`) |
-| `UniqueConstraintViolation` | `"UniqueConstraintViolation"` | Unique constraint violated on put/create |
-| `OptimisticLockError` | `"OptimisticLockError"` | Version mismatch on `expectedVersion()` |
+| `UniqueConstraintViolation` | `"UniqueConstraintViolation"` | Unique constraint violated on put/create/upsert/update, or by a put in `transactWrite` / `append`'s `additionalItems` |
+| `OptimisticLockError` | `"OptimisticLockError"` | A versioned write lost a version race: `expectedVersion()` did not match, or another writer changed the item between the read and the write of a read-then-write update, or a `put`, `upsert` or transaction put lost that race on every attempt. `actualVersion` is the stored version (`entityType`, `key`, `expectedVersion`, `actualVersion`) |
+| `ConcurrentModification` | `"ConcurrentModification"` | An unversioned write that reads first (a unique-field change, a computed change to an index composite, a `put` or `upsert` of a unique-constrained entity — the last two after every attempt) found that another writer changed one of the attributes it read before its write landed, or a unique sentinel it was releasing changed hands. Nothing was written; retrying recomputes from the new values (`entityType`, `key`, `attributes`, `current`) |
+| `UpdateAppliedButUnreadable` | `"UpdateAppliedButUnreadable"` | A retain update WAS applied at `version`, but another write replaced the item before it could be read back, and no snapshot proves what this update wrote. Don't retry a non-idempotent update on this error; read the item instead (`entityType`, `key`, `version`, `reason`) |
 | `ItemDeleted` | `"ItemDeleted"` | Item is soft-deleted (get returns this instead of the item) |
-| `ItemNotDeleted` | `"ItemNotDeleted"` | Restore called on an item that isn't soft-deleted |
+| `ItemNotDeleted` | `"ItemNotDeleted"` | `restore` found a live item under the key as well as the soft-deleted one (for example, the item was recreated after it was deleted) |
 | `CompositeKeyHoleError` | `"CompositeKeyHoleError"` | EDD-9024 — **deprecated in v1.7.1**, no longer thrown at runtime. Class export retained for back-compat with consumers who type-imported it for `Effect.catchTag` handlers. Hole patterns now collapse into the unified per-half can't-compose rule (drop under sparse, noop-or-cascade-override under preserve). |
 | `CompositeNullableError` | `"CompositeNullableError"` | EDD-9025 — composite attribute Schema includes `null`. Raised at `Entity.make()` time. Carries `entityType`, `surface` (e.g. `"primaryKey"`, `"index:..."`, `"unique:..."`), `compositeAttribute`, `schemaPath`. |
 | `RefNotFound` | `"RefNotFound"` | Referenced entity not found during ref hydration (`entity`, `field`, `refEntity`, `refId`) |
@@ -1246,8 +1273,27 @@ import {
 | `AggregateTransactionOverflow` | `"AggregateTransactionOverflow"` | Sub-aggregate exceeds 100-item transaction limit (`aggregate`, `subgraph`, `itemCount`, `limit`) |
 | `CascadePartialFailure` | `"CascadePartialFailure"` | Cascade update partially failed in eventual mode (`sourceEntity`, `sourceId`, `succeeded`, `failed`, `errors`) |
 | `VersionConflict` | `"VersionConflict"` | Event store version mismatch |
-| `AdditionalItemConditionFailed` | `"AdditionalItemConditionFailed"` | A caller-supplied `EventStore.append({ additionalItems })` condition failed — NOT a version conflict (`streamName`, `streamId`, `indices`, `reasons`) |
+| `AdditionalItemConditionFailed` | `"AdditionalItemConditionFailed"` | A condition the caller set on an `EventStore.append({ additionalItems })` op (`.condition()`, `create()`, `Transaction.check`) failed — NOT a version conflict, and never an op the caller set no condition on (`streamName`, `streamId`, `indices`, `reasons`) |
 | `DuplicateCommand` | `"DuplicateCommand"` | A `commandId` was already applied to this stream (`streamName`, `streamId`, `commandId`) |
+
+### Errors by operation
+
+Each operation declares a fixed error union, whatever the entity's configuration. Every union also includes `DynamoClientError`, plus ref and vector errors where the entity has refs or vector indexes. `.condition()` adds `ConditionalCheckFailed` to an operation that lacks it.
+
+| Operation | Declared errors (besides `DynamoClientError`) |
+|-----------|-----------------------------------------------|
+| `put` | `ValidationError`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `TransactionOverflow` |
+| `create` | as `put`, plus `ConditionalCheckFailed` |
+| `upsert` | as `put`, plus `ItemNotFound`, `ConditionalCheckFailed` |
+| `update` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `UpdateAppliedButUnreadable`, `UniqueConstraintViolation`, `ValidationError`, `TransactionOverflow` |
+| `patch` | as `update`, plus `ConditionalCheckFailed` |
+| `delete` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow`, `DeleteAppliedButUnreadable` |
+| `deleteIfExists` | as `delete`, plus `ConditionalCheckFailed` |
+| `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow` |
+| `purge` | `ValidationError` |
+| `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
+| `EventStore` `append` / `commandHandler` (plus the decider's errors) | `VersionConflict`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 
 ### Usage
 

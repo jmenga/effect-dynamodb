@@ -132,8 +132,10 @@ Products.condition({ status: "active", role: "admin" })
 
   On `delete`, the guard reaches DynamoDB on every path — the simple `DeleteItem`, the
   soft-delete transaction, and the unique-constraint transaction. On the two transaction
-  paths it rides the current item's own `Delete`, which is the only conditioned item, so
-  a rejection rolls the whole transaction back: no tombstone, no released sentinel.
+  paths it rides the current item's own `Delete`, so a rejection rolls the whole
+  transaction back: no tombstone, no released sentinel. The sentinel releases carry
+  only their own condition — that the item still owns the sentinel — and one that fails
+  is a `ConcurrentModification`, never your condition.
   `purge()` is the one operation that refuses a condition (`ValidationError`, `EDD-9047`)
   — it deletes a whole partition across batched writes, so no single `ConditionExpression`
   could guard it atomically.
@@ -314,6 +316,62 @@ For nested attributes, array elements, and attribute-to-attribute operations, us
 | Default value | — | `Entity.pathIfNotExists(...)` | `SET #f = if_not_exists(#f, :v)` |
 | Delete from set | `Entity.deleteFromSet({ f: set })` | `Entity.pathDelete(...)` | `DELETE #f :v` |
 | Copy attribute | — | `Entity.pathSet({ isPath: true })` | `SET #a = #b` |
+
+#### Values are encoded through the schema at the path
+
+`pathSet`, `pathAppend`, `pathPrepend`, `pathIfNotExists` and the record-based `append` encode their value through the model schema at the path they address, the same way `set` does:
+
+- A `DateTime` set at `["days", 0]` is stored as its ISO string, or as a number under `storedAs`.
+- A `Schema.NumberFromString` value is stored as a string.
+- A plain object set on a class-typed field is encoded as that class.
+- A class instance is always encoded as a whole, since its constructor took domain values.
+- A plain object or array that mixes wire and domain parts, such as `{ b64: "hi", at: DateTime, n: "5" }`, is encoded part by part, by the schema at each position. Every `DateTime`, `Date` and `Redacted` inside it is stored in its wire form.
+- Appended and prepended lists are encoded element by element.
+
+A value already in wire form is normalised the way `.set()` normalises it. A `NumberFromString` value of `"05"` is stored as `"5"`, a `DateTimeUtcFromString` value of `"2000-01-01"` as `"2000-01-01T00:00:00.000Z"`, and a `Schema.Trim` field stores its trimmed form. The value read back is the same either way; only the stored bytes differ, which matters to filters and DynamoDB Streams consumers.
+
+One kind of value is stored exactly as given: a value that is genuinely valid wire for a leaf transform with a primitive wire form, and also a valid domain value. Examples are `"aGk="` on a `Schema.StringFromBase64` field, or a JSON string on a `Schema.fromJsonString` field. Encoding such a value again would double-encode it. A plain string that isn't valid wire, such as `"hi"` on a `StringFromBase64` field, is a domain value and is encoded (`"aGk="`). The same rule applies to such leaves inside arrays and plain objects.
+
+Paths into and under a top-level `DynamoModel.ref` field are encoded through the ref target's model, like any other path: `pathSet` at `["author", "born"]` stores the author's date as an ISO string. Only a path no schema describes, such as one under a dynamic key of an untyped value, is written as given.
+
+A value set by path into a class that has lost its fields is written as given, in the same form `put` stores it, so the item stays readable. A class loses its fields when it is built with `.check()` or `.annotate()`, or when it is a `DynamoModel.ref` nested inside a ref target. Known limitation: plain dates inside such a class are still stored as maps, as on 1.22.0, and read back as plain objects. That applies to whole-value `put`, `.set()` and `pathSet` of the class too.
+
+On entities with `versioned: { retain: true }`, path operations were silently ignored before this release: they returned success and wrote nothing. They are now sent to DynamoDB as the same update expression other entities use, in one transaction with the version snapshot, so they follow DynamoDB's own semantics: list indexes refer to the item before the update, overlapping paths and appends to a missing list are rejected, and a rejected update writes no snapshot. `expectedVersion` and `.condition()` apply.
+
+#### Path operations on index composites and unique fields
+
+A path operation on a field that feeds an index key or a unique constraint is handled like the matching record operation. A top-level `pathSet` of a value or `pathRemove` works like `.set()` or `.remove()`, and a numeric `pathAdd` or `pathSubtract` works like `.add()` or `.subtract()`. The index keys are recomposed and the unique sentinels rotated, exactly as those operations do. `.add()`, `.subtract()`, `.append()` and `.deleteFromSet()` on an index composite also recompose the index key, on every entity.
+
+A `.remove()` (or top-level `pathRemove`) of an index composite that has a `Schema.withDecodingDefault` doesn't drop the item from the index. It stores the default instead and keeps the item indexed under it, so the keys agree with the value the item reads back with. On a unique field, the old value's sentinel is released and none is created for the default (see [Defaults and Unique Constraints](/effect-dynamodb/guides/data-integrity/#defaults-and-unique-constraints)).
+
+These are rejected with a `ValidationError` that names the field:
+
+- operations whose result DynamoDB computes at write time on such a field: a copy from another attribute, `pathIfNotExists`, and list or set operations;
+- a path below such a field;
+- any path operation on a primary-key composite or an immutable field;
+- more than one operation on the same such field.
+
+An update can't combine path operations with a change to a unique-constraint field, or with a computed change (`.add()`, `.append()`, …) to an index composite. Split it into two updates.
+
+Path values are also validated the way `.set()` validates its payload. A value the schema rejects, such as a literal outside its set, a string under its `minLength`, or a container that breaks its `.check()`, fails with a `ValidationError` instead of being stored. A key whose value is `undefined` is dropped before validation, as it is when the item is stored. List `append` and `prepend` validate each element, but can't enforce list-level checks such as `maxLength`, because DynamoDB builds the list server-side.
+
+:::caution[Appends can break a list-level check]
+An append or prepend can take a list past a list-level check such as `maxLength`, and DynamoDB stores the result. For a list whose check is also enforced on read (any array that holds no date or other substituted value), the item then fails to decode with a `ValidationError`, both on the update's returned item and on every later read. Guard such a list with a condition on its size. For example, when appending one element to a list capped at 2:
+
+```typescript
+db.entities.Items.update({ id: "1" })
+  .pathAppend({ segments: ["tags"], value: ["new"] })
+  .condition((t, { lt }) => lt(t.tags.size(), 2))
+```
+
+The update then fails with `ConditionalCheckFailed` instead of writing. Alternatively, use `.set()` with the full list, which is validated before it is written. This is not new in this release.
+:::
+
+`ADD`, `DELETE` and `SUBTRACT` are unchanged.
+
+:::note[Upgrading from 1.22.0 or earlier]
+Earlier versions wrote path and `append` values unencoded: a `DateTime` became a marshalled map even on a plain date field, and a `NumberFromString` value was stored as a number. Those values now read back. A map is rebuilt into a real `DateTime`, a number on a `NumberFromString` field reads as that number, and a safe-integer number on a `BigIntFromString` field reads as a `bigint`. Until old values are rewritten, a filter on the attribute can match old and new items differently, and DynamoDB Streams consumers see the type change.
+:::
 
 ---
 

@@ -559,16 +559,20 @@ Conditions ride along: `.condition({ ... })` on a bound put or delete, and the i
 :::caution[`upsert` is not a transact item]
 `upsert` is deliberately **not** accepted here, and neither is `update` / `patch`. An `upsert` is an `UpdateItem` whose `SET` clause uses `if_not_exists` for `createdAt`, immutable fields and the version counter — compiling it into a `TransactWriteItems` `Put` would reset all three. Rather than do that quietly, `append` fails with a `ValidationError` naming `upsert`. Use `put()` or `create()` in the transaction, or run the upsert as its own operation outside it.
 
-A **delete** of an entity configured with `unique`, `versioned: { retain: true }` or `softDelete` is refused for a related reason (**EDD-9048**): the extra items such a delete must write are derived from the *stored* row, and this path never reads. Use the entity's own `delete`.
+A **delete** of an entity configured with `unique`, `versioned: { retain: true }` or `softDelete` is refused for a related reason (**EDD-9048**): the extra items such a delete must write are derived from the *stored* row, and this path builds a delete from its key alone. Use the entity's own `delete`.
 :::
 
 ### One additional item can become several
 
-A **put** of an entity with `unique` constraints or `versioned: { retain: true }` expands: the row, one guarded uniqueness sentinel per satisfiable constraint, and the v1 version snapshot — all committed in the same transaction as the events. Two things follow.
+A **put** of a `versioned` or `unique`-constrained entity is written exactly as the entity's own `put` writes it. It reads the item, and commits in the same transaction as the events: the row (continuing an existing item's version, incarnation and `createdAt`), a guarded sentinel for each new unique value and a release of each old one the item owns, and with `retain` a version snapshot. So a versioned read model stays in step across appends: the second `append` that puts it replaces the row as version 2. A concurrent write to the row between that read and the append cancels the transaction, and `append` builds and writes it again. Four things follow.
 
-`AdditionalItemConditionFailed.indices` still means *indices into the array you passed*. A failing sentinel is reported against the op that produced it, not against the raw transaction position, and one op that fails in several places is reported once.
+`AdditionalItemConditionFailed` is reported only for a condition *you* set (`.condition()`, `create()`, `Transaction.check`). A put you set no condition on fails as the entity's put would: `UniqueConstraintViolation` for a taken value, a `ValidationError` for conflicting history, or `OptimisticLockError` / `ConcurrentModification` for a race lost on every attempt.
+
+`AdditionalItemConditionFailed.indices` still means *indices into the array you passed*. A failing item is reported against the op that produced it, not against the raw transaction position, and one op that fails in several places is reported once.
 
 The 100-item cap counts the **expanded** total, so `events + expanded additional items + sentinel + contiguity check` must fit. `AppendTooLarge.count` reports the expanded number.
+
+DynamoDB allows one operation per item in a transaction. Two `additionalItems` that touch the same item, such as two puts that swap unique values (each releases the sentinel the other reserves), or one that repeats an event or the idempotency sentinel, fail with a `ValidationError` naming the entity, before anything is sent. So does an append whose items pass DynamoDB's 4 MB limit; a `retain` put counts twice (its item and its snapshot).
 
 ### Telling the failures apart
 
@@ -592,6 +596,8 @@ const condError = yield* matchEvents
 |---|---|---|
 | `VersionConflict` | An event put's guard — the stream advanced under you | Re-read, re-decide, retry |
 | `AdditionalItemConditionFailed` | One of *your* `additionalItems` conditions | Inspect `indices` (0-based into `additionalItems`); retrying blindly will not help |
+| `UniqueConstraintViolation` | A put in `additionalItems` takes a unique value another item holds | Choose another value |
+| `OptimisticLockError` / `ConcurrentModification` | A put in `additionalItems` lost a race with another writer of its item on every attempt | Retry the command |
 | `DuplicateCommand` | The idempotency sentinel — this `commandId` already ran | Nothing; the command already took effect |
 | `TransactionCancelled` | Throttling, a concurrent transaction, or a validation error | Retry with backoff |
 | `AppendTooLarge` | `events + additionalItems + sentinel + contiguity check` exceeded DynamoDB's 100-item cap | Split the append |

@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest"
 import { DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Stream } from "effect"
 import { beforeEach, vi } from "vitest"
+import type { DynamoClient } from "../src/DynamoClient.js"
 import { createConditionOps } from "../src/internal/Expr.js"
 import { createPathBuilder } from "../src/internal/PathBuilder.js"
 import { toAttributeMap } from "../src/Marshaller.js"
@@ -635,6 +636,340 @@ describe("Query", () => {
   // -------------------------------------------------------------------------
   // paginate terminal
   // -------------------------------------------------------------------------
+
+  describe("a filter beside the ownership clause (#133)", () => {
+    it.effect("an empty part directly under and, or a whole empty filter, is left out", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        const ops = createConditionOps<{ id: string; name: string }>()
+        const pb = createPathBuilder<{ id: string; name: string }>()
+        yield* Query.collect(
+          makeTestQuery().pipe(Query.filterExpr(ops.and(ops.eq(pb.id, "a"), ops.and()))),
+        )
+        expect(mockQuery.mock.calls[0]![0].FilterExpression).toBe("#eddE IN (:et0) AND (#e0 = :e1)")
+        mockQuery.mockClear()
+        yield* Query.collect(makeTestQuery().pipe(Query.filterExpr(ops.and(ops.and()))))
+        expect(mockQuery.mock.calls[0]![0].FilterExpression).toBe("#eddE IN (:et0)")
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect("asParams fails with ValidationError on an empty part, never dies (#134)", () =>
+      Effect.gen(function* () {
+        const ops = createConditionOps<{ id: string; name: string }>()
+        const pb = createPathBuilder<{ id: string; name: string }>()
+        for (const filter of [
+          ops.isIn(pb.id, []),
+          ops.or(ops.eq(pb.id, "a"), ops.and()),
+          ops.not(ops.and()),
+          ops.or(),
+        ]) {
+          const exit = yield* Effect.exit(
+            makeTestQuery().pipe(Query.filterExpr(filter), Query.asParams),
+          )
+          expect(exit._tag).toBe("Failure")
+          const error = yield* Effect.flip(
+            makeTestQuery().pipe(Query.filterExpr(filter), Query.asParams),
+          )
+          expect(error._tag).toBe("ValidationError")
+        }
+        const params = yield* makeTestQuery().pipe(
+          Query.filterExpr(ops.and(ops.eq(pb.id, "a"), ops.and())),
+          Query.asParams,
+        )
+        expect(params.FilterExpression).toBe("#eddE IN (:et0) AND (#e0 = :e1)")
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect("an empty part under or or not, or an or() with no parts, is refused unsent", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        const ops = createConditionOps<{ id: string; name: string }>()
+        const pb = createPathBuilder<{ id: string; name: string }>()
+        const refused = [
+          ops.not(ops.and()),
+          ops.or(ops.eq(pb.id, "a"), ops.and()),
+          ops.or(ops.and()),
+          ops.or(),
+          ops.and(ops.eq(pb.name, "b"), ops.or(ops.eq(pb.id, "a"), ops.and(ops.and()))),
+          ops.not(ops.or(ops.eq(pb.id, "a"), ops.not(ops.and()))),
+          ops.isIn(pb.id, []),
+        ]
+        for (const filter of refused) {
+          const query = makeTestQuery().pipe(Query.filterExpr(filter))
+          for (const run of [
+            Query.collect(query),
+            Query.execute(query),
+            Query.count(query),
+            Query.paginate(query).pipe(Effect.flatMap((pages) => Stream.runCollect(pages))),
+          ]) {
+            const error = yield* Effect.flip(run as Effect.Effect<unknown, unknown, DynamoClient>)
+            expect(error).toBeInstanceOf(ValidationError)
+          }
+        }
+        expect(mockQuery).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect("a top-level OR is parenthesised, so it can't admit other entities", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        const ops = createConditionOps<{ id: string; name: string }>()
+        const pb = createPathBuilder<{ id: string; name: string }>()
+        yield* Query.collect(
+          makeTestQuery().pipe(Query.filterExpr(ops.or(ops.eq(pb.id, "a"), ops.eq(pb.name, "b")))),
+        )
+        expect(mockQuery.mock.calls[0]![0].FilterExpression).toBe(
+          "#eddE IN (:et0) AND ((#e0 = :e1) OR (#e2 = :e3))",
+        )
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+  })
+
+  describe("history rows are not items (#133)", () => {
+    // A row is live when the key composed from its own `id` is its sort key.
+    const liveRows: Query.LiveRows = {
+      isLive: (row) => row.sk?.S === `$myapp#v1#user#id_${row.id?.S}`,
+      reads: ["sk", "id"],
+    }
+    const row = (id: string, sk: string) => toAttributeMap({ id, name: id, pk: "p", sk })
+    const page = () => ({
+      Items: [
+        row("a", "$myapp#v1#user#id_a"),
+        row("a", "$myapp#v1#user#v#id_a#0000001"),
+        row("b", "$myapp#v1#user#deleted#id_b#2024-01-01T00:00:00.000Z"),
+        row("c", "$myapp#v1#user#id_c"),
+        row("c", "$myapp#v1#user#id_c#e#2026"),
+      ],
+    })
+    const historyQuery = () =>
+      Query.make<{ id: string }>({
+        tableName: "TestTable",
+        indexName: undefined,
+        pkField: "pk",
+        pkValue: "p",
+        skField: "sk",
+        entityTypes: ["User"],
+        decoder: (raw) => Effect.succeed({ id: raw.id as string }),
+        liveRows,
+        keyFields: ["pk", "sk"],
+      })
+    const historyScan = () =>
+      Query.makeScan<{ id: string }>({
+        tableName: "TestTable",
+        indexName: undefined,
+        entityTypes: ["User"],
+        decoder: (raw) => Effect.succeed({ id: raw.id as string }),
+        liveRows,
+      })
+
+    it.effect("a query and a scan drop them as they arrive — never in a filter", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue(page())
+        mockScan.mockResolvedValue(page())
+        expect((yield* Query.collect(historyQuery())).map((i) => i.id)).toEqual(["a", "c"])
+        expect((yield* Query.collect(historyScan())).map((i) => i.id)).toEqual(["a", "c"])
+        // DynamoDB refuses a key attribute in a query's FilterExpression, and
+        // a scan's would save no read capacity.
+        expect(mockQuery.mock.calls[0]![0].FilterExpression).not.toContain("sk")
+        expect(mockScan.mock.calls[0]![0].FilterExpression).not.toContain("sk")
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect("limit, paginate and count see only items", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue(page())
+        const first = yield* Query.execute(historyQuery().pipe(Query.limit(2)))
+        expect(first.items.map((i) => i.id)).toEqual(["a", "c"])
+        // The budget still bounds the request; dropped rows are made up by paging.
+        expect(mockQuery.mock.calls[0]![0].Limit).toBe(2)
+        const pages = yield* Query.paginate(historyQuery()).pipe(
+          Effect.flatMap((stream) => Stream.runCollect(stream)),
+        )
+        expect([...pages].flat().map((i) => i.id)).toEqual(["a", "c"])
+        expect(yield* Query.count(historyQuery())).toBe(2)
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect("limit is sent as Limit, and paging makes up rows dropped as history", () =>
+      Effect.gen(function* () {
+        for (const [mock, make] of [
+          [mockQuery, historyQuery],
+          [mockScan, historyScan],
+        ] as const) {
+          mock.mockReset()
+          mock
+            .mockResolvedValueOnce({
+              Items: [row("a", "$myapp#v1#user#id_a"), row("a", "$myapp#v1#user#v#id_a#0000001")],
+              LastEvaluatedKey: { pk: { S: "p" }, sk: { S: "$myapp#v1#user#v#id_a#0000001" } },
+            })
+            .mockResolvedValueOnce({ Items: [row("c", "$myapp#v1#user#id_c")] })
+          const items = yield* Query.collect(make().pipe(Query.limit(2)))
+          expect(items.map((i) => i.id)).toEqual(["a", "c"])
+          // `limit` first, then twice the last: never the remainder.
+          expect(mock.mock.calls.map((call) => call[0].Limit)).toEqual([2, 4])
+        }
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    /** A partition, served in sort key order a page at a time, as DynamoDB does. */
+    const servePartition = (rows: ReadonlyArray<Record<string, any>>) => (input: any) => {
+      const ordered = input.ScanIndexForward === false ? [...rows].reverse() : [...rows]
+      const from =
+        input.ExclusiveStartKey === undefined
+          ? 0
+          : ordered.findIndex((r) => r.sk.S === input.ExclusiveStartKey.sk.S) + 1
+      const page = ordered.slice(from, from + (input.Limit ?? ordered.length))
+      const last = page[page.length - 1]
+      return Promise.resolve({
+        Items: page,
+        ...(from + page.length < ordered.length && last !== undefined
+          ? { LastEvaluatedKey: { pk: last.pk, sk: last.sk } }
+          : {}),
+      })
+    }
+    const sorted = (rows: Array<Record<string, any>>) =>
+      rows.sort((a, b) => (a.sk.S < b.sk.S ? -1 : a.sk.S > b.sk.S ? 1 : 0))
+
+    it.effect("a run of history rows costs requests logarithmic in its length", () =>
+      Effect.gen(function* () {
+        // Three items with 300 snapshots each: in reverse, the snapshots come first.
+        const retained = sorted(
+          ["a", "b", "c"].flatMap((id) => [
+            row(id, `$myapp#v1#user#id_${id}`),
+            ...Array.from({ length: 300 }, (_, v) =>
+              row(id, `$myapp#v1#user#v#id_${id}#${String(v + 1).padStart(7, "0")}`),
+            ),
+          ]),
+        )
+        mockQuery.mockReset()
+        mockQuery.mockImplementation(servePartition(retained))
+        const last = yield* Query.collect(historyQuery().pipe(Query.reverse, Query.limit(1)))
+        expect(last.map((i) => i.id)).toEqual(["c"])
+        expect(mockQuery.mock.calls.length).toBeLessThanOrEqual(11)
+
+        // Three items, 300 tombstones each: forward, the tombstones come first.
+        const deleted = sorted(
+          ["a", "b", "c"].flatMap((id) => [
+            row(id, `$myapp#v1#user#id_${id}`),
+            ...Array.from({ length: 300 }, (_, n) =>
+              row(
+                id,
+                `$myapp#v1#user#deleted#id_${id}#2024-01-01T00:00:${String(n).padStart(3, "0")}Z`,
+              ),
+            ),
+          ]),
+        )
+        mockQuery.mockReset()
+        mockQuery.mockImplementation(servePartition(deleted))
+        const items = yield* Query.collect(historyQuery().pipe(Query.limit(5)))
+        expect(items.map((i) => i.id)).toEqual(["a", "b", "c"])
+        expect(mockQuery.mock.calls.length).toBeLessThanOrEqual(10)
+        // Paging through them a page of two at a time stays logarithmic too.
+        mockQuery.mockClear()
+        const page = yield* Query.execute(historyQuery().pipe(Query.limit(2)))
+        expect(page.items.map((i) => i.id)).toEqual(["a", "b"])
+        expect(mockQuery.mock.calls.length).toBeLessThanOrEqual(10)
+        mockQuery.mockClear()
+        const rest = yield* Query.execute(
+          historyQuery().pipe(Query.limit(2), Query.startFrom(page.cursor!)),
+        )
+        expect(rest.items.map((i) => i.id)).toEqual(["c"])
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect("pageSize is sent as is, and a grown Limit stops at 100,000", () =>
+      Effect.gen(function* () {
+        const historyOnly = () => ({
+          Items: [row("a", "$myapp#v1#user#v#id_a#0000001")],
+          LastEvaluatedKey: { pk: { S: "p" }, sk: { S: "$myapp#v1#user#v#id_a#0000001" } },
+        })
+        mockQuery.mockReset()
+        mockQuery.mockResolvedValueOnce(historyOnly()).mockResolvedValueOnce({ Items: [] })
+        yield* Query.collect(historyQuery().pipe(Query.limit(2), Query.pageSize(7)))
+        expect(mockQuery.mock.calls.map((call) => call[0].Limit)).toEqual([7, 7])
+        mockQuery.mockReset()
+        mockQuery.mockResolvedValueOnce(historyOnly()).mockResolvedValueOnce({ Items: [] })
+        yield* Query.collect(historyQuery().pipe(Query.limit(60_000)))
+        expect(mockQuery.mock.calls.map((call) => call[0].Limit)).toEqual([60_000, 100_000])
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect("count reads only what it judges rows by, and honours limit", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue(page())
+        expect(yield* Query.count(historyQuery())).toBe(2)
+        const input = mockQuery.mock.calls[0]![0]
+        expect(input.Select).toBeUndefined()
+        expect(Object.values(input.ExpressionAttributeNames).sort()).toEqual(
+          expect.arrayContaining(["sk", "id"]),
+        )
+        expect(input.ProjectionExpression.split(",").length).toBe(2)
+        mockQuery.mockClear()
+        expect(yield* Query.count(historyQuery().pipe(Query.limit(1)))).toBe(1)
+        expect(mockQuery.mock.calls[0]![0].Limit).toBe(1)
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect("a projected query still reads what it judges rows by", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue(page())
+        const items = yield* Query.collect(historyQuery().pipe(Query.select(["name"])))
+        expect(items).toHaveLength(2)
+        const input = mockQuery.mock.calls[0]![0]
+        expect(Object.values(input.ExpressionAttributeNames)).toEqual(
+          expect.arrayContaining(["sk", "id"]),
+        )
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect("paginate with select and limit projects no key attributes it doesn't need", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [toAttributeMap({ name: "n" })] })
+        const keyed = Query.make<{ name: string }>({
+          tableName: "TestTable",
+          indexName: undefined,
+          pkField: "pk",
+          pkValue: "p",
+          skField: "sk",
+          entityTypes: ["User"],
+          decoder: (raw) => Effect.succeed({ name: raw.name as string }),
+          keyFields: ["pk", "sk"],
+        })
+        yield* Query.paginate(keyed.pipe(Query.select(["name"]), Query.limit(5))).pipe(
+          Effect.flatMap((stream) => Stream.runCollect(stream)),
+        )
+        expect(Object.values(mockQuery.mock.calls[0]![0].ExpressionAttributeNames)).not.toContain(
+          "sk",
+        )
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect("prepare swaps the sort key operand and keeps only its rows", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue(page())
+        const q = Query.make<{ id: string }>({
+          tableName: "TestTable",
+          indexName: undefined,
+          pkField: "pk",
+          pkValue: "p",
+          skField: "sk",
+          entityTypes: ["User"],
+          decoder: (raw) => Effect.succeed({ id: raw.id as string }),
+          prepare: (tableName) =>
+            Effect.succeed({
+              replaceBeginsWith: { from: "own#", to: `${tableName}#all#` },
+              keep: (r) => !String(r.sk?.S).includes("#v#"),
+            }),
+        }).pipe(Query.where({ beginsWith: "own#" }))
+        const items = yield* Query.collect(q)
+        expect(items.map((i) => i.id)).toEqual(["a", "b", "c", "c"])
+        expect(mockQuery.mock.calls[0]![0].ExpressionAttributeValues[":sk"]).toEqual({
+          S: "TestTable#all#",
+        })
+        expect(yield* Query.count(q)).toBe(4)
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+  })
 
   describe("paginate", () => {
     it.effect("returns a Stream of page arrays", () =>

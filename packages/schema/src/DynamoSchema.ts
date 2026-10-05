@@ -247,61 +247,76 @@ export const composeUniqueKey = (
 }
 
 /**
+ * Options of the history keys (version snapshots and soft-delete tombstones).
+ *
+ * `item` — the item's identity within its partition, for an entity whose
+ * primary sort key has composites (several items per partition): the
+ * composite part of its sort key (see `KeyComposer.composeHistoryItemSegment`).
+ * Inserted after the history marker, so each item has its own history; an
+ * entity without sort key composites passes none, and its keys are exactly
+ * the partition-wide ones.
+ */
+export interface HistoryKeyOptions {
+  readonly casing?: Casing | undefined
+  readonly item?: string | undefined
+}
+
+const itemPart = (options: HistoryKeyOptions | undefined): string =>
+  options?.item === undefined || options.item === "" ? "" : `${options.item}#`
+
+/**
  * Compose a version snapshot sort key.
  *
- * Format: `$<schema>#v<version>#<entityType>#v#<zeroPaddedVersion>`
+ * Format: `$<schema>#v<version>#<entityType>#v#[<item>#]<zeroPaddedVersion>`
  */
 export const composeVersionKey = (
   schema: DynamoSchema,
   entityType: string,
   version: number,
-  options?: { readonly casing?: Casing | undefined } | undefined,
-): string => {
-  const { pre, label: type } = resolveKeyPrefix(schema, entityType, options)
-  return `${pre}#${type}#v#${String(version).padStart(7, "0")}`
-}
+  options?: HistoryKeyOptions | undefined,
+): string =>
+  `${composeVersionKeyPrefix(schema, entityType, options)}${String(version).padStart(7, "0")}`
 
 /**
  * Compose a soft-deleted item sort key.
  *
- * Format: `$<schema>#v<version>#<entityType>#deleted#<isoTimestamp>`
+ * Format: `$<schema>#v<version>#<entityType>#deleted#[<item>#]<isoTimestamp>`
  */
 export const composeDeletedKey = (
   schema: DynamoSchema,
   entityType: string,
   timestamp: string,
-  options?: { readonly casing?: Casing | undefined } | undefined,
-): string => {
-  const { pre, label: type } = resolveKeyPrefix(schema, entityType, options)
-  return `${pre}#${type}#deleted#${timestamp}`
-}
+  options?: HistoryKeyOptions | undefined,
+): string => `${composeDeletedKeyPrefix(schema, entityType, options)}${timestamp}`
 
 /**
- * Compose the version key prefix for `begins_with` queries.
+ * Compose the version key prefix for `begins_with` queries — of one item's
+ * history with `item`, of the partition's without.
  *
- * Format: `$<schema>#v<version>#<entityType>#v#`
+ * Format: `$<schema>#v<version>#<entityType>#v#[<item>#]`
  */
 export const composeVersionKeyPrefix = (
   schema: DynamoSchema,
   entityType: string,
-  options?: { readonly casing?: Casing | undefined } | undefined,
+  options?: HistoryKeyOptions | undefined,
 ): string => {
   const { pre, label: type } = resolveKeyPrefix(schema, entityType, options)
-  return `${pre}#${type}#v#`
+  return `${pre}#${type}#v#${itemPart(options)}`
 }
 
 /**
- * Compose the deleted key prefix for `begins_with` queries.
+ * Compose the deleted key prefix for `begins_with` queries — of one item's
+ * tombstones with `item`, of the partition's without.
  *
- * Format: `$<schema>#v<version>#<entityType>#deleted#`
+ * Format: `$<schema>#v<version>#<entityType>#deleted#[<item>#]`
  */
 export const composeDeletedKeyPrefix = (
   schema: DynamoSchema,
   entityType: string,
-  options?: { readonly casing?: Casing | undefined } | undefined,
+  options?: HistoryKeyOptions | undefined,
 ): string => {
   const { pre, label: type } = resolveKeyPrefix(schema, entityType, options)
-  return `${pre}#${type}#deleted#`
+  return `${pre}#${type}#deleted#${itemPart(options)}`
 }
 
 /**

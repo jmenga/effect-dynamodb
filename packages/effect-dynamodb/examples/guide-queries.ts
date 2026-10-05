@@ -404,8 +404,7 @@ const program = Effect.gen(function* () {
 
   // #region consistent-scan
   // Consistent read on scan (applies to any BoundQuery against the base table).
-  // Note: DynamoDB GSIs do not support consistent reads — only the base table
-  // and local secondary indexes do.
+  // Note: DynamoDB reads a GSI only eventually consistently.
   const consistentScan = yield* tasks.scan().consistentRead().collect()
   // #endregion
   yield* Console.log(`Consistent scan: ${consistentScan.length} tasks\n`)

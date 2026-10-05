@@ -7,11 +7,12 @@ import {
   DynamoError,
   type RefNotFound,
 } from "@effect-dynamodb/schema/Errors.js"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Fiber, Layer, Schema } from "effect"
+import { TestClock } from "effect/testing"
 import { beforeEach, vi } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Entity from "../src/Entity.js"
-import { toAttributeMap } from "../src/Marshaller.js"
+import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
@@ -1381,100 +1382,105 @@ describe("Aggregate write path", () => {
       },
     })
 
+    // Mock ref hydration via batchGetItem — Batch.get groups by table
+    const mockRefs = () => {
+      const refItems: Record<string, Record<string, unknown>> = {
+        venue: {
+          pk: "$myapp#v1#venue#venueid_v-1",
+          sk: "$myapp#v1#venue",
+          __edd_e__: "Venue",
+          venueId: "v-1",
+          name: "MCG",
+          city: "Melbourne",
+        },
+        "team-aus": {
+          pk: "$myapp#v1#team#teamid_t-aus",
+          sk: "$myapp#v1#team",
+          __edd_e__: "Team",
+          teamId: "t-aus",
+          name: "Australia",
+          country: "Australia",
+        },
+        "team-ind": {
+          pk: "$myapp#v1#team#teamid_t-ind",
+          sk: "$myapp#v1#team",
+          __edd_e__: "Team",
+          teamId: "t-ind",
+          name: "India",
+          country: "India",
+        },
+        "coach-1": {
+          pk: "$myapp#v1#coach#coachid_c-1",
+          sk: "$myapp#v1#coach",
+          __edd_e__: "Coach",
+          coachId: "c-1",
+          name: "Andrew McDonald",
+        },
+        "coach-2": {
+          pk: "$myapp#v1#coach#coachid_c-2",
+          sk: "$myapp#v1#coach",
+          __edd_e__: "Coach",
+          coachId: "c-2",
+          name: "Gautam Gambhir",
+        },
+        "player-smith": {
+          pk: "$myapp#v1#player#playerid_p-smith",
+          sk: "$myapp#v1#player",
+          __edd_e__: "Player",
+          playerId: "p-smith",
+          displayName: "Steve Smith",
+          role: "batter",
+        },
+        "player-kohli": {
+          pk: "$myapp#v1#player#playerid_p-kohli",
+          sk: "$myapp#v1#player",
+          __edd_e__: "Player",
+          playerId: "p-kohli",
+          displayName: "Virat Kohli",
+          role: "batter",
+        },
+      }
+      mockBatchGetItem.mockImplementation((input: Record<string, unknown>) => {
+        const requestItems = input.RequestItems as Record<
+          string,
+          { Keys: Array<Record<string, { S?: string }>> }
+        >
+        const responses: Record<string, Array<Record<string, unknown>>> = {}
+        for (const [tableName, { Keys }] of Object.entries(requestItems)) {
+          responses[tableName] = Keys.map((key) => {
+            const pk = key.pk?.S ?? ""
+            const match = Object.values(refItems).find((item) => item.pk === pk)
+            return match ? toAttributeMap(match) : undefined
+          }).filter(Boolean) as Array<Record<string, unknown>>
+        }
+        return Promise.resolve({ Responses: responses })
+      })
+    }
+
+    const matchInput = {
+      id: "match-1",
+      name: "AUS vs IND",
+      venueId: "v-1",
+      team1: {
+        teamId: "t-aus",
+        coachId: "c-1",
+        homeTeam: true,
+        players: [{ playerId: "p-smith", battingPosition: 1, isCaptain: true }],
+      },
+      team2: {
+        teamId: "t-ind",
+        coachId: "c-2",
+        homeTeam: false,
+        players: [{ playerId: "p-kohli", battingPosition: 1, isCaptain: true }],
+      },
+    }
+
     it.effect("writes sub-aggregates as separate transaction groups", () =>
       Effect.gen(function* () {
-        // Mock ref hydration via batchGetItem — Batch.get groups by table
-        const refItems: Record<string, Record<string, unknown>> = {
-          venue: {
-            pk: "$myapp#v1#venue#venueid_v-1",
-            sk: "$myapp#v1#venue",
-            __edd_e__: "Venue",
-            venueId: "v-1",
-            name: "MCG",
-            city: "Melbourne",
-          },
-          "team-aus": {
-            pk: "$myapp#v1#team#teamid_t-aus",
-            sk: "$myapp#v1#team",
-            __edd_e__: "Team",
-            teamId: "t-aus",
-            name: "Australia",
-            country: "Australia",
-          },
-          "team-ind": {
-            pk: "$myapp#v1#team#teamid_t-ind",
-            sk: "$myapp#v1#team",
-            __edd_e__: "Team",
-            teamId: "t-ind",
-            name: "India",
-            country: "India",
-          },
-          "coach-1": {
-            pk: "$myapp#v1#coach#coachid_c-1",
-            sk: "$myapp#v1#coach",
-            __edd_e__: "Coach",
-            coachId: "c-1",
-            name: "Andrew McDonald",
-          },
-          "coach-2": {
-            pk: "$myapp#v1#coach#coachid_c-2",
-            sk: "$myapp#v1#coach",
-            __edd_e__: "Coach",
-            coachId: "c-2",
-            name: "Gautam Gambhir",
-          },
-          "player-smith": {
-            pk: "$myapp#v1#player#playerid_p-smith",
-            sk: "$myapp#v1#player",
-            __edd_e__: "Player",
-            playerId: "p-smith",
-            displayName: "Steve Smith",
-            role: "batter",
-          },
-          "player-kohli": {
-            pk: "$myapp#v1#player#playerid_p-kohli",
-            sk: "$myapp#v1#player",
-            __edd_e__: "Player",
-            playerId: "p-kohli",
-            displayName: "Virat Kohli",
-            role: "batter",
-          },
-        }
-        mockBatchGetItem.mockImplementation((input: Record<string, unknown>) => {
-          const requestItems = input.RequestItems as Record<
-            string,
-            { Keys: Array<Record<string, { S?: string }>> }
-          >
-          const responses: Record<string, Array<Record<string, unknown>>> = {}
-          for (const [tableName, { Keys }] of Object.entries(requestItems)) {
-            responses[tableName] = Keys.map((key) => {
-              const pk = key.pk?.S ?? ""
-              const match = Object.values(refItems).find((item) => item.pk === pk)
-              return match ? toAttributeMap(match) : undefined
-            }).filter(Boolean) as Array<Record<string, unknown>>
-          }
-          return Promise.resolve({ Responses: responses })
-        })
-
+        mockRefs()
         mockTransactWrite.mockResolvedValue({})
 
-        const result = yield* MatchAggregate.create({
-          id: "match-1",
-          name: "AUS vs IND",
-          venueId: "v-1",
-          team1: {
-            teamId: "t-aus",
-            coachId: "c-1",
-            homeTeam: true,
-            players: [{ playerId: "p-smith", battingPosition: 1, isCaptain: true }],
-          },
-          team2: {
-            teamId: "t-ind",
-            coachId: "c-2",
-            homeTeam: false,
-            players: [{ playerId: "p-kohli", battingPosition: 1, isCaptain: true }],
-          },
-        })
+        const result = yield* MatchAggregate.create(matchInput)
 
         // Verify the assembled domain object
         expect(result.id).toBe("match-1")
@@ -1487,6 +1493,66 @@ describe("Aggregate write path", () => {
 
         // Should produce 3 transaction groups: root, team1, team2
         expect(mockTransactWrite).toHaveBeenCalledTimes(3)
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("guards the root item alone, in the first transaction (#134)", () =>
+      Effect.gen(function* () {
+        mockRefs()
+        mockTransactWrite.mockResolvedValue({})
+        yield* MatchAggregate.create(matchInput)
+        const calls = mockTransactWrite.mock.calls.map(
+          (call) => call[0].TransactItems as Array<{ Put: Record<string, any> }>,
+        )
+        const [root, ...rest] = calls[0]!
+        expect(fromAttributeMap(root!.Put.Item)).toMatchObject({
+          __edd_e__: "MatchItem",
+          sk: "$myapp#v1#matchitem",
+        })
+        expect(root!.Put.ConditionExpression).toBe("attribute_not_exists(#pk)")
+        expect(root!.Put.ExpressionAttributeNames).toEqual({ "#pk": "pk" })
+        expect(root!.Put.ExpressionAttributeValues).toBeUndefined()
+        // Edges and sub-aggregate rows carry no guard of their own.
+        for (const item of [...rest, ...calls.slice(1).flat()]) {
+          expect(item.Put.ConditionExpression).toBeUndefined()
+        }
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect(
+      "an existing root fails create with ConditionalCheckFailed, before any other write (#134)",
+      () =>
+        Effect.gen(function* () {
+          mockRefs()
+          mockTransactWrite.mockRejectedValueOnce(
+            Object.assign(new Error("cancelled"), {
+              name: "TransactionCanceledException",
+              CancellationReasons: [{ Code: "ConditionalCheckFailed" }, { Code: "None" }],
+            }),
+          )
+          mockTransactWrite.mockResolvedValue({})
+          const error = yield* MatchAggregate.create(matchInput).pipe(Effect.flip)
+          expect(error._tag).toBe("ConditionalCheckFailed")
+          expect(error).toMatchObject({
+            entityType: "MatchItem",
+            key: { pk: "$myapp#v1#match#match-1", sk: "$myapp#v1#matchitem" },
+          })
+          expect(mockTransactWrite).toHaveBeenCalledTimes(1)
+        }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("a later group's cancellation stays TransactionCancelled (#134)", () =>
+      Effect.gen(function* () {
+        mockRefs()
+        mockTransactWrite.mockResolvedValueOnce({})
+        mockTransactWrite.mockRejectedValueOnce(
+          Object.assign(new Error("cancelled"), {
+            name: "TransactionCanceledException",
+            CancellationReasons: [{ Code: "ConditionalCheckFailed" }],
+          }),
+        )
+        const error = yield* MatchAggregate.create(matchInput).pipe(Effect.flip)
+        expect(error._tag).toBe("TransactionCancelled")
       }).pipe(Effect.provide(WriteLayer)),
     )
   })
@@ -1536,6 +1602,65 @@ describe("Aggregate write path", () => {
         const call = mockBatchWrite.mock.calls[0]![0]
         expect(call.RequestItems["test-table"]).toHaveLength(1)
         expect(call.RequestItems["test-table"][0].DeleteRequest).toBeDefined()
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    const articleRow = toAttributeMap({
+      pk: "$myapp#v1#article#a-1",
+      sk: "$myapp#v1#articleitem",
+      lsi1sk: "$myapp#v1#article",
+      __edd_e__: "ArticleItem",
+      articleId: "a-1",
+      title: "Test",
+      author: "Alice",
+      tags: [],
+    })
+    const stillUnprocessed = {
+      UnprocessedItems: {
+        "test-table": [{ DeleteRequest: { Key: { pk: articleRow.pk, sk: articleRow.sk } } }],
+      },
+    }
+
+    it.effect("retries unprocessed deletes with backoff until they are written (#134)", () =>
+      Effect.gen(function* () {
+        const secondRow = { ...articleRow, sk: { S: "$myapp#v1#articleitem#2" } }
+        mockWriteQuery.mockResolvedValueOnce({ Items: [articleRow, secondRow] })
+        mockBatchWrite
+          .mockResolvedValueOnce(stillUnprocessed)
+          .mockResolvedValueOnce(stillUnprocessed)
+          .mockResolvedValueOnce({})
+        const fiber = yield* SimpleAggregate.delete({ articleId: "a-1" }).pipe(Effect.forkChild)
+        yield* TestClock.adjust("50 millis")
+        // The retry waits for its backoff.
+        expect(mockBatchWrite).toHaveBeenCalledTimes(1)
+        expect(mockBatchWrite.mock.calls[0]![0].RequestItems["test-table"]).toHaveLength(2)
+        yield* TestClock.adjust("10 seconds")
+        yield* Fiber.join(fiber)
+        expect(mockBatchWrite).toHaveBeenCalledTimes(3)
+        // Each retry resends only what was left unprocessed.
+        for (const call of mockBatchWrite.mock.calls.slice(1)) {
+          expect(call[0].RequestItems["test-table"]).toEqual(
+            stillUnprocessed.UnprocessedItems["test-table"],
+          )
+        }
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("fails clearly when deletes stay unprocessed (#134)", () =>
+      Effect.gen(function* () {
+        mockWriteQuery.mockResolvedValueOnce({ Items: [articleRow] })
+        mockBatchWrite.mockResolvedValue(stillUnprocessed)
+        const fiber = yield* SimpleAggregate.delete({ articleId: "a-1" }).pipe(
+          Effect.flip,
+          Effect.forkChild,
+        )
+        yield* TestClock.adjust("60 seconds")
+        const error = yield* Fiber.join(fiber)
+        expect(error._tag).toBe("DynamoError")
+        expect(String((error as { readonly cause?: unknown }).cause)).toContain("unprocessed")
+        // The first attempt and a bounded number of retries.
+        expect(mockBatchWrite.mock.calls.length).toBeGreaterThan(1)
+        expect(mockBatchWrite).toHaveBeenCalledTimes(6)
       }).pipe(Effect.provide(WriteLayer)),
     )
 
@@ -3477,6 +3602,29 @@ describe("Aggregate write path", () => {
     // Filtering `results.data` afterwards breaks `limit` (a short page) AND the
     // cursor (which resumes after the last aggregate RETURNED, not the last one
     // KEPT). `filterBy` runs inside the accumulate loop instead.
+
+    it.effect("a list filter follows the empty-part rules (#134)", () =>
+      Effect.gen(function* () {
+        for (const refused of [
+          (_: any, o: any) => o.or(),
+          (t: any, o: any) => o.or(o.eq(t.author, "Alice"), o.and()),
+          (_: any, o: any) => o.not(o.and()),
+          (t: any, o: any) => o.isIn(t.author, []),
+        ]) {
+          const error = yield* ListAggregate.list(undefined, { filter: refused }).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+        }
+        expect(mockListQuery).not.toHaveBeenCalled()
+        // An empty part directly under and is left out; a whole empty filter is none.
+        mockListQuery.mockResolvedValue({ Items: [] })
+        yield* ListAggregate.list(undefined, {
+          filter: (t: any, o: any) => o.and(o.eq(t.author, "Alice"), o.and()),
+        })
+        expect(mockListQuery.mock.calls[0]![0].FilterExpression).toBe("#e0 = :e1")
+        yield* ListAggregate.list(undefined, { filter: (_: any, o: any) => o.and() })
+        expect(mockListQuery.mock.calls[1]![0].FilterExpression).toBeUndefined()
+      }).pipe(Effect.provide(ListLayer)),
+    )
 
     it.effect("filterBy fills the page with ACCEPTED aggregates", () =>
       Effect.gen(function* () {

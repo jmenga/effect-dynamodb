@@ -74,12 +74,17 @@ yield* Console.log("Soft-deleted alice")
 4. **Optional TTL is set** for automatic purge by DynamoDB
 5. **Item stays in the same partition** (same pk) — co-located with version history
 
+The soft delete, and a hard delete of an entity with unique constraints or `retain`, are guarded against a concurrent update: if the item changed after it was read, the delete never removes the newer item. With no `.condition()` (or only `deleteIfExists`'s), it reads the item again and is retried (up to three attempts), so the tombstone or snapshot holds the newer state; if the item was deleted in between, it reports what a delete of a missing item does. With any other `.condition()`, it fails, since the condition was judged against the older read. `deleteIfExists` of a missing item fails with `ConditionalCheckFailed`. `delete(key).returnValues("allOld")` returns the item the delete removed. A versioned entity checks its version. An unversioned one checks every attribute it read.
+
+**Wide items.** An unversioned delete is never refused for width. When the full guard can't fit DynamoDB's condition limits (4 KB and 300 operators, counted on the actual condition including your `.condition()`, the way DynamoDB counts them), it falls back to the strongest guard that fits: the item exists, `updatedAt` is unchanged (with timestamps), then as many attributes as fit, unique-constraint fields first. With timestamps, that detects any concurrent library update except one in the same millisecond with an identical `updatedAt`. A writer outside the library that leaves `updatedAt` alone can change unguarded attributes undetected. Without timestamps, only the guarded attributes are protected. A `.condition()` too large to fit beside the guard fails before writing with a `ValidationError` stating its size.
+
 ### Visibility After Deletion
 
 | Access Path | Sees Deleted Items? |
 |-------------|---------------------|
 | `db.entities.Employees.get(key)` | No |
 | `db.entities.Employees.byTenant(...)` | No |
+| `db.entities.Employees.primary(...)`, `.scan()` | No |
 | Collection queries | No |
 | `db.entities.Employees.deleted.get(key)` | Yes |
 | `db.entities.Employees.deleted.list(key)` | Yes (returns BoundQuery) |
@@ -125,7 +130,7 @@ When an entity has both `softDelete` and `unique` constraints, you choose what h
 
 | Policy | `preserveUnique` | On Delete | On Restore |
 |--------|-------------------|-----------|------------|
-| **Free** (default) | `false` | Remove sentinel items | Re-establish sentinels (can fail) |
+| **Free** (default) | `false` | Release the sentinel items the item owns | Re-establish sentinels (can fail) |
 | **Reserve** | `true` | Keep sentinel items | No-op (sentinels still exist) |
 
 **Free policy** — The unique values (e.g., email) become available for other entities immediately after deletion. If someone claims the email before you restore, restore fails with `UniqueConstraintViolation`.
@@ -163,7 +168,7 @@ const tenantAfterRestore = yield* db.entities.Employees.byTenant({ tenantId: "t-
 
 ### Error Handling
 
-Restore can fail if unique values were claimed while the item was deleted, or if no deleted item exists:
+Restore can fail if unique values were claimed while the item was deleted (`UniqueConstraintViolation`), if no deleted item exists or a concurrent restore won (`ItemNotFound`), or if a live item already exists under the key (`ItemNotDeleted`):
 
 ```typescript region="restore-error" example="guide-lifecycle.ts"
 // Attempting to restore a non-existent deleted item
@@ -187,7 +192,11 @@ yield* Console.log("\nPurged bob — item + version history permanently removed"
 What gets deleted:
 - The soft-deleted item
 - All version history snapshots
-- All unique constraint sentinel items
+- The unique constraint sentinel items the item owns (one another item has since claimed is left alone)
+
+Purge collects the sentinels held by the live item and by every soft-deleted copy. Each costs one consistent `GetItem` to check ownership and one conditional `DeleteItem`; the rest is removed with batch deletes, so purge is not atomic. Purge removes only rows of its own entity: another entity sharing the partition through a collection on the primary key keeps its rows. Without sort key composites, that's every row of this entity in the partition. With them, the partition holds sibling items, and purge removes only this item's rows: the item, its history and its tombstones (see [Items that share a partition](#items-that-share-a-partition)).
+
+You don't need to purge to re-create a deleted item under the same key. On a `retain` entity, a delete (hard or soft) snapshots the item's final state at its own version, in the same transaction as the delete, and the new item continues after the version history its key still holds: a `put`, `create` or `upsert` of an item deleted at version 3 creates it at version 4, with a new incarnation token, and never overwrites the earlier history. A writer still holding version 3 fails with `OptimisticLockError` instead of overwriting the new item. A soft-deleted item counts as missing here. `restore` of its tombstone while the new item is live fails with `ItemNotDeleted`; once that item is deleted too, `restore` brings back the latest one.
 
 ### Auto-Purge with TTL
 
@@ -215,6 +224,25 @@ PK: $lifecycle#v1#employee#emp-alice  SK: $lifecycle#v1#employee#v#0000003  ← 
 ```
 
 All versions share the same partition key — single-partition operations for efficient access.
+
+A hard delete of a `retain` entity reads the item and writes the delete and a snapshot of its final state (`v#0000004` above) in one transaction, guarded on the version it read. That's a `GetItem` plus a two-item `TransactWriteItems` — twice the write capacity of a plain `DeleteItem`. Deleting a missing item writes nothing.
+
+### Items that share a partition
+
+When the primary sort key has composites, several items share one partition, and each keeps its own history: its snapshot and tombstone keys carry the composite part of its sort key after the marker.
+
+```
+PK: $app#v1#line#order_o1  SK: $app#v1#line#line_a                 ← item a (v2)
+PK: $app#v1#line#order_o1  SK: $app#v1#line#line_b                 ← item b (v1)
+PK: $app#v1#line#order_o1  SK: $app#v1#line#v#line_a#0000001       ← a, snapshot v1
+PK: $app#v1#line#order_o1  SK: $app#v1#line#v#line_b#0000001       ← b, snapshot v1
+```
+
+Each item's versions start at 1, and `versions`, `getVersion`, `deleted.get`, `restore` and `purge` act on the item you name. `deleted.list` lists the partition's tombstones, every item's. An entity without sort key composites keeps the keys shown above.
+
+History an earlier release wrote for such an entity, without the item segment, stays readable. Checking for it costs one keys-only `Limit 1` query per read of an item's history (and per `create`); only if that finds some is it read in full. A row there belongs to the item whose key its stored composites compose, and `versions`, `getVersion`, `deleted.get`, `restore` (which consumes such a tombstone), `deleted.list`, `purge` and the version a re-created item continues from all read it. A version held both ways is read from the item's own row, and of two tombstones the later one is found.
+
+Snapshots and tombstones keep their entity's type, but they aren't items: a primary-key query (with or without sort key composites), a scan and a collection on the primary key leave them out, as they leave out time-series event items. A row is left out only when it is positively history: its sort key isn't the one its own stored composites compose, and it has the layout of a snapshot, a tombstone or an event. Any other row is read as before, including one an earlier release keyed differently. A `select` on such a query also reads the sort key and its composites, and a primary-key `count()` of a `retain` or soft-delete entity reads those attributes of each row to count them, at the same read capacity. `limit` is sent as `Limit` on the first request, and each later request asks for twice the last, so a long run of history costs few requests. `maxPages` bounds requests, so a capped query can return fewer items than `limit` when rows are left out.
 
 ### Querying Version History
 
@@ -253,6 +281,25 @@ versioned: { retain: true, ttl: Duration.days(90) }
 - Version numbers are integers, starting at 1
 - Updates use DynamoDB atomic counters (`SET version = version + 1`)
 - In sort keys, versions are zero-padded (`#v#0000001`) for correct lexicographic ordering
+- A `put` over an existing item continues its version, incarnation token and `createdAt`, and snapshots the item it replaces. It never restarts at 1
+- An `upsert` reads the item once, and snapshots the item it replaces
+- An item created again at the key of a deleted one continues after the highest version retained there
+
+### History Is Never Overwritten
+
+Every snapshot write checks the `v#N` row it would write. If a row is already there with a different state (another version, another incarnation, or with timestamps another `updatedAt`), the update, delete, restore or `put` fails with a `ValidationError` and writes nothing. Rewriting the same state is allowed: the first update after a `put` snapshots the same version 1 state the `put` already stored, and a restore rewrites the delete-time snapshot.
+
+A write from outside the library that changes an item without bumping its version can still be captured into the next `v#N` snapshot, because the snapshot copies the item as read.
+
+### Enabling Versioning on an Existing Table
+
+Items written before the entity was `versioned` read as version 0 on every path, and `expectedVersion(0)` addresses them. Their first versioned write conditions on no version existing, adds the incarnation token and writes version 1. Their retain snapshot is `v#0000000`, and a race on that first write is an `OptimisticLockError`. Soft delete and restore work on them.
+
+An item that has the hidden `__edd_i__` token but no version is not one of these. A versioned entity sets the token when it creates an item, so a token without a version means the version was removed outside the library. Reading it as version 0 would let the next update rewrite its history, so reads and the writes that check the version refuse it with a `ValidationError`. A query over a partition that holds one fails as a whole. Restore the version attribute to read it again, or remove the item: `purge` removes it on any entity, and on an entity without unique constraints or `retain` a plain hard delete does too, since it reads nothing and writes no history.
+
+### Updates on Retained Entities
+
+A retain update returns exactly the item it wrote, even if another writer replaced it since. If that can't be proven, it fails with `UpdateAppliedButUnreadable`. The write **was** applied, so don't retry a non-idempotent update on this error; read the item instead. With `returnValues("allOld")` the update returns the item it replaced; earlier versions returned the new item on record and unique-field updates.
 
 ## Soft Delete + Versioning
 
@@ -273,16 +320,17 @@ When multiple features are enabled, entity operations compose into DynamoDB tran
 
 | Mutation | Transaction Items |
 |----------|-------------------|
-| **Put** | Entity + version snapshot + sentinel per unique field |
-| **Update** (unique field changed) | Entity + version snapshot + delete old sentinel + put new sentinel |
+| **Put** (new item) | Entity + snapshot of the new item (v1, or the version after any history retained at its key) + sentinel per unique field |
+| **Put** (over an existing item) | Entity + snapshot of the replaced item + release old sentinel (if owned) / put new sentinel per changed unique field |
+| **Update** (unique field changed) | Entity + version snapshot + release old sentinel (if owned) + put new sentinel |
 | **Update** (no unique field change) | Entity + version snapshot |
-| **Delete** (soft, free policy) | Delete current + put deleted item + version snapshot + delete sentinels |
+| **Delete** (soft, free policy) | Delete current + put deleted item + version snapshot + release owned sentinels |
 | **Delete** (soft, reserve policy) | Delete current + put deleted item + version snapshot |
+| **Delete** (hard, retain and/or unique) | Delete current + snapshot of its final state (retain) + release owned sentinels (unique) |
 | **Restore** (free policy) | Delete deleted item + put restored item + version snapshot + put sentinels |
 | **Restore** (reserve policy) | Delete deleted item + put restored item + version snapshot |
-| **Purge** | Delete item + delete all version snapshots + delete sentinels |
 
-DynamoDB limits transactions to 100 items. Plan accordingly.
+DynamoDB limits transactions to 100 items. Plan accordingly. Purge is not a transaction: it releases each owned sentinel with its own conditional `DeleteItem`, then batch-deletes the item, its soft-deleted copies and its version snapshots.
 
 ## Complete Example
 

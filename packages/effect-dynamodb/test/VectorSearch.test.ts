@@ -40,7 +40,12 @@ import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
 import * as VectorSearchEmulation from "../src/VectorSearchEmulation.js"
-import { mockDynamoClient, mockDynamoClientLayer, mockOutput } from "./helpers/MockDynamoClient.js"
+import {
+  applyUpdate,
+  mockDynamoClient,
+  mockDynamoClientLayer,
+  mockOutput,
+} from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -1411,13 +1416,20 @@ describe("vector search lifecycle integration", () => {
       yield* db.entities.LifecycleProducts.update({ tenantId: "t-1", productId: "p-1" }).set({
         description: "Now drier",
       })
-      const puts = transactPuts(capture)
-      // Index 0 is the live item; index 1 is the pre-update snapshot.
-      const snapshot = puts[1]!
+      // The live item is a guarded Update (#133); the Put is the pre-update snapshot.
+      const snapshot = transactPuts(capture)[0]!
       expect(snapshot.sk).toEqual({ S: "$app#v1#lcproduct#v#0000003" })
       expect(snapshot[VECTOR_ATTR]).toBeUndefined()
       expect(snapshot[PARTITION_ATTR]).toBeUndefined()
-      expect(puts[0]![VECTOR_ATTR]).toBeDefined()
+      const live = applyUpdate(
+        lifecycleStoredItem,
+        (
+          capture.transactWriteItems!.TransactItems![0] as {
+            Update: Parameters<typeof applyUpdate>[1]
+          }
+        ).Update,
+      )!
+      expect(live[VECTOR_ATTR]).toBeDefined()
     }).pipe(Effect.provide(makeLifecycleLayer(capture)))
   })
 

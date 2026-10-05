@@ -36,7 +36,7 @@ yield* db.entities.Products.update({ productId: "p-1" }).subtract({ stock: 3 })
 
 ### Appending to Lists
 
-Appends elements to the end of a list attribute using `list_append`:
+Appends elements to the end of a list attribute using `list_append`. Each element is encoded through the list's element schema, so a list of dates stores its wire form:
 
 ```typescript region="append" example="guide-advanced.ts"
   // #region append
@@ -161,7 +161,7 @@ When using `condition()` on an update that also has `Entity.expectedVersion()`, 
 
 ### Handling ConditionalCheckFailed
 
-`ConditionalCheckFailed` is on the typed error channel wherever it is reachable: on `create()`, `patch()`, `upsert()` and `deleteIfExists()` (which carry a built-in condition), and on any operation once `.condition(...)` is applied. Either way, `Effect.catchTag` handles it without widening by hand:
+`ConditionalCheckFailed` is on the typed error channel wherever it is reachable: on `create()`, `patch()` and `deleteIfExists()` (which carry a built-in condition), on `upsert()`, and on any operation once `.condition(...)` is applied. Either way, `Effect.catchTag` handles it without widening by hand:
 
 ```typescript region="handle-conditional" example="guide-advanced.ts"
   // #region handle-conditional

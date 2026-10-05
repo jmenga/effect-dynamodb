@@ -9,11 +9,11 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import { Effect, Function, Option, Pipeable, Stream } from "effect"
-import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
-import { compileExpr, type Expr } from "./internal/Expr.js"
+import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
+import { compileExpr, type Expr, ExprTag, emptyPartProblem, isEmptyExpr } from "./internal/Expr.js"
 import { compilePath } from "./internal/PathBuilder.js"
 import { fromAttributeMap, toAttributeValue } from "./Marshaller.js"
 
@@ -62,6 +62,11 @@ interface QueryState {
   readonly maxPagesValue: number | undefined
   readonly scanForward: boolean
   readonly consistentRead: boolean
+  /**
+   * The index is a GSI, which DynamoDB only reads eventually consistently:
+   * `consistentRead` is refused before sending (#133).
+   */
+  readonly globalIndex: boolean
   readonly ignoreOwnershipFlag: boolean
   readonly exclusiveStartKey: Record<string, AttributeValue> | undefined
   readonly isScan: boolean
@@ -76,6 +81,45 @@ interface QueryState {
    * request over-reads and the surplus is discarded (see {@link limit}).
    */
   readonly keyFields: ReadonlyArray<string> | undefined
+  /**
+   * Which rows are items (#133). An entity's version snapshots, soft-delete
+   * tombstones and time-series events keep its `__edd_e__`, so the ownership
+   * filter alone admits them to a query of the table's primary key, or a
+   * scan. Rows that fail it are dropped as they arrive, before they are
+   * decoded or counted — see {@link isExcludedRow}. (Client-side for scans
+   * too: a `FilterExpression` saves no read capacity, and no expression
+   * tells a live row from history as exactly.)
+   */
+  readonly liveRows: LiveRows | undefined
+  /**
+   * Run once at the start of each terminal, against the resolved table: may
+   * swap the sort key `begins_with` operand and add a row filter (`keep`)
+   * applied, like {@link liveRows}, to rows before they are decoded.
+   * An entity's `versions` uses it to read history written by an earlier
+   * release alongside its own (#133).
+   */
+  readonly prepare: QueryPrepare | undefined
+  /** @internal Set by {@link prepare}: rows outside it are dropped before decode. */
+  readonly keepRow: ((row: Record<string, AttributeValue>) => boolean) | undefined
+}
+
+/** @internal See {@link QueryState.prepare}. */
+export type QueryPrepare = (tableName: string) => Effect.Effect<
+  {
+    /** Replace a `begins_with` sort key condition on `from` with one on `to`. */
+    readonly replaceBeginsWith?: { readonly from: string; readonly to: string } | undefined
+    readonly keep?: ((row: Record<string, AttributeValue>) => boolean) | undefined
+  },
+  DynamoClientError,
+  DynamoClient
+>
+
+/** @internal See {@link QueryState.liveRows}. */
+export interface LiveRows {
+  /** Whether a raw row is an item, rather than an entity's history. */
+  readonly isLive: (row: Record<string, AttributeValue>) => boolean
+  /** The attributes `isLive` reads — kept in a request that projects. */
+  readonly reads: ReadonlyArray<string>
 }
 
 /** @internal Dedupe + drop absent entries from a caller-supplied key field list. */
@@ -139,11 +183,20 @@ export const make = <A>(config: {
   readonly skField: string | undefined
   readonly entityTypes: ReadonlyArray<string>
   readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<A, ValidationError>
+  /** `indexName` names a GSI (see {@link QueryState.globalIndex}). */
+  readonly globalIndex?: boolean | undefined
   readonly resolveTableName?: Effect.Effect<string, never, any> | undefined
   /** Index key + table key attribute names (used to rebuild cursors). */
   readonly keyFields?: ReadonlyArray<string | undefined> | undefined
+  /** Which rows are items (see {@link QueryState.liveRows}). */
+  readonly liveRows?: LiveRows | undefined
+  /** See {@link QueryState.prepare}. */
+  readonly prepare?: QueryPrepare | undefined
 }): Query<A> =>
   new QueryImpl<A>({
+    liveRows: config.liveRows,
+    prepare: config.prepare,
+    keepRow: undefined,
     tableName: config.tableName,
     indexName: config.indexName,
     pkField: config.pkField,
@@ -158,6 +211,7 @@ export const make = <A>(config: {
     maxPagesValue: undefined,
     scanForward: true,
     consistentRead: false,
+    globalIndex: config.globalIndex ?? false,
     ignoreOwnershipFlag: false,
     exclusiveStartKey: undefined,
     isScan: false,
@@ -180,11 +234,20 @@ export const makeScan = <A>(config: {
   readonly indexName: string | undefined
   readonly entityTypes: ReadonlyArray<string>
   readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<A, ValidationError>
+  /** `indexName` names a GSI (see {@link QueryState.globalIndex}). */
+  readonly globalIndex?: boolean | undefined
   readonly resolveTableName?: Effect.Effect<string, never, any> | undefined
   /** Index key + table key attribute names (used to rebuild cursors). */
   readonly keyFields?: ReadonlyArray<string | undefined> | undefined
+  /** Which rows are items (see {@link QueryState.liveRows}). */
+  readonly liveRows?: LiveRows | undefined
+  /** See {@link QueryState.prepare}. */
+  readonly prepare?: QueryPrepare | undefined
 }): Query<A> =>
   new QueryImpl<A>({
+    liveRows: config.liveRows,
+    prepare: config.prepare,
+    keepRow: undefined,
     tableName: config.tableName,
     indexName: config.indexName,
     pkField: "",
@@ -199,6 +262,7 @@ export const makeScan = <A>(config: {
     maxPagesValue: undefined,
     scanForward: true,
     consistentRead: false,
+    globalIndex: config.globalIndex ?? false,
     ignoreOwnershipFlag: false,
     exclusiveStartKey: undefined,
     isScan: true,
@@ -293,7 +357,9 @@ export const reverse = <A>(self: Query<A>): Query<A> =>
   })
 
 /**
- * Enable consistent reads for this query (or scan).
+ * Enable consistent reads for this query (or scan). Refused with a
+ * `ValidationError` when it runs on a global secondary index, which DynamoDB
+ * reads only eventually consistently.
  */
 export const consistentRead: {
   (): <A>(self: Query<A>) => Query<A>
@@ -377,6 +443,54 @@ export const select: {
 )
 
 /**
+ * @internal A projection of stored attribute paths, decoded by `decode`: what
+ * `select` becomes when the names a caller asks for are not the names stored
+ * (#133). Always numbered placeholders (`#proj0`), whatever characters the
+ * stored names hold.
+ */
+export const selectProjected = <A>(
+  self: Query<A>,
+  storedPaths: ReadonlyArray<ReadonlyArray<string | number>>,
+  decode: (raw: Record<string, unknown>) => unknown,
+): Query<Record<string, unknown>> => {
+  if (self._state.predicates.length > 0) {
+    throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
+  }
+  return new QueryImpl<Record<string, unknown>>({
+    ...self._state,
+    projection: undefined,
+    projectionPaths: storedPaths,
+    decoder: (raw) => Effect.succeed(decode(raw) as Record<string, unknown>),
+  })
+}
+
+/**
+ * @internal `select` / `selectPaths` of DOMAIN field names on an entity that
+ * stores some under other names (`DynamoModel.configure(..., { field })`): the
+ * projection names the stored attributes, and each item is handed back keyed
+ * by the domain names asked for (#133).
+ */
+export const selectRenamed = <A>(
+  self: Query<A>,
+  paths: ReadonlyArray<ReadonlyArray<string | number>>,
+  resolveDbName: (domainName: string) => string,
+): Query<Record<string, unknown>> => {
+  const heads = [...new Set(paths.map((path) => String(path[0])))]
+  return selectProjected(
+    self,
+    paths.map((path) => [resolveDbName(String(path[0])), ...path.slice(1)]),
+    (raw) => {
+      const item: Record<string, unknown> = {}
+      for (const head of heads) {
+        const value = raw[resolveDbName(head)]
+        if (value !== undefined) item[head] = value
+      }
+      return item
+    },
+  )
+}
+
+/**
  * Add an Expr-based filter expression to the query.
  * Multiple filterExpr calls are ANDed together.
  */
@@ -384,11 +498,12 @@ export const filterExpr: {
   (expr: Expr): <A>(self: Query<A>) => Query<A>
   <A>(self: Query<A>, expr: Expr): Query<A>
 } = Function.dual(2, <A>(self: Query<A>, expr: Expr): Query<A> => {
-  // An empty shorthand (`.filter({})`) parses to an empty `and`, which
-  // compiles to the empty string — and `FilterExpression: ""` is rejected by
-  // DynamoDB. A predicate over no attributes is a no-op, so drop it here
-  // rather than emitting an unusable request.
-  if ((expr._tag === "and" || expr._tag === "or") && expr.exprs.length === 0) return self
+  // A filter that asserts nothing (`.filter({})`, `and()`) is no filter: it is
+  // dropped here, never sent as `FilterExpression: ""`, which DynamoDB
+  // rejects (#133). An empty part anywhere else — under `or` or `not`, or an
+  // `or()` with no parts — is kept, and refused when the query runs
+  // (`emptyPartProblem`).
+  if (isEmptyExpr(expr)) return self
   return new QueryImpl<A>({
     ...self._state,
     exprFilters: [...self._state.exprFilters, expr],
@@ -510,10 +625,20 @@ const buildFilterClauses = (state: QueryState) => {
     })
   }
 
-  // Expr-based filters (compiled from Entity.filter() callback/shorthand API)
-  for (const expr of state.exprFilters) {
-    const compiled = compileExpr(expr)
-    filterClauses.push(compiled.expression)
+  // Expr-based filters (compiled from Entity.filter() callback/shorthand API).
+  // Compiled as ONE expression: each compile numbers its placeholders from
+  // zero, so two compiled apart both wrote `#e0` and the second overwrote the
+  // first's name (#133).
+  if (state.exprFilters.length > 0) {
+    const compiled = compileExpr(
+      state.exprFilters.length === 1
+        ? state.exprFilters[0]!
+        : ({ [ExprTag]: ExprTag, _tag: "and", exprs: state.exprFilters } as Expr),
+    )
+    // Parenthesised beside the ownership clause: a top-level `OR` would
+    // otherwise bind looser than the `AND` and admit other entities' rows
+    // (`#eddE IN (:et0) AND a OR b`).
+    filterClauses.push(filterClauses.length > 0 ? `(${compiled.expression})` : compiled.expression)
     Object.assign(names, compiled.names)
     Object.assign(values, compiled.values)
   }
@@ -651,6 +776,9 @@ const buildDynamoCommand = (
 // Internal: limit / pageSize execution helpers
 // ---------------------------------------------------------------------------
 
+/** The largest `Limit` a growing request asks for: DynamoDB stops at 1 MB anyway. */
+const MAX_GROWN_LIMIT = 100_000
+
 /**
  * @internal DynamoDB `Limit` for the next request.
  *
@@ -664,15 +792,107 @@ const buildDynamoCommand = (
  *   `pageSize` — or, unset, a natural (1 MB) page.
  * - A client-side predicate ({@link filterBy}) rejects rows even later, after
  *   decode, so it disqualifies the budget for exactly the same reason.
+ * - Rows dropped as history ({@link QueryState.liveRows}, a prepared `keep`)
+ *   are not: they can't be skipped server-side, and a run of them (an item's
+ *   versions, its tombstones) can far outnumber the items. The first request
+ *   asks for `limit`, and each later one twice the last — so a run of `n`
+ *   history rows costs about `log2(n / limit)` requests, not `n / limit` — and
+ *   the surplus past `limit` is discarded, the cursor rebuilt from the last
+ *   item returned (#133). `pageSize`, when set, is used as is.
+ *
+ * `page` is the request's 1-based number within the terminal.
  */
 const computeRequestLimit = (
   state: QueryState,
   remaining: number | undefined,
+  page = 1,
 ): number | undefined => {
   const pageSize = state.pageSizeValue
   if (remaining === undefined) return pageSize
   if (state.exprFilters.length > 0 || state.predicates.length > 0) return pageSize
+  if (dropsRows(state)) {
+    if (pageSize !== undefined) return pageSize
+    const limit = state.limitValue ?? remaining
+    return Math.min(limit * 2 ** (page - 1), MAX_GROWN_LIMIT)
+  }
   return pageSize === undefined ? remaining : Math.min(pageSize, remaining)
+}
+
+/**
+ * @internal Whether the query drops rows client-side (#133): like a predicate,
+ * it rejects rows after they are read, so the `limit` budget cannot be handed
+ * to DynamoDB, and a count has to read the rows.
+ */
+const dropsRows = (state: QueryState): boolean =>
+  state.keepRow !== undefined || state.liveRows !== undefined
+
+/** @internal Is this raw row one the query leaves out (#133)? */
+const isExcludedRow = (state: QueryState, row: Record<string, AttributeValue>): boolean =>
+  (state.keepRow !== undefined && !state.keepRow(row)) ||
+  (state.liveRows !== undefined && !state.liveRows.isLive(row))
+
+/**
+ * @internal A filter with an empty part where none may be (`emptyPartProblem`):
+ * the `ValidationError` every path that builds a request fails with, before
+ * `compileExpr` — which throws on one — ever sees it (#133).
+ */
+const refuseEmptyFilterParts = (state: QueryState): ValidationError | undefined => {
+  for (const filter of state.exprFilters) {
+    const problem = emptyPartProblem(filter)
+    if (problem !== undefined) {
+      return new ValidationError({
+        entityType: state.entityTypes.join(", ") || "unknown",
+        operation: "query.filter",
+        cause: `filter: ${problem} Nothing was sent.`,
+      })
+    }
+  }
+  return undefined
+}
+
+/**
+ * @internal The state a terminal runs: {@link QueryState.prepare} applied
+ * against the resolved table.
+ */
+const prepared = (
+  state: QueryState,
+  tableName: string,
+): Effect.Effect<QueryState, DynamoClientError | ValidationError, DynamoClient> => {
+  // A consistent read of a GSI — which DynamoDB only reads eventually
+  // consistently — is refused before anything is sent (#133).
+  if (state.consistentRead && state.globalIndex) {
+    return Effect.fail(
+      new ValidationError({
+        entityType: state.entityTypes.join(", ") || "unknown",
+        operation: "query.consistentRead",
+        cause:
+          `consistentRead: index "${state.indexName}" is a global secondary index, which ` +
+          "DynamoDB reads only eventually consistently. Nothing was sent.",
+      }),
+    )
+  }
+  // A filter with an empty part where none may be is refused before
+  // anything is sent (#133).
+  const filterRefusal = refuseEmptyFilterParts(state)
+  if (filterRefusal !== undefined) return Effect.fail(filterRefusal)
+  return state.prepare === undefined
+    ? Effect.succeed(state)
+    : Effect.map(state.prepare(tableName), (prep) => {
+        const swap = prep.replaceBeginsWith
+        return {
+          ...state,
+          prepare: undefined,
+          keepRow: prep.keep,
+          skConditions:
+            swap === undefined
+              ? state.skConditions
+              : state.skConditions.map((c) =>
+                  "beginsWith" in c.condition && c.condition.beginsWith === swap.from
+                    ? { ...c, condition: { beginsWith: swap.to } }
+                    : c,
+                ),
+        }
+      })
 }
 
 /** @internal Does the decoded item pass every client-side predicate? */
@@ -718,14 +938,23 @@ const cursorFromItem = (
  * over-reading request can still rebuild an accurate cursor. They are stripped
  * from the items handed back, so the caller sees exactly what it selected.
  */
-const cursorProjectionFields = (state: QueryState): ReadonlyArray<string> => {
-  if (state.limitValue === undefined || !state.keyFields) return []
+const cursorProjectionFields = (
+  state: QueryState,
+  /** Whether the terminal rebuilds a cursor (`execute`); `paginate` doesn't. */
+  forCursor: boolean,
+): ReadonlyArray<string> => {
   const projected = new Set<string>([
     ...(state.projection ?? []),
     ...(state.projectionPaths ?? []).map((segments) => String(segments[0])),
   ])
   if (projected.size === 0) return []
-  return state.keyFields.filter((field) => !projected.has(field))
+  const borrowed = new Set<string>(
+    !forCursor || state.limitValue === undefined || !state.keyFields ? [] : state.keyFields,
+  )
+  // A query that drops rows reads what it judges them by (#133).
+  if (state.keepRow !== undefined && state.skField !== undefined) borrowed.add(state.skField)
+  for (const attr of state.liveRows?.reads ?? []) borrowed.add(attr)
+  return [...borrowed].filter((field) => !projected.has(field))
 }
 
 // ---------------------------------------------------------------------------
@@ -782,8 +1011,10 @@ export const execute = <A>(
 ): Effect.Effect<Page<A>, DynamoClientError | ValidationError, DynamoClient> =>
   Effect.gen(function* () {
     const client = yield* DynamoClient
-    const state = self._state
-    const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName
+    const tableName = self._state.resolveTableName
+      ? yield* self._state.resolveTableName
+      : self._state.tableName
+    const state = yield* prepared(self._state, tableName)
     const limitValue = state.limitValue
 
     if (limitValue !== undefined && limitValue <= 0) {
@@ -792,8 +1023,8 @@ export const execute = <A>(
 
     // Key attributes borrowed into an active projection so an over-reading
     // request can still rebuild a cursor. Stripped again before decoding.
-    const borrowedFields = cursorProjectionFields(state)
-    const hasPredicate = state.predicates.length > 0
+    const borrowedFields = cursorProjectionFields(state, true)
+    const hasPredicate = state.predicates.length > 0 || dropsRows(state)
 
     const items: Array<A> = []
     let startKey = state.exclusiveStartKey
@@ -806,7 +1037,7 @@ export const execute = <A>(
       const cmd = buildDynamoCommand(
         state,
         tableName,
-        { ExclusiveStartKey: startKey, Limit: computeRequestLimit(state, remaining) },
+        { ExclusiveStartKey: startKey, Limit: computeRequestLimit(state, remaining, pageCount) },
         borrowedFields,
       )
       const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
@@ -825,6 +1056,7 @@ export const execute = <A>(
       /** Index of the last row examined when the limit was reached, else -1. */
       let stoppedAt = -1
       for (let i = 0; i < take; i++) {
+        if (isExcludedRow(state, returned[i]!)) continue
         const raw = fromAttributeMap(returned[i]!)
         for (const field of borrowedFields) delete raw[field]
         const item = yield* state.decoder(raw) as Effect.Effect<A, ValidationError>
@@ -887,71 +1119,98 @@ const paginateInternal = <A>(
 > =>
   Effect.gen(function* () {
     const client = yield* DynamoClient
-    const state = self._state
-    const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName
-
-    const limitValue = state.limitValue
-    if (limitValue !== undefined && limitValue <= 0) {
-      return Stream.empty as Stream.Stream<Array<A>, DynamoClientError | ValidationError>
-    }
-
-    // Cursor state travels through Stream.paginate rather than a closure, so
-    // re-running the returned stream restarts from the beginning.
-    interface PageState {
-      readonly key: Record<string, AttributeValue> | undefined
-      readonly pageCount: number
-      readonly emitted: number
-    }
-
-    return Stream.paginate(
-      {
-        key: state.exclusiveStartKey as Record<string, AttributeValue> | undefined,
-        pageCount: 0,
-        emitted: 0,
-      } as PageState,
-      (pageState: PageState) =>
-        Effect.gen(function* () {
-          const pageCount = pageState.pageCount + 1
-          const remaining = limitValue === undefined ? undefined : limitValue - pageState.emitted
-          const cmd = buildDynamoCommand(state, tableName, {
-            ExclusiveStartKey: pageState.key,
-            Limit: computeRequestLimit(state, remaining),
-          })
-          const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
-
-          const returned = (result.Items ?? []) as Array<Record<string, AttributeValue>>
-          // See `execute` — a client predicate rejects rows after decode, so
-          // the budget cannot bound the examine window, only the accepted one.
-          const hasPredicate = state.predicates.length > 0
-          const take =
-            remaining === undefined || hasPredicate
-              ? returned.length
-              : Math.min(remaining, returned.length)
-          const examined = yield* Effect.forEach(
-            returned.slice(0, take).map((item) => fromAttributeMap(item)),
-            (raw) => state.decoder(raw) as Effect.Effect<A, ValidationError>,
-          )
-          const kept = hasPredicate ? examined.filter((item) => accepts(state, item)) : examined
-          const decoded = remaining === undefined ? kept : kept.slice(0, remaining)
-
-          const emitted = pageState.emitted + decoded.length
-          const hasMorePages = result.LastEvaluatedKey != null
-          const maxPagesReached = state.maxPagesValue != null && pageCount >= state.maxPagesValue
-          const limitReached = limitValue !== undefined && emitted >= limitValue
-
-          const nextState =
-            hasMorePages && !maxPagesReached && !limitReached
-              ? Option.some({
-                  key: result.LastEvaluatedKey as Record<string, AttributeValue>,
-                  pageCount,
-                  emitted,
-                } as PageState)
-              : Option.none()
-
-          return [[decoded], nextState] as const
-        }),
+    const tableName = self._state.resolveTableName
+      ? yield* self._state.resolveTableName
+      : self._state.tableName
+    // Prepared when the stream runs, so a failure is the stream's.
+    return Stream.unwrap(
+      prepared(self._state, tableName).pipe(
+        Effect.provideService(DynamoClient, client),
+        Effect.map((state) => pageStream<A>(client, tableName, state)),
+      ),
     )
   })
+
+const pageStream = <A>(
+  client: DynamoClientService,
+  tableName: string,
+  state: QueryState,
+): Stream.Stream<Array<A>, DynamoClientError | ValidationError> => {
+  const limitValue = state.limitValue
+  if (limitValue !== undefined && limitValue <= 0) {
+    return Stream.empty as Stream.Stream<Array<A>, DynamoClientError | ValidationError>
+  }
+
+  // Cursor state travels through Stream.paginate rather than a closure, so
+  // re-running the returned stream restarts from the beginning.
+  interface PageState {
+    readonly key: Record<string, AttributeValue> | undefined
+    readonly pageCount: number
+    readonly emitted: number
+  }
+
+  return Stream.paginate(
+    {
+      key: state.exclusiveStartKey as Record<string, AttributeValue> | undefined,
+      pageCount: 0,
+      emitted: 0,
+    } as PageState,
+    (pageState: PageState) =>
+      Effect.gen(function* () {
+        const pageCount = pageState.pageCount + 1
+        const remaining = limitValue === undefined ? undefined : limitValue - pageState.emitted
+        const borrowedFields = cursorProjectionFields(state, false)
+        const cmd = buildDynamoCommand(
+          state,
+          tableName,
+          {
+            ExclusiveStartKey: pageState.key,
+            Limit: computeRequestLimit(state, remaining, pageCount),
+          },
+          borrowedFields,
+        )
+        const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
+
+        const returned = (result.Items ?? []) as Array<Record<string, AttributeValue>>
+        // See `execute` — a client predicate rejects rows after decode, so
+        // the budget cannot bound the examine window, only the accepted one.
+        const hasPredicate = state.predicates.length > 0 || dropsRows(state)
+        const take =
+          remaining === undefined || hasPredicate
+            ? returned.length
+            : Math.min(remaining, returned.length)
+        const examined = yield* Effect.forEach(
+          returned
+            .slice(0, take)
+            .filter((item) => !isExcludedRow(state, item))
+            .map((item) => {
+              const raw = fromAttributeMap(item)
+              for (const field of borrowedFields) delete raw[field]
+              return raw
+            }),
+          (raw) => state.decoder(raw) as Effect.Effect<A, ValidationError>,
+        )
+        const kept = hasPredicate ? examined.filter((item) => accepts(state, item)) : examined
+        const decoded = remaining === undefined ? kept : kept.slice(0, remaining)
+
+        const emitted = pageState.emitted + decoded.length
+        const hasMorePages = result.LastEvaluatedKey != null
+        const maxPagesReached = state.maxPagesValue != null && pageCount >= state.maxPagesValue
+        const limitReached = limitValue !== undefined && emitted >= limitValue
+
+        const nextState =
+          hasMorePages && !maxPagesReached && !limitReached
+            ? Option.some({
+                key: result.LastEvaluatedKey as Record<string, AttributeValue>,
+                pageCount,
+                emitted,
+              } as PageState)
+            : Option.none()
+
+        return [[decoded], nextState] as const
+      }),
+  )
+}
 
 /**
  * Execute a count query. Uses `Select: "COUNT"` on DynamoDB — no items are returned.
@@ -967,8 +1226,10 @@ export const count = <A>(
 ): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient> =>
   Effect.gen(function* () {
     const client = yield* DynamoClient
-    const state = self._state
-    const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName
+    const tableName = self._state.resolveTableName
+      ? yield* self._state.resolveTableName
+      : self._state.tableName
+    const state = yield* prepared(self._state, tableName)
     const limitValue = state.limitValue
 
     if (limitValue !== undefined && limitValue <= 0) return 0
@@ -983,6 +1244,36 @@ export const count = <A>(
     if (state.predicates.length > 0) {
       const items = yield* collect(self)
       return items.length
+    }
+
+    // Rows that may be history are judged by a few attributes, so only those
+    // are read — never whole items (#133).
+    if (dropsRows(state)) {
+      const judged = [
+        ...new Set([
+          ...(state.liveRows?.reads ?? []),
+          ...(state.keepRow !== undefined && state.skField !== undefined ? [state.skField] : []),
+        ]),
+      ]
+      const judging: QueryState = { ...state, projection: judged, projectionPaths: undefined }
+      let counted = 0
+      let pages = 0
+      let start: Record<string, AttributeValue> | undefined
+      do {
+        pages++
+        const remaining = limitValue === undefined ? undefined : limitValue - counted
+        const cmd = buildDynamoCommand(judging, tableName, {
+          ExclusiveStartKey: start,
+          Limit: computeRequestLimit(state, remaining, pages),
+        })
+        const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
+        const rows = (result.Items ?? []) as Array<Record<string, AttributeValue>>
+        counted += rows.filter((row) => !isExcludedRow(state, row)).length
+        start = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined
+        if (limitValue !== undefined && counted >= limitValue) return limitValue
+        if (state.maxPagesValue != null && pages >= state.maxPagesValue) break
+      } while (start != null)
+      return counted
     }
 
     let total = 0
@@ -1012,10 +1303,17 @@ export const count = <A>(
 /**
  * Return the built DynamoDB command input without executing.
  * Useful for debugging, logging, or passing to DynamoClient directly.
+ * Fails with a `ValidationError` for a filter the query would refuse to send
+ * (an empty part under `or` / `not`, an `or()` with no parts, an `isIn` with
+ * no values).
  */
-export const asParams = <A>(self: Query<A>): Effect.Effect<Record<string, unknown>, never, any> =>
+export const asParams = <A>(
+  self: Query<A>,
+): Effect.Effect<Record<string, unknown>, ValidationError, any> =>
   Effect.gen(function* () {
     const state = self._state
+    const refusal = refuseEmptyFilterParts(state)
+    if (refusal !== undefined) return yield* refusal
     const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName
     return buildDynamoCommand(state, tableName)
   })

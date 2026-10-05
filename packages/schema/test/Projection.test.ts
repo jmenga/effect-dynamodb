@@ -45,4 +45,15 @@ describe("Projection", () => {
     expect(result.expression).toBe("#proj_a, #proj_b, #proj_c, #proj_d, #proj_e, #proj_f")
     expect(Object.keys(result.names)).toHaveLength(6)
   })
+
+  it("gives a name a placeholder may not hold a numbered one (#133)", () => {
+    const result = Projection.projection(["first-name", "a.b", "plain", "has space"])
+    expect(result.expression).toBe("#projn0, #projn1, #proj_plain, #projn3")
+    expect(result.names).toEqual({
+      "#projn0": "first-name",
+      "#projn1": "a.b",
+      "#proj_plain": "plain",
+      "#projn3": "has space",
+    })
+  })
 })

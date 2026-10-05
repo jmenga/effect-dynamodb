@@ -14,13 +14,17 @@
 
 import { it } from "@effect/vitest"
 import {
+  Cause,
   Config,
   Data,
   DateTime,
   Duration,
   Effect,
+  Equal,
+  Exit,
   Layer,
   Option,
+  Redacted,
   Schema,
   SchemaGetter,
   Stream,
@@ -55,7 +59,7 @@ import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Expression from "../src/Expression.js"
-import { fromAttributeMap } from "../src/Marshaller.js"
+import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
@@ -2372,6 +2376,17 @@ describeConnected("timeSeries integration tests", () => {
         deviceId: "d-1",
       }).collect()
       expect(history).toHaveLength(3)
+
+      // Event items keep the entity's type, but they are not items: a query of
+      // the partition and a scan return the current item only.
+      const key = { channel: "c-seq", deviceId: "d-1" }
+      const current = yield* db.entities.Telemetries.primary(key).collect()
+      expect(current.map((t) => DateTime.formatIso(t.timestamp))).toEqual([
+        "2026-04-22T10:10:00.000Z",
+      ])
+      expect(yield* db.entities.Telemetries.primary(key).count()).toBe(1)
+      const scanned = yield* db.entities.Telemetries.scan().filter({ channel: "c-seq" }).collect()
+      expect(scanned).toHaveLength(1)
     }).pipe(provideTs),
   )
 
@@ -8181,6 +8196,56 @@ describeConnected("EventStore — additionalItems + idempotency (closes #85)", (
     }).pipe(provideEsIdem),
   )
 
+  it.effect("keeps a versioned read model in step across appends (#133)", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { EsStatusProjection },
+        tables: { EsIdemTable },
+      })
+      const client = yield* DynamoClient
+      const stored = () =>
+        client
+          .getItem({
+            TableName: esIdemTableName,
+            Key: {
+              pk: { S: "$es-idem#v1#esstatus#matchid_proj-3" },
+              sk: { S: "$es-idem#v1#esstatus" },
+            },
+            ConsistentRead: true,
+          })
+          .pipe(Effect.map((r) => fromAttributeMap(r.Item!) as Record<string, any>))
+
+      yield* EsIdemMatchEvents.append(
+        { matchId: "proj-3" },
+        [new EsIdemMatchStarted({ venue: "Eden Park" })],
+        0,
+        {
+          additionalItems: [
+            db.entities.EsStatusProjection.put({ matchId: "proj-3", state: "IN_PROGRESS" }),
+          ],
+        },
+      )
+      const first = yield* stored()
+      // The second append replaces the existing versioned row — no condition
+      // was set, so nothing may fail as one.
+      yield* EsIdemMatchEvents.append(
+        { matchId: "proj-3" },
+        [new EsIdemInningsCompleted({ innings: 1, runs: 250 })],
+        1,
+        {
+          additionalItems: [
+            db.entities.EsStatusProjection.put({ matchId: "proj-3", state: "INNINGS_BREAK" }),
+          ],
+        },
+      )
+      const second = yield* stored()
+      expect([second.state, second.version]).toEqual(["INNINGS_BREAK", 2])
+      expect(second.createdAt).toBe(first.createdAt)
+      expect(second.__edd_i__).toBe(first.__edd_i__)
+      expect(yield* EsIdemMatchEvents.read({ matchId: "proj-3" })).toHaveLength(2)
+    }).pipe(provideEsIdem),
+  )
+
   it.effect("Transaction.transactWrite accepts bound builders from a pure entity (#100)", () =>
     Effect.gen(function* () {
       const db = yield* DynamoClient.make({
@@ -9856,6 +9921,29 @@ describeConnected("composite key form — mixed-width ordering", () => {
 
         // Both are readable through the decode path.
         expect((yield* db.entities.KfRenameds.get({ rid: "r2" })).label).toBe("viaTransact")
+      }).pipe(provideKf),
+    )
+
+    it.effect("select and filter on a renamed field use its stored name (#133)", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: kfEntities, tables: kfTables })
+        yield* db.entities.KfRenameds.put({ rid: "rs1", label: "renamed" })
+        const q = () => db.entities.KfRenameds.primary({ rid: "rs1" })
+        expect(yield* q().select(["label"]).collect()).toEqual([{ label: "renamed" }])
+        expect(
+          yield* q()
+            .select((t) => [t.label])
+            .collect(),
+        ).toEqual([{ label: "renamed" }])
+        expect((yield* q().filter({ label: "renamed" }).collect()).map((r) => r.rid)).toEqual([
+          "rs1",
+        ])
+        expect(
+          (yield* q()
+            .filter((t, { eq }) => eq(t.label, "renamed"))
+            .collect()).map((r) => r.rid),
+        ).toEqual(["rs1"])
+        expect(yield* q().filter({ label: "other" }).collect()).toEqual([])
       }).pipe(provideKf),
     )
 
@@ -12306,5 +12394,5812 @@ describeConnected("index-level casing", () => {
       expect(moved.map((d) => d.deviceId)).toEqual(["d-3"])
       expect(yield* db.entities.IcDevices.byOwner({ ownerId: "own-c" }).collect()).toEqual([])
     }).pipe(provideIc),
+  )
+})
+
+// ===========================================================================
+// #133 — aggregate DateTimes nested in containers are stored in wire form
+// ===========================================================================
+//
+// The downstream `Match` shape from #133, trimmed to its date-bearing paths:
+// a root array of a date transform, a root array of a class with dates, a ref
+// in a root `many` element (declared `sk.composite`), and a ref in a `many`
+// element of a sub-aggregate bound twice. Entity models are configured wrappers
+// with an identifier rename, and `dateOfBirth` carries a decoding default.
+//
+// Before #133 every one of those nested dates was stored as a marshalled
+// `{ epochMilliseconds, "~effect/DateTime", _tag }` map, which effect 4.0.0
+// either rejects (rc-era maps) or reads back as a plain object (4.0.0-era
+// maps). The ref element field is exercised both as the plain entity class
+// (matched by field name) and `DynamoModel.ref`-annotated — the latter could not
+// read back even a fresh write.
+
+const I133PersonFields = {
+  id: Schema.String,
+  name: Schema.String,
+  dateOfBirth: Schema.DateTimeUtcFromString.pipe(
+    Schema.withDecodingDefault(Effect.succeed("1800-01-01")),
+  ),
+}
+class I133Team extends Schema.Class<I133Team>("I133Team")({
+  id: Schema.String,
+  name: Schema.String,
+}) {}
+class I133Coach extends Schema.Class<I133Coach>("I133Coach")({ ...I133PersonFields }) {}
+class I133Player extends Schema.Class<I133Player>("I133Player")({ ...I133PersonFields }) {}
+class I133Umpire extends Schema.Class<I133Umpire>("I133Umpire")({ ...I133PersonFields }) {}
+
+const i133PkSk = {
+  pk: { field: "pk", composite: ["id"] },
+  sk: { field: "sk", composite: [] },
+} as const
+const I133Teams = Entity.make({
+  model: DynamoModel.configure(I133Team, { id: { field: "teamId", identifier: true } }),
+  entityType: "Team",
+  primaryKey: i133PkSk,
+})
+const I133Coaches = Entity.make({
+  model: DynamoModel.configure(I133Coach, { id: { field: "coachId", identifier: true } }),
+  entityType: "Coach",
+  primaryKey: i133PkSk,
+})
+const I133Players = Entity.make({
+  model: DynamoModel.configure(I133Player, { id: { field: "playerId", identifier: true } }),
+  entityType: "Player",
+  primaryKey: i133PkSk,
+})
+const I133Umpires = Entity.make({
+  model: DynamoModel.configure(I133Umpire, { id: { field: "umpireId", identifier: true } }),
+  entityType: "Umpire",
+  primaryKey: i133PkSk,
+})
+
+class I133Session extends Schema.Class<I133Session>("I133Session")({
+  number: Schema.Number,
+  startTime: Schema.DateTimeUtcFromString,
+  finishTime: Schema.optionalKey(Schema.DateTimeUtcFromString),
+}) {}
+
+const I133Schema = DynamoSchema.make({ name: "issue133", version: 1 })
+const I133Table = Table.make({
+  schema: I133Schema,
+  entities: { I133Teams, I133Coaches, I133Players, I133Umpires },
+})
+
+const makeI133Match = (kind: "plain" | "ref") => {
+  const playerField = kind === "plain" ? I133Player : I133Player.pipe(DynamoModel.ref)
+  const umpireField = kind === "plain" ? I133Umpire : I133Umpire.pipe(DynamoModel.ref)
+  class PlayerSheet extends Schema.Class<PlayerSheet>(`I133PlayerSheet-${kind}`)({
+    player: playerField as typeof I133Player,
+    isCaptain: Schema.optionalKey(Schema.Boolean),
+  }) {}
+  class TeamSheet extends Schema.Class<TeamSheet>(`I133TeamSheet-${kind}`)({
+    team: I133Team,
+    coach: I133Coach,
+    homeTeam: Schema.Boolean,
+    players: Schema.Array(PlayerSheet),
+  }) {}
+  class UmpireSheet extends Schema.Class<UmpireSheet>(`I133UmpireSheet-${kind}`)({
+    umpire: umpireField as typeof I133Umpire,
+    role: Schema.Literals(["onfield", "third"]),
+  }) {}
+  class Match extends Schema.Class<Match>(`I133Match-${kind}`)({
+    id: Schema.String,
+    name: Schema.String,
+    startDate: Schema.DateTimeUtcFromString,
+    matchDays: Schema.optionalKey(Schema.Array(Schema.DateTimeUtcFromString)),
+    sessions: Schema.optionalKey(Schema.Array(I133Session)),
+    team1: TeamSheet,
+    team2: TeamSheet,
+    umpires: Schema.optionalKey(Schema.Array(UmpireSheet)),
+  }) {}
+  const TeamSheetAggregate = Aggregate.make(TeamSheet, {
+    root: { entityType: "MatchTeam" },
+    edges: {
+      team: Aggregate.ref(I133Teams),
+      coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: I133Coaches }),
+      players: Aggregate.many("players", { entityType: "MatchPlayer", entity: I133Players }),
+    },
+  })
+  return Aggregate.make(Match, {
+    table: I133Table,
+    schema: I133Schema,
+    pk: { field: "pk", composite: ["id"] },
+    collection: { name: `match${kind}` }, // no index: whole-partition read on the base table
+    root: { entityType: "MatchItem" },
+    edges: {
+      team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
+      team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
+      umpires: Aggregate.many("umpires", {
+        entityType: "MatchUmpire",
+        entity: I133Umpires,
+        sk: { composite: ["role", "umpire.id"] },
+      }),
+    },
+  })
+}
+
+const i133TableName = `issue133-${Date.now()}`
+const I133TestLayer = Layer.mergeAll(ClientLayer, I133Table.layer({ name: i133TableName }))
+const provideI133 = Effect.provide(I133TestLayer)
+
+const I133_DOB = "2000-01-01T00:00:00.000Z"
+const I133_DOB_MS = 946684800000
+const I133_DAY2 = "2000-01-02T00:00:00.000Z"
+
+const i133LegacyMap = (typeIdKey: string) => (ms: number) => ({
+  M: {
+    epochMilliseconds: { N: String(ms) },
+    [typeIdKey]: { S: typeIdKey },
+    _tag: { S: "Utc" },
+  },
+})
+const i133LegacyForms = [
+  ["rc-era map", i133LegacyMap("~effect/time/DateTime")],
+  ["4.0.0-era map", i133LegacyMap("~effect/DateTime")],
+] as const
+
+/** A real `DateTime.Utc` for `ms`, not a plain object that duck-types as one. */
+const i133IsRealUtc = (value: unknown, ms: number) =>
+  DateTime.isDateTime(value) &&
+  Object.getPrototypeOf(value) !== Object.prototype &&
+  Equal.equals(value, DateTime.makeUnsafe(ms))
+
+class I133Slot extends Schema.Class<I133Slot>("I133Slot")({ at: Schema.DateTimeUtcFromString }) {}
+class I133Holder extends Schema.Class<I133Holder>("I133Holder")({
+  id: Schema.String,
+  nullSelf: Schema.NullOr(Schema.DateTimeUtc),
+  arrNullSelf: Schema.Array(Schema.NullOr(Schema.DateTimeUtc)),
+  rec: Schema.Record(Schema.String, Schema.DateTimeUtcFromString),
+  tup: Schema.Tuple([Schema.String, Schema.DateTimeUtcFromString]),
+  either: Schema.Union([I133Slot, Schema.String]),
+  mixed: Schema.Union([Schema.DateTimeUtcFromString, Schema.Number]),
+  // A many edge whose element IS a DynamoModel.ref-annotated entity class.
+  players: Schema.Array(I133Player.pipe(DynamoModel.ref)),
+}) {}
+const I133HolderAggregate = Aggregate.make(I133Holder, {
+  table: I133Table,
+  schema: I133Schema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "holder" },
+  root: { entityType: "HolderItem" },
+  edges: {
+    players: Aggregate.many("players", { entityType: "HolderPlayer", entity: I133Players }),
+  },
+})
+
+describeConnected("#133 — aggregate DateTimes nested in containers", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { I133Teams, I133Coaches, I133Players, I133Umpires },
+          tables: { I133Table },
+        })
+        yield* db.tables.I133Table.create()
+        const dob = DateTime.makeUnsafe(I133_DOB)
+        yield* db.entities.I133Teams.put({ id: "team-1", name: "Team One" })
+        yield* db.entities.I133Teams.put({ id: "team-2", name: "Team Two" })
+        yield* db.entities.I133Coaches.put({ id: "coach-1", name: "Coach One", dateOfBirth: dob })
+        yield* db.entities.I133Coaches.put({ id: "coach-2", name: "Coach Two", dateOfBirth: dob })
+        yield* db.entities.I133Players.put({ id: "player-1", name: "Player One", dateOfBirth: dob })
+        yield* db.entities.I133Players.put({ id: "player-2", name: "Player Two", dateOfBirth: dob })
+        yield* db.entities.I133Umpires.put({ id: "umpire-1", name: "Umpire One", dateOfBirth: dob })
+      }).pipe(provideI133, Effect.scoped),
+    )
+  }, 30000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: i133TableName })
+      }).pipe(
+        provideI133,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 30000)
+
+  it.effect("Union / Record / Tuple containers and an annotated-ref many edge round-trip", () =>
+    Effect.gen(function* () {
+      const dt = DateTime.makeUnsafe(I133_DOB_MS)
+      yield* I133HolderAggregate.create({
+        id: "h1",
+        nullSelf: dt,
+        arrNullSelf: [dt, null],
+        rec: { a: I133_DOB },
+        tup: ["x", I133_DOB],
+        either: { at: I133_DOB },
+        mixed: 5,
+        players: ["player-1"],
+      } as any)
+
+      const client = yield* DynamoClient
+      const { Items = [] } = yield* client.query({
+        TableName: i133TableName,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: "$issue133#v1#holder#h1" } },
+        ConsistentRead: true,
+      })
+      const root = Items.find((i) => i.__edd_e__?.S === "HolderItem")!
+      const player = Items.find((i) => i.__edd_e__?.S === "HolderPlayer")!
+      expect({
+        nullSelf: root.nullSelf,
+        arrNullSelf: root.arrNullSelf,
+        rec: root.rec,
+        tup: root.tup,
+        either: root.either,
+        mixed: root.mixed,
+        dob: player.dateOfBirth,
+      }).toEqual({
+        nullSelf: { S: I133_DOB },
+        arrNullSelf: { L: [{ S: I133_DOB }, { NULL: true }] },
+        rec: { M: { a: { S: I133_DOB } } },
+        tup: { L: [{ S: "x" }, { S: I133_DOB }] },
+        either: { M: { at: { S: I133_DOB } } },
+        mixed: { N: "5" },
+        dob: { S: I133_DOB },
+      })
+
+      // A legacy map in the annotated-ref element reads back as a real DateTime.
+      yield* client.updateItem({
+        TableName: i133TableName,
+        Key: { pk: player.pk!, sk: player.sk! },
+        UpdateExpression: "SET #d = :v",
+        ExpressionAttributeNames: { "#d": "dateOfBirth" },
+        ExpressionAttributeValues: { ":v": i133LegacyMap("~effect/DateTime")(I133_DOB_MS) as any },
+      })
+
+      const got = (yield* I133HolderAggregate.get({ id: "h1" } as any)) as any
+      expect(i133IsRealUtc(got.nullSelf, I133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.arrNullSelf[0], I133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.rec.a, I133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.tup[1], I133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.either.at, I133_DOB_MS)).toBe(true)
+      expect(got.mixed).toBe(5)
+      expect(i133IsRealUtc(got.players[0].dateOfBirth, I133_DOB_MS)).toBe(true)
+
+      // A no-op update and a mutating one both succeed.
+      yield* I133HolderAggregate.update({ id: "h1" } as any, (c: any) => c.state)
+      const updated = (yield* I133HolderAggregate.update({ id: "h1" } as any, (c: any) => ({
+        ...c.state,
+        nullSelf: null,
+        mixed: DateTime.makeUnsafe(I133_DOB_MS),
+      }))) as any
+      expect(updated.nullSelf).toBe(null)
+      const after = (yield* I133HolderAggregate.get({ id: "h1" } as any)) as any
+      expect(i133IsRealUtc(after.mixed, I133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(after.players[0].dateOfBirth, I133_DOB_MS)).toBe(true)
+    }).pipe(provideI133),
+  )
+
+  for (const kind of ["plain", "ref"] as const) {
+    const MatchAggregate = makeI133Match(kind)
+    const createMatch = (id: string) =>
+      MatchAggregate.create({
+        id,
+        name: "Match",
+        startDate: I133_DOB,
+        matchDays: [I133_DOB, I133_DAY2],
+        sessions: [{ number: 1, startTime: I133_DOB }],
+        team1: {
+          teamId: "team-1",
+          coachId: "coach-1",
+          homeTeam: true,
+          players: [{ playerId: "player-1" }],
+        },
+        team2: {
+          teamId: "team-2",
+          coachId: "coach-2",
+          homeTeam: false,
+          players: [{ playerId: "player-2" }],
+        },
+        umpires: [{ umpireId: "umpire-1", role: "onfield" }],
+      })
+    const getMatch = (id: string) =>
+      MatchAggregate.get({ id } as any) as Effect.Effect<any, unknown, any>
+
+    /** Raw items of one match partition. */
+    const rawItems = (id: string) =>
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        const { Items = [] } = yield* client.query({
+          TableName: i133TableName,
+          KeyConditionExpression: "#pk = :pk",
+          ExpressionAttributeNames: { "#pk": "pk" },
+          ExpressionAttributeValues: { ":pk": { S: `$issue133#v1#match${kind}#${id}` } },
+          ConsistentRead: true,
+        })
+        return Items as ReadonlyArray<Record<string, any>>
+      })
+    const first = (items: ReadonlyArray<Record<string, any>>, entityType: string) =>
+      items.find((item) => item.__edd_e__?.S === entityType)!
+
+    /** Overwrite one nested attribute of a stored item with a legacy map. */
+    const overwrite = (
+      item: Record<string, any>,
+      path: string,
+      names: Record<string, string>,
+      value: unknown,
+    ) =>
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.updateItem({
+          TableName: i133TableName,
+          Key: { pk: item.pk, sk: item.sk },
+          UpdateExpression: `SET ${path} = :v`,
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: { ":v": value as any },
+        })
+      })
+
+    const label = kind === "plain" ? "plain class element" : "DynamoModel.ref element"
+
+    it.effect(`${label}: stores every date leaf in wire form (S)`, () =>
+      Effect.gen(function* () {
+        yield* createMatch("w1")
+        const items = yield* rawItems("w1")
+        const root = first(items, "MatchItem")
+        const stored = {
+          "MatchItem.startDate": root.startDate,
+          "MatchItem.matchDays": root.matchDays,
+          "MatchItem.sessions[0].startTime": root.sessions?.L?.[0]?.M?.startTime,
+          "MatchPlayer.player.dateOfBirth": first(items, "MatchPlayer").player?.M?.dateOfBirth,
+          "MatchUmpire.umpire.dateOfBirth": first(items, "MatchUmpire").umpire?.M?.dateOfBirth,
+          "MatchCoach.dateOfBirth": first(items, "MatchCoach").dateOfBirth,
+        }
+        expect(stored).toEqual({
+          "MatchItem.startDate": { S: I133_DOB },
+          "MatchItem.matchDays": { L: [{ S: I133_DOB }, { S: I133_DAY2 }] },
+          "MatchItem.sessions[0].startTime": { S: I133_DOB },
+          "MatchPlayer.player.dateOfBirth": { S: I133_DOB },
+          "MatchUmpire.umpire.dateOfBirth": { S: I133_DOB },
+          "MatchCoach.dateOfBirth": { S: I133_DOB },
+        })
+        // The declared sk composite still keys the umpire row on its id.
+        expect(first(items, "MatchUmpire").sk.S).toBe("$issue133#v1#matchumpire#onfield#umpire-1")
+      }).pipe(provideI133),
+    )
+
+    it.effect(`${label}: reads a fresh write back as real DateTime.Utc instances`, () =>
+      Effect.gen(function* () {
+        yield* createMatch("w2")
+        const got = yield* getMatch("w2")
+        expect({
+          startDate: i133IsRealUtc(got.startDate, I133_DOB_MS),
+          "matchDays[0]": i133IsRealUtc(got.matchDays?.[0], I133_DOB_MS),
+          "sessions[0].startTime": i133IsRealUtc(got.sessions?.[0]?.startTime, I133_DOB_MS),
+          "team1.players[0].player.dateOfBirth": i133IsRealUtc(
+            got.team1.players[0]?.player.dateOfBirth,
+            I133_DOB_MS,
+          ),
+          "team2.players[0].player.dateOfBirth": i133IsRealUtc(
+            got.team2.players[0]?.player.dateOfBirth,
+            I133_DOB_MS,
+          ),
+          "umpires[0].umpire.dateOfBirth": i133IsRealUtc(
+            got.umpires?.[0]?.umpire.dateOfBirth,
+            I133_DOB_MS,
+          ),
+          "team1.coach.dateOfBirth": i133IsRealUtc(got.team1.coach.dateOfBirth, I133_DOB_MS),
+        }).toEqual({
+          startDate: true,
+          "matchDays[0]": true,
+          "sessions[0].startTime": true,
+          "team1.players[0].player.dateOfBirth": true,
+          "team2.players[0].player.dateOfBirth": true,
+          "umpires[0].umpire.dateOfBirth": true,
+          "team1.coach.dateOfBirth": true,
+        })
+      }).pipe(provideI133),
+    )
+
+    for (const [formName, form] of i133LegacyForms) {
+      const id = (n: number) => `${formName.startsWith("rc") ? "rc" : "v4"}${n}`
+
+      it.effect(`${label}: reads a stored ${formName} in MatchItem.matchDays[]`, () =>
+        Effect.gen(function* () {
+          yield* createMatch(id(3))
+          const root = first(yield* rawItems(id(3)), "MatchItem")
+          yield* overwrite(root, "#a[0]", { "#a": "matchDays" }, form(I133_DOB_MS))
+          const got = yield* getMatch(id(3))
+          expect(i133IsRealUtc(got.matchDays?.[0], I133_DOB_MS)).toBe(true)
+        }).pipe(provideI133),
+      )
+
+      it.effect(`${label}: reads a stored ${formName} in MatchItem.sessions[].startTime`, () =>
+        Effect.gen(function* () {
+          yield* createMatch(id(4))
+          const root = first(yield* rawItems(id(4)), "MatchItem")
+          yield* overwrite(
+            root,
+            "#a[0].#b",
+            { "#a": "sessions", "#b": "startTime" },
+            form(I133_DOB_MS),
+          )
+          const got = yield* getMatch(id(4))
+          expect(i133IsRealUtc(got.sessions?.[0]?.startTime, I133_DOB_MS)).toBe(true)
+        }).pipe(provideI133),
+      )
+
+      it.effect(`${label}: reads a stored ${formName} in MatchPlayer.player.dateOfBirth`, () =>
+        Effect.gen(function* () {
+          yield* createMatch(id(5))
+          const player = first(yield* rawItems(id(5)), "MatchPlayer")
+          yield* overwrite(
+            player,
+            "#a.#b",
+            { "#a": "player", "#b": "dateOfBirth" },
+            form(I133_DOB_MS),
+          )
+          const got = yield* getMatch(id(5))
+          for (const sheet of [...got.team1.players, ...got.team2.players]) {
+            expect(i133IsRealUtc(sheet.player.dateOfBirth, I133_DOB_MS)).toBe(true)
+          }
+        }).pipe(provideI133),
+      )
+
+      it.effect(`${label}: reads a stored ${formName} in MatchUmpire.umpire.dateOfBirth`, () =>
+        Effect.gen(function* () {
+          yield* createMatch(id(6))
+          const umpire = first(yield* rawItems(id(6)), "MatchUmpire")
+          yield* overwrite(
+            umpire,
+            "#a.#b",
+            { "#a": "umpire", "#b": "dateOfBirth" },
+            form(I133_DOB_MS),
+          )
+          const got = yield* getMatch(id(6))
+          expect(i133IsRealUtc(got.umpires?.[0]?.umpire.dateOfBirth, I133_DOB_MS)).toBe(true)
+        }).pipe(provideI133),
+      )
+    }
+
+    it.effect(`${label}: update over a legacy root row rewrites it in wire form`, () =>
+      Effect.gen(function* () {
+        yield* createMatch("u1")
+        const root = first(yield* rawItems("u1"), "MatchItem")
+        yield* overwrite(
+          root,
+          "#a[0]",
+          { "#a": "matchDays" },
+          i133LegacyMap("~effect/time/DateTime")(I133_DOB_MS),
+        )
+        const updated = yield* MatchAggregate.update({ id: "u1" } as any, (c: any) => ({
+          ...c.state,
+          name: "Renamed",
+        }))
+        expect((updated as any).name).toBe("Renamed")
+        const after = first(yield* rawItems("u1"), "MatchItem")
+        expect(after.matchDays).toEqual({ L: [{ S: I133_DOB }, { S: I133_DAY2 }] })
+        const got = yield* getMatch("u1")
+        expect(i133IsRealUtc(got.matchDays?.[0], I133_DOB_MS)).toBe(true)
+        expect(i133IsRealUtc(got.team1.players[0]?.player.dateOfBirth, I133_DOB_MS)).toBe(true)
+      }).pipe(provideI133),
+    )
+  }
+})
+
+// ===========================================================================
+// #133 — entity self dates nested in Union / Record / Tuple containers
+// ===========================================================================
+//
+// An entity substitutes self dates (`Schema.DateTimeUtc`, `storedAs(...)`) with
+// a transform to their wire primitive, but the substitution stopped at a Union,
+// a Record or a Tuple, so those fields stored the marshalled `DateTime` itself.
+// Path-based update values were never encoded at all.
+
+class E133Stamp extends Schema.Class<E133Stamp>("E133Stamp")({ at: Schema.DateTimeUtc }) {}
+class E133Event extends Schema.Class<E133Event>("E133Event")({
+  eventId: Schema.String.pipe(DynamoModel.identifier),
+  venue: Schema.String,
+  nullAt: Schema.NullOr(Schema.DateTimeUtc),
+  nullMs: Schema.NullOr(Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs))),
+  stamp: Schema.NullOr(E133Stamp),
+  rec: Schema.Record(Schema.String, Schema.DateTimeUtc),
+  tup: Schema.Tuple([Schema.String, Schema.DateTimeUtc]),
+  arrNull: Schema.Array(Schema.NullOr(Schema.DateTimeUtc)),
+  days: Schema.Array(Schema.DateTimeUtc),
+}) {}
+class E133Note extends Schema.Class<E133Note>("E133Note")({
+  noteId: Schema.String,
+  venue: Schema.String,
+  event: E133Event.pipe(DynamoModel.ref),
+}) {}
+
+const E133Schema = DynamoSchema.make({ name: "edd133e", version: 1 })
+const E133Events = Entity.make({
+  model: E133Event,
+  entityType: "E133Event",
+  primaryKey: {
+    pk: { field: "pk", composite: ["eventId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byVenue: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["venue"] },
+      sk: { field: "gsi1sk", composite: ["eventId"] },
+      collection: "e133venue",
+    },
+  },
+})
+const E133Notes = Entity.make({
+  model: E133Note,
+  entityType: "E133Note",
+  primaryKey: {
+    pk: { field: "pk", composite: ["noteId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byVenue: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["venue"] },
+      sk: { field: "gsi1sk", composite: ["noteId"] },
+      collection: "e133venue",
+    },
+  },
+  refs: { event: { entity: E133Events } },
+})
+const E133Table = Table.make({ schema: E133Schema, entities: { E133Events, E133Notes } })
+const e133TableName = `edd133e-${Date.now()}`
+const provideE133 = Effect.provide(
+  Layer.mergeAll(ClientLayer, E133Table.layer({ name: e133TableName })),
+)
+const e133Client = DynamoClient.make({
+  entities: { E133Events, E133Notes },
+  tables: { E133Table },
+})
+
+const E133_DOB = "2000-01-01T00:00:00.000Z"
+const E133_DOB_MS = 946684800000
+const E133_LATER = "2000-01-01T00:00:01.000Z"
+const E133_LATER_MS = E133_DOB_MS + 1000
+const e133Dt = DateTime.makeUnsafe(E133_DOB_MS)
+const e133Later = DateTime.makeUnsafe(E133_LATER_MS)
+
+const e133Raw = (pk: string) =>
+  Effect.gen(function* () {
+    const client = yield* DynamoClient
+    const { Item } = yield* client.getItem({
+      TableName: e133TableName,
+      Key: { pk: { S: pk }, sk: { S: "$edd133e#v1#e133event" } },
+      ConsistentRead: true,
+    })
+    return Item as Record<string, any>
+  })
+
+const e133Event = (eventId: string) => ({
+  eventId,
+  venue: "mcg",
+  nullAt: e133Dt,
+  nullMs: e133Dt,
+  stamp: new E133Stamp({ at: e133Dt }),
+  rec: { a: e133Dt },
+  tup: ["x", e133Dt] as const,
+  arrNull: [e133Dt, null],
+  days: [e133Dt],
+})
+
+describeConnected("#133 — entity self dates nested in containers", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* e133Client
+        yield* db.tables.E133Table.create()
+      }).pipe(provideE133, Effect.scoped),
+    )
+  }, 30000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: e133TableName })
+      }).pipe(
+        provideE133,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 30000)
+
+  it.effect("stores wire form, reads real instances, and keeps keys", () =>
+    Effect.gen(function* () {
+      const db = yield* e133Client
+      yield* db.entities.E133Events.put(e133Event("ev1") as any)
+      const item = yield* e133Raw("$edd133e#v1#e133event#eventid_ev1")
+      expect({
+        nullAt: item.nullAt,
+        nullMs: item.nullMs,
+        stamp: item.stamp,
+        rec: item.rec,
+        tup: item.tup,
+        arrNull: item.arrNull,
+        gsi1pk: item.gsi1pk,
+        gsi1sk: item.gsi1sk,
+      }).toEqual({
+        nullAt: { S: E133_DOB },
+        nullMs: { N: String(E133_DOB_MS) },
+        stamp: { M: { at: { S: E133_DOB } } },
+        rec: { M: { a: { S: E133_DOB } } },
+        tup: { L: [{ S: "x" }, { S: E133_DOB }] },
+        arrNull: { L: [{ S: E133_DOB }, { NULL: true }] },
+        gsi1pk: { S: "$edd133e#v1#e133venue#venue_mcg" },
+        gsi1sk: { S: "$edd133e#v1#e133event_1#eventid_ev1" },
+      })
+
+      const got = (yield* db.entities.E133Events.get({ eventId: "ev1" })) as any
+      expect(i133IsRealUtc(got.nullAt, E133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.nullMs, E133_DOB_MS)).toBe(true)
+      expect(got.stamp).toBeInstanceOf(E133Stamp)
+      expect(i133IsRealUtc(got.stamp.at, E133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.rec.a, E133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.tup[1], E133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.arrNull[0], E133_DOB_MS)).toBe(true)
+    }).pipe(provideE133),
+  )
+
+  it.effect(".set() and path operations store wire form", () =>
+    Effect.gen(function* () {
+      const db = yield* e133Client
+      yield* db.entities.E133Events.put(e133Event("ev2") as any)
+      yield* db.entities.E133Events.update({ eventId: "ev2" }).set({
+        nullAt: e133Later,
+        rec: { b: e133Later },
+      } as any)
+      yield* db.entities.E133Events.update({ eventId: "ev2" })
+        .pathSet({ segments: ["stamp", "at"], value: e133Later, isPath: false })
+        .pathSet({ segments: ["days", 0], value: e133Later, isPath: false })
+        .pathAppend({ segments: ["arrNull"], value: [e133Later] })
+      const item = yield* e133Raw("$edd133e#v1#e133event#eventid_ev2")
+      expect({
+        nullAt: item.nullAt,
+        rec: item.rec,
+        stamp: item.stamp,
+        days: item.days,
+        arrNull: item.arrNull,
+      }).toEqual({
+        nullAt: { S: E133_LATER },
+        rec: { M: { b: { S: E133_LATER } } },
+        stamp: { M: { at: { S: E133_LATER } } },
+        days: { L: [{ S: E133_LATER }] },
+        arrNull: { L: [{ S: E133_DOB }, { NULL: true }, { S: E133_LATER }] },
+      })
+      const got = (yield* db.entities.E133Events.get({ eventId: "ev2" })) as any
+      expect(i133IsRealUtc(got.stamp.at, E133_LATER_MS)).toBe(true)
+      expect(i133IsRealUtc(got.arrNull[2], E133_LATER_MS)).toBe(true)
+    }).pipe(provideE133),
+  )
+
+  it.effect("reads a legacy marshalled map back as a real DateTime", () =>
+    Effect.gen(function* () {
+      const db = yield* e133Client
+      yield* db.entities.E133Events.put(e133Event("ev3") as any)
+      const client = yield* DynamoClient
+      yield* client.updateItem({
+        TableName: e133TableName,
+        Key: { pk: { S: "$edd133e#v1#e133event#eventid_ev3" }, sk: { S: "$edd133e#v1#e133event" } },
+        UpdateExpression: "SET #n = :v, #r.#a = :v",
+        ExpressionAttributeNames: { "#n": "nullAt", "#r": "rec", "#a": "a" },
+        ExpressionAttributeValues: {
+          ":v": i133LegacyMap("~effect/time/DateTime")(E133_DOB_MS) as any,
+        },
+      })
+      const got = (yield* db.entities.E133Events.get({ eventId: "ev3" })) as any
+      expect(i133IsRealUtc(got.nullAt, E133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.rec.a, E133_DOB_MS)).toBe(true)
+    }).pipe(provideE133),
+  )
+
+  it.effect("Batch, Transaction, collection and ref hydration decode real instances", () =>
+    Effect.gen(function* () {
+      const db = yield* e133Client
+      yield* Transaction.transactWrite([
+        E133Events.put(e133Event("ev4") as any),
+        E133Events.put(e133Event("ev5") as any),
+      ])
+      const [a, b] = yield* Batch.get([
+        E133Events.get({ eventId: "ev4" }),
+        E133Events.get({ eventId: "ev5" }),
+      ])
+      expect(i133IsRealUtc((a as any)?.nullAt, E133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc((b as any)?.tup[1], E133_DOB_MS)).toBe(true)
+      const [c] = yield* Transaction.transactGet([E133Events.get({ eventId: "ev4" })])
+      expect(i133IsRealUtc((c as any)?.rec.a, E133_DOB_MS)).toBe(true)
+
+      // A plain entity's ref is hydrated from the target and denormalised.
+      yield* db.entities.E133Notes.put({ noteId: "n1", venue: "mcg", eventId: "ev4" } as any)
+      const client = yield* DynamoClient
+      const { Item } = yield* client.getItem({
+        TableName: e133TableName,
+        Key: { pk: { S: "$edd133e#v1#e133note#noteid_n1" }, sk: { S: "$edd133e#v1#e133note" } },
+        ConsistentRead: true,
+      })
+      expect((Item as any).event.M.nullAt).toEqual({ S: E133_DOB })
+      expect((Item as any).event.M.rec).toEqual({ M: { a: { S: E133_DOB } } })
+      const note = (yield* db.entities.E133Notes.get({ noteId: "n1" })) as any
+      expect(i133IsRealUtc(note.event.nullAt, E133_DOB_MS)).toBe(true)
+
+      const venue = yield* db.collections.e133venue!({ venue: "mcg" }).collect()
+      const fromCollection = (venue.E133Events as Array<any>).find((e) => e.eventId === "ev4")
+      expect(i133IsRealUtc(fromCollection?.nullAt, E133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc((venue.E133Notes as Array<any>)[0]?.event.tup[1], E133_DOB_MS)).toBe(
+        true,
+      )
+    }).pipe(provideE133),
+  )
+})
+
+// ===========================================================================
+// #133 — a sub-aggregate nested inside a sub-aggregate
+// ===========================================================================
+//
+// The nested sub-aggregate's rows were written with only their own
+// discriminator, so assembly (which matches on the parent's too) found none —
+// `Missing key at ["club"]["squad"]` — and two bindings of the parent keyed
+// their inner rows identically.
+
+class N133Player extends Schema.Class<N133Player>("N133Player")({ ...I133PersonFields }) {}
+class N133Coach extends Schema.Class<N133Coach>("N133Coach")({ ...I133PersonFields }) {}
+const N133Players = Entity.make({
+  model: DynamoModel.configure(N133Player, { id: { field: "playerId", identifier: true } }),
+  entityType: "Player",
+  primaryKey: i133PkSk,
+})
+const N133Coaches = Entity.make({
+  model: DynamoModel.configure(N133Coach, { id: { field: "coachId", identifier: true } }),
+  entityType: "Coach",
+  primaryKey: i133PkSk,
+})
+class N133SquadPlayer extends Schema.Class<N133SquadPlayer>("N133SquadPlayer")({
+  player: N133Player,
+  joined: Schema.DateTimeUtcFromString,
+}) {}
+class N133Squad extends Schema.Class<N133Squad>("N133Squad")({
+  name: Schema.String,
+  players: Schema.Array(N133SquadPlayer),
+}) {}
+class N133Club extends Schema.Class<N133Club>("N133Club")({
+  name: Schema.String,
+  coach: N133Coach.pipe(DynamoModel.ref),
+  squad: N133Squad,
+}) {}
+class N133League extends Schema.Class<N133League>("N133League")({
+  id: Schema.String,
+  season: Schema.String,
+  club1: N133Club,
+  club2: N133Club,
+}) {}
+
+const N133Schema = DynamoSchema.make({ name: "edd133n", version: 1 })
+const N133Table = Table.make({ schema: N133Schema, entities: { N133Players, N133Coaches } })
+const N133SquadAggregate = Aggregate.make(N133Squad, {
+  root: { entityType: "NSquad" },
+  edges: {
+    players: Aggregate.many("players", { entityType: "NSquadPlayer", entity: N133Players }),
+  },
+})
+const N133ClubAggregate = Aggregate.make(N133Club, {
+  root: { entityType: "NClub" },
+  edges: {
+    coach: Aggregate.one("coach", { entityType: "NCoach", entity: N133Coaches }),
+    squad: N133SquadAggregate.with({ discriminator: { squadNo: 1 } }),
+  },
+})
+const N133LeagueAggregate = Aggregate.make(N133League, {
+  table: N133Table,
+  schema: N133Schema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "league" },
+  list: {
+    index: "gsi1",
+    name: "leagues",
+    pk: { field: "gsi1pk", composite: ["season"] },
+    sk: { field: "gsi1sk", composite: ["id"] },
+  },
+  root: { entityType: "NLeague" },
+  edges: {
+    club1: N133ClubAggregate.with({ discriminator: { clubNo: 1 } }),
+    club2: N133ClubAggregate.with({ discriminator: { clubNo: 2 } }),
+  },
+})
+const n133TableName = `edd133n-${Date.now()}`
+const provideN133 = Effect.provide(
+  Layer.mergeAll(ClientLayer, N133Table.layer({ name: n133TableName })),
+)
+const n133Client = DynamoClient.make({
+  entities: { N133Players, N133Coaches },
+  aggregates: { N133LeagueAggregate },
+  tables: { N133Table },
+})
+const n133League = (id: string) => ({
+  id,
+  season: "2026",
+  club1: {
+    name: "One",
+    coachId: "c1",
+    squad: { name: "A", players: [{ playerId: "p1", joined: I133_DOB }] },
+  },
+  club2: {
+    name: "Two",
+    coachId: "c2",
+    squad: { name: "B", players: [{ playerId: "p2", joined: I133_DAY2 }] },
+  },
+})
+
+describeConnected("#133 — nested sub-aggregates", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* n133Client
+        yield* db.tables.N133Table.create()
+        const dob = DateTime.makeUnsafe(I133_DOB)
+        yield* db.entities.N133Players.put({ id: "p1", name: "P1", dateOfBirth: dob })
+        yield* db.entities.N133Players.put({ id: "p2", name: "P2", dateOfBirth: dob })
+        yield* db.entities.N133Coaches.put({ id: "c1", name: "C1", dateOfBirth: dob })
+        yield* db.entities.N133Coaches.put({ id: "c2", name: "C2", dateOfBirth: dob })
+      }).pipe(provideN133, Effect.scoped),
+    )
+  }, 30000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: n133TableName })
+      }).pipe(
+        provideN133,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 30000)
+
+  it.effect("create, get, list, update and delete across both levels", () =>
+    Effect.gen(function* () {
+      const db = yield* n133Client
+      const leagues = db.aggregates.N133LeagueAggregate
+      yield* leagues.create(n133League("l1") as any)
+      yield* leagues.create(n133League("l2") as any)
+
+      const client = yield* DynamoClient
+      const raw = (id: string) =>
+        client
+          .query({
+            TableName: n133TableName,
+            KeyConditionExpression: "#pk = :pk",
+            ExpressionAttributeNames: { "#pk": "pk" },
+            ExpressionAttributeValues: { ":pk": { S: `$edd133n#v1#league#${id}` } },
+            ConsistentRead: true,
+          })
+          .pipe(Effect.map(({ Items = [] }) => Items as ReadonlyArray<Record<string, any>>))
+      const sks = (yield* raw("l1")).map((i) => i.sk.S as string).sort()
+      expect(sks).toEqual([
+        "$edd133n#v1#nclub#clubno#0000000000000001",
+        "$edd133n#v1#nclub#clubno#0000000000000002",
+        "$edd133n#v1#ncoach#clubno#0000000000000001",
+        "$edd133n#v1#ncoach#clubno#0000000000000002",
+        "$edd133n#v1#nleague",
+        "$edd133n#v1#nsquad#clubno#0000000000000001#squadno#0000000000000001",
+        "$edd133n#v1#nsquad#clubno#0000000000000002#squadno#0000000000000001",
+        "$edd133n#v1#nsquadplayer#clubno#0000000000000001#squadno#0000000000000001#p1",
+        "$edd133n#v1#nsquadplayer#clubno#0000000000000002#squadno#0000000000000001#p2",
+      ])
+
+      const got = (yield* leagues.get({ id: "l1" } as any)) as N133League
+      expect(got.club2.squad.name).toBe("B")
+      expect(i133IsRealUtc(got.club2.squad.players[0]!.joined, I133_DOB_MS + 86_400_000)).toBe(true)
+      expect(i133IsRealUtc(got.club1.coach.dateOfBirth, I133_DOB_MS)).toBe(true)
+
+      const listed = yield* leagues.list({ season: "2026" })
+      expect(listed.data.map((l: any) => l.id).sort()).toEqual(["l1", "l2"])
+      expect(listed.data.every((l: any) => l.club1.squad.name === "A")).toBe(true)
+
+      yield* leagues.update({ id: "l1" } as any, (c: any) => ({
+        ...c.state,
+        club2: { ...c.state.club2, squad: { ...c.state.club2.squad, name: "B2" } },
+      }))
+      const updated = (yield* leagues.get({ id: "l1" } as any)) as N133League
+      expect(updated.club2.squad.name).toBe("B2")
+      expect(updated.club1.squad.name).toBe("A")
+
+      yield* leagues.delete({ id: "l1" } as any)
+      expect(yield* raw("l1")).toEqual([])
+      expect((yield* raw("l2")).length).toBe(9)
+    }).pipe(provideN133),
+  )
+  it.effect("create of an existing aggregate fails and writes nothing (#134)", () =>
+    Effect.gen(function* () {
+      const db = yield* n133Client
+      const leagues = db.aggregates.N133LeagueAggregate
+      const client = yield* DynamoClient
+      const raw = (id: string) =>
+        client
+          .query({
+            TableName: n133TableName,
+            KeyConditionExpression: "#pk = :pk",
+            ExpressionAttributeNames: { "#pk": "pk" },
+            ExpressionAttributeValues: { ":pk": { S: `$edd133n#v1#league#${id}` } },
+            ConsistentRead: true,
+          })
+          .pipe(Effect.map(({ Items = [] }) => Items as ReadonlyArray<Record<string, any>>))
+      yield* leagues.create(n133League("dup") as any)
+      const before = yield* raw("dup")
+      expect(before.length).toBe(9)
+      // Different root fields, edges and sub-aggregate rows — new sort keys
+      // (p2 in club1, p1 in club2) that must not appear.
+      const again = {
+        ...n133League("dup"),
+        season: "2027",
+        club1: {
+          name: "Uno",
+          coachId: "c2",
+          squad: { name: "X", players: [{ playerId: "p2", joined: I133_DAY2 }] },
+        },
+        club2: {
+          name: "Dos",
+          coachId: "c1",
+          squad: { name: "Y", players: [{ playerId: "p1", joined: I133_DOB }] },
+        },
+      }
+      const error = yield* leagues.create(again as any).pipe(Effect.flip)
+      expect(error._tag).toBe("ConditionalCheckFailed")
+      const after = yield* raw("dup")
+      const bySk = (items: ReadonlyArray<Record<string, any>>) =>
+        [...items].sort((a, b) => (a.sk.S < b.sk.S ? -1 : 1))
+      expect(bySk(after)).toEqual(bySk(before))
+      const listed = yield* leagues.list({ season: "2027" })
+      expect(listed.data).toEqual([])
+      // A list filter follows the empty-part rules: refused, never widened.
+      for (const filter of [
+        (_: any, o: any) => o.or(),
+        (t: any, o: any) => o.or(o.eq(t.id, "dup"), o.and()),
+      ]) {
+        const refused = yield* leagues.list({ season: "2026" }, { filter } as any).pipe(Effect.flip)
+        expect(refused._tag).toBe("ValidationError")
+      }
+      // Orphan edge rows (the root gone, its edges left) don't stop create;
+      // `delete` clears the whole partition, orphans included, as documented.
+      yield* client.deleteItem({
+        TableName: n133TableName,
+        Key: { pk: { S: "$edd133n#v1#league#dup" }, sk: { S: "$edd133n#v1#nleague" } },
+      })
+      expect((yield* raw("dup")).length).toBe(8)
+      yield* leagues.delete({ id: "dup" } as any)
+      expect(yield* raw("dup")).toEqual([])
+      yield* leagues.create(again as any)
+      const fresh = (yield* leagues.get({ id: "dup" } as any)) as N133League
+      expect(fresh.club1.name).toBe("Uno")
+      expect((yield* raw("dup")).length).toBe(9)
+    }).pipe(provideN133),
+  )
+})
+
+// ===========================================================================
+// #133 — unions with a colliding member, wire-form path values, configured
+// union storage, legacy raw values and plain bigints
+// ===========================================================================
+
+class X133Row extends Schema.Class<X133Row>("X133Row")({
+  id: Schema.String,
+  dateOrText: Schema.Union([Schema.DateTimeUtc, Schema.String]),
+  textOrDate: Schema.Union([Schema.String, Schema.DateTimeUtc]),
+  epochOrNull: Schema.NullOr(
+    Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
+  ),
+  configured: Schema.NullOr(Schema.DateTimeUtc),
+  b64: Schema.StringFromBase64,
+  nfs: Schema.NumberFromString,
+  big: Schema.BigInt,
+}) {}
+const X133Schema = DynamoSchema.make({ name: "edd133x", version: 1 })
+const X133Rows = Entity.make({
+  model: DynamoModel.configure(X133Row, { configured: { storedAs: DynamoModel.DateEpochMs } }),
+  entityType: "X133Row",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+})
+class X133Agg extends Schema.Class<X133Agg>("X133Agg")({
+  id: Schema.String,
+  dateOrText: Schema.Union([Schema.DateTimeUtc, Schema.String]),
+  big: Schema.BigInt,
+}) {}
+const X133Table = Table.make({ schema: X133Schema, entities: { X133Rows } })
+const X133Aggregate = Aggregate.make(X133Agg, {
+  table: X133Table,
+  schema: X133Schema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "xagg" },
+  root: { entityType: "X133AggItem" },
+  edges: {},
+})
+const x133TableName = `edd133x-${Date.now()}`
+const provideX133 = Effect.provide(
+  Layer.mergeAll(ClientLayer, X133Table.layer({ name: x133TableName })),
+)
+const x133Client = DynamoClient.make({
+  entities: { X133Rows },
+  aggregates: { X133Aggregate },
+  tables: { X133Table },
+})
+const x133Key = (id: string) => ({
+  pk: { S: `$edd133x#v1#x133row#id_${id}` },
+  sk: { S: "$edd133x#v1#x133row" },
+})
+
+describeConnected("#133 — colliding unions, wire path values, legacy raw values", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* x133Client
+        yield* db.tables.X133Table.create()
+      }).pipe(provideX133, Effect.scoped),
+    )
+  }, 30000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: x133TableName })
+      }).pipe(
+        provideX133,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 30000)
+
+  it.effect("entity: each union member reads back as itself; storage as configured", () =>
+    Effect.gen(function* () {
+      const db = yield* x133Client
+      const client = yield* DynamoClient
+      const dt = DateTime.makeUnsafe(I133_DOB_MS)
+      const base = { b64: "hi", nfs: 1, big: 12345678901234567890n }
+      yield* db.entities.X133Rows.put({
+        id: "a",
+        dateOrText: "2020",
+        textOrDate: "5",
+        epochOrNull: null,
+        configured: dt,
+        ...base,
+      } as any)
+      yield* db.entities.X133Rows.put({
+        id: "b",
+        dateOrText: dt,
+        textOrDate: dt,
+        epochOrNull: dt,
+        configured: null,
+        ...base,
+      } as any)
+      const raw = (id: string) =>
+        client
+          .getItem({ TableName: x133TableName, Key: x133Key(id), ConsistentRead: true })
+          .pipe(Effect.map(({ Item }) => Item as Record<string, any>))
+      const a = yield* raw("a")
+      const b = yield* raw("b")
+      expect([a.dateOrText, a.textOrDate, a.epochOrNull, a.configured]).toEqual([
+        { S: "2020" },
+        { S: "5" },
+        { NULL: true },
+        { N: String(I133_DOB_MS) },
+      ])
+      expect([b.dateOrText, b.textOrDate, b.epochOrNull, b.big]).toEqual([
+        { S: I133_DOB },
+        { S: I133_DOB },
+        { N: String(I133_DOB_MS) },
+        { N: "12345678901234567890" },
+      ])
+
+      const gotA = (yield* db.entities.X133Rows.get({ id: "a" })) as any
+      expect([gotA.dateOrText, gotA.textOrDate, gotA.epochOrNull]).toEqual(["2020", "5", null])
+      expect(i133IsRealUtc(gotA.configured, I133_DOB_MS)).toBe(true)
+      expect(gotA.big).toBe(12345678901234567890n)
+      const gotB = (yield* db.entities.X133Rows.get({ id: "b" })) as any
+      expect(i133IsRealUtc(gotB.dateOrText, I133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(gotB.textOrDate, I133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(gotB.epochOrNull, I133_DOB_MS)).toBe(true)
+
+      // Path values: ambiguous wire values pass through, domain values encode.
+      yield* db.entities.X133Rows.update({ id: "a" })
+        .pathSet({ segments: ["b64"], value: "aGk=", isPath: false })
+        .pathSet({ segments: ["nfs"], value: 7, isPath: false })
+        .pathSet({ segments: ["configured"], value: dt, isPath: false })
+      const a2 = yield* raw("a")
+      expect([a2.b64, a2.nfs, a2.configured]).toEqual([
+        { S: "aGk=" },
+        { S: "7" },
+        { N: String(I133_DOB_MS) },
+      ])
+    }).pipe(provideX133),
+  )
+
+  it.effect("entity: rows left by older releases read back", () =>
+    Effect.gen(function* () {
+      const db = yield* x133Client
+      const client = yield* DynamoClient
+      yield* client.putItem({
+        TableName: x133TableName,
+        Item: {
+          ...x133Key("legacy"),
+          __edd_e__: { S: "X133Row" },
+          id: { S: "legacy" },
+          dateOrText: { S: "2020" },
+          textOrDate: i133LegacyMap("~effect/time/DateTime")(I133_DOB_MS) as any,
+          epochOrNull: { N: String(I133_DOB_MS) },
+          configured: i133LegacyMap("~effect/DateTime")(I133_DOB_MS) as any,
+          b64: { S: "aGk=" },
+          nfs: { N: "3" },
+          big: { N: "9" },
+        },
+      })
+      const got = (yield* db.entities.X133Rows.get({ id: "legacy" })) as any
+      expect(got.dateOrText).toBe("2020")
+      expect(i133IsRealUtc(got.textOrDate, I133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.epochOrNull, I133_DOB_MS)).toBe(true)
+      expect(i133IsRealUtc(got.configured, I133_DOB_MS)).toBe(true)
+      expect(got.nfs).toBe(3)
+      expect(got.big).toBe(9n)
+    }).pipe(provideX133),
+  )
+
+  it.effect("aggregate: a root union and a plain bigint round-trip", () =>
+    Effect.gen(function* () {
+      const db = yield* x133Client
+      const aggs = db.aggregates.X133Aggregate
+      yield* aggs.create({ id: "g1", dateOrText: "2020", big: 5n } as any)
+      yield* aggs.create({
+        id: "g2",
+        dateOrText: DateTime.makeUnsafe(I133_DOB_MS),
+        big: 12345678901234567890n,
+      } as any)
+      const g1 = (yield* aggs.get({ id: "g1" } as any)) as any
+      const g2 = (yield* aggs.get({ id: "g2" } as any)) as any
+      expect(g1.dateOrText).toBe("2020")
+      expect(g1.big).toBe(5n)
+      expect(i133IsRealUtc(g2.dateOrText, I133_DOB_MS)).toBe(true)
+      expect(g2.big).toBe(12345678901234567890n)
+      yield* aggs.update({ id: "g1" } as any, (c: any) => c.state)
+    }).pipe(provideX133),
+  )
+})
+
+// ===========================================================================
+// #133 — nested unions, zoned offsets and class values set by path
+// ===========================================================================
+
+class Y133Cred extends Schema.Class<Y133Cred>("Y133Cred")({
+  user: Schema.String,
+  token: Schema.Redacted(Schema.String),
+  issued: Schema.Date,
+  at: Schema.DateTimeUtc,
+}) {}
+class Y133Row extends Schema.Class<Y133Row>("Y133Row")({
+  id: Schema.String,
+  nested: Schema.Union([Schema.NullOr(Schema.DateTimeUtc), Schema.String]),
+  zoned: Schema.DateTimeZoned,
+  zonedOrText: Schema.Union([Schema.DateTimeZoned, Schema.String]),
+  cred: Y133Cred,
+  creds: Schema.Array(Y133Cred),
+  dmZoned: DynamoModel.DateTimeZoned,
+  mixed: Schema.Struct({
+    b64: Schema.StringFromBase64,
+    at: Schema.DateTimeUtc,
+    n: Schema.NumberFromString,
+  }),
+}) {}
+const Y133Schema = DynamoSchema.make({ name: "edd133y", version: 1 })
+const Y133Rows = Entity.make({
+  model: Y133Row,
+  entityType: "Y133Row",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+})
+const Y133Table = Table.make({ schema: Y133Schema, entities: { Y133Rows } })
+const y133TableName = `edd133y-${Date.now()}`
+const provideY133 = Effect.provide(
+  Layer.mergeAll(ClientLayer, Y133Table.layer({ name: y133TableName })),
+)
+const y133Client = DynamoClient.make({ entities: { Y133Rows }, tables: { Y133Table } })
+
+describeConnected("#133 — nested unions, zoned offsets, class path values", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* y133Client
+        yield* db.tables.Y133Table.create()
+      }).pipe(provideY133, Effect.scoped),
+    )
+  }, 30000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: y133TableName })
+      }).pipe(
+        provideY133,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 30000)
+
+  it.effect("stores and reads each member, zone and class value faithfully", () =>
+    Effect.gen(function* () {
+      const db = yield* y133Client
+      const client = yield* DynamoClient
+      const offset = DateTime.makeZonedUnsafe(I133_DOB_MS, {
+        timeZone: DateTime.zoneMakeOffset(5 * 3_600_000),
+      })
+      const named = DateTime.makeZonedUnsafe(I133_DOB_MS, { timeZone: "Europe/London" })
+      const cred = new Y133Cred({
+        user: "u",
+        token: Redacted.make("secret"),
+        issued: new Date(I133_DOB_MS),
+        at: DateTime.makeUnsafe(I133_DOB_MS),
+      })
+      const storedCred = {
+        M: {
+          user: { S: "u" },
+          token: { S: "secret" },
+          issued: { S: I133_DOB },
+          at: { S: I133_DOB },
+        },
+      }
+      yield* db.entities.Y133Rows.put({
+        id: "y",
+        nested: "2020",
+        zoned: offset,
+        zonedOrText: named,
+        cred,
+        creds: [],
+        dmZoned: offset,
+        mixed: { b64: "hi", at: DateTime.makeUnsafe(I133_DOB_MS), n: 1 },
+      } as any)
+      yield* db.entities.Y133Rows.update({ id: "y" })
+        .pathSet({ segments: ["cred"], value: cred, isPath: false })
+        .pathAppend({ segments: ["creds"], value: [cred] })
+        // `n` already wire, `at` domain, `b64` a plain string: encoded leaf by leaf.
+        .pathSet({
+          segments: ["mixed"],
+          value: { b64: "hi", at: DateTime.makeUnsafe(I133_DOB_MS), n: "5" },
+          isPath: false,
+        })
+      const { Item } = yield* client.getItem({
+        TableName: y133TableName,
+        Key: { pk: { S: "$edd133y#v1#y133row#id_y" }, sk: { S: "$edd133y#v1#y133row" } },
+        ConsistentRead: true,
+      })
+      const item = Item as Record<string, any>
+      expect([item.nested, item.zoned, item.zonedOrText, item.cred, item.creds]).toEqual([
+        { S: "2020" },
+        { S: "2000-01-01T05:00:00.000+05:00" },
+        { S: DateTime.formatIsoZoned(named) },
+        storedCred,
+        { L: [storedCred] },
+      ])
+      const got = (yield* db.entities.Y133Rows.get({ id: "y" })) as any
+      expect(got.nested).toBe("2020")
+      expect(DateTime.formatIsoZoned(got.zoned)).toBe("2000-01-01T05:00:00.000+05:00")
+      expect(DateTime.formatIsoZoned(got.zonedOrText)).toBe(DateTime.formatIsoZoned(named))
+      expect(Redacted.value(got.cred.token)).toBe("secret")
+      expect(got.creds[0].issued.getTime()).toBe(I133_DOB_MS)
+      expect(item.dmZoned).toEqual({ S: "2000-01-01T05:00:00.000+05:00" })
+      expect(DateTime.formatIsoZoned(got.dmZoned)).toBe("2000-01-01T05:00:00.000+05:00")
+      expect(item.mixed).toEqual({
+        M: { b64: { S: "aGk=" }, at: { S: I133_DOB }, n: { S: "5" } },
+      })
+      expect(got.mixed.b64).toBe("hi")
+      expect(i133IsRealUtc(got.mixed.at, I133_DOB_MS)).toBe(true)
+      expect(got.mixed.n).toBe(5)
+    }).pipe(provideY133),
+  )
+})
+
+// ===========================================================================
+// #133 — container checks enforced on writes, path values under a ref field
+// ===========================================================================
+
+class Z133Author extends Schema.Class<Z133Author>("Z133Author")({
+  authorId: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+  born: Schema.DateTimeUtc,
+  rank: Schema.NumberFromString,
+}) {}
+class Z133Note extends Schema.Class<Z133Note>("Z133Note")({
+  id: Schema.String,
+  days: Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(2)),
+  author: Z133Author.pipe(DynamoModel.ref),
+}) {}
+class Z133Agg extends Schema.Class<Z133Agg>("Z133Agg")({
+  id: Schema.String,
+  days: Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(2)),
+}) {}
+const Z133Schema = DynamoSchema.make({ name: "edd133z", version: 1 })
+const Z133Authors = Entity.make({
+  model: Z133Author,
+  entityType: "Z133Author",
+  primaryKey: { pk: { field: "pk", composite: ["authorId"] }, sk: { field: "sk", composite: [] } },
+})
+const Z133Notes = Entity.make({
+  model: Z133Note,
+  entityType: "Z133Note",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  refs: { author: { entity: Z133Authors } },
+})
+const Z133Table = Table.make({ schema: Z133Schema, entities: { Z133Authors, Z133Notes } })
+const Z133Aggregate = Aggregate.make(Z133Agg, {
+  table: Z133Table,
+  schema: Z133Schema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "zagg" },
+  root: { entityType: "Z133AggItem" },
+  edges: {},
+})
+const z133TableName = `edd133z-${Date.now()}`
+const provideZ133 = Effect.provide(
+  Layer.mergeAll(ClientLayer, Z133Table.layer({ name: z133TableName })),
+)
+const z133Client = DynamoClient.make({
+  entities: { Z133Authors, Z133Notes },
+  aggregates: { Z133Aggregate },
+  tables: { Z133Table },
+})
+
+describeConnected("#133 — container checks on writes, path values under a ref", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* z133Client
+        yield* db.tables.Z133Table.create()
+        yield* db.entities.Z133Authors.put({
+          authorId: "a1",
+          name: "Ann",
+          born: DateTime.makeUnsafe(I133_DOB_MS),
+          rank: 1,
+        })
+      }).pipe(provideZ133, Effect.scoped),
+    )
+  }, 30000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: z133TableName })
+      }).pipe(
+        provideZ133,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 30000)
+
+  it.effect("writes breaking a check are rejected; a stored violating row still reads", () =>
+    Effect.gen(function* () {
+      const db = yield* z133Client
+      const client = yield* DynamoClient
+      const dt = DateTime.makeUnsafe(I133_DOB_MS)
+      const three = [dt, dt, dt]
+      yield* db.entities.Z133Notes.put({ id: "n1", days: [dt], authorId: "a1" } as any)
+      const notes = db.entities.Z133Notes as any
+      for (const write of [
+        notes.put({ id: "n2", days: three, authorId: "a1" }).asEffect(),
+        notes.update({ id: "n1" }).set({ days: three }).asEffect(),
+        notes
+          .update({ id: "n1" })
+          .pathSet({ segments: ["days"], value: three, isPath: false })
+          .asEffect(),
+        db.aggregates.Z133Aggregate.create({ id: "g1", days: three } as any),
+      ] as ReadonlyArray<Effect.Effect<unknown, unknown>>) {
+        expect(((yield* Effect.flip(write)) as { _tag?: string })._tag).toBe("ValidationError")
+      }
+
+      yield* db.aggregates.Z133Aggregate.create({ id: "g2", days: [dt] } as any)
+      yield* client.updateItem({
+        TableName: z133TableName,
+        Key: { pk: { S: "$edd133z#v1#zagg#g2" }, sk: { S: "$edd133z#v1#z133aggitem" } },
+        UpdateExpression: "SET #d = :v",
+        ExpressionAttributeNames: { "#d": "days" },
+        ExpressionAttributeValues: {
+          ":v": { L: [{ S: I133_DOB }, { S: I133_DOB }, { S: I133_DOB }] },
+        },
+      })
+      const got = (yield* db.aggregates.Z133Aggregate.get({ id: "g2" } as any)) as any
+      expect(got.days).toHaveLength(3)
+      yield* db.aggregates.Z133Aggregate.update({ id: "g2" } as any, (c: any) => ({
+        ...c.state,
+        days: [dt],
+      }))
+      expect(
+        ((yield* db.aggregates.Z133Aggregate.get({ id: "g2" } as any)) as any).days,
+      ).toHaveLength(1)
+    }).pipe(provideZ133),
+  )
+
+  it.effect("path values under a DynamoModel.ref field are stored in wire form", () =>
+    Effect.gen(function* () {
+      const db = yield* z133Client
+      const client = yield* DynamoClient
+      yield* db.entities.Z133Notes.put({ id: "n3", days: [], authorId: "a1" } as any)
+      yield* db.entities.Z133Notes.update({ id: "n3" })
+        .pathSet({
+          segments: ["author", "born"],
+          value: DateTime.makeUnsafe(I133_DOB_MS + 1000),
+          isPath: false,
+        })
+        .pathSet({ segments: ["author", "rank"], value: 7, isPath: false })
+      const { Item } = yield* client.getItem({
+        TableName: z133TableName,
+        Key: { pk: { S: "$edd133z#v1#z133note#id_n3" }, sk: { S: "$edd133z#v1#z133note" } },
+        ConsistentRead: true,
+      })
+      const author = (Item as any).author.M
+      expect([author.born, author.rank]).toEqual([{ S: "2000-01-01T00:00:01.000Z" }, { S: "7" }])
+      const got = (yield* db.entities.Z133Notes.get({ id: "n3" })) as any
+      expect(i133IsRealUtc(got.author.born, I133_DOB_MS + 1000)).toBe(true)
+      expect(got.author.rank).toBe(7)
+    }).pipe(provideZ133),
+  )
+})
+
+// ===========================================================================
+// #133 — path operations on a versioned (retain) entity
+// ===========================================================================
+
+class R133Doc extends Schema.Class<R133Doc>("R133Doc")({
+  id: Schema.String,
+  n: Schema.Number,
+  tags: Schema.Array(Schema.String),
+  days: Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(3)),
+  labels: Schema.ReadonlySet(Schema.String),
+  nested: Schema.Struct({ at: Schema.DateTimeUtc, count: Schema.Number }),
+  opt: Schema.optionalKey(Schema.String),
+  gone: Schema.optionalKey(Schema.String),
+}) {}
+const R133Schema = DynamoSchema.make({ name: "edd133r", version: 1 })
+const R133Docs = Entity.make({
+  model: R133Doc,
+  entityType: "R133Doc",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  versioned: { retain: true },
+})
+const R133Table = Table.make({ schema: R133Schema, entities: { R133Docs } })
+const r133TableName = `edd133r-${Date.now()}`
+const provideR133 = Effect.provide(
+  Layer.mergeAll(ClientLayer, R133Table.layer({ name: r133TableName })),
+)
+const r133Client = DynamoClient.make({ entities: { R133Docs }, tables: { R133Table } })
+
+describeConnected("#133 — path operations on a retain entity", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* r133Client
+        yield* db.tables.R133Table.create()
+      }).pipe(provideR133, Effect.scoped),
+    )
+  }, 30000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: r133TableName })
+      }).pipe(
+        provideR133,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 30000)
+
+  it.effect("applies, validates and snapshots every path operation", () =>
+    Effect.gen(function* () {
+      const db = yield* r133Client
+      const client = yield* DynamoClient
+      const dt = DateTime.makeUnsafe(I133_DOB_MS)
+      const later = DateTime.makeUnsafe(I133_DOB_MS + 1000)
+      yield* db.entities.R133Docs.put({
+        id: "d1",
+        n: 1,
+        tags: ["a", "b"],
+        days: [dt],
+        labels: new Set(["x", "y"]),
+        nested: { at: dt, count: 5 },
+        gone: "bye",
+      } as any)
+      const updated = (yield* db.entities.R133Docs.update({ id: "d1" })
+        .expectedVersion(1)
+        .pathSet({ segments: ["nested", "at"], value: later, isPath: false })
+        .pathIfNotExists({ segments: ["opt"], value: "set" })
+        .pathAdd({ segments: ["n"], value: 2 })
+        .pathSubtract({ segments: ["nested", "count"], value: 1, isPath: false })
+        .pathAppend({ segments: ["days"], value: [later] })
+        .pathPrepend({ segments: ["tags"], value: ["first"] })
+        .pathDelete({ segments: ["labels"], value: new Set(["x"]) })
+        .pathRemove(["gone"])) as any
+      expect(updated.n).toBe(3)
+      expect([...updated.labels].sort()).toEqual(["y"])
+      expect(updated.tags).toEqual(["first", "a", "b"])
+      expect(updated.nested.count).toBe(4)
+      expect(i133IsRealUtc(updated.nested.at, I133_DOB_MS + 1000)).toBe(true)
+      expect(updated.days).toHaveLength(2)
+      expect(updated.opt).toBe("set")
+      expect(updated.gone).toBeUndefined()
+      expect(updated.version).toBe(2)
+
+      const raw = (sk: string) =>
+        client
+          .getItem({
+            TableName: r133TableName,
+            Key: { pk: { S: "$edd133r#v1#r133doc#id_d1" }, sk: { S: sk } },
+            ConsistentRead: true,
+          })
+          .pipe(Effect.map(({ Item }) => Item as Record<string, any>))
+      const current = yield* raw("$edd133r#v1#r133doc")
+      expect(current.nested).toEqual({
+        M: { at: { S: "2000-01-01T00:00:01.000Z" }, count: { N: "4" } },
+      })
+      const snapshot = yield* raw("$edd133r#v1#r133doc#v#0000001")
+      expect([snapshot.n, snapshot.nested, snapshot.gone]).toEqual([
+        { N: "1" },
+        { M: { at: { S: I133_DOB }, count: { N: "5" } } },
+        { S: "bye" },
+      ])
+
+      const docs = db.entities.R133Docs as any
+      const stale = yield* Effect.flip(
+        docs
+          .update({ id: "d1" })
+          .expectedVersion(1)
+          .pathSet({ segments: ["n"], value: 7, isPath: false })
+          .asEffect() as Effect.Effect<unknown, { readonly _tag: string }>,
+      )
+      expect(stale._tag).toBe("OptimisticLockError")
+      const tooMany = yield* Effect.flip(
+        docs
+          .update({ id: "d1" })
+          .pathSet({ segments: ["days"], value: [dt, dt, dt, dt], isPath: false })
+          .asEffect() as Effect.Effect<unknown, { readonly _tag: string }>,
+      )
+      expect(tooMany._tag).toBe("ValidationError")
+      expect((yield* raw("$edd133r#v1#r133doc")).version).toEqual({ N: "2" })
+    }).pipe(provideR133),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Retain vs non-retain parity: DynamoDB applies the path operations of both
+// ---------------------------------------------------------------------------
+
+class P133Doc extends Schema.Class<P133Doc>("P133Doc")({
+  id: Schema.String,
+  name: Schema.String,
+  tag: Schema.String,
+  list: Schema.Array(Schema.String),
+  n: Schema.Number,
+  labels: Schema.ReadonlySet(Schema.String),
+  opt: Schema.optional(Schema.Array(Schema.String)),
+}) {}
+const P133Schema = DynamoSchema.make({ name: "edd133p", version: 1 })
+const p133Key = {
+  pk: { field: "pk", composite: ["id"] },
+  sk: { field: "sk", composite: [] },
+} as const
+const P133Retained = Entity.make({
+  model: P133Doc,
+  entityType: "P133Retained",
+  primaryKey: p133Key,
+  versioned: { retain: true },
+})
+const P133Plain = Entity.make({
+  model: P133Doc,
+  entityType: "P133Plain",
+  primaryKey: p133Key,
+  versioned: true,
+})
+const P133Table = Table.make({ schema: P133Schema, entities: { P133Retained, P133Plain } })
+const p133TableName = `edd133p-${Date.now()}`
+const provideP133 = Effect.provide(
+  Layer.mergeAll(ClientLayer, P133Table.layer({ name: p133TableName })),
+)
+const p133Client = DynamoClient.make({
+  entities: { P133Retained, P133Plain },
+  tables: { P133Table },
+})
+
+describeConnected("#133 — retain path operations match DynamoDB's own", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* p133Client
+        yield* db.tables.P133Table.create()
+      }).pipe(provideP133, Effect.scoped),
+    )
+  }, 30000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: p133TableName })
+      }).pipe(
+        provideP133,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 30000)
+
+  const sequences: ReadonlyArray<readonly [string, (u: any) => any]> = [
+    ["remove list[0] and list[2]", (u) => u.pathRemove(["list", 0]).pathRemove(["list", 2])],
+    [
+      "set tag, copy tag into name",
+      (u) =>
+        u
+          .pathSet({ segments: ["tag"], value: "t2", isPath: false })
+          .pathSet({ segments: ["name"], value: undefined, isPath: true, valueSegments: ["tag"] }),
+    ],
+    [
+      "set and remove the same path",
+      (u) =>
+        u.pathSet({ segments: ["list", 1], value: "z", isPath: false }).pathRemove(["list", 1]),
+    ],
+    [
+      "if_not_exists on an absent attribute",
+      (u) => u.pathIfNotExists({ segments: ["opt"], value: ["w"] }),
+    ],
+    [
+      "if_not_exists on a present attribute",
+      (u) => u.pathIfNotExists({ segments: ["n"], value: 99 }),
+    ],
+    ["append to a missing list", (u) => u.pathAppend({ segments: ["opt"], value: ["q"] })],
+    ["delete from a non-set", (u) => u.pathDelete({ segments: ["list"], value: new Set(["a"]) })],
+    [
+      "set past the end, add, prepend",
+      (u) =>
+        u
+          .pathSet({ segments: ["list", 10], value: "z", isPath: false })
+          .pathAdd({ segments: ["n"], value: 5 })
+          .pathAdd({ segments: ["labels"], value: new Set(["c"]) }),
+    ],
+  ]
+
+  it.effect("each sequence stores the same item, or fails the same way", () =>
+    Effect.gen(function* () {
+      const db = yield* p133Client
+      const client = yield* DynamoClient
+      const read = (entityType: string, id: string, sk: string) =>
+        client
+          .getItem({
+            TableName: p133TableName,
+            Key: {
+              pk: { S: `$edd133p#v1#${entityType.toLowerCase()}#id_${id}` },
+              sk: { S: sk },
+            },
+            ConsistentRead: true,
+          })
+          .pipe(Effect.map(({ Item }) => Item as Record<string, any> | undefined))
+      const fields = (item: Record<string, any> | undefined) => {
+        if (item === undefined) return undefined
+        // Each create draws its own random incarnation token (`__edd_i__`).
+        const { pk, sk, __edd_e__, __edd_i__, updatedAt, createdAt, ...rest } = item
+        return rest
+      }
+      const base = {
+        name: "n",
+        tag: "t",
+        list: ["a", "b", "c", "d"],
+        n: 1,
+        labels: new Set(["a", "b"]),
+      }
+      for (const [index, [label, apply]] of sequences.entries()) {
+        const id = `s${index}`
+        yield* db.entities.P133Retained.put({ id, ...base } as any)
+        yield* db.entities.P133Plain.put({ id, ...base } as any)
+        // A record update first, so the path update below snapshots version 2
+        // (`put` on a retain entity already writes the version 1 snapshot).
+        yield* db.entities.P133Retained.update({ id }).set({ name: "pre" } as any)
+        yield* db.entities.P133Plain.update({ id }).set({ name: "pre" } as any)
+        const retained = yield* Effect.exit(
+          Effect.suspend(
+            () =>
+              apply(db.entities.P133Retained.update({ id })).asEffect() as Effect.Effect<
+                unknown,
+                unknown
+              >,
+          ),
+        )
+        const plain = yield* Effect.exit(
+          Effect.suspend(
+            () =>
+              apply(db.entities.P133Plain.update({ id })).asEffect() as Effect.Effect<
+                unknown,
+                unknown
+              >,
+          ),
+        )
+        const outcome = (exit: Exit.Exit<unknown, unknown>) =>
+          Exit.isSuccess(exit) ? "ok" : String((Cause.squash(exit.cause) as any)?._tag ?? "error")
+        expect([label, outcome(retained)]).toEqual([label, outcome(plain)])
+        const retainedItem = yield* read("P133Retained", id, "$edd133p#v1#p133retained")
+        const plainItem = yield* read("P133Plain", id, "$edd133p#v1#p133plain")
+        expect([label, fields(retainedItem)]).toEqual([label, fields(plainItem)])
+        // A snapshot of the pre-update item exactly when the update applied.
+        const snapshot = yield* read("P133Retained", id, "$edd133p#v1#p133retained#v#0000002")
+        if (Exit.isSuccess(retained)) {
+          expect([label, snapshot?.name, snapshot?.list]).toEqual([
+            label,
+            { S: "pre" },
+            { L: base.list.map((value) => ({ S: value })) },
+          ])
+        } else {
+          expect([label, snapshot]).toEqual([label, undefined])
+        }
+      }
+    }).pipe(provideP133),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// #133 — path operations on index composites and unique fields; condition
+// failures; the exact retain post-image
+//
+// A top-level `pathSet` / `pathRemove` on a field that feeds an index key or a
+// unique sentinel goes through the same logic as `.set()` / `.remove()`. Each
+// case runs the record form against one table and the path form against a
+// second table with the same definition: every item in the two tables — main
+// items, index keys, version snapshots, unique sentinels — must be identical.
+// Covers the six canonical GSI-composite shapes on a plain and a retain entity.
+// ---------------------------------------------------------------------------
+
+const G133Schema = DynamoSchema.make({ name: "edd133g", version: 1 })
+const g133Variants = <M extends Schema.Top>(
+  name: string,
+  model: M,
+  config: {
+    readonly primaryKey: Record<string, any>
+    readonly indexes?: Record<string, any>
+    readonly unique?: Record<string, any>
+  },
+) =>
+  ({
+    plain: Entity.make({
+      model,
+      entityType: `G133${name}Plain`,
+      ...config,
+      timestamps: true,
+      versioned: true,
+    } as any),
+    retained: Entity.make({
+      model,
+      entityType: `G133${name}Retained`,
+      ...config,
+      timestamps: true,
+      versioned: { retain: true },
+    } as any),
+  }) as const
+const g133IdKey = { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } }
+
+class G133Device extends Schema.Class<G133Device>("G133Device")({
+  id: Schema.String,
+  owner: Schema.optional(Schema.String),
+  reading: Schema.optional(Schema.String),
+  seq: Schema.optional(Schema.Number),
+  label: Schema.optional(Schema.String),
+}) {}
+const g133DeviceIndexes = {
+  byOwner: {
+    name: "gsi1",
+    pk: { field: "gsi1pk", composite: ["owner"] },
+    sk: { field: "gsi1sk", composite: ["reading", "seq"] },
+  },
+}
+const G133Devices = g133Variants("Device", G133Device, {
+  primaryKey: g133IdKey,
+  indexes: g133DeviceIndexes,
+})
+class G133Port extends Schema.Class<G133Port>("G133Port")({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  label: Schema.optional(Schema.String),
+}) {}
+const G133Ports = g133Variants("Port", G133Port, {
+  primaryKey: {
+    pk: { field: "pk", composite: ["channel"] },
+    sk: { field: "sk", composite: ["deviceId"] },
+  },
+  indexes: {
+    byChannel: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["channel"] },
+      sk: { field: "gsi2sk", composite: ["deviceId"] },
+    },
+  },
+})
+class G133Site extends Schema.Class<G133Site>("G133Site")({
+  id: Schema.String,
+  region: Schema.optional(Schema.String),
+  country: Schema.optional(Schema.String),
+  city: Schema.optional(Schema.String),
+  site: Schema.optional(Schema.String),
+}) {}
+const G133Sites = g133Variants("Site", G133Site, {
+  primaryKey: g133IdKey,
+  indexes: {
+    byLocation: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["region"] },
+      sk: { field: "gsi1sk", composite: ["country", "city", "site"] },
+    },
+  },
+})
+class G133Slot extends Schema.Class<G133Slot>("G133Slot")({
+  id: Schema.String,
+  tenant: Schema.optional(Schema.String),
+  lead: Schema.optional(Schema.String),
+  trail: Schema.optional(Schema.String),
+}) {}
+const G133Slots = g133Variants("Slot", G133Slot, {
+  primaryKey: g133IdKey,
+  indexes: {
+    byTenant: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenant"] },
+      sk: { field: "gsi1sk", composite: ["lead", "trail"] },
+      indexPolicy: { sk: "sparse" },
+    },
+  },
+})
+class G133Task extends Schema.Class<G133Task>("G133Task")({
+  id: Schema.String,
+  category: Schema.optional(Schema.String),
+  priority: Schema.optional(Schema.String),
+}) {}
+const G133Tasks = g133Variants("Task", G133Task, {
+  primaryKey: g133IdKey,
+  indexes: {
+    byCategory: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["category"] },
+      sk: { field: "gsi1sk", composite: ["priority"] },
+    },
+  },
+})
+class G133Binding extends Schema.Class<G133Binding>("G133Binding")({
+  id: Schema.String,
+  deviceBinding: Schema.optional(Schema.String),
+}) {}
+const G133Bindings = g133Variants("Binding", G133Binding, {
+  primaryKey: g133IdKey,
+  indexes: {
+    byDeviceBinding: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["deviceBinding"] },
+      sk: { field: "gsi1sk", composite: [] },
+    },
+  },
+})
+class G133Account extends Schema.Class<G133Account>("G133Account")({
+  id: Schema.String,
+  email: Schema.optional(Schema.String),
+  name: Schema.optional(Schema.String),
+}) {}
+const G133Accounts = g133Variants("Account", G133Account, {
+  primaryKey: g133IdKey,
+  unique: { email: ["email"] },
+})
+class G133Defaults extends Schema.Class<G133Defaults>("G133Defaults")({
+  id: Schema.String,
+  name: Schema.String,
+  born: Schema.DateTimeUtcFromString.pipe(
+    Schema.withDecodingDefault(Effect.succeed("1800-01-01T00:00:00.000Z")),
+  ),
+  when: Schema.DateTimeUtc.pipe(
+    Schema.withDecodingDefault(Effect.succeed(DateTime.makeUnsafe(86_400_000))),
+  ),
+  tier: Schema.String.pipe(Schema.withDecodingDefaultKey(Effect.succeed("basic"))),
+}) {}
+class G133Wide extends Schema.Class<G133Wide>("G133Wide")({
+  id: Schema.String,
+  email: Schema.optional(Schema.String),
+  totals: Schema.Record(Schema.String, Schema.Number),
+}) {}
+class G133Coded extends Schema.Class<G133Coded>("G133Coded")({
+  id: Schema.String,
+  name: Schema.String,
+  // A unique field that is also an index composite, with a default.
+  code: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed("none"))),
+  // A unique field with a default that no index uses.
+  handle: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed("anon"))),
+}) {}
+class G133Sparse extends Schema.Class<G133Sparse>("G133Sparse")({
+  id: Schema.String,
+  name: Schema.String,
+  team: Schema.optional(Schema.String),
+  rank: Schema.Number,
+}) {}
+class G133Ledger extends Schema.Class<G133Ledger>("G133Ledger")({
+  id: Schema.String,
+  book: Schema.String,
+  note: Schema.optional(Schema.String),
+}) {}
+class G133Author extends Schema.Class<G133Author>("G133Author")({
+  id: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+}) {}
+class G133Article extends Schema.Class<G133Article>("G133Article")({
+  articleId: Schema.String,
+  author: G133Author.pipe(DynamoModel.ref),
+}) {}
+const G133Authors = Entity.make({
+  model: G133Author,
+  entityType: "G133Author",
+  primaryKey: g133IdKey as any,
+})
+const G133Counters = Entity.make({
+  model: G133Device,
+  entityType: "G133Counter",
+  primaryKey: g133IdKey as any,
+  indexes: g133DeviceIndexes,
+})
+
+class G133Vec extends Schema.Class<G133Vec>("G133Vec")({
+  id: Schema.String,
+  vec: Schema.Array(Schema.Number),
+}) {}
+
+// Live rows whose keys look like history (#133).
+class G133Reading extends Schema.Class<G133Reading>("G133Reading")({
+  ch: Schema.String,
+  dev: Schema.String,
+  ts: Schema.DateTimeUtc,
+  v: Schema.optional(Schema.Number),
+}) {}
+const G133ReadingInput = Schema.Struct({
+  ch: Schema.String,
+  dev: Schema.String,
+  ts: Schema.DateTimeUtc,
+  v: Schema.optional(Schema.Number),
+})
+class G133Sub extends Schema.Class<G133Sub>("G133Sub")({
+  id: Schema.String,
+  label: Schema.String,
+}) {}
+// A collection on the primary key: an order and its lines share a partition.
+class G133POrder extends Schema.Class<G133POrder>("G133POrder")({
+  orderId: Schema.String,
+  label: Schema.String,
+}) {}
+class G133PLine extends Schema.Class<G133PLine>("G133PLine")({
+  orderId: Schema.String,
+  lineId: Schema.String,
+  qty: Schema.Number,
+}) {}
+const g133OrderKey = (sk: ReadonlyArray<string>) => ({
+  collection: "g133OrderAll",
+  type: "isolated",
+  pk: { field: "pk", composite: ["orderId"] },
+  sk: { field: "sk", composite: sk },
+})
+
+// A number composite stored as a string (#133): rows written by 1.15 have an
+// unpadded key (`#seq_5`) the current composer doesn't reproduce.
+class G133Seq extends Schema.Class<G133Seq>("G133Seq")({
+  tenant: Schema.String,
+  seq: Schema.NumberFromString,
+  label: Schema.String,
+}) {}
+
+// Names a placeholder may not hold, and renamed fields — on an entity, its GSI
+// collection, and a second member storing the same field under another name.
+const G133Named = Schema.Struct({
+  grp: Schema.String,
+  hid: Schema.String,
+  "first-name": Schema.String,
+  label: Schema.String,
+  addr: Schema.Struct({ city: Schema.String, zip: Schema.String }),
+  tags: Schema.Array(Schema.String),
+})
+const G133NamedOther = Schema.Struct({
+  grp: Schema.String,
+  nid: Schema.String,
+  label: Schema.String,
+})
+// A third member whose DOMAIN field is named what Hyphens stores `label` as.
+const G133NamedThird = Schema.Struct({
+  grp: Schema.String,
+  tid: Schema.String,
+  label: Schema.String,
+  "the-label": Schema.String,
+})
+const g133NamedIndex = (sk: string) => ({
+  byGrp: {
+    name: "gsi2",
+    collection: "g133Named",
+    pk: { field: "gsi2pk", composite: ["grp"] },
+    sk: { field: "gsi2sk", composite: [sk] },
+  },
+})
+
+// Two entities sharing a GSI partition: one's filter must never reach the other.
+const G133OrA = Schema.Struct({
+  owner: Schema.String,
+  aid: Schema.String,
+  n: Schema.Number,
+  code: Schema.optional(Schema.String),
+})
+const G133OrB = Schema.Struct({
+  owner: Schema.String,
+  bid: Schema.String,
+  n: Schema.Number,
+  secret: Schema.String,
+})
+const g133OrIndex = (sk: string) => ({
+  byOwner: {
+    name: "gsi2",
+    collection: "g133Or",
+    pk: { field: "gsi2pk", composite: ["owner"] },
+    sk: { field: "gsi2sk", composite: [sk] },
+  },
+})
+
+// Several items per partition (#133): a primary sort key with a composite.
+class G133Line extends Schema.Class<G133Line>("G133Line")({
+  order: Schema.String,
+  line: Schema.String,
+  label: Schema.String,
+}) {}
+const g133LineKey = {
+  pk: { field: "pk", composite: ["order"] },
+  sk: { field: "sk", composite: ["line"] },
+}
+
+const g133Entities = {
+  DevicesPlain: G133Devices.plain,
+  DevicesRetained: G133Devices.retained,
+  PortsPlain: G133Ports.plain,
+  PortsRetained: G133Ports.retained,
+  SitesPlain: G133Sites.plain,
+  SitesRetained: G133Sites.retained,
+  SlotsPlain: G133Slots.plain,
+  SlotsRetained: G133Slots.retained,
+  TasksPlain: G133Tasks.plain,
+  TasksRetained: G133Tasks.retained,
+  BindingsPlain: G133Bindings.plain,
+  BindingsRetained: G133Bindings.retained,
+  AccountsPlain: G133Accounts.plain,
+  AccountsRetained: G133Accounts.retained,
+  Counters: G133Counters,
+  AccountsBare: Entity.make({
+    model: G133Account,
+    entityType: "G133AccountBare",
+    primaryKey: g133IdKey as any,
+    unique: { email: ["email"] },
+    timestamps: true,
+  }),
+  SoftDevices: Entity.make({
+    model: G133Device,
+    entityType: "G133SoftDevice",
+    primaryKey: g133IdKey as any,
+    timestamps: true,
+    versioned: { retain: true },
+    softDelete: true,
+  }),
+  SoftAccounts: Entity.make({
+    model: G133Account,
+    entityType: "G133SoftAccount",
+    primaryKey: g133IdKey as any,
+    unique: { email: ["email"] },
+    timestamps: true,
+    softDelete: true,
+  }),
+  Ledgers: Entity.make({
+    model: DynamoModel.configure(G133Ledger, { book: { immutable: true } }),
+    entityType: "G133Ledger",
+    primaryKey: g133IdKey as any,
+    timestamps: true,
+    versioned: true,
+  }),
+  LedgersRetained: Entity.make({
+    model: DynamoModel.configure(G133Ledger, { book: { immutable: true } }),
+    entityType: "G133LedgerRetained",
+    primaryKey: g133IdKey as any,
+    timestamps: true,
+    versioned: { retain: true },
+  }),
+  Authors: G133Authors,
+  Coded: Entity.make({
+    model: G133Coded,
+    entityType: "G133Coded",
+    primaryKey: g133IdKey as any,
+    indexes: {
+      byCode: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["code"] },
+        sk: { field: "gsi1sk", composite: [] },
+      },
+    },
+    unique: { code: ["code"], handle: ["handle"] },
+    timestamps: true,
+  }),
+  SoftVersioned: Entity.make({
+    model: G133Account,
+    entityType: "G133SoftVersioned",
+    primaryKey: g133IdKey as any,
+    versioned: true,
+    softDelete: true,
+  }),
+  Defaults: Entity.make({
+    model: G133Defaults,
+    entityType: "G133Defaults",
+    primaryKey: g133IdKey as any,
+    indexes: {
+      byTier: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["tier"] },
+        sk: { field: "gsi1sk", composite: ["born"] },
+      },
+    },
+    timestamps: true,
+  }),
+  WideStamped: Entity.make({
+    model: DynamoModel.configure(G133Wide, { totals: { storedAs: DynamoModel.SparseMap() } }),
+    entityType: "G133WideStamped",
+    primaryKey: g133IdKey as any,
+    unique: { email: ["email"] },
+    timestamps: true,
+    softDelete: true,
+  }),
+  WideBare: Entity.make({
+    model: DynamoModel.configure(G133Wide, { totals: { storedAs: DynamoModel.SparseMap() } }),
+    entityType: "G133WideBare",
+    primaryKey: g133IdKey as any,
+    unique: { email: ["email"] },
+    softDelete: true,
+  }),
+  Sparse: Entity.make({
+    model: G133Sparse,
+    entityType: "G133Sparse",
+    primaryKey: g133IdKey as any,
+    indexes: {
+      byTeam: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["team"] },
+        sk: { field: "gsi1sk", composite: ["rank"] },
+      },
+    },
+    timestamps: true,
+    versioned: true,
+  }),
+  Vecs: Entity.make({ model: G133Vec, entityType: "G133Vec", primaryKey: g133IdKey as any }),
+  Seqs: Entity.make({
+    model: G133Seq,
+    entityType: "G133Seq",
+    primaryKey: {
+      pk: { field: "pk", composite: ["tenant"] },
+      sk: { field: "sk", composite: ["seq"] },
+    } as any,
+    versioned: { retain: true },
+  }),
+  Hyphens: Entity.make({
+    model: DynamoModel.configure(G133Named, {
+      label: { field: "the-label" },
+      addr: { field: "ad" },
+    } as any),
+    entityType: "G133Hyphen",
+    primaryKey: {
+      pk: { field: "pk", composite: ["grp"] },
+      sk: { field: "sk", composite: ["hid"] },
+    } as any,
+    indexes: g133NamedIndex("hid") as any,
+  }),
+  PlainHyphens: Entity.make({
+    model: G133Named,
+    entityType: "G133PlainHyphen",
+    primaryKey: {
+      pk: { field: "pk", composite: ["grp"] },
+      sk: { field: "sk", composite: ["hid"] },
+    } as any,
+  }),
+  NamedThirds: Entity.make({
+    model: G133NamedThird,
+    entityType: "G133NamedThird",
+    primaryKey: {
+      pk: { field: "pk", composite: ["grp"] },
+      sk: { field: "sk", composite: ["tid"] },
+    } as any,
+    indexes: g133NamedIndex("tid") as any,
+  }),
+  NamedOthers: Entity.make({
+    model: DynamoModel.configure(G133NamedOther, { label: { field: "nlabel" } } as any),
+    entityType: "G133NamedOther",
+    primaryKey: {
+      pk: { field: "pk", composite: ["grp"] },
+      sk: { field: "sk", composite: ["nid"] },
+    } as any,
+    indexes: g133NamedIndex("nid") as any,
+  }),
+  OrAs: Entity.make({
+    model: G133OrA,
+    entityType: "G133OrA",
+    primaryKey: {
+      pk: { field: "pk", composite: ["owner"] },
+      sk: { field: "sk", composite: ["aid"] },
+    } as any,
+    indexes: g133OrIndex("aid") as any,
+  }),
+  OrBs: Entity.make({
+    model: G133OrB,
+    entityType: "G133OrB",
+    primaryKey: {
+      pk: { field: "pk", composite: ["owner"] },
+      sk: { field: "sk", composite: ["bid"] },
+    } as any,
+    indexes: g133OrIndex("bid") as any,
+  }),
+  Readings: Entity.make({
+    model: G133Reading,
+    entityType: "G133Reading",
+    primaryKey: {
+      pk: { field: "pk", composite: ["ch"] },
+      sk: { field: "sk", composite: ["dev"] },
+    } as any,
+    timeSeries: { orderBy: "ts", appendInput: G133ReadingInput },
+  }),
+  SubDeleted: Entity.make({
+    model: G133Sub,
+    entityType: "G133SubDel",
+    primaryKey: {
+      collection: ["G133SubDel", "deleted"],
+      type: "clustered",
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
+    } as any,
+    softDelete: true,
+  }),
+  SubVersioned: Entity.make({
+    model: G133Sub,
+    entityType: "G133SubV",
+    primaryKey: {
+      collection: ["G133SubV", "v"],
+      type: "clustered",
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
+    } as any,
+    versioned: { retain: true },
+  }),
+  POrders: Entity.make({
+    model: G133POrder,
+    entityType: "G133POrder",
+    primaryKey: g133OrderKey([]) as any,
+    timestamps: true,
+    versioned: { retain: true },
+    softDelete: true,
+  }),
+  PLines: Entity.make({
+    model: G133PLine,
+    entityType: "G133PLine",
+    primaryKey: g133OrderKey(["lineId"]) as any,
+  }),
+
+  Lines: Entity.make({
+    model: G133Line,
+    entityType: "G133Line",
+    primaryKey: g133LineKey as any,
+    timestamps: true,
+    versioned: { retain: true },
+  }),
+  SoftLines: Entity.make({
+    model: G133Line,
+    entityType: "G133SoftLine",
+    primaryKey: g133LineKey as any,
+    timestamps: true,
+    versioned: { retain: true },
+    softDelete: true,
+  }),
+  Articles: Entity.make({
+    model: G133Article,
+    entityType: "G133Article",
+    primaryKey: {
+      pk: { field: "pk", composite: ["articleId"] },
+      sk: { field: "sk", composite: [] },
+    } as any,
+    indexes: {
+      byAuthor: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["authorId"] },
+        sk: { field: "gsi1sk", composite: ["articleId"] },
+      },
+    },
+    refs: { author: { entity: G133Authors } },
+  }),
+}
+const G133Table = Table.make({ schema: G133Schema, entities: g133Entities })
+const g133Tables = {
+  record: `edd133g-record-${Date.now()}`,
+  path: `edd133g-path-${Date.now()}`,
+} as const
+/** A stream on the same table, to write guarded puts as `additionalItems`. */
+class G133Noted extends Schema.Class<G133Noted>("G133Noted")({ note: Schema.String }) {}
+const G133Feed = EventStore.makeStream({
+  table: G133Table,
+  streamName: "G133Feed",
+  events: [G133Noted],
+  streamId: { composite: ["feedId"] },
+})
+const g133Layer = (name: string) => Layer.mergeAll(ClientLayer, G133Table.layer({ name }))
+const g133Client = DynamoClient.make({ entities: g133Entities, tables: { G133Table } })
+
+/**
+ * The bound accessors are driven through `any` (one table serves every shape),
+ * which leaves the requirements `unknown`; the layers provide them.
+ */
+const g133Closed = <A, E>(effect: Effect.Effect<A, E, unknown>): Effect.Effect<A, E> =>
+  effect as Effect.Effect<A, E>
+/** A hook's effect with its layers' scope closed, so it can run anywhere. */
+const g133Hook = (effect: Effect.Effect<void, unknown, any>): Effect.Effect<void, unknown> =>
+  Effect.scoped(effect) as Effect.Effect<void, unknown>
+/** One-shot hooks run around the next PutItem / UpdateItem / TransactWriteItems. */
+const g133Inject: {
+  before?: Effect.Effect<void, unknown> | undefined
+  after?: Effect.Effect<void, unknown> | undefined
+} = {}
+const G133InjectingClient = Layer.effect(
+  DynamoClient,
+  Effect.gen(function* () {
+    const real = yield* DynamoClient
+    const around = <A, E>(call: Effect.Effect<A, E>) =>
+      Effect.gen(function* () {
+        const before = g133Inject.before
+        g133Inject.before = undefined
+        if (before) yield* Effect.orDie(before)
+        const out = yield* call
+        const after = g133Inject.after
+        g133Inject.after = undefined
+        if (after) yield* Effect.orDie(after)
+        return out
+      })
+    return {
+      ...real,
+      putItem: (input) => around(real.putItem(input)),
+      updateItem: (input) => around(real.updateItem(input)),
+      transactWriteItems: (input) => around(real.transactWriteItems(input)),
+    } satisfies DynamoClientService
+  }),
+).pipe(Layer.provide(ClientLayer))
+const g133RaceLayer = Layer.mergeAll(
+  G133InjectingClient,
+  G133Table.layer({ name: g133Tables.record }),
+)
+
+// Items written before an entity was `versioned` (#133): the same entity type
+// defined without and with versioning, against the same physical table.
+class G133LegacyDoc extends Schema.Class<G133LegacyDoc>("G133LegacyDoc")({
+  id: Schema.String,
+  name: Schema.String,
+  email: Schema.optional(Schema.String),
+  tags: Schema.optional(Schema.Array(Schema.String)),
+}) {}
+const g133Legacy = (
+  entityType: string,
+  extra: Record<string, unknown>,
+  versioned: boolean | { readonly retain: true },
+) =>
+  Entity.make({
+    model: G133LegacyDoc,
+    entityType,
+    primaryKey: g133IdKey as any,
+    indexes: {
+      byName: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["name"] },
+        sk: { field: "gsi1sk", composite: [] },
+      },
+    },
+    ...extra,
+    ...(versioned === false ? {} : { versioned }),
+  } as any)
+const g133LegacyPairs = {
+  Plain: [g133Legacy("G133LegacyPlain", {}, false), g133Legacy("G133LegacyPlain", {}, true)],
+  Ret: [g133Legacy("G133LegacyRet", {}, false), g133Legacy("G133LegacyRet", {}, { retain: true })],
+  Uniq: [
+    g133Legacy("G133LegacyUniq", { unique: { email: ["email"] } }, false),
+    g133Legacy("G133LegacyUniq", { unique: { email: ["email"] } }, true),
+  ],
+  Soft: [
+    g133Legacy("G133LegacySoft", { softDelete: true }, false),
+    g133Legacy("G133LegacySoft", { softDelete: true }, { retain: true }),
+  ],
+} as const
+/** A client for one side (0: before `versioned`, 1: after) of one pair. */
+const g133LegacyClient = (pair: keyof typeof g133LegacyPairs, side: 0 | 1) => {
+  const entity = g133LegacyPairs[pair][side]
+  const table = Table.make({ schema: G133Schema, entities: { Doc: entity } as any })
+  return {
+    entity,
+    layer: table.layer({ name: g133Tables.record }),
+    client: DynamoClient.make({ entities: { Doc: entity }, tables: { T: table } } as any),
+  }
+}
+
+describeConnected("#133 — path operations on index composites and unique fields", () => {
+  beforeAll(async () => {
+    for (const name of Object.values(g133Tables)) {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const db = yield* g133Client
+          yield* db.tables.G133Table.create()
+        }).pipe(Effect.provide(g133Layer(name)), Effect.scoped),
+      )
+    }
+  }, 30000)
+
+  afterAll(async () => {
+    for (const name of Object.values(g133Tables)) {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const client = yield* DynamoClient
+          yield* client.deleteTable({ TableName: name })
+        }).pipe(
+          Effect.provide(g133Layer(name)),
+          Effect.scoped,
+          Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+        ),
+      )
+    }
+  }, 30000)
+
+  type Build = (u: any) => any
+  const pathSet =
+    (field: string, value: unknown): Build =>
+    (u) =>
+      u.pathSet({ segments: [field], value, isPath: false })
+  const shapes: ReadonlyArray<readonly [string, string, Record<string, unknown>, Build, Build]> = [
+    [
+      "1. multi-writer: PK-half composite",
+      "Devices",
+      { id: "mw", owner: "alice", reading: "r1", seq: 1, label: "l" },
+      (u) => u.set({ owner: "bob" }),
+      pathSet("owner", "bob"),
+    ],
+    [
+      "1. multi-writer: numeric SK-half composite",
+      "Devices",
+      { id: "mwn", owner: "alice", reading: "r1", seq: 1 },
+      (u) => u.add({ seq: 2 }),
+      (u) => u.pathAdd({ segments: ["seq"], value: 2 }),
+    ],
+    [
+      "2. PK-composites-only: a non-composite write",
+      "Ports",
+      { channel: "c1", deviceId: "x1", label: "l" },
+      (u) => u.set({ label: "m" }),
+      (u) => u.set({ label: "m" }),
+    ],
+    [
+      "3. hierarchical: parents set, leaf removed",
+      "Sites",
+      { id: "h", region: "emea", country: "uk", city: "ldn", site: "dc1" },
+      (u) => u.set({ region: "emea", country: "uk", city: "mcr" }).remove(["site"]),
+      (u) =>
+        u
+          .pathSet({ segments: ["region"], value: "emea", isPath: false })
+          .pathSet({ segments: ["country"], value: "uk", isPath: false })
+          .pathSet({ segments: ["city"], value: "mcr", isPath: false })
+          .pathRemove(["site"]),
+    ],
+    [
+      "3. hierarchical: a lone leaf",
+      "Sites",
+      { id: "hl", region: "emea", country: "uk", city: "ldn", site: "dc1" },
+      (u) => u.set({ city: "mcr" }),
+      pathSet("city", "mcr"),
+    ],
+    [
+      "4. hole pattern",
+      "Slots",
+      { id: "hp", tenant: "t1", trail: "z1" },
+      (u) => u.set({ trail: "z2" }),
+      pathSet("trail", "z2"),
+    ],
+    [
+      "5. all composites mutable",
+      "Tasks",
+      { id: "am", category: "a", priority: "low" },
+      (u) => u.set({ category: "b", priority: "high" }),
+      (u) =>
+        u
+          .pathSet({ segments: ["category"], value: "b", isPath: false })
+          .pathSet({ segments: ["priority"], value: "high", isPath: false }),
+    ],
+    [
+      "6. empty-composite half: set",
+      "Bindings",
+      { id: "eh", deviceBinding: "db1" },
+      (u) => u.set({ deviceBinding: "db2" }),
+      pathSet("deviceBinding", "db2"),
+    ],
+    [
+      "6. empty-composite half: remove",
+      "Bindings",
+      { id: "ehr", deviceBinding: "db1" },
+      (u) => u.remove(["deviceBinding"]),
+      (u) => u.pathRemove(["deviceBinding"]),
+    ],
+    [
+      "unique constraint: set",
+      "Accounts",
+      { id: "us", email: "us@x.io", name: "n" },
+      (u) => u.set({ email: "us2@x.io" }),
+      pathSet("email", "us2@x.io"),
+    ],
+    [
+      "unique constraint: remove",
+      "Accounts",
+      { id: "ur", email: "ur@x.io", name: "n" },
+      (u) => u.remove(["email"]),
+      (u) => u.pathRemove(["email"]),
+    ],
+  ]
+
+  const scanAll = (name: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { Items } = yield* client.scan({ TableName: name, ConsistentRead: true })
+      return (
+        (Items ?? [])
+          .map((item) => item as Record<string, any>)
+          // Each create draws its own random incarnation token.
+          .map((item) =>
+            item.__edd_i__ === undefined ? item : { ...item, __edd_i__: { S: "<incarnation>" } },
+          )
+          .sort((a, b) => `${a.pk.S}|${a.sk.S}`.localeCompare(`${b.pk.S}|${b.sk.S}`))
+      )
+    }).pipe(Effect.provide(g133Layer(name)))
+
+  it.effect("pathSet / pathRemove store exactly what .set() / .remove() store", () =>
+    Effect.gen(function* () {
+      for (const variant of ["Plain", "Retained"] as const) {
+        for (const [label, entity, seed, viaRecord, viaPath] of shapes) {
+          for (const [form, build] of [
+            ["record", viaRecord],
+            ["path", viaPath],
+          ] as const) {
+            yield* Effect.gen(function* () {
+              const db = yield* g133Client
+              const bound = (db.entities as Record<string, any>)[`${entity}${variant}`]
+              yield* bound.put(seed)
+              const key = Object.fromEntries(
+                Object.entries(seed).filter(([k]) => ["id", "channel", "deviceId"].includes(k)),
+              )
+              const out = yield* Effect.exit(
+                Effect.suspend(() => build(bound.update(key)).asEffect() as Effect.Effect<unknown>),
+              )
+              expect([variant, label, form, out._tag]).toEqual([variant, label, form, "Success"])
+            }).pipe(Effect.provide(g133Layer(g133Tables[form])))
+          }
+        }
+      }
+      const record = yield* scanAll(g133Tables.record)
+      const path = yield* scanAll(g133Tables.path)
+      expect(path).toEqual(record)
+      // The keys moved: spot-check one per shape in the stored rows.
+      const keysOf = (pk: string) =>
+        record.filter((i) => i.pk.S === pk).map((i) => [i.sk.S, i.gsi1pk?.S, i.gsi1sk?.S])
+      expect(keysOf("$edd133g#v1#g133deviceplain#id_mw")[0]![1]).toBe(
+        "$edd133g#v1#g133deviceplain#owner_bob",
+      )
+      expect(keysOf("$edd133g#v1#g133deviceplain#id_mwn")[0]![2]).toMatch(/#seq_0+3$/)
+      expect(keysOf("$edd133g#v1#g133siteplain#id_h")[0]![2]).toMatch(/#city_mcr$/)
+      expect(keysOf("$edd133g#v1#g133bindingplain#id_eh")[0]![1]).toMatch(/#devicebinding_db2$/)
+      expect(keysOf("$edd133g#v1#g133bindingplain#id_ehr")[0]![1]).toBeUndefined()
+      const sentinels = record.filter((i) => String(i.__edd_e__?.S).includes("_unique"))
+      expect(sentinels.map((i) => i.pk.S).filter((pk) => pk.includes("us"))).toEqual(
+        expect.arrayContaining([expect.stringContaining("us2@x.io")]),
+      )
+      expect(sentinels.some((i) => String(i.pk.S).includes("us@x.io"))).toBe(false)
+      expect(sentinels.some((i) => String(i.pk.S).includes("ur@x.io"))).toBe(false)
+    }).pipe(g133Closed),
+  )
+
+  it.effect("refuses path operations DynamoDB would compute on a composite", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      yield* db.entities.DevicesRetained.put({ id: "rf", owner: "alice", reading: "r1" } as any)
+      const error = yield* (db.entities.DevicesRetained as any)
+        .update({ id: "rf" })
+        .pathIfNotExists({ segments: ["owner"], value: "bob" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String(error.cause)).toContain('"owner"')
+    }).pipe(Effect.provide(g133Layer(g133Tables.record)), g133Closed),
+  )
+
+  it.effect(".add() on a composite of an unversioned entity recomposes the index key", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      yield* db.entities.Counters.put({ id: "cn", owner: "alice", reading: "r1", seq: 1 } as any)
+      const updated = (yield* (db.entities.Counters as any)
+        .update({ id: "cn" })
+        .add({ seq: 2 })) as any
+      expect(updated.seq).toBe(3)
+      const hits = yield* (db.entities.Counters as any)
+        .byOwner({ owner: "alice", reading: "r1", seq: 3 })
+        .collect()
+      expect(hits.map((h: any) => h.id)).toEqual(["cn"])
+    }).pipe(Effect.provide(g133Layer(g133Tables.record)), g133Closed),
+  )
+
+  // ---- condition failures: a lost version race vs the user's condition ----
+
+  const mainKey = (entityType: string, id: string) => ({
+    pk: { S: `$edd133g#v1#${entityType.toLowerCase()}#id_${id}` },
+    sk: { S: `$edd133g#v1#${entityType.toLowerCase()}` },
+  })
+  /** A concurrent writer: bumps the version (and label) behind our back. */
+  const bumpVersion = (entityType: string, id: string, label = "l") =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      yield* client.updateItem({
+        TableName: g133Tables.record,
+        Key: mainKey(entityType, id),
+        UpdateExpression: "SET #v = #v + :one, #l = :l",
+        ExpressionAttributeNames: { "#v": "version", "#l": "label" },
+        ExpressionAttributeValues: { ":one": { N: "1" }, ":l": { S: label } },
+      })
+    }).pipe(Effect.provide(ClientLayer))
+
+  const raceCases: ReadonlyArray<
+    readonly [string, "DevicesPlain" | "DevicesRetained", string, Build]
+  > = [
+    [
+      "plain update with expectedVersion and a condition",
+      "DevicesPlain",
+      "G133DevicePlain",
+      (u) =>
+        u
+          .set({ label: "m" })
+          .expectedVersion(1)
+          .condition({ eq: { label: "l" } }),
+    ],
+    [
+      "retain record update with a condition",
+      "DevicesRetained",
+      "G133DeviceRetained",
+      (u) => u.set({ label: "m" }).condition({ eq: { label: "l" } }),
+    ],
+    [
+      "retain path update with a condition",
+      "DevicesRetained",
+      "G133DeviceRetained",
+      (u) =>
+        u
+          .pathSet({ segments: ["label"], value: "m", isPath: false })
+          .condition({ eq: { label: "l" } }),
+    ],
+  ]
+  for (const [label, entity, entityType, build] of raceCases) {
+    it.effect(`${label}: a concurrent version bump is an OptimisticLockError`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const id = `race-${entity.toLowerCase()}-${label.length}`
+        yield* (db.entities[entity] as any).put({ id, owner: "o", reading: "r", label: "l" })
+        g133Inject.before = g133Hook(bumpVersion(entityType, id))
+        const error = yield* build((db.entities[entity] as any).update({ id }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("OptimisticLockError")
+        expect([error.expectedVersion, error.actualVersion]).toEqual([1, 2])
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+
+    it.effect(`${label}: a false condition without a race is a ConditionalCheckFailed`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const id = `cond-${entity.toLowerCase()}-${label.length}`
+        yield* (db.entities[entity] as any).put({ id, owner: "o", reading: "r", label: "other" })
+        const error = yield* build((db.entities[entity] as any).update({ id }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ConditionalCheckFailed")
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+  }
+
+  // ---- the retain path update returns its own post-image ----
+
+  it.effect("returns our post-image although a later retain write replaced it", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const id = "post"
+      yield* db.entities.DevicesRetained.put({
+        id,
+        owner: "alice",
+        reading: "r1",
+        seq: 1,
+        label: "l",
+      } as any)
+      const client = yield* DynamoClient
+      let ours: Record<string, any> | undefined
+      g133Inject.after = g133Hook(
+        Effect.gen(function* () {
+          // The item exactly as our update left it, then another retain write.
+          ours = (yield* client.getItem({
+            TableName: g133Tables.record,
+            Key: mainKey("G133DeviceRetained", id),
+            ConsistentRead: true,
+          })).Item
+          const other = yield* g133Client
+          yield* (other.entities.DevicesRetained as any).update({ id }).set({ label: "theirs" })
+        }).pipe(Effect.provide(g133Layer(g133Tables.record))),
+      )
+      const native = yield* Entity.asNative(
+        Entity.pathSet((G133Devices.retained as any).update({ id }), {
+          segments: ["label"],
+          value: "m",
+          isPath: false,
+        }),
+      )
+      expect(ours?.label).toEqual({ S: "m" })
+      expect(native).toEqual(ours)
+      const live = yield* db.entities.DevicesRetained.get({ id } as any)
+      expect((live as any).label).toBe("theirs")
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("returns the model of our post-image, and fails clearly once it is gone", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const id = "post2"
+      yield* db.entities.DevicesRetained.put({ id, owner: "alice", label: "l" } as any)
+      g133Inject.after = g133Hook(
+        Effect.gen(function* () {
+          const other = yield* g133Client
+          yield* (other.entities.DevicesRetained as any).update({ id }).set({ label: "theirs" })
+        }).pipe(Effect.provide(g133Layer(g133Tables.record))),
+      )
+      const mine = (yield* (db.entities.DevicesRetained as any)
+        .update({ id })
+        .pathSet({ segments: ["label"], value: "m", isPath: false })) as any
+      expect(mine.label).toBe("m")
+
+      // A writer that leaves no snapshot (a raw write) — nothing exact to return.
+      g133Inject.after = g133Hook(bumpVersion("G133DeviceRetained", id, "raw"))
+      const error = yield* (db.entities.DevicesRetained as any)
+        .update({ id })
+        .pathSet({ segments: ["label"], value: "n", isPath: false })
+        .asEffect()
+        .pipe(Effect.flip)
+      // The write WAS applied — a distinct error that says so, never a retry.
+      expect(error._tag).toBe("UpdateAppliedButUnreadable")
+      expect(error.version).toBe(4)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("returnValues('allOld') returns the item the update replaced", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      for (const [id, build] of [
+        ["old-path", (u: any) => u.pathSet({ segments: ["label"], value: "m", isPath: false })],
+        ["old-record", (u: any) => u.set({ label: "m" })],
+      ] as const) {
+        yield* db.entities.DevicesRetained.put({ id, owner: "alice", label: "l" } as any)
+        const old = (yield* build((db.entities.DevicesRetained as any).update({ id })).returnValues(
+          "allOld",
+        )) as any
+        expect([id, old.label, old.version]).toEqual([id, "l", 1])
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- read-then-write updates: guarded Update, never a whole-item Put ----
+
+  const rawItem = (entityType: string, id: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      return (yield* client.getItem({
+        TableName: g133Tables.record,
+        Key: mainKey(entityType, id),
+        ConsistentRead: true,
+      })).Item as Record<string, any>
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+  /** A concurrent raw write of one attribute behind the update's back. */
+  const rawSet = (entityType: string, id: string, attr: string, value: Record<string, unknown>) =>
+    g133Hook(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.updateItem({
+          TableName: g133Tables.record,
+          Key: mainKey(entityType, id),
+          UpdateExpression: "SET #a = :v",
+          ExpressionAttributeNames: { "#a": attr },
+          ExpressionAttributeValues: { ":v": value as any },
+        })
+      }).pipe(Effect.provide(ClientLayer)),
+    )
+
+  it.effect("stores exactly the read item plus the update's changes", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      yield* db.entities.AccountsBare.put({ id: "ex1", email: "ex1@x.io", name: "n" } as any)
+      const before = yield* rawItem("G133AccountBare", "ex1")
+      yield* (db.entities.AccountsBare as any).update({ id: "ex1" }).set({ email: "ex1b@x.io" })
+      expect(yield* rawItem("G133AccountBare", "ex1")).toEqual({
+        ...before,
+        email: { S: "ex1b@x.io" },
+      })
+
+      yield* db.entities.Counters.put({ id: "ex2", owner: "o", reading: "r", seq: 1 } as any)
+      const counter = yield* rawItem("G133Counter", "ex2")
+      yield* (db.entities.Counters as any).update({ id: "ex2" }).add({ seq: 2 })
+      expect(yield* rawItem("G133Counter", "ex2")).toEqual({
+        ...counter,
+        seq: { N: "3" },
+        gsi1sk: { S: counter.gsi1sk.S.replace(/seq_0+1$/, "seq_0000000000000003") },
+      })
+
+      yield* db.entities.DevicesRetained.put({ id: "ex3", owner: "o", label: "l" } as any)
+      const retained = yield* rawItem("G133DeviceRetained", "ex3")
+      yield* (db.entities.DevicesRetained as any).update({ id: "ex3" }).set({ label: "m" })
+      expect(yield* rawItem("G133DeviceRetained", "ex3")).toEqual({
+        ...retained,
+        label: { S: "m" },
+        version: { N: "2" },
+        // The owner composite composes the PK half of byOwner on update (the
+        // put left both halves out: its SK composites are missing).
+        gsi1pk: { S: "$edd133g#v1#g133deviceretained#owner_o" },
+      })
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  const readThenWrite: ReadonlyArray<
+    readonly [
+      string,
+      "AccountsBare" | "Counters",
+      string,
+      Record<string, unknown>,
+      Build,
+      string,
+      string,
+    ]
+  > = [
+    [
+      "unique-field change (transacted)",
+      "AccountsBare",
+      "G133AccountBare",
+      { email: "rw@x.io", name: "n" },
+      (u) => u.set({ email: "rw2@x.io" }),
+      "name",
+      "email",
+    ],
+    [
+      "computed GSI composite (single UpdateItem)",
+      "Counters",
+      "G133Counter",
+      { owner: "o", reading: "r", seq: 1, label: "l" },
+      (u) => u.add({ seq: 2 }),
+      "label",
+      "reading",
+    ],
+  ]
+  for (const [label, entity, entityType, seed, build, unrelated, input] of readThenWrite) {
+    it.effect(`${label}: a concurrent change to an unrelated attribute is preserved`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const id = `un-${entity.toLowerCase()}`
+        yield* (db.entities[entity] as any).put({ id, ...seed, email: `${id}@x.io` })
+        g133Inject.before = rawSet(entityType, id, unrelated, { S: "theirs" })
+        yield* build((db.entities[entity] as any).update({ id })).asEffect()
+        const stored = yield* rawItem(entityType, id)
+        expect(stored[unrelated]).toEqual({ S: "theirs" })
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+
+    it.effect(`${label}: a concurrent change to an input is rejected`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const id = `in-${entity.toLowerCase()}`
+        yield* (db.entities[entity] as any).put({ id, ...seed, email: `${id}@x.io` })
+        g133Inject.before = rawSet(entityType, id, input, { S: "theirs" })
+        const error = yield* build((db.entities[entity] as any).update({ id }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ConcurrentModification")
+        expect(error.attributes).toEqual([input])
+        expect(Option.isSome(error.current)).toBe(true)
+        const stored = yield* rawItem(entityType, id)
+        expect(stored[input]).toEqual({ S: "theirs" })
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+  }
+
+  // ---- returnValues: every mode on every update branch ----
+
+  const branches: ReadonlyArray<
+    readonly [
+      string,
+      keyof typeof g133Entities,
+      Record<string, unknown>,
+      Build,
+      Record<string, unknown>,
+      Record<string, unknown>,
+    ]
+  > = [
+    [
+      "plain UpdateItem",
+      "DevicesPlain",
+      { owner: "o", label: "l" },
+      (u) => u.set({ label: "m" }),
+      { label: "l" },
+      { label: "m" },
+    ],
+    [
+      "read-then-write UpdateItem",
+      "Counters",
+      { owner: "o", reading: "r", seq: 1, label: "l" },
+      (u) => u.add({ seq: 2 }),
+      { seq: 1 },
+      { seq: 3 },
+    ],
+    [
+      "read-then-write transaction",
+      "AccountsBare",
+      { email: "rv@x.io", name: "n" },
+      (u) => u.set({ email: "rv2@x.io" }),
+      { email: "rv@x.io" },
+      { email: "rv2@x.io" },
+    ],
+    [
+      "retain record update",
+      "DevicesRetained",
+      { owner: "o", label: "l" },
+      (u) => u.set({ label: "m" }),
+      { label: "l" },
+      { label: "m" },
+    ],
+    [
+      "retain path update",
+      "DevicesRetained",
+      { owner: "o", label: "l" },
+      (u) => u.pathSet({ segments: ["label"], value: "m", isPath: false }),
+      { label: "l" },
+      { label: "m" },
+    ],
+  ]
+  const modes = ["none", "allNew", "allOld", "updatedNew", "updatedOld"] as const
+  for (const [index, [label, entity, seed, build, , newPart]] of branches.entries()) {
+    it.effect(`returnValues on a ${label}`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const bound = db.entities[entity] as any
+        for (const mode of modes) {
+          const id = `rv-${index}-${mode.toLowerCase()}`
+          const email =
+            typeof seed.email === "string" ? `${mode.toLowerCase()}-${seed.email}` : undefined
+          const nextEmail =
+            typeof newPart.email === "string" ? `${mode.toLowerCase()}-${newPart.email}` : undefined
+          yield* bound.put({ id, ...seed, ...(email !== undefined && { email }) })
+          const before = yield* bound.get({ id })
+          const update = build(bound.update({ id }))
+          const result = yield* (
+            nextEmail !== undefined ? update.set({ email: nextEmail }) : update
+          )
+            .returnValues(mode)
+            .asEffect()
+          const after = yield* bound.get({ id })
+          // The written attributes: the update's own, plus the system fields
+          // every update writes (the bound client decodes in record mode).
+          const writtenFields = [
+            ...Object.keys(nextEmail !== undefined ? { email: nextEmail } : newPart),
+            ...["updatedAt", "version"].filter((field) => field in after),
+          ]
+          const pick = (item: Record<string, unknown>) =>
+            Object.fromEntries(writtenFields.map((field) => [field, item[field]]))
+          const expected = {
+            none: undefined,
+            allNew: after,
+            allOld: before,
+            updatedNew: pick(after),
+            updatedOld: pick(before),
+          }[mode]
+          expect([label, mode, result]).toEqual([label, mode, expected])
+        }
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+  }
+
+  it.effect("returnValues partials in record and native modes", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      yield* db.entities.DevicesPlain.put({ id: "rvn", owner: "o", label: "l" } as any)
+      const record = (yield* Entity.asRecord(
+        Entity.returnValues(
+          (G133Devices.plain as any).update({ id: "rvn" }).pipe(Entity.set({ label: "m" } as any)),
+          "updatedNew",
+        ),
+      )) as any
+      expect(Object.keys(record).sort()).toEqual(["label", "updatedAt", "version"])
+      expect([record.label, record.version]).toEqual(["m", 2])
+      const native = yield* Entity.asNative(
+        Entity.returnValues(
+          (G133Devices.plain as any).update({ id: "rvn" }).pipe(Entity.set({ label: "n" } as any)),
+          "updatedOld",
+        ),
+      )
+      expect(Object.keys(native).sort()).toEqual(["label", "updatedAt", "version"])
+      expect(native.label).toEqual({ S: "m" })
+      const none = yield* Entity.asNative(
+        Entity.returnValues(
+          (G133Devices.plain as any).update({ id: "rvn" }).pipe(Entity.set({ label: "o" } as any)),
+          "none",
+        ),
+      )
+      expect(none).toBeUndefined()
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- incarnations: a deleted-and-recreated item is never mistaken for ours ----
+
+  const rawDelete = (entityType: string, id: string) =>
+    g133Hook(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteItem({
+          TableName: g133Tables.record,
+          Key: mainKey(entityType, id),
+        })
+      }).pipe(Effect.provide(ClientLayer)),
+    )
+  /**
+   * A new incarnation of the item at version 1 — written raw, as an outside
+   * writer (or a pre-#133 library) would: the library's own re-create continues
+   * the version sequence past the earlier incarnation's history. `withHistory`
+   * also writes this incarnation's own `v#0000001` snapshot.
+   */
+  const recreateRaw = (id: string, label: string, withHistory = false) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const item = {
+        ...mainKey("G133DeviceRetained", id),
+        __edd_e__: { S: "G133DeviceRetained" },
+        __edd_i__: { S: crypto.randomUUID() },
+        id: { S: id },
+        owner: { S: "o" },
+        label: { S: label },
+        version: { N: "1" },
+        createdAt: { S: "1970-01-01T00:00:00.000Z" },
+        updatedAt: { S: "1970-01-01T00:00:00.000Z" },
+      }
+      yield* client.putItem({ TableName: g133Tables.record, Item: item })
+      if (withHistory) {
+        yield* client.putItem({
+          TableName: g133Tables.record,
+          Item: { ...item, sk: { S: "$edd133g#v1#g133deviceretained#v#0000001" } },
+        })
+      }
+    }).pipe(Effect.provide(ClientLayer))
+  const recreate = (id: string, label: string, withHistory = false) =>
+    g133Hook(recreateRaw(id, label, withHistory))
+  const snapshotKey = (id: string, version: number) => ({
+    pk: { S: `$edd133g#v1#g133deviceretained#id_${id}` },
+    sk: { S: `$edd133g#v1#g133deviceretained#v#${String(version).padStart(7, "0")}` },
+  })
+  const snapshotRow = (id: string, version: number) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      return (yield* client.getItem({
+        TableName: g133Tables.record,
+        Key: snapshotKey(id, version),
+        ConsistentRead: true,
+      })).Item as Record<string, any> | undefined
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+  /** A snapshot gone — as a `versioned.ttl` expiry removes the oldest first. */
+  const dropSnapshot = (id: string, version: number) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      yield* client.deleteItem({ TableName: g133Tables.record, Key: snapshotKey(id, version) })
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+
+  for (const [label, after] of [
+    ["a hard delete", (id: string) => rawDelete("G133DeviceRetained", id)],
+    [
+      "a delete and re-create",
+      (id: string) => Effect.andThen(rawDelete("G133DeviceRetained", id), recreate(id, "LATER")),
+    ],
+  ] as const) {
+    it.effect(
+      `a retain path update never returns an earlier incarnation's snapshot (${label})`,
+      () =>
+        Effect.gen(function* () {
+          const db = yield* g133Client
+          const id = `stale-${label.length}`
+          const docs = db.entities.DevicesRetained as any
+          // Incarnation 1: versions 1..3 — its v#1 and v#2 snapshots outlive
+          // the delete.
+          yield* docs.put({ id, owner: "o", label: "OLD1" })
+          yield* docs.update({ id }).set({ label: "OLD2" })
+          yield* docs.update({ id }).set({ label: "OLD3" })
+          yield* docs.delete({ id })
+          // Incarnation 2 at version 1, written raw, with incarnation 1's v#1
+          // expired: its update to version 2 snapshots v#1 and commits — while
+          // v#2 still holds incarnation 1's history.
+          yield* recreateRaw(id, "NEW").pipe(Effect.scoped)
+          yield* dropSnapshot(id, 1)
+          // Once the update commits, the item is deleted (and re-created), so
+          // its post-image can only come from a v#2 snapshot of ITS incarnation
+          // — and the v#2 there is incarnation 1's.
+          g133Inject.after = after(id)
+          const error = yield* docs
+            .update({ id })
+            .pathSet({ segments: ["label"], value: "mine", isPath: false })
+            .asEffect()
+            .pipe(Effect.flip)
+          g133Inject.after = undefined
+          expect([error._tag, error.version]).toEqual(["UpdateAppliedButUnreadable", 2])
+          // The update was applied: its own snapshot of the item it replaced.
+          expect((yield* snapshotRow(id, 1))?.label).toEqual({ S: "NEW" })
+          expect((yield* snapshotRow(id, 2))?.label).toEqual({ S: "OLD2" })
+        }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+  }
+
+  for (const [label, build] of [
+    ["record", (u: any) => u.set({ label: "mine" })],
+    ["path", (u: any) => u.pathSet({ segments: ["label"], value: "mine", isPath: false })],
+  ] as const) {
+    it.effect(`a ${label} retain update rejects a re-created item at the same version`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const id = `aba-${label}`
+        const docs = db.entities.DevicesRetained as any
+        yield* docs.put({ id, owner: "o", label: "first" })
+        // Between our read and our write: delete, and re-create at version 1 —
+        // with the new incarnation's own v#1 snapshot.
+        g133Inject.before = Effect.andThen(
+          rawDelete("G133DeviceRetained", id),
+          recreate(id, "second", true),
+        )
+        const error = yield* build(docs.update({ id })).asEffect().pipe(Effect.flip)
+        expect(error._tag).toBe("OptimisticLockError")
+        const live = yield* rawItem("G133DeviceRetained", id)
+        expect([live.label, live.version]).toEqual([{ S: "second" }, { N: "1" }])
+        // The new incarnation's v#1 is untouched: our snapshot of "first" was
+        // never written over it.
+        expect((yield* snapshotRow(id, 1))?.label).toEqual({ S: "second" })
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+  }
+
+  it.effect(".set() of a primary-key composite or an immutable field is refused", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      yield* db.entities.DevicesPlain.put({ id: "pkset", owner: "o", label: "l" } as any)
+      const error = yield* (db.entities.DevicesPlain as any)
+        .update({ id: "pkset" })
+        .set({ id: "other", label: "m" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String(error.cause)).toContain('"id"')
+      // The same value is the key itself — a no-op, not a refusal.
+      const same = (yield* (db.entities.DevicesPlain as any)
+        .update({ id: "pkset" })
+        .set({ id: "pkset", label: "m" })) as any
+      expect(same.label).toBe("m")
+      expect((yield* rawItem("G133DevicePlain", "pkset")).label).toEqual({ S: "m" })
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- deletes and restore: guarded on what the tombstone / sentinels derive from ----
+
+  const rawSetAttrs = (entityType: string, id: string, attrs: Record<string, any>, bump = false) =>
+    g133Hook(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        const names: Record<string, string> = {}
+        const values: Record<string, any> = {}
+        const sets = Object.entries(attrs).map(([attr, value], i) => {
+          names[`#a${i}`] = attr
+          values[`:a${i}`] = value
+          return `#a${i} = :a${i}`
+        })
+        if (bump) {
+          names["#v"] = "version"
+          values[":one"] = { N: "1" }
+          sets.push("#v = #v + :one")
+        }
+        yield* client.updateItem({
+          TableName: g133Tables.record,
+          Key: mainKey(entityType, id),
+          UpdateExpression: `SET ${sets.join(", ")}`,
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: values,
+        })
+      }).pipe(Effect.provide(ClientLayer)),
+    )
+  const partition = (entityType: string, id: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { Items } = yield* client.query({
+        TableName: g133Tables.record,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: {
+          ":pk": { S: `$edd133g#v1#${entityType.toLowerCase()}#id_${id}` },
+        },
+        ConsistentRead: true,
+      })
+      return (Items ?? []).map((item) => String(item.sk?.S)).sort()
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+  const sentinelExists = (entityType: string, email: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      // Every page: wide sparse-map items fill a scan page quickly.
+      let start: Record<string, any> | undefined
+      do {
+        const page: any = yield* client.scan({
+          TableName: g133Tables.record,
+          ConsistentRead: true,
+          FilterExpression: "#e = :e",
+          ExpressionAttributeNames: { "#e": "__edd_e__" },
+          ExpressionAttributeValues: { ":e": { S: `${entityType}._unique.email` } },
+          ...(start !== undefined && { ExclusiveStartKey: start }),
+        })
+        if (
+          (page.Items ?? []).some((item: any) => String(item.pk?.S).includes(email.toLowerCase()))
+        ) {
+          return true
+        }
+        start = page.LastEvaluatedKey
+      } while (start !== undefined)
+      return false
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+
+  const sentinelExistsFor = (entityType: string, constraint: string, value: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { Item } = yield* client.getItem({
+        TableName: g133Tables.record,
+        Key: {
+          pk: { S: `$edd133g#v1#${entityType.toLowerCase()}.${constraint}#${value}` },
+          sk: { S: `$edd133g#v1#${entityType.toLowerCase()}.${constraint}` },
+        },
+        ConsistentRead: true,
+      })
+      return Item !== undefined
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+
+  it.effect("a versioned soft delete loses no concurrent update into its tombstone", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const docs = db.entities.SoftDevices as any
+      yield* docs.put({ id: "sdv", owner: "o", label: "l" })
+      // With a `.condition()`, the read it was judged against has changed: refused.
+      g133Inject.before = rawSetAttrs("G133SoftDevice", "sdv", { label: { S: "theirs" } }, true)
+      const error = yield* docs
+        .delete({ id: "sdv" })
+        .condition({ attributeExists: "id" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("OptimisticLockError")
+      expect((yield* rawItem("G133SoftDevice", "sdv")).label).toEqual({ S: "theirs" })
+      expect(yield* partition("G133SoftDevice", "sdv")).toEqual([
+        "$edd133g#v1#g133softdevice",
+        "$edd133g#v1#g133softdevice#v#0000001",
+      ])
+      // Without one, it reads the item again: the tombstone holds the update.
+      g133Inject.before = rawSetAttrs("G133SoftDevice", "sdv", { label: { S: "later" } }, true)
+      yield* docs.delete({ id: "sdv" })
+      expect((yield* docs.deleted.get({ id: "sdv" })).label).toBe("later")
+      const keys = yield* partition("G133SoftDevice", "sdv")
+      expect(keys).toHaveLength(3)
+      expect(keys[0]).toMatch(/^\$edd133g#v1#g133softdevice#deleted#/)
+      // The snapshot is of the state deleted: version 3, after both bumps.
+      expect(keys.slice(1)).toEqual([
+        "$edd133g#v1#g133softdevice#v#0000001",
+        "$edd133g#v1#g133softdevice#v#0000003",
+      ])
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("an unversioned soft delete refuses a concurrent update to any attribute", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const accounts = db.entities.SoftAccounts as any
+      yield* accounts.put({ id: "sda", email: "sda@x.io", name: "n" })
+      g133Inject.before = rawSetAttrs("G133SoftAccount", "sda", { name: { S: "theirs" } })
+      const error = yield* accounts
+        .delete({ id: "sda" })
+        .condition({ attributeExists: "id" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ConcurrentModification")
+      expect(error.attributes).toEqual(["name"])
+      expect((yield* rawItem("G133SoftAccount", "sda")).name).toEqual({ S: "theirs" })
+      expect(yield* sentinelExists("G133SoftAccount", "sda@x.io")).toBe(true)
+      // Without a condition it reads the item again, and the tombstone holds the update.
+      g133Inject.before = rawSetAttrs("G133SoftAccount", "sda", { name: { S: "later" } })
+      yield* accounts.delete({ id: "sda" })
+      expect((yield* accounts.deleted.get({ id: "sda" })).name).toBe("later")
+      expect(yield* rawItem("G133SoftAccount", "sda")).toBeUndefined()
+      expect(yield* sentinelExists("G133SoftAccount", "sda@x.io")).toBe(false)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a unique hard delete orphans no sentinel under a concurrent rotation", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const bare = db.entities.AccountsBare as any
+      yield* bare.put({ id: "hd", email: "hd@x.io", name: "n" })
+      // Another writer rotates the email (item + sentinels) between our read and write.
+      g133Inject.before = g133Hook(
+        Effect.gen(function* () {
+          const other = yield* g133Client
+          yield* (other.entities.AccountsBare as any)
+            .update({ id: "hd" })
+            .set({ email: "hd2@x.io" })
+        }).pipe(Effect.provide(g133Layer(g133Tables.record))),
+      )
+      const error = yield* bare
+        .delete({ id: "hd" })
+        .condition({ attributeExists: "id" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ConcurrentModification")
+      expect(error.attributes).toEqual(["email"])
+      expect(yield* sentinelExists("G133AccountBare", "hd2@x.io")).toBe(true)
+      // Without a condition the delete reads the item again: the rotated
+      // sentinel is the one released.
+      g133Inject.before = g133Hook(
+        Effect.gen(function* () {
+          const other = yield* g133Client
+          yield* (other.entities.AccountsBare as any)
+            .update({ id: "hd" })
+            .set({ email: "hd3@x.io" })
+        }).pipe(Effect.provide(g133Layer(g133Tables.record))),
+      )
+      yield* bare.delete({ id: "hd" })
+      expect(yield* rawItem("G133AccountBare", "hd")).toBeUndefined()
+      for (const email of ["hd@x.io", "hd2@x.io", "hd3@x.io"]) {
+        expect(yield* sentinelExists("G133AccountBare", email)).toBe(false)
+      }
+
+      // Versioned: the version + incarnation condition.
+      const plain = db.entities.AccountsPlain as any
+      yield* plain.put({ id: "hdv", email: "hdv@x.io", name: "n" })
+      g133Inject.before = rawSetAttrs("G133AccountPlain", "hdv", { name: { S: "x" } }, true)
+      const versioned = yield* plain
+        .delete({ id: "hdv" })
+        .condition({ attributeExists: "id" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(versioned._tag).toBe("OptimisticLockError")
+      expect(yield* sentinelExists("G133AccountPlain", "hdv@x.io")).toBe(true)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("restore never restores twice, nor over a live item", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const accounts = db.entities.SoftAccounts as any
+      yield* accounts.put({ id: "rs", email: "rs@x.io", name: "n" })
+      yield* accounts.delete({ id: "rs" })
+      g133Inject.before = g133Hook(
+        Effect.gen(function* () {
+          const other = yield* g133Client
+          yield* (other.entities.SoftAccounts as any).restore({ id: "rs" })
+        }).pipe(Effect.provide(g133Layer(g133Tables.record))),
+      )
+      const twice = yield* accounts.restore({ id: "rs" }).pipe(Effect.flip)
+      expect(twice._tag).toBe("ItemNotFound")
+      expect(yield* partition("G133SoftAccount", "rs")).toEqual(["$edd133g#v1#g133softaccount"])
+
+      yield* accounts.delete({ id: "rs" })
+      g133Inject.before = g133Hook(
+        Effect.gen(function* () {
+          const other = yield* g133Client
+          yield* (other.entities.SoftAccounts as any).put({
+            id: "rs",
+            email: "rs-new@x.io",
+            name: "live",
+          })
+        }).pipe(Effect.provide(g133Layer(g133Tables.record))),
+      )
+      const overLive = yield* accounts.restore({ id: "rs" }).pipe(Effect.flip)
+      expect(overLive._tag).toBe("ItemNotDeleted")
+      expect((yield* rawItem("G133SoftAccount", "rs")).name).toEqual({ S: "live" })
+      expect(yield* sentinelExists("G133SoftAccount", "rs-new@x.io")).toBe(true)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- update() of a missing item ----
+
+  it.effect("update() of a missing item creates it only from a complete payload", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const devices = db.entities.DevicesPlain as any
+      const partial = yield* devices
+        .update({ id: "nx1" })
+        .set({ label: "m" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(partial._tag).toBe("ItemNotFound")
+      expect(yield* rawItem("G133DevicePlain", "nx1")).toBeUndefined()
+
+      // Every required field (and the key composite) supplied: a real upsert.
+      const created = (yield* devices.update({ id: "nx2" }).set({ id: "nx2", label: "m" })) as any
+      expect([created.id, created.label, created.version]).toEqual(["nx2", "m", 1])
+      const got = (yield* devices.get({ id: "nx2" })) as any
+      expect([got.id, got.label, got.version]).toEqual(["nx2", "m", 1])
+      expect((yield* rawItem("G133DevicePlain", "nx2")).__edd_e__).toEqual({ S: "G133DevicePlain" })
+      // …and on an existing item the same update is an ordinary update.
+      const again = (yield* devices.update({ id: "nx2" }).set({ id: "nx2", label: "n" })) as any
+      expect([again.label, again.version]).toEqual(["n", 2])
+
+      // patch keeps its contract: a missing item is ConditionalCheckFailed.
+      const patched = yield* devices
+        .patch({ id: "nx3" })
+        .set({ label: "m" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(patched._tag).toBe("ConditionalCheckFailed")
+      expect(yield* rawItem("G133DevicePlain", "nx3")).toBeUndefined()
+      // The read-then-write paths report a missing item as before.
+      const retained = yield* (db.entities.DevicesRetained as any)
+        .update({ id: "nx4" })
+        .set({ label: "m" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(retained._tag).toBe("ItemNotFound")
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- cascade with an old-image return mode ----
+
+  it.effect("a cascade returning the old item cascades this write's new item exactly", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      yield* (db.entities.Authors as any).put({ id: "au", name: "Old" })
+      yield* (db.entities.Articles as any).put({ articleId: "ar", authorId: "au" })
+      // A later write lands before the cascade runs.
+      g133Inject.after = rawSetAttrs("G133Author", "au", { name: { S: "Later" } })
+      const old = (yield* (db.entities.Authors as any)
+        .update({ id: "au" })
+        .set({ name: "New" })
+        .cascade({ targets: [g133Entities.Articles] })
+        .returnValues("allOld")) as any
+      expect(old.name).toBe("Old")
+      const article = (yield* (db.entities.Articles as any).get({ articleId: "ar" })) as any
+      expect(article.author.name).toBe("New")
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- immutable fields: restating is fine, changing is refused ----
+
+  for (const entity of ["Ledgers", "LedgersRetained"] as const) {
+    it.effect(`${entity}: a spread record updates; a changed immutable value is refused`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const ledgers = db.entities[entity] as any
+        const id = `lg-${entity.toLowerCase()}`
+        const record = (yield* ledgers.put({ id, book: "b1", note: "n" })) as any
+        const updated = (yield* ledgers.update({ id }).set({ ...record, note: "m" })) as any
+        expect([updated.book, updated.note, updated.version]).toEqual(["b1", "m", 2])
+        const error = yield* ledgers
+          .update({ id })
+          .set({ book: "b2", note: "x" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String(error.cause)).toContain('"book"')
+        const stored = (yield* ledgers.get({ id })) as any
+        expect([stored.book, stored.note, stored.version]).toEqual(["b1", "m", 2])
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+  }
+
+  // ---- wide unversioned soft delete: the strongest guard that fits ----
+
+  for (const [entity, entityType, stamped] of [
+    ["WideStamped", "G133WideStamped", true],
+    ["WideBare", "G133WideBare", false],
+  ] as const) {
+    it.effect(`${entity}: soft-deletes 50 / 150 / 300 sparse entries, never refusing`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const wide = db.entities[entity] as any
+        for (const n of [50, 150, 300]) {
+          const id = `w${n}`
+          const totals = Object.fromEntries(Array.from({ length: n }, (_, i) => [`k${i}`, i]))
+          yield* wide.put({ id, email: `${entity}${n}@x.io`, totals })
+          yield* wide.delete({ id })
+          expect([n, yield* rawItem(entityType, id)]).toEqual([n, undefined])
+          expect(yield* sentinelExists(entityType, `${entity}${n}@x.io`)).toBe(false)
+          const keys = yield* partition(entityType, id)
+          expect(keys).toHaveLength(1)
+          expect(keys[0]).toMatch(/#deleted#/)
+        }
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+
+    it.effect(`${entity}: an update too wide for one expression writes the whole item`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const wide = db.entities[entity] as any
+        const id = "wupd"
+        yield* wide.put({ id, email: `${entity}upd@x.io`, totals: { a: 1 } })
+        const totals = Object.fromEntries(Array.from({ length: 300 }, (_, i) => [`k${i}`, i]))
+        const updated = (yield* wide
+          .update({ id })
+          .set({ email: `${entity}upd2@x.io`, totals })) as any
+        expect(Object.keys(updated.totals)).toHaveLength(301)
+        const got = (yield* wide.get({ id })) as any
+        expect([got.email, Object.keys(got.totals).length]).toEqual([`${entity}upd2@x.io`, 301])
+        expect(yield* sentinelExists(entityType, `${entity}upd2@x.io`)).toBe(true)
+        expect(yield* sentinelExists(entityType, `${entity}upd@x.io`)).toBe(false)
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+
+    it.effect(`${entity}: a wide soft delete still refuses a concurrent update it can see`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const wide = db.entities[entity] as any
+        const id = "wrace"
+        const totals = Object.fromEntries(Array.from({ length: 300 }, (_, i) => [`k${i}`, i]))
+        yield* wide.put({ id, email: `${entity}race@x.io`, totals })
+        // With timestamps a library update always rewrites updatedAt; without,
+        // the unique field (guarded first) is what a sentinel derives from.
+        g133Inject.before = stamped
+          ? g133Hook(
+              Effect.gen(function* () {
+                const other = yield* g133Client
+                yield* TestClock.adjust("1 second")
+                yield* (other.entities[entity] as any).update({ id }).set({ totals: { k5: 500 } })
+              }).pipe(Effect.provide(g133Layer(g133Tables.record))),
+            )
+          : rawSetAttrs(entityType, id, { email: { S: `${entity}race2@x.io` } })
+        const error = yield* wide
+          .delete({ id })
+          .condition({ attributeExists: "id" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ConcurrentModification")
+        expect(error.attributes).toEqual([stamped ? "updatedAt" : "email"])
+        expect(yield* rawItem(entityType, id)).toBeDefined()
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+  }
+
+  // ---- a complete-payload update of a missing item writes what put writes ----
+
+  it.effect("update() of a missing item with a sparse index writes exactly put's item", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const sparse = db.entities.Sparse as any
+      const strip = (item: Record<string, any>, id: string) =>
+        JSON.parse(
+          JSON.stringify({ ...item, __edd_i__: undefined })
+            .replaceAll(id, "ID")
+            .replaceAll(id.toLowerCase(), "id"),
+        )
+      for (const [label, payload] of [
+        ["no team (sparse index omitted)", { name: "n", rank: 3 }],
+        ["team present", { name: "n", rank: 3, team: "t" }],
+      ] as const) {
+        const viaPut = `sp-put-${label.length}`
+        const viaUpdate = `sp-upd-${label.length}`
+        yield* sparse.put({ id: viaPut, ...payload })
+        const created = (yield* sparse
+          .update({ id: viaUpdate })
+          .set({ id: viaUpdate, ...payload })) as any
+        expect([label, created.version]).toEqual([label, 1])
+        expect([label, strip(yield* rawItem("G133Sparse", viaUpdate), viaUpdate)]).toEqual([
+          label,
+          strip(yield* rawItem("G133Sparse", viaPut), viaPut),
+        ])
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- decoding defaults: what put writes and what it returns agree ----
+
+  it.effect("put / create / upsert / batch / transaction honour decoding defaults", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const defaults = db.entities.Defaults as any
+      const expectDefaults = (value: any) => {
+        expect(DateTime.formatIso(value.born)).toBe("1800-01-01T00:00:00.000Z")
+        expect(DateTime.formatIso(value.when)).toBe("1970-01-02T00:00:00.000Z")
+        expect(value.tier).toBe("basic")
+      }
+      // The defaults are stored — so the index they compose is written too.
+      const expectStored = (id: string) =>
+        Effect.gen(function* () {
+          const raw = yield* rawItem("G133Defaults", id)
+          // `tier` and `born` compose the byTier index: stored. `when` is
+          // not part of any key: not stored, defaulted on read.
+          expect([id, raw.born, raw.when, raw.tier]).toEqual([
+            id,
+            { S: "1800-01-01T00:00:00.000Z" },
+            undefined,
+            { S: "basic" },
+          ])
+          expect(raw.gsi1pk).toEqual({ S: "$edd133g#v1#g133defaults#tier_basic" })
+        })
+      const put = yield* defaults.put({ id: "df1", name: "n" })
+      expectDefaults(put)
+      expectDefaults(yield* defaults.get({ id: "df1" }))
+      yield* expectStored("df1")
+      expectDefaults(yield* defaults.create({ id: "df2", name: "n" }))
+      expectDefaults(yield* defaults.get({ id: "df2" }))
+      yield* expectStored("df2")
+      expectDefaults(yield* defaults.upsert({ id: "df3", name: "n" }))
+      expectDefaults(yield* defaults.get({ id: "df3" }))
+      yield* expectStored("df3")
+      yield* Batch.write([g133Entities.Defaults.put({ id: "df4", name: "n" } as any)])
+      expectDefaults(yield* defaults.get({ id: "df4" }))
+      yield* expectStored("df4")
+      yield* Transaction.transactWrite([g133Entities.Defaults.put({ id: "df5", name: "n" } as any)])
+      expectDefaults(yield* defaults.get({ id: "df5" }))
+      yield* expectStored("df5")
+      // Every one of them is in the index its decoded record names.
+      const inIndex = (yield* defaults.byTier({ tier: "basic" }).collect()).map((d: any) => d.id)
+      expect(inIndex).toEqual(expect.arrayContaining(["df1", "df2", "df3", "df4", "df5"]))
+      // A value supplied is stored and returned as given.
+      const given = (yield* defaults.put({
+        id: "df6",
+        name: "n",
+        born: DateTime.makeUnsafe(1000),
+        when: DateTime.makeUnsafe(2000),
+        tier: "gold",
+      })) as any
+      expect([DateTime.formatIso(given.born), DateTime.formatIso(given.when), given.tier]).toEqual([
+        "1970-01-01T00:00:01.000Z",
+        "1970-01-01T00:00:02.000Z",
+        "gold",
+      ])
+      expect((yield* rawItem("G133Defaults", "df6")).born).toEqual({
+        S: "1970-01-01T00:00:01.000Z",
+      })
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a soft delete of an item written before the entity was versioned", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const client = yield* DynamoClient
+      // As `put` wrote it before `versioned` was enabled: no version, no token.
+      yield* client.putItem({
+        TableName: g133Tables.record,
+        Item: {
+          ...mainKey("G133SoftVersioned", "legacy"),
+          __edd_e__: { S: "G133SoftVersioned" },
+          id: { S: "legacy" },
+          name: { S: "n" },
+        },
+      })
+      yield* (db.entities.SoftVersioned as any).delete({ id: "legacy" })
+      expect(yield* rawItem("G133SoftVersioned", "legacy")).toBeUndefined()
+      const keys = yield* partition("G133SoftVersioned", "legacy")
+      expect(keys).toHaveLength(1)
+      expect(keys[0]).toMatch(/#deleted#/)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("update() of a missing item may omit a field that has a decoding default", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const defaults = db.entities.Defaults as any
+      yield* defaults.put({ id: "dp", name: "n" })
+      const created = (yield* defaults.update({ id: "du" }).set({ id: "du", name: "n" })) as any
+      expect(created.tier).toBe("basic")
+      expect((yield* defaults.byTier({ tier: "basic" }).collect()).map((d: any) => d.id)).toContain(
+        "du",
+      )
+      const strip = (item: Record<string, any>, id: string) =>
+        JSON.parse(
+          JSON.stringify(item).replaceAll(`id_${id}`, "id_ID").replaceAll(`"${id}"`, '"ID"'),
+        )
+      expect(strip(yield* rawItem("G133Defaults", "du"), "du")).toEqual(
+        strip(yield* rawItem("G133Defaults", "dp"), "dp"),
+      )
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- items written before the entity was `versioned` ----
+
+  /** Write `id` through the unversioned definition, then run `use` through the versioned one. */
+  const legacy = <A>(
+    pair: keyof typeof g133LegacyPairs,
+    seeds: ReadonlyArray<Record<string, unknown>>,
+    use: (db: any, entity: any) => Effect.Effect<A, any, any>,
+  ) =>
+    Effect.gen(function* () {
+      const before = g133LegacyClient(pair, 0)
+      yield* Effect.gen(function* () {
+        const db: any = yield* before.client
+        for (const seed of seeds) yield* db.entities.Doc.put(seed)
+      }).pipe(Effect.provide(before.layer))
+      const after = g133LegacyClient(pair, 1)
+      return yield* Effect.gen(function* () {
+        const db: any = yield* after.client
+        return yield* use(db, after.entity)
+      }).pipe(Effect.provide(after.layer))
+    })
+  const legacyRaw = (entityType: string, id: string) => rawItem(entityType, id)
+
+  it.effect("a pre-versioning item reads as version 0 on every read path", () =>
+    Effect.gen(function* () {
+      yield* legacy(
+        "Ret",
+        [
+          { id: "lr1", name: "legacy-read" },
+          { id: "lr2", name: "legacy-read" },
+        ],
+        (db, entity) =>
+          Effect.gen(function* () {
+            const docs = db.entities.Doc
+            expect((yield* docs.get({ id: "lr1" })).version).toBe(0)
+            const byName = yield* docs.byName({ name: "legacy-read" }).collect()
+            expect(byName.map((d: any) => d.version)).toEqual([0, 0])
+            const scanned = (yield* docs.scan().collect()).filter((d: any) =>
+              ["lr1", "lr2"].includes(d.id),
+            )
+            expect(scanned.map((d: any) => d.version)).toEqual([0, 0])
+            const [batch] = yield* Batch.get([entity.get({ id: "lr1" })])
+            expect((batch as any).version).toBe(0)
+            const [tx] = yield* Transaction.transactGet([entity.get({ id: "lr2" })])
+            expect((tx as any).version).toBe(0)
+            const item = (yield* Entity.asItem(entity.get({ id: "lr1" }))) as any
+            expect(item.version).toBe(0)
+          }),
+      )
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("the first versioned plain update writes version 1", () =>
+    Effect.gen(function* () {
+      yield* legacy(
+        "Plain",
+        [
+          { id: "lp1", name: "a" },
+          { id: "lp2", name: "a" },
+          { id: "lp3", name: "a" },
+        ],
+        (db) =>
+          Effect.gen(function* () {
+            const docs = db.entities.Doc
+            const updated = yield* docs.update({ id: "lp1" }).set({ tags: ["x"] })
+            expect(updated.version).toBe(1)
+            expect((yield* legacyRaw("G133LegacyPlain", "lp1")).version).toEqual({ N: "1" })
+            const pinned = yield* docs
+              .update({ id: "lp2" })
+              .set({ tags: ["y"] })
+              .expectedVersion(0)
+            expect(pinned.version).toBe(1)
+            const stale = yield* docs
+              .update({ id: "lp3" })
+              .set({ tags: ["z"] })
+              .expectedVersion(1)
+              .asEffect()
+              .pipe(Effect.flip)
+            expect([stale._tag, stale.expectedVersion, stale.actualVersion]).toEqual([
+              "OptimisticLockError",
+              1,
+              0,
+            ])
+            // A path update is a plain update too.
+            const path = yield* docs
+              .update({ id: "lp3" })
+              .pathSet({ segments: ["name"], value: "p", isPath: false })
+            expect([path.name, path.version]).toEqual(["p", 1])
+          }),
+      )
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("the first versioned read-then-write update writes version 1", () =>
+    Effect.gen(function* () {
+      yield* legacy("Uniq", [{ id: "lu1", name: "a", email: "lu1@x.io" }], (db) =>
+        Effect.gen(function* () {
+          const updated = yield* db.entities.Doc.update({ id: "lu1" }).set({ email: "lu1b@x.io" })
+          expect([updated.version, updated.email]).toEqual([1, "lu1b@x.io"])
+          const raw = yield* legacyRaw("G133LegacyUniq", "lu1")
+          expect(raw.version).toEqual({ N: "1" })
+          expect(raw.__edd_i__?.S).toMatch(/^[0-9a-f-]{36}$/)
+        }),
+      )
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  for (const [label, build] of [
+    ["record", (u: any) => u.set({ name: "b" })],
+    ["path", (u: any) => u.pathSet({ segments: ["name"], value: "b", isPath: false })],
+  ] as const) {
+    it.effect(`the first versioned retain ${label} update snapshots it as v#0000000`, () =>
+      Effect.gen(function* () {
+        const id = `lret-${label}`
+        yield* legacy("Ret", [{ id, name: "a" }], (db) =>
+          Effect.gen(function* () {
+            const docs = db.entities.Doc
+            const updated = yield* build(docs.update({ id }))
+            expect([updated.name, updated.version]).toEqual(["b", 1])
+            const v0 = yield* docs.getVersion({ id }, 0)
+            expect([v0.name, v0.version]).toEqual(["a", 0])
+            const all = yield* docs.versions({ id }).collect()
+            expect(all.map((v: any) => v.version)).toEqual([0])
+            expect(yield* partition("G133LegacyRet", id)).toEqual([
+              "$edd133g#v1#g133legacyret",
+              "$edd133g#v1#g133legacyret#v#0000000",
+            ])
+            // …and from there on, ordinary versioning.
+            const next = yield* build(docs.update({ id }))
+            expect(next.version).toBe(2)
+          }),
+        )
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+
+    it.effect(
+      `a race on the first versioned retain ${label} update is an OptimisticLockError`,
+      () =>
+        Effect.gen(function* () {
+          const id = `lrace-${label}`
+          yield* legacy("Ret", [{ id, name: "a" }], (db) =>
+            Effect.gen(function* () {
+              // Another writer versions the item between our read and write.
+              g133Inject.before = rawSetAttrs("G133LegacyRet", id, {
+                version: { N: "1" },
+                name: { S: "theirs" },
+              })
+              const error = yield* build(db.entities.Doc.update({ id }))
+                .asEffect()
+                .pipe(Effect.flip)
+              expect([error._tag, error.expectedVersion, error.actualVersion]).toEqual([
+                "OptimisticLockError",
+                0,
+                1,
+              ])
+              expect((yield* legacyRaw("G133LegacyRet", id)).name).toEqual({ S: "theirs" })
+            }),
+          )
+        }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+  }
+
+  it.effect("a race on the first versioned plain update with expectedVersion(0)", () =>
+    Effect.gen(function* () {
+      yield* legacy("Plain", [{ id: "lpr", name: "a" }], (db) =>
+        Effect.gen(function* () {
+          g133Inject.before = rawSetAttrs("G133LegacyPlain", "lpr", { version: { N: "1" } })
+          const error = yield* db.entities.Doc.update({ id: "lpr" })
+            .set({ name: "b" })
+            .expectedVersion(0)
+            .asEffect()
+            .pipe(Effect.flip)
+          expect([error._tag, error.actualVersion]).toEqual(["OptimisticLockError", 1])
+        }),
+      )
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a pre-versioning item soft-deletes and restores through the versioned entity", () =>
+    Effect.gen(function* () {
+      yield* legacy("Soft", [{ id: "lsd", name: "a" }], (db) =>
+        Effect.gen(function* () {
+          const docs = db.entities.Doc
+          yield* docs.delete({ id: "lsd" })
+          const tombstone = yield* docs.deleted.get({ id: "lsd" })
+          expect(tombstone.version).toBe(0)
+          const restored = yield* docs.restore({ id: "lsd" })
+          expect([restored.name, restored.version]).toEqual(["a", 1])
+          const keys = yield* partition("G133LegacySoft", "lsd")
+          expect(keys).toEqual([
+            "$edd133g#v1#g133legacysoft",
+            "$edd133g#v1#g133legacysoft#v#0000000",
+          ])
+        }),
+      )
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- a condition too large to share with the library's guard ----
+
+  it.effect("a pathological .condition() is refused before writing, naming its size", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const huge = (t: any, { or, eq }: any) =>
+        or(...Array.from({ length: 160 }, (_, i) => eq(t.name, `value-${i}`)))
+      const accounts = db.entities.SoftAccounts as any
+      yield* accounts.put({ id: "huge", email: "huge@x.io", name: "n" })
+      const del = yield* accounts
+        .delete({ id: "huge" })
+        .condition(huge)
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(del._tag).toBe("ValidationError")
+      expect(String(del.cause)).toMatch(/\.condition\(\) alone is \d+ characters \/ \d+ operators/)
+      expect(yield* rawItem("G133SoftAccount", "huge")).toBeDefined()
+
+      const retained = db.entities.DevicesRetained as any
+      yield* retained.put({ id: "huge", owner: "o", label: "l" })
+      for (const build of [
+        (u: any) => u.set({ label: "m" }),
+        (u: any) => u.pathSet({ segments: ["label"], value: "m", isPath: false }),
+      ]) {
+        const error = yield* build(retained.update({ id: "huge" }))
+          .condition(huge)
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+      }
+      const plain = yield* (db.entities.DevicesPlain as any)
+        .update({ id: "huge" })
+        .set({ label: "m" })
+        .condition(huge)
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(plain._tag).toBe("ValidationError")
+      expect((yield* rawItem("G133DeviceRetained", "huge")).label).toEqual({ S: "l" })
+
+      // A large condition that fits beside the guard still runs, and a wide
+      // item's fallback guard shrinks to leave it room.
+      const wide = db.entities.WideBare as any
+      const totals = Object.fromEntries(Array.from({ length: 300 }, (_, i) => [`k${i}`, i]))
+      yield* wide.put({ id: "wcond", email: "wcond@x.io", totals })
+      const sized = (t: any, { or, eq }: any) =>
+        or(...Array.from({ length: 60 }, (_, i) => eq(t.email, i === 0 ? "wcond@x.io" : `x${i}`)))
+      yield* wide.delete({ id: "wcond" }).condition(sized)
+      expect(yield* rawItem("G133WideBare", "wcond")).toBeUndefined()
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- a removed version is corruption, never "pre-versioning" ----
+
+  const removeAttr = (entityType: string, id: string, attr: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      yield* client.updateItem({
+        TableName: g133Tables.record,
+        Key: mainKey(entityType, id),
+        UpdateExpression: "REMOVE #a",
+        ExpressionAttributeNames: { "#a": attr },
+      })
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+  const snapshotOf = (entityType: string, id: string, version: number) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { Item } = yield* client.getItem({
+        TableName: g133Tables.record,
+        Key: {
+          pk: mainKey(entityType, id).pk,
+          sk: {
+            S: `$edd133g#v1#${entityType.toLowerCase()}#v#${String(version).padStart(7, "0")}`,
+          },
+        },
+        ConsistentRead: true,
+      })
+      return Item as Record<string, any> | undefined
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+  const snapshotLabel = (entityType: string, id: string, version: number) =>
+    Effect.map(snapshotOf(entityType, id, version), (item) => item?.label)
+
+  it.effect("an item whose version was removed outside the library is refused everywhere", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const docs = db.entities.DevicesRetained as any
+      // The reviewer's repro: v1 → v2 → v3, then the version is removed.
+      yield* docs.put({ id: "corrupt", owner: "o", label: "v1" })
+      yield* docs.update({ id: "corrupt" }).set({ label: "v2" })
+      yield* docs.update({ id: "corrupt" }).set({ label: "v3" })
+      yield* removeAttr("G133DeviceRetained", "corrupt", "version")
+      const refused = (effect: Effect.Effect<unknown, any>) =>
+        Effect.gen(function* () {
+          const error = yield* effect.pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          expect(String(error.cause)).toContain("incarnation token")
+        })
+      yield* refused(docs.get({ id: "corrupt" }).asEffect())
+      yield* refused(docs.update({ id: "corrupt" }).set({ label: "x1" }).asEffect())
+      yield* refused(
+        docs
+          .update({ id: "corrupt" })
+          .pathSet({ segments: ["label"], value: "x1", isPath: false })
+          .asEffect(),
+      )
+      yield* refused(docs.scan().collect())
+      // History untouched: no v#0000000, v#0000001 still "v1".
+      expect(yield* snapshotLabel("G133DeviceRetained", "corrupt", 1)).toEqual({ S: "v1" })
+      expect(yield* snapshotLabel("G133DeviceRetained", "corrupt", 0)).toBeUndefined()
+
+      // A plain (unread) update refuses it too, through its condition.
+      const plain = db.entities.DevicesPlain as any
+      yield* plain.put({ id: "corrupt2", owner: "o", label: "l" })
+      yield* removeAttr("G133DevicePlain", "corrupt2", "version")
+      yield* refused(plain.update({ id: "corrupt2" }).set({ label: "m" }).asEffect())
+      expect((yield* rawItem("G133DevicePlain", "corrupt2")).version).toBeUndefined()
+      // A plain upsert (no read) would version it as 1 — refused by its condition.
+      yield* refused(plain.upsert({ id: "corrupt2", owner: "o", label: "u" }).asEffect())
+      const afterUpsert = yield* rawItem("G133DevicePlain", "corrupt2")
+      expect([afterUpsert.version, afterUpsert.label]).toEqual([undefined, { S: "l" }])
+      // A plain hard delete reads and writes no history: it removes the item.
+      yield* plain.delete({ id: "corrupt2" })
+      expect(yield* rawItem("G133DevicePlain", "corrupt2")).toBeUndefined()
+      // …and so do soft delete and restore.
+      const soft = db.entities.SoftDevices as any
+      yield* soft.put({ id: "corrupt3", owner: "o", label: "l" })
+      yield* removeAttr("G133SoftDevice", "corrupt3", "version")
+      yield* refused(soft.delete({ id: "corrupt3" }).asEffect())
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a version snapshot is never overwritten", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const docs = db.entities.DevicesRetained as any
+      // Distinct clock readings: each version's updatedAt differs.
+      yield* docs.put({ id: "hist", owner: "o", label: "v1" })
+      yield* TestClock.adjust("1 second")
+      yield* docs.update({ id: "hist" }).set({ label: "v2" })
+      yield* TestClock.adjust("1 second")
+      yield* docs.update({ id: "hist" }).set({ label: "v3" })
+      // An outside write rewinds the version: the next snapshot would be v#0000001.
+      yield* rawSetAttrs("G133DeviceRetained", "hist", { version: { N: "1" } }).pipe(Effect.orDie)
+      for (const build of [
+        (u: any) => u.set({ label: "x" }),
+        (u: any) => u.pathSet({ segments: ["label"], value: "x", isPath: false }),
+      ]) {
+        const error = yield* build(docs.update({ id: "hist" }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String(error.cause)).toContain("version 1 snapshot already exists")
+      }
+      expect(yield* snapshotLabel("G133DeviceRetained", "hist", 1)).toEqual({ S: "v1" })
+      expect((yield* rawItem("G133DeviceRetained", "hist")).label).toEqual({ S: "v3" })
+
+      const soft = db.entities.SoftDevices as any
+      yield* soft.put({ id: "hist2", owner: "o", label: "v1" })
+      yield* TestClock.adjust("1 second")
+      yield* soft.update({ id: "hist2" }).set({ label: "v2" })
+      yield* rawSetAttrs("G133SoftDevice", "hist2", { version: { N: "1" } }).pipe(Effect.orDie)
+      const del = yield* soft.delete({ id: "hist2" }).asEffect().pipe(Effect.flip)
+      expect(del._tag).toBe("ValidationError")
+      expect(yield* rawItem("G133SoftDevice", "hist2")).toBeDefined()
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("an item written by a versioned entity before #133 (version, no token) works", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const client = yield* DynamoClient
+      yield* client.putItem({
+        TableName: g133Tables.record,
+        Item: {
+          ...mainKey("G133DeviceRetained", "pre133"),
+          __edd_e__: { S: "G133DeviceRetained" },
+          id: { S: "pre133" },
+          owner: { S: "o" },
+          label: { S: "l" },
+          version: { N: "4" },
+          createdAt: { S: "1970-01-01T00:00:00.000Z" },
+          updatedAt: { S: "1970-01-01T00:00:00.000Z" },
+        },
+      })
+      const docs = db.entities.DevicesRetained as any
+      expect((yield* docs.get({ id: "pre133" })).version).toBe(4)
+      const updated = yield* docs.update({ id: "pre133" }).set({ label: "m" })
+      expect(updated.version).toBe(5)
+      expect((yield* rawItem("G133DeviceRetained", "pre133")).__edd_i__?.S).toMatch(
+        /^[0-9a-f-]{36}$/,
+      )
+      expect(yield* snapshotLabel("G133DeviceRetained", "pre133", 4)).toEqual({ S: "l" })
+      yield* docs.delete({ id: "pre133" })
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- a default never creates a unique sentinel ----
+
+  it.effect("defaulted unique fields: indexed and stored, but no sentinel until supplied", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const coded = db.entities.Coded as any
+      // Two items leave both unique fields to their defaults: both succeed.
+      yield* coded.put({ id: "cd1", name: "a" })
+      yield* coded.put({ id: "cd2", name: "b" })
+      const raw1 = yield* rawItem("G133Coded", "cd1")
+      expect([raw1.code, raw1.handle, raw1.__edd_d__]).toEqual([
+        { S: "none" },
+        undefined,
+        { SS: ["code"] },
+      ])
+      expect(
+        (yield* coded.byCode({ code: "none" }).collect()).map((c: any) => c.id).sort(),
+      ).toEqual(["cd1", "cd2"])
+      expect(yield* sentinelExistsFor("G133Coded", "code", "none")).toBe(false)
+      expect(yield* sentinelExistsFor("G133Coded", "handle", "anon")).toBe(false)
+      // A third item SUPPLIES "none": its sentinel is created, and it is its own.
+      yield* coded.put({ id: "cd3", name: "c", code: "none" })
+      expect(yield* sentinelExistsFor("G133Coded", "code", "none")).toBe(true)
+      // cd1 moves to a real value: its sentinel is created, cd3's survives.
+      const moved = yield* coded.update({ id: "cd1" }).set({ code: "c1" })
+      expect(moved.code).toBe("c1")
+      expect((yield* rawItem("G133Coded", "cd1")).__edd_d__).toBeUndefined()
+      expect(yield* sentinelExistsFor("G133Coded", "code", "c1")).toBe(true)
+      expect(yield* sentinelExistsFor("G133Coded", "code", "none")).toBe(true)
+      // Deleting cd2 (still on the default) leaves cd3's sentinel alone too.
+      yield* coded.delete({ id: "cd2" })
+      expect(yield* sentinelExistsFor("G133Coded", "code", "none")).toBe(true)
+      // And the supplied value is enforced.
+      const taken = yield* coded
+        .put({ id: "cd4", name: "d", code: "c1" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(taken._tag).toBe("UniqueConstraintViolation")
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- operator counting against DynamoDB's own ----
+
+  it.effect("a condition at DynamoDB's operator limit is sent; one over is refused first", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const counters = db.entities.Counters as any
+      yield* counters.put({ id: "ops", owner: "o", label: "l0" })
+      // The plain update adds `AND attribute_exists(#exists)`: 2 operators.
+      const equals =
+        (k: number) =>
+        (t: any, { or, eq }: any) =>
+          or(...Array.from({ length: k }, (_, i) => eq(t.label, i === 0 ? "l0" : `x${i}`)))
+      const betweens =
+        (k: number) =>
+        (t: any, { or, between }: any) =>
+          or(...Array.from({ length: k }, (_, i) => between(t.label, i === 0 ? "a" : `x${i}`, "z")))
+      // 149 comparisons → 149 + 148 OR + 2 = 299: within the limit.
+      yield* counters.update({ id: "ops" }).set({ label: "l0" }).condition(equals(149))
+      // BETWEEN's own AND is part of it: 101 BETWEEN → 101 + 100 OR + 2 = 203,
+      // sent and accepted (counting that AND would make it 304, refused).
+      yield* counters.update({ id: "ops" }).set({ label: "l0" }).condition(betweens(101))
+      // 150 comparisons → 301: refused before anything is sent.
+      for (const cond of [equals(150)]) {
+        const error = yield* counters
+          .update({ id: "ops" })
+          .set({ label: "changed" })
+          .condition(cond)
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String(error.cause)).toContain("301 operators")
+      }
+      expect((yield* rawItem("G133Counter", "ops")).label).toEqual({ S: "l0" })
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- upsert of a unique-constrained entity: guarded read-then-write ----
+
+  for (const [entity, entityType, versioned] of [
+    ["AccountsBare", "G133AccountBare", false],
+    ["AccountsPlain", "G133AccountPlain", true],
+  ] as const) {
+    it.effect(`${entity}: upsert creates, rotates, keeps, and refuses duplicates`, () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const accounts = db.entities[entity] as any
+        const id = `ups-${entity.toLowerCase()}`
+        const email = (v: string) => `${v}-${entity.toLowerCase()}@x.io`
+        // Missing: a create, with its sentinel.
+        yield* accounts.upsert({ id, email: email("a"), name: "n1" })
+        expect(yield* sentinelExistsFor(entityType, "email", email("a"))).toBe(true)
+        // Existing, changed value: the sentinel rotates.
+        const rotated = yield* accounts.upsert({ id, email: email("b"), name: "n2" })
+        expect([rotated.email, rotated.name]).toEqual([email("b"), "n2"])
+        expect(yield* sentinelExistsFor(entityType, "email", email("a"))).toBe(false)
+        expect(yield* sentinelExistsFor(entityType, "email", email("b"))).toBe(true)
+        if (versioned) expect(rotated.version).toBe(2)
+        // Existing, unchanged value: left alone (no self-collision).
+        const same = yield* accounts.upsert({ id, email: email("b"), name: "n3" })
+        expect(same.name).toBe("n3")
+        expect(yield* sentinelExistsFor(entityType, "email", email("b"))).toBe(true)
+        // A value another item holds: refused, nothing written.
+        const other = `${id}-other`
+        const dup = yield* accounts
+          .upsert({ id: other, email: email("b"), name: "x" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(dup._tag).toBe("UniqueConstraintViolation")
+        expect(yield* rawItem(entityType, other)).toBeUndefined()
+        // A concurrent change between the read and the write.
+        g133Inject.before = rawSetAttrs(
+          entityType,
+          id,
+          versioned ? { name: { S: "theirs" } } : { email: { S: email("c") } },
+          versioned,
+        )
+        const race = yield* accounts
+          .upsert({ id, email: email("d"), name: "mine" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(race._tag).toBe(versioned ? "OptimisticLockError" : "ConcurrentModification")
+        expect(yield* sentinelExistsFor(entityType, "email", email("d"))).toBe(false)
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+    )
+  }
+
+  // ---- a put over an existing versioned item continues it ----
+
+  it.effect("a replacing put continues the version, incarnation and history", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const plain = db.entities.DevicesPlain as any
+      const first = yield* plain.put({ id: "rp1", owner: "o", label: "a" })
+      expect(first.version).toBe(1)
+      const firstRaw = yield* rawItem("G133DevicePlain", "rp1")
+      yield* TestClock.adjust("1 second")
+      const again = yield* plain.put({ id: "rp1", owner: "o", label: "b" })
+      expect(again.version).toBe(2)
+      const againRaw = yield* rawItem("G133DevicePlain", "rp1")
+      expect(againRaw.__edd_i__).toEqual(firstRaw.__edd_i__)
+      expect(againRaw.createdAt).toEqual(firstRaw.createdAt)
+      expect(againRaw.updatedAt).not.toEqual(firstRaw.updatedAt)
+
+      const retained = db.entities.DevicesRetained as any
+      yield* retained.put({ id: "rp2", owner: "o", label: "v1" })
+      yield* TestClock.adjust("1 second")
+      yield* retained.update({ id: "rp2" }).set({ label: "v2" })
+      yield* TestClock.adjust("1 second")
+      const replaced = yield* retained.put({ id: "rp2", owner: "o", label: "v3" })
+      expect(replaced.version).toBe(3)
+      expect(yield* snapshotLabel("G133DeviceRetained", "rp2", 1)).toEqual({ S: "v1" })
+      expect(yield* snapshotLabel("G133DeviceRetained", "rp2", 2)).toEqual({ S: "v2" })
+      expect(yield* snapshotLabel("G133DeviceRetained", "rp2", 3)).toBeUndefined()
+
+      // A race on the replace: the put is planned again from the item as the
+      // other writer left it, and the last writer wins — as a plain PutItem.
+      g133Inject.before = rawSetAttrs("G133DeviceRetained", "rp2", { label: { S: "x" } }, true)
+      const raced = yield* retained.put({ id: "rp2", owner: "o", label: "v4" })
+      expect([raced.label, raced.version]).toEqual(["v4", 5])
+      expect(yield* snapshotLabel("G133DeviceRetained", "rp2", 4)).toEqual({ S: "x" })
+
+      // create still fails on an existing item.
+      const dup = yield* retained
+        .create({ id: "rp2", owner: "o", label: "new" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(dup._tag).toBe("ConditionalCheckFailed")
+
+      // A put over a unique entity's item with the same value replaces it,
+      // keeping its createdAt as a versioned item's does.
+      const bare = db.entities.AccountsBare as any
+      yield* bare.put({ id: "rp3", email: "rp3@x.io", name: "a" })
+      const bareFirst = yield* rawItem("G133AccountBare", "rp3")
+      yield* TestClock.adjust("1 second")
+      yield* bare.put({ id: "rp3", email: "rp3@x.io", name: "b" })
+      const bareAgain = yield* rawItem("G133AccountBare", "rp3")
+      expect(bareAgain.createdAt).toEqual(bareFirst.createdAt)
+      expect(bareAgain.updatedAt).not.toEqual(bareFirst.updatedAt)
+      yield* bare.put({ id: "rp3", email: "rp3b@x.io", name: "c" })
+      expect(yield* sentinelExistsFor("G133AccountBare", "email", "rp3@x.io")).toBe(false)
+      expect(yield* sentinelExistsFor("G133AccountBare", "email", "rp3b@x.io")).toBe(true)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("transactions replace a versioned item; batches may only create one", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      yield* (db.entities.DevicesPlain as any).put({ id: "tx1", owner: "o", label: "a" })
+      yield* Transaction.transactWrite([
+        g133Entities.DevicesPlain.put({ id: "tx1", owner: "o", label: "b" } as any),
+      ])
+      const replaced = yield* rawItem("G133DevicePlain", "tx1")
+      expect([replaced.label, replaced.version]).toEqual([{ S: "b" }, { N: "2" }])
+      // A new item is still created through a transaction.
+      yield* Transaction.transactWrite([
+        g133Entities.DevicesPlain.put({ id: "tx2", owner: "o", label: "b" } as any),
+      ])
+      expect((yield* rawItem("G133DevicePlain", "tx2")).version).toEqual({ N: "1" })
+      // Batch.write: new versioned items are created through create-only
+      // transactions; one that exists cancels its whole chunk.
+      yield* Batch.write([
+        g133Entities.DevicesPlain.put({ id: "tx3", owner: "o", label: "b" } as any),
+      ])
+      expect((yield* rawItem("G133DevicePlain", "tx3")).version).toEqual({ N: "1" })
+      const batch = yield* Batch.write([
+        g133Entities.DevicesPlain.put({ id: "tx4", owner: "o", label: "b" } as any),
+        g133Entities.DevicesPlain.put({ id: "tx3", owner: "o", label: "c" } as any),
+      ]).pipe(Effect.flip)
+      expect(batch._tag).toBe("ValidationError")
+      expect(String((batch as any).cause)).toContain("would replace an existing")
+      expect(yield* rawItem("G133DevicePlain", "tx4")).toBeUndefined()
+      expect((yield* rawItem("G133DevicePlain", "tx3")).label).toEqual({ S: "b" })
+      // More than 4 MB of versioned puts is split under DynamoDB's transaction cap.
+      const big = "x".repeat(380_000)
+      yield* Batch.write(
+        Array.from({ length: 12 }, (_, i) =>
+          g133Entities.DevicesPlain.put({ id: `big${i}`, owner: "o", label: big } as any),
+        ),
+      )
+      expect((yield* rawItem("G133DevicePlain", "big11")).version).toEqual({ N: "1" })
+      // A delete and a versioned put of one item can't keep their order: refused.
+      const reordered = yield* Batch.write([
+        g133Entities.DevicesPlain.delete({ id: "tx2" } as any),
+        g133Entities.DevicesPlain.put({ id: "tx2", owner: "o", label: "z" } as any),
+      ]).pipe(Effect.flip)
+      expect(reordered._tag).toBe("ValidationError")
+      expect((yield* rawItem("G133DevicePlain", "tx2")).label).toEqual({ S: "b" })
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect(".remove() of a defaulted index composite re-materialises its default", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const coded = db.entities.Coded as any
+      yield* coded.put({ id: "rm1", name: "a", code: "real" })
+      expect(yield* sentinelExistsFor("G133Coded", "code", "real")).toBe(true)
+      const removed = yield* coded.update({ id: "rm1" }).remove(["code"])
+      expect(removed.code).toBe("none")
+      const raw = yield* rawItem("G133Coded", "rm1")
+      expect([raw.code, raw.gsi1pk, raw.__edd_d__]).toEqual([
+        { S: "none" },
+        { S: "$edd133g#v1#g133coded#code_none" },
+        { SS: ["code"] },
+      ])
+      expect(yield* sentinelExistsFor("G133Coded", "code", "real")).toBe(false)
+      expect((yield* coded.byCode({ code: "none" }).collect()).map((c: any) => c.id)).toContain(
+        "rm1",
+      )
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- a sentinel another item owns is never released (#133) ----
+
+  const sentinelKey = (entityType: string, constraint: string, value: string) => ({
+    pk: { S: `$edd133g#v1#${entityType.toLowerCase()}.${constraint}#${value}` },
+    sk: { S: `$edd133g#v1#${entityType.toLowerCase()}.${constraint}` },
+  })
+  const sentinelOwner = (entityType: string, constraint: string, value: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { Item } = yield* client.getItem({
+        TableName: g133Tables.record,
+        Key: sentinelKey(entityType, constraint, value),
+        ConsistentRead: true,
+      })
+      return Item?._entity_pk?.S
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+  const dropSentinel = (entityType: string, constraint: string, value: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      yield* client.deleteItem({
+        TableName: g133Tables.record,
+        Key: sentinelKey(entityType, constraint, value),
+      })
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+
+  for (const [entity, entityType] of [
+    ["AccountsBare", "G133AccountBare"],
+    ["AccountsPlain", "G133AccountPlain"],
+    ["AccountsRetained", "G133AccountRetained"],
+    ["SoftAccounts", "G133SoftAccount"],
+  ] as const) {
+    for (const [label, release] of [
+      ["put", (acc: any, id: string, to: string) => acc.put({ id, email: to, name: "moved" })],
+      ["update", (acc: any, id: string, to: string) => acc.update({ id }).set({ email: to })],
+      ["upsert", (acc: any, id: string, to: string) => acc.upsert({ id, email: to, name: "m" })],
+      ["delete", (acc: any, id: string) => acc.delete({ id })],
+      ["purge", (acc: any, id: string) => acc.purge({ id })],
+      [
+        "transactWrite put",
+        (_: any, id: string, to: string) =>
+          Transaction.transactWrite([
+            (g133Entities as any)[entity].put({ id, email: to, name: "moved" }),
+          ]),
+      ],
+    ] as const) {
+      it.effect(`${entity}: ${label} never releases a sentinel another item owns`, () =>
+        Effect.gen(function* () {
+          const db = yield* g133Client
+          const accounts = db.entities[entity] as any
+          const tag = `${entity}-${label.replace(" ", "-")}`.toLowerCase()
+          const [a, b, c] = [`${tag}-a`, `${tag}-b`, `${tag}-c`]
+          const held = `${tag}@x.io`
+          const moved = `${tag}-moved@x.io`
+          // `a` holds the value without its sentinel (an expired or later-added
+          // constraint); `b` then claimed the value and owns its sentinel.
+          yield* accounts.put({ id: a, email: held, name: "a" })
+          yield* dropSentinel(entityType, "email", held)
+          yield* accounts.put({ id: b, email: held, name: "b" })
+          const owner = mainKey(entityType, b).pk.S
+          expect(yield* sentinelOwner(entityType, "email", held)).toBe(owner)
+
+          yield* release(accounts, a, moved)
+
+          // `b` still owns its sentinel, and the value stays taken.
+          expect(yield* sentinelOwner(entityType, "email", held)).toBe(owner)
+          const dup = yield* accounts
+            .create({ id: c, email: held, name: "c" })
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(dup._tag).toBe("UniqueConstraintViolation")
+          if (label !== "delete" && label !== "purge") {
+            expect(yield* sentinelOwner(entityType, "email", moved)).toBe(
+              mainKey(entityType, a).pk.S,
+            )
+          }
+        }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+      )
+    }
+  }
+
+  // ---- a release whose reservation changes hands is planned again (#133) ----
+
+  /** Another item takes over a sentinel — between a write's ownership read and its write. */
+  const handOver = (entityType: string, constraint: string, value: string, to: string) =>
+    g133Hook(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.updateItem({
+          TableName: g133Tables.record,
+          Key: sentinelKey(entityType, constraint, value),
+          UpdateExpression: "SET #epk = :epk",
+          ExpressionAttributeNames: { "#epk": "_entity_pk" },
+          ExpressionAttributeValues: { ":epk": mainKey(entityType, to).pk },
+        })
+      }).pipe(Effect.provide(ClientLayer)),
+    )
+
+  for (const [entity, entityType] of [
+    ["AccountsBare", "G133AccountBare"],
+    ["AccountsPlain", "G133AccountPlain"],
+    ["AccountsRetained", "G133AccountRetained"],
+  ] as const) {
+    for (const [label, write] of [
+      ["put", (acc: any, id: string, to: string) => acc.put({ id, email: to, name: "m" })],
+      ["upsert", (acc: any, id: string, to: string) => acc.upsert({ id, email: to, name: "m" })],
+      [
+        "transactWrite put",
+        (_: any, id: string, to: string) =>
+          Transaction.transactWrite([
+            (g133Entities as any)[entity].put({ id, email: to, name: "m" }),
+          ]),
+      ],
+    ] as const) {
+      it.effect(`${entity}: ${label} is written again when a release races`, () =>
+        Effect.gen(function* () {
+          const db = yield* g133Client
+          const accounts = db.entities[entity] as any
+          const tag = `${entity}-hand-${label.replace(" ", "-")}`.toLowerCase()
+          const [a, b] = [`${tag}-a`, `${tag}-b`]
+          const held = `${tag}@x.io`
+          const moved = `${tag}-moved@x.io`
+          yield* accounts.put({ id: a, email: held, name: "a" })
+          // The reservation passes to `b` after `a`'s write read it as `a`'s.
+          g133Inject.before = handOver(entityType, "email", held, b)
+          yield* write(accounts, a, moved)
+          // Planned again from a fresh read: `b`'s sentinel is left alone.
+          expect(yield* sentinelOwner(entityType, "email", held)).toBe(mainKey(entityType, b).pk.S)
+          expect(yield* sentinelOwner(entityType, "email", moved)).toBe(mainKey(entityType, a).pk.S)
+          expect((yield* rawItem(entityType, a)).email).toEqual({ S: moved })
+        }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+      )
+    }
+  }
+
+  // ---- transactions write existing versioned and unique items (#133) ----
+
+  it.effect("transactWrite replaces an existing item exactly as its own put does", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const retained = db.entities.DevicesRetained as any
+      yield* retained.put({ id: "txr1", owner: "o", label: "v1" })
+      const firstRaw = yield* rawItem("G133DeviceRetained", "txr1")
+      yield* TestClock.adjust("1 second")
+      yield* Transaction.transactWrite([
+        g133Entities.DevicesRetained.put({ id: "txr1", owner: "o", label: "v2" } as any),
+      ])
+      const raw = yield* rawItem("G133DeviceRetained", "txr1")
+      expect([raw.label, raw.version]).toEqual([{ S: "v2" }, { N: "2" }])
+      expect(raw.__edd_i__).toEqual(firstRaw.__edd_i__)
+      expect(raw.createdAt).toEqual(firstRaw.createdAt)
+      expect(raw.updatedAt).not.toEqual(firstRaw.updatedAt)
+      expect(yield* snapshotLabel("G133DeviceRetained", "txr1", 1)).toEqual({ S: "v1" })
+
+      // A race between the read and the transaction: written again, last writer wins.
+      g133Inject.before = rawSetAttrs("G133DeviceRetained", "txr1", { label: { S: "x" } }, true)
+      yield* Transaction.transactWrite([
+        g133Entities.DevicesRetained.put({ id: "txr1", owner: "o", label: "v4" } as any),
+      ])
+      const after = yield* rawItem("G133DeviceRetained", "txr1")
+      expect([after.label, after.version]).toEqual([{ S: "v4" }, { N: "4" }])
+      expect(yield* snapshotLabel("G133DeviceRetained", "txr1", 3)).toEqual({ S: "x" })
+
+      // A unique entity: the changed value's sentinel rotates; createdAt is kept.
+      const bare = db.entities.AccountsBare as any
+      yield* bare.put({ id: "txr2", email: "txr2@x.io", name: "a" })
+      const bareFirst = yield* rawItem("G133AccountBare", "txr2")
+      yield* TestClock.adjust("1 second")
+      yield* Transaction.transactWrite([
+        g133Entities.AccountsBare.put({ id: "txr2", email: "txr2b@x.io", name: "b" } as any),
+      ])
+      expect(yield* sentinelExistsFor("G133AccountBare", "email", "txr2@x.io")).toBe(false)
+      expect(yield* sentinelOwner("G133AccountBare", "email", "txr2b@x.io")).toBe(
+        mainKey("G133AccountBare", "txr2").pk.S,
+      )
+      expect((yield* rawItem("G133AccountBare", "txr2")).createdAt).toEqual(bareFirst.createdAt)
+
+      // A value another item holds: UniqueConstraintViolation, nothing written.
+      yield* bare.put({ id: "txr3", email: "txr3@x.io", name: "c" })
+      const taken = yield* Transaction.transactWrite([
+        g133Entities.AccountsBare.put({ id: "txr3", email: "txr2b@x.io", name: "c" } as any),
+      ]).pipe(Effect.flip)
+      expect(taken._tag).toBe("UniqueConstraintViolation")
+      expect((yield* rawItem("G133AccountBare", "txr3")).email).toEqual({ S: "txr3@x.io" })
+
+      // The caller's own condition: TransactionCancelled, as for any op.
+      const refused = yield* Transaction.transactWrite([
+        g133Entities.DevicesRetained.put({ id: "txr1", owner: "o", label: "v5" } as any).pipe(
+          g133Entities.DevicesRetained.condition({ label: "nope" }),
+        ),
+      ]).pipe(Effect.flip)
+      expect(refused._tag).toBe("TransactionCancelled")
+      expect((yield* rawItem("G133DeviceRetained", "txr1")).label).toEqual({ S: "v4" })
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("EventStore.append writes a guarded additional put again after a lost race", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const docs = db.entities.DevicesRetained as any
+      yield* docs.put({ id: "esr1", owner: "o", label: "v1" })
+      // Another writer changes the item between the append's read and its
+      // transaction: the transaction is cancelled, built again and written.
+      g133Inject.before = rawSetAttrs("G133DeviceRetained", "esr1", { label: { S: "x" } }, true)
+      const appended = yield* G133Feed.append(
+        { feedId: "esr-feed" },
+        [new G133Noted({ note: "n" })],
+        0,
+        {
+          additionalItems: [
+            g133Entities.DevicesRetained.put({ id: "esr1", owner: "o", label: "mine" } as any),
+          ],
+        },
+      )
+      expect(appended.version).toBe(1)
+      // Last writer wins, past the concurrent write — which is kept as history.
+      const raw = yield* rawItem("G133DeviceRetained", "esr1")
+      expect([raw.label, raw.version]).toEqual([{ S: "mine" }, { N: "3" }])
+      expect(yield* snapshotLabel("G133DeviceRetained", "esr1", 2)).toEqual({ S: "x" })
+      // The event was written exactly once.
+      expect(yield* G133Feed.read({ feedId: "esr-feed" })).toHaveLength(1)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("transactWrite refuses two ops on one item, including swapped unique values", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const bare = db.entities.AccountsBare as any
+      yield* bare.put({ id: "sw1", email: "sw1@x.io", name: "a" })
+      yield* bare.put({ id: "sw2", email: "sw2@x.io", name: "b" })
+
+      // Swapping values releases and claims each sentinel in the same transaction.
+      const swapped = yield* Transaction.transactWrite([
+        g133Entities.AccountsBare.put({ id: "sw1", email: "sw2@x.io", name: "a" } as any),
+        g133Entities.AccountsBare.put({ id: "sw2", email: "sw1@x.io", name: "b" } as any),
+      ]).pipe(Effect.flip)
+      // Refused before anything is sent, naming the entity.
+      expect(swapped._tag).toBe("ValidationError")
+      expect((swapped as ValidationError).entityType).toBe("G133AccountBare")
+      expect(String(swapped.cause)).toContain("touches one item more than once")
+
+      // Two puts of one item.
+      const twice = yield* Transaction.transactWrite([
+        g133Entities.AccountsBare.put({ id: "sw1", email: "sw1@x.io", name: "c" } as any),
+        g133Entities.AccountsBare.put({ id: "sw1", email: "sw1@x.io", name: "d" } as any),
+      ]).pipe(Effect.flip)
+      expect(twice._tag).toBe("ValidationError")
+      expect(String(twice.cause)).toContain("touches one item more than once")
+
+      // Two puts of one versioned retain item: refused too — not judged a lost
+      // race, retried and reported as `OptimisticLockError`.
+      const retained = db.entities.DevicesRetained as any
+      yield* retained.put({ id: "sw3", owner: "o", label: "v1" })
+      const retainedTwice = yield* Transaction.transactWrite([
+        g133Entities.DevicesRetained.put({ id: "sw3", owner: "o", label: "a" } as any),
+        g133Entities.DevicesRetained.put({ id: "sw3", owner: "o", label: "b" } as any),
+      ]).pipe(Effect.flip)
+      expect(retainedTwice._tag).toBe("ValidationError")
+      expect((retainedTwice as ValidationError).entityType).toBe("G133DeviceRetained")
+      const sw3 = yield* rawItem("G133DeviceRetained", "sw3")
+      expect([sw3.label, sw3.version]).toEqual([{ S: "v1" }, { N: "1" }])
+      expect(yield* snapshotLabel("G133DeviceRetained", "sw3", 2)).toBeUndefined()
+
+      // Nothing was written: both items and their sentinels are as they were.
+      expect((yield* rawItem("G133AccountBare", "sw1")).email).toEqual({ S: "sw1@x.io" })
+      expect((yield* rawItem("G133AccountBare", "sw1")).name).toEqual({ S: "a" })
+      expect((yield* rawItem("G133AccountBare", "sw2")).email).toEqual({ S: "sw2@x.io" })
+      expect(yield* sentinelOwner("G133AccountBare", "email", "sw1@x.io")).toBe(
+        mainKey("G133AccountBare", "sw1").pk.S,
+      )
+      expect(yield* sentinelOwner("G133AccountBare", "email", "sw2@x.io")).toBe(
+        mainKey("G133AccountBare", "sw2").pk.S,
+      )
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a transaction over 4 MB is refused before it is sent", () =>
+    Effect.gen(function* () {
+      // Six 380 KB retain puts: 2.3 MB of items, 4.6 MB with their snapshots.
+      const big = "x".repeat(380_000)
+      const ids = Array.from({ length: 6 }, (_, i) => `big-${i}`)
+      const error = yield* Transaction.transactWrite(
+        ids.map((id) => g133Entities.DevicesRetained.put({ id, owner: "o", label: big } as any)),
+      ).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect((error as ValidationError).entityType).toBe("G133DeviceRetained")
+      expect(String(error.cause)).toContain("4194304 bytes (4 MB)")
+      for (const id of ids) expect(yield* rawItem("G133DeviceRetained", id)).toBeUndefined()
+      // The same items fit as two transactions.
+      yield* Transaction.transactWrite(
+        ids
+          .slice(0, 3)
+          .map((id) => g133Entities.DevicesRetained.put({ id, owner: "o", label: big } as any)),
+      )
+      expect((yield* rawItem("G133DeviceRetained", "big-0")).label.S).toHaveLength(380_000)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a transaction of number-heavy items DynamoDB accepts is not refused", () =>
+    Effect.gen(function* () {
+      // 25 lists of 12,000 floats: ~2.9 MB as DynamoDB stores numbers.
+      const vec = Array.from({ length: 12_000 }, (_, i) => 0.1234567890123 + i * 1e-13)
+      yield* Transaction.transactWrite(
+        Array.from({ length: 25 }, (_, i) => g133Entities.Vecs.put({ id: `vec-${i}`, vec } as any)),
+      )
+      const db = yield* g133Client
+      expect(
+        ((yield* (db.entities.Vecs as any).get({ id: "vec-24" })).vec as Array<number>).length,
+      ).toBe(12_000)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- a deleted retain item's key is reused: its history continues (#133) ----
+
+  it.effect("a hard-deleted retain item is created again past its retained history", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const docs = db.entities.DevicesRetained as any
+      for (const [id, recreate] of [
+        ["rc-put", (doc: any) => docs.put(doc)],
+        ["rc-create", (doc: any) => docs.create(doc)],
+        ["rc-upsert", (doc: any) => docs.upsert(doc)],
+        ["rc-tx", (doc: any) => Transaction.transactWrite([g133Entities.DevicesRetained.put(doc)])],
+      ] as const) {
+        yield* docs.put({ id, owner: "o", label: "first" })
+        yield* docs.update({ id }).set({ label: "second" })
+        const firstRaw = yield* rawItem("G133DeviceRetained", id)
+        yield* docs.delete({ id })
+        // The delete snapshots the final state (v#2) beside the history (v#1).
+        expect(yield* snapshotLabel("G133DeviceRetained", id, 1)).toEqual({ S: "first" })
+        expect(yield* snapshotLabel("G133DeviceRetained", id, 2)).toEqual({ S: "second" })
+        expect(yield* rawItem("G133DeviceRetained", id)).toBeUndefined()
+        yield* recreate({ id, owner: "o", label: "again" })
+        const raw = yield* rawItem("G133DeviceRetained", id)
+        // Past the highest version retained (2), with a new incarnation.
+        expect([raw.label, raw.version]).toEqual([{ S: "again" }, { N: "3" }])
+        expect(raw.__edd_i__).not.toEqual(firstRaw.__edd_i__)
+        expect(yield* snapshotLabel("G133DeviceRetained", id, 2)).toEqual({ S: "second" })
+        expect(yield* snapshotLabel("G133DeviceRetained", id, 3)).toEqual({ S: "again" })
+        // …and it goes on from there.
+        const next = yield* docs.update({ id }).set({ label: "more" })
+        expect(next.version).toBe(4)
+        // A query of its partition returns the item, never its snapshots.
+        expect((yield* docs.primary({ id }).collect()).map((r: any) => r.label)).toEqual(["more"])
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect(
+    "a retain hard delete with no condition is written again after a concurrent update",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        for (const [entity, entityType] of [
+          ["DevicesRetained", "G133DeviceRetained"],
+          ["AccountsRetained", "G133AccountRetained"],
+        ] as const) {
+          const docs = db.entities[entity] as any
+          const id = `hdr-${entity.toLowerCase()}`
+          const field = entity === "AccountsRetained" ? "name" : "label"
+          yield* docs.put(
+            entity === "AccountsRetained"
+              ? { id, email: `${id}@x.io`, name: "first" }
+              : { id, owner: "o", label: "first" },
+          )
+          // Another writer updates it between the delete's read and its write.
+          g133Inject.before = rawSetAttrs(entityType, id, { [field]: { S: "theirs" } }, true)
+          yield* docs.delete({ id })
+          expect(yield* rawItem(entityType, id)).toBeUndefined()
+          // The final state snapshotted is the one the concurrent write left.
+          expect((yield* snapshotOf(entityType, id, 2))?.[field]).toEqual({ S: "theirs" })
+          // With a `.condition()`, the race still fails.
+          yield* docs.put(
+            entity === "AccountsRetained"
+              ? { id, email: `${id}@x.io`, name: "again" }
+              : { id, owner: "o", label: "again" },
+          )
+          g133Inject.before = rawSetAttrs(entityType, id, { [field]: { S: "x" } }, true)
+          const refused = yield* docs
+            .delete({ id })
+            .condition({ attributeExists: "id" })
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(refused._tag).toBe("OptimisticLockError")
+        }
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect(
+    "a delete racing a concurrent delete reports what a delete of a missing item does",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        // Retain only: a delete of a missing item succeeds — so does the race.
+        const retained = db.entities.DevicesRetained as any
+        yield* retained.put({ id: "rdd1", owner: "o", label: "l" })
+        g133Inject.before = rawDelete("G133DeviceRetained", "rdd1")
+        yield* retained.delete({ id: "rdd1" })
+        yield* retained.delete({ id: "rdd1" })
+        // Soft delete: a missing item is ItemNotFound, raced or not.
+        const soft = db.entities.SoftDevices as any
+        yield* soft.put({ id: "rdd2", owner: "o", label: "l" })
+        g133Inject.before = rawDelete("G133SoftDevice", "rdd2")
+        expect((yield* soft.delete({ id: "rdd2" }).asEffect().pipe(Effect.flip))._tag).toBe(
+          "ItemNotFound",
+        )
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect(
+    "deleteIfExists racing an update reads the item again; a missing one fails its condition",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        for (const [entity, entityType, doc] of [
+          ["DevicesRetained", "G133DeviceRetained", { owner: "o", label: "l" }],
+          ["AccountsBare", "G133AccountBare", { email: "die@x.io", name: "l" }],
+          ["SoftDevices", "G133SoftDevice", { owner: "o", label: "l" }],
+        ] as const) {
+          const docs = db.entities[entity] as any
+          const id = `die-${entity.toLowerCase()}`
+          yield* docs.put({ id, ...doc })
+          g133Inject.before = rawSetAttrs(
+            entityType,
+            id,
+            entity === "AccountsBare" ? { name: { S: "x" } } : { label: { S: "x" } },
+            entity !== "AccountsBare",
+          )
+          yield* docs.deleteIfExists({ id })
+          expect(yield* rawItem(entityType, id)).toBeUndefined()
+          const gone = yield* docs.deleteIfExists({ id }).asEffect().pipe(Effect.flip)
+          expect(gone._tag).toBe("ConditionalCheckFailed")
+        }
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("delete().returnValues('allOld') returns the deleted item on every path", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      for (const [entity, doc] of [
+        ["Authors", { name: "plain" }],
+        ["DevicesPlain", { owner: "o", label: "versioned" }],
+        ["AccountsBare", { email: "rv@x.io", name: "unique" }],
+        ["DevicesRetained", { owner: "o", label: "retained" }],
+        ["SoftDevices", { owner: "o", label: "soft" }],
+      ] as const) {
+        const docs = db.entities[entity] as any
+        const id = `rv-${entity.toLowerCase()}`
+        yield* docs.put({ id, ...doc })
+        const old = yield* docs.delete({ id }).returnValues("allOld")
+        expect(old).toMatchObject({ id, ...doc })
+        // Nothing to delete: nothing returned. "none" returns nothing either.
+        if (entity === "Authors" || entity === "DevicesRetained") {
+          expect(yield* docs.delete({ id }).returnValues("allOld")).toBeUndefined()
+        }
+        yield* docs.put({ id, ...doc })
+        expect(yield* docs.delete({ id }).returnValues("none")).toBeUndefined()
+        // A mode DeleteItem doesn't support is refused, and nothing is deleted.
+        yield* docs.put({ id, ...doc })
+        const refused = yield* docs
+          .delete({ id })
+          .returnValues("allNew")
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(refused._tag).toBe("ValidationError")
+        expect(yield* docs.get({ id })).toMatchObject({ id })
+        // deleteIfExists with a condition asserts both.
+        const unmet = yield* docs
+          .deleteIfExists({ id })
+          .condition({ id: "someone-else" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(unmet._tag).toBe("ConditionalCheckFailed")
+        yield* docs.deleteIfExists({ id }).condition({ id })
+        const missing = yield* docs
+          .deleteIfExists({ id })
+          .condition({ id })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(missing._tag).toBe("ConditionalCheckFailed")
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a stale writer cannot overwrite a hard-deleted and re-created retain item", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      for (const [entity, entityType, extra] of [
+        ["DevicesRetained", "G133DeviceRetained", { owner: "o" }],
+        ["AccountsRetained", "G133AccountRetained", {}],
+      ] as const) {
+        const docs = db.entities[entity] as any
+        const id = `stale-${entity.toLowerCase()}`
+        const doc = (label: string) =>
+          entity === "AccountsRetained"
+            ? { id, email: `${id}-${label}@x.io`, name: label }
+            : { id, ...extra, label }
+        const field = entity === "AccountsRetained" ? "name" : "label"
+        yield* docs.put(doc("first"))
+        yield* docs.update({ id }).set({ [field]: "second" })
+        // A writer reads the item at version 2…
+        const seen = yield* docs.get({ id })
+        expect(seen.version).toBe(2)
+        // …it is hard-deleted (one transaction: the delete and the v#2 snapshot)…
+        yield* docs.delete({ id })
+        expect((yield* snapshotOf(entityType, id, 2))?.[field]).toEqual({ S: "second" })
+        // …and created again, past its history, under a new incarnation.
+        const again = yield* docs.create(doc("again"))
+        expect(again.version).toBe(3)
+        // The stale writer's expectedVersion(2) no longer matches anything live.
+        const stale = yield* docs
+          .update({ id })
+          .set({ [field]: "stale" })
+          .expectedVersion(2)
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(stale._tag).toBe("OptimisticLockError")
+        expect((yield* rawItem(entityType, id))[field]).toEqual({ S: "again" })
+        // `purge` still removes all of it — the delete-time snapshot included.
+        yield* docs.purge({ id })
+        expect(yield* rawItem(entityType, id)).toBeUndefined()
+        for (const version of [1, 2, 3]) {
+          expect(yield* snapshotOf(entityType, id, version)).toBeUndefined()
+        }
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a soft-deleted retain item is created again; restore then refuses the live one", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const docs = db.entities.SoftDevices as any
+      yield* docs.put({ id: "rs1", owner: "o", label: "first" })
+      yield* docs.update({ id: "rs1" }).set({ label: "second" })
+      yield* docs.delete({ id: "rs1" })
+      // A soft-deleted item is missing: created again, past its history (v#2).
+      const again = yield* docs.create({ id: "rs1", owner: "o", label: "again" })
+      expect(again.version).toBe(3)
+      expect(yield* snapshotLabel("G133SoftDevice", "rs1", 2)).toEqual({ S: "second" })
+      expect(yield* snapshotLabel("G133SoftDevice", "rs1", 3)).toEqual({ S: "again" })
+      // Restoring the tombstone over the live item is refused, clearly.
+      const refused = yield* docs.restore({ id: "rs1" }).pipe(Effect.flip)
+      expect(refused._tag).toBe("ItemNotDeleted")
+      expect((yield* rawItem("G133SoftDevice", "rs1")).label).toEqual({ S: "again" })
+      // Once the live item is deleted too, restore brings back the latest one.
+      yield* TestClock.adjust("1 second")
+      yield* docs.delete({ id: "rs1" })
+      const restored = yield* docs.restore({ id: "rs1" })
+      expect([restored.label, restored.version]).toEqual(["again", 4])
+      expect(yield* snapshotLabel("G133SoftDevice", "rs1", 3)).toEqual({ S: "again" })
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- several items per partition: each has its own history (#133) ----
+
+  /** Every row of an order's partition, by sort key. */
+  const linePartition = (order: string, entityType = "g133line") =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { Items } = yield* client.query({
+        TableName: g133Tables.record,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: `$edd133g#v1#${entityType}#order_${order}` } },
+        ConsistentRead: true,
+      })
+      return (Items ?? []).map((item) => item.sk!.S!)
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+
+  it.effect("sibling retain items keep independent version histories", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const lines = db.entities.Lines as any
+      const [a, b] = [
+        { order: "o1", line: "a" },
+        { order: "o1", line: "b" },
+      ]
+      yield* lines.put({ ...a, label: "a1" })
+      // A sibling is created at version 1 — not after the other's history.
+      expect((yield* lines.put({ ...b, label: "b1" })).version).toBe(1)
+      yield* lines.update(a).set({ label: "a2" })
+      expect((yield* lines.update(a).set({ label: "a3" })).version).toBe(3)
+      expect((yield* lines.update(b).set({ label: "b2" })).version).toBe(2)
+      // Each item's snapshots are its own, under its own key.
+      expect(yield* linePartition("o1")).toEqual([
+        "$edd133g#v1#g133line#line_a",
+        "$edd133g#v1#g133line#line_b",
+        "$edd133g#v1#g133line#v#line_a#0000001",
+        "$edd133g#v1#g133line#v#line_a#0000002",
+        "$edd133g#v1#g133line#v#line_b#0000001",
+      ])
+      const labels = (rows: ReadonlyArray<any>) => rows.map((r) => [r.version, r.label])
+      expect(labels(yield* lines.versions(a).collect())).toEqual([
+        [1, "a1"],
+        [2, "a2"],
+      ])
+      expect(labels(yield* lines.versions(b).collect())).toEqual([[1, "b1"]])
+      expect((yield* lines.getVersion(b, 1)).label).toBe("b1")
+      expect(yield* lines.getVersion(b, 2).pipe(Effect.flip)).toMatchObject({
+        _tag: "ItemNotFound",
+      })
+
+      // Delete and re-create one: it continues past its own history only.
+      yield* lines.delete(a)
+      expect((yield* lines.create({ ...a, label: "a4" })).version).toBe(4)
+      expect((yield* lines.update(b).set({ label: "b3" })).version).toBe(3)
+
+      // A query of the partition by sort key composite never meets history.
+      expect(
+        (yield* lines.primary({ order: "o1", line: "a" }).collect()).map((r: any) => r.label),
+      ).toEqual(["a4"])
+
+      // Nor does a query of the whole partition, or a scan: history rows keep
+      // the entity's type, but they are not its items.
+      const live = (rows: ReadonlyArray<any>) => rows.map((r) => r.label).sort()
+      expect(live(yield* lines.primary({ order: "o1" }).collect())).toEqual(["a4", "b3"])
+      expect(live(yield* lines.scan().collect())).toEqual(["a4", "b3"])
+      expect(yield* lines.primary({ order: "o1" }).count()).toBe(2)
+      // Purging one leaves its sibling and the sibling's history.
+      yield* lines.purge(a)
+      expect(yield* linePartition("o1")).toEqual([
+        "$edd133g#v1#g133line#line_b",
+        "$edd133g#v1#g133line#v#line_b#0000001",
+        "$edd133g#v1#g133line#v#line_b#0000002",
+      ])
+      expect((yield* lines.get(b)).label).toBe("b3")
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("sibling soft-deleted items are read, restored and purged one by one", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const lines = db.entities.SoftLines as any
+      const [a, b] = [
+        { order: "o2", line: "a" },
+        { order: "o2", line: "b" },
+      ]
+      yield* lines.put({ ...a, label: "a1" })
+      yield* lines.put({ ...b, label: "b1" })
+      yield* lines.update(b).set({ label: "b2" })
+      yield* lines.delete(a)
+      yield* TestClock.adjust("1 second")
+      yield* lines.delete(b)
+      // Tombstones are not items: a query of the partition finds none.
+      expect(yield* lines.primary({ order: "o2" }).collect()).toEqual([])
+      // Each tombstone is found by its own key — not the partition's latest.
+      expect((yield* lines.deleted.get(a)).label).toBe("a1")
+      expect((yield* lines.deleted.get(b)).label).toBe("b2")
+      // The partition's tombstones are still listed together.
+      expect((yield* lines.deleted.list(a).collect()).map((r: any) => r.label).sort()).toEqual([
+        "a1",
+        "b2",
+      ])
+      // Restoring one restores that one, at its own next version.
+      const restored = yield* lines.restore(a)
+      expect([restored.line, restored.label, restored.version]).toEqual(["a", "a1", 2])
+      expect(yield* lines.deleted.get(b).pipe(Effect.map((r: any) => r.label))).toBe("b2")
+      const restoredB = yield* lines.restore(b)
+      expect([restoredB.line, restoredB.label, restoredB.version]).toEqual(["b", "b2", 3])
+      // Purge removes one item, its tombstones and history only.
+      yield* lines.delete(a)
+      yield* lines.purge(a)
+      const left = yield* linePartition("o2", "g133softline")
+      expect(left.filter((sk) => sk.includes("line_a"))).toEqual([])
+      expect(left).toContain("$edd133g#v1#g133softline#line_b")
+      expect((yield* lines.versions(b).collect()).map((r: any) => r.version)).toEqual([1, 2])
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- history written before items got their own keeps working (#133) ----
+
+  /** A row as an earlier release stored it, written raw. */
+  const putRaw = (item: Record<string, unknown>) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      yield* client.putItem({ TableName: g133Tables.record, Item: toAttributeMap(item) })
+    }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+  const lineRow = (
+    entityType: string,
+    order: string,
+    line: string,
+    sk: string,
+    fields: Record<string, unknown>,
+  ) => ({
+    pk: `$edd133g#v1#${entityType.toLowerCase()}#order_${order}`,
+    sk,
+    __edd_e__: entityType,
+    order,
+    line,
+    createdAt: "2024-01-01T00:00:00.000Z",
+    updatedAt: "2024-01-01T00:00:00.000Z",
+    ...fields,
+  })
+
+  it.effect("sibling items read their legacy version history, segmented first", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const lines = db.entities.Lines as any
+      const at = (sk: string) => `$edd133g#v1#g133line#${sk}`
+      const row = (line: string, sk: string, version: number, label: string) =>
+        lineRow("G133Line", "o3", line, at(sk), { version, label })
+      // The shared sequence earlier releases wrote: a v1, b v2, a v3.
+      yield* putRaw(row("a", "v#0000001", 1, "a1"))
+      yield* putRaw(row("b", "v#0000002", 2, "b2"))
+      yield* putRaw(row("a", "v#0000003", 3, "a3-legacy"))
+      yield* putRaw(row("a", "line_a", 3, "a3"))
+      yield* putRaw(row("b", "line_b", 2, "b2"))
+      const a = { order: "o3", line: "a" }
+      const b = { order: "o3", line: "b" }
+      const history = (key: any) =>
+        Effect.map(lines.versions(key).collect(), (rows: any) =>
+          rows.map((r: any) => [r.version, r.label]),
+        )
+      expect(yield* history(a)).toEqual([
+        [1, "a1"],
+        [3, "a3-legacy"],
+      ])
+      expect(yield* history(b)).toEqual([[2, "b2"]])
+      expect((yield* lines.getVersion(a, 1)).label).toBe("a1")
+      expect((yield* lines.getVersion(b, 2)).label).toBe("b2")
+      // v#0000001 is a's, not b's.
+      expect(((yield* Effect.flip(lines.getVersion(b, 1))) as any)._tag).toBe("ItemNotFound")
+
+      // An update snapshots v3 again, under the item's own key: that one wins.
+      expect((yield* lines.update(a).set({ label: "a4" })).version).toBe(4)
+      expect(yield* history(a)).toEqual([
+        [1, "a1"],
+        [3, "a3"],
+      ])
+      expect((yield* lines.getVersion(a, 3)).label).toBe("a3")
+      expect((yield* lines.versions(a).reverse().collect()).map((r: any) => r.version)).toEqual([
+        3, 1,
+      ])
+
+      // b was hard-deleted by an earlier release (no final snapshot): created
+      // again, it continues past its legacy history, not at version 1.
+      yield* Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteItem({
+          TableName: g133Tables.record,
+          Key: toAttributeMap({ pk: "$edd133g#v1#g133line#order_o3", sk: at("line_b") }),
+        })
+      }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+      expect((yield* lines.create({ ...b, label: "b3" })).version).toBe(3)
+      expect(yield* history(b)).toEqual([
+        [2, "b2"],
+        [3, "b3"],
+      ])
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("sibling items find and restore their legacy tombstones", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const lines = db.entities.SoftLines as any
+      const tomb = (line: string, ts: string, label: string, version: number) =>
+        lineRow("G133SoftLine", "o4", line, `$edd133g#v1#g133softline#deleted#${ts}`, {
+          version,
+          label,
+          deletedAt: ts,
+        })
+      yield* putRaw(tomb("a", "2024-01-02T00:00:00.000Z", "a1", 1))
+      yield* putRaw(tomb("b", "2024-01-03T00:00:00.000Z", "b2", 2))
+      const a = { order: "o4", line: "a" }
+      const b = { order: "o4", line: "b" }
+      // Each item finds its own — not the partition's latest.
+      expect((yield* lines.deleted.get(a)).label).toBe("a1")
+      expect((yield* lines.deleted.get(b)).label).toBe("b2")
+      expect((yield* lines.deleted.list(a).collect()).map((r: any) => r.label).sort()).toEqual([
+        "a1",
+        "b2",
+      ])
+      // Restored from the legacy tombstone, which is consumed.
+      const restored = yield* lines.restore(a)
+      expect([restored.line, restored.label, restored.version]).toEqual(["a", "a1", 2])
+      expect(((yield* Effect.flip(lines.deleted.get(a))) as any)._tag).toBe("ItemNotFound")
+      expect((yield* lines.deleted.get(b)).label).toBe("b2")
+      const restoredB = yield* lines.restore(b)
+      expect([restoredB.line, restoredB.label, restoredB.version]).toEqual(["b", "b2", 3])
+      // Deleted again: the newer, segmented tombstone is the one found.
+      yield* TestClock.adjust("1 second")
+      yield* lines.update(a).set({ label: "a3" })
+      yield* lines.delete(a)
+      expect((yield* lines.deleted.get(a)).label).toBe("a3")
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a collection's fetch, paginate, count and select return its members' items", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      yield* (db.entities.OrAs as any).put({ owner: "cq1", aid: "a1", n: 1 })
+      yield* (db.entities.OrAs as any).put({ owner: "cq1", aid: "a2", n: 2 })
+      yield* (db.entities.OrBs as any).put({ owner: "cq1", bid: "b1", n: 3, secret: "s" })
+      const q = () => db.collections.g133Or!({ owner: "cq1" })
+      const page = yield* q().fetch()
+      expect(page.items.OrAs.map((a: any) => a.aid)).toEqual(["a1", "a2"])
+      expect(page.items.OrBs.map((b: any) => b.bid)).toEqual(["b1"])
+      const streamed = [...(yield* Stream.runCollect(q().paginate()))] as Array<any>
+      expect(streamed.map((s) => [s.member, s.item.aid ?? s.item.bid]).sort()).toEqual([
+        ["OrAs", "a1"],
+        ["OrAs", "a2"],
+        ["OrBs", "b1"],
+      ])
+      expect(yield* q().count()).toBe(3)
+      const selected = yield* q().select(["n"]).collect()
+      expect(selected).toEqual({ OrAs: [{ n: 1 }, { n: 2 }], OrBs: [{ n: 3 }] })
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect(
+    "a collection filter on a field only some members have reads it as absent on the rest",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const as = db.entities.OrAs as any
+        const bs = db.entities.OrBs as any
+        yield* as.put({ owner: "part", aid: "a1", n: 1, code: "c1" })
+        yield* as.put({ owner: "part", aid: "a2", n: 2, code: "c2" })
+        yield* bs.put({ owner: "part", bid: "b1", n: 3, secret: "s" })
+        yield* bs.put({ owner: "part", bid: "b2", n: 4, secret: "t" })
+        const q = () => db.collections.g133Or!({ owner: "part" })
+        const ids = (r: any) => [r.OrAs.map((a: any) => a.aid), r.OrBs.map((b: any) => b.bid)]
+        // What main returns: DynamoDB evaluates an absent attribute.
+        const either = (t: any, { or, eq }: any) => or(eq(t.secret, "s"), eq(t.code, "c1"))
+        expect(ids(yield* q().filter(either).collect())).toEqual([["a1"], ["b1"]])
+        expect(yield* q().filter(either).count()).toBe(2)
+        const notS = (t: any, { not, eq }: any) => not(eq(t.secret, "s"))
+        expect(ids(yield* q().filter(notS).collect())).toEqual([["a1", "a2"], ["b2"]])
+        const noSecret = (t: any, { notExists }: any) => notExists(t.secret)
+        expect(ids(yield* q().filter(noSecret).collect())).toEqual([["a1", "a2"], []])
+        // A field no member has matches nothing.
+        expect(ids(yield* q().filter({ nope: "x" }).collect())).toEqual([[], []])
+        // A GSI is read only eventually consistently: refused before sending.
+        expect((yield* q().consistentRead().collect().pipe(Effect.flip))._tag).toBe(
+          "ValidationError",
+        )
+        const byOwner = as.byOwner({ owner: "part" }).consistentRead()
+        expect((yield* byOwner.collect().pipe(Effect.flip))._tag).toBe("ValidationError")
+        // A row of no member's in the partition (seen once ownership is
+        // ignored) is never streamed as a member's item.
+        const a1 = yield* Effect.gen(function* () {
+          const client = yield* DynamoClient
+          return (yield* client.getItem({
+            TableName: g133Tables.record,
+            Key: toAttributeMap({
+              pk: "$edd133g#v1#g133ora#owner_part",
+              sk: "$edd133g#v1#g133ora#aid_a1",
+            }),
+          })).Item!
+        }).pipe(Effect.provide(ClientLayer), Effect.scoped)
+        yield* putRaw({
+          ...fromAttributeMap(a1),
+          pk: "$edd133g#v1#foreign#x",
+          sk: "$edd133g#v1#foreign",
+          __edd_e__: "Foreign",
+        })
+        const streamed = [...(yield* Stream.runCollect(q().ignoreOwnership().paginate()))]
+        expect(streamed.map((s) => s.member).sort()).toEqual(["OrAs", "OrAs", "OrBs", "OrBs"])
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- an op's own guard is never replaced by .condition() (#133) ----
+
+  it.effect("create of an existing item fails whatever condition is added", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      for (const [entity, entityType, doc] of [
+        ["Authors", "G133Author", { name: "first" }],
+        ["DevicesPlain", "G133DevicePlain", { owner: "o", label: "first" }],
+      ] as const) {
+        const docs = db.entities[entity] as any
+        const id = `cg-${entity.toLowerCase()}`
+        yield* docs.put({ id, ...doc })
+        const field = entity === "Authors" ? "name" : "label"
+        const again = { id, ...doc, [field]: "second" }
+        for (const condition of [{}, { [field]: "first" }]) {
+          const bound = yield* docs.create(again).condition(condition).asEffect().pipe(Effect.flip)
+          expect(bound._tag).toBe("ConditionalCheckFailed")
+          const unbound = yield* (g133Entities[entity] as any)
+            .create(again)
+            .pipe((g133Entities[entity] as any).condition(condition))
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(unbound._tag).toBe("ConditionalCheckFailed")
+          const inTransaction = yield* Transaction.transactWrite([
+            (g133Entities[entity] as any)
+              .create(again)
+              .pipe((g133Entities[entity] as any).condition(condition)),
+          ]).pipe(Effect.flip)
+          expect(inTransaction._tag).toBe("TransactionCancelled")
+          expect((yield* rawItem(entityType, id))[field]).toEqual({ S: "first" })
+        }
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("patch of a missing item fails its existence check whatever condition is added", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const authors = db.entities.Authors as any
+      for (const condition of [{}, { name: "x" }]) {
+        const missing = yield* authors
+          .patch({ id: "pg-missing" })
+          .set({ name: "n" })
+          .condition(condition)
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(missing._tag).toBe("ConditionalCheckFailed")
+        expect(yield* rawItem("G133Author", "pg-missing")).toBeUndefined()
+      }
+      // A patch that reads first (retain) reports the same, writing nothing (#134).
+      const retained = db.entities.DevicesRetained as any
+      for (const condition of [{}, { label: "x" }]) {
+        const missing = yield* retained
+          .patch({ id: "pg-missing-r" })
+          .set({ label: "n" })
+          .condition(condition)
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(missing._tag).toBe("ConditionalCheckFailed")
+        expect(yield* rawItem("G133DeviceRetained", "pg-missing-r")).toBeUndefined()
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect(
+    "a read-first patch that loses its item to a delete fails, writing nothing (#134)",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const accounts = db.entities.AccountsBare as any
+        yield* accounts.put({ id: "pr-race", email: "pr-race@x.io", name: "a" })
+        // Deleted between the patch's read and its write.
+        g133Inject.before = g133Hook(
+          Effect.gen(function* () {
+            const client = yield* DynamoClient
+            yield* client.deleteItem({
+              TableName: g133Tables.record,
+              Key: mainKey("G133AccountBare", "pr-race"),
+            })
+          }).pipe(Effect.provide(ClientLayer)),
+        )
+        const error = yield* accounts
+          .patch({ id: "pr-race" })
+          .set({ email: "pr-race-2@x.io" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ConditionalCheckFailed")
+        expect(yield* rawItem("G133AccountBare", "pr-race")).toBeUndefined()
+        // The new value's sentinel was not written: another item can take it.
+        yield* accounts.put({ id: "pr-race-other", email: "pr-race-2@x.io" })
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("deleteIfExists of a missing item fails whatever condition is added", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const devices = db.entities.DevicesPlain as any
+      const Devices = g133Entities.DevicesPlain as any
+      for (const condition of [{}, { label: "first" }]) {
+        const key = { id: "dg-missing" }
+        const bound = yield* devices
+          .deleteIfExists(key)
+          .condition(condition)
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(bound._tag).toBe("ConditionalCheckFailed")
+        const unbound = yield* Devices.deleteIfExists(key)
+          .pipe(Devices.condition(condition))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(unbound._tag).toBe("ConditionalCheckFailed")
+        const inTransaction = yield* Transaction.transactWrite([
+          Devices.deleteIfExists(key).pipe(Devices.condition(condition)),
+        ]).pipe(Effect.flip)
+        expect(inTransaction._tag).toBe("TransactionCancelled")
+      }
+      // A later `.condition({})` replaces an earlier one; existence stays.
+      yield* devices.put({ id: "dg-present", owner: "o", label: "first" })
+      yield* devices
+        .deleteIfExists({ id: "dg-present" })
+        .condition({ label: "other" })
+        .condition({})
+      expect(yield* rawItem("G133DevicePlain", "dg-present")).toBeUndefined()
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- an empty part under or / not is refused, never dropped (#133) ----
+
+  it.effect("an empty part under or or not is refused before anything is sent", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const devices = db.entities.DevicesPlain as any
+      const refused = [
+        (t: any, { or, eq, and }: any) => or(eq(t.label, "first"), and()),
+        (_: any, { not, and }: any) => not(and()),
+        (_: any, { or }: any) => or(),
+        (t: any, { isIn }: any) => isIn(t.label, []),
+      ]
+      yield* devices.put({ id: "ep-1", owner: "ep", label: "first" })
+      for (const cond of refused) {
+        const put = yield* devices
+          .put({ id: "ep-2", owner: "ep", label: "x" })
+          .condition(cond)
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(put._tag).toBe("ValidationError")
+        expect(yield* rawItem("G133DevicePlain", "ep-2")).toBeUndefined()
+        const del = yield* devices
+          .delete({ id: "ep-1" })
+          .condition(cond)
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(del._tag).toBe("ValidationError")
+        expect(yield* rawItem("G133DevicePlain", "ep-1")).toBeDefined()
+        const filtered = yield* devices.scan().filter(cond).collect().pipe(Effect.flip)
+        expect(filtered._tag).toBe("ValidationError")
+      }
+      // Directly under and, or as the whole filter, an empty part is none.
+      const kept = (t: any, { and, eq }: any) => and(eq(t.owner, "ep"), and())
+      expect((yield* devices.scan().filter(kept).collect()).map((d: any) => d.id)).toEqual(["ep-1"])
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- a filter never widens the ownership check (#133) ----
+
+  it.effect("a top-level OR filter returns only the entity's own rows", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const as = db.entities.OrAs as any
+      const bs = db.entities.OrBs as any
+      yield* as.put({ owner: "or1", aid: "a1", n: 1 })
+      yield* bs.put({ owner: "or1", bid: "b1", n: 5, secret: "s" })
+      const either = (t: any, { or, eq }: any) => or(eq(t.n, 1), eq(t.n, 5))
+      const q = () => as.byOwner({ owner: "or1" }).filter(either)
+      expect((yield* q().collect()).map((a: any) => a.aid)).toEqual(["a1"])
+      expect(yield* q().count()).toBe(1)
+      expect(yield* q().select(["n"]).collect()).toEqual([{ n: 1 }])
+      const scanned = yield* as.scan().filter({ owner: "or1" }).filter(either).collect()
+      expect(scanned.map((a: any) => a.aid)).toEqual(["a1"])
+      expect(yield* as.scan().filter(either).count()).toBeGreaterThanOrEqual(1)
+      const leaked = yield* as.scan().filter(either).collect()
+      expect(leaked.every((a: any) => a.aid !== undefined)).toBe(true)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- names a placeholder may not hold, and renamed fields (#133) ----
+
+  it.effect("select and filter field names that need placeholders, plain or renamed", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      for (const entity of ["Hyphens", "PlainHyphens"] as const) {
+        const docs = db.entities[entity] as any
+        const grp = `pl-${entity.toLowerCase()}`
+        yield* docs.put({
+          grp,
+          hid: "1",
+          "first-name": "Ann",
+          label: "L1",
+          addr: { city: "C1", zip: "Z1" },
+          tags: ["a", "b"],
+        })
+        yield* docs.put({
+          grp,
+          hid: "2",
+          "first-name": "Bob",
+          label: "L2",
+          addr: { city: "C2", zip: "Z2" },
+          tags: ["a"],
+        })
+        // A scan reads the whole shared table, so it gets the names that need
+        // placeholders and a nested renamed path, not every query below.
+        const scan = () => docs.scan().filter({ grp })
+        expect(yield* scan().select(["first-name"]).collect()).toEqual([
+          { "first-name": "Ann" },
+          { "first-name": "Bob" },
+        ])
+        expect(
+          yield* scan()
+            .select((x: any) => [x.addr.city])
+            .collect(),
+        ).toEqual([{ addr: { city: "C1" } }, { addr: { city: "C2" } }])
+        expect(
+          (yield* scan().filter({ "first-name": "Ann" }).collect()).map((r: any) => r.hid),
+        ).toEqual(["1"])
+        const queries = [
+          () => docs.primary({ grp }),
+          ...(entity === "Hyphens" ? [() => docs.byGrp({ grp })] : []),
+        ]
+        for (const q of queries) {
+          expect(yield* q().select(["first-name"]).collect()).toEqual([
+            { "first-name": "Ann" },
+            { "first-name": "Bob" },
+          ])
+          expect(
+            yield* q()
+              .select((x: any) => [x["first-name"], x.label])
+              .collect(),
+          ).toEqual([
+            { "first-name": "Ann", label: "L1" },
+            { "first-name": "Bob", label: "L2" },
+          ])
+          expect(yield* q().select(["label"]).collect()).toEqual([{ label: "L1" }, { label: "L2" }])
+          // A nested path under a renamed field.
+          expect(
+            yield* q()
+              .select((x: any) => [x.addr.city])
+              .collect(),
+          ).toEqual([{ addr: { city: "C1" } }, { addr: { city: "C2" } }])
+          const page = yield* q().select(["label"]).limit(1).fetch()
+          expect(page.items).toEqual([{ label: "L1" }])
+          const ids = (rows: ReadonlyArray<any>) => rows.map((r) => r.hid)
+          expect(ids(yield* q().filter({ label: "L2" }).collect())).toEqual(["2"])
+          expect(ids(yield* q().filter({ "first-name": "Ann" }).collect())).toEqual(["1"])
+          expect(
+            ids(
+              yield* q()
+                .filter((x: any, { eq }: any) => eq(x.addr.city, "C2"))
+                .collect(),
+            ),
+          ).toEqual(["2"])
+          expect(
+            ids(
+              yield* q()
+                .filter((x: any, { gt }: any) => gt(x.label.size(), 1))
+                .collect(),
+            ),
+          ).toEqual(["1", "2"])
+          expect(
+            ids(
+              yield* q()
+                .filter((x: any, { gt }: any) => gt(x.tags.size(), 1))
+                .collect(),
+            ),
+          ).toEqual(["1"])
+        }
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a collection filter names each member's domain fields, never stored names", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      yield* (db.entities.Hyphens as any).put({
+        grp: "dom",
+        hid: "1",
+        "first-name": "Ann",
+        label: "L1",
+        addr: { city: "C1", zip: "Z1" },
+        tags: [],
+      })
+      // Its `the-label` is a domain field, holding what Hyphens stores under that name.
+      yield* (db.entities.NamedThirds as any).put({
+        grp: "dom",
+        tid: "t1",
+        label: "X",
+        "the-label": "L1",
+      })
+      const named = (db.collections as any).g133Named
+      const byLabel = yield* named({ grp: "dom" }).filter({ label: "L1" }).collect()
+      expect(byLabel.Hyphens.map((h: any) => h.hid)).toEqual(["1"])
+      expect(byLabel.NamedThirds).toEqual([])
+      const byStoredName = yield* named({ grp: "dom" }).filter({ "the-label": "L1" }).collect()
+      expect(byStoredName.Hyphens).toEqual([])
+      expect(byStoredName.NamedThirds.map((t: any) => t.tid)).toEqual(["t1"])
+      // A field only one member stores, under a name that is no member's
+      // domain field: nothing.
+      expect(yield* named({ grp: "dom" }).filter({ nlabel: "L1" }).count()).toBe(0)
+      // select reads each member's own domain fields — never a stored name.
+      const selected = yield* named({ grp: "dom" }).select(["label", "the-label"]).collect()
+      expect(selected.Hyphens).toEqual([{ label: "L1" }])
+      expect(selected.NamedThirds).toEqual([{ label: "X", "the-label": "L1" }])
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a collection filters and selects each member's renamed fields", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const hyphens = db.entities.Hyphens as any
+      const others = db.entities.NamedOthers as any
+      yield* hyphens.put({
+        grp: "col",
+        hid: "1",
+        "first-name": "Ann",
+        label: "L1",
+        addr: { city: "C1", zip: "Z1" },
+        tags: [],
+      })
+      yield* hyphens.put({
+        grp: "col",
+        hid: "2",
+        "first-name": "Bob",
+        label: "L2",
+        addr: { city: "C2", zip: "Z2" },
+        tags: [],
+      })
+      yield* others.put({ grp: "col", nid: "n1", label: "L1" })
+      const named = (db.collections as any).g133Named
+      const filtered = yield* named({ grp: "col" }).filter({ label: "L1" }).collect()
+      expect(filtered.Hyphens.map((h: any) => h.hid)).toEqual(["1"])
+      expect(filtered.NamedOthers.map((o: any) => o.nid)).toEqual(["n1"])
+      const selected = yield* named({ grp: "col" }).select(["label"]).collect()
+      expect(selected.Hyphens).toEqual([{ label: "L1" }, { label: "L2" }])
+      expect(selected.NamedOthers).toEqual([{ label: "L1" }])
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- live rows are never mistaken for history (#133) ----
+
+  it.effect("a time-series item whose key holds the event marker is still an item", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const readings = db.entities.Readings as any
+      for (const dev of ["d1", "x#e#y"]) {
+        for (let day = 1; day <= 3; day++) {
+          yield* readings.append({
+            ch: "lr",
+            dev,
+            ts: DateTime.makeUnsafe(Date.UTC(2024, 0, day)),
+            v: day,
+          })
+        }
+      }
+      const devs = (rows: ReadonlyArray<any>) => rows.map((r) => r.dev).sort()
+      expect(devs(yield* readings.primary({ ch: "lr" }).collect())).toEqual(["d1", "x#e#y"])
+      expect(yield* readings.primary({ ch: "lr" }).count()).toBe(2)
+      expect(devs(yield* readings.scan().filter({ ch: "lr" }).collect())).toEqual(["d1", "x#e#y"])
+      expect(yield* readings.history({ ch: "lr", dev: "x#e#y" }).collect()).toHaveLength(3)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a row the composer can't reproduce is kept unless it is shaped like history", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const seqs = db.entities.Seqs as any
+      // As 1.15 wrote it: the key from the encoded string, unpadded.
+      yield* putRaw({
+        pk: "$edd133g#v1#g133seq#tenant_t1",
+        sk: "$edd133g#v1#g133seq#seq_5",
+        __edd_e__: "G133Seq",
+        tenant: "t1",
+        seq: "5",
+        label: "from-1.15",
+        version: 1,
+      })
+      yield* seqs.put({ tenant: "t1", seq: 42, label: "new" })
+      yield* seqs.update({ tenant: "t1", seq: 42 }).set({ label: "newer" })
+      const labels = (rows: ReadonlyArray<any>) => rows.map((r) => r.label).sort()
+      expect(labels(yield* seqs.primary({ tenant: "t1" }).collect())).toEqual([
+        "from-1.15",
+        "newer",
+      ])
+      expect(yield* seqs.primary({ tenant: "t1" }).count()).toBe(2)
+      expect(labels(yield* seqs.scan().filter({ tenant: "t1" }).collect())).toEqual([
+        "from-1.15",
+        "newer",
+      ])
+      // A malformed live row (its composite is missing) is read as before:
+      // the query fails to decode it rather than hiding it.
+      yield* putRaw({
+        pk: "$edd133g#v1#g133seq#tenant_t2",
+        sk: "$edd133g#v1#g133seq#seq_0000000000000007",
+        __edd_e__: "G133Seq",
+        tenant: "t2",
+        label: "malformed",
+        version: 1,
+      })
+      const failed = yield* Effect.flip(seqs.primary({ tenant: "t2" }).collect())
+      expect((failed as any)._tag).toBe("ValidationError")
+      // Rows under the snapshot or tombstone prefix that aren't shaped like a
+      // snapshot (`…#<7+ digits>`) or a tombstone (`…#<ISO timestamp>`) are kept.
+      yield* putRaw({
+        pk: "$edd133g#v1#g133seq#tenant_t3",
+        sk: "$edd133g#v1#g133seq#v#seq_5",
+        __edd_e__: "G133Seq",
+        tenant: "t3",
+        seq: "5",
+        label: "under-v",
+        version: 1,
+      })
+      expect(labels(yield* seqs.primary({ tenant: "t3" }).collect())).toEqual(["under-v"])
+      const soft = db.entities.SoftLines as any
+      yield* putRaw({
+        pk: "$edd133g#v1#g133softline#order_o9",
+        sk: "$edd133g#v1#g133softline#deleted#not-a-time",
+        __edd_e__: "G133SoftLine",
+        order: "o9",
+        line: "zz",
+        label: "under-deleted",
+        version: 1,
+        createdAt: "2024-01-01T00:00:00.000Z",
+        updatedAt: "2024-01-01T00:00:00.000Z",
+      })
+      expect(labels(yield* soft.primary({ order: "o9" }).collect())).toEqual(["under-deleted"])
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("select on items sharing a partition reads the composites it judges rows by", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const lines = db.entities.Lines as any
+      for (const line of ["a", "b"]) {
+        yield* lines.put({ order: "o5", line, label: `${line}1` })
+        yield* lines.update({ order: "o5", line }).set({ label: `${line}2` })
+      }
+      const labels = (rows: ReadonlyArray<any>) => rows.map((r) => r.label).sort()
+      expect(labels(yield* lines.primary({ order: "o5" }).select(["label"]).collect())).toEqual([
+        "a2",
+        "b2",
+      ])
+      expect(
+        labels(yield* lines.scan().filter({ order: "o5" }).select(["label"]).collect()),
+      ).toEqual(["a2", "b2"])
+      const streamed = yield* Stream.runCollect(
+        lines.primary({ order: "o5" }).select(["label"]).limit(5).paginate(),
+      )
+      expect(labels([...(streamed as any)])).toEqual(["a2", "b2"])
+
+      // A live time-series item whose composite holds the event marker is told
+      // from an event only by composing its key — which needs its composites.
+      const readings = db.entities.Readings as any
+      for (const dev of ["s1", "x#e#z"]) {
+        for (let day = 1; day <= 2; day++) {
+          yield* readings.append({
+            ch: "sel",
+            dev,
+            ts: DateTime.makeUnsafe(Date.UTC(2024, 0, day)),
+            v: day,
+          })
+        }
+      }
+      const values = (rows: ReadonlyArray<any>) => rows.map((r) => r.v)
+      expect(values(yield* readings.primary({ ch: "sel" }).select(["v"]).collect())).toEqual([2, 2])
+      expect(values(yield* readings.scan().filter({ ch: "sel" }).select(["v"]).collect())).toEqual([
+        2, 2,
+      ])
+      const paged = yield* Stream.runCollect(
+        readings.primary({ ch: "sel" }).select(["v"]).limit(5).paginate(),
+      )
+      expect(values([...(paged as any)])).toEqual([2, 2])
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("an item in a sub-collection named like a history marker is still an item", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      for (const entity of ["SubDeleted", "SubVersioned"] as const) {
+        const subs = db.entities[entity] as any
+        yield* subs.put({ id: "sc1", label: "one" })
+        expect((yield* subs.primary({ id: "sc1" }).collect()).map((r: any) => r.label)).toEqual([
+          "one",
+        ])
+        expect((yield* subs.scan().collect()).map((r: any) => r.label)).toEqual(["one"])
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect(
+    "a collection on the primary key returns items, and purge keeps other types' rows",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const orders = db.entities.POrders as any
+        const lines = db.entities.PLines as any
+        yield* orders.put({ orderId: "po1", label: "v1" })
+        yield* orders.update({ orderId: "po1" }).set({ label: "v2" })
+        yield* orders.update({ orderId: "po1" }).set({ label: "v3" })
+        yield* lines.put({ orderId: "po1", lineId: "a", qty: 1 })
+        yield* lines.put({ orderId: "po1", lineId: "b", qty: 2 })
+        const all = yield* (db.collections as any).g133OrderAll({ orderId: "po1" }).collect()
+        expect(all.POrders.map((o: any) => o.label)).toEqual(["v3"])
+        expect(all.PLines).toHaveLength(2)
+        // Counting judges each row by its member — which reads its entity type.
+        expect(yield* (db.collections as any).g133OrderAll({ orderId: "po1" }).count()).toBe(3)
+        // purge removes the order, its history and its tombstones — not the lines.
+        yield* orders.delete({ orderId: "po1" })
+        yield* orders.purge({ orderId: "po1" })
+        expect(yield* orders.versions({ orderId: "po1" }).collect()).toEqual([])
+        expect(
+          (yield* lines.primary({ orderId: "po1" }).collect()).map((l: any) => l.lineId),
+        ).toEqual(["a", "b"])
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- upsert validates the whole input, and stores defaults only on create ----
+
+  it.effect("upsert of an existing unique item still requires every required field", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const coded = db.entities.Coded as any
+      yield* coded.put({ id: "uv1", name: "a", code: "uv1" })
+      const missing = yield* coded.upsert({ id: "uv1", code: "uv1b" }).asEffect().pipe(Effect.flip)
+      expect(missing._tag).toBe("ValidationError")
+      expect(missing.operation).toMatch(/^upsert/)
+      const raw = yield* rawItem("G133Coded", "uv1")
+      expect([raw.name, raw.code]).toEqual([{ S: "a" }, { S: "uv1" }])
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("upsert stores an omitted default on create and keeps the stored value on update", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      const defaults = db.entities.Defaults as any
+      const coded = db.entities.Coded as any
+      // Created: the default is stored and indexed.
+      expect((yield* defaults.upsert({ id: "ud1", name: "n" })).tier).toBe("basic")
+      expect((yield* rawItem("G133Defaults", "ud1")).tier).toEqual({ S: "basic" })
+      // Existing: an upsert that omits it keeps what is stored — unique or not.
+      yield* defaults.put({ id: "ud2", name: "n", tier: "gold" })
+      const kept = yield* defaults.upsert({ id: "ud2", name: "m" })
+      expect([kept.tier, kept.name]).toEqual(["gold", "m"])
+      expect((yield* defaults.byTier({ tier: "gold" }).collect()).map((d: any) => d.id)).toContain(
+        "ud2",
+      )
+      yield* coded.put({ id: "ud3", name: "n", code: "ud3" })
+      const codedKept = yield* coded.upsert({ id: "ud3", name: "m" })
+      expect([codedKept.code, codedKept.name]).toEqual(["ud3", "m"])
+      expect(yield* sentinelExistsFor("G133Coded", "code", "ud3")).toBe(true)
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  // ---- concurrent puts of a missing versioned item: the last writer wins ----
+
+  it.effect("a put that loses the race to create an item replaces it", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      for (const [entity, entityType] of [
+        ["DevicesPlain", "G133DevicePlain"],
+        ["DevicesRetained", "G133DeviceRetained"],
+      ] as const) {
+        const docs = db.entities[entity] as any
+        const id = `lww-${entity.toLowerCase()}`
+        // Another writer creates the item between our read and our write.
+        g133Inject.before = g133Hook(
+          Effect.asVoid(
+            (g133Entities[entity] as any)
+              .put({ id, owner: "o", label: "theirs" })
+              .asEffect()
+              .pipe(Effect.provide(g133Layer(g133Tables.record))),
+          ),
+        )
+        const mine = yield* docs.put({ id, owner: "o", label: "mine" })
+        expect([mine.label, mine.version]).toEqual(["mine", 2])
+        expect((yield* rawItem(entityType, id)).label).toEqual({ S: "mine" })
+      }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 })

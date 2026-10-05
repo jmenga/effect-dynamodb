@@ -25,8 +25,10 @@ import {
   firstTypeParameterAst,
   getSchemaFields,
   isSchemaLike,
+  numericTypeWithStringEncoding,
   transformWireKind as transformWireKindImpl,
 } from "./SchemaAccessors.js"
+import { parseZonedIso } from "./ZonedIso.js"
 
 // ---------------------------------------------------------------------------
 // Resolved system field names (internal)
@@ -398,6 +400,54 @@ export const isSelfDateSchema = (schema: Schema.Top): boolean => {
 }
 
 /**
+ * Whether a value of this schema can hold something, AT ANY DEPTH, whose stored
+ * form differs from its domain form (#133):
+ *
+ * - any node carrying an encoding transformation — a leaf transform
+ *   (`DateTimeUtcFromString`, `BigIntFromString`, …), a `Schema.Class`, a
+ *   `withDecodingDefault` chain;
+ * - a self date (`Schema.DateTimeUtc` / `DateTimeZoned` / `Date`), whose domain
+ *   value marshals to a map rather than its wire primitive;
+ * - a `Redacted` declaration.
+ *
+ * Walks through containers (`Arrays`, `Objects`, `Union` — which covers
+ * `Schema.optional` and `NullOr` — and `Suspend`); an `optionalKey` wrapper is
+ * the inner AST with an optional context, so it needs no case of its own. The
+ * tolerant `substituteSchemaDeep` walks the same containers (see
+ * `walkedContainer`), except `Suspend`: a recursive schema keeps its own
+ * codec, so the aggregate encodes it through its own `encode`.
+ *
+ * `hasEncodingTransformation` asks the same question of the TOP-LEVEL node
+ * only, and an `Arrays` / `Objects` node never carries an encoding itself — so a
+ * `Schema.Array(DateTimeUtcFromString)` attribute was treated as identity and
+ * its `DateTime`s were marshalled as maps.
+ */
+export const containsWireTransform = (schema: Schema.Top): boolean =>
+  astContainsWireTransform(schema.ast, new Set())
+
+const astContainsWireTransform = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST>): boolean => {
+  if (seen.has(ast)) return false
+  seen.add(ast)
+  if (ast.encoding !== undefined) return true
+  if (SchemaAST.isDeclaration(ast)) {
+    const resolved = SchemaAST.resolve(ast) as globalThis.Record<string, unknown> | undefined
+    const rep = resolved?.representation as { readonly id?: string } | undefined
+    return matchDateRepresentation(resolved) !== undefined || rep?.id === "effect/schema/Redacted"
+  }
+  const walk = (child: SchemaAST.AST) => astContainsWireTransform(child, seen)
+  if (SchemaAST.isArrays(ast)) return ast.elements.some(walk) || ast.rest.some(walk)
+  if (SchemaAST.isObjects(ast)) {
+    return (
+      ast.propertySignatures.some((ps) => walk(ps.type)) ||
+      ast.indexSignatures.some((is) => walk(is.type))
+    )
+  }
+  if (SchemaAST.isUnion(ast)) return ast.types.some(walk)
+  if (SchemaAST.isSuspend(ast)) return walk(ast.thunk())
+  return false
+}
+
+/**
  * Returns true when the schema is a transform schema with a date typeConstructor
  * (e.g. `Schema.DateTimeUtcFromString`, `DynamoModel.DateEpochSeconds`).
  * Used to enforce the "transform owns the wire format" policy at Entity.make().
@@ -411,6 +461,68 @@ export const isDateTransform = (schema: Schema.Top): boolean => {
 // Self-date schema substitution
 // ---------------------------------------------------------------------------
 
+/** A plain record — what unmarshalling produces, as opposed to a class instance. */
+const isPlainObject = (value: unknown): value is globalThis.Record<string, unknown> => {
+  if (value === null || typeof value !== "object") return false
+  const proto = Object.getPrototypeOf(value)
+  return proto === Object.prototype || proto === null
+}
+
+/**
+ * A real `DateTime` instance. `DateTime.isDateTime` checks for the type-id
+ * property only, so a plain object read back from a marshalled instance passes
+ * it too (#133) — and is then neither `Equal` to the instant nor usable with the
+ * `DateTime` API that relies on the prototype.
+ */
+const isGenuineDateTime = (value: unknown): value is DateTime.DateTime =>
+  DateTime.isDateTime(value) && !isPlainObject(value)
+
+const reviveTimeZone = (zone: unknown): DateTime.TimeZone | undefined => {
+  if (!isPlainObject(zone)) return undefined
+  try {
+    if (zone._tag === "Named" && typeof zone.id === "string") {
+      return DateTime.zoneMakeNamedUnsafe(zone.id)
+    }
+    if (zone._tag === "Offset" && typeof zone.offset === "number") {
+      return DateTime.zoneMakeOffset(zone.offset)
+    }
+  } catch {
+    return undefined
+  }
+  return undefined
+}
+
+/**
+ * Rebuild a `DateTime` from a MARSHALLED instance (#133).
+ *
+ * Before #133 an aggregate stored some `DateTime`s by marshalling the instance
+ * itself, which keeps its own enumerable properties:
+ *
+ * - `Utc`: `{ epochMilliseconds, <type-id>, _tag: "Utc" }`
+ * - `Zoned`: the same plus `zone`, itself `{ id, _tag: "Named" }` or
+ *   `{ offset, _tag: "Offset" }` (a named zone's `Intl` formatter marshals to
+ *   an empty map and is not needed).
+ *
+ * The type-id key is `~effect/time/DateTime` on effect 4.0.0-rc and
+ * `~effect/DateTime` on 4.0.0, so it is deliberately NOT inspected: the instant
+ * and the tag are what identify the value, and they are all a `DateTime` holds.
+ * A zoned value is rebuilt only when its zone is recoverable.
+ *
+ * Returns `undefined` for anything else — including a genuine `DateTime`, which
+ * needs no rebuilding.
+ */
+export const reviveMarshalledDateTime = (value: unknown): DateTime.DateTime | undefined => {
+  if (!isPlainObject(value)) return undefined
+  const epochMs = value.epochMilliseconds
+  if (typeof epochMs !== "number" || !Number.isFinite(epochMs)) return undefined
+  if (value._tag === "Utc") return DateTime.makeUnsafe(epochMs)
+  if (value._tag === "Zoned") {
+    const timeZone = reviveTimeZone(value.zone)
+    return timeZone === undefined ? undefined : DateTime.makeZonedUnsafe(epochMs, { timeZone })
+  }
+  return undefined
+}
+
 /**
  * Convert any input value (string / number / DateTime / Date) to the wire
  * primitive for a given encoding. Used by date substitutes' `encode` path.
@@ -421,7 +533,8 @@ export const isDateTransform = (schema: Schema.Top): boolean => {
  * - `epochMs` storage → integer milliseconds since the Unix epoch
  * - `epochSeconds` storage → integer seconds since the Unix epoch (TTL format)
  */
-const toWirePrimitive = (value: unknown, encoding: DynamoEncoding): string | number => {
+const toWirePrimitive = (input: unknown, encoding: DynamoEncoding): string | number => {
+  const value = reviveMarshalledDateTime(input) ?? input
   let epochMs: number
   let zoned: DateTime.Zoned | undefined
   if (DateTime.isDateTime(value)) {
@@ -467,7 +580,32 @@ const toWirePrimitive = (value: unknown, encoding: DynamoEncoding): string | num
  *
  * @internal
  */
-export const buildDateTransform = (encoding: DynamoEncoding): Schema.Top => {
+export const buildDateTransform = (
+  encoding: DynamoEncoding,
+  options?: {
+    /**
+     * Accept only this encoding's OWN wire kind (a string for `string` storage, a
+     * number for epoch storage), a domain value of this encoding's domain, or a
+     * legacy marshalled map of it — never a cross-kind input. Used for date leaves
+     * reached through a `Union`: there the tolerant decode is tried member by
+     * member, and accepting any date-ish input would let a date member claim a
+     * value that belongs to a later member (a stored `5` in
+     * `Union([DateTimeUtcFromString, Number])` would read back as a `DateTime`).
+     */
+    readonly strictWireKind?: boolean | undefined
+    /**
+     * With `strictWireKind`: accept a wire primitive only in the exact
+     * canonical form `toWirePrimitive` writes. Set when another member of the
+     * same union encodes to the same primitive kind (a `String` member next to
+     * ISO storage): any string that is not this date's own canonical
+     * spelling — `"2020"`, `"5"` — is left for that member, as it was before
+     * dates were written in wire form (#133).
+     */
+    readonly canonicalOnly?: boolean | undefined
+  },
+): Schema.Top => {
+  const strict = options?.strictWireKind === true
+  const canonicalOnly = options?.canonicalOnly === true
   const targetSchema = (() => {
     switch (encoding.domain) {
       case "DateTime.Utc":
@@ -478,8 +616,56 @@ export const buildDateTransform = (encoding: DynamoEncoding): Schema.Top => {
         return Schema.Date as unknown as Schema.Top
     }
   })()
+  const fromDateTime = (value: DateTime.DateTime): unknown => {
+    switch (encoding.domain) {
+      case "DateTime.Utc":
+        return DateTime.toUtc(value)
+      case "DateTime.Zoned":
+        return DateTime.isZoned(value)
+          ? value
+          : DateTime.makeZonedUnsafe(DateTime.toEpochMillis(value), { timeZone: "UTC" })
+      case "Date":
+        return DateTime.toDateUtc(value)
+    }
+  }
+  /** Under `strictWireKind`: whether a DateTime is of this encoding's own domain. */
+  const ownDomain = (value: DateTime.DateTime): boolean =>
+    encoding.domain === "DateTime.Utc"
+      ? DateTime.isUtc(value)
+      : encoding.domain === "DateTime.Zoned" && DateTime.isZoned(value)
+  const liftStrict = (value: unknown): unknown => {
+    const revived = reviveMarshalledDateTime(value)
+    if (revived !== undefined) {
+      if (ownDomain(revived)) return revived
+      throw new Error("[effect-dynamodb] marshalled DateTime of another domain")
+    }
+    if (isGenuineDateTime(value) && ownDomain(value)) return value
+    if (value instanceof Date && encoding.domain === "Date" && !Number.isNaN(value.getTime())) {
+      return value
+    }
+    if (typeof value === (encoding.storage === "string" ? "string" : "number")) {
+      const lifted = liftToDomain(value)
+      if (lifted instanceof Date && Number.isNaN(lifted.getTime())) {
+        throw new Error("[effect-dynamodb] invalid date")
+      }
+      if (canonicalOnly && toWirePrimitive(lifted, encoding) !== value) {
+        throw new Error("[effect-dynamodb] not this date member's canonical wire form")
+      }
+      return lifted
+    }
+    throw new Error("[effect-dynamodb] not this date member's wire or domain form")
+  }
   const liftToDomain = (value: unknown): unknown => {
-    if (DateTime.isDateTime(value)) return value
+    // A marshalled `DateTime` instance (#133) — rebuilt, whatever type-id key
+    // the Effect version that wrote it used.
+    const revived = reviveMarshalledDateTime(value)
+    if (revived !== undefined) return fromDateTime(revived)
+    if (DateTime.isDateTime(value)) {
+      if (isGenuineDateTime(value)) return value
+      // Duck-types as a DateTime but carries no recoverable instant: refuse it
+      // rather than hand a plain object to the domain.
+      throw new Error("[effect-dynamodb] unrecoverable marshalled DateTime")
+    }
     if (value instanceof Date) {
       switch (encoding.domain) {
         case "DateTime.Utc":
@@ -494,15 +680,9 @@ export const buildDateTransform = (encoding: DynamoEncoding): Schema.Top => {
       switch (encoding.domain) {
         case "DateTime.Utc":
           return DateTime.makeUnsafe(value)
-        case "DateTime.Zoned": {
-          const match = value.match(/^(.+)\[(.+)\]$/)
-          if (match) {
-            const utc = DateTime.makeUnsafe(match[1]!)
-            return DateTime.makeZonedUnsafe(utc, { timeZone: match[2]! })
-          }
-          const utc = DateTime.makeUnsafe(value)
-          return DateTime.makeZonedUnsafe(utc, { timeZone: "UTC" })
-        }
+        case "DateTime.Zoned":
+          // Named and offset zones are both rebuilt as written (#133).
+          return parseZonedIso(value)
         case "Date":
           return new Date(value)
       }
@@ -524,7 +704,7 @@ export const buildDateTransform = (encoding: DynamoEncoding): Schema.Top => {
     Schema.decodeTo(targetSchema, {
       decode: SchemaGetter.transformEffect((value: unknown) => {
         try {
-          return Effect.succeed(liftToDomain(value))
+          return Effect.succeed(strict ? liftStrict(value) : liftToDomain(value))
         } catch {
           return Effect.fail(new SchemaIssue.InvalidType(Schema.Any.ast, value))
         }
@@ -634,14 +814,30 @@ const buildTolerantTransform = (schema: Schema.Top): Schema.Top => {
   const decodeWire = Schema.decodeUnknownOption(codec)
   const validateDomain = Schema.decodeUnknownOption(typeSide as unknown as Schema.Codec<any>)
   const encodeDomain = Schema.encodeUnknownOption(codec)
+  const bigintDomain = SchemaAST.isBigInt(SchemaAST.toType(schema.ast))
 
   return Schema.Any.pipe(
     Schema.decodeTo(typeSide, {
       decode: SchemaGetter.transformEffect((value: unknown) => {
         const fromWire = decodeWire(value)
         if (fromWire._tag === "Some") return Effect.succeed(fromWire.value)
-        const alreadyDomain = validateDomain(value)
+        // A marshalled `DateTime` (#133) is rebuilt before it is validated: a
+        // 4.0.0-era map would otherwise pass a `DateTime` check by duck typing
+        // and come back as a plain object.
+        const revived = reviveMarshalledDateTime(value)
+        const alreadyDomain = validateDomain(revived ?? value)
         if (alreadyDomain._tag === "Some") return Effect.succeed(alreadyDomain.value)
+        // A value stored in its DOMAIN form, as a transform nested in a container
+        // (or under `optional`) was before #133, comes back changed by the
+        // unmarshaller: a `bigint` is written as `N` and read back as a JS
+        // `number` (or a `bigint` only beyond the safe-integer range). Lift an
+        // integer back to the `bigint` it was. Every other primitive domain form
+        // (`number`, `string`, `boolean`, `Uint8Array`) reads back as itself and
+        // is already accepted above.
+        if (bigintDomain && typeof value === "number" && Number.isSafeInteger(value)) {
+          const lifted = validateDomain(BigInt(value))
+          if (lifted._tag === "Some") return Effect.succeed(lifted.value)
+        }
         return Effect.fail(new SchemaIssue.InvalidType(schema.ast, value))
       }),
       encode: SchemaGetter.transformEffect((value: unknown) => {
@@ -659,6 +855,165 @@ const buildTolerantTransform = (schema: Schema.Top): Schema.Top => {
   ) as unknown as Schema.Top
 }
 
+/** A plain `Schema.BigInt` (no transformation): stored as `N`, read back as a JS number. */
+const isSelfBigInt = (schema: Schema.Top): boolean =>
+  schema.ast.encoding === undefined && SchemaAST.isBigInt(schema.ast)
+
+/** A safe integer, or a bigint the unmarshaller returned for an out-of-range `N`. */
+const legacyBigInt = (value: unknown): bigint | undefined =>
+  typeof value === "bigint"
+    ? value
+    : typeof value === "number" && Number.isSafeInteger(value)
+      ? BigInt(value)
+      : undefined
+
+/**
+ * A plain `Schema.BigInt` that also reads the form DynamoDB hands back (#133).
+ * A `bigint` is marshalled as `N` and unmarshalled as a JS `number` (or as a
+ * `bigint` beyond the safe-integer range), which `Schema.BigInt` rejects — so a
+ * plain bigint field could be written but never read. Decode lifts a safe
+ * integer back to the `bigint` it was; encode is the schema's own (identity).
+ */
+const buildBigIntLift = (schema: Schema.Top): Schema.Top => {
+  const validate = Schema.decodeUnknownOption(schema as unknown as Schema.Codec<any>)
+  const encode = Schema.encodeUnknownOption(schema as unknown as Schema.Codec<any>)
+  return Schema.Any.pipe(
+    Schema.decodeTo(
+      schema as unknown as Schema.Codec<any>,
+      {
+        decode: SchemaGetter.transformEffect((value: unknown) => {
+          const lifted = legacyBigInt(value)
+          const valid = lifted === undefined ? validate(value) : validate(lifted)
+          return valid._tag === "Some"
+            ? Effect.succeed(valid.value)
+            : Effect.fail(new SchemaIssue.InvalidType(schema.ast, value))
+        }),
+        encode: SchemaGetter.transformEffect((value: unknown) => {
+          const wire = encode(value)
+          return wire._tag === "Some"
+            ? Effect.succeed(wire.value)
+            : Effect.fail(new SchemaIssue.InvalidType(schema.ast, value))
+        }),
+      } as any,
+    ),
+  ) as unknown as Schema.Top
+}
+
+/**
+ * An ENTITY transform field that also reads the domain-form values earlier
+ * releases left behind (#133) — but only the forms no other wire value can be
+ * mistaken for:
+ *
+ * - a `number` for a number-from-string transform (`NumberFromString`);
+ * - a safe-integer `number` (or unmarshalled `bigint`) for a bigint-from-string;
+ * - a marshalled `DateTime` map for a date transform (`DateTimeUtcFromString`).
+ *
+ * Path-based updates marshalled their value as given, so a `5` set on a
+ * `NumberFromString` was stored as `N` and every later read failed with
+ * "Expected string". A string is never accepted here other than through the
+ * transform's own decode, and the encode is the transform's own with no
+ * fallback, so what the transform writes is unchanged. Read schemas only.
+ */
+const buildLegacyReadTransform = (schema: Schema.Top): Schema.Top => {
+  const typeAst = SchemaAST.toType(schema.ast)
+  const typeSide = Schema.make<Schema.Top>(typeAst)
+  const codec = schema as unknown as Schema.Codec<any>
+  const decodeWire = Schema.decodeUnknownOption(codec)
+  const validateDomain = Schema.decodeUnknownOption(typeSide as unknown as Schema.Codec<any>)
+  const encodeWire = Schema.encodeUnknownOption(codec)
+  const isDate = isDateTransform(schema)
+  const numberDomain = SchemaAST.isNumber(typeAst)
+  const bigintDomain = SchemaAST.isBigInt(typeAst)
+  const legacy = (value: unknown): unknown => {
+    if (isDate) return reviveMarshalledDateTime(value)
+    if (numberDomain && typeof value === "number") return value
+    if (bigintDomain) return legacyBigInt(value)
+    return undefined
+  }
+  return Schema.Any.pipe(
+    Schema.decodeTo(typeSide, {
+      decode: SchemaGetter.transformEffect((value: unknown) => {
+        const fromWire = decodeWire(value)
+        if (fromWire._tag === "Some") return Effect.succeed(fromWire.value)
+        const domain = legacy(value)
+        if (domain !== undefined) {
+          const valid = validateDomain(domain)
+          if (valid._tag === "Some") return Effect.succeed(valid.value)
+        }
+        return Effect.fail(new SchemaIssue.InvalidType(schema.ast, value))
+      }),
+      encode: SchemaGetter.transformEffect((value: unknown) => {
+        const wire = encodeWire(value)
+        return wire._tag === "Some"
+          ? Effect.succeed(wire.value)
+          : Effect.fail(new SchemaIssue.InvalidType(schema.ast, value))
+      }),
+    } as any),
+  ) as unknown as Schema.Top
+}
+
+/** A primitive kind a value can be stored as, for telling union members apart. */
+type WireKind = "string" | "number"
+
+/**
+ * The primitive kinds a union member can be STORED as (#133). A self date is
+ * stored as its configured storage kind; a plain `bigint` as `N`; anything
+ * else as its encoded side's string / number forms. Objects, arrays, booleans
+ * and null never collide with a date's primitive and contribute nothing.
+ */
+const memberWireKinds = (
+  member: Schema.Top,
+  options?: {
+    /**
+     * Also count the member's DOMAIN-side kinds. Aggregates (`tolerantTransforms`)
+     * re-decode domain values on every `update`, so a `NumberFromString` member's
+     * domain `5` competes with an epoch date for the same decode, just as a
+     * `Number` member's stored `5` does on a read.
+     */
+    readonly domainSide?: boolean | undefined
+  },
+): ReadonlySet<WireKind> => {
+  const kinds = new Set<WireKind>()
+  const inner = optionalField(member)?.inner ?? member
+  if (isSelfDateSchema(inner)) {
+    const encoding = getEncoding(inner) ?? inferDefaultEncoding(inner)
+    kinds.add(encoding?.storage === "string" || encoding === undefined ? "string" : "number")
+    return kinds
+  }
+  const visit = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST>) => {
+    if (seen.has(ast)) return
+    seen.add(ast)
+    if (SchemaAST.isDeclaration(ast)) {
+      // A self date nested in this member — `NullOr(DateTimeUtc)` inside an
+      // outer union — is stored as its storage kind too.
+      const nested = Schema.make<Schema.Top>(ast)
+      if (isSelfDateSchema(nested)) {
+        const encoding = getEncoding(nested) ?? inferDefaultEncoding(nested)
+        kinds.add(encoding === undefined || encoding.storage === "string" ? "string" : "number")
+      }
+    } else if (SchemaAST.isAny(ast) || SchemaAST.isUnknown(ast)) {
+      kinds.add("string")
+      kinds.add("number")
+    } else if (SchemaAST.isString(ast) || SchemaAST.isTemplateLiteral(ast)) {
+      kinds.add("string")
+    } else if (SchemaAST.isNumber(ast) || SchemaAST.isBigInt(ast)) {
+      kinds.add("number")
+    } else if (SchemaAST.isLiteral(ast)) {
+      if (typeof ast.literal === "string") kinds.add("string")
+      if (typeof ast.literal === "number" || typeof ast.literal === "bigint") kinds.add("number")
+    } else if (SchemaAST.isEnum(ast)) {
+      for (const [, value] of ast.enums) kinds.add(typeof value === "number" ? "number" : "string")
+    } else if (SchemaAST.isUnion(ast)) {
+      for (const type of ast.types) visit(type, seen)
+    } else if (SchemaAST.isSuspend(ast)) {
+      visit(ast.thunk(), seen)
+    }
+  }
+  visit(SchemaAST.toEncoded(inner.ast), new Set())
+  if (options?.domainSide) visit(SchemaAST.toType(inner.ast), new Set())
+  return kinds
+}
+
 /**
  * True when the schema is a Schema.Class (a constructable function carrying
  * fields whose AST is a `Declaration`). The AST check matters: since Effect
@@ -668,6 +1023,13 @@ const isClassSchema = (schema: Schema.Top): boolean =>
   typeof schema === "function" &&
   schemaFieldsOf(schema) !== undefined &&
   (schema.ast as { readonly _tag?: string })._tag === "Declaration"
+
+/** The Struct AST a class decodes from — the last link of its encoding chain. */
+const classStructAst = (schema: Schema.Top): SchemaAST.AST | undefined => {
+  const encoding = schema.ast.encoding
+  const last = encoding === undefined ? undefined : encoding[encoding.length - 1]
+  return last !== undefined && SchemaAST.isObjects(last.to) ? last.to : undefined
+}
 
 /** True when the schema is `Schema.Array(...)` (AST tag `Arrays`). */
 const isArraySchema = (schema: Schema.Top): boolean =>
@@ -690,7 +1052,7 @@ const arrayElementOf = (schema: Schema.Top): Schema.Top | undefined => {
   return elementAst ? Schema.make<Schema.Top>(elementAst) : undefined
 }
 
-interface OptionalField {
+export interface OptionalField {
   /** The REAL inner schema X (class/struct/array/leaf) — `.fields` / `.value` /
    *  constructor intact, so the normal recursion can substitute and preserve it. */
   readonly inner: Schema.Top
@@ -705,8 +1067,10 @@ interface OptionalField {
  * accessors (which return real schemas with `.fields` / `.value` / constructor
  * intact), NOT AST reconstruction (which loses those). Returns `undefined` for
  * non-optional fields.
+ *
+ * @internal Also used by the aggregate runtime to see through a field's optionality.
  */
-const optionalField = (field: Schema.Top): OptionalField | undefined => {
+export const optionalField = (field: Schema.Top): OptionalField | undefined => {
   const ast = field.ast as {
     readonly _tag?: string
     readonly context?: { readonly isOptional?: boolean }
@@ -762,7 +1126,388 @@ export interface DeepSubstitutionOptions {
    * its wire format and must not be overridden there.
    */
   readonly tolerantTransforms?: boolean | undefined
+  /**
+   * Set internally while substituting inside a `Union` member: date leaves get
+   * a `strictWireKind` transform (see {@link buildDateTransform}). Propagated
+   * through the rest of the recursion.
+   */
+  readonly strictWireKind?: boolean | undefined
+  /**
+   * Entity READ schemas only (#133): also accept the domain-form values earlier
+   * releases stored on transform fields (see `buildLegacyReadTransform`) and
+   * lift an unmarshalled number back to a plain `Schema.BigInt`. Never inside a
+   * union, where a lenient member could claim another member's value.
+   * Propagated through the recursion.
+   */
+  readonly legacyReads?: boolean | undefined
+  /**
+   * Set internally on a union's members: the primitive kinds the OTHER members
+   * are stored as — and, under `tolerantTransforms`, their domain kinds too,
+   * since an aggregate re-decodes domain values on update. A self-date member
+   * whose storage collides with one of them decodes only its canonical wire
+   * form; an epoch storage that collides with a number kind is rejected at
+   * `make()` with EDD-9058, since any integer is a canonical epoch (#133).
+   * Applies to the immediate member, and to members of a union nested in it.
+   */
+  readonly collidingKinds?: ReadonlySet<WireKind> | undefined
+  /**
+   * A `DynamoModel.configure` storage override for a top-level UNION field,
+   * applied to the union's (single) self-date member (#133). Passes through an
+   * optional wrapper to the union; applies to that union's members only.
+   */
+  readonly unionDateOverride?: DynamoEncoding | undefined
+  /** Set internally from `unionDateOverride` on the union's members. */
+  readonly dateEncodingOverride?: DynamoEncoding | undefined
+  /** The field path being substituted, for error messages. */
+  readonly path?: ReadonlyArray<string> | undefined
+  /**
+   * WRITE schemas only (#133): keep the `.check()` refinements of the Arrays,
+   * Structs and class Structs the substitution rebuilds. Rebuilding them with a
+   * plain constructor dropped those checks, so a write breaking them was
+   * accepted. Read schemas leave this off: a row written while the check was
+   * not enforced must stay readable. Propagated through the recursion.
+   */
+  readonly enforceChecks?: boolean | undefined
 }
+
+/** The options a nested schema inherits: everything but the per-position ones. */
+const descend = (opts: DeepSubstitutionOptions | undefined): DeepSubstitutionOptions | undefined =>
+  opts?.tolerantTransforms ||
+  opts?.resolveRef ||
+  opts?.strictWireKind ||
+  opts?.legacyReads ||
+  opts?.path ||
+  opts?.enforceChecks
+    ? {
+        ...(opts?.tolerantTransforms ? { tolerantTransforms: true } : {}),
+        ...(opts?.resolveRef ? { resolveRef: opts.resolveRef } : {}),
+        ...(opts?.strictWireKind ? { strictWireKind: true } : {}),
+        ...(opts?.legacyReads ? { legacyReads: true } : {}),
+        ...(opts?.path ? { path: opts.path } : {}),
+        ...(opts?.enforceChecks ? { enforceChecks: true } : {}),
+      }
+    : undefined
+
+/** Options for a struct / class field: the inherited ones, with the field on the path. */
+const atField = (
+  deeper: DeepSubstitutionOptions | undefined,
+  opts: DeepSubstitutionOptions | undefined,
+  name: string,
+): DeepSubstitutionOptions => ({ ...deeper, path: [...(opts?.path ?? []), name] })
+
+/**
+ * A container the substitution walks only under `tolerantTransforms` (#133):
+ * its child schemas, and how to rebuild it around substituted children.
+ */
+interface WalkedContainer {
+  readonly children: ReadonlyArray<Schema.Top>
+  readonly rebuild: (children: ReadonlyArray<Schema.Top>) => Schema.Top
+  /** Children are alternatives (a `Union`), decoded member by member. */
+  readonly isUnion: boolean
+}
+
+/**
+ * The containers besides Struct / Class / Array that a value can nest a
+ * transformed leaf in: `Union` (incl. `NullOr` and a non-field `UndefinedOr`),
+ * `Record`, `Tuple`, `TupleWithRest` and `StructWithRest`. Each is rebuilt
+ * through its own runtime accessors so its kind, union options and checks are
+ * kept. `containsWireTransform` walks the same shapes.
+ *
+ * Walked in every mode. Without `tolerantTransforms` (entity derivation) the
+ * walk substitutes only self-date and `Redacted` leaves, so an entity's
+ * `NullOr(Schema.DateTimeUtc)` stores its wire form instead of a marshalled
+ * `DateTime` (#133), while a Pattern B transform inside keeps owning its wire.
+ */
+const walkedContainer = (schema: Schema.Top): WalkedContainer | undefined => {
+  const shape = containerShape(schema)
+  if (shape === undefined) return undefined
+  return { ...shape, rebuild: (children) => withMetadataOf(schema, shape.rebuild(children)) }
+}
+
+/**
+ * Give a rebuilt container the original's node-level metadata — its
+ * annotations, `.check()` refinements and context. Rebuilding through a
+ * constructor (`Schema.Record(k, v)`, `Schema.TupleWithRest(…)`) produces a
+ * fresh node without them, so a `.check(Schema.isMaxProperties(1))` on the
+ * original was silently dropped and an invalid value accepted (#133).
+ */
+const withMetadataOf = (original: Schema.Top, rebuilt: Schema.Top): Schema.Top =>
+  withAstMetadataOf(original.ast, rebuilt)
+
+/** `withMetadataOf`, taking the metadata from an AST node. */
+const withAstMetadataOf = (source: SchemaAST.AST, rebuilt: Schema.Top): Schema.Top => {
+  const from = source as SchemaAST.AST & { readonly encodingChecks?: unknown }
+  const to = rebuilt.ast as SchemaAST.AST & { readonly encodingChecks?: unknown }
+  if (
+    to.annotations === from.annotations &&
+    to.checks === from.checks &&
+    to.context === from.context &&
+    to.encodingChecks === from.encodingChecks
+  ) {
+    return rebuilt
+  }
+  // AST nodes are immutable value objects: a shallow copy with the metadata
+  // fields replaced is the same node shape the constructors produce.
+  const ast = Object.assign(Object.create(Object.getPrototypeOf(to)), to, {
+    annotations: from.annotations,
+    checks: from.checks,
+    context: from.context,
+    encodingChecks: from.encodingChecks,
+  }) as SchemaAST.AST
+  return Schema.make<Schema.Top>(ast)
+}
+
+const containerShape = (schema: Schema.Top): WalkedContainer | undefined => {
+  const s = schema as unknown as globalThis.Record<string, unknown>
+  const ast = schema.ast
+  // A container piped through its own transformation (`Record(…).pipe(decodeTo(…))`)
+  // has an encoding chain tied to its ORIGINAL children; rebuilding it would
+  // detach that chain, so it is left exactly as declared.
+  if (ast.encoding !== undefined) return undefined
+  const schemas = (value: unknown): ReadonlyArray<Schema.Top> | undefined =>
+    Array.isArray(value) && value.every(isSchemaLike)
+      ? (value as ReadonlyArray<Schema.Top>)
+      : undefined
+  if (SchemaAST.isUnion(ast)) {
+    const members = schemas(s.members)
+    if (members === undefined || typeof s.mapMembers !== "function") return undefined
+    const union = schema as unknown as {
+      mapMembers: (f: (m: unknown) => unknown, o: { unsafePreserveChecks: boolean }) => Schema.Top
+    }
+    return {
+      children: members,
+      rebuild: (subs) => union.mapMembers(() => subs, { unsafePreserveChecks: true }),
+      isUnion: true,
+    }
+  }
+  if (SchemaAST.isArrays(ast)) {
+    const elements = schemas(s.elements)
+    if (elements !== undefined && typeof s.mapElements === "function") {
+      const tuple = schema as unknown as {
+        mapElements: (
+          f: (e: unknown) => unknown,
+          o: { unsafePreserveChecks: boolean },
+        ) => Schema.Top
+      }
+      return {
+        children: elements,
+        rebuild: (subs) => tuple.mapElements(() => subs, { unsafePreserveChecks: true }),
+        isUnion: false,
+      }
+    }
+    const rest = schemas(s.rest)
+    if (isSchemaLike(s.schema) && rest !== undefined) {
+      return {
+        children: [s.schema, ...rest],
+        rebuild: ([head, ...tail]) =>
+          Schema.TupleWithRest(head as any, tail as any) as unknown as Schema.Top,
+        isUnion: false,
+      }
+    }
+    return undefined
+  }
+  if (SchemaAST.isObjects(ast)) {
+    if (isSchemaLike(s.key) && isSchemaLike(s.value)) {
+      const key = s.key
+      return {
+        children: [s.value],
+        rebuild: ([value]) => Schema.Record(key as any, value as any) as unknown as Schema.Top,
+        isUnion: false,
+      }
+    }
+    const records = schemas(s.records)
+    if (isSchemaLike(s.schema) && records !== undefined) {
+      return {
+        children: [s.schema, ...records],
+        rebuild: ([head, ...tail]) =>
+          Schema.StructWithRest(head as any, tail as any) as unknown as Schema.Top,
+        isUnion: false,
+      }
+    }
+  }
+  return undefined
+}
+
+/** Options for a tolerant container's children: a Union's members decode strictly by kind. */
+const childOptions = (
+  container: WalkedContainer,
+  deeper: DeepSubstitutionOptions | undefined,
+  index: number,
+  opts: DeepSubstitutionOptions | undefined,
+): DeepSubstitutionOptions | undefined => {
+  if (!container.isUnion) return deeper
+  // What the other members are stored as — plus, for a union nested inside
+  // another (`Union([NullOr(DateTimeUtc), String])`), what the OUTER union's
+  // other members are stored as: they compete for the same stored value.
+  const collidingKinds = new Set<WireKind>(opts?.collidingKinds ?? [])
+  container.children.forEach((member, i) => {
+    if (i !== index) {
+      const kinds = memberWireKinds(member, { domainSide: opts?.tolerantTransforms === true })
+      for (const kind of kinds) collidingKinds.add(kind)
+    }
+  })
+  return {
+    ...deeper,
+    strictWireKind: true,
+    collidingKinds,
+    ...(opts?.unionDateOverride ? { dateEncodingOverride: opts.unionDateOverride } : {}),
+  }
+}
+
+/** The options an optional wrapper hands its inner schema: it is transparent. */
+/**
+ * A field whose LAST encoding step makes the encoded key optional while the
+ * type side stays required — `Schema.withDecodingDefault(…)` /
+ * `withDecodingDefaultKey(…)`, or any `optional(…).pipe(decodeTo(…))`. Its
+ * inner schema (the field without that step) is what substitution works on;
+ * `rewrap` re-applies the same step on top of the substitute, so the default
+ * survives (#133). Without it a self-date / transform leaf was replaced
+ * wholesale and the read schema lost the default — a stored item without the
+ * key failed to decode.
+ */
+const decodingDefaultField = (
+  field: Schema.Top,
+): { readonly inner: Schema.Top; readonly rewrap: (s: Schema.Top) => Schema.Top } | undefined => {
+  const ast = field.ast
+  const encoding = ast.encoding
+  if (encoding === undefined || encoding.length === 0) return undefined
+  if ((ast.context as { readonly isOptional?: boolean } | undefined)?.isOptional === true) {
+    return undefined
+  }
+  const last = encoding[encoding.length - 1]!
+  const lastTo = last.to as SchemaAST.AST & {
+    readonly context?: { readonly isOptional?: boolean }
+  }
+  if (lastTo.context?.isOptional !== true) return undefined
+  const transformation = last.transformation as unknown as {
+    readonly _tag?: string
+    readonly decode: unknown
+    readonly encode: unknown
+  }
+  if (transformation._tag !== "Transformation") return undefined
+  // The same node without its last encoding step (what Effect's internal
+  // `replaceEncoding` does: a shallow copy carrying the shorter chain).
+  const innerAst = Object.assign(Object.create(Object.getPrototypeOf(ast)), ast, {
+    encoding: encoding.length === 1 ? undefined : encoding.slice(0, -1),
+  }) as SchemaAST.AST
+  const inner = Schema.make<Schema.Top>(innerAst)
+  const withUndefined =
+    SchemaAST.isUnion(lastTo) && lastTo.types.some((t) => SchemaAST.isUndefined(t))
+  return {
+    inner,
+    rewrap: (substitute) => {
+      const encodedSide = Schema.toEncoded(substitute as Schema.Codec<any>)
+      const optionalEncoded = withUndefined
+        ? Schema.optional(encodedSide)
+        : Schema.optionalKey(encodedSide)
+      return optionalEncoded.pipe(
+        Schema.decodeTo(substitute as Schema.Codec<any>, transformation as any),
+      ) as unknown as Schema.Top
+    },
+  }
+}
+
+const throughOptional = (
+  opts: DeepSubstitutionOptions | undefined,
+): DeepSubstitutionOptions | undefined => {
+  const deeper = descend(opts)
+  return opts?.unionDateOverride || opts?.collidingKinds || opts?.dateEncodingOverride
+    ? {
+        ...deeper,
+        ...(opts.unionDateOverride ? { unionDateOverride: opts.unionDateOverride } : {}),
+        ...(opts.collidingKinds ? { collidingKinds: opts.collidingKinds } : {}),
+        ...(opts.dateEncodingOverride ? { dateEncodingOverride: opts.dateEncodingOverride } : {}),
+      }
+    : deeper
+}
+
+/**
+ * The substitute for a self-date leaf: its own (or the configured) storage,
+ * adjusted for a union whose other members collide with it (#133).
+ */
+const selfDatePlan = (
+  schema: Schema.Top,
+  opts: DeepSubstitutionOptions | undefined,
+): { readonly encoding: DynamoEncoding; readonly canonicalOnly: boolean } | undefined => {
+  const own = getEncoding(schema) ?? inferDefaultEncoding(schema)
+  if (!own) return undefined
+  const encoding: DynamoEncoding = opts?.dateEncodingOverride
+    ? { storage: opts.dateEncodingOverride.storage, domain: own.domain }
+    : own
+  const colliding = opts?.collidingKinds
+  let canonicalOnly = false
+  if (colliding !== undefined) {
+    // An epoch number is indistinguishable from a number member's value — any
+    // integer is a canonical epoch — so no stored number could be read back
+    // reliably. Refused at make() time (EDD-9058) rather than guessed.
+    if (encoding.storage !== "string" && colliding.has("number")) {
+      const field = opts?.path?.length ? opts.path.join(".") : "(unnamed)"
+      const reason = opts?.tolerantTransforms
+        ? `next to a member that is stored as a number or decodes to one (aggregates ` +
+          `re-decode domain values on update, so a NumberFromString / BigIntFromString ` +
+          `member collides too). A number could belong to either member`
+        : `next to a member that is also stored as a number. A stored number could ` +
+          `belong to either member`
+      throw new Error(
+        `[EDD-9058] Field "${field}" is a union whose date member is stored as an epoch ` +
+          `number (${encoding.storage}), ${reason}, so it cannot be read back reliably. ` +
+          `Store the date as a string (DynamoModel.DateString — the default for a self ` +
+          `date), or remove the numeric member from the union.`,
+      )
+    }
+    canonicalOnly = colliding.has(encoding.storage === "string" ? "string" : "number")
+  }
+  return { encoding, canonicalOnly }
+}
+
+const selfDateSubstitute = (
+  schema: Schema.Top,
+  opts: DeepSubstitutionOptions | undefined,
+): Schema.Top => {
+  const plan = selfDatePlan(schema, opts)
+  if (plan === undefined) return schema
+  return buildDateTransform(plan.encoding, {
+    strictWireKind: opts?.strictWireKind,
+    canonicalOnly: plan.canonicalOnly,
+  })
+}
+
+/**
+ * Whether a union member is a self date that claims only its canonical form
+ * (see `selfDatePlan`). Such a member is decoded FIRST: its canonical spelling
+ * is the one value it and a colliding member could both take, and that value
+ * is what the library writes for a date — so it is read as the date whatever
+ * the declared member order. Encoding is unaffected: a date and a string /
+ * number are told apart by their Type side, which no reordering changes.
+ */
+const isCanonicalDateMember = (
+  member: Schema.Top,
+  opts: DeepSubstitutionOptions | undefined,
+): boolean => {
+  const inner = optionalField(member)?.inner ?? member
+  if (isSelfDateSchema(inner)) return selfDatePlan(inner, opts)?.canonicalOnly === true
+  // A nested union holding such a member (`NullOr(DateTimeUtc)` next to a
+  // `String`) is decoded first for the same reason.
+  const container = walkedContainer(inner)
+  if (container === undefined || !container.isUnion) return false
+  return container.children.some((child, index) =>
+    isCanonicalDateMember(child, childOptions(container, descend(opts), index, opts)),
+  )
+}
+
+/** Whether a leaf gets a read-leniency substitute (see `legacyReads`). */
+const needsLegacyRead = (schema: Schema.Top, opts: DeepSubstitutionOptions | undefined) =>
+  opts?.legacyReads === true &&
+  opts.strictWireKind !== true &&
+  schemaFieldsOf(schema) === undefined &&
+  !isArraySchema(schema) &&
+  (isDateTransform(schema) || numericTypeWithStringEncoding(schema))
+
+/** Whether a plain `Schema.BigInt` leaf gets the read lift (aggregate decode, entity reads). */
+const needsBigIntLift = (schema: Schema.Top, opts: DeepSubstitutionOptions | undefined) =>
+  (opts?.tolerantTransforms === true || opts?.legacyReads === true) &&
+  opts.strictWireKind !== true &&
+  isSelfBigInt(schema)
 
 /**
  * Recursively determine whether a schema contains — at any depth reachable
@@ -771,10 +1516,9 @@ export interface DeepSubstitutionOptions {
  * `RedactedFromValue`). Returns false for schemas that don't, so
  * {@link substituteSchemaDeep} can return them unchanged (zero structural churn).
  *
- * Optional / union members are intentionally NOT traversed — reconstructing a
- * `Schema.optional(Class)` while preserving the nested class is not reliably
- * supported, so such fields are left exactly as the caller declared them (same
- * as the pre-existing behavior).
+ * Optional wrappers are unwrapped to their real inner schema, and the walk
+ * enters `Union` members, `Record` values and `Tuple` elements too (see
+ * `walkedContainer`).
  */
 const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOptions): boolean => {
   if (schema == null || (schema as { readonly ast?: unknown }).ast == null) return false
@@ -786,13 +1530,7 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   // so the walker cannot see through it and the target's own transformed fields
   // keep their strict schemas. Only callers that pass `resolveRef` are affected
   // — the entity derivation passes no options at all (#116).
-  const deeper: DeepSubstitutionOptions | undefined =
-    opts?.tolerantTransforms || opts?.resolveRef
-      ? {
-          ...(opts?.tolerantTransforms ? { tolerantTransforms: true } : {}),
-          ...(opts?.resolveRef ? { resolveRef: opts.resolveRef } : {}),
-        }
-      : undefined
+  const deeper = descend(opts)
   // Optional wrapper FIRST — unwrap to the REAL inner before the leaf / array /
   // struct checks. `optionalKey(X)` is a bare AST (Declaration/Arrays) with an
   // `isOptional` context, so the leaf detectors (which resolve through to the
@@ -800,13 +1538,22 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   // required date and drop the optionality; and an `optionalKey(Array)` wrapper
   // has the `Arrays` AST but no runtime `.value`.
   const opt = optionalField(schema)
-  if (opt !== undefined) return needsDeepSubstitution(opt.inner, deeper)
+  if (opt !== undefined) return needsDeepSubstitution(opt.inner, throughOptional(opts))
+  const defaulted = decodingDefaultField(schema)
+  if (defaulted !== undefined) return needsDeepSubstitution(defaulted.inner, opts)
   if (isSelfDateSchema(schema)) return true
   if (opts?.tolerantTransforms && isDateTransform(schema)) return true
   if (tryGetRedactedInner(schema) !== undefined) return true
   // Any other leaf transform, tolerant mode only — same reason as the date
   // case: after a mutation the field may hold either form (#116).
   if (opts?.tolerantTransforms && isLeafEncodingTransform(schema)) return true
+  if (needsLegacyRead(schema, opts) || needsBigIntLift(schema, opts)) return true
+  const container = walkedContainer(schema)
+  if (container !== undefined) {
+    return container.children.some((child, index) =>
+      needsDeepSubstitution(child, childOptions(container, deeper, index, opts)),
+    )
+  }
   if (isArraySchema(schema)) {
     const element = arrayElementOf(schema)
     return element !== undefined && needsDeepSubstitution(element, deeper)
@@ -845,21 +1592,16 @@ export const substituteSchemaDeep = (
 ): Schema.Top => {
   if (!needsDeepSubstitution(schema, opts)) return schema
 
-  // `tolerantTransforms` AND `resolveRef` propagate through the recursion;
-  // `skipTopLevel` names top-level fields only, so it is dropped below.
+  // `tolerantTransforms`, `resolveRef`, `strictWireKind` and `legacyReads`
+  // propagate through the recursion (`descend`); `skipTopLevel` and the
+  // per-position union options do not.
   //
   // `resolveRef` has to descend: a `DynamoModel.ref` field nested INSIDE an edge
   // model is annotated, and `Schema.annotate` drops a `Schema.Class`'s `.fields`,
   // so the walker cannot see through it and the target's own transformed fields
   // keep their strict schemas. Only callers that pass `resolveRef` are affected
   // — the entity derivation passes no options at all (#116).
-  const deeper: DeepSubstitutionOptions | undefined =
-    opts?.tolerantTransforms || opts?.resolveRef
-      ? {
-          ...(opts?.tolerantTransforms ? { tolerantTransforms: true } : {}),
-          ...(opts?.resolveRef ? { resolveRef: opts.resolveRef } : {}),
-        }
-      : undefined
+  const deeper = descend(opts)
 
   // Optional wrapper FIRST — unwrap to the REAL inner, substitute it, then
   // re-apply the same optionality. Handled BEFORE the leaf / array / struct
@@ -868,17 +1610,25 @@ export const substituteSchemaDeep = (
   // the optional key), and an optional array's `.value` lives only on the inner.
   const opt = optionalField(schema)
   if (opt !== undefined) {
-    return opt.rewrap(substituteSchemaDeep(opt.inner, deeper))
+    return opt.rewrap(substituteSchemaDeep(opt.inner, throughOptional(opts)))
+  }
+  // A decoding default (or any optional-encoded step) on top: substitute the
+  // field beneath it and keep the step, so a missing key still defaults (#133).
+  const defaulted = decodingDefaultField(schema)
+  if (defaulted !== undefined) {
+    return defaulted.rewrap(substituteSchemaDeep(defaulted.inner, opts))
   }
 
   // Leaf: self-date schema → tolerant bidirectional date transform.
-  if (isSelfDateSchema(schema)) {
-    const encoding = getEncoding(schema) ?? inferDefaultEncoding(schema)
-    return encoding ? buildDateTransform(encoding) : schema
-  }
+  if (isSelfDateSchema(schema)) return selfDateSubstitute(schema, opts)
   // Leaf: Pattern B transform date schema (only under `tolerantTransforms`) →
   // tolerant date transform whose decode also accepts the already-domain value.
+  // Inside a union it keeps the transform's OWN decode instead: the union picks
+  // a member by what each one accepts, and the generic date transform accepts
+  // more (any epoch number, any parseable string) than the user's transform —
+  // enough to claim a value that belongs to a later member (#133).
   if (opts?.tolerantTransforms && isDateTransform(schema)) {
+    if (opts.strictWireKind) return buildTolerantTransform(schema)
     const encoding = getEncoding(schema) ?? inferDefaultEncoding(schema)
     if (encoding) return buildDateTransform(encoding)
   }
@@ -894,14 +1644,39 @@ export const substituteSchemaDeep = (
   if (opts?.tolerantTransforms && isLeafEncodingTransform(schema)) {
     return buildTolerantTransform(schema)
   }
+  // Leaf: read leniency for legacy domain-form values (entity read schemas) and
+  // the plain-bigint lift (#133).
+  if (needsLegacyRead(schema, opts)) return buildLegacyReadTransform(schema)
+  if (needsBigIntLift(schema, opts)) return buildBigIntLift(schema)
+
+  // Union / Record / Tuple / *WithRest: substitute every child and rebuild the
+  // same container kind, metadata included (#133). Without `tolerantTransforms`
+  // (entity derivation) only self-date / Redacted leaves inside are
+  // substituted, exactly as for a Struct or an Array. A union's members each
+  // learn which primitive kinds the others are stored as (`childOptions`).
+  const container = walkedContainer(schema)
+  if (container !== undefined) {
+    const children = container.children.map((child, index) => {
+      const childOpts = childOptions(container, deeper, index, opts)
+      return {
+        substituted: substituteSchemaDeep(child, childOpts),
+        first: container.isUnion && isCanonicalDateMember(child, childOpts),
+      }
+    })
+    return container.rebuild([
+      ...children.filter((c) => c.first).map((c) => c.substituted),
+      ...children.filter((c) => !c.first).map((c) => c.substituted),
+    ])
+  }
 
   // Array: substitute the element schema.
   if (isArraySchema(schema)) {
     const element = arrayElementOf(schema)
     if (element === undefined) return schema
-    return Schema.Array(
+    const rebuilt = Schema.Array(
       substituteSchemaDeep(element, deeper) as Schema.Codec<any>,
     ) as unknown as Schema.Top
+    return opts?.enforceChecks ? withMetadataOf(schema, rebuilt) : rebuilt
   }
 
   // Struct / Class: substitute each field, recursing into nested structures.
@@ -920,14 +1695,22 @@ export const substituteSchemaDeep = (
       const refTarget = opts?.resolveRef?.(name, field)
       if (refTarget !== undefined) {
         const fieldOpt = optionalField(field)
-        const sub = substituteSchemaDeep(refTarget, deeper)
+        const sub = substituteSchemaDeep(refTarget, atField(deeper, opts, name))
         subFields[name] = fieldOpt ? fieldOpt.rewrap(sub) : sub
       } else {
-        subFields[name] = substituteSchemaDeep(field, deeper)
+        subFields[name] = substituteSchemaDeep(field, atField(deeper, opts, name))
       }
     }
-    const subStruct = Schema.Struct(subFields as Schema.Struct.Fields)
-    if (!isClassSchema(schema)) return subStruct as unknown as Schema.Top
+    const plainStruct = Schema.Struct(subFields as Schema.Struct.Fields) as unknown as Schema.Top
+    if (!isClassSchema(schema)) {
+      return opts?.enforceChecks ? withMetadataOf(schema, plainStruct) : plainStruct
+    }
+    // A class built over a checked Struct (`Schema.Class("C")(Struct(…).check(f))`)
+    // keeps that check on the Struct its encoding leads to.
+    const classStruct = classStructAst(schema)
+    const subStruct = (opts?.enforceChecks && classStruct !== undefined
+      ? withAstMetadataOf(classStruct, plainStruct)
+      : plainStruct) as unknown as Schema.Struct<Schema.Struct.Fields>
     // Preserve the class instance: decode the substituted struct to the original
     // class via prototype attach (no constructor re-validation, no field re-decode).
     const ctor = schema as unknown as new (input: unknown) => unknown
@@ -975,8 +1758,18 @@ export const substituteSchemaDeep = (
 export const substituteSchemas = (
   modelFields: SchemaFields,
   fieldEncodings: globalThis.Record<string, DynamoEncoding>,
+  options?: {
+    /** Build READ schemas: see `DeepSubstitutionOptions.legacyReads`. */
+    readonly legacyReads?: boolean | undefined
+    /** Build WRITE schemas: see `DeepSubstitutionOptions.enforceChecks`. */
+    readonly enforceChecks?: boolean | undefined
+  },
 ): SchemaFields => {
   const out: SchemaFields = {}
+  const deep: DeepSubstitutionOptions = {
+    ...(options?.legacyReads ? { legacyReads: true } : {}),
+    ...(options?.enforceChecks ? { enforceChecks: true } : {}),
+  }
   for (const [name, schema] of Object.entries(modelFields)) {
     // 1. Self-date substitution. Pattern A: user declared `Schema.DateTimeUtc`
     //    and chose a wire format via annotation. We substitute with the
@@ -986,6 +1779,15 @@ export const substituteSchemas = (
       const enc = fieldEncodings[name]
       if (enc) {
         out[name] = buildDateTransform(enc)
+        continue
+      }
+    }
+    // …also beneath a decoding default, which is kept on top (#133).
+    const defaulted = decodingDefaultField(schema)
+    if (defaulted !== undefined && isSelfDateSchema(defaulted.inner)) {
+      const enc = fieldEncodings[name]
+      if (enc) {
+        out[name] = defaulted.rewrap(buildDateTransform(enc))
         continue
       }
     }
@@ -1004,9 +1806,49 @@ export const substituteSchemas = (
     //    `DynamoModel.ref` target) may itself carry a self-date or Redacted leaf
     //    — `substituteSchemaDeep` substitutes those while preserving class
     //    identity, and returns the schema unchanged when nothing nested needs it.
-    out[name] = substituteSchemaDeep(schema)
+    //    A configured storage override on a UNION field (`NullOr(DateTimeUtc)`)
+    //    is applied to the union's self-date member (#133).
+    const unionOverride = unionDateOverride(name, schema, fieldEncodings[name])
+    out[name] = substituteSchemaDeep(schema, {
+      ...deep,
+      path: [name],
+      ...(unionOverride === undefined ? {} : { unionDateOverride: unionOverride }),
+    })
   }
   return out
+}
+
+/**
+ * The storage a `DynamoModel.configure(..., { field: { storedAs } })` override
+ * gives a top-level UNION field's date member, or `undefined` when the field is
+ * not a union with a self-date member (#133).
+ *
+ * The override names one storage for the field; a union holding several self
+ * dates gives it no single member to apply to, so that is refused at
+ * `Entity.make()` rather than guessed (EDD-9057).
+ */
+const unionDateOverride = (
+  name: string,
+  schema: Schema.Top,
+  encoding: DynamoEncoding | undefined,
+): DynamoEncoding | undefined => {
+  if (encoding === undefined) return undefined
+  const inner = optionalField(schema)?.inner ?? schema
+  if (!SchemaAST.isUnion(inner.ast)) return undefined
+  const members = (inner as unknown as { readonly members?: ReadonlyArray<Schema.Top> }).members
+  const dateMembers = (members ?? []).filter((member) =>
+    isSelfDateSchema(optionalField(member)?.inner ?? member),
+  )
+  if (dateMembers.length === 0) return undefined
+  if (dateMembers.length > 1) {
+    throw new Error(
+      `[EDD-9057] Field "${name}" is a union with ${dateMembers.length} date members, and its ` +
+        `configured storage override (DynamoModel.configure … storedAs) cannot say which one it ` +
+        `applies to. Annotate the intended member directly with ` +
+        `\`.pipe(DynamoModel.storedAs(...))\` and drop the field-level override.`,
+    )
+  }
+  return encoding
 }
 
 /**
@@ -1087,6 +1929,12 @@ const transformWireKind = (schema: Schema.Top): "string" | "number" | undefined 
 export interface DerivedSchemas {
   /** Pure model fields schema (substituted — used for both validation and decode) */
   readonly modelSchema: Schema.Codec<any>
+  /**
+   * The model fields as WRITES encode them: container checks enforced, no
+   * read leniency (#133). Path-based update values are encoded and validated
+   * through it.
+   */
+  readonly writeModelSchema: Schema.Codec<any>
   /** Model + system fields schema */
   readonly recordSchema: Schema.Codec<any>
   /**
@@ -1142,7 +1990,14 @@ export const buildDerivedSchemas = (
   // fields are replaced with a custom bidirectional transform so encoding
   // round-trips. All other transform schemas are passed through — the user's
   // transform IS the wire format and we never override it.
-  const fields = substituteSchemas(modelFields, fieldEncodings)
+  // WRITE schemas (input / create / update / key) enforce the container checks
+  // the substitution rebuilds; the READ schemas below do not (#133).
+  const fields = substituteSchemas(modelFields, fieldEncodings, { enforceChecks: true })
+  // READ schemas (model / record / item / deleted / history decode) also take
+  // the domain-form values earlier releases left on transform fields (#133).
+  // Their encode is the strict one, and keys are composed from `inputSchema`,
+  // so neither writes nor keys see a difference.
+  const readFields = substituteSchemas(modelFields, fieldEncodings, { legacyReads: true })
 
   // Ref fields carry the `DynamoModel.ref` annotation (an opaque Declaration that
   // hides the target's fields), so `substituteSchemaDeep` above can't see into
@@ -1156,11 +2011,12 @@ export const buildDerivedSchemas = (
     const resolved = isConfiguredModel(targetModel)
       ? ((targetModel as ConfiguredModel<Schema.Top, any>).model as Schema.Top)
       : targetModel
-    fields[ref.fieldName] = substituteSchemaDeep(resolved)
+    fields[ref.fieldName] = substituteSchemaDeep(resolved, { enforceChecks: true })
+    readFields[ref.fieldName] = substituteSchemaDeep(resolved, { legacyReads: true })
   }
 
-  // --- Model Schema: pure model fields (for input decode/encode) ---
-  const modelSchema = Schema.Struct(fields)
+  // --- Model Schema: pure model fields (decode of stored items in "model" mode) ---
+  const modelSchema = Schema.Struct(readFields)
 
   // --- Record Schema: model + system fields ---
   // System timestamp fields use Schema.DateTimeUtcFromString as the canonical
@@ -1179,10 +2035,14 @@ export const buildDerivedSchemas = (
       : Schema.DateTimeUtcFromString
   }
   if (systemFields.version && !systemFields.versionCollision) {
-    systemSchemaFields[systemFields.version] = Schema.Number
+    // An item written before the entity was `versioned` has no version: it
+    // reads as version 0 — real versions start at 1 (#133).
+    systemSchemaFields[systemFields.version] = Schema.Number.pipe(
+      Schema.withDecodingDefaultKey(Effect.succeed(0)),
+    )
   }
   const recordSchema = Schema.Struct({
-    ...fields,
+    ...readFields,
     ...systemSchemaFields,
   })
 
@@ -1310,7 +2170,7 @@ export const buildDerivedSchemas = (
       : Schema.optional(Schema.String)
   }
   const itemSchema = Schema.Struct({
-    ...fields,
+    ...readFields,
     ...systemSchemaFields,
     ...keyAttrFields,
     __edd_e__: Schema.String,
@@ -1318,7 +2178,7 @@ export const buildDerivedSchemas = (
 
   // --- Deleted Record Schema: record + deletedAt ---
   const deletedRecordSchema = Schema.Struct({
-    ...fields,
+    ...readFields,
     ...systemSchemaFields,
     deletedAt: Schema.String,
   })
@@ -1334,7 +2194,7 @@ export const buildDerivedSchemas = (
 
   const modelVisibleSchema = hasHiddenFields
     ? Schema.Struct(
-        Object.fromEntries(Object.entries(fields).filter(([k]) => !hiddenFieldNames.has(k))),
+        Object.fromEntries(Object.entries(readFields).filter(([k]) => !hiddenFieldNames.has(k))),
       )
     : modelSchema
 
@@ -1342,7 +2202,7 @@ export const buildDerivedSchemas = (
     ? Schema.Struct(
         Object.fromEntries(
           Object.entries({
-            ...fields,
+            ...readFields,
             ...systemSchemaFields,
           }).filter(([k]) => !hiddenFieldNames.has(k)),
         ),
@@ -1365,7 +2225,7 @@ export const buildDerivedSchemas = (
         // Compute encodings for the appendInput fields (annotation +
         // inferred from typeConstructor for self schemas).
         const appendEncodings = buildFieldEncodings(userFields, {})
-        const subbedFields = substituteSchemas(userFields, appendEncodings)
+        const subbedFields = substituteSchemas(userFields, appendEncodings, { enforceChecks: true })
         return Schema.Struct(subbedFields as Schema.Struct.Fields) as unknown as Schema.Top
       })()
     : null
@@ -1375,7 +2235,7 @@ export const buildDerivedSchemas = (
           hasHiddenFields
             ? Object.fromEntries(Object.entries(record).filter(([k]) => !hiddenFieldNames.has(k)))
             : record
-        return Schema.Struct(hiddenFilter({ ...fields }) as Schema.Struct.Fields)
+        return Schema.Struct(hiddenFilter({ ...readFields }) as Schema.Struct.Fields)
       })()
     : null
 
@@ -1385,6 +2245,7 @@ export const buildDerivedSchemas = (
   type S = Schema.Codec<any>
   return {
     modelSchema: modelVisibleSchema as unknown as S,
+    writeModelSchema: Schema.Struct(fields) as unknown as S,
     recordSchema: recordVisibleSchema as unknown as S,
     inputSchema: inputSchema as unknown as S,
     createSchema: createSchema as unknown as S,
@@ -1403,3 +2264,372 @@ export const buildDerivedSchemas = (
 
 export const resolveUniqueFields = (def: UniqueConstraintDef): ReadonlyArray<string> =>
   Array.isArray(def) ? def : (def as { readonly fields: UniqueFieldsDef }).fields
+
+// ---------------------------------------------------------------------------
+// Path-addressed values (#133)
+// ---------------------------------------------------------------------------
+
+/** The schema one path segment addresses inside `schema`, or `undefined`. */
+const childAtSegment = (schema: Schema.Top, segment: string | number): Schema.Top | undefined => {
+  const inner = optionalField(schema)?.inner ?? schema
+  const s = inner as unknown as globalThis.Record<string, unknown>
+  const fields = schemaFieldsOf(inner)
+  if (fields !== undefined) return typeof segment === "string" ? fields[segment] : undefined
+  // An OPAQUE class — `X.check(…)`, `X.annotate(…)`, a `DynamoModel.ref` nested
+  // in a ref target — is deliberately NOT followed. Its `.fields` are gone, so
+  // the derived read schema keeps it unsubstituted and decodes its leaves
+  // exactly as `put` stores them; encoding a value under it into wire form
+  // would leave the item unreadable (#133). A path into it is passed through
+  // as given. A top-level `DynamoModel.ref` field is followed through its
+  // target model instead (`makePathValueEncoder`'s `refTargets`), whose read
+  // schema IS substituted.
+  if (SchemaAST.isUnion(inner.ast)) {
+    // `NullOr(Stamp)` and friends: the first member the segment resolves in.
+    const members = Array.isArray(s.members) ? (s.members as ReadonlyArray<Schema.Top>) : []
+    for (const member of members) {
+      const child = childAtSegment(member, segment)
+      if (child !== undefined) return child
+    }
+    return undefined
+  }
+  if (SchemaAST.isArrays(inner.ast)) {
+    if (typeof segment !== "number") return undefined
+    if (isSchemaLike(s.value)) return s.value
+    if (Array.isArray(s.elements)) return s.elements[segment] as Schema.Top | undefined
+    if (isSchemaLike(s.schema) && Array.isArray(s.rest)) {
+      const head = (s.schema as unknown as { readonly elements?: ReadonlyArray<Schema.Top> })
+        .elements
+      if (head !== undefined && segment < head.length) return head[segment]
+      return s.rest[0] as Schema.Top | undefined
+    }
+    return undefined
+  }
+  if (SchemaAST.isObjects(inner.ast) && typeof segment === "string") {
+    if (isSchemaLike(s.value) && isSchemaLike(s.key)) return s.value
+    if (isSchemaLike(s.schema) && Array.isArray(s.records)) {
+      const declared = schemaFieldsOf(s.schema)?.[segment]
+      if (declared !== undefined) return declared
+      const record = s.records[0] as unknown as { readonly value?: Schema.Top } | undefined
+      return record?.value
+    }
+  }
+  return undefined
+}
+
+/** The element schema of the list a path addresses (for append / prepend). */
+const listElementOf = (schema: Schema.Top): Schema.Top | undefined => {
+  const inner = optionalField(schema)?.inner ?? schema
+  if (!SchemaAST.isArrays(inner.ast)) return undefined
+  const value = (inner as unknown as { readonly value?: unknown }).value
+  if (isSchemaLike(value)) return value
+  // A rebuilt array with its checks restored has no runtime `.value`; a plain
+  // list (no fixed elements) still has its element in the AST's rest.
+  return inner.ast.elements.length === 0 ? arrayElementOf(inner) : undefined
+}
+
+/** Structural equality over plain values (primitives, arrays, plain objects). */
+const sameValue = (a: unknown, b: unknown): boolean => {
+  if (Object.is(a, b)) return true
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((entry, i) => sameValue(entry, b[i]))
+  }
+  if (isPlainObject(a) && isPlainObject(b)) {
+    const keys = Object.keys(a)
+    return keys.length === Object.keys(b).length && keys.every((k) => sameValue(a[k], b[k]))
+  }
+  return false
+}
+
+/**
+ * Whether a path value is ALREADY in the wire form of `original`, in a way
+ * encoding cannot tell apart from a domain value: it decodes as wire, it
+ * validates as the Type side, and encoding it would change it. `StringFromBase64`
+ * given `"aGk="`, or `fromJsonString(Unknown)` given `'{"a":2}'`, are both
+ * valid domain strings and valid wire strings; encoding would double-encode.
+ * Before path values were encoded, a wire value was the only way to round-trip
+ * such a field, so it is passed through as given (#133).
+ *
+ * Only a LEAF transform with a primitive wire form qualifies. A container — a
+ * class, struct, array, record, tuple or union — is always encoded: encoding a
+ * `Schema.Class` yields a plain object, so it would always look "changed", and
+ * passing it through whole would marshal its `Redacted` / `Date` / `DateTime`
+ * leaves as maps and lose them. A self date never qualifies either: its domain
+ * `DateTime` is "its own encoded form" to Effect, but the library stores it as
+ * a primitive.
+ */
+const makeAmbiguityCheck = (original: Schema.Top): ((value: unknown) => boolean) => {
+  if (!isLeafEncodingTransform(original)) return () => false
+  // "Already wire" means the value DECODES as wire — a plain string that is not
+  // valid base64 is a domain value for `StringFromBase64`, and is encoded.
+  const decodesAsWire = Schema.decodeUnknownOption(original as unknown as Schema.Codec<any>)
+  const isType = Schema.is(Schema.make<Schema.Top>(SchemaAST.toType(original.ast)))
+  const encode = Schema.encodeUnknownOption(original as unknown as Schema.Codec<any>)
+  return (value) => {
+    if (decodesAsWire(value)._tag === "None" || !isType(value)) return false
+    const encoded = encode(value)
+    return encoded._tag === "Some" && !sameValue(encoded.value, value)
+  }
+}
+
+/**
+ * A path value as DynamoDB will store it: the marshaller drops `undefined`
+ * object entries (`removeUndefinedValues`), so `{ opt: undefined }` is stored as
+ * `{}` and must be validated as such — an `optionalKey` rejects a present
+ * `undefined` that never reaches the table.
+ */
+const asStored = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(asStored)
+  if (!isPlainObject(value)) return value
+  const out: globalThis.Record<string, unknown> = {}
+  for (const [key, entry] of Object.entries(value)) {
+    if (entry !== undefined) out[key] = asStored(entry)
+  }
+  return out
+}
+
+/** A plain object or class instance whose fields a path value can be walked by. */
+const isWalkableObject = (value: unknown): value is object =>
+  value !== null &&
+  typeof value === "object" &&
+  !Array.isArray(value) &&
+  !(value instanceof Date) &&
+  !DateTime.isDateTime(value) &&
+  !Redacted.isRedacted(value)
+
+/**
+ * Encoders for the VALUES of path-based updates (`pathSet`, `pathAppend`,
+ * `pathPrepend`, `pathIfNotExists`) and record-based `append` (#133).
+ *
+ * Those values were marshalled as given, never encoded, so a `DateTime` set at
+ * `["days", 0]` — or appended to a list of dates — was stored as a marshalled
+ * `{ epochMilliseconds, … }` map, and a `NumberFromString` as a number. The
+ * schema the path addresses is resolved from the model and substituted exactly
+ * as the record schema substitutes it (a top-level field uses the record
+ * schema's own, so a configured `storedAs` applies), and the value is encoded
+ * through it.
+ *
+ * Passed through unchanged instead:
+ * - a value already in an ambiguous wire form (see `makeAmbiguityCheck`);
+ * - a value that does not encode — already wire-shaped, or a path the schema
+ *   cannot follow (an opaque `DynamoModel.ref`, a dynamic key).
+ *
+ * @internal
+ */
+export const makePathValueEncoder = (
+  modelFields: SchemaFields,
+  writeFields: SchemaFields,
+  /**
+   * The model each `DynamoModel.ref` field is denormalised from, keyed by
+   * field name. A ref field's own schema is opaque (the annotation drops its
+   * `.fields`), so a path under it is followed through the target model.
+   */
+  refTargets: globalThis.Record<string, Schema.Top> = {},
+): {
+  readonly value: (segments: ReadonlyArray<string | number>, value: unknown) => unknown
+  readonly elements: (segments: ReadonlyArray<string | number>, value: unknown) => unknown
+  /**
+   * The issue an ENCODED path value raises under the write schema at its path
+   * — a broken container check, or a value no form of which is valid — or
+   * `undefined` when it is valid, or when the path has no schema to check.
+   */
+  readonly validate: (segments: ReadonlyArray<string | number>, encoded: unknown) => unknown
+  /** `validate` for each element of a list value (append / prepend). */
+  readonly validateElements: (segments: ReadonlyArray<string | number>, encoded: unknown) => unknown
+} => {
+  const recordFields = writeFields
+  const cache = new Map<string, ((value: unknown) => unknown) | null>()
+  const encoderFor = (
+    key: string,
+    resolve: () => { readonly original: Schema.Top; readonly stored: Schema.Top } | undefined,
+  ): ((value: unknown) => unknown) | null => {
+    const cached = cache.get(key)
+    if (cached !== undefined) return cached
+    const resolved = resolve()
+    const fn = resolved === undefined ? null : leafAwareEncoder(resolved.original, resolved.stored)
+    cache.set(key, fn)
+    return fn
+  }
+  /**
+   * Encode through `stored`, passing an ambiguous wire value of a LEAF transform
+   * through. An array of such leaves (`Array(StringFromBase64)`) is the one
+   * container handled element by element, so a list of wire strings is not
+   * double-encoded either; every other container is encoded whole.
+   */
+  const leafAwareEncoder = (
+    originalSchema: Schema.Top,
+    stored: Schema.Top,
+  ): ((value: unknown) => unknown) => {
+    const original = optionalField(originalSchema)?.inner ?? originalSchema
+    const originalElement = listElementOf(original)
+    const storedElement = listElementOf(stored)
+    if (
+      originalElement !== undefined &&
+      storedElement !== undefined &&
+      isLeafEncodingTransform(optionalField(originalElement)?.inner ?? originalElement)
+    ) {
+      const element = leafAwareEncoder(originalElement, storedElement)
+      return (value) => (Array.isArray(value) ? value.map((entry) => element(entry)) : value)
+    }
+    const encode = Schema.encodeUnknownOption(stored as Schema.Codec<any>)
+    const decode = Schema.decodeUnknownOption(stored as Schema.Codec<any>)
+    const ambiguous = makeAmbiguityCheck(original)
+    return (value: unknown) => {
+      if (ambiguous(value)) return value
+      // A container holding an ambiguous wire leaf (`{ b64: "aGk=", at }`) is
+      // encoded part by part, so that leaf follows the leaf rule instead of
+      // being encoded a second time by the whole-value encode.
+      if (holdsAmbiguousLeaf(original, value)) return encodeByParts(original, value)
+      const encoded = encode(value)
+      if (encoded._tag === "Some") return encoded.value
+      // `decode -> encode`, as `.set()` / `put` do: a plain object given for a
+      // class-typed field, or a value already in wire form, round-trips to its
+      // wire form instead of being marshalled as given.
+      const decoded = decode(value)
+      if (decoded._tag === "Some") {
+        const reencoded = encode(decoded.value)
+        if (reencoded._tag === "Some") return reencoded.value
+      }
+      return encodeByParts(original, value)
+    }
+  }
+  const ambiguityChecks = new WeakMap<Schema.Top, (value: unknown) => boolean>()
+  const isAmbiguousAt = (schema: Schema.Top, value: unknown): boolean => {
+    let check = ambiguityChecks.get(schema)
+    if (check === undefined) {
+      check = makeAmbiguityCheck(optionalField(schema)?.inner ?? schema)
+      ambiguityChecks.set(schema, check)
+    }
+    return check(value)
+  }
+  /**
+   * Whether a container value holds, at any depth, a leaf in ambiguous wire
+   * form. Only arrays and PLAIN objects are looked into: a class instance was
+   * built from domain values by its constructor, so its leaves are domain and
+   * the whole instance is encoded.
+   */
+  const holdsAmbiguousLeaf = (schema: Schema.Top, value: unknown): boolean => {
+    const parts: ReadonlyArray<readonly [string | number, unknown]> = Array.isArray(value)
+      ? value.map((entry, index) => [index, entry] as const)
+      : isPlainObject(value)
+        ? Object.entries(value)
+        : []
+    return parts.some(([segment, entry]) => {
+      const child = childAtSegment(schema, segment)
+      return (
+        child !== undefined && (isAmbiguousAt(child, entry) || holdsAmbiguousLeaf(child, entry))
+      )
+    })
+  }
+  /** `leafAwareEncoder` for a schema nested in a path value, memoised per schema. */
+  const partEncoders = new WeakMap<Schema.Top, (value: unknown) => unknown>()
+  const partEncoder = (schema: Schema.Top): ((value: unknown) => unknown) => {
+    const cached = partEncoders.get(schema)
+    if (cached !== undefined) return cached
+    const fn = leafAwareEncoder(schema, substituteSchemaDeep(schema, { enforceChecks: true }))
+    partEncoders.set(schema, fn)
+    return fn
+  }
+  /**
+   * The last resort for a container value that neither encodes nor
+   * decode→encodes as a whole — one that MIXES wire and domain leaves, such as
+   * `{ b64: "hi", at: DateTime, n: "5" }` (`n` is already wire, `b64` is not
+   * valid base64). Each part is put into its stored form on its own, by the
+   * schema at its position, with the same leaf rules; storing the value raw
+   * would marshal its `DateTime` / `Date` / `Redacted` leaves as maps (#133).
+   *
+   * Arrays and tuples go element by element, structs, classes and records key
+   * by key. A part the schema has no position for, and a value that is neither
+   * an array nor a plain object or class instance, are kept as given.
+   */
+  const encodeByParts = (schema: Schema.Top, value: unknown): unknown => {
+    if (Array.isArray(value)) {
+      return value.map((entry, index) => {
+        const child = childAtSegment(schema, index)
+        return child === undefined ? entry : partEncoder(child)(entry)
+      })
+    }
+    if (!isWalkableObject(value)) return value
+    const out: globalThis.Record<string, unknown> = {}
+    for (const [key, entry] of Object.entries(value)) {
+      const child = childAtSegment(schema, key)
+      out[key] = child === undefined ? entry : partEncoder(child)(entry)
+    }
+    return out
+  }
+  /** The model's own schema at a path, before any substitution. */
+  const originalAt = (segments: ReadonlyArray<string | number>): Schema.Top | undefined => {
+    const [head, ...rest] = segments
+    if (typeof head !== "string") return undefined
+    let current: Schema.Top | undefined = refTargets[head] ?? modelFields[head]
+    for (const segment of rest) {
+      if (current === undefined) return undefined
+      current = childAtSegment(current, segment)
+    }
+    return current
+  }
+  const schemaAt = (segments: ReadonlyArray<string | number>) => {
+    const original = originalAt(segments)
+    if (original === undefined) return undefined
+    const head = segments[0] as string
+    const stored =
+      segments.length === 1
+        ? recordFields[head]
+        : substituteSchemaDeep(original, { enforceChecks: true })
+    return stored === undefined ? undefined : { original, stored }
+  }
+  const validators = new Map<string, ((encoded: unknown) => unknown) | null>()
+  const validatorFor = (
+    key: string,
+    resolve: () => Schema.Top | undefined,
+  ): ((encoded: unknown) => unknown) | null => {
+    const cached = validators.get(key)
+    if (cached !== undefined) return cached
+    const schema = resolve()
+    const fn =
+      schema === undefined
+        ? null
+        : (() => {
+            const decode = Schema.decodeUnknownExit(schema as Schema.Codec<any>)
+            return (encoded: unknown): unknown => {
+              const exit = decode(asStored(encoded))
+              return exit._tag === "Success" ? undefined : exit.cause
+            }
+          })()
+    validators.set(key, fn)
+    return fn
+  }
+  return {
+    validate: (segments, encoded) => {
+      const fn = validatorFor(`v:${JSON.stringify(segments)}`, () => schemaAt(segments)?.stored)
+      return fn === null ? undefined : fn(encoded)
+    },
+    validateElements: (segments, encoded) => {
+      if (!Array.isArray(encoded)) return undefined
+      const fn = validatorFor(`e:${JSON.stringify(segments)}`, () => {
+        const list = schemaAt(segments)
+        return list === undefined ? undefined : listElementOf(list.stored)
+      })
+      if (fn === null) return undefined
+      for (const entry of encoded) {
+        const issue = fn(entry)
+        if (issue !== undefined) return issue
+      }
+      return undefined
+    },
+    value: (segments, value) => {
+      const fn = encoderFor(`v:${JSON.stringify(segments)}`, () => schemaAt(segments))
+      return fn === null ? value : fn(value)
+    },
+    elements: (segments, value) => {
+      if (!Array.isArray(value)) return value
+      const fn = encoderFor(`e:${JSON.stringify(segments)}`, () => {
+        const list = schemaAt(segments)
+        if (list === undefined) return undefined
+        const original = listElementOf(list.original)
+        const stored = listElementOf(list.stored)
+        return original === undefined || stored === undefined ? undefined : { original, stored }
+      })
+      return fn === null ? value : value.map((entry) => fn(entry))
+    },
+  }
+}

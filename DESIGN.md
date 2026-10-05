@@ -84,7 +84,9 @@ db.Users.put(inputData)
   → compose keys (KeyComposer) for all indexes using composite attributes
   → add __edd_e__ + timestamps + version
   → marshall to DynamoDB format (Marshaller)
-  → DynamoClient.putItem (or transactWriteItems for unique constraints)
+  → versioned / unique entities: consistent read of the current item first, to
+    continue its version and rotate its sentinels (#133)
+  → DynamoClient.putItem (or transactWriteItems for unique constraints / retain)
   → Schema.decode(Entity.Record) — decode full item for return
 
 db.Users.get(key)
@@ -265,6 +267,7 @@ Examples with `name: "myapp"`, `version: 1`, `casing: "lowercase"`:
 | Unique constraint sentinel (email) | `$myapp#v1#user.email#foo@bar.com` |
 | Version snapshot (v7) | `$myapp#v1#user#v#0000007` |
 | Soft-deleted item | `$myapp#v1#user#deleted#2024-01-15T10:30:00Z` |
+| Version snapshot (v7), sk `["line"]`, value `"a"` | `$myapp#v1#user#v#line_a#0000007` |
 
 ### The `$` Sentinel
 
@@ -559,7 +562,11 @@ unique: {
 
 When a unique constraint declares a `ttl`, the **sentinel item** carries the TTL
 attribute and auto-expires, releasing the uniqueness reservation (e.g. a
-time-bounded hold). Without a `ttl`, sentinels are permanent.
+time-bounded hold), whether a put or an update wrote it. Without a `ttl`,
+sentinels are permanent. A sentinel names the item that reserved it
+(`_entity_pk` / `_entity_sk`), and a write releases only sentinels its item
+owns, since an expired reservation may have been claimed by another item (see
+"Sentinel ownership" in §10).
 
 Constraints are **sparse**: a sentinel is only written when every composing
 field is present on the record. Mirrors GSI sparse semantics — a record with a
@@ -567,6 +574,19 @@ missing optional composite is silently excluded from the constraint, allowing
 multiple records to coexist with the field unset (no false collision on a
 literal `"undefined"` key). Update transitions claim/release the sentinel as
 the field becomes set/unset.
+
+**A default never creates a sentinel (#133).** A field with
+`withDecodingDefault` that a write omits holds only its default, so no sentinel
+is composed for it, even when it is stored. A defaulted unique field that is
+also an index composite is stored (its index keys need it) and listed in a
+hidden string-set attribute, `__edd_d__` (`UNSENTINELED_DEFAULTS`), which is
+stripped from decoded models. `composeUniqueSentinel` returns nothing for a
+constraint over a listed field, so no sentinel is composed, rotated or deleted
+for it. A write that supplies the value drops the field from `__edd_d__` and
+claims its sentinel. A `.remove()` of a defaulted index composite stores the
+default again (`rematerializeRemovedDefaults`), keeps the item indexed under
+it, re-lists a unique field in `__edd_d__` and releases the old value's
+sentinel.
 
 ---
 
@@ -739,14 +759,84 @@ SK: ${schema}#{version}#{entityType}.{constraintName}
 **Version snapshot:**
 ```
 PK: (same as current item)
-SK: ${schema}#{version}#{entityType}#v#{zeroPaddedVersion}
+SK: ${schema}#{version}#{entityType}#v#[{item}#]{zeroPaddedVersion}
 ```
 
 **Soft-deleted item:**
 ```
 PK: (same as current item)
-SK: ${schema}#{version}#{entityType}#deleted#{isoTimestamp}
+SK: ${schema}#{version}#{entityType}#deleted#[{item}#]{isoTimestamp}
 ```
+
+**`{item}` — history of items that share a partition (#133).** An entity whose
+primary sort key has composites keeps several items in one partition, so each
+item's history keys carry its identity: the composite part of its live sort key
+(`KeyComposer.composeHistoryItemSegment`, e.g. `line_a`), inserted after the
+marker (`DynamoSchema.HistoryKeyOptions.item`). Siblings therefore never share a
+version sequence, a snapshot row or a tombstone; `versions`, `getVersion`,
+`deleted.get`, `restore`, `highestRetainedVersion` and `purge` key by the item,
+and `deleted.list` keeps the partition-wide prefix (every item's tombstones).
+Without sort key composites there is no segment, and the keys are byte-identical
+to every earlier release's. The segment sits after the marker, not after the
+live sort key as time-series events do (`<currentSk>#e#…`): the marker keeps the
+type-wide `begins_with` prefixes valid, so a primary-key query narrowed by sort
+key composites (`begins_with($app#v1#line#line_a)`) can never reach a history
+row, and a single-item entity's keys stay unchanged. `purge` of such an item
+removes its live row, rows nested under it, its own history, and history an
+earlier release wrote without a segment whose stored composites compose its
+live key; siblings are untouched. An entity without sort key composites purges
+every row of its own in the partition. Either way, only rows of its own entity
+type (`__edd_e__`): another entity sharing the partition through a collection on
+the primary key keeps its rows (purge used to delete every row in the
+partition).
+
+**History written before the segment stays readable.** Rows an earlier release
+wrote for such an entity sit under the partition-wide keys (`#v#0000003`,
+`#deleted#<ts>`), all items' in one sequence. A row there belongs to the item
+whose live key its stored composites compose (`isItemsRow`), and every reader
+of one item's history reads them too (`legacyHistory`: a `BETWEEN` on
+`<prefix>0`…`<prefix>:` — a version or timestamp starts with a digit, a
+segment with a composite name; a segment can still start with a digit if a
+composite's NAME does, so rows with a `#` past the prefix are dropped. A
+keys-only `Limit 1` probe of the range runs first, and only a hit reads it in
+full, so a partition with no such history costs one small read):
+`getVersion` falls back to the unsegmented key when the item's own is missing;
+`deleted.get` / `restore` take the later of the item's own latest tombstone and
+its latest unsegmented one (`latestTombstone`); `highestRetainedVersion` takes
+the higher of both; `deleted.list` is partition-wide and lists them anyway.
+`versions` stays a lazy `Query`: its `prepare` hook (run once per terminal)
+looks for the item's unsegmented snapshots and, if there are any, widens the
+`begins_with` to the partition's history and keeps the item's own rows plus
+those not already held under its own key. **Precedence:** a version held both
+ways is read from the segmented row; of two tombstones, the later wins (the
+segmented one on a tie).
+
+**History rows are not items.** Snapshots, tombstones and time-series event
+items keep their entity's `__edd_e__` (the history readers filter on it), so the
+ownership filter alone admits them to a primary-key query, a scan, or a
+collection on the primary key. A row is dropped only when it is positively
+history: the sort key composed from its own stored composites
+(`liveSkOf(toDomainView(composites))`, only those attributes unmarshalled) is not
+its stored sort key, or they don't compose, AND the sort key has a history
+layout — `#v#[…#]<7+ digits>` (retain), `#deleted#[…#]<ISO timestamp>`
+(softDelete), or `#e#` after the live key less its composites (timeSeries). A
+live row composes its own key, whatever its values or collection names hold
+(`#e#`, `deleted`, `v`); a row the current composer can't reproduce (an unpadded
+number composite written by 1.15, a row missing a composite) isn't history-shaped
+and is read as on main. `Entity._liveRows` (for `retain` / `softDelete` /
+`timeSeries`; otherwise `undefined`, and the query is unchanged) drives
+`Query`'s `liveRows`, applied to rows as they arrive, before decoding or
+counting, for queries and scans alike (a query can't name a key attribute in its
+filter, and a scan's filter saves no read capacity). `limit` is sent as `Limit`
+on the first request and each later request asks for twice the last
+(`computeRequestLimit`, capped at 100,000; `pageSize`, when set, is used as is):
+a run of `n` history rows costs about `log2(n / limit)` requests, where sending
+the remainder cost one per row for `limit(1)`. The surplus past `limit` is
+discarded and the cursor rebuilt from the last item returned. `maxPages` still
+bounds requests, so a capped query can return fewer items than `limit` when rows
+are dropped — as with a filter. `count()` reads only the sort key and composites (`reads`) of each row; a
+`select` also reads them. A collection on the primary key judges each row by the member its
+`__edd_e__` names. GSI queries never meet history rows, which carry no index keys.
 
 ### Policy-Aware GSI Composition (update & append)
 
@@ -1396,6 +1486,11 @@ class Order extends Schema.Class<Order>("Order")({
 | `DateEpochSeconds` | Epoch seconds number | Epoch seconds number |
 | `DateTimeZoned` | UTC ISO string (normalized) | Extended ISO with zone |
 
+The extended ISO form round-trips the zone: a named zone as `…+09:00[Asia/Tokyo]`,
+an offset zone as `…+05:00` (rebuilt with that offset since #133, for both
+`DynamoModel.DateTimeZoned` and a self `Schema.DateTimeZoned`; earlier versions
+read it back as UTC).
+
 ### Domain Model Purity
 
 The library supports two patterns for where storage configuration lives:
@@ -1455,6 +1550,98 @@ const OrderEntity = Entity.make({
 | `DynamoModel.storedAs(schema)` | Override DynamoDB storage format via schema annotation (Pattern A) |
 | `DynamoModel.configure(model, attributes)` | Create a configured model with per-field storage overrides and field renaming (Pattern B) |
 | `DynamoModel.configure({ immutable: true })` | Mark field as read-only after creation |
+
+#### Self dates nested in containers (#133)
+
+Entity derivation substitutes every **self** date (`Schema.DateTimeUtc`,
+`Schema.Date`, `storedAs(...)`) with a transform to its wire primitive. Before
+#133 the walk entered Struct / Class / Array but stopped at `Union`, `Record`,
+`Tuple`, `TupleWithRest` and `StructWithRest`, so `NullOr(Schema.DateTimeUtc)`,
+`NullOr(ClassWithDate)`, `Array(NullOr(date))` and `Record(_, date)` stored the
+`DateTime` instance itself, a marshalled `{ epochMilliseconds, … }` map.
+`substituteSchemaDeep` now walks those containers in every mode
+(`walkedContainer`), rebuilding each container kind with the original node's
+annotations, checks and context (`withMetadataOf`). A container with its own
+encoding chain is left as declared. Without `tolerantTransforms` only self-date
+and `Redacted` leaves are substituted, so a transform (Pattern B) inside a
+container keeps owning its wire form. A `TupleWithRest` is now derived as a
+tuple; it was previously treated as an array.
+
+**Container checks on writes (#133).** Rebuilding an `Array`, a `Struct` or a
+class around substituted children with a plain constructor dropped the original
+node's `.check()` refinements, so a write that broke one
+(`Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(1))` given two
+dates) was accepted. WRITE schemas are now built with `enforceChecks`, which
+restores those checks (`withMetadataOf`; for a class over a checked Struct, on
+the Struct its encoding leads to, `classStructAst`). That covers the entity
+input / create / update / key schemas (so `put`, `create`, `update`, Batch and
+Transaction), `appendInput`, the path-value schemas (`writeModelSchema`) and the
+aggregate's `writeSchema`, used by `create` and `update`. READ schemas leave it
+off, so a row written while the check was not enforced still reads. On an
+aggregate every `update` of such a row fails until the same update makes the
+value valid, because the whole mutated state is decoded through `writeSchema`;
+an entity `.set()` of other fields still succeeds. The repairing `update` works
+because it converts the current state through the read
+schema when `toIso` rejects it (`toPlainState`), and `keyRecord` normalises only
+key composites. `Union` / `Record` / `Tuple` rebuilds (`walkedContainer`) keep
+their metadata in every mode. A container that holds no substituted value is
+never rebuilt and keeps its own checks on reads and writes, as before.
+
+Date leaves inside a `Union` follow the union rules below, and also rebuild
+legacy maps, so rows written before #133 read back as real `DateTime`s.
+
+**Union rules (#133).** Every member of a union learns which primitive kinds
+the *other* members are stored as (`memberWireKinds`), including, for a union
+nested in another (`Union([NullOr(DateTimeUtc), String])`), the outer union's
+other members. A self-date member then:
+
+- accepts only its own wire kind, its own domain, or a legacy map
+  (`strictWireKind`), so it never claims a value of another kind;
+- when its storage kind **collides** with another member's (ISO storage next to
+  a `String`), accepts only the exact canonical string `toWirePrimitive` writes
+  (`canonicalOnly`), and is decoded **first** whatever the declared order. So
+  `"2000-01-01T00:00:00.000Z"` in `Union([DateTimeUtc, String])` reads back as a
+  `DateTime`, while `"2020"`, `"5"` and `"hello"` stay strings. A string field
+  that may legitimately hold canonical ISO instants needs a tagged or
+  discriminated shape;
+- when it is stored as an epoch number next to a member also stored as a number
+  (`Number`, a number literal, `BigInt`, another epoch date), cannot be told
+  apart from it at all: rejected at `make()` with **EDD-9058**. There is no
+  fallback to ISO storage. On an entity, `NumberFromString` and
+  `BigIntFromString` are stored as strings and do not collide. Under
+  `tolerantTransforms` (aggregates) a member's **domain** kinds count too
+  (`memberWireKinds(..., { domainSide })`), because `update` re-decodes domain
+  values: their domain `5` competes with an epoch date, so aggregates reject
+  them with EDD-9058 as well.
+
+A transform date member (`DateTimeUtcFromString`) keeps the transform's own
+decode inside a union, since the generic date transform accepts more than the
+user's transform. A `DynamoModel.configure(..., { f: { storedAs } })` override
+on a top-level union field applies to the union's single self-date member; with
+several date members it is rejected with **EDD-9057**.
+
+**Legacy reads on entities.** Entity READ schemas (model, record, item,
+deleted, history) are built with `legacyReads`: a transform field also accepts
+the domain-form value older path updates wrote (a `number` on a
+`NumberFromString`, a safe-integer `number` or `bigint` on a `BigIntFromString`,
+a marshalled map on a date transform), and a plain `Schema.BigInt` lifts the
+unmarshalled `number` back to `bigint`. Never inside a union, where a lenient
+member could claim another member's value. Write schemas and keys use the
+strict schemas, so nothing written changes.
+
+**Zoned offsets.** A zoned date stored as `…+05:00` (an offset zone, no
+bracket) is rebuilt with that offset; before #133 it was rebuilt as UTC. One
+parser (`internal/ZonedIso.ts`, `parseZonedIso`) serves both the
+`DynamoModel.DateTimeZoned` transform and the substituted date transform, so the
+two cannot drift. Named zones (`…[Europe/London]`) and UTC round-trip as before,
+and the stored form is unchanged. Offsets that are not whole minutes (historical
+LMT offsets, a sub-minute `zoneMakeOffset`) are rounded to the minute by
+`formatIsoZoned`, so the instant read back moves by the rounding difference, as
+in earlier versions.
+
+Key composition is unchanged for every
+existing shape (primary, GSI, unique, version, soft-delete, time-series keys);
+`Entity.nestedSelfDates.test.ts` snapshots the key attributes written.
 
 ---
 
@@ -1528,6 +1715,7 @@ Query.filter({ email: { contains: "@company.com" } })
 Query.limit(10)    // at most 10 ITEMS (accumulates across requests)
 Query.pageSize(10) // 10 rows examined per REQUEST (DynamoDB `Limit`)
 Query.reverse      // scanForward = false
+Query.consistentRead // the table; refused on a GSI (#133) — entity indexes are always GSIs
 
 // 6. Execute — terminal, crosses into Effect
 Query.execute    // Query<A> => Effect<A, DynamoError, DynamoClient>
@@ -1589,6 +1777,9 @@ yield* db.entities.Counters.upsert({ counterId: "c-1", total: 0 })
 yield* db.entities.Tasks.patch({ taskId: "t-1" })
   .set({ status: "blocked" })
 
+// deleteIfExists — delete with attribute_exists guard
+yield* db.entities.Tasks.deleteIfExists({ taskId: "t-1" })
+
 // Composed update
 yield* db.entities.Products.update({ productId: "p-1" })
   .set({ name: "Updated", price: 24.99 })
@@ -1598,6 +1789,46 @@ yield* db.entities.Products.update({ productId: "p-1" })
   .remove(["temporaryFlag"])
   .expectedVersion(5)
 ```
+
+**An op's own guard is structural (#133).** `create`'s
+`attribute_not_exists(pk) AND attribute_not_exists(sk)`, and `patch`'s and
+`deleteIfExists`'s `attribute_exists(pk)`, are not held as the op's condition:
+they come from the op's kind (`putKind: "create"`, `patch: true`,
+`_mustExist`) and are ANDed with the caller's condition where the request is
+built — the entity's own write, `Entity.extractTransactable` (transactions,
+`EventStore` additional items) and so `Batch.write`, which refuses any op with
+a condition. Guard and condition compile as one `and` expression, so their
+placeholders never collide; with no condition the guard is sent alone, byte
+for byte as before. As on every op, a later `.condition()` replaces an earlier
+one; the guard always stays. (The version, unique-sentinel and retain guards
+were already separate from the caller's condition.)
+
+**Empty conditions and filters (#133).** The `condition` combinator is the one
+place an empty condition becomes none (`nonEmptyCondition`; `append`, which
+takes its condition as an argument, applies it on entry): a condition that asserts nothing (`{}`, `and()`, an `and` of only such
+parts — `isEmptyExpr`) is dropped, leaving the op's own guard alone; likewise
+`Query.filterExpr` drops an empty filter. An empty part directly under `and` is
+left out when compiled. Anywhere else — under `or` (which it would make match
+everything) or `not` (nothing), or an `or()` with no parts (nothing) — it has
+no reading that keeps what the caller wrote, so `emptyPartProblem` refuses it
+with a `ValidationError` before anything is sent: in `EntityPut` / `Update` /
+`Delete` when they run, per op in `transactWrite`, in `append`, for filters
+when a query runs, and for aggregate `list` filters. An `isIn` with no values
+(`IN ()`, which DynamoDB rejects) is refused the same way, and a
+`Transaction.check()` with an empty condition is refused before sending.
+`compileExpr` itself throws on anything `emptyPartProblem` refuses, so no
+caller can compile one by skipping the check — reaching it is a library bug.
+
+**`patch` and missing items (#134).** `patch()` of a missing item fails with
+`ConditionalCheckFailed` on every path — including those that read first
+(retain, a unique-field change), which used to report `ItemNotFound`. A plain
+(unread) patch sends one exists clause: the plain write's own
+`attribute_exists(#exists)` already covers patch's guard.
+
+**`expectedVersion` needs a version (#134).** On an entity without
+`versioned`, `.expectedVersion(n)` is refused with a `ValidationError` before
+anything is read or sent — a silently skipped concurrency check is worse than
+none.
 
 **Yieldable, not Effect.** The *write* builders implement `Pipeable.Pipeable` and `[Symbol.iterator]` (via `Utils.SingleShotGen`) — the same contract as the unbound `EntityOp` and `EntityDelete` intermediates. You execute them by `yield*`ing inside `Effect.gen`. For interop with Effect combinators (`Effect.map`, `Effect.flip`, etc.) use `.asEffect()`.
 
@@ -1612,7 +1843,7 @@ yield* db.entities.Products.update({ productId: "p-1" })
 | Builder | Method | Accepts |
 |---|---|---|
 | `BoundGet` | *(no combinators — it is an `Effect`)* | — |
-| `BoundPut` / `BoundCreate` / `BoundUpsert` | `.condition(cond)` | callback `(t, ops) => Expr` or shorthand record |
+| `BoundPut` / `BoundCreate` / `BoundUpsert` | `.condition(cond)` | callback `(t, ops) => Expr` or equality shorthand record (`{ status: "active" }`) |
 | `BoundDelete` | `.condition(cond)` | same as above |
 | `BoundDelete` | `.returnValues(mode)` | `"none"` or `"allOld"` |
 | `BoundUpdate` / `BoundPatch` | `.set(updates)` | partial record |
@@ -1622,13 +1853,393 @@ yield* db.entities.Products.update({ productId: "p-1" })
 | `BoundUpdate` / `BoundPatch` | `.append(values)` | `Record<string, ReadonlyArray<unknown>>` |
 | `BoundUpdate` / `BoundPatch` | `.deleteFromSet(values)` | `Record<string, unknown>` |
 | `BoundUpdate` / `BoundPatch` | `.expectedVersion(n)` | `number` |
-| `BoundUpdate` / `BoundPatch` | `.condition(cond)` | callback or shorthand |
+| `BoundUpdate` / `BoundPatch` | `.condition(cond)` | callback or equality shorthand record |
 | `BoundUpdate` / `BoundPatch` | `.returnValues(mode)` | any `ReturnValuesMode` |
 | `BoundUpdate` / `BoundPatch` | `.cascade(config)` | cascade targets |
 | `BoundUpdate` / `BoundPatch` | `.pathSet(op)` / `.pathRemove(segs)` / `.pathAdd(op)` / `.pathSubtract(op)` / `.pathAppend(op)` / `.pathPrepend(op)` / `.pathIfNotExists(op)` / `.pathDelete(op)` | same payloads as the unbound `Entity.path*` combinators |
 | all builders | `.asEffect()` | — |
 
 **Implementation strategy.** The builders are thin wrappers. Internally each holds an `EntityOp` (or `EntityDelete`) from the unbound entity plus a pre-resolved `provide` for `DynamoClient + TableConfig`. Every chainable method forwards into the existing `Entity.set/remove/add/condition/…` combinators. On `yield*` (or `.asEffect()`) the builder calls `op._run("record")` (or `op.asEffect()` for deletes) and pipes through `provide` so the final `Effect` has `R = never`.
+
+**Path-addressed values are encoded (#133).** `pathSet`, `pathAppend`,
+`pathPrepend`, `pathIfNotExists` and record-based `append` (including the
+versioned-retain path) bypass the update schema, and used to marshal their
+value as given: a `DateTime` became a map even on a plain date field, and a
+`NumberFromString` value was stored as a number. `makePathValueEncoder` resolves
+the schema the path addresses (`childAtSegment` through struct fields, union
+members, array / tuple elements and record values; a top-level field uses the
+record schema's own, so `storedAs` applies) and encodes the value through it;
+list operations encode element by element. Values go through `encode`, then
+`decode → encode` as `.set()` does, so a plain object on a class-typed field is
+encoded as that class, and a value already in wire form is normalised
+(`NumberFromString` `"05"` → `"5"`, `DateTimeUtcFromString` `"2000-01-01"` →
+`"2000-01-01T00:00:00.000Z"`, `Schema.Trim`): read-back values are identical,
+only stored bytes differ. A class instance is always encoded whole. A plain
+object or array that neither encodes nor decode→encodes whole (it mixes wire and
+domain parts), or that holds an ambiguous wire leaf, is encoded part by part
+(`encodeByParts`, `holdsAmbiguousLeaf`), so every `DateTime` / `Date` /
+`Redacted` inside is stored in wire form. The one pass-through is a LEAF
+transform with a primitive wire form, given a value that genuinely decodes as
+wire AND validates as the domain type (`StringFromBase64` given `"aGk="`,
+`fromJsonString`), whose encode would double-encode it (`makeAmbiguityCheck`);
+`"hi"` on `StringFromBase64` is not valid wire and is encoded. Paths into and
+under a TOP-LEVEL `DynamoModel.ref` field follow the ref target's model
+(`refTargets`), whose read schema is substituted, so they are encoded like any
+other path. An opaque class (built with `.check()` or `.annotate()`, or a
+`DynamoModel.ref` nested inside a ref target) is deliberately not followed by
+`childAtSegment`: its `.fields` are gone, so the read schema keeps it
+unsubstituted and decodes its leaves exactly as `put` stores them, and a path
+value under it is passed through as given so the item stays readable. Known
+limitation: plain dates inside such a class are still stored as maps (also by
+`put` / `.set()`), as on 1.22.0. Only those and paths no schema describes (under
+a dynamic key of an untyped value) are passed through.
+
+**Retain entities.** The `versioned: { retain: true }` update branch builds the
+new item in memory and writes it in a transaction with the snapshot; it used to
+ignore path operations entirely (success, nothing written). An update that
+carries path operations now reads the current item (consistent read) for the
+snapshot, then sends the non-retain branch's own `UpdateExpression` (version
+bump, timestamps, GSI recomposition, `expectedVersion`, user condition) as the
+`Update` in one `TransactWriteItems` with the snapshot `Put`, conditioned on
+the version read. DynamoDB therefore applies the path semantics itself — parity
+by construction, never emulated — and a rejected expression writes no snapshot.
+Path operations combined with a unique-constraint change, or with a computed
+change to an index composite, are rejected with a `ValidationError`: both are
+read-then-write updates that cannot carry path expressions. Record retain
+updates are guarded read-then-write updates (below).
+
+Each encoded path value is then **validated** against the write schema at its
+path (`validate` / `validateElements`), as `.set()` validates its payload: a
+literal outside its set, a string under `minLength` or a broken container check
+fails with a `ValidationError` instead of being stored. `undefined` object
+entries are dropped first (`asStored`), since the marshaller drops them too.
+List `append` / `prepend` validate each element, but cannot enforce list-level
+checks such as `maxLength`: DynamoDB builds the list server-side. `ADD`,
+`DELETE` and `SUBTRACT` are unchanged.
+
+**Path operations on key and unique fields (#133).** DynamoDB evaluates a path
+operation, so compiling one on an index composite or unique field would change
+the attribute while its keys and sentinel stayed put. `normalizeDerivedPathOps`
+rewrites the ones whose result is known client-side into record operations: a
+top-level `pathSet` of a value / `pathRemove` into `.set()` / `.remove()`, a
+numeric `pathAdd` / `pathSubtract` into `.add()` / `.subtract()`. Those then go
+through the key composer and the sentinel rotation. It refuses, with a
+`ValidationError` naming the field: copies, `pathIfNotExists`, list and set
+operations on such a field (DynamoDB computes their result at write time); a
+path below such a field; any path operation on a primary-key composite or an
+immutable field; and a second operation on the same field. `.add()` /
+`.subtract()` / `.append()` / `.deleteFromSet()` on a GSI composite recompose
+the index key on every entity.
+
+**Guarded read-then-write (#133).** Updates that read first (a unique-field
+change, a computed change to an index composite, every retain update) write a
+guarded `Update` of only the attributes that changed, conditioned on what they
+read. A concurrent change to an unrelated attribute is preserved. A race on an
+input fails without writing: `OptimisticLockError` (with the real
+`actualVersion`) on a versioned entity, `ConcurrentModification` (naming the
+changed `attributes`, with `current`) on an unversioned one. Soft delete, and a
+hard delete of an entity with unique constraints or `retain`, are guarded the
+same way: by version, or for an unversioned entity by a condition over every
+attribute read. `restore` fails with `ItemNotFound` when the tombstone is gone (a
+concurrent restore won) and `ItemNotDeleted` when a live item already exists.
+
+**Wide items.** Guards are sized against DynamoDB's real limits on one
+expression (`EXPRESSION_LIMIT` 4,096 characters, `OPERATOR_LIMIT` 300 operators
+and functions), computed on the actual condition, including the caller's
+`.condition()` (`expressionFits`). An unversioned delete is never refused for
+width: when the full guard does not fit, `deleteGuard` falls back to the
+strongest guard that fits. That is `attribute_exists(pk)`, then `updatedAt`
+unchanged (with timestamps), then as many attributes as fit, unique-constraint
+fields first, then the model's fields, then the rest. With timestamps, every
+library write changes `updatedAt`, so any concurrent library update is detected
+except one in the same millisecond with an identical `updatedAt`. A writer
+outside the library that leaves `updatedAt` alone can change unguarded
+attributes undetected. Without timestamps only the guarded attributes are
+protected. An update too wide for one expression writes the whole item, under
+the version condition (versioned) or the same fallback guard (unversioned). A
+concurrent write from outside the library to an attribute the guard does not
+cover is lost, as 1.22.0 lost it for every such update. A caller's
+`.condition()` too large to fit beside the guard fails before writing
+(`oversizedCondition`), with a `ValidationError` stating both sizes.
+
+Operators are counted as DynamoDB counts them (`countOperators`, measured
+against DynamoDB). In a condition: each comparison (`=`, `<>`, `<`, `<=`, `>`,
+`>=`), `AND` / `OR` / `NOT`, `IN`, and each function; `BETWEEN` counts once,
+because its own `AND` is part of it. In an update expression: each `+` / `-`
+and each function (`if_not_exists`, `list_append`); a `SET` clause's `=` is not
+an operator.
+
+**Pre-versioning items.** An item written before the entity was `versioned` has
+no version attribute. It reads as version 0 on every path, and
+`expectedVersion(0)` addresses it. The first versioned write conditions on
+`attribute_not_exists(version)` (plus the incarnation token, which it adds) and
+writes version 1; the retain snapshot is `v#0000000`. A race on that first
+write is an `OptimisticLockError`. Soft delete and restore handle it too.
+
+**Items whose version was removed.** A versioned entity stamps the incarnation
+token when it creates an item, so only a pre-versioning item may lack a version,
+and it lacks the token too. An item with the token and no version had its
+version removed outside the library. Reading it as version 0 would let the next
+update rewrite its history, so `versionCorruption` refuses it with a
+`ValidationError`: on every decode (`get`, queries, the `deleted` views,
+`decodeMarshalledItem`), so a query over a partition holding one fails as a
+whole; on the read of every read-then-write path (updates, soft delete,
+hard delete with unique constraints or `retain`, `restore`, versioned `put`
+other than `create`,
+read-first `upsert`, transaction puts); and on a plain update and a plain
+`upsert`, through a
+`attribute_exists(version) OR attribute_not_exists(__edd_i__)` condition with
+`ALL_OLD` on failure. A plain hard delete (no unique constraints, no `retain`)
+deliberately doesn't check: it reads nothing and writes no history, so it is the
+safe way to remove such an item; `purge` removes it on any entity.
+
+**Version history is never overwritten.** Every `v#N` snapshot `Put`
+(`snapshotPut`) is conditioned on `attribute_not_exists(pk)` OR the existing
+row holding the same version, incarnation token and (with timestamps)
+`updatedAt`. Rewriting the same state is legitimate: a retain `put` writes
+`v#0000001` and the first update snapshots that same version-1 state again, and
+a restore rewrites the delete-time snapshot. Any other row is a different
+history, so the update, soft or hard delete, restore or replacing `put` fails with a
+`ValidationError` (`historyConflict`) and writes nothing. A new item's snapshot
+(`v#0000001`, or the version after the history retained at its key) carries a
+fresh incarnation token, so in effect it requires the row to be missing; one
+already there means the read missed retained history, and the put is planned
+again. Caveat: a write from outside the library that
+changes an item without bumping its version can be captured into the next
+`v#N` snapshot, because the snapshot copies the item read.
+
+**Decoding defaults.** Read schemas keep `withDecodingDefault`, so a `put` that
+omits a defaulted field returns and reads back the default (it used to write the
+item and then fail with a `ValidationError`). A defaulted self date is stored as
+an ISO string. A defaulted primary-key or index composite that a write omits is
+stored with its default, and keys are composed from it; other defaulted fields
+are not stored. A default never creates a unique sentinel: see §5 Unique
+Constraints for `__edd_d__` and `.remove()` of a defaulted index composite.
+
+**Error mapping.** Failed conditions ask DynamoDB for `ALL_OLD` and classify by
+the stored item. A newer stored version is `OptimisticLockError` with the real
+`actualVersion`; the same version is the user's `.condition()`, so
+`ConditionalCheckFailed`; no item is `ItemNotFound`. That holds on every update
+path. Before, three paths had it the other way round:
+
+- a plain versioned update with `expectedVersion` + `.condition()` reported a
+  failed condition as `OptimisticLockError(-1)`;
+- a retain record update with `.condition()` did the same;
+- a retain path update with `.condition()` reported a lost version race as
+  `ConditionalCheckFailed`.
+
+A versioned update of a missing item with `expectedVersion` also gave
+`OptimisticLockError(-1)`. `patch()` keeps its contract: a missing item is
+`ConditionalCheckFailed`.
+
+**Incarnation token.** A version alone cannot tell an item from one deleted and
+recreated at the same version. Versioned entities carry `__edd_i__`
+(`INCARNATION_TOKEN`), a random UUID stamped on create (put, create, upsert,
+batch / transaction put) and backfilled on the next guarded write. Every
+version-checked write also checks the token (`incarnationGuard`;
+`attribute_not_exists` for an item that has none yet). It is stripped from
+decoded models and appears only in `asNative` / raw items.
+
+**Return values.** `returnValues` is honoured on every update path: `"none"` →
+`undefined`; `"updatedOld"` / `"updatedNew"` → only the top-level attributes
+the update wrote, decoded as a partial; `"allOld"` / `"allNew"` → the whole
+item. The type follows the mode (`UpdateReturn<A, M>`); repeated
+`Entity.returnValues` calls are typed by the last one (`UpdateBase`). A retain
+update returns exactly the item it wrote even if another writer replaced it
+since. When that cannot be proven from a snapshot it fails with
+`UpdateAppliedButUnreadable` (the write was applied; do not retry). `allOld`
+returns the replaced item; the record retain / unique branch used to return the
+new one. A cascade with `allOld` / `updatedOld` cascades exactly what the update
+wrote, which needs both images; with path operations on an unversioned entity
+that combination is refused.
+
+**Missing items and refusals.** `update()` of a missing item no longer leaves an
+undecodable partial row. A plain update always requires the item to exist. When
+it is missing and the update is a plain `.set()` of a complete item (every
+required field and primary-key composite, where a field with a decoding default
+is not required) with no other operation, `expectedVersion`, `.condition()`,
+cascade, `withVector` or old-image return mode, the library creates it through
+`create` with the same payload (`MissingForCreate` → `updateOrCreate`), so the
+item is exactly what `put` writes. If another writer creates it in between, the
+update re-runs once on that item. Anything else fails with `ItemNotFound` and
+writes nothing, as do retain entities and updates that read first. `.set()` of a changed primary-key composite is refused (it was silently
+ignored). An immutable field may be restated with its stored value (spread
+records), while a different value is refused.
+
+**Guarded puts.** A `put` of a versioned or unique-constrained entity is planned
+from a consistent read of the item (`planPut`), and written by `runGuardedPut`.
+Over an existing item it continues that item: the next version, the same
+incarnation token, the stored `createdAt` (unless the input supplies one — on
+unique-only entities too), a retain snapshot of the replaced item at its version,
+and sentinel rotation (a changed value takes the new sentinel and releases the
+old one; an unchanged value is left alone). It never resets to version 1 or
+orphans a sentinel. The main `Put` is guarded by `attribute_not_exists(pk)` when
+the item was missing, and otherwise by `deleteGuard` over what was read (version
+and incarnation when versioned, the unique attributes otherwise), with
+`ReturnValuesOnConditionCheckFailure: ALL_OLD`. A soft-deleted item counts as
+missing, since its tombstone has a different sort key. Entities with neither
+feature keep the single `PutItem`, with no read.
+
+A put replaces the whole item, so a lost race is retried rather than reported:
+a concurrent create, replace or delete of the item between the read and the
+write cancels it, and it is planned again from a fresh read — the last writer
+wins, as with a plain `PutItem` (`GUARDED_PUT_ATTEMPTS` = 3; a race lost on every
+attempt is an `OptimisticLockError` when versioned, else `ConcurrentModification`).
+A `.condition()` failure is `ConditionalCheckFailed`, a taken unique value
+`UniqueConstraintViolation`, a replaced item whose `v#N` snapshot holds other
+history a `ValidationError`. `create` does not read: the item must be missing,
+so its `Put` is guarded by `attribute_not_exists(pk)` and carries a fresh
+incarnation; an existing item is `ConditionalCheckFailed`. A retain `create`
+runs only the one `Limit: 1` history query below.
+
+**Re-creating a deleted retain item.** A deleted (or soft-deleted) retain item's
+`v#N` snapshots outlive it, and its final state is one of them: a hard delete,
+like a soft delete, reads the item and snapshots it at its own version in the
+same transaction as the `Delete` (guarded on the version and incarnation read,
+under the `snapshotPut` guard). Without that snapshot an item deleted at `vN`
+(N ≥ 2) had history only up to `v(N−1)`, came back at exactly `vN`, and a writer
+still holding `vN` could overwrite the new incarnation. A retain hard delete
+therefore costs a `GetItem` and a two-item `TransactWriteItems`, not one
+`DeleteItem`; deleting a missing retain item writes nothing (with a
+`.condition()`, a `DeleteItem` conditioned on `attribute_not_exists(pk)` and the
+condition, so the condition is judged against no item and an item created since
+the read is never removed unsnapshotted). A delete that reads first — retain,
+unique or soft — with no `.condition()` is retried from a fresh read when it
+loses a race (the item changed, was deleted — `DeletedConcurrently` — or a
+sentinel it releases changed hands), up to `GUARDED_PUT_ATTEMPTS`, as a put is:
+the caller asserted nothing the race could break, and the guard still keeps a
+concurrent write out of the snapshot or tombstone. A retry that finds the item
+gone reports what a delete of a missing item does: nothing for retain only,
+`ItemNotFound` with unique constraints or soft delete. `deleteIfExists`'s
+`attribute_exists(pk)` (`assertsExistenceOnly`) is already implied by these
+guards, so it is judged against the read — a missing item is
+`ConditionalCheckFailed` — and retried like an unconditioned delete. With any
+other `.condition()`, the read is what the condition was judged against, and the
+race fails. Every delete path returns, under `returnValues("allOld")`, the item
+it removed: the one read (the delete is guarded on it), or `ALL_OLD` from a
+plain `DeleteItem`. A put, `create`, `upsert` or transaction put of a
+missing retain item reads the highest version retained for its key (a `Query` on
+the `v#` prefix, reversed, `Limit: 1`) and continues after it: the new item takes
+that version + 1, a new incarnation token, and its snapshot at that version.
+History is never overwritten, and the key is reusable without `purge`. If
+snapshots appear between the read and the write, the snapshot guard cancels the
+write and it is planned again. `restore` of a tombstone while a live item exists
+at the key is refused with `ItemNotDeleted`; once that item is deleted too,
+`restore` brings back the latest tombstone.
+
+**Sentinel ownership.** A sentinel names the item that reserved it
+(`_entity_pk` / `_entity_sk`). An item can hold a unique value without owning its
+sentinel: the constraint was added after the item was written, the item was
+written outside the library, or a `ttl`'d reservation expired and another item
+claimed the value. Releasing that sentinel by key would delete the other item's
+reservation and let the value be taken twice. So every path that releases a
+sentinel — a replacing put, an update or upsert that changes the value, a hard or
+soft delete, `purge`, a transaction put — first reads it consistently
+(`ownedSentinels`) and releases only those this item owns, each with a `Delete`
+conditioned on `_entity_pk` / `_entity_sk` still naming it (`sentinelRelease`). A
+release cancelled because the reservation changed hands in between is planned
+again from a fresh read by a put, an `upsert` and a transaction put (bounded by
+the same attempts), and is a `ConcurrentModification` on the unique fields from
+an update or a delete with a `.condition()` (an unconditioned delete is retried
+too). (`releaseRaced` marks those errors, `releaseRaces`, so
+`guardedUpsert` can tell them from a change of the item itself, which fails an
+upsert as it fails an update.) Each sentinel a write would release costs one consistent
+`GetItem` (projecting only `_entity_pk` / `_entity_sk`). `purge` releases them
+one by one with a conditional `DeleteItem`, since a batch delete cannot carry
+the condition, collects them from the live item and every tombstone, and skips
+a release whose reservation changed hands in between. A sentinel an update
+writes for a changed value carries its constraint's `ttl`, as a put's does.
+
+**`upsert` that reads first.** One `UpdateItem` cannot write, rotate or check a
+sentinel, snapshot the replaced item, or tell whether to store a default or keep
+the stored value. So an entity with `unique` constraints or `versioned: { retain:
+true }`, or an input that omits a defaulted index composite, takes
+`guardedUpsert`: it validates the whole input (required fields included) and
+reads the item once. Missing: `create`, sentinels guarded by
+`attribute_not_exists`, the retain snapshot written, omitted defaults stored.
+Present: an update of the upserted fields (primary-key composites, immutable
+fields, `createdAt` and the version dropped, so they keep their stored values,
+as do fields the input omits) from that same read, with sentinels rotated for
+changed values only and the replaced item snapshotted, under the update's
+version / incarnation guard (versioned) or attribute guard (unversioned). A
+concurrent create or delete between the read and the write is retried the other
+way, and a sentinel release that raced is planned again from a fresh read
+(`GUARDED_PUT_ATTEMPTS` in all); a race lost on every attempt is an
+`OptimisticLockError` / `ConcurrentModification`, never a
+`ConditionalCheckFailed` the caller didn't ask for, and every error names the
+`upsert`. Other entities keep the single `if_not_exists` `UpdateItem`.
+
+**Transaction puts.** `transactWrite` and `EventStore.append`'s
+`additionalItems` plan a put of a versioned or unique-constrained entity with
+the same `planPut` (`Entity._planPut`), so it creates or replaces exactly as the
+entity's own `put`: it reads the item, guards the `Put` on what it read,
+continues a replaced item's version, incarnation and `createdAt`, snapshots it,
+rotates its sentinels (releasing only owned ones) and continues a re-created
+retain item past its history. Each guarded put's items carry `"guarded"`
+provenance and are judged by `judgeCancellation`: a taken unique value
+(`UniqueConstraintViolation`) or a history conflict (`ValidationError`) is
+final; the caller's own condition is `TransactionCancelled` from
+`transactWrite` and `AdditionalItemConditionFailed` from `append` — never
+reported for an op the caller set no condition on; a race with the read cancels
+the transaction, which is built and written again
+(`GUARDED_TRANSACTION_ATTEMPTS` = 3, then `OptimisticLockError` /
+`ConcurrentModification`).
+
+Two checks run on the compiled transaction before it is sent, in
+`transactWrite` and `EventStore.append`. **One op per item**
+(`refuseRepeatedItems`): DynamoDB allows one operation per item in a
+transaction, and for a guarded put the reasons it reports for a repeated item
+can read as a lost race (`[None, ConditionalCheckFailed]` on DynamoDB Local),
+which would be retried and misreported. Every compiled item carries a target —
+its table and primary key, and the caller op it came from
+(`BuiltTransactWriteItems.targets`) — including the sentinels and snapshots a
+guarded put adds, so two puts that swap unique values (releasing and reserving
+the same sentinels) are caught too; `append` adds targets for its contiguity
+check, event puts and idempotency sentinel. A repeat is a `ValidationError`
+naming the entity and both sources. **Size** (`refuseOversizedTransaction`):
+a LOWER bound on the items' sizes by DynamoDB's item-size rules
+(`internal/ItemSize.ts`, `"lower"`: numbers a byte per two significant digits
+plus one, no list or map overhead; a `Put`'s item, a `Delete`'s or
+`ConditionCheck`'s or `Update`'s key — an Update's values may be its
+condition's; zero is one byte), so a transaction DynamoDB
+would accept is never refused, must not pass 4 MB =
+4,194,304 bytes, DynamoDB's documented aggregate limit for one transaction (in
+the binary megabytes of all its size limits). A retain put counts twice: its
+item and its snapshot. An oversized transaction is a `ValidationError` naming
+its largest item, not DynamoDB's bare `ValidationException`. Deletes of `unique` / retain / `softDelete`
+entities are still refused (EDD-9048): a transaction builds a delete from its
+key alone.
+
+**`Batch.write` of a `versioned` entity.** A `PutRequest` would reset an
+existing item to version 1 under a new incarnation. So `Batch.write` sends these
+puts first, before any other request, as create-only `TransactWriteItems` Puts
+(`attribute_not_exists(pk)`) in chunks of up to 100 items, each closed before
+its item size, by an upper bound of DynamoDB's item-size rules (`"upper"`), passes 3.5 MB (the cap is 4 MB). There
+is no read, and so no window between a check and the write. A batch that
+touches a versioned put's item more than once — a delete and a put, or two
+puts — is refused before anything is sent: the put runs in its own
+transaction, so the order couldn't be kept (and two puts of one item in one
+transaction would be misreported as a replace). Each chunk is atomic: a put that would
+replace an existing item cancels it, nothing in the chunk is written, and the
+batch fails with a `ValidationError` without sending later chunks or the plain
+requests. Earlier chunks may already have been written; `Batch.write` was never
+atomic across chunks. A cancellation whose reasons are only
+`TransactionConflict` / throttling is retried with the batch's `maxRetries` /
+`baseDelayMs` backoff, and any other cancellation is a `DynamoError`. Each
+chunk costs twice the write capacity of a batch write. Puts of other entities,
+and deletes, stay plain `BatchWriteItem` requests. (`unique` and retain
+entities are still refused by EDD-9049.)
+
+**Known limitations** (inherent):
+
+- On unversioned entities, nothing can prove an unguarded attribute unchanged.
+  So the item a unique-field update returns may show stale values for
+  attributes it neither reads nor writes, wide items use the fallback guard,
+  and the wide-update whole-item write can overwrite outside writers.
+- A plain `.expectedVersion(n)` cannot detect a delete-and-recreate that has
+  climbed back to version `n` on an entity without `retain` (its versions
+  restart at 1, so it takes `n − 1` updates; a retain item continues after its
+  retained history).
 
 **Why hard-break over dual.** Carrying both the variadic overload and the fluent builder would double the surface area of `BoundEntity`, degrade hover tooltips, and force contributors to remember two shapes. The read side settled on builders for the same reasons. The change is batched into the next major alongside other breaking changes.
 
@@ -1655,12 +2266,17 @@ semantics):
 
 | Operation | Transaction Items |
 |-----------|-------------------|
-| Put | Entity item + sentinel per unique field whose composites are all set (`condition: attribute_not_exists(pk)`) |
+| Put — new item | Entity item + sentinel per unique field whose composites are all set (`condition: attribute_not_exists(pk)`) |
+| Put — over an existing item | Entity item (guarded by what was read) + for each changed value, release old sentinel + put new sentinel |
 | Update — composites unchanged | Entity item only (no sentinel ops) |
 | Update — undefined → defined | Entity item + put new sentinel |
-| Update — defined → undefined | Entity item + delete old sentinel |
-| Update — defined → defined (changed) | Entity item + delete old sentinel + put new sentinel |
-| Delete | Entity item + delete sentinel per unique field whose composites were set |
+| Update — defined → undefined | Entity item + release old sentinel |
+| Update — defined → defined (changed) | Entity item + release old sentinel + put new sentinel |
+| Delete | Entity item + release sentinel per unique field whose composites were set |
+
+A release is a `Delete` conditioned on the sentinel still naming this item
+(`_entity_pk` / `_entity_sk`), emitted only for a sentinel this item owns — see
+"Sentinel ownership" under §10 Fluent bound-CRUD builders.
 
 #### Optimistic Concurrency
 
@@ -1894,7 +2510,7 @@ db.Matches.create({ matchId: "m-2", venueId: "v-1", teams: [...], players: [...]
   → Denormalize: MatchVenue = { matchId, venueId, name: "MCG", city: "Melbourne", capacity: 100000 }
   → Decompose all edges into entity inputs
   → Transaction.transactWrite(
-      MatchEntity.put(rootItem),
+      MatchEntity.create(rootItem),          // attribute_not_exists — first item of the first transaction
       MatchVenueEntity.put({ matchId, venueId, name: "MCG", city: "Melbourne", capacity: 100000 }),
       MatchTeamEntity.put(team1),
       MatchTeamEntity.put(team2),
@@ -1902,6 +2518,22 @@ db.Matches.create({ matchId: "m-2", venueId: "v-1", teams: [...], players: [...]
       ...
     )
 ```
+
+**`create` is guarded on the root (#134).** The root item is the first Put of
+the first transaction, conditioned on `attribute_not_exists(pk)`. An existing
+aggregate cancels that transaction — nothing is written — and its cancellation
+reason maps to `ConditionalCheckFailed` (the root's `entityType`, `key`
+`{ pk, sk }`), never a raw `TransactionCancelled`. Edge, `many` and nested
+sub-aggregate rows carry no guard: they are written only after the root's
+transaction commits. Each sub-aggregate group remains its own transaction, so a
+later group that fails leaves the earlier groups written — exactly as before;
+the guard only makes the first transaction refuse. `update` and `delete` are
+unchanged. The guard sees the root only: orphan edge rows (a root-less
+partition left by a partial earlier write) don't stop `create`, and `get`
+merges them in; detecting them would cost a partition read on every create, so
+it is documented instead (`delete` the key first). `delete` retries the
+`UnprocessedItems` of its `BatchWriteItem`s with `Batch.write`'s backoff and
+bound (5 retries), then fails with a `DynamoError`.
 
 **Update with diff:**
 
@@ -1919,6 +2551,97 @@ db.Matches.update({ matchId: "m-1" }, mutation)
 ```
 
 **Transaction Decomposition:** Each sub-aggregate is a transactional unit, keeping transactions well within DynamoDB's 100-item limit.
+
+### Attribute Encoding (#72, #133)
+
+Decomposition works from the schema-decoded domain object, so every attribute it
+produces is a Type-side value. Each attribute is put into its schema's **wire
+form** before marshalling, through per-attribute encoders built at `make()` time.
+Marshalling a domain value directly stores a shape the read path cannot decode:
+a `DateTime` becomes a `{ epochMilliseconds, <type-id>, _tag }` map, a `Date`
+becomes `{M:{}}`, and a `bigint` becomes `{N:"5"}`.
+
+| Rule | Behaviour |
+|------|-----------|
+| **Which attributes** | Any field holding a wire transform **at any depth** (`containsWireTransform`): a leaf transform, a `Schema.Class`, a self date or `Redacted`, or an `Array` / `Struct` / `Union` / `Record` / `Tuple` containing one. Gating on the top-level AST (pre-#133) skipped every container, since an `Arrays` / `Objects` / `Union` node carries no encoding of its own; that included `Schema.optional(X)` and `NullOr(X)` around a transform. Fields with nothing to encode get no encoder and their bytes are unchanged. |
+| **One encoder per field** | A `storedAs` annotation or inferred date default wins, except for a union mixing a date with a non-date member (`Union([DateTimeUtcFromString, Number])`, `isMixedDateUnion`), whose non-date values a date encoder would throw on. Otherwise the field is encoded through the same substituted, tolerant schema the read path decodes it with (`substituteSchemaDeep` + the aggregate's ref resolver), falling back to the field's own `encode`, then `decode → encode`. |
+| **Which schema** | The schema the decomposed value actually has: the root model's fields for the root, a `one` edge's entity model (or the model field's own class when the edge has no entity), the array **element** for a `many` edge (`PlayerSheet`, not `Player`), a sub-aggregate's own schema for its root item. Encoders are keyed by the element's field names, so a custom `decompose` that **renames** fields escapes them: the renamed values are stored in domain form (a `DateTime` as a map). This is a known limitation; the read path still lifts those maps. |
+| **Per attribute, not per aggregate** | The aggregate is never encoded as a whole before decomposition: key composition needs Type-side values (`numericTypeWithStringEncoding`). |
+| **Union members** | `substituteSchemaDeep` walks `Union`, `Record`, `Tuple`, `TupleWithRest` and `StructWithRest` in every mode (`walkedContainer`), rebuilding each container kind around substituted children with the original node's annotations and `.check()` refinements (`withMetadataOf`). Under `tolerantTransforms` (aggregates) every transformed leaf is substituted; for entity derivation only self-date and `Redacted` leaves are. Union members follow the union rules in §8 (Self dates nested in containers): a self date accepts only its own wire kind, its domain or a legacy map; on a storage-kind collision only its exact canonical form, decoded first; an epoch date next to a numeric member is rejected (**EDD-9058**). The collision set propagates into nested unions. A transform date member keeps its own decode, so a stored `5` in `Union([DateTimeUtcFromString, Number])` stays a number. |
+| **Keys unchanged** | A `many` edge's `sk.composite` and the root's list-index composites are read from a second encoder set (`buildKeyAttrEncoders`) that keeps the pre-#133 top-level-only behaviour. Composed keys are therefore byte-identical to earlier versions; only stored attribute values gained the deeper encoding. |
+
+**Ref resolution.** `DynamoModel.ref` annotates with `Schema.annotate`, which
+drops a `Schema.Class`'s `.fields`, so the schema walker cannot recurse into an
+annotated ref. `collectRefTargets` registers each such field with the model it
+should be read (and encoded) as: root `one`/`ref` edge fields, opaque ref fields
+inside sub-aggregate edges and `many` elements (found by
+`deriveEntityFieldName`), a `many` field whose element *is* an opaque ref
+(`Schema.Array(X.pipe(DynamoModel.ref))`, re-pointed as a whole at
+`Schema.Array(<entity model>)` because the walker re-points fields, not
+elements), and refs nested in an edge entity's own model (#116). A
+plain-class element field is walked directly and needs no registration. Targets
+are keyed by **field schema identity**, not field name: the resolver is
+consulted at every depth, and a name-keyed table re-pointed any same-named field
+anywhere in the model.
+
+**Legacy maps on read.** Versions ≤1.22.0 stored nested `DateTime`s as marshalled
+maps. The tolerant date decoder (`liftToDomain`) rebuilds any plain object with a
+finite numeric `epochMilliseconds` and `_tag: "Utc"`, or `_tag: "Zoned"` with a
+recoverable named or offset `zone`, into a real `DateTime`. The type-id key is
+deliberately not inspected (`~effect/time/DateTime` on the rc, `~effect/DateTime`
+on 4.0.0). An object that duck-types as a `DateTime` but carries no recoverable
+instant is rejected rather than passed to the domain. There is no backfill: a
+legacy row is rewritten in wire form only when an `update` changes its
+decomposed group, because the diff compares decomposed (re-encoded) groups and a
+no-op update writes nothing.
+
+**Stored-type change.** Because the gate now looks through `optional` /
+`NullOr` and into refs, some attributes that ≤1.22.0 stored in domain form are
+now encoded: a top-level `optional` / `NullOr` around a non-date transform, and
+a `NumberFromString` inside a hydrated ref (`{N:"5"}` → `{S:"5"}`). Keys are
+unaffected (they use `buildKeyAttrEncoders`), and both forms decode, but a
+`list` `filter` / `filterBy` on such an attribute can match old and new rows
+differently, and Streams consumers see the type change. An `optional` /
+`NullOr` `BigIntFromString` stored as `{N}` by ≤1.22.0 was never readable,
+because unmarshalling yields a `number`. The tolerant transform
+(`buildTolerantTransform`) now lifts a safe-integer `number` to `bigint` for a
+bigint domain, so those rows read. Domain objects with no enumerable state
+(`Schema.Date`, `URL`, `Duration`, `BigDecimal`) were stored as maps holding no
+value and cannot be recovered.
+
+**Create input cloning.** `replaceRefIds` deep-copies the create input with
+`cloneInput` rather than `structuredClone`, which reduced every Effect data type
+to a bare object (a `DateTime` to `{ epochMilliseconds }`, a `Redacted` to `{}`,
+an `Option` lost its variant). Values implementing `Equal` are immutable and are
+kept by reference; built-ins `structuredClone` knows still go through it; plain
+objects, arrays and other class instances are copied to plain objects; cycles
+are preserved.
+
+### Nested Sub-Aggregates (#133)
+
+A `BoundSubAggregate` inside another sub-aggregate inherits the parent's
+discriminator, as a `one` edge does: `resolveNode` merges
+`{ ...parentDiscriminator, ...bound.discriminator }`, so the inner rows carry
+both attributes and assembly, which matches on the merged set, can tell the
+parent's bindings apart. On the write side the inner sort keys are prefixed with
+the parent's `name#value` pairs, and each nested sub-aggregate is its own
+transaction group, named by its path (`club2.squad`):
+
+```
+SK = $app#v1#leagueclub#clubno#1                        → club1 root
+SK = $app#v1#leaguesquad#clubno#1#squadno#1             → club1.squad root
+SK = $app#v1#leaguesquadplayer#clubno#1#squadno#1#p-1   → club1.squad.players[*]
+```
+
+(numeric values zero-padded in real keys). A sub-aggregate bound on the root has
+no parent discriminator, so depth-1 keys are unchanged. Before #133 depth-2 rows
+were written without the parent's values and could not be assembled
+(`Missing key at ["club"]["squad"]`); they are not read under the new keys.
+
+**EDD-9056.** `validateNestedDiscriminators` runs at `make()` and rejects a
+nested binding that declares a discriminator attribute it already inherits: the
+inner value would overwrite the outer one on the inner rows, so both bindings of
+the parent would key and assemble the inner sub-aggregate identically.
 
 ### Aggregate System Timestamps
 
@@ -2522,12 +3245,16 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | Error | Cause |
 |-------|-------|
 | `DynamoError` | AWS SDK error wrapper |
-| `ItemNotFound` | GetItem returned no item |
-| `ConditionalCheckFailed` | ConditionExpression failed |
-| `ValidationError` | Schema decode/encode failure |
+| `ItemNotFound` | No item: `get`, `update` of a missing item (unless a plain `.set()` of a complete item, which is created), `restore` without a tombstone |
+| `ConditionalCheckFailed` | A user `.condition()` failed, or an op's own guard did: `create()` of an existing item (or aggregate), `patch()` or `deleteIfExists()` of a missing item |
+| `ValidationError` | Schema decode/encode failure, or a refused operation: an item with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, a condition or filter with an empty part under `or` / `not` (or an `or()` with no parts, or an `isIn` with no values), `consistentRead` on a GSI, `expectedVersion` on an unversioned entity |
 | `TransactionCancelled` | Transaction failed with cancellation reasons |
-| `UniqueConstraintViolation` | Sentinel item already exists for unique field |
-| `OptimisticLockError` | Version mismatch on update |
+| `UniqueConstraintViolation` | Sentinel item already exists for unique field (from the entity's write, `transactWrite`, or an `append`'s `additionalItems`) |
+| `OptimisticLockError` | A versioned write lost a version race (`expectedVersion` mismatch, a concurrent write between a read-then-write update's read and write, or a guarded put / upsert / transaction put that lost the race on every attempt); carries the real `actualVersion` |
+| `ConcurrentModification` | An unversioned read-then-write write found an attribute it read changed before its write landed (or lost a guarded put's race on every attempt), or a unique sentinel it was releasing changed hands; nothing written (`attributes`, `current`) |
+| `TransactionOverflow` | A write's own transaction (item, sentinels, snapshot) would exceed 100 items |
+| `UpdateAppliedButUnreadable` | A retain update was applied at `version` but its result could not be read back provably; do not retry (`version`, `reason`) |
+| `ItemNotDeleted` | `restore` found a live item under the key alongside the tombstone |
 | `RefNotFound` | Referenced entity does not exist during hydration |
 | `AggregateAssemblyError` | Collection query returned unexpected/incomplete data |
 | `AggregateDecompositionError` | Decomposition produced items that fail schema validation |
@@ -2536,25 +3263,29 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `EmbeddingError` | `Embedder.embed` failed, or no `Embedder` was provided for an entity with vector indexes |
 | `VectorIndexBackfilling` | `SearchVectors` called while the vector index is still backfilling |
 
-### Error Type Narrowing
+### Declared Errors per Operation
 
-Operation signatures narrow error types based on Entity configuration:
+Each operation declares a fixed error union, whatever the entity's
+configuration: a `put` declares `UniqueConstraintViolation` even on an entity
+without unique constraints. Every union also includes `DynamoClientError`,
+plus `RefErrors` / `VectorErrors` where the entity has refs or vector indexes.
 
-```typescript
-const db = yield* DynamoClient.make(MainTable)
+| Operation | Declared errors (besides `DynamoClientError`) |
+|-----------|-----------------------------------------------|
+| `put` | `ValidationError`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `TransactionOverflow` |
+| `create` | as `put`, plus `ConditionalCheckFailed` |
+| `upsert` | as `put`, plus `ItemNotFound`, `ConditionalCheckFailed` |
+| `update` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `UpdateAppliedButUnreadable`, `UniqueConstraintViolation`, `ValidationError`, `TransactionOverflow` |
+| `patch` | as `update`, plus `ConditionalCheckFailed` |
+| `delete` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow`, `DeleteAppliedButUnreadable` |
+| `deleteIfExists` | as `delete`, plus `ConditionalCheckFailed` |
+| `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow` |
+| `purge` | `ValidationError` |
+| `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
+| `EventStore` `append` / `commandHandler` (plus the decider's errors) | `AppendError`: `VersionConflict`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 
-// Entity without unique constraints or versioning
-db.Users.put(input)
-// Effect<Entity.Record<E>, DynamoError, never>
-
-// Entity with unique constraints
-db.Users.put(input)
-// Effect<Entity.Record<E>, DynamoError | UniqueConstraintViolation, never>
-
-// Update with optimistic locking
-db.Users.update(key, changes, { expectedVersion: 5 })
-// Effect<Entity.Record<E>, DynamoError | ItemNotFound | OptimisticLockError, never>
-```
+`.condition()` adds `ConditionalCheckFailed` to an operation that lacks it.
 
 ---
 
@@ -2665,7 +3396,12 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9054` | `Query.ts` | A client-side predicate (`.filterBy()`) and a projection (`.select()`) are both active — the predicate is an opaque closure, so its attribute reads cannot be borrowed into the `ProjectionExpression` the way key attributes are, and it would be handed items missing the fields it tests |
 | `EDD-9055` | `KeyComposer.ts` (via `DynamoClient.ts`, `Collection.ts`) | A collection's members compose its keys with different casings (index `casing` vs schema `casing`) — they share one physical index, so their keys would never meet |
 
-Next free code: **`EDD-9056`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+| `EDD-9056` | `Aggregate.ts` | A nested sub-aggregate binding declares a discriminator attribute it already inherits from an enclosing binding — the inner value would overwrite the outer one on the inner rows, so the parent's bindings could no longer be told apart. Use a distinct attribute name (e.g. `{ squadNo: 1 }` inside `{ clubNo: 1 }`) |
+
+| `EDD-9057` | `internal/EntitySchemas.ts` | A `DynamoModel.configure` `storedAs` override on a union field with more than one self-date member — the override cannot say which member it applies to. Annotate the intended member with `.pipe(DynamoModel.storedAs(...))` instead |
+| `EDD-9058` | `internal/EntitySchemas.ts` | A union's self-date member is stored as an epoch number next to a member also stored as a number (`Number`, a number literal, `BigInt`, another epoch date) — a stored number could belong to either, so it cannot be read back reliably. On aggregates a member whose DOMAIN is numeric (`NumberFromString`, `BigIntFromString`) is rejected too, since `update` re-decodes domain values. Store the date as a string, or remove the numeric member |
+
+Next free code: **`EDD-9059`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 

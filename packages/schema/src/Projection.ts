@@ -34,8 +34,10 @@ export const projection = (attributes: ReadonlyArray<string>): ProjectionResult 
   const names: Record<string, string> = {}
   const parts: Array<string> = []
 
-  for (const attr of attributes) {
-    const placeholder = `#proj_${attr}`
+  for (const [index, attr] of attributes.entries()) {
+    // A placeholder may hold only letters, digits and underscores: a name with
+    // any other character (`first-name`, `a.b`) gets a numbered one.
+    const placeholder = /^[A-Za-z0-9_]+$/.test(attr) ? `#proj_${attr}` : `#projn${index}`
     names[placeholder] = attr
     parts.push(placeholder)
   }

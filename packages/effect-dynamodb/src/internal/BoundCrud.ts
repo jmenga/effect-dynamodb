@@ -55,6 +55,7 @@ import type {
   PathSetOp,
   PathSubtractOp,
   ReturnValuesMode,
+  UpdateReturn,
 } from "./EntityOps.js"
 import type { ConditionOps, Expr } from "./Expr.js"
 import { parseSimpleShorthand } from "./Expr.js"
@@ -213,7 +214,7 @@ export class BoundPutImpl<Model, A, E, VN extends string = string>
  * yield* db.entities.Tasks.delete({ taskId }).returnValues("allOld")
  * ```
  */
-export interface BoundDelete<Model, E> extends Pipeable.Pipeable {
+export interface BoundDelete<Model, E, A = void> extends Pipeable.Pipeable {
   readonly [BoundOpTypeId]: BoundOpTypeId
   readonly _boundOpType: "delete"
   /**
@@ -223,37 +224,48 @@ export interface BoundDelete<Model, E> extends Pipeable.Pipeable {
    * rejecting the condition is the failure this combinator makes reachable, so
    * `Effect.catchTag("ConditionalCheckFailed", ...)` type-checks downstream.
    */
-  readonly condition: (cond: ConditionArg<Model>) => BoundDelete<Model, E | ConditionalCheckFailed>
-  /** Set ReturnValues mode (`"none"` or `"allOld"`). */
-  readonly returnValues: (mode: ReturnValuesMode) => BoundDelete<Model, E>
+  readonly condition: (
+    cond: ConditionArg<Model>,
+  ) => BoundDelete<Model, E | ConditionalCheckFailed, A>
+  /**
+   * Set ReturnValues mode: `"allOld"` returns the item the delete removed
+   * (`undefined` when there was none); `"none"` returns nothing. DynamoDB has no
+   * other mode for a delete: any other fails with a `ValidationError` before
+   * anything is sent.
+   */
+  readonly returnValues: <M extends ReturnValuesMode>(
+    mode: M,
+  ) => BoundDelete<Model, E, M extends "allOld" ? Model | undefined : void>
   /** Convert to an executable Effect for Effect combinator interop. */
-  readonly asEffect: () => Effect.Effect<void, E, never>
+  readonly asEffect: () => Effect.Effect<A, E, never>
   /** Yield support for `Effect.gen`. */
-  readonly [Symbol.iterator]: () => Iterator<Effect.Effect<void, E, never>, void>
+  readonly [Symbol.iterator]: () => Iterator<Effect.Effect<A, E, never>, A>
 }
 
 /** @internal */
-export class BoundDeleteImpl<Model, E> implements BoundDelete<Model, E> {
+export class BoundDeleteImpl<Model, E, A = void> implements BoundDelete<Model, E, A> {
   readonly [BoundOpTypeId]: BoundOpTypeId = BoundOpTypeId as BoundOpTypeId
   readonly _boundOpType = "delete" as const
   constructor(
-    readonly _op: EntityDelete<E, any>,
+    readonly _op: EntityDelete<E, any, any, any>,
     readonly _config: BoundCrudConfig<Model>,
   ) {}
 
-  condition(cond: ConditionArg<Model>): BoundDeleteImpl<Model, E | ConditionalCheckFailed> {
+  condition(cond: ConditionArg<Model>): BoundDeleteImpl<Model, E | ConditionalCheckFailed, A> {
     const compiled = buildCondition(this._config, cond)
     const next = conditionCombinator(this._op, compiled)
-    return new BoundDeleteImpl<Model, E | ConditionalCheckFailed>(next, this._config)
+    return new BoundDeleteImpl<Model, E | ConditionalCheckFailed, A>(next as any, this._config)
   }
 
-  returnValues(mode: ReturnValuesMode): BoundDeleteImpl<Model, E> {
+  returnValues<M extends ReturnValuesMode>(
+    mode: M,
+  ): BoundDeleteImpl<Model, E, M extends "allOld" ? Model | undefined : void> {
     const next = returnValuesCombinator(this._op, mode)
-    return new BoundDeleteImpl(next, this._config)
+    return new BoundDeleteImpl(next as any, this._config)
   }
 
-  asEffect(): Effect.Effect<void, E, never> {
-    return this._config.provide(this._op.asEffect())
+  asEffect(): Effect.Effect<A, E, never> {
+    return this._config.provide(this._op.asEffect()) as Effect.Effect<A, E, never>
   }
 
   [Symbol.iterator]() {
@@ -311,9 +323,10 @@ export interface BoundUpdate<Model, A, U, E, VN extends string = string> extends
    * rejecting the condition is the failure this combinator makes reachable, so
    * `Effect.catchTag("ConditionalCheckFailed", ...)` type-checks downstream.
    *
-   * Note: when `.expectedVersion(...)` is also set, a rejection is reported as
-   * `OptimisticLockError` — the two conditions ride the same
-   * `ConditionExpression` and DynamoDB does not say which half failed.
+   * Note: when `.expectedVersion(...)` is also set (or the update is a
+   * version-checked read-then-write), the stored item DynamoDB returns on the
+   * rejection tells the two apart: a version race is an `OptimisticLockError`,
+   * a failed condition a `ConditionalCheckFailed`.
    */
   readonly condition: (
     cond: ConditionArg<Model>,
@@ -324,8 +337,15 @@ export interface BoundUpdate<Model, A, U, E, VN extends string = string> extends
    * name declared on `Entity.make({ vectorIndexes })`.
    */
   readonly withVector: (name: VN, vector: ReadonlyArray<number>) => BoundUpdate<Model, A, U, E, VN>
-  /** Set ReturnValues mode. */
-  readonly returnValues: (mode: ReturnValuesMode) => BoundUpdate<Model, A, U, E, VN>
+  /**
+   * What the update returns. `"allNew"` (the default) / `"allOld"`: the whole
+   * item after / before it. `"updatedNew"` / `"updatedOld"`: only the
+   * top-level attributes the update wrote, after / before it, as a partial
+   * model. `"none"`: `undefined`. Exact on every update path.
+   */
+  readonly returnValues: <M extends ReturnValuesMode>(
+    mode: M,
+  ) => BoundUpdate<Model, UpdateReturn<Model, M>, U, E, VN>
   /** Configure cascade updates to denormalized target entities. */
   readonly cascade: (config: {
     readonly targets: ReadonlyArray<CascadeTarget>
@@ -429,8 +449,19 @@ export class BoundUpdateImpl<Model, A, U, E, VN extends string = string>
     return this._with(withVectorCombinator(this._op, name, vector))
   }
 
-  returnValues(mode: ReturnValuesMode): BoundUpdateImpl<Model, A, U, E, VN> {
-    return this._with(returnValuesCombinator(this._op, mode))
+  returnValues<M extends ReturnValuesMode>(
+    mode: M,
+  ): BoundUpdateImpl<Model, UpdateReturn<Model, M>, U, E, VN> {
+    return new BoundUpdateImpl(
+      returnValuesCombinator(this._op, mode) as unknown as EntityUpdate<
+        UpdateReturn<Model, M>,
+        any,
+        U,
+        E,
+        any
+      >,
+      this._config,
+    )
   }
 
   cascade(config: {
@@ -616,7 +647,7 @@ export const makeBoundPut = <Model, A, E, VN extends string = string>(
 
 /** @internal */
 export const makeBoundDelete = <Model, E>(
-  op: EntityDelete<E, any>,
+  op: EntityDelete<E, any, any, any>,
   config: BoundCrudConfig<Model>,
 ): BoundDelete<Model, E> => new BoundDeleteImpl(op, config)
 

@@ -12,6 +12,8 @@ import { beforeEach, describe, expect, vi } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Expression from "../src/Expression.js"
+import { itemBytes, transactItemBytes } from "../src/internal/ItemSize.js"
+import { refuseOversizedTransaction, transactItemTarget } from "../src/internal/TransactWriteOps.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
@@ -184,8 +186,17 @@ const MainTable = Table.make({
 
 const mockTransactGetItems = vi.fn()
 const mockTransactWriteItems = vi.fn()
+const mockGetItem = vi.fn()
 
 const TestDynamoClient = mockDynamoClientLayer({
+  // A guarded put (versioned / unique) reads its item; unanswered, it is missing.
+  getItem: (input) =>
+    Effect.tryPromise({
+      try: async () => (await mockGetItem(input)) ?? {},
+      catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
+    }),
+  // …and a missing retain item looks for its retained history: none.
+  query: () => Effect.succeed({ Items: [] } as any),
   transactGetItems: (input) =>
     Effect.tryPromise({
       try: () => mockTransactGetItems(input),
@@ -914,7 +925,10 @@ describe("Transaction", () => {
 
         const snapshot = fromAttributeMap(items[2].Put.Item)
         expect(snapshot.sk).toBe("$myapp#v1#lifecyclemember#v#0000001")
-        expect(items[2].Put.ConditionExpression).toBeUndefined()
+        // Never over another incarnation's history (#133).
+        expect(items[2].Put.ConditionExpression).toMatch(/^attribute_not_exists\(#snap\) OR /)
+        // The item was read missing: it must still be missing (#133).
+        expect(items[0].Put.ConditionExpression).toBe("attribute_not_exists(#pk)")
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -1030,6 +1044,287 @@ describe("Transaction", () => {
           expect(items).toHaveLength(1)
         }).pipe(Effect.provide(TestLayer)),
     )
+  })
+
+  it.effect("a transacted op keeps its own guard whatever .condition() is added (#133)", () =>
+    Effect.gen(function* () {
+      mockTransactWriteItems.mockResolvedValue({})
+      const db = yield* DynamoClient.make({
+        entities: { UserEntity, OrderEntity },
+        tables: { MainTable },
+      })
+      const input = { userId: "u-g", email: "g@x.io", name: "G", role: "member" } as const
+      const notExists = "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))"
+      yield* Transaction.transactWrite([
+        UserEntity.create(input).pipe(
+          UserEntity.condition({ name: "a" }),
+          UserEntity.condition({}),
+        ),
+        db.entities.OrderEntity.deleteIfExists({ orderId: "o-g" })
+          .condition({ status: "shipped" })
+          .condition({}),
+      ])
+      const [put, del] = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+      expect(put.Put.ConditionExpression).toBe(notExists)
+      expect(put.Put.ExpressionAttributeNames).toEqual({ "#e0": "pk", "#e1": "sk" })
+      expect(del.Delete.ConditionExpression).toBe("attribute_exists(#e0)")
+      expect(del.Delete.ExpressionAttributeNames).toEqual({ "#e0": "pk" })
+      yield* Transaction.transactWrite([
+        db.entities.UserEntity.create(input).condition({ name: "G" }),
+      ])
+      const guarded = mockTransactWriteItems.mock.calls[1]![0].TransactItems[0].Put
+      expect(guarded.ConditionExpression).toBe(`(${notExists}) AND (#e2 = :e3)`)
+      expect(guarded.ExpressionAttributeNames).toEqual({ "#e0": "pk", "#e1": "sk", "#e2": "name" })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("a Transaction.check with an empty condition is refused (#134)", () =>
+    Effect.gen(function* () {
+      const error = yield* Transaction.transactWrite([
+        Transaction.check(UserEntity.get({ userId: "u-1" }), Expression.condition({})),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(mockTransactWriteItems).not.toHaveBeenCalled()
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("an empty part under or or not in a transacted condition is refused (#133)", () =>
+    Effect.gen(function* () {
+      const input = { userId: "u-r", email: "r@x.io", name: "R", role: "member" } as const
+      for (const cond of [
+        UserEntity.condition((t, { or, eq, and }) => or(eq(t.name, "a"), and())),
+        UserEntity.condition((_, { not, and }) => not(and())),
+        UserEntity.condition((_, { or }) => or()),
+      ]) {
+        const error = yield* Transaction.transactWrite([UserEntity.put(input).pipe(cond)]).pipe(
+          Effect.flip,
+        )
+        expect(error._tag).toBe("ValidationError")
+      }
+      expect(mockTransactWriteItems).not.toHaveBeenCalled()
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("an empty condition on a transaction op is no condition (#133)", () =>
+    Effect.gen(function* () {
+      mockTransactWriteItems.mockResolvedValueOnce({})
+      yield* Transaction.transactWrite([
+        UserEntity.put({ userId: "u-e", email: "e@x.io", name: "E", role: "member" }).pipe(
+          UserEntity.condition({}),
+        ),
+        OrderEntity.delete({ orderId: "o-e" }).pipe(OrderEntity.condition({})),
+      ])
+      const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+      expect(items[0].Put.ConditionExpression).toBeUndefined()
+      expect(items[1].Delete.ConditionExpression).toBeUndefined()
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  describe("one op per item: a repeated item is refused before writing (#133)", () => {
+    const user = (userId: string, name: string) =>
+      ({ userId, email: `${userId}@x.io`, name, role: "member" }) as const
+
+    it.effect("two ops on one plain item are refused, and nothing is written", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([
+          UserEntity.put(user("u-1", "A")),
+          UserEntity.delete({ userId: "u-1" }),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.entityType).toBe("User")
+        expect(String(failure.cause)).toContain("touches one item more than once")
+        expect(String(failure.cause)).toMatch(/operation 0 \(User\) and operation 1 \(User\)/)
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("two puts of one versioned retain item are refused, not judged a lost race", () =>
+      Effect.gen(function* () {
+        const member = (label: string) => ({ memberId: "m-9", email: "m9@x.io", label })
+        const error = yield* Transaction.transactWrite([
+          LifecycleMembers.put(member("a")),
+          LifecycleMembers.put(member("b")),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).entityType).toBe("LifecycleMember")
+        expect(String((error as ValidationError).cause)).toContain(
+          "touches one item more than once",
+        )
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("swapping unique values between two items repeats a sentinel and is refused", () =>
+      Effect.gen(function* () {
+        // Both items exist, each holding (and owning) its own value's sentinel.
+        const stored: Record<string, Record<string, unknown>> = {
+          "$myapp#v1#sparsemember#memberid_s-1": { memberId: "s-1", email: "s1@x.io" },
+          "$myapp#v1#sparsemember#memberid_s-2": { memberId: "s-2", email: "s2@x.io" },
+        }
+        const owners: Record<string, string> = {
+          "$myapp#v1#sparsemember.email#s1@x.io": "$myapp#v1#sparsemember#memberid_s-1",
+          "$myapp#v1#sparsemember.email#s2@x.io": "$myapp#v1#sparsemember#memberid_s-2",
+        }
+        mockGetItem.mockImplementation(async (input: any) => {
+          const pk = input.Key.pk.S as string
+          if (input.ProjectionExpression === "#epk, #esk") {
+            const owner = owners[pk]
+            return owner === undefined
+              ? {}
+              : {
+                  Item: toAttributeMap({ _entity_pk: owner, _entity_sk: "$myapp#v1#sparsemember" }),
+                }
+          }
+          const item = stored[pk]
+          return item === undefined
+            ? {}
+            : {
+                Item: toAttributeMap({
+                  ...item,
+                  label: "L",
+                  pk,
+                  sk: "$myapp#v1#sparsemember",
+                  __edd_e__: "SparseMember",
+                }),
+              }
+        })
+        const error = yield* Transaction.transactWrite([
+          SparseMembers.put({ memberId: "s-1", email: "s2@x.io", label: "L" }),
+          SparseMembers.put({ memberId: "s-2", email: "s1@x.io", label: "L" }),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).entityType).toBe("SparseMember")
+        expect(String((error as ValidationError).cause)).toContain(
+          "touches one item more than once",
+        )
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("distinct items in one transaction are written as before", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        yield* Transaction.transactWrite([
+          UserEntity.put(user("u-1", "A")),
+          UserEntity.delete({ userId: "u-2" }),
+          OrderEntity.delete({ orderId: "u-1" }),
+        ])
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  describe("a transaction over DynamoDB's 4 MB is refused before writing (#133)", () => {
+    const big = "x".repeat(380_000)
+    const user = (i: number) =>
+      ({ userId: `u-${i}`, email: `u${i}@x.io`, name: big, role: "member" }) as const
+    const member = (i: number) => ({ memberId: `m-${i}`, email: `m${i}@x.io`, label: big })
+
+    it.effect("items totalling more than 4 MB are refused, naming the largest", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite(
+          Array.from({ length: 12 }, (_, i) => UserEntity.put(user(i))),
+        ).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.entityType).toBe("User")
+        expect(String(failure.cause)).toContain("over its limit of 4194304 bytes (4 MB)")
+        expect(String(failure.cause)).toMatch(/The largest is operation \d+ \(User\)'s/)
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a retain put counts twice: its item and its snapshot", () =>
+      Effect.gen(function* () {
+        // Six 380 KB items: 2.3 MB as plain puts — written…
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        yield* Transaction.transactWrite(
+          Array.from({ length: 6 }, (_, i) => UserEntity.put(user(i))),
+        )
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        // …but 4.6 MB as retain puts, each snapshotted in the same transaction.
+        const error = yield* Transaction.transactWrite(
+          Array.from({ length: 6 }, (_, i) => LifecycleMembers.put(member(i))),
+        ).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).entityType).toBe("LifecycleMember")
+        expect(String((error as ValidationError).cause)).toContain("counts twice")
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("the limit is exactly 4 MB by DynamoDB's item-size rules", () =>
+      Effect.gen(function* () {
+        // An item of one attribute `a`: 1 byte of name plus its value.
+        const put = (bytes: number) => ({
+          Put: { TableName: "t", Item: { a: { S: "x".repeat(bytes - 1) } } },
+        })
+        const target = transactItemTarget(put(2), "t", ["a"], "Doc", "operation 0 (Doc)")
+        yield* refuseOversizedTransaction([put(4 * 1024 * 1024)], [target], "transactWrite")
+        const over = yield* refuseOversizedTransaction(
+          [put(4 * 1024 * 1024 + 1)],
+          [target],
+          "transactWrite",
+        ).pipe(Effect.flip)
+        expect(over._tag).toBe("ValidationError")
+        expect(String(over.cause)).toContain("total at least 4194305 bytes")
+      }),
+    )
+
+    it.effect("numbers count as DynamoDB stores them: 25 lists of 12,000 floats fit", () =>
+      Effect.gen(function* () {
+        // ~2.9 MB as DynamoDB counts it (a byte per two significant digits,
+        // plus one); counted by digits it read as 5.5 MB and was refused.
+        const vec = Array.from({ length: 12_000 }, (_, i) => ({
+          N: String(0.1234567890123 + i * 1e-13),
+        }))
+        const items = Array.from({ length: 25 }, (_, i) => ({
+          Put: { TableName: "t", Item: { pk: { S: `p${i}` }, vec: { L: vec } } },
+        }))
+        const targets = items.map((item, i) =>
+          transactItemTarget(item, "t", ["pk"], "Vec", `operation ${i} (Vec)`),
+        )
+        yield* refuseOversizedTransaction(items, targets, "transactWrite")
+      }),
+    )
+
+    it("number sizes trim leading and trailing zeros and count digit pairs", () => {
+      const n = (value: string) => itemBytes({ a: { N: value } }) - 1
+      expect(n("5")).toBe(2)
+      expect(n("12")).toBe(2)
+      expect(n("123")).toBe(3)
+      expect(n("-0.00012300")).toBe(3)
+      expect(n("1000000")).toBe(2)
+      expect(n("0.1234567890123")).toBe(8)
+      expect(n("1e+21")).toBe(2)
+      // Zero has no significant digits: one byte.
+      expect(n("0")).toBe(1)
+      expect(n("-0.000")).toBe(1)
+      // The batch budget keeps its higher count.
+      expect(itemBytes({ a: { N: "0.1234567890123" } }, "upper")).toBeGreaterThan(9)
+    })
+
+    it("an Update counts only its key: its values may be the condition's", () => {
+      expect(
+        transactItemBytes({
+          Update: {
+            TableName: "t",
+            Key: { pk: { S: "abc" } },
+            UpdateExpression: "SET #a = :a",
+            ConditionExpression: "#b = :b",
+            ExpressionAttributeNames: { "#a": "a", "#b": "b" },
+            ExpressionAttributeValues: { ":a": { S: "x" }, ":b": { S: "y".repeat(1000) } },
+          },
+        }),
+      ).toBe(5)
+    })
+
+    it("item sizes count attribute names, UTF-8 strings and raw binary", () => {
+      expect(itemBytes({ ab: { S: "é" } })).toBe(4)
+      expect(itemBytes({ b: { B: new Uint8Array(10) } })).toBe(11)
+      expect(transactItemBytes({ Delete: { TableName: "t", Key: { pk: { S: "abc" } } } })).toBe(5)
+    })
   })
 
   describe("unsupported ops are rejected, not silently reinterpreted (#100)", () => {

@@ -88,6 +88,43 @@ Available date schemas: `DynamoModel.DateString` (ISO), `DynamoModel.DateEpochMs
 
 Applying `storedAs(DynamoModel.DateEpochSeconds)` on top of `Schema.DateTimeUtcFromString` (which already encodes to a string) used to silently override the transform's wire format. After the codec direction fix in v1.4, this combination raises a clear error at `Entity.make()` time. Migrate to a self schema (`Schema.DateTimeUtc.pipe(DynamoModel.storedAs(...))`) or drop the override.
 
+#### Dates nested in containers
+
+A self date schema is stored in its wire form wherever it sits in the model: at the top level, in a `Schema.Struct` or `Schema.Class`, in an array, and also in a container such as these:
+
+- a `Schema.NullOr` or other union, such as `Schema.NullOr(Schema.DateTimeUtc)`
+- a nullable class, such as `Schema.NullOr(Stamp)`, where `Stamp` has a date field
+- an array of a union, such as `Schema.Array(Schema.NullOr(Schema.DateTimeUtc))`
+- a `Schema.Record` value, such as `Schema.Record(Schema.String, Schema.DateTimeUtc)`
+- a `Schema.Tuple`, `Schema.TupleWithRest` or `Schema.StructWithRest`
+
+A `storedAs` annotation applies there too, so `Schema.NullOr(Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)))` stores a number. A `DynamoModel.configure` `storedAs` override on a union field applies to the union's date member. If the union has more than one date member, the override can't say which one it means, and `Entity.make()` rejects it with `EDD-9057`; annotate the intended member with `.pipe(DynamoModel.storedAs(...))` instead. Transform schemas such as `Schema.DateTimeUtcFromString` already owned their wire form in every container and are unchanged.
+
+#### Dates in unions
+
+A union is read back by trying its members, so a stored value must not be claimable by two of them.
+
+- **A date stored as a string next to a string member.** In `Schema.Union([Schema.DateTimeUtc, Schema.String])`, the date member claims only the exact ISO string the library writes for a date, and it is tried first. A string such as `"2020"`, `"5"` or `"hello"` reads back as a string. A string that happens to be a canonical ISO instant, such as `"2000-01-01T00:00:00.000Z"`, reads back as a `DateTime`. If a string field may legitimately hold ISO instants, use a tagged or discriminated shape instead of a bare union. The same rule applies through nested unions, such as `Schema.Union([Schema.NullOr(Schema.DateTimeUtc), Schema.String])`.
+- **A date stored as a number next to a numeric member.** A date stored as epoch milliseconds or seconds next to `Schema.Number`, a number literal, `Schema.BigInt` or another epoch date can't be told apart from that member at all, so `Entity.make()` rejects it with `EDD-9058`. Store the date as a string (the default for a self date), or remove the numeric member. On an entity, `Schema.NumberFromString` and `Schema.BigIntFromString` are stored as strings, so they don't collide. An aggregate also rejects those two, because it re-decodes domain values on `update`, where their domain value is a number (see [Aggregates](/effect-dynamodb/guides/aggregates/#how-values-are-stored)).
+
+#### Zoned dates
+
+A zoned field, either `DynamoModel.DateTimeZoned` or a self `Schema.DateTimeZoned`, is stored as an ISO string with its zone, and read back with the same zone: a named zone as `2025-01-01T19:00:00.000+09:00[Asia/Tokyo]`, an offset zone as `2025-01-01T15:00:00.000+05:00`. That holds wherever the field sits, on entities and aggregates. Versions up to 1.22.0 read an offset zone back as UTC. The stored form is unchanged.
+
+Offsets that aren't whole minutes, such as historical local-mean-time offsets or a sub-minute `DateTime.zoneMakeOffset`, are rounded to the minute by Effect's ISO format, and the instant read back moves by the same amount. Earlier versions behaved the same way.
+
+#### Container checks
+
+A `.check()` refinement on an array, a struct or a class built over a checked struct is enforced on every write when the container holds a date or another value the library substitutes, for example `Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(1))`. That covers `put`, `create`, `update` and `.set()`, path operations, `.append()`, Batch and Transaction. A violating value fails with a `ValidationError`. Earlier versions silently dropped these checks, so rows that break them may already exist. Reads don't enforce them, so those rows still read, and the next write that sets the field to a valid value repairs them.
+
+:::caution[Upgrading from 1.22.0 or earlier]
+Earlier versions stopped at unions, records and tuples, so a self date inside one was stored as a marshalled `DateTime` map (`{ epochMilliseconds, "~effect/DateTime", _tag: "Utc" }`). Those rows still read back, as real `DateTime` values, and are rewritten in wire form when the attribute is next written. Keys are not affected.
+
+The new stored form can't be read by 1.22.0. A 1.22.0 reader fails with `Expected DateTime.Utc` on a self date written as a string inside a `NullOr`, `Record` or `Tuple`. Inside a union with a string member, it reads the date back as a plain string. **Upgrade every reader before any writer, and don't roll back past this version** once new rows are written.
+
+Until old rows are rewritten, the attribute is a map (`M`) on old rows and a string or number on new ones. A filter on it can therefore match the two differently, and DynamoDB Streams consumers see the type change.
+:::
+
 ### Immutable Fields
 
 Mark fields as read-only after creation. Immutable fields are present in `Entity.Input` (you provide them on creation) and `Entity.Record` (you can read them), but excluded from `Entity.Update`:
@@ -100,6 +137,8 @@ const EmployeeModel = DynamoModel.configure(Employee, {
 ```
 
 Primary key composite attributes are inherently immutable — you don't need to mark them.
+
+An update may restate an immutable field with its current value, so spreading a whole record into `.set()` works. A `.set()` with a different value fails with a `ValidationError`, as does a `.set()` that changes a primary-key composite. Earlier versions silently ignored the latter.
 
 ### Identifier and Ref
 
@@ -332,6 +371,17 @@ unique: {
 ```
 
 See [Data Integrity](/effect-dynamodb/guides/data-integrity/) for details.
+
+### Decoding Defaults
+
+A field declared with `Schema.withDecodingDefault` can be left out of a `put`. The returned record and every later read carry the default. Whether the default is stored depends on the field:
+
+- **A primary-key or index composite** is stored with its default, and its keys are composed from it, so the item is indexed under the value it reads back with. A `.remove()` of such a field stores the default again and keeps the item indexed under it.
+- **Any other field** is not stored. The default is applied on read.
+
+An `upsert` that omits a defaulted index composite reads the item first: it stores the default only when it creates the item, and otherwise keeps the stored value.
+
+A default never creates a unique-constraint sentinel. A defaulted unique field that is also an index composite is listed in a hidden string-set attribute, `__edd_d__`, until a write supplies its value. See [Defaults and Unique Constraints](/effect-dynamodb/guides/data-integrity/#defaults-and-unique-constraints).
 
 ## Derived Types
 

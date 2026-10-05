@@ -15,7 +15,9 @@ export {
   CascadePartialFailure,
   CompositeKeyHoleError,
   CompositeNullableError,
+  ConcurrentModification,
   ConditionalCheckFailed,
+  DeleteAppliedButUnreadable,
   DuplicateCommand,
   DynamoError,
   DynamoValidationError,
@@ -35,6 +37,7 @@ export {
   TransactionCancelled,
   TransactionOverflow,
   UniqueConstraintViolation,
+  UpdateAppliedButUnreadable,
   ValidationError,
   VectorIndexBackfilling,
   VersionConflict,
@@ -71,13 +74,17 @@ export type {
   VectorSourceConfig,
 } from "@effect-dynamodb/schema/VectorIndex.js"
 export * as VectorIndex from "@effect-dynamodb/schema/VectorIndex.js"
-export type { BoundAggregate } from "./Aggregate.js"
+export type { AggregateCreateError, AggregateWriteError, BoundAggregate } from "./Aggregate.js"
 export * as Aggregate from "./Aggregate.js"
 export type { BatchRetryConfig } from "./Batch.js"
 export * as Batch from "./Batch.js"
 export type { Collection as CollectionType } from "./Collection.js"
 export * as Collection from "./Collection.js"
 export type {
+  CollectionAccessors,
+  CollectionQuery,
+  CollectionSelected,
+  CollectionStreamItem,
   DynamoClientError,
   DynamoClientService,
   TableLike,

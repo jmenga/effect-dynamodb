@@ -431,7 +431,7 @@ const mockService = mockDynamoClient({
     }),
   getItem: (input) =>
     Effect.tryPromise({
-      try: () => mockGetItem(input),
+      try: async () => (await mockGetItem(input)) ?? {},
       catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
     }),
   updateItem: (input) =>

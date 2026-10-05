@@ -33,11 +33,38 @@ import { DateTime, Duration, Effect, Layer, Schema } from "effect"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
-import { mockDynamoClient, mockOutput } from "./helpers/MockDynamoClient.js"
+import { applyUpdate, mockDynamoClient, mockOutput } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Mock client capture helpers
 // ---------------------------------------------------------------------------
+
+// Pretend the stored item has the full hierarchy populated.
+const storedAsset: Record<string, AttributeValue> = {
+  pk: { S: "$app#v1#asset#a-1" } as AttributeValue,
+  sk: { S: "$app#v1#asset" } as AttributeValue,
+  assetId: { S: "a-1" } as AttributeValue,
+  region: { S: "americas" } as AttributeValue,
+  country: { S: "us" } as AttributeValue,
+  city: { S: "sf" } as AttributeValue,
+  site: { S: "datacenter-1" } as AttributeValue,
+  gsi1pk: { S: "$app#v1#asset#region_americas" } as AttributeValue,
+  gsi1sk: {
+    S: "$app#v1#asset#country_us#city_sf#site_datacenter-1",
+  } as AttributeValue,
+  version: { N: "1" } as AttributeValue,
+  __edd_e__: { S: "Asset" } as AttributeValue,
+  createdAt: { S: "2026-01-01T00:00:00.000Z" } as AttributeValue,
+  updatedAt: { S: "2026-01-01T00:00:00.000Z" } as AttributeValue,
+}
+
+/** The item a read-then-write update leaves: its guarded Update applied to the stored item. */
+const writtenItem = (tx: unknown): Record<string, AttributeValue> =>
+  applyUpdate(
+    storedAsset,
+    (tx as { TransactItems: Array<{ Update: Parameters<typeof applyUpdate>[1] }> })
+      .TransactItems[0]!.Update,
+  )!
 
 type Capture = {
   updateItem?: UpdateItemCommandInput
@@ -49,24 +76,7 @@ const makeMockClient = (capture: Capture): DynamoClientService =>
     getItem: () =>
       Effect.succeed(
         mockOutput<GetItemCommandOutput>({
-          Item: {
-            // Pretend the stored item has the full hierarchy populated.
-            pk: { S: "$app#v1#asset#a-1" } as AttributeValue,
-            sk: { S: "$app#v1#asset" } as AttributeValue,
-            assetId: { S: "a-1" } as AttributeValue,
-            region: { S: "americas" } as AttributeValue,
-            country: { S: "us" } as AttributeValue,
-            city: { S: "sf" } as AttributeValue,
-            site: { S: "datacenter-1" } as AttributeValue,
-            gsi1pk: { S: "$app#v1#asset#region_americas" } as AttributeValue,
-            gsi1sk: {
-              S: "$app#v1#asset#country_us#city_sf#site_datacenter-1",
-            } as AttributeValue,
-            version: { N: "1" } as AttributeValue,
-            __edd_e__: { S: "Asset" } as AttributeValue,
-            createdAt: { S: "2026-01-01T00:00:00.000Z" } as AttributeValue,
-            updatedAt: { S: "2026-01-01T00:00:00.000Z" } as AttributeValue,
-          },
+          Item: storedAsset,
         }),
       ),
     updateItem: (input) => {
@@ -166,8 +176,7 @@ describe("Entity update — indexPolicy v1.7.1 wiring (retain path)", () => {
         expect(tx).toBeDefined()
         const items = (tx as { TransactItems?: Array<unknown> }).TransactItems
         expect(items?.length).toBeGreaterThan(0)
-        const mainPut = items?.[0] as { Put?: { Item?: Record<string, AttributeValue> } }
-        const item = mainPut.Put?.Item
+        const item = writtenItem(tx)
         expect(item).toBeDefined()
         // gsi1pk preserved (region untouched). v1.7.1 critical assertion.
         expect(item!.gsi1pk).toBeDefined()
@@ -194,9 +203,7 @@ describe("Entity update — indexPolicy v1.7.1 wiring (retain path)", () => {
         })
         yield* db.entities.Assets.update({ assetId: "a-1" }).remove(["country"])
         const tx = capture.transactWriteItems
-        const item = (
-          tx as { TransactItems: Array<{ Put: { Item: Record<string, AttributeValue> } }> }
-        ).TransactItems[0]!.Put.Item
+        const item = writtenItem(tx)
         // gsi1pk preserved (region untouched).
         expect(item.gsi1pk).toBeDefined()
         // gsi1sk REMOVE'd via per-half cascade override (preserve + can't-
@@ -216,9 +223,7 @@ describe("Entity update — indexPolicy v1.7.1 wiring (retain path)", () => {
       })
       yield* db.entities.Assets.update({ assetId: "a-1" }).remove(["region"])
       const tx = capture.transactWriteItems
-      const item = (
-        tx as { TransactItems: Array<{ Put: { Item: Record<string, AttributeValue> } }> }
-      ).TransactItems[0]!.Put.Item
+      const item = writtenItem(tx)
       // gsi1pk REMOVE'd via per-half cascade override (preserve + can't-
       // compose + region in removedSet).
       expect(item.gsi1pk).toBeUndefined()
@@ -244,9 +249,7 @@ describe("Entity update — indexPolicy v1.7.1 wiring (retain path)", () => {
           .set({ country: "us", city: "sf" })
           .remove(["site"])
         const tx = capture.transactWriteItems
-        const item = (
-          tx as { TransactItems: Array<{ Put: { Item: Record<string, AttributeValue> } }> }
-        ).TransactItems[0]!.Put.Item
+        const item = writtenItem(tx)
         // gsi1pk preserved (region untouched, not in payload, not in removedSet).
         expect(item.gsi1pk).toBeDefined()
         // gsi1sk SET to truncated leading prefix [country, city].

@@ -1686,6 +1686,49 @@ describe("KeyComposer", () => {
   })
 })
 
+describe("composeHistoryItemSegment (#133)", () => {
+  const schema = DynamoSchema.make({ name: "app", version: 1 })
+  const primary = (sk: ReadonlyArray<string>, extra: Record<string, unknown> = {}) =>
+    ({
+      pk: { field: "pk", composite: ["tenant"] },
+      sk: { field: "sk", composite: sk },
+      ...extra,
+    }) as KeyComposer.IndexDefinition
+  const live = (index: KeyComposer.IndexDefinition, record: Record<string, unknown>) =>
+    KeyComposer.composeSk(schema, "Task", 1, index, record)
+
+  it("is undefined without sort key composites", () => {
+    const index = primary([])
+    expect(KeyComposer.composeHistoryItemSegment(schema, "Task", 1, index, live(index, {}))).toBe(
+      undefined,
+    )
+  })
+
+  it("is the composite part of the live sort key, for every primary key layout", () => {
+    for (const index of [
+      primary(["kind", "seq"]),
+      primary(["kind", "seq"], { collection: "work" }),
+      primary(["kind", "seq"], { collection: "work", type: "clustered" }),
+      primary(["kind", "seq"], { casing: "preserve" }),
+    ]) {
+      const sk = live(index, { kind: "Alpha", seq: 2 })
+      const segment = KeyComposer.composeHistoryItemSegment(schema, "Task", 1, index, sk)
+      expect(sk.endsWith(`#${segment}`)).toBe(true)
+      expect(segment?.split("#")).toHaveLength(2)
+    }
+    const index = primary(["kind", "seq"])
+    expect(
+      KeyComposer.composeHistoryItemSegment(
+        schema,
+        "Task",
+        1,
+        index,
+        live(index, { kind: "A", seq: 2 }),
+      ),
+    ).toBe("kind_a#seq_0000000000000002")
+  })
+})
+
 describe("index-level casing", () => {
   const schema = DynamoSchema.make({ name: "App", version: 1 })
   const base = {

@@ -2290,7 +2290,7 @@ Key aggregate concepts:
 
 - **`Aggregate.one("venue", { entity: Venues, entityType: "MatchVenue" })`** — A one-to-one edge. The venue is decomposed into a separate DynamoDB item with entity type `MatchVenue`, all sharing the match's partition key.
 
-- **`Aggregate.many("players", { entity: Players, entityType: "MatchPlayer" })`** — A one-to-many edge. Each player in the team sheet becomes a separate DynamoDB item.
+- **`Aggregate.many("players", { entity: Players, entityType: "MatchPlayer" })`** — A one-to-many edge. Each player in the team sheet becomes a separate DynamoDB item. The hydrated player is stored in its wire form, so `player.dateOfBirth` is an ISO string on the `MatchPlayer` item and reads back as a `Date` (see [How Values Are Stored](/effect-dynamodb/guides/aggregates/#how-values-are-stored)).
 
 - **`TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } })`** — Binds a sub-aggregate with a discriminator. Since a match has **two** TeamSheets, the discriminator (`teamNumber: 1` vs `teamNumber: 2`) distinguishes them in the sort key.
 

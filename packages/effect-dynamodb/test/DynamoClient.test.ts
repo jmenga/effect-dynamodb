@@ -857,6 +857,42 @@ describe("DynamoClient", () => {
     const skLow = (input: any) => input.ExpressionAttributeValues[":sk1"].S as string
     const skHigh = (input: any) => input.ExpressionAttributeValues[":sk2"].S as string
 
+    // --- projections and filters send what they always sent (#133) ---------
+
+    describe("projections and chained filters on a plain entity", () => {
+      it.effect("select names its attributes as it always did", () =>
+        Effect.gen(function* () {
+          const byName = yield* capture((db: any) =>
+            db.entities.Lookups.primary({ lookupId: "l-1" }).select(["email"]).collect(),
+          )
+          expect(byName.ProjectionExpression).toBe("#proj_email")
+          const byPath = yield* capture((db: any) =>
+            db.entities.Lookups.primary({ lookupId: "l-1" })
+              .select((t: any) => [t.email])
+              .collect(),
+          )
+          expect(byPath.ProjectionExpression).toBe("#proj0")
+          expect(byPath.ExpressionAttributeNames["#proj0"]).toBe("email")
+        }),
+      )
+
+      it.effect("two filters never share a placeholder", () =>
+        Effect.gen(function* () {
+          const input = yield* capture((db: any) =>
+            db.entities.Lookups.primary({ lookupId: "l-1" })
+              .filter({ email: "a@x.io" })
+              .filter((t: any, { exists }: any) => exists(t.lookupId))
+              .collect(),
+          )
+          const names = Object.entries(input.ExpressionAttributeNames)
+          const placeholders = new Map<string, string>()
+          for (const [placeholder, name] of names) placeholders.set(placeholder, String(name))
+          expect([...placeholders.values()]).toEqual(expect.arrayContaining(["email", "lookupId"]))
+          expect(input.FilterExpression).toMatch(/\(.+\) AND \(.+\)/)
+        }),
+      )
+    })
+
     // --- named GSI accessor, single SK composite ---------------------------
 
     describe("named GSI accessor (single SK composite)", () => {

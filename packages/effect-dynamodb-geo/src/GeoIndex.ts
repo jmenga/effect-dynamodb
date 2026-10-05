@@ -9,11 +9,14 @@
 
 import { type Context, Effect, type Schema } from "effect"
 import type {
+  ConcurrentModification,
   DynamoClient,
   DynamoClientError,
   DynamoSchema,
   KeyComposer,
+  OptimisticLockError,
   Table,
+  TransactionOverflow,
   UniqueConstraintViolation,
   ValidationError,
 } from "effect-dynamodb"
@@ -174,10 +177,22 @@ export const make = <A, P>(config: {
  * All operations return `Effect<..., ..., never>`.
  */
 export interface BoundGeoIndex<A> {
-  /** Write an item with automatic geo field enrichment. R = never. */
+  /**
+   * Write an item with automatic geo field enrichment. R = never. Fails as the
+   * entity's own `put` does.
+   */
   readonly put: (
     input: A,
-  ) => Effect.Effect<A, DynamoClientError | ValidationError | UniqueConstraintViolation, never>
+  ) => Effect.Effect<
+    A,
+    | DynamoClientError
+    | ValidationError
+    | UniqueConstraintViolation
+    | OptimisticLockError
+    | ConcurrentModification
+    | TransactionOverflow,
+    never
+  >
   /** Search for items near a geographic point. R = never. */
   readonly nearby: (
     options: NearbyOptions,

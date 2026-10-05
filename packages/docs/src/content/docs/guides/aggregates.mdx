@@ -395,9 +395,10 @@ missing while the root is visible, which for optional or empty-able edges assemb
 aggregate that is quietly incomplete.
 
 Set `consistentRead: true` to close that window. It doubles the RCU cost of every assembly
-read, so it is opt-in. It requires a query that can be strongly consistent — the base table
-or an LSI; DynamoDB rejects consistent reads against a GSI, so pairing it with a GSI-shaped
-collection index throws at `make()` time.
+read, so it is opt-in. It requires an aggregate collection that can be read strongly
+consistently — on the base table, or on an LSI (an aggregate's collection index whose
+partition key is the table's is created as one). DynamoDB reads a GSI only eventually
+consistently, so pairing it with a GSI-shaped collection index throws at `make()` time.
 
 #### Sub-Aggregate Binding with Discriminators
 
@@ -409,6 +410,80 @@ team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
 ```
 
 Discriminator values are stored on each member item in DynamoDB and used during assembly to route items to the correct sub-aggregate instance.
+
+##### Nested sub-aggregates
+
+A sub-aggregate can itself bind another sub-aggregate, for example a `Club` sub-aggregate whose `squad` field is a bound `Squad` sub-aggregate, used twice on a `League` as `club1` and `club2`. `create`, `get`, `list`, `update` and `delete` all work at every depth.
+
+The nested level inherits its parent's discriminator. Its rows carry both attributes, and their sort keys are prefixed with the parent's discriminator values, so each binding of the parent keeps its own copy of the inner sub-aggregate:
+
+```text
+SK = $app#v1#leagueclub#clubno#1                         → LeagueClub (club1)
+SK = $app#v1#leaguesquad#clubno#1#squadno#1              → LeagueSquad (club1.squad)
+SK = $app#v1#leaguesquadplayer#clubno#1#squadno#1#p-1    → LeagueSquadPlayer (club1.squad.players)
+SK = $app#v1#leaguesquad#clubno#2#squadno#1              → LeagueSquad (club2.squad)
+```
+
+(Numeric discriminator values are zero-padded in real keys; they are shortened here.) Each nested sub-aggregate is its own transaction group, so `update` rewrites only the inner group that changed.
+
+Give a nested binding its own discriminator attribute. Reusing one it inherits (`{ clubNo: 9 }` inside a parent bound with `{ clubNo: 1 }`) would overwrite the parent's value on the inner rows, so `Aggregate.make` throws `EDD-9056`, naming the sub-aggregate's path.
+
+Sub-aggregates bound directly on the root keep exactly the keys they had before. Nested sub-aggregates did not work in 1.22.0 and earlier: they were written, but reading them failed (`Missing key at ["club"]["squad"]`). Rows those versions wrote below the first level used different keys and are not read, so recreate those aggregates.
+
+### How Values Are Stored
+
+Aggregate items store their values in their schema's **wire form**, the same form `Entity.put` writes, however deeply they are nested. A `Schema.DateTimeUtcFromString` is an ISO string (`S`) in each of these places:
+
+- a root field (`startDate`)
+- an element of a root array (`matchDays: Schema.Array(Schema.DateTimeUtcFromString)`)
+- a field of a class inside an array (`sessions[].startTime`)
+- a member of a `Schema.NullOr` or other union, including inside an array (`Schema.Array(Schema.NullOr(...))`) and a union of a class and a scalar (`Schema.Union([Slot, Schema.String])`)
+- a `Schema.Record` value or a `Schema.Tuple` element
+- a field of a ref hydrated into a `one` or `many` item (`player.dateOfBirth` on a `MatchPlayer` item), at the root or inside a sub-aggregate
+- a field of a `one` or `many` edge declared without an `entity`
+
+Other transforms follow the same rule. A `Schema.BigIntFromString` or `Schema.NumberFromString` is stored as a string, and self date schemas such as `Schema.DateTimeUtc` and `Schema.Date` default to an ISO string. In a union that mixes a date with another type (`Schema.Union([Schema.DateTimeUtcFromString, Schema.Number])`), each value is stored by the member it belongs to, so a `5` stays a number. A plain `Schema.BigInt` is stored as a number and reads back as a `bigint`. On read, each value is decoded back to its domain type, so the assembled aggregate holds real `DateTime` instances, and a zoned date keeps its named or offset zone.
+
+Self dates in unions follow the entity rules in [Dates in unions](/effect-dynamodb/guides/modeling/#dates-in-unions). A date next to a string member claims only its canonical ISO string, so a string member holding exactly such an instant reads back as a `DateTime`. An epoch-stored date next to a numeric member is rejected by `Aggregate.make` with `EDD-9058`. On an aggregate, that includes a `Schema.NumberFromString` or `Schema.BigIntFromString` member. These are stored as strings, but `update` re-decodes the aggregate's domain values, where they are numbers, and a number there could belong to either member. Entities accept those two.
+
+A ref in a `many` edge can be declared in any of these ways, and all of them round-trip through `create`, `get` and `update`:
+
+- inside an element class, annotated: `player: Player.pipe(DynamoModel.ref)`
+- inside an element class, as the plain class `player: Player`, matched by name to the edge's `entity`
+- as the element itself: `players: Schema.Array(Player.pipe(DynamoModel.ref))`
+
+Refs are matched by the field's schema, not its name. A nested field that happens to share a ref edge's name (a `coach: Schema.String` inside an array, next to a root `coach` edge) is stored and read as its own schema.
+
+Composed keys (`pk`, `sk`, collection and list-index keys) are not affected by this encoding. They are built exactly as before, so existing rows stay addressable.
+
+Container `.check()` refinements are enforced on `create` and `update`, as they are on entities (see [Container checks](/effect-dynamodb/guides/modeling/#container-checks)). An array, struct or checked-struct class holding a date or another substituted value that breaks its check fails with a `ValidationError`. Earlier versions silently dropped those checks. Reads don't enforce them, so a stored row that breaks one still assembles. Every `update` of that aggregate then fails until the same update makes the value valid, which repairs the row. On an entity, a `.set()` of other fields still succeeds on such a row.
+
+:::caution[Custom `decompose` that renames fields]
+A `many` edge with a custom `decompose` that **renames** element fields (`{ noteId, at }` → `{ nid, when }`) is the one exception. Encoders are matched to the element's own field names, so a renamed field is stored as its domain value, and a `DateTime` there is still written as a map. It reads back as a real `DateTime`. To store it in wire form, keep the element's field names in `decompose`, or encode the value yourself before returning it.
+:::
+
+#### Upgrading from 1.22.0 or earlier
+
+:::caution[Upgrade readers first]
+1.22.0 can't read every row this version writes. A **self** date schema (`Schema.DateTimeUtc`, `Schema.Date`, or one with `storedAs`) inside a `NullOr` or other union, a `Record` or a `Tuple` is now stored as a string or number. A 1.22.0 reader fails on it with `Expected DateTime.Utc`, or, in a union with a string member, reads it back as a plain string. **Upgrade every reader before any writer, and don't roll back past this version** once new rows are written.
+
+1.22.0 does read the other shapes this version writes differently. These include dates in root arrays and arrays of classes, transform dates such as `Schema.DateTimeUtcFromString` in any container, plain-class refs in `many` elements, and optional `NumberFromString` fields. Nested sub-aggregates and refs annotated with `DynamoModel.ref` in a `many` element never read back on 1.22.0 anyway.
+:::
+
+Versions up to and including 1.22.0 encoded only top-level fields, and only when the field's own schema was a transform. A transformed value nested inside an array, a union, a class or a hydrated ref was marshalled as the domain object itself, so a `DateTime` was stored as a map such as `{ epochMilliseconds, "~effect/DateTime", _tag: "Utc" }`. On Effect 4.0.0, rows written under an Effect release candidate (whose maps carry `~effect/time/DateTime`) failed assembly with `Expected DateTime.Utc`. Rows written under 4.0.0 decoded as plain objects that only looked like `DateTime`s.
+
+Existing rows need no migration step:
+
+- **Reads** rebuild a stored `DateTime` map into a real `DateTime`, whichever type-id key it carries. `Zoned` values keep their named or offset zone. A plain `Schema.BigInt`, stored as a number, now reads back; earlier versions could not read it.
+- **Writes** rewrite a row in wire form the next time an `update` changes its group (the root item, or the sub-aggregate it belongs to). An update that changes nothing writes nothing, and there is no automatic backfill, so rows that are never updated keep the map form and keep reading correctly.
+- **Lost values.** Some domain objects have no enumerable state, so the map they were stored as holds no value: a `Schema.Date` was stored as an empty map, and a `URL`, `Duration` or `BigDecimal` lost its value the same way. These cannot be recovered, and reading them fails with a `ValidationError`.
+
+**Some attributes change stored type.** A few values that 1.22.0 stored in their domain form are now encoded, which changes their DynamoDB type. Keys are not affected. The affected attributes are:
+
+- a top-level field wrapped in `Schema.optional(...)` or `Schema.NullOr(...)` around a non-date transform such as `Schema.NumberFromString`, on the root item, an edge item or a `many` element's own fields
+- a `Schema.NumberFromString` nested inside a hydrated ref
+
+For example, an optional `NumberFromString` holding `5` was stored as `{ "N": "5" }` and is now `{ "S": "5" }`. Rows of both kinds read back correctly. However, a `list` filter on such an attribute can match old and new rows differently until the old rows are rewritten: a `filter` expression compares against one DynamoDB type, and a `filterBy` predicate receives the stored value, a number on old rows and a string on new ones. DynamoDB Streams consumers also see the attribute change type. The same applies to an optional `Schema.BigIntFromString`. Rows 1.22.0 stored as `{ "N": "5" }` could not be read back at all; they now read back as `5n`.
 
 ### Aggregate Operations
 
@@ -458,11 +533,17 @@ const match = yield* MatchAggregate.create({
 The create operation:
 1. Validates the input against the schema
 2. Hydrates all ref fields (fetches entities by ID, embeds domain data)
-3. Decomposes the domain object into individual DynamoDB items following the graph structure
+3. Decomposes the domain object into individual DynamoDB items following the graph structure, with every value in its wire form (see [How Values Are Stored](#how-values-are-stored))
 4. Adds partition keys, sort keys, entity type discriminators, and context fields
-5. Writes items in sub-aggregate transaction groups (each sub-aggregate = one `transactWriteItems`)
+5. Writes items in sub-aggregate transaction groups (each sub-aggregate = one `transactWriteItems`). The root item goes first, in the first transaction, conditioned on `attribute_not_exists`
+
+Fields other than refs can be given in their domain form as well as their wire form, so the input may carry a `DateTime`, an `Option` or a `Redacted`. These are kept intact while ref IDs are replaced with hydrated data.
 
 Returns `RefNotFound` if a ref ID doesn't resolve. Returns `AggregateTransactionOverflow` if a sub-aggregate group exceeds 100 items (DynamoDB transaction limit).
+
+Returns `ConditionalCheckFailed` if the aggregate already exists. Its root item's guard cancels the first transaction, so nothing is written: not the root, not an edge, not a sub-aggregate row. Earlier versions overwrote the root and left behind any old rows the new aggregate didn't rewrite. To replace an aggregate, `update` it, or `delete` it first. Each sub-aggregate is still its own transaction, so if a later one fails, the ones before it stay written.
+
+The guard is on the root item only. Edge and sub-aggregate rows left without a root, for example by an earlier write that failed partway, don't stop `create`. `get` then reads them back together with the new aggregate's rows, merging stale edges into it. Before creating an aggregate where an earlier write may have failed partway, `delete` its key: `delete` removes every row in the partition, orphans included. The library doesn't check for orphan rows on `create`, because that would add a partition read to every create.
 
 #### update — Diff and Write
 
@@ -587,7 +668,7 @@ The first argument selects the partition (and, with contiguous SK composites, a 
 |--------|---------|
 | `limit` | At most _n_ **aggregates**. Accumulates across as many requests as it takes — not DynamoDB's `Limit`, which bounds rows examined |
 | `pageSize` | DynamoDB's `Limit` — rows examined per request. A contract on round trips, not on what comes back |
-| `filter` | `FilterExpression` on the root-item query. Same callback and shorthand forms as `BoundQuery.filter()` |
+| `filter` | `FilterExpression` on the root-item query. Same callback and shorthand forms as `BoundQuery.filter()`, and the same empty-part rules: an empty filter is none, and an empty part under `or()` / `not()`, an `or()` with no parts or an `isIn` with no values fails with a `ValidationError` before sending |
 | `reverse` | Walk the list index descending |
 | `cursor` | Resume after the last aggregate the previous call returned |
 
@@ -638,7 +719,8 @@ type MatchKey = Aggregate.Key<typeof MatchAggregate> // { id: string }
 
 | Error | When | Properties |
 |-------|------|------------|
-| `AggregateAssemblyError` | Read path: missing items, structural violations, or decode errors | `aggregate`, `reason`, `key` |
+| `AggregateAssemblyError` | Read path: no items for the key, a missing root item, or duplicate root / sub-aggregate items | `aggregate`, `reason`, `key` |
+| `ValidationError` | Read path: the assembled items fail schema decode (`operation: "aggregate.assemble"`) | `entityType`, `operation`, `cause` |
 | `AggregateDecompositionError` | Write path: schema validation or structural error during decomposition | `aggregate`, `member`, `reason` |
 | `AggregateTransactionOverflow` | Write path: sub-aggregate exceeds 100-item transaction limit | `aggregate`, `subgraph`, `itemCount`, `limit` |
 | `RefNotFound` | Ref hydration: referenced entity not found | `entity`, `field`, `refEntity`, `refId` |

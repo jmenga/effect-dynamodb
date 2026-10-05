@@ -7,13 +7,18 @@
  * Key, Item, Marshalled).
  */
 
-import type { AttributeValue, DeleteItemCommandInput } from "@aws-sdk/client-dynamodb"
+import type {
+  AttributeValue,
+  DeleteItemCommandInput,
+  TransactWriteItem,
+} from "@aws-sdk/client-dynamodb"
 import {
   type ConfiguredModel,
   type DynamoEncoding,
   type ExtractIdentifier,
   getIdentifierField,
   getSparseFields,
+  isConfiguredModel,
   isRefField,
 } from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
@@ -21,8 +26,11 @@ import type { EmbedderService } from "@effect-dynamodb/schema/Embedder.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import {
   CascadePartialFailure,
+  ConcurrentModification,
   ConditionalCheckFailed,
+  DeleteAppliedButUnreadable,
   EmbeddingError,
+  ItemNotDeleted,
   ItemNotFound,
   isAwsConditionalCheckFailed,
   isAwsTransactionCancelled,
@@ -31,6 +39,7 @@ import {
   StaleAppend,
   TransactionOverflow,
   UniqueConstraintViolation,
+  UpdateAppliedButUnreadable,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import {
@@ -46,7 +55,19 @@ import type {
   VectorIndexDefinition,
 } from "@effect-dynamodb/schema/VectorIndex.js"
 import { deriveSourceText } from "@effect-dynamodb/schema/VectorIndex.js"
-import { Context, Crypto, DateTime, type Duration, Effect, Option, Schema, Stream } from "effect"
+import {
+  Cause,
+  Context,
+  Crypto,
+  Data,
+  DateTime,
+  type Duration,
+  Effect,
+  Equal,
+  Option,
+  Schema,
+  Stream,
+} from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import type { ConditionInput } from "./Expression.js"
 import {
@@ -60,18 +81,27 @@ import {
 import {
   type BoundQueryConfig,
   BoundQueryImpl,
+  entityNaming,
   type RawSortKeyCondition,
 } from "./internal/BoundQuery.js"
 import {
   compileExpr,
   createConditionOps,
   type Expr,
+  emptyPartProblem,
   isExpr,
+  nonEmptyCondition,
   parseShorthand,
   parseSimpleShorthand,
+  toExpr,
 } from "./internal/Expr.js"
 import { compilePath, createPathBuilder } from "./internal/PathBuilder.js"
-import { generateTimestampPrimitive } from "./internal/TransactableOps.js"
+import {
+  freshIncarnationToken,
+  generateTimestampPrimitive,
+  INCARNATION_TOKEN,
+  UNSENTINELED_DEFAULTS,
+} from "./internal/TransactableOps.js"
 import {
   decodeSparseFields,
   encodeSparseFields,
@@ -120,6 +150,7 @@ export {
   type PutKind,
   type ReturnValuesMode,
   returnValuesMap,
+  type UpdateReturn,
   type UpdateState,
   type WithVectors,
 } from "./internal/EntityOps.js"
@@ -144,8 +175,8 @@ import {
   emptyUpdateState,
   type PutKind,
   type ReturnValuesMode,
-  returnValuesMap,
   type UpdateState,
+  withGuard,
 } from "./internal/EntityOps.js"
 
 export {
@@ -191,6 +222,7 @@ import {
   allKeyFieldNames,
   type DerivedSchemas,
   getSchemaFields,
+  makePathValueEncoder,
   primaryKeyComposites,
   type ResolvedSystemFields,
   resolveUniqueFields,
@@ -275,6 +307,13 @@ const composeUniqueSentinel = (
     }
   | undefined => {
   const fields = resolveUniqueFields(constraintDef)
+  // A field holding only a default has no sentinel (#133).
+  const defaulted = source[UNSENTINELED_DEFAULTS]
+  const defaultedFields =
+    defaulted instanceof Set
+      ? (defaulted as ReadonlySet<unknown>)
+      : new Set(Array.isArray(defaulted) ? defaulted : [])
+  if (fields.some((f) => defaultedFields.has(f))) return undefined
   const serialized: Array<string> = []
   const fieldsRecord: globalThis.Record<string, string> = {}
   for (const f of fields) {
@@ -341,6 +380,153 @@ const keyFormFor = (
     )
   })
   return toCompositeKeyRecord(form, record)
+}
+
+/**
+ * @internal A plain update of a complete item found no item: the caller
+ * creates it instead (`updateOrCreate`). Never escapes the update operation.
+ */
+class MissingForCreate extends Data.TaggedError("MissingForCreate")<{
+  readonly input: unknown
+}> {}
+
+/** DynamoDB's limits on one expression: its length, and its operators + functions. */
+const EXPRESSION_LIMIT = 4096
+const OPERATOR_LIMIT = 300
+
+/**
+ * The tokens of a compiled expression. Names and values are placeholders
+ * (`#…`, `:…`), so no operator can hide inside one.
+ */
+const EXPRESSION_TOKEN = /#\w+|:\w+|<>|<=|>=|[=<>()+\-,.[\]]|[A-Za-z_]\w*|\d+/g
+
+/**
+ * The operators DynamoDB counts against an expression's 300 (#133), measured
+ * against DynamoDB: in a condition, each comparison (`=`, `<>`, `<`, `<=`,
+ * `>`, `>=`), `AND` / `OR` / `NOT`, `BETWEEN` (whose own `AND` is part of it,
+ * not another operator), `IN`, and each function; in an update, each `+` /
+ * `-` and each function (`if_not_exists`, `list_append`) — a `SET` clause's
+ * `=` is not an operator.
+ */
+/** @internal */
+export const countOperators = (expression: string, kind: "condition" | "update"): number => {
+  const tokens = expression.match(EXPRESSION_TOKEN) ?? []
+  let count = 0
+  let betweens = 0
+  for (const [i, token] of tokens.entries()) {
+    const word = token.toUpperCase()
+    const isFunction = /^[A-Za-z_]\w*$/.test(token) && tokens[i + 1] === "("
+    if (kind === "update") {
+      if (token === "+" || token === "-" || isFunction) count++
+      continue
+    }
+    if (isFunction) count++
+    else if (["=", "<>", "<", "<=", ">", ">="].includes(token)) count++
+    else if (word === "BETWEEN") {
+      count++
+      betweens++
+    } else if (word === "AND" && betweens > 0) betweens--
+    else if (word === "AND" || word === "OR" || word === "NOT" || word === "IN") count++
+  }
+  return count
+}
+
+/** What DynamoDB counts against an expression's limits. */
+const expressionCost = (
+  expression: string | undefined,
+  kind: "condition" | "update" = "condition",
+): { readonly length: number; readonly operators: number } =>
+  expression === undefined
+    ? { length: 0, operators: 0 }
+    : { length: expression.length, operators: countOperators(expression, kind) }
+const expressionFits = (
+  expression: string,
+  kind: "condition" | "update" = "condition",
+): boolean => {
+  const cost = expressionCost(expression, kind)
+  return cost.length <= EXPRESSION_LIMIT && cost.operators <= OPERATOR_LIMIT
+}
+
+const bytesKey = (bytes: Uint8Array): string => Array.from(bytes).join(",")
+
+/** Structural equality of two marshalled values (sets compare as sets). */
+const attributeValueEquals = (
+  a: AttributeValue | undefined,
+  b: AttributeValue | undefined,
+): boolean => {
+  if (a === undefined || b === undefined) return a === b
+  const [kind] = Object.keys(a)
+  if (kind === undefined || Object.keys(b)[0] !== kind) return false
+  const x = (a as unknown as globalThis.Record<string, unknown>)[kind]
+  const y = (b as unknown as globalThis.Record<string, unknown>)[kind]
+  switch (kind) {
+    case "L": {
+      const xs = x as ReadonlyArray<AttributeValue>
+      const ys = y as ReadonlyArray<AttributeValue>
+      return xs.length === ys.length && xs.every((v, i) => attributeValueEquals(v, ys[i]))
+    }
+    case "M": {
+      const xm = x as globalThis.Record<string, AttributeValue>
+      const ym = y as globalThis.Record<string, AttributeValue>
+      const keys = Object.keys(xm)
+      return (
+        keys.length === Object.keys(ym).length &&
+        keys.every((k) => attributeValueEquals(xm[k], ym[k]))
+      )
+    }
+    case "SS":
+    case "NS": {
+      const xs = new Set(x as ReadonlyArray<string>)
+      const ys = y as ReadonlyArray<string>
+      return xs.size === new Set(ys).size && ys.every((v) => xs.has(v))
+    }
+    case "B":
+      return bytesKey(x as Uint8Array) === bytesKey(y as Uint8Array)
+    case "BS": {
+      const xs = new Set((x as ReadonlyArray<Uint8Array>).map(bytesKey))
+      const ys = (y as ReadonlyArray<Uint8Array>).map(bytesKey)
+      return xs.size === new Set(ys).size && ys.every((v) => xs.has(v))
+    }
+    default:
+      return x === y
+  }
+}
+
+/**
+ * The top-level attributes an UpdateExpression writes (SET / REMOVE / ADD /
+ * DELETE targets), resolved through its attribute names.
+ */
+const expressionTargets = (
+  expression: string,
+  names: globalThis.Record<string, string>,
+): ReadonlySet<string> => {
+  const targets = new Set<string>()
+  const sections = expression.split(/\b(SET|REMOVE|ADD|DELETE)\b/).slice(1)
+  for (let i = 0; i + 1 < sections.length; i += 2) {
+    const action = sections[i]!
+    const body = sections[i + 1]!
+    // Split on commas outside parentheses (`list_append(#a, :b)`).
+    const items: Array<string> = []
+    let depth = 0
+    let current = ""
+    for (const ch of body) {
+      if (ch === "(") depth++
+      if (ch === ")") depth--
+      if (ch === "," && depth === 0) {
+        items.push(current)
+        current = ""
+      } else current += ch
+    }
+    items.push(current)
+    for (const item of items) {
+      const trimmed = item.trim()
+      if (trimmed === "") continue
+      const path = action === "SET" ? trimmed.split("=")[0]!.trim() : trimmed.split(/\s+/)[0]!
+      const head = path.split(/[.[]/)[0]!
+      targets.add(head.startsWith("#") ? (names[head] ?? head) : head)
+    }
+  }
+  return targets
 }
 
 const encodeOrDecodeEncode = (
@@ -473,39 +659,48 @@ export interface Entity<
   readonly _renameToDynamo: (item: globalThis.Record<string, unknown>) => void
 
   /**
-   * @internal The extra items a `put` of `item` must write alongside the item
-   * itself: one uniqueness sentinel per satisfiable `unique` constraint, plus a
-   * v1 version snapshot when `versioned: { retain: true }`.
-   *
-   * Every one of these is derived from the payload being written, so the
-   * multi-item write paths (`Transaction.transactWrite`,
-   * `EventStore.append({ additionalItems })`) can emit them without reading
-   * anything back. The DELETE side is deliberately absent: releasing a sentinel,
-   * snapshotting the outgoing row and building a soft-delete tombstone all read
-   * the STORED item, which those paths never do — they reject instead (EDD-9048).
-   *
-   * `item` must be the fully assembled wire-form item (keys composed, system
-   * fields applied) — i.e. the output of `validateAndBuildPutItem`.
+   * @internal Whether a created item carries the hidden incarnation token
+   * (`__edd_i__`) — every versioned entity.
    */
-  readonly _buildPutSideItems: (
-    item: globalThis.Record<string, unknown>,
-    now: DateTime.Utc,
-    ttlAttrName: string,
-  ) => ReadonlyArray<{
-    readonly kind: "sentinel" | "snapshot"
-    /** Set for `kind: "sentinel"` — which `unique` constraint produced it. */
-    readonly constraintName?: string | undefined
-    /** Set for `kind: "sentinel"` — the serialized values it reserves, for `UniqueConstraintViolation`. */
-    readonly fields?: globalThis.Record<string, string> | undefined
+  readonly _incarnationToken: boolean
+
+  /** @internal An item with an incarnation token but no version (see `versionCorruption`). */
+  readonly _versionCorruption: (
+    item: Readonly<globalThis.Record<string, unknown>> | undefined,
+    operation: string,
+  ) => ValidationError | undefined
+
+  /** @internal Fill omitted decoding-default fields of a put's input (see `put`). */
+  readonly _fillDecodingDefaults: (input: unknown) => Effect.Effect<unknown, ValidationError>
+
+  /** @internal Unique fields a put's input leaves to an index-stored default. */
+  readonly _unsentineledDefaults: (input: unknown) => ReadonlyArray<string>
+
+  /**
+   * @internal Plan a guarded put — of a versioned or unique-constrained entity —
+   * from a fresh read of the item (#133): the same items `put` writes (the
+   * item continued or created, its sentinels rotated, its snapshot), for the
+   * transaction paths (`Transaction.transactWrite`, `EventStore.append`'s
+   * `additionalItems`) to write in their own transaction. `item` is the output
+   * of `validateAndBuildPutItem`. A `Retry` verdict means plan it again.
+   */
+  readonly _planPut: (args: {
+    readonly tableName: string
+    readonly ttlAttrName: string
+    readonly now: DateTime.Utc
     readonly item: globalThis.Record<string, unknown>
-    /** Sentinels are only correct under this guard; snapshots take none. */
-    readonly guard?:
+    readonly createdAtSupplied: boolean
+    readonly userCondition:
       | {
-          readonly ConditionExpression: string
-          readonly ExpressionAttributeNames: globalThis.Record<string, string>
+          readonly expression: string
+          readonly names: globalThis.Record<string, string>
+          readonly values: globalThis.Record<string, AttributeValue>
         }
       | undefined
-  }>
+    readonly create: boolean
+    readonly operation: string
+    readonly key: globalThis.Record<string, unknown>
+  }) => Effect.Effect<PutPlan, ValidationError | DynamoClientError, DynamoClient>
 
   /**
    * @internal Whether this entity's write contract needs items beyond the one
@@ -513,6 +708,16 @@ export interface Entity<
    * decide between expanding (put) and rejecting (delete, and all of Batch).
    */
   readonly _multiItemWriteFeatures: ReadonlyArray<"unique" | "retain" | "softDelete">
+
+  /**
+   * @internal Which of this entity's rows are items: a row is live iff the
+   * sort key composed from its own stored composites is its stored sort key.
+   * Version snapshots, soft-delete tombstones and time-series events keep the
+   * entity's `__edd_e__` but never satisfy it, so a query of the primary key
+   * or a scan leaves them out (#133). `undefined` without `retain`,
+   * `softDelete` or `timeSeries` — every row is then an item.
+   */
+  readonly _liveRows: () => Query.LiveRows | undefined
 
   /** @internal Attach model class prototype to a decoded plain object (no-op for Schema.Struct models). */
   readonly _attachPrototype: (decoded: any) => any
@@ -596,7 +801,17 @@ export interface Entity<
     DynamoClient | TableConfig
   >
 
-  /** Create or replace an item. Returns a lazy {@link EntityPut} intermediate. */
+  /**
+   * Create or replace an item. Returns a lazy {@link EntityPut} intermediate.
+   *
+   * On a versioned or unique-constrained entity the put reads the item first:
+   * a replacing put continues its version, incarnation and `createdAt`,
+   * snapshots it (`retain`) and rotates its unique sentinels — releasing only
+   * those the item owns; a created one continues after any history retained
+   * for its key. A concurrent write between the read and the put is retried,
+   * so the last writer wins; a race lost on every attempt is an
+   * `OptimisticLockError` (versioned) or `ConcurrentModification`.
+   */
   readonly put: (
     input: WithGeneratedId<
       EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
@@ -606,8 +821,11 @@ export interface Entity<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
     | DynamoClientError
+    | TransactionOverflow
     | ValidationError
     | UniqueConstraintViolation
+    | OptimisticLockError
+    | ConcurrentModification
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>,
     DynamoClient | TableConfig
@@ -624,8 +842,11 @@ export interface Entity<
     EntityRecordType<TModel, TTimestamps, TVersioned>,
     EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
     | DynamoClientError
+    | TransactionOverflow
     | ItemNotFound
     | OptimisticLockError
+    | ConcurrentModification
+    | UpdateAppliedButUnreadable
     | UniqueConstraintViolation
     | ValidationError
     | RefErrors<TRefs>
@@ -633,14 +854,30 @@ export interface Entity<
     DynamoClient | TableConfig
   >
 
-  /** Delete an item by primary key. Returns a lazy {@link EntityDelete} intermediate. */
+  /**
+   * Delete an item by primary key. Returns a lazy {@link EntityDelete} intermediate.
+   * A unique-constrained entity releases only the sentinels the item owns.
+   */
   readonly delete: (
     key: EntityKeyType<TModel, TIndexes>,
-  ) => EntityDelete<DynamoClientError | ItemNotFound, DynamoClient | TableConfig>
+  ) => EntityDelete<
+    | DynamoClientError
+    | TransactionOverflow
+    | ItemNotFound
+    | OptimisticLockError
+    | ConcurrentModification
+    | ValidationError
+    | DeleteAppliedButUnreadable,
+    DynamoClient | TableConfig,
+    void,
+    ModelType<TModel>
+  >
 
   /**
    * Create a new item. Fails with `ConditionalCheckFailed` if an item with the same
-   * primary key already exists. Equivalent to `put(input)` with an `attribute_not_exists` condition.
+   * primary key already exists. Equivalent to `put(input)` with an `attribute_not_exists`
+   * condition — it never reads the item (a `retain` entity reads only the highest
+   * version retained for the key, to continue after it).
    */
   readonly create: (
     input: WithGeneratedId<
@@ -651,8 +888,11 @@ export interface Entity<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
     | DynamoClientError
+    | TransactionOverflow
     | ValidationError
     | UniqueConstraintViolation
+    | OptimisticLockError
+    | ConcurrentModification
     | ConditionalCheckFailed
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>,
@@ -670,8 +910,11 @@ export interface Entity<
     EntityRecordType<TModel, TTimestamps, TVersioned>,
     EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
     | DynamoClientError
+    | TransactionOverflow
     | ItemNotFound
     | OptimisticLockError
+    | ConcurrentModification
+    | UpdateAppliedButUnreadable
     | UniqueConstraintViolation
     | ValidationError
     | ConditionalCheckFailed
@@ -687,17 +930,33 @@ export interface Entity<
   readonly deleteIfExists: (
     key: EntityKeyType<TModel, TIndexes>,
   ) => EntityDelete<
-    DynamoClientError | ItemNotFound | ConditionalCheckFailed,
-    DynamoClient | TableConfig
+    | DynamoClientError
+    | TransactionOverflow
+    | ItemNotFound
+    | OptimisticLockError
+    | ConcurrentModification
+    | ValidationError
+    | DeleteAppliedButUnreadable
+    | ConditionalCheckFailed,
+    DynamoClient | TableConfig,
+    void,
+    ModelType<TModel>
   >
 
   /**
-   * Create or update an item atomically. Uses DynamoDB UpdateItem with `if_not_exists()`
-   * for immutable fields and createdAt so they're only set on first creation.
-   * Version is incremented atomically: `if_not_exists(version, 0) + 1`.
-   * Returns the full record (ReturnValues: ALL_NEW).
+   * Create an item, or update the fields the input supplies on an existing one —
+   * immutable fields, `createdAt` and fields the input omits keep their stored
+   * values; the version is incremented. The whole input is validated either way.
+   * Returns the full record.
    *
-   * Does NOT support unique constraints or retain (cannot determine if item existed).
+   * Plain entities: one UpdateItem, `if_not_exists()` for immutable fields,
+   * `createdAt` and the version (`if_not_exists(version, 0) + 1`). An entity with
+   * `unique` constraints or `versioned: { retain: true }` — or an input omitting a
+   * defaulted index composite — reads the item once first: missing, it is
+   * `create`d (sentinels reserved, snapshot written, defaults stored); present, it
+   * is updated (sentinels rotated, the replaced item snapshotted). A concurrent
+   * create or delete in between is retried the other way; a race lost on every
+   * attempt is an `OptimisticLockError` (versioned) or `ConcurrentModification`.
    */
   readonly upsert: (
     input: WithGeneratedId<
@@ -708,8 +967,12 @@ export interface Entity<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
     | DynamoClientError
+    | TransactionOverflow
     | ValidationError
     | ItemNotFound
+    | UniqueConstraintViolation
+    | OptimisticLockError
+    | ConcurrentModification
     | ConditionalCheckFailed
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>,
@@ -740,7 +1003,12 @@ export interface Entity<
   ) => EntityGet<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
-    ItemNotFound | DynamoClientError | ValidationError | UniqueConstraintViolation,
+    | ItemNotFound
+    | ItemNotDeleted
+    | DynamoClientError
+    | TransactionOverflow
+    | ValidationError
+    | UniqueConstraintViolation,
     DynamoClient | TableConfig
   >
 
@@ -1036,8 +1304,11 @@ export interface BoundEntity<
     ModelType<TModel>,
     ModelType<TModel>,
     | DynamoClientError
+    | TransactionOverflow
     | ValidationError
     | UniqueConstraintViolation
+    | OptimisticLockError
+    | ConcurrentModification
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>,
     VectorIndexNames<TVectorIndexes>
@@ -1056,8 +1327,11 @@ export interface BoundEntity<
     ModelType<TModel>,
     ModelType<TModel>,
     | DynamoClientError
+    | TransactionOverflow
     | ValidationError
     | UniqueConstraintViolation
+    | OptimisticLockError
+    | ConcurrentModification
     | ConditionalCheckFailed
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>,
@@ -1080,8 +1354,11 @@ export interface BoundEntity<
     ModelType<TModel>,
     EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
     | DynamoClientError
+    | TransactionOverflow
     | ItemNotFound
     | OptimisticLockError
+    | ConcurrentModification
+    | UpdateAppliedButUnreadable
     | UniqueConstraintViolation
     | ValidationError
     | RefErrors<TRefs>
@@ -1102,13 +1379,21 @@ export interface BoundEntity<
     key: TKey,
   ) => import("./internal/BoundCrud.js").BoundDelete<
     ModelType<TModel>,
-    DynamoClientError | ItemNotFound
+    | DynamoClientError
+    | TransactionOverflow
+    | ItemNotFound
+    | OptimisticLockError
+    | ConcurrentModification
+    | ValidationError
+    | DeleteAppliedButUnreadable
   >
 
   /**
-   * Create or update an item atomically. Returns a fluent {@link BoundPut}.
-   * Uses DynamoDB UpdateItem with `if_not_exists()` for immutable fields and
-   * createdAt so they're only set on first creation.
+   * Create an item, or update the fields the input supplies on an existing one.
+   * Returns a fluent {@link BoundPut}. See `Entity.upsert`: a plain entity is one
+   * UpdateItem with `if_not_exists()` for immutable fields, `createdAt` and the
+   * version; a `unique` or `retain` entity (or an input omitting a defaulted index
+   * composite) reads the item once and creates or updates it.
    */
   readonly upsert: (
     input: WithGeneratedId<
@@ -1119,8 +1404,12 @@ export interface BoundEntity<
     ModelType<TModel>,
     ModelType<TModel>,
     | DynamoClientError
+    | TransactionOverflow
     | ValidationError
     | ItemNotFound
+    | UniqueConstraintViolation
+    | OptimisticLockError
+    | ConcurrentModification
     | ConditionalCheckFailed
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>,
@@ -1142,8 +1431,11 @@ export interface BoundEntity<
     ModelType<TModel>,
     EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
     | DynamoClientError
+    | TransactionOverflow
     | ItemNotFound
     | OptimisticLockError
+    | ConcurrentModification
+    | UpdateAppliedButUnreadable
     | UniqueConstraintViolation
     | ValidationError
     | ConditionalCheckFailed
@@ -1157,7 +1449,14 @@ export interface BoundEntity<
     key: TKey,
   ) => import("./internal/BoundCrud.js").BoundDelete<
     ModelType<TModel>,
-    DynamoClientError | ItemNotFound | ConditionalCheckFailed
+    | DynamoClientError
+    | TransactionOverflow
+    | ItemNotFound
+    | OptimisticLockError
+    | ConcurrentModification
+    | ValidationError
+    | DeleteAppliedButUnreadable
+    | ConditionalCheckFailed
   >
 
   // --- Lifecycle Operations ---
@@ -1190,7 +1489,12 @@ export interface BoundEntity<
     key: TKey,
   ) => Effect.Effect<
     ModelType<TModel>,
-    ItemNotFound | DynamoClientError | ValidationError | UniqueConstraintViolation,
+    | ItemNotFound
+    | ItemNotDeleted
+    | DynamoClientError
+    | TransactionOverflow
+    | ValidationError
+    | UniqueConstraintViolation,
     never
   >
 
@@ -1377,6 +1681,66 @@ const checkTransactionLimit = (
         }),
       )
     : Effect.void
+
+/** Attempts a guarded put makes before it reports a lost race (#133). */
+const GUARDED_PUT_ATTEMPTS = 3
+
+/**
+ * @internal A delete's item was deleted between its read and its write, with
+ * nothing asserted about it: read again, never reported (#133).
+ */
+class DeletedConcurrently extends Data.TaggedError("DeletedConcurrently")<{}> {}
+
+/**
+ * The `ConcurrentModification`s that report a sentinel release whose
+ * reservation changed hands between the ownership read and the write (#133),
+ * as opposed to a change of the item itself. Nothing was written, and the
+ * write is still valid against a fresh read — so an `upsert` plans it again,
+ * as a put does. Carried across the copies that fill in `current`.
+ */
+const releaseRaces = new WeakSet<ConcurrentModification>()
+/** `next`, a copy of `previous`, marked as a release race if `previous` was. */
+const keepReleaseRace = (
+  previous: ConcurrentModification,
+  next: ConcurrentModification,
+): ConcurrentModification => {
+  if (releaseRaces.has(previous)) releaseRaces.add(next)
+  return next
+}
+
+/** @internal One positional reason of a cancelled (or conditional) write. */
+export interface WriteCancellationReason {
+  readonly Code?: string | undefined
+  readonly Item?: Readonly<globalThis.Record<string, unknown>> | undefined
+}
+
+/** @internal What a cancelled guarded put means (#133) — see `planPut`. */
+export type PutVerdict =
+  | {
+      /** A lost race: plan the put again from a fresh read. */
+      readonly _tag: "Retry"
+      readonly stored: globalThis.Record<string, AttributeValue> | undefined
+      /** Reported when every attempt loses. */
+      readonly error: OptimisticLockError | ConcurrentModification
+    }
+  /** The caller's own condition rejected it (or `create` found the item). */
+  | { readonly _tag: "Condition" }
+  | { readonly _tag: "Fail"; readonly error: UniqueConstraintViolation | ValidationError }
+
+/**
+ * @internal A guarded put — of a versioned or unique-constrained entity —
+ * compiled against the item as read (#133): the items to write (the main Put
+ * first), the item written, and how to read a cancellation of them.
+ */
+export interface PutPlan {
+  readonly items: ReadonlyArray<TransactWriteItem>
+  readonly item: globalThis.Record<string, unknown>
+  readonly marshalled: globalThis.Record<string, AttributeValue>
+  /** `reasons` positional with `items`; `undefined` when none of them failed. */
+  readonly verdict: (
+    reasons: ReadonlyArray<WriteCancellationReason | undefined>,
+  ) => PutVerdict | undefined
+}
 
 // ---------------------------------------------------------------------------
 // Entity.make()
@@ -1690,12 +2054,364 @@ const makeImpl = <
     isSchemaClass,
     hasHiddenFields,
   } = data
+  // Encoders for path-addressed update values (`pathSet`, `pathAppend`, …) and
+  // record-based `append`, which bypass the update schema (#133).
+  const pathValues = makePathValueEncoder(
+    data.modelFields,
+    (
+      schemas.writeModelSchema as unknown as {
+        readonly fields: globalThis.Record<string, Schema.Top>
+      }
+    ).fields,
+    // A `DynamoModel.ref` field's own schema is opaque; paths under it follow
+    // the model it is denormalised from.
+    Object.fromEntries(
+      (
+        data.resolvedRefs as ReadonlyArray<{
+          readonly fieldName: string
+          readonly refEntity?: { readonly model?: unknown }
+        }>
+      )
+        .filter((ref) => ref.refEntity?.model !== undefined)
+        .map((ref) => {
+          const model = ref.refEntity!.model as Schema.Top
+          return [
+            ref.fieldName,
+            isConfiguredModel(model) ? (model.model as Schema.Top) : model,
+          ] as const
+        }),
+    ),
+  )
+  /**
+   * Encode a path-addressed update value and check it against the write schema
+   * at its path — container checks included (#133). `undefined` issue = valid.
+   */
+  const encodePathValue = (
+    segments: ReadonlyArray<string | number>,
+    value: unknown,
+    kind: "value" | "elements",
+  ): { readonly encoded: unknown; readonly issue: unknown } => {
+    if (kind === "value") {
+      const encoded = pathValues.value(segments, value)
+      return { encoded, issue: pathValues.validate(segments, encoded) }
+    }
+    const encoded = pathValues.elements(segments, value)
+    return { encoded, issue: pathValues.validateElements(segments, encoded) }
+  }
+  const hasPathOps = (uState: UpdateState): boolean =>
+    [
+      uState.pathSets,
+      uState.pathRemoves,
+      uState.pathAdds,
+      uState.pathSubtracts,
+      uState.pathAppends,
+      uState.pathPrepends,
+      uState.pathIfNotExists,
+      uState.pathDeletes,
+    ].some((ops) => ops !== undefined && ops.length > 0)
+
   // resolvedRefs carries the actual ref-target entity objects; at runtime they
   // are operational Entities (for runtime-authored refs) so write-time hydration
   // can call their CRUD ops. The pure bundle widens refEntity to EntityDefinition.
   const resolvedRefs = data.resolvedRefs as unknown as ReadonlyArray<ResolvedRef>
   // allIndexes is mutable: _injectIndex adds collection-owned GSIs after make().
   let allIndexes: globalThis.Record<string, IndexDefinition> = { ...data.initialIndexes }
+
+  /** Composites of the secondary indexes (`allIndexes` grows after make()). */
+  const indexCompositeFields = (): ReadonlySet<string> =>
+    new Set(
+      Object.entries(allIndexes)
+        .filter(([name]) => name !== "primary")
+        .flatMap(([, def]) => [...def.pk.composite, ...def.sk.composite]),
+    )
+
+  /**
+   * Why `field` feeds a key or a unique sentinel — values the library derives
+   * from the field at write time — or `undefined` when it feeds neither.
+   */
+  const derivedFrom = (field: string): string | undefined => {
+    const primary = allIndexes.primary
+    if (primary && [...primary.pk.composite, ...primary.sk.composite].includes(field)) {
+      return "a primary-key composite"
+    }
+    for (const [name, def] of Object.entries(allIndexes)) {
+      if (name === "primary") continue
+      if (def.pk.composite.includes(field) || def.sk.composite.includes(field)) {
+        return `a composite of index "${name}"`
+      }
+    }
+    for (const [name, def] of Object.entries(
+      (config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>,
+    )) {
+      if (resolveUniqueFields(def).includes(field)) return `a field of unique constraint "${name}"`
+    }
+    return undefined
+  }
+
+  /**
+   * Path operations on a field that feeds a key or a unique sentinel (#133).
+   *
+   * DynamoDB evaluates a path operation, so compiling one on such a field would
+   * change the attribute while its index keys and sentinel stay as they were.
+   * A top-level `pathSet` of a value / `pathRemove` IS `.set()` / `.remove()`
+   * of that field, and `pathAdd` / `pathSubtract` of a number IS `.add()` /
+   * `.subtract()`: they are rewritten into those record operations, which go
+   * through the key composer and the sentinel rotation. Anything whose result
+   * only DynamoDB knows (a copy from another attribute, `if_not_exists`, list
+   * and set operations) is refused, as is a path below such a field, a
+   * primary-key composite (it identifies the item), an immutable field, and a
+   * field targeted twice. Returns the rewritten state or the refusal.
+   */
+  const normalizeDerivedPathOps = (uState: UpdateState): UpdateState | string => {
+    if (!hasPathOps(uState)) return uState
+    const updates: globalThis.Record<string, unknown> = {
+      ...((uState.updates as globalThis.Record<string, unknown> | undefined) ?? {}),
+    }
+    const remove = [...(uState.remove ?? [])]
+    const add: globalThis.Record<string, number> = { ...uState.add }
+    const subtract: globalThis.Record<string, number> = { ...uState.subtract }
+    const targeted = new Set<string>([
+      ...Object.keys(updates),
+      ...remove,
+      ...Object.keys(add),
+      ...Object.keys(subtract),
+      ...Object.keys(uState.append ?? {}),
+      ...Object.keys(uState.deleteFromSet ?? {}),
+    ])
+    let refusal: string | undefined
+    let rewritten = false
+    const shown = (segments: ReadonlyArray<string | number>) =>
+      JSON.stringify(
+        segments.map((s, i) => (typeof s === "number" ? `[${s}]` : i === 0 ? s : `.${s}`)).join(""),
+      )
+    // The field a path operation addresses when it feeds a key or sentinel,
+    // "free" when it feeds neither, or "refused" (recorded) for the shapes
+    // that can never be rewritten.
+    const claim = (
+      op: string,
+      segments: ReadonlyArray<string | number>,
+    ): { readonly field: string; readonly reason: string } | "free" | "refused" => {
+      const first = segments[0]
+      if (typeof first !== "string") return "free"
+      const head: string = first
+      const reason = derivedFrom(head)
+      if (reason === undefined) return "free"
+      if (segments.length > 1) {
+        refusal ??=
+          `${op} on ${shown(segments)}: "${head}" is ${reason}, so a path below it cannot be ` +
+          `updated. Write the whole value with .set({ ${head} }).`
+      } else if (reason === "a primary-key composite") {
+        refusal ??=
+          `${op} on "${head}": "${head}" is a primary-key composite — it identifies the item ` +
+          "and cannot be changed by an update."
+      } else if (immutableFields.has(head)) {
+        refusal ??= `${op} on "${head}": "${head}" is immutable and cannot be changed by an update.`
+      } else if (targeted.has(head)) {
+        refusal ??=
+          `${op} on "${head}": "${head}" is ${reason} and is already targeted by another ` +
+          "operation in this update. Give it one operation."
+      } else {
+        targeted.add(head)
+        return { field: head, reason }
+      }
+      return "refused"
+    }
+    const serverSide = (op: string, field: string, reason: string) => {
+      refusal ??=
+        `${op} on "${field}": "${field}" is ${reason}. DynamoDB computes this operation's ` +
+        `result at write time, so the key or sentinel derived from "${field}" could not be ` +
+        `recomposed to match. Read the item and write the new value with .set({ ${field} }).`
+    }
+    const keep = <Op>(
+      ops: ReadonlyArray<Op> | undefined,
+      segmentsOf: (op: Op) => ReadonlyArray<string | number>,
+      name: string,
+      rewrite: (op: Op, field: string, reason: string) => void,
+    ): ReadonlyArray<Op> | undefined => {
+      if (ops === undefined) return undefined
+      const kept: Array<Op> = []
+      for (const op of ops) {
+        const claimed = claim(name, segmentsOf(op))
+        if (claimed === "free") kept.push(op)
+        if (typeof claimed === "string") continue
+        rewritten = true
+        rewrite(op, claimed.field, claimed.reason)
+      }
+      return kept
+    }
+    const pathSets = keep(
+      uState.pathSets,
+      (op) => op.segments,
+      "pathSet",
+      (op, field, reason) => {
+        if (op.isPath) serverSide("pathSet (a copy of another attribute)", field, reason)
+        else updates[field] = op.value
+      },
+    )
+    const pathRemoves = keep(
+      uState.pathRemoves,
+      (segments) => segments,
+      "pathRemove",
+      (_, field) => {
+        remove.push(field)
+      },
+    )
+    const pathAdds = keep(
+      uState.pathAdds,
+      (op) => op.segments,
+      "pathAdd",
+      (op, field, reason) => {
+        if (typeof op.value === "number") add[field] = op.value
+        else serverSide("pathAdd (to a set)", field, reason)
+      },
+    )
+    const pathSubtracts = keep(
+      uState.pathSubtracts,
+      (op) => op.segments,
+      "pathSubtract",
+      (op, field, reason) => {
+        if (!op.isPath && typeof op.value === "number") subtract[field] = op.value
+        else serverSide("pathSubtract (of another attribute)", field, reason)
+      },
+    )
+    const refuseAll =
+      (name: string) =>
+      (_: unknown, field: string, reason: string): void =>
+        serverSide(name, field, reason)
+    const pathAppends = keep(
+      uState.pathAppends,
+      (op) => op.segments,
+      "pathAppend",
+      refuseAll("pathAppend"),
+    )
+    const pathPrepends = keep(
+      uState.pathPrepends,
+      (op) => op.segments,
+      "pathPrepend",
+      refuseAll("pathPrepend"),
+    )
+    const pathIfNotExists = keep(
+      uState.pathIfNotExists,
+      (op) => op.segments,
+      "pathIfNotExists",
+      refuseAll("pathIfNotExists"),
+    )
+    const pathDeletes = keep(
+      uState.pathDeletes,
+      (op) => op.segments,
+      "pathDelete",
+      refuseAll("pathDelete"),
+    )
+    if (refusal !== undefined) return refusal
+    if (!rewritten) return uState
+    return {
+      ...uState,
+      updates: Object.keys(updates).length > 0 ? updates : uState.updates,
+      remove: remove.length > 0 ? remove : uState.remove,
+      add: Object.keys(add).length > 0 ? add : uState.add,
+      subtract: Object.keys(subtract).length > 0 ? subtract : uState.subtract,
+      pathSets,
+      pathRemoves,
+      pathAdds,
+      pathSubtracts,
+      pathAppends,
+      pathPrepends,
+      pathIfNotExists,
+      pathDeletes,
+    }
+  }
+
+  /**
+   * A `.set()` of a primary-key composite with a value other than the key's
+   * (#133): it identifies the item and cannot change. It was silently dropped;
+   * the update types already exclude it. The key's own value is a no-op, so a
+   * spread record keeps working.
+   */
+  const refusedRecordSet = (updates: unknown, key: unknown): string | undefined => {
+    if (typeof updates !== "object" || updates === null) return undefined
+    const record = updates as globalThis.Record<string, unknown>
+    const keyRecord = (key ?? {}) as globalThis.Record<string, unknown>
+    const primary = allIndexes.primary
+    for (const field of primary ? [...primary.pk.composite, ...primary.sk.composite] : []) {
+      if (record[field] === undefined || Equal.equals(record[field], keyRecord[field])) continue
+      return (
+        `.set() of "${field}": "${field}" is a primary-key composite — it identifies the item ` +
+        "and cannot be changed by an update."
+      )
+    }
+    return undefined
+  }
+
+  type AssertedImmutable = {
+    readonly field: string
+    readonly attr: string
+    readonly value: AttributeValue
+  }
+
+  /**
+   * The immutable fields a `.set()` names, in stored form (#133). An update may
+   * restate an immutable field's value — a spread record does — but never
+   * change it: each one is checked against the item (read, or a condition on
+   * the write) and a different value is refused.
+   */
+  const assertedImmutables = (updates: unknown): ReadonlyArray<AssertedImmutable> | string => {
+    if (typeof updates !== "object" || updates === null) return []
+    const record = updates as globalThis.Record<string, unknown>
+    const out: Array<AssertedImmutable> = []
+    for (const field of immutableFields) {
+      if (record[field] === undefined) continue
+      const encoded = encodePathValue([field], record[field], "value")
+      if (encoded.issue !== undefined) {
+        return `.set() of immutable "${field}": ${String(encoded.issue)}`
+      }
+      out.push({ field, attr: resolveDbName(field), value: toAttributeValue(encoded.encoded) })
+    }
+    return out
+  }
+  const immutableMismatch = (
+    asserted: ReadonlyArray<AssertedImmutable>,
+    stored: Readonly<globalThis.Record<string, unknown>>,
+  ): string | undefined => {
+    const changed = asserted.find(
+      ({ attr, value }) => !attributeValueEquals(stored[attr] as AttributeValue | undefined, value),
+    )
+    return changed === undefined
+      ? undefined
+      : `.set() of "${changed.field}": "${changed.field}" is immutable and the update's value ` +
+          "differs from the stored one."
+  }
+
+  /**
+   * Whether an update can safely create the item it names (#133): its payload
+   * supplies every required model field and every primary-key composite, so
+   * the item it writes decodes. Anything less on a missing item would leave a
+   * partial row behind — those updates require the item to exist.
+   */
+  const completeUpsertPayload = (updates: unknown): boolean => {
+    if (typeof updates !== "object" || updates === null) return false
+    const record = updates as globalThis.Record<string, unknown>
+    const present = (field: string) => record[field] !== undefined && record[field] !== null
+    const primary = allIndexes.primary
+    if (primary && ![...primary.pk.composite, ...primary.sk.composite].every(present)) return false
+    for (const [field, fieldSchema] of Object.entries(
+      data.modelFields as globalThis.Record<string, Schema.Top>,
+    )) {
+      const ast = fieldSchema.ast as {
+        readonly context?: { readonly isOptional?: boolean }
+        readonly encoding?: ReadonlyArray<{
+          readonly to: { readonly context?: { readonly isOptional?: boolean } }
+        }>
+      }
+      if (ast.context?.isOptional === true) continue
+      // A decoding default (optional on the stored side): `put` may omit it too.
+      if (ast.encoding?.[ast.encoding.length - 1]?.to.context?.isOptional === true) continue
+      const ref = resolvedRefs.find((r) => r.fieldName === field)
+      if (present(field) || (ref !== undefined && present(ref.idFieldName))) continue
+      return false
+    }
+    return true
+  }
+
   // schema + tableTag are injected via _configure() when the entity is registered
   // on a Table and bound through DynamoClient.make(); captured by operation closures.
   let schema!: DynamoSchema.DynamoSchema
@@ -1890,11 +2606,167 @@ const makeImpl = <
     )
   }
 
+  /**
+   * The model fields with a decoding default (`Schema.withDecodingDefault` and
+   * kin: optional on the stored side, required on the domain side).
+   */
+  const defaultedFields: ReadonlyArray<readonly [string, Schema.Top]> = Object.entries(
+    data.modelFields as globalThis.Record<string, Schema.Top>,
+  ).filter(([, field]) => {
+    const ast = field.ast as {
+      readonly context?: { readonly isOptional?: boolean }
+      readonly encoding?: ReadonlyArray<{
+        readonly to: { readonly context?: { readonly isOptional?: boolean } }
+      }>
+    }
+    return (
+      ast.context?.isOptional !== true &&
+      ast.encoding?.[ast.encoding.length - 1]?.to.context?.isOptional === true
+    )
+  })
+
+  /**
+   * Fill each omitted decoding-default field that an INDEX key derives from —
+   * a primary-key, GSI or LSI composite — with its default (#133), so the item
+   * stores it, its keys compose from it, and the item, its keys and its decoded
+   * read all agree. Left out, the item had no index keys while its decoded
+   * record named a value the index is keyed by. A default never creates a
+   * unique sentinel (`unsentineledDefaults`); other defaulted fields keep
+   * their contract: not stored, defaulted on read.
+   */
+  /** The defaulted fields an index key derives from — materialised when omitted. */
+  const indexedDefaultFields = (): ReadonlySet<string> => {
+    const composites = new Set(
+      Object.values(allIndexes).flatMap((def) => [...def.pk.composite, ...def.sk.composite]),
+    )
+    return new Set(defaultedFields.map(([name]) => name).filter((name) => composites.has(name)))
+  }
+  /**
+   * The unique-constraint fields a write's input omits but stores a default
+   * for (an index composite): the item lists them in `__edd_d__`, and no
+   * sentinel is composed from them — a default never creates a sentinel.
+   */
+  const unsentineledDefaults = (input: unknown): ReadonlyArray<string> => {
+    if (config.unique == null || typeof input !== "object" || input === null) return []
+    const record = input as globalThis.Record<string, unknown>
+    const unique = new Set(
+      Object.values(config.unique as globalThis.Record<string, UniqueConstraintDef>).flatMap(
+        (def) => [...resolveUniqueFields(def)],
+      ),
+    )
+    return [...indexedDefaultFields()].filter(
+      (name) => unique.has(name) && record[name] === undefined,
+    )
+  }
+
+  /**
+   * An update's `.remove()` of a defaulted index composite: the field would
+   * read back as its default while its index keys were dropped. It becomes a
+   * `.set()` of the default instead (#133) — stored, keys recomposed from it —
+   * and the fields so defaulted are returned (a unique one then holds only a
+   * default: `__edd_d__`).
+   */
+  const rematerializeRemovedDefaults = (
+    uState: UpdateState,
+  ): Effect.Effect<
+    { readonly state: UpdateState; readonly defaulted: ReadonlyArray<string> },
+    ValidationError
+  > => {
+    const indexed = indexedDefaultFields()
+    const removed = (uState.remove ?? []).filter((field) => indexed.has(field))
+    if (removed.length === 0) return Effect.succeed({ state: uState, defaulted: [] })
+    const fields = defaultedFields.filter(([name]) => removed.includes(name))
+    return Schema.decodeUnknownEffect(
+      Schema.Struct(Object.fromEntries(fields)) as unknown as Schema.Codec<any>,
+    )({}).pipe(
+      Effect.map((defaults) => ({
+        state: {
+          ...uState,
+          remove: (uState.remove ?? []).filter((field) => !removed.includes(field)),
+          updates: {
+            ...((uState.updates as globalThis.Record<string, unknown> | undefined) ?? {}),
+            ...(defaults as object),
+          },
+        },
+        defaulted: removed,
+      })),
+      Effect.mapError(
+        (cause) => new ValidationError({ entityType, operation: "update.default", cause }),
+      ),
+    ) as Effect.Effect<
+      { readonly state: UpdateState; readonly defaulted: ReadonlyArray<string> },
+      ValidationError
+    >
+  }
+
+  const fillDecodingDefaults = (input: unknown): Effect.Effect<unknown, ValidationError> => {
+    if (defaultedFields.length === 0 || typeof input !== "object" || input === null) {
+      return Effect.succeed(input)
+    }
+    const record = input as globalThis.Record<string, unknown>
+    const keyed = indexedDefaultFields()
+    const missing = defaultedFields.filter(
+      ([name]) => keyed.has(name) && record[name] === undefined,
+    )
+    if (missing.length === 0) return Effect.succeed(input)
+    return Schema.decodeUnknownEffect(
+      Schema.Struct(Object.fromEntries(missing)) as unknown as Schema.Codec<any>,
+    )({}).pipe(
+      Effect.map((defaults) => ({ ...record, ...(defaults as object) })),
+      Effect.mapError(
+        (cause) => new ValidationError({ entityType, operation: "put.default", cause }),
+      ),
+    ) as Effect.Effect<unknown, ValidationError>
+  }
+
+  /** Whether `input` omits a defaulted field an index key derives from (see `fillDecodingDefaults`). */
+  const omitsIndexedDefault = (input: unknown): boolean => {
+    if (defaultedFields.length === 0 || typeof input !== "object" || input === null) return false
+    const record = input as globalThis.Record<string, unknown>
+    return [...indexedDefaultFields()].some((name) => record[name] === undefined)
+  }
+
   /** Attach the model class prototype to a decoded plain object (when model is Schema.Class). */
   const attachPrototype = (decoded: any) =>
     isSchemaClass ? Object.assign(Object.create((rawModel as any).prototype), decoded) : decoded
 
+  /**
+   * An item of a versioned entity with an incarnation token but no version
+   * (#133). A versioned entity stamps the token when it creates an item, so
+   * only an item written before the entity was `versioned` may lack a version
+   * — and it lacks the token too. Token without version: the version was
+   * removed outside the library. Reading it as version 0 would let the next
+   * update rewrite the item's history, so every read and write refuses it.
+   */
+  const versionCorruption = (
+    item: Readonly<globalThis.Record<string, unknown>> | undefined,
+    operation: string,
+  ): ValidationError | undefined =>
+    systemFields.version &&
+    item !== undefined &&
+    item[systemFields.version] === undefined &&
+    item[INCARNATION_TOKEN] !== undefined
+      ? new ValidationError({
+          entityType,
+          operation,
+          cause:
+            `The ${entityType} item has an incarnation token (${INCARNATION_TOKEN}) but no ` +
+            `"${systemFields.version}" attribute: its version was removed outside the library. ` +
+            "It is refused rather than read as version 0, which would let an update overwrite " +
+            "its version history. Restore the version attribute.",
+        })
+      : undefined
+  const checkVersion = (
+    item: Readonly<globalThis.Record<string, unknown>> | undefined,
+    operation: string,
+  ): Effect.Effect<void, ValidationError> => {
+    const corruption = versionCorruption(item, operation)
+    return corruption === undefined ? Effect.void : Effect.fail(corruption)
+  }
+
   const decodeRecord = (raw: globalThis.Record<string, unknown>) => {
+    const corruption = versionCorruption(raw, "decode")
+    if (corruption !== undefined) return Effect.fail(corruption)
     deserializeSparseFields(raw)
     renameFromDynamo(raw)
     return Schema.decodeUnknownEffect(schemas.recordSchema as Schema.Codec<any>)(raw).pipe(
@@ -1916,6 +2788,8 @@ const makeImpl = <
     marshalled: globalThis.Record<string, AttributeValue>,
     mode: DecodeMode,
   ) => {
+    const corruption = versionCorruption(raw, "decode")
+    if (corruption !== undefined) return Effect.fail(corruption)
     if (mode === "native") return Effect.succeed(marshalled)
     // Collect flattened sparse-map attributes back into the domain Record.
     // Must happen before rename so the rebuilt Record sits at the domain field
@@ -2394,6 +3268,710 @@ const makeImpl = <
       return { sets, removes }
     })
 
+  // ---------------------------------------------------------------------------
+  // Update concurrency and return values (#133)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * What proves an item is the same INCARNATION as the one read — not a
+   * deleted-and-recreated item at the same version: a hidden per-incarnation
+   * token, `__edd_i__`, a random UUID set when the item is created (put,
+   * create, upsert, batch / transaction put). `createdAt` would not do: two
+   * creates in the same millisecond, or a caller-supplied value, repeat it.
+   * Only versioned entities need it — their version CAS is what it completes.
+   */
+  const incarnationAttr: string | undefined = systemFields.version ? INCARNATION_TOKEN : undefined
+  const stampsIncarnation = incarnationAttr === INCARNATION_TOKEN
+  const freshIncarnation = freshIncarnationToken
+
+  /**
+   * The condition (and its names / values) proving the stored item is still
+   * the incarnation `read` — `undefined` when the entity needs no proof.
+   */
+  const incarnationGuard = (
+    read: globalThis.Record<string, AttributeValue>,
+    names: globalThis.Record<string, string>,
+    values: globalThis.Record<string, AttributeValue>,
+  ): string | undefined => {
+    if (incarnationAttr === undefined) return undefined
+    names["#inc"] = incarnationAttr
+    const value = read[incarnationAttr]
+    if (value === undefined) return "attribute_not_exists(#inc)"
+    values[":inc"] = value
+    return "#inc = :inc"
+  }
+
+  /**
+   * The version an item is stored at: `undefined` for no item, 0 for an item
+   * written before the entity was `versioned` (it has no version attribute;
+   * real versions start at 1).
+   */
+  const storedVersionOf = (
+    item: Readonly<globalThis.Record<string, unknown>> | undefined,
+  ): number | undefined => {
+    if (item === undefined || !systemFields.version) return undefined
+    const attr = item[systemFields.version]
+    return attr !== undefined ? Number((attr as { readonly N?: string }).N) : 0
+  }
+
+  /**
+   * A version-snapshot Put that never overwrites history (#133). The
+   * `v#<version>` row may already exist only as a snapshot of the SAME state —
+   * a retain `put` writes `v#0000001` and the first update snapshots that same
+   * version 1 state again; a restore re-writes the delete-time snapshot — so
+   * the row is replaced only when it holds the same version, the same
+   * incarnation and (with timestamps) the same `updatedAt`. Any other row is a
+   * different history, and the write is refused.
+   */
+  const snapshotPut = (tableName: string, snapshotItem: globalThis.Record<string, unknown>) => {
+    const names: globalThis.Record<string, string> = { "#snap": config.indexes.primary.pk.field }
+    const values: globalThis.Record<string, AttributeValue> = {}
+    const same: Array<string> = []
+    if (systemFields.version) {
+      const version = snapshotItem[systemFields.version]
+      same.push(
+        versionIs(typeof version === "number" ? version : 0, names, values, "#snapVer", ":snapVer"),
+      )
+    }
+    const sameAs = (attr: string, tag: string) => {
+      names[`#${tag}`] = attr
+      const value = snapshotItem[attr]
+      if (value === undefined) {
+        same.push(`attribute_not_exists(#${tag})`)
+      } else {
+        values[`:${tag}`] = toAttributeValue(value)
+        same.push(`#${tag} = :${tag}`)
+      }
+    }
+    sameAs(INCARNATION_TOKEN, "snapInc")
+    if (systemFields.updatedAt) sameAs(systemFields.updatedAt, "snapUpd")
+    return {
+      TableName: tableName,
+      Item: toAttributeMap(snapshotItem),
+      ConditionExpression: `attribute_not_exists(#snap) OR (${same.join(" AND ")})`,
+      ExpressionAttributeNames: names,
+      ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
+    }
+  }
+  /** A version snapshot Put refused: that version's history row already exists. */
+  const historyConflict = (version: number, operation: string): ValidationError =>
+    new ValidationError({
+      entityType,
+      operation,
+      cause:
+        `The ${entityType} version ${version} snapshot already exists: the item's version is ` +
+        "inconsistent with its history, and history is never overwritten. Nothing was written.",
+    })
+
+  /**
+   * The condition that the stored version is `version` — for version 0 (an
+   * item written before the entity was `versioned`), that it has none (#133).
+   */
+  const versionIs = (
+    version: number,
+    names: globalThis.Record<string, string>,
+    values: globalThis.Record<string, AttributeValue>,
+    name: string,
+    value: string,
+  ): string => {
+    names[name] = systemFields.version!
+    if (version === 0) return `attribute_not_exists(${name})`
+    values[value] = toAttributeValue(version)
+    return `${name} = ${value}`
+  }
+
+  /**
+   * Which predicate rejected a version-conditioned (or user-conditioned)
+   * write. The write asked for `ReturnValuesOnConditionCheckFailure: "ALL_OLD"`,
+   * so DynamoDB hands back the item as stored: a version other than the one
+   * the write was conditioned on — or another incarnation at that version — is
+   * a lost race; otherwise the user's `.condition()` rejected it. No item back
+   * means the item is gone — a race when the write was version-conditioned.
+   */
+  const conditionRejection = (
+    key: globalThis.Record<string, unknown>,
+    stored: Readonly<globalThis.Record<string, unknown>> | undefined,
+    cas:
+      | {
+          /** `undefined`: the item read had no version (written before `versioned`). */
+          readonly version: number | undefined
+          /** The item read, when the write also proved its incarnation. */
+          readonly read?: globalThis.Record<string, AttributeValue> | undefined
+        }
+      | undefined,
+    userCondition: boolean,
+  ): OptimisticLockError | ConditionalCheckFailed => {
+    const storedVersion = storedVersionOf(stored)
+    const otherIncarnation =
+      cas?.read !== undefined &&
+      incarnationAttr !== undefined &&
+      !attributeValueEquals(
+        stored?.[incarnationAttr] as AttributeValue | undefined,
+        cas.read[incarnationAttr],
+      )
+    if (
+      (cas !== undefined && (storedVersion !== cas.version || otherIncarnation)) ||
+      !userCondition
+    ) {
+      return new OptimisticLockError({
+        entityType,
+        key,
+        expectedVersion: cas?.version ?? -1,
+        actualVersion: storedVersion ?? -1,
+      })
+    }
+    return new ConditionalCheckFailed({ entityType, key })
+  }
+
+  /**
+   * A condition the library sends — its own guard plus the user's
+   * `.condition()` — that exceeds DynamoDB's limits on one expression (4 KB,
+   * 300 operators and functions): refused BEFORE writing (#133).
+   */
+  const oversizedCondition = (
+    operation: string,
+    condition: string | undefined,
+    user: string | undefined,
+  ): ValidationError | undefined => {
+    if (condition === undefined || expressionFits(condition)) return undefined
+    const own = expressionCost(user)
+    return new ValidationError({
+      entityType,
+      operation,
+      cause:
+        `The ${operation}'s condition is ${expressionCost(condition).length} characters / ` +
+        `${expressionCost(condition).operators} operators — beyond DynamoDB's limits on one ` +
+        `expression (${EXPRESSION_LIMIT} characters, ${OPERATOR_LIMIT} operators). The ` +
+        `.condition() alone is ${own.length} characters / ${own.operators} operators, and ` +
+        "the library's own guard needs room beside it: simplify the condition.",
+    })
+  }
+
+  /** The domain field a stored attribute holds (`storedAs` renames reversed). */
+  const domainNameOf = (attr: string): string =>
+    Object.keys(data.modelFields as object).find((field) => resolveDbName(field) === attr) ?? attr
+
+  /**
+   * The condition a read-then-write DELETE carries (#133): the item is still
+   * what the tombstone, snapshot and sentinel deletes were derived from.
+   * Versioned: its version and incarnation. Otherwise: it exists and every
+   * attribute in `dependsOn` still holds the value read (absent ones still
+   * absent). `"item"` means the whole item — a tombstone copies all of it —
+   * so every stored attribute is guarded, plus every attribute the entity
+   * knows of that was absent; an item too wide for that falls back to the
+   * strongest guard within DynamoDB's expression limit (never a refusal).
+   */
+  const deleteGuard = (
+    read: globalThis.Record<string, AttributeValue>,
+    dependsOn: "item" | ReadonlyArray<string>,
+    /** The rest of the condition, ANDed with the guard (the user's, …). */
+    others: string | undefined,
+  ):
+    | {
+        readonly expression: string
+        readonly names: globalThis.Record<string, string>
+        readonly values: globalThis.Record<string, AttributeValue>
+        readonly inputs: ReadonlyArray<string>
+      }
+    | ValidationError => {
+    // Whether a guard fits beside `others` within DynamoDB's real limits.
+    const fits = (guard: string) =>
+      expressionFits(others === undefined || others === "" ? guard : `${guard} AND (${others})`)
+    const names: globalThis.Record<string, string> = {}
+    const values: globalThis.Record<string, AttributeValue> = {}
+    const parts: Array<string> = []
+    const pkField = config.indexes.primary.pk.field
+    const skField = config.indexes.primary.sk.field
+    if (systemFields.version) {
+      names["#dver"] = systemFields.version
+      // An item written before the entity was `versioned` has no version.
+      const readVersion = read[systemFields.version]
+      if (readVersion === undefined) {
+        parts.push("attribute_not_exists(#dver)")
+      } else {
+        values[":dver"] = readVersion
+        parts.push("#dver = :dver")
+      }
+      const incarnation = incarnationGuard(read, names, values)
+      if (incarnation !== undefined) parts.push(incarnation)
+      const expression = parts.join(" AND ")
+      if (!fits(expression)) return tooLargeBeside(expression)
+      return { expression, names, values, inputs: [] }
+    }
+    names["#dpk"] = pkField
+    parts.push("attribute_exists(#dpk)")
+    if (!fits(parts.join(" AND "))) return tooLargeBeside(parts.join(" AND "))
+    const attrs =
+      dependsOn === "item"
+        ? [
+            ...new Set([
+              ...Object.keys(read),
+              ...Object.keys(data.modelFields as object).map(resolveDbName),
+              ...[systemFields.createdAt, systemFields.updatedAt].filter(
+                (f): f is string => typeof f === "string",
+              ),
+              ...gsiKeyFields(),
+              ...vectorKeyFields(),
+            ]),
+          ].filter((attr) => attr !== pkField && attr !== skField)
+        : dependsOn
+    const guardOf = (attr: string, i: number): string => {
+      names[`#dg${i}`] = attr
+      if (read[attr] === undefined) return `attribute_not_exists(#dg${i})`
+      values[`:dg${i}`] = read[attr]!
+      return `#dg${i} = :dg${i}`
+    }
+    const full = [...parts, ...attrs.map(guardOf)].join(" AND ")
+    if (fits(full)) return { expression: full, names, values, inputs: attrs }
+    // Too wide to guard attribute by attribute (a sparse map with hundreds of
+    // entries): the strongest guard that fits. Every library write sets
+    // `updatedAt`, so with timestamps it alone detects any library update;
+    // then as many attributes as fit, those the sentinels derive from first,
+    // then the model's own fields, then the rest.
+    for (const key of Object.keys(names)) if (key.startsWith("#dg")) delete names[key]
+    for (const key of Object.keys(values)) if (key.startsWith(":dg")) delete values[key]
+    const uniqueAttrs = Object.values(config.unique ?? {}).flatMap((def) =>
+      resolveUniqueFields(def as UniqueConstraintDef).map(resolveDbName),
+    )
+    const modelAttrs = Object.keys(data.modelFields as object).map(resolveDbName)
+    const ordered = [
+      ...new Set([
+        ...(systemFields.updatedAt ? [systemFields.updatedAt] : []),
+        ...uniqueAttrs,
+        ...modelAttrs,
+        ...attrs.slice().sort(),
+      ]),
+    ].filter((attr) => attrs.includes(attr))
+    const inputs: Array<string> = []
+    let expression = parts.join(" AND ")
+    for (const attr of ordered) {
+      const clause = guardOf(attr, inputs.length)
+      if (!fits(`${expression} AND ${clause}`)) {
+        delete names[`#dg${inputs.length}`]
+        delete values[`:dg${inputs.length}`]
+        continue
+      }
+      expression = `${expression} AND ${clause}`
+      inputs.push(attr)
+    }
+    return { expression, names, values, inputs }
+
+    function tooLargeBeside(guard: string): ValidationError {
+      return (
+        oversizedCondition(
+          "write",
+          others === undefined || others === "" ? guard : `${guard} AND (${others})`,
+          others,
+        ) ?? new ValidationError({ entityType, operation: "write", cause: "condition too large" })
+      )
+    }
+  }
+
+  /** Which predicate rejected a guarded delete — from the stored item (ALL_OLD). */
+  const deleteRejection = (
+    key: globalThis.Record<string, unknown>,
+    read: globalThis.Record<string, AttributeValue>,
+    inputs: ReadonlyArray<string>,
+    stored: Readonly<globalThis.Record<string, unknown>> | undefined,
+    userCondition: boolean,
+  ): ItemNotFound | OptimisticLockError | ConcurrentModification | ConditionalCheckFailed => {
+    if (stored === undefined) return new ItemNotFound({ entityType, key })
+    if (systemFields.version) {
+      return conditionRejection(
+        key,
+        stored,
+        { version: storedVersionOf(read), read },
+        userCondition,
+      )
+    }
+    const changed = inputs.filter(
+      (attr) => !attributeValueEquals(stored[attr] as AttributeValue | undefined, read[attr]),
+    )
+    if (changed.length === 0 && userCondition)
+      return new ConditionalCheckFailed({ entityType, key })
+    return new ConcurrentModification({
+      entityType,
+      key,
+      attributes: changed.map(domainNameOf),
+      current: Option.none(),
+    })
+  }
+
+  /** Fill a `ConcurrentModification`'s `current` with the stored item, decoded. */
+  const withCurrentItem = <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+    stored: () => globalThis.Record<string, AttributeValue> | undefined,
+  ) =>
+    effect.pipe(
+      Effect.catchIf(
+        (e): e is E & ConcurrentModification => e instanceof ConcurrentModification,
+        (e) =>
+          Effect.gen(function* () {
+            const item = stored()
+            const current =
+              item === undefined
+                ? Option.none()
+                : yield* Effect.option(
+                    decodeAs(
+                      fromAttributeMap(item) as globalThis.Record<string, unknown>,
+                      item,
+                      "model",
+                    ),
+                  )
+            return yield* keepReleaseRace(e, new ConcurrentModification({ ...e, current }))
+          }),
+      ),
+    )
+
+  /**
+   * The item a retain path update wrote, read back after its transaction. The
+   * write is proven by version AND incarnation: within one incarnation a
+   * version is written exactly once, so the live item is ours while it holds
+   * our version and incarnation; once a later write replaced it, the
+   * `v#<ourVersion>` snapshot that write took is ours — if it carries our
+   * incarnation (a snapshot left by an earlier incarnation of the item does
+   * not). It is restored to item shape: what a snapshot strips (index and
+   * vector attributes) or adds (its sort key and TTL) comes from the item we
+   * replaced plus this update's own writes. Without a proven post-image the
+   * update still WAS applied: {@link UpdateAppliedButUnreadable}.
+   */
+  const readRetainPostImage = (
+    tableName: string,
+    marshalledKey: globalThis.Record<string, AttributeValue>,
+    replaced: globalThis.Record<string, AttributeValue>,
+    ourVersion: number,
+    ourIncarnation: AttributeValue | undefined,
+    derivedSets: globalThis.Record<string, AttributeValue>,
+    derivedRemoves: ReadonlySet<string>,
+    ttlAttrName: string,
+    encodedKey: globalThis.Record<string, unknown>,
+  ) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const ours = (item: globalThis.Record<string, AttributeValue> | undefined) =>
+        item !== undefined &&
+        (incarnationAttr === undefined ||
+          attributeValueEquals(item[incarnationAttr], ourIncarnation))
+      const current = (yield* client.getItem({
+        TableName: tableName,
+        Key: marshalledKey,
+        ConsistentRead: true,
+      })).Item
+      if (storedVersionOf(current) === ourVersion && ours(current)) return current!
+      const skField = config.indexes.primary.sk.field
+      const snapshot = (yield* client.getItem({
+        TableName: tableName,
+        Key: {
+          ...marshalledKey,
+          [skField]: toAttributeValue(
+            DynamoSchema.composeVersionKey(
+              schema,
+              entityType,
+              ourVersion,
+              historyKeyOptions(marshalledKey[skField]?.S),
+            ),
+          ),
+        },
+        ConsistentRead: true,
+      })).Item
+      if (!ours(snapshot)) {
+        return yield* new UpdateAppliedButUnreadable({
+          entityType,
+          key: encodedKey,
+          version: ourVersion,
+          reason:
+            current === undefined
+              ? "the item was deleted before it could be read back"
+              : `the item moved past version ${ourVersion}, and no snapshot of this write ` +
+                "remains to read it from",
+        })
+      }
+      const post: globalThis.Record<string, AttributeValue> = { ...snapshot! }
+      post[skField] = marshalledKey[skField]!
+      const restored = [
+        ...gsiKeyFields(),
+        ...vectorKeyFields(),
+        ...vectorIndexEntries.map(([, definition]) => definition.stashField),
+        ...(retainTtl() ? [ttlAttrName] : []),
+      ]
+      for (const field of restored) {
+        delete post[field]
+        if (replaced[field] !== undefined) post[field] = replaced[field]
+      }
+      Object.assign(post, derivedSets)
+      for (const field of derivedRemoves) delete post[field]
+      return post
+    })
+
+  /**
+   * Decode only `attributes` of a stored image (`updatedOld` / `updatedNew`):
+   * a partial — the fields present, each through its own schema.
+   */
+  const decodePartial = (
+    image: globalThis.Record<string, AttributeValue> | undefined,
+    attributes: ReadonlySet<string>,
+    mode: DecodeMode,
+  ) => {
+    const corruption = versionCorruption(image, "decode")
+    if (corruption !== undefined) return Effect.fail(corruption)
+    const projected: globalThis.Record<string, AttributeValue> = {}
+    for (const [attr, value] of Object.entries(image ?? {})) {
+      if (attributes.has(attr)) projected[attr] = value
+    }
+    if (mode === "native") return Effect.succeed(projected)
+    const raw = fromAttributeMap(projected) as globalThis.Record<string, unknown>
+    deserializeSparseFields(raw)
+    renameFromDynamo(raw)
+    const target =
+      mode === "model"
+        ? schemas.modelSchema
+        : mode === "record"
+          ? schemas.recordSchema
+          : schemas.itemSchema
+    const fields = (target as unknown as { readonly fields: Schema.Struct.Fields }).fields
+    const present = Object.fromEntries(Object.entries(fields).filter(([name]) => name in raw))
+    return Schema.decodeUnknownEffect(Schema.Struct(present) as unknown as Schema.Codec<any>)(
+      raw,
+    ).pipe(
+      Effect.mapError((cause) => new ValidationError({ entityType, operation: "decode", cause })),
+    )
+  }
+  /**
+   * The value an update returns for its `returnValues` mode, from the item
+   * before (`old`) and after (`next`) it, and the attributes it wrote:
+   * `none` → `undefined`; `allOld` / `allNew` → the whole item; `updatedOld` /
+   * `updatedNew` → just the written attributes, decoded as a partial.
+   */
+  const updateResult = (
+    rv: ReturnValuesMode,
+    old: globalThis.Record<string, AttributeValue> | undefined,
+    next: globalThis.Record<string, AttributeValue> | undefined,
+    written: ReadonlySet<string>,
+    mode: DecodeMode,
+    encodedKey: globalThis.Record<string, unknown>,
+  ): Effect.Effect<unknown, ValidationError | ItemNotFound> => {
+    switch (rv) {
+      case "none":
+        return Effect.succeed(undefined)
+      case "updatedOld":
+        return decodePartial(old, written, mode)
+      case "updatedNew":
+        return decodePartial(next, written, mode)
+      default: {
+        const image = rv === "allOld" ? old : next
+        if (image === undefined)
+          return Effect.fail(new ItemNotFound({ entityType, key: encodedKey }))
+        return decodeAs(fromAttributeMap(image) as globalThis.Record<string, unknown>, image, mode)
+      }
+    }
+  }
+
+  /**
+   * The history keys (version snapshots, soft-delete tombstones) of the item
+   * whose live sort key is `liveSk` (#133). An entity whose primary sort key
+   * has composites holds several items per partition, so each item's history
+   * keys carry its segment — the composite part of `liveSk` — and items never
+   * share a version sequence, a snapshot or a tombstone. Without sort key
+   * composites there is one item per partition and no segment: the keys are
+   * byte-identical to the partition-wide ones every earlier release wrote.
+   */
+  const historyKeyOptions = (liveSk: unknown): DynamoSchema.HistoryKeyOptions | undefined => {
+    if (typeof liveSk !== "string") return undefined
+    const item = KeyComposer.composeHistoryItemSegment(
+      schema,
+      entityType,
+      entityVersion,
+      config.indexes.primary,
+      liveSk,
+    )
+    return item === undefined ? undefined : { item }
+  }
+  /**
+   * See {@link Entity._liveRows}. A row is dropped only when it is positively
+   * history: its sort key is not the one its own composites compose (or they
+   * don't compose) AND it has the layout of a snapshot (`#v#…<version>`), a
+   * tombstone (`#deleted#…<timestamp>`) or a time-series event (`#e#` under
+   * the live key). Any other row is kept and decoded as before — including
+   * rows an earlier release keyed differently (an unpadded number composite),
+   * which the current composer can't reproduce.
+   */
+  const liveRows = (): Query.LiveRows | undefined => {
+    if (!isRetainEnabled() && !isSoftDeleteEnabled() && config.timeSeries === undefined) {
+      return undefined
+    }
+    const primary = config.indexes.primary
+    const skField = primary.sk.field
+    const compositeAttrs = primary.sk.composite.map(resolveDbName)
+    const versions = DynamoSchema.composeVersionKeyPrefix(schema, entityType)
+    const tombstones = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
+    const bare = KeyComposer.composeSk(
+      schema,
+      entityType,
+      entityVersion,
+      { ...primary, sk: { ...primary.sk, composite: [] } },
+      keyForm({}),
+    )
+    const eventMarker = KeyComposer.composeEventSkPrefix("", schema.casing)
+    const historyShaped = (sk: string): boolean =>
+      (isRetainEnabled() &&
+        sk.startsWith(versions) &&
+        /^(?:.*#)?\d{7,}$/.test(sk.slice(versions.length))) ||
+      (isSoftDeleteEnabled() &&
+        sk.startsWith(tombstones) &&
+        /^(?:.*#)?\d{4}-\d\d-\d\dT[^#]*$/.test(sk.slice(tombstones.length))) ||
+      (config.timeSeries !== undefined &&
+        sk.startsWith(bare) &&
+        sk.slice(bare.length).includes(eventMarker))
+    return {
+      isLive: (row) => {
+        const sk = row[skField]?.S
+        if (sk === undefined) return true
+        // Only the composites are unmarshalled: the row may be large.
+        const composites: globalThis.Record<string, AttributeValue> = {}
+        for (const attr of compositeAttrs) {
+          const value = row[attr]
+          if (value !== undefined) composites[attr] = value
+        }
+        try {
+          if (liveSkOf(toDomainView(fromAttributeMap(composites))) === sk) return true
+        } catch {
+          // Not composable now: judged by its layout alone.
+        }
+        return !historyShaped(sk)
+      },
+      reads: [skField, ...compositeAttrs],
+    }
+  }
+  // ---------------------------------------------------------------------------
+  // History an earlier release wrote without an item segment (#133)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Whether the entity's history keys carry an item segment — its primary sort
+   * key has composites. Only then can history an earlier release wrote, under
+   * the partition-wide keys (`#v#0000003`, `#deleted#<ts>`), be in the
+   * partition: every reader of one item's history also reads those rows, and
+   * takes the ones whose stored composites compose the item's live key. A
+   * version held both ways is read from the segmented row.
+   */
+  const hasItemHistory = config.indexes.primary.sk.composite.length > 0
+  /** Whether a stored (attribute-keyed) row is the history of the item at `liveSk`. */
+  const isItemsRow = (row: globalThis.Record<string, AttributeValue>, liveSk: string): boolean => {
+    try {
+      return liveSkOf(toDomainView(fromAttributeMap(row))) === liveSk
+    } catch {
+      return false
+    }
+  }
+  /**
+   * The item's unsegmented history rows of one kind, in sort key order (latest
+   * first with `descending`), stopping at the first with `first`. Unsegmented
+   * rows sort before every segmented one — a version or timestamp starts with
+   * a digit, a segment with a composite name — so a key range bounds them.
+   */
+  const legacyHistory = (args: {
+    readonly tableName: string
+    readonly pk: unknown
+    readonly liveSk: string
+    readonly kind: "version" | "deleted"
+    readonly descending?: boolean
+    readonly first?: boolean
+  }) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const primary = config.indexes.primary
+      const prefix =
+        args.kind === "version"
+          ? DynamoSchema.composeVersionKeyPrefix(schema, entityType)
+          : DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
+      const range = {
+        TableName: args.tableName,
+        KeyConditionExpression: "#pk = :pk AND #sk BETWEEN :lo AND :hi",
+        ExpressionAttributeNames: { "#pk": primary.pk.field, "#sk": primary.sk.field },
+        ExpressionAttributeValues: {
+          ":pk": toAttributeValue(args.pk),
+          ":lo": toAttributeValue(`${prefix}0`),
+          ":hi": toAttributeValue(`${prefix}:`),
+        },
+        ConsistentRead: true,
+      }
+      // The common case — a partition no earlier release wrote history into —
+      // costs one `Limit 1` keys-only read. (A row it finds may still be
+      // segmented, if a segment starts with a digit; the read below filters.)
+      const probe = yield* client.query({ ...range, ProjectionExpression: "#sk", Limit: 1 })
+      if ((probe.Items ?? []).length === 0) return []
+      const rows: Array<globalThis.Record<string, AttributeValue>> = []
+      let start: globalThis.Record<string, AttributeValue> | undefined
+      do {
+        const result = yield* client.query({
+          ...range,
+          ScanIndexForward: !args.descending,
+          ExclusiveStartKey: start,
+        })
+        for (const row of result.Items ?? []) {
+          const sk = row[primary.sk.field]?.S ?? ""
+          if (sk.slice(prefix.length).includes("#") || !isItemsRow(row, args.liveSk)) continue
+          rows.push(row)
+          if (args.first) return rows
+        }
+        start = result.LastEvaluatedKey as globalThis.Record<string, AttributeValue> | undefined
+      } while (start !== undefined)
+      return rows
+    })
+  /** The version a history sort key ends with. */
+  const versionOfSk = (sk: string | undefined): number => {
+    if (sk === undefined) return 0
+    const version = Number(sk.slice(sk.lastIndexOf("#") + 1))
+    return Number.isInteger(version) ? version : 0
+  }
+  /**
+   * The item's latest tombstone — its own, or one an earlier release wrote
+   * without a segment, whichever is later (its own on a tie).
+   */
+  const latestTombstone = (tableName: string, pk: unknown, liveSk: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const primary = config.indexes.primary
+      const own = (yield* client.query({
+        TableName: tableName,
+        KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
+        ExpressionAttributeNames: { "#pk": primary.pk.field, "#sk": primary.sk.field },
+        ExpressionAttributeValues: {
+          ":pk": toAttributeValue(pk),
+          ":skPrefix": toAttributeValue(
+            DynamoSchema.composeDeletedKeyPrefix(schema, entityType, historyKeyOptions(liveSk)),
+          ),
+        },
+        Limit: 1,
+        ScanIndexForward: false,
+      })).Items?.[0]
+      if (!hasItemHistory) return own
+      const [legacy] = yield* legacyHistory({
+        tableName,
+        pk,
+        liveSk,
+        kind: "deleted",
+        descending: true,
+        first: true,
+      })
+      if (legacy === undefined) return own
+      if (own === undefined) return legacy
+      const stamp = (row: globalThis.Record<string, AttributeValue>) => {
+        const sk = row[primary.sk.field]?.S ?? ""
+        return sk.slice(sk.lastIndexOf("#") + 1)
+      }
+      return stamp(legacy) > stamp(own) ? legacy : own
+    })
+  /** The live sort key of the item at `encodedKey` (the caller's key, encoded). */
+  const liveSkOf = (encodedKey: unknown): string =>
+    KeyComposer.composeSk(
+      schema,
+      entityType,
+      entityVersion,
+      config.indexes.primary,
+      keyForm(encodedKey as globalThis.Record<string, unknown>),
+    )
+
   /**
    * Build a version snapshot item: same PK, version SK, stripped GSI keys,
    * keeps __edd_e__ for entity type filtering.
@@ -2409,6 +3987,8 @@ const makeImpl = <
     tableSkField: string,
     ttlAttrName: string,
     now: DateTime.Utc,
+    /** The item's live sort key, when `item` is not the live item (a tombstone). */
+    liveSk: unknown = item[tableSkField],
   ): globalThis.Record<string, unknown> => {
     const snapshot: globalThis.Record<string, unknown> = { ...item }
 
@@ -2431,7 +4011,12 @@ const makeImpl = <
     }
 
     // Replace SK with version SK
-    snapshot[tableSkField] = DynamoSchema.composeVersionKey(schema, entityType, version)
+    snapshot[tableSkField] = DynamoSchema.composeVersionKey(
+      schema,
+      entityType,
+      version,
+      historyKeyOptions(liveSk),
+    )
 
     // Add optional TTL
     const ttl = retainTtl()
@@ -2458,98 +4043,530 @@ const makeImpl = <
     return features
   }
 
+  // ---------------------------------------------------------------------------
+  // Unique sentinels: reservation and release (#133)
+  // ---------------------------------------------------------------------------
+
   /**
-   * Side items for a `put`, derived purely from the payload being written —
-   * see the `_buildPutSideItems` doc on the Entity interface for why the delete
-   * side has no counterpart.
-   *
-   * Mirrors the emission in `put`'s own transact path so the two cannot drift:
-   * one sentinel per satisfiable constraint (sparse — a constraint whose fields
-   * are unset produces none), then the v1 snapshot.
-   *
-   * `item` arrives ALREADY renamed to stored attribute names (`_renameToDynamo`
-   * runs inside `validateAndBuildPutItem`, so the snapshot inherits the shape
-   * that was written), hence the `toDomainView` for sentinel composition — the
-   * constraint names domain fields. `put`'s own path composes from `encoded`,
-   * which is domain-keyed before the rename.
+   * The sentinel item reserving `key` for the item at `owner`. `_entity_pk` /
+   * `_entity_sk` name the reserving item — the back-pointer a release checks
+   * (see {@link ownedSentinels}).
    */
-  const buildPutSideItems = (
-    item: globalThis.Record<string, unknown>,
+  const sentinelItemFor = (
+    constraintName: string,
+    constraintDef: UniqueConstraintDef,
+    key: { readonly pk: string; readonly sk: string },
+    owner: { readonly pk: unknown; readonly sk: unknown },
     now: DateTime.Utc,
     ttlAttrName: string,
-  ): ReadonlyArray<{
-    readonly kind: "sentinel" | "snapshot"
-    readonly constraintName?: string | undefined
-    readonly fields?: globalThis.Record<string, string> | undefined
+  ): globalThis.Record<string, unknown> => {
+    const sentinel: globalThis.Record<string, unknown> = {
+      [config.indexes.primary.pk.field]: key.pk,
+      [config.indexes.primary.sk.field]: key.sk,
+      __edd_e__: `${entityType}._unique.${constraintName}`,
+      _entity_pk: owner.pk,
+      _entity_sk: owner.sk,
+    }
+    // Optional TTL — when the constraint declares one, the sentinel
+    // auto-expires (time-bounded uniqueness reservation/hold).
+    const uniqueTtl = resolveUniqueTtl(constraintDef)
+    if (uniqueTtl !== undefined) {
+      sentinel[ttlAttrName] = DateTime.toEpochSeconds(now) + normalizeTtlSeconds(uniqueTtl)
+    }
+    return sentinel
+  }
+
+  /**
+   * The sentinels among `candidates` that the item at `owner` holds, read
+   * consistently (#133). An item can hold a unique value WITHOUT owning its
+   * sentinel: the constraint was added after the item was written, the item
+   * was written outside the library, or a `ttl`'d reservation expired and
+   * another item then claimed the value. That other item owns the sentinel
+   * now — its `_entity_pk` / `_entity_sk` name it — and releasing the
+   * sentinel by key alone would delete its reservation and let the value be
+   * taken twice. So a write releases only the sentinels this returns, each
+   * under {@link sentinelRelease}.
+   */
+  const ownedSentinels = <K extends { readonly pk: string; readonly sk: string }>(
+    tableName: string,
+    candidates: ReadonlyArray<K>,
+    owner: { readonly pk: unknown; readonly sk: unknown },
+  ): Effect.Effect<ReadonlyArray<K>, DynamoClientError, DynamoClient> =>
+    Effect.gen(function* () {
+      if (candidates.length === 0) return []
+      const client = yield* DynamoClient
+      const pkField = config.indexes.primary.pk.field
+      const skField = config.indexes.primary.sk.field
+      const ownerPk = toAttributeValue(owner.pk)
+      const ownerSk = toAttributeValue(owner.sk)
+      const reads = yield* Effect.forEach(
+        candidates,
+        (key) =>
+          client.getItem({
+            TableName: tableName,
+            Key: toAttributeMap({ [pkField]: key.pk, [skField]: key.sk }),
+            ConsistentRead: true,
+            ProjectionExpression: "#epk, #esk",
+            ExpressionAttributeNames: { "#epk": "_entity_pk", "#esk": "_entity_sk" },
+          }),
+        { concurrency: "unbounded" },
+      )
+      return candidates.filter((_, i) => {
+        const stored = reads[i]?.Item
+        return (
+          stored !== undefined &&
+          attributeValueEquals(stored._entity_pk, ownerPk) &&
+          attributeValueEquals(stored._entity_sk, ownerSk)
+        )
+      })
+    })
+
+  /**
+   * The Delete releasing a sentinel {@link ownedSentinels} found owned by
+   * `owner` — conditioned on that ownership still holding, so a reservation
+   * that changed hands between the read and the write cancels the write
+   * instead of being deleted.
+   */
+  const sentinelRelease = (
+    tableName: string,
+    key: { readonly pk: string; readonly sk: string },
+    owner: { readonly pk: unknown; readonly sk: unknown },
+  ) => ({
+    Delete: {
+      TableName: tableName,
+      Key: toAttributeMap({
+        [config.indexes.primary.pk.field]: key.pk,
+        [config.indexes.primary.sk.field]: key.sk,
+      }),
+      ConditionExpression: "#epk = :epk AND #esk = :esk",
+      ExpressionAttributeNames: { "#epk": "_entity_pk", "#esk": "_entity_sk" },
+      ExpressionAttributeValues: {
+        ":epk": toAttributeValue(owner.pk),
+        ":esk": toAttributeValue(owner.sk),
+      },
+    },
+  })
+
+  /**
+   * A sentinel release cancelled: the reservation changed hands between the
+   * read and the write. Nothing was written; the item still holds the value.
+   */
+  const releaseRaced = (
+    key: globalThis.Record<string, unknown>,
+    constraintName: string,
+  ): ConcurrentModification => {
+    const error = new ConcurrentModification({
+      entityType,
+      key,
+      attributes: [...resolveUniqueFields(config.unique![constraintName]!)],
+      current: Option.none(),
+    })
+    releaseRaces.add(error)
+    return error
+  }
+
+  // ---------------------------------------------------------------------------
+  // Guarded puts (#133)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The highest version retained for the item at `pk` — 0 with none. A
+   * deleted retain item's version snapshots outlive it, so the item created
+   * again at its key continues the sequence after them rather than
+   * overwriting its earlier incarnation's history.
+   */
+  const highestRetainedVersion = (tableName: string, pk: unknown, liveSk: unknown) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const primary = config.indexes.primary
+      const { Items } = yield* client.query({
+        TableName: tableName,
+        KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :prefix)",
+        ExpressionAttributeNames: { "#pk": primary.pk.field, "#sk": primary.sk.field },
+        ExpressionAttributeValues: {
+          ":pk": toAttributeValue(pk),
+          ":prefix": toAttributeValue(
+            DynamoSchema.composeVersionKeyPrefix(schema, entityType, historyKeyOptions(liveSk)),
+          ),
+        },
+        ScanIndexForward: false,
+        Limit: 1,
+        ConsistentRead: true,
+      })
+      const own = versionOfSk(Items?.[0]?.[primary.sk.field]?.S)
+      if (!hasItemHistory || typeof liveSk !== "string") return own
+      // History an earlier release wrote for this item counts too: a version it
+      // holds is never written again.
+      const [legacy] = yield* legacyHistory({
+        tableName,
+        pk,
+        liveSk,
+        kind: "version",
+        descending: true,
+        first: true,
+      })
+      return Math.max(own, versionOfSk(legacy?.[primary.sk.field]?.S))
+    })
+
+  /**
+   * A guarded put — of a versioned or unique-constrained entity — compiled
+   * against the item as read (#133). Shared by `put` / `create` / `upsert`
+   * and the transaction paths (`Transaction.transactWrite`,
+   * `EventStore.append`'s `additionalItems`), so they write the same items:
+   *
+   * - **The item exists:** its next version, its incarnation and its
+   *   `createdAt` (unless the caller supplies one); the Put is guarded on the
+   *   item read — version and incarnation, or the unique values its sentinels
+   *   derive from. Retain: the replaced item is snapshotted at its version.
+   * - **The item is missing** (or not read: `create`): the Put requires it
+   *   still missing. A retain item continues after the highest version
+   *   retained for its key — a deleted item's history outlives it — with a new
+   *   incarnation, and is snapshotted at that version.
+   * - **Sentinels:** a changed value takes the new reservation and releases the
+   *   old one — only if this item owns it ({@link ownedSentinels}).
+   *
+   * `verdict` reads a cancellation: a lost race or retained history the read
+   * did not see is retried by the caller (re-planned from a fresh read); the
+   * caller's own condition is `Condition`; a taken value or a history conflict
+   * is final.
+   */
+  const planPut = (args: {
+    readonly tableName: string
+    readonly ttlAttrName: string
+    readonly now: DateTime.Utc
+    /** The item as built: stored attribute names, version 1, a fresh incarnation. */
     readonly item: globalThis.Record<string, unknown>
-    readonly guard?:
+    /** Whether the caller supplied `createdAt` (a replacing put keeps the stored one). */
+    readonly createdAtSupplied: boolean
+    readonly userCondition:
       | {
-          readonly ConditionExpression: string
-          readonly ExpressionAttributeNames: globalThis.Record<string, string>
+          readonly expression: string
+          readonly names: globalThis.Record<string, string>
+          readonly values: globalThis.Record<string, AttributeValue>
         }
       | undefined
-  }> => {
-    const out: Array<{
-      kind: "sentinel" | "snapshot"
-      constraintName?: string | undefined
-      fields?: globalThis.Record<string, string> | undefined
-      item: globalThis.Record<string, unknown>
-      guard?:
-        | {
-            readonly ConditionExpression: string
-            readonly ExpressionAttributeNames: globalThis.Record<string, string>
+    /** `create`: the item must be missing — it is not read. */
+    readonly create: boolean
+    readonly operation: string
+    /** The key errors name. */
+    readonly key: globalThis.Record<string, unknown>
+  }): Effect.Effect<PutPlan, ValidationError | DynamoClientError, DynamoClient> =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const pkField = config.indexes.primary.pk.field
+      const skField = config.indexes.primary.sk.field
+      const item: globalThis.Record<string, unknown> = { ...args.item }
+      const owner = { pk: item[pkField], sk: item[skField] }
+      const current = args.create
+        ? undefined
+        : (yield* client.getItem({
+            TableName: args.tableName,
+            Key: toAttributeMap({ [pkField]: owner.pk, [skField]: owner.sk }),
+            ConsistentRead: true,
+          })).Item
+      yield* checkVersion(current, args.operation)
+      const currentRaw =
+        current !== undefined
+          ? (fromAttributeMap(current) as globalThis.Record<string, unknown>)
+          : undefined
+      const storedVersion = storedVersionOf(current)
+      if (currentRaw !== undefined) {
+        // The same item, continued: its next version, its incarnation, its
+        // creation time (unless the caller supplies one).
+        if (systemFields.version) {
+          item[systemFields.version] = (storedVersion ?? 0) + 1
+          if (currentRaw[INCARNATION_TOKEN] !== undefined) {
+            item[INCARNATION_TOKEN] = currentRaw[INCARNATION_TOKEN]
           }
-        | undefined
-    }> = []
-
-    const pkField = config.indexes.primary.pk.field
-    const skField = config.indexes.primary.sk.field
-    const itemDomain = toDomainView(item)
-
-    if (config.unique != null) {
-      for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
-        const sentinel = composeUniqueSentinel(
-          schema,
-          entityType,
-          constraintName,
-          constraintDef,
-          itemDomain,
-        )
-        // Sparse: a constraint whose composing fields are unset never had a
-        // sentinel, so writing one would reserve `undefined` for everybody.
-        if (!sentinel) continue
-        const sentinelItem: globalThis.Record<string, unknown> = {
-          [pkField]: sentinel.key.pk,
-          [skField]: sentinel.key.sk,
-          __edd_e__: `${entityType}._unique.${constraintName}`,
-          _entity_pk: item[pkField],
-          _entity_sk: item[skField],
         }
-        const uniqueTtl = resolveUniqueTtl(constraintDef)
-        if (uniqueTtl !== undefined) {
-          sentinelItem[ttlAttrName] = DateTime.toEpochSeconds(now) + normalizeTtlSeconds(uniqueTtl)
+        if (systemFields.createdAt && !args.createdAtSupplied) {
+          const createdAttr = resolveDbName(systemFields.createdAt)
+          if (currentRaw[createdAttr] !== undefined) item[createdAttr] = currentRaw[createdAttr]
         }
-        out.push({
-          kind: "sentinel",
-          constraintName,
-          fields: sentinel.fieldsRecord,
-          item: sentinelItem,
-          // The guard IS the constraint — without it the sentinel would happily
-          // overwrite another row's reservation and enforce nothing.
-          guard: sentinelGuard(),
-        })
+      } else if (systemFields.version && isRetainEnabled()) {
+        item[systemFields.version] =
+          (yield* highestRetainedVersion(args.tableName, owner.pk, owner.sk)) + 1
       }
-    }
+      const marshalled = toAttributeMap(item)
 
-    if (isRetainEnabled()) {
-      out.push({
-        kind: "snapshot",
-        item: buildSnapshotItem(item, 1, pkField, skField, ttlAttrName, now),
+      // The main item. Missing: it must still be missing. Present: still the
+      // item read — its version and incarnation, or (unversioned) the unique
+      // values its sentinels are keyed by.
+      const uniqueAttrs = [
+        ...new Set(
+          Object.values((config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>)
+            .flatMap((def) => [...resolveUniqueFields(def)])
+            .map(resolveDbName),
+        ),
+      ]
+      const userCondition = args.userCondition
+      const guard =
+        current === undefined
+          ? {
+              expression: "attribute_not_exists(#pk)",
+              names: { "#pk": pkField } as globalThis.Record<string, string>,
+              values: {} as globalThis.Record<string, AttributeValue>,
+              inputs: [] as ReadonlyArray<string>,
+            }
+          : deleteGuard(current, uniqueAttrs, userCondition?.expression)
+      if (guard instanceof ValidationError) return yield* guard
+      const mainValues = { ...guard.values, ...userCondition?.values }
+      const mainCondition = userCondition
+        ? `${guard.expression} AND (${userCondition.expression})`
+        : guard.expression
+      const tooLarge = oversizedCondition(args.operation, mainCondition, userCondition?.expression)
+      if (tooLarge !== undefined) return yield* tooLarge
+
+      const items: Array<TransactWriteItem> = [
+        {
+          Put: {
+            TableName: args.tableName,
+            Item: marshalled,
+            ConditionExpression: mainCondition,
+            ExpressionAttributeNames: { ...guard.names, ...userCondition?.names },
+            ...(Object.keys(mainValues).length > 0 && { ExpressionAttributeValues: mainValues }),
+            ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+          },
+        },
+      ]
+      const roles: Array<
+        | { readonly kind: "main" }
+        | {
+            readonly kind: "sentinel"
+            readonly constraintName: string
+            readonly fields: globalThis.Record<string, string>
+          }
+        | { readonly kind: "release"; readonly constraintName: string }
+        | { readonly kind: "snapshot"; readonly version: number }
+      > = [{ kind: "main" }]
+
+      // Sentinels: a changed value takes the new reservation and releases the
+      // old one this item owns; an unchanged value is left alone. A field
+      // holding only a default has none (`__edd_d__`).
+      if (config.unique != null) {
+        const newSource = toDomainView(item)
+        const oldSource = currentRaw !== undefined ? toDomainView(currentRaw) : undefined
+        const changes: Array<{
+          readonly constraintName: string
+          readonly constraintDef: UniqueConstraintDef
+          readonly next:
+            | {
+                readonly key: { readonly pk: string; readonly sk: string }
+                readonly fieldsRecord: globalThis.Record<string, string>
+              }
+            | undefined
+          readonly prior: { readonly pk: string; readonly sk: string } | undefined
+        }> = []
+        for (const [constraintName, constraintDef] of Object.entries(
+          config.unique as globalThis.Record<string, UniqueConstraintDef>,
+        )) {
+          const next = composeUniqueSentinel(
+            schema,
+            entityType,
+            constraintName,
+            constraintDef,
+            newSource,
+          )
+          const prior =
+            oldSource !== undefined
+              ? composeUniqueSentinel(schema, entityType, constraintName, constraintDef, oldSource)
+              : undefined
+          if (
+            next !== undefined &&
+            prior !== undefined &&
+            next.key.pk === prior.key.pk &&
+            next.key.sk === prior.key.sk
+          ) {
+            continue
+          }
+          changes.push({ constraintName, constraintDef, next, prior: prior?.key })
+        }
+        const owned = new Set(
+          yield* ownedSentinels(
+            args.tableName,
+            changes.flatMap((change) => (change.prior !== undefined ? [change.prior] : [])),
+            owner,
+          ),
+        )
+        for (const change of changes) {
+          if (change.prior !== undefined && owned.has(change.prior)) {
+            items.push(sentinelRelease(args.tableName, change.prior, owner))
+            roles.push({ kind: "release", constraintName: change.constraintName })
+          }
+          if (change.next === undefined) continue
+          items.push({
+            Put: {
+              TableName: args.tableName,
+              Item: toAttributeMap(
+                sentinelItemFor(
+                  change.constraintName,
+                  change.constraintDef,
+                  change.next.key,
+                  owner,
+                  args.now,
+                  args.ttlAttrName,
+                ),
+              ),
+              ...sentinelGuard(),
+            },
+          })
+          roles.push({
+            kind: "sentinel",
+            constraintName: change.constraintName,
+            fields: change.next.fieldsRecord,
+          })
+        }
+      }
+
+      // Retain: the item replaced (at its version), or the new item at its own.
+      if (isRetainEnabled()) {
+        const version =
+          currentRaw !== undefined ? (storedVersion ?? 0) : (item[systemFields.version!] as number)
+        items.push({
+          Put: snapshotPut(
+            args.tableName,
+            buildSnapshotItem(
+              currentRaw ?? item,
+              version,
+              pkField,
+              skField,
+              args.ttlAttrName,
+              args.now,
+            ),
+          ),
+        })
+        roles.push({ kind: "snapshot", version })
+      }
+
+      /** The stored attributes that differ from the item read. */
+      const changedFrom = (stored: globalThis.Record<string, AttributeValue>) =>
+        guard.inputs.filter(
+          (attr) => !attributeValueEquals(stored[attr], current?.[attr] as AttributeValue),
+        )
+      /** A lost race on the main item: the error once retries run out. */
+      const lostRace = (
+        stored: globalThis.Record<string, AttributeValue> | undefined,
+      ): PutVerdict => ({
+        _tag: "Retry",
+        stored,
+        error: systemFields.version
+          ? new OptimisticLockError({
+              entityType,
+              key: args.key,
+              expectedVersion: storedVersion ?? 0,
+              actualVersion: storedVersionOf(stored) ?? -1,
+            })
+          : new ConcurrentModification({
+              entityType,
+              key: args.key,
+              attributes:
+                stored !== undefined && current !== undefined
+                  ? changedFrom(stored).map(domainNameOf)
+                  : [],
+              current: Option.none(),
+            }),
       })
-    }
 
-    return out
-  }
+      const verdict = (
+        reasons: ReadonlyArray<WriteCancellationReason | undefined>,
+      ): PutVerdict | undefined => {
+        const main = reasons[0]
+        if (main?.Code === "ConditionalCheckFailed") {
+          const stored = main.Item as globalThis.Record<string, AttributeValue> | undefined
+          // `create`: the item exists, or the caller's condition rejected it.
+          if (args.create) return { _tag: "Condition" }
+          if (current === undefined) {
+            // Still missing: the caller's condition. Created since: a race.
+            return stored === undefined && userCondition !== undefined
+              ? { _tag: "Condition" }
+              : lostRace(stored)
+          }
+          if (stored === undefined) return lostRace(stored)
+          const raced = systemFields.version
+            ? storedVersionOf(stored) !== storedVersion ||
+              (incarnationAttr !== undefined &&
+                !attributeValueEquals(stored[incarnationAttr], current[incarnationAttr]))
+            : changedFrom(stored).length > 0
+          return raced || userCondition === undefined ? lostRace(stored) : { _tag: "Condition" }
+        }
+        for (let i = 1; i < roles.length; i++) {
+          if (reasons[i]?.Code !== "ConditionalCheckFailed") continue
+          const role = roles[i]!
+          switch (role.kind) {
+            case "sentinel":
+              return {
+                _tag: "Fail",
+                error: new UniqueConstraintViolation({
+                  entityType,
+                  constraint: role.constraintName,
+                  fields: role.fields,
+                }),
+              }
+            case "snapshot":
+              // A missing item's snapshot: history the read did not see — retried
+              // past it. A present item's: its version disagrees with its history.
+              return current === undefined
+                ? lostRace(undefined)
+                : { _tag: "Fail", error: historyConflict(role.version, args.operation) }
+            case "release":
+              // The reservation changed hands since it was read.
+              return {
+                _tag: "Retry",
+                stored: current,
+                error: releaseRaced(args.key, role.constraintName),
+              }
+          }
+        }
+        return undefined
+      }
+
+      return { items, item, marshalled, verdict }
+    })
+
+  /**
+   * Run a guarded put to completion (#133): plan it from a fresh read, write
+   * it, and on a lost race — a concurrent create, replace or delete of the
+   * item, or retained history the read did not see — plan and write it again.
+   * A put replaces the whole item, so the last writer wins, as a plain
+   * `PutItem` would. Only the caller's own condition, a taken unique value or
+   * a history conflict fail it; a race lost on every attempt fails with the
+   * concurrency error.
+   */
+  const runGuardedPut = (args: Parameters<typeof planPut>[0]) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      let lost: Extract<PutVerdict, { readonly _tag: "Retry" }> | undefined
+      for (let attempt = 0; attempt < GUARDED_PUT_ATTEMPTS; attempt++) {
+        const plan = yield* planPut(args)
+        yield* checkTransactionLimit(entityType, args.operation, plan.items)
+        const write: Effect.Effect<unknown, DynamoClientError> =
+          plan.items.length === 1
+            ? client.putItem(plan.items[0]!.Put!)
+            : client.transactWriteItems({ TransactItems: [...plan.items] })
+        const verdict = yield* write.pipe(
+          Effect.as(undefined as PutVerdict | undefined),
+          Effect.catch((err: DynamoClientError) => {
+            const reasons = isAwsTransactionCancelled(err.cause)
+              ? (err.cause.CancellationReasons ?? [])
+              : isAwsConditionalCheckFailed(err.cause)
+                ? [{ Code: "ConditionalCheckFailed", Item: err.cause.Item }]
+                : undefined
+            const read = reasons !== undefined ? plan.verdict(reasons) : undefined
+            return read !== undefined ? Effect.succeed(read) : Effect.fail(err)
+          }),
+        )
+        if (verdict === undefined) return plan
+        switch (verdict._tag) {
+          case "Fail":
+            return yield* verdict.error
+          case "Condition":
+            return yield* new ConditionalCheckFailed({ entityType, key: args.key })
+          case "Retry":
+            lost = verdict
+        }
+      }
+      return yield* withCurrentItem(Effect.fail(lost!.error), () => lost!.stored)
+    })
 
   // ---------------------------------------------------------------------------
   // Ref hydration
@@ -2879,7 +4896,9 @@ const makeImpl = <
           const tableName = tc.name
           const ttlAttrName = resolveTtlAttributeName(tc)
 
-          yield* checkWithVectorNames(opts.withVectors, "put")
+          // `upsert` creates through this path: its errors name it.
+          const operation = opts.operation ?? "put"
+          yield* checkWithVectorNames(opts.withVectors, operation)
 
           // Auto-generated id: fill the configured primary-key field with a
           // fresh UUID BEFORE the encode, but only when the caller omitted it —
@@ -2888,7 +4907,9 @@ const makeImpl = <
           // so this keeps the bound `put` at `R = never`. The filled id then
           // flows through input validation → key composition → stored item →
           // returned record in this same pass.
-          const inputWithGeneratedId = yield* fillGeneratedId(input)
+          const withGeneratedId = yield* fillGeneratedId(input)
+          const unsentineled = unsentineledDefaults(withGeneratedId)
+          const inputWithGeneratedId = yield* fillDecodingDefaults(withGeneratedId)
 
           // Encode user input → wire form. Users typically construct domain
           // values for transforms (DateTime, Redacted, Number) and plain
@@ -2906,7 +4927,7 @@ const makeImpl = <
             schemas.inputSchema as Schema.Codec<any>,
             inputWithGeneratedId,
             entityType,
-            "put",
+            operation,
           )
 
           // Compose all keys from the encoded input (ID fields still present
@@ -2942,9 +4963,12 @@ const makeImpl = <
             }
           }
           if (systemFields.version) item[systemFields.version] = 1
+          if (stampsIncarnation) item[INCARNATION_TOKEN] = yield* freshIncarnation
 
           // Add entity type discriminator
           item.__edd_e__ = entityType
+          // Unique fields holding only a default: no sentinel for them (#133).
+          if (unsentineled.length > 0) item[UNSENTINELED_DEFAULTS] = new Set(unsentineled)
 
           // Apply composed keys
           Object.assign(item, keys)
@@ -2963,6 +4987,18 @@ const makeImpl = <
             for (const field of vectorWrite.removes) delete item[field]
           }
 
+          const hasUniqueConstraints =
+            config.unique != null && Object.keys(config.unique).length > 0
+          // A versioned or unique-constrained entity's put is guarded (#133):
+          // a put over an existing item continues its version sequence,
+          // incarnation and `createdAt`, snapshots the replaced item (retain)
+          // and rotates its unique sentinels — never resetting history or
+          // orphaning one. See `runGuardedPut`.
+          const guarded = hasUniqueConstraints || Boolean(systemFields.version)
+          const createdAtSupplied =
+            systemFields.createdAt !== null &&
+            (encoded as globalThis.Record<string, unknown>)[systemFields.createdAt] !== undefined
+
           // Rename domain fields to DynamoDB attribute names
           renameToDynamo(item)
           // Flatten sparse Map fields into per-entry top-level attributes.
@@ -2972,154 +5008,45 @@ const makeImpl = <
           } catch (e) {
             return yield* new ValidationError({
               entityType,
-              operation: "put.sparse",
+              operation: `${operation}.sparse`,
               cause: e instanceof Error ? e.message : String(e),
             })
           }
 
+          // The caller's condition, ANDed onto `create`'s not-exists guard —
+          // a guard no `.condition()` can replace (#133). `upsert`'s create
+          // attempt brings its own (`runGuardedPut` requires the item missing).
+          const condition = withGuard(
+            opts.putKind === "create" && operation !== "upsert"
+              ? {
+                  attributeNotExists: [
+                    config.indexes.primary.pk.field,
+                    config.indexes.primary.sk.field,
+                  ],
+                }
+              : undefined,
+            opts.condition,
+          )
+          const userCondition = condition ? compileCondition(condition, resolveDbName) : undefined
+
+          if (guarded) {
+            const plan = yield* runGuardedPut({
+              tableName,
+              ttlAttrName,
+              now,
+              item,
+              createdAtSupplied,
+              userCondition,
+              create: opts.putKind === "create",
+              operation,
+              key: encoded as globalThis.Record<string, unknown>,
+            })
+            return yield* decodeAs(plan.item, plan.marshalled, mode)
+          }
+
           const marshalledItem = toAttributeMap(item)
-
-          // Build user condition expression if provided
-          const userCondition = opts.condition
-            ? compileCondition(opts.condition, resolveDbName)
-            : undefined
-
-          const hasUniqueConstraints =
-            config.unique != null && Object.keys(config.unique).length > 0
-          const needsTransaction = hasUniqueConstraints || isRetainEnabled()
-
-          if (needsTransaction) {
-            // Use transactWriteItems for atomic put + sentinel creation + snapshot
-            const transactItems: Array<{
-              Put: {
-                TableName: string
-                Item: globalThis.Record<string, AttributeValue>
-                ConditionExpression?: string
-                ExpressionAttributeNames?: globalThis.Record<string, string>
-                ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
-              }
-            }> = []
-
-            // Main entity item (with optional user condition)
-            const mainPut: (typeof transactItems)[number]["Put"] = {
-              TableName: tableName,
-              Item: marshalledItem,
-            }
-            if (userCondition) {
-              mainPut.ConditionExpression = userCondition.expression
-              mainPut.ExpressionAttributeNames = userCondition.names
-              if (Object.keys(userCondition.values).length > 0) {
-                mainPut.ExpressionAttributeValues = userCondition.values
-              }
-            }
-            transactItems.push({ Put: mainPut })
-
-            // Unique constraint sentinels (sparse — skip when any composing field is missing)
-            const sentinelConstraints: Array<string> = []
-            if (hasUniqueConstraints) {
-              for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
-                const sentinel = composeUniqueSentinel(
-                  schema,
-                  entityType,
-                  constraintName,
-                  constraintDef,
-                  encoded as globalThis.Record<string, unknown>,
-                )
-                if (!sentinel) continue
-                sentinelConstraints.push(constraintName)
-                // Optional TTL — when the constraint declares one, the sentinel
-                // auto-expires (time-bounded uniqueness reservation/hold). Uses
-                // the table's resolved TTL attribute name + Clock-backed `now`.
-                const sentinelItem: globalThis.Record<string, unknown> = {
-                  [config.indexes.primary.pk.field]: sentinel.key.pk,
-                  [config.indexes.primary.sk.field]: sentinel.key.sk,
-                  __edd_e__: `${entityType}._unique.${constraintName}`,
-                  _entity_pk: keys[config.indexes.primary.pk.field],
-                  _entity_sk: keys[config.indexes.primary.sk.field],
-                }
-                const uniqueTtl = resolveUniqueTtl(constraintDef)
-                if (uniqueTtl !== undefined) {
-                  sentinelItem[ttlAttrName] =
-                    DateTime.toEpochSeconds(now) + normalizeTtlSeconds(uniqueTtl)
-                }
-                transactItems.push({
-                  Put: {
-                    TableName: tableName,
-                    Item: toAttributeMap(sentinelItem),
-                    ...sentinelGuard(),
-                  },
-                })
-              }
-            }
-
-            // Version snapshot (v1) when retain is enabled
-            if (isRetainEnabled()) {
-              const snapshotItem = buildSnapshotItem(
-                item,
-                1,
-                config.indexes.primary.pk.field,
-                config.indexes.primary.sk.field,
-                ttlAttrName,
-                now,
-              )
-              transactItems.push({
-                Put: {
-                  TableName: tableName,
-                  Item: toAttributeMap(snapshotItem),
-                },
-              })
-            }
-
-            yield* checkTransactionLimit(entityType, "put", transactItems)
-            yield* client
-              .transactWriteItems({
-                TransactItems: transactItems.map((t) => ({ Put: t.Put })),
-              })
-              .pipe(
-                Effect.mapError(
-                  (err): DynamoClientError | UniqueConstraintViolation | ConditionalCheckFailed => {
-                    // Check if this is a transaction cancellation
-                    if (isAwsTransactionCancelled(err.cause)) {
-                      const reasons = err.cause.CancellationReasons
-                      if (reasons) {
-                        // Index 0 is the main item — if it failed with user condition, return ConditionalCheckFailed
-                        if (opts.condition && reasons[0]?.Code === "ConditionalCheckFailed") {
-                          return new ConditionalCheckFailed({
-                            entityType,
-                            key: encoded as globalThis.Record<string, unknown>,
-                          })
-                        }
-                        // Sentinel items start at index 1, in the order recorded in
-                        // `sentinelConstraints` (skipped sparse entries are absent)
-                        for (let i = 1; i < reasons.length; i++) {
-                          if (reasons[i]?.Code === "ConditionalCheckFailed") {
-                            const constraintName = sentinelConstraints[i - 1] ?? "unknown"
-                            const constraintDef = config.unique?.[constraintName]
-                            const uniqueFields = constraintDef
-                              ? resolveUniqueFields(constraintDef)
-                              : []
-                            const fieldsRecord: globalThis.Record<string, string> = {}
-                            for (const f of uniqueFields) {
-                              const v = (encoded as globalThis.Record<string, unknown>)[f]
-                              if (v !== undefined && v !== null) {
-                                fieldsRecord[f] = KeyComposer.serializeValue(v)
-                              }
-                            }
-                            return new UniqueConstraintViolation({
-                              entityType,
-                              constraint: constraintName,
-                              fields: fieldsRecord,
-                            })
-                          }
-                        }
-                      }
-                    }
-                    return err
-                  },
-                ),
-              )
-          } else {
-            // Simple put without unique constraints or retain
+          {
+            // Simple put without unique constraints or versioning
             const putInput: {
               TableName: string
               Item: globalThis.Record<string, AttributeValue>
@@ -3139,7 +5066,7 @@ const makeImpl = <
             }
             yield* client.putItem(putInput).pipe(
               Effect.mapError((err): DynamoClientError | ConditionalCheckFailed => {
-                if (opts.condition && isAwsConditionalCheckFailed(err.cause)) {
+                if (condition && isAwsConditionalCheckFailed(err.cause)) {
                   return new ConditionalCheckFailed({
                     entityType,
                     key: encoded as globalThis.Record<string, unknown>,
@@ -3161,15 +5088,15 @@ const makeImpl = <
   // create operation — put + attribute_not_exists condition
   // ---------------------------------------------------------------------------
 
+  // The not-exists guard is the put builder's, from `putKind: "create"` —
+  // never the op's condition, which `.condition()` replaces (#133).
   const create = (input: unknown) => {
-    const pkField = config.indexes.primary.pk.field
-    const skField = config.indexes.primary.sk.field
     const op = put(input)
     return new EntityPutImpl(
       op._builder,
       op._entity,
       op._input,
-      { attributeNotExists: [pkField, skField] },
+      op._condition,
       op._withVectors,
       "create",
     )
@@ -3179,12 +5106,13 @@ const makeImpl = <
   // patch operation — update + attribute_exists condition
   // ---------------------------------------------------------------------------
 
+  // The exists guard is `runUpdate`'s, from `patch: true` — never the op's
+  // condition, which `.condition()` replaces (#133).
   const patch = (key: unknown) => {
-    const pkField = config.indexes.primary.pk.field
     const op = update(key)
     return new EntityUpdateImpl(
       op._builder,
-      { ...op._updateState, condition: { attributeExists: [pkField] } },
+      { ...op._updateState, patch: true },
       op._entity,
       op._key,
     )
@@ -3249,1059 +5177,1843 @@ const makeImpl = <
   // update operation
   // ---------------------------------------------------------------------------
 
-  const update = (key: unknown) =>
-    new EntityUpdateImpl(
-      (mode: DecodeMode, uState: UpdateState) =>
-        Effect.gen(function* () {
-          const updates = uState.updates
-          const evExpected = uState.expectedVersion
-          const userCond = uState.condition
-          const client = yield* DynamoClient
-          const tc = yield* tableTag
-          const tableName = tc.name
-          const ttlAttrName = resolveTtlAttributeName(tc)
-          // Clock-backed time source for the updatedAt timestamp + retain snapshot TTL.
-          const now = yield* DateTime.now
+  const runUpdate = (
+    key: unknown,
+    mode: DecodeMode,
+    requested: UpdateState,
+    /**
+     * The item as already read — consistently — by the caller (`upsert`).
+     * Used instead of reading it again: the write is guarded on it either way.
+     */
+    preRead?: globalThis.Record<string, AttributeValue>,
+  ) =>
+    Effect.gen(function* () {
+      // Path operations on a field that feeds a key or a unique sentinel
+      // become the record operations they are equivalent to, or are
+      // refused (#133) — before anything reads the state.
+      const normalized = normalizeDerivedPathOps(requested)
+      if (typeof normalized === "string") {
+        return yield* new ValidationError({
+          entityType,
+          operation: "update",
+          cause: normalized,
+        })
+      }
+      // Removing a defaulted index composite re-materialises its default —
+      // stored, keys recomposed from it — as a put that omits it does (#133).
+      const { state: uState, defaulted: removedToDefault } =
+        yield* rematerializeRemovedDefaults(normalized)
+      const refusedSet = refusedRecordSet(uState.updates, key)
+      if (refusedSet !== undefined) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "update",
+          cause: refusedSet,
+        })
+      }
+      const immutables = assertedImmutables(uState.updates)
+      if (typeof immutables === "string") {
+        return yield* new ValidationError({
+          entityType,
+          operation: "update",
+          cause: immutables,
+        })
+      }
+      const upsertable = completeUpsertPayload(uState.updates)
+      const requestedRv = uState.returnValues ?? "allNew"
+      // A cascade propagates the NEW item; a mode returning the OLD one then
+      // needs both images exactly — the read-then-write branch has both.
+      const needsBothImages =
+        uState.cascade !== undefined && (requestedRv === "allOld" || requestedRv === "updatedOld")
+      const updates = uState.updates
+      const evExpected = uState.expectedVersion
+      // An entity without `versioned` has no version to check: an expected
+      // version would be silently skipped — a concurrency check that never
+      // runs — so it is refused before anything is read or sent (#134).
+      if (evExpected !== undefined && !systemFields.version) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "update.expectedVersion",
+          cause:
+            `expectedVersion(${evExpected}): entity "${entityType}" is not versioned, so there ` +
+            "is no version to check. Add `versioned: true`, or use a `.condition()`. Nothing was sent.",
+        })
+      }
+      // The caller's condition, ANDed onto `patch`'s exists guard — a guard
+      // no `.condition()` can replace (#133).
+      const userCond = withGuard(
+        uState.patch ? { attributeExists: [config.indexes.primary.pk.field] } : undefined,
+        uState.condition,
+      )
+      const client = yield* DynamoClient
+      const tc = yield* tableTag
+      const tableName = tc.name
+      const ttlAttrName = resolveTtlAttributeName(tc)
+      // Clock-backed time source for the updatedAt timestamp + retain snapshot TTL.
+      const now = yield* DateTime.now
 
-          yield* checkWithVectorNames(uState.withVectors, "update")
+      yield* checkWithVectorNames(uState.withVectors, "update")
 
-          // Caller key: Type side in, ENCODED out (see `encodeKey`).
-          const encodedKey = yield* encodeKey(key, "update.decodeKey")
+      // Caller key: Type side in, ENCODED out (see `encodeKey`).
+      const encodedKey = yield* encodeKey(key, "update.decodeKey")
+      // A missing item: `patch`'s exists guard failed — `ConditionalCheckFailed`,
+      // on every path, including those that read first (#134); for `update`,
+      // `ItemNotFound`.
+      const missingItem = () =>
+        uState.patch
+          ? new ConditionalCheckFailed({
+              entityType,
+              key: encodedKey as globalThis.Record<string, unknown>,
+            })
+          : new ItemNotFound({ entityType, key: encodedKey })
 
-          // Encode update payload → wire form (see `put` for the strategy).
-          const encodedUpdates = yield* encodeOrDecodeEncode(
-            schemas.updateSchema as Schema.Codec<any>,
-            updates ?? {},
+      // Encode update payload → wire form (see `put` for the strategy).
+      const encodedUpdates = yield* encodeOrDecodeEncode(
+        schemas.updateSchema as Schema.Codec<any>,
+        updates ?? {},
+        entityType,
+        "update",
+      )
+
+      // Hydrate refs in updates: for any ${field}Id present, fetch and embed
+      let hydratedUpdates = encodedUpdates as globalThis.Record<string, unknown>
+      if (hasRefs) {
+        const refsToHydrate = resolvedRefs.filter(
+          (ref) =>
+            ref.idFieldName in (encodedUpdates as globalThis.Record<string, unknown>) &&
+            (encodedUpdates as globalThis.Record<string, unknown>)[ref.idFieldName] !== undefined,
+        )
+        if (refsToHydrate.length > 0) {
+          hydratedUpdates = yield* hydrateRefs(hydratedUpdates, refsToHydrate)
+        }
+      }
+
+      // Compose primary key
+      const primaryKey = composePrimaryKey(encodedKey)
+      const marshalledKey = toAttributeMap(primaryKey)
+
+      // Detect whether the update touches any unique constraint fields
+      const hasUniqueConstraints = config.unique != null && Object.keys(config.unique).length > 0
+      let touchesUniqueFields = false
+      if (hasUniqueConstraints) {
+        const uniqueFieldSet = new Set(
+          Object.values(config.unique!).flatMap((def) => [...resolveUniqueFields(def)]),
+        )
+        const allUpdatedFields = new Set([
+          ...Object.keys(hydratedUpdates as globalThis.Record<string, unknown>).filter(
+            (k) => (hydratedUpdates as globalThis.Record<string, unknown>)[k] !== undefined,
+          ),
+          ...(uState.remove ?? []),
+          ...Object.keys(uState.add ?? {}),
+          ...Object.keys(uState.subtract ?? {}),
+          ...Object.keys(uState.append ?? {}),
+          ...Object.keys(uState.deleteFromSet ?? {}),
+        ])
+        touchesUniqueFields = [...uniqueFieldSet].some((f) => allUpdatedFields.has(f))
+      }
+
+      // `.add()` / `.subtract()` / `.append()` / `.deleteFromSet()` on an
+      // index composite: DynamoDB would compute the new value, but the
+      // index key is composed from it here — so the item is read, the
+      // value computed and the keys recomposed by the read-then-write
+      // branch below, exactly as for a retain entity (#133).
+      const indexComposites = indexCompositeFields()
+      const computedComposites = [
+        ...Object.keys(uState.add ?? {}),
+        ...Object.keys(uState.subtract ?? {}),
+        ...Object.keys(uState.append ?? {}),
+        ...Object.keys(uState.deleteFromSet ?? {}),
+      ].filter((field) => indexComposites.has(field))
+
+      // Path operations are never emulated in memory: DynamoDB applies them
+      // (#133). A retain update carrying them takes the standard branch
+      // below, transacted with its version snapshot. An update that also
+      // rotates a unique sentinel or computes an index composite needs this
+      // branch's read-then-put, which cannot carry them — refused rather
+      // than silently dropping them.
+      const pathOpsPresent = hasPathOps(uState)
+      if (pathOpsPresent && (touchesUniqueFields || computedComposites.length > 0)) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "update",
+          cause: touchesUniqueFields
+            ? "Path operations (pathSet, pathAppend, …) cannot be combined with a change to a " +
+              "unique-constraint field in one update: the unique sentinels are rotated by a " +
+              "read-then-put that DynamoDB path expressions cannot join. Split the update in two."
+            : `Path operations (pathSet, pathAppend, …) cannot be combined with a computed ` +
+              `change to index composite "${computedComposites[0]}" in one update: its new ` +
+              "value is computed by a read-then-put that DynamoDB path expressions cannot " +
+              "join. Split the update in two.",
+        })
+      }
+      if (needsBothImages && pathOpsPresent && !isRetainEnabled() && !systemFields.version) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "update",
+          cause:
+            'A cascade with returnValues("allOld" | "updatedOld") and path operations ' +
+            "needs the item before AND after the update exactly, which an entity without " +
+            "`versioned` cannot prove. Drop the path operations, the cascade, or the mode.",
+        })
+      }
+      if (
+        (isRetainEnabled() ||
+          touchesUniqueFields ||
+          computedComposites.length > 0 ||
+          needsBothImages) &&
+        !pathOpsPresent
+      ) {
+        // --- Retain path: read-then-transact ---
+        // Read current item (needed to create snapshot of pre-update state)
+        const currentResult =
+          preRead !== undefined
+            ? { Item: preRead }
+            : yield* client.getItem({
+                TableName: tableName,
+                Key: marshalledKey,
+                ConsistentRead: true,
+              })
+
+        if (!currentResult.Item) {
+          return yield* missingItem()
+        }
+
+        const currentRaw = fromAttributeMap(currentResult.Item)
+        // 0: written before the entity was `versioned` (#133).
+        const currentVersion = systemFields.version
+          ? (((currentRaw as globalThis.Record<string, unknown>)[systemFields.version] as
+              | number
+              | undefined) ?? 0)
+          : 0
+
+        // Validate optimistic lock if requested
+        if (evExpected !== undefined && currentVersion !== evExpected) {
+          return yield* new OptimisticLockError({
             entityType,
-            "update",
-          )
+            key: encodedKey,
+            expectedVersion: evExpected,
+            actualVersion: currentVersion,
+          })
+        }
 
-          // Hydrate refs in updates: for any ${field}Id present, fetch and embed
-          let hydratedUpdates = encodedUpdates as globalThis.Record<string, unknown>
-          if (hasRefs) {
-            const refsToHydrate = resolvedRefs.filter(
-              (ref) =>
-                ref.idFieldName in (encodedUpdates as globalThis.Record<string, unknown>) &&
-                (encodedUpdates as globalThis.Record<string, unknown>)[ref.idFieldName] !==
-                  undefined,
-            )
-            if (refsToHydrate.length > 0) {
-              hydratedUpdates = yield* hydrateRefs(hydratedUpdates, refsToHydrate)
+        // Build new item: merge current + updates + rich ops + recompose keys.
+        // `currentRaw` uses DynamoDB attribute names (e.g. `dn`, `hd`);
+        // `hydratedUpdates` uses domain names. To avoid the merge leaving
+        // both names (which would later have the rename clobber the user's
+        // value), translate the current item's keys to domain names first
+        // so the spread + assign overlay cleanly.
+        const currentDomainItem = {
+          ...(currentRaw as globalThis.Record<string, unknown>),
+        }
+        renameFromDynamo(currentDomainItem)
+        // Rebuild sparse Map fields from flattened attrs into domain Records.
+        // Done in-place on the renamed domain item so subsequent merge logic
+        // operates on domain shape and re-flattening happens once at the end.
+        deserializeSparseFields(currentDomainItem)
+        const newItem: globalThis.Record<string, unknown> = { ...currentDomainItem }
+        // Apply user updates. For sparse fields, merge bucket-by-bucket
+        // rather than whole-field replace — concurrent writers to disjoint
+        // buckets must coexist (the version CAS protects against same-bucket
+        // races). Non-sparse fields use the existing replace semantics.
+        //
+        // null and undefined collapse: both mean "absent" under v3's
+        // two-way classification (DESIGN.md §7). For the in-memory item
+        // we DELETE the attribute (mirrors a DynamoDB REMOVE), so
+        // subsequent decode sees the field as absent rather than as a
+        // typed null that the model schema may not permit. The composer
+        // below sees the attr as absent in `newItem` and applies the
+        // structural rule.
+        for (const [attr, val] of Object.entries(
+          hydratedUpdates as globalThis.Record<string, unknown>,
+        )) {
+          if (val === null || val === undefined) {
+            delete newItem[attr]
+            continue
+          }
+          if (hasSparseFields && attr in sparseFields && typeof val === "object") {
+            const existing = (newItem[attr] as globalThis.Record<string, unknown>) ?? {}
+            newItem[attr] = { ...existing, ...(val as globalThis.Record<string, unknown>) }
+          } else {
+            newItem[attr] = val
+          }
+        }
+
+        // Apply rich operations to in-memory item
+        if (uState.remove) {
+          for (const attr of uState.remove) {
+            delete newItem[attr]
+          }
+        }
+        // Sparse-map removes: drop named entries from the in-memory Record.
+        if (uState.sparseRemoveEntries) {
+          for (const op of uState.sparseRemoveEntries) {
+            if (!hasSparseFields || !(op.field in sparseFields)) continue
+            const bucket = newItem[op.field] as globalThis.Record<string, unknown> | undefined
+            if (!bucket) continue
+            for (const k of op.keys) delete bucket[k]
+          }
+        }
+        // Sparse-map clear: blow away the entire bucket Record. The retain
+        // path always reads-then-writes the full item, so the version CAS
+        // already gives clearMap atomic semantics for free — no per-bucket
+        // GET dance needed here.
+        if (uState.sparseClearFields) {
+          for (const field of uState.sparseClearFields) {
+            if (!hasSparseFields || !(field in sparseFields)) continue
+            newItem[field] = {}
+          }
+        }
+        if (uState.add) {
+          for (const [attr, val] of Object.entries(uState.add)) {
+            newItem[attr] = ((newItem[attr] as number) ?? 0) + val
+          }
+        }
+        if (uState.subtract) {
+          for (const [attr, val] of Object.entries(uState.subtract)) {
+            newItem[attr] = ((newItem[attr] as number) ?? 0) - val
+          }
+        }
+        if (uState.append) {
+          for (const [attr, val] of Object.entries(uState.append)) {
+            const existing = (newItem[attr] as Array<unknown>) ?? []
+            const appended = encodePathValue([attr], val, "elements")
+            if (appended.issue !== undefined) {
+              return yield* new ValidationError({
+                entityType,
+                operation: "update.append",
+                cause: appended.issue,
+              })
+            }
+            newItem[attr] = [...existing, ...(appended.encoded as ReadonlyArray<unknown>)]
+          }
+        }
+        if (uState.deleteFromSet) {
+          for (const [attr, val] of Object.entries(uState.deleteFromSet)) {
+            if (newItem[attr] instanceof Set && val instanceof Set) {
+              const current = newItem[attr] as Set<unknown>
+              for (const elem of val as Set<unknown>) {
+                current.delete(elem)
+              }
             }
           }
+        }
 
-          // Compose primary key
-          const primaryKey = composePrimaryKey(encodedKey)
-          const marshalledKey = toAttributeMap(primaryKey)
+        // A unique field that held only a default gets its sentinel once a
+        // write supplies (or removes) its value (#133).
+        const defaultedMarker = newItem[UNSENTINELED_DEFAULTS]
+        if (defaultedMarker instanceof Set) {
+          const supplied = new Set<string>([
+            ...Object.keys(hydratedUpdates as globalThis.Record<string, unknown>),
+            ...(uState.remove ?? []),
+            ...Object.keys(uState.add ?? {}),
+            ...Object.keys(uState.subtract ?? {}),
+          ])
+          const still = [...(defaultedMarker as ReadonlySet<string>)].filter(
+            (f) => !supplied.has(f),
+          )
+          if (still.length === 0) delete newItem[UNSENTINELED_DEFAULTS]
+          else newItem[UNSENTINELED_DEFAULTS] = new Set(still)
+        }
+        // …and a unique field removed back to its default holds only a default.
+        const uniqueRemovedToDefault = removedToDefault.filter((field) =>
+          Object.values(config.unique ?? {}).some((def) =>
+            resolveUniqueFields(def as UniqueConstraintDef).includes(field),
+          ),
+        )
+        if (uniqueRemovedToDefault.length > 0) {
+          const marker = newItem[UNSENTINELED_DEFAULTS]
+          newItem[UNSENTINELED_DEFAULTS] = new Set([
+            ...(marker instanceof Set ? (marker as ReadonlySet<string>) : []),
+            ...uniqueRemovedToDefault,
+          ])
+        }
 
-          // Detect whether the update touches any unique constraint fields
-          const hasUniqueConstraints =
-            config.unique != null && Object.keys(config.unique).length > 0
-          let touchesUniqueFields = false
-          if (hasUniqueConstraints) {
-            const uniqueFieldSet = new Set(
-              Object.values(config.unique!).flatMap((def) => [...resolveUniqueFields(def)]),
+        // Increment version and update timestamp. If the caller supplied a
+        // value for `updatedAt` (allowed when the field collides with a
+        // model-declared field), respect it (already wire-form via encode);
+        // else generate a fresh wire primitive.
+        const newVersion = currentVersion + 1
+        if (systemFields.version) newItem[systemFields.version] = newVersion
+        if (systemFields.updatedAt) {
+          const userSupplied = (hydratedUpdates as globalThis.Record<string, unknown>)[
+            systemFields.updatedAt
+          ]
+          newItem[systemFields.updatedAt] =
+            userSupplied !== undefined
+              ? userSupplied
+              : generateTimestamp(systemFields.updatedAtEncoding, now)
+        }
+
+        // `newItem` is already in domain names (the merge built it from
+        // `currentDomainItem` + domain-keyed updates) — no rename needed
+        // here. Recompose all keys with the updated attributes.
+        //
+        // Primary key always recomposes from `newItem` (Put-style).
+        const primaryKeyMap = composePrimaryKey(newItem)
+        Object.assign(newItem, primaryKeyMap)
+
+        // GSI keys: route through the policy-aware composer so the
+        // v1.7.1 per-half evaluation gate, structural rule, and per-half
+        // cascade match the standard update path. `newItem` carries
+        // stored values for any composite the user did not touch — used
+        // as the merged record for the structural rule. The composer
+        // emits per-half SETs/REMOVEs/noops that we apply directly to
+        // `newItem` (which becomes the put-style item written back).
+        //
+        // No try/catch needed — EDD-9024 was deprecated in v1.7.1 and
+        // the composer no longer throws.
+        const retainRemovedSet = uState.remove ? new Set(uState.remove) : undefined
+        const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          entityType,
+          entityVersion,
+          allIndexes,
+          keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
+          keyForm(newItem),
+          retainRemovedSet === undefined ? {} : { removedSet: retainRemovedSet },
+        )
+        for (const [field, value] of Object.entries(gsiUpdate.sets)) {
+          newItem[field] = value
+        }
+        for (const field of gsiUpdate.removes) {
+          delete newItem[field]
+        }
+        // GSIs where neither half was touched (per the v1.7.1 evaluation
+        // gate): retain path semantics are Put-style — recompose from
+        // `newItem` and drop both keys when any composite is missing.
+        // For touched halves, trust the composer's per-half decision
+        // (SET / REMOVE / leave-stored-value-on-newItem-alone for noop).
+        const addressed = new Set<string>([...Object.keys(gsiUpdate.sets), ...gsiUpdate.removes])
+        for (const [indexName, indexDef] of Object.entries(allIndexes)) {
+          if (indexName === "primary") continue
+          // If either half was addressed, the composer made the per-half
+          // decision; the other half's stored value already lives on
+          // `newItem` from the read-then-write merge above.
+          if (addressed.has(indexDef.pk.field) || addressed.has(indexDef.sk.field)) continue
+          const keys = KeyComposer.tryComposeIndexKeys(
+            schema,
+            entityType,
+            entityVersion,
+            indexDef,
+            keyForm(newItem),
+          )
+          if (keys) {
+            Object.assign(newItem, keys)
+          } else {
+            delete newItem[indexDef.pk.field]
+            delete newItem[indexDef.sk.field]
+          }
+        }
+
+        // Compute sentinel rotation values while newItem is in domain names.
+        // currentRaw uses DynamoDB names, so read it through `toDomainView`
+        // for fields that may have been renamed (e.g. id → teamId).
+        // Sparse-aware rotation: each constraint may transition through one of four
+        // states between old and new — both-missing (no-op), missing→present (Put only),
+        // present→missing (Delete only), present→present (Delete + Put if changed).
+        type SentinelRotation = {
+          constraintName: string
+          oldUniqueKey: { readonly pk: string; readonly sk: string } | undefined
+          newUniqueKey: { readonly pk: string; readonly sk: string } | undefined
+          newFieldsRecord: globalThis.Record<string, string> | undefined
+        }
+        const sentinelRotations: Array<SentinelRotation> = []
+        if (touchesUniqueFields) {
+          const currentRawDomain = toDomainView(currentRaw as globalThis.Record<string, unknown>)
+          for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
+            const oldSentinel = composeUniqueSentinel(
+              schema,
+              entityType,
+              constraintName,
+              constraintDef,
+              currentRawDomain,
             )
-            const allUpdatedFields = new Set([
-              ...Object.keys(hydratedUpdates as globalThis.Record<string, unknown>).filter(
-                (k) => (hydratedUpdates as globalThis.Record<string, unknown>)[k] !== undefined,
-              ),
-              ...(uState.remove ?? []),
+            const newSentinel = composeUniqueSentinel(
+              schema,
+              entityType,
+              constraintName,
+              constraintDef,
+              newItem,
+            )
+
+            if (!oldSentinel && !newSentinel) continue
+            if (
+              oldSentinel &&
+              newSentinel &&
+              oldSentinel.key.pk === newSentinel.key.pk &&
+              oldSentinel.key.sk === newSentinel.key.sk
+            ) {
+              continue
+            }
+
+            sentinelRotations.push({
+              constraintName,
+              oldUniqueKey: oldSentinel?.key,
+              newUniqueKey: newSentinel?.key,
+              newFieldsRecord: newSentinel?.fieldsRecord,
+            })
+          }
+        }
+
+        // Vector search: the retain path already holds the full merged
+        // item, so a put-style recompute is exact — no extra read needed.
+        // Re-embedding is still gated on the payload touching a source
+        // field (`DESIGN.md §14`); untouched indexes keep their stored
+        // vector, which the merge above already carried onto `newItem`.
+        if (hasVectorIndexes) {
+          const embedFor = new Set(
+            vectorIndexesNeedingUpdate(
+              collectTouchedFields(hydratedUpdates as globalThis.Record<string, unknown>, uState),
+              uState.withVectors,
+            ).map(([logicalName]) => logicalName),
+          )
+          // `newItem` is the fully merged post-update item (removals already
+          // applied above), so a put-style recompute is exact.
+          const vectorWrite = yield* computeVectorAttributes(newItem, uState.withVectors, embedFor)
+          Object.assign(newItem, vectorWrite.sets)
+          for (const field of vectorWrite.removes) delete newItem[field]
+        }
+
+        // Convert back to DynamoDB attribute names for storage
+        renameToDynamo(newItem)
+        // Flatten sparse Map fields into per-entry top-level attributes.
+        try {
+          serializeSparseFields(newItem)
+        } catch (e) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "update.sparse",
+            cause: e instanceof Error ? e.message : String(e),
+          })
+        }
+
+        const currentItem = currentResult.Item
+        yield* checkVersion(currentItem, "update")
+        const immutableChange = immutableMismatch(immutables, currentItem)
+        if (immutableChange !== undefined) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "update",
+            cause: immutableChange,
+          })
+        }
+        const pkField = config.indexes.primary.pk.field
+        const skField = config.indexes.primary.sk.field
+        // A legacy item of an entity whose incarnation is proven by a
+        // hidden token gets one now, so the write is provable from here on.
+        if (stampsIncarnation && currentItem[INCARNATION_TOKEN] === undefined) {
+          newItem[INCARNATION_TOKEN] = yield* freshIncarnation
+        }
+        const marshalledNewItem = toAttributeMap(newItem)
+
+        // The write is a guarded Update of what changed — never a Put of
+        // the whole item read, which would overwrite whatever another
+        // writer changed in between (#133). Attributes the update names
+        // are written even when unchanged; the rest only when they differ.
+        const named = new Set<string>(
+          [
+            ...Object.keys(hydratedUpdates as globalThis.Record<string, unknown>),
+            ...(uState.remove ?? []),
+            ...Object.keys(uState.add ?? {}),
+            ...Object.keys(uState.subtract ?? {}),
+            ...Object.keys(uState.append ?? {}),
+            ...Object.keys(uState.deleteFromSet ?? {}),
+          ].map(resolveDbName),
+        )
+        if (systemFields.version) named.add(systemFields.version)
+        if (systemFields.updatedAt) named.add(systemFields.updatedAt)
+        const setAttrs: globalThis.Record<string, AttributeValue> = {}
+        for (const [attr, value] of Object.entries(marshalledNewItem)) {
+          if (attr === pkField || attr === skField) continue
+          if (named.has(attr) || !attributeValueEquals(currentItem[attr], value)) {
+            setAttrs[attr] = value
+          }
+        }
+        const removeAttrs = Object.keys(currentItem).filter((attr) => !(attr in marshalledNewItem))
+        const written = new Set<string>([...Object.keys(setAttrs), ...removeAttrs])
+
+        const writeNames: globalThis.Record<string, string> = {}
+        const writeValues: globalThis.Record<string, AttributeValue> = {}
+        const setClauses = Object.entries(setAttrs).map(([attr, value], i) => {
+          writeNames[`#w${i}`] = attr
+          writeValues[`:w${i}`] = value
+          return `#w${i} = :w${i}`
+        })
+        const removeClauses = removeAttrs.map((attr, i) => {
+          writeNames[`#x${i}`] = attr
+          return `#x${i}`
+        })
+        if (setClauses.length === 0 && removeClauses.length === 0) {
+          // Nothing changed: an idempotent write keeps the condition (and
+          // the transaction's other items) meaningful.
+          writeNames["#we"] = "__edd_e__"
+          writeValues[":we"] = currentItem.__edd_e__ ?? toAttributeValue(entityType)
+          setClauses.push("#we = :we")
+        }
+        const updateExpression = [
+          setClauses.length > 0 ? `SET ${setClauses.join(", ")}` : "",
+          removeClauses.length > 0 ? `REMOVE ${removeClauses.join(", ")}` : "",
+        ]
+          .filter((part) => part !== "")
+          .join(" ")
+
+        // The condition proves the item is still what the new values were
+        // computed from. Versioned: its version and incarnation. Otherwise:
+        // it exists, and every attribute whose read value fed a computed
+        // value is unchanged — so an unrelated concurrent write survives
+        // and a concurrent change to an input is refused.
+        const condParts: Array<string> = []
+        const inputs: Array<string> = []
+        if (systemFields.version) {
+          condParts.push(versionIs(currentVersion, writeNames, writeValues, "#ver", ":expectedVer"))
+          const incarnation = incarnationGuard(currentItem, writeNames, writeValues)
+          if (incarnation !== undefined) condParts.push(incarnation)
+        } else {
+          writeNames["#pk"] = pkField
+          condParts.push("attribute_exists(#pk)")
+          const fromPayload = new Set<string>([
+            ...Object.entries(hydratedUpdates as globalThis.Record<string, unknown>)
+              .filter(([, value]) => value !== undefined && value !== null)
+              .map(([field]) => field),
+          ])
+          const add = (fields: ReadonlyArray<string>, always = false) => {
+            for (const field of fields) {
+              if ((always || !fromPayload.has(field)) && !inputs.includes(field)) {
+                inputs.push(field)
+              }
+            }
+          }
+          add(
+            [
               ...Object.keys(uState.add ?? {}),
               ...Object.keys(uState.subtract ?? {}),
               ...Object.keys(uState.append ?? {}),
               ...Object.keys(uState.deleteFromSet ?? {}),
-            ])
-            touchesUniqueFields = [...uniqueFieldSet].some((f) => allUpdatedFields.has(f))
+            ],
+            true,
+          )
+          for (const [indexName, indexDef] of Object.entries(allIndexes)) {
+            if (indexName === "primary") continue
+            if (written.has(indexDef.pk.field)) add(indexDef.pk.composite)
+            if (written.has(indexDef.sk.field)) add(indexDef.sk.composite)
+          }
+          for (const rotation of sentinelRotations) {
+            add(resolveUniqueFields(config.unique![rotation.constraintName]!), true)
+          }
+          for (const [, definition] of vectorIndexEntries) {
+            if (written.has(definition.vectorField)) add(definition.sourceFields)
+            if (written.has(definition.partitionField)) add(definition.partition)
+          }
+          for (const [i, field] of inputs.entries()) {
+            const attr = resolveDbName(field)
+            writeNames[`#g${i}`] = attr
+            const read = currentItem[attr]
+            if (read === undefined) {
+              condParts.push(`attribute_not_exists(#g${i})`)
+            } else {
+              writeValues[`:g${i}`] = read
+              condParts.push(`#g${i} = :g${i}`)
+            }
+          }
+        }
+        const uc = userCond ? compileCondition(userCond, resolveDbName) : undefined
+        if (uc) {
+          condParts.push(`(${uc.expression})`)
+          Object.assign(writeNames, uc.names)
+          Object.assign(writeValues, uc.values)
+        }
+        const mainUpdate = {
+          TableName: tableName,
+          Key: marshalledKey,
+          UpdateExpression: updateExpression,
+          ConditionExpression: condParts.join(" AND "),
+          ExpressionAttributeNames: writeNames,
+          ...(Object.keys(writeValues).length > 0 && {
+            ExpressionAttributeValues: writeValues,
+          }),
+          ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
+        }
+
+        // An update too wide for one expression (DynamoDB: 4 KB, 300
+        // operators — e.g. hundreds of sparse-map entries) writes the whole
+        // item instead, as before #133: under the version condition when
+        // versioned (exact), otherwise under the strongest guard that fits —
+        // the same fallback a wide soft delete uses.
+        const wide = !expressionFits(updateExpression, "update")
+        const wideGuardOrRefusal =
+          wide && !systemFields.version
+            ? deleteGuard(currentItem, "item", condParts.slice(1).join(" AND "))
+            : undefined
+        if (wideGuardOrRefusal instanceof ValidationError) return yield* wideGuardOrRefusal
+        const wideGuard = wideGuardOrRefusal
+        const putCondition =
+          wideGuard === undefined
+            ? condParts.join(" AND ")
+            : [wideGuard.expression, ...condParts.slice(1)].join(" AND ")
+        // Only the placeholders the condition uses (the Put has no update expression).
+        const putTokens = new Set(putCondition.match(/[#:][A-Za-z0-9_]+/g) ?? [])
+        const used = <V>(entries: globalThis.Record<string, V>) =>
+          Object.fromEntries(Object.entries(entries).filter(([token]) => putTokens.has(token)))
+        const putValues = used({ ...writeValues, ...wideGuard?.values })
+        const mainPut = {
+          TableName: tableName,
+          Item: marshalledNewItem,
+          ConditionExpression: putCondition,
+          ExpressionAttributeNames: used({ ...writeNames, ...wideGuard?.names }),
+          ...(Object.keys(putValues).length > 0 && { ExpressionAttributeValues: putValues }),
+          ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
+        }
+        const tooLarge = oversizedCondition(
+          "update",
+          wide ? putCondition : mainUpdate.ConditionExpression,
+          userCond !== undefined
+            ? compileCondition(userCond, resolveDbName)?.expression
+            : undefined,
+        )
+        if (tooLarge !== undefined) return yield* tooLarge
+        // The stored attributes the rejection compares: the guarded inputs,
+        // and on the wide fallback whatever else its guard covered.
+        const guardedAttrs = [
+          ...new Set([...inputs.map(resolveDbName), ...(wideGuard?.inputs ?? [])]),
+        ]
+
+        // A rejected main write: which predicate, from the stored item.
+        const mainRejection = (
+          stored: Readonly<globalThis.Record<string, unknown>> | undefined,
+        ): OptimisticLockError | ConditionalCheckFailed | ConcurrentModification | ItemNotFound => {
+          if (systemFields.version) {
+            return conditionRejection(
+              encodedKey as globalThis.Record<string, unknown>,
+              stored,
+              { version: currentVersion, read: currentItem },
+              userCond !== undefined,
+            )
+          }
+          if (stored === undefined) return missingItem()
+          const changed = guardedAttrs.filter(
+            (attr) =>
+              !attributeValueEquals(stored[attr] as AttributeValue | undefined, currentItem[attr]),
+          )
+          if (changed.length === 0 && userCond) {
+            return new ConditionalCheckFailed({ entityType, key: encodedKey })
+          }
+          return new ConcurrentModification({
+            entityType,
+            key: encodedKey,
+            attributes: changed.map(domainNameOf),
+            current: Option.none(),
+          })
+        }
+        let rejectedItem: globalThis.Record<string, AttributeValue> | undefined
+        const recordRejected = (
+          stored: Readonly<globalThis.Record<string, unknown>> | undefined,
+        ) => {
+          rejectedItem = stored as globalThis.Record<string, AttributeValue> | undefined
+          return mainRejection(stored)
+        }
+        // `current` of a ConcurrentModification: the stored item, decoded.
+        const withCurrent = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+          effect.pipe(
+            Effect.catchIf(
+              (e): e is E & ConcurrentModification => e instanceof ConcurrentModification,
+              (e) =>
+                Effect.gen(function* () {
+                  const current =
+                    rejectedItem === undefined
+                      ? Option.none()
+                      : yield* Effect.option(
+                          decodeAs(
+                            fromAttributeMap(rejectedItem) as globalThis.Record<string, unknown>,
+                            rejectedItem,
+                            "model",
+                          ),
+                        )
+                  return yield* keepReleaseRace(e, new ConcurrentModification({ ...e, current }))
+                }),
+            ),
+          )
+
+        // Build snapshot of the pre-update state (only when retain is enabled)
+        const snapshotItem = isRetainEnabled()
+          ? buildSnapshotItem(
+              currentRaw as globalThis.Record<string, unknown>,
+              currentVersion,
+              config.indexes.primary.pk.field,
+              config.indexes.primary.sk.field,
+              ttlAttrName,
+              now,
+            )
+          : undefined
+
+        const rv = uState.returnValues ?? "allNew"
+        // The item before and after the write. Exact: a versioned write is
+        // CAS-guarded on what was read; an unguarded-for-unrelated-attribute
+        // single UpdateItem returns its own image.
+        let oldImage: globalThis.Record<string, AttributeValue> | undefined = currentItem
+        let newImage: globalThis.Record<string, AttributeValue> | undefined = marshalledNewItem
+
+        if (snapshotItem === undefined && sentinelRotations.length === 0) {
+          // One item: a plain UpdateItem, whose ALL_OLD image plus this
+          // write's own SET / REMOVE is the exact new image as well.
+          const result = yield* withCurrent(
+            (wide
+              ? client.putItem({ ...mainPut, ReturnValues: "ALL_OLD" })
+              : client.updateItem({ ...mainUpdate, ReturnValues: "ALL_OLD" })
+            ).pipe(
+              Effect.mapError((err) =>
+                isAwsConditionalCheckFailed(err.cause) ? recordRejected(err.cause.Item) : err,
+              ),
+            ),
+          )
+          oldImage = result.Attributes ?? currentItem
+          const applied: globalThis.Record<string, AttributeValue> = {
+            ...oldImage,
+            ...setAttrs,
+          }
+          for (const attr of removeAttrs) delete applied[attr]
+          newImage = wide ? marshalledNewItem : applied
+        } else {
+          type TransactPut = {
+            Put: {
+              TableName: string
+              Item: globalThis.Record<string, AttributeValue>
+              ConditionExpression?: string
+              ExpressionAttributeNames?: globalThis.Record<string, string>
+              ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
+            }
+          }
+          type TransactDelete = ReturnType<typeof sentinelRelease>
+          type TransactUpdate = { Update: typeof mainUpdate }
+          type TransactMainPut = { Put: typeof mainPut }
+          const transactItems: Array<
+            TransactPut | TransactDelete | TransactUpdate | TransactMainPut
+          > = [wide ? { Put: mainPut } : { Update: mainUpdate }]
+
+          // Snapshot of pre-update state (only when retain is enabled)
+          if (snapshotItem) {
+            transactItems.push({ Put: snapshotPut(tableName, snapshotItem) })
           }
 
-          if (isRetainEnabled() || touchesUniqueFields) {
-            // --- Retain path: read-then-transact ---
-            // Read current item (needed to create snapshot of pre-update state)
-            const currentResult = yield* client.getItem({
-              TableName: tableName,
-              Key: marshalledKey,
-            })
-
-            if (!currentResult.Item) {
-              return yield* new ItemNotFound({ entityType, key: encodedKey })
-            }
-
-            const currentRaw = fromAttributeMap(currentResult.Item)
-            const currentVersion = systemFields.version
-              ? ((currentRaw as globalThis.Record<string, unknown>)[systemFields.version] as number)
-              : 0
-
-            // Validate optimistic lock if requested
-            if (evExpected !== undefined && currentVersion !== evExpected) {
-              return yield* new OptimisticLockError({
-                entityType,
-                key: encodedKey,
-                expectedVersion: evExpected,
-                actualVersion: currentVersion,
+          // Apply sentinel rotations computed earlier. Delete and Put are emitted
+          // independently — a sparse field that becomes set emits Put only; a sparse
+          // field that becomes unset emits Delete only. A Delete releases only a
+          // sentinel this item owns (#133): the item may hold the old value
+          // without its reservation, which another item may hold.
+          const owner = { pk: primaryKey[pkField], sk: primaryKey[skField] }
+          const owned = new Set(
+            yield* ownedSentinels(
+              tableName,
+              sentinelRotations.flatMap((rotation) =>
+                rotation.oldUniqueKey !== undefined ? [rotation.oldUniqueKey] : [],
+              ),
+              owner,
+            ),
+          )
+          const sentinelPutIndices: Array<{
+            index: number
+            constraintName: string
+            newFieldsRecord: globalThis.Record<string, string>
+          }> = []
+          const releaseIndices: Array<{ index: number; constraintName: string }> = []
+          for (const rotation of sentinelRotations) {
+            if (rotation.oldUniqueKey && owned.has(rotation.oldUniqueKey)) {
+              releaseIndices.push({
+                index: transactItems.length,
+                constraintName: rotation.constraintName,
               })
+              transactItems.push(sentinelRelease(tableName, rotation.oldUniqueKey, owner))
             }
 
-            // Build new item: merge current + updates + rich ops + recompose keys.
-            // `currentRaw` uses DynamoDB attribute names (e.g. `dn`, `hd`);
-            // `hydratedUpdates` uses domain names. To avoid the merge leaving
-            // both names (which would later have the rename clobber the user's
-            // value), translate the current item's keys to domain names first
-            // so the spread + assign overlay cleanly.
-            const currentDomainItem = {
-              ...(currentRaw as globalThis.Record<string, unknown>),
-            }
-            renameFromDynamo(currentDomainItem)
-            // Rebuild sparse Map fields from flattened attrs into domain Records.
-            // Done in-place on the renamed domain item so subsequent merge logic
-            // operates on domain shape and re-flattening happens once at the end.
-            deserializeSparseFields(currentDomainItem)
-            const newItem: globalThis.Record<string, unknown> = { ...currentDomainItem }
-            // Apply user updates. For sparse fields, merge bucket-by-bucket
-            // rather than whole-field replace — concurrent writers to disjoint
-            // buckets must coexist (the version CAS protects against same-bucket
-            // races). Non-sparse fields use the existing replace semantics.
-            //
-            // null and undefined collapse: both mean "absent" under v3's
-            // two-way classification (DESIGN.md §7). For the in-memory item
-            // we DELETE the attribute (mirrors a DynamoDB REMOVE), so
-            // subsequent decode sees the field as absent rather than as a
-            // typed null that the model schema may not permit. The composer
-            // below sees the attr as absent in `newItem` and applies the
-            // structural rule.
-            for (const [attr, val] of Object.entries(
-              hydratedUpdates as globalThis.Record<string, unknown>,
-            )) {
-              if (val === null || val === undefined) {
-                delete newItem[attr]
-                continue
-              }
-              if (hasSparseFields && attr in sparseFields && typeof val === "object") {
-                const existing = (newItem[attr] as globalThis.Record<string, unknown>) ?? {}
-                newItem[attr] = { ...existing, ...(val as globalThis.Record<string, unknown>) }
-              } else {
-                newItem[attr] = val
-              }
-            }
-
-            // Apply rich operations to in-memory item
-            if (uState.remove) {
-              for (const attr of uState.remove) {
-                delete newItem[attr]
-              }
-            }
-            // Sparse-map removes: drop named entries from the in-memory Record.
-            if (uState.sparseRemoveEntries) {
-              for (const op of uState.sparseRemoveEntries) {
-                if (!hasSparseFields || !(op.field in sparseFields)) continue
-                const bucket = newItem[op.field] as globalThis.Record<string, unknown> | undefined
-                if (!bucket) continue
-                for (const k of op.keys) delete bucket[k]
-              }
-            }
-            // Sparse-map clear: blow away the entire bucket Record. The retain
-            // path always reads-then-writes the full item, so the version CAS
-            // already gives clearMap atomic semantics for free — no per-bucket
-            // GET dance needed here.
-            if (uState.sparseClearFields) {
-              for (const field of uState.sparseClearFields) {
-                if (!hasSparseFields || !(field in sparseFields)) continue
-                newItem[field] = {}
-              }
-            }
-            if (uState.add) {
-              for (const [attr, val] of Object.entries(uState.add)) {
-                newItem[attr] = ((newItem[attr] as number) ?? 0) + val
-              }
-            }
-            if (uState.subtract) {
-              for (const [attr, val] of Object.entries(uState.subtract)) {
-                newItem[attr] = ((newItem[attr] as number) ?? 0) - val
-              }
-            }
-            if (uState.append) {
-              for (const [attr, val] of Object.entries(uState.append)) {
-                const existing = (newItem[attr] as Array<unknown>) ?? []
-                newItem[attr] = [...existing, ...val]
-              }
-            }
-            if (uState.deleteFromSet) {
-              for (const [attr, val] of Object.entries(uState.deleteFromSet)) {
-                if (newItem[attr] instanceof Set && val instanceof Set) {
-                  const current = newItem[attr] as Set<unknown>
-                  for (const elem of val as Set<unknown>) {
-                    current.delete(elem)
-                  }
-                }
-              }
-            }
-
-            // Increment version and update timestamp. If the caller supplied a
-            // value for `updatedAt` (allowed when the field collides with a
-            // model-declared field), respect it (already wire-form via encode);
-            // else generate a fresh wire primitive.
-            const newVersion = currentVersion + 1
-            if (systemFields.version) newItem[systemFields.version] = newVersion
-            if (systemFields.updatedAt) {
-              const userSupplied = (hydratedUpdates as globalThis.Record<string, unknown>)[
-                systemFields.updatedAt
-              ]
-              newItem[systemFields.updatedAt] =
-                userSupplied !== undefined
-                  ? userSupplied
-                  : generateTimestamp(systemFields.updatedAtEncoding, now)
-            }
-
-            // `newItem` is already in domain names (the merge built it from
-            // `currentDomainItem` + domain-keyed updates) — no rename needed
-            // here. Recompose all keys with the updated attributes.
-            //
-            // Primary key always recomposes from `newItem` (Put-style).
-            const primaryKeyMap = composePrimaryKey(newItem)
-            Object.assign(newItem, primaryKeyMap)
-
-            // GSI keys: route through the policy-aware composer so the
-            // v1.7.1 per-half evaluation gate, structural rule, and per-half
-            // cascade match the standard update path. `newItem` carries
-            // stored values for any composite the user did not touch — used
-            // as the merged record for the structural rule. The composer
-            // emits per-half SETs/REMOVEs/noops that we apply directly to
-            // `newItem` (which becomes the put-style item written back).
-            //
-            // No try/catch needed — EDD-9024 was deprecated in v1.7.1 and
-            // the composer no longer throws.
-            const retainRemovedSet = uState.remove ? new Set(uState.remove) : undefined
-            const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
-              schema,
-              entityType,
-              entityVersion,
-              allIndexes,
-              keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
-              keyForm(newItem),
-              retainRemovedSet === undefined ? {} : { removedSet: retainRemovedSet },
-            )
-            for (const [field, value] of Object.entries(gsiUpdate.sets)) {
-              newItem[field] = value
-            }
-            for (const field of gsiUpdate.removes) {
-              delete newItem[field]
-            }
-            // GSIs where neither half was touched (per the v1.7.1 evaluation
-            // gate): retain path semantics are Put-style — recompose from
-            // `newItem` and drop both keys when any composite is missing.
-            // For touched halves, trust the composer's per-half decision
-            // (SET / REMOVE / leave-stored-value-on-newItem-alone for noop).
-            const addressed = new Set<string>([
-              ...Object.keys(gsiUpdate.sets),
-              ...gsiUpdate.removes,
-            ])
-            for (const [indexName, indexDef] of Object.entries(allIndexes)) {
-              if (indexName === "primary") continue
-              // If either half was addressed, the composer made the per-half
-              // decision; the other half's stored value already lives on
-              // `newItem` from the read-then-write merge above.
-              if (addressed.has(indexDef.pk.field) || addressed.has(indexDef.sk.field)) continue
-              const keys = KeyComposer.tryComposeIndexKeys(
-                schema,
-                entityType,
-                entityVersion,
-                indexDef,
-                keyForm(newItem),
-              )
-              if (keys) {
-                Object.assign(newItem, keys)
-              } else {
-                delete newItem[indexDef.pk.field]
-                delete newItem[indexDef.sk.field]
-              }
-            }
-
-            // Compute sentinel rotation values while newItem is in domain names.
-            // currentRaw uses DynamoDB names, so read it through `toDomainView`
-            // for fields that may have been renamed (e.g. id → teamId).
-            // Sparse-aware rotation: each constraint may transition through one of four
-            // states between old and new — both-missing (no-op), missing→present (Put only),
-            // present→missing (Delete only), present→present (Delete + Put if changed).
-            type SentinelRotation = {
-              constraintName: string
-              oldUniqueKey: { readonly pk: string; readonly sk: string } | undefined
-              newUniqueKey: { readonly pk: string; readonly sk: string } | undefined
-              newFieldsRecord: globalThis.Record<string, string> | undefined
-            }
-            const sentinelRotations: Array<SentinelRotation> = []
-            if (touchesUniqueFields) {
-              const currentRawDomain = toDomainView(
-                currentRaw as globalThis.Record<string, unknown>,
-              )
-              for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
-                const oldSentinel = composeUniqueSentinel(
-                  schema,
-                  entityType,
-                  constraintName,
-                  constraintDef,
-                  currentRawDomain,
-                )
-                const newSentinel = composeUniqueSentinel(
-                  schema,
-                  entityType,
-                  constraintName,
-                  constraintDef,
-                  newItem,
-                )
-
-                if (!oldSentinel && !newSentinel) continue
-                if (
-                  oldSentinel &&
-                  newSentinel &&
-                  oldSentinel.key.pk === newSentinel.key.pk &&
-                  oldSentinel.key.sk === newSentinel.key.sk
-                ) {
-                  continue
-                }
-
-                sentinelRotations.push({
-                  constraintName,
-                  oldUniqueKey: oldSentinel?.key,
-                  newUniqueKey: newSentinel?.key,
-                  newFieldsRecord: newSentinel?.fieldsRecord,
-                })
-              }
-            }
-
-            // Vector search: the retain path already holds the full merged
-            // item, so a put-style recompute is exact — no extra read needed.
-            // Re-embedding is still gated on the payload touching a source
-            // field (`DESIGN.md §14`); untouched indexes keep their stored
-            // vector, which the merge above already carried onto `newItem`.
-            if (hasVectorIndexes) {
-              const embedFor = new Set(
-                vectorIndexesNeedingUpdate(
-                  collectTouchedFields(
-                    hydratedUpdates as globalThis.Record<string, unknown>,
-                    uState,
-                  ),
-                  uState.withVectors,
-                ).map(([logicalName]) => logicalName),
-              )
-              // `newItem` is the fully merged post-update item (removals already
-              // applied above), so a put-style recompute is exact.
-              const vectorWrite = yield* computeVectorAttributes(
-                newItem,
-                uState.withVectors,
-                embedFor,
-              )
-              Object.assign(newItem, vectorWrite.sets)
-              for (const field of vectorWrite.removes) delete newItem[field]
-            }
-
-            // Convert back to DynamoDB attribute names for storage
-            renameToDynamo(newItem)
-            // Flatten sparse Map fields into per-entry top-level attributes.
-            try {
-              serializeSparseFields(newItem)
-            } catch (e) {
-              return yield* new ValidationError({
-                entityType,
-                operation: "update.sparse",
-                cause: e instanceof Error ? e.message : String(e),
+            if (rotation.newUniqueKey && rotation.newFieldsRecord) {
+              sentinelPutIndices.push({
+                index: transactItems.length,
+                constraintName: rotation.constraintName,
+                newFieldsRecord: rotation.newFieldsRecord,
               })
-            }
-
-            const marshalledNewItem = toAttributeMap(newItem)
-
-            // Build snapshot of the pre-update state (only when retain is enabled)
-            const snapshotItem = isRetainEnabled()
-              ? buildSnapshotItem(
-                  currentRaw as globalThis.Record<string, unknown>,
-                  currentVersion,
-                  config.indexes.primary.pk.field,
-                  config.indexes.primary.sk.field,
-                  ttlAttrName,
-                  now,
-                )
-              : undefined
-
-            type TransactPut = {
-              Put: {
-                TableName: string
-                Item: globalThis.Record<string, AttributeValue>
-                ConditionExpression?: string
-                ExpressionAttributeNames?: globalThis.Record<string, string>
-                ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
-              }
-            }
-            type TransactDelete = {
-              Delete: {
-                TableName: string
-                Key: globalThis.Record<string, AttributeValue>
-              }
-            }
-            const transactItems: Array<TransactPut | TransactDelete> = []
-
-            // Put new item with version condition + optional user condition
-            {
-              const retainCondParts: Array<string> = []
-              const retainNames: globalThis.Record<string, string> = {}
-              const retainValues: globalThis.Record<string, AttributeValue> = {}
-              if (systemFields.version) {
-                retainNames["#ver"] = systemFields.version
-                retainValues[":expectedVer"] = toAttributeValue(currentVersion)
-                retainCondParts.push("#ver = :expectedVer")
-              }
-              if (userCond) {
-                const uc = compileCondition(userCond, resolveDbName)!
-                retainCondParts.push(`(${uc.expression})`)
-                Object.assign(retainNames, uc.names)
-                Object.assign(retainValues, uc.values)
-              }
-              const mainPut: TransactPut["Put"] = {
-                TableName: tableName,
-                Item: marshalledNewItem,
-              }
-              if (retainCondParts.length > 0) {
-                mainPut.ConditionExpression = retainCondParts.join(" AND ")
-                mainPut.ExpressionAttributeNames = retainNames
-                mainPut.ExpressionAttributeValues = retainValues
-              }
-              transactItems.push({ Put: mainPut })
-            }
-
-            // Snapshot of pre-update state (only when retain is enabled)
-            if (snapshotItem) {
               transactItems.push({
                 Put: {
                   TableName: tableName,
-                  Item: toAttributeMap(snapshotItem),
+                  Item: toAttributeMap(
+                    sentinelItemFor(
+                      rotation.constraintName,
+                      config.unique![rotation.constraintName]!,
+                      rotation.newUniqueKey,
+                      owner,
+                      now,
+                      ttlAttrName,
+                    ),
+                  ),
+                  ...sentinelGuard(),
                 },
               })
             }
+          }
 
-            // Apply sentinel rotations computed earlier. Delete and Put are emitted
-            // independently — a sparse field that becomes set emits Put only; a sparse
-            // field that becomes unset emits Delete only.
-            const sentinelPutIndices: Array<{
-              index: number
-              constraintName: string
-              newFieldsRecord: globalThis.Record<string, string>
-            }> = []
-            for (const rotation of sentinelRotations) {
-              if (rotation.oldUniqueKey) {
-                transactItems.push({
-                  Delete: {
-                    TableName: tableName,
-                    Key: toAttributeMap({
-                      [config.indexes.primary.pk.field]: rotation.oldUniqueKey.pk,
-                      [config.indexes.primary.sk.field]: rotation.oldUniqueKey.sk,
-                    }),
-                  },
-                })
-              }
-
-              if (rotation.newUniqueKey && rotation.newFieldsRecord) {
-                sentinelPutIndices.push({
-                  index: transactItems.length,
-                  constraintName: rotation.constraintName,
-                  newFieldsRecord: rotation.newFieldsRecord,
-                })
-                transactItems.push({
-                  Put: {
-                    TableName: tableName,
-                    Item: toAttributeMap({
-                      [config.indexes.primary.pk.field]: rotation.newUniqueKey.pk,
-                      [config.indexes.primary.sk.field]: rotation.newUniqueKey.sk,
-                      __edd_e__: `${entityType}._unique.${rotation.constraintName}`,
-                      _entity_pk: primaryKey[config.indexes.primary.pk.field],
-                      _entity_sk: primaryKey[config.indexes.primary.sk.field],
-                    }),
-                    ...sentinelGuard(),
-                  },
-                })
-              }
-            }
-
-            yield* checkTransactionLimit(entityType, "update", transactItems)
-            yield* client
-              .transactWriteItems({
-                TransactItems: transactItems.map((t) =>
-                  "Put" in t ? { Put: t.Put } : { Delete: t.Delete },
-                ),
-              })
-              .pipe(
-                Effect.mapError(
-                  (
-                    err,
-                  ):
-                    | DynamoClientError
-                    | OptimisticLockError
-                    | ConditionalCheckFailed
-                    | UniqueConstraintViolation => {
-                    // The main item's ConditionExpression carries the version CAS
-                    // (when the entity is versioned) ANDed with any user condition.
-                    // DynamoDB does not say which half rejected, so attribute the
-                    // failure to the version CAS whenever one is present, and to
-                    // the user condition only when it is the sole predicate —
-                    // otherwise an unversioned entity's `.condition()` rejection
-                    // would surface as a nonsensical OptimisticLockError.
-                    const mainItemRejection = (): OptimisticLockError | ConditionalCheckFailed => {
-                      if (!systemFields.version && userCond) {
-                        return new ConditionalCheckFailed({ entityType, key: encodedKey })
+          yield* checkTransactionLimit(entityType, "update", transactItems)
+          yield* withCurrent(
+            client.transactWriteItems({ TransactItems: transactItems }).pipe(
+              Effect.mapError(
+                (
+                  err,
+                ):
+                  | DynamoClientError
+                  | OptimisticLockError
+                  | ConditionalCheckFailed
+                  | ConcurrentModification
+                  | ItemNotFound
+                  | ValidationError
+                  | UniqueConstraintViolation => {
+                  if (isAwsTransactionCancelled(err.cause)) {
+                    const reasons = err.cause.CancellationReasons
+                    if (reasons) {
+                      // The main item first: a sentinel Put rejected because
+                      // the main write was cancelled reports nothing useful.
+                      if (reasons[0]?.Code === "ConditionalCheckFailed") {
+                        return recordRejected(reasons[0].Item)
                       }
-                      return new OptimisticLockError({
-                        entityType,
-                        key: encodedKey,
-                        expectedVersion: currentVersion,
-                        actualVersion: -1,
-                      })
-                    }
-                    if (isAwsTransactionCancelled(err.cause)) {
-                      const reasons = err.cause.CancellationReasons
-                      if (reasons) {
-                        // Check sentinel Puts for unique constraint violations
-                        for (const {
-                          index,
-                          constraintName,
-                          newFieldsRecord,
-                        } of sentinelPutIndices) {
-                          if (reasons[index]?.Code === "ConditionalCheckFailed") {
-                            return new UniqueConstraintViolation({
-                              entityType,
-                              constraint: constraintName,
-                              fields: newFieldsRecord,
-                            })
-                          }
+                      if (snapshotItem && reasons[1]?.Code === "ConditionalCheckFailed") {
+                        return historyConflict(currentVersion, "update")
+                      }
+                      for (const { index, constraintName, newFieldsRecord } of sentinelPutIndices) {
+                        if (reasons[index]?.Code === "ConditionalCheckFailed") {
+                          return new UniqueConstraintViolation({
+                            entityType,
+                            constraint: constraintName,
+                            fields: newFieldsRecord,
+                          })
                         }
-                        // Index 0 is the main item — version conflict or user condition
-                        if (reasons[0]?.Code === "ConditionalCheckFailed") {
-                          return mainItemRejection()
+                      }
+                      for (const { index, constraintName } of releaseIndices) {
+                        if (reasons[index]?.Code === "ConditionalCheckFailed") {
+                          return releaseRaced(
+                            encodedKey as globalThis.Record<string, unknown>,
+                            constraintName,
+                          )
                         }
                       }
                     }
-                    if (isAwsConditionalCheckFailed(err.cause)) {
-                      return mainItemRejection()
-                    }
-                    return err as
-                      | DynamoClientError
-                      | OptimisticLockError
-                      | UniqueConstraintViolation
-                  },
-                ),
-              )
-
-            const retainDecoded = yield* decodeAs(newItem, marshalledNewItem, mode)
-
-            // Execute cascade if configured (retain path)
-            if (uState.cascade) {
-              const domainData = { ...(retainDecoded as object) }
-              const sourceId =
-                sourceIdentifierField != null
-                  ? (encodedKey as globalThis.Record<string, unknown>)[sourceIdentifierField]
-                  : undefined
-              if (sourceId != null) {
-                yield* executeCascade(uState.cascade, domainData, String(sourceId))
-              }
-            }
-
-            return retainDecoded
-          }
-
-          // --- Standard path: updateItem ---
-          // Build UpdateExpression
-          const setClauses: Array<string> = []
-          const names: globalThis.Record<string, string> = {}
-          const values: globalThis.Record<string, AttributeValue> = {}
-          let counter = 0
-
-          // `hydratedUpdates` was produced by `Schema.encode(updateSchema)` and
-          // is already in wire-format (ISO string / epoch number / etc.). Use
-          // it directly — no `serializeDateFields` pass required.
-          const encodedUpdatesMap = hydratedUpdates as globalThis.Record<string, unknown>
-
-          // System-colliding updatedAt is handled by the system-field block below.
-          // createdAt and version are already excluded by `updateSchema`.
-          const updateSystemColliders = new Set<string>()
-          if (systemFields.updatedAtCollision && systemFields.updatedAt)
-            updateSystemColliders.add(systemFields.updatedAt)
-
-          // Add user-provided updates. Buffered REMOVE clauses for null
-          // payload entries land in `removeClauses` below — under v3,
-          // `set({ attr: null | undefined })` REMOVEs the attribute from the
-          // item but does NOT separately cascade-drop GSI keys. The structural
-          // composer treats the cleared attribute as absent and recomposes
-          // (or truncates / drops / no-ops) per the half's policy.
-          // EDD-9025 guarantees no composite is nullable, so `set` of `null`
-          // is only reachable for non-composite, model-declared-nullable
-          // attributes. See DESIGN.md §7.
-          const nullClears: Array<string> = []
-          for (const [attr, val] of Object.entries(encodedUpdatesMap)) {
-            if (updateSystemColliders.has(attr)) continue
-
-            if (val === null || val === undefined) {
-              // Sparse fields: clearing a sparse field with null is a no-op
-              // here — the `.removeEntries` API is the explicit per-key
-              // remove. Skip to avoid REMOVE'ing the whole prefix erroneously.
-              if (hasSparseFields && attr in sparseFields) continue
-              nullClears.push(attr)
-              continue
-            }
-
-            // Sparse fields: emit one SET per bucket. Whole-bucket replace
-            // semantics — concurrent writers to disjoint buckets are safe.
-            if (hasSparseFields && attr in sparseFields) {
-              if (typeof val !== "object") continue
-              const sparse = sparseFields[attr]!
-              for (const [k, v] of Object.entries(val as globalThis.Record<string, unknown>)) {
-                if (typeof k !== "string" || k.length === 0 || k.includes("#")) {
-                  return yield* new ValidationError({
-                    entityType,
-                    operation: "update.sparse",
-                    cause: `Sparse map "${attr}": invalid key ${JSON.stringify(k)}`,
-                  })
-                }
-                const nameKey = `#u${counter}`
-                const valKey = `:u${counter}`
-                names[nameKey] = `${sparse.prefix}#${k}`
-                values[valKey] = toAttributeValue(v)
-                setClauses.push(`${nameKey} = ${valKey}`)
-                counter++
-              }
-              continue
-            }
-
-            const nameKey = `#u${counter}`
-            const valKey = `:u${counter}`
-            names[nameKey] = resolveDbName(attr)
-            values[valKey] = toAttributeValue(val)
-            setClauses.push(`${nameKey} = ${valKey}`)
-            counter++
-          }
-
-          // Add updatedAt timestamp. User-supplied value wins (already in wire
-          // form via encode); else fall back to a freshly generated wire
-          // primitive.
-          if (systemFields.updatedAt) {
-            const userSupplied = encodedUpdatesMap[systemFields.updatedAt]
-            const nameKey = `#u${counter}`
-            const valKey = `:u${counter}`
-            names[nameKey] = systemFields.updatedAt
-            values[valKey] = toAttributeValue(
-              userSupplied !== undefined
-                ? userSupplied
-                : generateTimestamp(systemFields.updatedAtEncoding, now),
-            )
-            setClauses.push(`${nameKey} = ${valKey}`)
-            counter++
-          }
-
-          // Add version increment
-          if (systemFields.version) {
-            const nameKey = `#u${counter}`
-            names[nameKey] = systemFields.version
-            setClauses.push(`${nameKey} = ${nameKey} + :vinc`)
-            values[":vinc"] = toAttributeValue(1)
-            counter++
-          }
-
-          // Rich update operations from state
-          const removeClauses: Array<string> = []
-          const addClauses: Array<string> = []
-          const deleteClauses: Array<string> = []
-
-          // SUBTRACT → synthesize SET #field = #field - :val
-          if (uState.subtract) {
-            for (const [attr, val] of Object.entries(uState.subtract)) {
-              const nameKey = `#u${counter}`
-              const valKey = `:u${counter}`
-              names[nameKey] = resolveDbName(attr)
-              values[valKey] = toAttributeValue(val)
-              setClauses.push(`${nameKey} = ${nameKey} - ${valKey}`)
-              counter++
-            }
-          }
-
-          // APPEND → synthesize SET #field = list_append(#field, :val)
-          if (uState.append) {
-            for (const [attr, val] of Object.entries(uState.append)) {
-              const nameKey = `#u${counter}`
-              const valKey = `:u${counter}`
-              names[nameKey] = resolveDbName(attr)
-              values[valKey] = toAttributeValue(val)
-              setClauses.push(`${nameKey} = list_append(${nameKey}, ${valKey})`)
-              counter++
-            }
-          }
-
-          // REMOVE
-          // Two channels feed REMOVE clauses:
-          //  1. `Entity.remove([attr])` — explicit per-attribute drop. Cascades
-          //     to drop the GSI keys for any GSI containing the attr as a
-          //     composite (one of v3's two drop triggers — see DESIGN.md §7).
-          //     Tracked in `removedSet` so the composer can apply the cascade
-          //     rule.
-          //  2. Null payload entries (`set({ attr: null })`). These REMOVE the
-          //     attribute from the item only. They do NOT cascade GSI drops —
-          //     under v3 two-way classification, the structural composer just
-          //     treats the attribute as absent. (EDD-9025 guarantees these
-          //     are never composites.)
-          const removedSet = uState.remove ? new Set(uState.remove) : undefined
-          if (uState.remove) {
-            for (const attr of uState.remove) {
-              const nameKey = `#r${removeClauses.length}`
-              names[nameKey] = resolveDbName(attr)
-              removeClauses.push(nameKey)
-            }
-          }
-          for (const attr of nullClears) {
-            const nameKey = `#r${removeClauses.length}`
-            names[nameKey] = resolveDbName(attr)
-            removeClauses.push(nameKey)
-          }
-
-          // Policy-aware GSI key composition (v1.7.1 — per-half evaluation
-          // gate, structural rule, and per-half cascade). One call covers
-          // SETs (full recompose, truncated leading prefix), per-half REMOVEs
-          // (sparse can't-compose, or preserve + cascade override), and
-          // per-half noops (preserve + can't-compose without cascade). See
-          // DESIGN.md §7 Policy-Aware GSI Composition.
-          //
-          // No try/catch — EDD-9024 was deprecated in v1.7.1 and the
-          // composer no longer throws. Hole patterns collapse into the
-          // unified can't-compose rule.
-          const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
-            schema,
-            entityType,
-            entityVersion,
-            allIndexes,
-            keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
-            keyForm(encodedKey as globalThis.Record<string, unknown>),
-            removedSet === undefined ? {} : { removedSet },
+                  }
+                  if (isAwsConditionalCheckFailed(err.cause)) {
+                    return recordRejected(err.cause.Item)
+                  }
+                  return err
+                },
+              ),
+            ),
           )
-          for (const [field, value] of Object.entries(gsiUpdate.sets)) {
+        }
+
+        // Execute cascade if configured (retain path) — from the new item.
+        if (uState.cascade) {
+          const domainData = {
+            ...((yield* decodeAs(
+              fromAttributeMap(newImage) as globalThis.Record<string, unknown>,
+              newImage,
+              "model",
+            )) as object),
+          }
+          const sourceId =
+            sourceIdentifierField != null
+              ? (encodedKey as globalThis.Record<string, unknown>)[sourceIdentifierField]
+              : undefined
+          if (sourceId != null) {
+            yield* executeCascade(uState.cascade, domainData, String(sourceId))
+          }
+        }
+
+        return yield* updateResult(
+          rv,
+          oldImage,
+          newImage,
+          written,
+          mode,
+          encodedKey as globalThis.Record<string, unknown>,
+        )
+      }
+
+      // --- Standard path: updateItem ---
+      // A retain entity reaching this branch carries path operations. Read
+      // the item first: its version snapshot is built from it, and the
+      // update below is conditioned on that version, so the snapshot is
+      // exactly the item the update replaces (#133).
+      let retainSnapshot:
+        | {
+            readonly item: globalThis.Record<string, unknown>
+            readonly raw: globalThis.Record<string, AttributeValue>
+            readonly version: number
+            /** The incarnation the post-image carries (proof of this write). */
+            readonly incarnation: AttributeValue | undefined
+            /** A fresh incarnation token this write stamps on a legacy item. */
+            readonly stamp: string | undefined
+          }
+        | undefined
+      // A cascade that also returns the OLD item, with path operations on a
+      // versioned entity: read first, condition the write on that version
+      // and incarnation, so the read IS the old item and ALL_NEW the new.
+      let casRead:
+        | { readonly raw: globalThis.Record<string, AttributeValue>; readonly version: number }
+        | undefined
+      if (isRetainEnabled() || needsBothImages) {
+        const current =
+          preRead !== undefined
+            ? { Item: preRead }
+            : yield* client.getItem({
+                TableName: tableName,
+                Key: marshalledKey,
+                ConsistentRead: true,
+              })
+        if (!current.Item) {
+          return yield* missingItem()
+        }
+        yield* checkVersion(current.Item, "update")
+        const immutableChange = immutableMismatch(immutables, current.Item)
+        if (immutableChange !== undefined) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "update",
+            cause: immutableChange,
+          })
+        }
+        const currentRaw = fromAttributeMap(current.Item) as globalThis.Record<string, unknown>
+        const version = systemFields.version
+          ? ((currentRaw[systemFields.version] as number | undefined) ?? 0)
+          : 0
+        if (evExpected !== undefined && version !== evExpected) {
+          return yield* new OptimisticLockError({
+            entityType,
+            key: encodedKey,
+            expectedVersion: evExpected,
+            actualVersion: version,
+          })
+        }
+        if (!isRetainEnabled()) {
+          casRead = { raw: current.Item, version }
+        } else {
+          retainSnapshot = {
+            item: buildSnapshotItem(
+              currentRaw,
+              version,
+              config.indexes.primary.pk.field,
+              config.indexes.primary.sk.field,
+              ttlAttrName,
+              now,
+            ),
+            raw: current.Item,
+            version,
+            ...(stampsIncarnation && current.Item[INCARNATION_TOKEN] === undefined
+              ? yield* freshIncarnation.pipe(
+                  Effect.map((stamp) => ({ stamp, incarnation: toAttributeValue(stamp) })),
+                )
+              : {
+                  stamp: undefined,
+                  incarnation:
+                    incarnationAttr !== undefined ? current.Item[incarnationAttr] : undefined,
+                }),
+          }
+        }
+      }
+      // Plain (unread) updates require the item to exist (#133). One that
+      // could create a complete item — a plain `.set()` of every required
+      // field and key composite — does so on a missing item through `put`
+      // (`createOnMissing`), so the item is exactly the one `put` writes.
+      const plainWrite = retainSnapshot === undefined && casRead === undefined
+      const createsOnMissing =
+        plainWrite &&
+        upsertable &&
+        !uState.patch &&
+        evExpected === undefined &&
+        userCond === undefined &&
+        uState.cascade === undefined &&
+        uState.withVectors === undefined &&
+        (requestedRv === "allNew" || requestedRv === "none" || requestedRv === "updatedNew") &&
+        [uState.remove, uState.sparseRemoveEntries, uState.sparseClearFields].every(
+          (ops) => ops === undefined || ops.length === 0,
+        ) &&
+        [uState.add, uState.subtract, uState.append, uState.deleteFromSet].every(
+          (ops) => ops === undefined || Object.keys(ops).length === 0,
+        ) &&
+        !hasPathOps(uState)
+      // Build UpdateExpression
+      const setClauses: Array<string> = []
+      const names: globalThis.Record<string, string> = {}
+      const values: globalThis.Record<string, AttributeValue> = {}
+      let counter = 0
+
+      // `hydratedUpdates` was produced by `Schema.encode(updateSchema)` and
+      // is already in wire-format (ISO string / epoch number / etc.). Use
+      // it directly — no `serializeDateFields` pass required.
+      const encodedUpdatesMap = hydratedUpdates as globalThis.Record<string, unknown>
+
+      // System-colliding updatedAt is handled by the system-field block below.
+      // createdAt and version are already excluded by `updateSchema`.
+      const updateSystemColliders = new Set<string>()
+      if (systemFields.updatedAtCollision && systemFields.updatedAt)
+        updateSystemColliders.add(systemFields.updatedAt)
+
+      // Add user-provided updates. Buffered REMOVE clauses for null
+      // payload entries land in `removeClauses` below — under v3,
+      // `set({ attr: null | undefined })` REMOVEs the attribute from the
+      // item but does NOT separately cascade-drop GSI keys. The structural
+      // composer treats the cleared attribute as absent and recomposes
+      // (or truncates / drops / no-ops) per the half's policy.
+      // EDD-9025 guarantees no composite is nullable, so `set` of `null`
+      // is only reachable for non-composite, model-declared-nullable
+      // attributes. See DESIGN.md §7.
+      const nullClears: Array<string> = []
+      for (const [attr, val] of Object.entries(encodedUpdatesMap)) {
+        if (updateSystemColliders.has(attr)) continue
+
+        if (val === null || val === undefined) {
+          // Sparse fields: clearing a sparse field with null is a no-op
+          // here — the `.removeEntries` API is the explicit per-key
+          // remove. Skip to avoid REMOVE'ing the whole prefix erroneously.
+          if (hasSparseFields && attr in sparseFields) continue
+          nullClears.push(attr)
+          continue
+        }
+
+        // Sparse fields: emit one SET per bucket. Whole-bucket replace
+        // semantics — concurrent writers to disjoint buckets are safe.
+        if (hasSparseFields && attr in sparseFields) {
+          if (typeof val !== "object") continue
+          const sparse = sparseFields[attr]!
+          for (const [k, v] of Object.entries(val as globalThis.Record<string, unknown>)) {
+            if (typeof k !== "string" || k.length === 0 || k.includes("#")) {
+              return yield* new ValidationError({
+                entityType,
+                operation: "update.sparse",
+                cause: `Sparse map "${attr}": invalid key ${JSON.stringify(k)}`,
+              })
+            }
             const nameKey = `#u${counter}`
             const valKey = `:u${counter}`
-            names[nameKey] = field
-            values[valKey] = toAttributeValue(value)
+            names[nameKey] = `${sparse.prefix}#${k}`
+            values[valKey] = toAttributeValue(v)
             setClauses.push(`${nameKey} = ${valKey}`)
             counter++
           }
-          for (const keyField of gsiUpdate.removes) {
-            const nameKey = `#r${removeClauses.length}`
-            names[nameKey] = keyField
+          continue
+        }
+
+        const nameKey = `#u${counter}`
+        const valKey = `:u${counter}`
+        names[nameKey] = resolveDbName(attr)
+        values[valKey] = toAttributeValue(val)
+        setClauses.push(`${nameKey} = ${valKey}`)
+        counter++
+      }
+
+      // Add updatedAt timestamp. User-supplied value wins (already in wire
+      // form via encode); else fall back to a freshly generated wire
+      // primitive.
+      if (systemFields.updatedAt) {
+        const userSupplied = encodedUpdatesMap[systemFields.updatedAt]
+        const nameKey = `#u${counter}`
+        const valKey = `:u${counter}`
+        names[nameKey] = systemFields.updatedAt
+        values[valKey] = toAttributeValue(
+          userSupplied !== undefined
+            ? userSupplied
+            : generateTimestamp(systemFields.updatedAtEncoding, now),
+        )
+        setClauses.push(`${nameKey} = ${valKey}`)
+        counter++
+      }
+
+      // Add version increment
+      if (systemFields.version) {
+        const nameKey = `#u${counter}`
+        names[nameKey] = systemFields.version
+        // An item written before the entity was `versioned` has none: its
+        // first versioned write makes it version 1 (#133).
+        values[":vzero"] = toAttributeValue(0)
+        setClauses.push(`${nameKey} = if_not_exists(${nameKey}, :vzero) + :vinc`)
+        values[":vinc"] = toAttributeValue(1)
+        counter++
+      }
+
+      // Rich update operations from state
+      const removeClauses: Array<string> = []
+      const addClauses: Array<string> = []
+      const deleteClauses: Array<string> = []
+
+      // SUBTRACT → synthesize SET #field = #field - :val
+      if (uState.subtract) {
+        for (const [attr, val] of Object.entries(uState.subtract)) {
+          const nameKey = `#u${counter}`
+          const valKey = `:u${counter}`
+          names[nameKey] = resolveDbName(attr)
+          values[valKey] = toAttributeValue(val)
+          setClauses.push(`${nameKey} = ${nameKey} - ${valKey}`)
+          counter++
+        }
+      }
+
+      // APPEND → synthesize SET #field = list_append(#field, :val)
+      if (uState.append) {
+        for (const [attr, val] of Object.entries(uState.append)) {
+          const nameKey = `#u${counter}`
+          const valKey = `:u${counter}`
+          names[nameKey] = resolveDbName(attr)
+          const appended = encodePathValue([attr], val, "elements")
+          if (appended.issue !== undefined) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "update.append",
+              cause: appended.issue,
+            })
+          }
+          values[valKey] = toAttributeValue(appended.encoded)
+          setClauses.push(`${nameKey} = list_append(${nameKey}, ${valKey})`)
+          counter++
+        }
+      }
+
+      // REMOVE
+      // Two channels feed REMOVE clauses:
+      //  1. `Entity.remove([attr])` — explicit per-attribute drop. Cascades
+      //     to drop the GSI keys for any GSI containing the attr as a
+      //     composite (one of v3's two drop triggers — see DESIGN.md §7).
+      //     Tracked in `removedSet` so the composer can apply the cascade
+      //     rule.
+      //  2. Null payload entries (`set({ attr: null })`). These REMOVE the
+      //     attribute from the item only. They do NOT cascade GSI drops —
+      //     under v3 two-way classification, the structural composer just
+      //     treats the attribute as absent. (EDD-9025 guarantees these
+      //     are never composites.)
+      const removedSet = uState.remove ? new Set(uState.remove) : undefined
+      if (uState.remove) {
+        for (const attr of uState.remove) {
+          const nameKey = `#r${removeClauses.length}`
+          names[nameKey] = resolveDbName(attr)
+          removeClauses.push(nameKey)
+        }
+      }
+      for (const attr of nullClears) {
+        const nameKey = `#r${removeClauses.length}`
+        names[nameKey] = resolveDbName(attr)
+        removeClauses.push(nameKey)
+      }
+
+      // Policy-aware GSI key composition (v1.7.1 — per-half evaluation
+      // gate, structural rule, and per-half cascade). One call covers
+      // SETs (full recompose, truncated leading prefix), per-half REMOVEs
+      // (sparse can't-compose, or preserve + cascade override), and
+      // per-half noops (preserve + can't-compose without cascade). See
+      // DESIGN.md §7 Policy-Aware GSI Composition.
+      //
+      // No try/catch — EDD-9024 was deprecated in v1.7.1 and the
+      // composer no longer throws. Hole patterns collapse into the
+      // unified can't-compose rule.
+      const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        entityType,
+        entityVersion,
+        allIndexes,
+        keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
+        keyForm(encodedKey as globalThis.Record<string, unknown>),
+        removedSet === undefined ? {} : { removedSet },
+      )
+      // The key and vector attributes this update writes — a retain
+      // snapshot strips them, so the post-image is rebuilt from these.
+      const derivedSets: globalThis.Record<string, AttributeValue> = {}
+      const derivedRemoves = new Set<string>()
+      for (const [field, value] of Object.entries(gsiUpdate.sets)) {
+        const nameKey = `#u${counter}`
+        const valKey = `:u${counter}`
+        names[nameKey] = field
+        values[valKey] = toAttributeValue(value)
+        derivedSets[field] = values[valKey]
+        setClauses.push(`${nameKey} = ${valKey}`)
+        counter++
+      }
+      for (const keyField of gsiUpdate.removes) {
+        const nameKey = `#r${removeClauses.length}`
+        names[nameKey] = keyField
+        derivedRemoves.add(keyField)
+        removeClauses.push(nameKey)
+      }
+
+      // Vector search: partition value is recomposed whenever it can be
+      // (idempotent); the embedding is regenerated only when the payload
+      // touched a `source.fields` member or supplied `.withVector(...)`.
+      // See `DESIGN.md §14 Write path`.
+      if (hasVectorIndexes) {
+        const vectorWrite = yield* computeVectorUpdateAttributes(
+          encodedKey as globalThis.Record<string, unknown>,
+          marshalledKey,
+          tableName,
+          hydratedUpdates as globalThis.Record<string, unknown>,
+          uState,
+        )
+        for (const [field, value] of Object.entries(vectorWrite.sets)) {
+          const nameKey = `#u${counter}`
+          const valKey = `:u${counter}`
+          names[nameKey] = field
+          values[valKey] = toAttributeValue(value)
+          derivedSets[field] = values[valKey]
+          setClauses.push(`${nameKey} = ${valKey}`)
+          counter++
+        }
+        // Clearing every source field takes the item out of the index —
+        // there is no other way to delete a vector index entry.
+        for (const field of new Set(vectorWrite.removes)) {
+          const nameKey = `#r${removeClauses.length}`
+          names[nameKey] = field
+          derivedRemoves.add(field)
+          removeClauses.push(nameKey)
+        }
+      }
+
+      // ADD (atomic numeric increment / set addition)
+      if (uState.add) {
+        for (const [attr, val] of Object.entries(uState.add)) {
+          const nameKey = `#a${addClauses.length}`
+          const valKey = `:a${addClauses.length}`
+          names[nameKey] = resolveDbName(attr)
+          values[valKey] = toAttributeValue(val)
+          addClauses.push(`${nameKey} ${valKey}`)
+        }
+      }
+
+      // DELETE (remove elements from set)
+      if (uState.deleteFromSet) {
+        for (const [attr, val] of Object.entries(uState.deleteFromSet)) {
+          const nameKey = `#d${deleteClauses.length}`
+          const valKey = `:d${deleteClauses.length}`
+          names[nameKey] = resolveDbName(attr)
+          values[valKey] = toAttributeValue(val)
+          deleteClauses.push(`${nameKey} ${valKey}`)
+        }
+      }
+
+      // Path-based operations (from typed callback API)
+      const pathCounter = { value: 0 }
+
+      // Path SET operations
+      if (uState.pathSets) {
+        for (const op of uState.pathSets) {
+          const pathExpr = compilePath(op.segments, names, "ps", pathCounter, resolveDbName)
+          if (op.isPath && op.valueSegments) {
+            const srcExpr = compilePath(op.valueSegments, names, "ps", pathCounter, resolveDbName)
+            setClauses.push(`${pathExpr} = ${srcExpr}`)
+          } else {
+            const valKey = `:ps${pathCounter.value++}`
+            const set = encodePathValue(op.segments, op.value, "value")
+            if (set.issue !== undefined) {
+              return yield* new ValidationError({
+                entityType,
+                operation: "update.pathSet",
+                cause: set.issue,
+              })
+            }
+            values[valKey] = toAttributeValue(set.encoded)
+            setClauses.push(`${pathExpr} = ${valKey}`)
+          }
+        }
+      }
+
+      // Path SUBTRACT operations
+      if (uState.pathSubtracts) {
+        for (const op of uState.pathSubtracts) {
+          const pathExpr = compilePath(op.segments, names, "psb", pathCounter, resolveDbName)
+          if (op.isPath && op.valueSegments) {
+            const srcExpr = compilePath(op.valueSegments, names, "psb", pathCounter, resolveDbName)
+            setClauses.push(`${pathExpr} = ${pathExpr} - ${srcExpr}`)
+          } else {
+            const valKey = `:psb${pathCounter.value++}`
+            values[valKey] = toAttributeValue(op.value)
+            setClauses.push(`${pathExpr} = ${pathExpr} - ${valKey}`)
+          }
+        }
+      }
+
+      // Path APPEND operations
+      if (uState.pathAppends) {
+        for (const op of uState.pathAppends) {
+          const pathExpr = compilePath(op.segments, names, "pa", pathCounter, resolveDbName)
+          const valKey = `:pa${pathCounter.value++}`
+          const appended = encodePathValue(op.segments, op.value, "elements")
+          if (appended.issue !== undefined) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "update.pathAppend",
+              cause: appended.issue,
+            })
+          }
+          values[valKey] = toAttributeValue(appended.encoded)
+          setClauses.push(`${pathExpr} = list_append(${pathExpr}, ${valKey})`)
+        }
+      }
+
+      // Path PREPEND operations
+      if (uState.pathPrepends) {
+        for (const op of uState.pathPrepends) {
+          const pathExpr = compilePath(op.segments, names, "pp", pathCounter, resolveDbName)
+          const valKey = `:pp${pathCounter.value++}`
+          const prepended = encodePathValue(op.segments, op.value, "elements")
+          if (prepended.issue !== undefined) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "update.pathPrepend",
+              cause: prepended.issue,
+            })
+          }
+          values[valKey] = toAttributeValue(prepended.encoded)
+          setClauses.push(`${pathExpr} = list_append(${valKey}, ${pathExpr})`)
+        }
+      }
+
+      // Path if_not_exists operations
+      if (uState.pathIfNotExists) {
+        for (const op of uState.pathIfNotExists) {
+          const pathExpr = compilePath(op.segments, names, "pi", pathCounter, resolveDbName)
+          const valKey = `:pi${pathCounter.value++}`
+          const ifAbsent = encodePathValue(op.segments, op.value, "value")
+          if (ifAbsent.issue !== undefined) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "update.pathIfNotExists",
+              cause: ifAbsent.issue,
+            })
+          }
+          values[valKey] = toAttributeValue(ifAbsent.encoded)
+          setClauses.push(`${pathExpr} = if_not_exists(${pathExpr}, ${valKey})`)
+        }
+      }
+
+      // Path REMOVE operations
+      if (uState.pathRemoves) {
+        for (const segments of uState.pathRemoves) {
+          const pathExpr = compilePath(segments, names, "pr", pathCounter, resolveDbName)
+          removeClauses.push(pathExpr)
+        }
+      }
+
+      // Path ADD operations
+      if (uState.pathAdds) {
+        for (const op of uState.pathAdds) {
+          const pathExpr = compilePath(op.segments, names, "pad", pathCounter, resolveDbName)
+          const valKey = `:pad${pathCounter.value++}`
+          values[valKey] = toAttributeValue(op.value)
+          addClauses.push(`${pathExpr} ${valKey}`)
+        }
+      }
+
+      // Path DELETE operations
+      if (uState.pathDeletes) {
+        for (const op of uState.pathDeletes) {
+          const pathExpr = compilePath(op.segments, names, "pd", pathCounter, resolveDbName)
+          const valKey = `:pd${pathCounter.value++}`
+          values[valKey] = toAttributeValue(op.value)
+          deleteClauses.push(`${pathExpr} ${valKey}`)
+        }
+      }
+
+      // Sparse-map .removeEntries — explicit REMOVE on `<prefix>#<key>`.
+      // Each key emits one REMOVE clause through ExpressionAttributeNames
+      // (the literal "#" survives via compilePath's raw-segment escape).
+      if (uState.sparseRemoveEntries) {
+        for (const op of uState.sparseRemoveEntries) {
+          if (!hasSparseFields || !(op.field in sparseFields)) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "update.removeEntries",
+              cause: `field "${op.field}" is not configured as a sparse map`,
+            })
+          }
+          const sparse = sparseFields[op.field]!
+          for (const k of op.keys) {
+            if (typeof k !== "string" || k.length === 0 || k.includes("#")) {
+              return yield* new ValidationError({
+                entityType,
+                operation: "update.removeEntries",
+                cause: `Sparse map "${op.field}": invalid key ${JSON.stringify(k)}`,
+              })
+            }
+            const nameKey = `#sr${removeClauses.length}`
+            names[nameKey] = `${sparse.prefix}#${k}`
             removeClauses.push(nameKey)
           }
+        }
+      }
 
-          // Vector search: partition value is recomposed whenever it can be
-          // (idempotent); the embedding is regenerated only when the payload
-          // touched a `source.fields` member or supplied `.withVector(...)`.
-          // See `DESIGN.md §14 Write path`.
-          if (hasVectorIndexes) {
-            const vectorWrite = yield* computeVectorUpdateAttributes(
-              encodedKey as globalThis.Record<string, unknown>,
-              marshalledKey,
-              tableName,
-              hydratedUpdates as globalThis.Record<string, unknown>,
-              uState,
-            )
-            for (const [field, value] of Object.entries(vectorWrite.sets)) {
-              const nameKey = `#u${counter}`
-              const valKey = `:u${counter}`
-              names[nameKey] = field
-              values[valKey] = toAttributeValue(value)
-              setClauses.push(`${nameKey} = ${valKey}`)
-              counter++
-            }
-            // Clearing every source field takes the item out of the index —
-            // there is no other way to delete a vector index entry.
-            for (const field of new Set(vectorWrite.removes)) {
-              const nameKey = `#r${removeClauses.length}`
-              names[nameKey] = field
-              removeClauses.push(nameKey)
-            }
+      // Sparse-map .clearMap — Get-then-Update helper. Reads the current
+      // item with a consistent read to discover which `<prefix>#*` attrs
+      // exist, then folds the resulting REMOVEs into this same UpdateItem.
+      // The version CAS (when configured) provides atomicity; non-versioned
+      // entities are best-effort (a concurrent writer can add a new bucket
+      // between the read and the update — that bucket survives).
+      if (uState.sparseClearFields && uState.sparseClearFields.length > 0) {
+        for (const field of uState.sparseClearFields) {
+          if (!hasSparseFields || !(field in sparseFields)) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "update.clearMap",
+              cause: `field "${field}" is not configured as a sparse map`,
+            })
           }
-
-          // ADD (atomic numeric increment / set addition)
-          if (uState.add) {
-            for (const [attr, val] of Object.entries(uState.add)) {
-              const nameKey = `#a${addClauses.length}`
-              const valKey = `:a${addClauses.length}`
-              names[nameKey] = resolveDbName(attr)
-              values[valKey] = toAttributeValue(val)
-              addClauses.push(`${nameKey} ${valKey}`)
-            }
-          }
-
-          // DELETE (remove elements from set)
-          if (uState.deleteFromSet) {
-            for (const [attr, val] of Object.entries(uState.deleteFromSet)) {
-              const nameKey = `#d${deleteClauses.length}`
-              const valKey = `:d${deleteClauses.length}`
-              names[nameKey] = resolveDbName(attr)
-              values[valKey] = toAttributeValue(val)
-              deleteClauses.push(`${nameKey} ${valKey}`)
-            }
-          }
-
-          // Path-based operations (from typed callback API)
-          const pathCounter = { value: 0 }
-
-          // Path SET operations
-          if (uState.pathSets) {
-            for (const op of uState.pathSets) {
-              const pathExpr = compilePath(op.segments, names, "ps", pathCounter, resolveDbName)
-              if (op.isPath && op.valueSegments) {
-                const srcExpr = compilePath(
-                  op.valueSegments,
-                  names,
-                  "ps",
-                  pathCounter,
-                  resolveDbName,
-                )
-                setClauses.push(`${pathExpr} = ${srcExpr}`)
-              } else {
-                const valKey = `:ps${pathCounter.value++}`
-                values[valKey] = toAttributeValue(op.value)
-                setClauses.push(`${pathExpr} = ${valKey}`)
-              }
-            }
-          }
-
-          // Path SUBTRACT operations
-          if (uState.pathSubtracts) {
-            for (const op of uState.pathSubtracts) {
-              const pathExpr = compilePath(op.segments, names, "psb", pathCounter, resolveDbName)
-              if (op.isPath && op.valueSegments) {
-                const srcExpr = compilePath(
-                  op.valueSegments,
-                  names,
-                  "psb",
-                  pathCounter,
-                  resolveDbName,
-                )
-                setClauses.push(`${pathExpr} = ${pathExpr} - ${srcExpr}`)
-              } else {
-                const valKey = `:psb${pathCounter.value++}`
-                values[valKey] = toAttributeValue(op.value)
-                setClauses.push(`${pathExpr} = ${pathExpr} - ${valKey}`)
-              }
-            }
-          }
-
-          // Path APPEND operations
-          if (uState.pathAppends) {
-            for (const op of uState.pathAppends) {
-              const pathExpr = compilePath(op.segments, names, "pa", pathCounter, resolveDbName)
-              const valKey = `:pa${pathCounter.value++}`
-              values[valKey] = toAttributeValue(op.value)
-              setClauses.push(`${pathExpr} = list_append(${pathExpr}, ${valKey})`)
-            }
-          }
-
-          // Path PREPEND operations
-          if (uState.pathPrepends) {
-            for (const op of uState.pathPrepends) {
-              const pathExpr = compilePath(op.segments, names, "pp", pathCounter, resolveDbName)
-              const valKey = `:pp${pathCounter.value++}`
-              values[valKey] = toAttributeValue(op.value)
-              setClauses.push(`${pathExpr} = list_append(${valKey}, ${pathExpr})`)
-            }
-          }
-
-          // Path if_not_exists operations
-          if (uState.pathIfNotExists) {
-            for (const op of uState.pathIfNotExists) {
-              const pathExpr = compilePath(op.segments, names, "pi", pathCounter, resolveDbName)
-              const valKey = `:pi${pathCounter.value++}`
-              values[valKey] = toAttributeValue(op.value)
-              setClauses.push(`${pathExpr} = if_not_exists(${pathExpr}, ${valKey})`)
-            }
-          }
-
-          // Path REMOVE operations
-          if (uState.pathRemoves) {
-            for (const segments of uState.pathRemoves) {
-              const pathExpr = compilePath(segments, names, "pr", pathCounter, resolveDbName)
-              removeClauses.push(pathExpr)
-            }
-          }
-
-          // Path ADD operations
-          if (uState.pathAdds) {
-            for (const op of uState.pathAdds) {
-              const pathExpr = compilePath(op.segments, names, "pad", pathCounter, resolveDbName)
-              const valKey = `:pad${pathCounter.value++}`
-              values[valKey] = toAttributeValue(op.value)
-              addClauses.push(`${pathExpr} ${valKey}`)
-            }
-          }
-
-          // Path DELETE operations
-          if (uState.pathDeletes) {
-            for (const op of uState.pathDeletes) {
-              const pathExpr = compilePath(op.segments, names, "pd", pathCounter, resolveDbName)
-              const valKey = `:pd${pathCounter.value++}`
-              values[valKey] = toAttributeValue(op.value)
-              deleteClauses.push(`${pathExpr} ${valKey}`)
-            }
-          }
-
-          // Sparse-map .removeEntries — explicit REMOVE on `<prefix>#<key>`.
-          // Each key emits one REMOVE clause through ExpressionAttributeNames
-          // (the literal "#" survives via compilePath's raw-segment escape).
-          if (uState.sparseRemoveEntries) {
-            for (const op of uState.sparseRemoveEntries) {
-              if (!hasSparseFields || !(op.field in sparseFields)) {
-                return yield* new ValidationError({
-                  entityType,
-                  operation: "update.removeEntries",
-                  cause: `field "${op.field}" is not configured as a sparse map`,
-                })
-              }
-              const sparse = sparseFields[op.field]!
-              for (const k of op.keys) {
-                if (typeof k !== "string" || k.length === 0 || k.includes("#")) {
-                  return yield* new ValidationError({
-                    entityType,
-                    operation: "update.removeEntries",
-                    cause: `Sparse map "${op.field}": invalid key ${JSON.stringify(k)}`,
-                  })
-                }
-                const nameKey = `#sr${removeClauses.length}`
-                names[nameKey] = `${sparse.prefix}#${k}`
+        }
+        // Read once for all clearMap fields combined.
+        const clearGetResult = yield* client.getItem({
+          TableName: tableName,
+          Key: marshalledKey,
+          ConsistentRead: true,
+        })
+        if (clearGetResult.Item) {
+          const clearItemKeys = Object.keys(clearGetResult.Item)
+          for (const field of uState.sparseClearFields) {
+            const sparse = sparseFields[field]!
+            const prefixWithDelim = `${sparse.prefix}#`
+            for (const attrName of clearItemKeys) {
+              if (attrName.startsWith(prefixWithDelim)) {
+                const nameKey = `#sc${removeClauses.length}`
+                names[nameKey] = attrName
                 removeClauses.push(nameKey)
               }
             }
           }
+        }
+        // If the item doesn't exist, clearMap is a no-op — and the
+        // subsequent UpdateItem's existence condition reports it.
+      }
 
-          // Sparse-map .clearMap — Get-then-Update helper. Reads the current
-          // item with a consistent read to discover which `<prefix>#*` attrs
-          // exist, then folds the resulting REMOVEs into this same UpdateItem.
-          // The version CAS (when configured) provides atomicity; non-versioned
-          // entities are best-effort (a concurrent writer can add a new bucket
-          // between the read and the update — that bucket survives).
-          if (uState.sparseClearFields && uState.sparseClearFields.length > 0) {
-            for (const field of uState.sparseClearFields) {
-              if (!hasSparseFields || !(field in sparseFields)) {
-                return yield* new ValidationError({
-                  entityType,
-                  operation: "update.clearMap",
-                  cause: `field "${field}" is not configured as a sparse map`,
-                })
-              }
-            }
-            // Read once for all clearMap fields combined.
-            const clearGetResult = yield* client.getItem({
-              TableName: tableName,
-              Key: marshalledKey,
-              ConsistentRead: true,
-            })
-            if (clearGetResult.Item) {
-              const clearItemKeys = Object.keys(clearGetResult.Item)
-              for (const field of uState.sparseClearFields) {
-                const sparse = sparseFields[field]!
-                const prefixWithDelim = `${sparse.prefix}#`
-                for (const attrName of clearItemKeys) {
-                  if (attrName.startsWith(prefixWithDelim)) {
-                    const nameKey = `#sc${removeClauses.length}`
-                    names[nameKey] = attrName
-                    removeClauses.push(nameKey)
-                  }
-                }
-              }
-            }
-            // If the item doesn't exist, clearMap is a no-op — the subsequent
-            // UpdateItem will create the row (with whatever other clauses the
-            // builder accumulated) per DynamoDB UpdateItem semantics.
-          }
+      // A legacy retain item gets its incarnation token with this write.
+      if (retainSnapshot?.stamp !== undefined) {
+        names["#eddInc"] = INCARNATION_TOKEN
+        values[":eddInc"] = toAttributeValue(retainSnapshot.stamp)
+        setClauses.push("#eddInc = :eddInc")
+      }
 
-          const hasAnyUpdate =
-            setClauses.length > 0 ||
-            removeClauses.length > 0 ||
-            addClauses.length > 0 ||
-            deleteClauses.length > 0
+      const hasAnyUpdate =
+        setClauses.length > 0 ||
+        removeClauses.length > 0 ||
+        addClauses.length > 0 ||
+        deleteClauses.length > 0
 
-          if (!hasAnyUpdate) {
-            // Nothing to update — just get the current item
-            return yield* get(key)._run(mode)
-          }
+      const rv = uState.returnValues ?? "allNew"
+      if (!hasAnyUpdate) {
+        // Nothing to update: nothing written, so nothing "updated"; the
+        // whole-item modes are the current item.
+        if (rv === "none") return undefined
+        if (rv === "updatedOld" || rv === "updatedNew") {
+          return yield* decodePartial(undefined, new Set(), mode)
+        }
+        return yield* get(key)._run(mode)
+      }
 
-          // Compose UpdateExpression from all clause types
-          const expressionParts: Array<string> = []
-          if (setClauses.length > 0) expressionParts.push(`SET ${setClauses.join(", ")}`)
-          if (removeClauses.length > 0) expressionParts.push(`REMOVE ${removeClauses.join(", ")}`)
-          if (addClauses.length > 0) expressionParts.push(`ADD ${addClauses.join(", ")}`)
-          if (deleteClauses.length > 0) expressionParts.push(`DELETE ${deleteClauses.join(", ")}`)
-          const updateExpression = expressionParts.join(" ")
+      // Compose UpdateExpression from all clause types
+      const expressionParts: Array<string> = []
+      if (setClauses.length > 0) expressionParts.push(`SET ${setClauses.join(", ")}`)
+      if (removeClauses.length > 0) expressionParts.push(`REMOVE ${removeClauses.join(", ")}`)
+      if (addClauses.length > 0) expressionParts.push(`ADD ${addClauses.join(", ")}`)
+      if (deleteClauses.length > 0) expressionParts.push(`DELETE ${deleteClauses.join(", ")}`)
+      const updateExpression = expressionParts.join(" ")
 
-          // Build condition expression — combine optimistic lock + user condition
-          const condParts: Array<string> = []
-          if (evExpected !== undefined && systemFields.version) {
-            names["#condVer"] = systemFields.version
-            values[":expectedVer"] = toAttributeValue(evExpected)
-            condParts.push("#condVer = :expectedVer")
-          }
-          if (userCond) {
-            const uc = compileCondition(userCond, resolveDbName)!
-            condParts.push(`(${uc.expression})`)
-            Object.assign(names, uc.names)
-            Object.assign(values, uc.values)
-          }
-          const conditionExpression = condParts.length > 0 ? condParts.join(" AND ") : undefined
+      // Build condition expression — combine optimistic lock + user condition
+      const condParts: Array<string> = []
+      if (evExpected !== undefined && systemFields.version) {
+        condParts.push(versionIs(evExpected, names, values, "#condVer", ":expectedVer"))
+      }
+      if (plainWrite && systemFields.version) {
+        // Never version an item whose version was removed outside the library
+        // (incarnation token, no version) as if it predated versioning.
+        names["#intVer"] = systemFields.version
+        names["#intInc"] = INCARNATION_TOKEN
+        condParts.push("(attribute_exists(#intVer) OR attribute_not_exists(#intInc))")
+      }
+      // A plain write already requires the item (`attribute_exists(#exists)`
+      // below), so `patch`'s own exists guard would only repeat it.
+      const sentCond = plainWrite ? uState.condition : userCond
+      const uc = sentCond ? compileCondition(sentCond, resolveDbName) : undefined
+      if (uc) {
+        condParts.push(`(${uc.expression})`)
+        Object.assign(names, uc.names)
+        Object.assign(values, uc.values)
+      }
+      if (plainWrite) {
+        // Restated immutable values must match the item's.
+        for (const [i, { attr, value }] of immutables.entries()) {
+          names[`#imm${i}`] = attr
+          values[`:imm${i}`] = value
+          condParts.push(`#imm${i} = :imm${i}`)
+        }
+        names["#exists"] = config.indexes.primary.pk.field
+        condParts.push("attribute_exists(#exists)")
+      }
+      if (casRead !== undefined && systemFields.version) {
+        condParts.push(versionIs(casRead.version, names, values, "#casVer", ":casVer"))
+        const incarnation = incarnationGuard(casRead.raw, names, values)
+        if (incarnation !== undefined) condParts.push(incarnation)
+      }
+      const conditionExpression = condParts.length > 0 ? condParts.join(" AND ") : undefined
+      {
+        const tooLarge = oversizedCondition(
+          "update",
+          conditionExpression,
+          sentCond !== undefined
+            ? compileCondition(sentCond, resolveDbName)?.expression
+            : undefined,
+        )
+        if (tooLarge !== undefined) return yield* tooLarge
+      }
 
-          // DynamoDB rejects an empty `ExpressionAttributeValues` map. When
-          // the UpdateExpression is REMOVE-only (e.g. clearMap with no other
-          // combinators), `values` may be empty — omit the property entirely.
-          const result = yield* client
-            .updateItem({
+      // The top-level attributes this update writes — what `updatedOld` /
+      // `updatedNew` return.
+      const written = expressionTargets(updateExpression, names)
+      const cascadeFrom = (image: globalThis.Record<string, AttributeValue>) =>
+        Effect.gen(function* () {
+          if (!uState.cascade) return
+          const sourceId =
+            sourceIdentifierField != null
+              ? (encodedKey as globalThis.Record<string, unknown>)[sourceIdentifierField]
+              : undefined
+          if (sourceId == null) return
+          const domainData = yield* decodeAs(
+            fromAttributeMap(image) as globalThis.Record<string, unknown>,
+            image,
+            "model",
+          )
+          yield* executeCascade(uState.cascade, { ...(domainData as object) }, String(sourceId))
+        })
+
+      if (retainSnapshot !== undefined) {
+        // The SAME UpdateExpression, transacted with the version snapshot of
+        // the item it replaces — DynamoDB applies the path operations, so
+        // their semantics are DynamoDB's own (#133). The version AND the
+        // incarnation prove the snapshot is of the item this replaces.
+        const snapshot = retainSnapshot
+        const guardParts = [...condParts]
+        if (systemFields.version) {
+          guardParts.push(versionIs(snapshot.version, names, values, "#retainVer", ":retainVer"))
+          const incarnation = incarnationGuard(snapshot.raw, names, values)
+          if (incarnation !== undefined) guardParts.push(incarnation)
+        }
+        const tooLarge = oversizedCondition(
+          "update",
+          guardParts.join(" AND "),
+          sentCond !== undefined
+            ? compileCondition(sentCond, resolveDbName)?.expression
+            : undefined,
+        )
+        if (tooLarge !== undefined) return yield* tooLarge
+        const transactItems = [
+          {
+            Update: {
               TableName: tableName,
               Key: marshalledKey,
               UpdateExpression: updateExpression,
               ExpressionAttributeNames: names,
               ExpressionAttributeValues: Object.keys(values).length > 0 ? values : undefined,
-              ConditionExpression: conditionExpression,
-              ReturnValues: returnValuesMap[uState.returnValues ?? "allNew"],
-            })
-            .pipe(
-              Effect.mapError((err) => {
-                if (isAwsConditionalCheckFailed(err.cause)) {
-                  if (evExpected !== undefined) {
-                    return new OptimisticLockError({
-                      entityType,
-                      key: encodedKey,
-                      expectedVersion: evExpected,
-                      actualVersion: -1,
-                    }) as DynamoClientError | OptimisticLockError | ConditionalCheckFailed
-                  }
-                  if (userCond) {
-                    return new ConditionalCheckFailed({
-                      entityType,
-                      key: encodedKey,
-                    }) as DynamoClientError | OptimisticLockError | ConditionalCheckFailed
-                  }
-                }
-                return err as DynamoClientError | OptimisticLockError | ConditionalCheckFailed
+              ...(guardParts.length > 0 && {
+                ConditionExpression: guardParts.join(" AND "),
+                ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
               }),
+            },
+          },
+          { Put: snapshotPut(tableName, snapshot.item) },
+        ]
+        yield* checkTransactionLimit(entityType, "update", transactItems)
+        yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
+          Effect.mapError(
+            (
+              err,
+            ):
+              | DynamoClientError
+              | OptimisticLockError
+              | ConditionalCheckFailed
+              | ValidationError => {
+              // The update is guarded by the snapshot version AND any user
+              // condition; the stored item (ALL_OLD) says which rejected it.
+              const rejection = (
+                stored: Readonly<globalThis.Record<string, unknown>> | undefined,
+              ) =>
+                conditionRejection(
+                  encodedKey as globalThis.Record<string, unknown>,
+                  stored,
+                  systemFields.version
+                    ? { version: snapshot.version, read: snapshot.raw }
+                    : undefined,
+                  userCond !== undefined,
+                )
+              if (isAwsTransactionCancelled(err.cause)) {
+                const main = err.cause.CancellationReasons?.[0]
+                if (main?.Code === "ConditionalCheckFailed") return rejection(main.Item)
+                if (err.cause.CancellationReasons?.[1]?.Code === "ConditionalCheckFailed") {
+                  return historyConflict(snapshot.version, "update")
+                }
+              }
+              if (isAwsConditionalCheckFailed(err.cause)) return rejection(err.cause.Item)
+              return err
+            },
+          ),
+        )
+        // A transacted Update returns no attributes. The old item is exact:
+        // the version condition proves `snapshot.raw` is what it replaced.
+        // The new item is read back only when needed, and proven ours.
+        const needsNew = rv === "allNew" || rv === "updatedNew" || uState.cascade !== undefined
+        const after = needsNew
+          ? yield* readRetainPostImage(
+              tableName,
+              marshalledKey,
+              snapshot.raw,
+              snapshot.version + 1,
+              snapshot.incarnation,
+              derivedSets,
+              derivedRemoves,
+              ttlAttrName,
+              encodedKey as globalThis.Record<string, unknown>,
             )
+          : undefined
+        if (after !== undefined) yield* cascadeFrom(after)
+        return yield* updateResult(
+          rv,
+          snapshot.raw,
+          after,
+          written,
+          mode,
+          encodedKey as globalThis.Record<string, unknown>,
+        )
+      }
 
-          if (!result.Attributes) {
-            return yield* new ItemNotFound({ entityType, key: encodedKey })
-          }
+      // The image the mode returns; `none` asks for nothing unless a
+      // cascade needs the new item.
+      const wantsOld = casRead === undefined && (rv === "allOld" || rv === "updatedOld")
+      const returned = wantsOld
+        ? "ALL_OLD"
+        : rv === "none" && !uState.cascade && casRead === undefined
+          ? "NONE"
+          : "ALL_NEW"
+      // DynamoDB rejects an empty `ExpressionAttributeValues` map. When
+      // the UpdateExpression is REMOVE-only (e.g. clearMap with no other
+      // combinators), `values` may be empty — omit the property entirely.
+      const result = yield* client
+        .updateItem({
+          TableName: tableName,
+          Key: marshalledKey,
+          UpdateExpression: updateExpression,
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: Object.keys(values).length > 0 ? values : undefined,
+          ConditionExpression: conditionExpression,
+          ...(conditionExpression !== undefined && {
+            ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
+          }),
+          ReturnValues: returned,
+        })
+        .pipe(
+          Effect.mapError(
+            (
+              err,
+            ):
+              | DynamoClientError
+              | OptimisticLockError
+              | ConditionalCheckFailed
+              | ItemNotFound
+              | MissingForCreate
+              | ValidationError => {
+              // The stored item (ALL_OLD) says what rejected the update: no
+              // item (it must exist), a restated immutable value, the
+              // version CAS, or the user's condition.
+              if (isAwsConditionalCheckFailed(err.cause)) {
+                const stored = err.cause.Item
+                if (stored === undefined && !uState.patch) {
+                  return createsOnMissing
+                    ? new MissingForCreate({ input: uState.updates })
+                    : new ItemNotFound({ entityType, key: encodedKey })
+                }
+                const corrupt = versionCorruption(stored, "update")
+                if (corrupt !== undefined) return corrupt
+                const immutableChange =
+                  stored !== undefined ? immutableMismatch(immutables, stored) : undefined
+                if (immutableChange !== undefined) {
+                  return new ValidationError({
+                    entityType,
+                    operation: "update",
+                    cause: immutableChange,
+                  })
+                }
+                return conditionRejection(
+                  encodedKey as globalThis.Record<string, unknown>,
+                  stored,
+                  casRead !== undefined
+                    ? { version: casRead.version, read: casRead.raw }
+                    : systemFields.version && evExpected !== undefined
+                      ? { version: evExpected }
+                      : undefined,
+                  userCond !== undefined,
+                )
+              }
+              return err
+            },
+          ),
+        )
 
-          const raw = fromAttributeMap(result.Attributes)
-          const decoded = yield* decodeAs(raw, result.Attributes, mode)
+      // A cascade never meets an old-image mode here: that combination is
+      // routed to the read-then-write branch, or read first (`casRead`).
+      const newImage = wantsOld ? undefined : result.Attributes
+      if (uState.cascade && newImage !== undefined) yield* cascadeFrom(newImage)
 
-          // Execute cascade if configured
-          if (uState.cascade) {
-            const domainData = { ...(decoded as object) }
-            const sourceId =
-              sourceIdentifierField != null
-                ? (encodedKey as globalThis.Record<string, unknown>)[sourceIdentifierField]
-                : undefined
-            if (sourceId != null) {
-              yield* executeCascade(uState.cascade, domainData, String(sourceId))
+      return yield* updateResult(
+        rv,
+        casRead !== undefined ? casRead.raw : wantsOld ? result.Attributes : undefined,
+        newImage,
+        written,
+        mode,
+        encodedKey as globalThis.Record<string, unknown>,
+      )
+    })
+
+  /**
+   * An update; on a missing item, a plain `.set()` of a complete item creates
+   * it through `create` — exactly the item `put` writes (#133). If another
+   * writer creates it first, the update runs once more against that item.
+   */
+  const updateOrCreate = (key: unknown, mode: DecodeMode, requested: UpdateState) =>
+    runUpdate(key, mode, requested).pipe(
+      Effect.catchIf(
+        (e): e is MissingForCreate => e instanceof MissingForCreate,
+        (missing) =>
+          Effect.gen(function* () {
+            const created = yield* Effect.exit(
+              (create(missing.input) as unknown as EntityPutImpl<any, any, any, any>)._run(
+                "native",
+              ) as Effect.Effect<globalThis.Record<string, AttributeValue>, unknown, any>,
+            )
+            if (created._tag === "Failure") {
+              const raced = Cause.findErrorOption(created.cause).pipe(
+                Option.filter((e) => e instanceof ConditionalCheckFailed),
+              )
+              if (Option.isNone(raced)) return yield* created
+              // Created concurrently: now an ordinary update of that item.
+              return yield* runUpdate(key, mode, requested).pipe(
+                Effect.catchIf(
+                  (e): e is MissingForCreate => e instanceof MissingForCreate,
+                  () =>
+                    Effect.fail(
+                      new ItemNotFound({
+                        entityType,
+                        key: key as globalThis.Record<string, unknown>,
+                      }),
+                    ),
+                ),
+              )
             }
-          }
+            const item = created.value
+            return yield* updateResult(
+              requested.returnValues ?? "allNew",
+              undefined,
+              item,
+              new Set(Object.keys(item)),
+              mode,
+              key as globalThis.Record<string, unknown>,
+            )
+          }),
+      ),
+    )
 
-          return decoded
-        }),
+  const update = (key: unknown) =>
+    new EntityUpdateImpl(
+      (mode: DecodeMode, requested: UpdateState) => updateOrCreate(key, mode, requested),
       emptyUpdateState,
       self,
       key as globalThis.Record<string, unknown>,
@@ -4316,6 +7028,7 @@ const makeImpl = <
       (opts: {
         readonly condition: Expr | ConditionInput | undefined
         readonly returnValues: ReturnValuesMode | undefined
+        readonly mustExist: boolean
       }) =>
         Effect.gen(function* () {
           const client = yield* DynamoClient
@@ -4333,10 +7046,67 @@ const makeImpl = <
           const hasUniqueConstraints =
             config.unique != null && Object.keys(config.unique).length > 0
 
-          // Build user condition expression if provided
-          const userCondition = opts.condition
-            ? compileCondition(opts.condition, resolveDbName)
-            : undefined
+          // A delete that reads the item first already requires it to exist,
+          // so a condition asserting only that (`deleteIfExists`) adds nothing
+          // to its guard: it is judged against the read instead — a missing
+          // item is `ConditionalCheckFailed` — and the delete is retried after
+          // a race like an unconditioned one.
+          const readsFirst = isSoftDeleteEnabled() || hasUniqueConstraints || isRetainEnabled()
+          // `deleteIfExists` (alone, or ANDed with a `.condition()`): a missing
+          // item fails its condition — a guard no `.condition()` replaces.
+          const mustExist = opts.mustExist
+          const existenceOnly = readsFirst && mustExist && opts.condition === undefined
+          if (
+            opts.returnValues !== undefined &&
+            opts.returnValues !== "none" &&
+            opts.returnValues !== "allOld"
+          ) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "delete",
+              cause:
+                `delete: returnValues("${opts.returnValues}") is not a mode DeleteItem ` +
+                'supports — only "none" and "allOld". Nothing was sent.',
+            })
+          }
+          // The caller's condition, ANDed onto `deleteIfExists`'s exists guard.
+          const condition = withGuard(
+            mustExist ? { attributeExists: [primary.pk.field] } : undefined,
+            opts.condition,
+          )
+          const userCondition =
+            condition && !existenceOnly ? compileCondition(condition, resolveDbName) : undefined
+          /**
+           * What the delete returns: with `returnValues("allOld")`, the item it
+           * removed — the one read (every read-first delete is guarded on it) or
+           * DynamoDB's `ALL_OLD` — as a model, `undefined` when there was none.
+           */
+          const deletedResult = (old: globalThis.Record<string, AttributeValue> | undefined) => {
+            if (opts.returnValues !== "allOld" || old === undefined)
+              return Effect.succeed(undefined)
+            const raw = fromAttributeMap(old) as globalThis.Record<string, unknown>
+            // The delete is applied: a decode failure must not read as a refusal.
+            return decodeAs({ ...raw }, old, "model").pipe(
+              Effect.mapError(
+                (cause) =>
+                  new DeleteAppliedButUnreadable({
+                    entityType,
+                    key: encodedKey as globalThis.Record<string, unknown>,
+                    item: raw,
+                    cause,
+                  }),
+              ),
+            )
+          }
+          /** The item is missing: what a delete that read it reports. */
+          const missing = (
+            otherwise: ItemNotFound | undefined,
+          ): Effect.Effect<undefined, ItemNotFound | ConditionalCheckFailed> =>
+            mustExist
+              ? Effect.fail(new ConditionalCheckFailed({ entityType, key: encodedKey }))
+              : otherwise === undefined
+                ? Effect.succeed(undefined)
+                : Effect.fail(otherwise)
 
           /**
            * Map a rejected user condition on either transaction delete path
@@ -4361,123 +7131,100 @@ const makeImpl = <
             return err
           }
 
-          if (isSoftDeleteEnabled()) {
-            // --- Soft delete path ---
-            // Read current item
-            const result = yield* client.getItem({
-              TableName: tableName,
-              Key: marshalledKey,
-            })
-
-            if (!result.Item) {
-              return yield* Effect.fail(new ItemNotFound({ entityType, key: encodedKey }))
+          /** The guard ANDed with the user's condition, for the main Delete. */
+          const guardedDeleteCondition = (guard: {
+            readonly expression: string
+            readonly names: globalThis.Record<string, string>
+            readonly values: globalThis.Record<string, AttributeValue>
+          }) => {
+            const values = { ...guard.values, ...userCondition?.values }
+            return {
+              ConditionExpression: userCondition
+                ? `${guard.expression} AND (${userCondition.expression})`
+                : guard.expression,
+              ExpressionAttributeNames: { ...guard.names, ...userCondition?.names },
+              ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
+              ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
             }
-
-            const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
-            // Clock-backed time source; `now` is the ISO timestamp used for the
-            // deleted SK + deletedAt, `dtNow` drives the optional TTL + snapshot.
-            const dtNow = yield* DateTime.now
-            const now = nowIso(dtNow)
-
-            // Build soft-deleted item: same PK, replace SK with deleted key, strip GSI keys
-            const deletedItem: globalThis.Record<string, unknown> = { ...raw }
-
-            // Strip GSI key fields — soft-deleted items must not appear in index queries
-            for (const field of gsiKeyFields()) {
-              delete deletedItem[field]
-            }
-
-            // Vector attributes: stash the embedding under a non-indexed name
-            // before stripping. Sparse semantics drop the tombstone out of the
-            // vector index immediately, and `restore()` un-stashes without
-            // paying for another Embedder call. See `DESIGN.md §14`.
-            for (const [, definition] of vectorIndexEntries) {
-              const stored = deletedItem[definition.vectorField]
-              if (stored !== undefined) deletedItem[definition.stashField] = stored
-              delete deletedItem[definition.vectorField]
-              delete deletedItem[definition.partitionField]
-            }
-
-            // Replace SK with deleted sort key
-            deletedItem[primary.sk.field] = DynamoSchema.composeDeletedKey(schema, entityType, now)
-
-            // Add deletedAt
-            deletedItem.deletedAt = now
-
-            // Add optional TTL
-            const sdTtl = softDeleteTtl()
-            if (sdTtl) {
-              deletedItem[ttlAttrName] = DateTime.toEpochSeconds(dtNow) + normalizeTtlSeconds(sdTtl)
-            }
-
-            // Build transaction
-            type TransactItem = {
-              Put?: { TableName: string; Item: globalThis.Record<string, AttributeValue> }
-              Delete?: {
-                TableName: string
-                Key: globalThis.Record<string, AttributeValue>
-                ConditionExpression?: string
-                ExpressionAttributeNames?: globalThis.Record<string, string>
-                ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
+          }
+          /**
+           * Run a guarded delete transaction: index 0 is the main Delete, the
+           * only conditioned item, so its rejection is read from the stored
+           * item (ALL_OLD) — gone, raced, or the user's condition.
+           */
+          const guardedDelete = <A>(
+            write: Effect.Effect<A, DynamoClientError>,
+            read: globalThis.Record<string, AttributeValue>,
+            inputs: ReadonlyArray<string>,
+            snapshotAt: { readonly index: number; readonly version: number } | undefined,
+            releases: ReadonlyArray<{ readonly index: number; readonly constraintName: string }>,
+          ) => {
+            let rejected: globalThis.Record<string, AttributeValue> | undefined
+            const reject = (stored: Readonly<globalThis.Record<string, unknown>> | undefined) => {
+              rejected = stored as globalThis.Record<string, AttributeValue> | undefined
+              // Deleted since the read: with nothing asserted, read it again —
+              // a delete of a missing item reports what such a delete does.
+              if (stored === undefined && userCondition === undefined) {
+                return new DeletedConcurrently()
               }
-            }
-            const transactItems: Array<TransactItem> = []
-
-            // Delete current entity item — index 0, and the ONLY item in this
-            // transaction carrying a ConditionExpression, so a cancellation
-            // naming index 0 is unambiguously the user's condition. The guard
-            // rides the transaction rather than being pre-checked against the
-            // item read above: a client-side check would leave a race window
-            // between the read and the write.
-            const currentDelete: NonNullable<TransactItem["Delete"]> = {
-              TableName: tableName,
-              Key: marshalledKey,
-            }
-            if (userCondition) {
-              currentDelete.ConditionExpression = userCondition.expression
-              currentDelete.ExpressionAttributeNames = userCondition.names
-              if (Object.keys(userCondition.values).length > 0) {
-                currentDelete.ExpressionAttributeValues = userCondition.values
-              }
-            }
-            transactItems.push({ Delete: currentDelete })
-
-            // Put soft-deleted item
-            transactItems.push({
-              Put: {
-                TableName: tableName,
-                Item: toAttributeMap(deletedItem),
-              },
-            })
-
-            // Version snapshot if retain is enabled
-            if (isRetainEnabled()) {
-              const currentVersion = systemFields.version
-                ? (raw[systemFields.version] as number)
-                : 0
-              const snapshotItem = buildSnapshotItem(
-                raw,
-                currentVersion,
-                primary.pk.field,
-                primary.sk.field,
-                ttlAttrName,
-                dtNow,
+              return deleteRejection(
+                encodedKey as globalThis.Record<string, unknown>,
+                read,
+                inputs,
+                stored,
+                userCondition !== undefined,
               )
-              transactItems.push({
-                Put: {
-                  TableName: tableName,
-                  Item: toAttributeMap(snapshotItem),
-                },
-              })
             }
+            return withCurrentItem(
+              write.pipe(
+                Effect.mapError((err) => {
+                  if (isAwsTransactionCancelled(err.cause)) {
+                    const main = err.cause.CancellationReasons?.[0]
+                    if (main?.Code === "ConditionalCheckFailed") return reject(main.Item)
+                    if (
+                      snapshotAt !== undefined &&
+                      err.cause.CancellationReasons?.[snapshotAt.index]?.Code ===
+                        "ConditionalCheckFailed"
+                    ) {
+                      return historyConflict(snapshotAt.version, "delete")
+                    }
+                    for (const { index, constraintName } of releases) {
+                      if (
+                        err.cause.CancellationReasons?.[index]?.Code === "ConditionalCheckFailed"
+                      ) {
+                        return releaseRaced(
+                          encodedKey as globalThis.Record<string, unknown>,
+                          constraintName,
+                        )
+                      }
+                    }
+                  }
+                  if (isAwsConditionalCheckFailed(err.cause)) return reject(err.cause.Item)
+                  return err
+                }),
+              ),
+              () => rejected,
+            )
+          }
 
-            // Delete sentinels if not preserving unique. Sparse — fields that were
-            // unset on the live item never had a sentinel, so nothing to delete.
-            // The stored row is attribute-keyed; the constraint names domain
-            // fields, so compose from the domain view — otherwise a renamed
-            // field reads `undefined` and the sentinel is orphaned (#127).
-            if (hasUniqueConstraints && !preserveUnique()) {
+          /**
+           * Append a release for each sentinel the stored item `raw` holds AND
+           * owns (#133) — composed from its domain view, since the stored row is
+           * attribute-keyed and the constraint is not (#127) — returning where
+           * each landed, so a release that lost a race can be reported.
+           */
+          const ownedReleases = (
+            table: string,
+            raw: globalThis.Record<string, unknown>,
+            into: Array<unknown>,
+          ) =>
+            Effect.gen(function* () {
               const rawDomain = toDomainView(raw)
+              const held: Array<{
+                readonly pk: string
+                readonly sk: string
+                readonly constraintName: string
+              }> = []
               for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
                 const sentinel = composeUniqueSentinel(
                   schema,
@@ -4486,95 +7233,300 @@ const makeImpl = <
                   constraintDef,
                   rawDomain,
                 )
-                if (!sentinel) continue
+                if (sentinel) held.push({ ...sentinel.key, constraintName })
+              }
+              const owner = { pk: primaryKey[primary.pk.field], sk: primaryKey[primary.sk.field] }
+              const releases: Array<{ index: number; constraintName: string }> = []
+              for (const sentinel of yield* ownedSentinels(table, held, owner)) {
+                releases.push({ index: into.length, constraintName: sentinel.constraintName })
+                into.push(sentinelRelease(table, sentinel, owner))
+              }
+              return releases
+            })
+
+          if (isSoftDeleteEnabled() || hasUniqueConstraints || isRetainEnabled()) {
+            const readFirst = Effect.gen(function* () {
+              if (isSoftDeleteEnabled()) {
+                // --- Soft delete path ---
+                // Read current item
+                const result = yield* client.getItem({
+                  TableName: tableName,
+                  Key: marshalledKey,
+                  ConsistentRead: true,
+                })
+
+                if (!result.Item) {
+                  return yield* missing(new ItemNotFound({ entityType, key: encodedKey }))
+                }
+                // The tombstone (and snapshot) copy the item read: the delete is
+                // conditioned on it being unchanged, so no concurrent update is lost
+                // into them (#133).
+                yield* checkVersion(result.Item, "delete")
+                const softGuard = deleteGuard(result.Item, "item", userCondition?.expression)
+                if (softGuard instanceof ValidationError) return yield* softGuard
+
+                const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
+                // Clock-backed time source; `now` is the ISO timestamp used for the
+                // deleted SK + deletedAt, `dtNow` drives the optional TTL + snapshot.
+                const dtNow = yield* DateTime.now
+                const now = nowIso(dtNow)
+
+                // Build soft-deleted item: same PK, replace SK with deleted key, strip GSI keys
+                const deletedItem: globalThis.Record<string, unknown> = { ...raw }
+
+                // Strip GSI key fields — soft-deleted items must not appear in index queries
+                for (const field of gsiKeyFields()) {
+                  delete deletedItem[field]
+                }
+
+                // Vector attributes: stash the embedding under a non-indexed name
+                // before stripping. Sparse semantics drop the tombstone out of the
+                // vector index immediately, and `restore()` un-stashes without
+                // paying for another Embedder call. See `DESIGN.md §14`.
+                for (const [, definition] of vectorIndexEntries) {
+                  const stored = deletedItem[definition.vectorField]
+                  if (stored !== undefined) deletedItem[definition.stashField] = stored
+                  delete deletedItem[definition.vectorField]
+                  delete deletedItem[definition.partitionField]
+                }
+
+                // Replace SK with deleted sort key
+                deletedItem[primary.sk.field] = DynamoSchema.composeDeletedKey(
+                  schema,
+                  entityType,
+                  now,
+                  historyKeyOptions(primaryKey[primary.sk.field]),
+                )
+
+                // Add deletedAt
+                deletedItem.deletedAt = now
+
+                // Add optional TTL
+                const sdTtl = softDeleteTtl()
+                if (sdTtl) {
+                  deletedItem[ttlAttrName] =
+                    DateTime.toEpochSeconds(dtNow) + normalizeTtlSeconds(sdTtl)
+                }
+
+                // Build transaction
+                type TransactItem = {
+                  Put?: { TableName: string; Item: globalThis.Record<string, AttributeValue> }
+                  Delete?: {
+                    TableName: string
+                    Key: globalThis.Record<string, AttributeValue>
+                    ConditionExpression?: string
+                    ExpressionAttributeNames?: globalThis.Record<string, string>
+                    ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
+                  }
+                }
+                const transactItems: Array<TransactItem> = []
+
+                // Delete current entity item — index 0, and the ONLY item in this
+                // transaction carrying a ConditionExpression, so a cancellation
+                // naming index 0 is unambiguously the user's condition. The guard
+                // rides the transaction rather than being pre-checked against the
+                // item read above: a client-side check would leave a race window
+                // between the read and the write.
+                const currentDelete: NonNullable<TransactItem["Delete"]> = {
+                  TableName: tableName,
+                  Key: marshalledKey,
+                  ...guardedDeleteCondition(softGuard),
+                }
+                transactItems.push({ Delete: currentDelete })
+
+                // Put soft-deleted item
+                transactItems.push({
+                  Put: {
+                    TableName: tableName,
+                    Item: toAttributeMap(deletedItem),
+                  },
+                })
+
+                // Version snapshot if retain is enabled — never over existing history.
+                let snapshotAt: { readonly index: number; readonly version: number } | undefined
+                if (isRetainEnabled()) {
+                  const currentVersion = systemFields.version
+                    ? ((raw[systemFields.version] as number | undefined) ?? 0)
+                    : 0
+                  const snapshotItem = buildSnapshotItem(
+                    raw,
+                    currentVersion,
+                    primary.pk.field,
+                    primary.sk.field,
+                    ttlAttrName,
+                    dtNow,
+                  )
+                  snapshotAt = { index: transactItems.length, version: currentVersion }
+                  transactItems.push({ Put: snapshotPut(tableName, snapshotItem) })
+                }
+
+                // Release sentinels if not preserving unique — only those this item
+                // owns (#133). Sparse — fields that were unset on the live item
+                // never had a sentinel, so nothing to release.
+                const releases =
+                  hasUniqueConstraints && !preserveUnique()
+                    ? yield* ownedReleases(tableName, raw, transactItems)
+                    : []
+
+                yield* checkTransactionLimit(entityType, "delete", transactItems)
+                yield* guardedDelete(
+                  client.transactWriteItems({ TransactItems: transactItems }),
+                  result.Item,
+                  softGuard.inputs,
+                  snapshotAt,
+                  releases,
+                )
+                return result.Item
+              } else {
+                // --- Hard delete with unique constraints and/or retained history ---
+                // The item is read first: the sentinels to release are keyed by its
+                // unique values, and a retain entity snapshots its final state.
+                const result = yield* client.getItem({
+                  TableName: tableName,
+                  Key: marshalledKey,
+                  ConsistentRead: true,
+                })
+
+                if (!result.Item) {
+                  if (hasUniqueConstraints || mustExist) {
+                    return yield* missing(new ItemNotFound({ entityType, key: encodedKey }))
+                  }
+                  // Retain only: deleting a missing item writes nothing, as a plain
+                  // `DeleteItem` would. The caller's condition is still judged
+                  // against no item — and the delete never removes an item created
+                  // since the read, which would leave its final state unsnapshotted.
+                  if (!userCondition) return undefined
+                  const values = userCondition.values
+                  yield* client
+                    .deleteItem({
+                      TableName: tableName,
+                      Key: marshalledKey,
+                      ConditionExpression: `attribute_not_exists(#dpk) AND (${userCondition.expression})`,
+                      ExpressionAttributeNames: {
+                        ...userCondition.names,
+                        "#dpk": primary.pk.field,
+                      },
+                      ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
+                      ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+                    })
+                    .pipe(
+                      Effect.mapError((err) =>
+                        isAwsConditionalCheckFailed(err.cause)
+                          ? conditionRejection(
+                              encodedKey as globalThis.Record<string, unknown>,
+                              err.cause.Item,
+                              err.cause.Item === undefined ? undefined : { version: 0 },
+                              true,
+                            )
+                          : err,
+                      ),
+                    )
+                  return undefined
+                }
+                // The sentinel deletes are keyed by the unique values read, and the
+                // snapshot copies the item read: the delete is conditioned on it —
+                // its version and incarnation — so no sentinel is orphaned and no
+                // concurrent write is lost from the history (#133).
+                yield* checkVersion(result.Item, "delete")
+                const hardGuard = deleteGuard(
+                  result.Item,
+                  hasUniqueConstraints
+                    ? [
+                        ...new Set(
+                          Object.values(config.unique!).flatMap((def) =>
+                            resolveUniqueFields(def).map(resolveDbName),
+                          ),
+                        ),
+                      ]
+                    : [],
+                  userCondition?.expression,
+                )
+                if (hardGuard instanceof ValidationError) return yield* hardGuard
+
+                const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
+
+                const transactItems: Array<TransactWriteItem> = []
+
+                // Delete entity item — index 0, and the only item conditioned on the
+                // item read (the sentinel Deletes are conditioned on ownership, the
+                // snapshot on history), so an index-0 cancellation is read from it.
                 transactItems.push({
                   Delete: {
                     TableName: tableName,
-                    Key: toAttributeMap({
-                      [primary.pk.field]: sentinel.key.pk,
-                      [primary.sk.field]: sentinel.key.sk,
-                    }),
+                    Key: marshalledKey,
+                    ...guardedDeleteCondition(hardGuard),
                   },
                 })
-              }
-            }
 
-            yield* checkTransactionLimit(entityType, "delete", transactItems)
-            yield* client
-              .transactWriteItems({
-                TransactItems: transactItems,
-              })
-              .pipe(Effect.mapError(mapDeleteConditionFailure))
-          } else if (hasUniqueConstraints) {
-            // --- Hard delete with unique constraints ---
-            // First get the item to find sentinel key values
-            const result = yield* client.getItem({
-              TableName: tableName,
-              Key: marshalledKey,
+                // Retain: the final state is history too. Snapshotted at its own
+                // version — under the same never-overwrite guard as every snapshot —
+                // so an item created again at this key continues PAST it, and a
+                // writer holding this version can never match the new incarnation.
+                let snapshotAt: { readonly index: number; readonly version: number } | undefined
+                if (isRetainEnabled()) {
+                  const currentVersion = storedVersionOf(result.Item) ?? 0
+                  snapshotAt = { index: transactItems.length, version: currentVersion }
+                  transactItems.push({
+                    Put: snapshotPut(
+                      tableName,
+                      buildSnapshotItem(
+                        raw,
+                        currentVersion,
+                        primary.pk.field,
+                        primary.sk.field,
+                        ttlAttrName,
+                        yield* DateTime.now,
+                      ),
+                    ),
+                  })
+                }
+
+                // Release sentinels — only those this item owns (#133). Sparse: no
+                // sentinel was ever written for a constraint whose fields are unset.
+                const releases = hasUniqueConstraints
+                  ? yield* ownedReleases(tableName, raw, transactItems)
+                  : []
+
+                yield* checkTransactionLimit(entityType, "delete", transactItems)
+                yield* guardedDelete(
+                  client.transactWriteItems({ TransactItems: transactItems }),
+                  result.Item,
+                  hardGuard.inputs,
+                  snapshotAt,
+                  releases,
+                )
+                return result.Item
+              }
             })
-
-            if (!result.Item) {
-              return yield* Effect.fail(new ItemNotFound({ entityType, key: encodedKey }))
-            }
-
-            const raw = fromAttributeMap(result.Item)
-
-            const transactItems: Array<{
-              Delete: {
-                TableName: string
-                Key: globalThis.Record<string, AttributeValue>
-                ConditionExpression?: string
-                ExpressionAttributeNames?: globalThis.Record<string, string>
-                ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
-              }
-            }> = []
-
-            // Delete entity item — index 0, and the only conditioned item (the
-            // sentinel Deletes below are unconditional), so an index-0
-            // cancellation is unambiguously the user's condition.
-            const entityDelete: (typeof transactItems)[number]["Delete"] = {
-              TableName: tableName,
-              Key: marshalledKey,
-            }
-            if (userCondition) {
-              entityDelete.ConditionExpression = userCondition.expression
-              entityDelete.ExpressionAttributeNames = userCondition.names
-              if (Object.keys(userCondition.values).length > 0) {
-                entityDelete.ExpressionAttributeValues = userCondition.values
-              }
-            }
-            transactItems.push({ Delete: entityDelete })
-
-            // Delete sentinels (sparse — skip constraints whose fields were unset
-            // on the live item; no sentinel was ever written for those). Domain
-            // view: the stored row is attribute-keyed, the constraint is not (#127).
-            const rawDomain = toDomainView(raw)
-            for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
-              const sentinel = composeUniqueSentinel(
-                schema,
-                entityType,
-                constraintName,
-                constraintDef,
-                rawDomain,
-              )
-              if (!sentinel) continue
-              transactItems.push({
-                Delete: {
-                  TableName: tableName,
-                  Key: toAttributeMap({
-                    [primary.pk.field]: sentinel.key.pk,
-                    [primary.sk.field]: sentinel.key.sk,
+            // The caller asserted nothing about the item, so a concurrent write
+            // between the read and the transaction — a changed item, or a
+            // sentinel release that changed hands — is not a refusal: the
+            // delete reads the item again and is written again, as a put is.
+            // With a `.condition()` the read is what the condition was judged
+            // against, and a race fails.
+            // Deleted concurrently on every attempt: what a delete that read
+            // it missing reports.
+            const deleted = (yield* userCondition === undefined
+              ? readFirst.pipe(
+                  Effect.retry({
+                    times: GUARDED_PUT_ATTEMPTS - 1,
+                    while: (e) =>
+                      e instanceof OptimisticLockError ||
+                      e instanceof ConcurrentModification ||
+                      e instanceof DeletedConcurrently,
                   }),
-                },
-              })
-            }
-
-            yield* checkTransactionLimit(entityType, "delete", transactItems)
-            yield* client
-              .transactWriteItems({
-                TransactItems: transactItems.map((t) => ({ Delete: t.Delete })),
-              })
-              .pipe(Effect.mapError(mapDeleteConditionFailure))
+                  Effect.catchIf(
+                    (e): e is DeletedConcurrently => e instanceof DeletedConcurrently,
+                    () =>
+                      missing(
+                        hasUniqueConstraints || isSoftDeleteEnabled()
+                          ? new ItemNotFound({ entityType, key: encodedKey })
+                          : undefined,
+                      ),
+                  ),
+                )
+              : readFirst) as globalThis.Record<string, AttributeValue> | undefined
+            return yield* deletedResult(deleted)
           } else {
             // Simple delete
             const deleteInput: DeleteItemCommandInput = {
@@ -4588,10 +7540,15 @@ const makeImpl = <
                 deleteInput.ExpressionAttributeValues = userCondition.values
               }
             }
-            if (opts.returnValues) {
-              deleteInput.ReturnValues = returnValuesMap[opts.returnValues]
+            if (opts.returnValues !== undefined) {
+              deleteInput.ReturnValues = opts.returnValues === "allOld" ? "ALL_OLD" : "NONE"
             }
-            yield* client.deleteItem(deleteInput).pipe(Effect.mapError(mapDeleteConditionFailure))
+            const output = yield* client
+              .deleteItem(deleteInput)
+              .pipe(Effect.mapError(mapDeleteConditionFailure))
+            return yield* deletedResult(
+              output.Attributes as globalThis.Record<string, AttributeValue> | undefined,
+            )
           }
         }),
       self,
@@ -4603,14 +7560,14 @@ const makeImpl = <
   // ---------------------------------------------------------------------------
 
   const deleteIfExists = (key: unknown) => {
-    const pkField = config.indexes.primary.pk.field
     const op = del(key)
     return new EntityDeleteImpl(
       op._builder,
       op._entity,
       op._key,
-      { attributeExists: [pkField] },
+      op._condition,
       op._returnValues,
+      true,
     )
   }
 
@@ -4618,10 +7575,147 @@ const makeImpl = <
   // upsert operation — create-or-update via UpdateItem with if_not_exists()
   // ---------------------------------------------------------------------------
 
+  /**
+   * `upsert` that reads the item first (#133) — of an entity with unique
+   * constraints or `versioned: { retain: true }`, or an input that omits a
+   * defaulted index composite. A single UpdateItem cannot write, rotate or
+   * check a sentinel, snapshot the replaced item, or tell whether to store a
+   * default or keep the stored value. Missing: a `create` (sentinels guarded
+   * by `attribute_not_exists`, the retain snapshot, omitted defaults stored).
+   * Present: an update of the upserted fields — sentinels rotate for changed
+   * values, unchanged ones are left alone, immutable fields, `createdAt` and
+   * fields the input omits keep their stored values, retain snapshots the
+   * replaced item — under the update's version / incarnation or attribute
+   * guards, from that one read. The whole input is validated either way. A
+   * concurrent create or delete between the read and the write is retried the
+   * other way, and a sentinel release whose reservation changed hands is
+   * planned again from a fresh read (as a put's is); a race lost on every
+   * attempt fails with the concurrency error. A concurrent change of the item
+   * itself fails the upsert, as it fails an update.
+   */
+  const guardedUpsert = (input: unknown, mode: DecodeMode, opts: EntityPutOpts) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { name: tableName } = yield* tableTag
+      yield* checkWithVectorNames(opts.withVectors, "upsert")
+      // Required fields are required whether or not the item exists.
+      yield* encodeOrDecodeEncode(
+        schemas.inputSchema as Schema.Codec<any>,
+        yield* fillDecodingDefaults(input),
+        entityType,
+        "upsert",
+      )
+      const record = (input ?? {}) as globalThis.Record<string, unknown>
+      const primary = config.indexes.primary
+      const keyFields = [...primary.pk.composite, ...primary.sk.composite]
+      const key = Object.fromEntries(keyFields.map((field) => [field, record[field]]))
+      const encodedKey = yield* encodeKey(key, "upsert.decodeKey")
+      const marshalledKey = toAttributeMap(composePrimaryKey(encodedKey))
+      const dropped = new Set<string>([
+        ...keyFields,
+        ...immutableFields,
+        ...(systemFields.createdAt ? [systemFields.createdAt] : []),
+        ...(systemFields.version ? [systemFields.version] : []),
+      ])
+      const updates = Object.fromEntries(
+        Object.entries(record).filter(([field]) => !dropped.has(field)),
+      )
+      const read = () =>
+        client
+          .getItem({ TableName: tableName, Key: marshalledKey, ConsistentRead: true })
+          .pipe(Effect.map((result) => result.Item))
+      let current = yield* read()
+      let expected = 0
+      let lost: ConcurrentModification | undefined
+      for (let attempt = 0; attempt < GUARDED_PUT_ATTEMPTS; attempt++) {
+        yield* checkVersion(current, "upsert")
+        expected = storedVersionOf(current) ?? 0
+        if (current === undefined) {
+          const created = yield* Effect.exit(
+            put(input)._builder(mode, {
+              condition: opts.condition,
+              withVectors: opts.withVectors,
+              putKind: "create",
+              operation: "upsert",
+            }) as Effect.Effect<unknown, unknown>,
+          )
+          if (created._tag === "Success") return created.value
+          const error = Cause.findErrorOption(created.cause)
+          if (Option.isNone(error) || !(error.value instanceof ConditionalCheckFailed)) {
+            return yield* created
+          }
+          // Created concurrently: upsert it as the existing item it now is.
+          // Still missing: the caller's condition rejected it.
+          current = yield* read()
+          if (current === undefined) return yield* created
+          continue
+        }
+        const updated = yield* Effect.exit(
+          runUpdate(
+            key,
+            mode,
+            {
+              ...emptyUpdateState,
+              updates,
+              condition: opts.condition,
+              withVectors: opts.withVectors,
+            },
+            current,
+          ).pipe(
+            // Its errors name the upsert, not the update it runs.
+            Effect.mapError((e) =>
+              e instanceof ValidationError && e.operation.startsWith("update")
+                ? new ValidationError({
+                    entityType: e.entityType,
+                    operation: `upsert${e.operation.slice("update".length)}`,
+                    cause: e.cause,
+                  })
+                : e,
+            ),
+          ) as Effect.Effect<unknown, unknown>,
+        )
+        if (updated._tag === "Success") return updated.value
+        const error = Cause.findErrorOption(updated.cause)
+        if (Option.isNone(error)) return yield* updated
+        // A sentinel it would release changed hands since its ownership read:
+        // nothing was written, and the upsert is planned again from a fresh
+        // read, as a put is.
+        if (error.value instanceof ConcurrentModification && releaseRaces.has(error.value)) {
+          lost = error.value
+        } else if (!(error.value instanceof ItemNotFound)) {
+          return yield* updated
+        }
+        // Deleted concurrently: upserted as the missing item it now is.
+        current = yield* read()
+      }
+      if (lost !== undefined) return yield* lost
+      // Every attempt raced a concurrent create or delete.
+      return yield* systemFields.version
+        ? new OptimisticLockError({
+            entityType,
+            key: encodedKey,
+            expectedVersion: expected,
+            actualVersion: storedVersionOf(current) ?? -1,
+          })
+        : new ConcurrentModification({
+            entityType,
+            key: encodedKey,
+            attributes: [],
+            current: Option.none(),
+          })
+    })
+
   const upsert = (input: unknown) =>
     new EntityPutImpl(
       (mode: DecodeMode, opts: EntityPutOpts) =>
         Effect.gen(function* () {
+          if (
+            (config.unique != null && Object.keys(config.unique).length > 0) ||
+            isRetainEnabled() ||
+            omitsIndexedDefault(input)
+          ) {
+            return yield* guardedUpsert(input, mode, opts)
+          }
           const client = yield* DynamoClient
           const { name: tableName } = yield* tableTag
           // Clock-backed time source for createdAt/updatedAt SET clauses.
@@ -4629,7 +7723,9 @@ const makeImpl = <
 
           yield* checkWithVectorNames(opts.withVectors, "upsert")
 
-          // Encode user input → wire form (see `put` for strategy).
+          // Encode user input → wire form (see `put` for strategy). An input
+          // that omits a defaulted index composite took the guarded path: the
+          // default is stored on create, the stored value kept on update.
           const encodedInput = yield* encodeOrDecodeEncode(
             schemas.inputSchema as Schema.Codec<any>,
             input,
@@ -4821,6 +7917,12 @@ const makeImpl = <
             setClauses.push(`${nameKey} = if_not_exists(${nameKey}, ${zeroKey}) + :vinc`)
             counter++
           }
+          // An upsert that creates the item gives it an incarnation token (#133).
+          if (stampsIncarnation) {
+            names["#eddInc"] = INCARNATION_TOKEN
+            values[":eddInc"] = toAttributeValue(yield* freshIncarnation)
+            setClauses.push("#eddInc = if_not_exists(#eddInc, :eddInc)")
+          }
 
           const updateExpression =
             upsertRemoveClauses.length > 0
@@ -4829,8 +7931,15 @@ const makeImpl = <
 
           // Optional user condition
           const condParts: Array<string> = []
-          if (opts.condition) {
-            const uc = compileCondition(opts.condition, resolveDbName)!
+          if (systemFields.version) {
+            // Never version an item whose version was removed outside the library
+            // (incarnation token, no version) as if it predated versioning (#133).
+            names["#intVer"] = systemFields.version
+            names["#intInc"] = INCARNATION_TOKEN
+            condParts.push("(attribute_exists(#intVer) OR attribute_not_exists(#intInc))")
+          }
+          const uc = opts.condition ? compileCondition(opts.condition, resolveDbName) : undefined
+          if (uc) {
             condParts.push(`(${uc.expression})`)
             Object.assign(names, uc.names)
             Object.assign(values, uc.values)
@@ -4844,15 +7953,23 @@ const makeImpl = <
               ExpressionAttributeNames: names,
               ExpressionAttributeValues: values,
               ConditionExpression: condParts.length > 0 ? condParts.join(" AND ") : undefined,
+              // Only the corruption guard needs the stored item.
+              ...(systemFields.version && {
+                ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
+              }),
               ReturnValues: "ALL_NEW",
             })
             .pipe(
-              Effect.mapError((err): DynamoClientError | ConditionalCheckFailed => {
-                if (opts.condition && isAwsConditionalCheckFailed(err.cause)) {
-                  return new ConditionalCheckFailed({ entityType, key: item })
-                }
-                return err
-              }),
+              Effect.mapError(
+                (err): DynamoClientError | ConditionalCheckFailed | ValidationError => {
+                  if (isAwsConditionalCheckFailed(err.cause)) {
+                    const corrupt = versionCorruption(err.cause.Item, "upsert")
+                    if (corrupt !== undefined) return corrupt
+                    if (opts.condition) return new ConditionalCheckFailed({ entityType, key: item })
+                  }
+                  return err
+                },
+              ),
             )
 
           if (!result.Attributes) {
@@ -4944,7 +8061,7 @@ const makeImpl = <
 
   const append = (
     input: unknown,
-    userCondition?: Expr | ConditionInput,
+    givenCondition?: Expr | ConditionInput,
     skipFollowUp = false,
     removeAttrs?: ReadonlyArray<string>,
   ) =>
@@ -4954,6 +8071,18 @@ const makeImpl = <
           entityType,
           operation: "append",
           cause: "Entity is not configured with timeSeries. .append() requires timeSeries config.",
+        })
+      }
+      // `append` takes its condition as an argument — no `condition`
+      // combinator — so an empty one becomes none here (#133).
+      const userCondition = nonEmptyCondition(givenCondition)
+      const emptyPart =
+        userCondition === undefined ? undefined : emptyPartProblem(toExpr(userCondition))
+      if (emptyPart !== undefined) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "append.condition",
+          cause: `append: ${emptyPart} Nothing was sent.`,
         })
       }
       const client = yield* DynamoClient
@@ -5179,8 +8308,9 @@ const makeImpl = <
 
       const casCondition = "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb"
       let finalCondition = casCondition
-      if (userCondition !== undefined) {
-        const uc = compileCondition(userCondition, resolveDbName)!
+      const uc =
+        userCondition !== undefined ? compileCondition(userCondition, resolveDbName) : undefined
+      if (uc) {
         finalCondition = `(${casCondition}) AND (${uc.expression})`
         Object.assign(names, uc.names)
         Object.assign(values, uc.values)
@@ -5422,6 +8552,7 @@ const makeImpl = <
       const query = Query.make({
         tableName: "",
         indexName: indexDef.index,
+        globalIndex: indexDef.index !== undefined,
         pkField: indexDef.pk.field,
         pkValue,
         skField: indexDef.sk.field,
@@ -5465,6 +8596,7 @@ const makeImpl = <
       decoder: (raw) => decodeRecord(raw),
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
       keyFields: [config.indexes.primary.pk.field, config.indexes.primary.sk.field],
+      liveRows: liveRows(),
     })
 
   // ---------------------------------------------------------------------------
@@ -5484,25 +8616,42 @@ const makeImpl = <
           // Compose PK + version SK
           const primary = config.indexes.primary
           const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
-          const versionSk = DynamoSchema.composeVersionKey(schema, entityType, versionNumber)
+          const liveSk = liveSkOf(encodedKey)
+          const read = (versionSk: string) =>
+            client
+              .getItem({
+                TableName: tableName,
+                Key: toAttributeMap({
+                  [primary.pk.field]: pkValue,
+                  [primary.sk.field]: versionSk,
+                }),
+                ConsistentRead: opts.consistentRead || undefined,
+              })
+              .pipe(Effect.map((result) => result.Item))
 
-          const marshalledKey = toAttributeMap({
-            [primary.pk.field]: pkValue,
-            [primary.sk.field]: versionSk,
-          })
+          let item = yield* read(
+            DynamoSchema.composeVersionKey(
+              schema,
+              entityType,
+              versionNumber,
+              historyKeyOptions(liveSk),
+            ),
+          )
+          // Not under the item's own key: written by an earlier release, under
+          // the partition-wide one — if it is this item's (#133).
+          if (item === undefined && hasItemHistory) {
+            const legacy = yield* read(
+              DynamoSchema.composeVersionKey(schema, entityType, versionNumber),
+            )
+            if (legacy !== undefined && isItemsRow(legacy, liveSk)) item = legacy
+          }
 
-          const result = yield* client.getItem({
-            TableName: tableName,
-            Key: marshalledKey,
-            ConsistentRead: opts.consistentRead || undefined,
-          })
-
-          if (!result.Item) {
+          if (!item) {
             return yield* new ItemNotFound({ entityType, key: encodedKey })
           }
 
-          const raw = fromAttributeMap(result.Item)
-          return yield* decodeAs(raw, result.Item, mode)
+          const raw = fromAttributeMap(item)
+          return yield* decodeAs(raw, item, mode)
         }),
       self,
       key as globalThis.Record<string, unknown>,
@@ -5516,7 +8665,62 @@ const makeImpl = <
     const encodedKey = keyForm(encodeKeySync(key))
     const primary = config.indexes.primary
     const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
-    const versionPrefix = DynamoSchema.composeVersionKeyPrefix(schema, entityType)
+    const liveSk = liveSkOf(encodedKey)
+    const versionPrefix = DynamoSchema.composeVersionKeyPrefix(
+      schema,
+      entityType,
+      historyKeyOptions(liveSk),
+    )
+
+    /**
+     * History an earlier release wrote for this item, under the partition-wide
+     * keys (#133): when there is any, the query reads the partition's history
+     * and keeps the item's own rows plus those — a version held both ways is
+     * read from its own row. Without any, it reads only the item's own.
+     */
+    const withLegacy: Query.QueryPrepare | undefined = hasItemHistory
+      ? (tableName) =>
+          Effect.gen(function* () {
+            const legacy = yield* legacyHistory({ tableName, pk: pkValue, liveSk, kind: "version" })
+            if (legacy.length === 0) return {}
+            const client = yield* DynamoClient
+            const own = new Set<number>()
+            let start: globalThis.Record<string, AttributeValue> | undefined
+            do {
+              const result = yield* client.query({
+                TableName: tableName,
+                KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :prefix)",
+                ExpressionAttributeNames: { "#pk": primary.pk.field, "#sk": primary.sk.field },
+                ExpressionAttributeValues: {
+                  ":pk": toAttributeValue(pkValue),
+                  ":prefix": toAttributeValue(versionPrefix),
+                },
+                ProjectionExpression: "#sk",
+                ConsistentRead: true,
+                ExclusiveStartKey: start,
+              })
+              for (const row of result.Items ?? []) own.add(versionOfSk(row[primary.sk.field]?.S))
+              start = result.LastEvaluatedKey as
+                | globalThis.Record<string, AttributeValue>
+                | undefined
+            } while (start !== undefined)
+            const legacySks = new Set(
+              legacy
+                .map((row) => row[primary.sk.field]?.S ?? "")
+                .filter((sk) => !own.has(versionOfSk(sk))),
+            )
+            return {
+              replaceBeginsWith: {
+                from: versionPrefix,
+                to: DynamoSchema.composeVersionKeyPrefix(schema, entityType),
+              },
+              keep: (row: globalThis.Record<string, AttributeValue>) => {
+                const sk = row[primary.sk.field]?.S ?? ""
+                return sk.startsWith(versionPrefix) || legacySks.has(sk)
+              },
+            }
+          })
+      : undefined
 
     return Query.make({
       tableName: "",
@@ -5528,6 +8732,7 @@ const makeImpl = <
       decoder: (raw) => decodeRecord(raw),
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
       keyFields: [primary.pk.field, primary.sk.field],
+      prepare: withLegacy,
     }).pipe(Query.where({ beginsWith: versionPrefix }))
   }
 
@@ -5539,40 +8744,26 @@ const makeImpl = <
     new EntityGetImpl(
       (mode: DecodeMode, _opts: EntityGetOpts) =>
         Effect.gen(function* () {
-          const client = yield* DynamoClient
           const { name: tableName } = yield* tableTag
 
           // Caller key: Type side in, ENCODED out (see `encodeKey`).
           const encodedKey = yield* encodeKey(key, "deleted.get.decode")
 
-          // Query for soft-deleted item using begins_with on deleted prefix
+          // The item's latest tombstone — not a sibling's in the same partition,
+          // and one an earlier release wrote counts (#133).
           const primary = config.indexes.primary
           const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
-          const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
+          const tombstone = yield* latestTombstone(tableName, pkValue, liveSkOf(encodedKey))
 
-          const result = yield* client.query({
-            TableName: tableName,
-            KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
-            ExpressionAttributeNames: {
-              "#pk": primary.pk.field,
-              "#sk": primary.sk.field,
-            },
-            ExpressionAttributeValues: {
-              ":pk": toAttributeValue(pkValue),
-              ":skPrefix": toAttributeValue(deletedPrefix),
-            },
-            Limit: 1,
-            ScanIndexForward: false,
-          })
-
-          if (!result.Items || result.Items.length === 0) {
+          if (tombstone === undefined) {
             return yield* new ItemNotFound({ entityType, key: encodedKey })
           }
 
-          const raw = fromAttributeMap(result.Items[0]!)
+          const raw = fromAttributeMap(tombstone)
+          yield* checkVersion(raw, "deleted.get.decode")
           // Soft-deleted items have GSI keys stripped — always use deletedRecordSchema
           // (itemSchema would fail because it expects GSI key fields that aren't present)
-          if (mode === "native") return result.Items[0]!
+          if (mode === "native") return tombstone
           // Sparse Map fields: rebuild domain Records from flattened attrs so
           // soft-deleted items decode correctly. Sparse data is preserved
           // verbatim across soft-delete (GSI keys are stripped, sparse data is
@@ -5604,9 +8795,13 @@ const makeImpl = <
     const encodedKey = keyForm(encodeKeySync(key))
     const primary = config.indexes.primary
     const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
+    // The whole partition's tombstones — every item's, with sort key
+    // composites (#133): no item segment.
     const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
 
     const decodeDeleted = (raw: globalThis.Record<string, unknown>) => {
+      const corruption = versionCorruption(raw, "deleted.list.decode")
+      if (corruption !== undefined) return Effect.fail(corruption)
       // Sparse fields are domain data and are preserved across soft-delete.
       // Rebuild Records from flattened attrs before schema decode.
       deserializeSparseFields(raw)
@@ -5656,31 +8851,18 @@ const makeImpl = <
           // Caller key: Type side in, ENCODED out (see `encodeKey`).
           const encodedKey = yield* encodeKey(key, "restore.decode")
 
-          // Query for the soft-deleted item
+          // The item's latest tombstone — not a sibling's in the same partition,
+          // and one an earlier release wrote counts (#133).
           const primary = config.indexes.primary
           const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
-          const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
+          const tombstone = yield* latestTombstone(tableName, pkValue, liveSkOf(encodedKey))
 
-          const queryResult = yield* client.query({
-            TableName: tableName,
-            KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
-            ExpressionAttributeNames: {
-              "#pk": primary.pk.field,
-              "#sk": primary.sk.field,
-            },
-            ExpressionAttributeValues: {
-              ":pk": toAttributeValue(pkValue),
-              ":skPrefix": toAttributeValue(deletedPrefix),
-            },
-            Limit: 1,
-            ScanIndexForward: false,
-          })
-
-          if (!queryResult.Items || queryResult.Items.length === 0) {
+          if (tombstone === undefined) {
             return yield* new ItemNotFound({ entityType, key: encodedKey })
           }
 
-          const deletedRaw = fromAttributeMap(queryResult.Items[0]!)
+          yield* checkVersion(tombstone, "restore")
+          const deletedRaw = fromAttributeMap(tombstone)
           const deletedMarshalledKey = toAttributeMap({
             [primary.pk.field]: (deletedRaw as globalThis.Record<string, unknown>)[
               primary.pk.field
@@ -5698,8 +8880,9 @@ const makeImpl = <
           delete restoredItem[ttlAttrName]
 
           // Increment version
+          // 0: a tombstone of an item written before the entity was `versioned`.
           const currentVersion = systemFields.version
-            ? (restoredItem[systemFields.version] as number)
+            ? ((restoredItem[systemFields.version] as number | undefined) ?? 0)
             : 0
           const newVersion = currentVersion + 1
           if (systemFields.version) restoredItem[systemFields.version] = newVersion
@@ -5749,20 +8932,34 @@ const makeImpl = <
               ExpressionAttributeNames?: globalThis.Record<string, string>
               ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
             }
-            Delete?: { TableName: string; Key: globalThis.Record<string, AttributeValue> }
+            Delete?: {
+              TableName: string
+              Key: globalThis.Record<string, AttributeValue>
+              ConditionExpression?: string
+              ExpressionAttributeNames?: globalThis.Record<string, string>
+            }
           }
           const transactItems: Array<TransactItem> = []
 
-          // Delete the soft-deleted item
+          // Delete the soft-deleted item — only while it is still there: a
+          // concurrent restore that already consumed it must not restore twice.
           transactItems.push({
-            Delete: { TableName: tableName, Key: deletedMarshalledKey },
+            Delete: {
+              TableName: tableName,
+              Key: deletedMarshalledKey,
+              ConditionExpression: "attribute_exists(#pk)",
+              ExpressionAttributeNames: { "#pk": primary.pk.field },
+            },
           })
 
-          // Put restored item
+          // Put restored item — never over a live item (a re-created one, or
+          // another restore's): that would lose it and orphan its sentinels.
           transactItems.push({
             Put: {
               TableName: tableName,
               Item: marshalledRestoredItem,
+              ConditionExpression: "attribute_not_exists(#pk)",
+              ExpressionAttributeNames: { "#pk": primary.pk.field },
             },
           })
 
@@ -5786,12 +8983,12 @@ const makeImpl = <
               primary.sk.field,
               ttlAttrName,
               now,
+              restoredKeys[primary.sk.field],
             )
+            // Replaces only the delete-time snapshot of this same state —
+            // never another version's history.
             transactItems.push({
-              Put: {
-                TableName: tableName,
-                Item: toAttributeMap(snapshotItem),
-              },
+              Put: snapshotPut(tableName, snapshotItem),
             })
           }
 
@@ -5839,36 +9036,58 @@ const makeImpl = <
               TransactItems: transactItems,
             })
             .pipe(
-              Effect.mapError((err): DynamoClientError | UniqueConstraintViolation => {
-                if (isAwsTransactionCancelled(err.cause)) {
-                  const reasons = err.cause.CancellationReasons
-                  if (reasons && config.unique) {
-                    // Sentinel Puts come after Delete + Put + optional snapshot, in the
-                    // order recorded in `sentinelConstraints` (sparse-skipped entries absent)
-                    const sentinelStart = isRetainEnabled() ? 3 : 2
-                    for (let i = sentinelStart; i < reasons.length; i++) {
-                      if (reasons[i]?.Code === "ConditionalCheckFailed") {
-                        const constraintName = sentinelConstraints[i - sentinelStart] ?? "unknown"
-                        const constraintDef = config.unique[constraintName]
-                        const uniqueFields = constraintDef ? resolveUniqueFields(constraintDef) : []
-                        const fieldsRecord: globalThis.Record<string, string> = {}
-                        for (const f of uniqueFields) {
-                          const v = restoredDomain[f]
-                          if (v !== undefined && v !== null) {
-                            fieldsRecord[f] = KeyComposer.serializeValue(v)
+              Effect.mapError(
+                (
+                  err,
+                ):
+                  | DynamoClientError
+                  | UniqueConstraintViolation
+                  | ItemNotFound
+                  | ItemNotDeleted
+                  | ValidationError => {
+                  if (isAwsTransactionCancelled(err.cause)) {
+                    const reasons = err.cause.CancellationReasons
+                    // The tombstone is gone (restored concurrently), or a live
+                    // item already exists under the key.
+                    if (reasons?.[0]?.Code === "ConditionalCheckFailed") {
+                      return new ItemNotFound({ entityType, key: encodedKey })
+                    }
+                    if (reasons?.[1]?.Code === "ConditionalCheckFailed") {
+                      return new ItemNotDeleted({ entityType, key: encodedKey })
+                    }
+                    if (isRetainEnabled() && reasons?.[2]?.Code === "ConditionalCheckFailed") {
+                      return historyConflict(currentVersion, "restore")
+                    }
+                    if (reasons && config.unique) {
+                      // Sentinel Puts come after Delete + Put + optional snapshot, in the
+                      // order recorded in `sentinelConstraints` (sparse-skipped entries absent)
+                      const sentinelStart = isRetainEnabled() ? 3 : 2
+                      for (let i = sentinelStart; i < reasons.length; i++) {
+                        if (reasons[i]?.Code === "ConditionalCheckFailed") {
+                          const constraintName = sentinelConstraints[i - sentinelStart] ?? "unknown"
+                          const constraintDef = config.unique[constraintName]
+                          const uniqueFields = constraintDef
+                            ? resolveUniqueFields(constraintDef)
+                            : []
+                          const fieldsRecord: globalThis.Record<string, string> = {}
+                          for (const f of uniqueFields) {
+                            const v = restoredDomain[f]
+                            if (v !== undefined && v !== null) {
+                              fieldsRecord[f] = KeyComposer.serializeValue(v)
+                            }
                           }
+                          return new UniqueConstraintViolation({
+                            entityType,
+                            constraint: constraintName,
+                            fields: fieldsRecord,
+                          })
                         }
-                        return new UniqueConstraintViolation({
-                          entityType,
-                          constraint: constraintName,
-                          fields: fieldsRecord,
-                        })
                       }
                     }
                   }
-                }
-                return err
-              }),
+                  return err
+                },
+              ),
             )
 
           return yield* decodeAs(restoredItem, marshalledRestoredItem, mode)
@@ -5885,8 +9104,9 @@ const makeImpl = <
     new EntityDeleteImpl(
       (opts: { readonly condition: Expr | ConditionInput | undefined }) =>
         Effect.gen(function* () {
-          // `purge` is partition-wide — it queries every item under the key and
-          // batch-deletes in chunks, so there is no single item for a
+          // `purge` queries the partition — every row of it, or with sort key
+          // composites this item's rows in it (#133) — and batch-deletes them
+          // in chunks, so there is no single item for a
           // ConditionExpression to guard and no way to make one atomic across
           // the batches. `.condition()` is structurally available because
           // `purge` returns an `EntityDelete`; refuse it loudly rather than
@@ -5910,9 +9130,54 @@ const makeImpl = <
 
           const primary = config.indexes.primary
           const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
+          const liveSk = liveSkOf(encodedKey)
+          const history = historyKeyOptions(liveSk)
 
-          // Query ALL items in this partition (current + versions + deleted)
-          // Use ProjectionExpression to only get keys
+          /**
+           * Whether a row of the partition is this item's (#133). Only this
+           * entity's rows (`__edd_e__`): in a single-table design another
+           * entity can share the partition — a collection on the primary key —
+           * and purge never removes its rows. Without sort key composites that
+           * is every row of this entity. With them, the partition holds
+           * siblings, and the item's rows are its live row, the rows nested
+           * under it (time-series events), and its own history. History an
+           * earlier release wrote without an item segment is the item's when
+           * the composites it carries compose the item's live key.
+           */
+          const ownVersions = DynamoSchema.composeVersionKeyPrefix(schema, entityType, history)
+          const ownTombstones = DynamoSchema.composeDeletedKeyPrefix(schema, entityType, history)
+          const sharedHistory = [
+            DynamoSchema.composeVersionKeyPrefix(schema, entityType),
+            DynamoSchema.composeDeletedKeyPrefix(schema, entityType),
+          ]
+          const belongsToItem = (row: globalThis.Record<string, AttributeValue>): boolean => {
+            if (row.__edd_e__?.S !== entityType) return false
+            if (history === undefined) return true
+            const sk = row[primary.sk.field]?.S
+            if (sk === undefined) return false
+            if (
+              sk === liveSk ||
+              sk.startsWith(`${liveSk}#`) ||
+              sk.startsWith(ownVersions) ||
+              sk.startsWith(ownTombstones)
+            ) {
+              return true
+            }
+            const unsegmented = sharedHistory.some(
+              (prefix) => sk.startsWith(prefix) && !sk.slice(prefix.length).includes("#"),
+            )
+            return unsegmented && isItemsRow(row, liveSk)
+          }
+
+          // Query ALL items in this partition (current + versions + deleted).
+          // Keys and entity type only — plus, with sort key composites, the
+          // composites that attribute an unsegmented history row to its item.
+          const projected: globalThis.Record<string, string> = { "#ent": "__edd_e__" }
+          if (history !== undefined) {
+            primary.sk.composite.forEach((attr, i) => {
+              projected[`#c${i}`] = resolveDbName(attr)
+            })
+          }
           const allItems: Array<globalThis.Record<string, AttributeValue>> = []
           let exclusiveStartKey: globalThis.Record<string, AttributeValue> | undefined
 
@@ -5920,45 +9185,49 @@ const makeImpl = <
             const result = yield* client.query({
               TableName: tableName,
               KeyConditionExpression: "#pk = :pk",
-              ExpressionAttributeNames: { "#pk": primary.pk.field },
+              ExpressionAttributeNames: {
+                "#pk": primary.pk.field,
+                "#sk": primary.sk.field,
+                ...projected,
+              },
               ExpressionAttributeValues: { ":pk": toAttributeValue(pkValue) },
-              ProjectionExpression: `${primary.pk.field}, ${primary.sk.field}`,
+              ProjectionExpression: ["#pk", "#sk", ...Object.keys(projected)].join(", "),
               ExclusiveStartKey: exclusiveStartKey,
             })
 
             if (result.Items) {
-              allItems.push(...result.Items)
+              allItems.push(...result.Items.filter(belongsToItem))
             }
             exclusiveStartKey = result.LastEvaluatedKey as
               | globalThis.Record<string, AttributeValue>
               | undefined
           } while (exclusiveStartKey)
 
-          // Also get the main/deleted item to find unique sentinel keys
+          // The unique sentinels the item holds — live, or soft-deleted with
+          // `preserveUnique` — and owns (#133): a sentinel of a value the item
+          // holds without owning its reservation belongs to another item.
           if (config.unique && Object.keys(config.unique).length > 0) {
-            // Get current or deleted item to extract field values for sentinel cleanup
-            const marshalledKey = toAttributeMap({
-              [primary.pk.field]: pkValue,
-              [primary.sk.field]: KeyComposer.composeSk(
+            const owner = {
+              pk: pkValue,
+              sk: KeyComposer.composeSk(
                 schema,
                 entityType,
                 entityVersion,
                 primary,
                 keyForm(encodedKey),
               ),
-            })
+            }
+            const holders: Array<globalThis.Record<string, AttributeValue>> = []
             const mainResult = yield* client.getItem({
               TableName: tableName,
-              Key: marshalledKey,
+              Key: toAttributeMap({ [primary.pk.field]: owner.pk, [primary.sk.field]: owner.sk }),
+              ConsistentRead: true,
             })
-
-            // Try deleted items if main not found
-            let entityItem: globalThis.Record<string, unknown> | undefined
-            if (mainResult.Item) {
-              entityItem = fromAttributeMap(mainResult.Item) as globalThis.Record<string, unknown>
-            } else {
-              // Check for a soft-deleted item
-              const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
+            if (mainResult.Item) holders.push(mainResult.Item)
+            // Every soft-deleted incarnation (each kept its reservations).
+            const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
+            let deletedStart: globalThis.Record<string, AttributeValue> | undefined
+            do {
               const deletedResult = yield* client.query({
                 TableName: tableName,
                 KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
@@ -5970,37 +9239,40 @@ const makeImpl = <
                   ":pk": toAttributeValue(pkValue),
                   ":skPrefix": toAttributeValue(deletedPrefix),
                 },
-                Limit: 1,
+                ConsistentRead: true,
+                ExclusiveStartKey: deletedStart,
               })
-              if (deletedResult.Items && deletedResult.Items.length > 0) {
-                entityItem = fromAttributeMap(deletedResult.Items[0]!) as globalThis.Record<
-                  string,
-                  unknown
-                >
-              }
-            }
+              holders.push(...(deletedResult.Items ?? []).filter(belongsToItem))
+              deletedStart = deletedResult.LastEvaluatedKey as
+                | globalThis.Record<string, AttributeValue>
+                | undefined
+            } while (deletedStart !== undefined)
 
-            if (entityItem) {
-              // Add sentinel keys to delete list (sparse — fields that were unset
-              // never had a sentinel written, so nothing to enqueue). The stored
-              // row is attribute-keyed, the constraint is not (#127).
-              const entityItemDomain = toDomainView(entityItem)
+            // Sparse — fields that were unset never had a sentinel. The stored
+            // row is attribute-keyed, the constraint is not (#127).
+            const held = new Map<string, { readonly pk: string; readonly sk: string }>()
+            for (const holder of holders) {
+              const holderDomain = toDomainView(fromAttributeMap(holder))
               for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
                 const sentinel = composeUniqueSentinel(
                   schema,
                   entityType,
                   constraintName,
                   constraintDef,
-                  entityItemDomain,
+                  holderDomain,
                 )
-                if (!sentinel) continue
-                allItems.push(
-                  toAttributeMap({
-                    [primary.pk.field]: sentinel.key.pk,
-                    [primary.sk.field]: sentinel.key.sk,
-                  }),
-                )
+                if (sentinel) held.set(`${sentinel.key.pk}\u0000${sentinel.key.sk}`, sentinel.key)
               }
+            }
+            // Released one by one, each only while still this item's: a batch
+            // delete cannot carry the ownership condition.
+            for (const sentinel of yield* ownedSentinels(tableName, [...held.values()], owner)) {
+              yield* client.deleteItem(sentinelRelease(tableName, sentinel, owner).Delete).pipe(
+                Effect.catchIf(
+                  (err) => isAwsConditionalCheckFailed(err.cause),
+                  () => Effect.void,
+                ),
+              )
             }
           }
 
@@ -6116,8 +9388,13 @@ const makeImpl = <
     _serializeSparseFields: serializeSparseFields,
     _keyForm: keyForm,
     _renameToDynamo: renameToDynamo,
-    _buildPutSideItems: buildPutSideItems,
+    _incarnationToken: stampsIncarnation,
+    _versionCorruption: versionCorruption,
+    _fillDecodingDefaults: fillDecodingDefaults,
+    _unsentineledDefaults: unsentineledDefaults,
+    _planPut: planPut,
     _multiItemWriteFeatures: multiItemWriteFeatures(),
+    _liveRows: liveRows,
     _attachPrototype: attachPrototype,
     _configure: (
       injectedSchema: DynamoSchema.DynamoSchema,
@@ -6301,6 +9578,7 @@ export const bind = <
         pathBuilder: createPathBuilder(),
         conditionOps: createConditionOps(),
         provide,
+        ...entityNaming(entity._resolveDbName),
       }
       return new BoundQueryImpl(
         q,
@@ -6559,6 +9837,7 @@ export const bind = <
           provide,
           skFields: orderBy ? [orderBy] : [],
           composeSkCondition,
+          ...entityNaming(entity._resolveDbName),
         }
         return new BoundQueryImpl(q, bqConfig)
       },
@@ -6632,6 +9911,7 @@ interface InternalEntityDelete {
   readonly _entity: Entity
   readonly _key: globalThis.Record<string, unknown>
   readonly _condition?: Expr | ConditionInput | undefined
+  readonly _mustExist?: boolean
 }
 
 const isEntityOp = (op: object): op is InternalEntityOp => EntityOpTypeId in op
@@ -6666,16 +9946,27 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
     if (target._opType === "get") {
       return { opType: "get", entity: target._entity, key: target._key }
     }
+    // `create`'s own not-exists guard is ANDed with the caller's condition:
+    // no `.condition()` replaces it (#133).
+    const primary = target._entity.indexes.primary!
     if (target._opType === "put") {
+      const putKind = target._putKind ?? "put"
       return {
         opType: "put",
         entity: target._entity,
         input: target._input,
-        condition: target._condition,
-        putKind: target._putKind ?? "put",
+        condition: withGuard(
+          putKind === "create"
+            ? { attributeNotExists: [primary.pk.field, primary.sk.field] }
+            : undefined,
+          target._condition,
+        ),
+        putKind,
       }
     }
     if (target._opType === "update") {
+      // Every multi-item path (transactions, `Batch.write`, `EventStore`
+      // additional items) refuses an update, so no guard is carried here.
       return {
         opType: "update",
         entity: target._entity,
@@ -6685,13 +9976,19 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
     }
   }
 
-  // Check for EntityDelete intermediate
+  // Check for EntityDelete intermediate — `deleteIfExists`'s exists guard
+  // ANDed with the caller's condition.
   if (isEntityDelete(target)) {
     return {
       opType: "delete",
       entity: target._entity,
       key: target._key,
-      condition: target._condition,
+      condition: withGuard(
+        target._mustExist
+          ? { attributeExists: [target._entity.indexes.primary!.pk.field] }
+          : undefined,
+        target._condition,
+      ),
     }
   }
 
@@ -6844,6 +10141,11 @@ export const compositeAttributes = (entity: EntityLike): ReadonlyArray<string> =
 interface EntityWithSchemas {
   readonly schemas: DerivedSchemas
   readonly _attachPrototype?: (decoded: any) => any
+  /** See `versionCorruption` (#133): an item with a token but no version. */
+  readonly _versionCorruption?: (
+    item: Readonly<globalThis.Record<string, unknown>>,
+    operation: string,
+  ) => ValidationError | undefined
 }
 
 /**
@@ -6868,8 +10170,12 @@ export const itemSchema = (entity: EntityWithSchemas): Schema.Codec<any> =>
 export const decodeMarshalledItem = (
   entity: EntityWithSchemas & { readonly entityType: string },
   marshalledItem: globalThis.Record<string, AttributeValue>,
-): Effect.Effect<unknown, ValidationError> =>
-  Schema.decodeUnknownEffect(entity.schemas.itemSchema)(fromAttributeMap(marshalledItem)).pipe(
+): Effect.Effect<unknown, ValidationError> => {
+  const corruption = entity._versionCorruption?.(marshalledItem, "decodeMarshalledItem")
+  if (corruption !== undefined) return Effect.fail(corruption)
+  return Schema.decodeUnknownEffect(entity.schemas.itemSchema)(
+    fromAttributeMap(marshalledItem),
+  ).pipe(
     Effect.map((decoded) => (entity._attachPrototype ? entity._attachPrototype(decoded) : decoded)),
     Effect.mapError(
       (cause) =>
@@ -6880,3 +10186,4 @@ export const decodeMarshalledItem = (
         }),
     ),
   )
+}

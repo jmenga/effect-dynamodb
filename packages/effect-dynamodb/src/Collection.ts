@@ -285,62 +285,31 @@ export const make = <
     )
   }
 
-  // Build the query function
-  const buildQuery = (
-    pkComposites: Record<string, unknown>,
-    targetEntityTypes: ReadonlyArray<string>,
-    decoder: (raw: Record<string, unknown>) => Effect.Effect<unknown, ValidationError>,
-  ) => {
-    // Use the first entity to compose the PK (they share the same index pattern)
+  // The collection's partition key. Same key form the member entities' write
+  // path uses — see `internal/CompositeCodec.ts`. Members are checked for
+  // agreement at `Collections.make()` time, so the first member's form speaks
+  // for all.
+  const collectionPk = (pkComposites: Record<string, unknown>) => {
     const firstEntity = entityEntries[0]![1]
-    const indexDef = firstEntity.indexes[sharedIndexName!]!
-    // Same key form the member entities' write path uses — see
-    // `internal/CompositeCodec.ts`. Members are checked for agreement at
-    // `Collections.make()` time, so the first member's form speaks for all.
-    const pkValue = KeyComposer.composePk(
+    return KeyComposer.composePk(
       sharedSchema!,
       firstEntity.entityType,
-      indexDef,
+      firstEntity.indexes[sharedIndexName!]!,
       collectionKeyForm(firstEntity, pkComposites),
     )
-
-    return Query.make({
-      tableName: "",
-      indexName: sharedDynamoIndexName,
-      pkField: sharedPkField!,
-      pkValue,
-      skField: sharedSkField,
-      entityTypes: targetEntityTypes,
-      decoder,
-      resolveTableName: firstEntity._tableTag.useSync((tc: TableConfig) => tc.name),
-      keyFields: [
-        sharedPkField,
-        sharedSkField,
-        firstEntity.indexes.primary?.pk.field,
-        firstEntity.indexes.primary?.sk.field,
-      ],
-    })
   }
 
   // Main query: returns grouped results
   const queryAll = (pkComposites: Record<string, unknown>) => {
-    const groupDecoder = (raw: Record<string, unknown>) =>
-      collectionDecoder(raw) as Effect.Effect<
-        { _entityKey: string; _entityType: string; _decoded: unknown },
-        ValidationError
-      >
-
-    // We need a custom decoder that groups results
-    // The Query will return flat items — we need to post-process into groups
-    // We'll use the collectionDecoder and the collect terminal will group them
-    const rawQuery = buildQuery(pkComposites, entityTypes, groupDecoder)
-
-    // Override with a custom decoder that produces the grouped result
+    // Each item is tagged with its member by `collectionDecoder`; the collect
+    // terminal groups them.
     let q = Query.make<CollectionResult<TEntities>>({
       tableName: "",
       indexName: sharedDynamoIndexName,
+      // A collection is over its members' secondary indexes — GSIs.
+      globalIndex: true,
       pkField: sharedPkField!,
-      pkValue: rawQuery._state.pkValue,
+      pkValue: collectionPk(pkComposites),
       skField: sharedSkField,
       entityTypes,
       resolveTableName: entityEntries[0]![1]._tableTag.useSync((tc: TableConfig) => tc.name),
@@ -382,6 +351,8 @@ export const make = <
       let q = Query.make({
         tableName: "",
         indexName: sharedDynamoIndexName,
+        // A collection is over its members' secondary indexes — GSIs.
+        globalIndex: true,
         pkField: sharedPkField!,
         pkValue,
         skField: sharedSkField,

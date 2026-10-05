@@ -272,7 +272,7 @@ const todoTasks = yield* db.entities.Tasks.byUser({ userId: "u-alice" })
 
 ### transactWrite
 
-Atomically create multiple items across entities. If either fails, neither is persisted:
+Atomically create multiple items across entities. If either fails, neither is persisted. Because `Users` and `Tasks` are versioned, each put reads its item first, so the same call would also replace an existing user or task, continuing its version (and snapshotting the user), just as the entity's own `put` does:
 
 ```typescript region="transact-write" example="crud.ts"
 yield* Transaction.transactWrite([
@@ -412,7 +412,7 @@ const afterDelete = yield* db.entities.Users.get({ userId: "u-charlie" }).pipe(
 
 ## Step 12: Version History
 
-With `versioned: { retain: true }`, every put and update creates a snapshot in the same DynamoDB partition. Retrieve individual versions or query the full history:
+With `versioned: { retain: true }`, every put, upsert and update creates a snapshot in the same DynamoDB partition. Retrieve individual versions or query the full history:
 
 ```typescript region="versions" example="crud.ts"
 // Fetch a specific version

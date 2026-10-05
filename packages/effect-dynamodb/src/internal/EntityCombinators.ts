@@ -34,8 +34,9 @@ import {
   type PathSetOp,
   type PathSubtractOp,
   type ReturnValuesMode,
+  type UpdateReturn,
 } from "./EntityOps.js"
-import type { Expr } from "./Expr.js"
+import { type Expr, nonEmptyCondition } from "./Expr.js"
 
 // ---------------------------------------------------------------------------
 // Terminal functions — select decode mode for EntityOp intermediates
@@ -54,6 +55,13 @@ type ExtractE<T> = T extends EntityOp<any, any, infer E, any> ? E : never
 /** Helper: extract R type */
 type ExtractR<T> = T extends EntityOp<any, any, any, infer R> ? R : never
 
+/** `undefined` for an update set to `returnValues("none")`, else `Full`. */
+type NoneOr<Self, Full> = 0 extends 1 & ExtractRec<Self>
+  ? Full
+  : [ExtractRec<Self>] extends [undefined]
+    ? undefined
+    : Full
+
 /** Decode through model schema (default for yield*). Returns clean model class instance. */
 export const asModel = <Self extends EntityOp<any, any, any, any>>(
   self: Self,
@@ -71,14 +79,20 @@ export const asRecord = <Self extends EntityOp<any, any, any, any>>(
 /** Decode through item schema (model + system + keys + `__edd_e__`). Returns `Record<string, unknown>`. */
 export const asItem = <Self extends EntityOp<any, any, any, any>>(
   self: Self,
-): Effect.Effect<globalThis.Record<string, unknown>, ExtractE<Self>, ExtractR<Self>> =>
-  self._run("item") as any
+): Effect.Effect<
+  NoneOr<Self, globalThis.Record<string, unknown>>,
+  ExtractE<Self>,
+  ExtractR<Self>
+> => self._run("item") as any
 
 /** Return raw marshalled DynamoDB format (`Record<string, AttributeValue>`). No decode. */
 export const asNative = <Self extends EntityOp<any, any, any, any>>(
   self: Self,
-): Effect.Effect<globalThis.Record<string, AttributeValue>, ExtractE<Self>, ExtractR<Self>> =>
-  self._run("native") as any
+): Effect.Effect<
+  NoneOr<Self, globalThis.Record<string, AttributeValue>>,
+  ExtractE<Self>,
+  ExtractR<Self>
+> => self._run("native") as any
 
 // ---------------------------------------------------------------------------
 // Update combinators — dual functions for pipe composition
@@ -248,8 +262,8 @@ export type WithConditionalCheckFailed<T> =
     ? EntityUpdate<A, Rec, U, E | ConditionalCheckFailed, R>
     : T extends EntityPut<infer A, infer Rec, infer E, infer R>
       ? EntityPut<A, Rec, E | ConditionalCheckFailed, R>
-      : T extends EntityDelete<infer E, infer R>
-        ? EntityDelete<E | ConditionalCheckFailed, R>
+      : T extends EntityDelete<infer E, infer R, infer A, infer Mo>
+        ? EntityDelete<E | ConditionalCheckFailed, R, A, Mo>
         : never
 
 /**
@@ -259,6 +273,8 @@ export type WithConditionalCheckFailed<T> =
 export type ConditionPipeable = <T extends ConditionTarget>(
   self: T,
 ) => WithConditionalCheckFailed<T>
+
+/** @internal Whether a condition compiles to nothing (`{}`, `and()`). */
 
 /**
  * Add a condition expression to a put, update, or delete operation.
@@ -273,9 +289,13 @@ export type ConditionPipeable = <T extends ConditionTarget>(
 export const condition: {
   (cond: Expr | ConditionInput): ConditionPipeable
   <T extends ConditionTarget>(self: T, cond: Expr | ConditionInput): WithConditionalCheckFailed<T>
-} = Fn.dual(2, <T extends ConditionTarget>(self: T, cond: Expr | ConditionInput): T => {
+} = Fn.dual(2, <T extends ConditionTarget>(self: T, given: Expr | ConditionInput): T => {
+  // An empty condition (`{}`, `and()`) is no condition (#133): like any later
+  // `.condition()`, it replaces an earlier one — with none.
+  const cond = nonEmptyCondition(given)
   if (EntityDeleteTypeId in self) {
-    // EntityDelete
+    // EntityDelete. `deleteIfExists`'s existence check is the op's own guard
+    // (`_mustExist`), never its condition: it stays, ANDed with this one.
     const impl = self as unknown as EntityDeleteImpl<any, any>
     return new EntityDeleteImpl(
       impl._builder,
@@ -283,6 +303,7 @@ export const condition: {
       impl._key,
       cond,
       impl._returnValues,
+      impl._mustExist,
     ) as unknown as T
   }
   if (EntityUpdateTypeId in self) {
@@ -355,20 +376,55 @@ export const withVector: {
 type ReturnValuesTarget = EntityUpdate<any, any, any, any, any> | EntityDelete<any, any>
 
 /**
+ * An update's result type under a `returnValues` mode — see {@link UpdateReturn}.
+ * A delete returns the item it deleted under `"allOld"` (`undefined` when
+ * there was none), and nothing otherwise.
+ */
+export type ReturnValuesResult<T, M extends ReturnValuesMode> =
+  T extends EntityUpdate<infer A, infer Rec, infer U, infer E, infer R>
+    ? typeof UpdateBaseTypeId extends keyof U
+      ? U extends UpdateBase<infer BA, infer BR>
+        ? EntityUpdate<UpdateReturn<BA, M>, UpdateReturn<BR, M>, U, E, R>
+        : never
+      : EntityUpdate<UpdateReturn<A, M>, UpdateReturn<Rec, M>, U & UpdateBase<A, Rec>, E, R>
+    : T extends EntityDelete<infer E, infer R, any, infer Mo>
+      ? EntityDelete<E, R, M extends "allOld" ? Mo | undefined : void, Mo>
+      : T
+
+/**
+ * @internal The model / record types an update returned before its first
+ * `returnValues`, carried on the (phantom) payload type so a later
+ * `returnValues` derives from them, not from the previous mode's result.
+ */
+declare const UpdateBaseTypeId: unique symbol
+/** @internal */
+export interface UpdateBase<A, Rec> {
+  readonly [UpdateBaseTypeId]?: (_: never) => readonly [A, Rec]
+}
+
+/**
  * Set the DynamoDB `ReturnValues` mode on an update or delete operation.
  *
  * Modes:
  * - `"none"` — return nothing (default for delete)
  * - `"allOld"` — return the item as it was before the operation
  * - `"allNew"` — return the item as it is after the operation (default for update)
- * - `"updatedOld"` — return only the updated attributes, with old values
- * - `"updatedNew"` — return only the updated attributes, with new values
+ * - `"updatedOld"` — return only the top-level attributes the update wrote, with
+ *   their old values, decoded as a partial
+ * - `"updatedNew"` — the same attributes with their new values
  *
- * For deletes, only `"none"` and `"allOld"` are valid DynamoDB modes.
+ * An update's result type follows the mode (`undefined` for `"none"`, a
+ * `Partial` for the `updated*` modes). For deletes, only `"none"` and
+ * `"allOld"` are valid DynamoDB modes.
  */
 export const returnValues: {
-  (mode: ReturnValuesMode): <T extends ReturnValuesTarget>(self: T) => T
-  <T extends ReturnValuesTarget>(self: T, mode: ReturnValuesMode): T
+  <M extends ReturnValuesMode>(
+    mode: M,
+  ): <T extends ReturnValuesTarget>(self: T) => ReturnValuesResult<T, M>
+  <T extends ReturnValuesTarget, M extends ReturnValuesMode>(
+    self: T,
+    mode: M,
+  ): ReturnValuesResult<T, M>
 } = Fn.dual(2, <T extends ReturnValuesTarget>(self: T, mode: ReturnValuesMode): T => {
   if (EntityDeleteTypeId in self) {
     const impl = self as unknown as EntityDeleteImpl<any, any>
@@ -378,6 +434,7 @@ export const returnValues: {
       impl._key,
       impl._condition,
       mode,
+      impl._mustExist,
     ) as unknown as T
   }
   // EntityUpdate

@@ -6,11 +6,11 @@
 
 import type { ReturnValue } from "@aws-sdk/client-dynamodb"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
-import type { Effect } from "effect"
-import { Pipeable, Utils } from "effect"
+import { Effect, Pipeable, Utils } from "effect"
 import type { ConditionInput } from "../Expression.js"
-import type { Expr } from "../internal/Expr.js"
+import { type Expr, ExprTag, emptyPartProblem, toExpr } from "../internal/Expr.js"
 import type { TableConfig } from "../Table.js"
 
 // ---------------------------------------------------------------------------
@@ -37,6 +37,56 @@ export type DecodeMode = "model" | "record" | "item" | "native" | "raw"
 
 /** DynamoDB ReturnValues modes */
 export type ReturnValuesMode = "none" | "allOld" | "allNew" | "updatedOld" | "updatedNew"
+
+/**
+ * What an update returns for a `returnValues` mode (#133): `"none"` →
+ * `undefined`; `"updatedOld"` / `"updatedNew"` → only the attributes the
+ * update wrote, as a `Partial`; `"allOld"` / `"allNew"` → the whole item.
+ */
+export type UpdateReturn<A, M extends ReturnValuesMode> = M extends "none"
+  ? undefined
+  : M extends "updatedOld" | "updatedNew"
+    ? Partial<A>
+    : A
+
+/**
+ * @internal An op's built-in guard ANDed with the caller's condition (#133):
+ * `create`'s not-exists, `patch`'s and `deleteIfExists`'s exists. The guard
+ * is held apart from the caller's condition, so no `.condition()` — empty,
+ * or replacing an earlier one — can remove it. Compiled as ONE expression,
+ * so their placeholders never collide; with no caller's condition, the guard
+ * alone (what these ops always sent).
+ */
+export const withGuard = (
+  guard: ConditionInput | undefined,
+  condition: Expr | ConditionInput | undefined,
+): Expr | ConditionInput | undefined => {
+  if (guard === undefined) return condition
+  if (condition === undefined) return guard
+  return { [ExprTag]: ExprTag, _tag: "and", exprs: [toExpr(guard), toExpr(condition)] } as Expr
+}
+
+/**
+ * @internal Run a write op unless its condition has an empty part where none
+ * may be (`emptyPartProblem`, #133): refused with a `ValidationError` before
+ * anything is sent.
+ */
+const refuseEmptyParts = <E, R>(
+  entity: EntityBase,
+  operation: string,
+  condition: Expr | ConditionInput | undefined,
+  run: () => Effect.Effect<any, E, R>,
+): Effect.Effect<any, E, R> => {
+  const problem = condition === undefined ? undefined : emptyPartProblem(toExpr(condition))
+  if (problem === undefined) return run()
+  return Effect.fail(
+    new ValidationError({
+      entityType: (entity as { readonly entityType?: string }).entityType ?? "unknown",
+      operation: `${operation}.condition`,
+      cause: `${operation}: ${problem} Nothing was sent.`,
+    }),
+  ) as Effect.Effect<never, E, never>
+}
 
 /** @internal Map from our mode names to DynamoDB ReturnValues strings */
 export const returnValuesMap: globalThis.Record<ReturnValuesMode, ReturnValue> = {
@@ -114,6 +164,11 @@ export interface UpdateState {
    * escape hatch that skips the Embedder for the named vector index.
    */
   readonly withVectors: WithVectors | undefined
+  /**
+   * `patch()`: the update requires the item to exist and reports a missing
+   * one as `ConditionalCheckFailed` (its documented contract).
+   */
+  readonly patch?: boolean | undefined
 }
 
 /** @internal Path-based SET operation */
@@ -263,12 +318,19 @@ export interface EntityUpdate<A, Rec, U, E, R> extends EntityOp<A, Rec, E, R> {
  * Does NOT extend EntityOp (no decode mode — delete returns void).
  * Yieldable in `Effect.gen`.
  */
-export interface EntityDelete<E, R> extends Pipeable.Pipeable {
+/**
+ * A delete descriptor. `A` is what it returns: nothing, or with
+ * `returnValues("allOld")` the item it deleted (`Model`, `undefined` when there
+ * was none).
+ */
+export interface EntityDelete<E, R, A = void, Model = unknown> extends Pipeable.Pipeable {
   readonly [EntityDeleteTypeId]: EntityDeleteTypeId
   /** Convert this descriptor to an executable Effect. */
-  readonly asEffect: () => Effect.Effect<void, E, R>
+  readonly asEffect: () => Effect.Effect<A, E, R>
   /** Yield support for `Effect.gen`. */
-  readonly [Symbol.iterator]: () => Iterator<Effect.Effect<void, E, R>, void>
+  readonly [Symbol.iterator]: () => Iterator<Effect.Effect<A, E, R>, A>
+  /** @internal Phantom: the model an `"allOld"` delete returns. */
+  readonly _deleteModel?: Model | undefined
   /** @internal */ readonly _opType: "delete"
   /** @internal */ readonly _entity: EntityBase
   /** @internal */ readonly _key: globalThis.Record<string, unknown>
@@ -341,6 +403,10 @@ export type WithVectors = globalThis.Record<string, ReadonlyArray<number>>
 export interface EntityPutOpts {
   readonly condition: Expr | ConditionInput | undefined
   readonly withVectors?: WithVectors | undefined
+  /** Which put-shaped op is running (`create` fails on an existing item). */
+  readonly putKind?: PutKind | undefined
+  /** The operation errors name — `upsert` runs its create through `put`. */
+  readonly operation?: string | undefined
 }
 
 /**
@@ -381,7 +447,13 @@ export class EntityPutImpl<A, Rec, E, R> implements Pipeable.Pipeable {
   }
   get _run(): (mode: DecodeMode) => Effect.Effect<any, E, R> {
     return (mode) =>
-      this._builder(mode, { condition: this._condition, withVectors: this._withVectors })
+      refuseEmptyParts(this._entity, this._putKind, this._condition, () =>
+        this._builder(mode, {
+          condition: this._condition,
+          withVectors: this._withVectors,
+          putKind: this._putKind,
+        }),
+      )
   }
   asEffect(): Effect.Effect<A, E, R> {
     return this._run("model") as Effect.Effect<A, E, R>
@@ -413,7 +485,13 @@ export class EntityUpdateImpl<A, Rec, U, E, R> implements Pipeable.Pipeable {
     this._key = key
   }
   get _run(): (mode: DecodeMode) => Effect.Effect<any, E, R> {
-    return (mode) => this._builder(mode, this._updateState)
+    return (mode) =>
+      refuseEmptyParts(
+        this._entity,
+        this._updateState.patch ? "patch" : "update",
+        this._updateState.condition,
+        () => this._builder(mode, this._updateState),
+      )
   }
   asEffect(): Effect.Effect<A, E, R> {
     return this._run("model") as Effect.Effect<A, E, R>
@@ -427,30 +505,45 @@ export class EntityUpdateImpl<A, Rec, U, E, R> implements Pipeable.Pipeable {
   }
 }
 
-export class EntityDeleteImpl<E, R> implements Pipeable.Pipeable {
+export class EntityDeleteImpl<E, R, A = void> implements Pipeable.Pipeable {
   readonly [EntityDeleteTypeId]: EntityDeleteTypeId = EntityDeleteTypeId as EntityDeleteTypeId
   readonly _opType = "delete" as const
   readonly _entity: EntityBase
   readonly _key: globalThis.Record<string, unknown>
   readonly _condition: Expr | ConditionInput | undefined
   readonly _returnValues: ReturnValuesMode | undefined
+  /** `deleteIfExists`: the item must exist — a guard no `.condition()` replaces. */
+  readonly _mustExist: boolean
   constructor(
     readonly _builder: (opts: {
       readonly condition: Expr | ConditionInput | undefined
       readonly returnValues: ReturnValuesMode | undefined
-    }) => Effect.Effect<void, E, R>,
+      readonly mustExist: boolean
+    }) => Effect.Effect<A, E, R>,
     entity: EntityBase,
     key: globalThis.Record<string, unknown>,
     condition?: Expr | ConditionInput | undefined,
     returnValues?: ReturnValuesMode | undefined,
+    mustExist = false,
   ) {
     this._entity = entity
     this._key = key
     this._condition = condition
     this._returnValues = returnValues
+    this._mustExist = mustExist
   }
-  asEffect(): Effect.Effect<void, E, R> {
-    return this._builder({ condition: this._condition, returnValues: this._returnValues })
+  asEffect(): Effect.Effect<A, E, R> {
+    return refuseEmptyParts(
+      this._entity,
+      this._mustExist ? "deleteIfExists" : "delete",
+      this._condition,
+      () =>
+        this._builder({
+          condition: this._condition,
+          returnValues: this._returnValues,
+          mustExist: this._mustExist,
+        }),
+    )
   }
   [Symbol.iterator]() {
     return new Utils.SingleShotGen(this.asEffect()) as any
