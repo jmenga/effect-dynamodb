@@ -249,7 +249,10 @@ export interface BoundQueryBase<Model, SkRemaining, A> {
   /** Resume pagination from an opaque cursor. */
   readonly startFrom: (cursor: string) => BoundQuery<Model, SkRemaining, A>
 
-  /** Enable consistent reads. */
+  /**
+   * Enable consistent reads. Refused with a `ValidationError` when it runs on
+   * a GSI, which DynamoDB reads only eventually consistently.
+   */
   readonly consistentRead: () => BoundQuery<Model, SkRemaining, A>
 
   /** Skip the __edd_e__ entity type filter. */

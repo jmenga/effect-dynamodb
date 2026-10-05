@@ -651,8 +651,17 @@ export interface CollectionQuery<TResult> {
   readonly startFrom: (cursor: string) => CollectionQuery<TResult>
   /** Stop after `n` DynamoDB requests. */
   readonly maxPages: (n: number) => CollectionQuery<TResult>
-  /** Strongly consistent reads (not on a GSI). */
+  /**
+   * Strongly consistent reads. A collection over a GSI — every auto-discovered
+   * one — is refused with a `ValidationError` when it runs: DynamoDB reads a
+   * GSI only eventually consistently.
+   */
   readonly consistentRead: () => CollectionQuery<TResult>
+  /**
+   * Skip the `__edd_e__` ownership filter. Rows of no member are still never
+   * returned as a member's items.
+   */
+  readonly ignoreOwnership: () => CollectionQuery<TResult>
 }
 
 /**
@@ -1155,6 +1164,8 @@ const makeFromConfig = (config: {
         const query = Query.make({
           tableName: "",
           indexName: indexDef.index,
+          // An entity's indexes are GSIs (`Table.definition`).
+          globalIndex: indexDef.index !== undefined,
           pkField: indexDef.pk.field,
           pkValue,
           skField: indexDef.sk.field,
@@ -1608,6 +1619,8 @@ const makeFromConfig = (config: {
         let query = Query.make({
           tableName: "",
           indexName: indexDef.index,
+          // An entity's indexes are GSIs (`Table.definition`).
+          globalIndex: indexDef.index !== undefined,
           pkField: indexDef.pk.field,
           pkValue,
           skField: indexDef.sk.field,

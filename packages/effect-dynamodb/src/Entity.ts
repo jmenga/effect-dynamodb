@@ -8523,6 +8523,7 @@ const makeImpl = <
       const query = Query.make({
         tableName: "",
         indexName: indexDef.index,
+        globalIndex: indexDef.index !== undefined,
         pkField: indexDef.pk.field,
         pkValue,
         skField: indexDef.sk.field,

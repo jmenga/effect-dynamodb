@@ -17483,7 +17483,7 @@ describeConnected("#133 — path operations on index composites and unique field
       yield* (db.entities.OrAs as any).put({ owner: "cq1", aid: "a1", n: 1 })
       yield* (db.entities.OrAs as any).put({ owner: "cq1", aid: "a2", n: 2 })
       yield* (db.entities.OrBs as any).put({ owner: "cq1", bid: "b1", n: 3, secret: "s" })
-      const q = () => (db.collections as any).g133Or({ owner: "cq1" })
+      const q = () => db.collections.g133Or!({ owner: "cq1" })
       const page = yield* q().fetch()
       expect(page.items.OrAs.map((a: any) => a.aid)).toEqual(["a1", "a2"])
       expect(page.items.OrBs.map((b: any) => b.bid)).toEqual(["b1"])
@@ -17510,7 +17510,7 @@ describeConnected("#133 — path operations on index composites and unique field
         yield* as.put({ owner: "part", aid: "a2", n: 2, code: "c2" })
         yield* bs.put({ owner: "part", bid: "b1", n: 3, secret: "s" })
         yield* bs.put({ owner: "part", bid: "b2", n: 4, secret: "t" })
-        const q = () => (db.collections as any).g133Or({ owner: "part" })
+        const q = () => db.collections.g133Or!({ owner: "part" })
         const ids = (r: any) => [r.OrAs.map((a: any) => a.aid), r.OrBs.map((b: any) => b.bid)]
         // What main returns: DynamoDB evaluates an absent attribute.
         const either = (t: any, { or, eq }: any) => or(eq(t.secret, "s"), eq(t.code, "c1"))
@@ -17522,6 +17522,12 @@ describeConnected("#133 — path operations on index composites and unique field
         expect(ids(yield* q().filter(noSecret).collect())).toEqual([["a1", "a2"], []])
         // A field no member has matches nothing.
         expect(ids(yield* q().filter({ nope: "x" }).collect())).toEqual([[], []])
+        // A GSI is read only eventually consistently: refused before sending.
+        expect((yield* q().consistentRead().collect().pipe(Effect.flip))._tag).toBe(
+          "ValidationError",
+        )
+        const byOwner = as.byOwner({ owner: "part" }).consistentRead()
+        expect((yield* byOwner.collect().pipe(Effect.flip))._tag).toBe("ValidationError")
         // A row of no member's in the partition (seen once ownership is
         // ignored) is never streamed as a member's item.
         const a1 = yield* Effect.gen(function* () {
@@ -17540,9 +17546,7 @@ describeConnected("#133 — path operations on index composites and unique field
           sk: "$edd133g#v1#foreign",
           __edd_e__: "Foreign",
         })
-        const streamed = [
-          ...(yield* Stream.runCollect(q().ignoreOwnership().paginate())),
-        ] as Array<any>
+        const streamed = [...(yield* Stream.runCollect(q().ignoreOwnership().paginate()))]
         expect(streamed.map((s) => s.member).sort()).toEqual(["OrAs", "OrAs", "OrBs", "OrBs"])
       }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )

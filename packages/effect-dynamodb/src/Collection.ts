@@ -307,6 +307,7 @@ export const make = <
     return Query.make({
       tableName: "",
       indexName: sharedDynamoIndexName,
+      globalIndex: sharedDynamoIndexName !== undefined,
       pkField: sharedPkField!,
       pkValue,
       skField: sharedSkField,
@@ -339,6 +340,7 @@ export const make = <
     let q = Query.make<CollectionResult<TEntities>>({
       tableName: "",
       indexName: sharedDynamoIndexName,
+      globalIndex: sharedDynamoIndexName !== undefined,
       pkField: sharedPkField!,
       pkValue: rawQuery._state.pkValue,
       skField: sharedSkField,
@@ -382,6 +384,7 @@ export const make = <
       let q = Query.make({
         tableName: "",
         indexName: sharedDynamoIndexName,
+        globalIndex: sharedDynamoIndexName !== undefined,
         pkField: sharedPkField!,
         pkValue,
         skField: sharedSkField,

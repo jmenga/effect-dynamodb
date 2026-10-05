@@ -62,6 +62,11 @@ interface QueryState {
   readonly maxPagesValue: number | undefined
   readonly scanForward: boolean
   readonly consistentRead: boolean
+  /**
+   * The index is a GSI, which DynamoDB only reads eventually consistently:
+   * `consistentRead` is refused before sending (#133).
+   */
+  readonly globalIndex: boolean
   readonly ignoreOwnershipFlag: boolean
   readonly exclusiveStartKey: Record<string, AttributeValue> | undefined
   readonly isScan: boolean
@@ -178,6 +183,8 @@ export const make = <A>(config: {
   readonly skField: string | undefined
   readonly entityTypes: ReadonlyArray<string>
   readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<A, ValidationError>
+  /** `indexName` names a GSI (see {@link QueryState.globalIndex}). */
+  readonly globalIndex?: boolean | undefined
   readonly resolveTableName?: Effect.Effect<string, never, any> | undefined
   /** Index key + table key attribute names (used to rebuild cursors). */
   readonly keyFields?: ReadonlyArray<string | undefined> | undefined
@@ -204,6 +211,7 @@ export const make = <A>(config: {
     maxPagesValue: undefined,
     scanForward: true,
     consistentRead: false,
+    globalIndex: config.globalIndex ?? false,
     ignoreOwnershipFlag: false,
     exclusiveStartKey: undefined,
     isScan: false,
@@ -226,6 +234,8 @@ export const makeScan = <A>(config: {
   readonly indexName: string | undefined
   readonly entityTypes: ReadonlyArray<string>
   readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<A, ValidationError>
+  /** `indexName` names a GSI (see {@link QueryState.globalIndex}). */
+  readonly globalIndex?: boolean | undefined
   readonly resolveTableName?: Effect.Effect<string, never, any> | undefined
   /** Index key + table key attribute names (used to rebuild cursors). */
   readonly keyFields?: ReadonlyArray<string | undefined> | undefined
@@ -252,6 +262,7 @@ export const makeScan = <A>(config: {
     maxPagesValue: undefined,
     scanForward: true,
     consistentRead: false,
+    globalIndex: config.globalIndex ?? false,
     ignoreOwnershipFlag: false,
     exclusiveStartKey: undefined,
     isScan: true,
@@ -346,7 +357,9 @@ export const reverse = <A>(self: Query<A>): Query<A> =>
   })
 
 /**
- * Enable consistent reads for this query (or scan).
+ * Enable consistent reads for this query (or scan). Refused with a
+ * `ValidationError` when it runs on a global secondary index, which DynamoDB
+ * reads only eventually consistently.
  */
 export const consistentRead: {
   (): <A>(self: Query<A>) => Query<A>
@@ -826,6 +839,19 @@ const prepared = (
   state: QueryState,
   tableName: string,
 ): Effect.Effect<QueryState, DynamoClientError | ValidationError, DynamoClient> => {
+  // A consistent read of a GSI — which DynamoDB only reads eventually
+  // consistently — is refused before anything is sent (#133).
+  if (state.consistentRead && state.globalIndex) {
+    return Effect.fail(
+      new ValidationError({
+        entityType: state.entityTypes.join(", ") || "unknown",
+        operation: "query.consistentRead",
+        cause:
+          `consistentRead: index "${state.indexName}" is a global secondary index, which ` +
+          "DynamoDB reads only eventually consistently. Nothing was sent.",
+      }),
+    )
+  }
   // A filter with an empty part where none may be is refused before
   // anything is sent (#133).
   for (const filter of state.exprFilters) {
