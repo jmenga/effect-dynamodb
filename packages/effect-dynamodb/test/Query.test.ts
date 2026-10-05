@@ -804,6 +804,23 @@ describe("Query", () => {
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
+    it.effect("pageSize is sent as is, and a grown Limit stops at 100,000", () =>
+      Effect.gen(function* () {
+        const historyOnly = () => ({
+          Items: [row("a", "$myapp#v1#user#v#id_a#0000001")],
+          LastEvaluatedKey: { pk: { S: "p" }, sk: { S: "$myapp#v1#user#v#id_a#0000001" } },
+        })
+        mockQuery.mockReset()
+        mockQuery.mockResolvedValueOnce(historyOnly()).mockResolvedValueOnce({ Items: [] })
+        yield* Query.collect(historyQuery().pipe(Query.limit(2), Query.pageSize(7)))
+        expect(mockQuery.mock.calls.map((call) => call[0].Limit)).toEqual([7, 7])
+        mockQuery.mockReset()
+        mockQuery.mockResolvedValueOnce(historyOnly()).mockResolvedValueOnce({ Items: [] })
+        yield* Query.collect(historyQuery().pipe(Query.limit(60_000)))
+        expect(mockQuery.mock.calls.map((call) => call[0].Limit)).toEqual([60_000, 100_000])
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
     it.effect("count reads only what it judges rows by, and honours limit", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValue(page())

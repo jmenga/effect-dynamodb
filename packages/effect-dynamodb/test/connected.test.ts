@@ -14345,6 +14345,13 @@ const G133NamedOther = Schema.Struct({
   nid: Schema.String,
   label: Schema.String,
 })
+// A third member whose DOMAIN field is named what Hyphens stores `label` as.
+const G133NamedThird = Schema.Struct({
+  grp: Schema.String,
+  tid: Schema.String,
+  label: Schema.String,
+  "the-label": Schema.String,
+})
 const g133NamedIndex = (sk: string) => ({
   byGrp: {
     name: "gsi2",
@@ -14528,6 +14535,15 @@ const g133Entities = {
       pk: { field: "pk", composite: ["grp"] },
       sk: { field: "sk", composite: ["hid"] },
     } as any,
+  }),
+  NamedThirds: Entity.make({
+    model: G133NamedThird,
+    entityType: "G133NamedThird",
+    primaryKey: {
+      pk: { field: "pk", composite: ["grp"] },
+      sk: { field: "sk", composite: ["tid"] },
+    } as any,
+    indexes: g133NamedIndex("tid") as any,
   }),
   NamedOthers: Entity.make({
     model: DynamoModel.configure(G133NamedOther, { label: { field: "nlabel" } } as any),
@@ -17456,6 +17472,28 @@ describeConnected("#133 — path operations on index composites and unique field
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
+  it.effect("a collection's fetch, paginate, count and select return its members' items", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      yield* (db.entities.OrAs as any).put({ owner: "cq1", aid: "a1", n: 1 })
+      yield* (db.entities.OrAs as any).put({ owner: "cq1", aid: "a2", n: 2 })
+      yield* (db.entities.OrBs as any).put({ owner: "cq1", bid: "b1", n: 3, secret: "s" })
+      const q = () => (db.collections as any).g133Or({ owner: "cq1" })
+      const page = yield* q().fetch()
+      expect(page.items.OrAs.map((a: any) => a.aid)).toEqual(["a1", "a2"])
+      expect(page.items.OrBs.map((b: any) => b.bid)).toEqual(["b1"])
+      const streamed = [...(yield* Stream.runCollect(q().paginate()))] as Array<any>
+      expect(streamed.map((s) => [s.member, s.item.aid ?? s.item.bid]).sort()).toEqual([
+        ["OrAs", "a1"],
+        ["OrAs", "a2"],
+        ["OrBs", "b1"],
+      ])
+      expect(yield* q().count()).toBe(3)
+      const selected = yield* q().select(["n"]).collect()
+      expect(selected).toEqual({ OrAs: [{ n: 1 }, { n: 2 }], OrBs: [{ n: 3 }] })
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
   // ---- a filter never widens the ownership check (#133) ----
 
   it.effect("a top-level OR filter returns only the entity's own rows", () =>
@@ -17555,6 +17593,34 @@ describeConnected("#133 — path operations on index composites and unique field
           ).toEqual(["1"])
         }
       }
+    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect("a collection filter names each member's domain fields, never stored names", () =>
+    Effect.gen(function* () {
+      const db = yield* g133Client
+      yield* (db.entities.Hyphens as any).put({
+        grp: "dom",
+        hid: "1",
+        "first-name": "Ann",
+        label: "L1",
+        addr: { city: "C1", zip: "Z1" },
+        tags: [],
+      })
+      // Its `the-label` is a domain field, holding what Hyphens stores under that name.
+      yield* (db.entities.NamedThirds as any).put({
+        grp: "dom",
+        tid: "t1",
+        label: "X",
+        "the-label": "L1",
+      })
+      const named = (db.collections as any).g133Named
+      const byLabel = yield* named({ grp: "dom" }).filter({ label: "L1" }).collect()
+      expect(byLabel.Hyphens.map((h: any) => h.hid)).toEqual(["1"])
+      expect(byLabel.NamedThirds).toEqual([])
+      const byStoredName = yield* named({ grp: "dom" }).filter({ "the-label": "L1" }).collect()
+      expect(byStoredName.Hyphens).toEqual([])
+      expect(byStoredName.NamedThirds.map((t: any) => t.tid)).toEqual(["t1"])
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 

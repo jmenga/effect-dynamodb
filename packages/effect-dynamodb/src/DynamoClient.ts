@@ -136,7 +136,17 @@ import type {
   VectorIndexConfig,
   VectorIndexDefinition,
 } from "@effect-dynamodb/schema/VectorIndex.js"
-import { Config, Context, Crypto, Duration, Effect, Layer, Option, type Schema } from "effect"
+import {
+  Config,
+  Context,
+  Crypto,
+  Duration,
+  Effect,
+  Layer,
+  Option,
+  type Schema,
+  type Stream,
+} from "effect"
 import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
 import { bind as aggregateBind } from "./Aggregate.js"
 import type { BoundEntity, Entity as EntityType } from "./Entity.js"
@@ -565,8 +575,25 @@ export interface TableLike {
 }
 
 /**
+ * One item a collection's `paginate()` streams: the member it belongs to (the
+ * key `collect()` groups it under) and the item.
+ */
+export type CollectionStreamItem<TResult> = {
+  readonly [K in keyof TResult]: {
+    readonly member: K
+    readonly item: TResult[K] extends ReadonlyArray<infer A> ? A : unknown
+  }
+}[keyof TResult]
+
+/** A collection's grouped result after `select`: partial records per member. */
+export type CollectionSelected<TResult> = {
+  readonly [K in keyof TResult]: Array<Record<string, unknown>>
+}
+
+/**
  * Collection query — returned by `db.collections.Name(composites)`.
- * `.collect()` returns the grouped result directly (not an array).
+ * `.collect()` and `.fetch()` return the grouped result (not an array);
+ * `.paginate()` streams each item tagged with its member.
  */
 export interface CollectionQuery<TResult> {
   /** Execute and collect all pages into a grouped result. */
@@ -575,12 +602,35 @@ export interface CollectionQuery<TResult> {
     DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
     never
   >
-  /** Execute a single page. */
+  /** Execute a single page, grouped like `collect()`. */
   readonly fetch: () => Effect.Effect<
     { items: TResult; cursor: string | null },
     DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
     never
   >
+  /** Stream every item, page by page, each tagged with its member. */
+  readonly paginate: () => Stream.Stream<
+    CollectionStreamItem<TResult>,
+    DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
+    never
+  >
+  /** Count the members' items (every member's, together). */
+  readonly count: () => Effect.Effect<
+    number,
+    DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
+    never
+  >
+  /**
+   * Project attributes — by domain name, per member: each member's items come
+   * back as partial records under its key.
+   */
+  readonly select: (
+    attributes:
+      | ReadonlyArray<string>
+      | ((
+          t: import("./internal/PathBuilder.js").PathBuilder<unknown, unknown, never>,
+        ) => ReadonlyArray<import("./internal/PathBuilder.js").Path<unknown, any, any>>),
+  ) => CollectionQuery<CollectionSelected<TResult>>
   /** Add a filter expression (post-read). */
   readonly filter: {
     (
@@ -937,6 +987,12 @@ interface EntityLike {
      * promoted at bind time still satisfy the shape. */
     readonly inputSchema?: Schema.Top | undefined
   }
+}
+
+/** An entity's domain field names (its record's), when its schema exposes them. */
+const domainFieldsOf = (entityLike: EntityLike): ReadonlySet<string> | undefined => {
+  const fields = (entityLike.schemas.recordSchema as unknown as { readonly fields?: object }).fields
+  return fields === undefined ? undefined : new Set(Object.keys(fields))
 }
 
 /**
@@ -1592,6 +1648,13 @@ const makeFromConfig = (config: {
           pathBuilder,
           conditionOps,
           provide: collectionProvide,
+          // Each streamed item tagged with its member; foreign rows dropped.
+          tagStreamed: (item) => {
+            const memberKey = (item as any)._memberKey
+            return memberKey !== undefined && memberKey !== "__unknown__"
+              ? { member: memberKey, item: (item as any)._decoded }
+              : undefined
+          },
           // Group results by member — through every combinator.
           groupCollected: (items) => {
             const result: Record<string, unknown[]> = {}
@@ -1611,6 +1674,7 @@ const makeFromConfig = (config: {
               entityType: m.entityLike.entityType,
               entityKey: m.entityKey,
               resolve: m.entityLike._resolveDbName ?? ((name: string) => name),
+              fields: domainFieldsOf(m.entityLike),
             })),
           ),
         }

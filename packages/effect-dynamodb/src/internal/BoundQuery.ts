@@ -331,6 +331,11 @@ export interface BoundQueryConfig<Model> {
    */
   readonly groupCollected?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
   /**
+   * Optional: how `paginate()` shapes each streamed item (`undefined` drops
+   * it) — a collection tags each with its member (#133).
+   */
+  readonly tagStreamed?: ((item: unknown) => unknown) | undefined
+  /**
    * Optional: how `.filter()` names the stored attributes of renamed fields
    * (#133) — see {@link entityNaming} / {@link collectionNaming}.
    */
@@ -410,21 +415,38 @@ export const collectionNaming = (
     readonly entityType: string
     readonly entityKey: string
     readonly resolve: (domainName: string) => string
+    /** The member's domain field names, when known: a filter names only these. */
+    readonly fields?: ReadonlySet<string> | undefined
   }>,
 ): Pick<BoundQueryConfig<unknown>, "renameExpr" | "selectAs"> => ({
   renameExpr: (expr) => {
     const heads = [...pathHeads(expr)]
+    // A filter names DOMAIN fields: a member without one of them has no rows
+    // it can match — never one whose stored attribute merely bears the name.
+    const knows = (m: (typeof members)[number]) =>
+      m.fields === undefined || heads.every((head) => m.fields!.has(head))
     const first = members[0]
     if (
       first === undefined ||
-      members.every((m) => heads.every((head) => m.resolve(head) === first.resolve(head)))
+      members.every(
+        (m) => knows(m) && heads.every((head) => m.resolve(head) === first.resolve(head)),
+      )
     ) {
       return first === undefined ? expr : (renamePaths(expr, first.resolve) as Expr)
+    }
+    const matching = members.filter(knows)
+    if (matching.length === 0) {
+      // No member has the field: nothing matches.
+      return {
+        [ExprTag]: ExprTag,
+        _tag: "notExists",
+        operand: { _tag: "path", segments: ["__edd_e__"] },
+      } as unknown as Expr
     }
     return {
       [ExprTag]: ExprTag,
       _tag: "or",
-      exprs: members.map(
+      exprs: matching.map(
         (m): Expr => ({
           [ExprTag]: ExprTag,
           _tag: "and",
@@ -566,7 +588,13 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
 
   // --- terminals ---
   fetch(): Effect.Effect<Query.Page<A>, DynamoClientError | ValidationError, never> {
-    return this._config.provide(Query.execute(this._query))
+    const page = this._config.provide(Query.execute(this._query))
+    const group = this._config.groupCollected
+    return group === undefined
+      ? page
+      : (page.pipe(
+          Effect.map((p) => ({ ...p, items: group(p.items) })),
+        ) as unknown as Effect.Effect<Query.Page<A>, DynamoClientError | ValidationError, never>)
   }
 
   collect(): Effect.Effect<Array<A>, DynamoClientError | ValidationError, never> {
@@ -582,9 +610,16 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
   }
 
   paginate(): Stream.Stream<A, DynamoClientError | ValidationError, never> {
-    return Stream.unwrap(this._config.provide(Query.paginate(this._query))).pipe(
+    const tag = this._config.tagStreamed
+    const items = Stream.unwrap(this._config.provide(Query.paginate(this._query))).pipe(
       Stream.flatMap((page: Array<A>) => Stream.fromIterable(page)),
     )
+    return tag === undefined
+      ? items
+      : (items.pipe(
+          Stream.map((item) => tag(item)),
+          Stream.filter((item) => item !== undefined),
+        ) as unknown as Stream.Stream<A, DynamoClientError | ValidationError, never>)
   }
 
   count(): Effect.Effect<number, DynamoClientError | ValidationError, never> {
