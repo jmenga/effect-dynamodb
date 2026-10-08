@@ -9030,6 +9030,21 @@ const provideEsLat = Effect.provide(EsLatLayer)
 const esLatRequests = (label: string, accountId: string) =>
   esLatLog.filter((entry) => entry.pk === `$es-lat#v1#${label}#${accountId}`)
 
+/** A command's idempotency sentinel in the "Bulk" stream, read back raw. */
+const esLatSentinel = (accountId: string, commandId: string) =>
+  Effect.gen(function* () {
+    const client = yield* DynamoClient
+    const result = yield* client.getItem({
+      TableName: esLatTableName,
+      Key: toAttributeMap({
+        pk: `$es-lat#v1#bulk#${accountId}`,
+        sk: DynamoSchema.composeKey(esLatSchema, "bulk.command", [commandId]),
+      }),
+      ConsistentRead: true,
+    })
+    return result.Item === undefined ? undefined : fromAttributeMap(result.Item)
+  })
+
 const esLatDeposits = (n: number) =>
   Array.from({ length: n }, () => new EsCmdDeposited({ amount: 1 }))
 
@@ -9183,6 +9198,18 @@ describeConnected("EventStore inline snapshots and chunked append (#138, #141)",
       expect(esLatRequests("batched", accountId).slice(mark2)).toHaveLength(1)
       expect(within.events.map((e) => e.version)).toEqual([14, 15])
       expect(within.version).toBe(15)
+
+      // Lagging by exactly `every`: the first page holds the snapshot and every
+      // missing event, so it is still one request.
+      const exact = { accountId: "lag-2" }
+      yield* EsBatched.append(exact, esLatDeposits(3), 0)
+      yield* EsBatched.writeSnapshot(exact, { balance: 3, txCount: 3 }, 3)
+      yield* EsBatched.append(exact, esLatDeposits(5), 3)
+      const mark3 = esLatRequests("batched", "lag-2").length
+      const boundary = yield* EsBatched.readLatest(exact, { consistentRead: true })
+      expect(esLatRequests("batched", "lag-2").slice(mark3)).toHaveLength(1)
+      expect(boundary.events.map((e) => e.version)).toEqual([4, 5, 6, 7, 8])
+      expect(boundary.version).toBe(8)
     }).pipe(provideEsLat),
   )
 
@@ -9257,11 +9284,14 @@ describeConnected("EventStore inline snapshots and chunked append (#138, #141)",
           (r) => r.op === "transactWriteItems",
         )
         expect(transacts).toHaveLength(2)
-        // Chunk 1 ends with the sentinel's ConditionCheck.
+        // Chunk 1 ends with the sentinel's guarded pending claim.
         const first = transacts[0]!.items!
-        expect((first[first.length - 1] as any).ConditionCheck.ConditionExpression).toBe(
-          "attribute_not_exists(pk)",
-        )
+        const claim = (first[first.length - 1] as any).Put
+        expect(claim.ConditionExpression).toBe("attribute_not_exists(pk)")
+        expect(fromAttributeMap(claim.Item)).toMatchObject({
+          __edd_e__: "bulk.command",
+          pending: true,
+        })
         // The final chunk ends with the projection, the sentinel and the snapshot.
         const final = transacts[1]!.items!
         const tail = final
@@ -9275,7 +9305,12 @@ describeConnected("EventStore inline snapshots and chunked append (#138, #141)",
         const snapshot = Option.getOrThrow(yield* EsBulk.readSnapshot(key))
         expect(snapshot).toMatchObject({ asOfVersion: 150, state: result.state })
 
-        // A replay fails on the first chunk's sentinel check: nothing written.
+        // The final chunk completed the claimed sentinel.
+        const sentinel = yield* esLatSentinel(accountId, "bulk-1")
+        expect(sentinel).toMatchObject({ commandId: "bulk-1", version: 150 })
+        expect(sentinel?.pending).toBeUndefined()
+
+        // A replay fails on the first chunk's sentinel claim: nothing written.
         const replay = yield* handle(key, 150, {
           commandId: "bulk-1",
           additionalItems: project,
@@ -9336,6 +9371,98 @@ describeConnected("EventStore inline snapshots and chunked append (#138, #141)",
         expect(events[100]!.data).toEqual(new EsCmdWithdrew({ amount: 7 }))
         // No snapshot rode along: it belongs to the final chunk.
         expect(Option.isNone(yield* EsBulk.readSnapshot(key))).toBe(true)
+      }).pipe(provideEsLat),
+  )
+
+  it.effect(
+    "#141 a redelivery while a chunked command is in flight is a DuplicateCommand, never a second application",
+    () =>
+      Effect.gen(function* () {
+        const accountId = "chunk-6"
+        const key = { accountId }
+        const tableLayer = EsLatTable.layer({ name: esLatTableName })
+        const handle = EventStore.commandHandler(esBulkDecider, EsBulk, {
+          idempotency: {},
+          chunked: true,
+          retry: 3,
+        })
+
+        // Delivery 2 of the same command runs to completion just before
+        // delivery 1's second transaction — after its first has committed.
+        let transactions = 0
+        let redelivery: unknown
+        esLatBeforeTransact = (raw, items) => {
+          if (!items.some((item) => transactPk(item)?.endsWith(`#bulk#${accountId}`))) {
+            return Effect.void
+          }
+          transactions++
+          if (transactions !== 2) return Effect.void
+          return handle(key, 150, { commandId: "cmd-1" }).pipe(
+            Effect.flip,
+            Effect.tap((error) =>
+              Effect.sync(() => {
+                redelivery = error
+              }),
+            ),
+            Effect.asVoid,
+            Effect.provideService(DynamoClient, raw),
+            Effect.provide(tableLayer),
+          )
+        }
+
+        const result = yield* handle(key, 150, { commandId: "cmd-1" })
+        esLatBeforeTransact = undefined
+
+        expect((redelivery as { _tag: string })._tag).toBe("DuplicateCommand")
+        expect(result).toMatchObject({ version: 150, state: { balance: 150, txCount: 150 } })
+        // One application of the command: 150 events, not 150 plus a second 150.
+        const events = yield* EsBulk.read(key, { consistentRead: true })
+        expect(events.map((e) => e.version)).toEqual(Array.from({ length: 150 }, (_, i) => i + 1))
+        expect((yield* esLatSentinel(accountId, "cmd-1"))?.pending).toBeUndefined()
+      }).pipe(provideEsLat),
+  )
+
+  it.effect(
+    "#141 a redelivery after a PartialAppend is a DuplicateCommand: the prefix is never re-applied",
+    () =>
+      Effect.gen(function* () {
+        const accountId = "chunk-7"
+        const key = { accountId }
+        const tableLayer = EsLatTable.layer({ name: esLatTableName })
+        const handle = EventStore.commandHandler(esBulkDecider, EsBulk, {
+          idempotency: {},
+          chunked: true,
+        })
+
+        // Another writer appends v100 between chunk 1 (v1–99 + the claim) and
+        // chunk 2, so delivery 1 fails partway.
+        let transactions = 0
+        esLatBeforeTransact = (raw, items) => {
+          if (!items.some((item) => transactPk(item)?.endsWith(`#bulk#${accountId}`))) {
+            return Effect.void
+          }
+          transactions++
+          if (transactions !== 2) return Effect.void
+          return EsBulk.append(key, [new EsCmdWithdrew({ amount: 7 })], 99).pipe(
+            Effect.asVoid,
+            Effect.provideService(DynamoClient, raw),
+            Effect.provide(tableLayer),
+          )
+        }
+        const first = yield* handle(key, 150, { commandId: "cmd-1" }).pipe(Effect.flip)
+        esLatBeforeTransact = undefined
+        expect(first._tag).toBe("PartialAppend")
+        expect((first as PartialAppend).committedVersion).toBe(99)
+        // The command stays claimed, pending.
+        expect(yield* esLatSentinel(accountId, "cmd-1")).toMatchObject({
+          pending: true,
+          version: 150,
+        })
+
+        const redelivery = yield* handle(key, 150, { commandId: "cmd-1" }).pipe(Effect.flip)
+        expect(redelivery._tag).toBe("DuplicateCommand")
+        // The prefix and the other writer's event — nothing more.
+        expect(yield* EsBulk.currentVersion(key, { consistentRead: true })).toBe(100)
       }).pipe(provideEsLat),
   )
 

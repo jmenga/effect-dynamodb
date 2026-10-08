@@ -4328,27 +4328,44 @@ describe("EventStore inline snapshots and readLatest (#138)", () => {
               LastEvaluatedKey: cursor,
             })
             .mockResolvedValueOnce({
-              Items: [
-                inningsItem("snapmatch", 4),
-                inningsItem("snapmatch", 3),
-                inningsItem("snapmatch", 2),
-              ],
+              Items: [inningsItem("snapmatch", 4), inningsItem("snapmatch", 3)],
               LastEvaluatedKey: toAttributeMap({ pk: "p", sk: "s2" }),
             })
 
           const latest = yield* SnapshotMatchEvents.readLatest({ matchId: "m-1" })
 
-          // Two requests: event 2 (the snapshot's version) was reached on the
-          // second, so the older events are never read.
+          // Two requests: event 3 (the first after the snapshot) was reached
+          // on the second, so the older events are never read.
           expect(mockQuery).toHaveBeenCalledTimes(2)
           const second = mockQuery.mock.calls[1]![0]
-          // Events 4, 3 and 2 are still missing: exactly three.
-          expect(second.Limit).toBe(3)
+          // Events 4 and 3 are still missing: exactly two.
+          expect(second.Limit).toBe(2)
           expect(second.ExclusiveStartKey).toEqual(cursor)
           expect(second.ScanIndexForward).toBe(false)
           expect(latest.events.map((e) => e.version)).toEqual([3, 4, 5, 6, 7])
           expect(latest.version).toBe(7)
         }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a snapshot lagging by exactly `every` events loads in one request", () =>
+      Effect.gen(function* () {
+        // every: 3, snapshot at v3, head at v6: the first page (Limit 4) holds
+        // the snapshot and events 6, 5 and 4 — everything the snapshot lacks.
+        mockQuery.mockResolvedValue({
+          ...latestPage(makeSnapshotItem("snapmatch", "m-1", 3, { status: "i", innings: [] }), [
+            inningsItem("snapmatch", 4),
+            inningsItem("snapmatch", 5),
+            inningsItem("snapmatch", 6),
+          ]),
+          LastEvaluatedKey: toAttributeMap({ pk: "p", sk: "s" }),
+        })
+
+        const latest = yield* SnapshotMatchEvents.readLatest({ matchId: "m-1" })
+
+        expect(mockQuery).toHaveBeenCalledOnce()
+        expect(latest.events.map((e) => e.version)).toEqual([4, 5, 6])
+        expect(latest.version).toBe(6)
+      }).pipe(Effect.provide(TestLayer)),
     )
 
     it.effect("stops after one page once the snapshot's version is reached", () =>
@@ -4724,30 +4741,36 @@ describe("EventStore chunked append (#141)", () => {
   )
 
   it.effect(
-    "the first chunk guards the sentinel; the final carries items, sentinel and snapshot",
+    "the first chunk claims the command; the final carries items, sentinel and snapshot",
     () =>
       Effect.gen(function* () {
         mockTransactWriteItems.mockResolvedValue({})
 
         yield* SnapStream.append({ matchId: "m-1" }, manyEvents(150), 10, {
           chunked: true,
-          idempotency: { commandId: "cmd-9" },
+          idempotency: { commandId: "cmd-9", ttl: "1 hour" },
           additionalItems: [Watermarks.put({ writerId: "w", lastSeq: 160 })],
           snapshot: { status: "in-progress", innings: [] },
         })
 
         const [first, final] = calls()
         expect(calls()).toHaveLength(2)
-        // Chunk 1: check on v10, 98 events, the sentinel ConditionCheck.
+        // Chunk 1: check on v10, 98 events, the sentinel's guarded pending claim.
         expect(first.TransactItems).toHaveLength(100)
         expect(fromAttributeMap(first.TransactItems[0].ConditionCheck.Key).sk).toBe(
           DynamoSchema.composeEventVersionKey(AppSchema, "chunkmatch.event", 10),
         )
-        const sentinelCheck = first.TransactItems[99].ConditionCheck
-        expect(sentinelCheck.ConditionExpression).toBe("attribute_not_exists(pk)")
-        expect(fromAttributeMap(sentinelCheck.Key).sk).toBe(
-          DynamoSchema.composeKey(AppSchema, "chunkmatch.command", ["cmd-9"]),
-        )
+        const claim = first.TransactItems[99].Put
+        expect(claim.ConditionExpression).toBe("attribute_not_exists(pk)")
+        const claimed = fromAttributeMap(claim.Item)
+        expect(claimed).toMatchObject({
+          sk: DynamoSchema.composeKey(AppSchema, "chunkmatch.command", ["cmd-9"]),
+          __edd_e__: "chunkmatch.command",
+          commandId: "cmd-9",
+          version: 160,
+          pending: true,
+        })
+        expect(typeof claimed._ttl).toBe("number")
         expect(versionsOf(first)).toEqual(Array.from({ length: 98 }, (_, i) => i + 11))
         // Final: check on v108, 52 events, the projection, sentinel Put, snapshot.
         expect(fromAttributeMap(final.TransactItems[0].ConditionCheck.Key).sk).toBe(
@@ -4762,6 +4785,14 @@ describe("EventStore chunked append (#141)", () => {
         ])
         expect(tail[1].version).toBe(160)
         expect(tail[2].asOfVersion).toBe(160)
+        // The completed sentinel overwrites the claim unconditionally (the
+        // chunk's event puts prove ownership), with the same attributes but
+        // no `pending` marker.
+        const completed = final.TransactItems[final.TransactItems.length - 2].Put
+        expect(completed.ConditionExpression).toBeUndefined()
+        expect(tail[1]).toEqual(
+          Object.fromEntries(Object.entries(claimed).filter(([k]) => k !== "pending")),
+        )
       }).pipe(Effect.provide(TestLayer)),
   )
 

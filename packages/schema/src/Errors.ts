@@ -408,6 +408,11 @@ export class AdditionalItemConditionFailed extends Data.TaggedError(
  * `idempotency`) finds an existing command-dedup sentinel for the supplied
  * `commandId`. Terminal — retrying the same `commandId` can never succeed.
  *
+ * A chunked append claims its command in its first transaction, so this is
+ * also the verdict for a delivery that arrives while another delivery's
+ * chunked append is in flight, or after one failed partway with
+ * {@link PartialAppend}.
+ *
  * Precedence: reported ahead of {@link VersionConflict} when both the sentinel
  * guard and an event-put guard fail in the same transaction, because a duplicate
  * is terminal whereas a version conflict invites a retry.
@@ -424,11 +429,12 @@ export class DuplicateCommand extends Data.TaggedError("DuplicateCommand")<{
  * events: versions `expectedVersion + 1 … committedVersion`.
  *
  * A chunked append is not atomic. Concurrency is decided by its first
- * transaction — a failure there maps exactly as a non-chunked append's does,
- * and nothing is written. Any failure of a later transaction surfaces as this
- * error, whatever caused it: another writer appended between two chunks (the
- * usual case, a `VersionConflict` in `cause`), an `additionalItems` condition
- * failed on the final chunk, a transport error, or anything else.
+ * transaction — a failure there maps exactly as a non-chunked append's does
+ * (a cancellation writes nothing). Any failure of a later transaction surfaces
+ * as this error, whatever caused it: another writer appended between two
+ * chunks (the usual case, a `VersionConflict` in `cause`), an
+ * `additionalItems` condition failed on the final chunk, a transport error, or
+ * anything else.
  *
  * - `expectedVersion` — the version the caller appended after.
  * - `committedVersion` — the last version known to be durably written by this
@@ -439,10 +445,15 @@ export class DuplicateCommand extends Data.TaggedError("DuplicateCommand")<{
  *   append would have reached.
  * - `cause` — the error the failing chunk produced.
  *
- * The `additionalItems`, the idempotency sentinel and an inline snapshot all
- * ride on the final chunk, so none of them is written when this error occurs:
- * read models never show a partially written command, and the command is not
- * recorded as applied. `EventStore.commandHandler` never retries it.
+ * The `additionalItems`, the completed idempotency sentinel and an inline
+ * snapshot ride on the final chunk. Unless `cause` is a transport error on
+ * that final chunk (whose outcome is unknown), none of them is written, so
+ * read models never show a partially written command. With idempotency, the
+ * first chunk has already claimed the command with a `pending` sentinel: a
+ * redelivery of the same `commandId` fails with {@link DuplicateCommand}
+ * rather than applying the command again on top of the prefix, so repairing
+ * the prefix is the application's call. `EventStore.commandHandler` never
+ * retries this error.
  */
 export class PartialAppend extends Data.TaggedError("PartialAppend")<{
   readonly streamName: string

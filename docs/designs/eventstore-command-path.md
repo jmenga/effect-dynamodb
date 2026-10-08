@@ -39,7 +39,10 @@ stream.currentVersion(streamId, options?)
   unchanged.
 - `commandHandler` loads state with strongly consistent reads **by default**.
   The handler-level `CommandHandlerOptions.consistentRead?: boolean` (default
-  `true`) opts out. The snapshot `GetItem` is already consistent.
+  `true`) opts out. On a snapshot-configured stream the snapshot is read in the
+  same `Query` as its delta (`readLatest`, §4), so the option covers the
+  snapshot too: `consistentRead: false` makes both eventually consistent.
+  (`readSnapshot`'s own `GetItem` stays strongly consistent.)
 
 ## 2. Caller-supplied expected version — If-Match (#136)
 
@@ -210,13 +213,14 @@ Implementation:
    - The lower bound is the event SK prefix (`<label>.event_1#`), which sorts
      before the first event and after every sentinel.
    - First page `Limit`: `(every ?? 1) + 1`.
-2. Keep paging until an event at `version <= asOfVersion` has been seen or the
+2. Keep paging until the event at `asOfVersion + 1` has been seen (versions are
+   contiguous, so every event the snapshot lacks is then in hand) or the
    partition is exhausted. When there is no snapshot (it would have been the
    first item evaluated), page to the start without a `Limit`. When there is
    one, each further page's `Limit` is the number of events still missing,
-   `oldestSeen - asOfVersion` (versions are contiguous), so a snapshot lagging
-   past the first page costs exactly one more request (DynamoDB's 1 MB page cap
-   aside) rather than reading the rest of the partition.
+   `oldestSeen - asOfVersion - 1`, so a snapshot lagging past the first page
+   costs exactly one more request (DynamoDB's 1 MB page cap aside) rather than
+   reading the rest of the partition.
 3. Decode the snapshot through the state schema. Decode failure is a
    `ValidationError`, as `readSnapshot` reports.
 4. Drop events at or below `asOfVersion`, and return the rest ascending.
@@ -226,7 +230,16 @@ Request counts:
 - A current inline snapshot loads in one request.
 - A lagging snapshot (data written before `inline` was enabled, or an
   `after-append` cadence) still loads in one request whenever the lag fits the
-  first page, and in two otherwise.
+  first page — up to and including `every` events — and in two otherwise.
+
+Read cost: the first page is read whatever the actual lag, so a load reads up
+to `every + 1` items, including events the snapshot already covers (they are
+discarded). For an `after-append` stream with a large `every` this trades read
+capacity for requests: with `every: 100` and a snapshot one event behind, a load
+reads the snapshot and 100 events in one request, where the previous
+`GetItem` + `readFrom` read the snapshot and one event in two. The
+`SnapshotConfig.every` JSDoc states this; `mode: "inline"` (no `every`) keeps the
+page at two items.
 
 `commandHandler` uses `readLatest` for **every** snapshot-configured stream,
 whatever the mode, consistent by default. Streams without a snapshot config
@@ -261,19 +274,37 @@ With `chunked: true`:
      before anything is written, exactly as a non-chunked one.
 3. **First chunk.** It carries the version-contiguity `ConditionCheck` on
    `expectedVersion` (when > 0) and the event puts (`attribute_not_exists`).
-   With idempotency it also carries a
-   `ConditionCheck attribute_not_exists` on the **sentinel key**, so a replay of
-   a completed command still reports `DuplicateCommand` instead of
-   `VersionConflict`.
+   With idempotency it also **claims the command**: a sentinel `Put` guarded by
+   `attribute_not_exists(pk)`, carrying `pending: true` and the intended
+   version. Every other delivery of the `commandId` from then on fails with
+   `DuplicateCommand` — a replay of a completed command, a redelivery that
+   arrives while this append is in flight (the at-least-once queue case: a
+   large command runs longest, which is when a visibility timeout redelivers),
+   and a redelivery after this append failed with `PartialAppend`. A
+   `ConditionCheck` on the sentinel key would only cover the first case: the
+   in-flight redelivery would pass it, decide on top of the prefix and apply
+   the command a second time.
    - Concurrency is decided once, here. A failure of chunk 1 maps exactly as a
      non-chunked append does (`VersionConflict`, `DuplicateCommand`,
-     `TransactionCancelled`, …), and nothing has been written.
+     `TransactionCancelled`, …). A cancellation writes nothing. A transport
+     error leaves chunk 1's outcome unknown, exactly as it leaves a non-chunked
+     append's, except that what may have committed is a prefix; it surfaces as
+     the raw `DynamoClientError`, which `commandHandler` does not retry. The AWS
+     SDK's own retries are idempotent: it fills in a `ClientRequestToken` once
+     per request and every retry reuses it, so a retry of a chunk that committed
+     succeeds rather than conflicting with itself.
+   - A command whose chunked append failed partway is never applied twice, but
+     nor is it completed by a redelivery: its prefix stays recorded under the
+     `pending` claim, and repairing it is the application's call.
 4. **Chunks 2..n.** Each carries a contiguity `ConditionCheck`
    (`attribute_exists`) on the previous chunk's last event, plus its event
    puts.
 5. **Final chunk.** It also carries the inline items: `additionalItems`, the
-   inline snapshot (§4), and the idempotency sentinel `Put`. Read models
-   therefore never show a partially written command.
+   inline snapshot (§4), and the completed idempotency sentinel `Put`, which
+   overwrites the claim without `pending`. That `Put` is unconditional for the
+   same reason the inline snapshot's is: the chunk's event puts prove this
+   append still owns the stream. Read models therefore never show a partially
+   written command.
    - The final chunk reserves room for these items. If they cannot fit
      alongside at least one event, the call fails before anything is written:
      with `AppendTooLarge` for the item count (`count` is the size of that
@@ -304,7 +335,9 @@ With `chunked: true`:
      (`committedVersion`) as its `expectedVersion`.
    - When `cause` is a transport error, the failing chunk's own outcome is
      unknown (DynamoDB may have committed it), so `committedVersion` is the
-     last version *known* to be written. The JSDoc says so.
+     last version *known* to be written. The JSDoc says so. On the final
+     chunk that also means its inline items may have committed; otherwise
+     none of them is written.
 7. **Not atomic.** This must be stated plainly in JSDoc and the docs:
    - Between chunks another writer can append, which aborts the remainder with
      `PartialAppend`.
@@ -345,8 +378,8 @@ const Entries = EventStore.makeStream({
 - **Definition-time validation** (thrown errors, new `EDD-` codes from 9063 — 9062 is `snapshot.mode`, §4):
   - Index attribute names must not collide with stream-owned attributes
     (`pk`, `sk`, `__edd_e__`, `streamId`, `version`, `eventType`, `data`,
-    `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`, and the TTL
-    attribute name where knowable).
+    `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`, `pending`,
+    and the TTL attribute name where knowable).
   - Attribute names and physical index names must not collide with each other.
   - A `gsi` without `pk`, or an `lsi` with `pk`, is rejected.
 - **Item scope.** Index attributes are written on event items only. Snapshot
@@ -436,6 +469,8 @@ Required connected scenarios:
     versions.
   - The final chunk carries the projection, snapshot and sentinel.
   - A replay → `DuplicateCommand`.
+  - A redelivery while a chunked command is in flight, and one after its
+    `PartialAppend` → `DuplicateCommand`, with the command applied once.
   - An injected chunk-2 conflict → `PartialAppend` with the correct
     `committedVersion`.
   - The default without `chunked` → `AppendTooLarge`.

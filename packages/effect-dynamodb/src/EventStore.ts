@@ -184,7 +184,14 @@ export interface Snapshot<State> {
  *
  * `every` also sizes the first page of {@link EventStream.readLatest}, which
  * {@link commandHandler} loads state with: a snapshot that lags the head by up
- * to `every` events still loads in one request.
+ * to `every` events still loads in one request. The first page is read whatever
+ * the actual lag, so every load reads up to `every + 1` items (`2` without
+ * `every`), including events the snapshot already covers, which are discarded.
+ * For an `"after-append"` stream that trades read capacity for requests: with
+ * `every: 100` and a snapshot one event behind, a load reads the snapshot and
+ * 100 events in one request, where a `GetItem` plus `readFrom` would read the
+ * snapshot and one event in two. Size `every` with that in mind, or use
+ * `mode: "inline"`, which keeps the snapshot current so the page stays small.
  */
 export interface SnapshotConfig<TSchema extends Schema.Top = Schema.Top> {
   readonly schema: TSchema
@@ -223,6 +230,16 @@ export interface SnapshotSettings {
  * `attribute_not_exists(pk)` into the same transaction as the events. A replayed
  * `commandId` therefore cancels the whole transaction and surfaces as
  * `DuplicateCommand` — the events are never written twice.
+ *
+ * A chunked append split across transactions ({@link AppendOptions.chunked})
+ * claims the command in its **first** transaction, with a `pending` sentinel,
+ * and completes the sentinel in its final one. From the first transaction on,
+ * every other delivery of the `commandId` — concurrent with the append, or
+ * after it failed partway with `PartialAppend` — fails with `DuplicateCommand`
+ * and writes nothing. A command whose chunked append failed partway is
+ * therefore never applied twice, but nor is it completed by a redelivery: the
+ * prefix it left stays recorded under the command, and repairing it is the
+ * application's call.
  *
  * The sentinel is co-located in the stream's own partition, so `commandId`
  * uniqueness is scoped to the stream (which is what "have I already applied this
@@ -306,20 +323,27 @@ export interface AppendOptions<TMetadata, TState = never> {
    * successive versions:
    *
    * - The **first** carries the version-contiguity check on `expectedVersion`
-   *   and, with `idempotency`, a check that the command's sentinel does not
-   *   exist, so a replay still fails with `DuplicateCommand`. Concurrency is
-   *   decided here: its failure maps exactly as a non-chunked append's does,
-   *   and nothing is written.
+   *   and, with `idempotency`, claims the command with a `pending` sentinel
+   *   (see {@link AppendIdempotency}), so a replay — or a redelivery while
+   *   this append is in flight — fails with `DuplicateCommand`. Concurrency is
+   *   decided here: its failure maps exactly as a non-chunked append's does. A
+   *   cancellation (`VersionConflict`, `DuplicateCommand`, …) means nothing
+   *   was written; a transport error leaves the first transaction's outcome
+   *   unknown, exactly as it leaves a non-chunked append's, except that what
+   *   may have committed is a prefix of the events. Re-read the stream before
+   *   acting on one.
    * - Each **later** one checks that the previous chunk's last event exists.
-   * - The **final** one also carries `additionalItems`, the idempotency
-   *   sentinel and the inline `snapshot`, so read models never show a partially
-   *   written command. If they cannot fit alongside one event, the append fails
-   *   with `AppendTooLarge` before anything is written.
+   * - The **final** one also carries `additionalItems`, the completed
+   *   idempotency sentinel and the inline `snapshot`, so read models never
+   *   show a partially written command. If they cannot fit alongside one
+   *   event, the append fails before anything is written: with
+   *   `AppendTooLarge` for the item count, or `ValidationError` for the 4 MB
+   *   size.
    *
    * **Not atomic.** Readers can observe a prefix of the events, and another
    * writer appending between two chunks aborts the rest: any failure after the
-   * first chunk surfaces as `PartialAppend`, carrying the last version
-   * committed. The result's `version` is the final version.
+   * first chunk surfaces as `PartialAppend`, carrying the last version known to
+   * be committed. The result's `version` is the final version.
    */
   readonly chunked?: boolean | undefined
 }
@@ -589,8 +613,9 @@ export interface EventStream<
  * - `[0, guardCount)` — the version-contiguity `ConditionCheck` (0 or 1 items)
  * - `[guardCount, guardCount + eventCount)` — the event puts
  * - then the `additional` items (caller op order preserved)
- * - then, at `sentinelIndex`, the idempotency sentinel (its `Put`, or on the
- *   first chunk of a chunked append a `ConditionCheck`)
+ * - then, at `sentinelIndex`, the idempotency sentinel `Put` (on the first
+ *   chunk of a chunked append its guarded `pending` claim, on the final chunk
+ *   the unconditional completed sentinel)
  * - then the inline snapshot `Put`
  *
  * The sentinel and snapshot come last, so adding them never shifts the
@@ -1020,7 +1045,7 @@ export const makeStream = <
    * is held to the lower bound the refusal uses.
    *
    * - The first chunk carries `firstChunkGuards` (the contiguity check on
-   *   `expectedVersion`, the sentinel ConditionCheck); every later one a
+   *   `expectedVersion`, the sentinel's `pending` claim); every later one a
    *   contiguity check on the previous chunk's last event.
    * - Chunks are filled greedily until the remaining events fit the final
    *   chunk together with `finalExtras` (additional items, sentinel Put, inline
@@ -1243,11 +1268,18 @@ export const makeStream = <
           }),
       )
 
-      // The idempotency sentinel: a guarded Put, plus — on the first chunk of a
-      // chunked append — a ConditionCheck on the same key, so a replay of a
-      // completed command fails with DuplicateCommand before anything is written.
+      // The idempotency sentinel: a Put guarded by `attribute_not_exists(pk)`.
+      // A chunked append split across transactions writes it twice: its FIRST
+      // transaction claims the command with a guarded `pending` sentinel — so a
+      // redelivery while the append is in flight, or after it failed partway,
+      // reports DuplicateCommand instead of applying the command again on top
+      // of the prefix — and its FINAL transaction overwrites the claim with the
+      // completed sentinel, unconditionally: that transaction's event puts
+      // prove this append still owns the stream, as they do for the inline
+      // snapshot.
       let sentinelPut: TransactWriteItem | undefined
-      let sentinelCheck: TransactWriteItem | undefined
+      let sentinelClaim: TransactWriteItem | undefined
+      let sentinelComplete: TransactWriteItem | undefined
       if (idempotency !== undefined) {
         const sentinelSk = composeCommandSk(idempotency.commandId)
         const sentinel: Record<string, unknown> = {
@@ -1279,13 +1311,14 @@ export const makeStream = <
             ConditionExpression: "attribute_not_exists(pk)",
           },
         }
-        sentinelCheck = {
-          ConditionCheck: {
+        sentinelClaim = {
+          Put: {
             TableName: tableName,
-            Key: toAttributeMap({ pk, sk: sentinelSk }),
+            Item: toAttributeMap({ ...sentinel, pending: true }),
             ConditionExpression: "attribute_not_exists(pk)",
           },
         }
+        sentinelComplete = { Put: { TableName: tableName, Item: toAttributeMap(sentinel) } }
       }
 
       // The inline snapshot (#138): unconditional — see AppendOptions.snapshot.
@@ -1476,12 +1509,12 @@ export const makeStream = <
             expectedVersion,
             firstChunkGuards: [
               ...(needsContiguityCheck ? [contiguityCheck(expectedVersion)] : []),
-              ...(sentinelCheck === undefined ? [] : [sentinelCheck]),
+              ...(sentinelClaim === undefined ? [] : [sentinelClaim]),
             ],
             contiguityCheck,
             finalExtras: [
               ...additional.items,
-              ...(sentinelPut === undefined ? [] : [sentinelPut]),
+              ...(sentinelComplete === undefined ? [] : [sentinelComplete]),
               ...(snapshotPut === undefined ? [] : [snapshotPut]),
             ],
             smallestFinal: () =>
@@ -1492,15 +1525,20 @@ export const makeStream = <
                     to: events.length,
                     checkVersion: expectedVersion + events.length - 1,
                     additional,
-                    sentinel: sentinelPut,
+                    sentinel: sentinelComplete,
                     snapshot: snapshotPut,
                   }),
             tooManyItems,
           })
 
           for (const [index, chunk] of plan.entries()) {
-            // The first chunk decides concurrency: its failure maps exactly as
-            // a non-chunked append's does, and nothing has been written.
+            // The first chunk decides concurrency and claims the command: its
+            // failure maps exactly as a non-chunked append's does. A
+            // cancellation writes nothing; a transport error leaves its outcome
+            // unknown, as it leaves a non-chunked append's. (The AWS SDK's own
+            // retries are idempotent: it fills in a ClientRequestToken once per
+            // request and every retry reuses it, so a retry of a chunk that
+            // committed succeeds instead of conflicting with itself.)
             const tx = layout({
               from: chunk.from,
               to: chunk.to,
@@ -1510,7 +1548,7 @@ export const makeStream = <
                     ? expectedVersion
                     : undefined
                   : expectedVersion + chunk.from,
-              sentinel: index === 0 ? sentinelCheck : undefined,
+              sentinel: index === 0 ? sentinelClaim : undefined,
             })
             yield* afterFirstChunk(sendAppendTransaction(client, tx, streamIdStr, commandId))
             committed = chunk.to
@@ -1526,7 +1564,7 @@ export const makeStream = <
               to: events.length,
               checkVersion: expectedVersion + committed,
               additional,
-              sentinel: sentinelPut,
+              sentinel: sentinelComplete,
               snapshot: snapshotPut,
             })
             if (final.items.length > TRANSACT_WRITE_ITEMS_LIMIT) {
@@ -1798,14 +1836,15 @@ export const makeStream = <
           limit = undefined
           continue
         }
-        // Done once an event at or below the snapshot's version has been seen:
-        // everything older is already folded into the snapshot. Otherwise read
-        // exactly the events down to it — versions are contiguous, so that is
-        // `oldest - asOfVersion` items (DynamoDB's 1 MB page cap aside).
+        // Done once the event right after the snapshot has been seen: versions
+        // are contiguous, so every event the snapshot does not cover is then in
+        // hand, and everything older is already folded into it. Otherwise read
+        // exactly the events still missing, `asOfVersion + 1 … oldest - 1`
+        // (DynamoDB's 1 MB page cap aside).
         const asOfVersion = snapshotRaw.asOfVersion as number
         const oldest = eventRaws[eventRaws.length - 1]?.version as number | undefined
-        if (oldest !== undefined && oldest <= asOfVersion) break
-        limit = oldest === undefined ? undefined : Math.max(1, oldest - asOfVersion)
+        if (oldest !== undefined && oldest <= asOfVersion + 1) break
+        limit = oldest === undefined ? undefined : oldest - asOfVersion - 1
       }
 
       const latest =
@@ -2235,8 +2274,10 @@ export interface CommandOptions<
    * one — see {@link AppendOptions.chunked}. Overrides the handler's
    * {@link CommandHandlerOptions.chunked}. **Not atomic** past the first
    * transaction: a failure after it surfaces as `PartialAppend`, which is
-   * never retried. The `additionalItems`, idempotency sentinel and inline
-   * snapshot ride on the final transaction.
+   * never retried. The `additionalItems`, the completed idempotency sentinel
+   * and the inline snapshot ride on the final transaction; the first one
+   * claims the command, so a redelivery never applies it twice (see
+   * {@link AppendIdempotency}).
    */
   readonly chunked?: boolean | undefined
 }
