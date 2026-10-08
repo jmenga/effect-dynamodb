@@ -2789,6 +2789,11 @@ const program = Effect.gen(function* () {
 })
 ```
 
+`read`, `readFrom` and `currentVersion` take an optional `ReadOptions`
+(`{ consistentRead?: boolean }`, default `false`); `consistentRead: true` sets
+`ConsistentRead` on every `Query` page for read-your-writes (#139).
+`query.events` composes with `Query.consistentRead` instead.
+
 ### Key Layout
 
 ```
@@ -2817,6 +2822,38 @@ const handler = EventStore.commandHandler(MatchDecider, MatchEvents)
 const result = yield* handler({ matchId: "m-1" }, new StartMatch({ venue: "MCG" }))
 // result: { state, version, events }
 ```
+
+Full design of the command path: `docs/designs/eventstore-command-path.md`
+(#136–#141). Each invocation runs:
+
+```
+load → [expectedVersion check] → decide → fold new events → derive items → append → [snapshot]
+```
+
+- **Load (#139).** Strongly consistent by default;
+  `CommandHandlerOptions.consistentRead: false` opts out. The snapshot `GetItem`
+  is always consistent.
+- **Caller expected version — If-Match (#136).** Per call,
+  `handle(streamId, command, { expectedVersion })`. A loaded version other than
+  `expectedVersion` fails with `VersionConflict` carrying
+  `actualVersion` (the loaded version) **before `decide` runs**; otherwise the
+  append is conditioned on it, and a writer that slips in between fails the
+  append with `VersionConflict` (no `actualVersion`). Neither is retried. With
+  `idempotency`, a pre-decide mismatch first probes the command's sentinel (one
+  consistent `GetItem`, on the mismatch path only): a redelivered command that
+  already committed fails with `DuplicateCommand`, matching `append`'s
+  precedence. A value that is not a non-negative integer is a
+  `ValidationError`, raised before anything is read.
+- **Fold before append (#137).** The new events are folded into state before
+  the append, so the returned, snapshotted and projected state is always the
+  `evolve` fold — never anything produced inside `decide`. `evolve` may mutate
+  in place.
+- **Decision-derived items (#137).** `CommandOptions.additionalItems` takes a
+  static array or a function of the `Decision`
+  (`{ events, state, previous, version }`) returning the ops or an `Effect` of
+  them. The items commit in the same transaction as the events; the function
+  is skipped for a no-op decision and re-run on every retry attempt. The
+  effect's `E2` / `R2` join the handler's error channel and requirements.
 
 ### Snapshots
 
@@ -2863,10 +2900,11 @@ State round-trips through the user-supplied `snapshot.schema` — `Schema.encode
 on write, `Schema.decodeUnknownEffect` on read — so transforming schemas work.
 
 **Snapshot-aware commandHandler.** When the stream declares `snapshot`, each handler
-invocation runs `readSnapshot → readFrom(asOfVersion) → foldFrom → decide → append`
-instead of a full replay. With `every: N`, the handler writes a fresh snapshot after a
-successful append once ≥ N events accumulated since the last snapshot (best-effort —
-a snapshot-write failure is logged and never fails the command).
+invocation loads `readSnapshot → readFrom(asOfVersion)` instead of a full replay,
+then runs the command path above. With `every: N`, the handler writes a fresh
+snapshot of the post-fold state after a successful append once ≥ N events
+accumulated since the last snapshot (best-effort — a snapshot-write failure is
+logged and never fails the command).
 
 ### Command Handler Retry
 
@@ -2879,8 +2917,11 @@ EventStore.commandHandler(matchDecider, matchEvents, {
 ```
 
 On `VersionConflict` the **full read–decide–append cycle re-runs** — never a blind
-re-append of stale events. Only `VersionConflict` is retried; domain errors and
-infrastructure errors fail immediately. A number `n` is shorthand for
+re-append of stale events, and a function-form `additionalItems` is re-derived from
+the fresh decision. Only `VersionConflict` is retried; domain errors,
+`DuplicateCommand` and infrastructure errors fail immediately. A call that
+supplies `expectedVersion` is never retried — its `VersionConflict` is the answer
+to a conditional write. A number `n` is shorthand for
 `Schedule.recurs(n)` (n retries after the initial attempt). Default: no retry.
 
 `commandHandler` dispatches data-first vs data-last on the `EventStreamTypeId` brand of
